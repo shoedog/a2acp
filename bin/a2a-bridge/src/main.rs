@@ -4190,61 +4190,63 @@ async fn run_workflow_cmd(args: &[String]) -> Result<(), BoxError> {
         .await
         .map_err(|error| format!("run-workflow: frozen admission failed: {error:?}"))?;
 
-    // Optional history remains fail-open except for identity collision. The final unpublished
-    // run spec records the actual disposition before any session/provider effect.
+    // Optional history remains fail-open except for identity collision and an
+    // unsupported physical-accounting configuration. Both fail closed before
+    // any session/provider effect.
     let offline_telemetry = bridge_coordinator::detached::AttemptTelemetryState::default();
-    let history_store =
-        match selected_history {
-            Ok(store) => {
-                let reservation = bridge_core::workflow_history::AttemptReservation {
-                    identity: identity.clone(),
-                    task_id: None,
-                    workflow: workflow_id.clone(),
-                    task_class: "workflow".into(),
-                    surface: bridge_core::workflow_history::ExecutionSurface::Offline,
-                    policy: "r2f1a".into(),
-                    workload_fingerprint: authority.run_spec.workload_fingerprint.clone(),
-                    started_ms: bridge_core::task_store::system_wall_now_ms(),
-                    workload_fingerprint_complete: true,
-                    prompt_acceptance: "not_dispatched".into(),
-                    pinned: false,
-                };
-                let mut nodes = authority
-                    .run_spec
-                    .graph
-                    .nodes
-                    .iter()
-                    .map(|node| node.id.clone())
-                    .collect::<Vec<_>>();
-                nodes.sort();
-                let expected_node_count = u32::try_from(nodes.len())
-                    .map_err(|_| "run-workflow: structured node roster exceeds u32")?;
-                let nodes = nodes
-                    .into_iter()
-                    .enumerate()
-                    .map(|(ordinal, node)| {
-                        Ok(bridge_core::workflow_history::HistoryNodeReservationV1 {
-                            node,
-                            sorted_ordinal: u32::try_from(ordinal)
-                                .map_err(|_| "run-workflow: structured node ordinal exceeds u32")?,
-                        })
+    let history_store = match selected_history {
+        Ok(store) => {
+            let reservation = bridge_core::workflow_history::AttemptReservation {
+                identity: identity.clone(),
+                task_id: None,
+                workflow: workflow_id.clone(),
+                task_class: "workflow".into(),
+                surface: bridge_core::workflow_history::ExecutionSurface::Offline,
+                policy: "r2f1a".into(),
+                workload_fingerprint: authority.run_spec.workload_fingerprint.clone(),
+                started_ms: bridge_core::task_store::system_wall_now_ms(),
+                workload_fingerprint_complete: true,
+                prompt_acceptance: "not_dispatched".into(),
+                pinned: false,
+            };
+            let mut nodes = authority
+                .run_spec
+                .graph
+                .nodes
+                .iter()
+                .map(|node| node.id.clone())
+                .collect::<Vec<_>>();
+            nodes.sort();
+            let expected_node_count = u32::try_from(nodes.len())
+                .map_err(|_| "run-workflow: structured node roster exceeds u32")?;
+            let nodes = nodes
+                .into_iter()
+                .enumerate()
+                .map(|(ordinal, node)| {
+                    Ok(bridge_core::workflow_history::HistoryNodeReservationV1 {
+                        node,
+                        sorted_ordinal: u32::try_from(ordinal)
+                            .map_err(|_| "run-workflow: structured node ordinal exceeds u32")?,
                     })
-                    .collect::<Result<Vec<_>, &str>>()?;
-                let controls_json =
-                    String::from_utf8(authority.run_spec.controls.encode_canonical().map_err(
-                        |error| format!("run-workflow: controls encoding failed: {error}"),
-                    )?)
-                    .map_err(|_| "run-workflow: controls encoding was not UTF-8")?;
-                let structured_reservation = bridge_core::workflow_history::AttemptReservationV2 {
-                    schema_version:
-                        bridge_core::workflow_history::WORKFLOW_HISTORY_EVIDENCE_SCHEMA_V1,
-                    reservation,
-                    controls_json,
-                    controls_fingerprint: authority.run_spec.controls_fingerprint.clone(),
-                    expected_node_count,
-                    nodes,
-                };
-                match bridge_core::workflow_history::WorkflowHistoryStore::reserve_v2(
+                })
+                .collect::<Result<Vec<_>, &str>>()?;
+            let controls_json = String::from_utf8(
+                authority
+                    .run_spec
+                    .controls
+                    .encode_canonical()
+                    .map_err(|error| format!("run-workflow: controls encoding failed: {error}"))?,
+            )
+            .map_err(|_| "run-workflow: controls encoding was not UTF-8")?;
+            let structured_reservation = bridge_core::workflow_history::AttemptReservationV2 {
+                schema_version: bridge_core::workflow_history::WORKFLOW_HISTORY_EVIDENCE_SCHEMA_V1,
+                reservation,
+                controls_json,
+                controls_fingerprint: authority.run_spec.controls_fingerprint.clone(),
+                expected_node_count,
+                nodes,
+            };
+            match bridge_core::workflow_history::WorkflowHistoryStore::reserve_v2(
                 store.as_ref(),
                 &structured_reservation,
             )
@@ -4252,12 +4254,15 @@ async fn run_workflow_cmd(args: &[String]) -> Result<(), BoxError> {
             {
                 Ok(()) => Some(store),
                 Err(error)
-                    if error.reason
-                        == bridge_core::workflow_history::LedgerUnavailableReason::Collision =>
+                    if matches!(
+                        error.reason,
+                        bridge_core::workflow_history::LedgerUnavailableReason::Collision
+                            | bridge_core::workflow_history::LedgerUnavailableReason::UnsupportedConfiguration
+                    ) =>
                 {
                     return Err(format!(
-                        "run-workflow: attempt identity collision ({})",
-                        identity.attempt_id.as_str()
+                        "run-workflow: history admission failed closed ({})",
+                        error.reason.as_str()
                     )
                     .into());
                 }
@@ -4276,13 +4281,13 @@ async fn run_workflow_cmd(args: &[String]) -> Result<(), BoxError> {
                     None
                 }
             }
-            }
-            Err(error) => {
-                offline_telemetry.record(error.reason);
-                eprintln!("telemetry_unavailable{{reason={}}}", error.reason.as_str());
-                None
-            }
-        };
+        }
+        Err(error) => {
+            offline_telemetry.record(error.reason);
+            eprintln!("telemetry_unavailable{{reason={}}}", error.reason.as_str());
+            None
+        }
+    };
 
     let (harvest_audit_store, harvest_audit_path) = run_workflow_harvest_audit_store(
         &admission_cfg,
@@ -4384,8 +4389,11 @@ async fn run_workflow_cmd(args: &[String]) -> Result<(), BoxError> {
                                 bridge_workflow::fanout::PolicyTriggerBarrierResultV1::PrimaryFailed
                             }
                             Err(error)
-                                if error.reason
-                                    == bridge_core::workflow_history::LedgerUnavailableReason::Collision =>
+                                if matches!(
+                                    error.reason,
+                                    bridge_core::workflow_history::LedgerUnavailableReason::Collision
+                                        | bridge_core::workflow_history::LedgerUnavailableReason::UnsupportedConfiguration
+                                ) =>
                             {
                                 bridge_workflow::fanout::PolicyTriggerBarrierResultV1::PrimaryFailed
                             }

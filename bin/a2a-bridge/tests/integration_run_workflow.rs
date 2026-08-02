@@ -358,7 +358,13 @@ addr = "127.0.0.1:0"
             [],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )
-        .unwrap();
+        .unwrap_or_else(|error| {
+            panic!(
+                "history summary missing ({error:?}); stdout={} stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            )
+        });
     assert_eq!(
         evidence_schema_version,
         i64::from(bridge_core::workflow_history::WORKFLOW_HISTORY_EVIDENCE_SCHEMA_V1),

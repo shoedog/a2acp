@@ -44,6 +44,11 @@ pub enum LedgerUnavailableReason {
     AdvisoryLockIo,
     Locked,
     Migration,
+    /// The configured store uses a physical mode for which the history
+    /// accounting proof is deliberately undefined (for example FULL
+    /// auto-vacuum or an unbounded journal mode). This is a fail-closed
+    /// configuration refusal, not optional telemetry unavailability.
+    UnsupportedConfiguration,
     Schema,
     Corruption,
     Io,
@@ -62,6 +67,7 @@ impl LedgerUnavailableReason {
             Self::AdvisoryLockIo => "advisory_lock_io",
             Self::Locked => "locked",
             Self::Migration => "migration",
+            Self::UnsupportedConfiguration => "unsupported_configuration",
             Self::Schema => "schema",
             Self::Corruption => "corruption",
             Self::Io => "io",

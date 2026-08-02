@@ -88,9 +88,13 @@ fn simultaneous_failures_select_lowest_node_and_attach_trigger_before_emission()
 }
 
 #[test]
-fn collision_is_the_only_offline_error_that_refuses_targeted_policy_action() {
+fn identity_and_configuration_errors_refuse_targeted_policy_action() {
     assert_eq!(
         classify_offline_barrier_error_v1(LedgerUnavailableReason::Collision),
+        PolicyTriggerBarrierResultV1::PrimaryFailed
+    );
+    assert_eq!(
+        classify_offline_barrier_error_v1(LedgerUnavailableReason::UnsupportedConfiguration,),
         PolicyTriggerBarrierResultV1::PrimaryFailed
     );
     assert!(matches!(

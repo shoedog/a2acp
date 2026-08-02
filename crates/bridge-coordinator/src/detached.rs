@@ -5290,16 +5290,27 @@ pub async fn resume_one_working_task(deps: &DetachedDeps, wt: &TaskRecord, cap: 
                 attempt_started,
                 0,
             );
-            if telemetry_unavailable
-                == Some(bridge_core::workflow_history::LedgerUnavailableReason::Collision)
-            {
+            if matches!(
+                telemetry_unavailable,
+                Some(
+                    bridge_core::workflow_history::LedgerUnavailableReason::Collision
+                        | bridge_core::workflow_history::LedgerUnavailableReason::UnsupportedConfiguration
+                )
+            ) {
+                let reason = if telemetry_unavailable
+                    == Some(bridge_core::workflow_history::LedgerUnavailableReason::Collision)
+                {
+                    "attempt identity collision"
+                } else {
+                    "unsupported history configuration"
+                };
                 let _ = finalize_detached_with_barrier(
                     &deps.task_store,
                     &deps.progress_hubs,
                     &task,
                     TaskRecordStatus::Interrupted,
                     None,
-                    Some("attempt identity collision"),
+                    Some(reason),
                     None,
                     Some(&terminal_barrier),
                     "not_needed",

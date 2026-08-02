@@ -1675,8 +1675,11 @@ impl Coordinator {
             } {
                 Ok(()) => (Some(history.clone()), None),
                 Err(error)
-                    if error.reason
-                        == bridge_core::workflow_history::LedgerUnavailableReason::Collision =>
+                    if matches!(
+                        error.reason,
+                        bridge_core::workflow_history::LedgerUnavailableReason::Collision
+                            | bridge_core::workflow_history::LedgerUnavailableReason::UnsupportedConfiguration
+                    ) =>
                 {
                     let _ = self
                         .task_store
@@ -1692,7 +1695,13 @@ impl Coordinator {
                             &task,
                             TaskRecordStatus::Interrupted,
                             None,
-                            Some("attempt identity collision"),
+                            Some(if error.reason
+                                == bridge_core::workflow_history::LedgerUnavailableReason::Collision
+                            {
+                                "attempt identity collision"
+                            } else {
+                                "unsupported history configuration"
+                            }),
                             self.clock.now_ms(),
                         )
                         .await;
@@ -2747,6 +2756,70 @@ mod tests {
 
         async fn interrupt_active(&self, _completed_ms: i64) -> Result<u64, LedgerError> {
             Err(LedgerError::new(LedgerUnavailableReason::Io))
+        }
+
+        async fn latest_reservation_for_task(
+            &self,
+            task: &TaskId,
+        ) -> Result<Option<AttemptReservation>, LedgerError> {
+            self.inner.latest_reservation_for_task(task).await
+        }
+
+        async fn completed_between(
+            &self,
+            start_ms: i64,
+            end_ms: i64,
+        ) -> Result<Vec<CompletedAttempt>, LedgerError> {
+            self.inner.completed_between(start_ms, end_ms).await
+        }
+    }
+
+    #[derive(Default)]
+    struct UnsupportedStructuredAdmissionHistory {
+        inner: MemoryWorkflowHistoryStore,
+    }
+
+    #[async_trait]
+    impl WorkflowHistoryStore for UnsupportedStructuredAdmissionHistory {
+        async fn reserve(&self, row: &AttemptReservation) -> Result<(), LedgerError> {
+            self.inner.reserve(row).await
+        }
+
+        async fn reserve_v2(
+            &self,
+            _row: &bridge_core::workflow_history::AttemptReservationV2,
+        ) -> Result<(), LedgerError> {
+            Err(LedgerError::new(
+                LedgerUnavailableReason::UnsupportedConfiguration,
+            ))
+        }
+
+        async fn mark_prompt_acceptance(
+            &self,
+            id: &bridge_core::ids::AttemptId,
+            acceptance: &str,
+        ) -> Result<(), LedgerError> {
+            self.inner.mark_prompt_acceptance(id, acceptance).await
+        }
+
+        async fn terminalize(
+            &self,
+            id: &bridge_core::ids::AttemptId,
+            terminal: &AttemptTerminal,
+        ) -> Result<TerminalWrite, LedgerError> {
+            self.inner.terminalize(id, terminal).await
+        }
+
+        async fn set_pinned(
+            &self,
+            id: &bridge_core::ids::AttemptId,
+            pinned: bool,
+        ) -> Result<bool, LedgerError> {
+            self.inner.set_pinned(id, pinned).await
+        }
+
+        async fn interrupt_active(&self, completed_ms: i64) -> Result<u64, LedgerError> {
+            self.inner.interrupt_active(completed_ms).await
         }
 
         async fn latest_reservation_for_task(
@@ -5402,6 +5475,59 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(run_spec.attempt_id, locator.identity.attempt_id);
+    }
+
+    #[tokio::test]
+    async fn unsupported_structured_history_refuses_served_workflow_before_provider() {
+        let mut workflows = HashMap::new();
+        workflows.insert(
+            WorkflowId::parse("code-review").unwrap(),
+            workflow("code-review"),
+        );
+        let backend = Arc::new(FakeBackend::new(None));
+        let fixture = coordinator_fixture_with_backend(Arc::new(workflows), backend.clone());
+        let admission = Arc::new(bridge_workflow::admission::WorkflowAdmissionV1::new(
+            fixture.coordinator.registry(),
+            Arc::new(bridge_workflow::admission::DirectWorkflowCheckoutPlannerV1),
+            SessionCwd::parse("/launch").unwrap(),
+            None,
+        ));
+        let coordinator = fixture
+            .coordinator
+            .with_workflow_admission(admission)
+            .with_workflow_history(Ok(Arc::new(
+                UnsupportedStructuredAdmissionHistory::default(),
+            )));
+        let identity = bridge_core::ids::AttemptIdentity::initial().unwrap();
+        let task = TaskId::parse(identity.execution_id.as_str()).unwrap();
+
+        let error = coordinator
+            .run_workflow_with_identity(workflow_params(), identity)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            BridgeError::DurableEvidenceUnavailable {
+                reason: "unsupported_configuration"
+            }
+        ));
+        assert_eq!(backend.prompt_calls.load(AtomicOrdering::SeqCst), 0);
+        let record = fixture.task_store.get(&task).await.unwrap().unwrap();
+        assert_eq!(record.status, TaskRecordStatus::Interrupted);
+        assert_eq!(
+            record.error.as_deref(),
+            Some("unsupported history configuration")
+        );
+        let locator = fixture
+            .task_store
+            .get_attempt_locator(&task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            locator.telemetry_unavailable,
+            Some(LedgerUnavailableReason::UnsupportedConfiguration),
+        );
     }
 
     #[tokio::test]

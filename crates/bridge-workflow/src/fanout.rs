@@ -83,7 +83,9 @@ pub fn classify_offline_barrier_error_v1(
         | LedgerUnavailableReason::CapacityProtected => {
             PolicyTriggerBarrierResultV1::OfflineTelemetryUnavailable { reason }
         }
-        LedgerUnavailableReason::Collision => PolicyTriggerBarrierResultV1::PrimaryFailed,
+        LedgerUnavailableReason::Collision | LedgerUnavailableReason::UnsupportedConfiguration => {
+            PolicyTriggerBarrierResultV1::PrimaryFailed
+        }
     }
 }
 
@@ -253,9 +255,11 @@ impl FanOutControllerV1 {
         let authorized = match result {
             PolicyTriggerBarrierResultV1::ServedPrimaryCommitted
             | PolicyTriggerBarrierResultV1::OfflineHistoryCommitted => true,
-            PolicyTriggerBarrierResultV1::OfflineTelemetryUnavailable { reason } => {
-                reason != LedgerUnavailableReason::Collision
-            }
+            PolicyTriggerBarrierResultV1::OfflineTelemetryUnavailable { reason } => !matches!(
+                reason,
+                LedgerUnavailableReason::Collision
+                    | LedgerUnavailableReason::UnsupportedConfiguration
+            ),
             PolicyTriggerBarrierResultV1::PrimaryFailed => false,
         };
         if !authorized {
