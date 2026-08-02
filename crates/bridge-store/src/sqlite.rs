@@ -20585,12 +20585,11 @@ mod r2f0a_history_tests {
         assert_ne!(boot.state, crate::history_accounting::TICKET_STATE_RESERVED);
         assert!(tickets
             .iter()
-            .filter(|ticket| {
+            .find(|ticket| {
                 ticket.attempt_id == attempt.as_str()
                     && ticket.kind == crate::history_accounting::MutationKindV2::NodeTerminal
                     && ticket.state == crate::history_accounting::TICKET_STATE_RESERVED
             })
-            .next()
             .is_none());
         let status: String = conn
             .query_row(

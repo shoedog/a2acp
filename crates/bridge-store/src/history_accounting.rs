@@ -553,7 +553,7 @@ pub(crate) fn measure_history_pages(
             .checked_add(pgsize)
             .ok_or_else(|| LedgerError::new(R::Corruption))?;
     }
-    if bytes % page_size != 0 {
+    if !bytes.is_multiple_of(page_size) {
         return Err(LedgerError::new(R::Corruption));
     }
     Ok(MeasuredHistoryPagesV2 {
