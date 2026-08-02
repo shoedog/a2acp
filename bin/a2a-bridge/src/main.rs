@@ -4020,6 +4020,17 @@ async fn run_workflow_cmd(args: &[String]) -> Result<(), BoxError> {
             opened
         }
     };
+    if let Err(error) = &selected_history {
+        if error.reason
+            == bridge_core::workflow_history::LedgerUnavailableReason::UnsupportedConfiguration
+        {
+            return Err(format!(
+                "run-workflow: history admission failed closed ({})",
+                error.reason.as_str()
+            )
+            .into());
+        }
+    }
     let configured_harvest_store = cfg
         .store
         .as_ref()
@@ -9413,6 +9424,203 @@ inputs = []
                 }
             }
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn offline_full_auto_vacuum_refuses_before_provider_effect() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        const TEST_NAME: &str =
+            "cli_tests::offline_full_auto_vacuum_refuses_before_provider_effect";
+
+        if std::env::var_os("A2A_BRIDGE_TEST_OFFLINE_FULL_VACUUM_CHILD").is_some() {
+            let config = PathBuf::from(
+                std::env::var_os("A2A_BRIDGE_TEST_OFFLINE_FULL_VACUUM_CONFIG").unwrap(),
+            );
+            let input = PathBuf::from(
+                std::env::var_os("A2A_BRIDGE_TEST_OFFLINE_FULL_VACUUM_INPUT").unwrap(),
+            );
+            let session_cwd =
+                PathBuf::from(std::env::var_os("A2A_BRIDGE_TEST_OFFLINE_FULL_VACUUM_CWD").unwrap());
+            let error = run_workflow_cmd(&[
+                "probe".into(),
+                "--input".into(),
+                input.to_string_lossy().into_owned(),
+                "--session-cwd".into(),
+                session_cwd.to_string_lossy().into_owned(),
+                "--config".into(),
+                config.to_string_lossy().into_owned(),
+            ])
+            .await
+            .expect_err("unsupported configured history must fail closed");
+            assert_eq!(
+                error.to_string(),
+                "run-workflow: history admission failed closed (unsupported_configuration)"
+            );
+            return;
+        }
+
+        fn wait_bounded(child: std::process::Child) -> std::process::Output {
+            let pid = child.id();
+            let (tx, rx) = std::sync::mpsc::sync_channel(1);
+            std::thread::spawn(move || {
+                let _ = tx.send(child.wait_with_output());
+            });
+            match rx.recv_timeout(std::time::Duration::from_secs(15)) {
+                Ok(output) => output.unwrap(),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    unsafe {
+                        libc::kill(pid as libc::pid_t, libc::SIGKILL);
+                    }
+                    rx.recv_timeout(std::time::Duration::from_secs(5))
+                        .expect("killed offline child was not reaped")
+                        .expect("wait for killed offline child")
+                }
+                Err(error) => panic!("offline child waiter failed: {error}"),
+            }
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let history_path = directory.path().join("full-auto-vacuum.sqlite");
+        {
+            let connection = rusqlite::Connection::open(&history_path).unwrap();
+            connection
+                .execute_batch(
+                    "PRAGMA auto_vacuum=FULL;
+                     VACUUM;
+                     CREATE TABLE unrelated_primary(id INTEGER PRIMARY KEY, payload BLOB);
+                     INSERT INTO unrelated_primary(payload) VALUES(zeroblob(8192));",
+                )
+                .unwrap();
+            assert_eq!(
+                connection
+                    .query_row("PRAGMA auto_vacuum", [], |row| row.get::<_, i64>(0))
+                    .unwrap(),
+                1,
+            );
+        }
+        let before = std::fs::read(&history_path).unwrap();
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let provider_addr = listener.local_addr().unwrap();
+        let provider_seen = std::sync::Arc::new(AtomicBool::new(false));
+        let provider_stop = std::sync::Arc::new(AtomicBool::new(false));
+        let thread_seen = std::sync::Arc::clone(&provider_seen);
+        let thread_stop = std::sync::Arc::clone(&provider_stop);
+        let provider = std::thread::spawn(move || {
+            use std::io::{Read as _, Write as _};
+
+            while !thread_stop.load(Ordering::SeqCst) {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        thread_seen.store(true, Ordering::SeqCst);
+                        stream
+                            .set_read_timeout(Some(std::time::Duration::from_secs(1)))
+                            .unwrap();
+                        let mut request = [0_u8; 1024];
+                        let _ = stream.read(&mut request);
+                        let _ = stream.write_all(
+                            b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                        );
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                    Err(error) => panic!("fake provider listener failed: {error}"),
+                }
+            }
+        });
+
+        let config_path = directory.path().join("a2a-bridge.toml");
+        let prompt_path = directory.path().join("prompt.md");
+        let input_path = directory.path().join("input.md");
+        let session_cwd = directory.path().join("cwd");
+        let home = directory.path().join("home");
+        let state_root = directory.path().join("state");
+        let lease_root = directory.path().join("leases");
+        let temp_root = directory.path().join("tmp");
+        std::fs::create_dir(&session_cwd).unwrap();
+        std::fs::create_dir(&temp_root).unwrap();
+        std::fs::write(&prompt_path, "{{input}}\nReply exactly PONG.\n").unwrap();
+        std::fs::write(
+            &input_path,
+            "---\ntask-type: freeform\n---\noffline probe\n",
+        )
+        .unwrap();
+        std::fs::write(
+            &config_path,
+            format!(
+                r#"default = "api"
+
+[registry]
+allowed_cmds = []
+
+[server]
+addr = "127.0.0.1:0"
+
+[store]
+path = {:?}
+
+[[agents]]
+id = "api"
+kind = "api"
+base_url = "http://{provider_addr}/v1"
+api_key_env = "A2A_BRIDGE_TEST_OFFLINE_FULL_VACUUM_API_KEY"
+model = "test-model"
+
+[[workflows]]
+id = "probe"
+[[workflows.nodes]]
+id = "node"
+agent = "api"
+prompt_file = {:?}
+inputs = []
+"#,
+                history_path, prompt_path
+            ),
+        )
+        .unwrap();
+
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .arg(TEST_NAME)
+            .arg("--exact")
+            .arg("--nocapture")
+            .env("HOME", &home)
+            .env("TMPDIR", &temp_root)
+            .env("A2A_BRIDGE_STATE_DIR", &state_root)
+            .env("A2A_LEASE_DIR", &lease_root)
+            .env(
+                "A2A_BRIDGE_TEST_OFFLINE_FULL_VACUUM_API_KEY",
+                "private-test-value",
+            )
+            .env("A2A_BRIDGE_TEST_OFFLINE_FULL_VACUUM_CHILD", "1")
+            .env("A2A_BRIDGE_TEST_OFFLINE_FULL_VACUUM_CONFIG", &config_path)
+            .env("A2A_BRIDGE_TEST_OFFLINE_FULL_VACUUM_INPUT", &input_path)
+            .env("A2A_BRIDGE_TEST_OFFLINE_FULL_VACUUM_CWD", &session_cwd)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        let output = wait_bounded(command.spawn().unwrap());
+        provider_stop.store(true, Ordering::SeqCst);
+        provider.join().unwrap();
+
+        assert_eq!(
+            std::fs::read(&history_path).unwrap(),
+            before,
+            "offline refusal changed configured database bytes"
+        );
+        assert!(
+            !provider_seen.load(Ordering::SeqCst),
+            "unsupported history reached the provider endpoint"
+        );
+        assert!(
+            output.status.success(),
+            "offline refusal child failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     #[cfg(unix)]

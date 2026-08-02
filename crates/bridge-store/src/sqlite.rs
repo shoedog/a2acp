@@ -7665,12 +7665,23 @@ fn validate_v2_allocation_namespace(
         .iter()
         .copied()
         .collect::<HashSet<_>>();
+    let is_reserved_history_name = |name: &str| {
+        let name = name.to_ascii_lowercase();
+        name.starts_with("workflow_history_") || name.starts_with("workflow_attempt_")
+    };
+    let is_history_root = |name: &str| {
+        names
+            .iter()
+            .any(|candidate| candidate.eq_ignore_ascii_case(name))
+    };
+    let is_authority_root = |name: &str| {
+        name.eq_ignore_ascii_case("attempt_identities")
+            || name.eq_ignore_ascii_case("task_attempt_locators")
+    };
     let objects = {
         let mut statement = conn.prepare(
             "SELECT type, name, tbl_name FROM sqlite_schema
              WHERE type IN ('table','index','trigger')
-               AND (name COLLATE NOCASE GLOB 'workflow_history_*'
-                    OR name COLLATE NOCASE GLOB 'workflow_attempt_*')
              ORDER BY type, name",
         )?;
         let rows = statement.query_map([], |row| {
@@ -7683,37 +7694,40 @@ fn validate_v2_allocation_namespace(
         rows.collect::<Result<Vec<_>, _>>()?
     };
     for (object_type, name, table) in objects {
-        let classified = match object_type.as_str() {
-            "table" => names.contains(name.as_str()),
-            "index" => names.contains(table.as_str()),
+        let invalid = match object_type.as_str() {
+            "table" => is_reserved_history_name(&name) && !names.contains(name.as_str()),
+            "index" => is_reserved_history_name(&name) && !names.contains(table.as_str()),
             // A trigger can dirty roots that are not visible from the top-level
             // statement; V2 admits none on history or its co-mutated authority.
-            "trigger" => false,
-            _ => false,
+            "trigger" => {
+                is_reserved_history_name(&name)
+                    || is_history_root(&table)
+                    || is_authority_root(&table)
+            }
+            _ => true,
         };
-        if !classified {
+        if invalid {
             return Err(SchemaMigrationError::Validation(
                 MigrationValidationError::AllocationSchema,
             ));
         }
     }
-    let authority_triggers: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM sqlite_schema
-         WHERE type='trigger' AND tbl_name IN ('attempt_identities','task_attempt_locators')",
-        [],
-        |row| row.get(0),
-    )?;
-    if authority_triggers != 0 {
-        return Err(SchemaMigrationError::Validation(
-            MigrationValidationError::AllocationSchema,
-        ));
-    }
-
-    for table in HISTORY_ALLOCATION_TABLES_V2 {
-        let mut statement = conn.prepare(&format!("PRAGMA foreign_key_list('{table}')"))?;
-        let rows = statement.query_map([], |row| row.get::<_, String>(2))?;
+    let tables = {
+        let mut statement =
+            conn.prepare("SELECT name FROM sqlite_schema WHERE type='table' ORDER BY name")?;
+        let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+        rows.collect::<Result<Vec<_>, _>>()?
+    };
+    for table in tables {
+        if table.to_ascii_lowercase().starts_with("sqlite_") {
+            continue;
+        }
+        let child_is_history = is_history_root(&table);
+        let mut statement = conn.prepare("SELECT \"table\" FROM pragma_foreign_key_list(?1)")?;
+        let rows = statement.query_map(rusqlite::params![table], |row| row.get::<_, String>(0))?;
         for target in rows {
-            if !names.contains(target?.as_str()) {
+            let target = target?;
+            if child_is_history != is_history_root(&target) {
                 return Err(SchemaMigrationError::Validation(
                     MigrationValidationError::AllocationSchema,
                 ));
@@ -11101,7 +11115,22 @@ impl SqliteStore {
             .filter(|ticket| ticket.attempt_id == victim.as_str())
             .collect::<Vec<_>>();
         if victim_tickets.is_empty() {
-            return Err(LedgerError::new(R::Corruption));
+            let schema_version: Option<i64> = tx
+                .query_row(
+                    "SELECT evidence_schema_version FROM workflow_attempt_summaries
+                     WHERE attempt_id=?1",
+                    rusqlite::params![victim.as_str()],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(|error| history_attempt_read_error(&error))?;
+            // A V1 survivor migrated into the V2 allocation predates mutation
+            // tickets. Only that coherent legacy shape may be reclaimed with
+            // an empty ticket set; structured or absent victims remain corrupt.
+            if schema_version != Some(0) || load_structured_history_evidence(tx, victim)?.is_some()
+            {
+                return Err(LedgerError::new(R::Corruption));
+            }
         }
         let carried_debt =
             if mutation.regime == accounting::JournalRegimeV2::Wal && !wal_reset_proven {
@@ -20685,6 +20714,192 @@ mod r2f0a_history_tests {
             ticket.attempt_id == crate::history_accounting::MAINTENANCE_TICKET_OWNER
                 && ticket.ordinal == 1
         }));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn configured_v2_retention_reclaims_migrated_legacy_terminal_without_tickets() {
+        use bridge_core::workflow_history::{WorkflowHistoryStore as _, RETENTION_DAYS};
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory
+            .path()
+            .join("configured-v2-legacy-retention.sqlite");
+        let store = SqliteStore::open_shared_history(&path).unwrap();
+        let legacy = reservation_with_ids(
+            "exec-ea111111111111111111111111111111",
+            "attempt-ea111111111111111111111111111111",
+        );
+        let legacy_id = legacy.identity.attempt_id.clone();
+        store.reserve(&legacy).await.unwrap();
+        store.terminalize(&legacy_id, &terminal()).await.unwrap();
+
+        let migration = structured_history_reservation_with_ids(
+            "exec-ea222222222222222222222222222222",
+            "attempt-ea222222222222222222222222222222",
+        );
+        store.reserve_v2(&migration).await.unwrap();
+        assert_eq!(store.interrupt_active(4_000).await.unwrap(), 1);
+        {
+            let connection = store.conn.lock().unwrap();
+            let legacy_state: (i64, i64) = connection
+                .query_row(
+                    "SELECT evidence_schema_version,
+                            (SELECT COUNT(*) FROM workflow_history_mutation_reserve
+                             WHERE attempt_id=?1)
+                     FROM workflow_attempt_summaries WHERE attempt_id=?1",
+                    rusqlite::params![legacy_id.as_str()],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(legacy_state, (0, 0));
+        }
+
+        let mut replacement = structured_history_reservation_with_ids(
+            "exec-ea333333333333333333333333333333",
+            "attempt-ea333333333333333333333333333333",
+        );
+        replacement.reservation.started_ms = 4_000 + RETENTION_DAYS * 24 * 60 * 60 * 1_000 + 1;
+        let replacement_id = replacement.reservation.identity.attempt_id.clone();
+        store.reserve_v2(&replacement).await.unwrap();
+
+        assert!(store.attempt(&legacy_id).await.unwrap().is_none());
+        assert!(store.attempt(&replacement_id).await.unwrap().is_some());
+        validate_tagged_history_allocation_v2(
+            &store.conn.lock().unwrap(),
+            HistoryAllocationKind::Configured,
+            false,
+        )
+        .unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn configured_v2_ticketless_structured_terminal_remains_corruption() {
+        use bridge_core::workflow_history::LedgerUnavailableReason as R;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory
+            .path()
+            .join("configured-v2-ticketless-structured.sqlite");
+        let store = SqliteStore::open_shared_history(&path).unwrap();
+        let reservation = structured_history_reservation_with_ids(
+            "exec-ea444444444444444444444444444444",
+            "attempt-ea444444444444444444444444444444",
+        );
+        let attempt = reservation.reservation.identity.attempt_id.clone();
+        store.reserve_v2(&reservation).await.unwrap();
+        assert_eq!(store.interrupt_active(4_000).await.unwrap(), 1);
+        drop(store);
+
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        connection
+            .execute(
+                "DELETE FROM workflow_history_mutation_reserve WHERE attempt_id=?1",
+                rusqlite::params![attempt.as_str()],
+            )
+            .unwrap();
+        drop(connection);
+        let before = allocation_fixture_snapshot(&path);
+
+        let error = SqliteStore::open_shared_history(&path)
+            .err()
+            .expect("structured evidence may not lose its mutation tickets");
+        assert_eq!(error.reason, R::Corruption);
+        assert_eq!(allocation_fixture_snapshot(&path), before);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn configured_v2_rejects_arbitrary_trigger_name_on_history_root_without_writes() {
+        use bridge_core::workflow_history::LedgerUnavailableReason as R;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory
+            .path()
+            .join("configured-v2-history-trigger.sqlite");
+        let store = SqliteStore::open_shared_history(&path).unwrap();
+        let reservation = structured_history_reservation_with_ids(
+            "exec-ea555555555555555555555555555555",
+            "attempt-ea555555555555555555555555555555",
+        );
+        store.reserve_v2(&reservation).await.unwrap();
+        assert_eq!(store.interrupt_active(4_000).await.unwrap(), 1);
+        drop(store);
+
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE unrelated_history_audit(value TEXT NOT NULL);
+                 CREATE TRIGGER audit_any_name
+                 AFTER DELETE ON workflow_attempt_summaries
+                 BEGIN
+                     INSERT INTO unrelated_history_audit(value) VALUES(OLD.attempt_id);
+                 END;",
+            )
+            .unwrap();
+        drop(connection);
+        let before = allocation_fixture_snapshot(&path);
+
+        let error = SqliteStore::open_shared_history(&path)
+            .err()
+            .expect("a trigger targeting an allocation root must be rejected");
+        assert_eq!(error.reason, R::Migration);
+        assert_eq!(allocation_fixture_snapshot(&path), before);
+        let audit_rows: i64 = rusqlite::Connection::open(&path)
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM unrelated_history_audit", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(audit_rows, 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn configured_v2_rejects_outside_child_foreign_key_to_history_root_without_writes() {
+        use bridge_core::workflow_history::LedgerUnavailableReason as R;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory
+            .path()
+            .join("configured-v2-reverse-foreign-key.sqlite");
+        let store = SqliteStore::open_shared_history(&path).unwrap();
+        let reservation = structured_history_reservation_with_ids(
+            "exec-ea666666666666666666666666666666",
+            "attempt-ea666666666666666666666666666666",
+        );
+        let attempt = reservation.reservation.identity.attempt_id.clone();
+        store.reserve_v2(&reservation).await.unwrap();
+        assert_eq!(store.interrupt_active(4_000).await.unwrap(), 1);
+        drop(store);
+
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE unrelated_history_child(
+                     attempt_id TEXT PRIMARY KEY
+                         REFERENCES workflow_attempt_summaries(attempt_id) ON DELETE CASCADE
+                 );",
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO unrelated_history_child(attempt_id) VALUES(?1)",
+                rusqlite::params![attempt.as_str()],
+            )
+            .unwrap();
+        drop(connection);
+        let before = allocation_fixture_snapshot(&path);
+
+        let error = SqliteStore::open_shared_history(&path)
+            .err()
+            .expect("an outside child referencing an allocation root must be rejected");
+        assert_eq!(error.reason, R::Migration);
+        assert_eq!(allocation_fixture_snapshot(&path), before);
+        let child_rows: i64 = rusqlite::Connection::open(&path)
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM unrelated_history_child", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(child_rows, 1);
     }
 
     #[tokio::test(flavor = "current_thread")]
