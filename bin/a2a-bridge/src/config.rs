@@ -1265,6 +1265,7 @@ pub struct LanguageToml {
     pub dep_cache_path: String,
     pub verify_cache_path: String,
     pub lsp_env: Option<std::collections::BTreeMap<String, String>>,
+    pub writer_env: Option<std::collections::BTreeMap<String, String>>,
     pub verify_env: Option<std::collections::BTreeMap<String, String>>,
     pub image: Option<String>,
     #[serde(default)]
@@ -2150,6 +2151,7 @@ impl LanguageToml {
             self.verify_cache_path.clone(),
             map_pairs(&self.fetch_env),
             map_pairs(&self.lsp_env),
+            map_pairs(&self.writer_env),
             map_pairs(&self.verify_env),
             self.image.clone(),
             self.verify
@@ -3389,10 +3391,10 @@ addr="127.0.0.1:8080"
         let build = ("build", "cargo build --locked", true);
         let bridge_test = (
             "test",
-            "cargo test --workspace --locked --exclude bridge-container -- --skip process::tests::terminate_reaps_child_no_zombie --skip process::tests::term_ignoring_loop_forces_group_sigkill --skip process::tests::drop_group_kills_descendants",
+            "cargo test --workspace --locked --no-fail-fast --exclude bridge-container -- --skip process::tests::terminate_reaps_child_no_zombie --skip process::tests::term_ignoring_loop_forces_group_sigkill --skip process::tests::drop_group_kills_descendants",
             true,
         );
-        let slicing_test = ("test", "cargo test --locked", true);
+        let slicing_test = ("test", "cargo test --locked --no-fail-fast", true);
         let cases = [
             (
                 include_str!("../../../examples/a2a-bridge.containerized.toml"),
@@ -3419,6 +3421,53 @@ addr="127.0.0.1:8080"
                 .map(|c| (c.name.as_str(), c.cmd.as_str(), c.gate))
                 .collect();
             assert_eq!(got, expected);
+        }
+    }
+
+    #[test]
+    fn tracked_container_profiles_give_the_writer_offline_dependency_access() {
+        for raw in [
+            include_str!("../../../examples/a2a-bridge.containerized.toml"),
+            include_str!("../../../examples/a2a-bridge.containerized.podman.toml"),
+        ] {
+            let profiles = RegistryConfig::parse(raw)
+                .unwrap()
+                .language_profiles()
+                .unwrap();
+            let binding = |id: &str| {
+                profiles
+                    .iter()
+                    .find(|profile| profile.id == id)
+                    .unwrap()
+                    .cache_binding(bridge_core::profile::CacheCtx::Writer, "warm", "")
+            };
+
+            let rust = binding("rust");
+            assert!(rust.env.contains(&("CARGO_HOME".into(), "/cargo".into())));
+            assert!(rust
+                .env
+                .contains(&("CARGO_NET_OFFLINE".into(), "true".into())));
+            assert_eq!(rust.mounts, vec!["warm:/cargo:ro"]);
+
+            let go = binding("go");
+            assert!(go
+                .env
+                .contains(&("GOMODCACHE".into(), "/go/pkg/mod".into())));
+            assert!(go.env.contains(&("GOFLAGS".into(), "-mod=readonly".into())));
+
+            let python = binding("python");
+            assert!(python
+                .env
+                .contains(&("UV_PROJECT_ENVIRONMENT".into(), "/pyvenv".into())));
+            assert!(python.env.contains(&("UV_OFFLINE".into(), "true".into())));
+
+            let typescript = binding("typescript");
+            assert!(typescript
+                .env
+                .contains(&("NODE_PATH".into(), "/node_modules".into())));
+            assert!(typescript
+                .env
+                .contains(&("npm_config_offline".into(), "true".into())));
         }
     }
 

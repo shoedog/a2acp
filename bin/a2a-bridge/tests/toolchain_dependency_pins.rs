@@ -4,6 +4,20 @@ use std::path::{Path, PathBuf};
 const GLOBAL_BASEDPYRIGHT_PIN: &str = "npm install -g basedpyright@1.39.8";
 const MISE_BASEDPYRIGHT_SELECTOR: &str = "npm:basedpyright@";
 const RELOCATED_BASEDPYRIGHT_LOOKUP: &str = "mise which basedpyright";
+const TOOLCHAIN_GIT_VERSION: &str = "ARG GIT_VERSION=2.54.0";
+const TOOLCHAIN_GIT_SHA256: &str =
+    "ARG GIT_SHA256=f689162364c10de79ef89aa8dbf48731eb057e34edbbd20aca510ce0154681a3";
+const LOGIN_SHELL_RUST_TOOLS: &[&str] = &[
+    "cargo",
+    "rustc",
+    "rustfmt",
+    "rustup",
+    "clippy-driver",
+    "cargo-clippy",
+    "rust-analyzer",
+    "cargo-llvm-cov",
+    "cargo-tarpaulin",
+];
 
 fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
@@ -53,6 +67,32 @@ fn toolchain_installs_basedpyright_without_relocating_a_mise_npm_shim() {
             path.display()
         )
     });
+}
+
+#[test]
+fn toolchain_exposes_rust_tools_on_the_login_shell_path() {
+    let path = repo_root().join("deploy/containers/toolchain.Containerfile");
+    let containerfile = fs::read_to_string(&path).unwrap();
+    for tool in LOGIN_SHELL_RUST_TOOLS {
+        assert!(
+            containerfile.contains("/usr/local/cargo/bin/$t\" \"/usr/local/bin/$t")
+                && containerfile.contains(tool),
+            "{} must expose {tool} through /usr/local/bin",
+            path.display()
+        );
+    }
+}
+
+#[test]
+fn toolchain_pins_git_with_explicit_merge_base_support() {
+    let path = repo_root().join("deploy/containers/toolchain.Containerfile");
+    let containerfile = fs::read_to_string(&path).unwrap();
+    assert!(containerfile.contains(TOOLCHAIN_GIT_VERSION));
+    assert!(containerfile.contains(TOOLCHAIN_GIT_SHA256));
+    assert!(containerfile.contains("sha256sum -c -"));
+    assert!(containerfile.contains("COPY --from=gitbuild /opt/git /opt/git"));
+    assert!(containerfile.contains("ENV PATH=/opt/git/bin:$PATH"));
+    assert!(containerfile.contains("ln -sf /opt/git/bin/git /usr/local/bin/git"));
 }
 
 #[test]

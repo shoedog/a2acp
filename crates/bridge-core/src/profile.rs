@@ -10,6 +10,8 @@ pub enum CacheCtx {
     Fetch,
     /// The in-container language server (reads the dep cache; offline).
     Lsp,
+    /// The write-capable implementor process (reads the dep cache; offline).
+    Writer,
     /// The verify container (build/test against a persistent cache).
     Verify,
 }
@@ -48,6 +50,8 @@ pub struct LanguageProfile {
     fetch_env: Vec<(String, String)>,
     /// Env exported in the Lsp container. Empty in Step 1 (the lsp env is still config-side).
     lsp_env: Vec<(String, String)>,
+    /// Env exported to the implementor process after a successful warm fetch.
+    writer_env: Vec<(String, String)>,
     /// Env exported in the Verify container.
     verify_env: Vec<(String, String)>,
     /// Optional per-profile container image override (default: `[verify].image`).
@@ -70,6 +74,10 @@ impl LanguageProfile {
                 env: self.lsp_env.clone(),
                 mounts: vec![format!("{warm_vol}:{}:ro", self.dep_cache_path)],
             },
+            CacheCtx::Writer => CacheBinding {
+                env: self.writer_env.clone(),
+                mounts: vec![format!("{warm_vol}:{}:ro", self.dep_cache_path)],
+            },
             CacheCtx::Verify => CacheBinding {
                 env: self.verify_env.clone(),
                 mounts: vec![format!("{verify_vol}:{}", self.verify_cache_path)],
@@ -88,6 +96,7 @@ impl LanguageProfile {
         verify_cache_path: String,
         fetch_env: Vec<(String, String)>,
         lsp_env: Vec<(String, String)>,
+        writer_env: Vec<(String, String)>,
         verify_env: Vec<(String, String)>,
         image: Option<String>,
         verify_commands: Vec<VerifyCommand>,
@@ -100,6 +109,7 @@ impl LanguageProfile {
             verify_cache_path,
             fetch_env,
             lsp_env,
+            writer_env,
             verify_env,
             image,
             verify_commands,
@@ -117,6 +127,7 @@ pub fn rust_profile() -> LanguageProfile {
         verify_cache_path: "/cache".to_string(),
         fetch_env: vec![("CARGO_HOME".to_string(), "/cargo".to_string())],
         lsp_env: vec![], // Step 1: lsp env stays config-side (the agent MCP env).
+        writer_env: vec![],
         verify_env: vec![
             ("CARGO_HOME".to_string(), "/cache/cargo".to_string()),
             ("CARGO_TARGET_DIR".to_string(), "/cache/target".to_string()),
@@ -140,7 +151,7 @@ pub fn rust_profile() -> LanguageProfile {
             },
             VerifyCommand {
                 name: "test".into(),
-                cmd: "cargo test --workspace --locked --exclude bridge-container -- --skip process::tests::terminate_reaps_child_no_zombie --skip process::tests::term_ignoring_loop_forces_group_sigkill --skip process::tests::drop_group_kills_descendants".into(),
+                cmd: "cargo test --workspace --locked --no-fail-fast --exclude bridge-container -- --skip process::tests::terminate_reaps_child_no_zombie --skip process::tests::term_ignoring_loop_forces_group_sigkill --skip process::tests::drop_group_kills_descendants".into(),
                 gate: true,
             },
         ],
@@ -169,6 +180,26 @@ mod tests {
         let b = p.cache_binding(CacheCtx::Lsp, "warmvol", "verifyvol");
         assert!(b.env.is_empty(), "lsp env stays config-side in Step 1");
         assert_eq!(b.mounts, vec!["warmvol:/cargo:ro".to_string()]);
+    }
+
+    #[test]
+    fn writer_binding_is_read_only_and_uses_only_writer_env() {
+        let p = LanguageProfile::from_parts(
+            "rust".into(),
+            "cargo fetch --locked".into(),
+            "warm".into(),
+            "/cargo".into(),
+            "/cache".into(),
+            vec![],
+            vec![("LSP_ONLY".into(), "yes".into())],
+            vec![("CARGO_HOME".into(), "/cargo".into())],
+            vec![],
+            None,
+            vec![],
+        );
+        let b = p.cache_binding(CacheCtx::Writer, "warmvol", "verifyvol");
+        assert_eq!(b.env, vec![("CARGO_HOME".into(), "/cargo".into())]);
+        assert_eq!(b.mounts, vec!["warmvol:/cargo:ro"]);
     }
 
     #[test]
@@ -208,7 +239,7 @@ mod tests {
                 VerifyCommand { name: "build".into(), cmd: "cargo build --locked".into(), gate: true },
                 VerifyCommand {
                     name: "test".into(),
-                    cmd: "cargo test --workspace --locked --exclude bridge-container -- --skip process::tests::terminate_reaps_child_no_zombie --skip process::tests::term_ignoring_loop_forces_group_sigkill --skip process::tests::drop_group_kills_descendants".into(),
+                    cmd: "cargo test --workspace --locked --no-fail-fast --exclude bridge-container -- --skip process::tests::terminate_reaps_child_no_zombie --skip process::tests::term_ignoring_loop_forces_group_sigkill --skip process::tests::drop_group_kills_descendants".into(),
                     gate: true,
                 },
             ]

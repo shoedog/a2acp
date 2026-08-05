@@ -69,6 +69,7 @@ verify_env = { CARGO_HOME = "/cache/cargo", CARGO_TARGET_DIR = "/cache/target" }
 # resolve a toolchain ("rustup could not choose a version"), RA never answers LSP initialize, lsp-mcp times
 # out + exits, and codex reports "no lsp tool" for rust. gopls is a direct binary so it was unaffected (#1d).
 lsp_env = { CARGO_HOME = "/cargo", CARGO_NET_OFFLINE = "true", RUSTUP_HOME = "/usr/local/rustup" }
+writer_env = { CARGO_HOME = "/cargo", CARGO_NET_OFFLINE = "true", RUSTUP_HOME = "/usr/local/rustup" }
 [[languages.verify]]
 name = "fmt"
 cmd  = "cargo fmt --all -- --check"
@@ -87,7 +88,7 @@ name = "test"
 #   --skip process::tests::{terminate_reaps_child_no_zombie,term_ignoring_loop_forces_group_sigkill,drop_group_kills_descendants}:
 #     the supervisor's zombie-reaping + process-group-SIGKILL/drop tests need host PID-1/signal semantics
 #     and a host-visible process table (container PID namespace breaks the grandchild-visibility precondition).
-cmd  = "cargo test --workspace --locked --exclude bridge-container -- --skip process::tests::terminate_reaps_child_no_zombie --skip process::tests::term_ignoring_loop_forces_group_sigkill --skip process::tests::drop_group_kills_descendants"
+cmd  = "cargo test --workspace --locked --no-fail-fast --exclude bridge-container -- --skip process::tests::terminate_reaps_child_no_zombie --skip process::tests::term_ignoring_loop_forces_group_sigkill --skip process::tests::drop_group_kills_descendants"
 # opt-in coverage (instrumented recompile; reported, never gates):
 # [[languages.verify]]
 # name = "coverage"
@@ -103,6 +104,7 @@ verify_cache_path = "/cache"
 fetch_env = { GOMODCACHE = "/go/pkg/mod", GOFLAGS = "-mod=mod" }
 verify_env = { GOMODCACHE = "/cache/gomodcache", GOCACHE = "/cache/go-build", GOFLAGS = "-mod=readonly" }
 lsp_env = { GOMODCACHE = "/go/pkg/mod", GOFLAGS = "-mod=mod" }
+writer_env = { GOMODCACHE = "/go/pkg/mod", GOFLAGS = "-mod=readonly", GOTOOLCHAIN = "local" }
 [[languages.verify]]
 name = "gofmt"
 cmd  = "test -z \"$(gofmt -l .)\""
@@ -131,6 +133,7 @@ verify_env = { UV_CACHE_DIR = "/cache/uv", RUFF_CACHE_DIR = "/cache/ruff" }
 # basedpyright reads site-packages via this interpreter. PATH not needed (binaries symlinked to /usr/local/bin,
 # already on codex's stripped PATH). PYTHONDONTWRITEBYTECODE guards a __pycache__ write under the :ro venv.
 lsp_env = { LSP_MCP_PYTHON_PATH = "/pyvenv/bin/python", PYTHONDONTWRITEBYTECODE = "1" }
+writer_env = { UV_PROJECT_ENVIRONMENT = "/pyvenv", UV_OFFLINE = "true", VIRTUAL_ENV = "/pyvenv", PYTHONDONTWRITEBYTECODE = "1" }
 [[languages.verify]]
 name = "format"
 cmd  = "ruff format --check ."
@@ -160,6 +163,7 @@ verify_env = { npm_config_cache = "/cache/npm" }
 # stripped-env path; a host/image env would NOT — see containerized-mcp-env-trap). Default: unset → tsls.
 # (tsserver's typescript-lib path, if needed, goes in initialize_params, NOT lsp_env — see Layer 1.)
 lsp_env = {}   # e.g. { LSP_MCP_TS_SERVER = "/usr/local/bin/vtsls" } to swap
+writer_env = { NODE_PATH = "/node_modules", npm_config_offline = "true" }
 [[languages.verify]]
 # B1: verify installs deps into the /node_modules verify vol (copy manifests + npm ci), THEN tsc resolves
 # via the root-walk. Mirrors python's verify-venv-into-/cache.

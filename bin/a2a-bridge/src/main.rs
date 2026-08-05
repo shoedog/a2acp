@@ -2737,6 +2737,37 @@ fn apply_warm_lsp(
     volumes.push(format!("{target_vol}:/lsp-target"));
 }
 
+/// Give the main write-capable agent process the selected profile's offline dependency environment.
+/// The dependency volume is already mounted read-only by [`apply_warm_lsp`]; this only selects it for
+/// shell commands by wrapping the inner ACP command as `env K=V ... <agent> <args>`. The wrapper is
+/// applied only after a successful warm fetch, so a missing cache never shadows the image defaults.
+fn apply_warm_writer_env(
+    cmd: &mut String,
+    args: &mut Vec<String>,
+    profile: Option<&bridge_core::profile::LanguageProfile>,
+    warm_cache_vol: Option<&str>,
+) {
+    let (Some(profile), Some(warm_cache_vol)) = (profile, warm_cache_vol) else {
+        return;
+    };
+    let binding = profile.cache_binding(bridge_core::profile::CacheCtx::Writer, warm_cache_vol, "");
+    if binding.env.is_empty() {
+        return;
+    }
+    let inner_cmd = std::mem::replace(cmd, "env".to_string());
+    let mut wrapped = Vec::with_capacity(binding.env.len() + args.len() + 2);
+    wrapped.push("--".to_string());
+    wrapped.extend(
+        binding
+            .env
+            .into_iter()
+            .map(|(name, value)| format!("{name}={value}")),
+    );
+    wrapped.push(inner_cmd);
+    wrapped.append(args);
+    *args = wrapped;
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn build_warm_impl(
     graph: &bridge_workflow::graph::WorkflowGraph,
@@ -2783,6 +2814,7 @@ async fn build_warm_impl(
         impl_lsp_cache_vol,
         repo,
     );
+    apply_warm_writer_env(&mut ccfg.cmd, &mut ccfg.args, profile, impl_lsp_cache_vol);
     let warm_owner = container_owner(
         owner_config_path,
         ccfg.sandbox.mount.as_str(),
@@ -4104,6 +4136,9 @@ async fn run_workflow_cmd(args: &[String]) -> Result<(), BoxError> {
                             warm_vol.as_deref(),
                             repo,
                         );
+                    }
+                    if let Some(cmd) = e.cmd.as_mut() {
+                        apply_warm_writer_env(cmd, &mut e.args, Some(p), warm_vol.as_deref());
                     }
                 }
             }
@@ -13976,6 +14011,10 @@ cmd = "cargo build --locked"
                 ("CARGO_HOME".into(), "/cargo".into()),
                 ("CARGO_NET_OFFLINE".into(), "true".into()),
             ],
+            vec![
+                ("CARGO_HOME".into(), "/cargo".into()),
+                ("CARGO_NET_OFFLINE".into(), "true".into()),
+            ], // writer_env
             vec![], // verify_env
             None,   // image
             vec![], // verify_commands
@@ -14009,5 +14048,46 @@ cmd = "cargo build --locked"
             vols.iter().any(|v| v.ends_with(":/lsp-target")),
             "missing /lsp-target mount: {vols:?}"
         );
+    }
+
+    #[test]
+    fn apply_warm_writer_env_wraps_agent_only_when_cache_exists() {
+        let p = bridge_core::profile::LanguageProfile::from_parts(
+            "rust".into(),
+            "cargo fetch --locked".into(),
+            "a2a-impl-lsp-cache".into(),
+            "/cargo".into(),
+            "/cache".into(),
+            vec![],
+            vec![("LSP_ONLY".into(), "yes".into())],
+            vec![
+                ("CARGO_HOME".into(), "/cargo".into()),
+                ("CARGO_NET_OFFLINE".into(), "true".into()),
+            ],
+            vec![],
+            None,
+            vec![],
+        );
+        let mut cmd = "codex-acp".to_string();
+        let mut args = vec!["-c".to_string(), "approval_policy=never".to_string()];
+        super::apply_warm_writer_env(&mut cmd, &mut args, Some(&p), Some("warmvol"));
+        assert_eq!(cmd, "env");
+        assert_eq!(
+            args,
+            vec![
+                "--",
+                "CARGO_HOME=/cargo",
+                "CARGO_NET_OFFLINE=true",
+                "codex-acp",
+                "-c",
+                "approval_policy=never",
+            ]
+        );
+
+        let mut cold_cmd = "codex-acp".to_string();
+        let mut cold_args = vec!["--flag".to_string()];
+        super::apply_warm_writer_env(&mut cold_cmd, &mut cold_args, Some(&p), None);
+        assert_eq!(cold_cmd, "codex-acp");
+        assert_eq!(cold_args, vec!["--flag"]);
     }
 }

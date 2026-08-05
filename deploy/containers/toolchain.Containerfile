@@ -19,6 +19,23 @@ WORKDIR /src
 COPY . .
 RUN cargo build --release --locked -p lsp-mcp && cp target/release/lsp-mcp /lsp-mcp
 
+# ADR-0040 requires `git merge-tree --write-tree --merge-base=<base>`. Debian bookworm's Git 2.39
+# lacks the explicit merge-base option, which makes the implementor/verifier's merge tests fail for an
+# image-only reason. Build the reviewed-capable Git release separately and copy only its installed tree.
+FROM a2a-agent-reader:latest AS gitbuild
+ARG GIT_VERSION=2.54.0
+ARG GIT_SHA256=f689162364c10de79ef89aa8dbf48731eb057e34edbbd20aca510ce0154681a3
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      build-essential gettext libcurl4-gnutls-dev libexpat1-dev libssl-dev xz-utils zlib1g-dev \
+    && rm -rf /var/lib/apt/lists/*
+RUN curl --proto '=https' --tlsv1.2 -sSfL \
+      "https://mirrors.edge.kernel.org/pub/software/scm/git/git-${GIT_VERSION}.tar.xz" \
+      -o /tmp/git.tar.xz \
+ && echo "${GIT_SHA256}  /tmp/git.tar.xz" | sha256sum -c - \
+ && tar -C /tmp -xJf /tmp/git.tar.xz \
+ && make -C "/tmp/git-${GIT_VERSION}" -j2 prefix=/opt/git NO_TCLTK=YesPlease all \
+ && make -C "/tmp/git-${GIT_VERSION}" prefix=/opt/git NO_TCLTK=YesPlease install
+
 # ── Final toolchain image ──
 FROM a2a-agent-reader:latest
 
@@ -42,6 +59,15 @@ RUN cargo install --locked cargo-llvm-cov --version 0.6.21 \
 # finding 2026-06-14; without rust-src RA logs "can't load standard library"). Added as its own layer
 # so the slow apt/rustup/cargo-install layers above stay cached.
 RUN rustup component add rust-analyzer rust-src
+
+# Login shells reset PATH through Debian's /etc/profile and drop /usr/local/cargo/bin. Codex can invoke
+# commands through a login shell, so expose real stable paths exactly as the Go/Python tools below do.
+# Include cargo's installed subcommands: finding `cargo` alone is insufficient for `cargo clippy` or
+# opt-in coverage when their companion executables are absent from the login-shell PATH.
+RUN set -eux; for t in cargo rustc rustfmt rustup clippy-driver cargo-clippy rust-analyzer \
+      cargo-llvm-cov cargo-tarpaulin; do \
+      ln -sf "/usr/local/cargo/bin/$t" "/usr/local/bin/$t"; \
+    done
 
 # L3 Slice B: the in-container lsp-mcp shim (built in the lspbuild stage), delivered to the impl agent
 # via CodexNative (`-c mcp_servers.lsp.command=/usr/local/bin/lsp-mcp`).
@@ -85,3 +111,7 @@ RUN set -eux; for t in python python3 uv ruff; do \
 # no shims — validated: tsls --stdio responds to `initialize` under a fully stripped env with no
 # tsserver.path needed). Pinned for reproducibility. node/npm are the image base.
 RUN npm install -g basedpyright@1.39.8 typescript-language-server@5.3.0 typescript@6.0.3
+
+COPY --from=gitbuild /opt/git /opt/git
+ENV PATH=/opt/git/bin:$PATH
+RUN ln -sf /opt/git/bin/git /usr/local/bin/git

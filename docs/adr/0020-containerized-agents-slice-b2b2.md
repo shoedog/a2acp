@@ -86,7 +86,7 @@ coverage keystone, a discriminating non-gate test ordering, and the `--rm`-raced
 ## Validation
 
 - Unit (Docker-free): `compose_verify` golden (the `:ro` clone, the verify-egress network/proxy from the
-  `EgressPolicy`, the cache volume, the `cd '<clone>'` script, no creds); `run_verify` (stop-at-first-gate,
+  `EgressPolicy`, the cache volume, the `cd '<clone>'` script, no creds); `run_verify` (all-gates enumeration,
   non-gate-reported-then-continues, runner-error); `aggregate`/`truncate_output`/`verdict_line`/
   `outcome_suffix`/`cache_volume_name`; `VerifyConfig` parse (present/absent, empty-commands reject,
   locked-without-network reject). Full workspace `cargo test` GREEN; clippy `-D warnings` clean.
@@ -95,7 +95,8 @@ coverage keystone, a discriminating non-gate test ordering, and the `--rm`-raced
   is unit-tested; only `docker_runner` + the impure Commit-arm resolution are live-gated.
 - Live gate (Docker, dogfooded on THIS repo): `implement` against a fresh clone →
   `verify: PASS (fmt ✓ · clippy ✓ · build ✓ · test ✓)` (committed `f351fb9`). Proven across the runs:
-  FAIL stops at the first gate + still commits (verify is informational); the warm cache (cold first run
+  FAIL still reaches every configured gate so one repair round sees the complete bounded population and
+  then commits (verify is informational); the warm cache (cold first run
   → fast subsequent); `docker events` showed **4 verify containers on `a2a-verify-egress` + the agent's
   edit container on `a2a-egress-internal`** (creds⊥registries); verify mounts no creds (structural).
 

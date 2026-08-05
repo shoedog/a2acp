@@ -240,7 +240,8 @@ pub fn cache_volume_name(base: &str, repo_canon: &str) -> String {
 pub type Runner<'a> = dyn Fn(&str, &[String]) -> std::io::Result<(i32, String)> + 'a;
 
 /// Run every configured command as its own container (sharing the per-repo cache volume), reading each
-/// container's exit code. Stops at the FIRST gate failure. Pure given an injected `runner`.
+/// container's exit code. Every configured population is reached even after an earlier command failure,
+/// so one repair round receives the complete bounded defect set. Pure given an injected `runner`.
 /// Returns `VerifyOutcome::Skipped` when `profile` is `None` (`--lang none`) without spawning any container.
 pub fn run_verify_recorded(
     cfg: &VerifyConfig,
@@ -262,21 +263,9 @@ pub fn run_verify_recorded(
     let mut results = Vec::new();
     let binding = profile.cache_binding(bridge_core::profile::CacheCtx::Verify, "", cache_vol);
     let image = profile.image.as_deref().unwrap_or(&cfg.image);
-    let mut stopped_after_gate_failure = false;
     let mut completed_count = 0_u64;
     for (index, c) in profile.verify_commands.iter().enumerate() {
         let ordinal = u64::try_from(index).unwrap_or(u64::MAX).saturating_add(1);
-        if stopped_after_gate_failure {
-            results.push(VerifyResult {
-                name: c.name.clone(),
-                gate: c.gate,
-                ok: false,
-                reach: VerifyReach::NotReached,
-                failure_class: None,
-                output: "verify: not reached because an earlier gate failed".into(),
-            });
-            continue;
-        }
         let _ = recorder.record(
             bridge_core::attempt_activity::AttemptPhase::Verification,
             bridge_core::attempt_activity::ActivityReason::GateStarted,
@@ -316,9 +305,6 @@ pub fn run_verify_recorded(
                 bridge_core::attempt_activity::ActivityReason::CompletedSetGrowth,
                 completed_count,
             );
-        }
-        if c.gate && !ok {
-            stopped_after_gate_failure = true;
         }
     }
     VerifyOutcome::Ran(aggregate(results))
@@ -561,6 +547,7 @@ mod tests {
             "/cache".into(),
             vec![("CARGO_HOME".into(), "/cargo".into())],
             Vec::new(),
+            Vec::new(),
             vec![
                 ("CARGO_HOME".into(), "/cache/cargo".into()),
                 ("CARGO_TARGET_DIR".into(), "/cache/target".into()),
@@ -616,13 +603,15 @@ mod tests {
             &recorder,
         ));
         assert!(!verdict.passed);
-        assert!(matches!(verdict.results[2].reach, VerifyReach::NotReached));
-        assert!(matches!(verdict.results[3].reach, VerifyReach::NotReached));
+        assert!(verdict
+            .results
+            .iter()
+            .all(|result| matches!(result.reach, VerifyReach::Reached { .. })));
 
         let tally = recorder.tally().expect("recorded verifier owns a tally");
-        assert_eq!(tally.meaningful_progress, 5);
+        assert_eq!(tally.meaningful_progress, 11);
         assert_eq!(tally.activity, 0);
-        assert_eq!(tally.max_advance, 2);
+        assert_eq!(tally.max_advance, 4);
         let encoded = serde_json::to_string(&tally).unwrap();
         for private in [
             "private-sentinel",
@@ -635,10 +624,11 @@ mod tests {
     }
 
     #[test]
-    fn run_verify_stops_at_first_gate_failure() {
+    fn run_verify_enumerates_every_gate_after_a_failure() {
         let clone = bridge_core::SessionCwd::parse("/repo/clone").unwrap();
-        // runner: fmt ok, clippy FAILS (gate) -> build/test must NOT run.
+        let calls = std::cell::Cell::new(0_u32);
         let runner = |_p: &str, argv: &[String]| -> std::io::Result<(i32, String)> {
+            calls.set(calls.get() + 1);
             let script = argv.last().unwrap();
             if script.contains("cargo clippy") {
                 Ok((1, "error: clippy".into()))
@@ -663,11 +653,12 @@ mod tests {
             4096,
         ));
         assert!(!v.passed);
-        assert_eq!(v.results.len(), 4); // stopped after clippy, reported later gates as not reached
+        assert_eq!(calls.get(), 4);
+        assert_eq!(v.results.len(), 4);
         assert_eq!(v.results[1].name, "clippy");
         assert!(!v.results[1].ok);
-        assert!(matches!(v.results[2].reach, VerifyReach::NotReached));
-        assert!(matches!(v.results[3].reach, VerifyReach::NotReached));
+        assert!(v.results[2].ok);
+        assert!(v.results[3].ok);
     }
 
     #[test]
@@ -738,7 +729,10 @@ mod tests {
             v.results[0].failure_class,
             Some(VerifyFailureClass::LockSync)
         );
-        assert!(matches!(v.results[1].reach, VerifyReach::NotReached));
+        assert!(matches!(
+            v.results[1].reach,
+            VerifyReach::Reached { exit_status: 101 }
+        ));
     }
 
     #[test]

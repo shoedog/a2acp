@@ -279,6 +279,19 @@ root via a symlink.
 Set the per-request `:rw` target via **`serve` + A2A** (`message.metadata` cwd) or, for **`run-workflow`**,
 the `--session-cwd <dir>` flag — without it, agents run in the LAUNCH cwd, not the target repo.
 
+For `implement` and local `run-workflow`, a successful no-credential warm fetch is also delivered to the
+main writer process through each language profile's `writer_env`. The dependency volume remains read-only,
+the writer remains offline for package registries, and build outputs stay in the writable quarantine clone;
+this lets the agent run format/lint/build/test commands without combining provider credentials and registry
+egress. Keep `writer_env` explicit and non-secret. Rust tools are linked into `/usr/local/bin` because agent
+commands may use login shells that discard the image's `/usr/local/cargo/bin` PATH entry. The independent
+post-edit verifier still uses its own no-credential cache and reaches every configured gate even after an
+earlier gate fails; Rust test profiles also use Cargo's `--no-fail-fast`, so one failing test binary does
+not hide later workspace binaries. A repair turn therefore sees the complete bounded failure population.
+The toolchain image pins a Git release with ADR-0040's explicit `merge-tree --merge-base` capability;
+Debian bookworm's base Git is too old for the bridge's parallel-implementation integration tests, so the
+pinned binary is also linked through `/usr/local/bin` for login-shell consistency.
+
 ## 9. Podman (macOS `podman machine`)
 
 The runtime is config-selected (the bridge is runtime-agnostic). Docker stays the default; podman is opt-in.
