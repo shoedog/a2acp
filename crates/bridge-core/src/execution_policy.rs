@@ -12,6 +12,7 @@ use crate::domain::{
 use crate::ids::{AgentId, AttemptId};
 use crate::mcp::{render_codex_mcp_args, render_kiro_agent_config, McpDelivery, McpServerSpec};
 use crate::SessionCwd;
+use ring::rand::{SecureRandom, SystemRandom};
 use ring::{digest, hmac};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
@@ -34,10 +35,24 @@ pub const POLICY_TRIGGER_SKELETON_CEILING_BYTES: usize = 160;
 pub const MAX_NODE_TERMINAL_JSON_BYTES: usize = 2_048;
 pub const MAX_POLICY_TRIGGER_JSON_BYTES: usize = 1_024;
 pub const MAX_CONTROLS_JSON_BYTES: usize = 4_096;
+pub const NODE_PRIMARY_RECORD_SCHEMA_V3: u16 = 3;
+pub const NODE_CLEANUP_RECORD_SCHEMA_V2: u16 = 2;
+pub const R2F1B_CONTRACT_SCHEMA_V1: u16 = 1;
+pub const R2F1B_RESOURCE_CONTRACT_VERSION_V1: u16 = 1;
+pub const NODE_PRIMARY_RECORD_SKELETON_CEILING_BYTES: usize = 256;
+pub const NODE_CLEANUP_RECORD_SKELETON_CEILING_BYTES: usize = 384;
+pub const MAX_NODE_PRIMARY_RECORD_JSON_BYTES: usize = 1_536;
+pub const MAX_NODE_CLEANUP_RECORD_JSON_BYTES: usize = 2_048;
 const DERIVED_NODE_TERMINAL_WORST_CASE_BYTES: usize = 1_978;
 const DERIVED_POLICY_TRIGGER_WORST_CASE_BYTES: usize = 550;
+const DERIVED_NODE_PRIMARY_RECORD_WORST_CASE_BYTES: usize = 1_396;
+const DERIVED_NODE_CLEANUP_RECORD_WORST_CASE_BYTES: usize = 1_936;
 const _: () = assert!(DERIVED_NODE_TERMINAL_WORST_CASE_BYTES <= MAX_NODE_TERMINAL_JSON_BYTES);
 const _: () = assert!(DERIVED_POLICY_TRIGGER_WORST_CASE_BYTES <= MAX_POLICY_TRIGGER_JSON_BYTES);
+const _: () =
+    assert!(DERIVED_NODE_PRIMARY_RECORD_WORST_CASE_BYTES <= MAX_NODE_PRIMARY_RECORD_JSON_BYTES);
+const _: () =
+    assert!(DERIVED_NODE_CLEANUP_RECORD_WORST_CASE_BYTES <= MAX_NODE_CLEANUP_RECORD_JSON_BYTES);
 const MAX_WORKTREE_OWNER_BYTES: usize = 64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -187,6 +202,148 @@ pub enum ProfileSelectionSourceV1 {
 #[serde(rename_all = "snake_case")]
 pub enum DeadlineActivationV1 {
     ManualOnlyR2f1a,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeadlineActivationV2 {
+    ManualOnlyR2f1a,
+    AutomaticR2f1b,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
+#[serde(transparent)]
+pub struct WorktreeCustodyIdV1(String);
+
+impl WorktreeCustodyIdV1 {
+    pub const PREFIX: &'static str = "custody-";
+    pub const ENCODED_LEN: usize = Self::PREFIX.len() + 64;
+
+    pub fn mint() -> Result<Self, crate::error::BridgeError> {
+        let mut bytes = [0_u8; 32];
+        SystemRandom::new()
+            .fill(&mut bytes)
+            .map_err(|_| crate::error::BridgeError::IdentityUnavailable)?;
+        if bytes.iter().all(|byte| *byte == 0) {
+            return Err(crate::error::BridgeError::IdentityUnavailable);
+        }
+        let mut value = String::with_capacity(Self::ENCODED_LEN);
+        value.push_str(Self::PREFIX);
+        for byte in bytes {
+            use std::fmt::Write as _;
+            let _ = write!(&mut value, "{byte:02x}");
+        }
+        Ok(Self(value))
+    }
+
+    pub fn parse(value: impl Into<String>) -> Result<Self, ExecutionPolicyError> {
+        let value = value.into();
+        let suffix = value
+            .strip_prefix(Self::PREFIX)
+            .ok_or(ExecutionPolicyError::InvalidStructuredEvidence)?;
+        if value.len() != Self::ENCODED_LEN
+            || suffix.bytes().all(|byte| byte == b'0')
+            || !suffix
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err(ExecutionPolicyError::InvalidStructuredEvidence);
+        }
+        Ok(Self(value))
+    }
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl<'de> Deserialize<'de> for WorktreeCustodyIdV1 {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::parse(value).map_err(serde::de::Error::custom)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorktreeObjectIdentityV1 {
+    pub canonical_path: String,
+    pub directory_identity: crate::fs_custody::DirectoryIdentityV1,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FrozenWorktreeCustodyPlanV1 {
+    pub custody_id: WorktreeCustodyIdV1,
+    pub checkout_fingerprint: Sha256HexV1,
+    pub target_cwd: SessionCwd,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FrozenR2f1bContractV1 {
+    pub schema_version: u16,
+    pub activation: DeadlineActivationV2,
+    pub custody_plans: Vec<FrozenWorktreeCustodyPlanV1>,
+    pub resource_contract_version: u16,
+    pub contract_fingerprint: Sha256HexV1,
+}
+
+impl FrozenR2f1bContractV1 {
+    pub fn validate(&self) -> Result<(), ExecutionPolicyError> {
+        if self.schema_version != R2F1B_CONTRACT_SCHEMA_V1
+            || self.resource_contract_version != R2F1B_RESOURCE_CONTRACT_VERSION_V1
+        {
+            return Err(ExecutionPolicyError::InvalidStructuredEvidence);
+        }
+        let mut plans = self.custody_plans.clone();
+        plans.sort_by(|left, right| {
+            left.checkout_fingerprint
+                .cmp(&right.checkout_fingerprint)
+                .then_with(|| left.custody_id.cmp(&right.custody_id))
+        });
+        if plans != self.custody_plans
+            || plans.windows(2).any(|pair| {
+                pair[0].checkout_fingerprint == pair[1].checkout_fingerprint
+                    || pair[0].custody_id == pair[1].custody_id
+            })
+        {
+            return Err(ExecutionPolicyError::InvalidStructuredEvidence);
+        }
+        let mut clone = self.clone();
+        clone.contract_fingerprint = Sha256HexV1::digest(b"r2f1b-contract-fingerprint-placeholder");
+        let encoded = canonical_json(&clone)?;
+        let expected = Sha256HexV1::digest(&encoded);
+        if self.contract_fingerprint != expected {
+            return Err(ExecutionPolicyError::InvalidStructuredEvidence);
+        }
+        Ok(())
+    }
+
+    pub fn with_computed_fingerprint(
+        activation: DeadlineActivationV2,
+        mut custody_plans: Vec<FrozenWorktreeCustodyPlanV1>,
+    ) -> Result<Self, ExecutionPolicyError> {
+        custody_plans.sort_by(|left, right| {
+            left.checkout_fingerprint
+                .cmp(&right.checkout_fingerprint)
+                .then_with(|| left.custody_id.cmp(&right.custody_id))
+        });
+        let mut value = Self {
+            schema_version: R2F1B_CONTRACT_SCHEMA_V1,
+            activation,
+            custody_plans,
+            resource_contract_version: R2F1B_RESOURCE_CONTRACT_VERSION_V1,
+            contract_fingerprint: Sha256HexV1::digest(b"r2f1b-contract-fingerprint-placeholder"),
+        };
+        value.contract_fingerprint = Sha256HexV1::digest(&canonical_json(&value)?);
+        value.validate()?;
+        Ok(value)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -470,20 +627,36 @@ fn shorten_terminal_cause(value: &mut NodeTerminalV1) -> bool {
     }
 }
 
+fn normalize_bounded_cause(cause: &mut BoundedCauseV1) {
+    let original = cause.deepest_cause.clone();
+    cause.deepest_cause = original.as_deref().map(|value| {
+        crate::diagnostics::DiagnosticRedactor::default()
+            .sanitize_stderr_line(value, MAX_DEEPEST_CAUSE_BYTES)
+    });
+    if cause.deepest_cause != original {
+        cause.cause_truncated = true;
+    }
+}
+
+fn shorten_bounded_cause(cause: &mut BoundedCauseV1) -> bool {
+    let Some(deepest) = cause.deepest_cause.as_mut() else {
+        return false;
+    };
+    if remove_first_scalar(deepest) {
+        true
+    } else {
+        cause.deepest_cause = None;
+        true
+    }
+}
+
 impl NodeTerminalV1 {
     fn normalize(mut self) -> Result<Self, ExecutionPolicyError> {
         if self.schema_version != EXECUTION_POLICY_SCHEMA_V1 {
             return Err(ExecutionPolicyError::InvalidStructuredEvidence);
         }
         if let Some(cause) = self.cause.as_mut() {
-            let original = cause.deepest_cause.clone();
-            cause.deepest_cause = original.as_deref().map(|value| {
-                crate::diagnostics::DiagnosticRedactor::default()
-                    .sanitize_stderr_line(value, MAX_DEEPEST_CAUSE_BYTES)
-            });
-            if cause.deepest_cause != original {
-                cause.cause_truncated = true;
-            }
+            normalize_bounded_cause(cause);
         }
         Ok(self)
     }
@@ -521,6 +694,364 @@ impl NodeTerminalV1 {
 
     pub fn decode_canonical(bytes: &[u8]) -> Result<Self, ExecutionPolicyError> {
         if bytes.len() > MAX_NODE_TERMINAL_JSON_BYTES {
+            return Err(ExecutionPolicyError::StructuredEvidenceOverBound);
+        }
+        let value: Self = serde_json::from_slice(bytes)
+            .map_err(|_| ExecutionPolicyError::InvalidStructuredEvidence)?;
+        if value.encode_canonical()? != bytes {
+            return Err(ExecutionPolicyError::InvalidStructuredEvidence);
+        }
+        Ok(value)
+    }
+}
+
+pub type BoundedCauseV1 = NodeCauseV1;
+pub type PolicyTriggerIdV1 = ControlEventIdV1;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NodePrimaryRecordV3 {
+    pub schema_version: u16,
+    pub primary: NodePrimaryDispositionV1,
+    pub cause: Option<BoundedCauseV1>,
+    pub prompt_may_have_been_accepted: bool,
+    pub degraded_ancestry: bool,
+    pub policy_trigger_id: Option<PolicyTriggerIdV1>,
+}
+
+impl NodePrimaryRecordV3 {
+    fn normalize(mut self) -> Result<Self, ExecutionPolicyError> {
+        if self.schema_version != NODE_PRIMARY_RECORD_SCHEMA_V3 {
+            return Err(ExecutionPolicyError::InvalidStructuredEvidence);
+        }
+        if let Some(cause) = self.cause.as_mut() {
+            normalize_bounded_cause(cause);
+        }
+        Ok(self)
+    }
+
+    pub fn placeholder() -> Self {
+        Self {
+            schema_version: NODE_PRIMARY_RECORD_SCHEMA_V3,
+            primary: NodePrimaryDispositionV1::NotStartedPolicy,
+            cause: None,
+            prompt_may_have_been_accepted: false,
+            degraded_ancestry: false,
+            policy_trigger_id: None,
+        }
+    }
+
+    pub fn encode_canonical(&self) -> Result<Vec<u8>, ExecutionPolicyError> {
+        let mut value = self.clone().normalize()?;
+        let mut encoded = canonical_json(&value)?;
+        if encoded.len() <= MAX_NODE_PRIMARY_RECORD_JSON_BYTES {
+            return Ok(encoded);
+        }
+        if let Some(cause) = value.cause.as_mut() {
+            cause.cause_truncated = true;
+        }
+        let mut terminal_like = NodeTerminalV1 {
+            schema_version: EXECUTION_POLICY_SCHEMA_V1,
+            primary: value.primary,
+            cleanup: NodeCleanupV1 {
+                disposition: NodeCleanupDispositionV1::NotNeeded,
+                duration_ms: 0,
+            },
+            cause: value.cause.clone(),
+            prompt_may_have_been_accepted: value.prompt_may_have_been_accepted,
+            degraded_ancestry: value.degraded_ancestry,
+            policy_trigger_id: value.policy_trigger_id.clone(),
+        };
+        while encoded.len() > MAX_NODE_PRIMARY_RECORD_JSON_BYTES
+            && shorten_terminal_cause(&mut terminal_like)
+        {
+            value.cause = terminal_like.cause.clone();
+            encoded = canonical_json(&value)?;
+        }
+        if encoded.len() > MAX_NODE_PRIMARY_RECORD_JSON_BYTES {
+            return Err(ExecutionPolicyError::StructuredEvidenceOverBound);
+        }
+        Ok(encoded)
+    }
+
+    pub fn decode_canonical(bytes: &[u8]) -> Result<Self, ExecutionPolicyError> {
+        if bytes.len() > MAX_NODE_PRIMARY_RECORD_JSON_BYTES {
+            return Err(ExecutionPolicyError::StructuredEvidenceOverBound);
+        }
+        let value: Self = serde_json::from_slice(bytes)
+            .map_err(|_| ExecutionPolicyError::InvalidStructuredEvidence)?;
+        if value.encode_canonical()? != bytes {
+            return Err(ExecutionPolicyError::InvalidStructuredEvidence);
+        }
+        Ok(value)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorktreePreservationDispositionV1 {
+    Pending,
+    Preserved,
+    Removed,
+    NotNeeded,
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorktreePreservationResultV1 {
+    pub disposition: WorktreePreservationDispositionV1,
+    pub custody_id: Option<WorktreeCustodyIdV1>,
+    pub claim_digest: Option<Sha256HexV1>,
+}
+
+impl WorktreePreservationResultV1 {
+    pub fn pending() -> Self {
+        Self {
+            disposition: WorktreePreservationDispositionV1::Pending,
+            custody_id: None,
+            claim_digest: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CollateralDispositionV1 {
+    None,
+    Complete,
+    Partial,
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CollateralResultV1 {
+    pub disposition: CollateralDispositionV1,
+    pub affected_owner_count: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum NodeCleanupV2 {
+    Pending {
+        resource_flight_id: crate::resource_flight::ResourceFlightIdV1,
+    },
+    Complete {
+        duration_ms: u64,
+    },
+    Partial {
+        duration_ms: u64,
+        recovery_owner: crate::resource_flight::RecoveryOwnerV1,
+    },
+    Failed {
+        duration_ms: u64,
+        cause: BoundedCauseV1,
+    },
+    NotNeeded,
+    Unknown {
+        duration_ms: u64,
+        recovery_owner: Option<crate::resource_flight::RecoveryOwnerV1>,
+    },
+}
+
+impl NodeCleanupV2 {
+    pub fn is_pending(&self) -> bool {
+        matches!(self, Self::Pending { .. })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NodeCleanupRecordV2 {
+    pub schema_version: u16,
+    pub cleanup: NodeCleanupV2,
+    pub preservation: WorktreePreservationResultV1,
+    pub collateral: Option<CollateralResultV1>,
+}
+
+impl NodeCleanupRecordV2 {
+    pub fn pending(resource_flight_id: crate::resource_flight::ResourceFlightIdV1) -> Self {
+        Self {
+            schema_version: NODE_CLEANUP_RECORD_SCHEMA_V2,
+            cleanup: NodeCleanupV2::Pending { resource_flight_id },
+            preservation: WorktreePreservationResultV1::pending(),
+            collateral: None,
+        }
+    }
+
+    /// Validate the closed cleanup/preservation/collateral product table.
+    ///
+    /// Pending is the pre-effect projection: it owns the admitted flight, keeps
+    /// preservation Pending, and cannot describe collateral. NotNeeded is the
+    /// no-resource projection. Every other cleanup state is final: preservation
+    /// is settled (or explicitly Unknown), and collateral is either absent or a
+    /// non-empty disposition. This mirrors the preservation-first flow in the
+    /// focused R2f1b boundary: collateral is recorded only after flight
+    /// admission closes, while a Pending row exists before any effect.
+    ///
+    /// Accepted product table:
+    ///
+    /// Pending + Pending + None; NotNeeded + (Removed|NotNeeded|Unknown)
+    /// + None; or any other final cleanup with non-Pending preservation,
+    ///   where None collateral has zero owners and every other disposition has
+    ///   at least one affected owner.
+    pub fn validate_coherence(&self) -> Result<(), ExecutionPolicyError> {
+        let final_cleanup = !self.cleanup.is_pending();
+        match (
+            &self.cleanup,
+            &self.preservation.disposition,
+            &self.collateral,
+        ) {
+            (NodeCleanupV2::Pending { .. }, WorktreePreservationDispositionV1::Pending, None) => {}
+            (NodeCleanupV2::NotNeeded, disposition, None)
+                if !matches!(
+                    disposition,
+                    WorktreePreservationDispositionV1::Preserved
+                        | WorktreePreservationDispositionV1::Pending
+                ) => {}
+            (_, WorktreePreservationDispositionV1::Pending, _) if final_cleanup => {
+                return Err(ExecutionPolicyError::InvalidStructuredEvidence);
+            }
+            (_, _, Some(collateral))
+                if matches!(collateral.disposition, CollateralDispositionV1::None)
+                    && collateral.affected_owner_count != 0 =>
+            {
+                return Err(ExecutionPolicyError::InvalidStructuredEvidence);
+            }
+            (_, _, Some(collateral))
+                if !matches!(collateral.disposition, CollateralDispositionV1::None)
+                    && collateral.affected_owner_count == 0 =>
+            {
+                return Err(ExecutionPolicyError::InvalidStructuredEvidence);
+            }
+            (NodeCleanupV2::Pending { .. }, _, _) | (NodeCleanupV2::NotNeeded, _, _) => {
+                return Err(ExecutionPolicyError::InvalidStructuredEvidence);
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// Bind recovery authority to the reservation that admitted this node.
+    pub fn validate_for_attempt(
+        &self,
+        attempt_id: &crate::ids::AttemptId,
+        resource_flight_id: &crate::resource_flight::ResourceFlightIdV1,
+    ) -> Result<(), ExecutionPolicyError> {
+        self.validate_coherence()?;
+        match &self.cleanup {
+            NodeCleanupV2::Pending {
+                resource_flight_id: persisted,
+            } if persisted != resource_flight_id => {
+                Err(ExecutionPolicyError::InvalidStructuredEvidence)
+            }
+            NodeCleanupV2::Partial { recovery_owner, .. }
+            | NodeCleanupV2::Unknown {
+                recovery_owner: Some(recovery_owner),
+                ..
+            } if recovery_owner.attempt_id != *attempt_id
+                || recovery_owner.resource_flight_id != *resource_flight_id =>
+            {
+                Err(ExecutionPolicyError::InvalidStructuredEvidence)
+            }
+            _ => Ok(()),
+        }
+    }
+
+    fn cleanup_cause_mut(&mut self) -> Option<&mut BoundedCauseV1> {
+        match &mut self.cleanup {
+            NodeCleanupV2::Failed { cause, .. } => Some(cause),
+            NodeCleanupV2::Pending { .. }
+            | NodeCleanupV2::Complete { .. }
+            | NodeCleanupV2::Partial { .. }
+            | NodeCleanupV2::NotNeeded
+            | NodeCleanupV2::Unknown { .. } => None,
+        }
+    }
+
+    fn normalize(mut self) -> Result<Self, ExecutionPolicyError> {
+        if self.schema_version != NODE_CLEANUP_RECORD_SCHEMA_V2 {
+            return Err(ExecutionPolicyError::InvalidStructuredEvidence);
+        }
+        self.validate_coherence()?;
+        match &self.cleanup {
+            NodeCleanupV2::Pending { resource_flight_id } => {
+                crate::resource_flight::ResourceFlightIdV1::parse(resource_flight_id.as_str())
+                    .map_err(|_| ExecutionPolicyError::InvalidStructuredEvidence)?;
+            }
+            NodeCleanupV2::Partial { recovery_owner, .. } => {
+                crate::resource_flight::ResourceFlightIdV1::parse(
+                    recovery_owner.resource_flight_id.as_str(),
+                )
+                .map_err(|_| ExecutionPolicyError::InvalidStructuredEvidence)?;
+            }
+            NodeCleanupV2::Unknown {
+                recovery_owner: Some(recovery_owner),
+                ..
+            } => {
+                crate::resource_flight::ResourceFlightIdV1::parse(
+                    recovery_owner.resource_flight_id.as_str(),
+                )
+                .map_err(|_| ExecutionPolicyError::InvalidStructuredEvidence)?;
+            }
+            NodeCleanupV2::Complete { .. }
+            | NodeCleanupV2::Failed { .. }
+            | NodeCleanupV2::NotNeeded
+            | NodeCleanupV2::Unknown {
+                recovery_owner: None,
+                ..
+            } => {}
+        }
+        if let Some(cause) = self.cleanup_cause_mut() {
+            normalize_bounded_cause(cause);
+        }
+        Ok(self)
+    }
+
+    pub fn encode_canonical(&self) -> Result<Vec<u8>, ExecutionPolicyError> {
+        let mut value = self.clone().normalize()?;
+        let mut encoded = canonical_json(&value)?;
+        if encoded.len() <= MAX_NODE_CLEANUP_RECORD_JSON_BYTES {
+            return Ok(encoded);
+        }
+        if let Some(cause) = value.cleanup_cause_mut() {
+            cause.cause_truncated = true;
+        }
+        while encoded.len() > MAX_NODE_CLEANUP_RECORD_JSON_BYTES {
+            let Some(cause) = value.cleanup_cause_mut() else {
+                break;
+            };
+            if !shorten_bounded_cause(cause) {
+                break;
+            }
+            encoded = canonical_json(&value)?;
+        }
+        if encoded.len() <= MAX_NODE_CLEANUP_RECORD_JSON_BYTES {
+            return Ok(encoded);
+        }
+        if let Some(cause) = value.cleanup_cause_mut() {
+            cause.evidence_overflow = true;
+            cause.dependency_set = None;
+        }
+        encoded = canonical_json(&value)?;
+        while encoded.len() > MAX_NODE_CLEANUP_RECORD_JSON_BYTES {
+            let Some(cause) = value.cleanup_cause_mut() else {
+                break;
+            };
+            if !shorten_bounded_cause(cause) {
+                break;
+            }
+            encoded = canonical_json(&value)?;
+        }
+        if encoded.len() > MAX_NODE_CLEANUP_RECORD_JSON_BYTES {
+            return Err(ExecutionPolicyError::StructuredEvidenceOverBound);
+        }
+        Ok(encoded)
+    }
+
+    pub fn decode_canonical(bytes: &[u8]) -> Result<Self, ExecutionPolicyError> {
+        if bytes.len() > MAX_NODE_CLEANUP_RECORD_JSON_BYTES {
             return Err(ExecutionPolicyError::StructuredEvidenceOverBound);
         }
         let value: Self = serde_json::from_slice(bytes)

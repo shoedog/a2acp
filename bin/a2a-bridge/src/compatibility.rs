@@ -1895,6 +1895,8 @@ struct InvocationResult {
     process_success: bool,
     runner_error_code: Option<&'static str>,
     not_run_reason: Option<&'static str>,
+    #[cfg(test)]
+    process_status: Option<std::process::ExitStatus>,
 }
 
 impl InvocationResult {
@@ -1904,6 +1906,8 @@ impl InvocationResult {
             process_success: false,
             runner_error_code: None,
             not_run_reason: Some(reason),
+            #[cfg(test)]
+            process_status: None,
         }
     }
 }
@@ -2021,6 +2025,8 @@ impl ProcessSmokeInvoker<'_> {
                     process_success: false,
                     runner_error_code: Some("candidate_binary_changed"),
                     not_run_reason: None,
+                    #[cfg(test)]
+                    process_status: None,
                 }
             }
         };
@@ -2082,6 +2088,8 @@ impl ProcessSmokeInvoker<'_> {
                 process_success: false,
                 runner_error_code: Some("smoke_process_launch_failed"),
                 not_run_reason: None,
+                #[cfg(test)]
+                process_status: None,
             };
         }
         #[cfg(unix)]
@@ -2119,16 +2127,22 @@ impl ProcessSmokeInvoker<'_> {
                     process_success: false,
                     runner_error_code: Some("smoke_process_launch_failed"),
                     not_run_reason: None,
+                    #[cfg(test)]
+                    process_status: None,
                 }
             }
         };
         let process_success = status.success();
+        #[cfg(test)]
+        let process_status = Some(status);
         let Some(artifact_name) = request.artifact_path.file_name() else {
             return InvocationResult {
                 artifact: None,
                 process_success,
                 runner_error_code: Some("smoke_artifact_missing_or_invalid_file"),
                 not_run_reason: None,
+                #[cfg(test)]
+                process_status,
             };
         };
         let snapshot = match self
@@ -2153,6 +2167,8 @@ impl ProcessSmokeInvoker<'_> {
                     process_success,
                     runner_error_code: Some("smoke_artifact_missing_or_invalid_file"),
                     not_run_reason: None,
+                    #[cfg(test)]
+                    process_status,
                 };
             }
         };
@@ -2167,12 +2183,16 @@ impl ProcessSmokeInvoker<'_> {
                 process_success,
                 runner_error_code: None,
                 not_run_reason: None,
+                #[cfg(test)]
+                process_status,
             },
             Err(_) => InvocationResult {
                 artifact: None,
                 process_success,
                 runner_error_code: Some("smoke_artifact_invalid_json"),
                 not_run_reason: None,
+                #[cfg(test)]
+                process_status,
             },
         }
     }
@@ -6046,6 +6066,8 @@ mod tests {
             artifact: Some(artifact),
             runner_error_code: None,
             not_run_reason: None,
+            #[cfg(test)]
+            process_status: None,
         }
     }
 
@@ -6864,6 +6886,8 @@ agent_cli = "@openai/codex=0.144.1"
             process_success: false,
             runner_error_code: Some("smoke_artifact_missing_or_invalid_file"),
             not_run_reason: None,
+            #[cfg(test)]
+            process_status: None,
         }]);
         let loaded = loaded(dir.path(), vec![first, second]);
         let cancelled = AtomicBool::new(false);
@@ -6947,6 +6971,8 @@ agent_cli = "@openai/codex=0.144.1"
             process_success: false,
             runner_error_code: None,
             not_run_reason: None,
+            #[cfg(test)]
+            process_status: None,
         }]);
         let exit_loaded = loaded(dir.path(), vec![case]);
         let exit = build_aggregate(
@@ -8712,6 +8738,7 @@ agent_cli = "@openai/codex=0.144.1"
         assert_eq!(result.runner_error_code, Some("candidate_binary_changed"));
         assert!(result.artifact.is_none());
         assert!(!request.artifact_path.exists());
+        assert!(result.process_status.is_none(), "{:?}", result);
     }
 
     #[cfg(unix)]
@@ -8762,7 +8789,52 @@ agent_cli = "@openai/codex=0.144.1"
             })
             .await;
 
-        assert!(result.process_success);
+        assert!(result.process_success, "{:?}", result);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn staged_candidate_nonzero_exit_retains_process_status() {
+        let dir = tempfile::tempdir().unwrap();
+        let snapshot = local_file::read_regular_file_bounded(
+            Path::new("/usr/bin/false"),
+            "test false executable",
+            MAX_EXECUTABLE_BYTES,
+        )
+        .unwrap();
+        let scratch = scratch_in(dir.path());
+        let staged = stage_candidate(&snapshot, &scratch).unwrap();
+        let invoker = ProcessSmokeInvoker {
+            executable: staged,
+            artifact_directory: &scratch.pin,
+            expected_sha256: snapshot.sha256,
+        };
+        let request = SmokeRequest {
+            agent: "test-agent".into(),
+            config: dir.path().join("missing.toml"),
+            model: "test-model".into(),
+            effort: None,
+            mode: None,
+            session_cwd: None,
+            timeout_secs: 1,
+            artifact_path: dir.path().join("artifact.json"),
+        };
+
+        let cancellation = AtomicBool::new(false);
+        let admission = test_spawn_admission(&cancellation);
+        let result = invoker.invoke(&request, &admission).await;
+
+        let status = result
+            .process_status
+            .expect("a successfully waited child must retain its process status");
+        assert!(!status.success(), "{:?}", result);
+        assert!(!result.process_success, "{:?}", result);
+        assert_eq!(
+            result.runner_error_code,
+            Some("smoke_artifact_missing_or_invalid_file"),
+            "{:?}",
+            result
+        );
     }
 
     #[cfg(unix)]

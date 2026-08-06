@@ -68,6 +68,9 @@ enum BoundBackendScope {
     EffectKeyedProcess,
 }
 
+type BoundBackendCell = Arc<OnceCell<Arc<dyn AgentBackend>>>;
+type BoundBackendMap = HashMap<String, BoundBackendCell>;
+
 fn bound_backend_scope(
     entry: &AgentEntry,
     delivery: &bridge_core::execution_policy::BoundMcpDeliveryPayloadV1,
@@ -111,7 +114,7 @@ pub(crate) struct Slot {
     pub backend: OnceCell<Arc<dyn AgentBackend>>,
     /// Process-start native MCP delivery is immutable for a child. Partition those children by
     /// the complete frozen provider-effect digest so two effective cwds can never alias.
-    pub bound_backends: SyncMutex<HashMap<String, Arc<OnceCell<Arc<dyn AgentBackend>>>>>,
+    pub bound_backends: SyncMutex<BoundBackendMap>,
     pub retired: Arc<AtomicBool>,
     pub leases: Arc<AtomicUsize>,
     /// Notified on every lease drop so the detached retirement task wakes the

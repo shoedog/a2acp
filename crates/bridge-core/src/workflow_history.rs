@@ -17,6 +17,7 @@ pub const MAX_PHASES: usize = 32;
 pub const MAX_RESERVATION_JSON_BYTES: usize = 4 * 1024;
 pub const MAX_TERMINAL_JSON_BYTES: usize = 8 * 1024;
 pub const WORKFLOW_HISTORY_EVIDENCE_SCHEMA_V1: u16 = 1;
+pub const WORKFLOW_HISTORY_EVIDENCE_SCHEMA_V3: u16 = 3;
 
 /// Hash a canonical, prompt-free configured workload shape into a bounded
 /// partition dimension. The caller owns canonicalization; only the digest is
@@ -287,6 +288,109 @@ pub struct AttemptStructuredEvidenceV1 {
     pub policy_trigger_json: Option<String>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HistoryNodeReservationV3 {
+    pub node: NodeId,
+    pub sorted_ordinal: u32,
+    pub resource_flight_id: crate::resource_flight::ResourceFlightIdV1,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AttemptReservationV3 {
+    pub schema_version: u16,
+    pub reservation: AttemptReservation,
+    pub controls_json: String,
+    pub controls_fingerprint: String,
+    pub expected_node_count: u32,
+    pub nodes: Vec<HistoryNodeReservationV3>,
+}
+
+impl AttemptReservationV3 {
+    pub fn validate(&self) -> Result<(), LedgerError> {
+        self.reservation.validate()?;
+        if self.schema_version != WORKFLOW_HISTORY_EVIDENCE_SCHEMA_V3
+            || !bounded(&self.controls_fingerprint, MAX_FINGERPRINT_LEN)
+            || self.controls_json.len() > crate::execution_policy::MAX_CONTROLS_JSON_BYTES
+            || usize::try_from(self.expected_node_count).ok() != Some(self.nodes.len())
+            || self.nodes.is_empty()
+        {
+            return Err(LedgerError::new(LedgerUnavailableReason::Schema));
+        }
+        let controls: crate::execution_policy::FrozenWorkflowControlsV1 =
+            serde_json::from_str(&self.controls_json)
+                .map_err(|_| LedgerError::new(LedgerUnavailableReason::Schema))?;
+        if controls
+            .encode_canonical()
+            .map_err(|_| LedgerError::new(LedgerUnavailableReason::Schema))?
+            != self.controls_json.as_bytes()
+        {
+            return Err(LedgerError::new(LedgerUnavailableReason::Schema));
+        }
+        let expected_fingerprint = format!(
+            "controls-{}",
+            crate::execution_policy::Sha256HexV1::digest(self.controls_json.as_bytes()).as_str()
+        );
+        if self.controls_fingerprint != expected_fingerprint {
+            return Err(LedgerError::new(LedgerUnavailableReason::Schema));
+        }
+        for (ordinal, node) in self.nodes.iter().enumerate() {
+            let ordinal = u32::try_from(ordinal)
+                .map_err(|_| LedgerError::new(LedgerUnavailableReason::Schema))?;
+            if node.sorted_ordinal != ordinal
+                || crate::resource_flight::ResourceFlightIdV1::parse(
+                    node.resource_flight_id.as_str(),
+                )
+                .is_err()
+                || self
+                    .nodes
+                    .get(ordinal as usize + 1)
+                    .is_some_and(|next| node.node.as_str() >= next.node.as_str())
+            {
+                return Err(LedgerError::new(LedgerUnavailableReason::Schema));
+            }
+        }
+        Ok(())
+    }
+
+    #[must_use]
+    pub fn node(&self, id: &NodeId) -> Option<&HistoryNodeReservationV3> {
+        self.nodes
+            .binary_search_by(|candidate| candidate.node.cmp(id))
+            .ok()
+            .and_then(|index| self.nodes.get(index))
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HistoryNodeTerminalV3 {
+    pub node: NodeId,
+    pub sorted_ordinal: u32,
+    pub primary_json: String,
+    pub cleanup_json: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AttemptStructuredEvidenceV3 {
+    pub reservation: AttemptReservationV3,
+    pub node_terminals: Vec<HistoryNodeTerminalV3>,
+}
+
+#[must_use]
+pub fn node_primary_placeholder_v3() -> String {
+    let payload =
+        "p".repeat(crate::execution_policy::MAX_NODE_PRIMARY_RECORD_JSON_BYTES.saturating_sub(2));
+    let encoded = serde_json::to_string(&payload).expect("JSON string encoding is infallible");
+    debug_assert_eq!(
+        encoded.len(),
+        crate::execution_policy::MAX_NODE_PRIMARY_RECORD_JSON_BYTES
+    );
+    encoded
+}
+
 #[must_use]
 pub fn node_terminal_placeholder_v1() -> String {
     let payload =
@@ -518,6 +622,11 @@ pub trait WorkflowHistoryStore: Send + Sync {
     async fn reserve_v2(&self, _row: &AttemptReservationV2) -> Result<(), LedgerError> {
         Err(LedgerError::new(LedgerUnavailableReason::Schema))
     }
+    /// Admit an inactive R2f1b V3 structured attempt and atomically reserve both
+    /// the cleanup-free primary placeholder and cleanup Pending row for every node.
+    async fn reserve_v3(&self, _row: &AttemptReservationV3) -> Result<(), LedgerError> {
+        Err(LedgerError::new(LedgerUnavailableReason::Schema))
+    }
     /// Replace one admitted placeholder with its canonical terminal. When a
     /// policy trigger is supplied, the selected terminal and attempt-level
     /// trigger must share this one durable transition.
@@ -536,6 +645,28 @@ pub trait WorkflowHistoryStore: Send + Sync {
         &self,
         _id: &AttemptId,
     ) -> Result<Option<AttemptStructuredEvidenceV1>, LedgerError> {
+        Ok(None)
+    }
+    async fn commit_node_primary_v3(
+        &self,
+        _id: &AttemptId,
+        _node: &NodeId,
+        _primary_json: &str,
+    ) -> Result<TerminalWrite, LedgerError> {
+        Err(LedgerError::new(LedgerUnavailableReason::Schema))
+    }
+    async fn settle_node_cleanup_v3(
+        &self,
+        _id: &AttemptId,
+        _node: &NodeId,
+        _cleanup_json: &str,
+    ) -> Result<TerminalWrite, LedgerError> {
+        Err(LedgerError::new(LedgerUnavailableReason::Schema))
+    }
+    async fn structured_evidence_v3(
+        &self,
+        _id: &AttemptId,
+    ) -> Result<Option<AttemptStructuredEvidenceV3>, LedgerError> {
         Ok(None)
     }
     /// Persist the conservative prompt-dispatch state before polling a provider prompt.
@@ -1129,6 +1260,7 @@ pub struct MemoryWorkflowHistoryStore {
         std::collections::BTreeMap<String, (AttemptReservation, Option<AttemptTerminal>)>,
     >,
     structured: std::sync::Mutex<std::collections::BTreeMap<String, MemoryStructuredAttemptV1>>,
+    structured_v3: std::sync::Mutex<std::collections::BTreeMap<String, MemoryStructuredAttemptV3>>,
     activity: std::sync::Mutex<
         std::collections::BTreeMap<String, crate::attempt_activity::ActivityTally>,
     >,
@@ -1139,6 +1271,12 @@ struct MemoryStructuredAttemptV1 {
     reservation: AttemptReservationV2,
     node_terminals: std::collections::BTreeMap<NodeId, Option<String>>,
     policy_trigger_json: Option<String>,
+}
+
+#[derive(Clone)]
+struct MemoryStructuredAttemptV3 {
+    reservation: AttemptReservationV3,
+    node_terminals: std::collections::BTreeMap<NodeId, (String, String)>,
 }
 
 impl MemoryWorkflowHistoryStore {
@@ -1344,6 +1482,49 @@ impl WorkflowHistoryStore for MemoryWorkflowHistoryStore {
         Ok(())
     }
 
+    async fn reserve_v3(&self, row: &AttemptReservationV3) -> Result<(), LedgerError> {
+        row.validate()?;
+        let mut rows = self
+            .rows
+            .lock()
+            .map_err(|_| LedgerError::new(LedgerUnavailableReason::Io))?;
+        let mut structured_v3 = self
+            .structured_v3
+            .lock()
+            .map_err(|_| LedgerError::new(LedgerUnavailableReason::Io))?;
+        if structured_v3.contains_key(row.reservation.identity.attempt_id.as_str()) {
+            return Err(LedgerError::new(LedgerUnavailableReason::Collision));
+        }
+        Self::reserve_row_locked(&mut rows, &row.reservation)?;
+        let placeholder = node_primary_placeholder_v3();
+        let mut node_terminals = std::collections::BTreeMap::new();
+        for node in &row.nodes {
+            let cleanup = crate::execution_policy::NodeCleanupRecordV2::pending(
+                node.resource_flight_id.clone(),
+            );
+            let cleanup_json = String::from_utf8(
+                cleanup
+                    .encode_canonical()
+                    .map_err(|_| LedgerError::new(LedgerUnavailableReason::Schema))?,
+            )
+            .map_err(|_| LedgerError::new(LedgerUnavailableReason::Schema))?;
+            if node_terminals
+                .insert(node.node.clone(), (placeholder.clone(), cleanup_json))
+                .is_some()
+            {
+                return Err(LedgerError::new(LedgerUnavailableReason::Schema));
+            }
+        }
+        structured_v3.insert(
+            row.reservation.identity.attempt_id.as_str().to_owned(),
+            MemoryStructuredAttemptV3 {
+                reservation: row.clone(),
+                node_terminals,
+            },
+        );
+        Ok(())
+    }
+
     async fn commit_node_terminal_v2(
         &self,
         id: &AttemptId,
@@ -1456,6 +1637,130 @@ impl WorkflowHistoryStore for MemoryWorkflowHistoryStore {
                 node_terminals,
                 policy_trigger_json: attempt.policy_trigger_json.clone(),
             }
+        }))
+    }
+
+    async fn commit_node_primary_v3(
+        &self,
+        id: &AttemptId,
+        node: &NodeId,
+        primary_json: &str,
+    ) -> Result<TerminalWrite, LedgerError> {
+        crate::execution_policy::NodePrimaryRecordV3::decode_canonical(primary_json.as_bytes())
+            .map_err(|_| LedgerError::new(LedgerUnavailableReason::Schema))?;
+        let mut structured_v3 = self
+            .structured_v3
+            .lock()
+            .map_err(|_| LedgerError::new(LedgerUnavailableReason::Io))?;
+        let attempt = structured_v3
+            .get_mut(id.as_str())
+            .ok_or_else(|| LedgerError::new(LedgerUnavailableReason::Schema))?;
+        attempt
+            .reservation
+            .node(node)
+            .ok_or_else(|| LedgerError::new(LedgerUnavailableReason::Schema))?;
+        let placeholder = node_primary_placeholder_v3();
+        let (primary, _) = attempt
+            .node_terminals
+            .get_mut(node)
+            .ok_or_else(|| LedgerError::new(LedgerUnavailableReason::Schema))?;
+        if primary == primary_json {
+            return Ok(TerminalWrite::Replayed);
+        }
+        if primary != &placeholder {
+            return Ok(TerminalWrite::Conflict);
+        }
+        *primary = primary_json.to_owned();
+        Ok(TerminalWrite::Applied)
+    }
+
+    async fn settle_node_cleanup_v3(
+        &self,
+        id: &AttemptId,
+        node: &NodeId,
+        cleanup_json: &str,
+    ) -> Result<TerminalWrite, LedgerError> {
+        let cleanup =
+            crate::execution_policy::NodeCleanupRecordV2::decode_canonical(cleanup_json.as_bytes())
+                .map_err(|_| LedgerError::new(LedgerUnavailableReason::Schema))?;
+        if cleanup.cleanup.is_pending() {
+            return Err(LedgerError::new(LedgerUnavailableReason::Schema));
+        }
+        let mut structured_v3 = self
+            .structured_v3
+            .lock()
+            .map_err(|_| LedgerError::new(LedgerUnavailableReason::Io))?;
+        let attempt = structured_v3
+            .get_mut(id.as_str())
+            .ok_or_else(|| LedgerError::new(LedgerUnavailableReason::Schema))?;
+        let admitted = attempt
+            .reservation
+            .node(node)
+            .ok_or_else(|| LedgerError::new(LedgerUnavailableReason::Schema))?
+            .clone();
+        cleanup
+            .validate_for_attempt(id, &admitted.resource_flight_id)
+            .map_err(|_| LedgerError::new(LedgerUnavailableReason::Schema))?;
+        let (_, persisted_cleanup_json) = attempt
+            .node_terminals
+            .get_mut(node)
+            .ok_or_else(|| LedgerError::new(LedgerUnavailableReason::Schema))?;
+        if persisted_cleanup_json == cleanup_json {
+            return Ok(TerminalWrite::Replayed);
+        }
+        let persisted_cleanup = crate::execution_policy::NodeCleanupRecordV2::decode_canonical(
+            persisted_cleanup_json.as_bytes(),
+        )
+        .map_err(|_| LedgerError::new(LedgerUnavailableReason::Schema))?;
+        persisted_cleanup
+            .validate_for_attempt(id, &admitted.resource_flight_id)
+            .map_err(|_| LedgerError::new(LedgerUnavailableReason::Schema))?;
+        if !persisted_cleanup.cleanup.is_pending() {
+            return Ok(TerminalWrite::Conflict);
+        }
+        *persisted_cleanup_json = cleanup_json.to_owned();
+        Ok(TerminalWrite::Applied)
+    }
+
+    async fn structured_evidence_v3(
+        &self,
+        id: &AttemptId,
+    ) -> Result<Option<AttemptStructuredEvidenceV3>, LedgerError> {
+        let structured_v3 = self
+            .structured_v3
+            .lock()
+            .map_err(|_| LedgerError::new(LedgerUnavailableReason::Io))?;
+        let Some(attempt) = structured_v3.get(id.as_str()) else {
+            return Ok(None);
+        };
+        let mut node_terminals = Vec::with_capacity(attempt.node_terminals.len());
+        for node in &attempt.reservation.nodes {
+            let (primary_json, cleanup_json) = attempt
+                .node_terminals
+                .get(&node.node)
+                .ok_or_else(|| LedgerError::new(LedgerUnavailableReason::Schema))?;
+            let cleanup = crate::execution_policy::NodeCleanupRecordV2::decode_canonical(
+                cleanup_json.as_bytes(),
+            )
+            .map_err(|_| LedgerError::new(LedgerUnavailableReason::Schema))?;
+            cleanup
+                .validate_for_attempt(id, &node.resource_flight_id)
+                .map_err(|_| LedgerError::new(LedgerUnavailableReason::Schema))?;
+            if primary_json == &node_primary_placeholder_v3() {
+                continue;
+            }
+            crate::execution_policy::NodePrimaryRecordV3::decode_canonical(primary_json.as_bytes())
+                .map_err(|_| LedgerError::new(LedgerUnavailableReason::Schema))?;
+            node_terminals.push(HistoryNodeTerminalV3 {
+                node: node.node.clone(),
+                sorted_ordinal: node.sorted_ordinal,
+                primary_json: primary_json.clone(),
+                cleanup_json: cleanup_json.clone(),
+            });
+        }
+        Ok(Some(AttemptStructuredEvidenceV3 {
+            reservation: attempt.reservation.clone(),
+            node_terminals,
         }))
     }
 
@@ -1940,6 +2245,107 @@ pub fn report(start_ms: i64, end_ms: i64, rows: &[CompletedAttempt]) -> StatsRep
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn node_cleanup_record_rejects_incoherent_cross_products() {
+        use crate::execution_policy::{
+            CollateralDispositionV1, CollateralResultV1, NodeCleanupRecordV2, NodeCleanupV2,
+            WorktreePreservationDispositionV1, WorktreePreservationResultV1,
+        };
+        use crate::resource_flight::RecoveryOwnerV1;
+
+        let flight = crate::resource_flight::ResourceFlightIdV1::parse(format!(
+            "resource-flight-{}",
+            "a".repeat(64)
+        ))
+        .unwrap();
+        let pending_with_preserved_work = NodeCleanupRecordV2 {
+            schema_version: crate::execution_policy::NODE_CLEANUP_RECORD_SCHEMA_V2,
+            cleanup: NodeCleanupV2::Pending {
+                resource_flight_id: flight.clone(),
+            },
+            preservation: WorktreePreservationResultV1 {
+                disposition: WorktreePreservationDispositionV1::Preserved,
+                custody_id: None,
+                claim_digest: None,
+            },
+            collateral: None,
+        };
+        assert!(pending_with_preserved_work.encode_canonical().is_err());
+
+        let final_with_pending_preservation = NodeCleanupRecordV2 {
+            schema_version: crate::execution_policy::NODE_CLEANUP_RECORD_SCHEMA_V2,
+            cleanup: NodeCleanupV2::Complete { duration_ms: 1 },
+            preservation: WorktreePreservationResultV1::pending(),
+            collateral: None,
+        };
+        assert!(final_with_pending_preservation.encode_canonical().is_err());
+
+        let not_needed_with_preserved_work = NodeCleanupRecordV2 {
+            schema_version: crate::execution_policy::NODE_CLEANUP_RECORD_SCHEMA_V2,
+            cleanup: NodeCleanupV2::NotNeeded,
+            preservation: WorktreePreservationResultV1 {
+                disposition: WorktreePreservationDispositionV1::Preserved,
+                custody_id: None,
+                claim_digest: None,
+            },
+            collateral: None,
+        };
+        assert!(not_needed_with_preserved_work.encode_canonical().is_err());
+
+        let incoherent_collateral = NodeCleanupRecordV2 {
+            schema_version: crate::execution_policy::NODE_CLEANUP_RECORD_SCHEMA_V2,
+            cleanup: NodeCleanupV2::Complete { duration_ms: 1 },
+            preservation: WorktreePreservationResultV1 {
+                disposition: WorktreePreservationDispositionV1::NotNeeded,
+                custody_id: None,
+                claim_digest: None,
+            },
+            collateral: Some(CollateralResultV1 {
+                disposition: CollateralDispositionV1::Partial,
+                affected_owner_count: 0,
+            }),
+        };
+        assert!(incoherent_collateral.encode_canonical().is_err());
+        let admitted_attempt =
+            crate::ids::AttemptId::parse("attempt-cccccccccccccccccccccccccccccccc").unwrap();
+        let wrong_attempt =
+            crate::ids::AttemptId::parse("attempt-dddddddddddddddddddddddddddddddd").unwrap();
+        let recovery_owner = RecoveryOwnerV1 {
+            attempt_id: admitted_attempt.clone(),
+            resource_flight_id: flight.clone(),
+            reason: crate::resource_flight::BoundedRecoveryReasonV1::new("crash").unwrap(),
+        };
+        let partial = NodeCleanupRecordV2 {
+            schema_version: crate::execution_policy::NODE_CLEANUP_RECORD_SCHEMA_V2,
+            cleanup: NodeCleanupV2::Partial {
+                duration_ms: 1,
+                recovery_owner,
+            },
+            preservation: WorktreePreservationResultV1 {
+                disposition: WorktreePreservationDispositionV1::Preserved,
+                custody_id: None,
+                claim_digest: None,
+            },
+            collateral: None,
+        };
+        assert!(partial
+            .validate_for_attempt(&admitted_attempt, &flight)
+            .is_ok());
+        assert!(partial
+            .validate_for_attempt(&wrong_attempt, &flight)
+            .is_err());
+
+        let wrong_flight = crate::resource_flight::ResourceFlightIdV1::parse(format!(
+            "resource-flight-{}",
+            "b".repeat(64)
+        ))
+        .unwrap();
+        assert!(partial
+            .validate_for_attempt(&admitted_attempt, &wrong_flight)
+            .is_err());
+    }
+
     #[test]
     fn quantiles_cover_empty_singleton_even_odd_and_boundary() {
         assert!(distribution([]).is_none());
@@ -2048,6 +2454,219 @@ mod tests {
                 },
             ],
         }
+    }
+
+    fn structured_reservation_v3(identity: AttemptIdentity) -> AttemptReservationV3 {
+        use crate::execution_policy::{
+            resolve_execution_policy_v1, ExecutionPolicyInvocationV1, FanOutPolicyV1,
+            PolicyActivationV1, Sha256HexV1, WorkflowControlDefaultsV1,
+        };
+
+        let controls = resolve_execution_policy_v1(
+            &WorkflowControlDefaultsV1 {
+                fan_out: Some(FanOutPolicyV1::FailFast),
+                ..WorkflowControlDefaultsV1::default()
+            },
+            &ExecutionPolicyInvocationV1::default(),
+            false,
+            PolicyActivationV1::Production,
+        )
+        .unwrap();
+        let controls_json = String::from_utf8(controls.encode_canonical().unwrap()).unwrap();
+        let controls_fingerprint = format!(
+            "controls-{}",
+            Sha256HexV1::digest(controls_json.as_bytes()).as_str()
+        );
+        AttemptReservationV3 {
+            schema_version: WORKFLOW_HISTORY_EVIDENCE_SCHEMA_V3,
+            reservation: served_reservation(identity, ExecutionSurface::Offline),
+            controls_json,
+            controls_fingerprint,
+            expected_node_count: 2,
+            nodes: vec![
+                HistoryNodeReservationV3 {
+                    node: NodeId::parse("root").unwrap(),
+                    sorted_ordinal: 0,
+                    resource_flight_id: crate::resource_flight::ResourceFlightIdV1::parse(format!(
+                        "resource-flight-{}",
+                        "a".repeat(64)
+                    ))
+                    .unwrap(),
+                },
+                HistoryNodeReservationV3 {
+                    node: NodeId::parse("synth").unwrap(),
+                    sorted_ordinal: 1,
+                    resource_flight_id: crate::resource_flight::ResourceFlightIdV1::parse(format!(
+                        "resource-flight-{}",
+                        "b".repeat(64)
+                    ))
+                    .unwrap(),
+                },
+            ],
+        }
+    }
+
+    #[tokio::test]
+    async fn v3_primary_and_pending_cleanup_are_atomically_reserved() {
+        use crate::execution_policy::{
+            NodeCleanupRecordV2, NodeCleanupV2, NodePrimaryRecordV3,
+            WorktreePreservationDispositionV1, WorktreePreservationResultV1,
+        };
+        use crate::resource_flight::{
+            BoundedRecoveryReasonV1, RecoveryOwnerV1, ResourceFlightIdV1,
+        };
+
+        let store = MemoryWorkflowHistoryStore::new();
+        let identity = AttemptIdentity::initial().unwrap();
+        let reservation = structured_reservation_v3(identity.clone());
+        store.reserve_v3(&reservation).await.unwrap();
+
+        let evidence = store
+            .structured_evidence_v3(&identity.attempt_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(evidence.node_terminals.is_empty());
+
+        let primary_json = String::from_utf8(
+            NodePrimaryRecordV3::placeholder()
+                .encode_canonical()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            store
+                .commit_node_primary_v3(
+                    &identity.attempt_id,
+                    &NodeId::parse("root").unwrap(),
+                    &primary_json
+                )
+                .await
+                .unwrap(),
+            TerminalWrite::Applied
+        );
+        let evidence = store
+            .structured_evidence_v3(&identity.attempt_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(evidence.node_terminals.len(), 1);
+        assert!(evidence.node_terminals[0].cleanup_json.contains("pending"));
+
+        let cleanup = NodeCleanupRecordV2 {
+            schema_version: crate::execution_policy::NODE_CLEANUP_RECORD_SCHEMA_V2,
+            cleanup: NodeCleanupV2::Complete { duration_ms: 1 },
+            preservation: WorktreePreservationResultV1 {
+                disposition: WorktreePreservationDispositionV1::NotNeeded,
+                custody_id: None,
+                claim_digest: None,
+            },
+            collateral: None,
+        };
+        let cleanup_json = String::from_utf8(cleanup.encode_canonical().unwrap()).unwrap();
+        assert_eq!(
+            store
+                .settle_node_cleanup_v3(
+                    &identity.attempt_id,
+                    &NodeId::parse("root").unwrap(),
+                    &cleanup_json,
+                )
+                .await
+                .unwrap(),
+            TerminalWrite::Applied
+        );
+        let wrong_attempt = loop {
+            let candidate = AttemptId::mint().unwrap();
+            if candidate != identity.attempt_id {
+                break candidate;
+            }
+        };
+        let wrong_flight =
+            ResourceFlightIdV1::parse(format!("resource-flight-{}", "f".repeat(64))).unwrap();
+        let wrong_cleanup = NodeCleanupRecordV2 {
+            schema_version: crate::execution_policy::NODE_CLEANUP_RECORD_SCHEMA_V2,
+            cleanup: NodeCleanupV2::Partial {
+                duration_ms: 1,
+                recovery_owner: RecoveryOwnerV1 {
+                    attempt_id: wrong_attempt,
+                    resource_flight_id: wrong_flight,
+                    reason: BoundedRecoveryReasonV1::new("crash").unwrap(),
+                },
+            },
+            preservation: WorktreePreservationResultV1 {
+                disposition: WorktreePreservationDispositionV1::Preserved,
+                custody_id: None,
+                claim_digest: None,
+            },
+            collateral: None,
+        };
+        let wrong_cleanup_json =
+            String::from_utf8(wrong_cleanup.encode_canonical().unwrap()).unwrap();
+        assert!(store
+            .settle_node_cleanup_v3(
+                &identity.attempt_id,
+                &NodeId::parse("root").unwrap(),
+                &wrong_cleanup_json,
+            )
+            .await
+            .is_err());
+        let evidence = store
+            .structured_evidence_v3(&identity.attempt_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(evidence.node_terminals[0].cleanup_json, cleanup_json);
+        assert_eq!(
+            store
+                .settle_node_cleanup_v3(
+                    &identity.attempt_id,
+                    &NodeId::parse("root").unwrap(),
+                    &cleanup_json,
+                )
+                .await
+                .unwrap(),
+            TerminalWrite::Replayed
+        );
+        let mut changed = cleanup.clone();
+        changed.cleanup = NodeCleanupV2::Complete { duration_ms: 2 };
+        let changed_json = String::from_utf8(changed.encode_canonical().unwrap()).unwrap();
+        assert_eq!(
+            store
+                .settle_node_cleanup_v3(
+                    &identity.attempt_id,
+                    &NodeId::parse("root").unwrap(),
+                    &changed_json,
+                )
+                .await
+                .unwrap(),
+            TerminalWrite::Conflict
+        );
+    }
+
+    #[test]
+    fn node_terminal_v1_budget_unchanged_and_cleanup_row_within_own_cap() {
+        use crate::execution_policy::{
+            NodeCleanupRecordV2, MAX_NODE_CLEANUP_RECORD_JSON_BYTES, MAX_NODE_TERMINAL_JSON_BYTES,
+        };
+
+        assert_eq!(MAX_NODE_TERMINAL_JSON_BYTES, 2_048);
+        assert_eq!(
+            node_terminal_placeholder_v1().len(),
+            MAX_NODE_TERMINAL_JSON_BYTES
+        );
+        let cleanup = NodeCleanupRecordV2::pending(
+            crate::resource_flight::ResourceFlightIdV1::parse(format!(
+                "resource-flight-{}",
+                "c".repeat(64)
+            ))
+            .unwrap(),
+        );
+        let cleanup_json = cleanup.encode_canonical().unwrap();
+        assert!(cleanup_json.len() <= MAX_NODE_CLEANUP_RECORD_JSON_BYTES);
+        assert_ne!(
+            MAX_NODE_TERMINAL_JSON_BYTES,
+            MAX_NODE_CLEANUP_RECORD_JSON_BYTES.saturating_sub(1)
+        );
     }
 
     #[tokio::test]
