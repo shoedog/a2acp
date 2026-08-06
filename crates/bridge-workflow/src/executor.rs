@@ -193,6 +193,25 @@ fn disposition_from_terminal_v1(terminal: &NodeTerminalV1) -> NodeDisposition {
     }
 }
 
+fn is_timeout_error(error: &BridgeError) -> bool {
+    match error {
+        BridgeError::AgentTimedOut | BridgeError::CancelTimeout => true,
+        BridgeError::AgentFailure { diagnostic } => {
+            diagnostic.class() == bridge_core::diagnostics::DiagnosticFailureClass::Timeout
+        }
+        _ => false,
+    }
+}
+
+fn prompt_acceptance_for_terminal(error: Option<&BridgeError>) -> bool {
+    match error {
+        Some(BridgeError::AgentFailure { diagnostic }) => {
+            diagnostic.prompt_may_have_been_accepted()
+        }
+        _ => false,
+    }
+}
+
 fn canonical_trigger_json_v1(
     trigger: &bridge_core::execution_policy::PolicyTriggerV1,
 ) -> Result<String, BridgeError> {
@@ -338,15 +357,7 @@ impl WorkflowDiagnosticContext {
         )
     }
 
-    fn into_parts(
-        self,
-    ) -> (
-        WorkflowRunContext,
-        Arc<dyn DiagnosticObserverFactory>,
-        Option<PromptDispatchBarrier>,
-        Option<PolicyTriggerBarrier>,
-        Option<FrozenWorkflowAuthority>,
-    ) {
+    fn into_parts(self) -> WorkflowDiagnosticParts {
         (
             self.request,
             self.factory,
@@ -356,6 +367,14 @@ impl WorkflowDiagnosticContext {
         )
     }
 }
+
+type WorkflowDiagnosticParts = (
+    WorkflowRunContext,
+    Arc<dyn DiagnosticObserverFactory>,
+    Option<PromptDispatchBarrier>,
+    Option<PolicyTriggerBarrier>,
+    Option<FrozenWorkflowAuthority>,
+);
 
 pub enum NodeTurnExit {
     Normal,
@@ -1236,6 +1255,10 @@ impl WorkflowOutcome {
     }
 }
 
+#[expect(
+    clippy::large_enum_variant,
+    reason = "the public event shape is stable and avoids a per-node heap allocation"
+)]
 #[derive(Debug, Clone)]
 pub enum WorkflowEvent {
     NodeStarted {
@@ -4717,12 +4740,7 @@ impl WorkflowExecutor {
                             NodePrimaryDispositionV1::Completed
                         }
                         NodeDisposition::Failed
-                            if terminal_error.is_some_and(|error| match error {
-                                BridgeError::AgentTimedOut | BridgeError::CancelTimeout => true,
-                                BridgeError::AgentFailure { diagnostic } => diagnostic.class()
-                                    == bridge_core::diagnostics::DiagnosticFailureClass::Timeout,
-                                _ => false,
-                            }) =>
+                            if terminal_error.is_some_and(is_timeout_error) =>
                         {
                             NodePrimaryDispositionV1::TimedOut
                         }
@@ -4749,14 +4767,8 @@ impl WorkflowExecutor {
                             cause: dependency_set
                                 .map(NodeCauseV1::skipped_dependency)
                                 .or_else(|| terminal_error.map(NodeCauseV1::from_bridge_error)),
-                            prompt_may_have_been_accepted: primary_error.as_ref().is_some_and(
-                                |error| match error {
-                                    BridgeError::AgentFailure { diagnostic } => {
-                                        diagnostic.prompt_may_have_been_accepted()
-                                    }
-                                    _ => false,
-                                },
-                            ),
+                            prompt_may_have_been_accepted:
+                                prompt_acceptance_for_terminal(primary_error.as_ref()),
                             degraded_ancestry,
                             policy_trigger_id: None,
                         },

@@ -244,6 +244,10 @@ use futures::StreamExt;
 
 /// A sink consumes the workflow's events. Intermediate node events are optional
 /// (the detached sink persists each node_finished as a checkpoint in W3b); terminal is also required.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the method mirrors the stable WorkflowEvent::NodeFinished field set; async_trait emits the lint twice"
+)]
 #[async_trait::async_trait]
 pub trait WorkflowSink: Send {
     async fn node_started(&mut self, _node: &str) -> Result<(), BridgeError> {
@@ -4125,6 +4129,10 @@ struct WorkflowSpecVersion {
     v: u16,
 }
 
+#[expect(
+    clippy::large_enum_variant,
+    reason = "the public decoded-snapshot ownership shape is stable and avoids an extra allocation"
+)]
 #[derive(Clone, Debug, PartialEq)]
 pub enum DecodedWorkflowSpec {
     LegacyV1(bridge_workflow::graph::WorkflowGraph),

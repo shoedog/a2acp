@@ -237,6 +237,68 @@ pub fn reauthor_commit(
     )
 }
 
+/// Create an unreachable, deterministic side commit for the Git 2.39-compatible merge-tree
+/// invocation below. This deliberately does not use the operator identity or move any ref.
+fn synthetic_side_commit(
+    clone: &Path,
+    tree_commit: &str,
+    base_commit: &str,
+) -> Result<String, String> {
+    let mut argv = pin_prefix_argv(&clone.to_string_lossy());
+    argv.extend([
+        "commit-tree".into(),
+        format!("{tree_commit}^{{tree}}"),
+        "-p".into(),
+        base_commit.into(),
+        "-F".into(),
+        "-".into(),
+    ]);
+
+    let mut child = std::process::Command::new("git")
+        .arg("-C")
+        .arg(clone)
+        .args(&argv)
+        .env("GIT_AUTHOR_NAME", "a2a-bridge synthetic merge-tree")
+        .env("GIT_AUTHOR_EMAIL", "synthetic@a2a-bridge.invalid")
+        .env("GIT_AUTHOR_DATE", "946684800 +0000")
+        .env("GIT_COMMITTER_NAME", "a2a-bridge synthetic merge-tree")
+        .env("GIT_COMMITTER_EMAIL", "synthetic@a2a-bridge.invalid")
+        .env("GIT_COMMITTER_DATE", "946684800 +0000")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("git commit-tree spawn: {e}"))?;
+    {
+        use std::io::Write;
+        child
+            .stdin
+            .take()
+            .expect("piped commit-tree stdin")
+            .write_all(b"a2a-bridge synthetic merge-tree side\n")
+            .map_err(|e| format!("commit-tree stdin: {e}"))?;
+    }
+    let out = child
+        .wait_with_output()
+        .map_err(|e| format!("commit-tree wait: {e}"))?;
+    if !out.status.success() {
+        let detail = bounded_git_detail(&out.stdout, &out.stderr);
+        return Err(format!(
+            "git commit-tree failed{}",
+            if detail.is_empty() {
+                String::new()
+            } else {
+                format!(": {detail}")
+            }
+        ));
+    }
+    let synthetic = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if synthetic.is_empty() {
+        return Err("git commit-tree returned no commit object".into());
+    }
+    Ok(synthetic)
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum IntegrationError {
     Conflict(String),
@@ -302,16 +364,18 @@ pub fn integrate_run_tree(
     current_commit: &str,
 ) -> Result<String, IntegrationError> {
     require_ancestor(clone, base_commit, target_commit).map_err(IntegrationError::Other)?;
-    let merge_base = format!("--merge-base={base_commit}");
+    let synthetic_target = synthetic_side_commit(clone, target_commit, base_commit)
+        .map_err(|e| IntegrationError::Other(format!("synthetic target commit: {e}")))?;
+    let synthetic_current = synthetic_side_commit(clone, current_commit, base_commit)
+        .map_err(|e| IntegrationError::Other(format!("synthetic current commit: {e}")))?;
     let out = run_git(
         Some(clone),
         &[
             "merge-tree",
             "--write-tree",
             "--name-only",
-            &merge_base,
-            target_commit,
-            current_commit,
+            &synthetic_target,
+            &synthetic_current,
         ],
     )
     .map_err(|e| IntegrationError::Other(format!("git merge-tree spawn: {e}")))?;

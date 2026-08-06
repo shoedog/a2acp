@@ -9,6 +9,7 @@ pub mod domain;
 pub mod error;
 pub mod execution_policy;
 pub mod failure_wire;
+pub mod fs_custody;
 pub mod harvest;
 pub mod ids;
 #[cfg(unix)]
@@ -17,12 +18,14 @@ pub mod mcp;
 pub mod orch;
 pub mod permission;
 pub mod ports;
+pub mod preparation_flight;
 #[cfg(unix)]
 pub mod process;
 pub mod profile;
 pub mod provider;
 #[cfg(unix)]
 pub mod reaper;
+pub mod resource_flight;
 #[cfg(unix)]
 pub mod run_identity;
 pub mod sandbox;

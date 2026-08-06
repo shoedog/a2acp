@@ -31,6 +31,8 @@ pub(crate) const HISTORY_ALLOCATION_TABLES_V2: &[&str] = &[
     "workflow_history_attachment",
     "workflow_history_rewrite_reserve",
     "workflow_attempt_node_terminals",
+    "workflow_attempt_node_primaries_v3",
+    "workflow_attempt_node_cleanups_v2",
     "workflow_history_mutation_reserve",
     "workflow_history_allocation",
 ];
@@ -526,6 +528,8 @@ pub(crate) fn measure_history_pages(
                      'workflow_history_attachment',
                      'workflow_history_rewrite_reserve',
                      'workflow_attempt_node_terminals',
+                     'workflow_attempt_node_primaries_v3',
+                     'workflow_attempt_node_cleanups_v2',
                      'workflow_history_mutation_reserve',
                      'workflow_history_allocation'
                  )) OR (type='index' AND tbl_name IN (
@@ -533,6 +537,8 @@ pub(crate) fn measure_history_pages(
                      'workflow_history_attachment',
                      'workflow_history_rewrite_reserve',
                      'workflow_attempt_node_terminals',
+                     'workflow_attempt_node_primaries_v3',
+                     'workflow_attempt_node_cleanups_v2',
                      'workflow_history_mutation_reserve',
                      'workflow_history_allocation'
                  ))
@@ -675,5 +681,20 @@ mod tests {
         assert!(low < high);
         assert_eq!(decode_u64(high.to_vec()).unwrap(), 256);
         assert_eq!(decode_u64(vec![0; 7]).unwrap_err().reason, R::Corruption);
+    }
+
+    #[test]
+    fn history_allocation_roster_contains_v3_workflow_tables_without_primary_table_or_duplicates() {
+        use std::collections::HashSet;
+
+        assert!(HISTORY_ALLOCATION_TABLES_V2.contains(&"workflow_attempt_node_primaries_v3"));
+        assert!(HISTORY_ALLOCATION_TABLES_V2.contains(&"workflow_attempt_node_cleanups_v2"));
+        assert!(!HISTORY_ALLOCATION_TABLES_V2.contains(&"task_node_terminals_v3"));
+
+        let unique = HISTORY_ALLOCATION_TABLES_V2
+            .iter()
+            .copied()
+            .collect::<HashSet<_>>();
+        assert_eq!(unique.len(), HISTORY_ALLOCATION_TABLES_V2.len());
     }
 }

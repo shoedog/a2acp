@@ -6,6 +6,76 @@ fn compatibility_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../compatibility")
 }
 
+fn trusted_cwd_root() -> PathBuf {
+    PathBuf::from("/Users/wesleyjinks/code")
+}
+
+fn owner_checkout() -> PathBuf {
+    trusted_cwd_root().join("a2a-bridge")
+}
+
+fn current_checkout_root() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(Path::parent)
+        .unwrap_or_else(|| panic!("CARGO_MANIFEST_DIR must identify bin/a2a-bridge"))
+        .to_path_buf()
+}
+
+fn fixture_session_cwd() -> PathBuf {
+    let trusted_root = trusted_cwd_root();
+    match fs::symlink_metadata(&trusted_root) {
+        Ok(_) => {
+            let canonical_root = fs::canonicalize(&trusted_root).unwrap_or_else(|error| {
+                panic!(
+                    "owner-approved trusted cwd root must be resolvable for the fixture: {error}"
+                )
+            });
+            assert!(
+                canonical_root.is_dir(),
+                "owner-approved trusted cwd root must be a directory"
+            );
+            let checkout = fs::canonicalize(current_checkout_root()).unwrap_or_else(|error| {
+                panic!("current checkout must be resolvable for the fixture: {error}")
+            });
+            assert!(
+                checkout.is_dir() && checkout.starts_with(&canonical_root),
+                "current checkout must be an existing directory under the owner-approved trusted cwd root: checkout={}, root={}",
+                checkout.display(),
+                canonical_root.display()
+            );
+            checkout
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            trusted_root.join(".r2f0b-offline-trusted-cwd")
+        }
+        Err(error) => {
+            panic!("cannot inspect the owner-approved trusted cwd root for the fixture: {error}")
+        }
+    }
+}
+
+fn path_assignment(name: &str, path: &Path) -> String {
+    format!("{name} = {:?}", path.to_string_lossy())
+}
+
+fn rebind_session_cwd_entries(source: &str, fixture_cwd: &Path) -> String {
+    let owner_assignment = path_assignment("session_cwd", &owner_checkout());
+    let fixture_assignment = path_assignment("session_cwd", fixture_cwd);
+    let replacement_count = source.matches(&owner_assignment).count();
+    assert!(
+        replacement_count > 0,
+        "copied foundation must contain at least one checked-in session_cwd entry"
+    );
+    let rebound = source.replace(&owner_assignment, &fixture_assignment);
+    assert_eq!(
+        rebound.matches(&fixture_assignment).count(),
+        replacement_count,
+        "every checked-in session_cwd entry must be rebound exactly once"
+    );
+    rebound
+}
+
 fn compatibility_command() -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_a2a-bridge"));
     command.arg("compatibility");
@@ -27,6 +97,7 @@ fn sha256_hex(bytes: &[u8]) -> String {
 
 fn copy_foundation(destination: &Path) {
     let source = compatibility_root();
+    let fixture_cwd = fixture_session_cwd();
     for name in [
         "scheduling-policy.toml",
         "characterization-profiles.toml",
@@ -34,7 +105,18 @@ fn copy_foundation(destination: &Path) {
         "manifest.toml",
         "floating-current.toml",
     ] {
-        fs::copy(source.join(name), destination.join(name)).unwrap();
+        let source_path = source.join(name);
+        let destination_path = destination.join(name);
+        if matches!(name, "scheduled-cases.toml" | "manifest.toml") {
+            let source_text = fs::read_to_string(source_path).unwrap();
+            fs::write(
+                destination_path,
+                rebind_session_cwd_entries(&source_text, &fixture_cwd),
+            )
+            .unwrap();
+        } else {
+            fs::copy(source_path, destination_path).unwrap();
+        }
     }
     fs::create_dir(destination.join("configs")).unwrap();
     for entry in fs::read_dir(source.join("configs")).unwrap() {
@@ -47,6 +129,7 @@ fn copy_foundation(destination: &Path) {
             .unwrap();
         }
     }
+    reseal_copied_inventory(destination);
 }
 
 fn rotate_array_table_section(text: &str, header: &str, next_header: Option<&str>) -> String {
@@ -119,6 +202,49 @@ fn repin_single_profile_mismatch(
     assert_ne!(repinned, inventory, "inventory fingerprint was not found");
     fs::write(inventory_path, repinned).unwrap();
     validate_foundation(root)
+}
+
+fn copied_inventory_population(root: &Path) -> usize {
+    let inventory_path = root.join("characterization-profiles.toml");
+    let inventory: toml::Value = toml::from_str(&fs::read_to_string(inventory_path).unwrap())
+        .unwrap_or_else(|error| panic!("copied characterization inventory must parse: {error}"));
+    let profiles = inventory
+        .get("profiles")
+        .and_then(|value| value.as_array())
+        .unwrap_or_else(|| panic!("copied characterization inventory must contain profiles"));
+    assert!(
+        !profiles.is_empty(),
+        "copied characterization inventory must contain at least one profile"
+    );
+    profiles.len()
+}
+
+fn reseal_copied_inventory(root: &Path) {
+    let replacement_bound = copied_inventory_population(root);
+    let mut output = validate_foundation(root);
+    for _ in 0..replacement_bound {
+        if output.status.success() {
+            return;
+        }
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("characterization fingerprint mismatch"),
+            "unexpected copied-foundation reseal failure: {stderr}"
+        );
+        output = repin_single_profile_mismatch(root, &output);
+    }
+    assert!(
+        output.status.success(),
+        "copied-foundation inventory reseal exhausted its profile-derived bound: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn rebound_foundation_baseline() -> (tempfile::TempDir, std::process::Output) {
+    let fixture = tempfile::tempdir().unwrap();
+    copy_foundation(fixture.path());
+    let output = validate_foundation(fixture.path());
+    (fixture, output)
 }
 
 fn caps_json() -> serde_json::Value {
@@ -297,14 +423,64 @@ fn admission_attempt_record_json(fingerprint: &str) -> serde_json::Value {
 }
 
 #[test]
-fn r3d0_checked_in_schedule_foundation_validates_without_effects() {
-    let output = compatibility_command()
-        .arg("validate")
-        .arg("--schedule-foundation")
-        .arg(compatibility_root())
-        .output()
-        .unwrap();
+fn r3d0_stale_characterization_fingerprint_rejects_without_resealing() {
+    if owner_checkout().is_dir() {
+        let baseline = validate_foundation(&compatibility_root());
+        assert!(
+            baseline.status.success(),
+            "checked-in baseline must validate: {}",
+            String::from_utf8_lossy(&baseline.stderr)
+        );
+    }
 
+    let temp = tempfile::tempdir().unwrap();
+    copy_foundation(temp.path());
+    let copied_baseline = validate_foundation(temp.path());
+    assert!(
+        copied_baseline.status.success(),
+        "an exact copy must validate before mutation: {}",
+        String::from_utf8_lossy(&copied_baseline.stderr)
+    );
+
+    let path = temp.path().join("characterization-profiles.toml");
+    let mut contents = fs::read_to_string(&path).unwrap();
+    contents.push_str("\n# non-semantic characterization inventory comment\n");
+    fs::write(&path, contents).unwrap();
+    let comment_only = validate_foundation(temp.path());
+    assert!(
+        comment_only.status.success(),
+        "a comment-only inventory change must preserve the semantic fingerprint: {}",
+        String::from_utf8_lossy(&comment_only.stderr)
+    );
+
+    let path = temp.path().join("scheduled-cases.toml");
+    let original = fs::read_to_string(&path).unwrap();
+    let changed = original.replacen("timeout_secs = 180", "timeout_secs = 181", 1);
+    assert_ne!(changed, original, "profile-defining fixture did not mutate");
+    fs::write(&path, changed).unwrap();
+
+    let stale = validate_foundation(temp.path());
+    assert!(
+        !stale.status.success(),
+        "mutated checked-in input unexpectedly validated: {}",
+        String::from_utf8_lossy(&stale.stdout)
+    );
+    let stderr = String::from_utf8_lossy(&stale.stderr);
+    assert!(
+        stderr.contains("characterization fingerprint mismatch"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn r3d0_checked_in_schedule_foundation_validates_without_effects() {
+    if !owner_checkout().is_dir() {
+        // The checked-in foundation intentionally names the owner-approved
+        // checkout; an unavailable owner cwd is an explicit offline branch.
+        return;
+    }
+
+    let output = validate_foundation(&compatibility_root());
     assert!(
         output.status.success(),
         "stderr: {}",
@@ -522,7 +698,7 @@ fn r3d0_schedule_foundation_rejects_parent_symlink_escape() {
 
 #[test]
 fn r3d0_execution_only_pins_do_not_change_profile_policy_bundle() {
-    let baseline = validate_foundation(&compatibility_root());
+    let (_fixture, baseline) = rebound_foundation_baseline();
     assert!(baseline.status.success());
     let baseline_bundle = bundle_sha256(&baseline);
 
@@ -562,7 +738,7 @@ fn r3d0_execution_only_pins_do_not_change_profile_policy_bundle() {
 
 #[test]
 fn r3d0_semantic_bundle_ignores_comments_but_validates_recipe_constraints() {
-    let baseline = validate_foundation(&compatibility_root());
+    let (_fixture, baseline) = rebound_foundation_baseline();
     assert!(baseline.status.success());
     let baseline_bundle = bundle_sha256(&baseline);
 
@@ -629,7 +805,7 @@ fn r3d0_semantic_bundle_ignores_comments_but_validates_recipe_constraints() {
 
 #[test]
 fn r3d0_semantic_bundle_ignores_set_and_row_order() {
-    let baseline = validate_foundation(&compatibility_root());
+    let (_fixture, baseline) = rebound_foundation_baseline();
     assert!(baseline.status.success());
     let baseline_bundle = bundle_sha256(&baseline);
 
@@ -784,9 +960,11 @@ fn r3d0_foundation_rejects_untrusted_scheduled_and_claimed_support_cwds() {
         copy_foundation(temp.path());
         let path = temp.path().join(relative);
         let original = fs::read_to_string(&path).unwrap();
+        let fixture_cwd = fixture_session_cwd();
+        let untrusted_cwd = trusted_cwd_root().join("../Documents");
         let changed = original.replacen(
-            "session_cwd = \"/Users/wesleyjinks/code/a2a-bridge\"",
-            "session_cwd = \"/Users/wesleyjinks/code/../Documents\"",
+            &path_assignment("session_cwd", &fixture_cwd),
+            &path_assignment("session_cwd", &untrusted_cwd),
             1,
         );
         assert_ne!(changed, original);
@@ -808,7 +986,7 @@ fn r3d0_foundation_rejects_untrusted_scheduled_and_claimed_support_cwds() {
 fn r3d0_foundation_rejects_a_scheduled_cwd_symlink_escape_after_inventory_repin() {
     use std::os::unix::fs::symlink;
 
-    let trusted_root = Path::new("/Users/wesleyjinks/code");
+    let trusted_root = trusted_cwd_root();
     if !trusted_root.is_dir() {
         // Portable CI validates the owner-specific checked-in identity without mounting the
         // owner's repository root. The unit-level object-resolution test remains unconditional.
@@ -830,10 +1008,11 @@ fn r3d0_foundation_rejects_a_scheduled_cwd_symlink_escape_after_inventory_repin(
 
     let temp = tempfile::tempdir().unwrap();
     copy_foundation(temp.path());
+    let fixture_cwd = fixture_session_cwd();
     let registry_path = temp.path().join("scheduled-cases.toml");
     let original = fs::read_to_string(&registry_path).unwrap();
     let changed = original.replacen(
-        "session_cwd = \"/Users/wesleyjinks/code/a2a-bridge\"",
+        &path_assignment("session_cwd", &fixture_cwd),
         &format!("session_cwd = {:?}", link.to_string_lossy()),
         1,
     );
@@ -884,10 +1063,12 @@ fn r3d0_policy_rejects_a_changed_trusted_cwd_root() {
     let temp = tempfile::tempdir().unwrap();
     copy_foundation(temp.path());
     let path = temp.path().join("scheduling-policy.toml");
+    let trusted_root = trusted_cwd_root();
+    let changed_root = trusted_root.parent().unwrap().to_path_buf();
     let original = fs::read_to_string(&path).unwrap();
     let changed = original.replacen(
-        "trusted_cwd_root = \"/Users/wesleyjinks/code\"",
-        "trusted_cwd_root = \"/Users/wesleyjinks\"",
+        &path_assignment("trusted_cwd_root", &trusted_root),
+        &path_assignment("trusted_cwd_root", &changed_root),
         1,
     );
     assert_ne!(changed, original);

@@ -6,15 +6,17 @@
 
 use crate::graph::{WorkflowGraph, WorkflowNode};
 use bridge_core::execution_policy::{
-    validate_node_execution_identity_v1, FrozenNodeExecutionIdentityV1, FrozenWorkflowControlsV1,
-    LedgerAdmissionV1, PolicyNodeRefV1, Sha256HexV1, EXECUTION_POLICY_SCHEMA_V1,
+    validate_node_execution_identity_v1, FrozenNodeExecutionIdentityV1, FrozenR2f1bContractV1,
+    FrozenWorkflowControlsV1, LedgerAdmissionV1, PolicyNodeRefV1, Sha256HexV1,
+    EXECUTION_POLICY_SCHEMA_V1,
 };
-use bridge_core::ids::AttemptId;
+use bridge_core::ids::{AttemptId, AttemptIdentity};
 use bridge_core::SessionCwd;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 pub const WORKFLOW_SNAPSHOT_V2: u16 = 2;
+pub const WORKFLOW_SNAPSHOT_V3: u16 = 3;
 pub const MAX_V2_RETRY_ATTEMPTS: u32 = 1_024;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -27,6 +29,9 @@ pub enum RunSpecError {
     RetryBudgetExceeded,
     FingerprintMismatch,
     SnapshotEncoding,
+    InvalidAttemptLineage,
+    DeliverySpecChanged,
+    InvalidR2f1bContract,
 }
 
 impl std::fmt::Display for RunSpecError {
@@ -39,7 +44,10 @@ impl std::fmt::Display for RunSpecError {
             Self::InvalidRetry => "invalid frozen retry policy",
             Self::RetryBudgetExceeded => "critical-path retry backoff exceeds the work cutoff",
             Self::FingerprintMismatch => "frozen workflow fingerprint mismatch",
-            Self::SnapshotEncoding => "invalid workflow snapshot V2 encoding",
+            Self::SnapshotEncoding => "invalid workflow snapshot encoding",
+            Self::InvalidAttemptLineage => "invalid workflow snapshot attempt lineage",
+            Self::DeliverySpecChanged => "workflow snapshot delivery spec changed",
+            Self::InvalidR2f1bContract => "invalid R2f1b contract",
         })
     }
 }
@@ -66,6 +74,113 @@ pub struct WorkflowRunSpecV1 {
 struct WorkflowSnapshotEnvelopeV2 {
     v: u16,
     run_spec: WorkflowRunSpecV1,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorkflowSnapshotEnvelopeV3 {
+    v: u16,
+    attempt: AttemptIdentity,
+    delivery_spec: WorkflowRunSpecV1,
+    predecessor_snapshot_digest: Option<Sha256HexV1>,
+    r2f1b: FrozenR2f1bContractV1,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct WorkflowSnapshotV3 {
+    pub attempt: AttemptIdentity,
+    pub delivery_spec: WorkflowRunSpecV1,
+    pub predecessor_snapshot_digest: Option<Sha256HexV1>,
+    pub r2f1b: FrozenR2f1bContractV1,
+}
+
+impl WorkflowSnapshotV3 {
+    pub fn validate(&self) -> Result<(), RunSpecError> {
+        self.delivery_spec.validate()?;
+        self.r2f1b
+            .validate()
+            .map_err(|_| RunSpecError::InvalidR2f1bContract)?;
+        match (self.attempt.ordinal, &self.attempt.parent_attempt_id) {
+            (0, None) => {
+                if self.predecessor_snapshot_digest.is_some()
+                    || self.attempt.attempt_id != self.delivery_spec.attempt_id
+                {
+                    return Err(RunSpecError::InvalidAttemptLineage);
+                }
+            }
+            (0, Some(_)) | (_, None) => return Err(RunSpecError::InvalidAttemptLineage),
+            (_, Some(parent)) => {
+                if self.predecessor_snapshot_digest.is_none()
+                    || parent == &self.attempt.attempt_id
+                    || self.attempt.attempt_id == self.delivery_spec.attempt_id
+                {
+                    return Err(RunSpecError::InvalidAttemptLineage);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub fn encode(&self) -> Result<Vec<u8>, RunSpecError> {
+        self.validate()?;
+        serde_json::to_vec(&WorkflowSnapshotEnvelopeV3 {
+            v: WORKFLOW_SNAPSHOT_V3,
+            attempt: self.attempt.clone(),
+            delivery_spec: self.delivery_spec.clone(),
+            predecessor_snapshot_digest: self.predecessor_snapshot_digest.clone(),
+            r2f1b: self.r2f1b.clone(),
+        })
+        .map_err(|_| RunSpecError::SnapshotEncoding)
+    }
+
+    pub fn digest(&self) -> Result<Sha256HexV1, RunSpecError> {
+        Ok(Sha256HexV1::digest(&self.encode()?))
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, RunSpecError> {
+        let envelope: WorkflowSnapshotEnvelopeV3 =
+            serde_json::from_slice(bytes).map_err(|_| RunSpecError::SnapshotEncoding)?;
+        if envelope.v != WORKFLOW_SNAPSHOT_V3 {
+            return Err(RunSpecError::UnsupportedSchema);
+        }
+        let snapshot = Self {
+            attempt: envelope.attempt,
+            delivery_spec: envelope.delivery_spec,
+            predecessor_snapshot_digest: envelope.predecessor_snapshot_digest,
+            r2f1b: envelope.r2f1b,
+        };
+        snapshot.validate()?;
+        if snapshot.encode()? != bytes {
+            return Err(RunSpecError::SnapshotEncoding);
+        }
+        Ok(snapshot)
+    }
+
+    pub fn validate_successor(predecessor: &Self, successor: &Self) -> Result<(), RunSpecError> {
+        predecessor.validate()?;
+        successor.validate()?;
+        if successor.attempt.attempt_id == predecessor.attempt.attempt_id
+            || successor.attempt.execution_id != predecessor.attempt.execution_id
+            || successor.attempt.ordinal
+                != predecessor
+                    .attempt
+                    .ordinal
+                    .checked_add(1)
+                    .ok_or(RunSpecError::InvalidAttemptLineage)?
+            || successor.attempt.parent_attempt_id.as_ref() != Some(&predecessor.attempt.attempt_id)
+            || successor.predecessor_snapshot_digest.as_ref() != Some(&predecessor.digest()?)
+        {
+            return Err(RunSpecError::InvalidAttemptLineage);
+        }
+        let predecessor_delivery = serde_json::to_vec(&predecessor.delivery_spec)
+            .map_err(|_| RunSpecError::SnapshotEncoding)?;
+        let successor_delivery = serde_json::to_vec(&successor.delivery_spec)
+            .map_err(|_| RunSpecError::SnapshotEncoding)?;
+        if predecessor_delivery != successor_delivery || predecessor.r2f1b != successor.r2f1b {
+            return Err(RunSpecError::DeliverySpecChanged);
+        }
+        Ok(())
+    }
 }
 
 fn push_bytes(target: &mut Vec<u8>, value: &[u8]) {
@@ -285,6 +400,30 @@ impl WorkflowRunSpecV1 {
             return Err(RunSpecError::FingerprintMismatch);
         }
         Ok(())
+    }
+
+    pub fn encode_snapshot_v3(
+        &self,
+        attempt: AttemptIdentity,
+        r2f1b: FrozenR2f1bContractV1,
+    ) -> Result<Vec<u8>, RunSpecError> {
+        if attempt.ordinal != 0
+            || attempt.parent_attempt_id.is_some()
+            || attempt.attempt_id != self.attempt_id
+        {
+            return Err(RunSpecError::InvalidAttemptLineage);
+        }
+        WorkflowSnapshotV3 {
+            attempt,
+            delivery_spec: self.clone(),
+            predecessor_snapshot_digest: None,
+            r2f1b,
+        }
+        .encode()
+    }
+
+    pub fn decode_snapshot_v3(bytes: &[u8]) -> Result<WorkflowSnapshotV3, RunSpecError> {
+        WorkflowSnapshotV3::decode(bytes)
     }
 
     pub fn encode_snapshot_v2(&self) -> Result<Vec<u8>, RunSpecError> {

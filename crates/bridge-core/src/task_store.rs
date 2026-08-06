@@ -7,7 +7,7 @@ use crate::harvest::{
     HarvestAuditBundleV1, HarvestAuditCommit, HarvestAuditStore, HarvestAuditStoreError,
     HarvestRawRecordV1, HarvestSanitizationDecisionV1,
 };
-use crate::ids::{BatchId, ContextId, NodeId, OperationId, TaskId, TurnId};
+use crate::ids::{AttemptId, BatchId, ContextId, NodeId, OperationId, TaskId, TurnId};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -274,6 +274,13 @@ pub enum NodeCheckpointOutput {
 pub struct NodeTerminalEvidenceV1 {
     pub node: NodeId,
     pub terminal_json: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct NodeTerminalEvidenceV3 {
+    pub node: NodeId,
+    pub primary_json: String,
+    pub cleanup_json: String,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -661,6 +668,47 @@ pub trait TaskStore: HarvestAuditStore + Send + Sync {
         Ok(Vec::new())
     }
 
+    async fn reserve_node_terminal_rows_v3(
+        &self,
+        _task: &TaskId,
+        _attempt: &AttemptId,
+        _reservation: &crate::workflow_history::AttemptReservationV3,
+    ) -> Result<(), BridgeError> {
+        Err(BridgeError::StoreFailure)
+    }
+
+    async fn put_node_primary_sequenced_v3(
+        &self,
+        _task: &TaskId,
+        _attempt: &AttemptId,
+        _node: &NodeId,
+        _operation_id: &OperationId,
+        _ts: i64,
+        _primary_json: &str,
+    ) -> Result<i64, BridgeError> {
+        Err(BridgeError::StoreFailure)
+    }
+
+    async fn settle_node_cleanup_sequenced_v3(
+        &self,
+        _task: &TaskId,
+        _attempt: &AttemptId,
+        _node: &NodeId,
+        _operation_id: &OperationId,
+        _ts: i64,
+        _cleanup_json: &str,
+    ) -> Result<i64, BridgeError> {
+        Err(BridgeError::StoreFailure)
+    }
+
+    async fn node_terminal_evidence_v3(
+        &self,
+        _task: &TaskId,
+        _attempt: &AttemptId,
+    ) -> Result<Vec<NodeTerminalEvidenceV3>, BridgeError> {
+        Ok(Vec::new())
+    }
+
     async fn workflow_task_evidence(
         &self,
         _task: &TaskId,
@@ -953,6 +1001,14 @@ pub fn validate_harvest_bundle_shape(
     Ok(())
 }
 
+#[derive(Clone)]
+struct MemoryNodeTerminalV3 {
+    primary_json: String,
+    cleanup_json: String,
+    primary_seq: Option<i64>,
+    cleanup_seq: Option<i64>,
+}
+
 /// In-memory `TaskStore` (the default when no DB path is configured). Production
 /// use, not just a test fake — lives in `bridge-core` so `bridge-a2a-inbound`
 /// can default to it WITHOUT depending on `bridge-store`.
@@ -975,6 +1031,10 @@ pub struct MemoryTaskStore {
     node_terminals: Mutex<HashMap<(String, String), String>>,
     /// Canonical R2f1a trigger bytes attached to the selected checkpoint.
     node_policy_triggers: Mutex<HashMap<(String, String), String>>,
+    /// Inactive R2f1b rows keyed by (task, attempt, node).
+    node_terminals_v3: Mutex<HashMap<(String, String, String), MemoryNodeTerminalV3>>,
+    node_v3_reservations:
+        Mutex<HashMap<(String, String), crate::workflow_history::AttemptReservationV3>>,
     /// Additive task-level R2f1a outcome/trigger evidence.
     workflow_evidence: Mutex<HashMap<String, WorkflowTaskEvidenceV1>>,
     /// Per-task monotonic seq counter. Key: task_id.
@@ -1015,6 +1075,8 @@ impl MemoryTaskStore {
             checkpoints: Mutex::new(HashMap::new()),
             node_terminals: Mutex::new(HashMap::new()),
             node_policy_triggers: Mutex::new(HashMap::new()),
+            node_terminals_v3: Mutex::new(HashMap::new()),
+            node_v3_reservations: Mutex::new(HashMap::new()),
             workflow_evidence: Mutex::new(HashMap::new()),
             seq_counters: Mutex::new(HashMap::new()),
             terminal_seqs: Mutex::new(HashMap::new()),
@@ -2256,6 +2318,241 @@ impl TaskStore for MemoryTaskStore {
             })
             .collect::<Result<Vec<_>, BridgeError>>()?;
         evidence.sort_by(|left, right| left.node.cmp(&right.node));
+        Ok(evidence)
+    }
+
+    async fn reserve_node_terminal_rows_v3(
+        &self,
+        task: &TaskId,
+        attempt: &AttemptId,
+        reservation: &crate::workflow_history::AttemptReservationV3,
+    ) -> Result<(), BridgeError> {
+        reservation
+            .validate()
+            .map_err(|_| BridgeError::StoreFailure)?;
+        if reservation.reservation.task_id.as_ref() != Some(task)
+            || reservation.reservation.identity.attempt_id != *attempt
+        {
+            return Err(BridgeError::StoreFailure);
+        }
+        let _guard = self.journal_fold_guard.lock().unwrap();
+        if !self.inner.lock().unwrap().contains_key(task.as_str()) {
+            return Err(BridgeError::StoreFailure);
+        }
+        let reservation_key = (task.as_str().to_owned(), attempt.as_str().to_owned());
+        let mut reservations = self.node_v3_reservations.lock().unwrap();
+        if reservations.contains_key(&reservation_key) {
+            return Err(BridgeError::StoreFailure);
+        }
+        let mut rows = self.node_terminals_v3.lock().unwrap();
+        if reservation.nodes.iter().any(|node| {
+            rows.contains_key(&(
+                task.as_str().to_owned(),
+                attempt.as_str().to_owned(),
+                node.node.as_str().to_owned(),
+            ))
+        }) {
+            return Err(BridgeError::StoreFailure);
+        }
+        let placeholder = crate::workflow_history::node_primary_placeholder_v3();
+        for node in &reservation.nodes {
+            let cleanup = crate::execution_policy::NodeCleanupRecordV2::pending(
+                node.resource_flight_id.clone(),
+            );
+            let cleanup_json = String::from_utf8(
+                cleanup
+                    .encode_canonical()
+                    .map_err(|_| BridgeError::StoreFailure)?,
+            )
+            .map_err(|_| BridgeError::StoreFailure)?;
+            rows.insert(
+                (
+                    task.as_str().to_owned(),
+                    attempt.as_str().to_owned(),
+                    node.node.as_str().to_owned(),
+                ),
+                MemoryNodeTerminalV3 {
+                    primary_json: placeholder.clone(),
+                    cleanup_json,
+                    primary_seq: None,
+                    cleanup_seq: None,
+                },
+            );
+        }
+        reservations.insert(reservation_key, reservation.clone());
+        Ok(())
+    }
+
+    async fn put_node_primary_sequenced_v3(
+        &self,
+        task: &TaskId,
+        attempt: &AttemptId,
+        node: &NodeId,
+        _operation_id: &OperationId,
+        _ts: i64,
+        primary_json: &str,
+    ) -> Result<i64, BridgeError> {
+        crate::execution_policy::NodePrimaryRecordV3::decode_canonical(primary_json.as_bytes())
+            .map_err(|_| BridgeError::StoreFailure)?;
+        let _guard = self.journal_fold_guard.lock().unwrap();
+        let reservation = self
+            .node_v3_reservations
+            .lock()
+            .unwrap()
+            .get(&(task.as_str().to_owned(), attempt.as_str().to_owned()))
+            .cloned()
+            .ok_or(BridgeError::StoreFailure)?;
+        reservation.node(node).ok_or(BridgeError::StoreFailure)?;
+        let key = (
+            task.as_str().to_owned(),
+            attempt.as_str().to_owned(),
+            node.as_str().to_owned(),
+        );
+        let placeholder = crate::workflow_history::node_primary_placeholder_v3();
+        {
+            let rows = self.node_terminals_v3.lock().unwrap();
+            let row = rows.get(&key).ok_or(BridgeError::StoreFailure)?;
+            if row.primary_json == primary_json {
+                if row.primary_json == placeholder {
+                    return Err(BridgeError::StoreFailure);
+                }
+                return row.primary_seq.ok_or(BridgeError::StoreFailure);
+            }
+            if row.primary_json != placeholder || row.primary_seq.is_some() {
+                return Err(BridgeError::StoreFailure);
+            }
+        }
+        let seq = self.next_seq(task.as_str());
+        let mut rows = self.node_terminals_v3.lock().unwrap();
+        let row = rows.get_mut(&key).ok_or(BridgeError::StoreFailure)?;
+        if row.primary_json != placeholder {
+            return Err(BridgeError::StoreFailure);
+        }
+        row.primary_json = primary_json.to_owned();
+        row.primary_seq = Some(seq);
+        Ok(seq)
+    }
+
+    async fn settle_node_cleanup_sequenced_v3(
+        &self,
+        task: &TaskId,
+        attempt: &AttemptId,
+        node: &NodeId,
+        _operation_id: &OperationId,
+        _ts: i64,
+        cleanup_json: &str,
+    ) -> Result<i64, BridgeError> {
+        let cleanup =
+            crate::execution_policy::NodeCleanupRecordV2::decode_canonical(cleanup_json.as_bytes())
+                .map_err(|_| BridgeError::StoreFailure)?;
+        if cleanup.cleanup.is_pending() {
+            return Err(BridgeError::StoreFailure);
+        }
+        let _guard = self.journal_fold_guard.lock().unwrap();
+        let reservation = self
+            .node_v3_reservations
+            .lock()
+            .unwrap()
+            .get(&(task.as_str().to_owned(), attempt.as_str().to_owned()))
+            .cloned()
+            .ok_or(BridgeError::StoreFailure)?;
+        let admitted = reservation
+            .node(node)
+            .ok_or(BridgeError::StoreFailure)?
+            .clone();
+        cleanup
+            .validate_for_attempt(attempt, &admitted.resource_flight_id)
+            .map_err(|_| BridgeError::StoreFailure)?;
+        let key = (
+            task.as_str().to_owned(),
+            attempt.as_str().to_owned(),
+            node.as_str().to_owned(),
+        );
+        {
+            let rows = self.node_terminals_v3.lock().unwrap();
+            let row = rows.get(&key).ok_or(BridgeError::StoreFailure)?;
+            if row.cleanup_json == cleanup_json {
+                return row.cleanup_seq.ok_or(BridgeError::StoreFailure);
+            }
+            let persisted = crate::execution_policy::NodeCleanupRecordV2::decode_canonical(
+                row.cleanup_json.as_bytes(),
+            )
+            .map_err(|_| BridgeError::StoreFailure)?;
+            if !persisted.cleanup.is_pending() || row.cleanup_seq.is_some() {
+                return Err(BridgeError::StoreFailure);
+            }
+        }
+        let seq = self.next_seq(task.as_str());
+        let mut rows = self.node_terminals_v3.lock().unwrap();
+        let row = rows.get_mut(&key).ok_or(BridgeError::StoreFailure)?;
+        if row.cleanup_seq.is_some() {
+            return Err(BridgeError::StoreFailure);
+        }
+        if row.cleanup_json
+            != crate::execution_policy::NodeCleanupRecordV2::pending(
+                admitted.resource_flight_id.clone(),
+            )
+            .encode_canonical()
+            .ok()
+            .and_then(|bytes| String::from_utf8(bytes).ok())
+            .ok_or(BridgeError::StoreFailure)?
+        {
+            return Err(BridgeError::StoreFailure);
+        }
+        row.cleanup_json = cleanup_json.to_owned();
+        row.cleanup_seq = Some(seq);
+        Ok(seq)
+    }
+
+    async fn node_terminal_evidence_v3(
+        &self,
+        task: &TaskId,
+        attempt: &AttemptId,
+    ) -> Result<Vec<NodeTerminalEvidenceV3>, BridgeError> {
+        let _guard = self.journal_fold_guard.lock().unwrap();
+        let reservation = self
+            .node_v3_reservations
+            .lock()
+            .unwrap()
+            .get(&(task.as_str().to_owned(), attempt.as_str().to_owned()))
+            .cloned()
+            .ok_or(BridgeError::StoreFailure)?;
+        let rows = self.node_terminals_v3.lock().unwrap();
+        let mut evidence = Vec::with_capacity(reservation.nodes.len());
+        for node in &reservation.nodes {
+            let row = rows
+                .get(&(
+                    task.as_str().to_owned(),
+                    attempt.as_str().to_owned(),
+                    node.node.as_str().to_owned(),
+                ))
+                .ok_or(BridgeError::StoreFailure)?;
+            let cleanup = crate::execution_policy::NodeCleanupRecordV2::decode_canonical(
+                row.cleanup_json.as_bytes(),
+            )
+            .map_err(|_| BridgeError::StoreFailure)?;
+            cleanup
+                .validate_for_attempt(attempt, &node.resource_flight_id)
+                .map_err(|_| BridgeError::StoreFailure)?;
+            if row.primary_json == crate::workflow_history::node_primary_placeholder_v3() {
+                if row.primary_seq.is_some() || row.cleanup_seq.is_some() {
+                    return Err(BridgeError::StoreFailure);
+                }
+                continue;
+            }
+            crate::execution_policy::NodePrimaryRecordV3::decode_canonical(
+                row.primary_json.as_bytes(),
+            )
+            .map_err(|_| BridgeError::StoreFailure)?;
+            if row.primary_seq.is_none() {
+                return Err(BridgeError::StoreFailure);
+            }
+            evidence.push(NodeTerminalEvidenceV3 {
+                node: node.node.clone(),
+                primary_json: row.primary_json.clone(),
+                cleanup_json: row.cleanup_json.clone(),
+            });
+        }
         Ok(evidence)
     }
 
@@ -4874,6 +5171,185 @@ mod tests {
             store.get_attempt_locator(&task).await.unwrap(),
             Some(current)
         );
+    }
+
+    #[tokio::test]
+    async fn v3_task_rows_are_attempt_scoped_and_replay_their_own_sequences() {
+        use crate::execution_policy::{
+            NodeCleanupRecordV2, NodeCleanupV2, NodePrimaryDispositionV1, NodePrimaryRecordV3,
+            Sha256HexV1, WorktreePreservationDispositionV1, WorktreePreservationResultV1,
+        };
+        use crate::workflow_history::{
+            AttemptReservation, AttemptReservationV3, HistoryNodeReservationV3,
+            WORKFLOW_HISTORY_EVIDENCE_SCHEMA_V3,
+        };
+
+        let store = MemoryTaskStore::new();
+        let task = TaskId::parse("task-v3").unwrap();
+        store
+            .create(&TaskRecord {
+                id: task.clone(),
+                workflow: "review".into(),
+                status: TaskRecordStatus::Working,
+                result: None,
+                error: None,
+                created_ms: 1,
+                updated_ms: 1,
+                last_artifact_ms: None,
+                input: String::new(),
+                workflow_spec_json: None,
+                resume_attempts: 0,
+                session_cwd: None,
+                batch_id: None,
+                item_id: None,
+                artifacts_purged_at: None,
+            })
+            .await
+            .unwrap();
+
+        let reservation = |attempt: &str, flight: char| {
+            let controls = crate::execution_policy::resolve_execution_policy_v1(
+                &crate::execution_policy::WorkflowControlDefaultsV1::default(),
+                &crate::execution_policy::ExecutionPolicyInvocationV1::default(),
+                false,
+                crate::execution_policy::PolicyActivationV1::Production,
+            )
+            .unwrap();
+            let controls_json = String::from_utf8(controls.encode_canonical().unwrap()).unwrap();
+            AttemptReservationV3 {
+                schema_version: WORKFLOW_HISTORY_EVIDENCE_SCHEMA_V3,
+                reservation: AttemptReservation {
+                    identity: crate::ids::AttemptIdentity {
+                        execution_id: crate::ids::ExecutionId::parse(
+                            "exec-33333333333333333333333333333333",
+                        )
+                        .unwrap(),
+                        attempt_id: AttemptId::parse(attempt).unwrap(),
+                        ordinal: 0,
+                        parent_attempt_id: None,
+                    },
+                    task_id: Some(task.clone()),
+                    workflow: "review".into(),
+                    task_class: "workflow".into(),
+                    surface: crate::workflow_history::ExecutionSurface::Offline,
+                    policy: "r2f1b".into(),
+                    workload_fingerprint: "shape".into(),
+                    started_ms: 1,
+                    workload_fingerprint_complete: true,
+                    prompt_acceptance: "not_dispatched".into(),
+                    pinned: false,
+                },
+                controls_fingerprint: format!(
+                    "controls-{}",
+                    Sha256HexV1::digest(controls_json.as_bytes()).as_str()
+                ),
+                expected_node_count: 1,
+                nodes: vec![HistoryNodeReservationV3 {
+                    node: NodeId::parse("root").unwrap(),
+                    sorted_ordinal: 0,
+                    resource_flight_id: crate::resource_flight::ResourceFlightIdV1::parse(format!(
+                        "resource-flight-{}",
+                        flight.to_string().repeat(64)
+                    ))
+                    .unwrap(),
+                }],
+                controls_json,
+            }
+        };
+
+        let attempt1 = AttemptId::parse("attempt-31313131313131313131313131313131").unwrap();
+        let attempt2 = AttemptId::parse("attempt-32323232323232323232323232323232").unwrap();
+        let row1 = reservation(attempt1.as_str(), 'a');
+        let row2 = reservation(attempt2.as_str(), 'b');
+        let node = NodeId::parse("root").unwrap();
+        let op = OperationId::parse("op-v3").unwrap();
+        store
+            .reserve_node_terminal_rows_v3(&task, &attempt1, &row1)
+            .await
+            .unwrap();
+        let primary = NodePrimaryRecordV3 {
+            schema_version: crate::execution_policy::NODE_PRIMARY_RECORD_SCHEMA_V3,
+            primary: NodePrimaryDispositionV1::Completed,
+            cause: None,
+            prompt_may_have_been_accepted: false,
+            degraded_ancestry: false,
+            policy_trigger_id: None,
+        };
+        let primary_json = String::from_utf8(primary.encode_canonical().unwrap()).unwrap();
+        let seq1 = store
+            .put_node_primary_sequenced_v3(&task, &attempt1, &node, &op, 1, &primary_json)
+            .await
+            .unwrap();
+
+        store
+            .reserve_node_terminal_rows_v3(&task, &attempt2, &row2)
+            .await
+            .unwrap();
+        let seq2 = store
+            .put_node_primary_sequenced_v3(&task, &attempt2, &node, &op, 2, &primary_json)
+            .await
+            .unwrap();
+        assert!(seq2 > seq1);
+        assert_eq!(
+            store
+                .put_node_primary_sequenced_v3(&task, &attempt1, &node, &op, 3, &primary_json)
+                .await
+                .unwrap(),
+            seq1
+        );
+        assert!(store
+            .put_node_primary_sequenced_v3(
+                &TaskId::parse("other-task").unwrap(),
+                &attempt1,
+                &node,
+                &op,
+                4,
+                &primary_json,
+            )
+            .await
+            .is_err());
+        assert!(store
+            .put_node_primary_sequenced_v3(
+                &task,
+                &AttemptId::parse("attempt-33333333333333333333333333333333").unwrap(),
+                &node,
+                &op,
+                5,
+                &primary_json,
+            )
+            .await
+            .is_err());
+
+        let cleanup = NodeCleanupRecordV2 {
+            schema_version: crate::execution_policy::NODE_CLEANUP_RECORD_SCHEMA_V2,
+            cleanup: NodeCleanupV2::Complete { duration_ms: 1 },
+            preservation: WorktreePreservationResultV1 {
+                disposition: WorktreePreservationDispositionV1::NotNeeded,
+                custody_id: None,
+                claim_digest: None,
+            },
+            collateral: None,
+        };
+        let cleanup_json = String::from_utf8(cleanup.encode_canonical().unwrap()).unwrap();
+        let cleanup_seq = store
+            .settle_node_cleanup_sequenced_v3(&task, &attempt1, &node, &op, 6, &cleanup_json)
+            .await
+            .unwrap();
+        assert!(cleanup_seq > seq2);
+        assert_eq!(
+            store
+                .settle_node_cleanup_sequenced_v3(&task, &attempt1, &node, &op, 7, &cleanup_json,)
+                .await
+                .unwrap(),
+            cleanup_seq
+        );
+        let mut changed_cleanup = cleanup.clone();
+        changed_cleanup.cleanup = NodeCleanupV2::Complete { duration_ms: 2 };
+        let changed_json = String::from_utf8(changed_cleanup.encode_canonical().unwrap()).unwrap();
+        assert!(store
+            .settle_node_cleanup_sequenced_v3(&task, &attempt1, &node, &op, 8, &changed_json,)
+            .await
+            .is_err());
     }
 
     #[tokio::test]

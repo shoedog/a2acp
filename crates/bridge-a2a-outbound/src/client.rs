@@ -438,7 +438,7 @@ impl A2aClient {
                 match parse_and_map(&ev.data, &tx) {
                     MapResult::Skip => {}
                     MapResult::Event(e) => {
-                        yield Ok(e);
+                        yield Ok(*e);
                     }
                     MapResult::Terminal => {
                         done = true;
@@ -488,7 +488,7 @@ enum MapResult {
     /// Unknown top-level key — skip this event, continue streaming.
     Skip,
     /// Yield this event and continue streaming.
-    Event(Event),
+    Event(Box<Event>),
     /// Terminal `StatusUpdate(Completed)` reached: end the stream without an error item.
     Terminal,
     /// Yield this error and end the stream.
@@ -539,7 +539,7 @@ fn parse_and_map(json_str: &str, tx: &watch::Sender<Option<PeerTaskId>>) -> MapR
                     .and_then(|m| m.text())
                     .unwrap_or("")
                     .to_string();
-                MapResult::Event(Event::status(text))
+                MapResult::Event(Box::new(Event::status(text)))
             }
         }
 
@@ -556,7 +556,7 @@ fn parse_and_map(json_str: &str, tx: &watch::Sender<Option<PeerTaskId>>) -> MapR
 
             // Every artifact chunk → Artifact event; continue streaming.
             // The stream ends only on a terminal StatusUpdate, not on lastChunk.
-            MapResult::Event(Event::artifact(text))
+            MapResult::Event(Box::new(Event::artifact(text)))
         }
 
         a2a::StreamResponse::Task(t) => {
@@ -567,7 +567,7 @@ fn parse_and_map(json_str: &str, tx: &watch::Sender<Option<PeerTaskId>>) -> MapR
 
         a2a::StreamResponse::Message(m) => {
             let text: String = m.parts.iter().filter_map(|p| p.as_text()).collect();
-            MapResult::Event(Event::status(text))
+            MapResult::Event(Box::new(Event::status(text)))
         }
     }
 }
