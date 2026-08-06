@@ -21750,7 +21750,8 @@ mod r2f0a_history_tests {
         use bridge_core::workflow_history::LedgerUnavailableReason as R;
 
         let schema_directory = tempfile::tempdir().unwrap();
-        let schema_path = schema_directory.path().join("configured-v3-schema.sqlite");
+        let schema_path =
+            canonical_fixture_path(&schema_directory.path().join("configured-v3-schema.sqlite"));
         {
             let store = SqliteStore::open_shared_history(&schema_path).unwrap();
             let v3 = structured_history_reservation_v3();
@@ -21772,7 +21773,8 @@ mod r2f0a_history_tests {
         assert_eq!(error.reason, R::Corruption);
 
         let roster_directory = tempfile::tempdir().unwrap();
-        let roster_path = roster_directory.path().join("configured-v3-roster.sqlite");
+        let roster_path =
+            canonical_fixture_path(&roster_directory.path().join("configured-v3-roster.sqlite"));
         {
             let store = SqliteStore::open_shared_history(&roster_path).unwrap();
             let v3 = structured_history_reservation_v3();

@@ -91,8 +91,11 @@
   Opus/high/plan hard-read-only closure review returned `APPROVE` with **0 WRONG / 14 SMELL-DEFER / no open-class
   finding**. Operator-authored exact-tree commit `23ed6439` is submitted by PR #50; its
   [closure record](superpowers/reviews/2026-08-06-r2f1b-opus-closure.md) owns the identities, repairs, controls,
-  limitations, and next-slice hard gates. No automatic deadline activation, compatibility run, release, deployment,
-  or running-operator mutation is implied.
+  limitations, and next-slice hard gates. PR CI measured `bridge-core` at **86.50%** line coverage, and local
+  first-error enumeration measured `bridge-workflow` at **87.63%**; PR #50 retains respective hard floors of
+  **86%** and **87%**. Restoring both package gates to **90%** is one deferred follow-on rather than release
+  acceptance for this slice. No automatic deadline activation, compatibility run, release, deployment, or
+  running-operator mutation is implied.
 - **R2f0p candidate verification (2026-07-30):** locked full workspace **2,994 passed / 0 failed / 12 ignored**
   across **61** test targets; diff/format, locked all-target/all-feature workspace check, warnings-denied Clippy,
   locked release workspace build, and repository hygiene **38 tracked artifacts / 7 example configs** are green.

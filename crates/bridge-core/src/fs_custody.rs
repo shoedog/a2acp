@@ -5,7 +5,9 @@
 //! no-replace publication needed by later custody tests/slices.
 
 use serde::{Deserialize, Serialize};
-use std::ffi::{CString, OsStr};
+#[cfg(unix)]
+use std::ffi::CString;
+use std::ffi::OsStr;
 use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
