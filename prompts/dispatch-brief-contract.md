@@ -74,6 +74,10 @@ suite cannot disagree with that class, so no gate will catch it for you.
 > Do not review anything else; do not confirm what you could not check yourself.
 > A refutation is a success, not a failure.
 
+An implementation handoff in scope here uses the handoff template installed adjacent
+to the global steering carrier (canonical: steering repo `bootstrap/handoff-template.md`)
+and carries this section's verdict on its `**§2c verdict:**` line.
+
 ## 3. Provenance tiers (required in relays and fix-claims)
 
 Separate, explicitly: **RE-RAN THIS TURN** (command + output attached) vs **SUPPLIED,
