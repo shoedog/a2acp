@@ -54,9 +54,12 @@ escalate. Order S1→S5 is preferred but only S3/S4 depend on S2.
   `ContainerOrImage`, plus `Unclassified`, which reapers must refuse; `CredentialOrSecret` is a §5
   cleanup-rule class, not an observable report class), measured bytes, live-consumer status per probed kind
   (lease, operation lock, container mount; the process/open-file probe lands with S3 at the destructive
-  boundary and reports `Unknown` until then), git HEAD, and containment: for implement clones, whether
-  HEAD's content is contained by the local source repo's current refs (the S4 query); for worktree items,
-  `origin/*` containment as of the last fetch, which can overstate remote reachability. No deletion, no
+  boundary and reports `Unknown` until then), git HEAD, and containment: for implement clones, a three-valued
+  `on_source_main` — `yes(head)` (reachable from source main), `yes(tree)` (exact tree on source main —
+  covers exact-tree squash landings), `no`, or `unknown` (any failed probe is inadmissible and never reads
+  `no`) — the S4 gate, fail-closed (rewritten squash trees read `no` and the clone is retained); any-ref
+  reachability is informational only. For worktree items, `origin/*` containment as of the last fetch,
+  which can overstate remote reachability. No deletion, no
   push, no network; sole state-visible exception: the advisory flock the lock probe takes and immediately
   releases (a racing merge/resume sees a clean retryable refusal). This is the audit instrument for S3/S4
   and for §8 triggers.
@@ -194,6 +197,14 @@ rewrite; sequence/journal accounting; history-growth preflight symmetry; reserve
 `integrate_run_tree` tests; platform/test fixture edges; restoring `bridge-core` 86% → 90% and
 `bridge-workflow` 87% → 90% coverage floors. Each is a bounded follow-on, none blocks slice-2 entry, and
 none may be silently dropped from successor plans.
+
+**Deferred from the 2026-08-07 Sol/high fold review** (DEFER-graded findings, carried, not dropped):
+volume ownership stays name-prefix until S3 labels volumes at creation (foreign `a2a-*` volumes can be
+misattributed — disclosed in the report's notes); non-UTF-8 directory entries in bridge roots are skipped
+(S3/S4 destructive code must refuse ambiguity independently); the `storage_cmd`/`storage_runtime_pass`
+CLI orchestration lacks seam-injected behavioral tests (S3 adds them with the reaper seams). Also carried:
+`shorten_bounded_cause`'s outer loop is measured-unreachable defensive dead code under current byte-budget
+constants (A3 evidence, 1702-byte worst case vs 2048 cap).
 
 ## 10. Corrections from revision 2 (audit trail)
 
