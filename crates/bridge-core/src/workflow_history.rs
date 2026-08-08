@@ -2643,6 +2643,248 @@ mod tests {
         );
     }
 
+    /// Two-node terminal map: ROOT fails with a durable diagnostic and SYNTH is
+    /// recorded as skipped-dependency but neither has had cleanup settled (both
+    /// still carry the `Pending` placeholder cleanup minted by `reserve_v3`). A
+    /// rejected `settle_node_cleanup_v3` on ROOT (a recovery-owner mismatch, the
+    /// same store-level rejection mechanism exercised by
+    /// `v3_primary_and_pending_cleanup_are_atomically_reserved` above) must not
+    /// mutate ANY node's evidence.
+    ///
+    /// Discriminates: a `settle_node_cleanup_v3` implementation that partially
+    /// applies a rejected write (e.g. validates ownership only after already
+    /// overwriting the persisted cleanup slot), or that corrupts/clears an
+    /// unrelated sibling node's row while handling one node's write.
+    #[tokio::test]
+    async fn v3_root_primary_cause_and_pending_sibling_survive_a_rejected_cleanup_settle() {
+        use crate::diagnostics::{DiagnosticCode, DiagnosticFailureClass, DiagnosticRedactor};
+        use crate::execution_policy::{
+            DependencySetRefV1, NodeCauseV1, NodeCleanupRecordV2, NodeCleanupV2,
+            NodePrimaryDispositionV1, NodePrimaryRecordV3, Sha256HexV1,
+            WorktreePreservationDispositionV1, WorktreePreservationResultV1,
+            NODE_CLEANUP_RECORD_SCHEMA_V2, NODE_PRIMARY_RECORD_SCHEMA_V3,
+        };
+        use crate::resource_flight::{
+            BoundedRecoveryReasonV1, RecoveryOwnerV1, ResourceFlightIdV1,
+        };
+
+        let store = MemoryWorkflowHistoryStore::new();
+        let identity = AttemptIdentity::initial().unwrap();
+        let reservation = structured_reservation_v3(identity.clone());
+        store.reserve_v3(&reservation).await.unwrap();
+
+        let root = NodeId::parse("root").unwrap();
+        let synth = NodeId::parse("synth").unwrap();
+
+        let root_primary = NodePrimaryRecordV3 {
+            schema_version: NODE_PRIMARY_RECORD_SCHEMA_V3,
+            primary: NodePrimaryDispositionV1::Failed,
+            cause: Some(NodeCauseV1 {
+                failure_class: DiagnosticFailureClass::Persistence,
+                code: DiagnosticCode::build("bridge.store_failure", &DiagnosticRedactor::default())
+                    .unwrap(),
+                deepest_cause: Some("root node primary diagnostic".into()),
+                cause_truncated: false,
+                evidence_overflow: false,
+                dependency_set: None,
+            }),
+            prompt_may_have_been_accepted: false,
+            degraded_ancestry: false,
+            policy_trigger_id: None,
+        };
+        let root_primary_json =
+            String::from_utf8(root_primary.encode_canonical().unwrap()).unwrap();
+        assert_eq!(
+            store
+                .commit_node_primary_v3(&identity.attempt_id, &root, &root_primary_json)
+                .await
+                .unwrap(),
+            TerminalWrite::Applied
+        );
+
+        let synth_primary = NodePrimaryRecordV3 {
+            schema_version: NODE_PRIMARY_RECORD_SCHEMA_V3,
+            primary: NodePrimaryDispositionV1::SkippedDependency,
+            cause: Some(NodeCauseV1::skipped_dependency(DependencySetRefV1 {
+                count: 1,
+                sorted_node_refs_sha256: Sha256HexV1::digest(b"root"),
+            })),
+            prompt_may_have_been_accepted: false,
+            degraded_ancestry: false,
+            policy_trigger_id: None,
+        };
+        let synth_primary_json =
+            String::from_utf8(synth_primary.encode_canonical().unwrap()).unwrap();
+        assert_eq!(
+            store
+                .commit_node_primary_v3(&identity.attempt_id, &synth, &synth_primary_json)
+                .await
+                .unwrap(),
+            TerminalWrite::Applied
+        );
+
+        let before = store
+            .structured_evidence_v3(&identity.attempt_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(before.node_terminals.len(), 2);
+        let root_before = before
+            .node_terminals
+            .iter()
+            .find(|t| t.node == root)
+            .unwrap();
+        let synth_before = before
+            .node_terminals
+            .iter()
+            .find(|t| t.node == synth)
+            .unwrap();
+        assert_eq!(root_before.primary_json, root_primary_json);
+        assert!(
+            NodeCleanupRecordV2::decode_canonical(root_before.cleanup_json.as_bytes())
+                .unwrap()
+                .cleanup
+                .is_pending()
+        );
+        assert_eq!(synth_before.primary_json, synth_primary_json);
+        assert!(
+            NodeCleanupRecordV2::decode_canonical(synth_before.cleanup_json.as_bytes())
+                .unwrap()
+                .cleanup
+                .is_pending()
+        );
+
+        // A recovery owner that matches neither this attempt nor root's admitted
+        // resource flight: `validate_for_attempt` (and thus `settle_node_cleanup_v3`)
+        // must reject this write outright -- a cleanup/store failure.
+        let wrong_attempt = loop {
+            let candidate = AttemptId::mint().unwrap();
+            if candidate != identity.attempt_id {
+                break candidate;
+            }
+        };
+        let wrong_flight =
+            ResourceFlightIdV1::parse(format!("resource-flight-{}", "f".repeat(64))).unwrap();
+        let rejected_cleanup = NodeCleanupRecordV2 {
+            schema_version: NODE_CLEANUP_RECORD_SCHEMA_V2,
+            cleanup: NodeCleanupV2::Partial {
+                duration_ms: 1,
+                recovery_owner: RecoveryOwnerV1 {
+                    attempt_id: wrong_attempt,
+                    resource_flight_id: wrong_flight,
+                    reason: BoundedRecoveryReasonV1::new("crash").unwrap(),
+                },
+            },
+            preservation: WorktreePreservationResultV1 {
+                disposition: WorktreePreservationDispositionV1::Preserved,
+                custody_id: None,
+                claim_digest: None,
+            },
+            collateral: None,
+        };
+        let rejected_cleanup_json =
+            String::from_utf8(rejected_cleanup.encode_canonical().unwrap()).unwrap();
+        // The Applied/Replayed/Conflict positive controls in
+        // v3_primary_and_pending_cleanup_are_atomically_reserved above (~2569-2643)
+        // are what make this is_err() discriminating: settle_node_cleanup_v3 is
+        // proven fallible-but-not-vacuously-so before this test relies on it
+        // actually rejecting a bad write.
+        assert!(store
+            .settle_node_cleanup_v3(&identity.attempt_id, &root, &rejected_cleanup_json)
+            .await
+            .is_err());
+
+        let after = store
+            .structured_evidence_v3(&identity.attempt_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            after, before,
+            "a rejected cleanup settle on root must not mutate any node's evidence, \
+             including the untouched pending sibling"
+        );
+    }
+
+    /// Escape-expansion / near-boundary safety for `NodeCleanupRecordV2::Failed`
+    /// (mirrors the technique in
+    /// `crates/bridge-core/tests/r2f1a_execution_policy.rs:338` for `NodeTerminalV1`):
+    /// a heavily backslash/quote-escaped, emoji-prefixed cause forces the mandatory
+    /// 512-byte (`MAX_DEEPEST_CAUSE_BYTES`) per-field truncation in
+    /// `normalize_bounded_cause`, and the resulting canonical encoding must stay
+    /// within `MAX_NODE_CLEANUP_RECORD_JSON_BYTES` with the cause's identity
+    /// (the leading marker) intact and no broken UTF-8/surrogate escaping.
+    ///
+    /// NOTE ON `shorten_bounded_cause` (execution_policy.rs ~641-651, looped at
+    /// ~1021-1029 inside `NodeCleanupRecordV2::encode_canonical`): this test does
+    /// NOT force that extra truncation loop to execute. Production maintains its
+    /// own worst-case-bytes ceiling for this exact record type --
+    /// `DERIVED_NODE_CLEANUP_RECORD_WORST_CASE_BYTES = 1_936` (execution_policy.rs
+    /// line 49), proved `<= MAX_NODE_CLEANUP_RECORD_JSON_BYTES` (2048) by the
+    /// `const _: () = assert!(...)` at execution_policy.rs line 55 -- which goes
+    /// red automatically at compile time if either bound is ever changed to break
+    /// that inequality, rather than relying on this comment's own re-derived
+    /// arithmetic staying in sync. `cleanup_cause_mut` only ever returns a cause
+    /// for the `Failed` variant, so no legitimately constructible
+    /// `NodeCleanupRecordV2` can drive `encoded.len()` past the cap after the
+    /// initial per-field truncation; the extra while-loop is therefore
+    /// unreachable from any public-API input within that maintained ceiling (see
+    /// PR report: untestable-from-public-surface gap). This test still covers the
+    /// genuine, reachable safety property: the guaranteed 512-byte truncation
+    /// itself is escape- and UTF-8-boundary-safe and preserves cause identity.
+    #[test]
+    fn cleanup_record_v2_failed_cause_bounds_escape_expansion_and_keeps_identity() {
+        use crate::diagnostics::{DiagnosticCode, DiagnosticFailureClass, DiagnosticRedactor};
+        use crate::execution_policy::{
+            NodeCauseV1, NodeCleanupRecordV2, NodeCleanupV2, WorktreePreservationDispositionV1,
+            WorktreePreservationResultV1, MAX_NODE_CLEANUP_RECORD_JSON_BYTES,
+            NODE_CLEANUP_RECORD_SCHEMA_V2,
+        };
+
+        let cause_text = format!("🌞 deepest {}", "\\\"".repeat(300));
+        let record = NodeCleanupRecordV2 {
+            schema_version: NODE_CLEANUP_RECORD_SCHEMA_V2,
+            cleanup: NodeCleanupV2::Failed {
+                duration_ms: u64::MAX,
+                cause: NodeCauseV1 {
+                    failure_class: DiagnosticFailureClass::ContainerCredentials,
+                    code: DiagnosticCode::build(
+                        "container.credentials",
+                        &DiagnosticRedactor::default(),
+                    )
+                    .unwrap(),
+                    deepest_cause: Some(cause_text),
+                    cause_truncated: false,
+                    evidence_overflow: false,
+                    dependency_set: None,
+                },
+            },
+            preservation: WorktreePreservationResultV1 {
+                disposition: WorktreePreservationDispositionV1::Removed,
+                custody_id: None,
+                claim_digest: None,
+            },
+            collateral: None,
+        };
+        let encoded = record.encode_canonical().unwrap();
+        assert!(encoded.len() <= MAX_NODE_CLEANUP_RECORD_JSON_BYTES);
+        let encoded_str = std::str::from_utf8(&encoded).unwrap();
+        assert!(encoded_str.contains('\u{1F31E}'));
+        assert!(!encoded_str.contains("\\ud83c"));
+
+        let decoded = NodeCleanupRecordV2::decode_canonical(&encoded).unwrap();
+        let NodeCleanupV2::Failed { cause, .. } = &decoded.cleanup else {
+            panic!("cleanup must remain Failed through the round trip")
+        };
+        assert!(cause.cause_truncated);
+        let deepest = cause
+            .deepest_cause
+            .as_deref()
+            .expect("truncation degrades content before ever dropping it entirely here");
+        assert!(deepest.starts_with('\u{1F31E}'));
+        assert!(deepest.len() <= 512);
+    }
+
     #[test]
     fn node_terminal_v1_budget_unchanged_and_cleanup_row_within_own_cap() {
         use crate::execution_policy::{

@@ -2405,3 +2405,391 @@ pub fn validate_node_execution_identity_v1(
     }
     Ok(())
 }
+
+/// R2f1b A3: `FrozenR2f1bContractV1` custody-plan canonicalization, fingerprint
+/// sensitivity, and `WorktreeCustodyIdV1` shape coverage. Every construction here
+/// goes through the same public constructors production code uses
+/// (`WorktreeCustodyIdV1::parse`, `Sha256HexV1::parse`/`digest`, `SessionCwd::parse`,
+/// struct-literal on the `pub` `FrozenR2f1bContractV1`/`FrozenWorktreeCustodyPlanV1`
+/// fields) — no private-field or pub(crate) backdoor is used or needed.
+#[cfg(test)]
+mod r2f1b_contract_tests {
+    use super::*;
+
+    /// Deterministic 64-hex `Sha256HexV1` for controllable sort-key tests: real
+    /// digests are effectively unordered, so hand-picked repeated-digit hex values
+    /// let a test pin exactly which plan sorts first.
+    fn fp(digit: char) -> Sha256HexV1 {
+        Sha256HexV1::parse(digit.to_string().repeat(64)).unwrap()
+    }
+
+    fn cid(digit: char) -> WorktreeCustodyIdV1 {
+        WorktreeCustodyIdV1::parse(format!("custody-{}", digit.to_string().repeat(64))).unwrap()
+    }
+
+    fn plan(id_digit: char, fp_digit: char) -> FrozenWorktreeCustodyPlanV1 {
+        FrozenWorktreeCustodyPlanV1 {
+            custody_id: cid(id_digit),
+            checkout_fingerprint: fp(fp_digit),
+            target_cwd: SessionCwd::parse("/repo").unwrap(),
+        }
+    }
+
+    /// Build a contract over exactly the given (possibly out-of-order or
+    /// duplicated) `custody_plans`, with its `contract_fingerprint` set to the
+    /// value `validate()` itself would compute for that exact content (replaying
+    /// its own clone-placeholder-then-hash algorithm via the private
+    /// `canonical_json`, reachable here because this test module is a descendant
+    /// of the defining module).
+    ///
+    /// This is deliberate, not incidental: an arbitrary *wrong* placeholder
+    /// fingerprint would make the three order/duplicate rejection tests below
+    /// pass for the wrong reason (the separate, independently-tested fingerprint
+    /// check would reject the contract on its own even if the order/duplicate
+    /// check were deleted entirely). Mutation-checked: with a wrong placeholder
+    /// fingerprint substituted here, weakening the `windows(2)` duplicate check
+    /// from `||` to `&&` left both duplicate tests green (false negative); with
+    /// this helper's genuinely-correct fingerprint, the same mutation turns them
+    /// red as expected.
+    fn contract_with_matching_fingerprint(
+        custody_plans: Vec<FrozenWorktreeCustodyPlanV1>,
+    ) -> FrozenR2f1bContractV1 {
+        let mut contract = FrozenR2f1bContractV1 {
+            schema_version: R2F1B_CONTRACT_SCHEMA_V1,
+            activation: DeadlineActivationV2::ManualOnlyR2f1a,
+            custody_plans,
+            resource_contract_version: R2F1B_RESOURCE_CONTRACT_VERSION_V1,
+            contract_fingerprint: Sha256HexV1::digest(b"r2f1b-contract-fingerprint-placeholder"),
+        };
+        contract.contract_fingerprint = Sha256HexV1::digest(&canonical_json(&contract).unwrap());
+        contract
+    }
+
+    /// Discriminates: `validate()` wrongly accepting a well-formed but out-of-order
+    /// `custody_plans` list (i.e. dropping or short-circuiting the
+    /// `plans != self.custody_plans` canonical-order check). The fingerprint is
+    /// genuinely correct for this exact (unsorted) content, so a passing
+    /// `validate()` here can only mean the order check was skipped.
+    #[test]
+    fn validate_rejects_custody_plans_out_of_canonical_order() {
+        let contract = contract_with_matching_fingerprint(vec![plan('b', '2'), plan('a', '1')]);
+        assert_eq!(
+            contract.validate(),
+            Err(ExecutionPolicyError::InvalidStructuredEvidence)
+        );
+    }
+
+    /// Discriminates: `validate()` wrongly accepting two custody plans that share a
+    /// `custody_id` (distinct `checkout_fingerprint`s keep the list itself sorted, so
+    /// this isolates the duplicate-id arm of the `windows(2)` check from the order
+    /// check above). The fingerprint is genuinely correct for this exact content.
+    #[test]
+    fn validate_rejects_duplicate_custody_id_across_distinct_fingerprints() {
+        let contract = contract_with_matching_fingerprint(vec![plan('a', '1'), plan('a', '2')]);
+        assert_eq!(
+            contract.validate(),
+            Err(ExecutionPolicyError::InvalidStructuredEvidence)
+        );
+    }
+
+    /// Discriminates: `validate()` wrongly accepting two custody plans that share a
+    /// `checkout_fingerprint` (distinct `custody_id`s keep the list itself sorted, so
+    /// this isolates the duplicate-fingerprint arm of the `windows(2)` check). The
+    /// fingerprint is genuinely correct for this exact content.
+    #[test]
+    fn validate_rejects_duplicate_checkout_fingerprint_across_distinct_ids() {
+        let contract = contract_with_matching_fingerprint(vec![plan('a', '1'), plan('b', '1')]);
+        assert_eq!(
+            contract.validate(),
+            Err(ExecutionPolicyError::InvalidStructuredEvidence)
+        );
+    }
+
+    /// Positive counterpart to the three rejection tests above: a canonically
+    /// sorted, uniquely keyed custody-plan list with its correctly computed
+    /// fingerprint must validate.
+    #[test]
+    fn validate_accepts_canonical_sorted_unique_custody_plans() {
+        let contract = FrozenR2f1bContractV1::with_computed_fingerprint(
+            DeadlineActivationV2::ManualOnlyR2f1a,
+            vec![plan('a', '1'), plan('b', '2')],
+        )
+        .unwrap();
+        assert!(contract.validate().is_ok());
+    }
+
+    /// Discriminates: `with_computed_fingerprint` failing to canonicalize
+    /// (sort) an out-of-order input, or the fingerprint it computes not being a
+    /// pure function of the (canonicalized) content — i.e. two independent calls
+    /// over the same unsorted input diverging.
+    #[test]
+    fn with_computed_fingerprint_round_trips_and_is_deterministic() {
+        let unsorted_input = vec![plan('b', '2'), plan('a', '1')];
+        let built = FrozenR2f1bContractV1::with_computed_fingerprint(
+            DeadlineActivationV2::ManualOnlyR2f1a,
+            unsorted_input.clone(),
+        )
+        .unwrap();
+        assert!(built.validate().is_ok());
+        assert_eq!(
+            built.custody_plans,
+            vec![plan('a', '1'), plan('b', '2')],
+            "constructor must canonicalize (sort) its input before freezing it"
+        );
+
+        let rebuilt = FrozenR2f1bContractV1::with_computed_fingerprint(
+            DeadlineActivationV2::ManualOnlyR2f1a,
+            unsorted_input,
+        )
+        .unwrap();
+        assert_eq!(
+            built.contract_fingerprint, rebuilt.contract_fingerprint,
+            "recomputing the fingerprint over identical content must be deterministic"
+        );
+    }
+
+    /// Discriminates: a contract fingerprint that is insensitive to appending a
+    /// custody plan (e.g. a fingerprint computed only over `activation` or only
+    /// over the first plan).
+    #[test]
+    fn fingerprint_changes_when_a_plan_is_added() {
+        let base = FrozenR2f1bContractV1::with_computed_fingerprint(
+            DeadlineActivationV2::ManualOnlyR2f1a,
+            vec![plan('a', '1')],
+        )
+        .unwrap();
+        let extended = FrozenR2f1bContractV1::with_computed_fingerprint(
+            DeadlineActivationV2::ManualOnlyR2f1a,
+            vec![plan('a', '1'), plan('b', '2')],
+        )
+        .unwrap();
+        assert_ne!(base.contract_fingerprint, extended.contract_fingerprint);
+    }
+
+    /// Discriminates: a contract fingerprint that is insensitive to dropping a
+    /// custody plan.
+    #[test]
+    fn fingerprint_changes_when_a_plan_is_dropped() {
+        let full = FrozenR2f1bContractV1::with_computed_fingerprint(
+            DeadlineActivationV2::ManualOnlyR2f1a,
+            vec![plan('a', '1'), plan('b', '2')],
+        )
+        .unwrap();
+        let dropped = FrozenR2f1bContractV1::with_computed_fingerprint(
+            DeadlineActivationV2::ManualOnlyR2f1a,
+            vec![plan('a', '1')],
+        )
+        .unwrap();
+        assert_ne!(full.contract_fingerprint, dropped.contract_fingerprint);
+    }
+
+    /// Discriminates: a contract fingerprint that ignores any one field of a
+    /// `FrozenWorktreeCustodyPlanV1` (e.g. hashing only the custody id, or only the
+    /// fingerprint, or dropping `target_cwd` from the canonical encoding).
+    #[test]
+    fn fingerprint_changes_when_any_plan_field_is_mutated() {
+        let base_plans = vec![plan('a', '1'), plan('b', '2')];
+        let base = FrozenR2f1bContractV1::with_computed_fingerprint(
+            DeadlineActivationV2::ManualOnlyR2f1a,
+            base_plans.clone(),
+        )
+        .unwrap();
+
+        let mut custody_id_changed = base_plans.clone();
+        custody_id_changed[0].custody_id = cid('c');
+        let by_custody_id = FrozenR2f1bContractV1::with_computed_fingerprint(
+            DeadlineActivationV2::ManualOnlyR2f1a,
+            custody_id_changed,
+        )
+        .unwrap();
+        assert_ne!(
+            base.contract_fingerprint, by_custody_id.contract_fingerprint,
+            "custody_id must be part of the canonical encoding"
+        );
+
+        let mut fingerprint_changed = base_plans.clone();
+        fingerprint_changed[0].checkout_fingerprint = fp('3');
+        let by_checkout_fingerprint = FrozenR2f1bContractV1::with_computed_fingerprint(
+            DeadlineActivationV2::ManualOnlyR2f1a,
+            fingerprint_changed,
+        )
+        .unwrap();
+        assert_ne!(
+            base.contract_fingerprint, by_checkout_fingerprint.contract_fingerprint,
+            "checkout_fingerprint must be part of the canonical encoding"
+        );
+
+        let mut cwd_changed = base_plans;
+        cwd_changed[0].target_cwd = SessionCwd::parse("/other-repo").unwrap();
+        let by_target_cwd = FrozenR2f1bContractV1::with_computed_fingerprint(
+            DeadlineActivationV2::ManualOnlyR2f1a,
+            cwd_changed,
+        )
+        .unwrap();
+        assert_ne!(
+            base.contract_fingerprint, by_target_cwd.contract_fingerprint,
+            "target_cwd must be part of the canonical encoding"
+        );
+    }
+
+    /// Discriminates: `with_computed_fingerprint` silently minting a fingerprint
+    /// over a custody-plan list that duplicates a plan wholesale, instead of
+    /// routing through the same `validate()` invariant every other duplicate case
+    /// above is caught by.
+    #[test]
+    fn with_computed_fingerprint_rejects_a_duplicated_plan() {
+        let duplicated = vec![plan('a', '1'), plan('a', '1')];
+        assert_eq!(
+            FrozenR2f1bContractV1::with_computed_fingerprint(
+                DeadlineActivationV2::ManualOnlyR2f1a,
+                duplicated,
+            ),
+            Err(ExecutionPolicyError::InvalidStructuredEvidence)
+        );
+    }
+
+    /// Discriminates: `validate()` failing to recompute and compare the
+    /// fingerprint (e.g. only checking presence/shape of `contract_fingerprint`,
+    /// not its value) — a contract whose stored fingerprint does not match its
+    /// content must be rejected even though every other field is well-formed.
+    #[test]
+    fn validate_rejects_a_contract_carrying_a_stale_fingerprint() {
+        let mut contract = FrozenR2f1bContractV1::with_computed_fingerprint(
+            DeadlineActivationV2::ManualOnlyR2f1a,
+            vec![plan('a', '1'), plan('b', '2')],
+        )
+        .unwrap();
+        let genuine = contract.contract_fingerprint.clone();
+        contract.contract_fingerprint = Sha256HexV1::digest(b"a-different-and-wrong-fingerprint");
+        assert_ne!(contract.contract_fingerprint, genuine);
+        assert_eq!(
+            contract.validate(),
+            Err(ExecutionPolicyError::InvalidStructuredEvidence)
+        );
+    }
+
+    /// Direct proof, not composed from two separate tests: mutating a
+    /// custody-plan element IN PLACE while KEEPING the previously-valid
+    /// `contract_fingerprint` untouched is rejected. `fingerprint_changes_when_any_plan_field_is_mutated`
+    /// above proves a plan-field edit moves the COMPUTED fingerprint;
+    /// `validate_rejects_a_contract_carrying_a_stale_fingerprint` above proves an
+    /// arbitrary WRONG digest is rejected. Neither test, alone or composed,
+    /// constructs the exact "in-place edit left a stale-but-real fingerprint
+    /// behind" state a resume/replay bug would actually produce — this test
+    /// does, directly.
+    #[test]
+    fn validate_rejects_a_plan_mutated_in_place_under_the_original_fingerprint() {
+        let mut contract = FrozenR2f1bContractV1::with_computed_fingerprint(
+            DeadlineActivationV2::ManualOnlyR2f1a,
+            vec![plan('a', '1'), plan('b', '2')],
+        )
+        .unwrap();
+        let original_fingerprint = contract.contract_fingerprint.clone();
+        contract.custody_plans[0].target_cwd = SessionCwd::parse("/mutated-in-place").unwrap();
+        assert_eq!(
+            contract.contract_fingerprint, original_fingerprint,
+            "sanity: only the plan changed — the stored fingerprint field itself \
+             must be untouched by this mutation for the test to be meaningful"
+        );
+        assert_eq!(
+            contract.validate(),
+            Err(ExecutionPolicyError::InvalidStructuredEvidence)
+        );
+    }
+
+    /// Golden fingerprint: every other fingerprint test in this module is
+    /// differential (change X, expect the fingerprint to move; change nothing,
+    /// expect it to stay put) — none of them pin the ACTUAL persisted value. A
+    /// canonicalization change (a field reorder, a different placeholder
+    /// literal, a hash algorithm swap) would move production and every
+    /// differential test's expectations together, silently, since they only ever
+    /// compare freshly-computed fingerprints to each other. This test computes
+    /// `with_computed_fingerprint` over one fully fixed, hand-picked contract
+    /// (fixed custody id, fixed checkout fingerprint, fixed activation — no
+    /// `mint()` or content-derived `digest()` anywhere in its construction) and
+    /// pins the result to a literal computed once and pasted here. A red here
+    /// means the persisted-fingerprint algorithm changed and needs an explicit
+    /// compatibility ruling: existing durable R2f1b contracts on disk, minted
+    /// under the old algorithm, would no longer validate.
+    #[test]
+    fn with_computed_fingerprint_matches_a_pinned_golden_value() {
+        let golden_plan = FrozenWorktreeCustodyPlanV1 {
+            custody_id: WorktreeCustodyIdV1::parse(format!("custody-{}", "7".repeat(64))).unwrap(),
+            checkout_fingerprint: Sha256HexV1::parse("9".repeat(64)).unwrap(),
+            target_cwd: SessionCwd::parse("/golden/repo").unwrap(),
+        };
+        let contract = FrozenR2f1bContractV1::with_computed_fingerprint(
+            DeadlineActivationV2::ManualOnlyR2f1a,
+            vec![golden_plan],
+        )
+        .unwrap();
+        assert_eq!(
+            contract.contract_fingerprint.as_str(),
+            "245eada7d63d2dfca7e191b35b3302b0ea0691fc11108b09a21e0f477ff29dce"
+        );
+    }
+
+    /// Discriminates: a contract fingerprint that does not cover `activation`,
+    /// which would let a `ManualOnlyR2f1a` contract be replayed/accepted in place
+    /// of an `AutomaticR2f1b` one (or vice versa) with an unchanged fingerprint.
+    #[test]
+    fn activation_variant_is_part_of_the_contract_fingerprint() {
+        let plans = vec![plan('a', '1')];
+        let manual = FrozenR2f1bContractV1::with_computed_fingerprint(
+            DeadlineActivationV2::ManualOnlyR2f1a,
+            plans.clone(),
+        )
+        .unwrap();
+        let automatic = FrozenR2f1bContractV1::with_computed_fingerprint(
+            DeadlineActivationV2::AutomaticR2f1b,
+            plans,
+        )
+        .unwrap();
+        assert_ne!(manual.contract_fingerprint, automatic.contract_fingerprint);
+    }
+
+    /// Discriminates: `WorktreeCustodyIdV1::parse` accepting a suffix that is not
+    /// exactly 64 hex characters (an off-by-one length check), and `mint()`
+    /// producing an id that fails its own `parse`.
+    #[test]
+    fn worktree_custody_id_accepts_the_exact_prefixed_64_hex_shape() {
+        assert!(WorktreeCustodyIdV1::parse(format!("custody-{}", "1".repeat(64))).is_ok());
+
+        let minted = WorktreeCustodyIdV1::mint().unwrap();
+        assert!(minted.as_str().starts_with(WorktreeCustodyIdV1::PREFIX));
+        assert_eq!(minted.as_str().len(), WorktreeCustodyIdV1::ENCODED_LEN);
+        assert!(WorktreeCustodyIdV1::parse(minted.as_str()).is_ok());
+    }
+
+    /// Discriminates: a length check that is off by one in either direction.
+    #[test]
+    fn worktree_custody_id_rejects_wrong_length() {
+        assert!(WorktreeCustodyIdV1::parse(format!("custody-{}", "1".repeat(63))).is_err());
+        assert!(WorktreeCustodyIdV1::parse(format!("custody-{}", "1".repeat(65))).is_err());
+    }
+
+    /// Discriminates: a hex-alphabet check that accepts non-hex ASCII or
+    /// uppercase hex (the parser is defined over lowercase `a`-`f` only).
+    #[test]
+    fn worktree_custody_id_rejects_non_hex_or_uppercase_suffix() {
+        assert!(WorktreeCustodyIdV1::parse(format!("custody-{}", "g".repeat(64))).is_err());
+        assert!(WorktreeCustodyIdV1::parse(format!("custody-{}", "A".repeat(64))).is_err());
+    }
+
+    /// Discriminates: the all-zero-suffix guard (`mint()`'s own defense against an
+    /// exhausted/broken RNG returning all zero bytes) being absent from `parse()`,
+    /// which would let an all-zero id round-trip even though `mint()` can never
+    /// produce one.
+    #[test]
+    fn worktree_custody_id_rejects_all_zero_suffix_but_accepts_one_nonzero_digit() {
+        assert!(WorktreeCustodyIdV1::parse(format!("custody-{}", "0".repeat(64))).is_err());
+        assert!(WorktreeCustodyIdV1::parse(format!("custody-{}1", "0".repeat(63))).is_ok());
+    }
+
+    /// Discriminates: a missing or case-sensitive-wrong prefix check.
+    #[test]
+    fn worktree_custody_id_rejects_missing_or_wrong_case_prefix() {
+        assert!(WorktreeCustodyIdV1::parse("1".repeat(72)).is_err());
+        assert!(WorktreeCustodyIdV1::parse(format!("Custody-{}", "1".repeat(64))).is_err());
+    }
+}
