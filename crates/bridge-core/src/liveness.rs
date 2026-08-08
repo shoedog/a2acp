@@ -25,8 +25,26 @@ fn flock_nb(file: &std::fs::File, exclusive: bool) -> std::io::Result<bool> {
     Err(e)
 }
 
-fn flock_unlock(file: &std::fs::File) {
-    unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
+/// Explicit release. Load-bearing: both guards release HERE rather than at close (see
+/// [`PersistentLockGuard::drop`]), so a filesystem that cannot unlock — `ENOLCK`/`EOPNOTSUPP` are reachable
+/// on NFS, and `$HOME/.a2a-bridge/leases` may well be NFS — would silently resurrect the spawn-window bug
+/// this release exists to prevent. Report it instead of swallowing it; releasing is still best-effort
+/// because the close that follows is the only remaining recourse.
+fn flock_unlock(file: &std::fs::File, path: &Path) {
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) } != 0 {
+        let err = std::io::Error::last_os_error();
+        tracing::error!(
+            path = %path.display(),
+            error = %err,
+            "releasing an advisory lock failed; a concurrently spawned child may hold it until it execs"
+        );
+        // Fail loudly in debug builds — but never while unwinding, where a second panic aborts the process.
+        debug_assert!(
+            std::thread::panicking(),
+            "flock(LOCK_UN) failed for {}: {err}",
+            path.display()
+        );
+    }
 }
 
 /// Stable per-host id (best-effort). Labelled `a2a.host` so a sweep never reaps another machine's containers.
@@ -69,7 +87,12 @@ impl LeaseGuard {
 }
 impl Drop for LeaseGuard {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path); // best-effort; the OS already freed the lock
+        // Unlink first to shrink the doomed-inode window; safe only because lease ids are unique per run —
+        // do not reuse lease ids across acquirers. (A contender that opened this inode before the unlink and
+        // flocks after the release below would acquire the doomed inode while a later `create` mints a fresh
+        // one: two holders of one lease id on two inodes.)
+        let _ = std::fs::remove_file(&self.path);
+        flock_unlock(&self._file, &self.path); // see PersistentLockGuard::drop — closing alone is not a release
     }
 }
 
@@ -102,6 +125,18 @@ pub struct PersistentLockGuard {
 impl PersistentLockGuard {
     pub fn path(&self) -> &Path {
         &self.path
+    }
+}
+
+/// Release explicitly instead of relying on the close. A `flock` belongs to the OPEN FILE DESCRIPTION, so
+/// closing our descriptor frees the lock only once EVERY descriptor sharing that description is gone — and
+/// every concurrent process spawn copies our whole descriptor table into the child, where `FD_CLOEXEC` does
+/// not take effect until `exec`. Relying on the close therefore leaks the lock for the width of an unrelated
+/// spawn, making the next `resume`/`merge` fail spuriously with "operation lock already held". `LOCK_UN`
+/// drops the lock from the description itself, so no inherited copy can hold it open.
+impl Drop for PersistentLockGuard {
+    fn drop(&mut self) {
+        flock_unlock(&self._file, &self.path);
     }
 }
 
@@ -149,7 +184,7 @@ impl LeaseProbe for FsLeaseProbe {
             .ok()?;
         match flock_nb(&f, true) {
             Ok(true) => {
-                flock_unlock(&f); // acquired ⇒ free ⇒ owner dead; release so we don't claim it
+                flock_unlock(&f, Path::new(lease_path)); // acquired ⇒ free ⇒ owner dead; release so we don't claim it
                 Some(true)
             }
             Ok(false) => Some(false), // held ⇒ owner alive
@@ -234,6 +269,63 @@ mod tests {
         assert!(path.exists(), "a reusable operation-lock path must persist");
         let reacquired = acquire_persistent_lock_in(dir.path(), "same-run").unwrap();
         drop(reacquired);
+    }
+
+    /// `flock` is owned by the OPEN FILE DESCRIPTION, not by one descriptor, so closing our descriptor
+    /// releases the lock only once EVERY descriptor sharing that description is gone. Any concurrent
+    /// process spawn copies the whole descriptor table into the child, and `FD_CLOEXEC` does not take
+    /// effect until the child reaches `exec` — so for the width of an unrelated spawn, a dropped guard's
+    /// lock stays held and the next acquire fails with `WouldBlock`. `dup` reproduces exactly that
+    /// sharing (one description, two descriptors) with no dependence on process timing.
+    #[test]
+    fn dropped_persistent_lock_is_free_even_while_an_inherited_descriptor_survives() {
+        let dir = tempfile::tempdir().unwrap();
+        let guard = acquire_persistent_lock_in(dir.path(), "run-b").unwrap();
+        let inherited = unsafe { libc::dup(guard._file.as_raw_fd()) };
+        assert!(inherited >= 0, "dup failed");
+
+        // Negative half: while the guard is ALIVE the lock must still exclude. Without this, releasing
+        // early (moving `LOCK_UN` out of `Drop`, or firing it sooner) would keep the positive half green.
+        assert!(
+            acquire_persistent_lock_in(dir.path(), "run-b").is_err(),
+            "a live guard must still exclude a second acquirer"
+        );
+        drop(guard);
+
+        let reacquired = acquire_persistent_lock_in(dir.path(), "run-b").map(|_| ());
+        unsafe { libc::close(inherited) };
+        assert!(
+            reacquired.is_ok(),
+            "dropping the guard must release the operation lock outright, not wait for a concurrently \
+             spawned child to exec: {reacquired:?}"
+        );
+    }
+
+    /// Same mechanism on the crash-detection lease. The misread needs one precondition: the probe must have
+    /// OPENED the lease inode before the owner's unlink — a probe that opens afterwards just gets `None`
+    /// (absent). Given that overlap, `FsLeaseProbe` holds an independent description on the same inode, and
+    /// if the owner's release waits on a descriptor inherited by a concurrently spawned child, the probe
+    /// reads `Some(false)` = "owner alive" for an owner that is already gone, suppressing a container reap.
+    #[test]
+    fn dropped_lease_probes_free_even_while_an_inherited_descriptor_survives() {
+        let dir = tempfile::tempdir().unwrap();
+        let guard = acquire_lease_in(dir.path(), "r1").unwrap();
+        let observer = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(guard.path())
+            .unwrap();
+        let inherited = unsafe { libc::dup(guard._file.as_raw_fd()) };
+        assert!(inherited >= 0, "dup failed");
+        drop(guard);
+
+        let free = flock_nb(&observer, true).unwrap();
+        unsafe { libc::close(inherited) };
+        assert!(
+            free,
+            "a dropped lease must read as free (owner gone) even while a concurrently spawned child \
+             still holds an inherited descriptor"
+        );
     }
 
     #[test]
