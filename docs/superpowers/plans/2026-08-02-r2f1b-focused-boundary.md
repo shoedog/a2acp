@@ -577,13 +577,13 @@ cleanup transfer, and terminal publication — reusing `fail_sync_on_nth_call_fo
 
 | Invariant | Fail-first regression | Negative / edge |
 |---|---|---|
-| Protection precedes clocks/effects | `automatic_activation_waits_for_parent_synced_protection` | Parent-sync failure → zero provider/process/timer calls |
+| Protection precedes clocks/effects *(effects half: slice 2; activation half: slice 4 — 2026-08-08 slice-2 brief)* | `automatic_activation_waits_for_parent_synced_protection` | Parent-sync failure → zero provider/process/timer calls |
 | Preparation is finitely owned | `nonreturning_custody_sync_transfers_pre_effect_owner` | Typed bounded terminal/transfer; zero provider/session/process/materialization/destructive-sweep calls |
 | Both sweeps exclude protection | `prepared_and_preserved_survive_run_end_and_dead_boot_sweep` | Corrupt/missing/mismatched/symlinked/multi-link → unknown, never deleted |
 | Partial add preserved | `add_failure_after_target_creation_never_removes_target` | Failure before any target exists may settle the unused marker only |
 | Candidate settlement | `unused_candidate_settles_only_after_exact_absence` | Crash after claim exchange remains `RecoveredLive` and sweep-protected |
-| Exact resume exchange | `successor_attempt_and_claim_exchange_precede_resume_provider_effect` | Reused current attempt, wrong origin/digest/lineage/parent refuses |
-| Cancel cannot delete | `completed_sibling_survives_later_workflow_cutoff` | Node-local success cannot remove; global healthy success with capability removes exactly once |
+| Exact resume exchange *(mechanism: slice 2; production resume path: slice 5 — 2026-08-08 slice-2 brief)* | `successor_attempt_and_claim_exchange_precede_resume_provider_effect` | Reused current attempt, wrong origin/digest/lineage/parent refuses |
+| Cancel cannot delete *(timer-driven cutoff variant: slice 4; slice 2 lands the outcome-driven equivalent — 2026-08-08 slice-2 brief)* | `completed_sibling_survives_later_workflow_cutoff` | Node-local success cannot remove; global healthy success with capability removes exactly once |
 | Silence only warns | `thirty_minute_no_progress_crossing_is_actionless` | Activity w/o progress doesn't reset; progress at 29:59 does |
 | Warning cadence | `warning_ordinal_emits_once_per_progress_epoch` | Duplicate wake and cutoff/warning tie don't duplicate |
 | Mechanical proof may cancel | `exited_owned_child_cancels_before_cutoff` | Unknown liveness and healthy silence never cancel |
