@@ -314,6 +314,89 @@ pub fn acquire_cache_volume_lock(
     )
 }
 
+// ─── F-1 item 2: the warm-cache lock (the S5 defect one volume over) ──────────────────────────
+//
+// `warm_lsp_deps_step` (bin main.rs) writes the per-repo warm LSP dep volume with NO lock — the exact
+// same "shared volume, unserialized container run" shape S5 closed for verify, on a DIFFERENT cache
+// volume (`[[languages]].warm_cache`, not `[verify].cache`). This section mirrors S5's lock verbatim —
+// same `cache_volume_lock_dir` namespace/fallback rules, same wait-not-fail contract, same
+// contended-note + degradation-arm semantics — under a DISTINCT `warm-` prefix. That prefix is ordinary
+// NAMESPACE SEPARATION for two independent, legitimately-concurrent lock families (a verify run and a
+// warm-deps fetch are expected to proceed at the same time when they hold DIFFERENT volumes) — it is
+// NOT a safety mechanism for a shared volume. If `warm_cache` and `[verify].cache` ever produced the
+// SAME volume name, these two non-communicating locks would NOT serialize a concurrent verify + warm-
+// deps fetch against it — that IS the corruption case, which is exactly why config.rs's F-1 item 3
+// rejects the alias at parse time. The actual guard against that corruption is the config-level
+// rejection, not this prefix.
+
+/// Distinct from [`CACHE_VOLUME_LOCK_PREFIX`] ("verify-"): a warm-cache lock id can never collide with a
+/// verify-cache lock id even for the same volume name, and (like `CACHE_VOLUME_LOCK_PREFIX`) can never
+/// collide with the run-operation-lock namespace ("impl-<pid>-<nonce>").
+pub const WARM_CACHE_LOCK_PREFIX: &str = "warm-";
+
+/// PURE. The lock id serializing warm-deps fetches that share one cache volume (file: `warm-<volume>.lock`).
+pub fn warm_cache_lock_id(cache_vol: &str) -> String {
+    format!("{WARM_CACHE_LOCK_PREFIX}{cache_vol}")
+}
+
+/// PURE. The operator note printed once when a warm-deps fetch is about to wait for another fetch of the
+/// same repository. Pure so its content is asserted by a test rather than by scraping stderr.
+pub fn warm_cache_wait_note(cache_vol: &str) -> String {
+    format!(
+        "[implement] lsp warm-deps: waiting for a concurrent warm-deps fetch of the same repository \
+         (cache volume {cache_vol}) to finish..."
+    )
+}
+
+/// Take the exclusive per-cache-volume warm-deps lock, WAITING (not failing) for any concurrent
+/// same-volume fetch — mirrors [`acquire_cache_volume_lock`]'s wait-not-fail contract (a warm fetch
+/// legitimately runs for a while, so a `WouldBlock` refusal would strand real work), same validation,
+/// under the distinct `warm-` namespace.
+pub fn acquire_warm_cache_lock(
+    lock_dir: &std::path::Path,
+    cache_vol: &str,
+) -> std::io::Result<bridge_core::liveness::PersistentLockGuard> {
+    if !is_volume_name(cache_vol) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("cache volume name {cache_vol:?} is not a usable lock id"),
+        ));
+    }
+    let note = || eprintln!("{}", warm_cache_wait_note(cache_vol));
+    bridge_core::liveness::acquire_persistent_lock_blocking_in(
+        lock_dir,
+        &warm_cache_lock_id(cache_vol),
+        &note,
+    )
+}
+
+/// Run ONE warm-deps fetch command (the injected `runner`, mirroring [`Runner`]) under the exclusive
+/// per-volume warm-cache lock, WAITING for a concurrent same-volume fetch rather than corrupting the
+/// shared cache. A lock that cannot be taken (unwritable namespace, no working `flock`, a non-volume-
+/// shaped name) degrades LOUDLY to an unserialized run rather than failing the fetch — same
+/// degradation-arm semantics as [`run_verify_serialized`].
+pub fn run_warm_fetch_serialized(
+    cache_vol: &str,
+    runner: &Runner,
+    lock_dir: &std::path::Path,
+    program: &str,
+    argv: &[String],
+) -> std::io::Result<(i32, String)> {
+    let _cache_volume = match acquire_warm_cache_lock(lock_dir, cache_vol) {
+        Ok(guard) => Some(guard),
+        Err(e) => {
+            eprintln!(
+                "[implement] lsp warm-deps: could not take the cache-volume lock in {} ({e}) — running \
+                 UNSERIALIZED; a concurrent warm-deps fetch of the same repository could corrupt the \
+                 shared {cache_vol} cache",
+                lock_dir.display()
+            );
+            None
+        }
+    };
+    runner(program, argv)
+}
+
 /// A command runner: given `(program, argv)`, run it and return `(exit_code, combined_output)`. The real
 /// impl spawns Docker; tests inject a stub. The exit code is the CONTAINER's — unforgeable by in-container
 /// agent code.
@@ -323,6 +406,15 @@ pub type Runner<'a> = dyn Fn(&str, &[String]) -> std::io::Result<(i32, String)> 
 /// container's exit code. Every configured population is reached even after an earlier command failure,
 /// so one repair round receives the complete bounded defect set. Pure given an injected `runner`.
 /// Returns `VerifyOutcome::Skipped` when `profile` is `None` (`--lang none`) without spawning any container.
+///
+/// `run`/`owner` (F-1 item 1) name + label EVERY spawned container exactly like implement's other managed
+/// containers (`a2a_name` + `RunHandle::labels`), so the ADR-0021 label reaper, `containers list|reap`,
+/// and (via the STABLE `owner` — see `verify_sweep_target` in bin main.rs) the NEXT process's
+/// `recover_orphans` can all find a verify container. `recover_orphans`, not `RunEndGuard`, is the
+/// SIGKILL-covering path: `RunEndGuard` is a `Drop` guard that runs on clean exit or a panic unwind, never
+/// under SIGKILL. Each command's ordinal is the name's tail (1-based) so sequential commands never
+/// collide on a container name.
+#[allow(clippy::too_many_arguments)] // 2 more than before F-1 item 1: the naming/labeling identity
 pub fn run_verify_recorded(
     cfg: &VerifyConfig,
     profile: Option<&bridge_core::profile::LanguageProfile>,
@@ -331,6 +423,8 @@ pub fn run_verify_recorded(
     runner: &Runner,
     max_bytes: usize,
     recorder: &dyn bridge_core::attempt_activity::AttemptRecorder,
+    run: &bridge_core::run_identity::RunHandle,
+    owner: &str,
 ) -> VerifyOutcome {
     let profile = match profile {
         None => {
@@ -351,6 +445,18 @@ pub fn run_verify_recorded(
             bridge_core::attempt_activity::ActivityReason::GateStarted,
             ordinal,
         );
+        let name =
+            bridge_core::sandbox::a2a_name("verify", owner, &run.instance_id, &ordinal.to_string());
+        let labels = run
+            .labels(
+                "verify",
+                "oneshot",
+                &c.name,
+                owner,
+                Some(clone.as_str()),
+                Some(clone.as_str()),
+            )
+            .to_arg_pairs();
         let (prog, argv) = bridge_core::sandbox::compose_verify(
             cfg.runtime.as_deref(),
             image,
@@ -358,6 +464,8 @@ pub fn run_verify_recorded(
             clone,
             &binding,
             &c.cmd,
+            &name,
+            &labels,
         );
         let (exit, out, runner_error) = match runner(&prog, &argv) {
             Ok((e, o)) => (e, o, false),
@@ -424,10 +532,14 @@ pub fn run_verify_serialized(
     max_bytes: usize,
     recorder: &dyn bridge_core::attempt_activity::AttemptRecorder,
     lock_dir: &std::path::Path,
+    run: &bridge_core::run_identity::RunHandle,
+    owner: &str,
 ) -> VerifyOutcome {
     if profile.is_none() {
         // No profile ⇒ no container ⇒ nothing to serialize; never create a lock namespace for a skip.
-        return run_verify_recorded(cfg, profile, clone, cache_vol, runner, max_bytes, recorder);
+        return run_verify_recorded(
+            cfg, profile, clone, cache_vol, runner, max_bytes, recorder, run, owner,
+        );
     }
     let _cache_volume = match acquire_cache_volume_lock(lock_dir, cache_vol) {
         Ok(guard) => Some(guard),
@@ -441,9 +553,12 @@ pub fn run_verify_serialized(
             None
         }
     };
-    run_verify_recorded(cfg, profile, clone, cache_vol, runner, max_bytes, recorder)
+    run_verify_recorded(
+        cfg, profile, clone, cache_vol, runner, max_bytes, recorder, run, owner,
+    )
 }
 
+#[allow(clippy::too_many_arguments)] // 2 more than before F-1 item 1: the naming/labeling identity
 pub fn run_verify(
     cfg: &VerifyConfig,
     profile: Option<&bridge_core::profile::LanguageProfile>,
@@ -451,6 +566,8 @@ pub fn run_verify(
     cache_vol: &str,
     runner: &Runner,
     max_bytes: usize,
+    run: &bridge_core::run_identity::RunHandle,
+    owner: &str,
 ) -> VerifyOutcome {
     run_verify_recorded(
         cfg,
@@ -460,6 +577,8 @@ pub fn run_verify(
         runner,
         max_bytes,
         &bridge_core::attempt_activity::NoopAttemptRecorder,
+        run,
+        owner,
     )
 }
 #[cfg(test)]
@@ -697,6 +816,61 @@ mod tests {
         )
     }
 
+    /// F-1 item 1: a stable `RunHandle` fixture for tests that assert on the composed verify
+    /// container's name/labels (the `a2a.run` value the run-scoped reaper keys on).
+    fn test_run() -> bridge_core::run_identity::RunHandle {
+        bridge_core::run_identity::RunHandle {
+            instance_id: "run-77".into(),
+            host: "host-x".into(),
+            lease: "/tmp/run-77.lock".into(),
+            start: "1700000000".into(),
+        }
+    }
+
+    #[test]
+    fn run_verify_recorded_names_and_labels_each_container_for_the_run_scoped_reaper() {
+        // F-1 item 1 (S5 follow-up): an unnamed/unlabeled verify container is invisible to the
+        // ADR-0021 label reaper, `containers list|reap`, `RunEndGuard`'s END sweep (clean-exit/panic
+        // path), and recover_orphans's crash recovery (the SIGKILL-covering path — RunEndGuard is
+        // Drop-based and never runs under SIGKILL; recover_orphans keys on `a2a.owner`/`a2a.managed`,
+        // asserted separately by the `verify_sweep_target`/`recovery_owners` tests in bin main.rs). This
+        // test proves the `a2a.run` label RunEndGuard's `by_run_filter_argv` and `containers`' `--run`
+        // filter key on is present on every container.
+        let clone = bridge_core::SessionCwd::parse("/repo/clone").unwrap();
+        let seen: std::cell::RefCell<Vec<Vec<String>>> = std::cell::RefCell::new(Vec::new());
+        let runner = |_p: &str, argv: &[String]| -> std::io::Result<(i32, String)> {
+            seen.borrow_mut().push(argv.to_vec());
+            Ok((0, "ok".into()))
+        };
+        let run = test_run();
+        let _ = run_verify_recorded(
+            &cfg(),
+            Some(&profile(&[("fmt", true), ("test", true)], None)),
+            &clone,
+            "cache-x",
+            &runner,
+            4096,
+            &bridge_core::attempt_activity::NoopAttemptRecorder,
+            &run,
+            "owner9",
+        );
+        let seen = seen.borrow();
+        assert_eq!(seen.len(), 2);
+        // each command gets its OWN uniquely-named container (ordinal-suffixed) carrying owner+run.
+        assert!(seen[0]
+            .windows(2)
+            .any(|w| w[0] == "--name" && w[1] == "a2a-verify-owner9-run-77-1"));
+        assert!(seen[1]
+            .windows(2)
+            .any(|w| w[0] == "--name" && w[1] == "a2a-verify-owner9-run-77-2"));
+        // the run label is on EVERY command's container — what RunEndGuard's by_run_filter_argv
+        // (`label=a2a.run=<id>`) and the ADR-0021 label reaper both key on.
+        for argv in seen.iter() {
+            assert!(argv.windows(2).any(|w| w == ["--label", "a2a.run=run-77"]));
+            assert!(argv.windows(2).any(|w| w == ["--label", "a2a.managed=1"]));
+        }
+    }
+
     fn unwrap_ran(outcome: VerifyOutcome) -> VerifyVerdict {
         match outcome {
             VerifyOutcome::Ran(v) => v,
@@ -735,6 +909,8 @@ mod tests {
             &runner,
             4096,
             &recorder,
+            &test_run(),
+            "owner9",
         ));
         assert!(!verdict.passed);
         assert!(verdict
@@ -785,6 +961,8 @@ mod tests {
             "cache-x",
             &runner,
             4096,
+            &test_run(),
+            "owner9",
         ));
         assert!(!v.passed);
         assert_eq!(calls.get(), 4);
@@ -815,6 +993,8 @@ mod tests {
             "cache-x",
             &runner,
             4096,
+            &test_run(),
+            "owner9",
         ));
         assert!(v.passed); // the non-gate coverage failure doesn't fail the verdict
         assert_eq!(v.results.len(), 2); // the later GATE ran (did NOT stop on the non-gate failure)
@@ -835,6 +1015,8 @@ mod tests {
             "cache-x",
             &runner,
             4096,
+            &test_run(),
+            "owner9",
         ));
         assert!(!v.passed);
         assert!(v.results[0].output.contains("docker missing"));
@@ -858,6 +1040,8 @@ mod tests {
             "cache-x",
             &runner,
             4096,
+            &test_run(),
+            "owner9",
         ));
         assert_eq!(
             v.results[0].failure_class,
@@ -875,7 +1059,16 @@ mod tests {
         let runner = |_p: &str, _argv: &[String]| -> std::io::Result<(i32, String)> {
             panic!("runner must NOT be called when profile is None")
         };
-        let outcome = run_verify(&cfg(), None, &clone, "cache-x", &runner, 4096);
+        let outcome = run_verify(
+            &cfg(),
+            None,
+            &clone,
+            "cache-x",
+            &runner,
+            4096,
+            &test_run(),
+            "owner9",
+        );
         assert!(
             matches!(outcome, VerifyOutcome::Skipped { .. }),
             "None profile must return Skipped, not run any container"
@@ -937,6 +1130,8 @@ mod tests {
                 4096,
                 &bridge_core::attempt_activity::NoopAttemptRecorder,
                 &lock_dir,
+                &test_run(),
+                "owner9",
             );
             done_tx.send(()).unwrap();
             outcome
@@ -1058,6 +1253,8 @@ mod tests {
             4096,
             &bridge_core::attempt_activity::NoopAttemptRecorder,
             &blocker.join("locks"), // create_dir_all under a regular file always fails
+            &test_run(),
+            "owner9",
         );
         assert!(matches!(outcome, VerifyOutcome::Ran(_)));
         assert_eq!(calls.get(), 1, "the verify still ran");
@@ -1079,6 +1276,8 @@ mod tests {
             4096,
             &bridge_core::attempt_activity::NoopAttemptRecorder,
             &namespace,
+            &test_run(),
+            "owner9",
         );
         assert!(matches!(outcome, VerifyOutcome::Skipped { .. }));
         assert!(
@@ -1092,6 +1291,180 @@ mod tests {
         let id = cache_volume_lock_id("a2a-verify-cache-0123456789abcdef");
         assert_eq!(id, "verify-a2a-verify-cache-0123456789abcdef");
         assert!(!crate::implement::task_id(4242, "abcd1234").starts_with(CACHE_VOLUME_LOCK_PREFIX));
+    }
+
+    // ---- F-1 item 2: the warm-cache lock (the S5 defect one volume over) --------------------
+    //
+    // `warm_lsp_deps_step` (bin main.rs) writes the per-repo warm LSP dep volume with NO lock — the
+    // exact same "SHARED volume, unserialized container run" shape S5 fixed for verify, just on a
+    // DIFFERENT cache volume. `run_warm_fetch_serialized` mirrors `run_verify_serialized`'s wait-not-fail
+    // contract and reuses `cache_volume_lock_dir`'s namespace/fallback rules verbatim, but under a
+    // DISTINCT `warm-` prefix — ordinary namespace separation between two independent lock families, NOT
+    // a safety net for a shared volume: if `warm_cache` and `[verify].cache` ever named the SAME volume,
+    // these non-communicating locks would fail to serialize a concurrent verify + warm-deps fetch against
+    // it. The actual guard against that is config.rs's F-1 item 3 parse-time alias rejection.
+
+    /// FAIL-FIRST for the warm-cache defect: with NO lock, two concurrent warm fetches against the same
+    /// volume would run their containers interleaved, so the ordering assertion below would fail. The
+    /// lock makes the two container runs strictly sequential — mirrors S5's
+    /// `same_cache_volume_verify_runs_never_interleave` exactly, one call site over.
+    #[test]
+    fn same_warm_cache_volume_fetches_never_interleave() {
+        struct ConcurrentFetch {
+            entered: std::sync::mpsc::Receiver<()>,
+            release: std::sync::mpsc::Sender<()>,
+            done: std::sync::mpsc::Receiver<()>,
+            handle: std::thread::JoinHandle<std::io::Result<(i32, String)>>,
+        }
+        fn spawn_fetch(
+            lock_dir: &std::path::Path,
+            cache_vol: &str,
+            label: &str,
+            park: bool,
+            log: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        ) -> ConcurrentFetch {
+            let (entered_tx, entered) = std::sync::mpsc::channel();
+            let (release, release_rx) = std::sync::mpsc::channel::<()>();
+            let (done_tx, done) = std::sync::mpsc::channel();
+            let lock_dir = lock_dir.to_path_buf();
+            let cache_vol = cache_vol.to_string();
+            let label = label.to_string();
+            let handle = std::thread::spawn(move || {
+                let runner = |_p: &str, _argv: &[String]| -> std::io::Result<(i32, String)> {
+                    log.lock().unwrap().push(format!("{label} enter"));
+                    entered_tx.send(()).unwrap();
+                    if park {
+                        release_rx.recv().expect("release channel");
+                    }
+                    log.lock().unwrap().push(format!("{label} exit"));
+                    Ok((0, "ok".into()))
+                };
+                let outcome =
+                    run_warm_fetch_serialized(&cache_vol, &runner, &lock_dir, "docker", &[]);
+                done_tx.send(()).unwrap();
+                outcome
+            });
+            ConcurrentFetch {
+                entered,
+                release,
+                done,
+                handle,
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let vol = "a2a-impl-lsp-cache-000000000000000f";
+        let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        let first = spawn_fetch(dir.path(), vol, "A", true, log.clone());
+        first
+            .entered
+            .recv_timeout(DEADLINE)
+            .expect("the first fetch must reach its container run");
+
+        // Exact: the guard is held ACROSS the container run, not merely taken and dropped around it.
+        assert!(
+            bridge_core::liveness::acquire_persistent_lock_in(dir.path(), &warm_cache_lock_id(vol))
+                .is_err(),
+            "the warm-cache lock must stay held while the fetch container runs"
+        );
+
+        let second = spawn_fetch(dir.path(), vol, "B", false, log.clone());
+        assert!(
+            second.done.recv_timeout(WHILE_HELD_GRACE).is_err(),
+            "a same-volume warm fetch must not complete while another holds the cache volume"
+        );
+
+        first.release.send(()).unwrap();
+        second
+            .done
+            .recv_timeout(DEADLINE)
+            .expect("the queued fetch must run once the holder releases");
+        let a = first.handle.join().unwrap();
+        let b = second.handle.join().unwrap();
+        assert!(a.is_ok() && b.is_ok());
+
+        assert_eq!(
+            log.lock().unwrap().as_slice(),
+            ["A enter", "A exit", "B enter", "B exit"],
+            "same-volume warm fetch container runs must be strictly sequential"
+        );
+    }
+
+    /// The warm lock and the verify lock live in SEPARATE namespaces (`warm-`/`verify-` prefixes): a held
+    /// verify lock for a volume name does NOT block a warm-fetch lock request for the SAME name. This is
+    /// namespace hygiene, NOT a corruption guard — if `warm_cache` and `[verify].cache` ever produced the
+    /// SAME volume, these two locks would run right past each other while the verify container and the
+    /// warm-fetch container both write the ONE shared Docker volume, unserialized. The actual guard
+    /// against that is config.rs's F-1 item 3 parse-time alias rejection
+    /// (`RegistryConfig::parse`, tested by `parse_rejects_a_warm_cache_that_aliases_verify_cache`), which
+    /// keeps `warm_cache` and `[verify].cache` from ever naming the same volume in the first place.
+    #[test]
+    fn warm_and_verify_locks_use_separate_lock_namespaces() {
+        let dir = tempfile::tempdir().unwrap();
+        let vol = "a2a-shared-name-0000000000000010";
+        let _verify_guard = acquire_cache_volume_lock(dir.path(), vol).unwrap();
+        // A warm lock request for the SAME name succeeds even while the verify lock is held — proving the
+        // namespaces are separate, NOT proving this is safe if the volume were actually shared.
+        drop(acquire_warm_cache_lock(dir.path(), vol).unwrap());
+    }
+
+    #[test]
+    fn the_warm_cache_lock_id_uses_a_distinct_prefix_from_verify() {
+        let id = warm_cache_lock_id("a2a-impl-lsp-cache-0123456789abcdef");
+        assert_eq!(id, "warm-a2a-impl-lsp-cache-0123456789abcdef");
+        assert_ne!(
+            warm_cache_lock_id("same-volume"),
+            cache_volume_lock_id("same-volume")
+        );
+        assert!(!crate::implement::task_id(4242, "abcd1234").starts_with(WARM_CACHE_LOCK_PREFIX));
+    }
+
+    #[test]
+    fn the_warm_wait_note_names_the_contended_cache_volume() {
+        let note = warm_cache_wait_note("a2a-impl-lsp-cache-0123456789abcdef");
+        assert!(note.contains("waiting for a concurrent warm-deps fetch of the same repository"));
+        assert!(note.contains("a2a-impl-lsp-cache-0123456789abcdef"));
+    }
+
+    #[test]
+    fn acquire_warm_cache_lock_refuses_a_name_that_is_not_a_volume() {
+        let dir = tempfile::tempdir().unwrap();
+        for bad in ["", "..", "a/b", "-leading", "a b"] {
+            let kind = acquire_warm_cache_lock(dir.path(), bad)
+                .map(|_| ())
+                .expect_err("must refuse a non-volume id")
+                .kind();
+            assert_eq!(kind, std::io::ErrorKind::InvalidInput, "{bad:?}");
+        }
+        assert!(
+            std::fs::read_dir(dir.path()).unwrap().next().is_none(),
+            "a refused name must not create any lock file"
+        );
+    }
+
+    /// A lock namespace that cannot be created must not strand the fetch: it degrades to an unserialized
+    /// run (loudly, on stderr) rather than refusing to fetch at all — mirrors
+    /// `an_unusable_lock_namespace_still_runs_the_verify`.
+    #[test]
+    fn an_unusable_warm_lock_namespace_still_runs_the_fetch() {
+        let dir = tempfile::tempdir().unwrap();
+        let blocker = dir.path().join("not-a-dir");
+        std::fs::write(&blocker, b"x").unwrap();
+        let calls = std::cell::Cell::new(0_u32);
+        let runner = |_p: &str, _argv: &[String]| -> std::io::Result<(i32, String)> {
+            calls.set(calls.get() + 1);
+            Ok((0, "ok".into()))
+        };
+        let outcome = run_warm_fetch_serialized(
+            "a2a-impl-lsp-cache-0000000000000011",
+            &runner,
+            &blocker.join("locks"), // create_dir_all under a regular file always fails
+            "docker",
+            &[],
+        );
+        assert!(outcome.is_ok());
+        assert_eq!(calls.get(), 1, "the fetch still ran");
     }
 
     #[test]
@@ -1150,6 +1523,8 @@ mod tests {
             "cache-x",
             &runner,
             4096,
+            &test_run(),
+            "owner9",
         );
         let _ = run_verify(
             &cfg(),
@@ -1158,6 +1533,8 @@ mod tests {
             "cache-x",
             &runner,
             4096,
+            &test_run(),
+            "owner9",
         );
 
         let seen = seen.borrow();

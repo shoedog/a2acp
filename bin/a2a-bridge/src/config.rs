@@ -1721,6 +1721,28 @@ impl RegistryConfig {
                 ));
             }
         }
+        // F-1 item 3 (review fix): moved from `language_profiles()` to HERE so every caller of `parse`
+        // — `a2a-bridge validate --config` (any scope) AND `serve`/`mcp`'s own boot preflight, which uses
+        // `ValidationScope::Startup` and does NOT reach `language_profiles()` (that call is gated behind
+        // `ValidationScope::Full`) — rejects the alias at the earliest common point, not just the
+        // implement/run-workflow path that happens to call `language_profiles()`. A `[[languages]].
+        // warm_cache` that equals `[verify].cache` would collapse the LOCKED verify volume (F-1 item 1)
+        // and the warm-deps volume (F-1 item 2's new lock) onto the SAME Docker volume name for a repo —
+        // both feed `verify::cache_volume_name(base, repo_canon)` — while the two paths take DIFFERENT
+        // lock namespaces (`verify-`/`warm-`) that never mutually exclude each other, so a concurrent
+        // verify + warm-deps fetch could still corrupt the shared volume undetected.
+        if let Some(verify) = &cfg.verify {
+            for lang in &cfg.languages {
+                if lang.warm_cache == verify.cache {
+                    return Err(ConfigError::Registry(format!(
+                        "[[languages]] id={:?} warm_cache {:?} must not equal [verify].cache {:?} — a \
+                         shared base collapses the locked verify volume and the warm-deps volume onto \
+                         the same cache for a repo; use distinct bases",
+                        lang.id, lang.warm_cache, verify.cache
+                    )));
+                }
+            }
+        }
         Ok(cfg)
     }
 
@@ -1814,6 +1836,10 @@ impl RegistryConfig {
     pub fn language_profiles(
         &self,
     ) -> Result<Vec<bridge_core::profile::LanguageProfile>, ConfigError> {
+        // F-1 item 3's `warm_cache`/`[verify].cache` alias rejection lives in `RegistryConfig::parse`
+        // (review fix — moved out of here so `serve`/`mcp`'s `ValidationScope::Startup` boot preflight,
+        // which never reaches this method, still rejects it). Any `RegistryConfig` reaching this method
+        // already passed through `parse`, so there is nothing left to check here.
         self.languages
             .iter()
             .map(LanguageToml::to_profile)
@@ -3432,6 +3458,163 @@ addr="127.0.0.1:8080"
         .unwrap();
         let e = c.language_profiles().unwrap_err();
         assert!(e.to_string().contains("at least one"));
+    }
+
+    // ---- F-1 item 3: warm_cache/[verify].cache alias rejection --------------------------------
+    //
+    // `warm_cache` and `[verify].cache` both feed `verify::cache_volume_name(base, repo_canon)`. An
+    // aliased base collapses the LOCKED verify volume (F-1 item 1 names/labels its containers; the S5
+    // lock serializes them) and the warm-deps volume (F-1 item 2's NEW lock) onto the SAME Docker volume
+    // name for a repo — but the two paths take DIFFERENT lock namespaces (`verify-`/`warm-`, F-1 item 2)
+    // that never mutually exclude each other, so a concurrent verify + warm-deps fetch could still
+    // corrupt the shared volume.
+    //
+    // Review fix: this lives in `RegistryConfig::parse` (not `language_profiles`, which only
+    // `select_profile`'s implement/run-workflow path and `validate --config`'s `ValidationScope::Full`
+    // ever reach) so EVERY caller of `parse` — including `serve`/`mcp`'s own boot preflight, which
+    // validates at `ValidationScope::Startup` and never calls `language_profiles` at all — rejects the
+    // alias at the earliest common point. `startup_validation_still_catches_a_warm_cache_verify_cache_alias`
+    // in bin main.rs's test module proves the operator-visible path (serve/mcp boot) this was missing.
+
+    #[test]
+    fn parse_rejects_a_warm_cache_that_aliases_verify_cache() {
+        let e = RegistryConfig::parse(
+            r#"
+            default = "x"
+            [server]
+            addr = "127.0.0.1:8080"
+            [[agents]]
+            id = "x"
+            cmd = "echo"
+            [verify]
+            image = "i"
+            cache = "shared-cache"
+            egress = "open"
+            [[languages]]
+            id = "rust"
+            fetch = "cargo fetch --locked"
+            warm_cache = "shared-cache"
+            dep_cache_path = "/cargo"
+            verify_cache_path = "/cache"
+            [[languages.verify]]
+            name = "t"
+            cmd = "cargo test"
+            "#,
+        )
+        .unwrap_err();
+        let msg = e.to_string();
+        // Names BOTH keys + the offending value + the offending language, so an operator can find and
+        // fix the exact two lines without guessing.
+        assert!(msg.contains("warm_cache"), "{msg}");
+        assert!(msg.contains("[verify].cache"), "{msg}");
+        assert!(msg.contains("shared-cache"), "{msg}");
+        assert!(msg.contains("rust"), "{msg}");
+    }
+
+    #[test]
+    fn parse_rejects_aliasing_in_a_non_first_language() {
+        // Guards against an implementation that only checks the FIRST [[languages]] entry.
+        let e = RegistryConfig::parse(
+            r#"
+            default = "x"
+            [server]
+            addr = "127.0.0.1:8080"
+            [[agents]]
+            id = "x"
+            cmd = "echo"
+            [verify]
+            image = "i"
+            cache = "shared-cache"
+            egress = "open"
+            [[languages]]
+            id = "go"
+            fetch = "go mod download"
+            warm_cache = "go-warm-cache"
+            dep_cache_path = "/gomodcache"
+            verify_cache_path = "/gobuildcache"
+            [[languages.verify]]
+            name = "t"
+            cmd = "go test ./..."
+            [[languages]]
+            id = "rust"
+            fetch = "cargo fetch --locked"
+            warm_cache = "shared-cache"
+            dep_cache_path = "/cargo"
+            verify_cache_path = "/cache"
+            [[languages.verify]]
+            name = "t"
+            cmd = "cargo test"
+            "#,
+        )
+        .unwrap_err();
+        assert!(e.to_string().contains("rust"), "{e}");
+    }
+
+    #[test]
+    fn language_profiles_accepts_distinct_warm_cache_and_verify_cache_bases() {
+        let c = RegistryConfig::parse(
+            r#"
+            default = "x"
+            [server]
+            addr = "127.0.0.1:8080"
+            [[agents]]
+            id = "x"
+            cmd = "echo"
+            [verify]
+            image = "i"
+            cache = "a2a-verify-cache"
+            egress = "open"
+            [[languages]]
+            id = "rust"
+            fetch = "cargo fetch --locked"
+            warm_cache = "a2a-impl-lsp-cache"
+            dep_cache_path = "/cargo"
+            verify_cache_path = "/cache"
+            [[languages.verify]]
+            name = "t"
+            cmd = "cargo test"
+            "#,
+        )
+        .unwrap();
+        assert!(c.language_profiles().is_ok());
+    }
+
+    #[test]
+    fn language_profiles_allows_any_warm_cache_when_no_verify_block_is_configured() {
+        // No [verify] block at all: nothing to alias against.
+        let c = RegistryConfig::parse(
+            r#"
+            default = "x"
+            [server]
+            addr = "127.0.0.1:8080"
+            [[agents]]
+            id = "x"
+            cmd = "echo"
+            [[languages]]
+            id = "rust"
+            fetch = "cargo fetch --locked"
+            warm_cache = "any-cache"
+            dep_cache_path = "/cargo"
+            verify_cache_path = "/cache"
+            [[languages.verify]]
+            name = "t"
+            cmd = "cargo test"
+            "#,
+        )
+        .unwrap();
+        assert!(c.language_profiles().is_ok());
+    }
+
+    #[test]
+    fn tracked_example_configs_use_distinct_warm_cache_and_verify_cache_bases() {
+        for raw in [
+            include_str!("../../../examples/a2a-bridge.containerized.toml"),
+            include_str!("../../../examples/a2a-bridge.containerized.podman.toml"),
+            include_str!("../../../examples/a2a-bridge.slicing-implement.toml"),
+        ] {
+            let profiles = RegistryConfig::parse(raw).unwrap().language_profiles();
+            assert!(profiles.is_ok(), "{raw:?}: {:?}", profiles.err());
+        }
     }
 
     #[test]

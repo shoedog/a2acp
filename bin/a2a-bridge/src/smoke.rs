@@ -2275,9 +2275,10 @@ async fn run_attempt(args: &SmokeArgs) -> SmokeArtifactV2 {
     // container runtime while attempting to verify the independent host lane; this run cannot create a
     // container, so it needs neither orphan recovery nor a container run-end sweep.
     let run_guard = if args.fallback_guard.is_none() {
-        recover_orphans(&snapshot, &config_path, &host);
+        // Smoke never runs [verify] — nothing to include here.
+        recover_orphans(&snapshot, &config_path, &host, None);
         Some(RunEndGuard {
-            runtimes: run_guard_runtimes(&snapshot, &config_path),
+            runtimes: run_guard_runtimes(&snapshot, &config_path, None),
             instance_id,
         })
     } else {

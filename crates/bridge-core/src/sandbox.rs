@@ -658,11 +658,18 @@ pub fn compose_container_rw_with_source(
     (program, argv)
 }
 
-/// PURE+TOTAL. The `(program, argv)` for ONE verify command (Slice B2b-2). Reuses [`compose_sandbox`]
+/// PURE+TOTAL. The `(program, argv)` for ONE verify command (Slice B2b-2). Reuses [`compose_sandbox_named`]
 /// (clone `mount=clone, access=Ro`, the cache volume appended) so egress / runtime / suffix derivation
 /// stay ONE source of truth. The command runs under `sh -c` with the binding's env exported — so its
 /// exit code (read by the caller from the container) IS the command's verdict. NO creds: the only
 /// volumes are the `:ro` clone + the cache.
+///
+/// NAMED + LABELED (R2f1b F-1 item 1, closing the S5 follow-up): an unnamed/unlabeled verify container
+/// is invisible to the ADR-0021 label reaper, to `containers list|reap`, and to `recover_orphans`'s
+/// before-first-use crash recovery — the path that actually covers a SIGKILLed bridge (`RunEndGuard` is a
+/// `Drop` guard: it runs on clean exit or a panic unwind, never under SIGKILL). `name`/`labels` are built
+/// by the caller exactly like implement's other managed containers (`a2a_name` + `RunHandle::labels`).
+#[allow(clippy::too_many_arguments)] // 2 more than before F-1 item 1: name + labels
 pub fn compose_verify(
     runtime: Option<&str>,
     image: &str,
@@ -670,6 +677,8 @@ pub fn compose_verify(
     clone: &crate::session_cwd::SessionCwd,
     cache: &crate::profile::CacheBinding,
     command: &str,
+    name: &str,
+    labels: &[(String, String)],
 ) -> (String, Vec<String>) {
     // Export the binding's env (each `K=V`), make the dirs it points at, then run the command. `cd` first
     // (compose_sandbox emits no --workdir; the reader base sets WORKDIR /work). `&&` chains so a failed cd
@@ -711,7 +720,7 @@ pub fn compose_verify(
         egress: egress.clone(),
         volumes: cache.mounts.clone(),
     };
-    compose_sandbox(&sb, "sh", &["-c".to_string(), script], &[])
+    compose_sandbox_named(&sb, name, "sh", &["-c".to_string(), script], labels)
 }
 
 /// PURE+TOTAL. Like [`compose_sandbox`] but NAMES the container so a reaper can `docker rm -f` it
@@ -1022,8 +1031,15 @@ mod tests {
             &clone,
             &binding,
             "cargo build --locked",
+            "a2a-verify-ownerx-run1-1",
+            &[],
         );
         assert_eq!(prog, "docker");
+        // named (reapable) even when the caller passes no labels.
+        assert_eq!(
+            &argv[0..5],
+            &["run", "-i", "--rm", "--name", "a2a-verify-ownerx-run1-1"]
+        );
         // egress from the EgressPolicy (both proxies, like compose_sandbox)
         assert!(argv
             .windows(2)
@@ -1070,6 +1086,8 @@ mod tests {
             &clone,
             &binding,
             "cargo test --locked",
+            "a2a-verify-ownerx-run2-1",
+            &[],
         );
         assert!(!argv.iter().any(|a| a == "--network"));
     }
@@ -1086,6 +1104,11 @@ mod tests {
         };
         let binding =
             rust_profile().cache_binding(CacheCtx::Verify, "warmvol", "a2a-verify-cache-x");
+        let labels = vec![
+            ("a2a.managed".to_string(), "1".to_string()),
+            ("a2a.role".to_string(), "verify".to_string()),
+            ("a2a.run".to_string(), "run-abc".to_string()),
+        ];
         let (prog, argv) = compose_verify(
             None,
             "img:latest",
@@ -1093,7 +1116,27 @@ mod tests {
             &clone,
             &binding,
             "cargo build --locked",
+            "a2a-verify-ownerx-run-abc-1",
+            &labels,
         );
+        // EXACT byte-for-byte prefix: named + labeled BEFORE the egress/mount argv (same splice position
+        // compose_sandbox_named/compose_container_rw already pin).
+        assert_eq!(
+            &argv[0..10],
+            &[
+                "run",
+                "-i",
+                "--rm",
+                "--name",
+                "a2a-verify-ownerx-run-abc-1",
+                "--label",
+                "a2a.managed=1",
+                "--label",
+                "a2a.role=verify",
+                "--label",
+            ]
+        );
+        assert_eq!(argv[10], "a2a.run=run-abc");
         // EXACT byte-for-byte: pin the WHOLE script (a partial contains/starts/ends check would let a
         // malformed `mkdir -p "$CARGO_HOME" "$CARGO_TARGET_DIR"` segment slip through).
         assert_eq!(
@@ -1106,6 +1149,42 @@ mod tests {
             "{argv:?}"
         );
         let _ = prog;
+    }
+
+    #[test]
+    fn compose_verify_is_named_and_labeled_for_the_run_scoped_reaper() {
+        // F-1 item 1 (S5 follow-up): an unnamed/unlabeled verify container is invisible to the
+        // ADR-0021 label reaper, `containers list|reap`, and recover_orphans's crash recovery — the
+        // SIGKILL-covering path (RunEndGuard is Drop-based and never runs under SIGKILL). Verify
+        // containers must be named + labeled exactly like implement's other managed containers
+        // (compose_sandbox_named + a2a_label_args).
+        use crate::profile::{rust_profile, CacheCtx};
+        use crate::session_cwd::SessionCwd;
+        let clone = SessionCwd::parse("/repo/clone").unwrap();
+        let binding = rust_profile().cache_binding(CacheCtx::Verify, "", "a2a-verify-cache-x");
+        let labels = vec![
+            ("a2a.managed".to_string(), "1".to_string()),
+            ("a2a.run".to_string(), "run-77".to_string()),
+        ];
+        let (_prog, argv) = compose_verify(
+            None,
+            "img:latest",
+            &EgressPolicy::Open,
+            &clone,
+            &binding,
+            "cargo test",
+            "a2a-verify-owner9-run-77-1",
+            &labels,
+        );
+        // --name lands right after `run -i --rm` — same position compose_sandbox_named/
+        // compose_container_rw already guarantee.
+        assert_eq!(
+            &argv[0..5],
+            &["run", "-i", "--rm", "--name", "a2a-verify-owner9-run-77-1"]
+        );
+        // labels follow immediately (BEFORE egress/mounts) per compose_sandbox's ordering.
+        assert!(argv.windows(2).any(|w| w == ["--label", "a2a.managed=1"]));
+        assert!(argv.windows(2).any(|w| w == ["--label", "a2a.run=run-77"]));
     }
 
     #[test]
@@ -1130,6 +1209,8 @@ mod tests {
             &clone,
             &binding,
             "go build ./...",
+            "a2a-verify-ownerx-run3-1",
+            &[],
         );
         assert_eq!(
             argv.last().unwrap(),

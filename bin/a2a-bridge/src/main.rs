@@ -968,6 +968,46 @@ fn rw_sweep_targets(
     targets
 }
 
+/// The STABLE owner token for THIS config's verify containers: `container_owner(config_path, repo_canon,
+/// "verify")`, keyed on the CANONICALIZED SOURCE repo path — the SAME key [`verify::cache_volume_name`]
+/// hashes over — never the per-run quarantine clone. Mirrors [`rw_sweep_targets`]/[`ro_sweep_targets`]'s
+/// `container_owner(config_path, mount, agent_id)` derivation (`agent_id = "verify"`, since verify
+/// containers aren't a registry entry).
+///
+/// This is corrective, not cosmetic: `recover_orphans` is the crash-path sweep — it runs at the START of
+/// the NEXT process and must RECOMPUTE an owner from data that outlives the dead process. `RunEndGuard`
+/// (this process's own `Drop` guard) never runs under SIGKILL, so `recover_orphans` is the only mechanism
+/// that reaps a SIGKILLed bridge's verify orphan. Keying the owner on the per-run clone (as an earlier
+/// revision did) would make it different every run — unrecoverable, since the next process can never
+/// reproduce a dead process's nonce'd clone path. Keying on `repo` (stable across runs, exactly like the
+/// `:rw` impl agent's owner is stable because it's keyed on the STATIC config-declared `sb.mount`, not a
+/// per-turn path) makes the owner reconstructible by any later process that reads the same config. ALWAYS
+/// computable (even when `[verify]` itself is absent/invalid) so a caller that unconditionally threads an
+/// owner string through never needs a placeholder — naming is simply inert when verify never runs.
+fn verify_owner_token(config_path: &std::path::Path, repo: &std::path::Path) -> String {
+    let repo_canon = std::fs::canonicalize(repo).unwrap_or_else(|_| repo.to_path_buf());
+    container_owner(config_path, &repo_canon.to_string_lossy(), "verify")
+}
+
+/// The `(runtime, owner)` sweep target for THIS run's verify containers, when `[verify]` is configured and
+/// valid — `None` otherwise (nothing to sweep: no `[verify]` block declares no runtime at all, matching
+/// how `rw_sweep_targets`/`ro_sweep_targets` only emit a target for an entry that actually has a
+/// sandbox). `owner` is [`verify_owner_token`]; see its doc for why it must be repo-keyed, not clone-keyed.
+fn verify_sweep_target(
+    verify_cfg: &Option<Result<verify::VerifyConfig, config::ConfigError>>,
+    config_path: &std::path::Path,
+    repo: &std::path::Path,
+) -> Option<(String, String)> {
+    let vcfg = verify_cfg.as_ref()?.as_ref().ok()?;
+    let owner = verify_owner_token(config_path, repo);
+    let runtime = vcfg
+        .runtime
+        .as_deref()
+        .unwrap_or(bridge_core::domain::DEFAULT_RUNTIME)
+        .to_string();
+    Some((runtime, owner))
+}
+
 /// B2: run a blocking closure on tokio's blocking pool so it can't park a runtime worker. Used at the
 /// few call sites where genuinely-blocking work (a container-runtime CLI shell-out) runs on a LIVE
 /// async runtime — NOT for one-shot CLI commands or pre-bind boot sweeps, where a parked worker has no
@@ -978,22 +1018,42 @@ async fn run_blocking<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static)
         .expect("blocking task panicked")
 }
 
+/// PURE. The deduped `(runtime, owner)` set [`recover_orphans`] sweeps: this instance's `:rw` ∪ `:ro`
+/// owners, plus the verify sweep target when the caller passes one (see [`verify_sweep_target`]).
+/// Extracted so the "a verify owner is in the recovery set" claim is a direct, fast unit-testable
+/// assertion rather than something only observable through `recover_orphans`'s real Docker I/O.
+fn recovery_owners(
+    snapshot: &bridge_core::domain::RegistrySnapshot,
+    config_path: &std::path::Path,
+    verify_owner: Option<(&str, &str)>,
+) -> Vec<(String, String)> {
+    let mut owners: Vec<(String, String)> = Vec::new();
+    owners.extend(rw_sweep_targets(snapshot, config_path));
+    owners.extend(ro_sweep_targets(snapshot, config_path));
+    if let Some((runtime, owner)) = verify_owner {
+        owners.push((runtime.to_string(), owner.to_string()));
+    }
+    owners.sort();
+    owners.dedup();
+    owners
+}
+
 /// Increment A before-first-use crash-orphan recovery (replaces the owner-name boot sweeps). For every
-/// owner THIS process can spawn (`:rw` ContainerRw ∪ `:ro` sandboxed Acp), [`classify_sweep`] inspects the
-/// owner's MANAGED containers and reaps ONLY the DEAD ones (same host + a FREE flock lease). A live
-/// concurrent run holds its lease → its containers classify Alive → spared. Idempotent + best-effort, so
-/// it's safe to call at every entry point (one-shots once; serve at startup AND on each hot-reload).
+/// owner THIS process can spawn (`:rw` ContainerRw ∪ `:ro` sandboxed Acp ∪ the verify owner when
+/// `verify_owner` is `Some` — F-1 item 1's review fix), [`classify_sweep`] inspects the owner's MANAGED
+/// containers and reaps ONLY the DEAD ones (same host + a FREE flock lease). A live concurrent run holds
+/// its lease → its containers classify Alive → spared. Idempotent + best-effort, so it's safe to call at
+/// every entry point (one-shots once; serve at startup AND on each hot-reload). This is the SIGKILL-
+/// covering crash path: it runs at the START of the NEXT process, unlike `RunEndGuard` (a same-process
+/// `Drop` guard that never runs under SIGKILL).
 fn recover_orphans(
     snapshot: &bridge_core::domain::RegistrySnapshot,
     config_path: &std::path::Path,
     host: &str,
+    verify_owner: Option<(&str, &str)>,
 ) {
     use bridge_core::liveness::FsLeaseProbe;
-    let mut owners: Vec<(String, String)> = Vec::new();
-    owners.extend(rw_sweep_targets(snapshot, config_path));
-    owners.extend(ro_sweep_targets(snapshot, config_path));
-    owners.sort();
-    owners.dedup();
+    let owners = recovery_owners(snapshot, config_path, verify_owner);
     // Reap every owner's DEAD orphans FIRST, collecting their (shared) lease files; delete the leases ONCE
     // at the end. A crashed run's containers span multiple owners but share one lease — deleting it per-owner
     // would blind the later owners' sweeps (absent lease → Unknown → spared → leak; live-gate finding).
@@ -1013,16 +1073,21 @@ fn recover_orphans(
     }
 }
 
-/// The DISTINCT container runtimes this process uses (across its `:rw` + `:ro` owners) — the set the
-/// [`RunEndGuard`] must sweep this run's `a2a.run` label over.
+/// The DISTINCT container runtimes this process uses (across its `:rw` + `:ro` owners, plus `[verify]`'s
+/// runtime when the caller runs verify) — the set the [`RunEndGuard`] must sweep this run's `a2a.run`
+/// label over. `verify_runtime` (F-1 item 1) closes the gap where `[verify].runtime` differs from every
+/// agent sandbox's runtime: without it a verify container's runtime would never be swept, so the
+/// END-sweep backstop couldn't reach it even though it now carries the `a2a.run` label.
 fn run_guard_runtimes(
     snapshot: &bridge_core::domain::RegistrySnapshot,
     config_path: &std::path::Path,
+    verify_runtime: Option<&str>,
 ) -> Vec<String> {
     let mut rts: Vec<String> = rw_sweep_targets(snapshot, config_path)
         .into_iter()
         .chain(ro_sweep_targets(snapshot, config_path))
         .map(|(runtime, _owner)| runtime)
+        .chain(verify_runtime.map(str::to_string))
         .collect();
     rts.sort();
     rts.dedup();
@@ -2059,12 +2124,21 @@ fn docker_runner(program: &str, argv: &[String]) -> std::io::Result<(i32, String
 /// Run the B2b-2 verify once (total). `verify_cfg` was captured pre-snapshot. The verdict run itself never
 /// fails (a runner error becomes a failed result); a config error reduces to `ConfigError`.
 /// Returns `Skipped` immediately when `profile` is `None` (`--lang none`).
+///
+/// `run`/`owner` (F-1 item 1) name + label every verify container so the ADR-0021 label reaper,
+/// `containers list|reap`, and — via `owner`, which `verify_sweep_target` computes from the STABLE source
+/// repo, never the per-run clone — the NEXT process's `recover_orphans` can all find it.
+/// `recover_orphans`, not the caller's `RunEndGuard`, is the SIGKILL-covering path: `RunEndGuard` is a
+/// `Drop` guard that runs on clean exit or a panic unwind only.
+#[allow(clippy::too_many_arguments)] // 2 more than before F-1 item 1: the naming/labeling identity
 fn run_verify_step(
     verify_cfg: &Option<Result<verify::VerifyConfig, config::ConfigError>>,
     profile: Option<&bridge_core::profile::LanguageProfile>,
     clone_cwd: &bridge_core::SessionCwd,
     repo: &std::path::Path,
     activity: &dyn bridge_core::attempt_activity::AttemptRecorder,
+    run: &bridge_core::run_identity::RunHandle,
+    owner: &str,
 ) -> verify::VerifyOutcome {
     let profile = match profile {
         None => {
@@ -2106,6 +2180,8 @@ fn run_verify_step(
                 16 * 1024,
                 activity,
                 &lock_dir,
+                run,
+                owner,
             );
             if let verify::VerifyOutcome::Ran(ref verdict) = outcome {
                 for r in &verdict.results {
@@ -2180,7 +2256,14 @@ fn warm_lsp_deps_step(
         read_only,
     );
     eprintln!("[implement] lsp warm-deps: fetching deps into {cache_vol}");
-    match docker_runner(&program, &argv) {
+    // F-1 item 2: this volume is SHARED by every run against this source repo (the S5 defect one volume
+    // over — `warm_lsp_deps_step` wrote it with no lock). Serialize the container run per volume exactly
+    // like verify's cache-volume lock (same namespace/fallback rules via `cache_volume_lock_dir`, same
+    // wait-not-fail + degrade-loudly contract), under the distinct `warm-` prefix so the two lock
+    // families never collide.
+    let lock_dir = verify::cache_volume_lock_dir(clone);
+    match verify::run_warm_fetch_serialized(&cache_vol, &docker_runner, &lock_dir, &program, &argv)
+    {
         Ok((0, _)) => {
             eprintln!("[implement] lsp warm-deps: ok ({cache_vol})");
             Some(cache_vol)
@@ -2593,6 +2676,12 @@ struct ProdEffects<'a> {
     last_head_sha: Option<String>,
     /// Adaptive review depth: Auto = size-based; Forced overrides the auto-selection.
     depth: review::Depth,
+    /// F-1 item 1: the run identity + STABLE owner token (from `verify_sweep_target` — keyed on the
+    /// source repo, never the per-run clone) verify containers are named/labeled with. `owner` is what
+    /// lets a SIGKILLed bridge's verify orphan be found by the NEXT process's `recover_orphans`;
+    /// `RunEndGuard` only covers THIS process's own clean-exit/panic path.
+    run: &'a bridge_core::run_identity::RunHandle,
+    verify_owner: &'a str,
 }
 
 #[async_trait::async_trait]
@@ -2605,6 +2694,8 @@ impl tweak::TweakEffects for ProdEffects<'_> {
             self.clone_cwd,
             self.repo,
             recorder.as_ref(),
+            self.run,
+            self.verify_owner,
         )
     }
     async fn review(
@@ -2908,6 +2999,8 @@ async fn run_warm_loop(
     prod_ckpt: &mut implement_resume::ProdCheckpoint,
     depth: review::Depth,
     telemetry: Arc<ImplementAttemptTelemetry>,
+    run: &bridge_core::run_identity::RunHandle,
+    verify_owner: &str,
 ) -> implement_resume::ImplementPhase {
     let final_ = {
         let mut effects = ProdEffects {
@@ -2928,6 +3021,8 @@ async fn run_warm_loop(
             repository_ordinal: 0,
             last_head_sha: None,
             depth,
+            run,
+            verify_owner,
         };
         tweak::run_tweak_loop(
             clone,
@@ -3250,9 +3345,25 @@ async fn implement_cmd(args: &[String]) -> Result<(), BoxError> {
         lease: _lease.path().to_string_lossy().to_string(),
         start: epoch_secs(),
     };
+    // F-1 item 1 (review fix): the verify sweep target, keyed on the STABLE source `repo` — the same key
+    // `verify::cache_volume_name` hashes over — NEVER the per-run quarantine `clone` (a fresh nonce every
+    // run, which would make a SIGKILL-orphaned verify container's owner unrecoverable by the NEXT
+    // process's `recover_orphans`; see `verify_sweep_target`'s doc). Computed here (before
+    // `owner_config_path` moves below) and `run` is CLONED into `make_spawn_fn` (not moved) so both stay
+    // available for `run_warm_loop`.
+    let verify_owner = verify_owner_token(&owner_config_path, &repo);
+    let verify_target = verify_sweep_target(&verify_cfg, &owner_config_path, &repo);
     // Before-first-use crash recovery: reap only DEAD (same host + free lease) orphans of THIS process's
-    // owners (`:rw` ∪ `:ro`); a live concurrent run's lease is held → its containers are spared.
-    recover_orphans(&snapshot, &owner_config_path, &host);
+    // owners (`:rw` ∪ `:ro` ∪ verify — F-1 item 1's review fix). This is the SIGKILL-covering path:
+    // `RunEndGuard` below is a same-process `Drop` guard and never runs under SIGKILL.
+    recover_orphans(
+        &snapshot,
+        &owner_config_path,
+        &host,
+        verify_target
+            .as_ref()
+            .map(|(runtime, owner)| (runtime.as_str(), owner.as_str())),
+    );
     if let Some(wc) = &worktree_cfg {
         bridge_worktree::sweep::sweep_orphans(
             &wc.root,
@@ -3260,10 +3371,17 @@ async fn implement_cmd(args: &[String]) -> Result<(), BoxError> {
             &bridge_core::liveness::FsLeaseProbe,
         );
     }
-    // Label-scoped END-sweep backstop (THIS run's `a2a.run` only). Declared BEFORE `warm` → drops AFTER it
-    // (the warm `retire` reaps first; this catches anything it missed, including the `:ro` reviewers).
+    // Label-scoped END-sweep backstop (THIS run's `a2a.run` only, clean-exit/panic path ONLY — see
+    // recover_orphans above for the SIGKILL path). Declared BEFORE `warm` → drops AFTER it (the warm
+    // `retire` reaps first; this catches anything it missed, including the `:ro` reviewers). The verify
+    // runtime is included so the sweep can see verify containers even when [verify].runtime differs from
+    // every agent sandbox's runtime (F-1 item 1).
     let _run_guard = RunEndGuard {
-        runtimes: run_guard_runtimes(&snapshot, &owner_config_path),
+        runtimes: run_guard_runtimes(
+            &snapshot,
+            &owner_config_path,
+            verify_target.as_ref().map(|(runtime, _)| runtime.as_str()),
+        ),
         instance_id: instance_id.clone(),
     };
     let _wt_run_guard = worktree_cfg.as_ref().and_then(|wc| {
@@ -3308,10 +3426,12 @@ async fn implement_cmd(args: &[String]) -> Result<(), BoxError> {
     ));
 
     // The registry + executor are still built — REVIEW runs through them (edit/fix are off-executor).
+    // `run` is CLONED here (not moved): `run_warm_loop` below still needs it to name/label verify
+    // containers (F-1 item 1).
     let spawn = make_spawn_fn(
         Arc::clone(&policy),
         owner_config_path,
-        run,
+        run.clone(),
         None,
         120_000,
         worktree_cfg.clone(),
@@ -3468,6 +3588,8 @@ async fn implement_cmd(args: &[String]) -> Result<(), BoxError> {
                 &mut prod_ckpt,
                 depth,
                 telemetry,
+                &run,
+                &verify_owner,
             )
             .await;
             merge_after_loop(
@@ -3582,7 +3704,21 @@ async fn implement_resume_cmd(
         lease: _lease.path().to_string_lossy().to_string(),
         start: epoch_secs(),
     };
-    recover_orphans(&snapshot, &owner_config_path, &host);
+    // F-1 item 1 (review fix): same STABLE-repo-keyed derivation as implement_cmd — `ck.source_repo` is
+    // the persisted SOURCE repo path (survives across resumes), never the resume clone. See
+    // `verify_owner_token`'s doc for why the owner must be repo-keyed, not clone-keyed.
+    let verify_owner = verify_owner_token(&owner_config_path, &ck.source_repo);
+    let verify_target = verify_sweep_target(&verify_cfg, &owner_config_path, &ck.source_repo);
+    // Before-first-use crash recovery — the SIGKILL-covering path (`RunEndGuard` below never runs under
+    // SIGKILL; it's a same-process `Drop` guard).
+    recover_orphans(
+        &snapshot,
+        &owner_config_path,
+        &host,
+        verify_target
+            .as_ref()
+            .map(|(runtime, owner)| (runtime.as_str(), owner.as_str())),
+    );
     if let Some(wc) = &worktree_cfg {
         bridge_worktree::sweep::sweep_orphans(
             &wc.root,
@@ -3591,7 +3727,11 @@ async fn implement_resume_cmd(
         );
     }
     let _run_guard = RunEndGuard {
-        runtimes: run_guard_runtimes(&snapshot, &owner_config_path),
+        runtimes: run_guard_runtimes(
+            &snapshot,
+            &owner_config_path,
+            verify_target.as_ref().map(|(runtime, _)| runtime.as_str()),
+        ),
         instance_id: instance_id.clone(),
     };
     let _wt_run_guard = worktree_cfg.as_ref().and_then(|wc| {
@@ -3640,7 +3780,7 @@ async fn implement_resume_cmd(
     let spawn = make_spawn_fn(
         Arc::clone(&policy),
         owner_config_path,
-        run,
+        run.clone(),
         None,
         120_000,
         worktree_cfg.clone(),
@@ -3711,6 +3851,8 @@ async fn implement_resume_cmd(
         &mut prod_ckpt,
         depth,
         telemetry,
+        &run,
+        &verify_owner,
     )
     .await;
     merge_after_loop(
@@ -4192,9 +4334,10 @@ async fn run_workflow_cmd(args: &[String]) -> Result<(), BoxError> {
         lease: _lease.path().to_string_lossy().to_string(),
         start: epoch_secs(),
     };
-    recover_orphans(&snapshot, &owner_config_path, &host);
+    // run-workflow never runs [verify] (implement-only) — nothing to include here.
+    recover_orphans(&snapshot, &owner_config_path, &host, None);
     let _run_guard = RunEndGuard {
-        runtimes: run_guard_runtimes(&snapshot, &owner_config_path),
+        runtimes: run_guard_runtimes(&snapshot, &owner_config_path, None),
         instance_id: instance_id.clone(),
     };
     if let Some(wc) = &worktree_cfg {
@@ -6645,6 +6788,14 @@ fn containers_cmd(args: &[String]) -> Result<(), BoxError> {
         .map_err(|e| format!("containers: read config {config_path:?}: {e}"))?;
     let cfg = config::RegistryConfig::parse(&raw)
         .map_err(|e| format!("containers: config parse: {e}"))?;
+    // F-1 item 1: capture [verify]'s runtime (best-effort default, same as compose_sandbox's) BEFORE
+    // `into_snapshot` moves `cfg` — so a verify-only runtime (e.g. podman when every agent is docker)
+    // is still scanned/reaped by `containers list|reap`.
+    let verify_runtime = cfg.verify.as_ref().map(|v| {
+        v.runtime
+            .clone()
+            .unwrap_or_else(|| bridge_core::domain::DEFAULT_RUNTIME.to_string())
+    });
     let snapshot = cfg
         .into_snapshot()
         .map_err(|e| format!("containers: snapshot: {e}"))?;
@@ -6658,7 +6809,7 @@ fn containers_cmd(args: &[String]) -> Result<(), BoxError> {
     my_owners.sort();
     my_owners.dedup();
     let runtimes = {
-        let r = run_guard_runtimes(&snapshot, &owner_config_path);
+        let r = run_guard_runtimes(&snapshot, &owner_config_path, verify_runtime.as_deref());
         if r.is_empty() {
             vec!["docker".to_string()]
         } else {
@@ -6968,8 +7119,17 @@ fn storage_runtime_pass(
     };
     let owner_config_path =
         std::fs::canonicalize(config_path).unwrap_or_else(|_| config_path.to_path_buf());
+    // Best-effort [verify] runtime inclusion (F-1 item 1), mirroring `containers_cmd`'s scan.
+    let verify_runtime = config::RegistryConfig::parse(raw_config)
+        .ok()
+        .and_then(|c| {
+            c.verify.map(|v| {
+                v.runtime
+                    .unwrap_or_else(|| bridge_core::domain::DEFAULT_RUNTIME.to_string())
+            })
+        });
     let runtimes = {
-        let r = run_guard_runtimes(&snapshot, &owner_config_path);
+        let r = run_guard_runtimes(&snapshot, &owner_config_path, verify_runtime.as_deref());
         if r.is_empty() {
             vec!["docker".to_string()]
         } else {
@@ -7733,7 +7893,8 @@ async fn mcp_cmd(args: &[String]) -> Result<(), BoxError> {
 
     let source = FileConfigSource::new(config_path.clone());
     let snapshot = source.load().await?;
-    recover_orphans(&snapshot, &config_path, &host);
+    // mcp never runs [verify] (implement-only) — nothing to include here.
+    recover_orphans(&snapshot, &config_path, &host, None);
     if let Some(wc) = &worktree_cfg {
         bridge_worktree::sweep::sweep_orphans(
             &wc.root,
@@ -9417,7 +9578,8 @@ async fn main() -> Result<(), BoxError> {
                                          // spared. serve is long-running with no END-sweep — per-backend
                                          // retire reaps with the runtime alive, and the next run's recovery
                                          // catches any crash leftover.
-    recover_orphans(&snapshot, &config_path, &host);
+                                         // serve never runs [verify] (implement-only) — nothing to include here.
+    recover_orphans(&snapshot, &config_path, &host, None);
     if let Some(wc) = &worktree_cfg {
         bridge_worktree::sweep::sweep_orphans(
             &wc.root,
@@ -9464,7 +9626,7 @@ async fn main() -> Result<(), BoxError> {
                 let snap_c = snap.clone();
                 let config_c = recover_config.clone();
                 let host_c = recover_host.clone();
-                run_blocking(move || recover_orphans(&snap_c, &config_c, &host_c)).await;
+                run_blocking(move || recover_orphans(&snap_c, &config_c, &host_c, None)).await;
                 if let Err(e) = reg.apply(snap).await {
                     tracing::error!(error = ?e, "registry reconcile failed");
                 }
@@ -11196,6 +11358,12 @@ inputs = []
             bridge_core::SessionCwd::parse(&directory.path().to_string_lossy()).unwrap();
         let session = bridge_core::ids::SessionId::parse("implement-scope").unwrap();
         let telemetry = ImplementAttemptTelemetry::new("scope-task");
+        let run = bridge_core::run_identity::RunHandle {
+            instance_id: "run0".into(),
+            host: "h".into(),
+            lease: "/l/run0.lock".into(),
+            start: "0".into(),
+        };
         let mut effects = ProdEffects {
             verify_cfg: &verify_cfg,
             profile: None,
@@ -11214,6 +11382,8 @@ inputs = []
             repository_ordinal: 0,
             last_head_sha: None,
             depth: review::Depth::Auto,
+            run: &run,
+            verify_owner: "owner9",
         };
 
         assert!(effects.fix(1, "first").await);
@@ -11340,6 +11510,93 @@ inputs = []
             container_owner(cfg, "/root", "impl"),
             "recovery-sweep owner must equal the backend spawn-time owner"
         );
+    }
+
+    // ---- F-1 review fix: the verify owner must be STABLE (repo-keyed), not clone-keyed --------------
+    //
+    // An earlier revision keyed the verify container's owner on the per-run quarantine clone path
+    // (`.a2a-implement/impl-<pid>-<nonce>`), which changes every run. `recover_orphans` is the SIGKILL-
+    // covering crash path: it runs at the START of the NEXT process (`RunEndGuard`, by contrast, is a
+    // same-process `Drop` guard that never fires under SIGKILL) and must RECOMPUTE the same owner a dead
+    // process's containers were labeled with, using only data that outlives that process. A clone-keyed
+    // owner can never be reproduced this way — the container leaks forever, unlike an impl `:rw`/`:ro`
+    // orphan in the same state, which recover_orphans DOES reach (its owner is keyed on the STATIC
+    // config-declared `sb.mount`, stable across runs).
+
+    #[test]
+    fn verify_owner_token_is_stable_across_runs_and_keyed_on_the_source_repo() {
+        let cfg = std::path::Path::new("/cfg/a2a.toml");
+        let repo = std::path::Path::new("/nonexistent/source/repo/for/test");
+
+        // Two "runs" against the SAME source repo: verify_owner_token never sees a clone path at all, so
+        // it must return the identical owner both times.
+        let owner_run_a = verify_owner_token(cfg, repo);
+        let owner_run_b = verify_owner_token(cfg, repo);
+        assert_eq!(
+            owner_run_a, owner_run_b,
+            "the verify owner must be STABLE across runs of the same repo"
+        );
+        assert_eq!(
+            owner_run_a,
+            container_owner(cfg, &repo.to_string_lossy(), "verify"),
+            "verify owner must equal container_owner over (config_path, SOURCE repo, \"verify\")"
+        );
+        // The bug this guards against: an owner derived from a per-run clone path would NOT match.
+        let bogus_clone_derived =
+            container_owner(cfg, "/root/.a2a-implement/impl-1234-abcd", "verify");
+        assert_ne!(
+            owner_run_a, bogus_clone_derived,
+            "the verify owner must NOT be derived from any per-run clone path"
+        );
+    }
+
+    #[test]
+    fn verify_sweep_target_is_none_when_verify_absent_or_invalid() {
+        let cfg = std::path::Path::new("/cfg/a2a.toml");
+        let repo = std::path::Path::new("/repo");
+        assert!(verify_sweep_target(&None, cfg, repo).is_none());
+        let err_cfg = Some(Err(config::ConfigError::Registry("x".into())));
+        assert!(verify_sweep_target(&err_cfg, cfg, repo).is_none());
+    }
+
+    #[test]
+    fn verify_sweep_target_carries_the_configured_runtime_and_the_stable_owner() {
+        let cfg = std::path::Path::new("/cfg/a2a.toml");
+        let repo = std::path::Path::new("/repo");
+        let vcfg = Some(Ok(verify::VerifyConfig {
+            runtime: Some("podman".into()),
+            image: "img".into(),
+            cache: "c".into(),
+            egress: bridge_core::domain::EgressPolicy::Open,
+        }));
+        let target = verify_sweep_target(&vcfg, cfg, repo).expect("verify configured");
+        assert_eq!(target.0, "podman");
+        assert_eq!(target.1, verify_owner_token(cfg, repo));
+    }
+
+    #[test]
+    fn recovery_owners_includes_the_verify_sweep_target() {
+        // The direct claim under review: a verify container's owner appears in the SAME owner set
+        // recover_orphans sweeps, alongside (not instead of) the existing :rw/:ro owners.
+        let cfg = std::path::Path::new("/cfg/a2a.toml");
+        let s = snap(vec![cr_entry("impl", "/root")]);
+        let verify_owner = verify_owner_token(cfg, std::path::Path::new("/some/source/repo"));
+        let owners = recovery_owners(&s, cfg, Some(("docker", verify_owner.as_str())));
+        assert!(
+            owners.contains(&("docker".to_string(), verify_owner.clone())),
+            "the verify owner must be in the recovery sweep set: {owners:?}"
+        );
+        assert!(
+            owners.contains(&("docker".to_string(), container_owner(cfg, "/root", "impl"))),
+            "the existing :rw owner must still be swept: {owners:?}"
+        );
+    }
+
+    #[test]
+    fn recovery_owners_omits_verify_when_not_configured() {
+        let cfg = std::path::Path::new("/cfg/a2a.toml");
+        let s = snap(vec![]);
+        assert!(recovery_owners(&s, cfg, None).is_empty());
     }
 
     #[test]
@@ -12539,12 +12796,20 @@ cmd = "true"
             "default union is podman-only"
         );
         let gated = config::gate_verify_runtime(verify_cfg, &snapshot.allowed_cmds);
+        let run = bridge_core::run_identity::RunHandle {
+            instance_id: "run0".into(),
+            host: "h".into(),
+            lease: "/l/run0.lock".into(),
+            start: "0".into(),
+        };
         let outcome = run_verify_step(
             &gated,
             profile.as_ref(),
             &bridge_core::SessionCwd::parse("/tmp").unwrap(),
             std::path::Path::new("/tmp"),
             &bridge_core::attempt_activity::NoopAttemptRecorder,
+            &run,
+            "owner9",
         );
         assert!(
             matches!(outcome, verify::VerifyOutcome::ConfigError),
@@ -13226,6 +13491,70 @@ verify_cache_path = "/verify"
         )
         .unwrap_err();
         assert!(err.to_string().contains("language profiles"));
+    }
+
+    #[test]
+    fn startup_validation_still_catches_a_warm_cache_verify_cache_alias() {
+        // F-1 item 3 review fix: the alias rejection moved from `language_profiles` (only reached under
+        // `ValidationScope::Full`, e.g. `a2a-bridge validate --config`) into `RegistryConfig::parse`
+        // itself — so `serve`/`mcp`'s OWN boot preflight (`ValidationScope::Startup`, which the PRECEDING
+        // test proves skips `language_profiles`'s OTHER checks) still refuses an aliased config, instead
+        // of booting a server that will silently corrupt a shared cache volume the first time `implement`
+        // runs against it.
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = dir.path().join("a2a-bridge.toml");
+        std::fs::write(
+            &cfg,
+            r#"
+default = "codex"
+
+[[agents]]
+id = "codex"
+cmd = "codex-acp"
+
+[server]
+
+[verify]
+image = "i"
+cache = "shared-cache"
+egress = "open"
+
+[[languages]]
+id = "rust"
+fetch = "cargo fetch --locked"
+warm_cache = "shared-cache"
+dep_cache_path = "/cargo"
+verify_cache_path = "/verify"
+[[languages.verify]]
+name = "t"
+cmd = "cargo test"
+"#,
+        )
+        .unwrap();
+
+        // ValidationScope::Startup is EXACTLY what serve_cmd/mcp_cmd run at their own boot, before ever
+        // reaching FileConfigSource::load — this is the operator-visible surface the review asked for.
+        let err = super::validate_config_file(
+            &cfg,
+            super::ExamplesPolicy::Off,
+            &[],
+            super::ValidationScope::Startup,
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("warm_cache"), "{msg}");
+        assert!(msg.contains("[verify].cache"), "{msg}");
+
+        // `validate --config` (ValidationScope::Full, config.rs's own suite already covers the direct
+        // RegistryConfig::parse case) surfaces the identical rejection.
+        let err = super::validate_config_file(
+            &cfg,
+            super::ExamplesPolicy::Off,
+            &[],
+            super::ValidationScope::Full,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("warm_cache"), "{err}");
     }
 
     #[test]
