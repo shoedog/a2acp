@@ -50,6 +50,30 @@ Any negative observation reported as fact must be accompanied by a positive cont
 same apparatus — proof the instrument could have produced the signal. Task specs for
 evidence capture carry a `control:` line naming it.
 
+## 2c. Outbound refutation (before handing off a claim-bearing report)
+
+Scope: deliverables whose load-bearing content is a claim rather than an artifact a
+gate can check — reviews, investigations, panels, closure verdicts, relays and
+fix-claims; also any implementation handoff whose prose carries a rationale others
+will build on.
+
+Name the one claim the most downstream work depends on and spend one dispatch
+refuting it — one fresh session (§4), no stake in the outcome, refutation as its only
+deliverable. If the claim controls a gate, an irreversible action, or downstream
+implementation, the pass must be independent; otherwise — and always when the worker
+cannot dispatch — an adversarial self-pass labeled `SELF-PASS (NOT INDEPENDENT)`
+substitutes. Either pass counts only if it inspects evidence capable of producing the
+stated falsifier and records its search scope — restating the report or rerunning its
+green suite does not count. Report the verdict under §3: SURVIVED, or REFUTED and
+corrected in place with the refutation left visible, never silently deleted. Target
+class: a narrow truth stated generally (ssot-agents `a1bea9e`, 2026-07-22: "the
+emission set was shared" inflated to "separating it would break something") — a green
+suite cannot disagree with that class, so no gate will catch it for you.
+
+> Your only job is to refute this claim: <claim>. It is refuted if <observation>.
+> Do not review anything else; do not confirm what you could not check yourself.
+> A refutation is a success, not a failure.
+
 ## 3. Provenance tiers (required in relays and fix-claims)
 
 Separate, explicitly: **RE-RAN THIS TURN** (command + output attached) vs **SUPPLIED,
