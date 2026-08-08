@@ -62,6 +62,7 @@ mod route;
 mod slice;
 mod smoke;
 mod storage_reap;
+mod storage_reap_clones;
 mod storage_report;
 
 pub(crate) use bridge_controller::{
@@ -192,9 +193,11 @@ SUBCOMMANDS:
   containers          List / reap this config's managed containers (crash-orphan cleanup).  list | reap
   storage report      READ-ONLY audit of bridge-owned storage: payload class, bytes, live consumers,
                       git HEAD + source/origin containment, totals, free space.  [--config <f>] [--json]
-  storage reap        DESTRUCTIVE. Delete completed runs' build targets / dependency caches after
-                      boundary gates (held operation lock, pinned root, live-consumer probe).
-                      --build-targets [--dry-run] [--config <f>] [--json]
+  storage reap        DESTRUCTIVE. Delete idle runs' build targets / dependency caches, or the
+                      quarantine clones whose content is verifiably on the source repo's main (D-1),
+                      after boundary gates (held operation lock, pinned root, live-consumer probe,
+                      git state + containment).  --build-targets | --clones [--dry-run] [--config <f>]
+                      [--json]
   submit              Send a unary message.  [skill] --input <file> [--context <id>] [--agent <id>] [--model <m>] [--effort <e>] [--mode <m>] [--cwd <dir>]
   task                Durable task store.  get | list | cancel | watch
   session             Warm session control.  status | release | cancel | clear | compact <contextId>
@@ -6779,13 +6782,19 @@ fn containers_cmd(args: &[String]) -> Result<(), BoxError> {
 fn storage_cmd(args: &[String]) -> Result<(), BoxError> {
     use storage_report as sr;
 
+    // The subcommand is REQUIRED, not defaulted: `storage` now carries a DESTRUCTIVE verb, and a bare
+    // `a2a-bridge storage` that silently meant one would be a footgun.
+    let has_sub = args.first().map(|a| !a.starts_with("--")).unwrap_or(false);
+    // Dispatch BEFORE the help check, not after: `storage reap --help` must reach the DESTRUCTIVE
+    // command's own gate documentation (and `--clones --help` its class's), not the umbrella page.
+    // Checking `--help` first here made both unreachable.
+    if has_sub && args[0] == "reap" {
+        return storage_reap_cmd(&args[1..]);
+    }
     if args.iter().any(|a| a == "--help" || a == "-h") {
         println!("{}", sr::STORAGE_USAGE);
         return Ok(());
     }
-    // The subcommand is REQUIRED, not defaulted: `storage` now carries a DESTRUCTIVE verb, and a bare
-    // `a2a-bridge storage` that silently meant one would be a footgun.
-    let has_sub = args.first().map(|a| !a.starts_with("--")).unwrap_or(false);
     let Some(sub) = has_sub.then(|| args[0].as_str()) else {
         return Err(format!(
             "storage: needs an action (expected: report | reap)\n{}",
@@ -6793,9 +6802,6 @@ fn storage_cmd(args: &[String]) -> Result<(), BoxError> {
         )
         .into());
     };
-    if sub == "reap" {
-        return storage_reap_cmd(&args[1..]);
-    }
     if sub != "report" {
         return Err(format!(
             "storage: unknown action {sub:?} (expected: report | reap)\n{}",
@@ -7056,6 +7062,9 @@ fn storage_runtime_pass(
             }
             items.push(sr::ReportItem {
                 path: name.to_string(),
+                // Declared, not inferred: this row's `path` is a volume NAME. Destructive code reads
+                // this field rather than deducing "not a path" from the string's shape.
+                source: sr::ItemSource::VolumeName,
                 class,
                 checkout_kind: None,
                 run_id: None,
@@ -7185,12 +7194,164 @@ impl storage_reap::ReapEnv for HostReapEnv {
         self.write_durable(evidence_dir, "storage-reap", json)
     }
 
+    /// The fold receipt: a STABLE name in a namespace that outlives the clone, written twice (intent,
+    /// then outcome). Published by rename so the second write cannot leave a torn file where the first
+    /// one's durable record used to be, and fsync'd on both the file and its parent directory.
+    fn write_named(&self, dir: &Path, file_name: &str, json: &str) -> Result<String, String> {
+        use std::io::Write as _;
+        if file_name.is_empty() || file_name.contains('/') || file_name.starts_with('.') {
+            return Err(format!("refusing to write receipt name {file_name:?}"));
+        }
+        std::fs::create_dir_all(dir).map_err(|e| format!("mkdir {}: {e}", dir.display()))?;
+        let path = dir.join(file_name);
+        let tmp = dir.join(format!("{file_name}.{}.tmp", std::process::id()));
+        let mut f =
+            std::fs::File::create(&tmp).map_err(|e| format!("create {}: {e}", tmp.display()))?;
+        f.write_all(json.as_bytes())
+            .map_err(|e| format!("write {}: {e}", tmp.display()))?;
+        f.sync_all()
+            .map_err(|e| format!("fsync {}: {e}", tmp.display()))?;
+        drop(f);
+        std::fs::rename(&tmp, &path).map_err(|e| {
+            let _ = std::fs::remove_file(&tmp);
+            format!("publish {}: {e}", path.display())
+        })?;
+        // Directory barrier: publishes the entry itself. PROPAGATED — a receipt whose directory
+        // entry never reached the disk is not a durable receipt, and swallowing this made the fold
+        // receipt's crash-durability claim unfalsifiable.
+        self.sync_dir_path(dir)?;
+        Ok(path.to_string_lossy().into_owned())
+    }
+
+    /// Copy this run's Evidence out of a clone about to be deleted. `sources` mixes the sidecar
+    /// DIRECTORY (recursed) with the `.git`-scoped evidence FILES that sit beside it.
+    ///
+    /// Nothing here is ever skipped and nothing is ever followed: a symlink, FIFO, socket or device is
+    /// an ERROR, because the two silent alternatives are both wrong — following one copies whatever a
+    /// `:rw` container aimed it at and files it as this run's evidence, while skipping one deletes the
+    /// clone with "evidence preserved" on the receipt. (The caller's structural preflight refuses these
+    /// shapes before anything is copied; this is the same rule enforced at the moment of the write, in
+    /// case the tree changed underneath.)
+    ///
+    /// EVERY durability barrier is propagated: each copied file is fsync'd and each directory it lands
+    /// in is fsync'd, and a failure of either fails the copy. An unsynced copy of a record whose
+    /// original is about to be unlinked is not a preserved record.
+    fn copy_evidence(&self, sources: &[PathBuf], to: &Path) -> Result<Vec<String>, String> {
+        let mut copied = Vec::new();
+        for src in sources {
+            let md = match std::fs::symlink_metadata(src) {
+                Ok(md) => md,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(format!("stat {}: {e}", src.display())),
+            };
+            if md.file_type().is_symlink() {
+                return Err(format!(
+                    "{} is a symlink — never followed, never skipped",
+                    src.display()
+                ));
+            }
+            if md.is_file() {
+                let name = src
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .ok_or_else(|| format!("{} has no usable name", src.to_string_lossy()))?
+                    .to_string();
+                self.copy_one(src, to, &name)?;
+                copied.push(name);
+                continue;
+            }
+            if !md.is_dir() {
+                return Err(format!(
+                    "{} is neither a regular file nor a directory",
+                    src.display()
+                ));
+            }
+            copied.extend(self.copy_dir(src, to)?);
+        }
+        if !copied.is_empty() {
+            self.sync_dir_path(to)?;
+        }
+        Ok(copied)
+    }
+
+    /// Fsync a directory, propagating both the open and the sync failure. Called on the receipt
+    /// namespace and its parent before the first removal.
+    fn sync_dir(&self, dir: &Path) -> Result<(), String> {
+        self.sync_dir_path(dir)
+    }
+
     fn progress(&self, message: &str) {
         eprintln!("storage reap: {message}");
     }
 }
 
 impl HostReapEnv {
+    /// One evidence file, copied and made durable. Both barriers are propagated: a copy that returned
+    /// success without reaching the disk is exactly the failure this whole path exists to prevent.
+    fn copy_one(&self, src: &Path, dir: &Path, name: &str) -> Result<(), String> {
+        std::fs::create_dir_all(dir).map_err(|e| format!("mkdir {}: {e}", dir.display()))?;
+        let dst = dir.join(name);
+        std::fs::copy(src, &dst)
+            .map_err(|e| format!("copy {} -> {}: {e}", src.display(), dst.display()))?;
+        let f = std::fs::File::open(&dst)
+            .map_err(|e| format!("reopen {} for fsync: {e}", dst.display()))?;
+        f.sync_all()
+            .map_err(|e| format!("fsync {}: {e}", dst.display()))
+    }
+
+    /// Recursive half of [`HostReapEnv::copy_evidence`], with the same refuse-never-skip rule.
+    fn copy_dir(&self, from: &Path, to: &Path) -> Result<Vec<String>, String> {
+        let mut copied = Vec::new();
+        let entries =
+            std::fs::read_dir(from).map_err(|e| format!("read {}: {e}", from.display()))?;
+        for entry in entries {
+            let entry = entry.map_err(|e| format!("read {}: {e}", from.display()))?;
+            let src = entry.path();
+            let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+                return Err(format!(
+                    "evidence entry {} has a non-UTF-8 name — refusing to preserve it under a \
+                     guessed name",
+                    src.to_string_lossy()
+                ));
+            };
+            let md = std::fs::symlink_metadata(&src)
+                .map_err(|e| format!("stat {}: {e}", src.display()))?;
+            if md.file_type().is_symlink() {
+                return Err(format!(
+                    "{} is a symlink — never followed, never skipped",
+                    src.display()
+                ));
+            }
+            if md.is_dir() {
+                let nested = self.copy_dir(&src, &to.join(&name))?;
+                copied.extend(nested.into_iter().map(|n| format!("{name}/{n}")));
+                continue;
+            }
+            if !md.is_file() {
+                return Err(format!(
+                    "{} is neither a regular file nor a directory (FIFO, socket or device) — it \
+                     cannot be preserved, and skipping it would delete the clone while claiming it \
+                     was",
+                    src.display()
+                ));
+            }
+            self.copy_one(&src, to, &name)?;
+            copied.push(name);
+        }
+        if !copied.is_empty() {
+            self.sync_dir_path(to)?;
+        }
+        Ok(copied)
+    }
+
+    /// Open + fsync a directory, propagating BOTH failures. A silently-swallowed directory barrier is
+    /// the difference between a receipt that survives a crash and one that never existed.
+    fn sync_dir_path(&self, dir: &Path) -> Result<(), String> {
+        let d = std::fs::File::open(dir).map_err(|e| format!("open {}: {e}", dir.display()))?;
+        d.sync_all()
+            .map_err(|e| format!("fsync {}: {e}", dir.display()))
+    }
+
     /// Write + FSYNC an evidence file, then fsync its parent directory. Both barriers matter for the
     /// intent record: an unsynced file can survive a crash as a zero-length entry, and an unsynced
     /// parent can lose the directory entry entirely — either way the record we crashed to preserve
@@ -7212,9 +7373,10 @@ impl HostReapEnv {
             .map_err(|e| format!("fsync {}: {e}", path.display()))?;
         drop(f);
         // Directory barrier: publishes the entry itself.
-        if let Ok(d) = std::fs::File::open(dir) {
-            let _ = d.sync_all();
-        }
+        // Directory barrier: publishes the entry itself. PROPAGATED — a receipt whose directory
+        // entry never reached the disk is not a durable receipt, and swallowing this made the fold
+        // receipt's crash-durability claim unfalsifiable.
+        self.sync_dir_path(dir)?;
         Ok(path.to_string_lossy().into_owned())
     }
 }
@@ -7240,16 +7402,26 @@ fn signal_of(_status: &std::process::ExitStatus) -> i32 {
 /// inventing a boundary for them would be a different gate — recorded for S4 rather than guessed at.
 fn storage_reap_cmd(args: &[String]) -> Result<(), BoxError> {
     use storage_reap as rp;
+    use storage_reap_clones as rc;
     use storage_report as sr;
 
+    let wants_clones = args.iter().any(|a| a == "--clones");
     if args.iter().any(|a| a == "--help" || a == "-h") {
-        println!("{}", rp::REAP_USAGE);
+        println!(
+            "{}",
+            if wants_clones {
+                rc::CLONES_USAGE
+            } else {
+                rp::REAP_USAGE
+            }
+        );
         return Ok(());
     }
     let mut config: Option<PathBuf> = None;
     let mut json = false;
     let mut dry_run = false;
     let mut build_targets = false;
+    let mut clones = false;
     let mut it = args.iter();
     while let Some(f) = it.next() {
         match f.as_str() {
@@ -7261,6 +7433,7 @@ fn storage_reap_cmd(args: &[String]) -> Result<(), BoxError> {
             "--json" => json = true,
             "--dry-run" => dry_run = true,
             "--build-targets" => build_targets = true,
+            "--clones" => clones = true,
             other => {
                 return Err(
                     format!("storage reap: unknown flag {other:?}\n{}", rp::REAP_USAGE).into(),
@@ -7270,10 +7443,22 @@ fn storage_reap_cmd(args: &[String]) -> Result<(), BoxError> {
     }
     // No default payload class. `storage reap` with no class named is refused rather than interpreted:
     // this command deletes, and an operator who did not say what must not have it inferred.
-    if !build_targets {
+    if !build_targets && !clones {
         return Err(format!(
-            "storage reap: refusing to run without --build-targets (there is no default payload \
-             class for a destructive command)\n{}",
+            "storage reap: refusing to run without --build-targets or --clones (there is no default \
+             payload class for a destructive command)\n{}",
+            rp::REAP_USAGE
+        )
+        .into());
+    }
+    // Two DIFFERENT destructive authorities with different gates and different receipts. Running them
+    // in one invocation would also invert the plan's §6 reclaim order in a single output the operator
+    // cannot audit class by class.
+    if build_targets && clones {
+        return Err(format!(
+            "storage reap: --build-targets and --clones are separate authorities with different \
+             gates and different receipts; run them one at a time (targets first — §6 reclaim \
+             order)\n{}",
             rp::REAP_USAGE
         )
         .into());
@@ -7313,16 +7498,30 @@ fn storage_reap_cmd(args: &[String]) -> Result<(), BoxError> {
     // consumer, and `resolve_mount` refuses to answer `free` unless every configured runtime answered.
     let runtimes_configured = storage_runtime_pass(&raw, &config_path, &mut items, &mut notes);
 
-    let mut report = rp::reap_build_targets(
-        rp::ReapRequest {
-            scan_root: &verified,
-            items: &items,
-            protected: &protected,
-            dry_run,
-            runtimes_configured,
-        },
-        &HostReapEnv,
-    );
+    let mut report = if clones {
+        storage_reap_clones::reap_clones(
+            storage_reap_clones::ClonesRequest {
+                scan_root: &verified,
+                items: &items,
+                protected: &protected,
+                dry_run,
+                runtimes_configured,
+                lookback: cfg.storage.clone_reap_lookback,
+            },
+            &HostReapEnv,
+        )
+    } else {
+        rp::reap_build_targets(
+            rp::ReapRequest {
+                scan_root: &verified,
+                items: &items,
+                protected: &protected,
+                dry_run,
+                runtimes_configured,
+            },
+            &HostReapEnv,
+        )
+    };
     report.notes.splice(0..0, notes);
     report.notes.push(
         "scope: this reap covers the `.a2a-implement` root only. `[worktrees]` payloads are not \
@@ -7331,6 +7530,21 @@ fn storage_reap_cmd(args: &[String]) -> Result<(), BoxError> {
          operation lock) applies to one."
             .into(),
     );
+    if clones {
+        report.notes.push(format!(
+            "containment window: `[storage] clone_reap_lookback` = {} commits of source main. A \
+             search that runs out of history answers `unknown`, which PARKS the clone — raising this \
+             finds more landings, it never licenses a deletion the gate would otherwise refuse.",
+            cfg.storage.clone_reap_lookback
+        ));
+        report.notes.push(format!(
+            "fold receipts and preserved evidence live in `{}/{}` — a SIBLING of the clones, so they \
+             outlive the runs they describe (plan §7). They are Evidence class and are never \
+             auto-deleted.",
+            sr::display_path(&verified),
+            sr::RECEIPTS_DIR
+        ));
+    }
     if runtimes_configured == 0 {
         report.notes.push(
             "container axis NOT COVERED: no container runtime is configured, so no container was \
@@ -7342,6 +7556,8 @@ fn storage_reap_cmd(args: &[String]) -> Result<(), BoxError> {
 
     if json {
         println!("{}", serde_json::to_string_pretty(&report)?);
+    } else if clones {
+        print!("{}", storage_reap_clones::render_text(&report));
     } else {
         print!("{}", rp::render_text(&report));
     }

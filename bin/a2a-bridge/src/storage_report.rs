@@ -78,6 +78,45 @@ impl PayloadClass {
     ];
 }
 
+/// WHAT a [`ReportItem`]'s `path` field actually NAMES. Recorded by the scanner that produced the row
+/// rather than inferred by whoever consumes it: S3 had to infer "this row is a container volume, not a
+/// filesystem path" from `!path.is_absolute()`, which made a destructive command's refusal rest on the
+/// accident that volume names happen not to start with `/`. The scanner always knew; now it says so.
+///
+/// Consumers must branch on this field. The shape checks stay as defence in depth, never as the primary
+/// discrimination.
+// kebab-case on the wire so the JSON spelling IS `label()`'s spelling and the one the `--help` schema
+// note documents. One name for one concept, in code, in the table, and in the receipt.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ItemSource {
+    /// A canonical filesystem path under the `.a2a-implement` root: a run's quarantine clone or one of
+    /// its nested payloads. The only source whose runs have a per-run operation lock to hold across a
+    /// destructive boundary.
+    ImplementPath,
+    /// A canonical filesystem path under `[worktrees].root`. Its custody handle is the ADR-0025 sidecar
+    /// lease, NOT the operation lock, so neither reaper's boundary applies to one — a linked worktree is
+    /// also removed with `git worktree remove`, never `rm -rf`.
+    WorktreePath,
+    /// A container VOLUME NAME. Not a filesystem path at all: no `stat`, `canonicalize` or removal can
+    /// address it, and ADR-0021/0025 owns its lifecycle.
+    VolumeName,
+}
+
+impl ItemSource {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::ImplementPath => "implement-path",
+            Self::WorktreePath => "worktree-path",
+            Self::VolumeName => "volume-name",
+        }
+    }
+    /// Is `path` a filesystem path this process may `stat` and (with authority) remove?
+    pub fn is_filesystem_path(self) -> bool {
+        matches!(self, Self::ImplementPath | Self::WorktreePath)
+    }
+}
+
 /// Which kind of checkout a `SourceCheckout` is. S4 reaps standalone clones (each carrying its own
 /// duplicated `.git` object store — the plan's 13.75 GiB class); a linked worktree shares its source
 /// repo's object store and is removed with `git worktree remove`, never `rm -rf`.
@@ -206,7 +245,9 @@ pub struct GitFacts {
     /// **The D-1 gate**: is this clone's content verifiably on the SOURCE repository's main branch?
     /// `None` when the question does not apply (origin is not a local path, or HEAD is unborn).
     pub on_source_main: Option<OnSourceMain>,
-    /// Which ref was treated as "main" (`main`, `master`, or the source's own HEAD branch).
+    /// Which ref was treated as "main", FULLY QUALIFIED (`refs/heads/main`, `refs/heads/master`, or the
+    /// source's own HEAD branch). Qualified because a bare `main` would let a TAG of that name stand in
+    /// for the branch — see [`resolve_source_main`].
     pub source_main_ref: Option<String>,
 
     /// This checkout's own `refs/remotes/origin/*` that contain HEAD. Used only when `origin` is a
@@ -287,8 +328,12 @@ pub struct Measured {
 /// One reported item.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 pub struct ReportItem {
-    /// Canonical path, or the volume name for `ContainerOrImage`.
+    /// Canonical path, or the volume name for `ContainerOrImage`. WHICH of those it is, is
+    /// [`ReportItem::source`] — never inferred from this string's shape.
     pub path: String,
+    /// What `path` names (filesystem path vs volume name; implement root vs worktree root). Destructive
+    /// consumers branch on this rather than guessing.
+    pub source: ItemSource,
     pub class: PayloadClass,
     /// Set iff `class == SourceCheckout`.
     pub checkout_kind: Option<CheckoutKind>,
@@ -524,6 +569,12 @@ pub fn operation_lock_path(implement_root: &Path, id: &str) -> PathBuf {
 }
 
 pub const OPERATION_LOCK_DIR: &str = ".operation-locks";
+
+/// `<implement root>/.receipts` — the fold-receipt namespace (plan §7). A SIBLING of the clones, not a
+/// child of one: the receipt exists precisely to outlive the clone it describes, so it cannot live
+/// inside it. Preserved run evidence is copied here too (plan §5: Evidence gets its own retention and
+/// never dies with its parent).
+pub const RECEIPTS_DIR: &str = ".receipts";
 
 // ---------------------------------------------------------------------------------------------
 // Root verification + container-mount resolution (pure seams, unit-tested)
@@ -796,7 +847,7 @@ pub fn git_facts_rechecked(dir: &Path, expected: &ShapeFingerprint) -> Result<Gi
 /// - `-c core.hooksPath=/dev/null`: same, for any other hook a probe might trigger;
 /// - `GIT_NO_LAZY_FETCH=1`: a promisor/partial clone cannot make `cat-file`/`rev-list` reach the network;
 /// - `GIT_TERMINAL_PROMPT=0`: no probe may block waiting for credentials.
-fn git_ro(dir: &Path, argv: &[&str]) -> std::io::Result<std::process::Output> {
+pub fn git_ro(dir: &Path, argv: &[&str]) -> std::io::Result<std::process::Output> {
     std::process::Command::new("git")
         .arg("--no-optional-locks")
         .args(["-c", "core.fsmonitor=false"])
@@ -810,7 +861,7 @@ fn git_ro(dir: &Path, argv: &[&str]) -> std::io::Result<std::process::Output> {
         .output()
 }
 
-fn git_str(dir: &Path, argv: &[&str]) -> Result<String, String> {
+pub fn git_str(dir: &Path, argv: &[&str]) -> Result<String, String> {
     let out = git_ro(dir, argv).map_err(|e| format!("git {}: {e}", argv.join(" ")))?;
     if !out.status.success() {
         return Err(format!(
@@ -859,7 +910,10 @@ pub fn refs_containing(repo: &Path, sha: &str) -> Result<Vec<String>, String> {
 
 /// A `remote.origin.url` that names a local directory, resolved against `dir` when relative. Implement
 /// clones are created with `git clone --no-hardlinks <local path>`, so this is their normal shape.
-fn local_source_path(dir: &Path, url: &str) -> Option<PathBuf> {
+///
+/// `None` for a hosted remote (ssh/https/scp-style) — which S4 treats as a REFUSAL, not a fallback: the
+/// containment query has to be asked of a local source repository's live refs, and there is none.
+pub fn local_source_path(dir: &Path, url: &str) -> Option<PathBuf> {
     let raw = url.strip_prefix("file://").unwrap_or(url);
     if raw.is_empty() || raw.contains("://") || raw.contains('@') {
         return None; // ssh/https/git remote
@@ -964,17 +1018,52 @@ fn object_present(repo: &Path, sha: &str) -> Result<bool, String> {
     }
 }
 
-/// Resolve which ref of `src` is "main": `main`, else `master`, else the source's own HEAD branch.
-fn resolve_source_main(src: &Path) -> Result<String, String> {
-    for cand in ["main", "master"] {
-        let out = git_ro(src, &["rev-parse", "--verify", "--quiet", cand])
+/// Resolve which BRANCH of `src` is "main", as a FULLY QUALIFIED ref: `refs/heads/main`, else
+/// `refs/heads/master`, else the source's own HEAD branch.
+///
+/// Qualified deliberately. `git rev-parse main` follows the gitrevisions precedence order, which tries
+/// `refs/tags/main` BEFORE `refs/heads/main` — so a stray tag named `main` (or `master`) silently
+/// becomes the history the D-1 gate searches, and a commit reachable only from that tag reads as
+/// landed. `refs/heads/<name>^{commit}` can only ever name a branch, and peeling to `^{commit}` also
+/// refuses a branch name that somehow resolves to a non-commit.
+///
+/// The returned ref is what the caller must record and re-check: it is the identity of the history the
+/// verdict was computed against.
+pub fn resolve_source_main(src: &Path) -> Result<String, String> {
+    for cand in ["refs/heads/main", "refs/heads/master"] {
+        let spec = format!("{cand}^{{commit}}");
+        let out = git_ro(src, &["rev-parse", "--verify", "--quiet", &spec])
             .map_err(|e| format!("rev-parse could not run: {e}"))?;
         if out.status.success() {
             return Ok(cand.to_string());
         }
     }
-    git_str(src, &["symbolic-ref", "--quiet", "--short", "HEAD"])
-        .map_err(|e| format!("no `main`/`master`, and HEAD is unresolvable: {e}"))
+    // `symbolic-ref HEAD` (NOT `--short`) yields the fully-qualified `refs/heads/<name>`.
+    let head_ref = git_str(src, &["symbolic-ref", "--quiet", "HEAD"])
+        .map_err(|e| format!("no `refs/heads/main`/`master`, and HEAD is unresolvable: {e}"))?;
+    if !head_ref.starts_with("refs/heads/") {
+        return Err(format!(
+            "source HEAD resolves to {head_ref:?}, which is not a branch under `refs/heads/`"
+        ));
+    }
+    let spec = format!("{head_ref}^{{commit}}");
+    let out = git_ro(src, &["rev-parse", "--verify", "--quiet", &spec])
+        .map_err(|e| format!("rev-parse could not run: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "source HEAD branch {head_ref} has no commit (unborn) — there is no main history to search"
+        ));
+    }
+    Ok(head_ref)
+}
+
+/// The current OID of a fully-qualified ref, for the boundary's before/after consistency check: a
+/// verdict computed while source main moved under the probes is a verdict about no single history.
+pub fn ref_oid(repo: &Path, full_ref: &str) -> Result<String, String> {
+    git_str(
+        repo,
+        &["rev-parse", "--verify", &format!("{full_ref}^{{commit}}")],
+    )
 }
 
 /// **The D-1 gate**: is `head` verifiably on `src`'s main branch?
@@ -1246,11 +1335,13 @@ fn nested_items(
     nested: Vec<(PathBuf, PayloadClass)>,
     run_id: &str,
     consumers: LiveConsumers,
+    source: ItemSource,
 ) -> Vec<ReportItem> {
     nested
         .into_iter()
         .map(|(path, class)| ReportItem {
             path: display_path(&path),
+            source,
             class,
             checkout_kind: None,
             run_id: Some(run_id.to_string()),
@@ -1305,10 +1396,32 @@ pub fn scan_implement_root(root: &Path, notes: &mut Vec<String>) -> Vec<ReportIt
         if name == OPERATION_LOCK_DIR {
             continue; // the lock namespace itself is a probe target, not a payload
         }
+        // The fold-receipt namespace (plan §7) is a SIBLING of the clones so it outlives them. It is
+        // Evidence, with its own retention: reported so its bytes are counted and named, never
+        // classified as a checkout or swept as cache.
+        if name == RECEIPTS_DIR {
+            items.push(ReportItem {
+                path: display_path(&entry),
+                source: ItemSource::ImplementPath,
+                class: PayloadClass::Evidence,
+                checkout_kind: None,
+                run_id: None,
+                measured: measure_tree(&entry, &[]),
+                consumers: LiveConsumers::default(),
+                git: None,
+                note: Some(
+                    "clone fold receipts + preserved run evidence (plan §7) — Evidence class, never \
+                     auto-deleted with the run it describes"
+                        .into(),
+                ),
+            });
+            continue;
+        }
         let op_lock = probe_lock_path(&operation_lock_path(root, &name));
         if !md.is_dir() {
             items.push(ReportItem {
                 path: display_path(&entry),
+                source: ItemSource::ImplementPath,
                 class: PayloadClass::Unclassified,
                 checkout_kind: None,
                 run_id: None,
@@ -1367,6 +1480,7 @@ pub fn scan_implement_root(root: &Path, notes: &mut Vec<String>) -> Vec<ReportIt
 
         items.push(ReportItem {
             path: display_path(&entry),
+            source: ItemSource::ImplementPath,
             class,
             checkout_kind,
             run_id: Some(name.clone()),
@@ -1378,6 +1492,7 @@ pub fn scan_implement_root(root: &Path, notes: &mut Vec<String>) -> Vec<ReportIt
         if has_evidence {
             items.push(ReportItem {
                 path: display_path(&ev),
+                source: ItemSource::ImplementPath,
                 class: PayloadClass::Evidence,
                 checkout_kind: None,
                 run_id: Some(name.clone()),
@@ -1387,7 +1502,12 @@ pub fn scan_implement_root(root: &Path, notes: &mut Vec<String>) -> Vec<ReportIt
                 note: None,
             });
         }
-        items.extend(nested_items(nested, &name, consumers));
+        items.extend(nested_items(
+            nested,
+            &name,
+            consumers,
+            ItemSource::ImplementPath,
+        ));
     }
     items
 }
@@ -1453,6 +1573,7 @@ pub fn scan_worktree_root(root: &Path, notes: &mut Vec<String>) -> Vec<ReportIte
             };
             items.push(ReportItem {
                 path: canonical,
+                source: ItemSource::WorktreePath,
                 class: if sidecar {
                     PayloadClass::Evidence
                 } else {
@@ -1504,6 +1625,7 @@ pub fn scan_worktree_root(root: &Path, notes: &mut Vec<String>) -> Vec<ReportIte
         };
         items.push(ReportItem {
             path: canonical,
+            source: ItemSource::WorktreePath,
             class,
             checkout_kind,
             run_id: Some(name.clone()),
@@ -1512,7 +1634,12 @@ pub fn scan_worktree_root(root: &Path, notes: &mut Vec<String>) -> Vec<ReportIte
             git,
             note,
         });
-        items.extend(nested_items(nested, &name, consumers));
+        items.extend(nested_items(
+            nested,
+            &name,
+            consumers,
+            ItemSource::WorktreePath,
+        ));
     }
     items
 }
@@ -1857,6 +1984,7 @@ pub fn render_text(r: &StorageReport) -> String {
 pub const STORAGE_USAGE: &str = "\
 usage: a2a-bridge storage report [--config <f>] [--json]
        a2a-bridge storage reap --build-targets [--dry-run] [--config <f>] [--json]
+       a2a-bridge storage reap --clones [--dry-run] [--config <f>] [--json]
 
 `report` audits bridge-owned storage. READ-ONLY, and not a reaper: it deletes nothing, pushes nothing,
 and fetches nothing — it is the instrument the storage reapers are gated on. Its findings are
@@ -1877,6 +2005,15 @@ and per-run dependency caches, and nothing else, after re-checking every gate at
   --config <path>     registry config (default: ./a2a-bridge.toml); its `allowed_cwd_root` resolves the
                       implement root exactly as `a2a-bridge implement` does.
   --json              machine-readable output instead of the table.
+
+JSON SCHEMA NOTE — every item carries a `source` field naming WHAT its `path` is, so a consumer never
+has to infer it from the string's shape:
+  \"implement-path\"  a canonical filesystem path under `.a2a-implement` (a run clone or its payloads);
+                    the only source whose runs have a per-run operation lock to gate a deletion on.
+  \"worktree-path\"   a canonical filesystem path under `[worktrees].root`. Custody is the ADR-0025
+                    sidecar lease, and removal is `git worktree remove` — neither reaper touches one.
+  \"volume-name\"     a container VOLUME NAME, not a path: nothing can `stat` or remove it, and
+                    ADR-0021/0025 owns its lifecycle.
 
 ONE DECLARED SIDE EFFECT: reading lock/lease liveness takes an advisory flock and immediately releases
 it (there is no query-only flock API). A merge or resume racing that window sees a clean \"already
@@ -2163,6 +2300,7 @@ mod tests {
         let t = totals(&[
             ReportItem {
                 path: "/c".into(),
+                source: ItemSource::ImplementPath,
                 class: PayloadClass::SourceCheckout,
                 checkout_kind: Some(CheckoutKind::StandaloneClone),
                 run_id: None,
@@ -2178,6 +2316,7 @@ mod tests {
             },
             ReportItem {
                 path: "/w".into(),
+                source: ItemSource::WorktreePath,
                 class: PayloadClass::SourceCheckout,
                 checkout_kind: Some(CheckoutKind::LinkedWorktree),
                 run_id: None,
@@ -2371,7 +2510,12 @@ mod tests {
         assert_eq!(g.probe_error, None, "{g:#?}");
         assert!(g.origin_is_local_path, "{g:#?}");
         assert_eq!(g.on_source_main, Some(OnSourceMain::YesHead), "{g:#?}");
-        assert_eq!(g.source_main_ref.as_deref(), Some("main"), "{g:#?}");
+        // FULLY QUALIFIED: a bare `main` would let a tag of that name stand in for the branch.
+        assert_eq!(
+            g.source_main_ref.as_deref(),
+            Some("refs/heads/main"),
+            "{g:#?}"
+        );
         assert_eq!(
             g.on_origin_as_of_last_fetch, None,
             "a frozen origin/* snapshot must not be presented as reachability"
@@ -3288,6 +3432,7 @@ mod tests {
         let items = vec![
             ReportItem {
                 path: "vol-a".into(),
+                source: ItemSource::VolumeName,
                 class: PayloadClass::ContainerOrImage,
                 checkout_kind: None,
                 run_id: None,
@@ -3298,6 +3443,7 @@ mod tests {
             },
             ReportItem {
                 path: "/x".into(),
+                source: ItemSource::ImplementPath,
                 class: PayloadClass::BuildTarget,
                 checkout_kind: None,
                 run_id: None,
@@ -3443,6 +3589,7 @@ mod tests {
         // The header and the rows share one format string; this pins that they stay in step.
         let it = ReportItem {
             path: "/p".into(),
+            source: ItemSource::ImplementPath,
             class: PayloadClass::BuildTarget,
             checkout_kind: None,
             run_id: None,

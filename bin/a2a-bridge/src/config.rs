@@ -459,6 +459,10 @@ fn default_admission_floor_gib() -> u64 {
     crate::storage_reap::DEFAULT_ADMISSION_FLOOR_GIB
 }
 
+fn default_clone_reap_lookback() -> u32 {
+    crate::storage_reap_clones::DEFAULT_CLONE_REAP_LOOKBACK
+}
+
 /// `[storage]` (R2f1b custody plan §6): the D-4 admission floor and the D-2 protected roots.
 ///
 /// Deliberately two keys. The plan removed the watermark ladder, reservations, quotas and per-repo
@@ -477,6 +481,11 @@ pub struct StorageToml {
     /// stockTrading/quant-platform repositories belong here.
     #[serde(default)]
     pub protected_roots: Vec<String>,
+    /// How many commits of the source repository's main branch `storage reap --clones` searches for a
+    /// clone's exact tree (the squash-landing case). A search that runs out of history answers
+    /// `unknown`, which PARKS the clone — so this is a completeness knob, never a safety one.
+    #[serde(default = "default_clone_reap_lookback")]
+    pub clone_reap_lookback: u32,
 }
 
 impl Default for StorageToml {
@@ -484,6 +493,7 @@ impl Default for StorageToml {
         Self {
             admission_floor_gib: default_admission_floor_gib(),
             protected_roots: Vec::new(),
+            clone_reap_lookback: default_clone_reap_lookback(),
         }
     }
 }

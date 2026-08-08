@@ -192,16 +192,65 @@ pub enum ParkReason {
     ConsumerProbeFailed { detail: String },
     /// The pinned scan root's dev/ino changed — the tree was swapped under us.
     ScanRootIdentityChanged { detail: String },
+
+    // -- S4 (clone reaper) ---------------------------------------------------------------------
+    /// A `[worktrees]` payload. Its custody handle is the ADR-0025 sidecar lease, not the per-run
+    /// operation lock, and a linked worktree is removed with `git worktree remove`, never `rm -rf`.
+    /// Read from the typed [`sr::ItemSource`], not inferred.
+    WorktreeCustody,
+    /// The on-disk `.git` shape does not prove standalone-clone semantics at the boundary. A linked
+    /// worktree shares its source's object store, and an ambiguous shape proves nothing at all.
+    NotAStandaloneClone { detail: String },
+    /// `git status` reported state that is not on any commit: modified, staged, untracked, a
+    /// non-disposable ignored entry, or a dirty submodule. Uncommitted bytes are BY DEFINITION not on
+    /// main, so no containment verdict can license deleting them.
+    GitStateNotClean { detail: String },
+    /// The git-state probe itself did not answer. A `status` that could not run is not a clean tree.
+    GitStateUnknown { detail: String },
+    /// HEAD has no commit. There is nothing to ask the containment question about.
+    UnbornHead,
+    /// `origin` is not a local path (or is absent), so there is no local source repository whose live
+    /// refs the containment query can be asked of. No network is ever contacted to fill the gap.
+    OriginNotLocal { detail: String },
+    /// The D-1 gate answered something other than `yes(head)`/`yes(tree)`. `no` and `unknown` BOTH park:
+    /// one means the content is demonstrably not on main, the other means the probe could not tell.
+    NotOnSourceMain { verdict: String, detail: String },
+    /// A ref other than HEAD holds commits that are on neither HEAD nor source main. Containment proves
+    /// HEAD; the deletion takes the WHOLE object store, so every ref must be accounted for.
+    RefsNotContained { detail: String },
+    /// The index carries a flag (`assume-unchanged`, `skip-worktree`, sparse) that makes
+    /// `git status --porcelain` silent about tracked bytes it can no longer see.
+    IndexFlagsHideState { detail: String },
+    /// An initialized submodule: its object store lives in `.git/modules` and dies with the clone, and
+    /// the superproject's gitlink SHA proves nothing about where those bytes are.
+    InitializedSubmodule { detail: String },
+    /// The checkpoint's recorded source repository disagrees with `remote.origin.url`, so the
+    /// containment proof was asked of a repository this run was not cloned from.
+    OriginDisagreesWithCheckpoint { detail: String },
+    /// Source main moved while the containment probes ran: the verdict describes no single history.
+    SourceMainMoved { detail: String },
+    /// `.git` changed identity around the git probes, so their answers describe a different repository.
+    GitIdentityChanged { detail: String },
+    /// The run's Evidence could not be preserved outside the clone. Evidence has its own retention
+    /// (plan §5) and must never die with the parent it describes.
+    EvidencePreservationFailed { detail: String },
+    /// The fold receipt could not be established before the deletion.
+    FoldReceiptUnavailable { detail: String },
+    /// The exact-mechanism removal guard refused: the path is not `<root>/<run id>`, has no `.git`, or
+    /// is (or contains) the source repository itself.
+    RemovalGuardRefused { detail: String },
 }
 
 impl ParkReason {
     pub fn summary(&self) -> String {
         match self {
             Self::ProtectedRoot { root } => format!("protected root (D-2): {root}"),
-            Self::NotReapableClass { class } => format!("class {class} is not reapable by S3"),
+            Self::NotReapableClass { class } => {
+                format!("class {class} is not a class this command may remove")
+            }
             Self::ContainerVolume => {
                 "container volume (its path is a volume NAME, not a filesystem path) — ADR-0021/0025 \
-                 authority, not S3's"
+                 authority, not a storage reaper's"
                     .to_string()
             }
             Self::NoOwningRun => "no owning run, so no operation lock to hold".to_string(),
@@ -248,6 +297,59 @@ impl ParkReason {
             }
             Self::ScanRootIdentityChanged { detail } => {
                 format!("scan root identity changed: {detail}")
+            }
+            Self::WorktreeCustody => "a `[worktrees]` payload: its custody handle is the ADR-0025 \
+                 sidecar lease (not the per-run operation lock) and it is removed with `git worktree \
+                 remove`, never `rm -rf`"
+                .to_string(),
+            Self::NotAStandaloneClone { detail } => {
+                format!("not provably a standalone clone: {detail}")
+            }
+            Self::GitStateNotClean { detail } => format!(
+                "working tree carries state that is on no commit, so it cannot be on main: {detail}"
+            ),
+            Self::GitStateUnknown { detail } => {
+                format!("git state could not be established: {detail}")
+            }
+            Self::UnbornHead => {
+                "HEAD is unborn — there is no commit to ask the containment question about".to_string()
+            }
+            Self::OriginNotLocal { detail } => format!(
+                "no local source repository to ask about containment: {detail} (no network is ever \
+                 contacted to fill the gap)"
+            ),
+            Self::NotOnSourceMain { verdict, detail } => format!(
+                "content is not verifiably on source main (verdict {verdict}): {detail}"
+            ),
+            Self::RefsNotContained { detail } => format!(
+                "a ref other than HEAD holds commits that are on neither HEAD nor source main — \
+                 containment proves HEAD, but the deletion takes the whole object store: {detail}"
+            ),
+            Self::IndexFlagsHideState { detail } => format!(
+                "the index carries flags that make `git status` blind to tracked bytes: {detail}"
+            ),
+            Self::InitializedSubmodule { detail } => format!(
+                "an initialized submodule's object store lives in `.git/modules` and would die with \
+                 the clone: {detail}"
+            ),
+            Self::OriginDisagreesWithCheckpoint { detail } => format!(
+                "`remote.origin.url` disagrees with the checkpoint's recorded source repository, so \
+                 the containment proof was asked of the wrong repository: {detail}"
+            ),
+            Self::SourceMainMoved { detail } => format!(
+                "source main moved while the containment probes ran: {detail}"
+            ),
+            Self::GitIdentityChanged { detail } => {
+                format!("`.git` changed around the probes: {detail}")
+            }
+            Self::EvidencePreservationFailed { detail } => format!(
+                "run evidence could not be preserved outside the clone: {detail}"
+            ),
+            Self::FoldReceiptUnavailable { detail } => {
+                format!("fold receipt could not be written before the deletion: {detail}")
+            }
+            Self::RemovalGuardRefused { detail } => {
+                format!("exact-mechanism removal guard refused: {detail}")
             }
         }
     }
@@ -300,6 +402,10 @@ impl ItemOutcome {
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 pub struct ReapItem {
     pub path: String,
+    /// What `path` names, carried through from the scan's own declaration. A receipt that dropped it
+    /// would push the volume-vs-path inference onto whoever reads the record — the very inference the
+    /// typed field exists to remove.
+    pub source: sr::ItemSource,
     pub class: String,
     pub run_id: Option<String>,
     pub logical_bytes: Option<u64>,
@@ -388,6 +494,15 @@ impl ReapReport {
         self.items
             .iter()
             .filter(|i| matches!(i.outcome, ItemOutcome::Deleted))
+            .filter_map(|i| i.disk_bytes)
+            .fold(0u64, u64::saturating_add)
+    }
+    /// Sum of `disk_bytes` over items a dry run PLANNED to remove — what the operator is being asked to
+    /// authorize. Never mixed into `removed_disk_bytes`: one is a proposal, the other is a fact.
+    pub fn planned_disk_bytes(&self) -> u64 {
+        self.items
+            .iter()
+            .filter(|i| matches!(i.outcome, ItemOutcome::Planned))
             .filter_map(|i| i.disk_bytes)
             .fold(0u64, u64::saturating_add)
     }
@@ -702,6 +817,32 @@ pub trait ReapEnv {
     /// Write a receipt into `evidence_dir`, returning the path written.
     fn write_receipt(&self, evidence_dir: &Path, json: &str) -> Result<String, String>;
 
+    /// Write (and FSYNC) `file_name` into `dir`, replacing any existing file of that name, returning
+    /// the path written. Separate from [`ReapEnv::write_receipt`] because S4's fold receipt has a
+    /// STABLE per-run name in a namespace that outlives the clone, and is written TWICE: once as the
+    /// crash-durable intent before the removal, once with the outcome before the lock is released.
+    /// A timestamped name would leave those two as unrelated files.
+    fn write_named(&self, dir: &Path, file_name: &str, json: &str) -> Result<String, String>;
+
+    /// Copy Evidence out of a payload that is about to be deleted, returning the relative names
+    /// copied. Evidence has its own retention (plan §5) and must never die with its parent.
+    ///
+    /// `sources` may mix directories (copied recursively) and regular files, because a run's evidence
+    /// is not one directory: the sidecar sits at `.git/a2a-bridge`, while `.git/A2A_TASK.md` and
+    /// `.git/A2A_COMMIT_MSG` sit beside it.
+    ///
+    /// Symlinks and other non-regular entries are NEVER followed and NEVER skipped — they are an
+    /// error, so the caller parks. Skipping them would delete a clone while reporting its evidence
+    /// preserved; following one would copy whatever a `:rw` container aimed it at. Every write is
+    /// durably synced before returning: an unsynced copy of a record whose original is about to be
+    /// unlinked is not a preserved record.
+    fn copy_evidence(&self, sources: &[PathBuf], to: &Path) -> Result<Vec<String>, String>;
+
+    /// Fsync a directory so its entries are durable. Called on the receipt namespace and its parent
+    /// BEFORE the first removal: a receipt whose directory entry has not reached the disk does not
+    /// survive the crash it exists to describe. A failure here parks the payload.
+    fn sync_dir(&self, dir: &Path) -> Result<(), String>;
+
     /// Operator-visible progress. A `+D` walk over a 20 GiB target takes long enough to read as a
     /// hang, so the command narrates itself. Default: silent (tests observe the journal instead).
     fn progress(&self, message: &str) {
@@ -937,15 +1078,25 @@ fn admit<'a>(
     root: &Path,
     protected: &ProtectedRoots,
 ) -> Result<Candidate<'a>, ParkReason> {
-    // FIRST, and BY IDENTITY rather than by class. A container volume's `path` is a volume NAME, not a
-    // filesystem path — and `classify_volume` maps `a2a-*-cache-<hash>` / `a2a-*-target-<hash>` into
-    // `DependencyCache` / `BuildTarget`, the very classes this reaper deletes. Discriminating them on
-    // class alone would miss those rows entirely; discriminating them only downstream would leave the
-    // refusal resting on the accident that a relative name fails an absolute-path check. Volumes are
-    // ADR-0021/0025's authority, and a name is not a path.
+    // FIRST, and BY THE SCANNER'S OWN DECLARATION rather than by class or by string shape. A container
+    // volume's `path` is a volume NAME, not a filesystem path — and `classify_volume` maps
+    // `a2a-*-cache-<hash>` / `a2a-*-target-<hash>` into `DependencyCache` / `BuildTarget`, the very
+    // classes this reaper deletes, so discriminating on class alone would miss those rows entirely.
+    //
+    // `source` is the primary discrimination (the S3 review's carried finding: destructive code must
+    // not INFER volume-vs-path). The `is_absolute` check stays as defence in depth — belt and braces,
+    // never the load-bearing gate.
     let path = PathBuf::from(&it.path);
-    if it.class == sr::PayloadClass::ContainerOrImage || !path.is_absolute() {
+    if !it.source.is_filesystem_path()
+        || it.class == sr::PayloadClass::ContainerOrImage
+        || !path.is_absolute()
+    {
         return Err(ParkReason::ContainerVolume);
+    }
+    // A `[worktrees]` payload has no operation lock and no `impl-<pid>-<nonce>` owner: neither of this
+    // command's idleness gates applies to one, so it is refused by source rather than gated on.
+    if it.source == sr::ItemSource::WorktreePath {
+        return Err(ParkReason::WorktreeCustody);
     }
 
     // D-2 BEFORE classification: a protected root is refused whatever class the scan gave it.
@@ -983,16 +1134,26 @@ fn admit<'a>(
         path,
         run_id,
         run_dir,
-        gates: vec![format!(
-            "D-2 protected roots: {} checked, none contains or is contained by this payload",
-            protected.paths().len()
-        )],
+        gates: vec![
+            format!(
+                "source: the scan declared this row `{}` — a filesystem path this command may address \
+                 (a volume name is not, and is refused by this field, not by its shape)",
+                it.source.label()
+            ),
+            format!(
+                "D-2 protected roots: {} checked, none contains or is contained by this payload",
+                protected.paths().len()
+            ),
+        ],
     })
 }
 
-fn park(it: &sr::ReportItem, reason: ParkReason) -> ReapItem {
+/// The parked record for an item that never reached a boundary gate. Shared with the clone reaper:
+/// both commands must report a refusal with the size the operator saw in `storage report`.
+pub(crate) fn park(it: &sr::ReportItem, reason: ParkReason) -> ReapItem {
     ReapItem {
         path: it.path.clone(),
+        source: it.source,
         class: it.class.label().to_string(),
         run_id: it.run_id.clone(),
         logical_bytes: it.measured.logical_bytes,
@@ -1006,7 +1167,7 @@ fn park(it: &sr::ReportItem, reason: ParkReason) -> ReapItem {
 /// `(dev, ino)` of a real directory at `path`. A symlink or non-directory is an error, never a
 /// silently-followed success.
 #[cfg(unix)]
-fn dir_dev_ino(path: &Path) -> Result<(u64, u64), String> {
+pub(crate) fn dir_dev_ino(path: &Path) -> Result<(u64, u64), String> {
     use std::os::unix::fs::MetadataExt as _;
     let md = std::fs::symlink_metadata(path).map_err(|e| format!("{}: {e}", path.display()))?;
     if md.file_type().is_symlink() {
@@ -1019,7 +1180,7 @@ fn dir_dev_ino(path: &Path) -> Result<(u64, u64), String> {
 }
 
 #[cfg(not(unix))]
-fn dir_dev_ino(path: &Path) -> Result<(u64, u64), String> {
+pub(crate) fn dir_dev_ino(path: &Path) -> Result<(u64, u64), String> {
     Err(format!(
         "{}: filesystem identity (dev/ino) is unavailable on this platform, so a directory swap \
          cannot be detected",
@@ -1030,7 +1191,9 @@ fn dir_dev_ino(path: &Path) -> Result<(u64, u64), String> {
 /// Re-verify that the pinned scan root's PATH still resolves to the descriptor we pinned. This is the
 /// swap check: an attacker controlling the parent can rename the root away and put another directory
 /// in its place, and every path-based operation would then land in the replacement.
-fn pinned_root_unchanged(pin: &bridge_core::fs_custody::PinnedDirectoryV1) -> Result<(), String> {
+pub(crate) fn pinned_root_unchanged(
+    pin: &bridge_core::fs_custody::PinnedDirectoryV1,
+) -> Result<(), String> {
     let (dev, ino) = dir_dev_ino(pin.canonical_path())?;
     let want = pin.identity();
     if want.dev != Some(dev) || want.ino != Some(ino) {
@@ -1045,7 +1208,7 @@ fn pinned_root_unchanged(pin: &bridge_core::fs_custody::PinnedDirectoryV1) -> Re
     Ok(())
 }
 
-fn root_identity_label(pin: &bridge_core::fs_custody::PinnedDirectoryV1) -> String {
+pub(crate) fn root_identity_label(pin: &bridge_core::fs_custody::PinnedDirectoryV1) -> String {
     let id = pin.identity();
     match (id.dev, id.ino) {
         (Some(d), Some(i)) => format!("dev {d} / ino {i}"),
@@ -1068,6 +1231,7 @@ impl Gated<'_> {
     fn base(&self, outcome: ItemOutcome) -> ReapItem {
         ReapItem {
             path: self.item.path.clone(),
+            source: self.item.source,
             class: self.item.class.label().to_string(),
             run_id: self.item.run_id.clone(),
             logical_bytes: self.logical,
@@ -1114,6 +1278,7 @@ fn gate_one<'a>(
         ($reason:expr) => {{
             return Err(ReapItem {
                 path: item.path.clone(),
+                source: item.source,
                 class: item.class.label().to_string(),
                 run_id: item.run_id.clone(),
                 // Seeded from the SCAN's measurement so a payload parked at the boundary still
@@ -1424,9 +1589,21 @@ fn row(c: [&str; 5]) -> String {
 }
 
 pub fn render_text(r: &ReapReport) -> String {
+    render_report(
+        r,
+        "--build-targets",
+        "DESTRUCTIVE: build targets and per-run dependency caches that passed every boundary gate \
+         were REMOVED.",
+    )
+}
+
+/// The shared reap table. `class_flag` names the invocation the report belongs to and `destructive` is
+/// the one-line banner for a real (non-dry) run — the two commands differ in exactly those two strings,
+/// and a second copy of this renderer would be a second place for the dry-run disclosure to rot.
+pub(crate) fn render_report(r: &ReapReport, class_flag: &str, destructive: &str) -> String {
     let mut s = String::new();
     if r.dry_run {
-        s.push_str("a2a-bridge storage reap --build-targets --dry-run\n");
+        s.push_str(&format!("a2a-bridge storage reap {class_flag} --dry-run\n"));
         s.push_str(
             "DRY RUN: every gate below was evaluated for real. No payload was deleted and no \
                     evidence was written.\n",
@@ -1435,11 +1612,9 @@ pub fn render_text(r: &ReapReport) -> String {
             "ONE STATE-VISIBLE EFFECT: {DRY_RUN_SIDE_EFFECT}\n\n"
         ));
     } else {
-        s.push_str("a2a-bridge storage reap --build-targets\n");
-        s.push_str(
-            "DESTRUCTIVE: build targets and per-run dependency caches that passed every \
-                    boundary gate were REMOVED.\n\n",
-        );
+        s.push_str(&format!("a2a-bridge storage reap {class_flag}\n"));
+        s.push_str(destructive);
+        s.push_str("\n\n");
     }
     s.push_str(&format!("scan root: {}\n\n", r.scan_root));
     s.push_str(&row(["outcome", "class", "logical", "on disk", "path"]));
@@ -1478,6 +1653,12 @@ pub fn render_text(r: &ReapReport) -> String {
         r.count("PARTIAL"),
         r.count("UNKNOWN"),
     ));
+    if r.dry_run {
+        s.push_str(&format!(
+            "planned (on-disk sizes, nothing removed): {}\n",
+            sr::human_bytes(Some(r.planned_disk_bytes()))
+        ));
+    }
     s.push_str(&format!(
         "removed (on-disk sizes): {}\n",
         sr::human_bytes(Some(r.removed_disk_bytes()))
@@ -1514,8 +1695,10 @@ DESTRUCTIVE. Deletes build targets (and per-run dependency caches) under this co
 never an unclassified item, never a container volume, and never anything at, inside, or containing a
 D-2 protected root.
 
-  --build-targets     REQUIRED. Names the payload classes this invocation may remove. There is no
-                      default class: a bare `storage reap` is refused.
+  --build-targets     REQUIRED (or `--clones`). Names the payload classes this invocation may remove.
+                      There is no default class: a bare `storage reap` is refused, and the two class
+                      flags may not be combined — they are different authorities with different gates
+                      and different receipts. See `storage reap --clones --help` for the other one.
   --dry-run           evaluate every boundary gate for real, delete nothing and write no evidence.
                       Its one state-visible effect is the operation-lock namespace (see below).
   --config <path>     registry config (default: ./a2a-bridge.toml).
@@ -1770,6 +1953,45 @@ mod tests {
                 .events
                 .push(Ev::Receipt(p.display().to_string()));
             Ok(p.display().to_string())
+        }
+
+        /// S3 never writes a stably-named file (its receipts are timestamped and live beside the
+        /// checkpoint). Modelled anyway so the seam is exercised by both commands' fakes.
+        fn write_named(&self, dir: &Path, file_name: &str, json: &str) -> Result<String, String> {
+            std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+            let p = dir.join(file_name);
+            std::fs::write(&p, json).map_err(|e| e.to_string())?;
+            Ok(p.display().to_string())
+        }
+
+        fn copy_evidence(&self, sources: &[PathBuf], to: &Path) -> Result<Vec<String>, String> {
+            let mut out = Vec::new();
+            for from in sources {
+                if from.is_file() {
+                    std::fs::create_dir_all(to).map_err(|e| e.to_string())?;
+                    let name = from.file_name().unwrap_or_default().to_string_lossy();
+                    std::fs::copy(from, to.join(name.as_ref())).map_err(|e| e.to_string())?;
+                    out.push(name.into_owned());
+                    continue;
+                }
+                if !from.is_dir() {
+                    continue;
+                }
+                std::fs::create_dir_all(to).map_err(|e| e.to_string())?;
+                for e in std::fs::read_dir(from).map_err(|e| e.to_string())? {
+                    let e = e.map_err(|e| e.to_string())?;
+                    if e.path().is_file() {
+                        std::fs::copy(e.path(), to.join(e.file_name()))
+                            .map_err(|e| e.to_string())?;
+                        out.push(e.file_name().to_string_lossy().into_owned());
+                    }
+                }
+            }
+            Ok(out)
+        }
+
+        fn sync_dir(&self, _dir: &Path) -> Result<(), String> {
+            Ok(())
         }
 
         fn progress(&self, message: &str) {
@@ -2116,6 +2338,7 @@ mod tests {
         let f = fx();
         let items = vec![sr::ReportItem {
             path: "a2a-impl-target-0123456789abcdef".into(),
+            source: sr::ItemSource::VolumeName,
             class: sr::PayloadClass::ContainerOrImage,
             checkout_kind: None,
             run_id: Some("impl-1-aa".into()),
@@ -2146,6 +2369,7 @@ mod tests {
         let items = vec![
             sr::ReportItem {
                 path: "a2a-verify-cache-0123456789abcdef".into(),
+                source: sr::ItemSource::VolumeName,
                 class: sr::PayloadClass::DependencyCache,
                 checkout_kind: None,
                 run_id: Some("impl-1-aa".into()),
@@ -2156,6 +2380,7 @@ mod tests {
             },
             sr::ReportItem {
                 path: "a2a-impl-lsp-target-0123456789abcdef".into(),
+                source: sr::ItemSource::VolumeName,
                 class: sr::PayloadClass::BuildTarget,
                 checkout_kind: None,
                 run_id: None,
@@ -2178,6 +2403,67 @@ mod tests {
             );
         }
         assert!(env.removed().is_empty());
+    }
+
+    /// The S3 review's carried finding: destructive code must not INFER volume-vs-path. Discriminates
+    /// the inference itself — a row the scanner declared a VOLUME, carrying a reapable class AND a
+    /// path that would pass every path-shaped check (it is absolute, canonical, and a real cargo
+    /// target on this disk). The old `class == ContainerOrImage || !path.is_absolute()` rule deletes
+    /// it; the typed `source` field refuses it.
+    #[test]
+    fn a_volume_row_is_refused_by_its_typed_source_not_by_the_shape_of_its_path() {
+        let f = fx();
+        let items = vec![sr::ReportItem {
+            path: sr::display_path(&f.target),
+            source: sr::ItemSource::VolumeName,
+            class: sr::PayloadClass::BuildTarget,
+            checkout_kind: None,
+            run_id: Some("impl-1-aa".into()),
+            measured: sr::Measured::default(),
+            consumers: sr::LiveConsumers::default(),
+            git: None,
+            note: None,
+        }];
+        let env = FakeEnv::new();
+        let r = run(&f, &items, &env, false);
+        assert_eq!(
+            r.items[0].outcome,
+            ItemOutcome::Parked {
+                reason: ParkReason::ContainerVolume
+            },
+            "an absolute-pathed volume row was not refused by its declared source"
+        );
+        assert!(f.target.join("debug/blob").exists());
+        assert!(env.removed().is_empty());
+    }
+
+    /// Discriminates a reaper that reaps whatever the scan hands it regardless of which root it came
+    /// from. A `[worktrees]` payload has no `impl-<pid>-<nonce>` owner and no per-run operation lock,
+    /// so NEITHER of this command's idleness gates applies — it must be refused by source, before any
+    /// gate that would silently pass for want of evidence.
+    #[test]
+    fn a_worktree_sourced_item_is_refused_by_source() {
+        let f = fx();
+        let items = vec![sr::ReportItem {
+            path: sr::display_path(&f.target),
+            source: sr::ItemSource::WorktreePath,
+            class: sr::PayloadClass::BuildTarget,
+            checkout_kind: None,
+            run_id: Some("impl-1-aa".into()),
+            measured: sr::Measured::default(),
+            consumers: sr::LiveConsumers::default(),
+            git: None,
+            note: None,
+        }];
+        let env = FakeEnv::new();
+        let r = run(&f, &items, &env, false);
+        assert_eq!(
+            r.items[0].outcome,
+            ItemOutcome::Parked {
+                reason: ParkReason::WorktreeCustody
+            }
+        );
+        assert!(f.target.join("debug/blob").exists());
     }
 
     /// Discriminates a reaper that reaps a nested payload with no owning run: with no run there is no
@@ -2393,6 +2679,7 @@ mod tests {
         cargo_target(&outside);
         let items = vec![sr::ReportItem {
             path: sr::display_path(&outside),
+            source: sr::ItemSource::ImplementPath,
             class: sr::PayloadClass::BuildTarget,
             checkout_kind: None,
             run_id: Some("impl-1-aa".into()),
