@@ -12,7 +12,7 @@
   standalone issues #35/#39 **MERGED** at `0f84a5ca`, issue #30 **MERGED** at `0d628271`, issue #36
   **MERGED** by PR #46 at `345941db`, and R2f incident intake **MERGED** by PR #45 at `db0eb28f`. R2e remains
   deferred and off the critical path.
-- **Active slice:** **R2f1b INACTIVE V3 FOUNDATION MERGED / PRE-SLICE-2 CUSTODY PLAN REVISION 3 APPROVED (OWNER DECISIONS D-1..D-4 RESOLVED 2026-08-07) / PHASE-0 STORAGE + TRACK-A GATE EXECUTION.**
+- **Active slice:** **R2f1b PRE-SLICE-2 PHASE-0 FOLD LANDED (2026-08-07): flock-release production fix + S1 incremental-off + S2 storage report (two Sol rounds + owner-capped repair) + A1 fs_custody tests (23) + A3 V3 snapshot tests (33), commits `ef74e6b..a85ff18` on `aedd2c2`; final gate 3320/1/12 composite-green (the 1 = feature-unification fixture, fixed and harness-verified 14/14); Sol cycle record at `docs/superpowers/reviews/2026-08-07-phase0-fold-sol-review.md`. REMAINING PRE-SLICE-2: S3 target reaper + D-4 floor, S4 clone reaper, S5 verify serialization, A2 flight type-contract tests, A4 fs_custody extraction, A5 fingerprint (pre-AutomaticR2f1b); slice-2 obligations in the custody plan ledger.**
   [ADR-0040](adr/0040-parallel-implementor-flight.md) owns the frozen-base ownership protocol,
   explicit current-target integration, per-run resume/merge lock, conflict retention, and aggregate verification
   boundary. R2f design is **APPROVED** and R2f0a is merged. Its integrated
