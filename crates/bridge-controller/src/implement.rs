@@ -252,15 +252,35 @@ pub fn task_id(pid: u32, nonce: &str) -> String {
 pub fn branch_for(task_id: &str) -> String {
     format!("implement/{task_id}")
 }
-/// A lowercase-alnum nonce of length `n` (the caller retries against existing clone dirs/branches, so
-/// uniqueness is belt-and-suspenders, not crypto).
+/// A lowercase-alnum nonce of length `n`, not crypto — but distinct on every call WITHIN a process.
+///
+/// The clock alone cannot carry that: `SystemTime::now()` is far coarser than the rate at which
+/// callers ask for ids, so a purely time-seeded nonce repeats itself. Measured on macOS, 20 000
+/// back-to-back calls of the previous time-only implementation produced only 8 669 distinct values
+/// (57 % duplicates) on ONE thread, and 5 691 of 80 000 across four. Two callers that collided then
+/// minted the same run id — and `liveness::acquire_lease` refuses the second with
+/// `WouldBlock "lease already held"`, failing a legitimate run.
+///
+/// So the per-process entropy is a fixed base (clock + pid, which separates PROCESSES) plus a
+/// monotonic counter added at the LOW end, which the digit loop below consumes first. Consecutive
+/// calls therefore differ in the FIRST character, and no two calls repeat until the counter has
+/// issued `36^n` values. The clock is read once, so its resolution stops mattering.
 pub fn nonce(n: usize) -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::OnceLock;
     use std::time::{SystemTime, UNIX_EPOCH};
-    let seed = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0)
-        ^ (std::process::id() as u128);
+
+    static BASE: OnceLock<u128> = OnceLock::new();
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    let base = *BASE.get_or_init(|| {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+            ^ (std::process::id() as u128)
+    });
+    let seed = base.wrapping_add(u128::from(COUNTER.fetch_add(1, Ordering::Relaxed)));
     const A: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789";
     let mut s = String::new();
     let mut x = seed;
@@ -821,6 +841,53 @@ mod tests {
             .chars()
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit()));
         assert_eq!(nonce(8).len(), 8);
+    }
+
+    /// The contract callers rely on: two ids minted in one process are never equal. A run id is
+    /// used as a lease path, and `liveness::acquire_lease` refuses a duplicate with
+    /// `WouldBlock "lease already held"` — it does not retry — so a repeat fails a legitimate run.
+    ///
+    /// The clock-only seed this replaced could not hold that. Measured on macOS, 20 000
+    /// back-to-back calls produced 8 669 distinct values on ONE thread and 5 691 of 80 000 across
+    /// four, because `SystemTime::now()` cannot resolve consecutive calls. Both assertions below
+    /// went red on that implementation with certainty in practice (over half of all adjacent pairs
+    /// collided); a formally deterministic version is not constructible without a seam that lets a
+    /// test force two identical clock readings.
+    #[test]
+    fn nonce_values_never_repeat_within_one_process() {
+        let minted: Vec<String> = (0..4096).map(|_| nonce(8)).collect();
+        let unique: std::collections::BTreeSet<&String> = minted.iter().collect();
+        assert_eq!(
+            unique.len(),
+            minted.len(),
+            "sequential nonces repeated within one process"
+        );
+    }
+
+    #[test]
+    fn nonce_values_never_repeat_across_concurrent_callers() {
+        let threads = 4;
+        let per_thread = 1024;
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(threads));
+        let handles: Vec<_> = (0..threads)
+            .map(|_| {
+                let barrier = std::sync::Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    (0..per_thread).map(|_| nonce(8)).collect::<Vec<String>>()
+                })
+            })
+            .collect();
+        let mut minted: Vec<String> = Vec::new();
+        for handle in handles {
+            minted.extend(handle.join().unwrap());
+        }
+        let unique: std::collections::BTreeSet<&String> = minted.iter().collect();
+        assert_eq!(
+            unique.len(),
+            minted.len(),
+            "concurrent callers minted the same nonce"
+        );
     }
 
     #[test]

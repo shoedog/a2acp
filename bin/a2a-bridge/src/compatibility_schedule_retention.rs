@@ -2614,7 +2614,7 @@ fn bundle_lease_id(bundle_id: &str) -> Result<String, BoxError> {
 pub(super) fn acquire_bundle_read_lease<C: EvidenceStateCapability + ?Sized>(
     capability: &C,
     bundle_id: &str,
-) -> Result<std::fs::File, BoxError> {
+) -> Result<crate::compatibility_schedule_evidence::EvidenceLeaseGuardV1, BoxError> {
     acquire_evidence_read_lease(capability, &bundle_lease_id(bundle_id)?)
 }
 

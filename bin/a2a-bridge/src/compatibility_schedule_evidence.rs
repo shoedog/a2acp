@@ -2547,12 +2547,53 @@ fn open_or_create_lease_file(
     Ok(file)
 }
 
+/// One held evidence lease, released in [`Drop`] with an explicit `LOCK_UN`.
+///
+/// Releasing by CLOSING the descriptor is not sound here. A `flock` belongs to the OPEN FILE
+/// DESCRIPTION, not to one descriptor, so the close frees the lock only once EVERY descriptor
+/// sharing that description is gone — and every concurrent process spawn copies this process's
+/// whole descriptor table into the child, where `FD_CLOEXEC` (set by `open_child_no_follow`) does
+/// not take effect until the child reaches `exec`. For the width of any unrelated spawn a dropped
+/// lease is therefore still held by the child's inherited copy, and the next acquirer of the same
+/// evidence id is refused: `try_acquire_evidence_gc_lease_optional` reports the lease busy and its
+/// caller defers a tombstone that was in fact free to proceed. `LOCK_UN` drops the lock from the
+/// description itself, so no inherited copy can keep it held.
+pub(super) struct EvidenceLeaseGuardV1 {
+    file: File,
+}
+
+impl EvidenceLeaseGuardV1 {
+    fn hold(file: File) -> Self {
+        Self { file }
+    }
+}
+
+impl Drop for EvidenceLeaseGuardV1 {
+    fn drop(&mut self) {
+        // SAFETY: this guard uniquely owns the locked descriptor for its whole lifetime.
+        if unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_UN) } == -1 {
+            let error = std::io::Error::last_os_error();
+            tracing::error!(
+                error = %error,
+                "releasing an evidence lease failed; a concurrently spawned child may hold it until it execs"
+            );
+            // Loud in debug builds so `ENOLCK`/`EOPNOTSUPP` on a filesystem without working
+            // `flock` cannot silently resurrect the inherited-descriptor bug this release exists
+            // to prevent — but never while unwinding, where a second panic aborts the process.
+            debug_assert!(
+                std::thread::panicking(),
+                "flock(LOCK_UN) failed for an evidence lease: {error}"
+            );
+        }
+    }
+}
+
 #[cfg_attr(not(test), allow(dead_code))]
 fn acquire_lease<C: EvidenceStateCapability + ?Sized>(
     capability: &C,
     evidence_id: &str,
     operation: libc::c_int,
-) -> Result<File, BoxError> {
+) -> Result<EvidenceLeaseGuardV1, BoxError> {
     let file = open_or_create_lease_file(capability.evidence_index_directory(), evidence_id)?;
     // SAFETY: the verified single-link regular file descriptor is live. LOCK_NB refuses rather
     // than queueing across scheduler processes.
@@ -2563,14 +2604,14 @@ fn acquire_lease<C: EvidenceStateCapability + ?Sized>(
         )
         .into());
     }
-    Ok(file)
+    Ok(EvidenceLeaseGuardV1::hold(file))
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
 pub(super) fn acquire_evidence_read_lease<C: EvidenceStateCapability + ?Sized>(
     capability: &C,
     evidence_id: &str,
-) -> Result<File, BoxError> {
+) -> Result<EvidenceLeaseGuardV1, BoxError> {
     acquire_lease(capability, evidence_id, libc::LOCK_SH)
 }
 
@@ -2578,7 +2619,7 @@ pub(super) fn acquire_evidence_read_lease<C: EvidenceStateCapability + ?Sized>(
 pub(super) fn try_acquire_evidence_gc_lease<C: EvidenceStateCapability + ?Sized>(
     capability: &C,
     evidence_id: &str,
-) -> Result<File, BoxError> {
+) -> Result<EvidenceLeaseGuardV1, BoxError> {
     acquire_lease(capability, evidence_id, libc::LOCK_EX)
 }
 
@@ -2586,7 +2627,7 @@ pub(super) fn try_acquire_evidence_gc_lease<C: EvidenceStateCapability + ?Sized>
 pub(super) fn try_acquire_evidence_gc_lease_optional<C: EvidenceStateCapability + ?Sized>(
     capability: &C,
     evidence_id: &str,
-) -> Result<Option<File>, BoxError> {
+) -> Result<Option<EvidenceLeaseGuardV1>, BoxError> {
     let file = open_or_create_lease_file(capability.evidence_index_directory(), evidence_id)?;
     // SAFETY: the verified single-link regular file descriptor is live. LOCK_NB refuses rather
     // than queueing across scheduler processes.
@@ -2599,7 +2640,7 @@ pub(super) fn try_acquire_evidence_gc_lease_optional<C: EvidenceStateCapability 
         }
         return Err(format!("schedule evidence: cannot acquire GC lease: {error}").into());
     }
-    Ok(Some(file))
+    Ok(Some(EvidenceLeaseGuardV1::hold(file)))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -6268,6 +6309,72 @@ mod tests {
         let exclusive = try_acquire_evidence_gc_lease(&lock, "evidence-1").unwrap();
         assert!(acquire_evidence_read_lease(&lock, "evidence-1").is_err());
         drop(exclusive);
+    }
+
+    /// Duplicate the lease descriptor to reproduce EXACTLY the state a concurrent process spawn
+    /// leaves behind — one open file description, two descriptors — with no dependence on process
+    /// timing. Releasing by closing our descriptor would leave the lock on the description the
+    /// other descriptor still holds open, and the reacquire below would be refused with
+    /// "schedule evidence: lease is busy".
+    #[test]
+    fn a_released_read_lease_is_not_held_by_an_inherited_open_file_description() {
+        use std::os::fd::{AsRawFd as _, FromRawFd as _};
+
+        let root = root();
+        let scheduler = SchedulerStateRoot::initialize_for_test(root.path()).unwrap();
+        let lock = scheduler
+            .try_owner_admission("test/evidence-lease-inherited-read")
+            .unwrap();
+        let reader = acquire_evidence_read_lease(&lock, "evidence-1").unwrap();
+        // SAFETY: `reader` owns a live descriptor for the whole call.
+        let duplicate = unsafe { libc::dup(reader.file.as_raw_fd()) };
+        assert!(
+            duplicate >= 0,
+            "dup failed: {}",
+            std::io::Error::last_os_error()
+        );
+        // SAFETY: dup returned an owned descriptor, adopted uniquely by File here.
+        let inherited = unsafe { File::from_raw_fd(duplicate) };
+
+        drop(reader);
+        let exclusive = try_acquire_evidence_gc_lease(&lock, "evidence-1")
+            .expect("a released read lease must not stay held by an inherited descriptor");
+        drop(exclusive);
+        drop(inherited);
+    }
+
+    /// The exclusive half of the same mechanism: a GC lease that a spawn duplicated must also be
+    /// released by the guard rather than by the close, or the next reader is refused.
+    #[test]
+    fn a_released_gc_lease_is_not_held_by_an_inherited_open_file_description() {
+        use std::os::fd::{AsRawFd as _, FromRawFd as _};
+
+        let root = root();
+        let scheduler = SchedulerStateRoot::initialize_for_test(root.path()).unwrap();
+        let lock = scheduler
+            .try_owner_admission("test/evidence-lease-inherited-gc")
+            .unwrap();
+        let exclusive = try_acquire_evidence_gc_lease(&lock, "evidence-1").unwrap();
+        // SAFETY: `exclusive` owns a live descriptor for the whole call.
+        let duplicate = unsafe { libc::dup(exclusive.file.as_raw_fd()) };
+        assert!(
+            duplicate >= 0,
+            "dup failed: {}",
+            std::io::Error::last_os_error()
+        );
+        // SAFETY: dup returned an owned descriptor, adopted uniquely by File here.
+        let inherited = unsafe { File::from_raw_fd(duplicate) };
+
+        drop(exclusive);
+        let reader = acquire_evidence_read_lease(&lock, "evidence-1")
+            .expect("a released GC lease must not stay held by an inherited descriptor");
+        drop(reader);
+        // The optional acquirer answers `DeferredLeaseBusy` rather than an error, so a leak there
+        // silently defers a tombstone instead of failing loudly. Cover it from the same state.
+        assert!(try_acquire_evidence_gc_lease_optional(&lock, "evidence-1")
+            .unwrap()
+            .is_some());
+        drop(inherited);
     }
 
     #[test]
