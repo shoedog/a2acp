@@ -262,9 +262,35 @@ pub fn branch_for(task_id: &str) -> String {
 /// `WouldBlock "lease already held"`, failing a legitimate run.
 ///
 /// So the per-process entropy is a fixed base (clock + pid, which separates PROCESSES) plus a
-/// monotonic counter added at the LOW end, which the digit loop below consumes first. Consecutive
-/// calls therefore differ in the FIRST character, and no two calls repeat until the counter has
-/// issued `36^n` values. The clock is read once, so its resolution stops mattering.
+/// monotonic counter added at the LOW end, which the digit loop below consumes first. The loop
+/// always extracts the base-36 digits of `seed` LOW-digit-first (`x % 36`, `x /= 36`), so for ANY
+/// `n` the first 12 characters are exactly `seed mod 36^12` — arithmetic, not an estimate: `base`
+/// (a nanosecond epoch timestamp XOR'd with a pid) sits between `36^11` (≈1.32e17) and `36^12`
+/// (≈4.74e18) at today's epoch magnitude, so those 12 digits are drawn before `x` can ever reach
+/// `0`. The counter is ADDED (not multiplied) to `base`, and adding a constant is a bijection on
+/// `Z/36^12 Z`, so distinct counter values within any run of `36^12` calls produce distinct
+/// 12-digit prefixes: no two calls repeat within `36^12` calls, for every `n >= 12`, REGARDLESS of
+/// what the digits past position 12 do. (For `n < 12` the same argument gives the weaker `36^n`
+/// bound directly, since the loop never looks past digit `n`.) The clock is read once, so its
+/// resolution stops mattering.
+///
+/// Digits past position 12 are a different story, but the uniqueness bound above never depends on
+/// them: once `x` (by then `seed / 36^12 == 0`) is exhausted, the loop below reseeds it from
+/// `seed.rotate_left(7)` — fixed for the REST of this one call (so every later digit is one more
+/// clean base-36 expansion of that same rotated value) but still varies ACROSS calls, since `seed`
+/// (hence the rotation) is a function of that call's counter. This engages routinely, not as an
+/// edge case: both of this crate's longer production lengths (`nonce(20)`, `nonce(24)`) exceed 12,
+/// as does the `nonce(64)` pin in the tests; only the shorter lengths (6, 8, and the `nonce(12)`
+/// pinned in the tests) stay entirely within the clean prefix.
+///
+/// A caller could additionally scatter the low digits by multiplying the counter's contribution by
+/// a constant `C` coprime to 36 before adding it to `base` (spreads consecutive ids across more than
+/// one digit position, which is friendlier to read in a log). That WOULD still preserve the `36^12`
+/// bound above with just a one-line check: `gcd(C, 36) = 1` makes `C` a unit mod `36^12` too (36's
+/// only prime factors are 2 and 3), so multiplying by `C` stays a bijection on the same group, and
+/// two counters that collided under it would already have had to collide without it. Deliberately
+/// NOT done here anyway — it is a log-readability nicety, not a correctness gap, and not worth the
+/// churn for this slice.
 pub fn nonce(n: usize) -> String {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::OnceLock;
@@ -288,6 +314,10 @@ pub fn nonce(n: usize) -> String {
         s.push(A[(x % A.len() as u128) as usize] as char);
         x /= A.len() as u128;
         if x == 0 {
+            // Mid-run refill: `x` exhausted its significant base-36 digits before `n` digits were
+            // drawn. Reseed from a bit-rotation of the ORIGINAL seed (not the exhausted `x`) so the
+            // remaining digits stay a function of this call's counter value rather than flattening
+            // to a run of the alphabet's first character.
             x = seed.rotate_left(7) | 1;
         }
     }
@@ -841,6 +871,27 @@ mod tests {
             .chars()
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit()));
         assert_eq!(nonce(8).len(), 8);
+    }
+
+    /// The fail-closed contract under the S4 reaper's run-id parse, pinned independently of
+    /// uniqueness: `storage_reap::run_owner_pid` splits `impl-<pid>-<nonce>` on `'-'` and requires
+    /// exactly 3 parts, so a nonce that ever emitted a `-` (or any character outside `[a-z0-9]`)
+    /// would either shift a well-formed run id into a spurious parse failure or, if the shift still
+    /// happened to yield 3 parts, misroute a pid. Cover every production length (6, 8, 20, 24) plus
+    /// 0 and 1 as edges, and 64 — past the point (see `nonce`'s doc comment) where the digit loop's
+    /// mid-run refill routinely engages — to prove the refill path stays in-charset too.
+    #[test]
+    fn nonce_charset_and_length_contract() {
+        for n in [0usize, 1, 6, 8, 12, 20, 24, 36, 64] {
+            let value = nonce(n);
+            assert_eq!(value.len(), n, "nonce({n}) produced the wrong length");
+            assert!(
+                value
+                    .chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit()),
+                "nonce({n}) = {value:?} used a character outside [a-z0-9]"
+            );
+        }
     }
 
     /// The contract callers rely on: two ids minted in one process are never equal. A run id is

@@ -41,26 +41,46 @@ fn flock_blocking_exclusive(file: &std::fs::File) -> std::io::Result<()> {
     }
 }
 
-/// Explicit release. Load-bearing: both guards release HERE rather than at close (see
-/// [`PersistentLockGuard::drop`]), so a filesystem that cannot unlock — `ENOLCK`/`EOPNOTSUPP` are reachable
-/// on NFS, and `$HOME/.a2a-bridge/leases` may well be NFS — would silently resurrect the spawn-window bug
-/// this release exists to prevent. Report it instead of swallowing it; releasing is still best-effort
-/// because the close that follows is the only remaining recourse.
-fn flock_unlock(file: &std::fs::File, path: &Path) {
+/// Explicit release, generalized over any display-able lease/lock identifier — a filesystem path
+/// (pass `.display()`), an evidence id, a named lock label: whatever a call site can name the held
+/// resource by, for the failure log below. `pub` because every flock guard in the binary shares
+/// this one release-then-report path, not just this crate's own two: [`LeaseGuard::drop`],
+/// [`PersistentLockGuard::drop`], the bin crate's `EvidenceLeaseGuardV1`, and the bin crate's
+/// `OwnerAdmissionLock` / `AdmissionAuthorityLocks` / `AuthorityMutationLock` (all released a raw
+/// `libc::flock(..., LOCK_UN)` with the result silently discarded before this consolidation — on a
+/// filesystem where `LOCK_UN` can fail, that silence would resurrect the inherited-descriptor bug
+/// this release exists to prevent, undetected).
+///
+/// Load-bearing: every one of those guards releases HERE rather than at close (see
+/// [`PersistentLockGuard::drop`]'s doc for why closing alone is not a release), so a filesystem
+/// that cannot unlock — `ENOLCK`/`EOPNOTSUPP` are reachable on NFS, and `$HOME/.a2a-bridge/leases`
+/// may well be NFS — would silently resurrect the spawn-window bug this release exists to prevent.
+/// Report it instead of swallowing it; releasing is still best-effort because the close that
+/// follows is the only remaining recourse.
+pub fn flock_unlock(file: &std::fs::File, id: impl std::fmt::Display) {
     if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) } != 0 {
-        let err = std::io::Error::last_os_error();
-        tracing::error!(
-            path = %path.display(),
-            error = %err,
-            "releasing an advisory lock failed; a concurrently spawned child may hold it until it execs"
-        );
-        // Fail loudly in debug builds — but never while unwinding, where a second panic aborts the process.
-        debug_assert!(
-            std::thread::panicking(),
-            "flock(LOCK_UN) failed for {}: {err}",
-            path.display()
-        );
+        report_unlock_failure(id, std::io::Error::last_os_error());
     }
+}
+
+/// The on-failure half of [`flock_unlock`], split out so a caller with a test-only seam for
+/// injecting a release failure can reuse this EXACT log-then-assert behavior instead of
+/// re-deriving it. A live file descriptor cannot be corrupted to force this path in a test: the
+/// standard library's I/O-safety runtime check hard-aborts the process the moment a `File`'s own
+/// descriptor is closed out from under it, so callers that need to prove "a release failure is
+/// loud, not silent" (e.g. the bin crate's `compatibility_schedule_state` guards) synthesize the
+/// `io::Error` instead of causing a real one.
+pub fn report_unlock_failure(id: impl std::fmt::Display, err: std::io::Error) {
+    tracing::error!(
+        lease = %id,
+        error = %err,
+        "releasing an advisory lock failed; a concurrently spawned child may hold it until it execs"
+    );
+    // Fail loudly in debug builds — but never while unwinding, where a second panic aborts the process.
+    debug_assert!(
+        std::thread::panicking(),
+        "flock(LOCK_UN) failed for {id}: {err}"
+    );
 }
 
 /// Stable per-host id (best-effort). Labelled `a2a.host` so a sweep never reaps another machine's containers.
@@ -111,7 +131,7 @@ impl Drop for LeaseGuard {
         // flocks after the release below would acquire the doomed inode while a later `create` mints a fresh
         // one: two holders of one lease id on two inodes.)
         let _ = std::fs::remove_file(&self.path);
-        flock_unlock(&self._file, &self.path); // see PersistentLockGuard::drop — closing alone is not a release
+        flock_unlock(&self._file, self.path.display()); // see PersistentLockGuard::drop — closing alone is not a release
     }
 }
 
@@ -155,7 +175,7 @@ impl PersistentLockGuard {
 /// drops the lock from the description itself, so no inherited copy can hold it open.
 impl Drop for PersistentLockGuard {
     fn drop(&mut self) {
-        flock_unlock(&self._file, &self.path);
+        flock_unlock(&self._file, self.path.display());
     }
 }
 
@@ -238,7 +258,7 @@ impl LeaseProbe for FsLeaseProbe {
             .ok()?;
         match flock_nb(&f, true) {
             Ok(true) => {
-                flock_unlock(&f, Path::new(lease_path)); // acquired ⇒ free ⇒ owner dead; release so we don't claim it
+                flock_unlock(&f, lease_path); // acquired ⇒ free ⇒ owner dead; release so we don't claim it
                 Some(true)
             }
             Ok(false) => Some(false), // held ⇒ owner alive

@@ -21,6 +21,7 @@ use crate::compatibility_schedule_schema::{
 };
 use crate::compatibility_schedule_state::{EvidenceStateCapability, StateQuota};
 use crate::{local_file, BoxError};
+use bridge_core::liveness::flock_unlock;
 
 #[cfg_attr(not(test), allow(dead_code))]
 pub(super) const DAY_MS: i64 = 86_400_000;
@@ -2547,7 +2548,7 @@ fn open_or_create_lease_file(
     Ok(file)
 }
 
-/// One held evidence lease, released in [`Drop`] with an explicit `LOCK_UN`.
+/// One held evidence lease, released in [`Drop`] through the shared `bridge_core::liveness::flock_unlock`.
 ///
 /// Releasing by CLOSING the descriptor is not sound here. A `flock` belongs to the OPEN FILE
 /// DESCRIPTION, not to one descriptor, so the close frees the lock only once EVERY descriptor
@@ -2557,34 +2558,26 @@ fn open_or_create_lease_file(
 /// lease is therefore still held by the child's inherited copy, and the next acquirer of the same
 /// evidence id is refused: `try_acquire_evidence_gc_lease_optional` reports the lease busy and its
 /// caller defers a tombstone that was in fact free to proceed. `LOCK_UN` drops the lock from the
-/// description itself, so no inherited copy can keep it held.
+/// description itself, so no inherited copy can keep it held. On a release failure the shared
+/// helper's log line now carries this lease's evidence id (previously it named no lease at all,
+/// so a stuck-release operator had no identifier to act on).
 pub(super) struct EvidenceLeaseGuardV1 {
     file: File,
+    evidence_id: String,
 }
 
 impl EvidenceLeaseGuardV1 {
-    fn hold(file: File) -> Self {
-        Self { file }
+    fn hold(file: File, evidence_id: &str) -> Self {
+        Self {
+            file,
+            evidence_id: evidence_id.to_string(),
+        }
     }
 }
 
 impl Drop for EvidenceLeaseGuardV1 {
     fn drop(&mut self) {
-        // SAFETY: this guard uniquely owns the locked descriptor for its whole lifetime.
-        if unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_UN) } == -1 {
-            let error = std::io::Error::last_os_error();
-            tracing::error!(
-                error = %error,
-                "releasing an evidence lease failed; a concurrently spawned child may hold it until it execs"
-            );
-            // Loud in debug builds so `ENOLCK`/`EOPNOTSUPP` on a filesystem without working
-            // `flock` cannot silently resurrect the inherited-descriptor bug this release exists
-            // to prevent — but never while unwinding, where a second panic aborts the process.
-            debug_assert!(
-                std::thread::panicking(),
-                "flock(LOCK_UN) failed for an evidence lease: {error}"
-            );
-        }
+        flock_unlock(&self.file, &self.evidence_id);
     }
 }
 
@@ -2604,7 +2597,7 @@ fn acquire_lease<C: EvidenceStateCapability + ?Sized>(
         )
         .into());
     }
-    Ok(EvidenceLeaseGuardV1::hold(file))
+    Ok(EvidenceLeaseGuardV1::hold(file, evidence_id))
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -2640,7 +2633,7 @@ pub(super) fn try_acquire_evidence_gc_lease_optional<C: EvidenceStateCapability 
         }
         return Err(format!("schedule evidence: cannot acquire GC lease: {error}").into());
     }
-    Ok(Some(EvidenceLeaseGuardV1::hold(file)))
+    Ok(Some(EvidenceLeaseGuardV1::hold(file, evidence_id)))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

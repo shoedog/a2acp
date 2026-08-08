@@ -15,6 +15,57 @@ use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
 
 use crate::local_file::{self, PinnedDirectory};
 use crate::BoxError;
+use bridge_core::liveness::flock_unlock;
+
+/// The on-disk lock file names, reused as the release-failure log's lease/lock identifier —
+/// previously these three guards discarded the `flock(LOCK_UN)` result outright, so an `ENOLCK`/
+/// `EOPNOTSUPP` release failure (reachable on NFS) would silently resurrect the inherited-descriptor
+/// bug the release exists to prevent. Now they route through the same `bridge_core::liveness::
+/// flock_unlock` every other flock guard in the binary uses: checked, logged with this identifier,
+/// and loud (`debug_assert`) in debug builds.
+const OWNER_ADMISSION_LOCK_NAME: &str = "owner-admission.lock";
+const AUTHORITY_STATE_LOCK_NAME: &str = "authority-state.lock";
+
+// Test-only fault injection for `release`: arms the NEXT call whose `label` matches to report a
+// synthetic failure instead of performing the real `flock`. Thread-local because these guards'
+// drops always run on the arming test's own thread; matching by label (rather than "the very next
+// call regardless of label") lets a test target one specific lock family in a guard that releases
+// more than one (`OwnerAdmissionLock` releases its nested authority lock before its own).
+#[cfg(test)]
+thread_local! {
+    static FORCE_RELEASE_FAILURE_FOR: std::cell::RefCell<Option<&'static str>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn force_next_release_failure_for(label: &'static str) {
+    FORCE_RELEASE_FAILURE_FOR.with(|cell| *cell.borrow_mut() = Some(label));
+}
+
+/// Every silent-before-this-slice release site now funnels through here, which is a transparent
+/// passthrough to the shared [`flock_unlock`] outside test builds.
+fn release(file: &File, label: &'static str) {
+    #[cfg(test)]
+    {
+        let armed = FORCE_RELEASE_FAILURE_FOR.with(|cell| {
+            let mut slot = cell.borrow_mut();
+            if *slot == Some(label) {
+                *slot = None;
+                true
+            } else {
+                false
+            }
+        });
+        if armed {
+            bridge_core::liveness::report_unlock_failure(
+                label,
+                std::io::Error::from_raw_os_error(libc::EBADF),
+            );
+            return;
+        }
+    }
+    flock_unlock(file, label);
+}
 
 const STATE_DIRECTORY_MODE: u32 = 0o700;
 const STATE_FILE_MODE: u32 = 0o600;
@@ -883,27 +934,32 @@ impl EvidenceStateCapability for OwnerAdmissionLock {
 
 impl Drop for OwnerAdmissionLock {
     fn drop(&mut self) {
-        // SAFETY: this guard uniquely owns both locked descriptors. Release the nested authority
-        // lock before the owner-wide lock to preserve the sole owner-then-authority order.
-        unsafe {
-            if let Some(authority_file) = self.authority_file.as_ref() {
-                libc::flock(authority_file.as_raw_fd(), libc::LOCK_UN);
-            }
-            libc::flock(self.file.as_raw_fd(), libc::LOCK_UN);
+        // Bookkeeping FIRST, release second. `release` can panic (a real LOCK_UN failure is loud
+        // in debug builds via `report_unlock_failure`'s debug_assert) — if the decrement ran
+        // AFTER it, a panicking release would skip the decrement outright, leaving
+        // `admission_holders` permanently over-counted for this `SchedulerStateRoot` and wrongly
+        // refusing every later `try_authority_mutation` on it (LockOrder) forever. Doing the
+        // bookkeeping first, in its own scope, makes it unconditional regardless of what the
+        // fallible releases below do.
+        {
+            let mut state = process_lock_state_after_drop(&self.inner);
+            debug_assert!(state.admission_holders > 0);
+            state.admission_holders = state.admission_holders.saturating_sub(1);
         }
-        let mut state = process_lock_state_after_drop(&self.inner);
-        debug_assert!(state.admission_holders > 0);
-        state.admission_holders = state.admission_holders.saturating_sub(1);
+        // This guard uniquely owns both locked descriptors. Release the nested authority lock
+        // before the owner-wide lock to preserve the sole owner-then-authority order.
+        if let Some(authority_file) = self.authority_file.as_ref() {
+            release(authority_file, AUTHORITY_STATE_LOCK_NAME);
+        }
+        release(&self.file, OWNER_ADMISSION_LOCK_NAME);
     }
 }
 
 impl Drop for AdmissionAuthorityLocks {
     fn drop(&mut self) {
-        // SAFETY: the combined guard uniquely owns the nested authority descriptor. The owner
-        // guard remains a field until this drop completes, enforcing authority-before-owner release.
-        unsafe {
-            libc::flock(self.authority_file.as_raw_fd(), libc::LOCK_UN);
-        }
+        // The combined guard uniquely owns the nested authority descriptor. The owner guard
+        // remains a field until this drop completes, enforcing authority-before-owner release.
+        release(&self.authority_file, AUTHORITY_STATE_LOCK_NAME);
     }
 }
 
@@ -953,13 +1009,16 @@ impl EvidenceStateCapability for AdmissionAuthorityLocks {
 
 impl Drop for AuthorityMutationLock {
     fn drop(&mut self) {
-        // SAFETY: this guard uniquely owns the locked descriptor.
-        unsafe {
-            libc::flock(self.file.as_raw_fd(), libc::LOCK_UN);
+        // Bookkeeping FIRST, release second — same reasoning as OwnerAdmissionLock::drop above:
+        // a panicking release must not skip the decrement and leave `authority_only_holders`
+        // stuck over-counted.
+        {
+            let mut state = process_lock_state_after_drop(&self.inner);
+            debug_assert!(state.authority_only_holders > 0);
+            state.authority_only_holders = state.authority_only_holders.saturating_sub(1);
         }
-        let mut state = process_lock_state_after_drop(&self.inner);
-        debug_assert!(state.authority_only_holders > 0);
-        state.authority_only_holders = state.authority_only_holders.saturating_sub(1);
+        // This guard uniquely owns the locked descriptor.
+        release(&self.file, AUTHORITY_STATE_LOCK_NAME);
     }
 }
 
@@ -1450,6 +1509,121 @@ mod tests {
         // SAFETY: the temporary path is NUL-terminated and owned by this test.
         assert_eq!(unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o600) }, 0);
         assert!(state.try_owner_admission("run-1:daily").is_err());
+    }
+
+    /// Before this consolidation these three guards discarded `flock(LOCK_UN)`'s result outright:
+    /// a release failure was fully silent (no log, no panic — exactly the `state.rs` gap the
+    /// flake-fix review ledgered, since an `ENOLCK`/`EOPNOTSUPP` release failure on an NFS state
+    /// root would then silently resurrect the inherited-descriptor bug the release exists to
+    /// prevent). Force one deterministically through the `force_next_release_failure_for` seam
+    /// (a live descriptor can't be corrupted for this — the stdlib's I/O-safety runtime check
+    /// hard-aborts the process on a foreign close, as an earlier version of this test discovered)
+    /// and prove the drop is now loud instead of silent: the shared `report_unlock_failure`'s
+    /// `debug_assert!(std::thread::panicking(), ..)` only fires because this thread is NOT
+    /// already unwinding, so a genuine release failure here panics. Also proves the
+    /// bookkeeping-before-release ordering: a panicking release must not skip the holder-count
+    /// decrement, so a fresh acquire on the SAME root must still succeed afterward.
+    //
+    // Requires debug_assertions: `report_unlock_failure`'s `debug_assert!` compiles out in a
+    // release build, so the forced failure would return normally instead of panicking (CI runs
+    // debug-only today).
+    #[cfg(debug_assertions)]
+    #[test]
+    fn owner_admission_lock_release_failure_is_loud_not_silent() {
+        let root = root();
+        let state = SchedulerStateRoot::initialize_for_test(root.path()).unwrap();
+        let owner = state.try_owner_admission("loud-release:owner").unwrap();
+        // Target the OWNER-WIDE release specifically (not the nested authority release that
+        // precedes it in the same drop) by arming the seam for its label only.
+        force_next_release_failure_for(OWNER_ADMISSION_LOCK_NAME);
+        let released = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(owner)));
+        assert!(
+            released.is_err(),
+            "a release failure on the owner-admission lock must panic loudly, not vanish silently"
+        );
+        assert_eq!(
+            state
+                .inner
+                .process_lock_state
+                .lock()
+                .unwrap()
+                .admission_holders,
+            0,
+            "a panicking release must not skip the holder-count decrement"
+        );
+        state
+            .try_owner_admission("loud-release:owner:after-panic")
+            .expect("a fresh acquire on the same root must succeed after the panicking release");
+    }
+
+    /// Same mechanism as [`owner_admission_lock_release_failure_is_loud_not_silent`], on the
+    /// upgraded (owner + authority) guard's nested authority-state release. Unwinding still drops
+    /// the nested `OwnerAdmissionLock` field, whose own (here unarmed, successful) release and
+    /// bookkeeping run regardless, so the owner-wide holder count and a fresh acquire are covered
+    /// too — a confirmatory check, since this guard never owned bookkeeping itself.
+    //
+    // Requires debug_assertions — see owner_admission_lock_release_failure_is_loud_not_silent.
+    #[cfg(debug_assertions)]
+    #[test]
+    fn admission_authority_locks_release_failure_is_loud_not_silent() {
+        let root = root();
+        let state = SchedulerStateRoot::initialize_for_test(root.path()).unwrap();
+        let owner = state
+            .try_owner_admission("loud-release:authority-owner")
+            .unwrap();
+        let combined = owner.try_authority_state("loud-release:authority").unwrap();
+        force_next_release_failure_for(AUTHORITY_STATE_LOCK_NAME);
+        let released = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(combined)));
+        assert!(
+            released.is_err(),
+            "a release failure on the authority-state lock must panic loudly, not vanish silently"
+        );
+        assert_eq!(
+            state
+                .inner
+                .process_lock_state
+                .lock()
+                .unwrap()
+                .admission_holders,
+            0,
+            "a panicking release must not skip the nested owner's holder-count decrement"
+        );
+        state
+            .try_owner_admission("loud-release:authority:after-panic")
+            .expect("a fresh acquire on the same root must succeed after the panicking release");
+    }
+
+    /// Same mechanism as [`owner_admission_lock_release_failure_is_loud_not_silent`], on the
+    /// standalone authority-only mutation guard.
+    //
+    // Requires debug_assertions — see owner_admission_lock_release_failure_is_loud_not_silent.
+    #[cfg(debug_assertions)]
+    #[test]
+    fn authority_mutation_lock_release_failure_is_loud_not_silent() {
+        let root = root();
+        let state = SchedulerStateRoot::initialize_for_test(root.path()).unwrap();
+        let authority = state
+            .try_authority_mutation("loud-release:mutation")
+            .unwrap();
+        force_next_release_failure_for(AUTHORITY_STATE_LOCK_NAME);
+        let released = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(authority)));
+        assert!(
+            released.is_err(),
+            "a release failure on the authority-mutation lock must panic loudly, not vanish silently"
+        );
+        assert_eq!(
+            state
+                .inner
+                .process_lock_state
+                .lock()
+                .unwrap()
+                .authority_only_holders,
+            0,
+            "a panicking release must not skip the holder-count decrement"
+        );
+        state
+            .try_authority_mutation("loud-release:mutation:after-panic")
+            .expect("a fresh acquire on the same root must succeed after the panicking release");
     }
 
     #[test]
