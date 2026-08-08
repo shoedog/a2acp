@@ -113,8 +113,8 @@ impl<'de> Deserialize<'de> for BoundedPreparationTransferReasonV1 {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
 pub enum PreparationFlightStateV1 {
-    Open,
-    BarrierSynced,
+    Open {},
+    BarrierSynced {},
     Transferred {
         reason: BoundedPreparationTransferReasonV1,
     },
@@ -357,21 +357,21 @@ mod tests {
     #[test]
     fn preparation_flight_state_unit_variants_golden_round_trip() {
         assert_eq!(
-            serde_json::to_string(&PreparationFlightStateV1::Open).unwrap(),
+            serde_json::to_string(&PreparationFlightStateV1::Open {}).unwrap(),
             r#"{"state":"open"}"#
         );
         assert_eq!(
             serde_json::from_str::<PreparationFlightStateV1>(r#"{"state":"open"}"#).unwrap(),
-            PreparationFlightStateV1::Open
+            PreparationFlightStateV1::Open {}
         );
         assert_eq!(
-            serde_json::to_string(&PreparationFlightStateV1::BarrierSynced).unwrap(),
+            serde_json::to_string(&PreparationFlightStateV1::BarrierSynced {}).unwrap(),
             r#"{"state":"barrier_synced"}"#
         );
         assert_eq!(
             serde_json::from_str::<PreparationFlightStateV1>(r#"{"state":"barrier_synced"}"#)
                 .unwrap(),
-            PreparationFlightStateV1::BarrierSynced
+            PreparationFlightStateV1::BarrierSynced {}
         );
     }
 
@@ -413,8 +413,9 @@ mod tests {
     /// `PreparationFlightStateV1` for its struct-payload variants (a
     /// persisted/journaled contract type must reject unrecognized sibling
     /// keys there, not silently ignore them). Uses `Transferred`, a
-    /// struct-payload variant -- see the FINDING test immediately below for
-    /// why a unit variant (`Open`) cannot be used to discriminate this.
+    /// struct-payload variant -- see the test immediately below, which
+    /// covers the same guarantee for the (as of this slice) empty-struct
+    /// variant `Open`.
     #[test]
     fn preparation_flight_state_rejects_unknown_field_on_struct_variant() {
         assert!(serde_json::from_str::<PreparationFlightStateV1>(
@@ -423,26 +424,24 @@ mod tests {
         .is_err());
     }
 
-    /// FINDING: `#[serde(tag = "state", deny_unknown_fields)]` on an
-    /// internally-tagged enum only enforces `deny_unknown_fields` for
-    /// struct-payload variants (proven by the positive control immediately
-    /// above). For a *unit* variant like `Open`/`BarrierSynced`, serde's
-    /// derive deserializes the variant without ever checking whether the
-    /// buffered JSON object had leftover keys, so an unrecognized sibling
-    /// key next to `"state":"open"` is silently accepted and dropped. This
-    /// is a general serde-derive characteristic (confirmed against a
-    /// standalone minimal repro of the same `tag`+`deny_unknown_fields`
-    /// combination outside this crate), not specific to this type, but it
-    /// means `PreparationFlightStateV1` -- a persisted contract type -- does
-    /// not actually close the door on stray fields when the wire state is
-    /// `open` or `barrier_synced`. This test pins CURRENT behavior
-    /// (`is_ok()`); it is not a claim that the behavior is desired, and
-    /// production is not changed here.
+    /// R2f1b F-2 tightening: `#[serde(tag = "state", deny_unknown_fields)]`
+    /// on an internally-tagged enum only enforces `deny_unknown_fields` for
+    /// struct-payload variants -- a bare unit variant like `Open`/
+    /// `BarrierSynced` used to deserialize without ever checking whether the
+    /// buffered JSON object had leftover keys, tightened per the A2-review
+    /// pre-slice-3 obligation recorded in the custody plan ledger
+    /// (`docs/superpowers/plans/2026-08-06-r2f1b-pre-slice-2-custody-plan.md`).
+    /// `Open` and `BarrierSynced` are now declared as empty-struct payloads
+    /// (`Open {}`) instead of unit variants: the wire form is byte-identical
+    /// (`{"state":"open"}`, see the golden round-trip test above), but the
+    /// derive now buffers the variant's fields like any other struct
+    /// payload, so a stray sibling key is rejected here too. This closes
+    /// the gap the FINDING test used to pin.
     #[test]
-    fn preparation_flight_state_silently_accepts_unknown_field_on_unit_variant() {
+    fn preparation_flight_state_rejects_unknown_field_on_unit_variant() {
         assert!(
             serde_json::from_str::<PreparationFlightStateV1>(r#"{"state":"open","extra":1}"#)
-                .is_ok()
+                .is_err()
         );
     }
 

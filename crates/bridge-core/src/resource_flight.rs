@@ -170,10 +170,10 @@ pub struct ResourceActionResultV1 {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ResourceFlightStateV1 {
-    Open,
-    AdmissionClosed,
-    IntentJournaled,
-    Signaling,
+    Open {},
+    AdmissionClosed {},
+    IntentJournaled {},
+    Signaling {},
     Settled { result: ResourceActionResultV1 },
 }
 
@@ -603,16 +603,19 @@ mod tests {
     #[test]
     fn resource_flight_state_unit_variants_golden_round_trip() {
         let cases = [
-            (ResourceFlightStateV1::Open, r#"{"state":"open"}"#),
+            (ResourceFlightStateV1::Open {}, r#"{"state":"open"}"#),
             (
-                ResourceFlightStateV1::AdmissionClosed,
+                ResourceFlightStateV1::AdmissionClosed {},
                 r#"{"state":"admission_closed"}"#,
             ),
             (
-                ResourceFlightStateV1::IntentJournaled,
+                ResourceFlightStateV1::IntentJournaled {},
                 r#"{"state":"intent_journaled"}"#,
             ),
-            (ResourceFlightStateV1::Signaling, r#"{"state":"signaling"}"#),
+            (
+                ResourceFlightStateV1::Signaling {},
+                r#"{"state":"signaling"}"#,
+            ),
         ];
         for (variant, golden) in cases {
             assert_eq!(serde_json::to_string(&variant).unwrap(), golden);
@@ -644,8 +647,8 @@ mod tests {
 
     /// Discriminates: `#[serde(deny_unknown_fields)]` being dropped from
     /// `ResourceFlightStateV1` for its struct-payload variant (`Settled`).
-    /// See the FINDING test immediately below for why a unit variant
-    /// (`Open`) cannot be used to discriminate this.
+    /// See the test immediately below, which covers the same guarantee for
+    /// the (as of this slice) empty-struct variant `Open`.
     #[test]
     fn resource_flight_state_rejects_unknown_field_on_struct_variant() {
         assert!(serde_json::from_str::<ResourceFlightStateV1>(
@@ -654,17 +657,23 @@ mod tests {
         .is_err());
     }
 
-    /// FINDING: same root cause as the matching test in
+    /// R2f1b F-2 tightening: same root cause as the matching test in
     /// preparation_flight.rs -- `#[serde(tag = "state", deny_unknown_fields)]`
-    /// on an internally-tagged enum does not enforce `deny_unknown_fields`
-    /// for unit variants (`Open`, `AdmissionClosed`, `IntentJournaled`,
-    /// `Signaling`), only for the struct-payload variant (`Settled`, proven
-    /// by the positive control immediately above). This test pins CURRENT
-    /// behavior (`is_ok()`); production is not changed here.
+    /// on an internally-tagged enum only enforces `deny_unknown_fields` for
+    /// struct-payload variants; a bare unit variant like `Open`,
+    /// `AdmissionClosed`, `IntentJournaled`, or `Signaling` used to
+    /// deserialize without ever checking for leftover keys in the buffered
+    /// JSON object. `Open`, `AdmissionClosed`, `IntentJournaled`, and
+    /// `Signaling` are now declared as empty-struct payloads (`Open {}`)
+    /// instead of unit variants: the wire form is byte-identical
+    /// (`{"state":"open"}`, see the golden round-trip test above), but the
+    /// derive now buffers the variant's fields like any other struct
+    /// payload, so a stray sibling key is rejected here too. This closes
+    /// the gap the FINDING test used to pin.
     #[test]
-    fn resource_flight_state_silently_accepts_unknown_field_on_unit_variant() {
+    fn resource_flight_state_rejects_unknown_field_on_unit_variant() {
         assert!(
-            serde_json::from_str::<ResourceFlightStateV1>(r#"{"state":"open","extra":1}"#).is_ok()
+            serde_json::from_str::<ResourceFlightStateV1>(r#"{"state":"open","extra":1}"#).is_err()
         );
     }
 
