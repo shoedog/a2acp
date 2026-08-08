@@ -207,8 +207,15 @@ pub enum ParkReason {
     GitStateNotClean { detail: String },
     /// The git-state probe itself did not answer. A `status` that could not run is not a clean tree.
     GitStateUnknown { detail: String },
-    /// HEAD has no commit. There is nothing to ask the containment question about.
-    UnbornHead,
+    /// HEAD has no commit. There is nothing to ask the containment question about. `detail` carries
+    /// the owner-disposition conflict note when the run is licensed — the license replaces the
+    /// content-on-main proof, and an unborn HEAD is not that.
+    UnbornHead { detail: Option<String> },
+    /// S4b: the source repository the containment proof was to be asked of stopped being the one
+    /// resolved before the boundary — its directory identity changed, or the clone's `origin` no
+    /// longer resolves to the first hop that was walked. Either way the cached chain describes a
+    /// different repository than the one now on disk.
+    SourceRootIdentityChanged { detail: String },
     /// `origin` is not a local path (or is absent), so there is no local source repository whose live
     /// refs the containment query can be asked of. No network is ever contacted to fill the gap.
     OriginNotLocal { detail: String },
@@ -311,9 +318,17 @@ impl ParkReason {
             Self::GitStateUnknown { detail } => {
                 format!("git state could not be established: {detail}")
             }
-            Self::UnbornHead => {
-                "HEAD is unborn — there is no commit to ask the containment question about".to_string()
-            }
+            Self::UnbornHead { detail } => format!(
+                "HEAD is unborn — there is no commit to ask the containment question about{}",
+                detail
+                    .as_deref()
+                    .map(|d| format!(" ({d})"))
+                    .unwrap_or_default()
+            ),
+            Self::SourceRootIdentityChanged { detail } => format!(
+                "the source repository resolved before the boundary is not the one now on disk, so \
+                 the containment proof would describe a different repository: {detail}"
+            ),
             Self::OriginNotLocal { detail } => format!(
                 "no local source repository to ask about containment: {detail} (no network is ever \
                  contacted to fill the gap)"

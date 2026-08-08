@@ -41,6 +41,24 @@ fn each_reap_authority_prints_its_own_gate_documentation() {
         "git status --porcelain",
         "clone_reap_lookback",
         "-fold.json",
+        // S4b/F1: the chained-origin resolution an operator must know about before reading a
+        // verdict — it changes WHICH repository the D-1 question was asked of.
+        "origin chain",
+        "8 in-root edges",
+        // S4b/F2: the license, its exact document shape, and the wording discipline on its receipts.
+        "--disposition-list",
+        "OWNER DISPOSITION",
+        "authorized_by",
+        "list_sha256",
+        "THE CONTENT-ON-MAIN GATE IS REPLACED",
+        "A DIRTY dispositioned clone PARKS",
+        // S4b review repairs: the loss under a license is enumerable, the chain's terminal root is
+        // corroborated, and deletion order cannot strand a chained child.
+        "ref_inventory",
+        "root corrobor",
+        "lineage root",
+        "GIT_CEILING_DIRECTORIES",
+        "BEFORE the first removal",
     ] {
         assert!(
             clones.contains(expected),
@@ -106,6 +124,138 @@ fn a_reap_without_exactly_one_class_flag_is_refused() {
     assert!(
         text.contains("/nonexistent/a2a-bridge.toml"),
         "the refusal does not name the config it could not read: {text}"
+    );
+}
+
+/// S4b/F2. The license belongs to ONE authority. `--build-targets` has no content-on-main gate for a
+/// disposition to replace, so a list handed to it would be silently inert — and an operator who
+/// believed a deletion was authorized when nothing read the authorization is precisely the state this
+/// refuses. Discriminates a flag parsed for every class and used by one.
+#[test]
+fn a_disposition_list_without_the_clones_authority_is_a_usage_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let list = dir.path().join("d.json");
+    std::fs::write(
+        &list,
+        "{\"authorized_by\":\"owner\",\"reason\":\"abandoned\",\"run_ids\":[\"impl-1-a\"]}",
+    )
+    .unwrap();
+    let path = list.to_str().unwrap();
+
+    for args in [
+        vec!["storage", "reap", "--disposition-list", path],
+        vec![
+            "storage",
+            "reap",
+            "--build-targets",
+            "--disposition-list",
+            path,
+        ],
+    ] {
+        let out = run(&args);
+        assert!(!out.status.success(), "{args:?} was accepted");
+        assert!(
+            stderr(&out).contains("--disposition-list applies only to `--clones`"),
+            "{args:?} did not name the misuse: {}",
+            stderr(&out)
+        );
+    }
+
+    // The value is required, and a missing file is refused before anything is scanned.
+    let bare = run(&["storage", "reap", "--clones", "--disposition-list"]);
+    assert!(!bare.status.success());
+    assert!(stderr(&bare).contains("--disposition-list needs a <path>"));
+}
+
+/// S4b/F2. A license is a DELETION AUTHORIZATION: a document this binary cannot read exactly is a
+/// command failure, never a warning that leaves the reap running with the license silently ignored.
+/// Discriminates a lenient decode and a swallowed load error — the operator would otherwise read
+/// "0 deleted" as "my authorized runs were considered and refused".
+#[test]
+fn a_malformed_disposition_list_fails_the_command_before_anything_is_scanned() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo: PathBuf = dir.path().join("workspace");
+    std::fs::create_dir_all(repo.join(".a2a-implement")).unwrap();
+    let config = dir.path().join("a2a-bridge.toml");
+    std::fs::write(
+        &config,
+        format!(
+            "default = \"codex\"\nallowed_cwd_root = {repo:?}\n[server]\naddr = \"127.0.0.1:0\"\n\
+             [[agents]]\nid = \"codex\"\ncmd = \"codex\"\n"
+        ),
+    )
+    .unwrap();
+
+    let cases = [
+        (
+            "unknown-field.json",
+            "{\"authorized_by\":\"o\",\"reason\":\"r\",\"run_ids\":[\"impl-1-a\"],\"note\":\"x\"}",
+            "unknown field",
+        ),
+        (
+            "empty-runs.json",
+            "{\"authorized_by\":\"o\",\"reason\":\"r\",\"run_ids\":[]}",
+            "`run_ids` is empty",
+        ),
+        ("empty.json", "", "is empty"),
+    ];
+    for (name, body, expected) in cases {
+        let list = dir.path().join(name);
+        std::fs::write(&list, body).unwrap();
+        let out = run(&[
+            "storage",
+            "reap",
+            "--clones",
+            "--dry-run",
+            "--config",
+            config.to_str().unwrap(),
+            "--disposition-list",
+            list.to_str().unwrap(),
+        ]);
+        assert!(
+            !out.status.success(),
+            "{name} was accepted as a license:\n{}",
+            stdout(&out)
+        );
+        let text = stderr(&out);
+        assert!(
+            text.contains("--disposition-list") && text.contains(expected),
+            "{name}: the refusal does not say what was wrong ({expected}): {text}"
+        );
+    }
+
+    // The control: the SAME invocation with a well-formed list runs to completion, so the refusals
+    // above are the document's doing and not a command that never works with the flag.
+    let good = dir.path().join("good.json");
+    std::fs::write(
+        &good,
+        "{\"authorized_by\":\"owner\",\"reason\":\"abandoned\",\"run_ids\":[\"impl-1-a\"]}",
+    )
+    .unwrap();
+    let out = run(&[
+        "storage",
+        "reap",
+        "--clones",
+        "--dry-run",
+        "--config",
+        config.to_str().unwrap(),
+        "--disposition-list",
+        good.to_str().unwrap(),
+    ]);
+    assert!(
+        out.status.success(),
+        "a well-formed license was refused:\n{}\n{}",
+        stdout(&out),
+        stderr(&out)
+    );
+    let text = stdout(&out);
+    assert!(
+        text.contains("OWNER DISPOSITION LICENSE IN FORCE"),
+        "the report does not disclose the license: {text}"
+    );
+    assert!(
+        text.contains("impl-1-a"),
+        "the report does not note the run id the scan never found: {text}"
     );
 }
 

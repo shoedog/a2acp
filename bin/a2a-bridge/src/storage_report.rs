@@ -846,10 +846,23 @@ pub fn git_facts_rechecked(dir: &Path, expected: &ShapeFingerprint) -> Result<Gi
 /// - `-c core.fsmonitor=false`: `status` would otherwise EXECUTE a repository-configured program;
 /// - `-c core.hooksPath=/dev/null`: same, for any other hook a probe might trigger;
 /// - `GIT_NO_LAZY_FETCH=1`: a promisor/partial clone cannot make `cat-file`/`rev-list` reach the network;
-/// - `GIT_TERMINAL_PROMPT=0`: no probe may block waiting for credentials.
+/// - `GIT_TERMINAL_PROMPT=0`: no probe may block waiting for credentials;
+/// - `GIT_CEILING_DIRECTORIES=<parent of dir>`: git's repository DISCOVERY WALKS UP. Without a
+///   ceiling, a probe aimed at a directory that is not a repository — or whose `.git` exists but is
+///   not a valid one — is answered by whatever repository happens to ENCLOSE it. So
+///   `git_ro(<some path>, ["rev-parse", …])` could return a commit that has nothing to do with
+///   `<some path>`, and a caller asking "what does THIS repository contain?" is silently answered by
+///   its parent. Every caller here means the question to be about `dir` itself.
+///
+///   The entry must be the PARENT, not `dir`: git computes the ceiling as the longest ceiling entry
+///   that is a proper ANCESTOR of the start directory, so an entry equal to `dir` matches nothing and
+///   does nothing at all (measured — an earlier form of this hardening was a silent no-op, and the
+///   mutation round that should have caught it stayed green until a test forced the distinction).
+///   With the parent set, `dir` itself is still examined and the ascent above it stops.
 pub fn git_ro(dir: &Path, argv: &[&str]) -> std::io::Result<std::process::Output> {
-    std::process::Command::new("git")
-        .arg("--no-optional-locks")
+    let canonical = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+    let mut cmd = std::process::Command::new("git");
+    cmd.arg("--no-optional-locks")
         .args(["-c", "core.fsmonitor=false"])
         .args(["-c", "core.hooksPath=/dev/null"])
         .arg("-C")
@@ -857,8 +870,12 @@ pub fn git_ro(dir: &Path, argv: &[&str]) -> std::io::Result<std::process::Output
         .args(argv)
         .env("GIT_NO_LAZY_FETCH", "1")
         .env("GIT_TERMINAL_PROMPT", "0")
-        .env("GIT_OPTIONAL_LOCKS", "0")
-        .output()
+        .env("GIT_OPTIONAL_LOCKS", "0");
+    // No parent means `dir` is the filesystem root: there is nothing above it to ascend into.
+    if let Some(parent) = canonical.parent() {
+        cmd.env("GIT_CEILING_DIRECTORIES", parent);
+    }
+    cmd.output()
 }
 
 pub fn git_str(dir: &Path, argv: &[&str]) -> Result<String, String> {
@@ -1004,7 +1021,7 @@ pub const SOURCE_MAIN_LOOKBACK: u32 = 500;
 /// with "Not a valid object name", which is indistinguishable from a genuinely broken repository. The
 /// `--quiet` form exits 1 for "cannot resolve" and reserves 128 for real failures, which is exactly the
 /// distinction this function has to make.
-fn object_present(repo: &Path, sha: &str) -> Result<bool, String> {
+pub fn object_present(repo: &Path, sha: &str) -> Result<bool, String> {
     let spec = format!("{sha}^{{commit}}");
     let out = git_ro(repo, &["rev-parse", "--verify", "--quiet", &spec])
         .map_err(|e| format!("rev-parse could not run: {e}"))?;

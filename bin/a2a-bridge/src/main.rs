@@ -194,10 +194,11 @@ SUBCOMMANDS:
   storage report      READ-ONLY audit of bridge-owned storage: payload class, bytes, live consumers,
                       git HEAD + source/origin containment, totals, free space.  [--config <f>] [--json]
   storage reap        DESTRUCTIVE. Delete idle runs' build targets / dependency caches, or the
-                      quarantine clones whose content is verifiably on the source repo's main (D-1),
-                      after boundary gates (held operation lock, pinned root, live-consumer probe,
-                      git state + containment).  --build-targets | --clones [--dry-run] [--config <f>]
-                      [--json]
+                      quarantine clones whose content is verifiably on the source repo's main (D-1)
+                      or whose run the owner dispositioned as abandoned, after boundary gates (held
+                      operation lock, pinned root, live-consumer probe, git state + containment).
+                      --build-targets | --clones [--dry-run] [--disposition-list <f>]
+                      [--config <f>] [--json]
   submit              Send a unary message.  [skill] --input <file> [--context <id>] [--agent <id>] [--model <m>] [--effort <e>] [--mode <m>] [--cwd <dir>]
   task                Durable task store.  get | list | cancel | watch
   session             Warm session control.  status | release | cancel | clear | compact <contextId>
@@ -7431,6 +7432,7 @@ fn storage_reap_cmd(args: &[String]) -> Result<(), BoxError> {
     let mut dry_run = false;
     let mut build_targets = false;
     let mut clones = false;
+    let mut disposition_list: Option<PathBuf> = None;
     let mut it = args.iter();
     while let Some(f) = it.next() {
         match f.as_str() {
@@ -7443,12 +7445,31 @@ fn storage_reap_cmd(args: &[String]) -> Result<(), BoxError> {
             "--dry-run" => dry_run = true,
             "--build-targets" => build_targets = true,
             "--clones" => clones = true,
+            "--disposition-list" => {
+                disposition_list = Some(PathBuf::from(
+                    it.next()
+                        .ok_or("storage reap: --disposition-list needs a <path>")?,
+                ))
+            }
             other => {
                 return Err(
                     format!("storage reap: unknown flag {other:?}\n{}", rp::REAP_USAGE).into(),
                 );
             }
         }
+    }
+    // The disposition license belongs to ONE authority. `--build-targets` has no content-on-main gate
+    // for a license to replace, so a list handed to it would be silently inert — and an operator who
+    // believed a deletion was authorized when nothing read the authorization is exactly the state this
+    // refuses. Checked before the class rules so the message names the real mistake.
+    if disposition_list.is_some() && !clones {
+        return Err(format!(
+            "storage reap: --disposition-list applies only to `--clones` (it replaces that \
+             authority's content-on-main gate; `--build-targets` has no such gate for it to \
+             replace)\n{}",
+            rc::CLONES_USAGE
+        )
+        .into());
     }
     // No default payload class. `storage reap` with no class named is refused rather than interpreted:
     // this command deletes, and an operator who did not say what must not have it inferred.
@@ -7472,6 +7493,17 @@ fn storage_reap_cmd(args: &[String]) -> Result<(), BoxError> {
         )
         .into());
     }
+
+    // The license is loaded, validated and HASHED before anything is scanned. A malformed one is a
+    // command failure, never a warning: an owner who wrote a list and saw the command proceed would
+    // reasonably read the result as "the runs I authorized were considered".
+    let disposition = match &disposition_list {
+        Some(p) => Some(
+            rc::load_disposition_list(p)
+                .map_err(|e| format!("storage reap: --disposition-list: {e}"))?,
+        ),
+        None => None,
+    };
 
     let config_path = require_config_path(config)?;
     let raw = std::fs::read_to_string(&config_path)
@@ -7516,6 +7548,7 @@ fn storage_reap_cmd(args: &[String]) -> Result<(), BoxError> {
                 dry_run,
                 runtimes_configured,
                 lookback: cfg.storage.clone_reap_lookback,
+                disposition: disposition.as_ref(),
             },
             &HostReapEnv,
         )
