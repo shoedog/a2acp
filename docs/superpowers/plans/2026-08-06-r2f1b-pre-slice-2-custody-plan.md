@@ -1,497 +1,204 @@
 # R2f1b pre-slice-2 gates and workspace-custody plan
 
-**Status:** revision 2, draft for owner re-review; documentation only. This document does not authorize
-implementation, remote pushes, future cleanup, automatic deadlines, provider turns, release, deployment, or
-served-operator mutation. The measured cleanup in §6.1 was separately authorized and is recorded as evidence, not
-as continuing deletion authority.
+**Status:** revision 3, owner decisions resolved 2026-08-07; implementation briefs authorized for Phase 0
+(S1–S5) and Track A (A1–A5) as scoped below. This revision supersedes revision 2 (committed at `b133841`)
+after the owner-side analysis in `~/Documents/R2f1b-custody-plan-rev2-analysis-fable.md` found five WRONG
+findings and inverted priorities; §10 records the corrections. This document still does not authorize
+automatic deadlines, provider turns, release, deployment, served-operator mutation, or any bridge-initiated
+hosted-remote push (D-3 denies that authority).
 
 ## 1. Purpose
 
-Close the remaining inactive-foundation gates without allowing useful agent workspaces to accumulate until the
-host runs out of space. The design must preserve useful work durably while treating local source materialization,
-build outputs, caches, and evidence as separate payloads. A local source checkout is retained only while a live or
-imminent consumer justifies it within the storage budget; a retained checkout does not imply retention of its
-regenerable build tree.
+Close the pre-slice-2 gates mandated by the PR #50 closure record, and stop useful-work storage from
+accumulating until the host runs out of space — with mechanism proportionate to the measured problem.
+Measured decomposition (2026-08-06 cleanup + 2026-08-07 verification): 86.5% of recovered bytes were Cargo
+targets, ~14% Docker volumes, 0% source; the largest surviving cost is 13.75 GiB of duplicated `.git`
+object stores across 112 standalone implement clones. Therefore: build-target and clone hygiene first
+(Phase 0), custody tests as mandated (Track A), and no remote-custody machinery unless a §8 trigger fires.
 
-Two custody planes must remain distinct:
+Two custody planes remain distinct (unchanged ruling):
 
-1. **R2f1b runtime worktree custody** protects workflow-created worktrees from cancellation, deadline, run-end,
-   boot-sweep, and recovery races. Its durable record belongs in the V3 workflow snapshot and custody sidecar.
-2. **Implement-run workspace custody** governs quarantine clones or linked worktrees used by
-   `a2a-bridge implement`, immediate review, bounded repair, integration, and cleanup. Its durable source of code
-   should normally be an exact remote Git ref plus a local receipt; it must not be smuggled into the runtime V3
-   contract.
+1. **R2f1b runtime worktree custody** — workflow-created worktrees; durable record in the V3 workflow
+   snapshot and custody sidecar.
+2. **Implement-run workspace custody** — `.a2a-implement` quarantine clones; durable identity in fold
+   receipts. Remote refs never enter `WorkflowSnapshotV3`.
 
-The planes may share descriptor-safe filesystem primitives, identities, and cleanup vocabulary. They do not share
-deletion authority or persistence records.
+## 2. Owner decisions — RESOLVED 2026-08-07
 
-## 2. Gate definitions
-
-### 2.1 Runtime custody-test gate
-
-**Safety property:** every materialized checkout is protected by durable, identity-bound evidence before a timer,
-provider, process, cancellation, or destructive sweep can act.
-
-The gate is green only when fail-first tests prove all of the following:
-
-- the prepared custody intent is file-synced, atomically published, and parent-directory-synced before effects;
-- parent-sync failure yields a typed ambiguous/unknown outcome and zero provider, process, timer, or sweep calls;
-- prepared and preserved worktrees survive normal run-end and dead-run boot sweeps;
-- corrupt, missing, mismatched, symlinked, hard-linked, or otherwise ambiguous evidence never authorizes deletion;
-- failure after a target directory materializes preserves that target;
-- an unused candidate is settled only after proving that its exact target never materialized;
-- resume mints a successor attempt and atomically exchanges the exact preserved claim before provider effects; and
-- global outcome owns deletion: node-local success cannot remove a checkout that a later sibling failure requires.
-
-**Wrong result prevented:** a timeout, cancellation, or crash lands between checkout creation and durable custody
-publication, and recovery deletes useful work.
-
-### 2.2 Preparation-flight test gate
-
-A preparation flight gives finitely bounded ownership to pre-effect work such as custody publication:
-
-```text
-Open -> BarrierSynced
-     -> Transferred { recovery reason }
-     -> Failed { typed cause }
-```
-
-**Safety property:** cancellation of the initiating waiter cannot abandon the only custody-preparation owner.
-
-The gate is green only when a nonreturning or canceled sync operation transfers an exact guard to a recovery owner
-within the approved bound, publishes a typed result, and makes zero provider/session/process/materialization or
-destructive-sweep calls before the barrier is durable.
-
-### 2.3 Resource-flight test gate
-
-A resource flight owns one action against one exact physical process/container generation:
-
-```text
-Open -> AdmissionClosed -> IntentJournaled -> Signaling -> Settled(result)
-```
-
-**Safety property:** every actor requesting cleanup, takeover, release escalation, or retirement joins one retained
-capability rather than reconstructing authority from a PID, PGID, name, or stale database row.
-
-The gate is green only when tests prove:
-
-- two nodes sharing one generation cause one signal/action and receive one shared result;
-- cancellation of one waiter does not cancel or duplicate the resource action;
-- cleanup-deadline transfer preserves the exact guard before the initiating future can finish;
-- missing or ambiguous capability returns refusal, `Partial`, or `Unknown` rather than guessed success;
-- collateral owners are complete and serialized with admission closure; and
-- reused numeric identities, unrelated processes, and other generations survive.
-
-The similarly named legacy worktree cleanup flight is not sufficient evidence for this V3 resource-flight gate.
-
-### 2.4 V3 snapshot-test gate
-
-“Snapshot” here means the durable `WorkflowSnapshotV3`, not the 30-minute no-progress evidence snapshot.
-
-**Safety property:** the durable attempt envelope commits every candidate requiring custody and cannot change
-delivery, custody, activation, resource, or lineage semantics during resume.
-
-The gate is green only when tests prove:
-
-- every checkout candidate in the frozen node/preflight/fallback matrix has exactly one custody plan;
-- custody plans are canonical, sorted, and unique by checkout fingerprint and custody id;
-- adding, dropping, duplicating, or mutating a plan invalidates the contract;
-- a successor retains exact delivery bytes and the exact R2f1b contract while using a new attempt id;
-- predecessor digest, attempt ordinal, parent attempt, execution id, and origin delivery remain coherent;
-- V2 remains manual-only and cannot be reinterpreted as automatic V3 evidence; and
-- old readers ignore, and therefore never delete from, the V3 custody-sidecar namespace.
-
-**Wrong result prevented:** a snapshot protects only a subset of possible checkouts or resume silently changes the
-authority under which cleanup and deadlines run.
-
-### 2.5 `fs_custody` versus `local_file` ownership gate
-
-This is an implementation-ownership decision, not a choice between two custody policies.
-
-- `bin/a2a-bridge/src/local_file.rs` contains the mature binary-private implementation: pinned directory identity,
-  descriptor-relative access, durable publication, bounded readers, quarantine, replacement, and compatibility
-  evidence behavior.
-- `crates/bridge-core/src/fs_custody.rs` contains a new reusable subset for directory/file identity, sync barriers,
-  and atomic no-replace publication.
-
-The current source duplicates important logic. The written design expects the generic primitives to have one
-library owner and binary-specific bounded-reader/quarantine policy to remain in `local_file`.
-
-The gate is green only when:
-
-- generic descriptor identity, no-follow access, sync, no-replace publication, and ambiguous-parent-sync handling
-  have one authoritative implementation;
-- `local_file` uses that implementation through narrow wrappers, or a deliberately chosen library boundary proves
-  equivalent behavior without copy-paste;
-- existing compatibility/fallback callers do not lose their bounded-reader and quarantine invariants; and
-- Linux/macOS, symlink/hard-link, target-race, rename, file-sync, parent-sync, and injected-failure tests pass.
-
-### 2.6 Workload-fingerprint gate
-
-**Safety property:** manual and automatically timed executions cannot share one workload/calibration identity.
-
-The existing run-spec workload fingerprint commits graph, controls, retries, and frozen node/provider identities,
-but the V3 R2f1b contract is wrapped outside that older delivery-spec fingerprint. Before
-`AutomaticR2f1b` becomes constructible, the versioned workload identity must also commit:
-
-```text
-existing frozen workload identity
-+ explicit DeadlineActivationV2
-+ validated FrozenR2f1bContractV1.contract_fingerprint
-```
-
-The gate is green only when tests prove:
-
-- manual and automatic activation produce different fingerprints;
-- any custody-plan or resource-contract change changes or invalidates the fingerprint;
-- a separately valid replacement contract cannot retain the old workload identity;
-- decode and successor resume recompute the same bound identity; and
-- historical V2/manual behavior remains manual and does not inherit automatic semantics.
-
-The explicit activation field is retained even though it also contributes to the contract fingerprint: the semantic
-boundary remains auditable and domain-separated from the contract-hash algorithm.
-
-**Wrong result prevented:** automatically timed attempts are pooled with manual observations, corrupting liveness
-baselines, history grouping, or later compatibility claims.
-
-## 3. Proposed implement-run workspace lifecycle
-
-Phase, durability, local materialization, and payload class are orthogonal. Composite names such as
-`ParkedRemoteDurable` hide the distinction between what happened to the work and where its bytes are safe.
-
-| Coordinate | Values | Meaning |
+| ID | Decision | Ruling |
 |---|---|---|
-| **Phase** | `ActiveImplementation`, `AwaitingImmediateReview`, `RepairAuthorized`, `ApprovedPendingFold`, `Folded`, `Parked`, `ProtectedUnknown` | What may consume or mutate the work next. |
-| **Durability** | `LocalOnly`, `RemoteVerified`, `BundleVerified`, `FoldReceiptVerified`, `Ambiguous` | Which exact committed/source identity is independently recoverable. |
-| **Local materialization** | `ActiveRequired`, `HotLeased`, `HotPreferred`, `Evictable`, `Absent` | Whether this physical checkout must remain on this host. |
-| **Payload class** | `SourceCheckout`, `BuildTarget`, `DependencyCache`, `Evidence`, `CredentialOrSecret`, `ContainerOrImage` | Which custody and cleanup rules apply to the bytes. |
+| **D-1** | Must pre-squash bot commits remain recoverable after squash-merge to main? | **No.** Content verifiably on `main` suffices; the clone reaper may delete. Fold receipts record `{run id, branch, pre-squash HEAD, tree, PR#, merge commit}` as the durable identity. This supersedes the ADR-0019/0026 keep-clones-for-operator ruling for merged/dispositioned runs. |
+| **D-2** | Protected roots/resources | **Confirmed as listed:** user working checkouts; served operator + release/rollback artifacts; active bridge stores; live runs; current shared caches; every stockTrading/quant-platform repo, container, and volume. Reapers hard-refuse these regardless of classification. |
+| **D-3** | May the bridge `git push` to a hosted remote on its own initiative? | **No.** Receipts only. No custody-ref namespace, no lease-bound push path, no bundles. Push authority stays with the owner's normal PR workflow. |
+| **D-4** | Disk admission control | **One floor: 50 GiB.** Refuse to start a new full build/verify when free space on the data volume is below 50 GiB (single `df`-equivalent check, config-overridable). No watermark ladder, reservations, quotas, or caps. |
 
-`Parked + RemoteVerified + Evictable` is the ordinary remote-durable parked state. `Parked + BundleVerified +
-Evictable` is the no-writable-remote equivalent. `Parked + LocalOnly` is protected local debt: it is not evictable,
-consumes a finite protected quota, and can block admission of new work. `ProtectedUnknown` is reserved for genuinely
-ambiguous custody rather than serving as the only non-remote state.
+All sixteen revision-2 decision items are closed by the four rulings above, by defaults recorded in this
+document, or removed as fake choices (orthogonal model, fingerprint domain, `fs_custody` owner,
+feature-branch model — see §10).
 
-| Phase | Required durability after a stable commit | Local source policy | Build-output policy |
-|---|---|---|---|
-| `ActiveImplementation` | Checkpoint when safe; uncommitted bytes remain local-only | `ActiveRequired` while the writer or owned child is live | Retain only while the active build owns it |
-| `AwaitingImmediateReview` | `RemoteVerified` or `BundleVerified` | `HotPreferred`; retain for immediate review when budget permits, otherwise reconstruct | Evict after verification unless an exact live reuse lease reserves it |
-| `RepairAuthorized` | Refresh exact durable identity after every bounded commit | `HotLeased` only while repair is scheduled or live; otherwise evictable | Evict between inactive repair windows under pressure |
-| `ApprovedPendingFold` | Reviewed commit/tree and target base remotely or bundle reachable | `HotPreferred` only when fold is imminent; otherwise evictable | Evict after the accepting verification |
-| `Folded` | `FoldReceiptVerified` | Remove promptly | Remove promptly |
-| `Parked` | Prefer `RemoteVerified`; accept `BundleVerified`; `LocalOnly` blocks eviction | Zero grace under pressure; optional short grace only above the inventory watermark | Remove promptly after useful evidence is separated |
-| `ProtectedUnknown` | `Ambiguous` | Required until operator resolution | Remove only an independently classified regenerable payload |
+## 3. Phase 0 — storage relief (five independent PRs)
 
-Age and disk pressure trigger classification and priority. They never manufacture durability or deletion authority.
-Local reuse is an optimization, not a custody invariant.
+Each slice is its own branch and PR, gated by `git diff --check`, `cargo fmt --all -- --check`,
+warnings-denied all-target Clippy, full workspace tests, and `validate --repo-hygiene`, with a declared
+**one-round review cap**. Findings ⇒ closed-enumerable targeted fix on the artifact; open-class ⇒ park and
+escalate. Order S1→S5 is preferred but only S3/S4 depend on S2.
 
-### 3.1 Remote-first feature and slice model
+- **S1 — `CARGO_INCREMENTAL=0` for one-shot verification.** Set in the bridge's verify environment
+  (container cache binding env alongside `CARGO_HOME`/`CARGO_TARGET_DIR`) and in CI one-shot builds; document
+  the convention for native one-shot runs. Measured basis: 6.88 GiB of a 15.77 GiB verifier target (44%) was
+  incremental artifacts. Note: `profile.release` already has `incremental=false`; this targets dev/test-profile
+  one-shot builds. Interactive development keeps incremental compilation.
+- **S2 — read-only `storage report`.** Walks bridge-owned roots only (`.a2a-implement`, worktree roots,
+  per-repo cache volumes); emits per item: path, payload class (`SourceCheckout`, `BuildTarget`,
+  `DependencyCache`, `Evidence`, `ContainerOrImage`), measured bytes, live-consumer status (lease, operation
+  lock, process/open-file, container mount), git HEAD, and whether that HEAD is reachable from `origin`.
+  No deletion, no push, no external effects. This is the audit instrument for S3/S4 and for §8 triggers.
+- **S3 — build-target reaper + D-4 floor.** Deletes a completed run's build target once its gate output is
+  reduced to retained evidence and no process, open file, or container owns it (rechecked at the destructive
+  boundary; failed or nondiscriminating probes park the payload). Records logical size and physical reclaim
+  separately. Implements the 50 GiB admission floor. D-2 roots are hard-refused.
+- **S4 — clone reaper (enabled by D-1).** Reaps `.a2a-implement` clones whose useful content is verifiably
+  on `main` (commit/tree containment check against the local source repo — no network required) or whose
+  run the owner has dispositioned as abandoned. Writes the fold receipt before deletion. Dirty, untracked-
+  nondisposable, submodule-dirty, or ambiguous clones are refused and reported, never deleted. Uses the
+  exact-mechanism rules (guarded standalone-clone removal; canonical-path identity; never a broad prefix).
+  Documents the `--no-hardlinks` quarantine tradeoff (the flag is load-bearing: hardlink-shared objects
+  would let a `:rw` container corrupt the source repo's object store) and the D-1 ruling change.
+- **S5 — same-repo verify serialization.** `verify.rs` claims same-repo verify runs are single-flight
+  serialized; no lock implements it. Add an flock (reusing the ADR-0025 `PersistentLockGuard` primitives)
+  keyed on the per-repo cache volume name, with a fail-first concurrent test. Correctness fix, independent
+  of storage policy.
 
-Recommended default:
+Expected recovery: the 36 GiB build-target class stops recurring (S1/S3); ~13.75 GiB of dead clone object
+stores become reapable (S4); admission can no longer start a build the disk cannot hold (S3/D-4).
 
-1. Keep the long-lived feature branch remotely; do not reserve a standing local worktree for it.
-2. Create a unique local quarantine checkout and unique slice branch from the exact remote feature tip.
-3. Commit useful implementor work before handoff. Never push credentials, ignored secrets, or arbitrary untracked
-   bytes merely to make cleanup possible.
-4. Push the exact slice commit through an operator-owned, lease-bound path. Agents do not receive generic remote
-   credentials or independent push authority.
-5. Prefer the same clean source checkout for immediate hard-read-only review and one authorized bounded repair when
-   it remains within the hot-storage budget. Delete its build outputs after verification. If pressure requires source
-   eviction after durable restoration proof, reconstruct the exact checkout for the reviewer or repairer.
-6. Fold the approved delta onto the remote feature branch with an exact lease and record source commit/tree,
-   target-before, integration commit/tree, and cumulative diff digest.
-7. Fetch/verify the remote integration result from a clean object view. Once the reviewed delta is durably reachable,
-   remove build payloads immediately and remove the source checkout when no live lease requires it.
-8. Start the next slice from the new remote feature tip in a new checkout.
-9. After aggregate review, main landing, and post-merge verification, retire feature and custody refs according to
-   the accepted retention policy.
+## 4. Track A — mandated pre-slice-2 gates, one PR per gate
 
-This preserves immediate-review locality when affordable without treating local bytes as boundless. A reviewer can
-reuse the exact source checkout without retaining its much larger target tree.
+The PR #50 closure record mandates before slice 2: close the remaining section-6 custody/flight/snapshot
+tests and adjudicate the `fs_custody`/`local_file` extraction. Gate definitions are unchanged from
+revision 2 §2 (recorded at `b133841`); they are referenced here, not restated.
 
-### 3.2 Original reviewed commit versus folded commit
+- **A1 — runtime custody-test gate** (rev-2 §2.1): durable identity-bound custody before timers/effects;
+  sweep survival; ambiguous evidence never deletes; global-outcome deletion authority; resume claim exchange.
+- **A2 — preparation-flight (§2.2) + resource-flight (§2.3) test gates.** Split into two PRs if either
+  review round finds a closed population larger than its cap.
+- **A3 — V3 snapshot-test gate** (§2.4): complete unique custody plans; immutable delivery/contract bytes
+  across successor resume; coherent lineage; manual-only V2.
+- **A4 — `fs_custody`/`local_file` single-owner extraction** (§2.5): `local_file`'s duplicated pinned-
+  directory/no-follow/sync/no-replace primitives become narrow wrappers over `fs_custody`; bounded-reader,
+  quarantine, replacement, and compatibility-evidence policy stay in `local_file`. Parity + fault-injection
+  tests. **A refactor — never rides in a test-only PR.**
+- **A5 — workload-fingerprint binding** (§2.6). **Re-gated per the closure record to "before any
+  `AutomaticR2f1b` construction"** — it may land after slice 2 begins and does not block slice-2 entry.
 
-Re-authoring, cherry-picking, tree composition, or squash merging can make the original reviewed commit unreachable
-even when its change is present in the feature branch. Before deleting the only clone containing that commit, choose
-one of these explicit policies:
+**Standing rule, declared before any dispatch:** a fail-first test that stays red has found a defect in
+merged, approved code. **Park and report; the fix is its own bounded PR** with its own red/green control.
+Test-landing PRs never silently expand into behavior fixes.
 
-- retain a remote per-slice custody ref through aggregate closure;
-- perform an atomic multi-ref push of the custody ref and integration ref where supported; or
-- prove that the integration receipt plus remotely reachable parent/tree/delta is the accepted durable identity and
-  that no later evidence requires the original commit object.
+Roadmap step "reconcile and freeze main" is already done (`05db0fe`); the remaining reconciliation is the
+closure record's stranded identities, handled as an addendum (§9).
 
-Deleting a topic branch immediately after a squash merge is unsafe when retained evidence still names its commit.
+## 5. Lifecycle model (simplified)
 
-## 4. Cleanup admission contract
+Revision 2's four-coordinate algebra is replaced by:
 
-A cleanup candidate is one exact payload, not an entire run directory inferred from a prefix. A cleaner may remove
-an exact source checkout only when every item below is true at deletion time:
+- **Phase:** the existing persisted `ImplementPhase` (`Cloned → EditStarted → FirstCommitCreated → InLoop →
+  Approved | LoopStopped`) plus the merge outcome. No parallel state machine.
+- **Payload class** (retained from rev 2 — its best idea): `SourceCheckout`, `BuildTarget`,
+  `DependencyCache`, `Evidence`, `CredentialOrSecret`, `ContainerOrImage`. Cleanup rules attach to the
+  class, never to the run directory as a prefix.
+- **Durability**, recorded on the fold receipt at disposition time: `LocalOnly` | `OnMain{merge commit,
+  tree}` | `Unknown`. Not a standing state machine; no materialization axis (a checkout is retained through
+  review and repair — at 20–180 MiB it is noise next to a 20 GiB target; there is no eviction engine).
 
-1. The path canonicalizes beneath the configured bridge-owned checkout root and matches the recorded object/path
-   identity. A source repo, user checkout, workspace root, symlink target, or broad prefix is never a target.
-2. The run is terminal and the per-run operation lock is held by the cleaner. The live run lease is free.
-3. No implementor, reviewer, repair, verifier, merge, or resume phase is active or scheduled to consume the checkout.
-4. No owned child process, container mount, current working directory, or open file refers to it. This is rechecked
-   immediately before removal.
-5. Git status, including untracked files and submodules, matches the retained checkpoint. Non-disposable ignored or
-   untracked bytes either receive explicit custody or block cleanup.
-6. Every useful tracked change is committed. The commit, tree, parent/base, diff digest, remote URL, remote ref, and
-   expected remote object id are recorded.
-7. A live remote query and clean fetch prove exact remote reachability. A local tracking ref or successful prior push
-   exit status is not sufficient.
-8. If the original reviewed commit will become unreachable after fold/squash, its accepted custody policy has been
-   satisfied.
-9. The removal mechanism matches the checkout kind: guarded standalone-clone removal or `git worktree remove` plus
-   exact registration pruning. A broad `git worktree prune` is not a substitute for checkout classification.
-10. Removal is verified, reclaimed space is measured separately from logical size, and failure leaves a durable
-    partial/unknown cleanup record rather than claiming success.
+Cleanup admission per class (condensed from rev 2 §4, which remains the reference for S3/S4 briefs):
 
-### 4.1 Payload-specific cleanup gates
+- **BuildTarget / DependencyCache:** exact path/type proven regenerable, not sole evidence, no live
+  process/open-file/container owner, current shared cache preserved. `CACHEDIR.TAG` is evidence, not proof.
+- **SourceCheckout (S4 only):** terminal run + cleaner-held operation lock + free lease; no scheduled
+  consumer; no process/cwd/open-file/mount; git status (incl. untracked/ignored/submodule) matches
+  disposition; content-on-main verified per D-1; receipt written; exact-mechanism removal; truthful
+  partial/unknown recording.
+- **Evidence:** own retention decision before any parent-directory deletion; never treated as cache.
+- **CredentialOrSecret:** never pushed or bundled; retained/quarantined under its secret policy.
+- **ContainerOrImage:** existing ADR-0021/0025 gates unchanged; current/rollback images protected.
 
-The source-checkout rules above must not be copied blindly onto other payload classes:
+Age and disk pressure trigger classification and priority. They never manufacture deletion authority.
 
-- **Build target:** may be removed independently of its retained source checkout only after its path/type is exact,
-  it is proven to contain regenerable compiler output rather than sole evidence, no live process/open file/container
-  owns it, and its source/lock/toolchain inputs remain recoverable. `CACHEDIR.TAG` is strong evidence but not a
-  substitute for path and content classification.
-- **Dependency cache:** may be removed only when it contains no credentials or unique offline package and no live
-  worker has reserved it. Current shared repo/toolchain caches are preferred over duplicated per-run caches.
-- **Evidence:** verifier logs, manifests, receipts, fingerprints, checkpoints, and accepted review artifacts are not
-  build cache. They require their own retention/durability decision before removal.
-- **Credential or secret:** never push or bundle as a cleanup shortcut. Retain or quarantine under its owning secret
-  policy.
-- **Container or image:** require runtime-visible consumer checks and separate current/rollback-image policy. A
-  zero-link volume or unused image is only a candidate; ambiguous hash-named volumes remain parked.
-- **Source checkout:** requires the complete ten-item contract above, including exact remote or bundle restoration
-  proof for every useful tracked change.
+## 6. Storage policy (simplified)
 
-The cleaner rechecks live processes, open files, operation locks, container consumers, and exact target identity at
-the destructive boundary. A failed or nondiscriminating probe is inadmissible and parks that payload.
+- **One admission floor (D-4): 50 GiB free**, checked before starting a full build/verify; refusal is a
+  typed, actionable error naming the floor and the observed value. Config-overridable.
+- **Reclaim order** when the floor (or the owner) triggers reaping: completed build targets → duplicated
+  inactive dependency caches → D-1-eligible clones → zero-consumer containers/volumes under existing gates.
+- **Protected roots (D-2)** are refused before classification, by canonical identity, never matched by
+  prefix/age/size alone.
+- **Measured baseline (2026-08-06, corrected):** data-volume free 328.93 → 371.00 GiB (observed gain
+  42.07 GiB). Removed: 36.41 GiB host Cargo targets (component-measured deltas sum to 35.76 GiB; the
+  0.65 GiB remainder is unattributed measurement drift) and 61.21 GB (57.0 GiB) *logical* Docker volume
+  data yielding ~6.1 GiB *physical* (sparse OrbStack/APFS accounting). Components sum to ~42.5 GiB against
+  42.07 GiB observed; the 0.4 GiB discrepancy is concurrent-activity noise, recorded rather than reconciled.
+  2026-08-07 verification: 391 GiB free; `.a2a-implement` = 112 standalone clones / 16 GiB / 13.75 GiB
+  duplicated `.git`. **Revision 2's "18–24 MiB source checkout" figure measured the eight *linked* sibling
+  worktrees, not the governed clone population; it is corrected here (W1).**
 
-## 5. Remote persistence is not complete workspace persistence
+## 7. Fold receipts (replaces the remote-custody plane)
 
-Remote Git normally preserves committed tracked content. It does not automatically preserve:
+At merge/disposition time the bridge writes one small JSON receipt per run (beside the existing checkpoint
+evidence, surviving clone deletion): `{run id, task id, branch, pre-squash HEAD, tree, base, PR number if
+known, merge commit, disposition, timestamp}`. Receipts are Evidence-class (never auto-deleted with the
+clone). They are the answer to squash-stranding — which is real: the PR #50 closure record's own reviewed
+tree `4fb6bfe` is locally unreachable (§9) — without any push authority. Durability of the content itself
+is the owner's normal PR push of `main`.
 
-- uncommitted or untracked work;
-- ignored evidence, logs, databases, generated artifacts, or build outputs;
-- credentials and secret material, which must not be pushed;
-- Git LFS objects that were not uploaded;
-- unavailable submodule commits;
-- local toolchains, containers, caches, or filesystem metadata;
-- a commit whose only remote ref is later deleted after squash/fold; or
-- a repository with no writable remote, an offline remote, or insufficient operator authorization.
+## 8. Deferred machinery and triggers
 
-When exact remote durability is unavailable, the fail-safe choices are an owner-private Git bundle plus bounded
-non-Git evidence inventory, or continued local retention. “Push failed” never becomes permission to clean locally.
+| Deferred (from revision 2) | Build only if |
+|---|---|
+| Operator-invoked push command (`runs push <id>`) | Owner reverses D-1/D-3, or a class of parked-not-folded work accumulates that the owner wants durable off-host |
+| Automated remote custody plane (lease-bound push, custody refs, CI namespace policy) | Multi-operator or multi-host operation |
+| Git-bundle fallback + restoration proofs | A repository with no writable remote enters real use |
+| Watermark ladder / reservations / per-repo caps / hot-storage budgets | Free space observed below ~300 GiB **with S1–S4 running** (storage report provides the evidence) |
+| Hot leases / source pressure-eviction / exact reconstruction | Source-class footprint exceeds ~10 GiB after S4 (not expected) |
+| Distribution profile experiment (`lto="thin"`, `strip="symbols"`) | Filed separately as release engineering; unrelated to custody. Rev-2's rejected defaults (no `opt-level=z`, no fat LTO, no `panic="abort"`, no `no_std`, no UPX) stand as conclusions without needing a decision. |
 
-Remote WIP/custody refs may also trigger CI, notifications, branch rules, storage billing, or external automation.
-The chosen namespace must be explicitly excluded from unintended workflows or those effects must be accepted.
+## 9. Reconciliations and deferral ledger
 
-## 6. Storage policy
+**Closure-record identity addendum (landed with this revision):** the closure record's "exact reviewed
+aggregate tree `4fb6bfe1…`" and "integration commit `23ed6439…`" are not reachable in the local repository;
+the bounded platform/coverage repair produced PR head `00f03c4` and the squash merge landed as `aedd2c2`
+(tree `de53676`). The durable identity of the landed foundation is PR #50's merge commit. This is itself an
+instance of the squash-stranding hazard §7 now guards against.
 
-The system operates on a shared, storage-constrained host with multiple repositories and multiple workers per
-repository. Retention is quota- and reservation-driven; it does not assume that local storage grows without bound.
+**Deferral ledger re-imported from the closure record** (dropped by revision 2; tracked here so the plan is
+self-contained): cleanup-before-primary ordering; snapshot custody-plan coverage; legacy SQLite schema
+rewrite; sequence/journal accounting; history-growth preflight symmetry; reserve literal binding; direct
+`integrate_run_tree` tests; platform/test fixture edges; restoring `bridge-core` 86% → 90% and
+`bridge-workflow` 87% → 90% coverage floors. Each is a bounded follow-on, none blocks slice-2 entry, and
+none may be silently dropped from successor plans.
 
-### 6.1 Measured 2026-08-06 baseline and cleanup evidence
+## 10. Corrections from revision 2 (audit trail)
 
-This is point-in-time evidence, not a permanent capacity guarantee or future cleanup authorization.
+Recorded so the lineage is reviewable; full analysis in the owner-side packet.
 
-| Measurement | Before | After the separately authorized cleanup |
-|---|---:|---:|
-| Data-volume free space | 328.93 GiB immediately before deletion | 371.00 GiB |
-| Physical free-space gain | — | 42.07 GiB |
-| Current repository | 5.05 GiB, including a 4.73 GiB target | 0.318 GiB |
-| `.a2a-implement` | 21.45 GiB across 113 directories | 16.37 GiB across the same 113 directories |
-| R2f1b completion scratch | 20.24 GiB | 0.247 GiB |
-| Old merge scratch | 5.96 GiB | effectively empty |
-| OrbStack physical allocation | about 258.04 GiB | about 251.91 GiB |
+- **W1** — source-checkout pricing measured the wrong population (linked worktrees, not the 112 standalone
+  `--no-hardlinks` clones); the 13.75 GiB duplicated-object-store class had no control. Fixed in §3 S4/§6.
+- **W2** — source pressure-eviction could recover ≤~1.5 GiB against the 50 GiB cap that triggered it, and
+  the reclaim order reached targets first; the lease/eviction/reconstruction subsystem was unreachable-by-
+  need. Removed (§5, §8).
+- **W3** — contradictory deletion authority for `Parked + BundleVerified` between §4.7 and §3/§6.3.
+  Mooted: bundles removed (D-3, §8).
+- **W4** — 2 workers × 25 GiB reservation exactly consumed the 50 GiB per-repo cap (and one 50 GiB slice
+  reservation was 100% of it); effective concurrency 1. Removed with the quota scheduler (D-4).
+- **W5** — the 6–8 checkout cap deadlocked admission against the existing 112 clones, which §4.7
+  simultaneously refused to clean. Removed; S4 + D-1 clear the backlog instead.
+- Plus: fingerprint re-gated to pre-`AutomaticR2f1b` (§4 A5); deferral ledger re-imported (§9); §6.1
+  arithmetic/units corrected (§6); the sixteen-decision surface replaced by D-1..D-4 (§2); track monoliths
+  replaced by per-PR slices with a red-test park-and-report rule (§3, §4).
 
-The cleanup removed 36.41 GiB of exact host Cargo targets and 61.21 GB of logical zero-consumer Docker volumes.
-Sparse OrbStack/APFS accounting meant that the logical Docker deletion produced only about 6.1 GiB of immediate
-host recovery. Source checkouts, Git objects, logs, receipts, images, current caches, the served operator, and all
-stockTrading/quant-platform resources were preserved.
+## 11. Planning exit
 
-Eight source-only linked worktrees measured only 18–24 MiB each. A retained full-suite target measured about 20 GiB.
-Therefore the primary capacity unit is an isolated build payload, not a Git worktree registration.
-
-### 6.2 Proposed watermarks, reservations, and quotas
-
-These values are recommended defaults for owner re-review:
-
-| Control | Proposed value | Behavior |
-|---|---:|---|
-| Inventory/reclaim trigger | 300 GiB free | Classify and reap exact remotely/bundle-durable idle payloads; do not wait for a weekly manual crisis. |
-| New full-build admission floor | 250 GiB projected free | Refuse admission unless the declared reservation leaves at least this much free. |
-| Critical floor | 200 GiB free | Start no new write-capable worker; checkpoint durable idle work and reclaim verified disposable payloads. |
-| Cleanup target | 350 GiB free | Continue bounded classified cleanup until this target or until no authorized candidate remains. |
-| Full-build reservation | 25 GiB | Reserve before one isolated full test/Clippy/build payload. |
-| Full-slice reservation | 50 GiB | Reserve when implementation and aggregate-verification targets may coexist. |
-| Per-repository concurrency | 2 full-build workers | Additional source-only readers do not consume a build reservation. |
-| Global concurrency | 3 full-build workers | Shared across all repositories on the host. |
-| Per-repository hot-storage soft cap | 50 GiB | Pressure-evict durable idle source/build payloads before admitting more. |
-| Global A2A hot-storage soft cap | 100 GiB | Includes source materializations, build targets, and per-run caches; excludes explicitly protected operator/data services. |
-| Local source checkout cap | 6–8 per repository | Operational/custody cap rather than a disk-capacity claim. |
-
-Admission uses projected free space after reservations, not the last observed `df` value. A local-only protected
-result consumes quota; when quota is exhausted, new work stops rather than deleting the sole copy or pretending
-that local retention is unlimited.
-
-### 6.3 Reclaim order and hot retention
-
-1. Exact completed per-run `BuildTarget` payloads, even when their source checkout remains hot for review.
-2. Duplicated inactive dependency caches after preserving the current shared repo/toolchain cache.
-3. `Folded + FoldReceiptVerified + Evictable` source checkouts, with zero grace.
-4. `Parked + RemoteVerified/BundleVerified + Evictable` source checkouts, with zero grace under pressure.
-5. Separately classified zero-consumer containers/volumes and non-current, non-rollback images.
-
-Immediate-review and repair locality are best-effort cache behavior. `HotPreferred` becomes `Evictable` when a
-watermark or quota requires it; exact reconstruction replaces indefinite retention. Never select a user-owned or
-protected path by prefix, age, or size alone.
-
-### 6.4 Build-footprint policy
-
-- Keep source checkouts small. Put regenerable Cargo/build/LSP caches in identified shared roots where correctness
-  permits, mark disposable roots with `CACHEDIR.TAG`, and bind reuse to repo/toolchain/config identities.
-- Set `CARGO_INCREMENTAL=0` for one-shot CI, full-suite, and aggregate-verifier runs. A preserved 15.77 GiB verifier
-  target contained 6.88 GiB of incremental artifacts (about 44%). Interactive development may retain incremental
-  compilation when it has an explicit hot-cache budget.
-- Delete completed one-shot build targets after their gate outputs have been reduced to retained evidence. Do not
-  retain a 20 GiB target merely to reuse a 20 MiB checkout for review.
-- Prefer a shared current dependency registry/cache over a new 620 MiB per-run copy, while preserving isolation and
-  toolchain/config compatibility.
-- Do not confuse clone/worktree cleanup with Docker cleanup. Containers and images retain separate live-owner,
-  project-data, current-image, and rollback-image gates.
-
-### 6.5 Release-binary size policy
-
-The current workspace defines no custom `[profile.release]`; normal release builds therefore use Cargo defaults:
-`opt-level=3`, `strip="none"`, `lto=false`, `panic="unwind"`, `incremental=false`, and 16 codegen units. The installed
-operator measured 30.46 MiB and retained 67,006 symbols, including about 5.23 MiB of symbol/string-table data.
-
-Binary-size tuning does not solve multi-gigabyte target retention. A separately reviewed distribution experiment
-may compare this custom profile with the unchanged release baseline:
-
-```toml
-[profile.dist]
-inherits = "release"
-lto = "thin"
-strip = "symbols"
-```
-
-Retain an unstripped diagnostic artifact if `strip="symbols"` is adopted. Do not default to `opt-level="z"` without
-measurement; Cargo does not guarantee that `s`/`z` are smaller. Do not use `codegen-units=1`/fat LTO as a storage
-fix because they trade substantial build time/parallelism for final-binary optimization. Reject `panic="abort"`:
-production observation, session, and reaper paths deliberately catch panics. Reject `no_std`: the bridge requires
-filesystem, process, network, Tokio/Axum, SQLite, and OS services. Do not add UPX to the default release path; a
-possible tens-of-megabytes distribution saving is immaterial to build storage and adds another platform/release
-transformation. None of these release-profile experiments is authorized by this plan revision.
-
-## 7. Required fail-first cases for workspace custody
-
-At minimum, the eventual implementation must prove:
-
-1. phase, durability, local materialization, and payload class change independently without fabricating authority;
-2. implement completion followed by immediate review reuses the same source checkout when a hot lease and budget
-   permit, while deleting its build target does not delete source or evidence;
-3. a remote/bundle-verified review checkout can be pressure-evicted and reconstructed at the exact commit/tree;
-4. a closed-enumerable review rejection retains or reconstructs the exact checkout for the authorized repair;
-5. approved fold plus exact remote verification reaps only that slice's source and build payloads;
-6. the remote feature branch remains usable without a standing local worktree;
-7. push failure, stale lease, missing remote ref, fetch mismatch, or failed bundle restoration keeps source
-   `LocalOnly` and blocks its cleanup;
-8. dirty, untracked, ignored, submodule-dirty, or LFS-incomplete state blocks source cleanup unless explicitly
-   dispositioned, but does not prevent independent removal of a proven regenerable target;
-9. active lease, operation lock contention, process cwd/open file, or container mount blocks the exact payload;
-10. squash/fold cannot strand the sole copy of the reviewed commit;
-11. `Parked + RemoteVerified` and `Parked + BundleVerified` reconstruct exactly, while `Parked + LocalOnly` consumes
-    quota and cannot be pressure-deleted;
-12. concurrent review/repair and cleanup serialize so only one owns each transition;
-13. a predicted build reservation crossing the 250 GiB admission floor refuses before materialization;
-14. the 300/250/200/350 GiB watermark transitions prioritize candidates without bypassing custody gates;
-15. completed one-shot verification with `CARGO_INCREMENTAL=0` retains test evidence but not incremental payloads;
-16. logical Docker/cache deletion and physical free-space gain are recorded separately;
-17. partial removal is recorded truthfully and is recoverable; and
-18. disk-pressure inventory never selects user-owned, served-operator, stockTrading/quant-platform, current-cache,
-    or rollback resources by prefix/age alone.
-
-## 8. Owner inputs
-
-The technical safety properties above are not optional. The following policy choices require owner direction.
-Recommended defaults are stated so planning can continue without inventing authority.
-
-### 8.1 Input needed for each remaining gate
-
-| Gate | Input needed from the owner | Recommended answer |
-|---|---|---|
-| **Runtime custody tests** | Confirm that automatic deletion is allowed only for an exact globally healthy outcome, never from node-local success, elapsed age, remote presence alone, or ambiguous custody. | Yes; preserve or return `Unknown` everywhere else. |
-| **Preparation flight** | No new duration is needed if the already approved D11 pre-effect/control bounds remain authoritative. Confirm that timeout transfers ownership instead of canceling the underlying preparation. | Retain D11 and transfer the exact guard to recovery. |
-| **Resource flight** | Confirm that cleanup/takeover/release/retirement must join one capability-bound generation flight even when waiting is slower than returning an optimistic success. | Prefer truthful `Partial`/`Unknown` or retained ownership over guessed success. |
-| **V3 snapshot** | Confirm that the snapshot enumerates runtime checkout candidates only; remote feature/custody refs belong in implement-run receipts, not `WorkflowSnapshotV3`. | Keep the two custody planes separate. |
-| **Filesystem implementation owner** | Select one reusable owner for generic descriptor/sync/publication primitives. | Finish `fs_custody`; retain bounded-reader/quarantine policy in `local_file`. |
-| **Workload fingerprint** | Approve a new automatic-R2f1b fingerprint domain while preserving historical V2/manual fingerprints. | Yes; there is no automatic production history whose old identity needs preservation. |
-| **Implement-run cleanup** | Approve the orthogonal phase/durability/materialization/payload model plus remote, bundle, quota, retention, and protected-resource policy. | Adopt §§3–6, including pressure eviction of durable idle source and immediate independent build-target cleanup. |
-
-| Decision | Recommended default | Why owner input is needed |
-|---|---|---|
-| **Remote push authority** | Per-repository opt-in authorizes an operator-owned bridge path—not an agent—to create/update exact lease-bound feature and custody refs. | A push is an external effect and some target repos may be private, forked, local-only, or read-only. |
-| **Feature-branch model** | One remote feature branch, no standing local worktree; one unique local checkout/branch per slice. | Confirms the lifecycle proposed by the owner. |
-| **Immediate-review reuse** | Prefer the exact clean source checkout through review and one bounded repair only while a hot lease fits quota; delete build outputs and reconstruct under pressure. | Reuse saves setup time, but local retention is a cache policy rather than a custody invariant. |
-| **Custody-ref namespace and CI effects** | Use an explicit `a2a/custody/<run-id>` or equivalent namespace excluded from ordinary push CI; never guess that it is effect-free. | Naming, visibility, branch protection, and CI rules are repository policy. |
-| **Original reviewed-commit retention** | Keep the per-slice custody ref until aggregate feature review and main landing are green; then retain only the integration receipt unless an audit requires longer. | Squash/fold can otherwise make the reviewed commit unreachable. |
-| **Parked-work hold** | Zero local grace under pressure after remote/bundle restoration proof; optional short grace only above 300 GiB free. | Balances repair latency against real storage pressure without making retention indefinite. |
-| **Untracked/ignored material** | Refuse cleanup unless every item is classified as disposable cache or preserved through an approved private artifact path. Never auto-push it. | Git remote durability does not cover these bytes and they may contain secrets. |
-| **No-writable-remote fallback** | Create an owner-private Git bundle plus bounded evidence manifest; if that fails, retain locally. | Cross-repo workflows cannot assume a writable `origin`. |
-| **Free-space watermarks** | Approve proposed 300 GiB inventory, 250 GiB admission, 200 GiB critical, and 350 GiB cleanup-target values. | Machine capacity and concurrent workloads are operator policy; measured baselines can drift. |
-| **Reservations and quotas** | Approve 25 GiB/full build, 50 GiB/full slice, two full-build workers per repo, three globally, 50 GiB/repo hot, and 100 GiB global A2A hot storage. | Admission and fairness across repositories require owner-selected finite budgets. |
-| **One-shot build policy** | Set `CARGO_INCREMENTAL=0` for CI/full-suite/aggregate verification and evict completed targets after evidence reduction. | A measured verifier cache devoted about 44% of its target to incremental artifacts. |
-| **Distribution profile experiment** | Permit a separate non-blocking comparison of the default release against `lto="thin"` plus `strip="symbols"`; keep unwind panics and an unstripped diagnostic artifact. | This changes release/debug characteristics and must not be confused with the high-value target-retention fix. |
-| **Protected roots/resources** | Explicitly preserve the user checkout, served operator/release, active bridge stores, and owner-named repositories/containers. | Broad cleanup inference is unsafe. |
-| **Fingerprint compatibility** | Accept a new version/domain for automatic R2f1b; retain historical V2/manual fingerprints unchanged. | Confirms that no nonexistent automatic-history compatibility is being preserved. |
-| **Filesystem ownership** | Finish the shared `fs_custody` extraction and make `local_file` a higher-level caller rather than retaining duplicated primitives. | The owner may reject this only by selecting another single library owner; duplication is not an acceptable outcome. |
-
-## 9. Proposed implementation sequence
-
-Keep runtime custody and operator workspace cleanup as separate reviewed artifacts even if they share primitives.
-
-### Track A — R2f1b inactive-foundation closure
-
-1. Reconcile the roadmap to the merged PR #50 identity and freeze exact current main.
-2. Enumerate every missing section-6 runtime custody/flight/snapshot test against current source; zero-selection or
-   setup failures are inadmissible.
-3. Land fail-first contract tests without activating deadlines.
-4. Finish the single-owner `fs_custody` extraction with parity/fault tests.
-5. Bind activation plus contract fingerprint into a versioned workload fingerprint; retain V2/manual behavior.
-6. Run focused package gates, full workspace acceptance, platform custody lanes, hygiene, and one capped cumulative
-   review. `AutomaticR2f1b` remains unconstructible.
-
-### Track B — implement-run remote custody and local cleanup
-
-1. Freeze ADR-0026/0027/0040 checkpoint, merge, operation-lock, and clone-reap behavior on exact current main.
-2. Add a read-only inventory/dry-run classifier that emits phase, durability, local materialization, payload class,
-   measured bytes, reservation owner, and every blocking gate for each exact bridge-owned item. It performs no push
-   or deletion.
-3. Add versioned remote-custody and fold receipts, exact lease-bound operator push, live remote verification, and
-   no-writable-remote fallback. No agent receives push authority.
-4. Add explicit hot leases for immediate review and bounded repair, with pressure eviction and exact reconstruction
-   after `RemoteVerified`/`BundleVerified` proof.
-5. Add independent exact guarded cleanup for completed build targets and dependency caches without deleting retained
-   source/evidence; then add guarded source cleanup for `Folded + FoldReceiptVerified` and accepted
-   `Parked + RemoteVerified/BundleVerified` states.
-6. Add reservation admission, per-repository/global quotas, and the 300/250/200/350 GiB transitions without allowing
-   storage pressure to bypass custody, process, Git, evidence, protected-project, current-cache, or rollback gates.
-7. Set `CARGO_INCREMENTAL=0` for one-shot verifier execution, retain raw gate evidence, and remove completed targets
-   according to the exact payload receipt.
-8. Verify remote/bundle restoration, pressure-evicted review/repair reconstruction, logical-versus-physical reclaim
-   reporting, concurrency with review/resume/merge, full suite, hygiene, and one capped adversarial review.
-
-Track B may precede later R2f1b production slices to reduce operator storage pain, but it does not prove runtime
-deadline custody and cannot green Track A by analogy.
-
-The optional distribution-profile comparison in §6.5 is a separately scoped follow-on. It is not a Track B blocker
-and must not delay the much larger build-target and incremental-artifact controls.
-
-## 10. Planning exit
-
-Planning is ready for bounded implementation briefs only when the owner has answered the decisions in §8, including
-the proposed watermarks/reservations/quotas, the roadmap is reconciled to merged `main`, exact current source has been
-re-audited for missing tests/callers, and Track A and Track B have separate path ownership, review caps, and
-acceptance totals.
+Ready now: S1, S2, S5 (no dependencies), then S3, S4; A1–A4 in parallel with Phase 0 (A5 gated as stated).
+Each brief inherits: exact base recorded at dispatch, the §3 gate set, a declared one-round review cap,
+park-and-report on red gates or open-class findings, and roadmap + receipt reconciliation in the landing
+commit. No further owner input is required for this scope; D-rulings above are the standing authority.
