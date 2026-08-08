@@ -49,10 +49,17 @@ escalate. Order S1→S5 is preferred but only S3/S4 depend on S2.
   incremental artifacts. Note: `profile.release` already has `incremental=false`; this targets dev/test-profile
   one-shot builds. Interactive development keeps incremental compilation.
 - **S2 — read-only `storage report`.** Walks bridge-owned roots only (`.a2a-implement`, worktree roots,
-  per-repo cache volumes); emits per item: path, payload class (`SourceCheckout`, `BuildTarget`,
-  `DependencyCache`, `Evidence`, `ContainerOrImage`), measured bytes, live-consumer status (lease, operation
-  lock, process/open-file, container mount), git HEAD, and whether that HEAD is reachable from `origin`.
-  No deletion, no push, no external effects. This is the audit instrument for S3/S4 and for §8 triggers.
+  per-repo cache volumes); emits per item: path, payload class (observable classes `SourceCheckout` —
+  tagged standalone-clone vs linked-worktree — `BuildTarget`, `DependencyCache`, `Evidence`,
+  `ContainerOrImage`, plus `Unclassified`, which reapers must refuse; `CredentialOrSecret` is a §5
+  cleanup-rule class, not an observable report class), measured bytes, live-consumer status per probed kind
+  (lease, operation lock, container mount; the process/open-file probe lands with S3 at the destructive
+  boundary and reports `Unknown` until then), git HEAD, and containment: for implement clones, whether
+  HEAD's content is contained by the local source repo's current refs (the S4 query); for worktree items,
+  `origin/*` containment as of the last fetch, which can overstate remote reachability. No deletion, no
+  push, no network; sole state-visible exception: the advisory flock the lock probe takes and immediately
+  releases (a racing merge/resume sees a clean retryable refusal). This is the audit instrument for S3/S4
+  and for §8 triggers.
 - **S3 — build-target reaper + D-4 floor.** Deletes a completed run's build target once its gate output is
   reduced to retained evidence and no process, open file, or container owns it (rechecked at the destructive
   boundary; failed or nondiscriminating probes park the payload). Records logical size and physical reclaim
