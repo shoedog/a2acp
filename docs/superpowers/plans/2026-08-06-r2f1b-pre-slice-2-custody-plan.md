@@ -206,6 +206,15 @@ CLI orchestration lacks seam-injected behavioral tests (S3 adds them with the re
 `shorten_bounded_cause`'s outer loop (and the `NodeTerminalV1` twin) is unreachable defensive dead code —
 production's own `DERIVED_NODE_CLEANUP_RECORD_WORST_CASE_BYTES = 1936` const-assert is what makes it so.
 
+**Sol fold-review cycle record (2026-08-07):** round 1 REJECT (6 BLOCKERs, all S2; flock fix + S1 traced
+clean); bounded repair; closure round REJECT with adjudication 2 FIXED / 3 PARTIAL / 1 deferred-WRONG and
+3 fresh BLOCKERs localized in the repair seams (lookback-exhaustion read as definitive No; discriminant-only
+`.git` recheck; runtime answered-before-parse). Cap reached; owner ruling: apply the valid findings in one
+final bounded repair, then proceed WITHOUT a further Sol round. Deferred and carried: verify_root
+same-parent swap window (descriptor pinning → S3; "race closed" claims removed), preflight git hardening
+(folded into the final repair), CLI/runtime seam tests (S3), volume labels (S3), non-UTF-8 fixture
+unverifiable on APFS (Linux CI exercises it).
+
 **Slice-2 obligations surfaced by the A3 review (2026-08-07):** no production code reads
 `FrozenR2f1bContractV1.activation` — an `AutomaticR2f1b` contract can today be minted, encoded, decoded,
 and validated without refusal, so "AutomaticR2f1b remains unconstructible" holds by convention only.
