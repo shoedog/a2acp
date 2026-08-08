@@ -224,7 +224,11 @@ pub fn outcome_suffix(o: &VerifyOutcome) -> String {
 }
 
 /// PURE. A stable per-repo cache volume name: `<base>-<hash(canonical repo path)>`. Per-repo keying
-/// isolates repos; same-repo runs share (single-flight serializes them — see `run_verify`'s caller).
+/// isolates repos; same-repo runs SHARE one volume, and `CARGO_HOME`/`CARGO_TARGET_DIR` point inside it —
+/// so concurrent same-repo verifies would write one another's cargo state. They do not, because
+/// [`run_verify_serialized`] holds an exclusive flock named for this volume across the container run.
+/// (Before that lock existed this comment claimed a "single-flight" serialization that nothing
+/// implemented — the S5 defect.)
 /// Reuses the codebase's `DefaultHasher` owner-token pattern (`main::container_owner`). The CALLER passes
 /// the CANONICAL repo path (Task 5 canonicalizes `a.repo`) — two spellings must not split the cache.
 pub fn cache_volume_name(base: &str, repo_canon: &str) -> String {
@@ -232,6 +236,82 @@ pub fn cache_volume_name(base: &str, repo_canon: &str) -> String {
     let mut h = std::collections::hash_map::DefaultHasher::new();
     repo_canon.hash(&mut h);
     format!("{base}-{:016x}", h.finish())
+}
+
+/// The prefix that keeps cache-volume locks disjoint from the run operation locks sharing their
+/// directory. Run locks are named for a run id — `impl-<pid>-<nonce>` (`implement::task_id`) — which can
+/// never begin with `verify-`, so the two namespaces cannot collide.
+pub const CACHE_VOLUME_LOCK_PREFIX: &str = "verify-";
+
+/// PURE. The lock id serializing verify runs that share one cache volume (file: `verify-<volume>.lock`).
+pub fn cache_volume_lock_id(cache_vol: &str) -> String {
+    format!("{CACHE_VOLUME_LOCK_PREFIX}{cache_vol}")
+}
+
+/// PURE. The operator note printed once when a verify is about to wait for another verify of the same
+/// repository. Pure so its content is asserted by a test rather than by scraping stderr.
+pub fn cache_volume_wait_note(cache_vol: &str) -> String {
+    format!(
+        "[implement] verify: waiting for a concurrent verify of the same repository \
+         (cache volume {cache_vol}) to finish..."
+    )
+}
+
+/// The Docker volume-name charset (`[a-zA-Z0-9][a-zA-Z0-9_.-]*`). A `[verify].cache` base outside it is
+/// already unusable as a volume name; refusing it here also keeps the lock id a single, literal path
+/// component (no `/`, no `..`, no NUL) so a lock can never be created outside its namespace.
+fn is_volume_name(s: &str) -> bool {
+    let mut chars = s.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphanumeric() => {}
+        _ => return false,
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-'))
+}
+
+/// Where the cache-volume lock lives for a run whose quarantine clone is `clone`.
+///
+/// `<implement root>/.operation-locks/` — the SAME namespace as the run operation locks
+/// (`implement_resume::acquire_operation_lock`) — whenever `clone`'s parent is an `.a2a-implement` root:
+/// it is a sibling of the clones (guarded clone reaping can never unlink a held lock inode) and it is the
+/// directory `storage report` already knows about. Any other shape (a verify outside an implement run)
+/// falls back to the host-global lease dir, which always exists as a namespace.
+///
+/// KNOWN SCOPE (disclosed, not closed): the cache volume is host-global (one Docker daemon), while this
+/// namespace is per-implement-root. Two implement roots on ONE host pointing at the same source repo would
+/// therefore key the same volume under two different lock directories and would not serialize. Deployment
+/// keeps a single `allowed_cwd_root` per host (it is the container mount anchor), so one root holds every
+/// run; if that ever stops holding, move this to `liveness::lease_dir()`, whose domain matches the volume's.
+pub fn cache_volume_lock_dir(clone: &std::path::Path) -> std::path::PathBuf {
+    match clone.parent() {
+        Some(root) if root.file_name() == Some(std::ffi::OsStr::new(IMPLEMENT_ROOT_DIR)) => {
+            root.join(crate::implement_resume::OPERATION_LOCK_DIR)
+        }
+        _ => bridge_core::liveness::lease_dir(),
+    }
+}
+
+/// The quarantine-clone root created by `implement` (`<allowed_cwd_root>/.a2a-implement`).
+const IMPLEMENT_ROOT_DIR: &str = ".a2a-implement";
+
+/// Take the exclusive per-cache-volume verify lock, WAITING (not failing) for any concurrent same-volume
+/// verify: a verify legitimately runs for minutes, so a `WouldBlock` refusal would strand real work.
+pub fn acquire_cache_volume_lock(
+    lock_dir: &std::path::Path,
+    cache_vol: &str,
+) -> std::io::Result<bridge_core::liveness::PersistentLockGuard> {
+    if !is_volume_name(cache_vol) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("cache volume name {cache_vol:?} is not a usable lock id"),
+        ));
+    }
+    let note = || eprintln!("{}", cache_volume_wait_note(cache_vol));
+    bridge_core::liveness::acquire_persistent_lock_blocking_in(
+        lock_dir,
+        &cache_volume_lock_id(cache_vol),
+        &note,
+    )
 }
 
 /// A command runner: given `(program, argv)`, run it and return `(exit_code, combined_output)`. The real
@@ -308,6 +388,60 @@ pub fn run_verify_recorded(
         }
     }
     VerifyOutcome::Ran(aggregate(results))
+}
+
+/// [`run_verify_recorded`] with the same-repo serialization its shared cache volume requires: hold an
+/// exclusive flock named for `cache_vol` across the WHOLE container run (every configured command — cargo
+/// state written by command 1 is read by command 2), and release it on return.
+///
+/// SCOPE: the guard covers the container run only. Edit turns, review turns and the tweak loop run outside
+/// it, so a repair round never holds a repo-wide lock while an agent thinks.
+///
+/// DEADLOCK ANALYSIS (against the real call graph as of this commit):
+/// * Two lock families exist on this path — the per-run operation lock
+///   (`<implement root>/.operation-locks/<run id>.lock`, taken by `implement --resume`, `merge` and the
+///   clone reaper) and this per-cache-volume lock. Where both are held, the order is fixed: `--resume`
+///   takes the operation lock for the run's whole life BEFORE its loop reaches verify, and nothing
+///   acquires an operation lock while this guard is alive (the guarded region spawns containers via the
+///   injected `runner` and takes no other lock). A cycle would need the reverse order; no path has it.
+/// * This lock is single-level: no code path acquires two cache-volume locks, so no hold-and-wait chain
+///   between volumes can form. A fresh (non-resume) `implement` holds no operation lock at all while
+///   verifying, and takes the merge lock only after this guard has been dropped.
+/// * The holder never awaits the waiter: it runs the container to completion, then releases. Waiting is
+///   therefore bounded by the holder's own verify, not by any lock the waiter owns.
+///
+/// A lock that cannot be TAKEN (unwritable namespace, a filesystem without working `flock`, a
+/// non-volume-shaped name) degrades LOUDLY to an unserialized run rather than failing the run: the risk it
+/// guards is concurrent same-repo verifies, while refusing here would strand a single run that has no
+/// contender at all. Contention itself never lands in this arm — that path waits.
+#[allow(clippy::too_many_arguments)] // one more than `run_verify_recorded`: its lock namespace
+pub fn run_verify_serialized(
+    cfg: &VerifyConfig,
+    profile: Option<&bridge_core::profile::LanguageProfile>,
+    clone: &bridge_core::SessionCwd,
+    cache_vol: &str,
+    runner: &Runner,
+    max_bytes: usize,
+    recorder: &dyn bridge_core::attempt_activity::AttemptRecorder,
+    lock_dir: &std::path::Path,
+) -> VerifyOutcome {
+    if profile.is_none() {
+        // No profile ⇒ no container ⇒ nothing to serialize; never create a lock namespace for a skip.
+        return run_verify_recorded(cfg, profile, clone, cache_vol, runner, max_bytes, recorder);
+    }
+    let _cache_volume = match acquire_cache_volume_lock(lock_dir, cache_vol) {
+        Ok(guard) => Some(guard),
+        Err(e) => {
+            eprintln!(
+                "[implement] verify: could not take the cache-volume lock in {} ({e}) — running \
+                 UNSERIALIZED; a concurrent verify of the same repository could corrupt the shared \
+                 {cache_vol} cache",
+                lock_dir.display()
+            );
+            None
+        }
+    };
+    run_verify_recorded(cfg, profile, clone, cache_vol, runner, max_bytes, recorder)
 }
 
 pub fn run_verify(
@@ -746,6 +880,258 @@ mod tests {
             matches!(outcome, VerifyOutcome::Skipped { .. }),
             "None profile must return Skipped, not run any container"
         );
+    }
+
+    // ---- S5: same-repo verify serialization -------------------------------------------------
+    //
+    // The harness below runs two verifies concurrently against a tempdir lock namespace with an
+    // injected runner (no container, no Docker). Ordering is carried by channels and by the flock
+    // itself. The ONE wall-clock wait is a NEGATIVE one (`WHILE_HELD_GRACE`): it can only ever weaken
+    // the assertion — a run that IS serialized can never deliver the event it waits for, so this wait
+    // cannot produce a false failure. Every positive wait uses a generous deadline and fails explicitly.
+
+    /// Generous bound for every POSITIVE wait: exceeded ⇒ the test fails loudly instead of hanging.
+    const DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);
+    /// Bound for the single NEGATIVE wait (see above).
+    const WHILE_HELD_GRACE: std::time::Duration = std::time::Duration::from_secs(1);
+
+    struct ConcurrentVerify {
+        entered: std::sync::mpsc::Receiver<()>,
+        release: std::sync::mpsc::Sender<()>,
+        done: std::sync::mpsc::Receiver<()>,
+        handle: std::thread::JoinHandle<VerifyOutcome>,
+    }
+
+    /// Spawn one `run_verify_serialized` whose single verify command signals `entered`, then parks until
+    /// `release` fires (`park=true`) or returns at once (`park=false`), appending `<label> enter` /
+    /// `<label> exit` to the shared log. `done` fires when the whole verify returns (guard dropped).
+    fn spawn_verify(
+        lock_dir: &std::path::Path,
+        cache_vol: &str,
+        label: &str,
+        park: bool,
+        log: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    ) -> ConcurrentVerify {
+        let (entered_tx, entered) = std::sync::mpsc::channel();
+        let (release, release_rx) = std::sync::mpsc::channel::<()>();
+        let (done_tx, done) = std::sync::mpsc::channel();
+        let lock_dir = lock_dir.to_path_buf();
+        let cache_vol = cache_vol.to_string();
+        let label = label.to_string();
+        let handle = std::thread::spawn(move || {
+            let runner = |_p: &str, _argv: &[String]| -> std::io::Result<(i32, String)> {
+                log.lock().unwrap().push(format!("{label} enter"));
+                entered_tx.send(()).unwrap();
+                if park {
+                    release_rx.recv().expect("release channel");
+                }
+                log.lock().unwrap().push(format!("{label} exit"));
+                Ok((0, "ok".into()))
+            };
+            let outcome = run_verify_serialized(
+                &cfg(),
+                Some(&profile(&[("test", true)], None)),
+                &bridge_core::SessionCwd::parse("/repo/clone").unwrap(),
+                &cache_vol,
+                &runner,
+                4096,
+                &bridge_core::attempt_activity::NoopAttemptRecorder,
+                &lock_dir,
+            );
+            done_tx.send(()).unwrap();
+            outcome
+        });
+        ConcurrentVerify {
+            entered,
+            release,
+            done,
+            handle,
+        }
+    }
+
+    /// FAIL-FIRST for the S5 defect: with `run_verify_recorded` (no lock) the second verify runs its
+    /// container while the first is still inside its own, so the log interleaves and the ordering
+    /// assertion fails. The lock makes the two container runs strictly sequential.
+    #[test]
+    fn same_cache_volume_verify_runs_never_interleave() {
+        let dir = tempfile::tempdir().unwrap();
+        let vol = "a2a-verify-cache-000000000000000a";
+        let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        let first = spawn_verify(dir.path(), vol, "A", true, log.clone());
+        first
+            .entered
+            .recv_timeout(DEADLINE)
+            .expect("the first verify must reach its container run");
+
+        // Exact: the guard is held ACROSS the container run, not merely taken and dropped around it.
+        assert!(
+            bridge_core::liveness::acquire_persistent_lock_in(
+                dir.path(),
+                &cache_volume_lock_id(vol)
+            )
+            .is_err(),
+            "the cache-volume lock must stay held while the verify container runs"
+        );
+
+        let second = spawn_verify(dir.path(), vol, "B", false, log.clone());
+        assert!(
+            second.done.recv_timeout(WHILE_HELD_GRACE).is_err(),
+            "a same-volume verify must not complete while another holds the cache volume"
+        );
+
+        first.release.send(()).unwrap();
+        second
+            .done
+            .recv_timeout(DEADLINE)
+            .expect("the queued verify must run once the holder releases");
+        let a = first.handle.join().unwrap();
+        let b = second.handle.join().unwrap();
+        assert!(matches!(a, VerifyOutcome::Ran(_)) && matches!(b, VerifyOutcome::Ran(_)));
+
+        assert_eq!(
+            log.lock().unwrap().as_slice(),
+            ["A enter", "A exit", "B enter", "B exit"],
+            "same-volume verify container runs must be strictly sequential"
+        );
+    }
+
+    /// The lock must not over-serialize: different repos key different volumes and must run in parallel.
+    #[test]
+    fn different_cache_volumes_do_not_serialize() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        let held = spawn_verify(
+            dir.path(),
+            "a2a-verify-cache-000000000000000b",
+            "A",
+            true,
+            log.clone(),
+        );
+        held.entered
+            .recv_timeout(DEADLINE)
+            .expect("the first verify must reach its container run");
+
+        let other = spawn_verify(
+            dir.path(),
+            "a2a-verify-cache-000000000000000c",
+            "B",
+            false,
+            log.clone(),
+        );
+        other
+            .done
+            .recv_timeout(DEADLINE)
+            .expect("a DIFFERENT cache volume must not wait on this one");
+
+        held.release.send(()).unwrap();
+        held.done.recv_timeout(DEADLINE).expect("holder completes");
+        held.handle.join().unwrap();
+        other.handle.join().unwrap();
+        let log = log.lock().unwrap();
+        assert_eq!(
+            &log[..3],
+            ["A enter", "B enter", "B exit"],
+            "the second volume ran INSIDE the first's container run: {log:?}"
+        );
+    }
+
+    /// A lock namespace that cannot be created must not strand the run: it degrades to an unserialized
+    /// verify (loudly, on stderr) rather than refusing to verify at all.
+    #[test]
+    fn an_unusable_lock_namespace_still_runs_the_verify() {
+        let dir = tempfile::tempdir().unwrap();
+        let blocker = dir.path().join("not-a-dir");
+        std::fs::write(&blocker, b"x").unwrap();
+        let calls = std::cell::Cell::new(0_u32);
+        let runner = |_p: &str, _argv: &[String]| -> std::io::Result<(i32, String)> {
+            calls.set(calls.get() + 1);
+            Ok((0, "ok".into()))
+        };
+        let outcome = run_verify_serialized(
+            &cfg(),
+            Some(&profile(&[("test", true)], None)),
+            &bridge_core::SessionCwd::parse("/repo/clone").unwrap(),
+            "a2a-verify-cache-000000000000000d",
+            &runner,
+            4096,
+            &bridge_core::attempt_activity::NoopAttemptRecorder,
+            &blocker.join("locks"), // create_dir_all under a regular file always fails
+        );
+        assert!(matches!(outcome, VerifyOutcome::Ran(_)));
+        assert_eq!(calls.get(), 1, "the verify still ran");
+    }
+
+    #[test]
+    fn a_none_profile_takes_no_lock_and_spawns_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let namespace = dir.path().join("locks");
+        let runner = |_p: &str, _argv: &[String]| -> std::io::Result<(i32, String)> {
+            panic!("runner must NOT be called when profile is None")
+        };
+        let outcome = run_verify_serialized(
+            &cfg(),
+            None,
+            &bridge_core::SessionCwd::parse("/repo/clone").unwrap(),
+            "a2a-verify-cache-000000000000000e",
+            &runner,
+            4096,
+            &bridge_core::attempt_activity::NoopAttemptRecorder,
+            &namespace,
+        );
+        assert!(matches!(outcome, VerifyOutcome::Skipped { .. }));
+        assert!(
+            !namespace.exists(),
+            "a skipped verify must not even create the lock namespace"
+        );
+    }
+
+    #[test]
+    fn the_cache_volume_lock_id_cannot_collide_with_a_run_id() {
+        let id = cache_volume_lock_id("a2a-verify-cache-0123456789abcdef");
+        assert_eq!(id, "verify-a2a-verify-cache-0123456789abcdef");
+        assert!(!crate::implement::task_id(4242, "abcd1234").starts_with(CACHE_VOLUME_LOCK_PREFIX));
+    }
+
+    #[test]
+    fn the_wait_note_names_the_contended_cache_volume() {
+        let note = cache_volume_wait_note("a2a-verify-cache-0123456789abcdef");
+        assert!(note.contains("waiting for a concurrent verify of the same repository"));
+        assert!(note.contains("a2a-verify-cache-0123456789abcdef"));
+    }
+
+    #[test]
+    fn the_lock_dir_is_the_implement_root_namespace_else_the_lease_dir() {
+        assert_eq!(
+            cache_volume_lock_dir(std::path::Path::new(
+                "/Users/w/code/.a2a-implement/impl-1-abcd"
+            )),
+            std::path::Path::new("/Users/w/code/.a2a-implement/.operation-locks"),
+            "an implement run locks beside its own operation lock"
+        );
+        assert_eq!(
+            cache_volume_lock_dir(std::path::Path::new("/Users/w/code/some-checkout")),
+            bridge_core::liveness::lease_dir(),
+            "a non-implement verify falls back to the host lease dir"
+        );
+    }
+
+    #[test]
+    fn acquire_cache_volume_lock_refuses_a_name_that_is_not_a_volume() {
+        let dir = tempfile::tempdir().unwrap();
+        for bad in ["", "..", "a/b", "-leading", "a b"] {
+            let kind = acquire_cache_volume_lock(dir.path(), bad)
+                .map(|_| ())
+                .expect_err("must refuse a non-volume id")
+                .kind();
+            assert_eq!(kind, std::io::ErrorKind::InvalidInput, "{bad:?}");
+        }
+        assert!(
+            std::fs::read_dir(dir.path()).unwrap().next().is_none(),
+            "a refused name must not create any lock file"
+        );
+        drop(acquire_cache_volume_lock(dir.path(), "a2a-verify-cache-0123456789abcdef").unwrap());
     }
 
     #[test]

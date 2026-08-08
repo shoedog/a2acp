@@ -25,6 +25,22 @@ fn flock_nb(file: &std::fs::File, exclusive: bool) -> std::io::Result<bool> {
     Err(e)
 }
 
+/// Blocking exclusive flock (`LOCK_EX` WITHOUT `LOCK_NB`): waits until the current holder releases.
+/// `EINTR` is retried — a signal (SIGCHLD from any spawned child, SIGWINCH from a resize) must not be
+/// read as "the lock is unavailable", which would silently drop the exclusion this wait exists to provide.
+fn flock_blocking_exclusive(file: &std::fs::File) -> std::io::Result<()> {
+    loop {
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } == 0 {
+            return Ok(());
+        }
+        let e = std::io::Error::last_os_error();
+        if e.raw_os_error() == Some(libc::EINTR) {
+            continue;
+        }
+        return Err(e);
+    }
+}
+
 /// Explicit release. Load-bearing: both guards release HERE rather than at close (see
 /// [`PersistentLockGuard::drop`]), so a filesystem that cannot unlock — `ENOLCK`/`EOPNOTSUPP` are reachable
 /// on NFS, and `$HOME/.a2a-bridge/leases` may well be NFS — would silently resurrect the spawn-window bug
@@ -66,7 +82,10 @@ fn parse_host(raw: &str) -> String {
     }
 }
 
-fn lease_dir() -> PathBuf {
+/// The host-global lock/lease directory (`$A2A_LEASE_DIR`, else `$HOME/.a2a-bridge/leases`). Public so
+/// callers whose lock identity is host-global — not scoped to one bridge root — can name the same
+/// namespace instead of inventing a second one.
+pub fn lease_dir() -> PathBuf {
     if let Ok(d) = std::env::var("A2A_LEASE_DIR") {
         return PathBuf::from(d);
     }
@@ -140,12 +159,12 @@ impl Drop for PersistentLockGuard {
     }
 }
 
-/// Create + exclusively flock `<dir>/<lock_id>.lock` without unlinking it on guard drop. This is for reusable
-/// operation mutexes; crash-detecting run leases must continue to use [`acquire_lease_in`].
-pub fn acquire_persistent_lock_in(
+/// Open (creating if absent) the stable lock path shared by both persistent-lock acquirers. Never
+/// truncates: a lock file is a handle, and its content is irrelevant.
+fn open_persistent_lock_file(
     dir: &Path,
     lock_id: &str,
-) -> std::io::Result<PersistentLockGuard> {
+) -> std::io::Result<(PathBuf, std::fs::File)> {
     std::fs::create_dir_all(dir)?;
     let path = dir.join(format!("{lock_id}.lock"));
     let file = std::fs::OpenOptions::new()
@@ -154,11 +173,46 @@ pub fn acquire_persistent_lock_in(
         .write(true)
         .truncate(false)
         .open(&path)?;
+    Ok((path, file))
+}
+
+/// Create + exclusively flock `<dir>/<lock_id>.lock` without unlinking it on guard drop. This is for reusable
+/// operation mutexes; crash-detecting run leases must continue to use [`acquire_lease_in`].
+pub fn acquire_persistent_lock_in(
+    dir: &Path,
+    lock_id: &str,
+) -> std::io::Result<PersistentLockGuard> {
+    let (path, file) = open_persistent_lock_file(dir, lock_id)?;
     if !flock_nb(&file, true)? {
         return Err(std::io::Error::new(
             std::io::ErrorKind::WouldBlock,
             "operation lock already held",
         ));
+    }
+    Ok(PersistentLockGuard { path, _file: file })
+}
+
+/// Same lock, same create-no-unlink contract and same [`PersistentLockGuard::drop`] release — but WAITS
+/// for the current holder instead of failing. For mutexes whose critical section is legitimately long
+/// (a containerized verify runs for minutes), where [`acquire_persistent_lock_in`]'s `WouldBlock` would
+/// turn a normal queue into a spurious refusal.
+///
+/// One non-blocking attempt runs first; `on_contended` fires ONLY when that attempt found the lock held,
+/// i.e. exactly when this call is about to wait, so the caller can tell the operator why it is stalled.
+/// It is called at most once, before the wait, on the calling thread.
+///
+/// Caller obligations: this blocks the calling thread with no timeout, so (1) never hold another lock that
+/// the current holder needs in order to release this one — acquire in a fixed global order, and (2) do not
+/// call it from a thread whose progress the holder depends on.
+pub fn acquire_persistent_lock_blocking_in(
+    dir: &Path,
+    lock_id: &str,
+    on_contended: &dyn Fn(),
+) -> std::io::Result<PersistentLockGuard> {
+    let (path, file) = open_persistent_lock_file(dir, lock_id)?;
+    if !flock_nb(&file, true)? {
+        on_contended();
+        flock_blocking_exclusive(&file)?;
     }
     Ok(PersistentLockGuard { path, _file: file })
 }
@@ -326,6 +380,88 @@ mod tests {
             "a dropped lease must read as free (owner gone) even while a concurrently spawned child \
              still holds an inherited descriptor"
         );
+    }
+
+    /// The blocking variant must WAIT for the holder rather than fail, must announce the wait exactly
+    /// once before blocking, and must acquire once the holder releases. Ordering is carried by channels
+    /// and by the flock itself — no sleeps: while `held` is alive the waiter provably cannot have
+    /// acquired, so the `try_recv` below is an exact mutual-exclusion assertion, not a timing guess.
+    #[test]
+    fn blocking_persistent_lock_waits_for_the_holder_then_acquires() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let dir = tempfile::tempdir().unwrap();
+        let held = acquire_persistent_lock_in(dir.path(), "vol-x").unwrap();
+
+        let (contended_tx, contended_rx) = mpsc::channel();
+        let (acquired_tx, acquired_rx) = mpsc::channel();
+        let waiter_dir = dir.path().to_path_buf();
+        let waiter = std::thread::spawn(move || {
+            let guard = acquire_persistent_lock_blocking_in(&waiter_dir, "vol-x", &|| {
+                contended_tx.send(()).unwrap();
+            })
+            .expect("blocking acquire must not fail on a merely-held lock");
+            acquired_tx.send(()).unwrap();
+            drop(guard);
+        });
+
+        contended_rx
+            .recv_timeout(Duration::from_secs(60))
+            .expect("a held lock must announce the wait before blocking");
+        assert!(
+            acquired_rx.try_recv().is_err(),
+            "the waiter must not hold the lock while another guard is alive"
+        );
+
+        drop(held);
+        acquired_rx
+            .recv_timeout(Duration::from_secs(60))
+            .expect("the waiter must acquire once the holder releases");
+        waiter.join().unwrap();
+
+        // The path persists (create-no-unlink) and is reacquirable after both guards are gone.
+        let path = dir.path().join("vol-x.lock");
+        assert!(
+            path.exists(),
+            "a persistent lock path must survive its guards"
+        );
+        drop(acquire_persistent_lock_in(dir.path(), "vol-x").unwrap());
+    }
+
+    #[test]
+    fn blocking_persistent_lock_on_a_free_id_neither_waits_nor_announces() {
+        let dir = tempfile::tempdir().unwrap();
+        // A DIFFERENT id is held: distinct ids must not serialize against each other.
+        let _other = acquire_persistent_lock_in(dir.path(), "vol-a").unwrap();
+        let announced = std::sync::atomic::AtomicBool::new(false);
+        let guard = acquire_persistent_lock_blocking_in(dir.path(), "vol-b", &|| {
+            announced.store(true, std::sync::atomic::Ordering::SeqCst);
+        })
+        .unwrap();
+        assert!(
+            !announced.load(std::sync::atomic::Ordering::SeqCst),
+            "an uncontended acquire must not announce a wait"
+        );
+        assert!(guard.path().ends_with("vol-b.lock"));
+        drop(guard);
+    }
+
+    /// The blocking acquirer must not weaken the NON-blocking one: a lock taken by the blocking variant
+    /// still excludes `acquire_persistent_lock_in`, and releases outright on drop.
+    #[test]
+    fn blocking_and_nonblocking_acquirers_share_one_exclusion() {
+        let dir = tempfile::tempdir().unwrap();
+        let guard = acquire_persistent_lock_blocking_in(dir.path(), "shared", &|| {
+            panic!("a free lock must not report contention")
+        })
+        .unwrap();
+        assert!(
+            acquire_persistent_lock_in(dir.path(), "shared").is_err(),
+            "a blocking-acquired lock must exclude the non-blocking acquirer"
+        );
+        drop(guard);
+        drop(acquire_persistent_lock_in(dir.path(), "shared").unwrap());
     }
 
     #[test]

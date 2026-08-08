@@ -62,6 +62,11 @@ pub struct ImplementCheckpoint {
 
 pub const SCHEMA_VERSION: u32 = 1;
 
+/// The lock namespace under an `.a2a-implement` root: run operation locks (`<run id>.lock`) and, sharing
+/// the directory under a disjoint prefix, the cache-volume verify locks (`verify::cache_volume_lock_id`).
+/// `storage_report::OPERATION_LOCK_DIR` is the bin's copy of this name.
+pub const OPERATION_LOCK_DIR: &str = ".operation-locks";
+
 /// One non-blocking operation lock for a quarantine clone. Its namespace is a sibling of the clones rather
 /// than inside `.git`, so guarded clone reaping cannot unlink the lock inode while another command has already
 /// resolved the run. Resume and merge both hold this guard for their entire clone-mutating/reaping operation.
@@ -76,7 +81,7 @@ pub fn acquire_operation_lock(
         .and_then(|name| name.to_str())
         .filter(|name| !name.is_empty() && !name.contains('/'))
         .ok_or_else(|| format!("run clone has no valid id: {}", clone.display()))?;
-    let lock_dir = implement_root.join(".operation-locks");
+    let lock_dir = implement_root.join(OPERATION_LOCK_DIR);
     bridge_core::liveness::acquire_persistent_lock_in(&lock_dir, id)
         .map_err(|e| format!("another resume or merge operation holds this run ({e})"))
 }

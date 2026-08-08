@@ -2088,7 +2088,15 @@ fn run_verify_step(
                 profile.verify_commands.len(),
                 image
             );
-            let outcome = verify::run_verify_recorded(
+            // S5: the cache volume is SHARED by every run against this source repo (`CARGO_HOME` and
+            // `CARGO_TARGET_DIR` live inside it), so the container run is serialized per volume. The
+            // guard is taken and released inside `run_verify_serialized`, i.e. it spans the container
+            // run only — never the edit/review turns around it. Lock order is fixed: `implement
+            // --resume` already holds the per-run operation lock when the loop reaches here, and
+            // nothing acquires an operation lock while the cache-volume guard is alive (full analysis
+            // on `verify::run_verify_serialized`).
+            let lock_dir = verify::cache_volume_lock_dir(std::path::Path::new(clone_cwd.as_str()));
+            let outcome = verify::run_verify_serialized(
                 vcfg,
                 Some(profile),
                 clone_cwd,
@@ -2096,6 +2104,7 @@ fn run_verify_step(
                 &docker_runner,
                 16 * 1024,
                 activity,
+                &lock_dir,
             );
             if let verify::VerifyOutcome::Ran(ref verdict) = outcome {
                 for r in &verdict.results {
