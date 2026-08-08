@@ -61,6 +61,7 @@ mod local_file;
 mod route;
 mod slice;
 mod smoke;
+mod storage_report;
 
 pub(crate) use bridge_controller::{
     implement, implement_resume, merge, resilient, review, turn, tweak, verify,
@@ -188,6 +189,8 @@ SUBCOMMANDS:
   provider-effect-key Provision the separately held V2 commitment key. create --out <absolute-new-path>
   prompt              Inspect the named prompt registry ([[prompts]]). list | show <id>  [--config <f>]
   containers          List / reap this config's managed containers (crash-orphan cleanup).  list | reap
+  storage report      READ-ONLY audit of bridge-owned storage: payload class, bytes, live consumers,
+                      git HEAD + source/origin containment, totals, free space.  [--config <f>] [--json]
   submit              Send a unary message.  [skill] --input <file> [--context <id>] [--agent <id>] [--model <m>] [--effort <e>] [--mode <m>] [--cwd <dir>]
   task                Durable task store.  get | list | cancel | watch
   session             Warm session control.  status | release | cancel | clear | compact <contextId>
@@ -289,6 +292,7 @@ enum TopSubcommand {
     Implement,
     Merge,
     Containers,
+    Storage,
     Submit,
     Task,
     Session,
@@ -317,6 +321,7 @@ fn parse_top_subcommand(raw_args: &[String]) -> TopSubcommand {
         Some("implement") => TopSubcommand::Implement,
         Some("merge") => TopSubcommand::Merge,
         Some("containers") => TopSubcommand::Containers,
+        Some("storage") => TopSubcommand::Storage,
         Some("submit") => TopSubcommand::Submit,
         Some("task") => TopSubcommand::Task,
         Some("session") => TopSubcommand::Session,
@@ -6743,6 +6748,321 @@ fn containers_cmd(args: &[String]) -> Result<(), BoxError> {
     }
 }
 
+/// Execute `a2a-bridge storage report` — the STRICTLY READ-ONLY audit instrument the storage reapers
+/// (custody plan §3 S3/S4) are gated on. It deletes nothing, pushes nothing, fetches nothing, and mutates
+/// no state.
+///
+/// It deliberately does NOT call `recover_orphans` or any worktree sweep, unlike `implement`/`merge`/
+/// `serve`: those entry points reap crash-orphans before their first use, which would make a "read-only"
+/// report a mutating command. `containers_cmd` is the precedent — an operator surface that loads config
+/// and probes, without booting the run machinery. It also resolves `[worktrees]` via
+/// `worktree_runtime_parts` rather than `resolve_worktree_runtime_cfg`, because the latter
+/// `create_dir_all`s the worktree root.
+///
+/// Pure / FS-only cores live in the `storage_report` module; this orchestrates the config load, the
+/// best-effort container-runtime shell-out, and printing. Synchronous (no async I/O).
+fn storage_cmd(args: &[String]) -> Result<(), BoxError> {
+    use storage_report as sr;
+
+    if args.iter().any(|a| a == "--help" || a == "-h") {
+        println!("{}", sr::STORAGE_USAGE);
+        return Ok(());
+    }
+    // The subcommand is REQUIRED, not defaulted: `storage` is about to grow destructive verbs (S3/S4),
+    // and a bare `a2a-bridge storage` that silently means one of them later is a footgun worth refusing
+    // now, while `report` is the only one.
+    let has_sub = args.first().map(|a| !a.starts_with("--")).unwrap_or(false);
+    let Some(sub) = has_sub.then(|| args[0].as_str()) else {
+        return Err(format!(
+            "storage: needs an action (expected: report)\n{}",
+            sr::STORAGE_USAGE
+        )
+        .into());
+    };
+    if sub != "report" {
+        return Err(format!(
+            "storage: unknown action {sub:?} (expected: report)\n{}",
+            sr::STORAGE_USAGE
+        )
+        .into());
+    }
+
+    let mut config: Option<PathBuf> = None;
+    let mut json = false;
+    let mut it = args.iter();
+    it.next(); // consume the subcommand positional
+    while let Some(f) = it.next() {
+        match f.as_str() {
+            "--config" => {
+                config = Some(PathBuf::from(
+                    it.next().ok_or("storage: --config needs a value")?,
+                ))
+            }
+            "--json" => json = true,
+            other => {
+                return Err(
+                    format!("storage: unknown flag {other:?}\n{}", sr::STORAGE_USAGE).into(),
+                );
+            }
+        }
+    }
+
+    let config_path = require_config_path(config)?;
+    let raw = std::fs::read_to_string(&config_path)
+        .map_err(|e| format!("storage: read config {config_path:?}: {e}"))?;
+    let cfg =
+        config::RegistryConfig::parse(&raw).map_err(|e| format!("storage: config parse: {e}"))?;
+
+    let mut notes: Vec<String> = Vec::new();
+    let mut roots: Vec<String> = Vec::new();
+    let mut items: Vec<sr::ReportItem> = Vec::new();
+
+    // Root 1: `<allowed_cwd_root>/.a2a-implement`, resolved exactly as `implement_cmd` does
+    // (canonicalized allowed_cwd_root + `.a2a-implement`) — but never created.
+    let mut primary: Option<PathBuf> = None;
+    match cfg.allowed_cwd_root.as_deref() {
+        None => notes.push(
+            "config has no allowed_cwd_root — no implement root to scan (the same field \
+             `a2a-bridge implement` requires)"
+                .into(),
+        ),
+        Some(root) => match std::fs::canonicalize(root) {
+            Err(e) => notes.push(format!("allowed_cwd_root {root:?} is not resolvable: {e}")),
+            Ok(canon) => {
+                let impl_dir = canon.join(".a2a-implement");
+                // `verify_root` (not `is_dir`, which follows symlinks): a symlinked `.a2a-implement`
+                // would redirect the entire scan onto whatever it points at, and every path enumerated
+                // through it would be reported as bridge-owned.
+                match sr::verify_root(&impl_dir) {
+                    Ok(verified) => {
+                        roots.push(sr::display_path(&verified));
+                        items.extend(sr::scan_implement_root(&verified, &mut notes));
+                        primary = Some(verified);
+                    }
+                    Err(e) if impl_dir.exists() => {
+                        notes.push(format!("implement root NOT scanned: {e}"));
+                        primary = Some(canon);
+                    }
+                    Err(_) => {
+                        notes.push(format!(
+                            "no implement root at {} (nothing has been cloned yet)",
+                            impl_dir.display()
+                        ));
+                        primary = Some(canon);
+                    }
+                }
+            }
+        },
+    }
+
+    // Root 2: `[worktrees].root`, when enabled. `worktree_runtime_parts` validates + resolves it WITHOUT
+    // the `create_dir_all` that `resolve_worktree_runtime_cfg` performs.
+    match worktree_runtime_parts(&cfg) {
+        Err(e) => notes.push(format!("[worktrees] not scanned: {e}")),
+        Ok(None) => {}
+        Ok(Some((root, _allowed))) => {
+            let path = PathBuf::from(&root);
+            match sr::verify_root(&path) {
+                Ok(verified) => {
+                    roots.push(sr::display_path(&verified));
+                    items.extend(sr::scan_worktree_root(&verified, &mut notes));
+                }
+                Err(e) if path.exists() => {
+                    notes.push(format!("[worktrees] root NOT scanned: {e}"));
+                }
+                Err(_) => notes.push(format!("[worktrees] root {root} does not exist yet")),
+            }
+        }
+    }
+
+    // Best-effort container-runtime pass: bridge-labeled volumes, plus the mount/lease evidence carried
+    // by managed containers. An unreachable runtime is a NOTE, never a failure.
+    storage_runtime_pass(&raw, &config_path, &mut items, &mut notes);
+
+    items.sort_by(|a, b| {
+        (a.class, a.checkout_kind, &a.path).cmp(&(b.class, b.checkout_kind, &b.path))
+    });
+    let totals = sr::totals(&items);
+    let probe_coverage = sr::probe_coverage(&items);
+    let volume_path = primary
+        .clone()
+        .or_else(|| config_path.parent().map(|p| p.to_path_buf()))
+        .unwrap_or_else(|| PathBuf::from("."));
+    let (free_bytes, total_bytes) = sr::filesystem_space(&volume_path);
+    let report = sr::StorageReport {
+        roots,
+        items,
+        totals,
+        probe_coverage,
+        data_volume: sr::DataVolume {
+            path: sr::display_path(&volume_path),
+            free_bytes,
+            total_bytes,
+        },
+        notes,
+    };
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        print!("{}", sr::render_text(&report));
+    }
+    Ok(())
+}
+
+/// Best-effort read-only container-runtime pass for `storage report`: list bridge-labeled volumes, and
+/// mark any scanned path that a managed container currently mounts (with that container's lease
+/// liveness). Every failure degrades to `unknown` + a note — the report must never fail because Docker
+/// is down. Only `volume ls` / `ps` are ever run; nothing is created or removed.
+fn storage_runtime_pass(
+    raw_config: &str,
+    config_path: &Path,
+    items: &mut Vec<storage_report::ReportItem>,
+    notes: &mut Vec<String>,
+) {
+    use storage_report as sr;
+
+    // Re-parsed rather than threaded in: `into_snapshot` consumes the config, and the caller still needs
+    // it for `[worktrees]` resolution.
+    let Ok(snapshot) = config::RegistryConfig::parse(raw_config).and_then(|c| c.into_snapshot())
+    else {
+        notes.push("config snapshot unavailable — container volumes not listed".into());
+        return;
+    };
+    let owner_config_path =
+        std::fs::canonicalize(config_path).unwrap_or_else(|_| config_path.to_path_buf());
+    let runtimes = {
+        let r = run_guard_runtimes(&snapshot, &owner_config_path);
+        if r.is_empty() {
+            vec!["docker".to_string()]
+        } else {
+            r
+        }
+    };
+
+    // 1. Managed containers: `a2a.repo` names a mounted path, `a2a.lease` its liveness handle.
+    let my_host = bridge_core::liveness::host_id();
+    let probe = bridge_core::liveness::FsLeaseProbe;
+    let mut evidence = sr::MountEvidence {
+        runtimes_configured: runtimes.len(),
+        ..Default::default()
+    };
+    let mut ps_answered = false;
+    // One `ps` line → (canonical repo path, that container's lease liveness). `None` = unparseable,
+    // which `ps_outcome` treats as "this runtime's answer is incomplete", NOT as a skippable line.
+    let parse_line = |line: &str| -> Option<(String, sr::HolderState)> {
+        let rec = containers::parse_record(line)?;
+        if rec.repo.is_empty() {
+            return None;
+        }
+        let labels = std::collections::HashMap::from([
+            ("a2a.host".to_string(), rec.host.clone()),
+            ("a2a.lease".to_string(), rec.lease.clone()),
+        ]);
+        let lease = match bridge_core::run_identity::classify(&labels, &my_host, &probe) {
+            bridge_core::run_identity::Verdict::Alive => sr::HolderState::Held,
+            bridge_core::run_identity::Verdict::Dead => sr::HolderState::Free,
+            bridge_core::run_identity::Verdict::Unknown => sr::HolderState::Unknown,
+        };
+        Some((sr::display_path(Path::new(&rec.repo)), lease))
+    };
+    for runtime in &runtimes {
+        let stdout = std::process::Command::new(runtime)
+            .args([
+                "ps",
+                "--filter",
+                "label=a2a.managed=1",
+                "--format",
+                containers::LIST_FORMAT,
+            ])
+            .output()
+            .ok()
+            .filter(|out| out.status.success())
+            .map(|out| String::from_utf8_lossy(&out.stdout).into_owned());
+        let outcome = sr::ps_outcome(runtime, stdout.as_deref(), parse_line, notes);
+        if !outcome.answered {
+            continue;
+        }
+        ps_answered = true;
+        evidence.runtimes_answered += 1;
+        for (key, lease) in outcome.records {
+            // Two runtimes can both report the same repo; merge conservatively rather than let the
+            // last writer win.
+            let merged = match evidence.by_repo.get(&key) {
+                Some(prev) => sr::merge_holder(*prev, lease),
+                None => lease,
+            };
+            evidence.by_repo.insert(key, merged);
+        }
+    }
+    // Mount evidence and lease evidence are recorded INDEPENDENTLY. `resolve_mount` owns the judgement:
+    // it refuses to report `Free` unless every configured runtime answered AND the item's path is even
+    // representable in an `a2a.repo` label (the label sanitizer strips non-ASCII and caps at 200 chars,
+    // so a unicode or very long path can never match).
+    for it in items.iter_mut() {
+        let (mount, lease) = sr::resolve_mount(&it.path, &evidence);
+        it.consumers.container_mount = mount;
+        // Never downgrade evidence a scan already established (e.g. a worktree sidecar's lease).
+        if let Some(lease) = lease {
+            if it.consumers.run_lease == sr::HolderState::Unknown {
+                it.consumers.run_lease = lease;
+            }
+        }
+    }
+
+    // 2. Bridge-labeled volumes. Sizes need `system df -v`, which is expensive and often unavailable, so
+    //    they are reported `unknown` rather than paid for on every audit.
+    let mut volumes_answered = false;
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+    for runtime in &runtimes {
+        let Ok(out) = std::process::Command::new(runtime)
+            .args(["volume", "ls", "--format", "{{.Name}}"])
+            .output()
+        else {
+            continue;
+        };
+        if !out.status.success() {
+            continue;
+        }
+        volumes_answered = true;
+        for name in String::from_utf8_lossy(&out.stdout).lines() {
+            let name = name.trim();
+            let Some(class) = sr::classify_volume(name) else {
+                continue;
+            };
+            if !seen.insert(name.to_string()) {
+                continue;
+            }
+            items.push(sr::ReportItem {
+                path: name.to_string(),
+                class,
+                checkout_kind: None,
+                run_id: None,
+                measured: sr::Measured::default(),
+                consumers: sr::LiveConsumers::default(),
+                git: None,
+                note: Some(format!("{runtime} volume; size not measured")),
+            });
+        }
+    }
+    // The two queries fail independently — `ps` can answer while `volume ls` is denied, and vice versa.
+    // One note for both would claim more (or less) than was observed. (Per-runtime `ps` failures are
+    // already noted by `ps_outcome`, which names the runtime; this is the nothing-answered summary.)
+    if !ps_answered && !runtimes.is_empty() {
+        notes.push(
+            "no container runtime produced a complete `ps` answer — container-mount consumers are \
+             unknown for every item"
+                .into(),
+        );
+    }
+    if !volumes_answered {
+        notes.push(
+            "container runtime did not answer `volume ls` — bridge-labeled volumes are not listed"
+                .into(),
+        );
+    }
+}
+
 async fn mcp_cmd(args: &[String]) -> Result<(), BoxError> {
     bridge_observ::init_stderr();
 
@@ -8423,6 +8743,7 @@ async fn main() -> Result<(), BoxError> {
         TopSubcommand::Implement => return implement_cmd(&raw_args[2..]).await,
         TopSubcommand::Merge => return merge_cmd(&raw_args[2..]).await,
         TopSubcommand::Containers => return containers_cmd(&raw_args[2..]),
+        TopSubcommand::Storage => return storage_cmd(&raw_args[2..]),
         TopSubcommand::Submit => return submit_cmd(&raw_args[2..]).await,
         TopSubcommand::Task => return task_cmd(&raw_args[2..]).await,
         TopSubcommand::Session => return session_cmd(&raw_args[2..]).await,
@@ -8445,7 +8766,7 @@ async fn main() -> Result<(), BoxError> {
         // would otherwise be swallowed and the default served).
         TopSubcommand::Unknown(other) => {
             return Err(format!(
-                "a2a-bridge: unknown subcommand {other:?} (expected: serve | mcp | run-workflow | run-batch | batch | models | compatibility | smoke | fallback-plan | implement | merge | containers | workflow-stats | submit | task | task-spec | provider-effect-key | prompt | session | init | validate | doctor | help)"
+                "a2a-bridge: unknown subcommand {other:?} (expected: serve | mcp | run-workflow | run-batch | batch | models | compatibility | smoke | fallback-plan | implement | merge | containers | storage | workflow-stats | submit | task | task-spec | provider-effect-key | prompt | session | init | validate | doctor | help)"
             )
             .into());
         }

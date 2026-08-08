@@ -594,10 +594,20 @@ pub fn preflight_worktrees_root(
     allowed_cwd_root: Option<&bridge_core::SessionCwd>,
 ) -> Result<(), ConfigError> {
     let probe = nearest_existing_ancestor(root)?;
+    // This preflight also runs from the strictly read-only `storage report` path (via
+    // `worktree_runtime_parts`), against a directory the bridge does not control. It therefore uses the
+    // SAME hardened invocation set as `storage_report::git_ro`: no index rewrites, no repo-configured
+    // program execution, no network, no credential prompt.
     let out = std::process::Command::new("git")
+        .arg("--no-optional-locks")
+        .args(["-c", "core.fsmonitor=false"])
+        .args(["-c", "core.hooksPath=/dev/null"])
         .arg("-C")
         .arg(&probe)
         .args(["rev-parse", "--is-inside-work-tree"])
+        .env("GIT_NO_LAZY_FETCH", "1")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_OPTIONAL_LOCKS", "0")
         .output();
     if matches!(out, Ok(o) if o.status.success() && String::from_utf8_lossy(&o.stdout).trim() == "true")
     {
