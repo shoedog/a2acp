@@ -2344,6 +2344,67 @@ mod tests {
         assert!(partial
             .validate_for_attempt(&admitted_attempt, &wrong_flight)
             .is_err());
+
+        // R2f1b A2: `NodeCleanupV2::Unknown { recovery_owner: Some(_) }` shares
+        // `validate_for_attempt`'s attempt/flight cross-check guard with `Partial`
+        // (execution_policy.rs `validate_for_attempt`'s second match arm ORs the two
+        // variants together), but until now nothing exercised that guard through the
+        // `Unknown` arm specifically -- only `Partial` was covered above. Mutation-
+        // checked: narrowing that arm's guard from `NodeCleanupV2::Partial { .. } |
+        // NodeCleanupV2::Unknown { recovery_owner: Some(_), .. }` down to
+        // `NodeCleanupV2::Partial { .. }` only (i.e. dropping the `Unknown` half of
+        // the pattern, so `Unknown` always falls through to the unguarded `_ => Ok(())`
+        // arm) turned the `wrong_attempt` `is_err()` assertion below red (the test
+        // panics there, before reaching the `wrong_flight` assertion, but by
+        // inspection that arm is the sole gate for both, so it would fail identically);
+        // reverted before commit.
+        let unknown_with_matching_owner = NodeCleanupRecordV2 {
+            schema_version: crate::execution_policy::NODE_CLEANUP_RECORD_SCHEMA_V2,
+            cleanup: NodeCleanupV2::Unknown {
+                duration_ms: 1,
+                recovery_owner: Some(RecoveryOwnerV1 {
+                    attempt_id: admitted_attempt.clone(),
+                    resource_flight_id: flight.clone(),
+                    reason: crate::resource_flight::BoundedRecoveryReasonV1::new("crash").unwrap(),
+                }),
+            },
+            preservation: WorktreePreservationResultV1 {
+                disposition: WorktreePreservationDispositionV1::Preserved,
+                custody_id: None,
+                claim_digest: None,
+            },
+            collateral: None,
+        };
+        assert!(unknown_with_matching_owner
+            .validate_for_attempt(&admitted_attempt, &flight)
+            .is_ok());
+        assert!(unknown_with_matching_owner
+            .validate_for_attempt(&wrong_attempt, &flight)
+            .is_err());
+        assert!(unknown_with_matching_owner
+            .validate_for_attempt(&admitted_attempt, &wrong_flight)
+            .is_err());
+
+        // `Unknown { recovery_owner: None }` has no owner to cross-check, so the
+        // guard's `Some(recovery_owner)` half never matches and it must fall through
+        // to the unguarded `_ => Ok(())` arm regardless of attempt/flight -- the
+        // absence of an owner is not itself incoherent.
+        let unknown_without_owner = NodeCleanupRecordV2 {
+            schema_version: crate::execution_policy::NODE_CLEANUP_RECORD_SCHEMA_V2,
+            cleanup: NodeCleanupV2::Unknown {
+                duration_ms: 1,
+                recovery_owner: None,
+            },
+            preservation: WorktreePreservationResultV1 {
+                disposition: WorktreePreservationDispositionV1::Preserved,
+                custody_id: None,
+                claim_digest: None,
+            },
+            collateral: None,
+        };
+        assert!(unknown_without_owner
+            .validate_for_attempt(&wrong_attempt, &wrong_flight)
+            .is_ok());
     }
 
     #[test]
