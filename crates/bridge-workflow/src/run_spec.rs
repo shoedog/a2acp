@@ -6,9 +6,9 @@
 
 use crate::graph::{WorkflowGraph, WorkflowNode};
 use bridge_core::execution_policy::{
-    validate_node_execution_identity_v1, FrozenNodeExecutionIdentityV1, FrozenR2f1bContractV1,
-    FrozenWorkflowControlsV1, LedgerAdmissionV1, PolicyNodeRefV1, Sha256HexV1,
-    EXECUTION_POLICY_SCHEMA_V1,
+    validate_node_execution_identity_v1, DeadlineActivationV2, FrozenNodeExecutionIdentityV1,
+    FrozenR2f1bContractV1, FrozenWorkflowControlsV1, LedgerAdmissionV1, PolicyNodeRefV1,
+    Sha256HexV1, EXECUTION_POLICY_SCHEMA_V1,
 };
 use bridge_core::ids::{AttemptId, AttemptIdentity};
 use bridge_core::SessionCwd;
@@ -181,6 +181,81 @@ impl WorkflowSnapshotV3 {
         }
         Ok(())
     }
+
+    /// The effective workload/calibration identity of this attempt (R2f1b gate
+    /// §2.6).
+    ///
+    /// The frozen delivery-spec `workload_fingerprint` commits graph, controls,
+    /// retries, and frozen node/provider identities, but the R2f1b contract is
+    /// wrapped OUTSIDE it. For an automatically timed attempt the identity must
+    /// additionally commit the explicit activation and the validated contract
+    /// fingerprint, so automatic observations can never be pooled with manual
+    /// ones (or with a different custody/resource contract).
+    ///
+    /// `ManualOnlyR2f1a` returns the historical fingerprint verbatim, and that
+    /// is deliberate on two grounds. It is a compatibility contract: persisted
+    /// history/calibration rows already group by that exact string, so binding
+    /// it would silently re-partition every historical grouping. It is also the
+    /// only grouping that survives at all — `WorktreeCustodyIdV1` is randomly
+    /// minted per attempt and feeds `contract_fingerprint`, so a bound manual
+    /// identity would be unique per attempt and pool nothing. Manual attempts
+    /// remain protected against custody substitution by
+    /// `FrozenR2f1bContractV1::validate` and by `validate_successor`'s
+    /// byte-exact contract comparison, not by the workload identity.
+    ///
+    /// Both inputs are persisted, forgeable fields, so this refuses rather than
+    /// computing over unverified bytes: `validate` re-derives the delivery
+    /// fingerprints and revalidates the contract fingerprint first.
+    pub fn workload_identity(&self) -> Result<String, RunSpecError> {
+        self.validate()?;
+        Ok(match self.r2f1b.activation {
+            DeadlineActivationV2::ManualOnlyR2f1a => {
+                self.delivery_spec.workload_fingerprint.clone()
+            }
+            DeadlineActivationV2::AutomaticR2f1b => bound_workload_fingerprint_v2(
+                &self.delivery_spec.workload_fingerprint,
+                self.r2f1b.activation,
+                &self.r2f1b.contract_fingerprint,
+            ),
+        })
+    }
+}
+
+/// Domain prefix for the R2f1b-bound workload identity. Separated from BOTH the
+/// manual computation (`a2a-bridge/workflow-run-spec/v1`, emitted under the
+/// `shape-` prefix that `bridge_core::workflow_history::fingerprint_workload_shape`
+/// also emits) and the contract-hash algorithm (`FrozenR2f1bContractV1`'s
+/// unprefixed canonical-JSON digest).
+const BOUND_WORKLOAD_DOMAIN_V2: &[u8] = b"a2a-bridge/workflow-run-spec/bound-workload/v2";
+
+/// Version 2 of the workload identity: the frozen V1 workload fingerprint bound
+/// to an explicit deadline activation and a validated R2f1b contract
+/// fingerprint, under its own domain and its own `bound-` output prefix.
+///
+/// `activation` is committed EXPLICITLY even though it is also an input to
+/// `contract_fingerprint`: gate §2.6 keeps the manual/automatic semantic
+/// boundary auditable in this buffer, independent of the contract-hash
+/// algorithm. Callers wanting the identity of a durable attempt should use
+/// [`WorkflowSnapshotV3::workload_identity`], which selects by activation and
+/// validates both inputs first; this free function is the raw computation.
+#[must_use]
+pub fn bound_workload_fingerprint_v2(
+    workload_fingerprint: &str,
+    activation: DeadlineActivationV2,
+    contract_fingerprint: &Sha256HexV1,
+) -> String {
+    let mut canonical = Vec::new();
+    push_bytes(&mut canonical, BOUND_WORKLOAD_DOMAIN_V2);
+    push_bytes(&mut canonical, workload_fingerprint.as_bytes());
+    push_bytes(
+        &mut canonical,
+        match activation {
+            DeadlineActivationV2::ManualOnlyR2f1a => b"manual_only_r2f1a".as_slice(),
+            DeadlineActivationV2::AutomaticR2f1b => b"automatic_r2f1b".as_slice(),
+        },
+    );
+    push_bytes(&mut canonical, contract_fingerprint.as_str().as_bytes());
+    digest_with_prefix("bound-", &canonical)
 }
 
 fn push_bytes(target: &mut Vec<u8>, value: &[u8]) {
