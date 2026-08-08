@@ -224,6 +224,22 @@ lease-based destructive boundary (S4); `is_cargo_target` plantability narrowed-n
 consumer line is never reap-eligibility. Checkpoint-phase reap gating REJECTED with reason (strands
 crashed-`InLoop` runs; pid-alive covers the live-consumer invariant).
 
+**S5 review ledger (2026-08-08, verdict SHIP, 0 WRONG):** verify containers run unnamed/unlabelled
+(`compose_verify` passes no labels) — a SIGKILLed bridge orphans a live volume writer that the
+kernel-freed flock no longer excludes; cheapest close = name + `a2a.*`-label verify containers so the
+ADR-0021 label reaper sees them (small follow-up). `warm_cache == verify.cache` config aliasing would
+share one volume across the locked and unlocked paths — cheapest close = parse-time rejection; the warm
+LSP volume itself is also unlocked across concurrent same-repo implements (the S5 defect one volume
+over — future slice). `flock_nb`'s probe does not retry EINTR (no known trigger; recorded). Promote the
+single-blocking-waiter deadlock argument to the acquisition docstring when next touched.
+
+**Backlog disposition record (2026-08-08):** forensic triage of the 81 parked clones proved 68 were
+chained-provenance artifacts (origin = sibling clone). Owner rulings: S4b builds the §3 disposition
+license + chained-origin root resolution; bulk-disposition authorized for the landed/evolved population
+EXCLUDING the 3 stockTrading/quant clones (owner hold), the live-pid clone, the 4 ambiguous partials, and
+the 5 genuinely unlanded clones — whose HEADs are preserved as `rescue/impl-*` branches in the source
+repo (wedge-watchdog, strip-process-narration ×2, R2f1b source-guard fix, corruption-fixture repair).
+
 **Slice-2 obligations surfaced by the A3 review (2026-08-07):** no production code reads
 `FrozenR2f1bContractV1.activation` — an `AutomaticR2f1b` contract can today be minted, encoded, decoded,
 and validated without refusal, so "AutomaticR2f1b remains unconstructible" holds by convention only.
