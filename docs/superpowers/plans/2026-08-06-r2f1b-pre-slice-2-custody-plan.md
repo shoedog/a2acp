@@ -215,6 +215,15 @@ same-parent swap window (descriptor pinning → S3; "race closed" claims removed
 (folded into the final repair), CLI/runtime seam tests (S3), volume labels (S3), non-UTF-8 fixture
 unverifiable on APFS (Linux CI exercises it).
 
+**S3 dual-review deferrals (2026-08-07, record at
+`docs/superpowers/reviews/2026-08-07-s3-dual-review.md`):** descriptor-relative recursive deletion lands
+with A4's `fs_custody` primitives (owner-concurred deferral of Sol's blocker grading — hostile
+concurrent-host-actor trigger, rare); D-4 admission CLI fixture test; `ReportItem` discriminated
+source/kind field (S4 — destructive code must not infer volume-vs-path); worktree payloads need a
+lease-based destructive boundary (S4); `is_cargo_target` plantability narrowed-not-closed; the report's
+consumer line is never reap-eligibility. Checkpoint-phase reap gating REJECTED with reason (strands
+crashed-`InLoop` runs; pid-alive covers the live-consumer invariant).
+
 **Slice-2 obligations surfaced by the A3 review (2026-08-07):** no production code reads
 `FrozenR2f1bContractV1.activation` — an `AutomaticR2f1b` contract can today be minted, encoded, decoded,
 and validated without refusal, so "AutomaticR2f1b remains unconstructible" holds by convention only.
