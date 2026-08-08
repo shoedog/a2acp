@@ -203,8 +203,17 @@ volume ownership stays name-prefix until S3 labels volumes at creation (foreign 
 misattributed — disclosed in the report's notes); non-UTF-8 directory entries in bridge roots are skipped
 (S3/S4 destructive code must refuse ambiguity independently); the `storage_cmd`/`storage_runtime_pass`
 CLI orchestration lacks seam-injected behavioral tests (S3 adds them with the reaper seams). Also carried:
-`shorten_bounded_cause`'s outer loop is measured-unreachable defensive dead code under current byte-budget
-constants (A3 evidence, 1702-byte worst case vs 2048 cap).
+`shorten_bounded_cause`'s outer loop (and the `NodeTerminalV1` twin) is unreachable defensive dead code —
+production's own `DERIVED_NODE_CLEANUP_RECORD_WORST_CASE_BYTES = 1936` const-assert is what makes it so.
+
+**Slice-2 obligations surfaced by the A3 review (2026-08-07):** no production code reads
+`FrozenR2f1bContractV1.activation` — an `AutomaticR2f1b` contract can today be minted, encoded, decoded,
+and validated without refusal, so "AutomaticR2f1b remains unconstructible" holds by convention only.
+Slice 2 must add the production refusal (validate/decode-level guard) with fail-first tests. Also for A4:
+extract the fingerprint placeholder literal (three copies: execution_policy.rs:318/:341 + the A3 test
+helper) into one `pub(crate)` const; the A3 golden-fingerprint test pins the algorithm meanwhile.
+`validate_successor`'s `(0, _)` reused-attempt disjunct at run_spec.rs:162 is dead in production
+(dominated by the parent/ordinal checks) — carried as a note, not a defect.
 
 ## 10. Corrections from revision 2 (audit trail)
 
