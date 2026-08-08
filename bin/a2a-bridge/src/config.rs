@@ -455,6 +455,39 @@ impl Default for TracesToml {
     }
 }
 
+fn default_admission_floor_gib() -> u64 {
+    crate::storage_reap::DEFAULT_ADMISSION_FLOOR_GIB
+}
+
+/// `[storage]` (R2f1b custody plan §6): the D-4 admission floor and the D-2 protected roots.
+///
+/// Deliberately two keys. The plan removed the watermark ladder, reservations, quotas and per-repo
+/// caps as W2/W4/W5 corrections — there is ONE floor, and protected roots are declared by canonical
+/// identity rather than inferred from prefix, age, or size.
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StorageToml {
+    /// Refuse to START a new implement run when the data volume has less than this many GiB free.
+    /// `0` disables the check — the deliberate operator opt-out, since an unmeasurable volume is
+    /// otherwise refused rather than assumed empty.
+    #[serde(default = "default_admission_floor_gib")]
+    pub admission_floor_gib: u64,
+    /// D-2 protected roots. The reapers hard-refuse anything at, inside, or containing one of these,
+    /// before classification. User working checkouts, release/rollback artifacts, and the
+    /// stockTrading/quant-platform repositories belong here.
+    #[serde(default)]
+    pub protected_roots: Vec<String>,
+}
+
+impl Default for StorageToml {
+    fn default() -> Self {
+        Self {
+            admission_floor_gib: default_admission_floor_gib(),
+            protected_roots: Vec::new(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TracesConfig {
     pub enabled: bool,
@@ -552,6 +585,9 @@ pub struct RegistryConfig {
     pub metrics: MetricsToml,
     #[serde(default)]
     pub traces: TracesToml,
+    /// `[storage]` (R2f1b S3): D-4 admission floor + D-2 protected roots.
+    #[serde(default)]
+    pub storage: StorageToml,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]

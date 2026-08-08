@@ -1856,10 +1856,14 @@ pub fn render_text(r: &StorageReport) -> String {
 
 pub const STORAGE_USAGE: &str = "\
 usage: a2a-bridge storage report [--config <f>] [--json]
+       a2a-bridge storage reap --build-targets [--dry-run] [--config <f>] [--json]
 
-Audit bridge-owned storage. READ-ONLY, and not a reaper: it deletes nothing, pushes nothing, and
-fetches nothing — it is the instrument the storage reapers are gated on. Its findings are
-OBSERVATIONS, never deletion authority: S3/S4 own that and re-probe at the destructive boundary.
+`report` audits bridge-owned storage. READ-ONLY, and not a reaper: it deletes nothing, pushes nothing,
+and fetches nothing — it is the instrument the storage reapers are gated on. Its findings are
+OBSERVATIONS, never deletion authority: the reapers own that and re-probe at the destructive boundary.
+
+`reap` is DESTRUCTIVE (see `a2a-bridge storage reap --help`): it removes completed runs' build targets
+and per-run dependency caches, and nothing else, after re-checking every gate at the boundary.
 
   report              walk this config's bridge-owned roots (`<allowed_cwd_root>/.a2a-implement` and,
                       when `[worktrees]` is enabled, its root), classify every item

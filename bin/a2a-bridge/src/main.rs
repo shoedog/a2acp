@@ -61,6 +61,7 @@ mod local_file;
 mod route;
 mod slice;
 mod smoke;
+mod storage_reap;
 mod storage_report;
 
 pub(crate) use bridge_controller::{
@@ -191,6 +192,9 @@ SUBCOMMANDS:
   containers          List / reap this config's managed containers (crash-orphan cleanup).  list | reap
   storage report      READ-ONLY audit of bridge-owned storage: payload class, bytes, live consumers,
                       git HEAD + source/origin containment, totals, free space.  [--config <f>] [--json]
+  storage reap        DESTRUCTIVE. Delete completed runs' build targets / dependency caches after
+                      boundary gates (held operation lock, pinned root, live-consumer probe).
+                      --build-targets [--dry-run] [--config <f>] [--json]
   submit              Send a unary message.  [skill] --input <file> [--context <id>] [--agent <id>] [--model <m>] [--effort <e>] [--mode <m>] [--cwd <dir>]
   task                Durable task store.  get | list | cancel | watch
   session             Warm session control.  status | release | cancel | clear | compact <contextId>
@@ -3091,6 +3095,17 @@ async fn implement_cmd(args: &[String]) -> Result<(), BoxError> {
 
     // R6: probe the EXISTING root for an enclosing worktree BEFORE creating .a2a-implement.
     implement::assert_dest_outside_worktree(&root)?;
+
+    // D-4 admission floor (custody plan §2/§6): refuse to START a new run when the data volume has
+    // less than `[storage].admission_floor_gib` (default 50) free. Checked on `root` — the volume that
+    // will hold the quarantine clone, its build target, and every verify artifact this run produces —
+    // and BEFORE `.a2a-implement` or the clone is created, so a refusal leaves no partial run behind.
+    //
+    // Deliberately not wired into resume, serve, or the workflow paths in this slice: D-4 gates
+    // STARTING a new run, and a resume continues one that already exists (its clone is already on
+    // disk, so refusing it would strand work rather than prevent it).
+    storage_reap::admit_new_run(&root, cfg.storage.admission_floor_gib)
+        .map_err(|e| format!("implement: {e}"))?;
 
     // B2b-3b: resolve the loop config PRE-CLONE so a malformed [implement] fails loud before any quarantine
     // clone is created. Absent → LoopConfig::default() (loop ON, max_attempts=3). `fix_graph` is resolved
@@ -6768,20 +6783,22 @@ fn storage_cmd(args: &[String]) -> Result<(), BoxError> {
         println!("{}", sr::STORAGE_USAGE);
         return Ok(());
     }
-    // The subcommand is REQUIRED, not defaulted: `storage` is about to grow destructive verbs (S3/S4),
-    // and a bare `a2a-bridge storage` that silently means one of them later is a footgun worth refusing
-    // now, while `report` is the only one.
+    // The subcommand is REQUIRED, not defaulted: `storage` now carries a DESTRUCTIVE verb, and a bare
+    // `a2a-bridge storage` that silently meant one would be a footgun.
     let has_sub = args.first().map(|a| !a.starts_with("--")).unwrap_or(false);
     let Some(sub) = has_sub.then(|| args[0].as_str()) else {
         return Err(format!(
-            "storage: needs an action (expected: report)\n{}",
+            "storage: needs an action (expected: report | reap)\n{}",
             sr::STORAGE_USAGE
         )
         .into());
     };
+    if sub == "reap" {
+        return storage_reap_cmd(&args[1..]);
+    }
     if sub != "report" {
         return Err(format!(
-            "storage: unknown action {sub:?} (expected: report)\n{}",
+            "storage: unknown action {sub:?} (expected: report | reap)\n{}",
             sr::STORAGE_USAGE
         )
         .into());
@@ -6877,7 +6894,7 @@ fn storage_cmd(args: &[String]) -> Result<(), BoxError> {
 
     // Best-effort container-runtime pass: bridge-labeled volumes, plus the mount/lease evidence carried
     // by managed containers. An unreachable runtime is a NOTE, never a failure.
-    storage_runtime_pass(&raw, &config_path, &mut items, &mut notes);
+    let _runtimes = storage_runtime_pass(&raw, &config_path, &mut items, &mut notes);
 
     items.sort_by(|a, b| {
         (a.class, a.checkout_kind, &a.path).cmp(&(b.class, b.checkout_kind, &b.path))
@@ -6914,12 +6931,14 @@ fn storage_cmd(args: &[String]) -> Result<(), BoxError> {
 /// mark any scanned path that a managed container currently mounts (with that container's lease
 /// liveness). Every failure degrades to `unknown` + a note — the report must never fail because Docker
 /// is down. Only `volume ls` / `ps` are ever run; nothing is created or removed.
+/// Returns how many container runtimes this config declares — the reaper needs that count to decide
+/// whether an unanswered container axis is a blind spot (runtimes configured) or simply out of scope.
 fn storage_runtime_pass(
     raw_config: &str,
     config_path: &Path,
     items: &mut Vec<storage_report::ReportItem>,
     notes: &mut Vec<String>,
-) {
+) -> usize {
     use storage_report as sr;
 
     // Re-parsed rather than threaded in: `into_snapshot` consumes the config, and the caller still needs
@@ -6927,7 +6946,9 @@ fn storage_runtime_pass(
     let Ok(snapshot) = config::RegistryConfig::parse(raw_config).and_then(|c| c.into_snapshot())
     else {
         notes.push("config snapshot unavailable — container volumes not listed".into());
-        return;
+        // Zero runtimes KNOWN, not zero runtimes configured: the caller must treat an unparseable
+        // config as an uncovered container axis, never as "there are no containers".
+        return 0;
     };
     let owner_config_path =
         std::fs::canonicalize(config_path).unwrap_or_else(|_| config_path.to_path_buf());
@@ -7061,6 +7082,281 @@ fn storage_runtime_pass(
                 .into(),
         );
     }
+    runtimes.len()
+}
+
+/// The production [`storage_reap::ReapEnv`]: the real ADR-0025 operation flock, a real `lsof` probe,
+/// real `statvfs`, and a real recursive removal. Every one of these is behind the seam so the
+/// orchestration in `storage_reap` is testable without a host — the S2 fold review's carried demand.
+struct HostReapEnv;
+
+impl storage_reap::ReapEnv for HostReapEnv {
+    type Lock = bridge_core::liveness::PersistentLockGuard;
+
+    /// The SAME lock `implement_resume::acquire_operation_lock` and `merge` take: the namespace is
+    /// `<implement root>/.operation-locks/` and the id is the run directory's name. Reusing the exact
+    /// path is the point — a reaper holding a lock nobody else contends for gates nothing.
+    fn acquire_operation_lock(
+        &self,
+        implement_root: &Path,
+        run_id: &str,
+    ) -> Result<Self::Lock, storage_reap::LockFailure> {
+        if run_id.is_empty() || run_id.contains('/') || run_id == "." || run_id == ".." {
+            return Err(storage_reap::LockFailure::Unavailable(format!(
+                "run id {run_id:?} is not a single path component"
+            )));
+        }
+        let dir = implement_root.join(storage_report::OPERATION_LOCK_DIR);
+        bridge_core::liveness::acquire_persistent_lock_in(&dir, run_id).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::WouldBlock {
+                storage_reap::LockFailure::Contended
+            } else {
+                storage_reap::LockFailure::Unavailable(e.to_string())
+            }
+        })
+    }
+
+    /// `lsof -w -t +D <path>`: `+D` descends the tree and reports cwd, open-file and mmap holders;
+    /// `-t` prints pids only; `-w` suppresses advisory warnings so a NONEMPTY stderr means a genuine
+    /// failure rather than noise. The verdict itself is [`storage_reap::lsof_outcome`]'s — a pure
+    /// parser that never reads the exit status, because `lsof` exits 1 for "found nothing" AND for a
+    /// real error.
+    fn probe_consumers(&self, path: &Path) -> storage_reap::ConsumerProbe {
+        match std::process::Command::new("lsof")
+            .args(["-w", "-t", "+D"])
+            .arg(path)
+            .output()
+        {
+            Err(_) => storage_reap::lsof_outcome(storage_reap::LsofStatus::NotSpawned, "", ""),
+            Ok(o) => {
+                // `Ok` only means the child was reaped, not that it ran to completion: a signalled
+                // `lsof` yields `code() == None`, and its empty output must never read as "idle".
+                let status = match o.status.code() {
+                    Some(c) => storage_reap::LsofStatus::Exited(c),
+                    None => storage_reap::LsofStatus::Signaled(signal_of(&o.status)),
+                };
+                storage_reap::lsof_outcome(
+                    status,
+                    &String::from_utf8_lossy(&o.stdout),
+                    &String::from_utf8_lossy(&o.stderr),
+                )
+            }
+        }
+    }
+
+    /// `kill(pid, 0)`: `Ok` ⇒ alive, `EPERM` ⇒ alive (a process we may not signal is still running),
+    /// `ESRCH` ⇒ dead. Any other errno is UNKNOWN, which parks rather than guessing.
+    fn process_alive(&self, pid: u32) -> storage_reap::PidLiveness {
+        // SAFETY: `kill` with signal 0 performs the permission/existence check only; it delivers
+        // nothing and cannot affect the target.
+        let rc = unsafe { libc::kill(pid as libc::pid_t, 0) };
+        if rc == 0 {
+            return storage_reap::PidLiveness::Alive;
+        }
+        match std::io::Error::last_os_error().raw_os_error() {
+            Some(libc::EPERM) => storage_reap::PidLiveness::Alive,
+            Some(libc::ESRCH) => storage_reap::PidLiveness::Dead,
+            other => storage_reap::PidLiveness::Unknown(format!(
+                "kill({pid}, 0) failed with errno {other:?}"
+            )),
+        }
+    }
+
+    fn free_bytes(&self, path: &Path) -> Option<u64> {
+        storage_report::filesystem_space(path).0
+    }
+
+    fn remove_tree(&self, path: &Path) -> Result<(), String> {
+        std::fs::remove_dir_all(path).map_err(|e| e.to_string())
+    }
+
+    fn now_epoch_secs(&self) -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
+    }
+
+    fn write_intent(&self, evidence_dir: &Path, json: &str) -> Result<String, String> {
+        self.write_durable(evidence_dir, "storage-reap-intent", json)
+    }
+
+    fn write_receipt(&self, evidence_dir: &Path, json: &str) -> Result<String, String> {
+        self.write_durable(evidence_dir, "storage-reap", json)
+    }
+
+    fn progress(&self, message: &str) {
+        eprintln!("storage reap: {message}");
+    }
+}
+
+impl HostReapEnv {
+    /// Write + FSYNC an evidence file, then fsync its parent directory. Both barriers matter for the
+    /// intent record: an unsynced file can survive a crash as a zero-length entry, and an unsynced
+    /// parent can lose the directory entry entirely — either way the record we crashed to preserve
+    /// would not be there.
+    fn write_durable(&self, dir: &Path, stem: &str, json: &str) -> Result<String, String> {
+        use std::io::Write as _;
+        std::fs::create_dir_all(dir).map_err(|e| format!("mkdir {}: {e}", dir.display()))?;
+        let name = format!(
+            "{stem}-{}-{}.json",
+            storage_reap::ReapEnv::now_epoch_secs(self),
+            std::process::id()
+        );
+        let path = dir.join(name);
+        let mut f =
+            std::fs::File::create(&path).map_err(|e| format!("create {}: {e}", path.display()))?;
+        f.write_all(json.as_bytes())
+            .map_err(|e| format!("write {}: {e}", path.display()))?;
+        f.sync_all()
+            .map_err(|e| format!("fsync {}: {e}", path.display()))?;
+        drop(f);
+        // Directory barrier: publishes the entry itself.
+        if let Ok(d) = std::fs::File::open(dir) {
+            let _ = d.sync_all();
+        }
+        Ok(path.to_string_lossy().into_owned())
+    }
+}
+
+/// The signal number that terminated a child, for the `lsof` admissibility check.
+#[cfg(unix)]
+fn signal_of(status: &std::process::ExitStatus) -> i32 {
+    use std::os::unix::process::ExitStatusExt as _;
+    status.signal().unwrap_or(0)
+}
+
+#[cfg(not(unix))]
+fn signal_of(_status: &std::process::ExitStatus) -> i32 {
+    0
+}
+
+/// Execute `a2a-bridge storage reap --build-targets [--dry-run]` — the FIRST destructive authority in
+/// the storage system (custody plan §3 S3).
+///
+/// It scans ONLY `<allowed_cwd_root>/.a2a-implement`, because that is the root whose runs have an
+/// operation lock to hold across the destructive boundary. `[worktrees]` payloads are deliberately not
+/// enumerated here: their custody handle is the ADR-0025 sidecar lease, not the operation lock, and
+/// inventing a boundary for them would be a different gate — recorded for S4 rather than guessed at.
+fn storage_reap_cmd(args: &[String]) -> Result<(), BoxError> {
+    use storage_reap as rp;
+    use storage_report as sr;
+
+    if args.iter().any(|a| a == "--help" || a == "-h") {
+        println!("{}", rp::REAP_USAGE);
+        return Ok(());
+    }
+    let mut config: Option<PathBuf> = None;
+    let mut json = false;
+    let mut dry_run = false;
+    let mut build_targets = false;
+    let mut it = args.iter();
+    while let Some(f) = it.next() {
+        match f.as_str() {
+            "--config" => {
+                config = Some(PathBuf::from(
+                    it.next().ok_or("storage reap: --config needs a value")?,
+                ))
+            }
+            "--json" => json = true,
+            "--dry-run" => dry_run = true,
+            "--build-targets" => build_targets = true,
+            other => {
+                return Err(
+                    format!("storage reap: unknown flag {other:?}\n{}", rp::REAP_USAGE).into(),
+                );
+            }
+        }
+    }
+    // No default payload class. `storage reap` with no class named is refused rather than interpreted:
+    // this command deletes, and an operator who did not say what must not have it inferred.
+    if !build_targets {
+        return Err(format!(
+            "storage reap: refusing to run without --build-targets (there is no default payload \
+             class for a destructive command)\n{}",
+            rp::REAP_USAGE
+        )
+        .into());
+    }
+
+    let config_path = require_config_path(config)?;
+    let raw = std::fs::read_to_string(&config_path)
+        .map_err(|e| format!("storage reap: read config {config_path:?}: {e}"))?;
+    let cfg = config::RegistryConfig::parse(&raw)
+        .map_err(|e| format!("storage reap: config parse: {e}"))?;
+
+    let mut notes: Vec<String> = Vec::new();
+    // D-2 roots are resolved BEFORE the scan: a root we cannot identify refuses the whole command.
+    let protected = rp::ProtectedRoots::resolve(&cfg.storage.protected_roots, &mut notes)
+        .map_err(|e| format!("storage reap: {e}"))?;
+    if protected.is_empty() {
+        // Disclosed rather than assumed benign: containment inside the pinned scan root is still
+        // enforced, but no D-2 root is declared, so the operator's own list is doing no work here.
+        notes.push(
+            "no `[storage].protected_roots` are configured — the D-2 refusal has nothing to match, \
+             and only the pinned-scan-root containment gate is limiting this reap's blast radius"
+                .into(),
+        );
+    }
+
+    let root = cfg
+        .allowed_cwd_root
+        .as_deref()
+        .ok_or("storage reap: config needs allowed_cwd_root (the implement root's anchor)")?;
+    let canon = std::fs::canonicalize(root)
+        .map_err(|e| format!("storage reap: allowed_cwd_root {root:?}: {e}"))?;
+    let impl_dir = canon.join(".a2a-implement");
+    let verified = sr::verify_root(&impl_dir).map_err(|e| format!("storage reap: {e}"))?;
+
+    let mut items = sr::scan_implement_root(&verified, &mut notes);
+    // The container pass is a GATE INPUT, not decoration: a container that mounts a payload is a live
+    // consumer, and `resolve_mount` refuses to answer `free` unless every configured runtime answered.
+    let runtimes_configured = storage_runtime_pass(&raw, &config_path, &mut items, &mut notes);
+
+    let mut report = rp::reap_build_targets(
+        rp::ReapRequest {
+            scan_root: &verified,
+            items: &items,
+            protected: &protected,
+            dry_run,
+            runtimes_configured,
+        },
+        &HostReapEnv,
+    );
+    report.notes.splice(0..0, notes);
+    report.notes.push(
+        "scope: this reap covers the `.a2a-implement` root only. `[worktrees]` payloads are not \
+         enumerated here — a worktree's custody handle is the ADR-0025 sidecar lease, and neither \
+         of this command's run-idleness gates (the `impl-<pid>-<nonce>` owner probe and the per-run \
+         operation lock) applies to one."
+            .into(),
+    );
+    if runtimes_configured == 0 {
+        report.notes.push(
+            "container axis NOT COVERED: no container runtime is configured, so no container was \
+             asked whether it mounts these payloads. The host open-file probe runs on the host \
+             kernel and cannot see inside a container VM."
+                .into(),
+        );
+    }
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        print!("{}", rp::render_text(&report));
+    }
+    // A reap whose record was lost is not a successful reap. Reducing this to a printed note would
+    // let an automated caller read a zero exit status as "reaped and recorded".
+    if !report.receipt_failures.is_empty() {
+        return Err(format!(
+            "storage reap: payloads were removed but {} receipt(s) could not be written — the \
+             durable record of this reap is incomplete: {}",
+            report.receipt_failures.len(),
+            report.receipt_failures.join("; ")
+        )
+        .into());
+    }
+    Ok(())
 }
 
 async fn mcp_cmd(args: &[String]) -> Result<(), BoxError> {
@@ -9230,6 +9526,32 @@ async fn main() -> Result<(), BoxError> {
 mod cli_tests {
     use super::*;
     use crate::turn::TurnRunner;
+
+    /// Discriminates a `storage reap` that defaults to a payload class. This command deletes; an
+    /// operator who did not name what may reap must get a refusal, not an inference. Asserted BEFORE
+    /// any config is read, so the refusal cannot depend on a well-formed environment.
+    #[test]
+    fn storage_reap_refuses_to_run_without_a_named_payload_class() {
+        let e = storage_reap_cmd(&["--dry-run".to_string()])
+            .expect_err("a classless reap was accepted");
+        let msg = e.to_string();
+        assert!(msg.contains("--build-targets"), "unexpected refusal: {msg}");
+        assert!(
+            msg.contains("no default payload class"),
+            "the refusal does not say why: {msg}"
+        );
+    }
+
+    /// Discriminates a `storage` dispatcher that silently swallows an unknown verb, and one whose
+    /// help/usage still advertises `report` as the only action after `reap` landed.
+    #[test]
+    fn storage_dispatch_names_both_actions_and_refuses_an_unknown_one() {
+        let e = storage_cmd(&["compact".to_string()]).expect_err("unknown action was accepted");
+        assert!(e.to_string().contains("report | reap"), "{e}");
+        let e = storage_cmd(&[]).expect_err("a bare `storage` was accepted");
+        assert!(e.to_string().contains("report | reap"), "{e}");
+        assert!(storage_report::STORAGE_USAGE.contains("storage reap --build-targets"));
+    }
 
     #[test]
     fn submit_failure_prefers_deepest_sanitized_cause_then_bounded_code() {
