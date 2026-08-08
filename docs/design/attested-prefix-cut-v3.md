@@ -1562,5 +1562,9 @@ These conditions are mechanical. A reviewer or automated judge needs no judgment
 6. **§4.4 citation correction:** the request-send seam is `ConnectionTo::send_request` at
    `jsonrpc.rs:2341`.
 7. **Off-mode audit exemption:** §18-4's regardless-of-ok clause applies to enabled-mode
-   completions; workflows with zero enabled nodes produce no durable audit rows —
-   operator-adjudicated 2026-07-26, pending owner ratification.
+   completions. Audit rows are durable exactly when `audit_required` holds — an enabled
+   node exists **outside the resume seed**. Workflows with zero enabled nodes, and
+   resumes whose enabled nodes are all seeded (nothing runs; seeded outputs are never
+   re-sanitized, §15.2 criterion 17), produce no durable audit rows — operator-adjudicated
+   2026-07-26, owner-ratified 2026-08-07 (wording per implnotes MAJOR-3/MINOR-7
+   resolution).
