@@ -48,6 +48,7 @@
 //! testable — the carried demand from the S2 fold review.
 
 use crate::storage_report as sr;
+use bridge_core::fs_custody;
 use std::path::{Path, PathBuf};
 
 // ---------------------------------------------------------------------------------------------
@@ -1179,55 +1180,54 @@ pub(crate) fn park(it: &sr::ReportItem, reason: ParkReason) -> ReapItem {
     }
 }
 
-/// `(dev, ino)` of a real directory at `path`. A symlink or non-directory is an error, never a
-/// silently-followed success.
-#[cfg(unix)]
-pub(crate) fn dir_dev_ino(path: &Path) -> Result<(u64, u64), String> {
-    use std::os::unix::fs::MetadataExt as _;
-    let md = std::fs::symlink_metadata(path).map_err(|e| format!("{}: {e}", path.display()))?;
-    if md.file_type().is_symlink() {
-        return Err(format!("{} is a symlink", path.display()));
+/// Translate a payload-identity refusal into park vocabulary. The DETAIL text comes from the
+/// shared check that produced it; the `ParkReason` is the reapers' own reporting surface, which
+/// is why the mapping (and not the check) lives here. Shared with the clone reaper: both commands
+/// refuse an admission-time payload identity under exactly these three reasons, and a second copy
+/// would be a second place for that correspondence to drift.
+pub(crate) fn payload_identity_park_reason(
+    refusal: fs_custody::PayloadIdentityRefusalV1,
+) -> ParkReason {
+    match refusal {
+        fs_custody::PayloadIdentityRefusalV1::IsSymlink => ParkReason::PathIsSymlink,
+        fs_custody::PayloadIdentityRefusalV1::NotADirectory { detail } => {
+            ParkReason::PathNotADirectory { detail }
+        }
+        fs_custody::PayloadIdentityRefusalV1::IdentityChanged { detail } => {
+            ParkReason::PathIdentityChanged { detail }
+        }
     }
-    if !md.is_dir() {
-        return Err(format!("{} is not a directory", path.display()));
-    }
-    Ok((md.dev(), md.ino()))
 }
 
-#[cfg(not(unix))]
-pub(crate) fn dir_dev_ino(path: &Path) -> Result<(u64, u64), String> {
-    Err(format!(
-        "{}: filesystem identity (dev/ino) is unavailable on this platform, so a directory swap \
-         cannot be detected",
-        path.display()
-    ))
-}
-
-/// Re-verify that the pinned scan root's PATH still resolves to the descriptor we pinned. This is the
-/// swap check: an attacker controlling the parent can rename the root away and put another directory
-/// in its place, and every path-based operation would then land in the replacement.
-pub(crate) fn pinned_root_unchanged(
-    pin: &bridge_core::fs_custody::PinnedDirectoryV1,
-) -> Result<(), String> {
-    let (dev, ino) = dir_dev_ino(pin.canonical_path())?;
-    let want = pin.identity();
-    if want.dev != Some(dev) || want.ino != Some(ino) {
-        return Err(format!(
-            "pinned scan root {} now resolves to a different directory (dev/ino {dev}/{ino}, pinned \
-             {:?}/{:?})",
-            pin.canonical_path().display(),
-            want.dev,
-            want.ino
-        ));
+/// As above, for the LAST recheck immediately before a removal. Shared with the clone reaper:
+/// both commands park a refused removal under exactly these three reasons.
+pub(crate) fn removal_boundary_park_reason(
+    refusal: fs_custody::RemovalBoundaryRefusalV1,
+) -> ParkReason {
+    match refusal {
+        fs_custody::RemovalBoundaryRefusalV1::RootIdentityChanged { detail } => {
+            ParkReason::ScanRootIdentityChanged { detail }
+        }
+        fs_custody::RemovalBoundaryRefusalV1::PayloadIdentityChanged { detail } => {
+            ParkReason::PathIdentityChanged { detail }
+        }
+        fs_custody::RemovalBoundaryRefusalV1::PayloadNotADirectory { detail } => {
+            ParkReason::PathNotADirectory { detail }
+        }
     }
-    Ok(())
 }
 
-pub(crate) fn root_identity_label(pin: &bridge_core::fs_custody::PinnedDirectoryV1) -> String {
-    let id = pin.identity();
-    match (id.dev, id.ino) {
-        (Some(d), Some(i)) => format!("dev {d} / ino {i}"),
-        _ => "unavailable".to_string(),
+/// What the removal actually did, in this command's outcome vocabulary. A reported success with
+/// the payload still present is NOT success, and a reported failure with the payload gone means
+/// we cannot attest what was removed.
+pub(crate) fn removal_item_outcome(observation: fs_custody::RemovalObservationV1) -> ItemOutcome {
+    match observation {
+        fs_custody::RemovalObservationV1::Removed => ItemOutcome::Deleted,
+        fs_custody::RemovalObservationV1::ReportedSuccessButPresent { detail }
+        | fs_custody::RemovalObservationV1::Failed { detail } => ItemOutcome::Partial { detail },
+        fs_custody::RemovalObservationV1::ReportedFailureButGone { detail } => {
+            ItemOutcome::Unknown { detail }
+        }
     }
 }
 
@@ -1308,36 +1308,19 @@ fn gate_one<'a>(
     }
 
     // 1. The pinned root must still be the root we pinned.
-    if let Err(detail) = pinned_root_unchanged(pin) {
+    if let Err(detail) = fs_custody::pinned_root_unchanged(pin) {
         bail!(ParkReason::ScanRootIdentityChanged { detail });
     }
     gates.push(format!(
         "scan root: descriptor-pinned and re-verified ({})",
-        root_identity_label(pin)
+        fs_custody::root_identity_label(pin)
     ));
 
     // 2. Path identity: a real directory, not a symlink, still resolving to itself.
-    let identity = match dir_dev_ino(&path) {
+    let identity = match fs_custody::verify_payload_directory_identity(&path) {
         Ok(id) => id,
-        Err(detail) => {
-            if std::fs::symlink_metadata(&path)
-                .map(|m| m.file_type().is_symlink())
-                .unwrap_or(false)
-            {
-                bail!(ParkReason::PathIsSymlink);
-            }
-            bail!(ParkReason::PathNotADirectory { detail });
-        }
+        Err(refusal) => bail!(payload_identity_park_reason(refusal)),
     };
-    match std::fs::canonicalize(&path) {
-        Ok(c) if c == path => {}
-        Ok(c) => bail!(ParkReason::PathIdentityChanged {
-            detail: format!("{} now resolves to {}", path.display(), c.display()),
-        }),
-        Err(e) => bail!(ParkReason::PathIdentityChanged {
-            detail: format!("{} has no canonical path: {e}", path.display()),
-        }),
-    }
     gates.push(format!(
         "path identity: real directory, no symlink, dev {} / ino {}",
         identity.0, identity.1
@@ -1459,58 +1442,43 @@ fn remove_one<E: ReapEnv>(
     let path = g.path.clone();
     let identity = g.identity;
 
-    if let Err(detail) = pinned_root_unchanged(pin) {
-        return g.parked(ParkReason::ScanRootIdentityChanged { detail });
-    }
-    match dir_dev_ino(&path) {
-        Ok(now) if now == identity => {}
-        Ok(now) => {
-            return g.parked(ParkReason::PathIdentityChanged {
-                detail: format!(
-                "{} changed identity between the gates and the removal (dev/ino {}/{} to {}/{})",
-                path.display(),
-                identity.0,
-                identity.1,
-                now.0,
-                now.1
-            ),
-            })
+    // The boundary gate line is appended INSIDE the act, in the same position the clone reaper
+    // uses: it records a recheck that has already passed, and it must never appear on a record
+    // whose removal was refused. Recording it here rather than after the call also makes the
+    // ordering observable — a fake env sees the line recorded before `remove_tree` runs.
+    let mut boundary_gate = None;
+    let mut freed_bytes_measured = None;
+    let verified = fs_custody::verify_then_remove(pin, &path, identity, || {
+        boundary_gate = Some(
+            "boundary recheck: root and payload identity unchanged immediately before removal"
+                .to_string(),
+        );
+        let before = env.free_bytes(pin.canonical_path());
+        let removal = env.remove_tree(&path);
+        let after = env.free_bytes(pin.canonical_path());
+        freed_bytes_measured = match (before, after) {
+            (Some(b), Some(a)) => Some(a as i64 - b as i64),
+            _ => None,
+        };
+        removal
+    });
+
+    let (observation, root_changed_during) = match verified {
+        fs_custody::VerifiedRemovalV1::Refused(refusal) => {
+            return g.parked(removal_boundary_park_reason(refusal))
         }
-        Err(detail) => return g.parked(ParkReason::PathNotADirectory { detail }),
-    }
+        fs_custody::VerifiedRemovalV1::Acted {
+            observation,
+            root_changed_during,
+        } => (observation, root_changed_during),
+    };
 
     let mut out = g.base(ItemOutcome::Planned);
-    out.gates.push(
-        "boundary recheck: root and payload identity unchanged immediately before removal"
-            .to_string(),
-    );
-
-    let before = env.free_bytes(pin.canonical_path());
-    let removal = env.remove_tree(&path);
-    let after = env.free_bytes(pin.canonical_path());
-    out.freed_bytes_measured = match (before, after) {
-        (Some(b), Some(a)) => Some(a as i64 - b as i64),
-        _ => None,
-    };
-    let gone = std::fs::symlink_metadata(&path).is_err();
-    out.outcome = match (removal, gone) {
-        (Ok(()), true) => ItemOutcome::Deleted,
-        // Reported success, payload still there: not success.
-        (Ok(()), false) => ItemOutcome::Partial {
-            detail: format!(
-                "the removal reported success but {} is still present",
-                path.display()
-            ),
-        },
-        // Reported failure, payload still there: a genuine partial removal.
-        (Err(e), false) => ItemOutcome::Partial { detail: e },
-        // Reported failure, payload gone: we cannot attest WHAT was removed or how much of it.
-        (Err(e), true) => ItemOutcome::Unknown {
-            detail: format!("removal reported an error ({e}) but the path is gone"),
-        },
-    };
+    out.gates.extend(boundary_gate);
+    out.freed_bytes_measured = freed_bytes_measured;
+    out.outcome = removal_item_outcome(observation);
     // A root swapped DURING the removal means we cannot attest what the removal landed on.
-    if let Err(detail) = pinned_root_unchanged(pin) {
+    if let Some(detail) = root_changed_during {
         out.outcome = ItemOutcome::Unknown {
             detail: format!("the pinned scan root changed during the removal: {detail}"),
         };
@@ -1528,12 +1496,12 @@ fn write_run_intent<E: ReapEnv>(
     pin: &bridge_core::fs_custody::PinnedDirectoryV1,
     env: &E,
 ) -> Result<String, String> {
-    pinned_root_unchanged(pin)?;
+    fs_custody::pinned_root_unchanged(pin)?;
     let intent = ReapIntent {
         schema: INTENT_SCHEMA.to_string(),
         run_id: run_id.to_string(),
         scan_root: pin.canonical_path().to_string_lossy().into_owned(),
-        scan_root_identity: root_identity_label(pin),
+        scan_root_identity: fs_custody::root_identity_label(pin),
         at_epoch_secs: env.now_epoch_secs(),
         candidates: candidates.to_vec(),
     };
@@ -1550,7 +1518,7 @@ fn write_run_receipt<E: ReapEnv>(
     report: &mut ReapReport,
 ) {
     // Never write into a root we can no longer attest: the receipt would land in the replacement.
-    if let Err(detail) = pinned_root_unchanged(pin) {
+    if let Err(detail) = fs_custody::pinned_root_unchanged(pin) {
         let msg = format!(
             "receipt for run {run_id} NOT written: the pinned scan root changed ({detail})"
         );
@@ -1563,7 +1531,7 @@ fn write_run_receipt<E: ReapEnv>(
         schema: RECEIPT_SCHEMA.to_string(),
         run_id: run_id.to_string(),
         scan_root: pin.canonical_path().to_string_lossy().into_owned(),
-        scan_root_identity: root_identity_label(pin),
+        scan_root_identity: fs_custody::root_identity_label(pin),
         dry_run: false,
         at_epoch_secs: env.now_epoch_secs(),
         items: items.to_vec(),
@@ -1780,6 +1748,12 @@ mod tests {
         intents: Vec<(String, String)>,
         progress: Vec<String>,
         free: u64,
+        /// R4 ordering witness. `free_bytes` appends here; `remove_tree` records how many
+        /// `free_bytes` calls had already happened when it ran. The removal is bracketed by the
+        /// act closure that also records the boundary gate line, so `[1]` proves `remove_tree`
+        /// ran strictly INSIDE that bracket rather than before it.
+        free_bytes_witness: Vec<String>,
+        remove_after_free_bytes: Vec<usize>,
     }
 
     impl Journal {
@@ -1907,11 +1881,17 @@ mod tests {
             (self.probe.borrow_mut())(path)
         }
 
-        fn free_bytes(&self, _path: &Path) -> Option<u64> {
+        fn free_bytes(&self, path: &Path) -> Option<u64> {
+            self.j
+                .borrow_mut()
+                .free_bytes_witness
+                .push(path.display().to_string());
             Some(self.j.borrow().free)
         }
 
         fn remove_tree(&self, path: &Path) -> Result<(), String> {
+            let seen = self.j.borrow().free_bytes_witness.len();
+            self.j.borrow_mut().remove_after_free_bytes.push(seen);
             let held = !self.j.borrow().locks_held.is_empty();
             self.j
                 .borrow_mut()
@@ -2151,6 +2131,135 @@ mod tests {
             !item_for(&r, &f.target).gates.is_empty(),
             "no gate evidence"
         );
+    }
+
+    /// R2f1b A4 R5. Discriminates a drifted refusal->`ParkReason` correspondence in the three
+    /// mapping functions both reapers now share. They are the only place a typed custody refusal
+    /// becomes operator-visible park vocabulary, and a swapped arm (e.g. reporting a symlink as
+    /// `PathNotADirectory`) would silently change what an operator is told a boundary refused on
+    /// while every end-to-end test stayed green.
+    #[test]
+    fn the_shared_refusal_mappings_preserve_every_variants_park_vocabulary() {
+        use fs_custody::{
+            PayloadIdentityRefusalV1 as Pid, RemovalBoundaryRefusalV1 as Rb,
+            RemovalObservationV1 as Ro,
+        };
+
+        assert!(matches!(
+            payload_identity_park_reason(Pid::IsSymlink),
+            ParkReason::PathIsSymlink
+        ));
+        assert!(matches!(
+            payload_identity_park_reason(Pid::NotADirectory { detail: "d".into() }),
+            ParkReason::PathNotADirectory { detail } if detail == "d"
+        ));
+        assert!(matches!(
+            payload_identity_park_reason(Pid::IdentityChanged { detail: "d".into() }),
+            ParkReason::PathIdentityChanged { detail } if detail == "d"
+        ));
+
+        assert!(matches!(
+            removal_boundary_park_reason(Rb::RootIdentityChanged { detail: "d".into() }),
+            ParkReason::ScanRootIdentityChanged { detail } if detail == "d"
+        ));
+        assert!(matches!(
+            removal_boundary_park_reason(Rb::PayloadIdentityChanged { detail: "d".into() }),
+            ParkReason::PathIdentityChanged { detail } if detail == "d"
+        ));
+        assert!(matches!(
+            removal_boundary_park_reason(Rb::PayloadNotADirectory { detail: "d".into() }),
+            ParkReason::PathNotADirectory { detail } if detail == "d"
+        ));
+
+        assert!(matches!(
+            removal_item_outcome(Ro::Removed),
+            ItemOutcome::Deleted
+        ));
+        assert!(matches!(
+            removal_item_outcome(Ro::ReportedSuccessButPresent { detail: "d".into() }),
+            ItemOutcome::Partial { detail } if detail == "d"
+        ));
+        assert!(matches!(
+            removal_item_outcome(Ro::Failed { detail: "d".into() }),
+            ItemOutcome::Partial { detail } if detail == "d"
+        ));
+        assert!(matches!(
+            removal_item_outcome(Ro::ReportedFailureButGone { detail: "d".into() }),
+            ItemOutcome::Unknown { detail } if detail == "d"
+        ));
+    }
+
+    /// R2f1b A4 R4. Discriminates a boundary gate line recorded OUTSIDE the verified act — i.e.
+    /// appended after `verify_then_remove` returns, where it would also land on records whose
+    /// removal never ran. The line must accompany a removal that actually happened, and the
+    /// removal must sit strictly inside the act's `free_bytes` bracket.
+    ///
+    /// HONEST LIMIT: the gate line is a local `String`, invisible to the fake env, so "recorded
+    /// before the unlink" is proven indirectly — the recording opens the same act closure whose
+    /// first observable effect is the BEFORE `free_bytes`, and `remove_after_free_bytes == [1]`
+    /// shows the removal ran after exactly that one call. What is asserted directly is the
+    /// biconditional: the line appears on the removed item and on no parked item.
+    #[test]
+    fn the_boundary_gate_line_is_recorded_inside_the_verified_act() {
+        const BOUNDARY: &str =
+            "boundary recheck: root and payload identity unchanged immediately before removal";
+        let f = fx();
+        let items = scan(&f.implement);
+        let env = FakeEnv::new();
+        let r = run(&f, &items, &env, false);
+
+        let removed = item_for(&r, &f.target);
+        assert_eq!(removed.outcome, ItemOutcome::Deleted);
+        let boundary_at = removed
+            .gates
+            .iter()
+            .position(|g| g == BOUNDARY)
+            .expect("the removed item must carry the boundary gate line");
+        assert_eq!(
+            removed.gates.iter().filter(|g| *g == BOUNDARY).count(),
+            1,
+            "the line must be recorded exactly once"
+        );
+        assert!(
+            removed.gates[boundary_at + 1..]
+                .iter()
+                .any(|g| g == "scan root identity re-verified AFTER the removal"),
+            "the AFTER-removal gate must follow the boundary line"
+        );
+
+        // Each removal must sit strictly between its OWN before/after `free_bytes` pair, which
+        // the act closure opens right after recording the boundary line. The absolute counts
+        // depend on how many payloads this fixture reaps and on the pre-loop capacity reading,
+        // so the invariant is expressed as shape: every removal has at least one preceding call,
+        // and consecutive removals are exactly two apart (the previous payload's `after` plus
+        // this payload's `before`).
+        let witness = env.j.borrow().remove_after_free_bytes.clone();
+        assert!(
+            witness.len() >= 2,
+            "the fixture must reap more than one payload for this shape to bite, got {witness:?}"
+        );
+        assert!(
+            witness[0] >= 1,
+            "the first removal must be preceded by its act's `before` reading, got {witness:?}"
+        );
+        for pair in witness.windows(2) {
+            assert_eq!(
+                pair[1] - pair[0],
+                2,
+                "each removal must be bracketed by exactly its own before/after pair, got \
+                 {witness:?}"
+            );
+        }
+
+        for item in &r.items {
+            if !matches!(item.outcome, ItemOutcome::Deleted) {
+                assert!(
+                    !item.gates.iter().any(|g| g == BOUNDARY),
+                    "a record whose removal did not run must not claim the boundary recheck: {:?}",
+                    item.path
+                );
+            }
+        }
     }
 
     /// Discriminates a reaper that removes the whole run directory (a prefix sweep) instead of the

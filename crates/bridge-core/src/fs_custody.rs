@@ -1,10 +1,22 @@
-//! Descriptor-relative filesystem custody primitives extracted for R2f1b.
+//! Descriptor-relative filesystem custody primitives — the single owner of the workspace's
+//! raw custody syscalls (R2f1b A4).
 //!
-//! The existing binary `local_file` module remains the production caller for compatibility
-//! evidence. This core module contains only generic descriptor identity, sync barriers, and
-//! no-replace publication needed by later custody tests/slices.
+//! Two layers live here, deliberately separated:
+//!
+//! 1. **Mechanism** (the `pub` free functions near the bottom): validated single-component child
+//!    names, the no-follow directory/child opens, the no-follow child stat, the atomic
+//!    no-replace rename, open-object identity comparison, and the failure-injection countdown.
+//!    These return bare [`std::io::Error`] (or a small typed refusal) and carry *no* message
+//!    vocabulary, precisely so each caller keeps its own operator-facing error text byte for
+//!    byte. The binary's `local_file` module is the second caller: its `PinnedDirectory` keeps
+//!    all of its own policy (durable object fingerprints, session-cwd binding, quarantine,
+//!    replacement, bounded readers) and reaches through these functions for the syscalls.
+//! 2. **Policy** ([`PinnedDirectoryV1`] and the `verify_*`/`VerifiedRemovalV1` boundary): the
+//!    custody contract used by R2f1b and by both storage reapers.
 
 use serde::{Deserialize, Serialize};
+#[cfg(unix)]
+use std::ffi::CStr;
 #[cfg(unix)]
 use std::ffi::CString;
 use std::ffi::OsStr;
@@ -46,11 +58,62 @@ pub enum FsCustodyError {
     InjectedSync(String),
 }
 
+/// A single-use "fail on the Nth call" hook, shared by every custody failure-injection point.
+///
+/// Armed with `n`, the next `n - 1` calls to [`Self::fire_if_due`] answer `false` and the `n`th
+/// answers `true`, after which the countdown is disarmed. The compare-exchange loop makes that
+/// true under concurrent callers: exactly one caller ever observes the firing transition.
+///
+/// This is the *mechanism* only. Which failure it injects, whether it is compiled at all, and
+/// what error it produces are the owning layer's decisions — `bridge-core` compiles its hook
+/// unconditionally (the operational surface has no `cfg(test)` callers to key off), while the
+/// binary's `local_file` keeps its two hooks `#[cfg(test)]`-gated.
+#[derive(Debug, Default)]
+pub struct FailureCountdownV1 {
+    remaining: AtomicUsize,
+}
+
+impl FailureCountdownV1 {
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            remaining: AtomicUsize::new(0),
+        }
+    }
+
+    /// Arm the countdown to fire on the `call`th subsequent [`Self::fire_if_due`].
+    ///
+    /// # Panics
+    /// Panics when `call` is zero: "fail on the zeroth call" has no meaning, and silently
+    /// treating it as disarmed would make a mis-written test pass for the wrong reason.
+    pub fn arm(&self, call: usize) {
+        assert!(call > 0, "failure injection call must be positive");
+        self.remaining.store(call, Ordering::SeqCst);
+    }
+
+    /// Consume one call; answer whether this is the one that must fail.
+    pub fn fire_if_due(&self) -> bool {
+        let mut remaining = self.remaining.load(Ordering::SeqCst);
+        while remaining != 0 {
+            match self.remaining.compare_exchange(
+                remaining,
+                remaining - 1,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => return remaining == 1,
+                Err(observed) => remaining = observed,
+            }
+        }
+        false
+    }
+}
+
 pub struct PinnedDirectoryV1 {
     file: File,
     canonical_path: PathBuf,
     identity: DirectoryIdentityV1,
-    sync_failure_countdown: AtomicUsize,
+    sync_failure_countdown: FailureCountdownV1,
 }
 
 pub struct RegularChildRefV1<'a> {
@@ -91,7 +154,7 @@ impl PinnedDirectoryV1 {
             file,
             canonical_path,
             identity,
-            sync_failure_countdown: AtomicUsize::new(0),
+            sync_failure_countdown: FailureCountdownV1::new(),
         })
     }
 
@@ -106,20 +169,8 @@ impl PinnedDirectoryV1 {
     }
 
     pub fn sync(&self, label: &str) -> Result<(), FsCustodyError> {
-        let mut remaining = self.sync_failure_countdown.load(Ordering::SeqCst);
-        while remaining != 0 {
-            match self.sync_failure_countdown.compare_exchange(
-                remaining,
-                remaining - 1,
-                Ordering::SeqCst,
-                Ordering::SeqCst,
-            ) {
-                Ok(_) if remaining == 1 => {
-                    return Err(FsCustodyError::InjectedSync(label.to_owned()));
-                }
-                Ok(_) => break,
-                Err(observed) => remaining = observed,
-            }
+        if self.sync_failure_countdown.fire_if_due() {
+            return Err(FsCustodyError::InjectedSync(label.to_owned()));
         }
         self.file
             .sync_all()
@@ -131,8 +182,7 @@ impl PinnedDirectoryV1 {
     }
 
     pub fn fail_sync_on_nth_call_for_test(&self, call: usize) {
-        assert!(call > 0, "sync failure injection call must be positive");
-        self.sync_failure_countdown.store(call, Ordering::SeqCst);
+        self.sync_failure_countdown.arm(call);
     }
 
     pub fn open_regular_file(&self, name: &OsStr, label: &str) -> Result<File, FsCustodyError> {
@@ -216,21 +266,30 @@ fn directory_path_identity(
     })
 }
 
-#[cfg(unix)]
-fn open_directory_no_follow(path: &Path, label: &str) -> Result<File, FsCustodyError> {
-    use std::os::unix::fs::OpenOptionsExt as _;
-    let mut options = OpenOptions::new();
-    options
-        .read(true)
-        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC);
-    options
-        .open(path)
-        .map_err(|error| FsCustodyError::Io(label.to_owned(), error))
+/// The workspace's one path-addressed directory open: read-only, `O_DIRECTORY`, `O_NOFOLLOW`,
+/// `O_CLOEXEC`. A final symlink is refused rather than followed, and a non-directory is refused
+/// by the kernel (`ENOTDIR`) before any content is read — which also means a FIFO substituted for
+/// a directory can never block this call.
+///
+/// Returns the bare [`std::io::Error`] so each caller keeps its own message vocabulary.
+pub fn open_directory_no_follow_raw(path: &Path) -> Result<File, std::io::Error> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let mut options = OpenOptions::new();
+        options
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC);
+        options.open(path)
+    }
+    #[cfg(not(unix))]
+    {
+        File::open(path)
+    }
 }
 
-#[cfg(not(unix))]
 fn open_directory_no_follow(path: &Path, label: &str) -> Result<File, FsCustodyError> {
-    File::open(path).map_err(|error| FsCustodyError::Io(label.to_owned(), error))
+    open_directory_no_follow_raw(path).map_err(|error| FsCustodyError::Io(label.to_owned(), error))
 }
 
 #[cfg(unix)]
@@ -276,41 +335,187 @@ fn directory_identity(
     })
 }
 
+/// Why a proposed child name is not usable as a single-component name beneath a retained
+/// directory descriptor. Discriminated so each caller can keep its own wording for each case.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChildNameRefusalV1 {
+    /// Empty, `.`, `..`, or containing a path separator — none of which *name a child*: they
+    /// walk the namespace, and handing any of them to a raw `openat`/`renameat*` would escape
+    /// the single-component contract the retained descriptor exists to enforce.
+    NotOneComponent,
+    /// Contains an interior NUL byte, which cannot be expressed as a C string at all.
+    ContainsNul,
+}
+
+/// Validate one child name and produce the C string the raw syscalls need.
+///
+/// The order of the two checks is load-bearing for message parity: callers that word the
+/// "not one component" and "contains NUL" refusals differently must agree on which one a name
+/// violating both (e.g. `a\0/b`) reports. Component-shape is checked first.
 #[cfg(unix)]
-fn child_name_cstring(name: &OsStr, label: &str) -> Result<CString, FsCustodyError> {
+pub fn validated_child_name(name: &OsStr) -> Result<CString, ChildNameRefusalV1> {
     use std::os::unix::ffi::OsStrExt as _;
     let bytes = name.as_bytes();
-    if bytes.is_empty()
-        || bytes.contains(&0)
-        || bytes.contains(&b'/')
-        || bytes == b"."
-        || bytes == b".."
-    {
-        return Err(FsCustodyError::InvalidChildName(label.to_owned()));
+    if bytes.is_empty() || bytes == b"." || bytes == b".." || bytes.contains(&b'/') {
+        return Err(ChildNameRefusalV1::NotOneComponent);
     }
-    CString::new(bytes).map_err(|_| FsCustodyError::InvalidChildName(label.to_owned()))
+    CString::new(bytes).map_err(|_| ChildNameRefusalV1::ContainsNul)
+}
+
+/// What a caller wants layered onto the mandatory read-only, no-follow, close-on-exec child open.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ChildOpenOptionsV1 {
+    /// Add `O_NONBLOCK`, so a FIFO substituted for the expected object refuses instead of
+    /// blocking the calling thread until a peer opens the other end.
+    pub nonblocking: bool,
+    /// Add `O_DIRECTORY`, so a non-directory is refused by the kernel rather than opened.
+    pub directory: bool,
+}
+
+/// The workspace's one descriptor-relative child `openat`: `O_RDONLY | O_CLOEXEC | O_NOFOLLOW`
+/// plus `options`, resolved against `parent` so no path component is re-traversed and a
+/// same-name replacement of any ancestor cannot redirect it.
+///
+/// The opened object's KIND is deliberately not checked here — each layer states its own kind
+/// policy (regular-vs-directory, link count) on the returned handle, and their refusals differ.
+#[cfg(unix)]
+pub fn open_child_no_follow(
+    parent: &File,
+    name: &CStr,
+    options: ChildOpenOptionsV1,
+) -> Result<File, std::io::Error> {
+    use std::os::fd::{AsRawFd as _, FromRawFd as _};
+    let mut flags = libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW;
+    if options.nonblocking {
+        flags |= libc::O_NONBLOCK;
+    }
+    if options.directory {
+        flags |= libc::O_DIRECTORY;
+    }
+    // SAFETY: parent is a live directory descriptor and name is a validated single component.
+    let fd = unsafe { libc::openat(parent.as_raw_fd(), name.as_ptr(), flags) };
+    if fd == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: successful openat returned an owned fd, adopted uniquely by File here.
+    Ok(unsafe { File::from_raw_fd(fd) })
+}
+
+/// The workspace's one descriptor-relative child `fstatat(AT_SYMLINK_NOFOLLOW)`: reports the
+/// directory ENTRY itself, never a symlink's target. `Ok(None)` means the name is genuinely
+/// absent (`ENOENT`); `Ok(Some(_))` means an entry of some kind exists.
+#[cfg(unix)]
+pub fn stat_child_no_follow(
+    parent: &File,
+    name: &CStr,
+) -> Result<Option<libc::stat>, std::io::Error> {
+    use std::mem::MaybeUninit;
+    use std::os::fd::AsRawFd as _;
+    let mut stat = MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: the parent descriptor, validated name, and writable stat buffer are all live.
+    let result = unsafe {
+        libc::fstatat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            stat.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    if result == -1 {
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::ENOENT) {
+            return Ok(None);
+        }
+        return Err(error);
+    }
+    // SAFETY: a successful fstatat initialized the complete stat value.
+    Ok(Some(unsafe { stat.assume_init() }))
+}
+
+/// Why an atomic no-replace rename did not happen.
+///
+/// The two arms are structurally distinct, and that is the whole point:
+/// [`Self::PlatformUnsupported`] is constructed ONLY by the compile arm for a platform that has
+/// no no-replace rename syscall at all, never from a syscall result. It cannot be inferred from
+/// an errno, because the errnos a real refusal carries (`ENOSYS`, `EOPNOTSUPP`, and on Linux the
+/// identical `ENOTSUP`) decode to [`std::io::ErrorKind::Unsupported`] too — a kernel or
+/// filesystem that declines `RENAME_NOREPLACE`/`RENAME_EXCL` (pre-3.15 Linux, overlayfs, NFS,
+/// SMB/FUSE/exFAT) is a runtime fact an operator can act on, and reporting it as a platform
+/// limitation both loses the errno and states something untrue.
+#[cfg(unix)]
+#[derive(Debug)]
+pub enum RenameNoReplaceRefusalV1 {
+    /// This build has no no-replace rename at all. Compile-time only.
+    PlatformUnsupported,
+    /// The syscall ran and the kernel refused. Carries the errno verbatim.
+    Io(std::io::Error),
+}
+
+/// The workspace's one atomic no-replace rename between two validated child names beneath the
+/// SAME retained directory descriptor. Target absence is part of the rename's linearization
+/// point, so it holds even against an actor that does not honor the caller's owner lock.
+#[cfg(unix)]
+pub fn rename_child_no_replace(
+    parent: &File,
+    source: &CStr,
+    target: &CStr,
+) -> Result<(), RenameNoReplaceRefusalV1> {
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    {
+        use std::os::fd::AsRawFd as _;
+        // SAFETY: both names are validated single components beneath the same live retained
+        // directory descriptor.
+        #[cfg(target_os = "macos")]
+        let result = unsafe {
+            libc::renameatx_np(
+                parent.as_raw_fd(),
+                source.as_ptr(),
+                parent.as_raw_fd(),
+                target.as_ptr(),
+                libc::RENAME_EXCL,
+            )
+        };
+        #[cfg(target_os = "linux")]
+        let result = unsafe {
+            libc::renameat2(
+                parent.as_raw_fd(),
+                source.as_ptr(),
+                parent.as_raw_fd(),
+                target.as_ptr(),
+                libc::RENAME_NOREPLACE,
+            )
+        };
+        if result == -1 {
+            return Err(RenameNoReplaceRefusalV1::Io(std::io::Error::last_os_error()));
+        }
+        Ok(())
+    }
+    // The ONLY construction site of `PlatformUnsupported`: a build with no such syscall.
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        let _ = (parent, source, target);
+        Err(RenameNoReplaceRefusalV1::PlatformUnsupported)
+    }
+}
+
+/// Whether two already-fetched metadata readings describe the same filesystem object.
+#[cfg(unix)]
+#[must_use]
+pub fn same_open_object(left: &std::fs::Metadata, right: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt as _;
+    left.dev() == right.dev() && left.ino() == right.ino()
+}
+
+#[cfg(unix)]
+fn child_name_cstring(name: &OsStr, label: &str) -> Result<CString, FsCustodyError> {
+    validated_child_name(name).map_err(|_| FsCustodyError::InvalidChildName(label.to_owned()))
 }
 
 #[cfg(unix)]
 fn open_regular_child(parent: &File, name: &OsStr, label: &str) -> Result<File, FsCustodyError> {
-    use std::os::fd::{AsRawFd as _, FromRawFd as _};
     let name = child_name_cstring(name, label)?;
-    // SAFETY: parent is a live directory descriptor and name is a validated single component.
-    let fd = unsafe {
-        libc::openat(
-            parent.as_raw_fd(),
-            name.as_ptr(),
-            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
-        )
-    };
-    if fd == -1 {
-        return Err(FsCustodyError::Io(
-            label.to_owned(),
-            std::io::Error::last_os_error(),
-        ));
-    }
-    // SAFETY: successful openat returned an owned fd.
-    let file = unsafe { File::from_raw_fd(fd) };
+    let file = open_child_no_follow(parent, &name, ChildOpenOptionsV1::default())
+        .map_err(|error| FsCustodyError::Io(label.to_owned(), error))?;
     let metadata = file
         .metadata()
         .map_err(|error| FsCustodyError::Io(label.to_owned(), error))?;
@@ -329,14 +534,13 @@ fn open_regular_child(_parent: &File, _name: &OsStr, label: &str) -> Result<File
 
 #[cfg(unix)]
 fn same_regular_file(left: &File, right: &File, label: &str) -> Result<bool, FsCustodyError> {
-    use std::os::unix::fs::MetadataExt as _;
     let left = left
         .metadata()
         .map_err(|error| FsCustodyError::Io(label.to_owned(), error))?;
     let right = right
         .metadata()
         .map_err(|error| FsCustodyError::Io(label.to_owned(), error))?;
-    Ok(left.dev() == right.dev() && left.ino() == right.ino())
+    Ok(same_open_object(&left, &right))
 }
 
 #[cfg(not(unix))]
@@ -355,8 +559,6 @@ fn publish_new_regular_child_impl<F>(
 where
     F: FnOnce() -> Result<(), FsCustodyError>,
 {
-    use std::mem::MaybeUninit;
-    use std::os::fd::AsRawFd as _;
     let source_name = child_name_cstring(source.name, label)?;
     let target_name = child_name_cstring(target_name, label)?;
     if source_name.as_bytes() == target_name.as_bytes() {
@@ -367,55 +569,20 @@ where
         return Err(FsCustodyError::IdentityChanged(label.to_owned()));
     }
 
-    let mut target_stat = MaybeUninit::<libc::stat>::uninit();
-    // SAFETY: retained parent descriptor and target pointer are valid; no-follow checks the entry.
-    let target_result = unsafe {
-        libc::fstatat(
-            parent.as_raw_fd(),
-            target_name.as_ptr(),
-            target_stat.as_mut_ptr(),
-            libc::AT_SYMLINK_NOFOLLOW,
-        )
-    };
-    if target_result == 0 {
-        return Err(FsCustodyError::TargetExists(label.to_owned()));
-    }
-    let target_error = std::io::Error::last_os_error();
-    if target_error.raw_os_error() != Some(libc::ENOENT) {
-        return Err(FsCustodyError::Io(label.to_owned(), target_error));
+    match stat_child_no_follow(parent, &target_name) {
+        Ok(Some(_)) => return Err(FsCustodyError::TargetExists(label.to_owned())),
+        Ok(None) => {}
+        Err(error) => return Err(FsCustodyError::Io(label.to_owned(), error)),
     }
 
     before_rename()?;
 
-    #[cfg(target_os = "macos")]
-    let rename_result = unsafe {
-        libc::renameatx_np(
-            parent.as_raw_fd(),
-            source_name.as_ptr(),
-            parent.as_raw_fd(),
-            target_name.as_ptr(),
-            libc::RENAME_EXCL,
-        )
-    };
-    #[cfg(target_os = "linux")]
-    let rename_result = unsafe {
-        libc::renameat2(
-            parent.as_raw_fd(),
-            source_name.as_ptr(),
-            parent.as_raw_fd(),
-            target_name.as_ptr(),
-            libc::RENAME_NOREPLACE,
-        )
-    };
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-    let rename_result = -1;
-    if rename_result == -1 {
-        return Err(FsCustodyError::Io(
-            label.to_owned(),
-            std::io::Error::last_os_error(),
-        ));
-    }
-    Ok(())
+    rename_child_no_replace(parent, &source_name, &target_name).map_err(|refusal| match refusal {
+        RenameNoReplaceRefusalV1::Io(error) => FsCustodyError::Io(label.to_owned(), error),
+        RenameNoReplaceRefusalV1::PlatformUnsupported => {
+            FsCustodyError::Unsupported(label.to_owned())
+        }
+    })
 }
 
 #[cfg(not(unix))]
@@ -430,6 +597,226 @@ where
     F: FnOnce() -> Result<(), FsCustodyError>,
 {
     Err(FsCustodyError::Unsupported(label.to_owned()))
+}
+
+// ---------------------------------------------------------------------------------------------
+// The verify-then-act boundary shared by every destructive custody caller.
+//
+// Both storage reapers carried structurally identical copies of this: pinned-root recheck,
+// payload `(dev, ino)`, canonicalize-equals-self, the pre-removal identity recheck, the
+// presence probe that decides what the removal actually did, and the post-removal root recheck
+// that decides whether the outcome can be attested at all. Two copies of a destructive boundary
+// is two places for it to rot; the refusal DETAIL text lives here with the check that produces
+// it, while the operator-facing gate vocabulary stays with each command's report.
+// ---------------------------------------------------------------------------------------------
+
+/// `(dev, ino)` of a real directory at `path`. A symlink or a non-directory is an error, never a
+/// silently-followed success.
+#[cfg(unix)]
+pub fn directory_dev_ino(path: &Path) -> Result<(u64, u64), String> {
+    use std::os::unix::fs::MetadataExt as _;
+    let metadata =
+        std::fs::symlink_metadata(path).map_err(|error| format!("{}: {error}", path.display()))?;
+    if metadata.file_type().is_symlink() {
+        return Err(format!("{} is a symlink", path.display()));
+    }
+    if !metadata.is_dir() {
+        return Err(format!("{} is not a directory", path.display()));
+    }
+    Ok((metadata.dev(), metadata.ino()))
+}
+
+#[cfg(not(unix))]
+pub fn directory_dev_ino(path: &Path) -> Result<(u64, u64), String> {
+    Err(format!(
+        "{}: filesystem identity (dev/ino) is unavailable on this platform, so a directory swap \
+         cannot be detected",
+        path.display()
+    ))
+}
+
+/// Re-verify that a pinned root's PATH still resolves to the descriptor that was pinned. This is
+/// the swap check: an actor controlling the parent can rename the root away and put another
+/// directory in its place, after which every path-based operation lands in the replacement.
+pub fn pinned_root_unchanged(pin: &PinnedDirectoryV1) -> Result<(), String> {
+    let (dev, ino) = directory_dev_ino(pin.canonical_path())?;
+    let want = pin.identity();
+    if want.dev != Some(dev) || want.ino != Some(ino) {
+        return Err(format!(
+            "pinned scan root {} now resolves to a different directory (dev/ino {dev}/{ino}, pinned \
+             {:?}/{:?})",
+            pin.canonical_path().display(),
+            want.dev,
+            want.ino
+        ));
+    }
+    Ok(())
+}
+
+/// The pinned root's identity rendered for an operator-facing gate line or evidence record.
+#[must_use]
+pub fn root_identity_label(pin: &PinnedDirectoryV1) -> String {
+    let identity = pin.identity();
+    match (identity.dev, identity.ino) {
+        (Some(dev), Some(ino)) => format!("dev {dev} / ino {ino}"),
+        _ => "unavailable".to_string(),
+    }
+}
+
+/// Why a payload directory failed its own identity gate.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PayloadIdentityRefusalV1 {
+    /// The path names a symlink. Following it would act on something else entirely.
+    IsSymlink,
+    /// The path is not a real directory (or could not be stat'ed at all).
+    NotADirectory { detail: String },
+    /// The path no longer canonically resolves to itself, so its name and its object disagree.
+    IdentityChanged { detail: String },
+}
+
+/// A payload directory's identity, re-derived from the filesystem right now: a real directory,
+/// not a symlink, still canonically resolving to itself. Returns its `(dev, ino)` so a later
+/// verify-then-act boundary can prove nothing was exchanged in between.
+pub fn verify_payload_directory_identity(
+    path: &Path,
+) -> Result<(u64, u64), PayloadIdentityRefusalV1> {
+    let identity = match directory_dev_ino(path) {
+        Ok(identity) => identity,
+        Err(detail) => {
+            if std::fs::symlink_metadata(path)
+                .map(|metadata| metadata.file_type().is_symlink())
+                .unwrap_or(false)
+            {
+                return Err(PayloadIdentityRefusalV1::IsSymlink);
+            }
+            return Err(PayloadIdentityRefusalV1::NotADirectory { detail });
+        }
+    };
+    match std::fs::canonicalize(path) {
+        Ok(canonical) if canonical == path => {}
+        Ok(canonical) => {
+            return Err(PayloadIdentityRefusalV1::IdentityChanged {
+                detail: format!("{} now resolves to {}", path.display(), canonical.display()),
+            })
+        }
+        Err(error) => {
+            return Err(PayloadIdentityRefusalV1::IdentityChanged {
+                detail: format!("{} has no canonical path: {error}", path.display()),
+            })
+        }
+    }
+    Ok(identity)
+}
+
+/// Why the LAST boundary recheck — the one immediately before a destructive act — refused.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RemovalBoundaryRefusalV1 {
+    /// The pinned root changed between the gates and this instant.
+    RootIdentityChanged { detail: String },
+    /// The payload is no longer the object the gates measured and authorized.
+    PayloadIdentityChanged { detail: String },
+    /// The payload is no longer a real directory at all.
+    PayloadNotADirectory { detail: String },
+}
+
+/// What a removal actually did, read from the filesystem rather than from its exit status.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RemovalObservationV1 {
+    /// Reported success, and the payload is gone.
+    Removed,
+    /// Reported success, but the payload is still there. That is not success.
+    ReportedSuccessButPresent { detail: String },
+    /// Reported failure, and the payload is still there: a genuine partial removal.
+    Failed { detail: String },
+    /// Reported failure, but the payload is gone: WHAT was removed cannot be attested.
+    ReportedFailureButGone { detail: String },
+}
+
+/// The result of [`verify_then_remove`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum VerifiedRemovalV1 {
+    /// A boundary recheck refused before the act ran. Nothing was touched.
+    Refused(RemovalBoundaryRefusalV1),
+    /// The act ran. `observation` says what it did; `root_changed_during` is `Some(detail)` when
+    /// the pinned root moved while the act was in flight — in which case the observation cannot
+    /// be attributed to the intended object at all, however clean it looks.
+    Acted {
+        observation: RemovalObservationV1,
+        root_changed_during: Option<String>,
+    },
+}
+
+/// Verify-then-act: the LAST identity checks immediately before a destructive act, the act
+/// itself, and the post-act re-verification that decides whether its outcome can be attested.
+///
+/// The gates a caller ran earlier took time, and time is the whole hazard: `expected_identity`
+/// is the `(dev, ino)` those gates authorized, and this refuses rather than acting if the name
+/// now points at anything else. `act` returns its own failure text unchanged; whether the payload
+/// is actually gone is then read from the filesystem, never inferred from that result.
+///
+/// PARKED (S3 dual-review deferral, carried into the R2f1b custody plan §9): the boundary this
+/// function closes is *around* the act, not *inside* it. Both reapers still pass a path-addressed
+/// `remove_dir_all` as `act`, which re-traverses every path component itself — so a hostile actor
+/// who swaps a component AFTER this recheck and BEFORE the traversal reaches it is outside what
+/// the pre/post identity checks can see. Closing it needs a descriptor-relative recursive removal
+/// (an `openat`/`O_NOFOLLOW` component walk plus `unlinkat`) built here and wired into the
+/// production `ReapEnv::remove_tree`; the `act` seam is deliberately shaped so that swap is a
+/// substitution behind this same signature, with no change to either reaper's gate logic.
+pub fn verify_then_remove<F>(
+    pin: &PinnedDirectoryV1,
+    payload: &Path,
+    expected_identity: (u64, u64),
+    act: F,
+) -> VerifiedRemovalV1
+where
+    F: FnOnce() -> Result<(), String>,
+{
+    if let Err(detail) = pinned_root_unchanged(pin) {
+        return VerifiedRemovalV1::Refused(RemovalBoundaryRefusalV1::RootIdentityChanged {
+            detail,
+        });
+    }
+    match directory_dev_ino(payload) {
+        Ok(now) if now == expected_identity => {}
+        Ok(now) => {
+            return VerifiedRemovalV1::Refused(RemovalBoundaryRefusalV1::PayloadIdentityChanged {
+                detail: format!(
+                    "{} changed identity between the gates and the removal (dev/ino {}/{} to \
+                     {}/{})",
+                    payload.display(),
+                    expected_identity.0,
+                    expected_identity.1,
+                    now.0,
+                    now.1
+                ),
+            })
+        }
+        Err(detail) => {
+            return VerifiedRemovalV1::Refused(RemovalBoundaryRefusalV1::PayloadNotADirectory {
+                detail,
+            })
+        }
+    }
+
+    let reported = act();
+    let gone = std::fs::symlink_metadata(payload).is_err();
+    let observation = match (reported, gone) {
+        (Ok(()), true) => RemovalObservationV1::Removed,
+        (Ok(()), false) => RemovalObservationV1::ReportedSuccessButPresent {
+            detail: format!(
+                "the removal reported success but {} is still present",
+                payload.display()
+            ),
+        },
+        (Err(detail), false) => RemovalObservationV1::Failed { detail },
+        (Err(detail), true) => RemovalObservationV1::ReportedFailureButGone {
+            detail: format!("removal reported an error ({detail}) but the path is gone"),
+        },
+    };
+    VerifiedRemovalV1::Acted {
+        observation,
+        root_changed_during: pinned_root_unchanged(pin).err(),
+    }
 }
 
 #[must_use]
@@ -1275,5 +1662,502 @@ mod tests {
             .open(&path)
             .unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // A4 mechanism surface: the shared primitives extracted so `local_file` and both storage
+    // reapers stop carrying their own copies. Every test below covers a contract that did not
+    // exist before A4 — the pre-existing behaviour is covered by the tests above and by the
+    // binary's own suites, which A4 left untouched.
+    // ---------------------------------------------------------------------------------------
+
+    /// Discriminates a `validated_child_name` that collapses its two refusals into one. The
+    /// binary's `local_file` wraps each with a DIFFERENT operator-facing message, so a validator
+    /// that reported `ContainsNul` for `a/b` (or vice versa) would silently change text that
+    /// `compatibility_*` tests assert verbatim. Also pins the ORDER: a name violating BOTH rules
+    /// must report `NotOneComponent`, because that is the one the pre-A4 `local_file` validator
+    /// reported for it.
+    #[cfg(unix)]
+    #[test]
+    fn validated_child_name_discriminates_its_two_refusals_and_fixes_their_order() {
+        use std::os::unix::ffi::OsStrExt as _;
+
+        for name in [
+            OsStr::new(""),
+            OsStr::new("."),
+            OsStr::new(".."),
+            OsStr::new("a/b"),
+        ] {
+            assert_eq!(
+                validated_child_name(name).unwrap_err(),
+                ChildNameRefusalV1::NotOneComponent,
+                "{name:?} must be refused as a non-component"
+            );
+        }
+        assert_eq!(
+            validated_child_name(OsStr::from_bytes(b"a\0b")).unwrap_err(),
+            ChildNameRefusalV1::ContainsNul
+        );
+        // Violates both: component shape is checked first, exactly as `local_file` always did.
+        assert_eq!(
+            validated_child_name(OsStr::from_bytes(b"a\0/b")).unwrap_err(),
+            ChildNameRefusalV1::NotOneComponent
+        );
+        assert_eq!(
+            validated_child_name(OsStr::new("ordinary.txt"))
+                .unwrap()
+                .as_bytes(),
+            b"ordinary.txt"
+        );
+    }
+
+    /// Discriminates `ChildOpenOptionsV1::nonblocking` being dropped on the floor. A read-only
+    /// open of a FIFO with no writer BLOCKS until one appears; without `O_NONBLOCK` this call
+    /// would hang the calling thread forever rather than returning, which is precisely the hazard
+    /// `local_file` sets the flag for. The test is bounded by running the open on a worker thread
+    /// and failing if it has not returned quickly — a regression hangs the worker, not the suite.
+    #[cfg(unix)]
+    #[test]
+    fn child_open_options_nonblocking_refuses_a_writerless_fifo_instead_of_blocking() {
+        use std::os::unix::ffi::OsStrExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join("pipe");
+        let fifo_c = CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        // SAFETY: a valid NUL-terminated path in a directory this test owns.
+        assert_eq!(unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o600) }, 0);
+        let parent = open_directory_no_follow_raw(dir.path()).unwrap();
+        let name = validated_child_name(OsStr::new("pipe")).unwrap();
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let opened = open_child_no_follow(
+                &parent,
+                &name,
+                ChildOpenOptionsV1 {
+                    nonblocking: true,
+                    directory: false,
+                },
+            );
+            let _ = tx.send(opened.is_ok());
+        });
+        let opened = rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("O_NONBLOCK open of a writerless FIFO must return promptly, not block");
+        assert!(opened, "the non-blocking FIFO open should still succeed");
+    }
+
+    /// Discriminates `ChildOpenOptionsV1::directory` being dropped: without `O_DIRECTORY` a
+    /// regular file is a perfectly valid read-only open, so the caller would receive a handle to
+    /// a file where it expected a directory. With it the kernel refuses with `ENOTDIR`.
+    #[cfg(unix)]
+    #[test]
+    fn child_open_options_directory_refuses_a_regular_child() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("regular.txt"), b"not a directory").unwrap();
+        let parent = open_directory_no_follow_raw(dir.path()).unwrap();
+        let name = validated_child_name(OsStr::new("regular.txt")).unwrap();
+
+        let error = open_child_no_follow(
+            &parent,
+            &name,
+            ChildOpenOptionsV1 {
+                nonblocking: false,
+                directory: true,
+            },
+        )
+        .unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::ENOTDIR));
+    }
+
+    /// Discriminates a `stat_child_no_follow` that reports a symlink's TARGET rather than the
+    /// link itself (i.e. one that lost `AT_SYMLINK_NOFOLLOW`), and one that reports a genuinely
+    /// absent name as an error rather than `Ok(None)` — the absence answer both the publication
+    /// pre-check and `local_file`'s quarantine resolution depend on.
+    #[cfg(unix)]
+    #[test]
+    fn stat_child_no_follow_reports_the_entry_itself_and_distinguishes_absence() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("real.txt"), b"real").unwrap();
+        std::os::unix::fs::symlink(dir.path().join("real.txt"), dir.path().join("link.txt"))
+            .unwrap();
+        let parent = open_directory_no_follow_raw(dir.path()).unwrap();
+
+        let link = stat_child_no_follow(
+            &parent,
+            &validated_child_name(OsStr::new("link.txt")).unwrap(),
+        )
+        .unwrap()
+        .expect("the link entry exists");
+        assert_eq!(
+            link.st_mode & libc::S_IFMT,
+            libc::S_IFLNK,
+            "the ENTRY must be reported, not the regular file it points at"
+        );
+
+        assert!(stat_child_no_follow(
+            &parent,
+            &validated_child_name(OsStr::new("absent")).unwrap()
+        )
+        .unwrap()
+        .is_none());
+    }
+
+    /// Discriminates a `rename_child_no_replace` that has lost its no-replace flag and would
+    /// silently clobber an existing target — the property the whole atomic publication protocol
+    /// rests on. Also proves the refusal leaves BOTH names as they were.
+    #[cfg(unix)]
+    #[test]
+    fn rename_child_no_replace_refuses_an_occupied_target_and_changes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("source"), b"source").unwrap();
+        fs::write(dir.path().join("target"), b"target").unwrap();
+        let parent = open_directory_no_follow_raw(dir.path()).unwrap();
+
+        let error = rename_child_no_replace(
+            &parent,
+            &validated_child_name(OsStr::new("source")).unwrap(),
+            &validated_child_name(OsStr::new("target")).unwrap(),
+        )
+        .unwrap_err();
+        // A kernel refusal must arrive as `Io` carrying its errno, never as the compile-time
+        // `PlatformUnsupported` claim — the R1 distinction, asserted at the primitive itself.
+        match error {
+            RenameNoReplaceRefusalV1::Io(error) => {
+                assert_eq!(error.raw_os_error(), Some(libc::EEXIST))
+            }
+            other => panic!("expected an Io refusal carrying EEXIST, got {other:?}"),
+        }
+        assert_eq!(fs::read(dir.path().join("source")).unwrap(), b"source");
+        assert_eq!(fs::read(dir.path().join("target")).unwrap(), b"target");
+
+        rename_child_no_replace(
+            &parent,
+            &validated_child_name(OsStr::new("source")).unwrap(),
+            &validated_child_name(OsStr::new("fresh")).unwrap(),
+        )
+        .unwrap();
+        assert!(!dir.path().join("source").exists());
+        assert_eq!(fs::read(dir.path().join("fresh")).unwrap(), b"source");
+    }
+
+    /// Discriminates a `FailureCountdownV1` that fires on the wrong call, fires repeatedly once
+    /// armed, or fires when it was never armed. Two independent countdowns must also not share
+    /// state — `local_file` keeps a sync hook and a journal-publication hook side by side on one
+    /// directory, and several of its tests arm both.
+    #[test]
+    fn failure_countdown_fires_exactly_once_on_exactly_the_armed_call() {
+        let countdown = FailureCountdownV1::new();
+        assert!(!countdown.fire_if_due(), "an unarmed countdown never fires");
+
+        countdown.arm(3);
+        assert!(!countdown.fire_if_due());
+        assert!(!countdown.fire_if_due());
+        assert!(countdown.fire_if_due(), "the third call must fire");
+        assert!(!countdown.fire_if_due(), "and it must disarm afterwards");
+
+        let other = FailureCountdownV1::new();
+        countdown.arm(1);
+        assert!(!other.fire_if_due(), "countdowns must not share state");
+        assert!(countdown.fire_if_due());
+    }
+
+    /// Discriminates a `verify_payload_directory_identity` that follows a symlink (would authorize
+    /// a destructive act against whatever it points at), accepts a non-directory, or drops the
+    /// canonicalize-equals-self check that catches a name whose object has been moved out from
+    /// under it.
+    #[cfg(unix)]
+    #[test]
+    fn verify_payload_directory_identity_refuses_symlinks_files_and_moved_names() {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        // The check compares a path against its own canonical form, so the fixture's ROOT must
+        // already be canonical: on macOS a tempdir lives under a symlinked `/var` and every path
+        // built from it would otherwise be refused for the fixture's sake rather than the test's.
+        let base = fs::canonicalize(dir.path()).unwrap();
+        let real = base.join("real");
+        fs::create_dir(&real).unwrap();
+        let expected = fs::symlink_metadata(&real).unwrap();
+        assert_eq!(
+            verify_payload_directory_identity(&real).unwrap(),
+            (expected.dev(), expected.ino())
+        );
+
+        let link = base.join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        assert_eq!(
+            verify_payload_directory_identity(&link).unwrap_err(),
+            PayloadIdentityRefusalV1::IsSymlink,
+            "a symlink must be refused, never resolved to its target"
+        );
+
+        let regular = base.join("regular.txt");
+        fs::write(&regular, b"payload").unwrap();
+        assert!(matches!(
+            verify_payload_directory_identity(&regular).unwrap_err(),
+            PayloadIdentityRefusalV1::NotADirectory { .. }
+        ));
+
+        let absent = base.join("absent");
+        assert!(matches!(
+            verify_payload_directory_identity(&absent).unwrap_err(),
+            PayloadIdentityRefusalV1::NotADirectory { .. }
+        ));
+    }
+
+    /// Discriminates a `verify_payload_directory_identity` that keeps the `(dev, ino)` check but
+    /// drops the canonicalize-equals-self comparison. A path reached through a symlinked ANCESTOR
+    /// stats as a real directory with a real identity, so only the canonical comparison catches
+    /// that the caller's name and the object it names disagree.
+    #[cfg(unix)]
+    #[test]
+    fn verify_payload_directory_identity_refuses_a_name_reached_through_a_symlinked_ancestor() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = fs::canonicalize(dir.path()).unwrap();
+        let real_parent = base.join("real-parent");
+        fs::create_dir(&real_parent).unwrap();
+        fs::create_dir(real_parent.join("payload")).unwrap();
+        // Control: the payload reached through its REAL parent is accepted, so the refusal below
+        // is attributable to the aliased ancestor and not to the fixture's own layout.
+        verify_payload_directory_identity(&real_parent.join("payload")).unwrap();
+        std::os::unix::fs::symlink(&real_parent, base.join("aliased-parent")).unwrap();
+
+        let through_alias = base.join("aliased-parent").join("payload");
+        match verify_payload_directory_identity(&through_alias).unwrap_err() {
+            PayloadIdentityRefusalV1::IdentityChanged { detail } => {
+                assert!(
+                    detail.contains("now resolves to"),
+                    "the refusal must name where it actually resolves, got {detail}"
+                );
+            }
+            other => panic!("expected IdentityChanged, got {other:?}"),
+        }
+    }
+
+    /// Discriminates a `verify_then_remove` that runs its act without re-checking the payload
+    /// identity the gates authorized — the whole point of the boundary, since arbitrary time
+    /// passes between the gates and the removal. The act must NOT run.
+    #[cfg(unix)]
+    #[test]
+    fn verify_then_remove_refuses_and_never_acts_when_the_payload_was_exchanged() {
+        let root = tempfile::tempdir().unwrap();
+        let base = fs::canonicalize(root.path()).unwrap();
+        let pinned = PinnedDirectoryV1::open(&base, "exchanged payload").unwrap();
+        let payload = base.join("payload");
+        fs::create_dir(&payload).unwrap();
+        let authorized = verify_payload_directory_identity(&payload).unwrap();
+
+        // The gates authorized THAT directory; a different one is now under the same name.
+        fs::remove_dir(&payload).unwrap();
+        fs::create_dir(&payload).unwrap();
+
+        let mut acts = 0_u32;
+        let verified = verify_then_remove(&pinned, &payload, authorized, || {
+            acts += 1;
+            Ok(())
+        });
+        assert_eq!(acts, 0, "the act must not run after a refused recheck");
+        match verified {
+            VerifiedRemovalV1::Refused(RemovalBoundaryRefusalV1::PayloadIdentityChanged {
+                detail,
+            }) => assert!(
+                detail.contains("changed identity between the gates and the removal"),
+                "got {detail}"
+            ),
+            other => panic!("expected PayloadIdentityChanged, got {other:?}"),
+        }
+        assert!(payload.exists());
+    }
+
+    /// Discriminates a `verify_then_remove` that skips the pre-act pinned-root recheck, or that
+    /// reports a vanished payload as `NotADirectory` when the ROOT is the thing that moved: the
+    /// root refusal must win, because nothing beneath an unattestable root can be attested.
+    #[cfg(unix)]
+    #[test]
+    fn verify_then_remove_refuses_when_the_pinned_root_moved_before_the_act() {
+        let outer = tempfile::tempdir().unwrap();
+        let outer = fs::canonicalize(outer.path()).unwrap();
+        let root = outer.join("root");
+        fs::create_dir(&root).unwrap();
+        let payload = root.join("payload");
+        fs::create_dir(&payload).unwrap();
+        let pinned = PinnedDirectoryV1::open(&root, "moved root").unwrap();
+        let authorized = verify_payload_directory_identity(&payload).unwrap();
+
+        // Swap the ROOT for a different directory at the same path. The payload travels with the
+        // real root, so `payload` now names nothing — and the assertion below is that the ROOT
+        // refusal wins anyway rather than the incidental `PayloadNotADirectory`.
+        let replacement = outer.join("replacement");
+        fs::create_dir(&replacement).unwrap();
+        fs::rename(&root, outer.join("root-moved-away")).unwrap();
+        fs::rename(&replacement, &root).unwrap();
+        assert!(!payload.exists());
+
+        let mut acts = 0_u32;
+        let verified = verify_then_remove(&pinned, &payload, authorized, || {
+            acts += 1;
+            Ok(())
+        });
+        assert_eq!(acts, 0, "the act must not run after a refused root recheck");
+        assert!(matches!(
+            verified,
+            VerifiedRemovalV1::Refused(RemovalBoundaryRefusalV1::RootIdentityChanged { .. })
+        ));
+    }
+
+    /// R2f1b A4 R2. Discriminates a `verify_then_remove` whose pre-act recheck only compares
+    /// `(dev, ino)` against the authorized pair and never re-establishes that the payload is
+    /// still a DIRECTORY. Between admission and the boundary an actor can replace the payload
+    /// with a regular file or with a symlink pointing anywhere; a recursive removal handed either
+    /// one acts on the wrong object entirely — the symlink case being the dangerous one, since
+    /// following it reaches outside the authorized subtree. Both must produce the typed
+    /// `PayloadNotADirectory` refusal, and in both the act must never run.
+    ///
+    /// Note the symlink lands on `PayloadNotADirectory` rather than a symlink-specific variant:
+    /// this is the LAST boundary, whose only question is "is this still exactly what was
+    /// authorized"; the symlink/not-a-directory distinction belongs to admission
+    /// (`verify_payload_directory_identity`), which is separately covered above.
+    #[cfg(unix)]
+    #[test]
+    fn verify_then_remove_refuses_a_payload_replaced_by_a_file_or_a_symlink() {
+        for replacement in ["regular file", "symlink"] {
+            let root = tempfile::tempdir().unwrap();
+            let base = fs::canonicalize(root.path()).unwrap();
+            let pinned = PinnedDirectoryV1::open(&base, "replaced payload").unwrap();
+            let payload = base.join("payload");
+            fs::create_dir(&payload).unwrap();
+            let authorized = verify_payload_directory_identity(&payload).unwrap();
+
+            fs::remove_dir(&payload).unwrap();
+            if replacement == "regular file" {
+                fs::write(&payload, b"not a directory any more").unwrap();
+            } else {
+                let elsewhere = base.join("elsewhere");
+                fs::create_dir(&elsewhere).unwrap();
+                std::os::unix::fs::symlink(&elsewhere, &payload).unwrap();
+            }
+
+            let mut acts = 0_u32;
+            let verified = verify_then_remove(&pinned, &payload, authorized, || {
+                acts += 1;
+                Ok(())
+            });
+            assert_eq!(acts, 0, "[{replacement}] the act must never run");
+            match verified {
+                VerifiedRemovalV1::Refused(RemovalBoundaryRefusalV1::PayloadNotADirectory {
+                    detail,
+                }) => assert!(
+                    detail.contains("payload"),
+                    "[{replacement}] the refusal must name the payload, got {detail}"
+                ),
+                other => panic!("[{replacement}] expected PayloadNotADirectory, got {other:?}"),
+            }
+            // And the replacement is untouched — including, for the symlink case, its target.
+            assert!(fs::symlink_metadata(&payload).is_ok());
+            if replacement == "symlink" {
+                assert!(
+                    base.join("elsewhere").is_dir(),
+                    "the link target must survive"
+                );
+            }
+        }
+    }
+
+    /// Discriminates a `verify_then_remove` that trusts the act's RETURN VALUE instead of reading
+    /// the filesystem: all four combinations of (reported result, actual presence) must be
+    /// distinguishable, because "reported success but still present" and "reported failure but
+    /// gone" are the two an exit-status-only reading would silently get wrong.
+    #[cfg(unix)]
+    #[test]
+    fn verify_then_remove_classifies_the_act_by_what_the_filesystem_shows() {
+        let root = tempfile::tempdir().unwrap();
+        let base = fs::canonicalize(root.path()).unwrap();
+        let pinned = PinnedDirectoryV1::open(&base, "classification").unwrap();
+
+        let case = |reported: Result<(), String>, actually_remove: bool| {
+            let payload = base.join("payload");
+            let _ = fs::remove_dir_all(&payload);
+            fs::create_dir(&payload).unwrap();
+            let authorized = verify_payload_directory_identity(&payload).unwrap();
+            let mut acts = 0_u32;
+            let verified = verify_then_remove(&pinned, &payload, authorized, || {
+                acts += 1;
+                if actually_remove {
+                    fs::remove_dir_all(&payload).unwrap();
+                }
+                reported
+            });
+            // A destructive act must run EXACTLY once: a retry loop hidden in the boundary would
+            // unlink twice, and a boundary that swallowed the act would report a phantom outcome.
+            assert_eq!(acts, 1, "the act must run exactly once");
+            match verified {
+                VerifiedRemovalV1::Acted {
+                    observation,
+                    root_changed_during,
+                } => {
+                    assert_eq!(root_changed_during, None);
+                    observation
+                }
+                other => panic!("expected Acted, got {other:?}"),
+            }
+        };
+
+        assert_eq!(case(Ok(()), true), RemovalObservationV1::Removed);
+        assert!(matches!(
+            case(Ok(()), false),
+            RemovalObservationV1::ReportedSuccessButPresent { .. }
+        ));
+        match case(Err("disk on fire".into()), false) {
+            RemovalObservationV1::Failed { detail } => assert_eq!(detail, "disk on fire"),
+            other => panic!("expected Failed, got {other:?}"),
+        }
+        match case(Err("disk on fire".into()), true) {
+            RemovalObservationV1::ReportedFailureButGone { detail } => assert!(
+                detail.contains("disk on fire") && detail.contains("the path is gone"),
+                "got {detail}"
+            ),
+            other => panic!("expected ReportedFailureButGone, got {other:?}"),
+        }
+    }
+
+    /// Discriminates a `verify_then_remove` that drops the POST-act root re-verification. A root
+    /// swapped while the removal was in flight means the removal may have landed in the
+    /// replacement, so even a textbook-clean `Removed` observation must be reported alongside the
+    /// root change rather than presented as an attested deletion.
+    #[cfg(unix)]
+    #[test]
+    fn verify_then_remove_reports_a_root_that_moved_while_the_act_was_in_flight() {
+        let outer = tempfile::tempdir().unwrap();
+        let outer = fs::canonicalize(outer.path()).unwrap();
+        let root = outer.join("root");
+        fs::create_dir(&root).unwrap();
+        let payload = root.join("payload");
+        fs::create_dir(&payload).unwrap();
+        let pinned = PinnedDirectoryV1::open(&root, "root moved mid-act").unwrap();
+        let authorized = verify_payload_directory_identity(&payload).unwrap();
+
+        let verified = verify_then_remove(&pinned, &payload, authorized, || {
+            fs::remove_dir_all(&payload).unwrap();
+            let replacement = outer.join("replacement");
+            fs::create_dir(&replacement).unwrap();
+            fs::rename(&replacement, &root).unwrap();
+            Ok(())
+        });
+        match verified {
+            VerifiedRemovalV1::Acted {
+                observation,
+                root_changed_during,
+            } => {
+                assert_eq!(observation, RemovalObservationV1::Removed);
+                let detail = root_changed_during
+                    .expect("a root swapped during the act must be reported, not swallowed");
+                assert!(
+                    detail.contains("now resolves to a different directory"),
+                    "got {detail}"
+                );
+            }
+            other => panic!("expected Acted, got {other:?}"),
+        }
     }
 }

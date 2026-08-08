@@ -3,15 +3,33 @@
 //! The descriptor is opened before type/size inspection, so a FIFO cannot park the process before the
 //! regular-file gate. On Unix, `O_NOFOLLOW` rejects a final symlink and `O_NONBLOCK` makes every special
 //! file return promptly; descriptor/path identity is then compared before the canonical path is trusted.
+//!
+//! R2f1b A4 single-owner rule: every raw custody syscall this module performs — validated child
+//! names, the no-follow directory/child opens, the no-follow child stat, the atomic no-replace
+//! rename, open-object identity, and the failure-injection countdown — comes from
+//! [`bridge_core::fs_custody`], which is their only implementation in the workspace. What stays
+//! here is this binary's POLICY over them: durable directory object fingerprints, session-cwd
+//! binding and the post-exec stable path, single-link ownership requirements, the removal
+//! quarantine, atomic replacement with rollback, the journal-append residue protocol, bounded
+//! readers, and every operator-facing message. Those messages are asserted verbatim by tests in
+//! the `compatibility_*` modules, so the wrappers below re-word the shared primitives' bare
+//! `io::Error`s (and their few typed refusals) into exactly the text this module has always
+//! produced. Where a primitive distinguishes a COMPILE-TIME platform limitation from a runtime
+//! kernel refusal it does so with a typed discriminant, never with `io::ErrorKind` — `ENOSYS`
+//! and `EOPNOTSUPP` decode to `ErrorKind::Unsupported`, so an `ErrorKind` test would swallow a
+//! real, operator-actionable errno and assert something untrue about the platform.
 
 use std::ffi::{OsStr, OsString};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek as _};
 use std::path::{Path, PathBuf};
-#[cfg(test)]
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
+#[cfg(test)]
+use bridge_core::fs_custody::FailureCountdownV1;
+use bridge_core::fs_custody::{
+    self, ChildNameRefusalV1, ChildOpenOptionsV1, RenameNoReplaceRefusalV1,
+};
 use bridge_core::session_cwd::SessionCwd;
 
 use crate::BoxError;
@@ -440,10 +458,13 @@ pub(crate) struct PinnedDirectory {
     identity: DirectoryIdentity,
     acp_session_cwd: PathBuf,
     retain_descriptor_after_exec: bool,
+    // Both hooks are `Arc`-shared so arming one through any clone of this handle is visible to
+    // every other clone: callers routinely arm the injection on a `PinnedDirectory` they cloned
+    // out of a store, then exercise the effect through a different clone.
     #[cfg(test)]
-    sync_failure_countdown: Arc<AtomicUsize>,
+    sync_failure_countdown: Arc<FailureCountdownV1>,
     #[cfg(test)]
-    journal_publish_failure_countdown: Arc<AtomicUsize>,
+    journal_publish_failure_countdown: Arc<FailureCountdownV1>,
 }
 
 #[derive(Clone, Copy)]
@@ -469,21 +490,17 @@ fn open_read_only_nonblocking(path: &Path) -> Result<File, std::io::Error> {
     options.open(path)
 }
 
+/// Narrow wrapper: the no-follow directory open is [`fs_custody::open_directory_no_follow_raw`].
+/// The flag set is identical to the one this module used to spell out here
+/// (`O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC`); the `io::Error` is returned unchanged so
+/// every caller's own message text is untouched.
 fn open_directory(path: &Path) -> Result<File, std::io::Error> {
-    let mut options = OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        options.custom_flags(libc::O_CLOEXEC | libc::O_DIRECTORY | libc::O_NOFOLLOW);
-    }
-    options.open(path)
+    fs_custody::open_directory_no_follow_raw(path)
 }
 
 #[cfg(unix)]
 fn same_file(left: &std::fs::Metadata, right: &std::fs::Metadata) -> bool {
-    use std::os::unix::fs::MetadataExt as _;
-    left.dev() == right.dev() && left.ino() == right.ino()
+    fs_custody::same_open_object(left, right)
 }
 
 fn open_directory_snapshot(
@@ -599,9 +616,9 @@ impl PinnedDirectory {
             acp_session_cwd,
             retain_descriptor_after_exec,
             #[cfg(test)]
-            sync_failure_countdown: Arc::new(AtomicUsize::new(0)),
+            sync_failure_countdown: Arc::new(FailureCountdownV1::new()),
             #[cfg(test)]
-            journal_publish_failure_countdown: Arc::new(AtomicUsize::new(0)),
+            journal_publish_failure_countdown: Arc::new(FailureCountdownV1::new()),
         })
     }
 
@@ -624,22 +641,8 @@ impl PinnedDirectory {
 
     pub(crate) fn sync(&self) -> Result<(), BoxError> {
         #[cfg(test)]
-        {
-            let mut remaining = self.sync_failure_countdown.load(Ordering::SeqCst);
-            while remaining != 0 {
-                match self.sync_failure_countdown.compare_exchange(
-                    remaining,
-                    remaining - 1,
-                    Ordering::SeqCst,
-                    Ordering::SeqCst,
-                ) {
-                    Ok(_) if remaining == 1 => {
-                        return Err("pinned directory: injected sync failure".into());
-                    }
-                    Ok(_) => break,
-                    Err(observed) => remaining = observed,
-                }
-            }
+        if self.sync_failure_countdown.fire_if_due() {
+            return Err("pinned directory: injected sync failure".into());
         }
         self.file
             .sync_all()
@@ -657,39 +660,24 @@ impl PinnedDirectory {
         })
     }
 
+    // The two injection points stay separate hooks even though they now share one countdown
+    // mechanism: they fire at different instants (the directory sync barrier versus the moment
+    // between a durable journal temporary and its publication rename), and several tests arm both
+    // on the same directory to prove one does not mask the other. Only the countdown itself was
+    // duplicated; unifying the HOOKS would change what can be injected.
     #[cfg(test)]
     pub(crate) fn fail_sync_on_nth_call_for_test(&self, call: usize) {
-        assert!(call > 0, "sync failure injection call must be positive");
-        self.sync_failure_countdown.store(call, Ordering::SeqCst);
+        self.sync_failure_countdown.arm(call);
     }
 
     #[cfg(test)]
     pub(crate) fn fail_journal_publish_on_nth_call_for_test(&self, call: usize) {
-        assert!(
-            call > 0,
-            "journal publication failure injection call must be positive"
-        );
-        self.journal_publish_failure_countdown
-            .store(call, Ordering::SeqCst);
+        self.journal_publish_failure_countdown.arm(call);
     }
 
     #[cfg(test)]
     fn journal_publish_failure_is_due(&self) -> bool {
-        let mut remaining = self
-            .journal_publish_failure_countdown
-            .load(Ordering::SeqCst);
-        while remaining != 0 {
-            match self.journal_publish_failure_countdown.compare_exchange(
-                remaining,
-                remaining - 1,
-                Ordering::SeqCst,
-                Ordering::SeqCst,
-            ) {
-                Ok(_) => return remaining == 1,
-                Err(observed) => remaining = observed,
-            }
-        }
-        false
+        self.journal_publish_failure_countdown.fire_if_due()
     }
 
     pub(crate) fn retain_descriptor_after_exec(&self) -> bool {
@@ -717,32 +705,17 @@ impl PinnedDirectory {
     ) -> Result<Option<ChildMetadataSnapshot>, BoxError> {
         #[cfg(unix)]
         {
-            use std::mem::MaybeUninit;
-            use std::os::fd::AsRawFd as _;
-
             let name = child_name_cstring(name, label)?;
-            let mut stat = MaybeUninit::<libc::stat>::uninit();
-            // SAFETY: the retained directory descriptor, validated child name, and writable stat
-            // buffer are live. AT_SYMLINK_NOFOLLOW reports the directory entry itself.
-            if unsafe {
-                libc::fstatat(
-                    self.file.as_raw_fd(),
-                    name.as_ptr(),
-                    stat.as_mut_ptr(),
-                    libc::AT_SYMLINK_NOFOLLOW,
-                )
-            } == -1
-            {
-                let error = std::io::Error::last_os_error();
-                if error.raw_os_error() == Some(libc::ENOENT) {
-                    return Ok(None);
+            let stat = match fs_custody::stat_child_no_follow(&self.file, &name) {
+                Ok(Some(stat)) => stat,
+                Ok(None) => return Ok(None),
+                Err(error) => {
+                    return Err(format!(
+                        "{label}: cannot inspect descriptor-relative child: {error}"
+                    )
+                    .into())
                 }
-                return Err(
-                    format!("{label}: cannot inspect descriptor-relative child: {error}").into(),
-                );
-            }
-            // SAFETY: successful fstatat initialized the complete stat value.
-            let stat = unsafe { stat.assume_init() };
+            };
             Ok(Some(ChildMetadataSnapshot {
                 mode: stat.st_mode as u32,
                 link_count: stat.st_nlink as u64,
@@ -959,30 +932,24 @@ impl PinnedDirectory {
     }
 
     /// Open one existing regular child relative to the retained directory object.
+    ///
+    /// Narrow wrapper over [`fs_custody::open_child_no_follow`]. The `O_NONBLOCK` request and the
+    /// single-link regular-file requirement are this module's POLICY, not the shared primitive's:
+    /// `O_NONBLOCK` keeps a substituted FIFO from parking the process before the kind gate runs,
+    /// and `nlink == 1` refuses an object that some other name also indexes.
     pub(crate) fn open_regular_file(&self, name: &OsStr, label: &str) -> Result<File, BoxError> {
         #[cfg(unix)]
         {
-            use std::os::fd::{AsRawFd as _, FromRawFd as _};
-
             let name = child_name_cstring(name, label)?;
-            // SAFETY: the parent descriptor and single-component name are live. The returned
-            // descriptor is uniquely adopted by File.
-            let fd = unsafe {
-                libc::openat(
-                    self.file.as_raw_fd(),
-                    name.as_ptr(),
-                    libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK,
-                )
-            };
-            if fd == -1 {
-                return Err(format!(
-                    "{label}: cannot open descriptor-relative file: {}",
-                    std::io::Error::last_os_error()
-                )
-                .into());
-            }
-            // SAFETY: `fd` was returned uniquely by openat above.
-            let file = unsafe { File::from_raw_fd(fd) };
+            let file = fs_custody::open_child_no_follow(
+                &self.file,
+                &name,
+                ChildOpenOptionsV1 {
+                    nonblocking: true,
+                    directory: false,
+                },
+            )
+            .map_err(|error| format!("{label}: cannot open descriptor-relative file: {error}"))?;
             let metadata = file
                 .metadata()
                 .map_err(|error| format!("{label}: cannot inspect opened file: {error}"))?;
@@ -1015,31 +982,25 @@ impl PinnedDirectory {
     ) -> Result<Option<Self>, BoxError> {
         #[cfg(unix)]
         {
-            use std::os::fd::{AsRawFd as _, FromRawFd as _};
-
             let c_name = child_name_cstring(name, label)?;
-            // SAFETY: the retained parent descriptor and single-component name are live; the
-            // returned descriptor is uniquely adopted by File and O_NOFOLLOW rejects a link.
-            let fd = unsafe {
-                libc::openat(
-                    self.file.as_raw_fd(),
-                    c_name.as_ptr(),
-                    libc::O_RDONLY | libc::O_CLOEXEC | libc::O_DIRECTORY | libc::O_NOFOLLOW,
-                )
-            };
-            if fd == -1 {
-                let error = std::io::Error::last_os_error();
-                if error.kind() == std::io::ErrorKind::NotFound {
-                    return Ok(None);
+            let file = match fs_custody::open_child_no_follow(
+                &self.file,
+                &c_name,
+                ChildOpenOptionsV1 {
+                    nonblocking: false,
+                    directory: true,
+                },
+            ) {
+                Ok(file) => file,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                Err(error) => {
+                    return Err(format!(
+                        "{label}: cannot open descriptor-relative directory: {}",
+                        error
+                    )
+                    .into())
                 }
-                return Err(format!(
-                    "{label}: cannot open descriptor-relative directory: {}",
-                    error
-                )
-                .into());
-            }
-            // SAFETY: `fd` was returned uniquely by openat above.
-            let file = unsafe { File::from_raw_fd(fd) };
+            };
             let metadata = file
                 .metadata()
                 .map_err(|error| format!("{label}: cannot inspect child directory: {error}"))?;
@@ -1059,9 +1020,9 @@ impl PinnedDirectory {
                 acp_session_cwd,
                 retain_descriptor_after_exec,
                 #[cfg(test)]
-                sync_failure_countdown: Arc::new(AtomicUsize::new(0)),
+                sync_failure_countdown: Arc::new(FailureCountdownV1::new()),
                 #[cfg(test)]
-                journal_publish_failure_countdown: Arc::new(AtomicUsize::new(0)),
+                journal_publish_failure_countdown: Arc::new(FailureCountdownV1::new()),
             }))
         }
         #[cfg(not(unix))]
@@ -1148,9 +1109,9 @@ impl PinnedDirectory {
                 acp_session_cwd,
                 retain_descriptor_after_exec,
                 #[cfg(test)]
-                sync_failure_countdown: Arc::new(AtomicUsize::new(0)),
+                sync_failure_countdown: Arc::new(FailureCountdownV1::new()),
                 #[cfg(test)]
-                journal_publish_failure_countdown: Arc::new(AtomicUsize::new(0)),
+                journal_publish_failure_countdown: Arc::new(FailureCountdownV1::new()),
             })
         }
         #[cfg(not(unix))]
@@ -1332,41 +1293,12 @@ impl PinnedDirectory {
             before_capture()?;
 
             if !captured_already {
-                // SAFETY: both validated names are beneath the retained directory. Atomic
-                // no-replace capture cannot clobber recovery residue and isolates the entry
-                // selected at the rename linearization point before any unlink is attempted.
-                #[cfg(target_os = "macos")]
-                let capture_result = unsafe {
-                    libc::renameatx_np(
-                        self.file.as_raw_fd(),
-                        original_c.as_ptr(),
-                        self.file.as_raw_fd(),
-                        quarantine_c.as_ptr(),
-                        libc::RENAME_EXCL,
-                    )
-                };
-                #[cfg(target_os = "linux")]
-                let capture_result = unsafe {
-                    libc::renameat2(
-                        self.file.as_raw_fd(),
-                        original_c.as_ptr(),
-                        self.file.as_raw_fd(),
-                        quarantine_c.as_ptr(),
-                        libc::RENAME_NOREPLACE,
-                    )
-                };
-                #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-                return Err(format!(
-                    "{label}: atomic removal quarantine is unsupported on this platform"
-                )
-                .into());
-                if capture_result == -1 {
-                    return Err(format!(
-                        "{label}: cannot capture verified child for removal: {}",
-                        std::io::Error::last_os_error()
-                    )
-                    .into());
-                }
+                // The atomic no-replace capture cannot clobber recovery residue, and it isolates
+                // the entry selected at the rename linearization point before any unlink is
+                // attempted. The rename itself is `fs_custody`'s; the quarantine protocol around
+                // it is this module's.
+                fs_custody::rename_child_no_replace(&self.file, &original_c, &quarantine_c)
+                    .map_err(|error| quarantine_capture_error(label, error))?;
                 self.sync().map_err(|error| {
                     format!("{label}: removal capture sync is ambiguous: {error}")
                 })?;
@@ -1427,9 +1359,6 @@ impl PinnedDirectory {
     {
         #[cfg(unix)]
         {
-            use std::mem::MaybeUninit;
-            use std::os::fd::AsRawFd as _;
-
             let source_name = child_name_cstring(source.name, label)?;
             let target_c = child_name_cstring(target_name, label)?;
             if source_name.as_bytes() == target_c.as_bytes() {
@@ -1444,64 +1373,22 @@ impl PinnedDirectory {
                 return Err(format!("{label}: source identity changed before publication").into());
             }
 
-            let mut target_metadata = MaybeUninit::<libc::stat>::uninit();
-            // SAFETY: the retained directory descriptor, target C string, and output pointer are
-            // valid for this no-follow existence check.
-            let target_result = unsafe {
-                libc::fstatat(
-                    self.file.as_raw_fd(),
-                    target_c.as_ptr(),
-                    target_metadata.as_mut_ptr(),
-                    libc::AT_SYMLINK_NOFOLLOW,
-                )
-            };
-            if target_result == 0 {
-                return Err(format!("{label}: publication target already exists").into());
-            }
-            let target_error = std::io::Error::last_os_error();
-            if target_error.raw_os_error() != Some(libc::ENOENT) {
-                return Err(format!(
-                    "{label}: cannot prove publication target absence: {target_error}"
-                )
-                .into());
+            match fs_custody::stat_child_no_follow(&self.file, &target_c) {
+                Ok(Some(_)) => {
+                    return Err(format!("{label}: publication target already exists").into())
+                }
+                Ok(None) => {}
+                Err(target_error) => {
+                    return Err(format!(
+                        "{label}: cannot prove publication target absence: {target_error}"
+                    )
+                    .into())
+                }
             }
             before_rename()?;
 
-            // SAFETY: both names are validated single components beneath the same retained
-            // directory descriptor. The no-replace flag makes target absence part of the atomic
-            // rename operation, including against actors that do not honor the owner lock.
-            #[cfg(target_os = "macos")]
-            let rename_result = unsafe {
-                libc::renameatx_np(
-                    self.file.as_raw_fd(),
-                    source_name.as_ptr(),
-                    self.file.as_raw_fd(),
-                    target_c.as_ptr(),
-                    libc::RENAME_EXCL,
-                )
-            };
-            #[cfg(target_os = "linux")]
-            let rename_result = unsafe {
-                libc::renameat2(
-                    self.file.as_raw_fd(),
-                    source_name.as_ptr(),
-                    self.file.as_raw_fd(),
-                    target_c.as_ptr(),
-                    libc::RENAME_NOREPLACE,
-                )
-            };
-            #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-            return Err(format!(
-                "{label}: atomic no-replace publication is unsupported on this platform"
-            )
-            .into());
-            if rename_result == -1 {
-                return Err(format!(
-                    "{label}: cannot atomically publish new regular child: {}",
-                    std::io::Error::last_os_error()
-                )
-                .into());
-            }
+            fs_custody::rename_child_no_replace(&self.file, &source_name, &target_c)
+                .map_err(|error| publication_rename_error(label, error))?;
             self.sync().map_err(|error| {
                 format!("{label}: publication renamed but directory sync is ambiguous: {error}")
             })?;
@@ -1662,15 +1549,53 @@ fn set_effective_owner(file: &File, label: &str) -> Result<(), BoxError> {
     Ok(())
 }
 
+/// The message for a failed removal-quarantine capture rename.
+///
+/// The platform claim is made ONLY for the structurally distinct
+/// [`RenameNoReplaceRefusalV1::PlatformUnsupported`], which only the off-matrix compile arm
+/// constructs. A kernel or filesystem that declines the flag at RUNTIME keeps its errno text —
+/// `ErrorKind` cannot separate the two cases, since a real `ENOSYS`/`EOPNOTSUPP` decodes to
+/// `ErrorKind::Unsupported` as well.
+#[cfg(unix)]
+fn quarantine_capture_error(label: &str, refusal: RenameNoReplaceRefusalV1) -> BoxError {
+    match refusal {
+        RenameNoReplaceRefusalV1::PlatformUnsupported => {
+            format!("{label}: atomic removal quarantine is unsupported on this platform").into()
+        }
+        RenameNoReplaceRefusalV1::Io(error) => {
+            format!("{label}: cannot capture verified child for removal: {error}").into()
+        }
+    }
+}
+
+/// The message for a failed atomic no-replace publication rename. Same platform-vs-runtime
+/// discipline as [`quarantine_capture_error`].
+#[cfg(unix)]
+fn publication_rename_error(label: &str, refusal: RenameNoReplaceRefusalV1) -> BoxError {
+    match refusal {
+        RenameNoReplaceRefusalV1::PlatformUnsupported => {
+            format!("{label}: atomic no-replace publication is unsupported on this platform").into()
+        }
+        RenameNoReplaceRefusalV1::Io(error) => {
+            format!("{label}: cannot atomically publish new regular child: {error}").into()
+        }
+    }
+}
+
+/// Narrow wrapper: the validator is [`fs_custody::validated_child_name`]. Its discriminated
+/// refusal is re-worded into the two messages this module has always produced — the shared
+/// validator checks component shape before NUL precisely so a name violating both keeps
+/// reporting the same one of the two here.
 #[cfg(unix)]
 fn child_name_cstring(name: &OsStr, label: &str) -> Result<std::ffi::CString, BoxError> {
-    use std::os::unix::ffi::OsStrExt as _;
-
-    let bytes = name.as_bytes();
-    if bytes.is_empty() || bytes == b"." || bytes == b".." || bytes.contains(&b'/') {
-        return Err(format!("{label}: child name must be one non-special path component").into());
-    }
-    std::ffi::CString::new(bytes).map_err(|_| format!("{label}: child name contains NUL").into())
+    fs_custody::validated_child_name(name).map_err(|refusal| -> BoxError {
+        match refusal {
+            ChildNameRefusalV1::NotOneComponent => {
+                format!("{label}: child name must be one non-special path component").into()
+            }
+            ChildNameRefusalV1::ContainsNul => format!("{label}: child name contains NUL").into(),
+        }
+    })
 }
 
 #[cfg(not(unix))]
@@ -1870,6 +1795,98 @@ where
 mod tests {
     use super::*;
     use std::fs;
+
+    /// R2f1b A4 R1. Discriminates a rename wrapper that decides "this platform has no
+    /// no-replace rename" from `io::ErrorKind`. It cannot: the pinned toolchain maps `ENOSYS`
+    /// and `EOPNOTSUPP` to `ErrorKind::Unsupported`
+    /// (`library/std/src/sys/io/error/unix.rs:123,140`), and those are exactly what a REAL
+    /// `renameat2`/`renameatx_np` returns when the FILESYSTEM does not implement the flag —
+    /// pre-3.15 kernels and overlay/network filesystems on Linux, and the Darwin VFS layers that
+    /// report `EOPNOTSUPP`. An `ErrorKind`-based branch swallows that actionable errno and
+    /// asserts something untrue about the platform, losing the `(os error N)` an operator needs
+    /// to tell "move this off SMB" from "this build cannot do it at all". Platform capability is
+    /// a compile-time fact and must never be inferred from a runtime errno.
+    ///
+    /// NOTE (measured, correcting the received analysis): on Darwin `ENOTSUP` (45) and
+    /// `EOPNOTSUPP` (102) are DIFFERENT values and only the latter decodes to `Unsupported`;
+    /// they are equal only on Linux. The precondition below therefore asserts that at least one
+    /// candidate reaches the branch under test on THIS platform, rather than assuming all three
+    /// do — an assumption that made an earlier version of this test inadmissible.
+    #[cfg(unix)]
+    #[test]
+    fn rename_refusals_carrying_an_unsupported_kind_errno_keep_their_errno_text() {
+        let candidates = [libc::ENOTSUP, libc::EOPNOTSUPP, libc::ENOSYS];
+        assert!(
+            candidates
+                .iter()
+                .any(|raw| std::io::Error::from_raw_os_error(*raw).kind()
+                    == std::io::ErrorKind::Unsupported),
+            "fixture precondition: at least one candidate errno must decode to \
+             ErrorKind::Unsupported on this platform, or this test cannot reach the branch it \
+             exists to discriminate"
+        );
+
+        for raw in candidates {
+            let rendered = std::io::Error::from_raw_os_error(raw).to_string();
+            assert_eq!(
+                quarantine_capture_error(
+                    "removal",
+                    RenameNoReplaceRefusalV1::Io(std::io::Error::from_raw_os_error(raw)),
+                )
+                .to_string(),
+                format!("removal: cannot capture verified child for removal: {rendered}"),
+                "errno {raw} must keep its errno text"
+            );
+            assert_eq!(
+                publication_rename_error(
+                    "publish",
+                    RenameNoReplaceRefusalV1::Io(std::io::Error::from_raw_os_error(raw)),
+                )
+                .to_string(),
+                format!("publish: cannot atomically publish new regular child: {rendered}"),
+                "errno {raw} must keep its errno text"
+            );
+        }
+    }
+
+    /// A2f1b A4 R3. Pins both child-name wrapper messages byte-exactly, including the
+    /// tie-break for a name that violates BOTH rules. The shared validator checks component
+    /// shape before NUL precisely so this case keeps reporting the component message; a
+    /// validator that reordered its checks would silently change operator-facing text that this
+    /// module has produced since before the extraction.
+    #[cfg(unix)]
+    #[test]
+    fn child_name_wrapper_messages_are_byte_exact_including_the_both_rules_tie_break() {
+        use std::os::unix::ffi::OsStrExt as _;
+
+        for name in [
+            OsStr::new(""),
+            OsStr::new("."),
+            OsStr::new(".."),
+            OsStr::new("a/b"),
+        ] {
+            assert_eq!(
+                child_name_cstring(name, "evidence")
+                    .unwrap_err()
+                    .to_string(),
+                "evidence: child name must be one non-special path component",
+                "for {name:?}"
+            );
+        }
+        assert_eq!(
+            child_name_cstring(OsStr::from_bytes(b"a\0b"), "evidence")
+                .unwrap_err()
+                .to_string(),
+            "evidence: child name contains NUL"
+        );
+        // Violates both rules: the component message wins, as it always has.
+        assert_eq!(
+            child_name_cstring(OsStr::from_bytes(b"a\0/b"), "evidence")
+                .unwrap_err()
+                .to_string(),
+            "evidence: child name must be one non-special path component"
+        );
+    }
 
     #[test]
     fn bounded_reader_accepts_regular_file_and_hashes_exact_bytes() {

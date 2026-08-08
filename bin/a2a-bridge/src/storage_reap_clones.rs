@@ -117,6 +117,7 @@
 
 use crate::storage_reap as rp;
 use crate::storage_report as sr;
+use bridge_core::fs_custody;
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
@@ -977,7 +978,7 @@ pub fn resolve_origin(clone: &Path, scan_root: &Path) -> OriginResolution {
     let root_identity = chain
         .as_ref()
         .ok()
-        .and_then(|c| rp::dir_dev_ino(&c.root).ok());
+        .and_then(|c| fs_custody::directory_dev_ino(&c.root).ok());
     OriginResolution {
         first_hop: immediate.clone(),
         chain,
@@ -1263,7 +1264,10 @@ pub fn derive_clone_facts(
         //     admission, before this run's operation lock was held, and `origin` lives inside the
         //     `:rw` mount — so both ends are re-checked: the clone's first hop, and the terminal
         //     root's directory identity.
-        match (resolution.root_identity, rp::dir_dev_ino(&resolved)) {
+        match (
+            resolution.root_identity,
+            fs_custody::directory_dev_ino(&resolved),
+        ) {
             (Some(before), Ok(now)) if before == now => {}
             (Some(before), Ok(now)) => {
                 return Err(rp::ParkReason::SourceRootIdentityChanged {
@@ -2406,36 +2410,19 @@ fn reap_one<E: rp::ReapEnv>(
     }
 
     // GATE 3 — the pinned scan root must still be the root we pinned.
-    if let Err(detail) = rp::pinned_root_unchanged(pin) {
+    if let Err(detail) = fs_custody::pinned_root_unchanged(pin) {
         parked_locked!(rp::ParkReason::ScanRootIdentityChanged { detail })
     }
     gates.push(format!(
         "scan root: descriptor-pinned and re-verified ({})",
-        rp::root_identity_label(pin)
+        fs_custody::root_identity_label(pin)
     ));
 
     // GATE 4 — path identity: a real directory, not a symlink, still resolving to itself.
-    let identity = match rp::dir_dev_ino(&path) {
+    let identity = match fs_custody::verify_payload_directory_identity(&path) {
         Ok(id) => id,
-        Err(detail) => {
-            if std::fs::symlink_metadata(&path)
-                .map(|m| m.file_type().is_symlink())
-                .unwrap_or(false)
-            {
-                parked_locked!(rp::ParkReason::PathIsSymlink)
-            }
-            parked_locked!(rp::ParkReason::PathNotADirectory { detail })
-        }
+        Err(refusal) => parked_locked!(rp::payload_identity_park_reason(refusal)),
     };
-    match std::fs::canonicalize(&path) {
-        Ok(cp) if cp == path => {}
-        Ok(cp) => parked_locked!(rp::ParkReason::PathIdentityChanged {
-            detail: format!("{} now resolves to {}", path.display(), cp.display()),
-        }),
-        Err(e) => parked_locked!(rp::ParkReason::PathIdentityChanged {
-            detail: format!("{} has no canonical path: {e}", path.display()),
-        }),
-    }
     gates.push(format!(
         "path identity: real directory, no symlink, dev {} / ino {}",
         identity.0, identity.1
@@ -2545,7 +2532,7 @@ fn reap_one<E: rp::ReapEnv>(
         descendant_presence: Vec::new(),
         gates: gates.clone(),
         scan_root: root.to_string_lossy().into_owned(),
-        scan_root_identity: rp::root_identity_label(pin),
+        scan_root_identity: fs_custody::root_identity_label(pin),
         at_epoch_secs: env.now_epoch_secs(),
     };
 
@@ -2659,7 +2646,7 @@ fn reap_one<E: rp::ReapEnv>(
 
     // GATE 12 — the fold receipt as the crash-durable INTENT, fsync'd BEFORE the removal, in the
     // sibling namespace that outlives the clone.
-    if let Err(detail) = rp::pinned_root_unchanged(pin) {
+    if let Err(detail) = fs_custody::pinned_root_unchanged(pin) {
         parked_locked!(rp::ParkReason::ScanRootIdentityChanged { detail })
     }
     let receipt_path = match encode_and_write(&receipt, &receipts, env) {
@@ -2670,37 +2657,12 @@ fn reap_one<E: rp::ReapEnv>(
         Err(detail) => parked_locked!(rp::ParkReason::FoldReceiptUnavailable { detail }),
     };
 
-    // The removal, with the LAST identity checks immediately before the unlink.
+    // The removal, with the LAST identity checks immediately before the unlink — the same
+    // verify-then-act boundary the build-target reaper runs, from its one implementation. Only
+    // the gate vocabulary below ("clone" rather than "payload") is this command's.
     let mut item_gates = gates.clone();
-    let outcome = 'removal: {
-        if let Err(detail) = rp::pinned_root_unchanged(pin) {
-            break 'removal rp::ItemOutcome::Parked {
-                reason: rp::ParkReason::ScanRootIdentityChanged { detail },
-            };
-        }
-        match rp::dir_dev_ino(&path) {
-            Ok(now) if now == identity => {}
-            Ok(now) => {
-                break 'removal rp::ItemOutcome::Parked {
-                    reason: rp::ParkReason::PathIdentityChanged {
-                        detail: format!(
-                            "{} changed identity between the gates and the removal (dev/ino {}/{} to \
-                             {}/{})",
-                            path.display(),
-                            identity.0,
-                            identity.1,
-                            now.0,
-                            now.1
-                        ),
-                    },
-                };
-            }
-            Err(detail) => {
-                break 'removal rp::ItemOutcome::Parked {
-                    reason: rp::ParkReason::PathNotADirectory { detail },
-                };
-            }
-        }
+    let mut freed_bytes_measured = None;
+    let verified = fs_custody::verify_then_remove(pin, &path, identity, || {
         item_gates.push(
             "boundary recheck: root and clone identity unchanged immediately before removal"
                 .to_string(),
@@ -2713,21 +2675,26 @@ fn reap_one<E: rp::ReapEnv>(
         let before = env.free_bytes(&root);
         let removal = env.remove_tree(&path);
         let after = env.free_bytes(&root);
-        let gone = std::fs::symlink_metadata(&path).is_err();
-        let mut outcome = match (removal, gone) {
-            (Ok(()), true) => rp::ItemOutcome::Deleted,
-            (Ok(()), false) => rp::ItemOutcome::Partial {
-                detail: format!(
-                    "the removal reported success but {} is still present",
-                    path.display()
-                ),
-            },
-            (Err(e), false) => rp::ItemOutcome::Partial { detail: e },
-            (Err(e), true) => rp::ItemOutcome::Unknown {
-                detail: format!("removal reported an error ({e}) but the path is gone"),
-            },
+        freed_bytes_measured = match (before, after) {
+            (Some(b), Some(a)) => Some(a as i64 - b as i64),
+            _ => None,
         };
-        if let Err(detail) = rp::pinned_root_unchanged(pin) {
+        removal
+    });
+    let outcome = 'removal: {
+        let (observation, root_changed_during) = match verified {
+            fs_custody::VerifiedRemovalV1::Refused(refusal) => {
+                break 'removal rp::ItemOutcome::Parked {
+                    reason: rp::removal_boundary_park_reason(refusal),
+                };
+            }
+            fs_custody::VerifiedRemovalV1::Acted {
+                observation,
+                root_changed_during,
+            } => (observation, root_changed_during),
+        };
+        let mut outcome = rp::removal_item_outcome(observation);
+        if let Some(detail) = root_changed_during {
             outcome = rp::ItemOutcome::Unknown {
                 detail: format!("the pinned scan root changed during the removal: {detail}"),
             };
@@ -2735,10 +2702,7 @@ fn reap_one<E: rp::ReapEnv>(
             item_gates.push("scan root identity re-verified AFTER the removal".to_string());
         }
         let mut out = base_item(outcome, item_gates.clone());
-        out.freed_bytes_measured = match (before, after) {
-            (Some(b), Some(a)) => Some(a as i64 - b as i64),
-            _ => None,
-        };
+        out.freed_bytes_measured = freed_bytes_measured;
         // Carried out of the block through the item below.
         receipt.disposition = disposition_of(&out.outcome).to_string();
         // A removal that began and did not cleanly finish leaves every OTHER row about this clone

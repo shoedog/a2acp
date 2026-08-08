@@ -39,6 +39,12 @@ pub const NODE_PRIMARY_RECORD_SCHEMA_V3: u16 = 3;
 pub const NODE_CLEANUP_RECORD_SCHEMA_V2: u16 = 2;
 pub const R2F1B_CONTRACT_SCHEMA_V1: u16 = 1;
 pub const R2F1B_RESOURCE_CONTRACT_VERSION_V1: u16 = 1;
+/// The stand-in `contract_fingerprint` byte string that both the minting and the validating
+/// halves of the R2f1b contract hash into the `contract_fingerprint` FIELD before canonicalizing
+/// and hashing the whole record. Minting and validation must agree on it exactly or every
+/// contract fails to validate, so it is named once rather than being spelled out per call site.
+pub(crate) const R2F1B_CONTRACT_FINGERPRINT_PLACEHOLDER: &[u8] =
+    b"r2f1b-contract-fingerprint-placeholder";
 pub const NODE_PRIMARY_RECORD_SKELETON_CEILING_BYTES: usize = 256;
 pub const NODE_CLEANUP_RECORD_SKELETON_CEILING_BYTES: usize = 384;
 pub const MAX_NODE_PRIMARY_RECORD_JSON_BYTES: usize = 1_536;
@@ -315,7 +321,7 @@ impl FrozenR2f1bContractV1 {
             return Err(ExecutionPolicyError::InvalidStructuredEvidence);
         }
         let mut clone = self.clone();
-        clone.contract_fingerprint = Sha256HexV1::digest(b"r2f1b-contract-fingerprint-placeholder");
+        clone.contract_fingerprint = Sha256HexV1::digest(R2F1B_CONTRACT_FINGERPRINT_PLACEHOLDER);
         let encoded = canonical_json(&clone)?;
         let expected = Sha256HexV1::digest(&encoded);
         if self.contract_fingerprint != expected {
@@ -338,7 +344,7 @@ impl FrozenR2f1bContractV1 {
             activation,
             custody_plans,
             resource_contract_version: R2F1B_RESOURCE_CONTRACT_VERSION_V1,
-            contract_fingerprint: Sha256HexV1::digest(b"r2f1b-contract-fingerprint-placeholder"),
+            contract_fingerprint: Sha256HexV1::digest(R2F1B_CONTRACT_FINGERPRINT_PLACEHOLDER),
         };
         value.contract_fingerprint = Sha256HexV1::digest(&canonical_json(&value)?);
         value.validate()?;
@@ -2459,7 +2465,7 @@ mod r2f1b_contract_tests {
             activation: DeadlineActivationV2::ManualOnlyR2f1a,
             custody_plans,
             resource_contract_version: R2F1B_RESOURCE_CONTRACT_VERSION_V1,
-            contract_fingerprint: Sha256HexV1::digest(b"r2f1b-contract-fingerprint-placeholder"),
+            contract_fingerprint: Sha256HexV1::digest(R2F1B_CONTRACT_FINGERPRINT_PLACEHOLDER),
         };
         contract.contract_fingerprint = Sha256HexV1::digest(&canonical_json(&contract).unwrap());
         contract
