@@ -85,12 +85,23 @@ The PR #50 closure record mandates before slice 2: close the remaining section-6
 tests and adjudicate the `fs_custody`/`local_file` extraction. Gate definitions are unchanged from
 revision 2 §2 (recorded at `b133841`); they are referenced here, not restated.
 
-- **A1 — runtime custody-test gate** (rev-2 §2.1): durable identity-bound custody before timers/effects;
-  sweep survival; ambiguous evidence never deletes; global-outcome deletion authority; resume claim exchange.
-- **A2 — preparation-flight (§2.2) + resource-flight (§2.3) test gates.** Split into two PRs if either
-  review round finds a closed population larger than its cap.
-- **A3 — V3 snapshot-test gate** (§2.4): complete unique custody plans; immutable delivery/contract bytes
-  across successor resume; coherent lineage; manual-only V2.
+- **Scoping ruling (2026-08-07 gap enumeration):** of the 32 §6/gate properties, 28 lack tests — and the
+  preparation/resource-flight rows plus the executor deadline/sweep rows lack the *behavior itself*
+  (`preparation_flight.rs`/`resource_flight.rs` are inert contracts; the executor has no clock wiring).
+  Pre-slice-2 Track A therefore covers only tests against **existing inactive code**; the behavioral matrix
+  rows land fail-first *with* their implementing focused-boundary slices (2 = custody/sweeps, 3 = resource
+  authority, 4 = scheduler), exactly as the focused boundary already sequences them. Cross-cutting §6 rows
+  (surface parity, rollback goldens) land with the slice that first makes them expressible.
+- **A1 — `fs_custody` primitive tests** (rev-2 §2.1, contract level): `PinnedDirectoryV1` identity pinning,
+  no-follow open, sync barriers + injected sync failure ⇒ typed ambiguous outcome, atomic no-replace
+  publication, post-rename identity re-check — the primitives currently have zero callers and zero tests.
+- **A2 — flight *type-contract* tests only** (§2.2/§2.3): state/ID serialization, `NodeCleanupRecordV2`
+  forced-overflow bound (`shorten_bounded_cause` is currently uncalled by any test), collateral coherence
+  edges. Flight-runner behavior tests move to focused-boundary slice 3.
+- **A3 — V3 snapshot/contract tests** (§2.4): `FrozenR2f1bContractV1::validate` canonical/sorted/unique
+  plans, fingerprint invalidation on any mutation, `WorkflowSnapshotV3::validate_successor` byte-exact
+  delivery/contract + lineage coherence, V2/V3 mutual non-reinterpretation, the two-node #22 terminal-map
+  case, and the V3 cleanup-row forced-overflow edge.
 - **A4 — `fs_custody`/`local_file` single-owner extraction** (§2.5): `local_file`'s duplicated pinned-
   directory/no-follow/sync/no-replace primitives become narrow wrappers over `fs_custody`; bounded-reader,
   quarantine, replacement, and compatibility-evidence policy stay in `local_file`. Parity + fault-injection
