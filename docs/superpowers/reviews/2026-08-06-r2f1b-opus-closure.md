@@ -100,3 +100,15 @@ fixture edges.
 PR #50 may merge only after required GitHub checks are green and live `main` still equals exact reviewed base
 `9a0bf6e9a62efd240c74fae3635bd21bf172e77a`. Target drift invalidates the reviewed composition and parks the
 landing under the one-review cap.
+
+## Addendum — post-merge identity reconciliation (2026-08-07)
+
+The identities above are preserved verbatim as review history, with one post-merge correction: the
+"exact reviewed aggregate tree" `4fb6bfe1cebcad937204a1a798fd2e7c8f7fa0e7` and the operator-authored
+integration commit `23ed6439c7e1f5315db7d0dc57502f5eafcb7aa9` are **no longer reachable in the local
+repository**. The bounded platform/coverage repair recorded in the roadmap produced final PR head
+`00f03c4`, and the squash merge landed as `aedd2c2` with tree `de53676`. The durable identity of the
+landed foundation is therefore PR #50's squash-merge commit `aedd2c2` (parent `9a0bf6e`, tree `de53676`);
+whether the pre-squash objects survive on the GitHub side via PR #50's head branch has not been verified
+locally. This stranding is an instance of the squash hazard the pre-slice-2 custody plan (revision 3 §7)
+now guards against with fold receipts.
