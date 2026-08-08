@@ -131,6 +131,12 @@ pub fn rust_profile() -> LanguageProfile {
         verify_env: vec![
             ("CARGO_HOME".to_string(), "/cache/cargo".to_string()),
             ("CARGO_TARGET_DIR".to_string(), "/cache/target".to_string()),
+            // R2f1b S1: one-shot verify builds must not use incremental compilation. Measured basis:
+            // 44% of a 15.77 GiB verifier cache volume was incremental artifacts, which never pay off
+            // for a fresh container invocation (no warm rustc process, no reused query cache) and only
+            // bloat the persistent `/cache` volume across unrelated verify runs. Scoped to the Verify
+            // context only — interactive/warm implement sessions (Writer) are unaffected.
+            ("CARGO_INCREMENTAL".to_string(), "0".to_string()),
         ],
         image: None,
         verify_commands: vec![
@@ -211,9 +217,41 @@ mod tests {
             vec![
                 ("CARGO_HOME".to_string(), "/cache/cargo".to_string()),
                 ("CARGO_TARGET_DIR".to_string(), "/cache/target".to_string()),
+                ("CARGO_INCREMENTAL".to_string(), "0".to_string()),
             ]
         );
         assert_eq!(b.mounts, vec!["verifyvol:/cache".to_string()]);
+    }
+
+    /// R2f1b S1: one-shot verify builds must disable incremental compilation (measured basis: 44% of a
+    /// 15.77 GiB verifier cache was incremental artifacts). Scoped to `CacheCtx::Verify` ONLY — the other
+    /// three contexts (Fetch/Lsp/Writer, exercised by the tests above) must NOT carry it, since interactive
+    /// warm-session (implementor) and lsp-nav env are unaffected by this change.
+    #[test]
+    fn rust_verify_binding_disables_incremental_compilation() {
+        let p = rust_profile();
+        let b = p.cache_binding(CacheCtx::Verify, "warmvol", "verifyvol");
+        assert!(
+            b.env
+                .contains(&("CARGO_INCREMENTAL".to_string(), "0".to_string())),
+            "one-shot verify env must force CARGO_INCREMENTAL=0: {:?}",
+            b.env
+        );
+    }
+
+    #[test]
+    fn non_verify_bindings_do_not_force_incremental_off() {
+        // Negative case: Fetch/Lsp/Writer are interactive/warm contexts, not one-shot verify — none of
+        // them should carry CARGO_INCREMENTAL.
+        let p = rust_profile();
+        for ctx in [CacheCtx::Fetch, CacheCtx::Lsp, CacheCtx::Writer] {
+            let b = p.cache_binding(ctx, "warmvol", "verifyvol");
+            assert!(
+                !b.env.iter().any(|(k, _)| k == "CARGO_INCREMENTAL"),
+                "{ctx:?} must not force CARGO_INCREMENTAL: {:?}",
+                b.env
+            );
+        }
     }
 
     #[test]

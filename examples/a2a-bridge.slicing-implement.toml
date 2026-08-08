@@ -51,7 +51,7 @@ warm_cache = "a2a-impl-lsp-cache"
 dep_cache_path = "/cargo"
 verify_cache_path = "/cache"
 fetch_env = { CARGO_HOME = "/cargo" }
-verify_env = { CARGO_HOME = "/cache/cargo", CARGO_TARGET_DIR = "/cache/target" }
+verify_env = { CARGO_HOME = "/cache/cargo", CARGO_TARGET_DIR = "/cache/target", CARGO_INCREMENTAL = "0" }
 writer_env = { CARGO_HOME = "/cargo", CARGO_NET_OFFLINE = "true", RUSTUP_HOME = "/usr/local/rustup" }
 [[languages.verify]]
 name = "fmt"

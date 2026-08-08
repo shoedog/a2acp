@@ -9,6 +9,9 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: "-D warnings"
+  # One-shot CI build/test jobs never reuse incremental artifacts across a run (R2f1b S1); a measured
+  # verifier target showed 44% of a 15.77 GiB cache was incremental artifacts with no reuse payoff.
+  CARGO_INCREMENTAL: 0
 
 permissions:
   contents: read
@@ -68,6 +71,7 @@ jobs:
             "PATH=$PATH" \
             "CARGO_HOME=$CARGO_HOME" \
             "RUSTFLAGS=$RUSTFLAGS" \
+            "CARGO_INCREMENTAL=$CARGO_INCREMENTAL" \
             cargo test -p bridge-store sqlite::r2f0a_history_tests::real_readonly_parent_lock_and_database_failures_remain_distinct \
             --locked -- --exact --nocapture --test-threads=1
 

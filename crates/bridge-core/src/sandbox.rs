@@ -681,9 +681,10 @@ pub fn compose_verify(
         .collect::<Vec<_>>()
         .join(" ");
     // Only `mkdir -p` env values that are ABSOLUTE PATHS (start with `/`). Non-path env (e.g. Go's
-    // `GOFLAGS=-mod=readonly`) must NOT be mkdir'd — `mkdir -p … -mod=readonly` parses the leading `-`
-    // as an option and aborts the `&&` chain before the command runs. Rust's verify_env is all `/`-paths,
-    // so this is byte-for-byte the old script for rust.
+    // `GOFLAGS=-mod=readonly`, or Rust's `CARGO_INCREMENTAL=0` since R2f1b S1) must NOT be mkdir'd —
+    // `mkdir -p … -mod=readonly` parses the leading `-` as an option and aborts the `&&` chain before the
+    // command runs. The invariant is per-VALUE, not per-profile: any `/`-prefixed env value gets mkdir'd,
+    // every other value is exported only.
     let mkdirs = cache
         .env
         .iter()
@@ -1050,6 +1051,9 @@ mod tests {
         assert!(script.contains("cd '/Users/w/code/.a2a-implement/impl-1-ab'"));
         assert!(script.contains("CARGO_HOME=/cache/cargo"));
         assert!(script.contains("CARGO_TARGET_DIR=/cache/target"));
+        // R2f1b S1: one-shot verify builds disable incremental compilation (measured basis: 44% of a
+        // 15.77 GiB verifier cache was incremental artifacts).
+        assert!(script.contains("CARGO_INCREMENTAL=0"));
         assert!(script.contains("cargo build --locked"));
     }
 
@@ -1094,7 +1098,7 @@ mod tests {
         // malformed `mkdir -p "$CARGO_HOME" "$CARGO_TARGET_DIR"` segment slip through).
         assert_eq!(
             argv.last().unwrap(),
-            "cd '/Users/x/code/.a2a-implement/impl-1-abc' && export CARGO_HOME=/cache/cargo CARGO_TARGET_DIR=/cache/target && mkdir -p \"$CARGO_HOME\" \"$CARGO_TARGET_DIR\" && cargo build --locked"
+            "cd '/Users/x/code/.a2a-implement/impl-1-abc' && export CARGO_HOME=/cache/cargo CARGO_TARGET_DIR=/cache/target CARGO_INCREMENTAL=0 && mkdir -p \"$CARGO_HOME\" \"$CARGO_TARGET_DIR\" && cargo build --locked"
         );
         // The cache mount comes from the binding.
         assert!(

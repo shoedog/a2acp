@@ -3472,6 +3472,37 @@ addr="127.0.0.1:8080"
     }
 
     #[test]
+    fn tracked_container_profiles_disable_incremental_compilation_for_one_shot_verify() {
+        // R2f1b S1 review repair: the hardcoded bridge_core::profile::rust_profile() is test-only — no
+        // production caller reaches it. Production verify profiles come exclusively from TOML
+        // (select_profile -> RegistryConfig::language_profiles -> LanguageToml::to_profile), which maps
+        // verify_env with NO injected defaults. So CARGO_INCREMENTAL=0 must be set directly in every
+        // tracked config's rust [[languages]] verify_env, or no production verify container ever receives
+        // it and the AGENTS.md convention documents nothing real.
+        for raw in [
+            include_str!("../../../examples/a2a-bridge.containerized.toml"),
+            include_str!("../../../examples/a2a-bridge.containerized.podman.toml"),
+            include_str!("../../../examples/a2a-bridge.slicing-implement.toml"),
+        ] {
+            let profiles = RegistryConfig::parse(raw)
+                .unwrap()
+                .language_profiles()
+                .unwrap();
+            let rust = profiles
+                .iter()
+                .find(|p| p.id == "rust")
+                .expect("rust profile present");
+            let verify_env = rust
+                .cache_binding(bridge_core::profile::CacheCtx::Verify, "", "")
+                .env;
+            assert!(
+                verify_env.contains(&("CARGO_INCREMENTAL".to_string(), "0".to_string())),
+                "tracked config's rust verify_env must force CARGO_INCREMENTAL=0: {verify_env:?}"
+            );
+        }
+    }
+
+    #[test]
     fn example_containerized_go_language_profile() {
         // Check both configs symmetrically — the go profile must be identical in each.
         for raw in [

@@ -106,7 +106,10 @@ for c in verify.commands:
 verdict = VerifyVerdict { results, passed: results.iter().all(|r| !r.gate || r.ok) }
 ```
 Per-command `docker run` sharing the `a2a-verify-cache-<repohash>` volume (`/cache/cargo` = CARGO_HOME,
-`/cache/target` = CARGO_TARGET_DIR) → first run cold, the rest incremental across commands AND runs. The
+`/cache/target` = CARGO_TARGET_DIR) → first run cold, the rest incremental across commands AND runs. (The
+"rest incremental across ... runs" property is superseded for one-shot verify by
+`docs/superpowers/plans/2026-08-06-r2f1b-pre-slice-2-custody-plan.md` rev 3 S1, which sets
+`CARGO_INCREMENTAL=0` — measured incremental artifacts were 44% of a 15.77 GiB verify cache.) The
 cache is a **named volume** (container-owned, root — no host-uid remap). Per-repo keying isolates repos;
 single-flight serializes same-repo runs (cargo locks + the poison surface).
 

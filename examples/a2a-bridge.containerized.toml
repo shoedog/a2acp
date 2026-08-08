@@ -63,7 +63,7 @@ warm_cache = "a2a-impl-lsp-cache"
 dep_cache_path = "/cargo"
 verify_cache_path = "/cache"
 fetch_env = { CARGO_HOME = "/cargo" }
-verify_env = { CARGO_HOME = "/cache/cargo", CARGO_TARGET_DIR = "/cache/target" }
+verify_env = { CARGO_HOME = "/cache/cargo", CARGO_TARGET_DIR = "/cache/target", CARGO_INCREMENTAL = "0" }
 # RUSTUP_HOME is REQUIRED: rust-analyzer is a rustup PROXY (/usr/local/cargo/bin/rust-analyzer); codex-acp
 # hands its MCP subprocesses a MINIMAL env that drops the image's RUSTUP_HOME, so without it the proxy can't
 # resolve a toolchain ("rustup could not choose a version"), RA never answers LSP initialize, lsp-mcp times

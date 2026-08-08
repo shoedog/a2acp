@@ -88,6 +88,12 @@ Clones the repo into a quarantine under `allowed_cwd_root`, runs the **warm** co
 (edit + fix turns share ONE container + session), build/test-verifies, reviews the diff, and hands off a
 branch for you to merge. The default `impl` agent is **codex (gpt-5.5, effort=high)**.
 
+Convention: the containerized verify step above already runs with `CARGO_INCREMENTAL=0` (set in each tracked
+config's rust `verify_env`, plus CI). Do the same for any other one-shot full-suite/aggregate-verifier run
+(e.g. a manual `cargo test --workspace` pass) — a fresh invocation never reuses incremental artifacts, and
+leaving it on only bloats the cache (measured: 44% of a 15.77 GiB verify cache was incremental artifacts).
+Interactive/warm dev sessions are unaffected.
+
 The shipped **review-the-diff** default is one host-side `gpt-5.6-sol`/`xhigh` hard-read-only review at every
 size tier. It completes correctness findings first, then revisits every WRONG/SMELL for real-world trigger
 conditions, likelihood, exposure, bounded repair cost, and blocker/defer value. Auto-sizing and `--depth` remain
