@@ -240,6 +240,23 @@ EXCLUDING the 3 stockTrading/quant clones (owner hold), the live-pid clone, the 
 the 5 genuinely unlanded clones — whose HEADs are preserved as `rescue/impl-*` branches in the source
 repo (wedge-watchdog, strip-process-narration ×2, R2f1b source-guard fix, corruption-fixture repair).
 
+**A2/A5 review ledger (2026-08-08, both SHIP):** A2 pinned golden wire forms for the flight contract
+types and surfaced two serde-strictness findings — **pre-slice-3 obligation:** tighten unit-variant
+unknown-field tolerance on `PreparationFlightStateV1`/`ResourceFlightStateV1` before slice 3 journals
+them (free today: zero production writers; the `Open {}` empty-struct-payload form keeps the wire bytes
+so A2's goldens hold); the nested `NodeCauseV1` deny-unknown decision is slice-2's (the type is already
+live in `NodePrimaryRecordV3`/`NodeCleanupV2`, which itself has no deny_unknown_fields). A5 bound the
+automatic workload identity (`bound-` domain, golden `shape-c52073ab…7b782c5` pins manual bytes) —
+**slice-2 preconditions:** the slice that constructs `AutomaticR2f1b` must switch the three history
+ledger sites (`batch.rs:1090`, `coordinator.rs:1646`, `main.rs:4285`) to `workload_identity()` in the
+SAME change (else automatic pools with manual); those sites hold `Arc<WorkflowRunSpecV1>` with no
+contract — the admission authority must carry the V3 snapshot or derived identity; consider
+`pub(crate)` on `bound_workload_fingerprint_v2` (raw-computation footgun); if automatic calibration
+POOLING is ever wanted, commit a custody *shape* digest instead of minted custody ids (today's
+per-construction uniqueness is the gate-mandated safe direction). Minor A5 test follow-ups ledgered:
+manual-invariance-across-contracts assert; doc/test mutation-isolation mismatch; "per attempt" doc
+precision (retries share the contract via validate_successor).
+
 **Slice-2 obligations surfaced by the A3 review (2026-08-07):** no production code reads
 `FrozenR2f1bContractV1.activation` — an `AutomaticR2f1b` contract can today be minted, encoded, decoded,
 and validated without refusal, so "AutomaticR2f1b remains unconstructible" holds by convention only.
