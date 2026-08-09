@@ -8,9 +8,9 @@
 
 ## 0. Gating facts — settle these before starting anything below
 
-**(a) Lane ownership** — this session owns slice-2 orchestration; a 2b1 implementer subagent is ALIVE in `.claude/worktrees/s2b1` `[MEASURED]` dispatched this session, completion notification pending — **OPEN until it reports**
+**(a) Lane ownership** — this session owns slice-2 orchestration; the 2b1 implementer COMPLETED (`fb9aad76`, deliverable in `.2b1-handoff.md`) `[MEASURED]` completion notification + git log — **RESOLVED 2026-08-09**; two REVIEW agents now alive (opus senior-lead subagent; sol via bridge `exec-a4747d507440b82851a2940f105cf9ef`) — **OPEN until both report**
 **(b) Custody exposure** — `[MEASURED]` `git fetch`: origin/main = local main = `b4fc1ff3` (2a fold IS pushed; older notes saying "unpushed past cffd8e60" are stale). Planning branch `agent/r2f1b-pre-slice2-custody-plan` is deliberately local-only (owner practice). Prompts §2c commits pushed on `agent/prompts-2c-outbound-refutation` (`fe4532aa`) — **RESOLVED this session**
-**(c) In flight / irreversible** — 2b1 implementer running in `.claude/worktrees/s2b1` (branch `feat/r2f1b-2b1-protection-gate`); do not edit that worktree or its branch until its handoff lands — **OPEN**
+**(c) In flight / irreversible** — dual-lens review running against `.claude/worktrees/s2b1` @ `fb9aad76`: opus senior-lead (static-only) + sol/xhigh via bridge dogfood `run-workflow code-review` (launched from the s2b1 worktree; fold debug binary). Do not modify the worktree/branch until both verdicts land and are adjudicated — **OPEN**
 **(d) Authorization granted but not exercised** — dual-lens review is MANDATORY for 2b1 ("dual — this is the deletion-authority gate", slice-2 brief §3); one-round review cap per sub-slice with targeted repair for closed-enumerable findings (brief §3 preamble). Owner posture rule: sol reviews adjudicated senior-lead, evidence discipline retained.
 
 ## 1. Resume order
@@ -29,8 +29,10 @@
 |---|---|---|
 | 2a custody reader | done | `[MEASURED]` folded `b4fc1ff3` = origin/main (fetch this session) |
 | Slice-2 brief rev 2 | done | `[MEASURED]` `fc98e343`, read this session |
-| 2b1 implement | next | `[MEASURED]` dispatched to opus subagent, worktree `s2b1`, base `b4fc1ff3` |
-| 2b1 dual-lens review + fold | pending | blocked by implementer completion |
+| 2b1 implement | done | `[MEASURED]` `fb9aad76` (+2,544, ~641 non-test); focused gates 1245/0/0 across 24 suites per `.2b1-handoff.md`; fmt/check/clippy clean (implementer-reported = [INHERITED] until fold gates) |
+| 2b1 implementer §2c SELF-PASS | done | `[INHERITED]` REFUTED-as-written, narrowed claim survived: sweep::remove_worktree + host_git::cleanup_failed_add are separate removal sites (owners: 2a arms / R-7 in 2b2); record in `.2b1-handoff.md` §5 |
+| 2b1 dual-lens review | next | `[MEASURED]` both dispatched: opus senior-lead subagent + sol `exec-a4747d507440b82851a2940f105cf9ef`; one-round cap declared in both briefs |
+| 2b1 adjudicate + fold + full gates | pending | blocked by both verdicts |
 | READTHIS §2c prompt commits | done | `[MEASURED]` `agent/prompts-2c-outbound-refutation` pushed (`fe4532aa`); READTHIS deleted |
 | 2b2 / 2c1 / 2c2 / 2d | pending | brief §3; strictly after 2b1 folds |
 
