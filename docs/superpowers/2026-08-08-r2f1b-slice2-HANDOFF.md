@@ -31,8 +31,10 @@
 | Slice-2 brief rev 2 | done | `[MEASURED]` `fc98e343`, read this session |
 | 2b1 implement | done | `[MEASURED]` `fb9aad76` (+2,544, ~641 non-test); focused gates 1245/0/0 across 24 suites per `.2b1-handoff.md`; fmt/check/clippy clean (implementer-reported = [INHERITED] until fold gates) |
 | 2b1 implementer §2c SELF-PASS | done | `[INHERITED]` REFUTED-as-written, narrowed claim survived: sweep::remove_worktree + host_git::cleanup_failed_add are separate removal sites (owners: 2a arms / R-7 in 2b2); record in `.2b1-handoff.md` §5 |
-| 2b1 dual-lens review | next | `[MEASURED]` both dispatched: opus senior-lead subagent + sol `exec-a4747d507440b82851a2940f105cf9ef`; one-round cap declared in both briefs |
-| 2b1 adjudicate + fold + full gates | pending | blocked by both verdicts |
+| 2b1 dual-lens review | done | `[MEASURED]` opus SHIP (1 doc WRONG W-1 + 10 SMELL, all DEFER; 3 gate decisions ENDORSED with mechanism checks) vs sol REJECT (3 WRONG BLOCKERs + 2 SMELL DEFER); full texts in session task outputs |
+| 2b1 adjudication | done | `[MEASURED against source]` sol-3 (replace `Err`≠no-effect under NFS error-after-effect) → REPAIR NOW; sol-1 (refusal projected Complete) + sol-2 (Reserving loses cleanup owner) → DEFER: typed retained disposition + ownership retention = 2c1 obligations; add-prohibition SAME-PR-as-writer + both-records coexistence test (opus W-1) = 2b2 obligations; opus W-1/S-4/S-5/S-9 doc repairs in-round; R-2 risk row downgraded to "partially resolved" at fold |
+| 2b1 targeted repair (declared single round) | next | `[MEASURED]` dispatched to implementer agent with R1/R2/R3 spec; verify-on-return by orchestrator, NO second sol round (cap) |
+| 2b1 fold + full gates + review record | pending | blocked by repair return; review record → `docs/superpowers/reviews/2026-08-08-s2b1-dual-review.md` at fold |
 | READTHIS §2c prompt commits | done | `[MEASURED]` `agent/prompts-2c-outbound-refutation` pushed (`fe4532aa`); READTHIS deleted |
 | 2b2 / 2c1 / 2c2 / 2d | pending | brief §3; strictly after 2b1 folds |
 
