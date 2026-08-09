@@ -45,7 +45,12 @@ no second sol round.
 ## The round's second find (implementor, during repair)
 
 **PARKED-1: `rename_child_no_replace` carries the identical errno-trust hazard in the
-FAIL-OPEN direction** (merged A4 code — parked per custody plan §4; own bounded PR). A
+FAIL-OPEN direction** (merged A4 code — parked per custody plan §4; own bounded PR).
+*FIXED 2026-08-09 — see `2026-08-09-noreplace-classify-review.md`: shared identity
+classification for both primitives (`CustodyPublicationV1` replaces
+`ReplacePublicationV1`), a second pre-existing fail-open route closed (publish returning
+`Err` after a successful rename on parent-sync/identity-recheck failure), and the
+`local_file` journal-publication path classified with its caller invariants verified.* A
 retried NFS RENAME can create the target and report ENOENT: a `ProtectionPrepared`
 publication then tells the writer the checkout is unprotected while the record exists.
 2b1's disk arm contains the deletion consequence (presence-keyed refusal), but writer

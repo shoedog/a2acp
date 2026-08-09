@@ -1,5 +1,14 @@
 # R2f1b slice 2b1 — protection primitives + the fail-closed deletion gate — handoff
 
+> **Erratum (2026-08-09, PARKED-1 fold).** The follow-up PR generalized the replace-only
+> classification to both publication primitives and renamed the surface this handoff
+> cites: `ReplacePublicationV1` → `CustodyPublicationV1` (now returned by publish AND
+> replace), `ReplaceRenameFaultV1` → `PublicationRenameFaultV1`,
+> `classify_failed_replace_rename` → `classify_failed_publication_rename` (over the shared
+> `classify_publication_rename_effect` rule), `fail_replace_rename_on_nth_call_for_test`
+> → `fail_publication_rename_on_nth_call_for_test` (ONE countdown shared by both
+> primitives). Read the old names below accordingly; the contracts otherwise stand.
+
 **Branch** `feat/r2f1b-2b1-protection-gate` in `/Users/wesleyjinks/code/a2a-bridge/.claude/worktrees/s2b1`
 **Base** local `main` @ `b4fc1ff3` (slice 2a folded). Commits:
 
