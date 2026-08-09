@@ -71,7 +71,7 @@
 | # | Work | State | Exact next action | Blocked by | Identifiers |
 |---:|---|---|---|---|---|
 | 1 | Slice-3 brief | **done** | — | — | LANDED `c0d43429` on main: `docs/superpowers/plans/2026-08-09-r2f1b-slice3-brief.md` (rev 2; dual design review opus REVISE 6W/8S + bridge plan-review REVISE 30B/21M, all adjudicated + folded; impl config committed; roadmap cursor reconciled). Owner ruling folded: Candidate settlement → 3d |
-| 2 | 3s dispatch (settlement completeness — slice 3's first sub-slice) | pending | dispatch per brief §3 "3s" via bridge implement | owner word | brief §2 order: 3s → 3a → 3b1 → 3b2 → 3c1 → 3c2 → 3d; strictly sequential folds; fold-time target reap in the ritual |
+| 2 | 3s implement (settlement completeness) | **in flight** | OWNER WORD 2026-08-09 ("proceed with 3s"). Bridge implement terra/xhigh: clone `impl-22708-aff68jfg`, base `feat/r2f1b-3s-settlement` @ `c0d43429`, task spec `…/scratchpad/3s-task.md`, log `…/scratchpad/3s-implement.log` (same scratchpad dir as §6). On hand-off: operator diff inspection → dual-lens review (opus + sol code-review) → adjudicate → fold ritual (gates + roadmap cursor + target reap) → push | — | deliverable mirror `docs/superpowers/reviews/2026-08-09-r2f1b-3s-implementer-handoff.md`; resume if stranded: `a2a-bridge implement --resume impl-22708-aff68jfg --config examples/a2a-bridge.r2f1b-impl.toml` |
 
 ## 5. Invariants and traps — do not do these
 
