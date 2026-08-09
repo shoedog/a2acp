@@ -94,7 +94,8 @@
 | 2c2 repair implement clone (holds the REJECTED compat diff `659e9556`) | `~/code/.a2a-implement/impl-96012-qz5j808a` |
 | bridge implement config (terra/xhigh + hermetic skips) | `examples/a2a-bridge.r2f1b-impl.toml` (untracked, main checkout; supersedes `a2a-bridge.2c2-repair-impl.toml`) |
 | 2d base branch / implement clone | `feat/r2f1b-2d-claim-exchange` @ `c13ff663` · `~/code/.a2a-implement/impl-28907-1iv8a077` |
-| 2d task spec | `/private/tmp/claude-501/-Users-wesleyjinks-code-a2a-bridge/9337e035-8348-4206-97af-21223ccae4c8/scratchpad/2d-task.md` |
+| 2d task spec / live log | `/private/tmp/claude-501/-Users-wesleyjinks-code-a2a-bridge/9337e035-8348-4206-97af-21223ccae4c8/scratchpad/2d-task.md` · `…/scratchpad/2d-implement.log` (same dir) |
+| 2d run state check (successor session, after /clear) | progress: `tail …/scratchpad/2d-implement.log` + `git -C ~/code/.a2a-implement/impl-28907-1iv8a077 log --oneline`; hand-off = log tail prints verify/review/commit summary. If the process died mid-run: `a2a-bridge implement --resume impl-28907-1iv8a077 --config examples/a2a-bridge.r2f1b-impl.toml` (from the main checkout; binary at `.claude/worktrees/fold/target/release/a2a-bridge`) |
 | 2d implementer deliverable mirror (when it lands) | `docs/superpowers/reviews/2026-08-09-s2d-implementer-handoff.md` in the clone |
 | prior sub-slice worktrees (folded, branches safe to prune) | `s2b1` (`fix/noreplace-errno-classify`), `s2b2`, `s2c1`, `s2c2` |
 | prompts §2c pushed branch | `agent/prompts-2c-outbound-refutation` @ `fe4532aa` |
