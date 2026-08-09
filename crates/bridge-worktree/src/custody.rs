@@ -308,6 +308,46 @@ impl WorktreeCustodyStateKindV1 {
             .any(|(from, _)| *from == self)
     }
 
+    /// Does a record in this state assert a preservation — prepared, terminal, or unknown?
+    ///
+    /// **The durable disposition source (slice 2c2, P5).** The in-memory cleanup cell that holds
+    /// a session's checkout disposition is evicted the moment a flight reports `Ok`, so a later
+    /// flight starts from `Reclaim` and would report `Retained` for a checkout whose record on
+    /// disk says `Preserved`. Once the cell is gone the RECORD is the authority, and this is the
+    /// predicate that reads it. Exhaustive by design: a new state must be classified by decision.
+    #[must_use]
+    pub fn is_preserving(self) -> bool {
+        match self {
+            Self::PreservationPrepared | Self::Preserved | Self::PreservationUnknown => true,
+            Self::ProtectionPrepared
+            | Self::UnusedSettled
+            | Self::Materializing
+            | Self::LiveProtected
+            | Self::DeleteAuthorized
+            | Self::Removed
+            | Self::RecoveredLive => false,
+        }
+    }
+
+    /// Is a preservation on disk R2f1b-TERMINAL (as opposed to merely prepared)?
+    ///
+    /// Split from [`Self::is_preserving`] because a stranded `PreservationPrepared` is resumable
+    /// (2c1 repair RA) and must not be reported as a settled preservation.
+    #[must_use]
+    pub fn is_terminal_preservation(self) -> bool {
+        match self {
+            Self::Preserved | Self::PreservationUnknown => true,
+            Self::PreservationPrepared
+            | Self::ProtectionPrepared
+            | Self::UnusedSettled
+            | Self::Materializing
+            | Self::LiveProtected
+            | Self::DeleteAuthorized
+            | Self::Removed
+            | Self::RecoveredLive => false,
+        }
+    }
+
     /// How a sweep classifies a record in this state. **Recovery-only**: no arm
     /// authorizes checkout removal in slice 2a.
     #[must_use]
@@ -729,6 +769,32 @@ pub fn probe_custody_record_presence(worktree_path: &str) -> CustodyRecordPresen
             CustodyRecordPresenceV1::Inconclusive(format!("custody record is unstattable: {error}"))
         }
     }
+}
+
+/// Best-effort read of the custody state durably recorded beside `worktree_path`.
+///
+/// **Deliberately NOT the deletion gate's question.** The gate asks *presence*, never content, so
+/// that damaging a record cannot remove its protection. This asks content, and it is used only
+/// where a wrong answer is protective or neutral: re-deriving a lost `Preserve` disposition
+/// (slice 2c2, P5) and labelling a refusal report truthfully. `None` therefore means "no answer" —
+/// absent, unreadable, or undecodable — and every caller must treat it as "no additional
+/// knowledge", never as "not preserved".
+#[must_use]
+pub fn probe_custody_record_state(worktree_path: &str) -> Option<WorktreeCustodyStateKindV1> {
+    let path = Path::new(worktree_path);
+    let (Some(parent), Some(stem)) = (path.parent(), path.file_name()) else {
+        return None;
+    };
+    let mut record_name = stem.to_os_string();
+    record_name.push(CUSTODY_RECORD_SUFFIX);
+    let pinned = PinnedDirectoryV1::open(parent, "worktree custody state probe").ok()?;
+    match pinned.child_entry_exists(&record_name, "worktree custody state probe") {
+        Ok(true) => {}
+        Ok(false) | Err(_) => return None,
+    }
+    read_custody_record_in(&pinned, &record_name)
+        .ok()
+        .map(|record| record.state.kind())
 }
 
 /// Why a custody record on disk could not be read into a decoded record. Every variant

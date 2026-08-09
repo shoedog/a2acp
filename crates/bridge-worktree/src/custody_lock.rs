@@ -37,18 +37,20 @@
 //!
 //! Who takes what:
 //!
-//! * the V3 writer takes the publication cell then the custody cell, in that order, and holds both
-//!   for one transition sequence (`custody_writer::WorktreeCustodianV1`);
-//! * every deletion-side and sweep-side caller takes the PUBLICATION cell only, with the refusing
-//!   acquirer — `backend::CheckoutRemovalWindowV1` and `sweep::remove_worktree_if_safe`.
+//! * the V3 writer, and the deletion-capability branch's blocking custodian, take the
+//!   publication cell then the custody cell, in that order, and hold both for their transition
+//!   sequences (`custody_writer::WorktreeCustodianV1`);
+//! * the context-free deletion gate and every sweep-side caller take the PUBLICATION cell only,
+//!   with the refusing acquirer — `backend::CheckoutRemovalWindowV1` and
+//!   `sweep::remove_worktree_if_safe`.
 //!
-//! **File lock inside in-process mutex.** The backend's deletion gate takes the publication cell
-//! while already holding the cleanup cell's async `state` mutex (`CleanupCellState`), which is the
-//! order declared above (file locks are OUTSIDE the in-process mutexes in the list, but the gate
-//! is the one place they nest the other way round). That is safe and deliberate: no holder of a
-//! custody or publication cell ever waits on that per-session mutex — the writer's cells are taken
-//! inside `spawn_blocking` with no backend mutex held — so the two cannot form a cycle. Stated
-//! explicitly because it is the one nesting a reader would otherwise have to re-derive.
+//! **File lock inside in-process mutex.** There are TWO deliberate inverse nestings. The deletion
+//! gate takes the publication cell while holding the cleanup cell's async `state` mutex
+//! (`CleanupCellState`); the deletion-capability branch likewise holds that mutex while its
+//! blocking custodian takes publication then custody cells across mint → `remove_v2` → tombstone.
+//! Both are safe: no holder of either file cell waits for `cell.state` — writer/custodian work runs
+//! in `spawn_blocking` without a backend mutex held — so neither nesting can form a cycle. Stated
+//! explicitly because the capability branch is not merely the gate's old inverse nesting.
 //!
 //! A custody-lock holder must therefore never acquire a run lease or an operation lock, and must
 //! never hold the lock across an `.await` that can only complete once another task takes it.

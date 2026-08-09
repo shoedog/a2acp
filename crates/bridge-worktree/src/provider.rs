@@ -116,6 +116,47 @@ pub trait WorktreeProvider: Send + Sync {
     /// absent targets are idempotent; an incomplete real cleanup is an error.
     async fn remove(&self, repo: &str, worktree_path: &str) -> Result<(), BridgeError>;
 
+    /// Does this provider implement [`Self::remove_v2`]?
+    ///
+    /// A side-effect-free preflight, for the same reason `supports_custody_add` is one (slice 2b2
+    /// repair R4): the capability is minted by a CAS that durably publishes `DeleteAuthorized`
+    /// BEFORE any provider call, and discovering the refusing default afterwards would strand the
+    /// checkout in a state whose sweep disposition is `Recover` — recovery-owned forever, for a
+    /// removal that could never have started.
+    ///
+    /// **Implementation obligation:** override this in lockstep with [`Self::remove_v2`].
+    fn supports_capability_removal(&self) -> bool {
+        false
+    }
+
+    /// R2f1b §5.1's capability-consuming removal: *"`HostGitWorktree::remove_v2` takes that
+    /// capability — **not a raw path** — revalidates source/root/target/common-dir identities
+    /// immediately before Git removal, and verifies registration + target absence afterward."*
+    ///
+    /// The signature is the enforcement. There is no `repo`/`worktree_path` parameter: the paths
+    /// come out of the [`AuthorizedRemovalV1`], which can only be built by consuming a
+    /// [`DeletionCapabilityV1`] through its descriptor revalidation, which in turn can only be
+    /// minted by the `LiveProtected -> DeleteAuthorized` CAS under both custody cells. A caller
+    /// holding only a path cannot reach this method at all.
+    ///
+    /// The default REFUSES, and unlike `preserve_checkout_v1`'s no-op default this one has to:
+    /// §5.4's rule is that a refusing default belongs on any method whose silent absence would let
+    /// an *effect* happen unguarded, and here the absent effect is the removal itself. A provider
+    /// that silently answered `Ok` would tell the custody writer to publish a `Removed` tombstone
+    /// over a checkout that is still on disk.
+    ///
+    /// [`AuthorizedRemovalV1`]: crate::custody_writer::AuthorizedRemovalV1
+    /// [`DeletionCapabilityV1`]: crate::custody_writer::DeletionCapabilityV1
+    async fn remove_v2(
+        &self,
+        authorized: crate::custody_writer::AuthorizedRemovalV1,
+    ) -> Result<(), BridgeError> {
+        let _ = authorized;
+        Err(BridgeError::ConfigInvalid {
+            reason: "worktree provider does not implement the R2f1b capability removal".into(),
+        })
+    }
+
     /// True if `path` is inside a git work tree.
     async fn is_git_repo(&self, path: &str) -> bool;
 }

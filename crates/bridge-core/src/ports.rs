@@ -208,6 +208,86 @@ impl CheckoutPreservationV1 {
     }
 }
 
+/// The workflow-level checkout disposition of R2f1b §5.1 (slice 2c2).
+///
+/// > "A node-local success is **not** a checkout disposition. It settles the node session but
+/// > leaves its checkout `LiveProtected` under a workflow-level disposition flight. After every
+/// > node is terminal, an all-healthy global workflow outcome may mint deletion capabilities and
+/// > perform the existing normal success cleanup. Any failed, degraded, canceled, timed-out,
+/// > mechanically impossible, or cleanup-ambiguous global outcome runs `preserve_after_cancel` for
+/// > **every materialized checkout**, including nodes that completed earlier."
+///
+/// **Why one method with an outcome argument rather than two methods.** The deletion path must be
+/// impossible to reach without asserting global health, and a separate `delete_checkout_v1` would
+/// be reachable by a caller that simply never thought about the outcome. Here the caller cannot
+/// call the settlement at all without naming which of the two worlds it is in, and every value
+/// other than [`Self::GloballyHealthy`] carries a preservation reason — so the *shape* of a
+/// forgotten or mistaken call is preservation, which is the protective direction.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WorkflowCheckoutOutcomeV1 {
+    /// Every node reached a healthy terminal, no cleanup failed, and the run was not cancelled.
+    /// **The only value that can mint deletion authority anywhere in the system.**
+    GloballyHealthy,
+    /// Anything else — failed, degraded, canceled, timed-out, mechanically impossible, or
+    /// cleanup-ambiguous. Runs preservation for the checkout.
+    NotHealthy(CheckoutPreservationReasonV1),
+}
+
+impl WorkflowCheckoutOutcomeV1 {
+    /// May this outcome mint deletion authority? Exhaustive on purpose: a new arm must be
+    /// classified by decision, not by falling through a wildcard into "deletable".
+    #[must_use]
+    pub fn authorizes_deletion(self) -> bool {
+        match self {
+            Self::GloballyHealthy => true,
+            Self::NotHealthy(_) => false,
+        }
+    }
+}
+
+/// What the workflow-level settlement did with one checkout.
+///
+/// [`Self::Removed`] and [`Self::RemovedRecordAmbiguous`] both mean the checkout is gone and are
+/// reachable only through a consumed `DeletionCapabilityV1`. The latter preserves the distinction
+/// that its `Removed` tombstone publication could not be verified; every other arm is protective.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CheckoutSettlementV1 {
+    /// This backend has no custody-governed checkout for the session — the truthful answer for
+    /// every V2 checkout and every backend that owns none. **No effect of any kind.**
+    NoCheckoutUnderCustody,
+    /// A capability was minted, consumed, and the checkout removed; the record is its tombstone.
+    Removed,
+    /// The checkout was verified absent, but its `Removed` tombstone parent sync was ambiguous.
+    /// The map is cleared because the checkout is gone; only durable-record evidence is unknown.
+    RemovedRecordAmbiguous(String),
+    /// A durable preservation exists for the checkout (settled now, including
+    /// `PreservationUnknown`, or already settled).
+    Preserved,
+    /// The checkout was deliberately kept: the mint refused, the deletion gate refused, or a
+    /// removal did not verifiably complete. Recovery-owned, never lost.
+    Retained(String),
+    /// A custody publication's outcome could not be determined. Protective in every direction.
+    Ambiguous(String),
+    /// Nothing was attempted (a retiring backend, an unreadable record). The prior state stands.
+    Refused(String),
+}
+
+impl CheckoutSettlementV1 {
+    /// Did this settlement actually remove the checkout? Exhaustive, mirroring
+    /// `CustodySweepDispositionV1::authorizes_checkout_removal`.
+    #[must_use]
+    pub fn removed_the_checkout(&self) -> bool {
+        match self {
+            Self::Removed | Self::RemovedRecordAmbiguous(_) => true,
+            Self::NoCheckoutUnderCustody
+            | Self::Preserved
+            | Self::Retained(_)
+            | Self::Ambiguous(_)
+            | Self::Refused(_) => false,
+        }
+    }
+}
+
 /// Streaming agent backend — adapters implement this; core never depends on adapters.
 #[async_trait::async_trait]
 pub trait AgentBackend: Send + Sync {
@@ -338,9 +418,11 @@ pub trait AgentBackend: Send + Sync {
     /// method's absence produces no effect at all, and a backend that owns no checkout has nothing
     /// to preserve, so `R2f1bUnsupported` would be a false alarm on 100+ implementations. The
     /// hazard the default does carry is a *forwarding wrapper* that neither preserves nor
-    /// delegates: today `WorktreeBackend` is the outermost production decorator (the agent factory
-    /// wraps the inner backend with it and nothing wraps the result), so no production composition
-    /// can drop the call — a future wrapper placed OUTSIDE it must forward this method.
+    /// delegates. The production spawn factory constructs `WorktreeBackend` directly around its
+    /// `AcpBackend`; its separate `ContainerRwBackend` decorator is also constructed around an
+    /// `AcpBackend`, never around a custody checkout, so no custody-governed checkout sits below
+    /// that non-forwarding wrapper. A future spawn-factory composition that places a wrapper outside
+    /// `WorktreeBackend` must forward this method.
     ///
     /// No arm of [`CheckoutPreservationV1`] authorizes a removal.
     async fn preserve_checkout_v1(
@@ -349,6 +431,41 @@ pub trait AgentBackend: Send + Sync {
         _reason: CheckoutPreservationReasonV1,
     ) -> CheckoutPreservationV1 {
         CheckoutPreservationV1::NoCheckoutUnderCustody
+    }
+
+    /// R2f1b §5.1's WORKFLOW-LEVEL CHECKOUT DISPOSITION (slice 2c2) — the drain from the workflow
+    /// executor, which holds `Arc<dyn AgentBackend>` and cannot reach a `WorktreeProvider`, to the
+    /// layer that owns the checkout.
+    ///
+    /// Called once per materialized checkout after **every** node is terminal, with the global
+    /// outcome. On [`WorkflowCheckoutOutcomeV1::GloballyHealthy`] the worktree layer may mint a
+    /// deletion capability and remove; on anything else it preserves. It is the ONLY caller-facing
+    /// entry point anywhere that can lead to a mint.
+    ///
+    /// # Why a defaulted `AgentBackend` method and not `NodeTurnCleanup`
+    ///
+    /// `NodeTurnCleanup` cannot carry this. It is a per-node-turn value consumed at that node's
+    /// exit (`cleanup_warm_turn` takes it by `Box` and no backend at all), whereas this settlement
+    /// runs after the LAST node and must reach checkouts of nodes that finished long before —
+    /// including ones whose session a context-free entry already tore down. All seven of its impls
+    /// are `#[cfg(test)]`, so it is also not a production drain at all.
+    ///
+    /// **The default is a no-op answer, not a refusal**, for the same reason
+    /// [`Self::preserve_checkout_v1`]'s is: §5.4's refusing defaults exist for methods whose
+    /// silent absence lets an *effect* happen unguarded, and this method's absence produces no
+    /// effect — the checkout simply stays protected. `R2f1bUnsupported` would be a false alarm on
+    /// 100+ implementations that own no checkout. The hazard the default does carry is a
+    /// forwarding wrapper that neither settles nor delegates. The production spawn factory constructs
+    /// `WorktreeBackend` directly around its `AcpBackend`; its separate `ContainerRwBackend`
+    /// decorator is also constructed around an `AcpBackend`, never around a custody checkout, so no
+    /// custody-governed checkout sits below that non-forwarding wrapper. A future spawn-factory
+    /// composition that places a wrapper outside `WorktreeBackend` must forward this method.
+    async fn settle_workflow_checkout_v1(
+        &self,
+        _session: &SessionId,
+        _outcome: WorkflowCheckoutOutcomeV1,
+    ) -> CheckoutSettlementV1 {
+        CheckoutSettlementV1::NoCheckoutUnderCustody
     }
 
     /// Reconcile model/effort on a LIVE warm session (Slice 1). Default: NotAdvertised

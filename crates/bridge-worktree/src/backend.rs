@@ -1,9 +1,10 @@
 use crate::custody::{
-    probe_custody_record_presence, CustodyRecordPresenceV1, PreservationReasonV1,
+    probe_custody_record_presence, probe_custody_record_state, CustodyRecordPresenceV1,
+    PreservationReasonV1, WorktreeCustodyStateKindV1,
 };
 use crate::custody_writer::{
-    observed_identity, planned_identity, CustodyWriteRefusalV1, MaterializedIdentitiesV1,
-    PreservationOutcomeV1, WorktreeCustodianV1,
+    observed_identity, planned_identity, CustodyWriteRefusalV1, DeletionAuthorizationV1,
+    MaterializedIdentitiesV1, PreservationOutcomeV1, RemovalRecordV1, WorktreeCustodianV1,
 };
 use crate::provider::{CustodyAddOutcomeV1, CustodyAddTargetV1, WorktreeProvider};
 use crate::provider_path::{
@@ -18,12 +19,15 @@ use bridge_core::orch::{AgentSessionCaps, ReconcileOutcome};
 use bridge_core::permission::TurnMeta;
 use bridge_core::ports::{
     AgentBackend, BackendObservers, BackendStream, CheckoutPreservationReasonV1,
-    CheckoutPreservationV1, DiagnosticObserver, RichEventSink,
+    CheckoutPreservationV1, CheckoutSettlementV1, DiagnosticObserver, RichEventSink,
+    WorkflowCheckoutOutcomeV1,
 };
 use bridge_core::terminal_evidence::{AcpChildLiveness, EvidenceCapability};
 use bridge_core::SessionCwd;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
+#[cfg(test)]
+use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
@@ -369,6 +373,197 @@ async fn preserve_entry_checkout(
     }
 }
 
+/// What one capability removal settled on. Nothing here is a `Result`: a removal that did not
+/// verifiably complete is not an error to propagate, it is a checkout that stayed on disk.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum CapabilityRemovalV1 {
+    /// Minted, consumed, removed, tombstoned. The only arm that means the checkout is gone AND
+    /// the record says so.
+    Removed,
+    /// Removed and verified gone, but the tombstone's publication outcome is unknown. The record
+    /// is `DeleteAuthorized` or `Removed`; both are truthful about a checkout that no longer
+    /// exists, and neither can lose work.
+    RemovedRecordAmbiguous(String),
+    /// The CAS refused, or the provider cannot consume a capability. Nothing was touched.
+    MintRefused(String),
+    /// The CAS's own publication was ambiguous, so no capability was minted and nothing was
+    /// removed. The record is `LiveProtected` or `DeleteAuthorized` — protective either way.
+    MintAmbiguous(String),
+    /// Authority was minted and the removal did NOT verifiably complete. The record stays
+    /// `DeleteAuthorized`, whose sweep disposition is `Recover`: the checkout is recovery-owned,
+    /// and no re-mint is possible because the CAS refuses from that state.
+    RemovalFailed(String),
+}
+
+impl CapabilityRemovalV1 {
+    /// Is the checkout provably gone? Exhaustive so a later arm must be classified by decision.
+    fn checkout_is_gone(&self) -> bool {
+        match self {
+            Self::Removed | Self::RemovedRecordAmbiguous(_) => true,
+            Self::MintRefused(_) | Self::MintAmbiguous(_) | Self::RemovalFailed(_) => false,
+        }
+    }
+}
+
+/// §5.1's only automatic deletion path, end to end for one checkout.
+///
+/// The whole sequence runs with the custodian ALIVE, which means both custody cells are held from
+/// before the CAS until after the tombstone. That is stronger than the gate's own removal window:
+/// while it runs, every deletion-side caller takes the publication cell with the refusing acquirer
+/// and fails closed, and no other writer can transition this record. It cannot deadlock — neither
+/// `remove_v2` nor anything it calls takes a custody cell — and it is the same shape
+/// `materialize_under_custody` already uses to hold the cells across `add_under_custody`.
+///
+/// Ordering, and why each step is where it is:
+///
+/// 1. **Preflight the provider capability before any record effect.** A provider on the refusing
+///    `remove_v2` default would otherwise leave a durable `DeleteAuthorized` for a removal that
+///    could never have started — recovery-owned forever. Same defect shape as 2b2's repair R4.
+/// 2. **CAS + mint**, under the cells, off the async executor.
+/// 3. **Revalidate**, on the caller's thread with NO await between it and the provider call, so
+///    §5.1's "immediately before Git removal" is program order and not an aspiration. It is four
+///    `openat`+`fstat` calls; the same blocking-work argument the deletion gate's own record probe
+///    makes a few lines below applies verbatim.
+/// 4. **`remove_v2`**, which re-checks §5.1's post-conditions (registration absent, target absent).
+/// 5. **Tombstone only on a verified removal.** An `Err` from step 4 means "the checkout may still
+///    be there", so no `Removed` may be written over it — that is P7's post-condition-disagreement
+///    boundary, and it is enforced by the shape of the code, not by a message check.
+async fn authorize_and_remove_checkout(
+    provider: &Arc<dyn WorktreeProvider>,
+    entry: &WtEntry,
+    #[cfg(test)] removal_tombstone_parent_sync_fault: Arc<AtomicUsize>,
+) -> CapabilityRemovalV1 {
+    if entry.custody != WtCustodyV1::Protected {
+        return CapabilityRemovalV1::MintRefused("checkout is not under R2f1b custody".to_string());
+    }
+    let Some(protection) = entry.protection.clone() else {
+        // Protected by the discriminator, but the materialization evidence a capability is bound
+        // to was never captured. Refusing is the only honest answer — the same fail-closed shape
+        // the preservation barrier takes for a missing claim, and for the same reason: an
+        // authority minted over identities we never observed authorizes a removal of whatever now
+        // occupies those paths.
+        return CapabilityRemovalV1::MintRefused(
+            "no retained materialization identities for this checkout".to_string(),
+        );
+    };
+    let Some(worktree_root) = Path::new(&entry.worktree_path)
+        .parent()
+        .map(Path::to_path_buf)
+    else {
+        return CapabilityRemovalV1::MintRefused(format!(
+            "worktree path has no enclosing root: {}",
+            entry.worktree_path
+        ));
+    };
+    if !provider.supports_capability_removal() {
+        return CapabilityRemovalV1::MintRefused(
+            "worktree provider does not implement the R2f1b capability removal".to_string(),
+        );
+    }
+
+    let worktree_path = entry.worktree_path.clone();
+    let canonical_source = entry.canonical_source.clone();
+    let minted = tokio::task::spawn_blocking({
+        let worktree_path = worktree_path.clone();
+        let canonical_source = canonical_source.clone();
+        let binding = protection.binding.clone();
+        let identities = protection.identities.clone();
+        move || -> (Option<WorktreeCustodianV1>, DeletionAuthorizationV1) {
+            let custodian =
+                match WorktreeCustodianV1::enter(&worktree_root, &worktree_path, binding) {
+                    Ok(custodian) => custodian,
+                    Err(CustodyWriteRefusalV1::Ambiguous(detail)) => {
+                        return (None, DeletionAuthorizationV1::Ambiguous(detail))
+                    }
+                    Err(other) => {
+                        return (None, DeletionAuthorizationV1::Refused(other.to_string()))
+                    }
+                };
+            let authorization = custodian.authorize_deletion(&canonical_source, &identities);
+            (Some(custodian), authorization)
+        }
+    })
+    .await;
+    let (custodian, authorization) = match minted {
+        Ok(minted) => minted,
+        Err(error) => {
+            return CapabilityRemovalV1::MintRefused(format!(
+                "deletion authorization task failed: {error}"
+            ))
+        }
+    };
+    let capability = match authorization {
+        DeletionAuthorizationV1::Authorized(capability) => capability,
+        DeletionAuthorizationV1::Ambiguous(detail) => {
+            return CapabilityRemovalV1::MintAmbiguous(detail)
+        }
+        DeletionAuthorizationV1::Refused(detail) => {
+            return CapabilityRemovalV1::MintRefused(detail)
+        }
+    };
+    let Some(custodian) = custodian else {
+        return CapabilityRemovalV1::MintRefused(
+            "a capability was minted without a custodian".to_string(),
+        );
+    };
+
+    #[cfg(test)]
+    if removal_tombstone_parent_sync_fault.swap(0, Ordering::SeqCst) != 0 {
+        custodian.pinned_root().fail_sync_on_nth_call_for_test(1);
+    }
+
+    // NO AWAIT between here and the provider call: this is §5.1's "revalidates ... immediately
+    // before Git removal".
+    let authorized = match capability.revalidate_for_removal() {
+        Ok(authorized) => authorized,
+        Err(detail) => return CapabilityRemovalV1::RemovalFailed(detail),
+    };
+    if let Err(error) = provider.remove_v2(authorized).await {
+        return CapabilityRemovalV1::RemovalFailed(format!("{error:?}"));
+    }
+
+    let recorded =
+        tokio::task::spawn_blocking(move || custodian.record_removed(&protection.identities)).await;
+    match recorded {
+        Ok(RemovalRecordV1::Recorded) => CapabilityRemovalV1::Removed,
+        Ok(RemovalRecordV1::Ambiguous(detail)) => {
+            CapabilityRemovalV1::RemovedRecordAmbiguous(detail)
+        }
+        // The checkout IS gone — `remove_v2` proved target and registration absence — so this is
+        // not a `RemovalFailed`. What is unknown is only whether the tombstone landed, and both
+        // candidate records are truthful about an absent checkout.
+        Ok(RemovalRecordV1::Refused(detail)) => CapabilityRemovalV1::RemovedRecordAmbiguous(detail),
+        Err(error) => CapabilityRemovalV1::RemovedRecordAmbiguous(format!(
+            "removal tombstone task failed: {error}"
+        )),
+    }
+}
+
+/// The DURABLE checkout disposition, re-derived from the record on disk (slice 2c2, P5).
+///
+/// **The defect this closes (2c1 review, opus W3, made binding on this slice).** A session's
+/// disposition lives in its cleanup cell, and the reporter EVICTS that cell the moment a flight
+/// reports `Ok` — which a gate refusal does. A later flight therefore starts from `Reclaim` and
+/// reports `Retained` for a checkout whose record says `Preserved`. Once the cell is gone the
+/// record is the authority, so every flight re-derives from it and takes the stronger of the two.
+///
+/// It returns `Preserve` for all three preserving states, prepared included: a stranded
+/// `PreservationPrepared` is a preservation in progress (2c1 repair RA resumes it), and treating
+/// it as anything else would let a mint request run against a checkout somebody is preserving.
+fn durable_checkout_disposition(
+    worktree_path: &str,
+) -> (CheckoutDispositionV1, Option<WorktreeCustodyStateKindV1>) {
+    let state = probe_custody_record_state(worktree_path);
+    let disposition = match state {
+        Some(kind) if kind.is_preserving() => CheckoutDispositionV1::Preserve,
+        // No answer, or a state that asserts no preservation. `Reclaim` here means "this read adds
+        // no knowledge" — it is the identity of the `max` below, never a downgrade: the caller
+        // takes the STRONGER of this and the cell's own disposition.
+        _ => CheckoutDispositionV1::Reclaim,
+    };
+    (disposition, state)
+}
+
 /// Map a custody write refusal onto the backend's error vocabulary.
 ///
 /// An AMBIGUOUS publication is deliberately reported as a configure failure, not swallowed: the
@@ -404,12 +599,28 @@ fn wall_clock_ms() -> i64 {
 /// preservation, no later request downgrades it (§5.1: "once a preserved claim exists, only
 /// R2f2's explicit local retain/archive/delete disposition can clear it; no later healthy
 /// projection or TTL can mint deletion authority").
+/// **The `Ord` is the whole safety property, and slice 2c2's third variant is placed inside it
+/// deliberately.** `Reclaim < DeleteAuthorized < Preserve`. Design note 2 of the 2c1 handoff
+/// anticipated exactly this variant and warned that enum equality across generations becomes
+/// accidentally true once a third disposition exists, which is why the epoch is carried on the
+/// flight slot and re-checked at the mint (P5).
+///
+/// `Preserve` dominating `DeleteAuthorized` is §5.1's monotonicity in the in-memory half: a
+/// workflow-level mint REQUEST cannot lower a checkout whose disposition is already preservation,
+/// because `raise_checkout_disposition` only ever moves upward — so the flight that would mint is
+/// never even started for a preserved checkout. The durable half is independent and redundant:
+/// `WorktreeCustodianV1::authorize_deletion` refuses from every from-state but `LiveProtected`.
+/// Two mechanisms, either one sufficient.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Default)]
 enum CheckoutDispositionV1 {
     /// The ordinary teardown request: remove the checkout if — and only if — the fail-closed
     /// deletion gate authorizes it. This is every pre-2c1 caller, unchanged.
     #[default]
     Reclaim,
+    /// §5.1's globally-healthy workflow outcome (slice 2c2): the flight may mint a
+    /// `DeletionCapabilityV1` and consume it. Raised ONLY by
+    /// `settle_workflow_checkout_v1(GloballyHealthy)`; no context-free caller can reach it.
+    DeleteAuthorized,
     /// §5.1's non-success exit: preserve the checkout durably, and never remove it.
     Preserve,
 }
@@ -418,13 +629,18 @@ enum CheckoutDispositionV1 {
 ///
 /// **This is the typed retained/refused disposition the 2b1 dual-review ledger made binding on
 /// 2c1 (sol-1 / D-1).** Until it existed, a gate refusal returned a bare `Ok` and every caller in
-/// the R-11 fan-in read it as "the checkout is gone". `Removed` is the only arm that means that.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// the R-11 fan-in read it as "the checkout is gone". `Removed` and
+/// `RemovedRecordAmbiguous` are the only arms that mean that; the latter never asserts a durable
+/// tombstone.
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum CheckoutCleanupDispositionV1 {
     /// No mapped checkout for this session; there was nothing to dispose of.
     NotNeeded,
     /// The checkout was removed and its sidecar cleared — the pre-2c1 meaning of a clean report.
     Removed,
+    /// The checkout is gone, but syncing the `Removed` tombstone to its parent was ambiguous.
+    /// The map can be cleared; only durable-record evidence remains unknown.
+    RemovedRecordAmbiguous(String),
     /// A removal was authorized and did not complete. The flight's `result` carries the error.
     RemovalFailed,
     /// Deliberately retained: the fail-closed deletion gate refused on custody evidence, or could
@@ -444,6 +660,7 @@ impl CheckoutCleanupDispositionV1 {
     fn completed_code(self, strength: CleanupStrength) -> &'static str {
         match self {
             Self::NotNeeded | Self::Removed | Self::RemovalFailed => strength.transition_codes().1,
+            Self::RemovedRecordAmbiguous(_) => "worktree.teardown.removed_record_ambiguous",
             Self::Retained => "worktree.teardown.retained",
             Self::Preserved => "worktree.teardown.preserved",
         }
@@ -698,6 +915,11 @@ pub struct WorktreeBackend {
     configure_admitted: Notify,
     #[cfg(test)]
     failed_configure_retry_now: Arc<Notify>,
+    // Test-only arming for the existing `fs_custody` parent-sync fault seam.
+    // It is consumed after the authorizing replace, so the tombstone parent sync is the
+    // exact publication operation that fails.
+    #[cfg(test)]
+    removal_tombstone_parent_sync_fault: Arc<AtomicUsize>,
 }
 
 impl WorktreeBackend {
@@ -740,6 +962,8 @@ impl WorktreeBackend {
             configure_admitted: Notify::new(),
             #[cfg(test)]
             failed_configure_retry_now: Arc::new(Notify::new()),
+            #[cfg(test)]
+            removal_tombstone_parent_sync_fault: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -957,6 +1181,12 @@ impl WorktreeBackend {
             .len()
     }
 
+    #[cfg(test)]
+    fn fail_next_capability_tombstone_parent_sync_for_test(&self) {
+        self.removal_tombstone_parent_sync_fault
+            .store(1, Ordering::SeqCst);
+    }
+
     fn claim_cleanup_cell(
         &self,
         session: &SessionId,
@@ -1021,7 +1251,7 @@ impl WorktreeBackend {
         &self,
         session: &SessionId,
         disposition: CheckoutDispositionV1,
-        reason: PreservationReasonV1,
+        reason: Option<PreservationReasonV1>,
     ) -> Option<Arc<CleanupCell>> {
         let cell = {
             let mut cells = self
@@ -1050,10 +1280,34 @@ impl WorktreeBackend {
                     .fetch_add(1, Ordering::SeqCst);
             }
             if lifecycle.preservation_reason.is_none() {
-                lifecycle.preservation_reason = Some(reason);
+                lifecycle.preservation_reason = reason;
             }
         }
         Some(cell)
+    }
+
+    /// Is the cell's checkout disposition still exactly the generation this flight was started
+    /// for? (slice 2c2, P5 second half.)
+    ///
+    /// **This is the epoch earning its keep.** `start_or_join_cleanup` reads the disposition
+    /// synchronously and the flight then awaits — the configure drain, the per-session state
+    /// mutex, the inner teardown — so a `Preserve` raised in that window would otherwise be
+    /// invisible to a flight already carrying `DeleteAuthorized`. Re-reading `(disposition,
+    /// epoch)` immediately before the mint turns "the state mutex happens to serialize them" into
+    /// a checked invariant. Comparing the epoch as well as the enum is what makes it hold once a
+    /// third disposition exists: with `Preserve` raised and then the cell evicted and rebuilt,
+    /// enum equality alone can be true across two different generations.
+    fn deletion_generation_is_current(
+        cell: &CleanupCell,
+        disposition: CheckoutDispositionV1,
+        disposition_epoch: u64,
+    ) -> bool {
+        let lifecycle = cell
+            .lifecycle
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        lifecycle.checkout_disposition == disposition
+            && lifecycle.disposition_epoch == disposition_epoch
     }
 
     async fn cleanup_session_with_sealed_admission(
@@ -1163,6 +1417,8 @@ impl WorktreeBackend {
         let cleanup_waiting_reservation = self.cleanup_waiting_reservation.clone();
         #[cfg(test)]
         let failed_configure_retry_now = self.failed_configure_retry_now.clone();
+        #[cfg(test)]
+        let removal_tombstone_parent_sync_fault = self.removal_tombstone_parent_sync_fault.clone();
         let (report_tx, report_rx) = watch::channel(None);
         *slot = Some(CleanupFlightSlot {
             id: flight_id,
@@ -1192,6 +1448,8 @@ impl WorktreeBackend {
             let cleanup_waiting_reservation_count = cleanup_waiting_reservation_count.clone();
             #[cfg(test)]
             let cleanup_waiting_reservation = cleanup_waiting_reservation.clone();
+            #[cfg(test)]
+            let removal_tombstone_parent_sync_fault = removal_tombstone_parent_sync_fault.clone();
             async move {
                 Self::run_cleanup_flight(
                     worker_cell,
@@ -1202,11 +1460,14 @@ impl WorktreeBackend {
                     worker_session,
                     requested,
                     disposition,
+                    disposition_epoch,
                     preservation_reason,
                     #[cfg(test)]
                     cleanup_waiting_reservation_count,
                     #[cfg(test)]
                     cleanup_waiting_reservation,
+                    #[cfg(test)]
+                    removal_tombstone_parent_sync_fault,
                 )
                 .await
             }
@@ -1345,6 +1606,9 @@ impl WorktreeBackend {
                         cleanup_waiting_reservation_count.clone();
                     #[cfg(test)]
                     let cleanup_waiting_reservation = cleanup_waiting_reservation.clone();
+                    #[cfg(test)]
+                    let removal_tombstone_parent_sync_fault =
+                        removal_tombstone_parent_sync_fault.clone();
                     async move {
                         Self::run_cleanup_flight(
                             worker_cell,
@@ -1355,11 +1619,14 @@ impl WorktreeBackend {
                             worker_session,
                             CleanupStrength::Release,
                             retry_disposition,
+                            retry_epoch,
                             retry_reason,
                             #[cfg(test)]
                             cleanup_waiting_reservation_count,
                             #[cfg(test)]
                             cleanup_waiting_reservation,
+                            #[cfg(test)]
+                            removal_tombstone_parent_sync_fault,
                         )
                         .await
                     }
@@ -1434,9 +1701,11 @@ impl WorktreeBackend {
         session: SessionId,
         strength: CleanupStrength,
         disposition: CheckoutDispositionV1,
+        disposition_epoch: u64,
         preservation_reason: Option<PreservationReasonV1>,
         #[cfg(test)] cleanup_waiting_reservation_count: Arc<AtomicU64>,
         #[cfg(test)] cleanup_waiting_reservation: Arc<Notify>,
+        #[cfg(test)] removal_tombstone_parent_sync_fault: Arc<AtomicUsize>,
     ) -> CleanupReportV1 {
         // Configure admission is published synchronously, before its first
         // git/inner await. Cleanup claims the same cell and waits for every
@@ -1494,6 +1763,18 @@ impl WorktreeBackend {
         // so terminalizing a live checkout from one would decide a disposition nobody asked for.
         // Those entries still cannot delete: the gate below refuses and the report says
         // `Retained`.
+        // ---- DURABLE DISPOSITION RE-DERIVATION (slice 2c2, P5) ------------------------------
+        // The cell's disposition is in-memory and the reporter evicts the cell on the first `Ok`
+        // report — which a gate refusal is — so a later flight would otherwise start from
+        // `Reclaim` and report `Retained` for a checkout whose record says `Preserved`. Once the
+        // cell is gone the RECORD is the authoritative disposition source; the flight takes the
+        // stronger of the two, so this can raise a disposition and can never lower one.
+        let (durable_disposition, durable_state) = match entry.as_ref() {
+            Some(entry) => durable_checkout_disposition(&entry.worktree_path),
+            None => (CheckoutDispositionV1::Reclaim, None),
+        };
+        let disposition = disposition.max(durable_disposition);
+
         let mut barrier = None;
         if disposition == CheckoutDispositionV1::Preserve {
             if let Some(entry) = entry.as_ref() {
@@ -1511,6 +1792,104 @@ impl WorktreeBackend {
                 Ok(()) => state.inner_strength = Some(strength),
                 Err(error) => first_error = Some(error),
             }
+        }
+
+        // ---- R2f1b §5.1 DELETION CAPABILITY (slice 2c2) --------------------------------------
+        // "Globally healthy workflow success is the only automatic deletion path." Reaching this
+        // block requires the cell's checkout disposition to be exactly `DeleteAuthorized`, and the
+        // ONLY writer of that value is `settle_workflow_checkout_v1(GloballyHealthy)` — no
+        // context-free entry (`ExpiryClaim`, either `Drop`, the reaper, controller retire) has a
+        // workflow outcome to declare, so none can raise it, and the durable re-derivation above
+        // can only raise the disposition to `Preserve`, never lower it to here.
+        //
+        // It runs AFTER the inner teardown, unchanged from the V2 order: the session must be
+        // released before its checkout can be removed.
+        //
+        // The gate below is deliberately NOT consulted on this path, and that is the substitution
+        // the capability makes: the gate is the context-free refusal for callers that have no
+        // authority, and this caller's authority is a `DeletionCapabilityV1` minted by a CAS under
+        // both custody cells over reverified identities. The cells are held for the whole
+        // mint→remove→tombstone window, which is a STRICTER mutual exclusion than the gate's own
+        // removal window — every deletion-side caller fails closed against the same cell while it
+        // runs. Any outcome that did not remove the checkout falls through to the gate, which
+        // refuses on the custody evidence exactly as before.
+        let mut capability_removal = None;
+        if disposition == CheckoutDispositionV1::DeleteAuthorized && first_error.is_none() {
+            if let Some(entry) = entry.as_ref() {
+                if Self::deletion_generation_is_current(&cell, disposition, disposition_epoch) {
+                    let outcome = authorize_and_remove_checkout(
+                        &provider,
+                        entry,
+                        #[cfg(test)]
+                        removal_tombstone_parent_sync_fault.clone(),
+                    )
+                    .await;
+                    tracing::info!(
+                        session = session.as_str(),
+                        worktree_path = entry.worktree_path,
+                        outcome = ?outcome,
+                        "R2f1b workflow-level deletion capability settled"
+                    );
+                    capability_removal = Some(outcome);
+                } else {
+                    tracing::info!(
+                        session = session.as_str(),
+                        worktree_path = entry.worktree_path,
+                        "R2f1b deletion authority is stale: the checkout disposition changed \
+                         generation after this flight started"
+                    );
+                }
+            }
+        }
+        if let Some(outcome) = capability_removal.as_ref().filter(|o| o.checkout_is_gone()) {
+            let checkout = match outcome {
+                CapabilityRemovalV1::Removed => CheckoutCleanupDispositionV1::Removed,
+                CapabilityRemovalV1::RemovedRecordAmbiguous(detail) => {
+                    tracing::warn!(
+                        session = session.as_str(),
+                        detail,
+                        "the checkout was removed but its `Removed` tombstone is unverified"
+                    );
+                    CheckoutCleanupDispositionV1::RemovedRecordAmbiguous(detail.clone())
+                }
+                CapabilityRemovalV1::MintRefused(_)
+                | CapabilityRemovalV1::MintAmbiguous(_)
+                | CapabilityRemovalV1::RemovalFailed(_) => {
+                    unreachable!("only gone capability outcomes enter this branch")
+                }
+            };
+            // The checkout is provably gone: `remove_v2` verified target and registration absence
+            // before the tombstone was attempted. Clear the map entry with the SAME still-same
+            // check the V2 removal path uses (`Retained` included, so 2c1's "removal clears
+            // `Retained` once protection lifts" arm composes with a capability-driven removal),
+            // and mark the flight's component state done so no later flight re-runs a removal for
+            // a checkout that no longer exists.
+            state.provider_removed = true;
+            state.sidecar_removed = true;
+            let mut map = map.lock().await;
+            let still_same = match map.get(session.as_str()) {
+                Some(WtState::Ready(current)) | Some(WtState::Retained { entry: current, .. }) => {
+                    let entry = entry
+                        .as_ref()
+                        .expect("the capability path requires an entry");
+                    current.canonical_source == entry.canonical_source
+                        && current.worktree_path == entry.worktree_path
+                }
+                _ => false,
+            };
+            if still_same {
+                map.remove(session.as_str());
+                notify.notify_waiters();
+            }
+            drop(map);
+            state.entry = None;
+            return CleanupReportV1 {
+                result: match first_error {
+                    Some(error) => Err(error),
+                    None => Ok(()),
+                },
+                checkout,
+            };
         }
 
         // ---- R2f1b fail-closed deletion gate (slice 2b1) ------------------------------------
@@ -1571,11 +1950,19 @@ impl WorktreeBackend {
                         &entry,
                         &refusal,
                         barrier.as_ref(),
+                        durable_state,
                     )
                     .await;
                     // The refusal is about the CHECKOUT only. A genuine inner-teardown failure
                     // recorded above is still the flight's result — swallowing it here would
                     // report a broken session release as a clean cleanup.
+                    //
+                    // The `Preserved` label comes from EITHER this flight's own barrier or the
+                    // record on disk (slice 2c2, P5): a flight on a rebuilt cell has no barrier
+                    // outcome to consult, and reporting `Retained` for a checkout whose durable
+                    // record is a settled preservation is exactly the mislabelling opus W3 named.
+                    let durably_preserved = durable_state
+                        .is_some_and(WorktreeCustodyStateKindV1::is_terminal_preservation);
                     return CleanupReportV1 {
                         result: match first_error {
                             Some(error) => Err(error),
@@ -1585,6 +1972,7 @@ impl WorktreeBackend {
                             Some(outcome) if outcome.is_terminal_preservation() => {
                                 CheckoutCleanupDispositionV1::Preserved
                             }
+                            _ if durably_preserved => CheckoutCleanupDispositionV1::Preserved,
                             _ => CheckoutCleanupDispositionV1::Retained,
                         },
                     };
@@ -1676,6 +2064,7 @@ impl WorktreeBackend {
         entry: &WtEntry,
         refusal: &CheckoutRemovalRefusalV1,
         barrier: Option<&PreservationOutcomeV1>,
+        durable_state: Option<WorktreeCustodyStateKindV1>,
     ) {
         let custody_positive = matches!(
             refusal,
@@ -1684,7 +2073,7 @@ impl WorktreeBackend {
         if !custody_positive {
             return;
         }
-        let retention = match barrier {
+        let from_barrier = match barrier {
             Some(PreservationOutcomeV1::Preserved | PreservationOutcomeV1::AlreadyPreserved) => {
                 CheckoutRetentionV1::Preserved
             }
@@ -1697,6 +2086,20 @@ impl WorktreeBackend {
                 CheckoutRetentionV1::RefusedUnderCustody
             }
         };
+        // The RECORD is the authoritative disposition source once the cell that held the
+        // in-memory one is gone (slice 2c2, P5). Take the strongest of the two: a flight with no
+        // barrier outcome at all must still label a durably-preserved checkout `Preserved`.
+        let from_record = match durable_state {
+            Some(WorktreeCustodyStateKindV1::Preserved) => CheckoutRetentionV1::Preserved,
+            Some(WorktreeCustodyStateKindV1::PreservationUnknown) => {
+                CheckoutRetentionV1::PreservationUnknown
+            }
+            Some(WorktreeCustodyStateKindV1::PreservationPrepared) => {
+                CheckoutRetentionV1::PreservationAmbiguous
+            }
+            _ => CheckoutRetentionV1::RefusedUnderCustody,
+        };
+        let retention = from_barrier.max(from_record);
         let mut map = map.lock().await;
         match map.get(session.as_str()) {
             // The reservation was popped by `entry_for_cleanup`; re-insert so an owner survives.
@@ -2598,7 +3001,7 @@ impl AgentBackend for WorktreeBackend {
             return CheckoutPreservationV1::NoCheckoutUnderCustody;
         }
         let outcome = preserve_entry_checkout(&entry, reason).await;
-        self.raise_checkout_disposition(session, CheckoutDispositionV1::Preserve, reason);
+        self.raise_checkout_disposition(session, CheckoutDispositionV1::Preserve, Some(reason));
         let retention = match &outcome {
             PreservationOutcomeV1::Preserved | PreservationOutcomeV1::AlreadyPreserved => {
                 Some(CheckoutRetentionV1::Preserved)
@@ -2639,6 +3042,93 @@ impl AgentBackend for WorktreeBackend {
             }
             PreservationOutcomeV1::Ambiguous(detail) => CheckoutPreservationV1::Ambiguous(detail),
             PreservationOutcomeV1::Refused(detail) => CheckoutPreservationV1::Refused(detail),
+        }
+    }
+
+    /// §5.1's workflow-level checkout disposition (slice 2c2) — the post-loop settlement, and the
+    /// ONLY entry point in the workspace from which a `DeletionCapabilityV1` can be minted.
+    ///
+    /// # The V2 boundary is the first check, and it is load-bearing
+    ///
+    /// A non-custody entry returns `NoCheckoutUnderCustody` before any disposition is raised and
+    /// before any flight is started, so a legacy checkout's teardown is byte-identical to
+    /// pre-2c2: the executor may call this for every session it configured without knowing which
+    /// ones are V3, and a V2 session gets no extra release, no extra probe, and no extra cleanup
+    /// flight. The worktree layer is the only layer that knows, so it is the one that answers.
+    ///
+    /// # The two arms
+    ///
+    /// * **Not healthy** — exactly [`Self::preserve_checkout_v1`]'s behaviour, reached through the
+    ///   same helper. This is what disposes of P6's gate-retained context-free deaths: a checkout
+    ///   whose session a reaper or a `Drop` tore down mid-run is `Retained` with NO claim (2c1's
+    ///   ruling), and this pass is where it finally gets one.
+    /// * **Globally healthy** — raise the disposition to `DeleteAuthorized` (monotonically: a
+    ///   checkout already at `Preserve` is NOT lowered, so a preserved sibling cannot be deleted by
+    ///   a later healthy projection) and run one ordinary `Release` cleanup flight. The mint,
+    ///   the capability, and its consumption all live inside that flight, so the capability never
+    ///   escapes the function that creates it.
+    ///
+    /// Running the healthy arm through the cleanup flight rather than beside it is deliberate: it
+    /// is what makes the removal single-flighted against every concurrent teardown of the same
+    /// session, gives it 2c1's typed `CleanupReportV1`, and composes the map-entry lifecycle
+    /// (`Retained` cleared exactly once) with a capability-driven removal.
+    async fn settle_workflow_checkout_v1(
+        &self,
+        session: &SessionId,
+        outcome: WorkflowCheckoutOutcomeV1,
+    ) -> CheckoutSettlementV1 {
+        let mapped = match self.map.lock().await.get(session.as_str()) {
+            Some(WtState::Ready(entry))
+            | Some(WtState::Retained { entry, .. })
+            | Some(WtState::Reserving { entry, .. }) => entry.clone(),
+            None => return CheckoutSettlementV1::NoCheckoutUnderCustody,
+        };
+        if mapped.custody != WtCustodyV1::Protected {
+            return CheckoutSettlementV1::NoCheckoutUnderCustody;
+        }
+        let reason = match outcome {
+            WorkflowCheckoutOutcomeV1::NotHealthy(reason) => {
+                return match self.preserve_checkout_v1(session, reason).await {
+                    CheckoutPreservationV1::Preserved => CheckoutSettlementV1::Preserved,
+                    CheckoutPreservationV1::Unknown(_detail) => CheckoutSettlementV1::Preserved,
+                    CheckoutPreservationV1::Ambiguous(detail) => {
+                        CheckoutSettlementV1::Ambiguous(detail)
+                    }
+                    CheckoutPreservationV1::Refused(detail) => {
+                        CheckoutSettlementV1::Refused(detail)
+                    }
+                    CheckoutPreservationV1::NoCheckoutUnderCustody => {
+                        CheckoutSettlementV1::NoCheckoutUnderCustody
+                    }
+                };
+            }
+            WorkflowCheckoutOutcomeV1::GloballyHealthy => None,
+        };
+        if self
+            .raise_checkout_disposition(session, CheckoutDispositionV1::DeleteAuthorized, reason)
+            .is_none()
+        {
+            return CheckoutSettlementV1::Refused(
+                "the worktree backend is retiring; the checkout stays protected".to_string(),
+            );
+        }
+        let report = self
+            .cleanup_session_reported(session, CleanupStrength::Release, false)
+            .await;
+        match report.checkout {
+            CheckoutCleanupDispositionV1::Removed => CheckoutSettlementV1::Removed,
+            CheckoutCleanupDispositionV1::RemovedRecordAmbiguous(detail) => {
+                CheckoutSettlementV1::RemovedRecordAmbiguous(detail)
+            }
+            CheckoutCleanupDispositionV1::Preserved => CheckoutSettlementV1::Preserved,
+            CheckoutCleanupDispositionV1::NotNeeded => CheckoutSettlementV1::NoCheckoutUnderCustody,
+            CheckoutCleanupDispositionV1::Retained
+            | CheckoutCleanupDispositionV1::RemovalFailed => {
+                CheckoutSettlementV1::Retained(match &report.result {
+                    Ok(()) => "the checkout was retained under R2f1b custody".to_string(),
+                    Err(error) => format!("{error:?}"),
+                })
+            }
         }
     }
 
@@ -2805,6 +3295,18 @@ mod tests {
         remove_count: AtomicUsize,
         remove_started: Notify,
         fail_remove: AtomicBool,
+        /// Counted SEPARATELY from `remove_count` (slice 2c2): the whole §2c claim is that a
+        /// custody-discriminated checkout is removable only through the capability method, so a
+        /// single counter could never distinguish "removed with authority" from "removed by the
+        /// raw-path V2 call".
+        remove_v2_count: AtomicUsize,
+        /// P7 boundary 2: the git removal fails. The record must NOT say `Removed`.
+        fail_remove_v2: AtomicBool,
+        /// P7 boundary 4: the removal reports success while the target is still there — a
+        /// post-condition disagreement. The real provider's `remove_and_verify` turns that into an
+        /// `Err`; this double reproduces it as an `Err` after leaving the target in place, which is
+        /// the state the writer must refuse to tombstone.
+        remove_v2_leaves_target: AtomicBool,
         fail_release: AtomicBool,
         retire_count: AtomicUsize,
         retire_gate: Mutex<Option<oneshot::Receiver<()>>>,
@@ -3177,6 +3679,36 @@ mod tests {
             } else {
                 Ok(())
             }
+        }
+
+        fn supports_capability_removal(&self) -> bool {
+            true
+        }
+
+        /// Enumeration 2 of 11 (slice 2c2): the capability-consuming removal.
+        ///
+        /// It REALLY deletes the target, because every assertion that matters here is about
+        /// whether the work is still on disk, and a double that only counted calls could not tell
+        /// a removal from a refusal. `Err` leaves the target in place, which is exactly what the
+        /// real provider's `remove_and_verify` guarantees for an incomplete removal.
+        async fn remove_v2(
+            &self,
+            authorized: crate::custody_writer::AuthorizedRemovalV1,
+        ) -> Result<(), BridgeError> {
+            self.rec.remove_v2_count.fetch_add(1, Ordering::SeqCst);
+            self.rec.order.lock().unwrap().push("wt_remove_v2".into());
+            if self.rec.fail_remove_v2.load(Ordering::SeqCst) {
+                return Err(BridgeError::StoreFailure);
+            }
+            if self.rec.remove_v2_leaves_target.load(Ordering::SeqCst) {
+                // The post-condition disagreement: git said something, the target is still there,
+                // so `remove_and_verify` reports the removal as incomplete rather than complete.
+                return Err(BridgeError::ConfigInvalid {
+                    reason: "worktree remove failed (target_absent=false)".into(),
+                });
+            }
+            let _ = std::fs::remove_dir_all(authorized.worktree_path());
+            Ok(())
         }
 
         async fn is_git_repo(&self, _path: &str) -> bool {
@@ -6325,7 +6857,7 @@ mod tests {
         be.raise_checkout_disposition(
             &session,
             CheckoutDispositionV1::Preserve,
-            PreservationReasonV1::NodeFailure,
+            Some(PreservationReasonV1::NodeFailure),
         )
         .expect("the configured session has a cell");
         assert_eq!(
@@ -6553,7 +7085,7 @@ mod tests {
         be.raise_checkout_disposition(
             &session,
             CheckoutDispositionV1::Preserve,
-            PreservationReasonV1::Cancellation,
+            Some(PreservationReasonV1::Cancellation),
         )
         .expect("the session has a cell");
         let preserve = be
@@ -7441,6 +7973,837 @@ mod tests {
             "an operation that never reported must not invent a definite locator"
         );
         assert_eq!(rec.remove_count.load(Ordering::SeqCst), 0);
+        std::fs::remove_dir_all(&tmp).unwrap();
+    }
+    // ---- slice 2c2: the deletion capability, end to end through the backend ----
+
+    fn capability_removals(rec: &Rec) -> usize {
+        rec.remove_v2_count.load(Ordering::SeqCst)
+    }
+
+    /// §5.1's own rule, and step 1 of this slice: **a node-local success is NOT a checkout
+    /// disposition.** The node's own success teardown — the exact call `cleanup_cold_session`
+    /// makes — must leave the checkout live, mapped, and undeleted, because the workflow outcome
+    /// that could authorize deleting it is not known yet.
+    ///
+    /// Discriminates a slice that hangs the mint off the node teardown rather than off the
+    /// post-loop settlement: a successful first node would then delete its checkout before a later
+    /// sibling failed, which is precisely the loss §5.1's deferral exists to prevent.
+    #[tokio::test]
+    async fn node_local_success_cannot_remove_its_checkout() {
+        let (be, rec, tmp, session, target, _bound) = v3_session("v3-node-success").await;
+
+        be.release_session_observed(&session, Arc::new(CodeRec::default()))
+            .await
+            .unwrap();
+
+        assert_eq!(removals(&rec), 0, "no raw-path removal");
+        assert_eq!(capability_removals(&rec), 0, "and no capability removal");
+        assert_eq!(record_state_of(&target).as_deref(), Some("live_protected"));
+        assert!(Path::new(&target).exists());
+        assert!(
+            be.mapped_worktree_path_for_test(&session).await.is_some(),
+            "the checkout keeps an in-memory owner for the post-loop pass"
+        );
+        std::fs::remove_dir_all(&tmp).unwrap();
+    }
+
+    /// The headline of the slice: a globally healthy workflow outcome mints a capability, consumes
+    /// it, removes the checkout EXACTLY ONCE, and leaves the record as a tombstone.
+    ///
+    /// The second settlement is the exactly-once half. It must not remove again and must not
+    /// re-mint — after the first removal the map has no entry, so there is nothing to settle.
+    ///
+    /// Discriminates a settlement that removes through the raw-path `remove` (asserted zero), one
+    /// that skips the tombstone (the record would still say `delete_authorized`), and one that
+    /// leaves the map entry behind (which would wedge the session id forever).
+    #[tokio::test]
+    async fn global_healthy_success_with_capability_removes_exactly_once() {
+        let (be, rec, tmp, session, target, _bound) = v3_session("v3-healthy-remove").await;
+
+        let first = be
+            .settle_workflow_checkout_v1(&session, WorkflowCheckoutOutcomeV1::GloballyHealthy)
+            .await;
+        let second = be
+            .settle_workflow_checkout_v1(&session, WorkflowCheckoutOutcomeV1::GloballyHealthy)
+            .await;
+
+        assert_eq!(first, CheckoutSettlementV1::Removed);
+        assert!(first.removed_the_checkout());
+        assert_eq!(
+            second,
+            CheckoutSettlementV1::NoCheckoutUnderCustody,
+            "the second settlement has nothing left to settle"
+        );
+        assert_eq!(
+            capability_removals(&rec),
+            1,
+            "exactly one capability removal"
+        );
+        assert_eq!(removals(&rec), 0, "and never the raw-path removal");
+        assert!(!Path::new(&target).exists(), "the checkout is gone");
+        assert_eq!(
+            record_state_of(&target).as_deref(),
+            Some("removed"),
+            "and its record is the tombstone"
+        );
+        assert!(
+            be.mapped_worktree_path_for_test(&session).await.is_none(),
+            "no entry may stay mapped after a post-loop removal"
+        );
+        std::fs::remove_dir_all(&tmp).unwrap();
+    }
+
+    /// RA / sol-1: a failed inner teardown makes the otherwise healthy settlement cleanup-ambiguous
+    /// for THIS checkout. It must retain the durable live custody record and never mint deletion.
+    ///
+    /// Discriminates the capability branch ignoring the inner teardown result.
+    #[tokio::test]
+    async fn a_failed_inner_release_skips_the_deletion_mint_and_retains_live_custody() {
+        let (be, rec, tmp, session, target, _bound) = v3_session("v3-inner-release-failed").await;
+        rec.fail_release.store(true, Ordering::SeqCst);
+
+        let settled = be
+            .settle_workflow_checkout_v1(&session, WorkflowCheckoutOutcomeV1::GloballyHealthy)
+            .await;
+
+        assert!(
+            !matches!(settled, CheckoutSettlementV1::Removed),
+            "a failed inner teardown must not report a removal: {settled:?}"
+        );
+        assert_eq!(
+            capability_removals(&rec),
+            0,
+            "the capability must not be minted or consumed after a failed release"
+        );
+        assert!(
+            Path::new(&target).exists(),
+            "the checkout must remain on disk"
+        );
+        assert!(
+            be.mapped_worktree_path_for_test(&session).await.is_some(),
+            "the retained checkout keeps its map entry for recovery"
+        );
+        assert_eq!(
+            record_state_of(&target).as_deref(),
+            Some("live_protected"),
+            "the skipped mint leaves durable custody live-protected"
+        );
+        std::fs::remove_dir_all(&tmp).unwrap();
+    }
+
+    /// RA / sol-1: inner teardown failures are per-checkout. A later failing checkout may not
+    /// revise the removal already completed for an independent healthy checkout.
+    #[tokio::test]
+    async fn a_failed_inner_release_isolated_to_its_checkout() {
+        let (first_be, first_rec, first_tmp, first_session, first_target, _first_bound) =
+            v3_session("v3-inner-release-first").await;
+        let first = first_be
+            .settle_workflow_checkout_v1(&first_session, WorkflowCheckoutOutcomeV1::GloballyHealthy)
+            .await;
+        assert_eq!(first, CheckoutSettlementV1::Removed);
+        assert_eq!(capability_removals(&first_rec), 1);
+        assert!(!Path::new(&first_target).exists());
+
+        let (second_be, second_rec, second_tmp, second_session, second_target, _second_bound) =
+            v3_session("v3-inner-release-second").await;
+        second_rec.fail_release.store(true, Ordering::SeqCst);
+        let second = second_be
+            .settle_workflow_checkout_v1(
+                &second_session,
+                WorkflowCheckoutOutcomeV1::GloballyHealthy,
+            )
+            .await;
+
+        assert!(
+            !matches!(second, CheckoutSettlementV1::Removed),
+            "the failed checkout must be retained: {second:?}"
+        );
+        assert_eq!(capability_removals(&second_rec), 0);
+        assert!(Path::new(&second_target).exists());
+        assert_eq!(
+            record_state_of(&second_target).as_deref(),
+            Some("live_protected")
+        );
+        assert!(second_be
+            .mapped_worktree_path_for_test(&second_session)
+            .await
+            .is_some());
+        assert_eq!(
+            capability_removals(&first_rec),
+            1,
+            "the first removal stays final"
+        );
+        assert!(!Path::new(&first_target).exists());
+        std::fs::remove_dir_all(&first_tmp).unwrap();
+        std::fs::remove_dir_all(&second_tmp).unwrap();
+    }
+
+    /// RB / sol-3: once `remove_v2` verified the checkout absent, a tombstone parent-sync failure
+    /// is ambiguous durable evidence, not an ordinary removed settlement. The test arms the same
+    /// `fs_custody` seam as the custody-writer tombstone boundary after the authorizing replace.
+    #[tokio::test]
+    async fn an_ambiguous_removed_tombstone_is_not_reported_as_plain_removed() {
+        let (be, rec, tmp, session, target, _bound) = v3_session("v3-ambiguous-removed").await;
+        be.fail_next_capability_tombstone_parent_sync_for_test();
+
+        let settled = be
+            .settle_workflow_checkout_v1(&session, WorkflowCheckoutOutcomeV1::GloballyHealthy)
+            .await;
+
+        assert!(
+            matches!(settled, CheckoutSettlementV1::RemovedRecordAmbiguous(_)),
+            "an unverified tombstone needs its typed outcome: {settled:?}"
+        );
+        assert!(
+            !Path::new(&target).exists(),
+            "the provider did remove the checkout"
+        );
+        assert_eq!(capability_removals(&rec), 1);
+        assert!(
+            be.mapped_worktree_path_for_test(&session).await.is_none(),
+            "a verified-absent checkout must still clear its map entry"
+        );
+        std::fs::remove_dir_all(&tmp).unwrap();
+    }
+
+    /// RB / sol-3: observers must distinguish a removed checkout whose tombstone is uncertain
+    /// from a durable `Removed` tombstone.
+    #[tokio::test]
+    async fn an_ambiguous_removed_tombstone_publishes_a_distinct_teardown_code() {
+        let (be, _rec, tmp, session, _target, _bound) =
+            v3_session("v3-ambiguous-removed-code").await;
+        be.raise_checkout_disposition(&session, CheckoutDispositionV1::DeleteAuthorized, None)
+            .expect("the session has a cleanup cell");
+        be.fail_next_capability_tombstone_parent_sync_for_test();
+        let observer = Arc::new(CodeRec::default());
+
+        be.release_session_observed(&session, observer.clone())
+            .await
+            .unwrap();
+
+        let codes = observer.codes.lock().unwrap().clone();
+        assert!(
+            codes.iter().any(|(status, code)| {
+                status == "Completed" && code == "worktree.teardown.removed_record_ambiguous"
+            }),
+            "the ambiguous tombstone must have its own observed code: {codes:?}"
+        );
+        assert!(
+            !codes
+                .iter()
+                .any(|(_, code)| code == "worktree.teardown.released"),
+            "the durable-removed code is false evidence here: {codes:?}"
+        );
+        std::fs::remove_dir_all(&tmp).unwrap();
+    }
+
+    /// RC / opus WRONG-1: `PreservationUnknown` is terminal durable preservation, so a completed
+    /// non-healthy settlement must never project it as recovery-owned `Retained`.
+    #[tokio::test]
+    async fn a_settled_preservation_unknown_is_classified_as_preservation() {
+        let (be, _rec, tmp, session, target, _bound) = v3_session("v3-settled-unknown").await;
+        std::fs::remove_dir_all(&target).unwrap();
+        std::fs::create_dir_all(&target).unwrap();
+
+        let settled = be
+            .settle_workflow_checkout_v1(
+                &session,
+                WorkflowCheckoutOutcomeV1::NotHealthy(CheckoutPreservationReasonV1::NodeFailure),
+            )
+            .await;
+
+        assert!(
+            matches!(settled, CheckoutSettlementV1::Preserved),
+            "a terminal preservation-unknown record is preservation, not retention: {settled:?}"
+        );
+        assert_eq!(
+            record_state_of(&target).as_deref(),
+            Some("preservation_unknown")
+        );
+        assert!(Path::new(&target).exists());
+        std::fs::remove_dir_all(&tmp).unwrap();
+    }
+
+    /// §5.1's "a successful sibling cannot delete useful work before a later sibling determines the
+    /// workflow outcome", driven as two real checkouts.
+    ///
+    /// The first session completes and runs its node-end success teardown; the workflow then
+    /// fails. BOTH checkouts must end preserved — including the one that finished cleanly long
+    /// before, which is the "including nodes that completed earlier" clause.
+    ///
+    /// Discriminates a settlement that only visits the failing node's checkout.
+    #[tokio::test]
+    async fn completed_sibling_survives_later_workflow_failure() {
+        let (be, rec, tmp, done_session, done_target, _bound) = v3_session("v3-sibling-a").await;
+        be.release_session_observed(&done_session, Arc::new(CodeRec::default()))
+            .await
+            .unwrap();
+        assert_eq!(
+            record_state_of(&done_target).as_deref(),
+            Some("live_protected"),
+            "the completed sibling is still live and undisposed"
+        );
+
+        let settled = be
+            .settle_workflow_checkout_v1(
+                &done_session,
+                WorkflowCheckoutOutcomeV1::NotHealthy(CheckoutPreservationReasonV1::NodeFailure),
+            )
+            .await;
+
+        assert_eq!(settled, CheckoutSettlementV1::Preserved);
+        assert!(!settled.removed_the_checkout());
+        assert_eq!(record_state_of(&done_target).as_deref(), Some("preserved"));
+        assert!(Path::new(&done_target).exists(), "the work survives");
+        assert_eq!(removals(&rec), 0);
+        assert_eq!(capability_removals(&rec), 0);
+        std::fs::remove_dir_all(&tmp).unwrap();
+    }
+
+    /// P2, the structural claim: **a raw-path provider removal is unreachable for a
+    /// custody-discriminated checkout.** Every teardown surface the backend exposes is driven over
+    /// one live V3 checkout, and none of them reaches `remove` or `remove_v2`.
+    ///
+    /// `remove` takes `(repo, path)` and is gated by the 2b1 fail-closed gate; `remove_v2` takes a
+    /// capability that only the CAS can mint. This test is the behavioural half of the claim — the
+    /// structural half is the signature itself, which no caller in this crate can satisfy without
+    /// a `DeletionCapabilityV1`.
+    ///
+    /// Discriminates a slice that widened the gate (say, by treating `DeleteAuthorized` on disk as
+    /// permission) instead of adding an authority.
+    #[tokio::test]
+    async fn raw_path_removal_is_unreachable_without_a_capability() {
+        let (be, rec, tmp, session, target, _bound) = v3_session("v3-no-raw-removal").await;
+
+        be.cancel(&session).await.unwrap();
+        be.forget_session_checked(&session).await.unwrap();
+        be.release_session_checked(&session).await.unwrap();
+        be.forget_session(&session).await;
+        be.release_session(&session).await;
+        be.release_session_observed(&session, Arc::new(CodeRec::default()))
+            .await
+            .unwrap();
+        be.retire().await.unwrap();
+
+        assert_eq!(removals(&rec), 0, "no raw-path removal from any entry");
+        assert_eq!(
+            capability_removals(&rec),
+            0,
+            "and no capability removal without a workflow-level authority"
+        );
+        assert_eq!(record_state_of(&target).as_deref(), Some("live_protected"));
+        assert!(Path::new(&target).exists());
+        std::fs::remove_dir_all(&tmp).unwrap();
+    }
+
+    /// P2's identity rule at the backend: a checkout whose objects were replaced since
+    /// materialization must not be removed, even under a globally healthy outcome.
+    ///
+    /// The target is swapped for a different directory at the same path. The mint's own
+    /// reverification refuses first, so `remove_v2` is never reached at all — the assertion is on
+    /// the provider's call count, not on a message.
+    ///
+    /// Discriminates a mint that compares canonical paths instead of `dev`/`ino`: the swapped
+    /// directory has the same path and would pass.
+    #[tokio::test]
+    async fn remove_v2_refuses_when_object_identity_changed_since_authorization() {
+        let (be, rec, tmp, session, target, _bound) = v3_session("v3-identity-changed").await;
+        std::fs::remove_dir_all(&target).unwrap();
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(format!("{target}/someone-elses-work.txt"), b"not ours").unwrap();
+
+        let settled = be
+            .settle_workflow_checkout_v1(&session, WorkflowCheckoutOutcomeV1::GloballyHealthy)
+            .await;
+
+        assert!(
+            matches!(settled, CheckoutSettlementV1::Retained(_)),
+            "a changed object graph is retained, never removed: {settled:?}"
+        );
+        assert_eq!(capability_removals(&rec), 0, "remove_v2 is never reached");
+        assert_eq!(removals(&rec), 0);
+        assert!(
+            Path::new(&format!("{target}/someone-elses-work.txt")).exists(),
+            "whatever now occupies the path must be untouched"
+        );
+        assert_eq!(
+            record_state_of(&target).as_deref(),
+            Some("live_protected"),
+            "and the CAS never ran"
+        );
+        std::fs::remove_dir_all(&tmp).unwrap();
+    }
+
+    /// V2 POSITIVE CONTROL for the whole settlement (the brief's "V2 cleanup byte-identical"):
+    /// a legacy checkout answers `NoCheckoutUnderCustody` for BOTH outcomes, with no removal, no
+    /// extra cleanup flight, and no cell conjured — and the ordinary V2 teardown still removes it
+    /// afterwards exactly as before.
+    ///
+    /// Discriminates a settlement that raises a disposition or starts a flight before checking the
+    /// custody discriminator, which would give every V2 session an extra release at workflow end.
+    #[tokio::test]
+    async fn the_workflow_settlement_is_a_no_op_for_a_legacy_checkout() {
+        let (be, rec, tmp, source, _cfg) = backend_fixture("v2-settlement-noop");
+        let session = SessionId::parse("ctx-v2-settlement-noop-g0").unwrap();
+        be.configure_session(&session, &spec(Some(&source.to_string_lossy())))
+            .await
+            .unwrap();
+        let cells_before = be.cleanup_cell_count();
+
+        for outcome in [
+            WorkflowCheckoutOutcomeV1::GloballyHealthy,
+            WorkflowCheckoutOutcomeV1::NotHealthy(CheckoutPreservationReasonV1::Cancellation),
+        ] {
+            assert_eq!(
+                be.settle_workflow_checkout_v1(&session, outcome).await,
+                CheckoutSettlementV1::NoCheckoutUnderCustody,
+                "{outcome:?}"
+            );
+        }
+
+        assert_eq!(removals(&rec), 0, "the settlement removed nothing");
+        assert_eq!(capability_removals(&rec), 0);
+        assert_eq!(
+            be.cleanup_cell_count(),
+            cells_before,
+            "and started no flight for a legacy checkout"
+        );
+        be.release_session_checked(&session).await.unwrap();
+        assert_eq!(removals(&rec), 1, "V2 teardown is byte-identical");
+        assert!(be.map.lock().await.is_empty());
+        std::fs::remove_dir_all(&tmp).unwrap();
+    }
+
+    /// An unmapped session is settled without conjuring anything — the same discipline the
+    /// preservation barrier holds.
+    #[tokio::test]
+    async fn the_workflow_settlement_answers_no_checkout_for_an_unmapped_session() {
+        let (be, _rec, tmp, _source, _cfg) = backend_fixture("v3-settle-unmapped");
+        let session = SessionId::parse("ctx-v3-settle-unmapped-g0").unwrap();
+
+        let settled = be
+            .settle_workflow_checkout_v1(&session, WorkflowCheckoutOutcomeV1::GloballyHealthy)
+            .await;
+
+        assert_eq!(settled, CheckoutSettlementV1::NoCheckoutUnderCustody);
+        assert_eq!(be.cleanup_cell_count(), 0);
+        std::fs::remove_dir_all(&tmp).unwrap();
+    }
+
+    /// P7 boundaries 2 and 4: the git removal did not verifiably complete, so the record must NOT
+    /// say `Removed`. It stays `DeleteAuthorized` — 2a classifies that `Recover`, so the checkout
+    /// is recovery-owned — and the work is still on disk.
+    ///
+    /// There is deliberately no escape edge here: `DeleteAuthorized -> PreservationPrepared` is not
+    /// in 2a's frozen table, so "preserve it instead" is not available to this slice, and inventing
+    /// the edge would be the non-goal. Recovery ownership is the defined result.
+    ///
+    /// Discriminates a settlement that tombstones on the strength of having minted the capability
+    /// rather than on the provider's verified post-conditions.
+    #[tokio::test]
+    async fn a_failed_capability_removal_never_records_removed() {
+        let (be, rec, tmp, session, target, _bound) = v3_session("v3-removal-failed").await;
+        rec.fail_remove_v2.store(true, Ordering::SeqCst);
+
+        let settled = be
+            .settle_workflow_checkout_v1(&session, WorkflowCheckoutOutcomeV1::GloballyHealthy)
+            .await;
+
+        assert!(
+            matches!(settled, CheckoutSettlementV1::Retained(_)),
+            "{settled:?}"
+        );
+        assert!(!settled.removed_the_checkout());
+        assert_eq!(
+            capability_removals(&rec),
+            1,
+            "the removal was attempted once"
+        );
+        assert_eq!(
+            record_state_of(&target).as_deref(),
+            Some("delete_authorized"),
+            "no tombstone over a removal that did not complete"
+        );
+        assert!(Path::new(&target).exists(), "and the work is still there");
+        assert_eq!(
+            WorktreeCustodyStateKindV1::DeleteAuthorized.sweep_disposition(),
+            crate::custody::CustodySweepDispositionV1::Recover,
+            "which makes the checkout recovery-owned, never sweep-deletable"
+        );
+        std::fs::remove_dir_all(&tmp).unwrap();
+    }
+
+    /// P7 boundary 1, end to end: **no re-mint from a stale capability.** After a crash-equivalent
+    /// (authorized, not removed) the record is `DeleteAuthorized`, and a SECOND globally-healthy
+    /// settlement must not authorize anything, must not remove, and must not reach the provider at
+    /// all — the CAS refuses from that from-state and the flight falls through to the gate, which
+    /// refuses on the custody evidence.
+    ///
+    /// Discriminates a mint whose from-state check accepts `DeleteAuthorized`, which would let any
+    /// number of later settlements re-acquire deletion authority over a recovery-owned checkout.
+    #[tokio::test]
+    async fn a_stranded_authorization_is_recovery_owned_and_never_re_minted() {
+        let (be, rec, tmp, session, target, _bound) = v3_session("v3-stranded-auth").await;
+        rec.fail_remove_v2.store(true, Ordering::SeqCst);
+        assert!(matches!(
+            be.settle_workflow_checkout_v1(&session, WorkflowCheckoutOutcomeV1::GloballyHealthy)
+                .await,
+            CheckoutSettlementV1::Retained(_)
+        ));
+        rec.fail_remove_v2.store(false, Ordering::SeqCst);
+
+        let second = be
+            .settle_workflow_checkout_v1(&session, WorkflowCheckoutOutcomeV1::GloballyHealthy)
+            .await;
+
+        assert!(
+            matches!(second, CheckoutSettlementV1::Retained(_)),
+            "a stranded authorization must not be re-minted: {second:?}"
+        );
+        assert_eq!(
+            capability_removals(&rec),
+            1,
+            "the provider is never reached a second time"
+        );
+        assert_eq!(removals(&rec), 0);
+        assert_eq!(
+            record_state_of(&target).as_deref(),
+            Some("delete_authorized")
+        );
+        assert!(Path::new(&target).exists());
+        std::fs::remove_dir_all(&tmp).unwrap();
+    }
+
+    /// P7 boundary 4, isolated from boundary 2: the removal reports failure specifically BECAUSE
+    /// its post-condition probe disagreed (the target is still present). Same rule — never record
+    /// `Removed` over a disagreeing probe — reached through the disagreement rather than through a
+    /// git error.
+    #[tokio::test]
+    async fn a_post_condition_disagreement_never_records_removed() {
+        let (be, rec, tmp, session, target, _bound) = v3_session("v3-postcondition").await;
+        rec.remove_v2_leaves_target.store(true, Ordering::SeqCst);
+
+        let settled = be
+            .settle_workflow_checkout_v1(&session, WorkflowCheckoutOutcomeV1::GloballyHealthy)
+            .await;
+
+        assert!(matches!(settled, CheckoutSettlementV1::Retained(_)));
+        assert!(
+            Path::new(&target).exists(),
+            "the target the probe found is still there"
+        );
+        assert_eq!(
+            record_state_of(&target).as_deref(),
+            Some("delete_authorized")
+        );
+        std::fs::remove_dir_all(&tmp).unwrap();
+    }
+
+    /// §5.1's monotonicity with the THIRD disposition present: "once a preserved claim exists ...
+    /// no later healthy projection or TTL can mint deletion authority."
+    ///
+    /// Two independent mechanisms have to hold here and both are asserted: the in-memory `Ord`
+    /// (`Preserve` dominates `DeleteAuthorized`, so `raise_checkout_disposition` does not lower the
+    /// cell and the flight never enters the mint branch) and the durable from-state check (which
+    /// would refuse anyway, because the record says `preserved`).
+    ///
+    /// Discriminates an `Ord` that placed `DeleteAuthorized` above `Preserve`, and a
+    /// `raise_checkout_disposition` that assigns rather than raises.
+    #[tokio::test]
+    async fn a_preserved_checkout_is_never_removed_by_a_later_healthy_settlement() {
+        let (be, rec, tmp, session, target, _bound) = v3_session("v3-no-downgrade").await;
+        assert_eq!(
+            be.preserve_checkout_v1(&session, CheckoutPreservationReasonV1::NodeFailure)
+                .await,
+            CheckoutPreservationV1::Preserved
+        );
+
+        let settled = be
+            .settle_workflow_checkout_v1(&session, WorkflowCheckoutOutcomeV1::GloballyHealthy)
+            .await;
+
+        assert_eq!(settled, CheckoutSettlementV1::Preserved);
+        assert_eq!(capability_removals(&rec), 0, "no mint, no removal");
+        assert_eq!(removals(&rec), 0);
+        assert_eq!(record_state_of(&target).as_deref(), Some("preserved"));
+        assert!(Path::new(&target).exists());
+        assert!(
+            CheckoutDispositionV1::Preserve > CheckoutDispositionV1::DeleteAuthorized,
+            "the Ord is the in-memory half of the rule"
+        );
+        std::fs::remove_dir_all(&tmp).unwrap();
+    }
+
+    /// P3's wrong-join hazard with the third disposition present: a deletion-authority request
+    /// must not join an in-flight `Reclaim` cleanup and be handed its report.
+    ///
+    /// The 2c1 test proved this for `Preserve`; with a third value in the enum the join key's
+    /// disposition half has three ways to be wrong instead of one, and the epoch is what keeps
+    /// equality from becoming accidental across generations.
+    ///
+    /// Discriminates a join key that dropped back to `(cell, strength)` — the pre-2c1 shape.
+    #[tokio::test]
+    async fn a_deletion_authority_request_never_joins_a_reclaim_flight() {
+        let (be, rec, tmp, source, _cfg) = backend_fixture("v3-race-delete");
+        let session = SessionId::parse("ctx-v3-race-delete-g0").unwrap();
+        be.configure_session(&session, &spec(Some(&source.to_string_lossy())))
+            .await
+            .unwrap();
+
+        let (reclaim_strength, _reclaim_report) = be
+            .start_or_join_cleanup(&session, CleanupStrength::Release, false)
+            .expect("a reclaim flight starts");
+        assert_eq!(reclaim_strength, CleanupStrength::Release);
+        be.raise_checkout_disposition(&session, CheckoutDispositionV1::DeleteAuthorized, None)
+            .expect("the session has a cell");
+        let authorized = be
+            .start_or_join_cleanup(&session, CleanupStrength::Release, false)
+            .expect("a deletion-authority flight starts");
+
+        assert_eq!(
+            be.cleanup_join_count(&session),
+            0,
+            "an equal-strength request of a DIFFERENT disposition must not join"
+        );
+        let report = wait_for_cleanup_report(authorized.1).await;
+        assert!(report.is_ok());
+        drop(rec);
+        std::fs::remove_dir_all(&tmp).unwrap();
+    }
+
+    /// P5's epoch guard as a unit: a disposition raised AFTER a flight captured its generation
+    /// makes that flight's authority stale, so the mint must not run.
+    ///
+    /// This is the window the per-session state mutex does not cover — `start_or_join_cleanup`
+    /// reads the disposition synchronously and the flight then awaits the configure drain, the
+    /// state mutex, and the inner teardown before it would mint. Comparing the EPOCH as well as
+    /// the enum is what makes the check hold once a third disposition exists: after an eviction and
+    /// a rebuild, enum equality alone can be true across two different generations.
+    ///
+    /// Discriminates a guard that compares only `disposition`.
+    #[tokio::test]
+    async fn a_disposition_raised_after_a_flight_started_makes_its_authority_stale() {
+        let (be, rec, tmp, source, _cfg) = backend_fixture("v3-epoch-guard");
+        let session = SessionId::parse("ctx-v3-epoch-guard-g0").unwrap();
+        be.configure_session(&session, &spec(Some(&source.to_string_lossy())))
+            .await
+            .unwrap();
+        let cell = be
+            .raise_checkout_disposition(&session, CheckoutDispositionV1::DeleteAuthorized, None)
+            .expect("the session has a cell");
+        let captured_epoch = cell.lifecycle.lock().unwrap().disposition_epoch;
+        assert!(WorktreeBackend::deletion_generation_is_current(
+            &cell,
+            CheckoutDispositionV1::DeleteAuthorized,
+            captured_epoch
+        ));
+
+        be.raise_checkout_disposition(
+            &session,
+            CheckoutDispositionV1::Preserve,
+            Some(PreservationReasonV1::Cancellation),
+        )
+        .expect("the session has a cell");
+
+        assert!(
+            !WorktreeBackend::deletion_generation_is_current(
+                &cell,
+                CheckoutDispositionV1::DeleteAuthorized,
+                captured_epoch
+            ),
+            "a preservation raised after the flight started must invalidate its authority"
+        );
+        assert!(
+            !WorktreeBackend::deletion_generation_is_current(
+                &cell,
+                CheckoutDispositionV1::Preserve,
+                captured_epoch
+            ),
+            "and the EPOCH must discriminate, not just the enum"
+        );
+        drop(rec);
+        std::fs::remove_dir_all(&tmp).unwrap();
+    }
+
+    /// P5, order 1 (evict-then-flight) — opus W3 made binding on this slice.
+    ///
+    /// The cleanup cell holding a session's `Preserve` disposition is EVICTED by the reporter the
+    /// moment a flight reports `Ok`, which a gate refusal does. The next context-free teardown
+    /// therefore starts from a fresh cell at `Reclaim`, and before this slice it published
+    /// `worktree.teardown.retained` for a checkout whose record on disk says `preserved`.
+    ///
+    /// The assertion is on the OBSERVED teardown code, which is the only channel a caller outside
+    /// `bridge-worktree` has (2c1 §4.1).
+    ///
+    /// Discriminates the label-only defect exactly: remove the durable re-derivation and the second
+    /// teardown reports `retained`.
+    #[tokio::test]
+    async fn a_fresh_cell_after_eviction_re_derives_the_preserved_disposition_from_disk() {
+        let (be, _rec, tmp, session, target, _bound) = v3_session("v3-cell-evicted").await;
+        assert_eq!(
+            be.preserve_checkout_v1(&session, CheckoutPreservationReasonV1::Cancellation)
+                .await,
+            CheckoutPreservationV1::Preserved
+        );
+        let first = Arc::new(CodeRec::default());
+        be.release_session_observed(&session, first.clone())
+            .await
+            .unwrap();
+        assert_eq!(
+            be.cleanup_cell_count(),
+            0,
+            "the reporter evicts the cell on an Ok report — this is the precondition"
+        );
+
+        let second = Arc::new(CodeRec::default());
+        be.release_session_observed(&session, second.clone())
+            .await
+            .unwrap();
+
+        assert_eq!(record_state_of(&target).as_deref(), Some("preserved"));
+        assert!(
+            second
+                .codes
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(_, code)| code == "worktree.teardown.preserved"),
+            "a flight on a rebuilt cell must read the durable disposition, not default to \
+             Retained: {:?}",
+            second.codes.lock().unwrap()
+        );
+        std::fs::remove_dir_all(&tmp).unwrap();
+    }
+
+    /// P5, order 2 (no in-memory evidence at all) — the shape a process restart leaves behind.
+    ///
+    /// Here the cell is gone AND the map entry has neither the custody discriminator nor the
+    /// retained identities, so the preservation barrier itself refuses (`not under R2f1b custody`)
+    /// and there is no barrier outcome to label from. The record on disk is the ONLY authority
+    /// left, and the report must still be `preserved`.
+    ///
+    /// Discriminates a re-derivation wired only into the barrier: the barrier cannot run here.
+    #[tokio::test]
+    async fn a_flight_with_no_in_memory_evidence_still_reports_the_durable_preservation() {
+        let (be, _rec, tmp, session, target, _bound) = v3_session("v3-no-evidence").await;
+        assert_eq!(
+            be.preserve_checkout_v1(&session, CheckoutPreservationReasonV1::NodeFailure)
+                .await,
+            CheckoutPreservationV1::Preserved
+        );
+        // Everything in memory forgets that this checkout is under custody; the record does not.
+        be.mark_entry_legacy_for_test(&session).await;
+
+        let observer = Arc::new(CodeRec::default());
+        be.release_session_observed(&session, observer.clone())
+            .await
+            .unwrap();
+
+        assert_eq!(record_state_of(&target).as_deref(), Some("preserved"));
+        assert!(Path::new(&target).exists());
+        assert!(
+            observer
+                .codes
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(_, code)| code == "worktree.teardown.preserved"),
+            "the record is the authoritative disposition source: {:?}",
+            observer.codes.lock().unwrap()
+        );
+        std::fs::remove_dir_all(&tmp).unwrap();
+    }
+
+    /// The typed report composes with a capability removal (the brief's "also yours"): a real
+    /// removal publishes the REAL terminal code, not the retained/preserved one.
+    ///
+    /// Without this, 2c1's typed disposition would have gained a fourth silent case — a genuine
+    /// removal reported through the refusal vocabulary.
+    #[tokio::test]
+    async fn a_capability_removal_publishes_the_real_removed_teardown_code() {
+        let (be, rec, tmp, session, _target, _bound) = v3_session("v3-removed-code").await;
+        be.raise_checkout_disposition(&session, CheckoutDispositionV1::DeleteAuthorized, None)
+            .expect("the session has a cell");
+
+        let observer = Arc::new(CodeRec::default());
+        be.release_session_observed(&session, observer.clone())
+            .await
+            .unwrap();
+
+        assert_eq!(capability_removals(&rec), 1);
+        let codes = observer.codes.lock().unwrap().clone();
+        assert!(
+            codes
+                .iter()
+                .any(|(status, code)| status == "Completed" && code == "worktree.teardown.released"),
+            "a capability removal is a real removal and publishes the real code: {codes:?}"
+        );
+        assert!(
+            !codes
+                .iter()
+                .any(|(_, code)| code == "worktree.teardown.retained"
+                    || code == "worktree.teardown.preserved"),
+            "and never a refusal code: {codes:?}"
+        );
+        std::fs::remove_dir_all(&tmp).unwrap();
+    }
+
+    /// P6 (BINDING): **disposition of gate-retained context-free deaths.**
+    ///
+    /// 2c1's ruling is that a context-free entry — a reaper, a `Drop`, controller retire — tears
+    /// the session down with NO workflow outcome, so it gate-retains the checkout and mints no
+    /// claim. 2c1's own handoff named the residual: those checkouts leak claimless if the post-loop
+    /// mint slips. This is the pass that settles them.
+    ///
+    /// The setup is that exact shape: the node completed, the session was then torn down by a
+    /// context-free release (which pops the reservation and re-inserts it as `Retained`), and the
+    /// post-loop pass must still reach it — through the `Retained` map state, which is the entry's
+    /// last in-memory owner. Both global outcomes are driven, on two separate checkouts.
+    ///
+    /// Discriminates a settlement that only looks at `WtState::Ready`, which would leave every
+    /// context-free-torn-down checkout unsettled — the precise residual 2c1 §4.4 recorded.
+    #[tokio::test]
+    async fn a_gate_retained_context_free_death_is_settled_by_the_post_loop_pass() {
+        // Arm A: the workflow failed. The claimless retained checkout finally gets its claim.
+        let (be, rec, tmp, session, target, _bound) = v3_session("v3-p6-failed").await;
+        be.release_session_checked(&session).await.unwrap();
+        assert_eq!(
+            record_state_of(&target).as_deref(),
+            Some("live_protected"),
+            "the context-free death gate-retained it with no claim (2c1's ruling)"
+        );
+
+        let settled = be
+            .settle_workflow_checkout_v1(
+                &session,
+                WorkflowCheckoutOutcomeV1::NotHealthy(CheckoutPreservationReasonV1::Cancellation),
+            )
+            .await;
+
+        assert_eq!(settled, CheckoutSettlementV1::Preserved);
+        assert_eq!(record_state_of(&target).as_deref(), Some("preserved"));
+        assert_eq!(removals(&rec), 0);
+        std::fs::remove_dir_all(&tmp).unwrap();
+
+        // Arm B: the workflow was globally healthy. The same claimless retained checkout is
+        // removed under a capability instead.
+        let (be, rec, tmp, session, target, _bound) = v3_session("v3-p6-healthy").await;
+        be.release_session_checked(&session).await.unwrap();
+        assert_eq!(record_state_of(&target).as_deref(), Some("live_protected"));
+
+        let settled = be
+            .settle_workflow_checkout_v1(&session, WorkflowCheckoutOutcomeV1::GloballyHealthy)
+            .await;
+
+        assert_eq!(settled, CheckoutSettlementV1::Removed);
+        assert_eq!(capability_removals(&rec), 1);
+        assert_eq!(removals(&rec), 0);
+        assert!(!Path::new(&target).exists());
+        assert!(
+            be.mapped_worktree_path_for_test(&session).await.is_none(),
+            "and the retained entry is cleared exactly once — no entry mapped forever"
+        );
         std::fs::remove_dir_all(&tmp).unwrap();
     }
 }

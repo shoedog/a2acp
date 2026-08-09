@@ -30,9 +30,10 @@ use bridge_core::orch::UsageSnapshot;
 use bridge_core::permission::TurnMeta;
 use bridge_core::ports::{
     classify_failure, AgentBackend, AgentRegistry, BackendObservers, BoundEntryUseV1,
-    CheckoutPreservationReasonV1, CheckoutPreservationV1, DiagnosticObserver,
+    CheckoutPreservationReasonV1, CheckoutPreservationV1, CheckoutSettlementV1, DiagnosticObserver,
     DiagnosticObserverFactory, FailureClass, ObsEvent, Observer, Resolved, RichEventSinkFactory,
-    TurnContext, TurnOutcome, Update, UsageFinalization, STOP_REASON_CANCELLED,
+    TurnContext, TurnOutcome, Update, UsageFinalization, WorkflowCheckoutOutcomeV1,
+    STOP_REASON_CANCELLED,
 };
 use bridge_core::SessionCwd;
 use futures::stream::FuturesUnordered;
@@ -688,6 +689,36 @@ struct NodeCleanupState {
     failed: bool,
     intervals: Vec<(std::time::Instant, std::time::Instant)>,
     failure: Option<BridgeError>,
+    /// The sessions this node configured, and the backend that owns each one's checkout
+    /// (slice 2c2, P3).
+    ///
+    /// A `Vec` rather than an `Option`, because a node's attempts can be served by DIFFERENT
+    /// backend instances: a transient failure invalidates the registry entry and the retry
+    /// resolves a fresh one, whose checkout map knows nothing about the previous instance's
+    /// retained entry. Settling only the last one would strand every earlier attempt's checkout.
+    checkouts: Vec<WorkflowCheckoutOwnerV1>,
+}
+
+/// One materialized checkout of the workflow, and the backend entitled to dispose of it.
+///
+/// **The executor deliberately does not know whether a checkout exists.** It records every session
+/// it successfully configured and lets the worktree layer answer `NoCheckoutUnderCustody` for the
+/// ones it does not own — which is every V2 session and every non-worktree backend. That is the
+/// fail-closed direction: a session the executor forgot to record is a checkout nobody settles,
+/// whereas a session it records needlessly costs one map lookup.
+#[derive(Clone)]
+struct WorkflowCheckoutOwnerV1 {
+    session: SessionId,
+    backend: Arc<dyn AgentBackend>,
+}
+
+impl WorkflowCheckoutOwnerV1 {
+    /// Same session AND same backend instance. Both halves matter: the same session id served by
+    /// two backend instances is two map entries to settle, and one backend serving two sessions is
+    /// two checkouts.
+    fn is_same_owner(&self, other: &Self) -> bool {
+        self.session == other.session && Arc::ptr_eq(&self.backend, &other.backend)
+    }
 }
 
 impl WorkflowCleanupTracker {
@@ -712,6 +743,55 @@ impl WorkflowCleanupTracker {
         if node_state.failure.is_none() {
             node_state.failure = result.as_ref().err().cloned();
         }
+    }
+
+    /// Register a session whose checkout the workflow-level disposition owns (slice 2c2, R-9).
+    ///
+    /// **Extends the tracker rather than building a parallel registry**, per the brief's R-9: this
+    /// value is already `Arc`, already `Mutex`-interior, already keyed by `NodeId`, and already
+    /// written from inside node futures, so the ~45 existing call sites need no plumbing at all.
+    /// A second registry would need every one of them threaded again and would have to be kept in
+    /// step with this one's node keys.
+    fn record_checkout(&self, node: &NodeId, session: &SessionId, backend: &Arc<dyn AgentBackend>) {
+        let owner = WorkflowCheckoutOwnerV1 {
+            session: session.clone(),
+            backend: backend.clone(),
+        };
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let node_state = state.nodes.entry(node.clone()).or_default();
+        if !node_state
+            .checkouts
+            .iter()
+            .any(|existing| existing.is_same_owner(&owner))
+        {
+            node_state.checkouts.push(owner);
+        }
+    }
+
+    /// Every materialized checkout of the workflow, in deterministic node order.
+    ///
+    /// §5.1 requires the settlement to reach **every** one, "including nodes that completed
+    /// earlier" — and, per P6, including nodes whose session a context-free entry already tore
+    /// down mid-run. Both fall out of reading the tracker rather than the live scheduler state:
+    /// a recorded owner is never removed.
+    fn materialized_checkouts(&self) -> Vec<(NodeId, WorkflowCheckoutOwnerV1)> {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state
+            .nodes
+            .iter()
+            .flat_map(|(node, node_state)| {
+                node_state
+                    .checkouts
+                    .iter()
+                    .map(move |owner| (node.clone(), owner.clone()))
+            })
+            .collect()
     }
 
     fn node_observation(&self, node: &NodeId) -> (NodeCleanupV1, Option<BridgeError>) {
@@ -759,6 +839,55 @@ impl WorkflowCleanupTracker {
         let duration_ms = interval_union_ms(state.intervals.clone());
         (disposition, duration_ms)
     }
+}
+
+/// R2f1b §5.1's global-outcome test, as a pure function (slice 2c2, P3).
+///
+/// > "After every node is terminal, an **all-healthy** global workflow outcome may mint deletion
+/// > capabilities ... Any failed, degraded, canceled, timed-out, mechanically impossible, or
+/// > cleanup-ambiguous global outcome runs `preserve_after_cancel` for every materialized
+/// > checkout, including nodes that completed earlier."
+///
+/// **Extracted rather than written inline, and that is evidence discipline rather than style.**
+/// Two of the four clauses cannot be discriminated through the executor's own graph shapes: a
+/// `WorkflowGraph` has exactly one terminal node (`graph.terminal()` is the first node nothing
+/// references), so a run whose terminal node COMPLETED while a sibling FAILED is not constructible
+/// from the node/edge vocabulary available to this slice — a failed dependency skips its
+/// dependents, and two unreferenced nodes are not a legal graph. The clause is still required by
+/// §5.1 (fan-out under `bounded_independent` is exactly that shape, and it is a later slice's), so
+/// it is kept and pinned HERE, where every clause has a discriminating case.
+///
+/// The conjunction, clause by clause:
+///
+/// * `outcome == Completed` — `CompletedDegraded` is named as a preserving outcome by §5.1 in its
+///   own right, so "completed" is not enough;
+/// * every node disposition is `Completed` — the sibling clause above, which also covers skipped,
+///   not-started-by-policy, timed-out and canceled nodes;
+/// * no node cleanup failed — §5.1's "cleanup-ambiguous" outcome;
+/// * the run was not cancelled — tested independently of the terminal disposition, because a
+///   cancellation can land after the terminal node completed.
+///
+/// The preservation REASON is `Cancellation` only when the run really was cancelled: it lands in a
+/// durable R2f2 claim, and a failure recorded as a cancellation misattributes the work.
+fn workflow_checkout_outcome(
+    outcome: &WorkflowOutcome,
+    cleanup: WorkflowCleanupDisposition,
+    cancelled: bool,
+    node_dispositions: impl Iterator<Item = NodeDisposition>,
+) -> WorkflowCheckoutOutcomeV1 {
+    let globally_healthy = *outcome == WorkflowOutcome::Completed
+        && cleanup != WorkflowCleanupDisposition::Failed
+        && !cancelled
+        && node_dispositions
+            .into_iter()
+            .all(|disposition| disposition == NodeDisposition::Completed);
+    if globally_healthy {
+        return WorkflowCheckoutOutcomeV1::GloballyHealthy;
+    }
+    if cancelled || *outcome == WorkflowOutcome::Canceled {
+        return WorkflowCheckoutOutcomeV1::NotHealthy(CheckoutPreservationReasonV1::Cancellation);
+    }
+    WorkflowCheckoutOutcomeV1::NotHealthy(CheckoutPreservationReasonV1::NodeFailure)
 }
 
 fn interval_union_ms(mut intervals: Vec<(std::time::Instant, std::time::Instant)>) -> u64 {
@@ -1921,6 +2050,10 @@ impl WorkflowExecutor {
                 }
                 break;
             }
+            // ENUMERATED CHECKOUT SITE (preflight). A preflight session configures through the
+            // same bound spec as the node's own attempt, so under V3 it materializes a checkout
+            // too, and §5.1's "every materialized checkout" admits no exception for it.
+            cleanup_tracker.record_checkout(&node.id, &session, attempt_use.backend());
             if cancel.is_cancelled() {
                 let _ = preserve_then_cleanup_cold_session(
                     &node.id,
@@ -3357,6 +3490,13 @@ impl WorkflowExecutor {
                             error: Some(e),
                         };
                     }
+                    // ENUMERATED CHECKOUT SITE (node loop). A successful configure is the moment a
+                    // worktree-backed session's checkout exists; recording it here — not at the
+                    // node's terminal — is what makes the post-loop pass reach checkouts whose
+                    // node failed, was cancelled, or had its session torn down by a context-free
+                    // entry mid-run (P6). The backend answers `NoCheckoutUnderCustody` for every
+                    // session that owns no custody-governed checkout, so V2 is unaffected.
+                    cleanup_tracker.record_checkout(&node.id, &session, attempt_use.backend());
                     if cancel.is_cancelled() {
                         match preserve_then_cleanup_cold_session(
                             &node.id,
@@ -5287,6 +5427,53 @@ impl WorkflowExecutor {
                     }
                 });
             let (cleanup_disposition, cleanup_ms) = cleanup_tracker.observation();
+            // ---- R2f1b §5.1 WORKFLOW-LEVEL CHECKOUT DISPOSITION (slice 2c2) ------------------
+            // "After every node is terminal, an all-healthy global workflow outcome may mint
+            // deletion capabilities and perform the existing normal success cleanup. Any failed,
+            // degraded, canceled, timed-out, mechanically impossible, or cleanup-ambiguous global
+            // outcome runs `preserve_after_cancel` for EVERY materialized checkout, including
+            // nodes that completed earlier."
+            //
+            // This is the only place in the workspace that can produce
+            // `WorkflowCheckoutOutcomeV1::GloballyHealthy`, and it runs strictly after the node
+            // loop, so no node-local success can reach it. The health test is a CONJUNCTION and
+            // every clause is a separate way to be unhealthy:
+            //
+            //  * the terminal node's own outcome is `Completed` — not `CompletedDegraded`, which
+            //    §5.1 names as a preserving outcome in its own right;
+            //  * EVERY node disposition is `Completed` — this is the clause that keeps a
+            //    successful terminal node from deleting a failed sibling's checkout under
+            //    `bounded_independent`, and it also covers skipped, not-started-by-policy, and
+            //    timed-out nodes, none of which are healthy;
+            //  * no node cleanup failed — §5.1's "cleanup-ambiguous" outcome;
+            //  * the run was not cancelled, tested independently of the terminal disposition
+            //    because a cancellation can land after the terminal node completed.
+            //
+            // Anything else preserves, and the reason is `Cancellation` only when the run really
+            // was cancelled: a failure recorded as a cancellation would put the wrong trigger in a
+            // durable R2f2 claim.
+            let checkout_outcome = workflow_checkout_outcome(
+                &outcome,
+                cleanup_disposition,
+                cancel.is_cancelled(),
+                dispositions.values().copied(),
+            );
+            for (checkout_node, owner) in cleanup_tracker.materialized_checkouts() {
+                let settled = owner
+                    .backend
+                    .settle_workflow_checkout_v1(&owner.session, checkout_outcome)
+                    .await;
+                match &settled {
+                    CheckoutSettlementV1::NoCheckoutUnderCustody => {}
+                    settled => tracing::info!(
+                        node = checkout_node.as_str(),
+                        session = owner.session.as_str(),
+                        ?checkout_outcome,
+                        ?settled,
+                        "R2f1b workflow-level checkout disposition settled"
+                    ),
+                }
+            }
             yield Ok(WorkflowEvent::CleanupObserved {
                 disposition: cleanup_disposition,
                 duration_ms: cleanup_ms,
@@ -12541,6 +12728,360 @@ mod tests {
         assert!(
             matches!(err, BridgeError::ConfigInvalid { reason } if reason.contains("closed under inputs")),
             "expected ConfigInvalid about closure, got: {err:?}"
+        );
+    }
+    // ---- slice 2c2: the workflow-level checkout disposition (P3, P6) ----
+
+    /// Records every workflow-level settlement, and fails whichever node it is told to.
+    #[derive(Default)]
+    struct SettlementBackend {
+        settlements: Mutex<Vec<(String, WorkflowCheckoutOutcomeV1)>>,
+        fail_prompt_for: Option<&'static str>,
+        cleanups: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl AgentBackend for SettlementBackend {
+        async fn prompt(
+            &self,
+            session: &SessionId,
+            _parts: Vec<Part>,
+        ) -> Result<BackendStream, BridgeError> {
+            if self
+                .fail_prompt_for
+                .is_some_and(|node| session.as_str().contains(node))
+            {
+                return Err(BridgeError::StoreFailure);
+            }
+            Ok(Box::pin(tokio_stream::iter(vec![
+                Ok(Update::FinalAnswer("OK".into())),
+                Ok(Update::Done {
+                    stop_reason: "end_turn".into(),
+                    prefix_attestation: Default::default(),
+                }),
+            ])))
+        }
+
+        async fn cancel(&self, _session: &SessionId) -> Result<(), BridgeError> {
+            Ok(())
+        }
+
+        async fn forget_session_checked(&self, _session: &SessionId) -> Result<(), BridgeError> {
+            self.cleanups.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        async fn settle_workflow_checkout_v1(
+            &self,
+            session: &SessionId,
+            outcome: WorkflowCheckoutOutcomeV1,
+        ) -> CheckoutSettlementV1 {
+            self.settlements
+                .lock()
+                .unwrap()
+                .push((session.as_str().to_owned(), outcome));
+            CheckoutSettlementV1::NoCheckoutUnderCustody
+        }
+    }
+
+    struct SettlementRegistry {
+        backend: Arc<SettlementBackend>,
+    }
+
+    #[async_trait::async_trait]
+    impl AgentRegistry for SettlementRegistry {
+        async fn resolve(&self, id: &AgentId) -> Result<Resolved, BridgeError> {
+            Ok(Resolved {
+                entry: Arc::new(minimal_entry(id)),
+                backend: self.backend.clone(),
+                lease: Box::new(NoopLease),
+            })
+        }
+
+        fn default_id(&self) -> AgentId {
+            AgentId::parse("codex").unwrap()
+        }
+
+        async fn apply(&self, _: RegistrySnapshot) -> Result<(), BridgeError> {
+            Ok(())
+        }
+
+        async fn invalidate(&self, _agent: &AgentId) {}
+
+        fn list(&self) -> Vec<AgentId> {
+            vec![]
+        }
+    }
+
+    fn settlement_graph(second: &str) -> Arc<WorkflowGraph> {
+        Arc::new(WorkflowGraph {
+            id: WorkflowId::parse("w").unwrap(),
+            nodes: vec![
+                WorkflowNode {
+                    id: NodeId::parse("first").unwrap(),
+                    agent: AgentId::parse("codex").unwrap(),
+                    prompt_template: "echo {{input}}".into(),
+                    inputs: vec![],
+                    retry: None,
+                    harvest_sanitization: None,
+                },
+                WorkflowNode {
+                    id: NodeId::parse(second).unwrap(),
+                    agent: AgentId::parse("codex").unwrap(),
+                    prompt_template: "echo {{first}}".into(),
+                    inputs: vec![NodeId::parse("first").unwrap()],
+                    retry: None,
+                    harvest_sanitization: None,
+                },
+            ],
+            panel: None,
+            controls: None,
+        })
+    }
+
+    async fn run_for_settlement(
+        graph: Arc<WorkflowGraph>,
+        backend: Arc<SettlementBackend>,
+        cancel: CancellationToken,
+    ) -> Vec<(String, WorkflowCheckoutOutcomeV1)> {
+        let registry = Arc::new(SettlementRegistry {
+            backend: backend.clone(),
+        });
+        let _events = WorkflowExecutor::new(registry)
+            .run(graph, "input".into(), "settle-run".into(), cancel)
+            .collect::<Vec<_>>()
+            .await;
+        let settlements = backend.settlements.lock().unwrap().clone();
+        settlements
+    }
+
+    /// §5.1's healthy path, from the executor's side: after EVERY node is terminal and every one
+    /// of them completed, the post-loop pass settles each materialized checkout with the one
+    /// outcome that can mint deletion authority.
+    ///
+    /// Discriminates a pass that never runs (no settlements at all) and one that settles per node
+    /// rather than per checkout.
+    #[tokio::test]
+    async fn a_globally_healthy_workflow_settles_every_checkout_as_healthy() {
+        let backend = Arc::new(SettlementBackend::default());
+
+        let settlements = run_for_settlement(
+            settlement_graph("second"),
+            backend,
+            CancellationToken::new(),
+        )
+        .await;
+
+        assert_eq!(settlements.len(), 2, "one per configured session");
+        assert!(
+            settlements
+                .iter()
+                .all(|(_, outcome)| *outcome == WorkflowCheckoutOutcomeV1::GloballyHealthy),
+            "{settlements:?}"
+        );
+        assert!(settlements.iter().any(|(s, _)| s.contains("first")));
+        assert!(settlements.iter().any(|(s, _)| s.contains("second")));
+    }
+
+    /// §5.1's "a successful sibling cannot delete useful work before a later sibling determines
+    /// the workflow outcome", at the executor: the FIRST node completed cleanly and its checkout is
+    /// still settled as NOT healthy, because a later node failed.
+    ///
+    /// This is the outcome-driven "cancel cannot delete" row of the §6 matrix, and it is the exact
+    /// case that makes the deferral worth having.
+    ///
+    /// Discriminates a health test computed from the terminal node's disposition alone.
+    #[tokio::test]
+    async fn a_completed_node_is_settled_not_healthy_when_a_later_node_fails() {
+        let backend = Arc::new(SettlementBackend {
+            fail_prompt_for: Some("second"),
+            ..SettlementBackend::default()
+        });
+
+        let settlements = run_for_settlement(
+            settlement_graph("second"),
+            backend,
+            CancellationToken::new(),
+        )
+        .await;
+
+        assert_eq!(settlements.len(), 2);
+        assert!(
+            settlements.iter().all(|(_, outcome)| *outcome
+                == WorkflowCheckoutOutcomeV1::NotHealthy(
+                    CheckoutPreservationReasonV1::NodeFailure
+                )),
+            "every materialized checkout preserves, including the node that completed earlier: \
+             {settlements:?}"
+        );
+        let (completed, _) = settlements
+            .iter()
+            .find(|(session, _)| session.contains("first"))
+            .expect("the completed node's checkout is settled too");
+        assert!(completed.contains("first"));
+    }
+
+    /// A cancelled run settles with the CANCELLATION reason, not the failure one — the trigger
+    /// ends up in a durable R2f2 claim, so naming it wrongly would misattribute the work.
+    ///
+    /// Discriminates a settlement that derives the reason from `WorkflowOutcome` alone: a
+    /// cancellation that lands after the terminal node completed still reports `Completed` there.
+    #[tokio::test]
+    async fn a_cancelled_workflow_settles_every_checkout_as_cancelled() {
+        let backend = Arc::new(SettlementBackend::default());
+        let cancel = CancellationToken::new();
+        let registry = Arc::new(SettlementRegistry {
+            backend: backend.clone(),
+        });
+        let mut stream = WorkflowExecutor::new(registry).run(
+            settlement_graph("second"),
+            "input".into(),
+            "settle-cancel".into(),
+            cancel.clone(),
+        );
+        // Let the first node start and finish, then cancel before the run terminalizes.
+        let mut seen = 0;
+        while let Some(event) = stream.next().await {
+            if matches!(event, Ok(WorkflowEvent::NodeFinished { .. })) {
+                seen += 1;
+                if seen == 1 {
+                    cancel.cancel();
+                }
+            }
+        }
+
+        let settlements = backend.settlements.lock().unwrap().clone();
+        assert!(!settlements.is_empty());
+        assert!(
+            settlements.iter().all(|(_, outcome)| *outcome
+                == WorkflowCheckoutOutcomeV1::NotHealthy(
+                    CheckoutPreservationReasonV1::Cancellation
+                )),
+            "{settlements:?}"
+        );
+    }
+
+    /// The §5.1 health test, clause by clause, with a discriminating case for each.
+    ///
+    /// Written against the extracted predicate BECAUSE two of the clauses are unreachable through
+    /// the executor's graph vocabulary (see the doc comment on `workflow_checkout_outcome`): a
+    /// `WorkflowGraph` has one terminal node, so "terminal completed, sibling failed" is not a
+    /// legal graph in this slice. Testing them here is the honest alternative to a defensive
+    /// conjunct with no evidence at all.
+    ///
+    /// Discriminates each clause independently — drop any one and exactly one row goes red.
+    #[test]
+    fn the_global_health_test_requires_every_clause() {
+        let healthy = |outcome, cleanup, cancelled, nodes: Vec<NodeDisposition>| {
+            workflow_checkout_outcome(&outcome, cleanup, cancelled, nodes.into_iter())
+        };
+        let all_done = vec![NodeDisposition::Completed, NodeDisposition::Completed];
+
+        assert_eq!(
+            healthy(
+                WorkflowOutcome::Completed,
+                WorkflowCleanupDisposition::Complete,
+                false,
+                all_done.clone()
+            ),
+            WorkflowCheckoutOutcomeV1::GloballyHealthy,
+            "the only healthy row"
+        );
+        assert_eq!(
+            healthy(
+                WorkflowOutcome::Completed,
+                WorkflowCleanupDisposition::NotNeeded,
+                false,
+                vec![]
+            ),
+            WorkflowCheckoutOutcomeV1::GloballyHealthy,
+            "no cleanup observed at all is not a cleanup failure"
+        );
+        // Clause: the terminal outcome itself.
+        assert_eq!(
+            healthy(
+                WorkflowOutcome::CompletedDegraded,
+                WorkflowCleanupDisposition::Complete,
+                false,
+                all_done.clone()
+            ),
+            WorkflowCheckoutOutcomeV1::NotHealthy(CheckoutPreservationReasonV1::NodeFailure),
+            "degraded is a preserving outcome in its own right"
+        );
+        // Clause: every node disposition. THE sibling case.
+        for sibling in [
+            NodeDisposition::Failed,
+            NodeDisposition::CompletedDegraded,
+            NodeDisposition::SkippedDependency,
+            NodeDisposition::NotStartedPolicy,
+            NodeDisposition::Canceled,
+        ] {
+            let outcome = healthy(
+                WorkflowOutcome::Completed,
+                WorkflowCleanupDisposition::Complete,
+                false,
+                vec![NodeDisposition::Completed, sibling],
+            );
+            assert!(
+                !outcome.authorizes_deletion(),
+                "a completed terminal must not authorize deleting a {sibling:?} sibling's checkout"
+            );
+        }
+        // Clause: cleanup ambiguity.
+        assert!(!healthy(
+            WorkflowOutcome::Completed,
+            WorkflowCleanupDisposition::Failed,
+            false,
+            all_done.clone()
+        )
+        .authorizes_deletion());
+        // Clause: cancellation, independent of the terminal disposition, and it names its own
+        // reason rather than borrowing the failure one.
+        assert_eq!(
+            healthy(
+                WorkflowOutcome::Completed,
+                WorkflowCleanupDisposition::Complete,
+                true,
+                all_done
+            ),
+            WorkflowCheckoutOutcomeV1::NotHealthy(CheckoutPreservationReasonV1::Cancellation)
+        );
+        assert_eq!(
+            healthy(
+                WorkflowOutcome::Canceled,
+                WorkflowCleanupDisposition::Complete,
+                false,
+                vec![NodeDisposition::Canceled]
+            ),
+            WorkflowCheckoutOutcomeV1::NotHealthy(CheckoutPreservationReasonV1::Cancellation)
+        );
+    }
+
+    /// The tracker extension itself (R-9): it keys checkouts by node, dedupes an owner that is
+    /// recorded twice (the same session re-configured on a retry), and keeps two owners apart when
+    /// the backend instance differs — which is what a registry invalidation between attempts
+    /// produces, and what makes "settle only the last one" lose a checkout.
+    #[test]
+    fn the_tracker_records_one_owner_per_distinct_session_and_backend() {
+        let tracker = WorkflowCleanupTracker::default();
+        let node = NodeId::parse("only").unwrap();
+        let session = SessionId::parse("s-1").unwrap();
+        let other_session = SessionId::parse("s-2").unwrap();
+        let first: Arc<dyn AgentBackend> = Arc::new(SettlementBackend::default());
+        let second: Arc<dyn AgentBackend> = Arc::new(SettlementBackend::default());
+
+        tracker.record_checkout(&node, &session, &first);
+        tracker.record_checkout(&node, &session, &first);
+        tracker.record_checkout(&node, &session, &second);
+        tracker.record_checkout(&node, &other_session, &first);
+
+        let owners = tracker.materialized_checkouts();
+        assert_eq!(owners.len(), 3, "the exact re-record is the only dedupe");
+        assert!(owners.iter().all(|(recorded, _)| *recorded == node));
+        assert_eq!(
+            tracker.node_observation(&node).0.disposition,
+            NodeCleanupDispositionV1::NotNeeded,
+            "recording a checkout must not look like a cleanup observation"
         );
     }
 }

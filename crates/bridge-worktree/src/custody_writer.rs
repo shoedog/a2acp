@@ -180,6 +180,157 @@ impl From<CustodyWriteRefusalV1> for PreservationOutcomeV1 {
     }
 }
 
+/// Focused boundary §5.1's deletion authority, as a value that cannot be forged or replayed.
+///
+/// > "Globally healthy workflow success is the only automatic deletion path. It CASes to
+/// > `DeleteAuthorized` and mints an unforgeable `DeletionCapabilityV1`.
+/// > `HostGitWorktree::remove_v2` takes that capability — **not a raw path**."
+///
+/// **Unforgeable** means two separate things, and both are structural rather than conventional:
+///
+/// * **Not constructible outside this module.** Every field is private and there is no public
+///   constructor, no `Default`, and no `From`. The ONLY expression anywhere that builds one is in
+///   [`WorktreeCustodianV1::authorize_deletion`], which runs under both custody cells and refuses
+///   unless the record on disk transitions `LiveProtected -> DeleteAuthorized`. A caller in
+///   `backend.rs` — or in any other crate — cannot write one down.
+/// * **Not usable twice.** It is neither `Clone` nor `Copy`, and the only way to reach a provider
+///   removal is [`Self::revalidate_for_removal`], which takes `self` BY VALUE. A capability is
+///   therefore consumed exactly once, and a failed revalidation consumes it too — retrying needs a
+///   fresh mint, which needs the record to be `LiveProtected` again, which a `DeleteAuthorized`
+///   record is not. That is what "no re-mint from the stale capability" means mechanically.
+///
+/// It carries the identity the removal is authorized FOR — the repo, the target, and the four
+/// object identities observed at materialization — so `remove_v2` never has to be handed a path
+/// by a caller, and a capability minted for one checkout can never name another.
+pub struct DeletionCapabilityV1 {
+    custody_id: WorktreeCustodyIdV1,
+    canonical_source: String,
+    worktree_path: String,
+    identities: MaterializedIdentitiesV1,
+}
+
+impl std::fmt::Debug for DeletionCapabilityV1 {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("DeletionCapabilityV1")
+            .field("custody_id", &self.custody_id.as_str())
+            .field("worktree_path", &self.worktree_path)
+            .finish()
+    }
+}
+
+impl DeletionCapabilityV1 {
+    #[must_use]
+    pub fn custody_id(&self) -> &WorktreeCustodyIdV1 {
+        &self.custody_id
+    }
+
+    #[must_use]
+    pub fn canonical_source(&self) -> &str {
+        &self.canonical_source
+    }
+
+    #[must_use]
+    pub fn worktree_path(&self) -> &str {
+        &self.worktree_path
+    }
+
+    /// §5.1's "revalidates source/root/target/common-dir identities **immediately before** Git
+    /// removal", made unskippable: this is the only way to obtain the [`AuthorizedRemovalV1`] that
+    /// [`crate::provider::WorktreeProvider::remove_v2`] requires, so no provider — production or
+    /// double — can run a git removal without the revalidation having just happened.
+    ///
+    /// It is a SECOND check, not a duplicate of the mint's. The mint refuses to authorize a
+    /// swapped object graph at CAS time; this refuses to act on one that was swapped in the window
+    /// between the CAS and the removal. Both are required: the first keeps a bad graph out of the
+    /// durable `DeleteAuthorized` state, the second keeps `git worktree remove` off it.
+    ///
+    /// The capability is consumed either way (`self` by value), so a refusal cannot be retried
+    /// into a success.
+    pub fn revalidate_for_removal(self) -> Result<AuthorizedRemovalV1, String> {
+        if !WorktreeCustodianV1::identities_reverify(&self.identities) {
+            return Err(format!(
+                "object identity changed since deletion was authorized for {}",
+                self.worktree_path
+            ));
+        }
+        Ok(AuthorizedRemovalV1 { capability: self })
+    }
+}
+
+/// A [`DeletionCapabilityV1`] whose object identities were revalidated by descriptor with no
+/// intervening await. Private field: the only way to build one is
+/// [`DeletionCapabilityV1::revalidate_for_removal`].
+#[derive(Debug)]
+pub struct AuthorizedRemovalV1 {
+    capability: DeletionCapabilityV1,
+}
+
+impl AuthorizedRemovalV1 {
+    #[must_use]
+    pub fn canonical_source(&self) -> &str {
+        self.capability.canonical_source()
+    }
+
+    #[must_use]
+    pub fn worktree_path(&self) -> &str {
+        self.capability.worktree_path()
+    }
+
+    #[must_use]
+    pub fn custody_id(&self) -> &WorktreeCustodyIdV1 {
+        self.capability.custody_id()
+    }
+}
+
+/// What one `LiveProtected -> DeleteAuthorized` CAS settled on.
+///
+/// **Exactly one arm carries deletion authority**, and the exhaustive [`Self::is_authorized`]
+/// match is how a later arm is forced to be classified rather than defaulting into permissiveness
+/// — the same discipline as `CustodySweepDispositionV1::authorizes_checkout_removal` and
+/// `PreservationOutcomeV1::is_protective`.
+#[derive(Debug)]
+#[must_use = "an unhandled authorization outcome hides a refusal or an ambiguous CAS, and an \
+              ambiguous CAS must never be read as a completed one"]
+pub enum DeletionAuthorizationV1 {
+    /// The record now says `DeleteAuthorized` and this is its single-use capability.
+    ///
+    /// Boxed for the size difference against the two `String` arms. Boxing does NOT weaken the
+    /// single-use property: `Box<DeletionCapabilityV1>` is still neither `Clone` nor `Copy`, and
+    /// the capability is still consumed by value out of the box.
+    Authorized(Box<DeletionCapabilityV1>),
+    /// Nothing was published; the prior state stands and the checkout keeps its protection.
+    Refused(String),
+    /// The CAS may or may not have taken effect. Both candidate states are non-preserving and
+    /// non-removing, so nothing further is written and NO capability is minted — an ambiguous
+    /// authorization is exactly the state that must not license a git removal.
+    Ambiguous(String),
+}
+
+impl DeletionAuthorizationV1 {
+    #[must_use]
+    pub fn is_authorized(&self) -> bool {
+        match self {
+            Self::Authorized(_) => true,
+            Self::Refused(_) | Self::Ambiguous(_) => false,
+        }
+    }
+}
+
+/// What recording the `DeleteAuthorized -> Removed` tombstone settled on.
+#[derive(Debug, PartialEq, Eq)]
+#[must_use = "an unrecorded tombstone leaves the checkout recovery-owned and must not be ignored"]
+pub enum RemovalRecordV1 {
+    /// The tombstone is durable.
+    Recorded,
+    /// The tombstone's publication outcome is unknown. Protective: the checkout is already gone,
+    /// and both candidate record states (`DeleteAuthorized`, `Removed`) are non-preserving, so no
+    /// work can be lost — but the record must not be reported as settled.
+    Ambiguous(String),
+    /// Nothing was written; the record still says whatever it said.
+    Refused(String),
+}
+
 /// The four object identities §2.2's claim records, captured by descriptor at materialization.
 ///
 /// Risk R-8's accepted disposition: `FrozenWorktreeCustodyPlanV1` carries only
@@ -624,6 +775,127 @@ impl WorktreeCustodianV1 {
             Ok(()) if verified => PreservationOutcomeV1::Preserved,
             Ok(()) => PreservationOutcomeV1::PreservationUnknown(terminal_reason),
             Err(error) => PreservationOutcomeV1::from(error),
+        }
+    }
+
+    /// §5.1's deletion CAS: `LiveProtected -> DeleteAuthorized`, and the mint of its capability.
+    ///
+    /// This is the ONLY producer of a [`DeletionCapabilityV1`] anywhere in the workspace, and it
+    /// runs under both custody cells (this custodian holds them), so no sweep, no gate, and no
+    /// other writer can interleave with it.
+    ///
+    /// # Every refusal, and why it is a refusal rather than a check the caller could skip
+    ///
+    /// 1. **The from-state must be exactly `LiveProtected`.** `Preserved`, `PreservationUnknown`
+    ///    and `PreservationPrepared` all refuse, which is where §5.1's monotonicity lives on the
+    ///    DURABLE side: "once a preserved claim exists, only R2f2's explicit local
+    ///    retain/archive/delete disposition can clear it; no later healthy projection or TTL can
+    ///    mint deletion authority." `DeleteAuthorized` refuses too — that is "no re-mint from the
+    ///    stale capability" (§5.7's crash-after-authorization row): a crash between the CAS and
+    ///    the removal leaves a record whose sweep disposition is `Recover`, and recovery owns it.
+    ///    Every other state has no `-> DeleteAuthorized` edge in 2a's frozen table, and this slice
+    ///    adds none.
+    /// 2. **The retained identities must reverify by descriptor.** A swapped object graph must
+    ///    never be authorized for deletion — authorizing it would durably assert that the objects
+    ///    we materialized are the ones now at those paths, and the whole point of the capability is
+    ///    that `remove_v2` acts on the identity, not on the string.
+    /// 3. **An ambiguous CAS mints nothing.** After an ambiguous replace the record may be
+    ///    `LiveProtected` or `DeleteAuthorized`; both are protective and neither is `Removed`, so
+    ///    the safe answer is to publish nothing further and authorize nothing.
+    ///
+    /// The record's `worktree` identity is the RETAINED one, not a fresh observation: it was just
+    /// reverified, and re-observing would re-open the substitution window the reverification
+    /// closed.
+    pub fn authorize_deletion(
+        &self,
+        canonical_source: &str,
+        retained: &MaterializedIdentitiesV1,
+    ) -> DeletionAuthorizationV1 {
+        let from = match self.current_state_kind() {
+            Ok(Some(kind)) => kind,
+            Ok(None) => {
+                return DeletionAuthorizationV1::Refused(
+                    "no custody record exists for this checkout".to_string(),
+                )
+            }
+            Err(error) => return DeletionAuthorizationV1::Refused(error.to_string()),
+        };
+        if from != WorktreeCustodyStateKindV1::LiveProtected {
+            return DeletionAuthorizationV1::Refused(format!(
+                "no legal deletion-authorization edge from {}",
+                from.wire_tag()
+            ));
+        }
+        if !Self::identities_reverify(retained) {
+            return DeletionAuthorizationV1::Refused(
+                "retained object identities no longer verify by descriptor".to_string(),
+            );
+        }
+        match self.replace_delete_authorized(retained) {
+            Ok(()) => DeletionAuthorizationV1::Authorized(Box::new(DeletionCapabilityV1 {
+                custody_id: self.custody.plan.custody_id.clone(),
+                canonical_source: canonical_source.to_string(),
+                worktree_path: self.worktree_path.clone(),
+                identities: retained.clone(),
+            })),
+            Err(CustodyWriteRefusalV1::Ambiguous(detail)) => {
+                DeletionAuthorizationV1::Ambiguous(detail)
+            }
+            Err(other) => DeletionAuthorizationV1::Refused(other.to_string()),
+        }
+    }
+
+    fn replace_delete_authorized(
+        &self,
+        retained: &MaterializedIdentitiesV1,
+    ) -> Result<(), CustodyWriteRefusalV1> {
+        let record = self.record(
+            WorktreeCustodyStateV1::DeleteAuthorized {},
+            Some(retained.worktree.clone()),
+            None,
+        )?;
+        self.stage_and_settle(&record, PublicationModeV1::Replace)
+    }
+
+    /// §5.1's final step: "then records `Removed`" — the tombstone, published only after the
+    /// provider proved the target and the registration are both gone.
+    ///
+    /// The from-state must be `DeleteAuthorized`. Recording `Removed` over anything else would
+    /// assert a removal this custodian never authorized, and `Removed` is where the record stops
+    /// protecting a checkout against a `MarkerOnly` sweep.
+    ///
+    /// The retained worktree identity is written rather than a fresh observation for a blunt
+    /// reason: the object is GONE, so a fresh observation would degrade to a path with no
+    /// `dev`/`ino` and 2a's completeness rule would reject the record outright. The tombstone's
+    /// honest content is the identity of the object that was removed.
+    pub fn record_removed(&self, retained: &MaterializedIdentitiesV1) -> RemovalRecordV1 {
+        let from = match self.current_state_kind() {
+            Ok(Some(kind)) => kind,
+            Ok(None) => {
+                return RemovalRecordV1::Refused(
+                    "no custody record exists for this checkout".to_string(),
+                )
+            }
+            Err(error) => return RemovalRecordV1::Refused(error.to_string()),
+        };
+        if from != WorktreeCustodyStateKindV1::DeleteAuthorized {
+            return RemovalRecordV1::Refused(format!(
+                "no legal removal-tombstone edge from {}",
+                from.wire_tag()
+            ));
+        }
+        let record = match self.record(
+            WorktreeCustodyStateV1::Removed {},
+            Some(retained.worktree.clone()),
+            None,
+        ) {
+            Ok(record) => record,
+            Err(error) => return RemovalRecordV1::Refused(error.to_string()),
+        };
+        match self.stage_and_settle(&record, PublicationModeV1::Replace) {
+            Ok(()) => RemovalRecordV1::Recorded,
+            Err(CustodyWriteRefusalV1::Ambiguous(detail)) => RemovalRecordV1::Ambiguous(detail),
+            Err(other) => RemovalRecordV1::Refused(other.to_string()),
         }
     }
 
@@ -1945,6 +2217,320 @@ mod tests {
         );
         drop(custodian);
         std::fs::remove_dir_all(&worktree_root).unwrap();
+    }
+
+    // ---- slice 2c2: the deletion capability (P1, P2, P7) ----
+
+    /// P1's headline: the `LiveProtected -> DeleteAuthorized` CAS, and the capability it mints.
+    ///
+    /// Also pins the two things that make the capability a capability rather than a struct: it
+    /// names the exact checkout it authorizes (so it can never be pointed at another), and the
+    /// record it leaves behind is `DeleteAuthorized` — a state 2a classifies `Recover`, so a crash
+    /// here is recovery-owned rather than deletable.
+    ///
+    /// Discriminates a mint that publishes `Removed` directly (which would tombstone a checkout
+    /// still on disk) and one that authorizes without transitioning (which would leave nothing
+    /// durable for recovery to find).
+    #[test]
+    fn a_live_checkout_authorizes_deletion_and_mints_its_capability() {
+        let worktree_root = root("authorize-live");
+        let target = worktree_root.join("ownr-run7-abc");
+        let (custodian, identities) = live_protected(&worktree_root, &target);
+
+        let authorization = custodian.authorize_deletion("/src", &identities);
+
+        assert!(authorization.is_authorized(), "{authorization:?}");
+        let DeletionAuthorizationV1::Authorized(capability) = authorization else {
+            unreachable!("asserted authorized above")
+        };
+        assert_eq!(capability.worktree_path(), target.to_string_lossy());
+        assert_eq!(capability.canonical_source(), "/src");
+        assert_eq!(
+            capability.custody_id().as_str(),
+            custodian.custody_id().as_str()
+        );
+        assert_eq!(
+            record_state(&worktree_root, &target),
+            Some(WorktreeCustodyStateKindV1::DeleteAuthorized)
+        );
+        assert_eq!(
+            WorktreeCustodyStateKindV1::DeleteAuthorized.sweep_disposition(),
+            crate::custody::CustodySweepDispositionV1::Recover,
+            "a crash after authorization is recovery-owned, never sweep-deletable"
+        );
+        drop(custodian);
+        std::fs::remove_dir_all(&worktree_root).unwrap();
+    }
+
+    /// §5.1's monotonicity on the DURABLE side, and the reason it is a refusal in the writer as
+    /// well as an `Ord` in the backend: "once a preserved claim exists ... no later healthy
+    /// projection or TTL can mint deletion authority."
+    ///
+    /// All three preserving states are driven, because they are three different disk states and a
+    /// mint that checked only `Preserved` would authorize deletion over a stranded
+    /// `PreservationPrepared` — the exact record 2c1's repair RA exists to resume.
+    ///
+    /// Discriminates a mint that keys on "not already removed" rather than on the frozen table's
+    /// single `LiveProtected -> DeleteAuthorized` edge.
+    #[test]
+    fn a_preserved_or_preparing_checkout_can_never_be_authorized_for_deletion() {
+        for (name, terminal) in [("preserved", true), ("prepared", false)] {
+            let worktree_root = root(&format!("authorize-refuses-{name}"));
+            let target = worktree_root.join("ownr-run7-abc");
+            let (custodian, identities) = live_protected(&worktree_root, &target);
+            if terminal {
+                let outcome = custodian.preserve_after_cancel(
+                    PreservationReasonV1::NodeFailure,
+                    &identities,
+                    RecoveryLocatorV1::RegisteredWorktree {},
+                    1_700_000_000_000,
+                );
+                assert_eq!(outcome, PreservationOutcomeV1::Preserved);
+            } else {
+                custodian
+                    .replace_preservation_prepared(
+                        PreservationReasonV1::NodeFailure,
+                        &identities,
+                        RecoveryLocatorV1::RegisteredWorktree {},
+                        1_700_000_000_000,
+                    )
+                    .unwrap();
+            }
+            let before = record_state(&worktree_root, &target);
+
+            let authorization = custodian.authorize_deletion("/src", &identities);
+
+            assert!(
+                matches!(authorization, DeletionAuthorizationV1::Refused(_)),
+                "a preserving record must never mint deletion authority ({name}): {authorization:?}"
+            );
+            assert_eq!(
+                record_state(&worktree_root, &target),
+                before,
+                "a refused mint writes nothing ({name})"
+            );
+            drop(custodian);
+            std::fs::remove_dir_all(&worktree_root).unwrap();
+        }
+    }
+
+    /// P7 boundary 1, the writer half: **no re-mint from a stale capability.** A crash between the
+    /// CAS and the removal leaves `DeleteAuthorized` on disk; a second authorization attempt must
+    /// refuse, so the checkout stays recovery-owned rather than acquiring a fresh licence to be
+    /// deleted by whoever asks next.
+    ///
+    /// Discriminates a mint whose from-state check is "anything but a preservation".
+    #[test]
+    fn an_already_authorized_record_refuses_a_second_mint() {
+        let worktree_root = root("authorize-no-remint");
+        let target = worktree_root.join("ownr-run7-abc");
+        let (custodian, identities) = live_protected(&worktree_root, &target);
+        assert!(custodian
+            .authorize_deletion("/src", &identities)
+            .is_authorized());
+
+        let second = custodian.authorize_deletion("/src", &identities);
+
+        assert!(
+            matches!(second, DeletionAuthorizationV1::Refused(_)),
+            "{second:?}"
+        );
+        assert_eq!(
+            record_state(&worktree_root, &target),
+            Some(WorktreeCustodyStateKindV1::DeleteAuthorized),
+            "and the record is still the recovery-owned one"
+        );
+        drop(custodian);
+        std::fs::remove_dir_all(&worktree_root).unwrap();
+    }
+
+    /// P1's identity rule at MINT time: a swapped object graph must never be authorized for
+    /// deletion. The target is replaced by a different directory at the same path — the exact
+    /// substitution `identities_reverify` exists to catch — and the CAS must not run.
+    ///
+    /// Discriminates a mint that reverifies after the CAS, or not at all: either would leave a
+    /// durable `DeleteAuthorized` naming an object graph nobody can vouch for.
+    #[test]
+    fn a_swapped_object_graph_is_never_authorized_for_deletion() {
+        let worktree_root = root("authorize-swap");
+        let target = worktree_root.join("ownr-run7-abc");
+        let (custodian, identities) = live_protected(&worktree_root, &target);
+        std::fs::remove_dir_all(&target).unwrap();
+        std::fs::create_dir_all(&target).unwrap();
+
+        let authorization = custodian.authorize_deletion("/src", &identities);
+
+        assert!(
+            matches!(authorization, DeletionAuthorizationV1::Refused(_)),
+            "{authorization:?}"
+        );
+        assert_eq!(
+            record_state(&worktree_root, &target),
+            Some(WorktreeCustodyStateKindV1::LiveProtected),
+            "a refused mint leaves the checkout live and protected"
+        );
+        drop(custodian);
+        std::fs::remove_dir_all(&worktree_root).unwrap();
+    }
+
+    /// P2's use-time revalidation, isolated: a capability minted over a graph that is then swapped
+    /// cannot be turned into an `AuthorizedRemovalV1`, so `remove_v2` is unreachable for it.
+    ///
+    /// This is the SECOND identity check, and the test drives the window the mint's own check
+    /// cannot cover — the swap happens after the CAS. Discriminates a `revalidate_for_removal`
+    /// that merely rewraps the capability.
+    #[test]
+    fn a_capability_whose_objects_changed_cannot_authorize_a_removal() {
+        let worktree_root = root("capability-revalidate");
+        let target = worktree_root.join("ownr-run7-abc");
+        let (custodian, identities) = live_protected(&worktree_root, &target);
+        let DeletionAuthorizationV1::Authorized(capability) =
+            custodian.authorize_deletion("/src", &identities)
+        else {
+            panic!("a live checkout authorizes")
+        };
+        std::fs::remove_dir_all(&target).unwrap();
+        std::fs::create_dir_all(&target).unwrap();
+
+        let authorized = capability.revalidate_for_removal();
+
+        assert!(
+            authorized.is_err(),
+            "a changed object graph must not reach a git removal"
+        );
+        drop(custodian);
+        std::fs::remove_dir_all(&worktree_root).unwrap();
+    }
+
+    /// The positive control for the two identity tests: an untouched graph revalidates, so the
+    /// refusals above are discriminating a real check rather than a permanently-false one.
+    #[test]
+    fn an_untouched_capability_revalidates_into_an_authorized_removal() {
+        let worktree_root = root("capability-revalidate-ok");
+        let target = worktree_root.join("ownr-run7-abc");
+        let (custodian, identities) = live_protected(&worktree_root, &target);
+        let DeletionAuthorizationV1::Authorized(capability) =
+            custodian.authorize_deletion("/src", &identities)
+        else {
+            panic!("a live checkout authorizes")
+        };
+
+        let authorized = capability
+            .revalidate_for_removal()
+            .expect("an untouched object graph revalidates");
+
+        assert_eq!(authorized.worktree_path(), target.to_string_lossy());
+        assert_eq!(authorized.canonical_source(), "/src");
+        drop(custodian);
+        std::fs::remove_dir_all(&worktree_root).unwrap();
+    }
+
+    /// §5.1's last step and P7 boundary 4: the tombstone is legal ONLY from `DeleteAuthorized`.
+    ///
+    /// The `Removed` arm records the RETAINED worktree identity, not a fresh observation, because
+    /// the object is gone by then and 2a's completeness rule would reject a degraded one — so this
+    /// also pins that a tombstone can be published at all after the checkout vanishes.
+    ///
+    /// Discriminates a `record_removed` that publishes from any state, which would let a
+    /// `LiveProtected` checkout acquire a tombstone while its work is still on disk — and a
+    /// tombstone is the one custody state whose sweep disposition permits marker reclamation.
+    #[test]
+    fn the_removal_tombstone_is_legal_only_from_delete_authorized() {
+        let worktree_root = root("tombstone-edge");
+        let target = worktree_root.join("ownr-run7-abc");
+        let (custodian, identities) = live_protected(&worktree_root, &target);
+
+        let too_early = custodian.record_removed(&identities);
+        assert!(
+            matches!(too_early, RemovalRecordV1::Refused(_)),
+            "a live checkout may not be tombstoned: {too_early:?}"
+        );
+        assert_eq!(
+            record_state(&worktree_root, &target),
+            Some(WorktreeCustodyStateKindV1::LiveProtected)
+        );
+
+        assert!(custodian
+            .authorize_deletion("/src", &identities)
+            .is_authorized());
+        std::fs::remove_dir_all(&target).unwrap();
+        assert_eq!(
+            custodian.record_removed(&identities),
+            RemovalRecordV1::Recorded
+        );
+        assert_eq!(
+            record_state(&worktree_root, &target),
+            Some(WorktreeCustodyStateKindV1::Removed)
+        );
+
+        let again = custodian.record_removed(&identities);
+        assert!(
+            matches!(again, RemovalRecordV1::Refused(_)),
+            "`Removed` is terminal and has no self-loop: {again:?}"
+        );
+        drop(custodian);
+        std::fs::remove_dir_all(&worktree_root).unwrap();
+    }
+
+    /// P7 boundary 5: an ambiguous parent sync while recording the tombstone stays protective —
+    /// the outcome is reported `Ambiguous`, never folded into `Recorded`.
+    ///
+    /// The fault is armed on the rename that publishes `Removed`. Both candidate records
+    /// (`DeleteAuthorized`, `Removed`) are non-preserving and neither can lose work, but a caller
+    /// that read this as a settled tombstone would report a clean removal for a record it cannot
+    /// prove landed.
+    ///
+    /// Discriminates the `From`-style collapse of ambiguity into success.
+    #[test]
+    fn an_ambiguous_tombstone_publication_stays_ambiguous() {
+        let worktree_root = root("tombstone-ambiguous");
+        let target = worktree_root.join("ownr-run7-abc");
+        let (custodian, identities) = live_protected(&worktree_root, &target);
+        assert!(custodian
+            .authorize_deletion("/src", &identities)
+            .is_authorized());
+        // Armed AFTER the authorizing replace, so the next parent sync — the tombstone's — is the
+        // one that fails. The rename commits, the parent sync does not: §5.7's "claim renamed,
+        // parent sync ambiguous" shape, applied to the tombstone.
+        custodian.pinned_root().fail_sync_on_nth_call_for_test(1);
+
+        let recorded = custodian.record_removed(&identities);
+
+        assert!(
+            matches!(recorded, RemovalRecordV1::Ambiguous(_)),
+            "an unverified tombstone publication must not report as recorded: {recorded:?}"
+        );
+        drop(custodian);
+        std::fs::remove_dir_all(&worktree_root).unwrap();
+    }
+
+    /// The frozen transition table is UNCHANGED by this slice: both edges this slice publishes
+    /// were already legal in 2a, and no new one was added.
+    ///
+    /// Discriminates the non-goal directly — a slice that "needed" a new edge (say
+    /// `DeleteAuthorized -> PreservationPrepared` for the git-removal-failure boundary) and quietly
+    /// added one instead of parking it.
+    #[test]
+    fn the_deletion_edges_were_already_legal_and_no_new_edge_was_added() {
+        use crate::custody::{transition_is_legal, LEGAL_CUSTODY_TRANSITIONS_V1};
+        use WorktreeCustodyStateKindV1 as K;
+
+        assert!(transition_is_legal(K::LiveProtected, K::DeleteAuthorized));
+        assert!(transition_is_legal(K::DeleteAuthorized, K::Removed));
+        assert_eq!(
+            LEGAL_CUSTODY_TRANSITIONS_V1.len(),
+            10,
+            "2a froze ten edges; this slice adds none"
+        );
+        // The failure boundaries deliberately have NO escape edge: a failed git removal leaves the
+        // record `DeleteAuthorized` (sweep `Recover`), because preserving from there is not an
+        // edge the frozen table contains.
+        assert!(!transition_is_legal(
+            K::DeleteAuthorized,
+            K::PreservationPrepared
+        ));
+        assert!(!transition_is_legal(K::DeleteAuthorized, K::Preserved));
+        assert!(!transition_is_legal(K::DeleteAuthorized, K::LiveProtected));
     }
 
     /// The names this writer really mints satisfy the tightened predicate. Without this, the

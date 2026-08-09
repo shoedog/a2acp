@@ -124,6 +124,39 @@ async fn registration_absent(repo: &str, wt: &str) -> Result<bool, BridgeError> 
     Ok(registration_absent_from_porcelain(&listed.stdout, wt))
 }
 
+/// `git worktree remove` + `prune`, then the two post-conditions §5.1 names: the target is absent
+/// and the registration is gone.
+///
+/// Factored verbatim out of `HostGitWorktree::remove` (slice 2c2) so the V2 removal and the
+/// capability removal share ONE definition of "the removal completed". A separate copy for
+/// `remove_v2` would be a second place for the post-conditions to weaken, and §5.1's requirement
+/// is explicitly to reuse these.
+///
+/// **`Err` is the fail-closed answer, and its shape is load-bearing for the caller:** it means the
+/// removal did NOT verifiably complete, so no `Removed` tombstone may be recorded over it. That
+/// covers a failed `git worktree remove`, a failed prune, a surviving target, a surviving
+/// registration, and an unstattable target (the probe's own `Err`) — all of them "the checkout may
+/// still be there", none of them "gone".
+async fn remove_and_verify(repo: &str, wt: &str) -> Result<(), BridgeError> {
+    let remove = run_git(&remove_argv(repo, wt)).await?;
+    let prune = run_git(&prune_argv(repo)).await?;
+    let target_absent = target_absent_from_probe(Path::new(wt).try_exists())?;
+    let registration_absent = registration_absent(repo, wt).await?;
+
+    if removal_is_complete(prune.status.success(), target_absent, registration_absent) {
+        return Ok(());
+    }
+
+    let remove_error = String::from_utf8_lossy(&remove.stderr).trim().to_owned();
+    let prune_error = String::from_utf8_lossy(&prune.stderr).trim().to_owned();
+    Err(BridgeError::ConfigInvalid {
+        reason: format!(
+            "worktree remove failed (remove_status={}, remove_stderr={remove_error:?}, prune_status={}, prune_stderr={prune_error:?}, target_absent={target_absent}, registration_absent={registration_absent})",
+            remove.status, prune.status
+        ),
+    })
+}
+
 /// Classify a failed custody-aware add by DESCRIPTOR-level probes, never by the git error text.
 ///
 /// The two probes answer independent questions and are kept independent: `target` decides whether
@@ -225,23 +258,29 @@ impl WorktreeProvider for HostGitWorktree {
     }
 
     async fn remove(&self, repo: &str, wt: &str) -> Result<(), BridgeError> {
-        let remove = run_git(&remove_argv(repo, wt)).await?;
-        let prune = run_git(&prune_argv(repo)).await?;
-        let target_absent = target_absent_from_probe(Path::new(wt).try_exists())?;
-        let registration_absent = registration_absent(repo, wt).await?;
+        remove_and_verify(repo, wt).await
+    }
 
-        if removal_is_complete(prune.status.success(), target_absent, registration_absent) {
-            return Ok(());
-        }
+    /// Enumeration 1 of 11: the one PRODUCTION impl, and the one that supports the capability
+    /// removal.
+    fn supports_capability_removal(&self) -> bool {
+        true
+    }
 
-        let remove_error = String::from_utf8_lossy(&remove.stderr).trim().to_owned();
-        let prune_error = String::from_utf8_lossy(&prune.stderr).trim().to_owned();
-        Err(BridgeError::ConfigInvalid {
-            reason: format!(
-                "worktree remove failed (remove_status={}, remove_stderr={remove_error:?}, prune_status={}, prune_stderr={prune_error:?}, target_absent={target_absent}, registration_absent={registration_absent})",
-                remove.status, prune.status
-            ),
-        })
+    /// §5.1's `remove_v2`. The identity revalidation already happened — it is what produced the
+    /// `AuthorizedRemovalV1` this method consumes, in the caller's last statement before the call,
+    /// with no await between — so what remains here is exactly what §5.1 asks for after Git:
+    /// "verifies registration + target absence afterward (`host_git.rs:153-161` already implements
+    /// those post-conditions; reuse them)".
+    ///
+    /// [`remove_and_verify`] IS those post-conditions, factored out of [`Self::remove`] verbatim,
+    /// so the V2 path and the capability path can never drift apart in what they accept as a
+    /// completed removal.
+    async fn remove_v2(
+        &self,
+        authorized: crate::custody_writer::AuthorizedRemovalV1,
+    ) -> Result<(), BridgeError> {
+        remove_and_verify(authorized.canonical_source(), authorized.worktree_path()).await
     }
 
     async fn is_git_repo(&self, path: &str) -> bool {
@@ -580,6 +619,213 @@ mod custody_add_tests {
             failure.recovery_locator,
             RecoveryLocatorV1::RegistrationUnproven {}
         );
+        std::fs::remove_dir_all(&tmp).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod capability_removal_tests {
+    use super::*;
+    use crate::custody_writer::{
+        observed_identity, DeletionAuthorizationV1, MaterializedIdentitiesV1, WorktreeCustodianV1,
+    };
+    use crate::provider::WorktreeProvider;
+    use bridge_core::execution_policy::{
+        BoundWorktreeCustodyV1, FrozenWorktreeCustodyPlanV1, PolicyNodeRefV1, Sha256HexV1,
+        WorktreeCustodyIdV1,
+    };
+    use bridge_core::ids::{AttemptId, AttemptIdentity, ExecutionId};
+    use bridge_core::SessionCwd;
+    use std::path::{Path, PathBuf};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn unique_temp_dir(name: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "a2a-bridge-capability-removal-{name}-{}-{nanos}",
+            std::process::id()
+        ))
+    }
+
+    fn git(dir: &Path, args: &[&str]) {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+
+    fn repo(tmp: &Path) -> PathBuf {
+        let src = tmp.join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        git(&src, &["init", "-q"]);
+        git(&src, &["config", "user.email", "a@b.c"]);
+        git(&src, &["config", "user.name", "x"]);
+        std::fs::write(src.join("file.txt"), "base\n").unwrap();
+        git(&src, &["add", "-A"]);
+        git(&src, &["commit", "-q", "-m", "init"]);
+        src
+    }
+
+    fn binding(target: &Path) -> BoundWorktreeCustodyV1 {
+        let attempt_id = AttemptId::parse(format!("attempt-{}", "2".repeat(32))).unwrap();
+        BoundWorktreeCustodyV1 {
+            attempt: AttemptIdentity {
+                execution_id: ExecutionId::parse(format!("exec-{}", "1".repeat(32))).unwrap(),
+                attempt_id: attempt_id.clone(),
+                ordinal: 0,
+                parent_attempt_id: None,
+            },
+            origin_attempt_id: attempt_id,
+            node: PolicyNodeRefV1::from_node_id(0, "node"),
+            plan: FrozenWorktreeCustodyPlanV1 {
+                custody_id: WorktreeCustodyIdV1::mint().unwrap(),
+                checkout_fingerprint: Sha256HexV1::parse("6".repeat(64)).unwrap(),
+                target_cwd: SessionCwd::parse(&target.to_string_lossy()).unwrap(),
+            },
+        }
+    }
+
+    /// Drive a real checkout to `LiveProtected` and mint its capability, exactly as
+    /// `materialize_under_custody` + the post-loop settlement do.
+    fn authorized_over(
+        worktree_root: &Path,
+        target: &Path,
+        source: &Path,
+        common_dir: &Path,
+    ) -> (
+        WorktreeCustodianV1,
+        MaterializedIdentitiesV1,
+        crate::custody_writer::AuthorizedRemovalV1,
+    ) {
+        let custodian =
+            WorktreeCustodianV1::enter(worktree_root, &target.to_string_lossy(), binding(target))
+                .unwrap();
+        custodian.publish_protection_prepared().unwrap();
+        custodian.replace_materializing().unwrap();
+        let identities = MaterializedIdentitiesV1 {
+            source: observed_identity(&source.to_string_lossy()),
+            root: observed_identity(&worktree_root.to_string_lossy()),
+            worktree: observed_identity(&target.to_string_lossy()),
+            common_dir: observed_identity(&common_dir.to_string_lossy()),
+        };
+        custodian.replace_live_protected(&identities).unwrap();
+        let DeletionAuthorizationV1::Authorized(capability) =
+            custodian.authorize_deletion(&source.to_string_lossy(), &identities)
+        else {
+            panic!("a live checkout authorizes its own deletion")
+        };
+        let authorized = capability
+            .revalidate_for_removal()
+            .expect("untouched objects revalidate");
+        (custodian, identities, authorized)
+    }
+
+    /// §5.1's `remove_v2` against REAL git: the capability's own paths drive the removal, the
+    /// target and its registration are both gone afterwards, and the tombstone is then legal.
+    ///
+    /// This is the production half of the capability path — the backend tests drive a double, and
+    /// a double cannot show that `git worktree remove` plus the post-conditions actually agree.
+    ///
+    /// Discriminates a `remove_v2` that removes the directory without pruning the registration:
+    /// `registration_absent` would be false and `remove_and_verify` would report the removal
+    /// incomplete.
+    #[tokio::test]
+    async fn capability_removal_removes_a_real_worktree_and_its_registration() {
+        let tmp = unique_temp_dir("real-removal");
+        let source = repo(&tmp);
+        let worktree_root = tmp.join("worktrees");
+        std::fs::create_dir_all(&worktree_root).unwrap();
+        let worktree_root = std::fs::canonicalize(&worktree_root).unwrap();
+        let target = worktree_root.join("ownr-run7-real");
+        let provider = HostGitWorktree::new();
+        let CustodyAddOutcomeV1::Materialized { common_dir } = provider
+            .add_under_custody(&source.to_string_lossy(), &target.to_string_lossy())
+            .await
+            .unwrap()
+        else {
+            panic!("a clean repo materializes")
+        };
+        std::fs::write(target.join("work.txt"), "node output").unwrap();
+
+        let (custodian, identities, authorized) =
+            authorized_over(&worktree_root, &target, &source, Path::new(&common_dir));
+        provider
+            .remove_v2(authorized)
+            .await
+            .expect("a real capability removal completes");
+
+        assert!(!target.exists(), "the checkout is gone");
+        let listed = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&source)
+            .args(["worktree", "list"])
+            .output()
+            .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&listed.stdout).lines().count(),
+            1,
+            "and its registration was pruned"
+        );
+        assert_eq!(
+            custodian.record_removed(&identities),
+            crate::custody_writer::RemovalRecordV1::Recorded
+        );
+        drop(custodian);
+        std::fs::remove_dir_all(&tmp).unwrap();
+    }
+
+    /// P7 boundaries 2, 3 and 4 at the REAL provider: when the git removal does not verifiably
+    /// complete, `remove_v2` fails closed, the target survives, and the `Removed` tombstone is
+    /// therefore never reachable — the record stays `DeleteAuthorized`, whose sweep disposition is
+    /// `Recover`.
+    ///
+    /// The target here is a plain directory the custody record protects but git does not know
+    /// about, so `git worktree remove` fails, the prune succeeds, and the target-absence
+    /// post-condition is what refuses. That is the same conjunction a failed prune or a surviving
+    /// registration trips (`removal_is_complete` is unit-tested for each independently).
+    ///
+    /// Discriminates a `remove_v2` that reports the git exit status instead of the descriptor-level
+    /// post-conditions — the precise "exit status is never behavioural evidence" failure.
+    #[tokio::test]
+    async fn a_removal_that_leaves_the_target_fails_closed_and_forbids_the_tombstone() {
+        let tmp = unique_temp_dir("failed-removal");
+        let source = repo(&tmp);
+        let worktree_root = tmp.join("worktrees");
+        std::fs::create_dir_all(&worktree_root).unwrap();
+        let worktree_root = std::fs::canonicalize(&worktree_root).unwrap();
+        let target = worktree_root.join("ownr-run7-unregistered");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(target.join("work.txt"), "hours of work").unwrap();
+        let common_dir = std::fs::canonicalize(source.join(".git")).unwrap();
+
+        let (custodian, identities, authorized) =
+            authorized_over(&worktree_root, &target, &source, &common_dir);
+        let result = HostGitWorktree::new().remove_v2(authorized).await;
+
+        assert!(
+            result.is_err(),
+            "a removal whose target survives must fail closed"
+        );
+        assert!(target.join("work.txt").exists(), "the work is untouched");
+        let tombstone = custodian.record_removed(&identities);
+        assert_eq!(
+            tombstone,
+            crate::custody_writer::RemovalRecordV1::Recorded,
+            "the writer will record a tombstone if asked — which is exactly why the CALLER must \
+             not ask after a failed removal; that ordering is what `authorize_and_remove_checkout` \
+             enforces and `a_failed_capability_removal_never_records_removed` pins"
+        );
+        drop(custodian);
         std::fs::remove_dir_all(&tmp).unwrap();
     }
 }
