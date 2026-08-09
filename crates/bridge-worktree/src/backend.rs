@@ -6306,10 +6306,12 @@ mod tests {
     /// Deliberately a REAL record rather than a placeholder file: the gate keys on presence, so a
     /// junk file would pass every assertion here while proving nothing about a genuine V3
     /// checkout. The one test that needs the presence-not-decode property writes junk explicitly.
-    fn publish_custody_record(worktree_path: &str) {
+    fn publish_custody_record_with_state(
+        worktree_path: &str,
+        state: crate::custody::WorktreeCustodyStateV1,
+    ) {
         use crate::custody::{
-            custody_record_path, WorktreeCustodyRecordV1, WorktreeCustodyStateV1,
-            WORKTREE_CUSTODY_RECORD_SCHEMA_V1,
+            custody_record_path, WorktreeCustodyRecordV1, WORKTREE_CUSTODY_RECORD_SCHEMA_V1,
         };
         use bridge_core::execution_policy::{
             Sha256HexV1, WorktreeCustodyIdV1, WorktreeObjectIdentityV1,
@@ -6335,7 +6337,7 @@ mod tests {
                     ino: Some(2),
                 },
             },
-            state: WorktreeCustodyStateV1::LiveProtected {},
+            state,
             claim: None,
         };
         std::fs::write(
@@ -6343,6 +6345,13 @@ mod tests {
             record.encode_canonical().unwrap(),
         )
         .unwrap();
+    }
+
+    fn publish_custody_record(worktree_path: &str) {
+        publish_custody_record_with_state(
+            worktree_path,
+            crate::custody::WorktreeCustodyStateV1::LiveProtected {},
+        );
     }
 
     /// The target a legacy `configure_session` will resolve for this session, computed before the
@@ -6434,6 +6443,54 @@ mod tests {
             .unwrap()
             .contains(&"inner_release".to_string()));
         std::fs::remove_dir_all(tmp).unwrap();
+    }
+
+    /// RecoveredLive must reach the same context-free gate refusal as LiveProtected.
+    /// The gate intentionally keys on durable-record presence rather than decoding a permissive
+    /// subset of states, so the claim-synced/lease-untransferred window cannot be deleted.
+    #[tokio::test]
+    async fn recovered_live_checkout_removal_refusal_matches_live_protected() {
+        for (name, state) in [
+            (
+                "live",
+                crate::custody::WorktreeCustodyStateV1::LiveProtected {},
+            ),
+            (
+                "recovered",
+                crate::custody::WorktreeCustodyStateV1::RecoveredLive {
+                    predecessor_claim_digest: bridge_core::execution_policy::Sha256HexV1::digest(
+                        b"predecessor-claim",
+                    ),
+                },
+            ),
+        ] {
+            let (be, rec, tmp, source, _cfg) = backend_fixture(&format!("gate-{name}"));
+            let sid = SessionId::parse(format!("ctx-gate-{name}-g0")).unwrap();
+            be.configure_session(&sid, &spec(Some(&source.to_string_lossy())))
+                .await
+                .unwrap();
+            let target = be.mapped_worktree_path_for_test(&sid).await.unwrap();
+            publish_custody_record_with_state(&target, state);
+            let entry = {
+                let map = be.map.lock().await;
+                match map.get(sid.as_str()) {
+                    Some(WtState::Ready(entry)) => entry.clone(),
+                    None => panic!("expected a ready checkout, but no state was stored"),
+                    Some(_) => {
+                        panic!("expected a ready checkout, but a different state was stored")
+                    }
+                }
+            };
+
+            assert_eq!(
+                checkout_removal_refusal(&entry),
+                Some(CheckoutRemovalRefusalV1::RecordPresent),
+                "{name}: a durable custody record must refuse the exact same gate arm"
+            );
+            be.release_session_checked(&sid).await.unwrap();
+            assert_eq!(removals(&rec), 0, "{name}: the provider must not remove it");
+            std::fs::remove_dir_all(tmp).unwrap();
+        }
     }
 
     /// A refusal is about the CHECKOUT only. Discriminates a gate that returns early with a bare

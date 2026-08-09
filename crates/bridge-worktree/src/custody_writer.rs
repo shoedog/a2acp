@@ -71,9 +71,9 @@
 //! call 3 = the terminal replace (`LiveProtected` / `PreservationUnknown`).
 
 use crate::custody::{
-    custody_record_path, read_custody_record_in, ClaimPresenceV1, CustodyReadRefusalV1,
-    IdentityCompletenessV1, PreservationReasonV1, PreservedWorktreeClaimV1, RecoveryLocatorV1,
-    WorktreeCustodyRecordV1, WorktreeCustodyStateKindV1, WorktreeCustodyStateV1,
+    custody_record_path, read_custody_record_in, transition_is_legal, ClaimPresenceV1,
+    CustodyReadRefusalV1, IdentityCompletenessV1, PreservationReasonV1, PreservedWorktreeClaimV1,
+    RecoveryLocatorV1, WorktreeCustodyRecordV1, WorktreeCustodyStateKindV1, WorktreeCustodyStateV1,
     CUSTODY_RECORD_SUFFIX, WORKTREE_CUSTODY_RECORD_SCHEMA_V1,
 };
 use crate::custody_lock::{
@@ -81,12 +81,15 @@ use crate::custody_lock::{
     CustodyLockRefusalV1, PublicationLockGuardV1,
 };
 use bridge_core::execution_policy::{
-    BoundWorktreeCustodyV1, WorktreeCustodyIdV1, WorktreeObjectIdentityV1,
+    select_custody_plan_v1, BoundWorktreeCustodyV1, FrozenCheckoutEffectV1, WorktreeCustodyIdV1,
+    WorktreeObjectIdentityV1,
 };
 use bridge_core::fs_custody::{
     open_options_create_new_owner_private, CustodyPublicationV1, DirectoryIdentityV1,
     FsCustodyError, PinnedDirectoryV1, RegularChildRefV1,
 };
+use bridge_core::liveness::{acquire_lease_in, LeaseGuard};
+use bridge_workflow::run_spec::WorkflowSnapshotV3;
 use std::ffi::{OsStr, OsString};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -342,6 +345,72 @@ pub struct MaterializedIdentitiesV1 {
     pub root: WorktreeObjectIdentityV1,
     pub worktree: WorktreeObjectIdentityV1,
     pub common_dir: WorktreeObjectIdentityV1,
+}
+
+/// Inputs for one production-inactive successor claim exchange.
+///
+/// The successor binding is owned because the custodian retains it while publishing the
+/// `RecoveredLive` record. Every other input is borrowed from the resume coordinator that slice 5
+/// will eventually own.
+pub struct ClaimExchangeRequestV1<'a> {
+    pub worktree_root: &'a Path,
+    pub worktree_path: &'a str,
+    pub predecessor_snapshot: &'a WorkflowSnapshotV3,
+    pub successor_snapshot: &'a WorkflowSnapshotV3,
+    pub predecessor_binding: &'a BoundWorktreeCustodyV1,
+    pub successor_binding: BoundWorktreeCustodyV1,
+    pub retained: &'a MaterializedIdentitiesV1,
+    /// Shared predecessor-recovery and successor-live lease namespace. Slice 5 must bind this
+    /// canonical namespace to configuration; this production-inactive API intentionally does not.
+    ///
+    /// The durable `RecoveredLive.predecessor_claim_digest` is the predecessor *snapshot* digest:
+    /// the normative `LiveProtected -> RecoveredLive` edge has no preserved claim to digest.
+    pub lease_namespace_dir: &'a Path,
+}
+
+/// The result of the production-inactive successor claim exchange.
+///
+/// An unsuccessful result never gives a caller permission to configure a provider. In particular,
+/// `LeaseUnavailable` means the `RecoveredLive` replace is already durable and recovery-owned;
+/// callers must leave it alone rather than attempting a second custody write.
+#[must_use = "an unhandled exchange outcome can hide a durable protective record or live lease"]
+pub enum ClaimExchangeOutcomeV1 {
+    /// The successor record and its live lease are both owned by the returned value.
+    Exchanged(ClaimExchangeReadyV1),
+    /// The record was published, but the successor lease could not be acquired afterwards.
+    LeaseUnavailable(String),
+    /// The record replace may have taken effect; do not write anything further.
+    Ambiguous(String),
+    /// Validation or an unambiguous pre-publication check refused the exchange.
+    Refused(String),
+}
+
+/// A completed exchange whose successor lease remains held for the caller's live attempt.
+///
+/// Slice 5 will retain this while it resolves/configures the provider. There is deliberately no
+/// provider handle here: the mechanism proves the precondition but does not activate V3 serving.
+#[must_use = "dropping the exchange result releases the successor live lease"]
+pub struct ClaimExchangeReadyV1 {
+    predecessor_claim_digest: bridge_core::execution_policy::Sha256HexV1,
+    successor_attempt: bridge_core::ids::AttemptIdentity,
+    _successor_live_lease: LeaseGuard,
+}
+
+impl ClaimExchangeReadyV1 {
+    #[must_use]
+    pub fn predecessor_claim_digest(&self) -> &bridge_core::execution_policy::Sha256HexV1 {
+        &self.predecessor_claim_digest
+    }
+
+    #[must_use]
+    pub fn successor_attempt(&self) -> &bridge_core::ids::AttemptIdentity {
+        &self.successor_attempt
+    }
+
+    #[must_use]
+    pub fn successor_live_lease_path(&self) -> &Path {
+        self._successor_live_lease.path()
+    }
 }
 
 /// A plan-derived identity: the canonical path with no observed `dev`/`ino`.
@@ -629,6 +698,19 @@ impl WorktreeCustodianV1 {
             .map(|record| Some(record.state.kind()))
     }
 
+    /// Read the full current record under the held publication and custody cells.
+    fn current_record(&self) -> Result<Option<WorktreeCustodyRecordV1>, CustodyReadRefusalV1> {
+        match self
+            .root
+            .child_entry_exists(&self.record_name, "custody record")
+        {
+            Ok(false) => return Ok(None),
+            Ok(true) => {}
+            Err(error) => return Err(CustodyReadRefusalV1::Unreadable(error.to_string())),
+        }
+        read_custody_record_in(&self.root, &self.record_name).map(Some)
+    }
+
     /// Re-observe the four object identities captured at materialization and compare them by
     /// DESCRIPTOR (§2.2: "Identity is checked by descriptor, not by re-canonicalizing a string, at
     /// every decision point").
@@ -650,6 +732,26 @@ impl WorktreeCustodianV1 {
             observed.directory_identity.dev.is_some()
                 && observed.directory_identity == expected.directory_identity
         })
+    }
+
+    /// Exchange a validated predecessor claim for a successor-owned `RecoveredLive` record.
+    ///
+    /// The snapshot validation runs before this method opens a custody cell, writes a record, or
+    /// acquires either lease. The returned ready value is the only successful outcome; it
+    /// deliberately owns no provider handle, so slice 5 remains responsible for the later effect.
+    ///
+    /// This method takes blocking flocks for both custody cells and the predecessor/successor
+    /// lease transfer; call it off the async executor, as with [`Self::enter`].
+    ///
+    /// It holds the predecessor recovery lease from validation through publication until the
+    /// successor lease is acquired. A crash before the replace leaves `LiveProtected` and a
+    /// process-released predecessor lease, so a later request retries cleanly. A crash after the
+    /// replace but before the successor lease leaves `RecoveredLive` with neither lease, which
+    /// the exact re-entry arm reacquires without publishing another transition.
+    pub fn claim_exchange_for_successor(
+        request: ClaimExchangeRequestV1<'_>,
+    ) -> ClaimExchangeOutcomeV1 {
+        claim_exchange_for_successor_impl(request)
     }
 
     /// §5.1's `preserve_after_cancel`, steps 3–7, for one custody-governed checkout.
@@ -1038,6 +1140,301 @@ impl WorktreeCustodianV1 {
              surfaced by the storage report for owner disposition."
         );
     }
+}
+
+/// Return the exact frozen checkout effect that a custody binding selected from a snapshot.
+fn binding_matches_snapshot<'a>(
+    binding: &BoundWorktreeCustodyV1,
+    snapshot: &'a WorkflowSnapshotV3,
+) -> Option<&'a FrozenCheckoutEffectV1> {
+    if binding.attempt != snapshot.attempt
+        || binding.origin_attempt_id != snapshot.delivery_spec.attempt_id
+    {
+        return None;
+    }
+    snapshot
+        .delivery_spec
+        .node_execution_identities
+        .iter()
+        .find(|identity| identity.node == binding.node)?
+        .provider_attempts
+        .iter()
+        .find_map(|provider_attempt| {
+            matches!(
+                select_custody_plan_v1(&snapshot.r2f1b, &provider_attempt.checkout),
+                Ok(Some(plan)) if plan == &binding.plan
+            )
+            .then_some(&provider_attempt.checkout)
+        })
+}
+
+fn validate_claim_exchange(
+    predecessor_snapshot: &WorkflowSnapshotV3,
+    successor_snapshot: &WorkflowSnapshotV3,
+    predecessor_binding: &BoundWorktreeCustodyV1,
+    successor_binding: &BoundWorktreeCustodyV1,
+) -> Result<
+    (
+        bridge_core::execution_policy::Sha256HexV1,
+        FrozenCheckoutEffectV1,
+    ),
+    String,
+> {
+    predecessor_snapshot
+        .validate()
+        .map_err(|error| format!("invalid predecessor snapshot: {error}"))?;
+    successor_snapshot
+        .validate()
+        .map_err(|error| format!("invalid successor snapshot: {error}"))?;
+    WorkflowSnapshotV3::validate_successor(predecessor_snapshot, successor_snapshot)
+        .map_err(|error| format!("invalid successor relationship: {error}"))?;
+    let predecessor_checkout = binding_matches_snapshot(predecessor_binding, predecessor_snapshot)
+        .ok_or_else(|| {
+            "predecessor custody binding does not match the frozen snapshot".to_string()
+        })?;
+    let successor_checkout = binding_matches_snapshot(successor_binding, successor_snapshot)
+        .ok_or_else(|| {
+            "successor custody binding does not match the frozen snapshot".to_string()
+        })?;
+    if predecessor_binding.plan != successor_binding.plan
+        || predecessor_binding.node != successor_binding.node
+        || predecessor_checkout != successor_checkout
+    {
+        return Err("successor custody binding changed the frozen checkout identity".to_string());
+    }
+    Ok((
+        predecessor_snapshot.digest().map_err(|error| {
+            format!("predecessor snapshot digest could not be computed: {error}")
+        })?,
+        predecessor_checkout.clone(),
+    ))
+}
+
+fn validate_frozen_exchange_graph(
+    frozen_checkout: &FrozenCheckoutEffectV1,
+    worktree_root: &Path,
+    worktree_path: &str,
+    retained: &MaterializedIdentitiesV1,
+) -> Result<(), String> {
+    let FrozenCheckoutEffectV1::Worktree {
+        canonical_source_cwd,
+        canonical_worktree_root,
+        target_cwd,
+        ..
+    } = frozen_checkout
+    else {
+        return Err("custody binding selected a direct checkout".to_string());
+    };
+    if worktree_root != Path::new(canonical_worktree_root.as_str()) {
+        return Err("claim-exchange root does not match the frozen worktree root".to_string());
+    }
+    let frozen_target = Path::new(target_cwd.as_str());
+    if frozen_target.parent() != Some(Path::new(canonical_worktree_root.as_str())) {
+        return Err("frozen worktree target is not a direct child of its frozen root".to_string());
+    }
+    if frozen_target != Path::new(worktree_path) {
+        return Err(
+            "claim-exchange worktree path does not match the frozen checkout target".to_string(),
+        );
+    }
+    if retained.source.canonical_path != canonical_source_cwd.as_str()
+        || retained.root.canonical_path != canonical_worktree_root.as_str()
+        || retained.worktree.canonical_path != target_cwd.as_str()
+    {
+        return Err("retained identities do not name the frozen checkout object graph".to_string());
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+enum ClaimExchangeRecordArmV1 {
+    PublishRecoveredLive,
+    ReenterRecoveredLive,
+}
+
+fn classify_claim_exchange_record(
+    record: &WorktreeCustodyRecordV1,
+    predecessor_binding: &BoundWorktreeCustodyV1,
+    successor_binding: &BoundWorktreeCustodyV1,
+    retained: &MaterializedIdentitiesV1,
+    predecessor_snapshot_digest: &bridge_core::execution_policy::Sha256HexV1,
+) -> Result<ClaimExchangeRecordArmV1, String> {
+    if record.custody_id != predecessor_binding.plan.custody_id
+        || record.checkout_fingerprint != predecessor_binding.plan.checkout_fingerprint
+        || record.worktree != retained.worktree
+    {
+        return Err(
+            "custody record does not match the retained frozen checkout identity".to_string(),
+        );
+    }
+    match &record.state {
+        WorktreeCustodyStateV1::LiveProtected {}
+            if record.current_attempt == predecessor_binding.attempt =>
+        {
+            Ok(ClaimExchangeRecordArmV1::PublishRecoveredLive)
+        }
+        WorktreeCustodyStateV1::RecoveredLive {
+            predecessor_claim_digest,
+        } if predecessor_claim_digest == predecessor_snapshot_digest
+            && record.current_attempt == successor_binding.attempt =>
+        {
+            Ok(ClaimExchangeRecordArmV1::ReenterRecoveredLive)
+        }
+        WorktreeCustodyStateV1::LiveProtected {} => {
+            Err("live predecessor custody record has a different attempt".to_string())
+        }
+        WorktreeCustodyStateV1::RecoveredLive { .. } => Err(
+            "RecoveredLive custody record does not exactly match this successor request"
+                .to_string(),
+        ),
+        state => Err(format!(
+            "no legal claim-exchange edge from {}",
+            state.kind().wire_tag()
+        )),
+    }
+}
+
+fn preflight_frozen_record(
+    worktree_root: &Path,
+    worktree_path: &str,
+    frozen_target: &str,
+) -> Result<WorktreeCustodyRecordV1, String> {
+    let root = PinnedDirectoryV1::open(worktree_root, "claim-exchange frozen-record preflight")
+        .map_err(|error| error.to_string())?;
+    let record_name = record_file_name(worktree_path).map_err(|error| error.to_string())?;
+    let record = read_custody_record_in(&root, &record_name).map_err(|error| error.to_string())?;
+    if record.worktree.canonical_path != frozen_target {
+        return Err(
+            "custody record worktree does not match the frozen checkout target".to_string(),
+        );
+    }
+    Ok(record)
+}
+
+fn claim_exchange_for_successor_impl(
+    request: ClaimExchangeRequestV1<'_>,
+) -> ClaimExchangeOutcomeV1 {
+    let ClaimExchangeRequestV1 {
+        worktree_root,
+        worktree_path,
+        predecessor_snapshot,
+        successor_snapshot,
+        predecessor_binding,
+        successor_binding,
+        retained,
+        lease_namespace_dir,
+    } = request;
+    // This is intentionally the first operation: no custody lock, lease acquisition, or write
+    // may occur before both individual snapshots and their successor relationship validate.
+    let (predecessor_claim_digest, frozen_checkout) = match validate_claim_exchange(
+        predecessor_snapshot,
+        successor_snapshot,
+        predecessor_binding,
+        &successor_binding,
+    ) {
+        Ok(validated) => validated,
+        Err(detail) => return ClaimExchangeOutcomeV1::Refused(detail),
+    };
+    if let Err(detail) =
+        validate_frozen_exchange_graph(&frozen_checkout, worktree_root, worktree_path, retained)
+    {
+        return ClaimExchangeOutcomeV1::Refused(detail);
+    }
+    if !WorktreeCustodianV1::identities_reverify(retained) {
+        return ClaimExchangeOutcomeV1::Refused(
+            "retained object identities no longer verify by descriptor".to_string(),
+        );
+    }
+    let FrozenCheckoutEffectV1::Worktree { target_cwd, .. } = &frozen_checkout else {
+        return ClaimExchangeOutcomeV1::Refused(
+            "custody binding selected a direct checkout".to_string(),
+        );
+    };
+    if let Err(detail) = preflight_frozen_record(worktree_root, worktree_path, target_cwd.as_str())
+    {
+        return ClaimExchangeOutcomeV1::Refused(detail);
+    }
+
+    let predecessor_recovery_lease =
+        match acquire_lease_in(lease_namespace_dir, predecessor_snapshot.attempt.run_id()) {
+            Ok(lease) => lease,
+            Err(error) => return ClaimExchangeOutcomeV1::Refused(error.to_string()),
+        };
+
+    let custodian =
+        match WorktreeCustodianV1::enter(worktree_root, worktree_path, successor_binding) {
+            Ok(custodian) => custodian,
+            Err(error) => return ClaimExchangeOutcomeV1::Refused(error.to_string()),
+        };
+
+    let current = match custodian.current_record() {
+        Ok(Some(record)) => record,
+        Ok(None) => {
+            return ClaimExchangeOutcomeV1::Refused(
+                "no custody record exists for this checkout".to_string(),
+            )
+        }
+        Err(error) => return ClaimExchangeOutcomeV1::Refused(error.to_string()),
+    };
+    let record_arm = match classify_claim_exchange_record(
+        &current,
+        predecessor_binding,
+        custodian.binding(),
+        retained,
+        &predecessor_claim_digest,
+    ) {
+        Ok(arm) => arm,
+        Err(detail) => return ClaimExchangeOutcomeV1::Refused(detail),
+    };
+    if !WorktreeCustodianV1::identities_reverify(retained) {
+        return ClaimExchangeOutcomeV1::Refused(
+            "retained object identities no longer verify by descriptor".to_string(),
+        );
+    }
+
+    match record_arm {
+        ClaimExchangeRecordArmV1::PublishRecoveredLive => {
+            if !transition_is_legal(
+                WorktreeCustodyStateKindV1::LiveProtected,
+                WorktreeCustodyStateKindV1::RecoveredLive,
+            ) {
+                return ClaimExchangeOutcomeV1::Refused(
+                    "the frozen custody table does not permit claim exchange".to_string(),
+                );
+            }
+            let recovered = match custodian.record(
+                WorktreeCustodyStateV1::RecoveredLive {
+                    predecessor_claim_digest: predecessor_claim_digest.clone(),
+                },
+                Some(retained.worktree.clone()),
+                None,
+            ) {
+                Ok(record) => record,
+                Err(error) => return ClaimExchangeOutcomeV1::Refused(error.to_string()),
+            };
+            match custodian.stage_and_settle(&recovered, PublicationModeV1::Replace) {
+                Ok(()) => {}
+                Err(CustodyWriteRefusalV1::Ambiguous(detail)) => {
+                    return ClaimExchangeOutcomeV1::Ambiguous(detail)
+                }
+                Err(other) => return ClaimExchangeOutcomeV1::Refused(other.to_string()),
+            }
+        }
+        ClaimExchangeRecordArmV1::ReenterRecoveredLive => {}
+    }
+    let successor_attempt = custodian.binding().attempt.clone();
+    drop(custodian);
+    let successor_live_lease =
+        match acquire_lease_in(lease_namespace_dir, successor_attempt.run_id()) {
+            Ok(lease) => lease,
+            Err(error) => return ClaimExchangeOutcomeV1::LeaseUnavailable(error.to_string()),
+        };
+    drop(predecessor_recovery_lease);
+    ClaimExchangeOutcomeV1::Exchanged(ClaimExchangeReadyV1 {
+        predecessor_claim_digest,
+        successor_attempt,
+        _successor_live_lease: successor_live_lease,
+    })
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2266,35 +2663,57 @@ mod tests {
     /// well as an `Ord` in the backend: "once a preserved claim exists ... no later healthy
     /// projection or TTL can mint deletion authority."
     ///
-    /// All three preserving states are driven, because they are three different disk states and a
-    /// mint that checked only `Preserved` would authorize deletion over a stranded
-    /// `PreservationPrepared` — the exact record 2c1's repair RA exists to resume.
+    /// The terminal and successor-owned non-`LiveProtected` states are driven, because they are
+    /// distinct disk states and a mint that checked only `Preserved` would authorize deletion
+    /// over a stranded `PreservationPrepared` or `RecoveredLive` claim exchange.
     ///
     /// Discriminates a mint that keys on "not already removed" rather than on the frozen table's
     /// single `LiveProtected -> DeleteAuthorized` edge.
     #[test]
-    fn a_preserved_or_preparing_checkout_can_never_be_authorized_for_deletion() {
-        for (name, terminal) in [("preserved", true), ("prepared", false)] {
+    fn a_protected_non_live_checkout_can_never_be_authorized_for_deletion() {
+        for name in ["preserved", "prepared", "recovered"] {
             let worktree_root = root(&format!("authorize-refuses-{name}"));
             let target = worktree_root.join("ownr-run7-abc");
             let (custodian, identities) = live_protected(&worktree_root, &target);
-            if terminal {
-                let outcome = custodian.preserve_after_cancel(
-                    PreservationReasonV1::NodeFailure,
-                    &identities,
-                    RecoveryLocatorV1::RegisteredWorktree {},
-                    1_700_000_000_000,
-                );
-                assert_eq!(outcome, PreservationOutcomeV1::Preserved);
-            } else {
-                custodian
-                    .replace_preservation_prepared(
+            match name {
+                "preserved" => {
+                    let outcome = custodian.preserve_after_cancel(
                         PreservationReasonV1::NodeFailure,
                         &identities,
                         RecoveryLocatorV1::RegisteredWorktree {},
                         1_700_000_000_000,
-                    )
-                    .unwrap();
+                    );
+                    assert_eq!(outcome, PreservationOutcomeV1::Preserved);
+                }
+                "prepared" => {
+                    custodian
+                        .replace_preservation_prepared(
+                            PreservationReasonV1::NodeFailure,
+                            &identities,
+                            RecoveryLocatorV1::RegisteredWorktree {},
+                            1_700_000_000_000,
+                        )
+                        .unwrap();
+                }
+                "recovered" => {
+                    let record =
+                        custodian
+                            .record(
+                                WorktreeCustodyStateV1::RecoveredLive {
+                                    predecessor_claim_digest:
+                                        bridge_core::execution_policy::Sha256HexV1::digest(
+                                            b"recovered",
+                                        ),
+                                },
+                                Some(identities.worktree.clone()),
+                                None,
+                            )
+                            .unwrap();
+                    custodian
+                        .stage_and_settle(&record, PublicationModeV1::Replace)
+                        .unwrap();
+                }
+                _ => unreachable!(),
             }
             let before = record_state(&worktree_root, &target);
 
@@ -2302,7 +2721,7 @@ mod tests {
 
             assert!(
                 matches!(authorization, DeletionAuthorizationV1::Refused(_)),
-                "a preserving record must never mint deletion authority ({name}): {authorization:?}"
+                "a protected non-live record must never mint deletion authority ({name}): {authorization:?}"
             );
             assert_eq!(
                 record_state(&worktree_root, &target),

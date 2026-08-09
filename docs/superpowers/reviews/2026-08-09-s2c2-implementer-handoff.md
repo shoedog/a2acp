@@ -313,7 +313,7 @@ Every P-item and every binding ledger row → test name(s) → status. Test crat
 | # | Binding item (source) | Test(s) | Status |
 |---|---|---|---|
 | P1 | the CAS transitions exactly `LiveProtected → DeleteAuthorized` and mints the capability | `a_live_checkout_authorizes_deletion_and_mints_its_capability` [w] | DONE |
-| P1 | "Preserve beats any mint" is STRUCTURAL, not conventional — durable half | `a_preserved_or_preparing_checkout_can_never_be_authorized_for_deletion` [w] (all three preserving states) | DONE |
+| P1 | "Preserve beats any mint" is STRUCTURAL, not conventional — durable half | `a_protected_non_live_checkout_can_never_be_authorized_for_deletion` [w] (all three preserving states) | DONE |
 | P1 | — in-memory half (`Ord` + upward-only raise) | `a_preserved_checkout_is_never_removed_by_a_later_healthy_settlement` [b] | DONE |
 | P1 | the mint REFUSES when identity reverification fails | `a_swapped_object_graph_is_never_authorized_for_deletion` [w] | DONE |
 | P1 | the mint refuses when the custody state is not `LiveProtected` | `an_already_authorized_record_refuses_a_second_mint` [w]; the preserving-state test above | DONE |
