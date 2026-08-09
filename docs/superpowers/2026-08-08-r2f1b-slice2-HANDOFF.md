@@ -70,8 +70,8 @@
 
 | # | Work | State | Exact next action | Blocked by | Identifiers |
 |---:|---|---|---|---|---|
-| 1 | Slice-3 brief + dispatch | pending | §1 steps 1–3 | owner word | custody plan §9; focused boundary §§2.5, 5.7 rows 7–11; carried ledgers |
-| 2 | Owner: Candidate-settlement §6 row disposition | pending | see §7 | owner | brief §7 vs §3 inconsistency; `UnusedSettled` producerless |
+| 1 | Slice-3 brief | **done** | — | — | LANDED `c0d43429` on main: `docs/superpowers/plans/2026-08-09-r2f1b-slice3-brief.md` (rev 2; dual design review opus REVISE 6W/8S + bridge plan-review REVISE 30B/21M, all adjudicated + folded; impl config committed; roadmap cursor reconciled). Owner ruling folded: Candidate settlement → 3d |
+| 2 | 3s dispatch (settlement completeness — slice 3's first sub-slice) | pending | dispatch per brief §3 "3s" via bridge implement | owner word | brief §2 order: 3s → 3a → 3b1 → 3b2 → 3c1 → 3c2 → 3d; strictly sequential folds; fold-time target reap in the ritual |
 
 ## 5. Invariants and traps — do not do these
 
@@ -113,6 +113,6 @@
 **§2c verdict (2d, final for the slice):** RUN AND DISCHARGED — the load-bearing claim (`RecoveredLive` inherits every `LiveProtected` protection; the exchange validates before any effect) was verified SOUND by both lenses, and the margins they refuted (predecessor-liveness exclusion — found INDEPENDENTLY by both; frozen-graph binding; the stranded-intermediate re-entry) were repaired in the declared round with the lease half of §5.7 row 6 made real. Record: `reviews/2026-08-09-s2d-dual-review.md`. (2c2's verdict paragraph is preserved in that sub-slice's record.)
 
 **Questions the owner owes an answer to:**
-1. **Word for slice 3** (+ its brief authoring — see §1).
-2. **Candidate-settlement §6 row disposition** (opus 2d mandate-gap): brief §7 assigns the whole row to 2d; §3's 2d steps omit it; `unused_candidate_settles_only_after_exact_absence` does not exist and `UnusedSettled` remains producerless (2b2 recovery-side ruling). Re-assign to the recovery-side owner (slice 3/5) or commission separately.
-3. **Slice-5 prerequisite sign-off (advance notice, not blocking):** `RecoveredLive` outgoing edges are a planned frozen-table amendment that will need owner approval before production resume can complete a lifecycle.
+1. **Word to dispatch 3s** (slice 3's first sub-slice; the brief is landed at `c0d43429` and each dispatch stays owner-gated per lane practice).
+2. **Slice-5 prerequisite sign-off (advance notice, not blocking):** `RecoveredLive` outgoing edges are a planned frozen-table amendment that will need owner approval before production resume can complete a lifecycle.
+*(Resolved 2026-08-09: slice-3 word + Candidate-settlement reassignment — both folded into the landed brief.)*
