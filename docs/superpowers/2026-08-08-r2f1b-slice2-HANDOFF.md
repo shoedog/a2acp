@@ -83,6 +83,7 @@
 - The transition table is FROZEN — a boundary appearing to need a NEW edge is a park, never an edit. 2c2 proved the discipline works: `DeleteAuthorized → PreservationPrepared` was wanted and recovery-ownership was defined instead.
 - Bridge implement fix loops will chase environment-red tests into out-of-scope production surgery — ALWAYS inspect the hand-off diff and strip at the operator boundary; `--lang rust` is required on this repo.
 - The bridge's hermetic verify cannot run the flock/exec test family (`*_lock_release_failure_is_loud_not_silent`, `staged_candidate_*`) — container failures there are environmental; control on host before believing them.
+- `~/code/a2a-bridge-operator-main` (detached worktree) is DELIBERATE infrastructure — a hosted checkout other repos consume (owner, 2026-08-09). Never flag or clean it. All other landed external worktrees were removed 2026-08-09 with clean+ancestor receipts.
 - Long tool-call payloads truncate intermittently — file-plus-pointer for specs, small append chunks for docs (predecessor session trap).
 - The 13 legacy `configure_session` tests in `backend.rs` must stay green UNTOUCHED through 2b1 (brief §8.1 R3).
 
