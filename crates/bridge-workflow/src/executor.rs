@@ -5069,6 +5069,93 @@ mod tests {
         );
     }
 
+    /// R2f1b slice 2b1, R-11 "workflow cold cleanup": pins the PATH COLLAPSE the worktree
+    /// backend's `observed_cleanup_refuses_to_delete_a_checkout_that_has_a_custody_record` relies
+    /// on. `cleanup_cold_session` is this crate's entire node-end deletion pressure on a
+    /// checkout, and it reaches the backend through exactly two methods —
+    /// `forget_session_observed` and `release_session_observed`. Because both are `AgentBackend`
+    /// trait methods, a `WorktreeBackend` inner routes them into `run_cleanup_flight`, where the
+    /// single fail-closed gate lives.
+    ///
+    /// Discriminates a later edit that adds a direct `release_session` / `forget_session` /
+    /// `retire` call here: those are recorded separately and must stay unused, so the collapse
+    /// claim cannot silently rot into a bypass.
+    #[tokio::test]
+    async fn cold_cleanup_reaches_the_backend_only_through_the_observed_methods() {
+        #[derive(Default)]
+        struct Calls {
+            seen: Mutex<Vec<&'static str>>,
+        }
+        struct RecordingBackend {
+            calls: Arc<Calls>,
+        }
+        #[async_trait::async_trait]
+        impl AgentBackend for RecordingBackend {
+            async fn prompt(
+                &self,
+                _s: &SessionId,
+                _p: Vec<Part>,
+            ) -> Result<BackendStream, BridgeError> {
+                self.calls.seen.lock().unwrap().push("prompt");
+                Ok(Box::pin(tokio_stream::iter(Vec::<
+                    Result<Update, BridgeError>,
+                >::new())))
+            }
+            async fn cancel(&self, _s: &SessionId) -> Result<(), BridgeError> {
+                self.calls.seen.lock().unwrap().push("cancel");
+                Ok(())
+            }
+            async fn forget_session(&self, _s: &SessionId) {
+                self.calls.seen.lock().unwrap().push("forget_session");
+            }
+            async fn release_session(&self, _s: &SessionId) {
+                self.calls.seen.lock().unwrap().push("release_session");
+            }
+            async fn forget_session_observed(
+                &self,
+                _s: &SessionId,
+                _o: Arc<dyn DiagnosticObserver>,
+            ) -> Result<(), BridgeError> {
+                self.calls.seen.lock().unwrap().push("forget_observed");
+                Ok(())
+            }
+            async fn release_session_observed(
+                &self,
+                _s: &SessionId,
+                _o: Arc<dyn DiagnosticObserver>,
+            ) -> Result<(), BridgeError> {
+                self.calls.seen.lock().unwrap().push("release_observed");
+                Ok(())
+            }
+            async fn retire(&self) -> Result<(), BridgeError> {
+                self.calls.seen.lock().unwrap().push("retire");
+                Ok(())
+            }
+        }
+
+        let calls = Arc::new(Calls::default());
+        let backend: Arc<dyn AgentBackend> = Arc::new(RecordingBackend {
+            calls: calls.clone(),
+        });
+        let observer: Arc<dyn DiagnosticObserver> =
+            Arc::new(bridge_core::diagnostics::NoopDiagnosticObserver::default());
+        let node = NodeId::parse("cold-cleanup-node").unwrap();
+        let session = SessionId::parse("cold-cleanup-session").unwrap();
+        let tracker = WorkflowCleanupTracker::default();
+
+        for action in [ColdCleanupAction::Forget, ColdCleanupAction::Release] {
+            cleanup_cold_session(&node, &backend, &session, &observer, action, &tracker)
+                .await
+                .unwrap();
+        }
+
+        assert_eq!(
+            calls.seen.lock().unwrap().as_slice(),
+            ["forget_observed", "release_observed"],
+            "cold cleanup must reach the backend only through the two observed methods"
+        );
+    }
+
     #[derive(Default)]
     pub(super) struct Rec {
         pub configured: Mutex<bool>,

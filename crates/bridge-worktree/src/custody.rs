@@ -29,6 +29,7 @@ use bridge_core::ids::{AttemptId, AttemptIdentity, ExecutionId};
 use serde::{Deserialize, Serialize};
 use std::ffi::OsStr;
 use std::io::Read as _;
+use std::path::Path;
 
 /// Custody-record schema version. Independent of the workflow-snapshot version: a V3
 /// snapshot publishes a `custody.v1` record.
@@ -645,6 +646,80 @@ pub fn is_custody_record_name(path: &str) -> bool {
         return false;
     };
     !stem.is_empty() && !stem.ends_with('/')
+}
+
+/// What a caller about to delete a checkout learns by asking whether a V3 custody record exists
+/// beside it.
+///
+/// The question is deliberately *presence*, never *content*. A destructive caller must fail
+/// closed, and a decode-based answer inverts that: a corrupt, truncated, or unreadable record
+/// would decode-fail and — if the caller keyed on "did I get a record?" — read as absent, which
+/// is the one answer that licenses deletion. Mere presence protects, so the protection cannot be
+/// removed by damaging the record.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CustodyRecordPresenceV1 {
+    /// The record name is provably free: a no-follow stat under a pinned parent said `ENOENT`,
+    /// or the enclosing directory does not exist at all, so nothing can be at that name.
+    ProvablyAbsent,
+    /// A directory entry exists at the record name — of any kind, readable or not.
+    Present,
+    /// The question could not be answered. Callers must treat this exactly as
+    /// [`Self::Present`]; [`Self::authorizes_checkout_removal`] already does.
+    Inconclusive(String),
+}
+
+impl CustodyRecordPresenceV1 {
+    /// The only answer that may permit a checkout removal to proceed. The exhaustive match is
+    /// deliberate, and mirrors [`CustodySweepDispositionV1::authorizes_checkout_removal`]: a new
+    /// arm must be classified by decision, not by falling through a wildcard into "deletable".
+    #[must_use]
+    pub fn authorizes_checkout_removal(&self) -> bool {
+        match self {
+            Self::ProvablyAbsent => true,
+            Self::Present | Self::Inconclusive(_) => false,
+        }
+    }
+}
+
+/// Is there a V3 custody record beside `worktree_path`?
+///
+/// Descriptor-relative: the enclosing directory is pinned (`O_NOFOLLOW`, identity-rechecked) and
+/// the record name is stat'ed relative to that descriptor, so a same-name replacement of an
+/// ancestor cannot redirect the probe and a symlinked record cannot be followed out of the root.
+///
+/// A missing enclosing directory answers [`CustodyRecordPresenceV1::ProvablyAbsent`] rather than
+/// inconclusive, and that is a decision, not an oversight: if the directory holding the checkout
+/// is gone then the checkout is gone, there is no work to protect, and answering "inconclusive"
+/// there would permanently refuse the legacy cleanup of an already-vanished worktree.
+#[must_use]
+pub fn probe_custody_record_presence(worktree_path: &str) -> CustodyRecordPresenceV1 {
+    let path = Path::new(worktree_path);
+    let (Some(parent), Some(stem)) = (path.parent(), path.file_name()) else {
+        return CustodyRecordPresenceV1::Inconclusive(format!(
+            "worktree path has no enclosing directory: {worktree_path}"
+        ));
+    };
+    let mut record_name = stem.to_os_string();
+    record_name.push(CUSTODY_RECORD_SUFFIX);
+
+    let pinned = match PinnedDirectoryV1::open(parent, "worktree custody probe") {
+        Ok(pinned) => pinned,
+        Err(error) => {
+            return match parent.try_exists() {
+                Ok(false) => CustodyRecordPresenceV1::ProvablyAbsent,
+                _ => CustodyRecordPresenceV1::Inconclusive(format!(
+                    "worktree parent is not pinnable: {error}"
+                )),
+            }
+        }
+    };
+    match pinned.child_entry_exists(&record_name, "worktree custody probe") {
+        Ok(true) => CustodyRecordPresenceV1::Present,
+        Ok(false) => CustodyRecordPresenceV1::ProvablyAbsent,
+        Err(error) => {
+            CustodyRecordPresenceV1::Inconclusive(format!("custody record is unstattable: {error}"))
+        }
+    }
 }
 
 /// Why a custody record on disk could not be read into a decoded record. Every variant
@@ -1810,5 +1885,140 @@ mod tests {
         assert!(is_custody_record_name(&path));
         assert!(!is_custody_record_name("/root/ownr-run7-abc.meta.json"));
         assert!(!is_custody_record_name("/root/custody.v1.json"));
+    }
+
+    // -------------------------------------------------------------------------------------
+    // probe_custody_record_presence — the deletion gate's read of durable truth (2b1).
+    // -------------------------------------------------------------------------------------
+
+    fn probe_root(name: &str) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "a2a-bridge-custody-probe-{name}-{}-{nanos}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    /// The gate's ALLOW arm. Discriminates a probe that cannot tell a free name from a taken one
+    /// — which, in whichever direction it errs, either deletes protected work or permanently
+    /// wedges legacy cleanup.
+    #[test]
+    fn a_checkout_with_no_record_beside_it_probes_provably_absent() {
+        let root = probe_root("absent");
+        let checkout = root.join("ownr-run7-abc");
+        std::fs::create_dir(&checkout).unwrap();
+
+        let presence = probe_custody_record_presence(&checkout.to_string_lossy());
+
+        assert_eq!(presence, CustodyRecordPresenceV1::ProvablyAbsent);
+        assert!(presence.authorizes_checkout_removal());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// Presence must not depend on the record being decodable. Discriminates a probe implemented
+    /// as "read and decode, treat failure as absent" — the exact inversion that would let an
+    /// actor unprotect a checkout by truncating its record.
+    #[test]
+    fn an_undecodable_record_still_probes_present() {
+        let root = probe_root("corrupt");
+        let checkout = root.join("ownr-run7-abc");
+        std::fs::create_dir(&checkout).unwrap();
+        std::fs::write(
+            custody_record_path(&checkout.to_string_lossy()),
+            b"{ not json",
+        )
+        .unwrap();
+
+        let presence = probe_custody_record_presence(&checkout.to_string_lossy());
+
+        assert_eq!(presence, CustodyRecordPresenceV1::Present);
+        assert!(!presence.authorizes_checkout_removal());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// A record placed as a symlink (pointing anywhere, including nowhere) still takes the name.
+    /// Discriminates a probe that follows symlinks and then reports a dangling one as absent.
+    #[test]
+    fn a_symlinked_or_dangling_record_name_probes_present() {
+        let root = probe_root("symlink");
+        let checkout = root.join("ownr-run7-abc");
+        std::fs::create_dir(&checkout).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(
+            root.join("does-not-exist"),
+            custody_record_path(&checkout.to_string_lossy()),
+        )
+        .unwrap();
+
+        #[cfg(unix)]
+        assert_eq!(
+            probe_custody_record_presence(&checkout.to_string_lossy()),
+            CustodyRecordPresenceV1::Present
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// A vanished enclosing directory answers ABSENT, not inconclusive. Discriminates a
+    /// blanket "any probe failure is inconclusive" rule, which would make the gate refuse the
+    /// cleanup of an already-deleted worktree forever — protecting nothing and leaking a map
+    /// entry on every such session.
+    #[test]
+    fn a_vanished_enclosing_directory_probes_provably_absent() {
+        let root = probe_root("vanished");
+        let checkout = root.join("gone").join("ownr-run7-abc");
+
+        let presence = probe_custody_record_presence(&checkout.to_string_lossy());
+
+        assert_eq!(presence, CustodyRecordPresenceV1::ProvablyAbsent);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// An enclosing "directory" that exists but cannot be pinned is INCONCLUSIVE, and
+    /// inconclusive refuses. Discriminates collapsing every pin failure into absent: here the
+    /// parent is a regular file, so it exists (nothing is provably gone) yet no descriptor-bound
+    /// answer is available.
+    #[test]
+    fn an_unpinnable_but_existing_enclosing_path_probes_inconclusive_and_refuses() {
+        let root = probe_root("unpinnable");
+        let parent = root.join("not-a-directory");
+        std::fs::write(&parent, b"file").unwrap();
+        let checkout = parent.join("ownr-run7-abc");
+
+        let presence = probe_custody_record_presence(&checkout.to_string_lossy());
+
+        assert!(
+            matches!(presence, CustodyRecordPresenceV1::Inconclusive(_)),
+            "unexpected presence: {presence:?}"
+        );
+        assert!(!presence.authorizes_checkout_removal());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// A well-formed record probes present, and — the point of the whole gate — 2a's disposition
+    /// still refuses removal for it. Pins the two layers agreeing rather than each assuming the
+    /// other checks.
+    #[test]
+    fn a_decodable_record_probes_present_and_its_disposition_still_refuses_removal() {
+        let root = probe_root("decodable");
+        let checkout = root.join("ownr-run7-abc");
+        std::fs::create_dir(&checkout).unwrap();
+        let record = live_record();
+        std::fs::write(
+            custody_record_path(&checkout.to_string_lossy()),
+            record.encode_canonical().unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            probe_custody_record_presence(&checkout.to_string_lossy()),
+            CustodyRecordPresenceV1::Present
+        );
+        assert!(!record.sweep_disposition().authorizes_checkout_removal());
+        std::fs::remove_dir_all(&root).unwrap();
     }
 }

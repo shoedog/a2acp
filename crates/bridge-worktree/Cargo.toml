@@ -15,3 +15,11 @@ thiserror.workspace = true
 tracing.workspace = true
 tokio = { workspace = true }
 tokio-stream.workspace = true
+
+# Test-only, and deliberately UPWARD: nothing depends on `bridge-worktree`, so the R2f1b deletion
+# fan-in's external families (BindingGuard::Drop, ExpiryClaim, controller retire) can only be
+# driven end-to-end against a real `WorktreeBackend` from here. Neither crate depends on this one,
+# so there is no cycle.
+[dev-dependencies]
+bridge-coordinator = { path = "../bridge-coordinator" }
+bridge-controller = { path = "../bridge-controller" }

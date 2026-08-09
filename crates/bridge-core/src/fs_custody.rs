@@ -22,7 +22,7 @@ use std::ffi::CString;
 use std::ffi::OsStr;
 use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -54,8 +54,133 @@ pub enum FsCustodyError {
     IdentityChanged(String),
     #[error("{0}: target already exists")]
     TargetExists(String),
+    /// The mirror image of [`Self::TargetExists`], produced only by the REPLACE primitive: a
+    /// replacement was asked to overwrite a record that is not there. `replace` and `publish` are
+    /// separately named operations so this is caller error, not a state to recover from.
+    #[error("{0}: target does not exist")]
+    TargetMissing(String),
     #[error("{0}: injected sync failure")]
     InjectedSync(String),
+}
+
+/// The outcome of an atomic REPLACE publication ([`PinnedDirectoryV1::replace_regular_child`]).
+///
+/// Every custody transition after `ProtectionPrepared` overwrites an existing record, so unlike
+/// every other publication path in this module the replace primitive is *allowed* to clobber. It
+/// therefore needs a richer answer than `Result<(), _>`, and the split is the load-bearing part.
+/// Stated as exactly what each arm PROVES, and no more:
+///
+/// * `Err(FsCustodyError)` — the rename **provably did not happen**, established either because
+///   the operation refused before reaching the rename, or because post-error verification found
+///   the staged source name still present AND still identical to the object the caller handed in.
+///   The previous record is intact and is still authoritative.
+/// * `Ok(_)` — the rename **did happen**, established either by the syscall succeeding or by
+///   post-error verification finding the target identical to the caller's object — EXCEPT for
+///   [`Self::RenameOutcomeUnverified`], which proves nothing in either direction. Nothing after
+///   the rename may be reported as an `Err`, because a `?`-using caller would read that as "no
+///   effect" and could retry a rename whose source name no longer exists, or keep treating a
+///   superseded record as current.
+///
+/// Within `Ok`, only [`Self::Durable`] is a clean success. Every other arm is **protective**: no
+/// caller may treat one as either success or failure — in R2f1b terms they resolve to "unknown",
+/// and unknown never licenses deletion (focused boundary §5.7, "Claim renamed, parent sync
+/// ambiguous").
+///
+/// **Why an errno is not evidence.** A failing `renameat` does not prove the rename did not
+/// happen. On a network filesystem a retried RPC can perform the rename and then report a
+/// failure: the server completed the first request, the reply was lost, and the retry finds the
+/// source already gone. Every arm below therefore rests on a descriptor-level identity
+/// comparison, never on the syscall's return value alone.
+#[must_use = "an atomic replacement outcome must be classified: the ambiguous arms are protective \
+              and must not be discarded as if the replacement were durable"]
+#[derive(Debug)]
+pub enum ReplacePublicationV1 {
+    /// Renamed, parent-synced, and the target reopened as the very object the caller published.
+    ///
+    /// `retried_rename` is `Some(detail)` when the rename syscall reported an error and
+    /// post-error verification proved the effect anyway. That does not weaken the durability
+    /// claim — it rests on the same identity comparison and the same parent sync as an uneventful
+    /// replacement — but it is retained because it is the operator's only signal that the
+    /// filesystem is answering error-after-effect.
+    Durable { retried_rename: Option<String> },
+    /// Renamed, but the parent directory sync did not complete. Whether a crash now leaves the
+    /// new record or the old one is unknown.
+    ParentSyncAmbiguous(String),
+    /// Renamed and parent-synced, but the target could not be reopened, or reopened as a
+    /// different object. Some other actor is writing this name; what is durable is unknown.
+    TargetIdentityUnverified(String),
+    /// The rename syscall reported an error and verification could not decide whether it took
+    /// effect: the staged source name is not provably still the caller's object, and the target
+    /// is not provably the caller's object either. Neither "the previous record survived" nor
+    /// "the replacement landed" is licensed.
+    RenameOutcomeUnverified(String),
+}
+
+impl ReplacePublicationV1 {
+    /// True only for the one arm that attests a durable replacement.
+    #[must_use]
+    pub fn is_durable(&self) -> bool {
+        matches!(self, Self::Durable { .. })
+    }
+
+    /// `Some(detail)` for every protective arm; `None` only for [`Self::Durable`]. Callers that
+    /// must fail closed can branch on this single predicate without matching every arm, so a
+    /// later arm added here is protective by default rather than by remembering to handle it.
+    #[must_use]
+    pub fn ambiguity(&self) -> Option<&str> {
+        match self {
+            Self::Durable { .. } => None,
+            Self::ParentSyncAmbiguous(detail)
+            | Self::TargetIdentityUnverified(detail)
+            | Self::RenameOutcomeUnverified(detail) => Some(detail),
+        }
+    }
+}
+
+/// What an injected replace-rename fault does to the filesystem before it reports its error.
+///
+/// The three shapes exist because the post-error verification step has three genuinely different
+/// inputs to distinguish, and no ordinary fault seam can produce them: an errno alone says nothing
+/// about what happened, so the seam has to say what happened *and* return the error.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReplaceRenameFaultV1 {
+    /// Report an error without touching anything — the ordinary refusal (bad name, full disk).
+    BeforeEffect,
+    /// Perform the rename, then report an error. Models a network filesystem's retried RPC.
+    AfterEffect,
+    /// Unlink the staged source and report an error, leaving the target untouched. Models the
+    /// undecidable shape: the source name is gone, but the target is not the caller's object.
+    UnlinkSourceOnly,
+}
+
+impl ReplaceRenameFaultV1 {
+    fn encode(self) -> u8 {
+        match self {
+            Self::BeforeEffect => 0,
+            Self::AfterEffect => 1,
+            Self::UnlinkSourceOnly => 2,
+        }
+    }
+
+    fn decode(raw: u8) -> Self {
+        match raw {
+            1 => Self::AfterEffect,
+            2 => Self::UnlinkSourceOnly,
+            _ => Self::BeforeEffect,
+        }
+    }
+}
+
+/// Whether the rename underlying a replacement took effect — the internal three-way answer
+/// `replace_regular_child` needs, and the reason the pre-rename half can no longer return a bare
+/// `Result<(), _>`.
+#[derive(Debug)]
+enum RenameCommitV1 {
+    /// The rename took effect. `syscall_error` is `Some` when that was established by post-error
+    /// verification rather than by the syscall succeeding.
+    Committed { syscall_error: Option<String> },
+    /// The rename reported an error and verification could not decide whether it took effect.
+    Unverifiable(String),
 }
 
 /// A single-use "fail on the Nth call" hook, shared by every custody failure-injection point.
@@ -114,6 +239,8 @@ pub struct PinnedDirectoryV1 {
     canonical_path: PathBuf,
     identity: DirectoryIdentityV1,
     sync_failure_countdown: FailureCountdownV1,
+    replace_rename_failure_countdown: FailureCountdownV1,
+    replace_rename_failure_shape: AtomicU8,
 }
 
 pub struct RegularChildRefV1<'a> {
@@ -155,6 +282,8 @@ impl PinnedDirectoryV1 {
             canonical_path,
             identity,
             sync_failure_countdown: FailureCountdownV1::new(),
+            replace_rename_failure_countdown: FailureCountdownV1::new(),
+            replace_rename_failure_shape: AtomicU8::new(0),
         })
     }
 
@@ -185,8 +314,43 @@ impl PinnedDirectoryV1 {
         self.sync_failure_countdown.arm(call);
     }
 
+    /// Arm the replace-rename fault. Unlike the sync hook, this seam must state what the
+    /// filesystem DID as well as what it reported: an errno carries no information about whether
+    /// the rename took effect, which is precisely the condition the post-error verification in
+    /// [`Self::replace_regular_child`] exists to resolve.
+    pub fn fail_replace_rename_on_nth_call_for_test(
+        &self,
+        call: usize,
+        shape: ReplaceRenameFaultV1,
+    ) {
+        self.replace_rename_failure_shape
+            .store(shape.encode(), Ordering::SeqCst);
+        self.replace_rename_failure_countdown.arm(call);
+    }
+
+    fn armed_replace_rename_fault(&self) -> Option<ReplaceRenameFaultV1> {
+        self.replace_rename_failure_countdown
+            .fire_if_due()
+            .then(|| {
+                ReplaceRenameFaultV1::decode(
+                    self.replace_rename_failure_shape.load(Ordering::SeqCst),
+                )
+            })
+    }
+
     pub fn open_regular_file(&self, name: &OsStr, label: &str) -> Result<File, FsCustodyError> {
         open_regular_child(&self.file, name, label)
+    }
+
+    /// Does a directory entry of ANY kind exist at `name` beneath this pinned directory?
+    ///
+    /// Descriptor-relative and no-follow, so a dangling symlink at `name` answers `true`: the
+    /// question is whether the NAME is taken, not whether it resolves. Deliberately says nothing
+    /// about the entry's kind or contents — callers that must fail closed on a name's mere
+    /// existence (the custody deletion gate) need exactly this and nothing more, and giving them
+    /// an answer that depended on decoding would make a corrupt file read as absent.
+    pub fn child_entry_exists(&self, name: &OsStr, label: &str) -> Result<bool, FsCustodyError> {
+        child_entry_exists_impl(&self.file, name, label)
     }
 
     pub fn publish_new_regular_child(
@@ -224,6 +388,71 @@ impl PinnedDirectoryV1 {
             return Err(FsCustodyError::IdentityChanged(label.to_owned()));
         }
         Ok(())
+    }
+
+    /// Atomically REPLACE an existing regular child with one the caller already built and synced,
+    /// then sync this parent directory — the R2f1b custody transition primitive.
+    ///
+    /// Same custody discipline as [`Self::publish_new_regular_child`]: both names are validated
+    /// single components, the rename is `renameat` against this retained descriptor (never a raw
+    /// path rename, so a same-name replacement of any ancestor cannot redirect it), and the
+    /// source is identity-checked against the descriptor the caller holds before anything moves.
+    /// The one deliberate difference is the rename flag: this operation clobbers, which is why it
+    /// is separately named rather than a mode of the publication path.
+    ///
+    /// **Caller obligation.** `source.file`'s own contents must already be `sync_all`'d; this
+    /// call syncs the *directory*, not the file — exactly as the publication path does.
+    ///
+    /// See [`ReplacePublicationV1`] for what each arm proves.
+    pub fn replace_regular_child(
+        &self,
+        source: RegularChildRefV1<'_>,
+        target_name: &OsStr,
+        label: &str,
+    ) -> Result<ReplacePublicationV1, FsCustodyError> {
+        let retried_rename = match replace_regular_child_impl(self, &source, target_name, label)? {
+            RenameCommitV1::Committed { syscall_error } => syscall_error,
+            RenameCommitV1::Unverifiable(detail) => {
+                return Ok(ReplacePublicationV1::RenameOutcomeUnverified(detail))
+            }
+        };
+        // Committed. From here every failure is an OUTCOME: returning `Err` after the rename
+        // would tell the caller the replacement did not happen, which is false.
+        let note = |message: String| match &retried_rename {
+            Some(detail) => format!("{message} (rename reported an error first: {detail})"),
+            None => message,
+        };
+        if let Err(error) = self.sync(label) {
+            return Ok(ReplacePublicationV1::ParentSyncAmbiguous(note(format!(
+                "{label}: record replaced but the parent sync is ambiguous: {error}"
+            ))));
+        }
+        let opened_target = match self.open_regular_file(target_name, label) {
+            Ok(file) => file,
+            Err(error) => {
+                return Ok(ReplacePublicationV1::TargetIdentityUnverified(note(
+                    format!(
+                        "{label}: record replaced and parent synced but the target could not be \
+                     reopened: {error}"
+                    ),
+                )))
+            }
+        };
+        match same_regular_file(&opened_target, source.file, label) {
+            Ok(true) => Ok(ReplacePublicationV1::Durable { retried_rename }),
+            Ok(false) => Ok(ReplacePublicationV1::TargetIdentityUnverified(note(
+                format!(
+                    "{label}: record replaced and parent synced but the target is now a different \
+                 object"
+                ),
+            ))),
+            Err(error) => Ok(ReplacePublicationV1::TargetIdentityUnverified(note(
+                format!(
+                "{label}: record replaced and parent synced but its identity could not be read: \
+                 {error}"
+            ),
+            ))),
+        }
     }
 }
 
@@ -498,6 +727,48 @@ pub fn rename_child_no_replace(
     }
 }
 
+/// The workspace's one descriptor-relative atomic REPLACING rename between two validated child
+/// names beneath the SAME retained directory descriptor.
+///
+/// Deliberately separate from [`rename_child_no_replace`], and deliberately plain POSIX
+/// `renameat`: replacement is atomic on every unix, so this needs no `RENAME_*` flag and no
+/// per-OS arm — which also means it has no "only if the target exists" mode. That absence is why
+/// the presence pre-check in the calling layer is documented as advisory.
+///
+/// **An `Err` from this function does NOT prove the rename did not happen.** The syscall is
+/// atomic; the *report* of its result is not durable. On a network filesystem a retried RPC can
+/// perform the rename and then report a failure — the server completed the first request, the
+/// reply was lost, and the retry finds the source already gone (typically `ENOENT`). A caller
+/// that maps this errno straight to "nothing moved" will treat a superseded record as
+/// authoritative. Callers must establish what happened by comparing descriptor-level identity;
+/// [`classify_failed_replace_rename`] is the one implementation of that rule.
+///
+/// PARKED, not fixed here: [`rename_child_no_replace`] carries the identical hazard, and
+/// `publish_new_regular_child_impl` still maps its errno straight to `Err`. That is merged A4
+/// code and its repair is its own bounded change — see the R2f1b 2b1 handoff's parked findings.
+#[cfg(unix)]
+pub fn rename_child_replacing(
+    parent: &File,
+    source: &CStr,
+    target: &CStr,
+) -> Result<(), std::io::Error> {
+    use std::os::fd::AsRawFd as _;
+    // SAFETY: both names are validated single components beneath the same live retained
+    // directory descriptor.
+    let result = unsafe {
+        libc::renameat(
+            parent.as_raw_fd(),
+            source.as_ptr(),
+            parent.as_raw_fd(),
+            target.as_ptr(),
+        )
+    };
+    if result == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 /// Whether two already-fetched metadata readings describe the same filesystem object.
 #[cfg(unix)]
 #[must_use]
@@ -583,6 +854,160 @@ where
             FsCustodyError::Unsupported(label.to_owned())
         }
     })
+}
+
+#[cfg(unix)]
+fn child_entry_exists_impl(
+    parent: &File,
+    name: &OsStr,
+    label: &str,
+) -> Result<bool, FsCustodyError> {
+    let name = child_name_cstring(name, label)?;
+    stat_child_no_follow(parent, &name)
+        .map(|entry| entry.is_some())
+        .map_err(|error| FsCustodyError::Io(label.to_owned(), error))
+}
+
+#[cfg(not(unix))]
+fn child_entry_exists_impl(
+    _parent: &File,
+    _name: &OsStr,
+    label: &str,
+) -> Result<bool, FsCustodyError> {
+    Err(FsCustodyError::Unsupported(label.to_owned()))
+}
+
+/// The pre-rename half of [`PinnedDirectoryV1::replace_regular_child`], plus the post-error
+/// verification that decides what a failing rename actually did.
+///
+/// **`Err` here means the rename provably did not happen**, and that claim is now earned rather
+/// than assumed. Two ways it is established: the function refused before reaching the rename at
+/// all; or the rename reported an error and [`classify_failed_replace_rename`] found the staged
+/// source name still present and still identical to the caller's object. An errno on its own is
+/// never sufficient — see [`rename_child_replacing`].
+#[cfg(unix)]
+fn replace_regular_child_impl(
+    pinned: &PinnedDirectoryV1,
+    source: &RegularChildRefV1<'_>,
+    target_name: &OsStr,
+    label: &str,
+) -> Result<RenameCommitV1, FsCustodyError> {
+    let parent = &pinned.file;
+    let source_cname = child_name_cstring(source.name, label)?;
+    let target_cname = child_name_cstring(target_name, label)?;
+    if source_cname.as_bytes() == target_cname.as_bytes() {
+        return Err(FsCustodyError::InvalidChildName(label.to_owned()));
+    }
+    let opened_source = open_regular_child(parent, source.name, label)?;
+    if !same_regular_file(&opened_source, source.file, label)? {
+        return Err(FsCustodyError::IdentityChanged(label.to_owned()));
+    }
+
+    // ADVISORY, not a linearization point. `rename_child_no_replace` gets its target-absence
+    // guarantee from the rename syscall's own flag; a replacing `renameat` has no "only if
+    // present" counterpart, so a target unlinked between this stat and the rename below is still
+    // created. The check exists to catch a caller reaching for `replace` where `publish` was
+    // meant — an operation ordering error — not to defeat a concurrent actor.
+    match stat_child_no_follow(parent, &target_cname) {
+        Ok(Some(_)) => {}
+        Ok(None) => return Err(FsCustodyError::TargetMissing(label.to_owned())),
+        Err(error) => return Err(FsCustodyError::Io(label.to_owned(), error)),
+    }
+
+    let renamed = match pinned.armed_replace_rename_fault() {
+        None => rename_child_replacing(parent, &source_cname, &target_cname),
+        Some(shape) => inject_replace_rename_fault(parent, &source_cname, &target_cname, shape),
+    };
+    match renamed {
+        Ok(()) => Ok(RenameCommitV1::Committed {
+            syscall_error: None,
+        }),
+        Err(error) => classify_failed_replace_rename(parent, source, target_name, label, error),
+    }
+}
+
+/// Decide what a FAILING replace-rename did, using only descriptor-level identity evidence.
+///
+/// Three answers, in the order the evidence supports them:
+///
+/// 1. the staged source name is still present AND still the caller's object ⇒ nothing moved, so
+///    the syscall error is a true `Err`;
+/// 2. otherwise the target is the caller's object ⇒ the rename took effect despite the error;
+/// 3. otherwise nothing is proven, and the caller gets a protective, undecidable outcome.
+///
+/// Rule 1 requires a POSITIVE identity match rather than merely "the source name still exists":
+/// a same-name substitution would otherwise be read as proof that nothing happened. Anything
+/// short of a match falls through, which is the fail-closed direction.
+#[cfg(unix)]
+fn classify_failed_replace_rename(
+    parent: &File,
+    source: &RegularChildRefV1<'_>,
+    target_name: &OsStr,
+    label: &str,
+    error: std::io::Error,
+) -> Result<RenameCommitV1, FsCustodyError> {
+    let staged_is_ours = open_regular_child(parent, source.name, label)
+        .ok()
+        .and_then(|staged| same_regular_file(&staged, source.file, label).ok())
+        .unwrap_or(false);
+    if staged_is_ours {
+        return Err(FsCustodyError::Io(label.to_owned(), error));
+    }
+
+    let target_is_ours = open_regular_child(parent, target_name, label)
+        .ok()
+        .and_then(|target| same_regular_file(&target, source.file, label).ok())
+        .unwrap_or(false);
+    if target_is_ours {
+        return Ok(RenameCommitV1::Committed {
+            syscall_error: Some(error.to_string()),
+        });
+    }
+
+    Ok(RenameCommitV1::Unverifiable(format!(
+        "{label}: the replacing rename reported an error and its effect could not be verified — \
+         the staged source is not provably intact and the target is not provably the published \
+         object ({error})"
+    )))
+}
+
+/// Perform an injected replace-rename fault: do what `shape` says, then report an error.
+///
+/// Compiled unconditionally, like the sync hook and for the same reason (`FailureCountdownV1`'s
+/// module doc): the operational surface has no `cfg(test)` callers to key off, and a hook that
+/// only exists under `cfg(test)` cannot be armed from an integration test.
+#[cfg(unix)]
+fn inject_replace_rename_fault(
+    parent: &File,
+    source: &CStr,
+    target: &CStr,
+    shape: ReplaceRenameFaultV1,
+) -> Result<(), std::io::Error> {
+    use std::os::fd::AsRawFd as _;
+    match shape {
+        ReplaceRenameFaultV1::BeforeEffect => {}
+        ReplaceRenameFaultV1::AfterEffect => rename_child_replacing(parent, source, target)?,
+        ReplaceRenameFaultV1::UnlinkSourceOnly => {
+            // SAFETY: a live directory descriptor and a validated single-component name.
+            let removed = unsafe { libc::unlinkat(parent.as_raw_fd(), source.as_ptr(), 0) };
+            if removed == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+        }
+    }
+    Err(std::io::Error::other(
+        "injected replacing-rename failure for test",
+    ))
+}
+
+#[cfg(not(unix))]
+fn replace_regular_child_impl(
+    _pinned: &PinnedDirectoryV1,
+    _source: &RegularChildRefV1<'_>,
+    _target_name: &OsStr,
+    label: &str,
+) -> Result<RenameCommitV1, FsCustodyError> {
+    Err(FsCustodyError::Unsupported(label.to_owned()))
 }
 
 #[cfg(not(unix))]
@@ -1331,6 +1756,382 @@ mod tests {
             fs::read(dir.path().join(source_name)).unwrap(),
             b"new bytes"
         );
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // PinnedDirectoryV1::replace_regular_child — the R2f1b custody REPLACE primitive.
+    //
+    // Every custody transition after `ProtectionPrepared` overwrites an existing record, so this
+    // is the one operation in the module that is *allowed* to clobber a target. Its contract is
+    // stated as an outcome, not a bool: `Err` means the rename provably did not happen, and every
+    // `Ok` arm means it did.
+    // ---------------------------------------------------------------------------------------
+
+    /// Discriminates a replace primitive that does not actually replace — e.g. one that inherits
+    /// the no-replace `fstatat` pre-check or the `RENAME_EXCL`/`RENAME_NOREPLACE` flag and so
+    /// refuses an existing target, which would make every custody transition after
+    /// `ProtectionPrepared` impossible.
+    #[cfg(unix)]
+    #[test]
+    fn replace_regular_child_overwrites_an_existing_record_and_reports_durable() {
+        let dir = tempfile::tempdir().unwrap();
+        let pinned = PinnedDirectoryV1::open(dir.path(), "custody replace").unwrap();
+        let source_name = OsStr::new("record.tmp");
+        let target_name = OsStr::new("record.custody.v1.json");
+        fs::write(dir.path().join(target_name), b"prepared").unwrap();
+        fs::write(dir.path().join(source_name), b"live-protected").unwrap();
+        let source_file = fs::File::open(dir.path().join(source_name)).unwrap();
+
+        let outcome = pinned
+            .replace_regular_child(
+                RegularChildRefV1::new(source_name, &source_file),
+                target_name,
+                "custody replace",
+            )
+            .unwrap();
+
+        assert!(outcome.is_durable(), "unexpected outcome: {outcome:?}");
+        assert_eq!(outcome.ambiguity(), None);
+        assert_eq!(
+            fs::read(dir.path().join(target_name)).unwrap(),
+            b"live-protected"
+        );
+        assert!(
+            !dir.path().join(source_name).exists(),
+            "the replacing rename must consume the source name"
+        );
+    }
+
+    /// The ambiguous post-rename-sync fault, and the reason the outcome is a type rather than a
+    /// `Result<(), _>`: the record on disk IS the replacement (so this is not a clean failure)
+    /// but its durability across a crash is unknown (so it is not a clean success either).
+    ///
+    /// Discriminates two distinct regressions: (a) mapping the parent-sync failure to `Err`,
+    /// which a `?`-using caller would read as "the replacement did not happen" and might retry
+    /// or treat the previous state as authoritative; and (b) swallowing the sync failure and
+    /// reporting `Durable`, which would license a later deletion on evidence that does not exist.
+    #[cfg(unix)]
+    #[test]
+    fn replace_regular_child_reports_a_protective_ambiguity_when_the_parent_sync_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let pinned = PinnedDirectoryV1::open(dir.path(), "ambiguous replace").unwrap();
+        let source_name = OsStr::new("record.tmp");
+        let target_name = OsStr::new("record.custody.v1.json");
+        fs::write(dir.path().join(target_name), b"prepared").unwrap();
+        fs::write(dir.path().join(source_name), b"preserved").unwrap();
+        let source_file = fs::File::open(dir.path().join(source_name)).unwrap();
+        pinned.fail_sync_on_nth_call_for_test(1);
+
+        let outcome = pinned
+            .replace_regular_child(
+                RegularChildRefV1::new(source_name, &source_file),
+                target_name,
+                "ambiguous replace",
+            )
+            .unwrap();
+
+        assert!(!outcome.is_durable(), "unexpected outcome: {outcome:?}");
+        let detail = outcome
+            .ambiguity()
+            .expect("a failed parent sync must be reported as an ambiguity");
+        assert!(
+            detail.contains("ambiguous"),
+            "ambiguity detail must say so: {detail}"
+        );
+        // Not a clean failure: the rename already happened.
+        assert_eq!(
+            fs::read(dir.path().join(target_name)).unwrap(),
+            b"preserved"
+        );
+        assert!(!dir.path().join(source_name).exists());
+    }
+
+    /// The error-after-effect hazard, and the reason `Err` can no longer be produced by simply
+    /// mapping the rename syscall's errno. A `renameat` that fails is NOT proof that nothing
+    /// moved: on a network filesystem a retried RPC can perform the rename and then report a
+    /// failure (the server completed the first request, the reply was lost, and the retry finds
+    /// the source already gone). Mapping that straight to `Err` tells the caller the previous
+    /// record is still authoritative when it has in fact been superseded — the exact inversion
+    /// the `Err`-means-nothing-happened contract exists to prevent.
+    ///
+    /// Discriminates a primitive that trusts the errno instead of verifying by identity.
+    #[cfg(unix)]
+    #[test]
+    fn a_rename_that_took_effect_despite_a_syscall_error_is_never_a_plain_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let pinned = PinnedDirectoryV1::open(dir.path(), "error after effect").unwrap();
+        let source_name = OsStr::new("record.tmp");
+        let target_name = OsStr::new("record.custody.v1.json");
+        fs::write(dir.path().join(target_name), b"prepared").unwrap();
+        fs::write(dir.path().join(source_name), b"live-protected").unwrap();
+        let source_file = fs::File::open(dir.path().join(source_name)).unwrap();
+        pinned.fail_replace_rename_on_nth_call_for_test(1, ReplaceRenameFaultV1::AfterEffect);
+
+        let outcome = pinned
+            .replace_regular_child(
+                RegularChildRefV1::new(source_name, &source_file),
+                target_name,
+                "error after effect",
+            )
+            .expect("a rename that took effect must never be reported as a plain error");
+
+        // The effect is real, and post-error verification proved it, so the replacement is
+        // attested exactly as an uneventful one would be — but the syscall error is retained so an
+        // operator can see the filesystem is answering error-after-effect.
+        assert!(outcome.is_durable(), "unexpected outcome: {outcome:?}");
+        let retried = match &outcome {
+            ReplacePublicationV1::Durable { retried_rename } => retried_rename.as_deref(),
+            other => panic!("unexpected outcome: {other:?}"),
+        };
+        assert!(
+            retried.is_some_and(|detail| detail.contains("injected")),
+            "the superseded syscall error must be retained: {retried:?}"
+        );
+        assert_eq!(
+            fs::read(dir.path().join(target_name)).unwrap(),
+            b"live-protected"
+        );
+        assert!(!dir.path().join(source_name).exists());
+    }
+
+    /// The other direction, and the reason the repair is verification rather than a blanket
+    /// weakening of the contract: when the rename genuinely did not happen, `Err` must still mean
+    /// exactly that, with the staged source untouched and the previous record authoritative.
+    /// Discriminates a "repair" that gives up and reports every rename error as ambiguous, which
+    /// would make an ordinary refusal (a wrong name, a full disk) indistinguishable from a lost
+    /// effect and leave every caller permanently unable to conclude anything.
+    #[cfg(unix)]
+    #[test]
+    fn a_rename_error_with_no_effect_is_still_a_provably_not_renamed_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let pinned = PinnedDirectoryV1::open(dir.path(), "error before effect").unwrap();
+        let source_name = OsStr::new("record.tmp");
+        let target_name = OsStr::new("record.custody.v1.json");
+        fs::write(dir.path().join(target_name), b"prepared").unwrap();
+        fs::write(dir.path().join(source_name), b"live-protected").unwrap();
+        let source_file = fs::File::open(dir.path().join(source_name)).unwrap();
+        pinned.fail_replace_rename_on_nth_call_for_test(1, ReplaceRenameFaultV1::BeforeEffect);
+
+        let error = pinned
+            .replace_regular_child(
+                RegularChildRefV1::new(source_name, &source_file),
+                target_name,
+                "error before effect",
+            )
+            .unwrap_err();
+
+        assert!(matches!(error, FsCustodyError::Io(_, _)));
+        assert_eq!(fs::read(dir.path().join(target_name)).unwrap(), b"prepared");
+        assert_eq!(
+            fs::read(dir.path().join(source_name)).unwrap(),
+            b"live-protected"
+        );
+    }
+
+    /// When verification itself cannot decide, the outcome is PROTECTIVE — never a plain `Err`
+    /// (which would claim the previous record survived) and never a durable success. The injected
+    /// shape is "the staged source name is gone but the target is not our object", which is what a
+    /// caller sees when a rename error coincides with any other actor touching either name.
+    ///
+    /// Discriminates a verification step that falls back to one of the two decisive answers when
+    /// the evidence supports neither.
+    #[cfg(unix)]
+    #[test]
+    fn a_rename_error_whose_effect_cannot_be_verified_is_protective() {
+        let dir = tempfile::tempdir().unwrap();
+        let pinned = PinnedDirectoryV1::open(dir.path(), "unverifiable rename").unwrap();
+        let source_name = OsStr::new("record.tmp");
+        let target_name = OsStr::new("record.custody.v1.json");
+        fs::write(dir.path().join(target_name), b"prepared").unwrap();
+        fs::write(dir.path().join(source_name), b"live-protected").unwrap();
+        let source_file = fs::File::open(dir.path().join(source_name)).unwrap();
+        pinned.fail_replace_rename_on_nth_call_for_test(1, ReplaceRenameFaultV1::UnlinkSourceOnly);
+
+        let outcome = pinned
+            .replace_regular_child(
+                RegularChildRefV1::new(source_name, &source_file),
+                target_name,
+                "unverifiable rename",
+            )
+            .expect("an undecidable rename outcome must not be reported as a plain error");
+
+        assert!(!outcome.is_durable(), "unexpected outcome: {outcome:?}");
+        let detail = outcome
+            .ambiguity()
+            .expect("an undecidable rename outcome must be protective");
+        assert!(
+            detail.contains("could not be verified"),
+            "unexpected detail: {detail}"
+        );
+        // Neither conclusion is licensed: the previous record is still what is on disk here, but
+        // the caller is told nothing that lets it act on that.
+        assert_eq!(fs::read(dir.path().join(target_name)).unwrap(), b"prepared");
+    }
+
+    /// Discriminates a replace primitive that silently *creates* an absent target. `replace` and
+    /// `publish` are separately named operations precisely so a caller cannot reach for the wrong
+    /// one; a create-if-absent replace would let a transition write a record for a checkout whose
+    /// `ProtectionPrepared` publication never landed.
+    ///
+    /// HONEST LIMIT: the pre-check is advisory, not a linearization point. Unlike
+    /// `rename_child_no_replace` — whose target-absence guarantee lives in the rename syscall's
+    /// own flag — a replacing `renameat` has no "only if present" flag, so a target unlinked
+    /// between this `fstatat` and the rename is still created. The check catches caller error,
+    /// not a hostile racer.
+    #[cfg(unix)]
+    #[test]
+    fn replace_regular_child_refuses_an_absent_target_and_leaves_the_source_in_place() {
+        let dir = tempfile::tempdir().unwrap();
+        let pinned = PinnedDirectoryV1::open(dir.path(), "replace absent").unwrap();
+        let source_name = OsStr::new("record.tmp");
+        let target_name = OsStr::new("record.custody.v1.json");
+        fs::write(dir.path().join(source_name), b"live-protected").unwrap();
+        let source_file = fs::File::open(dir.path().join(source_name)).unwrap();
+
+        let error = pinned
+            .replace_regular_child(
+                RegularChildRefV1::new(source_name, &source_file),
+                target_name,
+                "replace absent",
+            )
+            .unwrap_err();
+
+        assert!(matches!(error, FsCustodyError::TargetMissing(_)));
+        assert!(!dir.path().join(target_name).exists());
+        assert_eq!(
+            fs::read(dir.path().join(source_name)).unwrap(),
+            b"live-protected"
+        );
+    }
+
+    /// Discriminates dropping the source-identity pre-check, which would let a replacement
+    /// publish bytes the caller never wrote: the caller holds a descriptor on the object it
+    /// built, and a same-name substitution between build and publish must refuse rather than
+    /// clobber the durable record with an attacker's file.
+    #[cfg(unix)]
+    #[test]
+    fn replace_regular_child_refuses_a_source_name_substituted_since_the_caller_wrote_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let pinned = PinnedDirectoryV1::open(dir.path(), "replace substituted").unwrap();
+        let source_name = OsStr::new("record.tmp");
+        let target_name = OsStr::new("record.custody.v1.json");
+        fs::write(dir.path().join(target_name), b"prepared").unwrap();
+        fs::write(dir.path().join(source_name), b"mine").unwrap();
+        let source_file = fs::File::open(dir.path().join(source_name)).unwrap();
+        // Same name, different inode.
+        fs::remove_file(dir.path().join(source_name)).unwrap();
+        fs::write(dir.path().join(source_name), b"substituted").unwrap();
+
+        let error = pinned
+            .replace_regular_child(
+                RegularChildRefV1::new(source_name, &source_file),
+                target_name,
+                "replace substituted",
+            )
+            .unwrap_err();
+
+        assert!(matches!(error, FsCustodyError::IdentityChanged(_)));
+        assert_eq!(fs::read(dir.path().join(target_name)).unwrap(), b"prepared");
+    }
+
+    /// Discriminates handing an unvalidated name to the raw replacing `renameat`. A replacing
+    /// rename is strictly more dangerous than the no-replace one — a traversing name would let a
+    /// caller clobber an arbitrary path — so the single-component contract must hold here too.
+    #[cfg(unix)]
+    #[test]
+    fn replace_regular_child_refuses_a_traversing_target_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = dir.path().join("outside");
+        fs::create_dir(&outside).unwrap();
+        let inner = outside.join("inner");
+        fs::create_dir(&inner).unwrap();
+        let victim = outside.join("victim");
+        fs::write(&victim, b"not yours").unwrap();
+        let pinned = PinnedDirectoryV1::open(&inner, "replace traversal").unwrap();
+        let source_name = OsStr::new("record.tmp");
+        fs::write(inner.join(source_name), b"mine").unwrap();
+        let source_file = fs::File::open(inner.join(source_name)).unwrap();
+
+        let error = pinned
+            .replace_regular_child(
+                RegularChildRefV1::new(source_name, &source_file),
+                OsStr::new("../victim"),
+                "replace traversal",
+            )
+            .unwrap_err();
+
+        assert!(matches!(error, FsCustodyError::InvalidChildName(_)));
+        assert_eq!(fs::read(&victim).unwrap(), b"not yours");
+    }
+
+    /// The custody deletion gate refuses on a record's mere existence, so this probe must answer
+    /// "taken" for entries a decoder would reject. Discriminates an implementation built on
+    /// `open_regular_file` (or on a decode attempt), which would report a directory, a dangling
+    /// symlink, or an unreadable file as ABSENT — and absent is the one answer that licenses
+    /// deletion.
+    #[cfg(unix)]
+    #[test]
+    fn child_entry_exists_reports_any_taken_name_not_just_readable_regular_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let pinned = PinnedDirectoryV1::open(dir.path(), "entry probe").unwrap();
+        fs::write(dir.path().join("regular"), b"x").unwrap();
+        fs::create_dir(dir.path().join("as-directory")).unwrap();
+        std::os::unix::fs::symlink(dir.path().join("nowhere"), dir.path().join("dangling"))
+            .unwrap();
+
+        for name in ["regular", "as-directory", "dangling"] {
+            assert!(
+                pinned
+                    .child_entry_exists(OsStr::new(name), "entry probe")
+                    .unwrap(),
+                "{name} must read as taken"
+            );
+        }
+        assert!(!pinned
+            .child_entry_exists(OsStr::new("absent"), "entry probe")
+            .unwrap());
+    }
+
+    /// Discriminates handing an unvalidated name to the raw `fstatat`: a traversing name would
+    /// let the probe answer about an object outside the pinned directory entirely.
+    #[cfg(unix)]
+    #[test]
+    fn child_entry_exists_refuses_a_name_that_is_not_one_component() {
+        let dir = tempfile::tempdir().unwrap();
+        let pinned = PinnedDirectoryV1::open(dir.path(), "entry probe").unwrap();
+
+        let error = pinned
+            .child_entry_exists(OsStr::new("../elsewhere"), "entry probe")
+            .unwrap_err();
+
+        assert!(matches!(error, FsCustodyError::InvalidChildName(_)));
+    }
+
+    /// Positive control for the whole slice: adding a REPLACE primitive must not weaken the
+    /// no-replace publication paths that every `ProtectionPrepared` write still depends on. This
+    /// duplicates `publish_refuses_to_replace_an_existing_target`'s assertion deliberately — it
+    /// exists to fail loudly if a later refactor "unifies" the two renames.
+    #[cfg(unix)]
+    #[test]
+    fn adding_the_replace_primitive_leaves_publication_no_replace() {
+        let dir = tempfile::tempdir().unwrap();
+        let pinned = PinnedDirectoryV1::open(dir.path(), "no-replace control").unwrap();
+        let source_name = OsStr::new("record.tmp");
+        let target_name = OsStr::new("record.custody.v1.json");
+        fs::write(dir.path().join(source_name), b"new").unwrap();
+        fs::write(dir.path().join(target_name), b"old").unwrap();
+        let source_file = fs::File::open(dir.path().join(source_name)).unwrap();
+
+        let error = pinned
+            .publish_new_regular_child(
+                RegularChildRefV1::new(source_name, &source_file),
+                target_name,
+                "no-replace control",
+            )
+            .unwrap_err();
+
+        assert!(matches!(error, FsCustodyError::TargetExists(_)));
+        assert_eq!(fs::read(dir.path().join(target_name)).unwrap(), b"old");
     }
 
     /// Isolates the no-replace guarantee of the underlying `renameatx_np`/`renameat2` call

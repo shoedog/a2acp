@@ -678,6 +678,8 @@ name = "bridge-worktree"
 version = "0.3.1"
 dependencies = [
  "async-trait",
+ "bridge-controller",
+ "bridge-coordinator",
  "bridge-core",
  "bridge-workflow",
  "serde",

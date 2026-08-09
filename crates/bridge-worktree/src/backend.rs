@@ -1,3 +1,4 @@
+use crate::custody::{probe_custody_record_presence, CustodyRecordPresenceV1};
 use crate::provider::WorktreeProvider;
 use crate::provider_path::{
     resolve_worktree, sidecar_path, validate_bound_worktree, write_sidecar, ResolvedWorktree,
@@ -44,6 +45,91 @@ enum WtState {
 struct WtEntry {
     canonical_source: String,
     worktree_path: String,
+    custody: WtCustodyV1,
+}
+
+/// How a mapped checkout is governed — the discriminator the fail-closed deletion gate reads.
+///
+/// `WtEntry` is exactly the value that flows to the removal block in [`run_cleanup_flight`]:
+/// every construction site copies into `WtState`, `entry_for_cleanup` clones it into
+/// `state.entry`, and the removal block dereferences it. So a discriminator set at construction
+/// is visible verbatim at the one place a checkout can be deleted.
+///
+/// All four production construction sites set [`Self::Legacy`] in slice 2b1 — the V3 writer and
+/// its routing are 2b2's — so production behaviour is unchanged by the discriminator alone. What
+/// is *not* unchanged is the disk arm of the gate, which applies to every entry regardless.
+///
+/// [`run_cleanup_flight`]: WorktreeBackend::run_cleanup_flight
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WtCustodyV1 {
+    /// A V2 checkout: a `.meta.json` sidecar, no custody record, no protective state machine.
+    /// Ordinary cleanup deletes it exactly as it did before this slice.
+    Legacy,
+    /// An R2f1b V3 checkout under custody. Never deleted here — 2a's
+    /// `CustodySweepDispositionV1::authorizes_checkout_removal` is exhaustively false for every
+    /// custody state, and the removal block inherits that refusal.
+    Protected,
+}
+
+/// Why the removal block declined to delete a checkout.
+///
+/// Recorded rather than collapsed to a bool because the three arms mean operationally different
+/// things: one is the in-memory discriminator, one is durable truth on disk contradicting it, and
+/// one is the gate being unable to read durable truth at all.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum CheckoutRemovalRefusalV1 {
+    /// The mapped entry is custody-discriminated.
+    Discriminated,
+    /// The entry says legacy but a V3 custody record exists beside the checkout. Durable truth
+    /// wins: the record is the authority, the in-memory discriminator is a cache of it.
+    RecordPresent,
+    /// Durable truth could not be read. Fail closed.
+    ProbeInconclusive(String),
+}
+
+impl CheckoutRemovalRefusalV1 {
+    fn reason(&self) -> &'static str {
+        match self {
+            Self::Discriminated => "entry is custody-discriminated",
+            Self::RecordPresent => "a V3 custody record exists beside the checkout",
+            Self::ProbeInconclusive(_) => "the custody record could not be read",
+        }
+    }
+}
+
+/// The R2f1b fail-closed deletion gate. `None` authorizes removal; anything else refuses.
+///
+/// **Strength-independent and context-free by construction.** It takes only a `WtEntry`, so it
+/// cannot consult a cleanup strength, a workflow outcome, or a cancellation cause even by
+/// accident — which is the property `ExpiryClaim::Drop`, `BindingGuard::Drop`, and the idle
+/// reaper need, since none of them has any of those things to offer.
+///
+/// **The discriminator/disk rule.** Durable truth is the record at
+/// `custody_record_path(worktree_path)`; the discriminator is an in-memory cache of it. Removal
+/// is authorized only when BOTH say unprotected, so the gate fails closed in either direction of
+/// disagreement:
+///
+/// * discriminated but no record on disk (a crash between marking and publishing, or a record
+///   an actor deleted) — refuse;
+/// * legacy discriminator but a record present (a V3 checkout reached through a legacy code
+///   path, or a discriminator lost across a restart) — refuse;
+/// * the probe cannot answer — refuse.
+///
+/// The disk arm is what makes the gate survive a process restart, which the discriminator alone
+/// cannot: after a crash the map is empty and every rebuilt entry is `Legacy`.
+fn checkout_removal_refusal(entry: &WtEntry) -> Option<CheckoutRemovalRefusalV1> {
+    if entry.custody == WtCustodyV1::Protected {
+        return Some(CheckoutRemovalRefusalV1::Discriminated);
+    }
+    // Blocking filesystem calls, deliberately: the removal block a few lines below already does
+    // blocking `std::fs::remove_file` on this same path, and a stat is strictly cheaper.
+    match probe_custody_record_presence(&entry.worktree_path) {
+        CustodyRecordPresenceV1::ProvablyAbsent => None,
+        CustodyRecordPresenceV1::Present => Some(CheckoutRemovalRefusalV1::RecordPresent),
+        CustodyRecordPresenceV1::Inconclusive(detail) => {
+            Some(CheckoutRemovalRefusalV1::ProbeInconclusive(detail))
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -450,6 +536,33 @@ impl WorktreeBackend {
             .as_ref()
             .map(|flight| flight.report.clone());
         report
+    }
+
+    /// Mark a mapped checkout custody-discriminated.
+    ///
+    /// Test-only on purpose: in slice 2b1 no production path constructs a protected entry (the
+    /// writer and its routing are 2b2's), so the discriminator arm of the gate would otherwise be
+    /// unreachable and untested until then. Tests that need the *disk* arm instead write a real
+    /// custody record beside the checkout and leave the discriminator legacy.
+    #[cfg(test)]
+    async fn mark_checkout_protected_for_test(&self, session: &SessionId) {
+        let mut map = self.map.lock().await;
+        match map.get_mut(session.as_str()) {
+            Some(WtState::Ready(entry)) | Some(WtState::Reserving { entry, .. }) => {
+                entry.custody = WtCustodyV1::Protected;
+            }
+            None => panic!("no worktree entry is mapped for {}", session.as_str()),
+        }
+    }
+
+    #[cfg(test)]
+    async fn mapped_worktree_path_for_test(&self, session: &SessionId) -> Option<String> {
+        match self.map.lock().await.get(session.as_str()) {
+            Some(WtState::Ready(entry)) | Some(WtState::Reserving { entry, .. }) => {
+                Some(entry.worktree_path.clone())
+            }
+            None => None,
+        }
     }
 
     #[cfg(test)]
@@ -873,6 +986,63 @@ impl WorktreeBackend {
             }
         }
 
+        // ---- R2f1b fail-closed deletion gate (slice 2b1) ------------------------------------
+        // The whole deletion fan-in funnels through the block below: three `start_or_join_cleanup`
+        // callers, two `run_cleanup_flight` spawn sites, and every external subsystem
+        // (`BindingGuard::Drop`, `ExpiryClaim`'s three entry APIs, the eleven direct
+        // `release_session` sites, workflow cold cleanup, controller retire) reaches it through
+        // one of the `AgentBackend` cleanup methods. That convergence is why ONE gate suffices.
+        //
+        // Refusal is reported as Ok, not Err, and that is a decision with two reasons. It is not
+        // a cleanup FAILURE — the inner session teardown above completed, and only the checkout
+        // was deliberately retained; and the failed-configure reporter loop retries on an Err
+        // report while `failed_configure_cleanup_pending` is set, so an Err here would spin a
+        // protected rollback forever at the 30s backoff cap.
+        //
+        // On refusal we leave `state.provider_removed` / `state.sidecar_removed` false and
+        // `state.entry` populated, so the map is never emptied as if the checkout were gone and
+        // any later flight on this session re-runs the same refusal. Cleanup cells are
+        // per-session, so a refusal cannot wedge any OTHER session's cleanup.
+        //
+        // TWO DEFERRED RULINGS, recorded here so they cannot be silently forgotten (2b1 dual
+        // review, adjudicated). (1) Refusal-as-Ok is the 2b1 INTERIM PROJECTION, not the end
+        // state: an observer cannot currently distinguish "cleaned" from "deliberately retained",
+        // because the typed retained/refused cleanup disposition — and ownership retention
+        // through a refusal — is 2c1's vocabulary to mint. Until it exists, every caller in the
+        // fan-in sees a clean report for a checkout that is still on disk. (2) A refused
+        // rollback of a `Reserving` entry LOSES its cleanup owner: `entry_for_cleanup` pops the
+        // map entry before this gate runs, so the entry survives only in `state.entry` and a
+        // later `configure_session` for the same session starts a fresh reservation. 2c1 owns
+        // the state model that fixes it. 2b2 MUST land the `cleanup_failed_add` prohibition in
+        // the SAME PR as the V3 writer: without it, a refused rollback followed by a configure
+        // retry reaches `HostGitWorktree::add`'s `cleanup_failed_add` (`host_git.rs:42-47`),
+        // whose `remove_dir_all` is outside this gate and would delete the protected checkout.
+        let entry = match entry {
+            Some(entry) => match checkout_removal_refusal(&entry) {
+                None => Some(entry),
+                Some(refusal) => {
+                    tracing::warn!(
+                        session = session.as_str(),
+                        worktree_path = entry.worktree_path,
+                        reason = refusal.reason(),
+                        detail = match &refusal {
+                            CheckoutRemovalRefusalV1::ProbeInconclusive(detail) => detail.as_str(),
+                            _ => "",
+                        },
+                        "refusing to remove a worktree checkout under R2f1b custody"
+                    );
+                    // The refusal is about the CHECKOUT only. A genuine inner-teardown failure
+                    // recorded above is still the flight's result — swallowing it here would
+                    // report a broken session release as a clean cleanup.
+                    return match first_error {
+                        Some(error) => Err(error),
+                        None => Ok(()),
+                    };
+                }
+            },
+            None => None,
+        };
+
         if let Some(entry) = entry {
             if !state.provider_removed {
                 match provider
@@ -950,6 +1120,9 @@ impl WorktreeBackend {
         let reservation_entry = WtEntry {
             canonical_source: resolved.canonical_source.clone(),
             worktree_path: resolved.worktree_path.clone(),
+            // Legacy: the V3 writer and its routing are 2b2's. The disk arm of the deletion gate
+            // still applies to this entry.
+            custody: WtCustodyV1::Legacy,
         };
         let admission_cell = admission.cell.clone();
         let claim;
@@ -1078,6 +1251,7 @@ impl WorktreeBackend {
                 WtState::Ready(WtEntry {
                     canonical_source: resolved.canonical_source,
                     worktree_path: resolved.worktree_path,
+                    custody: WtCustodyV1::Legacy,
                 }),
             );
             self.notify.notify_waiters();
@@ -1269,6 +1443,9 @@ impl AgentBackend for WorktreeBackend {
         let reservation_entry = WtEntry {
             canonical_source: resolved.canonical_source.clone(),
             worktree_path: resolved.worktree_path.clone(),
+            // Legacy: the V3 writer and its routing are 2b2's. The disk arm of the deletion gate
+            // still applies to this entry.
+            custody: WtCustodyV1::Legacy,
         };
         let admission_cell = admission.cell.clone();
         let claim;
@@ -1413,6 +1590,7 @@ impl AgentBackend for WorktreeBackend {
                 WtState::Ready(WtEntry {
                     canonical_source: resolved.canonical_source,
                     worktree_path: resolved.worktree_path,
+                    custody: WtCustodyV1::Legacy,
                 }),
             );
             self.notify.notify_waiters();
@@ -4389,5 +4567,442 @@ mod tests {
         assert_eq!(rec.remove_count.load(Ordering::SeqCst), 1);
         assert!(be.map.lock().await.is_empty());
         std::fs::remove_dir_all(tmp).unwrap();
+    }
+
+    // =========================================================================================
+    // R2f1b slice 2b1 — the fail-closed deletion gate.
+    //
+    // The whole deletion fan-in (brief R-11) reaches ONE block: the `provider.remove` + sidecar
+    // removal sequence in `run_cleanup_flight`. The tests below drive every family that reaches
+    // it from inside this crate; `tests/r2f1b_deletion_gate.rs` drives the external subsystems.
+    // Each test names the family (or families) it stands for.
+    // =========================================================================================
+
+    /// Publish a real, canonically-encodable V3 custody record beside `worktree_path`.
+    ///
+    /// Deliberately a REAL record rather than a placeholder file: the gate keys on presence, so a
+    /// junk file would pass every assertion here while proving nothing about a genuine V3
+    /// checkout. The one test that needs the presence-not-decode property writes junk explicitly.
+    fn publish_custody_record(worktree_path: &str) {
+        use crate::custody::{
+            custody_record_path, WorktreeCustodyRecordV1, WorktreeCustodyStateV1,
+            WORKTREE_CUSTODY_RECORD_SCHEMA_V1,
+        };
+        use bridge_core::execution_policy::{
+            Sha256HexV1, WorktreeCustodyIdV1, WorktreeObjectIdentityV1,
+        };
+        use bridge_core::fs_custody::DirectoryIdentityV1;
+        use bridge_core::ids::{AttemptIdentity, ExecutionId};
+
+        let record = WorktreeCustodyRecordV1 {
+            schema_version: WORKTREE_CUSTODY_RECORD_SCHEMA_V1,
+            custody_id: WorktreeCustodyIdV1::parse(format!("custody-{}", "3".repeat(64))).unwrap(),
+            checkout_fingerprint: Sha256HexV1::parse("6".repeat(64)).unwrap(),
+            current_attempt: AttemptIdentity {
+                execution_id: ExecutionId::parse(format!("exec-{}", "1".repeat(32))).unwrap(),
+                attempt_id: AttemptId::parse(format!("attempt-{}", "2".repeat(32))).unwrap(),
+                ordinal: 0,
+                parent_attempt_id: None,
+            },
+            worktree: WorktreeObjectIdentityV1 {
+                canonical_path: worktree_path.to_owned(),
+                directory_identity: DirectoryIdentityV1 {
+                    canonical_path: worktree_path.to_owned(),
+                    dev: Some(1),
+                    ino: Some(2),
+                },
+            },
+            state: WorktreeCustodyStateV1::LiveProtected {},
+            claim: None,
+        };
+        std::fs::write(
+            custody_record_path(worktree_path),
+            record.encode_canonical().unwrap(),
+        )
+        .unwrap();
+    }
+
+    /// The target a legacy `configure_session` will resolve for this session, computed before the
+    /// call so a record can already be in place when a rollback path runs.
+    fn legacy_target(
+        tmp: &Path,
+        source: &Path,
+        cfg: &crate::provider_path::WorktreeConfig,
+        session: &str,
+    ) -> String {
+        let allowed_root = std::fs::canonicalize(tmp.join("allowed")).unwrap();
+        let source = std::fs::canonicalize(source).unwrap();
+        resolve_worktree(
+            cfg,
+            &Some(SessionCwd::parse(&allowed_root.to_string_lossy()).unwrap()),
+            &source.to_string_lossy(),
+            session,
+        )
+        .unwrap()
+        .worktree_path
+    }
+
+    fn removals(rec: &Rec) -> usize {
+        rec.remove_count.load(Ordering::SeqCst)
+    }
+
+    /// FAMILY: forget (`backend.rs` `forget_session` / `forget_session_checked`), and by path
+    /// collapse `BindingGuard::Drop` (`bridge-coordinator/src/dispatch.rs:63` calls exactly
+    /// `backend.forget_session(&session)`) — the cross-crate half of that family is pinned
+    /// end-to-end in `tests/r2f1b_deletion_gate.rs`.
+    ///
+    /// Also one half of STRENGTH INDEPENDENCE: this is `CleanupStrength::Forget`; its twin
+    /// `release_refuses_...` below is `::Release`. The gate consults neither.
+    ///
+    /// Asserts the refusal is scoped to the checkout: the inner session teardown still runs.
+    #[tokio::test]
+    async fn forget_refuses_to_delete_a_checkout_that_has_a_custody_record() {
+        let (be, rec, tmp, source, _cfg) = backend_fixture("gate-forget");
+        let sid = SessionId::parse("ctx-gate-forget-g0").unwrap();
+        be.configure_session(&sid, &spec(Some(&source.to_string_lossy())))
+            .await
+            .unwrap();
+        let target = be.mapped_worktree_path_for_test(&sid).await.unwrap();
+        publish_custody_record(&target);
+
+        be.forget_session_checked(&sid).await.unwrap();
+
+        assert_eq!(
+            removals(&rec),
+            0,
+            "a custody-protected checkout must not be removed"
+        );
+        assert!(rec
+            .order
+            .lock()
+            .unwrap()
+            .contains(&"inner_forget".to_string()));
+        assert!(
+            !be.map.lock().await.is_empty(),
+            "a refused entry must stay mapped, not be dropped as if it were cleaned"
+        );
+        std::fs::remove_dir_all(tmp).unwrap();
+    }
+
+    /// FAMILY: release (`release_session` / `_checked` / the eleven direct `release_session` call
+    /// sites in `bridge-coordinator/src/session_manager.rs`, all of which call this one trait
+    /// method), and `ExpiryClaim`'s three entry APIs — `into_flight`, `cleanup()`, and `Drop` all
+    /// funnel through `ExpiryClaim::start_flight`, whose only backend call is
+    /// `release_session_checked` (`session_manager.rs:356-359`). Verified in source, and driven
+    /// end-to-end through the real `reap_idle` chain in `tests/r2f1b_deletion_gate.rs`.
+    ///
+    /// The second half of STRENGTH INDEPENDENCE (`CleanupStrength::Release`).
+    #[tokio::test]
+    async fn release_refuses_to_delete_a_checkout_that_has_a_custody_record() {
+        let (be, rec, tmp, source, _cfg) = backend_fixture("gate-release");
+        let sid = SessionId::parse("ctx-gate-release-g0").unwrap();
+        be.configure_session(&sid, &spec(Some(&source.to_string_lossy())))
+            .await
+            .unwrap();
+        let target = be.mapped_worktree_path_for_test(&sid).await.unwrap();
+        publish_custody_record(&target);
+
+        be.release_session_checked(&sid).await.unwrap();
+
+        assert_eq!(removals(&rec), 0);
+        assert!(rec
+            .order
+            .lock()
+            .unwrap()
+            .contains(&"inner_release".to_string()));
+        std::fs::remove_dir_all(tmp).unwrap();
+    }
+
+    /// A refusal is about the CHECKOUT only. Discriminates a gate that returns early with a bare
+    /// `Ok(())` and swallows a genuine inner-teardown failure recorded before it — which would
+    /// report a broken session release as a clean cleanup to every caller in the fan-in.
+    #[tokio::test]
+    async fn a_refused_checkout_still_reports_a_failed_inner_teardown() {
+        let (be, rec, tmp, source, _cfg) = backend_fixture("gate-inner-error");
+        let sid = SessionId::parse("ctx-gate-inner-error-g0").unwrap();
+        be.configure_session(&sid, &spec(Some(&source.to_string_lossy())))
+            .await
+            .unwrap();
+        publish_custody_record(&be.mapped_worktree_path_for_test(&sid).await.unwrap());
+        rec.fail_release.store(true, Ordering::SeqCst);
+
+        assert_eq!(
+            be.release_session_checked(&sid).await,
+            Err(BridgeError::StoreFailure)
+        );
+
+        assert_eq!(removals(&rec), 0);
+        std::fs::remove_dir_all(tmp).unwrap();
+    }
+
+    /// FAMILY: observed cleanup (`forget_session_observed` / `release_session_observed`), and by
+    /// path collapse workflow cold cleanup — `cleanup_cold_session`
+    /// (`bridge-workflow/src/executor.rs:966-987`) calls exactly those two observed methods and
+    /// nothing else, which `cold_cleanup_reaches_the_backend_only_through_the_observed_methods`
+    /// in that crate pins.
+    #[tokio::test]
+    async fn observed_cleanup_refuses_to_delete_a_checkout_that_has_a_custody_record() {
+        let (be, rec, tmp, source, _cfg) = backend_fixture("gate-observed");
+        let sid = SessionId::parse("ctx-gate-observed-g0").unwrap();
+        be.configure_session(&sid, &spec(Some(&source.to_string_lossy())))
+            .await
+            .unwrap();
+        publish_custody_record(&be.mapped_worktree_path_for_test(&sid).await.unwrap());
+        let observer: Arc<dyn DiagnosticObserver> =
+            Arc::new(bridge_core::diagnostics::NoopDiagnosticObserver::default());
+
+        be.release_session_observed(&sid, observer.clone())
+            .await
+            .unwrap();
+        be.forget_session_observed(&sid, observer).await.unwrap();
+
+        assert_eq!(removals(&rec), 0);
+        std::fs::remove_dir_all(tmp).unwrap();
+    }
+
+    /// FAMILY: retirement (`WorktreeBackend::retire`), and by path collapse controller retire —
+    /// `ResilientWarm::retire` (`bridge-controller/src/resilient.rs:69-72`) and its transient
+    /// respawn path (`:178`) both call `AgentBackend::retire`, which for a worktree backend is
+    /// this method. Driven end-to-end through `ResilientWarm` in `tests/r2f1b_deletion_gate.rs`.
+    ///
+    /// Also the NO-WEDGE property the gate must not break: a refused session must not stop the
+    /// drain, so an unprotected sibling in the same retirement is still removed and the inner
+    /// backend still retires.
+    #[tokio::test]
+    async fn retire_refuses_a_protected_checkout_and_still_drains_an_unprotected_sibling() {
+        let (be, rec, tmp, protected_source, _cfg) = backend_fixture("gate-retire");
+        let plain_source = tmp.join("allowed").join("source2");
+        std::fs::create_dir_all(&plain_source).unwrap();
+        let protected = SessionId::parse("ctx-gate-retire-protected-g0").unwrap();
+        let plain = SessionId::parse("ctx-gate-retire-plain-g0").unwrap();
+        be.configure_session(&protected, &spec(Some(&protected_source.to_string_lossy())))
+            .await
+            .unwrap();
+        be.configure_session(&plain, &spec(Some(&plain_source.to_string_lossy())))
+            .await
+            .unwrap();
+        publish_custody_record(&be.mapped_worktree_path_for_test(&protected).await.unwrap());
+
+        be.retire().await.unwrap();
+
+        assert_eq!(
+            removals(&rec),
+            1,
+            "exactly the unprotected sibling is removed"
+        );
+        assert_eq!(rec.retire_count.load(Ordering::SeqCst), 1);
+        let map = be.map.lock().await;
+        assert!(map.contains_key(protected.as_str()));
+        assert!(!map.contains_key(plain.as_str()));
+        drop(map);
+        std::fs::remove_dir_all(tmp).unwrap();
+    }
+
+    /// FAMILY: bound-configure rollback. Every failure arm of
+    /// `configure_bound_resolved_with_admission` calls
+    /// `cleanup_session_with_sealed_admission(Release, true)`; this drives the inner-configure
+    /// arm, with the custody record already in place because the rollback happens inside the
+    /// call.
+    #[tokio::test]
+    async fn bound_configure_rollback_refuses_to_delete_a_protected_checkout() {
+        let (be, rec, tmp, source, cfg) = backend_fixture("gate-bound-rollback");
+        let (bound, target) = bound_spec(&source, &cfg);
+        let sid = SessionId::parse("ctx-gate-bound-rollback-g0").unwrap();
+        publish_custody_record(&target);
+        rec.fail_configure.store(true, Ordering::SeqCst);
+
+        // The bound path configures through `configure_bound_session`, whose fake always
+        // succeeds; make the rollback happen at the sidecar-write arm instead by pointing the
+        // spec's cwd elsewhere is not possible, so use a provider whose add fails: the
+        // reservation entry exists at that point and the rollback flight sees it.
+        let failing = Arc::new(WorktreeBackend::new(
+            Arc::new(FakeInner { rec: rec.clone() }),
+            Arc::new(NonGitProv { rec: rec.clone() }),
+            cfg.clone(),
+            Some(
+                SessionCwd::parse(
+                    &std::fs::canonicalize(tmp.join("allowed"))
+                        .unwrap()
+                        .to_string_lossy(),
+                )
+                .unwrap(),
+            ),
+            identity(),
+        ));
+        let before = removals(&rec);
+
+        assert!(failing.configure_bound_session(&sid, &bound).await.is_err());
+
+        assert_eq!(
+            removals(&rec),
+            before,
+            "the bound rollback must not remove a custody-protected checkout"
+        );
+        drop(be);
+        std::fs::remove_dir_all(tmp).unwrap();
+    }
+
+    /// FAMILY: legacy-configure rollback. Same shape as the bound arm, through
+    /// `configure_session`'s inner-configure failure path.
+    #[tokio::test]
+    async fn legacy_configure_rollback_refuses_to_delete_a_protected_checkout() {
+        let (be, rec, tmp, source, cfg) = backend_fixture("gate-legacy-rollback");
+        let sid = SessionId::parse("ctx-gate-legacy-rollback-g0").unwrap();
+        publish_custody_record(&legacy_target(&tmp, &source, &cfg, sid.as_str()));
+        rec.fail_configure.store(true, Ordering::SeqCst);
+
+        assert_eq!(
+            be.configure_session(&sid, &spec(Some(&source.to_string_lossy())))
+                .await,
+            Err(BridgeError::StoreFailure)
+        );
+
+        assert_eq!(removals(&rec), 0);
+        std::fs::remove_dir_all(tmp).unwrap();
+    }
+
+    /// FAMILY: `ConfigureAdmission::Drop`. Aborting a configure that is blocked inside the inner
+    /// backend drops the admission with `cleanup_on_drop` armed, which starts an observer-free
+    /// Release flight directly from the `Drop` impl — the most context-free entry in the whole
+    /// fan-in, and the reason the gate takes only a `WtEntry`.
+    #[tokio::test]
+    async fn configure_admission_drop_cleanup_refuses_to_delete_a_protected_checkout() {
+        let (be, rec, tmp, source, cfg) = backend_fixture("gate-admission-drop");
+        let sid = SessionId::parse("ctx-gate-admission-drop-g0").unwrap();
+        publish_custody_record(&legacy_target(&tmp, &source, &cfg, sid.as_str()));
+
+        let _allow = rec.block_next_configure();
+        let configure = tokio::spawn({
+            let be = be.clone();
+            let sid = sid.clone();
+            let spec = spec(Some(&source.to_string_lossy()));
+            async move { be.configure_session(&sid, &spec).await }
+        });
+        rec.wait_for_blocked_configure().await;
+        configure.abort();
+        assert!(configure.await.unwrap_err().is_cancelled());
+
+        // Drain the detached flight the Drop impl started.
+        be.release_session_checked(&sid).await.unwrap();
+
+        assert_eq!(removals(&rec), 0);
+        std::fs::remove_dir_all(tmp).unwrap();
+    }
+
+    /// DISAGREEMENT DIRECTION 1: the in-memory discriminator says protected while the disk says
+    /// nothing. Discriminates a gate implemented as "consult the record only", which would delete
+    /// a checkout whose record write is still in flight, or whose record an actor removed.
+    #[tokio::test]
+    async fn the_discriminator_alone_refuses_deletion_with_no_record_on_disk() {
+        let (be, rec, tmp, source, _cfg) = backend_fixture("gate-discriminator");
+        let sid = SessionId::parse("ctx-gate-discriminator-g0").unwrap();
+        be.configure_session(&sid, &spec(Some(&source.to_string_lossy())))
+            .await
+            .unwrap();
+        let target = be.mapped_worktree_path_for_test(&sid).await.unwrap();
+        assert!(!Path::new(&crate::custody::custody_record_path(&target)).exists());
+        be.mark_checkout_protected_for_test(&sid).await;
+
+        be.release_session_checked(&sid).await.unwrap();
+
+        assert_eq!(removals(&rec), 0);
+        std::fs::remove_dir_all(tmp).unwrap();
+    }
+
+    /// DISAGREEMENT DIRECTION 2 is what every `publish_custody_record` test above exercises (a
+    /// legacy discriminator with a record present). This pins the *undecodable* case of it:
+    /// protection must not be removable by damaging the record, so the gate keys on presence and
+    /// never on a successful decode.
+    #[tokio::test]
+    async fn a_corrupt_custody_record_still_refuses_deletion() {
+        let (be, rec, tmp, source, _cfg) = backend_fixture("gate-corrupt");
+        let sid = SessionId::parse("ctx-gate-corrupt-g0").unwrap();
+        be.configure_session(&sid, &spec(Some(&source.to_string_lossy())))
+            .await
+            .unwrap();
+        let target = be.mapped_worktree_path_for_test(&sid).await.unwrap();
+        std::fs::write(crate::custody::custody_record_path(&target), b"{ truncated").unwrap();
+
+        be.release_session_checked(&sid).await.unwrap();
+
+        assert_eq!(removals(&rec), 0);
+        std::fs::remove_dir_all(tmp).unwrap();
+    }
+
+    /// The INCONCLUSIVE arm: the enclosing directory exists but cannot be pinned, so durable
+    /// truth is unreadable. Discriminates a gate that treats an unanswerable probe as "no record"
+    /// — the failure mode that turns a transient filesystem condition into an irreversible
+    /// deletion.
+    #[tokio::test]
+    async fn an_unreadable_custody_probe_refuses_deletion() {
+        let (be, rec, tmp, source, cfg) = backend_fixture("gate-inconclusive");
+        let sid = SessionId::parse("ctx-gate-inconclusive-g0").unwrap();
+        be.configure_session(&sid, &spec(Some(&source.to_string_lossy())))
+            .await
+            .unwrap();
+        // Replace the worktree ROOT with a regular file: it exists (so nothing is provably
+        // absent) but no directory descriptor can be pinned on it.
+        std::fs::remove_dir_all(&cfg.root).unwrap();
+        std::fs::write(&cfg.root, b"not a directory").unwrap();
+
+        be.release_session_checked(&sid).await.unwrap();
+
+        assert_eq!(removals(&rec), 0);
+        std::fs::remove_file(&cfg.root).unwrap();
+        std::fs::remove_dir_all(tmp).unwrap();
+    }
+
+    /// IDEMPOTENCE + no wedge: a refusal must be repeatable and must leave the session cleanable
+    /// again later (e.g. once R2f2 disposes of the claim). Discriminates a gate that poisons the
+    /// cleanup cell, and one that lets the map entry go so a second attempt silently no-ops.
+    #[tokio::test]
+    async fn a_refused_checkout_re_refuses_and_becomes_deletable_once_its_record_is_gone() {
+        let (be, rec, tmp, source, _cfg) = backend_fixture("gate-idempotent");
+        let sid = SessionId::parse("ctx-gate-idempotent-g0").unwrap();
+        be.configure_session(&sid, &spec(Some(&source.to_string_lossy())))
+            .await
+            .unwrap();
+        let target = be.mapped_worktree_path_for_test(&sid).await.unwrap();
+        publish_custody_record(&target);
+
+        be.release_session_checked(&sid).await.unwrap();
+        be.release_session_checked(&sid).await.unwrap();
+        assert_eq!(removals(&rec), 0);
+        assert!(be.map.lock().await.contains_key(sid.as_str()));
+
+        std::fs::remove_file(crate::custody::custody_record_path(&target)).unwrap();
+        be.release_session_checked(&sid).await.unwrap();
+
+        assert_eq!(removals(&rec), 1, "the gate refuses, it does not disable");
+        assert!(be.map.lock().await.is_empty());
+        std::fs::remove_dir_all(tmp).unwrap();
+    }
+
+    /// POSITIVE CONTROL for forget, release and retire: an unprotected (V2) checkout is still
+    /// deleted by every strength. The gate must narrow deletion, not neuter it. The wider control
+    /// is the thirteen pre-existing legacy `configure_session` tests, unchanged by this slice.
+    #[tokio::test]
+    async fn an_unprotected_checkout_is_still_deleted_by_every_cleanup_strength() {
+        for (name, strength) in [("forget", true), ("release", false)] {
+            let (be, rec, tmp, source, _cfg) = backend_fixture(&format!("gate-control-{name}"));
+            let sid = SessionId::parse(format!("ctx-gate-control-{name}-g0")).unwrap();
+            be.configure_session(&sid, &spec(Some(&source.to_string_lossy())))
+                .await
+                .unwrap();
+
+            if strength {
+                be.forget_session_checked(&sid).await.unwrap();
+            } else {
+                be.release_session_checked(&sid).await.unwrap();
+            }
+
+            assert_eq!(
+                removals(&rec),
+                1,
+                "{name}: an unprotected checkout must still be removed"
+            );
+            assert!(be.map.lock().await.is_empty());
+            std::fs::remove_dir_all(tmp).unwrap();
+        }
     }
 }
