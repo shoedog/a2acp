@@ -1,0 +1,568 @@
+# kiro = :ro containerized reader behind the egress lock; claude+codex reviewers run HOST-SIDE with prism
+# (codex hard read-only via sandbox_mode); impl = container_rw; + the non-process ollama.
+# Run:  a2a-bridge serve --config examples/a2a-bridge.containerized.toml   (from the repo root)
+# Prereqs (see docs/containerized-agents.md):
+#   - docker compose -f deploy/containers/compose.egress.yaml up -d --build
+#   - the reader image built (deploy/containers/reader.Containerfile) — for the kiro :ro reader
+#   - per-agent creds: WRITABLE single-file copies in ~/.config/a2a-creds/{claude,codex}, and a
+#     one-time `kiro-cli login --use-device-flow` into the `a2a-kiro-data` volume.
+#
+# MUST-FIX (dual-review): for the still-containerized agents (kiro :ro, impl :rw), allowed_cwd_root is
+# OPT-IN and MUST equal the mount root, or they ship with NO cwd gate; identical-path mount makes the
+# session/new cwd resolve inside the container. (claude+codex reviewers are host-side — not gated by this.)
+
+default = "claude"
+
+allowed_cwd_root = "/Users/wesleyjinks/code"
+
+# B2b-3a: the review-the-diff run after `implement` commits + verifies. Two folded reviewers (codex+claude)
+# review `git diff base..HEAD` in the clone (read-only nav tools) -> a synth emits VERDICT: APPROVE|REJECT,
+# surfaced in the hand-off. ADVISORY (the operator accepts at merge). Absent -> skipped.
+[review]
+workflow = "implement-review"
+# Two thorough reviewers navigating + reviewing a REAL diff routinely exceed the 300s default and trip a
+# spurious timeout (looks like an agent failure but is just the bound). 1800s gives room (thorough does ~2×
+# passes) while still capping a runaway review (bridge agents are full coding agents). Raise further for very
+# large diffs.
+timeout_secs = 1800
+# Light-tier thresholds: diffs at or under BOTH limits use <workflow>-light (implement-review-light by
+# convention) instead of the full two-reviewer workflow — faster and cheaper for small changes.
+light_max_lines = 15
+light_max_files = 2
+# Thorough-tier trigger: a diff at or above EITHER limit (LLOC over code/infra files only — docs, tests,
+# lockfiles, generated files, comments, blanks excluded) runs <workflow>-thorough (draft→refine ×2).
+thorough_min_lines = 150
+thorough_min_files = 6
+# Default review depth when `--depth` is not given: auto | light | standard | thorough.
+default_depth = "auto"
+
+# B2b-3b: the review->tweak loop. After the first commit, the bridge runs verify+review each attempt; on a
+# verify-FAIL or review-REJECT it re-prompts the `impl` agent (the `implement-fix` workflow) to fix on the
+# SAME clone, then AMENDs the fix into the single commit. Bounded by max_attempts (commit turns: the initial
+# commit + up to max_attempts-1 fix amends). Advisory -> the operator still accepts at merge. Absent -> 3.
+[implement]
+max_attempts = 3
+fix_workflow = "implement-fix"
+
+# B2b-2: the build+test verify run after `a2a-bridge implement` commits. Bridge-deterministic (the
+# agent can't fake it), REPORTED not gating. Separate egress (registries only; NO creds) so creds and
+# registry-egress never coexist. Coverage is opt-in (commented) — it can't reuse the warm non-instrumented
+# cache. Default gates are fmt/clippy/build/test, all --locked against the :ro clone.
+[verify]
+image    = "a2a-toolchain:latest"
+cache    = "a2a-verify-cache"                  # per-repo: the bridge appends a hash of the source path
+egress   = "locked"
+network  = "a2a-verify-egress"
+proxy    = "http://a2a-verify-proxy:8888"
+# NO_PROXY=localhost so `cargo test`'s local HTTP servers (wiremock etc.) aren't hijacked by the cargo-
+# fetch proxy. Without it, any test that binds 127.0.0.1 spuriously fails verify (live-gate finding).
+no_proxy = "localhost,127.0.0.1"
+
+[[languages]]
+id = "rust"
+fetch = "cargo fetch --locked"
+warm_cache = "a2a-impl-lsp-cache"
+dep_cache_path = "/cargo"
+verify_cache_path = "/cache"
+fetch_env = { CARGO_HOME = "/cargo" }
+verify_env = { CARGO_HOME = "/cache/cargo", CARGO_TARGET_DIR = "/cache/target", CARGO_INCREMENTAL = "0" }
+# RUSTUP_HOME is REQUIRED: rust-analyzer is a rustup PROXY (/usr/local/cargo/bin/rust-analyzer); codex-acp
+# hands its MCP subprocesses a MINIMAL env that drops the image's RUSTUP_HOME, so without it the proxy can't
+# resolve a toolchain ("rustup could not choose a version"), RA never answers LSP initialize, lsp-mcp times
+# out + exits, and codex reports "no lsp tool" for rust. gopls is a direct binary so it was unaffected (#1d).
+lsp_env = { CARGO_HOME = "/cargo", CARGO_NET_OFFLINE = "true", RUSTUP_HOME = "/usr/local/rustup" }
+[[languages.verify]]
+name = "fmt"
+cmd  = "cargo fmt --all -- --check"
+[[languages.verify]]
+name = "clippy"
+cmd  = "cargo clippy --all-targets --all-features --locked -- -D warnings"
+[[languages.verify]]
+name = "build"
+cmd  = "cargo build --locked"
+[[languages.verify]]
+name = "test"
+# A HERMETIC verify can't run this repo's SYSTEM-INTEGRATION tests — they need host capabilities the
+# bare container lacks (dogfood finding). CI runs the full suite post-merge; the pre-merge verify covers
+# fmt/clippy/build + the hermetic-safe tests:
+#   --exclude bridge-container: its B2a tests spawn a real Docker daemon (no docker-in-docker here).
+#   --skip process::tests::{terminate_reaps_child_no_zombie,term_ignoring_loop_forces_group_sigkill,drop_group_kills_descendants}:
+#     the supervisor's zombie-reaping + process-group-SIGKILL/drop tests need host PID-1/signal semantics
+#     and a host-visible process table (container PID namespace breaks the grandchild-visibility precondition).
+#   --skip lock_release_failure_is_loud_not_silent + --skip staged_candidate_ (added 2026-08-09, 2c2 fold):
+#     the flock-EBADF/exec family fails in-container but passes on host (controls in
+#     docs/superpowers/reviews/2026-08-09-s2c2-dual-review.md "Flake attribution") — same hermetic
+#     class as the process:: skips. Without these the implement fix loop chases environment-red
+#     tests into out-of-scope production surgery (observed on the 2c2 repair run).
+cmd  = "cargo test --workspace --locked --exclude bridge-container -- --skip process::tests::terminate_reaps_child_no_zombie --skip process::tests::term_ignoring_loop_forces_group_sigkill --skip process::tests::drop_group_kills_descendants --skip lock_release_failure_is_loud_not_silent --skip staged_candidate_"
+# opt-in coverage (instrumented recompile; reported, never gates):
+# [[languages.verify]]
+# name = "coverage"
+# cmd  = "cargo llvm-cov --workspace --locked --summary-only"
+# gate = false
+
+[[languages]]
+id = "go"
+fetch = "go mod download"
+warm_cache = "a2a-impl-lsp-cache-go"
+dep_cache_path = "/go/pkg/mod"
+verify_cache_path = "/cache"
+fetch_env = { GOMODCACHE = "/go/pkg/mod", GOFLAGS = "-mod=mod" }
+verify_env = { GOMODCACHE = "/cache/gomodcache", GOCACHE = "/cache/go-build", GOFLAGS = "-mod=readonly" }
+lsp_env = { GOMODCACHE = "/go/pkg/mod", GOFLAGS = "-mod=mod" }
+[[languages.verify]]
+name = "gofmt"
+cmd  = "test -z \"$(gofmt -l .)\""
+[[languages.verify]]
+name = "vet"
+cmd  = "go vet ./..."
+[[languages.verify]]
+name = "build"
+cmd  = "go build ./..."
+[[languages.verify]]
+name = "test"
+cmd  = "go test ./..."
+
+[[languages]]
+id = "python"
+# Always create the venv at /pyvenv (so the interpreter exists even with no installable deps — the hard
+# LSP_MCP_PYTHON_PATH override would otherwise crash basedpyright). UV_PROJECT_ENVIRONMENT pins the target
+# so uv never writes /work/.venv on the :ro real repo. Deps are best-effort (|| true) → no-lock repos get a
+# bare venv (stdlib resolves; 3rd-party shows unresolved, not a crash). See docs/containerized-mcp-env-trap.md.
+fetch = "uv venv /pyvenv && { UV_PROJECT_ENVIRONMENT=/pyvenv uv sync --frozen || VIRTUAL_ENV=/pyvenv uv pip install -r requirements.txt || true; }"
+warm_cache = "a2a-impl-lsp-cache-py"
+dep_cache_path = "/pyvenv"
+verify_cache_path = "/cache"
+fetch_env = { UV_CACHE_DIR = "/uvcache" }
+verify_env = { UV_CACHE_DIR = "/cache/uv", RUFF_CACHE_DIR = "/cache/ruff" }
+# basedpyright reads site-packages via this interpreter. PATH not needed (binaries symlinked to /usr/local/bin,
+# already on codex's stripped PATH). PYTHONDONTWRITEBYTECODE guards a __pycache__ write under the :ro venv.
+lsp_env = { LSP_MCP_PYTHON_PATH = "/pyvenv/bin/python", PYTHONDONTWRITEBYTECODE = "1" }
+[[languages.verify]]
+name = "format"
+cmd  = "ruff format --check ."
+[[languages.verify]]
+name = "lint"
+cmd  = "ruff check ."
+[[languages.verify]]
+name = "test"
+cmd  = "uv venv /cache/venv && { UV_PROJECT_ENVIRONMENT=/cache/venv uv sync --frozen || VIRTUAL_ENV=/cache/venv uv pip install -r requirements.txt; } && /cache/venv/bin/python -m pytest -q"
+
+[[languages]]
+id = "typescript"
+# SPIKED fetch (spike 2): `npm ci --prefix /` FAILS (EUSAGE — it looks for the lock at the prefix). The
+# working shape copies the manifests to / then `npm ci` at / → populates the mounted /node_modules vol.
+# --ignore-scripts: a warm fetch must NOT run arbitrary dep postinstall scripts (codex hardening). Best-
+# effort (|| true) so a no-lock/no-deps repo still gets a usable bare server (degrades, never crashes).
+fetch = "cp /work/package.json / 2>/dev/null; cp /work/package-lock.json / 2>/dev/null; cd / && { npm ci --ignore-scripts || npm install --ignore-scripts || true; }"
+warm_cache = "a2a-impl-lsp-cache-ts"
+dep_cache_path = "/node_modules"     # the root-walk target (spiked); mounted :ro for nav, rw for fetch
+verify_cache_path = "/node_modules"  # B1 FIX: verify gets its OWN /node_modules vol (the verify container
+                                     # does NOT mount the warm dep cache + the clone is :ro), so the verify
+                                     # cmds install deps into it, then tsc resolves via the root-walk.
+fetch_env = { npm_config_cache = "/npmcache" }
+verify_env = { npm_config_cache = "/cache/npm" }
+# Swappable seam (M1): ts_config reads LSP_MCP_TS_SERVER (else "typescript-language-server"). To swap the
+# CONTAINERIZED server with NO rebuild, set it HERE (lsp_env reaches the in-container lsp-mcp via the
+# stripped-env path; a host/image env would NOT — see containerized-mcp-env-trap). Default: unset → tsls.
+# (tsserver's typescript-lib path, if needed, goes in initialize_params, NOT lsp_env — see Layer 1.)
+lsp_env = {}   # e.g. { LSP_MCP_TS_SERVER = "/usr/local/bin/vtsls" } to swap
+[[languages.verify]]
+# B1: verify installs deps into the /node_modules verify vol (copy manifests + npm ci), THEN tsc resolves
+# via the root-walk. Mirrors python's verify-venv-into-/cache.
+name = "typecheck"
+cmd  = "cp package.json / 2>/dev/null; cp package-lock.json / 2>/dev/null; (cd / && { npm ci --ignore-scripts || npm install --ignore-scripts || true; }); tsc --noEmit"
+[[languages.verify]]
+name = "lint"
+# eslint is project-local (in /node_modules/.bin) + config-driven; guard on a config + put the bin on PATH.
+cmd  = "if ls .eslintrc* eslint.config.* >/dev/null 2>&1; then PATH=/node_modules/.bin:$PATH eslint .; else echo 'no eslint config; skip'; fi"
+[[languages.verify]]
+name = "test"
+cmd  = "npm test --if-present"   # honors the project's test script; no-op if absent
+
+[registry]
+# docker: the container runtime for the impl/kiro/verify sandboxes.
+# codex-acp + claude-agent-acp: host-side reviewer agents (codex/claude run without a sandbox block).
+allowed_cmds = ["docker", "codex-acp", "claude-agent-acp"]
+
+[server]
+addr = "127.0.0.1:8080"
+
+# ── claude: host-side reviewer with prism code-nav (no container sandbox; runs the host claude-agent-acp).
+#    Moved from :ro container to host-side so it can use prism structural navigation for deeper reviews.
+#    Read-only is PROMPT-CONTRACT only here (claude-agent-acp has no read-only flag) — softer than codex's
+#    hard sandbox_mode=read-only below; acceptable for an advisory reviewer, but note the asymmetry. ──
+# Tier 0 — prompt-contract only (claude has no native sandbox flag)
+[[agents]]
+id  = "claude"
+cmd = "claude-agent-acp"
+model = "sonnet"   # reviewer pinned to Sonnet 4.6 (dogfood)
+[[agents.mcp]]
+name = "prism"
+command = "/Users/wesleyjinks/code/slicing/target/release/prism-mcp"
+args = ["--repo", "{cwd}", "--cache-dir", "/Users/wesleyjinks/.local/share/a2a/prism-cache-host"]
+# lsp (L3): type-resolved semantic nav via rust-analyzer (rust), basedpyright (python), or gopls (go), auto-detected per repo — the complement to prism's structural graph.
+# --target-cache keys a per-repo CARGO_TARGET_DIR by origin → ~0.7s warm index across clones. See lsp-nav skill.
+[[agents.mcp]]
+name = "lsp"
+command = "/Users/wesleyjinks/code/a2a-bridge/target/release/lsp-mcp"
+args = ["--repo", "{cwd}", "--lang", "auto", "--target-cache", "/Users/wesleyjinks/.local/share/a2a/lsp-target-cache"]
+
+# ── codex: host-side reviewer with prism code-nav (no container sandbox; runs host codex-acp in read-only
+#    mode). sandbox_mode=read-only + approval_policy=never enforces hard read-only on the host-side agent. ──
+# Tier 1 — codex agent-native read-only sandbox (host)
+[[agents]]
+id  = "codex"
+cmd = "codex-acp"
+model = "gpt-5.5"   # reviewer pinned (dogfood)
+args = ["-c", "sandbox_mode=\"read-only\"", "-c", "approval_policy=\"never\""]
+[[agents.mcp]]
+name = "prism"
+command = "/Users/wesleyjinks/code/slicing/target/release/prism-mcp"
+args = ["--repo", "{cwd}", "--cache-dir", "/Users/wesleyjinks/.local/share/a2a/prism-cache-host"]
+# lsp (L3): type-resolved semantic nav via rust-analyzer (rust), basedpyright (python), or gopls (go), auto-detected per repo — the complement to prism's structural graph.
+# --target-cache keys a per-repo CARGO_TARGET_DIR by origin → ~0.7s warm index across clones. See lsp-nav skill.
+[[agents.mcp]]
+name = "lsp"
+command = "/Users/wesleyjinks/code/a2a-bridge/target/release/lsp-mcp"
+args = ["--repo", "{cwd}", "--lang", "auto", "--target-cache", "/Users/wesleyjinks/.local/share/a2a/lsp-target-cache"]
+
+# ── kiro: Linux build baked into the image. VERIFIED: Linux auth is ~/.local/share/kiro-cli/data.sqlite3
+#    (NOT ~/.aws); minted once via `kiro-cli login --use-device-flow` into the a2a-kiro-data volume. ──
+# Tier 2 — container :ro + locked egress
+[[agents]]
+id   = "kiro"
+cmd  = "kiro-cli"
+args = ["acp"]
+[agents.sandbox]
+image   = "a2a-agent-reader:latest"
+mount   = "/Users/wesleyjinks/code"
+access  = "ro"
+egress  = "locked"
+network = "a2a-egress-internal"
+proxy   = "http://a2a-egress-proxy:8888"
+volumes = ["a2a-kiro-data:/root/.local/share"]
+
+# ── impl: WRITE-capable containerized agent (kind="container_rw" PERMITS access="rw"). Under `implement`
+#    it runs WARM (one container + one ACP session across the edit+fix turns, reaped at the end — ADR-0024);
+#    under `serve`/`run-workflow` it's per-turn. The :rw mount is the per-request session cwd (a per-task
+#    git clone) under allowed_cwd_root, canonicalized + is_under-gated.
+#    DEFAULT IMPLEMENTOR = codex (gpt-5.5, effort=high). `sandbox_mode=danger-full-access` disables codex's
+#    OWN bubblewrap sandbox (absent from the image) so it can edit the :rw clone — the Docker container IS
+#    the sandbox. effort=high is now honored by the warm session (the ADR-0024 effective_config fold).
+#    To use claude instead: cmd="claude-agent-acp", drop the codex args, and mount the claude creds.
+# Tier 3 — container_rw (Docker is the boundary; codex bwrap absent in-container)
+[[agents]]
+id     = "impl"
+kind   = "container_rw"
+cmd    = "codex-acp"
+# Explicitly force the ChatGPT auth contract this image mounts; the bridge default
+# also prefers ChatGPT-style auth when advertised.
+auth_method = "chat-gpt"
+model  = "gpt-5.6-terra"                       # 2c2 repair round — terra xhigh (owner directive 2026-08-09)
+effort = "xhigh"
+args   = ["-c", "sandbox_mode=\"danger-full-access\"", "-c", "approval_policy=\"never\""]
+[agents.sandbox]
+image   = "a2a-toolchain:latest"               # B2b-2: toolchain so the agent (and verify) has cargo
+mount   = "/Users/wesleyjinks/code"            # == allowed_cwd_root (S2); :rw target is the session cwd under it
+access  = "rw"
+egress  = "locked"
+network = "a2a-egress-internal"
+proxy   = "http://a2a-egress-proxy:8888"
+volumes = ["/Users/wesleyjinks/.config/a2a-creds/codex/auth.json:/root/.codex/auth.json"]
+# lsp (L3 Slice B): in-container type-resolved nav for the implementor's edits. The Linux lsp-mcp + RA are
+# baked into a2a-toolchain (Tasks 2-3); CARGO_HOME=/cargo is the READ-ONLY warmed dep cache (Task 1), offline
+# so RA never fetches; --target-cache /lsp-target is the writable per-repo CARGO_TARGET_DIR; the call log lands
+# under the clone's .git/ (survives --rm, fetched at hand-off). Both /cargo + /lsp-target are runtime-derived
+# named volumes appended in main.rs (per-clone names, NOT static).
+[[agents.mcp]]
+name = "lsp"
+command = "/usr/local/bin/lsp-mcp"
+args = ["--repo", "{cwd}", "--lang", "auto", "--target-cache", "/lsp-target"]
+[[agents.mcp.env]]
+name = "LSP_MCP_LOG"
+value = "{cwd}/.git/a2a-bridge/lsp-mcp-calls.log"
+
+# ── ollama: non-process api agent (kind="api"). Uncontainerized by design — no mount/proxy/creds.
+#    NOT tool-free — it advertises a deterministic side-effect-free stub tool (no fs/shell).
+#    Local => no remote egress (a cloud base_url would egress host-direct, bypassing the proxy). ──
+[[agents]]
+id          = "ollama"
+kind        = "api"
+base_url    = "http://localhost:11434/v1"
+api_key_env = "OLLAMA_API_KEY"
+model       = "qwen2.5-coder:7b"
+
+# ── ollama-cloud: same api backend, ollama's hosted models. base_url is host-direct egress
+#    (ollama.com), bypassing the container egress proxy — fine: this is the BRIDGE calling out
+#    (non-process), not a contained agent. ──
+[[agents]]
+id          = "ollama-cloud"
+kind        = "api"
+base_url    = "https://ollama.com/v1"
+api_key_env = "OLLAMA_API_KEY"
+model       = "qwen3-coder:480b"
+
+[[prompts]]
+id = "review-implement"
+file = "../prompts/review-implement.md"
+description = "shared implement-review prompt"
+
+[[prompts]]
+id = "smoke-reply"
+file = "../prompts/smoke-reply.md"
+description = "one-line smoke reply prompt"
+
+# ── Review/design workflows (single-pass here; Phase D restructures design/spec/plan into two-pass) ──
+# E8a migrates duplicated shared prompts first. Remaining prompt_file nodes stay file-backed until the
+# broader E8b registry/partial migration.
+[[workflows]]
+id = "code-review"
+[[workflows.nodes]]
+id = "correctness"
+agent = "codex"
+prompt_file = "../prompts/review-correctness.md"
+inputs = []
+[[workflows.nodes]]
+id = "architecture"
+agent = "claude"
+prompt_file = "../prompts/review-architecture.md"
+inputs = []
+[[workflows.nodes]]
+id = "synth"
+agent = "claude"
+prompt_file = "../prompts/review-synth.md"
+inputs = ["correctness", "architecture"]
+
+# ── implement-review (B2b-3a): two folded reviewers of the committed diff → synth verdict. Driven by
+#    `a2a-bridge implement` after the commit + verify (via the [review] block above). ──
+[[workflows]]
+id = "implement-review"
+[[workflows.nodes]]
+id = "reviewer_codex"
+agent = "codex"
+prompt = "review-implement"
+inputs = []
+[[workflows.nodes]]
+id = "reviewer_claude"
+agent = "claude"
+prompt = "review-implement"
+inputs = []
+[[workflows.nodes]]
+id = "synth"
+agent = "claude"
+prompt_file = "../prompts/review-implement-synth.md"
+inputs = ["reviewer_codex", "reviewer_claude"]
+
+# ── implement-review-light: single reviewer + synth for small diffs (≤ light_max_lines / light_max_files).
+#    Faster + cheaper than the full two-reviewer workflow; same synth contract (VERDICT: APPROVE|REJECT). ──
+[[workflows]]
+id = "implement-review-light"
+[[workflows.nodes]]
+id = "reviewer"
+agent = "codex"
+prompt = "review-implement"
+inputs = []
+[[workflows.nodes]]
+id = "synth"
+agent = "claude"
+prompt_file = "../prompts/implement-review-light-synth.md"
+inputs = ["reviewer"]
+
+[[workflows]]
+# implement-review-thorough: 2 reviewers each draft→refine → synth (the large-diff tier). Reuses the
+# standard reviewer + synth prompts; the refine pass re-reads the diff line-by-line. Slice attached.
+id = "implement-review-thorough"
+[[workflows.nodes]]
+id = "reviewer_codex_draft"
+agent = "codex"
+prompt = "review-implement"
+inputs = []
+[[workflows.nodes]]
+id = "reviewer_claude_draft"
+agent = "claude"
+prompt = "review-implement"
+inputs = []
+[[workflows.nodes]]
+id = "reviewer_codex"
+agent = "codex"
+prompt_file = "../prompts/review-implement-refine.md"
+inputs = ["reviewer_codex_draft"]
+[[workflows.nodes]]
+id = "reviewer_claude"
+agent = "claude"
+prompt_file = "../prompts/review-implement-refine.md"
+inputs = ["reviewer_claude_draft"]
+[[workflows.nodes]]
+id = "synth"
+agent = "claude"
+prompt_file = "../prompts/review-implement-synth.md"
+inputs = ["reviewer_codex", "reviewer_claude"]
+
+[[workflows]]
+# B2a acceptance gate: a single write-capable container_rw node. Run from under the mount with
+#   a2a-bridge run-workflow impl-smoke --input README.md --session-cwd /Users/wesleyjinks/code/.b2a-scratch
+id = "impl-smoke"
+[[workflows.nodes]]
+id = "write"
+agent = "impl"
+prompt_file = "../prompts/impl-smoke.md"
+inputs = []
+
+[[workflows]]
+# C2b: a single container_rw `impl` turn that uses the in-container lsp (--lang auto) to type-resolve a
+# symbol. Run per-session-cwd to prove ONE serve/run-workflow handles polyglot sessions (go vs rust). The
+# codex impl gets the lsp via CodexNative (-c mcp_servers.*); see ADR-00xx (claude/kiro container_rw MCP
+# delivery is a separate gap). Run:
+#   a2a-bridge run-workflow c2b-nav --input <fn-name-file> --session-cwd <a-go-or-rust-repo> --config <this>
+id = "c2b-nav"
+[[workflows.nodes]]
+id = "nav"
+agent = "impl"
+prompt_file = "../prompts/c2b-nav.md"
+inputs = []
+
+[[workflows]]
+# B2b-1: the write-capable edit node driven by `a2a-bridge implement`. The agent edits + stages + writes
+# .git/A2A_COMMIT_MSG; the bridge host-commits the staged index.
+id = "implement-edit"
+[[workflows.nodes]]
+id = "edit"
+agent = "impl"
+prompt_file = "../prompts/implement-edit.md"
+inputs = []
+
+# ── implement-fix (B2b-3b): one ContainerRw `impl` turn to FIX verify/review failures on the existing clone.
+#    EXAMPLE-ONLY (references `impl`, which is not in the `init` scaffold). ──
+[[workflows]]
+id = "implement-fix"
+[[workflows.nodes]]
+id = "fix"
+agent = "impl"
+prompt_file = "../prompts/implement-fix.md"
+inputs = []
+
+[[workflows]]
+id = "spec-review"
+[[workflows.nodes]]
+id = "rigordraft"
+agent = "codex"
+prompt_file = "../prompts/spec-review-rigor.md"
+inputs = []
+[[workflows.nodes]]
+id = "soundnessdraft"
+agent = "claude"
+prompt_file = "../prompts/spec-review-soundness.md"
+inputs = []
+[[workflows.nodes]]
+id = "rigor"
+agent = "codex"
+prompt_file = "../prompts/spec-review-rigor-refine.md"
+inputs = ["rigordraft"]
+[[workflows.nodes]]
+id = "soundness"
+agent = "claude"
+prompt_file = "../prompts/spec-review-soundness-refine.md"
+inputs = ["soundnessdraft"]
+[[workflows.nodes]]
+id = "synth"
+agent = "claude"
+prompt_file = "../prompts/spec-review-synth.md"
+inputs = ["rigor", "soundness"]
+
+[[workflows]]
+id = "plan-review"
+[[workflows.nodes]]
+id = "execdraft"
+agent = "codex"
+prompt_file = "../prompts/plan-review-exec.md"
+inputs = []
+[[workflows.nodes]]
+id = "coveragedraft"
+agent = "claude"
+prompt_file = "../prompts/plan-review-coverage.md"
+inputs = []
+[[workflows.nodes]]
+id = "exec"
+agent = "codex"
+prompt_file = "../prompts/plan-review-exec-refine.md"
+inputs = ["execdraft"]
+[[workflows.nodes]]
+id = "coverage"
+agent = "claude"
+prompt_file = "../prompts/plan-review-coverage-refine.md"
+inputs = ["coveragedraft"]
+[[workflows.nodes]]
+id = "synth"
+agent = "claude"
+prompt_file = "../prompts/plan-review-synth.md"
+inputs = ["exec", "coverage"]
+
+[[workflows]]
+id = "design"
+[[workflows.nodes]]
+id = "executabilitydraft"
+agent = "codex"
+prompt_file = "../prompts/design-executability.md"
+inputs = []
+[[workflows.nodes]]
+id = "structuredraft"
+agent = "claude"
+prompt_file = "../prompts/design-structure.md"
+inputs = []
+[[workflows.nodes]]
+id = "executability"
+agent = "codex"
+prompt_file = "../prompts/design-executability-refine.md"
+inputs = ["executabilitydraft"]
+[[workflows.nodes]]
+id = "structure"
+agent = "claude"
+prompt_file = "../prompts/design-structure-refine.md"
+inputs = ["structuredraft"]
+[[workflows.nodes]]
+id = "synth"
+agent = "claude"
+prompt_file = "../prompts/design-synth.md"
+inputs = ["executability", "structure"]
+
+# ── Single-agent auth smokes (one node, one agent) — the per-agent validation gates (Task 8) ──
+[[workflows]]
+id = "smoke-claude"
+[[workflows.nodes]]
+id = "go"
+agent = "claude"
+prompt_file = "../prompts/smoke-read.md"
+inputs = []
+
+[[workflows]]
+id = "smoke-codex"
+[[workflows.nodes]]
+id = "go"
+agent = "codex"
+prompt_file = "../prompts/smoke-read.md"
+inputs = []
+
+[[workflows]]
+id = "smoke-kiro"
+[[workflows.nodes]]
+id = "go"
+agent = "kiro"
+prompt_file = "../prompts/smoke-read.md"
+inputs = []
+
+[[workflows]]
+id = "smoke-ollama"
+[[workflows.nodes]]
+id = "go"
+agent = "ollama"
+prompt = "smoke-reply"
+inputs = []
+
+[[workflows]]
+id = "smoke-ollama-cloud"
+[[workflows.nodes]]
+id = "go"
+agent = "ollama-cloud"
+prompt = "smoke-reply"
+inputs = []
