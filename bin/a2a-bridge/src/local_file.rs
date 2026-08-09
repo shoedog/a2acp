@@ -465,6 +465,12 @@ pub(crate) struct PinnedDirectory {
     sync_failure_countdown: Arc<FailureCountdownV1>,
     #[cfg(test)]
     journal_publish_failure_countdown: Arc<FailureCountdownV1>,
+    /// 0 = disarmed; otherwise the [`fs_custody::PublicationRenameFaultV1`] to inject on the next
+    /// publication rename. A plain counter rather than a `FailureCountdownV1` because this seam
+    /// must state WHAT the filesystem did, not just that a call failed — an errno alone carries no
+    /// information about whether the rename took effect, which is the whole thing under test.
+    #[cfg(test)]
+    publication_rename_fault: Arc<std::sync::atomic::AtomicU8>,
 }
 
 #[derive(Clone, Copy)]
@@ -619,6 +625,8 @@ impl PinnedDirectory {
             sync_failure_countdown: Arc::new(FailureCountdownV1::new()),
             #[cfg(test)]
             journal_publish_failure_countdown: Arc::new(FailureCountdownV1::new()),
+            #[cfg(test)]
+            publication_rename_fault: Arc::new(std::sync::atomic::AtomicU8::new(0)),
         })
     }
 
@@ -678,6 +686,57 @@ impl PinnedDirectory {
     #[cfg(test)]
     fn journal_publish_failure_is_due(&self) -> bool {
         self.journal_publish_failure_countdown.fire_if_due()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_publication_rename_for_test(
+        &self,
+        shape: fs_custody::PublicationRenameFaultV1,
+    ) {
+        let encoded = match shape {
+            fs_custody::PublicationRenameFaultV1::BeforeEffect => 1,
+            fs_custody::PublicationRenameFaultV1::AfterEffect => 2,
+            fs_custody::PublicationRenameFaultV1::UnlinkSourceOnly => 3,
+        };
+        self.publication_rename_fault
+            .store(encoded, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Do what the armed fault says, then report a rename failure. Single-use: the fault disarms
+    /// itself so one armed shape cannot leak into an unrelated later publication.
+    #[cfg(all(test, unix))]
+    fn inject_publication_rename_for_test(
+        &self,
+        source: &RegularChildRef<'_>,
+        source_name: &std::ffi::CString,
+        target_name: &std::ffi::CString,
+    ) -> Option<Result<(), RenameNoReplaceRefusalV1>> {
+        let shape = match self
+            .publication_rename_fault
+            .swap(0, std::sync::atomic::Ordering::SeqCst)
+        {
+            2 => fs_custody::PublicationRenameFaultV1::AfterEffect,
+            3 => fs_custody::PublicationRenameFaultV1::UnlinkSourceOnly,
+            1 => fs_custody::PublicationRenameFaultV1::BeforeEffect,
+            _ => return None,
+        };
+        match shape {
+            fs_custody::PublicationRenameFaultV1::BeforeEffect => {}
+            fs_custody::PublicationRenameFaultV1::AfterEffect => {
+                if let Err(refusal) =
+                    fs_custody::rename_child_no_replace(&self.file, source_name, target_name)
+                {
+                    return Some(Err(refusal));
+                }
+            }
+            fs_custody::PublicationRenameFaultV1::UnlinkSourceOnly => {
+                self.remove_child(source.name, false, "injected publication rename fault")
+                    .expect("injected fault must be able to unlink the staged source");
+            }
+        }
+        Some(Err(RenameNoReplaceRefusalV1::Io(std::io::Error::other(
+            "injected publication rename failure for test",
+        ))))
     }
 
     pub(crate) fn retain_descriptor_after_exec(&self) -> bool {
@@ -1023,6 +1082,8 @@ impl PinnedDirectory {
                 sync_failure_countdown: Arc::new(FailureCountdownV1::new()),
                 #[cfg(test)]
                 journal_publish_failure_countdown: Arc::new(FailureCountdownV1::new()),
+                #[cfg(test)]
+                publication_rename_fault: Arc::new(std::sync::atomic::AtomicU8::new(0)),
             }))
         }
         #[cfg(not(unix))]
@@ -1112,6 +1173,8 @@ impl PinnedDirectory {
                 sync_failure_countdown: Arc::new(FailureCountdownV1::new()),
                 #[cfg(test)]
                 journal_publish_failure_countdown: Arc::new(FailureCountdownV1::new()),
+                #[cfg(test)]
+                publication_rename_fault: Arc::new(std::sync::atomic::AtomicU8::new(0)),
             })
         }
         #[cfg(not(unix))]
@@ -1337,6 +1400,23 @@ impl PinnedDirectory {
     /// directory. The target must be absent; callers serialize the check and rename under their
     /// owner lock. A directory-sync error is reported as an ambiguous publication so recovery can
     /// inspect the final name rather than retrying blindly.
+    ///
+    /// **Error semantics, after the no-replace errno classification round.** An `Err` from a
+    /// FAILED RENAME now means one of exactly two things, distinguished by the message: a true
+    /// refusal ("cannot atomically publish new regular child" — the rename provably did not
+    /// happen, including the ordinary `EEXIST` where another actor published first), or an
+    /// ambiguous publication ("publication renamed but its effect is ambiguous" — undecidable,
+    /// same handling rule as the directory-sync arm). A rename that took effect despite reporting
+    /// an error is NO LONGER an error: it continues to the sync and identity recheck and reports
+    /// whatever those find.
+    ///
+    /// KNOWN LIMITATION, deliberate and bounded: this signature is `Result<(), BoxError>`, so an
+    /// ambiguous publication can only be carried as an `Err` with distinguishing text. A caller
+    /// that branches solely on `is_err()` still cannot tell "not published" from "published,
+    /// durability unknown". The typed answer to that is
+    /// `bridge_core::fs_custody::CustodyPublicationV1`, which the custody primitives return;
+    /// giving this module the same type means deciding what the journal-append and cold-evidence
+    /// callers do with each arm, which is their subsystems' invariant to set, not this change's.
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn publish_new_regular_child(
         &self,
@@ -1387,8 +1467,64 @@ impl PinnedDirectory {
             }
             before_rename()?;
 
-            fs_custody::rename_child_no_replace(&self.file, &source_name, &target_c)
-                .map_err(|error| publication_rename_error(label, error))?;
+            // A failing no-replace rename does NOT prove nothing was published: on a network
+            // filesystem a retried RPC can perform the rename and then report a failure. Trusting
+            // the errno here is FAIL-OPEN — the caller is told the publication did not happen for
+            // one that did, and then abandons, retries, or quarantines on that answer. Classify by
+            // descriptor identity instead, through the same shared mechanism the custody
+            // primitives use (`fs_custody::classify_publication_rename_effect`).
+            //
+            // The ordinary `EEXIST` (another actor published into the target first) stays a true
+            // refusal with its existing message byte for byte: a refused rename leaves our staged
+            // source intact, which is exactly `NotRenamed`.
+            #[cfg(test)]
+            let renamed = self
+                .inject_publication_rename_for_test(&source, &source_name, &target_c)
+                .unwrap_or_else(|| {
+                    fs_custody::rename_child_no_replace(&self.file, &source_name, &target_c)
+                });
+            #[cfg(not(test))]
+            let renamed = fs_custody::rename_child_no_replace(&self.file, &source_name, &target_c);
+            if let Err(refusal) = renamed {
+                let error = match refusal {
+                    // Compile-arm only: nothing ran, so there is no effect to classify.
+                    RenameNoReplaceRefusalV1::PlatformUnsupported => {
+                        return Err(publication_rename_error(
+                            label,
+                            RenameNoReplaceRefusalV1::PlatformUnsupported,
+                        ))
+                    }
+                    RenameNoReplaceRefusalV1::Io(error) => error,
+                };
+                match fs_custody::classify_publication_rename_effect(
+                    &self.file,
+                    source.name,
+                    source.file,
+                    target_name,
+                ) {
+                    fs_custody::PublicationRenameEffectV1::NotRenamed => {
+                        return Err(publication_rename_error(
+                            label,
+                            RenameNoReplaceRefusalV1::Io(error),
+                        ))
+                    }
+                    // Published after all. Fall through to the ordinary post-publication path so
+                    // the directory sync and the target identity recheck still run.
+                    fs_custody::PublicationRenameEffectV1::Renamed => {}
+                    // Undecidable. Reported in this module's established AMBIGUOUS-publication
+                    // vocabulary — the contract this function already documents, and which the
+                    // directory-sync arm below has always used: inspect the final name, do not
+                    // retry blindly.
+                    fs_custody::PublicationRenameEffectV1::Unverified => {
+                        return Err(format!(
+                            "{label}: publication renamed but its effect is ambiguous: the rename \
+                             reported {error}, the staged source is not provably intact, and the \
+                             target is not provably the published object"
+                        )
+                        .into())
+                    }
+                }
+            }
             self.sync().map_err(|error| {
                 format!("{label}: publication renamed but directory sync is ambiguous: {error}")
             })?;
@@ -2266,6 +2402,107 @@ mod tests {
             fs::read(dir.path().join(quarantine_name)).unwrap(),
             b"replacement bytes"
         );
+    }
+
+    /// The FAIL-OPEN direction this round removes. A no-replace rename that took effect but
+    /// reported an error used to be reported as a failed publication; a caller that abandons,
+    /// retries, or quarantines on that answer is then acting on a file that exists.
+    ///
+    /// Discriminates trusting the errno instead of classifying by descriptor identity. Drives the
+    /// whole `PinnedDirectory` publication path, so it covers the wiring as well as the rule.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn a_publication_that_took_effect_despite_a_rename_error_is_reported_as_published() {
+        use std::io::Write as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let snapshot = snapshot_directory(dir.path(), "test publish root").unwrap();
+        let pin = PinnedDirectory::open(
+            dir.path(),
+            &snapshot.canonical_cwd,
+            &snapshot.identity,
+            "test publish root",
+        )
+        .unwrap();
+        let partial_name = OsStr::new("evidence.partial");
+        let final_name = OsStr::new("evidence.json");
+        let mut partial = pin
+            .create_new_file(partial_name, 0o600, "test partial")
+            .unwrap();
+        partial.write_all(b"published bytes").unwrap();
+        partial.sync_all().unwrap();
+        pin.fail_publication_rename_for_test(fs_custody::PublicationRenameFaultV1::AfterEffect);
+
+        pin.publish_new_regular_child(
+            RegularChildRef::new(partial_name, &partial),
+            final_name,
+            "test publication after effect",
+        )
+        .expect("a publication that took effect must not be reported as a failure");
+
+        assert_eq!(
+            fs::read(dir.path().join(final_name)).unwrap(),
+            b"published bytes"
+        );
+        assert!(!dir.path().join(partial_name).exists());
+    }
+
+    /// When the effect cannot be established, the answer must be the module's AMBIGUOUS
+    /// publication vocabulary — "inspect the final name, do not retry blindly" — and not the
+    /// true-refusal message, which would assert something unproven. The injected shape is the
+    /// adversarial one: the staged source is gone (so "nothing moved" is not provable) AND a
+    /// foreign object occupies the target (so "our publication landed" is not provable either).
+    ///
+    /// Discriminates a classifier that resolves an undecidable case toward either decisive
+    /// answer, and in particular one that reads a merely-present target as our own effect.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn a_publication_whose_rename_effect_is_unverifiable_reports_ambiguity_not_refusal() {
+        use std::io::Write as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let snapshot = snapshot_directory(dir.path(), "test publish root").unwrap();
+        let pin = PinnedDirectory::open(
+            dir.path(),
+            &snapshot.canonical_cwd,
+            &snapshot.identity,
+            "test publish root",
+        )
+        .unwrap();
+        let partial_name = OsStr::new("evidence.partial");
+        let final_name = OsStr::new("evidence.json");
+        let mut partial = pin
+            .create_new_file(partial_name, 0o600, "test partial")
+            .unwrap();
+        partial.write_all(b"ours").unwrap();
+        partial.sync_all().unwrap();
+        pin.fail_publication_rename_for_test(
+            fs_custody::PublicationRenameFaultV1::UnlinkSourceOnly,
+        );
+
+        let error = pin
+            .publish_new_regular_child_with_before_rename(
+                RegularChildRef::new(partial_name, &partial),
+                final_name,
+                "test publication unverifiable",
+                || {
+                    fs::write(dir.path().join(final_name), b"theirs")?;
+                    Ok(())
+                },
+            )
+            .unwrap_err();
+
+        let rendered = error.to_string();
+        assert!(
+            rendered.contains("publication renamed but its effect is ambiguous"),
+            "unexpected error: {rendered}"
+        );
+        assert!(
+            !rendered.contains("cannot atomically publish new regular child"),
+            "an undecidable outcome must not claim the publication provably did not happen: \
+             {rendered}"
+        );
+        assert_eq!(fs::read(dir.path().join(final_name)).unwrap(), b"theirs");
     }
 
     #[cfg(any(target_os = "macos", target_os = "linux"))]
