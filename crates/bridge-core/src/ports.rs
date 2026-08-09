@@ -148,6 +148,66 @@ impl BackendObservers {
     }
 }
 
+/// Why a caller is asking for its checkout to be preserved (R2f1b §5.1, slice 2c1).
+///
+/// Deliberately only the two triggers a *caller* can legitimately declare. The other four
+/// `PreservationReasonV1` values (`AmbiguousCleanup`, `MaterializationInFlight`,
+/// `PostConditionDisagreement`, `RemovalFailed`) are writer-internal conclusions about what the
+/// filesystem did, and a caller that could name them could durably assert a fact it never
+/// observed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CheckoutPreservationReasonV1 {
+    /// The owning node reached a failure terminal.
+    NodeFailure,
+    /// The run, node, or session was cancelled.
+    Cancellation,
+}
+
+/// What the preservation barrier did — the answer §5.1 step 7 requires ("Return `Preserved` /
+/// `Partial` / `Unknown`. Never call provider remove, reset, clean, checkout, or prune").
+///
+/// §5.1 step 5 — "mark the live lease transferred to recovery ownership" — is **not** performed by
+/// this slice and is not represented here. Recovery-lease acquisition and transfer is the
+/// claim-exchange mechanism, which §5.8 and the slice-2 split both assign to 2d; naming it as
+/// absent rather than leaving the gap silent, because a reader comparing this enum against §5.1's
+/// seven steps would otherwise have to guess whether step 5 was folded into step 4.
+///
+/// **No arm authorizes deletion, and there is deliberately no arm that could.** The exhaustive
+/// match in [`Self::is_protective`] mirrors `CustodySweepDispositionV1::authorizes_checkout_removal`
+/// and `CustodyRecordPresenceV1::authorizes_checkout_removal`: adding a permissive arm must be a
+/// decision, not an omission.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CheckoutPreservationV1 {
+    /// This backend has no custody-governed checkout for the session. The default answer, and the
+    /// truthful one for every backend that owns no checkout at all.
+    NoCheckoutUnderCustody,
+    /// A durable preserved claim exists. Terminal for R2f1b: only an R2f2 disposition releases it.
+    Preserved,
+    /// Durably typed as unknown. Protective, and never a licence to infer permission to delete.
+    Unknown(String),
+    /// The transition's outcome could not be determined (e.g. a rename committed but its parent
+    /// sync did not). The record on disk is protective in either direction — §5.7 "claim renamed,
+    /// parent sync ambiguous".
+    Ambiguous(String),
+    /// Nothing was published and the prior state stands (a contended cell, an unreadable record,
+    /// missing retained identities). Also protective.
+    Refused(String),
+}
+
+impl CheckoutPreservationV1 {
+    /// Every arm is protective; none licenses a removal. Exhaustive on purpose.
+    #[must_use]
+    pub fn is_protective(&self) -> bool {
+        match self {
+            Self::NoCheckoutUnderCustody
+            | Self::Preserved
+            | Self::Unknown(_)
+            | Self::Ambiguous(_)
+            | Self::Refused(_) => true,
+        }
+    }
+}
+
 /// Streaming agent backend — adapters implement this; core never depends on adapters.
 #[async_trait::async_trait]
 pub trait AgentBackend: Send + Sync {
@@ -264,6 +324,33 @@ pub trait AgentBackend: Send + Sync {
     ) -> Result<(), BridgeError> {
         self.release_session_checked(session).await
     }
+    /// R2f1b §5.1 step 6 — the PRESERVATION BARRIER. Durably preserve this session's
+    /// custody-governed checkout *before* any session or resource death signal.
+    ///
+    /// Callers on a non-success exit must invoke this **before** `cancel`/`cancel_observed` and
+    /// before any `forget_*`/`release_*`, because those are the death signal §5.1 orders it
+    /// against. Calling it late is not an error — it is idempotent and a later cleanup flight runs
+    /// the same barrier — but the ordering property is only the caller's to hold at the sites where
+    /// the caller signals first.
+    ///
+    /// **The default is a no-op answer, not a refusal, and that is a decision.** §5.4's refusing
+    /// defaults exist for methods whose silent absence would let an *effect* happen unguarded; this
+    /// method's absence produces no effect at all, and a backend that owns no checkout has nothing
+    /// to preserve, so `R2f1bUnsupported` would be a false alarm on 100+ implementations. The
+    /// hazard the default does carry is a *forwarding wrapper* that neither preserves nor
+    /// delegates: today `WorktreeBackend` is the outermost production decorator (the agent factory
+    /// wraps the inner backend with it and nothing wraps the result), so no production composition
+    /// can drop the call — a future wrapper placed OUTSIDE it must forward this method.
+    ///
+    /// No arm of [`CheckoutPreservationV1`] authorizes a removal.
+    async fn preserve_checkout_v1(
+        &self,
+        _session: &SessionId,
+        _reason: CheckoutPreservationReasonV1,
+    ) -> CheckoutPreservationV1 {
+        CheckoutPreservationV1::NoCheckoutUnderCustody
+    }
+
     /// Reconcile model/effort on a LIVE warm session (Slice 1). Default: NotAdvertised
     /// (non-ACP/non-process backends can't reconcile a live session). cwd/mode are NOT
     /// reconciled here (the caller routes those). [Slice 1]

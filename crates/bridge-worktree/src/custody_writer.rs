@@ -71,8 +71,9 @@
 //! call 3 = the terminal replace (`LiveProtected` / `PreservationUnknown`).
 
 use crate::custody::{
-    custody_record_path, ClaimPresenceV1, IdentityCompletenessV1, PreservationReasonV1,
-    PreservedWorktreeClaimV1, RecoveryLocatorV1, WorktreeCustodyRecordV1, WorktreeCustodyStateV1,
+    custody_record_path, read_custody_record_in, ClaimPresenceV1, CustodyReadRefusalV1,
+    IdentityCompletenessV1, PreservationReasonV1, PreservedWorktreeClaimV1, RecoveryLocatorV1,
+    WorktreeCustodyRecordV1, WorktreeCustodyStateKindV1, WorktreeCustodyStateV1,
     CUSTODY_RECORD_SUFFIX, WORKTREE_CUSTODY_RECORD_SCHEMA_V1,
 };
 use crate::custody_lock::{
@@ -112,6 +113,70 @@ pub enum CustodyWriteRefusalV1 {
 impl From<FsCustodyError> for CustodyWriteRefusalV1 {
     fn from(error: FsCustodyError) -> Self {
         Self::Failed(error.to_string())
+    }
+}
+
+/// What one `preserve_after_cancel` sequence settled on.
+///
+/// **No arm authorizes deletion, and the exhaustive [`Self::is_protective`] match is how a later
+/// arm is forced to be classified rather than defaulting into permissiveness** — the same
+/// discipline as `CustodySweepDispositionV1::authorizes_checkout_removal`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[must_use = "an unhandled preservation outcome hides an ambiguous or refused transition, and an \
+              ambiguous transition must never be read as a completed one"]
+pub enum PreservationOutcomeV1 {
+    /// A durable `Preserved` claim now exists. R2f1b-terminal.
+    Preserved,
+    /// A durable `PreservationUnknown { reason }` claim now exists. R2f1b-terminal.
+    PreservationUnknown(PreservationReasonV1),
+    /// The record was already `Preserved` when the barrier ran (§5.7's last row).
+    AlreadyPreserved,
+    /// The record was already `PreservationUnknown` when the barrier ran.
+    AlreadyUnknown,
+    /// A publication may or may not have taken effect. Both candidate states are protective;
+    /// nothing further was written (§5.7 "claim renamed, parent sync ambiguous").
+    Ambiguous(String),
+    /// Nothing was published; the prior state stands.
+    Refused(String),
+}
+
+impl PreservationOutcomeV1 {
+    /// Every arm is protective. There is no arm that permits provider removal, reset, clean,
+    /// checkout, or prune, and adding one must be a decision.
+    #[must_use]
+    pub fn is_protective(&self) -> bool {
+        match self {
+            Self::Preserved
+            | Self::PreservationUnknown(_)
+            | Self::AlreadyPreserved
+            | Self::AlreadyUnknown
+            | Self::Ambiguous(_)
+            | Self::Refused(_) => true,
+        }
+    }
+
+    /// Did this sequence leave an R2f1b-terminal preservation on disk?
+    #[must_use]
+    pub fn is_terminal_preservation(&self) -> bool {
+        matches!(
+            self,
+            Self::Preserved
+                | Self::PreservationUnknown(_)
+                | Self::AlreadyPreserved
+                | Self::AlreadyUnknown
+        )
+    }
+}
+
+impl From<CustodyWriteRefusalV1> for PreservationOutcomeV1 {
+    /// The ambiguity-discard hardening (2b1 opus S-7) at this slice's own call sites: the ONE
+    /// conversion from a write refusal to an outcome, so an `Ambiguous` write can never be folded
+    /// into a `Refused` ("nothing happened") answer by a caller writing its own match.
+    fn from(refusal: CustodyWriteRefusalV1) -> Self {
+        match refusal {
+            CustodyWriteRefusalV1::Ambiguous(detail) => Self::Ambiguous(detail),
+            other => Self::Refused(other.to_string()),
+        }
     }
 }
 
@@ -247,6 +312,13 @@ impl WorktreeCustodianV1 {
         &self.custody.plan.custody_id
     }
 
+    /// The binding this custodian was entered with, so a caller can retain exactly what a LATER
+    /// custodian must be re-entered with to publish a preservation over the same record.
+    #[must_use]
+    pub fn binding(&self) -> &BoundWorktreeCustodyV1 {
+        &self.custody
+    }
+
     #[must_use]
     pub fn worktree_path(&self) -> &str {
         &self.worktree_path
@@ -298,11 +370,11 @@ impl WorktreeCustodianV1 {
 
     /// Replace with `PreservationUnknown { reason }` and its required claim.
     ///
-    /// The only preservation transition this slice performs, and it is the one the add path
-    /// mandates: §5.7 row 4 ("during/after partial add, before live identity → report
-    /// preservation unknown; never delete target") and §5.1 ("if materialization is unresolved,
-    /// publish `PreservationUnknown{materialization_inflight}`"). Failure/cancel preservation —
-    /// `LiveProtected → PreservationPrepared → Preserved` — is 2c1's and is NOT implemented here.
+    /// §5.7 row 4 ("during/after partial add, before live identity → report preservation unknown;
+    /// never delete target") and §5.1 ("if materialization is unresolved, publish
+    /// `PreservationUnknown{materialization_inflight}`"). Slice 2c1 also reaches this from
+    /// [`Self::preserve_after_cancel`] when the claim cannot be minted over the retained
+    /// identities.
     pub fn replace_preservation_unknown(
         &self,
         reason: PreservationReasonV1,
@@ -310,7 +382,61 @@ impl WorktreeCustodianV1 {
         recovery_locator: RecoveryLocatorV1,
         created_wall_ms: i64,
     ) -> Result<(), CustodyWriteRefusalV1> {
-        let state = WorktreeCustodyStateV1::PreservationUnknown { reason };
+        self.replace_preserving_state(
+            WorktreeCustodyStateV1::PreservationUnknown { reason },
+            reason,
+            identities,
+            recovery_locator,
+            created_wall_ms,
+        )
+    }
+
+    /// Replace with `PreservationPrepared` and its required claim — §5.1 step 3.
+    ///
+    /// 2a's `claim_presence` makes the claim REQUIRED here, not optional: the design's step 3/4
+    /// split is about which *state* is durable, not about whether an artifact exists. That data is
+    /// built against, never re-derived (2a's docstring on `claim_presence`).
+    pub fn replace_preservation_prepared(
+        &self,
+        reason: PreservationReasonV1,
+        identities: &MaterializedIdentitiesV1,
+        recovery_locator: RecoveryLocatorV1,
+        created_wall_ms: i64,
+    ) -> Result<(), CustodyWriteRefusalV1> {
+        self.replace_preserving_state(
+            WorktreeCustodyStateV1::PreservationPrepared {},
+            reason,
+            identities,
+            recovery_locator,
+            created_wall_ms,
+        )
+    }
+
+    /// Replace with `Preserved` and its required claim — §5.1 step 4, R2f1b-terminal.
+    pub fn replace_preserved(
+        &self,
+        reason: PreservationReasonV1,
+        identities: &MaterializedIdentitiesV1,
+        recovery_locator: RecoveryLocatorV1,
+        created_wall_ms: i64,
+    ) -> Result<(), CustodyWriteRefusalV1> {
+        self.replace_preserving_state(
+            WorktreeCustodyStateV1::Preserved {},
+            reason,
+            identities,
+            recovery_locator,
+            created_wall_ms,
+        )
+    }
+
+    fn replace_preserving_state(
+        &self,
+        state: WorktreeCustodyStateV1,
+        reason: PreservationReasonV1,
+        identities: &MaterializedIdentitiesV1,
+        recovery_locator: RecoveryLocatorV1,
+        created_wall_ms: i64,
+    ) -> Result<(), CustodyWriteRefusalV1> {
         let claim = PreservedWorktreeClaimV1 {
             schema_version: WORKTREE_CUSTODY_RECORD_SCHEMA_V1,
             custody_id: self.custody.plan.custody_id.clone(),
@@ -329,6 +455,176 @@ impl WorktreeCustodianV1 {
         };
         let record = self.record(state, Some(identities.worktree.clone()), Some(claim))?;
         self.stage_and_settle(&record, PublicationModeV1::Replace)
+    }
+
+    /// The custody state currently on disk for this checkout, read under the held cells.
+    ///
+    /// `Ok(None)` means the record name is free. An unreadable or undecodable record is an `Err`,
+    /// never `None`: for a *transition* (unlike the deletion gate, whose discipline is
+    /// presence-not-content) the from-state has to be known, and guessing it is how an illegal
+    /// edge gets published over someone else's protection.
+    pub fn current_state_kind(
+        &self,
+    ) -> Result<Option<WorktreeCustodyStateKindV1>, CustodyReadRefusalV1> {
+        match self
+            .root
+            .child_entry_exists(&self.record_name, "custody record")
+        {
+            Ok(false) => return Ok(None),
+            Ok(true) => {}
+            Err(error) => return Err(CustodyReadRefusalV1::Unreadable(error.to_string())),
+        }
+        read_custody_record_in(&self.root, &self.record_name)
+            .map(|record| Some(record.state.kind()))
+    }
+
+    /// Re-observe the four object identities captured at materialization and compare them by
+    /// DESCRIPTOR (§2.2: "Identity is checked by descriptor, not by re-canonicalizing a string, at
+    /// every decision point").
+    ///
+    /// The comparison is on the observed `dev`/`ino`, and a degraded re-observation (the object is
+    /// gone, or cannot be opened no-follow) never matches a complete retained identity — so a
+    /// vanished object fails verification rather than silently passing as "same path".
+    #[must_use]
+    pub fn identities_reverify(retained: &MaterializedIdentitiesV1) -> bool {
+        [
+            &retained.source,
+            &retained.root,
+            &retained.worktree,
+            &retained.common_dir,
+        ]
+        .into_iter()
+        .all(|expected| {
+            let observed = observed_identity(&expected.canonical_path);
+            observed.directory_identity.dev.is_some()
+                && observed.directory_identity == expected.directory_identity
+        })
+    }
+
+    /// §5.1's `preserve_after_cancel`, steps 3–7, for one custody-governed checkout.
+    ///
+    /// The cells are already held (they are this custodian's), so step 1 is satisfied by
+    /// construction and step 2 — "close deletion admission" — is what holding the publication cell
+    /// with the writer's blocking acquirer *is*: every deletion-side caller takes the same cell
+    /// with the refusing acquirer and fails closed while we hold it.
+    ///
+    /// The sequence, and why each branch is where it is:
+    ///
+    /// 1. **Read the from-state.** Already `Preserved`/`PreservationUnknown` ⇒ return it unchanged:
+    ///    §5.7's last row ("crash after preserved terminal: no automatic provider replay; claim
+    ///    awaits R2f2"), and the transition table has no outgoing edge from either.
+    /// 2. **Reverify the retained identities BEFORE minting anything** (P7). A mismatch means the
+    ///    object graph is not the one we materialized, so no claim may assert it. The retained
+    ///    identities — what we *did* materialize, observed at materialization — are what gets
+    ///    recorded, and the state becomes `PreservationUnknown{AmbiguousCleanup}` instead of
+    ///    `Preserved`. The replacement's identity never enters any record.
+    /// 3. **`LiveProtected → PreservationPrepared → (Preserved | PreservationUnknown)`.** Never a
+    ///    direct `LiveProtected → PreservationUnknown`: 2a's frozen table has no such edge, and
+    ///    this slice adds none. A from-state that is ALREADY `PreservationPrepared` resumes at the
+    ///    terminal step — see the resume rule below.
+    /// 4. **Any ambiguous publication stops the sequence.** After an ambiguous replace the
+    ///    from-state is genuinely unknown (either the prior state or the new one), so a further
+    ///    replace could publish an illegal edge. Both candidates are protective — §5.7 "claim
+    ///    renamed, parent sync ambiguous: prior prepared state or ambiguous claim remains
+    ///    protective; report unknown" — so the answer is `Ambiguous`, and nothing else is written.
+    ///
+    /// # The `PreservationPrepared` resume rule (repair RA)
+    ///
+    /// A stranded `PreservationPrepared` record — the two-step's whole reason for existing — RESUMES
+    /// to its terminal state instead of being refused as "no legal edge". It is a legal from-state:
+    /// 2a's frozen table contains both `(PreservationPrepared, Preserved)` and
+    /// `(PreservationPrepared, PreservationUnknown)`, and before this repair those were the only two
+    /// edges in the table with no producer at all — the dead-wire-contract shape this slice refuses
+    /// elsewhere. It is also *reachable*, not hypothetical: a crash or an ambiguous outcome between
+    /// the two renames leaves exactly this state, and
+    /// `claim_renamed_with_ambiguous_parent_sync_stays_protective` manufactures it deliberately.
+    ///
+    /// The resume **re-derives `verified` from the live objects and does not trust the stranded
+    /// record's claim.** The stranded claim was minted at prepare time; anything could have happened
+    /// to the object graph since, including the substitution P7 exists to refuse. Re-reading its
+    /// identities would launder a stale assertion into a terminal one.
+    ///
+    /// The prepared re-publish is SKIPPED on resume, and that is not merely an optimization:
+    /// `PreservationPrepared → PreservationPrepared` is not an edge in the table, so republishing
+    /// would be a self-loop the frozen contract does not contain.
+    pub fn preserve_after_cancel(
+        &self,
+        reason: PreservationReasonV1,
+        retained: &MaterializedIdentitiesV1,
+        recovery_locator: RecoveryLocatorV1,
+        created_wall_ms: i64,
+    ) -> PreservationOutcomeV1 {
+        let from = match self.current_state_kind() {
+            Ok(Some(kind)) => kind,
+            Ok(None) => {
+                return PreservationOutcomeV1::Refused(
+                    "no custody record exists for this checkout".to_string(),
+                )
+            }
+            Err(error) => return PreservationOutcomeV1::Refused(error.to_string()),
+        };
+        let resuming = match from {
+            WorktreeCustodyStateKindV1::Preserved => {
+                return PreservationOutcomeV1::AlreadyPreserved
+            }
+            WorktreeCustodyStateKindV1::PreservationUnknown => {
+                return PreservationOutcomeV1::AlreadyUnknown
+            }
+            WorktreeCustodyStateKindV1::LiveProtected => false,
+            WorktreeCustodyStateKindV1::PreservationPrepared => true,
+            other => {
+                return PreservationOutcomeV1::Refused(format!(
+                    "no legal preservation edge from {}",
+                    other.wire_tag()
+                ))
+            }
+        };
+
+        let verified = Self::identities_reverify(retained);
+        let terminal_reason = if verified {
+            reason
+        } else {
+            PreservationReasonV1::AmbiguousCleanup
+        };
+        // LOCATOR DOWNGRADE (repair RB). The locator is materialization-time evidence, and the
+        // reverification that just failed is the only thing that could still vouch for it — the
+        // common dir is one of the four objects it checks, so a claim asserting
+        // `RegisteredWorktree` after a failed reverify would assert registration of an object graph
+        // we have just proved we cannot recognise. Applied to the PREPARED publication too, not
+        // only the terminal one: `verified` is known before either is written, so publishing a
+        // confident locator and then contradicting it one rename later would leave a crash window
+        // in which the durable record is more confident than the writer ever was.
+        let recovery_locator = if verified {
+            recovery_locator
+        } else {
+            RecoveryLocatorV1::RegistrationUnproven {}
+        };
+
+        if !resuming {
+            if let Err(error) = self.replace_preservation_prepared(
+                reason,
+                retained,
+                recovery_locator,
+                created_wall_ms,
+            ) {
+                return PreservationOutcomeV1::from(error);
+            }
+        }
+        let settled = if verified {
+            self.replace_preserved(reason, retained, recovery_locator, created_wall_ms)
+        } else {
+            self.replace_preservation_unknown(
+                terminal_reason,
+                retained,
+                recovery_locator,
+                created_wall_ms,
+            )
+        };
+        match settled {
+            Ok(()) if verified => PreservationOutcomeV1::Preserved,
+            Ok(()) => PreservationOutcomeV1::PreservationUnknown(terminal_reason),
+            Err(error) => PreservationOutcomeV1::from(error),
+        }
     }
 
     fn record(
@@ -1109,6 +1405,546 @@ mod tests {
                 "must not be recognised as residue: {bad}"
             );
         }
+    }
+
+    // ---- slice 2c1: fail-closed preservation (P1, P7, §5.7 rows 5 and 12) ----
+
+    /// Four FULLY OBSERVED identities. The shared `identities()` fixture leaves `common_dir`
+    /// plan-derived, which is legal for `LiveProtected` (only the envelope's `worktree` is checked
+    /// there) but is refused for every preserving state: 2a's `identity_completeness` requires
+    /// observed `dev`/`ino` on all four claim identities, and the writer is checked by the reader's
+    /// own rule. That refusal is correct and was the first thing these tests found.
+    fn complete_identities(worktree_root: &Path, target: &Path) -> MaterializedIdentitiesV1 {
+        let source = worktree_root.join("src");
+        let common = source.join(".git");
+        std::fs::create_dir_all(&common).unwrap();
+        MaterializedIdentitiesV1 {
+            source: observed_identity(&source.to_string_lossy()),
+            root: observed_identity(&worktree_root.to_string_lossy()),
+            worktree: observed_identity(&target.to_string_lossy()),
+            common_dir: observed_identity(&common.to_string_lossy()),
+        }
+    }
+
+    /// Drive a checkout to `LiveProtected` the way the writer really does, then hand back a FRESH
+    /// custodian so a preservation test starts its own fault countdown at 1.
+    fn live_protected(
+        worktree_root: &Path,
+        target: &Path,
+    ) -> (WorktreeCustodianV1, MaterializedIdentitiesV1) {
+        std::fs::create_dir_all(target).unwrap();
+        let bound = binding(target);
+        let custodian =
+            WorktreeCustodianV1::enter(worktree_root, &target.to_string_lossy(), bound.clone())
+                .unwrap();
+        custodian.publish_protection_prepared().unwrap();
+        custodian.replace_materializing().unwrap();
+        let identities = complete_identities(worktree_root, target);
+        custodian.replace_live_protected(&identities).unwrap();
+        drop(custodian);
+        let custodian =
+            WorktreeCustodianV1::enter(worktree_root, &target.to_string_lossy(), bound).unwrap();
+        (custodian, identities)
+    }
+
+    /// P1's headline: a live checkout settles `Preserved` with the claim R2f2 disposes of, and the
+    /// claim carries the trigger reason rather than a writer-chosen one.
+    ///
+    /// Discriminates a driver that settles `PreservationUnknown` for a perfectly verifiable
+    /// checkout (which would strand recoverable work in the unknown bucket) and one that publishes
+    /// a state carrying no claim.
+    #[test]
+    fn a_live_checkout_settles_preserved_with_its_required_claim() {
+        let worktree_root = root("preserve-live");
+        let target = worktree_root.join("ownr-run7-abc");
+        let (custodian, identities) = live_protected(&worktree_root, &target);
+
+        let outcome = custodian.preserve_after_cancel(
+            PreservationReasonV1::NodeFailure,
+            &identities,
+            RecoveryLocatorV1::RegisteredWorktree {},
+            1_700_000_000_000,
+        );
+
+        assert_eq!(outcome, PreservationOutcomeV1::Preserved);
+        assert!(outcome.is_protective());
+        assert_eq!(
+            record_state(&worktree_root, &target),
+            Some(WorktreeCustodyStateKindV1::Preserved)
+        );
+        let pinned = PinnedDirectoryV1::open(&worktree_root, "test").unwrap();
+        let name: OsString = Path::new(&custody_record_path(&target.to_string_lossy()))
+            .file_name()
+            .unwrap()
+            .to_os_string();
+        let record = read_custody_record_in(&pinned, &name).unwrap();
+        let claim = record.claim.clone().expect("Preserved requires a claim");
+        assert_eq!(claim.reason, PreservationReasonV1::NodeFailure);
+        assert_eq!(claim.source, identities.source);
+        assert_eq!(claim.common_dir, identities.common_dir);
+        assert!(!record.sweep_disposition().authorizes_checkout_removal());
+        drop(custodian);
+        std::fs::remove_dir_all(&worktree_root).unwrap();
+    }
+
+    /// The EDGE ORDER, pinned by injection rather than by reading the code: arm the SECOND rename
+    /// of the preservation sequence to fail before taking effect. If the driver publishes
+    /// `PreservationPrepared` first (§5.1 steps 3 then 4), rename 1 lands it and rename 2 — the
+    /// terminal replace — is the armed one, so the record is left `PreservationPrepared`.
+    ///
+    /// Discriminates a driver that shortcuts `LiveProtected -> Preserved`: rename 1 would then BE
+    /// the terminal publication and would succeed, leaving `preserved` on disk. It also
+    /// discriminates a driver that publishes an edge 2a's frozen table does not contain, since
+    /// `LiveProtected -> PreservationUnknown` is asserted illegal below.
+    #[test]
+    fn preservation_publishes_prepared_before_its_terminal_state() {
+        let worktree_root = root("preserve-edge-order");
+        let target = worktree_root.join("ownr-run7-abc");
+        let (custodian, identities) = live_protected(&worktree_root, &target);
+        custodian
+            .pinned_root()
+            .fail_publication_rename_on_nth_call_for_test(
+                2,
+                PublicationRenameFaultV1::BeforeEffect,
+            );
+
+        let outcome = custodian.preserve_after_cancel(
+            PreservationReasonV1::Cancellation,
+            &identities,
+            RecoveryLocatorV1::RegisteredWorktree {},
+            1_700_000_000_000,
+        );
+
+        assert!(
+            matches!(outcome, PreservationOutcomeV1::Refused(_)),
+            "a rename that provably did not happen is a refusal, not an ambiguity: {outcome:?}"
+        );
+        assert_eq!(
+            record_state(&worktree_root, &target),
+            Some(WorktreeCustodyStateKindV1::PreservationPrepared),
+            "rename 1 must have been the PreservationPrepared replace"
+        );
+        assert!(
+            !crate::custody::transition_is_legal(
+                WorktreeCustodyStateKindV1::LiveProtected,
+                WorktreeCustodyStateKindV1::PreservationUnknown
+            ),
+            "the shortcut this test forbids is not a legal edge either"
+        );
+        drop(custodian);
+        std::fs::remove_dir_all(&worktree_root).unwrap();
+    }
+
+    /// §5.7 row 5 — "claim renamed, parent sync ambiguous: prior prepared state or ambiguous claim
+    /// remains protective; report unknown."
+    ///
+    /// Discriminates a driver that reads a non-`Durable` publication as success and marches on to
+    /// the terminal replace (it would publish an edge from a state it cannot know it is in), and
+    /// one that reads it as "nothing happened" and reports a plain refusal while a claim is in
+    /// fact on disk.
+    #[test]
+    fn claim_renamed_with_ambiguous_parent_sync_stays_protective() {
+        let worktree_root = root("preserve-row5");
+        let target = worktree_root.join("ownr-run7-abc");
+        let (custodian, identities) = live_protected(&worktree_root, &target);
+        custodian.pinned_root().fail_sync_on_nth_call_for_test(1);
+
+        let outcome = custodian.preserve_after_cancel(
+            PreservationReasonV1::Cancellation,
+            &identities,
+            RecoveryLocatorV1::RegisteredWorktree {},
+            1_700_000_000_000,
+        );
+
+        assert!(
+            matches!(outcome, PreservationOutcomeV1::Ambiguous(_)),
+            "unexpected outcome: {outcome:?}"
+        );
+        assert!(outcome.is_protective());
+        assert!(
+            !outcome.is_terminal_preservation(),
+            "an ambiguous transition must not be projected as a settled preservation"
+        );
+        let state = record_state(&worktree_root, &target);
+        assert_eq!(
+            state,
+            Some(WorktreeCustodyStateKindV1::PreservationPrepared),
+            "the rename DID commit; the claim is on disk and protective"
+        );
+        assert!(!state
+            .expect("state read above")
+            .sweep_disposition()
+            .authorizes_checkout_removal());
+        drop(custodian);
+        std::fs::remove_dir_all(&worktree_root).unwrap();
+    }
+
+    /// §5.7 row 12 — "crash after preserved terminal: no automatic provider replay; claim awaits
+    /// R2f2." Re-running the barrier over a terminal record is a NO-OP, byte for byte.
+    ///
+    /// Discriminates a driver that re-publishes on every request: `Preserved` has no outgoing edge
+    /// in 2a's table, and a re-publication would both rewrite `created_wall_ms` (destroying the
+    /// only record of when the work was preserved) and re-run a rename over a settled claim.
+    #[test]
+    fn preserved_claim_awaits_r2f2_with_no_provider_replay() {
+        let worktree_root = root("preserve-row12");
+        let target = worktree_root.join("ownr-run7-abc");
+        let (custodian, identities) = live_protected(&worktree_root, &target);
+        custodian
+            .preserve_after_cancel(
+                PreservationReasonV1::NodeFailure,
+                &identities,
+                RecoveryLocatorV1::RegisteredWorktree {},
+                1_700_000_000_000,
+            )
+            .is_protective()
+            .then_some(())
+            .expect("the first preservation settles");
+        let settled = std::fs::read(custody_record_path(&target.to_string_lossy())).unwrap();
+
+        let again = custodian.preserve_after_cancel(
+            PreservationReasonV1::Cancellation,
+            &identities,
+            RecoveryLocatorV1::RegisteredWorktree {},
+            1_800_000_000_000,
+        );
+
+        assert_eq!(again, PreservationOutcomeV1::AlreadyPreserved);
+        assert!(again.is_terminal_preservation());
+        assert_eq!(
+            std::fs::read(custody_record_path(&target.to_string_lossy())).unwrap(),
+            settled,
+            "a terminal claim is not rewritten, so its wall clock and reason survive"
+        );
+        assert!(WorktreeCustodyStateKindV1::Preserved.is_terminal());
+        drop(custodian);
+        std::fs::remove_dir_all(&worktree_root).unwrap();
+    }
+
+    /// P7 (2b2 opus S-9 / sol S-3) — the RED case. Swap the source directory for a same-named
+    /// replacement after materialization: preservation must refuse to claim the replacement.
+    ///
+    /// Discriminates the shipped 2b2 behaviour exactly. Without retained identities the only thing
+    /// a claim could carry is a fresh `observed_identity(...)` of each path, which would happily
+    /// record the REPLACEMENT's `dev`/`ino` and assert it is the object this custody protected.
+    /// Here the claim must instead carry the retained identity and the state must be
+    /// `PreservationUnknown`, so an R2f2 consumer sees "we cannot vouch for this" rather than a
+    /// confident claim about the wrong object.
+    #[test]
+    fn preservation_refuses_to_claim_a_swapped_source_and_settles_protective() {
+        let worktree_root = root("preserve-swap");
+        let target = worktree_root.join("ownr-run7-abc");
+        let source = worktree_root.join("src");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::create_dir_all(&target).unwrap();
+        let bound = binding(&target);
+        let custodian =
+            WorktreeCustodianV1::enter(&worktree_root, &target.to_string_lossy(), bound.clone())
+                .unwrap();
+        custodian.publish_protection_prepared().unwrap();
+        custodian.replace_materializing().unwrap();
+        let common = worktree_root.join("common");
+        std::fs::create_dir_all(&common).unwrap();
+        let retained = MaterializedIdentitiesV1 {
+            source: observed_identity(&source.to_string_lossy()),
+            root: observed_identity(&worktree_root.to_string_lossy()),
+            worktree: observed_identity(&target.to_string_lossy()),
+            common_dir: observed_identity(&common.to_string_lossy()),
+        };
+        custodian.replace_live_protected(&retained).unwrap();
+        drop(custodian);
+        // Same NAME, different object — the substitution a path-based check cannot see.
+        std::fs::remove_dir_all(&source).unwrap();
+        std::fs::create_dir_all(&source).unwrap();
+        let replacement = observed_identity(&source.to_string_lossy());
+        assert_ne!(replacement, retained.source, "the swap must change dev/ino");
+        let custodian =
+            WorktreeCustodianV1::enter(&worktree_root, &target.to_string_lossy(), bound).unwrap();
+
+        let outcome = custodian.preserve_after_cancel(
+            PreservationReasonV1::NodeFailure,
+            &retained,
+            RecoveryLocatorV1::RegisteredWorktree {},
+            1_700_000_000_000,
+        );
+
+        assert_eq!(
+            outcome,
+            PreservationOutcomeV1::PreservationUnknown(PreservationReasonV1::AmbiguousCleanup)
+        );
+        assert_eq!(
+            record_state(&worktree_root, &target),
+            Some(WorktreeCustodyStateKindV1::PreservationUnknown)
+        );
+        let pinned = PinnedDirectoryV1::open(&worktree_root, "test").unwrap();
+        let name: OsString = Path::new(&custody_record_path(&target.to_string_lossy()))
+            .file_name()
+            .unwrap()
+            .to_os_string();
+        let claim = read_custody_record_in(&pinned, &name)
+            .unwrap()
+            .claim
+            .expect("PreservationUnknown requires a claim");
+        assert_eq!(
+            claim.source, retained.source,
+            "the claim records what we materialized, never the replacement"
+        );
+        assert_ne!(claim.source, replacement);
+        assert_eq!(
+            claim.recovery_locator,
+            RecoveryLocatorV1::RegistrationUnproven {},
+            "repair RB: a failed reverification must DOWNGRADE the locator — the caller passed \
+             `RegisteredWorktree`, and keeping it would durably assert registration of an object \
+             graph we just proved we cannot recognise"
+        );
+        drop(custodian);
+        std::fs::remove_dir_all(&worktree_root).unwrap();
+    }
+
+    /// Repair RB, the VANISH arm — the same downgrade when an object is gone rather than swapped.
+    ///
+    /// Split from the swap test deliberately: a swapped object still produces a complete
+    /// re-observation (it just names a different inode), while a vanished one produces the degraded
+    /// shape, and those travel different branches of `identities_reverify`. Both must downgrade.
+    #[test]
+    fn a_vanished_object_also_downgrades_the_claims_recovery_locator() {
+        let worktree_root = root("preserve-vanish-locator");
+        let target = worktree_root.join("ownr-run7-abc");
+        let (custodian, retained) = live_protected(&worktree_root, &target);
+        // The common dir is one of the four reverified objects, and it is exactly the object the
+        // locator makes a claim about.
+        std::fs::remove_dir_all(&retained.common_dir.canonical_path).unwrap();
+
+        let outcome = custodian.preserve_after_cancel(
+            PreservationReasonV1::Cancellation,
+            &retained,
+            RecoveryLocatorV1::RegisteredWorktree {},
+            1_700_000_000_000,
+        );
+
+        assert_eq!(
+            outcome,
+            PreservationOutcomeV1::PreservationUnknown(PreservationReasonV1::AmbiguousCleanup)
+        );
+        let pinned = PinnedDirectoryV1::open(&worktree_root, "test").unwrap();
+        let name: OsString = Path::new(&custody_record_path(&target.to_string_lossy()))
+            .file_name()
+            .unwrap()
+            .to_os_string();
+        let claim = read_custody_record_in(&pinned, &name)
+            .unwrap()
+            .claim
+            .expect("PreservationUnknown requires a claim");
+        assert_eq!(
+            claim.recovery_locator,
+            RecoveryLocatorV1::RegistrationUnproven {}
+        );
+        drop(custodian);
+        std::fs::remove_dir_all(&worktree_root).unwrap();
+    }
+
+    /// Strand a record in `PreservationPrepared` the way a crash between the two renames does:
+    /// let the prepared publication land and fail the terminal one before it takes effect.
+    fn stranded_prepared(
+        worktree_root: &Path,
+        target: &Path,
+    ) -> (WorktreeCustodianV1, MaterializedIdentitiesV1) {
+        let (custodian, identities) = live_protected(worktree_root, target);
+        custodian
+            .pinned_root()
+            .fail_publication_rename_on_nth_call_for_test(
+                2,
+                PublicationRenameFaultV1::BeforeEffect,
+            );
+        let stranded = custodian.preserve_after_cancel(
+            PreservationReasonV1::NodeFailure,
+            &identities,
+            RecoveryLocatorV1::RegisteredWorktree {},
+            1_700_000_000_000,
+        );
+        assert!(
+            matches!(stranded, PreservationOutcomeV1::Refused(_)),
+            "the setup must strand, not settle: {stranded:?}"
+        );
+        assert_eq!(
+            record_state(worktree_root, target),
+            Some(WorktreeCustodyStateKindV1::PreservationPrepared)
+        );
+        drop(custodian);
+        let custodian =
+            WorktreeCustodianV1::enter(worktree_root, &target.to_string_lossy(), binding(target))
+                .unwrap();
+        (custodian, identities)
+    }
+
+    /// Repair RA (opus W2 / sol B-1) — a stranded `PreservationPrepared` record RESUMES to its
+    /// terminal state, and resumes in ONE rename rather than re-publishing the prepared edge.
+    ///
+    /// The rename count is the discriminator, and it is why the fault is armed at call 2 rather
+    /// than call 1. A writer that resumes directly performs exactly one rename (the terminal
+    /// replace), so the armed call-2 fault never fires and the record settles `Preserved`. A writer
+    /// that re-publishes `PreservationPrepared` first performs two, so call 2 IS its terminal
+    /// replace, the fault fires, and the record is left stranded again — an infinite loop of
+    /// prepared re-publications, and a `PreservationPrepared -> PreservationPrepared` self-loop
+    /// that 2a's frozen table does not contain.
+    ///
+    /// Before this repair the barrier refused this state outright with "no legal preservation edge
+    /// from preservation_prepared", which both stranded the checkout permanently and left the two
+    /// real outgoing edges of the frozen table with zero producers.
+    #[test]
+    fn a_stranded_prepared_record_resumes_to_exactly_one_terminal_state() {
+        let worktree_root = root("preserve-resume");
+        let target = worktree_root.join("ownr-run7-abc");
+        let (custodian, identities) = stranded_prepared(&worktree_root, &target);
+        custodian
+            .pinned_root()
+            .fail_publication_rename_on_nth_call_for_test(
+                2,
+                PublicationRenameFaultV1::BeforeEffect,
+            );
+
+        let resumed = custodian.preserve_after_cancel(
+            PreservationReasonV1::NodeFailure,
+            &identities,
+            RecoveryLocatorV1::RegisteredWorktree {},
+            1_700_000_000_000,
+        );
+
+        assert_eq!(
+            resumed,
+            PreservationOutcomeV1::Preserved,
+            "the resume must settle, and in one rename: the call-2 fault must never fire"
+        );
+        assert_eq!(
+            record_state(&worktree_root, &target),
+            Some(WorktreeCustodyStateKindV1::Preserved)
+        );
+        assert!(crate::custody::transition_is_legal(
+            WorktreeCustodyStateKindV1::PreservationPrepared,
+            WorktreeCustodyStateKindV1::Preserved
+        ));
+        assert!(
+            !crate::custody::transition_is_legal(
+                WorktreeCustodyStateKindV1::PreservationPrepared,
+                WorktreeCustodyStateKindV1::PreservationPrepared
+            ),
+            "the edge a re-publishing resume would take does not exist"
+        );
+        drop(custodian);
+        std::fs::remove_dir_all(&worktree_root).unwrap();
+    }
+
+    /// Repair RA's second half: the resume RE-DERIVES `verified` from the live objects instead of
+    /// trusting the stranded record's claim.
+    ///
+    /// The stranded claim was minted while the object graph still verified. If the resume read its
+    /// identities back — the obvious shortcut, since the record is right there and already carries
+    /// a complete claim — a substitution performed after the strand would be laundered into a
+    /// confident terminal `Preserved` claim over the replacement. That is P7's hazard, reachable
+    /// through a path P7's own test does not cover.
+    #[test]
+    fn a_resume_reverifies_the_live_objects_and_never_trusts_the_stranded_claim() {
+        let worktree_root = root("preserve-resume-reverify");
+        let target = worktree_root.join("ownr-run7-abc");
+        let (custodian, identities) = stranded_prepared(&worktree_root, &target);
+        // The strand's claim already asserts these identities; swap one AFTER it was written.
+        let source = &identities.source.canonical_path;
+        std::fs::remove_dir_all(source).unwrap();
+        std::fs::create_dir_all(source).unwrap();
+
+        let resumed = custodian.preserve_after_cancel(
+            PreservationReasonV1::NodeFailure,
+            &identities,
+            RecoveryLocatorV1::RegisteredWorktree {},
+            1_700_000_000_000,
+        );
+
+        assert_eq!(
+            resumed,
+            PreservationOutcomeV1::PreservationUnknown(PreservationReasonV1::AmbiguousCleanup),
+            "the resume must reverify live objects, not read the stranded claim back"
+        );
+        let pinned = PinnedDirectoryV1::open(&worktree_root, "test").unwrap();
+        let name: OsString = Path::new(&custody_record_path(&target.to_string_lossy()))
+            .file_name()
+            .unwrap()
+            .to_os_string();
+        let claim = read_custody_record_in(&pinned, &name)
+            .unwrap()
+            .claim
+            .expect("PreservationUnknown requires a claim");
+        assert_eq!(
+            claim.source, identities.source,
+            "still never the replacement"
+        );
+        assert_eq!(
+            claim.recovery_locator,
+            RecoveryLocatorV1::RegistrationUnproven {}
+        );
+        drop(custodian);
+        std::fs::remove_dir_all(&worktree_root).unwrap();
+    }
+
+    /// The positive control for the reverification predicate itself: an untouched object graph
+    /// verifies, and a single swapped member is enough to fail it. Without this, the test above
+    /// could pass against a predicate that is simply always false.
+    #[test]
+    fn identity_reverification_passes_untouched_objects_and_fails_one_swap() {
+        let worktree_root = root("preserve-reverify");
+        let target = worktree_root.join("ownr-run7-abc");
+        std::fs::create_dir_all(&target).unwrap();
+        let retained = complete_identities(&worktree_root, &target);
+
+        assert!(WorktreeCustodianV1::identities_reverify(&retained));
+
+        std::fs::remove_dir_all(&target).unwrap();
+        std::fs::create_dir_all(&target).unwrap();
+        assert!(
+            !WorktreeCustodianV1::identities_reverify(&retained),
+            "a same-name replacement must not reverify"
+        );
+        std::fs::remove_dir_all(&target).unwrap();
+        assert!(
+            !WorktreeCustodianV1::identities_reverify(&retained),
+            "a VANISHED object must not reverify either: the degraded re-observation falls back \
+             to the plan-derived shape, which must never match a complete retained identity"
+        );
+        std::fs::remove_dir_all(&worktree_root).unwrap();
+    }
+
+    /// No preservation edge exists from `Materializing`, so the barrier refuses rather than
+    /// inventing one. Discriminates a driver that treats "any non-terminal record" as
+    /// preservable, which would publish an edge outside 2a's frozen table and make the
+    /// add-failure arm's `Materializing -> PreservationUnknown` race a second producer.
+    #[test]
+    fn preservation_refuses_a_from_state_with_no_legal_edge() {
+        let worktree_root = root("preserve-illegal-edge");
+        let target = worktree_root.join("ownr-run7-abc");
+        std::fs::create_dir_all(&target).unwrap();
+        let custodian =
+            WorktreeCustodianV1::enter(&worktree_root, &target.to_string_lossy(), binding(&target))
+                .unwrap();
+        custodian.publish_protection_prepared().unwrap();
+        custodian.replace_materializing().unwrap();
+
+        let outcome = custodian.preserve_after_cancel(
+            PreservationReasonV1::NodeFailure,
+            &complete_identities(&worktree_root, &target),
+            RecoveryLocatorV1::RegisteredWorktree {},
+            1_700_000_000_000,
+        );
+
+        assert!(
+            matches!(outcome, PreservationOutcomeV1::Refused(_)),
+            "unexpected outcome: {outcome:?}"
+        );
+        assert_eq!(
+            record_state(&worktree_root, &target),
+            Some(WorktreeCustodyStateKindV1::Materializing),
+            "a refused barrier writes nothing"
+        );
+        drop(custodian);
+        std::fs::remove_dir_all(&worktree_root).unwrap();
     }
 
     /// The names this writer really mints satisfy the tightened predicate. Without this, the

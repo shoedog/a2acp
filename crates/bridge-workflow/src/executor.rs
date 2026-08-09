@@ -30,9 +30,9 @@ use bridge_core::orch::UsageSnapshot;
 use bridge_core::permission::TurnMeta;
 use bridge_core::ports::{
     classify_failure, AgentBackend, AgentRegistry, BackendObservers, BoundEntryUseV1,
-    DiagnosticObserver, DiagnosticObserverFactory, FailureClass, ObsEvent, Observer, Resolved,
-    RichEventSinkFactory, TurnContext, TurnOutcome, Update, UsageFinalization,
-    STOP_REASON_CANCELLED,
+    CheckoutPreservationReasonV1, CheckoutPreservationV1, DiagnosticObserver,
+    DiagnosticObserverFactory, FailureClass, ObsEvent, Observer, Resolved, RichEventSinkFactory,
+    TurnContext, TurnOutcome, Update, UsageFinalization, STOP_REASON_CANCELLED,
 };
 use bridge_core::SessionCwd;
 use futures::stream::FuturesUnordered;
@@ -1036,6 +1036,102 @@ enum ColdCleanupAction {
     Release,
 }
 
+/// How a cold node/preflight attempt is leaving, as the checkout-disposition decision sees it.
+///
+/// **This enum IS the outcome→disposition selection (slice 2c1, repair RC).** Before it, only the
+/// four sites the brief enumerated raised `Preserve`; every other non-success cold teardown —
+/// configure failure, cancel-after-configure, attestation failure, prompt failure, stream failure,
+/// empty final, `Done(cancelled)` — reached `cleanup_cold_session` with the cell still at
+/// `Reclaim`, so the flight-side barrier no-opped.
+///
+/// **What that cost, stated precisely, because it is NOT a deletion hole.** The gate refused those
+/// removals anyway (the record's presence is what it keys on) and `WtState::Retained` refuses reuse,
+/// so no checkout was deleted and none was handed to a later session. What was lost is
+/// RECOVERY-EVIDENCE QUALITY: the checkout stayed `LiveProtected` forever with no
+/// `PreservedWorktreeClaimV1` beside it, so an R2f2 disposition would find work it cannot attribute
+/// to an execution, an attempt, a node, or a moment. Minting that claim on failure is this slice's
+/// charter, which is why the fix is in scope.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ColdExitV1 {
+    /// The attempt produced its result. **Not** a checkout disposition (§5.1): the checkout stays
+    /// `LiveProtected` under the workflow-level disposition flight that 2c2 owns.
+    Success,
+    /// Any non-success exit that is not a cancellation.
+    Failure,
+    /// The run, node, or session was cancelled.
+    Cancellation,
+}
+
+impl ColdExitV1 {
+    /// The one place an exit becomes a preservation reason. `Success` maps to nothing at all —
+    /// there is no "preserve on success" arm to add by accident.
+    fn preservation_reason(self) -> Option<CheckoutPreservationReasonV1> {
+        match self {
+            Self::Success => None,
+            Self::Failure => Some(CheckoutPreservationReasonV1::NodeFailure),
+            Self::Cancellation => Some(CheckoutPreservationReasonV1::Cancellation),
+        }
+    }
+}
+
+/// R2f1b §5.1 step 6 — the caller half of the preservation barrier (slice 2c1).
+///
+/// Every cold exit site calls this (directly, or through
+/// [`preserve_then_cleanup_cold_session`]) BEFORE its first session signal, because those signals
+/// are what §5.1 orders preservation against: "Only then may session cancel or a resource signal
+/// occur." Sites that issue a `cancel_observed` of their own call it explicitly, ahead of the
+/// cancel; sites whose only signal is the cleanup use the wrapper.
+///
+/// It is intentionally infallible from the caller's point of view. No arm of
+/// [`CheckoutPreservationV1`] authorizes a removal, so there is no branch here that could make the
+/// node's outcome worse; and a preservation that came back ambiguous or refused must not convert a
+/// node cancellation into a node failure, because the checkout is protected either way (the
+/// fail-closed deletion gate keys on the record's presence, not on this answer).
+async fn preserve_checkout_before_signal(
+    backend: &Arc<dyn AgentBackend>,
+    node: &NodeId,
+    session: &SessionId,
+    exit: ColdExitV1,
+) {
+    let Some(reason) = exit.preservation_reason() else {
+        return;
+    };
+    let outcome = backend.preserve_checkout_v1(session, reason).await;
+    debug_assert!(
+        outcome.is_protective(),
+        "no preservation outcome may license a removal"
+    );
+    match &outcome {
+        CheckoutPreservationV1::NoCheckoutUnderCustody => {}
+        settled => tracing::info!(
+            node = node.as_str(),
+            session = session.as_str(),
+            ?reason,
+            ?settled,
+            "R2f1b preservation barrier settled before the session teardown signal"
+        ),
+    }
+}
+
+/// `preserve_checkout_before_signal` immediately followed by `cleanup_cold_session`, for the sites
+/// whose FIRST session signal is the cleanup itself.
+///
+/// Every non-success cold teardown goes through here or through an explicit barrier call ahead of
+/// its own `cancel_observed`; the two are the same decision, differing only in where the site's
+/// first signal is.
+async fn preserve_then_cleanup_cold_session(
+    node: &NodeId,
+    backend: &Arc<dyn AgentBackend>,
+    session: &SessionId,
+    observer: &Arc<dyn DiagnosticObserver>,
+    action: ColdCleanupAction,
+    tracker: &WorkflowCleanupTracker,
+    exit: ColdExitV1,
+) -> Result<(), BridgeError> {
+    preserve_checkout_before_signal(backend, node, session, exit).await;
+    cleanup_cold_session(node, backend, session, observer, action, tracker).await
+}
+
 async fn cleanup_cold_session(
     node: &NodeId,
     backend: &Arc<dyn AgentBackend>,
@@ -1068,6 +1164,9 @@ async fn cancel_and_forget_preflight_session(
     observer: &Arc<dyn DiagnosticObserver>,
     tracker: &WorkflowCleanupTracker,
 ) {
+    // ENUMERATED BARRIER SITE (preflight). The preflight session is torn down with a cancel that
+    // precedes cleanup, so preservation goes ahead of the cancel, not inside the cleanup.
+    preserve_checkout_before_signal(backend, node, session, ColdExitV1::Cancellation).await;
     let _ = backend.cancel_observed(session, observer.clone()).await;
     let _ = cleanup_cold_session(
         node,
@@ -1774,26 +1873,30 @@ impl WorkflowExecutor {
             let configure_result = tokio::select! {
                 biased;
                 _ = cancel.cancelled() => {
-                    let _ = cleanup_cold_session(
+                    let _ = preserve_then_cleanup_cold_session(
                         &node.id,
                         attempt_use.backend(),
                         &session,
                         &diagnostic,
                         ColdCleanupAction::Forget,
                         cleanup_tracker,
+                        // R2f1b non-success cold exit (repair RC): preflight cancelled while its configure was in flight.
+                        ColdExitV1::Cancellation,
                     ).await;
                     return Err(PreflightFailure::Canceled);
                 }
                 result = attempt_use.configure_session(&session, ctx.session_cwd.clone()) => result,
             };
             if let Err(error) = configure_result {
-                let _ = cleanup_cold_session(
+                let _ = preserve_then_cleanup_cold_session(
                     &node.id,
                     attempt_use.backend(),
                     &session,
                     &diagnostic,
                     ColdCleanupAction::Forget,
                     cleanup_tracker,
+                    // R2f1b non-success cold exit (repair RC): preflight configure failed.
+                    ColdExitV1::Failure,
                 )
                 .await;
                 attempts.push(AttemptSummary {
@@ -1819,13 +1922,15 @@ impl WorkflowExecutor {
                 break;
             }
             if cancel.is_cancelled() {
-                let _ = cleanup_cold_session(
+                let _ = preserve_then_cleanup_cold_session(
                     &node.id,
                     attempt_use.backend(),
                     &session,
                     &diagnostic,
                     ColdCleanupAction::Forget,
                     cleanup_tracker,
+                    // R2f1b non-success cold exit (repair RC): preflight cancelled after configure.
+                    ColdExitV1::Cancellation,
                 )
                 .await;
                 return Err(PreflightFailure::Canceled);
@@ -1958,13 +2063,15 @@ impl WorkflowExecutor {
                         )
                         .await;
                     } else {
-                        let _ = cleanup_cold_session(
+                        let _ = preserve_then_cleanup_cold_session(
                             &node.id,
                             attempt_use.backend(),
                             &session,
                             &diagnostic,
                             ColdCleanupAction::Forget,
                             cleanup_tracker,
+                            // R2f1b non-success cold exit (repair RC): preflight prompt-open failed and the prompt was provably not accepted.
+                            ColdExitV1::Failure,
                         )
                         .await;
                     }
@@ -2051,6 +2158,11 @@ impl WorkflowExecutor {
                 }
             }
 
+            // The preflight verdict, computed BEFORE the teardown so the exit can be named
+            // (repair RC). Its fourth conjunct below — `cleanup_error.is_none()` — cannot be part
+            // of it, because that is the teardown's own result; a preflight that answered PONG and
+            // then failed its cleanup is a cleanup failure, not a checkout to preserve.
+            let preflight_ok = saw_done && reason.is_none() && is_exact_preflight_pong(&text);
             let cleanup_error = if replay_barrier {
                 cancel_and_forget_preflight_session(
                     &node.id,
@@ -2062,13 +2174,18 @@ impl WorkflowExecutor {
                 .await;
                 None
             } else {
-                cleanup_cold_session(
+                preserve_then_cleanup_cold_session(
                     &node.id,
                     attempt_use.backend(),
                     &session,
                     &diagnostic,
                     ColdCleanupAction::Forget,
                     cleanup_tracker,
+                    if preflight_ok {
+                        ColdExitV1::Success
+                    } else {
+                        ColdExitV1::Failure
+                    },
                 )
                 .await
                 .err()
@@ -3203,13 +3320,15 @@ impl WorkflowExecutor {
                             } else {
                                 ColdCleanupAction::Forget
                             };
-                            let cleanup_allows_retry = cleanup_cold_session(
+                            let cleanup_allows_retry = preserve_then_cleanup_cold_session(
                                 &node.id,
                                 attempt_use.backend(),
                                 &session,
                                 &diagnostic,
                                 action,
                                 cleanup_tracker,
+                                // R2f1b non-success cold exit (repair RC): configure failed transiently; the attempt will retry.
+                                ColdExitV1::Failure,
                             )
                             .await
                             .is_ok();
@@ -3220,13 +3339,15 @@ impl WorkflowExecutor {
                                 invalidation: attempt_use.into_retry_invalidation(&node.agent),
                             };
                         }
-                        let _ = cleanup_cold_session(
+                        let _ = preserve_then_cleanup_cold_session(
                             &node.id,
                             attempt_use.backend(),
                             &session,
                             &diagnostic,
                             ColdCleanupAction::Forget,
                             cleanup_tracker,
+                            // R2f1b non-success cold exit (repair RC): configure failed fatally.
+                            ColdExitV1::Failure,
                         )
                         .await;
                         break 'attempt Attempt::Fatal {
@@ -3237,13 +3358,15 @@ impl WorkflowExecutor {
                         };
                     }
                     if cancel.is_cancelled() {
-                        match cleanup_cold_session(
+                        match preserve_then_cleanup_cold_session(
                             &node.id,
                             attempt_use.backend(),
                             &session,
                             &diagnostic,
                             ColdCleanupAction::Forget,
                             cleanup_tracker,
+                            // R2f1b non-success cold exit (repair RC): cancelled after a successful configure, before the prompt.
+                            ColdExitV1::Cancellation,
                         )
                         .await
                         {
@@ -3286,13 +3409,15 @@ impl WorkflowExecutor {
                     ) {
                         Ok(request) => request,
                         Err(e) => {
-                            let _ = cleanup_cold_session(
+                            let _ = preserve_then_cleanup_cold_session(
                                 &node.id,
                                 attempt_use.backend(),
                                 &session,
                                 &diagnostic,
                                 ColdCleanupAction::Forget,
                                 cleanup_tracker,
+                                // R2f1b non-success cold exit (repair RC): the prefix-attestation request could not be built.
+                                ColdExitV1::Failure,
                             )
                             .await;
                             break 'attempt Attempt::Fatal {
@@ -3391,13 +3516,15 @@ impl WorkflowExecutor {
                                     } else {
                                         ColdCleanupAction::Forget
                                     };
-                                    let cleanup_allows_retry = cleanup_cold_session(
+                                    let cleanup_allows_retry = preserve_then_cleanup_cold_session(
                                         &node.id,
                                         attempt_use.backend(),
                                         &session,
                                         &diagnostic,
                                         action,
                                         cleanup_tracker,
+                                        // R2f1b non-success cold exit (repair RC): prompt failed transiently; the attempt will retry.
+                                        ColdExitV1::Failure,
                                     )
                                     .await
                                     .is_ok();
@@ -3409,13 +3536,15 @@ impl WorkflowExecutor {
                                             .into_retry_invalidation(&node.agent),
                                     };
                                 }
-                                let _ = cleanup_cold_session(
+                                let _ = preserve_then_cleanup_cold_session(
                                     &node.id,
                                     attempt_use.backend(),
                                     &session,
                                     &diagnostic,
                                     ColdCleanupAction::Forget,
                                     cleanup_tracker,
+                                    // R2f1b non-success cold exit (repair RC): prompt failed fatally.
+                                    ColdExitV1::Failure,
                                 )
                                 .await;
                                 break 'attempt Attempt::Fatal {
@@ -3442,6 +3571,14 @@ impl WorkflowExecutor {
                             // cancellation even while prompt-open is pending,
                             // then settle the session teardown before projecting
                             // a terminal outcome.
+                            // ENUMERATED BARRIER SITE (cold prompt-open cancellation).
+                            preserve_checkout_before_signal(
+                                attempt_use.backend(),
+                                &node.id,
+                                &session,
+                                ColdExitV1::Cancellation,
+                            )
+                            .await;
                             let cancel_error = attempt_use
                                 .backend()
                                 .cancel_observed(&session, diagnostic.clone())
@@ -3589,6 +3726,14 @@ impl WorkflowExecutor {
                         }
                     }
                     let cancel_error = if canceled_during_drain {
+                        // ENUMERATED BARRIER SITE (cold drain cancellation).
+                        preserve_checkout_before_signal(
+                            attempt_use.backend(),
+                            &node.id,
+                            &session,
+                            ColdExitV1::Cancellation,
+                        )
+                        .await;
                         attempt_use
                             .backend()
                             .cancel_observed(&session, diagnostic.clone())
@@ -3615,6 +3760,18 @@ impl WorkflowExecutor {
                                 );
                                 usage = None;
                             } else {
+                                // ENUMERATED BARRIER SITE (rich-flush failure). The one cold exit
+                                // that destroys the session with NO preceding `cancel_observed`,
+                                // so the flight's own barrier would be the first and only one —
+                                // and this is a node FAILURE, not a cancellation, which only the
+                                // caller knows.
+                                preserve_checkout_before_signal(
+                                    attempt_use.backend(),
+                                    &node.id,
+                                    &session,
+                                    ColdExitV1::Failure,
+                                )
+                                .await;
                                 let _ = cleanup_cold_session(
                                     &node.id,
                                     attempt_use.backend(),
@@ -3717,13 +3874,15 @@ impl WorkflowExecutor {
                             vec!["empty final agent message".to_string()],
                         )
                         .await;
-                        let _ = cleanup_cold_session(
+                        let _ = preserve_then_cleanup_cold_session(
                             &node.id,
                             attempt_use.backend(),
                             &session,
                             &diagnostic,
                             ColdCleanupAction::Forget,
                             cleanup_tracker,
+                            // R2f1b non-success cold exit (repair RC): the node produced an empty final message.
+                            ColdExitV1::Failure,
                         )
                         .await;
                         attempt_harvest = node_harvest_meta_from_context(
@@ -3742,13 +3901,15 @@ impl WorkflowExecutor {
                             } else {
                                 ColdCleanupAction::Forget
                             };
-                            let cleanup_allows_retry = cleanup_cold_session(
+                            let cleanup_allows_retry = preserve_then_cleanup_cold_session(
                                 &node.id,
                                 attempt_use.backend(),
                                 &session,
                                 &diagnostic,
                                 action,
                                 cleanup_tracker,
+                                // R2f1b non-success cold exit (repair RC): the stream failed transiently; the attempt will retry.
+                                ColdExitV1::Failure,
                             )
                             .await
                             .is_ok();
@@ -3760,13 +3921,15 @@ impl WorkflowExecutor {
                             };
                         }
                         let fc = classify_failure(&e);
-                        let _ = cleanup_cold_session(
+                        let _ = preserve_then_cleanup_cold_session(
                             &node.id,
                             attempt_use.backend(),
                             &session,
                             &diagnostic,
                             ColdCleanupAction::Forget,
                             cleanup_tracker,
+                            // R2f1b non-success cold exit (repair RC): the stream failed fatally.
+                            ColdExitV1::Failure,
                         )
                         .await;
                         let origin = if matches!(&e, BridgeError::AgentCrashed { .. }) {
@@ -3788,13 +3951,26 @@ impl WorkflowExecutor {
                             error: Some(e),
                         };
                     }
-                    let cleanup = cleanup_cold_session(
+                    // The one cold teardown SHARED by success and failure (repair RC), which is
+                    // why the exit is computed rather than named: `ok` distinguishes them, and
+                    // `done_stop_cancelled` further separates an agent-reported cancellation from
+                    // a stream failure. Success arms NOTHING — §5.1 keeps a node-local success out
+                    // of the checkout-disposition decision entirely.
+                    let exit = if ok {
+                        ColdExitV1::Success
+                    } else if done_stop_cancelled {
+                        ColdExitV1::Cancellation
+                    } else {
+                        ColdExitV1::Failure
+                    };
+                    let cleanup = preserve_then_cleanup_cold_session(
                         &node.id,
                         attempt_use.backend(),
                         &session,
                         &diagnostic,
                         ColdCleanupAction::Forget,
                         cleanup_tracker,
+                        exit,
                     )
                     .await;
                     if ok {
@@ -6241,6 +6417,12 @@ mod tests {
             usage: UsageSnapshot,
             usage_notify: Arc<tokio::sync::Notify>,
         },
+        /// `prompt` is entered and never yields a stream — the state the cold PROMPT-OPEN
+        /// cancellation site exists for. Nothing else in this harness can reach it, because every
+        /// other behaviour returns a stream immediately.
+        PromptOpenPending {
+            open_notify: Arc<tokio::sync::Notify>,
+        },
     }
 
     #[derive(Default)]
@@ -6253,6 +6435,12 @@ mod tests {
         forget_count: AtomicUsize,
         prompt_notify: tokio::sync::Notify,
         invalidate_notify: tokio::sync::Notify,
+        /// The ORDER in which this backend saw the R2f1b preservation barrier and each session
+        /// death signal — the slice-2c1 witness at the executor's own call sites.
+        order: Mutex<Vec<&'static str>>,
+        /// Fires once a hanging prompt has been entered, so a test can cancel at the exact point
+        /// the enumerated site is reachable.
+        prompt_open_notify: Arc<tokio::sync::Notify>,
     }
 
     struct RetryBackend {
@@ -6320,11 +6508,26 @@ mod tests {
                         .chain(futures::stream::pending()),
                     ))
                 }
+                RetryBehavior::PromptOpenPending { open_notify } => {
+                    open_notify.notify_waiters();
+                    std::future::pending::<()>().await;
+                    unreachable!("a pending prompt-open never returns")
+                }
             }
         }
 
         async fn cancel(&self, _s: &SessionId) -> Result<(), BridgeError> {
+            self.rec.order.lock().unwrap().push("cancel");
             Ok(())
+        }
+
+        async fn preserve_checkout_v1(
+            &self,
+            _s: &SessionId,
+            _reason: CheckoutPreservationReasonV1,
+        ) -> CheckoutPreservationV1 {
+            self.rec.order.lock().unwrap().push("preserve");
+            CheckoutPreservationV1::Preserved
         }
 
         async fn configure_session(
@@ -6344,16 +6547,315 @@ mod tests {
 
         async fn forget_session(&self, _s: &SessionId) {
             self.rec.forget_count.fetch_add(1, Ordering::SeqCst);
+            self.rec.order.lock().unwrap().push("forget");
         }
 
         async fn release_session(&self, _s: &SessionId) {
             self.rec.release_count.fetch_add(1, Ordering::SeqCst);
+            self.rec.order.lock().unwrap().push("release");
         }
     }
 
     struct RetryRegistry {
         behavior: RetryBehavior,
         rec: Arc<RetryRec>,
+    }
+
+    // ---- slice 2c1: §5.1 step 6 barrier placement (R-8) --------------------------------------
+
+    /// `preservation_precedes_cancel_observed_at_every_enumerated_entry`, part 1 of 4 —
+    /// the PREFLIGHT entry of the R-11 fan-in.
+    ///
+    /// Every one of these four tests asserts the same shape: the backend saw `preserve` BEFORE it
+    /// saw the death signal that follows it at that site. Each drives the real executor code path,
+    /// not a helper, because the property R-8 states is about where the call sits relative to
+    /// `cancel_observed` — which is exactly what a helper-level test cannot observe.
+    ///
+    /// Discriminates the "put the barrier inside `run_cleanup_flight`" design R-8 rejects: with
+    /// that placement the recorded order at every one of these sites is cancel-then-preserve, or
+    /// forget-then-preserve, i.e. the preservation happens after the signal it must precede.
+    #[tokio::test]
+    async fn preservation_precedes_cancel_observed_at_the_preflight_entry() {
+        let rec = Arc::new(RetryRec::default());
+        let backend: Arc<dyn AgentBackend> = Arc::new(RetryBackend {
+            behavior: RetryBehavior::NonTransientPrompt,
+            generation: 0,
+            rec: rec.clone(),
+        });
+        let observer: Arc<dyn DiagnosticObserver> =
+            Arc::new(bridge_core::diagnostics::NoopDiagnosticObserver::default());
+        let node = NodeId::parse("preflight-node").unwrap();
+        let session = SessionId::parse("preflight-session").unwrap();
+        let tracker = WorkflowCleanupTracker::default();
+
+        cancel_and_forget_preflight_session(&node, &backend, &session, &observer, &tracker).await;
+
+        assert_eq!(
+            rec.order.lock().unwrap().as_slice(),
+            ["preserve", "cancel", "forget"],
+            "the preflight teardown must preserve before it cancels"
+        );
+    }
+
+    /// Part 2 of 4 — the cold PROMPT-OPEN cancellation site (`executor.rs`, the `cancel.cancelled()`
+    /// arm of the prompt-open `select!`). The prompt is entered and never yields a stream, which is
+    /// the only state that reaches this arm.
+    #[tokio::test]
+    async fn preservation_precedes_cancel_observed_at_the_cold_prompt_open_cancellation() {
+        let rec = Arc::new(RetryRec::default());
+        let cancel = CancellationToken::new();
+        let open_notify = rec.prompt_open_notify.clone();
+        let run = tokio::spawn(run_retry_case(
+            RetryBehavior::PromptOpenPending {
+                open_notify: open_notify.clone(),
+            },
+            None,
+            cancel.clone(),
+            rec.clone(),
+        ));
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), open_notify.notified())
+            .await
+            .expect("the prompt must be entered before we cancel");
+        cancel.cancel();
+        let events = tokio::time::timeout(std::time::Duration::from_secs(2), run)
+            .await
+            .expect("prompt-open cancellation must settle promptly")
+            .unwrap();
+
+        let (ok, output, _usage) = only_node_finished(&events);
+        assert!(!*ok);
+        assert_eq!(output, "[node only canceled]");
+        assert_eq!(
+            rec.order.lock().unwrap().as_slice(),
+            ["preserve", "cancel", "forget"],
+            "prompt-open cancellation must preserve before it cancels"
+        );
+    }
+
+    /// Part 3 of 4 — the cold DRAIN cancellation site. The stream yields once and then hangs, so
+    /// the cancel lands inside the drain loop rather than at prompt-open.
+    #[tokio::test]
+    async fn preservation_precedes_cancel_observed_at_the_cold_drain_cancellation() {
+        let rec = Arc::new(RetryRec::default());
+        let cancel = CancellationToken::new();
+        let usage_notify = Arc::new(tokio::sync::Notify::new());
+        let run = tokio::spawn(run_retry_case(
+            RetryBehavior::UsageThenPending {
+                usage: usage(616),
+                usage_notify: usage_notify.clone(),
+            },
+            None,
+            cancel.clone(),
+            rec.clone(),
+        ));
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), usage_notify.notified())
+            .await
+            .expect("backend should emit usage before hanging");
+        cancel.cancel();
+        let events = tokio::time::timeout(std::time::Duration::from_secs(2), run)
+            .await
+            .expect("drain cancellation must settle promptly")
+            .unwrap();
+
+        let (ok, _output, _usage) = only_node_finished(&events);
+        assert!(!*ok);
+        assert_eq!(
+            rec.order.lock().unwrap().as_slice(),
+            ["preserve", "cancel", "forget"],
+            "drain cancellation must preserve before it cancels"
+        );
+    }
+
+    /// Part 4 of 4 — the RICH-FLUSH FAILURE destroy site, the one cold exit with NO preceding
+    /// `cancel_observed` at all. Its death signal is the cold cleanup itself, so the recorded
+    /// order is preserve-then-forget with no cancel between them, and a barrier that only ever
+    /// ran "before `cancel_observed`" would never run here.
+    ///
+    /// It is also the only enumerated site whose trigger is a node FAILURE rather than a
+    /// cancellation, which is why the reason cannot be inferred inside the backend.
+    #[tokio::test]
+    async fn preservation_precedes_the_teardown_at_the_cold_rich_flush_failure_site() {
+        let rec = Arc::new(RetryRec::default());
+        let rich_sink = Arc::new(FailingRichSink::default());
+        let context = WorkflowRunContext {
+            make_rich_sink: Some(Arc::new(FailingRichFactory {
+                sink: rich_sink.clone(),
+            })),
+            ..WorkflowRunContext::default()
+        };
+        let ex = WorkflowExecutor::new(Arc::new(RetryRegistry {
+            behavior: RetryBehavior::SucceedsAfterInvalidates {
+                required_invalidates: 0,
+            },
+            rec: rec.clone(),
+        }));
+
+        let events: Vec<_> = ex
+            .run_with_context(
+                retry_graph(None),
+                "DIFF".into(),
+                "run1".into(),
+                CancellationToken::new(),
+                context,
+            )
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .map(|r| r.unwrap())
+            .collect();
+
+        let (ok, output, _usage) = only_node_finished(&events);
+        assert!(!*ok);
+        assert!(
+            output.contains("rich-flush failed"),
+            "this test must land on the rich-flush arm, got {output}"
+        );
+        assert_eq!(rich_sink.flushes.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            rec.order.lock().unwrap().as_slice(),
+            ["preserve", "forget"],
+            "the no-cancel destroy site must still preserve before it tears the session down"
+        );
+    }
+
+    /// Repair RC — the outcome→disposition mapping ITSELF, as a table. This is the centralization
+    /// point the repair exists to create: one enum, one `preservation_reason`, and every cold exit
+    /// site names its variant instead of each site deciding for itself.
+    ///
+    /// `Success => None` is the assertion that matters most. A "preserve on success" arm would
+    /// terminalize a healthy node's checkout and take the disposition decision away from the
+    /// workflow-level owner (2c2), which is precisely what §5.1 reserves.
+    #[test]
+    fn the_cold_exit_disposition_mapping_preserves_only_non_success_exits() {
+        assert_eq!(ColdExitV1::Success.preservation_reason(), None);
+        assert_eq!(
+            ColdExitV1::Failure.preservation_reason(),
+            Some(CheckoutPreservationReasonV1::NodeFailure)
+        );
+        assert_eq!(
+            ColdExitV1::Cancellation.preservation_reason(),
+            Some(CheckoutPreservationReasonV1::Cancellation)
+        );
+    }
+
+    /// Repair RC, family 1 of 3 — CONFIGURE FAILURE. A non-transient configure error breaks the
+    /// attempt fatally, and its only session signal is the cold cleanup, so preservation must
+    /// precede that cleanup.
+    ///
+    /// Before this repair the site reached `cleanup_cold_session` with the cell at `Reclaim`, so
+    /// the flight-side barrier no-opped and the checkout was retained as `LiveProtected` with no
+    /// claim beside it — recoverable work an R2f2 disposition could not attribute to anything.
+    #[tokio::test]
+    async fn preservation_precedes_the_teardown_at_the_configure_failure_exit() {
+        let rec = Arc::new(RetryRec::default());
+
+        let events = run_retry_case(
+            RetryBehavior::ConfigInvalid,
+            None,
+            CancellationToken::new(),
+            rec.clone(),
+        )
+        .await;
+
+        let (ok, _output, _usage) = only_node_finished(&events);
+        assert!(!*ok);
+        assert_eq!(
+            rec.order.lock().unwrap().as_slice(),
+            ["preserve", "forget"],
+            "a configure failure must preserve before its cold teardown"
+        );
+    }
+
+    /// Repair RC, family 2 of 3 — PROMPT FAILURE (non-transient, no retry policy).
+    #[tokio::test]
+    async fn preservation_precedes_the_teardown_at_the_prompt_failure_exit() {
+        let rec = Arc::new(RetryRec::default());
+
+        let events = run_retry_case(
+            RetryBehavior::NonTransientPrompt,
+            None,
+            CancellationToken::new(),
+            rec.clone(),
+        )
+        .await;
+
+        let (ok, _output, _usage) = only_node_finished(&events);
+        assert!(!*ok);
+        assert_eq!(
+            rec.order.lock().unwrap().as_slice(),
+            ["preserve", "forget"],
+            "a prompt failure must preserve before its cold teardown"
+        );
+    }
+
+    /// Repair RC, family 3 of 3 — TRANSIENT failure with retries. Every attempt's teardown is a
+    /// non-success exit, so every one of them preserves first; the interleaving is what the
+    /// exact-sequence assertion pins.
+    ///
+    /// This family also covers the `cleanup_allows_retry` sites specifically, which are the ones
+    /// whose result feeds the NEXT attempt's admission — a barrier that failed the cleanup, or ran
+    /// after it, would change retry behaviour rather than merely losing evidence.
+    #[tokio::test]
+    async fn preservation_precedes_every_transient_attempts_teardown() {
+        let rec = Arc::new(RetryRec::default());
+
+        let events = run_retry_case(
+            RetryBehavior::AlwaysTimedOutWithUsage {
+                final_generation: usize::MAX,
+                first_usage: usage(444),
+                final_usage: usage(555),
+            },
+            Some(retry_policy(2, 1)),
+            CancellationToken::new(),
+            rec.clone(),
+        )
+        .await;
+
+        let (ok, _output, _usage) = only_node_finished(&events);
+        assert!(!*ok);
+        let order = rec.order.lock().unwrap().clone();
+        assert!(
+            !order.is_empty() && order.len() % 2 == 0,
+            "each attempt contributes a preserve and a teardown: {order:?}"
+        );
+        for pair in order.chunks(2) {
+            assert_eq!(
+                pair[0], "preserve",
+                "every attempt's teardown must be preceded by a preservation: {order:?}"
+            );
+            assert!(
+                pair[1] == "forget" || pair[1] == "release",
+                "unexpected signal in {order:?}"
+            );
+        }
+    }
+
+    /// The CONTROL for all four: a node that finishes normally must NOT invoke the barrier.
+    /// §5.1 is explicit that a node-local success is not a checkout disposition, so a barrier that
+    /// fired on every exit would terminalize live checkouts that the workflow-level disposition
+    /// (2c2) is entitled to reclaim.
+    #[tokio::test]
+    async fn a_normal_node_exit_never_invokes_the_preservation_barrier() {
+        let rec = Arc::new(RetryRec::default());
+
+        let events = run_retry_case(
+            RetryBehavior::SucceedsAfterInvalidates {
+                required_invalidates: 0,
+            },
+            None,
+            CancellationToken::new(),
+            rec.clone(),
+        )
+        .await;
+
+        let (ok, _output, _usage) = only_node_finished(&events);
+        assert!(*ok);
+        assert!(
+            !rec.order.lock().unwrap().contains(&"preserve"),
+            "a successful node must not request preservation"
+        );
     }
 
     #[async_trait::async_trait]

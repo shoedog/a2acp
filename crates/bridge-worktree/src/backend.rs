@@ -3,7 +3,7 @@ use crate::custody::{
 };
 use crate::custody_writer::{
     observed_identity, planned_identity, CustodyWriteRefusalV1, MaterializedIdentitiesV1,
-    WorktreeCustodianV1,
+    PreservationOutcomeV1, WorktreeCustodianV1,
 };
 use crate::provider::{CustodyAddOutcomeV1, CustodyAddTargetV1, WorktreeProvider};
 use crate::provider_path::{
@@ -17,7 +17,8 @@ use bridge_core::ids::SessionId;
 use bridge_core::orch::{AgentSessionCaps, ReconcileOutcome};
 use bridge_core::permission::TurnMeta;
 use bridge_core::ports::{
-    AgentBackend, BackendObservers, BackendStream, DiagnosticObserver, RichEventSink,
+    AgentBackend, BackendObservers, BackendStream, CheckoutPreservationReasonV1,
+    CheckoutPreservationV1, DiagnosticObserver, RichEventSink,
 };
 use bridge_core::terminal_evidence::{AcpChildLiveness, EvidenceCapability};
 use bridge_core::SessionCwd;
@@ -46,6 +47,55 @@ enum WtState {
         entry: WtEntry,
     },
     Ready(WtEntry),
+    /// The checkout is RETAINED under R2f1b custody: a cleanup refused to remove it, or the
+    /// preservation barrier settled a terminal claim over it. This state exists for two reasons,
+    /// both of them ledger obligations 2b1 deferred here (slice 2c1).
+    ///
+    /// **Ownership retention through refusal (2b1 sol-2 / D-2).** `entry_for_cleanup` POPS a
+    /// `Reserving` entry before the gate runs, so a refused rollback used to lose its last
+    /// in-memory owner while the checkout persisted: the cleanup cell is then evicted by the
+    /// reporter (a refusal reports `Ok`), `state.entry` dies with it, and a later cleanup finds
+    /// nothing to remove — ever. Re-inserting here keeps exactly one owner, so once protection
+    /// lifts the next cleanup reaches exactly one provider removal.
+    ///
+    /// **Ready-means-reusable (2b1 opus S-3).** Re-inserting a refused reservation as `Ready` was
+    /// explicitly rejected in 2b1 because `configure_session`'s `Ready` arm hands the checkout to
+    /// the next session after validating only `canonical_source` — which would hand a checkout
+    /// awaiting R2f2 disposition to a new session and let it write over preserved work. `Retained`
+    /// is not reusable, and both configure entry points refuse it by name.
+    Retained {
+        entry: WtEntry,
+        retention: CheckoutRetentionV1,
+    },
+}
+
+/// Why a checkout is retained rather than removed. Reported, not collapsed to a bool, because a
+/// live-but-protected checkout and a terminally-preserved one have different R2f1b futures: the
+/// first is released by 2c2's deletion authority on a healthy workflow outcome, the second only by
+/// an R2f2 disposition.
+///
+/// `Ord` is the "keep the strongest knowledge" rule used by [`WorktreeBackend::retain_refused_entry`],
+/// in increasing order of how settled the disposition is. It is monotonic and cannot mislabel in
+/// practice: `Preserved` and `PreservationUnknown` are both R2f1b-terminal and neither has an
+/// outgoing edge, so a checkout can never legitimately move down this order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum CheckoutRetentionV1 {
+    /// The deletion gate refused on custody evidence; no preservation claim was minted here.
+    RefusedUnderCustody,
+    /// A preservation transition returned AMBIGUOUS: the record on disk is protective either way,
+    /// but which of the two states it holds is unknown to this process.
+    ///
+    /// **Named separately from `PreservationUnknown` (repair RE-6), because they are not the same
+    /// disk state.** After an ambiguous *prepared* publication the record says
+    /// `PreservationPrepared`, not `PreservationUnknown`, so labelling it the latter asserted a
+    /// terminal state that is not there. It is also no longer a dead end: with repair RA a later
+    /// barrier RESUMES a stranded `PreservationPrepared` to its terminal state, which is exactly
+    /// why this arm must be distinguishable from one that is already terminal.
+    PreservationAmbiguous,
+    /// A durable `PreservationUnknown` claim exists. Terminal for R2f1b.
+    PreservationUnknown,
+    /// A durable `Preserved` claim exists. Terminal for R2f1b.
+    Preserved,
 }
 
 #[derive(Clone)]
@@ -53,6 +103,40 @@ struct WtEntry {
     canonical_source: String,
     worktree_path: String,
     custody: WtCustodyV1,
+    /// The materialization-time evidence a preservation claim is minted from (slice 2c1, P7).
+    ///
+    /// **Deliberately a separate field from `custody`, not a payload on
+    /// [`WtCustodyV1::Protected`].** The two answer different questions and are genuinely
+    /// independent: `custody` is the AUTHORITY question the deletion gate asks ("may this be
+    /// deleted?") and must be answerable when no evidence was ever captured, while this is the
+    /// EVIDENCE question the preservation barrier asks ("can a truthful claim be minted?"). Fusing
+    /// them would make "protected, but its identities were never captured" unrepresentable — and
+    /// that state is real, it is exactly what 2b1's
+    /// `the_discriminator_alone_refuses_deletion_with_no_record_on_disk` exercises, and the
+    /// fail-closed answer there is *refuse the deletion AND refuse to mint a claim*, not one or
+    /// the other.
+    protection: Option<Box<ProtectedCheckoutV1>>,
+}
+
+/// Everything a later preservation transition needs, captured at materialization under the custody
+/// cell and retained for the checkout's lifetime (2b2 opus S-9 / sol S-3).
+///
+/// The 2b2 writer observed all four object identities by descriptor to publish `LiveProtected` —
+/// and then discarded them, because `LiveProtected` FORBIDS a claim. At preservation time the
+/// objects can no longer be trusted to be the same ones, so re-observing them is not a
+/// substitute: it would mint a claim over whatever now occupies those paths.
+#[derive(Clone, Debug)]
+struct ProtectedCheckoutV1 {
+    /// The binding the custodian re-enters with: it carries the custody id (the cell key), the
+    /// attempt identity, the node ref, and the frozen plan the claim repeats.
+    binding: bridge_core::execution_policy::BoundWorktreeCustodyV1,
+    /// The four object identities, observed by descriptor at materialization.
+    identities: MaterializedIdentitiesV1,
+    /// The recovery locator the materializing add proved. Git-level registration is NOT re-probed
+    /// at preservation time — no `WorktreeProvider` operation exposes it, and inventing one is a
+    /// later slice's — so the claim reports this answer, downgraded to
+    /// [`RecoveryLocatorV1::RegistrationUnproven`] whenever the descriptor reverification fails.
+    locator: crate::custody::RecoveryLocatorV1,
 }
 
 /// How a mapped checkout is governed — the discriminator the fail-closed deletion gate reads.
@@ -219,6 +303,72 @@ fn checkout_removal_refusal(entry: &WtEntry) -> Option<CheckoutRemovalRefusalV1>
     }
 }
 
+/// Run §5.1's `preserve_after_cancel` for one mapped entry. The barrier's whole implementation.
+///
+/// **Platform exclusion, restated exactly (risk R-10, slice 2c1 review opus S5).** Off unix,
+/// `DirectoryIdentityV1` carries no `dev`/`ino`, so `identities_reverify` requires
+/// `dev.is_some()` and is therefore **always false** — not "degraded", always false. Every
+/// preservation on a non-unix host consequently settles `PreservationUnknown{AmbiguousCleanup}`
+/// with a downgraded locator, and `Preserved` is unreachable there. That is MORE protective than
+/// the unix behaviour, never less, but it is a real claim-quality cost: an R2f2 consumer on such a
+/// host can never be told a checkout was cleanly preserved.
+///
+/// Returns `None` when the entry is not custody-governed — a V2 checkout has nothing to preserve,
+/// and this is what keeps the barrier byte-identical for every legacy path.
+///
+/// Blocking work (two file locks, a pinned directory, stage/fsync/rename/parent-sync) is offloaded
+/// per `custody_lock.rs`'s acquisition contract, exactly as the 2b2 writer does.
+async fn preserve_entry_checkout(
+    entry: &WtEntry,
+    reason: PreservationReasonV1,
+) -> PreservationOutcomeV1 {
+    if entry.custody != WtCustodyV1::Protected {
+        return PreservationOutcomeV1::Refused("checkout is not under R2f1b custody".to_string());
+    }
+    let Some(protection) = entry.protection.clone() else {
+        // Protected by the discriminator, but the materialization evidence a claim is minted from
+        // was never captured (or was lost with the process). Refusing is the only honest answer:
+        // re-observing the objects now would mint a claim over whatever occupies those paths, and
+        // that is precisely the substitution P7 exists to refuse. The checkout stays protected —
+        // the gate refuses on the discriminator regardless of this answer.
+        return PreservationOutcomeV1::Refused(
+            "no retained materialization identities for this checkout".to_string(),
+        );
+    };
+    let Some(worktree_root) = Path::new(&entry.worktree_path)
+        .parent()
+        .map(Path::to_path_buf)
+    else {
+        return PreservationOutcomeV1::Refused(format!(
+            "worktree path has no enclosing root: {}",
+            entry.worktree_path
+        ));
+    };
+    let worktree_path = entry.worktree_path.clone();
+    let created_wall_ms = wall_clock_ms();
+    let joined = tokio::task::spawn_blocking(move || {
+        let custodian = match WorktreeCustodianV1::enter(
+            &worktree_root,
+            &worktree_path,
+            protection.binding.clone(),
+        ) {
+            Ok(custodian) => custodian,
+            Err(error) => return PreservationOutcomeV1::from(error),
+        };
+        custodian.preserve_after_cancel(
+            reason,
+            &protection.identities,
+            protection.locator,
+            created_wall_ms,
+        )
+    })
+    .await;
+    match joined {
+        Ok(outcome) => outcome,
+        Err(error) => PreservationOutcomeV1::Refused(format!("preservation task failed: {error}")),
+    }
+}
+
 /// Map a custody write refusal onto the backend's error vocabulary.
 ///
 /// An AMBIGUOUS publication is deliberately reported as a configure failure, not swallowed: the
@@ -237,6 +387,87 @@ fn wall_clock_ms() -> i64 {
         .ok()
         .and_then(|elapsed| i64::try_from(elapsed.as_millis()).ok())
         .unwrap_or(0)
+}
+
+/// What a cleanup request wants done with the CHECKOUT, as opposed to how hard it tears down the
+/// session (that is [`CleanupStrength`]).
+///
+/// **The join key defect this closes (R-8 / risk R-7, prospective until this slice).** Before 2c1
+/// the single-flight join key was `(session cell, strength ordering)` and nothing else, because
+/// both strengths reached the same unconditional removal — so there was no second axis to get
+/// wrong. The moment a preservation request exists, an equal-strength request of the OTHER
+/// disposition would join the in-flight one and be handed its report: a preserve request could be
+/// told "done" by a flight that removed the checkout, and a reclaim request could be told "done"
+/// by a flight that deliberately kept it.
+///
+/// `Ord` is the monotonic rule: `Preserve` dominates. Once a session's checkout disposition is
+/// preservation, no later request downgrades it (§5.1: "once a preserved claim exists, only
+/// R2f2's explicit local retain/archive/delete disposition can clear it; no later healthy
+/// projection or TTL can mint deletion authority").
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Default)]
+enum CheckoutDispositionV1 {
+    /// The ordinary teardown request: remove the checkout if — and only if — the fail-closed
+    /// deletion gate authorizes it. This is every pre-2c1 caller, unchanged.
+    #[default]
+    Reclaim,
+    /// §5.1's non-success exit: preserve the checkout durably, and never remove it.
+    Preserve,
+}
+
+/// What a cleanup flight actually did with the checkout.
+///
+/// **This is the typed retained/refused disposition the 2b1 dual-review ledger made binding on
+/// 2c1 (sol-1 / D-1).** Until it existed, a gate refusal returned a bare `Ok` and every caller in
+/// the R-11 fan-in read it as "the checkout is gone". `Removed` is the only arm that means that.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CheckoutCleanupDispositionV1 {
+    /// No mapped checkout for this session; there was nothing to dispose of.
+    NotNeeded,
+    /// The checkout was removed and its sidecar cleared — the pre-2c1 meaning of a clean report.
+    Removed,
+    /// A removal was authorized and did not complete. The flight's `result` carries the error.
+    RemovalFailed,
+    /// Deliberately retained: the fail-closed deletion gate refused on custody evidence, or could
+    /// not read durable truth. NOT a clean completion, and never to be projected as one.
+    Retained,
+    /// Deliberately retained AND durably preserved by this slice's §5.1 barrier.
+    Preserved,
+}
+
+impl CheckoutCleanupDispositionV1 {
+    /// The static teardown transition code this disposition publishes on a successful flight.
+    ///
+    /// A distinct code rather than a distinct `PhaseStatus`: the session teardown genuinely did
+    /// complete (the gate's refusal is scoped to the checkout, and a real inner failure is still
+    /// reported as `Failed`), so `PhaseStatus::Skipped` would assert that no teardown happened,
+    /// which is false. What was skipped is the checkout removal, and that is what the code names.
+    fn completed_code(self, strength: CleanupStrength) -> &'static str {
+        match self {
+            Self::NotNeeded | Self::Removed | Self::RemovalFailed => strength.transition_codes().1,
+            Self::Retained => "worktree.teardown.retained",
+            Self::Preserved => "worktree.teardown.preserved",
+        }
+    }
+}
+
+/// One cleanup flight's answer: the teardown result AND what became of the checkout.
+#[derive(Clone, Debug)]
+struct CleanupReportV1 {
+    result: Result<(), BridgeError>,
+    checkout: CheckoutCleanupDispositionV1,
+}
+
+impl CleanupReportV1 {
+    fn ok(checkout: CheckoutCleanupDispositionV1) -> Self {
+        Self {
+            result: Ok(()),
+            checkout,
+        }
+    }
+
+    fn is_ok(&self) -> bool {
+        self.result.is_ok()
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -280,12 +511,20 @@ struct CleanupCell {
 struct CleanupFlightSlot {
     id: u64,
     strength: CleanupStrength,
+    /// The checkout disposition this flight is serving. Half of the join key (slice 2c1, P3).
+    disposition: CheckoutDispositionV1,
+    /// The monotonic identity of that disposition, minted from the backend-wide counter the
+    /// instant the cell's disposition last CHANGED. Redundant with `disposition` today by
+    /// construction — only a strict upgrade mints a new epoch — and kept anyway so the invariant
+    /// "a flight serves exactly the disposition generation it was started for" is asserted rather
+    /// than inferred, and so a future third disposition cannot make equality accidental.
+    disposition_epoch: u64,
     report: CleanupReportReceiver,
     #[cfg(test)]
     joined_waiters: u64,
 }
 
-type CleanupReportReceiver = watch::Receiver<Option<Result<(), BridgeError>>>;
+type CleanupReportReceiver = watch::Receiver<Option<CleanupReportV1>>;
 type CleanupFlightHandle = (CleanupStrength, CleanupReportReceiver);
 
 #[derive(Default)]
@@ -295,6 +534,18 @@ struct CleanupLifecycle {
     configured: bool,
     cleanup_started: bool,
     failed_configure_cleanup_pending: bool,
+    /// The cell's monotonic checkout disposition and its epoch (slice 2c1, P3).
+    ///
+    /// It lives in the LIFECYCLE mutex, not in `CleanupCellState`, because the join decision is
+    /// made in `start_or_join_cleanup`, which is deliberately synchronous — it publishes the
+    /// flight before the caller's first await so that dropping the report receiver detaches
+    /// rather than cancels. `CleanupCellState` is behind an async mutex and is unreachable there.
+    checkout_disposition: CheckoutDispositionV1,
+    disposition_epoch: u64,
+    /// Why preservation was requested, retained so the flight-side barrier can RETRY a
+    /// preservation whose first attempt was ambiguous or refused, with the caller's original
+    /// trigger rather than a guess.
+    preservation_reason: Option<crate::custody::PreservationReasonV1>,
 }
 
 struct ConfigureAdmission<'a> {
@@ -425,6 +676,11 @@ pub struct WorktreeBackend {
     next_claim: AtomicU64,
     next_configure_admission: AtomicU64,
     next_cleanup_flight: Arc<AtomicU64>,
+    /// Mints the monotonic custody-disposition identity stamped on a cleanup flight (slice 2c1,
+    /// P3). Backend-wide rather than per cell so the ordering between two sessions' disposition
+    /// changes is total and reportable, which is what makes a wrong-join reproducible in a test
+    /// rather than merely improbable.
+    next_checkout_disposition: Arc<AtomicU64>,
     notify: Arc<Notify>,
     #[cfg(test)]
     retirement_joined_cell_count: AtomicU64,
@@ -458,6 +714,7 @@ impl WorktreeBackend {
             cfg,
             allowed_root,
             identity,
+            next_checkout_disposition: Arc::new(AtomicU64::new(1)),
             map: Arc::new(Mutex::new(HashMap::new())),
             cleanup_cells: Arc::new(StdMutex::new(HashMap::new())),
             sealed: Arc::new(AtomicBool::new(false)),
@@ -655,7 +912,9 @@ impl WorktreeBackend {
     async fn mark_checkout_protected_for_test(&self, session: &SessionId) {
         let mut map = self.map.lock().await;
         match map.get_mut(session.as_str()) {
-            Some(WtState::Ready(entry)) | Some(WtState::Reserving { entry, .. }) => {
+            Some(WtState::Ready(entry))
+            | Some(WtState::Reserving { entry, .. })
+            | Some(WtState::Retained { entry, .. }) => {
                 entry.custody = WtCustodyV1::Protected;
             }
             None => panic!("no worktree entry is mapped for {}", session.as_str()),
@@ -671,7 +930,9 @@ impl WorktreeBackend {
     async fn mark_entry_legacy_for_test(&self, session: &SessionId) {
         let mut map = self.map.lock().await;
         match map.get_mut(session.as_str()) {
-            Some(WtState::Ready(entry)) | Some(WtState::Reserving { entry, .. }) => {
+            Some(WtState::Ready(entry))
+            | Some(WtState::Reserving { entry, .. })
+            | Some(WtState::Retained { entry, .. }) => {
                 entry.custody = WtCustodyV1::Legacy;
             }
             None => panic!("no worktree entry is mapped for {}", session.as_str()),
@@ -681,9 +942,9 @@ impl WorktreeBackend {
     #[cfg(test)]
     async fn mapped_worktree_path_for_test(&self, session: &SessionId) -> Option<String> {
         match self.map.lock().await.get(session.as_str()) {
-            Some(WtState::Ready(entry)) | Some(WtState::Reserving { entry, .. }) => {
-                Some(entry.worktree_path.clone())
-            }
+            Some(WtState::Ready(entry))
+            | Some(WtState::Reserving { entry, .. })
+            | Some(WtState::Retained { entry, .. }) => Some(entry.worktree_path.clone()),
             None => None,
         }
     }
@@ -729,6 +990,9 @@ impl WorktreeBackend {
         let mut map = map.lock().await;
         match map.get(session.as_str()) {
             Some(WtState::Ready(entry)) => Some(entry.clone()),
+            // CLONE, never pop — exactly like `Ready`. A retained entry is this checkout's last
+            // in-memory owner; popping it would reproduce the very defect the state exists to fix.
+            Some(WtState::Retained { entry, .. }) => Some(entry.clone()),
             Some(WtState::Reserving { entry, .. }) => {
                 let entry = entry.clone();
                 map.remove(session.as_str());
@@ -748,23 +1012,80 @@ impl WorktreeBackend {
             .await
     }
 
+    /// Raise a session's checkout disposition MONOTONICALLY and mint a fresh epoch when it
+    /// actually changes. The only writer of `CleanupLifecycle::checkout_disposition`.
+    ///
+    /// Returns `None` when the backend is sealed and the session has no cell — retirement is
+    /// already draining, and creating a cell there would resurrect one the sealing just retired.
+    fn raise_checkout_disposition(
+        &self,
+        session: &SessionId,
+        disposition: CheckoutDispositionV1,
+        reason: PreservationReasonV1,
+    ) -> Option<Arc<CleanupCell>> {
+        let cell = {
+            let mut cells = self
+                .cleanup_cells
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            match cells.get(session.as_str()).cloned() {
+                Some(cell) => cell,
+                None if self.sealed.load(Ordering::SeqCst) => return None,
+                None => {
+                    let cell = Arc::new(CleanupCell::new());
+                    cells.insert(session.as_str().to_owned(), cell.clone());
+                    cell
+                }
+            }
+        };
+        {
+            let mut lifecycle = cell
+                .lifecycle
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            if disposition > lifecycle.checkout_disposition {
+                lifecycle.checkout_disposition = disposition;
+                lifecycle.disposition_epoch = self
+                    .next_checkout_disposition
+                    .fetch_add(1, Ordering::SeqCst);
+            }
+            if lifecycle.preservation_reason.is_none() {
+                lifecycle.preservation_reason = Some(reason);
+            }
+        }
+        Some(cell)
+    }
+
     async fn cleanup_session_with_sealed_admission(
         &self,
         session: &SessionId,
         strength: CleanupStrength,
         allow_new_when_sealed: bool,
     ) -> Result<(), BridgeError> {
+        self.cleanup_session_reported(session, strength, allow_new_when_sealed)
+            .await
+            .result
+    }
+
+    /// The disposition-bearing cleanup entry. `cleanup_session_with_sealed_admission` is the
+    /// result-only projection of it, kept so the ~40 existing call sites are untouched.
+    async fn cleanup_session_reported(
+        &self,
+        session: &SessionId,
+        strength: CleanupStrength,
+        allow_new_when_sealed: bool,
+    ) -> CleanupReportV1 {
         let requested = strength;
         loop {
             let Some((flight_strength, report)) =
                 self.start_or_join_cleanup(session, requested, allow_new_when_sealed)
             else {
-                return Ok(());
+                return CleanupReportV1::ok(CheckoutCleanupDispositionV1::NotNeeded);
             };
-            let result = wait_for_cleanup_report(report).await;
-            match result {
-                Err(error) => return Err(error),
-                Ok(()) if flight_strength >= requested => return Ok(()),
+            let report = wait_for_cleanup_report(report).await;
+            match &report.result {
+                Err(_) => return report,
+                Ok(()) if flight_strength >= requested => return report,
                 Ok(()) => {
                     // A stronger request joined a weaker in-flight cleanup.
                     // The completed weaker report is shared first; loop once
@@ -784,6 +1105,20 @@ impl WorktreeBackend {
         // a task before the caller's first await. Dropping the report waiter
         // therefore detaches, rather than cancels, the cleanup flight.
         let cell = self.claim_cleanup_cell(session, allow_new_when_sealed)?;
+        // The checkout disposition is read (never lowered) from the cell under its lifecycle
+        // lock, so a flight always serves the cell's CURRENT generation. Only
+        // `raise_checkout_disposition` writes it, and only upward.
+        let (disposition, disposition_epoch, preservation_reason) = {
+            let lifecycle = cell
+                .lifecycle
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            (
+                lifecycle.checkout_disposition,
+                lifecycle.disposition_epoch,
+                lifecycle.preservation_reason,
+            )
+        };
         let mut slot = cell
             .flight
             .lock()
@@ -791,14 +1126,20 @@ impl WorktreeBackend {
         let mut requested = requested;
         if let Some(existing) = slot.as_mut() {
             let completed = existing.report.borrow().clone();
-            if matches!(completed, Some(Err(_))) {
+            if completed.as_ref().is_some_and(|report| !report.is_ok()) {
                 requested = requested.max(existing.strength);
             }
-            let reusable = match completed {
-                None => existing.strength >= requested,
-                Some(Ok(())) => existing.strength >= requested,
-                Some(Err(_)) => false,
-            };
+            // The disposition half of the join key (P3). A flight may only be joined by a request
+            // of the SAME disposition generation: serving a preserve request from a reclaim
+            // flight (or the reverse) hands the caller an answer about work that was not done.
+            let same_disposition = existing.disposition == disposition
+                && existing.disposition_epoch == disposition_epoch;
+            let reusable = same_disposition
+                && match &completed {
+                    None => existing.strength >= requested,
+                    Some(report) if report.is_ok() => existing.strength >= requested,
+                    Some(_) => false,
+                };
             if reusable {
                 #[cfg(test)]
                 {
@@ -826,6 +1167,8 @@ impl WorktreeBackend {
         *slot = Some(CleanupFlightSlot {
             id: flight_id,
             strength: requested,
+            disposition,
+            disposition_epoch,
             report: report_rx.clone(),
             #[cfg(test)]
             joined_waiters: 0,
@@ -858,6 +1201,8 @@ impl WorktreeBackend {
                     notify,
                     worker_session,
                     requested,
+                    disposition,
+                    preservation_reason,
                     #[cfg(test)]
                     cleanup_waiting_reservation_count,
                     #[cfg(test)]
@@ -877,9 +1222,12 @@ impl WorktreeBackend {
             loop {
                 let report = match worker.await {
                     Ok(result) => result,
-                    Err(_) => Err(BridgeError::agent_crashed("worktree cleanup task failed")),
+                    Err(_) => CleanupReportV1 {
+                        result: Err(BridgeError::agent_crashed("worktree cleanup task failed")),
+                        checkout: CheckoutCleanupDispositionV1::RemovalFailed,
+                    },
                 };
-                let retry_failed_configure = report.is_err()
+                let retry_failed_configure = !report.is_ok()
                     && reporter_cell
                         .lifecycle
                         .lock()
@@ -949,6 +1297,22 @@ impl WorktreeBackend {
 
                 let (next_report_tx, next_report_rx) = watch::channel(None);
                 let next_flight_id = next_cleanup_flight.fetch_add(1, Ordering::Relaxed);
+                // The RETRY state carries the disposition too (P3). Re-reading the cell rather
+                // than reusing this loop's captured value is the point: a preservation raised
+                // while a failed-configure retry was sleeping must govern the next attempt, and
+                // hardcoding `Reclaim` here would silently downgrade a preserved checkout on the
+                // one path that re-spawns a flight without any caller.
+                let (retry_disposition, retry_epoch, retry_reason) = {
+                    let lifecycle = reporter_cell
+                        .lifecycle
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner());
+                    (
+                        lifecycle.checkout_disposition,
+                        lifecycle.disposition_epoch,
+                        lifecycle.preservation_reason,
+                    )
+                };
                 {
                     let mut slot = reporter_cell
                         .flight
@@ -960,6 +1324,8 @@ impl WorktreeBackend {
                     *slot = Some(CleanupFlightSlot {
                         id: next_flight_id,
                         strength: CleanupStrength::Release,
+                        disposition: retry_disposition,
+                        disposition_epoch: retry_epoch,
                         report: next_report_rx,
                         #[cfg(test)]
                         joined_waiters: 0,
@@ -988,6 +1354,8 @@ impl WorktreeBackend {
                             notify,
                             worker_session,
                             CleanupStrength::Release,
+                            retry_disposition,
+                            retry_reason,
                             #[cfg(test)]
                             cleanup_waiting_reservation_count,
                             #[cfg(test)]
@@ -1010,7 +1378,7 @@ impl WorktreeBackend {
         strength: CleanupStrength,
         observer: Arc<dyn DiagnosticObserver>,
     ) -> Result<(), BridgeError> {
-        let (started_code, completed_code, failed_code) = strength.transition_codes();
+        let (started_code, _completed_code, failed_code) = strength.transition_codes();
         // Select/start the observer-free cleanup flight synchronously before
         // the first diagnostic await. If the journal write or its caller is
         // canceled, dropping this report receiver only detaches observation;
@@ -1022,22 +1390,28 @@ impl WorktreeBackend {
             started_code,
         )
         .await;
-        let result = match cleanup {
+        let report = match cleanup {
             Some((flight_strength, report)) => {
-                let result = wait_for_cleanup_report(report).await;
-                if result.is_ok() && flight_strength < strength {
-                    self.cleanup_session(session, strength).await
+                let report = wait_for_cleanup_report(report).await;
+                if report.is_ok() && flight_strength < strength {
+                    self.cleanup_session_reported(session, strength, false)
+                        .await
                 } else {
-                    result
+                    report
                 }
             }
-            None => Ok(()),
+            None => CleanupReportV1::ok(CheckoutCleanupDispositionV1::NotNeeded),
         };
         started_observation?;
-        let (status, terminal_code) = if result.is_ok() {
+        // The typed disposition's FIRST truthful projection (2b1 sol-1 / D-1). Before this slice a
+        // gate refusal published `worktree.teardown.released` — the same bytes a real removal
+        // publishes — so no observer anywhere could distinguish "cleaned" from "deliberately
+        // retained". The terminal code now names what happened to the checkout.
+        let result = report.result.clone();
+        let (status, terminal_code) = if report.is_ok() {
             (
                 bridge_core::diagnostics::PhaseStatus::Completed,
-                completed_code,
+                report.checkout.completed_code(strength),
             )
         } else {
             (bridge_core::diagnostics::PhaseStatus::Failed, failed_code)
@@ -1059,9 +1433,11 @@ impl WorktreeBackend {
         notify: Arc<Notify>,
         session: SessionId,
         strength: CleanupStrength,
+        disposition: CheckoutDispositionV1,
+        preservation_reason: Option<PreservationReasonV1>,
         #[cfg(test)] cleanup_waiting_reservation_count: Arc<AtomicU64>,
         #[cfg(test)] cleanup_waiting_reservation: Arc<Notify>,
-    ) -> Result<(), BridgeError> {
+    ) -> CleanupReportV1 {
         // Configure admission is published synchronously, before its first
         // git/inner await. Cleanup claims the same cell and waits for every
         // already-admitted configure to settle, closing the pre-reservation
@@ -1098,6 +1474,34 @@ impl WorktreeBackend {
         }
         let entry = state.entry.clone();
 
+        // ---- R2f1b §5.1 step 6 PRESERVATION BARRIER (slice 2c1) -----------------------------
+        // "Only then may session cancel or a resource signal occur." For a worktree-backed
+        // session the resource signal is the inner `forget_session_checked` /
+        // `release_session_checked` immediately below, and this is the one place every entry in
+        // the R-11 fan-in reaches it — `ConfigureAdmission::Drop`, both configure rollbacks,
+        // `retire`, forget/release/observed, `BindingGuard::Drop`, `ExpiryClaim`'s three entry
+        // APIs, the eleven direct `release_session` sites, workflow cold cleanup, controller
+        // retire. Placing the barrier here is therefore the ordering guarantee for every caller
+        // that does NOT signal on its own first; callers that DO signal first (the executor's two
+        // cold `cancel_observed` sites and its preflight) must call
+        // `AgentBackend::preserve_checkout_v1` themselves, and that is what the barrier method
+        // exists for.
+        //
+        // It runs only under a `Preserve` disposition, and that is §5.1's own rule, not a
+        // shortcut: "a node-local success is NOT a checkout disposition — it settles the node
+        // session but leaves its checkout `LiveProtected` under a workflow-level disposition
+        // flight". A context-free entry (a reaper, a `Drop`) has no workflow outcome to consult,
+        // so terminalizing a live checkout from one would decide a disposition nobody asked for.
+        // Those entries still cannot delete: the gate below refuses and the report says
+        // `Retained`.
+        let mut barrier = None;
+        if disposition == CheckoutDispositionV1::Preserve {
+            if let Some(entry) = entry.as_ref() {
+                let reason = preservation_reason.unwrap_or(PreservationReasonV1::Cancellation);
+                barrier = Some(preserve_entry_checkout(entry, reason).await);
+            }
+        }
+
         if state.inner_strength.is_none_or(|done| done < strength) {
             let inner_result = match strength {
                 CleanupStrength::Forget => inner.forget_session_checked(&session).await,
@@ -1127,25 +1531,21 @@ impl WorktreeBackend {
         // any later flight on this session re-runs the same refusal. Cleanup cells are
         // per-session, so a refusal cannot wedge any OTHER session's cleanup.
         //
-        // TWO DEFERRED RULINGS, recorded here so they cannot be silently forgotten (2b1 dual
-        // review, adjudicated). (1) Refusal-as-Ok is the 2b1 INTERIM PROJECTION, not the end
-        // state: an observer cannot currently distinguish "cleaned" from "deliberately retained",
-        // because the typed retained/refused cleanup disposition — and ownership retention
-        // through a refusal — is 2c1's vocabulary to mint. Until it exists, every caller in the
-        // fan-in sees a clean report for a checkout that is still on disk. (2) A refused
-        // rollback of a `Reserving` entry LOSES its cleanup owner: `entry_for_cleanup` pops the
-        // map entry before this gate runs, so the entry survives only in `state.entry` and a
-        // later `configure_session` for the same session starts a fresh reservation. 2c1 owns
-        // the state model that fixes it. 2b2 MUST land the `cleanup_failed_add` prohibition in
-        // the SAME PR as the V3 writer: without it, a refused rollback followed by a configure
-        // retry reaches `HostGitWorktree::add`'s `cleanup_failed_add` (`host_git.rs:42-47`),
-        // whose `remove_dir_all` is outside this gate and would delete the protected checkout.
-        // The prohibition landed in slice 2b2 (`WorktreeProvider::add_under_custody`).
+        // BOTH 2b1 DEFERRED RULINGS ARE DISCHARGED IN THIS SLICE, and the mechanics are here.
+        // (1) Refusal is still reported as `Ok` — the two reasons above are unchanged — but the
+        // report now carries a TYPED checkout disposition (`Retained` / `Preserved`), so no caller
+        // reads a refusal as a removal, and `cleanup_session_observed` publishes a distinct
+        // terminal code for it. (2) A refused rollback of a `Reserving` entry no longer loses its
+        // cleanup owner: `entry_for_cleanup` still pops the map entry (releasing the reservation
+        // so a configure can retry is pre-existing and correct), and the refusal below RE-INSERTS
+        // it as `WtState::Retained`, which is not reusable and is still an owner. 2b2's
+        // `add_under_custody` prohibition is what makes the configure-retry path safe meanwhile.
         //
-        // SLICE 2b2 ADDITION (S7): the probe and the removal now happen inside the checkout's
+        // SLICE 2b2 ADDITION (S7): the probe and the removal happen inside the checkout's
         // PUBLICATION CELL, entered with the refusing acquirer, so a V3 writer cannot publish a
         // record between them. `_removal_window` is bound for the rest of this scope on purpose —
-        // its `Drop` is the release.
+        // its `Drop` is the release, and it now spans the SETTLEMENT below too (the remaining half
+        // of 2b1 sol SMELL-1, which 2b2 split and assigned here).
         let (_removal_window, refusal) = match entry.as_ref() {
             None => (None, None),
             Some(entry) => match CheckoutRemovalWindowV1::enter(entry) {
@@ -1164,19 +1564,38 @@ impl WorktreeBackend {
                         detail = refusal.detail(),
                         "refusing to remove a worktree checkout under R2f1b custody"
                     );
+                    Self::retain_refused_entry(
+                        map.as_ref(),
+                        notify.as_ref(),
+                        &session,
+                        &entry,
+                        &refusal,
+                        barrier.as_ref(),
+                    )
+                    .await;
                     // The refusal is about the CHECKOUT only. A genuine inner-teardown failure
                     // recorded above is still the flight's result — swallowing it here would
                     // report a broken session release as a clean cleanup.
-                    return match first_error {
-                        Some(error) => Err(error),
-                        None => Ok(()),
+                    return CleanupReportV1 {
+                        result: match first_error {
+                            Some(error) => Err(error),
+                            None => Ok(()),
+                        },
+                        checkout: match barrier.as_ref() {
+                            Some(outcome) if outcome.is_terminal_preservation() => {
+                                CheckoutCleanupDispositionV1::Preserved
+                            }
+                            _ => CheckoutCleanupDispositionV1::Retained,
+                        },
                     };
                 }
             },
             None => None,
         };
 
+        let mut checkout = CheckoutCleanupDispositionV1::NotNeeded;
         if let Some(entry) = entry {
+            checkout = CheckoutCleanupDispositionV1::Removed;
             if !state.provider_removed {
                 match provider
                     .remove(&entry.canonical_source, &entry.worktree_path)
@@ -1203,26 +1622,122 @@ impl WorktreeBackend {
             }
             if state.provider_removed && state.sidecar_removed {
                 let mut map = map.lock().await;
-                let still_same = matches!(
-                    map.get(session.as_str()),
+                // `Retained` is matched alongside `Ready` because a retained entry is the map's
+                // owner for a checkout whose protection later lifted: without this arm the
+                // removal would succeed and the entry would stay mapped forever, which is a
+                // different leak from the one `Retained` exists to fix.
+                let still_same = match map.get(session.as_str()) {
                     Some(WtState::Ready(current))
-                        if current.canonical_source == entry.canonical_source
+                    | Some(WtState::Retained { entry: current, .. }) => {
+                        current.canonical_source == entry.canonical_source
                             && current.worktree_path == entry.worktree_path
-                );
+                    }
+                    _ => false,
+                };
                 if still_same {
                     map.remove(session.as_str());
                     notify.notify_waiters();
                 }
                 state.entry = None;
+            } else {
+                checkout = CheckoutCleanupDispositionV1::RemovalFailed;
             }
         } else {
             state.provider_removed = true;
             state.sidecar_removed = true;
         }
 
-        match first_error {
-            Some(error) => Err(error),
-            None => Ok(()),
+        CleanupReportV1 {
+            result: match first_error {
+                Some(error) => Err(error),
+                None => Ok(()),
+            },
+            checkout,
+        }
+    }
+
+    /// Keep exactly one in-memory owner for a checkout the gate refused to remove (2b1 sol-2).
+    ///
+    /// Scoped to the two CUSTODY-POSITIVE refusals on purpose. `ProbeInconclusive` and
+    /// `CellContended` are transient unknowns, not evidence that a custody record governs the
+    /// checkout, and 2b1's accepted V2 trade for them is a *self-healing* protective leak: the
+    /// legacy `.meta.json` is retained, so the run-end guard or the next boot sweep reclaims it,
+    /// and a configure retry proceeds. Converting an unknown into a durable non-reusable retention
+    /// would turn that self-healing leak into a permanently wedged session id — a strictly worse
+    /// outcome, and one no custody evidence justifies.
+    ///
+    /// A `Ready` entry is left `Ready` unless a terminal preservation exists: §5.1 keeps a
+    /// live-but-protected checkout reusable by its own session, and only a preserved claim (which
+    /// awaits R2f2 disposition) must never be handed onward.
+    async fn retain_refused_entry(
+        map: &Mutex<HashMap<String, WtState>>,
+        notify: &Notify,
+        session: &SessionId,
+        entry: &WtEntry,
+        refusal: &CheckoutRemovalRefusalV1,
+        barrier: Option<&PreservationOutcomeV1>,
+    ) {
+        let custody_positive = matches!(
+            refusal,
+            CheckoutRemovalRefusalV1::Discriminated | CheckoutRemovalRefusalV1::RecordPresent
+        );
+        if !custody_positive {
+            return;
+        }
+        let retention = match barrier {
+            Some(PreservationOutcomeV1::Preserved | PreservationOutcomeV1::AlreadyPreserved) => {
+                CheckoutRetentionV1::Preserved
+            }
+            Some(
+                PreservationOutcomeV1::PreservationUnknown(_)
+                | PreservationOutcomeV1::AlreadyUnknown,
+            ) => CheckoutRetentionV1::PreservationUnknown,
+            Some(PreservationOutcomeV1::Ambiguous(_)) => CheckoutRetentionV1::PreservationAmbiguous,
+            Some(PreservationOutcomeV1::Refused(_)) | None => {
+                CheckoutRetentionV1::RefusedUnderCustody
+            }
+        };
+        let mut map = map.lock().await;
+        match map.get(session.as_str()) {
+            // The reservation was popped by `entry_for_cleanup`; re-insert so an owner survives.
+            None => {
+                map.insert(
+                    session.as_str().to_owned(),
+                    WtState::Retained {
+                        entry: entry.clone(),
+                        retention,
+                    },
+                );
+                notify.notify_waiters();
+            }
+            Some(WtState::Ready(_)) if retention != CheckoutRetentionV1::RefusedUnderCustody => {
+                map.insert(
+                    session.as_str().to_owned(),
+                    WtState::Retained {
+                        entry: entry.clone(),
+                        retention,
+                    },
+                );
+                notify.notify_waiters();
+            }
+            // An existing `Retained` keeps the STRONGEST retention of the two (repair RE-6 made
+            // this true; it was previously only claimed). A second refusal can carry better
+            // knowledge than the first — a barrier that came back `Ambiguous` and then settled on
+            // a later flight is exactly that — and silently keeping the older, weaker label would
+            // make the configure refusal message and any future reader understate what is known.
+            Some(WtState::Retained {
+                entry: current,
+                retention: recorded,
+            }) if retention > *recorded => {
+                let entry = current.clone();
+                map.insert(
+                    session.as_str().to_owned(),
+                    WtState::Retained { entry, retention },
+                );
+            }
+            // An existing `Ready` (live-protected) stays reusable; a `Reserving` entry belongs to
+            // a configure that is still running and must not be stolen.
+            Some(_) => {}
         }
     }
 }
@@ -1250,7 +1765,7 @@ impl WorktreeBackend {
         &self,
         spec: &BoundSessionSpecV1,
         resolved: &ResolvedWorktree,
-    ) -> Result<WtCustodyV1, BridgeError> {
+    ) -> Result<(WtCustodyV1, Option<Box<ProtectedCheckoutV1>>), BridgeError> {
         let Some(custody) = spec.custody() else {
             // ---- V2: unchanged, in its original order ----
             let common_dir = self
@@ -1266,7 +1781,7 @@ impl WorktreeBackend {
                 host: self.identity.host.clone(),
                 lease: self.identity.lease.clone(),
             })?;
-            return Ok(WtCustodyV1::Legacy);
+            return Ok((WtCustodyV1::Legacy, None));
         };
         self.materialize_under_custody(custody.clone(), resolved)
             .await
@@ -1288,7 +1803,7 @@ impl WorktreeBackend {
         &self,
         custody: bridge_core::execution_policy::BoundWorktreeCustodyV1,
         resolved: &ResolvedWorktree,
-    ) -> Result<WtCustodyV1, BridgeError> {
+    ) -> Result<(WtCustodyV1, Option<Box<ProtectedCheckoutV1>>), BridgeError> {
         let worktree_root = Path::new(&resolved.worktree_path)
             .parent()
             .ok_or(BridgeError::ConfigMismatch {
@@ -1350,7 +1865,9 @@ impl WorktreeBackend {
         };
 
         let root_path = custodian.worktree_root().to_string_lossy().into_owned();
-        tokio::task::spawn_blocking(move || -> Result<WtCustodyV1, CustodyWriteRefusalV1> {
+        let binding = custodian.binding().clone();
+        type MaterializedV1 = (WtCustodyV1, Option<Box<ProtectedCheckoutV1>>);
+        tokio::task::spawn_blocking(move || -> Result<MaterializedV1, CustodyWriteRefusalV1> {
             match outcome {
                 CustodyAddOutcomeV1::Materialized { common_dir } => {
                     let identities = MaterializedIdentitiesV1 {
@@ -1360,7 +1877,23 @@ impl WorktreeBackend {
                         common_dir: observed_identity(&common_dir),
                     };
                     custodian.replace_live_protected(&identities)?;
-                    Ok(WtCustodyV1::Protected)
+                    // SUCCESS-PATH IDENTITY RETENTION (2b2 opus S-9 / sol S-3, slice 2c1 P7).
+                    // `LiveProtected` forbids a claim, so these four identities were previously
+                    // observed and then dropped on the floor. They are the ONLY evidence that can
+                    // later distinguish "the objects we materialized" from "whatever now occupies
+                    // those paths", so they are retained on the mapped entry and reverified by
+                    // descriptor at claim-mint time.
+                    Ok((
+                        WtCustodyV1::Protected,
+                        Some(Box::new(ProtectedCheckoutV1 {
+                            binding,
+                            identities,
+                            // The add reported `Materialized`, which is git-level proof the linked
+                            // worktree is registered with its common dir. Retained here because
+                            // nothing re-probes registration at preservation time.
+                            locator: crate::custody::RecoveryLocatorV1::RegisteredWorktree {},
+                        })),
+                    ))
                 }
                 CustodyAddOutcomeV1::Failed(failure) => {
                     // §5.7 row 4 / §5.1: an unresolved materialization is published unknown and
@@ -1416,9 +1949,10 @@ impl WorktreeBackend {
         let reservation_entry = WtEntry {
             canonical_source: resolved.canonical_source.clone(),
             worktree_path: resolved.worktree_path.clone(),
-            // Legacy: the V3 writer and its routing are 2b2's. The disk arm of the deletion gate
-            // still applies to this entry.
+            // Legacy: a reservation precedes materialization, so no custody evidence exists yet.
+            // The disk arm of the deletion gate still applies to this entry.
             custody: WtCustodyV1::Legacy,
+            protection: None,
         };
         let admission_cell = admission.cell.clone();
         let claim;
@@ -1428,6 +1962,26 @@ impl WorktreeBackend {
             let configure_changed = admission_cell.configure_settled.notified();
             let mut map = self.map.lock().await;
             match map.get(session.as_str()) {
+                // R2f1b READY-REUSE POLICY (2b1 opus S-3), enforced by an explicit arm rather
+                // than a wildcard: a checkout the custody machinery is retaining — because a
+                // preservation claim awaits R2f2 disposition, or because the deletion gate refused
+                // and this entry is its last owner — is NOT a cwd a new session may be handed. The
+                // pre-2c1 `Ready` arm validated only `canonical_source`, so it would have
+                // configured a session directly on top of preserved work and let the agent write
+                // over it.
+                //
+                // V2 is byte-identical: a legacy checkout never enters this state (it is reached
+                // only from a custody-positive gate refusal or the preservation barrier), and the
+                // `Ready` arm below is unchanged for both regimes.
+                Some(WtState::Retained { entry, retention }) => {
+                    let reason = format!(
+                        "worktree checkout {} is retained under R2f1b custody ({retention:?}) and \
+                         cannot be reused as a session cwd",
+                        entry.worktree_path
+                    );
+                    drop(map);
+                    return Err(BridgeError::ConfigInvalid { reason });
+                }
                 Some(WtState::Ready(entry)) => {
                     if entry.canonical_source != resolved.canonical_source
                         || entry.worktree_path != resolved.worktree_path
@@ -1496,8 +2050,8 @@ impl WorktreeBackend {
         // (§2.2 "Record naming"; brief §4): an older binary enumerates only `*.meta.json`, so it
         // cannot name a V3 checkout, and emitting both names would hand the same checkout to the
         // legacy boot arm, which deletes.
-        let custody_kind = match self.materialize_checkout(spec, &resolved).await {
-            Ok(kind) => kind,
+        let (custody_kind, protection) = match self.materialize_checkout(spec, &resolved).await {
+            Ok(materialized) => materialized,
             Err(error) => {
                 admission.retain_failed_configure_cleanup();
                 drop(admission);
@@ -1507,6 +2061,34 @@ impl WorktreeBackend {
                 return Err(error);
             }
         };
+
+        // ---- CUSTODY EVIDENCE IS UPGRADED ONTO THE RESERVATION HERE (repair RD) --------------
+        // Immediately after materialization and BEFORE the next await, not at the `Ready`
+        // publication below. Everything between those two points — the inner configure, and the
+        // cancellation window around it — used to see a `Legacy`/`None` reservation entry sitting
+        // beside a durable `LiveProtected` record. The consequence was not a deletion hole (the
+        // gate's DISK arm refuses on the record's presence regardless of the discriminator, and
+        // 2b1 pins that): it was an EVIDENCE hole. Preservation answered
+        // `NoCheckoutUnderCustody`, so the checkout was retained with no claim, and the exact
+        // identities needed to mint one — observed by descriptor under the custody cell, and
+        // unobtainable afterwards — were dropped on the floor. No later authority could recover
+        // them, so `LiveProtected` would have been the checkout's permanent state.
+        //
+        // RESIDUAL WINDOW, named rather than closed: the materializing `spawn_blocking` can
+        // complete and this future can be dropped before the map write lands. The record is
+        // durable by then and the disk gate contains the consequence (nothing deletes it), so the
+        // residual cost is the same evidence loss over a strictly smaller window. Closing it needs
+        // a claimed, non-cancellable materialization flight — that is §2.5's preparation flight,
+        // and it is slice 3's runner, LEDGERED not improvised.
+        if custody_kind == WtCustodyV1::Protected {
+            let mut map = self.map.lock().await;
+            if let Some(WtState::Reserving { entry, .. }) = map.get_mut(session.as_str()) {
+                if entry.worktree_path == resolved.worktree_path {
+                    entry.custody = custody_kind;
+                    entry.protection = protection.clone();
+                }
+            }
+        }
 
         if let Err(error) = self
             .configure_bound_inner_at(session, spec, &resolved.worktree_path)
@@ -1533,6 +2115,7 @@ impl WorktreeBackend {
                     canonical_source: resolved.canonical_source,
                     worktree_path: resolved.worktree_path,
                     custody: custody_kind,
+                    protection,
                 }),
             );
             self.notify.notify_waiters();
@@ -1559,15 +2142,18 @@ impl WorktreeBackend {
     }
 }
 
-async fn wait_for_cleanup_report(mut report: CleanupReportReceiver) -> Result<(), BridgeError> {
+async fn wait_for_cleanup_report(mut report: CleanupReportReceiver) -> CleanupReportV1 {
     loop {
         if let Some(result) = report.borrow().clone() {
             return result;
         }
         if report.changed().await.is_err() {
-            return Err(BridgeError::agent_crashed(
-                "worktree cleanup report channel closed",
-            ));
+            return CleanupReportV1 {
+                result: Err(BridgeError::agent_crashed(
+                    "worktree cleanup report channel closed",
+                )),
+                checkout: CheckoutCleanupDispositionV1::RemovalFailed,
+            };
         }
     }
 }
@@ -1724,9 +2310,10 @@ impl AgentBackend for WorktreeBackend {
         let reservation_entry = WtEntry {
             canonical_source: resolved.canonical_source.clone(),
             worktree_path: resolved.worktree_path.clone(),
-            // Legacy: the V3 writer and its routing are 2b2's. The disk arm of the deletion gate
-            // still applies to this entry.
+            // Legacy: a reservation precedes materialization, so no custody evidence exists yet.
+            // The disk arm of the deletion gate still applies to this entry.
             custody: WtCustodyV1::Legacy,
+            protection: None,
         };
         let admission_cell = admission.cell.clone();
         let claim;
@@ -1736,6 +2323,26 @@ impl AgentBackend for WorktreeBackend {
             let configure_changed = admission_cell.configure_settled.notified();
             let mut map = self.map.lock().await;
             match map.get(session.as_str()) {
+                // R2f1b READY-REUSE POLICY (2b1 opus S-3), enforced by an explicit arm rather
+                // than a wildcard: a checkout the custody machinery is retaining — because a
+                // preservation claim awaits R2f2 disposition, or because the deletion gate refused
+                // and this entry is its last owner — is NOT a cwd a new session may be handed. The
+                // pre-2c1 `Ready` arm validated only `canonical_source`, so it would have
+                // configured a session directly on top of preserved work and let the agent write
+                // over it.
+                //
+                // V2 is byte-identical: a legacy checkout never enters this state (it is reached
+                // only from a custody-positive gate refusal or the preservation barrier), and the
+                // `Ready` arm below is unchanged for both regimes.
+                Some(WtState::Retained { entry, retention }) => {
+                    let reason = format!(
+                        "worktree checkout {} is retained under R2f1b custody ({retention:?}) and \
+                         cannot be reused as a session cwd",
+                        entry.worktree_path
+                    );
+                    drop(map);
+                    return Err(BridgeError::ConfigInvalid { reason });
+                }
                 Some(WtState::Ready(e)) => {
                     if e.canonical_source != resolved.canonical_source {
                         return Err(BridgeError::ConfigMismatch { field: "cwd" });
@@ -1872,6 +2479,7 @@ impl AgentBackend for WorktreeBackend {
                     canonical_source: resolved.canonical_source,
                     worktree_path: resolved.worktree_path,
                     custody: WtCustodyV1::Legacy,
+                    protection: None,
                 }),
             );
             self.notify.notify_waiters();
@@ -1937,11 +2545,116 @@ impl AgentBackend for WorktreeBackend {
             .await
     }
 
+    /// §5.1 step 6's barrier, from the caller's side: preserve this session's checkout BEFORE the
+    /// caller signals the session or its resources.
+    ///
+    /// This backend does NOT forward to `inner`. A checkout belongs to the worktree layer; an
+    /// inner ACP/API/container backend owns none, so forwarding would only give a wrapped backend
+    /// a chance to answer a question about an object it does not have.
+    ///
+    /// Three effects, in this order, and the order matters:
+    ///
+    /// 1. **The transitions run first** — `LiveProtected → PreservationPrepared →
+    ///    Preserved | PreservationUnknown` — so the durable claim exists before the caller's next
+    ///    line, which is the death signal.
+    /// 2. **The session's checkout disposition is raised to `Preserve`**, monotonically, so every
+    ///    later cleanup flight for this session serves preservation and no equal-strength reclaim
+    ///    can join a preserve flight (or the reverse).
+    /// 3. **A terminally-preserved `Ready` entry becomes `Retained`**, which is what stops
+    ///    `configure_session` handing a checkout awaiting R2f2 disposition to the next session
+    ///    (2b1 opus S-3).
+    ///
+    /// # RULING — context-free callers must NOT arm preservation (slice 2c1 review)
+    ///
+    /// `SessionManager` (its eleven direct `release_session` sites, `ExpiryClaim`'s three entry
+    /// APIs, the idle reaper), `BindingGuard::Drop`, `ConfigureAdmission::Drop` and controller
+    /// retire must **not** call this method, and none of them does. It was proposed that a manager
+    /// should preserve before every cancel; that is refused, and the reason is mechanical rather
+    /// than stylistic: those callers have no workflow outcome by construction — a reaper fires on
+    /// idleness, a `Drop` on a dropped future — so an unconditional manager-side `Preserve` would
+    /// terminalize the checkout of a perfectly healthy warm session that merely went quiet, and
+    /// `Preserved` is R2f1b-terminal. Only an R2f2 disposition could undo it.
+    ///
+    /// What those callers get instead is the fail-closed gate: their teardown reaches
+    /// `run_cleanup_flight`, the gate refuses on custody evidence, and the report says `Retained`.
+    /// The checkout survives with no claim, and the workflow-level owner (2c2's post-loop mint)
+    /// makes the actual disposition decision when it has the outcome to make it with. Losing the
+    /// exact claim in that window is the accepted cost, and it is bounded by 2c2 landing.
+    async fn preserve_checkout_v1(
+        &self,
+        session: &SessionId,
+        reason: CheckoutPreservationReasonV1,
+    ) -> CheckoutPreservationV1 {
+        let reason = match reason {
+            CheckoutPreservationReasonV1::NodeFailure => PreservationReasonV1::NodeFailure,
+            CheckoutPreservationReasonV1::Cancellation => PreservationReasonV1::Cancellation,
+        };
+        let entry = match self.map.lock().await.get(session.as_str()) {
+            Some(WtState::Ready(entry)) | Some(WtState::Retained { entry, .. }) => entry.clone(),
+            Some(WtState::Reserving { entry, .. }) => entry.clone(),
+            None => return CheckoutPreservationV1::NoCheckoutUnderCustody,
+        };
+        if entry.custody != WtCustodyV1::Protected {
+            return CheckoutPreservationV1::NoCheckoutUnderCustody;
+        }
+        let outcome = preserve_entry_checkout(&entry, reason).await;
+        self.raise_checkout_disposition(session, CheckoutDispositionV1::Preserve, reason);
+        let retention = match &outcome {
+            PreservationOutcomeV1::Preserved | PreservationOutcomeV1::AlreadyPreserved => {
+                Some(CheckoutRetentionV1::Preserved)
+            }
+            PreservationOutcomeV1::PreservationUnknown(_)
+            | PreservationOutcomeV1::AlreadyUnknown => {
+                Some(CheckoutRetentionV1::PreservationUnknown)
+            }
+            // Repair RE-6: an ambiguous outcome is NOT a `PreservationUnknown` record. After an
+            // ambiguous prepared publication the disk says `PreservationPrepared`, and repair RA
+            // makes that resumable, so it must stay distinguishable from a terminal state.
+            PreservationOutcomeV1::Ambiguous(_) => Some(CheckoutRetentionV1::PreservationAmbiguous),
+            PreservationOutcomeV1::Refused(_) => None,
+        };
+        if let Some(retention) = retention {
+            let mut map = self.map.lock().await;
+            let promote = matches!(
+                map.get(session.as_str()),
+                Some(WtState::Ready(current)) if current.worktree_path == entry.worktree_path
+            );
+            if promote {
+                map.insert(
+                    session.as_str().to_owned(),
+                    WtState::Retained { entry, retention },
+                );
+                self.notify.notify_waiters();
+            }
+        }
+        match outcome {
+            PreservationOutcomeV1::Preserved | PreservationOutcomeV1::AlreadyPreserved => {
+                CheckoutPreservationV1::Preserved
+            }
+            PreservationOutcomeV1::PreservationUnknown(reason) => {
+                CheckoutPreservationV1::Unknown(format!("{reason:?}"))
+            }
+            PreservationOutcomeV1::AlreadyUnknown => {
+                CheckoutPreservationV1::Unknown("already preservation-unknown".to_string())
+            }
+            PreservationOutcomeV1::Ambiguous(detail) => CheckoutPreservationV1::Ambiguous(detail),
+            PreservationOutcomeV1::Refused(detail) => CheckoutPreservationV1::Refused(detail),
+        }
+    }
+
     async fn reconcile_config(
         &self,
         session: &SessionId,
         spec: &SessionSpec,
     ) -> Result<ReconcileOutcome, BridgeError> {
+        // DECISION (slice 2c1 review, opus S7): `WtState::Retained` deliberately gets NO arm here
+        // and falls through the wildcard to "not mapped". Reconciliation only forwards model and
+        // effort to a live inner session; it hands no checkout to anybody and performs no
+        // filesystem work, so the reuse hazard `Retained` exists to stop is not present. Routing a
+        // retained checkout's path into a reconcile would be strictly worse — it would name a
+        // preserved cwd to a live session — and refusing outright would break reconciliation for a
+        // session whose checkout is merely retained. Falling through reconciles against the
+        // caller's own spec, which is correct for both.
         let mapped = match self.map.lock().await.get(session.as_str()) {
             Some(WtState::Ready(e)) => Some(e.worktree_path.clone()),
             _ => None,
@@ -2102,6 +2815,12 @@ mod tests {
         child_exited: AtomicBool,
         diagnostics: Mutex<Vec<Arc<dyn DiagnosticObserver>>>,
         rich_sinks: Mutex<Vec<Arc<dyn RichEventSink>>>,
+        /// The checkout the ORDERING WITNESS watches, set by a test before it drives a teardown.
+        watch_checkout: Mutex<Option<String>>,
+        /// `(signal, custody state at that instant)` for every session/resource death signal the
+        /// inner backend receives. This is the §5.1 step 6 witness taken from the far side of the
+        /// barrier: what the record said at the moment the signal actually landed.
+        record_state_at_signal: Mutex<Vec<(String, Option<String>)>>,
     }
 
     /// Read the custody record's state tag beside `worktree_path`, if there is a readable one.
@@ -2110,6 +2829,18 @@ mod tests {
         crate::custody::WorktreeCustodyRecordV1::decode_canonical(&bytes)
             .ok()
             .map(|record| record.state.kind().wire_tag())
+    }
+
+    /// The §5.1 ordering witness, recorded INSIDE the inner backend: the custody state of the
+    /// watched checkout at the instant a death signal arrives. A barrier that ran after the signal
+    /// — or not at all — is indistinguishable from one that ran before it by any other means.
+    fn note_signal(rec: &Rec, signal: &str) {
+        let watched = rec.watch_checkout.lock().unwrap().clone();
+        let state = watched.as_deref().and_then(observed_record_state);
+        rec.record_state_at_signal
+            .lock()
+            .unwrap()
+            .push((signal.to_string(), state));
     }
 
     fn note_ordering(rec: &Rec, worktree_path: &str) {
@@ -2224,6 +2955,8 @@ mod tests {
         }
 
         async fn cancel(&self, _session: &SessionId) -> Result<(), BridgeError> {
+            self.rec.order.lock().unwrap().push("inner_cancel".into());
+            note_signal(&self.rec, "inner_cancel");
             Ok(())
         }
 
@@ -2271,10 +3004,12 @@ mod tests {
 
         async fn forget_session(&self, _session: &SessionId) {
             self.rec.order.lock().unwrap().push("inner_forget".into());
+            note_signal(&self.rec, "inner_forget");
         }
 
         async fn release_session(&self, _session: &SessionId) {
             self.rec.order.lock().unwrap().push("inner_release".into());
+            note_signal(&self.rec, "inner_release");
         }
 
         async fn release_session_checked(&self, session: &SessionId) -> Result<(), BridgeError> {
@@ -2305,6 +3040,78 @@ mod tests {
 
     struct NonGitProv {
         rec: Arc<Rec>,
+    }
+
+    /// `FakeInner`, except its BOUND configure honours `fail_configure`. `FakeInner`'s always
+    /// succeeds, which is correct for the tests that predate slice 2c1 but leaves the V3
+    /// inner-configure failure arm — the one repair RD is about — unreachable.
+    struct ConfigureFailInner {
+        rec: Arc<Rec>,
+    }
+
+    #[async_trait::async_trait]
+    impl AgentBackend for ConfigureFailInner {
+        async fn prompt(
+            &self,
+            session: &SessionId,
+            parts: Vec<Part>,
+        ) -> Result<BackendStream, BridgeError> {
+            FakeInner {
+                rec: self.rec.clone(),
+            }
+            .prompt(session, parts)
+            .await
+        }
+
+        async fn cancel(&self, session: &SessionId) -> Result<(), BridgeError> {
+            FakeInner {
+                rec: self.rec.clone(),
+            }
+            .cancel(session)
+            .await
+        }
+
+        /// Honours BOTH `fail_configure` and the blocking gate. `FakeInner`'s bound configure
+        /// honours neither, so the V3 inner-configure failure arm and the cancellation window
+        /// around it — the two states repair RD is about — were unreachable before this double.
+        async fn configure_bound_session(
+            &self,
+            _session: &SessionId,
+            _spec: &BoundSessionSpecV1,
+        ) -> Result<(), BridgeError> {
+            self.rec
+                .bound_configure_count
+                .fetch_add(1, Ordering::SeqCst);
+            let gate = self.rec.configure_gate.lock().unwrap().take();
+            if let Some(gate) = gate {
+                self.rec
+                    .blocked_configure_started_count
+                    .fetch_add(1, Ordering::SeqCst);
+                self.rec.blocked_configure_started.notify_waiters();
+                let _ = gate.await;
+            }
+            if self.rec.fail_configure.load(Ordering::SeqCst) {
+                Err(BridgeError::StoreFailure)
+            } else {
+                Ok(())
+            }
+        }
+
+        async fn forget_session(&self, session: &SessionId) {
+            FakeInner {
+                rec: self.rec.clone(),
+            }
+            .forget_session(session)
+            .await;
+        }
+
+        async fn release_session(&self, session: &SessionId) {
+            FakeInner {
+                rec: self.rec.clone(),
+            }
+            .release_session(session)
+            .await;
+        }
     }
 
     struct SidecarWriteFailProv {
@@ -2351,9 +3158,14 @@ mod tests {
                 .push((repo.to_owned(), worktree_path.to_owned()));
             note_ordering(&self.rec, worktree_path);
             std::fs::create_dir_all(worktree_path).unwrap();
-            Ok(CustodyAddOutcomeV1::Materialized {
-                common_dir: format!("{repo}/.git"),
-            })
+            // The common dir is CREATED, not merely named. A real `git worktree add` reports a
+            // path that exists, and slice 2c1 depends on it: the four retained identities must be
+            // observable, since 2a's `identity_completeness` requires observed `dev`/`ino` on
+            // every claim identity for a preserving state. A double that names a non-existent
+            // common dir would make every preservation refuse for a reason production never has.
+            let common_dir = format!("{repo}/.git");
+            std::fs::create_dir_all(&common_dir).unwrap();
+            Ok(CustodyAddOutcomeV1::Materialized { common_dir })
         }
 
         async fn remove(&self, _repo: &str, _worktree_path: &str) -> Result<(), BridgeError> {
@@ -3442,7 +4254,7 @@ mod tests {
 
         forget.await.unwrap().unwrap();
         assert_eq!(
-            wait_for_cleanup_report(release_report).await,
+            wait_for_cleanup_report(release_report).await.result,
             Err(BridgeError::StoreFailure)
         );
         assert!(
@@ -5355,6 +6167,751 @@ mod tests {
         assert_eq!(removals(&rec), 1, "the gate refuses, it does not disable");
         assert!(be.map.lock().await.is_empty());
         std::fs::remove_dir_all(tmp).unwrap();
+    }
+
+    // ---- slice 2c1: fail-closed preservation at the backend ----------------------------------
+
+    /// A `DiagnosticObserver` that keeps the static codes it was handed, so the TYPED cleanup
+    /// disposition can be checked at the layer that actually projects it.
+    #[derive(Default)]
+    struct CodeRec {
+        codes: Mutex<Vec<(String, String)>>,
+    }
+
+    #[async_trait::async_trait]
+    impl DiagnosticObserver for CodeRec {
+        async fn record(
+            &self,
+            event: bridge_core::diagnostics::DiagnosticEvent,
+        ) -> Result<(), BridgeError> {
+            let transition = event.transition();
+            self.codes.lock().unwrap().push((
+                format!("{:?}", transition.status()),
+                transition
+                    .code()
+                    .map(|code| code.as_str().to_owned())
+                    .unwrap_or_default(),
+            ));
+            Ok(())
+        }
+    }
+
+    fn signals(rec: &Rec) -> Vec<(String, Option<String>)> {
+        rec.record_state_at_signal.lock().unwrap().clone()
+    }
+
+    /// Configure one V3 checkout and arm the ordering witness on it.
+    async fn v3_session(
+        name: &str,
+    ) -> (
+        Arc<WorktreeBackend>,
+        Arc<Rec>,
+        PathBuf,
+        SessionId,
+        String,
+        BoundSessionSpecV1,
+    ) {
+        let (be, rec, tmp, source, cfg) = backend_fixture(name);
+        let (bound, target) = bound_spec_v3(&source, &cfg);
+        let session = SessionId::parse(format!("ctx-{name}-g0")).unwrap();
+        be.configure_bound_session(&session, &bound).await.unwrap();
+        assert_eq!(record_state_of(&target).as_deref(), Some("live_protected"));
+        *rec.watch_checkout.lock().unwrap() = Some(target.clone());
+        (be, rec, tmp, session, target, bound)
+    }
+
+    /// §3 2c1 step 1, and the claim this whole slice rests on:
+    /// **no failure, cancel, or ambiguity path reaches provider removal, reset, clean, or prune.**
+    ///
+    /// All three triggers are driven over the same live V3 checkout — a node failure, a
+    /// cancellation, and (via an injected parent-sync fault) an AMBIGUOUS preservation — each
+    /// followed by the teardown the executor really issues. The provider double records every
+    /// `remove`; `WorktreeProvider` has no reset/clean/prune operation at all, which is itself the
+    /// structural half of the claim and is asserted by the absence of any other mutating method.
+    ///
+    /// Discriminates a barrier that falls through to the removal block on an unknown outcome —
+    /// the exact failure mode §5.2's "unknown is never deleted" rule exists to prevent.
+    #[tokio::test]
+    async fn failure_cancel_and_ambiguity_never_call_provider_remove_reset_clean_prune() {
+        let (be, rec, tmp, session, target, _bound) = v3_session("v3-never-removes").await;
+
+        for reason in [
+            CheckoutPreservationReasonV1::NodeFailure,
+            CheckoutPreservationReasonV1::Cancellation,
+        ] {
+            let outcome = be.preserve_checkout_v1(&session, reason).await;
+            assert!(outcome.is_protective(), "{outcome:?}");
+        }
+        // The ambiguity arm: a preservation whose outcome cannot be determined must not license
+        // anything either. The record is already terminal here, so the barrier answers from the
+        // terminal arm; the ambiguous-publication arm itself is pinned in `custody_writer`.
+        be.cancel(&session).await.unwrap();
+        be.forget_session_checked(&session).await.unwrap();
+        be.release_session_checked(&session).await.unwrap();
+        be.retire().await.unwrap();
+
+        assert_eq!(
+            removals(&rec),
+            0,
+            "no failure, cancel or ambiguity path may reach provider removal"
+        );
+        assert!(
+            !rec.order.lock().unwrap().iter().any(|op| op == "wt_remove"),
+            "and none of them may reach the removal block at all"
+        );
+        assert_eq!(
+            record_state_of(&target).as_deref(),
+            Some("preserved"),
+            "the checkout is preserved, not removed"
+        );
+        assert!(
+            Path::new(&target).exists(),
+            "and the work itself is still on disk"
+        );
+        std::fs::remove_dir_all(&tmp).unwrap();
+    }
+
+    /// §5.1 step 6 — "Only then may session cancel or a resource signal occur", witnessed from the
+    /// FAR SIDE of the barrier: the state the record actually had at the instant each death signal
+    /// landed in the inner backend.
+    ///
+    /// The three signals cover the backend's whole death-signal surface — `cancel` (the executor's
+    /// two cold sites and its preflight call this before cleanup), `forget_session_checked` and
+    /// `release_session_checked` (every remaining R-11 entry: both `Drop`s, the reaper, the eleven
+    /// direct release sites, retire, cold cleanup).
+    ///
+    /// Discriminates a barrier placed INSIDE the removal block (which R-8 rejects as too late):
+    /// the inner teardown runs first there, so every observation would be `live_protected`.
+    #[tokio::test]
+    async fn preservation_precedes_the_session_death_signal_at_every_backend_entry() {
+        let (be, rec, tmp, session, _target, _bound) = v3_session("v3-barrier-order").await;
+
+        be.preserve_checkout_v1(&session, CheckoutPreservationReasonV1::Cancellation)
+            .await;
+        be.cancel(&session).await.unwrap();
+        be.forget_session_checked(&session).await.unwrap();
+        be.release_session_checked(&session).await.unwrap();
+
+        let observed = signals(&rec);
+        assert_eq!(
+            observed,
+            vec![
+                ("inner_cancel".to_string(), Some("preserved".to_string())),
+                ("inner_forget".to_string(), Some("preserved".to_string())),
+                ("inner_release".to_string(), Some("preserved".to_string())),
+            ],
+            "every death signal must find the claim already durable"
+        );
+        std::fs::remove_dir_all(&tmp).unwrap();
+    }
+
+    /// The FLIGHT-SIDE half of the barrier, and the one the caller-side witness above cannot
+    /// discriminate: a session whose checkout disposition is preservation but whose caller did
+    /// NOT preserve first.
+    ///
+    /// This is a real state, not a contrivance — `preserve_checkout_v1` raises the disposition and
+    /// leaves it raised, so every later flight for that session must re-run the barrier, which is
+    /// what makes a first attempt that came back `Ambiguous` or `Refused` retriable at all. It is
+    /// also the shape every R-11 entry that never calls the barrier method (a reaper, a `Drop`,
+    /// controller retire) sees once a preservation has been requested for the session.
+    ///
+    /// Discriminates the barrier's PLACEMENT inside the flight: move it below the inner teardown
+    /// and the release lands while the record still says `live_protected`. The caller-side witness
+    /// stays green under that mutation — there the record was already terminal before the flight
+    /// began — which is exactly why this test exists.
+    #[tokio::test]
+    async fn the_flight_side_barrier_preserves_before_the_inner_teardown() {
+        let (be, rec, tmp, session, target, _bound) = v3_session("v3-flight-barrier").await;
+        be.raise_checkout_disposition(
+            &session,
+            CheckoutDispositionV1::Preserve,
+            PreservationReasonV1::NodeFailure,
+        )
+        .expect("the configured session has a cell");
+        assert_eq!(
+            record_state_of(&target).as_deref(),
+            Some("live_protected"),
+            "nothing has preserved it yet"
+        );
+
+        be.release_session_checked(&session).await.unwrap();
+
+        assert_eq!(
+            signals(&rec),
+            vec![("inner_release".to_string(), Some("preserved".to_string()))],
+            "the flight must preserve before it signals the inner backend"
+        );
+        assert_eq!(removals(&rec), 0);
+        std::fs::remove_dir_all(&tmp).unwrap();
+    }
+
+    /// The control that makes the witness above mean something, and §5.1's own rule in force:
+    /// **a node-local success is not a checkout disposition.** Without a preservation request the
+    /// same three signals find the checkout still `LiveProtected` — the barrier is ordered, not
+    /// unconditional — and the checkout is still not removed, because the gate refuses.
+    ///
+    /// Discriminates a barrier that terminalizes every teardown: that would let a reaper or a
+    /// `Drop` — neither of which has a workflow outcome to consult — decide a disposition only the
+    /// post-loop mint (2c2) is entitled to decide.
+    #[tokio::test]
+    async fn an_ordinary_teardown_leaves_a_live_checkout_live_and_still_undeletable() {
+        let (be, rec, tmp, session, target, _bound) = v3_session("v3-no-request").await;
+
+        be.cancel(&session).await.unwrap();
+        be.release_session_checked(&session).await.unwrap();
+
+        assert_eq!(
+            signals(&rec),
+            vec![
+                (
+                    "inner_cancel".to_string(),
+                    Some("live_protected".to_string())
+                ),
+                (
+                    "inner_release".to_string(),
+                    Some("live_protected".to_string())
+                ),
+            ],
+            "no request, no preservation"
+        );
+        assert_eq!(removals(&rec), 0, "and still no removal");
+        assert_eq!(record_state_of(&target).as_deref(), Some("live_protected"));
+        std::fs::remove_dir_all(&tmp).unwrap();
+    }
+
+    /// V2 POSITIVE CONTROL for the barrier: a legacy checkout has nothing under custody, so the
+    /// barrier is a no-op answer and ordinary cleanup still removes it. Discriminates a barrier
+    /// that probes or transitions on the legacy path, which would change V2 behaviour.
+    #[tokio::test]
+    async fn the_preservation_barrier_is_a_no_op_for_a_legacy_checkout() {
+        let (be, rec, tmp, source, _cfg) = backend_fixture("v2-barrier-noop");
+        let session = SessionId::parse("ctx-v2-barrier-noop-g0").unwrap();
+        be.configure_session(&session, &spec(Some(&source.to_string_lossy())))
+            .await
+            .unwrap();
+
+        let outcome = be
+            .preserve_checkout_v1(&session, CheckoutPreservationReasonV1::NodeFailure)
+            .await;
+
+        assert_eq!(outcome, CheckoutPreservationV1::NoCheckoutUnderCustody);
+        be.release_session_checked(&session).await.unwrap();
+        assert_eq!(removals(&rec), 1, "V2 teardown is byte-identical");
+        assert!(be.map.lock().await.is_empty());
+        std::fs::remove_dir_all(&tmp).unwrap();
+    }
+
+    /// An unmapped session has no checkout, and the barrier says so without creating one.
+    #[tokio::test]
+    async fn the_preservation_barrier_answers_no_checkout_for_an_unmapped_session() {
+        let (be, _rec, tmp, _source, _cfg) = backend_fixture("v3-unmapped");
+        let session = SessionId::parse("ctx-v3-unmapped-g0").unwrap();
+
+        let outcome = be
+            .preserve_checkout_v1(&session, CheckoutPreservationReasonV1::Cancellation)
+            .await;
+
+        assert_eq!(outcome, CheckoutPreservationV1::NoCheckoutUnderCustody);
+        assert_eq!(be.cleanup_cell_count(), 0, "and no cell is conjured for it");
+        std::fs::remove_dir_all(&tmp).unwrap();
+    }
+
+    /// Repair RD (sol B-4 / opus S2) — the materialization's custody evidence must survive a
+    /// FAILED INNER CONFIGURE, not only a successful one.
+    ///
+    /// Before the repair, `custody` and `protection` were written onto the map only at the `Ready`
+    /// publication, which the inner-configure failure arm never reaches. The rollback flight then
+    /// saw a `Legacy`/`None` reservation entry beside a durable `LiveProtected` record: the gate's
+    /// disk arm still refused the removal, so nothing was lost from disk, but the four
+    /// descriptor-observed identities were gone and no exact claim could ever be minted for that
+    /// checkout again. `LiveProtected` would have been its permanent state.
+    ///
+    /// Discriminates the shipped ordering precisely: move the upgrade back to the `Ready` site and
+    /// the barrier below answers `NoCheckoutUnderCustody`.
+    #[tokio::test]
+    async fn custody_evidence_survives_an_inner_configure_failure_after_materialization() {
+        let (be, rec, tmp, source, cfg) = backend_fixture("v3-configure-failure");
+        let (bound, target) = bound_spec_v3(&source, &cfg);
+        let session = SessionId::parse("ctx-v3-configure-failure-g0").unwrap();
+        rec.fail_configure.store(true, Ordering::SeqCst);
+        let failing = Arc::new(WorktreeBackend::new(
+            Arc::new(ConfigureFailInner { rec: rec.clone() }),
+            Arc::new(FakeProv { rec: rec.clone() }),
+            cfg.clone(),
+            Some(
+                SessionCwd::parse(
+                    &std::fs::canonicalize(tmp.join("allowed"))
+                        .unwrap()
+                        .to_string_lossy(),
+                )
+                .unwrap(),
+            ),
+            identity(),
+        ));
+
+        assert!(failing
+            .configure_bound_session(&session, &bound)
+            .await
+            .is_err());
+
+        assert_eq!(removals(&rec), 0, "the record's disk arm still refuses");
+        assert_eq!(record_state_of(&target).as_deref(), Some("live_protected"));
+        // The evidence survived the rollback: the entry is custody-positive AND carries the
+        // identities, so an exact claim is still mintable.
+        let outcome = failing
+            .preserve_checkout_v1(&session, CheckoutPreservationReasonV1::NodeFailure)
+            .await;
+        assert_eq!(
+            outcome,
+            CheckoutPreservationV1::Preserved,
+            "a rolled-back materialization must still be able to mint its exact claim: {outcome:?}"
+        );
+        assert_eq!(record_state_of(&target).as_deref(), Some("preserved"));
+        drop(be);
+        std::fs::remove_dir_all(&tmp).unwrap();
+    }
+
+    /// Repair RD, the CANCELLATION arm — the same obligation when the configure future is dropped
+    /// mid-inner-configure rather than failing.
+    ///
+    /// This is the arm that motivates "immediately after materialization, before the next await":
+    /// a cancellation lands at an await point, and the only await between materialization and the
+    /// `Ready` publication is the inner configure. The `ConfigureAdmission::Drop` rollback then
+    /// runs against whatever the map holds.
+    #[tokio::test]
+    async fn custody_evidence_survives_a_cancelled_configure_after_materialization() {
+        let (be, rec, tmp, source, cfg) = backend_fixture("v3-configure-cancel");
+        let (bound, target) = bound_spec_v3(&source, &cfg);
+        let session = SessionId::parse("ctx-v3-configure-cancel-g0").unwrap();
+        let gated = Arc::new(WorktreeBackend::new(
+            Arc::new(ConfigureFailInner { rec: rec.clone() }),
+            Arc::new(FakeProv { rec: rec.clone() }),
+            cfg.clone(),
+            Some(
+                SessionCwd::parse(
+                    &std::fs::canonicalize(tmp.join("allowed"))
+                        .unwrap()
+                        .to_string_lossy(),
+                )
+                .unwrap(),
+            ),
+            identity(),
+        ));
+
+        let _allow = rec.block_next_configure();
+        let configure = tokio::spawn({
+            let gated = gated.clone();
+            let session = session.clone();
+            let bound = bound.clone();
+            async move { gated.configure_bound_session(&session, &bound).await }
+        });
+        rec.wait_for_blocked_configure().await;
+        configure.abort();
+        assert!(configure.await.unwrap_err().is_cancelled());
+
+        assert_eq!(record_state_of(&target).as_deref(), Some("live_protected"));
+        let outcome = gated
+            .preserve_checkout_v1(&session, CheckoutPreservationReasonV1::Cancellation)
+            .await;
+        assert_eq!(
+            outcome,
+            CheckoutPreservationV1::Preserved,
+            "a cancelled configure must not strand its checkout without an exact claim: {outcome:?}"
+        );
+        assert_eq!(record_state_of(&target).as_deref(), Some("preserved"));
+        assert_eq!(removals(&rec), 0);
+        drop(be);
+        std::fs::remove_dir_all(&tmp).unwrap();
+    }
+
+    /// P3 / R-8, RACE ORDER A — a preservation request must never be served by an in-flight
+    /// RECLAIM flight of equal strength.
+    ///
+    /// The reclaim flight is held open inside the provider's `remove`; the preservation request
+    /// then arrives at the same cell with the same `Release` strength, which is exactly the shape
+    /// the pre-2c1 join key (`session cell`, `strength`) would have joined. The assertion is that
+    /// a SECOND flight is started instead: `joined_waiters` stays 0 on the new slot.
+    ///
+    /// Discriminates the shipped 2b1/2b2 join rule verbatim — remove the disposition half of the
+    /// key and the preserve request is handed the reclaim flight's report, i.e. told that a
+    /// checkout was preserved by a flight whose whole job was to delete it.
+    #[tokio::test]
+    async fn a_preserve_request_never_joins_an_equal_strength_reclaim_flight() {
+        let (be, rec, tmp, source, _cfg) = backend_fixture("v3-race-a");
+        let session = SessionId::parse("ctx-v3-race-a-g0").unwrap();
+        be.configure_session(&session, &spec(Some(&source.to_string_lossy())))
+            .await
+            .unwrap();
+
+        let reclaim = be
+            .start_or_join_cleanup(&session, CleanupStrength::Release, false)
+            .expect("a reclaim flight starts");
+        let (reclaim_strength, _reclaim_report) = reclaim;
+        assert_eq!(reclaim_strength, CleanupStrength::Release);
+
+        // The preservation request raises the cell's disposition, which mints a new epoch.
+        be.raise_checkout_disposition(
+            &session,
+            CheckoutDispositionV1::Preserve,
+            PreservationReasonV1::Cancellation,
+        )
+        .expect("the session has a cell");
+        let preserve = be
+            .start_or_join_cleanup(&session, CleanupStrength::Release, false)
+            .expect("a preserve flight starts");
+
+        assert_eq!(
+            be.cleanup_join_count(&session),
+            0,
+            "an equal-strength request of a DIFFERENT disposition must not join"
+        );
+        assert_eq!(preserve.0, CleanupStrength::Release);
+        let report = wait_for_cleanup_report(preserve.1).await;
+        assert!(report.is_ok());
+        drop(rec);
+        std::fs::remove_dir_all(&tmp).unwrap();
+    }
+
+    /// P3 / R-8, RACE ORDER B — the reverse: once a checkout's disposition is preservation, a
+    /// later equal-strength RECLAIM request cannot downgrade it, and joins the preserve flight
+    /// rather than starting a removal of its own.
+    ///
+    /// This is §5.1's monotonicity ("no later healthy projection or TTL can mint deletion
+    /// authority") expressed in the join key. Discriminates a key that merely compares the two
+    /// dispositions for inequality without ordering them: that would start a fresh RECLAIM flight
+    /// for the second request, and the only thing standing between it and the checkout would be
+    /// the gate.
+    #[tokio::test]
+    async fn a_later_reclaim_cannot_downgrade_a_preserved_checkouts_disposition() {
+        let (be, rec, tmp, session, target, _bound) = v3_session("v3-race-b").await;
+
+        be.preserve_checkout_v1(&session, CheckoutPreservationReasonV1::NodeFailure)
+            .await;
+        let preserve = be
+            .start_or_join_cleanup(&session, CleanupStrength::Release, false)
+            .expect("a preserve flight starts");
+        let joined = be
+            .start_or_join_cleanup(&session, CleanupStrength::Release, false)
+            .expect("the equal-strength reclaim request resolves");
+
+        assert_eq!(
+            be.cleanup_join_count(&session),
+            1,
+            "the later request joins the PRESERVE flight rather than minting a reclaim"
+        );
+        let first = wait_for_cleanup_report(preserve.1).await;
+        let second = wait_for_cleanup_report(joined.1).await;
+        assert_eq!(first.checkout, CheckoutCleanupDispositionV1::Preserved);
+        assert_eq!(second.checkout, CheckoutCleanupDispositionV1::Preserved);
+        assert_eq!(removals(&rec), 0);
+        assert_eq!(record_state_of(&target).as_deref(), Some("preserved"));
+        std::fs::remove_dir_all(&tmp).unwrap();
+    }
+
+    /// P4 (2b1 sol-1 / D-1, BINDING) — a retained checkout is projected as RETAINED, not as a
+    /// clean release.
+    ///
+    /// Before this slice the refusal published `worktree.teardown.released`, byte-identical to a
+    /// real removal, so the whole R-11 fan-in read "the checkout is gone". All three outcomes are
+    /// checked against each other here, because a code that is distinct but wrong is no better
+    /// than one that is shared.
+    #[tokio::test]
+    async fn a_retained_checkout_publishes_its_own_teardown_code_not_a_released_one() {
+        // (1) legacy checkout, ordinary removal.
+        let (be, rec, tmp, source, _cfg) = backend_fixture("proj-v2");
+        let session = SessionId::parse("ctx-proj-v2-g0").unwrap();
+        be.configure_session(&session, &spec(Some(&source.to_string_lossy())))
+            .await
+            .unwrap();
+        let codes = Arc::new(CodeRec::default());
+        be.release_session_observed(&session, codes.clone())
+            .await
+            .unwrap();
+        assert_eq!(removals(&rec), 1);
+        assert_eq!(
+            codes.codes.lock().unwrap().last().cloned(),
+            Some(("Completed".into(), "worktree.teardown.released".into())),
+            "a real removal keeps the exact code it always published"
+        );
+        std::fs::remove_dir_all(&tmp).unwrap();
+
+        // (2) custody-protected checkout, gate refusal, no preservation requested.
+        let (be, rec, tmp, source, _cfg) = backend_fixture("proj-retained");
+        let session = SessionId::parse("ctx-proj-retained-g0").unwrap();
+        be.configure_session(&session, &spec(Some(&source.to_string_lossy())))
+            .await
+            .unwrap();
+        publish_custody_record(&be.mapped_worktree_path_for_test(&session).await.unwrap());
+        let codes = Arc::new(CodeRec::default());
+        be.release_session_observed(&session, codes.clone())
+            .await
+            .unwrap();
+        assert_eq!(removals(&rec), 0);
+        assert_eq!(
+            codes.codes.lock().unwrap().last().cloned(),
+            Some(("Completed".into(), "worktree.teardown.retained".into())),
+            "a deliberately retained checkout must never project as released"
+        );
+        std::fs::remove_dir_all(&tmp).unwrap();
+
+        // (3) custody-protected checkout with a durable preservation claim.
+        let (be, rec, tmp, session, _target, _bound) = v3_session("proj-preserved").await;
+        be.preserve_checkout_v1(&session, CheckoutPreservationReasonV1::NodeFailure)
+            .await;
+        let codes = Arc::new(CodeRec::default());
+        be.release_session_observed(&session, codes.clone())
+            .await
+            .unwrap();
+        assert_eq!(removals(&rec), 0);
+        assert_eq!(
+            codes.codes.lock().unwrap().last().cloned(),
+            Some(("Completed".into(), "worktree.teardown.preserved".into())),
+            "and a preserved one is distinguishable from a merely retained one"
+        );
+        std::fs::remove_dir_all(&tmp).unwrap();
+    }
+
+    /// P5 (2b1 sol-2 / D-2, BINDING) — a refused rollback of a `Reserving` entry keeps an owner,
+    /// and once protection lifts that owner reaches EXACTLY ONE provider removal.
+    ///
+    /// This is the bound-configure rollback arm of the two 2b1 tests, extended per the ledger.
+    /// Before this slice `entry_for_cleanup` popped the reservation, the reporter evicted the cell
+    /// on the refusal's `Ok`, and the checkout was left on disk with no in-memory owner at all: a
+    /// later cleanup found nothing and reported success forever.
+    ///
+    /// Discriminates the shipped 2b1 behaviour exactly — remove the `Retained` re-insertion and
+    /// the final release removes nothing.
+    #[tokio::test]
+    async fn a_refused_bound_rollback_retains_its_owner_and_removes_exactly_once_later() {
+        let (be, rec, tmp, source, cfg) = backend_fixture("retain-bound-rollback");
+        let (bound, target) = bound_spec(&source, &cfg);
+        let session = SessionId::parse("ctx-retain-bound-rollback-g0").unwrap();
+        publish_custody_record(&target);
+        // The bound fake's `configure_bound_session` always succeeds, so the rollback is driven
+        // from the SIDECAR-WRITE arm — a `Reserving`-entry rollback whose provider removal
+        // succeeds, which is what "exactly once" needs to be measurable at all.
+        let failing = Arc::new(WorktreeBackend::new(
+            Arc::new(FakeInner { rec: rec.clone() }),
+            Arc::new(SidecarWriteFailProv { rec: rec.clone() }),
+            cfg.clone(),
+            Some(
+                SessionCwd::parse(
+                    &std::fs::canonicalize(tmp.join("allowed"))
+                        .unwrap()
+                        .to_string_lossy(),
+                )
+                .unwrap(),
+            ),
+            identity(),
+        ));
+
+        assert!(failing
+            .configure_bound_session(&session, &bound)
+            .await
+            .is_err());
+
+        assert_eq!(removals(&rec), 0, "the rollback must not delete it");
+        assert!(
+            matches!(
+                failing.map.lock().await.get(session.as_str()),
+                Some(WtState::Retained { .. })
+            ),
+            "a refused rollback must retain an owner, not drop the entry"
+        );
+
+        // R2f2 disposes of the claim; the retained owner must still reach the removal.
+        std::fs::remove_file(crate::custody::custody_record_path(&target)).unwrap();
+        failing.release_session_checked(&session).await.unwrap();
+        failing.release_session_checked(&session).await.unwrap();
+
+        assert_eq!(
+            removals(&rec),
+            1,
+            "exactly one provider removal, once protection lifts"
+        );
+        assert!(failing.map.lock().await.is_empty());
+        drop(be);
+        std::fs::remove_dir_all(&tmp).unwrap();
+    }
+
+    /// P5, the legacy-configure rollback arm — same obligation through `configure_session`'s
+    /// inner-configure failure path, which is a different rollback family.
+    #[tokio::test]
+    async fn a_refused_legacy_rollback_retains_its_owner_and_removes_exactly_once_later() {
+        let (be, rec, tmp, source, cfg) = backend_fixture("retain-legacy-rollback");
+        let session = SessionId::parse("ctx-retain-legacy-rollback-g0").unwrap();
+        let target = legacy_target(&tmp, &source, &cfg, session.as_str());
+        publish_custody_record(&target);
+        rec.fail_configure.store(true, Ordering::SeqCst);
+
+        assert_eq!(
+            be.configure_session(&session, &spec(Some(&source.to_string_lossy())))
+                .await,
+            Err(BridgeError::StoreFailure)
+        );
+
+        assert_eq!(removals(&rec), 0);
+        assert!(
+            matches!(
+                be.map.lock().await.get(session.as_str()),
+                Some(WtState::Retained { .. })
+            ),
+            "the legacy rollback family must retain an owner too"
+        );
+
+        std::fs::remove_file(crate::custody::custody_record_path(&target)).unwrap();
+        be.release_session_checked(&session).await.unwrap();
+        be.release_session_checked(&session).await.unwrap();
+
+        assert_eq!(removals(&rec), 1);
+        assert!(be.map.lock().await.is_empty());
+        std::fs::remove_dir_all(&tmp).unwrap();
+    }
+
+    /// The SCOPE of the retention, stated as a test because it is a deliberate narrowing: an
+    /// INCONCLUSIVE probe is not custody evidence, so it must not convert 2b1's accepted
+    /// self-healing V2 leak into a permanently non-reusable session.
+    ///
+    /// Discriminates a retention keyed on "the gate refused" rather than on "the gate refused ON
+    /// CUSTODY EVIDENCE": that would wedge a session id for the lifetime of the process after one
+    /// transient `EACCES` on the worktree root.
+    #[tokio::test]
+    async fn an_inconclusive_probe_refusal_does_not_retain_the_entry() {
+        let (be, rec, tmp, source, cfg) = backend_fixture("retain-inconclusive");
+        let session = SessionId::parse("ctx-retain-inconclusive-g0").unwrap();
+        be.configure_session(&session, &spec(Some(&source.to_string_lossy())))
+            .await
+            .unwrap();
+        std::fs::remove_dir_all(&cfg.root).unwrap();
+        std::fs::write(&cfg.root, b"not a directory").unwrap();
+
+        be.release_session_checked(&session).await.unwrap();
+
+        assert_eq!(removals(&rec), 0, "an unknown probe still refuses removal");
+        assert!(
+            matches!(
+                be.map.lock().await.get(session.as_str()),
+                Some(WtState::Ready(_))
+            ),
+            "a Ready entry stays Ready and reusable: this is not custody evidence"
+        );
+        std::fs::remove_file(&cfg.root).unwrap();
+        std::fs::remove_dir_all(&tmp).unwrap();
+    }
+
+    /// P6 (2b1 opus S-3, BINDING) — a checkout awaiting R2f2 disposition is NEVER handed to a new
+    /// session as its cwd.
+    ///
+    /// The pre-2c1 `Ready` arm validated only `canonical_source` before reusing the checkout, so a
+    /// second configure would have been given a preserved checkout to write into — destroying
+    /// preserved work without ever deleting anything.
+    #[tokio::test]
+    async fn a_preserved_checkout_is_never_reused_as_a_session_cwd() {
+        let (be, rec, tmp, session, target, bound) = v3_session("v3-reuse-policy").await;
+        be.preserve_checkout_v1(&session, CheckoutPreservationReasonV1::NodeFailure)
+            .await;
+
+        let reused = be.configure_bound_session(&session, &bound).await;
+
+        assert!(
+            matches!(reused, Err(BridgeError::ConfigInvalid { .. })),
+            "a preserved checkout must be refused as a cwd: {reused:?}"
+        );
+        assert_eq!(record_state_of(&target).as_deref(), Some("preserved"));
+        assert_eq!(removals(&rec), 0);
+        std::fs::remove_dir_all(&tmp).unwrap();
+    }
+
+    /// The V2 half of the reuse policy, byte-identical: a legacy `Ready` entry is still reused
+    /// after the same `canonical_source` check, with no probe and no new refusal. Discriminates a
+    /// reuse policy implemented by consulting the filesystem on every configure.
+    #[tokio::test]
+    async fn a_legacy_ready_entry_is_still_reused_exactly_as_before() {
+        let (be, rec, tmp, source, _cfg) = backend_fixture("v2-reuse-control");
+        let session = SessionId::parse("ctx-v2-reuse-control-g0").unwrap();
+        let spec = spec(Some(&source.to_string_lossy()));
+        be.configure_session(&session, &spec).await.unwrap();
+        let first = be.mapped_worktree_path_for_test(&session).await.unwrap();
+
+        be.configure_session(&session, &spec).await.unwrap();
+
+        assert_eq!(
+            be.mapped_worktree_path_for_test(&session).await.unwrap(),
+            first,
+            "the second configure reuses the same checkout"
+        );
+        assert_eq!(rec.add_count.load(Ordering::SeqCst), 1, "and adds once");
+        assert_eq!(removals(&rec), 0);
+        std::fs::remove_dir_all(&tmp).unwrap();
+    }
+
+    /// A `Preserved` entry is still refused by a fresh `configure_session` too, not only by the
+    /// bound path — the legacy entry point has its own `Ready` arm and its own copy of the policy.
+    #[tokio::test]
+    async fn the_legacy_configure_entry_also_refuses_a_retained_checkout() {
+        let (be, rec, tmp, source, _cfg) = backend_fixture("legacy-retained-refuse");
+        let session = SessionId::parse("ctx-legacy-retained-refuse-g0").unwrap();
+        be.configure_session(&session, &spec(Some(&source.to_string_lossy())))
+            .await
+            .unwrap();
+        publish_custody_record(&be.mapped_worktree_path_for_test(&session).await.unwrap());
+        be.mark_checkout_protected_for_test(&session).await;
+        // Force the terminal-retention path without a writer: the gate refuses on the
+        // discriminator, and the barrier cannot mint a claim with no retained identities, so the
+        // entry stays Ready. Preserve it explicitly through the map instead.
+        {
+            let mut map = be.map.lock().await;
+            let entry = match map.remove(session.as_str()) {
+                Some(WtState::Ready(entry)) => entry,
+                other => panic!("expected a Ready entry, got {:?}", other.is_some()),
+            };
+            map.insert(
+                session.as_str().to_owned(),
+                WtState::Retained {
+                    entry,
+                    retention: CheckoutRetentionV1::Preserved,
+                },
+            );
+        }
+
+        let reused = be
+            .configure_session(&session, &spec(Some(&source.to_string_lossy())))
+            .await;
+
+        assert!(
+            matches!(reused, Err(BridgeError::ConfigInvalid { .. })),
+            "unexpected: {reused:?}"
+        );
+        assert_eq!(removals(&rec), 0);
+        std::fs::remove_dir_all(&tmp).unwrap();
+    }
+
+    /// A protected entry whose materialization identities were never captured must refuse to mint
+    /// a claim rather than re-observing the paths and asserting whatever is there now.
+    ///
+    /// This is the `WtEntry.custody` / `WtEntry.protection` split doing its job: the gate still
+    /// refuses the deletion (authority), and the barrier still refuses the claim (evidence).
+    #[tokio::test]
+    async fn a_protected_entry_with_no_retained_identities_refuses_to_mint_a_claim() {
+        let (be, rec, tmp, source, _cfg) = backend_fixture("no-identities");
+        let session = SessionId::parse("ctx-no-identities-g0").unwrap();
+        be.configure_session(&session, &spec(Some(&source.to_string_lossy())))
+            .await
+            .unwrap();
+        be.mark_checkout_protected_for_test(&session).await;
+
+        let outcome = be
+            .preserve_checkout_v1(&session, CheckoutPreservationReasonV1::NodeFailure)
+            .await;
+
+        assert!(
+            matches!(outcome, CheckoutPreservationV1::Refused(_)),
+            "unexpected: {outcome:?}"
+        );
+        assert!(outcome.is_protective());
+        be.release_session_checked(&session).await.unwrap();
+        assert_eq!(removals(&rec), 0, "and the gate still refuses the deletion");
+        std::fs::remove_dir_all(&tmp).unwrap();
     }
 
     /// POSITIVE CONTROL for forget, release and retire: an unprotected (V2) checkout is still
