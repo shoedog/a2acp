@@ -9,20 +9,20 @@
 
 ## 0. Gating facts — settle these before starting anything below
 
-**(a) Lane ownership** — session 9337e035 owns slice-2 orchestration; NO live agents — **RESOLVED 2026-08-09** (2c2 complete end-to-end)
-**(b) Custody exposure** — `[MEASURED]` push this session: origin/main = local main = `c13ff663` (2a, 2b1, PARKED-1, 2b2, 2c1, 2c2 all folded and pushed). Planning branch `agent/r2f1b-pre-slice2-custody-plan` is deliberately local-only (owner practice). Prompts §2c commits pushed on `agent/prompts-2c-outbound-refutation` (`fe4532aa`)
-**(c) In flight / irreversible** — 2d implement IN FLIGHT via bridge: clone `impl-28907-1iv8a077`, base branch `feat/r2f1b-2d-claim-exchange` @ `c13ff663`, config `examples/a2a-bridge.r2f1b-impl.toml` (terra/xhigh; hermetic flock-family skips added), task spec at the §6 path. Prior clone `impl-96012-qz5j808a` holds the REJECTED out-of-scope `compatibility.rs` diff (`659e9556`) — inspectable, reaper-eligible
-**(d) Authorization / standing directives** — OWNER WORD 2026-08-09: "approved - proceed" → 2d dispatched; the ledgered two-phase settlement question RATIFIED-AS-SHIPPED (per-checkout independence stands; recorded here — owner can reopen). Standing: implementation via bridge (terra/sol high/xhigh, memory `implement-via-bridge-terra-sol`); dual-lens review mandatory (2d touches sweep exclusion = deletion-adjacent); one-round cap with targeted repair; sol adjudicated senior-lead.
+**(a) Lane ownership** — session 9337e035 owned slice-2 orchestration; NO live agents — **SLICE 2 COMPLETE 2026-08-09** (2a, 2b1, PARKED-1, 2b2, 2c1, 2c2, 2d all shipped)
+**(b) Custody exposure** — `[MEASURED]` push this session: origin/main = local main = `f58862a5` (all six sub-slices folded and pushed; workspace 3826/0/12 across 90). Planning branch `agent/r2f1b-pre-slice2-custody-plan` is deliberately local-only (owner practice). Prompts §2c commits pushed on `agent/prompts-2c-outbound-refutation` (`fe4532aa`)
+**(c) In flight / irreversible** — nothing in flight. Implement clones `impl-28907-1iv8a077` and `impl-94946-odquuf4w` (2d) and `impl-96012-qz5j808a` (2c2 repair; holds the REJECTED out-of-scope compat diff `659e9556`) are fully folded/inspected — reaper-eligible. Sub-slice worktrees `s2b1`/`s2b2`/`s2c1`/`s2c2`/`s2d` are folded branch homes, safe to prune
+**(d) Authorization / standing directives** — standing: implementation via bridge (terra/sol high/xhigh, memory `implement-via-bridge-terra-sol`; usage window closes 2026-08-11); dual-lens review mandatory for custody-authority slices; one-round cap with targeted repair; sol adjudicated senior-lead. Two-phase settlement RATIFIED-AS-SHIPPED (owner, 2026-08-09). SLICE 3 dispatch awaits owner word + a slice-3 brief (the slice-2 brief covers only slice 2; §5.7 rows 7–11 and the preparation-flight runners are slice 3's per the custody plan and focused boundary).
 
 ## 1. Resume order
 
-1. Get owner word for 2d (claim-exchange mechanism, production-inactive), then re-read brief §3 "2d" and the carried ledger rows in `reviews/2026-08-09-s2c2-dual-review.md` "Ledger" + the 2c1 record's slice-3/5/R2f2 rows.
-2. Dispatch the 2d implementer THROUGH THE BRIDGE per the standing directive (memory `implement-via-bridge-terra-sol`: `a2a-bridge implement --input <task.md> --repo ~/code/a2a-bridge --base-ref <branch> --config examples/a2a-bridge.2c2-repair-impl.toml --depth light --lang rust`; task-spec front-matter `task-type: implement`). Note: for a full sub-slice (vs a repair round) consider a fresh worktree branch and `--base-ref main`.
-3. Dual-lens review: opus senior-lead + sol via `run-workflow code-review` (front-matter `task-type: code-review`). One round, cap declared before dispatch. The implementer handoff's behavioral claims are review surface, not context (2b1/2c1/2c2 all produced WRONGs exactly there).
-4. Adjudicate on primary evidence; closed-enumerable → one targeted repair; if via the bridge fix loop, INSPECT THE HAND-OFF DIFF before landing — the 2c2 fix loop chased environment-red tests into out-of-scope production surgery and the operator boundary (strip + control-test) was load-bearing.
-5. Fold to local `main` in `.claude/worktrees/fold` (under `~/code` — GOTCHA 1): `git diff --check`, fmt, clippy `-D warnings`, `cargo test --workspace` (exact totals), release build, `validate --repo-hygiene`; write the review record; reconcile memory + this handoff; push.
+**SLICE 2 IS COMPLETE.** The next unit of work is SLICE 3 (resource/preparation-flight runners; §5.7 rows 7–11; the claimed non-cancellable materialization flight from the 2c1 ledger; the error-exit settlement population if the owner assigns it here rather than slice 5). Resume order for a successor session:
 
-**STOP conditions:** 2d's §2c claim refuted (`RecoveredLive` fails to inherit `LiveProtected`'s sweep exclusion — a silent deletion path spanning 2a and 2d) → park and re-plan, do not fold. A fail-first test staying red = defect in merged code → park + report, fix is its own PR (custody plan §4). Findings open-class at the review cap → park and escalate. A boundary appearing to need a NEW transition-table edge → park (the table is frozen). **Gate for slice 3** (brief §3): §5.7 rows 1–6 and 12 must be green at the end of 2d.
+1. Owner word for slice 3, then author the slice-3 brief the way the slice-2 brief was authored (measured-anchor verification against live main FIRST — every count/line anchor in the plans has drifted before; the custody plan `2026-08-06-r2f1b-pre-slice-2-custody-plan.md` §9 and focused boundary §§2.5, 5.7 rows 7–11 are the sources), dual design review per lane practice.
+2. Carried ledger to fold into the slice-3 brief: BOTH 2c records' ledgers + the 2d record's (`reviews/2026-08-09-s2d-dual-review.md`): slice-3 rows (claimed noncancellable materialization flight; session-manager disposition bookkeeping R-5), slice-5 prerequisites (RecoveredLive outgoing edges; durable retained identities; NodeCleanupDispositionV1 cutover; error-exit settlement population if not slice 3's), trigger-gated rows, and the OPEN owner question (Candidate-settlement §6 row — see §7).
+3. Pipeline per standing directives: bridge implement (terra/sol; config `examples/a2a-bridge.r2f1b-impl.toml`), dual-lens review, one-round cap, operator boundary on every bridge hand-off (inspect diff; verify internal-review objections against source — they have been wrong in BOTH directions: 2c2's out-of-scope surgery, 2d's acceptance-literalism REJECT).
+
+**STOP conditions (standing):** a fail-first test staying red = defect in merged code → park + report, fix is its own PR (custody plan §4). Findings open-class at the review cap → park and escalate. A boundary appearing to need a NEW transition-table edge → park — EXCEPT the slice-5 RecoveredLive outgoing edges, which are a LEDGERED planned amendment needing owner sign-off, not an improvisation.
 
 ## 2. State ledger
 
@@ -55,7 +55,9 @@
 | READTHIS §2c prompt commits | done | `[MEASURED]` `agent/prompts-2c-outbound-refutation` pushed (`fe4532aa`); READTHIS deleted |
 | 2d implement | done | `[MEASURED]` `85c0b33d` on the branch (+885/−27; via bridge, terra/xhigh, clone `impl-28907-1iv8a077`; internal REJECT was gate-evidence — adjudicated environmental: fs_custody errno-identity ENOTDIR-vs-ELOOP in-container, host controls green; landed via `merge --force` = documented operator override); host six-package 2658/0/11 across 51; ALL §5.7 rows 1–6+12 green BY NAME on host |
 | 2d dual-lens review | done | `[MEASURED]` opus REVISE (F1 WRONG/BLOCKER predecessor-liveness never consulted — successor lease provably disjoint, §5.8 step 3 unimplemented; 9 DEFER SMELLs; sweep/gate/mint inheritance + validate-before-effect + frozen-edge reading + token lifecycle all verified SOUND; mandate gap: §6 Candidate-settlement row half undelivered+undeclared) vs sol REJECT (3 BLOCKERs: same predecessor-lease defect found independently; frozen object-graph binding gap — wrong-root record accepted; unrecoverable `RecoveredLive` after LeaseUnavailable/ambiguous — the 2c1 PreservationPrepared class). Orchestrator verified F1's three mechanism legs in source |
-| 2d targeted repair (declared single round) | in flight | Dispatched via bridge (terra/xhigh, clone `impl-94946-odquuf4w`, base `85c0b33d`): RA' predecessor-recovery-lease exclusion (held→byte-identical refusal; held-across-publication = the transfer; row-6 lease half made real), RB' frozen-graph binding (root/record/retained bound to the matched frozen checkout + zero-effect negatives), RC' idempotent `RecoveredLive` re-entry (NO table edge, no re-publish; lease-failure-then-repair), RD' small items (#[must_use], docs, sol S-1 pristine-root negative, handoff corrections incl. Candidate-settlement owner question). LEDGERED: RecoveredLive outgoing edges (slice-5 prerequisite); retained-identity durability (slice-5 activation gate, sol S-2); opus F3/F4 evidence notes |
+| 2d targeted repair (declared single round) | done | `[MEASURED]` `f0d32965` (bridge-built merge, clone `impl-94946-odquuf4w`): RA' predecessor-lease exclusion + row-6 lease half, RB' frozen-graph binding + zero-effect negatives, RC' idempotent `RecoveredLive` re-entry (record byte-identity pinned, NO table edge), RD' docs/#[must_use]/S-1 negative. Fix-loop REJECT (RB' "pristine root") OVERRULED on source: entry-list-unchanged is the correct instrument where a record must pre-exist; acceptance-literalism (A4 class). Focused 2665/0/11 across 51 |
+| 2d fold + full gates + push | done | `[MEASURED]` origin/main → `f58862a5` (squash; docs record `6b079c51`); gates: diff-check/fmt/clippy clean, workspace 3826/0/12 across 90, release build ok, repo-hygiene ok. **SLICE-3 GATE DISCHARGED: §5.7 rows 1–6 + 12 green by name (row 6 now proves BOTH protections incl. the real lease)** |
+| SLICE 2 | **COMPLETE** | six sub-slices + PARKED-1: 2a `b4fc1ff3` → 2b1 `3d1fef9c` → PARKED-1 `8255cf5f` → 2b2 `a9962e25` → 2c1 `23909d5c` → 2c2 `c13ff663` → 2d `f58862a5`; total workspace suite growth 3618 → 3826 |
 | Owner ruling: two-phase settlement | done | RATIFIED-AS-SHIPPED 2026-08-09 ("approved - proceed" on the presented ratify-or-schedule question): per-checkout independence stands; an earlier sibling's verified capability removal is final when a later sibling's release fails. Reopenable by owner word |
 
 ## 3. Corrections to standing documents and memory
@@ -68,9 +70,8 @@
 
 | # | Work | State | Exact next action | Blocked by | Identifiers |
 |---:|---|---|---|---|---|
-| 1 | 2d implement | in flight | await bridge hand-off; INSPECT the diff at the operator boundary before landing (2c2 lesson) | — | clone `impl-28907-1iv8a077`; task spec §6 |
-| 2 | 2d dual-lens review + adjudication + repair | pending | §1 steps 3–4 | #1 | opus + sol lenses |
-| 3 | 2d fold + slice-3 gate (§5.7 rows 1–6+12) + push + reconcile | pending | §1 step 5 | #2 | fold worktree, local `main` |
+| 1 | Slice-3 brief + dispatch | pending | §1 steps 1–3 | owner word | custody plan §9; focused boundary §§2.5, 5.7 rows 7–11; carried ledgers |
+| 2 | Owner: Candidate-settlement §6 row disposition | pending | see §7 | owner | brief §7 vs §3 inconsistency; `UnusedSettled` producerless |
 
 ## 5. Invariants and traps — do not do these
 
@@ -89,7 +90,10 @@
 
 | Item | Verbatim |
 |---|---|
-| origin/main = local main (2a…2c2 folded) | `c13ff663` (docs record `14cbf213`) |
+| origin/main = local main (SLICE 2 COMPLETE) | `f58862a5` (2d; docs record `6b079c51`) |
+| 2d branch (folded) | `feat/r2f1b-2d-claim-exchange` @ `f0d32965` (implement `85c0b33d`, repair merge `f0d32965`) in worktree `s2d` |
+| 2d dual-review record | `docs/superpowers/reviews/2026-08-09-s2d-dual-review.md` (on main; carries the slice-5 prerequisites + owner question) |
+| 2d implement clones (folded, reaper-eligible) | `~/code/.a2a-implement/impl-28907-1iv8a077` · `impl-94946-odquuf4w` |
 | slice-2 brief commit / path | `fc98e343` · `docs/superpowers/plans/2026-08-08-r2f1b-slice2-brief.md` |
 | 2c2 branch (folded) | `feat/r2f1b-2c2-deletion` @ `e26a87e3` (implement `66f8ab0c`, repair `e26a87e3`) in worktree `s2c2` |
 | 2c2 dual-review record | `docs/superpowers/reviews/2026-08-09-s2c2-dual-review.md` (on main) |
@@ -106,6 +110,9 @@
 
 ## 7. Refutation verdict and owner questions
 
-**§2c verdict:** RUN AND DISCHARGED for 2c2 — the implementer's SELF-PASS SURVIVED with three corrections left visible (`s2c2-implementer-handoff.md` §5), then the claim was INDEPENDENTLY verified by both review lenses (opus: six explicit verdicts SOUND, including the gate-bypass substitution and mint unforgeability; sol: "capability/gate substitution sound for cooperative actors") and repaired where they refuted the margins (RA: the failed-inner-teardown path could delete — fixed; RB: ambiguous tombstone misreported — typed). Record: `reviews/2026-08-09-s2c2-dual-review.md`.
+**§2c verdict (2d, final for the slice):** RUN AND DISCHARGED — the load-bearing claim (`RecoveredLive` inherits every `LiveProtected` protection; the exchange validates before any effect) was verified SOUND by both lenses, and the margins they refuted (predecessor-liveness exclusion — found INDEPENDENTLY by both; frozen-graph binding; the stranded-intermediate re-entry) were repaired in the declared round with the lease half of §5.7 row 6 made real. Record: `reviews/2026-08-09-s2d-dual-review.md`. (2c2's verdict paragraph is preserved in that sub-slice's record.)
 
-**Questions the owner owes an answer to:** None — both prior questions answered 2026-08-09 ("approved - proceed"): 2d dispatched; two-phase settlement ratified-as-shipped (§0(d), §2 ruling row).
+**Questions the owner owes an answer to:**
+1. **Word for slice 3** (+ its brief authoring — see §1).
+2. **Candidate-settlement §6 row disposition** (opus 2d mandate-gap): brief §7 assigns the whole row to 2d; §3's 2d steps omit it; `unused_candidate_settles_only_after_exact_absence` does not exist and `UnusedSettled` remains producerless (2b2 recovery-side ruling). Re-assign to the recovery-side owner (slice 3/5) or commission separately.
+3. **Slice-5 prerequisite sign-off (advance notice, not blocking):** `RecoveredLive` outgoing edges are a planned frozen-table amendment that will need owner approval before production resume can complete a lifecycle.
