@@ -722,6 +722,15 @@ struct CleanupCell {
     state: Mutex<CleanupCellState>,
     flight: StdMutex<Option<CleanupFlightSlot>>,
     lifecycle: StdMutex<CleanupLifecycle>,
+    /// Serializes a preservation raise with the deletion generation validation and its subsequent
+    /// `LiveProtected -> DeleteAuthorized` mint. The lifecycle mutex alone cannot do that: it is
+    /// intentionally released before the async custody-cell admission, leaving a preserve writer
+    /// able to change the epoch in the old check-to-CAS window.
+    deletion_admission: Mutex<()>,
+    #[cfg(test)]
+    deletion_admission_barrier: Arc<DeletionAdmissionBarrier>,
+    #[cfg(test)]
+    removal_projection_barrier: Arc<DeletionAdmissionBarrier>,
     configure_settled: Notify,
 }
 
@@ -765,6 +774,13 @@ struct CleanupLifecycle {
     preservation_reason: Option<crate::custody::PreservationReasonV1>,
 }
 
+#[cfg(test)]
+#[derive(Default)]
+struct DeletionAdmissionBarrier {
+    armed: AtomicBool,
+    checked: Notify,
+    proceed: Notify,
+}
 struct ConfigureAdmission<'a> {
     owner: &'a WorktreeBackend,
     count: &'a AtomicU64,
@@ -874,11 +890,43 @@ impl CleanupCell {
             state: Mutex::new(CleanupCellState::default()),
             flight: StdMutex::new(None),
             lifecycle: StdMutex::new(CleanupLifecycle::default()),
+            #[cfg(test)]
+            deletion_admission_barrier: Arc::new(DeletionAdmissionBarrier::default()),
+            #[cfg(test)]
+            removal_projection_barrier: Arc::new(DeletionAdmissionBarrier::default()),
+            deletion_admission: Mutex::new(()),
             configure_settled: Notify::new(),
         }
     }
-}
 
+    #[cfg(test)]
+    async fn pause_deletion_mint_for_test(&self) {
+        if self
+            .deletion_admission_barrier
+            .armed
+            .swap(false, Ordering::SeqCst)
+        {
+            self.deletion_admission_barrier.checked.notify_one();
+            self.deletion_admission_barrier.proceed.notified().await;
+        }
+    }
+
+    // 3s repair R1: pauses AFTER the removal + tombstone, BEFORE the map projection — the window
+    // both review lenses named. Discriminates the deletion-admission guard's scope: with the guard
+    // held across the projection a queued preservation writer stays blocked here; with the old
+    // block-scoped guard it would run against the stale map entry.
+    #[cfg(test)]
+    async fn pause_removal_projection_for_test(&self) {
+        if self
+            .removal_projection_barrier
+            .armed
+            .swap(false, Ordering::SeqCst)
+        {
+            self.removal_projection_barrier.checked.notify_one();
+            self.removal_projection_barrier.proceed.notified().await;
+        }
+    }
+}
 pub struct WorktreeBackend {
     inner: Arc<dyn AgentBackend>,
     provider: Arc<dyn WorktreeProvider>,
@@ -1187,6 +1235,29 @@ impl WorktreeBackend {
             .store(1, Ordering::SeqCst);
     }
 
+    #[cfg(test)]
+    fn arm_deletion_admission_barrier_for_test(
+        &self,
+        session: &SessionId,
+    ) -> Arc<DeletionAdmissionBarrier> {
+        let barrier = self.cleanup_cells.lock().unwrap()[session.as_str()]
+            .deletion_admission_barrier
+            .clone();
+        barrier.armed.store(true, Ordering::SeqCst);
+        barrier
+    }
+
+    #[cfg(test)]
+    fn arm_removal_projection_barrier_for_test(
+        &self,
+        session: &SessionId,
+    ) -> Arc<DeletionAdmissionBarrier> {
+        let barrier = self.cleanup_cells.lock().unwrap()[session.as_str()]
+            .removal_projection_barrier
+            .clone();
+        barrier.armed.store(true, Ordering::SeqCst);
+        barrier
+    }
     fn claim_cleanup_cell(
         &self,
         session: &SessionId,
@@ -1247,7 +1318,7 @@ impl WorktreeBackend {
     ///
     /// Returns `None` when the backend is sealed and the session has no cell — retirement is
     /// already draining, and creating a cell there would resurrect one the sealing just retired.
-    fn raise_checkout_disposition(
+    async fn raise_checkout_disposition(
         &self,
         session: &SessionId,
         disposition: CheckoutDispositionV1,
@@ -1268,6 +1339,7 @@ impl WorktreeBackend {
                 }
             }
         };
+        let deletion_admission = cell.deletion_admission.lock().await;
         {
             let mut lifecycle = cell
                 .lifecycle
@@ -1283,6 +1355,7 @@ impl WorktreeBackend {
                 lifecycle.preservation_reason = reason;
             }
         }
+        drop(deletion_admission);
         Some(cell)
     }
 
@@ -1814,9 +1887,20 @@ impl WorktreeBackend {
         // runs. Any outcome that did not remove the checkout falls through to the gate, which
         // refuses on the custody evidence exactly as before.
         let mut capability_removal = None;
+        // 3s repair R1 (both review lenses): the admission guard must OUTLIVE the mint block and
+        // span the map PROJECTION below — released at block scope, a queued preservation writer
+        // could run between the tombstone and the map clear and observe the stale entry.
+        let mut deletion_admission_guard = None;
         if disposition == CheckoutDispositionV1::DeleteAuthorized && first_error.is_none() {
             if let Some(entry) = entry.as_ref() {
+                // Keep the same guard a preservation raise takes from the epoch validation through
+                // the custody-cell CAS. A preserve is therefore ordered either before this check
+                // or after the mint; it cannot change the generation in the old blind window.
+                let guard = cell.deletion_admission.lock().await;
+                deletion_admission_guard = Some(guard);
                 if Self::deletion_generation_is_current(&cell, disposition, disposition_epoch) {
+                    #[cfg(test)]
+                    cell.pause_deletion_mint_for_test().await;
                     let outcome = authorize_and_remove_checkout(
                         &provider,
                         entry,
@@ -1840,6 +1924,23 @@ impl WorktreeBackend {
                     );
                 }
             }
+        }
+        // A removal that did NOT complete falls through to the gate below — release admission now
+        // so the gate path adds no new nesting. A COMPLETED removal keeps the guard until its
+        // projection lands (the map clear + `state.entry = None`), so no preservation writer can
+        // observe the pre-projection map.
+        if !capability_removal
+            .as_ref()
+            .is_some_and(|o| o.checkout_is_gone())
+        {
+            deletion_admission_guard = None;
+        }
+        #[cfg(test)]
+        if capability_removal
+            .as_ref()
+            .is_some_and(|o| o.checkout_is_gone())
+        {
+            cell.pause_removal_projection_for_test().await;
         }
         if let Some(outcome) = capability_removal.as_ref().filter(|o| o.checkout_is_gone()) {
             let checkout = match outcome {
@@ -1883,6 +1984,9 @@ impl WorktreeBackend {
             }
             drop(map);
             state.entry = None;
+            // The projection is complete — a preservation writer admitted from here on re-reads
+            // an already-cleared map and truthfully observes `NoCheckoutUnderCustody`.
+            drop(deletion_admission_guard);
             return CleanupReportV1 {
                 result: match first_error {
                     Some(error) => Err(error),
@@ -3000,8 +3104,28 @@ impl AgentBackend for WorktreeBackend {
         if entry.custody != WtCustodyV1::Protected {
             return CheckoutPreservationV1::NoCheckoutUnderCustody;
         }
+        if self
+            .raise_checkout_disposition(session, CheckoutDispositionV1::Preserve, Some(reason))
+            .await
+            .is_none()
+        {
+            return CheckoutPreservationV1::NoCheckoutUnderCustody;
+        }
+        // 3s linearization: the raise above queues at the deletion-admission guard, so an
+        // in-flight capability mint completes before it returns — and (repair R1, both review
+        // lenses) the mint holds that guard THROUGH its map projection, so this post-admission
+        // re-read is exact in BOTH directions: absence means removal preceded the raise, and
+        // presence means the checkout genuinely still exists (no removal can be mid-projection
+        // while this writer holds admission, and no new mint can run once `Preserve` is raised).
+        let entry = match self.map.lock().await.get(session.as_str()) {
+            Some(WtState::Ready(entry)) | Some(WtState::Retained { entry, .. }) => entry.clone(),
+            Some(WtState::Reserving { entry, .. }) => entry.clone(),
+            None => return CheckoutPreservationV1::NoCheckoutUnderCustody,
+        };
+        if entry.custody != WtCustodyV1::Protected {
+            return CheckoutPreservationV1::NoCheckoutUnderCustody;
+        }
         let outcome = preserve_entry_checkout(&entry, reason).await;
-        self.raise_checkout_disposition(session, CheckoutDispositionV1::Preserve, Some(reason));
         let retention = match &outcome {
             PreservationOutcomeV1::Preserved | PreservationOutcomeV1::AlreadyPreserved => {
                 Some(CheckoutRetentionV1::Preserved)
@@ -3106,6 +3230,7 @@ impl AgentBackend for WorktreeBackend {
         };
         if self
             .raise_checkout_disposition(session, CheckoutDispositionV1::DeleteAuthorized, reason)
+            .await
             .is_none()
         {
             return CheckoutSettlementV1::Refused(
@@ -6916,6 +7041,7 @@ mod tests {
             CheckoutDispositionV1::Preserve,
             Some(PreservationReasonV1::NodeFailure),
         )
+        .await
         .expect("the configured session has a cell");
         assert_eq!(
             record_state_of(&target).as_deref(),
@@ -7144,6 +7270,7 @@ mod tests {
             CheckoutDispositionV1::Preserve,
             Some(PreservationReasonV1::Cancellation),
         )
+        .await
         .expect("the session has a cell");
         let preserve = be
             .start_or_join_cleanup(&session, CleanupStrength::Release, false)
@@ -8231,6 +8358,7 @@ mod tests {
         let (be, _rec, tmp, session, _target, _bound) =
             v3_session("v3-ambiguous-removed-code").await;
         be.raise_checkout_disposition(&session, CheckoutDispositionV1::DeleteAuthorized, None)
+            .await
             .expect("the session has a cleanup cell");
         be.fail_next_capability_tombstone_parent_sync_for_test();
         let observer = Arc::new(CodeRec::default());
@@ -8593,6 +8721,121 @@ mod tests {
     }
 
     /// P3's wrong-join hazard with the third disposition present: a deletion-authority request
+    /// 3s repair R1 (both review lenses converged): the deletion-admission guard must span the
+    /// map PROJECTION of a completed removal, not just the removal itself. A preservation writer
+    /// queued while the tombstone exists but the map still holds the old entry must stay blocked
+    /// until the projection lands, then observe `NoCheckoutUnderCustody` — never a refusal
+    /// against the stale pre-projection entry. Multi-thread flavor on purpose: the pre-repair
+    /// guard was green only under current-thread scheduling.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_preserve_queued_during_removal_projection_observes_no_checkout() {
+        let (be, rec, tmp, session, target, _bound) = v3_session("v3-projection-window").await;
+        let be = Arc::new(be);
+        let barrier = be.arm_removal_projection_barrier_for_test(&session);
+        let checked = barrier.checked.notified();
+        let mint_backend = be.clone();
+        let mint_session = session.clone();
+        let mint = tokio::spawn(async move {
+            mint_backend
+                .settle_workflow_checkout_v1(
+                    &mint_session,
+                    WorkflowCheckoutOutcomeV1::GloballyHealthy,
+                )
+                .await
+        });
+        checked.await;
+        let preserve_backend = be.clone();
+        let preserve_session = session.clone();
+        let preserve = tokio::spawn(async move {
+            preserve_backend
+                .preserve_checkout_v1(&preserve_session, CheckoutPreservationReasonV1::NodeFailure)
+                .await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(
+            !preserve.is_finished(),
+            "the preservation writer must stay blocked until the removal is projected"
+        );
+        barrier.proceed.notify_one();
+        assert_eq!(mint.await.unwrap(), CheckoutSettlementV1::Removed);
+        assert_eq!(
+            preserve.await.unwrap(),
+            CheckoutPreservationV1::NoCheckoutUnderCustody,
+            "a writer queued behind a completed removal observes no checkout, never a stale refusal"
+        );
+        assert_eq!(record_state_of(&target).as_deref(), Some("removed"));
+        assert_eq!(capability_removals(&rec), 1);
+        drop(be);
+        std::fs::remove_dir_all(&tmp).unwrap();
+    }
+
+    /// The shared deletion-admission guard is the linearization point for the preservation writer
+    /// and the healthy settlement mint. These orders exercise that guard, not the publication cell.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn preservation_writer_and_healthy_settlement_linearize_in_both_orders() {
+        let (be, rec, tmp, session, target, _bound) = v3_session("v3-linearize-writer-first").await;
+        assert_eq!(
+            be.preserve_checkout_v1(&session, CheckoutPreservationReasonV1::NodeFailure)
+                .await,
+            CheckoutPreservationV1::Preserved
+        );
+        let settled = be
+            .settle_workflow_checkout_v1(&session, WorkflowCheckoutOutcomeV1::GloballyHealthy)
+            .await;
+        assert_eq!(
+            settled,
+            CheckoutSettlementV1::Preserved,
+            "preservation writer wins when it raises first"
+        );
+        assert_eq!(record_state_of(&target).as_deref(), Some("preserved"));
+        assert_eq!(capability_removals(&rec), 0);
+        drop(be);
+        std::fs::remove_dir_all(&tmp).unwrap();
+
+        let (be, rec, tmp, session, target, _bound) =
+            v3_session("v3-linearize-settlement-first").await;
+        let be = Arc::new(be);
+        let barrier = be.arm_deletion_admission_barrier_for_test(&session);
+        let checked = barrier.checked.notified();
+        let mint_backend = be.clone();
+        let mint_session = session.clone();
+        let mint = tokio::spawn(async move {
+            mint_backend
+                .settle_workflow_checkout_v1(
+                    &mint_session,
+                    WorkflowCheckoutOutcomeV1::GloballyHealthy,
+                )
+                .await
+        });
+        checked.await;
+        let preserve_backend = be.clone();
+        let preserve_session = session.clone();
+        let preserve = tokio::spawn(async move {
+            preserve_backend
+                .preserve_checkout_v1(&preserve_session, CheckoutPreservationReasonV1::NodeFailure)
+                .await
+        });
+        tokio::task::yield_now().await;
+        assert!(
+            !preserve.is_finished(),
+            "the preservation writer is held at deletion admission"
+        );
+        barrier.proceed.notify_one();
+        assert_eq!(
+            mint.await.unwrap(),
+            CheckoutSettlementV1::Removed,
+            "the first admission owns the mint"
+        );
+        assert_eq!(
+            preserve.await.unwrap(),
+            CheckoutPreservationV1::NoCheckoutUnderCustody
+        );
+        assert_eq!(record_state_of(&target).as_deref(), Some("removed"));
+        assert_eq!(capability_removals(&rec), 1);
+        drop(be);
+        std::fs::remove_dir_all(&tmp).unwrap();
+    }
+
     /// must not join an in-flight `Reclaim` cleanup and be handed its report.
     ///
     /// The 2c1 test proved this for `Preserve`; with a third value in the enum the join key's
@@ -8613,6 +8856,7 @@ mod tests {
             .expect("a reclaim flight starts");
         assert_eq!(reclaim_strength, CleanupStrength::Release);
         be.raise_checkout_disposition(&session, CheckoutDispositionV1::DeleteAuthorized, None)
+            .await
             .expect("the session has a cell");
         let authorized = be
             .start_or_join_cleanup(&session, CleanupStrength::Release, false)
@@ -8648,6 +8892,7 @@ mod tests {
             .unwrap();
         let cell = be
             .raise_checkout_disposition(&session, CheckoutDispositionV1::DeleteAuthorized, None)
+            .await
             .expect("the session has a cell");
         let captured_epoch = cell.lifecycle.lock().unwrap().disposition_epoch;
         assert!(WorktreeBackend::deletion_generation_is_current(
@@ -8661,6 +8906,7 @@ mod tests {
             CheckoutDispositionV1::Preserve,
             Some(PreservationReasonV1::Cancellation),
         )
+        .await
         .expect("the session has a cell");
 
         assert!(
@@ -8781,6 +9027,7 @@ mod tests {
     async fn a_capability_removal_publishes_the_real_removed_teardown_code() {
         let (be, rec, tmp, session, _target, _bound) = v3_session("v3-removed-code").await;
         be.raise_checkout_disposition(&session, CheckoutDispositionV1::DeleteAuthorized, None)
+            .await
             .expect("the session has a cell");
 
         let observer = Arc::new(CodeRec::default());

@@ -928,6 +928,24 @@ impl WorktreeCustodianV1 {
                 from.wire_tag()
             ));
         }
+        let record = match self.current_record() {
+            Ok(Some(record)) => record,
+            Ok(None) => {
+                return DeletionAuthorizationV1::Refused(
+                    "no custody record exists for this checkout".to_string(),
+                )
+            }
+            Err(error) => return DeletionAuthorizationV1::Refused(error.to_string()),
+        };
+        if record.custody_id != self.custody.plan.custody_id
+            || record.checkout_fingerprint != self.custody.plan.checkout_fingerprint
+            || record.current_attempt != self.custody.attempt
+            || record.worktree != retained.worktree
+        {
+            return DeletionAuthorizationV1::Refused(
+                "custody record does not match this checkout's retained ownership".to_string(),
+            );
+        }
         if !Self::identities_reverify(retained) {
             return DeletionAuthorizationV1::Refused(
                 "retained object identities no longer verify by descriptor".to_string(),
@@ -2628,6 +2646,38 @@ mod tests {
     /// Discriminates a mint that publishes `Removed` directly (which would tombstone a checkout
     /// still on disk) and one that authorizes without transitioning (which would leave nothing
     /// durable for recovery to find).
+    #[test]
+    fn a_foreign_live_record_never_authorizes_deletion() {
+        let worktree_root = root("authorize-foreign-record");
+        let target = worktree_root.join("ownr-run7-abc");
+
+        let (owner, identities) = live_protected(&worktree_root, &target);
+        let original = std::fs::read(custody_record_path(&target.to_string_lossy())).unwrap();
+        drop(owner);
+
+        let foreign =
+            WorktreeCustodianV1::enter(&worktree_root, &target.to_string_lossy(), binding(&target))
+                .unwrap();
+        let authorization = foreign.authorize_deletion("/src", &identities);
+
+        assert!(
+            matches!(authorization, DeletionAuthorizationV1::Refused(_)),
+            "a foreign record must not be claimed: {authorization:?}"
+        );
+        assert_eq!(
+            record_state(&worktree_root, &target),
+            Some(WorktreeCustodyStateKindV1::LiveProtected),
+            "the foreign record remains protective"
+        );
+        assert_eq!(
+            std::fs::read(custody_record_path(&target.to_string_lossy())).unwrap(),
+            original,
+            "refusal is effect-free"
+        );
+        drop(foreign);
+        std::fs::remove_dir_all(&worktree_root).unwrap();
+    }
+
     #[test]
     fn a_live_checkout_authorizes_deletion_and_mints_its_capability() {
         let worktree_root = root("authorize-live");

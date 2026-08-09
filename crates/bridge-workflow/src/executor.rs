@@ -43,6 +43,17 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
+/// A deterministic, test-only fault injected after a checkout has been recorded.
+///
+/// Canonical policy serialization and terminal accounting are infallible for valid public inputs,
+/// so these probes exercise the executor's otherwise defensive post-recording error exits.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PostRecordingExitFaultForTest {
+    PolicyFinalize,
+    Encode,
+    Invariant,
+}
 
 /// Per-request context forwarded opaquely through the executor to each node's
 /// `configure_session` call. The scheduler/topo logic MUST NOT read this — it
@@ -56,6 +67,8 @@ pub struct WorkflowRunContext {
     pub task_id: Option<bridge_core::ids::TaskId>,
     pub prompt_id: Option<String>,
     pub harvest_audit_store: Arc<dyn HarvestAuditStore>,
+    #[cfg(test)]
+    post_recording_exit_fault: Option<PostRecordingExitFaultForTest>,
 }
 
 impl Default for WorkflowRunContext {
@@ -68,6 +81,8 @@ impl Default for WorkflowRunContext {
             task_id: None,
             prompt_id: None,
             harvest_audit_store: Arc::new(NoopHarvestAuditStore),
+            #[cfg(test)]
+            post_recording_exit_fault: None,
         }
     }
 }
@@ -888,6 +903,42 @@ fn workflow_checkout_outcome(
         return WorkflowCheckoutOutcomeV1::NotHealthy(CheckoutPreservationReasonV1::Cancellation);
     }
     WorkflowCheckoutOutcomeV1::NotHealthy(CheckoutPreservationReasonV1::NodeFailure)
+}
+
+/// The preserving outcome for a terminal executor error. An error is not a cancellation merely
+/// because it happened on a cancellation-aware path: the reason becomes durable claim evidence,
+/// so only an observed workflow cancellation may use the cancellation label.
+fn terminal_error_checkout_outcome(cancelled: bool) -> WorkflowCheckoutOutcomeV1 {
+    WorkflowCheckoutOutcomeV1::NotHealthy(if cancelled {
+        CheckoutPreservationReasonV1::Cancellation
+    } else {
+        CheckoutPreservationReasonV1::NodeFailure
+    })
+}
+
+/// Settle every owner recorded by the workflow cleanup tracker exactly once for this executor
+/// path. The tracker deduplicates an exact `(node, session, backend)` re-record and is never
+/// cleared, so this covers checkouts whose node-level cleanup already ran too.
+async fn settle_materialized_workflow_checkouts(
+    cleanup_tracker: &WorkflowCleanupTracker,
+    checkout_outcome: WorkflowCheckoutOutcomeV1,
+) {
+    for (checkout_node, owner) in cleanup_tracker.materialized_checkouts() {
+        let settled = owner
+            .backend
+            .settle_workflow_checkout_v1(&owner.session, checkout_outcome)
+            .await;
+        match &settled {
+            CheckoutSettlementV1::NoCheckoutUnderCustody => {}
+            settled => tracing::info!(
+                node = checkout_node.as_str(),
+                session = owner.session.as_str(),
+                ?checkout_outcome,
+                ?settled,
+                "R2f1b workflow-level checkout disposition settled"
+            ),
+        }
+    }
 }
 
 fn interval_union_ms(mut intervals: Vec<(std::time::Instant, std::time::Instant)>) -> u64 {
@@ -4689,6 +4740,22 @@ impl WorkflowExecutor {
                 }
             }
             let cleanup_tracker = Arc::new(WorkflowCleanupTracker::default());
+            // This macro is deliberately inside the stream, at every post-recording return site.
+            // `async_stream` resumes only when the consumer polls; yielding the terminal error
+            // before this await would allow a consumer drop to strand a materialized checkout.
+            // Validation-phase exits above this tracker remain effect-free by construction.
+            macro_rules! settle_error_before_yield {
+                ($primary_error:expr) => {{
+                    let primary_error = $primary_error;
+                    settle_materialized_workflow_checkouts(
+                        cleanup_tracker.as_ref(),
+                        terminal_error_checkout_outcome(cancel.is_cancelled()),
+                    )
+                    .await;
+                    yield Err(primary_error);
+                    return;
+                }};
+            }
             // Off-mode audit exemption (§18-7, operator-adjudicated): audit
             // rows are durable whenever the feature is enabled for at least
             // one node that can still RUN in this invocation; workflows with
@@ -5080,8 +5147,7 @@ impl WorkflowExecutor {
                     let raw_output = match raw_output {
                         Ok(output) => output,
                         Err(error) => {
-                            yield Err(error);
-                            return;
+                            settle_error_before_yield!(error);
                         }
                     };
                     let NodeRunOutput {
@@ -5125,8 +5191,7 @@ impl WorkflowExecutor {
                         {
                             Ok(committed) => committed,
                             Err(error) => {
-                                yield Err(BridgeError::from(error));
-                                return;
+                                settle_error_before_yield!(BridgeError::from(error));
                             }
                         };
                         if let Some(factory) = &ctx.make_rich_sink {
@@ -5201,6 +5266,13 @@ impl WorkflowExecutor {
                 if let (Some(controller), Some(authority)) =
                     (fanout_controller.as_mut(), frozen_authority.as_ref())
                 {
+                    #[cfg(test)]
+                    if ctx.post_recording_exit_fault
+                        == Some(PostRecordingExitFaultForTest::PolicyFinalize)
+                    {
+                        settle_error_before_yield!(BridgeError::InvalidStateTransition);
+                    }
+
                     let selection = match controller.finalize_ready_batch(
                         &authority.run_spec.attempt_id,
                         ready_terminals,
@@ -5209,27 +5281,30 @@ impl WorkflowExecutor {
                     ) {
                         Ok(selection) => selection,
                         Err(_) => {
-                            yield Err(BridgeError::InvalidStateTransition);
-                            return;
+                            settle_error_before_yield!(BridgeError::InvalidStateTransition);
                         }
                     };
                     let trigger_json = match selection.trigger.as_ref() {
                         Some(trigger) => match canonical_trigger_json_v1(trigger) {
                             Ok(encoded) => Some(encoded),
                             Err(error) => {
-                                yield Err(error);
-                                return;
+                                settle_error_before_yield!(error);
                             }
                         },
                         None => None,
                     };
                     let mut selected_node = None;
+                    #[cfg(test)]
+                    if ctx.post_recording_exit_fault == Some(PostRecordingExitFaultForTest::Encode)
+                    {
+                        settle_error_before_yield!(BridgeError::InvalidStateTransition);
+                    }
+
                     for ready in &selection.terminals {
                         let terminal_json = match canonical_terminal_json_v1(&ready.terminal) {
                             Ok(encoded) => encoded,
                             Err(error) => {
-                                yield Err(error);
-                                return;
+                                settle_error_before_yield!(error);
                             }
                         };
                         let selected = selection.trigger.as_ref().is_some_and(|trigger| {
@@ -5254,14 +5329,12 @@ impl WorkflowExecutor {
                             .iter()
                             .find(|(node, ..)| node == &selected_node)
                         else {
-                            yield Err(BridgeError::InvalidStateTransition);
-                            return;
+                            settle_error_before_yield!(BridgeError::InvalidStateTransition);
                         };
                         let Some((terminal_json, _, barrier_slot)) =
                             ready_event_evidence.get_mut(&selected_node)
                         else {
-                            yield Err(BridgeError::InvalidStateTransition);
-                            return;
+                            settle_error_before_yield!(BridgeError::InvalidStateTransition);
                         };
                         let checkpoint = PolicyTriggerCheckpointV1 {
                             node: selected_node,
@@ -5360,8 +5433,7 @@ impl WorkflowExecutor {
                             format!("[node {} not started: policy]", node.as_str()),
                         )
                     } else {
-                        yield Err(BridgeError::InvalidStateTransition);
-                        return;
+                        settle_error_before_yield!(BridgeError::InvalidStateTransition);
                     };
                     let terminal = NodeTerminalV1 {
                         schema_version: EXECUTION_POLICY_SCHEMA_V1,
@@ -5378,8 +5450,7 @@ impl WorkflowExecutor {
                     let terminal_json = match canonical_terminal_json_v1(&terminal) {
                         Ok(terminal_json) => terminal_json,
                         Err(error) => {
-                            yield Err(error);
-                            return;
+                            settle_error_before_yield!(error);
                         }
                     };
                     node_terminals.insert(node.clone(), terminal);
@@ -5396,9 +5467,13 @@ impl WorkflowExecutor {
                         policy_trigger_barrier_result: None,
                     });
                 }
+                #[cfg(test)]
+                if ctx.post_recording_exit_fault == Some(PostRecordingExitFaultForTest::Invariant) {
+                    settle_error_before_yield!(BridgeError::InvalidStateTransition);
+                }
+
                 if node_terminals.len() != graph.nodes.len() {
-                    yield Err(BridgeError::InvalidStateTransition);
-                    return;
+                    settle_error_before_yield!(BridgeError::InvalidStateTransition);
                 }
             }
             let (term_text, _, _usage) = outputs.get(&terminal_id).cloned().unwrap_or_default();
@@ -5458,22 +5533,7 @@ impl WorkflowExecutor {
                 cancel.is_cancelled(),
                 dispositions.values().copied(),
             );
-            for (checkout_node, owner) in cleanup_tracker.materialized_checkouts() {
-                let settled = owner
-                    .backend
-                    .settle_workflow_checkout_v1(&owner.session, checkout_outcome)
-                    .await;
-                match &settled {
-                    CheckoutSettlementV1::NoCheckoutUnderCustody => {}
-                    settled => tracing::info!(
-                        node = checkout_node.as_str(),
-                        session = owner.session.as_str(),
-                        ?checkout_outcome,
-                        ?settled,
-                        "R2f1b workflow-level checkout disposition settled"
-                    ),
-                }
-            }
+            settle_materialized_workflow_checkouts(cleanup_tracker.as_ref(), checkout_outcome).await;
             yield Ok(WorkflowEvent::CleanupObserved {
                 disposition: cleanup_disposition,
                 duration_ms: cleanup_ms,
@@ -5493,12 +5553,22 @@ mod tests {
     };
     use bridge_core::domain::{Part, PermissionRequest, RegistrySnapshot, SessionSpec};
     use bridge_core::error::BridgeError;
-    use bridge_core::ids::{AgentId, NodeId, SessionId, WorkflowId};
-    use bridge_core::ports::{AgentBackend, AgentRegistry, BackendStream, Lease, Resolved, Update};
+    use bridge_core::ids::{AgentId, AttemptId, NodeId, SessionId, WorkflowId};
+    use bridge_core::ports::{
+        AgentBackend, AgentRegistry, BackendStream, BoundEntryUseV1, Lease, Resolved, Update,
+    };
     use futures::StreamExt;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use tokio_util::sync::CancellationToken;
+
+    use crate::run_spec::WorkflowRunSpecV1;
+    use bridge_core::execution_policy::{
+        freeze_direct_checkout_v1, freeze_node_execution_identity_v1, freeze_provider_attempt_v1,
+        resolve_execution_policy_v1, ExecutionPolicyInvocationV1, FrozenProviderLogicalSessionV1,
+        HistoryAllocationKindV1, LedgerAdmissionV1, PolicyActivationV1, PolicyNodeRefV1,
+        ProviderFreezeInputV1, WorkflowControlDefaultsV1,
+    };
 
     #[test]
     fn cleanup_duration_is_the_union_of_overlapping_intervals() {
@@ -12765,6 +12835,13 @@ mod tests {
         async fn cancel(&self, _session: &SessionId) -> Result<(), BridgeError> {
             Ok(())
         }
+        async fn configure_bound_session(
+            &self,
+            _session: &SessionId,
+            _spec: &bridge_core::execution_policy::BoundSessionSpecV1,
+        ) -> Result<(), BridgeError> {
+            Ok(())
+        }
 
         async fn forget_session_checked(&self, _session: &SessionId) -> Result<(), BridgeError> {
             self.cleanups.fetch_add(1, Ordering::SeqCst);
@@ -12796,6 +12873,23 @@ mod tests {
                 backend: self.backend.clone(),
                 lease: Box::new(NoopLease),
             })
+        }
+        fn bind_entry_use(&self, id: &AgentId) -> Option<BoundEntryUseV1> {
+            let entry = Arc::new(minimal_entry(id));
+            Some(BoundEntryUseV1 {
+                entry: entry.clone(),
+                lease: Box::new(NoopLease),
+                use_token: bridge_core::ports::EntryUseTokenV1::new(Arc::new(()), &entry, 1),
+            })
+        }
+
+        async fn resolve_bound(
+            &self,
+            _bound: &BoundEntryUseV1,
+            _effect: &bridge_core::execution_policy::BoundProviderEffectV1,
+            _observer: Arc<dyn DiagnosticObserver>,
+        ) -> Result<Arc<dyn AgentBackend>, BridgeError> {
+            Ok(self.backend.clone())
         }
 
         fn default_id(&self) -> AgentId {
@@ -12838,6 +12932,58 @@ mod tests {
             controls: None,
         })
     }
+    fn frozen_settlement_run_spec() -> Arc<WorkflowRunSpecV1> {
+        let mut graph = (*settlement_graph("second")).clone();
+        graph.controls = Some(WorkflowControlDefaultsV1::default());
+        let agent = AgentId::parse("codex").unwrap();
+        let entry = minimal_entry(&agent);
+        let attempt_id = AttemptId::parse("attempt-35111111111111111111111111111111").unwrap();
+        let source = SessionCwd::parse("/repo/source").unwrap();
+        let mut nodes = graph.nodes.iter().collect::<Vec<_>>();
+        nodes.sort_by(|left, right| left.id.cmp(&right.id));
+        let identities = nodes
+            .into_iter()
+            .enumerate()
+            .map(|(ordinal, node)| {
+                let node = PolicyNodeRefV1::from_node_id(
+                    u32::try_from(ordinal).unwrap(),
+                    node.id.as_str(),
+                );
+                let provider = freeze_provider_attempt_v1(&ProviderFreezeInputV1 {
+                    entry: &entry,
+                    overrides: None,
+                    node: node.clone(),
+                    logical_session: FrozenProviderLogicalSessionV1::Execute {
+                        candidate_ordinal: 0,
+                    },
+                    checkout: freeze_direct_checkout_v1(source.clone()),
+                    provider_effect_key: None,
+                })
+                .unwrap();
+                freeze_node_execution_identity_v1(node, vec![provider]).unwrap()
+            })
+            .collect();
+        let controls = resolve_execution_policy_v1(
+            graph.controls.as_ref().unwrap(),
+            &ExecutionPolicyInvocationV1::default(),
+            false,
+            PolicyActivationV1::Production,
+        )
+        .unwrap();
+        Arc::new(
+            WorkflowRunSpecV1::build(
+                attempt_id,
+                graph,
+                controls,
+                Some(source),
+                identities,
+                LedgerAdmissionV1::HistoryLedgerAdmitted {
+                    kind: HistoryAllocationKindV1::Configured,
+                },
+            )
+            .unwrap(),
+        )
+    }
 
     async fn run_for_settlement(
         graph: Arc<WorkflowGraph>,
@@ -12854,10 +13000,147 @@ mod tests {
         let settlements = backend.settlements.lock().unwrap().clone();
         settlements
     }
+    async fn assert_frozen_post_recording_fault_settles_once(
+        fault: PostRecordingExitFaultForTest,
+        expected_settlements: usize,
+    ) {
+        let backend = Arc::new(SettlementBackend::default());
+        let run_spec = frozen_settlement_run_spec();
+        let context = WorkflowDiagnosticContext::in_memory(WorkflowRunContext {
+            session_cwd: run_spec.requested_session_cwd.clone(),
+            post_recording_exit_fault: Some(fault),
+            ..WorkflowRunContext::default()
+        })
+        .with_frozen_run_spec(run_spec.clone(), None)
+        .unwrap();
+        let events = WorkflowExecutor::new(Arc::new(SettlementRegistry {
+            backend: backend.clone(),
+        }))
+        .run_with_diagnostic_context(
+            Arc::new(run_spec.graph.clone()),
+            "input".into(),
+            "settlement-fault".into(),
+            CancellationToken::new(),
+            context,
+        )
+        .collect::<Vec<_>>()
+        .await;
+
+        assert!(matches!(
+            events.last(),
+            Some(Err(BridgeError::InvalidStateTransition))
+        ));
+        let settlements = backend.settlements.lock().unwrap().clone();
+        assert_eq!(settlements.len(), expected_settlements, "{settlements:?}");
+        let unique_sessions = settlements
+            .iter()
+            .map(|(session, _)| session)
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(unique_sessions.len(), settlements.len(), "{settlements:?}");
+        assert!(
+            settlements.iter().all(|(_, outcome)| *outcome
+                == WorkflowCheckoutOutcomeV1::NotHealthy(
+                    CheckoutPreservationReasonV1::NodeFailure
+                )),
+            "{settlements:?}"
+        );
+    }
+    #[tokio::test]
+    async fn a_policy_finalize_error_settles_before_yielding() {
+        assert_frozen_post_recording_fault_settles_once(
+            PostRecordingExitFaultForTest::PolicyFinalize,
+            1,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn an_encode_error_settles_before_yielding() {
+        assert_frozen_post_recording_fault_settles_once(PostRecordingExitFaultForTest::Encode, 1)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn an_invariant_error_settles_every_recorded_checkout_before_yielding() {
+        assert_frozen_post_recording_fault_settles_once(
+            PostRecordingExitFaultForTest::Invariant,
+            2,
+        )
+        .await;
+    }
+    #[tokio::test]
+    async fn a_pre_recording_validation_error_settles_no_checkout() {
+        let backend = Arc::new(SettlementBackend::default());
+        let registry = Arc::new(SettlementRegistry {
+            backend: backend.clone(),
+        });
+        let seed = [("unknown".to_string(), ("seed".to_string(), true, None))]
+            .into_iter()
+            .collect::<std::collections::HashMap<_, _>>();
+        let events = WorkflowExecutor::new(registry)
+            .run_from(
+                settlement_graph("second"),
+                "input".into(),
+                "pre-recording".into(),
+                CancellationToken::new(),
+                seed,
+            )
+            .collect::<Vec<_>>()
+            .await;
+        assert!(matches!(
+            events.as_slice(),
+            [Err(BridgeError::ConfigInvalid { .. })]
+        ));
+        assert!(backend.settlements.lock().unwrap().is_empty());
+    }
 
     /// §5.1's healthy path, from the executor's side: after EVERY node is terminal and every one
     /// of them completed, the post-loop pass settles each materialized checkout with the one
     /// outcome that can mint deletion authority.
+    /// The harvest-audit error is post-recording. Its settlement must complete before the error is
+    /// yielded because this consumer intentionally drops the stream as soon as it observes it.
+    #[tokio::test]
+    async fn a_harvest_error_settles_before_a_consumer_can_drop_the_stream() {
+        let backend = Arc::new(SettlementBackend::default());
+        let registry = Arc::new(SettlementRegistry {
+            backend: backend.clone(),
+        });
+        let mut graph = settlement_graph("second");
+        Arc::get_mut(&mut graph)
+            .expect("the fixture graph has one owner")
+            .nodes[0]
+            .harvest_sanitization = Some(HarvestSanitizationMode::AttestedPrefixV1);
+        let ctx = WorkflowRunContext {
+            task_id: Some(bridge_core::ids::TaskId::parse("task-settlement-error").unwrap()),
+            harvest_audit_store: Arc::new(FailingHarvestAuditStore),
+            ..WorkflowRunContext::default()
+        };
+        let mut stream = WorkflowExecutor::new(registry).run_with_context(
+            graph,
+            "input".into(),
+            "settlement-error".into(),
+            CancellationToken::new(),
+            ctx,
+        );
+        let saw_error = loop {
+            let event = stream.next().await.expect("the audit error is terminal");
+            if matches!(event, Err(BridgeError::HarvestAuditPersistFailed { .. })) {
+                break true;
+            }
+        };
+        assert!(saw_error);
+        drop(stream);
+        let settlements = backend.settlements.lock().unwrap().clone();
+        assert_eq!(
+            settlements.len(),
+            1,
+            "the recorded checkout settled exactly once"
+        );
+        assert_eq!(
+            settlements[0].1,
+            WorkflowCheckoutOutcomeV1::NotHealthy(CheckoutPreservationReasonV1::NodeFailure)
+        );
+    }
     ///
     /// Discriminates a pass that never runs (no settlements at all) and one that settles per node
     /// rather than per checkout.
@@ -13209,6 +13492,7 @@ mod observability_tests {
     async fn workflow_node_emits_lifecycle_around_usage() {
         let rec = Arc::new(Rec::default());
         let ctx = WorkflowRunContext {
+            post_recording_exit_fault: None,
             session_cwd: None,
             make_rich_sink: None,
             observer: rec.clone(),
@@ -13383,6 +13667,7 @@ mod observability_tests {
     async fn warm_path_emits_full_lifecycle() {
         let rec = Arc::new(DetailedRec::default());
         let ctx = WorkflowRunContext {
+            post_recording_exit_fault: None,
             session_cwd: None,
             make_rich_sink: None,
             observer: rec.clone(),
@@ -13502,6 +13787,7 @@ mod observability_tests {
     async fn dispatcher_empty_final_fails_without_replaying_in_a_fresh_checkout() {
         let rec = Arc::new(DetailedRec::default());
         let ctx = WorkflowRunContext {
+            post_recording_exit_fault: None,
             session_cwd: None,
             make_rich_sink: None,
             observer: rec,
@@ -13638,6 +13924,7 @@ mod observability_tests {
     async fn cold_path_ttft_some_when_text_emitted() {
         let rec = Arc::new(DetailedRec::default());
         let ctx = WorkflowRunContext {
+            post_recording_exit_fault: None,
             session_cwd: None,
             make_rich_sink: None,
             observer: rec.clone(),
@@ -13742,6 +14029,7 @@ mod observability_tests {
     async fn fatal_timedout_produces_failed_timed_out_class() {
         let rec = Arc::new(DetailedRec::default());
         let ctx = WorkflowRunContext {
+            post_recording_exit_fault: None,
             session_cwd: None,
             make_rich_sink: None,
             observer: rec.clone(),
@@ -13866,6 +14154,7 @@ mod observability_tests {
         let calls = Arc::new(AtomicUsize::new(0));
         let rec = Arc::new(DetailedRec::default());
         let ctx = WorkflowRunContext {
+            post_recording_exit_fault: None,
             session_cwd: None,
             make_rich_sink: None,
             observer: rec.clone(),
@@ -14040,6 +14329,7 @@ mod observability_tests {
     async fn workflow_success_without_usage_emits_explicit_no_usage() {
         let rec = Arc::new(UsageFinalRec::default());
         let ctx = WorkflowRunContext {
+            post_recording_exit_fault: None,
             session_cwd: None,
             make_rich_sink: None,
             observer: rec.clone(),
@@ -14066,6 +14356,7 @@ mod observability_tests {
     async fn workflow_failure_without_usage_emits_explicit_no_usage() {
         let rec = Arc::new(UsageFinalRec::default());
         let ctx = WorkflowRunContext {
+            post_recording_exit_fault: None,
             session_cwd: None,
             make_rich_sink: None,
             observer: rec.clone(),
@@ -14092,6 +14383,7 @@ mod observability_tests {
     async fn workflow_cancel_without_usage_emits_explicit_no_usage() {
         let rec = Arc::new(StartAndUsageFinalRec::default());
         let ctx = WorkflowRunContext {
+            post_recording_exit_fault: None,
             session_cwd: None,
             make_rich_sink: None,
             observer: rec.clone(),
@@ -14129,6 +14421,7 @@ mod observability_tests {
     async fn turn_finished_emitted_before_usage_finalized_cold_path() {
         let rec = Arc::new(OrderRec::default());
         let ctx = WorkflowRunContext {
+            post_recording_exit_fault: None,
             session_cwd: None,
             make_rich_sink: None,
             observer: rec.clone(),
@@ -14177,6 +14470,7 @@ mod observability_tests {
     async fn turn_finished_emitted_before_usage_finalized_warm_path() {
         let rec = Arc::new(OrderRec::default());
         let ctx = WorkflowRunContext {
+            post_recording_exit_fault: None,
             session_cwd: None,
             make_rich_sink: None,
             observer: rec.clone(),
@@ -14302,6 +14596,7 @@ mod observability_tests {
         });
         let rich_sink = Arc::new(PromptOpenRichSink::default());
         let ctx = WorkflowRunContext {
+            post_recording_exit_fault: None,
             session_cwd: None,
             make_rich_sink: Some(Arc::new(PromptOpenRichFactory {
                 sink: rich_sink.clone(),
@@ -14376,6 +14671,7 @@ mod observability_tests {
     async fn dispatcher_prompt_error_emits_explicit_no_usage() {
         let rec = Arc::new(PromptOpenFinalizationRec::default());
         let ctx = WorkflowRunContext {
+            post_recording_exit_fault: None,
             session_cwd: None,
             make_rich_sink: None,
             observer: rec.clone(),

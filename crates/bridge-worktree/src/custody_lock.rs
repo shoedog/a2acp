@@ -32,7 +32,8 @@
 //!   → operation lock (implement-resume, verify, run-id: liveness::acquire_persistent_lock*)
 //!     → checkout PUBLICATION cell (this module, one per checkout, keyed by target path)
 //!       → custody cell (this module, one per checkout, keyed by custody id)
-//!         → in-process backend mutexes (WorktreeBackend map / cleanup cells / cell state)
+//!         → in-process backend mutexes (WorktreeBackend map / cleanup cells / cell state /
+//!           deletion admission — slice 3s)
 //! ```
 //!
 //! Who takes what:
@@ -44,13 +45,20 @@
 //!   with the refusing acquirer — `backend::CheckoutRemovalWindowV1` and
 //!   `sweep::remove_worktree_if_safe`.
 //!
-//! **File lock inside in-process mutex.** There are TWO deliberate inverse nestings. The deletion
-//! gate takes the publication cell while holding the cleanup cell's async `state` mutex
+//! **File lock inside in-process mutex.** There are THREE deliberate inverse nestings. The
+//! deletion gate takes the publication cell while holding the cleanup cell's async `state` mutex
 //! (`CleanupCellState`); the deletion-capability branch likewise holds that mutex while its
-//! blocking custodian takes publication then custody cells across mint → `remove_v2` → tombstone.
-//! Both are safe: no holder of either file cell waits for `cell.state` — writer/custodian work runs
-//! in `spawn_blocking` without a backend mutex held — so neither nesting can form a cycle. Stated
-//! explicitly because the capability branch is not merely the gate's old inverse nesting.
+//! blocking custodian takes publication then custody cells across mint → `remove_v2` → tombstone;
+//! and since slice 3s the capability branch ALSO holds the cell's `deletion_admission` mutex
+//! across that same custodian window AND through the map projection of a completed removal
+//! (repair R1: released earlier, a queued preservation writer could observe the stale
+//! pre-projection map). All three are safe by the same argument: no holder of either file cell
+//! ever waits for `cell.state` or `deletion_admission` — writer/custodian work runs in
+//! `spawn_blocking` without a backend mutex held, and `raise_checkout_disposition`'s callers take
+//! `deletion_admission` while holding neither the map nor any file cell. The PROHIBITION that
+//! keeps it safe: a file-cell holder must never acquire `deletion_admission`; a
+//! `deletion_admission` holder may acquire file cells (that is the mint's nesting) but never the
+//! run lease or an operation lock.
 //!
 //! A custody-lock holder must therefore never acquire a run lease or an operation lock, and must
 //! never hold the lock across an `.await` that can only complete once another task takes it.
