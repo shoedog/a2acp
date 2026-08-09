@@ -10,7 +10,7 @@
 
 **(a) Lane ownership** — this session owns slice-2 orchestration; the 2b1 implementer COMPLETED (`fb9aad76`, deliverable in `.2b1-handoff.md`) `[MEASURED]` completion notification + git log — **RESOLVED 2026-08-09**; two REVIEW agents now alive (opus senior-lead subagent; sol via bridge `exec-a4747d507440b82851a2940f105cf9ef`) — **OPEN until both report**
 **(b) Custody exposure** — `[MEASURED]` `git fetch`: origin/main = local main = `b4fc1ff3` (2a fold IS pushed; older notes saying "unpushed past cffd8e60" are stale). Planning branch `agent/r2f1b-pre-slice2-custody-plan` is deliberately local-only (owner practice). Prompts §2c commits pushed on `agent/prompts-2c-outbound-refutation` (`fe4532aa`) — **RESOLVED this session**
-**(c) In flight / irreversible** — dual-lens review running against `.claude/worktrees/s2b1` @ `fb9aad76`: opus senior-lead (static-only) + sol/xhigh via bridge dogfood `run-workflow code-review` (launched from the s2b1 worktree; fold debug binary). Do not modify the worktree/branch until both verdicts land and are adjudicated — **OPEN**
+**(c) In flight / irreversible** — nothing in flight. 2b1 pushed (`3d1fef9c`); no live agents; s2b1 worktree retained as the branch's home (branch fully folded, safe to prune) — **RESOLVED 2026-08-09**
 **(d) Authorization granted but not exercised** — dual-lens review is MANDATORY for 2b1 ("dual — this is the deletion-authority gate", slice-2 brief §3); one-round review cap per sub-slice with targeted repair for closed-enumerable findings (brief §3 preamble). Owner posture rule: sol reviews adjudicated senior-lead, evidence discipline retained.
 
 ## 1. Resume order
@@ -33,8 +33,10 @@
 | 2b1 implementer §2c SELF-PASS | done | `[INHERITED]` REFUTED-as-written, narrowed claim survived: sweep::remove_worktree + host_git::cleanup_failed_add are separate removal sites (owners: 2a arms / R-7 in 2b2); record in `.2b1-handoff.md` §5 |
 | 2b1 dual-lens review | done | `[MEASURED]` opus SHIP (1 doc WRONG W-1 + 10 SMELL, all DEFER; 3 gate decisions ENDORSED with mechanism checks) vs sol REJECT (3 WRONG BLOCKERs + 2 SMELL DEFER); full texts in session task outputs |
 | 2b1 adjudication | done | `[MEASURED against source]` sol-3 (replace `Err`≠no-effect under NFS error-after-effect) → REPAIR NOW; sol-1 (refusal projected Complete) + sol-2 (Reserving loses cleanup owner) → DEFER: typed retained disposition + ownership retention = 2c1 obligations; add-prohibition SAME-PR-as-writer + both-records coexistence test (opus W-1) = 2b2 obligations; opus W-1/S-4/S-5/S-9 doc repairs in-round; R-2 risk row downgraded to "partially resolved" at fold |
-| 2b1 targeted repair (declared single round) | next | `[MEASURED]` dispatched to implementer agent with R1/R2/R3 spec; verify-on-return by orchestrator, NO second sol round (cap) |
-| 2b1 fold + full gates + review record | pending | blocked by repair return; review record → `docs/superpowers/reviews/2026-08-08-s2b1-dual-review.md` at fold |
+| 2b1 targeted repair (declared single round) | done | `[MEASURED]` `775db6b3`; R1 classify-failed-rename verified in source by orchestrator; PARKED-1 surfaced (rename_child_no_replace errno-trust, FAIL-OPEN) |
+| 2b1 fold + full gates + push | done | `[MEASURED]` origin/main → `3d1fef9c` (squash; docs `64e48859`); gates: diff-check/fmt/check/clippy clean, workspace 3663/0/12 across 89, release build ok, repo-hygiene ok (task output b2xwc8vxr) |
+| PARKED-1 bounded PR (rename_child_no_replace) | parked | `[MEASURED]` mechanism in `reviews/2026-08-08-s2b1-dual-review.md`; own PR per custody plan §4; NOT dispatched |
+| 2b2 dispatch | next | brief §3 "2b2" + binding obligations in the dual-review ledger (add-prohibition SAME PR as writer; both-records coexistence test; sweep redundant-guard item; .custody-locks storage-report class) |
 | READTHIS §2c prompt commits | done | `[MEASURED]` `agent/prompts-2c-outbound-refutation` pushed (`fe4532aa`); READTHIS deleted |
 | 2b2 / 2c1 / 2c2 / 2d | pending | brief §3; strictly after 2b1 folds |
 
