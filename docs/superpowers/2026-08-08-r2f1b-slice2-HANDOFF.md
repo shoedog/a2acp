@@ -1,27 +1,30 @@
 # Handoff — R2f1b slice 2 orchestration (2b1 in flight)
 
 **Written:** 2026-08-09T00:56:59Z · **By:** session b2f72f61 (Fable orchestrator) · **Provider:** claude
-**Workspace:** a2a-bridge · `agent/r2f1b-pre-slice2-custody-plan` · **Measured state:** `[MEASURED]` HEAD `5297da7c` · Tree DIRTY (3 untracked files, none this lane's: `SSOT_AGENTS_BRIDGE_COORDINATION.md`, 2 `examples/*.toml`) · Probe `git status` · Output inline this session
+**Refreshed:** 2026-08-09 (2c2 dispatch) · **By:** session 9337e035 (Fable orchestrator, successor lane owner)
+**Workspace:** a2a-bridge · `agent/r2f1b-pre-slice2-custody-plan` · **Measured state:** `[MEASURED]` HEAD `bb46529c` at refresh · Tree DIRTY (3 untracked files, none this lane's: `SSOT_AGENTS_BRIDGE_COORDINATION.md`, 2 `examples/*.toml`) · Probe `git status` · Output inline this session
 **Predecessor:** session 82410dd4 (2a fold + brief rev 2), via memory `r2f1b-custody-plan-rev2-review.md`
 **Truth ordering:** measured live state > explicit owner/contract authority within its scope > this handoff for current operational state > earlier handoffs and non-authoritative summaries. A conflict between tiers stays OPEN in §0 — never resolved by document class alone.
 **Provenance:** written live by the worker. `[MEASURED]` claims were probed by this writer; `[INHERITED]` claims were not.
 
 ## 0. Gating facts — settle these before starting anything below
 
-**(a) Lane ownership** — this session owns slice-2 orchestration; the 2b1 implementer COMPLETED (`fb9aad76`, deliverable in `.2b1-handoff.md`) `[MEASURED]` completion notification + git log — **RESOLVED 2026-08-09**; two REVIEW agents now alive (opus senior-lead subagent; sol via bridge `exec-a4747d507440b82851a2940f105cf9ef`) — **OPEN until both report**
-**(b) Custody exposure** — `[MEASURED]` `git fetch`: origin/main = local main = `b4fc1ff3` (2a fold IS pushed; older notes saying "unpushed past cffd8e60" are stale). Planning branch `agent/r2f1b-pre-slice2-custody-plan` is deliberately local-only (owner practice). Prompts §2c commits pushed on `agent/prompts-2c-outbound-refutation` (`fe4532aa`) — **RESOLVED this session**
-**(c) In flight / irreversible** — nothing in flight. 2b1 pushed (`3d1fef9c`); no live agents; s2b1 worktree retained as the branch's home (branch fully folded, safe to prune) — **RESOLVED 2026-08-09**
-**(d) Authorization granted but not exercised** — dual-lens review is MANDATORY for 2b1 ("dual — this is the deletion-authority gate", slice-2 brief §3); one-round review cap per sub-slice with targeted repair for closed-enumerable findings (brief §3 preamble). Owner posture rule: sol reviews adjudicated senior-lead, evidence discipline retained.
+**(a) Lane ownership** — session 9337e035 owns slice-2 orchestration; the 2c2 IMPLEMENTER is ALIVE (opus subagent, dispatched 2026-08-09) in worktree `s2c2` — **OPEN until it completes**
+**(b) Custody exposure** — `[MEASURED]` `git fetch` this session: origin/main = local main = `23909d5c` (2a, 2b1, PARKED-1, 2b2, 2c1 all folded and pushed). Planning branch `agent/r2f1b-pre-slice2-custody-plan` is deliberately local-only (owner practice). Prompts §2c commits pushed on `agent/prompts-2c-outbound-refutation` (`fe4532aa`)
+**(c) In flight / irreversible** — 2c2 implement IN FLIGHT: worktree `.claude/worktrees/s2c2`, branch `feat/r2f1b-2c2-deletion`, base `23909d5c`; dispatch brief at the §6 path. Nothing irreversible outstanding
+**(d) Authorization granted but not exercised** — OWNER WORD RECEIVED 2026-08-09: proceed to 2c2 with its full accumulated ledger (DeleteAuthorized CAS, remove_v2, post-loop mint, disposition monotonicity, gate-retained deaths). Dual-lens review MANDATORY for 2c2 (deletion authority); one-round cap with targeted repair for closed-enumerable findings. Owner posture rule: sol reviews adjudicated senior-lead, evidence discipline retained.
 
 ## 1. Resume order
 
-1. Read the implementer deliverable: `.claude/worktrees/s2b1/.2b1-handoff.md` (mirror of its final message). If absent, the agent died — inspect the worktree diff directly before anything else.
-2. Dual-lens review of the artifact: (a) opus senior-lead review agent; (b) sol/high via bridge dogfood `run-workflow code-review` (brief needs `task-type: code-review` front-matter; see memory `a2a-bridge-review-tooling`). One round, cap declared before dispatch.
+1. Read the 2c2 implementer deliverable:
+   `.claude/worktrees/s2c2/docs/superpowers/reviews/2026-08-09-s2c2-implementer-handoff.md`
+   (mirror of its final message). If absent, the agent died — inspect the worktree diff directly before anything else.
+2. Dual-lens review of the artifact: (a) opus senior-lead review agent; (b) sol/high via bridge dogfood `run-workflow code-review` (brief needs `task-type: code-review` front-matter; see memory `a2a-bridge-review-tooling`). One round, cap declared before dispatch. 2c1 posture note stands: the handoff's behavioral claims are review surface, not context.
 3. Adjudicate on primary evidence; closed-enumerable findings → one targeted repair on the branch.
 4. Fold to local `main` in `.claude/worktrees/fold`; run full aggregate gates there (checkout is under `~/code` — GOTCHA 1): `cargo fmt --all -- --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace` + `git diff --check`, release build, `validate --repo-hygiene`. Report exact totals.
-5. Write the review record to `docs/superpowers/reviews/2026-08-08-s2b1-dual-review.md` (pattern: `2026-08-08-s2a-dual-review.md`), reconcile memory + this handoff, push main per owner practice (origin/main was at `b4fc1ff3` when checked).
+5. Write the review record to `docs/superpowers/reviews/2026-08-09-s2c2-dual-review.md` (pattern: `2026-08-09-s2c1-dual-review.md`), reconcile memory + this handoff, push main per owner practice (origin/main was at `23909d5c` when checked).
 
-**STOP conditions:** implementer reports the fan-in claim REFUTED (a production deletion path bypasses the removal block) → that reshapes the gate design, park and re-plan, do not fold. A fail-first test staying red = defect in merged code → park + report, fix is its own PR (custody plan §4). Findings open-class at the review cap → park and escalate.
+**STOP conditions:** implementer reports the §2c capability claim REFUTED (a destructive path is reachable without a capability, or a mint is reachable from a non-healthy outcome or context-free caller) → that reshapes the deletion design, park and re-plan, do not fold. A fail-first test staying red = defect in merged code → park + report, fix is its own PR (custody plan §4). Findings open-class at the review cap → park and escalate. A failure boundary appearing to need a NEW transition-table edge → park (the table is frozen).
 
 ## 2. State ledger
 
@@ -47,9 +50,9 @@
 | 2c1 dual-lens review | done | `[MEASURED]` opus REVISE (W1 locator no-downgrade, W2 PreservationPrepared strand — both in preserve_after_cancel; W3 disposition-dies-with-cell DEFER; 10 SMELL; preservation-only invariant HOLDS, P5 split CORRECT, P3 key correct-as-key) + sol REJECT (7 BLOCKERs; B-2 cold-failure inventory unarmed and B-4 identity window adjudicated IN-scope; B-3 manager-preserve REFUTED — context-free callers must not arm Preserve; B-5 = accepted 2b1 trade; B-6 = owner-accepted V2 case + slice-5 remainder). Task outputs hold full texts |
 | 2c1 targeted repair (declared single round) | done | `[MEASURED]` `b5c7f1ba`; RA–RE all red-first, 0 pushback, 2 justified widenings; focused 2614/0/11 |
 | 2c1 fold + full gates + push | done | `[MEASURED]` origin/main → `23909d5c` (docs `297927b4`); gates 3775/0/12 across 89, release+hygiene ok (task bux4rsov4); review record `reviews/2026-08-09-s2c1-dual-review.md` |
-| 2c2 dispatch (deletion capability) | next | AWAITING OWNER WORD — brief §3 "2c2" + 2c2 ledger (disposition monotonicity across cell eviction; post-loop mint; disposition of gate-retained context-free deaths; DeleteAuthorized CAS; remove_v2 across ten impls; NodeTurnCleanup drain) |
+| 2c2 dispatch (deletion capability) | in flight | OWNER WORD RECEIVED 2026-08-09 ("proceed to 2c2 … the slice that closes 2c1's deliberate leak"). Dispatched: opus implementer, worktree `s2c2`, branch `feat/r2f1b-2c2-deletion`, base `23909d5c`; brief covers DeleteAuthorized CAS + DeletionCapabilityV1, remove_v2 (11 provider impls measured on base — brief's "nine"/ledger's "ten" are stale counts), post-loop mint (anchor drifted: `node_observation` ~`:5017`, `observation()` ~`:5289`), drain choice (AgentBackend defaulted API vs NodeTurnCleanup handle — 7 impls incl. `WarmNodeCleanup` in bridge-a2a-inbound), disposition monotonicity across cell eviction (opus W3), gate-retained context-free deaths, Sol 24 failure boundaries |
 | READTHIS §2c prompt commits | done | `[MEASURED]` `agent/prompts-2c-outbound-refutation` pushed (`fe4532aa`); READTHIS deleted |
-| 2b2 / 2c1 / 2c2 / 2d | pending | brief §3; strictly after 2b1 folds |
+| 2d | pending | brief §3; strictly after 2c2 folds |
 
 ## 3. Corrections to standing documents and memory
 
@@ -61,9 +64,10 @@
 
 | # | Work | State | Exact next action | Blocked by | Identifiers |
 |---:|---|---|---|---|---|
-| 1 | 2b1 artifact review | pending | §1 steps 1–2 | implementer completion | worktree `s2b1` |
-| 2 | 2b1 fold + gates + push | pending | §1 steps 4–5 | #1 | fold worktree, local `main` |
-| 3 | 2b2 dispatch | pending | re-read brief §3 "2b2"; carries sweep redundant-guard coverage item (s2a review) + custody.rs docstring obligations | #2 | — |
+| 1 | 2c2 implement | in flight | await completion notification; then §1 step 1 | — | worktree `s2c2` |
+| 2 | 2c2 dual-lens review + adjudication | pending | §1 steps 2–3 | #1 | opus subagent + sol via bridge |
+| 3 | 2c2 fold + gates + push + record | pending | §1 steps 4–5 | #2 | fold worktree, local `main` |
+| 4 | 2d dispatch (claim-exchange mechanism, production-inactive) | pending | re-read brief §3 "2d"; carries slice-3/5/R2f2 ledger rows from the 2c1/2c2 records | #3 | — |
 
 ## 5. Invariants and traps — do not do these
 
@@ -71,7 +75,8 @@
 - Never test after `git worktree move` without `cargo clean` — stale embedded paths look like mass regressions. (GOTCHA 2)
 - Never trust `cargo test -p` on feature-sensitive fixtures — verify under `--workspace` (serde_json `preserve_order` unification). (GOTCHA 3)
 - Never dispatch a fable subagent without owner-vetted need (standing rule, memory `fable-allow-gate-shipped`).
-- Never edit `.claude/worktrees/s2b1` while the implementer owns it.
+- Never edit `.claude/worktrees/s2c2` while the implementer owns it.
+- The transition table is FROZEN — `LiveProtected → DeleteAuthorized → Removed` already exist; a failure boundary appearing to need a NEW edge is a park, never an edit.
 - Long tool-call payloads truncate intermittently — file-plus-pointer for specs, small append chunks for docs (predecessor session trap).
 - The 13 legacy `configure_session` tests in `backend.rs` must stay green UNTOUCHED through 2b1 (brief §8.1 R3).
 
@@ -79,17 +84,18 @@
 
 | Item | Verbatim |
 |---|---|
-| origin/main = local main (2a folded) | `b4fc1ff3` |
+| origin/main = local main (2a…2c1 folded) | `23909d5c` |
 | slice-2 brief commit / path | `fc98e343` · `docs/superpowers/plans/2026-08-08-r2f1b-slice2-brief.md` |
-| 2b1 worktree / branch | `/Users/wesleyjinks/code/a2a-bridge/.claude/worktrees/s2b1` · `feat/r2f1b-2b1-protection-gate` |
-| 2b1 dispatch brief | `/private/tmp/claude-501/-Users-wesleyjinks-code-a2a-bridge/b2f72f61-42ce-4fa3-940a-60b47f5c537e/scratchpad/2b1-dispatch-brief.md` |
-| 2b1 implementer deliverable mirror | `.claude/worktrees/s2b1/.2b1-handoff.md` |
+| 2c2 worktree / branch / base | `/Users/wesleyjinks/code/a2a-bridge/.claude/worktrees/s2c2` · `feat/r2f1b-2c2-deletion` · `23909d5c` |
+| 2c2 dispatch brief | `/private/tmp/claude-501/-Users-wesleyjinks-code-a2a-bridge/9337e035-8348-4206-97af-21223ccae4c8/scratchpad/2c2-dispatch-brief.md` |
+| 2c2 implementer deliverable mirror | `.claude/worktrees/s2c2/docs/superpowers/reviews/2026-08-09-s2c2-implementer-handoff.md` |
+| prior sub-slice worktrees (folded, branches safe to prune) | `s2b1` (`fix/noreplace-errno-classify`), `s2b2`, `s2c1` |
 | prompts §2c pushed branch | `agent/prompts-2c-outbound-refutation` @ `fe4532aa` |
 | fold worktree (local main) | `/Users/wesleyjinks/code/a2a-bridge/.claude/worktrees/fold` |
-| planning branch (local-only) | `agent/r2f1b-pre-slice2-custody-plan` @ `5297da7c` |
+| planning branch (local-only) | `agent/r2f1b-pre-slice2-custody-plan` @ `bb46529c` + this refresh |
 
 ## 7. Refutation verdict and owner questions
 
-**§2c verdict:** NOT RUN — interim checkpoint; no claim-bearing handover leaves this session yet (the 2b1 implementer's deliverable carries its own mandated SELF-PASS, and the post-review fold record will carry this lane's) · claim: "every production deletion path that can remove a worktree checkout funnels through the removal block in `run_cleanup_flight`" · pass: SELF-PASS (NOT INDEPENDENT) planned at implementer handoff · evidence tier: STATIC-ONLY planned · record: `.2b1-handoff.md` §5 when it lands
+**§2c verdict:** NOT RUN — interim checkpoint; no claim-bearing handover leaves this session yet (the 2c2 implementer's deliverable carries its own mandated SELF-PASS, and the post-review fold record will carry this lane's) · claim: "provider removal of a custody-discriminated checkout is reachable only by consuming a `DeletionCapabilityV1` minted through the `LiveProtected → DeleteAuthorized` CAS from a globally-healthy workflow outcome — single-use, identity-revalidated, unreachable from preservation-armed, context-free, or non-healthy paths" · pass: SELF-PASS (NOT INDEPENDENT) mandated at implementer handoff · evidence tier: STATIC + test-driven planned · record: `s2c2-implementer-handoff.md` §5 when it lands
 
 **Questions the owner owes an answer to:** None.
