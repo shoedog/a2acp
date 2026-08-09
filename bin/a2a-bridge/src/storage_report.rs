@@ -1529,8 +1529,95 @@ pub fn scan_implement_root(root: &Path, notes: &mut Vec<String>) -> Vec<ReportIt
     items
 }
 
+/// The two record suffixes a worktree root can carry, and what each says about its sibling.
+///
+/// Added in R2f1b slice 2b2 because V3 publishes `<name>.custody.v1.json` INSTEAD OF
+/// `<name>.meta.json`: a report that knew only the legacy suffix would show every V3 record and
+/// every V3 checkout's custody evidence as `Unclassified` — bridge-owned bytes presented as
+/// garbage, which is exactly what risk R-4 named.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WorktreeRecordKindV1 {
+    /// `<name>.meta.json` — the V2 sidecar. Its `lease` field is a run-lease handle.
+    LegacySidecar,
+    /// `<name>.custody.v1.json` — the V3 custody record. Its holder state is derived from the
+    /// custody STATE, not from a lease: V3 protection is the record itself (§5.2), and a live
+    /// custody state is held by definition while a terminal one is awaiting R2f2 disposition.
+    CustodyRecord,
+    /// `<name>.custody.v1.json.staging-<hex>` — a quarantined staged publication (2b2's residue
+    /// policy). Recovery-owned, never a checkout.
+    CustodyStagingResidue,
+}
+
+impl WorktreeRecordKindV1 {
+    fn classify(name: &str) -> Option<Self> {
+        if name.ends_with(".meta.json") {
+            Some(Self::LegacySidecar)
+        } else if bridge_worktree::custody::is_custody_record_name(name) {
+            Some(Self::CustodyRecord)
+        } else if bridge_worktree::custody_writer::is_staged_custody_residue(name) {
+            Some(Self::CustodyStagingResidue)
+        } else {
+            None
+        }
+    }
+
+    fn note(self) -> &'static str {
+        match self {
+            Self::LegacySidecar => "worktree custody sidecar",
+            Self::CustodyRecord => "R2f1b worktree custody record",
+            Self::CustodyStagingResidue => {
+                "R2f1b staged custody publication (quarantined; recovery-owned)"
+            }
+        }
+    }
+}
+
+/// Record one holder answer for a path, combining it with any answer already there through the
+/// module's existing [`merge_holder`] lattice (`Held` dominates; `Unknown` beats `Free`).
+///
+/// A checkout can be named by TWO records at once — 2b1's deletion gate manufactures exactly that
+/// state, retaining the legacy sidecar beside a custody record — and the two are probed from
+/// different evidence: the sidecar from its run lease, the custody record from its custody state.
+/// Plain insertion made the answer depend on FILENAME SORT ORDER, and `.custody.v1.json` sorts
+/// before `.meta.json`, so a checkout held by a live custody record was reported free the moment a
+/// stale sidecar sat beside it. Reusing `merge_holder` rather than inventing a second rule also
+/// keeps "one runtime's 'nobody' must not mask another's 'cannot tell'" true here (repair R8a).
+fn record_holder(map: &mut BTreeMap<String, HolderState>, key: String, state: HolderState) {
+    let merged = match map.get(&key).copied() {
+        Some(existing) => merge_holder(existing, state),
+        None => state,
+    };
+    map.insert(key, merged);
+}
+
+/// Holder state for a V3 custody record, derived from its own custody state.
+///
+/// `Held` for every state whose checkout is live or protective, because the record IS the
+/// protection and no lease can be consulted for it. `Free` is never produced: no custody state
+/// this slice can publish releases the checkout, and answering "free" for one would invite a
+/// reaper to treat protected work as reclaimable.
+fn custody_record_holder_state(path: &Path) -> HolderState {
+    let Ok(bytes) = std::fs::read(path) else {
+        return HolderState::Unknown;
+    };
+    match bridge_worktree::custody::WorktreeCustodyRecordV1::decode_canonical(&bytes) {
+        Ok(record) => match record.sweep_disposition() {
+            bridge_worktree::custody::CustodySweepDispositionV1::Recover
+            | bridge_worktree::custody::CustodySweepDispositionV1::Preserved => HolderState::Held,
+            // Marker-only and refused records name no protected checkout of their own, and an
+            // unknown one is exactly that.
+            _ => HolderState::Unknown,
+        },
+        Err(_) => HolderState::Unknown,
+    }
+}
+
 /// Scan one `[worktrees].root`. Each `<name>.meta.json` sidecar is Evidence and binds its sibling
 /// worktree's run lease; each sibling directory is a `SourceCheckout` of kind `LinkedWorktree`.
+///
+/// R2f1b slice 2b2 adds the second suffix: `<name>.custody.v1.json` is Evidence too, associates
+/// with the same sibling, and takes its holder state from the custody state. V2 output is
+/// unchanged — a root with no V3 records produces byte-identical items.
 pub fn scan_worktree_root(root: &Path, notes: &mut Vec<String>) -> Vec<ReportItem> {
     let mut items = Vec::new();
     let Ok(rd) = std::fs::read_dir(root) else {
@@ -1546,13 +1633,28 @@ pub fn scan_worktree_root(root: &Path, notes: &mut Vec<String>) -> Vec<ReportIte
     let mut sidecar_leases: BTreeMap<String, HolderState> = BTreeMap::new();
     for entry in &entries {
         let s = entry.to_string_lossy();
-        if !s.ends_with(".meta.json") || is_symlink(entry) {
+        if is_symlink(entry) {
             continue;
         }
-        if let Some(sidecar) = bridge_worktree::provider_path::read_sidecar(&s) {
-            let state = probe_lock_path(Path::new(&sidecar.lease));
-            leases.insert(sidecar.worktree_path.clone(), state);
-            sidecar_leases.insert(display_path(entry), state);
+        match WorktreeRecordKindV1::classify(&s) {
+            Some(WorktreeRecordKindV1::LegacySidecar) => {
+                if let Some(sidecar) = bridge_worktree::provider_path::read_sidecar(&s) {
+                    let state = probe_lock_path(Path::new(&sidecar.lease));
+                    record_holder(&mut leases, sidecar.worktree_path.clone(), state);
+                    record_holder(&mut sidecar_leases, display_path(entry), state);
+                }
+            }
+            Some(WorktreeRecordKindV1::CustodyRecord) => {
+                // Sibling association by NAME, the same rule the sweep uses: strip the suffix.
+                let state = custody_record_holder_state(entry);
+                if let Some(sibling) =
+                    s.strip_suffix(bridge_worktree::custody::CUSTODY_RECORD_SUFFIX)
+                {
+                    record_holder(&mut leases, display_path(Path::new(sibling)), state);
+                }
+                record_holder(&mut sidecar_leases, display_path(entry), state);
+            }
+            Some(WorktreeRecordKindV1::CustodyStagingResidue) | None => {}
         }
     }
     for entry in entries {
@@ -1579,7 +1681,7 @@ pub fn scan_worktree_root(root: &Path, notes: &mut Vec<String>) -> Vec<ReportIte
             continue;
         }
         if !md.is_dir() {
-            let sidecar = name.ends_with(".meta.json");
+            let record = WorktreeRecordKindV1::classify(&name);
             let canonical = display_path(&entry);
             let consumers = LiveConsumers {
                 run_lease: sidecar_leases
@@ -1591,7 +1693,7 @@ pub fn scan_worktree_root(root: &Path, notes: &mut Vec<String>) -> Vec<ReportIte
             items.push(ReportItem {
                 path: canonical,
                 source: ItemSource::WorktreePath,
-                class: if sidecar {
+                class: if record.is_some() {
                     PayloadClass::Evidence
                 } else {
                     PayloadClass::Unclassified
@@ -1601,7 +1703,26 @@ pub fn scan_worktree_root(root: &Path, notes: &mut Vec<String>) -> Vec<ReportIte
                 measured: measure_tree(&entry, &[]),
                 consumers,
                 git: None,
-                note: sidecar.then(|| "worktree custody sidecar".to_string()),
+                note: record.map(|record| record.note().to_string()),
+            });
+            continue;
+        }
+
+        // The R2f1b custody LOCK directory (`<root>/.custody-locks`). It is bridge-owned
+        // coordination state, not a checkout: without this arm it lands in the directory branch
+        // below, fails the linked-worktree shape check, and surfaces as an Unclassified item on
+        // every report (2b1 dual review, opus S-10 — report noise, never a deletion hazard).
+        if name == bridge_worktree::custody_lock::CUSTODY_LOCK_DIR_NAME {
+            items.push(ReportItem {
+                path: display_path(&entry),
+                source: ItemSource::WorktreePath,
+                class: PayloadClass::Evidence,
+                checkout_kind: None,
+                run_id: None,
+                measured: measure_tree(&entry, &[]),
+                consumers: LiveConsumers::default(),
+                git: None,
+                note: Some("R2f1b custody lock cells (coordination state, not a checkout)".into()),
             });
             continue;
         }
@@ -3700,5 +3821,260 @@ mod tests {
         assert!(STORAGE_USAGE.contains("advisory flock"));
         assert!(STORAGE_USAGE.contains("not a reaper"));
         assert!(STORAGE_USAGE.contains("on-source"));
+    }
+
+    // ---- R2f1b slice 2b2: the second record suffix and the custody lock directory ----
+
+    fn v3_custody_record(worktree: &Path, state: bridge_worktree::custody::WorktreeCustodyStateV1) {
+        use bridge_core::execution_policy::{
+            PolicyNodeRefV1, Sha256HexV1, WorktreeCustodyIdV1, WorktreeObjectIdentityV1,
+        };
+        use bridge_core::fs_custody::DirectoryIdentityV1;
+        use bridge_core::ids::{AttemptId, AttemptIdentity, ExecutionId};
+        let canonical = display_path(worktree);
+        let meta = std::fs::symlink_metadata(worktree).unwrap();
+        use std::os::unix::fs::MetadataExt as _;
+        let mut record = bridge_worktree::custody::WorktreeCustodyRecordV1 {
+            schema_version: bridge_worktree::custody::WORKTREE_CUSTODY_RECORD_SCHEMA_V1,
+            custody_id: WorktreeCustodyIdV1::parse(format!("custody-{}", "3".repeat(64))).unwrap(),
+            checkout_fingerprint: Sha256HexV1::parse("6".repeat(64)).unwrap(),
+            current_attempt: AttemptIdentity {
+                execution_id: ExecutionId::parse(format!("exec-{}", "1".repeat(32))).unwrap(),
+                attempt_id: AttemptId::parse(format!("attempt-{}", "2".repeat(32))).unwrap(),
+                ordinal: 0,
+                parent_attempt_id: None,
+            },
+            worktree: WorktreeObjectIdentityV1 {
+                canonical_path: canonical.clone(),
+                directory_identity: DirectoryIdentityV1 {
+                    canonical_path: canonical.clone(),
+                    dev: Some(meta.dev()),
+                    ino: Some(meta.ino()),
+                },
+            },
+            state,
+            claim: None,
+        };
+        // The state's own settled rule decides whether a claim is REQUIRED (2a data); a record
+        // that violates it would not encode at all.
+        if record.state.claim_presence() == bridge_worktree::custody::ClaimPresenceV1::Required {
+            record.claim = Some(bridge_worktree::custody::PreservedWorktreeClaimV1 {
+                schema_version: bridge_worktree::custody::WORKTREE_CUSTODY_RECORD_SCHEMA_V1,
+                custody_id: record.custody_id.clone(),
+                execution_id: record.current_attempt.execution_id.clone(),
+                origin_attempt_id: record.current_attempt.attempt_id.clone(),
+                current_attempt: record.current_attempt.clone(),
+                node: PolicyNodeRefV1::from_node_id(0, "node"),
+                checkout_fingerprint: record.checkout_fingerprint.clone(),
+                source: record.worktree.clone(),
+                root: record.worktree.clone(),
+                worktree: record.worktree.clone(),
+                common_dir: record.worktree.clone(),
+                reason: bridge_worktree::custody::PreservationReasonV1::NodeFailure,
+                created_wall_ms: 1_700_000_000_000,
+                recovery_locator: bridge_worktree::custody::RecoveryLocatorV1::RegisteredWorktree {},
+            });
+        }
+        std::fs::write(
+            bridge_worktree::custody::custody_record_path(&canonical),
+            record.encode_canonical().unwrap(),
+        )
+        .unwrap();
+    }
+
+    /// R-4's closure. A V3 record is Evidence, associates with its sibling checkout, and its
+    /// holder state comes from the CUSTODY STATE (there is no lease to probe for one).
+    ///
+    /// Discriminates a report that knows only `.meta.json`: the record would show as
+    /// `Unclassified` — bridge-owned bytes presented as garbage — and the checkout's `run_lease`
+    /// would read `Unknown`, i.e. "nobody holds this", for a live protected checkout.
+    #[test]
+    fn worktree_root_reports_a_v3_custody_record_as_evidence_binding_its_sibling() {
+        let td = tempfile::tempdir().unwrap();
+        let root = td.path().join("wt-root");
+        let wt = root.join("ownr-run7-abc");
+        std::fs::create_dir_all(&wt).unwrap();
+        let common = td.path().join("source-repo/.git/worktrees/ownr-run7-abc");
+        std::fs::create_dir_all(&common).unwrap();
+        std::fs::write(wt.join(".git"), format!("gitdir: {}\n", common.display())).unwrap();
+        v3_custody_record(
+            &wt,
+            bridge_worktree::custody::WorktreeCustodyStateV1::LiveProtected {},
+        );
+
+        let mut notes = Vec::new();
+        let items = scan_worktree_root(&root, &mut notes);
+
+        let record = items
+            .iter()
+            .find(|i| i.path.ends_with(".custody.v1.json"))
+            .expect("the V3 record must be reported");
+        assert_eq!(record.class, PayloadClass::Evidence);
+        assert_eq!(record.consumers.run_lease, HolderState::Held);
+        assert_eq!(
+            record.note.as_deref(),
+            Some("R2f1b worktree custody record")
+        );
+        let checkout = items
+            .iter()
+            .find(|i| i.class == PayloadClass::SourceCheckout)
+            .expect("the sibling checkout is still reported");
+        assert_eq!(
+            checkout.consumers.run_lease,
+            HolderState::Held,
+            "a live custody record holds its sibling checkout"
+        );
+        assert!(
+            !items.iter().any(|i| i.class == PayloadClass::Unclassified),
+            "nothing in a V3 root may surface as unclassified: {items:#?}"
+        );
+    }
+
+    /// A preserved record still HOLDS: it awaits R2f2 disposition, so nothing may treat its
+    /// checkout as reclaimable. Discriminates a holder mapping that reads any terminal custody
+    /// state as free.
+    #[test]
+    fn a_preserved_custody_record_still_holds_its_checkout() {
+        let td = tempfile::tempdir().unwrap();
+        let root = td.path().join("wt-root");
+        let wt = root.join("ownr-run7-abc");
+        std::fs::create_dir_all(&wt).unwrap();
+        v3_custody_record(
+            &wt,
+            bridge_worktree::custody::WorktreeCustodyStateV1::PreservationPrepared {},
+        );
+
+        let mut notes = Vec::new();
+        let items = scan_worktree_root(&root, &mut notes);
+
+        let record = items
+            .iter()
+            .find(|i| i.path.ends_with(".custody.v1.json"))
+            .unwrap();
+        assert_eq!(record.consumers.run_lease, HolderState::Held);
+        assert_ne!(record.consumers.run_lease, HolderState::Free);
+    }
+
+    /// 2b1 dual-review ledger item (opus S-10): `<root>/.custody-locks` is coordination state, not
+    /// a checkout. Discriminates the pre-2b2 behaviour where it fell through to the directory
+    /// branch, failed the linked-worktree shape check, and surfaced Unclassified on every report.
+    #[test]
+    fn the_custody_lock_directory_is_classified_and_never_unclassified() {
+        let td = tempfile::tempdir().unwrap();
+        let root = td.path().join("wt-root");
+        std::fs::create_dir_all(&root).unwrap();
+        let cell = bridge_worktree::custody_lock::try_acquire_custody_lock_in(
+            &root,
+            &bridge_core::execution_policy::WorktreeCustodyIdV1::parse(format!(
+                "custody-{}",
+                "b".repeat(64)
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let mut notes = Vec::new();
+        let items = scan_worktree_root(&root, &mut notes);
+
+        let locks = items
+            .iter()
+            .find(|i| i.path.ends_with(".custody-locks"))
+            .expect("the lock directory must be reported");
+        assert_eq!(locks.class, PayloadClass::Evidence);
+        assert_eq!(locks.checkout_kind, None);
+        assert!(
+            !items.iter().any(|i| i.class == PayloadClass::Unclassified),
+            "{items:#?}"
+        );
+        drop(cell);
+    }
+
+    /// V2 output is unchanged: a root with no V3 artifacts produces the same items it always did.
+    /// The positive control for every assertion above — without it, the tests could pass against a
+    /// scanner that reclassified the legacy sidecar too.
+    #[test]
+    fn a_v2_only_worktree_root_reports_exactly_what_it_did_before() {
+        let td = tempfile::tempdir().unwrap();
+        let root = td.path().join("wt-root");
+        let wt = root.join("ownr-run7-abc");
+        std::fs::create_dir_all(&wt).unwrap();
+        let lease_dir = td.path().join("leases");
+        let lease = bridge_core::liveness::acquire_lease_in(&lease_dir, "run7").unwrap();
+        let sidecar = bridge_worktree::provider_path::WorktreeSidecar {
+            canonical_source: "/repo".into(),
+            common_dir: "/repo/.git".into(),
+            worktree_path: display_path(&wt),
+            owner: "ownr".into(),
+            run_id: "run7".into(),
+            host: "h1".into(),
+            lease: lease.path().to_string_lossy().into_owned(),
+        };
+        bridge_worktree::provider_path::write_sidecar(&sidecar).unwrap();
+
+        let mut notes = Vec::new();
+        let items = scan_worktree_root(&root, &mut notes);
+
+        let ev = items
+            .iter()
+            .find(|i| i.class == PayloadClass::Evidence)
+            .expect("the legacy sidecar is Evidence, exactly as before");
+        assert!(ev.path.ends_with(".meta.json"));
+        assert_eq!(ev.note.as_deref(), Some("worktree custody sidecar"));
+        assert_eq!(ev.consumers.run_lease, HolderState::Held);
+        assert!(!items.iter().any(|i| i.path.ends_with(".custody.v1.json")));
+    }
+
+    /// R8a's red test. A checkout named by BOTH records — the state 2b1's deletion gate produces
+    /// on every refusal — must report `Held` when either record holds it.
+    ///
+    /// Discriminates the shipped plain-insert: `.custody.v1.json` sorts before `.meta.json`, so a
+    /// live custody record's `Held` was overwritten by a free legacy sidecar's `Free`, and a
+    /// protected checkout was reported as having no live consumer. The lease here is deliberately
+    /// FREE (no holder), so only the merge rule can produce `Held`.
+    #[test]
+    fn a_live_custody_record_holds_its_checkout_even_beside_a_free_legacy_sidecar() {
+        let td = tempfile::tempdir().unwrap();
+        let root = td.path().join("wt-root");
+        let wt = root.join("ownr-run7-abc");
+        std::fs::create_dir_all(&wt).unwrap();
+        v3_custody_record(
+            &wt,
+            bridge_worktree::custody::WorktreeCustodyStateV1::LiveProtected {},
+        );
+        // A legacy sidecar naming a lease nobody holds — `probe_lock_path` answers Free/Unknown.
+        let sidecar = bridge_worktree::provider_path::WorktreeSidecar {
+            canonical_source: "/repo".into(),
+            common_dir: "/repo/.git".into(),
+            worktree_path: display_path(&wt),
+            owner: "ownr".into(),
+            run_id: "run7".into(),
+            host: "h1".into(),
+            lease: td
+                .path()
+                .join("leases/never-held.lock")
+                .display()
+                .to_string(),
+        };
+        std::fs::create_dir_all(td.path().join("leases")).unwrap();
+        std::fs::write(&sidecar.lease, b"").unwrap();
+        bridge_worktree::provider_path::write_sidecar(&sidecar).unwrap();
+        assert!(
+            wt.with_file_name("ownr-run7-abc.custody.v1.json")
+                < wt.with_file_name("ownr-run7-abc.meta.json"),
+            "the custody record must sort FIRST, so a plain insert really is overwritten"
+        );
+
+        let mut notes = Vec::new();
+        let items = scan_worktree_root(&root, &mut notes);
+
+        let checkout = items
+            .iter()
+            .find(|i| i.class == PayloadClass::SourceCheckout || i.path == display_path(&wt))
+            .expect("the checkout is reported");
+        assert_eq!(
+            checkout.consumers.run_lease,
+            HolderState::Held,
+            "a live custody record must hold the checkout regardless of a free sidecar beside it"
+        );
     }
 }

@@ -593,6 +593,15 @@ impl WorktreeCustodyRecordV1 {
         Ok(())
     }
 
+    /// The decoder's own rules, run by a WRITER before it publishes.
+    ///
+    /// Same function the reader enforces, deliberately: a record that this crate would refuse to
+    /// read must never be published in the first place, and the way to guarantee that is for the
+    /// writer to be checked by the reader's rule rather than by a parallel one.
+    pub fn validate_for_publication(&self) -> Result<(), CustodyRecordDecodeErrorV1> {
+        self.validate()
+    }
+
     pub fn encode_canonical(&self) -> Result<Vec<u8>, CustodyRecordDecodeErrorV1> {
         self.validate()?;
         let encoded =

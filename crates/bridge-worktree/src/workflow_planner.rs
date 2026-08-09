@@ -144,6 +144,18 @@ mod tests {
             panic!("admission must never add a worktree")
         }
 
+        /// Nine-impl enumeration (R-6), 8 of 10: admission plans a checkout, it never
+        /// materializes one. Panicking rather than refusing is the stronger statement — a
+        /// custody-aware add reaching the planner is a routing bug, not a capability gap.
+        async fn add_under_custody(
+            &self,
+            _repo: &str,
+            _worktree_path: &str,
+        ) -> Result<crate::provider::CustodyAddOutcomeV1, BridgeError> {
+            self.adds.fetch_add(1, Ordering::SeqCst);
+            panic!("admission must never add a worktree under custody")
+        }
+
         async fn remove(&self, _repo: &str, _worktree_path: &str) -> Result<(), BridgeError> {
             panic!("admission must never remove a worktree")
         }

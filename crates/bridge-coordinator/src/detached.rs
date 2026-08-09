@@ -3923,9 +3923,7 @@ fn spawn_detached_workflow_inner(
             None => diagnostic_context,
         };
         let diagnostic_context = match authority {
-            Some(authority) => match diagnostic_context
-                .with_frozen_run_spec(authority.run_spec, authority.provider_effect_key)
-            {
+            Some(authority) => match diagnostic_context.with_admitted_workflow_run(authority) {
                 Ok(context) => context,
                 Err(error) => {
                     tracing::warn!(task = task.as_str(), error = ?error, "frozen workflow authority refused before execution");
@@ -7041,6 +7039,7 @@ mod resume_tests {
                 requested_session_cwd: Some(bridge_core::SessionCwd::parse("/tmp").unwrap()),
                 policy_invocation: ExecutionPolicyInvocationV1::default(),
                 ledger_admission: LedgerAdmissionV1::DurablePrimaryTaskStore,
+                r2f1b: None,
             })
             .await
             .unwrap();
@@ -7196,6 +7195,7 @@ mod resume_tests {
                 requested_session_cwd: Some(bridge_core::SessionCwd::parse("/tmp").unwrap()),
                 policy_invocation: ExecutionPolicyInvocationV1::default(),
                 ledger_admission: LedgerAdmissionV1::DurablePrimaryTaskStore,
+                r2f1b: None,
             })
             .await
             .unwrap();

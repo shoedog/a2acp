@@ -240,6 +240,9 @@ pub struct WorkflowDiagnosticContext {
 struct FrozenWorkflowAuthority {
     run_spec: Arc<WorkflowRunSpecV1>,
     provider_effect_key: Option<Arc<ProviderEffectKeyV1>>,
+    /// The admitted R2f1b contract. `None` on every V2 route — and on every production route,
+    /// because nothing production-side constructs one (slice-2 brief §5.2).
+    r2f1b: Option<Arc<crate::admission::R2f1bAdmissionV1>>,
 }
 
 impl FrozenWorkflowAuthority {
@@ -307,8 +310,44 @@ impl WorkflowDiagnosticContext {
         self
     }
 
+    /// Bind this invocation to a COMPLETE admission result — spec, key, and the admitted R2f1b
+    /// contract if there is one.
+    ///
+    /// **This is the constructor every production authority consumer must use.** Taking the
+    /// admission result apart field by field is what made `AdmittedWorkflowRunV1::r2f1b`
+    /// write-only in production (slice 2b2 repair R1): both consumers passed `run_spec` and
+    /// `provider_effect_key` to [`Self::with_frozen_run_spec`], which hardcodes `r2f1b: None`, so
+    /// an admitted `ManualOnlyR2f1a` contract was silently dropped and the run degraded to V2 —
+    /// legacy `add`, `.meta.json`, no custody record — with nothing failing.
+    ///
+    /// Consuming the whole value makes that class of drop a compile error rather than a silent
+    /// downgrade: a future field added to `AdmittedWorkflowRunV1` has exactly one place to be
+    /// wired, and the ordering obligation ([`Self::with_frozen_r2f1b_contract`] needs the spec
+    /// first) is discharged here once instead of at every call site.
+    pub fn with_admitted_workflow_run(
+        self,
+        admitted: crate::admission::AdmittedWorkflowRunV1,
+        // Destructured rather than dotted, so adding a field to the admission result breaks this
+        // function until someone decides what it means.
+    ) -> Result<Self, BridgeError> {
+        let crate::admission::AdmittedWorkflowRunV1 {
+            run_spec,
+            provider_effect_key,
+            r2f1b,
+        } = admitted;
+        let context = self.with_frozen_run_spec(run_spec, provider_effect_key)?;
+        match r2f1b {
+            None => Ok(context),
+            Some(r2f1b) => context.with_frozen_r2f1b_contract(r2f1b),
+        }
+    }
+
     /// Bind this invocation to one validated V2 run specification and its separately held
     /// provider-effect commitment key. The key is never persisted by the workflow layer.
+    ///
+    /// Prefer [`Self::with_admitted_workflow_run`] when you hold a whole
+    /// [`crate::admission::AdmittedWorkflowRunV1`]: this entry hardcodes `r2f1b: None`, so calling
+    /// it with an admission result's fields silently drops an admitted contract.
     pub fn with_frozen_run_spec(
         mut self,
         run_spec: Arc<WorkflowRunSpecV1>,
@@ -343,7 +382,41 @@ impl WorkflowDiagnosticContext {
         self.frozen_authority = Some(FrozenWorkflowAuthority {
             run_spec,
             provider_effect_key,
+            r2f1b: None,
         });
+        Ok(self)
+    }
+
+    /// Bind this invocation to one admitted R2f1b contract, making the run V3.
+    ///
+    /// Requires [`Self::with_frozen_run_spec`] first: the contract's custody plans are matched
+    /// against the delivery spec's frozen checkouts, so binding one without the other would
+    /// accept a contract nothing checks it against. The activation refusal is re-applied here
+    /// rather than trusted from admission, because this is a second boundary a caller can reach
+    /// (it is `pub`), and a rule enforced at one of two entrances is not enforced.
+    pub fn with_frozen_r2f1b_contract(
+        mut self,
+        r2f1b: Arc<crate::admission::R2f1bAdmissionV1>,
+    ) -> Result<Self, BridgeError> {
+        let authority =
+            self.frozen_authority
+                .as_mut()
+                .ok_or_else(|| BridgeError::ConfigInvalid {
+                    reason: "an R2f1b contract needs its frozen run specification first".into(),
+                })?;
+        crate::admission::admit_r2f1b_contract_v1(&authority.run_spec.attempt_id, &r2f1b)?;
+        for identity in &authority.run_spec.node_execution_identities {
+            for attempt in &identity.provider_attempts {
+                bridge_core::execution_policy::select_custody_plan_v1(
+                    &r2f1b.contract,
+                    &attempt.checkout,
+                )
+                .map_err(|error| BridgeError::ConfigInvalid {
+                    reason: format!("R2f1b custody plan coverage is incomplete: {error}"),
+                })?;
+            }
+        }
+        authority.r2f1b = Some(r2f1b);
         Ok(self)
     }
 
@@ -1371,9 +1444,41 @@ impl WorkflowExecutor {
             .ok_or_else(|| BridgeError::ConfigInvalid {
                 reason: "frozen provider candidate is outside the admitted selection".into(),
             })?;
+        // R2f1b routing (slice 2b2, R-3). Selection is EXACT — `checkout_digest ==
+        // checkout_fingerprint` — and `bind_custody_plan` re-verifies it, so a V3 attempt either
+        // carries the one plan frozen for its own checkout or refuses. A V2 route (no contract)
+        // takes neither branch and is byte-identical to before.
+        let provider_effect = match &authority.r2f1b {
+            None => reconstructed.bound,
+            Some(r2f1b) => {
+                let plan = bridge_core::execution_policy::select_custody_plan_v1(
+                    &r2f1b.contract,
+                    &persisted.checkout,
+                )
+                .map_err(|error| BridgeError::ConfigInvalid {
+                    reason: format!("R2f1b custody plan cannot be selected: {error}"),
+                })?;
+                match plan {
+                    None => reconstructed.bound,
+                    Some(plan) => reconstructed
+                        .bound
+                        .bind_custody_plan(Arc::new(
+                            bridge_core::execution_policy::BoundWorktreeCustodyV1 {
+                                attempt: r2f1b.attempt.clone(),
+                                origin_attempt_id: authority.run_spec.attempt_id.clone(),
+                                node: identity.node.clone(),
+                                plan: plan.clone(),
+                            },
+                        ))
+                        .map_err(|error| BridgeError::ConfigInvalid {
+                            reason: format!("R2f1b custody plan cannot be bound: {error}"),
+                        })?,
+                }
+            }
+        };
         Ok(FrozenBoundEntryUse {
             bound,
-            provider_effect: Arc::new(reconstructed.bound),
+            provider_effect: Arc::new(provider_effect),
             config: EffectiveConfig {
                 model: selected_model,
                 effort: identity.selection.effective_effort,

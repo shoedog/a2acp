@@ -1576,6 +1576,8 @@ impl Coordinator {
                         policy_invocation:
                             bridge_core::execution_policy::ExecutionPolicyInvocationV1::default(),
                         ledger_admission: self.task_store.workflow_ledger_admission(),
+                        // R2f1b: production admission mints no V3 contract (slice-2 brief §5.2).
+                        r2f1b: None,
                     })
                     .await?,
             ),

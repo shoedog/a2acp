@@ -3,6 +3,7 @@
 pub mod backend;
 pub mod custody;
 pub mod custody_lock;
+pub mod custody_writer;
 pub mod host_git;
 pub mod provider;
 pub mod provider_path;

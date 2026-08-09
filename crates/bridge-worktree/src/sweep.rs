@@ -51,6 +51,11 @@ fn remove_worktree_if_safe(
     sidecar_file: &str,
     s: &crate::provider_path::WorktreeSidecar,
 ) {
+    // ---- STEP 1: the two forgery guards, FIRST ----------------------------------------------
+    // Order matters, and this is a repair (2b2 review, opus S-8): the custody probe used to run
+    // ahead of these, so a FORGED sidecar naming an arbitrary path made the sweep stat that path
+    // — and, once the publication cell landed below, would have made it create a lock directory
+    // beside it. Nothing may touch a path these two guards have not yet vouched for.
     if !sidecar_file_matches(sidecar_file, &s.worktree_path) {
         tracing::warn!(
             sidecar = sidecar_file,
@@ -68,6 +73,60 @@ fn remove_worktree_if_safe(
         );
         return;
     }
+
+    // ---- STEP 2: enter the checkout's publication cell, REFUSING -----------------------------
+    // `custody_lock.rs`'s contract says "every deletion-side and sweep-side caller" must take
+    // this cell with the refusing acquirer, and until this repair the sweep did not — it probed
+    // and removed with nothing serializing the two. The race is the same one the backend gate's
+    // window closes, and just as reachable: the sweep sees no record, a writer publishes
+    // `ProtectionPrepared` while holding the cell, and the sweep deletes a protected checkout.
+    //
+    // Contention and unavailability both SKIP. A cell this sweep cannot enter is a custody state
+    // it cannot inspect, and unknown never licenses deletion (§5.2). Skipping is also free of
+    // consequence here: the next boot sweep retries.
+    //
+    // The cell is entered only AFTER the forgery guards pass, so the lock directory is created
+    // under the sweep root only when a removal of a vouched-for sibling is actually imminent.
+    let _cell = match crate::custody_lock::try_acquire_publication_lock_in(
+        Path::new(root.as_str()),
+        &s.worktree_path,
+    ) {
+        Ok(cell) => cell,
+        Err(refusal) => {
+            tracing::info!(
+                sidecar = sidecar_file,
+                worktree_path = s.worktree_path,
+                refusal = %refusal,
+                "skipping a worktree reclaim whose custody publication cell could not be entered"
+            );
+            return;
+        }
+    };
+
+    // ---- STEP 3: coexistence guard, inside the cell ------------------------------------------
+    // A checkout carrying BOTH records must be reclaimed by neither arm. Two halves, and the
+    // first is not sufficient on its own:
+    //
+    // 1. the V3 writer never emits `.meta.json` (`v3_path_writes_no_legacy_meta_json`), but
+    // 2. 2b1's deletion gate MANUFACTURES coexistence anyway: a refused cleanup RETAINS the
+    //    legacy sidecar beside a custody record. That state needs no crash and no exotic input —
+    //    it is the gate's ordinary output — and both this function's callers would then delete
+    //    the checkout, including `WorktreeRunEndGuard`'s CLEAN arm on every normal run.
+    //
+    // Presence, never content, exactly as the backend gate: a corrupt or unreadable record must
+    // still protect, so a decode-based answer (which would read damage as absence) is the one
+    // shape this must not have.
+    let presence = crate::custody::probe_custody_record_presence(&s.worktree_path);
+    if !presence.authorizes_checkout_removal() {
+        tracing::info!(
+            sidecar = sidecar_file,
+            worktree_path = s.worktree_path,
+            "leaving a legacy sidecar whose checkout also carries an R2f1b custody record"
+        );
+        return;
+    }
+
+    // ---- STEP 4: remove, still holding the cell ---------------------------------------------
     remove_worktree(&s.canonical_source, &s.common_dir, &s.worktree_path);
 }
 
@@ -293,17 +352,55 @@ pub fn sweep_orphans(root: &str, my_host: &str, probe: &dyn LeaseProbe) {
 /// crashed process left its lease file behind with the lock free. Pinned by
 /// `boot_sweep_cannot_reclaim_a_cleanly_exited_run`.
 ///
-/// Explicit run-end *settlement* — converting unresolved live V3 entries to
-/// preserved/unknown before this backstop ever runs — is a later sub-slice's, and needs
-/// the durable replace primitive this slice does not have.
+/// # Explicit settlement (slice 2b2, S5)
+///
+/// [`Self::settle`] is the run's normal terminal path: an explicit, idempotent call the owner
+/// makes when it knows the run ended in a handled way. `Drop` is then a BACKSTOP, and the two are
+/// distinguishable:
+///
+/// * settled → `Drop` does nothing at all, so nothing is done twice;
+/// * unsettled + clean → `Drop` performs the legacy reclaim as before (R9 leaves the clean path
+///   destructive, because the boot sweep provably cannot fire after a clean exit);
+/// * unsettled + unwinding → `Drop` defers, and records that settlement did NOT occur rather
+///   than logging as though it had. That distinction is the point of Sol 17: an abrupt drop is
+///   the moment the process knows least, and a backstop that reports itself as a settlement
+///   makes an unsettled run indistinguishable from a settled one in the record.
+///
+/// Settlement is **non-destructive for every V3 record**. Converting unresolved live V3 entries
+/// to preserved/unknown needs preservation transitions, which are 2c1's; what this slice settles
+/// is the run-end pass itself, and it reports each V3 record as still recovery-owned rather than
+/// pretending it was disposed of.
 pub struct WorktreeRunEndGuard {
     pub root: String,
     pub instance_id: String,
+    settled: std::sync::atomic::AtomicBool,
 }
 
-impl Drop for WorktreeRunEndGuard {
-    fn drop(&mut self) {
-        let unwinding = std::thread::panicking();
+impl WorktreeRunEndGuard {
+    #[must_use]
+    pub fn new(root: String, instance_id: String) -> Self {
+        Self {
+            root,
+            instance_id,
+            settled: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    /// Settle this run's worktrees explicitly. Idempotent: the second call is a no-op, and so is
+    /// the later `Drop`.
+    pub fn settle(&self) {
+        if self.settled.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
+        self.run_end_pass(false, "settle");
+    }
+
+    #[must_use]
+    pub fn is_settled(&self) -> bool {
+        self.settled.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn run_end_pass(&self, unwinding: bool, phase: &'static str) {
         let root_cwd = canonicalize_lenient(&self.root);
         for (path, scanned) in scan_worktree_records(&self.root) {
             match scanned {
@@ -328,16 +425,50 @@ impl Drop for WorktreeRunEndGuard {
                     record = path,
                     state = record.state.kind().wire_tag(),
                     run_id = self.instance_id,
-                    "leaving custody-protected worktree record untouched at run end"
+                    phase,
+                    settled = self.is_settled(),
+                    "leaving custody-protected worktree record untouched at run end; its \
+                     disposition stays recovery-owned"
                 ),
                 ScannedWorktreeRecordV1::UnreadableCustody(refusal) => tracing::warn!(
                     record = path,
                     refusal = %refusal,
                     run_id = self.instance_id,
+                    phase,
+                    settled = self.is_settled(),
                     "leaving unreadable worktree custody record untouched at run end"
                 ),
             }
         }
+    }
+}
+
+impl Drop for WorktreeRunEndGuard {
+    fn drop(&mut self) {
+        if self.is_settled() {
+            // Already settled explicitly. Doing the pass again would be harmless but would also
+            // make "settled" unobservable; skipping it is what makes `settle` meaningful.
+            return;
+        }
+        let unwinding = std::thread::panicking();
+        if unwinding {
+            tracing::warn!(
+                root = self.root,
+                run_id = self.instance_id,
+                "worktree run-end guard dropped during an unwind WITHOUT explicit settlement; \
+                 deferring reclaim to the next boot sweep. This is a backstop, not a settlement."
+            );
+        } else {
+            // A NON-panicking drop is a handled terminal — an ordinary `return`, an early `?`, a
+            // match arm that forgot the epilogue. Marking it settled before the pass is what makes
+            // `is_settled()` (and the `settled` log field) truthful: "unsettled" then means
+            // exactly "panicked or otherwise unhandled", which is the distinction Sol 17 asks for.
+            // Call sites still settle explicitly where the terminal is named; this is the floor,
+            // not a substitute (slice 2b2 repair R5).
+            self.settled
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        self.run_end_pass(unwinding, "drop");
     }
 }
 
@@ -435,10 +566,8 @@ mod tests {
             write_worktree_sidecar(&root, "other", "my-host", "/leases/other.lock", "other");
 
         {
-            let _guard = super::WorktreeRunEndGuard {
-                root: root.to_string_lossy().into_owned(),
-                instance_id: "mine".into(),
-            };
+            let _guard =
+                super::WorktreeRunEndGuard::new(root.to_string_lossy().into_owned(), "mine".into());
         }
 
         assert!(!Path::new(&mine.worktree_path).exists());
@@ -460,10 +589,8 @@ mod tests {
         let mine = write_worktree_sidecar(&root, "mine", "my-host", "/leases/mine.lock", "mine");
 
         let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _guard = super::WorktreeRunEndGuard {
-                root: root.to_string_lossy().into_owned(),
-                instance_id: "mine".into(),
-            };
+            let _guard =
+                super::WorktreeRunEndGuard::new(root.to_string_lossy().into_owned(), "mine".into());
             panic!("run failed after the worktree was configured");
         }));
         assert!(unwound.is_err(), "the harness must actually unwind");
@@ -585,10 +712,8 @@ mod tests {
         fs::write(&forged, serde_json::to_vec(&sidecar).unwrap()).unwrap();
 
         {
-            let _guard = super::WorktreeRunEndGuard {
-                root: root.to_string_lossy().into_owned(),
-                instance_id: "mine".into(),
-            };
+            let _guard =
+                super::WorktreeRunEndGuard::new(root.to_string_lossy().into_owned(), "mine".into());
         }
 
         assert!(victim.join("keep").exists());
@@ -1108,15 +1233,484 @@ mod tests {
             write_custody_checkout(&root, "v3", WorktreeCustodyStateV1::LiveProtected {});
 
         {
-            let _guard = super::WorktreeRunEndGuard {
-                root: root.to_string_lossy().into_owned(),
-                instance_id: attempt_identity().run_id().to_string(),
-            };
+            let _guard = super::WorktreeRunEndGuard::new(
+                root.to_string_lossy().into_owned(),
+                attempt_identity().run_id().to_string(),
+            );
         }
 
         assert!(worktree.exists());
         assert!(record.exists());
 
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    // ---- R2f1b slice 2b2: coexistence, per-guard discrimination, and explicit settlement ----
+
+    /// The binding 2b2 obligation from the 2b1 dual review (opus W-1). ONE checkout carrying BOTH
+    /// records must be reclaimed by NEITHER arm — and this state is not exotic: 2b1's deletion
+    /// gate produces it on every refusal (the legacy sidecar is retained beside the custody
+    /// record). The run-end guard's arm is the CLEAN-drop one, no crash required.
+    ///
+    /// Discriminates the guard being absent: without it the legacy arm sees a dead lease, sees a
+    /// sidecar that matches its sibling and is under the root, and deletes a custody-protected
+    /// checkout together with its record.
+    #[test]
+    fn a_checkout_carrying_both_records_is_reclaimed_by_neither_sweep_arm() {
+        for (name, run_id, boot) in [
+            ("coexist-boot", "run-a", true),
+            ("coexist-end", "mine", false),
+        ] {
+            let root = unique_temp_dir(name);
+            fs::create_dir_all(&root).unwrap();
+            let sidecar =
+                write_worktree_sidecar(&root, "both", "my-host", "/leases/dead.lock", run_id);
+            let canonical = fs::canonicalize(&sidecar.worktree_path)
+                .unwrap()
+                .to_string_lossy()
+                .into_owned();
+            let record = custody_record(&canonical, WorktreeCustodyStateV1::LiveProtected {});
+            fs::write(
+                custody_record_path(&canonical),
+                record.encode_canonical().unwrap(),
+            )
+            .unwrap();
+
+            if boot {
+                super::sweep_orphans(
+                    &root.to_string_lossy(),
+                    "my-host",
+                    &dead_probe("/leases/dead.lock"),
+                );
+            } else {
+                // The CLEAN drop, which is the destructive one for legacy entries after R9.
+                drop(super::WorktreeRunEndGuard::new(
+                    root.to_string_lossy().into_owned(),
+                    "mine".into(),
+                ));
+            }
+
+            assert!(
+                Path::new(&sidecar.worktree_path).exists(),
+                "{name}: the custody-protected checkout must survive"
+            );
+            assert!(
+                Path::new(&custody_record_path(&canonical)).exists(),
+                "{name}: its custody record must survive"
+            );
+            assert!(
+                Path::new(&sidecar_path(&sidecar.worktree_path)).exists(),
+                "{name}: and the retained legacy sidecar with it"
+            );
+            fs::remove_dir_all(&root).unwrap();
+        }
+    }
+
+    /// Guard-set coverage, part 1 — isolates `sidecar_file_matches` (2a carried item, docstring'd
+    /// on `end_guard_skips_sidecar_that_points_at_non_sibling_worktree`, which the pair above only
+    /// covered REDUNDANTLY: neutering either guard alone left it green).
+    ///
+    /// The forged record names a victim INSIDE the sweep root, so `worktree_under_root` passes and
+    /// cannot be what stops it. Only the sidecar↔sibling match can. Neuter that one guard and this
+    /// test goes red on its own.
+    #[test]
+    fn sidecar_sibling_match_alone_stops_a_forged_in_root_sidecar() {
+        let root = unique_temp_dir("guard-sibling-only");
+        fs::create_dir_all(&root).unwrap();
+        let victim = root.join("victim");
+        fs::create_dir_all(&victim).unwrap();
+        fs::write(victim.join("keep"), "do not delete").unwrap();
+        let sidecar = WorktreeSidecar {
+            canonical_source: root.join("source").to_string_lossy().into_owned(),
+            common_dir: root.join("source/.git").to_string_lossy().into_owned(),
+            worktree_path: victim.to_string_lossy().into_owned(),
+            owner: "owner".into(),
+            run_id: "run-a".into(),
+            host: "my-host".into(),
+            lease: "/leases/dead.lock".into(),
+        };
+        // Named `forged.meta.json`, NOT `victim.meta.json`: the file is not its target's sibling.
+        let forged = root.join("forged.meta.json");
+        fs::write(&forged, serde_json::to_vec(&sidecar).unwrap()).unwrap();
+        assert!(
+            super::worktree_under_root(
+                &crate::provider_path::canonicalize_lenient(&root.to_string_lossy()).unwrap(),
+                &sidecar.worktree_path,
+            ),
+            "the under-root guard must PASS here, so it cannot be what stops the removal"
+        );
+
+        super::sweep_orphans(
+            &root.to_string_lossy(),
+            "my-host",
+            &dead_probe("/leases/dead.lock"),
+        );
+
+        assert!(victim.join("keep").exists());
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// Guard-set coverage, part 2 — isolates `worktree_under_root`.
+    ///
+    /// The record IS its target's sibling by name (`victim.meta.json` beside `victim`), so
+    /// `sidecar_file_matches` passes and cannot be what stops it; but `victim` is a SYMLINK whose
+    /// canonical target lies outside the sweep root, which only the under-root check sees.
+    /// Neuter that one guard and the sidecar is deleted, turning this red on its own.
+    #[test]
+    fn under_root_check_alone_stops_a_sibling_sidecar_pointing_outside_the_root() {
+        let root = unique_temp_dir("guard-under-root-only");
+        let outside = unique_temp_dir("guard-under-root-victim");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("keep"), "do not delete").unwrap();
+        let link = root.join("victim");
+        std::os::unix::fs::symlink(&outside, &link).unwrap();
+        let sidecar = WorktreeSidecar {
+            canonical_source: root.join("source").to_string_lossy().into_owned(),
+            common_dir: root.join("source/.git").to_string_lossy().into_owned(),
+            worktree_path: link.to_string_lossy().into_owned(),
+            owner: "owner".into(),
+            run_id: "run-a".into(),
+            host: "my-host".into(),
+            lease: "/leases/dead.lock".into(),
+        };
+        write_sidecar(&sidecar).unwrap();
+        assert!(
+            super::sidecar_file_matches(
+                &sidecar_path(&sidecar.worktree_path),
+                &sidecar.worktree_path
+            ),
+            "the sibling-match guard must PASS here, so it cannot be what stops the removal"
+        );
+
+        super::sweep_orphans(
+            &root.to_string_lossy(),
+            "my-host",
+            &dead_probe("/leases/dead.lock"),
+        );
+
+        assert!(
+            Path::new(&sidecar_path(&sidecar.worktree_path)).exists(),
+            "the under-root guard must stop the removal before the sidecar is unlinked"
+        );
+        assert!(outside.join("keep").exists());
+        fs::remove_dir_all(&root).unwrap();
+        fs::remove_dir_all(&outside).unwrap();
+    }
+
+    /// S5: explicit settlement runs the run-end pass ONCE, and the later `Drop` is a no-op.
+    /// Discriminates a `settle()` that does not mark itself settled (the pass would run twice —
+    /// harmless here but unobservable, which defeats the whole point of distinguishing a
+    /// settlement from a backstop).
+    #[test]
+    fn explicit_settlement_reclaims_once_and_makes_the_drop_a_no_op() {
+        let root = unique_temp_dir("settle-once");
+        fs::create_dir_all(&root).unwrap();
+        let mine = write_worktree_sidecar(&root, "mine", "my-host", "/leases/mine.lock", "mine");
+        let guard =
+            super::WorktreeRunEndGuard::new(root.to_string_lossy().into_owned(), "mine".into());
+
+        assert!(!guard.is_settled());
+        guard.settle();
+        assert!(guard.is_settled());
+        assert!(!Path::new(&mine.worktree_path).exists());
+
+        // A second settle and the eventual Drop must both be no-ops. Re-create the checkout so a
+        // repeated pass would be observable if it happened.
+        fs::create_dir_all(&mine.worktree_path).unwrap();
+        write_sidecar(&mine).unwrap();
+        guard.settle();
+        drop(guard);
+        assert!(
+            Path::new(&mine.worktree_path).exists(),
+            "a settled guard must not run its pass again on drop"
+        );
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// S5, the abrupt half (Sol 17): an unwinding `Drop` on an UNSETTLED guard is protective and
+    /// does not pretend a settlement occurred. Discriminates a backstop that reclaims on the panic
+    /// path (destroying evidence at the moment the process understands least) and one that marks
+    /// itself settled afterwards, which would make an unsettled run indistinguishable from a
+    /// settled one.
+    #[test]
+    fn an_abrupt_drop_is_protective_and_does_not_claim_settlement() {
+        let root = unique_temp_dir("settle-abrupt");
+        fs::create_dir_all(&root).unwrap();
+        let mine = write_worktree_sidecar(&root, "mine", "my-host", "/leases/mine.lock", "mine");
+        let root_for_panic = root.to_string_lossy().into_owned();
+
+        let settled_at_drop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let observed = settled_at_drop.clone();
+        let unwound = std::panic::catch_unwind(move || {
+            let guard = super::WorktreeRunEndGuard::new(root_for_panic, "mine".into());
+            observed.store(guard.is_settled(), std::sync::atomic::Ordering::SeqCst);
+            panic!("run failed abruptly");
+        });
+
+        assert!(unwound.is_err());
+        assert!(
+            !settled_at_drop.load(std::sync::atomic::Ordering::SeqCst),
+            "the guard must not report itself settled merely because it was constructed"
+        );
+        assert!(
+            Path::new(&mine.worktree_path).exists(),
+            "an abrupt drop must defer the reclaim to the next boot sweep"
+        );
+        assert!(Path::new(&sidecar_path(&mine.worktree_path)).exists());
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    // ---- slice 2b2 repair R2: sweep-side publication cell ----
+
+    /// R2's red test, boot arm. A writer holding the checkout's publication cell must stop the boot
+    /// sweep dead — and the record is deliberately ABSENT, so the coexistence guard cannot be what
+    /// stops it and the cell is isolated as the only remaining protection.
+    ///
+    /// Discriminates the shipped defect exactly: without the cell the sweep probes (sees nothing),
+    /// then removes, while a writer is mid-`ProtectionPrepared` on the same target. The release leg
+    /// proves the refusal is the cell and not a permanent wedge.
+    #[test]
+    fn a_writer_holding_the_publication_cell_stops_the_boot_sweep_and_releases_it() {
+        let root = unique_temp_dir("cell-boot-sweep");
+        fs::create_dir_all(&root).unwrap();
+        let orphan =
+            write_worktree_sidecar(&root, "orphan", "my-host", "/leases/dead.lock", "run-a");
+        assert!(
+            !Path::new(&custody_record_path(&orphan.worktree_path)).exists(),
+            "no custody record: the cell must be the only thing protecting this checkout"
+        );
+
+        let writer =
+            crate::custody_lock::try_acquire_publication_lock_in(&root, &orphan.worktree_path)
+                .unwrap();
+        super::sweep_orphans(
+            &root.to_string_lossy(),
+            "my-host",
+            &dead_probe("/leases/dead.lock"),
+        );
+        assert!(
+            Path::new(&orphan.worktree_path).exists(),
+            "the boot sweep must not delete a checkout whose publication cell it cannot enter"
+        );
+        assert!(Path::new(&sidecar_path(&orphan.worktree_path)).exists());
+
+        drop(writer);
+        super::sweep_orphans(
+            &root.to_string_lossy(),
+            "my-host",
+            &dead_probe("/leases/dead.lock"),
+        );
+        assert!(
+            !Path::new(&orphan.worktree_path).exists(),
+            "once the cell is free the ordinary reclaim proceeds"
+        );
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// R2's red test, run-end arm. Same race against explicit settlement, which is the arm that
+    /// runs on EVERY clean run — no crash, no boot, no dead lease needed.
+    #[test]
+    fn a_writer_holding_the_publication_cell_stops_run_end_settlement() {
+        let root = unique_temp_dir("cell-run-end");
+        fs::create_dir_all(&root).unwrap();
+        let mine = write_worktree_sidecar(&root, "mine", "my-host", "/leases/mine.lock", "mine");
+
+        let writer =
+            crate::custody_lock::try_acquire_publication_lock_in(&root, &mine.worktree_path)
+                .unwrap();
+        let guard =
+            super::WorktreeRunEndGuard::new(root.to_string_lossy().into_owned(), "mine".into());
+        guard.settle();
+        assert!(
+            Path::new(&mine.worktree_path).exists(),
+            "run-end settlement must not delete a checkout whose cell is held"
+        );
+        drop(guard);
+
+        drop(writer);
+        let second =
+            super::WorktreeRunEndGuard::new(root.to_string_lossy().into_owned(), "mine".into());
+        second.settle();
+        assert!(
+            !Path::new(&mine.worktree_path).exists(),
+            "with the cell free, settlement reclaims as before"
+        );
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// The reverse order: the SWEEP holds the cell and a writer arriving must WAIT rather than
+    /// publish into the middle of a removal. Discriminates a writer that takes the non-blocking
+    /// acquirer (it would spuriously fail a legitimate transition) and, more importantly, one that
+    /// takes no publication cell at all — it would publish `ProtectionPrepared` over a checkout
+    /// whose deletion is already in flight.
+    #[test]
+    fn a_writer_waits_when_a_reclaim_already_holds_the_publication_cell() {
+        let root = unique_temp_dir("cell-reverse-order");
+        fs::create_dir_all(&root).unwrap();
+        let target = root.join("ownr-run7-abc");
+        fs::create_dir_all(&target).unwrap();
+        let target_path = target.to_string_lossy().into_owned();
+
+        let reclaiming =
+            crate::custody_lock::try_acquire_publication_lock_in(&root, &target_path).unwrap();
+
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let writer = std::thread::spawn({
+            let root = root.clone();
+            let target_path = target_path.clone();
+            move || {
+                let guard = crate::custody_lock::acquire_publication_lock_blocking_in(
+                    &root,
+                    &target_path,
+                    &|| entered_tx.send(()).unwrap(),
+                )
+                .unwrap();
+                done_tx.send(()).unwrap();
+                drop(guard);
+            }
+        });
+
+        entered_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the writer must report that it is waiting");
+        assert!(
+            done_rx
+                .recv_timeout(std::time::Duration::from_millis(200))
+                .is_err(),
+            "the writer must not enter the cell while a reclaim holds it"
+        );
+
+        drop(reclaiming);
+        done_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the writer proceeds once the reclaim releases");
+        writer.join().unwrap();
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// The forgery guards must run BEFORE anything touches the named path (opus S-8). A forged
+    /// sidecar naming a path outside the root must not cause a custody probe there, and — now that
+    /// the publication cell is taken on this path — must not cause a lock directory to be created
+    /// beside the victim either.
+    ///
+    /// Discriminates the shipped order, where `probe_custody_record_presence` ran first.
+    #[test]
+    fn a_forged_sidecar_never_touches_its_named_path_before_the_guards_pass() {
+        let root = unique_temp_dir("forged-no-touch");
+        let victim = unique_temp_dir("forged-no-touch-victim");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&victim).unwrap();
+        fs::write(victim.join("keep"), "do not delete").unwrap();
+        let sidecar = WorktreeSidecar {
+            canonical_source: root.join("source").to_string_lossy().into_owned(),
+            common_dir: root.join("source/.git").to_string_lossy().into_owned(),
+            worktree_path: victim.to_string_lossy().into_owned(),
+            owner: "owner".into(),
+            run_id: "run-a".into(),
+            host: "my-host".into(),
+            lease: "/leases/dead.lock".into(),
+        };
+        fs::write(
+            root.join("forged.meta.json"),
+            serde_json::to_vec(&sidecar).unwrap(),
+        )
+        .unwrap();
+
+        super::sweep_orphans(
+            &root.to_string_lossy(),
+            "my-host",
+            &dead_probe("/leases/dead.lock"),
+        );
+
+        assert!(victim.join("keep").exists());
+        assert!(
+            !victim
+                .parent()
+                .unwrap()
+                .join(crate::custody_lock::CUSTODY_LOCK_DIR_NAME)
+                .exists(),
+            "a forged path must not have a lock directory created beside it"
+        );
+        fs::remove_dir_all(&root).unwrap();
+        fs::remove_dir_all(&victim).unwrap();
+    }
+
+    // ---- slice 2b2 repair R5: one settlement per handled terminal ----
+
+    /// The branch table. Every HANDLED terminal — whatever the outcome — settles exactly once, and
+    /// the guard reports itself settled afterwards.
+    ///
+    /// Models the four `implement::Action` arms plus run-workflow's two: before this repair only
+    /// the `Commit` arm was wrapped, so three of implement's four terminals and run-workflow's
+    /// output-write failure reached `Drop` unsettled. "Exactly once" is observed by re-creating
+    /// the checkout after the settle: a second pass would reclaim it again.
+    #[test]
+    fn every_handled_outcome_settles_exactly_once_and_reports_it() {
+        for outcome in [
+            "abort",
+            "no-commit-clean",
+            "no-commit-dirty",
+            "commit",
+            "workflow-ok",
+            "workflow-output-error",
+        ] {
+            let root = unique_temp_dir(&format!("branch-{outcome}"));
+            fs::create_dir_all(&root).unwrap();
+            let mine =
+                write_worktree_sidecar(&root, "mine", "my-host", "/leases/mine.lock", "mine");
+            let guard =
+                super::WorktreeRunEndGuard::new(root.to_string_lossy().into_owned(), "mine".into());
+
+            assert!(
+                !guard.is_settled(),
+                "{outcome}: unsettled before the epilogue"
+            );
+            guard.settle();
+            assert!(guard.is_settled(), "{outcome}: settled after the epilogue");
+            assert!(
+                !Path::new(&mine.worktree_path).exists(),
+                "{outcome}: the settlement pass ran"
+            );
+
+            // Exactly once: a repeated settle and the eventual drop must both be no-ops.
+            fs::create_dir_all(&mine.worktree_path).unwrap();
+            write_sidecar(&mine).unwrap();
+            guard.settle();
+            drop(guard);
+            assert!(
+                Path::new(&mine.worktree_path).exists(),
+                "{outcome}: the pass must not run a second time"
+            );
+            fs::remove_dir_all(&root).unwrap();
+        }
+    }
+
+    /// A handled terminal that forgot its epilogue still settles — a NON-panicking drop is by
+    /// definition an ordinary return, so it is a handled exit and must record itself as one.
+    /// Together with `an_abrupt_drop_is_protective_and_does_not_claim_settlement`, this makes
+    /// "unsettled" mean exactly "panicked or otherwise unhandled".
+    ///
+    /// Discriminates the shipped bookkeeping, where a clean drop of an UNSETTLED guard ran the
+    /// pass but left `is_settled()` false and logged `settled = !unwinding`, i.e. `true` — the
+    /// field and the flag disagreeing in opposite directions at the same moment.
+    #[test]
+    fn a_clean_drop_of_an_unsettled_guard_counts_as_a_handled_settlement() {
+        let root = unique_temp_dir("clean-drop-settles");
+        fs::create_dir_all(&root).unwrap();
+        let mine = write_worktree_sidecar(&root, "mine", "my-host", "/leases/mine.lock", "mine");
+
+        {
+            let guard =
+                super::WorktreeRunEndGuard::new(root.to_string_lossy().into_owned(), "mine".into());
+            assert!(!guard.is_settled());
+        }
+
+        assert!(
+            !Path::new(&mine.worktree_path).exists(),
+            "a clean drop still performs the reclaim"
+        );
         fs::remove_dir_all(&root).unwrap();
     }
 }

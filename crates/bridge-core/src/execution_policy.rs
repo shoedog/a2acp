@@ -9,7 +9,7 @@ use crate::domain::{
     effective_config, AgentEntry, AgentKind, AgentOverride, EgressPolicy, MountAccess,
     SandboxConfig,
 };
-use crate::ids::{AgentId, AttemptId};
+use crate::ids::{AgentId, AttemptId, AttemptIdentity};
 use crate::mcp::{render_codex_mcp_args, render_kiro_agent_config, McpDelivery, McpServerSpec};
 use crate::SessionCwd;
 use ring::rand::{SecureRandom, SystemRandom};
@@ -287,6 +287,74 @@ pub struct FrozenWorktreeCustodyPlanV1 {
     pub custody_id: WorktreeCustodyIdV1,
     pub checkout_fingerprint: Sha256HexV1,
     pub target_cwd: SessionCwd,
+}
+
+/// One frozen custody plan, resolved against the attempt that will execute it.
+///
+/// The plan alone cannot build a [`crate::fs_custody`]-published custody record: §2.2's record
+/// and claim additionally need the executing attempt identity, the delivery-origin attempt, and
+/// the node reference, none of which are in [`FrozenWorktreeCustodyPlanV1`] (it carries only
+/// `{custody_id, checkout_fingerprint, target_cwd}`). This is the value the routing carries so a
+/// V3 writer has exactly what the record requires and nothing it must invent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BoundWorktreeCustodyV1 {
+    /// The attempt that owns the checkout right now — the record's `current_attempt`.
+    pub attempt: AttemptIdentity,
+    /// The delivery-origin attempt (`delivery_spec.attempt_id`). At ordinal 0 it equals
+    /// `attempt.attempt_id`; after a resume it legally differs.
+    pub origin_attempt_id: AttemptId,
+    pub node: PolicyNodeRefV1,
+    pub plan: FrozenWorktreeCustodyPlanV1,
+}
+
+/// Why a frozen custody plan could not be bound to a frozen checkout.
+///
+/// Selection is EXACT: the plan is chosen by `checkout_digest == checkout_fingerprint` and then
+/// re-checked against the target. Nothing here is a heuristic, and every arm refuses rather than
+/// falling back to an unbound (V2) route — a V3 attempt that silently degrades to V2 would
+/// materialize a checkout with no custody record, which is the one state the whole slice exists
+/// to prevent.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum CustodyPlanBindingRefusalV1 {
+    #[error("a worktree custody plan cannot bind to a direct (non-worktree) checkout")]
+    NotAWorktreeCheckout,
+    #[error("custody plan fingerprint does not match the frozen checkout digest")]
+    CheckoutDigestMismatch,
+    #[error("custody plan target does not match the frozen checkout target")]
+    TargetMismatch,
+    #[error("no custody plan matches this frozen worktree checkout")]
+    NoPlanForCheckout,
+    #[error("the attempt identity does not own this custody binding")]
+    AttemptMismatch,
+}
+
+/// Select the one custody plan that belongs to `checkout`, by exact digest match.
+///
+/// `Ok(None)` for a direct checkout: custody is a worktree concept, and a direct session has no
+/// checkout to protect. For a worktree checkout a missing plan is a REFUSAL, not `None` — §2.2
+/// requires `custody_plans` to enumerate every worktree checkout in the candidate matrix, so an
+/// unmatched worktree checkout means the contract and the delivery spec disagree.
+pub fn select_custody_plan_v1<'a>(
+    contract: &'a FrozenR2f1bContractV1,
+    checkout: &FrozenCheckoutEffectV1,
+) -> Result<Option<&'a FrozenWorktreeCustodyPlanV1>, CustodyPlanBindingRefusalV1> {
+    let FrozenCheckoutEffectV1::Worktree {
+        target_cwd,
+        checkout_digest,
+        ..
+    } = checkout
+    else {
+        return Ok(None);
+    };
+    let plan = contract
+        .custody_plans
+        .iter()
+        .find(|plan| plan.checkout_fingerprint == *checkout_digest)
+        .ok_or(CustodyPlanBindingRefusalV1::NoPlanForCheckout)?;
+    if plan.target_cwd != *target_cwd {
+        return Err(CustodyPlanBindingRefusalV1::TargetMismatch);
+    }
+    Ok(Some(plan))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1828,6 +1896,27 @@ pub enum LedgerAdmissionV1 {
 pub struct BoundProviderEffectV1 {
     frozen: FrozenProviderAttemptIdentityV1,
     delivery: Arc<BoundMcpDeliveryV1>,
+    /// The R2f1b custody binding for this attempt's checkout, when the run is V3.
+    ///
+    /// **Design note (slice 2b2, structural decision 1).** The propagated plan lives HERE rather
+    /// than as a new field on [`BoundSessionSpecV1`] or as a wrapper around it. Three reasons,
+    /// in decreasing order of force:
+    ///
+    /// 1. **V2 routes stay byte-identical with zero ripple.** `BoundSessionSpecV1` has public
+    ///    fields and is built by exhaustive struct literal outside this crate
+    ///    (`bridge-container/src/lib.rs`, twice). A new public field breaks those literals; a new
+    ///    private field makes them impossible. `BoundProviderEffectV1`'s fields are already
+    ///    private and it is constructed in exactly one place — `freeze_provider_attempt_v1`
+    ///    below — so a binding added here reaches every consumer that already holds the
+    ///    `Arc<BoundProviderEffectV1>` without touching a single call site.
+    /// 2. **The matching key is already here.** Selection is `checkout_digest ==
+    ///    checkout_fingerprint`, and `checkout` is `self.frozen.checkout`. Putting the plan
+    ///    beside the thing it is matched against lets [`Self::bind_custody_plan`] re-verify the
+    ///    match at construction, so an unverified pairing cannot be represented at all.
+    /// 3. **One binding per provider effect is the true cardinality.** A session spec is built
+    ///    fresh per configure call from a shared `Arc<BoundProviderEffectV1>`; a plan attached to
+    ///    the spec would have to be re-attached (and re-verified, or not) on every call.
+    custody: Option<Arc<BoundWorktreeCustodyV1>>,
 }
 
 impl std::fmt::Debug for BoundProviderEffectV1 {
@@ -1836,6 +1925,7 @@ impl std::fmt::Debug for BoundProviderEffectV1 {
             .debug_struct("BoundProviderEffectV1")
             .field("frozen", &self.frozen)
             .field("delivery", &self.delivery)
+            .field("custody", &self.custody)
             .finish()
     }
 }
@@ -1849,6 +1939,51 @@ impl BoundProviderEffectV1 {
     #[must_use]
     pub fn delivery(&self) -> &BoundMcpDeliveryV1 {
         &self.delivery
+    }
+
+    /// The R2f1b custody binding, or `None` for every V2 route.
+    #[must_use]
+    pub fn custody(&self) -> Option<&BoundWorktreeCustodyV1> {
+        self.custody.as_deref()
+    }
+
+    /// Attach one custody binding, re-verifying the exact match that selected it.
+    ///
+    /// The re-verification is not redundant with [`select_custody_plan_v1`]: this is the
+    /// constructor, so it is the only place that can guarantee no `BoundProviderEffectV1`
+    /// anywhere carries a plan for a different checkout. A caller that selected by any other
+    /// rule — nearest, first, configured — is refused here.
+    ///
+    /// **Exactly what is re-verified** (corrected in the 2b2 repair round, opus S-5 — the previous
+    /// wording implied full lineage checking): the checkout digest, the target path, and the
+    /// ordinal-0 consistency rule `origin_attempt_id == attempt.attempt_id`. It does NOT validate
+    /// `parent_attempt_id`, ordinal monotonicity, or successor lineage — that is
+    /// `WorkflowSnapshotV3::validate_successor`'s job, and for slice 2 the question does not arise
+    /// because `admission::admit_r2f1b_contract_v1` refuses any attempt with a non-zero ordinal or
+    /// a parent before a binding can be built at all.
+    pub fn bind_custody_plan(
+        mut self,
+        custody: Arc<BoundWorktreeCustodyV1>,
+    ) -> Result<Self, CustodyPlanBindingRefusalV1> {
+        let FrozenCheckoutEffectV1::Worktree {
+            target_cwd,
+            checkout_digest,
+            ..
+        } = &self.frozen.checkout
+        else {
+            return Err(CustodyPlanBindingRefusalV1::NotAWorktreeCheckout);
+        };
+        if custody.plan.checkout_fingerprint != *checkout_digest {
+            return Err(CustodyPlanBindingRefusalV1::CheckoutDigestMismatch);
+        }
+        if custody.plan.target_cwd != *target_cwd {
+            return Err(CustodyPlanBindingRefusalV1::TargetMismatch);
+        }
+        if custody.attempt.ordinal == 0 && custody.origin_attempt_id != custody.attempt.attempt_id {
+            return Err(CustodyPlanBindingRefusalV1::AttemptMismatch);
+        }
+        self.custody = Some(custody);
+        Ok(self)
     }
 }
 
@@ -1869,6 +2004,16 @@ impl std::fmt::Debug for BoundSessionSpecV1 {
 }
 
 impl BoundSessionSpecV1 {
+    /// The R2f1b custody binding this spec routes, or `None` for a V2 route.
+    ///
+    /// This is the V2/V3 discriminator the worktree backend branches on — the gap R-3 named
+    /// ("the bound path cannot distinguish V2 from V3"). It is a delegation rather than a field
+    /// so the answer cannot drift from the provider effect that was actually verified.
+    #[must_use]
+    pub fn custody(&self) -> Option<&BoundWorktreeCustodyV1> {
+        self.provider_effect.custody()
+    }
+
     #[must_use]
     pub fn new(
         config: crate::domain::EffectiveConfig,
@@ -2303,6 +2448,10 @@ pub fn freeze_provider_attempt_v1(
     let bound = BoundProviderEffectV1 {
         frozen: frozen.clone(),
         delivery: Arc::new(delivery),
+        // Freezing is V2-shaped and stays so: a custody binding is attached afterwards, by the
+        // one caller that holds a validated R2f1b contract (`BoundProviderEffectV1::
+        // bind_custody_plan`). Minting it here would make every frozen attempt look V3.
+        custody: None,
     };
     Ok(FrozenProviderAttemptBundleV1 {
         selection,
@@ -2804,6 +2953,199 @@ mod r2f1b_contract_tests {
     fn worktree_custody_id_rejects_missing_or_wrong_case_prefix() {
         assert!(WorktreeCustodyIdV1::parse("1".repeat(72)).is_err());
         assert!(WorktreeCustodyIdV1::parse(format!("Custody-{}", "1".repeat(64))).is_err());
+    }
+
+    // ---- slice 2b2: exact custody-plan selection and binding ----
+
+    fn worktree_checkout(target: &str, digest: char) -> FrozenCheckoutEffectV1 {
+        FrozenCheckoutEffectV1::Worktree {
+            source_cwd: SessionCwd::parse("/repo/source").unwrap(),
+            canonical_source_cwd: SessionCwd::parse("/repo/source").unwrap(),
+            canonical_worktree_root: SessionCwd::parse("/wt").unwrap(),
+            worktree_owner: "ownr".into(),
+            target_cwd: SessionCwd::parse(target).unwrap(),
+            checkout_digest: fp(digest),
+        }
+    }
+
+    fn plan_for(id_digit: char, fp_digit: char, target: &str) -> FrozenWorktreeCustodyPlanV1 {
+        FrozenWorktreeCustodyPlanV1 {
+            custody_id: cid(id_digit),
+            checkout_fingerprint: fp(fp_digit),
+            target_cwd: SessionCwd::parse(target).unwrap(),
+        }
+    }
+
+    /// Discriminates a selector that picks by position, by target path, or by "the only plan" —
+    /// each of which would bind a V3 attempt to a checkout it was not frozen for, and so publish
+    /// a custody record under another checkout's custody id.
+    #[test]
+    fn plan_selection_is_by_exact_checkout_digest_not_by_position_or_target() {
+        let contract = contract_with_matching_fingerprint(vec![
+            plan_for('a', '1', "/wt/one"),
+            plan_for('b', '2', "/wt/two"),
+        ]);
+
+        let selected = select_custody_plan_v1(&contract, &worktree_checkout("/wt/two", '2'))
+            .unwrap()
+            .expect("the frozen worktree checkout has a plan");
+
+        assert_eq!(selected.custody_id, cid('b'));
+        assert_eq!(selected.checkout_fingerprint, fp('2'));
+    }
+
+    /// A worktree checkout with no matching plan is a REFUSAL, never a silent V2 fallback: §2.2
+    /// requires `custody_plans` to enumerate every worktree checkout in the candidate matrix, so
+    /// an unmatched one means the contract and the delivery spec disagree. Discriminates a
+    /// selector returning `Ok(None)` there, which would materialize an unprotected checkout on a
+    /// run that believes it is under custody.
+    #[test]
+    fn an_unmatched_worktree_checkout_refuses_instead_of_degrading_to_v2() {
+        let contract = contract_with_matching_fingerprint(vec![plan_for('a', '1', "/wt/one")]);
+        assert_eq!(
+            select_custody_plan_v1(&contract, &worktree_checkout("/wt/nine", '9')),
+            Err(CustodyPlanBindingRefusalV1::NoPlanForCheckout)
+        );
+    }
+
+    /// A direct checkout has nothing to protect, so it selects nothing and does not refuse.
+    /// Discriminates a selector that treats every checkout as a worktree and so refuses every
+    /// direct node of a mixed V3 graph.
+    #[test]
+    fn a_direct_checkout_selects_no_plan_and_does_not_refuse() {
+        let contract = contract_with_matching_fingerprint(vec![plan_for('a', '1', "/wt/one")]);
+        let direct = freeze_direct_checkout_v1(SessionCwd::parse("/repo/source").unwrap());
+        assert_eq!(select_custody_plan_v1(&contract, &direct), Ok(None));
+    }
+
+    /// A plan whose fingerprint matches but whose target does not is refused. Discriminates a
+    /// selector that trusts the digest alone: `checkout_digest` commits the target, so a
+    /// disagreement means one of the two values was substituted after freezing.
+    #[test]
+    fn a_plan_whose_target_disagrees_with_its_checkout_is_refused() {
+        let contract = contract_with_matching_fingerprint(vec![plan_for('a', '1', "/wt/other")]);
+        assert_eq!(
+            select_custody_plan_v1(&contract, &worktree_checkout("/wt/one", '1')),
+            Err(CustodyPlanBindingRefusalV1::TargetMismatch)
+        );
+    }
+
+    fn bound_effect(checkout: FrozenCheckoutEffectV1) -> BoundProviderEffectV1 {
+        let entry = crate::domain::AgentEntry {
+            id: AgentId::parse("codex").unwrap(),
+            cmd: Some("codex-acp".into()),
+            base_url: None,
+            api_key_env: None,
+            args: vec![],
+            kind: crate::domain::AgentKind::Acp,
+            model_provider: None,
+            model: Some("gpt-5.6-sol".into()),
+            effort: None,
+            mode: None,
+            preflight: false,
+            fallback_models: vec![],
+            cwd: None,
+            session_cwd: None,
+            sandbox: None,
+            watchdog: None,
+            mcp: vec![],
+            mcp_delivery: crate::mcp::McpDelivery::Acp,
+            auth_method: None,
+            pre_authenticated: true,
+            host_fallback_eligible: false,
+            name: None,
+            description: None,
+            tags: vec![],
+            version: None,
+            extensions: std::collections::BTreeMap::new(),
+        };
+        freeze_provider_attempt_v1(&ProviderFreezeInputV1 {
+            entry: &entry,
+            overrides: None,
+            node: PolicyNodeRefV1::from_node_id(0, "n"),
+            logical_session: FrozenProviderLogicalSessionV1::Execute {
+                candidate_ordinal: 0,
+            },
+            checkout,
+            provider_effect_key: None,
+        })
+        .unwrap()
+        .bound
+    }
+
+    fn custody_binding(plan: FrozenWorktreeCustodyPlanV1) -> Arc<BoundWorktreeCustodyV1> {
+        let attempt_id = AttemptId::parse(format!("attempt-{}", "2".repeat(32))).unwrap();
+        Arc::new(BoundWorktreeCustodyV1 {
+            attempt: AttemptIdentity {
+                execution_id: crate::ids::ExecutionId::parse(format!("exec-{}", "1".repeat(32)))
+                    .unwrap(),
+                attempt_id: attempt_id.clone(),
+                ordinal: 0,
+                parent_attempt_id: None,
+            },
+            origin_attempt_id: attempt_id,
+            node: PolicyNodeRefV1::from_node_id(0, "n"),
+            plan,
+        })
+    }
+
+    /// The constructor re-verifies the match. Discriminates a `bind_custody_plan` that trusts its
+    /// caller: selection lives in one function today, but the binding is `pub`, and a rule
+    /// enforced only by the selector is a rule any other caller can skip.
+    #[test]
+    fn binding_re_verifies_the_digest_and_target_it_was_selected_by() {
+        let effect = bound_effect(worktree_checkout("/wt/one", '1'));
+
+        let wrong_digest = effect
+            .clone()
+            .bind_custody_plan(custody_binding(plan_for('a', '9', "/wt/one")));
+        assert_eq!(
+            wrong_digest.err(),
+            Some(CustodyPlanBindingRefusalV1::CheckoutDigestMismatch)
+        );
+
+        let wrong_target =
+            effect
+                .clone()
+                .bind_custody_plan(custody_binding(plan_for('a', '1', "/wt/elsewhere")));
+        assert_eq!(
+            wrong_target.err(),
+            Some(CustodyPlanBindingRefusalV1::TargetMismatch)
+        );
+
+        let bound = effect
+            .bind_custody_plan(custody_binding(plan_for('a', '1', "/wt/one")))
+            .expect("the exactly-matching plan binds");
+        assert_eq!(
+            bound.custody().map(|c| c.plan.custody_id.clone()),
+            Some(cid('a'))
+        );
+    }
+
+    /// A custody plan cannot ride a direct checkout: there is no checkout to protect and no
+    /// digest to match against. Discriminates a binding that stores the plan and lets the writer
+    /// discover the mismatch later, after effects.
+    #[test]
+    fn a_custody_plan_cannot_bind_to_a_direct_checkout() {
+        let effect = bound_effect(freeze_direct_checkout_v1(
+            SessionCwd::parse("/repo/source").unwrap(),
+        ));
+        assert_eq!(
+            effect
+                .bind_custody_plan(custody_binding(plan_for('a', '1', "/wt/one")))
+                .err(),
+            Some(CustodyPlanBindingRefusalV1::NotAWorktreeCheckout)
+        );
+    }
+
+    /// Freezing stays V2-shaped. Discriminates a `freeze_provider_attempt_v1` that starts
+    /// synthesising custody bindings, which would make every frozen attempt look V3 to the
+    /// backend and defeat the whole production-unreachability argument.
+    #[test]
+    fn a_freshly_frozen_provider_effect_carries_no_custody_binding() {
+        assert!(bound_effect(worktree_checkout("/wt/one", '1'))
+            .custody()
+            .is_none());
     }
 }
 

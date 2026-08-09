@@ -239,6 +239,12 @@ impl AgentRegistry for BoundOnlyRegistry {
             .fetch_add(1, Ordering::SeqCst);
     }
 
+    /// Needed by the REAL `WorkflowAdmissionV1::freeze`, which the end-to-end routing test drives
+    /// so the whole admission -> authority -> executor -> backend chain is production code.
+    fn entry_snapshot(&self, id: &AgentId) -> Option<Arc<AgentEntry>> {
+        (id == &self.entry.id).then(|| self.entry.clone())
+    }
+
     fn default_id(&self) -> AgentId {
         self.entry.id.clone()
     }
@@ -1346,4 +1352,412 @@ async fn v2_degraded_synthesis_uses_typed_marker_and_propagates_ancestry() {
         other => panic!("missing workflow terminal: {other:?}"),
     };
     assert_eq!(format!("{outcome:?}"), "CompletedDegraded");
+}
+
+// ---------------------------------------------------------------------------------------------
+// R2f1b slice 2b2 — V3 routing: admission → executor → `BoundSessionSpecV1`.
+//
+// R-3: `BoundSessionSpecV1` could not distinguish V2 from V3, so a V3-only writer could not
+// exist. These tests pin both directions of the discriminator on the SAME harness the V2 tests
+// above use, which is what makes "V2 routes byte-identical" observable rather than asserted.
+// ---------------------------------------------------------------------------------------------
+
+fn r2f1b_admission_for(
+    run_spec: &WorkflowRunSpecV1,
+    activation: bridge_core::execution_policy::DeadlineActivationV2,
+) -> Arc<bridge_workflow::admission::R2f1bAdmissionV1> {
+    use bridge_core::execution_policy::{
+        FrozenCheckoutEffectV1, FrozenR2f1bContractV1, FrozenWorktreeCustodyPlanV1, Sha256HexV1,
+        WorktreeCustodyIdV1,
+    };
+    let mut plans = Vec::new();
+    for identity in &run_spec.node_execution_identities {
+        for attempt in &identity.provider_attempts {
+            if let FrozenCheckoutEffectV1::Worktree {
+                target_cwd,
+                checkout_digest,
+                ..
+            } = &attempt.checkout
+            {
+                plans.push(FrozenWorktreeCustodyPlanV1 {
+                    custody_id: WorktreeCustodyIdV1::parse(format!(
+                        "custody-{}",
+                        Sha256HexV1::digest(checkout_digest.as_str().as_bytes()).as_str()
+                    ))
+                    .unwrap(),
+                    checkout_fingerprint: checkout_digest.clone(),
+                    target_cwd: target_cwd.clone(),
+                });
+            }
+        }
+    }
+    Arc::new(bridge_workflow::admission::R2f1bAdmissionV1 {
+        attempt: bridge_core::ids::AttemptIdentity {
+            execution_id: bridge_core::ids::ExecutionId::parse(format!("exec-{}", "7".repeat(32)))
+                .unwrap(),
+            attempt_id: run_spec.attempt_id.clone(),
+            ordinal: 0,
+            parent_attempt_id: None,
+        },
+        contract: FrozenR2f1bContractV1::with_computed_fingerprint(activation, plans).unwrap(),
+    })
+}
+
+async fn execute_v3(
+    entry: AgentEntry,
+    r2f1b: Arc<bridge_workflow::admission::R2f1bAdmissionV1>,
+    run_spec: Arc<WorkflowRunSpecV1>,
+) -> (Arc<Calls>, Option<(WorkflowOutcome, String)>) {
+    let entry = Arc::new(entry);
+    let calls = Arc::new(Calls::default());
+    let backend: Arc<dyn AgentBackend> = Arc::new(RecordingBackend {
+        calls: calls.clone(),
+    });
+    let registry = Arc::new(BoundOnlyRegistry {
+        entry,
+        backend,
+        slot: Arc::new(()),
+        calls: calls.clone(),
+        fail_preflight_ordinal: None,
+    });
+    let request = WorkflowRunContext {
+        session_cwd: run_spec.requested_session_cwd.clone(),
+        ..WorkflowRunContext::default()
+    };
+    let context = WorkflowDiagnosticContext::in_memory(request)
+        .with_frozen_run_spec(run_spec.clone(), None)
+        .unwrap()
+        .with_frozen_r2f1b_contract(r2f1b)
+        .expect("a manual-only contract covering every checkout binds");
+    let executor = WorkflowExecutor::new(registry);
+    let mut stream = executor.run_with_diagnostic_context(
+        Arc::new(run_spec.graph.clone()),
+        "review this".into(),
+        "v3-run".into(),
+        CancellationToken::new(),
+        context,
+    );
+    let mut terminal = None;
+    while let Some(event) = stream.next().await {
+        if let WorkflowEvent::Terminal { outcome, output } = event.unwrap() {
+            terminal = Some((outcome, output));
+        }
+    }
+    (calls, terminal)
+}
+
+/// V3 direction. Discriminates a route that drops the plan (leaving the backend unable to tell
+/// V2 from V3 — R-3 unfixed), and one that attaches *a* plan rather than *the* plan for this
+/// checkout: the asserted custody id is derived from this attempt's own frozen digest, so a
+/// first-plan or nearest-plan selector fails here.
+#[tokio::test]
+async fn v3_routing_carries_the_exactly_matching_custody_plan_to_the_backend() {
+    let configured = entry();
+    let run_spec = Arc::new(frozen_worktree_run(&configured));
+    let r2f1b = r2f1b_admission_for(
+        &run_spec,
+        bridge_core::execution_policy::DeadlineActivationV2::ManualOnlyR2f1a,
+    );
+    let (calls, terminal) = execute_v3(configured, r2f1b.clone(), run_spec.clone()).await;
+
+    assert_eq!(
+        terminal,
+        Some((WorkflowOutcome::Completed, "BOUND_OK".into()))
+    );
+    let specs = calls.bound_specs.lock().unwrap();
+    assert_eq!(specs.len(), 1);
+    let custody = specs[0]
+        .custody()
+        .expect("a V3 route must carry its custody binding");
+    let persisted = &run_spec.node_execution_identities[0].provider_attempts[0];
+    let bridge_core::execution_policy::FrozenCheckoutEffectV1::Worktree {
+        target_cwd,
+        checkout_digest,
+        ..
+    } = &persisted.checkout
+    else {
+        panic!("the frozen checkout is a worktree")
+    };
+    assert_eq!(&custody.plan.checkout_fingerprint, checkout_digest);
+    assert_eq!(&custody.plan.target_cwd, target_cwd);
+    assert_eq!(custody.attempt, r2f1b.attempt);
+    assert_eq!(custody.origin_attempt_id, run_spec.attempt_id);
+    assert_eq!(
+        custody.node, run_spec.node_execution_identities[0].node,
+        "the writer needs the node ref the claim records"
+    );
+}
+
+/// V2 direction, on the same harness: with no contract bound, nothing changes. Discriminates a
+/// routing change that synthesises a custody binding for every worktree checkout, which would
+/// make every existing V2 run take the V3 writer.
+#[tokio::test]
+async fn v2_routing_carries_no_custody_binding() {
+    let configured = entry();
+    let run_spec = Arc::new(frozen_worktree_run(&configured));
+    let (_run_spec, calls, node_ok, _terminal) = execute_bound(configured, None, None, 0).await;
+
+    assert_eq!(node_ok, Some(true));
+    let specs = calls.bound_specs.lock().unwrap();
+    assert_eq!(specs.len(), 1);
+    assert!(
+        specs[0].custody().is_none(),
+        "a V2 route must reach the backend indistinguishable from before this slice"
+    );
+    assert!(matches!(
+        run_spec.node_execution_identities[0].provider_attempts[0].checkout,
+        bridge_core::execution_policy::FrozenCheckoutEffectV1::Worktree { .. }
+    ));
+}
+
+/// The executor-side boundary enforces the same activation rule as admission. Discriminates a
+/// rule enforced at only one of the two entrances: `with_frozen_r2f1b_contract` is `pub`, so a
+/// caller can reach the executor without going through `WorkflowAdmissionV1::freeze`.
+#[test]
+fn the_executor_boundary_also_refuses_automatic_activation() {
+    let configured = entry();
+    let run_spec = Arc::new(frozen_worktree_run(&configured));
+    let automatic = r2f1b_admission_for(
+        &run_spec,
+        bridge_core::execution_policy::DeadlineActivationV2::AutomaticR2f1b,
+    );
+    let context = WorkflowDiagnosticContext::in_memory(WorkflowRunContext {
+        session_cwd: run_spec.requested_session_cwd.clone(),
+        ..WorkflowRunContext::default()
+    })
+    .with_frozen_run_spec(run_spec, None)
+    .unwrap();
+
+    let Err(BridgeError::ConfigInvalid { reason }) = context.with_frozen_r2f1b_contract(automatic)
+    else {
+        panic!("the executor boundary must refuse automatic activation");
+    };
+    assert!(
+        reason.contains("automatic R2f1b deadline activation is refused"),
+        "unexpected refusal reason: {reason}"
+    );
+}
+
+/// A contract cannot be bound without the delivery spec it is matched against. Discriminates an
+/// ordering-free API where a caller can attach a contract nothing checks its coverage against.
+#[test]
+fn an_r2f1b_contract_needs_its_frozen_run_spec_first() {
+    let configured = entry();
+    let run_spec = Arc::new(frozen_worktree_run(&configured));
+    let manual = r2f1b_admission_for(
+        &run_spec,
+        bridge_core::execution_policy::DeadlineActivationV2::ManualOnlyR2f1a,
+    );
+    let context = WorkflowDiagnosticContext::in_memory(WorkflowRunContext::default());
+
+    assert!(context.with_frozen_r2f1b_contract(manual).is_err());
+}
+
+// ---------------------------------------------------------------------------------------------
+// R2f1b slice 2b2 repair R1 — the ADMISSION -> AUTHORITY -> EXECUTOR handoff, end to end.
+//
+// The bug this closes: both production authority consumers (`main.rs` run-workflow,
+// `detached.rs`) took `authority.run_spec` and `authority.provider_effect_key` apart and passed
+// them to `with_frozen_run_spec`, which hardcodes `r2f1b: None`. So `AdmittedWorkflowRunV1::r2f1b`
+// was write-only in production: an admitted `ManualOnlyR2f1a` contract was dropped between
+// admission and the executor, the run silently degraded to V2 (legacy `add`, `.meta.json`, no
+// custody record), and nothing failed. Every test above bound the contract by hand and therefore
+// could not see it.
+// ---------------------------------------------------------------------------------------------
+
+struct WorktreeAdmissionPlanner {
+    root: SessionCwd,
+}
+
+#[async_trait]
+impl bridge_workflow::admission::WorkflowCheckoutPlannerV1 for WorktreeAdmissionPlanner {
+    async fn freeze_checkout(
+        &self,
+        _entry: &AgentEntry,
+        input: &bridge_workflow::admission::CheckoutPlanInputV1,
+    ) -> Result<bridge_core::execution_policy::FrozenCheckoutEffectV1, BridgeError> {
+        freeze_worktree_checkout_v1(&WorktreeCheckoutInputV1 {
+            attempt_id: input.attempt_id.clone(),
+            node: input.node.clone(),
+            logical_session: input.logical_session,
+            source_cwd: input.source_cwd.clone(),
+            canonical_source_cwd: input.source_cwd.clone(),
+            canonical_worktree_root: self.root.clone(),
+            worktree_owner: "bound-test".into(),
+        })
+        .map_err(|error| BridgeError::ConfigInvalid {
+            reason: format!("{error:?}"),
+        })
+    }
+}
+
+/// Drive the REAL `WorkflowAdmissionV1::freeze`, optionally offering a contract covering every
+/// frozen worktree checkout it produces.
+async fn admit_through_production_admission(
+    registry: Arc<dyn AgentRegistry>,
+    with_contract: bool,
+) -> bridge_workflow::admission::AdmittedWorkflowRunV1 {
+    use bridge_core::execution_policy::{
+        FrozenCheckoutEffectV1, FrozenR2f1bContractV1, FrozenWorktreeCustodyPlanV1,
+        HistoryAllocationKindV1, Sha256HexV1, WorktreeCustodyIdV1,
+    };
+    let source_cwd = SessionCwd::parse("/repo/source").unwrap();
+    let graph = Arc::new(WorkflowGraph {
+        id: WorkflowId::parse("review").unwrap(),
+        nodes: vec![WorkflowNode {
+            id: NodeId::parse("review-node").unwrap(),
+            agent: AgentId::parse("codex").unwrap(),
+            prompt_template: "{{input}}".into(),
+            inputs: vec![],
+            retry: None,
+            harvest_sanitization: None,
+        }],
+        panel: None,
+        controls: Some(WorkflowControlDefaultsV1::default()),
+    });
+    let admission = bridge_workflow::admission::WorkflowAdmissionV1::new(
+        registry,
+        Arc::new(WorktreeAdmissionPlanner {
+            root: SessionCwd::parse("/private/tmp/a2a-bound-worktrees").unwrap(),
+        }),
+        source_cwd.clone(),
+        None,
+    );
+    let attempt = bridge_core::ids::AttemptIdentity::initial().unwrap();
+    let attempt_id = attempt.attempt_id.clone();
+    let request = |r2f1b| bridge_workflow::admission::WorkflowAdmissionRequestV1 {
+        attempt_id: attempt_id.clone(),
+        graph: graph.clone(),
+        requested_session_cwd: Some(source_cwd.clone()),
+        policy_invocation: ExecutionPolicyInvocationV1::default(),
+        ledger_admission: LedgerAdmissionV1::HistoryLedgerAdmitted {
+            kind: HistoryAllocationKindV1::Configured,
+        },
+        r2f1b,
+    };
+    let probe = admission.freeze(request(None)).await.unwrap();
+    if !with_contract {
+        return probe;
+    }
+    let plans = probe.run_spec.node_execution_identities[0]
+        .provider_attempts
+        .iter()
+        .filter_map(|attempt| match &attempt.checkout {
+            FrozenCheckoutEffectV1::Worktree {
+                target_cwd,
+                checkout_digest,
+                ..
+            } => Some(FrozenWorktreeCustodyPlanV1 {
+                custody_id: WorktreeCustodyIdV1::parse(format!(
+                    "custody-{}",
+                    Sha256HexV1::digest(checkout_digest.as_str().as_bytes()).as_str()
+                ))
+                .unwrap(),
+                checkout_fingerprint: checkout_digest.clone(),
+                target_cwd: target_cwd.clone(),
+            }),
+            FrozenCheckoutEffectV1::Direct { .. } => None,
+        })
+        .collect();
+    admission
+        .freeze(request(Some(
+            bridge_workflow::admission::R2f1bAdmissionV1 {
+                attempt,
+                contract: FrozenR2f1bContractV1::with_computed_fingerprint(
+                    bridge_core::execution_policy::DeadlineActivationV2::ManualOnlyR2f1a,
+                    plans,
+                )
+                .unwrap(),
+            },
+        )))
+        .await
+        .unwrap()
+}
+
+async fn run_through_production_binder(
+    with_contract: bool,
+) -> (Arc<Calls>, Arc<WorkflowRunSpecV1>) {
+    let entry = Arc::new(entry());
+    let calls = Arc::new(Calls::default());
+    let backend: Arc<dyn AgentBackend> = Arc::new(RecordingBackend {
+        calls: calls.clone(),
+    });
+    let registry = Arc::new(BoundOnlyRegistry {
+        entry,
+        backend,
+        slot: Arc::new(()),
+        calls: calls.clone(),
+        fail_preflight_ordinal: None,
+    });
+    let admitted = admit_through_production_admission(
+        registry.clone() as Arc<dyn AgentRegistry>,
+        with_contract,
+    )
+    .await;
+    let run_spec = admitted.run_spec.clone();
+    let request = WorkflowRunContext {
+        session_cwd: run_spec.requested_session_cwd.clone(),
+        ..WorkflowRunContext::default()
+    };
+    // THE production binder. Nothing in this test reaches into the admission result by hand.
+    let context = WorkflowDiagnosticContext::in_memory(request)
+        .with_admitted_workflow_run(admitted)
+        .expect("the admitted run binds");
+    let executor = WorkflowExecutor::new(registry);
+    let mut stream = executor.run_with_diagnostic_context(
+        Arc::new(run_spec.graph.clone()),
+        "review this".into(),
+        "production-binder-run".into(),
+        CancellationToken::new(),
+        context,
+    );
+    while stream.next().await.is_some() {}
+    (calls, run_spec)
+}
+
+/// R1's red test. An admitted `ManualOnlyR2f1a` contract must survive the real production binder
+/// and reach the backend as a custody binding.
+///
+/// Discriminates exactly the shipped defect: with the consumers calling `with_frozen_run_spec`
+/// (which hardcodes `r2f1b: None`) this asserts `custody().is_some()` on a spec that carries
+/// `None`, and it is the ONLY test that can — every other V3 test binds the contract by hand and
+/// so never exercises the handoff at all. A dropped contract means the worktree backend takes the
+/// V2 leg: legacy `add`, `.meta.json`, no custody record (pinned separately by
+/// `v3_path_writes_no_legacy_meta_json` at the backend boundary, which keys on this same
+/// `custody()` discriminator).
+#[tokio::test]
+async fn an_admitted_contract_survives_the_production_authority_binder() {
+    let (calls, run_spec) = run_through_production_binder(true).await;
+
+    let specs = calls.bound_specs.lock().unwrap();
+    assert_eq!(specs.len(), 1);
+    let custody = specs[0]
+        .custody()
+        .expect("the admitted contract must reach the backend, not be dropped at the handoff");
+    let bridge_core::execution_policy::FrozenCheckoutEffectV1::Worktree {
+        checkout_digest,
+        target_cwd,
+        ..
+    } = &run_spec.node_execution_identities[0].provider_attempts[0].checkout
+    else {
+        panic!("admission froze a worktree checkout")
+    };
+    assert_eq!(&custody.plan.checkout_fingerprint, checkout_digest);
+    assert_eq!(&custody.plan.target_cwd, target_cwd);
+    assert_eq!(custody.origin_attempt_id, run_spec.attempt_id);
+    assert_eq!(calls.legacy_configures.load(Ordering::SeqCst), 0);
+}
+
+/// The V2 negative through the SAME binder: admission with no contract still routes V2, so the
+/// test above cannot pass by making every run look V3.
+#[tokio::test]
+async fn an_admission_with_no_contract_still_routes_v2_through_the_same_binder() {
+    let (calls, _run_spec) = run_through_production_binder(false).await;
+
+    let specs = calls.bound_specs.lock().unwrap();
+    assert_eq!(specs.len(), 1);
+    assert!(
+        specs[0].custody().is_none(),
+        "a V2 admission must reach the backend indistinguishable from before this slice"
+    );
 }

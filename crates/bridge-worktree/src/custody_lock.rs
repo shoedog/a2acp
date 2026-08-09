@@ -23,15 +23,32 @@
 //! whose deletion it guards is destroyed by the very act it is meant to serialize.
 //!
 //! **(c) Acquisition order.** `acquire_persistent_lock_blocking_in` documents a global obligation:
-//! never hold a lock the current holder needs in order to release yours. The custody lock is the
-//! **innermost** file lock in this workspace. The declared total order is
+//! never hold a lock the current holder needs in order to release yours. **Re-declared in slice
+//! 2b2** (repair R8b): the order below predated the publication cell and no longer described the
+//! code. The complete, current total order is
 //!
 //! ```text
 //! run lease (liveness::acquire_lease, held for the whole process run)
 //!   → operation lock (implement-resume, verify, run-id: liveness::acquire_persistent_lock*)
-//!     → custody lock (this module, one per checkout)
-//!       → in-process backend mutexes (WorktreeBackend map / cleanup cells / cell state)
+//!     → checkout PUBLICATION cell (this module, one per checkout, keyed by target path)
+//!       → custody cell (this module, one per checkout, keyed by custody id)
+//!         → in-process backend mutexes (WorktreeBackend map / cleanup cells / cell state)
 //! ```
+//!
+//! Who takes what:
+//!
+//! * the V3 writer takes the publication cell then the custody cell, in that order, and holds both
+//!   for one transition sequence (`custody_writer::WorktreeCustodianV1`);
+//! * every deletion-side and sweep-side caller takes the PUBLICATION cell only, with the refusing
+//!   acquirer — `backend::CheckoutRemovalWindowV1` and `sweep::remove_worktree_if_safe`.
+//!
+//! **File lock inside in-process mutex.** The backend's deletion gate takes the publication cell
+//! while already holding the cleanup cell's async `state` mutex (`CleanupCellState`), which is the
+//! order declared above (file locks are OUTSIDE the in-process mutexes in the list, but the gate
+//! is the one place they nest the other way round). That is safe and deliberate: no holder of a
+//! custody or publication cell ever waits on that per-session mutex — the writer's cells are taken
+//! inside `spawn_blocking` with no backend mutex held — so the two cannot form a cycle. Stated
+//! explicitly because it is the one nesting a reader would otherwise have to re-derive.
 //!
 //! A custody-lock holder must therefore never acquire a run lease or an operation lock, and must
 //! never hold the lock across an `.await` that can only complete once another task takes it.
@@ -152,6 +169,98 @@ pub fn try_acquire_custody_lock_in(
         guard,
     })
     .map_err(|error| classify(custody_id, error))
+}
+
+/// The publication-cell prefix. A distinct namespace from [`custody_lock_id`]'s custody ids
+/// (`"custody-"` + 64 hex), so the two cell families can never alias inside one lock directory.
+const PUBLICATION_LOCK_PREFIX: &str = "target-";
+
+/// The lock id for a checkout's PUBLICATION cell: `"target-"` + sha256 of the canonical target
+/// path. Single path component by construction (hex only).
+///
+/// **Why a second cell exists (slice 2b2, S7).** The 2b1 deletion gate probes for a custody
+/// record and then removes; a writer that publishes a record inside that window makes the gate
+/// delete a protected checkout. Closing it requires the gate and the writer to hold ONE cell —
+/// but the gate cannot name the custody cell: the custody id lives inside the record, and the
+/// gate's whole discipline is presence-not-content (a corrupt record must still protect, so the
+/// gate must never depend on decoding one). The only identifier both sides certainly share is
+/// the canonical target path, so that is the key.
+///
+/// This does not weaken [`custody_lock_id`]'s single-derivation rule; it adds a strictly outer
+/// cell with its own, also-single, derivation. Order is fixed and total:
+/// **publication cell (path) → custody cell (id)**. The writer takes both, in that order; every
+/// deletion-side and sweep-side caller takes the publication cell only, with the refusing
+/// acquirer.
+#[must_use]
+pub fn custody_publication_lock_id(canonical_worktree_path: &str) -> String {
+    format!(
+        "{PUBLICATION_LOCK_PREFIX}{}",
+        bridge_core::execution_policy::Sha256HexV1::digest(canonical_worktree_path.as_bytes())
+            .as_str()
+    )
+}
+
+/// Enter a checkout's publication cell, or refuse. **Required for every deletion-side and
+/// sweep-side caller**, and taken by the writer before its custody cell.
+pub fn try_acquire_publication_lock_in(
+    worktree_root: &Path,
+    canonical_worktree_path: &str,
+) -> Result<PublicationLockGuardV1, CustodyLockRefusalV1> {
+    let id = custody_publication_lock_id(canonical_worktree_path);
+    acquire_persistent_lock_in(&custody_lock_dir(worktree_root), &id)
+        .map(|guard| PublicationLockGuardV1 { id, guard })
+        .map_err(|error| {
+            if error.kind() == std::io::ErrorKind::WouldBlock {
+                CustodyLockRefusalV1::Contended(id_for_error(canonical_worktree_path))
+            } else {
+                CustodyLockRefusalV1::Unavailable(id_for_error(canonical_worktree_path), error)
+            }
+        })
+}
+
+/// Enter a checkout's publication cell, waiting. For the transition writer only.
+pub fn acquire_publication_lock_blocking_in(
+    worktree_root: &Path,
+    canonical_worktree_path: &str,
+    on_contended: &dyn Fn(),
+) -> Result<PublicationLockGuardV1, CustodyLockRefusalV1> {
+    let id = custody_publication_lock_id(canonical_worktree_path);
+    acquire_persistent_lock_blocking_in(&custody_lock_dir(worktree_root), &id, on_contended)
+        .map(|guard| PublicationLockGuardV1 { id, guard })
+        .map_err(|error| {
+            if error.kind() == std::io::ErrorKind::WouldBlock {
+                CustodyLockRefusalV1::Contended(id_for_error(canonical_worktree_path))
+            } else {
+                CustodyLockRefusalV1::Unavailable(id_for_error(canonical_worktree_path), error)
+            }
+        })
+}
+
+fn id_for_error(canonical_worktree_path: &str) -> String {
+    format!("publication:{canonical_worktree_path}")
+}
+
+/// A held publication cell. Dropping it releases the cell without unlinking the path.
+pub struct PublicationLockGuardV1 {
+    id: String,
+    guard: PersistentLockGuard,
+}
+
+impl std::fmt::Debug for PublicationLockGuardV1 {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PublicationLockGuardV1")
+            .field("id", &self.id)
+            .field("path", &self.guard.path())
+            .finish()
+    }
+}
+
+impl PublicationLockGuardV1 {
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        self.guard.path()
+    }
 }
 
 /// Enter a custody cell, waiting for the current holder. For the transition writer only.
@@ -399,6 +508,108 @@ mod tests {
         drop(guard);
 
         assert!(path.exists(), "the custody lock path must stay stable");
+        std::fs::remove_dir_all(&worktree_root).unwrap();
+    }
+
+    // ---- slice 2b2 repair R8d: the PUBLICATION cell's own coverage ----
+    //
+    // The publication cell shipped with no unit tests of its own — every assertion about it lived
+    // in the callers. These give it the same coverage the custody cell already had.
+
+    /// Distinct checkouts must not serialize against each other. Discriminates a publication cell
+    /// keyed on the ROOT rather than the target — every concurrent workflow node in one worktree
+    /// root would queue behind the others.
+    #[test]
+    fn distinct_checkouts_do_not_contend_on_the_publication_cell() {
+        let worktree_root = root("publication-distinct");
+
+        let first = try_acquire_publication_lock_in(&worktree_root, "/wt/one").unwrap();
+        let second = try_acquire_publication_lock_in(&worktree_root, "/wt/two").unwrap();
+
+        assert_ne!(first.path(), second.path());
+        drop((first, second));
+        std::fs::remove_dir_all(&worktree_root).unwrap();
+    }
+
+    /// The same target derives the same cell from two different callers. Discriminates a key with
+    /// any per-caller input (a pid, a nonce, a session id): a writer and a sweeper would serialize
+    /// on two different files while each believed it held the cell.
+    #[test]
+    fn the_publication_cell_key_is_a_pure_function_of_the_target_path() {
+        let first = custody_publication_lock_id("/wt/ownr-run7-abc");
+        let second = custody_publication_lock_id("/wt/ownr-run7-abc");
+
+        assert_eq!(first, second);
+        assert_ne!(first, custody_publication_lock_id("/wt/ownr-run7-abd"));
+        assert!(first.starts_with("target-"));
+        assert!(!first.contains(std::path::MAIN_SEPARATOR) && !first.contains('\0'));
+        assert!(!first.contains('/') && first != "." && first != "..");
+        // Distinct namespace from the custody-id cells, so the two families cannot alias.
+        assert!(!first.starts_with(WorktreeCustodyIdV1::PREFIX));
+    }
+
+    /// The blocking acquirer waits and says so. Discriminates a "blocking" acquirer that is really
+    /// the refusing one (the writer would spuriously fail a legitimate transition) and one whose
+    /// `on_contended` never fires (an operator gets no reason for a stall).
+    #[test]
+    fn the_blocking_publication_acquirer_waits_and_reports_contention() {
+        let worktree_root = root("publication-blocking");
+        let target = "/wt/ownr-run7-abc";
+        let held = try_acquire_publication_lock_in(&worktree_root, target).unwrap();
+
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let waited = Arc::new(AtomicBool::new(false));
+        let writer = std::thread::spawn({
+            let worktree_root = worktree_root.clone();
+            let waited = Arc::clone(&waited);
+            move || {
+                let _guard = acquire_publication_lock_blocking_in(&worktree_root, target, &|| {
+                    waited.store(true, Ordering::SeqCst);
+                    entered_tx.send(()).unwrap();
+                })
+                .unwrap();
+            }
+        });
+
+        entered_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        assert!(!writer.is_finished());
+        drop(held);
+        writer.join().unwrap();
+        assert!(waited.load(Ordering::SeqCst));
+        std::fs::remove_dir_all(&worktree_root).unwrap();
+    }
+
+    /// Releasing leaves the lock PATH in place. Discriminates a guard whose `Drop` unlinks it (the
+    /// `LeaseGuard` behaviour, wrong for a reusable cell): a contender that opened the doomed inode
+    /// before the unlink would flock it while a later acquirer creates a fresh one, giving two
+    /// holders of one cell on two inodes.
+    #[test]
+    fn releasing_a_publication_cell_leaves_its_lock_path_in_place() {
+        let worktree_root = root("publication-stable-path");
+        let guard = try_acquire_publication_lock_in(&worktree_root, "/wt/ownr-run7-abc").unwrap();
+        let path = guard.path().to_path_buf();
+
+        drop(guard);
+
+        assert!(path.exists(), "the publication cell path must stay stable");
+        assert!(try_acquire_publication_lock_in(&worktree_root, "/wt/ownr-run7-abc").is_ok());
+        std::fs::remove_dir_all(&worktree_root).unwrap();
+    }
+
+    /// The two cell families live in ONE directory and must never collide there. Discriminates a
+    /// publication key that could ever equal a custody key.
+    #[test]
+    fn publication_and_custody_cells_share_a_directory_without_aliasing() {
+        let worktree_root = root("publication-vs-custody");
+        let custody_id = cid('7');
+
+        let publication =
+            try_acquire_publication_lock_in(&worktree_root, "/wt/ownr-run7-abc").unwrap();
+        let custody = try_acquire_custody_lock_in(&worktree_root, &custody_id).unwrap();
+
+        assert_ne!(publication.path(), custody.path());
+        assert_eq!(publication.path().parent(), custody.path().parent());
+        drop((publication, custody));
         std::fs::remove_dir_all(&worktree_root).unwrap();
     }
 }

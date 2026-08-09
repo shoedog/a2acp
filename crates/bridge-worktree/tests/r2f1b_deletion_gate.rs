@@ -90,6 +90,9 @@ impl WorktreeProvider for FakeProvider {
         Ok(String::new())
     }
 
+    // Nine-impl enumeration (R-6), 9 of 10: REFUSING default. This suite drives the deletion
+    // gate through V2 configures; the custody records it asserts against are published directly.
+
     async fn remove(&self, _repo: &str, _worktree_path: &str) -> Result<(), BridgeError> {
         self.rec.provider_removes.fetch_add(1, Ordering::SeqCst);
         Ok(())

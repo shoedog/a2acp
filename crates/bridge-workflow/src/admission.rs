@@ -7,11 +7,12 @@ use bridge_core::domain::AgentEntry;
 use bridge_core::error::BridgeError;
 use bridge_core::execution_policy::{
     freeze_node_execution_identity_v1, freeze_provider_attempt_v1, resolve_execution_policy_v1,
-    ExecutionPolicyInvocationV1, FrozenCheckoutEffectV1, FrozenProviderLogicalSessionV1,
+    select_custody_plan_v1, DeadlineActivationV2, ExecutionPolicyInvocationV1,
+    FrozenCheckoutEffectV1, FrozenProviderLogicalSessionV1, FrozenR2f1bContractV1,
     LedgerAdmissionV1, PolicyActivationV1, PolicyNodeRefV1, ProviderEffectKeyV1,
     ProviderFreezeInputV1, WorkflowControlDefaultsV1,
 };
-use bridge_core::ids::AttemptId;
+use bridge_core::ids::{AttemptId, AttemptIdentity};
 use bridge_core::ports::AgentRegistry;
 use bridge_core::SessionCwd;
 use std::path::{Path, PathBuf};
@@ -63,6 +64,61 @@ pub struct WorkflowAdmissionV1 {
 pub struct AdmittedWorkflowRunV1 {
     pub run_spec: Arc<WorkflowRunSpecV1>,
     pub provider_effect_key: Option<Arc<ProviderEffectKeyV1>>,
+    /// The admitted R2f1b contract, or `None` for every V2 run.
+    ///
+    /// Production admission has no way to populate this: every caller of [`WorkflowAdmissionV1::
+    /// freeze`] passes `r2f1b: None` (see the §2c unreachability argument in the slice handoff),
+    /// and the one activation that could arm timers is refused outright by
+    /// [`admit_r2f1b_contract_v1`]. Slice 4 owns making it reachable.
+    pub r2f1b: Option<Arc<R2f1bAdmissionV1>>,
+}
+
+/// One R2f1b contract offered to admission, with the attempt that will execute it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct R2f1bAdmissionV1 {
+    pub attempt: AttemptIdentity,
+    pub contract: FrozenR2f1bContractV1,
+}
+
+/// The single production admission rule for an R2f1b contract (slice-2 brief §3, Sol 13).
+///
+/// **Deliberately NOT in [`FrozenR2f1bContractV1::validate`].** Putting the activation refusal in
+/// `validate` would make `with_computed_fingerprint` fail for `AutomaticR2f1b` and break the
+/// already-landed A3/A5 offline construction, encoding, decoding, and workload-identity tests —
+/// which must stay legal, because slice 4 needs to build and persist automatic contracts before
+/// it is allowed to run them. The refusal belongs at the boundary where a contract becomes
+/// *effective*, and this is that boundary.
+///
+/// It is also half of the reachability argument the whole slice rests on: with automatic
+/// activation refused here and no production caller offering a `ManualOnlyR2f1a` contract, no
+/// production path can route a custody plan to the backend at all.
+pub fn admit_r2f1b_contract_v1(
+    attempt_id: &AttemptId,
+    admission: &R2f1bAdmissionV1,
+) -> Result<(), BridgeError> {
+    admission.contract.validate().map_err(|error| {
+        invalid(&format!(
+            "R2f1b contract is not admissible: {error}, contract is invalid"
+        ))
+    })?;
+    if admission.contract.activation == DeadlineActivationV2::AutomaticR2f1b {
+        return Err(invalid(
+            "automatic R2f1b deadline activation is refused at admission: no slice-2 \
+             production path may arm it",
+        ));
+    }
+    // Fresh admission only. Resume mints a successor identity and exchanges the custody claim —
+    // §5.8, owned by 2d (mechanism) and slice 5 (production). A successor arriving here would
+    // route a claim-less V3 write over a predecessor's live checkout.
+    if admission.attempt.ordinal != 0
+        || admission.attempt.parent_attempt_id.is_some()
+        || &admission.attempt.attempt_id != attempt_id
+    {
+        return Err(invalid(
+            "R2f1b admission accepts only a fresh attempt identity matching the run attempt",
+        ));
+    }
+    Ok(())
 }
 
 pub struct WorkflowAdmissionRequestV1 {
@@ -71,6 +127,9 @@ pub struct WorkflowAdmissionRequestV1 {
     pub requested_session_cwd: Option<SessionCwd>,
     pub policy_invocation: ExecutionPolicyInvocationV1,
     pub ledger_admission: LedgerAdmissionV1,
+    /// The R2f1b contract for this run. **Every production construction site passes `None`** —
+    /// the field is explicit rather than defaulted precisely so that stays greppable.
+    pub r2f1b: Option<R2f1bAdmissionV1>,
 }
 
 impl WorkflowAdmissionV1 {
@@ -103,6 +162,10 @@ impl WorkflowAdmissionV1 {
             .graph
             .validate()
             .map_err(|_| invalid("workflow graph is invalid"))?;
+        // Before any freezing, so a refused activation admits nothing at all.
+        if let Some(r2f1b) = &request.r2f1b {
+            admit_r2f1b_contract_v1(&request.attempt_id, r2f1b)?;
+        }
 
         let mut nodes: Vec<_> = request.graph.nodes.iter().collect();
         nodes.sort_by(|left, right| left.id.as_str().cmp(right.id.as_str()));
@@ -216,9 +279,27 @@ impl WorkflowAdmissionV1 {
             )
             .map_err(|error| invalid(&format!("workflow run specification is invalid: {error}")))?,
         );
+        // Coverage, checked once at admission rather than per node at bind time: §2.2 requires
+        // `custody_plans` to enumerate EVERY worktree checkout in the candidate matrix. Deferring
+        // this to the executor would let a run start and then refuse mid-graph, after siblings
+        // had already materialized.
+        if let Some(r2f1b) = &request.r2f1b {
+            for identity in &run_spec.node_execution_identities {
+                for attempt in &identity.provider_attempts {
+                    select_custody_plan_v1(&r2f1b.contract, &attempt.checkout).map_err(
+                        |error| {
+                            invalid(&format!(
+                                "R2f1b custody plan coverage is incomplete: {error}"
+                            ))
+                        },
+                    )?;
+                }
+            }
+        }
         Ok(AdmittedWorkflowRunV1 {
             run_spec,
             provider_effect_key: self.provider_effect_key.clone(),
+            r2f1b: request.r2f1b.map(Arc::new),
         })
     }
 
@@ -258,6 +339,10 @@ impl WorkflowAdmissionV1 {
         Ok(AdmittedWorkflowRunV1 {
             run_spec: Arc::new(run_spec),
             provider_effect_key: self.provider_effect_key.clone(),
+            // A restored V2 run spec carries no R2f1b contract by construction: the contract is
+            // wrapped OUTSIDE `WorkflowRunSpecV1` (in `WorkflowSnapshotV3`), and this entry takes
+            // only the V2 spec. Restoring a V3 snapshot is slice 5's.
+            r2f1b: None,
         })
     }
 

@@ -1,5 +1,11 @@
-use crate::custody::{probe_custody_record_presence, CustodyRecordPresenceV1};
-use crate::provider::WorktreeProvider;
+use crate::custody::{
+    probe_custody_record_presence, CustodyRecordPresenceV1, PreservationReasonV1,
+};
+use crate::custody_writer::{
+    observed_identity, planned_identity, CustodyWriteRefusalV1, MaterializedIdentitiesV1,
+    WorktreeCustodianV1,
+};
+use crate::provider::{CustodyAddOutcomeV1, CustodyAddTargetV1, WorktreeProvider};
 use crate::provider_path::{
     resolve_worktree, sidecar_path, validate_bound_worktree, write_sidecar, ResolvedWorktree,
     WorktreeConfig, WorktreeSidecar,
@@ -16,6 +22,7 @@ use bridge_core::ports::{
 use bridge_core::terminal_evidence::{AcpChildLiveness, EvidenceCapability};
 use bridge_core::SessionCwd;
 use std::collections::{HashMap, HashSet};
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
@@ -85,6 +92,10 @@ enum CheckoutRemovalRefusalV1 {
     RecordPresent,
     /// Durable truth could not be read. Fail closed.
     ProbeInconclusive(String),
+    /// The checkout's publication cell is held by another actor, so a writer may be mid-transition
+    /// on this very target. Fail closed: an uninspectable custody cell is unknown, and unknown
+    /// never licenses deletion (§5.2).
+    CellContended(String),
 }
 
 impl CheckoutRemovalRefusalV1 {
@@ -93,6 +104,82 @@ impl CheckoutRemovalRefusalV1 {
             Self::Discriminated => "entry is custody-discriminated",
             Self::RecordPresent => "a V3 custody record exists beside the checkout",
             Self::ProbeInconclusive(_) => "the custody record could not be read",
+            Self::CellContended(_) => "the checkout publication cell is held by another owner",
+        }
+    }
+
+    fn detail(&self) -> &str {
+        match self {
+            Self::Discriminated | Self::RecordPresent => "",
+            Self::ProbeInconclusive(detail) | Self::CellContended(detail) => detail,
+        }
+    }
+}
+
+/// The gate's held window: the publication cell, taken with the REFUSING acquirer, spanning
+/// probe → removal (slice 2b2, S7).
+///
+/// **Why this exists.** 2b1's gate probed for a record and then removed, with nothing serializing
+/// the two: a writer publishing `ProtectionPrepared` inside that window makes the gate delete a
+/// checkout that is protected on disk by the time the `remove` lands. That was deliberate in 2b1
+/// (no writer existed) and is wrong the moment one does.
+///
+/// **Why the publication cell and not the custody cell.** The gate cannot name the custody cell —
+/// the custody id lives inside the record, and the gate's discipline is presence-not-content, so
+/// it must never depend on decoding one (a corrupt record must still protect). The canonical
+/// target path is the only key both the writer and the gate certainly share.
+///
+/// This SUPERSEDES the 2b1 dual-review ledger's assignment of "hold the refusing custody lock
+/// across probe→removal→settlement" to 2c1 (sol SMELL-1): the writer landing here is exactly what
+/// made it due now. What remains 2c1's is holding it across *settlement*, which needs the typed
+/// retained/refused disposition 2c1 mints.
+struct CheckoutRemovalWindowV1 {
+    _cell: crate::custody_lock::PublicationLockGuardV1,
+}
+
+impl CheckoutRemovalWindowV1 {
+    /// `Ok(None)` means no cell is needed because the enclosing root does not exist: the checkout
+    /// is gone, there is nothing for a writer to be publishing about, and refusing there would
+    /// permanently wedge the ordinary legacy cleanup of an already-vanished worktree — the same
+    /// ruling 2b1 made for `probe_custody_record_presence`'s missing-directory arm. Every other
+    /// failure to enter the cell refuses.
+    fn enter(entry: &WtEntry) -> Result<Option<Self>, CheckoutRemovalRefusalV1> {
+        let Some(root) = Path::new(&entry.worktree_path).parent() else {
+            return Err(CheckoutRemovalRefusalV1::ProbeInconclusive(format!(
+                "worktree path has no enclosing root: {}",
+                entry.worktree_path
+            )));
+        };
+        // The root check must come BEFORE the cell attempt, not after it (repair R6). Entering
+        // the cell goes through `liveness::open_persistent_lock_file`, which does
+        // `create_dir_all(<root>/.custody-locks)` — so on a vanished root the old order RE-CREATED
+        // the `[worktrees].root` tree from a TEARDOWN path, and the `Unavailable` arm it keyed the
+        // `Ok(None)` answer on could never fire, because `create_dir_all` had already succeeded.
+        // The documented vanished-root behaviour was therefore unreachable and the code did the
+        // opposite of what it claimed.
+        match root.try_exists() {
+            // Root gone: the checkout is gone, there is nothing for a writer to be publishing
+            // about, and refusing here would permanently wedge the ordinary legacy cleanup of an
+            // already-vanished worktree — the same ruling 2b1 made for
+            // `probe_custody_record_presence`'s missing-directory arm.
+            Ok(false) => return Ok(None),
+            Ok(true) => {}
+            Err(error) => {
+                return Err(CheckoutRemovalRefusalV1::ProbeInconclusive(format!(
+                    "worktree root is unstattable: {error}"
+                )))
+            }
+        }
+        match crate::custody_lock::try_acquire_publication_lock_in(root, &entry.worktree_path) {
+            Ok(cell) => Ok(Some(Self { _cell: cell })),
+            Err(crate::custody_lock::CustodyLockRefusalV1::Contended(id)) => {
+                Err(CheckoutRemovalRefusalV1::CellContended(id))
+            }
+            Err(crate::custody_lock::CustodyLockRefusalV1::Unavailable(_, error)) => {
+                Err(CheckoutRemovalRefusalV1::ProbeInconclusive(format!(
+                    "checkout publication cell is unavailable: {error}"
+                )))
+            }
         }
     }
 }
@@ -130,6 +217,26 @@ fn checkout_removal_refusal(entry: &WtEntry) -> Option<CheckoutRemovalRefusalV1>
             Some(CheckoutRemovalRefusalV1::ProbeInconclusive(detail))
         }
     }
+}
+
+/// Map a custody write refusal onto the backend's error vocabulary.
+///
+/// An AMBIGUOUS publication is deliberately reported as a configure failure, not swallowed: the
+/// record may or may not carry the new state, so the configure cannot be attested. It is not a
+/// licence to delete anything — the checkout's protection is the record on disk, which the
+/// deletion gate reads independently of this return value.
+fn custody_write_error(refusal: CustodyWriteRefusalV1) -> BridgeError {
+    BridgeError::ConfigInvalid {
+        reason: format!("R2f1b custody transition: {refusal}"),
+    }
+}
+
+fn wall_clock_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|elapsed| i64::try_from(elapsed.as_millis()).ok())
+        .unwrap_or(0)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -550,6 +657,22 @@ impl WorktreeBackend {
         match map.get_mut(session.as_str()) {
             Some(WtState::Ready(entry)) | Some(WtState::Reserving { entry, .. }) => {
                 entry.custody = WtCustodyV1::Protected;
+            }
+            None => panic!("no worktree entry is mapped for {}", session.as_str()),
+        }
+    }
+
+    /// The inverse: force a mapped checkout back to the legacy discriminator.
+    ///
+    /// Test-only, and needed to ISOLATE the S7 publication-cell arm of the gate. The gate fails
+    /// closed on three independent grounds; a test that wants to prove the cell arm works must
+    /// first remove the other two, or it cannot tell which one refused.
+    #[cfg(test)]
+    async fn mark_entry_legacy_for_test(&self, session: &SessionId) {
+        let mut map = self.map.lock().await;
+        match map.get_mut(session.as_str()) {
+            Some(WtState::Ready(entry)) | Some(WtState::Reserving { entry, .. }) => {
+                entry.custody = WtCustodyV1::Legacy;
             }
             None => panic!("no worktree entry is mapped for {}", session.as_str()),
         }
@@ -1017,18 +1140,28 @@ impl WorktreeBackend {
         // the SAME PR as the V3 writer: without it, a refused rollback followed by a configure
         // retry reaches `HostGitWorktree::add`'s `cleanup_failed_add` (`host_git.rs:42-47`),
         // whose `remove_dir_all` is outside this gate and would delete the protected checkout.
+        // The prohibition landed in slice 2b2 (`WorktreeProvider::add_under_custody`).
+        //
+        // SLICE 2b2 ADDITION (S7): the probe and the removal now happen inside the checkout's
+        // PUBLICATION CELL, entered with the refusing acquirer, so a V3 writer cannot publish a
+        // record between them. `_removal_window` is bound for the rest of this scope on purpose —
+        // its `Drop` is the release.
+        let (_removal_window, refusal) = match entry.as_ref() {
+            None => (None, None),
+            Some(entry) => match CheckoutRemovalWindowV1::enter(entry) {
+                Err(refusal) => (None, Some(refusal)),
+                Ok(window) => (window, checkout_removal_refusal(entry)),
+            },
+        };
         let entry = match entry {
-            Some(entry) => match checkout_removal_refusal(&entry) {
+            Some(entry) => match refusal {
                 None => Some(entry),
                 Some(refusal) => {
                     tracing::warn!(
                         session = session.as_str(),
                         worktree_path = entry.worktree_path,
                         reason = refusal.reason(),
-                        detail = match &refusal {
-                            CheckoutRemovalRefusalV1::ProbeInconclusive(detail) => detail.as_str(),
-                            _ => "",
-                        },
+                        detail = refusal.detail(),
                         "refusing to remove a worktree checkout under R2f1b custody"
                     );
                     // The refusal is about the CHECKOUT only. A genuine inner-teardown failure
@@ -1107,6 +1240,169 @@ impl WorktreeBackend {
             });
         }
         self.inner.configure_bound_session(session, spec).await
+    }
+
+    /// Materialize the checkout under whichever record regime this spec routes.
+    ///
+    /// Folded into one step because both V2 legs already shared one rollback: `provider.add`
+    /// failure and `write_sidecar` failure ran byte-identical recovery at the call site.
+    async fn materialize_checkout(
+        &self,
+        spec: &BoundSessionSpecV1,
+        resolved: &ResolvedWorktree,
+    ) -> Result<WtCustodyV1, BridgeError> {
+        let Some(custody) = spec.custody() else {
+            // ---- V2: unchanged, in its original order ----
+            let common_dir = self
+                .provider
+                .add(&resolved.canonical_source, &resolved.worktree_path)
+                .await?;
+            write_sidecar(&WorktreeSidecar {
+                canonical_source: resolved.canonical_source.clone(),
+                common_dir,
+                worktree_path: resolved.worktree_path.clone(),
+                owner: self.cfg.owner.clone(),
+                run_id: self.identity.run_id.clone(),
+                host: self.identity.host.clone(),
+                lease: self.identity.lease.clone(),
+            })?;
+            return Ok(WtCustodyV1::Legacy);
+        };
+        self.materialize_under_custody(custody.clone(), resolved)
+            .await
+    }
+
+    /// The V3 writer's control flow (§2.5). Ordering is the property, so it is stated once here
+    /// and nowhere else:
+    ///
+    /// 1. enter both cells + pin the root, publish `ProtectionPrepared` (no-replace) + parent
+    ///    sync, replace `Materializing` + parent sync — **all before any provider effect**;
+    /// 2. `add_under_custody`, which never reaches `cleanup_failed_add`;
+    /// 3. success → capture the four identities by descriptor → replace `LiveProtected`;
+    ///    failure → replace `PreservationUnknown{materialization_inflight}`, target untouched.
+    ///
+    /// The custody cells are held across the add on purpose: the record must stay this
+    /// custodian's for the whole window in which the checkout is half-made. The add itself never
+    /// takes a custody cell, so this cannot deadlock.
+    async fn materialize_under_custody(
+        &self,
+        custody: bridge_core::execution_policy::BoundWorktreeCustodyV1,
+        resolved: &ResolvedWorktree,
+    ) -> Result<WtCustodyV1, BridgeError> {
+        let worktree_root = Path::new(&resolved.worktree_path)
+            .parent()
+            .ok_or(BridgeError::ConfigMismatch {
+                field: "bound worktree target has no enclosing root",
+            })?
+            .to_path_buf();
+        let worktree_path = resolved.worktree_path.clone();
+        let canonical_source = resolved.canonical_source.clone();
+
+        // ---- CAPABILITY PREFLIGHT, before ANY record effect (repair R4) ----------------------
+        // A provider that takes `add_under_custody`'s refusing default must produce zero records
+        // and zero provider effects. Discovering the refusal after `ProtectionPrepared` and
+        // `Materializing` were published would leave a durable record asserting a materialization
+        // that never began — and `Materializing` is a LIVE state, so the sweep classifies it
+        // `Recover` and nothing would ever resolve it.
+        if !self.provider.supports_custody_add() {
+            return Err(BridgeError::ConfigInvalid {
+                reason: "worktree provider does not implement the R2f1b custody-aware add".into(),
+            });
+        }
+
+        // Blocking: every step is descriptor-level filesystem work behind two blocking file
+        // locks. `custody_lock.rs` requires offloading, and the pinned root and both guards are
+        // `Send`, so the custodian moves back out.
+        let custodian = tokio::task::spawn_blocking({
+            let worktree_path = worktree_path.clone();
+            move || -> Result<WorktreeCustodianV1, CustodyWriteRefusalV1> {
+                let custodian =
+                    WorktreeCustodianV1::enter(&worktree_root, &worktree_path, custody)?;
+                custodian.publish_protection_prepared()?;
+                custodian.replace_materializing()?;
+                Ok(custodian)
+            }
+        })
+        .await
+        .map_err(|error| {
+            BridgeError::agent_crashed(format!("custody preparation task failed: {error}"))
+        })?
+        .map_err(custody_write_error)?;
+
+        // A runtime `Err` here (a git spawn failure, say) is NOT allowed to propagate raw: the
+        // record is already `Materializing`, and returning without settling would leave a durable
+        // live state for a materialization that is over. Normalize it into the same classified
+        // failure the settlement arm already handles, with the most protective answers available:
+        // the target is Unproven (so it is treated as present and never touched) and registration
+        // is unproven (so no definite locator is invented from an operation that never reported).
+        let outcome = match self
+            .provider
+            .add_under_custody(&canonical_source, &worktree_path)
+            .await
+        {
+            Ok(outcome) => outcome,
+            Err(error) => CustodyAddOutcomeV1::Failed(crate::provider::CustodyAddFailureV1 {
+                reason: format!("custody-aware add failed before reporting an outcome: {error:?}"),
+                target: CustodyAddTargetV1::Unproven,
+                common_dir: None,
+                recovery_locator: crate::custody::RecoveryLocatorV1::RegistrationUnproven {},
+            }),
+        };
+
+        let root_path = custodian.worktree_root().to_string_lossy().into_owned();
+        tokio::task::spawn_blocking(move || -> Result<WtCustodyV1, CustodyWriteRefusalV1> {
+            match outcome {
+                CustodyAddOutcomeV1::Materialized { common_dir } => {
+                    let identities = MaterializedIdentitiesV1 {
+                        source: observed_identity(&canonical_source),
+                        root: observed_identity(&root_path),
+                        worktree: observed_identity(&worktree_path),
+                        common_dir: observed_identity(&common_dir),
+                    };
+                    custodian.replace_live_protected(&identities)?;
+                    Ok(WtCustodyV1::Protected)
+                }
+                CustodyAddOutcomeV1::Failed(failure) => {
+                    // §5.7 row 4 / §5.1: an unresolved materialization is published unknown and
+                    // the target is NEVER deleted — including when the target is provably absent,
+                    // where the record is simply retained rather than reclaimed (the
+                    // `Materializing -> UnusedSettled` edge is not in 2a's frozen transition
+                    // table, and minting a marker removal is not this slice's authority).
+                    let identities = MaterializedIdentitiesV1 {
+                        source: observed_identity(&canonical_source),
+                        root: observed_identity(&root_path),
+                        worktree: match failure.target {
+                            CustodyAddTargetV1::ProvablyAbsent => planned_identity(&worktree_path),
+                            _ => observed_identity(&worktree_path),
+                        },
+                        // No observed common dir: record the PLAN-DERIVED common-dir path, not
+                        // the source repo (repair R7). `<source>/.git` is what the common dir of a
+                        // linked worktree is, so a degraded identity there is a true statement
+                        // about the right object; naming the source repo instead made the claim
+                        // assert that the source directory IS the common dir, which is false and
+                        // would send an R2f2 consumer to the wrong object.
+                        common_dir: match &failure.common_dir {
+                            Some(path) => observed_identity(path),
+                            None => planned_identity(
+                                &Path::new(&canonical_source).join(".git").to_string_lossy(),
+                            ),
+                        },
+                    };
+                    custodian.replace_preservation_unknown(
+                        PreservationReasonV1::MaterializationInFlight,
+                        &identities,
+                        failure.recovery_locator,
+                        wall_clock_ms(),
+                    )?;
+                    Err(CustodyWriteRefusalV1::Failed(failure.reason))
+                }
+            }
+        })
+        .await
+        .map_err(|error| {
+            BridgeError::agent_crashed(format!("custody settlement task failed: {error}"))
+        })?
+        .map_err(custody_write_error)
     }
 
     async fn configure_bound_resolved_with_admission(
@@ -1193,12 +1489,15 @@ impl WorktreeBackend {
             }
         }
 
-        let common_dir = match self
-            .provider
-            .add(&resolved.canonical_source, &resolved.worktree_path)
-            .await
-        {
-            Ok(common_dir) => common_dir,
+        // ---- V2/V3 fork (slice 2b2) --------------------------------------------------------
+        // The ONE place the two record regimes diverge. V2 keeps its exact sequence: add, then
+        // `.meta.json`. V3 inverts it — record published and parent-synced BEFORE any
+        // `git worktree add` — and writes NO `.meta.json` at all, which is the rollback condition
+        // (§2.2 "Record naming"; brief §4): an older binary enumerates only `*.meta.json`, so it
+        // cannot name a V3 checkout, and emitting both names would hand the same checkout to the
+        // legacy boot arm, which deletes.
+        let custody_kind = match self.materialize_checkout(spec, &resolved).await {
+            Ok(kind) => kind,
             Err(error) => {
                 admission.retain_failed_configure_cleanup();
                 drop(admission);
@@ -1208,24 +1507,6 @@ impl WorktreeBackend {
                 return Err(error);
             }
         };
-
-        let sidecar = WorktreeSidecar {
-            canonical_source: resolved.canonical_source.clone(),
-            common_dir,
-            worktree_path: resolved.worktree_path.clone(),
-            owner: self.cfg.owner.clone(),
-            run_id: self.identity.run_id.clone(),
-            host: self.identity.host.clone(),
-            lease: self.identity.lease.clone(),
-        };
-        if let Err(error) = write_sidecar(&sidecar) {
-            admission.retain_failed_configure_cleanup();
-            drop(admission);
-            let _ = self
-                .cleanup_session_with_sealed_admission(session, CleanupStrength::Release, true)
-                .await;
-            return Err(error);
-        }
 
         if let Err(error) = self
             .configure_bound_inner_at(session, spec, &resolved.worktree_path)
@@ -1251,7 +1532,7 @@ impl WorktreeBackend {
                 WtState::Ready(WtEntry {
                     canonical_source: resolved.canonical_source,
                     worktree_path: resolved.worktree_path,
-                    custody: WtCustodyV1::Legacy,
+                    custody: custody_kind,
                 }),
             );
             self.notify.notify_waiters();
@@ -1795,6 +2076,12 @@ mod tests {
         configured_cwd: Mutex<Vec<Option<String>>>,
         bound_configure_count: AtomicUsize,
         added_worktrees: Mutex<Vec<(String, String)>>,
+        /// The custody-record state observed by the provider AT THE MOMENT the add runs — the
+        /// creation-ordering witness. `None` means no record existed when the add was entered.
+        record_state_at_add: Mutex<Vec<Option<String>>>,
+        /// The legacy sidecar's existence at the same instant, so "V3 writes no `.meta.json`"
+        /// is checked while the checkout is live rather than only after teardown.
+        legacy_sidecar_at_add: Mutex<Vec<bool>>,
         order: Mutex<Vec<String>>,
         configure_count: AtomicUsize,
         fail_configure: AtomicBool,
@@ -1817,6 +2104,24 @@ mod tests {
         rich_sinks: Mutex<Vec<Arc<dyn RichEventSink>>>,
     }
 
+    /// Read the custody record's state tag beside `worktree_path`, if there is a readable one.
+    fn observed_record_state(worktree_path: &str) -> Option<String> {
+        let bytes = std::fs::read(crate::custody::custody_record_path(worktree_path)).ok()?;
+        crate::custody::WorktreeCustodyRecordV1::decode_canonical(&bytes)
+            .ok()
+            .map(|record| record.state.kind().wire_tag())
+    }
+
+    fn note_ordering(rec: &Rec, worktree_path: &str) {
+        rec.record_state_at_add
+            .lock()
+            .unwrap()
+            .push(observed_record_state(worktree_path));
+        rec.legacy_sidecar_at_add
+            .lock()
+            .unwrap()
+            .push(Path::new(&sidecar_path(worktree_path)).exists());
+    }
     impl Rec {
         fn block_next_configure(&self) -> oneshot::Sender<()> {
             let (allow, gate) = oneshot::channel();
@@ -2008,6 +2313,9 @@ mod tests {
 
     struct PartialAddFailProv {
         rec: Arc<Rec>,
+        /// Flip the custody-aware add from "target created, then failed" to "failed before any
+        /// target exists" — the two arms of §6's "Partial add preserved" row.
+        partial_target_absent: AtomicBool,
     }
 
     #[async_trait::async_trait]
@@ -2021,6 +2329,31 @@ mod tests {
                 .push((repo.to_owned(), worktree_path.to_owned()));
             tokio::task::yield_now().await;
             Ok(String::new())
+        }
+
+        fn supports_custody_add(&self) -> bool {
+            true
+        }
+
+        /// Nine-impl enumeration (R-6), 1 of 10: the V3-capable happy path. Materializes the
+        /// target for real, because `LiveProtected` requires the record to carry the target's
+        /// OBSERVED `dev`/`ino` and a double that adds nothing could never produce one.
+        async fn add_under_custody(
+            &self,
+            repo: &str,
+            worktree_path: &str,
+        ) -> Result<CustodyAddOutcomeV1, BridgeError> {
+            self.rec.add_count.fetch_add(1, Ordering::SeqCst);
+            self.rec
+                .added_worktrees
+                .lock()
+                .unwrap()
+                .push((repo.to_owned(), worktree_path.to_owned()));
+            note_ordering(&self.rec, worktree_path);
+            std::fs::create_dir_all(worktree_path).unwrap();
+            Ok(CustodyAddOutcomeV1::Materialized {
+                common_dir: format!("{repo}/.git"),
+            })
         }
 
         async fn remove(&self, _repo: &str, _worktree_path: &str) -> Result<(), BridgeError> {
@@ -2046,6 +2379,9 @@ mod tests {
             Err(BridgeError::InvalidStateTransition)
         }
 
+        // Enumeration 2 of 10: takes the REFUSING default deliberately. This double exists to
+        // prove the non-git preflight refusal, which happens before any custody transition.
+
         async fn remove(&self, _repo: &str, _worktree_path: &str) -> Result<(), BridgeError> {
             self.rec.remove_count.fetch_add(1, Ordering::SeqCst);
             Err(BridgeError::InvalidStateTransition)
@@ -2063,6 +2399,9 @@ mod tests {
             std::fs::create_dir_all(format!("{}.tmp", sidecar_path(worktree_path))).unwrap();
             Ok(String::new())
         }
+
+        // Enumeration 3 of 10: REFUSING default, and it must stay that way — this double
+        // sabotages the legacy `.meta.json` write, which the V3 path never performs at all.
 
         async fn remove(&self, _repo: &str, worktree_path: &str) -> Result<(), BridgeError> {
             self.rec.remove_count.fetch_add(1, Ordering::SeqCst);
@@ -2085,6 +2424,37 @@ mod tests {
         async fn add(&self, _repo: &str, _worktree_path: &str) -> Result<String, BridgeError> {
             self.rec.add_count.fetch_add(1, Ordering::SeqCst);
             Err(BridgeError::StoreFailure)
+        }
+
+        fn supports_custody_add(&self) -> bool {
+            true
+        }
+
+        /// Enumeration 4 of 10: the PARTIAL ADD double — it creates the target and then fails,
+        /// which is §5.7 row 4's exact shape ("during/after partial add, before live identity").
+        /// `partial_target_absent` flips it to the failure-before-any-target case.
+        async fn add_under_custody(
+            &self,
+            repo: &str,
+            worktree_path: &str,
+        ) -> Result<CustodyAddOutcomeV1, BridgeError> {
+            self.rec.add_count.fetch_add(1, Ordering::SeqCst);
+            note_ordering(&self.rec, worktree_path);
+            let target = if self.partial_target_absent.load(Ordering::SeqCst) {
+                CustodyAddTargetV1::ProvablyAbsent
+            } else {
+                std::fs::create_dir_all(worktree_path).unwrap();
+                std::fs::write(format!("{worktree_path}/work.txt"), b"unsaved work").unwrap();
+                CustodyAddTargetV1::Present
+            };
+            Ok(CustodyAddOutcomeV1::Failed(
+                crate::provider::CustodyAddFailureV1 {
+                    reason: "injected partial add failure".into(),
+                    target,
+                    common_dir: Some(format!("{repo}/.git")),
+                    recovery_locator: crate::custody::RecoveryLocatorV1::RegistrationUnproven {},
+                },
+            ))
         }
 
         async fn remove(&self, _repo: &str, _worktree_path: &str) -> Result<(), BridgeError> {
@@ -3215,7 +3585,10 @@ mod tests {
         rec.fail_remove.store(true, Ordering::SeqCst);
         let be = WorktreeBackend::new(
             Arc::new(FakeInner { rec: rec.clone() }),
-            Arc::new(PartialAddFailProv { rec: rec.clone() }),
+            Arc::new(PartialAddFailProv {
+                rec: rec.clone(),
+                partial_target_absent: AtomicBool::new(false),
+            }),
             crate::provider_path::WorktreeConfig {
                 root: canonical_worktree_root.to_string_lossy().into_owned(),
                 owner: "ownr".into(),
@@ -3701,6 +4074,8 @@ mod tests {
 
     #[async_trait::async_trait]
     impl crate::provider::WorktreeProvider for BlockingRemoveProv {
+        // Enumeration 5 of 10: REFUSING default. This double exists to gate V2 cleanup and
+        // probe concurrency; no custody transition runs through it.
         async fn add(&self, _repo: &str, _worktree_path: &str) -> Result<String, BridgeError> {
             self.rec.add_count.fetch_add(1, Ordering::SeqCst);
             Ok(String::new())
@@ -3729,6 +4104,8 @@ mod tests {
 
     #[async_trait::async_trait]
     impl crate::provider::WorktreeProvider for BlockingProv {
+        // Enumeration 6 of 10: REFUSING default. This double exists to gate V2 cleanup and
+        // probe concurrency; no custody transition runs through it.
         async fn add(&self, _repo: &str, _worktree_path: &str) -> Result<String, BridgeError> {
             self.rec.add_count.fetch_add(1, Ordering::SeqCst);
             self.add_entered.notify_one();
@@ -3749,6 +4126,8 @@ mod tests {
 
     #[async_trait::async_trait]
     impl crate::provider::WorktreeProvider for BlockingProbeProv {
+        // Enumeration 7 of 10: REFUSING default. This double exists to gate V2 cleanup and
+        // probe concurrency; no custody transition runs through it.
         async fn add(&self, _repo: &str, _worktree_path: &str) -> Result<String, BridgeError> {
             self.rec.add_count.fetch_add(1, Ordering::SeqCst);
             Ok(String::new())
@@ -5004,5 +5383,507 @@ mod tests {
             assert!(be.map.lock().await.is_empty());
             std::fs::remove_dir_all(tmp).unwrap();
         }
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // R2f1b slice 2b2 — the V3 writer at the backend boundary.
+    //
+    // Everything here runs on the SAME fixture as the V2 tests above, so "V2 is byte-identical"
+    // is a property of one harness rather than two.
+    // ---------------------------------------------------------------------------------------
+
+    /// The V2 `bound_spec`, with a matching custody plan bound onto its provider effect. This is
+    /// the ONLY way a V3 route can exist — there is no production constructor for it.
+    fn bound_spec_v3(
+        source: &Path,
+        cfg: &crate::provider_path::WorktreeConfig,
+    ) -> (BoundSessionSpecV1, String) {
+        use bridge_core::execution_policy::{
+            BoundWorktreeCustodyV1, FrozenCheckoutEffectV1, FrozenWorktreeCustodyPlanV1,
+            WorktreeCustodyIdV1,
+        };
+        let (spec, target) = bound_spec(source, cfg);
+        let FrozenCheckoutEffectV1::Worktree {
+            target_cwd,
+            checkout_digest,
+            ..
+        } = &spec.provider_effect.frozen().checkout
+        else {
+            panic!("the bound fixture freezes a worktree checkout")
+        };
+        let attempt_id = AttemptId::parse(format!("attempt-{}", "2".repeat(32))).unwrap();
+        let custody = BoundWorktreeCustodyV1 {
+            attempt: bridge_core::ids::AttemptIdentity {
+                execution_id: bridge_core::ids::ExecutionId::parse(format!(
+                    "exec-{}",
+                    "1".repeat(32)
+                ))
+                .unwrap(),
+                attempt_id: attempt_id.clone(),
+                ordinal: 0,
+                parent_attempt_id: None,
+            },
+            origin_attempt_id: attempt_id,
+            node: PolicyNodeRefV1::from_node_id(0, "node"),
+            plan: FrozenWorktreeCustodyPlanV1 {
+                custody_id: WorktreeCustodyIdV1::mint().unwrap(),
+                checkout_fingerprint: checkout_digest.clone(),
+                target_cwd: target_cwd.clone(),
+            },
+        };
+        let effect = (*spec.provider_effect)
+            .clone()
+            .bind_custody_plan(Arc::new(custody))
+            .expect("the plan matches the fixture's own frozen checkout");
+        (
+            BoundSessionSpecV1::new(EffectiveConfig::default(), Arc::new(effect)),
+            target,
+        )
+    }
+
+    fn record_state_of(target: &str) -> Option<String> {
+        observed_record_state(target)
+    }
+
+    /// `backend_fixture`, with a caller-chosen provider. Extracted so the V3 tests can swap the
+    /// provider without duplicating the four-directory layout every fixture needs.
+    fn provider_fixture(
+        tmp: &Path,
+        provider: impl FnOnce(Arc<Rec>) -> Arc<dyn crate::provider::WorktreeProvider>,
+    ) -> (
+        Arc<WorktreeBackend>,
+        Arc<Rec>,
+        PathBuf,
+        crate::provider_path::WorktreeConfig,
+    ) {
+        let allowed_root = tmp.join("allowed");
+        let source = allowed_root.join("source");
+        let worktree_root = tmp.join("worktrees");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::create_dir_all(&worktree_root).unwrap();
+        let canonical_allowed_root = std::fs::canonicalize(&allowed_root).unwrap();
+        let canonical_worktree_root = std::fs::canonicalize(&worktree_root).unwrap();
+        let rec = Arc::new(Rec::default());
+        let cfg = crate::provider_path::WorktreeConfig {
+            root: canonical_worktree_root.to_string_lossy().into_owned(),
+            owner: "ownr".into(),
+            run: "run7".into(),
+        };
+        let be = Arc::new(WorktreeBackend::new(
+            Arc::new(FakeInner { rec: rec.clone() }),
+            provider(rec.clone()),
+            cfg.clone(),
+            Some(SessionCwd::parse(&canonical_allowed_root.to_string_lossy()).unwrap()),
+            identity(),
+        ));
+        (be, rec, source, cfg)
+    }
+
+    /// Claims custody support and then fails the add with a raw `Err` — a git spawn failure, say.
+    /// The point is the state the writer is already in when that happens: `Materializing`.
+    struct CustodyAddErrProv {
+        rec: Arc<Rec>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::provider::WorktreeProvider for CustodyAddErrProv {
+        fn supports_custody_add(&self) -> bool {
+            true
+        }
+
+        async fn add(&self, _repo: &str, _worktree_path: &str) -> Result<String, BridgeError> {
+            unreachable!("the V3 path never uses the V2 add")
+        }
+
+        async fn add_under_custody(
+            &self,
+            _repo: &str,
+            worktree_path: &str,
+        ) -> Result<CustodyAddOutcomeV1, BridgeError> {
+            self.rec.add_count.fetch_add(1, Ordering::SeqCst);
+            note_ordering(&self.rec, worktree_path);
+            Err(BridgeError::agent_crashed("git spawn failed"))
+        }
+
+        async fn remove(&self, _repo: &str, _worktree_path: &str) -> Result<(), BridgeError> {
+            self.rec.remove_count.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        async fn is_git_repo(&self, _path: &str) -> bool {
+            true
+        }
+    }
+
+    fn partial_add_fixture(
+        tmp: &Path,
+        target_absent: bool,
+    ) -> (
+        Arc<WorktreeBackend>,
+        Arc<Rec>,
+        PathBuf,
+        crate::provider_path::WorktreeConfig,
+    ) {
+        provider_fixture(tmp, |rec| {
+            Arc::new(PartialAddFailProv {
+                rec,
+                partial_target_absent: AtomicBool::new(target_absent),
+            })
+        })
+    }
+
+    /// THE ordering property (§2.5, R-3): the custody record is durable and past
+    /// `ProtectionPrepared` before `git worktree add` is entered. The witness is taken INSIDE the
+    /// provider, so it cannot be satisfied by a writer that publishes after the add returns.
+    ///
+    /// Discriminates: today's V2 order (add first — the observation would be `None`); a writer
+    /// that publishes `ProtectionPrepared` but never advances to `Materializing` (the observation
+    /// would be `protection_prepared`, leaving a crash during the add indistinguishable from one
+    /// before it); and a V3 path that also emits the legacy sidecar.
+    #[tokio::test]
+    async fn custody_record_is_parent_synced_before_any_git_worktree_add() {
+        let (be, rec, tmp, source, cfg) = backend_fixture("v3-ordering");
+        let (bound, target) = bound_spec_v3(&source, &cfg);
+        let session = SessionId::parse("v3-ordering").unwrap();
+
+        be.configure_bound_session(&session, &bound).await.unwrap();
+
+        assert_eq!(
+            rec.record_state_at_add.lock().unwrap().clone(),
+            vec![Some("materializing".to_string())],
+            "the record must be durable and in Materializing when the add is entered"
+        );
+        assert_eq!(
+            rec.legacy_sidecar_at_add.lock().unwrap().clone(),
+            vec![false],
+            "the V3 path must not have written a .meta.json by add time either"
+        );
+        assert_eq!(
+            record_state_of(&target).as_deref(),
+            Some("live_protected"),
+            "a materialized checkout settles LiveProtected"
+        );
+        std::fs::remove_dir_all(&tmp).unwrap();
+    }
+
+    /// The rollback CONDITION (§2.2 "Record naming"; brief §4): the V3 path writes no
+    /// `.meta.json`, ever. Discriminates a writer that keeps the legacy sidecar "for
+    /// compatibility" — which would hand the same checkout to the legacy boot arm, which deletes,
+    /// while the V3 arm believes it is protecting it.
+    #[tokio::test]
+    async fn v3_path_writes_no_legacy_meta_json() {
+        let (be, _rec, tmp, source, cfg) = backend_fixture("v3-no-legacy");
+        let (bound, target) = bound_spec_v3(&source, &cfg);
+
+        be.configure_bound_session(&SessionId::parse("v3-no-legacy").unwrap(), &bound)
+            .await
+            .unwrap();
+
+        assert!(
+            !Path::new(&sidecar_path(&target)).exists(),
+            "no legacy sidecar may exist beside a V3 checkout"
+        );
+        assert!(Path::new(&crate::custody::custody_record_path(&target)).exists());
+        std::fs::remove_dir_all(&tmp).unwrap();
+    }
+
+    /// The rollback GUARANTEE: an older binary enumerates only `*.meta.json`, so it cannot name a
+    /// V3 checkout and therefore cannot select it for removal. Modelled with the legacy scanner's
+    /// own predicate over the real directory a V3 configure produced.
+    #[tokio::test]
+    async fn old_binary_sweep_cannot_select_a_v3_checkout() {
+        let (be, _rec, tmp, source, cfg) = backend_fixture("v3-rollback");
+        let (bound, target) = bound_spec_v3(&source, &cfg);
+        be.configure_bound_session(&SessionId::parse("v3-rollback").unwrap(), &bound)
+            .await
+            .unwrap();
+
+        let legacy_selected: Vec<String> = std::fs::read_dir(&cfg.root)
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.path().to_string_lossy().into_owned())
+            .filter(|path| path.ends_with(".meta.json"))
+            .collect();
+
+        assert!(
+            legacy_selected.is_empty(),
+            "an old binary's scanner must enumerate nothing here: {legacy_selected:?}"
+        );
+        assert!(
+            Path::new(&target).is_dir(),
+            "the checkout itself is present"
+        );
+        std::fs::remove_dir_all(&tmp).unwrap();
+    }
+
+    /// §5.7 row 4 / §2.5's `cleanup_failed_add` prohibition. The provider creates the target, then
+    /// fails; the target and its contents MUST survive.
+    ///
+    /// Discriminates the V2 behaviour exactly: `HostGitWorktree::add` calls `cleanup_failed_add`,
+    /// whose `remove_dir_all` would take the whole directory — including work — and it sits
+    /// outside the 2b1 deletion gate, so nothing else would stop it.
+    #[tokio::test]
+    async fn add_failure_after_target_creation_never_removes_target() {
+        let tmp = unique_temp_dir("v3-partial-add");
+        let (be, rec, source, cfg) = partial_add_fixture(&tmp, false);
+        let (bound, target) = bound_spec_v3(&source, &cfg);
+
+        let result = be
+            .configure_bound_session(&SessionId::parse("v3-partial-add").unwrap(), &bound)
+            .await;
+
+        assert!(result.is_err(), "the configure reports the add failure");
+        assert!(
+            Path::new(&target).is_dir(),
+            "the partially added target must survive"
+        );
+        assert_eq!(
+            std::fs::read_to_string(format!("{target}/work.txt")).unwrap(),
+            "unsaved work",
+            "and so must everything inside it"
+        );
+        assert_eq!(rec.remove_count.load(Ordering::SeqCst), 0);
+        std::fs::remove_dir_all(&tmp).unwrap();
+    }
+
+    /// The other half of §6's "Partial add preserved" row: a failure before any target exists
+    /// preserves an unknown disposition and touches nothing else — no checkout is created, none is
+    /// removed, and no legacy sidecar appears.
+    ///
+    /// RENAMED from `..._settles_unused_marker_only` in the 2b2 repair round (opus W-4), because
+    /// the dual review RULED the shipped behaviour correct rather than a deviation: §5.7 row 3
+    /// ("prepared synced, before `git add`") is a CRASH case recovering from `ProtectionPrepared`
+    /// — the state 2a's frozen `ProtectionPrepared -> UnusedSettled` edge already serves — so
+    /// `UnusedSettled` is a RECOVERY-side transition, not an in-line writer transition. 2a's own
+    /// identity data anticipated this arm exactly: `PreservationUnknown{MaterializationInFlight}`
+    /// is the only degraded-legal preservation reason, which is precisely the shape a writer that
+    /// has already published `Materializing` can produce. The `Materializing -> UnusedSettled`
+    /// edge is deliberately NOT added.
+    ///
+    /// Every "only" assertion the row demands is kept below.
+    #[tokio::test]
+    async fn add_failure_before_any_target_preserves_unknown_and_touches_nothing() {
+        let tmp = unique_temp_dir("v3-absent-add");
+        let (be, rec, source, cfg) = partial_add_fixture(&tmp, true);
+        let (bound, target) = bound_spec_v3(&source, &cfg);
+
+        let result = be
+            .configure_bound_session(&SessionId::parse("v3-absent-add").unwrap(), &bound)
+            .await;
+
+        assert!(result.is_err());
+        assert!(
+            !Path::new(&target).exists(),
+            "nothing may be created for a checkout that never materialized"
+        );
+        assert!(!Path::new(&sidecar_path(&target)).exists());
+        assert_eq!(rec.remove_count.load(Ordering::SeqCst), 0);
+        let state = record_state_of(&target).expect("the marker is retained and readable");
+        assert_eq!(state, "preservation_unknown");
+        let record = crate::custody::WorktreeCustodyRecordV1::decode_canonical(
+            &std::fs::read(crate::custody::custody_record_path(&target)).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            !record.sweep_disposition().authorizes_checkout_removal(),
+            "the settled marker must not license any removal"
+        );
+        std::fs::remove_dir_all(&tmp).unwrap();
+    }
+
+    /// §5.1: "if materialization is unresolved, publish
+    /// `PreservationUnknown{materialization_inflight}`". Discriminates a writer that leaves the
+    /// record in `Materializing` (indistinguishable from a live in-flight add forever) or that
+    /// publishes a preserving state with no claim, and one that discards the provider's
+    /// `RegistrationUnproven` answer instead of recording it.
+    #[tokio::test]
+    async fn partial_add_publishes_preservation_unknown_materialization_inflight() {
+        let tmp = unique_temp_dir("v3-preservation-unknown");
+        let (be, _rec, source, cfg) = partial_add_fixture(&tmp, false);
+        let (bound, target) = bound_spec_v3(&source, &cfg);
+
+        let _ = be
+            .configure_bound_session(
+                &SessionId::parse("v3-preservation-unknown").unwrap(),
+                &bound,
+            )
+            .await;
+
+        let record = crate::custody::WorktreeCustodyRecordV1::decode_canonical(
+            &std::fs::read(crate::custody::custody_record_path(&target)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            record.state,
+            crate::custody::WorktreeCustodyStateV1::PreservationUnknown {
+                reason: crate::custody::PreservationReasonV1::MaterializationInFlight,
+            }
+        );
+        let claim = record.claim.expect("this state requires a claim");
+        assert_eq!(
+            claim.recovery_locator,
+            crate::custody::RecoveryLocatorV1::RegistrationUnproven {},
+            "the provider's ambiguous registration probe must be recorded, not collapsed"
+        );
+        assert_eq!(claim.checkout_fingerprint, record.checkout_fingerprint);
+        std::fs::remove_dir_all(&tmp).unwrap();
+    }
+
+    /// The REFUSING default is reachable and refuses BEFORE any effect. Discriminates a default
+    /// that returns a successful-looking outcome, which would let an unmodified provider silently
+    /// materialize a V3 checkout with no custody-aware handling at all.
+    #[tokio::test]
+    async fn a_provider_without_a_custody_aware_add_refuses_before_any_checkout_exists() {
+        let tmp = unique_temp_dir("v3-refusing-default");
+        let (be, rec, source, cfg) = provider_fixture(&tmp, |rec| {
+            Arc::new(BlockingProv {
+                rec,
+                add_entered: Arc::new(Notify::new()),
+                allow_add: Arc::new(Notify::new()),
+            })
+        });
+        let (bound, target) = bound_spec_v3(&source, &cfg);
+
+        let result = be
+            .configure_bound_session(&SessionId::parse("v3-refusing-default").unwrap(), &bound)
+            .await;
+
+        assert!(
+            result.is_err(),
+            "the refusing default must fail the configure"
+        );
+        assert!(!Path::new(&target).exists());
+        assert_eq!(
+            rec.add_count.load(Ordering::SeqCst),
+            0,
+            "V2 `add` must not be used as a fallback"
+        );
+        std::fs::remove_dir_all(&tmp).unwrap();
+    }
+
+    /// S7, order 1: a deletion arriving while a writer holds the checkout's publication cell is
+    /// REFUSED, not queued and not admitted. Discriminates 2b1's gate exactly as it stood — probe
+    /// then remove, with nothing serializing the two — where a writer publishing between the two
+    /// steps makes the removal delete a protected checkout.
+    #[tokio::test]
+    async fn a_cleanup_is_refused_while_a_writer_holds_the_checkout_publication_cell() {
+        let (be, rec, tmp, source, cfg) = backend_fixture("v3-cell-race");
+        let (bound, target) = bound_spec_v3(&source, &cfg);
+        let session = SessionId::parse("v3-cell-race").unwrap();
+        be.configure_bound_session(&session, &bound).await.unwrap();
+        // Delete the record so the gate's DISK arm cannot be what refuses: the only remaining
+        // protection is the cell itself, which is exactly what this test is about.
+        std::fs::remove_file(crate::custody::custody_record_path(&target)).unwrap();
+        be.mark_entry_legacy_for_test(&session).await;
+
+        let held =
+            crate::custody_lock::try_acquire_publication_lock_in(Path::new(&cfg.root), &target)
+                .expect("the writer's cells released when its custodian dropped");
+        be.release_session_checked(&session).await.unwrap();
+
+        assert_eq!(
+            rec.remove_count.load(Ordering::SeqCst),
+            0,
+            "a contended publication cell must refuse the removal"
+        );
+        assert!(Path::new(&target).is_dir());
+
+        // Order 2: once the cell is free the same cleanup proceeds, so the refusal is the cell
+        // and not a permanent wedge.
+        drop(held);
+        be.release_session_checked(&session).await.unwrap();
+        assert_eq!(rec.remove_count.load(Ordering::SeqCst), 1);
+        std::fs::remove_dir_all(&tmp).unwrap();
+    }
+
+    // ---- slice 2b2 repair R4: no permanent false `Materializing` ----
+
+    /// R4's red test, half 1. A provider taking the REFUSING default must produce ZERO records and
+    /// ZERO provider effects.
+    ///
+    /// Discriminates the shipped order, where the refusal surfaced only from
+    /// `add_under_custody` — i.e. AFTER `ProtectionPrepared` and `Materializing` had been
+    /// published and parent-synced. That left a durable record asserting a materialization that
+    /// never began, in a LIVE state (`Materializing` classifies `Recover`), which nothing in
+    /// R2f1b would ever resolve.
+    #[tokio::test]
+    async fn a_provider_without_custody_support_publishes_no_record_at_all() {
+        let tmp = unique_temp_dir("v3-no-record-on-refusal");
+        let (be, rec, source, cfg) = provider_fixture(&tmp, |rec| {
+            Arc::new(BlockingProv {
+                rec,
+                add_entered: Arc::new(Notify::new()),
+                allow_add: Arc::new(Notify::new()),
+            })
+        });
+        let (bound, target) = bound_spec_v3(&source, &cfg);
+
+        let result = be
+            .configure_bound_session(&SessionId::parse("v3-no-record").unwrap(), &bound)
+            .await;
+
+        assert!(result.is_err());
+        assert_eq!(
+            record_state_of(&target),
+            None,
+            "the refusing default must leave NO custody record behind"
+        );
+        assert!(!Path::new(&crate::custody::custody_record_path(&target)).exists());
+        assert_eq!(
+            rec.add_count.load(Ordering::SeqCst),
+            0,
+            "and no provider add of either kind may have run"
+        );
+        assert!(!Path::new(&target).exists());
+        // The ordinary rollback DOES run its provider removal here, and that is correct rather
+        // than a leak: with no record published there is genuinely nothing under custody, the
+        // gate authorizes the removal on that evidence, and the target never existed to remove.
+        // Asserting zero removals would be asserting that a refused configure skips its rollback.
+        assert_eq!(rec.remove_count.load(Ordering::SeqCst), 1);
+        std::fs::remove_dir_all(&tmp).unwrap();
+    }
+
+    /// R4's red test, half 2. A runtime `Err` from a custody-capable provider — raised after the
+    /// record is already `Materializing` — must be SETTLED, not propagated raw.
+    ///
+    /// Discriminates the shipped `add_under_custody(..).await?`: the `?` returned with the record
+    /// left in `Materializing` forever. Here the record must reach a terminal unknown state, the
+    /// target must be retained, and nothing may be removed.
+    #[tokio::test]
+    async fn a_runtime_add_error_settles_preservation_unknown_instead_of_leaving_materializing() {
+        let tmp = unique_temp_dir("v3-add-err-settles");
+        let (be, rec, source, cfg) =
+            provider_fixture(&tmp, |rec| Arc::new(CustodyAddErrProv { rec }));
+        let (bound, target) = bound_spec_v3(&source, &cfg);
+
+        let result = be
+            .configure_bound_session(&SessionId::parse("v3-add-err").unwrap(), &bound)
+            .await;
+
+        assert!(result.is_err(), "the configure still reports the failure");
+        assert_eq!(
+            rec.record_state_at_add.lock().unwrap().clone(),
+            vec![Some("materializing".to_string())],
+            "the record really was Materializing when the add ran — the state this repair is about"
+        );
+        let record = crate::custody::WorktreeCustodyRecordV1::decode_canonical(
+            &std::fs::read(crate::custody::custody_record_path(&target)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            record.state,
+            crate::custody::WorktreeCustodyStateV1::PreservationUnknown {
+                reason: crate::custody::PreservationReasonV1::MaterializationInFlight,
+            },
+            "a runtime add error must settle, never leave a permanent live Materializing"
+        );
+        let claim = record.claim.expect("this state requires a claim");
+        assert_eq!(
+            claim.recovery_locator,
+            crate::custody::RecoveryLocatorV1::RegistrationUnproven {},
+            "an operation that never reported must not invent a definite locator"
+        );
+        assert_eq!(rec.remove_count.load(Ordering::SeqCst), 0);
+        std::fs::remove_dir_all(&tmp).unwrap();
     }
 }

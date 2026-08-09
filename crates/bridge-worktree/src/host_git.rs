@@ -1,5 +1,7 @@
+use crate::custody::RecoveryLocatorV1;
 use crate::provider::{
-    add_argv, is_repo_argv, list_porcelain_argv, prune_argv, remove_argv, WorktreeProvider,
+    add_argv, is_repo_argv, list_porcelain_argv, prune_argv, remove_argv, CustodyAddFailureV1,
+    CustodyAddOutcomeV1, CustodyAddTargetV1, WorktreeProvider,
 };
 use bridge_core::error::BridgeError;
 use std::path::Path;
@@ -122,6 +124,37 @@ async fn registration_absent(repo: &str, wt: &str) -> Result<bool, BridgeError> 
     Ok(registration_absent_from_porcelain(&listed.stdout, wt))
 }
 
+/// Classify a failed custody-aware add by DESCRIPTOR-level probes, never by the git error text.
+///
+/// The two probes answer independent questions and are kept independent: `target` decides whether
+/// there is work to preserve, `recovery_locator` decides how a recovery consumer reaches it.
+///
+/// **2a's docstring'd obligation, discharged here.** `registration_absent` returns
+/// `Result<bool, BridgeError>` and its `Err` arm is the ONLY producer of
+/// [`RecoveryLocatorV1::RegistrationUnproven`]. Collapsing that `Err` into
+/// `UnregisteredDirectory` (or propagating it) would make the third variant unreachable in
+/// production and record every ambiguous probe as a definite answer — the exact failure mode
+/// §5.7's ambiguity rows exist to prevent.
+async fn classify_custody_add_failure(repo: &str, wt: &str, reason: String) -> CustodyAddFailureV1 {
+    let target = match Path::new(wt).try_exists() {
+        Ok(true) => CustodyAddTargetV1::Present,
+        Ok(false) => CustodyAddTargetV1::ProvablyAbsent,
+        Err(_) => CustodyAddTargetV1::Unproven,
+    };
+    let recovery_locator = match registration_absent(repo, wt).await {
+        Ok(true) => RecoveryLocatorV1::UnregisteredDirectory {},
+        Ok(false) => RecoveryLocatorV1::RegisteredWorktree {},
+        Err(_) => RecoveryLocatorV1::RegistrationUnproven {},
+    };
+    let common_dir = common_dir(repo).await;
+    CustodyAddFailureV1 {
+        reason: format!("custody worktree add failed: {reason}"),
+        target,
+        common_dir: (!common_dir.is_empty()).then_some(common_dir),
+        recovery_locator,
+    }
+}
+
 #[async_trait::async_trait]
 impl WorktreeProvider for HostGitWorktree {
     async fn add(&self, repo: &str, wt: &str) -> Result<String, BridgeError> {
@@ -148,6 +181,47 @@ impl WorktreeProvider for HostGitWorktree {
         Err(BridgeError::ConfigInvalid {
             reason: format!("worktree add failed after lock retries: {last_err}"),
         })
+    }
+
+    /// Enumeration 10 of 10: the one PRODUCTION impl, and the one that supports custody.
+    fn supports_custody_add(&self) -> bool {
+        true
+    }
+
+    /// The custody-aware add: [`HostGitWorktree::add`]'s retry loop with `cleanup_failed_add`
+    /// REMOVED, and the failure classified instead.
+    ///
+    /// This is R-7's whole point. `add`'s two `cleanup_failed_add` call sites do
+    /// `remove_dir_all(wt)`, which is outside the 2b1 deletion gate — and 2b1's own review proved
+    /// the path is ROUTINE, not exotic: a refused custody rollback leaves the checkout on disk,
+    /// the failed-configure loop retries the configure, `git worktree add` fails on the surviving
+    /// directory, and today that would delete a protected checkout. Here it cannot: nothing in
+    /// this function removes anything.
+    async fn add_under_custody(
+        &self,
+        repo: &str,
+        wt: &str,
+    ) -> Result<CustodyAddOutcomeV1, BridgeError> {
+        let mut last_err = String::new();
+        for attempt in 0..5 {
+            let out = run_git(&add_argv(repo, wt, "HEAD")).await?;
+            if out.status.success() {
+                return Ok(CustodyAddOutcomeV1::Materialized {
+                    common_dir: common_dir(repo).await,
+                });
+            }
+            let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
+            last_err = err;
+            if !retryable_lock_error(&last_err) {
+                break;
+            }
+            if attempt + 1 < 5 {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+        }
+        Ok(CustodyAddOutcomeV1::Failed(
+            classify_custody_add_failure(repo, wt, last_err).await,
+        ))
     }
 
     async fn remove(&self, repo: &str, wt: &str) -> Result<(), BridgeError> {
@@ -341,6 +415,171 @@ mod tests {
 
         assert!(r.is_err(), "unborn HEAD => typed error, not a panic");
         assert!(!wt.exists(), "failed add should clean partial worktree");
+        std::fs::remove_dir_all(&tmp).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod custody_add_tests {
+    use super::*;
+    use crate::provider::WorktreeProvider;
+    use std::path::{Path, PathBuf};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn unique_temp_dir(name: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "a2a-bridge-custody-add-{name}-{}-{nanos}",
+            std::process::id()
+        ))
+    }
+
+    fn git(dir: &Path, args: &[&str]) {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+
+    fn repo(tmp: &Path) -> PathBuf {
+        let src = tmp.join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        git(&src, &["init", "-q"]);
+        git(&src, &["config", "user.email", "a@b.c"]);
+        git(&src, &["config", "user.name", "x"]);
+        std::fs::write(src.join("file.txt"), "base\n").unwrap();
+        git(&src, &["add", "-A"]);
+        git(&src, &["commit", "-q", "-m", "init"]);
+        src
+    }
+
+    /// THE routine sequence 2b1's dual review proved is not exotic, run against REAL git.
+    ///
+    /// The chain: the deletion gate refuses a rollback, so the checkout survives; the
+    /// failed-configure loop retries the configure; `git worktree add` now fails because the
+    /// target directory is already there. Through `add` that reaches `cleanup_failed_add`'s
+    /// `remove_dir_all` — outside the 2b1 gate — and takes a protected checkout with its work.
+    /// Through `add_under_custody` nothing may be removed.
+    ///
+    /// Discriminates any custody-aware add that still calls `cleanup_failed_add`, and one that
+    /// reports the surviving directory as provably absent (which the writer would settle as an
+    /// unmaterialized candidate rather than preserved work).
+    #[tokio::test]
+    async fn custody_add_failing_on_a_surviving_directory_never_removes_it() {
+        let tmp = unique_temp_dir("surviving-directory");
+        let src = repo(&tmp);
+        let wt = tmp.join("wt-retry");
+        std::fs::create_dir_all(&wt).unwrap();
+        std::fs::write(wt.join("preserved-work.txt"), "hours of work").unwrap();
+        let provider = HostGitWorktree::new();
+
+        let outcome = provider
+            .add_under_custody(src.to_str().unwrap(), wt.to_str().unwrap())
+            .await
+            .expect("the host provider implements the custody-aware add");
+
+        let CustodyAddOutcomeV1::Failed(failure) = outcome else {
+            panic!("git cannot add a worktree onto a non-empty existing directory")
+        };
+        assert_eq!(failure.target, CustodyAddTargetV1::Present);
+        assert!(
+            wt.join("preserved-work.txt").exists(),
+            "the surviving checkout and its work must be untouched"
+        );
+        assert_eq!(
+            std::fs::read_to_string(wt.join("preserved-work.txt")).unwrap(),
+            "hours of work"
+        );
+        assert!(
+            failure.common_dir.is_some(),
+            "a readable source still yields its common dir"
+        );
+        std::fs::remove_dir_all(&tmp).unwrap();
+    }
+
+    /// The V2 control for the test above, on the same input: `add` really does delete. Without
+    /// this, the custody test could pass against a git that simply never fails, and would prove
+    /// nothing about the prohibition.
+    #[tokio::test]
+    async fn the_legacy_add_still_removes_the_same_directory() {
+        let tmp = unique_temp_dir("legacy-control");
+        let src = repo(&tmp);
+        let wt = tmp.join("wt-retry");
+        std::fs::create_dir_all(&wt).unwrap();
+        std::fs::write(wt.join("preserved-work.txt"), "hours of work").unwrap();
+
+        let result = HostGitWorktree::new()
+            .add(src.to_str().unwrap(), wt.to_str().unwrap())
+            .await;
+
+        assert!(result.is_err());
+        assert!(
+            !wt.exists(),
+            "V2's `add` deletes the target on failure — this is the behaviour the custody-aware \
+             operation exists to avoid, and it stays unchanged for V2"
+        );
+        std::fs::remove_dir_all(&tmp).unwrap();
+    }
+
+    /// A failure with no target at all classifies `ProvablyAbsent`, so the writer can tell
+    /// "nothing was created" from "something was". Discriminates a classifier that reports a
+    /// single answer for every failure, which would make every unborn-HEAD add look like
+    /// preserved work.
+    #[tokio::test]
+    async fn a_failure_before_any_target_classifies_provably_absent() {
+        let tmp = unique_temp_dir("unborn");
+        let src = tmp.join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        git(&src, &["init", "-q"]);
+        let wt = tmp.join("wt");
+
+        let outcome = HostGitWorktree::new()
+            .add_under_custody(src.to_str().unwrap(), wt.to_str().unwrap())
+            .await
+            .unwrap();
+
+        let CustodyAddOutcomeV1::Failed(failure) = outcome else {
+            panic!("an unborn HEAD cannot be checked out")
+        };
+        assert_eq!(failure.target, CustodyAddTargetV1::ProvablyAbsent);
+        assert!(!wt.exists());
+        std::fs::remove_dir_all(&tmp).unwrap();
+    }
+
+    /// An unreadable source makes the registration probe fail, and that `Err` — the ONLY producer
+    /// of `RegistrationUnproven` — must reach the record. Discriminates the 2a-forbidden
+    /// collapse into `UnregisteredDirectory`, which would durably record an ambiguous probe as a
+    /// definite "not registered" answer.
+    #[tokio::test]
+    async fn an_unprovable_registration_maps_to_registration_unproven() {
+        let tmp = unique_temp_dir("unproven-registration");
+        std::fs::create_dir_all(&tmp).unwrap();
+        let missing_repo = tmp.join("not-a-repo");
+        std::fs::create_dir_all(&missing_repo).unwrap();
+        let wt = tmp.join("wt");
+
+        let outcome = HostGitWorktree::new()
+            .add_under_custody(missing_repo.to_str().unwrap(), wt.to_str().unwrap())
+            .await
+            .unwrap();
+
+        let CustodyAddOutcomeV1::Failed(failure) = outcome else {
+            panic!("a non-repository cannot add a worktree")
+        };
+        assert_eq!(
+            failure.recovery_locator,
+            RecoveryLocatorV1::RegistrationUnproven {}
+        );
         std::fs::remove_dir_all(&tmp).unwrap();
     }
 }

@@ -3081,6 +3081,27 @@ async fn run_warm_loop(
     terminal
 }
 
+/// Explicit run-end worktree settlement on a HANDLED terminal path (R2f1b slice 2b2, S5).
+///
+/// `WorktreeRunEndGuard`'s `Drop` is a backstop, not a settlement: it is the moment the process
+/// knows least about whether the run ended in a way it understands. Calling this on the normal
+/// path makes the two distinguishable — a settled guard's `Drop` is a no-op, and a `Drop` that
+/// still finds the guard unsettled during an unwind records exactly that rather than pretending a
+/// settlement occurred.
+///
+/// Idempotent, and deliberately NOT installed at the `mcp` and `serve` sweep entry points: those
+/// two install a boot sweep but no run-end guard at all, because they are long-running servers
+/// with no run end to settle. That exclusion is named rather than silent.
+fn settle_worktree_run_end<T>(
+    guard: Option<&bridge_worktree::sweep::WorktreeRunEndGuard>,
+    outcome: T,
+) -> T {
+    if let Some(guard) = guard {
+        guard.settle();
+    }
+    outcome
+}
+
 /// `implement --merge` sugar (ADR-0027): when the run ended `Approved`, land it via `merge_clone`
 /// (Approved-only, `--force` n/a — `implement` has no `--force`) and exit with its code; a non-Approved
 /// run prints `not merged:` and exits 2. Without `--merge`, returns `Ok(())` (plain implement unchanged).
@@ -3385,11 +3406,12 @@ async fn implement_cmd(args: &[String]) -> Result<(), BoxError> {
         instance_id: instance_id.clone(),
     };
     let _wt_run_guard = worktree_cfg.as_ref().and_then(|wc| {
-        wc.enabled
-            .then(|| bridge_worktree::sweep::WorktreeRunEndGuard {
-                root: wc.root.clone(),
-                instance_id: run.instance_id.clone(),
-            })
+        wc.enabled.then(|| {
+            bridge_worktree::sweep::WorktreeRunEndGuard::new(
+                wc.root.clone(),
+                run.instance_id.clone(),
+            )
+        })
     });
     let policy: Arc<dyn PolicyEngine> = Arc::new(AutoPolicy);
     let impl_lsp_cache_vol =
@@ -3485,124 +3507,130 @@ async fn implement_cmd(args: &[String]) -> Result<(), BoxError> {
     if msg.1 == implement::CommitSource::Derived {
         eprintln!("[implement] no .git/A2A_COMMIT_MSG — using task-derived message");
     }
-    match implement::decide(completed, guard, stage, msg) {
-        implement::Action::Abort(reason) => {
-            eprintln!(
-                "[implement] {reason} — NO commit; clone left at {}",
-                clone.display()
-            );
-            let _ = warm_runner.retire().await; // sole warm reap site; RunEndGuard is the backstop
-            Err(format!("implement: {reason}").into())
-        }
-        implement::Action::NoCommitClean => {
-            println!(
-                "implement: made no changes; clone left at {}",
-                clone.display()
-            );
-            let _ = warm_runner.retire().await;
-            Ok(())
-        }
-        implement::Action::NoCommitDirty => {
-            eprintln!(
+    // R5: the settlement epilogue wraps EVERY handled arm. Previously only `Commit` settled, so
+    // `Abort` / `NoCommitClean` / `NoCommitDirty` — three of the four terminals, and the common
+    // ones — fell through to `Drop` unsettled.
+    settle_worktree_run_end(
+        _wt_run_guard.as_ref(),
+        match implement::decide(completed, guard, stage, msg) {
+            implement::Action::Abort(reason) => {
+                eprintln!(
+                    "[implement] {reason} — NO commit; clone left at {}",
+                    clone.display()
+                );
+                let _ = warm_runner.retire().await; // sole warm reap site; RunEndGuard is the backstop
+                Err(format!("implement: {reason}").into())
+            }
+            implement::Action::NoCommitClean => {
+                println!(
+                    "implement: made no changes; clone left at {}",
+                    clone.display()
+                );
+                let _ = warm_runner.retire().await;
+                Ok(())
+            }
+            implement::Action::NoCommitDirty => {
+                eprintln!(
                 "[implement] agent edited but staged NOTHING — NOT committing (agent owns staging). \
                  Clone left at {} for inspection.",
                 clone.display()
             );
-            let _ = warm_runner.retire().await;
-            Ok(())
-        }
-        implement::Action::Commit(message) => {
-            // Phase 1 → 2 boundary: the LAST fallible setup step. Retire the warm container on its error
-            // path too (a container exists); after this the loop body is lossy (no `?`).
-            let sha = match implement::host_commit(&clone, &message) {
-                Ok(s) => s,
-                Err(e) => {
-                    let _ = warm_runner.retire().await;
-                    return Err(e.into());
-                }
-            };
-            let _ = std::fs::remove_file(clone.join(".git").join("A2A_COMMIT_MSG")); // R13 hygiene
-                                                                                     // ADR-0026: build the resume checkpoint (FirstCommitCreated) before the loop.
-            let mut prod_ckpt = implement_resume::ProdCheckpoint {
-                clone: clone.clone(),
-                ck: implement_resume::ImplementCheckpoint {
-                    schema_version: implement_resume::SCHEMA_VERSION,
-                    resume_id: task_id.clone(),
-                    task_id: task_id.clone(),
-                    task_brief: task.clone(),
-                    source_repo: repo.clone(),
-                    clone_path: clone.clone(),
-                    config_path: config_path.clone(),
-                    branch: branch.clone(),
-                    base_ref: base_ref.clone(),
-                    base_commit: base_sha.clone(),
-                    current_commit: Some(sha.clone()),
-                    original_message: Some(message.clone()),
-                    edit_workflow: workflow.clone(),
-                    fix_workflow: loop_cfg.fix_workflow.as_str().to_string(),
-                    loop_max_attempts: loop_cfg.max_attempts,
-                    attempt_next: 1,
-                    forced_depth: depth.to_forced_str(),
-                    resolved_lang: Some(
-                        profile
-                            .as_ref()
-                            .map(|p| p.id.clone())
-                            .unwrap_or_else(|| "none".to_string()),
-                    ),
-                    activity_tally: None,
-                    terminal_evidence_counts: None,
-                    phase: implement_resume::ImplementPhase::FirstCommitCreated,
-                    created_at_ms: implement_resume::now_ms(),
-                    updated_at_ms: implement_resume::now_ms(),
-                },
-            };
-            let _ = implement_resume::save_checkpoint(&clone, &prod_ckpt.ck);
-            let subject = message.lines().next().unwrap_or("").to_string();
-            let WarmImpl {
-                impl_session,
-                fix_template,
-                ..
-            } = warm_impl;
-            let outcome_phase = run_warm_loop(
-                &clone,
-                &repo,
-                &branch,
-                &task,
-                &base_sha,
-                &task_id,
-                sha,
-                &message,
-                &subject,
-                1, // start_attempt (fresh run)
-                loop_cfg.max_attempts,
-                fix_graph.is_some(),
-                warm_runner.as_ref(),
-                &impl_session,
-                &clone_cwd,
-                &verify_cfg,
-                profile.as_ref(),
-                &review_cfg,
-                &wf_map,
-                &executor,
-                fix_template,
-                &mut prod_ckpt,
-                depth,
-                telemetry,
-                &run,
-                &verify_owner,
-            )
-            .await;
-            merge_after_loop(
-                merge_requested,
-                outcome_phase,
-                merge_cfg,
-                &clone,
-                &root,
-                onto.as_deref(),
-                None,
-            )
-        }
-    }
+                let _ = warm_runner.retire().await;
+                Ok(())
+            }
+            implement::Action::Commit(message) => {
+                // Phase 1 → 2 boundary: the LAST fallible setup step. Retire the warm container on its error
+                // path too (a container exists); after this the loop body is lossy (no `?`).
+                let sha = match implement::host_commit(&clone, &message) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        let _ = warm_runner.retire().await;
+                        return Err(e.into());
+                    }
+                };
+                let _ = std::fs::remove_file(clone.join(".git").join("A2A_COMMIT_MSG")); // R13 hygiene
+                                                                                         // ADR-0026: build the resume checkpoint (FirstCommitCreated) before the loop.
+                let mut prod_ckpt = implement_resume::ProdCheckpoint {
+                    clone: clone.clone(),
+                    ck: implement_resume::ImplementCheckpoint {
+                        schema_version: implement_resume::SCHEMA_VERSION,
+                        resume_id: task_id.clone(),
+                        task_id: task_id.clone(),
+                        task_brief: task.clone(),
+                        source_repo: repo.clone(),
+                        clone_path: clone.clone(),
+                        config_path: config_path.clone(),
+                        branch: branch.clone(),
+                        base_ref: base_ref.clone(),
+                        base_commit: base_sha.clone(),
+                        current_commit: Some(sha.clone()),
+                        original_message: Some(message.clone()),
+                        edit_workflow: workflow.clone(),
+                        fix_workflow: loop_cfg.fix_workflow.as_str().to_string(),
+                        loop_max_attempts: loop_cfg.max_attempts,
+                        attempt_next: 1,
+                        forced_depth: depth.to_forced_str(),
+                        resolved_lang: Some(
+                            profile
+                                .as_ref()
+                                .map(|p| p.id.clone())
+                                .unwrap_or_else(|| "none".to_string()),
+                        ),
+                        activity_tally: None,
+                        terminal_evidence_counts: None,
+                        phase: implement_resume::ImplementPhase::FirstCommitCreated,
+                        created_at_ms: implement_resume::now_ms(),
+                        updated_at_ms: implement_resume::now_ms(),
+                    },
+                };
+                let _ = implement_resume::save_checkpoint(&clone, &prod_ckpt.ck);
+                let subject = message.lines().next().unwrap_or("").to_string();
+                let WarmImpl {
+                    impl_session,
+                    fix_template,
+                    ..
+                } = warm_impl;
+                let outcome_phase = run_warm_loop(
+                    &clone,
+                    &repo,
+                    &branch,
+                    &task,
+                    &base_sha,
+                    &task_id,
+                    sha,
+                    &message,
+                    &subject,
+                    1, // start_attempt (fresh run)
+                    loop_cfg.max_attempts,
+                    fix_graph.is_some(),
+                    warm_runner.as_ref(),
+                    &impl_session,
+                    &clone_cwd,
+                    &verify_cfg,
+                    profile.as_ref(),
+                    &review_cfg,
+                    &wf_map,
+                    &executor,
+                    fix_template,
+                    &mut prod_ckpt,
+                    depth,
+                    telemetry,
+                    &run,
+                    &verify_owner,
+                )
+                .await;
+                merge_after_loop(
+                    merge_requested,
+                    outcome_phase,
+                    merge_cfg,
+                    &clone,
+                    &root,
+                    onto.as_deref(),
+                    None,
+                )
+            }
+        },
+    )
 }
 
 async fn implement_resume_cmd(
@@ -3735,11 +3763,12 @@ async fn implement_resume_cmd(
         instance_id: instance_id.clone(),
     };
     let _wt_run_guard = worktree_cfg.as_ref().and_then(|wc| {
-        wc.enabled
-            .then(|| bridge_worktree::sweep::WorktreeRunEndGuard {
-                root: wc.root.clone(),
-                instance_id: run.instance_id.clone(),
-            })
+        wc.enabled.then(|| {
+            bridge_worktree::sweep::WorktreeRunEndGuard::new(
+                wc.root.clone(),
+                run.instance_id.clone(),
+            )
+        })
     });
 
     let policy: Arc<dyn PolicyEngine> = Arc::new(AutoPolicy);
@@ -3855,14 +3884,17 @@ async fn implement_resume_cmd(
         &verify_owner,
     )
     .await;
-    merge_after_loop(
-        merge_requested,
-        outcome_phase,
-        merge_cfg,
-        &clone,
-        &root,
-        onto,
-        Some(_operation),
+    settle_worktree_run_end(
+        _wt_run_guard.as_ref(),
+        merge_after_loop(
+            merge_requested,
+            outcome_phase,
+            merge_cfg,
+            &clone,
+            &root,
+            onto,
+            Some(_operation),
+        ),
     )
 }
 
@@ -4348,11 +4380,12 @@ async fn run_workflow_cmd(args: &[String]) -> Result<(), BoxError> {
         );
     }
     let _wt_run_guard = worktree_cfg.as_ref().and_then(|wc| {
-        wc.enabled
-            .then(|| bridge_worktree::sweep::WorktreeRunEndGuard {
-                root: wc.root.clone(),
-                instance_id: run.instance_id.clone(),
-            })
+        wc.enabled.then(|| {
+            bridge_worktree::sweep::WorktreeRunEndGuard::new(
+                wc.root.clone(),
+                run.instance_id.clone(),
+            )
+        })
     });
     let policy = Arc::new(bridge_policy::permission::AutoPolicy);
     let policy_for_spawn = Arc::clone(&policy) as Arc<dyn bridge_core::ports::PolicyEngine>;
@@ -4408,6 +4441,8 @@ async fn run_workflow_cmd(args: &[String]) -> Result<(), BoxError> {
             policy_invocation: bridge_core::execution_policy::ExecutionPolicyInvocationV1::default(
             ),
             ledger_admission: initial_ledger_admission,
+            // R2f1b: production admission mints no V3 contract (slice-2 brief §5.2).
+            r2f1b: None,
         })
         .await
         .map_err(|error| format!("run-workflow: frozen admission failed: {error:?}"))?;
@@ -4644,7 +4679,7 @@ async fn run_workflow_cmd(args: &[String]) -> Result<(), BoxError> {
         None => diagnostic_ctx,
     };
     let diagnostic_ctx = diagnostic_ctx
-        .with_frozen_run_spec(authority.run_spec, authority.provider_effect_key)
+        .with_admitted_workflow_run(authority)
         .map_err(|error| format!("run-workflow: frozen authority refused: {error:?}"))?;
 
     // Run the workflow.
@@ -5054,14 +5089,16 @@ async fn run_workflow_cmd(args: &[String]) -> Result<(), BoxError> {
         }
     }
 
-    if let Some(error) = output_error {
-        return Err(error.into());
-    }
-    if ok {
-        Ok(())
-    } else {
-        Err("run-workflow: workflow did not complete successfully".into())
-    }
+    // R5: the output-write failure is a HANDLED terminal and must settle like any other; it
+    // previously returned early, past the epilogue, and fell to `Drop`.
+    settle_worktree_run_end(
+        _wt_run_guard.as_ref(),
+        match (output_error, ok) {
+            (Some(error), _) => Err(error.into()),
+            (None, true) => Ok(()),
+            (None, false) => Err("run-workflow: workflow did not complete successfully".into()),
+        },
+    )
 }
 
 const WORKFLOW_STATS_USAGE: &str = "\
