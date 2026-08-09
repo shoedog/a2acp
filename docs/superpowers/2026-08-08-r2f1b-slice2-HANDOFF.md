@@ -11,8 +11,8 @@
 
 **(a) Lane ownership** — session 9337e035 owns slice-2 orchestration; NO live agents — **RESOLVED 2026-08-09** (2c2 complete end-to-end)
 **(b) Custody exposure** — `[MEASURED]` push this session: origin/main = local main = `c13ff663` (2a, 2b1, PARKED-1, 2b2, 2c1, 2c2 all folded and pushed). Planning branch `agent/r2f1b-pre-slice2-custody-plan` is deliberately local-only (owner practice). Prompts §2c commits pushed on `agent/prompts-2c-outbound-refutation` (`fe4532aa`)
-**(c) In flight / irreversible** — nothing in flight. 2c2 pushed (`c13ff663`); s2c2 worktree retained as the branch's home (fully folded, safe to prune). Implement clone `impl-96012-qz5j808a` under `~/code/.a2a-implement` holds the REJECTED out-of-scope `compatibility.rs` diff (`659e9556`) — inspectable, reaper-eligible once the owner has no further use
-**(d) Authorization / standing directives** — owner directive 2026-08-09 (standing): implementation dispatches route through the bridge (`a2a-bridge implement`, gpt-5.6-terra or -sol, high/xhigh) — memory `implement-via-bridge-terra-sol` has the working invocation. Dual-lens review remains MANDATORY for deletion-authority slices; one-round cap with targeted repair. Owner posture rule: sol reviews adjudicated senior-lead, evidence discipline retained. 2d dispatch AWAITS OWNER WORD (lane practice: each sub-slice dispatch is owner-gated).
+**(c) In flight / irreversible** — 2d implement IN FLIGHT via bridge: clone `impl-28907-1iv8a077`, base branch `feat/r2f1b-2d-claim-exchange` @ `c13ff663`, config `examples/a2a-bridge.r2f1b-impl.toml` (terra/xhigh; hermetic flock-family skips added), task spec at the §6 path. Prior clone `impl-96012-qz5j808a` holds the REJECTED out-of-scope `compatibility.rs` diff (`659e9556`) — inspectable, reaper-eligible
+**(d) Authorization / standing directives** — OWNER WORD 2026-08-09: "approved - proceed" → 2d dispatched; the ledgered two-phase settlement question RATIFIED-AS-SHIPPED (per-checkout independence stands; recorded here — owner can reopen). Standing: implementation via bridge (terra/sol high/xhigh, memory `implement-via-bridge-terra-sol`); dual-lens review mandatory (2d touches sweep exclusion = deletion-adjacent); one-round cap with targeted repair; sol adjudicated senior-lead.
 
 ## 1. Resume order
 
@@ -53,7 +53,8 @@
 | 2c2 targeted repair (declared single round) | done | `[MEASURED]` `e26a87e3` — RA teardown-gated mint (sol-1) / RB typed RemovedRecordAmbiguous (sol-3) / RC preserved-unknown settlement (opus W-1) / RD doc truthfulness; implemented VIA THE BRIDGE (gpt-5.6-terra/xhigh, clone `impl-96012-qz5j808a`); fix loop's out-of-scope `compatibility.rs` surgery REJECTED at operator boundary (container-environmental red tests: host controls 1/1 + 4/4 green, base control green — pre-existing #9/F-3 flock fork-inheritance family, 2 newly observed members); focused 2652/0/11 |
 | 2c2 fold + full gates + push | done | `[MEASURED]` origin/main → `c13ff663` (squash; docs `14cbf213`); gates: diff-check/fmt/clippy clean, workspace 3813/0/12 across 89, release build ok, repo-hygiene ok (per-stage exit codes captured) |
 | READTHIS §2c prompt commits | done | `[MEASURED]` `agent/prompts-2c-outbound-refutation` pushed (`fe4532aa`); READTHIS deleted |
-| 2d dispatch (claim-exchange mechanism) | next | AWAITING OWNER WORD — brief §3 "2d" (successor minting, claim validation, `RecoveredLive` publication, sweep exclusion; production-inactive until slice 5); carries the 2c2 ledger (error-exit settlement population slice 3/5; two-phase settlement question; proof-of-removal token; epoch-linearization trigger; impl-config hermetic skips) |
+| 2d dispatch (claim-exchange mechanism) | in flight | OWNER WORD 2026-08-09 ("approved - proceed"). Dispatched via bridge implement (terra/xhigh): clone `impl-28907-1iv8a077`, base `feat/r2f1b-2d-claim-exchange` @ `c13ff663`; task spec covers P1 validate-before-effect + negatives, P2 `RecoveredLive` publication (claim Forbidden, frozen edge), P3 sweep-exclusion inheritance incl. gate + mint from-state refusals (THE load-bearing claim), P4 recovery lease (§5.1 step 5 / RE-5), P5 production-shaped `validate_successor` consumer (production-inactive); slice-3 gate check (§5.7 rows 1–6 + 12) mandated in the handoff |
+| Owner ruling: two-phase settlement | done | RATIFIED-AS-SHIPPED 2026-08-09 ("approved - proceed" on the presented ratify-or-schedule question): per-checkout independence stands; an earlier sibling's verified capability removal is final when a later sibling's release fails. Reopenable by owner word |
 
 ## 3. Corrections to standing documents and memory
 
@@ -65,8 +66,9 @@
 
 | # | Work | State | Exact next action | Blocked by | Identifiers |
 |---:|---|---|---|---|---|
-| 1 | 2d dispatch (claim-exchange mechanism, production-inactive) | pending | §1 steps 1–2 (owner word, then bridge implement per the standing directive) | owner word | brief §3 "2d"; ledger rows in both 2c records |
-| 2 | 2d review + fold | pending | §1 steps 3–5 | #1 | opus + sol lenses; fold worktree |
+| 1 | 2d implement | in flight | await bridge hand-off; INSPECT the diff at the operator boundary before landing (2c2 lesson) | — | clone `impl-28907-1iv8a077`; task spec §6 |
+| 2 | 2d dual-lens review + adjudication + repair | pending | §1 steps 3–4 | #1 | opus + sol lenses |
+| 3 | 2d fold + slice-3 gate (§5.7 rows 1–6+12) + push + reconcile | pending | §1 step 5 | #2 | fold worktree, local `main` |
 
 ## 5. Invariants and traps — do not do these
 
@@ -90,7 +92,10 @@
 | 2c2 branch (folded) | `feat/r2f1b-2c2-deletion` @ `e26a87e3` (implement `66f8ab0c`, repair `e26a87e3`) in worktree `s2c2` |
 | 2c2 dual-review record | `docs/superpowers/reviews/2026-08-09-s2c2-dual-review.md` (on main) |
 | 2c2 repair implement clone (holds the REJECTED compat diff `659e9556`) | `~/code/.a2a-implement/impl-96012-qz5j808a` |
-| bridge implement config (terra/xhigh) | `examples/a2a-bridge.2c2-repair-impl.toml` (untracked, main checkout) |
+| bridge implement config (terra/xhigh + hermetic skips) | `examples/a2a-bridge.r2f1b-impl.toml` (untracked, main checkout; supersedes `a2a-bridge.2c2-repair-impl.toml`) |
+| 2d base branch / implement clone | `feat/r2f1b-2d-claim-exchange` @ `c13ff663` · `~/code/.a2a-implement/impl-28907-1iv8a077` |
+| 2d task spec | `/private/tmp/claude-501/-Users-wesleyjinks-code-a2a-bridge/9337e035-8348-4206-97af-21223ccae4c8/scratchpad/2d-task.md` |
+| 2d implementer deliverable mirror (when it lands) | `docs/superpowers/reviews/2026-08-09-s2d-implementer-handoff.md` in the clone |
 | prior sub-slice worktrees (folded, branches safe to prune) | `s2b1` (`fix/noreplace-errno-classify`), `s2b2`, `s2c1`, `s2c2` |
 | prompts §2c pushed branch | `agent/prompts-2c-outbound-refutation` @ `fe4532aa` |
 | fold worktree (local main) | `/Users/wesleyjinks/code/a2a-bridge/.claude/worktrees/fold` |
@@ -100,4 +105,4 @@
 
 **§2c verdict:** RUN AND DISCHARGED for 2c2 — the implementer's SELF-PASS SURVIVED with three corrections left visible (`s2c2-implementer-handoff.md` §5), then the claim was INDEPENDENTLY verified by both review lenses (opus: six explicit verdicts SOUND, including the gate-bypass substitution and mint unforgeability; sol: "capability/gate substitution sound for cooperative actors") and repaired where they refuted the margins (RA: the failed-inner-teardown path could delete — fixed; RB: ambiguous tombstone misreported — typed). Record: `reviews/2026-08-09-s2c2-dual-review.md`.
 
-**Questions the owner owes an answer to:** (1) word to dispatch 2d; (2) the two-phase settlement question (ledgered in the 2c2 record: tear down all checkouts → recompute health → then mint, vs the shipped per-checkout independence) — ratify or schedule.
+**Questions the owner owes an answer to:** None — both prior questions answered 2026-08-09 ("approved - proceed"): 2d dispatched; two-phase settlement ratified-as-shipped (§0(d), §2 ruling row).
