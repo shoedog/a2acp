@@ -111,6 +111,10 @@ checkout fingerprints share one plan. No runtime path may invent another destina
 
 ### 2.2 Worktree custody state machine
 
+> **Errata (2026-08-08, slice-2a review):** the diagram edge `Preserved -> RecoveredLive` is
+> NON-NORMATIVE — contradicted by this section's prose (terminal for R2f1b) and by §5.8. The shipped
+> transition table follows the prose.
+
 New `crates/bridge-worktree/src/custody.rs`:
 
 ```
