@@ -100,3 +100,21 @@ per lane practice.
   the non-discriminating first probe (yield-loop) is recorded beside the
   discriminating one (real-timer): evidence admissibility applies to test
   design, not just debugging.
+
+## Fold addendum (post-push)
+
+Fold gates at `01e7b677`: diff-check/fmt/clippy/workspace/release all clean —
+**workspace 3834 / 0 / 12 across 90** (3826 → +8). Repo-hygiene FAILED once,
+correctly: the slice-3 brief landing had committed the impl config without
+regenerating the workflow-artifact allowlist — fixed intentionally
+(`a7b016d6`); ritual lesson recorded (docs landings that track new
+examples/prompts files run the hygiene gate too). Coverage obligation (brief
+§6 item 6), lib-test scope on darwin via cargo-llvm-cov: bridge-core
+**87.48%** lines (20,133/2,520 missed), bridge-workflow **84.90%**
+(11,827/1,786 missed) — the §9 floors (86→90 / 87→90) were set against fuller
+suites, so these lib-only figures SEED the per-fold delta series rather than
+adjudicate the floors; 3a/3b2 folds report against these. One probe note: the
+first coverage invocation failed on its own flags (--workspace with -p) —
+inadmissible, corrected, re-run. Fold-ritual reaps: s3s worktree target (11G)
++ the 3s clone (no host target — container-side caches only); receipts in the
+session scratchpad.
