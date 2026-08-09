@@ -452,23 +452,28 @@ mod tests {
         assert!(serde_json::from_str::<PreparationFlightStateV1>(r#"{"state":"bogus"}"#).is_err());
     }
 
-    /// FINDING (not a defect in this slice's own code -- flagged per task
-    /// instructions rather than changed): `BoundedCauseV1` (`NodeCauseV1` in
-    /// execution_policy.rs) has no `#[serde(deny_unknown_fields)]` of its
-    /// own. `PreparationFlightStateV1`'s `deny_unknown_fields` only guards
-    /// its *own* top-level keys ("state", "cause"); it does not propagate
-    /// into the nested `cause` object's field set. So an unrecognized key
-    /// inside `cause` is currently accepted and silently dropped even though
-    /// the outer contract type is journaled. This test pins that CURRENT
-    /// behavior (it asserts `is_ok()`); it is not a claim that the behavior
-    /// is desired.
+    /// R2f1b slice-2a tightening (was the A2 FINDING test, which pinned the
+    /// gap by asserting `is_ok()`): `PreparationFlightStateV1`'s
+    /// `deny_unknown_fields` guards only its *own* top-level keys ("state",
+    /// "cause") -- it does not propagate into the nested `cause` object's
+    /// field set, and `BoundedCauseV1` (`NodeCauseV1` in execution_policy.rs)
+    /// carried no `deny_unknown_fields` of its own. `NodeCauseV1` now does
+    /// (see `execution_policy::r2f1b_node_cause_strictness_tests`), so an
+    /// unrecognized key inside `cause` is rejected on this plain-serde path
+    /// too -- which matters here precisely because, unlike the durable node
+    /// records, this contract has no canonical re-encode check to catch it.
+    /// Discriminates: that attribute being dropped again; the positive control
+    /// below pins that the well-formed nested cause still decodes.
     #[test]
-    fn preparation_flight_state_failed_cause_silently_accepts_unknown_nested_field() {
+    fn preparation_flight_state_failed_cause_rejects_unknown_nested_field() {
         let json = "{\"state\":\"failed\",\"cause\":{\"failure_class\":\"persistence\",\
              \"code\":\"bridge.sample_cause\",\"deepest_cause\":\"boom\",\
              \"cause_truncated\":false,\"evidence_overflow\":false,\"dependency_set\":null,\
              \"unexpected_extra_field\":\"leaked\"}}";
-        assert!(serde_json::from_str::<PreparationFlightStateV1>(json).is_ok());
+        assert!(serde_json::from_str::<PreparationFlightStateV1>(json).is_err());
+
+        let without_extra = json.replace(",\"unexpected_extra_field\":\"leaked\"", "");
+        assert!(serde_json::from_str::<PreparationFlightStateV1>(&without_extra).is_ok());
     }
 
     struct FakeClock(AtomicU64);

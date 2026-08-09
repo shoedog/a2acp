@@ -483,7 +483,14 @@ pub struct DependencySetRefV1 {
 pub type NodeFailureClassV1 = crate::diagnostics::DiagnosticFailureClass;
 pub type StaticBoundedCodeV1 = crate::diagnostics::DiagnosticCode;
 
+/// R2f1b slice 2a: `deny_unknown_fields` closes the nested-tolerance gap the A2 review
+/// recorded. It is free on the durable paths — all 13 production decodes go through a
+/// `decode_canonical` whose re-encode check already refused an unknown nested key with the
+/// identical error — and it is the only guard on the flight-contract paths
+/// (`ResourceActionResultV1`, `PreparationFlightStateV1`), which are plain serde with no
+/// re-encode check and, as of this slice, no production writers.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct NodeCauseV1 {
     pub failure_class: NodeFailureClassV1,
     pub code: StaticBoundedCodeV1,
@@ -2797,5 +2804,103 @@ mod r2f1b_contract_tests {
     fn worktree_custody_id_rejects_missing_or_wrong_case_prefix() {
         assert!(WorktreeCustodyIdV1::parse("1".repeat(72)).is_err());
         assert!(WorktreeCustodyIdV1::parse(format!("Custody-{}", "1".repeat(64))).is_err());
+    }
+}
+
+/// R2f1b slice 2a: `NodeCauseV1` (== `BoundedCauseV1`) unknown-field strictness.
+///
+/// `NodeCauseV1` is nested inside every durable node record (`NodeTerminalV1.cause`,
+/// `NodePrimaryRecordV3.cause`, `NodeCleanupV2::Failed.cause`) and inside both R2f1b
+/// flight contracts (`ResourceActionResultV1.cause`, `PreparationFlightStateV1::Failed`).
+/// On the durable path the tightening is behaviourally neutral — `decode_canonical`'s
+/// re-encode check already rejects an unknown nested field, because a dropped key cannot
+/// be reproduced. On the flight path there is no re-encode check, and the A2 review's two
+/// FINDING tests pinned the resulting tolerance; this closes it while that path still has
+/// zero production writers.
+#[cfg(test)]
+mod r2f1b_node_cause_strictness_tests {
+    use super::*;
+    use crate::diagnostics::{DiagnosticCode, DiagnosticFailureClass, DiagnosticRedactor};
+
+    fn sample_cause() -> NodeCauseV1 {
+        NodeCauseV1 {
+            failure_class: DiagnosticFailureClass::Persistence,
+            code: DiagnosticCode::build("bridge.sample_cause", &DiagnosticRedactor::default())
+                .unwrap(),
+            deepest_cause: Some("boom".to_string()),
+            cause_truncated: false,
+            evidence_overflow: false,
+            dependency_set: None,
+        }
+    }
+
+    const GOLDEN_CAUSE: &str =
+        "{\"failure_class\":\"persistence\",\"code\":\"bridge.sample_cause\",\
+         \"deepest_cause\":\"boom\",\"cause_truncated\":false,\
+         \"evidence_overflow\":false,\"dependency_set\":null}";
+
+    fn with_leaked_key(json: &str) -> String {
+        json.replacen(
+            "\"dependency_set\":null}",
+            "\"dependency_set\":null,\"unexpected_extra_field\":\"leaked\"}",
+            1,
+        )
+    }
+
+    /// Discriminates: `#[serde(deny_unknown_fields)]` being dropped from
+    /// `NodeCauseV1`, which would re-open the nested-tolerance gap the two
+    /// flight-contract FINDING tests used to pin. Positive control: the same
+    /// bytes without the stray key still decode to the same value.
+    #[test]
+    fn node_cause_rejects_unknown_nested_field() {
+        assert_eq!(
+            serde_json::from_str::<NodeCauseV1>(GOLDEN_CAUSE).unwrap(),
+            sample_cause()
+        );
+        assert!(serde_json::from_str::<NodeCauseV1>(&with_leaked_key(GOLDEN_CAUSE)).is_err());
+    }
+
+    /// Discriminates: the tightening changing the *accepted* wire form. These
+    /// bytes are already persisted inside `NodeTerminalV1` and
+    /// `NodePrimaryRecordV3` rows, so they must be byte-identical before and
+    /// after — the tightening removes tolerance, never re-shapes the record.
+    #[test]
+    fn node_cause_wire_form_is_unchanged_by_the_tightening() {
+        assert_eq!(
+            serde_json::to_string(&sample_cause()).unwrap(),
+            GOLDEN_CAUSE
+        );
+    }
+
+    /// Discriminates: the durable path losing the property that made this
+    /// tightening free — an unknown nested field was *already* refused by
+    /// `decode_canonical`'s re-encode check, with the identical error. If this
+    /// ever goes red, the "behaviourally neutral on live paths" justification
+    /// for the tightening no longer holds.
+    #[test]
+    fn durable_terminal_decode_already_refused_an_unknown_nested_cause_field() {
+        let terminal = NodeTerminalV1 {
+            schema_version: EXECUTION_POLICY_SCHEMA_V1,
+            primary: NodePrimaryDispositionV1::Failed,
+            cleanup: NodeCleanupV1 {
+                disposition: NodeCleanupDispositionV1::Complete,
+                duration_ms: 1,
+            },
+            cause: Some(sample_cause()),
+            prompt_may_have_been_accepted: false,
+            degraded_ancestry: false,
+            policy_trigger_id: None,
+        };
+        let encoded = terminal.encode_canonical().unwrap();
+        assert_eq!(
+            NodeTerminalV1::decode_canonical(&encoded).unwrap(),
+            terminal
+        );
+
+        let tampered = with_leaked_key(&String::from_utf8(encoded).unwrap());
+        assert_eq!(
+            NodeTerminalV1::decode_canonical(tampered.as_bytes()),
+            Err(ExecutionPolicyError::InvalidStructuredEvidence)
+        );
     }
 }

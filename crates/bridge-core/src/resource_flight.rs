@@ -584,18 +584,24 @@ mod tests {
         .is_err());
     }
 
-    /// FINDING (see the matching test in preparation_flight.rs for the same
-    /// root cause): `ResourceActionResultV1` denies unknown fields at its
-    /// own level, but its nested `cause: Option<BoundedCauseV1>` does not --
-    /// `BoundedCauseV1` has no `#[serde(deny_unknown_fields)]` of its own, so
-    /// an unrecognized key inside `cause` is silently accepted here too, via
-    /// `ResourceFlightStateV1::Settled { result }`, the exact path a later
-    /// slice will journal. This test pins CURRENT behavior; it does not
-    /// change production.
+    /// R2f1b slice-2a tightening (was the A2 FINDING test, which pinned the
+    /// gap by asserting `is_ok()`): `ResourceActionResultV1` denied unknown
+    /// fields at its own level, but its nested `cause: Option<BoundedCauseV1>`
+    /// did not, so an unrecognized key inside `cause` was silently accepted
+    /// via `ResourceFlightStateV1::Settled { result }` -- the exact path slice
+    /// 3 will journal, and one with no canonical re-encode check to catch it.
+    /// `NodeCauseV1` now carries its own `#[serde(deny_unknown_fields)]` (see
+    /// `execution_policy::r2f1b_node_cause_strictness_tests`), closing the gap
+    /// before the path gains writers. Discriminates: that attribute being
+    /// dropped again; the positive control below pins that the well-formed
+    /// nested cause still decodes.
     #[test]
-    fn resource_flight_state_settled_cause_silently_accepts_unknown_nested_field() {
+    fn resource_flight_state_settled_cause_rejects_unknown_nested_field() {
         let json = r#"{"state":"settled","result":{"disposition":"failed","duration_ms":1,"recovery_owner":null,"cause":{"failure_class":"persistence","code":"bridge.sample_cause","deepest_cause":"boom","cause_truncated":false,"evidence_overflow":false,"dependency_set":null,"unexpected_extra_field":"leaked"}}}"#;
-        assert!(serde_json::from_str::<ResourceFlightStateV1>(json).is_ok());
+        assert!(serde_json::from_str::<ResourceFlightStateV1>(json).is_err());
+
+        let without_extra = json.replace(",\"unexpected_extra_field\":\"leaked\"", "");
+        assert!(serde_json::from_str::<ResourceFlightStateV1>(&without_extra).is_ok());
     }
 
     /// Discriminates: drift in the internally-tagged wire shape of the four
