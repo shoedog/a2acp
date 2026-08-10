@@ -1236,7 +1236,7 @@ pub(crate) fn removal_item_outcome(observation: fs_custody::RemovalObservationV1
 struct Gated<'a> {
     item: &'a sr::ReportItem,
     path: PathBuf,
-    identity: (u64, u64),
+    identity: fs_custody::DirectoryIdentityV1,
     logical: Option<u64>,
     disk: Option<u64>,
     gates: Vec<String>,
@@ -1321,9 +1321,12 @@ fn gate_one<'a>(
         Ok(id) => id,
         Err(refusal) => bail!(payload_identity_park_reason(refusal)),
     };
+    let identity_label = match (identity.dev, identity.ino) {
+        (Some(dev), Some(ino)) => format!("dev {dev} / ino {ino}"),
+        _ => "dev/ino unavailable".to_string(),
+    };
     gates.push(format!(
-        "path identity: real directory, no symlink, dev {} / ino {}",
-        identity.0, identity.1
+        "path identity: real directory, no symlink, {identity_label}"
     ));
 
     // 3. The enclosing run must be a standalone clone. Regenerability is a property of a cargo
@@ -1440,7 +1443,6 @@ fn remove_one<E: ReapEnv>(
     env: &E,
 ) -> ReapItem {
     let path = g.path.clone();
-    let identity = g.identity;
 
     // The boundary gate line is appended INSIDE the act, in the same position the clone reaper
     // uses: it records a recheck that has already passed, and it must never appear on a record
@@ -1448,7 +1450,7 @@ fn remove_one<E: ReapEnv>(
     // ordering observable — a fake env sees the line recorded before `remove_tree` runs.
     let mut boundary_gate = None;
     let mut freed_bytes_measured = None;
-    let verified = fs_custody::verify_then_remove(pin, &path, identity, || {
+    let verified = fs_custody::verify_then_remove(pin, &path, &g.identity, || {
         boundary_gate = Some(
             "boundary recheck: root and payload identity unchanged immediately before removal"
                 .to_string(),

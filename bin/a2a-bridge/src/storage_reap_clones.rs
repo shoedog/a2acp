@@ -2423,9 +2423,12 @@ fn reap_one<E: rp::ReapEnv>(
         Ok(id) => id,
         Err(refusal) => parked_locked!(rp::payload_identity_park_reason(refusal)),
     };
+    let identity_label = match (identity.dev, identity.ino) {
+        (Some(dev), Some(ino)) => format!("dev {dev} / ino {ino}"),
+        _ => "dev/ino unavailable".to_string(),
+    };
     gates.push(format!(
-        "path identity: real directory, no symlink, dev {} / ino {}",
-        identity.0, identity.1
+        "path identity: real directory, no symlink, {identity_label}"
     ));
 
     // GATE 5 — consumers the scan established, then the container axis.
@@ -2662,7 +2665,7 @@ fn reap_one<E: rp::ReapEnv>(
     // the gate vocabulary below ("clone" rather than "payload") is this command's.
     let mut item_gates = gates.clone();
     let mut freed_bytes_measured = None;
-    let verified = fs_custody::verify_then_remove(pin, &path, identity, || {
+    let verified = fs_custody::verify_then_remove(pin, &path, &identity, || {
         item_gates.push(
             "boundary recheck: root and clone identity unchanged immediately before removal"
                 .to_string(),

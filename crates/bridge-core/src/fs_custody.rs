@@ -1281,10 +1281,12 @@ where
 // it, while the operator-facing gate vocabulary stays with each command's report.
 // ---------------------------------------------------------------------------------------------
 
-/// `(dev, ino)` of a real directory at `path`. A symlink or a non-directory is an error, never a
-/// silently-followed success.
+/// The identity of a real directory at `path`, captured from one no-follow metadata probe. A
+/// symlink or a non-directory is an error, never a silently-followed success. Birthtime comes
+/// from the same [`std::fs::Metadata`] as device and inode so the three fields always describe
+/// one observation.
 #[cfg(unix)]
-pub fn directory_dev_ino(path: &Path) -> Result<(u64, u64), String> {
+fn observed_directory_identity(path: &Path) -> Result<DirectoryIdentityV1, String> {
     use std::os::unix::fs::MetadataExt as _;
     let metadata =
         std::fs::symlink_metadata(path).map_err(|error| format!("{}: {error}", path.display()))?;
@@ -1294,16 +1296,35 @@ pub fn directory_dev_ino(path: &Path) -> Result<(u64, u64), String> {
     if !metadata.is_dir() {
         return Err(format!("{} is not a directory", path.display()));
     }
-    Ok((metadata.dev(), metadata.ino()))
+    Ok(DirectoryIdentityV1 {
+        canonical_path: path.to_string_lossy().into_owned(),
+        dev: Some(metadata.dev()),
+        ino: Some(metadata.ino()),
+        btime: BirthTimeV1::from_metadata(&metadata),
+    })
 }
 
 #[cfg(not(unix))]
-pub fn directory_dev_ino(path: &Path) -> Result<(u64, u64), String> {
+fn observed_directory_identity(path: &Path) -> Result<DirectoryIdentityV1, String> {
     Err(format!(
         "{}: filesystem identity (dev/ino) is unavailable on this platform, so a directory swap \
          cannot be detected",
         path.display()
     ))
+}
+
+/// `(dev, ino)` of a real directory at `path`. A symlink or a non-directory is an error, never a
+/// silently-followed success.
+pub fn directory_dev_ino(path: &Path) -> Result<(u64, u64), String> {
+    let identity = observed_directory_identity(path)?;
+    match (identity.dev, identity.ino) {
+        (Some(dev), Some(ino)) => Ok((dev, ino)),
+        _ => Err(format!(
+            "{}: filesystem identity (dev/ino) is unavailable on this platform, so a directory \
+             swap cannot be detected",
+            path.display()
+        )),
+    }
 }
 
 /// Re-verify that a pinned root's PATH still resolves to the descriptor that was pinned. This is
@@ -1347,12 +1368,13 @@ pub enum PayloadIdentityRefusalV1 {
 }
 
 /// A payload directory's identity, re-derived from the filesystem right now: a real directory,
-/// not a symlink, still canonically resolving to itself. Returns its `(dev, ino)` so a later
-/// verify-then-act boundary can prove nothing was exchanged in between.
+/// not a symlink, still canonically resolving to itself. Device, inode, and optional birthtime
+/// come from one metadata probe so a later verify-then-act boundary can prove nothing was
+/// exchanged in between without mixing observations.
 pub fn verify_payload_directory_identity(
     path: &Path,
-) -> Result<(u64, u64), PayloadIdentityRefusalV1> {
-    let identity = match directory_dev_ino(path) {
+) -> Result<DirectoryIdentityV1, PayloadIdentityRefusalV1> {
+    let identity = match observed_directory_identity(path) {
         Ok(identity) => identity,
         Err(detail) => {
             if std::fs::symlink_metadata(path)
@@ -1422,9 +1444,11 @@ pub enum VerifiedRemovalV1 {
 /// itself, and the post-act re-verification that decides whether its outcome can be attested.
 ///
 /// The gates a caller ran earlier took time, and time is the whole hazard: `expected_identity`
-/// is the `(dev, ino)` those gates authorized, and this refuses rather than acting if the name
-/// now points at anything else. `act` returns its own failure text unchanged; whether the payload
-/// is actually gone is then read from the filesystem, never inferred from that result.
+/// is the device, inode, and optional birthtime those gates authorized, and this refuses rather
+/// than acting if the name now points at anything else. Birthtime is strengthening-only: two
+/// present values must match, while either missing value preserves the legacy `(dev, ino)`
+/// verdict. `act` returns its own failure text unchanged; whether the payload is actually gone is
+/// then read from the filesystem, never inferred from that result.
 ///
 /// PARKED (S3 dual-review deferral, carried into the R2f1b custody plan §9): the boundary this
 /// function closes is *around* the act, not *inside* it. Both reapers still pass a path-addressed
@@ -1437,31 +1461,105 @@ pub enum VerifiedRemovalV1 {
 pub fn verify_then_remove<F>(
     pin: &PinnedDirectoryV1,
     payload: &Path,
-    expected_identity: (u64, u64),
+    expected_identity: &DirectoryIdentityV1,
     act: F,
 ) -> VerifiedRemovalV1
 where
     F: FnOnce() -> Result<(), String>,
+{
+    verify_then_remove_with_identity_probe(
+        pin,
+        payload,
+        expected_identity,
+        observed_directory_identity,
+        act,
+    )
+}
+
+fn verify_then_remove_with_identity_probe<F, P>(
+    pin: &PinnedDirectoryV1,
+    payload: &Path,
+    expected_identity: &DirectoryIdentityV1,
+    identity_probe: P,
+    act: F,
+) -> VerifiedRemovalV1
+where
+    F: FnOnce() -> Result<(), String>,
+    P: FnOnce(&Path) -> Result<DirectoryIdentityV1, String>,
 {
     if let Err(detail) = pinned_root_unchanged(pin) {
         return VerifiedRemovalV1::Refused(RemovalBoundaryRefusalV1::RootIdentityChanged {
             detail,
         });
     }
-    match directory_dev_ino(payload) {
-        Ok(now) if now == expected_identity => {}
+    match identity_probe(payload) {
+        Ok(now) if expected_identity.matches(&now) => {}
         Ok(now) => {
+            let detail = match (expected_identity.btime, now.btime) {
+                (Some(expected_btime), Some(now_btime)) if expected_btime != now_btime => {
+                    match (
+                        expected_identity.dev,
+                        expected_identity.ino,
+                        now.dev,
+                        now.ino,
+                    ) {
+                        (Some(expected_dev), Some(expected_ino), Some(now_dev), Some(now_ino)) => {
+                            format!(
+                                "{} changed identity between the gates and the removal (dev/ino \
+                                 {}/{} to {}/{}; btime {:?} to {:?})",
+                                payload.display(),
+                                expected_dev,
+                                expected_ino,
+                                now_dev,
+                                now_ino,
+                                expected_btime,
+                                now_btime,
+                            )
+                        }
+                        _ => format!(
+                            "{} changed identity between the gates and the removal (dev/ino \
+                             {:?}/{:?} to {:?}/{:?}; btime {:?} to {:?})",
+                            payload.display(),
+                            expected_identity.dev,
+                            expected_identity.ino,
+                            now.dev,
+                            now.ino,
+                            expected_btime,
+                            now_btime,
+                        ),
+                    }
+                }
+                _ => match (
+                    expected_identity.dev,
+                    expected_identity.ino,
+                    now.dev,
+                    now.ino,
+                ) {
+                    (Some(expected_dev), Some(expected_ino), Some(now_dev), Some(now_ino)) => {
+                        format!(
+                            "{} changed identity between the gates and the removal (dev/ino \
+                             {}/{} to {}/{})",
+                            payload.display(),
+                            expected_dev,
+                            expected_ino,
+                            now_dev,
+                            now_ino,
+                        )
+                    }
+                    _ => format!(
+                        "{} changed identity between the gates and the removal (dev/ino \
+                         {:?}/{:?} to {:?}/{:?})",
+                        payload.display(),
+                        expected_identity.dev,
+                        expected_identity.ino,
+                        now.dev,
+                        now.ino,
+                    ),
+                },
+            };
             return VerifiedRemovalV1::Refused(RemovalBoundaryRefusalV1::PayloadIdentityChanged {
-                detail: format!(
-                    "{} changed identity between the gates and the removal (dev/ino {}/{} to \
-                     {}/{})",
-                    payload.display(),
-                    expected_identity.0,
-                    expected_identity.1,
-                    now.0,
-                    now.1
-                ),
-            })
+                detail,
+            });
         }
         Err(detail) => {
             return VerifiedRemovalV1::Refused(RemovalBoundaryRefusalV1::PayloadNotADirectory {
@@ -1976,24 +2074,28 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn publish_refuses_when_the_callers_source_handle_is_stale() {
-        use std::os::unix::fs::MetadataExt as _;
-
         let dir = tempfile::tempdir().unwrap();
         let pinned = PinnedDirectoryV1::open(dir.path(), "stale source").unwrap();
         let source_name = OsStr::new("source.tmp");
         let target_name = OsStr::new("target.final");
         fs::write(dir.path().join(source_name), b"original").unwrap();
         let stale_handle = fs::File::open(dir.path().join(source_name)).unwrap();
-        let stale_ino = stale_handle.metadata().unwrap().ino();
 
-        // Replace the entry at `source_name` with a different file (different inode) while the
-        // caller's handle still points at the original, now-unlinked, inode.
-        fs::remove_file(dir.path().join(source_name)).unwrap();
-        fs::write(dir.path().join(source_name), b"swapped").unwrap();
-        let replacement_ino = fs::metadata(dir.path().join(source_name)).unwrap().ino();
-        assert_ne!(
-            stale_ino, replacement_ino,
-            "test setup must produce a genuinely different inode"
+        // Pre-create the replacement while the original is still live, so the two objects cannot
+        // receive the same inode even on an aggressively recycling filesystem. The replacing
+        // rename then puts that already-distinct object under `source_name`.
+        let replacement_path = dir.path().join("replacement.tmp");
+        fs::write(&replacement_path, b"swapped").unwrap();
+        let replacement_handle = fs::File::open(&replacement_path).unwrap();
+        assert!(
+            !same_regular_file(&stale_handle, &replacement_handle, "stale source setup").unwrap(),
+            "test setup must produce a genuinely different file identity"
+        );
+        fs::rename(&replacement_path, dir.path().join(source_name)).unwrap();
+        let replacement_at_name = fs::File::open(dir.path().join(source_name)).unwrap();
+        assert!(
+            !same_regular_file(&stale_handle, &replacement_at_name, "stale source setup").unwrap(),
+            "precondition: the same-name replacement must not match the retained source"
         );
 
         let error = pinned
@@ -2357,9 +2459,28 @@ mod tests {
         fs::write(dir.path().join(target_name), b"prepared").unwrap();
         fs::write(dir.path().join(source_name), b"mine").unwrap();
         let source_file = fs::File::open(dir.path().join(source_name)).unwrap();
-        // Same name, different inode.
-        fs::remove_file(dir.path().join(source_name)).unwrap();
-        fs::write(dir.path().join(source_name), b"substituted").unwrap();
+
+        // Pre-create the substitute while the caller's source still exists, prove the matcher
+        // sees a different live object, then atomically replace the name with that object.
+        let substitute_path = dir.path().join("substitute.tmp");
+        fs::write(&substitute_path, b"substituted").unwrap();
+        let substitute_file = fs::File::open(&substitute_path).unwrap();
+        assert!(
+            !same_regular_file(&source_file, &substitute_file, "replace substituted setup")
+                .unwrap(),
+            "test setup must produce a genuinely different file identity"
+        );
+        fs::rename(&substitute_path, dir.path().join(source_name)).unwrap();
+        let substitute_at_name = fs::File::open(dir.path().join(source_name)).unwrap();
+        assert!(
+            !same_regular_file(
+                &source_file,
+                &substitute_at_name,
+                "replace substituted setup"
+            )
+            .unwrap(),
+            "precondition: the same-name substitute must not match the retained source"
+        );
 
         let error = pinned
             .replace_regular_child(
@@ -2490,9 +2611,22 @@ mod tests {
         );
         fs::remove_file(dir.path().join(target_name)).unwrap();
 
-        // A same-name substitution at the source is NOT proof that nothing moved.
-        fs::remove_file(dir.path().join(source_name)).unwrap();
-        fs::write(dir.path().join(source_name), b"impostor").unwrap();
+        // A same-name substitution at the source is NOT proof that nothing moved. Pre-create
+        // the impostor while our source is still live, prove the matcher sees distinct objects,
+        // then replace the source name so inode recycling cannot collapse the fixture.
+        let impostor_path = dir.path().join("impostor.tmp");
+        fs::write(&impostor_path, b"impostor").unwrap();
+        let impostor = fs::File::open(&impostor_path).unwrap();
+        assert!(
+            !same_regular_file(&ours, &impostor, "rename effect setup").unwrap(),
+            "test setup must produce a genuinely different file identity"
+        );
+        fs::rename(&impostor_path, dir.path().join(source_name)).unwrap();
+        let impostor_at_name = fs::File::open(dir.path().join(source_name)).unwrap();
+        assert!(
+            !same_regular_file(&ours, &impostor_at_name, "rename effect setup").unwrap(),
+            "precondition: the same-name impostor must not match the retained source"
+        );
         assert_eq!(
             classify_publication_rename_effect(&parent, source_name, &ours, target_name),
             PublicationRenameEffectV1::Unverified
@@ -3291,10 +3425,11 @@ mod tests {
         let real = base.join("real");
         fs::create_dir(&real).unwrap();
         let expected = fs::symlink_metadata(&real).unwrap();
-        assert_eq!(
-            verify_payload_directory_identity(&real).unwrap(),
-            (expected.dev(), expected.ino())
-        );
+        let identity = verify_payload_directory_identity(&real).unwrap();
+        assert_eq!(identity.canonical_path, real.to_string_lossy().into_owned());
+        assert_eq!(identity.dev, Some(expected.dev()));
+        assert_eq!(identity.ino, Some(expected.ino()));
+        assert_eq!(identity.btime, BirthTimeV1::from_metadata(&expected));
 
         let link = base.join("link");
         std::os::unix::fs::symlink(&real, &link).unwrap();
@@ -3360,12 +3495,20 @@ mod tests {
         fs::create_dir(&payload).unwrap();
         let authorized = verify_payload_directory_identity(&payload).unwrap();
 
-        // The gates authorized THAT directory; a different one is now under the same name.
-        fs::remove_dir(&payload).unwrap();
-        fs::create_dir(&payload).unwrap();
+        // Pre-create the replacement while the authorized directory is still live. Two
+        // simultaneous objects cannot share an inode, so the replacing rename makes the
+        // exchange deterministic even on an aggressively recycling filesystem.
+        let replacement = base.join("replacement");
+        fs::create_dir(&replacement).unwrap();
+        fs::rename(&replacement, &payload).unwrap();
+        let observed = verify_payload_directory_identity(&payload).unwrap();
+        assert!(
+            !authorized.matches(&observed),
+            "the strengthening matcher must see the exchanged payload before the boundary runs"
+        );
 
         let mut acts = 0_u32;
-        let verified = verify_then_remove(&pinned, &payload, authorized, || {
+        let verified = verify_then_remove(&pinned, &payload, &authorized, || {
             acts += 1;
             Ok(())
         });
@@ -3380,6 +3523,157 @@ mod tests {
             other => panic!("expected PayloadIdentityChanged, got {other:?}"),
         }
         assert!(payload.exists());
+    }
+
+    /// Pins the recycled-inode bypass directly: device and inode alone still match, but two
+    /// present birthtimes differ. The typed payload-identity refusal must win before the act.
+    #[cfg(unix)]
+    #[test]
+    fn verify_then_remove_refuses_same_dev_ino_with_different_btime_without_acting() {
+        let root = tempfile::tempdir().unwrap();
+        let base = fs::canonicalize(root.path()).unwrap();
+        let pinned = PinnedDirectoryV1::open(&base, "recycled payload identity").unwrap();
+        let payload = base.join("payload");
+        fs::create_dir(&payload).unwrap();
+
+        let legacy = verify_payload_directory_identity(&payload).unwrap();
+        let expected = DirectoryIdentityV1 {
+            btime: Some(BirthTimeV1::new(1_700_000_000, 123).unwrap()),
+            ..legacy.clone()
+        };
+        let observed = DirectoryIdentityV1 {
+            btime: Some(BirthTimeV1::new(1_700_000_000, 124).unwrap()),
+            ..legacy
+        };
+        assert_eq!(
+            (expected.dev, expected.ino),
+            (observed.dev, observed.ino),
+            "the regression must isolate btime from the legacy identity"
+        );
+        assert!(
+            !expected.matches(&observed),
+            "the strengthening matcher must reject the btime divergence"
+        );
+
+        let mut acts = 0_u32;
+        let verified = verify_then_remove_with_identity_probe(
+            &pinned,
+            &payload,
+            &expected,
+            move |_| Ok(observed),
+            || {
+                acts += 1;
+                Ok(())
+            },
+        );
+
+        assert_eq!(acts, 0, "the act must not run after a btime refusal");
+        match verified {
+            VerifiedRemovalV1::Refused(RemovalBoundaryRefusalV1::PayloadIdentityChanged {
+                detail,
+            }) => assert!(
+                detail.contains("btime")
+                    && detail.contains("changed identity between the gates and the removal"),
+                "the typed refusal must name the btime divergence, got {detail}"
+            ),
+            other => panic!("expected PayloadIdentityChanged, got {other:?}"),
+        }
+    }
+
+    /// Birthtime is strengthening-only at the destructive boundary itself: either missing side
+    /// must preserve the legacy matching `(dev, ino)` verdict and let the act run exactly once.
+    #[cfg(unix)]
+    #[test]
+    fn verify_then_remove_falls_back_to_dev_ino_when_either_btime_is_missing() {
+        let root = tempfile::tempdir().unwrap();
+        let base = fs::canonicalize(root.path()).unwrap();
+        let pinned = PinnedDirectoryV1::open(&base, "legacy payload identity").unwrap();
+        let payload = base.join("payload");
+        fs::create_dir(&payload).unwrap();
+
+        let legacy = DirectoryIdentityV1 {
+            btime: None,
+            ..verify_payload_directory_identity(&payload).unwrap()
+        };
+        let refined = DirectoryIdentityV1 {
+            btime: Some(BirthTimeV1::new(1_700_000_000, 123).unwrap()),
+            ..legacy.clone()
+        };
+
+        for (expected, observed, missing_side) in [
+            (legacy.clone(), refined.clone(), "expected"),
+            (refined, legacy, "observed"),
+        ] {
+            let mut acts = 0_u32;
+            let verified = verify_then_remove_with_identity_probe(
+                &pinned,
+                &payload,
+                &expected,
+                move |_| Ok(observed),
+                || {
+                    acts += 1;
+                    Ok(())
+                },
+            );
+            assert_eq!(
+                acts, 1,
+                "{missing_side}-btime fallback must preserve the legacy act"
+            );
+            assert!(matches!(
+                verified,
+                VerifiedRemovalV1::Acted {
+                    observation: RemovalObservationV1::ReportedSuccessButPresent { .. },
+                    root_changed_during: None,
+                }
+            ));
+        }
+    }
+
+    /// The strengthening must not perturb the legacy no-birthtime refusal text: downstream
+    /// reports retain these bytes when `(dev, ino)` changes and neither side carries btime.
+    #[cfg(unix)]
+    #[test]
+    fn verify_then_remove_preserves_legacy_mismatch_detail_without_btime() {
+        let root = tempfile::tempdir().unwrap();
+        let base = fs::canonicalize(root.path()).unwrap();
+        let pinned = PinnedDirectoryV1::open(&base, "legacy mismatch bytes").unwrap();
+        let payload = base.join("payload");
+        fs::create_dir(&payload).unwrap();
+
+        let expected = DirectoryIdentityV1 {
+            btime: None,
+            ..verify_payload_directory_identity(&payload).unwrap()
+        };
+        let mut observed = expected.clone();
+        observed.ino = expected.ino.map(|ino| ino.wrapping_add(1));
+        assert!(!expected.matches(&observed));
+
+        let mut acts = 0_u32;
+        let verified = verify_then_remove_with_identity_probe(
+            &pinned,
+            &payload,
+            &expected,
+            move |_| Ok(observed),
+            || {
+                acts += 1;
+                Ok(())
+            },
+        );
+
+        assert_eq!(acts, 0, "the act must not run after the legacy mismatch");
+        assert_eq!(
+            verified,
+            VerifiedRemovalV1::Refused(RemovalBoundaryRefusalV1::PayloadIdentityChanged {
+                detail: format!(
+                    "{} changed identity between the gates and the removal (dev/ino {}/{} to {}/{})",
+                    payload.display(),
+                    expected.dev.unwrap(),
+                    expected.ino.unwrap(),
+                    expected.dev.unwrap(),
+                    expected.ino.unwrap().wrapping_add(1),
+                ),
+            })
+        );
     }
 
     /// Discriminates a `verify_then_remove` that skips the pre-act pinned-root recheck, or that
@@ -3407,7 +3701,7 @@ mod tests {
         assert!(!payload.exists());
 
         let mut acts = 0_u32;
-        let verified = verify_then_remove(&pinned, &payload, authorized, || {
+        let verified = verify_then_remove(&pinned, &payload, &authorized, || {
             acts += 1;
             Ok(())
         });
@@ -3451,7 +3745,7 @@ mod tests {
             }
 
             let mut acts = 0_u32;
-            let verified = verify_then_remove(&pinned, &payload, authorized, || {
+            let verified = verify_then_remove(&pinned, &payload, &authorized, || {
                 acts += 1;
                 Ok(())
             });
@@ -3493,7 +3787,7 @@ mod tests {
             fs::create_dir(&payload).unwrap();
             let authorized = verify_payload_directory_identity(&payload).unwrap();
             let mut acts = 0_u32;
-            let verified = verify_then_remove(&pinned, &payload, authorized, || {
+            let verified = verify_then_remove(&pinned, &payload, &authorized, || {
                 acts += 1;
                 if actually_remove {
                     fs::remove_dir_all(&payload).unwrap();
@@ -3549,7 +3843,7 @@ mod tests {
         let pinned = PinnedDirectoryV1::open(&root, "root moved mid-act").unwrap();
         let authorized = verify_payload_directory_identity(&payload).unwrap();
 
-        let verified = verify_then_remove(&pinned, &payload, authorized, || {
+        let verified = verify_then_remove(&pinned, &payload, &authorized, || {
             fs::remove_dir_all(&payload).unwrap();
             let replacement = outer.join("replacement");
             fs::create_dir(&replacement).unwrap();
