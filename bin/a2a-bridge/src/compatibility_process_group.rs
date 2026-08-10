@@ -595,9 +595,17 @@ impl Drop for AnchoredProcessGroup {
             // SAFETY: the exact anchor Child has not been waited/reaped, so the PGID cannot have been
             // recycled. This is the resolver's synchronous cancellation fail-safe; the scheduler uses
             // ReleaseOnly and recovery holds.
-            unsafe {
-                libc::kill(-self.process_group, libc::SIGKILL);
-            }
+            let return_code = unsafe { libc::kill(-self.process_group, libc::SIGKILL) };
+            let errno = (return_code == -1)
+                .then(|| std::io::Error::last_os_error().raw_os_error())
+                .flatten();
+            tracing::debug!(
+                process_group = self.process_group,
+                signal = libc::SIGKILL,
+                return_code,
+                errno = ?errno,
+                "compatibility anchor drop signal observed"
+            );
         }
         self.anchor_stdin.take();
         if let Some(anchor) = &mut self.anchor {

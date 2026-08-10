@@ -1,7 +1,7 @@
 // e2e_kiro.rs — Gated real-Kiro end-to-end smoke test (spec S1, Task 17).
 //
 // This test stands up the REAL pipeline against a live `kiro-cli acp` process:
-//   Supervised::spawn("kiro-cli", ["acp"])
+//   OwnedProcessTreeV1::spawn("kiro-cli", ["acp"])
 //     -> AcpBackend::from_child
 //     -> InboundServer (AlwaysGrant, AutoPolicy, inline RouteDecision -> "kiro")
 //     -> axum server on an ephemeral TCP port
@@ -26,7 +26,7 @@ use bridge_core::domain::{RouteTarget, TaskMeta};
 use bridge_core::error::BridgeError;
 use bridge_core::ids::AgentId;
 use bridge_core::ports::RouteDecision;
-use bridge_core::process::Supervised;
+use bridge_core::process::OwnedProcessTreeV1;
 use bridge_policy::auth::AlwaysGrant;
 use bridge_policy::permission::AutoPolicy;
 use bridge_store::sqlite::SqliteStore;
@@ -52,7 +52,7 @@ impl RouteDecision for E2eKiroRoute {
 #[tokio::test]
 async fn real_kiro_round_trip_returns_pong() {
     // 1. Spawn the real kiro-cli agent child process.
-    let supervised = Supervised::spawn("kiro-cli", &["acp"], None)
+    let supervised = OwnedProcessTreeV1::spawn("kiro-cli", &["acp"], None)
         .expect("kiro-cli must be on PATH and executable; run `kiro-cli whoami` first");
 
     let acp_config = AcpConfig {

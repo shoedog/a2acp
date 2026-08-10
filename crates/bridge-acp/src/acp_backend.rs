@@ -64,8 +64,8 @@ use bridge_core::domain::{
     SessionSpec,
 };
 use bridge_core::error::BridgeError;
-use bridge_core::execution_policy::{BoundMcpDeliveryPayloadV1, BoundSessionSpecV1};
-use bridge_core::ids::SessionId;
+use bridge_core::execution_policy::{BoundMcpDeliveryPayloadV1, BoundSessionSpecV1, Sha256HexV1};
+use bridge_core::ids::{NodeId, SessionId};
 use bridge_core::mcp::McpServerSpec;
 use bridge_core::orch::{
     AgentSessionCaps, ContentSummary, OrchEventKind, PlanEntry as BridgePlanEntry, ReconcileOutcome,
@@ -78,9 +78,12 @@ use bridge_core::ports::{
     AgentBackend, BackendObservers, BackendStream, DiagnosticObserver, PolicyEngine, PolicyOutcome,
     RichEventSink, Update, STOP_REASON_CANCELLED,
 };
+use bridge_core::resource_flight::{ResourceActionDispositionV1, ResourceActionResultV1};
+use bridge_core::retained_resource_flight::ResourceFlightOwnerV1;
 
 use bridge_core::process::{
-    ProcessStderrCursor, ProcessStderrRing, ProcessStderrSnapshot, Supervised,
+    DurableProcessFlightAttemptV3, DurableProcessFlightV3, OwnedProcessTreeV1, ProcessStderrCursor,
+    ProcessStderrRing, ProcessStderrSnapshot,
 };
 use bridge_core::provider::{classify_acp_error_data, ProviderEvidence};
 use bridge_core::reaper::{
@@ -104,7 +107,7 @@ const DEFAULT_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from
 /// the per-session turn lock — and hang the caller's stream — forever.
 const DEFAULT_CANCEL_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// Grace handed to `Supervised::terminate` between SIGTERM and the SIGKILL
+/// Grace handed to `OwnedProcessTreeV1::terminate` between SIGTERM and the SIGKILL
 /// escalation when we nuke the agent process on a cancel/drop timeout.
 const TERMINATE_GRACE: std::time::Duration = std::time::Duration::from_millis(500);
 const CONTAINER_START_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
@@ -839,11 +842,32 @@ enum AcpTraceEvent {
     /// An attested-prefix control frame arrived after its turn's drain barrier
     /// (route already unregistered) and was dropped as post-terminal.
     PostTerminalControlFrameDropped,
+    ProcessFlightEscalationSettled,
+    ProcessFlightEscalationRefused,
+    ProcessFlightUnpublishedAsyncRefused,
+    ProcessFlightUnpublishedBlockingRefused,
+    ProcessFlightBackendDropRefused,
+    ProcessFlightOwnerAttachFailed {
+        owner_key_fingerprint: i64,
+        supervised_lock_poisoned: bool,
+    },
+    ProcessFlightOwnerDetachFailed {
+        owner_key_fingerprint: i64,
+        supervised_lock_poisoned: bool,
+    },
 }
 
 impl AcpTraceEvent {
     fn bounded_count(count: usize) -> u16 {
         u16::try_from(count).unwrap_or(u16::MAX)
+    }
+
+    /// Correlate an owner-failure trace with its actual journal owner without
+    /// admitting the unbounded, caller-controlled session text into tracing.
+    fn owner_key_fingerprint(owner_key: &str) -> i64 {
+        let digest = Sha256HexV1::digest(owner_key.as_bytes());
+        let prefix = &digest.as_str()[..16];
+        u64::from_str_radix(prefix, 16).expect("SHA-256 prefix is hexadecimal") as i64
     }
 
     fn emit(self) {
@@ -928,7 +952,80 @@ impl AcpTraceEvent {
                 event = "acp.post_terminal_control_frame_dropped",
                 "ACP lifecycle metadata"
             ),
+            Self::ProcessFlightEscalationSettled => tracing::debug!(
+                event = "acp.process_flight_escalation_settled",
+                "ACP lifecycle metadata"
+            ),
+            Self::ProcessFlightEscalationRefused => tracing::error!(
+                event = "acp.process_flight_escalation_refused",
+                "ACP lifecycle metadata"
+            ),
+            Self::ProcessFlightUnpublishedAsyncRefused => tracing::error!(
+                event = "acp.process_flight_unpublished_async_refused",
+                "ACP lifecycle metadata"
+            ),
+            Self::ProcessFlightUnpublishedBlockingRefused => tracing::error!(
+                event = "acp.process_flight_unpublished_blocking_refused",
+                "ACP lifecycle metadata"
+            ),
+            Self::ProcessFlightBackendDropRefused => tracing::error!(
+                event = "acp.process_flight_backend_drop_refused",
+                "ACP lifecycle metadata"
+            ),
+            Self::ProcessFlightOwnerAttachFailed {
+                owner_key_fingerprint,
+                supervised_lock_poisoned,
+            } => tracing::error!(
+                event = "acp.process_flight_owner_attach_failed",
+                owner_key_fingerprint,
+                supervised_lock_poisoned,
+                "ACP lifecycle metadata"
+            ),
+            Self::ProcessFlightOwnerDetachFailed {
+                owner_key_fingerprint,
+                supervised_lock_poisoned,
+            } => tracing::error!(
+                event = "acp.process_flight_owner_detach_failed",
+                owner_key_fingerprint,
+                supervised_lock_poisoned,
+                "ACP lifecycle metadata"
+            ),
         }
+    }
+}
+
+/// Attempt-owned production route for one protected ACP process generation.
+///
+/// Cloning this route preserves the exact attempt object, and therefore its one
+/// registry and durable journal, while allowing constructor-specific config clones.
+#[derive(Clone)]
+pub struct AcpProcessFlightRouteV3 {
+    attempt: Arc<DurableProcessFlightAttemptV3>,
+    generation: String,
+    owner: ResourceFlightOwnerV1,
+}
+
+impl AcpProcessFlightRouteV3 {
+    /// Bind one ACP process generation to the attempt-scoped durable registry
+    /// and journal created by `AutomaticR2f1b` admission.
+    #[must_use]
+    pub fn new(
+        attempt: Arc<DurableProcessFlightAttemptV3>,
+        generation: impl Into<String>,
+        owner: ResourceFlightOwnerV1,
+    ) -> Self {
+        Self {
+            attempt,
+            generation: generation.into(),
+            owner,
+        }
+    }
+}
+
+impl std::fmt::Debug for AcpProcessFlightRouteV3 {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AcpProcessFlightRouteV3")
+            .finish_non_exhaustive()
     }
 }
 
@@ -982,6 +1079,9 @@ pub struct AcpConfig {
     pub child_env_remove: Vec<String>,
     /// Optional per-turn watchdog. `None` disables watchdog behavior.
     pub watchdog: Option<bridge_core::domain::WatchdogConfig>,
+    /// Attempt-owned protected process route. Slice 4 supplies this only after
+    /// `AutomaticR2f1b` admission succeeds; `None` preserves V2 behavior.
+    pub process_flight_route_v3: Option<AcpProcessFlightRouteV3>,
     /// Exact credential values the bridge already possesses and must remove
     /// from lifecycle causes and process stderr before either is retained.
     /// `Debug` reports only a count; values are never rendered.
@@ -1065,6 +1165,7 @@ impl Default for AcpConfig {
             mcp: Vec::new(),
             child_env_remove: Vec::new(),
             watchdog: None,
+            process_flight_route_v3: None,
             diagnostic_redactor: DiagnosticRedactor::default(),
             prefix_attestation_transport: PrefixAttestationTransport::Unsupported,
         }
@@ -1806,7 +1907,7 @@ struct AgentSession {
     /// drop-path) can notify it to abandon its `send_request` await — surfacing a
     /// terminal `Err`, releasing the lock, and ending the caller's stream even if
     /// the agent never answers. `None` between turns. (Alongside this we also
-    /// `terminate()` a real `Supervised` child so a runaway agent PROCESS is
+    /// `terminate()` a real `OwnedProcessTreeV1` child so a runaway agent PROCESS is
     /// actually killed; the kill switch is what makes the in-process transport —
     /// which has no process to kill — unblock deterministically too.)
     turn_kill: Arc<StdMutex<Option<Arc<tokio::sync::Notify>>>>,
@@ -1963,19 +2064,16 @@ pub struct AcpBackend {
     /// connection); `Option` only so the `cx()`/`updates()` accessors have a
     /// clean error seam if a future constructor ever leaves it unset.
     conn: Option<AcpConn>,
-    /// The spawned `Supervised` child, held for the whole backend lifetime so
-    /// `kill_on_drop(true)` does not SIGKILL it the instant `spawn` returns.
+    /// The spawned `OwnedProcessTreeV1` capability, held for the backend lifetime so
+    /// ordinary drop reaches the process flight instead of a raw child backstop.
     /// `Some` on the `spawn`/`from_child` paths (we own the child); `None` on
     /// `connect` (in-process transport).
     ///
-    /// Behind an `Arc<StdMutex<Option<_>>>` because the cancel grace-watcher and
-    /// the driver's early-drop path escalate by TAKING the child out and
-    /// `terminate()`-ing it — and `terminate(self, _)` consumes `Supervised`,
-    /// which a `&self` method cannot move out of a plain field. The shared,
-    /// take-once handle lets either escalation path claim the child exactly once
-    /// (the loser sees `None`), and the backend still drops it on `Drop` if no
-    /// escalation ever fired.
-    supervised: Arc<StdMutex<Option<Supervised>>>,
+    /// Behind an `Arc<StdMutex<Option<_>>>` so cancel, driver escalation,
+    /// registry retirement, and backend drop all clone the same live capability.
+    /// The retained flight elects one signal driver; every other adapter path joins
+    /// the shared result instead of treating a taken `None` as successful teardown.
+    supervised: Arc<StdMutex<Option<OwnedProcessTreeV1>>>,
     /// Process-scoped stderr evidence retained independently from the child
     /// owner so prompt attempts can snapshot a cursor without retaining the
     /// operation observer on the cached backend.
@@ -2050,6 +2148,10 @@ pub struct AcpBackend {
     fail_deferred_cancel_send: Arc<AtomicBool>,
     #[cfg(test)]
     fail_cancel_send: Arc<AtomicBool>,
+    #[cfg(test)]
+    fail_process_owner_attach: Arc<AtomicBool>,
+    #[cfg(test)]
+    fail_process_owner_detach: Arc<AtomicBool>,
 }
 
 /// Shared, swappable handle to the active [`PolicyEngine`]. See [`AcpBackend::policy`].
@@ -2061,7 +2163,7 @@ type PermissionRegistryHandle = Arc<StdMutex<Option<Arc<PermissionRegistry>>>>;
 /// a positively observed pre-start object can become a typed container-runtime failure.
 async fn await_container_start(
     controller: Option<&ReapController>,
-    supervised: &mut Supervised,
+    supervised: &mut OwnedProcessTreeV1,
     deadline: tokio::time::Instant,
 ) -> Result<(), ContainerStartFailure> {
     let Some(controller) = controller.filter(|controller| controller.has_start_probe()) else {
@@ -2114,6 +2216,55 @@ async fn await_container_start(
     }
 }
 
+fn process_action_failed<E>(result: &Result<ResourceActionResultV1, E>) -> bool {
+    match result {
+        Err(_) => true,
+        Ok(result) => !matches!(
+            result.disposition,
+            ResourceActionDispositionV1::Complete | ResourceActionDispositionV1::NotNeeded
+        ),
+    }
+}
+
+fn optional_process_action_failed<E>(result: &Result<Option<ResourceActionResultV1>, E>) -> bool {
+    match result {
+        Err(_) => true,
+        Ok(Some(result)) => !matches!(
+            result.disposition,
+            ResourceActionDispositionV1::Complete | ResourceActionDispositionV1::NotNeeded
+        ),
+        Ok(None) => false,
+    }
+}
+
+fn record_unpublished_blocking_process_action<E>(
+    result: &Result<ResourceActionResultV1, E>,
+) -> bool {
+    let failed = process_action_failed(result);
+    if failed {
+        AcpTraceEvent::ProcessFlightUnpublishedBlockingRefused.emit();
+    }
+    failed
+}
+
+fn record_unpublished_async_process_action<E>(result: &Result<ResourceActionResultV1, E>) -> bool {
+    let failed = process_action_failed(result);
+    if failed {
+        AcpTraceEvent::ProcessFlightUnpublishedAsyncRefused.emit();
+    }
+    failed
+}
+
+fn record_backend_final_drop_process_action<E>(
+    result: &Result<Option<ResourceActionResultV1>, E>,
+) -> bool {
+    let failed = optional_process_action_failed(result);
+    if failed {
+        AcpTraceEvent::ProcessFlightBackendDropRefused.emit();
+    }
+    failed
+}
+
 /// One runtime-independent cleanup flight. The thread owns both resources; this handle remains in the
 /// initializer across its async wait, so cancellation or runtime shutdown joins the same flight in Drop.
 struct UnpublishedContainerCleanup {
@@ -2122,12 +2273,16 @@ struct UnpublishedContainerCleanup {
 }
 
 impl UnpublishedContainerCleanup {
-    fn start(supervised: Supervised, controller: ReapController) -> Result<Self, ReapFailure> {
+    fn start(
+        supervised: OwnedProcessTreeV1,
+        controller: ReapController,
+    ) -> Result<Self, ReapFailure> {
         let (settled_tx, settled) = tokio::sync::oneshot::channel();
         let worker = std::thread::Builder::new()
             .name("a2a-unpublished-container-cleanup".to_owned())
             .spawn(move || {
-                supervised.terminate_blocking(TERMINATE_GRACE);
+                let termination = supervised.terminate_blocking(TERMINATE_GRACE);
+                record_unpublished_blocking_process_action(&termination);
                 let result = match tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build()
@@ -2182,25 +2337,25 @@ impl Drop for UnpublishedContainerCleanup {
 /// succeeds until a backend receives that process. Dropping any cancellable pre-publication await starts
 /// the same ordered cleanup flight; ordinary errors join it and successful publication disarms it.
 struct UnpublishedContainerSpawn {
-    supervised: Option<Supervised>,
+    supervised: Option<OwnedProcessTreeV1>,
     controller: Option<ReapController>,
 }
 
 impl UnpublishedContainerSpawn {
-    fn new(supervised: Supervised, controller: Option<ReapController>) -> Self {
+    fn new(supervised: OwnedProcessTreeV1, controller: Option<ReapController>) -> Self {
         Self {
             supervised: Some(supervised),
             controller,
         }
     }
 
-    fn supervised_mut(&mut self) -> &mut Supervised {
+    fn supervised_mut(&mut self) -> &mut OwnedProcessTreeV1 {
         self.supervised
             .as_mut()
             .expect("unpublished supervised process must remain owned")
     }
 
-    fn publish(mut self) -> Supervised {
+    fn publish(mut self) -> OwnedProcessTreeV1 {
         self.controller = None;
         self.supervised
             .take()
@@ -2215,13 +2370,24 @@ impl UnpublishedContainerSpawn {
             .take()
             .expect("failed supervised process must remain owned");
         let Some(controller) = self.controller.take() else {
-            drop(supervised);
+            if supervised.is_legacy_v2() {
+                drop(supervised);
+            } else {
+                let termination = supervised.terminate(TERMINATE_GRACE).await;
+                record_unpublished_async_process_action(&termination);
+            }
             return None;
         };
         if !controller.has_start_probe() {
             // Public legacy `ReapFn` controllers remain fire-and-forget. Bridge-owned production
-            // controllers carry the active probe and therefore use the ordered, joinable path below.
-            drop(supervised);
+            // controllers carry the active probe and therefore use the ordered, joinable container
+            // path below. Process cleanup is flight-joined in both cases.
+            if supervised.is_legacy_v2() {
+                drop(supervised);
+            } else {
+                let termination = supervised.terminate(TERMINATE_GRACE).await;
+                record_unpublished_async_process_action(&termination);
+            }
             controller.reap_detached();
             return None;
         }
@@ -2238,11 +2404,21 @@ impl Drop for UnpublishedContainerSpawn {
             return;
         };
         let Some(controller) = self.controller.take() else {
-            drop(supervised);
+            if supervised.is_legacy_v2() {
+                drop(supervised);
+            } else {
+                let termination = supervised.terminate_blocking(TERMINATE_GRACE);
+                record_unpublished_blocking_process_action(&termination);
+            }
             return;
         };
         if !controller.has_start_probe() {
-            drop(supervised);
+            if supervised.is_legacy_v2() {
+                drop(supervised);
+            } else {
+                let termination = supervised.terminate_blocking(TERMINATE_GRACE);
+                record_unpublished_blocking_process_action(&termination);
+            }
             controller.reap_detached();
             return;
         }
@@ -3036,18 +3212,75 @@ impl AcpBackend {
             .map(|level| (*level).to_string())
     }
 
-    /// **Production** constructor: spawn `cmd args` as a `Supervised` child
+    /// **Production** constructor: spawn `cmd args` as a `OwnedProcessTreeV1` child
     /// (its own process group, tested SIGTERM→SIGKILL reaping) and drive the
     /// ACP connection over its stdin/stdout with raw-frame uniqueness validation.
     ///
-    /// This is `Supervised` + `connect(Lines)`: process lifecycle stays
-    /// with `Supervised`; protocol drive is the shared `connect` core.
+    /// This is `OwnedProcessTreeV1` + `connect(Lines)`: process lifecycle stays
+    /// with `OwnedProcessTreeV1`; protocol drive is the shared `connect` core.
     pub async fn spawn(cmd: &str, args: &[&str], config: AcpConfig) -> Result<Self, BridgeError> {
+        if let Some(route) = config.process_flight_route_v3.clone() {
+            return Self::spawn_with_durable_process_flight_attempt_v3(
+                cmd,
+                args,
+                config,
+                route.attempt.as_ref(),
+                route.generation,
+                route.owner,
+            )
+            .await;
+        }
         Self::spawn_observed(
             cmd,
             args,
             config,
             Arc::new(bridge_core::diagnostics::NoopDiagnosticObserver::default()),
+        )
+        .await
+    }
+
+    /// Nearest in-scope production attempt route for V3. The upstream
+    /// `AutomaticR2f1b` admission consumer remains deliberately unreachable
+    /// until slice 4; once armed, it must create one `attempt` value and reuse
+    /// it for every generation in that attempt. This method binds one exact
+    /// generation flight from that route and hands the same value to the
+    /// flight-owning spawn constructor below.
+    pub async fn spawn_with_durable_process_flight_attempt_v3(
+        cmd: &str,
+        args: &[&str],
+        config: AcpConfig,
+        attempt: &DurableProcessFlightAttemptV3,
+        generation: String,
+        owner: ResourceFlightOwnerV1,
+    ) -> Result<Self, BridgeError> {
+        let process_flight = attempt
+            .bind_generation(generation, owner)
+            .map_err(|error| {
+                BridgeError::agent_crashed(format!(
+                    "ACP durable process-flight binding failed: {error}"
+                ))
+            })?;
+        Self::spawn_with_durable_process_flight_v3(cmd, args, config, process_flight).await
+    }
+
+    /// Production V3 constructor. The caller supplies the attempt-owned
+    /// registry and durable file journal through `process_flight`; ACP owns and
+    /// joins that exact process capability after spawn.
+    pub async fn spawn_with_durable_process_flight_v3(
+        cmd: &str,
+        args: &[&str],
+        config: AcpConfig,
+        process_flight: DurableProcessFlightV3,
+    ) -> Result<Self, BridgeError> {
+        Self::spawn_observed_with_process_flight(
+            cmd,
+            args,
+            config,
+            Arc::new(bridge_core::diagnostics::NoopDiagnosticObserver::default()),
+            None,
+            None,
+            false,
+            Some(process_flight),
         )
         .await
     }
@@ -3096,6 +3329,44 @@ impl AcpBackend {
         pinned_cwd_fd: Option<std::os::fd::RawFd>,
         retain_pinned_cwd_fd_after_exec: bool,
     ) -> Result<Self, BridgeError> {
+        let process_flight = config
+            .process_flight_route_v3
+            .as_ref()
+            .map(|route| {
+                route
+                    .attempt
+                    .bind_generation(route.generation.clone(), route.owner.clone())
+                    .map_err(|error| {
+                        BridgeError::agent_crashed(format!(
+                            "ACP durable process-flight binding failed: {error}"
+                        ))
+                    })
+            })
+            .transpose()?;
+        Self::spawn_observed_with_process_flight(
+            cmd,
+            args,
+            config,
+            observer,
+            container_controller,
+            pinned_cwd_fd,
+            retain_pinned_cwd_fd_after_exec,
+            process_flight,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn spawn_observed_with_process_flight(
+        cmd: &str,
+        args: &[&str],
+        config: AcpConfig,
+        observer: Arc<dyn DiagnosticObserver>,
+        container_controller: Option<ReapController>,
+        pinned_cwd_fd: Option<std::os::fd::RawFd>,
+        retain_pinned_cwd_fd_after_exec: bool,
+        process_flight: Option<DurableProcessFlightV3>,
+    ) -> Result<Self, BridgeError> {
         let redactor = config.diagnostic_redactor.clone();
         let lifecycle = AcpLifecycle::new(observer.clone(), redactor.clone(), None);
         lifecycle
@@ -3116,15 +3387,29 @@ impl AcpBackend {
                 .as_ref()
                 .map(ContainerReap::legacy_controller)
         });
-        let supervised = match Supervised::spawn_with_stderr_redactor_pinned_cwd_and_env_removals(
-            cmd,
-            args,
-            None,
-            redactor.clone(),
-            pinned_cwd_fd,
-            retain_pinned_cwd_fd_after_exec,
-            &config.child_env_remove,
-        ) {
+        let process = if let Some(process_flight) = process_flight {
+            OwnedProcessTreeV1::spawn_with_durable_flight_v3(
+                cmd,
+                args,
+                None,
+                redactor.clone(),
+                pinned_cwd_fd,
+                retain_pinned_cwd_fd_after_exec,
+                &config.child_env_remove,
+                process_flight,
+            )
+        } else {
+            OwnedProcessTreeV1::spawn_with_stderr_redactor_pinned_cwd_and_env_removals(
+                cmd,
+                args,
+                None,
+                redactor.clone(),
+                pinned_cwd_fd,
+                retain_pinned_cwd_fd_after_exec,
+                &config.child_env_remove,
+            )
+        };
+        let supervised = match process {
             Ok(supervised) => supervised,
             Err(error) => {
                 return Err(lifecycle
@@ -3159,8 +3444,11 @@ impl AcpBackend {
         // Everything after the local child starts: any error leaves no backend owner, so the outer
         // path terminates that exact client and joins its exact named-container reap before returning.
         let result: Result<Self, SpawnObservedFailure> = async {
-            let child = unpublished.supervised_mut().child_mut();
-            let stdin = match child.stdin.take() {
+            let (stdin, stdout) = {
+                let mut child = unpublished.supervised_mut().child_mut();
+                (child.stdin.take(), child.stdout.take())
+            };
+            let stdin = match stdin {
                 Some(stdin) => stdin,
                 None => {
                     return Err(SpawnObservedFailure::Bridge(
@@ -3182,7 +3470,7 @@ impl AcpBackend {
                     ))
                 }
             };
-            let stdout = match child.stdout.take() {
+            let stdout = match stdout {
                 Some(stdout) => stdout,
                 None => {
                     return Err(SpawnObservedFailure::Bridge(
@@ -3897,6 +4185,10 @@ impl AcpBackend {
             fail_deferred_cancel_send: Arc::new(AtomicBool::new(false)),
             #[cfg(test)]
             fail_cancel_send: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
+            fail_process_owner_attach: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
+            fail_process_owner_detach: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -4270,6 +4562,103 @@ impl AcpBackend {
             .remove(session)
     }
 
+    fn process_flight_owner(session: &SessionId) -> Option<ResourceFlightOwnerV1> {
+        ResourceFlightOwnerV1::new(
+            NodeId::parse("acp-session-owner").ok()?,
+            session.as_str().to_owned(),
+        )
+        .ok()
+    }
+
+    /// Attach is an admission gate: a session whose owner cannot be durably
+    /// registered never becomes active, preserving the escalation owner census.
+    fn attach_process_flight_owner(&self, session: &SessionId) -> Result<(), BridgeError> {
+        let owner_key_fingerprint = AcpTraceEvent::owner_key_fingerprint(session.as_str());
+        let owner = Self::process_flight_owner(session).ok_or_else(|| {
+            AcpTraceEvent::ProcessFlightOwnerAttachFailed {
+                owner_key_fingerprint,
+                supervised_lock_poisoned: false,
+            }
+            .emit();
+            BridgeError::agent_crashed("ACP process-flight owner is invalid")
+        })?;
+        #[cfg(test)]
+        if self.fail_process_owner_attach.load(Ordering::SeqCst) {
+            AcpTraceEvent::ProcessFlightOwnerAttachFailed {
+                owner_key_fingerprint,
+                supervised_lock_poisoned: false,
+            }
+            .emit();
+            return Err(BridgeError::agent_crashed(
+                "ACP process-flight owner attachment failed",
+            ));
+        }
+        let supervised = self.supervised.lock().map_err(|_| {
+            AcpTraceEvent::ProcessFlightOwnerAttachFailed {
+                owner_key_fingerprint,
+                supervised_lock_poisoned: true,
+            }
+            .emit();
+            BridgeError::agent_crashed("ACP supervised process lock is poisoned")
+        })?;
+        if let Some(supervised) = supervised.as_ref() {
+            supervised.attach_owner(owner).map_err(|_| {
+                AcpTraceEvent::ProcessFlightOwnerAttachFailed {
+                    owner_key_fingerprint,
+                    supervised_lock_poisoned: false,
+                }
+                .emit();
+                BridgeError::agent_crashed("ACP process-flight owner attachment failed")
+            })?;
+        }
+        Ok(())
+    }
+
+    /// Detach is cleanup, not admission: a failure is returned loudly after the
+    /// caller finishes the rest of session cleanup. A successful transition is
+    /// already durable as the flight's exact `OwnerDetached` journal row.
+    fn detach_process_flight_owner(&self, session: &SessionId) -> Result<(), BridgeError> {
+        let owner_key_fingerprint = AcpTraceEvent::owner_key_fingerprint(session.as_str());
+        let owner = Self::process_flight_owner(session).ok_or_else(|| {
+            AcpTraceEvent::ProcessFlightOwnerDetachFailed {
+                owner_key_fingerprint,
+                supervised_lock_poisoned: false,
+            }
+            .emit();
+            BridgeError::agent_crashed("ACP process-flight owner is invalid")
+        })?;
+        #[cfg(test)]
+        if self.fail_process_owner_detach.load(Ordering::SeqCst) {
+            AcpTraceEvent::ProcessFlightOwnerDetachFailed {
+                owner_key_fingerprint,
+                supervised_lock_poisoned: false,
+            }
+            .emit();
+            return Err(BridgeError::agent_crashed(
+                "ACP process-flight owner detachment failed",
+            ));
+        }
+        let supervised = self.supervised.lock().map_err(|_| {
+            AcpTraceEvent::ProcessFlightOwnerDetachFailed {
+                owner_key_fingerprint,
+                supervised_lock_poisoned: true,
+            }
+            .emit();
+            BridgeError::agent_crashed("ACP supervised process lock is poisoned")
+        })?;
+        if let Some(supervised) = supervised.as_ref() {
+            supervised.detach_owner(&owner).map_err(|_| {
+                AcpTraceEvent::ProcessFlightOwnerDetachFailed {
+                    owner_key_fingerprint,
+                    supervised_lock_poisoned: false,
+                }
+                .emit();
+                BridgeError::agent_crashed("ACP process-flight owner detachment failed")
+            })?;
+        }
+        Ok(())
+    }
+
     /// Look up (or create) the per-bridge-session state for `key`, cloning the
     /// `Arc` out so the map mutex is released before any await. Always returns
     /// the SAME `Arc` for a given key, so the `OnceCell`/turn-lock/latch inside
@@ -4279,14 +4668,17 @@ impl AcpBackend {
     /// async `lock().await` is held only for nanoseconds — there is no deadlock
     /// risk and no chance of holding the map lock across an await. (`try_lock`
     /// would PANIC if two tasks on different runtime threads raced here.)
-    async fn session_entry(&self, key: &SessionId) -> Arc<AgentSession> {
+    async fn session_entry(&self, key: &SessionId) -> Result<Arc<AgentSession>, BridgeError> {
         let mut map = self.sessions.lock().await;
         if let Some(s) = map.get(key) {
-            return Arc::clone(s);
+            return Ok(Arc::clone(s));
         }
+        // Attach before publication. Failure blocks the turn and leaves no map
+        // entry that could later be mistaken for an active, registered owner.
+        self.attach_process_flight_owner(key)?;
         let s = Arc::new(AgentSession::new());
         map.insert(key.clone(), Arc::clone(&s));
-        s
+        Ok(s)
     }
 
     /// Ensure the agent-minted session for bridge key `key` exists, minting it
@@ -4342,7 +4734,7 @@ impl AcpBackend {
             self.diagnostic_redactor_for_cwds(std::slice::from_ref(&snapshot.desired_cwd)),
             stderr,
         );
-        let entry = self.session_entry(key).await;
+        let entry = self.session_entry(key).await?;
         // One owned snapshot supplies both mint inputs and the lifecycle redactor.
         // A concurrent `configure_session` replacement affects the next snapshot,
         // never half of this attempt.
@@ -4790,7 +5182,13 @@ impl AcpBackend {
     /// Task 4 builds full `cancel()` completion semantics (waiting for the
     /// prompt result with `stopReason:"cancelled"`) on top of this.
     async fn request_cancel(&self, key: &SessionId) -> Result<CancelDispatch, TeardownFailure> {
-        let entry = self.session_entry(key).await;
+        let entry = self
+            .session_entry(key)
+            .await
+            .map_err(|error| TeardownFailure {
+                error,
+                prompt_may_have_been_accepted: false,
+            })?;
         let cx = self.cx().map_err(|error| TeardownFailure {
             error,
             prompt_may_have_been_accepted: false,
@@ -4823,7 +5221,13 @@ impl AcpBackend {
     async fn cancel_inner(&self, session: &SessionId) -> Result<CancelDispatch, TeardownFailure> {
         let dispatch = self.request_cancel(session).await?;
 
-        let entry = self.session_entry(session).await;
+        let entry = self
+            .session_entry(session)
+            .await
+            .map_err(|error| TeardownFailure {
+                error,
+                prompt_may_have_been_accepted: false,
+            })?;
         let (turn_active, turn_meta) = if let Some(agent_id) = entry.agent_id.get() {
             self.updates()
                 .ok()
@@ -4870,13 +5274,18 @@ impl AcpBackend {
                 {
                     return;
                 }
+                // Notification intentionally follows the awaited escalation. Moving it
+                // earlier could let the awakened owner tear down the runtime and drop this
+                // task before process termination settles, so the reorder is not
+                // cancellation-safe.
                 AcpBackend::escalate_terminate(
                     &supervised,
                     &container,
                     &reaped,
                     &dispatch_gate,
                     &unavailable,
-                );
+                )
+                .await;
                 let kill = kill_slot.lock().ok().and_then(|guard| guard.clone());
                 if let Some(kill) = kill {
                     kill.notify_one();
@@ -4886,7 +5295,7 @@ impl AcpBackend {
         Ok(dispatch)
     }
 
-    /// Construct from an already-spawned `Supervised` child, driving the ACP
+    /// Construct from an already-spawned `OwnedProcessTreeV1` child, driving the ACP
     /// connection over its stdin/stdout via the SDK — a thin shim over `connect`
     /// (same validated line transport + tokio→futures-io compat as `spawn`, but for a child
     /// the caller already spawned). The returned backend owns `supervised` for
@@ -4895,20 +5304,19 @@ impl AcpBackend {
     /// This replaces the v1 hand-rolled JSON-RPC `from_child`; call sites (the
     /// gated e2es, `main`) now `.await` it.
     pub async fn from_child(
-        mut supervised: Supervised,
+        mut supervised: OwnedProcessTreeV1,
         config: AcpConfig,
     ) -> Result<Self, BridgeError> {
         supervised.apply_stderr_redactor(config.diagnostic_redactor.clone());
         let stderr_ring = supervised.stderr_ring();
         let stderr_cursor = stderr_ring.origin();
-        let child = supervised.child_mut();
-        let stdin = child
-            .stdin
-            .take()
+        let (stdin, stdout) = {
+            let mut child = supervised.child_mut();
+            (child.stdin.take(), child.stdout.take())
+        };
+        let stdin = stdin
             .ok_or_else(|| BridgeError::agent_crashed("agent stdin unavailable in from_child"))?;
-        let stdout = child
-            .stdout
-            .take()
+        let stdout = stdout
             .ok_or_else(|| BridgeError::agent_crashed("agent stdout unavailable in from_child"))?;
         let transport = validated_acp_transport(stdin.compat_write(), stdout.compat());
         let mut backend = Self::connect_observed_after(
@@ -4936,7 +5344,7 @@ impl AcpBackend {
     /// nothing from it. The minted session is intentionally NOT registered in `self.sessions` (it
     /// is throwaway), so there is no `forget_session` to call. Teardown is the CALLER's: the host
     /// model-catalog probe ([`crate::catalog_probe`] in the bin) builds a one-shot backend per
-    /// agent and drops it, which SIGKILLs the `Supervised` child (`kill_on_drop`) and reaps any
+    /// agent and drops it, which drives the process flight's V2 final-drop backstop and reaps any
     /// `:ro` container (the [`Drop`] impl). The advertised list is account/adapter-driven and
     /// sandbox-independent, so the probe builds this backend host-side (sandbox stripped).
     pub async fn describe_options(&self, cwd: &std::path::Path) -> Result<AgentCaps, BridgeError> {
@@ -5106,7 +5514,7 @@ impl AcpBackend {
         // must not retain stale per-session routing/config state. The error is
         // still returned to the observed owner instead of being discarded.
         let cancel_result = self.cancel_inner(session).await;
-        {
+        let removed = {
             let mut sessions = self.sessions.lock().await;
             if sessions.contains_key(session) {
                 // ACP has no session-close acknowledgement here. Once bridge
@@ -5119,8 +5527,15 @@ impl AcpBackend {
                     stderr_ring.retain_metadata_only();
                 }
             }
-            sessions.remove(session);
-        }
+            sessions.remove(session).is_some()
+        };
+        let owner_detach_result = if removed {
+            // Ordinary release changes owner membership only. Destructive
+            // retirement remains a separate, flight-joined adapter action.
+            self.detach_process_flight_owner(session)
+        } else {
+            Ok(())
+        };
         self.session_catalogs
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -5132,12 +5547,19 @@ impl AcpBackend {
             .lock()
             .expect("pending_turn_meta lock")
             .remove(session);
-        cancel_result.map(|_| ())
+        match (cancel_result, owner_detach_result) {
+            (Err(failure), _) => Err(failure),
+            (Ok(_), Err(error)) => Err(TeardownFailure {
+                error,
+                prompt_may_have_been_accepted: false,
+            }),
+            (Ok(_), Ok(())) => Ok(()),
+        }
     }
 
     /// Last-resort escalation when a cancelled turn does not complete within the
-    /// grace window: TAKE the supervised child (exactly once — a concurrent
-    /// escalator sees `None`) and SIGTERM→SIGKILL the whole agent PROCESS.
+    /// grace window: clone the process capability and join its single retained
+    /// SIGTERM→SIGKILL flight for the whole agent process.
     ///
     /// NOTE this NUKES THE ENTIRE AGENT CONNECTION, not just the one turn: this
     /// backend multiplexes all bridge sessions over a single agent process, so
@@ -5148,8 +5570,7 @@ impl AcpBackend {
     ///
     /// On the in-process `connect` test path `supervised` is `None`, so this is a
     /// no-op there (closing the duplex channel is the test's own concern).
-    /// `terminate(self, _)` is async + consumes the child, so we run it on a
-    /// detached task and return immediately.
+    /// The caller awaits this method until the shared flight settles or refuses.
     fn close_connection_fence(dispatch_gate: &Arc<StdMutex<()>>, unavailable: &Arc<AtomicBool>) {
         let _dispatch = dispatch_gate
             .lock()
@@ -5157,19 +5578,22 @@ impl AcpBackend {
         unavailable.store(true, Ordering::SeqCst);
     }
 
-    fn escalate_terminate(
-        supervised: &Arc<StdMutex<Option<Supervised>>>,
+    async fn escalate_terminate(
+        supervised: &Arc<StdMutex<Option<OwnedProcessTreeV1>>>,
         container: &Option<ReapController>,
         reaped: &Arc<AtomicBool>,
         dispatch_gate: &Arc<StdMutex<()>>,
         unavailable: &Arc<AtomicBool>,
     ) {
         Self::close_connection_fence(dispatch_gate, unavailable);
-        let taken = supervised.lock().ok().and_then(|mut g| g.take());
-        if let Some(child) = taken {
-            tokio::spawn(async move {
-                child.terminate(TERMINATE_GRACE).await;
-            });
+        let joined = supervised.lock().ok().and_then(|g| g.as_ref().cloned());
+        if let Some(child) = joined {
+            let termination = child.terminate(TERMINATE_GRACE).await;
+            if process_action_failed(&termination) {
+                AcpTraceEvent::ProcessFlightEscalationRefused.emit();
+            } else {
+                AcpTraceEvent::ProcessFlightEscalationSettled.emit();
+            }
         }
         // Site B: the agent PROCESS is being nuked → reap its `:ro` container (idempotent; no-op if none).
         AcpBackend::reap_container(container, reaped);
@@ -5802,7 +6226,7 @@ impl AcpBackend {
 
         // (1) Mint/get the agent session id. Done OUTSIDE the turn lock so a
         // first-prompt's `session/new` doesn't hold the lock while awaiting.
-        let entry = self.session_entry(session).await;
+        let entry = self.session_entry(session).await?;
         let agent_id = self
             .ensure_session_observed_with_snapshot(session, diagnostic_observer, config_snapshot)
             .await?;
@@ -6120,7 +6544,8 @@ impl AcpBackend {
                             &reaped_for_driver,
                             &dispatch_gate_for_driver,
                             &unavailable_for_driver,
-                        );
+                        )
+                        .await;
                     }
                 }
                 turn_active.store(false, Ordering::SeqCst);
@@ -6169,7 +6594,8 @@ impl AcpBackend {
                                 &reaped_for_driver,
                                 &dispatch_gate_for_driver,
                                 &unavailable_for_driver,
-                            );
+                            )
+                            .await;
                             None
                         }
                     };
@@ -6203,7 +6629,8 @@ impl AcpBackend {
                                 &reaped_for_driver,
                                 &dispatch_gate_for_driver,
                                 &unavailable_for_driver,
-                            );
+                            )
+                            .await;
                             Err(PromptDriverFailure::DroppedStreamTimeout)
                         }
                     }
@@ -6548,11 +6975,12 @@ impl AgentBackend for AcpBackend {
         let Some(supervised) = supervised.as_mut() else {
             return bridge_core::terminal_evidence::AcpChildLiveness::Unknown;
         };
-        match supervised.child_mut().try_wait() {
+        let liveness = match supervised.child_mut().try_wait() {
             Ok(None) => bridge_core::terminal_evidence::AcpChildLiveness::Live,
             Ok(Some(_)) => bridge_core::terminal_evidence::AcpChildLiveness::Exited,
             Err(_) => bridge_core::terminal_evidence::AcpChildLiveness::Unknown,
-        }
+        };
+        liveness
     }
 
     async fn configure_turn(&self, session: &SessionId, meta: TurnMeta) {
@@ -6774,7 +7202,7 @@ impl AgentBackend for AcpBackend {
         session: &SessionId,
         spec: &SessionSpec,
     ) -> Result<ReconcileOutcome, BridgeError> {
-        let entry = self.session_entry(session).await;
+        let entry = self.session_entry(session).await?;
         if entry.agent_id.get().is_none() {
             self.configure_session(session, spec).await?;
             let _aid = self.ensure_session(session).await?;
@@ -6920,32 +7348,53 @@ impl AgentBackend for AcpBackend {
             .await
     }
 
-    /// Graceful async teardown of the agent process (Increment 3b §5.4). IDEMPOTENT
-    /// by construction: TAKE the `Supervised` child out of the shared slot (exactly
-    /// once — a concurrent/second caller sees `None`) and SIGTERM→SIGKILL it. Both
-    /// `resolve`'s race-loss path AND the registry retirement task may call this on
-    /// the same backend (T5 review), so the take-once makes the second call a clean
-    /// no-op. The connection fence closes before either path so an active lease
-    /// cannot install new work while retirement tears down the shared agent.
+    /// Graceful async teardown of the agent process (Increment 3b §5.4).
+    /// Idempotence comes from cloning the same `OwnedProcessTreeV1` capability
+    /// and joining its flight: resolve race-loss and registry retirement may
+    /// call concurrently, but one drives signals and every peer shares the
+    /// result. The fence closes first so no active lease installs new work.
     async fn retire(&self) -> Result<(), BridgeError> {
         Self::close_connection_fence(&self.dispatch_gate, &self.unavailable);
         // Registry retirement must select/start process-owned container cleanup
         // before the cancellable graceful process termination await.
         let container = self.container_reap.clone();
         AcpBackend::reap_container(&container, &self.reaped);
-        let sup = self.supervised.lock().ok().and_then(|mut g| g.take());
+        let sup = self
+            .supervised
+            .lock()
+            .ok()
+            .and_then(|g| g.as_ref().cloned());
         if let Some(sup) = sup {
-            sup.terminate(self.cancel_grace()).await;
+            let termination = sup.terminate(self.cancel_grace()).await;
+            if process_action_failed(&termination) {
+                let detail = termination.err().map_or_else(
+                    || "failed disposition".to_owned(),
+                    |error| error.to_string(),
+                );
+                return Err(BridgeError::agent_crashed(format!(
+                    "ACP process retirement refused by retained process flight: {detail}"
+                )));
+            }
         }
         Ok(())
     }
 }
 
 impl Drop for AcpBackend {
-    /// Site D: the plain-drop path (normal workflow completion → registry drop). Reaps the `:ro` container
-    /// if no earlier site already did. The shared controller's detached start is
-    /// off-runtime-safe, so a Drop at process shutdown never panics.
+    /// Site D: plain backend drop joins or refuses a protected V3 flight before
+    /// field destruction. Legacy V2 deliberately does not initiate termination
+    /// here: dropping its final capability retains the historical one-stage
+    /// process-group SIGKILL leak backstop.
     fn drop(&mut self) {
+        let process = self
+            .supervised
+            .lock()
+            .ok()
+            .and_then(|supervised| supervised.as_ref().cloned());
+        if let Some(process) = process {
+            let final_drop = process.final_drop_join_or_refuse();
+            record_backend_final_drop_process_action(&final_drop);
+        }
         let container = self.container_reap.clone();
         AcpBackend::reap_container(&container, &self.reaped);
     }
@@ -6964,7 +7413,7 @@ mod tests {
     use bridge_core::domain::EffectiveConfig;
     use bridge_core::error::BridgeError;
     use bridge_core::ports::{AgentBackend, BackendObservers, RichEventSink, Update};
-    use bridge_core::process::Supervised;
+    use bridge_core::process::OwnedProcessTreeV1;
     use bridge_core::reaper::{ContainerStartProbeFn, ReapAttemptFn, ReapFailure};
     use bridge_core::SessionCwd;
     use futures::StreamExt;
@@ -7328,6 +7777,96 @@ mod tests {
         fn make_writer(&'a self) -> Self::Writer {
             TraceWriter(self.0.clone())
         }
+    }
+
+    fn action_result(disposition: ResourceActionDispositionV1) -> ResourceActionResultV1 {
+        ResourceActionResultV1 {
+            disposition,
+            duration_ms: 0,
+            recovery_owner: None,
+            cause: None,
+        }
+    }
+
+    #[test]
+    fn every_non_success_process_disposition_refuses_acp_teardown() {
+        for disposition in [
+            ResourceActionDispositionV1::Failed,
+            ResourceActionDispositionV1::Partial,
+            ResourceActionDispositionV1::Unknown,
+        ] {
+            let result: Result<ResourceActionResultV1, ()> = Ok(action_result(disposition.clone()));
+            assert!(process_action_failed(&result), "{disposition:?}");
+            assert!(optional_process_action_failed(&Ok::<_, ()>(Some(
+                action_result(disposition)
+            ))));
+        }
+        for disposition in [
+            ResourceActionDispositionV1::Complete,
+            ResourceActionDispositionV1::NotNeeded,
+        ] {
+            let result: Result<ResourceActionResultV1, ()> = Ok(action_result(disposition.clone()));
+            assert!(!process_action_failed(&result), "{disposition:?}");
+        }
+    }
+
+    #[test]
+    fn unpublished_process_consumers_emit_refusal_for_failed_disposition() {
+        let bytes = Arc::new(StdMutex::new(Vec::new()));
+        let dispatch = test_trace_dispatch(bytes.clone());
+        let _trace = tracing::dispatcher::set_default(&dispatch);
+        let failed: Result<ResourceActionResultV1, ()> =
+            Ok(action_result(ResourceActionDispositionV1::Failed));
+
+        assert!(record_unpublished_blocking_process_action(&failed));
+        assert!(record_unpublished_async_process_action(&failed));
+
+        let output = String::from_utf8(bytes.lock().unwrap().clone()).unwrap();
+        assert!(output.contains("acp.process_flight_unpublished_blocking_refused"));
+        assert!(output.contains("acp.process_flight_unpublished_async_refused"));
+    }
+
+    #[test]
+    fn backend_drop_consumer_emits_refusal_for_failed_disposition() {
+        let bytes = Arc::new(StdMutex::new(Vec::new()));
+        let dispatch = test_trace_dispatch(bytes.clone());
+        let _trace = tracing::dispatcher::set_default(&dispatch);
+        let failed: Result<Option<ResourceActionResultV1>, ()> =
+            Ok(Some(action_result(ResourceActionDispositionV1::Failed)));
+
+        assert!(record_backend_final_drop_process_action(&failed));
+
+        let output = String::from_utf8(bytes.lock().unwrap().clone()).unwrap();
+        assert!(output.contains("acp.process_flight_backend_drop_refused"));
+    }
+
+    #[test]
+    fn all_teardown_consumer_sites_use_the_tested_loud_handlers() {
+        let production = include_str!("acp_backend.rs")
+            .split("// ── Tests")
+            .next()
+            .unwrap();
+        assert_eq!(
+            production
+                .matches("record_unpublished_blocking_process_action(&termination);")
+                .count(),
+            3,
+            "the cleanup worker and both blocking Drop branches stay disposition-aware"
+        );
+        assert_eq!(
+            production
+                .matches("record_unpublished_async_process_action(&termination);")
+                .count(),
+            2,
+            "both async unpublished-process branches stay disposition-aware"
+        );
+        assert_eq!(
+            production
+                .matches("record_backend_final_drop_process_action(&final_drop);")
+                .count(),
+            1,
+            "backend final Drop stays disposition-aware"
+        );
     }
 
     #[test]
@@ -8089,7 +8628,7 @@ mod tests {
             bridge_core::attempt_activity::SystemMonotonicClock::start(),
         ));
         let progress = Arc::new(TurnProgress::new(recorder.clone()));
-        let mut child = Supervised::spawn(
+        let mut child = OwnedProcessTreeV1::spawn(
             "/bin/sh",
             &[
                 "-c",
@@ -8995,7 +9534,7 @@ mod tests {
             )),
             ..AcpConfig::default()
         };
-        // /bin/cat starts (Supervised ok) but never answers `initialize` → handshake timeout → spawn Err.
+        // /bin/cat starts (OwnedProcessTreeV1 ok) but never answers `initialize` → handshake timeout → spawn Err.
         let res = AcpBackend::spawn("/bin/cat", &[], cfg).await;
         assert!(res.is_err(), "handshake must time out");
         tokio::time::timeout(Duration::from_secs(2), async {
@@ -9186,7 +9725,7 @@ mod tests {
             Arc::new(|_runtime, _name| Box::pin(async move { Ok(()) })),
         )
         .with_start_probe(probe);
-        let mut supervised = Supervised::spawn("/bin/cat", &[], None).expect("spawn cat");
+        let mut supervised = OwnedProcessTreeV1::spawn("/bin/cat", &[], None).expect("spawn cat");
 
         let result = await_container_start(
             Some(&controller),
@@ -9201,7 +9740,7 @@ mod tests {
             1,
             "the shared deadline must be checked before starting another runtime probe"
         );
-        supervised.terminate(Duration::from_millis(10)).await;
+        let _ = supervised.terminate(Duration::from_millis(10)).await;
     }
 
     #[tokio::test]
@@ -10071,7 +10610,7 @@ mod tests {
     #[tokio::test]
     async fn from_child_installs_configured_stderr_redactor_on_adopted_process() {
         const SECRET: &str = "from-child-known-secret";
-        let process = Supervised::spawn(
+        let process = OwnedProcessTreeV1::spawn(
             "/bin/sh",
             &[
                 "-c",
@@ -10138,7 +10677,7 @@ mod tests {
     #[tokio::test]
     async fn from_child_initialize_failure_preserves_bounded_stderr_metadata() {
         const SECRET: &str = "from-child-initialize-secret";
-        let process = Supervised::spawn(
+        let process = OwnedProcessTreeV1::spawn(
             "/bin/sh",
             &[
                 "-c",
@@ -10189,21 +10728,21 @@ mod tests {
         assert!(!serde_json::to_string(&json).unwrap().contains(SECRET));
     }
 
-    // B1: `spawn` must HOLD the Supervised child for the backend's lifetime.
-    // Before the fix, `Supervised` (kill_on_drop) was dropped when `spawn`
+    // B1: `spawn` must HOLD the OwnedProcessTreeV1 child for the backend's lifetime.
+    // Before the fix, `OwnedProcessTreeV1` (kill_on_drop) was dropped when `spawn`
     // returned, SIGKILLing the child immediately. We cannot run a real ACP
-    // agent here, so we drive the same `Supervised::spawn` path through a long-
+    // agent here, so we drive the same `OwnedProcessTreeV1::spawn` path through a long-
     // lived child and assert: (a) the backend retains `supervised.is_some()`,
     // and (b) the child is still alive (not reaped/SIGKILLed) shortly after.
     #[tokio::test]
     async fn spawn_holds_child_alive_after_returning() {
         // A long-lived child (`cat` blocks reading stdin), driven through the
-        // exact `Supervised::spawn` + pipe-`take()` seam that `spawn` uses, then
+        // exact `OwnedProcessTreeV1::spawn` + pipe-`take()` seam that `spawn` uses, then
         // held on the backend struct mirroring `spawn`'s end state.
-        let mut supervised = Supervised::spawn("/bin/cat", &[], None).expect("spawn cat");
+        let mut supervised = OwnedProcessTreeV1::spawn("/bin/cat", &[], None).expect("spawn cat");
         let pid = supervised.pid();
         // Take the pipes exactly as `spawn` does (also exercises the I3 seam).
-        let child = supervised.child_mut();
+        let mut child = supervised.child_mut();
         let _stdin = child
             .stdin
             .take()
@@ -10214,6 +10753,7 @@ mod tests {
             .take()
             .ok_or_else(|| BridgeError::agent_crashed("test: stdout unavailable"))
             .unwrap();
+        drop(child);
 
         let backend = AcpBackend {
             conn: None,
@@ -10239,11 +10779,13 @@ mod tests {
             before_process_redactor_hook: StdMutex::new(None),
             fail_deferred_cancel_send: Arc::new(AtomicBool::new(false)),
             fail_cancel_send: Arc::new(AtomicBool::new(false)),
+            fail_process_owner_attach: Arc::new(AtomicBool::new(false)),
+            fail_process_owner_detach: Arc::new(AtomicBool::new(false)),
         };
 
         assert!(
             backend.supervised.lock().unwrap().is_some(),
-            "backend must retain the Supervised child (B1)"
+            "backend must retain the OwnedProcessTreeV1 child (B1)"
         );
 
         // Give an erroneous kill_on_drop time to fire, then confirm the child is
@@ -10261,7 +10803,7 @@ mod tests {
         // Clean up deterministically (SIGTERM->reap), leaving no zombie.
         let taken = backend.supervised.lock().unwrap().take();
         if let Some(s) = taken {
-            s.terminate(Duration::from_millis(100)).await;
+            let _ = s.terminate(Duration::from_millis(100)).await;
         }
     }
 
@@ -11396,6 +11938,195 @@ mod tests {
         SessionId::parse(s).unwrap()
     }
 
+    fn test_trace_dispatch(bytes: Arc<StdMutex<Vec<u8>>>) -> tracing::Dispatch {
+        tracing::Dispatch::new(
+            tracing_subscriber::fmt()
+                .without_time()
+                .with_ansi(false)
+                .with_max_level(tracing_subscriber::filter::LevelFilter::TRACE)
+                .with_writer(TraceCapture(bytes))
+                .finish(),
+        )
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn forced_process_owner_attach_failures_log_distinct_actual_owner_fingerprints() {
+        let backend = connect_recording(Recorder::new("agent-owner-attach")).await;
+        backend
+            .fail_process_owner_attach
+            .store(true, Ordering::SeqCst);
+        let bytes = Arc::new(StdMutex::new(Vec::new()));
+        let dispatch = test_trace_dispatch(bytes.clone());
+        let _trace = tracing::dispatcher::set_default(&dispatch);
+        let first = bkey("bridge-owner-attach-a");
+        let second = bkey("bridge-owner-attach-b");
+        let first_fingerprint = AcpTraceEvent::owner_key_fingerprint(first.as_str());
+        let second_fingerprint = AcpTraceEvent::owner_key_fingerprint(second.as_str());
+        assert_ne!(first_fingerprint, second_fingerprint);
+
+        assert!(backend.session_entry(&first).await.is_err());
+        assert!(backend.session_entry(&second).await.is_err());
+
+        assert!(
+            backend.sessions.lock().await.is_empty(),
+            "failed owner attach must block admission"
+        );
+        let output = String::from_utf8(bytes.lock().unwrap().clone()).unwrap();
+        assert!(output.contains("acp.process_flight_owner_attach_failed"));
+        assert!(output.contains(&format!("owner_key_fingerprint={first_fingerprint}")));
+        assert!(output.contains(&format!("owner_key_fingerprint={second_fingerprint}")));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn forced_process_owner_detach_failure_is_logged_after_cleanup() {
+        let backend = connect_recording(Recorder::new("agent-owner-detach")).await;
+        let session = bkey("bridge-owner-detach");
+        backend.session_entry(&session).await.unwrap();
+        backend
+            .fail_process_owner_detach
+            .store(true, Ordering::SeqCst);
+        let bytes = Arc::new(StdMutex::new(Vec::new()));
+        let dispatch = test_trace_dispatch(bytes.clone());
+        let _trace = tracing::dispatcher::set_default(&dispatch);
+
+        let result = backend.release_session_result(&session).await;
+
+        assert!(result.is_err(), "failed owner detach must fail release");
+        assert!(
+            backend.sessions.lock().await.is_empty(),
+            "cleanup still runs"
+        );
+        let output = String::from_utf8(bytes.lock().unwrap().clone()).unwrap();
+        assert!(output.contains("acp.process_flight_owner_detach_failed"));
+        let fingerprint = AcpTraceEvent::owner_key_fingerprint(session.as_str());
+        assert!(output.contains(&format!("owner_key_fingerprint={fingerprint}")));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn poisoned_process_owner_locks_are_logged_for_attach_and_detach() {
+        let attach_backend = connect_recording(Recorder::new("agent-owner-poison-a")).await;
+        let attach_slot = Arc::clone(&attach_backend.supervised);
+        assert!(std::thread::spawn(move || {
+            let _guard = attach_slot.lock().unwrap();
+            panic!("poison supervised attach lock");
+        })
+        .join()
+        .is_err());
+        let attach_bytes = Arc::new(StdMutex::new(Vec::new()));
+        let attach_dispatch = test_trace_dispatch(attach_bytes.clone());
+        let _attach_trace = tracing::dispatcher::set_default(&attach_dispatch);
+        assert!(attach_backend
+            .session_entry(&bkey("bridge-owner-poison-a"))
+            .await
+            .is_err());
+        let attach_output = String::from_utf8(attach_bytes.lock().unwrap().clone()).unwrap();
+        assert!(attach_output.contains("acp.process_flight_owner_attach_failed"));
+        let attach_fingerprint = AcpTraceEvent::owner_key_fingerprint("bridge-owner-poison-a");
+        assert!(attach_output.contains(&format!("owner_key_fingerprint={attach_fingerprint}")));
+        assert!(attach_output.contains("supervised_lock_poisoned=true"));
+        drop(_attach_trace);
+
+        let detach_backend = connect_recording(Recorder::new("agent-owner-poison-d")).await;
+        let detach_session = bkey("bridge-owner-poison-d");
+        detach_backend.session_entry(&detach_session).await.unwrap();
+        let detach_slot = Arc::clone(&detach_backend.supervised);
+        assert!(std::thread::spawn(move || {
+            let _guard = detach_slot.lock().unwrap();
+            panic!("poison supervised detach lock");
+        })
+        .join()
+        .is_err());
+        let detach_bytes = Arc::new(StdMutex::new(Vec::new()));
+        let detach_dispatch = test_trace_dispatch(detach_bytes.clone());
+        let _detach_trace = tracing::dispatcher::set_default(&detach_dispatch);
+        assert!(detach_backend
+            .release_session_result(&detach_session)
+            .await
+            .is_err());
+        let detach_output = String::from_utf8(detach_bytes.lock().unwrap().clone()).unwrap();
+        assert!(detach_output.contains("acp.process_flight_owner_detach_failed"));
+        let detach_fingerprint = AcpTraceEvent::owner_key_fingerprint(detach_session.as_str());
+        assert!(detach_output.contains(&format!("owner_key_fingerprint={detach_fingerprint}")));
+        assert!(detach_output.contains("supervised_lock_poisoned=true"));
+    }
+
+    #[tokio::test]
+    async fn production_attempt_route_hands_exact_bound_flight_to_v3_spawn() {
+        struct TestDir(std::path::PathBuf);
+
+        impl Drop for TestDir {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+
+        let attempt_id = bridge_core::ids::AttemptId::mint().unwrap();
+        let root =
+            TestDir(std::env::temp_dir().join(format!("a2a-acp-v3-route-{}", attempt_id.as_str())));
+        std::fs::create_dir(&root.0).unwrap();
+        let journal = Arc::new(
+            bridge_core::retained_resource_flight::FileResourceFlightJournal::open(&root.0, 512)
+                .unwrap(),
+        );
+        let attempt = Arc::new(DurableProcessFlightAttemptV3::new(
+            attempt_id,
+            journal.clone(),
+        ));
+        let owner = ResourceFlightOwnerV1::new(
+            NodeId::parse("acp-attempt-route").unwrap(),
+            "attempt-route-owner",
+        )
+        .unwrap();
+
+        let mut config = test_config();
+        config.process_flight_route_v3 = Some(AcpProcessFlightRouteV3::new(
+            Arc::clone(&attempt),
+            "attempt-route-generation",
+            owner,
+        ));
+        let result = AcpBackend::spawn("/definitely/missing-a2a-acp-v3-route", &[], config).await;
+
+        assert!(
+            result.is_err(),
+            "missing executable is the deterministic stop"
+        );
+        let journal_paths: Vec<_> = std::fs::read_dir(&root.0)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| path.extension().and_then(|value| value.to_str()) == Some("jsonl"))
+            .collect();
+        assert_eq!(journal_paths.len(), 1, "one exact flight reached spawn");
+        let flight_id = bridge_core::resource_flight::ResourceFlightIdV1::parse(
+            journal_paths[0]
+                .file_stem()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned(),
+        )
+        .unwrap();
+        let rows = bridge_core::retained_resource_flight::ResourceFlightJournal::records(
+            journal.as_ref(),
+            &flight_id,
+        )
+        .unwrap();
+        assert!(rows.iter().any(|row| matches!(
+            row.event,
+            bridge_core::retained_resource_flight::ResourceFlightJournalEventV1::ProcessBindingFailed {
+                stage: bridge_core::retained_resource_flight::ProcessBindingStageV1::Spawn,
+                pid: None,
+            }
+        )));
+        assert!(rows.iter().any(|row| matches!(
+            &row.event,
+            bridge_core::retained_resource_flight::ResourceFlightJournalEventV1::Settled {
+                result: ResourceActionResultV1 {
+                    disposition: ResourceActionDispositionV1::Failed,
+                    ..
+                }
+            }
+        )));
+    }
+
     fn assert_agent_failure(
         error: &BridgeError,
         phase: DiagnosticPhase,
@@ -11873,7 +12604,7 @@ mod tests {
         assert!(!rendered.contains(ACTIVE_SECRET));
         rec.new_session_gate.notify_waiters();
         mint.await.unwrap().unwrap();
-        let entry = backend.session_entry(&session).await;
+        let entry = backend.session_entry(&session).await.unwrap();
         assert!(entry.active_mint_cwd.lock().unwrap().is_none());
     }
 
@@ -11979,7 +12710,7 @@ mod tests {
         let mut backend = connect_recording(rec.clone()).await;
         backend.stderr_ring = Some(ProcessStderrRing::default());
         let key = bkey("bridge-PROCESS-REDACTOR-CANCEL");
-        let entry = backend.session_entry(&key).await;
+        let entry = backend.session_entry(&key).await.unwrap();
 
         let before_redactor = Arc::new(std::sync::Barrier::new(2));
         let release_redactor = Arc::new(std::sync::Barrier::new(2));
@@ -12106,7 +12837,7 @@ mod tests {
             .await
             .unwrap();
         let session = bkey("bridge-FAILED-MINT-CWD");
-        let entry = backend.session_entry(&session).await;
+        let entry = backend.session_entry(&session).await.unwrap();
         for cwd in ["/srv/failed-a", "/srv/failed-b"] {
             backend
                 .configure_session(
@@ -12332,7 +13063,7 @@ mod tests {
     async fn prompt_failure_uses_attempt_cursor_and_persists_stderr_metadata_only() {
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
-        let mut process = Supervised::spawn(
+        let mut process = OwnedProcessTreeV1::spawn(
             "/bin/sh",
             &[
                 "-c",
@@ -12417,7 +13148,7 @@ mod tests {
         const ENCODED_SECRET: &str = "cjJjLWtub3duLXNlY3JldC12YWx1ZQ==";
         const TRANSFORMED_LINE: &str = "encoded-secret=cjJjLWtub3duLXNlY3JldC12YWx1ZQ==";
 
-        let mut process = Supervised::spawn_with_stderr_redactor(
+        let mut process = OwnedProcessTreeV1::spawn_with_stderr_redactor(
             "/bin/sh",
             &[
                 "-c",
@@ -12495,7 +13226,7 @@ mod tests {
     async fn pre_prompt_config_failure_includes_available_process_stderr_metadata() {
         use tokio::io::AsyncWriteExt;
 
-        let mut process = Supervised::spawn(
+        let mut process = OwnedProcessTreeV1::spawn(
             "/bin/sh",
             &["-c", "read _; echo preprompt-process-secret 1>&2; sleep 30"],
             None,
@@ -12703,11 +13434,14 @@ mod tests {
             before_process_redactor_hook: StdMutex::new(None),
             fail_deferred_cancel_send: Arc::new(AtomicBool::new(false)),
             fail_cancel_send: Arc::new(AtomicBool::new(false)),
+            fail_process_owner_attach: Arc::new(AtomicBool::new(false)),
+            fail_process_owner_detach: Arc::new(AtomicBool::new(false)),
         };
         let key = bkey("bridge-MISSING-CONNECTION");
         backend
             .session_entry(&key)
             .await
+            .unwrap()
             .agent_id
             .set(AgentSessionId::new("agent-sess-MISSING-CONNECTION"))
             .expect("test pre-mints the session without a connection");
@@ -12790,6 +13524,7 @@ mod tests {
         let agent_id = backend
             .session_entry(&key)
             .await
+            .unwrap()
             .agent_id
             .get()
             .cloned()
@@ -12842,7 +13577,7 @@ mod tests {
             .await
             .expect("prompt must remove routing before slow completion observation");
 
-        let entry = backend.session_entry(&key).await;
+        let entry = backend.session_entry(&key).await.unwrap();
         let agent_id = entry.agent_id.get().cloned().unwrap();
         assert!(
             backend
@@ -12978,7 +13713,8 @@ mod tests {
             &backend.reaped,
             &backend.dispatch_gate,
             &backend.unavailable,
-        );
+        )
+        .await;
         release.notify_one();
         let error = match tokio::time::timeout(Duration::from_secs(2), prompt)
             .await
@@ -14000,7 +14736,7 @@ mod tests {
         let _ = first.await;
         rec.new_session_gate.notify_waiters();
 
-        let entry = backend.session_entry(&key).await;
+        let entry = backend.session_entry(&key).await.unwrap();
         tokio::time::timeout(Duration::from_secs(2), async {
             while entry.agent_id.get().is_none() {
                 tokio::task::yield_now().await;
@@ -15748,13 +16484,103 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn two_nodes_one_generation_signal_once_and_share_result_host_signal_semantics() {
+        let process = OwnedProcessTreeV1::spawn("/bin/cat", &[], None).expect("spawn cat");
+        let observed = process.clone();
+        let first =
+            ResourceFlightOwnerV1::new(NodeId::parse("node-a").unwrap(), "session-a").unwrap();
+        let second =
+            ResourceFlightOwnerV1::new(NodeId::parse("node-b").unwrap(), "session-b").unwrap();
+        process.attach_owner(first.clone()).unwrap();
+        process.attach_owner(second.clone()).unwrap();
+
+        let supervised = Arc::new(StdMutex::new(Some(process)));
+        let container = None;
+        let reaped = Arc::new(AtomicBool::new(false));
+        let dispatch_gate = Arc::new(StdMutex::new(()));
+        let unavailable = Arc::new(AtomicBool::new(false));
+        let left = AcpBackend::escalate_terminate(
+            &supervised,
+            &container,
+            &reaped,
+            &dispatch_gate,
+            &unavailable,
+        );
+        let right = AcpBackend::escalate_terminate(
+            &supervised,
+            &container,
+            &reaped,
+            &dispatch_gate,
+            &unavailable,
+        );
+        tokio::join!(left, right);
+
+        assert!(unavailable.load(Ordering::SeqCst));
+        assert!(matches!(
+            observed.flight_state().unwrap(),
+            bridge_core::resource_flight::ResourceFlightStateV1::Settled { .. }
+        ));
+        let rows = observed.journal_records().unwrap();
+        assert_eq!(
+            rows.iter()
+                .filter(|row| matches!(
+                    row.event,
+                    bridge_core::retained_resource_flight::ResourceFlightJournalEventV1::ProcessSignalsObserved {
+                        ..
+                    }
+                ))
+                .count(),
+            1,
+            "both ACP escalations must join one observed signal batch"
+        );
+        let owners = rows
+            .iter()
+            .find_map(|row| match &row.event {
+                bridge_core::retained_resource_flight::ResourceFlightJournalEventV1::IntentJournaled {
+                    owner_snapshot,
+                    ..
+                } => Some(owner_snapshot),
+                _ => None,
+            })
+            .expect("journaled owner snapshot");
+        assert!(owners.contains(&first));
+        assert!(owners.contains(&second));
+    }
+
+    #[tokio::test]
+    async fn legacy_v2_owner_churn_does_not_exhaust_process_journal_host_signal_semantics() {
+        let backend = connect_recording(Recorder::new("agent-owner-churn")).await;
+        let process = OwnedProcessTreeV1::spawn("/bin/cat", &[], None).expect("spawn cat");
+        let observed = process.clone();
+        *backend.supervised.lock().unwrap() = Some(process);
+
+        for index in 0..261 {
+            let session = bkey(&format!("bridge-owner-churn-{index}"));
+            backend.session_entry(&session).await.unwrap();
+            backend.release_session_result(&session).await.unwrap();
+        }
+
+        backend
+            .retire()
+            .await
+            .expect("owner churn must leave enough capacity for retirement");
+        assert!(matches!(
+            observed.flight_state().unwrap(),
+            bridge_core::resource_flight::ResourceFlightStateV1::Settled { .. }
+        ));
+        assert!(
+            observed.journal_records().unwrap().len() < 512,
+            "legacy session membership must not consume durable lifecycle rows"
+        );
+    }
+
+    #[tokio::test]
     async fn retire_is_idempotent() {
-        // A long-lived child (`cat` blocks on stdin). `retire()` takes-once and
-        // terminates the agent PROCESS; a SECOND `retire()` finds `None` (take-once)
-        // and is a clean no-op (no panic, no double-kill).
-        let mut supervised = Supervised::spawn("/bin/cat", &[], None).expect("spawn cat");
+        // A long-lived child (`cat` blocks on stdin). Concurrent/repeated retire
+        // calls clone one capability: the first drives and the second joins.
+        let mut supervised = OwnedProcessTreeV1::spawn("/bin/cat", &[], None).expect("spawn cat");
         let pid = supervised.pid();
-        let child = supervised.child_mut();
+        let mut child = supervised.child_mut();
         let _stdin = child
             .stdin
             .take()
@@ -15765,6 +16591,7 @@ mod tests {
             .take()
             .ok_or_else(|| BridgeError::agent_crashed("test: stdout unavailable"))
             .unwrap();
+        drop(child);
 
         let backend = AcpBackend {
             conn: None,
@@ -15790,6 +16617,8 @@ mod tests {
             before_process_redactor_hook: StdMutex::new(None),
             fail_deferred_cancel_send: Arc::new(AtomicBool::new(false)),
             fail_cancel_send: Arc::new(AtomicBool::new(false)),
+            fail_process_owner_attach: Arc::new(AtomicBool::new(false)),
+            fail_process_owner_detach: Arc::new(AtomicBool::new(false)),
         };
 
         assert!(
@@ -15802,11 +16631,11 @@ mod tests {
             backend.unavailable.load(Ordering::SeqCst),
             "retirement must close the connection fence before process teardown"
         );
-        // The take-once consumed the child; a second retire is a no-op.
+        // The second retirement joins the already-settled process flight.
         backend
             .retire()
             .await
-            .expect("second retire is a clean no-op (take-once → None)");
+            .expect("second retire joins the same flight");
 
         // After the first retire the child is terminated (SIGTERM→reap); confirm the
         // pid is no longer a live, signalable process we own.
@@ -16159,7 +16988,7 @@ mod tests {
         .unwrap();
         be.ensure_session(&key).await.unwrap();
 
-        let entry = be.session_entry(&key).await;
+        let entry = be.session_entry(&key).await.unwrap();
         let surface = entry
             .config_surface
             .lock()
@@ -16390,7 +17219,7 @@ mod tests {
         be.configure_session(&s, &SessionSpec::from_config(Default::default()))
             .await
             .unwrap();
-        let _ = be.session_entry(&s).await;
+        let _ = be.session_entry(&s).await.unwrap();
         be.release_session(&s).await;
         assert!(
             be.session_cfg.lock().unwrap().get(&s).is_none(),
@@ -16451,7 +17280,7 @@ mod tests {
                 turn_meta("ctx-forget-observed", 1, "op-forget-observed"),
             )
             .await;
-        let entry = backend.session_entry(&session).await;
+        let entry = backend.session_entry(&session).await.unwrap();
 
         let rejecting = Arc::new(RejectOnRecord {
             count: AtomicU64::new(0),
@@ -16478,7 +17307,7 @@ mod tests {
         assert!(!backend.session_cfg.lock().unwrap().contains_key(&session));
         assert!(backend.take_pending_turn_meta(&session).is_none());
         assert!(
-            Arc::ptr_eq(&entry, &backend.session_entry(&session).await),
+            Arc::ptr_eq(&entry, &backend.session_entry(&session).await.unwrap()),
             "forget must not release the live ACP session"
         );
         let events = observer.snapshot().await;
@@ -16984,13 +17813,15 @@ mod tests {
             before_process_redactor_hook: StdMutex::new(None),
             fail_deferred_cancel_send: Arc::new(AtomicBool::new(false)),
             fail_cancel_send: Arc::new(AtomicBool::new(false)),
+            fail_process_owner_attach: Arc::new(AtomicBool::new(false)),
+            fail_process_owner_detach: Arc::new(AtomicBool::new(false)),
         };
         let session = bkey("bridge-RELEASE-ERROR");
         backend
             .configure_session(&session, &SessionSpec::from_config(Default::default()))
             .await
             .unwrap();
-        let _ = backend.session_entry(&session).await;
+        let _ = backend.session_entry(&session).await.unwrap();
         let cancel_observer = Arc::new(InMemoryDiagnosticObserver::new(8).unwrap());
         let cancel_error = backend
             .cancel_observed(&session, cancel_observer.clone())
@@ -17018,7 +17849,7 @@ mod tests {
             .configure_session(&session, &SessionSpec::from_config(Default::default()))
             .await
             .unwrap();
-        let _ = backend.session_entry(&session).await;
+        let _ = backend.session_entry(&session).await.unwrap();
 
         let observer = Arc::new(InMemoryDiagnosticObserver::new(8).unwrap());
 

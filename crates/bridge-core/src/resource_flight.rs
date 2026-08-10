@@ -1,19 +1,19 @@
-//! Inactive R2f1b retained-resource flight contracts.
-//!
-//! These types describe the durable ownership boundary used by later R2f1b slices. This
-//! slice deliberately does not signal processes, containers, or providers.
+//! R2f1b retained-resource flight contracts. Process generations are active through
+//! `process::OwnedProcessTreeV1`; containers and remote providers remain adapters
+//! for their separately gated slices.
 
 use crate::ids::AttemptId;
 use ring::rand::{SecureRandom, SystemRandom};
 use serde::{Deserialize, Serialize};
 
 pub use crate::retained_resource_flight::{
-    CleanupDeadlineTransferV1, FileResourceFlightJournal, JournaledDispatchAdmissionV1,
-    NodeCleanupAggregationV1, OwnedProcessTreeV1, ResourceActionIntentV1, ResourceFlightJournal,
-    ResourceFlightJournalError, ResourceFlightJournalEventV1, ResourceFlightJournalRecordV1,
-    ResourceFlightKeyV1, ResourceFlightOwnerV1, ResourceFlightRegistryV1,
-    ResourceFlightReservationOutcomeV1, ResourceFlightReservationRecordV1,
-    ResourceFlightReservationV1, ResourceFlightResultPublisher,
+    CleanupDeadlineTransferV1, FileResourceFlightJournal, InMemoryResourceFlightJournal,
+    JournaledDispatchAdmissionV1, NodeCleanupAggregationV1, NoopResourceFlightResultPublisher,
+    OwnedProcessTreeV1, ProcessBindingStageV1, ProcessSignalObservationV1, ResourceActionIntentV1,
+    ResourceFlightJournal, ResourceFlightJournalError, ResourceFlightJournalEventV1,
+    ResourceFlightJournalRecordV1, ResourceFlightKeyV1, ResourceFlightOwnerV1,
+    ResourceFlightRegistryV1, ResourceFlightReservationOutcomeV1,
+    ResourceFlightReservationRecordV1, ResourceFlightReservationV1, ResourceFlightResultPublisher,
     ResourceFlightTerminalAppendOutcomeV1, RetainedResourceFlight, RetainedResourceFlightConfigV1,
     RetainedResourceFlightError, RetainedResourceFlightGuardV1,
 };

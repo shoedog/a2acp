@@ -747,7 +747,12 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let runtime = temp.path().join("hung-runtime");
         let marker = temp.path().join("late-side-effect");
-        std::fs::write(&runtime, "#!/bin/sh\nsleep 0.25\nprintf reached > \"$3\"\n").unwrap();
+        let release = temp.path().join("late-side-effect.release");
+        std::fs::write(
+            &runtime,
+            "#!/bin/sh\nwhile [ ! -e \"$3.release\" ]; do sleep 0.01; done\nprintf reached > \"$3\"\n",
+        )
+        .unwrap();
         let mut permissions = std::fs::metadata(&runtime).unwrap().permissions();
         permissions.set_mode(0o755);
         std::fs::set_permissions(&runtime, permissions).unwrap();
@@ -758,6 +763,11 @@ mod tests {
             Duration::from_millis(20),
         );
         assert_eq!(controller.reap_observed().await, Err(ReapFailure::Timeout));
+        // Give the kill-on-drop signal time to settle before allowing a live
+        // runtime to continue. Unlike a fixed child delay, this gate cannot
+        // elapse during a heavily loaded synchronous spawn-to-timeout gap.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        std::fs::write(release, b"release").unwrap();
         tokio::time::sleep(Duration::from_millis(350)).await;
         assert!(
             !marker.exists(),

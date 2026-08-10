@@ -573,6 +573,7 @@ impl ContainerRwBackend {
             auth_method: self.cfg.auth_method.clone(),
             pre_authenticated: self.cfg.pre_authenticated,
             watchdog: self.cfg.watchdog.clone(),
+            process_flight_route_v3: None,
             prefix_attestation_transport:
                 bridge_acp::acp_backend::PrefixAttestationTransport::Unsupported,
             handshake_timeout: self.cfg.handshake_timeout,

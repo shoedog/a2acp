@@ -1,4 +1,4 @@
-//! Journal-backed, non-destructive retained resource flight runner.
+//! Journal-backed retained resource flight runner.
 //!
 //! Design notes:
 //! * `FileResourceFlightJournal` is an append-only JSONL durable substrate.
@@ -39,7 +39,15 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex};
 
 pub const RESOURCE_FLIGHT_JOURNAL_SCHEMA_V1: u16 = 1;
-const LIFECYCLE_SLOTS: u8 = 3;
+// Dispatch, the observed signal batch, an optional guard transfer, and terminal
+// settlement must all remain appendable after intent becomes durable.
+const LIFECYCLE_SLOTS: u8 = 4;
+// A protected process reserves its complete destructive lifecycle before the
+// child exists: capture or binding failure, intent, dispatch, one observed
+// signal batch, optional guard transfer, terminal settlement, and one owner
+// evidence margin. Unused slots are harmless; their purpose is to keep later
+// owner churn from consuming the rows needed to settle the process flight.
+const PROCESS_LIFECYCLE_SLOTS: u8 = 7;
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -96,6 +104,27 @@ pub struct ResourceActionIntentV1 {
     pub cause: Option<BoundedCauseV1>,
 }
 
+/// One observed process-authority call. `errno` is captured immediately after
+/// a failed syscall; no signal attempt is allowed to disappear into a
+/// best-effort branch.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessSignalObservationV1 {
+    pub pid: u32,
+    pub expected_start_time_ticks: u64,
+    pub signal: i32,
+    pub return_code: i32,
+    pub errno: Option<i32>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProcessBindingStageV1 {
+    Spawn,
+    ImmutableStart,
+    JournalBinding,
+}
+
 /// Deliberately carries no retained capability. A recovered intent has no API
 /// that can reconstruct a signal target from this metadata, a PID, or a name.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -108,8 +137,18 @@ pub enum ResourceFlightJournalEventV1 {
     OwnerAttached {
         owner: ResourceFlightOwnerV1,
     },
+    OwnerDetached {
+        owner: ResourceFlightOwnerV1,
+    },
+    ProcessLifecycleReserved {
+        reserved_lifecycle_slots: u8,
+    },
     ProcessTreeCaptured {
         identity: ResourceIdentityV1,
+    },
+    ProcessBindingFailed {
+        stage: ProcessBindingStageV1,
+        pid: Option<u32>,
     },
     IntentJournaled {
         intent: ResourceActionIntentV1,
@@ -120,6 +159,9 @@ pub enum ResourceFlightJournalEventV1 {
         owner: ResourceFlightOwnerV1,
     },
     DispatchStarted {},
+    ProcessSignalsObserved {
+        observations: Vec<ProcessSignalObservationV1>,
+    },
     GuardTransferred {
         recovery_owner: RecoveryOwnerV1,
         deadline_ms: u64,
@@ -132,7 +174,10 @@ pub enum ResourceFlightJournalEventV1 {
 impl ResourceFlightJournalEventV1 {
     fn reserved(&self) -> u8 {
         match self {
-            Self::IntentJournaled {
+            Self::ProcessLifecycleReserved {
+                reserved_lifecycle_slots,
+            }
+            | Self::IntentJournaled {
                 reserved_lifecycle_slots,
                 ..
             } => *reserved_lifecycle_slots,
@@ -140,11 +185,24 @@ impl ResourceFlightJournalEventV1 {
         }
     }
 
-    fn consumes_reserved_slot(&self) -> bool {
+    fn requires_reserved_slot(&self) -> bool {
         matches!(
             self,
-            Self::DispatchStarted {} | Self::GuardTransferred { .. } | Self::Settled { .. }
+            Self::DispatchStarted {}
+                | Self::ProcessSignalsObserved { .. }
+                | Self::GuardTransferred { .. }
+                | Self::Settled { .. }
         )
+    }
+
+    fn consumes_process_reservation_when_present(&self) -> bool {
+        match self {
+            Self::ProcessTreeCaptured { .. }
+            | Self::ProcessBindingFailed { .. }
+            | Self::IntentJournaled { .. } => true,
+            Self::OwnerDetached { owner } => owner.node_id.as_str() == "process-spawn",
+            _ => false,
+        }
     }
 }
 
@@ -262,12 +320,17 @@ fn outstanding(
         if record.sequence != u64::try_from(index + 1).unwrap_or(u64::MAX) {
             return Err(ResourceFlightJournalError::Sequence);
         }
+        let before = slots;
         slots = slots
             .checked_add(usize::from(record.event.reserved()))
             .ok_or(ResourceFlightJournalError::Accounting)?;
-        if record.event.consumes_reserved_slot() {
+        let consumed = usize::from(
+            record.event.requires_reserved_slot()
+                || (before != 0 && record.event.consumes_process_reservation_when_present()),
+        );
+        if consumed != 0 {
             slots = slots
-                .checked_sub(1)
+                .checked_sub(consumed)
                 .ok_or(ResourceFlightJournalError::Accounting)?;
         }
     }
@@ -293,7 +356,10 @@ fn admission_check(
     if record.sequence != u64::try_from(records.len() + 1).unwrap_or(u64::MAX) {
         return Err(ResourceFlightJournalError::Sequence);
     }
-    let consumed = usize::from(record.event.consumes_reserved_slot());
+    let consumed = usize::from(
+        record.event.requires_reserved_slot()
+            || (slots != 0 && record.event.consumes_process_reservation_when_present()),
+    );
     if consumed == 1 && slots == 0 {
         return Err(ResourceFlightJournalError::Accounting);
     }
@@ -312,22 +378,20 @@ fn admission_check(
     Ok(())
 }
 
-/// Test-only simulation implementation with the same accounting rules.
-#[cfg(test)]
+/// Bounded in-memory implementation used by the V2 compatibility adapter and
+/// deterministic unit tests. V3 callers supply a durable journal instead.
 #[derive(Debug)]
 pub struct InMemoryResourceFlightJournal {
     cap: usize,
     state: Mutex<InMemoryResourceFlightJournalState>,
 }
 
-#[cfg(test)]
 #[derive(Default, Debug)]
 struct InMemoryResourceFlightJournalState {
     records: BTreeMap<ResourceFlightIdV1, Vec<ResourceFlightJournalRecordV1>>,
     reservations: BTreeMap<ResourceFlightKeyV1, ResourceFlightReservationRecordV1>,
 }
 
-#[cfg(test)]
 impl InMemoryResourceFlightJournal {
     #[must_use]
     pub fn new(cap: usize) -> Self {
@@ -338,7 +402,6 @@ impl InMemoryResourceFlightJournal {
     }
 }
 
-#[cfg(test)]
 impl ResourceFlightJournal for InMemoryResourceFlightJournal {
     fn reserve_flight(
         &self,
@@ -751,10 +814,8 @@ pub trait ResourceFlightResultPublisher: Send + Sync {
     fn publish(&self, aggregation: NodeCleanupAggregationV1);
 }
 
-#[cfg(test)]
 #[derive(Default)]
 pub struct NoopResourceFlightResultPublisher;
-#[cfg(test)]
 impl ResourceFlightResultPublisher for NoopResourceFlightResultPublisher {
     fn publish(&self, _: NodeCleanupAggregationV1) {}
 }
@@ -843,7 +904,7 @@ pub struct OwnerSnapshotV1 {
     pub owners: Vec<ResourceFlightOwnerV1>,
 }
 
-/// Inert proof of journaled dispatch admission. It has no effectful method.
+/// Proof of journaled dispatch admission. It has no effectful method.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct JournaledDispatchAdmissionV1 {
     _resource_flight_id: ResourceFlightIdV1,
@@ -865,6 +926,7 @@ struct State {
     snapshot: BTreeSet<ResourceFlightOwnerV1>,
     collateral: BTreeSet<ResourceFlightOwnerV1>,
     delivered: BTreeSet<ResourceFlightOwnerV1>,
+    process_lifecycle_reserved: bool,
     sequence: u64,
     next_guard: u64,
     guards: BTreeSet<u64>,
@@ -879,6 +941,7 @@ impl Default for State {
             snapshot: BTreeSet::new(),
             collateral: BTreeSet::new(),
             delivered: BTreeSet::new(),
+            process_lifecycle_reserved: false,
             sequence: 1,
             next_guard: 1,
             guards: BTreeSet::new(),
@@ -1027,6 +1090,79 @@ impl RetainedResourceFlight {
         Ok(true)
     }
 
+    /// Legacy V2 keeps the live owner set but deliberately spends no bounded
+    /// journal rows on warm-session churn. Its compatibility journal is
+    /// process-local evidence, while signal intent and terminal rows must stay
+    /// available no matter how many sessions the long-lived backend served.
+    pub(crate) fn attach_owner_legacy_v2(
+        &self,
+        owner: ResourceFlightOwnerV1,
+    ) -> Result<bool, RetainedResourceFlightError> {
+        let mut state = self.lock()?;
+        if !matches!(state.state, ResourceFlightStateV1::Open {}) {
+            return Err(RetainedResourceFlightError::AdmissionClosed);
+        }
+        Ok(state.owners.insert(owner))
+    }
+
+    /// Ordinary session release detaches only that owner while admission remains open.
+    /// It never signals or retires the process generation.
+    pub fn detach_owner(
+        &self,
+        owner: &ResourceFlightOwnerV1,
+    ) -> Result<bool, RetainedResourceFlightError> {
+        let mut state = self.lock()?;
+        if !matches!(state.state, ResourceFlightStateV1::Open {}) {
+            return Err(RetainedResourceFlightError::AdmissionClosed);
+        }
+        if !state.owners.remove(owner) {
+            return Ok(false);
+        }
+        if let Err(error) = self.append(
+            &mut state,
+            ResourceFlightJournalEventV1::OwnerDetached {
+                owner: owner.clone(),
+            },
+        ) {
+            state.owners.insert(owner.clone());
+            return Err(error);
+        }
+        Ok(true)
+    }
+
+    pub(crate) fn detach_owner_legacy_v2(
+        &self,
+        owner: &ResourceFlightOwnerV1,
+    ) -> Result<bool, RetainedResourceFlightError> {
+        let mut state = self.lock()?;
+        if !matches!(state.state, ResourceFlightStateV1::Open {}) {
+            return Err(RetainedResourceFlightError::AdmissionClosed);
+        }
+        Ok(state.owners.remove(owner))
+    }
+
+    /// Reserve every row that a protected process may need before the spawn
+    /// syscall. The journal append lock makes this atomic with concurrent
+    /// evidence admission, whose rows can use only capacity beyond these
+    /// outstanding slots.
+    pub(crate) fn reserve_process_lifecycle(&self) -> Result<(), RetainedResourceFlightError> {
+        let mut state = self.lock()?;
+        if !matches!(state.state, ResourceFlightStateV1::Open {}) {
+            return Err(RetainedResourceFlightError::AdmissionClosed);
+        }
+        if state.process_lifecycle_reserved {
+            return Ok(());
+        }
+        self.append(
+            &mut state,
+            ResourceFlightJournalEventV1::ProcessLifecycleReserved {
+                reserved_lifecycle_slots: PROCESS_LIFECYCLE_SLOTS,
+            },
+        )?;
+        state.process_lifecycle_reserved = true;
+        Ok(())
+    }
+
     /// The single transition lock linearizes attachment with deterministic close.
     pub fn close_admission(&self) -> Result<OwnerSnapshotV1, RetainedResourceFlightError> {
         let mut state = self.lock()?;
@@ -1058,12 +1194,17 @@ impl RetainedResourceFlight {
             return Err(RetainedResourceFlightError::OwnerNotAttached);
         }
         let snapshot = state.snapshot.iter().cloned().collect();
+        let reserved_lifecycle_slots = if state.process_lifecycle_reserved {
+            0
+        } else {
+            LIFECYCLE_SLOTS
+        };
         self.append(
             &mut state,
             ResourceFlightJournalEventV1::IntentJournaled {
                 intent,
                 owner_snapshot: snapshot,
-                reserved_lifecycle_slots: LIFECYCLE_SLOTS,
+                reserved_lifecycle_slots,
             },
         )?;
         state.state = ResourceFlightStateV1::IntentJournaled {};
@@ -1100,7 +1241,7 @@ impl RetainedResourceFlight {
         Ok(true)
     }
 
-    /// Inert state transition for later signal adapters. There is no method in
+    /// Journal-before-dispatch transition for effectful adapters. There is no method in
     /// this module that can convert this admission into an OS/container call.
     pub fn begin_journaled_dispatch(
         &self,
@@ -1130,6 +1271,25 @@ impl RetainedResourceFlight {
         Ok(JournaledDispatchAdmissionV1 {
             _resource_flight_id: self.id.clone(),
         })
+    }
+
+    /// Append the complete, bounded outcome set for one signal dispatch. The row
+    /// consumes the slot reserved by `journal_intent`; even failed syscalls are
+    /// evidence and must be present before settlement.
+    pub fn journal_process_signals(
+        &self,
+        observations: Vec<ProcessSignalObservationV1>,
+    ) -> Result<(), RetainedResourceFlightError> {
+        let mut state = self.lock()?;
+        if !matches!(state.state, ResourceFlightStateV1::Signaling {}) {
+            return Err(RetainedResourceFlightError::TransitionRefused {
+                state: Box::new(state.state.clone()),
+            });
+        }
+        self.append(
+            &mut state,
+            ResourceFlightJournalEventV1::ProcessSignalsObserved { observations },
+        )
     }
 
     fn settle_locked(
@@ -1199,13 +1359,13 @@ impl RetainedResourceFlight {
     pub fn settle(
         &self,
         result: ResourceActionResultV1,
-    ) -> Result<(), RetainedResourceFlightError> {
+    ) -> Result<ResourceActionResultV1, RetainedResourceFlightError> {
         let settlement = {
             let mut state = self.lock()?;
             self.settle_locked(&mut state, result)?
         };
         self.publish(settlement.recipients, &settlement.result);
-        Ok(())
+        Ok(settlement.result)
     }
 
     pub fn join_blocking(&self) -> Result<ResourceActionResultV1, RetainedResourceFlightError> {
@@ -1399,7 +1559,7 @@ impl RetainedResourceFlight {
         }
     }
 
-    fn journal_process_tree(
+    pub(crate) fn journal_process_tree(
         &self,
         identity: ResourceIdentityV1,
     ) -> Result<(), RetainedResourceFlightError> {
@@ -1415,6 +1575,26 @@ impl RetainedResourceFlight {
         self.append(
             &mut state,
             ResourceFlightJournalEventV1::ProcessTreeCaptured { identity },
+        )
+    }
+
+    /// Protective pre-bind evidence. The caller follows this with an ordinary
+    /// empty-signal flight settlement; it never invents a PID capability from
+    /// this diagnostic row.
+    pub fn journal_process_binding_failure(
+        &self,
+        stage: ProcessBindingStageV1,
+        pid: Option<u32>,
+    ) -> Result<(), RetainedResourceFlightError> {
+        let mut state = self.lock()?;
+        if !matches!(state.state, ResourceFlightStateV1::Open {}) {
+            return Err(RetainedResourceFlightError::TransitionRefused {
+                state: Box::new(state.state.clone()),
+            });
+        }
+        self.append(
+            &mut state,
+            ResourceFlightJournalEventV1::ProcessBindingFailed { stage, pid },
         )
     }
 }
@@ -1453,11 +1633,20 @@ pub enum CleanupDeadlineTransferV1 {
     },
 }
 
-/// Construction and journal shell only; platform probes and every signal path
-/// belong to slice 3b1.
-#[derive(Clone, Debug)]
+/// Sole live capability for an owned process generation. Capture-only values
+/// remain available for persisted-identity decoding tests, but cannot signal.
+#[derive(Clone)]
 pub struct OwnedProcessTreeV1 {
     identity: ResourceIdentityV1,
+    pub(crate) process: Option<Arc<crate::process::OwnedProcessStateV1>>,
+}
+impl std::fmt::Debug for OwnedProcessTreeV1 {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OwnedProcessTreeV1")
+            .field("identity", &self.identity)
+            .field("live_capability", &self.process.is_some())
+            .finish()
+    }
 }
 impl OwnedProcessTreeV1 {
     pub fn capture(
@@ -1485,11 +1674,21 @@ impl OwnedProcessTreeV1 {
                 pgid,
                 immutable_start,
             },
+            process: None,
         })
     }
     #[must_use]
     pub fn identity(&self) -> &ResourceIdentityV1 {
         &self.identity
+    }
+    pub(crate) fn from_bound(
+        identity: ResourceIdentityV1,
+        process: Arc<crate::process::OwnedProcessStateV1>,
+    ) -> Self {
+        Self {
+            identity,
+            process: Some(process),
+        }
     }
     pub fn journal_capture(
         &self,
@@ -2453,7 +2652,7 @@ mod tests {
 
     #[test]
     fn journaled_intent_reserves_exact_capacity_through_terminal_settlement() {
-        let (flight, _, _) = create(6);
+        let (flight, _, _) = create(7);
         let primary = owner("node_a", "session-a");
         flight.attach_owner(primary.clone()).unwrap();
         flight.close_admission().unwrap();
@@ -2570,7 +2769,11 @@ mod tests {
             }
         ));
 
-        flight.settle(complete()).unwrap();
+        assert_eq!(
+            flight.settle(complete()).unwrap().disposition,
+            ResourceActionDispositionV1::Unknown,
+            "the driver must return the terminal result that won the journal CAS"
+        );
         assert_eq!(
             flight.join_blocking().unwrap().disposition,
             ResourceActionDispositionV1::Unknown
@@ -2890,5 +3093,93 @@ mod tests {
         });
         assert!(result_rx.recv_timeout(Duration::from_secs(1)).unwrap());
         assert_eq!(publisher.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn process_lifecycle_events_have_exact_wire_goldens() {
+        let detached = ResourceFlightJournalEventV1::OwnerDetached {
+            owner: owner("node_a", "session-a"),
+        };
+        assert_eq!(
+            serde_json::to_string(&detached).unwrap(),
+            r#"{"event":"owner_detached","owner":{"node_id":"node_a","owner_key":"session-a"}}"#
+        );
+
+        let binding = ResourceFlightJournalEventV1::ProcessBindingFailed {
+            stage: ProcessBindingStageV1::ImmutableStart,
+            pid: Some(42),
+        };
+        assert_eq!(
+            serde_json::to_string(&binding).unwrap(),
+            r#"{"event":"process_binding_failed","stage":"immutable_start","pid":42}"#
+        );
+
+        let signals = ResourceFlightJournalEventV1::ProcessSignalsObserved {
+            observations: vec![ProcessSignalObservationV1 {
+                pid: 42,
+                expected_start_time_ticks: 7,
+                signal: 15,
+                return_code: 0,
+                errno: None,
+            }],
+        };
+        assert_eq!(
+            serde_json::to_string(&signals).unwrap(),
+            r#"{"event":"process_signals_observed","observations":[{"pid":42,"expected_start_time_ticks":7,"signal":15,"return_code":0,"errno":null}]}"#
+        );
+
+        let reservation = ResourceFlightJournalEventV1::ProcessLifecycleReserved {
+            reserved_lifecycle_slots: PROCESS_LIFECYCLE_SLOTS,
+        };
+        assert_eq!(
+            serde_json::to_string(&reservation).unwrap(),
+            r#"{"event":"process_lifecycle_reserved","reserved_lifecycle_slots":7}"#
+        );
+    }
+
+    #[test]
+    fn process_lifecycle_event_reader_rejects_unknown_event_fields_and_stages() {
+        for invalid in [
+            r#"{"event":"future_process_event"}"#,
+            r#"{"event":"owner_detached","owner":{"node_id":"node_a","owner_key":"session-a"},"future":true}"#,
+            r#"{"event":"owner_detached","owner":{"node_id":"node_a","owner_key":"session-a","future":true}}"#,
+            r#"{"event":"process_binding_failed","stage":"future_stage","pid":42}"#,
+            r#"{"event":"process_signals_observed","observations":[{"pid":42,"expected_start_time_ticks":7,"signal":15,"return_code":0,"errno":null,"future":true}]}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<ResourceFlightJournalEventV1>(invalid).is_err(),
+                "must reject unsupported durable wire shape: {invalid}"
+            );
+        }
+    }
+
+    #[test]
+    fn process_lifecycle_reservation_protects_terminal_capacity() {
+        let (flight, _, _) = create(10);
+        let primary = owner("node_a", "session-a");
+        flight.attach_owner(primary).unwrap();
+        flight.reserve_process_lifecycle().unwrap();
+        let spawn_owner = owner("process-spawn", "spawn-owner");
+        flight.attach_owner_legacy_v2(spawn_owner.clone()).unwrap();
+        assert!(flight.detach_owner(&spawn_owner).unwrap());
+        assert!(matches!(
+            flight.attach_owner(owner("node_b", "session-b")),
+            Err(RetainedResourceFlightError::Journal(
+                ResourceFlightJournalError::Full
+            ))
+        ));
+        flight
+            .journal_process_tree(ResourceIdentityV1::AcpProcess {
+                generation: "shared-generation".into(),
+                spawn_nonce_sha256: sha('b'),
+                pid: 42,
+                pgid: Some(42),
+                immutable_start: ProcessStartIdentityV1 {
+                    pid: 42,
+                    start_time_ticks: 7,
+                    executable_sha256: None,
+                },
+            })
+            .unwrap();
     }
 }
