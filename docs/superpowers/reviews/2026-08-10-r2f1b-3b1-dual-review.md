@@ -98,3 +98,22 @@ filled with the 19/20 baseline control on `0a3c2434`).
   liveness, transfer sink, journal serialization.
 
 Fold-gate totals + coverage delta in the addendum below.
+
+## Fold addendum (post-push)
+
+Fold gates at `3c4dbe15`: squash code-tree BYTE-IDENTICAL to the gated branch
+tip (`git diff` over crates/bin/Cargo\* empty), so the s3b1 host gates
+transfer — fmt OK, clippy `-D warnings` exit 0, **workspace 3,904 / 0 / 12
+across 90** (3,866 → +38); `cargo deny` 0; repo-hygiene 0 (40 tracked
+artifacts, 8 validated example configs). Coverage vs the 3s seed (lib scope,
+darwin): bridge-core **85.70%** lines (24,808 / 3,548 missed) — **−1.99 vs
+3a's 87.69** on a population 3b1 grew by ~4.7k lines (large in-file test
+modules + darwin-only census/probe arms that only host tests exercise);
+bridge-workflow **84.90%** (11,827 / 1,786) — EXACTLY the seed, unchanged
+(3b1 does not touch it; validates the scope replication). Probe note: the
+first coverage invocation ran default scope — population mismatch, so
+inadmissible for the delta; retained as supplementary (core 84.89 / workflow
+89.66 default-scope darwin). The CI Linux floors adjudicate separately —
+the bridge-core ≥86 fail-under-lines stage is the watch item on this push.
+Fold-ritual reaps: s3b1 worktree target + the three 3b1 implement-clone
+targets; receipts in the session scratchpad.
