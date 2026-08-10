@@ -118,7 +118,25 @@ does not rebuild this site. Disposition:
 indistinguishable) stays parked under the same family owner; the per-run
 timeout on gate runs is the containment.
 
-## 5. Baseline appendix (filled before the 3b1 fold gate)
+## 5. Baseline appendix (filled 2026-08-09 22:43 MDT, before dispatch completed)
 
-- [pending] N=20 whole-bin baseline on `0a3c2434`: exit codes + any failure
-  signatures, log `scratchpad/3b1-baseline-control.log`.
+N=20 sequential whole-bin (`--bin a2a-bridge`, 1081 tests) runs at
+`--test-threads=32`, `CARGO_INCREMENTAL=0`, on `0a3c2434` (fold worktree,
+darwin host; ~16 s/run, no timeouts): **19/20 green.**
+
+- `process_executor_kills_descendants_when_execution_is_cancelled`: **0
+  failures in 20** — consistent with the recorded ~2%/run (P(zero) ≈ 0.67);
+  presence unbounded either way at this n, exactly as §3 predicted. The
+  disposition in §4 is unchanged.
+- Run 18 failed `compatibility_schedule_state::tests::owner_admission_lock_release_failure_is_loud_not_silent`
+  (panic chain `liveness.rs:80` → `compatibility_schedule_state.rs:1556`;
+  1080/1/0) — the KNOWN flock/exec family (F-3/#9 lineage, already
+  hermetic-container-excluded). New data point for that family's ledger: it
+  flakes HOST-side at ~1/20 under whole-bin `--test-threads=32`, not only
+  in-container. Attribution rule §4(b) extends to this family at the 3b1
+  fold gate (it predates 3b1 on the dispatch base — this run IS the
+  same-environment control).
+
+Full log: session scratchpad `3b1-baseline-control.log`; failing-run capture
+`3b1-baseline-run-18.log` (both under
+`/private/tmp/claude-501/-Users-wesleyjinks-code-a2a-bridge/9011bdd2-0fb8-4c5b-a150-74e3ec60d1b0/scratchpad/`).
