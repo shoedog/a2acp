@@ -97,7 +97,11 @@ name = "test"
 #   --skip _host_signal_semantics (added 2026-08-10, 3b1 dispatch): the 3b1 spec instructs the
 #     implementer to suffix any NEW test needing host process-tree/signal semantics with
 #     `_host_signal_semantics`; the host fold gate runs them.
-cmd  = "cargo test --workspace --locked --exclude bridge-container -- --skip process::tests::terminate_reaps_child_no_zombie --skip process::tests::term_ignoring_loop_forces_group_sigkill --skip process::tests::drop_group_kills_descendants --skip lock_release_failure_is_loud_not_silent --skip staged_candidate_ --skip _host_signal_semantics"
+#   --skip open_directory_no_follow (added 2026-08-10, 3b1 continuation): the fs_custody
+#     exact-per-platform errno tripwire fires on the container VFS (in-container Linux returns
+#     ENOTDIR where bare Linux pins ELOOP — the 2d-record environmental family). Host gates run it;
+#     the 3b1 base run weakened the assert to pass in-container and the continuation reverts that.
+cmd  = "cargo test --workspace --locked --exclude bridge-container -- --skip process::tests::terminate_reaps_child_no_zombie --skip process::tests::term_ignoring_loop_forces_group_sigkill --skip process::tests::drop_group_kills_descendants --skip lock_release_failure_is_loud_not_silent --skip staged_candidate_ --skip _host_signal_semantics --skip open_directory_no_follow"
 # opt-in coverage (instrumented recompile; reported, never gates):
 # [[languages.verify]]
 # name = "coverage"
