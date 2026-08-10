@@ -84,6 +84,8 @@ use bridge_core::execution_policy::{
     select_custody_plan_v1, BoundWorktreeCustodyV1, FrozenCheckoutEffectV1, WorktreeCustodyIdV1,
     WorktreeObjectIdentityV1,
 };
+#[cfg(unix)]
+use bridge_core::fs_custody::BirthTimeV1;
 use bridge_core::fs_custody::{
     open_options_create_new_owner_private, CustodyPublicationV1, DirectoryIdentityV1,
     FsCustodyError, PinnedDirectoryV1, RegularChildRefV1,
@@ -426,6 +428,7 @@ pub fn planned_identity(path: &str) -> WorktreeObjectIdentityV1 {
             canonical_path: path.to_string(),
             dev: None,
             ino: None,
+            btime: None,
         },
     }
 }
@@ -450,6 +453,7 @@ pub fn observed_identity(path: &str) -> WorktreeObjectIdentityV1 {
                 canonical_path: path.to_string(),
                 dev: Some(metadata.dev()),
                 ino: Some(metadata.ino()),
+                btime: BirthTimeV1::from_metadata(&metadata),
             },
         }
     }
@@ -715,8 +719,9 @@ impl WorktreeCustodianV1 {
     /// DESCRIPTOR (§2.2: "Identity is checked by descriptor, not by re-canonicalizing a string, at
     /// every decision point").
     ///
-    /// The comparison is on the observed `dev`/`ino`, and a degraded re-observation (the object is
-    /// gone, or cannot be opened no-follow) never matches a complete retained identity — so a
+    /// The comparison is on observed `dev`/`ino` plus birthtime when both sides carry it. A
+    /// degraded re-observation (the object is gone, or cannot be opened no-follow) never matches
+    /// a complete retained identity — so a
     /// vanished object fails verification rather than silently passing as "same path".
     #[must_use]
     pub fn identities_reverify(retained: &MaterializedIdentitiesV1) -> bool {
@@ -730,7 +735,9 @@ impl WorktreeCustodianV1 {
         .all(|expected| {
             let observed = observed_identity(&expected.canonical_path);
             observed.directory_identity.dev.is_some()
-                && observed.directory_identity == expected.directory_identity
+                && expected
+                    .directory_identity
+                    .matches(&observed.directory_identity)
         })
     }
 
@@ -1544,6 +1551,40 @@ mod tests {
         ));
         std::fs::create_dir_all(&path).unwrap();
         std::fs::canonicalize(&path).unwrap()
+    }
+
+    /// Pre-create the replacement while the authorized directory is still live, then rename
+    /// both objects into place. Two simultaneously live directories cannot share an inode, so
+    /// this constructs a deterministic swap even when the filesystem promptly recycles inodes.
+    /// The displaced original remains at the returned path until the test root is removed.
+    fn replace_directory_with_precreated_sibling(path: &Path) -> PathBuf {
+        let parent = path.parent().expect("test directory has a parent");
+        let name = path
+            .file_name()
+            .expect("test directory has a name")
+            .to_string_lossy();
+        let replacement = parent.join(format!("{name}.swap-replacement"));
+        let displaced = parent.join(format!("{name}.swap-original"));
+        std::fs::create_dir(&replacement).unwrap();
+
+        let before = observed_identity(&path.to_string_lossy());
+        let candidate = observed_identity(&replacement.to_string_lossy());
+        assert!(
+            !before
+                .directory_identity
+                .matches(&candidate.directory_identity),
+            "precondition: simultaneously live original and replacement must have distinct identities"
+        );
+
+        std::fs::rename(path, &displaced).unwrap();
+        std::fs::rename(&replacement, path).unwrap();
+
+        let after = observed_identity(&path.to_string_lossy());
+        assert!(
+            !before.directory_identity.matches(&after.directory_identity),
+            "precondition: the same-name replacement must not match the retained identity"
+        );
+        displaced
     }
 
     fn binding(target: &Path) -> BoundWorktreeCustodyV1 {
@@ -2574,7 +2615,8 @@ mod tests {
 
     /// The positive control for the reverification predicate itself: an untouched object graph
     /// verifies, and a single swapped member is enough to fail it. Without this, the test above
-    /// could pass against a predicate that is simply always false.
+    /// could pass against a predicate that is simply always false. The replacement is pre-created
+    /// so two live objects guarantee distinct inodes before the rename swap.
     #[test]
     fn identity_reverification_passes_untouched_objects_and_fails_one_swap() {
         let worktree_root = root("preserve-reverify");
@@ -2584,8 +2626,7 @@ mod tests {
 
         assert!(WorktreeCustodianV1::identities_reverify(&retained));
 
-        std::fs::remove_dir_all(&target).unwrap();
-        std::fs::create_dir_all(&target).unwrap();
+        let _displaced = replace_directory_with_precreated_sibling(&target);
         assert!(
             !WorktreeCustodianV1::identities_reverify(&retained),
             "a same-name replacement must not reverify"
@@ -2818,14 +2859,14 @@ mod tests {
     /// substitution `identities_reverify` exists to catch — and the CAS must not run.
     ///
     /// Discriminates a mint that reverifies after the CAS, or not at all: either would leave a
-    /// durable `DeleteAuthorized` naming an object graph nobody can vouch for.
+    /// durable `DeleteAuthorized` naming an object graph nobody can vouch for. The replacement is
+    /// pre-created so two live objects guarantee distinct inodes before the rename swap.
     #[test]
     fn a_swapped_object_graph_is_never_authorized_for_deletion() {
         let worktree_root = root("authorize-swap");
         let target = worktree_root.join("ownr-run7-abc");
         let (custodian, identities) = live_protected(&worktree_root, &target);
-        std::fs::remove_dir_all(&target).unwrap();
-        std::fs::create_dir_all(&target).unwrap();
+        let _displaced = replace_directory_with_precreated_sibling(&target);
 
         let authorization = custodian.authorize_deletion("/src", &identities);
 
@@ -2847,7 +2888,8 @@ mod tests {
     ///
     /// This is the SECOND identity check, and the test drives the window the mint's own check
     /// cannot cover — the swap happens after the CAS. Discriminates a `revalidate_for_removal`
-    /// that merely rewraps the capability.
+    /// that merely rewraps the capability. The replacement is pre-created so two live objects
+    /// guarantee distinct inodes before the rename swap.
     #[test]
     fn a_capability_whose_objects_changed_cannot_authorize_a_removal() {
         let worktree_root = root("capability-revalidate");
@@ -2858,8 +2900,7 @@ mod tests {
         else {
             panic!("a live checkout authorizes")
         };
-        std::fs::remove_dir_all(&target).unwrap();
-        std::fs::create_dir_all(&target).unwrap();
+        let _displaced = replace_directory_with_precreated_sibling(&target);
 
         let authorized = capability.revalidate_for_removal();
 

@@ -3832,7 +3832,7 @@ mod tests {
         use bridge_core::execution_policy::{
             PolicyNodeRefV1, Sha256HexV1, WorktreeCustodyIdV1, WorktreeObjectIdentityV1,
         };
-        use bridge_core::fs_custody::DirectoryIdentityV1;
+        use bridge_core::fs_custody::{BirthTimeV1, DirectoryIdentityV1};
         use bridge_core::ids::{AttemptId, AttemptIdentity, ExecutionId};
         let canonical = display_path(worktree);
         let meta = std::fs::symlink_metadata(worktree).unwrap();
@@ -3853,6 +3853,7 @@ mod tests {
                     canonical_path: canonical.clone(),
                     dev: Some(meta.dev()),
                     ino: Some(meta.ino()),
+                    btime: BirthTimeV1::from_metadata(&meta),
                 },
             },
             state,

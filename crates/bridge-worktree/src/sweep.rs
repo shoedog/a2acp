@@ -5,6 +5,8 @@ use crate::custody::{
 use crate::provider::{prune_argv, remove_argv};
 use crate::provider_path::{canonicalize_lenient, read_sidecar, sidecar_path};
 use bridge_core::fs_custody::PinnedDirectoryV1;
+#[cfg(unix)]
+use bridge_core::fs_custody::{BirthTimeV1, DirectoryIdentityV1};
 use bridge_core::liveness::LeaseProbe;
 use bridge_core::run_identity::{classify, Verdict};
 use bridge_core::SessionCwd;
@@ -248,8 +250,10 @@ pub fn custody_entry_disposition(
 /// pre-materialization writer records plan-derived paths with no `dev`/`ino`), or the
 /// platform has no such evidence (brief risk R-10, non-unix).
 fn recorded_identity_matches_sibling(record: &WorktreeCustodyRecordV1) -> Option<bool> {
-    let recorded_dev = record.worktree.directory_identity.dev?;
-    let recorded_ino = record.worktree.directory_identity.ino?;
+    let recorded = &record.worktree.directory_identity;
+    if recorded.dev.is_none() || recorded.ino.is_none() {
+        return None;
+    }
     let file = bridge_core::fs_custody::open_directory_no_follow_raw(Path::new(
         record.worktree.canonical_path.as_str(),
     ))
@@ -258,11 +262,17 @@ fn recorded_identity_matches_sibling(record: &WorktreeCustodyRecordV1) -> Option
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt as _;
-        Some(metadata.dev() == recorded_dev && metadata.ino() == recorded_ino)
+        let observed = DirectoryIdentityV1 {
+            canonical_path: record.worktree.canonical_path.clone(),
+            dev: Some(metadata.dev()),
+            ino: Some(metadata.ino()),
+            btime: BirthTimeV1::from_metadata(&metadata),
+        };
+        Some(recorded.matches(&observed))
     }
     #[cfg(not(unix))]
     {
-        let _ = (metadata, recorded_dev, recorded_ino);
+        let _ = metadata;
         None
     }
 }
@@ -733,7 +743,7 @@ mod tests {
     use bridge_core::execution_policy::{
         PolicyNodeRefV1, Sha256HexV1, WorktreeCustodyIdV1, WorktreeObjectIdentityV1,
     };
-    use bridge_core::fs_custody::DirectoryIdentityV1;
+    use bridge_core::fs_custody::{BirthTimeV1, DirectoryIdentityV1};
     use bridge_core::ids::{AttemptId, AttemptIdentity, ExecutionId};
 
     fn sha(digit: char) -> Sha256HexV1 {
@@ -750,18 +760,19 @@ mod tests {
             .then(|| {
                 std::fs::symlink_metadata(path).ok().map(|meta| {
                     use std::os::unix::fs::MetadataExt as _;
-                    (meta.dev(), meta.ino())
+                    (meta.dev(), meta.ino(), BirthTimeV1::from_metadata(&meta))
                 })
             })
             .flatten();
-        let fallback = if degraded { None } else { Some((1, 2)) };
+        let fallback = if degraded { None } else { Some((1, 2, None)) };
         let identity = observed.or(fallback);
         WorktreeObjectIdentityV1 {
             canonical_path: path.to_string(),
             directory_identity: DirectoryIdentityV1 {
                 canonical_path: path.to_string(),
-                dev: identity.map(|(dev, _)| dev),
-                ino: identity.map(|(_, ino)| ino),
+                dev: identity.map(|(dev, _, _)| dev),
+                ino: identity.map(|(_, ino, _)| ino),
+                btime: identity.and_then(|(_, _, btime)| btime),
             },
         }
     }
@@ -1138,8 +1149,6 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn sweep_falls_back_to_recover_when_the_sibling_directory_was_swapped() {
-        use std::os::unix::fs::MetadataExt as _;
-
         let root = unique_temp_dir("v3-swapped");
         fs::create_dir_all(&root).unwrap();
         let (worktree, record) =
@@ -1151,11 +1160,24 @@ mod tests {
             CustodySweepDispositionV1::Preserved
         );
 
-        let before = fs::symlink_metadata(&worktree).unwrap().ino();
-        fs::remove_dir_all(&worktree).unwrap();
-        fs::create_dir_all(&worktree).unwrap();
-        let after = fs::symlink_metadata(&worktree).unwrap().ino();
-        assert_ne!(before, after, "the swap must actually change the inode");
+        // Pre-create the replacement while the recorded directory is still live, guaranteeing
+        // a distinct inode even on ext4, then rename both objects to perform the same-name swap.
+        let replacement = root.join("swapped.swap-replacement");
+        let displaced = root.join("swapped.swap-original");
+        fs::create_dir(&replacement).unwrap();
+        let before = object_with(&worktree.to_string_lossy(), false).directory_identity;
+        let candidate = object_with(&replacement.to_string_lossy(), false).directory_identity;
+        assert!(
+            !before.matches(&candidate),
+            "precondition: simultaneously live original and replacement must have distinct identities"
+        );
+        fs::rename(&worktree, &displaced).unwrap();
+        fs::rename(&replacement, &worktree).unwrap();
+        let after = object_with(&worktree.to_string_lossy(), false).directory_identity;
+        assert!(
+            !before.matches(&after),
+            "precondition: the same-name replacement must not match the recorded identity"
+        );
 
         let disposition = scanned_disposition(&root, &record);
         assert_eq!(disposition, CustodySweepDispositionV1::Recover);

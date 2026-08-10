@@ -23,6 +23,87 @@ use std::ffi::OsStr;
 use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+/// A filesystem object's birth timestamp, normalized as signed Unix-epoch seconds plus
+/// nanoseconds. The nanosecond component is always in `0..1_000_000_000`, including for times
+/// before the epoch, so the serialized pair has one stable representation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub struct BirthTimeV1 {
+    secs: i64,
+    nanos: u32,
+}
+
+impl<'de> Deserialize<'de> for BirthTimeV1 {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct WireBirthTimeV1 {
+            secs: i64,
+            nanos: u32,
+        }
+
+        let wire = WireBirthTimeV1::deserialize(deserializer)?;
+        if wire.nanos >= 1_000_000_000 {
+            return Err(serde::de::Error::custom(
+                "birth timestamp nanoseconds must be less than 1000000000",
+            ));
+        }
+        Ok(Self {
+            secs: wire.secs,
+            nanos: wire.nanos,
+        })
+    }
+}
+
+impl BirthTimeV1 {
+    /// Construct a birth timestamp whose nanosecond component is canonical.
+    #[must_use]
+    pub const fn new(secs: i64, nanos: u32) -> Option<Self> {
+        if nanos < 1_000_000_000 {
+            Some(Self { secs, nanos })
+        } else {
+            None
+        }
+    }
+
+    /// Convert a `SystemTime` into the canonical signed-seconds representation. A timestamp
+    /// outside the `i64` epoch range is unavailable rather than a custody observation error.
+    #[must_use]
+    pub fn from_system_time(time: SystemTime) -> Option<Self> {
+        match time.duration_since(UNIX_EPOCH) {
+            Ok(duration) => Some(Self {
+                secs: i64::try_from(duration.as_secs()).ok()?,
+                nanos: duration.subsec_nanos(),
+            }),
+            Err(error) => {
+                let duration = error.duration();
+                let whole_seconds = i64::try_from(duration.as_secs()).ok()?;
+                if duration.subsec_nanos() == 0 {
+                    Some(Self {
+                        secs: whole_seconds.checked_neg()?,
+                        nanos: 0,
+                    })
+                } else {
+                    Some(Self {
+                        secs: whole_seconds.checked_neg()?.checked_sub(1)?,
+                        nanos: 1_000_000_000 - duration.subsec_nanos(),
+                    })
+                }
+            }
+        }
+    }
+
+    /// Read `Metadata::created()` when the filesystem exposes it. Missing birthtime support is
+    /// intentionally represented as `None` and never turns identity observation into an error.
+    #[must_use]
+    pub fn from_metadata(metadata: &std::fs::Metadata) -> Option<Self> {
+        metadata.created().ok().and_then(Self::from_system_time)
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -32,6 +113,27 @@ pub struct DirectoryIdentityV1 {
     pub dev: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ino: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub btime: Option<BirthTimeV1>,
+}
+
+impl DirectoryIdentityV1 {
+    /// Match an observed directory identity using birthtime as a strengthening refinement.
+    ///
+    /// Path, device, and inode retain their exact pre-birthtime semantics. A birthtime mismatch
+    /// refuses only when both identities carry one; if either side lacks birthtime, verification
+    /// falls back to the legacy `(canonical_path, dev, ino)` verdict so pre-upgrade records keep
+    /// verifying exactly as before.
+    #[must_use]
+    pub fn matches(&self, observed: &Self) -> bool {
+        self.canonical_path == observed.canonical_path
+            && self.dev == observed.dev
+            && self.ino == observed.ino
+            && match (self.btime, observed.btime) {
+                (Some(expected), Some(actual)) => expected == actual,
+                _ => true,
+            }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -284,7 +386,7 @@ impl PinnedDirectoryV1 {
         let file = open_directory_no_follow(&canonical_path, label)?;
         let identity = directory_identity(&canonical_path, &file, label)?;
         let after = directory_path_identity(&canonical_path, label)?;
-        if identity != before || identity != after {
+        if !identity.matches(&before) || !identity.matches(&after) {
             return Err(FsCustodyError::IdentityChanged(label.to_owned()));
         }
         Ok(Self {
@@ -500,6 +602,7 @@ fn directory_path_identity(
         canonical_path: canonical_path.to_string_lossy().into_owned(),
         dev: Some(metadata.dev()),
         ino: Some(metadata.ino()),
+        btime: BirthTimeV1::from_metadata(&metadata),
     })
 }
 
@@ -519,6 +622,7 @@ fn directory_path_identity(
         canonical_path: canonical_path.to_string_lossy().into_owned(),
         dev: None,
         ino: None,
+        btime: None,
     })
 }
 
@@ -567,6 +671,7 @@ fn directory_identity(
         canonical_path: canonical_path.to_string_lossy().into_owned(),
         dev: Some(metadata.dev()),
         ino: Some(metadata.ino()),
+        btime: BirthTimeV1::from_metadata(&metadata),
     })
 }
 
@@ -588,6 +693,7 @@ fn directory_identity(
         canonical_path: canonical_path.to_string_lossy().into_owned(),
         dev: None,
         ino: None,
+        btime: None,
     })
 }
 
@@ -1204,15 +1310,16 @@ pub fn directory_dev_ino(path: &Path) -> Result<(u64, u64), String> {
 /// the swap check: an actor controlling the parent can rename the root away and put another
 /// directory in its place, after which every path-based operation lands in the replacement.
 pub fn pinned_root_unchanged(pin: &PinnedDirectoryV1) -> Result<(), String> {
-    let (dev, ino) = directory_dev_ino(pin.canonical_path())?;
+    let observed = directory_path_identity(pin.canonical_path(), "pinned scan root")
+        .map_err(|error| error.to_string())?;
     let want = pin.identity();
-    if want.dev != Some(dev) || want.ino != Some(ino) {
+    if !want.matches(&observed) {
         return Err(format!(
-            "pinned scan root {} now resolves to a different directory (dev/ino {dev}/{ino}, pinned \
-             {:?}/{:?})",
+            "pinned scan root {} now resolves to a different directory (observed {:?}, pinned \
+             {:?})",
             pin.canonical_path().display(),
-            want.dev,
-            want.ino
+            observed,
+            want,
         ));
     }
     Ok(())
@@ -1445,6 +1552,78 @@ mod tests {
         }
     }
 
+    /// Birthtime is a refinement, not a migration barrier: two present values must agree,
+    /// while either missing value preserves the legacy path/device/inode verdict.
+    #[test]
+    fn directory_identity_birthtime_is_a_strengthening_refinement() {
+        let legacy = DirectoryIdentityV1 {
+            canonical_path: "/root/worktree".to_string(),
+            dev: Some(7),
+            ino: Some(11),
+            btime: None,
+        };
+        let first = DirectoryIdentityV1 {
+            btime: Some(BirthTimeV1::new(1_700_000_000, 123).unwrap()),
+            ..legacy.clone()
+        };
+        let second = DirectoryIdentityV1 {
+            btime: Some(BirthTimeV1::new(1_700_000_000, 124).unwrap()),
+            ..legacy.clone()
+        };
+
+        assert!(
+            legacy.matches(&legacy),
+            "None/None keeps the legacy verdict"
+        );
+        assert!(
+            legacy.matches(&first),
+            "None/Some falls back to the legacy verdict"
+        );
+        assert!(
+            first.matches(&legacy),
+            "Some/None falls back to the legacy verdict"
+        );
+        assert!(first.matches(&first), "equal Some birthtimes match");
+        assert!(
+            !first.matches(&second),
+            "differing present birthtimes must refuse even when path/device/inode match"
+        );
+
+        let different_inode = DirectoryIdentityV1 {
+            ino: Some(12),
+            btime: None,
+            ..legacy.clone()
+        };
+        assert!(
+            !legacy.matches(&different_inode),
+            "None/None must retain a legacy inode mismatch"
+        );
+        assert!(
+            !first.matches(&different_inode),
+            "Some/None must fall through to the legacy inode mismatch"
+        );
+        let different_inode_with_btime = DirectoryIdentityV1 {
+            btime: first.btime,
+            ..different_inode
+        };
+        assert!(
+            !legacy.matches(&different_inode_with_btime),
+            "None/Some must fall through to the legacy inode mismatch"
+        );
+    }
+
+    /// Locks the normalized representation for timestamps immediately before the Unix epoch.
+    #[test]
+    fn birthtime_before_epoch_has_one_canonical_seconds_nanos_pair() {
+        let time = UNIX_EPOCH
+            .checked_sub(Duration::from_nanos(1))
+            .expect("one nanosecond before the epoch is representable");
+        assert_eq!(
+            BirthTimeV1::from_system_time(time),
+            BirthTimeV1::new(-1, 999_999_999)
+        );
+    }
+
     // ---------------------------------------------------------------------------------------
     // PinnedDirectoryV1::open
     // ---------------------------------------------------------------------------------------
@@ -1466,12 +1645,16 @@ mod tests {
         assert_eq!(pinned.identity().dev, Some(expected.dev()));
         assert_eq!(pinned.identity().ino, Some(expected.ino()));
         assert_eq!(
+            pinned.identity().btime,
+            BirthTimeV1::from_metadata(&expected)
+        );
+        assert_eq!(
             pinned.canonical_path(),
             fs::canonicalize(dir.path()).unwrap()
         );
     }
 
-    /// Discriminates a regression that drops the `identity != before || identity != after`
+    /// Discriminates a regression that drops the `refinement-aware before and after matcher`
     /// recheck in `PinnedDirectoryV1::open` *entirely*: a background thread continuously
     /// replaces the target directory (via an atomic directory-to-directory rename, so the path
     /// is never momentarily absent) while the foreground repeatedly calls `open` until it
@@ -1481,7 +1664,7 @@ mod tests {
     /// field distinguishing which side of the check tripped — the pre-open `before` stat or the
     /// post-open `after` stat. Because the swapper races continuously through the whole guarded
     /// window (often swapping more than once per `open` attempt), a *one-sided* weakening — e.g.
-    /// keeping only `identity != before` and dropping `identity != after`, or vice versa — often
+    /// keeping only the before matcher and dropping the after matcher, or vice versa — often
     /// still fires by chance on the surviving comparison across many attempts, so this test
     /// cannot reliably prove either half of the check is individually required. It reliably
     /// catches only complete removal of the guard (both comparisons dropped, as verified by

@@ -551,7 +551,8 @@ fn validate_object_identity(
     }
     let dev = identity.directory_identity.dev;
     let ino = identity.directory_identity.ino;
-    if dev.is_some() != ino.is_some() {
+    let btime = identity.directory_identity.btime;
+    if dev.is_some() != ino.is_some() || (btime.is_some() && dev.is_none()) {
         return Err(CustodyRecordDecodeErrorV1::IdentityPartial);
     }
     // Platform exclusion (brief risk R-10): `DirectoryIdentityV1` has no dev/ino on
@@ -618,6 +619,8 @@ impl WorktreeCustodyRecordV1 {
         if claim.custody_id != self.custody_id
             || claim.checkout_fingerprint != self.checkout_fingerprint
             || claim.current_attempt != self.current_attempt
+            // This is exact structural equality between the duplicated envelope and claim bytes,
+            // not filesystem verification; differing birthtime presence is contradictory here.
             || claim.worktree != self.worktree
         {
             return Err(CustodyRecordDecodeErrorV1::ClaimIdentityMismatch);
@@ -852,7 +855,7 @@ pub fn read_custody_record_in(
 mod tests {
     use super::*;
     use bridge_core::execution_policy::{PolicyNodeRefV1, Sha256HexV1, WorktreeCustodyIdV1};
-    use bridge_core::fs_custody::DirectoryIdentityV1;
+    use bridge_core::fs_custody::{BirthTimeV1, DirectoryIdentityV1};
     use bridge_core::ids::{AttemptId, AttemptIdentity, ExecutionId};
 
     fn cid(digit: char) -> WorktreeCustodyIdV1 {
@@ -895,6 +898,7 @@ mod tests {
                 canonical_path: path.to_string(),
                 dev: Some(dev),
                 ino: Some(ino),
+                btime: None,
             },
         }
     }
@@ -992,6 +996,7 @@ mod tests {
                 canonical_path: path.to_string(),
                 dev: None,
                 ino: None,
+                btime: None,
             },
         }
     }
@@ -1263,8 +1268,57 @@ mod tests {
         format!("{trimmed},\"extra\":1}}")
     }
 
-    /// Discriminates: `deny_unknown_fields` being dropped from the claim, at
-    /// the claim's own level.
+    /// Golden coverage for the additive directory birthtime refinement. The legacy object
+    /// remains byte-for-byte unchanged when birthtime is absent, while a present timestamp has
+    /// one exact seconds/nanoseconds representation and malformed nanoseconds fail strict read.
+    #[test]
+    fn directory_birthtime_golden_round_trip_and_strict_malformed_refusal() {
+        let legacy = object("/root/wt", 1, 12);
+        assert_eq!(
+            serde_json::to_string(&legacy).unwrap(),
+            object_golden("/root/wt", 1, 12),
+            "an absent btime must preserve the exact pre-upgrade bytes"
+        );
+
+        let mut with_btime = legacy;
+        with_btime.directory_identity.btime =
+            Some(BirthTimeV1::new(1_700_000_000, 123_456_789).unwrap());
+        let golden = "{\"canonical_path\":\"/root/wt\",\"directory_identity\":{\"canonical_path\":\"/root/wt\",\"dev\":1,\"ino\":12,\"btime\":{\"secs\":1700000000,\"nanos\":123456789}}}";
+        assert_eq!(serde_json::to_string(&with_btime).unwrap(), golden);
+        assert_eq!(
+            serde_json::from_str::<WorktreeObjectIdentityV1>(golden).unwrap(),
+            with_btime
+        );
+
+        let mut record = live_record();
+        record.worktree = with_btime;
+        let record_golden = live_record_golden().replacen(
+            "\"ino\":12}",
+            "\"ino\":12,\"btime\":{\"secs\":1700000000,\"nanos\":123456789}}",
+            1,
+        );
+        assert_eq!(
+            String::from_utf8(record.encode_canonical().unwrap()).unwrap(),
+            record_golden
+        );
+        assert_eq!(
+            WorktreeCustodyRecordV1::decode_canonical(record_golden.as_bytes()).unwrap(),
+            record
+        );
+
+        let malformed = golden.replace("\"nanos\":123456789", "\"nanos\":1000000000");
+        assert!(
+            serde_json::from_str::<WorktreeObjectIdentityV1>(&malformed).is_err(),
+            "a non-canonical nanosecond component must be rejected by the strict reader"
+        );
+        let malformed_record = record_golden.replace("\"nanos\":123456789", "\"nanos\":1000000000");
+        assert_eq!(
+            WorktreeCustodyRecordV1::decode_canonical(malformed_record.as_bytes()),
+            Err(CustodyRecordDecodeErrorV1::Malformed)
+        );
+    }
+
+    /// Discriminates removal of the claim's strict unknown-field policy.
     #[test]
     fn preserved_claim_rejects_unknown_field() {
         let with_extra = with_extra_top_level_key(&claim_golden());
@@ -1624,6 +1678,7 @@ mod tests {
                     canonical_path: "/root/wt".to_string(),
                     dev,
                     ino,
+                    btime: None,
                 },
             };
             assert_eq!(

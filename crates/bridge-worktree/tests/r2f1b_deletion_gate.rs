@@ -251,6 +251,7 @@ fn publish_custody_record(worktree_path: &str) {
                 canonical_path: worktree_path.to_owned(),
                 dev: Some(1),
                 ino: Some(2),
+                btime: None,
             },
         },
         state: WorktreeCustodyStateV1::LiveProtected {},

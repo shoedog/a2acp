@@ -6460,6 +6460,7 @@ mod tests {
                     canonical_path: worktree_path.to_owned(),
                     dev: Some(1),
                     ino: Some(2),
+                    btime: None,
                 },
             },
             state,
@@ -8388,8 +8389,27 @@ mod tests {
     #[tokio::test]
     async fn a_settled_preservation_unknown_is_classified_as_preservation() {
         let (be, _rec, tmp, session, target, _bound) = v3_session("v3-settled-unknown").await;
-        std::fs::remove_dir_all(&target).unwrap();
-        std::fs::create_dir_all(&target).unwrap();
+
+        // Pre-create the replacement while the protected checkout is still live, guaranteeing a
+        // distinct inode even on ext4, then rename both objects to perform the same-name swap.
+        let target_path = Path::new(&target);
+        let name = target_path.file_name().unwrap().to_string_lossy();
+        let replacement = target_path.with_file_name(format!("{name}.swap-replacement"));
+        let displaced = target_path.with_file_name(format!("{name}.swap-original"));
+        std::fs::create_dir(&replacement).unwrap();
+        let before = observed_identity(&target).directory_identity;
+        let candidate = observed_identity(&replacement.to_string_lossy()).directory_identity;
+        assert!(
+            !before.matches(&candidate),
+            "precondition: simultaneously live original and replacement must have distinct identities"
+        );
+        std::fs::rename(target_path, &displaced).unwrap();
+        std::fs::rename(&replacement, target_path).unwrap();
+        let after = observed_identity(&target).directory_identity;
+        assert!(
+            !before.matches(&after),
+            "precondition: the same-name replacement must not match the retained identity"
+        );
 
         let settled = be
             .settle_workflow_checkout_v1(
