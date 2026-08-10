@@ -7,6 +7,17 @@ use crate::ids::AttemptId;
 use ring::rand::{SecureRandom, SystemRandom};
 use serde::{Deserialize, Serialize};
 
+pub use crate::retained_resource_flight::{
+    CleanupDeadlineTransferV1, FileResourceFlightJournal, JournaledDispatchAdmissionV1,
+    NodeCleanupAggregationV1, OwnedProcessTreeV1, ResourceActionIntentV1, ResourceFlightJournal,
+    ResourceFlightJournalError, ResourceFlightJournalEventV1, ResourceFlightJournalRecordV1,
+    ResourceFlightKeyV1, ResourceFlightOwnerV1, ResourceFlightRegistryV1,
+    ResourceFlightReservationOutcomeV1, ResourceFlightReservationRecordV1,
+    ResourceFlightReservationV1, ResourceFlightResultPublisher,
+    ResourceFlightTerminalAppendOutcomeV1, RetainedResourceFlight, RetainedResourceFlightConfigV1,
+    RetainedResourceFlightError, RetainedResourceFlightGuardV1,
+};
+
 pub const MAX_RECOVERY_REASON_BYTES: usize = 512;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]

@@ -26,6 +26,7 @@ pub mod provider;
 #[cfg(unix)]
 pub mod reaper;
 pub mod resource_flight;
+pub mod retained_resource_flight;
 #[cfg(unix)]
 pub mod run_identity;
 pub mod sandbox;
