@@ -1638,14 +1638,18 @@ pub enum CleanupDeadlineTransferV1 {
 #[derive(Clone)]
 pub struct OwnedProcessTreeV1 {
     identity: ResourceIdentityV1,
+    // The live signal capability exists only where the process module does;
+    // non-unix targets keep the capture-only decoding surface.
+    #[cfg(unix)]
     pub(crate) process: Option<Arc<crate::process::OwnedProcessStateV1>>,
 }
 impl std::fmt::Debug for OwnedProcessTreeV1 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("OwnedProcessTreeV1")
-            .field("identity", &self.identity)
-            .field("live_capability", &self.process.is_some())
-            .finish()
+        let mut s = f.debug_struct("OwnedProcessTreeV1");
+        s.field("identity", &self.identity);
+        #[cfg(unix)]
+        s.field("live_capability", &self.process.is_some());
+        s.finish()
     }
 }
 impl OwnedProcessTreeV1 {
@@ -1674,6 +1678,7 @@ impl OwnedProcessTreeV1 {
                 pgid,
                 immutable_start,
             },
+            #[cfg(unix)]
             process: None,
         })
     }
@@ -1681,6 +1686,7 @@ impl OwnedProcessTreeV1 {
     pub fn identity(&self) -> &ResourceIdentityV1 {
         &self.identity
     }
+    #[cfg(unix)]
     pub(crate) fn from_bound(
         identity: ResourceIdentityV1,
         process: Arc<crate::process::OwnedProcessStateV1>,
