@@ -47,6 +47,7 @@ const LIFECYCLE_SLOTS: u8 = 4;
 // signal batch, optional guard transfer, terminal settlement, and one owner
 // evidence margin. Unused slots are harmless; their purpose is to keep later
 // owner churn from consuming the rows needed to settle the process flight.
+#[cfg_attr(not(unix), allow(dead_code))]
 const PROCESS_LIFECYCLE_SLOTS: u8 = 7;
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -1094,6 +1095,7 @@ impl RetainedResourceFlight {
     /// journal rows on warm-session churn. Its compatibility journal is
     /// process-local evidence, while signal intent and terminal rows must stay
     /// available no matter how many sessions the long-lived backend served.
+    #[cfg_attr(not(unix), allow(dead_code))]
     pub(crate) fn attach_owner_legacy_v2(
         &self,
         owner: ResourceFlightOwnerV1,
@@ -1130,6 +1132,7 @@ impl RetainedResourceFlight {
         Ok(true)
     }
 
+    #[cfg_attr(not(unix), allow(dead_code))]
     pub(crate) fn detach_owner_legacy_v2(
         &self,
         owner: &ResourceFlightOwnerV1,
@@ -1145,6 +1148,7 @@ impl RetainedResourceFlight {
     /// syscall. The journal append lock makes this atomic with concurrent
     /// evidence admission, whose rows can use only capacity beyond these
     /// outstanding slots.
+    #[cfg_attr(not(unix), allow(dead_code))]
     pub(crate) fn reserve_process_lifecycle(&self) -> Result<(), RetainedResourceFlightError> {
         let mut state = self.lock()?;
         if !matches!(state.state, ResourceFlightStateV1::Open {}) {

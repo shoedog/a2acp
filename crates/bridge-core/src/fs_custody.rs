@@ -1577,10 +1577,17 @@ mod tests {
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
     fn open_directory_no_follow_refuses_a_symlinked_directory() {
+        // Exact per-platform tripwire. Linux: every measured Linux (the
+        // hermetic-verify container AND GitHub's ubuntu runner, 2026-08-10)
+        // returns ENOTDIR — the O_DIRECTORY check fires before O_NOFOLLOW's
+        // ELOOP on these kernels. The original ELOOP pin was never observed
+        // true on any Linux this repo gates on; corrected at the operator
+        // boundary on that two-environment CI evidence (fs_custody ledger
+        // item resolved — the assertion stays EXACT, not a tolerance).
         #[cfg(target_os = "macos")]
         const EXPECTED_ERRNO: i32 = libc::ENOTDIR;
         #[cfg(target_os = "linux")]
-        const EXPECTED_ERRNO: i32 = libc::ELOOP;
+        const EXPECTED_ERRNO: i32 = libc::ENOTDIR;
 
         let dir = tempfile::tempdir().unwrap();
         let real = dir.path().join("real");
