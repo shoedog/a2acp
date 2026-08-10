@@ -514,6 +514,9 @@ fn allocated_bytes(md: &std::fs::Metadata) -> u64 {
 /// Free / total bytes of the filesystem holding `path` (the D-4 admission floor's `df`-equivalent).
 /// `None` when the syscall fails. Read-only.
 #[cfg(unix)]
+// The statvfs field widths differ per platform libc (u32 on some, u64 on others),
+// so the widening casts are required on one target and "unnecessary" on another.
+#[allow(clippy::unnecessary_cast)]
 pub fn filesystem_space(path: &Path) -> (Option<u64>, Option<u64>) {
     let Ok(c) = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()) else {
         return (None, None);

@@ -169,6 +169,8 @@ impl PublicationRenameFaultV1 {
         }
     }
 
+    // Consumed only by the unix custody arms; non-unix keeps the shape without callers.
+    #[cfg_attr(not(unix), allow(dead_code))]
     fn decode(raw: u8) -> Self {
         match raw {
             1 => Self::AfterEffect,
@@ -182,6 +184,7 @@ impl PublicationRenameFaultV1 {
 /// `replace_regular_child` needs, and the reason the pre-rename half can no longer return a bare
 /// `Result<(), _>`.
 #[derive(Debug)]
+#[cfg_attr(not(unix), allow(dead_code))]
 enum RenameCommitV1 {
     /// The rename took effect. `syscall_error` is `Some` when that was established by post-error
     /// verification rather than by the syscall succeeding.
@@ -339,6 +342,7 @@ impl PinnedDirectoryV1 {
         self.publication_rename_failure_countdown.arm(call);
     }
 
+    #[cfg_attr(not(unix), allow(dead_code))]
     fn armed_publication_rename_fault(&self) -> Option<PublicationRenameFaultV1> {
         self.publication_rename_failure_countdown
             .fire_if_due()
