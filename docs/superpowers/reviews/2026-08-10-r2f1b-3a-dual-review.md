@@ -124,3 +124,12 @@ host run. Fold-gate totals + coverage delta in the addendum below.
   clean, settlement bypassed; sol: the cross-registry variant) again justified
   dual-lens on a non-destructive sub-slice — 3a's semantics are inherited by
   five destructive ones.
+
+## Fold addendum (post-push)
+
+Fold gates at `4597feb9`: all seven stages clean — **workspace 3866 / 0 / 12
+across 90** (3834 → +32), release + hygiene OK. Coverage vs the 3s seed
+(lib scope, darwin): bridge-core **87.69%** (+0.21), bridge-workflow **84.90%**
+(unchanged — 3a lands entirely in bridge-core). Fold-ritual reaps: s3a
+worktree target + the three 3a implement-clone targets; receipts in the
+session scratchpad.
