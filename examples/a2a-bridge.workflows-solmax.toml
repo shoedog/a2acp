@@ -1,0 +1,121 @@
+default = "codex"
+
+[[agents]]
+id = "codex"
+cmd = "codex-acp"
+pre_authenticated = true
+model = "gpt-5.6-sol"
+effort = "max"    # 3b1 review lens — owner directive: sol max for safety
+mode = "read-only"
+args = ["-c", "sandbox_mode=\"read-only\"", "-c", "approval_policy=\"never\""]
+
+[[agents]]
+id = "claude"
+cmd = "claude-agent-acp"
+
+[[prompts]]
+id = "review-sol-risk"
+file = "../prompts/review-sol-risk.md"
+description = "single Sol review with real-world risk and repair triage"
+
+[[prompts]]
+id = "review-correctness"
+file = "../prompts/review-correctness.md"
+description = "code-review correctness lens"
+
+[[prompts]]
+id = "review-architecture"
+file = "../prompts/review-architecture.md"
+description = "code-review architecture lens"
+
+[[prompts]]
+id = "review-synth"
+file = "../prompts/review-synth.md"
+description = "code-review synthesis prompt"
+
+[[prompts]]
+id = "spec-review-rigor"
+file = "../prompts/spec-review-rigor.md"
+description = "spec-review rigor lens"
+
+[[prompts]]
+id = "spec-review-soundness"
+file = "../prompts/spec-review-soundness.md"
+description = "spec-review soundness lens"
+
+[[prompts]]
+id = "spec-review-synth"
+file = "../prompts/spec-review-synth.md"
+description = "spec-review synthesis prompt"
+
+[[prompts]]
+id = "plan-review-exec"
+file = "../prompts/plan-review-exec.md"
+description = "plan-review executability lens"
+
+[[prompts]]
+id = "plan-review-coverage"
+file = "../prompts/plan-review-coverage.md"
+description = "plan-review coverage lens"
+
+[[prompts]]
+id = "plan-review-synth"
+file = "../prompts/plan-review-synth.md"
+description = "plan-review synthesis prompt"
+
+[[workflows]]
+id = "code-review"
+
+[[workflows.nodes]]
+id = "review"
+agent = "codex"
+prompt = "review-sol-risk"
+inputs = []
+
+# spec-review: rigor (completeness/ambiguity) + soundness (design) -> synth.
+# Feed a design spec as the input; agents do not explore, so inline all context.
+[[workflows]]
+id = "spec-review"
+
+[[workflows.nodes]]
+id = "rigor"
+agent = "codex"
+prompt = "spec-review-rigor"
+inputs = []
+
+[[workflows.nodes]]
+id = "soundness"
+agent = "claude"
+prompt = "spec-review-soundness"
+inputs = []
+
+[[workflows.nodes]]
+id = "synth"
+agent = "claude"
+prompt = "spec-review-synth"
+inputs = ["rigor", "soundness"]
+
+# plan-review: executability (compile/ordering/ripple) + coverage (spec/decomposition) -> synth.
+[[workflows]]
+id = "plan-review"
+
+[[workflows.nodes]]
+id = "exec"
+agent = "codex"
+prompt = "plan-review-exec"
+inputs = []
+
+[[workflows.nodes]]
+id = "coverage"
+agent = "claude"
+prompt = "plan-review-coverage"
+inputs = []
+
+[[workflows.nodes]]
+id = "synth"
+agent = "claude"
+prompt = "plan-review-synth"
+inputs = ["exec", "coverage"]
+
+[server]
+addr = "127.0.0.1:8080"
