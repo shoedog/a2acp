@@ -65,6 +65,10 @@ description = "plan-review synthesis prompt"
 
 [[workflows]]
 id = "code-review"
+# Max-effort admission gate: max effort requires an explicit qualification
+# (cutoff must exceed the 7,200,000 ms default; reason is bounded free text).
+max_work_cutoff_ms = 10800000
+max_reason = "owner directive 2026-08-10: sol max review lens for the 3b1 process-authority destructive surface"
 
 [[workflows.nodes]]
 id = "review"
