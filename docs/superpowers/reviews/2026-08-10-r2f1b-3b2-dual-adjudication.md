@@ -91,3 +91,28 @@ dispatch converged immediately. LEDGERED: dedicated login session for the
 `a2a-creds` copy (kiro device-flow-into-volume pattern); surface agent
 `AgentFailure` detail at default verbosity ("workflow did not complete" is
 evidence-free); stranded clean clones ×5 are reaper-eligible.
+
+## Fold addendum (at the fold)
+
+Fold gates at the squash (`40e2e64c`): squash code-tree byte-identical to the
+gated branch tip (same base, same diff), fmt/clippy `-D warnings`/release/
+hygiene all exit 0; **workspace 3,935 / 0 / 12 across 90** (3,904 → +31). One
+first-run red in the gate block, attributed with controls per R3-2:
+`fresh_claude_oauth_does_not_block_adapter_spawn` (smoke_cli) — a 1-second
+spawn-latency bound that failed once under whole-workspace parallel load;
+unchanged since base, zero 3b2-diff lines in its harness, 5/5 green isolated
+(~1.4 s wall against the 1 s bound), green in the other three full runs
+tonight — pre-existing load-sensitive flake, LEDGERED as its own item (widen
+the bound or serialize the harness), not re-baselined. Coverage vs the 3s
+seed (workspace lib-test scope, darwin, per-crate aggregation): bridge-core
+**90.90%** lines (25,275 / 2,299 missed) — **+5.20 vs 3b1's 85.70** on a
+population grown by exactly the 3b2 addition (+467); the jump is the
+real-host V3 closure test exercising the darwin census/containment arms 3b1
+had flagged as host-only-reachable — the ledgered obligation measurably
+discharged. bridge-workflow **87.17%** (11,828 / 1,517) — +2.27 vs the
+84.90 seed. The CI Linux bridge-core ≥86 floor watch item from the 3b1 fold
+resolves. Probe note: `-p`-scoped invocations (core 74.16 on a 29,320-line
+population) are a feature-unification/scope artifact — inadmissible for the
+series, retained here as the method warning. Fold-ritual reaps: s3b2
+worktree target + the repair-clone targets; stranded auth-incident clones
+left to the licensed reaper.
