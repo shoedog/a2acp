@@ -2531,6 +2531,17 @@ mod tests {
     use std::time::Duration;
 
     // returns the `stat`/`state` column for a pid, or None if the pid is gone/reaped.
+    #[cfg(target_os = "linux")]
+    fn proc_state(pid: u32) -> Option<String> {
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        stat.rsplit_once(") ")?
+            .1
+            .split_whitespace()
+            .next()
+            .map(str::to_owned)
+    }
+
+    #[cfg(not(target_os = "linux"))]
     fn proc_state(pid: u32) -> Option<String> {
         let out = std::process::Command::new("ps")
             .args(["-o", "state=", "-p", &pid.to_string()])
@@ -3056,6 +3067,136 @@ mod tests {
             killed,
             "grandchild must be group-killed on Supervised drop (no orphan); it was still running"
         );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test]
+    async fn protected_v3_child_grandchild_stop_then_child_first_kill_has_no_live_leaks_host_signal_semantics(
+    ) {
+        use tokio::io::{AsyncBufReadExt, BufReader};
+
+        let root = tempfile::tempdir().unwrap();
+        let attempt_id = AttemptId::mint().unwrap();
+        let generation = format!("host-containment-{}", attempt_id.as_str());
+        let journal = Arc::new(FileResourceFlightJournal::open(root.path(), 512).unwrap());
+        let owner = ResourceFlightOwnerV1::new(
+            NodeId::parse("host-containment").unwrap(),
+            generation.clone(),
+        )
+        .unwrap();
+        let durable = DurableProcessFlightV3::new(
+            attempt_id.clone(),
+            generation,
+            Arc::new(ResourceFlightRegistryV1::new(attempt_id)),
+            journal.clone(),
+            owner,
+        )
+        .unwrap();
+        let flight_id = durable.flight_id().clone();
+        let script = "trap '' TERM; /bin/sh -c 'trap \"\" TERM; \
+                      printf \"READY_CHILD %s\\n\" $$; exec sleep 300' & descendant=$!; \
+                      printf 'READY_ROOT %s %s\\n' $$ $descendant; wait";
+        let mut process = OwnedProcessTreeV1::spawn_with_durable_flight_v3(
+            "/bin/sh",
+            &["-c", script],
+            None,
+            DiagnosticRedactor::default(),
+            None,
+            false,
+            &[],
+            durable,
+        )
+        .unwrap();
+        let root_pid = process.pid();
+        let stdout = process.child_mut().stdout.take().unwrap();
+        let mut lines = BufReader::new(stdout).lines();
+        let ready = tokio::time::timeout(Duration::from_secs(2), async {
+            let mut messages = Vec::new();
+            for _ in 0..2 {
+                messages.push(
+                    lines
+                        .next_line()
+                        .await
+                        .unwrap()
+                        .expect("both processes must publish readiness"),
+                );
+            }
+            messages
+        })
+        .await
+        .expect("child/grandchild readiness handshake timed out");
+        let mut reported_root = None;
+        let mut reported_descendant = None;
+        let mut child_ready = None;
+        for message in ready {
+            let fields: Vec<_> = message.split_whitespace().collect();
+            match fields.as_slice() {
+                ["READY_ROOT", root, descendant] => {
+                    reported_root = Some(root.parse::<u32>().unwrap());
+                    reported_descendant = Some(descendant.parse::<u32>().unwrap());
+                }
+                ["READY_CHILD", child] => child_ready = Some(child.parse::<u32>().unwrap()),
+                other => panic!("unexpected readiness message: {other:?}"),
+            }
+        }
+        let descendant_pid = reported_descendant.expect("root descendant pid");
+        assert_eq!(reported_root, Some(root_pid));
+        assert_eq!(child_ready, Some(descendant_pid));
+        assert!(proc_state(root_pid).is_some());
+        assert!(proc_state(descendant_pid).is_some());
+
+        let result = process.terminate(Duration::ZERO).await.unwrap();
+        assert_eq!(
+            result.disposition,
+            ResourceActionDispositionV1::Complete,
+            "the protected flight must close and reap the exact generation"
+        );
+
+        let records = journal.records(&flight_id).unwrap();
+        let observations = records
+            .iter()
+            .find_map(|row| match &row.event {
+                crate::retained_resource_flight::ResourceFlightJournalEventV1::ProcessSignalsObserved {
+                    observations,
+                } => Some(observations),
+                _ => None,
+            })
+            .expect("flight signal observations");
+        let stop_root = observations
+            .iter()
+            .position(|entry| entry.pid == root_pid && entry.signal == libc::SIGSTOP)
+            .expect("root SIGSTOP");
+        let stop_descendant = observations
+            .iter()
+            .position(|entry| entry.pid == descendant_pid && entry.signal == libc::SIGSTOP)
+            .expect("descendant SIGSTOP");
+        let kill_descendant = observations
+            .iter()
+            .position(|entry| entry.pid == descendant_pid && entry.signal == libc::SIGKILL)
+            .expect("descendant SIGKILL after verified stop");
+        let kill_root = observations
+            .iter()
+            .position(|entry| entry.pid == root_pid && entry.signal == libc::SIGKILL)
+            .expect("root SIGKILL after verified stop");
+        assert!(stop_root < kill_root);
+        assert!(stop_descendant < kill_descendant);
+        assert!(kill_descendant < kill_root, "SIGKILL must be child-first");
+
+        async fn wait_until_not_running(pid: u32) {
+            tokio::time::timeout(Duration::from_secs(2), async move {
+                loop {
+                    match proc_state(pid) {
+                        None => break,
+                        Some(state) if state.starts_with('Z') => break,
+                        Some(_) => tokio::task::yield_now().await,
+                    }
+                }
+            })
+            .await
+            .unwrap_or_else(|_| panic!("pid {pid} remained live after protected settlement"));
+        }
+        wait_until_not_running(root_pid).await;
+        wait_until_not_running(descendant_pid).await;
     }
 
     #[tokio::test]

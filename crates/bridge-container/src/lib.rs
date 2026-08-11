@@ -20,7 +20,8 @@ use bridge_core::execution_policy::{
 use bridge_core::ids::SessionId;
 use bridge_core::permission::TurnMeta;
 use bridge_core::ports::{
-    AgentBackend, BackendObservers, BackendStream, DiagnosticObserver, RichEventSink,
+    AgentBackend, BackendCleanupDispositionV1, BackendObservers, BackendResourceFlightV1,
+    BackendStream, DiagnosticObserver, RichEventSink,
 };
 use bridge_core::reaper::{spawn_detached, ReapController, ReapFailure, ReapFn};
 use bridge_core::run_identity::RunHandle;
@@ -1331,6 +1332,17 @@ impl AgentBackend for ContainerRwBackend {
         self.prompt_inner(session, parts, Some(observers)).await
     }
 
+    fn resource_flight_v1(&self) -> Result<BackendResourceFlightV1, BridgeError> {
+        Ok(BackendResourceFlightV1::LegacyV2)
+    }
+
+    fn attach_resource_flight_owner_v1(
+        &self,
+        _session: &SessionId,
+    ) -> Result<BackendResourceFlightV1, BridgeError> {
+        Err(BridgeError::ResourceFlightUnsupported)
+    }
+
     async fn cancel(&self, session: &SessionId) -> Result<(), BridgeError> {
         if self.is_warm() {
             return self.cancel_warm(session).await;
@@ -1433,7 +1445,10 @@ impl AgentBackend for ContainerRwBackend {
         let _ = self.forget_session_checked(session).await;
     }
 
-    async fn forget_session_checked(&self, session: &SessionId) -> Result<(), BridgeError> {
+    async fn forget_session_checked(
+        &self,
+        session: &SessionId,
+    ) -> Result<BackendCleanupDispositionV1, BridgeError> {
         let result = if self.is_warm() {
             Ok(())
         } else {
@@ -1441,17 +1456,19 @@ impl AgentBackend for ContainerRwBackend {
         };
         self.session_cfg.lock().await.remove(session);
         self.pending_turn_meta.lock().await.remove(session);
-        result.map_err(|failure| match build_reap_failure(failure) {
-            Ok(diagnostic) => container_reap_failure_error(diagnostic),
-            Err(error) => error,
-        })
+        result
+            .map_err(|failure| match build_reap_failure(failure) {
+                Ok(diagnostic) => container_reap_failure_error(diagnostic),
+                Err(error) => error,
+            })
+            .map(|()| BackendCleanupDispositionV1::Complete)
     }
 
     async fn forget_session_observed(
         &self,
         session: &SessionId,
         observer: Arc<dyn DiagnosticObserver>,
-    ) -> Result<(), BridgeError> {
+    ) -> Result<BackendCleanupDispositionV1, BridgeError> {
         let result = if self.is_warm() {
             Ok(())
         } else {
@@ -1459,14 +1476,17 @@ impl AgentBackend for ContainerRwBackend {
         };
         self.session_cfg.lock().await.remove(session);
         self.pending_turn_meta.lock().await.remove(session);
-        result
+        result.map(|()| BackendCleanupDispositionV1::Complete)
     }
 
     async fn release_session(&self, session: &SessionId) {
         let _ = self.release_session_checked(session).await;
     }
 
-    async fn release_session_checked(&self, session: &SessionId) -> Result<(), BridgeError> {
+    async fn release_session_checked(
+        &self,
+        session: &SessionId,
+    ) -> Result<BackendCleanupDispositionV1, BridgeError> {
         let result = if self.is_warm() {
             self.release_warm_checked(session).await
         } else {
@@ -1474,17 +1494,19 @@ impl AgentBackend for ContainerRwBackend {
         };
         self.session_cfg.lock().await.remove(session);
         self.pending_turn_meta.lock().await.remove(session);
-        result.map_err(|failure| match build_reap_failure(failure) {
-            Ok(diagnostic) => container_reap_failure_error(diagnostic),
-            Err(error) => error,
-        })
+        result
+            .map_err(|failure| match build_reap_failure(failure) {
+                Ok(diagnostic) => container_reap_failure_error(diagnostic),
+                Err(error) => error,
+            })
+            .map(|()| BackendCleanupDispositionV1::Complete)
     }
 
     async fn release_session_observed(
         &self,
         session: &SessionId,
         observer: Arc<dyn DiagnosticObserver>,
-    ) -> Result<(), BridgeError> {
+    ) -> Result<BackendCleanupDispositionV1, BridgeError> {
         let result = if self.is_warm() {
             self.release_warm_observed(session, observer).await
         } else {
@@ -1492,7 +1514,7 @@ impl AgentBackend for ContainerRwBackend {
         };
         self.session_cfg.lock().await.remove(session);
         self.pending_turn_meta.lock().await.remove(session);
-        result
+        result.map(|()| BackendCleanupDispositionV1::Complete)
     }
 
     async fn retire(&self) -> Result<(), BridgeError> {
@@ -2860,7 +2882,7 @@ mod tests {
                 match action {
                     TeardownAction::Cancel => backend.cancel(&session).await,
                     TeardownAction::ReleaseChecked => {
-                        backend.release_session_checked(&session).await
+                        backend.release_session_checked(&session).await.map(|_| ())
                     }
                     TeardownAction::Retire => backend.retire().await,
                 }
@@ -2975,9 +2997,11 @@ mod tests {
         let owner = backend.current_reap_owner(&session).unwrap();
         match action {
             TeardownAction::Cancel => backend.cancel(&session).await.unwrap(),
-            TeardownAction::ReleaseChecked => {
-                backend.release_session_checked(&session).await.unwrap()
-            }
+            TeardownAction::ReleaseChecked => backend
+                .release_session_checked(&session)
+                .await
+                .map(|_| ())
+                .unwrap(),
             TeardownAction::Retire => backend.retire().await.unwrap(),
         }
 

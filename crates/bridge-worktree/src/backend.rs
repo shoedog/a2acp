@@ -18,9 +18,9 @@ use bridge_core::ids::SessionId;
 use bridge_core::orch::{AgentSessionCaps, ReconcileOutcome};
 use bridge_core::permission::TurnMeta;
 use bridge_core::ports::{
-    AgentBackend, BackendObservers, BackendStream, CheckoutPreservationReasonV1,
-    CheckoutPreservationV1, CheckoutSettlementV1, DiagnosticObserver, RichEventSink,
-    WorkflowCheckoutOutcomeV1,
+    AgentBackend, BackendCleanupDispositionV1, BackendObservers, BackendResourceFlightV1,
+    BackendStream, CheckoutPreservationReasonV1, CheckoutPreservationV1, CheckoutSettlementV1,
+    DiagnosticObserver, RichEventSink, WorkflowCheckoutOutcomeV1,
 };
 use bridge_core::terminal_evidence::{AcpChildLiveness, EvidenceCapability};
 use bridge_core::SessionCwd;
@@ -651,6 +651,17 @@ enum CheckoutCleanupDispositionV1 {
 }
 
 impl CheckoutCleanupDispositionV1 {
+    fn backend_disposition(&self) -> BackendCleanupDispositionV1 {
+        match self {
+            Self::NotNeeded | Self::Removed => BackendCleanupDispositionV1::Complete,
+            Self::Retained => BackendCleanupDispositionV1::Retained,
+            Self::Preserved => BackendCleanupDispositionV1::Preserved,
+            Self::RemovedRecordAmbiguous(_) | Self::RemovalFailed => {
+                BackendCleanupDispositionV1::Unknown
+            }
+        }
+    }
+
     /// The static teardown transition code this disposition publishes on a successful flight.
     ///
     /// A distinct code rather than a distinct `PhaseStatus`: the session teardown genuinely did
@@ -670,16 +681,25 @@ impl CheckoutCleanupDispositionV1 {
 /// One cleanup flight's answer: the teardown result AND what became of the checkout.
 #[derive(Clone, Debug)]
 struct CleanupReportV1 {
-    result: Result<(), BridgeError>,
+    result: Result<BackendCleanupDispositionV1, BridgeError>,
     checkout: CheckoutCleanupDispositionV1,
 }
 
 impl CleanupReportV1 {
     fn ok(checkout: CheckoutCleanupDispositionV1) -> Self {
-        Self {
-            result: Ok(()),
-            checkout,
-        }
+        Self::settled(checkout, BackendCleanupDispositionV1::Complete, None)
+    }
+
+    fn settled(
+        checkout: CheckoutCleanupDispositionV1,
+        inner: BackendCleanupDispositionV1,
+        error: Option<BridgeError>,
+    ) -> Self {
+        let result = match error {
+            Some(error) => Err(error),
+            None => Ok(inner.combine(checkout.backend_disposition())),
+        };
+        Self { result, checkout }
     }
 
     fn is_ok(&self) -> bool {
@@ -713,6 +733,7 @@ impl CleanupStrength {
 #[derive(Default)]
 struct CleanupCellState {
     inner_strength: Option<CleanupStrength>,
+    inner_disposition: BackendCleanupDispositionV1,
     provider_removed: bool,
     sidecar_removed: bool,
     entry: Option<WtEntry>,
@@ -1308,7 +1329,7 @@ impl WorktreeBackend {
         &self,
         session: &SessionId,
         strength: CleanupStrength,
-    ) -> Result<(), BridgeError> {
+    ) -> Result<BackendCleanupDispositionV1, BridgeError> {
         self.cleanup_session_with_sealed_admission(session, strength, false)
             .await
     }
@@ -1388,7 +1409,7 @@ impl WorktreeBackend {
         session: &SessionId,
         strength: CleanupStrength,
         allow_new_when_sealed: bool,
-    ) -> Result<(), BridgeError> {
+    ) -> Result<BackendCleanupDispositionV1, BridgeError> {
         self.cleanup_session_reported(session, strength, allow_new_when_sealed)
             .await
             .result
@@ -1412,8 +1433,8 @@ impl WorktreeBackend {
             let report = wait_for_cleanup_report(report).await;
             match &report.result {
                 Err(_) => return report,
-                Ok(()) if flight_strength >= requested => return report,
-                Ok(()) => {
+                Ok(_) if flight_strength >= requested => return report,
+                Ok(_) => {
                     // A stronger request joined a weaker in-flight cleanup.
                     // The completed weaker report is shared first; loop once
                     // to install/join the monotonic upgrade.
@@ -1717,7 +1738,7 @@ impl WorktreeBackend {
         session: &SessionId,
         strength: CleanupStrength,
         observer: Arc<dyn DiagnosticObserver>,
-    ) -> Result<(), BridgeError> {
+    ) -> Result<BackendCleanupDispositionV1, BridgeError> {
         let (started_code, _completed_code, failed_code) = strength.transition_codes();
         // Select/start the observer-free cleanup flight synchronously before
         // the first diagnostic await. If the journal write or its caller is
@@ -1759,8 +1780,8 @@ impl WorktreeBackend {
         let observation = record_cleanup_transition(observer.as_ref(), status, terminal_code).await;
         match (result, observation) {
             (Err(primary), _) => Err(primary),
-            (Ok(()), Err(observation)) => Err(observation),
-            (Ok(()), Ok(())) => Ok(()),
+            (Ok(_), Err(observation)) => Err(observation),
+            (Ok(disposition), Ok(())) => Ok(disposition),
         }
     }
 
@@ -1807,6 +1828,13 @@ impl WorktreeBackend {
         // stronger inner step; concurrent equal requests join the completed
         // component state.
         let mut state = cell.state.lock().await;
+        if let Err(error) = inner.resource_flight_v1() {
+            return CleanupReportV1::settled(
+                CheckoutCleanupDispositionV1::NotNeeded,
+                state.inner_disposition,
+                Some(error),
+            );
+        }
         let mut first_error = None;
         // A reserving configure may not have invoked the inner backend yet. Let
         // it publish Ready (or remove its failed reservation) before teardown,
@@ -1862,7 +1890,10 @@ impl WorktreeBackend {
                 CleanupStrength::Release => inner.release_session_checked(&session).await,
             };
             match inner_result {
-                Ok(()) => state.inner_strength = Some(strength),
+                Ok(disposition) => {
+                    state.inner_strength = Some(strength);
+                    state.inner_disposition = state.inner_disposition.combine(disposition);
+                }
                 Err(error) => first_error = Some(error),
             }
         }
@@ -1987,13 +2018,7 @@ impl WorktreeBackend {
             // The projection is complete — a preservation writer admitted from here on re-reads
             // an already-cleared map and truthfully observes `NoCheckoutUnderCustody`.
             drop(deletion_admission_guard);
-            return CleanupReportV1 {
-                result: match first_error {
-                    Some(error) => Err(error),
-                    None => Ok(()),
-                },
-                checkout,
-            };
+            return CleanupReportV1::settled(checkout, state.inner_disposition, first_error);
         }
 
         // ---- R2f1b fail-closed deletion gate (slice 2b1) ------------------------------------
@@ -2067,19 +2092,18 @@ impl WorktreeBackend {
                     // record is a settled preservation is exactly the mislabelling opus W3 named.
                     let durably_preserved = durable_state
                         .is_some_and(WorktreeCustodyStateKindV1::is_terminal_preservation);
-                    return CleanupReportV1 {
-                        result: match first_error {
-                            Some(error) => Err(error),
-                            None => Ok(()),
-                        },
-                        checkout: match barrier.as_ref() {
-                            Some(outcome) if outcome.is_terminal_preservation() => {
-                                CheckoutCleanupDispositionV1::Preserved
-                            }
-                            _ if durably_preserved => CheckoutCleanupDispositionV1::Preserved,
-                            _ => CheckoutCleanupDispositionV1::Retained,
-                        },
+                    let checkout = match barrier.as_ref() {
+                        Some(outcome) if outcome.is_terminal_preservation() => {
+                            CheckoutCleanupDispositionV1::Preserved
+                        }
+                        _ if durably_preserved => CheckoutCleanupDispositionV1::Preserved,
+                        _ => CheckoutCleanupDispositionV1::Retained,
                     };
+                    return CleanupReportV1::settled(
+                        checkout,
+                        state.inner_disposition,
+                        first_error,
+                    );
                 }
             },
             None => None,
@@ -2139,13 +2163,7 @@ impl WorktreeBackend {
             state.sidecar_removed = true;
         }
 
-        CleanupReportV1 {
-            result: match first_error {
-                Some(error) => Err(error),
-                None => Ok(()),
-            },
-            checkout,
-        }
+        CleanupReportV1::settled(checkout, state.inner_disposition, first_error)
     }
 
     /// Keep exactly one in-memory owner for a checkout the gate refused to remove (2b1 sol-2).
@@ -2726,6 +2744,17 @@ impl AgentBackend for WorktreeBackend {
             .await
     }
 
+    fn resource_flight_v1(&self) -> Result<BackendResourceFlightV1, BridgeError> {
+        self.inner.resource_flight_v1()
+    }
+
+    fn attach_resource_flight_owner_v1(
+        &self,
+        session: &SessionId,
+    ) -> Result<BackendResourceFlightV1, BridgeError> {
+        self.inner.attach_resource_flight_owner_v1(session)
+    }
+
     async fn cancel(&self, session: &SessionId) -> Result<(), BridgeError> {
         self.inner.cancel(session).await
     }
@@ -3019,7 +3048,10 @@ impl AgentBackend for WorktreeBackend {
         let _ = self.cleanup_session(session, CleanupStrength::Forget).await;
     }
 
-    async fn forget_session_checked(&self, session: &SessionId) -> Result<(), BridgeError> {
+    async fn forget_session_checked(
+        &self,
+        session: &SessionId,
+    ) -> Result<BackendCleanupDispositionV1, BridgeError> {
         self.cleanup_session(session, CleanupStrength::Forget).await
     }
 
@@ -3027,7 +3059,7 @@ impl AgentBackend for WorktreeBackend {
         &self,
         session: &SessionId,
         observer: Arc<dyn DiagnosticObserver>,
-    ) -> Result<(), BridgeError> {
+    ) -> Result<BackendCleanupDispositionV1, BridgeError> {
         self.cleanup_session_observed(session, CleanupStrength::Forget, observer)
             .await
     }
@@ -3038,7 +3070,10 @@ impl AgentBackend for WorktreeBackend {
             .await;
     }
 
-    async fn release_session_checked(&self, session: &SessionId) -> Result<(), BridgeError> {
+    async fn release_session_checked(
+        &self,
+        session: &SessionId,
+    ) -> Result<BackendCleanupDispositionV1, BridgeError> {
         self.cleanup_session(session, CleanupStrength::Release)
             .await
     }
@@ -3047,7 +3082,7 @@ impl AgentBackend for WorktreeBackend {
         &self,
         session: &SessionId,
         observer: Arc<dyn DiagnosticObserver>,
-    ) -> Result<(), BridgeError> {
+    ) -> Result<BackendCleanupDispositionV1, BridgeError> {
         self.cleanup_session_observed(session, CleanupStrength::Release, observer)
             .await
     }
@@ -3250,7 +3285,7 @@ impl AgentBackend for WorktreeBackend {
             CheckoutCleanupDispositionV1::Retained
             | CheckoutCleanupDispositionV1::RemovalFailed => {
                 CheckoutSettlementV1::Retained(match &report.result {
-                    Ok(()) => "the checkout was retained under R2f1b custody".to_string(),
+                    Ok(_) => "the checkout was retained under R2f1b custody".to_string(),
                     Err(error) => format!("{error:?}"),
                 })
             }
@@ -3299,6 +3334,7 @@ impl AgentBackend for WorktreeBackend {
     }
 
     async fn retire(&self) -> Result<(), BridgeError> {
+        self.inner.resource_flight_v1()?;
         {
             // Linearize the admission boundary with configure publication and
             // successful-flight eviction. A configured session already owns a
@@ -3433,6 +3469,9 @@ mod tests {
         /// the state the writer must refuse to tombstone.
         remove_v2_leaves_target: AtomicBool,
         fail_release: AtomicBool,
+        cleanup_disposition: Mutex<BackendCleanupDispositionV1>,
+        flight_protected: AtomicBool,
+        flight_attach_count: AtomicUsize,
         retire_count: AtomicUsize,
         retire_gate: Mutex<Option<oneshot::Receiver<()>>>,
         retire_started_count: AtomicUsize,
@@ -3587,6 +3626,22 @@ mod tests {
             Ok(())
         }
 
+        fn resource_flight_v1(&self) -> Result<BackendResourceFlightV1, BridgeError> {
+            Ok(if self.rec.flight_protected.load(Ordering::SeqCst) {
+                BackendResourceFlightV1::ProtectedV3
+            } else {
+                BackendResourceFlightV1::LegacyV2
+            })
+        }
+
+        fn attach_resource_flight_owner_v1(
+            &self,
+            _session: &SessionId,
+        ) -> Result<BackendResourceFlightV1, BridgeError> {
+            self.rec.flight_attach_count.fetch_add(1, Ordering::SeqCst);
+            self.resource_flight_v1()
+        }
+
         async fn configure_session(
             &self,
             _session: &SessionId,
@@ -3639,12 +3694,15 @@ mod tests {
             note_signal(&self.rec, "inner_release");
         }
 
-        async fn release_session_checked(&self, session: &SessionId) -> Result<(), BridgeError> {
+        async fn release_session_checked(
+            &self,
+            session: &SessionId,
+        ) -> Result<bridge_core::ports::BackendCleanupDispositionV1, BridgeError> {
             self.release_session(session).await;
             if self.rec.fail_release.load(Ordering::SeqCst) {
                 Err(BridgeError::StoreFailure)
             } else {
-                Ok(())
+                Ok(*self.rec.cleanup_disposition.lock().unwrap())
             }
         }
 
@@ -3657,6 +3715,43 @@ mod tests {
             if let Some(gate) = gate {
                 let _ = gate.await;
             }
+            Ok(())
+        }
+    }
+
+    struct UnforwardedInner {
+        rec: Arc<Rec>,
+    }
+
+    #[async_trait::async_trait]
+    impl AgentBackend for UnforwardedInner {
+        async fn prompt(
+            &self,
+            _session: &SessionId,
+            _parts: Vec<Part>,
+        ) -> Result<BackendStream, BridgeError> {
+            Ok(Box::pin(tokio_stream::empty()))
+        }
+
+        async fn cancel(&self, _session: &SessionId) -> Result<(), BridgeError> {
+            self.rec
+                .order
+                .lock()
+                .unwrap()
+                .push("unforwarded_cancel".into());
+            Ok(())
+        }
+
+        async fn release_session(&self, _session: &SessionId) {
+            self.rec
+                .order
+                .lock()
+                .unwrap()
+                .push("unforwarded_release".into());
+        }
+
+        async fn retire(&self) -> Result<(), BridgeError> {
+            self.rec.retire_count.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
     }
@@ -3688,6 +3783,23 @@ mod tests {
             }
             .prompt(session, parts)
             .await
+        }
+
+        fn resource_flight_v1(&self) -> Result<BackendResourceFlightV1, BridgeError> {
+            FakeInner {
+                rec: self.rec.clone(),
+            }
+            .resource_flight_v1()
+        }
+
+        fn attach_resource_flight_owner_v1(
+            &self,
+            session: &SessionId,
+        ) -> Result<BackendResourceFlightV1, BridgeError> {
+            FakeInner {
+                rec: self.rec.clone(),
+            }
+            .attach_resource_flight_owner_v1(session)
         }
 
         async fn cancel(&self, session: &SessionId) -> Result<(), BridgeError> {
@@ -4071,6 +4183,62 @@ mod tests {
             identity(),
         ));
         (be, rec, tmp, source, cfg)
+    }
+
+    fn flight_only_backend(inner: Arc<dyn AgentBackend>, rec: Arc<Rec>) -> WorktreeBackend {
+        WorktreeBackend::new(
+            inner,
+            Arc::new(FakeProv { rec }),
+            WorktreeConfig {
+                root: "/tmp".into(),
+                owner: "ownr".into(),
+                run: "run7".into(),
+            },
+            None,
+            identity(),
+        )
+    }
+
+    #[tokio::test]
+    async fn protected_flight_exposure_and_attachment_forward_to_inner_teardown() {
+        let rec = Arc::new(Rec::default());
+        rec.flight_protected.store(true, Ordering::SeqCst);
+        let backend = flight_only_backend(Arc::new(FakeInner { rec: rec.clone() }), rec.clone());
+        let session = SessionId::parse("protected-forwarding").unwrap();
+
+        assert_eq!(
+            backend.resource_flight_v1().unwrap(),
+            BackendResourceFlightV1::ProtectedV3
+        );
+        assert_eq!(
+            backend.attach_resource_flight_owner_v1(&session).unwrap(),
+            BackendResourceFlightV1::ProtectedV3
+        );
+        backend.retire().await.unwrap();
+
+        assert_eq!(rec.flight_attach_count.load(Ordering::SeqCst), 1);
+        assert_eq!(rec.retire_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn default_unforwarded_flight_cannot_signal_through_worktree_cleanup_or_retire() {
+        let rec = Arc::new(Rec::default());
+        let backend =
+            flight_only_backend(Arc::new(UnforwardedInner { rec: rec.clone() }), rec.clone());
+
+        let session = SessionId::parse("unforwarded-cleanup").unwrap();
+        assert_eq!(
+            backend.release_session_checked(&session).await,
+            Err(BridgeError::ResourceFlightUnsupported)
+        );
+        assert!(rec.order.lock().unwrap().is_empty());
+
+        assert_eq!(
+            backend.retire().await,
+            Err(BridgeError::ResourceFlightUnsupported)
+        );
+        assert_eq!(rec.retire_count.load(Ordering::SeqCst), 0);
+        assert!(rec.order.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -6933,6 +7101,113 @@ mod tests {
         assert_eq!(record_state_of(&target).as_deref(), Some("live_protected"));
         *rec.watch_checkout.lock().unwrap() = Some(target.clone());
         (be, rec, tmp, session, target, bound)
+    }
+
+    #[tokio::test]
+    async fn inner_protective_cleanup_dispositions_survive_worktree_composition() {
+        let rec = Arc::new(Rec::default());
+        let backend = flight_only_backend(Arc::new(FakeInner { rec: rec.clone() }), rec.clone());
+
+        for (index, disposition) in [
+            BackendCleanupDispositionV1::Retained,
+            BackendCleanupDispositionV1::Preserved,
+            BackendCleanupDispositionV1::Unknown,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            *rec.cleanup_disposition.lock().unwrap() = disposition;
+            let session = SessionId::parse(format!("inner-disposition-{index}")).unwrap();
+            assert_eq!(
+                backend.release_session_checked(&session).await,
+                Ok(disposition)
+            );
+        }
+
+        assert_eq!(
+            rec.order
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|step| step.as_str() == "inner_release")
+                .count(),
+            3,
+            "one inner cleanup signal per composed flight"
+        );
+    }
+
+    async fn assert_outer_preservation_composes_once(
+        name: &str,
+        inner: BackendCleanupDispositionV1,
+        expected: BackendCleanupDispositionV1,
+    ) {
+        let (backend, rec, tmp, session, _target, _bound) = v3_session(name).await;
+        *rec.cleanup_disposition.lock().unwrap() = inner;
+        assert!(matches!(
+            backend
+                .preserve_checkout_v1(&session, CheckoutPreservationReasonV1::Cancellation,)
+                .await,
+            CheckoutPreservationV1::Preserved
+        ));
+
+        assert_eq!(
+            backend.release_session_checked(&session).await,
+            Ok(expected)
+        );
+        assert_eq!(
+            rec.order
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|step| step.as_str() == "inner_release")
+                .count(),
+            1,
+            "inner and outer protective outcomes must share one cleanup flight"
+        );
+        std::fs::remove_dir_all(tmp).unwrap();
+    }
+
+    #[tokio::test]
+    async fn outer_preserved_and_inner_retained_do_not_collapse_or_double_signal() {
+        assert_outer_preservation_composes_once(
+            "compose-preserved-retained",
+            BackendCleanupDispositionV1::Retained,
+            BackendCleanupDispositionV1::Preserved,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn outer_retained_and_inner_preserved_do_not_collapse_or_double_signal() {
+        let (backend, rec, tmp, session, target, _bound) =
+            v3_session("compose-retained-preserved").await;
+        *rec.cleanup_disposition.lock().unwrap() = BackendCleanupDispositionV1::Preserved;
+
+        assert_eq!(
+            backend.release_session_checked(&session).await,
+            Ok(BackendCleanupDispositionV1::Preserved)
+        );
+        assert_eq!(record_state_of(&target).as_deref(), Some("live_protected"));
+        assert_eq!(
+            rec.order
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|step| step.as_str() == "inner_release")
+                .count(),
+            1
+        );
+        std::fs::remove_dir_all(tmp).unwrap();
+    }
+
+    #[tokio::test]
+    async fn outer_preserved_and_inner_unknown_remain_unknown_without_double_signal() {
+        assert_outer_preservation_composes_once(
+            "compose-preserved-unknown",
+            BackendCleanupDispositionV1::Unknown,
+            BackendCleanupDispositionV1::Unknown,
+        )
+        .await;
     }
 
     /// §3 2c1 step 1, and the claim this whole slice rests on:

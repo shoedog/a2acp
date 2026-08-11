@@ -1863,11 +1863,11 @@ async fn cleanup_backend_until(
     }
 }
 
-fn cleanup_step(
-    result: Result<Result<(), BridgeError>, tokio::time::error::Elapsed>,
+fn cleanup_step<T>(
+    result: Result<Result<T, BridgeError>, tokio::time::error::Elapsed>,
 ) -> (&'static str, Option<BridgeError>) {
     match result {
-        Ok(Ok(())) => ("completed", None),
+        Ok(Ok(_)) => ("completed", None),
         Ok(Err(error)) => ("failed", Some(error)),
         Err(_) => ("timed_out", Some(BridgeError::AgentTimedOut)),
     }
@@ -2870,7 +2870,7 @@ mod tests {
             &self,
             _session: &SessionId,
             _observer: Arc<dyn bridge_core::ports::DiagnosticObserver>,
-        ) -> Result<(), BridgeError> {
+        ) -> Result<bridge_core::ports::BackendCleanupDispositionV1, BridgeError> {
             self.release_calls.fetch_add(1, Ordering::SeqCst);
             self.catalog.lock().unwrap().take();
             if self.hanging_release {
@@ -2885,7 +2885,7 @@ mod tests {
                     self.release_failure_accepted,
                 )))
             } else {
-                Ok(())
+                Ok(bridge_core::ports::BackendCleanupDispositionV1::Complete)
             }
         }
 
@@ -2918,9 +2918,12 @@ mod tests {
             self.catalog.lock().unwrap().clone()
         }
 
-        async fn release_session_checked(&self, _session: &SessionId) -> Result<(), BridgeError> {
+        async fn release_session_checked(
+            &self,
+            _session: &SessionId,
+        ) -> Result<bridge_core::ports::BackendCleanupDispositionV1, BridgeError> {
             self.catalog.lock().unwrap().take();
-            Ok(())
+            Ok(bridge_core::ports::BackendCleanupDispositionV1::Complete)
         }
     }
 

@@ -14115,7 +14115,10 @@ impl bridge_core::workflow_history::WorkflowHistoryStore for SqliteStore {
         use bridge_core::workflow_history::{
             AttemptTerminal, LedgerError, LedgerUnavailableReason as R, TerminalWrite,
         };
-        if !matches!(disposition, "complete" | "failed") {
+        if !matches!(
+            disposition,
+            "complete" | "retained" | "preserved" | "unknown" | "failed"
+        ) {
             return Err(LedgerError::new(R::Schema));
         }
         let _admission_lease = self.acquire_history_admission_lease()?;

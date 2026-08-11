@@ -4,7 +4,9 @@ use std::time::Duration;
 use bridge_core::domain::{Part, SessionSpec};
 use bridge_core::error::BridgeError;
 use bridge_core::ids::SessionId;
-use bridge_core::ports::{AgentBackend, BackendObservers, DiagnosticObserver};
+use bridge_core::ports::{
+    AgentBackend, BackendObservers, BackendResourceFlightV1, DiagnosticObserver,
+};
 use tokio::sync::Mutex;
 
 use crate::turn;
@@ -68,6 +70,7 @@ impl ResilientWarm {
 
     pub async fn retire(&self) -> Result<(), BridgeError> {
         let backend = self.backend.lock().await.clone();
+        backend.resource_flight_v1()?;
         backend.retire().await
     }
 }
@@ -166,6 +169,17 @@ impl turn::TurnRunner for ResilientWarm {
             if classify_death(&err) != Death::Transient {
                 return false;
             }
+            let flight = match backend.resource_flight_v1() {
+                Ok(flight) => flight,
+                Err(_) => return false,
+            };
+            if flight == BackendResourceFlightV1::ProtectedV3 {
+                // Protected attempts may stop only through the backend-owned flight.
+                // The historical retire -> reset -> rebuild chain is intentionally
+                // unreachable for this mode.
+                let _ = backend.cancel(session).await;
+                return false;
+            }
             {
                 let mut respawns_left = self.respawns_left.lock().await;
                 if *respawns_left == 0 {
@@ -189,7 +203,9 @@ impl turn::TurnRunner for ResilientWarm {
             };
             if let Err(e) = rebuilt.configure_session(session, &self.spec).await {
                 eprintln!("[implement] warm respawn configure_session failed: {e:?}");
-                let _ = rebuilt.retire().await;
+                if rebuilt.resource_flight_v1().is_ok() {
+                    let _ = rebuilt.retire().await;
+                }
                 return false;
             }
             *self.backend.lock().await = rebuilt;
@@ -203,7 +219,7 @@ mod tests {
     use super::*;
     use crate::turn::TurnRunner;
     use bridge_core::domain::EffectiveConfig;
-    use bridge_core::ports::{BackendStream, Update};
+    use bridge_core::ports::{BackendResourceFlightV1, BackendStream, Update};
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicBool, Ordering as BoolOrdering};
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -262,6 +278,7 @@ mod tests {
             BridgeError::ConfigReseedRequired { .. } => "ConfigReseedRequired",
             BridgeError::BoundSessionUnsupported => "BoundSessionUnsupported",
             BridgeError::BindUnsupported => "BindUnsupported",
+            BridgeError::ResourceFlightUnsupported => "ResourceFlightUnsupported",
             BridgeError::SessionExpired => "SessionExpired",
             BridgeError::HandleBusy => "HandleBusy",
             BridgeError::TaskSpecInvalid { .. } => "TaskSpecInvalid",
@@ -386,6 +403,7 @@ mod tests {
         cancels: AtomicUsize,
         configured: AtomicUsize,
         retired: AtomicUsize,
+        flight: BackendResourceFlightV1,
         first: BridgeError,
         fail_first: bool,
         complete: bool,
@@ -406,6 +424,7 @@ mod tests {
                 cancels: AtomicUsize::new(0),
                 configured: AtomicUsize::new(0),
                 retired: AtomicUsize::new(0),
+                flight: BackendResourceFlightV1::LegacyV2,
                 first,
                 fail_first,
                 complete,
@@ -424,6 +443,11 @@ mod tests {
                 clean_end: true,
                 ..Self::new(BridgeError::agent_crashed("unused"), false, false)
             }
+        }
+
+        fn protected_v3(mut self) -> Self {
+            self.flight = BackendResourceFlightV1::ProtectedV3;
+            self
         }
 
         fn write_scratch(mut self, path: PathBuf) -> Self {
@@ -481,6 +505,10 @@ mod tests {
         async fn cancel(&self, _session: &SessionId) -> Result<(), BridgeError> {
             self.cancels.fetch_add(1, Ordering::SeqCst);
             Ok(())
+        }
+
+        fn resource_flight_v1(&self) -> Result<BackendResourceFlightV1, BridgeError> {
+            Ok(self.flight)
         }
 
         async fn configure_session(
@@ -569,6 +597,65 @@ mod tests {
         assert_eq!(first.retired.load(Ordering::SeqCst), 1);
         assert_eq!(second.configured.load(Ordering::SeqCst), 1);
         assert_eq!(second.prompts.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn protected_transient_never_retires_resets_or_rebuilds() {
+        let first = Arc::new(
+            FakeBackend::new(BridgeError::agent_crashed("gone"), true, false).protected_v3(),
+        );
+        let second = Arc::new(FakeBackend::new(
+            BridgeError::agent_crashed("unused"),
+            false,
+            true,
+        ));
+        let rebuilds = Arc::new(AtomicUsize::new(0));
+        let resets = Arc::new(AtomicUsize::new(0));
+        let reset_count = resets.clone();
+        let runner = ResilientWarm::new(
+            first.clone(),
+            Arc::new(CountingRebuild {
+                count: rebuilds.clone(),
+                next: second,
+            }),
+            session_spec(),
+            1,
+            Arc::new(move || {
+                reset_count.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }),
+        );
+        let session = SessionId::parse("protected-implement-test").unwrap();
+
+        assert!(
+            !runner
+                .run_turn(&session, vec![Part { text: "fix".into() }])
+                .await
+        );
+        assert_eq!(first.cancels.load(Ordering::SeqCst), 1);
+        assert_eq!(first.retired.load(Ordering::SeqCst), 0);
+        assert_eq!(resets.load(Ordering::SeqCst), 0);
+        assert_eq!(rebuilds.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn protected_public_retire_delegates_to_the_backend_owned_flight() {
+        let backend = Arc::new(
+            FakeBackend::new(BridgeError::agent_crashed("unused"), false, true).protected_v3(),
+        );
+        let runner = ResilientWarm::new(
+            backend.clone(),
+            Arc::new(CountingRebuild {
+                count: Arc::new(AtomicUsize::new(0)),
+                next: backend.clone(),
+            }),
+            session_spec(),
+            0,
+            noop_reset(),
+        );
+
+        runner.retire().await.unwrap();
+        assert_eq!(backend.retired.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

@@ -1332,7 +1332,8 @@ async fn cleanup_cold_session(
                 .release_session_observed(session, observer.clone())
                 .await
         }
-    };
+    }
+    .map(|_| ());
     tracker.record(node, started, std::time::Instant::now(), &result);
     result
 }
@@ -5653,17 +5654,17 @@ mod tests {
                 &self,
                 _s: &SessionId,
                 _o: Arc<dyn DiagnosticObserver>,
-            ) -> Result<(), BridgeError> {
+            ) -> Result<bridge_core::ports::BackendCleanupDispositionV1, BridgeError> {
                 self.calls.seen.lock().unwrap().push("forget_observed");
-                Ok(())
+                Ok(bridge_core::ports::BackendCleanupDispositionV1::Complete)
             }
             async fn release_session_observed(
                 &self,
                 _s: &SessionId,
                 _o: Arc<dyn DiagnosticObserver>,
-            ) -> Result<(), BridgeError> {
+            ) -> Result<bridge_core::ports::BackendCleanupDispositionV1, BridgeError> {
                 self.calls.seen.lock().unwrap().push("release_observed");
-                Ok(())
+                Ok(bridge_core::ports::BackendCleanupDispositionV1::Complete)
             }
             async fn retire(&self) -> Result<(), BridgeError> {
                 self.calls.seen.lock().unwrap().push("retire");
@@ -6007,18 +6008,18 @@ mod tests {
             &self,
             _session: &SessionId,
             observer: Arc<dyn DiagnosticObserver>,
-        ) -> Result<(), BridgeError> {
+        ) -> Result<bridge_core::ports::BackendCleanupDispositionV1, BridgeError> {
             self.cleanups.lock().unwrap().push(("forget", observer));
-            Ok(())
+            Ok(bridge_core::ports::BackendCleanupDispositionV1::Complete)
         }
 
         async fn release_session_observed(
             &self,
             _session: &SessionId,
             observer: Arc<dyn DiagnosticObserver>,
-        ) -> Result<(), BridgeError> {
+        ) -> Result<bridge_core::ports::BackendCleanupDispositionV1, BridgeError> {
             self.cleanups.lock().unwrap().push(("release", observer));
-            Ok(())
+            Ok(bridge_core::ports::BackendCleanupDispositionV1::Complete)
         }
     }
 
@@ -9435,11 +9436,14 @@ mod tests {
             self.legacy_forgets.fetch_add(1, Ordering::SeqCst);
         }
 
-        async fn forget_session_checked(&self, _session: &SessionId) -> Result<(), BridgeError> {
+        async fn forget_session_checked(
+            &self,
+            _session: &SessionId,
+        ) -> Result<bridge_core::ports::BackendCleanupDispositionV1, BridgeError> {
             self.checked_forgets.fetch_add(1, Ordering::SeqCst);
             match &self.cleanup_error {
                 Some(error) => Err(error.clone()),
-                None => Ok(()),
+                None => Ok(bridge_core::ports::BackendCleanupDispositionV1::Complete),
             }
         }
     }
@@ -9566,16 +9570,16 @@ mod tests {
             &self,
             _session: &SessionId,
             observer: Arc<dyn DiagnosticObserver>,
-        ) -> Result<(), BridgeError> {
+        ) -> Result<bridge_core::ports::BackendCleanupDispositionV1, BridgeError> {
             self.cleanups.lock().unwrap().push(("forget", observer));
-            Ok(())
+            Ok(bridge_core::ports::BackendCleanupDispositionV1::Complete)
         }
 
         async fn release_session_observed(
             &self,
             _session: &SessionId,
             observer: Arc<dyn DiagnosticObserver>,
-        ) -> Result<(), BridgeError> {
+        ) -> Result<bridge_core::ports::BackendCleanupDispositionV1, BridgeError> {
             self.cleanups.lock().unwrap().push(("release", observer));
             Err(BridgeError::StoreFailure)
         }
@@ -9819,10 +9823,13 @@ mod tests {
             }
         }
 
-        async fn forget_session_checked(&self, _session: &SessionId) -> Result<(), BridgeError> {
+        async fn forget_session_checked(
+            &self,
+            _session: &SessionId,
+        ) -> Result<bridge_core::ports::BackendCleanupDispositionV1, BridgeError> {
             match &self.cleanup_error {
                 Some(error) => Err(error.clone()),
-                None => Ok(()),
+                None => Ok(bridge_core::ports::BackendCleanupDispositionV1::Complete),
             }
         }
     }
@@ -9882,7 +9889,10 @@ mod tests {
             Ok(())
         }
 
-        async fn forget_session_checked(&self, _session: &SessionId) -> Result<(), BridgeError> {
+        async fn forget_session_checked(
+            &self,
+            _session: &SessionId,
+        ) -> Result<bridge_core::ports::BackendCleanupDispositionV1, BridgeError> {
             self.checked_forgets.fetch_add(1, Ordering::SeqCst);
             Err(BridgeError::StoreFailure)
         }
@@ -10741,9 +10751,12 @@ mod tests {
                 *self.rec.forgets.lock().unwrap() += 1;
             }
 
-            async fn forget_session_checked(&self, _s: &SessionId) -> Result<(), BridgeError> {
+            async fn forget_session_checked(
+                &self,
+                _s: &SessionId,
+            ) -> Result<bridge_core::ports::BackendCleanupDispositionV1, BridgeError> {
                 self.checked_forgets.fetch_add(1, Ordering::SeqCst);
-                Ok(())
+                Ok(bridge_core::ports::BackendCleanupDispositionV1::Complete)
             }
         }
 
@@ -12843,9 +12856,12 @@ mod tests {
             Ok(())
         }
 
-        async fn forget_session_checked(&self, _session: &SessionId) -> Result<(), BridgeError> {
+        async fn forget_session_checked(
+            &self,
+            _session: &SessionId,
+        ) -> Result<bridge_core::ports::BackendCleanupDispositionV1, BridgeError> {
             self.cleanups.fetch_add(1, Ordering::SeqCst);
-            Ok(())
+            Ok(bridge_core::ports::BackendCleanupDispositionV1::Complete)
         }
 
         async fn settle_workflow_checkout_v1(

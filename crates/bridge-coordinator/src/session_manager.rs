@@ -11,7 +11,9 @@ use bridge_core::ids::{
 };
 use bridge_core::orch::{AgentSessionCaps, ReconcileOutcome, UsageSnapshot};
 use bridge_core::permission::PermissionRegistry;
-use bridge_core::ports::{AgentBackend, AgentRegistry, DiagnosticObserver, Lease};
+use bridge_core::ports::{
+    AgentBackend, AgentRegistry, BackendCleanupDispositionV1, DiagnosticObserver, Lease,
+};
 use bridge_core::session_cwd::SessionCwd;
 use bridge_core::session_fingerprint::SessionSpecFingerprint;
 use futures::FutureExt;
@@ -252,7 +254,7 @@ impl SessionTable {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct CleanupReport {
-    pub(crate) result: Result<(), BridgeError>,
+    pub(crate) result: Result<BackendCleanupDispositionV1, BridgeError>,
 }
 
 /// Exact-claim capability retained by both the detached cleanup worker and
@@ -271,7 +273,10 @@ struct CleanupClaimSettlement {
 }
 
 impl CleanupClaimSettlement {
-    async fn settle(&self, result: Result<(), BridgeError>) -> CleanupReport {
+    async fn settle(
+        &self,
+        result: Result<BackendCleanupDispositionV1, BridgeError>,
+    ) -> CleanupReport {
         let mut table = self.by_context.lock().await;
         let matches_claim = matches!(
             table.tombstones.get(&self.ctx),
@@ -353,10 +358,15 @@ impl ExpiryClaim {
         let task = tokio::spawn(async move {
             let recovery = worker_settlement.clone();
             let worker = AssertUnwindSafe(async move {
-                let result = retry
-                    .backend
-                    .release_session_checked(&retry.backend_session)
-                    .await;
+                let result = match retry.backend.resource_flight_v1() {
+                    Ok(_) => {
+                        retry
+                            .backend
+                            .release_session_checked(&retry.backend_session)
+                            .await
+                    }
+                    Err(error) => Err(error),
+                };
                 // The lease and every remaining handle-owned value belong to
                 // this task and are dropped exactly once even when the joining
                 // waiter is canceled. The whole worker is unwind-protected so
@@ -411,7 +421,9 @@ impl ExpiryClaim {
         // polled, ExpiryClaim::drop starts the flight; once polled, dropping the
         // JoinHandle merely detaches the already-owned task.
         let Some(flight) = self.start_flight() else {
-            return CleanupReport { result: Ok(()) };
+            return CleanupReport {
+                result: Ok(BackendCleanupDispositionV1::Complete),
+            };
         };
         Self::join_flight(flight).await
     }
@@ -1773,15 +1785,15 @@ impl SessionManager {
             let expired_handle = expired.is_some();
             let cleanup_result = match expired {
                 Some(claim) => claim.cleanup().await.result,
-                None => Ok(()),
+                None => Ok(BackendCleanupDispositionV1::Complete),
             };
 
             let result = match (cancel_result, cleanup_result) {
                 (Err(error), _) if gone || expired_handle => Err(error),
-                (Err(_), Ok(())) => Ok(()),
+                (Err(_), Ok(_)) => Ok(()),
                 (Err(_), Err(cleanup)) => Err(cleanup),
                 (Ok(()), Err(cleanup)) => Err(cleanup),
-                (Ok(()), Ok(())) => Ok(()),
+                (Ok(()), Ok(_)) => Ok(()),
             };
             (result, expired_handle)
         });
@@ -1931,7 +1943,7 @@ impl SessionManager {
         };
         if let Some((claim, generation)) = failed_cleanup_retry {
             return match claim.cleanup().await.result {
-                Ok(()) => (
+                Ok(_) => (
                     Ok(ResetOutcome::Cleared {
                         generation: generation.get(),
                     }),
@@ -2363,6 +2375,8 @@ mod tests {
         reply: String,
         releases: StdMutex<Vec<String>>,
         release_result: StdMutex<Result<(), BridgeError>>,
+        release_disposition: StdMutex<BackendCleanupDispositionV1>,
+        flight_supported: AtomicBool,
         release_panics: AtomicBool,
         release_gate: StdMutex<Option<oneshot::Receiver<()>>>,
         release_started: Notify,
@@ -2392,6 +2406,8 @@ mod tests {
                 reply: reply.into(),
                 releases: StdMutex::new(Vec::new()),
                 release_result: StdMutex::new(Ok(())),
+                release_disposition: StdMutex::new(BackendCleanupDispositionV1::Complete),
+                flight_supported: AtomicBool::new(true),
                 release_panics: AtomicBool::new(false),
                 release_gate: StdMutex::new(None),
                 release_started: Notify::new(),
@@ -2429,6 +2445,14 @@ mod tests {
 
         fn set_release_result(&self, result: Result<(), BridgeError>) {
             *self.release_result.lock().unwrap() = result;
+        }
+
+        fn set_release_disposition(&self, disposition: BackendCleanupDispositionV1) {
+            *self.release_disposition.lock().unwrap() = disposition;
+        }
+
+        fn set_flight_supported(&self, supported: bool) {
+            self.flight_supported.store(supported, Ordering::SeqCst);
         }
 
         fn set_release_panics(&self) {
@@ -2603,13 +2627,31 @@ mod tests {
             }
         }
 
-        async fn release_session_checked(&self, session: &SessionId) -> Result<(), BridgeError> {
+        fn resource_flight_v1(
+            &self,
+        ) -> Result<bridge_core::ports::BackendResourceFlightV1, BridgeError> {
+            if self.flight_supported.load(Ordering::SeqCst) {
+                Ok(bridge_core::ports::BackendResourceFlightV1::LegacyV2)
+            } else {
+                Err(BridgeError::ResourceFlightUnsupported)
+            }
+        }
+
+        async fn release_session_checked(
+            &self,
+            session: &SessionId,
+        ) -> Result<bridge_core::ports::BackendCleanupDispositionV1, BridgeError> {
             self.release_session(session).await;
             assert!(
                 !self.release_panics.load(Ordering::SeqCst),
                 "injected cleanup panic"
             );
-            self.release_result.lock().unwrap().clone()
+            let disposition = *self.release_disposition.lock().unwrap();
+            self.release_result
+                .lock()
+                .unwrap()
+                .clone()
+                .map(|()| disposition)
         }
 
         fn capabilities(&self) -> AgentSessionCaps {
@@ -4357,6 +4399,57 @@ mod tests {
         assert_eq!(backend.releases(), vec!["ctx-expiry-failed-g0"]);
     }
 
+    async fn assert_cleanup_disposition_reaches_session_manager(
+        disposition: BackendCleanupDispositionV1,
+        context: &str,
+    ) {
+        let (manager, backend, _registry) = manager();
+        let manager = Arc::new(manager);
+        let c = ctx(context);
+        let turn = manager
+            .checkout_turn(&c, agent(), None, None)
+            .await
+            .unwrap();
+        backend.set_release_disposition(disposition);
+        let report = manager
+            .begin_expire_current(&c, turn.generation, &turn.op)
+            .await
+            .unwrap()
+            .cleanup()
+            .await;
+
+        assert_eq!(report.result, Ok(disposition));
+        assert!(manager.status(&c).await.is_none());
+        assert_eq!(backend.releases().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn retained_cleanup_reaches_session_manager_without_complete_collapse() {
+        assert_cleanup_disposition_reaches_session_manager(
+            BackendCleanupDispositionV1::Retained,
+            "cleanup-retained",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn preserved_cleanup_reaches_session_manager_without_complete_collapse() {
+        assert_cleanup_disposition_reaches_session_manager(
+            BackendCleanupDispositionV1::Preserved,
+            "cleanup-preserved",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn unknown_cleanup_reaches_session_manager_without_complete_collapse() {
+        assert_cleanup_disposition_reaches_session_manager(
+            BackendCleanupDispositionV1::Unknown,
+            "cleanup-unknown",
+        )
+        .await;
+    }
+
     #[tokio::test]
     async fn explicit_release_retries_cleanup_failed_tombstone_after_backend_recovers() {
         let (manager, backend, _registry) = manager();
@@ -4387,6 +4480,38 @@ mod tests {
                 "ctx-expiry-failed-release-retry-g0"
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn checked_cleanup_retry_refuses_before_reentering_an_unexposed_backend() {
+        let (manager, backend, _registry) = manager();
+        let manager = Arc::new(manager);
+        let c = ctx("cleanup-retry-flight-refusal");
+        let turn = manager
+            .checkout_turn(&c, agent(), None, None)
+            .await
+            .unwrap();
+        backend.set_release_result(Err(BridgeError::StoreFailure));
+        assert_eq!(
+            manager
+                .begin_expire_current(&c, turn.generation, &turn.op)
+                .await
+                .unwrap()
+                .cleanup()
+                .await
+                .result,
+            Err(BridgeError::StoreFailure)
+        );
+        assert_eq!(backend.releases().len(), 1);
+
+        backend.set_release_result(Ok(()));
+        backend.set_flight_supported(false);
+        assert_eq!(
+            manager.reset_session(&c, ResetOpts { force: false }).await,
+            Err(BridgeError::ResourceFlightUnsupported)
+        );
+        assert_eq!(backend.releases().len(), 1, "refusal must precede cleanup");
+        assert_eq!(manager.status(&c).await.unwrap().state, "cleanup_failed");
     }
 
     #[tokio::test]

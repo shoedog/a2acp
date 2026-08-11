@@ -41,6 +41,8 @@ pub enum BridgeError {
     BoundSessionUnsupported,
     #[error("bound registry resolution is unsupported")]
     BindUnsupported,
+    #[error("retained resource flight is unsupported")]
+    ResourceFlightUnsupported,
     #[error("session expired")]
     SessionExpired,
     #[error("session busy")]
@@ -186,6 +188,7 @@ impl BridgeError {
             | SessionNotFound
             | ConfigMismatch { .. }
             | ConfigReseedRequired { .. }
+            | ResourceFlightUnsupported
             | SessionExpired
             | HandleBusy => RejectRequest,
             IdentityUnavailable | DurableEvidenceUnavailable { .. } => RejectRequest,
@@ -390,6 +393,7 @@ mod tests {
             ConfigReseedRequired { field: "x" },
             BoundSessionUnsupported,
             BindUnsupported,
+            ResourceFlightUnsupported,
             SessionExpired,
             HandleBusy,
             AuthRequired {

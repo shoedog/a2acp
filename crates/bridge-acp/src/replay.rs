@@ -12,7 +12,7 @@ use std::pin::Pin;
 use bridge_core::domain::{Part, PermissionRequest};
 use bridge_core::error::BridgeError;
 use bridge_core::ids::SessionId;
-use bridge_core::ports::{AgentBackend, BackendStream, Update};
+use bridge_core::ports::{AgentBackend, BackendResourceFlightV1, BackendStream, Update};
 
 use crate::framing::FrameReader;
 
@@ -85,6 +85,17 @@ impl AgentBackend for ReplayBackend {
     async fn cancel(&self, _session: &SessionId) -> Result<(), BridgeError> {
         Ok(())
     }
+
+    fn resource_flight_v1(&self) -> Result<BackendResourceFlightV1, BridgeError> {
+        Err(BridgeError::ResourceFlightUnsupported)
+    }
+
+    fn attach_resource_flight_owner_v1(
+        &self,
+        _session: &SessionId,
+    ) -> Result<BackendResourceFlightV1, BridgeError> {
+        Err(BridgeError::ResourceFlightUnsupported)
+    }
 }
 
 // Suppress dead_code warnings on Pin — it's used via the BackendStream type alias.
@@ -146,5 +157,20 @@ mod tests {
             .unwrap();
         // the unknown-shaped update is skipped; only Done comes through
         assert!(matches!(s.next().await, Some(Ok(Update::Done { .. }))));
+    }
+
+    #[test]
+    fn replay_refuses_resource_flight_exposure_and_attachment() {
+        let backend = ReplayBackend::from_ndjson(Vec::new());
+        let session = SessionId::parse("replay-flight-refusal").unwrap();
+
+        assert_eq!(
+            backend.resource_flight_v1(),
+            Err(BridgeError::ResourceFlightUnsupported)
+        );
+        assert_eq!(
+            backend.attach_resource_flight_owner_v1(&session),
+            Err(BridgeError::ResourceFlightUnsupported)
+        );
     }
 }

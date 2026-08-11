@@ -288,6 +288,58 @@ impl CheckoutSettlementV1 {
     }
 }
 
+/// Process/resource authority exposed by one concrete backend generation.
+///
+/// `ProtectedV3` means every destructive backend entry point is already wired
+/// to the generation's retained flight. This value deliberately carries no
+/// signal capability: wrappers may use it only to decide whether they can
+/// delegate a destructive call to the backend that owns that capability.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BackendResourceFlightV1 {
+    LegacyV2,
+    ProtectedV3,
+}
+
+/// Closed result of backend/session cleanup.
+///
+/// Protective outcomes are successful settlements, but they are not
+/// `Complete`: callers must retain the exact disposition through detached
+/// cleanup and terminal projection.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum BackendCleanupDispositionV1 {
+    #[default]
+    Complete,
+    Retained,
+    Preserved,
+    Unknown,
+}
+
+impl BackendCleanupDispositionV1 {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Complete => "complete",
+            Self::Retained => "retained",
+            Self::Preserved => "preserved",
+            Self::Unknown => "unknown",
+        }
+    }
+
+    /// Compose independent inner-resource and outer-custody cleanup without
+    /// collapsing a protective result. `Unknown` is most conservative; an
+    /// outer preservation outranks a mere retention.
+    #[must_use]
+    pub const fn combine(self, other: Self) -> Self {
+        use BackendCleanupDispositionV1::{Complete, Preserved, Retained, Unknown};
+        match (self, other) {
+            (Unknown, _) | (_, Unknown) => Unknown,
+            (Preserved, _) | (_, Preserved) => Preserved,
+            (Retained, _) | (_, Retained) => Retained,
+            (Complete, Complete) => Complete,
+        }
+    }
+}
+
 /// Streaming agent backend — adapters implement this; core never depends on adapters.
 #[async_trait::async_trait]
 pub trait AgentBackend: Send + Sync {
@@ -322,6 +374,23 @@ pub trait AgentBackend: Send + Sync {
         _observer: std::sync::Arc<dyn DiagnosticObserver>,
     ) -> Result<(), BridgeError> {
         self.cancel(session).await
+    }
+
+    /// Expose whether destructive operations for this backend generation are
+    /// protected by a retained-resource flight. Refusing by default prevents
+    /// an unmodified forwarding wrapper from silently authorizing a signal.
+    fn resource_flight_v1(&self) -> Result<BackendResourceFlightV1, BridgeError> {
+        Err(BridgeError::ResourceFlightUnsupported)
+    }
+
+    /// Attach a session owner to this generation before provider work. The
+    /// returned mode is the exact generation that accepted the owner. Defaults
+    /// refuse for the same reason as [`Self::resource_flight_v1`].
+    fn attach_resource_flight_owner_v1(
+        &self,
+        _session: &SessionId,
+    ) -> Result<BackendResourceFlightV1, BridgeError> {
+        Err(BridgeError::ResourceFlightUnsupported)
     }
 
     /// Prefix-attestation capability for this resolved backend instance. The default is
@@ -373,15 +442,18 @@ pub trait AgentBackend: Send + Sync {
     /// Result-bearing, observer-free cleanup used by detached cleanup ownership.
     /// Implementors with fallible teardown override this method; the default
     /// preserves source and behavior compatibility with legacy backends.
-    async fn forget_session_checked(&self, session: &SessionId) -> Result<(), BridgeError> {
+    async fn forget_session_checked(
+        &self,
+        session: &SessionId,
+    ) -> Result<BackendCleanupDispositionV1, BridgeError> {
         self.forget_session(session).await;
-        Ok(())
+        Ok(BackendCleanupDispositionV1::Complete)
     }
     async fn forget_session_observed(
         &self,
         session: &SessionId,
         _observer: std::sync::Arc<dyn DiagnosticObserver>,
-    ) -> Result<(), BridgeError> {
+    ) -> Result<BackendCleanupDispositionV1, BridgeError> {
         self.forget_session_checked(session).await
     }
     /// Release a warm session: drop ALL per-session backend state + reap any per-session
@@ -393,15 +465,18 @@ pub trait AgentBackend: Send + Sync {
     /// Result-bearing, observer-free warm release. A cleanup flight owns this
     /// call, while its optional diagnostic waiter retains the operation observer
     /// and records the bounded result after joining.
-    async fn release_session_checked(&self, session: &SessionId) -> Result<(), BridgeError> {
+    async fn release_session_checked(
+        &self,
+        session: &SessionId,
+    ) -> Result<BackendCleanupDispositionV1, BridgeError> {
         self.release_session(session).await;
-        Ok(())
+        Ok(BackendCleanupDispositionV1::Complete)
     }
     async fn release_session_observed(
         &self,
         session: &SessionId,
         _observer: std::sync::Arc<dyn DiagnosticObserver>,
-    ) -> Result<(), BridgeError> {
+    ) -> Result<BackendCleanupDispositionV1, BridgeError> {
         self.release_session_checked(session).await
     }
     /// R2f1b §5.1 step 6 — the PRESERVATION BARRIER. Durably preserve this session's
@@ -1226,7 +1301,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn agentbackend_defaults_are_noops_and_object_safe() {
+    async fn agentbackend_defaults_are_noops_or_refusals_and_object_safe() {
         struct Fake;
         #[async_trait::async_trait]
         impl AgentBackend for Fake {
@@ -1248,6 +1323,15 @@ mod tests {
         )
         .await
         .unwrap();
+        let session = crate::ids::SessionId::parse("s").unwrap();
+        assert_eq!(
+            f.resource_flight_v1(),
+            Err(BridgeError::ResourceFlightUnsupported)
+        );
+        assert_eq!(
+            f.attach_resource_flight_owner_v1(&session),
+            Err(BridgeError::ResourceFlightUnsupported)
+        );
         f.forget_session(&crate::ids::SessionId::parse("s").unwrap())
             .await;
         f.release_session(&crate::ids::SessionId::parse("s").unwrap())
@@ -1264,5 +1348,31 @@ mod tests {
         assert_eq!(f.capabilities(), crate::orch::AgentSessionCaps::default());
         f.retire().await.unwrap();
         let _obj: std::sync::Arc<dyn AgentBackend> = std::sync::Arc::new(Fake); // object-safe
+    }
+
+    #[test]
+    fn cleanup_disposition_composition_is_closed_and_conservative() {
+        use BackendCleanupDispositionV1::{Complete, Preserved, Retained, Unknown};
+
+        for (outer, inner, expected) in [
+            (Complete, Complete, Complete),
+            (Complete, Retained, Retained),
+            (Complete, Preserved, Preserved),
+            (Complete, Unknown, Unknown),
+            (Retained, Complete, Retained),
+            (Retained, Retained, Retained),
+            (Retained, Preserved, Preserved),
+            (Retained, Unknown, Unknown),
+            (Preserved, Complete, Preserved),
+            (Preserved, Retained, Preserved),
+            (Preserved, Preserved, Preserved),
+            (Preserved, Unknown, Unknown),
+            (Unknown, Complete, Unknown),
+            (Unknown, Retained, Unknown),
+            (Unknown, Preserved, Unknown),
+            (Unknown, Unknown, Unknown),
+        ] {
+            assert_eq!(outer.combine(inner), expected);
+        }
     }
 }

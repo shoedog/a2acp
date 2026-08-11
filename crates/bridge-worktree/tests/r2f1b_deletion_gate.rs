@@ -18,7 +18,9 @@ use bridge_core::error::BridgeError;
 use bridge_core::execution_policy::{Sha256HexV1, WorktreeCustodyIdV1, WorktreeObjectIdentityV1};
 use bridge_core::fs_custody::DirectoryIdentityV1;
 use bridge_core::ids::{AgentId, AttemptIdentity, ContextId, ExecutionId, SessionId, TaskId};
-use bridge_core::ports::{AgentBackend, AgentRegistry, BackendStream, Lease, Resolved, Update};
+use bridge_core::ports::{
+    AgentBackend, AgentRegistry, BackendResourceFlightV1, BackendStream, Lease, Resolved, Update,
+};
 use bridge_core::SessionCwd;
 use bridge_worktree::backend::{WorktreeBackend, WorktreeIdentity};
 use bridge_worktree::custody::{
@@ -51,6 +53,10 @@ struct FakeInner {
 
 #[async_trait::async_trait]
 impl AgentBackend for FakeInner {
+    fn resource_flight_v1(&self) -> Result<BackendResourceFlightV1, BridgeError> {
+        Ok(BackendResourceFlightV1::LegacyV2)
+    }
+
     async fn prompt(
         &self,
         _session: &SessionId,

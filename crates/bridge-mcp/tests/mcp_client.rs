@@ -16,7 +16,8 @@ use bridge_core::ids::{
     AgentId, AttemptIdentity, ContextId, NodeId, OperationId, SessionId, TaskId, WorkflowId,
 };
 use bridge_core::ports::{
-    AgentBackend, AgentRegistry, BackendStream, Lease, PolicyEngine, Resolved, SessionStore, Update,
+    AgentBackend, AgentRegistry, BackendResourceFlightV1, BackendStream, Lease, PolicyEngine,
+    Resolved, SessionStore, Update,
 };
 use bridge_core::session_cwd::SessionCwd;
 use bridge_core::task_store::{MemoryTaskStore, TaskStore};
@@ -63,6 +64,10 @@ impl FakeBackend {
 
 #[async_trait]
 impl AgentBackend for FakeBackend {
+    fn resource_flight_v1(&self) -> Result<BackendResourceFlightV1, BridgeError> {
+        Ok(BackendResourceFlightV1::LegacyV2)
+    }
+
     async fn prompt(
         &self,
         _session: &SessionId,
@@ -87,12 +92,15 @@ impl AgentBackend for FakeBackend {
         self.releases.fetch_add(1, Ordering::SeqCst);
     }
 
-    async fn release_session_checked(&self, _session: &SessionId) -> Result<(), BridgeError> {
+    async fn release_session_checked(
+        &self,
+        _session: &SessionId,
+    ) -> Result<bridge_core::ports::BackendCleanupDispositionV1, BridgeError> {
         self.releases.fetch_add(1, Ordering::SeqCst);
         if self.fail_release.load(Ordering::SeqCst) {
             Err(BridgeError::StoreFailure)
         } else {
-            Ok(())
+            Ok(bridge_core::ports::BackendCleanupDispositionV1::Complete)
         }
     }
 }

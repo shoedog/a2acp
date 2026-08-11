@@ -5,7 +5,7 @@ use bridge_core::domain::{EffectiveConfig, QueuedInject};
 use bridge_core::error::{warm_session_survivability, BridgeError, WarmSessionSurvivability};
 use bridge_core::ids::{ContextId, OperationId, SessionGeneration, SessionId, TaskId};
 use bridge_core::permission::TurnMeta;
-use bridge_core::ports::{AgentBackend, DiagnosticObserver, Lease};
+use bridge_core::ports::{AgentBackend, BackendCleanupDispositionV1, DiagnosticObserver, Lease};
 use tokio::sync::Mutex;
 
 use crate::session_manager::{ExpiryClaim, SessionManager, WarmExpiryIntent};
@@ -113,15 +113,42 @@ pub enum WarmCompletionExit<'a> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DetachedCleanupDisposition {
     Complete,
+    Retained,
+    Preserved,
+    Unknown,
     Failed,
     OwnerHeld,
+}
+
+impl DetachedCleanupDisposition {
+    pub const fn as_str(self) -> Option<&'static str> {
+        match self {
+            Self::Complete => Some("complete"),
+            Self::Retained => Some("retained"),
+            Self::Preserved => Some("preserved"),
+            Self::Unknown => Some("unknown"),
+            Self::Failed => Some("failed"),
+            Self::OwnerHeld => None,
+        }
+    }
+}
+
+impl From<BackendCleanupDispositionV1> for DetachedCleanupDisposition {
+    fn from(value: BackendCleanupDispositionV1) -> Self {
+        match value {
+            BackendCleanupDispositionV1::Complete => Self::Complete,
+            BackendCleanupDispositionV1::Retained => Self::Retained,
+            BackendCleanupDispositionV1::Preserved => Self::Preserved,
+            BackendCleanupDispositionV1::Unknown => Self::Unknown,
+        }
+    }
 }
 
 /// Observable custody for one exact cleanup flight. Constructing this value
 /// transfers the warm claim before durable terminal publication; awaiting it is
 /// deliberately separate from response delivery.
 pub struct DetachedWarmCleanup {
-    task: Option<tokio::task::JoinHandle<Result<(), BridgeError>>>,
+    task: Option<tokio::task::JoinHandle<Result<BackendCleanupDispositionV1, BridgeError>>>,
     immediate: Option<DetachedCleanupDisposition>,
 }
 
@@ -131,7 +158,7 @@ impl DetachedWarmCleanup {
             return disposition;
         }
         match self.task.expect("non-immediate cleanup owns a task").await {
-            Ok(Ok(())) => DetachedCleanupDisposition::Complete,
+            Ok(Ok(disposition)) => disposition.into(),
             Ok(Err(_)) | Err(_) => DetachedCleanupDisposition::Failed,
         }
     }
@@ -302,8 +329,8 @@ impl WarmCompletionGuard {
                         record_cleanup_transition(diagnostic.as_ref(), status, code).await;
                     match (report.result, observation) {
                         (Err(primary), _) => Err(primary),
-                        (Ok(()), Err(observation)) => Err(observation),
-                        (Ok(()), Ok(())) => Ok(()),
+                        (Ok(_), Err(observation)) => Err(observation),
+                        (Ok(disposition), Ok(())) => Ok(disposition),
                     }
                 });
                 DetachedWarmCleanup {
@@ -314,14 +341,14 @@ impl WarmCompletionGuard {
         }
     }
 
-    pub async fn complete(mut self) -> Result<(), BridgeError> {
+    pub async fn complete(mut self) -> Result<BackendCleanupDispositionV1, BridgeError> {
         match self.action {
             WarmCompletionAction::Finish => {
                 self.sm
                     .finish_turn(&self.ctx, self.generation, &self.op)
                     .await;
                 self.armed = false;
-                Ok(())
+                Ok(BackendCleanupDispositionV1::Complete)
             }
             WarmCompletionAction::Cancel => {
                 let result = self
@@ -329,7 +356,7 @@ impl WarmCompletionGuard {
                     .cancel_turn_current(&self.ctx, self.generation, &self.op)
                     .await;
                 self.armed = false;
-                result
+                result.map(|()| BackendCleanupDispositionV1::Complete)
             }
             WarmCompletionAction::Expire => {
                 let claim = self
@@ -338,7 +365,7 @@ impl WarmCompletionGuard {
                     .await;
                 let Some(claim) = claim else {
                     self.armed = false;
-                    return Ok(());
+                    return Ok(BackendCleanupDispositionV1::Complete);
                 };
                 // From this point the claim/tombstone pair owns fallback. The
                 // completion guard must not start a second cleanup flight.
@@ -375,8 +402,8 @@ impl WarmCompletionGuard {
                         .await;
                 match (report.result, observation) {
                     (Err(primary), _) => Err(primary),
-                    (Ok(()), Err(observation)) => Err(observation),
-                    (Ok(()), Ok(())) => Ok(()),
+                    (Ok(_), Err(observation)) => Err(observation),
+                    (Ok(disposition), Ok(())) => Ok(disposition),
                 }
             }
         }

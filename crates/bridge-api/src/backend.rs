@@ -19,8 +19,8 @@ use bridge_core::execution_policy::{BoundMcpDeliveryPayloadV1, BoundSessionSpecV
 use bridge_core::ids::SessionId;
 use bridge_core::orch::OrchEventKind;
 use bridge_core::ports::{
-    AgentBackend, BackendObservers, BackendStream, DiagnosticObserver, PolicyEngine, RichEventSink,
-    Update, STOP_REASON_CANCELLED,
+    AgentBackend, BackendObservers, BackendResourceFlightV1, BackendStream, DiagnosticObserver,
+    PolicyEngine, RichEventSink, Update, STOP_REASON_CANCELLED,
 };
 use bridge_core::provider::ProviderEvidence;
 use futures::StreamExt;
@@ -687,6 +687,17 @@ impl AgentBackend for ApiBackend {
             observers.diagnostic,
         )
         .await
+    }
+
+    fn resource_flight_v1(&self) -> Result<BackendResourceFlightV1, BridgeError> {
+        Ok(BackendResourceFlightV1::LegacyV2)
+    }
+
+    fn attach_resource_flight_owner_v1(
+        &self,
+        _session: &SessionId,
+    ) -> Result<BackendResourceFlightV1, BridgeError> {
+        Err(BridgeError::ResourceFlightUnsupported)
     }
 
     async fn cancel(&self, session: &SessionId) -> Result<(), BridgeError> {

@@ -75,8 +75,9 @@ use bridge_core::permission::{
     TurnMeta,
 };
 use bridge_core::ports::{
-    AgentBackend, BackendObservers, BackendStream, DiagnosticObserver, PolicyEngine, PolicyOutcome,
-    RichEventSink, Update, STOP_REASON_CANCELLED,
+    AgentBackend, BackendCleanupDispositionV1, BackendObservers, BackendResourceFlightV1,
+    BackendStream, DiagnosticObserver, PolicyEngine, PolicyOutcome, RichEventSink, Update,
+    STOP_REASON_CANCELLED,
 };
 use bridge_core::resource_flight::{ResourceActionDispositionV1, ResourceActionResultV1};
 use bridge_core::retained_resource_flight::ResourceFlightOwnerV1;
@@ -4601,6 +4602,9 @@ impl AcpBackend {
             .emit();
             BridgeError::agent_crashed("ACP supervised process lock is poisoned")
         })?;
+        // A missing supervisor is refused by the public attachment's load-bearing
+        // resource-flight re-read below. Internal session attachment reaches this
+        // helper only after spawn has published `supervised`.
         if let Some(supervised) = supervised.as_ref() {
             supervised.attach_owner(owner).map_err(|_| {
                 AcpTraceEvent::ProcessFlightOwnerAttachFailed {
@@ -7024,6 +7028,32 @@ impl AgentBackend for AcpBackend {
             .map_err(|failure| failure.error)
     }
 
+    fn resource_flight_v1(&self) -> Result<BackendResourceFlightV1, BridgeError> {
+        let supervised = self
+            .supervised
+            .lock()
+            .map_err(|_| BridgeError::agent_crashed("ACP supervised process lock is poisoned"))?;
+        let supervised = supervised
+            .as_ref()
+            .ok_or(BridgeError::ResourceFlightUnsupported)?;
+        Ok(if supervised.is_legacy_v2() {
+            BackendResourceFlightV1::LegacyV2
+        } else {
+            BackendResourceFlightV1::ProtectedV3
+        })
+    }
+
+    fn attach_resource_flight_owner_v1(
+        &self,
+        session: &SessionId,
+    ) -> Result<BackendResourceFlightV1, BridgeError> {
+        // Load-bearing: re-read after attachment so a missing supervisor cannot
+        // turn the helper's no-op `None` branch into successful public exposure.
+        // Keep this check adjacent to the attachment.
+        self.attach_process_flight_owner(session)?;
+        self.resource_flight_v1()
+    }
+
     async fn cancel_observed(
         &self,
         session: &SessionId,
@@ -7162,16 +7192,19 @@ impl AgentBackend for AcpBackend {
             .remove(session);
     }
 
-    async fn forget_session_checked(&self, session: &SessionId) -> Result<(), BridgeError> {
+    async fn forget_session_checked(
+        &self,
+        session: &SessionId,
+    ) -> Result<BackendCleanupDispositionV1, BridgeError> {
         self.forget_session(session).await;
-        Ok(())
+        Ok(BackendCleanupDispositionV1::Complete)
     }
 
     async fn forget_session_observed(
         &self,
         session: &SessionId,
         observer: Arc<dyn DiagnosticObserver>,
-    ) -> Result<(), BridgeError> {
+    ) -> Result<BackendCleanupDispositionV1, BridgeError> {
         let lifecycle = self.operation_lifecycle(session, observer).await;
         lifecycle
             .record(
@@ -7191,7 +7224,8 @@ impl AgentBackend for AcpBackend {
                 Some("acp.teardown.forgotten"),
                 None,
             )
-            .await
+            .await?;
+        Ok(BackendCleanupDispositionV1::Complete)
     }
 
     /// Re-apply warm-session model/effort against the cached ACP config surface.
@@ -7289,20 +7323,24 @@ impl AgentBackend for AcpBackend {
         let _ = self.release_session_checked(session).await;
     }
 
-    async fn release_session_checked(&self, session: &SessionId) -> Result<(), BridgeError> {
+    async fn release_session_checked(
+        &self,
+        session: &SessionId,
+    ) -> Result<BackendCleanupDispositionV1, BridgeError> {
         // ACP multiplexes every bridge session over one process. Releasing a
         // session must clear only that session; process/container ownership is
         // retired by `retire`, escalation, spawn-failure cleanup, or `Drop`.
         self.release_session_result(session)
             .await
             .map_err(|failure| failure.error)
+            .map(|()| BackendCleanupDispositionV1::Complete)
     }
 
     async fn release_session_observed(
         &self,
         session: &SessionId,
         observer: Arc<dyn DiagnosticObserver>,
-    ) -> Result<(), BridgeError> {
+    ) -> Result<BackendCleanupDispositionV1, BridgeError> {
         let lifecycle = self.operation_lifecycle(session, observer).await;
 
         lifecycle
@@ -7345,7 +7383,8 @@ impl AgentBackend for AcpBackend {
                 Some("acp.teardown.released"),
                 None,
             )
-            .await
+            .await?;
+        Ok(BackendCleanupDispositionV1::Complete)
     }
 
     /// Graceful async teardown of the agent process (Increment 3b §5.4).

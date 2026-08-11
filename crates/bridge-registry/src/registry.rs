@@ -487,7 +487,7 @@ impl Registry {
             );
             if slot.retired.load(SeqCst) {
                 drop(lease);
-                let _ = backend.retire().await;
+                let _ = Self::retire_join_or_refuse(id, &backend).await;
                 continue;
             }
 
@@ -501,6 +501,31 @@ impl Registry {
         }
     }
 
+    async fn retire_join_or_refuse(
+        agent: &AgentId,
+        backend: &Arc<dyn AgentBackend>,
+    ) -> Result<(), BridgeError> {
+        if let Err(error) = backend.resource_flight_v1() {
+            tracing::warn!(
+                agent = agent.as_str(),
+                failure_kind = "flight_refusal",
+                "registry backend retirement refused"
+            );
+            return Err(error);
+        }
+        match backend.retire().await {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                tracing::warn!(
+                    agent = agent.as_str(),
+                    failure_kind = "retire_error",
+                    "registry backend retirement failed"
+                );
+                Err(error)
+            }
+        }
+    }
+
     /// Detached lease-draining retirement [spec §7]. The slot is already marked
     /// `retired` (blocks NEW leases via resolve's post-spawn re-check) and absent
     /// from the live map. This task awaits `leases == 0` — woken by the slot's
@@ -510,10 +535,11 @@ impl Registry {
     /// `retire()` may also be invoked by `resolve`'s race-loss path, so backends
     /// MUST treat repeat/concurrent `retire()` as idempotent.
     fn spawn_retirement(slot: Arc<Slot>, grace: Duration) {
+        let agent = slot.entry.load().id.clone();
         tokio::spawn(async move {
             Self::wait_for_slot_drain(&slot, grace).await;
             if let Some(b) = slot.backend.get() {
-                let _ = b.retire().await;
+                let _ = Self::retire_join_or_refuse(&agent, b).await;
             }
             let keyed: Vec<_> = slot
                 .bound_backends
@@ -524,7 +550,7 @@ impl Registry {
                 .collect();
             for cell in keyed {
                 if let Some(backend) = cell.get() {
-                    let _ = backend.retire().await;
+                    let _ = Self::retire_join_or_refuse(&agent, backend).await;
                 }
             }
         });
@@ -553,10 +579,11 @@ impl Registry {
         backend: Arc<OnceCell<Arc<dyn AgentBackend>>>,
         grace: Duration,
     ) {
+        let agent = slot.entry.load().id.clone();
         tokio::spawn(async move {
             Self::wait_for_slot_drain(&slot, grace).await;
             if let Some(backend) = backend.get() {
-                let _ = backend.retire().await;
+                let _ = Self::retire_join_or_refuse(&agent, backend).await;
             }
         });
     }
@@ -919,7 +946,7 @@ mod tests {
     use bridge_core::domain::{AgentKind, Effort, RegistrySnapshot, WatchdogConfig};
     use bridge_core::ids::SessionId;
     use bridge_core::mcp::{McpDelivery, McpServerSpec};
-    use bridge_core::ports::{BackendStream, DiagnosticObserver, Update};
+    use bridge_core::ports::{BackendResourceFlightV1, BackendStream, DiagnosticObserver, Update};
     use std::collections::BTreeMap;
     use std::sync::Mutex as StdMutex;
 
@@ -945,6 +972,39 @@ mod tests {
         async fn cancel(&self, _s: &SessionId) -> Result<(), BridgeError> {
             Ok(())
         }
+        fn resource_flight_v1(&self) -> Result<BackendResourceFlightV1, BridgeError> {
+            Ok(BackendResourceFlightV1::LegacyV2)
+        }
+        async fn retire(&self) -> Result<(), BridgeError> {
+            self.retired.fetch_add(1, SeqCst);
+            Ok(())
+        }
+    }
+
+    struct RefusingBackend {
+        exposures: Arc<AtomicUsize>,
+        retired: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl AgentBackend for RefusingBackend {
+        async fn prompt(
+            &self,
+            _session: &SessionId,
+            _parts: Vec<bridge_core::domain::Part>,
+        ) -> Result<BackendStream, BridgeError> {
+            Ok(Box::pin(futures::stream::empty()))
+        }
+
+        async fn cancel(&self, _session: &SessionId) -> Result<(), BridgeError> {
+            Ok(())
+        }
+
+        fn resource_flight_v1(&self) -> Result<BackendResourceFlightV1, BridgeError> {
+            self.exposures.fetch_add(1, SeqCst);
+            Err(BridgeError::ResourceFlightUnsupported)
+        }
+
         async fn retire(&self) -> Result<(), BridgeError> {
             self.retired.fetch_add(1, SeqCst);
             Ok(())
@@ -1000,6 +1060,38 @@ mod tests {
                     retired.load(SeqCst)
                 )
             });
+    }
+
+    async fn await_counter(label: &str, counter: &Arc<AtomicUsize>, want: usize) {
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while counter.load(SeqCst) < want {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "timed out waiting for {label} count {want} (got {})",
+                counter.load(SeqCst)
+            )
+        });
+    }
+
+    fn refusing_backend() -> (Arc<dyn AgentBackend>, Arc<AtomicUsize>, Arc<AtomicUsize>) {
+        let exposures = Arc::new(AtomicUsize::new(0));
+        let retired = Arc::new(AtomicUsize::new(0));
+        let backend: Arc<dyn AgentBackend> = Arc::new(RefusingBackend {
+            exposures: exposures.clone(),
+            retired: retired.clone(),
+        });
+        (backend, exposures, retired)
+    }
+
+    fn fixed_spawn(backend: Arc<dyn AgentBackend>) -> SpawnFn {
+        Arc::new(move |_entry| {
+            let backend = backend.clone();
+            Box::pin(async move { Ok(backend) })
+        })
     }
 
     fn snapshot(ids: &[&str]) -> RegistrySnapshot {
@@ -2133,6 +2225,117 @@ mod tests {
             "no respawn across idempotent applies"
         );
         assert_eq!(retired.load(SeqCst), 0, "kept slot is never retired");
+    }
+
+    #[tokio::test]
+    async fn registry_drain_refuses_before_backend_retire() {
+        let (backend, exposures, retired) = refusing_backend();
+        let slot = Slot::new(entry("a"));
+        assert!(slot.backend.set(backend).is_ok());
+
+        Registry::spawn_retirement(slot, Duration::ZERO);
+        await_counter("flight exposure", &exposures, 1).await;
+        assert_eq!(retired.load(SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn registry_invalidation_refuses_before_backend_retire() {
+        let (backend, exposures, retired) = refusing_backend();
+        let registry = Registry::new(snapshot(&["a"]), fixed_spawn(backend)).unwrap();
+        let id = AgentId::parse("a").unwrap();
+        drop(registry.resolve(&id).await.unwrap());
+
+        registry.invalidate(&id).await;
+        await_counter("flight exposure", &exposures, 1).await;
+        assert_eq!(retired.load(SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn registry_reload_refuses_before_backend_retire() {
+        let (backend, exposures, retired) = refusing_backend();
+        let registry = Registry::new(snapshot(&["a"]), fixed_spawn(backend)).unwrap();
+        let id = AgentId::parse("a").unwrap();
+        drop(registry.resolve(&id).await.unwrap());
+        let mut desired = snapshot(&["a"]);
+        desired.entries[0].cmd = Some("other-cmd".into());
+        desired.allowed_cmds.push("other-cmd".into());
+
+        registry.apply(desired).await.unwrap();
+        await_counter("flight exposure", &exposures, 1).await;
+        assert_eq!(retired.load(SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn registry_keyed_retirement_refuses_before_backend_retire() {
+        let (backend, exposures, retired) = refusing_backend();
+        let slot = Slot::new(entry("a"));
+        let keyed = Arc::new(OnceCell::new());
+        assert!(keyed.set(backend).is_ok());
+
+        Registry::spawn_keyed_retirement(slot, keyed, Duration::ZERO);
+        await_counter("flight exposure", &exposures, 1).await;
+        assert_eq!(retired.load(SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn registry_resolve_race_loss_refuses_before_backend_retire() {
+        let (first_backend, exposures, retired) = refusing_backend();
+        let second_backend: Arc<dyn AgentBackend> = Arc::new(FakeBackend {
+            retired: Arc::new(AtomicUsize::new(0)),
+        });
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let started_tx = Arc::new(StdMutex::new(Some(started_tx)));
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let release_rx = Arc::new(StdMutex::new(Some(release_rx)));
+        let spawn: SpawnFn = {
+            let calls = calls.clone();
+            let started_tx = started_tx.clone();
+            let release_rx = release_rx.clone();
+            Arc::new(move |_entry| {
+                let call = calls.fetch_add(1, SeqCst);
+                let first_backend = first_backend.clone();
+                let second_backend = second_backend.clone();
+                let started_tx = started_tx.clone();
+                let release_rx = release_rx.clone();
+                let started_tx = started_tx.lock().unwrap().take();
+                let release_rx = release_rx.lock().unwrap().take();
+                Box::pin(async move {
+                    if call == 0 {
+                        started_tx.unwrap().send(()).unwrap();
+                        release_rx.unwrap().await.unwrap();
+                        Ok(first_backend)
+                    } else {
+                        Ok(second_backend)
+                    }
+                })
+            })
+        };
+        let registry = Arc::new(Registry::new(snapshot(&["a"]), spawn).unwrap());
+        let id = AgentId::parse("a").unwrap();
+        let old_slot = registry.slot_arc(&id).unwrap();
+        let drain_hold = LeaseGuard::new(
+            old_slot.leases.clone(),
+            old_slot.lease_notify.clone(),
+            old_slot.retired.clone(),
+        );
+        let resolving = {
+            let registry = registry.clone();
+            let id = id.clone();
+            tokio::spawn(async move { registry.resolve(&id).await })
+        };
+        started_rx.await.unwrap();
+        let mut desired = snapshot(&["a"]);
+        desired.entries[0].cmd = Some("other-cmd".into());
+        desired.allowed_cmds.push("other-cmd".into());
+        registry.apply(desired).await.unwrap();
+        release_tx.send(()).unwrap();
+
+        drop(resolving.await.unwrap().unwrap());
+        await_counter("race-loss flight exposure", &exposures, 1).await;
+        assert_eq!(calls.load(SeqCst), 2);
+        assert_eq!(retired.load(SeqCst), 0);
+        drop(drain_hold);
     }
 
     // --- Task 5: lease-draining detached retirement ---------------------------

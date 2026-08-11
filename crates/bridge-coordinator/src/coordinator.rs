@@ -339,10 +339,8 @@ impl DirectAttemptHandle {
         })?;
         tokio::spawn(async move {
             let disposition = cleanup.settle().await;
-            let value = match disposition {
-                crate::dispatch::DetachedCleanupDisposition::Complete => "complete",
-                crate::dispatch::DetachedCleanupDisposition::Failed => "failed",
-                crate::dispatch::DetachedCleanupDisposition::OwnerHeld => return,
+            let Some(value) = disposition.as_str() else {
+                return;
             };
             match settlement.settle(value).await {
                 Ok(bridge_core::workflow_history::TerminalWrite::Applied)
@@ -1396,10 +1394,9 @@ impl Coordinator {
         // to the checked unobserved path.
         let cleanup_result = finish_guard.complete().await;
         finish_guard.disarm();
-        let cleanup_disposition = if cleanup_result.is_ok() {
-            "complete"
-        } else {
-            "failed"
+        let cleanup_disposition = match &cleanup_result {
+            Ok(disposition) => disposition.as_str(),
+            Err(_) => "failed",
         };
 
         if let Some(Err(e)) = collected.iter().find(|r| r.is_err()) {
@@ -2120,10 +2117,12 @@ impl TurnFinishGuard {
         }
     }
 
-    async fn complete(&mut self) -> Result<(), BridgeError> {
+    async fn complete(
+        &mut self,
+    ) -> Result<bridge_core::ports::BackendCleanupDispositionV1, BridgeError> {
         match self.completion.take() {
             Some(completion) => completion.complete().await,
-            None => Ok(()),
+            None => Ok(bridge_core::ports::BackendCleanupDispositionV1::Complete),
         }
     }
 
@@ -2204,6 +2203,8 @@ mod tests {
         prompt_gate: Option<Arc<Notify>>,
         prompt_calls: AtomicUsize,
         release_calls: AtomicUsize,
+        release_disposition: StdMutex<bridge_core::ports::BackendCleanupDispositionV1>,
+        flight_supported: std::sync::atomic::AtomicBool,
         fail_release: std::sync::atomic::AtomicBool,
         release_gate: Option<Arc<Notify>>,
         configured_turns: Arc<StdMutex<Vec<(SessionId, TurnMeta)>>>,
@@ -2216,6 +2217,10 @@ mod tests {
                 prompt_gate,
                 prompt_calls: AtomicUsize::new(0),
                 release_calls: AtomicUsize::new(0),
+                release_disposition: StdMutex::new(
+                    bridge_core::ports::BackendCleanupDispositionV1::Complete,
+                ),
+                flight_supported: std::sync::atomic::AtomicBool::new(true),
                 fail_release: std::sync::atomic::AtomicBool::new(false),
                 release_gate: None,
                 configured_turns: Arc::new(StdMutex::new(Vec::new())),
@@ -2236,12 +2241,27 @@ mod tests {
                 prompt_gate: None,
                 prompt_calls: AtomicUsize::new(0),
                 release_calls: AtomicUsize::new(0),
+                release_disposition: StdMutex::new(
+                    bridge_core::ports::BackendCleanupDispositionV1::Complete,
+                ),
+                flight_supported: std::sync::atomic::AtomicBool::new(true),
                 fail_release: std::sync::atomic::AtomicBool::new(false),
                 release_gate: Some(release_gate),
                 configured_turns: Arc::new(StdMutex::new(Vec::new())),
                 terminal_evidence_capability:
                     bridge_core::terminal_evidence::EvidenceCapability::Unsupported,
             }
+        }
+
+        fn set_release_disposition(
+            &self,
+            disposition: bridge_core::ports::BackendCleanupDispositionV1,
+        ) {
+            *self.release_disposition.lock().unwrap() = disposition;
+        }
+
+        fn refuse_flight_exposure(&self) {
+            self.flight_supported.store(false, AtomicOrdering::SeqCst);
         }
     }
 
@@ -2270,7 +2290,20 @@ mod tests {
             Ok(())
         }
 
-        async fn release_session_checked(&self, _session: &SessionId) -> Result<(), BridgeError> {
+        fn resource_flight_v1(
+            &self,
+        ) -> Result<bridge_core::ports::BackendResourceFlightV1, BridgeError> {
+            if self.flight_supported.load(AtomicOrdering::SeqCst) {
+                Ok(bridge_core::ports::BackendResourceFlightV1::LegacyV2)
+            } else {
+                Err(BridgeError::ResourceFlightUnsupported)
+            }
+        }
+
+        async fn release_session_checked(
+            &self,
+            _session: &SessionId,
+        ) -> Result<bridge_core::ports::BackendCleanupDispositionV1, BridgeError> {
             self.release_calls.fetch_add(1, AtomicOrdering::SeqCst);
             if let Some(gate) = &self.release_gate {
                 gate.notified().await;
@@ -2278,7 +2311,7 @@ mod tests {
             if self.fail_release.load(AtomicOrdering::SeqCst) {
                 Err(BridgeError::StoreFailure)
             } else {
-                Ok(())
+                Ok(*self.release_disposition.lock().unwrap())
             }
         }
 
@@ -2619,9 +2652,18 @@ mod tests {
             Ok(())
         }
 
-        async fn release_session_checked(&self, _session: &SessionId) -> Result<(), BridgeError> {
+        fn resource_flight_v1(
+            &self,
+        ) -> Result<bridge_core::ports::BackendResourceFlightV1, BridgeError> {
+            Ok(bridge_core::ports::BackendResourceFlightV1::LegacyV2)
+        }
+
+        async fn release_session_checked(
+            &self,
+            _session: &SessionId,
+        ) -> Result<bridge_core::ports::BackendCleanupDispositionV1, BridgeError> {
             self.releases.fetch_add(1, AtomicOrdering::SeqCst);
-            Ok(())
+            Ok(bridge_core::ports::BackendCleanupDispositionV1::Complete)
         }
     }
 
@@ -3154,6 +3196,214 @@ mod tests {
                 assert_eq!(rows[0].terminal.cleanup_disposition, expected_cleanup);
             }
         }
+    }
+
+    async fn prompt_barrier_failure_terminal(
+        backend: Arc<FakeBackend>,
+    ) -> bridge_core::workflow_history::AttemptTerminal {
+        let history = Arc::new(PromptBarrierFailureHistory::default());
+        let fixture = coordinator_fixture_with_backend_and_observer(
+            Arc::new(HashMap::new()),
+            backend,
+            Arc::new(WorkflowBalanceObserver::default()),
+        );
+        let coordinator = fixture
+            .coordinator
+            .with_workflow_history(Ok(history.clone()));
+        let identity = bridge_core::ids::AttemptIdentity::initial().unwrap();
+        match coordinator
+            .prompt_with_identity(prompt_params("hi"), identity)
+            .await
+        {
+            Ok(_) => panic!("prompt barrier failure unexpectedly succeeded"),
+            Err(BridgeError::DurableEvidenceUnavailable { reason: "io" }) => {}
+            Err(error) => panic!("unexpected prompt error: {error:?}"),
+        }
+        history
+            .completed_between(0, i64::MAX)
+            .await
+            .unwrap()
+            .into_iter()
+            .next()
+            .expect("one terminal row")
+            .terminal
+    }
+
+    #[tokio::test]
+    async fn detached_cleanup_projects_each_protective_disposition_exactly() {
+        for (disposition, expected) in [
+            (
+                bridge_core::ports::BackendCleanupDispositionV1::Retained,
+                "retained",
+            ),
+            (
+                bridge_core::ports::BackendCleanupDispositionV1::Preserved,
+                "preserved",
+            ),
+            (
+                bridge_core::ports::BackendCleanupDispositionV1::Unknown,
+                "unknown",
+            ),
+        ] {
+            let backend = Arc::new(FakeBackend::new(None));
+            backend.set_release_disposition(disposition);
+            let terminal = prompt_barrier_failure_terminal(backend.clone()).await;
+            assert_eq!(terminal.cleanup_disposition, expected);
+            assert_eq!(backend.release_calls.load(AtomicOrdering::SeqCst), 1);
+        }
+    }
+
+    async fn detached_cleanup_settles_protective_disposition_in_both_stores(
+        disposition: bridge_core::ports::BackendCleanupDispositionV1,
+        expected: &'static str,
+    ) {
+        let stores: [(&str, Arc<dyn WorkflowHistoryStore>); 2] = [
+            (
+                "memory",
+                Arc::new(MemoryWorkflowHistoryStore::new()) as Arc<dyn WorkflowHistoryStore>,
+            ),
+            (
+                "sqlite",
+                Arc::new(bridge_store::sqlite::SqliteStore::open_in_memory().unwrap())
+                    as Arc<dyn WorkflowHistoryStore>,
+            ),
+        ];
+
+        let mut settlement_failures = Vec::new();
+        for (store_name, history) in stores {
+            let backend = Arc::new(FakeBackend::new(None));
+            backend.set_release_disposition(disposition);
+            let fixture = coordinator_fixture_with_backend_and_observer(
+                Arc::new(HashMap::new()),
+                backend.clone(),
+                Arc::new(NoopObserver),
+            );
+            let coordinator = fixture
+                .coordinator
+                .with_workflow_history(Ok(history.clone()));
+            let context = ctx(&format!("ctx-detached-{expected}-{store_name}"));
+            let turn = coordinator
+                .session_manager
+                .checkout_turn(
+                    &context,
+                    AgentId::parse("codex").unwrap(),
+                    None,
+                    Some(SessionCwd::parse("/tmp/repo").unwrap()),
+                )
+                .await
+                .unwrap();
+            let mut completion = WarmCompletionGuard::finish_owner(
+                coordinator.session_manager.clone(),
+                context,
+                turn.generation,
+                turn.op,
+                turn.expiry_intent,
+                Arc::new(bridge_core::diagnostics::NoopDiagnosticObserver::default()),
+            );
+            let failure = structured_agent_failure(DiagnosticFailureClass::Transport);
+            completion.observe_exit(WarmCompletionExit::Error(&failure));
+            let cleanup = completion.transfer_cleanup_custody().await;
+
+            let identity = bridge_core::ids::AttemptIdentity::initial().unwrap();
+            let attempt_id = identity.attempt_id.clone();
+            let mut attempt = coordinator
+                .admit_direct_attempt(
+                    identity,
+                    bridge_core::workflow_history::ExecutionSurface::DirectUnary,
+                    "direct",
+                    format!("detached-{expected}-{store_name}"),
+                    true,
+                )
+                .await
+                .unwrap();
+            attempt
+                .finish_with_detached_cleanup("failed", "prompt_failed", true, cleanup)
+                .await
+                .unwrap();
+
+            let settled = tokio::time::timeout(Duration::from_secs(1), async {
+                loop {
+                    let terminal = history
+                        .attempt(&attempt_id)
+                        .await
+                        .unwrap()
+                        .and_then(|row| row.terminal)
+                        .expect("detached cleanup writes the initial terminal");
+                    if terminal.cleanup_disposition != "pending" {
+                        break terminal;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await;
+            let Ok(terminal) = settled else {
+                settlement_failures.push(store_name);
+                continue;
+            };
+            assert_eq!(terminal.cleanup_disposition, expected, "{store_name}");
+            assert_eq!(backend.release_calls.load(AtomicOrdering::SeqCst), 1);
+
+            for invalid in ["pending", "garbage"] {
+                let error = history
+                    .settle_cleanup(&attempt_id, invalid)
+                    .await
+                    .expect_err("invalid cleanup settlement vocabulary must be rejected");
+                assert_eq!(
+                    error.reason,
+                    LedgerUnavailableReason::Schema,
+                    "{store_name}: {invalid}"
+                );
+            }
+            assert_eq!(
+                history
+                    .settle_cleanup(&attempt_id, "complete")
+                    .await
+                    .unwrap(),
+                TerminalWrite::Conflict,
+                "{store_name} must reject a conflicting second settlement"
+            );
+        }
+        assert!(
+            settlement_failures.is_empty(),
+            "detached cleanup did not settle {expected} durably in {settlement_failures:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn detached_retained_cleanup_settles_durably_in_both_stores() {
+        detached_cleanup_settles_protective_disposition_in_both_stores(
+            bridge_core::ports::BackendCleanupDispositionV1::Retained,
+            "retained",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn detached_preserved_cleanup_settles_durably_in_both_stores() {
+        detached_cleanup_settles_protective_disposition_in_both_stores(
+            bridge_core::ports::BackendCleanupDispositionV1::Preserved,
+            "preserved",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn detached_unknown_cleanup_settles_durably_in_both_stores() {
+        detached_cleanup_settles_protective_disposition_in_both_stores(
+            bridge_core::ports::BackendCleanupDispositionV1::Unknown,
+            "unknown",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn detached_cleanup_refuses_before_signaling_an_unexposed_backend() {
+        let backend = Arc::new(FakeBackend::new(None));
+        backend.refuse_flight_exposure();
+        let terminal = prompt_barrier_failure_terminal(backend.clone()).await;
+
+        assert_eq!(terminal.cleanup_disposition, "failed");
+        assert_eq!(backend.release_calls.load(AtomicOrdering::SeqCst), 0);
     }
 
     #[tokio::test]

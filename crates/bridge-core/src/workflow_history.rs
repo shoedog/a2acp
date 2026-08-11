@@ -527,7 +527,13 @@ impl AttemptTerminal {
             )
             || !matches!(
                 self.cleanup_disposition.as_str(),
-                "pending" | "complete" | "failed" | "not_needed" | "unknown"
+                "pending"
+                    | "complete"
+                    | "retained"
+                    | "preserved"
+                    | "failed"
+                    | "not_needed"
+                    | "unknown"
             )
             || !self.terminal_evidence_counts.validate()
             || !evidence_coherent
@@ -682,8 +688,9 @@ pub trait WorkflowHistoryStore: Send + Sync {
         id: &AttemptId,
         terminal: &AttemptTerminal,
     ) -> Result<TerminalWrite, LedgerError>;
-    /// Settle the one post-terminal cleanup transition. Only
-    /// `pending -> complete|failed` is legal; identical replay is idempotent.
+    /// Settle the one post-terminal cleanup transition. Only `pending ->
+    /// complete|retained|preserved|unknown|failed` is legal; identical replay
+    /// is idempotent.
     async fn settle_cleanup(
         &self,
         _id: &AttemptId,
@@ -1834,7 +1841,10 @@ impl WorkflowHistoryStore for MemoryWorkflowHistoryStore {
         id: &AttemptId,
         disposition: &str,
     ) -> Result<TerminalWrite, LedgerError> {
-        if !matches!(disposition, "complete" | "failed") {
+        if !matches!(
+            disposition,
+            "complete" | "retained" | "preserved" | "unknown" | "failed"
+        ) {
             return Err(LedgerError::new(LedgerUnavailableReason::Schema));
         }
         let mut rows = self
@@ -3726,7 +3736,14 @@ mod tests {
             ExecutionSurface::Mcp,
             ExecutionSurface::Smoke,
         ] {
-            for disposition in ["complete", "failed", "not_needed", "unknown"] {
+            for disposition in [
+                "complete",
+                "retained",
+                "preserved",
+                "failed",
+                "not_needed",
+                "unknown",
+            ] {
                 let store = std::sync::Arc::new(OneShotFaultStore::default());
                 let reservation = served_reservation(AttemptIdentity::initial().unwrap(), surface);
                 let attempt_id = reservation.identity.attempt_id.clone();

@@ -627,6 +627,9 @@ impl NodeCauseV1 {
                 (Class::Config, "bridge.bound_session_unsupported")
             }
             BridgeError::BindUnsupported => (Class::Config, "bridge.bind_unsupported"),
+            BridgeError::ResourceFlightUnsupported => {
+                (Class::Config, "bridge.resource_flight_unsupported")
+            }
             BridgeError::SessionExpired => (Class::Unknown, "bridge.session_expired"),
             BridgeError::HandleBusy => (Class::Unknown, "bridge.handle_busy"),
             BridgeError::AuthRequired { .. } => (Class::Authentication, "bridge.auth_required"),

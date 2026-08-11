@@ -960,8 +960,11 @@ impl AgentBackend for TerminalEvidenceBackend {
         &self,
         _session: &SessionId,
         _observer: Arc<dyn bridge_core::ports::DiagnosticObserver>,
-    ) -> Result<(), BridgeError> {
-        self.cleanup_error.clone().map_or(Ok(()), Err)
+    ) -> Result<bridge_core::ports::BackendCleanupDispositionV1, BridgeError> {
+        self.cleanup_error.clone().map_or(
+            Ok(bridge_core::ports::BackendCleanupDispositionV1::Complete),
+            Err,
+        )
     }
 }
 

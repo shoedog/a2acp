@@ -898,7 +898,7 @@ impl WarmNodeCleanup {
     async fn finish(mut self: Box<Self>, exit: NodeTurnExit) -> Result<(), BridgeError> {
         self.arm_exit(&exit);
         let WarmNodeCleanup { guard } = *self;
-        guard.complete().await
+        guard.complete().await.map(|_| ())
     }
 }
 
@@ -3997,10 +3997,9 @@ async fn unary_message(
                 } else {
                     warm.observe_exit(WarmCompletionExit::Normal);
                     let cleanup_result = warm.complete().await;
-                    cleanup_disposition = if cleanup_result.is_ok() {
-                        "complete"
-                    } else {
-                        "failed"
+                    cleanup_disposition = match &cleanup_result {
+                        Ok(disposition) => disposition.as_str(),
+                        Err(_) => "failed",
                     };
                     if let Err(cleanup_error) = cleanup_result {
                         collected.push(Err(cleanup_error));
@@ -4283,7 +4282,7 @@ async fn unary_fanout_message(
             // the bounded error returned to the caller.
             let cleanup_disposition = match kiro_backend.as_ref() {
                 Some(backend) => match backend.release_session_checked(&routed.session).await {
-                    Ok(()) => "complete",
+                    Ok(disposition) => disposition.as_str(),
                     Err(cleanup_error) => {
                         tracing::warn!(error = ?cleanup_error, "fanout prompt barrier cleanup failed");
                         "failed"
@@ -10772,12 +10771,15 @@ mod tests {
             }
         }
 
-        async fn release_session_checked(&self, _session: &SessionId) -> Result<(), BridgeError> {
+        async fn release_session_checked(
+            &self,
+            _session: &SessionId,
+        ) -> Result<bridge_core::ports::BackendCleanupDispositionV1, BridgeError> {
             self.released.fetch_add(1, Ordering::SeqCst);
             if self.fail_release {
                 Err(BridgeError::StoreFailure)
             } else {
-                Ok(())
+                Ok(bridge_core::ports::BackendCleanupDispositionV1::Complete)
             }
         }
     }
@@ -12143,6 +12145,10 @@ mod tests {
 
     #[async_trait::async_trait]
     impl AgentBackend for WarmRecordingBackend {
+        fn resource_flight_v1(&self) -> Result<BackendResourceFlightV1, BridgeError> {
+            Ok(BackendResourceFlightV1::LegacyV2)
+        }
+
         async fn prompt(&self, s: &SessionId, p: Vec<Part>) -> Result<BackendStream, BridgeError> {
             self.prompted_parts
                 .lock()
@@ -12246,6 +12252,10 @@ mod tests {
 
     #[async_trait::async_trait]
     impl AgentBackend for WarmErrorBackend {
+        fn resource_flight_v1(&self) -> Result<BackendResourceFlightV1, BridgeError> {
+            Ok(BackendResourceFlightV1::LegacyV2)
+        }
+
         async fn prompt(
             &self,
             _session: &SessionId,
@@ -12271,14 +12281,17 @@ mod tests {
             Ok(())
         }
 
-        async fn release_session_checked(&self, _session: &SessionId) -> Result<(), BridgeError> {
+        async fn release_session_checked(
+            &self,
+            _session: &SessionId,
+        ) -> Result<bridge_core::ports::BackendCleanupDispositionV1, BridgeError> {
             self.releases.fetch_add(1, Ordering::SeqCst);
             let gate = self.release_gate.lock().unwrap().take();
             if let Some(gate) = gate {
                 let _ = gate.await;
             }
             self.release_completed.notify_waiters();
-            Ok(())
+            Ok(bridge_core::ports::BackendCleanupDispositionV1::Complete)
         }
     }
 
