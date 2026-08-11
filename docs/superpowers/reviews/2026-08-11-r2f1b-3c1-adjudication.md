@@ -131,3 +131,45 @@ lenses).
   re-login; combined with the pre-reseed dispatch death (xdg-open ENOENT, ~5s),
   the single-token-family mechanism is now confirmed in both directions. The
   dedicated a2a-creds login session remains the standing fix.
+
+## Fold addendum (2026-08-11) — 3c1 FOLDED+PUSHED: origin/main → `b15dbb75`
+
+Squash of `feat/r2f1b-3c1-container-authority` (`ed840e81` slice + `dc6b9031` gate
+repair + `0e0b14f3` R1-R7 repair + `6ac9e10a` blind-tail completion); squash tree
+verified byte-identical to the gated branch tip. Darwin host gates round 4 ALL EXIT
+0: fmt / clippy / workspace test **3,961/0/13 across 90 harnesses** / the
+`#[ignore]`d docker round-trip run live against real docker (R1's end-to-end proof)
+/ release build / deny / hygiene. CI watch on `b15dbb75` dispatched (non-unix lanes
+invisible to the darwin host — 3b1 lesson).
+
+Repair-round record: the bridge run (sol/xhigh) converged at internal bound 3 with
+verify PASS; its reviewer died at Authenticate ×3 — third recurrence, mechanism now
+airtight (the impl container's own refresh-token rotation kills every subsequent
+fresh host session in the same family; the owner's morning reseed was consumed by
+this run). Gates round 3 then surfaced 3 reds in bridge-container — the crate the
+impl agent structurally cannot run (hermetic exclusion). Adjudicated: two stale
+expectations the mandate itself inverted (R4 pre-ID cancel scaffolding; C2
+extra-label tolerance — converted to a tolerance-positive control plus a NEW
+canonical-mismatch refusal sibling), and one test guarding a REAL soundness gap in
+the repair: the R2 fence-exit marked `never_published` on ANY spawn `Err`, but the
+production spawn adapter can fail AFTER `docker run` created the container, so a
+release could clear custody and report vacuous `Complete` over a possibly-live
+orphan. Operator completion (`6ac9e10a`, the disclosed one-pass convergence
+extension): `finish_reap` narrowed to Complete-only clearing — the guarding test
+passes UNCHANGED — while the mandated retry survives via reserve-time replacement
+(count-2 control green); the marker renamed `spawn_failed` to claim only what it
+records.
+
+BINDING carry-forwards (restated): (1) two-field inner/outer cleanup split — or an
+equivalent non-lossy composite disposition — REQUIRED in the same slice as the first
+of production V3 arming (`resource_flight_attempt_v3`) or wrapping ContainerRw in a
+preservation-owning decorator (opus S9 = evidence). (2) Dedicated a2a-creds login
+session before the next container dispatch (3c2) — three Authenticate-death
+recurrences on one mechanism; every container run consumes the shared family.
+
+Ledger (unchanged from adjudication): opus S4 cancel latency semantics, S5 retire
+first-error vs wrapper composition, S10 oversized-inspect Timeout conflation;
+process row: new production I/O ⇒ seam test in the same slice (C1 discharged for
+this surface).
+
+Roadmap cursor → 3c1 FOLDED; next 3c2 (api request-flights) → 3d.
