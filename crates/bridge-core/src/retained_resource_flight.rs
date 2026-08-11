@@ -1396,6 +1396,7 @@ impl RetainedResourceFlight {
     /// Terminalize a driver that refused before effect dispatch. No signal is
     /// authorized by this transition: it is accepted only before `Signaling`,
     /// and the terminal disposition must be `Failed`.
+    #[cfg_attr(not(unix), allow(dead_code))]
     pub(crate) fn settle_failed_before_dispatch(
         &self,
         result: ResourceActionResultV1,
@@ -1643,6 +1644,7 @@ impl RetainedResourceFlight {
         )
     }
 
+    #[cfg_attr(not(unix), allow(dead_code))]
     pub(crate) fn journal_container_identity(
         &self,
         identity: ResourceIdentityV1,
@@ -1664,6 +1666,7 @@ impl RetainedResourceFlight {
         )
     }
 
+    #[cfg_attr(not(unix), allow(dead_code))]
     pub(crate) fn journal_container_removal(
         &self,
         observation: ContainerRemovalObservationV1,
