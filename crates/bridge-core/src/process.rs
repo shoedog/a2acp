@@ -38,6 +38,7 @@ use tokio::process::{Child, ChildStderr, Command};
 use crate::attempt_activity::SystemMonotonicClock;
 use crate::execution_policy::{BoundedCauseV1, Sha256HexV1};
 use crate::ids::{AttemptId, NodeId};
+use crate::reaper::DurableContainerFlightV3;
 use crate::resource_flight::{
     ProcessStartIdentityV1, ResourceActionDispositionV1, ResourceActionResultV1,
     ResourceFlightIdV1, ResourceFlightStateV1, ResourceIdentityV1,
@@ -787,6 +788,31 @@ impl DurableProcessFlightAttemptV3 {
             owner,
         )
         .map(|flight| flight.with_result_publisher(Arc::clone(&self.result_publisher)))
+    }
+
+    /// Bind a container generation to the same attempt registry and durable
+    /// journal used by its subordinate ACP process generation.
+    pub fn bind_container_generation(
+        &self,
+        generation: impl Into<String>,
+        owner: ResourceFlightOwnerV1,
+    ) -> Result<DurableContainerFlightV3, ProcessAuthorityErrorV1> {
+        let generation = generation.into();
+        if generation.is_empty() {
+            return Err(ProcessAuthorityErrorV1::Flight(
+                "V3 container generation is empty".into(),
+            ));
+        }
+        Ok(DurableContainerFlightV3 {
+            attempt_id: self.attempt_id.clone(),
+            generation,
+            flight_id: ResourceFlightIdV1::mint()
+                .map_err(|error| ProcessAuthorityErrorV1::Flight(error.to_string()))?,
+            registry: Arc::clone(&self.registry),
+            journal: Arc::clone(&self.journal) as Arc<dyn ResourceFlightJournal>,
+            owner,
+            result_publisher: Arc::clone(&self.result_publisher),
+        })
     }
 }
 
@@ -4450,11 +4476,24 @@ mod tests {
                 ResourceFlightOwnerV1::new(NodeId::parse("node-b").unwrap(), "session-b").unwrap(),
             )
             .unwrap();
+        let container = route
+            .bind_container_generation(
+                "container-generation",
+                ResourceFlightOwnerV1::new(
+                    NodeId::parse("container-node").unwrap(),
+                    "container-session",
+                )
+                .unwrap(),
+            )
+            .unwrap();
 
         assert!(Arc::ptr_eq(&route.registry, &first.registry));
         assert!(Arc::ptr_eq(&first.registry, &second.registry));
+        assert!(Arc::ptr_eq(&route.registry, &container.registry));
         assert!(Arc::ptr_eq(&route.journal, &first.journal));
         assert!(Arc::ptr_eq(&first.journal, &second.journal));
+        let route_journal = Arc::clone(&route.journal) as Arc<dyn ResourceFlightJournal>;
+        assert!(Arc::ptr_eq(&route_journal, &container.journal));
     }
 
     #[tokio::test]

@@ -29,11 +29,11 @@ use bridge_core::ids::{ContextId, NodeId, OperationId, SessionId};
 use bridge_core::orch::UsageSnapshot;
 use bridge_core::permission::TurnMeta;
 use bridge_core::ports::{
-    classify_failure, AgentBackend, AgentRegistry, BackendObservers, BoundEntryUseV1,
-    CheckoutPreservationReasonV1, CheckoutPreservationV1, CheckoutSettlementV1, DiagnosticObserver,
-    DiagnosticObserverFactory, FailureClass, ObsEvent, Observer, Resolved, RichEventSinkFactory,
-    TurnContext, TurnOutcome, Update, UsageFinalization, WorkflowCheckoutOutcomeV1,
-    STOP_REASON_CANCELLED,
+    classify_failure, AgentBackend, AgentRegistry, BackendCleanupDispositionV1, BackendObservers,
+    BoundEntryUseV1, CheckoutPreservationReasonV1, CheckoutPreservationV1, CheckoutSettlementV1,
+    DiagnosticObserver, DiagnosticObserverFactory, FailureClass, ObsEvent, Observer, Resolved,
+    RichEventSinkFactory, TurnContext, TurnOutcome, Update, UsageFinalization,
+    WorkflowCheckoutOutcomeV1, STOP_REASON_CANCELLED,
 };
 use bridge_core::SessionCwd;
 use futures::stream::FuturesUnordered;
@@ -671,6 +671,9 @@ impl NodeDisposition {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WorkflowCleanupDisposition {
     Complete,
+    Retained,
+    Preserved,
+    Unknown,
     Failed,
     NotNeeded,
 }
@@ -679,6 +682,9 @@ impl WorkflowCleanupDisposition {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Complete => "complete",
+            Self::Retained => "retained",
+            Self::Preserved => "preserved",
+            Self::Unknown => "unknown",
             Self::Failed => "failed",
             Self::NotNeeded => "not_needed",
         }
@@ -694,6 +700,7 @@ struct WorkflowCleanupTracker {
 struct WorkflowCleanupState {
     observed: u32,
     failed: bool,
+    disposition: BackendCleanupDispositionV1,
     intervals: Vec<(std::time::Instant, std::time::Instant)>,
     nodes: BTreeMap<NodeId, NodeCleanupState>,
 }
@@ -702,6 +709,7 @@ struct WorkflowCleanupState {
 struct NodeCleanupState {
     observed: u32,
     failed: bool,
+    disposition: BackendCleanupDispositionV1,
     intervals: Vec<(std::time::Instant, std::time::Instant)>,
     failure: Option<BridgeError>,
     /// The sessions this node configured, and the backend that owns each one's checkout
@@ -742,7 +750,7 @@ impl WorkflowCleanupTracker {
         node: &NodeId,
         started: std::time::Instant,
         finished: std::time::Instant,
-        result: &Result<(), BridgeError>,
+        result: &Result<BackendCleanupDispositionV1, BridgeError>,
     ) {
         let mut state = self
             .state
@@ -750,10 +758,16 @@ impl WorkflowCleanupTracker {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         state.observed = state.observed.saturating_add(1);
         state.failed |= result.is_err();
+        if let Ok(disposition) = result {
+            state.disposition = state.disposition.combine(*disposition);
+        }
         state.intervals.push((started, finished));
         let node_state = state.nodes.entry(node.clone()).or_default();
         node_state.observed = node_state.observed.saturating_add(1);
         node_state.failed |= result.is_err();
+        if let Ok(disposition) = result {
+            node_state.disposition = node_state.disposition.combine(*disposition);
+        }
         node_state.intervals.push((started, finished));
         if node_state.failure.is_none() {
             node_state.failure = result.as_ref().err().cloned();
@@ -828,7 +842,12 @@ impl WorkflowCleanupTracker {
         } else if node_state.observed == 0 {
             NodeCleanupDispositionV1::NotNeeded
         } else {
-            NodeCleanupDispositionV1::Complete
+            match node_state.disposition {
+                BackendCleanupDispositionV1::Complete => NodeCleanupDispositionV1::Complete,
+                BackendCleanupDispositionV1::Retained
+                | BackendCleanupDispositionV1::Preserved
+                | BackendCleanupDispositionV1::Unknown => NodeCleanupDispositionV1::UnknownLegacy,
+            }
         };
         (
             NodeCleanupV1 {
@@ -849,7 +868,12 @@ impl WorkflowCleanupTracker {
         } else if state.observed == 0 {
             WorkflowCleanupDisposition::NotNeeded
         } else {
-            WorkflowCleanupDisposition::Complete
+            match state.disposition {
+                BackendCleanupDispositionV1::Complete => WorkflowCleanupDisposition::Complete,
+                BackendCleanupDispositionV1::Retained => WorkflowCleanupDisposition::Retained,
+                BackendCleanupDispositionV1::Preserved => WorkflowCleanupDisposition::Preserved,
+                BackendCleanupDispositionV1::Unknown => WorkflowCleanupDisposition::Unknown,
+            }
         };
         let duration_ms = interval_union_ms(state.intervals.clone());
         (disposition, duration_ms)
@@ -891,7 +915,10 @@ fn workflow_checkout_outcome(
     node_dispositions: impl Iterator<Item = NodeDisposition>,
 ) -> WorkflowCheckoutOutcomeV1 {
     let globally_healthy = *outcome == WorkflowOutcome::Completed
-        && cleanup != WorkflowCleanupDisposition::Failed
+        && matches!(
+            cleanup,
+            WorkflowCleanupDisposition::Complete | WorkflowCleanupDisposition::NotNeeded
+        )
         && !cancelled
         && node_dispositions
             .into_iter()
@@ -968,7 +995,11 @@ async fn cleanup_warm_turn(
 ) -> Result<(), BridgeError> {
     let started = std::time::Instant::now();
     let result = cleanup.on_exit_observed(exit, observer).await;
-    tracker.record(node, started, std::time::Instant::now(), &result);
+    let tracked = result
+        .as_ref()
+        .map(|_| BackendCleanupDispositionV1::Complete)
+        .map_err(Clone::clone);
+    tracker.record(node, started, std::time::Instant::now(), &tracked);
     result
 }
 
@@ -1332,10 +1363,9 @@ async fn cleanup_cold_session(
                 .release_session_observed(session, observer.clone())
                 .await
         }
-    }
-    .map(|_| ());
+    };
     tracker.record(node, started, std::time::Instant::now(), &result);
-    result
+    result.map(|_| ())
 }
 
 async fn cancel_and_forget_preflight_session(
@@ -5580,7 +5610,7 @@ mod tests {
             &node,
             base,
             base + std::time::Duration::from_millis(30),
-            &Ok(()),
+            &Ok(BackendCleanupDispositionV1::Complete),
         );
         tracker.record(
             &node,
@@ -5592,7 +5622,7 @@ mod tests {
             &node,
             base + std::time::Duration::from_millis(60),
             base + std::time::Duration::from_millis(70),
-            &Ok(()),
+            &Ok(BackendCleanupDispositionV1::Complete),
         );
 
         assert_eq!(
@@ -5606,6 +5636,44 @@ mod tests {
                 duration_ms: 50,
             }
         );
+    }
+
+    #[test]
+    fn cleanup_tracker_preserves_protective_backend_dispositions() {
+        for (backend, workflow) in [
+            (
+                BackendCleanupDispositionV1::Retained,
+                WorkflowCleanupDisposition::Retained,
+            ),
+            (
+                BackendCleanupDispositionV1::Preserved,
+                WorkflowCleanupDisposition::Preserved,
+            ),
+            (
+                BackendCleanupDispositionV1::Unknown,
+                WorkflowCleanupDisposition::Unknown,
+            ),
+        ] {
+            let tracker = WorkflowCleanupTracker::default();
+            let node = NodeId::parse("protective-cleanup-node").unwrap();
+            let now = std::time::Instant::now();
+            tracker.record(&node, now, now, &Ok(backend));
+
+            assert_eq!(tracker.observation().0, workflow);
+            assert_eq!(
+                tracker.node_observation(&node).0.disposition,
+                NodeCleanupDispositionV1::UnknownLegacy
+            );
+            assert_eq!(
+                workflow_checkout_outcome(
+                    &WorkflowOutcome::Completed,
+                    workflow,
+                    false,
+                    [NodeDisposition::Completed].into_iter(),
+                ),
+                WorkflowCheckoutOutcomeV1::NotHealthy(CheckoutPreservationReasonV1::NodeFailure)
+            );
+        }
     }
 
     /// R2f1b slice 2b1, R-11 "workflow cold cleanup": pins the PATH COLLAPSE the worktree
@@ -5934,6 +6002,7 @@ mod tests {
         fail_first: bool,
         final_answer: bool,
         stream_failure: bool,
+        cleanup_disposition: BackendCleanupDispositionV1,
     }
 
     impl CompositePathBackend {
@@ -5945,6 +6014,7 @@ mod tests {
                 fail_first,
                 final_answer: true,
                 stream_failure: false,
+                cleanup_disposition: BackendCleanupDispositionV1::Complete,
             }
         }
 
@@ -5956,6 +6026,14 @@ mod tests {
                 fail_first: false,
                 final_answer: false,
                 stream_failure,
+                cleanup_disposition: BackendCleanupDispositionV1::Complete,
+            }
+        }
+
+        fn with_cleanup_disposition(disposition: BackendCleanupDispositionV1) -> Self {
+            Self {
+                cleanup_disposition: disposition,
+                ..Self::new(false)
             }
         }
     }
@@ -6004,13 +6082,21 @@ mod tests {
             Ok(())
         }
 
+        async fn configure_bound_session(
+            &self,
+            _session: &SessionId,
+            _spec: &bridge_core::execution_policy::BoundSessionSpecV1,
+        ) -> Result<(), BridgeError> {
+            Ok(())
+        }
+
         async fn forget_session_observed(
             &self,
             _session: &SessionId,
             observer: Arc<dyn DiagnosticObserver>,
         ) -> Result<bridge_core::ports::BackendCleanupDispositionV1, BridgeError> {
             self.cleanups.lock().unwrap().push(("forget", observer));
-            Ok(bridge_core::ports::BackendCleanupDispositionV1::Complete)
+            Ok(self.cleanup_disposition)
         }
 
         async fn release_session_observed(
@@ -6019,7 +6105,7 @@ mod tests {
             observer: Arc<dyn DiagnosticObserver>,
         ) -> Result<bridge_core::ports::BackendCleanupDispositionV1, BridgeError> {
             self.cleanups.lock().unwrap().push(("release", observer));
-            Ok(bridge_core::ports::BackendCleanupDispositionV1::Complete)
+            Ok(self.cleanup_disposition)
         }
     }
 
@@ -6049,6 +6135,24 @@ mod tests {
 
         fn default_id(&self) -> AgentId {
             AgentId::parse("codex").unwrap()
+        }
+
+        fn bind_entry_use(&self, id: &AgentId) -> Option<BoundEntryUseV1> {
+            let entry = Arc::new(minimal_entry(id));
+            Some(BoundEntryUseV1 {
+                entry: entry.clone(),
+                lease: Box::new(NoopLease),
+                use_token: bridge_core::ports::EntryUseTokenV1::new(Arc::new(()), &entry, 1),
+            })
+        }
+
+        async fn resolve_bound(
+            &self,
+            _bound: &BoundEntryUseV1,
+            _effect: &bridge_core::execution_policy::BoundProviderEffectV1,
+            _observer: Arc<dyn DiagnosticObserver>,
+        ) -> Result<Arc<dyn AgentBackend>, BridgeError> {
+            Ok(self.backend.clone())
         }
 
         async fn apply(&self, _: RegistrySnapshot) -> Result<(), BridgeError> {
@@ -6245,6 +6349,59 @@ mod tests {
         assert!(Arc::ptr_eq(&made[0].2, &cleanups[0].1));
         assert_eq!(rich_sink.events.load(Ordering::SeqCst), 1);
         assert_eq!(rich_sink.flushes.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn cold_unknown_cleanup_survives_node_and_workflow_projection() {
+        let backend = Arc::new(CompositePathBackend::with_cleanup_disposition(
+            BackendCleanupDispositionV1::Unknown,
+        ));
+        let registry = Arc::new(CompositePathRegistry {
+            backend,
+            resolutions: Mutex::new(Vec::new()),
+        });
+        let diagnostic_factory = Arc::new(RecordingDiagnosticFactory::default());
+        let run_spec = frozen_settlement_run_spec();
+        let graph = Arc::new(run_spec.graph.clone());
+        let context = WorkflowDiagnosticContext::new(
+            WorkflowRunContext {
+                session_cwd: run_spec.requested_session_cwd.clone(),
+                ..WorkflowRunContext::default()
+            },
+            diagnostic_factory,
+        )
+        .with_frozen_run_spec(run_spec, None)
+        .unwrap();
+
+        let events = WorkflowExecutor::new(registry)
+            .run_with_diagnostic_context(
+                graph,
+                "input".into(),
+                "unknown-cleanup".into(),
+                CancellationToken::new(),
+                context,
+            )
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+
+        assert!(events.iter().any(|event| matches!(
+            event,
+            WorkflowEvent::CleanupObserved {
+                disposition: WorkflowCleanupDisposition::Unknown,
+                ..
+            }
+        )));
+        let terminal_json = events.iter().find_map(|event| match event {
+            WorkflowEvent::NodeFinished { terminal_json, .. } => terminal_json.as_deref(),
+            _ => None,
+        });
+        assert!(
+            terminal_json.is_some_and(|json| json.contains("\"disposition\":\"unknown_legacy\"")),
+            "protective cleanup must survive persisted node-terminal projection: {terminal_json:?}"
+        );
     }
 
     #[tokio::test]

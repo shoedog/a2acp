@@ -105,9 +105,20 @@ pub struct ResourceActionIntentV1 {
     pub cause: Option<BoundedCauseV1>,
 }
 
+/// One exact-ID container runtime removal observation. The immutable ID is
+/// repeated so terminal evidence never requires a name-to-container lookup.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ContainerRemovalObservationV1 {
+    pub immutable_container_id: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub observed_noncanonical_a2a_labels: Vec<(String, String)>,
+    pub removed: bool,
+    pub failure_code: Option<String>,
+}
+
 /// One observed process-authority call. `errno` is captured immediately after
-/// a failed syscall; no signal attempt is allowed to disappear into a
-/// best-effort branch.
+/// a failed syscall; no signal attempt is allowed to disappear into a best-effort branch.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProcessSignalObservationV1 {
@@ -147,6 +158,9 @@ pub enum ResourceFlightJournalEventV1 {
     ProcessTreeCaptured {
         identity: ResourceIdentityV1,
     },
+    ContainerIdentityCaptured {
+        identity: ResourceIdentityV1,
+    },
     ProcessBindingFailed {
         stage: ProcessBindingStageV1,
         pid: Option<u32>,
@@ -166,6 +180,9 @@ pub enum ResourceFlightJournalEventV1 {
     GuardTransferred {
         recovery_owner: RecoveryOwnerV1,
         deadline_ms: u64,
+    },
+    ContainerRemovalObserved {
+        observation: ContainerRemovalObservationV1,
     },
     Settled {
         result: ResourceActionResultV1,
@@ -191,6 +208,7 @@ impl ResourceFlightJournalEventV1 {
             self,
             Self::DispatchStarted {}
                 | Self::ProcessSignalsObserved { .. }
+                | Self::ContainerRemovalObserved { .. }
                 | Self::GuardTransferred { .. }
                 | Self::Settled { .. }
         )
@@ -199,6 +217,7 @@ impl ResourceFlightJournalEventV1 {
     fn consumes_process_reservation_when_present(&self) -> bool {
         match self {
             Self::ProcessTreeCaptured { .. }
+            | Self::ContainerIdentityCaptured { .. }
             | Self::ProcessBindingFailed { .. }
             | Self::IntentJournaled { .. } => true,
             Self::OwnerDetached { owner } => owner.node_id.as_str() == "process-spawn",
@@ -894,6 +913,8 @@ pub enum RetainedResourceFlightError {
     ReservationUnavailable {
         resource_flight_id: ResourceFlightIdV1,
     },
+    #[error("managed container identity does not match flight key")]
+    ContainerIdentityKeyMismatch,
     #[error("resource-flight terminal refusal after journal failure: {cause}")]
     TerminalRefusal {
         cause: Arc<ResourceFlightJournalError>,
@@ -1372,6 +1393,46 @@ impl RetainedResourceFlight {
         Ok(settlement.result)
     }
 
+    /// Terminalize a driver that refused before effect dispatch. No signal is
+    /// authorized by this transition: it is accepted only before `Signaling`,
+    /// and the terminal disposition must be `Failed`.
+    pub(crate) fn settle_failed_before_dispatch(
+        &self,
+        result: ResourceActionResultV1,
+    ) -> Result<ResourceActionResultV1, RetainedResourceFlightError> {
+        if result.disposition != ResourceActionDispositionV1::Failed {
+            return Err(RetainedResourceFlightError::TransitionRefused {
+                state: Box::new(self.state()?),
+            });
+        }
+        let existing = {
+            let mut state = self.lock()?;
+            if let Some(existing) = self.adopt_durable_terminal_locked(&mut state)? {
+                Some(existing)
+            } else {
+                if !matches!(
+                    &state.state,
+                    ResourceFlightStateV1::Open {}
+                        | ResourceFlightStateV1::AdmissionClosed {}
+                        | ResourceFlightStateV1::IntentJournaled {}
+                ) {
+                    return Err(RetainedResourceFlightError::TransitionRefused {
+                        state: Box::new(state.state.clone()),
+                    });
+                }
+                if matches!(&state.state, ResourceFlightStateV1::Open {}) {
+                    state.snapshot = state.owners.clone();
+                }
+                state.state = ResourceFlightStateV1::Signaling {};
+                None
+            }
+        };
+        if let Some(existing) = existing {
+            return Ok(existing);
+        }
+        self.settle(result)
+    }
+
     pub fn join_blocking(&self) -> Result<ResourceActionResultV1, RetainedResourceFlightError> {
         let mut state = self.lock()?;
         loop {
@@ -1579,6 +1640,43 @@ impl RetainedResourceFlight {
         self.append(
             &mut state,
             ResourceFlightJournalEventV1::ProcessTreeCaptured { identity },
+        )
+    }
+
+    pub(crate) fn journal_container_identity(
+        &self,
+        identity: ResourceIdentityV1,
+    ) -> Result<(), RetainedResourceFlightError> {
+        if !matches!(identity, ResourceIdentityV1::ManagedContainer { .. })
+            || ResourceFlightKeyV1::from_identity(&identity) != self.key
+        {
+            return Err(RetainedResourceFlightError::ContainerIdentityKeyMismatch);
+        }
+        let mut state = self.lock()?;
+        if !matches!(state.state, ResourceFlightStateV1::Open {}) {
+            return Err(RetainedResourceFlightError::TransitionRefused {
+                state: Box::new(state.state.clone()),
+            });
+        }
+        self.append(
+            &mut state,
+            ResourceFlightJournalEventV1::ContainerIdentityCaptured { identity },
+        )
+    }
+
+    pub(crate) fn journal_container_removal(
+        &self,
+        observation: ContainerRemovalObservationV1,
+    ) -> Result<(), RetainedResourceFlightError> {
+        let mut state = self.lock()?;
+        if !matches!(state.state, ResourceFlightStateV1::Signaling {}) {
+            return Err(RetainedResourceFlightError::TransitionRefused {
+                state: Box::new(state.state.clone()),
+            });
+        }
+        self.append(
+            &mut state,
+            ResourceFlightJournalEventV1::ContainerRemovalObserved { observation },
         )
     }
 
@@ -3148,6 +3246,38 @@ mod tests {
     }
 
     #[test]
+    fn managed_container_events_have_exact_wire_goldens() {
+        let identity = ResourceFlightJournalEventV1::ContainerIdentityCaptured {
+            identity: ResourceIdentityV1::ManagedContainer {
+                generation: "container-id:abc".into(),
+                runtime: "docker".into(),
+                immutable_container_id: "abc".into(),
+                ownership_labels_digest: sha('c'),
+            },
+        };
+        assert_eq!(
+            serde_json::to_string(&identity).unwrap(),
+            format!(
+                "{{\"event\":\"container_identity_captured\",\"identity\":{{\"kind\":\"managed_container\",\"generation\":\"container-id:abc\",\"runtime\":\"docker\",\"immutable_container_id\":\"abc\",\"ownership_labels_digest\":\"{}\"}}}}",
+                "c".repeat(64)
+            )
+        );
+
+        let removal = ResourceFlightJournalEventV1::ContainerRemovalObserved {
+            observation: ContainerRemovalObservationV1 {
+                immutable_container_id: "abc".into(),
+                observed_noncanonical_a2a_labels: Vec::new(),
+                removed: false,
+                failure_code: Some("container.reap.identity_changed".into()),
+            },
+        };
+        assert_eq!(
+            serde_json::to_string(&removal).unwrap(),
+            r#"{"event":"container_removal_observed","observation":{"immutable_container_id":"abc","removed":false,"failure_code":"container.reap.identity_changed"}}"#
+        );
+    }
+
+    #[test]
     fn process_lifecycle_event_reader_rejects_unknown_event_fields_and_stages() {
         for invalid in [
             r#"{"event":"future_process_event"}"#,
@@ -3155,6 +3285,10 @@ mod tests {
             r#"{"event":"owner_detached","owner":{"node_id":"node_a","owner_key":"session-a","future":true}}"#,
             r#"{"event":"process_binding_failed","stage":"future_stage","pid":42}"#,
             r#"{"event":"process_signals_observed","observations":[{"pid":42,"expected_start_time_ticks":7,"signal":15,"return_code":0,"errno":null,"future":true}]}"#,
+            r#"{"event":"container_identity_captured","identity":{"kind":"managed_container","generation":"g","runtime":"docker","immutable_container_id":"abc","ownership_labels_digest":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"},"future":true}"#,
+            r#"{"event":"container_identity_captured","identity":{"kind":"managed_container","generation":"g","runtime":"docker","immutable_container_id":"abc","ownership_labels_digest":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","future":true}}"#,
+            r#"{"event":"container_removal_observed","observation":{"immutable_container_id":"abc","removed":false,"failure_code":null},"future":true}"#,
+            r#"{"event":"container_removal_observed","observation":{"immutable_container_id":"abc","removed":false,"failure_code":null,"future":true}}"#,
         ] {
             assert!(
                 serde_json::from_str::<ResourceFlightJournalEventV1>(invalid).is_err(),

@@ -848,7 +848,8 @@ impl bridge_container::ContainerSpawn for AcpContainerSpawn {
         program: &str,
         argv: &[String],
         cfg: bridge_acp::acp_backend::AcpConfig,
-    ) -> Result<Arc<dyn bridge_core::ports::AgentBackend>, BridgeError> {
+        request: &bridge_container::ContainerSpawnRequestV1,
+    ) -> Result<bridge_container::ContainerSpawnResultV1, BridgeError> {
         let argv_ref: Vec<&str> = argv.iter().map(String::as_str).collect();
         let controller = cfg
             .container
@@ -868,7 +869,15 @@ impl bridge_container::ContainerSpawn for AcpContainerSpawn {
                 .with_permission_registry(Arc::clone(reg))
                 .with_permission_timeout_ms(self.perm_timeout_ms);
         }
-        Ok(Arc::new(be) as Arc<dyn bridge_core::ports::AgentBackend>)
+        let evidence =
+            bridge_core::reaper::production_container_identity(&request.runtime, &request.name)
+                .await
+                .map_err(|_| BridgeError::IdentityUnavailable)?;
+        Ok(bridge_container::ContainerSpawnResultV1 {
+            backend: Arc::new(be) as Arc<dyn bridge_core::ports::AgentBackend>,
+            immutable_container_id: evidence.immutable_container_id,
+            ownership_labels: evidence.ownership_labels,
+        })
     }
 
     async fn spawn_observed(
@@ -876,8 +885,9 @@ impl bridge_container::ContainerSpawn for AcpContainerSpawn {
         program: &str,
         argv: &[String],
         cfg: bridge_acp::acp_backend::AcpConfig,
+        request: &bridge_container::ContainerSpawnRequestV1,
         observer: Arc<dyn bridge_core::ports::DiagnosticObserver>,
-    ) -> Result<Arc<dyn bridge_core::ports::AgentBackend>, BridgeError> {
+    ) -> Result<bridge_container::ContainerSpawnResultV1, BridgeError> {
         let argv_ref: Vec<&str> = argv.iter().map(String::as_str).collect();
         let controller = cfg
             .container
@@ -893,7 +903,15 @@ impl bridge_container::ContainerSpawn for AcpContainerSpawn {
                 .with_permission_registry(Arc::clone(reg))
                 .with_permission_timeout_ms(self.perm_timeout_ms);
         }
-        Ok(Arc::new(be) as Arc<dyn bridge_core::ports::AgentBackend>)
+        let evidence =
+            bridge_core::reaper::production_container_identity(&request.runtime, &request.name)
+                .await
+                .map_err(|_| BridgeError::IdentityUnavailable)?;
+        Ok(bridge_container::ContainerSpawnResultV1 {
+            backend: Arc::new(be) as Arc<dyn bridge_core::ports::AgentBackend>,
+            immutable_container_id: evidence.immutable_container_id,
+            ownership_labels: evidence.ownership_labels,
+        })
     }
 }
 
@@ -1137,6 +1155,7 @@ fn container_rw_cfg_from_entry(
         watchdog: entry.watchdog.clone(),
         handshake_timeout: bridge_acp::acp_backend::AcpConfig::default().handshake_timeout,
         cancel_grace: bridge_acp::acp_backend::AcpConfig::default().cancel_grace,
+        resource_flight_attempt_v3: None,
         run: run.clone(),
         agent: entry.id.as_str().to_string(),
     })
@@ -6752,6 +6771,129 @@ fn init_cmd(args: &[String]) -> Result<(), BoxError> {
     Ok(())
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct OperatorContainerAuthorityV1 {
+    runtime: String,
+    identity: bridge_core::reaper::ContainerRuntimeIdentityV1,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum OperatorIdentityObservationV1 {
+    Found(bridge_core::reaper::ContainerRuntimeIdentityV1),
+    Absent,
+    Unknown,
+}
+
+fn operator_observe_container_identity(
+    runtime: &str,
+    selector: &str,
+) -> OperatorIdentityObservationV1 {
+    let inspected = std::process::Command::new(runtime)
+        .args([
+            "container",
+            "inspect",
+            "--format",
+            bridge_core::reaper::CONTAINER_IDENTITY_FORMAT,
+            selector,
+        ])
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output();
+    match inspected {
+        Ok(output) if output.status.success() => {
+            return bridge_core::reaper::parse_container_identity(&output.stdout)
+                .map(OperatorIdentityObservationV1::Found)
+                .unwrap_or(OperatorIdentityObservationV1::Unknown);
+        }
+        Ok(_) => {}
+        Err(_) => return OperatorIdentityObservationV1::Unknown,
+    }
+
+    let inventory = std::process::Command::new(runtime)
+        .args([
+            "container",
+            "ps",
+            "--all",
+            "--no-trunc",
+            "--format",
+            bridge_core::reaper::CONTAINER_INVENTORY_FORMAT,
+        ])
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output();
+    match inventory {
+        Ok(output) if output.status.success() => {
+            match bridge_core::reaper::parse_container_inventory_contains(&output.stdout, selector)
+            {
+                Ok(false) => OperatorIdentityObservationV1::Absent,
+                Ok(true) | Err(_) => OperatorIdentityObservationV1::Unknown,
+            }
+        }
+        Ok(_) | Err(_) => OperatorIdentityObservationV1::Unknown,
+    }
+}
+
+fn select_operator_container_authority(
+    observations: Vec<(String, OperatorIdentityObservationV1)>,
+) -> Option<OperatorContainerAuthorityV1> {
+    let mut selected = None;
+    for (runtime, observation) in observations {
+        match observation {
+            OperatorIdentityObservationV1::Found(identity) if selected.is_none() => {
+                selected = Some(OperatorContainerAuthorityV1 { runtime, identity });
+            }
+            OperatorIdentityObservationV1::Found(_) | OperatorIdentityObservationV1::Unknown => {
+                return None;
+            }
+            OperatorIdentityObservationV1::Absent => {}
+        }
+    }
+    selected
+}
+
+fn operator_identity_matches(
+    authority: &OperatorContainerAuthorityV1,
+    current: &bridge_core::reaper::ContainerRuntimeIdentityV1,
+) -> bool {
+    current == &authority.identity
+}
+
+fn discover_operator_container_authority(
+    runtimes: &[String],
+    selector: &str,
+) -> Option<OperatorContainerAuthorityV1> {
+    select_operator_container_authority(
+        runtimes
+            .iter()
+            .map(|runtime| {
+                (
+                    runtime.clone(),
+                    operator_observe_container_identity(runtime, selector),
+                )
+            })
+            .collect(),
+    )
+}
+
+fn operator_remove_container(authority: &OperatorContainerAuthorityV1) -> bool {
+    let current = operator_observe_container_identity(
+        &authority.runtime,
+        &authority.identity.immutable_container_id,
+    );
+    let OperatorIdentityObservationV1::Found(current) = current else {
+        return false;
+    };
+    if !operator_identity_matches(authority, &current) {
+        return false;
+    }
+    std::process::Command::new(&authority.runtime)
+        .args(["rm", "-f", &authority.identity.immutable_container_id])
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .is_ok_and(|output| output.status.success())
+}
+
 /// Execute `a2a-bridge containers <list|reap>` — the operator view/cleanup over Increment A's managed
 /// containers. Reads the docker labels + probes the per-run `flock` lease to classify each container
 /// (Alive/Dead/Unknown), scoped (by default) to the owners THIS `--config` would spawn. Pure cores live in
@@ -6945,14 +7087,15 @@ fn containers_cmd(args: &[String]) -> Result<(), BoxError> {
                 println!("containers reap: nothing to reap");
                 return Ok(());
             }
-            for name in &plan {
-                // Reap on every runtime (idempotent — `rm -f` of a gone/absent name is harmless).
-                for runtime in &runtimes {
-                    let _ = std::process::Command::new(runtime)
-                        .args(["rm", "-f", name])
-                        .output();
+            for selector in &plan {
+                let removed = discover_operator_container_authority(&runtimes, selector)
+                    .as_ref()
+                    .is_some_and(operator_remove_container);
+                if removed {
+                    println!("reaped {selector}");
+                } else {
+                    println!("skipped (unresolved) {selector}");
                 }
-                println!("reaped {name}");
             }
             Ok(())
         }
@@ -10008,6 +10151,132 @@ mod cli_tests {
         let e = storage_cmd(&[]).expect_err("a bare `storage` was accepted");
         assert!(e.to_string().contains("report | reap"), "{e}");
         assert!(storage_report::STORAGE_USAGE.contains("storage reap --build-targets"));
+    }
+
+    fn operator_test_identity(id: &str) -> bridge_core::reaper::ContainerRuntimeIdentityV1 {
+        bridge_core::reaper::ContainerRuntimeIdentityV1 {
+            immutable_container_id: id.to_owned(),
+            ownership_labels: vec![("a2a.owner".into(), "owner".into())],
+        }
+    }
+
+    fn operator_test_authority(runtime: String, id: &str) -> OperatorContainerAuthorityV1 {
+        OperatorContainerAuthorityV1 {
+            runtime,
+            identity: operator_test_identity(id),
+        }
+    }
+
+    #[test]
+    fn operator_container_authority_refuses_cross_runtime_ambiguity() {
+        let identity = operator_test_identity("immutable-id");
+        assert!(select_operator_container_authority(vec![
+            (
+                "docker".into(),
+                OperatorIdentityObservationV1::Found(identity.clone()),
+            ),
+            (
+                "podman".into(),
+                OperatorIdentityObservationV1::Found(identity.clone()),
+            ),
+        ],)
+        .is_none());
+        assert!(select_operator_container_authority(vec![
+            (
+                "docker".into(),
+                OperatorIdentityObservationV1::Found(identity),
+            ),
+            ("podman".into(), OperatorIdentityObservationV1::Unknown),
+        ],)
+        .is_none());
+    }
+
+    #[test]
+    fn operator_container_authority_requires_full_label_identity() {
+        let authority = operator_test_authority("docker".into(), "immutable-id");
+        let mut changed = authority.identity.clone();
+        changed
+            .ownership_labels
+            .push(("a2a.future".into(), "changed".into()));
+        assert!(!operator_identity_matches(&authority, &changed));
+        assert!(operator_identity_matches(&authority, &authority.identity));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn operator_container_authority_refuses_failed_inspect() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let runtime = temp.path().join("runtime");
+        let marker = temp.path().join("removed");
+        std::fs::write(
+            &runtime,
+            format!(
+                "#!/bin/sh\nif [ \"$1\" = container ] && [ \"$2\" = inspect ]; then exit 7; fi\nif [ \"$1\" = container ] && [ \"$2\" = ps ]; then printf 'immutable-id\\tstable-name\\n'; exit 0; fi\nif [ \"$1\" = rm ]; then printf called > '{}'; fi\n",
+                marker.display()
+            ),
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&runtime).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&runtime, permissions).unwrap();
+
+        let authority =
+            operator_test_authority(runtime.to_string_lossy().into_owned(), "immutable-id");
+        assert!(!operator_remove_container(&authority));
+        assert!(!marker.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn operator_container_authority_spares_a_recycled_name() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let runtime = temp.path().join("runtime");
+        let marker = temp.path().join("removed");
+        std::fs::write(
+            &runtime,
+            format!(
+                "#!/bin/sh\nif [ \"$1\" = container ] && [ \"$2\" = inspect ]; then exit 1; fi\nif [ \"$1\" = container ] && [ \"$2\" = ps ]; then printf 'new-id\\tstable-name\\n'; exit 0; fi\nif [ \"$1\" = rm ]; then printf called > '{}'; fi\n",
+                marker.display()
+            ),
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&runtime).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&runtime, permissions).unwrap();
+
+        let authority = operator_test_authority(runtime.to_string_lossy().into_owned(), "old-id");
+        assert!(!operator_remove_container(&authority));
+        assert!(!marker.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn operator_container_authority_reports_failed_exact_id_removal() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let runtime = temp.path().join("runtime");
+        let marker = temp.path().join("removal-attempted");
+        std::fs::write(
+            &runtime,
+            format!(
+                "#!/bin/sh\nif [ \"$1\" = container ] && [ \"$2\" = inspect ]; then printf 'immutable-id\\t{{\"a2a.owner\":\"owner\"}}\\n'; exit 0; fi\nif [ \"$1\" = rm ]; then printf called > '{}'; exit 9; fi\nexit 1\n",
+                marker.display()
+            ),
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&runtime).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&runtime, permissions).unwrap();
+
+        let authority =
+            operator_test_authority(runtime.to_string_lossy().into_owned(), "immutable-id");
+        assert!(!operator_remove_container(&authority));
+        assert!(marker.exists(), "the exact-ID removal port was not invoked");
     }
 
     #[test]

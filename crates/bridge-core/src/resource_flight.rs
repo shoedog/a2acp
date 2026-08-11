@@ -7,13 +7,14 @@ use ring::rand::{SecureRandom, SystemRandom};
 use serde::{Deserialize, Serialize};
 
 pub use crate::retained_resource_flight::{
-    CleanupDeadlineTransferV1, FileResourceFlightJournal, InMemoryResourceFlightJournal,
-    JournaledDispatchAdmissionV1, NodeCleanupAggregationV1, NoopResourceFlightResultPublisher,
-    OwnedProcessTreeV1, ProcessBindingStageV1, ProcessSignalObservationV1, ResourceActionIntentV1,
-    ResourceFlightJournal, ResourceFlightJournalError, ResourceFlightJournalEventV1,
-    ResourceFlightJournalRecordV1, ResourceFlightKeyV1, ResourceFlightOwnerV1,
-    ResourceFlightRegistryV1, ResourceFlightReservationOutcomeV1,
-    ResourceFlightReservationRecordV1, ResourceFlightReservationV1, ResourceFlightResultPublisher,
+    CleanupDeadlineTransferV1, ContainerRemovalObservationV1, FileResourceFlightJournal,
+    InMemoryResourceFlightJournal, JournaledDispatchAdmissionV1, NodeCleanupAggregationV1,
+    NoopResourceFlightResultPublisher, OwnedProcessTreeV1, ProcessBindingStageV1,
+    ProcessSignalObservationV1, ResourceActionIntentV1, ResourceFlightJournal,
+    ResourceFlightJournalError, ResourceFlightJournalEventV1, ResourceFlightJournalRecordV1,
+    ResourceFlightKeyV1, ResourceFlightOwnerV1, ResourceFlightRegistryV1,
+    ResourceFlightReservationOutcomeV1, ResourceFlightReservationRecordV1,
+    ResourceFlightReservationV1, ResourceFlightResultPublisher,
     ResourceFlightTerminalAppendOutcomeV1, RetainedResourceFlight, RetainedResourceFlightConfigV1,
     RetainedResourceFlightError, RetainedResourceFlightGuardV1,
 };

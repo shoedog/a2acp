@@ -822,12 +822,12 @@ pub fn managed_inspect_argv(runtime: &str, owner: &str) -> (String, Vec<String>)
     )
 }
 
-/// PURE. The reap command for a named per-turn container: `<runtime> rm -f <name>`. Idempotent at the
-/// Docker layer (`rm -f` of a gone container is a harmless error the caller ignores).
-pub fn reap_argv(runtime: &str, name: &str) -> (String, Vec<String>) {
+/// PURE. The reap command for one immutable container ID: `<runtime> rm -f <id>`. Idempotent at the
+/// Docker layer (`rm -f` of a gone ID is a harmless error the caller ignores).
+pub fn reap_argv(runtime: &str, immutable_container_id: &str) -> (String, Vec<String>) {
     (
         runtime.to_string(),
-        vec!["rm".into(), "-f".into(), name.to_string()],
+        vec!["rm".into(), "-f".into(), immutable_container_id.to_string()],
     )
 }
 
@@ -1319,13 +1319,13 @@ mod tests {
     #[test]
     fn reap_argv_shape_docker_and_podman() {
         assert_eq!(
-            reap_argv("docker", "a2a-rw-x"),
+            reap_argv("docker", "sha256:abc"),
             (
                 "docker".to_string(),
-                vec!["rm".into(), "-f".into(), "a2a-rw-x".into()]
+                vec!["rm".into(), "-f".into(), "sha256:abc".into()]
             )
         );
-        assert_eq!(reap_argv("podman", "a2a-rw-y").0, "podman");
+        assert_eq!(reap_argv("podman", "sha256:def").0, "podman");
     }
 
     #[test]

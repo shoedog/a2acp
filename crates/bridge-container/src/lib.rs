@@ -17,14 +17,20 @@ use bridge_core::error::BridgeError;
 use bridge_core::execution_policy::{
     BoundMcpDeliveryPayloadV1, BoundProviderEffectV1, BoundSessionSpecV1,
 };
-use bridge_core::ids::SessionId;
+use bridge_core::ids::{NodeId, SessionId};
 use bridge_core::permission::TurnMeta;
 use bridge_core::ports::{
     AgentBackend, BackendCleanupDispositionV1, BackendObservers, BackendResourceFlightV1,
     BackendStream, DiagnosticObserver, RichEventSink,
 };
-use bridge_core::reaper::{spawn_detached, ReapController, ReapFailure, ReapFn};
-use bridge_core::run_identity::RunHandle;
+use bridge_core::process::DurableProcessFlightAttemptV3;
+use bridge_core::reaper::{
+    spawn_detached, ContainerIdentityProbeFn, ContainerRuntimeIdentityV1,
+    ContainerSubordinateCleanupFn, ReapAttemptFn, ReapController, ReapFailure, ReapFn,
+};
+use bridge_core::resource_flight::ResourceIdentityV1;
+use bridge_core::retained_resource_flight::ResourceFlightOwnerV1;
+use bridge_core::run_identity::{CanonicalContainerOwnershipV1, ContainerLabels, RunHandle};
 use bridge_core::sandbox::{
     a2a_name, check_rw_target, compose_container_rw, compose_container_rw_with_source,
 };
@@ -34,6 +40,28 @@ use tokio::sync::Mutex;
 
 /// Injection seam so warm-reuse / reaper tests run Docker-free. Production wraps `AcpBackend::spawn`
 /// (and applies the system `PolicyEngine` to the inner backend — see `main.rs`'s `AcpContainerSpawn`).
+#[derive(Clone, Debug)]
+pub struct ContainerSpawnRequestV1 {
+    pub runtime: String,
+    pub name: String,
+    pub ownership: CanonicalContainerOwnershipV1,
+}
+
+pub struct ContainerSpawnResultV1 {
+    pub backend: Arc<dyn AgentBackend>,
+    pub immutable_container_id: String,
+    pub ownership_labels: Vec<(String, String)>,
+}
+
+impl std::fmt::Debug for ContainerSpawnResultV1 {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ContainerSpawnResultV1")
+            .field("immutable_container_id", &self.immutable_container_id)
+            .field("ownership_label_count", &self.ownership_labels.len())
+            .finish_non_exhaustive()
+    }
+}
+
 #[async_trait]
 pub trait ContainerSpawn: Send + Sync {
     /// Production validates composition-owned host/runtime evidence before a generation is published.
@@ -47,16 +75,18 @@ pub trait ContainerSpawn: Send + Sync {
         program: &str,
         argv: &[String],
         cfg: AcpConfig,
-    ) -> Result<Arc<dyn AgentBackend>, BridgeError>;
+        request: &ContainerSpawnRequestV1,
+    ) -> Result<ContainerSpawnResultV1, BridgeError>;
 
     async fn spawn_observed(
         &self,
         program: &str,
         argv: &[String],
         cfg: AcpConfig,
+        request: &ContainerSpawnRequestV1,
         _observer: Arc<dyn DiagnosticObserver>,
-    ) -> Result<Arc<dyn AgentBackend>, BridgeError> {
-        self.spawn(program, argv, cfg).await
+    ) -> Result<ContainerSpawnResultV1, BridgeError> {
+        self.spawn(program, argv, cfg, request).await
     }
 }
 
@@ -184,6 +214,9 @@ pub struct ContainerRwConfig {
     pub watchdog: Option<bridge_core::domain::WatchdogConfig>,
     pub handshake_timeout: Duration,
     pub cancel_grace: Duration,
+    /// Slice-4 admission supplies this attempt-owned route. `None` is the
+    /// production V2 default and keeps V3 destructive refusal unarmed.
+    pub resource_flight_attempt_v3: Option<Arc<DurableProcessFlightAttemptV3>>,
     /// Increment A: the per-process run identity — stamps the `a2a.run`/`a2a.host`/`a2a.lease` labels +
     /// the `run_id` segment of each container name (so a concurrent same-owner run never name-clashes).
     pub run: RunHandle,
@@ -196,13 +229,7 @@ pub struct ContainerRwConfig {
 #[derive(Clone)]
 struct ReapOwner {
     generation: u64,
-    reap: ReapController,
-    /// A removal request may be selected before the async spawn attempt has
-    /// reached the point where it can no longer create the named resource.
-    /// The detached cleanup flight waits for this cancellation-safe fence so
-    /// its one underlying attempt cannot settle against an absent container
-    /// and then be followed by a late `docker run`.
-    spawn_settlement: Arc<SpawnSettlement>,
+    authority: Arc<SpawnAuthority>,
     /// Linearizes the final inner prompt installation against cancel, release,
     /// and retirement for this exact container generation. The prompt holds it
     /// only until `inner.prompt*` returns its stream; teardown starts the
@@ -210,65 +237,213 @@ struct ReapOwner {
     dispatch_gate: Arc<Mutex<()>>,
 }
 
-struct SpawnSettlement {
-    settled: AtomicBool,
+enum SpawnAuthorityState {
+    Pending {
+        owners: Vec<ResourceFlightOwnerV1>,
+    },
+    Bound(Box<ReapController>),
+    /// `spawn_failed` records only that the spawn call REPORTED failure — it is
+    /// not proof that no container was created (the runtime command may have run
+    /// before the failure). It authorizes reserve-time generation replacement
+    /// (retry), never a custody-clearing release.
+    RefusedUnknown {
+        spawn_failed: bool,
+    },
+}
+
+struct SpawnAuthority {
+    state: StdMutex<SpawnAuthorityState>,
     notify: tokio::sync::Notify,
 }
 
-impl SpawnSettlement {
+impl SpawnAuthority {
     fn pending() -> Self {
         Self {
-            settled: AtomicBool::new(false),
+            state: StdMutex::new(SpawnAuthorityState::Pending { owners: Vec::new() }),
             notify: tokio::sync::Notify::new(),
         }
     }
 
-    fn settle(&self) {
-        if !self.settled.swap(true, Ordering::SeqCst) {
+    fn refuse_pre_id(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if matches!(*state, SpawnAuthorityState::Pending { .. }) {
+            *state = SpawnAuthorityState::RefusedUnknown {
+                spawn_failed: false,
+            };
             self.notify.notify_waiters();
         }
     }
 
-    async fn wait(&self) {
+    fn refuse_spawn_failed(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match &mut *state {
+            SpawnAuthorityState::Pending { .. } => {
+                *state = SpawnAuthorityState::RefusedUnknown { spawn_failed: true };
+                self.notify.notify_waiters();
+            }
+            SpawnAuthorityState::RefusedUnknown { spawn_failed } => {
+                *spawn_failed = true;
+            }
+            SpawnAuthorityState::Bound(_) => {}
+        }
+    }
+
+    fn is_clearable_spawn_failed(&self) -> bool {
+        matches!(
+            *self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            SpawnAuthorityState::RefusedUnknown { spawn_failed: true }
+        )
+    }
+
+    async fn controller(&self) -> Option<ReapController> {
         loop {
             let notified = self.notify.notified();
-            if self.settled.load(Ordering::SeqCst) {
-                return;
+            {
+                let state = self
+                    .state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                match &*state {
+                    SpawnAuthorityState::Pending { .. } => {}
+                    SpawnAuthorityState::Bound(controller) => {
+                        return Some(controller.as_ref().clone());
+                    }
+                    SpawnAuthorityState::RefusedUnknown { .. } => return None,
+                }
             }
             notified.await;
         }
     }
 }
 
-struct SpawnSettlementGuard(Arc<SpawnSettlement>);
+struct SpawnSettlementGuard {
+    authority: Arc<SpawnAuthority>,
+    armed: bool,
+}
+impl SpawnSettlementGuard {
+    fn complete(&mut self) {
+        self.armed = false;
+    }
+
+    fn refuse_spawn_failed(&mut self) {
+        self.authority.refuse_spawn_failed();
+        self.armed = false;
+    }
+}
 
 impl Drop for SpawnSettlementGuard {
     fn drop(&mut self) {
-        self.0.settle();
+        if self.armed {
+            self.authority.refuse_pre_id();
+        }
     }
 }
 
 impl ReapOwner {
-    /// Transfer cleanup to an observer-free task immediately, but do not
-    /// consume the one-shot removal until spawn returns or is canceled.
+    fn request_session_owner(&self, session: &SessionId) -> Result<(), ReapFailure> {
+        let owner = ResourceFlightOwnerV1::new(
+            NodeId::parse("container-session").map_err(|_| ReapFailure::FlightRefused)?,
+            session.as_str(),
+        )
+        .map_err(|_| ReapFailure::FlightRefused)?;
+        let mut state = self
+            .authority
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match &mut *state {
+            SpawnAuthorityState::Pending { owners } => {
+                if !owners.contains(&owner) {
+                    owners.push(owner);
+                }
+                Ok(())
+            }
+            SpawnAuthorityState::Bound(controller) => controller.attach_owner(owner).map(|_| ()),
+            SpawnAuthorityState::RefusedUnknown { .. } => Err(ReapFailure::FlightRefused),
+        }
+    }
+
+    fn bind(&self, controller: ReapController) -> Result<(), ReapFailure> {
+        let mut state = self
+            .authority
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let SpawnAuthorityState::Pending { owners } = &*state else {
+            return Err(ReapFailure::FlightRefused);
+        };
+        for owner in owners.iter().cloned() {
+            controller.attach_owner(owner)?;
+        }
+        *state = SpawnAuthorityState::Bound(Box::new(controller));
+        self.authority.notify.notify_waiters();
+        Ok(())
+    }
+
     fn reap_detached(&self) {
-        let settlement = Arc::clone(&self.spawn_settlement);
-        let reap = self.reap.clone();
+        // A teardown entrance cannot wait for a future name-to-ID binding:
+        // while spawn evidence is pending it closes the authority as Unknown,
+        // which makes every later bind and destructive action refuse.
+        self.authority.refuse_pre_id();
+        let authority = Arc::clone(&self.authority);
         spawn_detached(async move {
-            settlement.wait().await;
-            // Await internally so an off-runtime throwaway runtime cannot drop
-            // after spawning, but before polling, a nested detached worker.
-            // This task owns no operation observer and discards only the report.
-            let _ = reap.reap_observed().await;
+            if let Some(controller) = authority.controller().await {
+                let _ = controller.reap_observed().await;
+            }
         });
     }
 
-    /// Join the same cleanup flight. Starting the detached waiter before this
-    /// await keeps removal owned if the observed caller is canceled.
-    async fn reap_observed(&self) -> Result<(), ReapFailure> {
+    async fn reap_observed(&self) -> Result<BackendCleanupDispositionV1, ReapFailure> {
         self.reap_detached();
-        self.spawn_settlement.wait().await;
-        self.reap.reap_observed().await
+        let Some(controller) = self.authority.controller().await else {
+            return Ok(BackendCleanupDispositionV1::Unknown);
+        };
+        let protected_v3 = controller.is_protected_v3();
+        match controller.reap_observed().await {
+            Ok(()) => Ok(BackendCleanupDispositionV1::Complete),
+            Err(error) if protected_v3 => Ok(match error {
+                ReapFailure::IdentityUnavailable => BackendCleanupDispositionV1::Unknown,
+                _ => BackendCleanupDispositionV1::Retained,
+            }),
+            Err(error) => Err(error),
+        }
+    }
+
+    fn is_clearable_spawn_failed(&self) -> bool {
+        self.authority.is_clearable_spawn_failed()
+    }
+}
+
+fn require_complete_cleanup(disposition: BackendCleanupDispositionV1) -> Result<(), BridgeError> {
+    match disposition {
+        BackendCleanupDispositionV1::Complete => Ok(()),
+        BackendCleanupDispositionV1::Retained => Err(BridgeError::DurableEvidenceUnavailable {
+            reason: "container cleanup retained",
+        }),
+        BackendCleanupDispositionV1::Preserved => Err(BridgeError::DurableEvidenceUnavailable {
+            reason: "container cleanup preserved",
+        }),
+        BackendCleanupDispositionV1::Unknown => Err(BridgeError::DurableEvidenceUnavailable {
+            reason: "container cleanup unknown",
+        }),
+    }
+}
+
+fn container_cleanup_detail(disposition: BackendCleanupDispositionV1) -> &'static str {
+    match disposition {
+        BackendCleanupDispositionV1::Complete => "container.teardown.reaped",
+        BackendCleanupDispositionV1::Retained => "container.teardown.retained",
+        BackendCleanupDispositionV1::Preserved => "container.teardown.preserved",
+        BackendCleanupDispositionV1::Unknown => "container.teardown.unknown",
     }
 }
 
@@ -316,6 +491,9 @@ struct PreparedInner {
     argv: Vec<String>,
     acp: AcpConfig,
     rw_canon: SessionCwd,
+    spawn_request: ContainerSpawnRequestV1,
+    ownership: CanonicalContainerOwnershipV1,
+    flight_attempt: Option<Arc<DurableProcessFlightAttemptV3>>,
 }
 
 #[derive(Clone)]
@@ -325,7 +503,17 @@ struct ContainerSessionSpec {
 }
 
 type Inflight = Arc<Mutex<HashMap<SessionId, InflightState>>>;
-type ReapFactory = Arc<dyn Fn(String, String) -> ReapController + Send + Sync>;
+type ReapFactory = Arc<
+    dyn Fn(
+            ResourceIdentityV1,
+            String,
+            CanonicalContainerOwnershipV1,
+            ContainerSubordinateCleanupFn,
+            Option<bridge_core::reaper::DurableContainerFlightV3>,
+        ) -> Result<ReapController, ReapFailure>
+        + Send
+        + Sync,
+>;
 
 /// Per-turn (cold) vs warm (one container + session reused across turns, reaped only at `retire`).
 #[derive(Clone, Copy, PartialEq)]
@@ -376,9 +564,54 @@ impl ContainerRwBackend {
         owner: String,
         reap_fn: ReapFn,
     ) -> Result<Self, BridgeError> {
-        let reap_factory: ReapFactory = Arc::new(move |runtime, name| {
-            ReapController::from_legacy(runtime, name, Arc::clone(&reap_fn))
-        });
+        let reap_factory: ReapFactory =
+            Arc::new(move |identity, selector, ownership, subordinate, durable| {
+                let expected_id = match &identity {
+                    ResourceIdentityV1::ManagedContainer {
+                        immutable_container_id,
+                        ..
+                    } => immutable_container_id.clone(),
+                    _ => return Err(ReapFailure::IdentityUnavailable),
+                };
+                let observed_labels = ownership.ordered().to_vec();
+                let probe: ContainerIdentityProbeFn = Arc::new(move |_runtime, _selector| {
+                    let immutable_container_id = expected_id.clone();
+                    let ownership_labels = observed_labels.clone();
+                    Box::pin(async move {
+                        Ok(ContainerRuntimeIdentityV1 {
+                            immutable_container_id,
+                            ownership_labels,
+                        })
+                    })
+                });
+                let reap_fn = Arc::clone(&reap_fn);
+                let attempt: ReapAttemptFn = Arc::new(move |runtime, immutable_id| {
+                    let reap_fn = Arc::clone(&reap_fn);
+                    Box::pin(async move {
+                        reap_fn(runtime, immutable_id);
+                        Ok(())
+                    })
+                });
+                match durable {
+                    Some(durable) => ReapController::managed_durable_v3(
+                        identity,
+                        selector,
+                        ownership,
+                        attempt,
+                        probe,
+                        subordinate,
+                        durable,
+                    ),
+                    None => ReapController::managed_legacy_v2(
+                        identity,
+                        selector,
+                        ownership,
+                        attempt,
+                        probe,
+                        subordinate,
+                    ),
+                }
+            });
         Self::new_with_reap_factory(cfg, spawn, owner, reap_factory).await
     }
 
@@ -425,7 +658,23 @@ impl ContainerRwBackend {
         spawn: Arc<dyn ContainerSpawn>,
         owner: String,
     ) -> Result<Self, BridgeError> {
-        let reap_factory: ReapFactory = Arc::new(ReapController::production);
+        let reap_factory: ReapFactory = Arc::new(
+            |identity, selector, ownership, subordinate, durable| match durable {
+                Some(durable) => ReapController::managed_production_v3(
+                    identity,
+                    selector,
+                    ownership,
+                    subordinate,
+                    durable,
+                ),
+                None => ReapController::managed_production_v2(
+                    identity,
+                    selector,
+                    ownership,
+                    subordinate,
+                ),
+            },
+        );
         let mut backend = Self::new_with_reap_factory(cfg, spawn, owner, reap_factory).await?;
         backend.lifecycle = Lifecycle::Warm;
         Ok(backend)
@@ -442,7 +691,23 @@ impl ContainerRwBackend {
         spawn: Arc<dyn ContainerSpawn>,
         owner: String,
     ) -> Result<Self, BridgeError> {
-        let reap_factory: ReapFactory = Arc::new(ReapController::production);
+        let reap_factory: ReapFactory = Arc::new(
+            |identity, selector, ownership, subordinate, durable| match durable {
+                Some(durable) => ReapController::managed_production_v3(
+                    identity,
+                    selector,
+                    ownership,
+                    subordinate,
+                    durable,
+                ),
+                None => ReapController::managed_production_v2(
+                    identity,
+                    selector,
+                    ownership,
+                    subordinate,
+                ),
+            },
+        );
         Self::new_with_reap_factory(cfg, spawn, owner, reap_factory).await
     }
 
@@ -486,27 +751,28 @@ impl ContainerRwBackend {
             &self.cfg.run.instance_id,
             &generation.to_string(),
         );
-        let reap = (self.reap_factory)(runtime.clone(), name.clone());
-        let owner = ReapOwner {
-            generation,
-            reap,
-            spawn_settlement: Arc::new(SpawnSettlement::pending()),
-            dispatch_gate: Arc::new(Mutex::new(())),
-        };
         let kind = if self.is_warm() { "warm" } else { "perturn" };
         let repo = delivery_cwd.as_str();
-        let labels = self
-            .cfg
-            .run
-            .labels(
-                "rw",
-                kind,
-                &self.cfg.agent,
-                &self.owner,
-                Some(repo),
-                Some(repo),
-            )
-            .to_arg_pairs();
+        let label_model: ContainerLabels = self.cfg.run.labels(
+            "rw",
+            kind,
+            &self.cfg.agent,
+            &self.owner,
+            Some(repo),
+            Some(repo),
+        );
+        let ownership = label_model.canonical_ownership();
+        let labels = ownership.ordered().to_vec();
+        let owner = ReapOwner {
+            generation,
+            authority: Arc::new(SpawnAuthority::pending()),
+            dispatch_gate: Arc::new(Mutex::new(())),
+        };
+        let spawn_request = ContainerSpawnRequestV1 {
+            runtime,
+            name: name.clone(),
+            ownership: ownership.clone(),
+        };
         // Native codex MCP (ADR-0028): append `-c mcp_servers.*` args to the inner codex-acp argv,
         // `{cwd}`-substituted with THIS turn's `:rw` clone (identical-path mount → the same path
         // resolves inside the container). claude/non-codex leave `mcp` empty.
@@ -574,7 +840,18 @@ impl ContainerRwBackend {
             auth_method: self.cfg.auth_method.clone(),
             pre_authenticated: self.cfg.pre_authenticated,
             watchdog: self.cfg.watchdog.clone(),
-            process_flight_route_v3: None,
+            process_flight_route_v3: self.cfg.resource_flight_attempt_v3.as_ref().map(|attempt| {
+                let owner = ResourceFlightOwnerV1::new(
+                    NodeId::parse("container-inner-process").expect("static node id"),
+                    format!("inner-{name}"),
+                )
+                .expect("non-empty owner key");
+                bridge_acp::acp_backend::AcpProcessFlightRouteV3::new(
+                    Arc::clone(attempt),
+                    format!("inner-{name}"),
+                    owner,
+                )
+            }),
             prefix_attestation_transport:
                 bridge_acp::acp_backend::PrefixAttestationTransport::Unsupported,
             handshake_timeout: self.cfg.handshake_timeout,
@@ -614,6 +891,9 @@ impl ContainerRwBackend {
             argv,
             acp,
             rw_canon,
+            spawn_request,
+            ownership,
+            flight_attempt: self.cfg.resource_flight_attempt_v3.clone(),
         })
     }
 
@@ -635,14 +915,21 @@ impl ContainerRwBackend {
             .session_reaps
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if reaps.contains_key(session) {
-            return Err(BridgeError::ConfigInvalid {
-                reason: format!(
-                    "session {} cleanup is still owned by its previous container generation",
-                    session.as_str()
-                ),
-            });
+        if let Some(existing) = reaps.get(session) {
+            if existing.is_clearable_spawn_failed() {
+                reaps.remove(session);
+            } else {
+                return Err(BridgeError::ConfigInvalid {
+                    reason: format!(
+                        "session {} cleanup is still owned by its previous container generation",
+                        session.as_str()
+                    ),
+                });
+            }
         }
+        owner
+            .request_session_owner(session)
+            .map_err(|failure| BridgeError::agent_crashed(failure.code()))?;
         reaps.insert(session.clone(), owner.clone());
         inflight.insert(session.clone(), InflightState::Reserving(owner.clone()));
         Ok(())
@@ -682,28 +969,83 @@ impl ContainerRwBackend {
             argv,
             acp,
             rw_canon,
+            spawn_request,
+            ownership,
+            flight_attempt,
         } = prepared;
-        let spawned = {
-            // Dropping this scope after success, failure, panic unwind, or
-            // caller cancellation proves that no later poll of this spawn
-            // future can create the named resource.
-            let _spawn_settlement = SpawnSettlementGuard(Arc::clone(&owner.spawn_settlement));
-            match diagnostic_observer {
-                Some(observer) => {
-                    self.spawn
-                        .spawn_observed(&program, &argv, acp, observer)
-                        .await
-                }
-                None => self.spawn.spawn(&program, &argv, acp).await,
-            }
+        // Until this guard is disarmed no immutable authority exists. Drop or
+        // caller cancellation settles the pending generation as Unknown and
+        // can never dispatch a runtime removal.
+        let mut spawn_settlement = SpawnSettlementGuard {
+            authority: Arc::clone(&owner.authority),
+            armed: true,
         };
-        let inner = match spawned {
-            Ok(i) => i,
+        let spawned = match diagnostic_observer {
+            Some(observer) => {
+                self.spawn
+                    .spawn_observed(&program, &argv, acp, &spawn_request, observer)
+                    .await
+            }
+            None => self.spawn.spawn(&program, &argv, acp, &spawn_request).await,
+        };
+        let spawned = match spawned {
+            Ok(spawned) => spawned,
             Err(e) => {
+                spawn_settlement.refuse_spawn_failed();
                 owner.reap_detached();
                 return Err(e);
             }
         };
+        if spawned.immutable_container_id.is_empty()
+            || ownership
+                .validate_observed(&spawned.ownership_labels)
+                .is_err()
+        {
+            owner.reap_detached();
+            return Err(BridgeError::IdentityUnavailable);
+        }
+        let identity_generation = format!("container-id:{}", spawned.immutable_container_id);
+        let identity = ResourceIdentityV1::ManagedContainer {
+            generation: identity_generation.clone(),
+            runtime: spawn_request.runtime.clone(),
+            immutable_container_id: spawned.immutable_container_id.clone(),
+            ownership_labels_digest: ownership.digest().clone(),
+        };
+        let durable = match flight_attempt {
+            Some(attempt) => {
+                let flight_owner = ResourceFlightOwnerV1::new(
+                    NodeId::parse("container-spawn").expect("static node id"),
+                    identity_generation.clone(),
+                )
+                .map_err(|_| BridgeError::IdentityUnavailable)?;
+                Some(
+                    attempt
+                        .bind_container_generation(identity_generation, flight_owner)
+                        .map_err(|_| BridgeError::IdentityUnavailable)?,
+                )
+            }
+            None => None,
+        };
+        let inner = spawned.backend;
+        let subordinate_inner = Arc::clone(&inner);
+        let subordinate_session = session.clone();
+        let subordinate: ContainerSubordinateCleanupFn = Arc::new(move || {
+            let inner = Arc::clone(&subordinate_inner);
+            let session = subordinate_session.clone();
+            Box::pin(async move { inner.cancel(&session).await.map_err(|_| ()) })
+        });
+        let controller = (self.reap_factory)(
+            identity,
+            spawn_request.name,
+            ownership,
+            subordinate,
+            durable,
+        )
+        .map_err(|failure| BridgeError::agent_crashed(failure.code()))?;
+        owner
+            .bind(controller)
+            .map_err(|failure| BridgeError::agent_crashed(failure.code()))?;
+        spawn_settlement.complete();
         let configure = if let Some(effect) = &spec.bound_effect {
             inner
                 .configure_bound_session(
@@ -823,7 +1165,6 @@ impl ContainerRwBackend {
             };
             if !published {
                 wi.owner.reap_detached();
-                let _ = wi.inner.cancel(session).await;
                 fail!(BridgeError::SessionExpired);
             }
             // NO re-configure on cache-miss: open_inner already configured with the canonical cwd.
@@ -913,7 +1254,6 @@ impl ContainerRwBackend {
                 }
                 drop(warm);
                 owner.reap_detached();
-                let _ = inner.cancel(session).await;
             }
             return Err(BridgeError::SessionExpired);
         }
@@ -988,7 +1328,16 @@ impl ContainerRwBackend {
             }
         }
         self.turn_active.lock().await.remove(session);
-        if let Some(inner) = inner {
+        drop(_dispatch);
+        if was_reserving {
+            let disposition = owner
+                .reap_observed()
+                .await
+                .map_err(|failure| BridgeError::agent_crashed(failure.code()))?;
+            require_complete_cleanup(disposition)?;
+        } else if let Some(inner) = inner {
+            // Live warm cancellation is turn-scoped and intentionally retains
+            // the outer container for reuse; retirement owns its flight.
             let _ = inner.cancel(session).await;
         }
         Ok(())
@@ -1003,9 +1352,9 @@ impl ContainerRwBackend {
             self.turn_active.lock().await.remove(session);
             return (None, None);
         };
-        // The controller owns cleanup before any async gate/map wait. Canceling
-        // this waiter can detach reporting, but cannot suppress container
-        // removal.
+        // The controller owns the terminal cleanup decision before any async
+        // gate/map wait. Canceling this waiter can detach reporting, but cannot
+        // reopen destructive authority after a pre-ID Unknown refusal.
         owner.reap_detached();
         let _dispatch = owner.dispatch_gate.lock().await;
         let mut inner = None;
@@ -1058,23 +1407,30 @@ impl ContainerRwBackend {
         &self,
         session: &SessionId,
         owner: &Option<ReapOwner>,
-        result: &Result<(), ReapFailure>,
+        result: &Result<BackendCleanupDispositionV1, ReapFailure>,
     ) {
-        if result.is_ok() {
+        // Only a proven-Complete reap surrenders custody here. A spawn-failure
+        // refusal (`Unknown`) authorizes reserve-time REPLACEMENT only: a spawn
+        // `Err` does not prove no container was created (the runtime command may
+        // have run before the failure), so clearing on release would let a later
+        // vacuous release report Complete for a possibly-live orphan. A retry
+        // that collides with such an orphan's name fails loudly at `run`.
+        let clear = matches!(result, Ok(BackendCleanupDispositionV1::Complete));
+        if clear {
             if let Some(owner) = owner {
                 self.clear_reap_owner(session, owner.generation);
             }
         }
     }
 
-    async fn release_warm_checked(&self, session: &SessionId) -> Result<(), ReapFailure> {
-        let (owner, inner) = self.begin_warm_cleanup(session).await;
-        if let Some(inner) = inner {
-            let _ = inner.cancel(session).await;
-        }
+    async fn release_warm_checked(
+        &self,
+        session: &SessionId,
+    ) -> Result<BackendCleanupDispositionV1, ReapFailure> {
+        let (owner, _inner) = self.begin_warm_cleanup(session).await;
         let result = match &owner {
             Some(owner) => owner.reap_observed().await,
-            None => Ok(()),
+            None => Ok(BackendCleanupDispositionV1::Complete),
         };
         self.finish_reap(session, &owner, &result);
         result
@@ -1084,7 +1440,7 @@ impl ContainerRwBackend {
         &self,
         session: &SessionId,
         observer: Arc<dyn DiagnosticObserver>,
-    ) -> Result<(), BridgeError> {
+    ) -> Result<BackendCleanupDispositionV1, BridgeError> {
         use bridge_core::diagnostics::{DiagnosticPhase, PhaseStatus};
 
         let (owner, inner) = self.begin_warm_cleanup(session).await;
@@ -1096,37 +1452,36 @@ impl ContainerRwBackend {
         )
         .await;
 
-        if let Some(inner) = inner {
-            let _ = inner.cancel(session).await;
-        }
+        let _inner = inner;
         let reap_result = match &owner {
             Some(owner) => owner.reap_observed().await,
-            None => Ok(()),
+            None => Ok(BackendCleanupDispositionV1::Complete),
         };
         self.finish_reap(session, &owner, &reap_result);
         start_result?;
         match reap_result {
-            Ok(()) => {
+            Ok(disposition) => {
                 record_container_transition(
                     &observer,
                     DiagnosticPhase::Teardown,
                     PhaseStatus::Completed,
-                    Some("container.teardown.reaped"),
+                    Some(container_cleanup_detail(disposition)),
                 )
-                .await
+                .await?;
+                Ok(disposition)
             }
             Err(failure) => Err(record_reap_failure(&observer, failure).await),
         }
     }
 
-    async fn release_cold_checked(&self, session: &SessionId) -> Result<(), ReapFailure> {
-        let (owner, inner) = self.begin_cold_cleanup(session).await;
-        if let Some(inner) = inner {
-            let _ = inner.cancel(session).await;
-        }
+    async fn release_cold_checked(
+        &self,
+        session: &SessionId,
+    ) -> Result<BackendCleanupDispositionV1, ReapFailure> {
+        let (owner, _inner) = self.begin_cold_cleanup(session).await;
         let result = match &owner {
             Some(owner) => owner.reap_observed().await,
-            None => Ok(()),
+            None => Ok(BackendCleanupDispositionV1::Complete),
         };
         self.finish_reap(session, &owner, &result);
         result
@@ -1136,7 +1491,7 @@ impl ContainerRwBackend {
         &self,
         session: &SessionId,
         observer: Arc<dyn DiagnosticObserver>,
-    ) -> Result<(), BridgeError> {
+    ) -> Result<BackendCleanupDispositionV1, BridgeError> {
         use bridge_core::diagnostics::{DiagnosticPhase, PhaseStatus};
 
         let (owner, inner) = self.begin_cold_cleanup(session).await;
@@ -1147,24 +1502,23 @@ impl ContainerRwBackend {
             Some("container.teardown.reap"),
         )
         .await;
-        if let Some(inner) = inner {
-            let _ = inner.cancel(session).await;
-        }
+        let _inner = inner;
         let reap_result = match &owner {
             Some(owner) => owner.reap_observed().await,
-            None => Ok(()),
+            None => Ok(BackendCleanupDispositionV1::Complete),
         };
         self.finish_reap(session, &owner, &reap_result);
         start_result?;
         match reap_result {
-            Ok(()) => {
+            Ok(disposition) => {
                 record_container_transition(
                     &observer,
                     DiagnosticPhase::Teardown,
                     PhaseStatus::Completed,
-                    Some("container.teardown.reaped"),
+                    Some(container_cleanup_detail(disposition)),
                 )
-                .await
+                .await?;
+                Ok(disposition)
             }
             Err(failure) => Err(record_reap_failure(&observer, failure).await),
         }
@@ -1242,7 +1596,6 @@ impl ContainerRwBackend {
         };
         if !promoted {
             wi.owner.reap_detached();
-            let _ = wi.inner.cancel(session).await;
             return Err(BridgeError::SessionExpired);
         }
 
@@ -1333,14 +1686,23 @@ impl AgentBackend for ContainerRwBackend {
     }
 
     fn resource_flight_v1(&self) -> Result<BackendResourceFlightV1, BridgeError> {
-        Ok(BackendResourceFlightV1::LegacyV2)
+        Ok(if self.cfg.resource_flight_attempt_v3.is_some() {
+            BackendResourceFlightV1::ProtectedV3
+        } else {
+            BackendResourceFlightV1::LegacyV2
+        })
     }
 
     fn attach_resource_flight_owner_v1(
         &self,
-        _session: &SessionId,
+        session: &SessionId,
     ) -> Result<BackendResourceFlightV1, BridgeError> {
-        Err(BridgeError::ResourceFlightUnsupported)
+        if let Some(owner) = self.current_reap_owner(session) {
+            owner
+                .request_session_owner(session)
+                .map_err(|failure| BridgeError::agent_crashed(failure.code()))?;
+        }
+        self.resource_flight_v1()
     }
 
     async fn cancel(&self, session: &SessionId) -> Result<(), BridgeError> {
@@ -1354,7 +1716,7 @@ impl AgentBackend for ContainerRwBackend {
         if let Some(owner) = owner {
             owner.reap_detached();
             let _dispatch = owner.dispatch_gate.lock().await;
-            let state = {
+            let _state = {
                 let mut inflight = self.inflight.lock().await;
                 if inflight.get(session).map(InflightState::generation) == Some(owner.generation) {
                     inflight.remove(session)
@@ -1362,9 +1724,12 @@ impl AgentBackend for ContainerRwBackend {
                     None
                 }
             };
-            if let Some(InflightState::Live(turn)) = state {
-                let _ = turn.inner.cancel(session).await;
-            }
+            drop(_dispatch);
+            let disposition = owner
+                .reap_observed()
+                .await
+                .map_err(|failure| BridgeError::agent_crashed(failure.code()))?;
+            require_complete_cleanup(disposition)?;
         }
         Ok(())
     }
@@ -1450,18 +1815,16 @@ impl AgentBackend for ContainerRwBackend {
         session: &SessionId,
     ) -> Result<BackendCleanupDispositionV1, BridgeError> {
         let result = if self.is_warm() {
-            Ok(())
+            Ok(BackendCleanupDispositionV1::Complete)
         } else {
             self.release_cold_checked(session).await
         };
         self.session_cfg.lock().await.remove(session);
         self.pending_turn_meta.lock().await.remove(session);
-        result
-            .map_err(|failure| match build_reap_failure(failure) {
-                Ok(diagnostic) => container_reap_failure_error(diagnostic),
-                Err(error) => error,
-            })
-            .map(|()| BackendCleanupDispositionV1::Complete)
+        result.map_err(|failure| match build_reap_failure(failure) {
+            Ok(diagnostic) => container_reap_failure_error(diagnostic),
+            Err(error) => error,
+        })
     }
 
     async fn forget_session_observed(
@@ -1470,13 +1833,13 @@ impl AgentBackend for ContainerRwBackend {
         observer: Arc<dyn DiagnosticObserver>,
     ) -> Result<BackendCleanupDispositionV1, BridgeError> {
         let result = if self.is_warm() {
-            Ok(())
+            Ok(BackendCleanupDispositionV1::Complete)
         } else {
             self.release_cold_observed(session, observer).await
         };
         self.session_cfg.lock().await.remove(session);
         self.pending_turn_meta.lock().await.remove(session);
-        result.map(|()| BackendCleanupDispositionV1::Complete)
+        result
     }
 
     async fn release_session(&self, session: &SessionId) {
@@ -1494,12 +1857,10 @@ impl AgentBackend for ContainerRwBackend {
         };
         self.session_cfg.lock().await.remove(session);
         self.pending_turn_meta.lock().await.remove(session);
-        result
-            .map_err(|failure| match build_reap_failure(failure) {
-                Ok(diagnostic) => container_reap_failure_error(diagnostic),
-                Err(error) => error,
-            })
-            .map(|()| BackendCleanupDispositionV1::Complete)
+        result.map_err(|failure| match build_reap_failure(failure) {
+            Ok(diagnostic) => container_reap_failure_error(diagnostic),
+            Err(error) => error,
+        })
     }
 
     async fn release_session_observed(
@@ -1514,7 +1875,7 @@ impl AgentBackend for ContainerRwBackend {
         };
         self.session_cfg.lock().await.remove(session);
         self.pending_turn_meta.lock().await.remove(session);
-        result.map(|()| BackendCleanupDispositionV1::Complete)
+        result
     }
 
     async fn retire(&self) -> Result<(), BridgeError> {
@@ -1535,29 +1896,39 @@ impl AgentBackend for ContainerRwBackend {
         for (_, owner) in &owners {
             owner.reap_detached();
         }
+        let mut first_error = None;
         for (session, owner) in owners {
             let _dispatch = owner.dispatch_gate.lock().await;
-            let mut inner = None;
+            let mut _inner = None;
             {
                 let mut inflight = self.inflight.lock().await;
                 if inflight.get(&session).map(InflightState::generation) == Some(owner.generation) {
                     if let Some(InflightState::Live(turn)) = inflight.remove(&session) {
-                        inner = Some(turn.inner);
+                        _inner = Some(turn.inner);
                     }
                 }
                 let mut warm = self.warm.lock().await;
                 if warm.get(&session).map(|warm| warm.owner.generation) == Some(owner.generation) {
                     if let Some(warm) = warm.remove(&session) {
-                        inner = Some(warm.inner);
+                        _inner = Some(warm.inner);
                     }
                 }
             }
             self.turn_active.lock().await.remove(&session);
-            if let Some(inner) = inner {
-                let _ = inner.cancel(&session).await;
+            drop(_dispatch);
+            let result = owner.reap_observed().await;
+            self.finish_reap(&session, &Some(owner.clone()), &result);
+            if first_error.is_none() {
+                first_error = match result {
+                    Ok(disposition) => require_complete_cleanup(disposition).err(),
+                    Err(failure) => Some(BridgeError::agent_crashed(failure.code())),
+                };
             }
         }
-        Ok(())
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
     }
 }
 
@@ -1734,6 +2105,79 @@ mod tests {
     use std::collections::HashSet;
     use std::sync::atomic::{AtomicBool, AtomicUsize};
 
+    #[tokio::test]
+    #[ignore = "requires a host Docker daemon and the alpine image"]
+    async fn docker_identity_template_round_trips_all_a2a_labels() {
+        let name = format!("a2a-identity-roundtrip-{}", std::process::id());
+        let started = std::process::Command::new("docker")
+            .args([
+                "run",
+                "-d",
+                "--name",
+                &name,
+                "--label",
+                "a2a.managed=1",
+                "--label",
+                "a2a.owner=roundtrip-owner",
+                "--label",
+                "a2a.future=image-extra",
+                "alpine",
+                "sleep",
+                "60",
+            ])
+            .output()
+            .expect("docker must be executable for the ignored host test");
+        assert!(
+            started.status.success(),
+            "docker run failed: {}",
+            String::from_utf8_lossy(&started.stderr)
+        );
+
+        let observed = bridge_core::reaper::production_container_identity("docker", &name)
+            .await
+            .expect("the production identity template must parse Docker output");
+        let removed = std::process::Command::new("docker")
+            .args(["rm", "-f", &observed.immutable_container_id])
+            .output()
+            .expect("docker rm must execute");
+        assert!(removed.status.success());
+        assert!(!observed.immutable_container_id.is_empty());
+        assert_eq!(
+            observed.ownership_labels,
+            vec![
+                ("a2a.future".into(), "image-extra".into()),
+                ("a2a.managed".into(), "1".into()),
+                ("a2a.owner".into(), "roundtrip-owner".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn unit_cleanup_wrappers_accept_complete_and_refuse_protective_outcomes() {
+        assert_eq!(
+            require_complete_cleanup(BackendCleanupDispositionV1::Complete),
+            Ok(())
+        );
+        assert_eq!(
+            require_complete_cleanup(BackendCleanupDispositionV1::Retained),
+            Err(BridgeError::DurableEvidenceUnavailable {
+                reason: "container cleanup retained"
+            })
+        );
+        assert_eq!(
+            require_complete_cleanup(BackendCleanupDispositionV1::Preserved),
+            Err(BridgeError::DurableEvidenceUnavailable {
+                reason: "container cleanup preserved"
+            })
+        );
+        assert_eq!(
+            require_complete_cleanup(BackendCleanupDispositionV1::Unknown),
+            Err(BridgeError::DurableEvidenceUnavailable {
+                reason: "container cleanup unknown"
+            })
+        );
+    }
+
     // ---- stubs -------------------------------------------------------------
 
     /// Stub inner backend: emits one `Done`, records cancel + prompt count + the sessions it served.
@@ -1836,6 +2280,8 @@ mod tests {
         fail: bool,
         fail_prompt: bool,
         terminal_evidence_v1: AtomicBool,
+        extra_ownership_label: AtomicBool,
+        mismatched_ownership_label: AtomicBool,
         observed_count: AtomicUsize,
         last_argv: Mutex<Vec<String>>,
         last_acp_mcp: Mutex<Vec<bridge_core::mcp::McpServerSpec>>,
@@ -1873,7 +2319,8 @@ mod tests {
             _program: &str,
             _argv: &[String],
             _cfg: AcpConfig,
-        ) -> Result<Arc<dyn AgentBackend>, BridgeError> {
+            _request: &ContainerSpawnRequestV1,
+        ) -> Result<ContainerSpawnResultV1, BridgeError> {
             self.spawn_count.fetch_add(1, Ordering::SeqCst);
             Err(BridgeError::InvalidStateTransition)
         }
@@ -1945,6 +2392,8 @@ mod tests {
                 fail,
                 fail_prompt: false,
                 terminal_evidence_v1: AtomicBool::new(false),
+                extra_ownership_label: AtomicBool::new(false),
+                mismatched_ownership_label: AtomicBool::new(false),
                 observed_count: AtomicUsize::new(0),
                 last_argv: Mutex::new(vec![]),
                 last_acp_mcp: Mutex::new(vec![]),
@@ -1965,7 +2414,8 @@ mod tests {
             _program: &str,
             argv: &[String],
             cfg: AcpConfig,
-        ) -> Result<Arc<dyn AgentBackend>, BridgeError> {
+            request: &ContainerSpawnRequestV1,
+        ) -> Result<ContainerSpawnResultV1, BridgeError> {
             self.count.fetch_add(1, Ordering::SeqCst);
             *self.last_argv.lock().await = argv.to_vec();
             *self.last_acp_mcp.lock().await = cfg.mcp.clone();
@@ -1995,7 +2445,20 @@ mod tests {
                 cancel_gate: self.cancel_gate.clone(),
             });
             *self.last_inner.lock().await = Some(inner.clone());
-            Ok(inner)
+            let mut ownership_labels = request.ownership.ordered().to_vec();
+            if self.extra_ownership_label.load(Ordering::SeqCst) {
+                ownership_labels.push(("a2a.future".into(), "unexpected".into()));
+            }
+            if self.mismatched_ownership_label.load(Ordering::SeqCst) {
+                if let Some(first) = ownership_labels.first_mut() {
+                    first.1 = "tampered".into();
+                }
+            }
+            Ok(ContainerSpawnResultV1 {
+                backend: inner,
+                immutable_container_id: format!("sha256:test-{}", request.name),
+                ownership_labels,
+            })
         }
 
         async fn spawn_observed(
@@ -2003,8 +2466,9 @@ mod tests {
             program: &str,
             argv: &[String],
             cfg: AcpConfig,
+            request: &ContainerSpawnRequestV1,
             observer: Arc<dyn DiagnosticObserver>,
-        ) -> Result<Arc<dyn AgentBackend>, BridgeError> {
+        ) -> Result<ContainerSpawnResultV1, BridgeError> {
             self.observed_count.fetch_add(1, Ordering::SeqCst);
             observer
                 .record(test_transition(
@@ -2013,7 +2477,7 @@ mod tests {
                     None,
                 ))
                 .await?;
-            let inner = self.spawn(program, argv, cfg).await?;
+            let inner = self.spawn(program, argv, cfg, request).await?;
             observer
                 .record(test_transition(
                     DiagnosticPhase::Spawn,
@@ -2087,6 +2551,64 @@ mod tests {
         (f, n)
     }
 
+    fn bound_test_owner(reap: ReapFn) -> ReapOwner {
+        let labels = ContainerLabels {
+            role: "rw".into(),
+            kind: "perturn".into(),
+            agent: "impl".into(),
+            owner: "inst".into(),
+            run_id: "run0".into(),
+            host: "h".into(),
+            lease: "/l/run0.lock".into(),
+            repo: None,
+            cwd: None,
+            start: "0".into(),
+        };
+        let ownership = labels.canonical_ownership();
+        let immutable_id = "container-id-off-runtime".to_owned();
+        let observed_labels = ownership.ordered().to_vec();
+        let expected_id = immutable_id.clone();
+        let probe: ContainerIdentityProbeFn = Arc::new(move |_runtime, _selector| {
+            let immutable_container_id = expected_id.clone();
+            let ownership_labels = observed_labels.clone();
+            Box::pin(async move {
+                Ok(ContainerRuntimeIdentityV1 {
+                    immutable_container_id,
+                    ownership_labels,
+                })
+            })
+        });
+        let attempt: ReapAttemptFn = Arc::new(move |runtime, immutable_id| {
+            let reap = Arc::clone(&reap);
+            Box::pin(async move {
+                reap(runtime, immutable_id);
+                Ok(())
+            })
+        });
+        let subordinate: ContainerSubordinateCleanupFn = Arc::new(|| Box::pin(async { Ok(()) }));
+        let controller = ReapController::managed_legacy_v2(
+            ResourceIdentityV1::ManagedContainer {
+                generation: "container-id:off-runtime".into(),
+                runtime: "docker".into(),
+                immutable_container_id: immutable_id,
+                ownership_labels_digest: ownership.digest().clone(),
+            },
+            "a2a-rw-inst-0",
+            ownership,
+            attempt,
+            probe,
+            subordinate,
+        )
+        .unwrap();
+        ReapOwner {
+            generation: 0,
+            authority: Arc::new(SpawnAuthority {
+                state: StdMutex::new(SpawnAuthorityState::Bound(Box::new(controller))),
+                notify: tokio::sync::Notify::new(),
+            }),
+            dispatch_gate: Arc::new(Mutex::new(())),
+        }
+    }
     async fn wait_for_reaps(reaps: &AtomicUsize, expected: usize) {
         tokio::time::timeout(Duration::from_secs(1), async {
             while reaps.load(Ordering::SeqCst) < expected {
@@ -2117,6 +2639,7 @@ mod tests {
             watchdog: None,
             handshake_timeout: Duration::from_secs(30),
             cancel_grace: Duration::from_secs(5),
+            resource_flight_attempt_v3: None,
             run: RunHandle {
                 instance_id: "run0".into(),
                 host: "h".into(),
@@ -2146,13 +2669,54 @@ mod tests {
             .unwrap()
     }
 
+    fn managed_factory(attempt: ReapAttemptFn) -> ReapFactory {
+        Arc::new(move |identity, selector, ownership, subordinate, durable| {
+            let expected_id = match &identity {
+                ResourceIdentityV1::ManagedContainer {
+                    immutable_container_id,
+                    ..
+                } => immutable_container_id.clone(),
+                _ => return Err(ReapFailure::IdentityUnavailable),
+            };
+            let labels = ownership.ordered().to_vec();
+            let probe: ContainerIdentityProbeFn = Arc::new(move |_runtime, _selector| {
+                let immutable_container_id = expected_id.clone();
+                let ownership_labels = labels.clone();
+                Box::pin(async move {
+                    Ok(ContainerRuntimeIdentityV1 {
+                        immutable_container_id,
+                        ownership_labels,
+                    })
+                })
+            });
+            match durable {
+                Some(durable) => ReapController::managed_durable_v3(
+                    identity,
+                    selector,
+                    ownership,
+                    Arc::clone(&attempt),
+                    probe,
+                    subordinate,
+                    durable,
+                ),
+                None => ReapController::managed_legacy_v2(
+                    identity,
+                    selector,
+                    ownership,
+                    Arc::clone(&attempt),
+                    probe,
+                    subordinate,
+                ),
+            }
+        })
+    }
+
     async fn warm_backend_with_attempt(
         mount: &str,
         spawn: Arc<dyn ContainerSpawn>,
         attempt: ReapAttemptFn,
     ) -> ContainerRwBackend {
-        let factory: ReapFactory =
-            Arc::new(move |runtime, name| ReapController::new(runtime, name, Arc::clone(&attempt)));
+        let factory = managed_factory(attempt);
         let mut backend = ContainerRwBackend::new_with_reap_factory(
             cfg_with_mount(mount),
             spawn,
@@ -2170,8 +2734,7 @@ mod tests {
         spawn: Arc<dyn ContainerSpawn>,
         attempt: ReapAttemptFn,
     ) -> ContainerRwBackend {
-        let factory: ReapFactory =
-            Arc::new(move |runtime, name| ReapController::new(runtime, name, Arc::clone(&attempt)));
+        let factory = managed_factory(attempt);
         ContainerRwBackend::new_with_reap_factory(
             cfg_with_mount(mount),
             spawn,
@@ -2208,6 +2771,165 @@ mod tests {
     }
 
     // ---- tests -------------------------------------------------------------
+
+    #[tokio::test]
+    async fn extra_noncanonical_spawn_ownership_evidence_is_tolerated() {
+        let mount = tempfile::tempdir().unwrap();
+        let spawn = CountingSpawn::new(false);
+        spawn.extra_ownership_label.store(true, Ordering::SeqCst);
+        let (reap, reaps) = counting_reap();
+        let backend = backend(mount.path().to_str().unwrap(), spawn.clone(), reap).await;
+        let session = SessionId::parse("extra-spawn-label").unwrap();
+        backend
+            .configure_session(&session, &spec_cwd(mount.path().to_str().unwrap()))
+            .await
+            .unwrap();
+        let mut stream = backend.prompt(&session, vec![]).await.unwrap();
+        while stream.next().await.is_some() {}
+        assert_eq!(
+            backend.release_session_checked(&session).await.unwrap(),
+            BackendCleanupDispositionV1::Complete
+        );
+        assert_eq!(reaps.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn canonical_ownership_mismatch_refuses_spawn_without_removal() {
+        let mount = tempfile::tempdir().unwrap();
+        let spawn = CountingSpawn::new(false);
+        spawn
+            .mismatched_ownership_label
+            .store(true, Ordering::SeqCst);
+        let (reap, reaps) = counting_reap();
+        let backend = backend(mount.path().to_str().unwrap(), spawn.clone(), reap).await;
+        let session = SessionId::parse("mismatched-spawn-label").unwrap();
+        backend
+            .configure_session(&session, &spec_cwd(mount.path().to_str().unwrap()))
+            .await
+            .unwrap();
+        assert!(matches!(
+            prompt_err(&backend, &session).await,
+            BridgeError::IdentityUnavailable
+        ));
+        let owner = backend.current_reap_owner(&session).unwrap();
+        assert_eq!(
+            owner.reap_observed().await,
+            Ok(BackendCleanupDispositionV1::Unknown)
+        );
+        assert_eq!(reaps.load(Ordering::SeqCst), 0);
+        let inner = spawn.last_inner.lock().await.clone().unwrap();
+        assert!(!inner.canceled.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn container_decorator_exposes_legacy_v2_until_attempt_route_is_supplied() {
+        let (reap, _) = counting_reap();
+        let backend = backend("/root", CountingSpawn::new(false), reap).await;
+        let session = SessionId::parse("legacy-exposure").unwrap();
+        assert_eq!(
+            backend.resource_flight_v1().unwrap(),
+            BackendResourceFlightV1::LegacyV2
+        );
+        assert_eq!(
+            backend.attach_resource_flight_owner_v1(&session).unwrap(),
+            BackendResourceFlightV1::LegacyV2
+        );
+    }
+
+    #[tokio::test]
+    async fn protected_container_exposes_real_generation_and_retains_identity_refusal() {
+        let mount = tempfile::tempdir().unwrap();
+        let journal_root = tempfile::tempdir().unwrap();
+        let journal = Arc::new(
+            bridge_core::retained_resource_flight::FileResourceFlightJournal::open(
+                journal_root.path(),
+                512,
+            )
+            .unwrap(),
+        );
+        let route = Arc::new(DurableProcessFlightAttemptV3::new(
+            bridge_core::ids::AttemptId::mint().unwrap(),
+            journal,
+        ));
+        let mut cfg = cfg_with_mount(mount.path().to_str().unwrap());
+        cfg.resource_flight_attempt_v3 = Some(route);
+
+        let removal_calls = Arc::new(AtomicUsize::new(0));
+        let factory: ReapFactory = {
+            let removal_calls = Arc::clone(&removal_calls);
+            Arc::new(move |identity, selector, ownership, subordinate, durable| {
+                let attempt: ReapAttemptFn = {
+                    let removal_calls = Arc::clone(&removal_calls);
+                    Arc::new(move |_runtime, _immutable_id| {
+                        let removal_calls = Arc::clone(&removal_calls);
+                        Box::pin(async move {
+                            removal_calls.fetch_add(1, Ordering::SeqCst);
+                            Ok(())
+                        })
+                    })
+                };
+                let labels = ownership.ordered().to_vec();
+                let expected_selector = selector.clone();
+                let probe: ContainerIdentityProbeFn =
+                    Arc::new(move |_runtime, observed_selector| {
+                        let labels = labels.clone();
+                        let expected_selector = expected_selector.clone();
+                        Box::pin(async move {
+                            assert_eq!(observed_selector, expected_selector);
+                            Ok(ContainerRuntimeIdentityV1 {
+                                immutable_container_id: "same-name-successor-id".into(),
+                                ownership_labels: labels,
+                            })
+                        })
+                    });
+                ReapController::managed_durable_v3(
+                    identity,
+                    selector,
+                    ownership,
+                    attempt,
+                    probe,
+                    subordinate,
+                    durable.expect("protected config supplies the container route"),
+                )
+            })
+        };
+        let backend = ContainerRwBackend::new_with_reap_factory(
+            cfg,
+            CountingSpawn::new(false),
+            "inst".into(),
+            factory,
+        )
+        .await
+        .unwrap();
+        let session = SessionId::parse("protected-exposure").unwrap();
+        assert_eq!(
+            backend.resource_flight_v1().unwrap(),
+            BackendResourceFlightV1::ProtectedV3
+        );
+        // Before spawn there is no generation to attach; the route is exposed
+        // without inventing a capability from a future container name.
+        assert_eq!(
+            backend.attach_resource_flight_owner_v1(&session).unwrap(),
+            BackendResourceFlightV1::ProtectedV3
+        );
+        backend
+            .configure_session(&session, &spec_cwd(mount.path().to_str().unwrap()))
+            .await
+            .unwrap();
+        let stream = backend.prompt(&session, vec![]).await.unwrap();
+        assert_eq!(
+            backend.attach_resource_flight_owner_v1(&session).unwrap(),
+            BackendResourceFlightV1::ProtectedV3,
+            "the decorator attaches to the published immutable-ID generation"
+        );
+        assert_eq!(
+            backend.release_session_checked(&session).await.unwrap(),
+            BackendCleanupDispositionV1::Retained,
+            "a leaked outer container must remain observable through the decorator"
+        );
+        drop(stream);
+        assert_eq!(removal_calls.load(Ordering::SeqCst), 0);
+    }
 
     #[tokio::test]
     async fn configure_then_forget_clears_stash() {
@@ -2520,7 +3242,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn prompt_spawn_failure_reaps_and_errors() {
+    async fn prompt_spawn_failure_refuses_pre_id_removal_and_errors() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().to_str().unwrap();
         let (reap, reaps) = counting_reap();
@@ -2536,8 +3258,16 @@ mod tests {
         for keyword in ["docker", "image", "network", "mount", "credential"] {
             assert!(reason.contains(keyword));
         }
-        wait_for_reaps(&reaps, 1).await;
-        assert_eq!(reaps.load(Ordering::SeqCst), 1, "spawn failure MUST reap");
+        let owner = be.current_reap_owner(&s).unwrap();
+        assert_eq!(
+            owner.reap_observed().await,
+            Ok(BackendCleanupDispositionV1::Unknown)
+        );
+        assert_eq!(
+            reaps.load(Ordering::SeqCst),
+            0,
+            "spawn failure has no immutable ID and MUST NOT remove by name"
+        );
         assert!(be.inflight.lock().await.is_empty(), "reservation removed");
         assert!(
             !be.pending_turn_meta.lock().await.contains_key(&s),
@@ -2580,7 +3310,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn launch_failure_is_preserved_without_keyword_promotion_and_still_reaped() {
+    async fn launch_failure_is_preserved_without_keyword_promotion_or_name_reap() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().to_str().unwrap();
         let spawn = CountingSpawn::new(true);
@@ -2597,43 +3327,41 @@ mod tests {
         };
         assert_eq!(reason, "boom docker image network mount credential");
         assert_eq!(spawn.count.load(Ordering::SeqCst), 1);
-        wait_for_reaps(&reaps, 1).await;
+        let owner = be.current_reap_owner(&session).unwrap();
+        assert_eq!(
+            owner.reap_observed().await,
+            Ok(BackendCleanupDispositionV1::Unknown)
+        );
+        assert_eq!(reaps.load(Ordering::SeqCst), 0);
         assert!(be.inflight.lock().await.is_empty());
     }
 
     #[tokio::test]
-    async fn cold_generation_cannot_replace_unacknowledged_cleanup_owner() {
+    async fn cold_failed_spawn_is_joinable_but_next_prompt_retries_once() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().to_str().unwrap();
         let spawn = CountingSpawn::new(true);
         let (reap, _) = counting_reap();
         let be = backend(root, spawn.clone(), reap).await;
-        let session = SessionId::parse("cold-generation-owner").unwrap();
+        let session = SessionId::parse("cold-never-published-retry").unwrap();
         be.configure_session(&session, &spec_cwd(root))
             .await
             .unwrap();
 
         assert!(be.prompt(&session, vec![]).await.is_err());
         assert_eq!(spawn.count.load(Ordering::SeqCst), 1);
-
-        let second = prompt_err(&be, &session).await;
-        assert!(
-            format!("{second:?}").contains("cleanup is still owned"),
-            "unexpected second-generation rejection: {second:?}"
+        let first_owner = be.current_reap_owner(&session).unwrap();
+        assert_eq!(
+            first_owner.reap_observed().await,
+            Ok(BackendCleanupDispositionV1::Unknown)
         );
+
+        assert!(be.prompt(&session, vec![]).await.is_err());
         assert_eq!(
             spawn.count.load(Ordering::SeqCst),
-            1,
-            "a retained cleanup owner must fence the next spawn"
+            2,
+            "the sequential prompt must perform one fresh spawn attempt"
         );
-
-        be.release_session_checked(&session).await.unwrap();
-        be.configure_session(&session, &spec_cwd(root))
-            .await
-            .unwrap();
-        let third = prompt_err(&be, &session).await;
-        assert!(format!("{third:?}").contains("boom"));
-        assert_eq!(spawn.count.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]
@@ -2720,7 +3448,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cold_cancel_during_spawn_reaps_reserved_generation_before_dispatch() {
+    async fn cold_cancel_during_spawn_refuses_pre_id_generation() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().to_str().unwrap();
         let spawn_entered = Arc::new(tokio::sync::Notify::new());
@@ -2744,21 +3472,29 @@ mod tests {
             tokio::spawn(async move { backend.prompt(&session, vec![]).await })
         };
         spawn_entered.notified().await;
-        backend.cancel(&session).await.unwrap();
+        let owner = backend.current_reap_owner(&session).unwrap();
+        assert_eq!(
+            backend.cancel(&session).await.unwrap_err(),
+            BridgeError::DurableEvidenceUnavailable {
+                reason: "container cleanup unknown"
+            }
+        );
+        assert_eq!(
+            owner.reap_observed().await,
+            Ok(BackendCleanupDispositionV1::Unknown)
+        );
         spawn_release.notify_one();
 
-        let result = prompt.await.unwrap();
-        assert!(matches!(result, Err(BridgeError::SessionExpired)));
-        wait_for_reaps(&reaps, 1).await;
-        assert_eq!(reaps.load(Ordering::SeqCst), 1);
+        assert!(prompt.await.unwrap().is_err());
+        assert_eq!(reaps.load(Ordering::SeqCst), 0);
         let inner = spawn.last_inner.lock().await.clone().unwrap();
         assert_eq!(inner.prompts.load(Ordering::SeqCst), 0);
-        assert!(inner.canceled.load(Ordering::SeqCst));
+        assert!(!inner.canceled.load(Ordering::SeqCst));
         assert!(!backend.inflight.lock().await.contains_key(&session));
     }
 
     #[tokio::test]
-    async fn cold_retire_during_spawn_reaps_reserved_generation_before_dispatch() {
+    async fn cold_retire_during_spawn_refuses_pre_id_generation() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().to_str().unwrap();
         let spawn_entered = Arc::new(tokio::sync::Notify::new());
@@ -2782,16 +3518,24 @@ mod tests {
             tokio::spawn(async move { backend.prompt(&session, vec![]).await })
         };
         spawn_entered.notified().await;
-        backend.retire().await.unwrap();
+        let owner = backend.current_reap_owner(&session).unwrap();
+        assert_eq!(
+            backend.retire().await.unwrap_err(),
+            BridgeError::DurableEvidenceUnavailable {
+                reason: "container cleanup unknown"
+            }
+        );
+        assert_eq!(
+            owner.reap_observed().await,
+            Ok(BackendCleanupDispositionV1::Unknown)
+        );
         spawn_release.notify_one();
 
-        let result = prompt.await.unwrap();
-        assert!(matches!(result, Err(BridgeError::SessionExpired)));
-        wait_for_reaps(&reaps, 1).await;
-        assert_eq!(reaps.load(Ordering::SeqCst), 1);
+        assert!(prompt.await.unwrap().is_err());
+        assert_eq!(reaps.load(Ordering::SeqCst), 0);
         let inner = spawn.last_inner.lock().await.clone().unwrap();
         assert_eq!(inner.prompts.load(Ordering::SeqCst), 0);
-        assert!(inner.canceled.load(Ordering::SeqCst));
+        assert!(!inner.canceled.load(Ordering::SeqCst));
     }
 
     #[tokio::test]
@@ -2936,7 +3680,7 @@ mod tests {
         assert_teardown_waits_for_inner_prompt_dispatch(true, TeardownAction::ReleaseChecked).await;
     }
 
-    async fn assert_reap_waits_until_spawn_can_no_longer_create_resource(
+    async fn assert_pre_id_teardown_refuses_unknown_without_removal(
         warm: bool,
         action: TeardownAction,
     ) {
@@ -2995,53 +3739,65 @@ mod tests {
         };
         spawn_entered.notified().await;
         let owner = backend.current_reap_owner(&session).unwrap();
-        match action {
-            TeardownAction::Cancel => backend.cancel(&session).await.unwrap(),
-            TeardownAction::ReleaseChecked => backend
-                .release_session_checked(&session)
-                .await
-                .map(|_| ())
-                .unwrap(),
-            TeardownAction::Retire => backend.retire().await.unwrap(),
-        }
+        let teardown = {
+            let backend = Arc::clone(&backend);
+            let session = session.clone();
+            tokio::spawn(async move {
+                match action {
+                    TeardownAction::Cancel => backend.cancel(&session).await,
+                    TeardownAction::ReleaseChecked => {
+                        backend.release_session_checked(&session).await.map(|_| ())
+                    }
+                    TeardownAction::Retire => backend.retire().await,
+                }
+            })
+        };
 
+        tokio::time::timeout(Duration::from_secs(1), teardown)
+            .await
+            .expect("pre-ID teardown settles without waiting for spawn")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            owner.reap_observed().await,
+            Ok(BackendCleanupDispositionV1::Unknown)
+        );
+        assert_eq!(reap_calls.load(Ordering::SeqCst), 0);
         assert!(
             tokio::time::timeout(Duration::from_millis(50), reap_entered.notified())
                 .await
                 .is_err(),
-            "the one-shot removal ran before spawn could no longer create the resource"
+            "pre-ID refusal must never dispatch the removal port"
         );
+
         spawn_release.notify_one();
-        assert!(matches!(
-            prompt.await.unwrap(),
-            Err(BridgeError::SessionExpired)
-        ));
-        assert_eq!(
-            tokio::time::timeout(Duration::from_secs(1), owner.reap.reap_observed())
-                .await
-                .expect("post-spawn cleanup must settle"),
-            Ok(())
-        );
-        assert_eq!(reap_calls.load(Ordering::SeqCst), 1);
-        assert!(!resource_exists.load(Ordering::SeqCst));
+        assert!(prompt.await.unwrap().is_err());
+        assert_eq!(reap_calls.load(Ordering::SeqCst), 0);
+        assert!(resource_exists.load(Ordering::SeqCst));
         let inner = spawn.last_inner.lock().await.clone().unwrap();
-        assert!(inner.canceled.load(Ordering::SeqCst));
+        assert!(!inner.canceled.load(Ordering::SeqCst));
     }
 
     #[tokio::test]
-    async fn cold_cancel_cannot_consume_reap_before_late_spawn_creates_resource() {
-        assert_reap_waits_until_spawn_can_no_longer_create_resource(false, TeardownAction::Cancel)
-            .await;
+    async fn cold_checked_release_in_pre_id_window_refuses_unknown_without_removal() {
+        assert_pre_id_teardown_refuses_unknown_without_removal(
+            false,
+            TeardownAction::ReleaseChecked,
+        )
+        .await;
     }
 
     #[tokio::test]
-    async fn warm_retire_cannot_consume_reap_before_late_spawn_creates_resource() {
-        assert_reap_waits_until_spawn_can_no_longer_create_resource(true, TeardownAction::Retire)
-            .await;
+    async fn warm_checked_release_in_pre_id_window_refuses_unknown_without_removal() {
+        assert_pre_id_teardown_refuses_unknown_without_removal(
+            true,
+            TeardownAction::ReleaseChecked,
+        )
+        .await;
     }
 
     #[tokio::test]
-    async fn aborting_spawn_future_opens_settlement_fence_for_owned_cleanup() {
+    async fn aborting_spawn_future_refuses_pre_id_cleanup_as_unknown() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().to_str().unwrap();
         let spawn_entered = Arc::new(tokio::sync::Notify::new());
@@ -3083,20 +3839,23 @@ mod tests {
         };
         spawn_entered.notified().await;
         let owner = backend.current_reap_owner(&session).unwrap();
-        backend.cancel(&session).await.unwrap();
         prompt.abort();
         match prompt.await {
             Err(error) => assert!(error.is_cancelled()),
             Ok(_) => panic!("aborted spawn prompt unexpectedly completed"),
         }
 
+        match backend.cancel(&session).await {
+            Err(BridgeError::DurableEvidenceUnavailable { .. }) => {}
+            other => panic!("pre-ID cancel must refuse with typed unknown evidence, got {other:?}"),
+        }
         assert_eq!(
             tokio::time::timeout(Duration::from_secs(1), owner.reap_observed())
                 .await
                 .expect("aborting spawn must open the cleanup settlement fence"),
-            Err(ReapFailure::NonZeroExit)
+            Ok(BackendCleanupDispositionV1::Unknown)
         );
-        assert_eq!(reap_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(reap_calls.load(Ordering::SeqCst), 0);
         assert!(!resource_exists.load(Ordering::SeqCst));
     }
 
@@ -3304,15 +4063,8 @@ mod tests {
         // Drop firing OUTSIDE a tokio runtime must not panic (process-shutdown path).
         let (reap, reaps) = counting_reap();
         let inflight: Inflight = Arc::new(Mutex::new(HashMap::new()));
-        let spawn_settlement = Arc::new(SpawnSettlement::pending());
-        spawn_settlement.settle();
         let reaper = ContainerReaper {
-            owner: ReapOwner {
-                generation: 0,
-                reap: ReapController::from_legacy("docker", "a2a-rw-inst-0", reap),
-                spawn_settlement,
-                dispatch_gate: Arc::new(Mutex::new(())),
-            },
+            owner: bound_test_owner(reap),
             inflight,
             session: SessionId::parse("s1").unwrap(),
         };
@@ -3635,7 +4387,13 @@ mod tests {
             .unwrap();
         let mut stream = backend.prompt(&session, vec![]).await.unwrap();
         while stream.next().await.is_some() {}
-        let controller = backend.current_reap_owner(&session).unwrap().reap;
+        let controller = backend
+            .current_reap_owner(&session)
+            .unwrap()
+            .authority
+            .controller()
+            .await
+            .unwrap();
 
         let inflight_guard = backend.inflight.lock().await;
         let release = {
@@ -3675,7 +4433,13 @@ mod tests {
             .await
             .unwrap();
         let stream = backend.prompt(&session, vec![]).await.unwrap();
-        let controller = backend.current_reap_owner(&session).unwrap().reap;
+        let controller = backend
+            .current_reap_owner(&session)
+            .unwrap()
+            .authority
+            .controller()
+            .await
+            .unwrap();
 
         let inflight_guard = backend.inflight.lock().await;
         let release = {
@@ -3695,7 +4459,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn observed_cold_release_joins_reap_after_agent_spawn_failure() {
+    async fn observed_cold_release_reports_unknown_after_agent_spawn_failure() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().to_str().unwrap();
         let calls = Arc::new(AtomicUsize::new(0));
@@ -3715,25 +4479,26 @@ mod tests {
 
         assert!(be.prompt(&session, vec![]).await.is_err());
         let observer = Arc::new(InMemoryDiagnosticObserver::new(8).unwrap());
-        let error = be
-            .release_session_observed(&session, observer.clone())
-            .await
-            .expect_err("observed cleanup must join the failed detached reap");
-        let BridgeError::AgentFailure { diagnostic } = error else {
-            panic!("typed reap failure must be structured");
-        };
         assert_eq!(
-            diagnostic.class(),
-            bridge_core::diagnostics::DiagnosticFailureClass::ContainerRuntime
+            be.release_session_observed(&session, observer.clone())
+                .await
+                .unwrap(),
+            BackendCleanupDispositionV1::Unknown
         );
-        assert_eq!(diagnostic.code().as_str(), ReapFailure::Spawn.code());
-        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
         let events = observer.snapshot().await;
         assert_eq!(events.len(), 2);
         assert_eq!(events[0].transition().status(), PhaseStatus::Started);
-        assert_eq!(events[1].transition().status(), PhaseStatus::Failed);
-        assert!(be.release_session_checked(&session).await.is_err());
-        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(events[1].transition().status(), PhaseStatus::Completed);
+        assert_eq!(
+            events[1].transition().code().map(|code| code.as_str()),
+            Some("container.teardown.unknown")
+        );
+        assert_eq!(
+            be.release_session_checked(&session).await.unwrap(),
+            BackendCleanupDispositionV1::Unknown
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
@@ -3940,8 +4705,16 @@ mod tests {
         let mut stream = be.prompt(&session, vec![]).await.unwrap();
         while stream.next().await.is_some() {}
 
-        be.retire().await.unwrap();
-        entered.notified().await;
+        // retire() joins every generation's reap flight before returning, so it
+        // must run concurrently with the gated attempt: awaiting it inline would
+        // deadlock against the attempt's release gate.
+        let retire_task = {
+            let be = Arc::clone(&be);
+            tokio::spawn(async move { be.retire().await })
+        };
+        tokio::time::timeout(Duration::from_secs(30), entered.notified())
+            .await
+            .expect("retirement must enter the gated reap attempt");
         let observer = Arc::new(InMemoryDiagnosticObserver::new(8).unwrap());
         let observer_dyn: Arc<dyn DiagnosticObserver> = observer.clone();
         let weak = Arc::downgrade(&observer_dyn);
@@ -3951,9 +4724,22 @@ mod tests {
             tokio::spawn(async move { be.release_session_observed(&session, observer_dyn).await })
         };
         tokio::task::yield_now().await;
+        assert!(
+            !release_task.is_finished(),
+            "observed release must join the still-running retained reap"
+        );
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         release.notify_waiters();
-        release_task.await.unwrap().unwrap();
+        tokio::time::timeout(Duration::from_secs(30), release_task)
+            .await
+            .expect("observed release must settle once the gated reap attempt completes")
+            .unwrap()
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(30), retire_task)
+            .await
+            .expect("retire must settle once the gated reap attempt completes")
+            .unwrap()
+            .unwrap();
         drop(observer);
         assert!(
             weak.upgrade().is_none(),
@@ -3983,7 +4769,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn warm_cancel_during_cache_miss_reaps_reserved_generation_before_dispatch() {
+    async fn warm_cancel_during_cache_miss_refuses_pre_id_generation() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().to_str().unwrap();
         let spawn_entered = Arc::new(tokio::sync::Notify::new());
@@ -4007,23 +4793,29 @@ mod tests {
             tokio::spawn(async move { backend.prompt(&session, vec![]).await })
         };
         spawn_entered.notified().await;
-        backend.cancel(&session).await.unwrap();
+        let owner = backend.current_reap_owner(&session).unwrap();
+        assert_eq!(
+            backend.cancel(&session).await.unwrap_err(),
+            BridgeError::DurableEvidenceUnavailable {
+                reason: "container cleanup unknown"
+            }
+        );
+        assert_eq!(
+            owner.reap_observed().await,
+            Ok(BackendCleanupDispositionV1::Unknown)
+        );
         spawn_release.notify_one();
 
-        assert!(matches!(
-            prompt.await.unwrap(),
-            Err(BridgeError::SessionExpired)
-        ));
-        wait_for_reaps(&reaps, 1).await;
-        assert_eq!(reaps.load(Ordering::SeqCst), 1);
+        assert!(prompt.await.unwrap().is_err());
+        assert_eq!(reaps.load(Ordering::SeqCst), 0);
         assert!(!backend.warm.lock().await.contains_key(&session));
         let inner = spawn.last_inner.lock().await.clone().unwrap();
         assert_eq!(inner.prompts.load(Ordering::SeqCst), 0);
-        assert!(inner.canceled.load(Ordering::SeqCst));
+        assert!(!inner.canceled.load(Ordering::SeqCst));
     }
 
     #[tokio::test]
-    async fn warm_retire_during_cache_miss_reaps_reserved_generation_before_dispatch() {
+    async fn warm_retire_during_cache_miss_refuses_pre_id_generation() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().to_str().unwrap();
         let spawn_entered = Arc::new(tokio::sync::Notify::new());
@@ -4047,19 +4839,25 @@ mod tests {
             tokio::spawn(async move { backend.prompt(&session, vec![]).await })
         };
         spawn_entered.notified().await;
-        backend.retire().await.unwrap();
+        let owner = backend.current_reap_owner(&session).unwrap();
+        assert_eq!(
+            backend.retire().await.unwrap_err(),
+            BridgeError::DurableEvidenceUnavailable {
+                reason: "container cleanup unknown"
+            }
+        );
+        assert_eq!(
+            owner.reap_observed().await,
+            Ok(BackendCleanupDispositionV1::Unknown)
+        );
         spawn_release.notify_one();
 
-        assert!(matches!(
-            prompt.await.unwrap(),
-            Err(BridgeError::SessionExpired)
-        ));
-        wait_for_reaps(&reaps, 1).await;
-        assert_eq!(reaps.load(Ordering::SeqCst), 1);
+        assert!(prompt.await.unwrap().is_err());
+        assert_eq!(reaps.load(Ordering::SeqCst), 0);
         assert!(!backend.warm.lock().await.contains_key(&session));
         let inner = spawn.last_inner.lock().await.clone().unwrap();
         assert_eq!(inner.prompts.load(Ordering::SeqCst), 0);
-        assert!(inner.canceled.load(Ordering::SeqCst));
+        assert!(!inner.canceled.load(Ordering::SeqCst));
     }
 
     #[tokio::test]
@@ -4104,11 +4902,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn warm_edit_turn_open_failure_reaps_and_clears() {
+    async fn warm_edit_turn_open_failure_refuses_name_removal_and_clears() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().to_str().unwrap();
         let (reap, reaps) = counting_reap();
-        let be = warm_backend(root, CountingSpawn::new(true), reap).await; // spawn fails (cache-miss open)
+        let be = warm_backend(root, CountingSpawn::new(true), reap).await; // spawn fails before ID capture
         let s = SessionId::parse("implement-x").unwrap();
         be.configure_session(&s, &spec_cwd(root)).await.unwrap();
         be.configure_turn(
@@ -4118,11 +4916,15 @@ mod tests {
         .await;
         let err = prompt_err(&be, &s).await;
         assert!(format!("{err:?}").contains("boom"), "got {err:?}");
-        wait_for_reaps(&reaps, 1).await;
+        let owner = be.current_reap_owner(&s).unwrap();
+        assert_eq!(
+            owner.reap_observed().await,
+            Ok(BackendCleanupDispositionV1::Unknown)
+        );
         assert_eq!(
             reaps.load(Ordering::SeqCst),
-            1,
-            "cache-miss spawn failure reaps the just-started container"
+            0,
+            "cache-miss spawn failure has no immutable ID and MUST NOT remove by name"
         );
         assert!(
             be.warm.lock().await.is_empty(),

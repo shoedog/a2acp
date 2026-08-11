@@ -484,6 +484,7 @@ const PERMISSION_VIEW_CAP: usize = 4096;
 enum ContainerStartFailure {
     TimedOut,
     ProcessExited,
+    IdentityUnavailable,
 }
 
 impl ContainerStartFailure {
@@ -491,6 +492,7 @@ impl ContainerStartFailure {
         match self {
             Self::TimedOut => "container.runtime.start_timeout",
             Self::ProcessExited => "container.runtime.start_failed",
+            Self::IdentityUnavailable => "container.runtime.identity_unavailable",
         }
     }
 
@@ -499,6 +501,9 @@ impl ContainerStartFailure {
             Self::TimedOut => "Container runtime did not start the ACP agent container in time",
             Self::ProcessExited => {
                 "Container runtime left the ACP agent container unstarted when its client exited"
+            }
+            Self::IdentityUnavailable => {
+                "Container runtime identity could not be captured at the start boundary"
             }
         }
     }
@@ -2191,8 +2196,20 @@ async fn await_container_start(
             state = controller.probe_start_state() => state,
         };
         match state {
-            ContainerStartState::NotStarted => saw_not_started = true,
-            ContainerStartState::Started => return Ok(()),
+            ContainerStartState::NotStarted => {
+                saw_not_started = true;
+                controller
+                    .capture_production_identity()
+                    .await
+                    .map_err(|_| ContainerStartFailure::IdentityUnavailable)?;
+            }
+            ContainerStartState::Started => {
+                controller
+                    .capture_production_identity()
+                    .await
+                    .map_err(|_| ContainerStartFailure::IdentityUnavailable)?;
+                return Ok(());
+            }
             ContainerStartState::Unknown => {}
         }
 
