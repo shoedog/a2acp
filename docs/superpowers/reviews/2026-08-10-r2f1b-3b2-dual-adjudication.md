@@ -60,3 +60,34 @@ If the round's review surfaces open-class findings, park and escalate per steeri
 V3 remains route-unarmed; arming stays slice 4. The internal-reviewer auth-timeout
 degradation is a pipeline item, not an artifact item; recurrence at the repair round
 triggers the reviewer-auth investigation.
+
+## Repair round outcome (addendum, 2026-08-10 evening)
+
+Repair CONVERGED attempt 1 once dispatchable: commit `6d7cb518` (clone
+`impl-15966-0rn0psiy`, +236/−15 across exactly the six mandated files + handoff
+append §9); container verify PASS; internal review APPROVE (reviewer ran — see
+pipeline note below). Operator verification at source: R1 both stores widened to
+`complete|retained|preserved|unknown|failed` with `pending` still Schema-rejected;
+R2 typed sibling projection with error-push preserved; R3 comment form pinning the
+load-bearing re-read at both attachment sites; R4 static-field warns inside the
+funnel, call-site control flow unchanged. **Red-first proven by operator control**:
+with only `workflow_history.rs`/`sqlite.rs` reverted to `90359127`, the new
+`detached_retained_cleanup_settles_durably_in_both_stores` FAILS (0 passed /
+1 failed); implementer's own archive-based red proof (all three tests, both store
+names in each failure) corroborated. Darwin fold gates on the repaired tree: all
+six stages exit 0, workspace **3,935/0/12 across 90**.
+
+PIPELINE INCIDENT (root-caused, not artifact-related): five consecutive dispatch
+attempts died pre-edit — in-container codex-acp 1.1.7 answered
+`authenticate(chat-gpt)` with `Internal error: spawn xdg-open ENOENT` (browser-
+login fallback in a headless container), visible only at `RUST_LOG=debug`.
+Mechanism: single-use refresh-token rotation — the base run's three container
+attempts rotated the `a2a-creds` copy's token family, transitively invalidating
+the host file's refresh token; access-token holders kept working (sol/max review,
+`codex exec` control) while refresh-needing paths died at Authenticate — this also
+retro-explains the base run's internal-reviewer Authenticate timeouts ×3. Remedy:
+owner minted a fresh interactive `codex login` and reseeded the copy; next
+dispatch converged immediately. LEDGERED: dedicated login session for the
+`a2a-creds` copy (kiro device-flow-into-volume pattern); surface agent
+`AgentFailure` detail at default verbosity ("workflow did not complete" is
+evidence-free); stranded clean clones ×5 are reaper-eligible.
