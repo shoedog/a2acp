@@ -305,6 +305,30 @@ Post-adjudication repair and host gates passed:
 The current base-to-tree implementation plus this handoff is 3,042 insertions
 and 126 deletions across twelve files. The reviewed artifact stayed below its
 2,250-line stop threshold and the targeted repair met its separately declared
-800-net-line cap. A repaired-tail review, fold, and CI remain pending. No
-provider, smoke, compatibility case, deployment, or running operator was
-invoked.
+800-net-line cap.
+
+## Repaired-tail review and park
+
+One declared Sol/xhigh repaired-tail review completed read-only against exact
+`772518a8..cecff376`. It returned `VERDICT: REJECT` with eight proposed BLOCKER
+WRONGs. The 16,340-byte terminal artifact has SHA-256
+`6a690d6191f1d2faadcb208b1ddcf03c19525bb1d75d6e188cab554b555ad6e2` and is
+mirrored with the operator adjudication on the planning branch.
+
+Operator source adjudication confirmed the mechanisms: successor admission can
+recover a different live request; checked cleanup collapses active LegacyV2,
+admission-pending, and unobservable-refusal states; drop can erase settlement
+refusal; timeout detaches an unbounded blocking waiter; nonzero pre-intent
+prefixes strand; the 4,097th retained reservation bricks later census; terminal
+CAS can crash before its one required publication; and file-journal root
+authority is path-based across open/replacement races. The review's claim that
+every previously settled non-Complete request must taint later no-active cleanup
+was broader than established, but that refinement collapses none of the live or
+unresolved cleanup failures.
+
+This population is larger than the repaired six-WRONG round and includes new
+admission-serialization, publication-outbox, deadline-aware observation, and
+descriptor-root design. It is open-class at the declared review cap. Per
+convergence discipline, 3c2 is parked for spec/design; no second repair round,
+fold, push, CI, provider, smoke, compatibility case, deployment, or running
+operator action was performed. Production remains unarmed.
