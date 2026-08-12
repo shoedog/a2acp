@@ -227,7 +227,7 @@ between-round test owns pre-send cancellation.
 
 ## Verification
 
-Operator repair checks passed so far:
+Operator repair and host gates passed:
 
 - `cargo fmt --all -- --check` — exit 0.
 - `git diff --check` — exit 0.
@@ -237,9 +237,28 @@ Operator repair checks passed so far:
   0 failed; the request-received barrier proves the in-flight precondition.
 - `cargo test -p bridge-api --locked` — 77 passed, 0 failed, 1 ignored live
   Ollama test across six harnesses.
+- `cargo clippy --workspace --all-targets --all-features --locked -- -D
+  warnings` — exit 0. The first feature run found one change-local
+  `await_holding_lock` in the repaired forget test; exact base passed the same
+  command in the same environment. Scoping the assertion guard before the
+  asynchronous request-count check repaired it, and the feature rerun passed.
+- `cargo test --workspace --locked --quiet` — 3,977 passed, 0 failed, 13
+  ignored across 90 harnesses, with no exclusions. The first sandbox run reached
+  1,055 passed and 31 failed in the 1,086-test binary harness because host port,
+  filesystem, watcher, and related facilities were denied. Exact base
+  reproduced the same 31 named failures and totals in that environment. The
+  unsandboxed host feature run passed the full workspace.
+- `cargo build --workspace --release --locked` — exit 0.
+- `cargo deny check` — exit 0: advisories, bans, licenses, and sources all
+  passed; policy-allowed duplicate-version warnings remain. The sandbox-only
+  advisory-lock refusal reproduced identically on exact base before the host
+  run.
+- `cargo run -p a2a-bridge --locked -- validate --repo-hygiene` — exit 0;
+  40 tracked artifacts and 8 example configs validated.
 - Production remains unarmed: the API constructor assigns
   `api_cfg.resource_flight_route_v3 = None`.
 
-The full host gate round, independent dual-lens review, adjudication, fold, and
-CI remain pending. No provider, smoke, compatibility case, release, deployment,
-or running operator was invoked.
+The current base-to-tree artifact is 2,125 insertions and 55 deletions across
+ten files, below the 2,250-line stop threshold. Independent dual-lens review,
+adjudication, fold, and CI remain pending. No provider, smoke, compatibility
+case, deployment, or running operator was invoked.

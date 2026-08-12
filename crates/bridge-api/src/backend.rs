@@ -2111,12 +2111,14 @@ mod tests {
             .lock()
             .unwrap()
             .contains_key(&session));
-        let aggregations = fixture.publisher.0.lock().unwrap();
-        assert_eq!(aggregations.len(), 1);
-        assert_eq!(
-            aggregations[0].result.disposition,
-            ResourceActionDispositionV1::Partial
-        );
+        {
+            let aggregations = fixture.publisher.0.lock().unwrap();
+            assert_eq!(aggregations.len(), 1);
+            assert_eq!(
+                aggregations[0].result.disposition,
+                ResourceActionDispositionV1::Partial
+            );
+        }
         assert_eq!(server.received_requests().await.unwrap().len(), 1);
     }
 
