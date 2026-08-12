@@ -99,6 +99,15 @@
   `de53676`. Post-merge main CI `31108038309` passed Linux build/lint/all coverage gates plus macOS and Windows;
   its workspace coverage run emitted **69 harnesses / 3,211 passed / 0 failed / 12 ignored**. No automatic deadline
   activation, compatibility run, release, deployment, or running-operator mutation is implied.
+- **R2f1b slice-3 cursor (2026-08-12):** 3s + 3a + 3b1 + 3b2 + 3c1 are folded on green `main` at
+  `42249b3d`. The 3c2 API request-flight artifact reached green deterministic gates at repair commit `cecff376`
+  (**3,980 passed / 0 failed / 13 ignored across 90 harnesses**) but its one capped Sol/xhigh repaired-tail review
+  returned **REJECT / eight BLOCKER WRONGs**. Operator adjudication classifies the population open-class across
+  live-admission recovery, cleanup-result/drop/timeout custody, pre-intent recovery, bounded reservation retirement,
+  durable publication, and descriptor-root identity. 3c2 is **PARKED FOR SPEC/DESIGN**; its preserved feature head
+  `530992b7` must not fold or push, and 3d must not advance as though 3c2 landed. Production API V3 remains unarmed.
+  See the [repaired-tail lens](superpowers/reviews/2026-08-12-r2f1b-3c2-repaired-tail-solxhigh.md) and
+  [operator adjudication](superpowers/reviews/2026-08-12-r2f1b-3c2-repaired-tail-adjudication.md).
 - **R2f0p candidate verification (2026-07-30):** locked full workspace **2,994 passed / 0 failed / 12 ignored**
   across **61** test targets; diff/format, locked all-target/all-feature workspace check, warnings-denied Clippy,
   locked release workspace build, and repository hygiene **38 tracked artifacts / 7 example configs** are green.
