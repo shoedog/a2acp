@@ -44,9 +44,10 @@ route. The implementation changes:
   used elsewhere in the workspace.
 - `bin/a2a-bridge/src/main.rs`: explicit production `None`.
 
-The measured source/manifest diff is 1,812 insertions and 62 deletions across
-eight files. This 222-line handoff brings the task artifact to 2,096 changed
-lines, below the 2,250-line stop threshold.
+The rejected implementation commit changed 2,045 lines (2,045 insertions and
+55 deletions) across ten files including this handoff, below the 2,250-line
+stop threshold. The operator blind-tail repair remains bounded to the request
+scope ownership/compiler population and one deterministic test barrier.
 
 ## Design notes
 
@@ -188,35 +189,57 @@ The stale-round test is mutation-sensitive: removing either identity comparison
 makes A signal or clear B and fails the explicit live-B assertions. Removing the
 turn epoch/preflight makes the between-round test mint/post B. Removing
 conditional clear or request-scoped drop settlement fails the successor/drop
-tests. These mutations were not executed because dependency resolution was
-blocked; the predicates are asserted directly in the deterministic tests.
+tests. These predicates are asserted directly in deterministic tests; a separate
+mutated checkout was not created.
 
 Existing V2 Wiremock coverage continues to own one/two-round success, in-flight
 cancel, later-round fatal error, HTTP/SSE/non-stream failures, forget, and
 successor behavior. No live provider is used by new tests.
 
+## Rejected-run and blind-tail record
+
+The bounded bridge artifact committed `c24f31b9849dc49b6b5b7d2d4dff69c21e5986ef`
+in retained clone `impl-40762-wdpnf5tx`; its exact tree was carried to feature
+commit `0b4a18d1`. The three configured attempts converged but reached the cap:
+
+1. `tempfile` was added without the required `Cargo.lock` edge, so all
+   `--locked` compile gates refused.
+2. The lock was repaired; eight `E0277` async-stream control-flow errors and one
+   private-field test `E0616` remained.
+3. Those were repaired; seven `E0382` errors remained because terminal
+   `RequestScope::settle(self, ...)` calls appeared reusable to the
+   `async_stream` expansion.
+
+The review node failed during `Authenticate` on every attempt and supplied no
+admissible code-review findings. Deterministic compiler evidence independently
+established each rejection.
+
+At the declared cap the defect population was fewer, smaller, and
+non-repeating, so the operator disclosed one blind-tail extension. The repair
+stores each round's `RequestScope` in an `Option`, consumes it through one
+`settle_request_scope` helper, and refuses a second terminalization with
+`InvalidStateTransition`. Changing `settle` to borrow was rejected because it
+would permit duplicate durable terminalization. The initially red forget test
+was a test race: active-slot publication intentionally precedes POST
+installation. It now waits for one received POST before exercising
+`forget_session`, preserving its intended in-flight scenario while the separate
+between-round test owns pre-send cancellation.
+
 ## Verification
 
-Passed locally:
+Operator repair checks passed so far:
 
-- `cargo fmt --all -- --check`
-- `git diff --check`
-- `cargo metadata --no-deps --format-version 1` (85,447-byte metadata output)
-- production-unarmed grep: the API constructor assigns
-  `api_cfg.resource_flight_route_v3 = None`
-- no `bridge-container`, custody, cleanup lattice, history-store, watchdog,
-  auth, deployment, compatibility, or operator files changed
+- `cargo fmt --all -- --check` — exit 0.
+- `git diff --check` — exit 0.
+- `cargo check -p bridge-api --all-targets --locked` — exit 0; the seven
+  `E0382` failures are eliminated.
+- Focused `forget_session_cancels_and_settles_the_exact_request_once` — 1 passed,
+  0 failed; the request-received barrier proves the in-flight precondition.
+- `cargo test -p bridge-api --locked` — 77 passed, 0 failed, 1 ignored live
+  Ollama test across six harnesses.
+- Production remains unarmed: the API constructor assigns
+  `api_cfg.resource_flight_route_v3 = None`.
 
-Blocked environment gates:
-
-- `CARGO_INCREMENTAL=0 cargo check -p bridge-core -p bridge-api -p a2a-bridge`
-  could not download `a2a-lf`; the configured CONNECT proxy returned HTTP 403.
-- The offline retry could not resolve `arc-swap`; the shared Cargo source
-  cache contains neither `arc-swap` nor `a2a-lf`.
-- `CARGO_INCREMENTAL=0 cargo run --offline -p a2a-bridge -- validate
-  --repo-hygiene` stopped in dependency resolution on the same missing
-  `arc-swap` package, before the hygiene binary could execute.
-
-Consequently, zero dependency-backed tests, Clippy targets, release builds, or
-repo-hygiene binaries were executed in this clone. No provider, smoke,
-compatibility case, release, deployment, or running operator was invoked.
+The full host gate round, independent dual-lens review, adjudication, fold, and
+CI remain pending. No provider, smoke, compatibility case, release, deployment,
+or running operator was invoked.
