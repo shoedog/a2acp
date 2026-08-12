@@ -380,6 +380,16 @@ impl Drop for RequestScope {
     }
 }
 
+fn settle_request_scope(
+    scope: &mut Option<RequestScope>,
+    disposition: ResourceActionDispositionV1,
+) -> Result<ResourceActionResultV1, BridgeError> {
+    scope
+        .take()
+        .ok_or(BridgeError::InvalidStateTransition)?
+        .settle(disposition)
+}
+
 enum PreparedRequest {
     Ready {
         scope: RequestScope,
@@ -701,7 +711,7 @@ impl ApiBackend {
             let mut acceptance_barrier_crossed = false;
             for round in 0..max_rounds {
                 let PreparedRequest::Ready {
-                    mut scope,
+                    scope,
                     mut cancel_rx,
                 } = request_admission.prepare(&session, turn_epoch)? else {
                     complete_prompt_lifecycle(&lifecycle).await?;
@@ -711,9 +721,13 @@ impl ApiBackend {
                     };
                     return;
                 };
+                let mut scope = Some(scope);
                 // Durable reservation, owner attachment, identity evidence,
                 // intent, and dispatch all precede installation of the POST future.
-                scope.begin_dispatch()?;
+                scope
+                    .as_mut()
+                    .ok_or(BridgeError::InvalidStateTransition)?
+                    .begin_dispatch()?;
                 let req = ChatRequest { model: model.clone(), messages: messages.clone(),
                     tools: vec![crate::tool::tool_def()], stream: do_stream };
                 let mut builder = client.post(&url).json(&req);
@@ -725,7 +739,7 @@ impl ApiBackend {
                     install_first_send(&lifecycle, || builder.send()).await?
                 };
                 if *cancel_rx.borrow() {
-                    scope.settle(ResourceActionDispositionV1::Partial)?;
+                    settle_request_scope(&mut scope, ResourceActionDispositionV1::Partial)?;
                     complete_prompt_lifecycle(&lifecycle).await?;
                     yield Update::Done {
                         stop_reason: STOP_REASON_CANCELLED.into(),
@@ -746,7 +760,7 @@ impl ApiBackend {
                     }
                 };
                 let Some(send_result) = send_result else {
-                    scope.settle(ResourceActionDispositionV1::Partial)?;
+                    settle_request_scope(&mut scope, ResourceActionDispositionV1::Partial)?;
                     complete_prompt_lifecycle(&lifecycle).await?;
                     yield Update::Done {
                         stop_reason: STOP_REASON_CANCELLED.into(),
@@ -758,7 +772,7 @@ impl ApiBackend {
                     Ok(response) => response,
                     Err(error) => {
                         let (class, code, summary) = request_failure(&error, "api.prompt.send");
-                        scope.settle(ResourceActionDispositionV1::Failed)?;
+                        settle_request_scope(&mut scope, ResourceActionDispositionV1::Failed)?;
                         Err(lifecycle
                             .failure(
                                 class,
@@ -788,7 +802,7 @@ impl ApiBackend {
                         }
                     };
                     let Some(body_result) = body_result else {
-                        scope.settle(ResourceActionDispositionV1::Partial)?;
+                        settle_request_scope(&mut scope, ResourceActionDispositionV1::Partial)?;
                         complete_prompt_lifecycle(&lifecycle).await?;
                         yield Update::Done {
                             stop_reason: STOP_REASON_CANCELLED.into(),
@@ -801,7 +815,7 @@ impl ApiBackend {
                         Err(error) => {
                             let (class, code, summary) =
                                 request_failure(&error, "api.prompt.error_body_read");
-                            scope.settle(ResourceActionDispositionV1::Failed)?;
+                            settle_request_scope(&mut scope, ResourceActionDispositionV1::Failed)?;
                             Err(lifecycle
                                 .failure(
                                     class,
@@ -826,7 +840,7 @@ impl ApiBackend {
                         &headers,
                         diagnostic_timestamp_ms(),
                     );
-                    scope.settle(ResourceActionDispositionV1::Failed)?;
+                    settle_request_scope(&mut scope, ResourceActionDispositionV1::Failed)?;
                     Err(lifecycle
                         .failure(
                             class,
@@ -858,7 +872,10 @@ impl ApiBackend {
                         };
                         let Some(chunk) = chunk else {
                             if *cancel_rx.borrow() {
-                                scope.settle(ResourceActionDispositionV1::Partial)?;
+                                settle_request_scope(
+                                    &mut scope,
+                                    ResourceActionDispositionV1::Partial,
+                                )?;
                                 complete_prompt_lifecycle(&lifecycle).await?;
                                 yield Update::Done {
                                     stop_reason: STOP_REASON_CANCELLED.into(),
@@ -873,7 +890,10 @@ impl ApiBackend {
                             Err(error) => {
                                 let (class, code, summary) =
                                     request_failure(&error, "api.prompt.sse_read");
-                                scope.settle(ResourceActionDispositionV1::Failed)?;
+                                settle_request_scope(
+                                    &mut scope,
+                                    ResourceActionDispositionV1::Failed,
+                                )?;
                                 Err(lifecycle
                                     .failure(
                                         class,
@@ -896,7 +916,10 @@ impl ApiBackend {
                                 }
                                 Ok(None) => {}
                                 Err(_) => {
-                                    scope.settle(ResourceActionDispositionV1::Failed)?;
+                                    settle_request_scope(
+                                        &mut scope,
+                                        ResourceActionDispositionV1::Failed,
+                                    )?;
                                     Err(lifecycle
                                         .failure(
                                             DiagnosticFailureClass::Protocol,
@@ -923,7 +946,10 @@ impl ApiBackend {
                             }
                             Ok(None) => {}
                             Err(_) => {
-                                scope.settle(ResourceActionDispositionV1::Failed)?;
+                                settle_request_scope(
+                                    &mut scope,
+                                    ResourceActionDispositionV1::Failed,
+                                )?;
                                 Err(lifecycle
                                     .failure(
                                         DiagnosticFailureClass::Protocol,
@@ -938,7 +964,7 @@ impl ApiBackend {
                         }
                     }
                     if !acc.is_done() {
-                        scope.settle(ResourceActionDispositionV1::Failed)?;
+                        settle_request_scope(&mut scope, ResourceActionDispositionV1::Failed)?;
                         Err(lifecycle
                             .failure(
                                 DiagnosticFailureClass::Protocol,
@@ -966,7 +992,7 @@ impl ApiBackend {
                         }
                     };
                     let Some(body_result) = body_result else {
-                        scope.settle(ResourceActionDispositionV1::Partial)?;
+                        settle_request_scope(&mut scope, ResourceActionDispositionV1::Partial)?;
                         complete_prompt_lifecycle(&lifecycle).await?;
                         yield Update::Done {
                             stop_reason: STOP_REASON_CANCELLED.into(),
@@ -979,7 +1005,7 @@ impl ApiBackend {
                         Err(error) => {
                             let (class, code, summary) =
                                 request_failure(&error, "api.prompt.body_read");
-                            scope.settle(ResourceActionDispositionV1::Failed)?;
+                            settle_request_scope(&mut scope, ResourceActionDispositionV1::Failed)?;
                             Err(lifecycle
                                 .failure(
                                     class,
@@ -995,7 +1021,7 @@ impl ApiBackend {
                     let p = match crate::wire::parse_nonstream(&body) {
                         Ok(parsed) => parsed,
                         Err(_) => {
-                            scope.settle(ResourceActionDispositionV1::Failed)?;
+                            settle_request_scope(&mut scope, ResourceActionDispositionV1::Failed)?;
                             Err(lifecycle
                                 .failure(
                                     DiagnosticFailureClass::Protocol,
@@ -1014,7 +1040,7 @@ impl ApiBackend {
                     }
                     p
                 };
-                scope.settle(ResourceActionDispositionV1::Complete)?;
+                settle_request_scope(&mut scope, ResourceActionDispositionV1::Complete)?;
                 if parsed.tool_calls.is_empty() {
                     complete_prompt_lifecycle(&lifecycle).await?;
                     yield Update::Done { stop_reason: "stop".into() , prefix_attestation: Default::default()}; return;
@@ -2062,6 +2088,16 @@ mod tests {
             &ActiveRequestIdentity::Dedicated(id),
         )
         .await;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if server.received_requests().await.unwrap().len() == 1 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("provider did not receive the request before forget");
         fixture.backend.forget_session(&session).await;
 
         let updates = task.await.unwrap();
