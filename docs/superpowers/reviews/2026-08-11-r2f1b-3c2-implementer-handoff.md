@@ -30,24 +30,29 @@ route. The implementation changes:
   `DedicatedRemoteRequestIdV1`.
 - `crates/bridge-core/src/retained_resource_flight.rs`: typed request keys,
   exact request owner/identity evidence, lifecycle accounting, strict wire
-  tests, and mismatch/capacity negatives.
+  tests, bounded reservation recovery, and a cross-handle journal lock.
+- `crates/bridge-core/src/liveness.rs`: existing-only persistent-lock
+  acquisition, so an operation cannot recreate a removed journal root.
 - `crates/bridge-core/src/process.rs`: non-cloneable request flight plus
-  attempt-owned request binding using the attempt's existing registry, file
-  journal, clock, and publisher.
+  attempt-owned request binding and pre-admission recovery using the attempt's
+  existing registry, file journal, clock, and publisher.
+- `crates/bridge-core/src/reaper.rs`: journal decorator support for the required
+  reservation census and rollback contract.
 - `crates/bridge-api/src/config.rs`: optional
   `ApiResourceFlightRouteV3 { attempt, node_id }`.
 - `crates/bridge-api/src/backend.rs`: per-turn/per-request cancellation,
   request admission/settlement across the full HTTP census, V3 exposure and
   attachment, and deterministic Wiremock tests.
-- `crates/bridge-api/src/lib.rs`: exports the route and injectable ID source.
+- `crates/bridge-api/src/lib.rs`: exports the route; deterministic ID injection
+  remains crate-private and test-only.
 - `crates/bridge-api/Cargo.toml`: test-only `tempfile` dependency already
   used elsewhere in the workspace.
 - `bin/a2a-bridge/src/main.rs`: explicit production `None`.
 
-The rejected implementation commit changed 2,045 lines (2,045 insertions and
-55 deletions) across ten files including this handoff, below the 2,250-line
-stop threshold. The operator blind-tail repair remains bounded to the request
-scope ownership/compiler population and one deterministic test barrier.
+The reviewed `772518a8` artifact changed 2,180 lines (2,125 insertions and 55
+deletions) across ten files including this handoff, below the 2,250-line stop
+threshold. Its targeted repair closed at exactly 800 net implementation lines.
+Documentation and receipts are accounted separately.
 
 ## Design notes
 
@@ -105,8 +110,10 @@ publishes that winner, once, through the injected
 
 ### Cancellation and linearization
 
-`SessionState` owns `next_turn_epoch`, `current_turn_epoch`, and
-`cancelled_turn_epoch` separately from `active_request`.
+`ApiBackend` owns one checked monotonic `next_turn_authority`; `SessionState`
+owns `current_turn_epoch` and `cancelled_turn_epoch` separately from
+`active_request`. Recreating a forgotten session therefore cannot alias a
+retained prior turn capability.
 `cancel(session)` first marks the current epoch canceled, then captures an
 exact request capability. The capability re-locks and signals only if both the
 epoch and identity still match. Sending is idempotent when the watch is already
@@ -155,9 +162,10 @@ only; `NodeCleanupRecordV2.collateral` remains slice 5's durable-writer scope.
 - Fresh successor turn: new epoch and new request identity; stale prior controls
   refuse.
 - `max_tool_rounds = 0`: no ID, reservation, flight, or POST.
-- Recovery can adopt only the durable key/intent/owner evidence and durable
-  terminal CAS winner; no registry or request authority is reconstructed from
-  `records()`.
+- Attempt admission first discovers bounded durable reservations. A zero-row
+  request reservation is rolled back exactly; a journaled, unterminated request
+  is terminalized `Unknown` through the durable CAS and published once. No live
+  request capability is reconstructed from journal evidence.
 
 The existing prompt-level diagnostic acceptance barrier remains monotonic
 across all rounds. Once any provider request may have been accepted, a later
@@ -181,6 +189,12 @@ Added tests include:
 - `forget_session_cancels_and_settles_the_exact_request_once`.
 - `zero_rounds_mints_no_request_flight_and_missing_attachment_refuses`.
 - `fresh_turn_is_live_and_stale_prior_turn_control_cannot_affect_it`.
+- `forgotten_session_authority_cannot_alias_a_recreated_session`, for both V2
+  and V3 identity paths.
+- `cancel_before_first_stream_poll_closes_the_lifecycle`.
+- checked forget/release tests proving only a durably `Complete` request
+  projects cleanup `Complete`; partial and terminal-refusal outcomes project
+  `Unknown`.
 - `poisoned_request_owner_attachment_and_admission_refuse`.
 - exact request wire/strict-reader tests, key/identity mismatch, exact
   five-row lifecycle accounting, and pre-capability capacity refusal.
@@ -225,40 +239,72 @@ installation. It now waits for one received POST before exercising
 `forget_session`, preserving its intended in-flight scenario while the separate
 between-round test owns pre-send cancellation.
 
+## Dual-lens adjudication and targeted repair
+
+The exact `772518a8` artifact received two independent read-only lenses: Opus
+returned `REVISE`; Sol/max returned `REJECT`. The operator verified six distinct
+constructible WRONGs and four coverage/closure requirements. Canonical lens
+records and adjudication live on the planning branch:
+
+- `docs/superpowers/reviews/2026-08-12-r2f1b-3c2-opus-lens.md`
+- `docs/superpowers/reviews/2026-08-12-r2f1b-3c2-solmax-lens.md`
+- `docs/superpowers/reviews/2026-08-12-r2f1b-3c2-dual-adjudication.md`
+
+The confirmed population was: invalid pre-first-poll diagnostic grammar;
+forgot/recreate ABA authority; request-flight custody errors projected as
+transient/replayable crashes; checked cleanup claiming `Complete` before the
+durable request winner; no attempt-admission reservation recovery; and a
+zero-row orphan when creation failed after reservation. The repair also keeps
+provider failure class authoritative when settlement refuses, restricts ID
+injection to tests, and closes the corresponding negative/edge coverage.
+
+One bridge repair flight was declared with an +800-net-line cap. It failed
+before editing during authentication, retained a clean `772518a8` clone, and
+had no usable checkpoint to resume. Per no-restart discipline, the operator
+repaired the existing feature artifact rather than rerolling a fresh clone.
+
+The gates then found three closed, smaller blind-tail defects: a cross-handle
+journal lock initially recreated a deliberately removed root; a failed durable
+terminal read returned before storing refusal/waking cleanup observers; and the
+diagnostic constructor contract required the single `agent_failure` call to
+remain in `ApiLifecycle::failure`. Each received a same-environment exact-base
+control where attribution was needed. The loop converged without a repeated
+defect class and closed at the declared 800-line cap.
+
 ## Verification
 
-Operator repair and host gates passed:
+Post-adjudication repair and host gates passed:
 
 - `cargo fmt --all -- --check` — exit 0.
 - `git diff --check` — exit 0.
-- `cargo check -p bridge-api --all-targets --locked` — exit 0; the seven
-  `E0382` failures are eliminated.
-- Focused `forget_session_cancels_and_settles_the_exact_request_once` — 1 passed,
-  0 failed; the request-received barrier proves the in-flight precondition.
-- `cargo test -p bridge-api --locked` — 77 passed, 0 failed, 1 ignored live
-  Ollama test across six harnesses.
+- Focused reservation recovery, cross-handle rollback, removed-journal-root,
+  and checked-cleanup regressions — all exit 0.
+- `cargo test -p bridge-core --lib` — 566 passed, 0 failed, 0 ignored.
+- `cargo test -p bridge-api` — 81 passed, 0 failed, 1 ignored live Ollama test
+  across its unit/integration/doc harnesses.
 - `cargo clippy --workspace --all-targets --all-features --locked -- -D
   warnings` — exit 0. The first feature run found one change-local
   `await_holding_lock` in the repaired forget test; exact base passed the same
   command in the same environment. Scoping the assertion guard before the
   asynchronous request-count check repaired it, and the feature rerun passed.
-- `cargo test --workspace --locked --quiet` — 3,977 passed, 0 failed, 13
-  ignored across 90 harnesses, with no exclusions. The first sandbox run reached
-  1,055 passed and 31 failed in the 1,086-test binary harness because host port,
-  filesystem, watcher, and related facilities were denied. Exact base
-  reproduced the same 31 named failures and totals in that environment. The
-  unsandboxed host feature run passed the full workspace.
-- `cargo build --workspace --release --locked` — exit 0.
+- `cargo test --workspace --locked --quiet` — 3,980 passed, 0 failed, 13
+  ignored across 90 harnesses. The ignored population is the repository's
+  declared authenticated/live-provider integration set, including Kiro and
+  local Ollama lanes; no runnable host test was excluded. A sandbox-only
+  Wiremock bind denial was inadmissible; the approved host suite is the gate.
+- `cargo build --release --bin a2a-bridge --locked` — exit 0.
 - `cargo deny check` — exit 0: advisories, bans, licenses, and sources all
   passed; policy-allowed duplicate-version warnings remain. The sandbox-only
   advisory-lock refusal reproduced identically on exact base before the host
   run.
-- `cargo run -p a2a-bridge --locked -- validate --repo-hygiene` — exit 0;
+- `./target/release/a2a-bridge validate --repo-hygiene` — exit 0;
   40 tracked artifacts and 8 example configs validated.
 - Production remains unarmed: the API constructor assigns
   `api_cfg.resource_flight_route_v3 = None`.
 
-The current base-to-tree artifact is 2,125 insertions and 55 deletions across
-ten files, below the 2,250-line stop threshold. Independent dual-lens review,
-adjudication, fold, and CI remain pending. No provider, smoke, compatibility
-case, deployment, or running operator was invoked.
+The current base-to-tree implementation plus this handoff is 3,042 insertions
+and 126 deletions across twelve files. The reviewed artifact stayed below its
+2,250-line stop threshold and the targeted repair met its separately declared
+800-net-line cap. A repaired-tail review, fold, and CI remain pending. No
+provider, smoke, compatibility case, deployment, or running operator was
+invoked.

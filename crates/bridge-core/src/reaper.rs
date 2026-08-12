@@ -1262,6 +1262,19 @@ mod tests {
             self.inner.reserve_flight(reservation)
         }
 
+        fn reservations(
+            &self,
+        ) -> Result<Vec<ResourceFlightReservationRecordV1>, ResourceFlightJournalError> {
+            self.inner.reservations()
+        }
+
+        fn rollback_empty_reservation(
+            &self,
+            reservation: &ResourceFlightReservationRecordV1,
+        ) -> Result<bool, ResourceFlightJournalError> {
+            self.inner.rollback_empty_reservation(reservation)
+        }
+
         fn append(
             &self,
             id: &ResourceFlightIdV1,
