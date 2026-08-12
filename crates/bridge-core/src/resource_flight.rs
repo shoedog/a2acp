@@ -21,6 +21,82 @@ pub use crate::retained_resource_flight::{
 
 pub const MAX_RECOVERY_REASON_BYTES: usize = 512;
 
+/// Bridge-minted identity for one exact remote HTTP request.
+///
+/// The complete value returned by `mint` is safe to expose in diagnostics and journal
+/// evidence: it contains only CSPRNG bytes and carries no provider, session,
+/// prompt, model, URL, or round material. `parse` also accepts the bounded
+/// legacy opaque reader shape so existing schema-v1 wire remains readable;
+/// callers must not extend the minted-value exposure guarantee to arbitrary
+/// legacy input.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
+#[serde(transparent)]
+pub struct DedicatedRemoteRequestIdV1(String);
+
+impl DedicatedRemoteRequestIdV1 {
+    pub const PREFIX: &'static str = "remote-request-";
+    pub const ENCODED_LEN: usize = Self::PREFIX.len() + 64;
+    pub const MAX_ENCODED_LEN: usize = 128;
+
+    pub fn mint() -> Result<Self, crate::error::BridgeError> {
+        let mut bytes = [0_u8; 32];
+        SystemRandom::new()
+            .fill(&mut bytes)
+            .map_err(|_| crate::error::BridgeError::IdentityUnavailable)?;
+        Self::from_bytes(bytes)
+    }
+
+    fn from_bytes(bytes: [u8; 32]) -> Result<Self, crate::error::BridgeError> {
+        if bytes.iter().all(|byte| *byte == 0) {
+            return Err(crate::error::BridgeError::IdentityUnavailable);
+        }
+        let mut value = String::with_capacity(Self::ENCODED_LEN);
+        value.push_str(Self::PREFIX);
+        for byte in bytes {
+            use std::fmt::Write as _;
+            let _ = write!(&mut value, "{byte:02x}");
+        }
+        Ok(Self(value))
+    }
+
+    pub fn parse(value: impl Into<String>) -> Result<Self, crate::error::BridgeError> {
+        let value = value.into();
+        let bounded_opaque = !value.is_empty()
+            && value.len() <= Self::MAX_ENCODED_LEN
+            && value.bytes().all(|byte| {
+                byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':')
+            });
+        let bridge_shape_valid = value.strip_prefix(Self::PREFIX).is_none_or(|suffix| {
+            value.len() == Self::ENCODED_LEN
+                && !suffix.bytes().all(|byte| byte == b'0')
+                && suffix
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        });
+        if !bounded_opaque || !bridge_shape_valid {
+            return Err(crate::error::BridgeError::InvalidRequest {
+                field: "dedicated_remote_request_id",
+            });
+        }
+        Ok(Self(value))
+    }
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl<'de> Deserialize<'de> for DedicatedRemoteRequestIdV1 {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::parse(value).map_err(serde::de::Error::custom)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
 #[serde(transparent)]
 pub struct ResourceFlightIdV1(String);
@@ -112,7 +188,7 @@ pub enum ResourceIdentityV1 {
         ownership_labels_digest: crate::execution_policy::Sha256HexV1,
     },
     DedicatedRemoteRequest {
-        request_id: String,
+        request_id: DedicatedRemoteRequestIdV1,
     },
 }
 
@@ -412,7 +488,7 @@ mod tests {
     #[test]
     fn resource_identity_dedicated_remote_request_golden_round_trip() {
         let identity = ResourceIdentityV1::DedicatedRemoteRequest {
-            request_id: "req-1".to_string(),
+            request_id: DedicatedRemoteRequestIdV1::parse("req-1").unwrap(),
         };
         let golden = r#"{"kind":"dedicated_remote_request","request_id":"req-1"}"#;
         assert_eq!(serde_json::to_string(&identity).unwrap(), golden);
@@ -420,6 +496,32 @@ mod tests {
             serde_json::from_str::<ResourceIdentityV1>(golden).unwrap(),
             identity
         );
+    }
+
+    #[test]
+    fn dedicated_remote_request_id_validates_minted_namespace_without_changing_legacy_wire() {
+        let minted = DedicatedRemoteRequestIdV1::parse(format!(
+            "{}{}",
+            DedicatedRemoteRequestIdV1::PREFIX,
+            "1".repeat(64)
+        ))
+        .unwrap();
+        assert_eq!(
+            minted.as_str().len(),
+            DedicatedRemoteRequestIdV1::ENCODED_LEN
+        );
+        for invalid in [
+            "",
+            "contains space",
+            "remote-request-deadbeef",
+            "remote-request-0000000000000000000000000000000000000000000000000000000000000000",
+            "remote-request-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        ] {
+            assert!(
+                DedicatedRemoteRequestIdV1::parse(invalid).is_err(),
+                "{invalid}"
+            );
+        }
     }
 
     /// Discriminates: `#[serde(deny_unknown_fields)]` being dropped from

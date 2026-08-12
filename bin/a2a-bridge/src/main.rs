@@ -1619,6 +1619,9 @@ fn make_spawn_fn(
                     let mut api_cfg = bridge_api::ApiConfig::new(base_url);
                     api_cfg.model = entry.model.clone();
                     api_cfg.api_key_env = entry.api_key_env.clone();
+                    // R2f1b slice 3c2 threads the route but deliberately leaves
+                    // production V3 activation to slice 4.
+                    api_cfg.resource_flight_route_v3 = None;
                     let be = bridge_api::ApiBackend::new(api_cfg).with_policy(policy);
                     Ok(Arc::new(be) as Arc<dyn bridge_core::ports::AgentBackend>)
                 }

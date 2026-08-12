@@ -1,5 +1,5 @@
 //! ApiBackend — the non-process OpenAI-compatible AgentBackend.
-use crate::config::ApiConfig;
+use crate::config::{ApiConfig, ApiResourceFlightRouteV3};
 use crate::provider::{classify_http_error, MAX_ERROR_BODY_BYTES};
 use crate::wire::{ChatRequest, Message, SseAccumulator, ToolCall};
 use bridge_core::attempt_activity::{
@@ -22,7 +22,12 @@ use bridge_core::ports::{
     AgentBackend, BackendObservers, BackendResourceFlightV1, BackendStream, DiagnosticObserver,
     PolicyEngine, RichEventSink, Update, STOP_REASON_CANCELLED,
 };
+use bridge_core::process::{DurableRemoteRequestFlightV3, RemoteRequestFlightErrorV1};
 use bridge_core::provider::ProviderEvidence;
+use bridge_core::resource_flight::{
+    DedicatedRemoteRequestIdV1, ResourceActionDispositionV1, ResourceActionResultV1,
+};
+use bridge_core::retained_resource_flight::ResourceFlightOwnerV1;
 use futures::StreamExt;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex as StdMutex};
@@ -198,13 +203,40 @@ async fn install_first_send<F>(
     Ok(send)
 }
 
-/// Per-session state: the stashed effective model + a `watch` channel used as the
-/// cancel signal. A `watch` (level-triggered, version-counted) lets the turn loop
-/// `select!` on cancellation even while parked awaiting the next SSE chunk — an
-/// `AtomicBool` polled only between chunks cannot cancel during a stall.
+pub trait RemoteRequestIdSource: Send + Sync {
+    fn mint(&self) -> Result<DedicatedRemoteRequestIdV1, BridgeError>;
+}
+
+struct SystemRemoteRequestIdSource;
+impl RemoteRequestIdSource for SystemRemoteRequestIdSource {
+    fn mint(&self) -> Result<DedicatedRemoteRequestIdV1, BridgeError> {
+        DedicatedRemoteRequestIdV1::mint()
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ActiveRequestIdentity {
+    Legacy(u64),
+    Dedicated(DedicatedRemoteRequestIdV1),
+}
+
+struct ActiveRequestSlot {
+    turn_epoch: u64,
+    identity: ActiveRequestIdentity,
+    cancel_control: watch::Sender<bool>,
+}
+
+/// Per-session model plus two deliberately separate cancellation scopes.
+/// `cancelled_turn_epoch` closes the gap between tool rounds. The active slot
+/// owns one request-local sender, guarded by the exact request identity.
 struct SessionState {
     model: SessionModelState,
-    cancel: watch::Sender<bool>,
+    next_turn_epoch: u64,
+    current_turn_epoch: Option<u64>,
+    cancelled_turn_epoch: Option<u64>,
+    next_legacy_request: u64,
+    active_request: Option<ActiveRequestSlot>,
+    request_flight_owner_attached: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -218,9 +250,264 @@ impl Default for SessionState {
     fn default() -> Self {
         Self {
             model: SessionModelState::Unconfigured,
-            cancel: watch::channel(false).0,
+            next_turn_epoch: 0,
+            current_turn_epoch: None,
+            cancelled_turn_epoch: None,
+            next_legacy_request: 0,
+            active_request: None,
+            request_flight_owner_attached: false,
         }
     }
+}
+
+struct TurnScope {
+    sessions: Arc<StdMutex<HashMap<SessionId, SessionState>>>,
+    session: SessionId,
+    epoch: u64,
+}
+
+impl Drop for TurnScope {
+    fn drop(&mut self) {
+        let Ok(mut sessions) = self.sessions.lock() else {
+            return;
+        };
+        let Some(state) = sessions.get_mut(&self.session) else {
+            return;
+        };
+        if state.current_turn_epoch == Some(self.epoch) {
+            state.current_turn_epoch = None;
+            state.cancelled_turn_epoch = None;
+        }
+    }
+}
+
+#[derive(Clone)]
+struct RequestCancelCapability {
+    sessions: Arc<StdMutex<HashMap<SessionId, SessionState>>>,
+    session: SessionId,
+    turn_epoch: u64,
+    identity: ActiveRequestIdentity,
+}
+
+impl RequestCancelCapability {
+    /// The identity comparison is the load-bearing stale-round fence.
+    fn cancel_exact(&self) -> bool {
+        let Ok(sessions) = self.sessions.lock() else {
+            return false;
+        };
+        let Some(active) = sessions
+            .get(&self.session)
+            .and_then(|state| state.active_request.as_ref())
+        else {
+            return false;
+        };
+        if active.turn_epoch != self.turn_epoch || active.identity != self.identity {
+            return false;
+        }
+        let already_cancelled = *active.cancel_control.borrow();
+        if already_cancelled {
+            return false;
+        }
+        let _ = active.cancel_control.send(true);
+        true
+    }
+
+    fn clear_exact(&self) -> bool {
+        let Ok(mut sessions) = self.sessions.lock() else {
+            return false;
+        };
+        let Some(state) = sessions.get_mut(&self.session) else {
+            return false;
+        };
+        let matches = state.active_request.as_ref().is_some_and(|active| {
+            active.turn_epoch == self.turn_epoch && active.identity == self.identity
+        });
+        if matches {
+            state.active_request = None;
+        }
+        matches
+    }
+}
+
+struct RequestScope {
+    cancel: RequestCancelCapability,
+    cancel_control: watch::Sender<bool>,
+    flight: Option<DurableRemoteRequestFlightV3>,
+    dispatched: bool,
+}
+
+impl RequestScope {
+    fn begin_dispatch(&mut self) -> Result<(), BridgeError> {
+        if let Some(flight) = &mut self.flight {
+            flight.begin_dispatch().map_err(request_flight_error)?;
+        }
+        self.dispatched = true;
+        Ok(())
+    }
+
+    fn settle(
+        mut self,
+        disposition: ResourceActionDispositionV1,
+    ) -> Result<ResourceActionResultV1, BridgeError> {
+        let result = match &mut self.flight {
+            Some(flight) => flight.settle(disposition).map_err(request_flight_error)?,
+            None => ResourceActionResultV1 {
+                disposition,
+                duration_ms: 0,
+                recovery_owner: None,
+                cause: None,
+            },
+        };
+        self.flight = None;
+        self.cancel.clear_exact();
+        Ok(result)
+    }
+}
+
+impl Drop for RequestScope {
+    fn drop(&mut self) {
+        if let Some(flight) = &mut self.flight {
+            let disposition = if !self.dispatched {
+                ResourceActionDispositionV1::Failed
+            } else if *self.cancel_control.borrow() {
+                ResourceActionDispositionV1::Partial
+            } else {
+                ResourceActionDispositionV1::Unknown
+            };
+            let _ = flight.settle(disposition);
+        }
+        self.cancel.clear_exact();
+    }
+}
+
+enum PreparedRequest {
+    Ready {
+        scope: RequestScope,
+        cancel_rx: watch::Receiver<bool>,
+    },
+    TurnCancelled,
+}
+
+#[derive(Clone)]
+struct RequestAdmission {
+    sessions: Arc<StdMutex<HashMap<SessionId, SessionState>>>,
+    route: Option<ApiResourceFlightRouteV3>,
+    request_ids: Arc<dyn RemoteRequestIdSource>,
+}
+
+impl RequestAdmission {
+    fn prepare(
+        &self,
+        session: &SessionId,
+        turn_epoch: u64,
+    ) -> Result<PreparedRequest, BridgeError> {
+        // First reject a cancellation already linearized in the between-round
+        // gap. No request identity or flight is minted in that case. Admission
+        // is checked again after durable work and before publication to close
+        // the race in the opposite direction.
+        {
+            let sessions = self
+                .sessions
+                .lock()
+                .map_err(|_| BridgeError::InvalidStateTransition)?;
+            let Some(state) = sessions.get(session) else {
+                return Ok(PreparedRequest::TurnCancelled);
+            };
+            if state.current_turn_epoch != Some(turn_epoch)
+                || state.cancelled_turn_epoch == Some(turn_epoch)
+            {
+                return Ok(PreparedRequest::TurnCancelled);
+            }
+            if state.active_request.is_some() {
+                return Err(BridgeError::InvalidStateTransition);
+            }
+        }
+
+        let mut flight = match &self.route {
+            Some(route) => {
+                let request_id = self.request_ids.mint()?;
+                let owner = ResourceFlightOwnerV1::new(route.node_id.clone(), session.as_str())
+                    .map_err(|error| BridgeError::agent_crashed(error.to_string()))?;
+                Some(
+                    route
+                        .attempt
+                        .bind_remote_request(request_id, owner)
+                        .map_err(request_flight_error)?,
+                )
+            }
+            None => None,
+        };
+
+        let active_conflict = {
+            let mut sessions = self
+                .sessions
+                .lock()
+                .map_err(|_| BridgeError::InvalidStateTransition)?;
+            match sessions.get_mut(session) {
+                None => false,
+                Some(state)
+                    if state.current_turn_epoch != Some(turn_epoch)
+                        || state.cancelled_turn_epoch == Some(turn_epoch) =>
+                {
+                    false
+                }
+                Some(state) if state.active_request.is_some() => true,
+                Some(state) => {
+                    let identity = match &flight {
+                        Some(flight) => {
+                            ActiveRequestIdentity::Dedicated(flight.request_id().clone())
+                        }
+                        None => {
+                            state.next_legacy_request = state
+                                .next_legacy_request
+                                .checked_add(1)
+                                .ok_or(BridgeError::InvalidStateTransition)?;
+                            ActiveRequestIdentity::Legacy(state.next_legacy_request)
+                        }
+                    };
+                    let (cancel_control, cancel_rx) = watch::channel(false);
+                    state.active_request = Some(ActiveRequestSlot {
+                        turn_epoch,
+                        identity: identity.clone(),
+                        cancel_control: cancel_control.clone(),
+                    });
+                    let cancel = RequestCancelCapability {
+                        sessions: Arc::clone(&self.sessions),
+                        session: session.clone(),
+                        turn_epoch,
+                        identity,
+                    };
+                    return Ok(PreparedRequest::Ready {
+                        scope: RequestScope {
+                            cancel,
+                            cancel_control,
+                            flight,
+                            dispatched: false,
+                        },
+                        cancel_rx,
+                    });
+                }
+            }
+        };
+
+        // Publication lost its race with cancellation, forget, or another
+        // request. Settle outside the session lock so node aggregation may
+        // re-enter unrelated bridge state without deadlocking this session.
+        if let Some(flight) = &mut flight {
+            flight
+                .settle(ResourceActionDispositionV1::Failed)
+                .map_err(request_flight_error)?;
+        }
+        if active_conflict {
+            Err(BridgeError::InvalidStateTransition)
+        } else {
+            Ok(PreparedRequest::TurnCancelled)
+        }
+    }
+}
+
+fn request_flight_error(error: RemoteRequestFlightErrorV1) -> BridgeError {
+    BridgeError::agent_crashed(error.to_string())
 }
 
 pub struct ApiBackend {
@@ -228,6 +515,7 @@ pub struct ApiBackend {
     client: reqwest::Client,
     policy: Arc<StdMutex<Arc<dyn PolicyEngine>>>,
     sessions: Arc<StdMutex<HashMap<SessionId, SessionState>>>,
+    request_ids: Arc<dyn RemoteRequestIdSource>,
 }
 
 /// Default policy: approve everything (mirrors AcpBackend's default auto-approver).
@@ -253,6 +541,7 @@ impl ApiBackend {
             client,
             policy: Arc::new(StdMutex::new(Arc::new(AutoApprove) as Arc<dyn PolicyEngine>)),
             sessions: Arc::new(StdMutex::new(HashMap::new())),
+            request_ids: Arc::new(SystemRemoteRequestIdSource),
         }
     }
 
@@ -264,6 +553,12 @@ impl ApiBackend {
         self
     }
 
+    #[must_use]
+    pub fn with_request_id_source(mut self, source: Arc<dyn RemoteRequestIdSource>) -> Self {
+        self.request_ids = source;
+        self
+    }
+
     /// Test/inspection helper: the stashed effective model for a session.
     pub fn session_model(&self, s: &SessionId) -> Option<String> {
         match self.sessions.lock().ok()?.get(s)?.model.clone() {
@@ -272,10 +567,38 @@ impl ApiBackend {
         }
     }
 
-    /// The session's cancel sender (creating the slot if absent).
-    fn session_cancel(&self, s: &SessionId) -> watch::Sender<bool> {
-        let mut map = self.sessions.lock().expect("sessions lock");
-        map.entry(s.clone()).or_default().cancel.clone()
+    fn begin_turn(&self, session: &SessionId) -> Result<TurnScope, BridgeError> {
+        let mut map = self
+            .sessions
+            .lock()
+            .map_err(|_| BridgeError::ResourceFlightUnsupported)?;
+        let state = map.entry(session.clone()).or_default();
+        if self.cfg.resource_flight_route_v3.is_some() && !state.request_flight_owner_attached {
+            return Err(BridgeError::ResourceFlightUnsupported);
+        }
+        if state.current_turn_epoch.is_some() || state.active_request.is_some() {
+            return Err(BridgeError::InvalidStateTransition);
+        }
+        state.next_turn_epoch = state
+            .next_turn_epoch
+            .checked_add(1)
+            .ok_or(BridgeError::InvalidStateTransition)?;
+        let epoch = state.next_turn_epoch;
+        state.current_turn_epoch = Some(epoch);
+        state.cancelled_turn_epoch = None;
+        Ok(TurnScope {
+            sessions: Arc::clone(&self.sessions),
+            session: session.clone(),
+            epoch,
+        })
+    }
+
+    fn request_admission(&self) -> RequestAdmission {
+        RequestAdmission {
+            sessions: Arc::clone(&self.sessions),
+            route: self.cfg.resource_flight_route_v3.clone(),
+            request_ids: Arc::clone(&self.request_ids),
+        }
     }
 
     fn resolve_api_key(&self) -> Option<String> {
@@ -351,12 +674,10 @@ impl ApiBackend {
         let policy = self.policy.clone();
         let max_rounds = self.cfg.max_tool_rounds;
 
-        // Cancel: reset for this fresh turn, THEN subscribe so a later send(true)
-        // is observed as a change. `select!` on `changed()` fires even while parked
-        // awaiting the next SSE chunk.
-        let cancel_tx = self.session_cancel(session);
-        let _ = cancel_tx.send(false);
-        let mut cancel_rx = cancel_tx.subscribe();
+        let turn_scope = self.begin_turn(session)?;
+        let turn_epoch = turn_scope.epoch;
+        let request_admission = self.request_admission();
+        let session = session.clone();
 
         let mut messages: Vec<Message> = vec![Message::user(
             parts
@@ -367,6 +688,7 @@ impl ApiBackend {
         )];
 
         let stream = async_stream::try_stream! {
+            let _turn_scope = turn_scope;
             let mut message_char_high_water = 0u64;
             lifecycle
                 .record(DiagnosticPhase::PromptStart, PhaseStatus::Started)
@@ -378,6 +700,20 @@ impl ApiBackend {
             // the provider, every later failure is fatal and non-replayable.
             let mut acceptance_barrier_crossed = false;
             for round in 0..max_rounds {
+                let PreparedRequest::Ready {
+                    mut scope,
+                    mut cancel_rx,
+                } = request_admission.prepare(&session, turn_epoch)? else {
+                    complete_prompt_lifecycle(&lifecycle).await?;
+                    yield Update::Done {
+                        stop_reason: STOP_REASON_CANCELLED.into(),
+                        prefix_attestation: Default::default(),
+                    };
+                    return;
+                };
+                // Durable reservation, owner attachment, identity evidence,
+                // intent, and dispatch all precede installation of the POST future.
+                scope.begin_dispatch()?;
                 let req = ChatRequest { model: model.clone(), messages: messages.clone(),
                     tools: vec![crate::tool::tool_def()], stream: do_stream };
                 let mut builder = client.post(&url).json(&req);
@@ -389,13 +725,40 @@ impl ApiBackend {
                     install_first_send(&lifecycle, || builder.send()).await?
                 };
                 if *cancel_rx.borrow() {
+                    scope.settle(ResourceActionDispositionV1::Partial)?;
                     complete_prompt_lifecycle(&lifecycle).await?;
-                    yield Update::Done { stop_reason: STOP_REASON_CANCELLED.into() , prefix_attestation: Default::default()}; return;
+                    yield Update::Done {
+                        stop_reason: STOP_REASON_CANCELLED.into(),
+                        prefix_attestation: Default::default(),
+                    };
+                    return;
                 }
-                let resp = match send.await {
+                tokio::pin!(send);
+                let send_result = loop {
+                    tokio::select! {
+                        biased;
+                        changed = cancel_rx.changed() => {
+                            if changed.is_ok() && *cancel_rx.borrow() {
+                                break None;
+                            }
+                        }
+                        result = &mut send => break Some(result),
+                    }
+                };
+                let Some(send_result) = send_result else {
+                    scope.settle(ResourceActionDispositionV1::Partial)?;
+                    complete_prompt_lifecycle(&lifecycle).await?;
+                    yield Update::Done {
+                        stop_reason: STOP_REASON_CANCELLED.into(),
+                        prefix_attestation: Default::default(),
+                    };
+                    return;
+                };
+                let resp = match send_result {
                     Ok(response) => response,
                     Err(error) => {
                         let (class, code, summary) = request_failure(&error, "api.prompt.send");
+                        scope.settle(ResourceActionDispositionV1::Failed)?;
                         Err(lifecycle
                             .failure(
                                 class,
@@ -411,11 +774,34 @@ impl ApiBackend {
                 if !resp.status().is_success() {
                     let status = resp.status();
                     let headers = resp.headers().clone();
-                    let body = match read_bounded_error_body(resp).await {
+                    let body = read_bounded_error_body(resp);
+                    tokio::pin!(body);
+                    let body_result = loop {
+                        tokio::select! {
+                            biased;
+                            changed = cancel_rx.changed() => {
+                                if changed.is_ok() && *cancel_rx.borrow() {
+                                    break None;
+                                }
+                            }
+                            result = &mut body => break Some(result),
+                        }
+                    };
+                    let Some(body_result) = body_result else {
+                        scope.settle(ResourceActionDispositionV1::Partial)?;
+                        complete_prompt_lifecycle(&lifecycle).await?;
+                        yield Update::Done {
+                            stop_reason: STOP_REASON_CANCELLED.into(),
+                            prefix_attestation: Default::default(),
+                        };
+                        return;
+                    };
+                    let body = match body_result {
                         Ok(body) => body,
                         Err(error) => {
                             let (class, code, summary) =
                                 request_failure(&error, "api.prompt.error_body_read");
+                            scope.settle(ResourceActionDispositionV1::Failed)?;
                             Err(lifecycle
                                 .failure(
                                     class,
@@ -440,6 +826,7 @@ impl ApiBackend {
                         &headers,
                         diagnostic_timestamp_ms(),
                     );
+                    scope.settle(ResourceActionDispositionV1::Failed)?;
                     Err(lifecycle
                         .failure(
                             class,
@@ -471,8 +858,12 @@ impl ApiBackend {
                         };
                         let Some(chunk) = chunk else {
                             if *cancel_rx.borrow() {
+                                scope.settle(ResourceActionDispositionV1::Partial)?;
                                 complete_prompt_lifecycle(&lifecycle).await?;
-                                yield Update::Done { stop_reason: STOP_REASON_CANCELLED.into() , prefix_attestation: Default::default()};
+                                yield Update::Done {
+                                    stop_reason: STOP_REASON_CANCELLED.into(),
+                                    prefix_attestation: Default::default(),
+                                };
                                 return;
                             }
                             break 'read;
@@ -482,6 +873,7 @@ impl ApiBackend {
                             Err(error) => {
                                 let (class, code, summary) =
                                     request_failure(&error, "api.prompt.sse_read");
+                                scope.settle(ResourceActionDispositionV1::Failed)?;
                                 Err(lifecycle
                                     .failure(
                                         class,
@@ -504,6 +896,7 @@ impl ApiBackend {
                                 }
                                 Ok(None) => {}
                                 Err(_) => {
+                                    scope.settle(ResourceActionDispositionV1::Failed)?;
                                     Err(lifecycle
                                         .failure(
                                             DiagnosticFailureClass::Protocol,
@@ -530,6 +923,7 @@ impl ApiBackend {
                             }
                             Ok(None) => {}
                             Err(_) => {
+                                scope.settle(ResourceActionDispositionV1::Failed)?;
                                 Err(lifecycle
                                     .failure(
                                         DiagnosticFailureClass::Protocol,
@@ -544,6 +938,7 @@ impl ApiBackend {
                         }
                     }
                     if !acc.is_done() {
+                        scope.settle(ResourceActionDispositionV1::Failed)?;
                         Err(lifecycle
                             .failure(
                                 DiagnosticFailureClass::Protocol,
@@ -557,11 +952,34 @@ impl ApiBackend {
                     }
                     acc.finish()
                 } else {
-                    let body = match resp.text().await {
+                    let body = resp.text();
+                    tokio::pin!(body);
+                    let body_result = loop {
+                        tokio::select! {
+                            biased;
+                            changed = cancel_rx.changed() => {
+                                if changed.is_ok() && *cancel_rx.borrow() {
+                                    break None;
+                                }
+                            }
+                            result = &mut body => break Some(result),
+                        }
+                    };
+                    let Some(body_result) = body_result else {
+                        scope.settle(ResourceActionDispositionV1::Partial)?;
+                        complete_prompt_lifecycle(&lifecycle).await?;
+                        yield Update::Done {
+                            stop_reason: STOP_REASON_CANCELLED.into(),
+                            prefix_attestation: Default::default(),
+                        };
+                        return;
+                    };
+                    let body = match body_result {
                         Ok(body) => body,
                         Err(error) => {
                             let (class, code, summary) =
                                 request_failure(&error, "api.prompt.body_read");
+                            scope.settle(ResourceActionDispositionV1::Failed)?;
                             Err(lifecycle
                                 .failure(
                                     class,
@@ -577,6 +995,7 @@ impl ApiBackend {
                     let p = match crate::wire::parse_nonstream(&body) {
                         Ok(parsed) => parsed,
                         Err(_) => {
+                            scope.settle(ResourceActionDispositionV1::Failed)?;
                             Err(lifecycle
                                 .failure(
                                     DiagnosticFailureClass::Protocol,
@@ -595,6 +1014,7 @@ impl ApiBackend {
                     }
                     p
                 };
+                scope.settle(ResourceActionDispositionV1::Complete)?;
                 if parsed.tool_calls.is_empty() {
                     complete_prompt_lifecycle(&lifecycle).await?;
                     yield Update::Done { stop_reason: "stop".into() , prefix_attestation: Default::default()}; return;
@@ -690,24 +1110,62 @@ impl AgentBackend for ApiBackend {
     }
 
     fn resource_flight_v1(&self) -> Result<BackendResourceFlightV1, BridgeError> {
-        Ok(BackendResourceFlightV1::LegacyV2)
+        Ok(if self.cfg.resource_flight_route_v3.is_some() {
+            BackendResourceFlightV1::ProtectedV3
+        } else {
+            BackendResourceFlightV1::LegacyV2
+        })
     }
 
     fn attach_resource_flight_owner_v1(
         &self,
-        _session: &SessionId,
+        session: &SessionId,
     ) -> Result<BackendResourceFlightV1, BridgeError> {
-        Err(BridgeError::ResourceFlightUnsupported)
+        if self.cfg.resource_flight_route_v3.is_none() {
+            return Err(BridgeError::ResourceFlightUnsupported);
+        }
+        let mut sessions = self
+            .sessions
+            .lock()
+            .map_err(|_| BridgeError::ResourceFlightUnsupported)?;
+        sessions
+            .entry(session.clone())
+            .or_default()
+            .request_flight_owner_attached = true;
+        drop(sessions);
+        // Load-bearing re-read: a failed/missing attachment cannot become a
+        // successful public exposure through a stale local mode assumption.
+        self.resource_flight_v1()
     }
 
     async fn cancel(&self, session: &SessionId) -> Result<(), BridgeError> {
-        // Only signal an EXISTING slot — never mint a new one (a forgotten session
-        // has no in-flight turn to cancel; minting a fresh channel here would lose
-        // the signal vs the running turn's receiver).
-        if let Ok(map) = self.sessions.lock() {
-            if let Some(st) = map.get(session) {
-                let _ = st.cancel.send(true);
-            }
+        let exact = {
+            let mut sessions = self
+                .sessions
+                .lock()
+                .map_err(|_| BridgeError::InvalidStateTransition)?;
+            let Some(state) = sessions.get_mut(session) else {
+                return Ok(());
+            };
+            let Some(turn_epoch) = state.current_turn_epoch else {
+                return Ok(());
+            };
+            state.cancelled_turn_epoch = Some(turn_epoch);
+            state
+                .active_request
+                .as_ref()
+                .map(|active| RequestCancelCapability {
+                    sessions: Arc::clone(&self.sessions),
+                    session: session.clone(),
+                    turn_epoch,
+                    identity: active.identity.clone(),
+                })
+        };
+        // If the captured request settled and a successor published between the
+        // two lock acquisitions, exact identity comparison refuses the stale send.
+        // The turn epoch remains cancelled, so the successor cannot be POSTed.
+        if let Some(exact) = exact {
+            exact.cancel_exact();
         }
         Ok(())
     }
@@ -758,6 +1216,14 @@ impl AgentBackend for ApiBackend {
 
     async fn forget_session(&self, session: &SessionId) {
         if let Ok(mut map) = self.sessions.lock() {
+            if let Some(state) = map.get_mut(session) {
+                if let Some(epoch) = state.current_turn_epoch {
+                    state.cancelled_turn_epoch = Some(epoch);
+                }
+                if let Some(active) = &state.active_request {
+                    let _ = active.cancel_control.send(true);
+                }
+            }
             map.remove(session);
         }
     }
@@ -785,10 +1251,20 @@ mod tests {
         EffectiveConfig, PermissionDecision, PermissionRequest, SessionContext, SessionSpec,
     };
     use bridge_core::error::BridgeError;
-    use bridge_core::ids::SessionId;
+    use bridge_core::ids::{AttemptId, NodeId, SessionId};
     use bridge_core::ports::{AgentBackend, DiagnosticObserver, PolicyEngine};
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use bridge_core::process::DurableProcessFlightAttemptV3;
+    use bridge_core::resource_flight::{
+        FileResourceFlightJournal, NodeCleanupAggregationV1, ResourceFlightJournal,
+        ResourceFlightJournalEventV1, ResourceFlightKeyV1, ResourceFlightResultPublisher,
+    };
+    use std::collections::VecDeque;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Arc;
+    use std::time::Duration;
+    use wiremock::matchers::{body_string_contains, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     #[test]
     fn text_activity_high_water_saturates_and_empty_text_is_neutral() {
@@ -970,6 +1446,766 @@ mod tests {
             ),
             Ok(_) => panic!("blocked API model must fail before creating a stream"),
         }
+    }
+
+    fn request_id(digit: char) -> DedicatedRemoteRequestIdV1 {
+        DedicatedRemoteRequestIdV1::parse(format!(
+            "{}{}",
+            DedicatedRemoteRequestIdV1::PREFIX,
+            digit.to_string().repeat(64)
+        ))
+        .unwrap()
+    }
+
+    struct SequenceRequestIds {
+        ids: StdMutex<VecDeque<DedicatedRemoteRequestIdV1>>,
+        minted: AtomicUsize,
+    }
+
+    impl SequenceRequestIds {
+        fn new(ids: impl IntoIterator<Item = DedicatedRemoteRequestIdV1>) -> Self {
+            Self {
+                ids: StdMutex::new(ids.into_iter().collect()),
+                minted: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl RemoteRequestIdSource for SequenceRequestIds {
+        fn mint(&self) -> Result<DedicatedRemoteRequestIdV1, BridgeError> {
+            self.minted.fetch_add(1, Ordering::SeqCst);
+            self.ids
+                .lock()
+                .map_err(|_| BridgeError::IdentityUnavailable)?
+                .pop_front()
+                .ok_or(BridgeError::IdentityUnavailable)
+        }
+    }
+
+    #[derive(Default)]
+    struct RecordingRequestPublisher(StdMutex<Vec<NodeCleanupAggregationV1>>);
+
+    impl ResourceFlightResultPublisher for RecordingRequestPublisher {
+        fn publish(&self, aggregation: NodeCleanupAggregationV1) {
+            self.0.lock().unwrap().push(aggregation);
+        }
+    }
+
+    struct ProtectedBackendFixture {
+        backend: Arc<ApiBackend>,
+        ids: Arc<SequenceRequestIds>,
+        journal: Arc<FileResourceFlightJournal>,
+        publisher: Arc<RecordingRequestPublisher>,
+        _root: tempfile::TempDir,
+        journal_root: PathBuf,
+    }
+
+    fn protected_backend(
+        base_url: String,
+        request_ids: Vec<DedicatedRemoteRequestIdV1>,
+        journal_cap: usize,
+        max_tool_rounds: usize,
+        policy: Option<Arc<dyn PolicyEngine>>,
+    ) -> ProtectedBackendFixture {
+        let root = tempfile::tempdir().unwrap();
+        let journal_root = root.path().join("journal");
+        std::fs::create_dir(&journal_root).unwrap();
+        let journal =
+            Arc::new(FileResourceFlightJournal::open(&journal_root, journal_cap).unwrap());
+        let publisher = Arc::new(RecordingRequestPublisher::default());
+        let publisher_port: Arc<dyn ResourceFlightResultPublisher> = publisher.clone();
+        let attempt =
+            DurableProcessFlightAttemptV3::new(AttemptId::mint().unwrap(), Arc::clone(&journal))
+                .with_result_publisher(publisher_port);
+        let ids = Arc::new(SequenceRequestIds::new(request_ids));
+        let request_id_source: Arc<dyn RemoteRequestIdSource> = ids.clone();
+        let mut cfg = crate::config::ApiConfig::new(base_url);
+        cfg.max_tool_rounds = max_tool_rounds;
+        cfg.resource_flight_route_v3 = Some(ApiResourceFlightRouteV3::new(
+            Arc::new(attempt),
+            NodeId::parse("api-node").unwrap(),
+        ));
+        let backend = ApiBackend::new(cfg).with_request_id_source(request_id_source);
+        let backend = match policy {
+            Some(policy) => backend.with_policy(policy),
+            None => backend,
+        };
+        ProtectedBackendFixture {
+            backend: Arc::new(backend),
+            ids,
+            journal,
+            publisher,
+            journal_root,
+            _root: root,
+        }
+    }
+
+    async fn wait_for_active_request(
+        backend: &Arc<ApiBackend>,
+        session: &SessionId,
+        expected: &ActiveRequestIdentity,
+    ) -> RequestCancelCapability {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let capability = {
+                    let sessions = backend.sessions.lock().unwrap();
+                    sessions.get(session).and_then(|state| {
+                        state.active_request.as_ref().and_then(|active| {
+                            (active.identity == *expected).then(|| RequestCancelCapability {
+                                sessions: Arc::clone(&backend.sessions),
+                                session: session.clone(),
+                                turn_epoch: active.turn_epoch,
+                                identity: active.identity.clone(),
+                            })
+                        })
+                    })
+                };
+                if let Some(capability) = capability {
+                    return capability;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("request slot was not published")
+    }
+
+    fn exact_request_cancelled(
+        backend: &ApiBackend,
+        session: &SessionId,
+        expected: &ActiveRequestIdentity,
+    ) -> Option<bool> {
+        let sessions = backend.sessions.lock().unwrap();
+        let active = sessions.get(session)?.active_request.as_ref()?;
+        if &active.identity != expected {
+            return None;
+        }
+        let cancelled = *active.cancel_control.borrow();
+        Some(cancelled)
+    }
+
+    fn tool_call_sse() -> &'static str {
+        "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"get_current_time\",\"arguments\":\"{}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\ndata: [DONE]\n\n"
+    }
+
+    fn stop_sse() -> &'static str {
+        "data: {\"choices\":[{\"delta\":{\"content\":\"done\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n"
+    }
+
+    fn spawn_drain(
+        backend: Arc<ApiBackend>,
+        session: SessionId,
+    ) -> tokio::task::JoinHandle<Vec<Result<Update, BridgeError>>> {
+        tokio::spawn(async move {
+            let mut stream = backend
+                .prompt(&session, vec![Part { text: "hi".into() }])
+                .await
+                .unwrap();
+            let mut updates = Vec::new();
+            while let Some(update) = stream.next().await {
+                updates.push(update);
+            }
+            updates
+        })
+    }
+
+    #[tokio::test]
+    async fn stale_round_one_cancel_cannot_cancel_round_two() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .and(body_string_contains("\"role\":\"tool\""))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(stop_sse())
+                    .set_delay(Duration::from_secs(5)),
+            )
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(tool_call_sse())
+                    .set_delay(Duration::from_millis(100)),
+            )
+            .mount(&server)
+            .await;
+
+        let id_a = request_id('1');
+        let id_b = request_id('2');
+        let fixture = protected_backend(
+            format!("{}/v1", server.uri()),
+            vec![id_a.clone(), id_b.clone()],
+            64,
+            4,
+            None,
+        );
+        let session = SessionId::parse("stale-round").unwrap();
+        assert_eq!(
+            fixture
+                .backend
+                .attach_resource_flight_owner_v1(&session)
+                .unwrap(),
+            BackendResourceFlightV1::ProtectedV3
+        );
+        let task = spawn_drain(Arc::clone(&fixture.backend), session.clone());
+        let stale_a = wait_for_active_request(
+            &fixture.backend,
+            &session,
+            &ActiveRequestIdentity::Dedicated(id_a.clone()),
+        )
+        .await;
+        let _current_b = wait_for_active_request(
+            &fixture.backend,
+            &session,
+            &ActiveRequestIdentity::Dedicated(id_b.clone()),
+        )
+        .await;
+
+        assert!(
+            !stale_a.cancel_exact(),
+            "a retained A sender must refuse successor B"
+        );
+        assert!(
+            !stale_a.clear_exact(),
+            "a retained A settlement/drop must not clear successor B"
+        );
+        assert_eq!(
+            exact_request_cancelled(
+                &fixture.backend,
+                &session,
+                &ActiveRequestIdentity::Dedicated(id_b.clone())
+            ),
+            Some(false),
+            "the mutation-sensitive positive state proves B remained live"
+        );
+
+        fixture.backend.cancel(&session).await.unwrap();
+        fixture.backend.cancel(&session).await.unwrap();
+        let updates = task.await.unwrap();
+        assert!(matches!(
+            updates.last(),
+            Some(Ok(Update::Done { stop_reason, .. })) if stop_reason == STOP_REASON_CANCELLED
+        ));
+        assert_eq!(server.received_requests().await.unwrap().len(), 2);
+
+        let aggregations = fixture.publisher.0.lock().unwrap().clone();
+        assert_eq!(aggregations.len(), 2);
+        assert_ne!(
+            aggregations[0].resource_flight_id,
+            aggregations[1].resource_flight_id
+        );
+        assert_eq!(aggregations[0].owner, aggregations[1].owner);
+        assert_eq!(
+            aggregations[0].owner.node_id,
+            NodeId::parse("api-node").unwrap()
+        );
+        assert_eq!(aggregations[0].owner.owner_key, session.as_str());
+        assert_eq!(
+            aggregations[0].result.disposition,
+            ResourceActionDispositionV1::Complete
+        );
+        assert_eq!(
+            aggregations[1].result.disposition,
+            ResourceActionDispositionV1::Partial
+        );
+
+        for (aggregation, expected) in aggregations.iter().zip([id_a, id_b]) {
+            let rows = fixture
+                .journal
+                .records(&aggregation.resource_flight_id)
+                .unwrap();
+            assert_eq!(
+                rows.iter()
+                    .filter(|row| matches!(
+                        &row.event,
+                        ResourceFlightJournalEventV1::Settled { .. }
+                    ))
+                    .count(),
+                1
+            );
+            assert!(rows.iter().any(|row| matches!(
+                &row.event,
+                ResourceFlightJournalEventV1::FlightReserved {
+                    key: ResourceFlightKeyV1::DedicatedRemoteRequest { request_id },
+                    ..
+                } if request_id == &expected
+            )));
+            assert!(rows.iter().any(|row| matches!(
+                &row.event,
+                ResourceFlightJournalEventV1::RemoteRequestIdentityCaptured {
+                    identity: bridge_core::resource_flight::ResourceIdentityV1::DedicatedRemoteRequest {
+                        request_id,
+                    },
+                    ..
+                } if request_id == &expected
+            )));
+        }
+    }
+
+    struct BetweenRoundsPolicy {
+        arrived: Arc<std::sync::Barrier>,
+        release: Arc<std::sync::Barrier>,
+    }
+
+    impl PolicyEngine for BetweenRoundsPolicy {
+        fn decide(
+            &self,
+            _: &PermissionRequest,
+            _: &SessionContext,
+        ) -> Result<PermissionDecision, BridgeError> {
+            self.arrived.wait();
+            self.release.wait();
+            Ok(PermissionDecision::Approve)
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancellation_between_round_terminal_and_successor_publication_prevents_post() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(tool_call_sse()),
+            )
+            .mount(&server)
+            .await;
+        let policy = Arc::new(BetweenRoundsPolicy {
+            arrived: Arc::new(std::sync::Barrier::new(2)),
+            release: Arc::new(std::sync::Barrier::new(2)),
+        });
+        let fixture = protected_backend(
+            format!("{}/v1", server.uri()),
+            vec![request_id('3'), request_id('4')],
+            64,
+            4,
+            Some(policy.clone()),
+        );
+        let session = SessionId::parse("between-rounds").unwrap();
+        fixture
+            .backend
+            .attach_resource_flight_owner_v1(&session)
+            .unwrap();
+        let task = spawn_drain(Arc::clone(&fixture.backend), session.clone());
+
+        let arrived = Arc::clone(&policy.arrived);
+        tokio::task::spawn_blocking(move || arrived.wait())
+            .await
+            .unwrap();
+        fixture.backend.cancel(&session).await.unwrap();
+        let release = Arc::clone(&policy.release);
+        tokio::task::spawn_blocking(move || release.wait())
+            .await
+            .unwrap();
+
+        let updates = task.await.unwrap();
+        assert!(matches!(
+            updates.last(),
+            Some(Ok(Update::Done { stop_reason, .. })) if stop_reason == STOP_REASON_CANCELLED
+        ));
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+        assert_eq!(fixture.ids.minted.load(Ordering::SeqCst), 1);
+        let aggregations = fixture.publisher.0.lock().unwrap();
+        assert_eq!(aggregations.len(), 1);
+        assert_eq!(
+            aggregations[0].result.disposition,
+            ResourceActionDispositionV1::Complete
+        );
+    }
+
+    struct BreakJournalBetweenRounds {
+        journal_root: PathBuf,
+        moved_root: PathBuf,
+    }
+
+    impl PolicyEngine for BreakJournalBetweenRounds {
+        fn decide(
+            &self,
+            _: &PermissionRequest,
+            _: &SessionContext,
+        ) -> Result<PermissionDecision, BridgeError> {
+            std::fs::rename(&self.journal_root, &self.moved_root)
+                .map_err(|error| BridgeError::agent_crashed(error.to_string()))?;
+            Ok(PermissionDecision::Approve)
+        }
+    }
+
+    #[tokio::test]
+    async fn round_two_journal_failure_refuses_before_post_and_preserves_round_one() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(tool_call_sse()),
+            )
+            .mount(&server)
+            .await;
+        let fixture = protected_backend(
+            format!("{}/v1", server.uri()),
+            vec![request_id('9'), request_id('a')],
+            64,
+            4,
+            None,
+        );
+        let moved_root = fixture._root.path().join("journal-disabled");
+        *fixture.backend.policy.lock().unwrap() = Arc::new(BreakJournalBetweenRounds {
+            journal_root: fixture.journal_root.clone(),
+            moved_root: moved_root.clone(),
+        });
+        let session = SessionId::parse("round-two-journal").unwrap();
+        fixture
+            .backend
+            .attach_resource_flight_owner_v1(&session)
+            .unwrap();
+
+        let updates = spawn_drain(Arc::clone(&fixture.backend), session)
+            .await
+            .unwrap();
+        assert!(updates.iter().any(Result::is_err));
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+        assert_eq!(fixture.ids.minted.load(Ordering::SeqCst), 2);
+        let aggregations = fixture.publisher.0.lock().unwrap();
+        assert_eq!(aggregations.len(), 1);
+        assert_eq!(
+            aggregations[0].result.disposition,
+            ResourceActionDispositionV1::Complete
+        );
+        let moved_journal = FileResourceFlightJournal::open(moved_root, 64).unwrap();
+        let rows = moved_journal
+            .records(&aggregations[0].resource_flight_id)
+            .unwrap();
+        assert_eq!(
+            rows.iter()
+                .filter(|row| matches!(&row.event, ResourceFlightJournalEventV1::Settled { .. }))
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn request_capacity_refusal_precedes_flight_creation_and_post() {
+        let server = MockServer::start().await;
+        let fixture = protected_backend(
+            format!("{}/v1", server.uri()),
+            vec![request_id('5')],
+            4,
+            4,
+            None,
+        );
+        let session = SessionId::parse("capacity-refusal").unwrap();
+        fixture
+            .backend
+            .attach_resource_flight_owner_v1(&session)
+            .unwrap();
+        let updates = spawn_drain(Arc::clone(&fixture.backend), session)
+            .await
+            .unwrap();
+        assert!(updates.iter().any(Result::is_err));
+        assert_eq!(server.received_requests().await.unwrap().len(), 0);
+        assert_eq!(fixture.ids.minted.load(Ordering::SeqCst), 1);
+        assert!(
+            fixture.publisher.0.lock().unwrap().is_empty(),
+            "capacity is reserved by FlightReserved, so refusal creates no live flight"
+        );
+    }
+
+    #[tokio::test]
+    async fn round_two_identity_collision_does_not_post_or_rewrite_round_one() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(tool_call_sse()),
+            )
+            .mount(&server)
+            .await;
+        let duplicate = request_id('6');
+        let fixture = protected_backend(
+            format!("{}/v1", server.uri()),
+            vec![duplicate.clone(), duplicate],
+            64,
+            4,
+            None,
+        );
+        let session = SessionId::parse("round-two-refusal").unwrap();
+        fixture
+            .backend
+            .attach_resource_flight_owner_v1(&session)
+            .unwrap();
+        let updates = spawn_drain(Arc::clone(&fixture.backend), session)
+            .await
+            .unwrap();
+        assert!(updates.iter().any(Result::is_err));
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+        assert_eq!(fixture.ids.minted.load(Ordering::SeqCst), 2);
+        let aggregations = fixture.publisher.0.lock().unwrap();
+        assert_eq!(aggregations.len(), 1);
+        assert_eq!(
+            aggregations[0].result.disposition,
+            ResourceActionDispositionV1::Complete
+        );
+        let rows = fixture
+            .journal
+            .records(&aggregations[0].resource_flight_id)
+            .unwrap();
+        assert_eq!(
+            rows.iter()
+                .filter(|row| matches!(&row.event, ResourceFlightJournalEventV1::Settled { .. }))
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn consumer_drop_settles_and_clears_only_the_exact_request() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(stop_sse())
+                    .set_delay(Duration::from_secs(5)),
+            )
+            .mount(&server)
+            .await;
+        let id = request_id('7');
+        let fixture = protected_backend(
+            format!("{}/v1", server.uri()),
+            vec![id.clone()],
+            64,
+            4,
+            None,
+        );
+        let session = SessionId::parse("consumer-drop").unwrap();
+        fixture
+            .backend
+            .attach_resource_flight_owner_v1(&session)
+            .unwrap();
+        let task = spawn_drain(Arc::clone(&fixture.backend), session.clone());
+        wait_for_active_request(
+            &fixture.backend,
+            &session,
+            &ActiveRequestIdentity::Dedicated(id),
+        )
+        .await;
+        task.abort();
+        let _ = task.await;
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if fixture.publisher.0.lock().unwrap().len() == 1 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(fixture
+            .backend
+            .sessions
+            .lock()
+            .unwrap()
+            .get(&session)
+            .is_some_and(
+                |state| state.active_request.is_none() && state.current_turn_epoch.is_none()
+            ));
+        let aggregations = fixture.publisher.0.lock().unwrap();
+        assert_eq!(aggregations.len(), 1);
+        assert_eq!(
+            aggregations[0].result.disposition,
+            ResourceActionDispositionV1::Unknown
+        );
+    }
+
+    #[tokio::test]
+    async fn forget_session_cancels_and_settles_the_exact_request_once() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(stop_sse())
+                    .set_delay(Duration::from_secs(5)),
+            )
+            .mount(&server)
+            .await;
+        let id = request_id('c');
+        let fixture = protected_backend(
+            format!("{}/v1", server.uri()),
+            vec![id.clone()],
+            64,
+            4,
+            None,
+        );
+        let session = SessionId::parse("forget-exact").unwrap();
+        fixture
+            .backend
+            .attach_resource_flight_owner_v1(&session)
+            .unwrap();
+        let task = spawn_drain(Arc::clone(&fixture.backend), session.clone());
+        wait_for_active_request(
+            &fixture.backend,
+            &session,
+            &ActiveRequestIdentity::Dedicated(id),
+        )
+        .await;
+        fixture.backend.forget_session(&session).await;
+
+        let updates = task.await.unwrap();
+        assert!(matches!(
+            updates.last(),
+            Some(Ok(Update::Done { stop_reason, .. })) if stop_reason == STOP_REASON_CANCELLED
+        ));
+        assert!(!fixture
+            .backend
+            .sessions
+            .lock()
+            .unwrap()
+            .contains_key(&session));
+        let aggregations = fixture.publisher.0.lock().unwrap();
+        assert_eq!(aggregations.len(), 1);
+        assert_eq!(
+            aggregations[0].result.disposition,
+            ResourceActionDispositionV1::Partial
+        );
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn poisoned_request_owner_attachment_and_admission_refuse() {
+        let fixture = protected_backend(
+            "http://127.0.0.1:1/v1".into(),
+            vec![request_id('b')],
+            64,
+            4,
+            None,
+        );
+        let sessions = Arc::clone(&fixture.backend.sessions);
+        assert!(std::thread::spawn(move || {
+            let _guard = sessions.lock().unwrap();
+            panic!("poison request-flight attachment state");
+        })
+        .join()
+        .is_err());
+        let session = SessionId::parse("poisoned-attachment").unwrap();
+        assert!(matches!(
+            fixture.backend.attach_resource_flight_owner_v1(&session),
+            Err(BridgeError::ResourceFlightUnsupported)
+        ));
+        assert!(matches!(
+            fixture
+                .backend
+                .prompt(&session, vec![Part { text: "hi".into() }])
+                .await,
+            Err(BridgeError::ResourceFlightUnsupported)
+        ));
+        assert_eq!(fixture.ids.minted.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn zero_rounds_mints_no_request_flight_and_missing_attachment_refuses() {
+        let server = MockServer::start().await;
+        let fixture = protected_backend(
+            format!("{}/v1", server.uri()),
+            vec![request_id('8')],
+            64,
+            0,
+            None,
+        );
+        let session = SessionId::parse("zero-rounds").unwrap();
+        assert_eq!(
+            fixture.backend.resource_flight_v1().unwrap(),
+            BackendResourceFlightV1::ProtectedV3
+        );
+        assert!(matches!(
+            fixture
+                .backend
+                .prompt(&session, vec![Part { text: "hi".into() }])
+                .await,
+            Err(BridgeError::ResourceFlightUnsupported)
+        ));
+        assert_eq!(fixture.ids.minted.load(Ordering::SeqCst), 0);
+        fixture
+            .backend
+            .attach_resource_flight_owner_v1(&session)
+            .unwrap();
+        let updates = spawn_drain(Arc::clone(&fixture.backend), session)
+            .await
+            .unwrap();
+        assert!(matches!(
+            updates.last(),
+            Some(Ok(Update::Done { stop_reason, .. })) if stop_reason == "max_tool_rounds"
+        ));
+        assert_eq!(fixture.ids.minted.load(Ordering::SeqCst), 0);
+        assert!(fixture.publisher.0.lock().unwrap().is_empty());
+        assert!(server.received_requests().await.unwrap().is_empty());
+
+        let v2 = ApiBackend::new(crate::config::ApiConfig::new("http://127.0.0.1:1"));
+        assert_eq!(
+            v2.resource_flight_v1().unwrap(),
+            BackendResourceFlightV1::LegacyV2
+        );
+        assert!(matches!(
+            v2.attach_resource_flight_owner_v1(&SessionId::parse("v2").unwrap()),
+            Err(BridgeError::ResourceFlightUnsupported)
+        ));
+    }
+
+    #[tokio::test]
+    async fn fresh_turn_is_live_and_stale_prior_turn_control_cannot_affect_it() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(stop_sse())
+                    .set_delay(Duration::from_millis(250)),
+            )
+            .mount(&server)
+            .await;
+        let backend = Arc::new(ApiBackend::new(crate::config::ApiConfig::new(format!(
+            "{}/v1",
+            server.uri()
+        ))));
+        let session = SessionId::parse("fresh-after-cancel").unwrap();
+
+        let first = spawn_drain(Arc::clone(&backend), session.clone());
+        let stale =
+            wait_for_active_request(&backend, &session, &ActiveRequestIdentity::Legacy(1)).await;
+        backend.cancel(&session).await.unwrap();
+        let first_updates = first.await.unwrap();
+        assert!(matches!(
+            first_updates.last(),
+            Some(Ok(Update::Done { stop_reason, .. })) if stop_reason == STOP_REASON_CANCELLED
+        ));
+
+        let second = spawn_drain(Arc::clone(&backend), session.clone());
+        wait_for_active_request(&backend, &session, &ActiveRequestIdentity::Legacy(2)).await;
+        assert!(!stale.cancel_exact());
+        assert!(!stale.clear_exact());
+        assert_eq!(
+            exact_request_cancelled(&backend, &session, &ActiveRequestIdentity::Legacy(2)),
+            Some(false)
+        );
+        let second_updates = second.await.unwrap();
+        assert!(matches!(
+            second_updates.last(),
+            Some(Ok(Update::Done { stop_reason, .. })) if stop_reason == "stop"
+        ));
     }
 
     #[tokio::test]

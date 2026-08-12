@@ -27,8 +27,9 @@ use crate::attempt_activity::MonotonicClock;
 use crate::execution_policy::{BoundedCauseV1, CollateralDispositionV1, Sha256HexV1};
 use crate::ids::{AttemptId, NodeId};
 use crate::resource_flight::{
-    BoundedRecoveryReasonV1, ProcessStartIdentityV1, RecoveryOwnerV1, ResourceActionDispositionV1,
-    ResourceActionResultV1, ResourceFlightIdV1, ResourceFlightStateV1, ResourceIdentityV1,
+    BoundedRecoveryReasonV1, DedicatedRemoteRequestIdV1, ProcessStartIdentityV1, RecoveryOwnerV1,
+    ResourceActionDispositionV1, ResourceActionResultV1, ResourceFlightIdV1, ResourceFlightStateV1,
+    ResourceIdentityV1,
 };
 use ring::digest::{digest, SHA256};
 use serde::{Deserialize, Serialize};
@@ -73,9 +74,15 @@ impl ResourceFlightOwnerV1 {
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ResourceFlightKeyV1 {
-    AcpGeneration { generation: String },
-    ContainerGeneration { generation: String },
-    DedicatedRemoteRequest { request_id: String },
+    AcpGeneration {
+        generation: String,
+    },
+    ContainerGeneration {
+        generation: String,
+    },
+    DedicatedRemoteRequest {
+        request_id: DedicatedRemoteRequestIdV1,
+    },
 }
 
 impl ResourceFlightKeyV1 {
@@ -161,6 +168,10 @@ pub enum ResourceFlightJournalEventV1 {
     ContainerIdentityCaptured {
         identity: ResourceIdentityV1,
     },
+    RemoteRequestIdentityCaptured {
+        identity: ResourceIdentityV1,
+        owner: ResourceFlightOwnerV1,
+    },
     ProcessBindingFailed {
         stage: ProcessBindingStageV1,
         pid: Option<u32>,
@@ -192,10 +203,14 @@ pub enum ResourceFlightJournalEventV1 {
 impl ResourceFlightJournalEventV1 {
     fn reserved(&self) -> u8 {
         match self {
+            Self::FlightReserved {
+                key: ResourceFlightKeyV1::DedicatedRemoteRequest { .. },
+                ..
+            } => LIFECYCLE_SLOTS,
             Self::ProcessLifecycleReserved {
                 reserved_lifecycle_slots,
-            }
-            | Self::IntentJournaled {
+            } => *reserved_lifecycle_slots,
+            Self::IntentJournaled {
                 reserved_lifecycle_slots,
                 ..
             } => *reserved_lifecycle_slots,
@@ -218,6 +233,7 @@ impl ResourceFlightJournalEventV1 {
         match self {
             Self::ProcessTreeCaptured { .. }
             | Self::ContainerIdentityCaptured { .. }
+            | Self::RemoteRequestIdentityCaptured { .. }
             | Self::ProcessBindingFailed { .. }
             | Self::IntentJournaled { .. } => true,
             Self::OwnerDetached { owner } => owner.node_id.as_str() == "process-spawn",
@@ -915,6 +931,8 @@ pub enum RetainedResourceFlightError {
     },
     #[error("managed container identity does not match flight key")]
     ContainerIdentityKeyMismatch,
+    #[error("dedicated remote request identity does not match flight key")]
+    RemoteRequestIdentityKeyMismatch,
     #[error("resource-flight terminal refusal after journal failure: {cause}")]
     TerminalRefusal {
         cause: Arc<ResourceFlightJournalError>,
@@ -949,6 +967,7 @@ struct State {
     collateral: BTreeSet<ResourceFlightOwnerV1>,
     delivered: BTreeSet<ResourceFlightOwnerV1>,
     process_lifecycle_reserved: bool,
+    request_lifecycle_reserved: bool,
     sequence: u64,
     next_guard: u64,
     guards: BTreeSet<u64>,
@@ -964,6 +983,7 @@ impl Default for State {
             collateral: BTreeSet::new(),
             delivered: BTreeSet::new(),
             process_lifecycle_reserved: false,
+            request_lifecycle_reserved: false,
             sequence: 1,
             next_guard: 1,
             guards: BTreeSet::new(),
@@ -1020,6 +1040,10 @@ impl RetainedResourceFlight {
             settled: Condvar::new(),
         });
         let mut state = flight.lock()?;
+        state.request_lifecycle_reserved = matches!(
+            &flight.key,
+            ResourceFlightKeyV1::DedicatedRemoteRequest { .. }
+        );
         flight.append(
             &mut state,
             ResourceFlightJournalEventV1::FlightReserved {
@@ -1219,11 +1243,12 @@ impl RetainedResourceFlight {
             return Err(RetainedResourceFlightError::OwnerNotAttached);
         }
         let snapshot = state.snapshot.iter().cloned().collect();
-        let reserved_lifecycle_slots = if state.process_lifecycle_reserved {
-            0
-        } else {
-            LIFECYCLE_SLOTS
-        };
+        let reserved_lifecycle_slots =
+            if state.process_lifecycle_reserved || state.request_lifecycle_reserved {
+                0
+            } else {
+                LIFECYCLE_SLOTS
+            };
         self.append(
             &mut state,
             ResourceFlightJournalEventV1::IntentJournaled {
@@ -1664,6 +1689,33 @@ impl RetainedResourceFlight {
             &mut state,
             ResourceFlightJournalEventV1::ContainerIdentityCaptured { identity },
         )
+    }
+
+    pub(crate) fn attach_remote_request_owner(
+        &self,
+        owner: ResourceFlightOwnerV1,
+        identity: ResourceIdentityV1,
+    ) -> Result<(), RetainedResourceFlightError> {
+        if !matches!(identity, ResourceIdentityV1::DedicatedRemoteRequest { .. })
+            || ResourceFlightKeyV1::from_identity(&identity) != self.key
+        {
+            return Err(RetainedResourceFlightError::RemoteRequestIdentityKeyMismatch);
+        }
+        let mut state = self.lock()?;
+        if !matches!(state.state, ResourceFlightStateV1::Open {}) || state.owners.contains(&owner) {
+            return Err(RetainedResourceFlightError::TransitionRefused {
+                state: Box::new(state.state.clone()),
+            });
+        }
+        self.append(
+            &mut state,
+            ResourceFlightJournalEventV1::RemoteRequestIdentityCaptured {
+                identity,
+                owner: owner.clone(),
+            },
+        )?;
+        state.owners.insert(owner);
+        Ok(())
     }
 
     #[cfg_attr(not(unix), allow(dead_code))]
@@ -2348,16 +2400,127 @@ mod tests {
             .unwrap();
         let mut request_a = config('2', journal.clone(), clock.clone(), publisher.clone());
         request_a.key = ResourceFlightKeyV1::DedicatedRemoteRequest {
-            request_id: "request-a".to_string(),
+            request_id: DedicatedRemoteRequestIdV1::parse("request-a").unwrap(),
         };
         let mut request_b = config('3', journal, clock, publisher);
         request_b.key = ResourceFlightKeyV1::DedicatedRemoteRequest {
-            request_id: "request-b".to_string(),
+            request_id: DedicatedRemoteRequestIdV1::parse("request-b").unwrap(),
         };
         let a = registry.reserve(request_a).unwrap();
         let b = registry.reserve(request_b).unwrap();
         assert!(!Arc::ptr_eq(shared.flight().unwrap(), a.flight().unwrap()));
         assert!(!Arc::ptr_eq(a.flight().unwrap(), b.flight().unwrap()));
+    }
+
+    #[test]
+    fn dedicated_remote_request_key_identity_mismatch_refuses_before_dispatch() {
+        let registry = ResourceFlightRegistryV1::new(attempt());
+        let journal = Arc::new(InMemoryResourceFlightJournal::new(32));
+        let journal_port: Arc<dyn ResourceFlightJournal> = journal.clone();
+        let clock: Arc<dyn MonotonicClock> = Arc::new(ManualClock::new(0));
+        let publisher: Arc<dyn ResourceFlightResultPublisher> = Arc::new(Publisher::default());
+        let mut request = config('4', journal_port, clock, publisher);
+        request.key = ResourceFlightKeyV1::DedicatedRemoteRequest {
+            request_id: DedicatedRemoteRequestIdV1::parse("request-a").unwrap(),
+        };
+        let reservation = registry.reserve(request).unwrap();
+        let flight = reservation.flight().unwrap();
+        let error = flight
+            .attach_remote_request_owner(
+                owner("node_a", "session-a"),
+                ResourceIdentityV1::DedicatedRemoteRequest {
+                    request_id: DedicatedRemoteRequestIdV1::parse("request-b").unwrap(),
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            RetainedResourceFlightError::RemoteRequestIdentityKeyMismatch
+        ));
+        let rows = journal.records(flight.flight_id()).unwrap();
+        assert!(!rows.iter().any(|row| matches!(
+            &row.event,
+            ResourceFlightJournalEventV1::RemoteRequestIdentityCaptured { .. }
+                | ResourceFlightJournalEventV1::DispatchStarted {}
+        )));
+    }
+
+    #[test]
+    fn dedicated_request_reserves_exact_full_lifecycle_before_owner_admission() {
+        let registry = ResourceFlightRegistryV1::new(attempt());
+        let journal = Arc::new(InMemoryResourceFlightJournal::new(5));
+        let journal_port: Arc<dyn ResourceFlightJournal> = journal.clone();
+        let clock: Arc<dyn MonotonicClock> = Arc::new(ManualClock::new(0));
+        let publisher = Arc::new(Publisher::default());
+        let publisher_port: Arc<dyn ResourceFlightResultPublisher> = publisher.clone();
+        let request_id = DedicatedRemoteRequestIdV1::parse("request-capacity").unwrap();
+        let mut request = config('5', journal_port, clock, publisher_port);
+        request.key = ResourceFlightKeyV1::DedicatedRemoteRequest {
+            request_id: request_id.clone(),
+        };
+        let reservation = registry.reserve(request).unwrap();
+        let flight = reservation.flight().unwrap();
+        let request_owner = owner("node_a", "session-a");
+        flight
+            .attach_remote_request_owner(
+                request_owner.clone(),
+                ResourceIdentityV1::DedicatedRemoteRequest { request_id },
+            )
+            .unwrap();
+        flight.close_admission().unwrap();
+        flight.journal_intent(intent(request_owner)).unwrap();
+        flight.begin_journaled_dispatch().unwrap();
+        let winner = flight.settle(complete()).unwrap();
+
+        assert_eq!(winner.disposition, ResourceActionDispositionV1::Complete);
+        let rows = journal.records(flight.flight_id()).unwrap();
+        assert_eq!(rows.len(), 5);
+        assert!(matches!(
+            &rows[0].event,
+            ResourceFlightJournalEventV1::FlightReserved {
+                key: ResourceFlightKeyV1::DedicatedRemoteRequest { .. },
+                ..
+            }
+        ));
+        assert!(matches!(
+            &rows[1].event,
+            ResourceFlightJournalEventV1::RemoteRequestIdentityCaptured { .. }
+        ));
+        assert!(matches!(
+            &rows[2].event,
+            ResourceFlightJournalEventV1::IntentJournaled {
+                reserved_lifecycle_slots: 0,
+                ..
+            }
+        ));
+        assert!(matches!(
+            &rows[3].event,
+            ResourceFlightJournalEventV1::DispatchStarted {}
+        ));
+        assert!(matches!(
+            &rows[4].event,
+            ResourceFlightJournalEventV1::Settled { .. }
+        ));
+        assert_eq!(publisher.0.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn dedicated_request_capacity_refuses_before_flight_capability_creation() {
+        let registry = ResourceFlightRegistryV1::new(attempt());
+        let journal: Arc<dyn ResourceFlightJournal> =
+            Arc::new(InMemoryResourceFlightJournal::new(4));
+        let clock: Arc<dyn MonotonicClock> = Arc::new(ManualClock::new(0));
+        let publisher: Arc<dyn ResourceFlightResultPublisher> = Arc::new(Publisher::default());
+        let mut request = config('6', journal, clock, publisher);
+        request.key = ResourceFlightKeyV1::DedicatedRemoteRequest {
+            request_id: DedicatedRemoteRequestIdV1::parse("request-full").unwrap(),
+        };
+        assert!(matches!(
+            registry.reserve(request),
+            Err(RetainedResourceFlightError::Journal(
+                ResourceFlightJournalError::Full
+            ))
+        ));
     }
 
     #[test]
@@ -3246,6 +3409,50 @@ mod tests {
             serde_json::to_string(&reservation).unwrap(),
             r#"{"event":"process_lifecycle_reserved","reserved_lifecycle_slots":7}"#
         );
+    }
+
+    #[test]
+    fn dedicated_remote_request_event_has_exact_wire_golden() {
+        let identity = ResourceFlightJournalEventV1::RemoteRequestIdentityCaptured {
+            identity: ResourceIdentityV1::DedicatedRemoteRequest {
+                request_id: DedicatedRemoteRequestIdV1::parse(format!(
+                    "{}{}",
+                    DedicatedRemoteRequestIdV1::PREFIX,
+                    "1".repeat(64)
+                ))
+                .unwrap(),
+            },
+            owner: owner("node_a", "session-a"),
+        };
+        assert_eq!(
+            serde_json::to_string(&identity).unwrap(),
+            format!(
+                "{{\"event\":\"remote_request_identity_captured\",\"identity\":{{\"kind\":\"dedicated_remote_request\",\"request_id\":\"{}{}\"}},\"owner\":{{\"node_id\":\"node_a\",\"owner_key\":\"session-a\"}}}}",
+                DedicatedRemoteRequestIdV1::PREFIX,
+                "1".repeat(64)
+            )
+        );
+    }
+
+    #[test]
+    fn dedicated_remote_request_event_reader_rejects_top_level_and_nested_unknown_fields() {
+        let request_id = format!("{}{}", DedicatedRemoteRequestIdV1::PREFIX, "1".repeat(64));
+        for invalid in [
+            format!(
+                "{{\"event\":\"remote_request_identity_captured\",\"identity\":{{\"kind\":\"dedicated_remote_request\",\"request_id\":\"{request_id}\"}},\"owner\":{{\"node_id\":\"node_a\",\"owner_key\":\"session-a\"}},\"future\":true}}"
+            ),
+            format!(
+                "{{\"event\":\"remote_request_identity_captured\",\"identity\":{{\"kind\":\"dedicated_remote_request\",\"request_id\":\"{request_id}\",\"future\":true}},\"owner\":{{\"node_id\":\"node_a\",\"owner_key\":\"session-a\"}}}}"
+            ),
+            format!(
+                "{{\"event\":\"remote_request_identity_captured\",\"identity\":{{\"kind\":\"dedicated_remote_request\",\"request_id\":\"{request_id}\"}},\"owner\":{{\"node_id\":\"node_a\",\"owner_key\":\"session-a\",\"future\":true}}}}"
+            ),
+        ] {
+            assert!(
+                serde_json::from_str::<ResourceFlightJournalEventV1>(&invalid).is_err(),
+                "must reject unsupported request evidence: {invalid}"
+            );
+        }
     }
 
     #[test]

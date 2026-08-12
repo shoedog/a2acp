@@ -1,7 +1,22 @@
 //! Configuration for ApiBackend. `model`/`api_key_env` are NOT frozen here — the
 //! backend resolves the key per-prompt (env) and the model per-session (stash);
 //! `ApiConfig` holds only the construction-time defaults.
+use bridge_core::ids::NodeId;
+use bridge_core::process::DurableProcessFlightAttemptV3;
+use std::sync::Arc;
 use std::time::Duration;
+
+#[derive(Debug, Clone)]
+pub struct ApiResourceFlightRouteV3 {
+    pub attempt: Arc<DurableProcessFlightAttemptV3>,
+    pub node_id: NodeId,
+}
+
+impl ApiResourceFlightRouteV3 {
+    pub fn new(attempt: Arc<DurableProcessFlightAttemptV3>, node_id: NodeId) -> Self {
+        Self { attempt, node_id }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct ApiConfig {
@@ -17,6 +32,9 @@ pub struct ApiConfig {
     pub request_timeout: Duration,
     /// Use SSE streaming (default). `false` uses the non-streamed `message.tool_calls` shape.
     pub stream: bool,
+    /// Explicit attempt-owned request-flight route. Production remains `None`
+    /// until scheduler activation in R2f1b slice 4.
+    pub resource_flight_route_v3: Option<ApiResourceFlightRouteV3>,
 }
 
 impl ApiConfig {
@@ -28,6 +46,7 @@ impl ApiConfig {
             max_tool_rounds: 4,
             request_timeout: Duration::from_secs(120),
             stream: true,
+            resource_flight_route_v3: None,
         }
     }
 }
@@ -43,5 +62,6 @@ mod tests {
         assert!(c.stream);
         assert_eq!(c.request_timeout, std::time::Duration::from_secs(120));
         assert!(c.model.is_none() && c.api_key_env.is_none());
+        assert!(c.resource_flight_route_v3.is_none());
     }
 }
