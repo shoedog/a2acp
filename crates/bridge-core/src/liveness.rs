@@ -237,6 +237,25 @@ pub fn acquire_persistent_lock_blocking_in(
     Ok(PersistentLockGuard { path, _file: file })
 }
 
+/// Exclusively flock an already-created persistent lock without recreating its parent.
+pub fn acquire_existing_persistent_lock_blocking(
+    path: &Path,
+    on_contended: &dyn Fn(),
+) -> std::io::Result<PersistentLockGuard> {
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)?;
+    if !flock_nb(&file, true)? {
+        on_contended();
+        flock_blocking_exclusive(&file)?;
+    }
+    Ok(PersistentLockGuard {
+        path: path.to_path_buf(),
+        _file: file,
+    })
+}
+
 /// Production: acquire under the default lease dir (`$A2A_LEASE_DIR` else `$HOME/.a2a-bridge/leases`).
 pub fn acquire_lease(run_id: &str) -> std::io::Result<LeaseGuard> {
     acquire_lease_in(&lease_dir(), run_id)

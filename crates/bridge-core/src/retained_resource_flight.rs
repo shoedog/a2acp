@@ -40,6 +40,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex};
 
 pub const RESOURCE_FLIGHT_JOURNAL_SCHEMA_V1: u16 = 1;
+const MAX_DISCOVERED_RESOURCE_FLIGHT_RESERVATIONS: usize = 4096;
 // Dispatch, the observed signal batch, an optional guard transfer, and terminal
 // settlement must all remain appendable after intent becomes durable.
 const LIFECYCLE_SLOTS: u8 = 4;
@@ -322,6 +323,17 @@ pub trait ResourceFlightJournal: Send + Sync {
         reservation: &ResourceFlightReservationRecordV1,
     ) -> Result<ResourceFlightReservationOutcomeV1, ResourceFlightJournalError>;
 
+    /// Return every strict reservation record in deterministic key order.
+    fn reservations(
+        &self,
+    ) -> Result<Vec<ResourceFlightReservationRecordV1>, ResourceFlightJournalError>;
+
+    /// Remove this exact reservation only while it has zero complete rows.
+    fn rollback_empty_reservation(
+        &self,
+        reservation: &ResourceFlightReservationRecordV1,
+    ) -> Result<bool, ResourceFlightJournalError>;
+
     /// Success means the row is durable enough to survive a process crash.
     fn append(
         &self,
@@ -463,6 +475,39 @@ impl ResourceFlightJournal for InMemoryResourceFlightJournal {
         }
     }
 
+    fn reservations(
+        &self,
+    ) -> Result<Vec<ResourceFlightReservationRecordV1>, ResourceFlightJournalError> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| ResourceFlightJournalError::Accounting)?;
+        if state.reservations.len() > MAX_DISCOVERED_RESOURCE_FLIGHT_RESERVATIONS {
+            return Err(ResourceFlightJournalError::Full);
+        }
+        Ok(state.reservations.values().cloned().collect())
+    }
+
+    fn rollback_empty_reservation(
+        &self,
+        reservation: &ResourceFlightReservationRecordV1,
+    ) -> Result<bool, ResourceFlightJournalError> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| ResourceFlightJournalError::Accounting)?;
+        if state.reservations.get(&reservation.key) != Some(reservation)
+            || state
+                .records
+                .get(&reservation.resource_flight_id)
+                .is_some_and(|rows| !rows.is_empty())
+        {
+            return Ok(false);
+        }
+        state.reservations.remove(&reservation.key);
+        Ok(true)
+    }
+
     fn append(
         &self,
         id: &ResourceFlightIdV1,
@@ -526,6 +571,7 @@ impl ResourceFlightJournal for InMemoryResourceFlightJournal {
 /// root before use; `open` refuses an absent/non-directory root.
 pub struct FileResourceFlightJournal {
     root: PathBuf,
+    lock_path: PathBuf,
     cap: usize,
     append_lock: Mutex<()>,
 }
@@ -544,11 +590,45 @@ impl FileResourceFlightJournal {
                 source: std::io::Error::new(std::io::ErrorKind::NotADirectory, "journal root"),
             });
         }
+        let lock = crate::liveness::acquire_persistent_lock_blocking_in(
+            &root,
+            "resource-flight-journal",
+            &|| {},
+        )
+        .map_err(|source| ResourceFlightJournalError::Io {
+            path: root.clone(),
+            source,
+        })?;
+        let lock_path = lock.path().to_path_buf();
+        drop(lock);
         Ok(Self {
             root,
+            lock_path,
             cap,
             append_lock: Mutex::new(()),
         })
+    }
+
+    fn operation_lock(
+        &self,
+    ) -> Result<
+        (
+            std::sync::MutexGuard<'_, ()>,
+            crate::liveness::PersistentLockGuard,
+        ),
+        ResourceFlightJournalError,
+    > {
+        let local = self
+            .append_lock
+            .lock()
+            .map_err(|_| ResourceFlightJournalError::Accounting)?;
+        let shared =
+            crate::liveness::acquire_existing_persistent_lock_blocking(&self.lock_path, &|| {})
+                .map_err(|source| ResourceFlightJournalError::Io {
+                    path: self.lock_path.clone(),
+                    source,
+                })?;
+        Ok((local, shared))
     }
 
     fn path(&self, id: &ResourceFlightIdV1) -> PathBuf {
@@ -661,10 +741,7 @@ impl ResourceFlightJournal for FileResourceFlightJournal {
         if reservation.schema_version != RESOURCE_FLIGHT_JOURNAL_SCHEMA_V1 {
             return Err(ResourceFlightJournalError::Schema);
         }
-        let _write = self
-            .append_lock
-            .lock()
-            .map_err(|_| ResourceFlightJournalError::Accounting)?;
+        let _write = self.operation_lock()?;
         let path = self.reservation_path(&reservation.key)?;
         let encoded = serde_json::to_vec(reservation).map_err(|source| {
             ResourceFlightJournalError::Encode {
@@ -737,15 +814,112 @@ impl ResourceFlightJournal for FileResourceFlightJournal {
         }
     }
 
+    fn reservations(
+        &self,
+    ) -> Result<Vec<ResourceFlightReservationRecordV1>, ResourceFlightJournalError> {
+        const PREFIX: &str = "resource-flight-reservation-";
+        const SUFFIX: &str = ".json";
+        let _read = self.operation_lock()?;
+        let entries =
+            std::fs::read_dir(&self.root).map_err(|source| ResourceFlightJournalError::Io {
+                path: self.root.clone(),
+                source,
+            })?;
+        let mut reservations = Vec::new();
+        let mut keys = BTreeSet::new();
+        let mut flight_ids = BTreeSet::new();
+        for entry in entries {
+            let entry = entry.map_err(|source| ResourceFlightJournalError::Io {
+                path: self.root.clone(),
+                source,
+            })?;
+            let name = entry
+                .file_name()
+                .into_string()
+                .map_err(|_| ResourceFlightJournalError::Accounting)?;
+            let Some(digest) = name
+                .strip_prefix(PREFIX)
+                .and_then(|name| name.strip_suffix(SUFFIX))
+            else {
+                if name.starts_with(PREFIX) {
+                    return Err(ResourceFlightJournalError::Accounting);
+                }
+                continue;
+            };
+            if digest.len() != 64
+                || !digest
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            {
+                return Err(ResourceFlightJournalError::Accounting);
+            }
+            if reservations.len() == MAX_DISCOVERED_RESOURCE_FLIGHT_RESERVATIONS {
+                return Err(ResourceFlightJournalError::Full);
+            }
+            let path = entry.path();
+            let file_type = entry
+                .file_type()
+                .map_err(|source| ResourceFlightJournalError::Io {
+                    path: path.clone(),
+                    source,
+                })?;
+            if !file_type.is_file() {
+                return Err(ResourceFlightJournalError::Accounting);
+            }
+            let reservation = self.read_reservation(&path)?;
+            if self.reservation_path(&reservation.key)? != path
+                || !keys.insert(reservation.key.clone())
+                || !flight_ids.insert(reservation.resource_flight_id.as_str().to_owned())
+            {
+                return Err(ResourceFlightJournalError::Accounting);
+            }
+            reservations.push(reservation);
+        }
+        reservations.sort_by(|left, right| left.key.cmp(&right.key));
+        Ok(reservations)
+    }
+
+    fn rollback_empty_reservation(
+        &self,
+        reservation: &ResourceFlightReservationRecordV1,
+    ) -> Result<bool, ResourceFlightJournalError> {
+        let _write = self.operation_lock()?;
+        let path = self.reservation_path(&reservation.key)?;
+        let stored = match self.read_reservation(&path) {
+            Ok(stored) => stored,
+            Err(ResourceFlightJournalError::Io { source, .. })
+                if source.kind() == std::io::ErrorKind::NotFound =>
+            {
+                return Ok(false)
+            }
+            Err(error) => return Err(error),
+        };
+        if stored != *reservation
+            || !self
+                .read(&self.path(&reservation.resource_flight_id))?
+                .is_empty()
+        {
+            return Ok(false);
+        }
+        std::fs::remove_file(&path).map_err(|source| ResourceFlightJournalError::Io {
+            path: path.clone(),
+            source,
+        })?;
+        File::open(&self.root)
+            .and_then(|dir| dir.sync_all())
+            .map_err(|source| ResourceFlightJournalError::Io {
+                path: self.root.clone(),
+                source,
+            })?;
+        Ok(true)
+    }
+
     fn append(
         &self,
         id: &ResourceFlightIdV1,
         record: &ResourceFlightJournalRecordV1,
     ) -> Result<(), ResourceFlightJournalError> {
-        let _write = self
-            .append_lock
-            .lock()
-            .map_err(|_| ResourceFlightJournalError::Accounting)?;
+        let _write = self.operation_lock()?;
         let path = self.path(id);
         let rows = self.read(&path)?;
         if settled_result(&rows).is_some() {
@@ -785,10 +959,7 @@ impl ResourceFlightJournal for FileResourceFlightJournal {
         id: &ResourceFlightIdV1,
         result: &ResourceActionResultV1,
     ) -> Result<ResourceFlightTerminalAppendOutcomeV1, ResourceFlightJournalError> {
-        let _write = self
-            .append_lock
-            .lock()
-            .map_err(|_| ResourceFlightJournalError::Accounting)?;
+        let _write = self.operation_lock()?;
         let path = self.path(id);
         let mut rows = self.read(&path)?;
         if let Some(existing) = settled_result(&rows) {
@@ -836,10 +1007,7 @@ impl ResourceFlightJournal for FileResourceFlightJournal {
         &self,
         id: &ResourceFlightIdV1,
     ) -> Result<Vec<ResourceFlightJournalRecordV1>, ResourceFlightJournalError> {
-        let _read = self
-            .append_lock
-            .lock()
-            .map_err(|_| ResourceFlightJournalError::Accounting)?;
+        let _read = self.operation_lock()?;
         self.read(&self.path(id))
     }
 }
@@ -1103,7 +1271,12 @@ impl RetainedResourceFlight {
         &self,
         state: &mut State,
     ) -> Result<Option<ResourceActionResultV1>, RetainedResourceFlightError> {
-        let rows = self.journal.records(&self.id)?;
+        let rows = self.journal.records(&self.id).map_err(|cause| {
+            let cause = Arc::new(cause);
+            state.refusal = Some(Arc::clone(&cause));
+            self.settled.notify_all();
+            RetainedResourceFlightError::TerminalRefusal { cause }
+        })?;
         let Some(result) = settled_result(&rows) else {
             return Ok(None);
         };
@@ -1915,6 +2088,49 @@ impl ResourceFlightRegistryV1 {
         }
     }
 
+    /// Reconcile this attempt's requests before successor admission.
+    pub fn recover_remote_request_reservations(
+        &self,
+        journal: &dyn ResourceFlightJournal,
+        duration_ms: u64,
+        publisher: &dyn ResourceFlightResultPublisher,
+    ) -> Result<(), RetainedResourceFlightError> {
+        let reservations = journal.reservations()?;
+        if reservations
+            .iter()
+            .any(|reservation| reservation.attempt_id != self.attempt_id)
+        {
+            return Err(RetainedResourceFlightError::ReservationAttemptMismatch);
+        }
+        for reservation in reservations {
+            if !matches!(
+                reservation.key,
+                ResourceFlightKeyV1::DedicatedRemoteRequest { .. }
+            ) {
+                continue;
+            }
+            let mut rows = journal.records(&reservation.resource_flight_id)?;
+            if rows.is_empty() {
+                if journal.rollback_empty_reservation(&reservation)? {
+                    continue;
+                }
+                rows = journal.records(&reservation.resource_flight_id)?;
+                if rows.is_empty() {
+                    return Err(RetainedResourceFlightError::ReservationUnavailable {
+                        resource_flight_id: reservation.resource_flight_id,
+                    });
+                }
+            }
+            let _ = RetainedResourceFlight::recover_dead_journaled_intent_as_unknown(
+                journal,
+                &reservation.resource_flight_id,
+                duration_ms,
+                publisher,
+            )?;
+        }
+        Ok(())
+    }
+
     fn recovered_reservation(
         config: &RetainedResourceFlightConfigV1,
         reservation: ResourceFlightReservationRecordV1,
@@ -1974,7 +2190,14 @@ impl ResourceFlightRegistryV1 {
             match config.journal.reserve_flight(&reservation)? {
                 ResourceFlightReservationOutcomeV1::Created => {
                     let key = config.key.clone();
-                    let flight = RetainedResourceFlight::create(config)?;
+                    let journal = Arc::clone(&config.journal);
+                    let flight = match RetainedResourceFlight::create(config) {
+                        Ok(flight) => flight,
+                        Err(error) => {
+                            let _ = journal.rollback_empty_reservation(&reservation)?;
+                            return Err(error);
+                        }
+                    };
                     flights.insert(key, Arc::clone(&flight));
                     return Ok(ResourceFlightReservationV1::Created(flight));
                 }
@@ -2025,6 +2248,19 @@ mod tests {
             reservation: &ResourceFlightReservationRecordV1,
         ) -> Result<ResourceFlightReservationOutcomeV1, ResourceFlightJournalError> {
             self.inner.reserve_flight(reservation)
+        }
+
+        fn reservations(
+            &self,
+        ) -> Result<Vec<ResourceFlightReservationRecordV1>, ResourceFlightJournalError> {
+            self.inner.reservations()
+        }
+
+        fn rollback_empty_reservation(
+            &self,
+            reservation: &ResourceFlightReservationRecordV1,
+        ) -> Result<bool, ResourceFlightJournalError> {
+            self.inner.rollback_empty_reservation(reservation)
         }
 
         fn append(
@@ -2078,6 +2314,19 @@ mod tests {
             reservation: &ResourceFlightReservationRecordV1,
         ) -> Result<ResourceFlightReservationOutcomeV1, ResourceFlightJournalError> {
             self.inner.reserve_flight(reservation)
+        }
+
+        fn reservations(
+            &self,
+        ) -> Result<Vec<ResourceFlightReservationRecordV1>, ResourceFlightJournalError> {
+            self.inner.reservations()
+        }
+
+        fn rollback_empty_reservation(
+            &self,
+            reservation: &ResourceFlightReservationRecordV1,
+        ) -> Result<bool, ResourceFlightJournalError> {
+            self.inner.rollback_empty_reservation(reservation)
         }
 
         fn append(
@@ -2506,21 +2755,63 @@ mod tests {
 
     #[test]
     fn dedicated_request_capacity_refuses_before_flight_capability_creation() {
-        let registry = ResourceFlightRegistryV1::new(attempt());
-        let journal: Arc<dyn ResourceFlightJournal> =
-            Arc::new(InMemoryResourceFlightJournal::new(4));
-        let clock: Arc<dyn MonotonicClock> = Arc::new(ManualClock::new(0));
-        let publisher: Arc<dyn ResourceFlightResultPublisher> = Arc::new(Publisher::default());
-        let mut request = config('6', journal, clock, publisher);
-        request.key = ResourceFlightKeyV1::DedicatedRemoteRequest {
-            request_id: DedicatedRemoteRequestIdV1::parse("request-full").unwrap(),
+        let root = tempfile::tempdir().unwrap();
+        let journals: Vec<Arc<dyn ResourceFlightJournal>> = vec![
+            Arc::new(InMemoryResourceFlightJournal::new(4)),
+            Arc::new(FileResourceFlightJournal::open(root.path(), 4).unwrap()),
+        ];
+        for journal in journals {
+            let mut request = config(
+                '6',
+                Arc::clone(&journal),
+                Arc::new(ManualClock::new(0)),
+                Arc::new(Publisher::default()),
+            );
+            request.key = ResourceFlightKeyV1::DedicatedRemoteRequest {
+                request_id: DedicatedRemoteRequestIdV1::parse("request-full").unwrap(),
+            };
+            assert!(matches!(
+                ResourceFlightRegistryV1::new(attempt()).reserve(request),
+                Err(RetainedResourceFlightError::Journal(
+                    ResourceFlightJournalError::Full
+                ))
+            ));
+            assert!(journal.reservations().unwrap().is_empty());
+        }
+        assert!(FileResourceFlightJournal::open(root.path(), 4)
+            .unwrap()
+            .reservations()
+            .unwrap()
+            .is_empty());
+
+        let journal = Arc::new(FileResourceFlightJournal::open(root.path(), 5).unwrap());
+        let zero = ResourceFlightReservationRecordV1 {
+            schema_version: RESOURCE_FLIGHT_JOURNAL_SCHEMA_V1,
+            key: ResourceFlightKeyV1::DedicatedRemoteRequest {
+                request_id: DedicatedRemoteRequestIdV1::parse("request-crash-zero").unwrap(),
+            },
+            attempt_id: attempt(),
+            resource_flight_id: id('7'),
         };
-        assert!(matches!(
-            registry.reserve(request),
-            Err(RetainedResourceFlightError::Journal(
-                ResourceFlightJournalError::Full
-            ))
-        ));
+        journal.reserve_flight(&zero).unwrap();
+        ResourceFlightRegistryV1::new(attempt())
+            .recover_remote_request_reservations(journal.as_ref(), 0, &Publisher::default())
+            .unwrap();
+        assert!(journal.reservations().unwrap().is_empty());
+
+        let mut advanced = config(
+            '8',
+            journal.clone(),
+            Arc::new(ManualClock::new(0)),
+            Arc::new(Publisher::default()),
+        );
+        advanced.key = zero.key;
+        ResourceFlightRegistryV1::new(attempt())
+            .reserve(advanced)
+            .unwrap();
+        let advanced = journal.reservations().unwrap().pop().unwrap();
+        let reopened = FileResourceFlightJournal::open(root.path(), 5).unwrap();
+        assert!(!reopened.rollback_empty_reservation(&advanced).unwrap());
     }
 
     #[test]
@@ -2726,33 +3017,6 @@ mod tests {
             .unwrap()
             .is_none()
         );
-    }
-
-    #[test]
-    fn crash_reopen_recovers_journaled_intent() {
-        let root = tempfile::tempdir().unwrap();
-        let journal = Arc::new(FileResourceFlightJournal::open(root.path(), 24).unwrap());
-        let clock = Arc::new(ManualClock::new(3));
-        let publisher = Arc::new(Publisher::default());
-        let registry = ResourceFlightRegistryV1::new(attempt());
-        let reservation = registry
-            .reserve(config('1', journal, clock, publisher))
-            .unwrap();
-        let flight = Arc::clone(reservation.flight().unwrap());
-        let first = owner("node_a", "session-a");
-        flight.attach_owner(first.clone()).unwrap();
-        flight.close_admission().unwrap();
-        flight.journal_intent(intent(first)).unwrap();
-        let flight_id = flight.flight_id().clone();
-        drop(flight);
-        drop(reservation);
-        drop(registry);
-        let reopened = FileResourceFlightJournal::open(root.path(), 24).unwrap();
-        let records = reopened.records(&flight_id).unwrap();
-        assert!(records.iter().any(|row| matches!(
-            &row.event,
-            ResourceFlightJournalEventV1::IntentJournaled { .. }
-        )));
     }
 
     #[test]

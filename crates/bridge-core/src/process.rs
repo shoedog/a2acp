@@ -766,6 +766,20 @@ pub struct DurableRemoteRequestFlightV3 {
     settled: bool,
 }
 
+/// Cloneable observation-only authority for joining the durable request winner.
+#[derive(Clone)]
+pub struct RemoteRequestSettlementV1 {
+    flight: Arc<RetainedResourceFlight>,
+}
+
+impl RemoteRequestSettlementV1 {
+    pub fn join_blocking(&self) -> Result<ResourceActionResultV1, RemoteRequestFlightErrorV1> {
+        self.flight
+            .join_blocking()
+            .map_err(|error| RemoteRequestFlightErrorV1::Admission(error.to_string()))
+    }
+}
+
 impl std::fmt::Debug for DurableRemoteRequestFlightV3 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DurableRemoteRequestFlightV3")
@@ -786,6 +800,13 @@ impl DurableRemoteRequestFlightV3 {
     #[must_use]
     pub fn flight_id(&self) -> &ResourceFlightIdV1 {
         self.flight.flight_id()
+    }
+
+    #[must_use]
+    pub fn settlement_handle(&self) -> RemoteRequestSettlementV1 {
+        RemoteRequestSettlementV1 {
+            flight: Arc::clone(&self.flight),
+        }
     }
 
     pub fn begin_dispatch(&mut self) -> Result<(), RemoteRequestFlightErrorV1> {
@@ -929,11 +950,18 @@ impl DurableProcessFlightAttemptV3 {
         request_id: DedicatedRemoteRequestIdV1,
         owner: ResourceFlightOwnerV1,
     ) -> Result<DurableRemoteRequestFlightV3, RemoteRequestFlightErrorV1> {
+        let clock: Arc<dyn MonotonicClock> = Arc::new(SystemMonotonicClock::start());
+        self.registry
+            .recover_remote_request_reservations(
+                self.journal.as_ref(),
+                clock.elapsed_ms(),
+                self.result_publisher.as_ref(),
+            )
+            .map_err(|error| RemoteRequestFlightErrorV1::Admission(error.to_string()))?;
         let identity = ResourceIdentityV1::DedicatedRemoteRequest {
             request_id: request_id.clone(),
         };
         let key = ResourceFlightKeyV1::from_identity(&identity);
-        let clock: Arc<dyn MonotonicClock> = Arc::new(SystemMonotonicClock::start());
         let reservation = self
             .registry
             .reserve(RetainedResourceFlightConfigV1 {
@@ -2732,6 +2760,7 @@ impl OwnedProcessTreeV1 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::retained_resource_flight::ResourceFlightJournalEventV1;
     use std::os::fd::AsRawFd as _;
     use std::time::Duration;
 
@@ -3771,6 +3800,22 @@ mod tests {
             self.inner.reserve_flight(reservation)
         }
 
+        fn reservations(
+            &self,
+        ) -> Result<
+            Vec<crate::retained_resource_flight::ResourceFlightReservationRecordV1>,
+            crate::retained_resource_flight::ResourceFlightJournalError,
+        > {
+            self.inner.reservations()
+        }
+
+        fn rollback_empty_reservation(
+            &self,
+            reservation: &crate::retained_resource_flight::ResourceFlightReservationRecordV1,
+        ) -> Result<bool, crate::retained_resource_flight::ResourceFlightJournalError> {
+            self.inner.rollback_empty_reservation(reservation)
+        }
+
         fn append(
             &self,
             id: &ResourceFlightIdV1,
@@ -4642,7 +4687,10 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let attempt_id = AttemptId::mint().unwrap();
         let journal = Arc::new(FileResourceFlightJournal::open(root.path(), 512).unwrap());
-        let route = DurableProcessFlightAttemptV3::new(attempt_id, journal);
+        let publisher = Arc::new(RecordingProcessPublisher::default());
+        let publisher_port: Arc<dyn ResourceFlightResultPublisher> = publisher.clone();
+        let route = DurableProcessFlightAttemptV3::new(attempt_id.clone(), journal)
+            .with_result_publisher(publisher_port);
         let first = route
             .bind_generation(
                 "generation-a",
@@ -4672,9 +4720,9 @@ mod tests {
             "1".repeat(64)
         ))
         .unwrap();
-        let request = route
+        let mut request = route
             .bind_remote_request(
-                request_id,
+                request_id.clone(),
                 ResourceFlightOwnerV1::new(NodeId::parse("request-node").unwrap(), "request-a")
                     .unwrap(),
             )
@@ -4687,11 +4735,42 @@ mod tests {
         assert!(Arc::ptr_eq(&first.journal, &second.journal));
         let route_journal = Arc::clone(&route.journal) as Arc<dyn ResourceFlightJournal>;
         assert!(Arc::ptr_eq(&route_journal, &container.journal));
-        assert!(!route
-            .journal
-            .records(request.flight_id())
-            .unwrap()
-            .is_empty());
+        let abandoned_id = request.flight_id().clone();
+        request.begin_dispatch().unwrap();
+        std::mem::forget(request);
+
+        for _ in 0..2 {
+            let publisher_port: Arc<dyn ResourceFlightResultPublisher> = publisher.clone();
+            let reopened = DurableProcessFlightAttemptV3::new(
+                attempt_id.clone(),
+                Arc::new(FileResourceFlightJournal::open(root.path(), 512).unwrap()),
+            )
+            .with_result_publisher(publisher_port);
+            assert_eq!(
+                reopened
+                    .bind_remote_request(
+                        request_id.clone(),
+                        ResourceFlightOwnerV1::new(
+                            NodeId::parse("request-node").unwrap(),
+                            "request-a",
+                        )
+                        .unwrap(),
+                    )
+                    .unwrap_err(),
+                RemoteRequestFlightErrorV1::IdentityCollision
+            );
+        }
+        let rows = route.journal.records(&abandoned_id).unwrap();
+        assert_eq!(
+            rows.iter()
+                .filter(
+                    |row| matches!(&row.event, ResourceFlightJournalEventV1::Settled { result }
+                    if result.disposition == ResourceActionDispositionV1::Unknown)
+                )
+                .count(),
+            1
+        );
+        assert_eq!(publisher.0.lock().unwrap().len(), 1);
     }
 
     #[tokio::test]

@@ -19,10 +19,12 @@ use bridge_core::execution_policy::{BoundMcpDeliveryPayloadV1, BoundSessionSpecV
 use bridge_core::ids::SessionId;
 use bridge_core::orch::OrchEventKind;
 use bridge_core::ports::{
-    AgentBackend, BackendObservers, BackendResourceFlightV1, BackendStream, DiagnosticObserver,
-    PolicyEngine, RichEventSink, Update, STOP_REASON_CANCELLED,
+    AgentBackend, BackendCleanupDispositionV1, BackendObservers, BackendResourceFlightV1,
+    BackendStream, DiagnosticObserver, PolicyEngine, RichEventSink, Update, STOP_REASON_CANCELLED,
 };
-use bridge_core::process::{DurableRemoteRequestFlightV3, RemoteRequestFlightErrorV1};
+use bridge_core::process::{
+    DurableRemoteRequestFlightV3, RemoteRequestFlightErrorV1, RemoteRequestSettlementV1,
+};
 use bridge_core::provider::ProviderEvidence;
 use bridge_core::resource_flight::{
     DedicatedRemoteRequestIdV1, ResourceActionDispositionV1, ResourceActionResultV1,
@@ -30,6 +32,7 @@ use bridge_core::resource_flight::{
 use bridge_core::retained_resource_flight::ResourceFlightOwnerV1;
 use futures::StreamExt;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use tokio::sync::watch;
 
@@ -69,22 +72,25 @@ impl ApiLifecycle {
     #[allow(clippy::too_many_arguments)]
     async fn failure(
         &self,
+        failed_phase: DiagnosticPhase,
+        last_completed_phase: Option<DiagnosticPhase>,
         class: DiagnosticFailureClass,
         code: &'static str,
         summary: &'static str,
-        cause: Option<String>,
+        causes: Vec<String>,
         retry_after_ms: Option<u64>,
         reset_at_ms: Option<i64>,
+        prompt_may_have_been_accepted: bool,
     ) -> BridgeError {
         let failure = match FailureDiagnostic::build_static_code(
             FailureDiagnosticInput {
-                failed_phase: DiagnosticPhase::PromptStream,
-                last_completed_phase: Some(DiagnosticPhase::PromptStart),
+                failed_phase,
+                last_completed_phase,
                 class,
                 disposition: FailureDisposition::Fatal,
                 code: String::new(),
                 summary: summary.to_owned(),
-                causes: cause.into_iter().collect(),
+                causes,
                 stderr_observed: false,
                 stderr_line_count: 0,
                 stderr_scope: None,
@@ -92,7 +98,7 @@ impl ApiLifecycle {
                 stderr_redaction: None,
                 retry_after_ms,
                 reset_at_ms,
-                prompt_may_have_been_accepted: true,
+                prompt_may_have_been_accepted,
             },
             code,
             &self.redactor,
@@ -102,7 +108,7 @@ impl ApiLifecycle {
         };
         let transition = match PersistedPhaseTransition::build_static_code(
             PersistedPhaseTransitionInput {
-                phase: DiagnosticPhase::PromptStream,
+                phase: failed_phase,
                 status: PhaseStatus::Failed,
                 at_ms: diagnostic_timestamp_ms(),
                 operation: None,
@@ -125,6 +131,33 @@ impl ApiLifecycle {
             Ok(()) => BridgeError::agent_failure(failure),
             Err(error) => error,
         }
+    }
+
+    async fn request_flight_failure(
+        &self,
+        error: RemoteRequestFlightErrorV1,
+        prompt_may_have_been_accepted: bool,
+    ) -> BridgeError {
+        let (failed_phase, last_completed_phase) = if prompt_may_have_been_accepted {
+            (
+                DiagnosticPhase::PromptStream,
+                Some(DiagnosticPhase::PromptStart),
+            )
+        } else {
+            (DiagnosticPhase::PromptStart, None)
+        };
+        self.failure(
+            failed_phase,
+            last_completed_phase,
+            DiagnosticFailureClass::Persistence,
+            "api.prompt.request_flight",
+            "Durable remote request custody failed",
+            vec![error.to_string()],
+            None,
+            None,
+            prompt_may_have_been_accepted,
+        )
+        .await
     }
 }
 
@@ -203,7 +236,7 @@ async fn install_first_send<F>(
     Ok(send)
 }
 
-pub trait RemoteRequestIdSource: Send + Sync {
+pub(crate) trait RemoteRequestIdSource: Send + Sync {
     fn mint(&self) -> Result<DedicatedRemoteRequestIdV1, BridgeError>;
 }
 
@@ -224,6 +257,7 @@ struct ActiveRequestSlot {
     turn_epoch: u64,
     identity: ActiveRequestIdentity,
     cancel_control: watch::Sender<bool>,
+    settlement: Option<RemoteRequestSettlementV1>,
 }
 
 /// Per-session model plus two deliberately separate cancellation scopes.
@@ -231,7 +265,6 @@ struct ActiveRequestSlot {
 /// owns one request-local sender, guarded by the exact request identity.
 struct SessionState {
     model: SessionModelState,
-    next_turn_epoch: u64,
     current_turn_epoch: Option<u64>,
     cancelled_turn_epoch: Option<u64>,
     next_legacy_request: u64,
@@ -250,7 +283,6 @@ impl Default for SessionState {
     fn default() -> Self {
         Self {
             model: SessionModelState::Unconfigured,
-            next_turn_epoch: 0,
             current_turn_epoch: None,
             cancelled_turn_epoch: None,
             next_legacy_request: 0,
@@ -337,9 +369,9 @@ struct RequestScope {
 }
 
 impl RequestScope {
-    fn begin_dispatch(&mut self) -> Result<(), BridgeError> {
+    fn begin_dispatch(&mut self) -> Result<(), RemoteRequestFlightErrorV1> {
         if let Some(flight) = &mut self.flight {
-            flight.begin_dispatch().map_err(request_flight_error)?;
+            flight.begin_dispatch()?;
         }
         self.dispatched = true;
         Ok(())
@@ -348,9 +380,9 @@ impl RequestScope {
     fn settle(
         mut self,
         disposition: ResourceActionDispositionV1,
-    ) -> Result<ResourceActionResultV1, BridgeError> {
+    ) -> Result<ResourceActionResultV1, RemoteRequestFlightErrorV1> {
         let result = match &mut self.flight {
-            Some(flight) => flight.settle(disposition).map_err(request_flight_error)?,
+            Some(flight) => flight.settle(disposition)?,
             None => ResourceActionResultV1 {
                 disposition,
                 duration_ms: 0,
@@ -383,11 +415,57 @@ impl Drop for RequestScope {
 fn settle_request_scope(
     scope: &mut Option<RequestScope>,
     disposition: ResourceActionDispositionV1,
-) -> Result<ResourceActionResultV1, BridgeError> {
+) -> Result<ResourceActionResultV1, RemoteRequestFlightErrorV1> {
     scope
         .take()
-        .ok_or(BridgeError::InvalidStateTransition)?
+        .ok_or_else(|| {
+            RemoteRequestFlightErrorV1::Admission("request scope was already settled".into())
+        })?
         .settle(disposition)
+}
+
+async fn settle_request_scope_or_fail(
+    lifecycle: &ApiLifecycle,
+    scope: &mut Option<RequestScope>,
+    disposition: ResourceActionDispositionV1,
+    prompt_may_have_been_accepted: bool,
+) -> Result<ResourceActionResultV1, BridgeError> {
+    match settle_request_scope(scope, disposition) {
+        Ok(result) => Ok(result),
+        Err(error) => Err(lifecycle
+            .request_flight_failure(error, prompt_may_have_been_accepted)
+            .await),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn provider_failure_after_settlement(
+    lifecycle: &ApiLifecycle,
+    scope: &mut Option<RequestScope>,
+    class: DiagnosticFailureClass,
+    code: &'static str,
+    summary: &'static str,
+    cause: Option<String>,
+    retry_after_ms: Option<u64>,
+    reset_at_ms: Option<i64>,
+) -> BridgeError {
+    let mut causes: Vec<String> = cause.into_iter().collect();
+    if let Err(error) = settle_request_scope(scope, ResourceActionDispositionV1::Failed) {
+        causes.push(format!("durable request settlement refused: {error}"));
+    }
+    lifecycle
+        .failure(
+            DiagnosticPhase::PromptStream,
+            Some(DiagnosticPhase::PromptStart),
+            class,
+            code,
+            summary,
+            causes,
+            retry_after_ms,
+            reset_at_ms,
+            true,
+        )
+        .await
 }
 
 enum PreparedRequest {
@@ -410,16 +488,15 @@ impl RequestAdmission {
         &self,
         session: &SessionId,
         turn_epoch: u64,
-    ) -> Result<PreparedRequest, BridgeError> {
+    ) -> Result<PreparedRequest, RemoteRequestFlightErrorV1> {
         // First reject a cancellation already linearized in the between-round
         // gap. No request identity or flight is minted in that case. Admission
         // is checked again after durable work and before publication to close
         // the race in the opposite direction.
         {
-            let sessions = self
-                .sessions
-                .lock()
-                .map_err(|_| BridgeError::InvalidStateTransition)?;
+            let sessions = self.sessions.lock().map_err(|_| {
+                RemoteRequestFlightErrorV1::Admission("session state poisoned".into())
+            })?;
             let Some(state) = sessions.get(session) else {
                 return Ok(PreparedRequest::TurnCancelled);
             };
@@ -429,30 +506,29 @@ impl RequestAdmission {
                 return Ok(PreparedRequest::TurnCancelled);
             }
             if state.active_request.is_some() {
-                return Err(BridgeError::InvalidStateTransition);
+                return Err(RemoteRequestFlightErrorV1::Admission(
+                    "another request is active".into(),
+                ));
             }
         }
 
         let mut flight = match &self.route {
             Some(route) => {
-                let request_id = self.request_ids.mint()?;
+                let request_id = self
+                    .request_ids
+                    .mint()
+                    .map_err(|_| RemoteRequestFlightErrorV1::IdentityUnavailable)?;
                 let owner = ResourceFlightOwnerV1::new(route.node_id.clone(), session.as_str())
-                    .map_err(|error| BridgeError::agent_crashed(error.to_string()))?;
-                Some(
-                    route
-                        .attempt
-                        .bind_remote_request(request_id, owner)
-                        .map_err(request_flight_error)?,
-                )
+                    .map_err(|error| RemoteRequestFlightErrorV1::Admission(error.to_string()))?;
+                Some(route.attempt.bind_remote_request(request_id, owner)?)
             }
             None => None,
         };
 
         let active_conflict = {
-            let mut sessions = self
-                .sessions
-                .lock()
-                .map_err(|_| BridgeError::InvalidStateTransition)?;
+            let mut sessions = self.sessions.lock().map_err(|_| {
+                RemoteRequestFlightErrorV1::Admission("session state poisoned".into())
+            })?;
             match sessions.get_mut(session) {
                 None => false,
                 Some(state)
@@ -468,18 +544,24 @@ impl RequestAdmission {
                             ActiveRequestIdentity::Dedicated(flight.request_id().clone())
                         }
                         None => {
-                            state.next_legacy_request = state
-                                .next_legacy_request
-                                .checked_add(1)
-                                .ok_or(BridgeError::InvalidStateTransition)?;
+                            state.next_legacy_request =
+                                state.next_legacy_request.checked_add(1).ok_or_else(|| {
+                                    RemoteRequestFlightErrorV1::Admission(
+                                        "legacy request authority exhausted".into(),
+                                    )
+                                })?;
                             ActiveRequestIdentity::Legacy(state.next_legacy_request)
                         }
                     };
                     let (cancel_control, cancel_rx) = watch::channel(false);
+                    let settlement = flight
+                        .as_ref()
+                        .map(DurableRemoteRequestFlightV3::settlement_handle);
                     state.active_request = Some(ActiveRequestSlot {
                         turn_epoch,
                         identity: identity.clone(),
                         cancel_control: cancel_control.clone(),
+                        settlement,
                     });
                     let cancel = RequestCancelCapability {
                         sessions: Arc::clone(&self.sessions),
@@ -504,20 +586,16 @@ impl RequestAdmission {
         // request. Settle outside the session lock so node aggregation may
         // re-enter unrelated bridge state without deadlocking this session.
         if let Some(flight) = &mut flight {
-            flight
-                .settle(ResourceActionDispositionV1::Failed)
-                .map_err(request_flight_error)?;
+            flight.settle(ResourceActionDispositionV1::Failed)?;
         }
         if active_conflict {
-            Err(BridgeError::InvalidStateTransition)
+            Err(RemoteRequestFlightErrorV1::Admission(
+                "another request won publication".into(),
+            ))
         } else {
             Ok(PreparedRequest::TurnCancelled)
         }
     }
-}
-
-fn request_flight_error(error: RemoteRequestFlightErrorV1) -> BridgeError {
-    BridgeError::agent_crashed(error.to_string())
 }
 
 pub struct ApiBackend {
@@ -525,6 +603,7 @@ pub struct ApiBackend {
     client: reqwest::Client,
     policy: Arc<StdMutex<Arc<dyn PolicyEngine>>>,
     sessions: Arc<StdMutex<HashMap<SessionId, SessionState>>>,
+    next_turn_authority: AtomicU64,
     request_ids: Arc<dyn RemoteRequestIdSource>,
 }
 
@@ -551,6 +630,7 @@ impl ApiBackend {
             client,
             policy: Arc::new(StdMutex::new(Arc::new(AutoApprove) as Arc<dyn PolicyEngine>)),
             sessions: Arc::new(StdMutex::new(HashMap::new())),
+            next_turn_authority: AtomicU64::new(0),
             request_ids: Arc::new(SystemRemoteRequestIdSource),
         }
     }
@@ -564,7 +644,8 @@ impl ApiBackend {
     }
 
     #[must_use]
-    pub fn with_request_id_source(mut self, source: Arc<dyn RemoteRequestIdSource>) -> Self {
+    #[cfg(test)]
+    pub(crate) fn with_request_id_source(mut self, source: Arc<dyn RemoteRequestIdSource>) -> Self {
         self.request_ids = source;
         self
     }
@@ -589,11 +670,15 @@ impl ApiBackend {
         if state.current_turn_epoch.is_some() || state.active_request.is_some() {
             return Err(BridgeError::InvalidStateTransition);
         }
-        state.next_turn_epoch = state
-            .next_turn_epoch
+        let prior = self
+            .next_turn_authority
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+                value.checked_add(1)
+            })
+            .map_err(|_| BridgeError::InvalidStateTransition)?;
+        let epoch = prior
             .checked_add(1)
             .ok_or(BridgeError::InvalidStateTransition)?;
-        let epoch = state.next_turn_epoch;
         state.current_turn_epoch = Some(epoch);
         state.cancelled_turn_epoch = None;
         Ok(TurnScope {
@@ -637,6 +722,42 @@ impl ApiBackend {
             )));
         }
         Ok(())
+    }
+
+    async fn cleanup_session_checked(
+        &self,
+        session: &SessionId,
+    ) -> Result<BackendCleanupDispositionV1, BridgeError> {
+        let settlement = {
+            let mut sessions = self
+                .sessions
+                .lock()
+                .map_err(|_| BridgeError::InvalidStateTransition)?;
+            let settlement = sessions.get_mut(session).and_then(|state| {
+                if let Some(epoch) = state.current_turn_epoch {
+                    state.cancelled_turn_epoch = Some(epoch);
+                }
+                state.active_request.as_ref().and_then(|active| {
+                    let _ = active.cancel_control.send(true);
+                    active.settlement.clone()
+                })
+            });
+            sessions.remove(session);
+            settlement
+        };
+
+        let Some(settlement) = settlement else {
+            return Ok(BackendCleanupDispositionV1::Complete);
+        };
+        let join = tokio::task::spawn_blocking(move || settlement.join_blocking());
+        match tokio::time::timeout(self.cfg.request_timeout, join).await {
+            Ok(Ok(Ok(result))) if result.disposition == ResourceActionDispositionV1::Complete => {
+                Ok(BackendCleanupDispositionV1::Complete)
+            }
+            Ok(Ok(Ok(_))) | Ok(Ok(Err(_))) | Ok(Err(_)) | Err(_) => {
+                Ok(BackendCleanupDispositionV1::Unknown)
+            }
+        }
     }
 }
 
@@ -710,10 +831,24 @@ impl ApiBackend {
             // the provider, every later failure is fatal and non-replayable.
             let mut acceptance_barrier_crossed = false;
             for round in 0..max_rounds {
+                let prepared = match request_admission.prepare(&session, turn_epoch) {
+                    Ok(prepared) => prepared,
+                    Err(error) => Err(lifecycle
+                        .request_flight_failure(error, acceptance_barrier_crossed)
+                        .await)?,
+                };
                 let PreparedRequest::Ready {
                     scope,
                     mut cancel_rx,
-                } = request_admission.prepare(&session, turn_epoch)? else {
+                } = prepared else {
+                    if !acceptance_barrier_crossed {
+                        lifecycle
+                            .record(DiagnosticPhase::PromptStart, PhaseStatus::Completed)
+                            .await?;
+                        lifecycle
+                            .record(DiagnosticPhase::PromptStream, PhaseStatus::Started)
+                            .await?;
+                    }
                     complete_prompt_lifecycle(&lifecycle).await?;
                     yield Update::Done {
                         stop_reason: STOP_REASON_CANCELLED.into(),
@@ -724,10 +859,19 @@ impl ApiBackend {
                 let mut scope = Some(scope);
                 // Durable reservation, owner attachment, identity evidence,
                 // intent, and dispatch all precede installation of the POST future.
-                scope
+                if let Err(error) = scope
                     .as_mut()
-                    .ok_or(BridgeError::InvalidStateTransition)?
-                    .begin_dispatch()?;
+                    .ok_or_else(|| {
+                        RemoteRequestFlightErrorV1::Admission(
+                            "request scope disappeared before dispatch".into(),
+                        )
+                    })
+                    .and_then(RequestScope::begin_dispatch)
+                {
+                    Err(lifecycle
+                        .request_flight_failure(error, acceptance_barrier_crossed)
+                        .await)?;
+                }
                 let req = ChatRequest { model: model.clone(), messages: messages.clone(),
                     tools: vec![crate::tool::tool_def()], stream: do_stream };
                 let mut builder = client.post(&url).json(&req);
@@ -739,7 +883,13 @@ impl ApiBackend {
                     install_first_send(&lifecycle, || builder.send()).await?
                 };
                 if *cancel_rx.borrow() {
-                    settle_request_scope(&mut scope, ResourceActionDispositionV1::Partial)?;
+                    settle_request_scope_or_fail(
+                        &lifecycle,
+                        &mut scope,
+                        ResourceActionDispositionV1::Partial,
+                        true,
+                    )
+                    .await?;
                     complete_prompt_lifecycle(&lifecycle).await?;
                     yield Update::Done {
                         stop_reason: STOP_REASON_CANCELLED.into(),
@@ -760,7 +910,13 @@ impl ApiBackend {
                     }
                 };
                 let Some(send_result) = send_result else {
-                    settle_request_scope(&mut scope, ResourceActionDispositionV1::Partial)?;
+                    settle_request_scope_or_fail(
+                        &lifecycle,
+                        &mut scope,
+                        ResourceActionDispositionV1::Partial,
+                        true,
+                    )
+                    .await?;
                     complete_prompt_lifecycle(&lifecycle).await?;
                     yield Update::Done {
                         stop_reason: STOP_REASON_CANCELLED.into(),
@@ -772,9 +928,9 @@ impl ApiBackend {
                     Ok(response) => response,
                     Err(error) => {
                         let (class, code, summary) = request_failure(&error, "api.prompt.send");
-                        settle_request_scope(&mut scope, ResourceActionDispositionV1::Failed)?;
-                        Err(lifecycle
-                            .failure(
+                        Err(provider_failure_after_settlement(
+                                &lifecycle,
+                                &mut scope,
                                 class,
                                 code,
                                 summary,
@@ -802,7 +958,13 @@ impl ApiBackend {
                         }
                     };
                     let Some(body_result) = body_result else {
-                        settle_request_scope(&mut scope, ResourceActionDispositionV1::Partial)?;
+                        settle_request_scope_or_fail(
+                            &lifecycle,
+                            &mut scope,
+                            ResourceActionDispositionV1::Partial,
+                            true,
+                        )
+                        .await?;
                         complete_prompt_lifecycle(&lifecycle).await?;
                         yield Update::Done {
                             stop_reason: STOP_REASON_CANCELLED.into(),
@@ -815,9 +977,9 @@ impl ApiBackend {
                         Err(error) => {
                             let (class, code, summary) =
                                 request_failure(&error, "api.prompt.error_body_read");
-                            settle_request_scope(&mut scope, ResourceActionDispositionV1::Failed)?;
-                            Err(lifecycle
-                                .failure(
+                            Err(provider_failure_after_settlement(
+                                    &lifecycle,
+                                    &mut scope,
                                     class,
                                     code,
                                     summary,
@@ -840,9 +1002,9 @@ impl ApiBackend {
                         &headers,
                         diagnostic_timestamp_ms(),
                     );
-                    settle_request_scope(&mut scope, ResourceActionDispositionV1::Failed)?;
-                    Err(lifecycle
-                        .failure(
+                    Err(provider_failure_after_settlement(
+                            &lifecycle,
+                            &mut scope,
                             class,
                             code,
                             "Upstream API rejected the prompt",
@@ -872,10 +1034,13 @@ impl ApiBackend {
                         };
                         let Some(chunk) = chunk else {
                             if *cancel_rx.borrow() {
-                                settle_request_scope(
+                                settle_request_scope_or_fail(
+                                    &lifecycle,
                                     &mut scope,
                                     ResourceActionDispositionV1::Partial,
-                                )?;
+                                    true,
+                                )
+                                .await?;
                                 complete_prompt_lifecycle(&lifecycle).await?;
                                 yield Update::Done {
                                     stop_reason: STOP_REASON_CANCELLED.into(),
@@ -890,12 +1055,9 @@ impl ApiBackend {
                             Err(error) => {
                                 let (class, code, summary) =
                                     request_failure(&error, "api.prompt.sse_read");
-                                settle_request_scope(
-                                    &mut scope,
-                                    ResourceActionDispositionV1::Failed,
-                                )?;
-                                Err(lifecycle
-                                    .failure(
+                                Err(provider_failure_after_settlement(
+                                        &lifecycle,
+                                        &mut scope,
                                         class,
                                         code,
                                         summary,
@@ -916,12 +1078,9 @@ impl ApiBackend {
                                 }
                                 Ok(None) => {}
                                 Err(_) => {
-                                    settle_request_scope(
-                                        &mut scope,
-                                        ResourceActionDispositionV1::Failed,
-                                    )?;
-                                    Err(lifecycle
-                                        .failure(
+                                    Err(provider_failure_after_settlement(
+                                            &lifecycle,
+                                            &mut scope,
                                             DiagnosticFailureClass::Protocol,
                                             "api.prompt.sse_frame",
                                             "Upstream API returned a malformed SSE frame",
@@ -946,12 +1105,9 @@ impl ApiBackend {
                             }
                             Ok(None) => {}
                             Err(_) => {
-                                settle_request_scope(
-                                    &mut scope,
-                                    ResourceActionDispositionV1::Failed,
-                                )?;
-                                Err(lifecycle
-                                    .failure(
+                                Err(provider_failure_after_settlement(
+                                        &lifecycle,
+                                        &mut scope,
                                         DiagnosticFailureClass::Protocol,
                                         "api.prompt.sse_frame",
                                         "Upstream API returned a malformed SSE frame",
@@ -964,9 +1120,9 @@ impl ApiBackend {
                         }
                     }
                     if !acc.is_done() {
-                        settle_request_scope(&mut scope, ResourceActionDispositionV1::Failed)?;
-                        Err(lifecycle
-                            .failure(
+                        Err(provider_failure_after_settlement(
+                                &lifecycle,
+                                &mut scope,
                                 DiagnosticFailureClass::Protocol,
                                 "api.prompt.sse_incomplete",
                                 "Upstream API ended SSE before terminal evidence",
@@ -992,7 +1148,13 @@ impl ApiBackend {
                         }
                     };
                     let Some(body_result) = body_result else {
-                        settle_request_scope(&mut scope, ResourceActionDispositionV1::Partial)?;
+                        settle_request_scope_or_fail(
+                            &lifecycle,
+                            &mut scope,
+                            ResourceActionDispositionV1::Partial,
+                            true,
+                        )
+                        .await?;
                         complete_prompt_lifecycle(&lifecycle).await?;
                         yield Update::Done {
                             stop_reason: STOP_REASON_CANCELLED.into(),
@@ -1005,9 +1167,9 @@ impl ApiBackend {
                         Err(error) => {
                             let (class, code, summary) =
                                 request_failure(&error, "api.prompt.body_read");
-                            settle_request_scope(&mut scope, ResourceActionDispositionV1::Failed)?;
-                            Err(lifecycle
-                                .failure(
+                            Err(provider_failure_after_settlement(
+                                    &lifecycle,
+                                    &mut scope,
                                     class,
                                     code,
                                     summary,
@@ -1021,9 +1183,9 @@ impl ApiBackend {
                     let p = match crate::wire::parse_nonstream(&body) {
                         Ok(parsed) => parsed,
                         Err(_) => {
-                            settle_request_scope(&mut scope, ResourceActionDispositionV1::Failed)?;
-                            Err(lifecycle
-                                .failure(
+                            Err(provider_failure_after_settlement(
+                                    &lifecycle,
+                                    &mut scope,
                                     DiagnosticFailureClass::Protocol,
                                     "api.prompt.body_parse",
                                     "Upstream API returned a malformed response body",
@@ -1040,7 +1202,13 @@ impl ApiBackend {
                     }
                     p
                 };
-                settle_request_scope(&mut scope, ResourceActionDispositionV1::Complete)?;
+                settle_request_scope_or_fail(
+                    &lifecycle,
+                    &mut scope,
+                    ResourceActionDispositionV1::Complete,
+                    true,
+                )
+                .await?;
                 if parsed.tool_calls.is_empty() {
                     complete_prompt_lifecycle(&lifecycle).await?;
                     yield Update::Done { stop_reason: "stop".into() , prefix_attestation: Default::default()}; return;
@@ -1253,6 +1421,20 @@ impl AgentBackend for ApiBackend {
             map.remove(session);
         }
     }
+
+    async fn forget_session_checked(
+        &self,
+        session: &SessionId,
+    ) -> Result<BackendCleanupDispositionV1, BridgeError> {
+        self.cleanup_session_checked(session).await
+    }
+
+    async fn release_session_checked(
+        &self,
+        session: &SessionId,
+    ) -> Result<BackendCleanupDispositionV1, BridgeError> {
+        self.cleanup_session_checked(session).await
+    }
 }
 
 /// Silent permission decision for one tool call → the `content` of its tool-result
@@ -1392,6 +1574,105 @@ mod tests {
         send.await;
 
         assert!(observer.saw_prompt_start_completed.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn cancel_before_first_stream_poll_closes_the_lifecycle() {
+        let backend = ApiBackend::new(crate::config::ApiConfig::new("http://127.0.0.1:1"));
+        let session = SessionId::parse("cancel-before-first-poll").unwrap();
+        let observer =
+            Arc::new(bridge_core::diagnostics::InMemoryDiagnosticObserver::new(16).unwrap());
+        let mut stream = backend
+            .prompt_with_observers(
+                &session,
+                vec![Part { text: "hi".into() }],
+                BackendObservers::diagnostic_only(observer.clone()),
+            )
+            .await
+            .unwrap();
+
+        backend.cancel(&session).await.unwrap();
+        let mut updates = Vec::new();
+        while let Some(update) = stream.next().await {
+            updates.push(update.unwrap());
+        }
+
+        assert!(matches!(
+            updates.last(),
+            Some(Update::Done { stop_reason, .. }) if stop_reason == STOP_REASON_CANCELLED
+        ));
+        let transitions: Vec<_> = observer
+            .snapshot()
+            .await
+            .into_iter()
+            .map(|event| (event.transition().phase(), event.transition().status()))
+            .collect();
+        assert_eq!(
+            transitions,
+            vec![
+                (DiagnosticPhase::PromptStart, PhaseStatus::Started),
+                (DiagnosticPhase::PromptStart, PhaseStatus::Completed),
+                (DiagnosticPhase::PromptStream, PhaseStatus::Started),
+                (DiagnosticPhase::PromptStream, PhaseStatus::Completed),
+                (DiagnosticPhase::PromptFinish, PhaseStatus::Started),
+                (DiagnosticPhase::PromptFinish, PhaseStatus::Completed),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn forgotten_session_authority_cannot_alias_a_recreated_session() {
+        for identity in [
+            ActiveRequestIdentity::Legacy(0),
+            ActiveRequestIdentity::Dedicated(request_id('a')),
+        ] {
+            let backend = ApiBackend::new(crate::config::ApiConfig::new("http://127.0.0.1:1"));
+            let session = SessionId::parse("forget-recreate-aba").unwrap();
+            let old_turn = backend.begin_turn(&session).unwrap();
+            let old_epoch = old_turn.epoch;
+            let stale = RequestCancelCapability {
+                sessions: Arc::clone(&backend.sessions),
+                session: session.clone(),
+                turn_epoch: old_epoch,
+                identity: identity.clone(),
+            };
+
+            backend.forget_session(&session).await;
+            let new_turn = backend.begin_turn(&session).unwrap();
+            let new_epoch = new_turn.epoch;
+            let (new_cancel, new_rx) = watch::channel(false);
+            backend
+                .sessions
+                .lock()
+                .unwrap()
+                .get_mut(&session)
+                .unwrap()
+                .active_request = Some(ActiveRequestSlot {
+                turn_epoch: new_epoch,
+                identity: identity.clone(),
+                cancel_control: new_cancel,
+                settlement: None,
+            });
+
+            assert_ne!(old_epoch, new_epoch, "turn authority must never be reused");
+            assert!(
+                !stale.cancel_exact(),
+                "stale cancel must refuse successor B"
+            );
+            assert!(!stale.clear_exact(), "stale clear must refuse successor B");
+            drop(old_turn);
+
+            let sessions = backend.sessions.lock().unwrap();
+            let successor = sessions.get(&session).unwrap();
+            assert_eq!(successor.current_turn_epoch, Some(new_epoch));
+            assert_eq!(
+                successor.active_request.as_ref().map(|slot| &slot.identity),
+                Some(&identity)
+            );
+            assert!(!*new_rx.borrow(), "successor B must remain uncancelled");
+            drop(sessions);
+            drop(new_turn);
+        }
     }
 
     #[tokio::test]
@@ -1635,6 +1916,19 @@ mod tests {
         })
     }
 
+    async fn wait_for_provider_requests(server: &MockServer, expected: usize) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if server.received_requests().await.unwrap().len() == expected {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("provider request count was not reached");
+    }
+
     #[tokio::test]
     async fn stale_round_one_cancel_cannot_cancel_round_two() {
         let server = MockServer::start().await;
@@ -1771,6 +2065,14 @@ mod tests {
                 } if request_id == &expected
             )));
         }
+        assert_eq!(
+            fixture
+                .backend
+                .forget_session_checked(&session)
+                .await
+                .unwrap(),
+            BackendCleanupDispositionV1::Complete
+        );
     }
 
     struct BetweenRoundsPolicy {
@@ -1895,8 +2197,18 @@ mod tests {
         let updates = spawn_drain(Arc::clone(&fixture.backend), session)
             .await
             .unwrap();
-        assert!(updates.iter().any(Result::is_err));
+        let diagnostic = updates
+            .iter()
+            .find_map(|update| match update {
+                Err(BridgeError::AgentFailure { diagnostic }) => Some(diagnostic.as_ref()),
+                _ => None,
+            })
+            .expect("round-two custody failure must be structured");
+        assert_eq!(diagnostic.class(), DiagnosticFailureClass::Persistence);
+        assert_eq!(diagnostic.disposition(), FailureDisposition::Fatal);
+        assert!(diagnostic.prompt_may_have_been_accepted());
         assert_eq!(server.received_requests().await.unwrap().len(), 1);
+        assert!(!fixture.journal_root.exists());
         assert_eq!(fixture.ids.minted.load(Ordering::SeqCst), 2);
         let aggregations = fixture.publisher.0.lock().unwrap();
         assert_eq!(aggregations.len(), 1);
@@ -1934,7 +2246,16 @@ mod tests {
         let updates = spawn_drain(Arc::clone(&fixture.backend), session)
             .await
             .unwrap();
-        assert!(updates.iter().any(Result::is_err));
+        let diagnostic = updates
+            .iter()
+            .find_map(|update| match update {
+                Err(BridgeError::AgentFailure { diagnostic }) => Some(diagnostic.as_ref()),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("pre-send custody refusal must be structured: {updates:?}"));
+        assert_eq!(diagnostic.class(), DiagnosticFailureClass::Persistence);
+        assert_eq!(diagnostic.disposition(), FailureDisposition::Fatal);
+        assert!(!diagnostic.prompt_may_have_been_accepted());
         assert_eq!(server.received_requests().await.unwrap().len(), 0);
         assert_eq!(fixture.ids.minted.load(Ordering::SeqCst), 1);
         assert!(
@@ -2056,7 +2377,122 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn forget_session_cancels_and_settles_the_exact_request_once() {
+    async fn checked_forget_and_release_join_the_exact_request_winner() {
+        for (operation, id_digit) in [("forget", 'c'), ("release", 'd')] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/v1/chat/completions"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .insert_header("content-type", "text/event-stream")
+                        .set_body_string(stop_sse())
+                        .set_delay(Duration::from_secs(5)),
+                )
+                .mount(&server)
+                .await;
+            let id = request_id(id_digit);
+            let fixture = protected_backend(
+                format!("{}/v1", server.uri()),
+                vec![id.clone()],
+                64,
+                4,
+                None,
+            );
+            let session = SessionId::parse(format!("{operation}-exact")).unwrap();
+            fixture
+                .backend
+                .attach_resource_flight_owner_v1(&session)
+                .unwrap();
+            let task = spawn_drain(Arc::clone(&fixture.backend), session.clone());
+            wait_for_active_request(
+                &fixture.backend,
+                &session,
+                &ActiveRequestIdentity::Dedicated(id),
+            )
+            .await;
+            wait_for_provider_requests(&server, 1).await;
+            let cleanup = if operation == "forget" {
+                fixture.backend.forget_session_checked(&session).await
+            } else {
+                fixture.backend.release_session_checked(&session).await
+            }
+            .unwrap();
+
+            assert_eq!(cleanup, BackendCleanupDispositionV1::Unknown);
+            let updates = task.await.unwrap();
+            assert!(matches!(
+                updates.last(),
+                Some(Ok(Update::Done { stop_reason, .. })) if stop_reason == STOP_REASON_CANCELLED
+            ));
+            assert!(!fixture
+                .backend
+                .sessions
+                .lock()
+                .unwrap()
+                .contains_key(&session));
+            {
+                let aggregations = fixture.publisher.0.lock().unwrap();
+                assert_eq!(aggregations.len(), 1);
+                assert_eq!(
+                    aggregations[0].result.disposition,
+                    ResourceActionDispositionV1::Partial
+                );
+            }
+            assert_eq!(server.received_requests().await.unwrap().len(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn settlement_refusal_does_not_mask_the_provider_failure() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string("data: not-json\n\n")
+                    .set_delay(Duration::from_millis(200)),
+            )
+            .mount(&server)
+            .await;
+        let fixture = protected_backend(
+            format!("{}/v1", server.uri()),
+            vec![request_id('f')],
+            64,
+            4,
+            None,
+        );
+        let session = SessionId::parse("provider-plus-settlement").unwrap();
+        fixture
+            .backend
+            .attach_resource_flight_owner_v1(&session)
+            .unwrap();
+        let task = spawn_drain(Arc::clone(&fixture.backend), session);
+        wait_for_provider_requests(&server, 1).await;
+        std::fs::rename(
+            &fixture.journal_root,
+            fixture._root.path().join("journal-refusing-terminal"),
+        )
+        .unwrap();
+
+        let updates = task.await.unwrap();
+        let diagnostic = updates
+            .iter()
+            .find_map(|update| match update {
+                Err(BridgeError::AgentFailure { diagnostic }) => Some(diagnostic.as_ref()),
+                _ => None,
+            })
+            .expect("provider failure must remain structured");
+        assert_eq!(diagnostic.class(), DiagnosticFailureClass::Protocol);
+        assert!(diagnostic.prompt_may_have_been_accepted());
+        assert!(diagnostic
+            .causes()
+            .iter()
+            .any(|cause| cause.contains("durable request settlement refused")));
+    }
+
+    #[tokio::test]
+    async fn checked_cleanup_projects_terminal_refusal_as_unknown() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/v1/chat/completions"))
@@ -2068,7 +2504,7 @@ mod tests {
             )
             .mount(&server)
             .await;
-        let id = request_id('c');
+        let id = request_id('b');
         let fixture = protected_backend(
             format!("{}/v1", server.uri()),
             vec![id.clone()],
@@ -2076,7 +2512,7 @@ mod tests {
             4,
             None,
         );
-        let session = SessionId::parse("forget-exact").unwrap();
+        let session = SessionId::parse("cleanup-terminal-refusal").unwrap();
         fixture
             .backend
             .attach_resource_flight_owner_v1(&session)
@@ -2088,38 +2524,27 @@ mod tests {
             &ActiveRequestIdentity::Dedicated(id),
         )
         .await;
-        tokio::time::timeout(Duration::from_secs(2), async {
-            loop {
-                if server.received_requests().await.unwrap().len() == 1 {
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("provider did not receive the request before forget");
-        fixture.backend.forget_session(&session).await;
+        wait_for_provider_requests(&server, 1).await;
+        std::fs::rename(
+            &fixture.journal_root,
+            fixture._root.path().join("journal-refusing-cleanup"),
+        )
+        .unwrap();
 
+        assert_eq!(
+            fixture
+                .backend
+                .forget_session_checked(&session)
+                .await
+                .unwrap(),
+            BackendCleanupDispositionV1::Unknown
+        );
         let updates = task.await.unwrap();
-        assert!(matches!(
-            updates.last(),
-            Some(Ok(Update::Done { stop_reason, .. })) if stop_reason == STOP_REASON_CANCELLED
-        ));
-        assert!(!fixture
-            .backend
-            .sessions
-            .lock()
-            .unwrap()
-            .contains_key(&session));
-        {
-            let aggregations = fixture.publisher.0.lock().unwrap();
-            assert_eq!(aggregations.len(), 1);
-            assert_eq!(
-                aggregations[0].result.disposition,
-                ResourceActionDispositionV1::Partial
-            );
-        }
-        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+        assert!(updates.iter().any(|update| matches!(
+            update,
+            Err(BridgeError::AgentFailure { diagnostic })
+                if diagnostic.prompt_may_have_been_accepted()
+        )));
     }
 
     #[tokio::test]

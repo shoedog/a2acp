@@ -6,5 +6,5 @@ mod provider;
 pub mod tool;
 pub mod wire;
 
-pub use backend::{ApiBackend, RemoteRequestIdSource};
+pub use backend::ApiBackend;
 pub use config::{ApiConfig, ApiResourceFlightRouteV3};
