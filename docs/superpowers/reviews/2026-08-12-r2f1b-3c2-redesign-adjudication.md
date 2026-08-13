@@ -219,5 +219,24 @@ process/container changes, or two consecutive task cuts exceed their declared
 stop thresholds because the authority is inseparable. Current source evidence
 establishes none of those conditions.
 
+## Planning-record verification
+
+Exact checkpoint `0d72415a1f826408891d9fe64b2ca5ceb2037adf` passed:
+
+- `git diff --check` and `cargo fmt --all -- --check` — exit 0;
+- `cargo test --workspace --locked --quiet` — 3,211 passed, 0 failed,
+  12 ignored across 85 harnesses.
+
+Those totals describe the older planning branch's code, not current main or the
+3c2 feature tree. The ignored population is the declared authenticated/live
+set, including Kiro and local Ollama. Repository hygiene compiled and ran, then
+refused only four pre-existing user-owned untracked files under `examples/`:
+`a2a-bridge.2c2-repair-impl.toml`,
+`a2a-bridge.m4-slice3a-impl-openegress.toml`,
+`a2a-bridge.m4-slice3a-impl.toml`, and
+`a2a-bridge.r2f1b-impl.toml`. They were preserved and excluded, not deleted or
+rebaselined. No code, provider, smoke, compatibility, deployment, or operator
+effect was exercised by these gates.
+
 **DESIGN ADJUDICATION: APPROVE SALVAGE PLAN; KEEP 3c2 PARKED FROM IMPLEMENTATION
 LANDING UNTIL TASKS A-G AND THE AGGREGATE REVIEW/GATES COMPLETE.**
