@@ -5,6 +5,11 @@ Base: `42249b3d926b49afd9d0dbd213d0ee3d3e459af6`
 
 ## Outcome
 
+**Superseding status:** this code is a preserved, rejected partial artifact.
+The design escalation has completed and approves salvage through a
+request-specific replacement, but this exact head remains non-foldable. The
+paragraphs below describe what the artifact implemented, not accepted delivery.
+
 Every HTTP POST/tool round issued by `ApiBackend` now owns a distinct,
 attempt-registry-reserved `DedicatedRemoteRequest` flight when an injected V3
 route is present. Cancellation owns two separate authorities:
@@ -332,3 +337,45 @@ descriptor-root design. It is open-class at the declared review cap. Per
 convergence discipline, 3c2 is parked for spec/design; no second repair round,
 fold, push, CI, provider, smoke, compatibility case, deployment, or running
 operator action was performed. Production remains unarmed.
+
+## Design escalation resolved — salvage plan approved
+
+One capped independent design round ran against exact preserved head
+`530992b7ff1e8e9151fb2a69e86f3ff71c44f905` and landed base `42249b3d`: Sol/xhigh
+hard-read-only and Fable Opus/xhigh plan both returned `DESIGN LENS: READY` with
+no unresolved blocker. Operator source adjudication selected the convergent
+salvage result and resolved their architectural disagreement:
+
+- keep this artifact's request identity, backend-global turn authority,
+  stale-scope cancellation fences, lifecycle grammar, acceptance barrier, and
+  error/diagnostic repairs;
+- replace the request adaptation of `ResourceFlightRegistryV1` with a separate
+  descriptor-rooted request journal/state machine;
+- recover only once behind an exclusive attempt-lifetime lease and before route
+  publication;
+- make the initial durable child atomic, cap active children at 4,096 before
+  mutation, and retire only publication-acknowledged terminal children;
+- preserve exactly one observable sink effect through a durable idempotent
+  delivery ID plus matching acknowledgement;
+- distinguish pre-first-poll `Failed`/accepted=false from post-arm
+  `Unknown`/accepted=true;
+- move request cleanup/drop observation to an owned async cell with no detached
+  blocking waiter; and
+- pass the exact protective cleanup disposition to retry, where only `Complete`
+  permits another provider attempt.
+
+The binding seven-task plan, both lens records, original brief, Opus side-plan
+artifact, operator adjudication, and roadmap cursor are durably checkpointed on
+the planning branch at
+`0d72415a1f826408891d9fe64b2ca5ceb2037adf`. Tasks A-G each freeze the exact
+predecessor commit, stay at or below 500 production lines, start with a
+pre-change red crash/concurrency regression, run the full workspace gate before
+commit, and have a declared one-review plus one-targeted-repair/closure cap.
+
+This is design approval, not implementation acceptance. Do not fold or push
+this head, arm production V3, create a production request-journal root, or
+advance 3d. The next action is Task A (descriptor primitives/root custody) on
+this preserved branch; the exact resulting commit becomes Task B's frozen
+input. The two-field `CleanupReportV1 { result, checkout }` carry-forward remains
+mandatory in the first later slice that arms production V3 or wraps
+`ContainerRw`.
