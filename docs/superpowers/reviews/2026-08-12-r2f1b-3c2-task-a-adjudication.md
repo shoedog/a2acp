@@ -103,3 +103,19 @@ not accepted delivery. No feature integration, fold, full host acceptance gate,
 push, CI, provider call, smoke, compatibility run, deployment, or operator
 mutation followed. Production API V3 remains unarmed; Task B and 3d remain
 blocked.
+
+## Superseding design resolution
+
+The capped Sol/xhigh plus Opus/xhigh custody round and operator adjudication are
+now complete. The binding result is
+[`2026-08-12-r2f1b-3c2-task-a-custody-design-adjudication.md`](2026-08-12-r2f1b-3c2-task-a-custody-design-adjudication.md).
+It selects an owner-private cooperating-participant contract, an externally
+bound trusted anchor plus sibling operation-lock object, required birthtime,
+no-replace capture with distinct replace/retire recovery namespaces, owned
+stage/append sessions, and a protective result lattice in which only `Complete`
+projects success.
+
+The design park is therefore resolved, but implementation acceptance is not.
+The exact retained candidate `517703cb` remains the salvage input and remains
+non-integrable. Task A is split into A1-A4; Task B and 3d stay blocked until all
+four cuts are individually green, reviewed, committed, and integrated.

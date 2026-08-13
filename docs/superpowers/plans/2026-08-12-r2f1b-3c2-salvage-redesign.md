@@ -2,7 +2,7 @@
 
 Date: 2026-08-12
 
-Status: **DESIGN APPROVED FOR SALVAGE IMPLEMENTATION; IMPLEMENTATION NOT STARTED**
+Status: **DESIGN APPROVED FOR SALVAGE IMPLEMENTATION; TASK A1 READY**
 
 Landed base: `42249b3d926b49afd9d0dbd213d0ee3d3e459af6`
 
@@ -255,28 +255,63 @@ dispatch, replace `S1`...`S6` below with the predecessor's 40-hex commit. A
 branch name or moving ref is not a frozen input. Each task writes the lane
 handoff before its commit and leaves the whole tree green.
 
-### A. Descriptor primitives and journal-root custody
+### A1-A4. Descriptor primitives and journal-root custody
 
-- Frozen input: `S0 = 530992b7ff1e8e9151fb2a69e86f3ff71c44f905`.
-- Own: `crates/bridge-core/src/fs_custody.rs`, narrow liveness helpers, exports,
-  focused tests, handoff.
-- Add descriptor-relative child operations, open-file locking, and
-  `JournalRootCustodyV1`; do not migrate the shared file journal in this task.
-- Red tests: rename/replace never redirects; removed root never recreates;
-  expected-identity mismatch refuses; child symlink refuses; retained lock fd
-  remains the same object after name replacement.
-- Focused gates: `cargo test -p bridge-core fs_custody` and the new root-custody
-  module.
-- Stop/split: 450 production or 800 total changed lines. Split platform
-  primitives before adding a path fallback. No fallback is permitted.
+The first implementation attempt is preserved at exact retained commit
+`517703cbd2e469bf208f20a36248169536bca8b3`. Its review cap exposed an open-class
+route/namespace-CAS family, so it is the salvage input rather than accepted
+delivery. The binding custody adjudication is
+[`2026-08-12-r2f1b-3c2-task-a-custody-design-adjudication.md`](../reviews/2026-08-12-r2f1b-3c2-task-a-custody-design-adjudication.md).
+
+Task A executes as four sequential, individually green and reviewed commits:
+
+1. **A1 - identity, names, and no-replace capture foundations.** Start from exact
+   `517703cb`; add required object/content identity separation, bounded reversible
+   reserved names, immutable intent grammar, and policy-neutral no-replace
+   capture/restore classification. Stop at 200 production / 450 total.
+2. **A2 - trusted route binding and sibling operation lease.** Start from exact
+   A1; bind trusted anchor -> parent -> root plus the exact sibling lock object,
+   acquire/flock/re-prove before returning an owned operation, and remove
+   revalidate/path projection as authority. Stop at 220 / 500.
+3. **A3 - capture settlement and bounded crash recovery.** Start from exact A2;
+   add distinct replace/retire/stage/intent namespaces, replace rollback, retire
+   roll-forward, recovery tickets, and the protective outcome lattice. Stop at
+   320 / 700.
+4. **A4 - owned journal API and broken-method deletion.** Start from exact A3;
+   wire stage/publish/append/replace/retire/read/enumerate/sync through the owned
+   operation value, make retained debt write-blocking, delete the candidate's
+   raw writable-file/plain-replace/name-unlink/free-standing-lock APIs, and
+   restore lock-fd privacy. Stop at 280 / 650.
+
+The A1-A4 aggregate stops at 700 production / 1,500 total changed lines relative
+to `S0`. A cap breach parks before more code or before B; it never authorizes a
+path, exchange, replacing-rename, link/copy, or unchecked-unlink fallback.
+
+Task A remains scoped to the new request journal. Do not migrate the shared
+generation journal, worktree custody, `local_file`, either reaper, or recursive
+directory removal. Those callers cannot construct Task A's `Complete` proof.
+
+The binding red schedules include parent and root replacement at the actual
+pre-syscall/flock boundary; A/B target substitution before capture; takeover of
+the freed target; reserved-name substitution before cleanup; independent flock
+contention on the renamed original inode; every intent/capture/publish/sync/
+cleanup crash cut; and simultaneous proof that crashed replacement rolls back
+while crashed retirement rolls forward. Required birthtime absence and runtime
+primitive refusal return typed `Unsupported` with no fallback.
+
+Focused gates are the exact A1-A4 modules/selectors from the custody
+adjudication. Each cut also runs the common full gate below and writes the lane
+handoff before its one commit.
 
 ### B. Request journal, atomic admission, and bounded retirement
 
-- Frozen input: exact `S1`.
+- Frozen input: exact accepted A4 commit (`S1`).
 - Own: new `remote_request_flight.rs`, `bridge-core` exports, tests, handoff.
 - Implement the request child/checkpoint grammar, atomic initial publication,
   4,096-active cap, checked ordinal allocation, ack retirement, and strict
-  decoding. The module is unreachable outside tests.
+  decoding. Consume the full Task A namespace outcome: only `Complete` may
+  advance the checkpoint or acknowledge retirement; `Retained`, `Unknown`, or
+  `Unsupported` blocks the attempt. The module is unreachable outside tests.
 - Red tests: no zero-row reservation at every admission crash cut; capacity
   refuses before ID mint/mutation; more than 4,096 sequential acknowledged
   requests succeed; corrupt/over-cap census refuses; checkpoint-before-return
@@ -413,7 +448,8 @@ CleanupReportV1 {
 Both fields travel independently through persistence and terminal projection;
 only `Complete + Complete` may project `Complete`.
 
-3c2 is done only when A-G are individually committed and reviewed, the exact
+3c2 is done only when A1-A4 plus B-G (ten implementation tasks) are individually
+committed and reviewed, the exact
 aggregate diff passes the full gate, both aggregate lenses are adjudicated,
 the fold is byte-identical to the gated tree, and CI is green after landing.
 Until then 3c2 remains unarmed and 3d remains blocked.
