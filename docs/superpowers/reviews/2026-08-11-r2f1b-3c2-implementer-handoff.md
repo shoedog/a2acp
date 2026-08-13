@@ -422,3 +422,29 @@ Final verification:
 
 No live provider, smoke, compatibility, deployment, fold, push, API migration,
 or running-operator action was performed. Production remains unarmed.
+
+## Task A1 targeted closure repair
+
+Date: 2026-08-13. Frozen parent: `517703cbd2e469bf208f20a36248169536bca8b3`; repaired rejected artifact: `c0b5993a6c2ce5884ffcbb004f26442f2ba52b64`.
+
+### Repair result
+
+The descriptor-relative contract now captures the target with `rename_child_no_replace`, classifies the actual captured regular object by mandatory dev/inode/birthtime, and restores an unexpected capture only by the same exact no-replace primitive. Occupied custody cannot be clobbered; target takeover retains both objects as protective debt.
+`CustodyCaptureOutcomeV2` keeps no-effect refusal, expected capture, unexpected restoration, retained debt, unknown, compile unsupported, and runtime unsupported structurally distinct. There is no success projection or weaker fallback. Identity/name/intent behavior remains policy-neutral; real-file content length is outside identity, and both Replace/Retire bind distinct predecessor/staged identities and refuse overflow.
+
+### Admissible red evidence
+
+Focused tests were added before production repair and compiled against `c0b5993a` production with this exact cached-artifact command:
+```text
+CARGO_PKG_VERSION=0.3.1 rustc --edition=2021 --test crates/bridge-core/src/lib.rs -L dependency=target/debug/deps --extern async_stream=target/debug/deps/libasync_stream-b21bf6375faa6f1f.rlib --extern thiserror=target/debug/deps/libthiserror-09d2b04943c8968d.rlib --extern futures=target/debug/deps/libfutures-825610e75520da33.rlib --extern ring=target/debug/deps/libring-9970c10e834c7569.rlib --extern libc=target/debug/deps/liblibc-8844194d13f2ff95.rlib --extern trybuild=target/debug/deps/libtrybuild-f3ab7e2788b15dbc.rlib --extern serde_json=target/debug/deps/libserde_json-622dfe45f1596545.rlib --extern tokio=target/debug/deps/libtokio-aabdc131ccdff1d8.rlib --extern tempfile=target/debug/deps/libtempfile-53ead19774e889a3.rlib --extern tokio_stream=target/debug/deps/libtokio_stream-12d3b45a41c8900b.rlib --extern syn=target/debug/deps/libsyn-5515cf2d944c9107.rlib --extern serde=target/debug/deps/libserde-edd2d6fc2ac8d018.rlib --extern tracing=target/debug/deps/libtracing-e3db5561f662c768.rlib --extern toml=target/debug/deps/libtoml-5b8358668b668f07.rlib --extern async_trait=target/debug/deps/libasync_trait-4297081399e1ed63.so -o /tmp/bridge-core-custody-v2-red
+```
+It failed nonzero with 20 `E0425`/`E0433` errors naming the absent capture name/function, typed outcome/action, and retention reason: bridge-core was reached, so this was neither dependency refusal nor zero-selected red.
+
+### Verification and limits
+
+- Host Cargo selectors after repair: focused `custody_v2` 7 passed, 0 failed; full `fs_custody` 73 passed, 0 failed.
+- The first host focused run exposed macOS `ENOTSUP` as `ErrorKind::Uncategorized` (6/7); a raw-errno discriminator fixed that closed blind-tail defect without a fallback.
+- `cargo fmt --all -- --check` and `git diff --check`: exit 0.
+- Delta from frozen parent: 200 production + 224 colocated-test + 26 handoff = 450 lines; paths are `crates/bridge-core/src/fs_custody.rs` and this handoff.
+
+A2-A4, Task B, production V3, live providers, smoke, compatibility, deployment, fold, push, HTTP, and the running operator remain unarmed and unchanged.
