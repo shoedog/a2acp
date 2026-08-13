@@ -371,6 +371,10 @@ the planning branch at
 predecessor commit, stay at or below 500 production lines, start with a
 pre-change red crash/concurrency regression, run the full workspace gate before
 commit, and have a declared one-review plus one-targeted-repair/closure cap.
+Planning verification record `7b397bf6` adds the exact **3,211 passed / 0 failed
+/ 12 ignored across 85 harnesses** checkpoint result and the four preserved
+pre-existing untracked-config hygiene exclusions; those totals cover the older
+planning branch, not this feature code.
 
 This is design approval, not implementation acceptance. Do not fold or push
 this head, arm production V3, create a production request-journal root, or
