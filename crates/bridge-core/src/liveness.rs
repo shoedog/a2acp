@@ -159,7 +159,7 @@ pub fn acquire_lease_in(dir: &Path, run_id: &str) -> std::io::Result<LeaseGuard>
 /// every contender closes its descriptor prevents a later opener from locking a replacement inode concurrently.
 pub struct PersistentLockGuard {
     path: PathBuf,
-    _file: std::fs::File,
+    pub(crate) _file: std::fs::File,
 }
 impl PersistentLockGuard {
     pub fn path(&self) -> &Path {
@@ -237,6 +237,14 @@ pub fn acquire_persistent_lock_blocking_in(
     Ok(PersistentLockGuard { path, _file: file })
 }
 
+pub fn acquire_persistent_lock_file(
+    file: std::fs::File,
+    path: PathBuf,
+) -> std::io::Result<PersistentLockGuard> {
+    flock_nb(&file, true)?
+        .then_some(PersistentLockGuard { path, _file: file })
+        .ok_or(std::io::ErrorKind::WouldBlock.into())
+}
 /// Exclusively flock an already-created persistent lock without recreating its parent.
 pub fn acquire_existing_persistent_lock_blocking(
     path: &Path,

@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 use std::ffi::CStr;
 #[cfg(unix)]
 use std::ffi::CString;
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
@@ -142,6 +142,7 @@ pub struct RegularFileIdentityV1 {
     pub dev: Option<u64>,
     pub ino: Option<u64>,
     pub len: u64,
+    pub btime: BirthTimeV1,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -161,6 +162,8 @@ pub enum FsCustodyError {
     /// separately named operations so this is caller error, not a state to recover from.
     #[error("{0}: target does not exist")]
     TargetMissing(String),
+    #[error("{label}: enumeration exceeds the {limit}-child bound")]
+    EnumerationLimitExceeded { label: String, limit: usize },
     #[error("{0}: injected sync failure")]
     InjectedSync(String),
 }
@@ -524,7 +527,7 @@ impl PinnedDirectoryV1 {
         target_name: &OsStr,
         label: &str,
     ) -> Result<CustodyPublicationV1, FsCustodyError> {
-        let commit = replace_regular_child_impl(self, &source, target_name, label)?;
+        let commit = replace_regular_child_impl(self, &source, target_name, None, label)?;
         self.settle_publication(commit, &source, target_name, label, "replaced")
     }
 
@@ -585,6 +588,159 @@ impl PinnedDirectoryV1 {
     }
 }
 
+#[derive(Debug)]
+pub struct JournalRootCustodyV1 {
+    parent: PinnedDirectoryV1,
+    root: PinnedDirectoryV1,
+    root_name: OsString,
+}
+#[cfg(unix)]
+impl JournalRootCustodyV1 {
+    pub fn open(
+        parent_path: &Path,
+        root_name: &OsStr,
+        expected_parent: &DirectoryIdentityV1,
+        expected_root: &DirectoryIdentityV1,
+        label: &str,
+    ) -> Result<Self, FsCustodyError> {
+        let parent = PinnedDirectoryV1::open(parent_path, label)?;
+        if parent.identity() != expected_parent {
+            return Err(FsCustodyError::IdentityChanged(label.to_owned()));
+        }
+        let root = open_directory_child(&parent, root_name, label)?;
+        if root.identity() != expected_root {
+            return Err(FsCustodyError::IdentityChanged(label.to_owned()));
+        }
+        let custody = Self {
+            parent,
+            root,
+            root_name: root_name.to_os_string(),
+        };
+        custody.revalidate(label)?;
+        Ok(custody)
+    }
+    pub fn revalidate(&self, label: &str) -> Result<(), FsCustodyError> {
+        verify_directory_file(&self.parent.file, self.parent.identity(), label)?;
+        verify_directory_file(&self.root.file, self.root.identity(), label)?;
+        let child = open_directory_child_file(&self.parent.file, &self.root_name, label)?;
+        verify_directory_file(&child, self.root.identity(), label)
+    }
+    pub fn open_regular_child(&self, name: &OsStr, label: &str) -> Result<File, FsCustodyError> {
+        self.revalidate(label)?;
+        self.root.open_regular_file(name, label)
+    }
+    pub fn create_new_regular_child(
+        &self,
+        name: &OsStr,
+        label: &str,
+    ) -> Result<File, FsCustodyError> {
+        self.create_new_regular_child_with_before_mutation(name, label, || {})
+    }
+    fn create_new_regular_child_with_before_mutation<F>(
+        &self,
+        name: &OsStr,
+        label: &str,
+        before_mutation: F,
+    ) -> Result<File, FsCustodyError>
+    where
+        F: FnOnce(),
+    {
+        before_mutation();
+        self.revalidate(label)?;
+        create_new_regular_child_at(&self.root.file, name, label)
+    }
+    pub fn publish_new_regular_child(
+        &self,
+        source: RegularChildRefV1<'_>,
+        target_name: &OsStr,
+        label: &str,
+    ) -> Result<CustodyPublicationV1, FsCustodyError> {
+        self.root
+            .publish_new_regular_child_with_before_rename(source, target_name, label, || {
+                self.revalidate(label)
+            })
+    }
+    pub fn open_regular_child_for_append(
+        &self,
+        name: &OsStr,
+        expected: &RegularFileIdentityV1,
+        label: &str,
+    ) -> Result<File, FsCustodyError> {
+        self.revalidate(label)?;
+        let file = open_regular_child_for_update(&self.root.file, name, true, label)?;
+        verify_regular_file_identity(&file, expected, label)?;
+        Ok(file)
+    }
+    pub fn replace_regular_child(
+        &self,
+        source: RegularChildRefV1<'_>,
+        target_name: &OsStr,
+        expected_target: &RegularFileIdentityV1,
+        label: &str,
+    ) -> Result<CustodyPublicationV1, FsCustodyError> {
+        let commit = replace_regular_child_impl(
+            &self.root,
+            &source,
+            target_name,
+            Some((expected_target, self)),
+            label,
+        )?;
+        self.root
+            .settle_publication(commit, &source, target_name, label, "replaced")
+    }
+    pub fn enumerate_child_names(
+        &self,
+        limit: usize,
+        label: &str,
+    ) -> Result<Vec<OsString>, FsCustodyError> {
+        self.revalidate(label)?;
+        let directory = open_directory_child_file(&self.parent.file, &self.root_name, label)?;
+        verify_directory_file(&directory, self.root.identity(), label)?;
+        let names = enumerate_directory_names(&directory, limit, label)?;
+        self.revalidate(label)?;
+        Ok(names)
+    }
+    pub fn unlink_regular_child(
+        &self,
+        name: &OsStr,
+        expected: &RegularFileIdentityV1,
+        label: &str,
+    ) -> Result<(), FsCustodyError> {
+        let file = self.open_regular_child(name, label)?;
+        verify_regular_file_identity(&file, expected, label)?;
+        self.revalidate(label)?;
+        unlink_regular_child_at(&self.root.file, name, expected, label)
+    }
+    pub fn sync(&self, label: &str) -> Result<(), FsCustodyError> {
+        self.revalidate(label)?;
+        self.root.sync(label)
+    }
+    pub fn acquire_persistent_child_lock(
+        &self,
+        name: &OsStr,
+        expected: &RegularFileIdentityV1,
+        label: &str,
+    ) -> Result<crate::liveness::PersistentLockGuard, FsCustodyError> {
+        self.revalidate(label)?;
+        let file = open_regular_child_for_update(&self.root.file, name, false, label)?;
+        verify_regular_file_identity(&file, expected, label)?;
+        self.revalidate(label)?;
+        crate::liveness::acquire_persistent_lock_file(file, self.root.canonical_path.join(name))
+            .map_err(|error| FsCustodyError::Io(label.to_owned(), error))
+    }
+}
+#[cfg(not(unix))]
+impl JournalRootCustodyV1 {
+    pub fn open(
+        _parent_path: &Path,
+        _root_name: &OsStr,
+        _expected_parent: &DirectoryIdentityV1,
+        _expected_root: &DirectoryIdentityV1,
+        label: &str,
+    ) -> Result<Self, FsCustodyError> {
+        Err(FsCustodyError::Unsupported(label.to_owned()))
+    }
+}
 #[cfg(unix)]
 fn directory_path_identity(
     canonical_path: &Path,
@@ -926,6 +1082,268 @@ pub fn same_open_object(left: &std::fs::Metadata, right: &std::fs::Metadata) -> 
 }
 
 #[cfg(unix)]
+fn verify_directory_file(
+    file: &File,
+    expected: &DirectoryIdentityV1,
+    label: &str,
+) -> Result<(), FsCustodyError> {
+    use std::os::unix::fs::MetadataExt as _;
+    let (Some(expected_dev), Some(expected_ino), Some(expected_birth)) =
+        (expected.dev, expected.ino, expected.btime)
+    else {
+        return Err(FsCustodyError::Unsupported(label.to_owned()));
+    };
+    let metadata = file
+        .metadata()
+        .map_err(|error| FsCustodyError::Io(label.to_owned(), error))?;
+    if !metadata.is_dir() {
+        return Err(FsCustodyError::Unsupported(format!(
+            "{label}: expected a directory"
+        )));
+    }
+    let Some(observed_birth) = BirthTimeV1::from_metadata(&metadata) else {
+        return Err(FsCustodyError::Unsupported(label.to_owned()));
+    };
+    if metadata.dev() != expected_dev
+        || metadata.ino() != expected_ino
+        || observed_birth != expected_birth
+    {
+        return Err(FsCustodyError::IdentityChanged(label.to_owned()));
+    }
+    Ok(())
+}
+#[cfg(unix)]
+fn open_directory_child_file(
+    parent: &File,
+    name: &OsStr,
+    label: &str,
+) -> Result<File, FsCustodyError> {
+    let name = child_name_cstring(name, label)?;
+    open_child_no_follow(
+        parent,
+        &name,
+        ChildOpenOptionsV1 {
+            nonblocking: false,
+            directory: true,
+        },
+    )
+    .map_err(|error| FsCustodyError::Io(label.to_owned(), error))
+}
+#[cfg(unix)]
+fn open_directory_child(
+    parent: &PinnedDirectoryV1,
+    name: &OsStr,
+    label: &str,
+) -> Result<PinnedDirectoryV1, FsCustodyError> {
+    let file = open_directory_child_file(&parent.file, name, label)?;
+    let canonical_path = parent.canonical_path.join(name);
+    let identity = directory_identity(&canonical_path, &file, label)?;
+    Ok(PinnedDirectoryV1 {
+        file,
+        canonical_path,
+        identity,
+        sync_failure_countdown: FailureCountdownV1::new(),
+        publication_rename_failure_countdown: FailureCountdownV1::new(),
+        publication_rename_failure_shape: AtomicU8::new(0),
+    })
+}
+pub fn regular_file_identity(
+    file: &File,
+    label: &str,
+) -> Result<RegularFileIdentityV1, FsCustodyError> {
+    let metadata = file
+        .metadata()
+        .map_err(|error| FsCustodyError::Io(label.to_owned(), error))?;
+    if !metadata.is_file() {
+        return Err(FsCustodyError::Unsupported(format!(
+            "{label}: child is not a regular file"
+        )));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        Ok(RegularFileIdentityV1 {
+            dev: Some(metadata.dev()),
+            ino: Some(metadata.ino()),
+            len: metadata.len(),
+            btime: BirthTimeV1::from_metadata(&metadata)
+                .ok_or_else(|| FsCustodyError::Unsupported(label.to_owned()))?,
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = metadata;
+        Err(FsCustodyError::Unsupported(label.to_owned()))
+    }
+}
+fn verify_regular_file_identity(
+    file: &File,
+    expected: &RegularFileIdentityV1,
+    label: &str,
+) -> Result<(), FsCustodyError> {
+    if expected.dev.is_none() || expected.ino.is_none() {
+        return Err(FsCustodyError::Unsupported(label.to_owned()));
+    }
+    if regular_file_identity(file, label)? != *expected {
+        return Err(FsCustodyError::IdentityChanged(label.to_owned()));
+    }
+    Ok(())
+}
+#[cfg(unix)]
+fn create_new_regular_child_at(
+    parent: &File,
+    name: &OsStr,
+    label: &str,
+) -> Result<File, FsCustodyError> {
+    use std::os::fd::{AsRawFd as _, FromRawFd as _};
+    let name = child_name_cstring(name, label)?;
+    let fd = unsafe {
+        libc::openat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_CREAT | libc::O_EXCL | libc::O_RDWR | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+            0o600,
+        )
+    };
+    if fd == -1 {
+        let error = std::io::Error::last_os_error();
+        return if error.raw_os_error() == Some(libc::EEXIST) {
+            Err(FsCustodyError::TargetExists(label.to_owned()))
+        } else {
+            Err(FsCustodyError::Io(label.to_owned(), error))
+        };
+    }
+    let file = unsafe { File::from_raw_fd(fd) };
+    regular_file_identity(&file, label)?;
+    Ok(file)
+}
+#[cfg(unix)]
+fn open_regular_child_for_update(
+    parent: &File,
+    name: &OsStr,
+    append: bool,
+    label: &str,
+) -> Result<File, FsCustodyError> {
+    use std::os::fd::{AsRawFd as _, FromRawFd as _};
+    let name = child_name_cstring(name, label)?;
+    let mut flags = libc::O_RDWR | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK;
+    if append {
+        flags |= libc::O_APPEND;
+    }
+    let fd = unsafe { libc::openat(parent.as_raw_fd(), name.as_ptr(), flags) };
+    if fd == -1 {
+        return Err(FsCustodyError::Io(
+            label.to_owned(),
+            std::io::Error::last_os_error(),
+        ));
+    }
+    let file = unsafe { File::from_raw_fd(fd) };
+    regular_file_identity(&file, label)?;
+    Ok(file)
+}
+#[cfg(unix)]
+fn unlink_regular_child_at(
+    parent: &File,
+    name: &OsStr,
+    expected: &RegularFileIdentityV1,
+    label: &str,
+) -> Result<(), FsCustodyError> {
+    use std::os::fd::AsRawFd as _;
+    let opened = open_regular_child_for_update(parent, name, false, label)?;
+    verify_regular_file_identity(&opened, expected, label)?;
+    let name = child_name_cstring(name, label)?;
+    let result = unsafe { libc::unlinkat(parent.as_raw_fd(), name.as_ptr(), 0) };
+    if result == -1 {
+        return Err(FsCustodyError::Io(
+            label.to_owned(),
+            std::io::Error::last_os_error(),
+        ));
+    }
+    Ok(())
+}
+#[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
+struct DirectoryStreamV1(*mut libc::DIR);
+#[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
+impl Drop for DirectoryStreamV1 {
+    fn drop(&mut self) {
+        unsafe { libc::closedir(self.0) };
+    }
+}
+#[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
+fn errno_location() -> *mut libc::c_int {
+    #[cfg(target_os = "linux")]
+    unsafe {
+        libc::__errno_location()
+    }
+    #[cfg(target_os = "macos")]
+    unsafe {
+        libc::__error()
+    }
+}
+#[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
+fn enumerate_directory_names(
+    directory: &File,
+    limit: usize,
+    label: &str,
+) -> Result<Vec<OsString>, FsCustodyError> {
+    use std::os::fd::AsRawFd as _;
+    use std::os::unix::ffi::OsStringExt as _;
+    let fd = unsafe { libc::fcntl(directory.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
+    if fd == -1 {
+        return Err(FsCustodyError::Io(
+            label.to_owned(),
+            std::io::Error::last_os_error(),
+        ));
+    }
+    let stream = unsafe { libc::fdopendir(fd) };
+    if stream.is_null() {
+        unsafe { libc::close(fd) };
+        return Err(FsCustodyError::Io(
+            label.to_owned(),
+            std::io::Error::last_os_error(),
+        ));
+    }
+    let stream = DirectoryStreamV1(stream);
+    let mut names = Vec::new();
+    loop {
+        unsafe { *errno_location() = 0 };
+        let entry = unsafe { libc::readdir(stream.0) };
+        if entry.is_null() {
+            let errno = unsafe { *errno_location() };
+            if errno == 0 {
+                break;
+            }
+            return Err(FsCustodyError::Io(
+                label.to_owned(),
+                std::io::Error::from_raw_os_error(errno),
+            ));
+        }
+        let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) }.to_bytes();
+        if name == b"." || name == b".." {
+            continue;
+        }
+        if names.len() == limit {
+            return Err(FsCustodyError::EnumerationLimitExceeded {
+                label: label.to_owned(),
+                limit,
+            });
+        }
+        let name = OsString::from_vec(name.to_vec());
+        validated_child_name(&name)
+            .map_err(|_| FsCustodyError::InvalidChildName(label.to_owned()))?;
+        names.push(name);
+    }
+    Ok(names)
+}
+#[cfg(not(all(unix, any(target_os = "linux", target_os = "macos"))))]
+fn enumerate_directory_names(
+    _directory: &File,
+    _limit: usize,
+    label: &str,
+) -> Result<Vec<OsString>, FsCustodyError> {
+    Err(FsCustodyError::Unsupported(label.to_owned()))
+}
+#[cfg(unix)]
 fn child_name_cstring(name: &OsStr, label: &str) -> Result<CString, FsCustodyError> {
     validated_child_name(name).map_err(|_| FsCustodyError::InvalidChildName(label.to_owned()))
 }
@@ -933,8 +1351,15 @@ fn child_name_cstring(name: &OsStr, label: &str) -> Result<CString, FsCustodyErr
 #[cfg(unix)]
 fn open_regular_child(parent: &File, name: &OsStr, label: &str) -> Result<File, FsCustodyError> {
     let name = child_name_cstring(name, label)?;
-    let file = open_child_no_follow(parent, &name, ChildOpenOptionsV1::default())
-        .map_err(|error| FsCustodyError::Io(label.to_owned(), error))?;
+    let file = open_child_no_follow(
+        parent,
+        &name,
+        ChildOpenOptionsV1 {
+            nonblocking: true,
+            ..ChildOpenOptionsV1::default()
+        },
+    )
+    .map_err(|error| FsCustodyError::Io(label.to_owned(), error))?;
     let metadata = file
         .metadata()
         .map_err(|error| FsCustodyError::Io(label.to_owned(), error))?;
@@ -1070,6 +1495,7 @@ fn replace_regular_child_impl(
     pinned: &PinnedDirectoryV1,
     source: &RegularChildRefV1<'_>,
     target_name: &OsStr,
+    expected_target: Option<(&RegularFileIdentityV1, &JournalRootCustodyV1)>,
     label: &str,
 ) -> Result<RenameCommitV1, FsCustodyError> {
     let parent = &pinned.file;
@@ -1094,6 +1520,11 @@ fn replace_regular_child_impl(
         Err(error) => return Err(FsCustodyError::Io(label.to_owned(), error)),
     }
 
+    if let Some((expected, custody)) = expected_target {
+        custody.revalidate(label)?;
+        let target = open_regular_child(parent, target_name, label)?;
+        verify_regular_file_identity(&target, expected, label)?;
+    }
     let renamed = match pinned.armed_publication_rename_fault() {
         None => rename_child_replacing(parent, &source_cname, &target_cname),
         Some(shape) => inject_publication_rename_fault(
@@ -1251,6 +1682,7 @@ fn replace_regular_child_impl(
     _pinned: &PinnedDirectoryV1,
     _source: &RegularChildRefV1<'_>,
     _target_name: &OsStr,
+    _expected_target: Option<(&RegularFileIdentityV1, &JournalRootCustodyV1)>,
     label: &str,
 ) -> Result<RenameCommitV1, FsCustodyError> {
     Err(FsCustodyError::Unsupported(label.to_owned()))
@@ -3865,5 +4297,316 @@ mod tests {
             }
             other => panic!("expected Acted, got {other:?}"),
         }
+    }
+
+    fn directory_id(path: &Path) -> DirectoryIdentityV1 {
+        PinnedDirectoryV1::open(path, "expected directory")
+            .unwrap()
+            .identity()
+            .clone()
+    }
+    fn journal_custody() -> (tempfile::TempDir, PathBuf, JournalRootCustodyV1) {
+        let outer = tempfile::tempdir().unwrap();
+        let parent = fs::canonicalize(outer.path()).unwrap();
+        fs::create_dir(parent.join("journal")).unwrap();
+        let parent_id = directory_id(&parent);
+        let root_id = directory_id(&parent.join("journal"));
+        let custody = JournalRootCustodyV1::open(
+            &parent,
+            OsStr::new("journal"),
+            &parent_id,
+            &root_id,
+            "request journal root",
+        )
+        .unwrap();
+        (outer, parent, custody)
+    }
+    #[cfg(unix)]
+    #[test]
+    fn journal_root_custody_replacement_never_redirects() {
+        let (_outer, parent, custody) = journal_custody();
+        let original = parent.join("original");
+        fs::rename(parent.join("journal"), &original).unwrap();
+        fs::create_dir(parent.join("journal")).unwrap();
+
+        assert!(matches!(
+            custody.create_new_regular_child(OsStr::new("entry"), "create after replacement"),
+            Err(FsCustodyError::IdentityChanged(_))
+        ));
+        assert!(!original.join("entry").exists());
+        assert!(!parent.join("journal/entry").exists());
+        assert!(matches!(
+            JournalRootCustodyV1::open(
+                &parent,
+                OsStr::new("journal"),
+                custody.parent.identity(),
+                custody.root.identity(),
+                "open replaced root",
+            ),
+            Err(FsCustodyError::IdentityChanged(_))
+        ));
+    }
+    #[cfg(unix)]
+    #[test]
+    fn journal_root_custody_removed_root_is_never_recreated() {
+        let (_outer, parent, custody) = journal_custody();
+        fs::remove_dir(parent.join("journal")).unwrap();
+
+        assert!(custody
+            .create_new_regular_child(OsStr::new("entry"), "create after removal")
+            .is_err());
+        assert!(!parent.join("journal").exists());
+    }
+    #[cfg(unix)]
+    #[test]
+    fn journal_root_custody_revalidates_at_mutation_time() {
+        let (_outer, parent, custody) = journal_custody();
+        let original = parent.join("original");
+        let result = custody.create_new_regular_child_with_before_mutation(
+            OsStr::new("entry"),
+            "mutation-time replacement",
+            || {
+                fs::rename(parent.join("journal"), &original).unwrap();
+                fs::create_dir(parent.join("journal")).unwrap();
+            },
+        );
+
+        assert!(matches!(result, Err(FsCustodyError::IdentityChanged(_))));
+        assert!(!original.join("entry").exists());
+        assert!(!parent.join("journal/entry").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn journal_root_custody_refuses_identity_mismatch_and_unsupported_custody() {
+        let (_outer, parent, mut custody) = journal_custody();
+        custody.parent.identity.ino = custody.parent.identity.ino.map(|ino| ino.wrapping_add(1));
+        assert!(matches!(
+            custody.create_new_regular_child(OsStr::new("parent-mismatch"), "parent mismatch"),
+            Err(FsCustodyError::IdentityChanged(_))
+        ));
+
+        let (_outer3, parent3, mut custody3) = journal_custody();
+        custody3.parent.identity.dev = None;
+        assert!(matches!(
+            custody3.create_new_regular_child(OsStr::new("unsupported"), "unsupported identity"),
+            Err(FsCustodyError::Unsupported(_))
+        ));
+
+        assert!(!parent.join("journal/parent-mismatch").exists());
+        assert!(!parent3.join("journal/unsupported").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn journal_root_custody_child_identity_mismatch_refuses_before_mutation() {
+        use std::io::Write as _;
+
+        let (_outer, parent, custody) = journal_custody();
+        let mut original = custody
+            .create_new_regular_child(OsStr::new("record"), "create record")
+            .unwrap();
+        original.write_all(b"old").unwrap();
+        original.sync_all().unwrap();
+        let expected = regular_file_identity(&original, "record identity").unwrap();
+        drop(original);
+
+        let recycled = RegularFileIdentityV1 {
+            btime: BirthTimeV1::new(i64::MIN, 0).unwrap(),
+            ..expected.clone()
+        };
+        assert!(custody
+            .open_regular_child_for_append(OsStr::new("record"), &recycled, "recycled inode",)
+            .is_err());
+
+        fs::remove_file(parent.join("journal/record")).unwrap();
+        fs::write(parent.join("journal/record"), b"replacement").unwrap();
+        assert!(matches!(
+            custody.open_regular_child_for_append(
+                OsStr::new("record"),
+                &expected,
+                "append replacement",
+            ),
+            Err(FsCustodyError::IdentityChanged(_))
+        ));
+        assert!(matches!(
+            custody.unlink_regular_child(OsStr::new("record"), &expected, "unlink replacement"),
+            Err(FsCustodyError::IdentityChanged(_))
+        ));
+        assert_eq!(
+            fs::read(parent.join("journal/record")).unwrap(),
+            b"replacement"
+        );
+
+        let mut initial = custody
+            .create_new_regular_child(OsStr::new("initial.tmp"), "create initial")
+            .unwrap();
+        initial.write_all(b"authority").unwrap();
+        initial.sync_all().unwrap();
+        assert!(custody
+            .publish_new_regular_child(
+                RegularChildRefV1::new(OsStr::new("initial.tmp"), &initial),
+                OsStr::new("authority"),
+                "publish initial",
+            )
+            .unwrap()
+            .is_durable());
+
+        let target = File::open(parent.join("journal/record")).unwrap();
+        let target_id = regular_file_identity(&target, "replacement identity").unwrap();
+        let mut staged = custody
+            .create_new_regular_child(OsStr::new("staged"), "create staged")
+            .unwrap();
+        staged.write_all(b"new").unwrap();
+        staged.sync_all().unwrap();
+        fs::rename(
+            parent.join("journal/record"),
+            parent.join("journal/predecessor"),
+        )
+        .unwrap();
+        fs::write(parent.join("journal/record"), b"intruder").unwrap();
+        let result = custody.replace_regular_child(
+            RegularChildRefV1::new(OsStr::new("staged"), &staged),
+            OsStr::new("record"),
+            &target_id,
+            "target swap",
+        );
+        assert!(matches!(result, Err(FsCustodyError::IdentityChanged(_))));
+        assert_eq!(
+            fs::read(parent.join("journal/record")).unwrap(),
+            b"intruder"
+        );
+        assert_eq!(fs::read(parent.join("journal/staged")).unwrap(), b"new");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn journal_root_custody_refuses_child_symlinks_for_open_and_mutation() {
+        let (_outer, parent, custody) = journal_custody();
+        let outside = parent.join("outside");
+        fs::write(&outside, b"outside").unwrap();
+        std::os::unix::fs::symlink(&outside, parent.join("journal/link")).unwrap();
+        let outside_file = File::open(&outside).unwrap();
+        let outside_identity = regular_file_identity(&outside_file, "outside identity").unwrap();
+
+        assert!(custody
+            .open_regular_child(OsStr::new("link"), "open link")
+            .is_err());
+        assert!(custody
+            .create_new_regular_child(OsStr::new("link"), "create link")
+            .is_err());
+        assert!(custody
+            .open_regular_child_for_append(OsStr::new("link"), &outside_identity, "append link")
+            .is_err());
+        assert!(custody
+            .unlink_regular_child(OsStr::new("link"), &outside_identity, "unlink link")
+            .is_err());
+        assert!(custody
+            .acquire_persistent_child_lock(OsStr::new("link"), &outside_identity, "lock link")
+            .is_err());
+
+        let staged = custody
+            .create_new_regular_child(OsStr::new("staged"), "staged replacement")
+            .unwrap();
+        assert!(custody
+            .replace_regular_child(
+                RegularChildRefV1::new(OsStr::new("staged"), &staged),
+                OsStr::new("link"),
+                &outside_identity,
+                "replace link",
+            )
+            .is_err());
+        assert_eq!(fs::read(&outside).unwrap(), b"outside");
+        assert!(fs::symlink_metadata(parent.join("journal/link"))
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert!(parent.join("journal/staged").exists());
+
+        use std::os::unix::ffi::OsStrExt as _;
+        let fifo = parent.join("journal/fifo");
+        let fifo_c = CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o600) }, 0);
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            tx.send(
+                custody
+                    .open_regular_child(OsStr::new("fifo"), "open fifo")
+                    .is_err(),
+            )
+            .unwrap();
+        });
+        assert!(rx.recv_timeout(Duration::from_secs(10)).unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn journal_root_custody_enumeration_and_child_name_bounds_fail_closed() {
+        let (_outer, _parent, custody) = journal_custody();
+        for name in ["a", "b"] {
+            drop(
+                custody
+                    .create_new_regular_child(OsStr::new(name), "enumerated child")
+                    .unwrap(),
+            );
+        }
+        let over_limit = custody.enumerate_child_names(1, "bounded enumeration");
+        assert!(
+            matches!(
+                over_limit,
+                Err(FsCustodyError::EnumerationLimitExceeded { limit: 1, .. })
+            ),
+            "got {over_limit:?}"
+        );
+        let mut names = custody
+            .enumerate_child_names(2, "complete enumeration")
+            .unwrap();
+        names.sort();
+        assert_eq!(names, [OsStr::new("a"), OsStr::new("b")]);
+
+        for invalid in ["", ".", "..", "a/b"] {
+            assert!(matches!(
+                custody.create_new_regular_child(OsStr::new(invalid), "invalid child"),
+                Err(FsCustodyError::InvalidChildName(_))
+            ));
+        }
+        use std::os::unix::ffi::OsStrExt as _;
+        assert!(matches!(
+            custody.create_new_regular_child(OsStr::from_bytes(b"nul\0child"), "nul child"),
+            Err(FsCustodyError::InvalidChildName(_))
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn journal_root_custody_persistent_lock_stays_bound_after_name_replacement() {
+        let (_outer, parent, custody) = journal_custody();
+        let lock_file = custody
+            .create_new_regular_child(OsStr::new("attempt.lock"), "create attempt lock")
+            .unwrap();
+        let expected = regular_file_identity(&lock_file, "attempt lock identity").unwrap();
+        drop(lock_file);
+        let held = custody
+            .acquire_persistent_child_lock(OsStr::new("attempt.lock"), &expected, "hold attempt")
+            .unwrap();
+
+        fs::rename(
+            parent.join("journal/attempt.lock"),
+            parent.join("journal/original.lock"),
+        )
+        .unwrap();
+        fs::write(parent.join("journal/attempt.lock"), b"replacement").unwrap();
+        assert!(matches!(
+            custody.acquire_persistent_child_lock(
+                OsStr::new("attempt.lock"),
+                &expected,
+                "peer attempt",
+            ),
+            Err(FsCustodyError::IdentityChanged(_))
+        ));
+        assert_eq!(
+            regular_file_identity(&held._file, "held identity").unwrap(),
+            expected
+        );
     }
 }

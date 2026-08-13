@@ -383,3 +383,42 @@ this preserved branch; the exact resulting commit becomes Task B's frozen
 input. The two-field `CleanupReportV1 { result, checkout }` carry-forward remains
 mandatory in the first later slice that arms production V3 or wraps
 `ContainerRw`.
+
+## Salvage Task A implementation
+
+Task A exact clone base is `771c0fb8deca88fca06cac631208c9c83b87ea53`;
+the unchanged code substrate is
+`S0 = 530992b7ff1e8e9151fb2a69e86f3ff71c44f905`.
+Initial red evidence used the exact command
+`CARGO_HOME=/cargo CARGO_INCREMENTAL=0 cargo test -p bridge-core --locked
+--offline journal_root_custody -- --nocapture` against the pre-implementation
+code. Nine missing-Task-A API errors named `JournalRootCustodyV1`, regular-file
+identity, bounded enumeration, and required operations. No zero-selected or
+dependency-network refusal is counted as red evidence.
+
+Review rejected exact artifact `40b9ac364495ee9ca90ac21660dc8e54e929427e`.
+The same selector failed with five contract-specific missing APIs: expected
+parent/root identities, birthtime, no-replace publication, and the expected
+target rename seam. The repair binds supplied identities, requires birthtime,
+makes reads nonblocking, publishes behind final route revalidation, and checks
+route plus target immediately before replacing rename.
+
+Changed paths are `crates/bridge-core/src/fs_custody.rs`, the narrow
+already-opened lock helper in `crates/bridge-core/src/liveness.rs`, and this
+handoff. `lib.rs`, shared journal, request state, API/HTTP, and production V3 are
+unchanged. Budgets are exactly 450 production and 800 total changed lines.
+
+Final verification:
+
+- `cargo test -p bridge-core fs_custody`: 66 passed, 0 failed.
+- Exact `journal_root_custody` selector: 8 passed, 0 failed, including all five
+  review regressions plus root replacement/removal and lock-object retention.
+- Workspace all-target/all-feature clippy with `-D warnings`: exit 0.
+- `cargo fmt --all -- --check` and `git diff --check`: exit 0.
+- Aggregate workspace tests again passed all 1,084 bridge-core tests, then hit
+  the pre-existing `a2a-bridge` test
+  `api_entry_resolves_and_serves_through_registry` with
+  `api.prompt.error_body_read`; exact base `771c0fb8` reproduces it identically.
+
+No live provider, smoke, compatibility, deployment, fold, push, API migration,
+or running-operator action was performed. Production remains unarmed.
