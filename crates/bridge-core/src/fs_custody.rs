@@ -145,10 +145,12 @@ pub struct RegularFileIdentityV1 {
     pub btime: BirthTimeV1,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 #[rustfmt::skip]
 pub struct RequiredObjectIdentityV2 { pub dev: u64, pub ino: u64, pub birthtime: BirthTimeV1 }
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 #[rustfmt::skip]
 pub struct FileContentSnapshotV2 { pub object: RequiredObjectIdentityV2, pub content_len: u64 }
 #[rustfmt::skip]
@@ -236,7 +238,7 @@ impl ReservedNameNamespaceV2 {
     #[rustfmt::skip]
     fn prefix(self) -> &'static [u8] { [b".a2a-v2-int-", b".a2a-v2-stg-", b".a2a-v2-rpc-", b".a2a-v2-rtc-"][self as usize] }
 }
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CustodyOperationKindV2 {
     Replace,
     Retire,
@@ -257,6 +259,9 @@ impl CustodyIntentV2 {
     }
     #[rustfmt::skip]
     pub fn parts(&self) -> (CustodyOperationKindV2, &ChildNameV2, &RequiredObjectIdentityV2, &FileContentSnapshotV2) { (self.0, &self.1, &self.2, &self.3) }
+    pub fn reserved_name(&self, namespace: ReservedNameNamespaceV2) -> &ChildNameV2 {
+        &self.4[namespace as usize]
+    }
     pub fn capture_name(&self) -> &ChildNameV2 {
         &self.4[(match self.0 {
             CustodyOperationKindV2::Replace => ReservedNameNamespaceV2::ReplacementCapture,
@@ -277,7 +282,7 @@ pub enum CustodyCaptureOutcomeV2 {
 }
 #[cfg(unix)]
 #[rustfmt::skip]
-fn required_identity_at_v2(parent: &File, name: &OsStr, label: &str) -> Result<RequiredObjectIdentityV2, FsCustodyError> {
+pub(crate) fn required_identity_at_v2(parent: &File, name: &OsStr, label: &str) -> Result<RequiredObjectIdentityV2, FsCustodyError> {
     Ok(required_file_content_snapshot_v2(&open_regular_child(parent, name, label)?, label)?.object)
 }
 #[cfg(unix)]
@@ -866,6 +871,7 @@ pub struct JournalRootOperationV2<'a> {
     _mutex: std::sync::MutexGuard<'a, ()>,
     lock: File,
     label: String,
+    custody: &'a JournalRootCustodyV2,
 }
 
 #[cfg(unix)]
@@ -986,6 +992,7 @@ impl JournalRootCustodyV2 {
             _mutex: mutex,
             lock,
             label: label.to_owned(),
+            custody: self,
         };
         after_lock();
         self.prove_route(label)?;
@@ -1003,6 +1010,16 @@ impl JournalRootCustodyV2 {
         verify_directory_identity_v2(&parent, self.binding.parent, label)?;
         let root = open_directory_child_file(&parent, self.binding.root_name.as_os_str(), label)?;
         verify_directory_identity_v2(&root, self.binding.root, label)
+    }
+}
+
+#[cfg(unix)]
+impl JournalRootOperationV2<'_> {
+    pub(crate) fn root_file(&self) -> &File {
+        &self.custody.root.file
+    }
+    pub(crate) fn prove_route_v2(&self, label: &str) -> Result<(), FsCustodyError> {
+        self.custody.prove_route(label)
     }
 }
 
@@ -1625,7 +1642,7 @@ fn verify_regular_file_identity(
     Ok(())
 }
 #[cfg(unix)]
-fn create_new_regular_child_at(
+pub(crate) fn create_new_regular_child_at(
     parent: &File,
     name: &OsStr,
     label: &str,
@@ -1716,7 +1733,7 @@ fn errno_location() -> *mut libc::c_int {
     }
 }
 #[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
-fn enumerate_directory_names(
+pub(crate) fn enumerate_directory_names(
     directory: &File,
     limit: usize,
     label: &str,
@@ -1739,6 +1756,7 @@ fn enumerate_directory_names(
         ));
     }
     let stream = DirectoryStreamV1(stream);
+    unsafe { libc::rewinddir(stream.0) };
     let mut names = Vec::new();
     loop {
         unsafe { *errno_location() = 0 };
@@ -1771,7 +1789,7 @@ fn enumerate_directory_names(
     Ok(names)
 }
 #[cfg(not(all(unix, any(target_os = "linux", target_os = "macos"))))]
-fn enumerate_directory_names(
+pub(crate) fn enumerate_directory_names(
     _directory: &File,
     _limit: usize,
     label: &str,
@@ -1779,12 +1797,16 @@ fn enumerate_directory_names(
     Err(FsCustodyError::Unsupported(label.to_owned()))
 }
 #[cfg(unix)]
-fn child_name_cstring(name: &OsStr, label: &str) -> Result<CString, FsCustodyError> {
+pub(crate) fn child_name_cstring(name: &OsStr, label: &str) -> Result<CString, FsCustodyError> {
     validated_child_name(name).map_err(|_| FsCustodyError::InvalidChildName(label.to_owned()))
 }
 
 #[cfg(unix)]
-fn open_regular_child(parent: &File, name: &OsStr, label: &str) -> Result<File, FsCustodyError> {
+pub(crate) fn open_regular_child(
+    parent: &File,
+    name: &OsStr,
+    label: &str,
+) -> Result<File, FsCustodyError> {
     let name = child_name_cstring(name, label)?;
     let file = open_child_no_follow(
         parent,
@@ -1807,7 +1829,11 @@ fn open_regular_child(parent: &File, name: &OsStr, label: &str) -> Result<File, 
 }
 
 #[cfg(not(unix))]
-fn open_regular_child(_parent: &File, _name: &OsStr, label: &str) -> Result<File, FsCustodyError> {
+pub(crate) fn open_regular_child(
+    _parent: &File,
+    _name: &OsStr,
+    label: &str,
+) -> Result<File, FsCustodyError> {
     Err(FsCustodyError::Unsupported(label.to_owned()))
 }
 
@@ -1897,7 +1923,7 @@ where
 }
 
 #[cfg(unix)]
-fn child_entry_exists_impl(
+pub(crate) fn child_entry_exists_impl(
     parent: &File,
     name: &OsStr,
     label: &str,
@@ -1909,7 +1935,7 @@ fn child_entry_exists_impl(
 }
 
 #[cfg(not(unix))]
-fn child_entry_exists_impl(
+pub(crate) fn child_entry_exists_impl(
     _parent: &File,
     _name: &OsStr,
     label: &str,
@@ -5121,12 +5147,18 @@ mod tests {
 
         #[derive(Clone, Copy)]
         enum Replaced {
+            Anchor,
             Parent,
             Root,
         }
 
         fn replace(case: &RouteCase, replaced: Replaced) {
             match replaced {
+                Replaced::Anchor => {
+                    fs::rename(&case.anchor, case._dir.path().join("old-anchor")).unwrap();
+                    fs::create_dir_all(&case.root).unwrap();
+                    fs::write(&case.lock, b"replacement").unwrap();
+                }
                 Replaced::Parent => {
                     fs::rename(&case.parent, case.anchor.join("old-parent")).unwrap();
                     fs::create_dir_all(&case.root).unwrap();
@@ -5144,8 +5176,8 @@ mod tests {
         }
 
         #[test]
-        fn journal_route_custody_v2_parent_and_root_replacement_refuse_every_schedule() {
-            for replaced in [Replaced::Parent, Replaced::Root] {
+        fn journal_route_custody_v2_anchor_parent_and_root_replacement_refuse_every_schedule() {
+            for replaced in [Replaced::Anchor, Replaced::Parent, Replaced::Root] {
                 let case = route_case();
                 let custody = JournalRootCustodyV2::open(
                     &case.anchor,
@@ -5264,6 +5296,51 @@ mod tests {
         }
 
         #[test]
+        fn journal_route_custody_v2_same_cell_waits_on_the_process_mutex() {
+            use std::sync::{mpsc, Arc};
+            use std::time::Duration;
+            let case = route_case();
+            let custody = Arc::new(
+                JournalRootCustodyV2::open(&case.anchor, &case.binding, "same cell").unwrap(),
+            );
+            let held = custody
+                .begin_operation("first same-cell operation")
+                .unwrap();
+            let (entered_tx, entered_rx) = mpsc::channel();
+            let (done_tx, done_rx) = mpsc::channel();
+            let peer = Arc::clone(&custody);
+            let thread = std::thread::spawn(move || {
+                entered_tx.send(()).unwrap();
+                done_tx
+                    .send(peer.begin_operation("queued same-cell operation").is_ok())
+                    .unwrap();
+            });
+            entered_rx.recv().unwrap();
+            assert!(done_rx.recv_timeout(Duration::from_millis(100)).is_err());
+            drop(held);
+            assert!(done_rx.recv_timeout(Duration::from_secs(2)).unwrap());
+            thread.join().unwrap();
+        }
+
+        #[test]
+        fn journal_route_custody_v2_constructor_rejects_shared_root_and_lock_name() {
+            let case = route_case();
+            let same = ChildNameV2::from_bytes(b"same").unwrap();
+            assert!(matches!(
+                JournalRootBindingV2::new(
+                    object(&case.anchor),
+                    ChildNameV2::from_bytes(b"parent").unwrap(),
+                    object(&case.parent),
+                    same.clone(),
+                    object(&case.root),
+                    same,
+                    object(&case.lock),
+                ),
+                Err(FsCustodyError::InvalidChildName(_))
+            ));
+        }
+
+        #[test]
         fn journal_route_custody_v2_external_binding_and_unsupported_primitive_fail_closed() {
             let case = route_case();
             fs::write(case.root.join("binding.json"), b"untrusted").unwrap();
@@ -5284,6 +5361,31 @@ mod tests {
             assert_eq!((flock_calls.get(), after_lock.get()), (1, 0));
             assert!(matches!(
                 required_object_identity_v2(1, 2, None, "missing birthtime"),
+                Err(FsCustodyError::Unsupported(_))
+            ));
+        }
+    }
+    #[cfg(not(unix))]
+    mod journal_route_custody_v2_non_unix {
+        use super::*;
+
+        #[test]
+        fn journal_route_custody_v2_refuses_before_opening_on_non_unix() {
+            let identity =
+                required_object_identity_v2(1, 2, BirthTimeV1::new(3, 4), "synthetic identity")
+                    .unwrap();
+            let binding = JournalRootBindingV2::new(
+                identity,
+                ChildNameV2::from_bytes(b"parent").unwrap(),
+                identity,
+                ChildNameV2::from_bytes(b"journal").unwrap(),
+                identity,
+                ChildNameV2::from_bytes(b"operation.lock").unwrap(),
+                identity,
+            )
+            .unwrap();
+            assert!(matches!(
+                JournalRootCustodyV2::open(Path::new("never-opened"), &binding, "non-unix"),
                 Err(FsCustodyError::Unsupported(_))
             ));
         }

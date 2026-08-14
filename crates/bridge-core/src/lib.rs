@@ -15,6 +15,8 @@ pub mod ids;
 #[cfg(unix)]
 pub mod liveness;
 pub mod mcp;
+#[cfg(unix)]
+pub mod namespace_transaction;
 pub mod orch;
 pub mod permission;
 pub mod ports;
