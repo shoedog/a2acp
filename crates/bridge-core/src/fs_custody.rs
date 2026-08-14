@@ -811,6 +811,218 @@ impl PinnedDirectoryV1 {
     }
 }
 
+pub type ObjectIdentityV2 = RequiredObjectIdentityV2;
+
+#[derive(Clone, Debug)]
+pub struct JournalRootBindingV2 {
+    anchor: ObjectIdentityV2,
+    parent_name: ChildNameV2,
+    parent: ObjectIdentityV2,
+    root_name: ChildNameV2,
+    root: ObjectIdentityV2,
+    operation_lock_name: ChildNameV2,
+    operation_lock: ObjectIdentityV2,
+}
+
+impl JournalRootBindingV2 {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        anchor: ObjectIdentityV2,
+        parent_name: ChildNameV2,
+        parent: ObjectIdentityV2,
+        root_name: ChildNameV2,
+        root: ObjectIdentityV2,
+        operation_lock_name: ChildNameV2,
+        operation_lock: ObjectIdentityV2,
+    ) -> Result<Self, FsCustodyError> {
+        if root_name == operation_lock_name {
+            return Err(FsCustodyError::InvalidChildName(
+                "journal root and operation lock must be siblings".into(),
+            ));
+        }
+        Ok(Self {
+            anchor,
+            parent_name,
+            parent,
+            root_name,
+            root,
+            operation_lock_name,
+            operation_lock,
+        })
+    }
+}
+
+#[cfg_attr(not(unix), allow(dead_code))]
+pub struct JournalRootCustodyV2 {
+    anchor: PinnedDirectoryV1,
+    parent: PinnedDirectoryV1,
+    root: PinnedDirectoryV1,
+    binding: JournalRootBindingV2,
+    operation_mutex: std::sync::Mutex<()>,
+}
+
+#[cfg_attr(not(unix), allow(dead_code))]
+pub struct JournalRootOperationV2<'a> {
+    _mutex: std::sync::MutexGuard<'a, ()>,
+    lock: File,
+    label: String,
+}
+
+#[cfg(unix)]
+impl Drop for JournalRootOperationV2<'_> {
+    fn drop(&mut self) {
+        crate::liveness::flock_unlock(&self.lock, &self.label);
+    }
+}
+
+#[cfg(unix)]
+fn verify_directory_identity_v2(
+    file: &File,
+    expected: ObjectIdentityV2,
+    label: &str,
+) -> Result<(), FsCustodyError> {
+    use std::os::unix::fs::MetadataExt as _;
+    let metadata = file
+        .metadata()
+        .map_err(|error| FsCustodyError::Io(label.to_owned(), error))?;
+    if !metadata.is_dir() {
+        return Err(FsCustodyError::Unsupported(format!(
+            "{label}: route object is not a directory"
+        )));
+    }
+    let observed = required_object_identity_v2(
+        metadata.dev(),
+        metadata.ino(),
+        BirthTimeV1::from_metadata(&metadata),
+        label,
+    )?;
+    if observed != expected {
+        return Err(FsCustodyError::IdentityChanged(label.to_owned()));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn verify_regular_identity_v2(
+    file: &File,
+    expected: ObjectIdentityV2,
+    label: &str,
+) -> Result<(), FsCustodyError> {
+    if required_file_content_snapshot_v2(file, label)?.object != expected {
+        return Err(FsCustodyError::IdentityChanged(label.to_owned()));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+impl JournalRootCustodyV2 {
+    pub fn open(
+        anchor_path: &Path,
+        binding: &JournalRootBindingV2,
+        label: &str,
+    ) -> Result<Self, FsCustodyError> {
+        let anchor = PinnedDirectoryV1::open(anchor_path, label)?;
+        verify_directory_identity_v2(&anchor.file, binding.anchor, label)?;
+        let parent = open_directory_child(&anchor, binding.parent_name.as_os_str(), label)?;
+        verify_directory_identity_v2(&parent.file, binding.parent, label)?;
+        let root = open_directory_child(&parent, binding.root_name.as_os_str(), label)?;
+        verify_directory_identity_v2(&root.file, binding.root, label)?;
+        let lock =
+            open_regular_child(&parent.file, binding.operation_lock_name.as_os_str(), label)?;
+        verify_regular_identity_v2(&lock, binding.operation_lock, label)?;
+        let custody = Self {
+            anchor,
+            parent,
+            root,
+            binding: binding.clone(),
+            operation_mutex: std::sync::Mutex::new(()),
+        };
+        custody.prove_route(label)?;
+        Ok(custody)
+    }
+
+    pub fn begin_operation(
+        &self,
+        label: &str,
+    ) -> Result<JournalRootOperationV2<'_>, FsCustodyError> {
+        self.begin_operation_with(label, |file| crate::liveness::flock_nb(file, true), || {})
+    }
+
+    fn begin_operation_with<F, H>(
+        &self,
+        label: &str,
+        try_flock: F,
+        after_lock: H,
+    ) -> Result<JournalRootOperationV2<'_>, FsCustodyError>
+    where
+        F: FnOnce(&File) -> std::io::Result<bool>,
+        H: FnOnce(),
+    {
+        let mutex = self.operation_mutex.lock().map_err(|_| {
+            FsCustodyError::Unsupported(format!("{label}: operation mutex is poisoned"))
+        })?;
+        let lock = open_regular_child(
+            &self.parent.file,
+            self.binding.operation_lock_name.as_os_str(),
+            label,
+        )?;
+        verify_regular_identity_v2(&lock, self.binding.operation_lock, label)?;
+        let acquired = try_flock(&lock).map_err(|error| {
+            let raw = error.raw_os_error();
+            if raw == Some(libc::ENOSYS) || raw == Some(libc::ENOTSUP) || raw == Some(libc::ENOLCK)
+            {
+                FsCustodyError::Unsupported(label.to_owned())
+            } else {
+                FsCustodyError::Io(label.to_owned(), error)
+            }
+        })?;
+        if !acquired {
+            return Err(FsCustodyError::Io(
+                label.to_owned(),
+                std::io::ErrorKind::WouldBlock.into(),
+            ));
+        }
+        let operation = JournalRootOperationV2 {
+            _mutex: mutex,
+            lock,
+            label: label.to_owned(),
+        };
+        after_lock();
+        self.prove_route(label)?;
+        Ok(operation)
+    }
+
+    fn prove_route(&self, label: &str) -> Result<(), FsCustodyError> {
+        verify_directory_identity_v2(&self.anchor.file, self.binding.anchor, label)?;
+        verify_directory_identity_v2(&self.parent.file, self.binding.parent, label)?;
+        verify_directory_identity_v2(&self.root.file, self.binding.root, label)?;
+        let anchor = open_directory_no_follow(&self.anchor.canonical_path, label)?;
+        verify_directory_identity_v2(&anchor, self.binding.anchor, label)?;
+        let parent =
+            open_directory_child_file(&anchor, self.binding.parent_name.as_os_str(), label)?;
+        verify_directory_identity_v2(&parent, self.binding.parent, label)?;
+        let root = open_directory_child_file(&parent, self.binding.root_name.as_os_str(), label)?;
+        verify_directory_identity_v2(&root, self.binding.root, label)
+    }
+}
+
+#[cfg(not(unix))]
+impl JournalRootCustodyV2 {
+    pub fn open(
+        _anchor_path: &Path,
+        _binding: &JournalRootBindingV2,
+        label: &str,
+    ) -> Result<Self, FsCustodyError> {
+        Err(FsCustodyError::Unsupported(label.to_owned()))
+    }
+
+    pub fn begin_operation(
+        &self,
+        label: &str,
+    ) -> Result<JournalRootOperationV2<'_>, FsCustodyError> {
+        Err(FsCustodyError::Unsupported(label.to_owned()))
+    }
+}
 #[derive(Debug)]
 pub struct JournalRootCustodyV1 {
     parent: PinnedDirectoryV1,
@@ -4831,6 +5043,250 @@ mod tests {
             regular_file_identity(&held._file, "held identity").unwrap(),
             expected
         );
+    }
+    #[cfg(unix)]
+    mod journal_route_custody_v2 {
+        use super::*;
+        use std::cell::Cell;
+        use std::os::unix::fs::MetadataExt as _;
+
+        struct RouteCase {
+            _dir: tempfile::TempDir,
+            anchor: PathBuf,
+            parent: PathBuf,
+            root: PathBuf,
+            lock: PathBuf,
+            binding: JournalRootBindingV2,
+        }
+
+        fn object(path: &Path) -> ObjectIdentityV2 {
+            let metadata = fs::metadata(path).unwrap();
+            required_object_identity_v2(
+                metadata.dev(),
+                metadata.ino(),
+                BirthTimeV1::from_metadata(&metadata),
+                "fixture identity",
+            )
+            .unwrap()
+        }
+
+        fn binding(case: &RouteCase) -> JournalRootBindingV2 {
+            JournalRootBindingV2::new(
+                object(&case.anchor),
+                ChildNameV2::from_bytes(b"parent").unwrap(),
+                object(&case.parent),
+                ChildNameV2::from_bytes(b"journal").unwrap(),
+                object(&case.root),
+                ChildNameV2::from_bytes(b"operation.lock").unwrap(),
+                object(&case.lock),
+            )
+            .unwrap()
+        }
+
+        fn route_case() -> RouteCase {
+            let dir = tempfile::tempdir().unwrap();
+            let anchor = dir.path().join("anchor");
+            let parent = anchor.join("parent");
+            let root = parent.join("journal");
+            let lock = parent.join("operation.lock");
+            fs::create_dir_all(&root).unwrap();
+            fs::write(&lock, b"").unwrap();
+            let binding = JournalRootBindingV2::new(
+                object(&anchor),
+                ChildNameV2::from_bytes(b"parent").unwrap(),
+                object(&parent),
+                ChildNameV2::from_bytes(b"journal").unwrap(),
+                object(&root),
+                ChildNameV2::from_bytes(b"operation.lock").unwrap(),
+                object(&lock),
+            )
+            .unwrap();
+            RouteCase {
+                _dir: dir,
+                anchor,
+                parent,
+                root,
+                lock,
+                binding,
+            }
+        }
+
+        fn flock(file: &File) -> std::io::Result<bool> {
+            crate::liveness::flock_nb(file, true)
+        }
+
+        fn unlock(file: &File) {
+            crate::liveness::flock_unlock(file, "test peer");
+        }
+
+        #[derive(Clone, Copy)]
+        enum Replaced {
+            Parent,
+            Root,
+        }
+
+        fn replace(case: &RouteCase, replaced: Replaced) {
+            match replaced {
+                Replaced::Parent => {
+                    fs::rename(&case.parent, case.anchor.join("old-parent")).unwrap();
+                    fs::create_dir_all(&case.root).unwrap();
+                    fs::write(&case.lock, b"replacement").unwrap();
+                }
+                Replaced::Root => {
+                    fs::rename(&case.root, case.parent.join("old-root")).unwrap();
+                    fs::create_dir(&case.root).unwrap();
+                }
+            }
+        }
+
+        fn assert_identity_refusal<T>(result: Result<T, FsCustodyError>) {
+            assert!(matches!(result, Err(FsCustodyError::IdentityChanged(_))));
+        }
+
+        #[test]
+        fn journal_route_custody_v2_parent_and_root_replacement_refuse_every_schedule() {
+            for replaced in [Replaced::Parent, Replaced::Root] {
+                let case = route_case();
+                let custody = JournalRootCustodyV2::open(
+                    &case.anchor,
+                    &case.binding,
+                    "before-lock replacement",
+                )
+                .unwrap();
+                replace(&case, replaced);
+                assert_identity_refusal(custody.begin_operation("before-lock replacement"));
+
+                let case = route_case();
+                let custody = JournalRootCustodyV2::open(
+                    &case.anchor,
+                    &case.binding,
+                    "contended replacement",
+                )
+                .unwrap();
+                let peer = File::open(&case.lock).unwrap();
+                assert!(flock(&peer).unwrap());
+                replace(&case, replaced);
+                assert!(matches!(
+                    custody.begin_operation("contended replacement"),
+                    Err(FsCustodyError::Io(_, ref error))
+                        if error.kind() == std::io::ErrorKind::WouldBlock
+                ));
+                unlock(&peer);
+                assert_identity_refusal(custody.begin_operation("post-contention replacement"));
+
+                let case = route_case();
+                let custody = JournalRootCustodyV2::open(
+                    &case.anchor,
+                    &case.binding,
+                    "after-lock replacement",
+                )
+                .unwrap();
+                assert_identity_refusal(custody.begin_operation_with(
+                    "after-lock replacement",
+                    flock,
+                    || replace(&case, replaced),
+                ));
+            }
+        }
+
+        #[test]
+        fn journal_route_custody_v2_wrong_lock_and_missing_root_refuse_without_creation() {
+            let case = route_case();
+            let custody =
+                JournalRootCustodyV2::open(&case.anchor, &case.binding, "bound route").unwrap();
+            let expected_lock = object(&case.lock);
+            fs::rename(&case.lock, case.parent.join("old-operation.lock")).unwrap();
+            fs::write(&case.lock, b"planted").unwrap();
+            assert_ne!(object(&case.lock), expected_lock);
+            assert_identity_refusal(JournalRootCustodyV2::open(
+                &case.anchor,
+                &case.binding,
+                "planted lock",
+            ));
+            assert_identity_refusal(custody.begin_operation("planted lock"));
+            fs::remove_file(&case.lock).unwrap();
+            fs::create_dir(&case.lock).unwrap();
+            assert!(matches!(
+                JournalRootCustodyV2::open(&case.anchor, &case.binding, "wrong lock type"),
+                Err(FsCustodyError::Unsupported(_))
+            ));
+
+            let case = route_case();
+            let custody =
+                JournalRootCustodyV2::open(&case.anchor, &case.binding, "removable root").unwrap();
+            fs::remove_dir(&case.root).unwrap();
+            assert!(
+                JournalRootCustodyV2::open(&case.anchor, &case.binding, "removed root").is_err()
+            );
+            assert!(custody.begin_operation("removed root").is_err());
+            assert!(!case.root.exists(), "custody must never recreate the root");
+        }
+
+        #[test]
+        fn journal_route_custody_v2_stale_and_bound_lock_cells_cannot_both_authorize() {
+            let case = route_case();
+            let custody =
+                JournalRootCustodyV2::open(&case.anchor, &case.binding, "stale route").unwrap();
+            let held_new = std::cell::RefCell::new(None);
+            assert_identity_refusal(custody.begin_operation_with("stale route", flock, || {
+                replace(&case, Replaced::Root);
+                fs::rename(&case.lock, case.parent.join("old-operation.lock")).unwrap();
+                fs::write(&case.lock, b"new cell").unwrap();
+                let held = File::open(&case.lock).unwrap();
+                assert!(flock(&held).unwrap());
+                assert!(!flock(&File::open(&case.lock).unwrap()).unwrap());
+                *held_new.borrow_mut() = Some(held);
+            }));
+            let new_binding = binding(&case);
+            let current =
+                JournalRootCustodyV2::open(&case.anchor, &new_binding, "current route").unwrap();
+            assert!(matches!(
+                current.begin_operation("bound cell contention"),
+                Err(FsCustodyError::Io(_, ref error))
+                    if error.kind() == std::io::ErrorKind::WouldBlock
+            ));
+            unlock(held_new.borrow().as_ref().unwrap());
+            assert!(current.begin_operation("current route").is_ok());
+        }
+
+        #[test]
+        fn journal_route_custody_v2_guard_contends_on_an_independent_fd() {
+            let case = route_case();
+            let custody =
+                JournalRootCustodyV2::open(&case.anchor, &case.binding, "independent contention")
+                    .unwrap();
+            let operation = custody.begin_operation("held operation").unwrap();
+            let peer = File::open(&case.lock).unwrap();
+            assert!(!flock(&peer).unwrap());
+            drop(operation);
+            assert!(flock(&peer).unwrap());
+            unlock(&peer);
+        }
+
+        #[test]
+        fn journal_route_custody_v2_external_binding_and_unsupported_primitive_fail_closed() {
+            let case = route_case();
+            fs::write(case.root.join("binding.json"), b"untrusted").unwrap();
+            let custody =
+                JournalRootCustodyV2::open(&case.anchor, &case.binding, "external binding")
+                    .unwrap();
+            let flock_calls = Cell::new(0);
+            let after_lock = Cell::new(0);
+            let result = custody.begin_operation_with(
+                "unsupported flock",
+                |_| {
+                    flock_calls.set(flock_calls.get() + 1);
+                    Err(std::io::Error::from_raw_os_error(libc::ENOTSUP))
+                },
+                || after_lock.set(after_lock.get() + 1),
+            );
+            assert!(matches!(result, Err(FsCustodyError::Unsupported(_))));
+            assert_eq!((flock_calls.get(), after_lock.get()), (1, 0));
+            assert!(matches!(
+                required_object_identity_v2(1, 2, None, "missing birthtime"),
+                Err(FsCustodyError::Unsupported(_))
+            ));
+        }
     }
     #[cfg(unix)]
     mod custody_v2 {
