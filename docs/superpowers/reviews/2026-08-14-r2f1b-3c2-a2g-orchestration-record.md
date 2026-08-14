@@ -148,6 +148,33 @@ All checks passed; no drift found.
   read-only `code-review` pass on exact `5cbeea1e..3890fa6c` in the run
   clone; brief `closure-a2.md` (durable copy committed beside this record as
   [`2026-08-14-r2f1b-3c2-task-a2-review-brief.md`](2026-08-14-r2f1b-3c2-task-a2-review-brief.md)).
+- 2026-08-14: **A2 ACCEPTED at exact `3890fa6c`.** The counted Sol/xhigh review
+  (`exec-1bc950823f1e6916270e628908f91455` /
+  `attempt-1165c343acfda236a00d38930aff2cff`) returned `VERDICT: APPROVE` with
+  **0 WRONG / 2 SMELL-DEFER** at 95/100 confidence; original terminal artifact
+  8,657 bytes, SHA-256
+  `847b0353701eb0927129366f6b0e6bcb78f9f81fc5241f49243a50d40c45a993`, mirrored
+  as [`2026-08-14-r2f1b-3c2-task-a2-sol-review.md`](2026-08-14-r2f1b-3c2-task-a2-sol-review.md).
+  All five operator concerns resolved: V1-deletion deferral to A4 ruled sound
+  (removal remains mandatory before A4 completion/production arming);
+  `Io(WouldBlock)` contention encoding harmless in-scope; seam unreachable
+  from production; re-walk excludes the scheduled substitutions under the
+  cooperating-participant threat model; `flock_nb` widening is byte-unchanged
+  with one new consumer. No repair round consumed; the cap closes with the
+  single review.
+- Ledger from the A2 review (carried forward): (S1) behavioral mutation
+  receipts for the A2 red schedule remain unsupplied — compile-only red
+  evidence was accepted on direct source discrimination; offer receipts at
+  the aggregate round if disputed. (S2) four missing direct regressions —
+  anchor replacement before/after flock, two-thread mutex queuing order,
+  root/lock-name constructor collision, `cfg(not(unix))` refusal — are
+  BINDING riders on A3's brief (~40-80 test lines). The reviewer also noted
+  the in-container environment classification lacks an exact-parent
+  same-container control; it gates nothing now, and the control runs before
+  adjudication if any later round disputes the class.
+- A3 next: "capture settlement and bounded crash recovery" freezes exact
+  input `3890fa6c`; stop/split 320 production / 700 total; same declared
+  review cap shape as A2.
 
 ## Non-scope reaffirmed
 
