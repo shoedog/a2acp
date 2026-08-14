@@ -337,8 +337,8 @@ where
     let target_c = child_name_cstring(target, label).expect("validated target");
     let custody_c = child_name_cstring(custody, label).expect("validated custody");
     let mut at = |name| identity_at(parent, name, label);
-    let before = match at(target) {
-        Ok(identity) => identity,
+    match at(target) {
+        Ok(_) => {}
         Err(FsCustodyError::Unsupported(reason)) => {
             return RuntimeUnsupported(format!("{label}: {reason}"))
         }
@@ -347,21 +347,12 @@ where
                 "{label}: pre-capture identity unavailable: {error}"
             ))
         }
-    };
+    }
     boundary(false);
     let captured = match rename(parent, &target_c, &custody_c) {
         Err(RenameNoReplaceRefusalV1::PlatformUnsupported) => return CompileUnsupported,
         Err(RenameNoReplaceRefusalV1::Io(error)) => {
-            if matches!(at(target), Ok(observed) if observed == before) {
-                return if error.kind() == std::io::ErrorKind::Unsupported
-                    || matches!(error.raw_os_error(), Some(code) if code == libc::ENOTSUP || code == libc::EOPNOTSUPP || code == libc::ENOSYS)
-                {
-                    RuntimeUnsupported(format!("{label}: {error}"))
-                } else {
-                    RefusedNoEffect(format!("{label}: {error}"))
-                };
-            }
-            return Unknown(format!("{label}: capture outcome is unknown: {error}"));
+            return Unknown(format!("{label}: capture outcome is unknown: {error}"))
         }
         Ok(()) => match at(custody) {
             Ok(captured) => captured,
@@ -374,18 +365,7 @@ where
         return ExpectedCaptured(captured);
     }
     boundary(true);
-    match rename(parent, &custody_c, &target_c) {
-        Ok(()) if at(target).ok() == Some(captured) => UnexpectedRestored(captured),
-        Ok(()) => Unknown(format!("{label}: restoration identity is unknown")),
-        Err(error) if at(custody).ok() == Some(captured) => Retained(
-            captured,
-            format!("{label}: restoration retained after {error:?}"),
-        ),
-        Err(_) if at(target).ok() == Some(captured) => UnexpectedRestored(captured),
-        Err(error) => Unknown(format!(
-            "{label}: restoration outcome is unknown: {error:?}"
-        )),
-    }
+    Unknown(format!("{label}: captured unexpected target identity"))
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -5037,7 +5017,7 @@ mod tests {
         }
 
         #[test]
-        fn custody_v2_occupied_custody_refuses_without_clobbering_either_object() {
+        fn custody_v2_occupied_custody_is_unknown_without_clobbering_either_object() {
             let (dir, parent, intent, custody) =
                 custody_v2_case(CustodyOperationKindV2::Replace, b"predecessor");
             let outcome = capture_target_no_replace_v2_with(
@@ -5051,10 +5031,7 @@ mod tests {
                 },
                 rename_child_no_replace,
             );
-            assert!(matches!(
-                outcome,
-                CustodyCaptureOutcomeV2::RefusedNoEffect(_)
-            ));
+            assert!(matches!(outcome, CustodyCaptureOutcomeV2::Unknown(_)));
             assert_eq!(fs::read(dir.path().join("target")).unwrap(), b"predecessor");
             assert_eq!(fs::read(custody).unwrap(), b"occupied");
         }
@@ -5090,9 +5067,45 @@ mod tests {
         }
 
         #[test]
-        fn custody_v2_last_boundary_substitution_restores_the_captured_b_object() {
+        fn custody_v2_error_after_effect_and_hard_link_back_never_probes_or_claims_no_effect() {
+            use std::cell::Cell;
+
+            let (dir, parent, intent, custody) =
+                custody_v2_case(CustodyOperationKindV2::Replace, b"predecessor");
+            let calls = Cell::new(0);
+            let probes = Cell::new(0);
+            let outcome = capture_target_no_replace_v2_with_probe(
+                &parent,
+                &intent,
+                "error after effect",
+                |_| {},
+                |parent, source, destination| {
+                    calls.set(calls.get() + 1);
+                    rename_child_no_replace(parent, source, destination).unwrap();
+                    fs::hard_link(&custody, dir.path().join("target")).unwrap();
+                    Err(RenameNoReplaceRefusalV1::Io(
+                        std::io::ErrorKind::Other.into(),
+                    ))
+                },
+                |parent, name, label| {
+                    probes.set(probes.get() + 1);
+                    required_identity_at_v2(parent, name, label)
+                },
+            );
+            assert!(matches!(outcome, CustodyCaptureOutcomeV2::Unknown(_)));
+            assert_eq!(calls.get(), 1);
+            assert_eq!(probes.get(), 1, "only the pre-capture probe is allowed");
+            assert_eq!(fs::read(dir.path().join("target")).unwrap(), b"predecessor");
+            assert_eq!(fs::read(custody).unwrap(), b"predecessor");
+        }
+
+        #[test]
+        fn custody_v2_unexpected_capture_stays_in_custody_without_restoration() {
+            use std::cell::Cell;
+
             let (dir, parent, intent, custody) =
                 custody_v2_case(CustodyOperationKindV2::Replace, b"A");
+            let calls = Cell::new(0);
             let outcome = capture_target_no_replace_v2_with(
                 &parent,
                 &intent,
@@ -5103,21 +5116,58 @@ mod tests {
                         fs::write(dir.path().join("target"), b"B").unwrap();
                     }
                 },
-                rename_child_no_replace,
+                |parent, source, destination| {
+                    calls.set(calls.get() + 1);
+                    rename_child_no_replace(parent, source, destination)
+                },
             );
-            assert!(matches!(
-                outcome,
-                CustodyCaptureOutcomeV2::UnexpectedRestored(_)
-            ));
+            assert!(matches!(outcome, CustodyCaptureOutcomeV2::Unknown(_)));
+            assert_eq!(calls.get(), 1);
             assert_eq!(fs::read(dir.path().join("A")).unwrap(), b"A");
-            assert_eq!(fs::read(dir.path().join("target")).unwrap(), b"B");
-            assert!(!custody.exists());
+            assert_eq!(fs::read(custody).unwrap(), b"B");
+            assert!(!dir.path().join("target").exists());
         }
 
         #[test]
-        fn custody_v2_target_takeover_retains_both_objects_as_protective_debt() {
+        fn custody_v2_old_restoration_boundary_substitution_never_moves_c_into_target() {
+            use std::cell::Cell;
+
+            let (dir, parent, intent, custody) =
+                custody_v2_case(CustodyOperationKindV2::Replace, b"A");
+            let calls = Cell::new(0);
+            let outcome = capture_target_no_replace_v2_with(
+                &parent,
+                &intent,
+                "custody substitution",
+                |restoring| {
+                    if restoring {
+                        fs::rename(&custody, dir.path().join("B")).unwrap();
+                        fs::write(&custody, b"C").unwrap();
+                    } else {
+                        fs::rename(dir.path().join("target"), dir.path().join("A")).unwrap();
+                        fs::write(dir.path().join("target"), b"B").unwrap();
+                    }
+                },
+                |parent, source, destination| {
+                    calls.set(calls.get() + 1);
+                    rename_child_no_replace(parent, source, destination)
+                },
+            );
+            assert!(matches!(outcome, CustodyCaptureOutcomeV2::Unknown(_)));
+            assert_eq!(calls.get(), 1);
+            assert_eq!(fs::read(dir.path().join("A")).unwrap(), b"A");
+            assert_eq!(fs::read(dir.path().join("B")).unwrap(), b"B");
+            assert_eq!(fs::read(custody).unwrap(), b"C");
+            assert!(!dir.path().join("target").exists());
+        }
+
+        #[test]
+        fn custody_v2_target_takeover_leaves_captured_object_as_unknown_debt() {
+            use std::cell::Cell;
+
             let (dir, parent, intent, custody) =
                 custody_v2_case(CustodyOperationKindV2::Retire, b"A");
+            let calls = Cell::new(0);
             let outcome = capture_target_no_replace_v2_with(
                 &parent,
                 &intent,
@@ -5130,15 +5180,19 @@ mod tests {
                         fs::write(dir.path().join("target"), b"B").unwrap();
                     }
                 },
-                rename_child_no_replace,
+                |parent, source, destination| {
+                    calls.set(calls.get() + 1);
+                    rename_child_no_replace(parent, source, destination)
+                },
             );
-            assert!(matches!(outcome, CustodyCaptureOutcomeV2::Retained(_, _)));
+            assert!(matches!(outcome, CustodyCaptureOutcomeV2::Unknown(_)));
+            assert_eq!(calls.get(), 1);
             assert_eq!(fs::read(dir.path().join("target")).unwrap(), b"takeover");
             assert_eq!(fs::read(custody).unwrap(), b"B");
         }
 
         #[test]
-        fn custody_v2_unsupported_and_unknown_are_typed_without_fallback() {
+        fn custody_v2_compile_unsupported_and_io_are_typed_without_fallback() {
             use std::cell::Cell;
             for (case, refusal) in [
                 (0, RenameNoReplaceRefusalV1::PlatformUnsupported),
@@ -5170,7 +5224,6 @@ mod tests {
                 );
                 assert!(match case {
                     0 => matches!(outcome, CustodyCaptureOutcomeV2::CompileUnsupported),
-                    1 => matches!(outcome, CustodyCaptureOutcomeV2::RuntimeUnsupported(_)),
                     _ => matches!(outcome, CustodyCaptureOutcomeV2::Unknown(_)),
                 });
                 assert_eq!(calls.get(), 1, "one no-replace attempt and zero fallbacks");
