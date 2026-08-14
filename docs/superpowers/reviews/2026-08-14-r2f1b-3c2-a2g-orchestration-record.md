@@ -101,8 +101,53 @@ All checks passed; no drift found.
 
 ## Execution log
 
-- 2026-08-14: record opened; A2 dispatched (run id appended at the next
-  stable point).
+- 2026-08-14: record opened; A2 dispatched.
+- 2026-08-14: A2 base run complete. Run `impl-66546-s8d4i725` (clone
+  `/Users/wesleyjinks/code/.a2a-implement/impl-66546-s8d4i725`), source repo =
+  the retained A1 clone, base exactly `5cbeea1e`. Candidate commit
+  `3890fa6c295abcf92055940816c162c781d824bf`
+  ("feat(r2f1b): bind trusted journal route and operation lease"), preserved
+  as second copy at local unpushed branch `salvage/r2f1b-3c2-a2-candidate`.
+  Delta 214 production / 483 total changed lines (caps 220/500):
+  `fs_custody.rs` +456 (212 production + 244 colocated tests), one
+  `liveness.rs` `flock_nb` visibility line, +25 handoff. Loop closed at its
+  declared bound of 1 attempt.
+- In-container hermetic verify: fmt/clippy/build exit 0; focused
+  `journal_route_custody_v2` 5/0, `custody_v2` 16/0, `fs_custody` 82/0; the
+  aggregate run passed all 1,084 bridge-core tests then failed the whole-bin
+  `a2a-bridge` harness at `api_entry_resolves_and_serves_through_registry`
+  (`api.prompt.error_body_read`), a surface the diff does not touch, with the
+  ledgered flock-EBADF log signature adjacent. Internal advisory review:
+  APPROVE (deferring the unsupported-route regression completeness note and
+  the documented unrelated aggregate exclusion).
+- Operator host gates on exact `3890fa6c` in the run clone, all exit 0:
+  diff-check, fmt, locked all-target/all-feature check, Clippy `-D warnings`,
+  full locked all-feature workspace test **4,004 passed / 0 failed / 13
+  ignored across 90 harnesses** (ignored = the declared authenticated/live
+  set), locked release build, `cargo deny check`, hygiene 40 tracked / 8
+  configs (log: session scratchpad `a2-host-gates.log`). The in-container red
+  is therefore environment-classified (host green at the same candidate,
+  untouched surface, known hermetic whole-bin class); it is not attributed to
+  the change, so no in-container base control was spent — if any review
+  disputes the classification, the control runs before adjudication.
+- Operator source inspection: mandate mechanisms verified at source
+  (externally supplied `JournalRootBindingV2` with private fields and
+  sibling-name refusal; no-create/no-follow opens; identity verification on
+  the opened descriptor before flock; fresh anchor->parent->root re-walk under
+  the held flock; guard with private lock fd, no path projection, unlock on
+  drop; non-Unix arms refuse typed). Red schedule present and seam-injected at
+  the exact boundaries. One disclosed deviation handed to the review: the A2
+  "remove revalidate-as-authority / path-exposing lock result" clause is
+  satisfied only by the new V2 authority path not using them —
+  `JournalRootCustodyV1::revalidate` and `acquire_persistent_child_lock`
+  remain with zero callers outside colocated tests; A4 owns broken-method
+  deletion. Also disclosed: `Io(WouldBlock)` contention encoding, the
+  `begin_operation_with` test seam, the anchor-path re-walk shape, and the
+  `flock_nb` `pub(crate)` widening.
+- 2026-08-14: counted independent review dispatched — one Sol/xhigh hard
+  read-only `code-review` pass on exact `5cbeea1e..3890fa6c` in the run
+  clone; brief `closure-a2.md` (durable copy committed beside this record as
+  [`2026-08-14-r2f1b-3c2-task-a2-review-brief.md`](2026-08-14-r2f1b-3c2-task-a2-review-brief.md)).
 
 ## Non-scope reaffirmed
 
