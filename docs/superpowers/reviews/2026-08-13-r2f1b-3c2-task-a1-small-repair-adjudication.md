@@ -2,6 +2,14 @@
 
 Date: 2026-08-13
 
+> **Superseded 2026-08-14.** The owner separately authorized one bounded
+> continuation on this preserved artifact. Exact commit `5cbeea1e` fixes both
+> WRONGs recorded below and its sole Sol/xhigh closure returned `APPROVE` with
+> no WRONG or SMELL findings. This file remains the historical adjudication of
+> `6616753b`; current status is owned by the
+> [owner-extension adjudication](2026-08-14-r2f1b-3c2-task-a1-owner-extension-adjudication.md)
+> and [closure](2026-08-14-r2f1b-3c2-task-a1-owner-extension-sol-closure.md).
+
 Landed base: `42249b3d926b49afd9d0dbd213d0ee3d3e459af6`
 
 Rejected input: `bc262ad466b45470cd44fceda8224a36b2ba77b2`

@@ -2,6 +2,12 @@
 
 Date: 2026-08-13
 
+> **Superseded 2026-08-14.** The two WRONGs in this historical closure became
+> the complete contract for one owner-authorized bounded continuation. Exact
+> commit `5cbeea1e` fixes both and received `VERDICT: APPROVE`; see the
+> [owner-extension closure](2026-08-14-r2f1b-3c2-task-a1-owner-extension-sol-closure.md)
+> and [adjudication](2026-08-14-r2f1b-3c2-task-a1-owner-extension-adjudication.md).
+
 Reviewed commit: `6616753bf479d8775381eb9ef1d7237f5660514c`
 
 Exact parent: `bc262ad466b45470cd44fceda8224a36b2ba77b2`

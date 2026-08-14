@@ -8,9 +8,19 @@ Frozen green production base: `42249b3d926b49afd9d0dbd213d0ee3d3e459af6`
 
 Preserved rejected 3c2 feature head: `771c0fb8`
 
-Rejected small A1 repair: `6616753bf479d8775381eb9ef1d7237f5660514c`
+Superseded small A1 repair: `6616753bf479d8775381eb9ef1d7237f5660514c`
+
+Closure-approved A1 continuation: `5cbeea1ed882afe448d3825984af9a3ed74bcb58`
+(retained, not integrated)
 
 ## Recommendation
+
+**Status update (2026-08-14):** one separately authorized bounded continuation
+removed the two open A1 race mechanisms and received a clean closure approval.
+That establishes an acceptable inactive A1 candidate; it does not land A1,
+authorize A2, or decide this proposed split. The recommendation below remains
+pending because it rests on the size and product priority of the dormant
+request-flight mini-program, not on those now-closed A1 defects.
 
 Do not continue A1-A4 plus B-G as the active critical path. Close the current
 reliability core at green 3c1 plus one small current-production cleanup/retry
@@ -82,7 +92,7 @@ projection collapse is separable from every A1-F journal decision.
 
 | Old task | Disposition | Reason / replacement |
 |---|---|---|
-| A1 | Park, do not integrate | The small repair fixed its inherited failures but another open-class peer-race population remains. The arbitrary-peer contract is not justified by the operating model. |
+| A1 | Closure-approved at `5cbeea1e`; retain, do not integrate pending owner program choice | The bounded continuation removed restoration and post-`Io` no-effect proof, closing both peer-race WRONGs without adding a namespace transaction engine. The candidate remains inactive and unarmed. |
 | A2 | Remove from active plan | Trusted anchor plus sibling namespace lease exists to defend the custom file journal. A single live bridge instance and owner-private state can instead be enforced at application/store admission. |
 | A3 | Remove from active plan | Rename-stage rollback/roll-forward is a custom filesystem transaction engine. If automatic request recovery is later required, use one transactional store and a fail-closed recovery policy. |
 | A4 | Remove from active plan | Owned journal wrappers and deletion of candidate-only broken APIs disappear when the candidate journal is not adopted. |
