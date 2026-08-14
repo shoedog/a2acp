@@ -473,3 +473,46 @@ Changed paths are `crates/bridge-core/src/fs_custody.rs`, the one visibility lin
 - Delta from the frozen parent: 214 production (212 custody additions plus the one liveness replacement counted add/delete) + 244 colocated-test + 25 handoff = 483 changed lines.
 
 A3-A4, Task B, production V3, shared journal/request state, API/HTTP, live providers, smoke, compatibility, deployment, fold, push, and the running operator remain unarmed and unchanged.
+
+## Task A3 capture settlement and bounded crash recovery
+
+Date: 2026-08-14.
+Frozen input: `3890fa6c295abcf92055940816c162c781d824bf`.
+
+### Admissible red evidence
+
+Exact pre-production command:
+```text
+CARGO_INCREMENTAL=0 cargo test -p bridge-core --locked --offline namespace_transaction -- --nocapture
+```
+Cargo reached `bridge-core` and failed nonzero with three `E0425` errors naming only the absent `NamespaceTransactionV2`, `NamespaceRecoveryTicketV2`, and `NamespaceTransactionOutcomeV2` APIs.
+This was neither dependency/network refusal nor a zero-selected selector; an earlier malformed test scaffold is not counted.
+The four A2 riders are mutation-style regressions: removing anchor schedule coverage, the process mutex, the root/lock distinct-name check, or the non-Unix refusal makes its corresponding focused assertion fail.
+
+### Result and limits
+
+Under the held `JournalRootOperationV2` lease, replace and retire now use synced immutable intents and distinct stage, swap, and del namespaces with descriptor-relative no-replace transitions.
+Replace rolls exact A back after a pre-publication crash, otherwise verifies the committed successor before identity-checked retirement and zero-link proof; retire rolls authorized capture forward.
+Malformed, duplicate, foreign, over-cap, substituted, or ambiguous residue is preserved as typed protective debt, and repeated recovery reaches a stable outcome.
+No drop cleanup, path/replacing rename, link/copy, unchecked unlink, success helper, or outcome-flattening `Result<(), _>` exists in the new surface.
+
+Changed paths:
+- `crates/bridge-core/src/namespace_transaction.rs` (new transaction/recovery surface and focused tests)
+- `crates/bridge-core/src/fs_custody.rs` (narrow custody access plus A2 riders)
+- `crates/bridge-core/src/lib.rs` (Unix module export)
+- this handoff
+
+Delta from the frozen input: 320 production + 281 colocated-test + 43 handoff = 644 changed lines.
+
+### Verification
+
+- `namespace_transaction`: 8 passed, 0 failed.
+- `journal_route_custody_v2`: 7 passed, 0 failed.
+- `custody_v2`: 18 passed, 0 failed.
+- `fs_custody`: 84 passed, 0 failed.
+- `git diff --check`: exit 0.
+- Required `cargo fmt --all -- --check` could not start because this Cargo installation has no `fmt` subcommand.
+- Available equivalent `rustfmt --check --edition 2021` on both changed implementation files: exit 0.
+
+Full workspace tests/check/clippy, release build, repository hygiene, live providers, smoke, compatibility, deployment, fold, push, and running-operator actions were excluded.
+A4, Task B, production V3, shared journal/request state, API/HTTP, and every production caller remain unarmed and unchanged.
