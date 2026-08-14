@@ -182,35 +182,41 @@ pub const MAX_RESERVED_SOURCE_V2_BYTES: usize = 243;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ChildNameV2(OsString);
 impl ChildNameV2 {
-    #[cfg(unix)]
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, ChildNameRefusalV1> {
-        use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
-        if bytes.len() > MAX_CHILD_NAME_V2_BYTES || bytes.contains(&b'\\') {
+        if bytes.len() > MAX_CHILD_NAME_V2_BYTES
+            || bytes.is_empty()
+            || bytes == b"."
+            || bytes == b".."
+            || bytes.contains(&b'/')
+            || bytes.contains(&b'\\')
+        {
             return Err(ChildNameRefusalV1::NotOneComponent);
         }
-        validated_child_name(OsStr::from_bytes(bytes))?;
-        Ok(Self(OsString::from_vec(bytes.to_vec())))
+        if bytes.contains(&0) {
+            return Err(ChildNameRefusalV1::ContainsNul);
+        }
+        let value = std::str::from_utf8(bytes).map_err(|_| ChildNameRefusalV1::NotOneComponent)?;
+        Ok(Self(OsString::from(value)))
     }
     pub fn as_os_str(&self) -> &OsStr {
         &self.0
     }
-    #[cfg(unix)]
     pub fn reserved(
         namespace: ReservedNameNamespaceV2,
         target: &Self,
     ) -> Result<Self, FsCustodyError> {
-        use std::os::unix::ffi::OsStrExt as _;
-        Self::from_bytes(&[namespace.prefix(), target.0.as_bytes()].concat())
+        let target = target.0.to_str().expect("ChildNameV2 is portable UTF-8");
+        Self::from_bytes(&[namespace.prefix(), target.as_bytes()].concat())
             .map_err(|_| FsCustodyError::InvalidChildName("reserved child name".into()))
     }
-    #[cfg(unix)]
     pub fn parse_reserved(
         expected: ReservedNameNamespaceV2,
         encoded: &Self,
     ) -> Result<Self, FsCustodyError> {
-        use std::os::unix::ffi::OsStrExt as _;
         encoded
             .0
+            .to_str()
+            .expect("ChildNameV2 is portable UTF-8")
             .as_bytes()
             .strip_prefix(expected.prefix())
             .and_then(|value| Self::from_bytes(value).ok())
@@ -239,7 +245,6 @@ pub enum CustodyOperationKindV2 {
 #[rustfmt::skip]
 pub struct CustodyIntentV2(CustodyOperationKindV2, ChildNameV2, RequiredObjectIdentityV2, FileContentSnapshotV2, [ChildNameV2; 4]);
 impl CustodyIntentV2 {
-    #[cfg(unix)]
     pub fn new(
         operation: CustodyOperationKindV2,
         target: ChildNameV2,
@@ -272,10 +277,8 @@ pub enum CustodyCaptureOutcomeV2 {
 }
 #[cfg(unix)]
 #[rustfmt::skip]
-fn required_identity_at_v2(parent: &File, name: &OsStr, label: &str) -> Option<RequiredObjectIdentityV2> {
-    required_file_content_snapshot_v2(&open_regular_child(parent, name, label).ok()?, label)
-        .ok()
-        .map(|value| value.object)
+fn required_identity_at_v2(parent: &File, name: &OsStr, label: &str) -> Result<RequiredObjectIdentityV2, FsCustodyError> {
+    Ok(required_file_content_snapshot_v2(&open_regular_child(parent, name, label)?, label)?.object)
 }
 #[cfg(unix)]
 pub fn capture_target_no_replace_v2(
@@ -285,30 +288,71 @@ pub fn capture_target_no_replace_v2(
 ) -> CustodyCaptureOutcomeV2 {
     capture_target_no_replace_v2_with(parent, intent, label, |_| {}, rename_child_no_replace)
 }
+#[cfg(not(unix))]
+pub fn capture_target_no_replace_v2(
+    _parent: &File,
+    _intent: &CustodyIntentV2,
+    _label: &str,
+) -> CustodyCaptureOutcomeV2 {
+    CustodyCaptureOutcomeV2::CompileUnsupported
+}
 #[cfg(unix)]
 fn capture_target_no_replace_v2_with<H, R>(
     parent: &File,
     intent: &CustodyIntentV2,
     label: &str,
-    mut boundary: H,
-    mut rename: R,
+    boundary: H,
+    rename: R,
 ) -> CustodyCaptureOutcomeV2
 where
     H: FnMut(bool),
     R: FnMut(&File, &CStr, &CStr) -> Result<(), RenameNoReplaceRefusalV1>,
+{
+    capture_target_no_replace_v2_with_probe(
+        parent,
+        intent,
+        label,
+        boundary,
+        rename,
+        required_identity_at_v2,
+    )
+}
+#[cfg(unix)]
+fn capture_target_no_replace_v2_with_probe<H, R, P>(
+    parent: &File,
+    intent: &CustodyIntentV2,
+    label: &str,
+    mut boundary: H,
+    mut rename: R,
+    mut identity_at: P,
+) -> CustodyCaptureOutcomeV2
+where
+    H: FnMut(bool),
+    R: FnMut(&File, &CStr, &CStr) -> Result<(), RenameNoReplaceRefusalV1>,
+    P: FnMut(&File, &OsStr, &str) -> Result<RequiredObjectIdentityV2, FsCustodyError>,
 {
     use CustodyCaptureOutcomeV2::*;
     let target = intent.1.as_os_str();
     let custody = intent.capture_name().as_os_str();
     let target_c = child_name_cstring(target, label).expect("validated target");
     let custody_c = child_name_cstring(custody, label).expect("validated custody");
-    let at = |name| required_identity_at_v2(parent, name, label);
-    let before = at(target);
+    let mut at = |name| identity_at(parent, name, label);
+    let before = match at(target) {
+        Ok(identity) => identity,
+        Err(FsCustodyError::Unsupported(reason)) => {
+            return RuntimeUnsupported(format!("{label}: {reason}"))
+        }
+        Err(error) => {
+            return RefusedNoEffect(format!(
+                "{label}: pre-capture identity unavailable: {error}"
+            ))
+        }
+    };
     boundary(false);
     let captured = match rename(parent, &target_c, &custody_c) {
         Err(RenameNoReplaceRefusalV1::PlatformUnsupported) => return CompileUnsupported,
         Err(RenameNoReplaceRefusalV1::Io(error)) => {
-            if before.is_some() && at(target) == before {
+            if matches!(at(target), Ok(observed) if observed == before) {
                 return if error.kind() == std::io::ErrorKind::Unsupported
                     || matches!(error.raw_os_error(), Some(code) if code == libc::ENOTSUP || code == libc::EOPNOTSUPP || code == libc::ENOSYS)
                 {
@@ -317,14 +361,13 @@ where
                     RefusedNoEffect(format!("{label}: {error}"))
                 };
             }
-            match at(custody) {
-                Some(captured) => captured,
-                None => return Unknown(format!("{label}: capture outcome is unknown: {error}")),
-            }
+            return Unknown(format!("{label}: capture outcome is unknown: {error}"));
         }
         Ok(()) => match at(custody) {
-            Some(captured) => captured,
-            None => return Unknown(format!("{label}: captured identity is unknown")),
+            Ok(captured) => captured,
+            Err(error) => {
+                return Unknown(format!("{label}: captured identity is unknown: {error}"))
+            }
         },
     };
     if captured == intent.2 {
@@ -332,13 +375,13 @@ where
     }
     boundary(true);
     match rename(parent, &custody_c, &target_c) {
-        Ok(()) if at(target) == Some(captured) => UnexpectedRestored(captured),
+        Ok(()) if at(target).ok() == Some(captured) => UnexpectedRestored(captured),
         Ok(()) => Unknown(format!("{label}: restoration identity is unknown")),
-        Err(error) if at(custody) == Some(captured) => Retained(
+        Err(error) if at(custody).ok() == Some(captured) => Retained(
             captured,
             format!("{label}: restoration retained after {error:?}"),
         ),
-        Err(_) if at(target) == Some(captured) => UnexpectedRestored(captured),
+        Err(_) if at(target).ok() == Some(captured) => UnexpectedRestored(captured),
         Err(error) => Unknown(format!(
             "{label}: restoration outcome is unknown: {error:?}"
         )),
@@ -4843,9 +4886,70 @@ mod tests {
         }
 
         #[test]
+        fn custody_v2_incomplete_pre_capture_identity_never_reaches_rename() {
+            use std::cell::Cell;
+
+            fn assert_stops_before_rename(parent: &File, intent: &CustodyIntentV2) {
+                let boundaries = Cell::new(0);
+                let renames = Cell::new(0);
+                let outcome = capture_target_no_replace_v2_with(
+                    parent,
+                    intent,
+                    "incomplete identity",
+                    |_| boundaries.set(boundaries.get() + 1),
+                    |_, _, _| {
+                        renames.set(renames.get() + 1);
+                        Ok(())
+                    },
+                );
+                assert!(matches!(
+                    outcome,
+                    CustodyCaptureOutcomeV2::RefusedNoEffect(_)
+                        | CustodyCaptureOutcomeV2::RuntimeUnsupported(_)
+                ));
+                assert_eq!((boundaries.get(), renames.get()), (0, 0));
+            }
+
+            let (dir, parent, intent, _) =
+                custody_v2_case(CustodyOperationKindV2::Replace, b"predecessor");
+            fs::remove_file(dir.path().join("target")).unwrap();
+            assert_stops_before_rename(&parent, &intent);
+
+            fs::create_dir(dir.path().join("target")).unwrap();
+            assert_stops_before_rename(&parent, &intent);
+            assert_stops_before_rename(&File::open(dir.path().join("staged")).unwrap(), &intent);
+
+            let renames = Cell::new(0);
+            let outcome = capture_target_no_replace_v2_with_probe(
+                &parent,
+                &intent,
+                "missing birthtime",
+                |_| panic!("identity refusal must precede the boundary"),
+                |_, _, _| {
+                    renames.set(renames.get() + 1);
+                    Ok(())
+                },
+                |_, _, _| Err(FsCustodyError::Unsupported("missing birthtime".into())),
+            );
+            assert!(matches!(
+                outcome,
+                CustodyCaptureOutcomeV2::RuntimeUnsupported(_)
+            ));
+            assert_eq!(renames.get(), 0);
+        }
+
+        #[test]
         fn custody_v2_names_and_both_intents_are_distinct_bounded_and_reversible() {
             use std::os::unix::ffi::OsStrExt as _;
-            for invalid in [b"".as_slice(), b".", b"..", b"a/b", b"a\\b", b"a\0b"] {
+            for invalid in [
+                b"".as_slice(),
+                b".",
+                b"..",
+                b"a/b",
+                b"a\\b",
+                b"a\0b",
+                b"\xff",
+            ] {
                 assert!(
                     ChildNameV2::from_bytes(invalid).is_err(),
                     "accepted {invalid:?}"
@@ -4859,11 +4963,30 @@ mod tests {
                     ChildNameV2::parse_reserved(namespace, &name).unwrap(),
                     target
                 );
+                for other in ReservedNameNamespaceV2::ALL {
+                    if other != namespace {
+                        assert!(ChildNameV2::parse_reserved(other, &name).is_err());
+                    }
+                }
                 encoded.push(name.as_os_str().as_bytes().to_vec());
             }
             encoded.sort();
             encoded.dedup();
             assert_eq!(encoded.len(), 4);
+
+            let exact_bound =
+                ChildNameV2::from_bytes(&vec![b'x'; MAX_RESERVED_SOURCE_V2_BYTES]).unwrap();
+            for namespace in ReservedNameNamespaceV2::ALL {
+                let encoded = ChildNameV2::reserved(namespace, &exact_bound).unwrap();
+                assert_eq!(
+                    encoded.as_os_str().as_bytes().len(),
+                    MAX_CHILD_NAME_V2_BYTES
+                );
+                assert_eq!(
+                    ChildNameV2::parse_reserved(namespace, &encoded).unwrap(),
+                    exact_bound
+                );
+            }
 
             let expected =
                 required_object_identity_v2(1, 2, BirthTimeV1::new(3, 4), "expected").unwrap();
@@ -4934,6 +5057,36 @@ mod tests {
             ));
             assert_eq!(fs::read(dir.path().join("target")).unwrap(), b"predecessor");
             assert_eq!(fs::read(custody).unwrap(), b"occupied");
+        }
+
+        #[test]
+        fn custody_v2_failed_capture_never_claims_or_restores_foreign_custody() {
+            use std::cell::Cell;
+
+            let (dir, parent, intent, custody) =
+                custody_v2_case(CustodyOperationKindV2::Replace, b"predecessor");
+            let calls = Cell::new(0);
+            let outcome = capture_target_no_replace_v2_with(
+                &parent,
+                &intent,
+                "foreign custody",
+                |restoring| {
+                    assert!(!restoring, "capture error must not enter restoration");
+                    fs::write(&custody, b"foreign").unwrap();
+                    fs::rename(dir.path().join("target"), dir.path().join("lost")).unwrap();
+                },
+                |_, _, _| {
+                    calls.set(calls.get() + 1);
+                    Err(RenameNoReplaceRefusalV1::Io(
+                        std::io::ErrorKind::Other.into(),
+                    ))
+                },
+            );
+            assert!(matches!(outcome, CustodyCaptureOutcomeV2::Unknown(_)));
+            assert_eq!(calls.get(), 1);
+            assert_eq!(fs::read(custody).unwrap(), b"foreign");
+            assert_eq!(fs::read(dir.path().join("lost")).unwrap(), b"predecessor");
+            assert!(!dir.path().join("target").exists());
         }
 
         #[test]
@@ -5031,6 +5184,32 @@ mod tests {
                     "no outcome may fall back to replacing rename"
                 );
             }
+        }
+    }
+
+    #[cfg(not(unix))]
+    mod custody_v2_non_unix {
+        use super::*;
+
+        #[test]
+        fn portable_surface_constructs_and_capture_is_compile_unsupported() {
+            assert!(ChildNameV2::from_bytes(b"\xff").is_err());
+            let target = ChildNameV2::from_bytes(b"target").unwrap();
+            let expected =
+                required_object_identity_v2(1, 2, BirthTimeV1::new(3, 4), "expected").unwrap();
+            let staged = FileContentSnapshotV2 {
+                object: required_object_identity_v2(5, 6, BirthTimeV1::new(7, 8), "staged")
+                    .unwrap(),
+                content_len: 9,
+            };
+            let intent =
+                CustodyIntentV2::new(CustodyOperationKindV2::Replace, target, expected, staged)
+                    .unwrap();
+            let ignored_parent = tempfile::tempfile().unwrap();
+            assert!(matches!(
+                capture_target_no_replace_v2(&ignored_parent, &intent, "unsupported"),
+                CustodyCaptureOutcomeV2::CompileUnsupported
+            ));
         }
     }
 }
