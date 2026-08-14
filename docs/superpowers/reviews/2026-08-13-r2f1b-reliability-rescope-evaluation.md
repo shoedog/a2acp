@@ -2,7 +2,8 @@
 
 Date: 2026-08-13
 
-Status: **PROPOSED PROGRAM SPLIT - OWNER DECISION REQUIRED**
+Status: **EVALUATED ALTERNATIVE - OWNER DECLINED SPLIT; FULL TEN-TASK PATH
+SELECTED**
 
 Frozen green production base: `42249b3d926b49afd9d0dbd213d0ee3d3e459af6`
 
@@ -13,28 +14,27 @@ Superseded small A1 repair: `6616753bf479d8775381eb9ef1d7237f5660514c`
 Closure-approved A1 continuation: `5cbeea1ed882afe448d3825984af9a3ed74bcb58`
 (retained, not integrated)
 
-## Recommendation
+## Historical recommendation and owner disposition
 
 **Status update (2026-08-14):** one separately authorized bounded continuation
 removed the two open A1 race mechanisms and received a clean closure approval.
-That establishes an acceptable inactive A1 candidate; it does not land A1,
-authorize A2, or decide this proposed split. The recommendation below remains
-pending because it rests on the size and product priority of the dormant
-request-flight mini-program, not on those now-closed A1 defects.
+After reviewing this evaluation, the owner declined its proposed split and
+selected the full ten-task 3c2 path. A1 remains retained and not integrated; A2
+is now the next sequential task from exact input `5cbeea1e`, but no A2
+implementation run started in the decision/bookkeeping turn.
 
-Do not continue A1-A4 plus B-G as the active critical path. Close the current
-reliability core at green 3c1 plus one small current-production cleanup/retry
-shield; move request-flight crash automation, preparation-flight activation,
-automatic backend health/drain, and zero-downtime release handoff into deferred
-programs. Advance explicit, default-off OpenRouter and OpenCode work without
-claiming automatic V3 deadlines, automatic retry, or cross-crash request
-recovery.
+This evaluation recommended not continuing A1-A4 plus B-G as the active critical
+path. Its alternative was to close the current reliability core at green 3c1
+plus one small current-production cleanup/retry shield, defer the larger
+automatic-reliability work, and advance explicit default-off provider work.
+That recommendation is preserved as evaluated history but is not the selected
+program path.
 
-This reduces the active 3c2 reliability repair from ten planned implementation
-tasks plus aggregate review to **one bounded shield task**. A later owner choice
-to arm automatic API deadline/restart behavior starts with a fresh focused
-design and at most three implementation cuts, not the existing filesystem
-journal plan.
+Had it been selected, this would have reduced the active 3c2 reliability repair
+from ten planned implementation tasks plus aggregate review to **one bounded
+shield task**. Its later automatic API deadline/restart option would have begun
+with a fresh focused design and at most three implementation cuts, not the
+existing filesystem journal plan.
 
 ## Options evaluated
 
@@ -49,8 +49,8 @@ journal plan.
    creates dormant code with ongoing maintenance cost and no operator benefit.
 3. **Close the current reliability need narrowly.** Retain A1 outside main,
    skip A2, and implement only Shield S1 on current green main so an uncertain
-   cleanup can never authorize another provider request. This is the recommended
-   near-term option.
+   cleanup can never authorize another provider request. This was the evaluation's
+   recommended near-term option; the owner did not select it.
 4. **Build automatic request recovery later, if it becomes a real need.** Start
    a new focused design using the existing transactional database, the
    single-operator/quiet-update assumptions, and no automatic replay of an
@@ -58,9 +58,11 @@ journal plan.
    tasks. This is a replacement for the ten-task filesystem plan, not a promise
    to resume at A2.
 
-Provider expansion was also evaluated as independent work after Shield S1:
-explicit, default-off OpenRouter work and read-only OpenCode discovery do not
-need A1-A4 or B-F and should not be held behind dormant request recovery.
+Provider expansion was also evaluated as independent work after Shield S1 in
+the proposed split: explicit, default-off OpenRouter work and read-only OpenCode
+discovery do not need A1-A4 or B-F. Because the split was not selected, actual
+provider implementation sequencing returns to the canonical roadmap; read-only
+discovery remains separable.
 
 ## Product and threat-model basis
 
@@ -196,7 +198,10 @@ not on the provider-integration critical path.
 No provider live turn, running-service edit, deployment, or automatic
 scheduling is authorized by this evaluation.
 
-## Same-machine parallel execution
+## Historical same-machine parallel option
+
+The following parallel shape was evaluated for the proposed split and is not
+the active sequencing decision after the owner selected the full ten-task path.
 
 No new bridge feature is required to develop two items on one machine. ADR-0040
 already permits parallel implementor flights from one frozen base with one
@@ -213,10 +218,11 @@ brief excludes executor changes. A1/A2 and overlapping API migrations are not.
 
 ## Owner decision
 
-Recommended decision: approve this split, dispatch S1, then begin R3e
-OpenRouter while a separate read-only lane grounds OpenCode. Until the owner
-approves, the old ten-task 3c2 plan remains the formal binding sequence. A1 is
-closure-approved and retained at `5cbeea1e` but not integrated; A2 has that
-possible frozen input but remains unauthorized. Landing A1 or A1+A2 and then
-pausing is explicitly rejected as a non-delivering island. No priority cursor
-moves until the owner selects the full plan or the proposed split.
+On 2026-08-14 the owner selected the full ten-task 3c2 plan and declined this
+document's proposed split. A1 is closure-approved and retained at `5cbeea1e` but
+not integrated. A2 is the next sequential task from that exact input; no A2
+implementation run was started by this record. Continue A2, A3, A4, and B-G
+under the salvage plan's per-task gates and review caps. Landing A1 or A1+A2 and
+then pausing remains rejected as a non-delivering island. This decision does not
+authorize a provider turn, production activation, release, deployment, or
+running-operator mutation.

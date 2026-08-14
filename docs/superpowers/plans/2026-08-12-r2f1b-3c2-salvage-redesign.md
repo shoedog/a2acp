@@ -2,8 +2,8 @@
 
 Date: 2026-08-12
 
-Status: **FULL TEN-TASK OPTION EVALUATED; A1 APPROVED AND RETAINED; OWNER PATH
-DECISION PENDING; A2 NOT AUTHORIZED**
+Status: **FULL TEN-TASK PATH OWNER-SELECTED; A1 APPROVED AND RETAINED; A2 NEXT,
+NOT YET DISPATCHED**
 
 Landed base: `42249b3d926b49afd9d0dbd213d0ee3d3e459af6`
 
@@ -18,12 +18,12 @@ BLOCKER WRONGs. That candidate was preserved rather than restarted.
 
 Current execution update (2026-08-14): the separately authorized continuation
 at `5cbeea1e` fixed the remaining A1 findings and received closure approval. A1
-is retained and not integrated. This document now records the fully hardened
-ten-task option that was evaluated; it is not an owner decision to execute that
-whole option. The [rescope evaluation](../reviews/2026-08-13-r2f1b-reliability-rescope-evaluation.md)
-records the smaller alternatives and rejects stopping after A1 or A2 as a
-standalone endpoint. A2 has exact possible input `5cbeea1e` but no dispatch
-authorization. See the current
+is retained and not integrated. After reviewing the full plan and the smaller
+alternatives in the [rescope evaluation](../reviews/2026-08-13-r2f1b-reliability-rescope-evaluation.md),
+the owner selected this full ten-task path and declined the proposed split.
+Stopping after A1 or A2 remains rejected as a standalone endpoint. A2 is the
+next sequential task from exact approved input `5cbeea1e`; no A2 implementation
+run started in the owner-decision/bookkeeping turn. See the current
 [A1 adjudication](../reviews/2026-08-14-r2f1b-3c2-task-a1-owner-extension-adjudication.md).
 
 This plan is the design escalation required by the repaired-tail adjudication.
