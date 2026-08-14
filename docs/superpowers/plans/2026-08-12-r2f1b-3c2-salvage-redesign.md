@@ -2,7 +2,7 @@
 
 Date: 2026-08-12
 
-Status: **DESIGN APPROVED FOR SALVAGE IMPLEMENTATION; TASK A1 READY**
+Status: **A1 PARKED FOR TARGETED SALVAGE REDESIGN; A2 NOT DISPATCHABLE**
 
 Landed base: `42249b3d926b49afd9d0dbd213d0ee3d3e459af6`
 
@@ -10,6 +10,13 @@ Preserved artifact: `feat/r2f1b-3c2-api-authority` at
 `530992b7ff1e8e9151fb2a69e86f3ff71c44f905`
 
 Design-record branch input: `d698e6f02f3229da3787dbc2a8630c03cb8b25df`
+
+Execution update (2026-08-13): A1 candidate `bc262ad4` passed the full host
+gate but its capped closure review found three operator-confirmed BLOCKER WRONGs.
+The candidate is preserved, not integrated or scrapped. The last approved count
+remains A1-A4 plus B-G, but A1 requires a targeted design correction and A2 has
+no frozen input. See the
+[A1 adjudication](../reviews/2026-08-13-r2f1b-3c2-task-a1-adjudication.md).
 
 This plan is the design escalation required by the repaired-tail adjudication.
 It salvages the accepted identity, cancellation, lifecycle, diagnostic, and

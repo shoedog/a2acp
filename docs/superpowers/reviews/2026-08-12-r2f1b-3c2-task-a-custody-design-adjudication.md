@@ -11,6 +11,13 @@ Retained Task A candidate: `517703cbd2e469bf208f20a36248169536bca8b3`
 Planning checkpoint before this round:
 `8eee456af142eb056faf790a0e1d94948b08a197`
 
+Execution update (2026-08-13): this design verdict remains historical authority,
+but its first implementation cut did not reach acceptance. Exact A1 candidate
+`bc262ad4` passed the full host gate and was rejected at its closure-review cap
+with three operator-confirmed BLOCKER WRONGs. A1 is now parked for targeted
+salvage redesign; A2 has no frozen input. See the
+[A1 adjudication](2026-08-13-r2f1b-3c2-task-a1-adjudication.md).
+
 ## Verdict
 
 **TARGETED CUSTODY REDESIGN APPROVED; SALVAGE THE RETAINED CANDIDATE AS FOUR
