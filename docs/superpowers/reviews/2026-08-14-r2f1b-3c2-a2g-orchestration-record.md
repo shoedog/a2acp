@@ -175,6 +175,30 @@ All checks passed; no drift found.
 - A3 next: "capture settlement and bounded crash recovery" freezes exact
   input `3890fa6c`; stop/split 320 production / 700 total; same declared
   review cap shape as A2.
+- 2026-08-14: A3 base run complete. Run `impl-31489-rooxagqj`, base exactly
+  `3890fa6c`, candidate `f6b6ccf6` (+630/−14; module
+  `namespace_transaction.rs` 469 packed lines under a module-wide
+  `#[rustfmt::skip]`). In-container verify PASS all four stages (the A2-era
+  whole-bin red did not recur). Internal Sol/xhigh review — counted as the
+  one independent implementation review — returned REJECT: 4 proposed
+  BLOCKER WRONGs + 2 SMELLs.
+- 2026-08-14: **A3 PARKED AT A PLANNING STOP** — full classification in the
+  [A3 adjudication](2026-08-14-r2f1b-3c2-task-a3-adjudication.md). Grounds:
+  (1) true size measured by de-skip + `cargo fmt` = **~735 production /
+  ~1,285 total vs 320/700 caps**, concealed by statement packing; (2) the
+  A1-A4 aggregate 700-production budget (custody ruling 7) is exhausted even
+  at nominal numbers (200+214+320 = 734 before A4). Findings adjudicated at
+  source: W4 CONFIRMED (typed `Unsupported` erased to `Retained`/`NoEffect`;
+  bounded); W1 = design-vocabulary question for the owner (`len`-only
+  content snapshot vs ruling-1 "never success" under crash-window in-place
+  rewrite); W2 and W3 REFUTED as blockers (accepted-impossibility threat
+  model; second-trust-root requirement; W3 targets unchanged A2-accepted
+  code). No repair or closure round spent. Candidate preserved in the clone
+  and at `salvage/r2f1b-3c2-a3-candidate`. Task B and successors BLOCKED
+  pending the owner's path choice (split A3 / amend caps + one targeted
+  repair / redesign) and a ruling on the W1 content-commitment question.
+  Gate lesson ledgered: reject module-level `#[rustfmt::skip]` on production
+  code in hygiene.
 
 ## Non-scope reaffirmed
 
