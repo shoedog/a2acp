@@ -2,7 +2,8 @@
 
 Date: 2026-08-12
 
-Status: **A1 PARKED FOR TARGETED SALVAGE REDESIGN; A2 NOT DISPATCHABLE**
+Status: **FULL TEN-TASK OPTION EVALUATED; A1 APPROVED AND RETAINED; OWNER PATH
+DECISION PENDING; A2 NOT AUTHORIZED**
 
 Landed base: `42249b3d926b49afd9d0dbd213d0ee3d3e459af6`
 
@@ -11,12 +12,19 @@ Preserved artifact: `feat/r2f1b-3c2-api-authority` at
 
 Design-record branch input: `d698e6f02f3229da3787dbc2a8630c03cb8b25df`
 
-Execution update (2026-08-13): A1 candidate `bc262ad4` passed the full host
-gate but its capped closure review found three operator-confirmed BLOCKER WRONGs.
-The candidate is preserved, not integrated or scrapped. The last approved count
-remains A1-A4 plus B-G, but A1 requires a targeted design correction and A2 has
-no frozen input. See the
-[A1 adjudication](../reviews/2026-08-13-r2f1b-3c2-task-a1-adjudication.md).
+Historical execution update (2026-08-13): A1 candidate `bc262ad4` passed the
+full host gate but its capped closure review found three operator-confirmed
+BLOCKER WRONGs. That candidate was preserved rather than restarted.
+
+Current execution update (2026-08-14): the separately authorized continuation
+at `5cbeea1e` fixed the remaining A1 findings and received closure approval. A1
+is retained and not integrated. This document now records the fully hardened
+ten-task option that was evaluated; it is not an owner decision to execute that
+whole option. The [rescope evaluation](../reviews/2026-08-13-r2f1b-reliability-rescope-evaluation.md)
+records the smaller alternatives and rejects stopping after A1 or A2 as a
+standalone endpoint. A2 has exact possible input `5cbeea1e` but no dispatch
+authorization. See the current
+[A1 adjudication](../reviews/2026-08-14-r2f1b-3c2-task-a1-owner-extension-adjudication.md).
 
 This plan is the design escalation required by the repaired-tail adjudication.
 It salvages the accepted identity, cancellation, lifecycle, diagnostic, and

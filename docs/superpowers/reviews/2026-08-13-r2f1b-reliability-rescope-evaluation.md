@@ -36,6 +36,32 @@ to arm automatic API deadline/restart behavior starts with a fresh focused
 design and at most three implementation cuts, not the existing filesystem
 journal plan.
 
+## Options evaluated
+
+1. **Finish the full ten-task 3c2 plan.** Continue from approved A1 through A2,
+   A3, A4, and B-G, then run the combined review, fold, and CI. This builds the
+   strongest automatic request tracking and crash-recovery system, but it is the
+   largest and slowest option. Even after completion, production activation is
+   deferred to 3d.
+2. **Land A1 or A1+A2 and pause.** Reject this as an endpoint. Those tasks only
+   provide low-level file identity, safe naming, directory binding, and a lock.
+   No current request, cleanup, or retry behavior uses them. Landing them alone
+   creates dormant code with ongoing maintenance cost and no operator benefit.
+3. **Close the current reliability need narrowly.** Retain A1 outside main,
+   skip A2, and implement only Shield S1 on current green main so an uncertain
+   cleanup can never authorize another provider request. This is the recommended
+   near-term option.
+4. **Build automatic request recovery later, if it becomes a real need.** Start
+   a new focused design using the existing transactional database, the
+   single-operator/quiet-update assumptions, and no automatic replay of an
+   uncertain request. Cap that later program at three individually useful
+   tasks. This is a replacement for the ten-task filesystem plan, not a promise
+   to resume at A2.
+
+Provider expansion was also evaluated as independent work after Shield S1:
+explicit, default-off OpenRouter work and read-only OpenCode discovery do not
+need A1-A4 or B-F and should not be held behind dormant request recovery.
+
 ## Product and threat-model basis
 
 The application has one operator on one machine. Normal updates can stop usage,
@@ -189,5 +215,8 @@ brief excludes executor changes. A1/A2 and overlapping API migrations are not.
 
 Recommended decision: approve this split, dispatch S1, then begin R3e
 OpenRouter while a separate read-only lane grounds OpenCode. Until the owner
-approves, the old ten-task 3c2 plan remains the formal binding sequence, A1
-remains rejected, A2 remains undispatchable, and no priority cursor moves.
+approves, the old ten-task 3c2 plan remains the formal binding sequence. A1 is
+closure-approved and retained at `5cbeea1e` but not integrated; A2 has that
+possible frozen input but remains unauthorized. Landing A1 or A1+A2 and then
+pausing is explicitly rejected as a non-delivering island. No priority cursor
+moves until the owner selects the full plan or the proposed split.

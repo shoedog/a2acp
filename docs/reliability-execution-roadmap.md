@@ -137,7 +137,8 @@
   zero-downtime work, and advancing explicit default-off provider work; that split requires owner approval and does
   not yet select the active program. Until owner choice, the formal count remains ten tasks and A2 has exact possible
   input `5cbeea1e` but no dispatch authorization; the preserved feature remains non-foldable, 3d remains blocked, and
-  production API V3 remains unarmed.
+  production API V3 remains unarmed. The evaluated endpoints are full completion or the proposed split; landing A1
+  or A1+A2 and pausing is explicitly rejected because neither changes current request, cleanup, or retry behavior.
 - **R2f0p candidate verification (2026-07-30):** locked full workspace **2,994 passed / 0 failed / 12 ignored**
   across **61** test targets; diff/format, locked all-target/all-feature workspace check, warnings-denied Clippy,
   locked release workspace build, and repository hygiene **38 tracked artifacts / 7 example configs** are green.
