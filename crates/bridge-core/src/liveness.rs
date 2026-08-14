@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 
 /// Non-blocking flock. `Ok(true)` = acquired, `Ok(false)` = held by another open file description,
 /// `Err` = a real error.
-fn flock_nb(file: &std::fs::File, exclusive: bool) -> std::io::Result<bool> {
+pub(crate) fn flock_nb(file: &std::fs::File, exclusive: bool) -> std::io::Result<bool> {
     let op = (if exclusive {
         libc::LOCK_EX
     } else {

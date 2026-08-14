@@ -448,3 +448,28 @@ It failed nonzero with 20 `E0425`/`E0433` errors naming the absent capture name/
 - Delta from frozen parent: 200 production + 224 colocated-test + 26 handoff = 450 lines; paths are `crates/bridge-core/src/fs_custody.rs` and this handoff.
 
 A2-A4, Task B, production V3, live providers, smoke, compatibility, deployment, fold, push, HTTP, and the running operator remain unarmed and unchanged.
+
+## Task A2 trusted route binding and operation lease
+
+Date: 2026-08-14. Frozen input: `.git/A2A_TASK.md` at parent `5cbeea1ed882afe448d3825984af9a3ed74bcb58`.
+The two dated design/plan paths named by dispatch are absent from this frozen tree and reachable history; no substitute guidance was inferred.
+
+### Admissible red evidence
+
+Exact command: `CARGO_INCREMENTAL=0 cargo test -p bridge-core --locked --offline journal_route_custody_v2 -- --nocapture`.
+Cargo reached bridge-core and failed nonzero with 16 `E0425`/`E0433` errors naming only the absent `JournalRootBindingV2`, `ObjectIdentityV2`, and `JournalRootCustodyV2`; this was neither dependency refusal nor zero selection.
+
+### Result, gates, and limits
+
+`JournalRootBindingV2` externally binds the anchor/parent/root route and the sibling operation-lock object with mandatory dev/inode/birthtime. `JournalRootCustodyV2::open` only opens and proves that route; it never creates it.
+`begin_operation` serializes in-process acquisition, proves and nonblocking-flocks the exact retained lock object, then re-proves the held route. The opaque guard exposes no path, file, or descriptor surface and unlocks on drop.
+Changed paths are `crates/bridge-core/src/fs_custody.rs`, the one visibility line in `crates/bridge-core/src/liveness.rs`, and this handoff.
+
+- Focused `journal_route_custody_v2`: 5 passed, 0 failed; combined `custody_v2`: 16 passed, 0 failed; full `fs_custody`: 82 passed, 0 failed.
+- Workspace all-target/all-feature check and clippy with `-D warnings`: exit 0.
+- Aggregate workspace tests passed all 1,084 bridge-core tests, then hit the already-recorded `api_entry_resolves_and_serves_through_registry` / `api.prompt.error_body_read` failure; it was not repaired or rebaselined.
+- Release `a2a-bridge` build and its repository-hygiene validation: exit 0; 40 tracked artifacts and 8 example configs validated.
+- `cargo fmt --all -- --check` and `git diff --check`: exit 0.
+- Delta from the frozen parent: 214 production (212 custody additions plus the one liveness replacement counted add/delete) + 244 colocated-test + 25 handoff = 483 changed lines.
+
+A3-A4, Task B, production V3, shared journal/request state, API/HTTP, live providers, smoke, compatibility, deployment, fold, push, and the running operator remain unarmed and unchanged.
