@@ -629,6 +629,39 @@ fn serializer_impossible_cleanup_records_never_authorize_fallback() {
     }
 }
 
+fn assert_protective_release_is_structured_ineligible(release: &str) {
+    let (_dir, marker, config, source) = fixture();
+    let repo = source.parent().unwrap().join("owned repo");
+    let mut artifact = smoke_artifact(&repo, &config, "container_runtime", false);
+    artifact["cleanup"]["release"] = serde_json::json!(release);
+    write_json(&source, &artifact);
+
+    let output = fallback_command(&config, &source)
+        .arg("--confirm-trusted-own-repo-read-only")
+        .output()
+        .unwrap();
+    assert_ineligible_without_command(&read_plan(&output), "source_diagnostics_incomplete");
+    assert!(
+        !marker.exists(),
+        "protective release {release} spawned the target"
+    );
+}
+
+#[test]
+fn protective_release_unknown_is_structured_ineligible_without_rerun() {
+    assert_protective_release_is_structured_ineligible("unknown");
+}
+
+#[test]
+fn protective_release_retained_is_structured_ineligible_without_rerun() {
+    assert_protective_release_is_structured_ineligible("retained");
+}
+
+#[test]
+fn protective_release_preserved_is_structured_ineligible_without_rerun() {
+    assert_protective_release_is_structured_ineligible("preserved");
+}
+
 #[test]
 fn hand_assembled_task_diagnostic_is_rejected_without_a_plan() {
     let (_dir, marker, config, source) = fixture();

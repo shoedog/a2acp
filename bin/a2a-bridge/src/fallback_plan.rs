@@ -551,10 +551,12 @@ fn validate_smoke_lifecycle(
 fn validate_cleanup(cleanup: &SmokeCleanup) -> Result<bool, BoxError> {
     let valid_step =
         |value: &str| matches!(value, "not_needed" | "completed" | "failed" | "timed_out");
+    let valid_release =
+        |value: &str| valid_step(value) || matches!(value, "unknown" | "retained" | "preserved");
     if cleanup.grace_timeout_secs == 0
         || cleanup.grace_timeout_secs > 60
         || !valid_step(&cleanup.cancel)
-        || !valid_step(&cleanup.release)
+        || !valid_release(&cleanup.release)
         || !valid_step(&cleanup.retire)
         || !matches!(
             cleanup.run_scoped_backstop.as_str(),
