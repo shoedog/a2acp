@@ -918,6 +918,37 @@ All checks passed; no drift found.
   production-route assertion (caps 350/700, one-consumer-per-task
   split; the binding G contract restated inline; brief mirrored as
   [`2026-08-15-r2f1b-3c2-task-g-brief.md`](2026-08-15-r2f1b-3c2-task-g-brief.md)).
+- 2026-08-15: G base run: candidate `4c8e408b` (181 production/541
+  total, within 350/700; in-container verify fully green; the worktree
+  guard pins both disposition sets, both report fields, and the full
+  fold cross-product; the executor tracker and detached persistence
+  retain exact protective dispositions). Advisory review REJECT, all
+  findings operator-source-verified: **W1 blocker** — a configure or
+  provably-unaccepted preflight failure whose cleanup is not exactly
+  `Ok(Complete)` exits via the "preflight exhausted" terminal with
+  `retain_in_run_cache: false`, so the run cache evicts the cell and a
+  later node can reconfigure and prompt the same logical session with
+  unproven cleanup (the accepted-prompt branch already retains — the
+  gap is exactly the pre-acceptance-with-unproven-cleanup family);
+  **W2 blocker (split obligation)** — the enumeration duty found a
+  second collapsing consumer, smoke's generic `cleanup_step` mapping
+  every `Ok(T)` to artifact `"completed"`; that file is outside G's
+  ownership, and the binding one-consumer-per-task clause requires
+  naming a split, which the implementer failed to report; **W3
+  DEFER-classed WRONG** — the reason match lacks a `Some(Ok(Complete))`
+  arm, so complete cleanup masks the real empty/unexpected-response
+  failure with the self-contradictory `cleanup incomplete: Complete`;
+  one SMELL (four-variant coverage table) largely subsumed by W1's
+  prescribed red. Candidate preserved at
+  `salvage/r2f1b-3c2-g-candidate`.
+- Rejection classified CLOSED and enumerable → contracted targeted
+  repair dispatched on frozen `4c8e408b`: retention keyed on
+  proven-clean (evict only pre-acceptance AND exactly-`Complete`
+  cleanup) with per-disposition reds; the reason-preservation arm
+  (disclosed inclusion of the DEFER-classed WRONG — trivial, same
+  file); and the handoff naming **G2** as the separate smoke-consumer
+  slice (no smoke.rs code here). Caps 100/300 (brief mirrored as
+  [`2026-08-15-r2f1b-3c2-repair-g-brief.md`](2026-08-15-r2f1b-3c2-repair-g-brief.md)).
 
 ## Non-scope reaffirmed
 
