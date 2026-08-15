@@ -542,3 +542,34 @@ Post-format accounting versus the frozen input: production +100/-38 = 138 change
 - Direct `rustfmt --check --edition 2021` and `git diff --check`: exit 0; required `cargo fmt --all -- --check` cannot start because this Cargo installation has no `fmt` subcommand. No `rustfmt::skip` was introduced.
 
 Task B, production V3, consumers, live providers, smoke, compatibility, deployment, fold, push, and the running operator remain unarmed and unchanged.
+
+
+## Task B1 request journal grammar and atomic admission
+
+Date: 2026-08-15. Exact frozen input: `d8ec93ad4a03a29d6da80c4fdf9fa818c8572459`.
+
+### Admissible red evidence
+
+Exact command: `CARGO_INCREMENTAL=0 cargo test -p bridge-core --lib --locked --offline -- remote_request_flight --nocapture`.
+Cargo reached `bridge-core` and failed nonzero with 26 Task-B-specific `E0425`/`E0433` errors naming the absent request journal, child/checkpoint wires, admission boundaries, typed refusals, and Task A outcome consumer. It was neither dependency/network refusal nor a zero-selected selector.
+
+### Result and cap-directed split
+
+The new owned request root has a strict schema-v1 checkpoint and request-child grammar, exact attempt binding, canonical dedicated request IDs, owner binding, ordinal/checkpoint/authority digests, `deny_unknown_fields`, bounded capacity-plus-one enumeration, and typed corrupt/foreign/digest/legacy/protective refusals. Admission validates census and headroom before ID mint or mutation, allocates from the checkpoint and active maximum with checked arithmetic, publishes one complete child through Task A stage/no-replace/root-sync operations, advances the checkpoint only on exact `Complete`, and returns a non-cloneable authority only after both publications. Six injected admission cuts prove every visible request-shaped file is a nonempty strictly decodable row; B1 reopen refuses staged or unowned active rows without mutation.
+
+Normal formatting could not fit bounded retirement inside the 500-production-line cap. Per the dispatch split rule, B1 stops here. B2 is the named remainder: recover Task A transaction residue, advance and close a step-5 orphan as pre-send failure, persist terminal acknowledgement, identity-check unlink plus root sync, prove ack-before-unlink and after-unlink restart idempotence, and prove retirement frees bounded capacity across more than the cap's sequential cycles. Those self-heal/retirement criteria are not claimed by B1.
+
+Changed paths are `crates/bridge-core/src/remote_request_flight.rs`, the two-line Unix `lib.rs` export, and this handoff. Accepted Task A files and behavior were not changed. Post-format accounting is 500 production additions (498 module plus 2 export), 247 colocated-test additions, and this appended handoff; there are no deletions.
+
+### Verification and exclusions
+
+- Focused `remote_request_flight`: 4 passed, 0 failed, 612 filtered out.
+- Required Task A regression selector: 118 passed, 0 failed, 498 filtered out.
+- `CARGO_INCREMENTAL=0 cargo check -p bridge-core --lib --locked --offline`: exit 0.
+- `git diff --check`: exit 0. Required `cargo fmt --all -- --check` cannot start because this Cargo installation has no `fmt` subcommand; direct `rustfmt --check --edition 2021` passed for both changed Rust files. The new module has no `rustfmt::skip`; nine skips are pre-existing in frozen Task A `fs_custody.rs`.
+- The reduced capacity fixture admits the exact positive edge of five active rows at cap 8, then refuses before the sixth ID mint or mutation.
+- Corrupt/foreign/digest/legacy and over-cap cases refuse without mutation; the over-cap fixture enumerates cap plus one.
+- Protective Task A outcome classes remain typed and only exact `Complete` advances the checkpoint.
+- No production caller, request route, shared-journal migration, provider send, API/HTTP surface, live smoke, or compatibility action was added.
+
+B2, Tasks C-G, production V3, every production caller, providers, smoke, compatibility, deployment, fold, push, and the running operator remain unarmed.
