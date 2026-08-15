@@ -904,6 +904,7 @@ impl RemoteRequestJournalV1 {
         expected: fn(&ChildStateV1) -> bool,
         successor: ChildStateV1,
         label: &'static str,
+        settle_on_failure: bool,
     ) -> FlightResult<()> {
         if self.requires_reopen {
             return Err(Refusal::ReopenRequired("prior transition was interrupted"));
@@ -915,7 +916,11 @@ impl RemoteRequestJournalV1 {
             return Err(Refusal::InvalidStateTransition(label));
         }
         #[cfg(test)]
-        if label == "arm provider send" {
+        let arm_effect_then_debt = (label == "arm provider send")
+            .then(take_arm_effect_then_debt_for_test)
+            .flatten();
+        #[cfg(test)]
+        if label == "arm provider send" && arm_effect_then_debt.is_none() {
             if let Some(injected) = take_task_a_boundary(TaskABoundaryV1::Replace) {
                 drop(operation);
                 return injected_task_a_no_effect(injected);
@@ -923,8 +928,22 @@ impl RemoteRequestJournalV1 {
         }
         let result = Self::replace_child(&operation, child, successor, label);
         drop(operation);
+        #[cfg(test)]
+        let result = match (result, arm_effect_then_debt) {
+            (Ok(()), Some(fail_terminal_settlement)) => {
+                if fail_terminal_settlement {
+                    inject_terminal_settlement_failure_for_test();
+                }
+                Err(protective(
+                    TaskAProtectiveOutcomeV1::ProtectiveDebt,
+                    "injected effect-then-debt",
+                ))
+            }
+            (result, _) => result,
+        };
         if result.as_ref().is_err_and(|error| {
             !matches!(error, Refusal::TaskA(TaskAProtectiveOutcomeV1::Refused, _))
+                && !settle_on_failure
         }) {
             self.requires_reopen = true;
         }
@@ -936,6 +955,7 @@ impl RemoteRequestJournalV1 {
             |state| matches!(state, ChildStateV1::Active {}),
             ChildStateV1::IntentJournaled {},
             "journal request intent",
+            false,
         )
     }
     pub fn authorize_dispatch(&mut self, authority: &RemoteRequestAuthorityV1) -> FlightResult<()> {
@@ -944,6 +964,7 @@ impl RemoteRequestJournalV1 {
             |state| matches!(state, ChildStateV1::IntentJournaled {}),
             ChildStateV1::DispatchAuthorized {},
             "authorize request dispatch",
+            false,
         )
     }
     pub fn arm_provider_send(&mut self, authority: &RemoteRequestAuthorityV1) -> FlightResult<()> {
@@ -952,6 +973,7 @@ impl RemoteRequestJournalV1 {
             |state| matches!(state, ChildStateV1::DispatchAuthorized {}),
             ChildStateV1::ProviderSendArmed {},
             "arm provider send",
+            true,
         )
     }
     pub fn settle(
@@ -989,11 +1011,19 @@ impl RemoteRequestJournalV1 {
                     | ChildStateV1::PreSendFailure {}
                     | ChildStateV1::IntentJournaled {}
                     | ChildStateV1::DispatchAuthorized {}
+                    | ChildStateV1::ProviderSendArmed {}
             )
         };
         if !valid {
             return Err(Refusal::InvalidStateTransition(
                 "persist terminal publication",
+            ));
+        }
+        #[cfg(test)]
+        if take_terminal_settlement_failure_for_test() {
+            return Err(protective(
+                TaskAProtectiveOutcomeV1::ProtectiveDebt,
+                "injected terminal settlement failure",
             ));
         }
         let publication = RemoteRequestTerminalPublicationV1 {
@@ -1078,6 +1108,7 @@ impl RemoteRequestJournalV1 {
                 delivery_id: acknowledgement,
             },
             "acknowledge terminal publication",
+            false,
         )?;
         #[cfg(test)]
         boundary(_cut, 1, "after publication acknowledgement")?;
@@ -1672,6 +1703,30 @@ thread_local! {
     static INJECTED_TASK_A_BOUNDARY: std::cell::RefCell<
         Option<(TaskABoundaryV1, InjectedTaskAOutcomeV1)>,
     > = const { std::cell::RefCell::new(None) };
+    static INJECTED_ARM_EFFECT_THEN_DEBT: std::cell::Cell<Option<bool>> = const {
+        std::cell::Cell::new(None)
+    };
+    static INJECTED_TERMINAL_SETTLEMENT_FAILURE: std::cell::Cell<bool> = const {
+        std::cell::Cell::new(false)
+    };
+}
+#[cfg(test)]
+fn inject_arm_effect_then_debt_for_test(fail_terminal_settlement: bool) {
+    INJECTED_ARM_EFFECT_THEN_DEBT.with(|slot| {
+        assert!(slot.replace(Some(fail_terminal_settlement)).is_none());
+    });
+}
+#[cfg(test)]
+fn take_arm_effect_then_debt_for_test() -> Option<bool> {
+    INJECTED_ARM_EFFECT_THEN_DEBT.with(|slot| slot.take())
+}
+#[cfg(test)]
+fn inject_terminal_settlement_failure_for_test() {
+    INJECTED_TERMINAL_SETTLEMENT_FAILURE.with(|slot| assert!(!slot.replace(true)));
+}
+#[cfg(test)]
+fn take_terminal_settlement_failure_for_test() -> bool {
+    INJECTED_TERMINAL_SETTLEMENT_FAILURE.with(|slot| slot.replace(false))
 }
 #[cfg(test)]
 fn inject_task_a_boundary_for_test(boundary: TaskABoundaryV1, outcome: InjectedTaskAOutcomeV1) {
@@ -3182,6 +3237,104 @@ mod tests {
             ResourceActionDispositionV1::Failed
         );
         assert!(!calls[0].prompt_may_have_been_accepted());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn remote_request_flight_task_d_effect_then_debt_recovers_failed_unaccepted() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let case = case();
+        let publisher =
+            RecordingPublisher::with_replies([PublisherReply::Refuse, PublisherReply::Echo]);
+        initialize_root(&case, attempt(), 16);
+        let driver =
+            RemoteRequestDriverV1::open_recovered(custody(&case), attempt(), 16, publisher.clone())
+                .unwrap();
+        let request = driver.admit(owner(0)).unwrap();
+        request.journal_intent().unwrap();
+        request.authorize_dispatch().unwrap();
+
+        let polls = Arc::new(AtomicUsize::new(0));
+        let inner_polls = Arc::clone(&polls);
+        inject_arm_effect_then_debt_for_test(false);
+        let result = request
+            .arm_provider_send(std::future::poll_fn(|_| {
+                inner_polls.fetch_add(1, Ordering::SeqCst);
+                std::task::Poll::Ready(())
+            }))
+            .await;
+        assert!(matches!(
+            result,
+            Err(RemoteRequestFlightRefusalV1::TaskA(
+                TaskAProtectiveOutcomeV1::ProtectiveDebt,
+                _
+            ))
+        ));
+        assert_eq!(polls.load(Ordering::SeqCst), 0);
+        drop(request);
+        drop(driver);
+
+        drop(
+            RemoteRequestDriverV1::open_recovered(custody(&case), attempt(), 16, publisher.clone())
+                .unwrap(),
+        );
+        let calls = publisher.calls();
+        assert_eq!(calls.len(), 2);
+        assert!(calls.iter().all(|call| {
+            call.result().disposition == ResourceActionDispositionV1::Failed
+                && !call.prompt_may_have_been_accepted()
+        }));
+        assert!(request_paths(&case).is_empty());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn remote_request_flight_task_d_failed_terminal_after_debt_recovers_unknown_accepted() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let case = case();
+        let publisher = RecordingPublisher::with_replies([]);
+        initialize_root(&case, attempt(), 16);
+        let driver =
+            RemoteRequestDriverV1::open_recovered(custody(&case), attempt(), 16, publisher.clone())
+                .unwrap();
+        let request = driver.admit(owner(0)).unwrap();
+        request.journal_intent().unwrap();
+        request.authorize_dispatch().unwrap();
+
+        let polls = Arc::new(AtomicUsize::new(0));
+        let inner_polls = Arc::clone(&polls);
+        inject_arm_effect_then_debt_for_test(true);
+        let result = request
+            .arm_provider_send(std::future::poll_fn(|_| {
+                inner_polls.fetch_add(1, Ordering::SeqCst);
+                std::task::Poll::Ready(())
+            }))
+            .await;
+        assert!(matches!(
+            result,
+            Err(RemoteRequestFlightRefusalV1::TaskA(
+                TaskAProtectiveOutcomeV1::ProtectiveDebt,
+                _
+            ))
+        ));
+        assert_eq!(polls.load(Ordering::SeqCst), 0);
+        assert!(!take_terminal_settlement_failure_for_test());
+        assert!(publisher.calls().is_empty());
+        drop(request);
+        drop(driver);
+
+        drop(
+            RemoteRequestDriverV1::open_recovered(custody(&case), attempt(), 16, publisher.clone())
+                .unwrap(),
+        );
+        let calls = publisher.calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0].result().disposition,
+            ResourceActionDispositionV1::Unknown
+        );
+        assert!(calls[0].prompt_may_have_been_accepted());
+        assert!(request_paths(&case).is_empty());
     }
 
     #[tokio::test(flavor = "current_thread")]

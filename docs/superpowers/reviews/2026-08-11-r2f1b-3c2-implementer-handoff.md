@@ -846,3 +846,48 @@ Only `remote_request_flight.rs` and this handoff changed; `lib.rs` needed
 no broader export. Tasks E-G, every production caller/route, provider send,
 API/HTTP work, live smoke, compatibility, deployment, and production V3 remain
 unarmed and unchanged.
+
+## Task D owner-declared targeted repair: effect-then-debt arming
+
+Date: 2026-08-15. Exact frozen input:
+`bd29eddf4759f210306d27e3e25c2dd782f86cc2` (`bd29eddf`).
+
+### Admissible red evidence
+
+Exact command:
+`CARGO_INCREMENTAL=0 cargo test -p bridge-core --lib --locked --offline --
+remote_request_flight_task_d_effect_then_debt_recovers_failed_unaccepted
+remote_request_flight_task_d_failed_terminal_after_debt_recovers_unknown_accepted
+--nocapture`.
+Cargo reached `bridge-core`, selected exactly two tests, and failed 0/2 with
+653 filtered. The first reopened the durably armed row on the conservative
+publication-refusal path instead of retaining pre-send `Failed,false`; the
+second proved the injected terminal settlement was never reached. Neither was
+a dependency, network, or zero-selection refusal.
+
+### Repair, residual, and gates
+
+A non-`Complete` arming append no longer poisons the immediate terminal CAS,
+and that CAS accepts either the pre-arm prefix or a durably
+`ProviderSendArmed` row as pre-send when the wrapper positively knows the
+inner future received zero polls. Successful settlement therefore persists and
+recovers `Failed` with `accepted = false` before the original arming error
+is surfaced. Ordering, observation, publication/outbox, and retirement are
+otherwise unchanged.
+
+If that terminal CAS itself fails, no weaker success is inferred: the armed row
+remains crash-equivalent, and reopen conservatively reports `Unknown` with
+`accepted = true`. The second regression pins that residual and zero polls.
+
+- Focused repair tests: 2 passed, 0 failed, 653 filtered out.
+- Required aggregate selector: 161 passed, 0 failed, 494 filtered out.
+- Direct `rustfmt --edition 2021 --check` and `git diff --check`: exit 0.
+- Required `cargo fmt --all -- --check` was run but this Cargo installation
+  has no `fmt` subcommand; no `rustfmt::skip` was added.
+- Post-format source churn is 7 production additions and 147 additions/1
+  deletion in test-only seams and colocated tests. This handoff adds 45
+  lines, for 200 total changed lines versus `bd29eddf`.
+
+Only `remote_request_flight.rs` and this handoff changed. Tasks E-G, every
+production caller/route, provider send, API/HTTP work, live smoke,
+compatibility, deployment, and production V3 remain unarmed and unchanged.
