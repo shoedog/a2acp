@@ -1065,6 +1065,20 @@ All checks passed; no drift found.
   no-further-split ruling, and the gate-evidence completion all
   explicit; brief mirrored as
   [`2026-08-15-r2f1b-3c2-task-g2-closure-brief.md`](2026-08-15-r2f1b-3c2-task-g2-closure-brief.md).
+- 2026-08-15: **counted closure APPROVE — ZERO WRONGs, ZERO SMELLs**
+  (97/100): the reader-break FIXED (release-specific vocabulary;
+  whole-wire equality untouched, so protective values classify as
+  `source_diagnostics_incomplete` with no rerun), the
+  no-further-split ruling SUSTAINED, the gate blocker FIXED on the
+  dated evidence, and the reader census independently closed at exactly
+  three production readers, all protective. **G2 ACCEPTED at exact
+  `50f3336e` — ALL ELEVEN 3c2 IMPLEMENTATION ROUNDS COMPLETE** (A1-A4,
+  B1-B2, C, D, E, F, F2, G, G2; final head `50f3336e`; gates
+  4,101/0/13; artifact mirrored as
+  [`2026-08-15-r2f1b-3c2-task-g2-sol-closure.md`](2026-08-15-r2f1b-3c2-task-g2-sol-closure.md)).
+- The exact combined diff for the aggregate dual-lens round is
+  `42249b3d..50f3336e` (51 commits; `42249b3d` is the 3c1-folded main
+  and the verified merge-base of the lane).
 
 ## Non-scope reaffirmed
 
