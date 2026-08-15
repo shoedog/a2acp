@@ -1497,6 +1497,10 @@ pub(crate) fn render_weights(panel: &Option<crate::graph::PanelConfig>) -> Strin
 
 pub struct WorkflowExecutor {
     registry: Arc<dyn AgentRegistry>,
+    /// Test-only fault injection for the preflight turn-metadata mint, so the
+    /// zero-effects-before-fallible-metadata ordering is behaviorally provable.
+    #[cfg(test)]
+    preflight_metadata_fault: std::sync::atomic::AtomicBool,
 }
 
 struct FrozenBoundEntryUse {
@@ -1700,7 +1704,11 @@ fn node_turn_context(
 
 impl WorkflowExecutor {
     pub fn new(registry: Arc<dyn AgentRegistry>) -> Self {
-        Self { registry }
+        Self {
+            registry,
+            #[cfg(test)]
+            preflight_metadata_fault: std::sync::atomic::AtomicBool::new(false),
+        }
     }
 
     fn bind_frozen_entry(
@@ -2082,6 +2090,50 @@ impl WorkflowExecutor {
                 }
             };
 
+            // Every fallible piece of turn metadata is constructed BEFORE the
+            // first backend effect (the ordinary node path orders itself the
+            // same way): a failure here has provably performed zero
+            // configurations, so evicting it from the run cache is the
+            // proven-clean case by construction.
+            #[cfg(test)]
+            if self
+                .preflight_metadata_fault
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err(PreflightFailure::Hard {
+                    message: "injected preflight metadata fault".into(),
+                    failure_class: FailureClass::Other,
+                    retain_in_run_cache: false,
+                });
+            }
+            let preflight_turn_id =
+                bridge_core::attestation::generate_turn_id().map_err(|error| {
+                    PreflightFailure::Hard {
+                        message: format!(
+                            "preflight failed to mint turn evidence correlation: {error:?}"
+                        ),
+                        failure_class: classify_failure(&error),
+                        retain_in_run_cache: false,
+                    }
+                })?;
+            let preflight_context =
+                ContextId::parse(session.as_str().to_string()).map_err(|error| {
+                    PreflightFailure::Hard {
+                        message: format!("preflight failed to bind context: {error:?}"),
+                        failure_class: classify_failure(&error),
+                        retain_in_run_cache: false,
+                    }
+                })?;
+            let preflight_op = OperationId::parse(format!(
+                "workflow-preflight-{}-{attempt_no}",
+                node.id.as_str()
+            ))
+            .map_err(|error| PreflightFailure::Hard {
+                message: format!("preflight failed to bind operation: {error:?}"),
+                failure_class: classify_failure(&error),
+                retain_in_run_cache: false,
+            })?;
+
             let configure_result = tokio::select! {
                 biased;
                 _ = cancel.cancelled() => {
@@ -2165,33 +2217,6 @@ impl WorkflowExecutor {
                 return Err(PreflightFailure::Canceled);
             }
 
-            let preflight_turn_id =
-                bridge_core::attestation::generate_turn_id().map_err(|error| {
-                    PreflightFailure::Hard {
-                        message: format!(
-                            "preflight failed to mint turn evidence correlation: {error:?}"
-                        ),
-                        failure_class: classify_failure(&error),
-                        retain_in_run_cache: false,
-                    }
-                })?;
-            let preflight_context =
-                ContextId::parse(session.as_str().to_string()).map_err(|error| {
-                    PreflightFailure::Hard {
-                        message: format!("preflight failed to bind context: {error:?}"),
-                        failure_class: classify_failure(&error),
-                        retain_in_run_cache: false,
-                    }
-                })?;
-            let preflight_op = OperationId::parse(format!(
-                "workflow-preflight-{}-{attempt_no}",
-                node.id.as_str()
-            ))
-            .map_err(|error| PreflightFailure::Hard {
-                message: format!("preflight failed to bind operation: {error:?}"),
-                failure_class: classify_failure(&error),
-                retain_in_run_cache: false,
-            })?;
             attempt_use
                 .backend()
                 .configure_turn(
@@ -4769,6 +4794,8 @@ impl WorkflowExecutor {
     ) -> WorkflowStream {
         let this = WorkflowExecutor {
             registry: self.registry.clone(),
+            #[cfg(test)]
+            preflight_metadata_fault: std::sync::atomic::AtomicBool::new(false),
         };
         Box::pin(async_stream::stream! {
             if let Some(authority) = frozen_authority.as_ref() {
@@ -8556,6 +8583,66 @@ mod tests {
             )
             .await;
         (first, second, state, registry)
+    }
+
+    #[tokio::test]
+    async fn preflight_metadata_failure_cannot_leave_configured_state_behind() {
+        let state = Arc::new(PreflightFaultState::default());
+        let backend: Arc<dyn AgentBackend> = Arc::new(PreflightFaultBackend {
+            fault: PreflightFault::PromptAccepted,
+            state: state.clone(),
+            cleanup_result: Ok(BackendCleanupDispositionV1::Complete),
+        });
+        let registry = Arc::new(SharedBackendRegistry {
+            entry: preflight_entry("good", &[]),
+            backend,
+            invalidates: AtomicUsize::new(0),
+        });
+        let executor = WorkflowExecutor::new(registry.clone());
+        let graph = one_node_graph();
+        let node = graph.nodes[0].clone();
+        let diagnostic_factory: Arc<dyn DiagnosticObserverFactory> =
+            Arc::new(RecordingDiagnosticFactory::default());
+        let cancel = CancellationToken::new();
+        let ctx = WorkflowRunContext::default();
+        let cache: PreflightCache = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        let cleanup_tracker = WorkflowCleanupTracker::default();
+        let prompt_dispatch = None;
+
+        executor
+            .preflight_metadata_fault
+            .store(true, Ordering::SeqCst);
+        let first = executor
+            .ensure_agent_preflight(
+                "w",
+                &node,
+                "preflight-metadata-fault",
+                &ctx,
+                &diagnostic_factory,
+                &prompt_dispatch,
+                &cancel,
+                Arc::new(registry.entry.clone()),
+                &cache,
+                &cleanup_tracker,
+            )
+            .await;
+        let failure = first.expect_err("the injected metadata fault must fail preflight");
+        assert!(
+            matches!(&failure, PreflightFailure::Hard { message, .. }
+                if message.contains("injected preflight metadata fault")),
+            "unexpected failure: {failure:?}"
+        );
+        // Fallible turn metadata must be constructed before ANY backend
+        // effect: a metadata failure performs zero configurations, so the
+        // evicted (pre-effect, proven-clean) cell cannot leave configured
+        // session state behind for a later node to reuse.
+        assert_eq!(
+            state.configures.load(Ordering::SeqCst),
+            0,
+            "a metadata failure must not follow a configuration effect"
+        );
+        assert_eq!(state.prompts.load(Ordering::SeqCst), 0);
+        assert_eq!(state.forgets.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
