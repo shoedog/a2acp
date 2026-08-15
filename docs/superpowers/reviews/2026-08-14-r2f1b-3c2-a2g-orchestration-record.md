@@ -311,7 +311,20 @@ All checks passed; no drift found.
   lane). SMELL (thin fail-first evidence on the owned surface) folds into
   the repair. Population classification: W1/W3/W4 closed, enumerable,
   bounded → eligible for the standing one-targeted-repair + one-closure
-  path; W5 requires owner size regularization. Awaiting the owner's call.
+  path; W5 requires owner size regularization.
+- 2026-08-15: **OWNER — A4 regularize + repair approved** ("Regularize +
+  repair"): measured 499/1,010 accepted (mandated-deletion arithmetic);
+  the classified W1/W3/W4 targeted repair dispatched from exact `04e59579`
+  under explicit churn-convention caps 140 production / 350 total (brief
+  mirrored as
+  [`2026-08-14-r2f1b-3c2-task-a4-repair-brief.md`](2026-08-14-r2f1b-3c2-task-a4-repair-brief.md)).
+- 2026-08-15: **OWNER — standing continuation authorization** ("when A4
+  lands if it needs another repair that is authorized, otherwise authorized
+  to move to next slice"): one further bounded repair round on the A4
+  artifact is pre-authorized if the closure surfaces a closed enumerable
+  population; on A4 acceptance the orchestration proceeds directly to
+  Task B (A4 completes Task A) without a further owner round-trip, under
+  the standing per-task cap discipline and the recorded non-scope.
 
 ## Non-scope reaffirmed
 
