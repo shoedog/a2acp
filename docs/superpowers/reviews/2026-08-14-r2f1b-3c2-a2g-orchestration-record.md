@@ -352,6 +352,28 @@ All checks passed; no drift found.
   the four operator adjudications and the repin disclosed for contest. An
   APPROVE completes Task A; Task B then freezes the accepted head per the
   standing owner authorization.
+- 2026-08-15: the counted closure returned REJECT with exactly ONE BLOCKER
+  (artifact SHA-256 `79eb2448…9238`, mirrored as
+  [`2026-08-14-r2f1b-3c2-task-a4-sol-closure-1.md`](2026-08-14-r2f1b-3c2-task-a4-sol-closure-1.md)):
+  the direct journal mutators refused reserved names BEFORE the admission
+  census, so a fresh handle over residue misclassified protective state as
+  ordinary `Refused` — an inconsistency introduced by the operator
+  completion's ordering, contradicting the disclosed repin. Everything else
+  was adjudicated FIXED/ACCEPTED-RESIDUAL; two SMELLs deferred (compile-only
+  initial red evidence; replace 4,094 positive boundary). Population 1,
+  closed → the owner's pre-authorized repair round applies.
+- 2026-08-15: pre-authorized repair executed operator-side, red-first
+  (repinned object-present + derived-staging-only publish cases red on
+  `7a973866`): commit `863f2fd4` (+68/−15, fs_custody only) — census before
+  name refusal in stage/publish/append; publish stops whitelisting the
+  staging name derived from a reserved target; clean-root name refusals
+  preserved with the debt flag proven clear. Full lib 610/0; host gates on
+  exact `863f2fd4` all exit 0 — **4,024/0/13 across 90**, hygiene 40/8
+  (log `a4-host-gates-2.log`). Head preserved at
+  `salvage/r2f1b-3c2-a4-final`.
+- Final closure (the pre-authorized round's one closure) dispatched on
+  `6114596d..863f2fd4`; brief mirrored as
+  [`2026-08-14-r2f1b-3c2-task-a4-final-closure-brief.md`](2026-08-14-r2f1b-3c2-task-a4-final-closure-brief.md).
 
 ## Non-scope reaffirmed
 
