@@ -332,15 +332,17 @@ impl RemoteRequestJournalV1 {
                 .checked_add(1)
                 .ok_or(Refusal::OrdinalOverflow)?;
             let value = checkpoint(&journal.attempt, next);
-            #[cfg(test)]
-            task_a_boundary(TaskABoundaryV1::Replace)?;
-            transaction(NamespaceTransactionV2::replace(
+            let healed = NamespaceTransactionV2::replace(
                 &operation,
                 Self::checkpoint_name(),
                 census.checkpoint_snapshot.object,
                 &encoded(&value)?,
                 "heal orphan checkpoint",
-            ))?;
+            );
+            #[cfg(test)]
+            task_a_transaction_boundary(TaskABoundaryV1::Replace, healed)?;
+            #[cfg(not(test))]
+            transaction(healed)?;
             sync(operation.sync("sync healed checkpoint"))?;
             Self::replace_child(
                 &operation,
@@ -408,15 +410,19 @@ impl RemoteRequestJournalV1 {
     ) -> FlightResult<()> {
         let mut successor = child.wire.clone();
         successor.status = status;
-        #[cfg(test)]
-        task_a_boundary(TaskABoundaryV1::Replace)?;
-        transaction(NamespaceTransactionV2::replace(
+        let successor_bytes = encoded(&successor)?;
+        let replaced = NamespaceTransactionV2::replace(
             op,
             request_name(&child.authority_digest),
             child.snapshot.object,
-            &encoded(&successor)?,
+            &successor_bytes,
             label,
-        ))
+        );
+        #[cfg(test)]
+        let result = task_a_transaction_boundary(TaskABoundaryV1::Replace, replaced);
+        #[cfg(not(test))]
+        let result = transaction(replaced);
+        result
     }
     fn retire_child(
         op: &JournalRootOperationV2<'_>,
@@ -614,9 +620,12 @@ impl RemoteRequestJournalV1 {
             let name = request_name(&wire.authority_digest);
             #[cfg(test)]
             boundary(_cut, 0, "temporary write")?;
+            let staged_bytes = encoded(&wire)?;
+            let staged_actual = op.stage(&name, &staged_bytes, "stage request child");
             #[cfg(test)]
-            task_a_boundary(TaskABoundaryV1::Stage)?;
-            let staged = mutation(op.stage(&name, &encoded(&wire)?, "stage request child"))?;
+            let staged = task_a_journal_boundary(TaskABoundaryV1::Stage, staged_actual)?;
+            #[cfg(not(test))]
+            let staged = mutation(staged_actual)?;
             #[cfg(test)]
             boundary(_cut, 1, "temporary sync")?;
             #[cfg(test)]
@@ -838,7 +847,7 @@ fn task_a_journal_boundary<T>(
         None => mutation(actual),
         Some(I::IoUnknown) => Err(fs(FsCustodyError::Io(
             "injected".into(),
-            std::io::Error::new(std::io::ErrorKind::Other, "injected"),
+            std::io::Error::other("injected"),
         ))),
         Some(value) => mutation(Err(match value {
             I::Refused => J::Refused("injected".into()),
@@ -862,7 +871,7 @@ fn task_a_transaction_boundary(
     if matches!(injected, I::IoUnknown) {
         return Err(fs(FsCustodyError::Io(
             "injected".into(),
-            std::io::Error::new(std::io::ErrorKind::Other, "injected"),
+            std::io::Error::other("injected"),
         )));
     }
     let N::Complete(ticket) = actual else {
@@ -969,10 +978,10 @@ mod tests {
             .unwrap()
             .map(|entry| entry.unwrap().path())
             .filter(|path| {
-                path.file_name()
-                    .unwrap()
-                    .to_string_lossy()
-                    .contains(REQUEST_CHILD_PREFIX_V1)
+                let name = path.file_name().unwrap().to_string_lossy().into_owned();
+                // Published request children only: reserved-namespace entries
+                // (staging/intent/capture residue) are not requests.
+                name.contains(REQUEST_CHILD_PREFIX_V1) && !name.starts_with(".a2a-v2-")
             })
             .collect()
     }
@@ -1379,7 +1388,8 @@ mod tests {
 
     #[test]
     fn remote_request_flight_reopen_closes_step_five_orphan_idempotently() {
-        for boundary in [4] {
+        {
+            let boundary = 4;
             let case = case();
             let mut journal = initialized(&case, 16);
             assert!(journal
@@ -1603,14 +1613,22 @@ mod tests {
         for (outcome, expected) in outcomes {
             let stage_case = case();
             let mut stage_journal = initialized(&stage_case, 16);
-            let before = root_bytes(&stage_case);
             inject_task_a_boundary_for_test(TaskABoundaryV1::Stage, outcome);
             assert!(matches!(
                 stage_journal.admit_with(owner(0), || Ok(request(0))),
                 Err(RemoteRequestFlightRefusalV1::TaskA(kind, _)) if kind == expected
             ));
             assert!(request_paths(&stage_case).is_empty());
-            assert_eq!(root_bytes(&stage_case), before);
+            assert!(
+                std::fs::read_dir(&stage_case.root)
+                    .unwrap()
+                    .any(|entry| entry
+                        .unwrap()
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with(".a2a-v2-stg-")),
+                "the production stage adapter must execute"
+            );
 
             let publish_case = case();
             let mut publish_journal = initialized(&publish_case, 16);
@@ -1636,7 +1654,11 @@ mod tests {
                 acknowledge_journal.acknowledge(&authority, D::Complete),
                 Err(RemoteRequestFlightRefusalV1::TaskA(kind, _)) if kind == expected
             ));
-            assert_eq!(root_bytes(&acknowledge_case), before);
+            assert_ne!(
+                root_bytes(&acknowledge_case),
+                before,
+                "the production replace adapter must execute"
+            );
 
             let retire_case = case();
             let mut retire_journal = initialized(&retire_case, 16);
