@@ -736,6 +736,32 @@ All checks passed; no drift found.
   discriminates on cell STATE because repair 2 alone would mask its
   projection symptom. Caps 120/400 (mirror
   [`2026-08-15-r2f1b-3c2-task-e-repair2-brief.md`](2026-08-15-r2f1b-3c2-task-e-repair2-brief.md)).
+- 2026-08-15: owner-authorized repair `a1f1f8de` (production +10/−7,
+  tests +133/−2, handoff +60; 212 total, within 120/400; in-container
+  verify fully green; advisory review APPROVE with two non-blocking
+  test-hardening DEFERs) landed both prescribed mechanisms red-first —
+  both public-path regressions failed behaviorally on exact `1f3c3a82`
+  (the late-`Complete` test at its cell-state discriminator; the
+  no-op-publisher test returning `Complete` instead of `Unknown`).
+  Operator source verification: absorbing guard inside `finish()`
+  (state preserved, evidence recorded, success returned to the settled
+  scope); `acknowledged=false` at all three old-adapter tails;
+  projection table and no-authority rows unchanged; two direct-cell
+  assertions migrated `(Complete, true)`→`(Complete, false)` as pins of
+  the removed fabrication. ONE disclosed side effect outside the
+  prescription: `begin_admission()`'s reuse-reset now keys on terminal
+  `Complete` alone (honest acks would otherwise refuse round-2
+  admission in multi-round turns); operator assessment — reset gates
+  intra-turn reuse only, cleanup projection still demands the ack for
+  V3 `Complete`, `TimedOut` never re-admits — handed to the final
+  closure for adjudication. Preserved at
+  `salvage/r2f1b-3c2-e-repaired2`.
+- Host gates on exact `a1f1f8de` all exit 0: **4,086 passed / 0 failed
+  / 13 ignored across 90 harnesses** (log `e2-host-gates.log`; +2 = the
+  two public-path regressions), hygiene green, post-gate self-reap ran.
+- Final counted closure dispatched on the full `2697c438..a1f1f8de`
+  line; brief mirrored as
+  [`2026-08-15-r2f1b-3c2-task-e-final-closure-brief.md`](2026-08-15-r2f1b-3c2-task-e-final-closure-brief.md).
 
 ## Non-scope reaffirmed
 
