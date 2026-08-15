@@ -732,7 +732,7 @@ impl DurableProcessFlightV3 {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum RemoteRequestFlightErrorV1 {
+pub(crate) enum RemoteRequestFlightErrorV1 {
     IdentityUnavailable,
     IdentityCollision,
     Admission(String),
@@ -758,7 +758,7 @@ impl std::error::Error for RemoteRequestFlightErrorV1 {}
 /// the request identity, closed admission, and journaled intent before returning
 /// this value. `begin_dispatch` is the final pre-POST journal fence. Dropping a
 /// dispatched value settles `Unknown`; dropping before dispatch settles `Failed`.
-pub struct DurableRemoteRequestFlightV3 {
+pub(crate) struct DurableRemoteRequestFlightV3 {
     request_id: DedicatedRemoteRequestIdV1,
     flight: Arc<RetainedResourceFlight>,
     clock: Arc<dyn MonotonicClock>,
@@ -768,7 +768,7 @@ pub struct DurableRemoteRequestFlightV3 {
 
 /// Cloneable observation-only authority for joining the durable request winner.
 #[derive(Clone)]
-pub struct RemoteRequestSettlementV1 {
+pub(crate) struct RemoteRequestSettlementV1 {
     flight: Arc<RetainedResourceFlight>,
 }
 
@@ -945,7 +945,7 @@ impl DurableProcessFlightAttemptV3 {
     /// Reserve one request through this attempt's exact registry and journal.
     /// A duplicate key is a collision/refusal, never a join: every POST owns a
     /// distinct identity and flight.
-    pub fn bind_remote_request(
+    pub(crate) fn bind_remote_request(
         &self,
         request_id: DedicatedRemoteRequestIdV1,
         owner: ResourceFlightOwnerV1,
