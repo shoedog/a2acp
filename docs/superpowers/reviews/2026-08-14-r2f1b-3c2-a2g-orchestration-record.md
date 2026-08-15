@@ -609,6 +609,30 @@ All checks passed; no drift found.
 - Counted closure dispatched on the full `832221c9..08aa5531` line; brief
   mirrored as
   [`2026-08-14-r2f1b-3c2-task-d-closure-brief.md`](2026-08-14-r2f1b-3c2-task-d-closure-brief.md).
+- 2026-08-15: the D closure sustained everything previously fixed and
+  REJECTed on TWO fresh bounded concurrency blockers (duplicate-wrapper
+  privilege misuse; false-success publication race). Population 1→1→2 —
+  not shrinking — so the convergence-extension clause was NOT applied; the
+  owner was asked and authorized **one repair round** (mirror
+  [`2026-08-14-r2f1b-3c2-task-d-repair2-brief.md`](2026-08-14-r2f1b-3c2-task-d-repair2-brief.md);
+  closure-1 mirrored as
+  [`2026-08-14-r2f1b-3c2-task-d-sol-closure-1.md`](2026-08-14-r2f1b-3c2-task-d-sol-closure-1.md)).
+- 2026-08-15: owner-authorized repair `2697c438` (+286/−20 module, +50
+  handoff; within 150/400 production caps per handoff accounting) landed
+  both prescribed mechanisms red-first — the irreversible request-wide
+  send permit and the joinable publication flight. In-container verify
+  fully green; advisory review APPROVE. Host gates on exact `2697c438`
+  all exit 0: **4,073/0/13 across 90**, hygiene 40/8.
+- 2026-08-15: **final closure APPROVE — both prior blockers FIXED, no
+  blocker remains** (94/100; two concurrency-test robustness DEFERs to
+  the aggregate ledger). **D ACCEPTED at exact `2697c438` — TASK D
+  COMPLETE** (custody at `salvage/r2f1b-3c2-d-final`; artifact mirrored
+  as [`2026-08-14-r2f1b-3c2-task-d-sol-closure-2.md`](2026-08-14-r2f1b-3c2-task-d-sol-closure-2.md)).
+- 2026-08-15: **Task E dispatched** from exact `2697c438` — the API
+  cleanup cell, drop custody transfer, bounded observation, and the exact
+  checked-cleanup projection table (caps 500/900 churn, E2 split escape
+  hatch; brief mirrored as
+  [`2026-08-14-r2f1b-3c2-task-e-brief.md`](2026-08-14-r2f1b-3c2-task-e-brief.md)).
 
 ## Non-scope reaffirmed
 
