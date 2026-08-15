@@ -21,7 +21,7 @@ use std::{
     pin::Pin,
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
-        Arc, Mutex, MutexGuard,
+        Arc, Condvar, Mutex, MutexGuard,
     },
     task::{Context, Poll},
 };
@@ -40,7 +40,7 @@ pub enum TaskAProtectiveOutcomeV1 {
     Unsupported,
     ProtectiveDebt,
 }
-#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+#[derive(Clone, Debug, thiserror::Error, PartialEq, Eq)]
 pub enum RemoteRequestFlightRefusalV1 {
     #[error("request journal capacity is exhausted")]
     Capacity,
@@ -249,10 +249,11 @@ pub struct OwnedRemoteRequestV1 {
     authority: RemoteRequestAuthorityV1,
     outcome_tx: tokio::sync::watch::Sender<Option<RemoteRequestTerminalOutcomeV1>>,
     live_waiters: Arc<AtomicUsize>,
+    provider_send_claimed: AtomicBool,
     provider_send_armed: AtomicBool,
     settlement_attempted: AtomicBool,
-    publication_claimed: AtomicBool,
-    publication_complete: AtomicBool,
+    publication_flight: Mutex<PublicationFlightStateV1>,
+    publication_settled: Condvar,
 }
 pub struct RemoteRequestObserverV1 {
     outcome_rx: tokio::sync::watch::Receiver<Option<RemoteRequestTerminalOutcomeV1>>,
@@ -262,6 +263,40 @@ pub struct ArmedProviderSendV1<'a, F> {
     request: &'a OwnedRemoteRequestV1,
     inner: Option<Pin<Box<F>>>,
     arm_attempted: bool,
+}
+#[derive(Clone)]
+enum PublicationFlightStateV1 {
+    Idle,
+    Driving,
+    Finished(FlightResult<()>),
+}
+struct PublicationDriverGuardV1<'a> {
+    request: &'a OwnedRemoteRequestV1,
+    armed: bool,
+}
+impl<'a> PublicationDriverGuardV1<'a> {
+    fn new(request: &'a OwnedRemoteRequestV1) -> Self {
+        Self {
+            request,
+            armed: true,
+        }
+    }
+    fn finish(mut self, result: FlightResult<()>) -> FlightResult<()> {
+        let result = self.request.finish_publication_flight(result);
+        self.armed = false;
+        result
+    }
+}
+impl Drop for PublicationDriverGuardV1<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = self
+                .request
+                .finish_publication_flight(Err(Refusal::PublicationRefused(
+                    "publication driver unwound".into(),
+                )));
+        }
+    }
 }
 struct LiveWaiterGuardV1 {
     live_waiters: Arc<AtomicUsize>,
@@ -1411,10 +1446,11 @@ impl RemoteRequestDriverV1 {
             authority,
             outcome_tx,
             live_waiters: Arc::new(AtomicUsize::new(0)),
+            provider_send_claimed: AtomicBool::new(false),
             provider_send_armed: AtomicBool::new(false),
             settlement_attempted: AtomicBool::new(false),
-            publication_claimed: AtomicBool::new(false),
-            publication_complete: AtomicBool::new(false),
+            publication_flight: Mutex::new(PublicationFlightStateV1::Idle),
+            publication_settled: Condvar::new(),
         })
     }
 }
@@ -1522,19 +1558,42 @@ impl OwnedRemoteRequestV1 {
         Ok(outcome)
     }
 
+    fn finish_publication_flight(&self, result: FlightResult<()>) -> FlightResult<()> {
+        let mut flight = self
+            .publication_flight
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *flight = PublicationFlightStateV1::Finished(result.clone());
+        self.publication_settled.notify_all();
+        result
+    }
+
     fn drive_publication(
         &self,
         publication: RemoteRequestTerminalPublicationV1,
     ) -> FlightResult<()> {
-        if self.publication_complete.load(Ordering::Acquire)
-            || self
-                .publication_claimed
-                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-                .is_err()
-        {
-            return Ok(());
+        let mut flight = self
+            .publication_flight
+            .lock()
+            .map_err(|_| Refusal::RequestMutexPoisoned)?;
+        loop {
+            match &*flight {
+                PublicationFlightStateV1::Idle => {
+                    *flight = PublicationFlightStateV1::Driving;
+                    break;
+                }
+                PublicationFlightStateV1::Driving => {
+                    flight = self
+                        .publication_settled
+                        .wait(flight)
+                        .map_err(|_| Refusal::RequestMutexPoisoned)?;
+                }
+                PublicationFlightStateV1::Finished(result) => return result.clone(),
+            }
         }
-        let outcome = (|| {
+        drop(flight);
+        let driving = PublicationDriverGuardV1::new(self);
+        let result = (|| {
             let publisher = {
                 let journal = self.lock()?;
                 Arc::clone(&journal.publisher)
@@ -1550,11 +1609,7 @@ impl OwnedRemoteRequestV1 {
             self.lock()?
                 .finish_publication(&self.authority, acknowledgement, None)
         })();
-        if outcome.is_ok() {
-            self.publication_complete.store(true, Ordering::Release);
-        }
-        self.publication_claimed.store(false, Ordering::Release);
-        outcome
+        driving.finish(result)
     }
 
     #[cfg(test)]
@@ -1583,6 +1638,17 @@ impl<F: Future> Future for ArmedProviderSendV1<'_, F> {
         let this = self.get_mut();
         if !this.arm_attempted {
             this.arm_attempted = true;
+            if this
+                .request
+                .provider_send_claimed
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+            {
+                this.inner = None;
+                return Poll::Ready(Err(Refusal::InvalidStateTransition(
+                    "claim provider send wrapper",
+                )));
+            }
             if let Err(error) = this.request.arm_now() {
                 // A refused arm is known pre-send. The inner future is
                 // destroyed here without receiving its first poll.
@@ -1853,7 +1919,8 @@ mod tests {
         fs::File,
         os::unix::fs::MetadataExt as _,
         path::PathBuf,
-        sync::{Arc, Mutex},
+        sync::{mpsc, Arc, Barrier, Mutex},
+        time::Duration,
     };
     #[derive(Default)]
     pub(super) struct TestAckPublisherV1 {
@@ -2829,6 +2896,53 @@ mod tests {
         }
     }
 
+    struct BarrierPublisher {
+        reply: PublisherReply,
+        calls: std::sync::atomic::AtomicUsize,
+        entered: Barrier,
+        release: Barrier,
+    }
+
+    impl BarrierPublisher {
+        fn new(reply: PublisherReply) -> Arc<Self> {
+            Arc::new(Self {
+                reply,
+                calls: std::sync::atomic::AtomicUsize::new(0),
+                entered: Barrier::new(2),
+                release: Barrier::new(2),
+            })
+        }
+
+        fn wait_until_entered(&self) {
+            self.entered.wait();
+        }
+
+        fn release(&self) {
+            self.release.wait();
+        }
+
+        fn calls(&self) -> usize {
+            self.calls.load(Ordering::Acquire)
+        }
+    }
+
+    impl RemoteRequestResultPublisherV1 for BarrierPublisher {
+        fn publish_idempotent(
+            &self,
+            publication: &RemoteRequestTerminalPublicationV1,
+        ) -> Result<RemoteRequestDeliveryIdV1, String> {
+            if self.calls.fetch_add(1, Ordering::AcqRel) == 0 {
+                self.entered.wait();
+                self.release.wait();
+            }
+            match self.reply {
+                PublisherReply::Echo => Ok(publication.delivery_id().clone()),
+                PublisherReply::Refuse => Err("barrier publication refusal".into()),
+                PublisherReply::Mismatch => unreachable!(),
+            }
+        }
+    }
+
     fn terminal(disposition: ResourceActionDispositionV1) -> ResourceActionResultV1 {
         ResourceActionResultV1 {
             disposition,
@@ -3291,6 +3405,72 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn remote_request_flight_task_d_duplicate_send_wrapper_has_zero_row_effect() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let case = case();
+        let publisher = RecordingPublisher::with_replies([]);
+        initialize_root(&case, attempt(), 16);
+        let driver =
+            RemoteRequestDriverV1::open_recovered(custody(&case), attempt(), 16, publisher.clone())
+                .unwrap();
+        let request = driver.admit(owner(0)).unwrap();
+        request.journal_intent().unwrap();
+        request.authorize_dispatch().unwrap();
+
+        let mut first =
+            Box::pin(request.arm_provider_send(std::future::poll_fn(|_| Poll::<()>::Pending)));
+        assert!(matches!(futures::poll!(first.as_mut()), Poll::Pending));
+        let second_polls = Arc::new(AtomicUsize::new(0));
+        let polled = Arc::clone(&second_polls);
+        let mut second = Box::pin(request.arm_provider_send(std::future::poll_fn(move |_| {
+            polled.fetch_add(1, Ordering::SeqCst);
+            Poll::Ready(())
+        })));
+        let refusal = match futures::poll!(second.as_mut()) {
+            Poll::Ready(Err(error)) => error,
+            other => panic!("duplicate wrapper must refuse, got {other:?}"),
+        };
+        assert!(matches!(
+            refusal,
+            RemoteRequestFlightRefusalV1::InvalidStateTransition(_)
+        ));
+        assert_eq!(second_polls.load(Ordering::SeqCst), 0);
+        assert!(publisher.calls().is_empty());
+        assert_eq!(child(&case).1.status, ChildStateV1::ProviderSendArmed {});
+
+        drop(second);
+        drop(first);
+        let post_drop_polls = Arc::new(AtomicUsize::new(0));
+        let polled = Arc::clone(&post_drop_polls);
+        let mut after_drop = Box::pin(request.arm_provider_send(std::future::poll_fn(move |_| {
+            polled.fetch_add(1, Ordering::SeqCst);
+            Poll::Ready(())
+        })));
+        assert!(matches!(
+            futures::poll!(after_drop.as_mut()),
+            Poll::Ready(Err(RemoteRequestFlightRefusalV1::InvalidStateTransition(_)))
+        ));
+        assert_eq!(post_drop_polls.load(Ordering::SeqCst), 0);
+        assert!(publisher.calls().is_empty());
+        assert_eq!(child(&case).1.status, ChildStateV1::ProviderSendArmed {});
+        drop(after_drop);
+        request.crash_without_settlement_for_test();
+        drop(driver);
+        drop(
+            RemoteRequestDriverV1::open_recovered(custody(&case), attempt(), 16, publisher.clone())
+                .unwrap(),
+        );
+        let calls = publisher.calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0].result().disposition,
+            ResourceActionDispositionV1::Unknown
+        );
+        assert!(calls[0].prompt_may_have_been_accepted());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn remote_request_flight_task_d_effect_then_debt_recovers_failed_unaccepted() {
         use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -3505,6 +3685,92 @@ mod tests {
             Ok(right_outcome)
         );
         assert_eq!(publisher.calls().len(), 2);
+    }
+
+    #[test]
+    fn remote_request_flight_task_d_refusing_publication_racers_join_same_refusal() {
+        let case = case();
+        let publisher = BarrierPublisher::new(PublisherReply::Refuse);
+        initialize_root(&case, attempt(), 16);
+        let driver =
+            RemoteRequestDriverV1::open_recovered(custody(&case), attempt(), 16, publisher.clone())
+                .unwrap();
+        let request = driver.admit(owner(0)).unwrap();
+
+        let (first, second, returned_early) = std::thread::scope(|scope| {
+            let first =
+                scope.spawn(|| request.settle(terminal(ResourceActionDispositionV1::Complete)));
+            publisher.wait_until_entered();
+            let (started_tx, started_rx) = mpsc::channel();
+            let (done_tx, done_rx) = mpsc::channel();
+            let request_ref = &request;
+            let second = scope.spawn(move || {
+                started_tx.send(()).unwrap();
+                let result = request_ref.settle(terminal(ResourceActionDispositionV1::Partial));
+                done_tx.send(()).unwrap();
+                result
+            });
+            started_rx.recv().unwrap();
+            let returned_early = done_rx.recv_timeout(Duration::from_secs(1)).is_ok();
+            publisher.release();
+            (
+                first.join().unwrap(),
+                second.join().unwrap(),
+                returned_early,
+            )
+        });
+        assert!(!returned_early, "a racer must join the live publication");
+        assert_eq!(first, second);
+        assert!(matches!(
+            first,
+            Err(RemoteRequestFlightRefusalV1::PublicationRefused(ref reason))
+                if reason == "barrier publication refusal"
+        ));
+        assert_eq!(publisher.calls(), 1);
+        assert!(child(&case).1.status.is_terminal_pending());
+    }
+
+    #[test]
+    fn remote_request_flight_task_d_successful_publication_racers_join_once() {
+        let case = case();
+        let publisher = BarrierPublisher::new(PublisherReply::Echo);
+        initialize_root(&case, attempt(), 16);
+        let driver =
+            RemoteRequestDriverV1::open_recovered(custody(&case), attempt(), 16, publisher.clone())
+                .unwrap();
+        let request = driver.admit(owner(0)).unwrap();
+
+        let (first, second, returned_early) = std::thread::scope(|scope| {
+            let first =
+                scope.spawn(|| request.settle(terminal(ResourceActionDispositionV1::Complete)));
+            publisher.wait_until_entered();
+            let (started_tx, started_rx) = mpsc::channel();
+            let (done_tx, done_rx) = mpsc::channel();
+            let request_ref = &request;
+            let second = scope.spawn(move || {
+                started_tx.send(()).unwrap();
+                let result = request_ref.settle(terminal(ResourceActionDispositionV1::Partial));
+                done_tx.send(()).unwrap();
+                result
+            });
+            started_rx.recv().unwrap();
+            let returned_early = done_rx.recv_timeout(Duration::from_secs(1)).is_ok();
+            publisher.release();
+            (
+                first.join().unwrap(),
+                second.join().unwrap(),
+                returned_early,
+            )
+        });
+        assert!(!returned_early, "a racer must join the live publication");
+        assert_eq!(first, second);
+        let outcome = first.unwrap();
+        assert_eq!(
+            request.settle(terminal(ResourceActionDispositionV1::Failed)),
+            Ok(outcome)
+        );
+        assert_eq!(publisher.calls(), 1);
+        assert!(request_paths(&case).is_empty());
     }
 
     #[tokio::test(flavor = "current_thread")]

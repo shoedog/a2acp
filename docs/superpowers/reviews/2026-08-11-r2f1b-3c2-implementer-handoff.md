@@ -906,3 +906,53 @@ Red evidence: the stale-settlement regression (durable armed row with a
 false acceptance atomic, ordinary settle) succeeded in publishing
 `accepted=false` on the pre-change head and now refuses with zero publisher
 calls. Tasks E-G and production V3 remain unarmed.
+
+## Task D owner-authorized second repair: linear send and publication flights
+
+Date: 2026-08-15. Exact frozen input:
+`08aa553173eb5bd05bfbda4547ec49d0cf482656` (`08aa5531`).
+
+### Admissible red evidence
+
+Each exact command reached `bridge-core`, selected one test, and exited 101 on
+the frozen production mechanism; none was a dependency/network refusal or a
+zero-selected selector:
+
+- `CARGO_INCREMENTAL=0 cargo test -p bridge-core --lib --locked --offline -- remote_request_flight_task_d_duplicate_send_wrapper_has_zero_row_effect --nocapture`
+  failed because wrapper B durably published `Failed,false` after wrapper A
+  armed and polled its pending inner future.
+- The same command with selector
+  `remote_request_flight_task_d_refusing_publication_racers_join_same_refusal`
+  failed because the racer returned before the barrier-controlled winner
+  refused publication.
+- The same command with selector
+  `remote_request_flight_task_d_successful_publication_racers_join_once`
+  failed because the racer returned before the barrier-controlled winner
+  completed publication.
+
+### Repair, gates, and accounting
+
+The first-polled provider-send wrapper now takes one irreversible request-wide
+claim before arming. A later wrapper destroys its own inner future unpolled and
+returns `InvalidStateTransition` without journal or publisher effect; dropping
+either wrapper never releases the winner's claim. The winner's existing
+zero-poll failed-arm and normal settlement paths are unchanged.
+
+Publication now has one `Idle`/`Driving`/`Finished` mutex-and-condition-variable
+flight with an unwind guard. Every concurrent or later settler joins the cached
+winner result, including refusal; successful retirement is rechecked through
+that same finished state, so it cannot be republished.
+
+- The three exact red selectors now pass 1/0 each.
+- Required Task A-D aggregate: 165 passed, 0 failed, 494 filtered.
+- Bridge-core library all-feature offline Clippy with `-D warnings`, direct
+  `rustfmt --edition 2021 --check`, and `git diff --check`: exit 0.
+- Required `cargo fmt --all -- --check` was run but cannot start because this
+  Cargo installation has no `fmt` subcommand; no `rustfmt::skip` was added.
+- Post-format source churn is 85 production additions / 19 deletions (104
+  changed production lines) and 201 focused-test additions / 1 deletion.
+  This handoff adds 50 lines, for 356 total changed lines versus `08aa5531`.
+
+Only `remote_request_flight.rs` and this handoff changed. Tasks E-G, every
+production caller/route, provider/API/HTTP work, live smoke, compatibility,
+deployment, and production V3 remain unarmed and unchanged.
