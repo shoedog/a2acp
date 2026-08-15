@@ -709,6 +709,33 @@ All checks passed; no drift found.
   finish/refuse inlining parity, acknowledged=true evidence claim,
   snapshot-gated retry reasoning); brief mirrored as
   [`2026-08-15-r2f1b-3c2-task-e-closure-brief.md`](2026-08-15-r2f1b-3c2-task-e-closure-brief.md).
+- 2026-08-15: the E closure adjudicated ALL FOUR prior blockers FIXED and
+  sustained three of the four disclosed operator rulings (test-seam
+  neutrality, inlining parity, snapshot-gated retry), but REJECTed on TWO
+  fresh WRONGs (97/100): (1) the backend fabricates
+  `acknowledged=true` for results settled through the old adapter, whose
+  publisher is a void no-op callback with no exact-echo surface — a V3
+  `Complete` projects `Complete` without the matching publication
+  acknowledgement the binding table requires (this was the operator's
+  contested disclosure (c), judged unsound); (2) `finish()` — the cell's
+  second terminal writer, reached from ordinary `RequestScope::settle` —
+  still overwrites `TimedOut` unconditionally, so a normal settlement
+  stalled in its publisher across the deadline erases timeout debt. One
+  SMELL-DEFER (direct-cell tests do not bind the production paths) to
+  the aggregate ledger. Both WRONGs operator-source-verified. Artifact
+  mirrored as
+  [`2026-08-15-r2f1b-3c2-task-e-sol-closure-1.md`](2026-08-15-r2f1b-3c2-task-e-sol-closure-1.md).
+- Population 3→1→2 — not shrinking — so the convergence-extension clause
+  was NOT applied; the owner was asked and authorized **one repair
+  round**. Dispatched on frozen `1f3c3a82`: class-terminal absorbing
+  `TimedOut` INSIDE `finish()` (closing the overwrite family at the
+  single remaining Complete-projecting writer) and honest
+  `acknowledged=false` for all old-adapter settlements (V3 `Complete`
+  projects `Unknown` until Task F wires the exact-echo driver), each
+  with closure-prescribed public-path red regressions — repair 1's red
+  discriminates on cell STATE because repair 2 alone would mask its
+  projection symptom. Caps 120/400 (mirror
+  [`2026-08-15-r2f1b-3c2-task-e-repair2-brief.md`](2026-08-15-r2f1b-3c2-task-e-repair2-brief.md)).
 
 ## Non-scope reaffirmed
 
