@@ -206,6 +206,9 @@ impl ChildNameV2 {
     pub fn as_os_str(&self) -> &OsStr {
         &self.0
     }
+    pub(crate) fn is_reserved_target(&self) -> bool {
+        self.0.as_encoded_bytes().starts_with(b".a2a-v2-")
+    }
     pub fn reserved(
         namespace: ReservedNameNamespaceV2,
         target: &Self,
@@ -1083,31 +1086,53 @@ impl JournalRootOperationV2<'_> {
             error => JournalMutationOutcomeV2::Refused(error.to_string()),
         }
     }
-    fn retained(&self, reason: String) -> JournalMutationOutcomeV2 {
+    pub(crate) fn record_protective_debt<T>(&self, outcome: T) -> T {
         self.custody.protective_debt.store(1, Ordering::SeqCst);
-        JournalMutationOutcomeV2::Retained(reason)
+        outcome
     }
-    fn guard(
+    pub(crate) fn clear_protective_debt(&self) {
+        self.custody.protective_debt.store(0, Ordering::SeqCst);
+    }
+    fn retained(&self, reason: String) -> JournalMutationOutcomeV2 {
+        self.record_protective_debt(JournalMutationOutcomeV2::Retained(reason))
+    }
+    fn protective(&self, reason: impl Into<String>) -> JournalMutationOutcomeV2 {
+        self.record_protective_debt(JournalMutationOutcomeV2::ProtectiveDebt(reason.into()))
+    }
+    fn refuse_reserved_target(&self, target: &ChildNameV2) -> Result<(), JournalMutationOutcomeV2> {
+        if target.is_reserved_target() {
+            Err(JournalMutationOutcomeV2::Refused("reserved target".into()))
+        } else {
+            Ok(())
+        }
+    }
+    pub(crate) fn guard(
         &self,
         allowed: Option<&ChildNameV2>,
+        footprint: usize,
         label: &str,
     ) -> Result<(), JournalMutationOutcomeV2> {
         self.prove_route_v2(label)
             .map_err(|error| self.failed(error, false))?;
-        let residue = enumerate_directory_names(self.root_file(), 4096, label)
-            .map_err(|error| self.failed(error, false))?
-            .into_iter()
-            .any(|name| {
-                name.as_bytes().starts_with(b".a2a-v2-")
-                    && allowed.is_none_or(|value| name != value.as_os_str())
-            });
+        let names = match enumerate_directory_names(self.root_file(), 4096, label) {
+            Ok(names) => names,
+            Err(FsCustodyError::EnumerationLimitExceeded { .. }) => {
+                return Err(self.protective(format!("{label}: census exceeds capacity")))
+            }
+            Err(error) => return Err(self.failed(error, false)),
+        };
+        let residue = names.iter().any(|name| {
+            name.as_bytes().starts_with(b".a2a-v2-")
+                && allowed.is_none_or(|value| name != value.as_os_str())
+        });
         self.prove_route_v2(label)
             .map_err(|error| self.failed(error, false))?;
-        if self.custody.protective_debt.load(Ordering::SeqCst) != 0 || residue {
-            return Err(JournalMutationOutcomeV2::ProtectiveDebt(label.into()));
+        if self.debt() || residue || names.len().saturating_add(footprint) > 4096 {
+            return Err(self.protective(format!("{label}: protective debt")));
         }
         Ok(())
     }
+    #[allow(dead_code)]
     pub(crate) fn recovery_debt(&self, label: &str) -> Result<bool, FsCustodyError> {
         self.prove_route_v2(label)?;
         let residue = enumerate_directory_names(self.root_file(), 4096, label)?
@@ -1180,7 +1205,8 @@ impl JournalRootOperationV2<'_> {
         bytes: &[u8],
         label: &str,
     ) -> Result<FileContentSnapshotV2, JournalMutationOutcomeV2> {
-        self.guard(None, label)?;
+        self.refuse_reserved_target(target)?;
+        self.guard(None, 1, label)?;
         let name = ChildNameV2::reserved(ReservedNameNamespaceV2::Staging, target)
             .map_err(|error| self.failed(error, false))?;
         let file = create_new_regular_child_at(self.root_file(), name.as_os_str(), label)
@@ -1207,9 +1233,10 @@ impl JournalRootOperationV2<'_> {
         label: &str,
         before_publish: F,
     ) -> Result<FileContentSnapshotV2, JournalMutationOutcomeV2> {
+        self.refuse_reserved_target(target)?;
         let name = ChildNameV2::reserved(ReservedNameNamespaceV2::Staging, target)
             .map_err(|error| self.failed(error, false))?;
-        self.guard(Some(&name), label)?;
+        self.guard(Some(&name), 0, label)?;
         let file = open_regular_child(self.root_file(), name.as_os_str(), label)
             .map_err(|error| self.failed(error, true))?;
         let observed = required_file_content_snapshot_v2(&file, label)
@@ -1246,7 +1273,8 @@ impl JournalRootOperationV2<'_> {
         bytes: &[u8],
         label: &str,
     ) -> Result<FileContentSnapshotV2, JournalMutationOutcomeV2> {
-        self.guard(None, label)?;
+        self.refuse_reserved_target(name)?;
+        self.guard(None, 1, label)?;
         let file = open_regular_child_for_update(self.root_file(), name.as_os_str(), true, label)
             .map_err(|error| self.failed(error, false))?;
         let observed = required_file_content_snapshot_v2(&file, label)
@@ -1266,7 +1294,7 @@ impl JournalRootOperationV2<'_> {
         };
         match result {
             Err(_) if self.rollback_append(&session, expected, label) => {
-                self.custody.protective_debt.store(0, Ordering::SeqCst);
+                self.clear_protective_debt();
                 Err(JournalMutationOutcomeV2::Refused(format!(
                     "{label}: append rolled back"
                 )))
@@ -1309,7 +1337,7 @@ impl JournalRootOperationV2<'_> {
         Ok(names)
     }
     pub fn sync(&self, label: &str) -> JournalMutationOutcomeV2 {
-        if let Err(value) = self.guard(None, label) {
+        if let Err(value) = self.guard(None, 0, label) {
             return value;
         }
         match self
@@ -4885,6 +4913,12 @@ mod tests {
             }
         }
 
+        fn fill_root_to(case: &RouteCase, count: usize) {
+            for index in fs::read_dir(&case.root).unwrap().count()..count {
+                fs::hard_link(&case.lock, case.root.join(format!("ordinary-{index}"))).unwrap();
+            }
+        }
+
         fn flock(file: &File) -> std::io::Result<bool> {
             crate::liveness::flock_nb(file, true)
         }
@@ -5230,6 +5264,72 @@ mod tests {
                 operation.stage(&ChildNameV2::from_bytes(b"next").unwrap(), b"x", "blocked"),
                 Err(JournalMutationOutcomeV2::ProtectiveDebt(_))
             ));
+        }
+
+        #[test]
+        fn journal_owned_surface_v2_reserves_stage_capacity_and_overcap_is_protective() {
+            for count in [4095, 4096, 4097] {
+                let case = route_case();
+                fill_root_to(&case, count);
+                let custody =
+                    JournalRootCustodyV2::open(&case.anchor, &case.binding, "stage capacity")
+                        .unwrap();
+                let operation = custody.begin_operation("stage capacity").unwrap();
+                let outcome = operation.stage(
+                    &ChildNameV2::from_bytes(b"record").unwrap(),
+                    b"A",
+                    "stage capacity",
+                );
+                let admitted = count == 4095;
+                assert_eq!(outcome.is_ok(), admitted);
+                if !admitted {
+                    assert!(matches!(
+                        outcome,
+                        Err(JournalMutationOutcomeV2::ProtectiveDebt(_))
+                    ));
+                }
+                assert_eq!(
+                    fs::read_dir(&case.root).unwrap().count(),
+                    count + usize::from(admitted)
+                );
+            }
+        }
+
+        #[test]
+        fn journal_owned_surface_v2_reserved_targets_refuse_before_effect() {
+            for target in [
+                ".a2a-v2-int-record",
+                ".a2a-v2-stg-record",
+                ".a2a-v2-rpc-record",
+                ".a2a-v2-rtc-record",
+                ".a2a-v2-x",
+            ] {
+                let case = route_case();
+                fs::write(case.root.join(target), b"A").unwrap();
+                let custody =
+                    JournalRootCustodyV2::open(&case.anchor, &case.binding, "reserved target")
+                        .unwrap();
+                let operation = custody.begin_operation("reserved target").unwrap();
+                let target = ChildNameV2::from_bytes(target.as_bytes()).unwrap();
+                let expected = required_file_content_snapshot_v2(
+                    &File::open(case.root.join(target.as_os_str())).unwrap(),
+                    "reserved target",
+                )
+                .unwrap();
+                for outcome in [
+                    operation.stage(&target, b"B", "reserved target"),
+                    operation.publish(&target, expected, "reserved target"),
+                    operation.append(&target, expected, 1, b"B", "reserved target"),
+                ] {
+                    assert!(matches!(
+                        outcome,
+                        Err(JournalMutationOutcomeV2::Refused(ref reason))
+                            if reason.contains("reserved target")
+                    ));
+                    assert_eq!(fs::read_dir(&case.root).unwrap().count(), 1);
+                    assert_eq!(fs::read(case.root.join(target.as_os_str())).unwrap(), b"A");
+                }
+            }
         }
     }
     #[cfg(not(unix))]
