@@ -374,6 +374,42 @@ All checks passed; no drift found.
 - Final closure (the pre-authorized round's one closure) dispatched on
   `6114596d..863f2fd4`; brief mirrored as
   [`2026-08-14-r2f1b-3c2-task-a4-final-closure-brief.md`](2026-08-14-r2f1b-3c2-task-a4-final-closure-brief.md).
+- 2026-08-15: the final closure returned REJECT with prior WRONG 1
+  **PARTIAL** — one last edge: a valid 244-255-byte target makes `publish`'s
+  staging-name derivation fail before the census, bypassing residue-first
+  classification (everything else FIXED/sustained; three coverage SMELLs
+  deferred; 97/100). Population trajectory across A4 rounds: 5 → 1 →
+  1-edge — converging, closed, with a prescribed ~8-line fix.
+- 2026-08-15: **disclosed operator convergence extension** (steering
+  converging-branch; one line: the shrinking single-edge population was
+  folded rather than parked): commit `d8ec93ad` (+97/−8, ~14 production) —
+  in `publish`, the census and reserved refusal now precede staging-name
+  derivation, whose error surfaces only on an admitted clean root; red
+  control observed against the pre-fix ordering; the three deferred
+  coverage smells folded (per-mutator fresh-handle residue cases, replace
+  4,094 positive boundary, long clean-root refusal reason). Full lib
+  612/0. **BINDING second look: the post-G aggregate dual-lens round
+  reviews this extension as a named item.**
+- 2026-08-15: full host gate on exact `d8ec93ad`: first run red on TWO
+  `reaper::tests` bounded-probe assertions — classified as the ledgered
+  start-probe load-flake family, NOT change-attributed (controls: isolated
+  5/5 green on the same tree; the same tests ran green in the two prior
+  full-workspace gates on this clone; zero surface overlap with the
+  change); not re-baselined. Disclosed rerun: **ALL GATES GREEN — 4,026
+  passed / 0 failed / 13 ignored across 90 harnesses**, hygiene 40/8 (logs
+  `a4-host-gates-3.log` red + `a4-host-gates-4.log` green).
+- 2026-08-15: **A4 ACCEPTED at exact `d8ec93ad` — TASK A COMPLETE**
+  (A1 `5cbeea1e`, A2 `3890fa6c`, A3 `6114596d`, A4 `d8ec93ad`; line
+  preserved at `salvage/r2f1b-3c2-a4-accepted`). Ledger carried forward to
+  the aggregate round: the convergence-extension second look; SMELL-1's
+  mutation receipts offer; the residue-disposition authority question; the
+  RW1 ENOTSUP-crash-window accepted-residual; the hygiene
+  module-`rustfmt::skip` ban slice.
+- 2026-08-15: **Task B dispatched** from exact `d8ec93ad` per the standing
+  owner authorization — "request journal, atomic admission, and bounded
+  retirement" (churn caps 500 production / 900 total, B2 split escape
+  hatch; brief mirrored as
+  [`2026-08-14-r2f1b-3c2-task-b-brief.md`](2026-08-14-r2f1b-3c2-task-b-brief.md)).
 
 ## Non-scope reaffirmed
 
