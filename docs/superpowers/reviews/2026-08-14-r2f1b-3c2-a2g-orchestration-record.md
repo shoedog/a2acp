@@ -813,6 +813,43 @@ All checks passed; no drift found.
   items, each naming F2; handoff 367→371 correction; caps 100/300;
   brief mirrored as
   [`2026-08-15-r2f1b-3c2-repair-f-brief.md`](2026-08-15-r2f1b-3c2-repair-f-brief.md)).
+- 2026-08-15: targeted repair `7d3202cf` (34 production/149 total,
+  within caps; in-container verify fully green — clippy now passes with
+  the seven item-scoped F2 allows) delivered both repairs and the docs
+  correction; its advisory review confirmed the first-round fix but
+  REJECTed on exactly ONE fresh WRONG (99/100): `attach_lifecycle`
+  copied the turn-wide `acceptance_barrier_crossed` into the
+  REQUEST-LOCAL bit, so successor tool-call rounds were pre-marked
+  accepted and a round-two cancel/drop before its own first poll still
+  persisted `Partial,false`/`Unknown,false`. Population 2→1, shrinking
+  and non-repeating (a distinct mechanism exposed by the first fix).
+  Operator source verification confirmed the chain (`attach_lifecycle`
+  → `mark_accepted` → `acceptance_keyed_disposition`). Preserved at
+  `salvage/r2f1b-3c2-f-repaired`.
+- 2026-08-15: disclosed operator completion `15912e3a` (+5/−6
+  production = 11 changed lines, +151 tests, +52 handoff), red-first
+  (successor cancel and drop regressions failed behaviorally on
+  `7d3202cf` at the request-local assertion; log `f2-red.log`): the
+  sticky turn acceptance propagates ONLY to the cleanup cell's
+  diagnostic custody; the request bit is set solely by the first-poll
+  `RequestAcceptanceMarker`; the unused `RequestScope::mark_accepted`
+  deleted. A public two-round accepted-edge test (`Complete,true` then
+  in-flight cancel `Partial,true`) guards against overcorrection —
+  green on both heads by design. Full bridge-api suite green;
+  remote_request_flight unchanged 45/0; workspace clippy `-D warnings`
+  clean. This completion is INSIDE F's declared round — the counted
+  closure reviews the full line including it. Preserved at
+  `salvage/r2f1b-3c2-f-completed`.
+- Host gates on exact `15912e3a` all exit 0: **4,090 passed / 0 failed
+  / 13 ignored across 90 harnesses** (log `f-host-gates.log`), hygiene
+  green, post-gate self-reap ran.
+- Counted closure dispatched on the full `a1f1f8de..15912e3a` line with
+  disclosed operator concerns for contest (sticky-to-cell-only
+  propagation halves, sole-setter deletion, accepted-edge narrowing)
+  and the F2 split state explicit; the binding Task F contract is
+  restated inline because the salvage plan file is not in the clone's
+  lineage; brief mirrored as
+  [`2026-08-15-r2f1b-3c2-task-f-closure-brief.md`](2026-08-15-r2f1b-3c2-task-f-closure-brief.md).
 
 ## Non-scope reaffirmed
 
