@@ -27,7 +27,8 @@ use bridge_core::error::BridgeError;
 use bridge_core::ids::{AgentId, SessionId};
 use bridge_core::orch::{OrchEventKind, UsageSnapshot};
 use bridge_core::ports::{
-    AgentBackend, AgentRegistry, BackendObservers, PolicyEngine, Resolved, RichEventSink, Update,
+    AgentBackend, AgentRegistry, BackendCleanupDispositionV1, BackendObservers, PolicyEngine,
+    Resolved, RichEventSink, Update,
 };
 use bridge_core::workflow_history::WorkflowHistoryStore;
 use bridge_core::SessionCwd;
@@ -1838,7 +1839,7 @@ async fn cleanup_backend_until(
         ("not_needed", None)
     };
     let observer: Arc<dyn bridge_core::ports::DiagnosticObserver> = observer;
-    let (release, release_error) = cleanup_step(
+    let (release, release_error) = release_cleanup_step(
         tokio::time::timeout_at(
             deadline,
             backend.release_session_observed(session, observer),
@@ -1868,6 +1869,19 @@ fn cleanup_step<T>(
 ) -> (&'static str, Option<BridgeError>) {
     match result {
         Ok(Ok(_)) => ("completed", None),
+        Ok(Err(error)) => ("failed", Some(error)),
+        Err(_) => ("timed_out", Some(BridgeError::AgentTimedOut)),
+    }
+}
+
+fn release_cleanup_step(
+    result: Result<Result<BackendCleanupDispositionV1, BridgeError>, tokio::time::error::Elapsed>,
+) -> (&'static str, Option<BridgeError>) {
+    match result {
+        Ok(Ok(BackendCleanupDispositionV1::Complete)) => ("completed", None),
+        Ok(Ok(BackendCleanupDispositionV1::Unknown)) => ("unknown", None),
+        Ok(Ok(BackendCleanupDispositionV1::Retained)) => ("retained", None),
+        Ok(Ok(BackendCleanupDispositionV1::Preserved)) => ("preserved", None),
         Ok(Err(error)) => ("failed", Some(error)),
         Err(_) => ("timed_out", Some(BridgeError::AgentTimedOut)),
     }
@@ -2617,6 +2631,7 @@ mod tests {
         cancel_calls: AtomicUsize,
         release_calls: AtomicUsize,
         retire_calls: AtomicUsize,
+        release_disposition: bridge_core::ports::BackendCleanupDispositionV1,
         hanging_release: bool,
         failing_release: bool,
         release_failure_accepted: bool,
@@ -2636,6 +2651,7 @@ mod tests {
                 cancel_calls: AtomicUsize::new(0),
                 release_calls: AtomicUsize::new(0),
                 retire_calls: AtomicUsize::new(0),
+                release_disposition: bridge_core::ports::BackendCleanupDispositionV1::Complete,
                 hanging_release: false,
                 failing_release: false,
                 release_failure_accepted: true,
@@ -2649,6 +2665,14 @@ mod tests {
 
         fn with_hanging_release(mut self) -> Self {
             self.hanging_release = true;
+            self
+        }
+
+        fn with_release_disposition(
+            mut self,
+            disposition: bridge_core::ports::BackendCleanupDispositionV1,
+        ) -> Self {
+            self.release_disposition = disposition;
             self
         }
 
@@ -2885,7 +2909,7 @@ mod tests {
                     self.release_failure_accepted,
                 )))
             } else {
-                Ok(bridge_core::ports::BackendCleanupDispositionV1::Complete)
+                Ok(self.release_disposition)
             }
         }
 
@@ -3905,6 +3929,68 @@ mod tests {
             state.failure.as_ref().unwrap().code().as_str(),
             "smoke.cleanup_timeout"
         );
+    }
+
+    async fn assert_release_cleanup_wire(
+        disposition: bridge_core::ports::BackendCleanupDispositionV1,
+        expected_release: &str,
+        expected_aggregate: &str,
+    ) {
+        let backend: Arc<dyn AgentBackend> =
+            Arc::new(FakeBackend::new(Behavior::Exact).with_release_disposition(disposition));
+        let outcome = cleanup_backend_until(
+            backend,
+            &SessionId::parse("typed-release-cleanup").unwrap(),
+            observer(),
+            false,
+            false,
+            tokio::time::Instant::now() + Duration::from_secs(1),
+        )
+        .await;
+        assert!(outcome.error.is_none());
+        let wire = serde_json::to_value(&outcome.record).unwrap();
+        assert_eq!(wire["release"], expected_release);
+        assert_eq!(cleanup_disposition(&outcome.record), expected_aggregate);
+    }
+
+    #[tokio::test]
+    async fn release_cleanup_serializes_unknown_protectively() {
+        assert_release_cleanup_wire(
+            bridge_core::ports::BackendCleanupDispositionV1::Unknown,
+            "unknown",
+            "unknown",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn release_cleanup_serializes_retained_protectively() {
+        assert_release_cleanup_wire(
+            bridge_core::ports::BackendCleanupDispositionV1::Retained,
+            "retained",
+            "unknown",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn release_cleanup_serializes_preserved_protectively() {
+        assert_release_cleanup_wire(
+            bridge_core::ports::BackendCleanupDispositionV1::Preserved,
+            "preserved",
+            "unknown",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn release_cleanup_serializes_exact_complete_as_completed() {
+        assert_release_cleanup_wire(
+            bridge_core::ports::BackendCleanupDispositionV1::Complete,
+            "completed",
+            "complete",
+        )
+        .await;
     }
 
     #[tokio::test]

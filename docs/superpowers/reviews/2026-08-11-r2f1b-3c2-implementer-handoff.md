@@ -1,8 +1,87 @@
 # R2f1b 3c2 implementer handoff — API request-flight authority
 
 Date: 2026-08-15
+Task G2 frozen input: `2a912d18067c0ae59a598d2ba1c3c611117e6c7b`
 Frozen targeted-repair input: `4c8e408bc2290db9de9a3c31763cc0a0a2655c76`
 Original Task G base: `f17e2bd37868c398d5c04d175ffee2a5cc5c1a00`
+
+## Task G2: protective typed smoke cleanup dispositions
+
+The ordinary smoke release step now serializes the exact result of
+`release_session_observed`: `Complete` is `"completed"`, `Unknown` is
+`"unknown"`, `Retained` is `"retained"`, and `Preserved` is `"preserved"`.
+Thus `"completed"` has narrowed from any successful typed result to exact
+`BackendCleanupDispositionV1::Complete`. Release errors and timeouts remain
+`"failed"` and `"timed_out"`; cancel and retire still use the unchanged generic
+void-step mapping.
+
+The cleanup aggregate already admits `"complete"` only when every step is
+`"completed"` or `"not_needed"` and the run backstop is not active. Each new
+protective release value therefore folds to aggregate `"unknown"` independently
+of the existing backstop. Exact `Complete` with no other cleanup debt still
+folds to aggregate `"complete"`.
+
+### Fail-first evidence
+
+The exact pre-change command was:
+
+```bash
+CARGO_INCREMENTAL=0 cargo test -p a2a-bridge --bin a2a-bridge \
+  release_cleanup_serializes_ -- --nocapture
+```
+
+It compiled against exact frozen input `2a912d18`, selected four tests, and
+failed 3/4. The `Unknown`, `Retained`, and `Preserved` tests each independently
+observed serialized `"completed"` instead of their protective value; the exact
+`Complete` positive passed. This was admissible behavioral red evidence: the
+binary and intended tests ran, and all three failures were the frozen generic
+`Ok(T)` collapse rather than setup, dependency, network, or zero-selection
+failure.
+
+### Wire-compatibility census
+
+Repository-wide source and fixture search found these readers of the smoke
+artifact's `cleanup.release` field:
+
+- `bin/a2a-bridge/src/smoke.rs` computes the attempt-history cleanup aggregate.
+  It treats only `"completed"`/`"not_needed"` as complete, so all three new
+  values are conservatively `"unknown"`; no run-backstop inference is needed.
+- `bin/a2a-bridge/src/compatibility.rs` requires exact `"completed"` for both a
+  floating success and a definitive floating failure. A protective value fails
+  that contract and becomes `candidate_unknown` with
+  `outcome.smoke_contract`; it cannot green a compatibility case. Its baseline
+  projection retains the raw cleanup object, so pinned comparison also reports
+  the changed release value as terminal cleanup drift. The four checked-in
+  pinned baseline rows and compatibility fixtures contain historical exact
+  `"completed"` successes and remain valid without rewriting evidence.
+- `bin/a2a-bridge/src/fallback_plan.rs` deserializes release as a string, but its
+  validator is deliberately narrower than the general smoke wire: the only
+  authorizable cleanup record must byte-equal
+  `ordinary_pre_spawn_cleanup_wire_value`, whose release is `"not_needed"`.
+  Protective values are rejected fail-closed as invalid/incomplete and can
+  never authorize or emit a host command. No previously eligible fallback
+  artifact can contain a post-session protective release, so this does not
+  break the planner's supported input contract.
+
+No other production reader accesses this field. Colocated smoke assertions,
+fallback/compatibility CLI fixtures, and `compatibility/baselines/pinned.json`
+exercise the readers above rather than define another parser. No reader needs
+an in-scope adaptation, and none upgrades a protective value to completion.
+
+### Verification, accounting, and remaining boundary
+
+- Focused typed release mapping: 4 passed, 0 failed.
+- Complete colocated `smoke::tests::` namespace: 35 passed, 0 failed.
+- Complete `a2a-bridge` binary harness: 1,088 passed, 0 failed, 0 ignored.
+- `cargo fmt --all -- --check` and `git diff --check`: exit 0; no formatter-skip
+  attribute was added.
+
+Post-format churn versus `2a912d18` is production +16/-2 = 18 lines and
+colocated tests +73/-1 = 74 lines. Including this handoff refresh, total churn
+is +168/-3 = 171 lines, below the 120-production and 300-total stop limits.
+No live provider, billable smoke, compatibility run, release, deployment, or
+running-operator action occurred. The 3c2 aggregate review remains ahead;
+production remains `LegacyV2` and the V3 route remains unarmed.
 
 ## Targeted repair closure
 
