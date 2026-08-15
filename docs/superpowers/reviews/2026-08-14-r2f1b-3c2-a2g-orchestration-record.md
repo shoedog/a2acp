@@ -458,6 +458,36 @@ All checks passed; no drift found.
   retirement, reopen self-healing, sequential throughput, both riders
   (caps 350/700 churn; brief mirrored as
   [`2026-08-14-r2f1b-3c2-task-b2-brief.md`](2026-08-14-r2f1b-3c2-task-b2-brief.md)).
+- 2026-08-15: B2 base run: candidate `6115c93e` (216 production / 592
+  total churn, in caps; verify fully green in-container). Advisory review
+  REJECT with three claims; operator adjudication: W3 (reopen relabeled
+  every active child pre-send) and W2 (recovery before attempt
+  authorization) CONFIRMED bounded; W1 (mid-retire permanent `Retained`)
+  REFUTED as a B2 blocker — accepted A3 pinned semantics, owner-ledgered
+  residue-disposition item, Task A scope shield — with a coverage rider.
+  Candidate preserved at `salvage/r2f1b-3c2-b2-candidate`; repair declared
+  (150/400; mirror
+  [`2026-08-14-r2f1b-3c2-task-b2-repair-brief.md`](2026-08-14-r2f1b-3c2-task-b2-repair-brief.md)).
+- 2026-08-15: targeted repair `09a19025` (99 production churn) delivered
+  both confirmed fixes; its advisory review REJECTed on three trivial
+  clippy lints plus the injection rider still bypassing stage/replace (the
+  class's third, shrinking instance: publish/retire were converted, two
+  adapters remained), and deferred the below-checkpoint ambiguity to Task
+  C. In-container test red = the whole-bin flock-EBADF hermetic class
+  (5th/6th lane instances).
+- 2026-08-15: disclosed operator completion `2e472a09` (+43/−21),
+  red-first (the new side-effect assertions failed on the pre-call seams;
+  first observed red at the stage-residue assertion): stage,
+  acknowledgement replacement, and orphan-checkpoint healing consume real
+  adapter results through the wrap-actual seam; three lints fixed;
+  `request_paths` narrowed to published children. Full lib 631/0. Head
+  preserved at `salvage/r2f1b-3c2-b2-repaired`.
+- Host gates on exact `2e472a09` all exit 0: **4,045 passed / 0 failed /
+  13 ignored across 90 harnesses**, hygiene 40/8 (log
+  `b2-host-gates.log`).
+- Counted closure dispatched on the full `6033fd34..2e472a09` line; brief
+  mirrored as
+  [`2026-08-14-r2f1b-3c2-task-b2-closure-brief.md`](2026-08-14-r2f1b-3c2-task-b2-closure-brief.md).
 
 ## Non-scope reaffirmed
 
