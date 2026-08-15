@@ -1002,3 +1002,60 @@ the cell and return the exact checked disposition to existing callers.
 Only `backend.rs` and this handoff changed. The shared-flight adapter still
 compiles; Tasks F-G, API HTTP execution, production routing, and production V3
 remain unarmed. Production still constructs `resource_flight_route_v3 = None`.
+
+## Task E targeted repair: diagnostic and timed-out custody
+
+Date: 2026-08-15. Exact frozen input:
+`05e9517e0cb566633ce04675430a29e474a7e3b1` (`05e9517e`).
+
+### Admissible red evidence
+
+Each command reached `bridge-api`, selected exactly one test, and exited 101
+on the frozen production mechanism; none was a dependency/network refusal or
+zero-selected selector:
+
+- `CARGO_INCREMENTAL=0 cargo test -p bridge-api --lib task_e_expired_observation_retains_accepted_refusal_diagnostic -- --nocapture`
+  failed because observation destructively removed the unrecorded diagnostic.
+- `CARGO_INCREMENTAL=0 cargo test -p bridge-api --lib task_e_rejected_or_timed_out_diagnostic_recording_retains_custody -- --nocapture`
+  failed on the rejecting observer because its diagnostic was destroyed; the
+  repaired test also drives the deadline-expiring stalled-observer branch.
+- `CARGO_INCREMENTAL=0 cargo test -p bridge-api --lib task_e_timeout_then_drop_records_success_without_upgrading_unknown -- --nocapture`
+  failed because the timed-out cell recorded neither acceptance nor success.
+- `CARGO_INCREMENTAL=0 cargo test -p bridge-api --lib task_e_timeout_then_drop_records_refusal_without_upgrading_unknown -- --nocapture`
+  failed because the timed-out cell recorded neither acceptance nor refusal.
+
+The independent pre-change command
+`CARGO_INCREMENTAL=0 cargo clippy -p bridge-api --all-targets -- -D warnings`
+exited 101 with exactly `large_enum_variant` on `PreparedRequest` and
+`manual_inspect` on request admission.
+
+### Repair, gates, and bounds
+
+`PreparedRequest::Ready` now boxes its large scope and admission uses
+`inspect_err`. Diagnostic observation clones custody, records under the
+immutable deadline, and clears only the exact still-current diagnostic after a
+confirmed observer write; expiry, observer refusal, and observer timeout retain
+the acceptance-aware diagnostic. A timed-out cell accepts the exact late drop
+transfer, attempts settlement only once after expiry, records success or
+refusal while retaining `TimedOut` and its `Unknown` projection, and retains a
+refused flight so its destructor cannot perform an immediate ignored retry.
+
+- Focused Task E tests: 9 passed, 0 failed.
+- `cargo test -p bridge-api`: 90 passed, 0 failed, 1 intentionally ignored
+  live-Ollama test; the zero-test doctest harness also passed. The installed
+  toolchain directory and loopback `NO_PROXY` were exposed because this host's
+  default `PATH` omits `rustdoc`/`cargo-fmt` and its proxy variables otherwise
+  redirect Wiremock.
+- `cargo test -p bridge-core --lib -- remote_request_flight`: 45 passed,
+  0 failed, 614 filtered.
+- Fresh-target workspace all-target/all-feature locked Clippy with
+  `-D warnings`, `cargo fmt --all -- --check`, and `git diff --check`: exit 0.
+- Post-format delta is production +69/-24 (93 changed lines), colocated tests
+  +188/-0, and this handoff section +57/-0: aggregate
+  +314/-24 (338 changed lines), below the 150-production and
+  400-total limits.
+
+Only `crates/bridge-api/src/backend.rs` and this handoff changed. Tasks F-G,
+API production V3 routing, bridge core, workflows, worktrees, and `bin/`
+remain unarmed and unchanged. Production still assigns
+`resource_flight_route_v3 = None`.
