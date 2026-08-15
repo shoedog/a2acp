@@ -778,6 +778,41 @@ All checks passed; no drift found.
   additions (caps 500/900, F2 split escape hatch per the salvage plan;
   brief mirrored as
   [`2026-08-15-r2f1b-3c2-task-f-brief.md`](2026-08-15-r2f1b-3c2-task-f-brief.md)).
+- 2026-08-15: F base run: candidate `f17e2958` — the implementer took
+  the salvage plan's F2 SPLIT (old adapter private and unreferenced;
+  removal named F2, due before the aggregate round). Churn 884/900
+  total, 371/500 production (operator numstat concurs) — inside caps
+  with 16 lines of headroom. The migration itself verified causally
+  sound by the advisory reviewer: route on the Task B-D mechanism,
+  first-poll arming fence in the core wrapper, and `settle()` returns
+  only after the exact delivery-ID echo is durably acknowledged (the
+  positive-acknowledgement path Task E left pending). In-container
+  verify FAILED at clippy and the whole-bin target; advisory review
+  REJECT with TWO WRONGs, both operator-verified: (1) pre-send exits
+  publish the wrong durable disposition — `begin_dispatch()` sets
+  `dispatched=true` at dispatch AUTHORIZATION while arming happens only
+  at first poll, so cancel/drop in that window settles the unarmed row
+  `Partial,false`/`Unknown,false` instead of the recovery table's
+  `Failed,false`; (2) the F2 split fails the workspace `-D warnings`
+  gate as dead code. Two SMELLs: API-level edge regressions
+  (first-poll ordering at the real reqwest future, rejected/mismatched
+  echo) → DEFER to closure/aggregate; handoff production churn
+  understated 367 vs 371 → folded into the repair as a docs
+  correction. The `remote_request_flight.rs` +6 is a semantics-free
+  `Debug` impl (disclosed to the closure).
+- Operator enumeration before the retry: host clippy = EXACTLY seven
+  dead-code warnings, all retained-adapter symbols (population closed;
+  log `f-clippy-enum.log`); container whole-bin failure = flock-EBADF
+  signature, instance 8; host control on exact `f17e2958`: **1,086
+  passed / 0 failed** (log `f-wholebin-host.log`; class 8/8
+  host-green). Candidate preserved at `salvage/r2f1b-3c2-f-candidate`.
+- Rejection classified CLOSED and enumerable → contracted targeted
+  repair dispatched on frozen `f17e2958` (acceptance-keyed pre-send
+  disposition with deterministic cancel/drop-before-first-poll reds;
+  narrowest-scope `#[allow(dead_code)]` on exactly the seven retained
+  items, each naming F2; handoff 367→371 correction; caps 100/300;
+  brief mirrored as
+  [`2026-08-15-r2f1b-3c2-repair-f-brief.md`](2026-08-15-r2f1b-3c2-repair-f-brief.md)).
 
 ## Non-scope reaffirmed
 
