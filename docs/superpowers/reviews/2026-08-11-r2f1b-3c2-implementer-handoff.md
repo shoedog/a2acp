@@ -1106,3 +1106,63 @@ colocated tests +153/-0, this handoff section +54/-0. Only
 production V3 routing, bridge core, workflows, worktrees, and `bin/` remain
 unarmed and unchanged. Production still assigns
 `resource_flight_route_v3 = None`.
+
+## Task E owner-authorized second repair
+
+Date: 2026-08-15. Exact frozen input:
+`1f3c3a82cef043ce824959e4cbae8037347590fa` (`1f3c3a82`).
+
+### Admissible red evidence
+
+- `NO_PROXY=127.0.0.1,localhost CARGO_INCREMENTAL=0 cargo test -p
+  bridge-api --lib
+  task_e_late_complete_cannot_overwrite_timed_out_through_public_path --
+  --nocapture` reached `bridge-api`, selected one test, and failed 0/1 at
+  the cell-state discriminator: after checked cleanup expired and the blocked
+  publisher resumed, the frozen writer recorded `Terminal`, not `TimedOut`.
+- `NO_PROXY=127.0.0.1,localhost CARGO_INCREMENTAL=0 cargo test -p
+  bridge-api --lib
+  task_e_noop_publisher_success_has_no_fabricated_acknowledgement --
+  --nocapture` reached `bridge-api`, selected one test, and failed 0/1
+  because checked cleanup returned `Complete`, not `Unknown`.
+
+Both were public-path behavioral failures on the exact frozen input. Neither
+was a dependency/network refusal, compile-only failure, or zero-selected
+selector. The first uses a synchronous barrier publisher after the durable
+settlement append, proves expiry leaves zero live waiters, then releases the
+normal successful scope path.
+
+### Repair and compatibility
+
+`finish()` now treats current `TimedOut` as absorbing under its own lock:
+it records terminal evidence, preserves the state and non-reclaimability, and
+returns success to the already-settled scope. `refuse()` is unchanged.
+All three old-adapter result tails now record `acknowledged=false`; the
+no-authority `begin_cleanup` row, `finish_pending` callers, and exact
+projection table are unchanged.
+
+Two older cell tests that asserted the fabricated `true` literal now assert
+`false`. Honest acknowledgement also required next-round admission to key
+only on terminal `Complete`, not the acknowledgement bit; otherwise three
+unchanged multi-round tests stopped before request B. This admission reset
+atomically marks admission started and cannot project `Complete` from the
+unacknowledged result.
+
+### Verification and accounting
+
+- Focused Task E tests: 13 passed, 0 failed.
+- `cargo test -p bridge-api` with the installed toolchain directory and
+  loopback `NO_PROXY` exposed: 94 passed, 0 failed, 1 intentionally ignored
+  live-Ollama test; the zero-test doctest harness passed.
+- `cargo test -p bridge-core --lib -- remote_request_flight`: 45 passed,
+  0 failed, 614 filtered.
+- `cargo fmt --all -- --check` and `git diff --check`: exit 0.
+- Post-format churn versus `1f3c3a82`: production +10/-7, focused tests
+  +133/-2, and this handoff +60/-0; total +203/-9 (212 changed lines).
+
+Only `crates/bridge-api/src/backend.rs` and this handoff changed. The old
+request adapter still compiles. Tasks F-G, bridge core, workflows, worktrees,
+`bin/`, API production V3 routing, providers, smoke, compatibility,
+deployment, fold, push, and the running operator remain unarmed and unchanged.
+Production still assigns `resource_flight_route_v3 = None` and exposes
+`LegacyV2`.

@@ -344,9 +344,10 @@ impl ApiRequestCleanupCustodianV1 {
             .lock()
             .map_err(|_| RemoteRequestFlightErrorV1::Admission("cleanup cell poisoned".into()))?;
         if inner.state == ApiRequestCleanupStateV1::Terminal
-            && inner.terminal.as_ref().is_some_and(|(result, ack)| {
-                *result == ResourceActionDispositionV1::Complete && *ack
-            })
+            && inner
+                .terminal
+                .as_ref()
+                .is_some_and(|(result, _)| *result == ResourceActionDispositionV1::Complete)
         {
             inner.state = if inner.v3 {
                 ApiRequestCleanupStateV1::AdmissionPendingV3
@@ -435,7 +436,9 @@ impl ApiRequestCleanupCustodianV1 {
         if inner.identity.as_ref() != Some(identity) {
             return false;
         }
-        inner.state = ApiRequestCleanupStateV1::Terminal;
+        if inner.state != ApiRequestCleanupStateV1::TimedOut {
+            inner.state = ApiRequestCleanupStateV1::Terminal;
+        }
         inner.terminal = Some((result, acknowledged));
         drop(inner);
         self.notify();
@@ -545,7 +548,7 @@ impl ApiRequestCleanupCustodianV1 {
             if inner.identity.as_ref() == Some(identity) {
                 if inner.state == ApiRequestCleanupStateV1::TimedOut {
                     match result {
-                        Ok(result) => inner.terminal = Some((result.disposition, true)),
+                        Ok(result) => inner.terminal = Some((result.disposition, false)),
                         Err(error) => {
                             inner.diagnostic =
                                 lifecycle.map(|lifecycle| (lifecycle, error, inner.accepted));
@@ -556,7 +559,7 @@ impl ApiRequestCleanupCustodianV1 {
                     match result {
                         Ok(result) => {
                             inner.state = ApiRequestCleanupStateV1::Terminal;
-                            inner.terminal = Some((result.disposition, true));
+                            inner.terminal = Some((result.disposition, false));
                         }
                         Err(error) => {
                             inner.state = ApiRequestCleanupStateV1::SettlementRefused;
@@ -818,7 +821,7 @@ impl RequestScope {
         self.flight = None;
         if !self
             .cleanup
-            .finish(&self.identity, result.disposition.clone(), true)
+            .finish(&self.identity, result.disposition.clone(), false)
         {
             return Err(RemoteRequestFlightErrorV1::Admission(
                 "cleanup cell rejected exact terminal publication".into(),
@@ -2383,6 +2386,18 @@ mod tests {
         }
     }
 
+    struct BlockingRequestPublisher {
+        arrived: Arc<std::sync::Barrier>,
+        release: Arc<std::sync::Barrier>,
+    }
+
+    impl ResourceFlightResultPublisher for BlockingRequestPublisher {
+        fn publish(&self, _aggregation: NodeCleanupAggregationV1) {
+            self.arrived.wait();
+            self.release.wait();
+        }
+    }
+
     struct ProtectedBackendFixture {
         backend: Arc<ApiBackend>,
         ids: Arc<SequenceRequestIds>,
@@ -3340,6 +3355,125 @@ mod tests {
         assert_send_sync(&be);
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn task_e_late_complete_cannot_overwrite_timed_out_through_public_path() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(stop_sse()),
+            )
+            .mount(&server)
+            .await;
+        let root = tempfile::tempdir().unwrap();
+        let journal_root = root.path().join("journal");
+        std::fs::create_dir(&journal_root).unwrap();
+        let journal = Arc::new(FileResourceFlightJournal::open(journal_root, 64).unwrap());
+        let arrived = Arc::new(std::sync::Barrier::new(2));
+        let release = Arc::new(std::sync::Barrier::new(2));
+        let publisher: Arc<dyn ResourceFlightResultPublisher> =
+            Arc::new(BlockingRequestPublisher {
+                arrived: Arc::clone(&arrived),
+                release: Arc::clone(&release),
+            });
+        let attempt = DurableProcessFlightAttemptV3::new(AttemptId::mint().unwrap(), journal)
+            .with_result_publisher(publisher);
+        let ids = Arc::new(SequenceRequestIds::new([request_id('6')]));
+        let request_id_source: Arc<dyn RemoteRequestIdSource> = ids;
+        let mut cfg = crate::config::ApiConfig::new(format!("{}/v1", server.uri()));
+        cfg.request_timeout = Duration::from_millis(200);
+        cfg.resource_flight_route_v3 = Some(ApiResourceFlightRouteV3::new(
+            Arc::new(attempt),
+            NodeId::parse("api-node").unwrap(),
+        ));
+        let backend = Arc::new(ApiBackend::new(cfg).with_request_id_source(request_id_source));
+        let session = SessionId::parse("task-e-public-late-complete").unwrap();
+        backend.attach_resource_flight_owner_v1(&session).unwrap();
+        let task = spawn_drain(Arc::clone(&backend), session.clone());
+
+        let arrived_gate = Arc::clone(&arrived);
+        tokio::task::spawn_blocking(move || arrived_gate.wait())
+            .await
+            .unwrap();
+        let cell = backend
+            .sessions
+            .lock()
+            .unwrap()
+            .get(&session)
+            .unwrap()
+            .cleanup_cell
+            .clone()
+            .unwrap();
+        let cleanup = backend.forget_session_checked(&session).await.unwrap();
+        let live_waiters = cell.live_waiters.load(Ordering::Acquire);
+        let release_gate = Arc::clone(&release);
+        tokio::task::spawn_blocking(move || release_gate.wait())
+            .await
+            .unwrap();
+        let updates = task.await.unwrap();
+        assert!(matches!(
+            updates.last(),
+            Some(Ok(Update::Done { stop_reason, .. })) if stop_reason == "stop"
+        ));
+        assert_eq!(cleanup, BackendCleanupDispositionV1::Unknown);
+        assert_eq!(live_waiters, 0);
+        let inner = cell.inner.lock().unwrap();
+        assert_eq!(
+            inner.state,
+            ApiRequestCleanupStateV1::TimedOut,
+            "late Complete evidence must not erase timeout debt"
+        );
+        assert_eq!(
+            inner.terminal,
+            Some((ResourceActionDispositionV1::Complete, false))
+        );
+        drop(inner);
+        assert!(!cell.reclaimable());
+    }
+
+    #[tokio::test]
+    async fn task_e_noop_publisher_success_has_no_fabricated_acknowledgement() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(stop_sse()),
+            )
+            .mount(&server)
+            .await;
+        let root = tempfile::tempdir().unwrap();
+        let journal_root = root.path().join("journal");
+        std::fs::create_dir(&journal_root).unwrap();
+        let journal = Arc::new(FileResourceFlightJournal::open(journal_root, 64).unwrap());
+        let attempt = DurableProcessFlightAttemptV3::new(AttemptId::mint().unwrap(), journal);
+        let ids = Arc::new(SequenceRequestIds::new([request_id('7')]));
+        let request_id_source: Arc<dyn RemoteRequestIdSource> = ids;
+        let mut cfg = crate::config::ApiConfig::new(format!("{}/v1", server.uri()));
+        cfg.resource_flight_route_v3 = Some(ApiResourceFlightRouteV3::new(
+            Arc::new(attempt),
+            NodeId::parse("api-node").unwrap(),
+        ));
+        let backend = Arc::new(ApiBackend::new(cfg).with_request_id_source(request_id_source));
+        let session = SessionId::parse("task-e-noop-publication").unwrap();
+        backend.attach_resource_flight_owner_v1(&session).unwrap();
+
+        let updates = spawn_drain(Arc::clone(&backend), session.clone())
+            .await
+            .unwrap();
+        assert!(matches!(
+            updates.last(),
+            Some(Ok(Update::Done { stop_reason, .. })) if stop_reason == "stop"
+        ));
+        assert_eq!(
+            backend.release_session_checked(&session).await.unwrap(),
+            BackendCleanupDispositionV1::Unknown
+        );
+    }
+
     #[tokio::test]
     async fn task_e_exact_projection_and_deadline_leave_no_waiter() {
         let session = SessionId::parse("task-e-projection").unwrap();
@@ -3563,7 +3697,7 @@ mod tests {
         assert!(inner.accepted);
         assert_eq!(
             inner.terminal,
-            Some((ResourceActionDispositionV1::Complete, true))
+            Some((ResourceActionDispositionV1::Complete, false))
         );
         drop(inner);
         assert_eq!(
@@ -3676,7 +3810,7 @@ mod tests {
         );
         assert_eq!(
             inner.terminal,
-            Some((ResourceActionDispositionV1::Complete, true))
+            Some((ResourceActionDispositionV1::Complete, false))
         );
         drop(inner);
         assert_eq!(
