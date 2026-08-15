@@ -147,11 +147,13 @@ mod mechanism {
         Ok(Some((file, value)))
     }
     fn move_new(
-        root: &File,
+        op: &JournalRootOperationV2<'_>,
         from: &ChildNameV2,
         to: &ChildNameV2,
         label: &str,
     ) -> Result<SettledV2, Failure> {
+        op.prove_route_v2(label)?;
+        let root = op.root_file();
         let from = child_name_cstring(from.as_os_str(), label)?;
         let to = child_name_cstring(to.as_os_str(), label)?;
         match rename_child_no_replace(root, &from, &to) {
@@ -172,7 +174,7 @@ mod mechanism {
         Ok(sync_root(root, label)?)
     }
     fn remove<F>(
-        root: &File,
+        op: &JournalRootOperationV2<'_>,
         name: &ChildNameV2,
         expected: FileContentSnapshotV2,
         events: Option<(TransitionV2, TransitionV2)>,
@@ -182,6 +184,7 @@ mod mechanism {
     where
         F: FnMut(TransitionV2, &ChildNameV2) -> bool,
     {
+        let root = op.root_file();
         let (held, before) =
             snapshot(root, name, label)?.ok_or_else(|| format!("{label}: unlink source absent"))?;
         if before != expected {
@@ -195,6 +198,7 @@ mod mechanism {
         if current != expected {
             return Err(format!("{label}: unlink source substituted").into());
         }
+        op.prove_route_v2(label)?;
         let encoded = child_name_cstring(name.as_os_str(), label)?;
         if unsafe { libc::unlinkat(root.as_raw_fd(), encoded.as_ptr(), 0) } == -1 {
             return Err(format!(
@@ -254,11 +258,13 @@ mod mechanism {
         Ok((intent, wire.staged_sha256))
     }
     fn create_intent(
-        root: &File,
+        op: &JournalRootOperationV2<'_>,
         intent: &CustodyIntentV2,
         staged_sha256: Option<CommitmentV2>,
         label: &str,
     ) -> Result<FileContentSnapshotV2, Failure> {
+        op.prove_route_v2(label)?;
+        let root = op.root_file();
         let name = intent.reserved_name(ReservedNameNamespaceV2::TransactionIntent);
         let mut file = create_new_regular_child_at(root, name.as_os_str(), label)?;
         let bytes =
@@ -298,7 +304,7 @@ mod mechanism {
         F: FnMut(TransitionV2, &ChildNameV2) -> bool,
     {
         let name = intent.reserved_name(ReservedNameNamespaceV2::TransactionIntent);
-        let held = remove(op.root_file(), name, snap, None, hook, label)?;
+        let held = remove(op, name, snap, None, hook, label)?;
         if hook(TransitionV2::IntentRemoved, name) {
             return Err(format!("{label}: interrupted after intent removal").into());
         }
@@ -387,20 +393,13 @@ mod mechanism {
             op: &JournalRootOperationV2<'_>,
             label: &str,
         ) -> Option<NamespaceTransactionOutcomeV2> {
-            if !cfg!(any(target_os = "linux", target_os = "macos")) {
-                return Some(NamespaceTransactionOutcomeV2::Unsupported(label.into()));
+            match op.recovery_debt(label) {
+                Ok(false) => None,
+                Ok(true) => Some(NamespaceTransactionOutcomeV2::ProtectiveDebt(format!(
+                    "{label}: recovery debt is write-blocking"
+                ))),
+                Err(error) => Some(protect(error)),
             }
-            for _ in 0..2 {
-                match Self::recover(op, label) {
-                    NamespaceTransactionOutcomeV2::Ready => return None,
-                    NamespaceTransactionOutcomeV2::Complete(_)
-                    | NamespaceTransactionOutcomeV2::NoEffect(_, _) => {}
-                    other => return Some(other),
-                }
-            }
-            Some(NamespaceTransactionOutcomeV2::ProtectiveDebt(format!(
-                "{label}: recovery did not converge"
-            )))
         }
         fn replace_with<F>(
             op: &JournalRootOperationV2<'_>,
@@ -433,6 +432,9 @@ mod mechanism {
                 Ok(v) => v,
                 Err(e) => return debt(recovery, e),
             };
+            if let Err(error) = op.prove_route_v2(label) {
+                return debt(recovery, error);
+            }
             let mut stage = match create_new_regular_child_at(root, stage_name.as_os_str(), label) {
                 Ok(v) => v,
                 Err(e) => return debt(recovery, e),
@@ -466,7 +468,7 @@ mod mechanism {
                 Ok(v) => v,
                 Err(e) => return debt(recovery, e),
             };
-            let intent_snap = match create_intent(root, &intent, Some(commitment), label) {
+            let intent_snap = match create_intent(op, &intent, Some(commitment), label) {
                 Ok(v) => v,
                 Err(e) => return debt(recovery, e),
             };
@@ -475,6 +477,9 @@ mod mechanism {
                 return debt(recovery, format!("{label}: interrupted after intent sync"));
             }
             hook(TransitionV2::BeforeCapture, intent.parts().1);
+            if let Err(error) = op.prove_route_v2(label) {
+                return debt(recovery, error);
+            }
             match capture(root, &intent, label) {
                 CustodyCaptureOutcomeV2::ExpectedCaptured(_) => {}
                 CustodyCaptureOutcomeV2::CompileUnsupported => {
@@ -502,7 +507,7 @@ mod mechanism {
                 );
             }
             if let Err(e) = move_new(
-                root,
+                op,
                 intent.reserved_name(ReservedNameNamespaceV2::Staging),
                 intent.parts().1,
                 label,
@@ -561,7 +566,7 @@ mod mechanism {
                 Ok(v) => v,
                 Err(e) => return debt(recovery, e),
             };
-            let intent_snap = match create_intent(root, &intent, None, label) {
+            let intent_snap = match create_intent(op, &intent, None, label) {
                 Ok(v) => v,
                 Err(e) => return debt(recovery, e),
             };
@@ -572,6 +577,9 @@ mod mechanism {
                 return debt(recovery, format!("{label}: interrupted after intent sync"));
             }
             hook(TransitionV2::BeforeCapture, intent.parts().1);
+            if let Err(error) = op.prove_route_v2(label) {
+                return debt(recovery, error);
+            }
             match capture(root, &intent, label) {
                 CustodyCaptureOutcomeV2::ExpectedCaptured(_) => {}
                 CustodyCaptureOutcomeV2::CompileUnsupported => {
@@ -624,7 +632,7 @@ mod mechanism {
                 }
             }
             if let Err(e) = remove(
-                op.root_file(),
+                op,
                 capture,
                 expected,
                 Some((TransitionV2::Retired, TransitionV2::ZeroLinkProved)),
@@ -679,7 +687,13 @@ mod mechanism {
                 reserved.push(name);
             }
             if reserved.is_empty() {
-                return NamespaceTransactionOutcomeV2::Ready;
+                return if op.debt() {
+                    NamespaceTransactionOutcomeV2::ProtectiveDebt(format!(
+                        "{label}: retained journal mutation debt"
+                    ))
+                } else {
+                    NamespaceTransactionOutcomeV2::Ready
+                };
             }
             if intents.len() != 1 {
                 return NamespaceTransactionOutcomeV2::ProtectiveDebt(format!(
@@ -733,7 +747,7 @@ mod mechanism {
                                 return debt(recovery, format!("{label}: stage changed"));
                             }
                             if let Err(e) = remove(
-                                root,
+                                op,
                                 intent.reserved_name(ReservedNameNamespaceV2::Staging),
                                 v,
                                 None,
@@ -756,7 +770,7 @@ mod mechanism {
                         && stage == Some(*intent.parts().3)
                     {
                         if let Err(e) = move_new(
-                            root,
+                            op,
                             intent.reserved_name(ReservedNameNamespaceV2::ReplacementCapture),
                             intent.parts().1,
                             label,
@@ -778,6 +792,9 @@ mod mechanism {
                         ) {
                             return debt(recovery, e);
                         }
+                        if hook(TransitionV2::TargetSynced, intent.parts().1) {
+                            return debt(recovery, format!("{label}: recovery interrupted"));
+                        }
                         return Self::finish(
                             op,
                             &intent,
@@ -792,7 +809,7 @@ mod mechanism {
                         && swap.map(|v| v.object) != Some(*intent.parts().2)
                     {
                         if let Err(e) = move_new(
-                            root,
+                            op,
                             intent.reserved_name(ReservedNameNamespaceV2::ReplacementCapture),
                             intent.parts().1,
                             label,
@@ -827,8 +844,8 @@ mod mechanism {
     mod tests {
         use super::*;
         use crate::fs_custody::{
-            required_object_identity_v2, BirthTimeV1, JournalRootBindingV2, JournalRootCustodyV2,
-            ObjectIdentityV2,
+            required_object_identity_v2, BirthTimeV1, JournalMutationOutcomeV2,
+            JournalRootBindingV2, JournalRootCustodyV2, ObjectIdentityV2,
         };
         use std::{
             fs,
@@ -931,6 +948,66 @@ mod mechanism {
             ));
             assert!(!case.root.join("target").exists());
             assert!(residue(&case).is_empty());
+        }
+
+        #[test]
+        fn namespace_transaction_recovery_debt_blocks_every_mutator_until_clean() {
+            let case = case();
+            let expected = case.expected();
+            assert!(matches!(
+                case.operate(|op| NamespaceTransactionV2::replace_with(
+                    op,
+                    target(),
+                    expected,
+                    b"B",
+                    "plant debt",
+                    |transition, _| transition == TransitionV2::IntentSynced,
+                )),
+                O::Retained(_, _)
+            ));
+            let target_snapshot = required_file_content_snapshot_v2(
+                &File::open(case.root.join("target")).unwrap(),
+                "target",
+            )
+            .unwrap();
+            let staged = required_file_content_snapshot_v2(
+                &File::open(
+                    case.root
+                        .join(reserved(ReservedNameNamespaceV2::Staging).as_os_str()),
+                )
+                .unwrap(),
+                "stage",
+            )
+            .unwrap();
+            let recovered = case.operate(|op| {
+                let other = ChildNameV2::from_bytes(b"other").unwrap();
+                for outcome in [
+                    op.stage(&other, b"x", "blocked"),
+                    op.publish(&target(), staged, "blocked"),
+                    op.append(&target(), target_snapshot, 1, b"x", "blocked"),
+                ] {
+                    assert!(matches!(
+                        outcome,
+                        Err(JournalMutationOutcomeV2::ProtectiveDebt(_))
+                    ));
+                }
+                assert!(matches!(
+                    op.sync("blocked"),
+                    JournalMutationOutcomeV2::ProtectiveDebt(_)
+                ));
+                for outcome in [
+                    NamespaceTransactionV2::replace(op, target(), expected, b"x", "blocked"),
+                    NamespaceTransactionV2::retire(op, target(), expected, "blocked"),
+                ] {
+                    assert!(matches!(outcome, O::ProtectiveDebt(_)));
+                }
+                NamespaceTransactionV2::recover(op, "recover debt")
+            });
+            assert!(matches!(recovered, O::NoEffect(_, _)));
+            assert_eq!(
+                case.operate(|op| NamespaceTransactionV2::recover(op, "clean")),
+                O::Ready
+            );
         }
 
         #[test]
@@ -1345,6 +1422,35 @@ mod mechanism {
                 .unwrap(),
                 b"A"
             );
+        }
+
+        #[test]
+        fn namespace_transaction_recovery_rechecks_target_before_finish() {
+            let case = case();
+            let expected = case.expected();
+            let _ = case.operate(|op| {
+                NamespaceTransactionV2::replace_with(
+                    op,
+                    target(),
+                    expected,
+                    b"B",
+                    "recovery setup",
+                    |transition, _| transition == TransitionV2::Published,
+                )
+            });
+            let root = case.root.clone();
+            let outcome = case.operate(|op| {
+                NamespaceTransactionV2::recover_with(op, "recovery recheck", |transition, _| {
+                    if transition == TransitionV2::TargetSynced {
+                        fs::write(root.join("target"), b"C").unwrap();
+                    }
+                    false
+                })
+            });
+            assert!(matches!(outcome, O::Retained(_, _)), "{outcome:?}");
+            assert_eq!(fs::read(case.root.join("target")).unwrap(), b"C");
+            let capture = reserved(ReservedNameNamespaceV2::ReplacementCapture);
+            assert_eq!(fs::read(case.root.join(capture.as_os_str())).unwrap(), b"A");
         }
 
         #[test]
