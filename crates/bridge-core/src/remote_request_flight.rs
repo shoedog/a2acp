@@ -6,17 +6,26 @@ use crate::{
         ReservedNameNamespaceV2,
     },
     ids::{AttemptId, AttemptIdentity, ExecutionId},
+    liveness::PersistentLockGuard,
     namespace_transaction::{NamespaceTransactionOutcomeV2, NamespaceTransactionV2},
-    resource_flight::{DedicatedRemoteRequestIdV1, ResourceActionDispositionV1},
+    resource_flight::{
+        DedicatedRemoteRequestIdV1, ResourceActionDispositionV1, ResourceActionResultV1,
+    },
     retained_resource_flight::ResourceFlightOwnerV1,
 };
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
-use std::{collections::BTreeSet, ops::Deref};
+use std::{
+    collections::BTreeSet,
+    ops::Deref,
+    path::PathBuf,
+    sync::{Arc, Mutex},
+};
 const SCHEMA: u8 = 1;
 const CAPACITY: usize = 4096;
 const ADMISSION_FOOTPRINT: usize = 3;
 const WIRE_CAP: usize = 4096;
 const CHECKPOINT_CHILD_V1: &str = "remote-request-checkpoint.json";
+const ATTEMPT_LEASE_CHILD_V1: &str = "remote-request-attempt.lock";
 const REQUEST_CHILD_PREFIX_V1: &str = "remote-request-authority-";
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TaskAProtectiveOutcomeV1 {
@@ -54,6 +63,14 @@ pub enum RemoteRequestFlightRefusalV1 {
     TaskA(TaskAProtectiveOutcomeV1, String),
     #[error("request journal requires B2 recovery: {0}")]
     ReopenRequired(&'static str),
+    #[error("request attempt is already live")]
+    AttemptLive,
+    #[error("terminal publication was refused: {0}")]
+    PublicationRefused(String),
+    #[error("terminal publication acknowledgement did not echo the delivery identity")]
+    PublicationAcknowledgementMismatch,
+    #[error("attempt admission mutex is poisoned")]
+    AdmissionMutexPoisoned,
 }
 type Refusal = RemoteRequestFlightRefusalV1;
 type FlightResult<T> = std::result::Result<T, Refusal>;
@@ -69,9 +86,61 @@ struct AttemptIdentityWireV1 {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
 enum ChildStateV1 {
+    #[serde(rename = "reserved")]
     Active {},
     PreSendFailure {},
-    TerminalAcknowledged {},
+    IntentJournaled {},
+    DispatchAuthorized {},
+    ProviderSendArmed {},
+    TerminalPendingPublication {
+        result: ResourceActionResultV1,
+        prompt_may_have_been_accepted: bool,
+    },
+    PublicationAcknowledged {
+        delivery_id: RemoteRequestDeliveryIdV1,
+    },
+}
+impl ChildStateV1 {
+    fn is_terminal_pending(&self) -> bool {
+        matches!(self, Self::TerminalPendingPublication { .. })
+    }
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RemoteRequestDeliveryIdV1 {
+    #[serde(with = "AttemptIdentityWireV1")]
+    attempt: AttemptIdentity,
+    ordinal: u64,
+    request_id: DedicatedRemoteRequestIdV1,
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RemoteRequestTerminalPublicationV1 {
+    delivery_id: RemoteRequestDeliveryIdV1,
+    result: ResourceActionResultV1,
+    prompt_may_have_been_accepted: bool,
+}
+impl RemoteRequestTerminalPublicationV1 {
+    #[must_use]
+    pub fn delivery_id(&self) -> &RemoteRequestDeliveryIdV1 {
+        &self.delivery_id
+    }
+    #[must_use]
+    pub fn result(&self) -> &ResourceActionResultV1 {
+        &self.result
+    }
+    #[must_use]
+    pub fn prompt_may_have_been_accepted(&self) -> bool {
+        self.prompt_may_have_been_accepted
+    }
+}
+/// Durable consumers must deduplicate on the complete delivery id before
+/// acknowledging it. Recovery may invoke this method again after a crash;
+/// exactly-once applies to the sink effect, not to callback count.
+pub trait RemoteRequestResultPublisherV1: Send + Sync {
+    fn publish_idempotent(
+        &self,
+        publication: &RemoteRequestTerminalPublicationV1,
+    ) -> Result<RemoteRequestDeliveryIdV1, String>;
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -112,6 +181,8 @@ struct CensusV1 {
     staged: bool,
 }
 pub struct RemoteRequestAuthorityV1 {
+    attempt: AttemptIdentity,
+    ordinal: u64,
     request_id: DedicatedRemoteRequestIdV1,
 }
 impl RemoteRequestAuthorityV1 {
@@ -119,12 +190,29 @@ impl RemoteRequestAuthorityV1 {
     pub fn request_id(&self) -> &DedicatedRemoteRequestIdV1 {
         &self.request_id
     }
+    fn delivery_id(&self) -> RemoteRequestDeliveryIdV1 {
+        RemoteRequestDeliveryIdV1 {
+            attempt: self.attempt.clone(),
+            ordinal: self.ordinal,
+            request_id: self.request_id.clone(),
+        }
+    }
 }
 pub struct RemoteRequestJournalV1 {
     custody: JournalRootCustodyV2,
     attempt: AttemptIdentity,
     capacity: usize,
     requires_reopen: bool,
+    publisher: Arc<dyn RemoteRequestResultPublisherV1>,
+    _attempt_lease: PersistentLockGuard,
+    admission_mutex: Mutex<()>,
+}
+fn delivery_id(wire: &RequestChildWireV1) -> RemoteRequestDeliveryIdV1 {
+    RemoteRequestDeliveryIdV1 {
+        attempt: wire.attempt.clone(),
+        ordinal: wire.ordinal,
+        request_id: wire.request_id.clone(),
+    }
 }
 fn hash<T: Serialize>(value: &T) -> Sha256HexV1 {
     Sha256HexV1::digest(&serde_json::to_vec(value).expect("journal digest input serializes"))
@@ -241,17 +329,14 @@ fn validate_owner(owner: &ResourceFlightOwnerV1) -> FlightResult<()> {
         .ok_or_else(|| Refusal::Malformed("invalid request owner".into()))
 }
 impl RemoteRequestJournalV1 {
-    pub fn initialize(
-        custody: JournalRootCustodyV2,
-        attempt: AttemptIdentity,
-    ) -> FlightResult<Self> {
+    pub fn initialize(custody: JournalRootCustodyV2, attempt: AttemptIdentity) -> FlightResult<()> {
         Self::initialize_with_capacity(custody, attempt, CAPACITY)
     }
     fn initialize_with_capacity(
         custody: JournalRootCustodyV2,
         attempt: AttemptIdentity,
         capacity: usize,
-    ) -> FlightResult<Self> {
+    ) -> FlightResult<()> {
         if !(ADMISSION_FOOTPRINT + 1..=CAPACITY).contains(&capacity) {
             return Err(RemoteRequestFlightRefusalV1::Capacity);
         }
@@ -268,32 +353,94 @@ impl RemoteRequestJournalV1 {
                     "request root is not empty".into(),
                 ));
             }
+            let lease_name = Self::attempt_lease_name();
+            let staged = mutation(op.stage(&lease_name, b"", "stage attempt lease"))?;
+            mutation(op.publish(&lease_name, staged, "publish attempt lease"))?;
             let checkpoint = checkpoint(&attempt, 0);
             let name = Self::checkpoint_name();
             let staged = mutation(op.stage(&name, &encoded(&checkpoint)?, "stage checkpoint"))?;
             mutation(op.publish(&name, staged, "publish checkpoint"))?;
-            sync(op.sync("sync checkpoint"))?;
+            sync(op.sync("sync initialized request root"))?;
         }
-        Ok(Self {
-            custody,
-            attempt,
-            capacity,
-            requires_reopen: false,
-        })
+        Ok(())
     }
+    #[cfg(test)]
     pub fn open(custody: JournalRootCustodyV2, attempt: AttemptIdentity) -> FlightResult<Self> {
         Self::open_with_capacity(custody, attempt, CAPACITY)
     }
+    #[cfg(test)]
     fn open_with_capacity(
         custody: JournalRootCustodyV2,
         attempt: AttemptIdentity,
         capacity: usize,
     ) -> FlightResult<Self> {
+        Self::open_base(
+            custody,
+            attempt,
+            capacity,
+            Arc::new(tests::TestAckPublisherV1::default()),
+        )
+    }
+    pub fn open_recovered(
+        custody: JournalRootCustodyV2,
+        attempt: AttemptIdentity,
+        capacity: usize,
+        publisher: Arc<dyn RemoteRequestResultPublisherV1>,
+    ) -> FlightResult<Self> {
+        let mut journal = Self::open_base(custody, attempt, capacity, publisher)?;
+        journal.recover_send_states()?;
+        Ok(journal)
+    }
+    fn attempt_lease_name() -> ChildNameV2 {
+        ChildNameV2::from_bytes(ATTEMPT_LEASE_CHILD_V1.as_bytes())
+            .expect("portable attempt lease name")
+    }
+    fn acquire_attempt_lease(custody: &JournalRootCustodyV2) -> FlightResult<PersistentLockGuard> {
+        let operation = custody
+            .begin_operation("open attempt lifetime lease")
+            .map_err(fs)?;
+        let name = Self::attempt_lease_name();
+        let file = open_regular_child(
+            operation.root_file(),
+            name.as_os_str(),
+            "open attempt lifetime lease",
+        )
+        .map_err(fs)?;
+        if required_file_content_snapshot_v2(&file, "attempt lifetime lease")
+            .map_err(fs)?
+            .content_len
+            != 0
+        {
+            return Err(Refusal::Malformed("attempt lease is not empty".into()));
+        }
+        drop(operation);
+        crate::liveness::acquire_persistent_lock_file(file, PathBuf::from(ATTEMPT_LEASE_CHILD_V1))
+            .map_err(|error| {
+                if error.kind() == std::io::ErrorKind::WouldBlock {
+                    Refusal::AttemptLive
+                } else {
+                    fs(FsCustodyError::Io("attempt lifetime lease".into(), error))
+                }
+            })
+    }
+    fn open_base(
+        custody: JournalRootCustodyV2,
+        attempt: AttemptIdentity,
+        capacity: usize,
+        publisher: Arc<dyn RemoteRequestResultPublisherV1>,
+    ) -> FlightResult<Self> {
+        if !(ADMISSION_FOOTPRINT + 1..=CAPACITY).contains(&capacity) {
+            return Err(Refusal::Capacity);
+        }
+        let attempt_lease = Self::acquire_attempt_lease(&custody)?;
         let journal = Self {
             custody,
             attempt,
             capacity,
             requires_reopen: false,
+            publisher,
+            _attempt_lease: attempt_lease,
+            admission_mutex: Mutex::new(()),
         };
         let operation = journal
             .custody
@@ -365,12 +512,21 @@ impl RemoteRequestJournalV1 {
             sync(operation.sync("sync healed checkpoint"))?;
         }
         for child in &census.children {
-            match child.status {
-                ChildStateV1::Active {} => {}
-                ChildStateV1::TerminalAcknowledged {} => {
+            match &child.status {
+                ChildStateV1::PublicationAcknowledged { delivery_id: ack }
+                    if *ack == delivery_id(child) =>
+                {
                     Self::retire_child(&operation, child, "retire acknowledged request")?
                 }
-                ChildStateV1::PreSendFailure {} => {}
+                ChildStateV1::PublicationAcknowledged { .. } => {
+                    return Err(Refusal::DigestMismatch("publication acknowledgement"))
+                }
+                ChildStateV1::Active {}
+                | ChildStateV1::PreSendFailure {}
+                | ChildStateV1::IntentJournaled {}
+                | ChildStateV1::DispatchAuthorized {}
+                | ChildStateV1::ProviderSendArmed {}
+                | ChildStateV1::TerminalPendingPublication { .. } => {}
             }
         }
         sync(operation.sync("sync reopened request root"))?;
@@ -470,6 +626,7 @@ impl RemoteRequestJournalV1 {
             return Err(RemoteRequestFlightRefusalV1::LegacyMigrationRequired);
         }
         let mut checkpoint = None;
+        let mut lease = false;
         let mut children = Vec::new();
         let mut staged = false;
         for raw in &names {
@@ -480,6 +637,19 @@ impl RemoteRequestJournalV1 {
                 .map_err(|error| RemoteRequestFlightRefusalV1::Malformed(format!("{error:?}")))?;
             if name == Self::checkpoint_name() {
                 checkpoint = Some(read_wire(op, &name)?);
+                continue;
+            }
+            if name == Self::attempt_lease_name() {
+                let file = open_regular_child(op.root_file(), name.as_os_str(), "attempt lease")
+                    .map_err(fs)?;
+                if required_file_content_snapshot_v2(&file, "attempt lease")
+                    .map_err(fs)?
+                    .content_len
+                    != 0
+                {
+                    return Err(Refusal::Malformed("attempt lease is not empty".into()));
+                }
+                lease = true;
                 continue;
             }
             let (read_name, final_name, is_staged) = if value.starts_with(REQUEST_CHILD_PREFIX_V1) {
@@ -527,6 +697,11 @@ impl RemoteRequestJournalV1 {
                     "non-canonical request identity".into(),
                 ));
             }
+            if let ChildStateV1::PublicationAcknowledged { delivery_id: ack } = &wire.status {
+                if *ack != delivery_id(&wire) {
+                    return Err(Refusal::DigestMismatch("publication acknowledgement"));
+                }
+            }
             if is_staged {
                 if std::mem::replace(&mut staged, true) {
                     return Err(RemoteRequestFlightRefusalV1::IdentityCollision);
@@ -537,6 +712,9 @@ impl RemoteRequestJournalV1 {
         }
         let (checkpoint, checkpoint_snapshot): (CheckpointWireV1, _) =
             checkpoint.ok_or_else(|| Refusal::Malformed("checkpoint is absent".into()))?;
+        if !lease {
+            return Err(Refusal::Malformed("attempt lease is absent".into()));
+        }
         self.validate_checkpoint(&checkpoint)?;
         let mut ordinals = BTreeSet::new();
         let mut requests = BTreeSet::new();
@@ -551,6 +729,215 @@ impl RemoteRequestJournalV1 {
             children,
             staged,
         })
+    }
+    fn authority_for(wire: &RequestChildWireV1) -> RemoteRequestAuthorityV1 {
+        RemoteRequestAuthorityV1 {
+            attempt: wire.attempt.clone(),
+            ordinal: wire.ordinal,
+            request_id: wire.request_id.clone(),
+        }
+    }
+    fn recovered_result(disposition: ResourceActionDispositionV1) -> ResourceActionResultV1 {
+        ResourceActionResultV1 {
+            disposition,
+            duration_ms: 0,
+            recovery_owner: None,
+            cause: None,
+        }
+    }
+    fn publication(child: &CensusChildV1) -> FlightResult<RemoteRequestTerminalPublicationV1> {
+        match &child.status {
+            ChildStateV1::TerminalPendingPublication {
+                result,
+                prompt_may_have_been_accepted,
+            } => Ok(RemoteRequestTerminalPublicationV1 {
+                delivery_id: delivery_id(child),
+                result: result.clone(),
+                prompt_may_have_been_accepted: *prompt_may_have_been_accepted,
+            }),
+            _ => Err(Refusal::InvalidStateTransition(
+                "request has no pending terminal publication",
+            )),
+        }
+    }
+    fn recover_send_states(&mut self) -> FlightResult<()> {
+        let operation = self
+            .custody
+            .begin_operation("recover remote request send states")
+            .map_err(fs)?;
+        let census = self.scan(&operation)?;
+        if census.staged {
+            return Err(Refusal::ReopenRequired("ambiguous staged child"));
+        }
+        let mut pending = Vec::new();
+        for child in &census.children {
+            let authority = Self::authority_for(child);
+            let recovered = match &child.status {
+                ChildStateV1::Active {}
+                | ChildStateV1::PreSendFailure {}
+                | ChildStateV1::IntentJournaled {}
+                | ChildStateV1::DispatchAuthorized {} => Some((
+                    Self::recovered_result(ResourceActionDispositionV1::Failed),
+                    false,
+                )),
+                ChildStateV1::ProviderSendArmed {} => Some((
+                    Self::recovered_result(ResourceActionDispositionV1::Unknown),
+                    true,
+                )),
+                ChildStateV1::TerminalPendingPublication { .. } => None,
+                ChildStateV1::PublicationAcknowledged { .. } => {
+                    Self::retire_child(
+                        &operation,
+                        child,
+                        "retire recovered publication acknowledgement",
+                    )?;
+                    continue;
+                }
+            };
+            if let Some((result, accepted)) = recovered {
+                Self::replace_child(
+                    &operation,
+                    child,
+                    ChildStateV1::TerminalPendingPublication {
+                        result,
+                        prompt_may_have_been_accepted: accepted,
+                    },
+                    "terminalize recovered request",
+                )?;
+            }
+            pending.push(authority);
+        }
+        sync(operation.sync("sync recovered send states"))?;
+        drop(operation);
+        for authority in pending {
+            self.publish_pending(&authority, None)?;
+        }
+        Ok(())
+    }
+    fn transition_state(
+        &mut self,
+        authority: &RemoteRequestAuthorityV1,
+        expected: fn(&ChildStateV1) -> bool,
+        successor: ChildStateV1,
+        label: &'static str,
+    ) -> FlightResult<()> {
+        if self.requires_reopen {
+            return Err(Refusal::ReopenRequired("prior transition was interrupted"));
+        }
+        let operation = self.custody.begin_operation(label).map_err(fs)?;
+        let census = self.scan(&operation)?;
+        let child = Self::child_for(&census, authority)?;
+        if !expected(&child.status) {
+            return Err(Refusal::InvalidStateTransition(label));
+        }
+        let result = Self::replace_child(&operation, child, successor, label);
+        drop(operation);
+        if result.is_err() {
+            self.requires_reopen = true;
+        }
+        result
+    }
+    pub fn record_intent(&mut self, authority: &RemoteRequestAuthorityV1) -> FlightResult<()> {
+        self.transition_state(
+            authority,
+            |state| matches!(state, ChildStateV1::Active {}),
+            ChildStateV1::IntentJournaled {},
+            "journal request intent",
+        )
+    }
+    pub fn authorize_dispatch(&mut self, authority: &RemoteRequestAuthorityV1) -> FlightResult<()> {
+        self.transition_state(
+            authority,
+            |state| matches!(state, ChildStateV1::IntentJournaled {}),
+            ChildStateV1::DispatchAuthorized {},
+            "authorize request dispatch",
+        )
+    }
+    pub fn arm_provider_send(&mut self, authority: &RemoteRequestAuthorityV1) -> FlightResult<()> {
+        self.transition_state(
+            authority,
+            |state| matches!(state, ChildStateV1::DispatchAuthorized {}),
+            ChildStateV1::ProviderSendArmed {},
+            "arm provider send",
+        )
+    }
+    pub fn settle(
+        &mut self,
+        authority: &RemoteRequestAuthorityV1,
+        result: ResourceActionResultV1,
+        prompt_may_have_been_accepted: bool,
+    ) -> FlightResult<()> {
+        self.settle_inner(authority, result, prompt_may_have_been_accepted, None)
+    }
+    fn settle_inner(
+        &mut self,
+        authority: &RemoteRequestAuthorityV1,
+        result: ResourceActionResultV1,
+        accepted: bool,
+        cut: Option<u8>,
+    ) -> FlightResult<()> {
+        let valid = if accepted {
+            |state: &ChildStateV1| matches!(state, ChildStateV1::ProviderSendArmed {})
+        } else {
+            |state: &ChildStateV1| {
+                matches!(
+                    state,
+                    ChildStateV1::Active {}
+                        | ChildStateV1::PreSendFailure {}
+                        | ChildStateV1::IntentJournaled {}
+                        | ChildStateV1::DispatchAuthorized {}
+                )
+            }
+        };
+        let outcome = (|| {
+            self.transition_state(
+                authority,
+                valid,
+                ChildStateV1::TerminalPendingPublication {
+                    result,
+                    prompt_may_have_been_accepted: accepted,
+                },
+                "persist terminal publication",
+            )?;
+            #[cfg(test)]
+            boundary(cut, 0, "before publisher callback")?;
+            self.publish_pending(authority, cut)
+        })();
+        if outcome.is_err() {
+            self.requires_reopen = true;
+        }
+        outcome
+    }
+    fn publish_pending(
+        &mut self,
+        authority: &RemoteRequestAuthorityV1,
+        _cut: Option<u8>,
+    ) -> FlightResult<()> {
+        let operation = self
+            .custody
+            .begin_operation("read pending terminal publication")
+            .map_err(fs)?;
+        let census = self.scan(&operation)?;
+        let publication = Self::publication(Self::child_for(&census, authority)?)?;
+        drop(operation);
+        let acknowledgement = self
+            .publisher
+            .publish_idempotent(&publication)
+            .map_err(Refusal::PublicationRefused)?;
+        if acknowledgement != *publication.delivery_id() {
+            return Err(Refusal::PublicationAcknowledgementMismatch);
+        }
+        self.transition_state(
+            authority,
+            ChildStateV1::is_terminal_pending,
+            ChildStateV1::PublicationAcknowledged {
+                delivery_id: acknowledgement,
+            },
+            "acknowledge terminal publication",
+        )?;
+        #[cfg(test)]
+        boundary(_cut, 1, "after publication acknowledgement")?;
+        self.retire_inner(authority, None)
     }
     pub fn admit(
         &mut self,
@@ -583,6 +970,10 @@ impl RemoteRequestJournalV1 {
                 "prior admission was interrupted",
             ));
         }
+        let _admission = self
+            .admission_mutex
+            .lock()
+            .map_err(|_| Refusal::AdmissionMutexPoisoned)?;
         let op = self
             .custody
             .begin_operation("admit remote request")
@@ -677,6 +1068,8 @@ impl RemoteRequestJournalV1 {
             #[cfg(not(test))]
             sync(checkpoint_synced)?;
             Ok(RemoteRequestAuthorityV1 {
+                attempt: wire.attempt,
+                ordinal: wire.ordinal,
                 request_id: wire.request_id,
             })
         })();
@@ -692,11 +1085,16 @@ impl RemoteRequestJournalV1 {
         census
             .children
             .iter()
-            .find(|child| child.request_id == *authority.request_id())
+            .find(|child| {
+                child.attempt == authority.attempt
+                    && child.ordinal == authority.ordinal
+                    && child.request_id == *authority.request_id()
+            })
             .ok_or(Refusal::InvalidStateTransition(
                 "request authority is absent",
             ))
     }
+    #[cfg(test)]
     pub fn acknowledge(
         &mut self,
         authority: &RemoteRequestAuthorityV1,
@@ -717,16 +1115,27 @@ impl RemoteRequestJournalV1 {
             return Err(Refusal::ReopenRequired("ambiguous staged child"));
         }
         let child = Self::child_for(&census, authority)?;
-        let result = match child.status {
+        let result = match &child.status {
             ChildStateV1::Active {} => Self::replace_child(
                 &op,
                 child,
-                ChildStateV1::TerminalAcknowledged {},
+                ChildStateV1::PublicationAcknowledged {
+                    delivery_id: authority.delivery_id(),
+                },
                 "acknowledge terminal request",
             ),
-            ChildStateV1::TerminalAcknowledged {} => Ok(()),
-            ChildStateV1::PreSendFailure {} => Err(Refusal::InvalidStateTransition(
-                "pre-send failure cannot be acknowledged",
+            ChildStateV1::PublicationAcknowledged { delivery_id }
+                if *delivery_id == authority.delivery_id() =>
+            {
+                Ok(())
+            }
+            ChildStateV1::PreSendFailure {}
+            | ChildStateV1::IntentJournaled {}
+            | ChildStateV1::DispatchAuthorized {}
+            | ChildStateV1::ProviderSendArmed {}
+            | ChildStateV1::TerminalPendingPublication { .. }
+            | ChildStateV1::PublicationAcknowledged { .. } => Err(Refusal::InvalidStateTransition(
+                "request cannot receive legacy acknowledgement",
             )),
         };
         drop(op);
@@ -735,6 +1144,7 @@ impl RemoteRequestJournalV1 {
         }
         result
     }
+    #[cfg(test)]
     pub fn retire(&mut self, authority: &RemoteRequestAuthorityV1) -> FlightResult<()> {
         self.retire_inner(authority, None)
     }
@@ -752,7 +1162,11 @@ impl RemoteRequestJournalV1 {
             .map_err(fs)?;
         let census = self.scan(&op)?;
         let child = Self::child_for(&census, authority)?;
-        if child.status != (ChildStateV1::TerminalAcknowledged {}) {
+        if !matches!(
+            &child.status,
+            ChildStateV1::PublicationAcknowledged { delivery_id }
+                if *delivery_id == authority.delivery_id()
+        ) {
             return Err(Refusal::InvalidStateTransition(
                 "request is not acknowledged",
             ));
@@ -804,6 +1218,20 @@ impl RemoteRequestJournalV1 {
         boundary: u8,
     ) -> FlightResult<()> {
         self.retire_inner(authority, Some(boundary))
+    }
+    fn settle_with_boundary(
+        &mut self,
+        authority: &RemoteRequestAuthorityV1,
+        result: ResourceActionResultV1,
+        prompt_may_have_been_accepted: bool,
+        boundary: u8,
+    ) -> FlightResult<()> {
+        self.settle_inner(
+            authority,
+            result,
+            prompt_may_have_been_accepted,
+            Some(boundary),
+        )
     }
 }
 #[cfg(test)]
@@ -942,8 +1370,35 @@ mod tests {
             JournalRootBindingV2, ObjectIdentityV2,
         },
         ids::{AttemptId, ExecutionId, NodeId},
+        resource_flight::ResourceActionResultV1,
     };
-    use std::{fs, fs::File, os::unix::fs::MetadataExt as _, path::PathBuf};
+    use std::{
+        collections::VecDeque,
+        fs,
+        fs::File,
+        os::unix::fs::MetadataExt as _,
+        path::PathBuf,
+        sync::{Arc, Mutex},
+    };
+    #[derive(Default)]
+    pub(super) struct TestAckPublisherV1 {
+        committed: Mutex<BTreeSet<Vec<u8>>>,
+    }
+    impl RemoteRequestResultPublisherV1 for TestAckPublisherV1 {
+        fn publish_idempotent(
+            &self,
+            publication: &RemoteRequestTerminalPublicationV1,
+        ) -> Result<RemoteRequestDeliveryIdV1, String> {
+            self.committed
+                .lock()
+                .map_err(|_| "test sink lock poisoned".to_owned())?
+                .insert(
+                    serde_json::to_vec(publication.delivery_id())
+                        .map_err(|error| error.to_string())?,
+                );
+            Ok(publication.delivery_id().clone())
+        }
+    }
     struct Case {
         _temp: tempfile::TempDir,
         anchor: PathBuf,
@@ -1015,7 +1470,8 @@ mod tests {
         JournalRootCustodyV2::open(&case.anchor, &case.binding, "request journal").unwrap()
     }
     fn initialized(case: &Case, cap: usize) -> RemoteRequestJournalV1 {
-        RemoteRequestJournalV1::initialize_with_capacity(custody(case), attempt(), cap).unwrap()
+        RemoteRequestJournalV1::initialize_with_capacity(custody(case), attempt(), cap).unwrap();
+        RemoteRequestJournalV1::open_with_capacity(custody(case), attempt(), cap).unwrap()
     }
     fn request_paths(case: &Case) -> Vec<PathBuf> {
         fs::read_dir(&case.root)
@@ -1043,13 +1499,13 @@ mod tests {
         entries.sort_by(|left, right| left.0.cmp(&right.0));
         entries
     }
-    fn unchecked(case: &Case, capacity: usize) -> RemoteRequestJournalV1 {
-        RemoteRequestJournalV1 {
-            custody: custody(case),
-            attempt: attempt(),
+    fn unchecked(case: &Case, capacity: usize) -> FlightResult<RemoteRequestJournalV1> {
+        RemoteRequestJournalV1::open_recovered(
+            custody(case),
+            attempt(),
             capacity,
-            requires_reopen: false,
-        }
+            Arc::new(TestAckPublisherV1::default()),
+        )
     }
     fn child(case: &Case) -> (PathBuf, RequestChildWireV1) {
         let path = request_paths(case).pop().unwrap();
@@ -1186,10 +1642,10 @@ mod tests {
             let before = root_bytes(&case);
             let mut minted = 0;
             assert!(matches!(
-                unchecked(&case, 16).admit_with(owner(1), || {
+                unchecked(&case, 16).and_then(|mut journal| journal.admit_with(owner(1), || {
                     minted += 1;
                     Ok(request(1))
-                }),
+                })),
                 Err(RemoteRequestFlightRefusalV1::Malformed(_))
             ));
             assert_eq!(minted, 0);
@@ -1394,10 +1850,10 @@ mod tests {
             let before = root_bytes(&case);
             let mut minted = 0;
             assert!(unchecked(&case, 16)
-                .admit_with(owner(1), || {
+                .and_then(|mut journal| journal.admit_with(owner(1), || {
                     minted += 1;
                     Ok(request(1))
-                })
+                }))
                 .is_err());
             assert_eq!(minted, 0);
             assert_eq!(
@@ -1421,10 +1877,10 @@ mod tests {
         let before = root_bytes(&case);
         let mut minted = 0;
         assert!(unchecked(&case, 16)
-            .admit_with(owner(1), || {
+            .and_then(|mut journal| journal.admit_with(owner(1), || {
                 minted += 1;
                 Ok(request(1))
-            })
+            }))
             .is_err());
         assert_eq!(minted, 0);
         assert_eq!(root_bytes(&case), before);
@@ -1616,8 +2072,10 @@ mod tests {
     fn remote_request_flight_foreign_checkpoint_precedes_task_a_recovery() {
         let case = case();
         let foreign = foreign_attempt();
+        RemoteRequestJournalV1::initialize_with_capacity(custody(&case), foreign.clone(), 16)
+            .unwrap();
         let mut journal =
-            RemoteRequestJournalV1::initialize_with_capacity(custody(&case), foreign.clone(), 16)
+            RemoteRequestJournalV1::open_with_capacity(custody(&case), foreign.clone(), 16)
                 .unwrap();
         journal.admit_with(owner(0), || Ok(request(0))).unwrap();
         drop(journal);
@@ -1672,7 +2130,10 @@ mod tests {
                 assert_eq!(root_bytes(&case), before);
             }
             journal.acknowledge(&authority, D::Complete).unwrap();
-            assert_eq!(child(&case).1.status, ChildStateV1::TerminalAcknowledged {});
+            assert!(matches!(
+                child(&case).1.status,
+                ChildStateV1::PublicationAcknowledged { .. }
+            ));
             journal.retire(&authority).unwrap();
             assert!(request_paths(&case).is_empty());
             let op = journal
@@ -1808,5 +2269,276 @@ mod tests {
             assert_ne!(root_bytes(&retire_case), before);
             assert!(request_paths(&retire_case).is_empty());
         }
+    }
+
+    #[derive(Clone, Copy)]
+    enum PublisherReply {
+        Echo,
+        Mismatch,
+        Refuse,
+    }
+
+    #[derive(Default)]
+    struct RecordingPublisher {
+        replies: Mutex<VecDeque<PublisherReply>>,
+        calls: Mutex<Vec<RemoteRequestTerminalPublicationV1>>,
+        committed: Mutex<BTreeSet<Vec<u8>>>,
+    }
+
+    impl RecordingPublisher {
+        fn with_replies(replies: impl IntoIterator<Item = PublisherReply>) -> Arc<Self> {
+            Arc::new(Self {
+                replies: Mutex::new(replies.into_iter().collect()),
+                ..Self::default()
+            })
+        }
+
+        fn calls(&self) -> Vec<RemoteRequestTerminalPublicationV1> {
+            self.calls.lock().unwrap().clone()
+        }
+
+        fn committed_len(&self) -> usize {
+            self.committed.lock().unwrap().len()
+        }
+    }
+
+    impl RemoteRequestResultPublisherV1 for RecordingPublisher {
+        fn publish_idempotent(
+            &self,
+            publication: &RemoteRequestTerminalPublicationV1,
+        ) -> Result<RemoteRequestDeliveryIdV1, String> {
+            self.calls.lock().unwrap().push(publication.clone());
+            self.committed
+                .lock()
+                .unwrap()
+                .insert(serde_json::to_vec(publication.delivery_id()).unwrap());
+            match self
+                .replies
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or(PublisherReply::Echo)
+            {
+                PublisherReply::Echo => Ok(publication.delivery_id().clone()),
+                PublisherReply::Mismatch => {
+                    let mut mismatched = publication.delivery_id().clone();
+                    mismatched.ordinal = mismatched.ordinal.checked_add(1).unwrap();
+                    Ok(mismatched)
+                }
+                PublisherReply::Refuse => Err("injected publication refusal".into()),
+            }
+        }
+    }
+
+    fn terminal(disposition: ResourceActionDispositionV1) -> ResourceActionResultV1 {
+        ResourceActionResultV1 {
+            disposition,
+            duration_ms: 0,
+            recovery_owner: None,
+            cause: None,
+        }
+    }
+
+    fn initialize_root(case: &Case, attempt: AttemptIdentity, capacity: usize) {
+        RemoteRequestJournalV1::initialize_with_capacity(custody(case), attempt, capacity).unwrap();
+    }
+
+    fn open_recovered(
+        case: &Case,
+        attempt: AttemptIdentity,
+        capacity: usize,
+        publisher: Arc<RecordingPublisher>,
+    ) -> FlightResult<RemoteRequestJournalV1> {
+        RemoteRequestJournalV1::open_recovered(custody(case), attempt, capacity, publisher)
+    }
+
+    #[test]
+    fn remote_request_flight_task_c_recovers_every_durable_prefix_without_resend() {
+        use ResourceActionDispositionV1 as D;
+
+        for prefix in 0..5 {
+            let case = case();
+            let publisher = RecordingPublisher::with_replies([]);
+            initialize_root(&case, attempt(), 16);
+            let mut journal = open_recovered(&case, attempt(), 16, publisher.clone()).unwrap();
+            let authority = journal.admit_with(owner(0), || Ok(request(0))).unwrap();
+            if prefix >= 1 {
+                journal.record_intent(&authority).unwrap();
+            }
+            if prefix >= 2 {
+                journal.authorize_dispatch(&authority).unwrap();
+            }
+            if prefix >= 3 {
+                journal.arm_provider_send(&authority).unwrap();
+            }
+            if prefix == 4 {
+                assert!(journal
+                    .settle_with_boundary(&authority, terminal(D::Partial), true, 0)
+                    .is_err());
+            }
+            drop(journal);
+
+            drop(open_recovered(&case, attempt(), 16, publisher.clone()).unwrap());
+            let calls = publisher.calls();
+            assert_eq!(calls.len(), 1, "prefix {prefix}");
+            let expected = match prefix {
+                0..=2 => (D::Failed, false),
+                3 => (D::Unknown, true),
+                _ => (D::Partial, true),
+            };
+            assert_eq!(
+                (
+                    calls[0].result().disposition.clone(),
+                    calls[0].prompt_may_have_been_accepted()
+                ),
+                expected,
+                "prefix {prefix}"
+            );
+            assert!(request_paths(&case).is_empty(), "prefix {prefix}");
+
+            drop(open_recovered(&case, attempt(), 16, publisher.clone()).unwrap());
+            assert_eq!(publisher.calls().len(), 1, "prefix {prefix} replayed");
+        }
+    }
+
+    #[test]
+    fn remote_request_flight_task_c_attempt_lease_excludes_and_releases() {
+        let case = case();
+        let publisher = RecordingPublisher::with_replies([]);
+        initialize_root(&case, attempt(), 16);
+        let first = open_recovered(&case, attempt(), 16, publisher.clone()).unwrap();
+        let before = root_bytes(&case);
+        assert!(matches!(
+            open_recovered(&case, attempt(), 16, publisher.clone()),
+            Err(RemoteRequestFlightRefusalV1::AttemptLive)
+        ));
+        assert_eq!(root_bytes(&case), before);
+        drop(first);
+        drop(open_recovered(&case, attempt(), 16, publisher).unwrap());
+    }
+
+    #[test]
+    fn remote_request_flight_task_c_old_or_corrupt_lease_is_nonmutating() {
+        for nonempty in [false, true] {
+            let case = case();
+            initialize_root(&case, attempt(), 16);
+            let lease = case.root.join(ATTEMPT_LEASE_CHILD_V1);
+            if nonempty {
+                fs::write(&lease, b"corrupt").unwrap();
+            } else {
+                fs::remove_file(&lease).unwrap();
+            }
+            let before = root_bytes(&case);
+            assert!(
+                open_recovered(&case, attempt(), 16, RecordingPublisher::with_replies([]),)
+                    .is_err()
+            );
+            assert_eq!(root_bytes(&case), before);
+        }
+    }
+
+    #[test]
+    fn remote_request_flight_task_c_pending_outbox_replays_until_exact_ack() {
+        use ResourceActionDispositionV1 as D;
+
+        for first_reply in [PublisherReply::Refuse, PublisherReply::Mismatch] {
+            let case = case();
+            let publisher = RecordingPublisher::with_replies([first_reply, PublisherReply::Echo]);
+            initialize_root(&case, attempt(), 16);
+            let mut journal = open_recovered(&case, attempt(), 16, publisher.clone()).unwrap();
+            let authority = journal.admit_with(owner(0), || Ok(request(0))).unwrap();
+            journal.record_intent(&authority).unwrap();
+            journal.authorize_dispatch(&authority).unwrap();
+            journal.arm_provider_send(&authority).unwrap();
+            assert!(journal
+                .settle_with_boundary(&authority, terminal(D::Complete), true, 0)
+                .is_err());
+            drop(journal);
+
+            let first = open_recovered(&case, attempt(), 16, publisher.clone());
+            assert!(matches!(
+                first,
+                Err(RemoteRequestFlightRefusalV1::PublicationRefused(_))
+                    | Err(RemoteRequestFlightRefusalV1::PublicationAcknowledgementMismatch)
+            ));
+            assert!(child(&case).1.status.is_terminal_pending());
+            drop(open_recovered(&case, attempt(), 16, publisher.clone()).unwrap());
+            assert_eq!(publisher.calls().len(), 2);
+            assert_eq!(publisher.committed_len(), 1);
+            assert!(request_paths(&case).is_empty());
+        }
+
+        let case = case();
+        let publisher = RecordingPublisher::with_replies([]);
+        initialize_root(&case, attempt(), 16);
+        let mut journal = open_recovered(&case, attempt(), 16, publisher.clone()).unwrap();
+        let authority = journal.admit_with(owner(0), || Ok(request(0))).unwrap();
+        assert!(journal
+            .settle_with_boundary(&authority, terminal(D::Failed), false, 1)
+            .is_err());
+        drop(journal);
+        assert_eq!(publisher.calls().len(), 1);
+        drop(open_recovered(&case, attempt(), 16, publisher.clone()).unwrap());
+        assert_eq!(publisher.calls().len(), 1);
+        assert!(request_paths(&case).is_empty());
+    }
+
+    #[test]
+    fn remote_request_flight_task_c_invalid_transition_is_nonmutating() {
+        let case = case();
+        let publisher = RecordingPublisher::with_replies([]);
+        initialize_root(&case, attempt(), 16);
+        let mut journal = open_recovered(&case, attempt(), 16, publisher).unwrap();
+        let authority = journal.admit_with(owner(0), || Ok(request(0))).unwrap();
+        let before = root_bytes(&case);
+        assert!(matches!(
+            journal.arm_provider_send(&authority),
+            Err(RemoteRequestFlightRefusalV1::InvalidStateTransition(_))
+        ));
+        assert_eq!(root_bytes(&case), before);
+    }
+
+    #[test]
+    fn remote_request_flight_task_c_pending_row_is_strict_and_nonmutating() {
+        use ResourceActionDispositionV1 as D;
+
+        let case = case();
+        let publisher = RecordingPublisher::with_replies([]);
+        initialize_root(&case, attempt(), 16);
+        let mut journal = open_recovered(&case, attempt(), 16, publisher.clone()).unwrap();
+        let authority = journal.admit_with(owner(0), || Ok(request(0))).unwrap();
+        assert!(journal
+            .settle_with_boundary(&authority, terminal(D::Failed), false, 0)
+            .is_err());
+        drop(journal);
+
+        let (path, wire) = child(&case);
+        let mut value = serde_json::to_value(wire).unwrap();
+        value["status"]["unexpected"] = serde_json::Value::Bool(true);
+        fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+        let before = root_bytes(&case);
+        assert!(open_recovered(&case, attempt(), 16, publisher).is_err());
+        assert_eq!(root_bytes(&case), before);
+    }
+
+    #[test]
+    fn remote_request_flight_task_c_full_binding_never_aliases_attempts() {
+        let left = case();
+        let right = case();
+        let publisher = RecordingPublisher::with_replies([]);
+        initialize_root(&left, attempt(), 16);
+        initialize_root(&right, foreign_attempt(), 16);
+        let mut left_journal = open_recovered(&left, attempt(), 16, publisher.clone()).unwrap();
+        let mut right_journal =
+            open_recovered(&right, foreign_attempt(), 16, publisher.clone()).unwrap();
+        let left_authority = left_journal
+            .admit_with(owner(0), || Ok(request(0)))
+            .unwrap();
+        let right_authority = right_journal
+            .admit_with(owner(0), || Ok(request(0)))
+            .unwrap();
+        assert_eq!(left_authority.request_id, right_authority.request_id);
+        assert_ne!(left_authority.attempt, right_authority.attempt);
+        assert_ne!(left_authority.delivery_id(), right_authority.delivery_id());
     }
 }
