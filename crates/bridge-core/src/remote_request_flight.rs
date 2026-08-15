@@ -16,8 +16,14 @@ use crate::{
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::{
     collections::BTreeSet,
+    future::Future,
     ops::Deref,
-    sync::{Arc, Mutex},
+    pin::Pin,
+    sync::{
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        Arc, Mutex, MutexGuard,
+    },
+    task::{Context, Poll},
 };
 const SCHEMA: u8 = 1;
 const CAPACITY: usize = 4096;
@@ -70,6 +76,12 @@ pub enum RemoteRequestFlightRefusalV1 {
     PublicationAcknowledgementMismatch,
     #[error("attempt admission mutex is poisoned")]
     AdmissionMutexPoisoned,
+    #[error("owned request journal mutex is poisoned")]
+    RequestMutexPoisoned,
+    #[error("terminal observation deadline elapsed")]
+    ObservationTimedOut,
+    #[error("terminal observation closed without an outcome")]
+    ObservationClosed,
 }
 type Refusal = RemoteRequestFlightRefusalV1;
 type FlightResult<T> = std::result::Result<T, Refusal>;
@@ -130,6 +142,29 @@ impl RemoteRequestTerminalPublicationV1 {
     #[must_use]
     pub fn prompt_may_have_been_accepted(&self) -> bool {
         self.prompt_may_have_been_accepted
+    }
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RemoteRequestTerminalOutcomeV1 {
+    publication: RemoteRequestTerminalPublicationV1,
+}
+impl RemoteRequestTerminalOutcomeV1 {
+    #[must_use]
+    pub fn delivery_id(&self) -> &RemoteRequestDeliveryIdV1 {
+        self.publication.delivery_id()
+    }
+    #[must_use]
+    pub fn result(&self) -> &ResourceActionResultV1 {
+        self.publication.result()
+    }
+    #[must_use]
+    pub fn prompt_may_have_been_accepted(&self) -> bool {
+        self.publication.prompt_may_have_been_accepted()
+    }
+}
+impl From<RemoteRequestTerminalPublicationV1> for RemoteRequestTerminalOutcomeV1 {
+    fn from(publication: RemoteRequestTerminalPublicationV1) -> Self {
+        Self { publication }
     }
 }
 /// Durable consumers must deduplicate on the complete delivery id before
@@ -205,6 +240,50 @@ pub struct RemoteRequestJournalV1 {
     publisher: Arc<dyn RemoteRequestResultPublisherV1>,
     _attempt_lease: PersistentLockGuard,
     admission_mutex: Mutex<()>,
+}
+pub struct RemoteRequestDriverV1 {
+    journal: Arc<Mutex<RemoteRequestJournalV1>>,
+}
+pub struct OwnedRemoteRequestV1 {
+    journal: Arc<Mutex<RemoteRequestJournalV1>>,
+    authority: RemoteRequestAuthorityV1,
+    outcome_tx: tokio::sync::watch::Sender<Option<RemoteRequestTerminalOutcomeV1>>,
+    live_waiters: Arc<AtomicUsize>,
+    provider_send_armed: AtomicBool,
+    settlement_attempted: AtomicBool,
+    publication_claimed: AtomicBool,
+    publication_complete: AtomicBool,
+}
+pub struct RemoteRequestObserverV1 {
+    outcome_rx: tokio::sync::watch::Receiver<Option<RemoteRequestTerminalOutcomeV1>>,
+    live_waiters: Arc<AtomicUsize>,
+}
+pub struct ArmedProviderSendV1<'a, F> {
+    request: &'a OwnedRemoteRequestV1,
+    inner: Option<Pin<Box<F>>>,
+    arm_attempted: bool,
+}
+struct LiveWaiterGuardV1 {
+    live_waiters: Arc<AtomicUsize>,
+}
+impl Drop for LiveWaiterGuardV1 {
+    fn drop(&mut self) {
+        self.live_waiters.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+fn failed_before_send() -> ResourceActionResultV1 {
+    ResourceActionResultV1 {
+        disposition: ResourceActionDispositionV1::Failed,
+        duration_ms: 0,
+        recovery_owner: None,
+        cause: None,
+    }
+}
+fn unknown_after_arm() -> ResourceActionResultV1 {
+    ResourceActionResultV1 {
+        disposition: ResourceActionDispositionV1::Unknown,
+        ..failed_before_send()
+    }
 }
 fn delivery_id(wire: &RequestChildWireV1) -> RemoteRequestDeliveryIdV1 {
     RemoteRequestDeliveryIdV1 {
@@ -835,9 +914,18 @@ impl RemoteRequestJournalV1 {
         if !expected(&child.status) {
             return Err(Refusal::InvalidStateTransition(label));
         }
+        #[cfg(test)]
+        if label == "arm provider send" {
+            if let Some(injected) = take_task_a_boundary(TaskABoundaryV1::Replace) {
+                drop(operation);
+                return injected_task_a_no_effect(injected);
+            }
+        }
         let result = Self::replace_child(&operation, child, successor, label);
         drop(operation);
-        if result.is_err() {
+        if result.as_ref().is_err_and(|error| {
+            !matches!(error, Refusal::TaskA(TaskAProtectiveOutcomeV1::Refused, _))
+        }) {
             self.requires_reopen = true;
         }
         result
@@ -874,6 +962,62 @@ impl RemoteRequestJournalV1 {
     ) -> FlightResult<()> {
         self.settle_inner(authority, result, prompt_may_have_been_accepted, None)
     }
+    fn terminal_winner(
+        &mut self,
+        authority: &RemoteRequestAuthorityV1,
+        result: ResourceActionResultV1,
+        accepted: bool,
+    ) -> FlightResult<RemoteRequestTerminalPublicationV1> {
+        if self.requires_reopen {
+            return Err(Refusal::ReopenRequired("prior transition was interrupted"));
+        }
+        let operation = self
+            .custody
+            .begin_operation("persist terminal publication")
+            .map_err(fs)?;
+        let census = self.scan(&operation)?;
+        let child = Self::child_for(&census, authority)?;
+        if child.status.is_terminal_pending() {
+            return Self::publication(child);
+        }
+        let valid = if accepted {
+            matches!(child.status, ChildStateV1::ProviderSendArmed {})
+        } else {
+            matches!(
+                child.status,
+                ChildStateV1::Active {}
+                    | ChildStateV1::PreSendFailure {}
+                    | ChildStateV1::IntentJournaled {}
+                    | ChildStateV1::DispatchAuthorized {}
+            )
+        };
+        if !valid {
+            return Err(Refusal::InvalidStateTransition(
+                "persist terminal publication",
+            ));
+        }
+        let publication = RemoteRequestTerminalPublicationV1 {
+            delivery_id: authority.delivery_id(),
+            result: result.clone(),
+            prompt_may_have_been_accepted: accepted,
+        };
+        let replaced = Self::replace_child(
+            &operation,
+            child,
+            ChildStateV1::TerminalPendingPublication {
+                result,
+                prompt_may_have_been_accepted: accepted,
+            },
+            "persist terminal publication",
+        );
+        drop(operation);
+        if replaced.as_ref().is_err_and(|error| {
+            !matches!(error, Refusal::TaskA(TaskAProtectiveOutcomeV1::Refused, _))
+        }) {
+            self.requires_reopen = true;
+        }
+        replaced.map(|()| publication)
+    }
     fn settle_inner(
         &mut self,
         authority: &RemoteRequestAuthorityV1,
@@ -881,32 +1025,11 @@ impl RemoteRequestJournalV1 {
         accepted: bool,
         cut: Option<u8>,
     ) -> FlightResult<()> {
-        let valid = if accepted {
-            |state: &ChildStateV1| matches!(state, ChildStateV1::ProviderSendArmed {})
-        } else {
-            |state: &ChildStateV1| {
-                matches!(
-                    state,
-                    ChildStateV1::Active {}
-                        | ChildStateV1::PreSendFailure {}
-                        | ChildStateV1::IntentJournaled {}
-                        | ChildStateV1::DispatchAuthorized {}
-                )
-            }
-        };
         let outcome = (|| {
-            self.transition_state(
-                authority,
-                valid,
-                ChildStateV1::TerminalPendingPublication {
-                    result,
-                    prompt_may_have_been_accepted: accepted,
-                },
-                "persist terminal publication",
-            )?;
+            let publication = self.terminal_winner(authority, result, accepted)?;
             #[cfg(test)]
             boundary(cut, 0, "before publisher callback")?;
-            self.publish_pending(authority, cut)
+            self.publish_publication(authority, publication, cut)
         })();
         if outcome.is_err() {
             self.requires_reopen = true;
@@ -925,6 +1048,14 @@ impl RemoteRequestJournalV1 {
         let census = self.scan(&operation)?;
         let publication = Self::publication(Self::child_for(&census, authority)?)?;
         drop(operation);
+        self.publish_publication(authority, publication, _cut)
+    }
+    fn publish_publication(
+        &mut self,
+        authority: &RemoteRequestAuthorityV1,
+        publication: RemoteRequestTerminalPublicationV1,
+        cut: Option<u8>,
+    ) -> FlightResult<()> {
         let acknowledgement = self
             .publisher
             .publish_idempotent(&publication)
@@ -932,6 +1063,14 @@ impl RemoteRequestJournalV1 {
         if acknowledgement != *publication.delivery_id() {
             return Err(Refusal::PublicationAcknowledgementMismatch);
         }
+        self.finish_publication(authority, acknowledgement, cut)
+    }
+    fn finish_publication(
+        &mut self,
+        authority: &RemoteRequestAuthorityV1,
+        acknowledgement: RemoteRequestDeliveryIdV1,
+        _cut: Option<u8>,
+    ) -> FlightResult<()> {
         self.transition_state(
             authority,
             ChildStateV1::is_terminal_pending,
@@ -984,6 +1123,15 @@ impl RemoteRequestJournalV1 {
             .begin_operation("admit remote request")
             .map_err(fs)?;
         let census = self.scan(&op)?;
+        if census.children.iter().any(|child| {
+            matches!(
+                child.status,
+                ChildStateV1::TerminalPendingPublication { .. }
+                    | ChildStateV1::PublicationAcknowledged { .. }
+            )
+        }) {
+            return Err(Refusal::ReopenRequired("terminal publication is pending"));
+        }
         if census.staged
             || census.children.len().saturating_add(ADMISSION_FOOTPRINT) >= self.capacity
         {
@@ -1198,6 +1346,242 @@ impl RemoteRequestJournalV1 {
         result
     }
 }
+impl RemoteRequestDriverV1 {
+    pub fn open_recovered(
+        custody: JournalRootCustodyV2,
+        attempt: AttemptIdentity,
+        capacity: usize,
+        publisher: Arc<dyn RemoteRequestResultPublisherV1>,
+    ) -> FlightResult<Self> {
+        Ok(Self {
+            journal: Arc::new(Mutex::new(RemoteRequestJournalV1::open_recovered(
+                custody, attempt, capacity, publisher,
+            )?)),
+        })
+    }
+
+    fn lock(&self) -> FlightResult<MutexGuard<'_, RemoteRequestJournalV1>> {
+        self.journal
+            .lock()
+            .map_err(|_| Refusal::RequestMutexPoisoned)
+    }
+
+    pub fn admit(&self, owner: ResourceFlightOwnerV1) -> FlightResult<OwnedRemoteRequestV1> {
+        let authority = self.lock()?.admit(owner)?;
+        let (outcome_tx, initial_receiver) = tokio::sync::watch::channel(None);
+        drop(initial_receiver);
+        Ok(OwnedRemoteRequestV1 {
+            journal: Arc::clone(&self.journal),
+            authority,
+            outcome_tx,
+            live_waiters: Arc::new(AtomicUsize::new(0)),
+            provider_send_armed: AtomicBool::new(false),
+            settlement_attempted: AtomicBool::new(false),
+            publication_claimed: AtomicBool::new(false),
+            publication_complete: AtomicBool::new(false),
+        })
+    }
+}
+impl OwnedRemoteRequestV1 {
+    fn lock(&self) -> FlightResult<MutexGuard<'_, RemoteRequestJournalV1>> {
+        self.journal
+            .lock()
+            .map_err(|_| Refusal::RequestMutexPoisoned)
+    }
+
+    #[must_use]
+    pub fn request_id(&self) -> &DedicatedRemoteRequestIdV1 {
+        self.authority.request_id()
+    }
+
+    pub fn journal_intent(&self) -> FlightResult<()> {
+        self.lock()?.record_intent(&self.authority)
+    }
+
+    pub fn authorize_dispatch(&self) -> FlightResult<()> {
+        self.lock()?.authorize_dispatch(&self.authority)
+    }
+
+    #[must_use]
+    pub fn arm_provider_send<F>(&self, future: F) -> ArmedProviderSendV1<'_, F>
+    where
+        F: Future,
+    {
+        ArmedProviderSendV1 {
+            request: self,
+            inner: Some(Box::pin(future)),
+            arm_attempted: false,
+        }
+    }
+
+    fn arm_now(&self) -> FlightResult<()> {
+        self.lock()?.arm_provider_send(&self.authority)?;
+        self.provider_send_armed.store(true, Ordering::Release);
+        Ok(())
+    }
+
+    #[must_use]
+    pub fn observer(&self) -> RemoteRequestObserverV1 {
+        RemoteRequestObserverV1 {
+            outcome_rx: self.outcome_tx.subscribe(),
+            live_waiters: Arc::clone(&self.live_waiters),
+        }
+    }
+
+    #[must_use]
+    pub fn live_waiters(&self) -> usize {
+        self.live_waiters.load(Ordering::Acquire)
+    }
+
+    pub fn settle(
+        &self,
+        result: ResourceActionResultV1,
+    ) -> FlightResult<RemoteRequestTerminalOutcomeV1> {
+        let accepted = self.provider_send_armed.load(Ordering::Acquire);
+        self.settle_with_acceptance(result, accepted)
+    }
+
+    fn settle_with_acceptance(
+        &self,
+        result: ResourceActionResultV1,
+        accepted: bool,
+    ) -> FlightResult<RemoteRequestTerminalOutcomeV1> {
+        self.settlement_attempted.store(true, Ordering::Release);
+        let prior = { self.outcome_tx.borrow().clone() };
+        let (outcome, publication) = if let Some(outcome) = prior {
+            let publication = outcome.publication.clone();
+            (outcome, publication)
+        } else {
+            let mut journal = self.lock()?;
+            // A peer may have won while this caller waited for the journal.
+            // Recheck under the same mutex that serializes durable CAS so the
+            // winner is visible before its outbox can retire the row.
+            let observed = { self.outcome_tx.borrow().clone() };
+            let selected = if let Some(outcome) = observed {
+                let publication = outcome.publication.clone();
+                (outcome, publication)
+            } else {
+                let publication = journal.terminal_winner(&self.authority, result, accepted)?;
+                let outcome = RemoteRequestTerminalOutcomeV1::from(publication.clone());
+                self.outcome_tx.send_replace(Some(outcome.clone()));
+                (outcome, publication)
+            };
+            // The external publisher path reacquires this mutex only after
+            // invoking its callback; make that lifetime structural here.
+            drop(journal);
+            selected
+        };
+        self.drive_publication(publication)?;
+        Ok(outcome)
+    }
+
+    fn drive_publication(
+        &self,
+        publication: RemoteRequestTerminalPublicationV1,
+    ) -> FlightResult<()> {
+        if self.publication_complete.load(Ordering::Acquire)
+            || self
+                .publication_claimed
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+        {
+            return Ok(());
+        }
+        let outcome = (|| {
+            let publisher = {
+                let journal = self.lock()?;
+                Arc::clone(&journal.publisher)
+            };
+            // No journal, admission, transition, or Task A operation lock is
+            // held while the idempotent external sink is invoked.
+            let acknowledgement = publisher
+                .publish_idempotent(&publication)
+                .map_err(Refusal::PublicationRefused)?;
+            if acknowledgement != *publication.delivery_id() {
+                return Err(Refusal::PublicationAcknowledgementMismatch);
+            }
+            self.lock()?
+                .finish_publication(&self.authority, acknowledgement, None)
+        })();
+        if outcome.is_ok() {
+            self.publication_complete.store(true, Ordering::Release);
+        }
+        self.publication_claimed.store(false, Ordering::Release);
+        outcome
+    }
+
+    #[cfg(test)]
+    fn crash_without_settlement_for_test(self) {
+        self.settlement_attempted.store(true, Ordering::Release);
+    }
+}
+impl Drop for OwnedRemoteRequestV1 {
+    fn drop(&mut self) {
+        if self.settlement_attempted.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let accepted = self.provider_send_armed.load(Ordering::Acquire);
+        let result = if accepted {
+            unknown_after_arm()
+        } else {
+            failed_before_send()
+        };
+        let _ = self.settle_with_acceptance(result, accepted);
+    }
+}
+impl<F: Future> Future for ArmedProviderSendV1<'_, F> {
+    type Output = FlightResult<F::Output>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        if !this.arm_attempted {
+            this.arm_attempted = true;
+            if let Err(error) = this.request.arm_now() {
+                // A refused arm is known pre-send. The inner future is
+                // destroyed here without receiving its first poll.
+                this.inner = None;
+                let _ = this
+                    .request
+                    .settle_with_acceptance(failed_before_send(), false);
+                return Poll::Ready(Err(error));
+            }
+        }
+        let poll = this
+            .inner
+            .as_mut()
+            .expect("provider-send future polled after completion")
+            .as_mut()
+            .poll(cx);
+        match poll {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(output) => {
+                this.inner = None;
+                Poll::Ready(Ok(output))
+            }
+        }
+    }
+}
+impl RemoteRequestObserverV1 {
+    pub async fn wait_until(
+        &mut self,
+        deadline: tokio::time::Instant,
+    ) -> FlightResult<RemoteRequestTerminalOutcomeV1> {
+        self.live_waiters.fetch_add(1, Ordering::AcqRel);
+        let _waiter = LiveWaiterGuardV1 {
+            live_waiters: Arc::clone(&self.live_waiters),
+        };
+        loop {
+            if let Some(outcome) = { self.outcome_rx.borrow().clone() } {
+                return Ok(outcome);
+            }
+            match tokio::time::timeout_at(deadline, self.outcome_rx.changed()).await {
+                Ok(Ok(())) => {}
+                Ok(Err(_)) => return Err(Refusal::ObservationClosed),
+                Err(_) => return Err(Refusal::ObservationTimedOut),
+            }
+        }
+    }
+}
 #[cfg(test)]
 fn boundary(actual: Option<u8>, expected: u8, reason: &'static str) -> FlightResult<()> {
     (actual != Some(expected))
@@ -1257,6 +1641,21 @@ impl InjectedTaskAOutcomeV1 {
         Self::Unsupported,
         Self::ProtectiveDebt,
     ];
+}
+#[cfg(test)]
+fn injected_task_a_no_effect(outcome: InjectedTaskAOutcomeV1) -> FlightResult<()> {
+    use InjectedTaskAOutcomeV1 as I;
+    use TaskAProtectiveOutcomeV1 as P;
+    match outcome {
+        I::Refused => Err(protective(P::Refused, "injected")),
+        I::Retained => Err(protective(P::Retained, "injected")),
+        I::IoUnknown => Err(fs(FsCustodyError::Io(
+            "injected".into(),
+            std::io::Error::other("injected"),
+        ))),
+        I::Unsupported => Err(protective(P::Unsupported, "injected")),
+        I::ProtectiveDebt => Err(protective(P::ProtectiveDebt, "injected")),
+    }
 }
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2718,5 +3117,245 @@ mod tests {
         assert_eq!(left_authority.request_id, right_authority.request_id);
         assert_ne!(left_authority.attempt, right_authority.attempt);
         assert_ne!(left_authority.delivery_id(), right_authority.delivery_id());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn remote_request_flight_task_d_first_poll_arms_before_inner_poll() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let case = case();
+        let publisher = RecordingPublisher::with_replies([]);
+        initialize_root(&case, attempt(), 16);
+        let driver =
+            RemoteRequestDriverV1::open_recovered(custody(&case), attempt(), 16, publisher)
+                .unwrap();
+        let request = driver.admit(owner(0)).unwrap();
+        request.journal_intent().unwrap();
+        request.authorize_dispatch().unwrap();
+
+        let polls = Arc::new(AtomicUsize::new(0));
+        let inner_polls = Arc::clone(&polls);
+        let send = request.arm_provider_send(std::future::poll_fn(|_| {
+            inner_polls.fetch_add(1, Ordering::SeqCst);
+            assert_eq!(child(&case).1.status, ChildStateV1::ProviderSendArmed {});
+            std::task::Poll::Ready(41)
+        }));
+        assert_eq!(send.await.unwrap(), 41);
+        assert_eq!(polls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn remote_request_flight_task_d_failed_arm_never_polls_and_settles_pre_send() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let case = case();
+        let publisher = RecordingPublisher::with_replies([]);
+        initialize_root(&case, attempt(), 16);
+        let driver =
+            RemoteRequestDriverV1::open_recovered(custody(&case), attempt(), 16, publisher.clone())
+                .unwrap();
+        let request = driver.admit(owner(0)).unwrap();
+        request.journal_intent().unwrap();
+        request.authorize_dispatch().unwrap();
+
+        let polls = Arc::new(AtomicUsize::new(0));
+        let inner_polls = Arc::clone(&polls);
+        inject_task_a_boundary_for_test(TaskABoundaryV1::Replace, InjectedTaskAOutcomeV1::Refused);
+        let result = request
+            .arm_provider_send(std::future::poll_fn(|_| {
+                inner_polls.fetch_add(1, Ordering::SeqCst);
+                std::task::Poll::Ready(())
+            }))
+            .await;
+        assert!(matches!(
+            result,
+            Err(RemoteRequestFlightRefusalV1::TaskA(
+                TaskAProtectiveOutcomeV1::Refused,
+                _
+            ))
+        ));
+        assert_eq!(polls.load(Ordering::SeqCst), 0);
+        let calls = publisher.calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0].result().disposition,
+            ResourceActionDispositionV1::Failed
+        );
+        assert!(!calls[0].prompt_may_have_been_accepted());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn remote_request_flight_task_d_pre_and_post_arm_crash_recovery() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        for prefix in 1..=3 {
+            let case = case();
+            let publisher = RecordingPublisher::with_replies([]);
+            initialize_root(&case, attempt(), 16);
+            let driver = RemoteRequestDriverV1::open_recovered(
+                custody(&case),
+                attempt(),
+                16,
+                publisher.clone(),
+            )
+            .unwrap();
+            let request = driver.admit(owner(0)).unwrap();
+            request.journal_intent().unwrap();
+            if prefix >= 2 {
+                request.authorize_dispatch().unwrap();
+            }
+            let polls = Arc::new(AtomicUsize::new(0));
+            if prefix == 2 {
+                let inner_polls = Arc::clone(&polls);
+                let send = request.arm_provider_send(std::future::poll_fn(|_| {
+                    inner_polls.fetch_add(1, Ordering::SeqCst);
+                    std::task::Poll::Ready(())
+                }));
+                drop(send);
+            }
+            if prefix == 3 {
+                let inner_polls = Arc::clone(&polls);
+                let mut send = Box::pin(request.arm_provider_send(std::future::poll_fn(|_| {
+                    inner_polls.fetch_add(1, Ordering::SeqCst);
+                    assert_eq!(child(&case).1.status, ChildStateV1::ProviderSendArmed {});
+                    std::task::Poll::<()>::Pending
+                })));
+                assert!(matches!(
+                    futures::poll!(send.as_mut()),
+                    std::task::Poll::Pending
+                ));
+                drop(send);
+            }
+            request.crash_without_settlement_for_test();
+            drop(driver);
+
+            drop(
+                RemoteRequestDriverV1::open_recovered(
+                    custody(&case),
+                    attempt(),
+                    16,
+                    publisher.clone(),
+                )
+                .unwrap(),
+            );
+            let calls = publisher.calls();
+            assert_eq!(calls.len(), 1, "prefix {prefix}");
+            let expected = if prefix == 3 {
+                (ResourceActionDispositionV1::Unknown, true)
+            } else {
+                (ResourceActionDispositionV1::Failed, false)
+            };
+            assert_eq!(
+                (
+                    calls[0].result().disposition.clone(),
+                    calls[0].prompt_may_have_been_accepted()
+                ),
+                expected,
+                "prefix {prefix}"
+            );
+            assert_eq!(polls.load(Ordering::SeqCst), usize::from(prefix == 3));
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn remote_request_flight_task_d_peer_control_and_racing_settlement_are_bound() {
+        let case = case();
+        let publisher = RecordingPublisher::with_replies([]);
+        initialize_root(&case, attempt(), 16);
+        let driver =
+            RemoteRequestDriverV1::open_recovered(custody(&case), attempt(), 16, publisher.clone())
+                .unwrap();
+        let left = driver.admit(owner(0)).unwrap();
+        let right = driver.admit(owner(1)).unwrap();
+        let mut right_observer = right.observer();
+        left.journal_intent().unwrap();
+        left.authorize_dispatch().unwrap();
+        right.journal_intent().unwrap();
+        right.authorize_dispatch().unwrap();
+
+        let (first, second) = std::thread::scope(|scope| {
+            let first =
+                scope.spawn(|| left.settle(terminal(ResourceActionDispositionV1::Complete)));
+            let second =
+                scope.spawn(|| left.settle(terminal(ResourceActionDispositionV1::Partial)));
+            (
+                first.join().unwrap().unwrap(),
+                second.join().unwrap().unwrap(),
+            )
+        });
+        assert_eq!(first, second);
+        assert_eq!(publisher.calls().len(), 1);
+        assert!(matches!(
+            right_observer.wait_until(tokio::time::Instant::now()).await,
+            Err(RemoteRequestFlightRefusalV1::ObservationTimedOut)
+        ));
+
+        drop(left);
+        assert_eq!(request_paths(&case).len(), 1);
+        let right_outcome = right
+            .settle(terminal(ResourceActionDispositionV1::Failed))
+            .unwrap();
+        assert_ne!(first.delivery_id(), right_outcome.delivery_id());
+        assert_eq!(
+            right_observer.wait_until(tokio::time::Instant::now()).await,
+            Ok(right_outcome)
+        );
+        assert_eq!(publisher.calls().len(), 2);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn remote_request_flight_task_d_timeout_drops_its_waiter() {
+        let case = case();
+        initialize_root(&case, attempt(), 16);
+        let driver = RemoteRequestDriverV1::open_recovered(
+            custody(&case),
+            attempt(),
+            16,
+            RecordingPublisher::with_replies([]),
+        )
+        .unwrap();
+        let request = driver.admit(owner(0)).unwrap();
+        let mut observer = request.observer();
+        let deadline = tokio::time::Instant::now();
+        assert!(matches!(
+            observer.wait_until(deadline).await,
+            Err(RemoteRequestFlightRefusalV1::ObservationTimedOut)
+        ));
+        assert_eq!(request.live_waiters(), 0);
+    }
+
+    #[test]
+    fn remote_request_flight_task_d_drop_retains_refused_publication_debt() {
+        let case = case();
+        let publisher =
+            RecordingPublisher::with_replies([PublisherReply::Refuse, PublisherReply::Echo]);
+        initialize_root(&case, attempt(), 16);
+        let driver =
+            RemoteRequestDriverV1::open_recovered(custody(&case), attempt(), 16, publisher.clone())
+                .unwrap();
+        let request = driver.admit(owner(0)).unwrap();
+        assert!(matches!(
+            request.settle(terminal(ResourceActionDispositionV1::Failed)),
+            Err(RemoteRequestFlightRefusalV1::PublicationRefused(_))
+        ));
+        drop(request);
+        assert_eq!(
+            publisher.calls().len(),
+            1,
+            "drop must not retry publication"
+        );
+        assert!(child(&case).1.status.is_terminal_pending());
+        assert!(matches!(
+            driver.admit(owner(1)),
+            Err(RemoteRequestFlightRefusalV1::ReopenRequired(_))
+        ));
+        drop(driver);
+
+        let recovered =
+            RemoteRequestDriverV1::open_recovered(custody(&case), attempt(), 16, publisher.clone())
+                .unwrap();
+        assert_eq!(publisher.calls().len(), 2);
+        assert!(request_paths(&case).is_empty());
+        drop(recovered.admit(owner(2)).unwrap());
     }
 }
