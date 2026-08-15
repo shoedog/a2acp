@@ -1303,3 +1303,33 @@ colocated tests +151/-0, this handoff section +52/-0. Only
 `crates/bridge-api/src/backend.rs` and this handoff changed. F2, Task G,
 and production V3 remain unarmed; production still assigns the V3 route
 `None` and exposes `LegacyV2`.
+
+### Operator completion: F2 focused-gate evidence (2026-08-15)
+
+The F2 advisory review rejected on exactly one delivery finding: the
+handoff recorded the mandatory focused core selector red (128/129,
+twice) without a green exact-command run. That gate is now green and the
+failure classified:
+
+- Exact post-commit host run on `b3e354ab`, 2026-08-15
+  (log `f2-focused-host.log`):
+  `cargo test -p bridge-core --lib -- remote_request_flight process
+  retained_resource_flight` → **129 passed / 0 failed**, including
+  `term_ignoring_child_with_descendant_is_group_killed_host_signal_semantics`
+  explicitly ok.
+- Same-environment control: the same container session that produced the
+  two agent-turn failures ran the full workspace verify test stage GREEN
+  afterwards — the identical test passed in the identical environment,
+  so the two reds were transient container scheduling of process-group
+  kill visibility, not a property of this commit.
+- The test is byte-identical to the frozen base `15912e3a`, the F2 diff
+  is deletion-only and touches no signal or process-group code, and the
+  same sole in-container failure was already recorded once on the Task F
+  line ("reproduced alone and outside owned paths").
+
+Classification: container-environment signal-semantics flake (kill
+visibility), joining the ledgered hermetic classes; host-green on every
+exact-command run. The F2 acceptance contract's focused gate is
+satisfied by the dated exact-command run above. No code changed in this
+completion; F2 remains deletion-only. Task G and production V3 remain
+unarmed.
