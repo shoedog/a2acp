@@ -4,7 +4,8 @@ mod mechanism {
         create_new_regular_child_at, enumerate_directory_names, open_regular_child,
         rename_child_no_replace, required_file_content_snapshot_v2, ChildNameV2,
         CustodyCaptureOutcomeV2, CustodyIntentV2, CustodyOperationKindV2, FileContentSnapshotV2,
-        JournalRootOperationV2, RequiredObjectIdentityV2, ReservedNameNamespaceV2,
+        FsCustodyError, JournalRootOperationV2, RenameNoReplaceRefusalV1, RequiredObjectIdentityV2,
+        ReservedNameNamespaceV2,
     };
     use serde::{Deserialize, Serialize};
     use std::{
@@ -16,6 +17,7 @@ mod mechanism {
         },
     };
     const CHILD_CAP: usize = 4096;
+    type CommitmentV2 = [u8; 32];
     const INTENT_CAP: u64 = 4096;
     #[derive(Clone, Debug, PartialEq, Eq)]
     pub struct NamespaceRecoveryTicketV2 {
@@ -66,7 +68,27 @@ mod mechanism {
         target: String,
         expected: RequiredObjectIdentityV2,
         staged: FileContentSnapshotV2,
+        staged_sha256: Option<CommitmentV2>,
         reserved: [String; 4],
+    }
+    struct Failure(bool, String);
+    impl From<String> for Failure {
+        fn from(reason: String) -> Self {
+            Self(false, reason)
+        }
+    }
+    impl From<FsCustodyError> for Failure {
+        fn from(error: FsCustodyError) -> Self {
+            match error {
+                FsCustodyError::Unsupported(reason) => Self(true, reason),
+                error => Self(false, error.to_string()),
+            }
+        }
+    }
+    #[cfg(test)]
+    thread_local! {
+        static SNAPSHOT_UNSUPPORTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        static CAPTURE_UNSUPPORTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     }
     fn ticket(
         operation: CustodyOperationKindV2,
@@ -79,9 +101,29 @@ mod mechanism {
     }
     fn debt(
         ticket: NamespaceRecoveryTicketV2,
-        reason: impl Into<String>,
+        reason: impl Into<Failure>,
     ) -> NamespaceTransactionOutcomeV2 {
-        NamespaceTransactionOutcomeV2::Retained(ticket, reason.into())
+        let Failure(unsupported, reason) = reason.into();
+        if unsupported {
+            NamespaceTransactionOutcomeV2::Unsupported(reason)
+        } else {
+            NamespaceTransactionOutcomeV2::Retained(ticket, reason)
+        }
+    }
+    fn protect(reason: impl Into<Failure>) -> NamespaceTransactionOutcomeV2 {
+        let Failure(unsupported, reason) = reason.into();
+        if unsupported {
+            NamespaceTransactionOutcomeV2::Unsupported(reason)
+        } else {
+            NamespaceTransactionOutcomeV2::ProtectiveDebt(reason)
+        }
+    }
+    fn capture(root: &File, intent: &CustodyIntentV2, label: &str) -> CustodyCaptureOutcomeV2 {
+        #[cfg(test)]
+        if CAPTURE_UNSUPPORTED.with(|fault| fault.replace(false)) {
+            return CustodyCaptureOutcomeV2::RuntimeUnsupported(label.into());
+        }
+        capture_target_no_replace_v2(root, intent, label)
     }
     fn sync_root(root: &File, label: &str) -> Result<SettledV2, String> {
         root.sync_all()
@@ -92,12 +134,16 @@ mod mechanism {
         root: &File,
         name: &ChildNameV2,
         label: &str,
-    ) -> Result<Option<(File, FileContentSnapshotV2)>, String> {
-        if !child_entry_exists_impl(root, name.as_os_str(), label).map_err(|e| e.to_string())? {
+    ) -> Result<Option<(File, FileContentSnapshotV2)>, Failure> {
+        #[cfg(test)]
+        if SNAPSHOT_UNSUPPORTED.with(|fault| fault.replace(false)) {
+            return Err(FsCustodyError::Unsupported(label.into()).into());
+        }
+        if !child_entry_exists_impl(root, name.as_os_str(), label)? {
             return Ok(None);
         }
-        let file = open_regular_child(root, name.as_os_str(), label).map_err(|e| e.to_string())?;
-        let value = required_file_content_snapshot_v2(&file, label).map_err(|e| e.to_string())?;
+        let file = open_regular_child(root, name.as_os_str(), label)?;
+        let value = required_file_content_snapshot_v2(&file, label)?;
         Ok(Some((file, value)))
     }
     fn move_new(
@@ -105,12 +151,25 @@ mod mechanism {
         from: &ChildNameV2,
         to: &ChildNameV2,
         label: &str,
-    ) -> Result<SettledV2, String> {
-        let from = child_name_cstring(from.as_os_str(), label).map_err(|e| e.to_string())?;
-        let to = child_name_cstring(to.as_os_str(), label).map_err(|e| e.to_string())?;
-        rename_child_no_replace(root, &from, &to)
-            .map_err(|e| format!("{label}: no-replace rename refused: {e:?}"))?;
-        sync_root(root, label)
+    ) -> Result<SettledV2, Failure> {
+        let from = child_name_cstring(from.as_os_str(), label)?;
+        let to = child_name_cstring(to.as_os_str(), label)?;
+        match rename_child_no_replace(root, &from, &to) {
+            Ok(()) => {}
+            Err(RenameNoReplaceRefusalV1::PlatformUnsupported) => {
+                return Err(FsCustodyError::Unsupported(label.into()).into())
+            }
+            Err(RenameNoReplaceRefusalV1::Io(error))
+                if [libc::ENOSYS, libc::ENOTSUP, libc::EOPNOTSUPP]
+                    .contains(&error.raw_os_error().unwrap_or_default()) =>
+            {
+                return Err(FsCustodyError::Unsupported(label.into()).into());
+            }
+            Err(error) => {
+                return Err(format!("{label}: no-replace rename refused: {error:?}").into())
+            }
+        }
+        Ok(sync_root(root, label)?)
     }
     fn remove<F>(
         root: &File,
@@ -119,43 +178,44 @@ mod mechanism {
         events: Option<(TransitionV2, TransitionV2)>,
         hook: &mut F,
         label: &str,
-    ) -> Result<File, String>
+    ) -> Result<File, Failure>
     where
         F: FnMut(TransitionV2, &ChildNameV2) -> bool,
     {
         let (held, before) =
             snapshot(root, name, label)?.ok_or_else(|| format!("{label}: unlink source absent"))?;
         if before != expected {
-            return Err(format!("{label}: unlink identity/content changed"));
+            return Err(format!("{label}: unlink identity/content changed").into());
         }
         if hook(TransitionV2::BeforeCleanup, name) {
-            return Err(format!("{label}: interrupted before unlink"));
+            return Err(format!("{label}: interrupted before unlink").into());
         }
         let (_, current) = snapshot(root, name, label)?
             .ok_or_else(|| format!("{label}: unlink source disappeared"))?;
         if current != expected {
-            return Err(format!("{label}: unlink source substituted"));
+            return Err(format!("{label}: unlink source substituted").into());
         }
-        let encoded = child_name_cstring(name.as_os_str(), label).map_err(|e| e.to_string())?;
+        let encoded = child_name_cstring(name.as_os_str(), label)?;
         if unsafe { libc::unlinkat(root.as_raw_fd(), encoded.as_ptr(), 0) } == -1 {
             return Err(format!(
                 "{label}: exact unlink refused: {}",
                 std::io::Error::last_os_error()
-            ));
+            )
+            .into());
         }
         if events.is_some_and(|e| hook(e.0, name)) {
-            return Err(format!("{label}: interrupted after unlink"));
+            return Err(format!("{label}: interrupted after unlink").into());
         }
         if held.metadata().map_err(|e| e.to_string())?.nlink() != 0 {
-            return Err(format!("{label}: retained fd still linked"));
+            return Err(format!("{label}: retained fd still linked").into());
         }
         if events.is_some_and(|e| hook(e.1, name)) {
-            return Err(format!("{label}: interrupted after zero-link proof"));
+            return Err(format!("{label}: interrupted after zero-link proof").into());
         }
         sync_root(root, label)?;
         Ok(held)
     }
-    fn to_wire(intent: &CustodyIntentV2) -> IntentWireV2 {
+    fn to_wire(intent: &CustodyIntentV2, staged_sha256: Option<CommitmentV2>) -> IntentWireV2 {
         let (operation, target, expected, staged) = intent.parts();
         let reserved = ReservedNameNamespaceV2::ALL.map(|n| {
             intent
@@ -171,56 +231,61 @@ mod mechanism {
             target: target.as_os_str().to_str().expect("V2 name").into(),
             expected: *expected,
             staged: *staged,
+            staged_sha256,
             reserved,
         }
     }
-    fn decode(bytes: &[u8]) -> Result<CustodyIntentV2, String> {
+    fn decode(bytes: &[u8]) -> Result<(CustodyIntentV2, Option<CommitmentV2>), Failure> {
         let wire: IntentWireV2 =
             serde_json::from_slice(bytes).map_err(|e| format!("malformed intent: {e}"))?;
         if wire.schema != 2 {
-            return Err("foreign intent schema".into());
+            return Err("foreign intent schema".to_owned().into());
         }
-        let target =
-            ChildNameV2::from_bytes(wire.target.as_bytes()).map_err(|_| "invalid intent target")?;
-        let intent = CustodyIntentV2::new(wire.operation, target, wire.expected, wire.staged)
-            .map_err(|e| e.to_string())?;
-        if to_wire(&intent).reserved != wire.reserved {
-            return Err("non-deterministic reserved names".into());
+        if wire.staged_sha256.is_some() != matches!(wire.operation, CustodyOperationKindV2::Replace)
+        {
+            return Err("invalid staged commitment".to_owned().into());
         }
-        Ok(intent)
+        let target = ChildNameV2::from_bytes(wire.target.as_bytes())
+            .map_err(|_| "invalid intent target".to_owned())?;
+        let intent = CustodyIntentV2::new(wire.operation, target, wire.expected, wire.staged)?;
+        if to_wire(&intent, wire.staged_sha256).reserved != wire.reserved {
+            return Err("non-deterministic reserved names".to_owned().into());
+        }
+        Ok((intent, wire.staged_sha256))
     }
     fn create_intent(
         root: &File,
         intent: &CustodyIntentV2,
+        staged_sha256: Option<CommitmentV2>,
         label: &str,
-    ) -> Result<FileContentSnapshotV2, String> {
+    ) -> Result<FileContentSnapshotV2, Failure> {
         let name = intent.reserved_name(ReservedNameNamespaceV2::TransactionIntent);
-        let mut file = create_new_regular_child_at(root, name.as_os_str(), label)
-            .map_err(|e| e.to_string())?;
-        let bytes = serde_json::to_vec(&to_wire(intent)).map_err(|e| e.to_string())?;
+        let mut file = create_new_regular_child_at(root, name.as_os_str(), label)?;
+        let bytes =
+            serde_json::to_vec(&to_wire(intent, staged_sha256)).map_err(|e| e.to_string())?;
         if bytes.len() as u64 > INTENT_CAP {
-            return Err("intent exceeds cap".into());
+            return Err("intent exceeds cap".to_owned().into());
         }
         file.write_all(&bytes)
             .and_then(|_| file.sync_all())
             .map_err(|e| format!("{label}: intent write/sync: {e}"))?;
         sync_root(root, label)?;
-        required_file_content_snapshot_v2(&file, label).map_err(|e| e.to_string())
+        Ok(required_file_content_snapshot_v2(&file, label)?)
     }
     fn read_intent(
         root: &File,
         name: &ChildNameV2,
         label: &str,
-    ) -> Result<(CustodyIntentV2, FileContentSnapshotV2), String> {
-        let mut file =
-            open_regular_child(root, name.as_os_str(), label).map_err(|e| e.to_string())?;
+    ) -> Result<(CustodyIntentV2, FileContentSnapshotV2, Option<CommitmentV2>), Failure> {
+        let mut file = open_regular_child(root, name.as_os_str(), label)?;
         if file.metadata().map_err(|e| e.to_string())?.len() > INTENT_CAP {
-            return Err("intent exceeds cap".into());
+            return Err("intent exceeds cap".to_owned().into());
         }
-        let snap = required_file_content_snapshot_v2(&file, label).map_err(|e| e.to_string())?;
+        let snap = required_file_content_snapshot_v2(&file, label)?;
         let mut bytes = Vec::new();
         file.read_to_end(&mut bytes).map_err(|e| e.to_string())?;
-        Ok((decode(&bytes)?, snap))
+        let (intent, commitment) = decode(&bytes)?;
+        Ok((intent, snap, commitment))
     }
     fn clear_intent<F>(
         op: &JournalRootOperationV2<'_>,
@@ -228,39 +293,71 @@ mod mechanism {
         snap: FileContentSnapshotV2,
         hook: &mut F,
         label: &str,
-    ) -> Result<File, String>
+    ) -> Result<File, Failure>
     where
         F: FnMut(TransitionV2, &ChildNameV2) -> bool,
     {
         let name = intent.reserved_name(ReservedNameNamespaceV2::TransactionIntent);
         let held = remove(op.root_file(), name, snap, None, hook, label)?;
         if hook(TransitionV2::IntentRemoved, name) {
-            return Err(format!("{label}: interrupted after intent removal"));
+            return Err(format!("{label}: interrupted after intent removal").into());
         }
         sync_root(op.root_file(), label)?;
         if hook(TransitionV2::FinalSync, name) {
-            return Err(format!("{label}: interrupted after final sync"));
+            return Err(format!("{label}: interrupted after final sync").into());
         }
-        op.prove_route_v2(label).map_err(|e| e.to_string())?;
+        op.prove_route_v2(label)?;
         Ok(held)
+    }
+    fn sha256(mut file: &File, label: &str) -> Result<CommitmentV2, Failure> {
+        let mut context = ring::digest::Context::new(&ring::digest::SHA256);
+        let mut buffer = [0; 8192];
+        loop {
+            let count = file
+                .read(&mut buffer)
+                .map_err(|error| FsCustodyError::Io(label.into(), error))?;
+            if count == 0 {
+                return Ok(context.finish().as_ref().try_into().expect("SHA-256"));
+            }
+            context.update(&buffer[..count]);
+        }
     }
     fn verify_target(
         root: &File,
         name: &ChildNameV2,
         expected: FileContentSnapshotV2,
+        commitment: CommitmentV2,
         label: &str,
-    ) -> Result<File, String> {
+    ) -> Result<File, Failure> {
         let (file, before) =
             snapshot(root, name, label)?.ok_or_else(|| format!("{label}: target absent"))?;
         if before != expected {
-            return Err(format!("{label}: target changed"));
+            return Err(format!("{label}: target changed").into());
         }
         file.sync_all()
             .map_err(|e| format!("{label}: target sync: {e}"))?;
-        if required_file_content_snapshot_v2(&file, label).map_err(|e| e.to_string())? != expected {
-            return Err(format!("{label}: target changed during sync"));
+        if required_file_content_snapshot_v2(&file, label)? != expected {
+            return Err(format!("{label}: target changed during sync").into());
+        }
+        if sha256(&file, label)? != commitment {
+            return Err(format!("{label}: target commitment changed").into());
         }
         Ok(file)
+    }
+    fn rollback_unsupported(
+        op: &JournalRootOperationV2<'_>,
+        label: &str,
+        reason: String,
+    ) -> NamespaceTransactionOutcomeV2 {
+        match NamespaceTransactionV2::recover(op, label) {
+            NamespaceTransactionOutcomeV2::Ready
+            | NamespaceTransactionOutcomeV2::NoEffect(_, _) => {
+                NamespaceTransactionOutcomeV2::Unsupported(reason)
+            }
+            _ => NamespaceTransactionOutcomeV2::ProtectiveDebt(format!(
+                "{label}: unsupported capture rollback failed"
+            )),
+        }
     }
     impl NamespaceTransactionV2 {
         pub fn replace(
@@ -334,19 +431,23 @@ mod mechanism {
             let stage_name = match ChildNameV2::reserved(ReservedNameNamespaceV2::Staging, &target)
             {
                 Ok(v) => v,
-                Err(e) => return debt(recovery, e.to_string()),
+                Err(e) => return debt(recovery, e),
             };
             let mut stage = match create_new_regular_child_at(root, stage_name.as_os_str(), label) {
                 Ok(v) => v,
-                Err(e) => return debt(recovery, e.to_string()),
+                Err(e) => return debt(recovery, e),
             };
             if let Err(e) = stage.write_all(successor).and_then(|_| stage.sync_all()) {
                 return debt(recovery, format!("{label}: stage write/sync: {e}"));
             }
             let staged = match required_file_content_snapshot_v2(&stage, label) {
                 Ok(v) => v,
-                Err(e) => return debt(recovery, e.to_string()),
+                Err(e) => return debt(recovery, e),
             };
+            let commitment: CommitmentV2 = ring::digest::digest(&ring::digest::SHA256, successor)
+                .as_ref()
+                .try_into()
+                .expect("SHA-256");
             if let Err(e) = sync_root(root, label) {
                 return debt(recovery, e);
             }
@@ -363,9 +464,9 @@ mod mechanism {
                 staged,
             ) {
                 Ok(v) => v,
-                Err(e) => return debt(recovery, e.to_string()),
+                Err(e) => return debt(recovery, e),
             };
-            let intent_snap = match create_intent(root, &intent, label) {
+            let intent_snap = match create_intent(root, &intent, Some(commitment), label) {
                 Ok(v) => v,
                 Err(e) => return debt(recovery, e),
             };
@@ -374,10 +475,13 @@ mod mechanism {
                 return debt(recovery, format!("{label}: interrupted after intent sync"));
             }
             hook(TransitionV2::BeforeCapture, intent.parts().1);
-            match capture_target_no_replace_v2(root, &intent, label) {
+            match capture(root, &intent, label) {
                 CustodyCaptureOutcomeV2::ExpectedCaptured(_) => {}
                 CustodyCaptureOutcomeV2::CompileUnsupported => {
-                    return NamespaceTransactionOutcomeV2::Unsupported(label.into())
+                    return rollback_unsupported(op, label, label.into())
+                }
+                CustodyCaptureOutcomeV2::RuntimeUnsupported(reason) => {
+                    return rollback_unsupported(op, label, reason)
                 }
                 _ => {
                     let _ = sync_root(root, label);
@@ -408,7 +512,7 @@ mod mechanism {
             if hook(TransitionV2::Published, intent.parts().1) {
                 return debt(recovery, format!("{label}: committed target retains debt"));
             }
-            if let Err(e) = verify_target(root, intent.parts().1, staged, label) {
+            if let Err(e) = verify_target(root, intent.parts().1, staged, commitment, label) {
                 return debt(recovery, e);
             }
             if hook(TransitionV2::TargetSynced, intent.parts().1) {
@@ -448,9 +552,9 @@ mod mechanism {
                 observed,
             ) {
                 Ok(v) => v,
-                Err(e) => return debt(recovery, e.to_string()),
+                Err(e) => return debt(recovery, e),
             };
-            let intent_snap = match create_intent(root, &intent, label) {
+            let intent_snap = match create_intent(root, &intent, None, label) {
                 Ok(v) => v,
                 Err(e) => return debt(recovery, e),
             };
@@ -461,12 +565,18 @@ mod mechanism {
                 return debt(recovery, format!("{label}: interrupted after intent sync"));
             }
             hook(TransitionV2::BeforeCapture, intent.parts().1);
-            if !matches!(
-                capture_target_no_replace_v2(root, &intent, label),
-                CustodyCaptureOutcomeV2::ExpectedCaptured(_)
-            ) {
-                let _ = sync_root(root, label);
-                return Self::recover_with(op, label, hook);
+            match capture(root, &intent, label) {
+                CustodyCaptureOutcomeV2::ExpectedCaptured(_) => {}
+                CustodyCaptureOutcomeV2::CompileUnsupported => {
+                    return rollback_unsupported(op, label, label.into())
+                }
+                CustodyCaptureOutcomeV2::RuntimeUnsupported(reason) => {
+                    return rollback_unsupported(op, label, reason)
+                }
+                _ => {
+                    let _ = sync_root(root, label);
+                    return Self::recover_with(op, label, hook);
+                }
             }
             if let Err(e) = sync_root(root, label) {
                 return debt(recovery, e);
@@ -525,12 +635,12 @@ mod mechanism {
                 return NamespaceTransactionOutcomeV2::Unsupported(label.into());
             }
             if let Err(e) = op.prove_route_v2(label) {
-                return NamespaceTransactionOutcomeV2::ProtectiveDebt(e.to_string());
+                return protect(e);
             }
             let root = op.root_file();
             let names = match enumerate_directory_names(root, CHILD_CAP, label) {
                 Ok(v) => v,
-                Err(e) => return NamespaceTransactionOutcomeV2::ProtectiveDebt(e.to_string()),
+                Err(e) => return protect(e),
             };
             let mut reserved = Vec::new();
             let mut intents = Vec::new();
@@ -561,9 +671,9 @@ mod mechanism {
                     "{label}: missing or duplicate intent"
                 ));
             }
-            let (intent, intent_snap) = match read_intent(root, &intents[0], label) {
+            let (intent, intent_snap, commitment) = match read_intent(root, &intents[0], label) {
                 Ok(v) => v,
-                Err(e) => return NamespaceTransactionOutcomeV2::ProtectiveDebt(e),
+                Err(e) => return protect(e),
             };
             let expected_names: Vec<_> = ReservedNameNamespaceV2::ALL
                 .map(|n| intent.reserved_name(n))
@@ -598,6 +708,7 @@ mod mechanism {
             };
             match intent.parts().0 {
                 CustodyOperationKindV2::Replace => {
+                    let commitment = commitment.expect("validated replacement commitment");
                     if del.is_some() {
                         return debt(recovery, format!("{label}: foreign retirement residue"));
                     }
@@ -643,9 +754,13 @@ mod mechanism {
                         && swap.map(|v| v.object) == Some(*intent.parts().2)
                         && stage.is_none()
                     {
-                        if let Err(e) =
-                            verify_target(root, intent.parts().1, *intent.parts().3, label)
-                        {
+                        if let Err(e) = verify_target(
+                            root,
+                            intent.parts().1,
+                            *intent.parts().3,
+                            commitment,
+                            label,
+                        ) {
                             return debt(recovery, e);
                         }
                         return Self::finish(op, &intent, intent_snap, &mut hook, label);
@@ -697,6 +812,7 @@ mod mechanism {
             fs,
             path::{Path, PathBuf},
         };
+        use NamespaceTransactionOutcomeV2 as O;
 
         struct Case {
             _dir: tempfile::TempDir,
@@ -796,6 +912,32 @@ mod mechanism {
         }
 
         #[test]
+        fn namespace_transaction_unsupported_is_typed_and_clean_when_knowable() {
+            for retire in [false, true] {
+                let case = case();
+                let expected = case.expected();
+                SNAPSHOT_UNSUPPORTED.with(|fault| fault.set(true));
+                let outcome = case.operate(|op| {
+                    if retire {
+                        NamespaceTransactionV2::retire(op, target(), expected, "u")
+                    } else {
+                        NamespaceTransactionV2::replace(op, target(), expected, b"B", "u")
+                    }
+                });
+                assert!(matches!(outcome, O::Unsupported(_)));
+                assert_eq!(fs::read(case.root.join("target")).unwrap(), b"A");
+                assert!(residue(&case).is_empty());
+            }
+            let case = case();
+            CAPTURE_UNSUPPORTED.with(|fault| fault.set(true));
+            let outcome = case.operate(|op| {
+                NamespaceTransactionV2::replace(op, target(), case.expected(), b"B", "u")
+            });
+            assert!(matches!(outcome, O::Unsupported(_)));
+            assert_eq!(fs::read(case.root.join("target")).unwrap(), b"A");
+            assert!(residue(&case).is_empty());
+        }
+        #[test]
         fn namespace_transaction_capture_substitution_is_restored_and_never_published() {
             let case = case();
             let expected = case.expected();
@@ -888,6 +1030,28 @@ mod mechanism {
                 NamespaceTransactionOutcomeV2::Retained(_, _)
             ));
             assert!(!stage.root.join("target").exists());
+
+            let live = case();
+            let root = live.root.clone();
+            let outcome = live.operate(|op| {
+                NamespaceTransactionV2::replace_with(
+                    op,
+                    target(),
+                    live.expected(),
+                    b"B",
+                    "c",
+                    |transition, _| {
+                        if transition == TransitionV2::Published {
+                            fs::write(root.join("target"), b"C").unwrap();
+                        }
+                        false
+                    },
+                )
+            });
+            assert!(matches!(outcome, O::Retained(_, _)));
+            assert_eq!(fs::read(live.root.join("target")).unwrap(), b"C");
+            let swap = reserved(ReservedNameNamespaceV2::ReplacementCapture);
+            assert_eq!(fs::read(live.root.join(swap.as_os_str())).unwrap(), b"A");
         }
 
         #[test]
@@ -963,6 +1127,9 @@ mod mechanism {
                     interrupted,
                     NamespaceTransactionOutcomeV2::Retained(_, _)
                 ));
+                if cut == TransitionV2::Published {
+                    fs::write(case.root.join("target"), b"C").unwrap();
+                }
                 let recovered =
                     case.operate(|op| NamespaceTransactionV2::recover(op, "recover cut"));
                 match cut {
@@ -974,7 +1141,12 @@ mod mechanism {
                         matches!(recovered, NamespaceTransactionOutcomeV2::NoEffect(_, _)),
                         "{cut:?}: {recovered:?}"
                     ),
-                    TransitionV2::Published | TransitionV2::TargetSynced => assert!(matches!(
+                    TransitionV2::Published => {
+                        assert!(matches!(recovered, O::Retained(_, _)));
+                        let swap = reserved(ReservedNameNamespaceV2::ReplacementCapture);
+                        assert_eq!(fs::read(case.root.join(swap.as_os_str())).unwrap(), b"A");
+                    }
+                    TransitionV2::TargetSynced => assert!(matches!(
                         recovered,
                         NamespaceTransactionOutcomeV2::Complete(_)
                     )),
@@ -993,17 +1165,16 @@ mod mechanism {
                         stable,
                         NamespaceTransactionOutcomeV2::ProtectiveDebt(_)
                     )),
-                    TransitionV2::Retired | TransitionV2::ZeroLinkProved => assert!(matches!(
-                        stable,
-                        NamespaceTransactionOutcomeV2::Retained(_, _)
-                    )),
+                    TransitionV2::Published
+                    | TransitionV2::Retired
+                    | TransitionV2::ZeroLinkProved => assert!(matches!(stable, O::Retained(_, _))),
                     _ => assert_eq!(stable, NamespaceTransactionOutcomeV2::Ready),
                 }
             }
         }
 
         #[test]
-        fn namespace_transaction_replace_rolls_back_but_retire_rolls_forward_after_capture() {
+        fn namespace_transaction_replace_rollback_and_every_retire_crash_cut_are_pinned() {
             let replace = case();
             let expected = replace.expected();
             let _ = replace.operate(|op| {
@@ -1024,24 +1195,45 @@ mod mechanism {
             );
             assert_eq!(fs::read(replace.root.join("target")).unwrap(), b"A");
 
-            let retire = case();
-            let expected = retire.expected();
-            let _ = retire.operate(|op| {
-                NamespaceTransactionV2::retire_with(
-                    op,
-                    target(),
-                    expected,
-                    "retire crash",
-                    |transition, _| transition == TransitionV2::Captured,
-                )
-            });
-            let recovered =
-                retire.operate(|op| NamespaceTransactionV2::recover(op, "retire recovery"));
-            assert!(matches!(
-                recovered,
-                NamespaceTransactionOutcomeV2::Complete(_)
-            ));
-            assert!(!retire.root.join("target").exists());
+            for cut in [
+                TransitionV2::IntentSynced,
+                TransitionV2::Captured,
+                TransitionV2::Retired,
+                TransitionV2::ZeroLinkProved,
+                TransitionV2::IntentRemoved,
+                TransitionV2::FinalSync,
+            ] {
+                let retire = case();
+                let expected = retire.expected();
+                let interrupted = retire.operate(|op| {
+                    NamespaceTransactionV2::retire_with(
+                        op,
+                        target(),
+                        expected,
+                        "r",
+                        |transition, _| transition == cut,
+                    )
+                });
+                assert!(matches!(interrupted, O::Retained(_, _)));
+                let recovered = retire.operate(|op| NamespaceTransactionV2::recover(op, "r"));
+                assert!(
+                    match cut {
+                        TransitionV2::IntentSynced => matches!(recovered, O::NoEffect(_, _)),
+                        TransitionV2::Captured => matches!(recovered, O::Complete(_)),
+                        TransitionV2::Retired | TransitionV2::ZeroLinkProved => {
+                            matches!(recovered, O::Retained(_, _))
+                        }
+                        TransitionV2::IntentRemoved | TransitionV2::FinalSync =>
+                            recovered == O::Ready,
+                        _ => unreachable!(),
+                    },
+                    "{cut:?}: {recovered:?}"
+                );
+                if matches!(cut, TransitionV2::Retired | TransitionV2::ZeroLinkProved) {
+                    let stable = retire.operate(|op| NamespaceTransactionV2::recover(op, "r"));
+                    assert!(matches!(stable, O::Retained(_, _)), "{stable:?}");
+                }
+            }
         }
 
         #[test]
