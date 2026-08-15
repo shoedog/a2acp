@@ -1216,8 +1216,8 @@ impl JournalRootOperationV2<'_> {
         label: &str,
     ) -> Result<FileContentSnapshotV2, JournalMutationOutcomeV2> {
         self.refuse_debt(label)?;
-        self.refuse_reserved_target(target)?;
         self.guard(None, 1, label)?;
+        self.refuse_reserved_target(target)?;
         let name = ChildNameV2::reserved(ReservedNameNamespaceV2::Staging, target)
             .map_err(|error| self.failed(error, false))?;
         let file = create_new_regular_child_at(self.root_file(), name.as_os_str(), label)
@@ -1245,10 +1245,17 @@ impl JournalRootOperationV2<'_> {
         before_publish: F,
     ) -> Result<FileContentSnapshotV2, JournalMutationOutcomeV2> {
         self.refuse_debt(label)?;
-        self.refuse_reserved_target(target)?;
         let name = ChildNameV2::reserved(ReservedNameNamespaceV2::Staging, target)
             .map_err(|error| self.failed(error, false))?;
-        self.guard(Some(&name), 0, label)?;
+        // A staging name derived from a reserved target must not be
+        // whitelisted: for reserved targets the census sees everything.
+        let allowed = if target.is_reserved_target() {
+            None
+        } else {
+            Some(&name)
+        };
+        self.guard(allowed, 0, label)?;
+        self.refuse_reserved_target(target)?;
         let file = open_regular_child(self.root_file(), name.as_os_str(), label)
             .map_err(|error| self.failed(error, true))?;
         let observed = required_file_content_snapshot_v2(&file, label)
@@ -1286,8 +1293,8 @@ impl JournalRootOperationV2<'_> {
         label: &str,
     ) -> Result<FileContentSnapshotV2, JournalMutationOutcomeV2> {
         self.refuse_debt(label)?;
-        self.refuse_reserved_target(name)?;
         self.guard(None, 1, label)?;
+        self.refuse_reserved_target(name)?;
         let file = open_regular_child_for_update(self.root_file(), name.as_os_str(), true, label)
             .map_err(|error| self.failed(error, false))?;
         let observed = required_file_content_snapshot_v2(&file, label)
@@ -5317,32 +5324,78 @@ mod tests {
                 ".a2a-v2-rtc-record",
                 ".a2a-v2-x",
             ] {
+                // A reserved-named object present in the root is residue: the
+                // admission census refuses protectively before the name-level
+                // refusal can apply, and the root is untouched.
                 let case = route_case();
                 fs::write(case.root.join(target), b"A").unwrap();
                 let custody =
                     JournalRootCustodyV2::open(&case.anchor, &case.binding, "reserved target")
                         .unwrap();
                 let operation = custody.begin_operation("reserved target").unwrap();
-                let target = ChildNameV2::from_bytes(target.as_bytes()).unwrap();
+                let name = ChildNameV2::from_bytes(target.as_bytes()).unwrap();
                 let expected = required_file_content_snapshot_v2(
-                    &File::open(case.root.join(target.as_os_str())).unwrap(),
+                    &File::open(case.root.join(name.as_os_str())).unwrap(),
                     "reserved target",
                 )
                 .unwrap();
                 for outcome in [
-                    operation.stage(&target, b"B", "reserved target"),
-                    operation.publish(&target, expected, "reserved target"),
-                    operation.append(&target, expected, 1, b"B", "reserved target"),
+                    operation.stage(&name, b"B", "reserved target"),
+                    operation.publish(&name, expected, "reserved target"),
+                    operation.append(&name, expected, 1, b"B", "reserved target"),
                 ] {
-                    assert!(matches!(
-                        outcome,
-                        Err(JournalMutationOutcomeV2::Refused(ref reason))
-                            if reason.contains("reserved target")
-                    ));
+                    assert!(
+                        matches!(outcome, Err(JournalMutationOutcomeV2::ProtectiveDebt(_))),
+                        "{outcome:?}"
+                    );
                     assert_eq!(fs::read_dir(&case.root).unwrap().count(), 1);
-                    assert_eq!(fs::read(case.root.join(target.as_os_str())).unwrap(), b"A");
+                    assert_eq!(fs::read(case.root.join(name.as_os_str())).unwrap(), b"A");
+                }
+
+                // On a clean root the pure name refusal applies with no effect.
+                let clean = route_case();
+                let custody =
+                    JournalRootCustodyV2::open(&clean.anchor, &clean.binding, "reserved name")
+                        .unwrap();
+                let operation = custody.begin_operation("reserved name").unwrap();
+                for outcome in [
+                    operation.stage(&name, b"B", "reserved name"),
+                    operation.publish(&name, expected, "reserved name"),
+                    operation.append(&name, expected, 1, b"B", "reserved name"),
+                ] {
+                    assert!(
+                        matches!(
+                            outcome,
+                            Err(JournalMutationOutcomeV2::Refused(ref reason))
+                                if reason.contains("reserved target")
+                        ),
+                        "{outcome:?}"
+                    );
+                    assert_eq!(fs::read_dir(&clean.root).unwrap().count(), 0);
+                    assert!(!operation.debt());
                 }
             }
+
+            // A reserved target whose derived staging object is the only entry
+            // must still classify protectively: publish may not whitelist the
+            // staging name it derived from a reserved target.
+            let case = route_case();
+            let target = ChildNameV2::from_bytes(b".a2a-v2-x").unwrap();
+            let staging = ChildNameV2::reserved(ReservedNameNamespaceV2::Staging, &target).unwrap();
+            fs::write(case.root.join(staging.as_os_str()), b"S").unwrap();
+            let custody =
+                JournalRootCustodyV2::open(&case.anchor, &case.binding, "derived staging").unwrap();
+            let operation = custody.begin_operation("derived staging").unwrap();
+            let staged = required_file_content_snapshot_v2(
+                &File::open(case.root.join(staging.as_os_str())).unwrap(),
+                "derived staging",
+            )
+            .unwrap();
+            assert!(matches!(
+                operation.publish(&target, staged, "derived staging"),
+                Err(JournalMutationOutcomeV2::ProtectiveDebt(_))
+            ));
+            assert_eq!(fs::read_dir(&case.root).unwrap().count(), 1);
         }
 
         #[test]
