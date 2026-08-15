@@ -599,3 +599,31 @@ Versus the frozen input, the module delta is +172/-38 including tests; with this
 - Direct `rustfmt --check --edition 2021` and `git diff --check`: exit 0. `cargo fmt --all -- --check` still cannot start because this Cargo installation has no `fmt` subcommand.
 
 B2, Tasks C-G, production V3, all callers/routes, providers, smoke, compatibility, deployment, fold, push, and the running operator remain unarmed and unchanged.
+
+## Task B2 acknowledged retirement and reopen self-healing
+
+Date: 2026-08-15. Exact frozen input: `6033fd34fccb2fb8fbbb45585df5472eb95331df`.
+
+### Admissible red evidence
+
+Exact pre-production command: `CARGO_INCREMENTAL=0 cargo test -p bridge-core --lib --locked --offline -- remote_request_flight --nocapture`.
+Cargo reached `bridge-core` and exited 101 with 11 B2-specific compile errors naming the absent pre-send-failure state, acknowledgement/retirement methods, exact-complete refusal, and real Task A boundary seam. It was neither dependency/network refusal nor zero selection. The owner/census and fault-boundary rider regressions were in this same pre-production batch; the boundary seam contributed the missing-API red.
+A later strict-terminal corruption regression selected 15 tests and failed 1 because unit-style tagged states accepted an unknown nested field. Empty struct variants closed that grammar hole while retaining the minimal three-state wire.
+
+### Result and restart census
+
+The strict child marker is now `active`, `pre_send_failure`, or `terminal_acknowledged`. Only exact `ResourceActionDispositionV1::Complete` may persist acknowledgement. Acknowledgement uses Task A identity-bound replacement; retirement requires that marker, uses identity-bound removal, and root-syncs. Refused, retained, unsupported, protective-debt, and injected I/O-unknown outcomes stay exact typed refusals at real stage, acknowledgement-replace, and retirement-removal boundaries without root mutation.
+`open` first invokes Task A transaction recovery and refuses ambiguous staged/reserved residue. A published child ahead of the checkpoint advances the checkpoint, then closes without authority reissue as pre-send failure. A durable acknowledgement is retired on reopen; a completed unlink has no residual debt. Replayed reopen is byte-idempotent. Every cut before unlink, after unlink, and after root sync is pinned.
+Shared owner validation reparses the node ID and rejects empty, oversized, or control-bearing owner keys before mint and during census. Strict state/owner nesting plus schema, authority digest, and child-name corruption all refuse without mint, checkpoint advance, or additional root mutation.
+A reduced capacity of 5 was used: eight sequential admit/acknowledge/retire cycles succeed on one root, with the checkpoint asserted monotonically after every cycle.
+
+### Verification and post-format accounting
+
+- Focused `remote_request_flight`: 15 passed, 0 failed, 612 filtered out.
+- Required aggregate command: 133 passed, 0 failed, 494 filtered out.
+- Bridge-core library all-feature offline clippy with `-D warnings`: exit 0. The tests-inclusive clippy command reached unchanged integration-test crate resolution and failed with the already-recorded `E0463`/dependent inference errors.
+- Direct `rustfmt --check --edition 2021` and `git diff --check`: exit 0. Required `cargo fmt --all -- --check` cannot start because this Cargo installation has no `fmt` subcommand; no `rustfmt::skip` was added.
+- Versus `6033fd34`, module production is +195/-21 (216 churn) and test-only code is +339/-9 (348 churn). This handoff adds 28 lines, for 592 total changed lines; production deletions 21 do not exceed the module's 30 total deletions.
+- Versus `d8ec93ad`, the module is 673 production plus 710 test-only additions, the existing `lib.rs` export is 2 production additions, and the handoff is 85 documentation additions; there are no deletions on that comparison.
+
+The attempt-bound authority identity remains Task C scope. Tasks C-G, production V3, every caller/route, providers, smoke, compatibility, deployment, fold, push, and the running operator remain unarmed and unchanged.
