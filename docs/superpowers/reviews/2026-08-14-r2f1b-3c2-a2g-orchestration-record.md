@@ -670,6 +670,45 @@ All checks passed; no drift found.
   repair dispatched on frozen `05e9517e` (three repairs only; caps
   150/400; brief mirrored as
   [`2026-08-15-r2f1b-3c2-repair-e-brief.md`](2026-08-15-r2f1b-3c2-repair-e-brief.md)).
+- 2026-08-15: targeted repair `6b9788a6` (93 production/338 total, within
+  caps; in-container verify fully green) delivered all three repairs;
+  its advisory review REJECTed on exactly ONE fresh WRONG: the
+  post-settlement branch keyed on a PRE-settlement `timed_out` snapshot,
+  so a settlement crossing the deadline routed around the absorbing
+  `TimedOut` — a crossing success overwrote it with `Terminal` and
+  projected `Complete` (the projection's V3 arm bypasses the
+  overlapped-cleanup guard, and the cell became reclaimable), while a
+  crossing refusal overwrote the state and the dropped flight's
+  destructor performed the prohibited ignored after-deadline retry.
+  Population 3→1, shrinking and non-repeating. Operator source
+  verification confirmed every link; the repair had already built the
+  correct machinery (`retained_late_flight`, the reacquire-and-record
+  branch) but gated it on the stale snapshot. Preserved at
+  `salvage/r2f1b-3c2-e-repaired`.
+- 2026-08-15: disclosed operator completion `1f3c3a82` (+35/−13
+  production of which +15 `#[cfg(test)]`-gated, +153 tests, +54
+  handoff), red-first (both deadline-crossing regressions failed
+  behaviorally on `6b9788a6` at their `TimedOut` assertions; log
+  `e2-red.log`): the post-settlement branch now runs under a single lock
+  acquisition keyed on the CURRENT state — `TimedOut` is absorbing
+  (crossing success records `terminal` evidence without changing state;
+  crossing refusal stores the acceptance-aware diagnostic and retains
+  the flight so settlement is attempted exactly once); a
+  `#[cfg(test)]`-only ordering gate between snapshot and settlement
+  makes both schedules deterministic (fs_custody ordering-token
+  discipline). Full bridge-api suite green; remote_request_flight lib
+  unchanged 45/0; workspace clippy `-D warnings` clean. This completion
+  is INSIDE E's declared round — the counted closure reviews the full
+  line including it. Preserved at `salvage/r2f1b-3c2-e-completed`.
+- Host gates on exact `1f3c3a82` all exit 0: **4,084 passed / 0 failed /
+  13 ignored across 90 harnesses** (log `e-host-gates.log`; +11 over
+  Task D's totals = the repair's 9 tests plus the 2 crossing
+  regressions), hygiene green, post-gate self-reap ran.
+- Counted closure dispatched on the full `2697c438..1f3c3a82` line with
+  disclosed operator concerns for contest (test-seam neutrality,
+  finish/refuse inlining parity, acknowledged=true evidence claim,
+  snapshot-gated retry reasoning); brief mirrored as
+  [`2026-08-15-r2f1b-3c2-task-e-closure-brief.md`](2026-08-15-r2f1b-3c2-task-e-closure-brief.md).
 
 ## Non-scope reaffirmed
 
