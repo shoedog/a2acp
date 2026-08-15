@@ -5317,6 +5317,7 @@ mod tests {
 
         #[test]
         fn journal_route_custody_v2_same_cell_waits_on_the_process_mutex() {
+            use std::sync::atomic::{AtomicBool, Ordering};
             use std::sync::{mpsc, Arc};
             use std::time::Duration;
             let case = route_case();
@@ -5326,16 +5327,31 @@ mod tests {
             let held = custody
                 .begin_operation("first same-cell operation")
                 .unwrap();
+            // Ordering tokens: `main_holding` stays true until immediately before the
+            // first guard drops; the peer's injected flock records whether its attempt
+            // ran while the guard was still held. With the process mutex present the
+            // peer cannot reach flock before the release; if the mutex were removed it
+            // would reach flock while `main_holding` is true (or refuse WouldBlock on
+            // the held lease), failing the final assertions either way.
+            let main_holding = Arc::new(AtomicBool::new(true));
+            let flock_saw_holder = Arc::new(AtomicBool::new(false));
             let (entered_tx, entered_rx) = mpsc::channel();
             let (done_tx, done_rx) = mpsc::channel();
             let peer = Arc::clone(&custody);
+            let peer_holding = Arc::clone(&main_holding);
+            let peer_saw = Arc::clone(&flock_saw_holder);
             let thread = std::thread::spawn(move || {
                 done_tx
                     .send(
                         peer.begin_operation_with(
                             "queued same-cell operation",
                             || entered_tx.send(()).unwrap(),
-                            flock,
+                            move |file| {
+                                if peer_holding.load(Ordering::SeqCst) {
+                                    peer_saw.store(true, Ordering::SeqCst);
+                                }
+                                flock(file)
+                            },
                             || {},
                         )
                         .is_ok(),
@@ -5344,9 +5360,15 @@ mod tests {
             });
             entered_rx.recv().unwrap();
             assert!(done_rx.recv_timeout(Duration::from_millis(100)).is_err());
+            main_holding.store(false, Ordering::SeqCst);
             drop(held);
             assert!(done_rx.recv_timeout(Duration::from_secs(2)).unwrap());
             thread.join().unwrap();
+            assert!(
+                !flock_saw_holder.load(Ordering::SeqCst),
+                "peer reached flock while the first operation was still held: the \
+                 process mutex did not serialize same-cell acquisition"
+            );
         }
 
         #[test]
