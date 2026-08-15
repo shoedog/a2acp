@@ -518,7 +518,14 @@ mod mechanism {
             if hook(TransitionV2::TargetSynced, intent.parts().1) {
                 return debt(recovery, format!("{label}: committed target retains debt"));
             }
-            Self::finish(op, &intent, intent_snap, &mut hook, label)
+            Self::finish(
+                op,
+                &intent,
+                intent_snap,
+                Some((staged, commitment)),
+                &mut hook,
+                label,
+            )
         }
         fn retire_with<F>(
             op: &JournalRootOperationV2<'_>,
@@ -584,12 +591,13 @@ mod mechanism {
             if hook(TransitionV2::Captured, intent.capture_name()) {
                 return debt(recovery, format!("{label}: interrupted after capture"));
             }
-            Self::finish(op, &intent, intent_snap, &mut hook, label)
+            Self::finish(op, &intent, intent_snap, None, &mut hook, label)
         }
         fn finish<F>(
             op: &JournalRootOperationV2<'_>,
             intent: &CustodyIntentV2,
             intent_snap: FileContentSnapshotV2,
+            target_expectation: Option<(FileContentSnapshotV2, CommitmentV2)>,
             hook: &mut F,
             label: &str,
         ) -> NamespaceTransactionOutcomeV2
@@ -608,6 +616,13 @@ mod mechanism {
                 }
                 Err(e) => return debt(recovery, e),
             };
+            if let Some((staged, commitment)) = target_expectation {
+                if let Err(e) =
+                    verify_target(op.root_file(), intent.parts().1, staged, commitment, label)
+                {
+                    return debt(recovery, e);
+                }
+            }
             if let Err(e) = remove(
                 op.root_file(),
                 capture,
@@ -763,7 +778,14 @@ mod mechanism {
                         ) {
                             return debt(recovery, e);
                         }
-                        return Self::finish(op, &intent, intent_snap, &mut hook, label);
+                        return Self::finish(
+                            op,
+                            &intent,
+                            intent_snap,
+                            Some((*intent.parts().3, commitment)),
+                            &mut hook,
+                            label,
+                        );
                     }
                     if target.is_none()
                         && swap.is_some()
@@ -794,7 +816,7 @@ mod mechanism {
                         );
                     }
                     if target.is_none() && del.map(|v| v.object) == Some(*intent.parts().2) {
-                        return Self::finish(op, &intent, intent_snap, &mut hook, label);
+                        return Self::finish(op, &intent, intent_snap, None, &mut hook, label);
                     }
                     debt(recovery, format!("{label}: retirement residue retained"))
                 }
@@ -1288,6 +1310,123 @@ mod mechanism {
                 NamespaceTransactionOutcomeV2::ProtectiveDebt(_)
             ));
             assert!(over.root.join("child-0").exists());
+        }
+
+        #[test]
+        fn namespace_transaction_post_digest_target_mutation_refuses_completion() {
+            let case = case();
+            let expected = case.expected();
+            let root = case.root.clone();
+            let outcome = case.operate(|op| {
+                NamespaceTransactionV2::replace_with(
+                    op,
+                    target(),
+                    expected,
+                    b"B",
+                    "post-digest mutation",
+                    |transition, _| {
+                        if transition == TransitionV2::TargetSynced {
+                            fs::write(root.join("target"), b"C").unwrap();
+                        }
+                        false
+                    },
+                )
+            });
+            assert!(
+                matches!(outcome, NamespaceTransactionOutcomeV2::Retained(_, _)),
+                "{outcome:?}"
+            );
+            assert_eq!(fs::read(case.root.join("target")).unwrap(), b"C");
+            assert_eq!(
+                fs::read(
+                    case.root
+                        .join(reserved(ReservedNameNamespaceV2::ReplacementCapture).as_os_str())
+                )
+                .unwrap(),
+                b"A"
+            );
+        }
+
+        #[test]
+        fn namespace_transaction_recovery_unsupported_identity_is_typed() {
+            let case = case();
+            let expected = case.expected();
+            let _ = case.operate(|op| {
+                NamespaceTransactionV2::replace_with(
+                    op,
+                    target(),
+                    expected,
+                    b"B",
+                    "unsupported setup",
+                    |transition, _| transition == TransitionV2::IntentSynced,
+                )
+            });
+            assert!(!residue(&case).is_empty());
+            SNAPSHOT_UNSUPPORTED.with(|fault| fault.set(true));
+            let outcome =
+                case.operate(|op| NamespaceTransactionV2::recover(op, "unsupported recovery"));
+            assert!(
+                matches!(outcome, NamespaceTransactionOutcomeV2::Unsupported(_)),
+                "{outcome:?}"
+            );
+            assert!(!residue(&case).is_empty());
+            assert!(matches!(
+                case.operate(|op| NamespaceTransactionV2::recover(op, "after")),
+                NamespaceTransactionOutcomeV2::NoEffect(_, _)
+            ));
+        }
+
+        #[test]
+        fn namespace_transaction_missing_birthtime_identity_classifies_unsupported() {
+            let error = required_object_identity_v2(1, 2, None, "missing birthtime").unwrap_err();
+            let outcome = debt(ticket(CustodyOperationKindV2::Replace, &target()), error);
+            assert!(
+                matches!(outcome, NamespaceTransactionOutcomeV2::Unsupported(_)),
+                "{outcome:?}"
+            );
+            let error = required_object_identity_v2(1, 2, None, "missing birthtime").unwrap_err();
+            assert!(matches!(
+                protect(error),
+                NamespaceTransactionOutcomeV2::Unsupported(_)
+            ));
+        }
+
+        #[test]
+        fn namespace_transaction_wire_rejects_mismatched_commitment_presence() {
+            for (operation, commitment) in [
+                (CustodyOperationKindV2::Replace, None),
+                (CustodyOperationKindV2::Retire, Some([0u8; 32])),
+            ] {
+                let case = case();
+                let staged = required_file_content_snapshot_v2(
+                    &File::open(case.root.join("target")).unwrap(),
+                    "wire fixture",
+                )
+                .unwrap();
+                let intent =
+                    CustodyIntentV2::new(operation, target(), staged.object, staged).unwrap();
+                let bytes = serde_json::to_vec(&to_wire(&intent, commitment)).unwrap();
+                fs::write(
+                    case.root.join(
+                        intent
+                            .reserved_name(ReservedNameNamespaceV2::TransactionIntent)
+                            .as_os_str(),
+                    ),
+                    bytes,
+                )
+                .unwrap();
+                let outcome =
+                    case.operate(|op| NamespaceTransactionV2::recover(op, "wire negative"));
+                assert!(
+                    matches!(
+                        outcome,
+                        NamespaceTransactionOutcomeV2::ProtectiveDebt(ref reason)
+                            if reason.contains("invalid staged commitment")
+                    ),
+                    "{outcome:?}"
+                );
+                assert!(!residue(&case).is_empty());
+            }
         }
 
         #[test]
