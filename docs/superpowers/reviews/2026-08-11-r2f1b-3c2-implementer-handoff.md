@@ -702,3 +702,82 @@ The publisher receives the full private attempt+ordinal+request delivery identit
 Changed paths are `crates/bridge-core/src/remote_request_flight.rs` and this handoff; `lib.rs` required no change. Post-format accounting versus the frozen input is 480 raw pre-test production changed lines, 336 colocated-test changed lines, and 29 handoff additions: 845 total churn, below both stop limits.
 
 Tasks D-G, production V3, every production caller/route, live providers, smoke, compatibility, deployment, fold, push, and the running operator remain unarmed and unchanged.
+
+## Task C targeted repair: lease-first open and lease-aware headroom
+
+Date: 2026-08-15. Exact frozen input:
+`4db414f08b96541d8471707b4143903d7a4a75e6` (`4db414f0`).
+
+### Admissible fail-first evidence
+
+All three commands reached `bridge-core`, selected exactly one test, and exited
+101 on the frozen production mechanisms; none was a dependency, network, or
+zero-selection refusal:
+
+- `CARGO_INCREMENTAL=0 cargo test -p bridge-core --lib --locked --offline -- remote_request_flight_capacity_counts_permanent_lease_before_mint_or_mutation --nocapture`
+  failed 0/1 because the 4,094-entry root admitted, minted, and mutated instead
+  of returning `Capacity` before the mint.
+- The same command with selector
+  `remote_request_flight_interrupted_positive_edge_reopens_with_healing_headroom`
+  failed 0/1 because reopen returned exact `TaskA(ProtectiveDebt, "close orphan
+  request: ...")` at the old positive edge.
+- The same command with selector
+  `remote_request_flight_task_c_attempt_lease_precedes_contended_operation`
+  failed 0/1 at the exact-`AttemptLive` assertion while the ordering token proved
+  the first admission closure still held its Task A operation.
+
+### Repair and bounded evidence
+
+`ADMISSION_FOOTPRINT` is now four: checkpoint replacement headroom plus the
+permanent checkpoint and attempt-lease children are accounted before mint or
+mutation. The exact maximum census now refuses byte-identically, and the
+positive-edge fixture moves down one child; an interruption before checkpoint
+advance reopens, relabels, advances, and completes without protective debt.
+
+The only Task A production addition is the one
+`pub(crate) JournalRootCustodyV2::acquire_existing_regular_child_lease`
+accessor (plus its non-Unix refusing form). It proves the bound route before
+and after, opens an exact existing regular child descriptor-relatively with
+no create and no follow, takes a nonblocking flock, rechecks that the name
+still denotes the opened object, and returns only the lease guard plus content
+snapshot: no file, route path, or mutation authority. Colocated tests cover
+wrong-route identity, wrong type, no creation, contention, drop release, and
+subsequent acquisition. `open_recovered` uses this accessor first; only a held
+lifetime lease can precede any Task A operation. A live holder returns exact
+`AttemptLive` with unchanged bytes, then drop permits a successful open.
+
+Folded evidence is explicit. A one-line mutation of armed-send recovery from
+`Unknown` to `Failed` made
+`remote_request_flight_task_c_recovers_every_durable_prefix_without_resend`
+fail 0/1 at prefix 3 with left `(Failed, true)` versus right `(Unknown, true)`.
+A separately restored one-line inversion of exact acknowledgement matching
+made `remote_request_flight_task_c_pending_outbox_replays_until_exact_ack`
+fail 0/1 with `PublicationAcknowledgementMismatch` on the later exact echo.
+The refusal and mismatch arms now assert their exact distinct errors, and a
+real `PreSendFailure` recovery publishes exact `Failed,false` then retires.
+
+Named migrated setup inventory: `initialized` retains the test-only B-era
+opener, while its cap-edge setup moved from reduced capacity to the real 4,096
+Task A boundary because that is where replacement headroom is enforced;
+`unchecked` continues through production `open_recovered`, so its callers drop
+the prior journal before a second custody handle acquires the lease; the
+foreign-checkpoint setup intentionally remains on test-only `open_with_capacity`
+because it isolates checkpoint authorization before Task A recovery rather
+than exercising publisher recovery.
+
+### Verification and accounting
+
+- Focused `remote_request_flight`: 32 passed, 0 failed, 614 filtered out.
+- Required aggregate command: 152 passed, 0 failed, 494 filtered out.
+- `git diff --check`, direct `rustfmt --edition 2021 --check`, and bridge-core
+  library Clippy with `-D warnings` pass. Required `cargo fmt --all -- --check`
+  cannot start because this Cargo has no `fmt` subcommand; no `rustfmt::skip` was added.
+- No live/billable agent, provider, smoke, compatibility, network, deployment,
+  fold, push, or running-operator action ran.
+
+Post-format churn versus `4db414f0` is 76 production lines and 216 colocated-
+test lines. This repair record adds 79 documentation lines, for 371 total
+changed lines. The 180-production / 450-total stop limits are not approached.
+
+Tasks D-G and production V3 remain unarmed; every production caller/route is
+unchanged and no later task is implied or activated.
