@@ -781,3 +781,22 @@ changed lines. The 180-production / 450-total stop limits are not approached.
 
 Tasks D-G and production V3 remain unarmed; every production caller/route is
 unchanged and no later task is implied or activated.
+
+### Task C closure extension (exact head record)
+
+The C closure review confirmed both round-1 blockers FIXED and found one
+fresh ordering defect: recovery ran before the full request census was
+validated, so an attempt containing both Task A residue and an
+independently corrupt row surfaced recovery's protective classification
+(and could mutate legitimate residue) instead of refusing byte-preserved on
+the corrupt row. Under the disclosed operator convergence extension, `open`
+now runs a residue-tolerant validation pass (`scan_with`) over every
+ordinary row before any recovery; reserved Task A entries are skipped there
+because recovery owns their classification, and the full scan still runs
+after recovery. Red evidence: the composite regression (stage residue plus
+corrupt sibling) failed on the pre-change head with recovery's
+`ProtectiveDebt("missing or duplicate intent")` where `Malformed` was
+required; it now refuses `Malformed` with every root byte preserved, and
+the residue-only control still surfaces the recovery-side classification.
+This closes the validate-before-recover class at its terminal scope (the
+full census). Tasks D-G and production V3 remain unarmed.
