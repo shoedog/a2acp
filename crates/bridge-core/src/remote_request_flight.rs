@@ -989,6 +989,7 @@ impl RemoteRequestJournalV1 {
         authority: &RemoteRequestAuthorityV1,
         result: ResourceActionResultV1,
         accepted: bool,
+        allow_armed_pre_send: bool,
     ) -> FlightResult<RemoteRequestTerminalPublicationV1> {
         if self.requires_reopen {
             return Err(Refusal::ReopenRequired("prior transition was interrupted"));
@@ -1005,14 +1006,18 @@ impl RemoteRequestJournalV1 {
         let valid = if accepted {
             matches!(child.status, ChildStateV1::ProviderSendArmed {})
         } else {
+            // Only the arming wrapper's zero-poll failure branch may settle
+            // an armed row as unaccepted: it positively owns the unpolled
+            // future. Every ordinary settlement path must refuse, or a stale
+            // acceptance flag could durably misreport an accepted send.
             matches!(
                 child.status,
                 ChildStateV1::Active {}
                     | ChildStateV1::PreSendFailure {}
                     | ChildStateV1::IntentJournaled {}
                     | ChildStateV1::DispatchAuthorized {}
-                    | ChildStateV1::ProviderSendArmed {}
-            )
+            ) || (allow_armed_pre_send
+                && matches!(child.status, ChildStateV1::ProviderSendArmed {}))
         };
         if !valid {
             return Err(Refusal::InvalidStateTransition(
@@ -1056,7 +1061,7 @@ impl RemoteRequestJournalV1 {
         cut: Option<u8>,
     ) -> FlightResult<()> {
         let outcome = (|| {
-            let publication = self.terminal_winner(authority, result, accepted)?;
+            let publication = self.terminal_winner(authority, result, accepted, false)?;
             #[cfg(test)]
             boundary(cut, 0, "before publisher callback")?;
             self.publish_publication(authority, publication, cut)
@@ -1477,6 +1482,16 @@ impl OwnedRemoteRequestV1 {
         result: ResourceActionResultV1,
         accepted: bool,
     ) -> FlightResult<RemoteRequestTerminalOutcomeV1> {
+        self.settle_with_acceptance_mode(result, accepted, false)
+    }
+    /// `failed_arm` is the arming wrapper's zero-poll privilege: it alone may
+    /// settle an unaccepted terminal over a durably armed row.
+    fn settle_with_acceptance_mode(
+        &self,
+        result: ResourceActionResultV1,
+        accepted: bool,
+        failed_arm: bool,
+    ) -> FlightResult<RemoteRequestTerminalOutcomeV1> {
         self.settlement_attempted.store(true, Ordering::Release);
         let prior = { self.outcome_tx.borrow().clone() };
         let (outcome, publication) = if let Some(outcome) = prior {
@@ -1492,7 +1507,8 @@ impl OwnedRemoteRequestV1 {
                 let publication = outcome.publication.clone();
                 (outcome, publication)
             } else {
-                let publication = journal.terminal_winner(&self.authority, result, accepted)?;
+                let publication =
+                    journal.terminal_winner(&self.authority, result, accepted, failed_arm)?;
                 let outcome = RemoteRequestTerminalOutcomeV1::from(publication.clone());
                 self.outcome_tx.send_replace(Some(outcome.clone()));
                 (outcome, publication)
@@ -1573,7 +1589,7 @@ impl<F: Future> Future for ArmedProviderSendV1<'_, F> {
                 this.inner = None;
                 let _ = this
                     .request
-                    .settle_with_acceptance(failed_before_send(), false);
+                    .settle_with_acceptance_mode(failed_before_send(), false, true);
                 return Poll::Ready(Err(error));
             }
         }
@@ -3197,6 +3213,41 @@ mod tests {
         }));
         assert_eq!(send.await.unwrap(), 41);
         assert_eq!(polls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn remote_request_flight_stale_unarmed_settlement_cannot_consume_an_armed_row() {
+        // The exact arm/atomic handoff window: the durable armed row lands
+        // while this handle's acceptance atomic still reads false. An
+        // ordinary settlement using that stale flag must refuse instead of
+        // durably publishing accepted=false over a possibly accepted send.
+        let case = case();
+        let publisher = RecordingPublisher::with_replies([]);
+        initialize_root(&case, attempt(), 16);
+        let driver =
+            RemoteRequestDriverV1::open_recovered(custody(&case), attempt(), 16, publisher.clone())
+                .unwrap();
+        let request = driver.admit(owner(0)).unwrap();
+        request.journal_intent().unwrap();
+        request.authorize_dispatch().unwrap();
+        request
+            .lock()
+            .unwrap()
+            .arm_provider_send(&request.authority)
+            .unwrap();
+        let outcome = request.settle(failed_before_send()).err();
+        assert!(
+            matches!(
+                outcome,
+                Some(RemoteRequestFlightRefusalV1::InvalidStateTransition(_))
+            ),
+            "{outcome:?}"
+        );
+        assert!(
+            publisher.calls().is_empty(),
+            "no unaccepted terminal may publish over an armed row"
+        );
+        request.crash_without_settlement_for_test();
     }
 
     #[tokio::test(flavor = "current_thread")]
