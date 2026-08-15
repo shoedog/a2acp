@@ -949,6 +949,43 @@ All checks passed; no drift found.
   file); and the handoff naming **G2** as the separate smoke-consumer
   slice (no smoke.rs code here). Caps 100/300 (brief mirrored as
   [`2026-08-15-r2f1b-3c2-repair-g-brief.md`](2026-08-15-r2f1b-3c2-repair-g-brief.md)).
+- 2026-08-15: targeted repair `be7baa29` (248 total, within caps;
+  advisory review APPROVE — "delivered correctly and within scope" —
+  with two DEFERs: the undiscriminated aggregate red and a missing
+  configure-clean eviction regression). Operator source verification:
+  `retain_exhausted_failure = !cleanup_proven_complete` at BOTH break
+  sites feeding the exhausted terminal with the documented
+  evict-only-pre-acceptance-AND-proven-clean invariant; the
+  `Some(Ok(Complete)) | None` reason arm; the handoff's smoke census
+  naming G2 with a wire-compatibility boundary. In-container red =
+  flock-EBADF instance 9; host whole-bin control **1,086/0** (class 9/9
+  host-green). Preserved at `salvage/r2f1b-3c2-g-repaired`.
+- 2026-08-15: **first host-gate red of the lane** — the full gate on
+  `be7baa29` failed twice at the Task E public-path crossing test
+  (`Done("stop")` assertion) under full-suite load. Operator
+  investigation with declared hypotheses and discriminating probes:
+  10/10 isolated green on the exact head (falsifying G-regression);
+  same-environment BASE control — the full workspace suite at accepted
+  `f17e2bd3` — red at the SAME test and assertion (logs
+  `g-flake-probe.log`, `g-base-load-control.log`). Attribution: a
+  pre-existing E-test construction defect — `request_timeout` 200 ms is
+  one knob bounding BOTH the HTTP round and the cleanup deadline, and
+  the HTTP round exceeds it under parallel load; the test's determinism
+  actually lives in its barriers, not the clock. Disclosed operator
+  gate-repair `f04ec55e` (+7/−1, test-only, cross-crate — disclosed to
+  the closure for judgment): bound raised to 2 s with the invariant
+  documented; the crossing property is unchanged (isolated run took
+  2.09 s = the full deadline expiry under the held barrier). Same
+  hardening class the F2 closure prescribed for the signal test.
+  Preserved at `salvage/r2f1b-3c2-g-final`.
+- Host gates on exact `f04ec55e` all exit 0: **4,093 passed / 0 failed
+  / 13 ignored across 90 harnesses** (log `g-host-gates-final.log`;
+  under the same load profile that failed twice pre-hardening), hygiene
+  green, post-gate self-reap ran.
+- Counted closure dispatched on the full `f17e2bd3..f04ec55e` line with
+  the retention-completeness trace, the G2-naming adjudication, and the
+  gate-repair disposition all explicit; brief mirrored as
+  [`2026-08-15-r2f1b-3c2-task-g-closure-brief.md`](2026-08-15-r2f1b-3c2-task-g-closure-brief.md).
 
 ## Non-scope reaffirmed
 
