@@ -3,7 +3,53 @@
 Date: 2026-08-15
 Task G2 frozen input: `2a912d18067c0ae59a598d2ba1c3c611117e6c7b`
 Frozen targeted-repair input: `4c8e408bc2290db9de9a3c31763cc0a0a2655c76`
+Task G2 fallback-plan repair input: `737239ae16efd6be1ca2cd474586c5d8c751e16f`
 Original Task G base: `f17e2bd37868c398d5c04d175ffee2a5cc5c1a00`
+
+## Task G2 targeted repair: fallback-plan protective release vocabulary
+
+Against exact frozen input `737239ae`, fallback-plan cleanup validation now
+gives release its own accepted set: the old four values (`"not_needed"`,
+`"completed"`, `"failed"`, and `"timed_out"`) plus `"unknown"`, `"retained"`,
+and `"preserved"`. Cancel and retire remain on the old vocabulary; grace
+bounds and the backstop check are unchanged. The pre-spawn exact whole-wire
+authorization equality is also unchanged, so every protective release produces
+structured `eligible:false` with `source_diagnostics_incomplete` and no rerun
+command rather than authorizing a host attempt.
+
+### Targeted fail-first evidence
+
+The exact pre-change command was:
+
+```bash
+CARGO_INCREMENTAL=0 cargo test -p a2a-bridge --test fallback_plan_cli \
+  protective_release_ -- --nocapture
+```
+
+The binary and intended tests compiled against exact frozen input `737239ae`,
+selected three tests, and failed 0/3. For `"unknown"`, `"retained"`, and
+`"preserved"` independently, the fallback-plan subprocess exited nonzero with
+`invalid or incomplete smoke cleanup record` instead of emitting a JSON plan.
+This was admissible behavioral red evidence: all three failures exercised the
+exact frozen validation behavior rather than setup, dependency, network, or
+zero-selection failure.
+
+### Targeted verification and accounting
+
+- Focused protective fallback-plan cases: 3 passed, 0 failed.
+- Focused unchanged typed smoke release mapping: 4 passed, 0 failed.
+- Complete fallback-plan CLI suite: 28 passed, 0 failed.
+- Complete smoke CLI suite: 15 passed, 0 failed.
+- Complete `a2a-bridge` binary harness: 1,088 passed, 0 failed, 0 ignored.
+- `cargo fmt --all -- --check` and `git diff --check`: exit 0; no formatter-skip
+  attribute was added.
+
+Post-format churn versus `737239ae` is production +3/-1 (4 changed lines),
+focused CLI tests +33/-0, and this handoff +54/-8. Total churn is +90/-9 = 99
+changed lines, below the 60-production and 200-total stop limits.
+No live provider, billable smoke, compatibility run, release, deployment, or
+running-operator action occurred. The 3c2 aggregate review remains ahead, and
+production V3 remains unarmed.
 
 ## Task G2: protective typed smoke cleanup dispositions
 
@@ -54,19 +100,19 @@ artifact's `cleanup.release` field:
   the changed release value as terminal cleanup drift. The four checked-in
   pinned baseline rows and compatibility fixtures contain historical exact
   `"completed"` successes and remain valid without rewriting evidence.
-- `bin/a2a-bridge/src/fallback_plan.rs` deserializes release as a string, but its
-  validator is deliberately narrower than the general smoke wire: the only
-  authorizable cleanup record must byte-equal
+- `bin/a2a-bridge/src/fallback_plan.rs` deserializes release as a string. Its
+  release-only validator accepts the old four values plus `"unknown"`,
+  `"retained"`, and `"preserved"`; cancel and retire retain the old vocabulary.
+  Authorization still requires byte equality with
   `ordinary_pre_spawn_cleanup_wire_value`, whose release is `"not_needed"`.
-  Protective values are rejected fail-closed as invalid/incomplete and can
-  never authorize or emit a host command. No previously eligible fallback
-  artifact can contain a post-session protective release, so this does not
-  break the planner's supported input contract.
+  Protective values therefore produce structured `eligible:false` with
+  `source_diagnostics_incomplete` and no rerun command; none can authorize a
+  host attempt or change pre-spawn authorization.
 
 No other production reader accesses this field. Colocated smoke assertions,
 fallback/compatibility CLI fixtures, and `compatibility/baselines/pinned.json`
 exercise the readers above rather than define another parser. No reader needs
-an in-scope adaptation, and none upgrades a protective value to completion.
+another in-scope adaptation, and none upgrades a protective value to completion.
 
 ### Verification, accounting, and remaining boundary
 
