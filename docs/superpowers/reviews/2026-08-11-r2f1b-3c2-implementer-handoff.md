@@ -1,9 +1,60 @@
 # R2f1b 3c2 implementer handoff — API request-flight authority
 
 Date: 2026-08-15
-Base: `f17e2958b934534173f60f90e4fe71de070a338a`
+Base: `15912e3ab4f3a2c39bbe599d91010fe3f945b9f5`
 
 ## Outcome
+
+**Task F2 complete:** the retired retained shared-flight request adapter was
+removed on the exact frozen input `15912e3ab4f3a2c39bbe599d91010fe3f945b9f5`.
+This is deletion-only: production remains `LegacyV2`, the production V3 route
+remains `None`, and Task G remains unarmed.
+
+The workspace-wide reference census commands were:
+
+```bash
+rg -n "DurableRemoteRequestFlightV3|RemoteRequestSettlementV1|RemoteRequestFlightErrorV1|bind_remote_request|attach_remote_request_owner|settlement_handle" . \
+  --glob "!docs/superpowers/reviews/2026-08-11-r2f1b-3c2-implementer-handoff.md"
+rg -n "F2 removes this retained private" \
+  crates/bridge-core/src/process.rs \
+  crates/bridge-core/src/retained_resource_flight.rs
+```
+
+Both commands exited 1 with zero matches after deletion, covering all source and
+test paths while excluding only this evidence record. All seven F2-scoped
+`#[allow(dead_code)]` annotations disappeared with their items. The surviving
+`DurableProcessFlightAttemptV3` process/container route and its public
+`with_result_publisher` signature remain unchanged: `bind_generation` and
+`bind_container_generation` consume those route fields, so deleting them would
+have crossed the live-signature stop condition.
+
+Two tests were deleted because they exercised only
+`attach_remote_request_owner`, the deleted retained adapter seam:
+
+- `dedicated_remote_request_key_identity_mismatch_refuses_before_dispatch`
+- `dedicated_request_reserves_exact_full_lifecycle_before_owner_admission`
+
+The mixed
+`durable_attempt_route_reuses_exactly_one_registry_for_every_generation` test
+was retained; only its retired request-adapter fixture and assertions were
+deleted, leaving its process/container registry and journal assertions intact.
+
+Post-format churn versus `15912e3a` is production +3/-395 and this handoff
++52/-1, for 451 changed lines by additions plus
+deletions. This remains below 50 added production lines and 600 total changed
+lines.
+
+Verification: warnings-denied all-workspace/all-target/all-feature locked Clippy
+passes; `bridge-api` passes all harnesses (98 passed, 1 explicitly ignored) and
+doctests (0 tests) with the documented loopback exemption and pinned rustdoc;
+formatting and diff checks pass. The exact focused core selector ran 128/129
+green twice, but the untouched, frozen-base-identical
+`term_ignoring_child_with_descendant_is_group_killed_host_signal_semantics`
+failed both times because the killed descendant remained visible in this
+container. That same host-signal failure is already recorded below from Task F;
+no process behavior or test expectation was changed in this deletion task.
+
+## Accepted Task F history
 
 **Task F targeted repair:** terminal disposition is now keyed to actual provider-send
 acceptance, not merely to `begin_dispatch` authorization. The exact frozen input

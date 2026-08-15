@@ -35,13 +35,13 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use tokio::io::AsyncReadExt;
 use tokio::process::{Child, ChildStderr, Command};
 
-use crate::attempt_activity::{MonotonicClock, SystemMonotonicClock};
+use crate::attempt_activity::SystemMonotonicClock;
 use crate::execution_policy::{BoundedCauseV1, Sha256HexV1};
 use crate::ids::{AttemptId, NodeId};
 use crate::reaper::DurableContainerFlightV3;
 use crate::resource_flight::{
-    DedicatedRemoteRequestIdV1, ProcessStartIdentityV1, ResourceActionDispositionV1,
-    ResourceActionResultV1, ResourceFlightIdV1, ResourceFlightStateV1, ResourceIdentityV1,
+    ProcessStartIdentityV1, ResourceActionDispositionV1, ResourceActionResultV1,
+    ResourceFlightIdV1, ResourceFlightStateV1, ResourceIdentityV1,
 };
 pub use crate::retained_resource_flight::OwnedProcessTreeV1;
 use crate::retained_resource_flight::{
@@ -731,143 +731,6 @@ impl DurableProcessFlightV3 {
     }
 }
 
-// F2 removes this retained private request-flight error adapter.
-#[allow(dead_code)]
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum RemoteRequestFlightErrorV1 {
-    IdentityUnavailable,
-    IdentityCollision,
-    Admission(String),
-}
-
-impl std::fmt::Display for RemoteRequestFlightErrorV1 {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::IdentityUnavailable => f.write_str("remote request flight identity unavailable"),
-            Self::IdentityCollision => f.write_str("remote request flight identity collided"),
-            Self::Admission(detail) => {
-                write!(f, "remote request flight admission refused: {detail}")
-            }
-        }
-    }
-}
-
-impl std::error::Error for RemoteRequestFlightErrorV1 {}
-
-/// One exact, non-cloneable remote request flight.
-///
-/// The attempt route has already reserved the key, attached its owner, recorded
-/// the request identity, closed admission, and journaled intent before returning
-/// this value. `begin_dispatch` is the final pre-POST journal fence. Dropping a
-/// dispatched value settles `Unknown`; dropping before dispatch settles `Failed`.
-// F2 removes this retained private request-flight adapter.
-#[allow(dead_code)]
-pub(crate) struct DurableRemoteRequestFlightV3 {
-    request_id: DedicatedRemoteRequestIdV1,
-    flight: Arc<RetainedResourceFlight>,
-    clock: Arc<dyn MonotonicClock>,
-    dispatched: bool,
-    settled: bool,
-}
-
-/// Cloneable observation-only authority for joining the durable request winner.
-// F2 removes this retained private settlement adapter.
-#[allow(dead_code)]
-#[derive(Clone)]
-pub(crate) struct RemoteRequestSettlementV1 {
-    flight: Arc<RetainedResourceFlight>,
-}
-
-impl RemoteRequestSettlementV1 {
-    // F2 removes this retained private adapter method.
-    #[allow(dead_code)]
-    pub fn join_blocking(&self) -> Result<ResourceActionResultV1, RemoteRequestFlightErrorV1> {
-        self.flight
-            .join_blocking()
-            .map_err(|error| RemoteRequestFlightErrorV1::Admission(error.to_string()))
-    }
-}
-
-impl std::fmt::Debug for DurableRemoteRequestFlightV3 {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("DurableRemoteRequestFlightV3")
-            .field("request_id", &self.request_id)
-            .field("resource_flight_id", self.flight.flight_id())
-            .field("dispatched", &self.dispatched)
-            .field("settled", &self.settled)
-            .finish()
-    }
-}
-
-// F2 removes these retained private adapter methods.
-#[allow(dead_code)]
-impl DurableRemoteRequestFlightV3 {
-    #[must_use]
-    pub fn request_id(&self) -> &DedicatedRemoteRequestIdV1 {
-        &self.request_id
-    }
-
-    #[must_use]
-    pub fn flight_id(&self) -> &ResourceFlightIdV1 {
-        self.flight.flight_id()
-    }
-
-    #[must_use]
-    pub fn settlement_handle(&self) -> RemoteRequestSettlementV1 {
-        RemoteRequestSettlementV1 {
-            flight: Arc::clone(&self.flight),
-        }
-    }
-
-    pub fn begin_dispatch(&mut self) -> Result<(), RemoteRequestFlightErrorV1> {
-        self.flight
-            .begin_journaled_dispatch()
-            .map_err(|error| RemoteRequestFlightErrorV1::Admission(error.to_string()))?;
-        self.dispatched = true;
-        Ok(())
-    }
-
-    pub fn settle(
-        &mut self,
-        disposition: ResourceActionDispositionV1,
-    ) -> Result<ResourceActionResultV1, RemoteRequestFlightErrorV1> {
-        if self.settled {
-            return self
-                .flight
-                .join_blocking()
-                .map_err(|error| RemoteRequestFlightErrorV1::Admission(error.to_string()));
-        }
-        let proposed = ResourceActionResultV1 {
-            disposition,
-            duration_ms: self.clock.elapsed_ms(),
-            recovery_owner: None,
-            cause: None,
-        };
-        let result = if self.dispatched {
-            self.flight.settle(proposed)
-        } else {
-            self.flight.settle_failed_before_dispatch(proposed)
-        }
-        .map_err(|error| RemoteRequestFlightErrorV1::Admission(error.to_string()))?;
-        self.settled = true;
-        Ok(result)
-    }
-}
-
-impl Drop for DurableRemoteRequestFlightV3 {
-    fn drop(&mut self) {
-        if self.settled {
-            return;
-        }
-        let disposition = if self.dispatched {
-            ResourceActionDispositionV1::Unknown
-        } else {
-            ResourceActionDispositionV1::Failed
-        };
-        let _ = self.settle(disposition);
-    }
-}
-
 /// Attempt-scoped production binding for protected ACP generations.
 ///
 /// Construct this exactly once at V3 attempt admission and reuse it for every
@@ -950,88 +813,6 @@ impl DurableProcessFlightAttemptV3 {
             owner,
             result_publisher: Arc::clone(&self.result_publisher),
         })
-    }
-
-    /// Reserve one request through this attempt's exact registry and journal.
-    /// A duplicate key is a collision/refusal, never a join: every POST owns a
-    /// distinct identity and flight.
-    // F2 removes this retained private request-binding adapter.
-    #[allow(dead_code)]
-    pub(crate) fn bind_remote_request(
-        &self,
-        request_id: DedicatedRemoteRequestIdV1,
-        owner: ResourceFlightOwnerV1,
-    ) -> Result<DurableRemoteRequestFlightV3, RemoteRequestFlightErrorV1> {
-        let clock: Arc<dyn MonotonicClock> = Arc::new(SystemMonotonicClock::start());
-        self.registry
-            .recover_remote_request_reservations(
-                self.journal.as_ref(),
-                clock.elapsed_ms(),
-                self.result_publisher.as_ref(),
-            )
-            .map_err(|error| RemoteRequestFlightErrorV1::Admission(error.to_string()))?;
-        let identity = ResourceIdentityV1::DedicatedRemoteRequest {
-            request_id: request_id.clone(),
-        };
-        let key = ResourceFlightKeyV1::from_identity(&identity);
-        let reservation = self
-            .registry
-            .reserve(RetainedResourceFlightConfigV1 {
-                flight_id: ResourceFlightIdV1::mint()
-                    .map_err(|_| RemoteRequestFlightErrorV1::IdentityUnavailable)?,
-                attempt_id: self.attempt_id.clone(),
-                key,
-                journal: Arc::clone(&self.journal) as Arc<dyn ResourceFlightJournal>,
-                clock: Arc::clone(&clock),
-                result_publisher: Arc::clone(&self.result_publisher),
-            })
-            .map_err(|error| RemoteRequestFlightErrorV1::Admission(error.to_string()))?;
-        let flight = match reservation {
-            ResourceFlightReservationV1::Created(flight) => flight,
-            ResourceFlightReservationV1::Joined(_)
-            | ResourceFlightReservationV1::Recovered { .. } => {
-                return Err(RemoteRequestFlightErrorV1::IdentityCollision)
-            }
-        };
-        let mut request = DurableRemoteRequestFlightV3 {
-            request_id,
-            flight,
-            clock,
-            dispatched: false,
-            settled: false,
-        };
-        let admission = (|| {
-            request
-                .flight
-                .attach_remote_request_owner(owner.clone(), identity)
-                .map_err(|error| RemoteRequestFlightErrorV1::Admission(error.to_string()))?;
-            request
-                .flight
-                .close_admission()
-                .map_err(|error| RemoteRequestFlightErrorV1::Admission(error.to_string()))?;
-            let digest = ring::digest::digest(
-                &ring::digest::SHA256,
-                request.request_id.as_str().as_bytes(),
-            )
-            .as_ref()
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect::<String>();
-            request
-                .flight
-                .journal_intent(ResourceActionIntentV1 {
-                    initiator: owner,
-                    capability_digest: Sha256HexV1::parse(digest)
-                        .map_err(|_| RemoteRequestFlightErrorV1::IdentityUnavailable)?,
-                    cause: None,
-                })
-                .map_err(|error| RemoteRequestFlightErrorV1::Admission(error.to_string()))
-        })();
-        if let Err(error) = admission {
-            let _ = request.settle(ResourceActionDispositionV1::Failed);
-            return Err(error);
-        }
-        Ok(request)
     }
 }
 
@@ -2772,7 +2553,6 @@ impl OwnedProcessTreeV1 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::retained_resource_flight::ResourceFlightJournalEventV1;
     use std::os::fd::AsRawFd as _;
     use std::time::Duration;
 
@@ -4725,21 +4505,6 @@ mod tests {
                 .unwrap(),
             )
             .unwrap();
-
-        let request_id = DedicatedRemoteRequestIdV1::parse(format!(
-            "{}{}",
-            DedicatedRemoteRequestIdV1::PREFIX,
-            "1".repeat(64)
-        ))
-        .unwrap();
-        let mut request = route
-            .bind_remote_request(
-                request_id.clone(),
-                ResourceFlightOwnerV1::new(NodeId::parse("request-node").unwrap(), "request-a")
-                    .unwrap(),
-            )
-            .unwrap();
-
         assert!(Arc::ptr_eq(&route.registry, &first.registry));
         assert!(Arc::ptr_eq(&first.registry, &second.registry));
         assert!(Arc::ptr_eq(&route.registry, &container.registry));
@@ -4747,42 +4512,6 @@ mod tests {
         assert!(Arc::ptr_eq(&first.journal, &second.journal));
         let route_journal = Arc::clone(&route.journal) as Arc<dyn ResourceFlightJournal>;
         assert!(Arc::ptr_eq(&route_journal, &container.journal));
-        let abandoned_id = request.flight_id().clone();
-        request.begin_dispatch().unwrap();
-        std::mem::forget(request);
-
-        for _ in 0..2 {
-            let publisher_port: Arc<dyn ResourceFlightResultPublisher> = publisher.clone();
-            let reopened = DurableProcessFlightAttemptV3::new(
-                attempt_id.clone(),
-                Arc::new(FileResourceFlightJournal::open(root.path(), 512).unwrap()),
-            )
-            .with_result_publisher(publisher_port);
-            assert_eq!(
-                reopened
-                    .bind_remote_request(
-                        request_id.clone(),
-                        ResourceFlightOwnerV1::new(
-                            NodeId::parse("request-node").unwrap(),
-                            "request-a",
-                        )
-                        .unwrap(),
-                    )
-                    .unwrap_err(),
-                RemoteRequestFlightErrorV1::IdentityCollision
-            );
-        }
-        let rows = route.journal.records(&abandoned_id).unwrap();
-        assert_eq!(
-            rows.iter()
-                .filter(
-                    |row| matches!(&row.event, ResourceFlightJournalEventV1::Settled { result }
-                    if result.disposition == ResourceActionDispositionV1::Unknown)
-                )
-                .count(),
-            1
-        );
-        assert_eq!(publisher.0.lock().unwrap().len(), 1);
     }
 
     #[tokio::test]
