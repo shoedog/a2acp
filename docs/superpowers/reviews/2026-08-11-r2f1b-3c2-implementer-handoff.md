@@ -673,3 +673,32 @@ residual remains the accepted, owner-ledgered Task A semantics; the
 below-checkpoint send-state discrimination remains Task C scope, as does
 the attempt-bound authority identity. Tasks C-G and production V3 remain
 unarmed.
+
+## Task C attempt lease, recovery table, and acknowledged outbox
+
+Date: 2026-08-15. Exact frozen input: `dbf514bd548f00ab4563d36ee48dcecf2cd343b8`.
+
+### Admissible red evidence
+
+Exact pre-production command: `CARGO_INCREMENTAL=0 cargo test -p bridge-core --lib --locked --offline -- remote_request_flight --nocapture`.
+Cargo reached `bridge-core` and exited nonzero with five Task-C-specific missing-symbol failures naming `RemoteRequestDeliveryIdV1`, `RemoteRequestTerminalPublicationV1`, and `RemoteRequestResultPublisherV1`. It was neither dependency/network refusal nor zero selection.
+
+### Result and recovery contract
+
+Initialization now creates the empty attempt-lock child. The sole production constructor is `open_recovered(custody, attempt, capacity, publisher)`; it takes a nonblocking whole-attempt lease before recovery or mutation, returns typed `AttemptLive` to a second opener without changing bytes, and releases the lease when the journal drops. The order is attempt lease, admission mutex, request transition, then Task A operation. No Task A operation, admission mutex, or transition borrow is held across the publisher callback; the lifetime attempt lease remains held as the opener exclusion invariant.
+
+The strict child progression is reserved, intent journaled, dispatch authorized, provider-send armed, terminal pending publication, publication acknowledged, then retirement. Exact-order transitions use Task A replacement and invalid order is nonmutating. Recovery maps reserved/intent/dispatch to `Failed,false`, armed to `Unknown,true`, replays pending publication without provider resend, and retires an exact acknowledged delivery without republishing. Corrupt, foreign, over-cap, ambiguous, and unknown-field roots remain fail-closed and byte-preserving.
+
+The publisher receives the full private attempt+ordinal+request delivery identity, terminal result, and acceptance bit. Its trait contract requires durable sink deduplication before echoing that exact identity; callback count may exceed one, while the committed sink effect is exactly once. Refusal or mismatched acknowledgement leaves the durable pending row in place and blocks constructor success/admission until a later exact echo. Test-only B-era openers retain their original recovery behavior; no production legacy opener was exported.
+
+### Verification and accounting
+
+- Required aggregate command `CARGO_INCREMENTAL=0 cargo test -p bridge-core --lib -- remote_request_flight namespace_transaction custody_v2 fs_custody journal`: 147 passed, 0 failed, 494 filtered out.
+- Final focused Task C/module sweep: 29 passed, 0 failed, 612 filtered out.
+- Direct `rustfmt --edition 2021 --check crates/bridge-core/src/remote_request_flight.rs`, `git diff --check`, and bridge-core library all-feature offline clippy with `-D warnings`: exit 0.
+- Required `cargo fmt --all -- --check` was run but cannot start because this Cargo installation has no `fmt` subcommand; the available direct `rustfmt` check passed and no `rustfmt::skip` was added.
+- No live/billable agent, smoke, compatibility, provider, network, or deployment action ran.
+
+Changed paths are `crates/bridge-core/src/remote_request_flight.rs` and this handoff; `lib.rs` required no change. Post-format accounting versus the frozen input is 480 raw pre-test production changed lines, 336 colocated-test changed lines, and 29 handoff additions: 845 total churn, below both stop limits.
+
+Tasks D-G, production V3, every production caller/route, live providers, smoke, compatibility, deployment, fold, push, and the running operator remain unarmed and unchanged.
