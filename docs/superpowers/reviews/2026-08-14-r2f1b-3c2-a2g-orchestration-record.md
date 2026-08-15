@@ -199,6 +199,32 @@ All checks passed; no drift found.
   repair / redesign) and a ruling on the W1 content-commitment question.
   Gate lesson ledgered: reject module-level `#[rustfmt::skip]` on production
   code in hygiene.
+- 2026-08-14: **OWNER DECISION — Path 2 approved** ("approved recommendation,
+  proceed"): amend the caps as a one-time regularization, run the one
+  classified targeted repair, one closure review; fold the W1 content
+  commitment into the repair (owner "yes" on W1). Amended caps: A3 = the
+  measured true size plus repair headroom of **150 production / 350 total**
+  relative to the reformatted base; the A1-A4 aggregate production budget is
+  re-authorized to the plan's honest arithmetic (~1,600 production) — the
+  original 700 was an estimation error since the plan's own per-task caps
+  sum to 1,020. Standing rule for every remaining brief (A4, B-G): caps are
+  measured post-`cargo fmt`; module-level `#[rustfmt::skip]` on production
+  code is an automatic reject; the hygiene-gate code change is a separate
+  later slice.
+- 2026-08-14: mechanical reformat executed operator-side on the retained
+  clone (deterministic: attribute removal + `cargo fmt`; the dc6b9031-class
+  disclosed operator action): commit `b1b55a218c0b78213ec4a719ab96831cd766bd87`,
+  +1,069/−427 in `namespace_transaction.rs` only, `cargo fmt --all --check`
+  clean, focused custody suites 92/92 green — zero semantic change. This
+  makes the semantic repair's caps measurable.
+- 2026-08-14: targeted repair dispatched from exact `b1b55a21` — brief
+  `repair-a3.md` (durable copy beside this record as
+  [`2026-08-14-r2f1b-3c2-task-a3-repair-brief.md`](2026-08-14-r2f1b-3c2-task-a3-repair-brief.md)):
+  R1 typed-`Unsupported` preservation (confirmed W4), R2 SHA-256 staged
+  content commitment on replace `Complete` paths (W1, with the recorded
+  retire-needs-no-commitment reasoning), R3 mutex-test determinism + full
+  retire crash-cut matrix with the residue-disposition ledger note, R4
+  normal formatting. One closure review follows; no further rounds.
 
 ## Non-scope reaffirmed
 
