@@ -1656,3 +1656,25 @@ exact-command run. The F2 acceptance contract's focused gate is
 satisfied by the dated exact-command run above. No code changed in this
 completion; F2 remains deletion-only. Task G and production V3 remain
 unarmed.
+
+### Operator completion: G2 repair gate evidence (2026-08-15)
+
+The repair's advisory review adjudicated the scoped code repair correct
+and rejected solely on the red in-container whole-bin test gate. That
+gate is now green and the failure classified:
+
+- Exact post-commit host run on `bc313dc6`, 2026-08-15 (log
+  `g2r-wholebin-host.log`): `cargo test -p a2a-bridge --bin a2a-bridge
+  --locked --all-features` → **1,090 passed / 0 failed**.
+- The in-container failure carried the ledgered flock-EBADF hermetic
+  signature (`authority-state.lock`/`owner-admission.lock`, Bad file
+  descriptor, os error 9; no per-test failure identity in the captured
+  output) — the TENTH instance of the class this lane, host-green on
+  every exact-command control (now 10/10). The class was established
+  with in-container same-environment controls earlier in the lane and
+  has never reproduced outside the container.
+- The G2 repair diff touches only `fallback_plan.rs` release validation,
+  CLI tests, and this handoff — no process, lock, or liveness code.
+
+No code changed in this completion. The 3c2 aggregate review remains
+ahead; production V3 remains unarmed.
