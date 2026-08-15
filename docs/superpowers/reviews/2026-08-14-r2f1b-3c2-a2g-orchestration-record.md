@@ -1047,6 +1047,24 @@ All checks passed; no drift found.
   targeted repair on frozen `737239ae` with per-value CLI reds and
   old-vocabulary/pre-spawn pins (caps 60/200; brief mirrored as
   [`2026-08-15-r2f1b-3c2-repair-g2-brief.md`](2026-08-15-r2f1b-3c2-repair-g2-brief.md)).
+- 2026-08-15: targeted repair `bc313dc6` (4 production/99 total): the
+  release field gets its own accepted set; cancel/retire keep the old
+  vocabulary; pre-spawn whole-wire authorization unchanged; per-value
+  fail-first CLI reds. Advisory review: **the code repair is CORRECT**;
+  rejected solely on the red in-container whole-bin gate — the
+  flock-EBADF signature, instance 10. Operator host control on exact
+  `bc313dc6`: **1,090/0** (class 10/10 host-green). Disclosed operator
+  docs completion `50f3336e` (22 handoff lines, zero code) records the
+  dated exact-command evidence — the F2 precedent exactly. Preserved at
+  `salvage/r2f1b-3c2-g2-repaired` and `salvage/r2f1b-3c2-g2-completed`.
+- Host gates on exact `50f3336e` all exit 0: **4,101 passed / 0 failed
+  / 13 ignored across 90 harnesses** (log `g2-host-gates.log`), hygiene
+  green, post-gate self-reap ran.
+- Counted closure dispatched on the full `2a912d18..50f3336e` line —
+  the FINAL task closure of 3c2 — with the reader-break fix, the
+  no-further-split ruling, and the gate-evidence completion all
+  explicit; brief mirrored as
+  [`2026-08-15-r2f1b-3c2-task-g2-closure-brief.md`](2026-08-15-r2f1b-3c2-task-g2-closure-brief.md).
 
 ## Non-scope reaffirmed
 
