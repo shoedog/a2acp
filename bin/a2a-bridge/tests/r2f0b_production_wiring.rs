@@ -19,6 +19,28 @@ use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 #[test]
+fn task_g_production_api_construction_explicitly_leaves_v3_unarmed() {
+    let source = include_str!("../src/main.rs");
+    let api_start = source
+        .find("AgentKind::Api => {")
+        .expect("production API construction branch");
+    let container_start = source[api_start..]
+        .find("AgentKind::ContainerRw => {")
+        .map(|offset| api_start + offset)
+        .expect("branch following production API construction");
+    let api_branch = &source[api_start..container_start];
+
+    assert!(
+        api_branch.contains("api_cfg.resource_flight_route_v3 = None;"),
+        "production API construction must explicitly assign the V3 route to None"
+    );
+    assert!(
+        !api_branch.contains("api_cfg.resource_flight_route_v3 = Some"),
+        "Task G must not arm the production V3 route"
+    );
+}
+
+#[test]
 fn production_attempt_factory_carries_activity_and_terminal_evidence_to_one_owner() {
     let factory = AttemptTelemetrySinkFactory::new("attempt-production");
     let rich = factory.make(&NodeId::parse("only").unwrap());

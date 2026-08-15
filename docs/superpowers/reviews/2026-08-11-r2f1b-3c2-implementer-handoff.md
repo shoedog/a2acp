@@ -1,58 +1,136 @@
 # R2f1b 3c2 implementer handoff — API request-flight authority
 
 Date: 2026-08-15
-Base: `15912e3ab4f3a2c39bbe599d91010fe3f945b9f5`
+Base: `f17e2bd37868c398d5c04d175ffee2a5cc5c1a00`
 
 ## Outcome
 
-**Task F2 complete:** the retired retained shared-flight request adapter was
-removed on the exact frozen input `15912e3ab4f3a2c39bbe599d91010fe3f945b9f5`.
-This is deletion-only: production remains `LegacyV2`, the production V3 route
-remains `None`, and Task G remains unarmed.
+**Task G complete:** cold workflow cleanup now returns and propagates the exact
+`BackendCleanupDispositionV1`. Every retry, fallback, or other redispatch gate
+requires exact `Ok(Complete)`; `Ok(Unknown)`, `Ok(Retained)`, `Ok(Preserved)`,
+and errors all fail closed. Post-acceptance persistence failure remains fatal
+and nonretryable. ContainerRw/worktree reconciliation stays a separate
+two-field result, and production API construction remains explicitly
+`LegacyV2` with `resource_flight_route_v3 = None`.
 
-The workspace-wide reference census commands were:
+No bridge-api/core production source, Task A-F surface, binary production
+wiring, compatibility record, or reliability-roadmap cursor changed; 3c2 aggregate review remains ahead.
+
+## Fail-first and carry-forward evidence
+
+The exact focused workflow red command was:
 
 ```bash
-rg -n "DurableRemoteRequestFlightV3|RemoteRequestSettlementV1|RemoteRequestFlightErrorV1|bind_remote_request|attach_remote_request_owner|settlement_handle" . \
-  --glob "!docs/superpowers/reviews/2026-08-11-r2f1b-3c2-implementer-handoff.md"
-rg -n "F2 removes this retained private" \
-  crates/bridge-core/src/process.rs \
-  crates/bridge-core/src/retained_resource_flight.rs
+CARGO_INCREMENTAL=0 cargo test -p bridge-workflow --lib \
+  task_g_unknown_cleanup_disposition_vetoes_every_transient_redispatch -- --nocapture
 ```
 
-Both commands exited 1 with zero matches after deletion, covering all source and
-test paths while excluding only this evidence record. All seven F2-scoped
-`#[allow(dead_code)]` annotations disappeared with their items. The surviving
-`DurableProcessFlightAttemptV3` process/container route and its public
-`with_result_publisher` signature remain unchanged: `bind_generation` and
-`bind_container_generation` consume those route fields, so deleting them would
-have crossed the live-signature stop condition.
+It compiled and selected one test, then failed 0/1 because an
+`Ok(Unknown)` cleanup permitted a transient redispatch and the node completed
+instead of failing. The test covers configure, prompt-open, and stream
+transients with the same retry policy.
 
-Two tests were deleted because they exercised only
-`attach_remote_request_owner`, the deleted retained adapter seam:
+The direct API fail-first command was:
 
-- `dedicated_remote_request_key_identity_mismatch_refuses_before_dispatch`
-- `dedicated_request_reserves_exact_full_lifecycle_before_owner_admission`
+```bash
+CARGO_INCREMENTAL=0 cargo test -p bridge-workflow --lib \
+  cold_cleanup_reaches_the_backend_only_through_the_observed_methods -- --nocapture
+```
 
-The mixed
-`durable_attempt_route_reuses_exactly_one_registry_for_every_generation` test
-was retained; only its retired request-adapter fixture and assertions were
-deleted, leaving its process/container registry and journal assertions intact.
+It failed to compile with E0308: the new assertion expected the exact backend
+disposition while `cleanup_cold_session` still returned
+`Result<(), BridgeError>`. After the signature repair, the test observes
+`Retained` from forget and `Unknown` from release without normalization.
 
-Post-format churn versus `15912e3a` is production +3/-395 and this handoff
-+52/-1, for 451 changed lines by additions plus
-deletions. This remains below 50 added production lines and 600 total changed
-lines.
+Three required carry-forward characterizations were green on the frozen input:
 
-Verification: warnings-denied all-workspace/all-target/all-feature locked Clippy
-passes; `bridge-api` passes all harnesses (98 passed, 1 explicitly ignored) and
-doctests (0 tests) with the documented loopback exemption and pinned rustdoc;
-formatting and diff checks pass. The exact focused core selector ran 128/129
-green twice, but the untouched, frozen-base-identical
-`term_ignoring_child_with_descendant_is_group_killed_host_signal_semantics`
-failed both times because the killed descendant remained visible in this
-container. That same host-signal failure is already recorded below from Task F;
-no process behavior or test expectation was changed in this deletion task.
+- accepted provider output followed by rich-sink flush failure was already
+  fatal with one resolution, one prompt, one flush, and zero invalidations;
+- production API construction already assigned the V3 route to `None`;
+- the existing worktree fold already kept result and checkout reconciliation
+  separate.
+
+Those controls are retained as Task G regression guards rather than described
+as newly discovered red behavior.
+
+## Cleanup caller and wrapper reconciliation
+
+The complete production census is reproducible with:
+
+```bash
+rg -n "preserve_then_cleanup_cold_session|cleanup_cold_session\(|cancel_and_forget_preflight_session" \
+  crates/bridge-workflow/src/executor.rs
+```
+
+Every caller falls into one of these closed groups:
+
+- `preserve_then_cleanup_cold_session` preserves checkout state before the
+  backend signal and returns `cleanup_cold_session`'s exact disposition.
+- Preflight configure failure, provably-unaccepted prompt-open failure, and
+  terminal PONG cleanup retain the exact result. Candidate fallback or real
+  dispatch occurs only after exact `Ok(Complete)`; all protective values and
+  errors become hard preflight failures.
+- Node configure, prompt-open, and stream transient branches retain the exact
+  result and set `cleanup_allows_retry` only for `Ok(Complete)`. The existing
+  cleanup-error veto tests remain alongside the new `Ok(Unknown)` veto table.
+- Preflight cancellation sites and accepted/indeterminate prompt or stream
+  failures call `cancel_and_forget_preflight_session`. That wrapper cancels
+  first, records cleanup through the exact-returning function, and intentionally
+  discards the value only on a terminal canceled/hard path that cannot retry.
+- Configure fatal, prefix-attestation fatal, prompt-open fatal, empty-final,
+  stream fatal, and rich-persistence failure cleanup sites are terminal and
+  cannot redispatch. Their cleanup call still records every protective value in
+  `WorkflowCleanupTracker`; errors retain the existing fatal outcome.
+- Cancellation during prompt-open or drain calls `cleanup_cold_session`
+  directly, extracts only an error for the cancellation diagnostic, and cannot
+  retry. The tracker retains the complete protective disposition before that
+  projection.
+- Final node cleanup retains the exact result. A cleanup error can turn an
+  otherwise successful node fatal; a protective success is recorded and keeps
+  global cleanup/checkout disposition non-complete, but never authorizes a
+  retry.
+- The observed-method unit test is the only direct test caller. It proves both
+  exact return propagation and that legacy unobserved cleanup entry points are
+  not used.
+
+This separation is deliberate: `Complete` is the sole authority to issue more
+provider work, while terminal consumers may project diagnostics only after the
+protective disposition has been recorded.
+
+## ContainerRw/worktree and production-route shields
+
+The worktree regression exhaustively destructures
+`CleanupReportV1 { result, checkout }`, exhaustively matches all four backend
+and six checkout disposition variants, and checks their full cross-product.
+The two outcomes stay separate, and only exact inner `Complete` plus checkout
+`Complete` can produce result `Complete`; notably, either side being `Unknown`
+folds to `Unknown`. This is a test-only compatibility shield around the existing
+private two-field contract; no worktree production code or serialized shape
+changed.
+
+The production-wiring test slices the real `AgentKind::Api` construction branch
+and requires the exact assignment
+`api_cfg.resource_flight_route_v3 = None;`, while rejecting a `Some` assignment.
+It is test-only; `bin/a2a-bridge/src/main.rs` is unchanged.
+
+## Verification and accounting
+
+Focused post-repair results:
+
+- workflow `task_g_`: 2/2 passed;
+- exact cleanup API observation: 1/1 passed;
+- existing `final_review_` cleanup/race lens: 10/10 passed;
+- worktree Task G contract guard: 1/1 passed;
+- production route guard: 1/1 passed.
+
+With the complete pinned Rust toolchain and `CARGO_INCREMENTAL=0`, full
+`bridge-workflow` passes 207 tests across its harnesses plus doctests (0), and
+full `bridge-worktree` passes 265 tests across its harnesses plus doctests (0).
+Formatting and diff checks pass.
+
+Post-format churn versus `f17e2bd3` is production +111/-70 = 181 lines and
+541 total changed lines by additions plus deletions, below the Task G
+limits of 350 production and 700 total.
 
 ## Accepted Task F history
 

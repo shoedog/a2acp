@@ -7136,6 +7136,72 @@ mod tests {
         );
     }
 
+    /// Task G carry-forward guard for ContainerRw/worktree composition. The exact two-field
+    /// report remains private but load-bearing: exhaustive destructuring pins its fields,
+    /// exhaustive matches pin both closed disposition sets, and this cross-product pins the fold.
+    /// Only exact Complete + Complete may project Complete.
+    #[test]
+    fn task_g_cleanup_report_two_field_contract_and_fold_table_are_frozen() {
+        fn protective_fold(
+            inner: BackendCleanupDispositionV1,
+            checkout: BackendCleanupDispositionV1,
+        ) -> BackendCleanupDispositionV1 {
+            use BackendCleanupDispositionV1::{Complete, Preserved, Retained, Unknown};
+            match (inner, checkout) {
+                (Unknown, _) | (_, Unknown) => Unknown,
+                (Preserved, _) | (_, Preserved) => Preserved,
+                (Retained, _) | (_, Retained) => Retained,
+                (Complete, Complete) => Complete,
+            }
+        }
+        fn checkout_variant(disposition: &CheckoutCleanupDispositionV1) -> &'static str {
+            match disposition {
+                CheckoutCleanupDispositionV1::NotNeeded => "not_needed",
+                CheckoutCleanupDispositionV1::Removed => "removed",
+                CheckoutCleanupDispositionV1::RemovedRecordAmbiguous(_) => {
+                    "removed_record_ambiguous"
+                }
+                CheckoutCleanupDispositionV1::RemovalFailed => "removal_failed",
+                CheckoutCleanupDispositionV1::Retained => "retained",
+                CheckoutCleanupDispositionV1::Preserved => "preserved",
+            }
+        }
+
+        let inner_dispositions = [
+            BackendCleanupDispositionV1::Complete,
+            BackendCleanupDispositionV1::Retained,
+            BackendCleanupDispositionV1::Preserved,
+            BackendCleanupDispositionV1::Unknown,
+        ];
+        let checkout_dispositions = [
+            CheckoutCleanupDispositionV1::NotNeeded,
+            CheckoutCleanupDispositionV1::Removed,
+            CheckoutCleanupDispositionV1::RemovedRecordAmbiguous("ambiguous".into()),
+            CheckoutCleanupDispositionV1::RemovalFailed,
+            CheckoutCleanupDispositionV1::Retained,
+            CheckoutCleanupDispositionV1::Preserved,
+        ];
+
+        for inner in inner_dispositions {
+            for checkout in checkout_dispositions.iter().cloned() {
+                let checkout_backend = checkout.backend_disposition();
+                assert!(!checkout_variant(&checkout).is_empty());
+                let report = CleanupReportV1::settled(checkout, inner, None);
+                let CleanupReportV1 { result, checkout } = report;
+                let expected = protective_fold(inner, checkout_backend);
+
+                assert_eq!(result, Ok(expected));
+                assert_eq!(checkout.backend_disposition(), checkout_backend);
+                assert_eq!(
+                    result == Ok(BackendCleanupDispositionV1::Complete),
+                    inner == BackendCleanupDispositionV1::Complete
+                        && checkout_backend == BackendCleanupDispositionV1::Complete,
+                    "only exact Complete + Complete may fold to Complete"
+                );
+            }
+        }
+    }
+
     async fn assert_outer_preservation_composes_once(
         name: &str,
         inner: BackendCleanupDispositionV1,
