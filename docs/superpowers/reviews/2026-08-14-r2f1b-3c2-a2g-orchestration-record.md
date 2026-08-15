@@ -488,6 +488,41 @@ All checks passed; no drift found.
 - Counted closure dispatched on the full `6033fd34..2e472a09` line; brief
   mirrored as
   [`2026-08-14-r2f1b-3c2-task-b2-closure-brief.md`](2026-08-14-r2f1b-3c2-task-b2-closure-brief.md).
+- 2026-08-15: the B2 closure returned REJECT with exactly ONE fresh
+  BLOCKER — heal ordering advanced the checkpoint before the orphan
+  relabel, so an interrupted heal stranded a proven never-issued child as
+  `Active` below the checkpoint — plus three DEFERs (two remaining
+  injection seams; the stale handoff, which was the operator completion's
+  own omission; the lens also recorded the repair-line churn at 455 vs the
+  declared 400, the completion's +64 being the disclosed operator
+  authorization). W2 adjudicated FIXED, W1 ACCEPTED-RESIDUAL, W3 PARTIAL
+  on exactly this ordering. Population across B2 rounds: 3 → 2 → 1,
+  non-repeating classes.
+- 2026-08-15: **disclosed operator convergence extension** `dbf514bd`
+  (+151/−18 module + handoff refresh): relabel-first healing with the
+  resumable `PreSendFailure`-at-`next_ordinal` intermediate recognized and
+  completed idempotently; a dedicated `HealCheckpoint` injection boundary;
+  admission checkpoint advance and all three root-sync seams converted to
+  wrap-actual; the stale handoff refreshed with exact-head accounting.
+  Red-first: the resume, heal-seam, and admission-checkpoint-seam
+  regressions all failed on the pre-change head (`b2x-red.log`). Full lib
+  634/0. **BINDING second look at the post-G aggregate round** (same terms
+  as the A4 extension).
+- Host gates on exact `dbf514bd` all exit 0: **4,048 passed / 0 failed /
+  13 ignored across 90 harnesses**, hygiene 40/8 (log
+  `b2-host-gates-2.log`).
+- 2026-08-15: **B2 ACCEPTED at exact `dbf514bd` — TASK B COMPLETE**
+  (B1 `6033fd34` + B2 `dbf514bd`; custody at
+  `salvage/r2f1b-3c2-b1-accepted` and `salvage/r2f1b-3c2-b2-accepted`).
+  Ledger to Task C: durable send-state rows resolve the below-checkpoint
+  ambiguity; the attempt-bound authority rider is binding; the aggregate
+  round carries the A4 and B2 extension second looks, the mutation-receipt
+  offers, the residue-disposition owner question, and the flock-EBADF
+  classification note.
+- 2026-08-15: **Task C dispatched** from exact `dbf514bd` — attempt lease,
+  complete recovery table, idempotent outbox, authority-binding rider
+  (caps 500/900 churn, C2 split escape hatch; brief mirrored as
+  [`2026-08-14-r2f1b-3c2-task-c-brief.md`](2026-08-14-r2f1b-3c2-task-c-brief.md)).
 
 ## Non-scope reaffirmed
 
