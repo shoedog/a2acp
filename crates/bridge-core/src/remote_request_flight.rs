@@ -438,6 +438,7 @@ impl RemoteRequestJournalV1 {
             .begin_operation("open request journal")
             .map_err(fs)?;
         journal.authorize_checkpoint(&operation)?;
+        journal.scan_with(&operation, true)?;
         recovery(NamespaceTransactionV2::recover(
             &operation,
             "recover request transaction",
@@ -601,6 +602,17 @@ impl RemoteRequestJournalV1 {
         transaction(outcome)
     }
     fn scan(&self, op: &JournalRootOperationV2<'_>) -> FlightResult<CensusV1> {
+        self.scan_with(op, false)
+    }
+    /// Residue-tolerant validation pass: with `tolerate_residue`, reserved
+    /// Task A entries are skipped (recovery owns their classification) while
+    /// every ordinary row is validated exactly as in a full scan. Running
+    /// this before recovery makes an invalid attempt refuse byte-preserved.
+    fn scan_with(
+        &self,
+        op: &JournalRootOperationV2<'_>,
+        tolerate_residue: bool,
+    ) -> FlightResult<CensusV1> {
         let names = match op.enumerate(self.capacity + 1, "request census") {
             Ok(names) => names,
             Err(FsCustodyError::EnumerationLimitExceeded { .. }) => return Err(Refusal::Capacity),
@@ -645,6 +657,8 @@ impl RemoteRequestJournalV1 {
             }
             let (read_name, final_name, is_staged) = if value.starts_with(REQUEST_CHILD_PREFIX_V1) {
                 (name.clone(), name, false)
+            } else if tolerate_residue && value.starts_with(".a2a-v2-") {
+                continue;
             } else if value.starts_with(".a2a-v2-stg-") {
                 let target = ChildNameV2::parse_reserved(ReservedNameNamespaceV2::Staging, &name)
                     .map_err(fs)?;
@@ -2365,6 +2379,80 @@ mod tests {
         publisher: Arc<RecordingPublisher>,
     ) -> FlightResult<RemoteRequestJournalV1> {
         RemoteRequestJournalV1::open_recovered(custody(case), attempt, capacity, publisher)
+    }
+
+    #[test]
+    fn remote_request_flight_invalid_row_refuses_before_any_recovery() {
+        // An independently corrupt request row must refuse the whole attempt
+        // BEFORE recovery may touch Task A residue: with both present, the
+        // refusal is the corrupt row's Malformed, not recovery's protective
+        // classification, and every root byte is preserved.
+        let make_case = case;
+        let case = case();
+        let mut journal = initialized(&case, 16);
+        drop(journal.admit_with(owner(0), || Ok(request(0))).unwrap());
+        drop(journal.admit_with(owner(1), || Ok(request(1))).unwrap());
+        drop(journal);
+
+        let custody_handle = custody(&case);
+        let op = custody_handle
+            .begin_operation("construct stage residue")
+            .unwrap();
+        op.stage(
+            &ChildNameV2::from_bytes(b"seed").unwrap(),
+            b"residue",
+            "construct stage residue",
+        )
+        .unwrap();
+        drop(op);
+        drop(custody_handle);
+        let paths = request_paths(&case);
+        assert_eq!(paths.len(), 2);
+        fs::write(&paths[1], b"junk").unwrap();
+
+        let before = root_bytes(&case);
+        let publisher = RecordingPublisher::with_replies([]);
+        let outcome = open_recovered(&case, attempt(), 16, publisher).err();
+        assert!(
+            matches!(outcome, Some(RemoteRequestFlightRefusalV1::Malformed(_))),
+            "{outcome:?}"
+        );
+        assert_eq!(
+            root_bytes(&case),
+            before,
+            "an invalid attempt must refuse byte-preserved before recovery"
+        );
+
+        // Without the corrupt sibling, the same residue still surfaces the
+        // recovery-side protective classification after validation passes.
+        let clean = make_case();
+        let mut journal = initialized(&clean, 16);
+        drop(journal.admit_with(owner(0), || Ok(request(0))).unwrap());
+        drop(journal);
+        let custody_handle = custody(&clean);
+        let op = custody_handle
+            .begin_operation("construct stage residue")
+            .unwrap();
+        op.stage(
+            &ChildNameV2::from_bytes(b"seed").unwrap(),
+            b"residue",
+            "construct stage residue",
+        )
+        .unwrap();
+        drop(op);
+        drop(custody_handle);
+        let publisher = RecordingPublisher::with_replies([]);
+        let outcome = open_recovered(&clean, attempt(), 16, publisher).err();
+        assert!(
+            matches!(
+                outcome,
+                Some(RemoteRequestFlightRefusalV1::TaskA(
+                    TaskAProtectiveOutcomeV1::ProtectiveDebt,
+                    _
+                )) | Some(RemoteRequestFlightRefusalV1::ReopenRequired(_))
+            ),
+            "{outcome:?}"
+        );
     }
 
     #[test]
