@@ -1204,3 +1204,51 @@ request adapter still compiles. Tasks F-G, bridge core, workflows, worktrees,
 deployment, fold, push, and the running operator remain unarmed and unchanged.
 Production still assigns `resource_flight_route_v3 = None` and exposes
 `LegacyV2`.
+
+### Operator completion: request-local acceptance (2026-08-15)
+
+The repair's advisory review confirmed one remaining blocker on frozen
+input `7d3202cf`: `attach_lifecycle` propagated the turn-wide
+`acceptance_barrier_crossed` into the REQUEST-LOCAL acceptance bit via
+`RequestScope::mark_accepted`, so every successor tool-call round was
+pre-marked accepted before its own send future existed. A round-two
+cancel or drop in the authorization-to-first-poll window therefore kept
+`Partial`/`Unknown` through `acceptance_keyed_disposition` while the core
+row was unarmed — durably publishing the forbidden `Partial,false` /
+`Unknown,false` tuples instead of `Failed,false`.
+
+This disclosed operator completion, inside the declared round:
+
+- keeps the request bit strictly request-local: `attach_lifecycle` now
+  propagates the sticky turn acceptance ONLY to the cleanup cell's
+  diagnostic custody (`cleanup.mark_accepted`); the request-local bit is
+  set solely by the first-poll `RequestAcceptanceMarker::mark`. The
+  now-unused `RequestScope::mark_accepted` is deleted.
+
+Red-first evidence (log `f2-red.log`; both failed behaviorally on
+`7d3202cf` at the request-local assertion, with the publication
+disposition assertion behind it):
+
+- `cargo test -p bridge-api --lib -- task_f_successor` — the cancel and
+  drop variants attach a lifecycle with the barrier crossed (the exact
+  production round-loop call), never poll the send, and require the
+  durable result `Failed` with `prompt_may_have_been_accepted=false`
+  while the cell's diagnostic acceptance stays true.
+- `task_f_second_round_cancel_after_send_observed_stays_partial_accepted`
+  is the accepted-edge guard: a public two-round run (tool call, then a
+  delayed second round cancelled in flight) pins publications
+  `Complete,true` then `Partial,true` — green on both heads, proving the
+  fix does not overcorrect accepted cancellations.
+
+Post-change: all three tests green; `cargo test -p bridge-api` fully
+green across all harnesses; `cargo test -p bridge-core --lib --
+remote_request_flight` unchanged at 45 passed; fresh workspace
+all-target/all-feature locked Clippy with `-D warnings` (the seven
+scoped F2 allowances hold after the method deletion), `cargo fmt --all
+-- --check`, and `git diff --check` all exit 0.
+
+Post-format delta vs `7d3202cf`: production +5/-6 (11 changed lines),
+colocated tests +151/-0, this handoff section +52/-0. Only
+`crates/bridge-api/src/backend.rs` and this handoff changed. F2, Task G,
+and production V3 remain unarmed; production still assigns the V3 route
+`None` and exposes `LegacyV2`.
