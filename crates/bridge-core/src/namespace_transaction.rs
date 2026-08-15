@@ -4,8 +4,8 @@ mod mechanism {
         create_new_regular_child_at, enumerate_directory_names, open_regular_child,
         rename_child_no_replace, required_file_content_snapshot_v2, ChildNameV2,
         CustodyCaptureOutcomeV2, CustodyIntentV2, CustodyOperationKindV2, FileContentSnapshotV2,
-        FsCustodyError, JournalRootOperationV2, RenameNoReplaceRefusalV1, RequiredObjectIdentityV2,
-        ReservedNameNamespaceV2,
+        FsCustodyError, JournalMutationOutcomeV2, JournalRootOperationV2, RenameNoReplaceRefusalV1,
+        RequiredObjectIdentityV2, ReservedNameNamespaceV2,
     };
     use serde::{Deserialize, Serialize};
     use std::{
@@ -116,6 +116,18 @@ mod mechanism {
             NamespaceTransactionOutcomeV2::Unsupported(reason)
         } else {
             NamespaceTransactionOutcomeV2::ProtectiveDebt(reason)
+        }
+    }
+    fn record(
+        op: &JournalRootOperationV2<'_>,
+        outcome: NamespaceTransactionOutcomeV2,
+    ) -> NamespaceTransactionOutcomeV2 {
+        match outcome {
+            value @ NamespaceTransactionOutcomeV2::Retained(_, _)
+            | value @ NamespaceTransactionOutcomeV2::ProtectiveDebt(_) => {
+                op.record_protective_debt(value)
+            }
+            value => value,
         }
     }
     fn capture(root: &File, intent: &CustodyIntentV2, label: &str) -> CustodyCaptureOutcomeV2 {
@@ -373,7 +385,10 @@ mod mechanism {
             successor: &[u8],
             label: &str,
         ) -> NamespaceTransactionOutcomeV2 {
-            Self::replace_with(op, target, expected, successor, label, |_, _| false)
+            record(
+                op,
+                Self::replace_with(op, target, expected, successor, label, |_, _| false),
+            )
         }
         pub fn retire(
             op: &JournalRootOperationV2<'_>,
@@ -381,24 +396,30 @@ mod mechanism {
             expected: RequiredObjectIdentityV2,
             label: &str,
         ) -> NamespaceTransactionOutcomeV2 {
-            Self::retire_with(op, target, expected, label, |_, _| false)
+            record(
+                op,
+                Self::retire_with(op, target, expected, label, |_, _| false),
+            )
         }
         pub fn recover(
             op: &JournalRootOperationV2<'_>,
             label: &str,
         ) -> NamespaceTransactionOutcomeV2 {
-            Self::recover_with(op, label, |_, _| false)
+            record(op, Self::recover_with(op, label, |_, _| false))
         }
         fn ready(
             op: &JournalRootOperationV2<'_>,
+            footprint: usize,
             label: &str,
         ) -> Option<NamespaceTransactionOutcomeV2> {
-            match op.recovery_debt(label) {
-                Ok(false) => None,
-                Ok(true) => Some(NamespaceTransactionOutcomeV2::ProtectiveDebt(format!(
-                    "{label}: recovery debt is write-blocking"
+            match op.guard(None, footprint, label) {
+                Ok(()) => None,
+                Err(JournalMutationOutcomeV2::Unsupported(reason)) => {
+                    Some(NamespaceTransactionOutcomeV2::Unsupported(reason))
+                }
+                Err(reason) => Some(NamespaceTransactionOutcomeV2::ProtectiveDebt(format!(
+                    "{label}: {reason:?}"
                 ))),
-                Err(error) => Some(protect(error)),
             }
         }
         fn replace_with<F>(
@@ -412,11 +433,17 @@ mod mechanism {
         where
             F: FnMut(TransitionV2, &ChildNameV2) -> bool,
         {
-            if let Some(value) = Self::ready(op, label) {
+            let recovery = ticket(CustodyOperationKindV2::Replace, &target);
+            if target.is_reserved_target() {
+                return NamespaceTransactionOutcomeV2::NoEffect(
+                    recovery,
+                    format!("{label}: reserved target"),
+                );
+            }
+            if let Some(value) = Self::ready(op, 2, label) {
                 return value;
             }
             let root = op.root_file();
-            let recovery = ticket(CustodyOperationKindV2::Replace, &target);
             match snapshot(root, &target, label) {
                 Ok(Some((_, value))) if value.object == expected => {}
                 Ok(_) => {
@@ -542,11 +569,17 @@ mod mechanism {
         where
             F: FnMut(TransitionV2, &ChildNameV2) -> bool,
         {
-            if let Some(value) = Self::ready(op, label) {
+            let recovery = ticket(CustodyOperationKindV2::Retire, &target);
+            if target.is_reserved_target() {
+                return NamespaceTransactionOutcomeV2::NoEffect(
+                    recovery,
+                    format!("{label}: reserved target"),
+                );
+            }
+            if let Some(value) = Self::ready(op, 1, label) {
                 return value;
             }
             let root = op.root_file();
-            let recovery = ticket(CustodyOperationKindV2::Retire, &target);
             let observed = match snapshot(root, &target, label) {
                 Ok(Some((_, v))) if v.object == expected => v,
                 Ok(_) => {
@@ -687,13 +720,14 @@ mod mechanism {
                 reserved.push(name);
             }
             if reserved.is_empty() {
-                return if op.debt() {
-                    NamespaceTransactionOutcomeV2::ProtectiveDebt(format!(
-                        "{label}: retained journal mutation debt"
-                    ))
-                } else {
-                    NamespaceTransactionOutcomeV2::Ready
-                };
+                if let Err(error) = sync_root(root, label) {
+                    return protect(error);
+                }
+                if let Err(error) = op.prove_route_v2(label) {
+                    return protect(error);
+                }
+                op.clear_protective_debt();
+                return NamespaceTransactionOutcomeV2::Ready;
             }
             if intents.len() != 1 {
                 return NamespaceTransactionOutcomeV2::ProtectiveDebt(format!(
@@ -927,6 +961,14 @@ mod mechanism {
             names
         }
 
+        fn fill_root_to(case: &Case, count: usize) {
+            let source = case.root.join("ordinary-1");
+            fs::write(&source, b"x").unwrap();
+            for index in 2..count {
+                fs::hard_link(&source, case.root.join(format!("ordinary-{index}"))).unwrap();
+            }
+        }
+
         #[test]
         fn namespace_transaction_happy_replace_and_retire_complete_only_after_cleanup() {
             let case = case();
@@ -1008,6 +1050,104 @@ mod mechanism {
                 case.operate(|op| NamespaceTransactionV2::recover(op, "clean")),
                 O::Ready
             );
+        }
+
+        #[test]
+        fn namespace_transaction_residue_free_retained_blocks_same_handle_until_clean_recovery() {
+            let case = case();
+            let custody = JournalRootCustodyV2::open(&case.anchor, &case.binding, "debt").unwrap();
+            let op = custody.begin_operation("debt").unwrap();
+            let retained = NamespaceTransactionV2::replace_with(
+                &op,
+                target(),
+                case.expected(),
+                b"B",
+                "debt",
+                |transition, _| transition == TransitionV2::FinalSync,
+            );
+            assert!(matches!(record(&op, retained), O::Retained(_, _)));
+            assert!(residue(&case).is_empty());
+            let next = ChildNameV2::from_bytes(b"next").unwrap();
+            assert!(matches!(
+                op.stage(&next, b"x", "blocked"),
+                Err(JournalMutationOutcomeV2::ProtectiveDebt(_))
+            ));
+            assert_eq!(NamespaceTransactionV2::recover(&op, "clean"), O::Ready);
+            assert!(op.stage(&next, b"x", "after recovery").is_ok());
+        }
+
+        #[test]
+        fn namespace_transaction_reserves_replace_and_retire_capacity_before_effect() {
+            for count in [4095, 4096] {
+                let case = case();
+                fill_root_to(&case, count);
+                let replaced = case.operate(|op| {
+                    NamespaceTransactionV2::replace(
+                        op,
+                        target(),
+                        case.expected(),
+                        b"B",
+                        "replace capacity",
+                    )
+                });
+                assert!(matches!(replaced, O::ProtectiveDebt(_)));
+                assert!(residue(&case).is_empty());
+                assert_eq!(fs::read_dir(&case.root).unwrap().count(), count);
+                let retired = case.operate(|op| {
+                    NamespaceTransactionV2::retire(op, target(), case.expected(), "retire capacity")
+                });
+                let admitted = count == 4095;
+                assert_eq!(matches!(retired, O::Complete(_)), admitted);
+                if !admitted {
+                    assert!(matches!(retired, O::ProtectiveDebt(_)));
+                    assert!(residue(&case).is_empty());
+                }
+                assert_eq!(
+                    fs::read_dir(&case.root).unwrap().count(),
+                    count - usize::from(admitted)
+                );
+            }
+        }
+
+        #[test]
+        fn namespace_transaction_reserved_targets_refuse_before_effect() {
+            for target in [
+                ".a2a-v2-int-target",
+                ".a2a-v2-stg-target",
+                ".a2a-v2-rpc-target",
+                ".a2a-v2-rtc-target",
+                ".a2a-v2-x",
+            ] {
+                let case = case();
+                fs::rename(case.root.join("target"), case.root.join(target)).unwrap();
+                let name = ChildNameV2::from_bytes(target.as_bytes()).unwrap();
+                let expected = required_file_content_snapshot_v2(
+                    &File::open(case.root.join(target)).unwrap(),
+                    "reserved target",
+                )
+                .unwrap()
+                .object;
+                let outcomes = case.operate(|op| {
+                    [
+                        NamespaceTransactionV2::replace(
+                            op,
+                            name.clone(),
+                            expected,
+                            b"B",
+                            "reserved target",
+                        ),
+                        NamespaceTransactionV2::retire(op, name, expected, "reserved target"),
+                    ]
+                });
+                for outcome in outcomes {
+                    assert!(matches!(
+                        outcome,
+                        O::NoEffect(_, ref reason) if reason.contains("reserved target")
+                    ));
+                    assert_eq!(fs::read_dir(&case.root).unwrap().count(), 1);
+                    assert_eq!(fs::read(case.root.join(target)).unwrap(), b"A");
+                }
+            }
         }
 
         #[test]

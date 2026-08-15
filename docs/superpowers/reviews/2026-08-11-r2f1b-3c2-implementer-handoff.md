@@ -516,3 +516,29 @@ Changed paths are `crates/bridge-core/src/fs_custody.rs`, `crates/bridge-core/sr
 - Direct `rustfmt --check --edition 2021` on both changed Rust files and `git diff --check`: exit 0. Required `cargo fmt --all -- --check` cannot start because this Cargo installation has no `fmt` subcommand, the same frozen-environment limitation recorded by A3; no `rustfmt::skip` was introduced.
 
 Task B, production V3, shared journal/request consumers, API/HTTP, providers, smoke, compatibility, deployment, fold, push, and the running operator remain unarmed and unchanged.
+
+## Task A4 owner-authorized closure repair
+
+Date: 2026-08-15. Exact frozen input: `04e5957949575bec053b0739b21d42dc670cbbcf`.
+
+### Admissible red evidence
+
+- `CARGO_INCREMENTAL=0 cargo test -p bridge-core --lib --locked --offline namespace_transaction_residue_free_retained_blocks_same_handle_until_clean_recovery -- --nocapture`: 1 selected, 1 failed because residue-free `Retained` did not block the next journal mutation.
+- The same command with selector `reserves_`: 10 selected, 8 passed and 2 failed on missing stage/replace/retire headroom; with selector `reserved_targets_refuse_before_effect`: 2 selected and 2 failed on missing typed prefix refusal.
+- Every red reached `bridge-core`, was nonzero, and was neither dependency/network refusal nor zero selection.
+- Mutation controls temporarily disabled clean-recovery clearing and transaction-outcome recording in turn; the debt regression failed 1/1 each time at the corresponding post-recovery and immediate-block assertion. Both degradations were immediately reversed.
+
+### Result, scope, and gates
+
+All journal and namespace protective outcomes now record through one handle choke point. Admission reserves maximum transient entries (stage/append 1, publish/sync 0, replace 2, retire 1), and over-cap census is typed `ProtectiveDebt`; all five reserved-prefix variants are refused before effect and leave root bytes unchanged.
+Recovery alone clears externally visible debt after an empty reserved census, successful root sync, and fresh route proof; residue parsing and recovery's bounded census remain unchanged.
+Accepted debt scope: residue-backed debt is durable across handles/restarts through the residue itself; residue-free durability uncertainty self-heals on the next successful route-proof-plus-sync clean recovery. This re-argument is submitted to closure review.
+Changed paths: `crates/bridge-core/src/fs_custody.rs`, `crates/bridge-core/src/namespace_transaction.rs`, and this handoff.
+Post-format accounting versus the frozen input: production +100/-38 = 138 changed lines; colocated tests +178/-0; handoff +26/-0; aggregate +304/-38 = 342 changed lines.
+
+- Required selectors: `namespace_transaction` 18/0, `custody_v2` 22/0, `fs_custody` 80/0, `journal_route` 11/0, and `journal_owned_surface` 4/0.
+- Bridge-core all-target/all-feature offline clippy with `-D warnings`: exit 0.
+- Full bridge-core library sweep: 605 passed; the sole failure was the unchanged process-group host test `term_ignoring_child_with_descendant_is_group_killed_host_signal_semantics`, reproduced alone and outside owned paths.
+- Direct `rustfmt --check --edition 2021` and `git diff --check`: exit 0; required `cargo fmt --all -- --check` cannot start because this Cargo installation has no `fmt` subcommand. No `rustfmt::skip` was introduced.
+
+Task B, production V3, consumers, live providers, smoke, compatibility, deployment, fold, push, and the running operator remain unarmed and unchanged.
