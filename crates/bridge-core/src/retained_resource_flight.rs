@@ -1864,35 +1864,6 @@ impl RetainedResourceFlight {
         )
     }
 
-    // F2 removes this retained private request-owner adapter.
-    #[allow(dead_code)]
-    pub(crate) fn attach_remote_request_owner(
-        &self,
-        owner: ResourceFlightOwnerV1,
-        identity: ResourceIdentityV1,
-    ) -> Result<(), RetainedResourceFlightError> {
-        if !matches!(identity, ResourceIdentityV1::DedicatedRemoteRequest { .. })
-            || ResourceFlightKeyV1::from_identity(&identity) != self.key
-        {
-            return Err(RetainedResourceFlightError::RemoteRequestIdentityKeyMismatch);
-        }
-        let mut state = self.lock()?;
-        if !matches!(state.state, ResourceFlightStateV1::Open {}) || state.owners.contains(&owner) {
-            return Err(RetainedResourceFlightError::TransitionRefused {
-                state: Box::new(state.state.clone()),
-            });
-        }
-        self.append(
-            &mut state,
-            ResourceFlightJournalEventV1::RemoteRequestIdentityCaptured {
-                identity,
-                owner: owner.clone(),
-            },
-        )?;
-        state.owners.insert(owner);
-        Ok(())
-    }
-
     #[cfg_attr(not(unix), allow(dead_code))]
     pub(crate) fn journal_container_removal(
         &self,
@@ -2661,98 +2632,6 @@ mod tests {
         let b = registry.reserve(request_b).unwrap();
         assert!(!Arc::ptr_eq(shared.flight().unwrap(), a.flight().unwrap()));
         assert!(!Arc::ptr_eq(a.flight().unwrap(), b.flight().unwrap()));
-    }
-
-    #[test]
-    fn dedicated_remote_request_key_identity_mismatch_refuses_before_dispatch() {
-        let registry = ResourceFlightRegistryV1::new(attempt());
-        let journal = Arc::new(InMemoryResourceFlightJournal::new(32));
-        let journal_port: Arc<dyn ResourceFlightJournal> = journal.clone();
-        let clock: Arc<dyn MonotonicClock> = Arc::new(ManualClock::new(0));
-        let publisher: Arc<dyn ResourceFlightResultPublisher> = Arc::new(Publisher::default());
-        let mut request = config('4', journal_port, clock, publisher);
-        request.key = ResourceFlightKeyV1::DedicatedRemoteRequest {
-            request_id: DedicatedRemoteRequestIdV1::parse("request-a").unwrap(),
-        };
-        let reservation = registry.reserve(request).unwrap();
-        let flight = reservation.flight().unwrap();
-        let error = flight
-            .attach_remote_request_owner(
-                owner("node_a", "session-a"),
-                ResourceIdentityV1::DedicatedRemoteRequest {
-                    request_id: DedicatedRemoteRequestIdV1::parse("request-b").unwrap(),
-                },
-            )
-            .unwrap_err();
-        assert!(matches!(
-            error,
-            RetainedResourceFlightError::RemoteRequestIdentityKeyMismatch
-        ));
-        let rows = journal.records(flight.flight_id()).unwrap();
-        assert!(!rows.iter().any(|row| matches!(
-            &row.event,
-            ResourceFlightJournalEventV1::RemoteRequestIdentityCaptured { .. }
-                | ResourceFlightJournalEventV1::DispatchStarted {}
-        )));
-    }
-
-    #[test]
-    fn dedicated_request_reserves_exact_full_lifecycle_before_owner_admission() {
-        let registry = ResourceFlightRegistryV1::new(attempt());
-        let journal = Arc::new(InMemoryResourceFlightJournal::new(5));
-        let journal_port: Arc<dyn ResourceFlightJournal> = journal.clone();
-        let clock: Arc<dyn MonotonicClock> = Arc::new(ManualClock::new(0));
-        let publisher = Arc::new(Publisher::default());
-        let publisher_port: Arc<dyn ResourceFlightResultPublisher> = publisher.clone();
-        let request_id = DedicatedRemoteRequestIdV1::parse("request-capacity").unwrap();
-        let mut request = config('5', journal_port, clock, publisher_port);
-        request.key = ResourceFlightKeyV1::DedicatedRemoteRequest {
-            request_id: request_id.clone(),
-        };
-        let reservation = registry.reserve(request).unwrap();
-        let flight = reservation.flight().unwrap();
-        let request_owner = owner("node_a", "session-a");
-        flight
-            .attach_remote_request_owner(
-                request_owner.clone(),
-                ResourceIdentityV1::DedicatedRemoteRequest { request_id },
-            )
-            .unwrap();
-        flight.close_admission().unwrap();
-        flight.journal_intent(intent(request_owner)).unwrap();
-        flight.begin_journaled_dispatch().unwrap();
-        let winner = flight.settle(complete()).unwrap();
-
-        assert_eq!(winner.disposition, ResourceActionDispositionV1::Complete);
-        let rows = journal.records(flight.flight_id()).unwrap();
-        assert_eq!(rows.len(), 5);
-        assert!(matches!(
-            &rows[0].event,
-            ResourceFlightJournalEventV1::FlightReserved {
-                key: ResourceFlightKeyV1::DedicatedRemoteRequest { .. },
-                ..
-            }
-        ));
-        assert!(matches!(
-            &rows[1].event,
-            ResourceFlightJournalEventV1::RemoteRequestIdentityCaptured { .. }
-        ));
-        assert!(matches!(
-            &rows[2].event,
-            ResourceFlightJournalEventV1::IntentJournaled {
-                reserved_lifecycle_slots: 0,
-                ..
-            }
-        ));
-        assert!(matches!(
-            &rows[3].event,
-            ResourceFlightJournalEventV1::DispatchStarted {}
-        ));
-        assert!(matches!(
-            &rows[4].event,
-            ResourceFlightJournalEventV1::Settled { .. }
-        ));
-        assert_eq!(publisher.0.lock().unwrap().len(), 1);
     }
 
     #[test]
