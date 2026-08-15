@@ -293,6 +293,10 @@ struct ApiRequestCleanupCustodianV1 {
     inner: StdMutex<ApiRequestCleanupInnerV1>,
     changed: watch::Sender<u64>,
     live_waiters: AtomicUsize,
+    /// Test-only ordering gate between the pre-settlement snapshot and the
+    /// durable settlement, so deadline-crossing schedules are deterministic.
+    #[cfg(test)]
+    settle_drop_gate: StdMutex<Option<Box<dyn FnOnce() + Send + Sync>>>,
 }
 
 impl ApiRequestCleanupCustodianV1 {
@@ -324,6 +328,8 @@ impl ApiRequestCleanupCustodianV1 {
             }),
             changed,
             live_waiters: AtomicUsize::new(0),
+            #[cfg(test)]
+            settle_drop_gate: StdMutex::new(None),
         })
     }
 
@@ -506,6 +512,15 @@ impl ApiRequestCleanupCustodianV1 {
         inner.overlapped_cleanup = true;
         drop(inner);
         self.notify();
+        #[cfg(test)]
+        if let Some(gate) = self
+            .settle_drop_gate
+            .lock()
+            .ok()
+            .and_then(|mut gate| gate.take())
+        {
+            gate();
+        }
         let mut settle = || match &mut flight {
             Some(flight) => flight.settle(disposition.clone()),
             None => Ok(ResourceActionResultV1 {
@@ -522,11 +537,13 @@ impl ApiRequestCleanupCustodianV1 {
                 Err(error)
             }
         });
-        if timed_out {
-            if let Ok(mut inner) = self.inner.lock() {
-                if inner.identity.as_ref() == Some(identity)
-                    && inner.state == ApiRequestCleanupStateV1::TimedOut
-                {
+        // Branch on the CURRENT state under one lock acquisition: observation
+        // may have expired while the settlement above was in flight, and a
+        // stale pre-settlement snapshot must never route around the absorbing
+        // TimedOut — a timed-out cleanup records evidence but never upgrades.
+        if let Ok(mut inner) = self.inner.lock() {
+            if inner.identity.as_ref() == Some(identity) {
+                if inner.state == ApiRequestCleanupStateV1::TimedOut {
                     match result {
                         Ok(result) => inner.terminal = Some((result.disposition, true)),
                         Err(error) => {
@@ -535,17 +552,22 @@ impl ApiRequestCleanupCustodianV1 {
                             inner.retained_late_flight = flight;
                         }
                     }
+                } else {
+                    match result {
+                        Ok(result) => {
+                            inner.state = ApiRequestCleanupStateV1::Terminal;
+                            inner.terminal = Some((result.disposition, true));
+                        }
+                        Err(error) => {
+                            inner.state = ApiRequestCleanupStateV1::SettlementRefused;
+                            inner.diagnostic =
+                                lifecycle.map(|lifecycle| (lifecycle, error, inner.accepted));
+                        }
+                    }
                 }
             }
-            self.notify();
-            return;
         }
-        match result {
-            Ok(result) => {
-                self.finish(identity, result.disposition, true);
-            }
-            Err(error) => self.refuse(Some(identity), error, lifecycle),
-        }
+        self.notify();
     }
 
     fn projection(&self) -> Option<BackendCleanupDispositionV1> {
@@ -3586,6 +3608,159 @@ mod tests {
             .diagnostic
             .as_ref()
             .is_some_and(|(_, _, accepted)| *accepted));
+        drop(inner);
+        assert_eq!(
+            cell.projection(),
+            Some(BackendCleanupDispositionV1::Unknown)
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn task_e_settlement_crossing_expiry_cannot_upgrade_timed_out() {
+        let root = tempfile::tempdir().unwrap();
+        let journal_root = root.path().join("journal");
+        let session = SessionId::parse("task-e-crossing-success").unwrap();
+        let request_id = request_id('4');
+        let identity = ActiveRequestIdentity::Dedicated(request_id.clone());
+        let flight = cleanup_request_flight(&journal_root, &session, request_id);
+        let cell = ApiRequestCleanupCustodianV1::new(94, session, true, Duration::from_millis(200));
+        cell.begin_admission().unwrap();
+        cell.bind(&identity).unwrap();
+        cell.begin_cleanup();
+
+        let arrived = Arc::new(std::sync::Barrier::new(2));
+        let release = Arc::new(std::sync::Barrier::new(2));
+        {
+            let arrived = Arc::clone(&arrived);
+            let release = Arc::clone(&release);
+            *cell.settle_drop_gate.lock().unwrap() = Some(Box::new(move || {
+                arrived.wait();
+                release.wait();
+            }));
+        }
+        let settler = {
+            let cell = Arc::clone(&cell);
+            let identity = identity.clone();
+            std::thread::spawn(move || {
+                cell.settle_drop(
+                    &identity,
+                    Some(flight),
+                    ResourceActionDispositionV1::Complete,
+                    None,
+                    true,
+                );
+            })
+        };
+        let arrived_gate = Arc::clone(&arrived);
+        tokio::task::spawn_blocking(move || arrived_gate.wait())
+            .await
+            .unwrap();
+        // The settlement is stalled between its pre-settlement snapshot and
+        // the durable settle; observation now expires and takes TimedOut.
+        assert_eq!(cell.observe().await, BackendCleanupDispositionV1::Unknown);
+        assert_eq!(
+            cell.inner.lock().unwrap().state,
+            ApiRequestCleanupStateV1::TimedOut
+        );
+        let release_gate = Arc::clone(&release);
+        tokio::task::spawn_blocking(move || release_gate.wait())
+            .await
+            .unwrap();
+        settler.join().unwrap();
+
+        let inner = cell.inner.lock().unwrap();
+        assert_eq!(
+            inner.state,
+            ApiRequestCleanupStateV1::TimedOut,
+            "a settlement that began before expiry must not overwrite TimedOut"
+        );
+        assert_eq!(
+            inner.terminal,
+            Some((ResourceActionDispositionV1::Complete, true))
+        );
+        drop(inner);
+        assert_eq!(
+            cell.projection(),
+            Some(BackendCleanupDispositionV1::Unknown)
+        );
+        assert!(!cell.reclaimable());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn task_e_settlement_refusal_crossing_expiry_retains_flight_custody() {
+        let root = tempfile::tempdir().unwrap();
+        let journal_root = root.path().join("journal");
+        let moved_root = root.path().join("journal-moved");
+        let session = SessionId::parse("task-e-crossing-refusal").unwrap();
+        let request_id = request_id('5');
+        let identity = ActiveRequestIdentity::Dedicated(request_id.clone());
+        let flight = cleanup_request_flight(&journal_root, &session, request_id);
+        let observer = Arc::new(DiagnosticOutcomeObserver::new(
+            DiagnosticRecordOutcome::Accept,
+        ));
+        let lifecycle = ApiLifecycle::new(observer, None);
+        let cell = ApiRequestCleanupCustodianV1::new(95, session, true, Duration::from_millis(200));
+        cell.begin_admission().unwrap();
+        cell.bind(&identity).unwrap();
+        cell.mark_accepted(&identity);
+        cell.begin_cleanup();
+
+        let arrived = Arc::new(std::sync::Barrier::new(2));
+        let release = Arc::new(std::sync::Barrier::new(2));
+        {
+            let arrived = Arc::clone(&arrived);
+            let release = Arc::clone(&release);
+            *cell.settle_drop_gate.lock().unwrap() = Some(Box::new(move || {
+                arrived.wait();
+                release.wait();
+            }));
+        }
+        let settler = {
+            let cell = Arc::clone(&cell);
+            let identity = identity.clone();
+            std::thread::spawn(move || {
+                cell.settle_drop(
+                    &identity,
+                    Some(flight),
+                    ResourceActionDispositionV1::Unknown,
+                    Some(lifecycle),
+                    true,
+                );
+            })
+        };
+        let arrived_gate = Arc::clone(&arrived);
+        tokio::task::spawn_blocking(move || arrived_gate.wait())
+            .await
+            .unwrap();
+        assert_eq!(cell.observe().await, BackendCleanupDispositionV1::Unknown);
+        assert_eq!(
+            cell.inner.lock().unwrap().state,
+            ApiRequestCleanupStateV1::TimedOut
+        );
+        // The settlement that is about to resume must refuse: its journal
+        // root disappears while it is still stalled pre-settle.
+        std::fs::rename(&journal_root, &moved_root).unwrap();
+        let release_gate = Arc::clone(&release);
+        tokio::task::spawn_blocking(move || release_gate.wait())
+            .await
+            .unwrap();
+        settler.join().unwrap();
+
+        let inner = cell.inner.lock().unwrap();
+        assert_eq!(
+            inner.state,
+            ApiRequestCleanupStateV1::TimedOut,
+            "a refusal that crossed expiry must not overwrite TimedOut"
+        );
+        assert!(inner.terminal.is_none());
+        assert!(inner
+            .diagnostic
+            .as_ref()
+            .is_some_and(|(_, _, accepted)| *accepted));
+        assert!(
+            inner.retained_late_flight.is_some(),
+            "the refused late flight must stay in the custodian so its drop never retries"
+        );
         drop(inner);
         assert_eq!(
             cell.projection(),
