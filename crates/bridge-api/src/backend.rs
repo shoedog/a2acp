@@ -79,7 +79,7 @@ impl ApiLifecycle {
         retry_after_ms: Option<u64>,
         reset_at_ms: Option<i64>,
         prompt_may_have_been_accepted: bool,
-    ) -> BridgeError {
+    ) -> (BridgeError, bool) {
         let failure = match FailureDiagnostic::build_static_code(
             FailureDiagnosticInput {
                 failed_phase,
@@ -102,7 +102,7 @@ impl ApiLifecycle {
             &self.redactor,
         ) {
             Ok(failure) => failure,
-            Err(_) => return BridgeError::InvalidStateTransition,
+            Err(_) => return (BridgeError::InvalidStateTransition, false),
         };
         let transition = match PersistedPhaseTransition::build_static_code(
             PersistedPhaseTransitionInput {
@@ -117,25 +117,25 @@ impl ApiLifecycle {
             &self.redactor,
         ) {
             Ok(transition) => transition,
-            Err(_) => return BridgeError::InvalidStateTransition,
+            Err(_) => return (BridgeError::InvalidStateTransition, false),
         };
         let event =
             match bridge_core::diagnostics::DiagnosticEvent::new(transition, Some(failure.clone()))
             {
                 Ok(event) => event,
-                Err(_) => return BridgeError::InvalidStateTransition,
+                Err(_) => return (BridgeError::InvalidStateTransition, false),
             };
         match self.observer.record(event).await {
-            Ok(()) => BridgeError::agent_failure(failure),
-            Err(error) => error,
+            Ok(()) => (BridgeError::agent_failure(failure), true),
+            Err(error) => (error, false),
         }
     }
 
-    async fn request_flight_failure(
+    async fn request_flight_failure_recorded(
         &self,
         error: RemoteRequestFlightErrorV1,
         prompt_may_have_been_accepted: bool,
-    ) -> BridgeError {
+    ) -> (BridgeError, bool) {
         let (failed_phase, last_completed_phase) = if prompt_may_have_been_accepted {
             (
                 DiagnosticPhase::PromptStream,
@@ -156,6 +156,16 @@ impl ApiLifecycle {
             prompt_may_have_been_accepted,
         )
         .await
+    }
+
+    async fn request_flight_failure(
+        &self,
+        error: RemoteRequestFlightErrorV1,
+        prompt_may_have_been_accepted: bool,
+    ) -> BridgeError {
+        self.request_flight_failure_recorded(error, prompt_may_have_been_accepted)
+            .await
+            .0
     }
 }
 
@@ -272,6 +282,7 @@ struct ApiRequestCleanupInnerV1 {
     overlapped_cleanup: bool,
     terminal: Option<(ResourceActionDispositionV1, bool)>,
     diagnostic: Option<(ApiLifecycle, RemoteRequestFlightErrorV1, bool)>,
+    retained_late_flight: Option<DurableRemoteRequestFlightV3>,
 }
 
 /// Turn-keyed custody retained independently of the removable session slot.
@@ -309,6 +320,7 @@ impl ApiRequestCleanupCustodianV1 {
                 overlapped_cleanup: false,
                 terminal: None,
                 diagnostic: None,
+                retained_late_flight: None,
             }),
             changed,
             live_waiters: AtomicUsize::new(0),
@@ -478,17 +490,18 @@ impl ApiRequestCleanupCustodianV1 {
         let Ok(mut inner) = self.inner.lock() else {
             return;
         };
+        let timed_out = inner.state == ApiRequestCleanupStateV1::TimedOut;
         if inner.identity.as_ref() != Some(identity)
             || matches!(
                 inner.state,
-                ApiRequestCleanupStateV1::Terminal
-                    | ApiRequestCleanupStateV1::SettlementRefused
-                    | ApiRequestCleanupStateV1::TimedOut
+                ApiRequestCleanupStateV1::Terminal | ApiRequestCleanupStateV1::SettlementRefused
             )
         {
             return;
         }
-        inner.state = ApiRequestCleanupStateV1::DropOwned;
+        if !timed_out {
+            inner.state = ApiRequestCleanupStateV1::DropOwned;
+        }
         inner.accepted |= accepted;
         inner.overlapped_cleanup = true;
         drop(inner);
@@ -503,12 +516,30 @@ impl ApiRequestCleanupCustodianV1 {
             }),
         };
         let result = settle().or_else(|error| {
-            if tokio::time::Instant::now() < self.deadline {
+            if !timed_out && tokio::time::Instant::now() < self.deadline {
                 settle()
             } else {
                 Err(error)
             }
         });
+        if timed_out {
+            if let Ok(mut inner) = self.inner.lock() {
+                if inner.identity.as_ref() == Some(identity)
+                    && inner.state == ApiRequestCleanupStateV1::TimedOut
+                {
+                    match result {
+                        Ok(result) => inner.terminal = Some((result.disposition, true)),
+                        Err(error) => {
+                            inner.diagnostic =
+                                lifecycle.map(|lifecycle| (lifecycle, error, inner.accepted));
+                            inner.retained_late_flight = flight;
+                        }
+                    }
+                }
+            }
+            self.notify();
+            return;
+        }
         match result {
             Ok(result) => {
                 self.finish(identity, result.disposition, true);
@@ -560,14 +591,30 @@ impl ApiRequestCleanupCustodianV1 {
                     .inner
                     .lock()
                     .ok()
-                    .and_then(|mut inner| inner.diagnostic.take());
+                    .and_then(|inner| inner.diagnostic.clone());
                 if let Some((lifecycle, error, accepted)) = diagnostic {
                     if tokio::time::Instant::now() < self.deadline {
-                        let _ = tokio::time::timeout_at(
+                        let recording = tokio::time::timeout_at(
                             self.deadline,
-                            lifecycle.request_flight_failure(error, accepted),
+                            lifecycle.request_flight_failure_recorded(error.clone(), accepted),
                         )
                         .await;
+                        if matches!(recording, Ok((_, true))) {
+                            if let Ok(mut inner) = self.inner.lock() {
+                                let is_same = inner.diagnostic.as_ref().is_some_and(
+                                    |(pending_lifecycle, pending_error, pending_accepted)| {
+                                        Arc::ptr_eq(
+                                            &pending_lifecycle.observer,
+                                            &lifecycle.observer,
+                                        ) && pending_error == &error
+                                            && *pending_accepted == accepted
+                                    },
+                                );
+                                if is_same {
+                                    inner.diagnostic = None;
+                                }
+                            }
+                        }
                     }
                 }
                 return result;
@@ -841,11 +888,12 @@ async fn provider_failure_after_settlement(
             true,
         )
         .await
+        .0
 }
 
 enum PreparedRequest {
     Ready {
-        scope: RequestScope,
+        scope: Box<RequestScope>,
         cancel_rx: watch::Receiver<bool>,
     },
     TurnCancelled,
@@ -915,10 +963,7 @@ impl RequestAdmission {
                 None => None,
             })
         })()
-        .map_err(|error| {
-            cleanup.refuse(None, error.clone(), None);
-            error
-        })?;
+        .inspect_err(|error| cleanup.refuse(None, error.clone(), None))?;
 
         let active_conflict = {
             let mut sessions = self.sessions.lock().map_err(|_| {
@@ -962,7 +1007,7 @@ impl RequestAdmission {
                         identity: identity.clone(),
                     };
                     return Ok(PreparedRequest::Ready {
-                        scope: RequestScope {
+                        scope: Box::new(RequestScope {
                             cancel,
                             cancel_control,
                             cleanup: Arc::clone(&cleanup),
@@ -972,7 +1017,7 @@ impl RequestAdmission {
                             accepted: false,
                             dispatched: false,
                             settled: false,
-                        },
+                        }),
                         cancel_rx,
                     });
                 }
@@ -1302,7 +1347,7 @@ impl ApiBackend {
                     return;
                 };
                 scope.attach_lifecycle(lifecycle.clone(), acceptance_barrier_crossed);
-                let mut scope = Some(scope);
+                let mut scope = Some(*scope);
                 // Durable reservation, owner attachment, identity evidence,
                 // intent, and dispatch all precede installation of the POST future.
                 if let Err(error) = scope
@@ -1999,6 +2044,42 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Copy)]
+    enum DiagnosticRecordOutcome {
+        Accept,
+        Reject,
+        Stall,
+    }
+
+    struct DiagnosticOutcomeObserver {
+        outcome: DiagnosticRecordOutcome,
+        calls: AtomicUsize,
+    }
+
+    impl DiagnosticOutcomeObserver {
+        fn new(outcome: DiagnosticRecordOutcome) -> Self {
+            Self {
+                outcome,
+                calls: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl DiagnosticObserver for DiagnosticOutcomeObserver {
+        async fn record(
+            &self,
+            _event: bridge_core::diagnostics::DiagnosticEvent,
+        ) -> Result<(), BridgeError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            match self.outcome {
+                DiagnosticRecordOutcome::Accept => Ok(()),
+                DiagnosticRecordOutcome::Reject => Err(BridgeError::InvalidStateTransition),
+                DiagnosticRecordOutcome::Stall => std::future::pending().await,
+            }
+        }
+    }
+
     struct DenyAll;
     impl PolicyEngine for DenyAll {
         fn decide(
@@ -2327,6 +2408,42 @@ mod tests {
             journal_root,
             _root: root,
         }
+    }
+
+    fn cleanup_request_flight(
+        journal_root: &std::path::Path,
+        session: &SessionId,
+        request_id: DedicatedRemoteRequestIdV1,
+    ) -> DurableRemoteRequestFlightV3 {
+        std::fs::create_dir(journal_root).unwrap();
+        let journal = Arc::new(FileResourceFlightJournal::open(journal_root, 64).unwrap());
+        let attempt = DurableProcessFlightAttemptV3::new(AttemptId::mint().unwrap(), journal);
+        let owner = ResourceFlightOwnerV1::new(
+            NodeId::parse("task-e-cleanup-node").unwrap(),
+            session.as_str(),
+        )
+        .unwrap();
+        let mut flight = attempt.bind_remote_request(request_id, owner).unwrap();
+        flight.begin_dispatch().unwrap();
+        flight
+    }
+
+    fn refused_cleanup_cell(
+        session: &SessionId,
+        timeout: Duration,
+        observer: Arc<dyn DiagnosticObserver>,
+    ) -> Arc<ApiRequestCleanupCustodianV1> {
+        let identity = ActiveRequestIdentity::Dedicated(request_id('d'));
+        let cell = ApiRequestCleanupCustodianV1::new(91, session.clone(), true, timeout);
+        cell.begin_admission().unwrap();
+        cell.bind(&identity).unwrap();
+        cell.mark_accepted(&identity);
+        cell.refuse(
+            Some(&identity),
+            RemoteRequestFlightErrorV1::Admission("injected settlement refusal".into()),
+            Some(ApiLifecycle::new(observer, None)),
+        );
+        cell
     }
 
     async fn wait_for_active_request(
@@ -3358,6 +3475,122 @@ mod tests {
         assert!(observer.snapshot().await.iter().any(|event| event
             .failure()
             .is_some_and(|failure| failure.prompt_may_have_been_accepted())));
+    }
+
+    #[tokio::test]
+    async fn task_e_expired_observation_retains_accepted_refusal_diagnostic() {
+        let session = SessionId::parse("task-e-expired-diagnostic").unwrap();
+        let observer = Arc::new(DiagnosticOutcomeObserver::new(
+            DiagnosticRecordOutcome::Accept,
+        ));
+        let cell = refused_cleanup_cell(&session, Duration::ZERO, observer.clone());
+
+        assert_eq!(cell.observe().await, BackendCleanupDispositionV1::Unknown);
+        assert_eq!(observer.calls.load(Ordering::SeqCst), 0);
+        assert!(cell
+            .inner
+            .lock()
+            .unwrap()
+            .diagnostic
+            .as_ref()
+            .is_some_and(|(_, _, accepted)| *accepted));
+        assert_eq!(cell.live_waiters.load(Ordering::Acquire), 0);
+    }
+
+    #[tokio::test]
+    async fn task_e_rejected_or_timed_out_diagnostic_recording_retains_custody() {
+        let session = SessionId::parse("task-e-observer-refusal").unwrap();
+        for outcome in [
+            DiagnosticRecordOutcome::Reject,
+            DiagnosticRecordOutcome::Stall,
+        ] {
+            let observer = Arc::new(DiagnosticOutcomeObserver::new(outcome));
+            let cell = refused_cleanup_cell(&session, Duration::from_millis(20), observer.clone());
+
+            assert_eq!(cell.observe().await, BackendCleanupDispositionV1::Unknown);
+            assert_eq!(observer.calls.load(Ordering::SeqCst), 1);
+            assert!(cell.inner.lock().unwrap().diagnostic.is_some());
+            assert_eq!(cell.live_waiters.load(Ordering::Acquire), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn task_e_timeout_then_drop_records_success_without_upgrading_unknown() {
+        let root = tempfile::tempdir().unwrap();
+        let journal_root = root.path().join("journal");
+        let session = SessionId::parse("task-e-timeout-drop-success").unwrap();
+        let request_id = request_id('c');
+        let identity = ActiveRequestIdentity::Dedicated(request_id.clone());
+        let flight = cleanup_request_flight(&journal_root, &session, request_id);
+        let cell = ApiRequestCleanupCustodianV1::new(92, session, true, Duration::ZERO);
+        cell.begin_admission().unwrap();
+        cell.bind(&identity).unwrap();
+        cell.begin_cleanup();
+        assert_eq!(cell.observe().await, BackendCleanupDispositionV1::Unknown);
+
+        cell.settle_drop(
+            &identity,
+            Some(flight),
+            ResourceActionDispositionV1::Complete,
+            None,
+            true,
+        );
+
+        let inner = cell.inner.lock().unwrap();
+        assert_eq!(inner.state, ApiRequestCleanupStateV1::TimedOut);
+        assert!(inner.accepted);
+        assert_eq!(
+            inner.terminal,
+            Some((ResourceActionDispositionV1::Complete, true))
+        );
+        drop(inner);
+        assert_eq!(
+            cell.projection(),
+            Some(BackendCleanupDispositionV1::Unknown)
+        );
+    }
+
+    #[tokio::test]
+    async fn task_e_timeout_then_drop_records_refusal_without_upgrading_unknown() {
+        let root = tempfile::tempdir().unwrap();
+        let journal_root = root.path().join("journal");
+        let moved_root = root.path().join("journal-moved");
+        let session = SessionId::parse("task-e-timeout-drop-refusal").unwrap();
+        let request_id = request_id('f');
+        let identity = ActiveRequestIdentity::Dedicated(request_id.clone());
+        let flight = cleanup_request_flight(&journal_root, &session, request_id);
+        let observer = Arc::new(DiagnosticOutcomeObserver::new(
+            DiagnosticRecordOutcome::Accept,
+        ));
+        let lifecycle = ApiLifecycle::new(observer, None);
+        let cell = ApiRequestCleanupCustodianV1::new(93, session, true, Duration::ZERO);
+        cell.begin_admission().unwrap();
+        cell.bind(&identity).unwrap();
+        cell.begin_cleanup();
+        assert_eq!(cell.observe().await, BackendCleanupDispositionV1::Unknown);
+        std::fs::rename(&journal_root, moved_root).unwrap();
+
+        cell.settle_drop(
+            &identity,
+            Some(flight),
+            ResourceActionDispositionV1::Unknown,
+            Some(lifecycle),
+            true,
+        );
+
+        let inner = cell.inner.lock().unwrap();
+        assert_eq!(inner.state, ApiRequestCleanupStateV1::TimedOut);
+        assert!(inner.accepted);
+        assert!(inner.terminal.is_none());
+        assert!(inner
+            .diagnostic
+            .as_ref()
+            .is_some_and(|(_, _, accepted)| *accepted));
+        drop(inner);
+        assert_eq!(
+            cell.projection(),
+            Some(BackendCleanupDispositionV1::Unknown)
+        );
     }
 
     #[test]
