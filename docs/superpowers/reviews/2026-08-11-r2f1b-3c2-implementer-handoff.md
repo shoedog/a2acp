@@ -208,7 +208,49 @@ Formatting and diff checks pass.
 
 Post-format churn versus `f17e2bd3` is production +111/-70 = 181 lines and
 541 total changed lines by additions plus deletions, below the Task G
-limits of 350 production and 700 total.
+limits of 350 production and 700 total. (Base-implementation accounting
+only, through `4c8e408b`; the targeted repair, gate repair, and closure
+extension below carry their own accounting, and the full-line totals are
+stated in the closure-extension section.)
+
+### Operator closure extension: fallible metadata before effects (2026-08-15)
+
+The counted closure adjudicated the repair's two reported retention sites
+FIXED but found the retention INCOMPLETE across one more pre-acceptance
+exit: the preflight turn-metadata mint (`generate_turn_id`, context and
+operation binding) ran AFTER `configure_session` succeeded, and a failure
+there `?`-returned with `retain_in_run_cache: false` and no cleanup call —
+evicting the cell while configured session state existed, so a later node
+could reconfigure and reuse it. Population across the round: 3 -> 1,
+shrinking; this disclosed operator convergence extension folds the single
+bounded residual and carries a BINDING second look at the aggregate round.
+
+- Fix: every fallible piece of turn metadata is constructed BEFORE the
+  first backend effect (the ordinary node path already orders itself this
+  way). A metadata failure now provably performs zero configurations, so
+  its eviction is the proven-clean case by construction — class-terminal
+  for the fallible-exit-after-effect family in this function.
+- Red-first (log `g-ext-red.log`): a test-only injected metadata fault
+  (`preflight_metadata_fault`, the established `#[cfg(test)]` ordering-
+  gate discipline; the gate moves with the metadata block) drove
+  `preflight_metadata_failure_cannot_leave_configured_state_behind`,
+  which FAILED on the pre-hoist mechanism at `configures == 0` (actual:
+  1) and passes after the hoist with zero configures, zero prompts, zero
+  forgets.
+- Post-change: full `bridge-workflow` and `bridge-worktree` suites green;
+  fresh workspace all-target/all-feature locked Clippy with `-D warnings`,
+  `cargo fmt --all -- --check`, and `git diff --check` all exit 0.
+- Extension churn versus the gate-repair head: 143 changed lines in
+  `executor.rs` (the hoisted block counts twice under the churn
+  convention) plus this handoff section.
+- Full Task G line code churn versus `f17e2bd3` (all four commits):
+  `executor.rs` +443/-137, `bridge-worktree/src/backend.rs` +66/-0
+  (guard tests), `bin/.../r2f0b_production_wiring.rs` +22/-0 (assertion
+  test), `bridge-api/src/backend.rs` +7/-1 (test hardening only).
+
+The closure's remaining deferrals stand for the aggregate ledger: the
+configure-clean eviction regression (test-only) and the G2 smoke-consumer
+slice. Production V3 remains unarmed.
 
 ## Accepted Task F history
 
