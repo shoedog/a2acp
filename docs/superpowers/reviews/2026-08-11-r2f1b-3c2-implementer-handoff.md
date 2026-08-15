@@ -891,3 +891,18 @@ remains crash-equivalent, and reopen conservatively reports `Unknown` with
 Only `remote_request_flight.rs` and this handoff changed. Tasks E-G, every
 production caller/route, provider send, API/HTTP work, live smoke,
 compatibility, deployment, and production V3 remain unarmed and unchanged.
+
+### Task D repair completion (exact head record)
+
+The repair's advisory review confirmed the effect-then-debt recovery fix
+but found the widened terminal CAS allowed ANY unaccepted settlement to
+consume a durably armed row — a stale acceptance flag racing the
+arm/atomic handoff could durably misreport an accepted send as
+`accepted=false`. The completion scopes the allowance to a private
+`failed_arm` privilege held only by the arming wrapper's zero-poll failure
+branch; every ordinary settlement (public settle, drop, journal/recovery
+paths) refuses `InvalidStateTransition` on an armed row when unaccepted.
+Red evidence: the stale-settlement regression (durable armed row with a
+false acceptance atomic, ordinary settle) succeeded in publishing
+`accepted=false` on the pre-change head and now refuses with zero publisher
+calls. Tasks E-G and production V3 remain unarmed.
