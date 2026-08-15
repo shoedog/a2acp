@@ -800,3 +800,49 @@ required; it now refuses `Malformed` with every root byte preserved, and
 the residue-only control still surfaces the recovery-side classification.
 This closes the validate-before-recover class at its terminal scope (the
 full census). Tasks D-G and production V3 remain unarmed.
+
+## Task D owned request driver and bounded observation
+
+Date: 2026-08-15. Exact frozen input:
+`832221c905e3e32d541d311931a177637a2d0f28` (`832221c9`).
+
+### Admissible red evidence
+
+Exact pre-production command:
+`CARGO_INCREMENTAL=0 cargo test -p bridge-core --lib --locked --offline --
+remote_request_flight_task_d --nocapture`.
+Cargo reached `bridge-core` and exited 101 with eleven errors specific to the
+absent Task D `RemoteRequestDriverV1`, owned first-poll/settlement surface,
+and `ObservationTimedOut` refusal. It was neither a dependency or network
+refusal nor a zero-selected selector.
+
+### Result, recovery, and bounds
+
+The production opener now yields a shared driver whose admission returns one
+non-cloneable owned request. Its authority-bound methods durably journal intent
+and dispatch authorization in exact order. The generic provider-send wrapper
+appends `ProviderSendArmed` before the inner future's first poll; an injected
+no-effect Task A refusal never polls the inner future and settles
+`Failed,false`. Crash recovery retains the Task C prefix table:
+pre-arm is `Failed,false`, while post-arm is `Unknown,true`.
+
+Terminal settlement records one durable winner, publishes it only after every
+journal/Task A lock is released, requires the exact delivery acknowledgement,
+and retires the row. Racing settlers return the same winner. A watch observer
+uses deadline-bounded Tokio waits and an RAII waiter count; timeout leaves zero
+live waiters and creates no thread. Publication refusal leaves the pending row
+and blocks new admission; drop does not retry or erase that debt, and reopen
+drains it through the existing Task C outbox.
+
+The required aggregate selector passes 159/0; focused Task D passes 6/0.
+Bridge-core library Clippy with `-D warnings`, direct Rustfmt check, and
+`git diff --check` pass. Required `cargo fmt --all -- --check` was run but
+cannot start because this Cargo has no `fmt` subcommand; no
+`rustfmt::skip` was added. Post-format churn versus `832221c9` is 428
+production lines (412 additions/16 deletions), 261 colocated-test lines
+(252/9), and this 46-line handoff: 735 total changed lines.
+
+Only `remote_request_flight.rs` and this handoff changed; `lib.rs` needed
+no broader export. Tasks E-G, every production caller/route, provider send,
+API/HTTP work, live smoke, compatibility, deployment, and production V3 remain
+unarmed and unchanged.
