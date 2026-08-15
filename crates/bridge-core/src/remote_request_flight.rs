@@ -17,12 +17,11 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::{
     collections::BTreeSet,
     ops::Deref,
-    path::PathBuf,
     sync::{Arc, Mutex},
 };
 const SCHEMA: u8 = 1;
 const CAPACITY: usize = 4096;
-const ADMISSION_FOOTPRINT: usize = 3;
+const ADMISSION_FOOTPRINT: usize = 4;
 const WIRE_CAP: usize = 4096;
 const CHECKPOINT_CHILD_V1: &str = "remote-request-checkpoint.json";
 const ATTEMPT_LEASE_CHILD_V1: &str = "remote-request-attempt.lock";
@@ -396,32 +395,24 @@ impl RemoteRequestJournalV1 {
             .expect("portable attempt lease name")
     }
     fn acquire_attempt_lease(custody: &JournalRootCustodyV2) -> FlightResult<PersistentLockGuard> {
-        let operation = custody
-            .begin_operation("open attempt lifetime lease")
-            .map_err(fs)?;
         let name = Self::attempt_lease_name();
-        let file = open_regular_child(
-            operation.root_file(),
-            name.as_os_str(),
-            "open attempt lifetime lease",
-        )
-        .map_err(fs)?;
-        if required_file_content_snapshot_v2(&file, "attempt lifetime lease")
-            .map_err(fs)?
-            .content_len
-            != 0
-        {
-            return Err(Refusal::Malformed("attempt lease is not empty".into()));
-        }
-        drop(operation);
-        crate::liveness::acquire_persistent_lock_file(file, PathBuf::from(ATTEMPT_LEASE_CHILD_V1))
+        let (lease, snapshot) = custody
+            .acquire_existing_regular_child_lease(&name, "open attempt lifetime lease")
             .map_err(|error| {
-                if error.kind() == std::io::ErrorKind::WouldBlock {
+                if matches!(
+                    &error,
+                    FsCustodyError::Io(_, source)
+                        if source.kind() == std::io::ErrorKind::WouldBlock
+                ) {
                     Refusal::AttemptLive
                 } else {
-                    fs(FsCustodyError::Io("attempt lifetime lease".into(), error))
+                    fs(error)
                 }
-            })
+            })?;
+        if snapshot.content_len != 0 {
+            return Err(Refusal::Malformed("attempt lease is not empty".into()));
+        }
+        Ok(lease)
     }
     fn open_base(
         custody: JournalRootCustodyV2,
@@ -1534,6 +1525,29 @@ mod tests {
         fs::remove_file(path).unwrap();
         fs::write(replacement, serde_json::to_vec(&wire).unwrap()).unwrap();
     }
+    fn install_active_children(case: &Case, count: usize) {
+        for index in 0..count {
+            let ordinal = index as u64;
+            let mut wire = RequestChildWireV1 {
+                schema: SCHEMA,
+                attempt: attempt(),
+                ordinal,
+                checkpoint_digest: checkpoint_digest(&attempt(), ordinal),
+                authority_digest: Sha256HexV1::digest(b"pending"),
+                request_id: request(index),
+                owner: owner(index),
+                status: ChildStateV1::Active {},
+            };
+            wire.authority_digest = authority_digest(&wire);
+            fs::write(
+                case.root
+                    .join(request_name(&wire.authority_digest).as_os_str()),
+                serde_json::to_vec(&wire).unwrap(),
+            )
+            .unwrap();
+        }
+        rewrite_checkpoint(case, &attempt(), count as u64);
+    }
     fn install_retire_residue(case: &Case, keep_capture: bool) {
         let (path, wire) = child(case);
         let target = request_name(&wire.authority_digest);
@@ -1686,35 +1700,36 @@ mod tests {
         assert_eq!(root_bytes(&case), before);
     }
     #[test]
-    fn remote_request_flight_capacity_precedes_id_mint_and_positive_edge_admits() {
+    fn remote_request_flight_capacity_counts_permanent_lease_before_mint_or_mutation() {
         let case = case();
-        let mut journal = initialized(&case, 8);
+        let mut journal = initialized(&case, CAPACITY);
+        install_active_children(&case, CAPACITY - 4);
         let mut minted = 0;
-        for index in 0..5 {
-            journal
-                .admit_with(owner(index), || {
-                    minted += 1;
-                    Ok(request(index))
-                })
-                .unwrap();
-        }
-        assert_eq!(minted, 5);
-        let (checkpoint, _): (CheckpointWireV1, _) = read_wire(
-            &journal.custody.begin_operation("read checkpoint").unwrap(),
-            &RemoteRequestJournalV1::checkpoint_name(),
-        )
-        .unwrap();
-        assert_eq!(checkpoint.next_ordinal, 5);
-        let before = fs::read_dir(&case.root).unwrap().count();
+        let before = root_bytes(&case);
         assert!(matches!(
-            journal.admit_with(owner(6), || {
+            journal.admit_with(owner(CAPACITY), || {
                 minted += 1;
-                Ok(request(6))
+                Ok(request(CAPACITY))
             }),
             Err(RemoteRequestFlightRefusalV1::Capacity)
         ));
-        assert_eq!(minted, 5);
-        assert_eq!(fs::read_dir(&case.root).unwrap().count(), before);
+        assert_eq!(minted, 0);
+        assert_eq!(root_bytes(&case), before);
+    }
+    #[test]
+    fn remote_request_flight_interrupted_positive_edge_reopens_with_healing_headroom() {
+        let case = case();
+        let mut journal = initialized(&case, CAPACITY);
+        install_active_children(&case, CAPACITY - ADMISSION_FOOTPRINT - 1);
+        assert!(journal
+            .admit_with_boundary(owner(CAPACITY), || Ok(request(CAPACITY)), 4)
+            .is_err());
+        drop(journal);
+
+        drop(
+            RemoteRequestJournalV1::open_with_capacity(custody(&case), attempt(), CAPACITY)
+                .unwrap(),
+        );
     }
     #[test]
     fn remote_request_flight_real_task_a_protective_outcome_is_not_flattened() {
@@ -2402,6 +2417,30 @@ mod tests {
     }
 
     #[test]
+    fn remote_request_flight_task_c_recovers_pre_send_failure_without_acceptance() {
+        use ResourceActionDispositionV1 as D;
+
+        let case = case();
+        let publisher = RecordingPublisher::with_replies([]);
+        initialize_root(&case, attempt(), 16);
+        let mut journal =
+            RemoteRequestJournalV1::open_with_capacity(custody(&case), attempt(), 16).unwrap();
+        assert!(journal
+            .admit_with_boundary(owner(0), || Ok(request(0)), 4)
+            .is_err());
+        drop(journal);
+        drop(RemoteRequestJournalV1::open_with_capacity(custody(&case), attempt(), 16).unwrap());
+        assert_eq!(child(&case).1.status, ChildStateV1::PreSendFailure {});
+
+        drop(open_recovered(&case, attempt(), 16, publisher.clone()).unwrap());
+        let calls = publisher.calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].result().disposition, D::Failed);
+        assert!(!calls[0].prompt_may_have_been_accepted());
+        assert!(request_paths(&case).is_empty());
+    }
+
+    #[test]
     fn remote_request_flight_task_c_attempt_lease_excludes_and_releases() {
         let case = case();
         let publisher = RecordingPublisher::with_replies([]);
@@ -2414,6 +2453,50 @@ mod tests {
         ));
         assert_eq!(root_bytes(&case), before);
         drop(first);
+        drop(open_recovered(&case, attempt(), 16, publisher).unwrap());
+    }
+
+    #[test]
+    fn remote_request_flight_task_c_attempt_lease_precedes_contended_operation() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let case = case();
+        let publisher = RecordingPublisher::with_replies([]);
+        initialize_root(&case, attempt(), 16);
+        let journal = open_recovered(&case, attempt(), 16, publisher.clone()).unwrap();
+        let operation_held = Arc::new(AtomicBool::new(false));
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let thread_holding = Arc::clone(&operation_held);
+        let thread = std::thread::spawn(move || {
+            let mut journal = journal;
+            let admitted = journal.admit_with(owner(0), || {
+                thread_holding.store(true, Ordering::SeqCst);
+                entered_tx.send(()).unwrap();
+                release_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+                Ok(request(0))
+            });
+            (admitted, journal)
+        });
+        entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+
+        let before = root_bytes(&case);
+        assert!(matches!(
+            open_recovered(&case, attempt(), 16, publisher.clone()),
+            Err(RemoteRequestFlightRefusalV1::AttemptLive)
+        ));
+        assert!(
+            operation_held.load(Ordering::SeqCst),
+            "the lease flock must answer while the first Task A operation is still held"
+        );
+        assert_eq!(root_bytes(&case), before);
+
+        release_tx.send(()).unwrap();
+        let (admitted, journal) = thread.join().unwrap();
+        admitted.unwrap();
+        drop(journal);
         drop(open_recovered(&case, attempt(), 16, publisher).unwrap());
     }
 
@@ -2456,11 +2539,18 @@ mod tests {
             drop(journal);
 
             let first = open_recovered(&case, attempt(), 16, publisher.clone());
-            assert!(matches!(
-                first,
-                Err(RemoteRequestFlightRefusalV1::PublicationRefused(_))
-                    | Err(RemoteRequestFlightRefusalV1::PublicationAcknowledgementMismatch)
-            ));
+            match first_reply {
+                PublisherReply::Refuse => assert!(matches!(
+                    first,
+                    Err(RemoteRequestFlightRefusalV1::PublicationRefused(ref reason))
+                        if reason == "injected publication refusal"
+                )),
+                PublisherReply::Mismatch => assert!(matches!(
+                    first,
+                    Err(RemoteRequestFlightRefusalV1::PublicationAcknowledgementMismatch)
+                )),
+                PublisherReply::Echo => unreachable!(),
+            }
             assert!(child(&case).1.status.is_terminal_pending());
             drop(open_recovered(&case, attempt(), 16, publisher.clone()).unwrap());
             assert_eq!(publisher.calls().len(), 2);

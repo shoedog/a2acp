@@ -977,6 +977,38 @@ impl JournalRootCustodyV2 {
         )
     }
 
+    /// Open and nonblocking-flock one existing regular child without entering the journal
+    /// operation lock. The returned snapshot lets the caller validate content without receiving
+    /// the file or any route path; pre/post route and name checks bind the held inode to `name`.
+    pub(crate) fn acquire_existing_regular_child_lease(
+        &self,
+        name: &ChildNameV2,
+        label: &str,
+    ) -> Result<(crate::liveness::PersistentLockGuard, FileContentSnapshotV2), FsCustodyError> {
+        self.prove_route(label)?;
+        let file = open_regular_child(&self.root.file, name.as_os_str(), label)?;
+        let opened = required_file_content_snapshot_v2(&file, label)?;
+        let lease = crate::liveness::acquire_persistent_lock_file(file, PathBuf::from(label))
+            .map_err(|error| {
+                if [libc::ENOSYS, libc::ENOTSUP, libc::ENOLCK]
+                    .contains(&error.raw_os_error().unwrap_or_default())
+                {
+                    FsCustodyError::Unsupported(label.to_owned())
+                } else {
+                    FsCustodyError::Io(label.to_owned(), error)
+                }
+            })?;
+        self.prove_route(label)?;
+        let current = required_file_content_snapshot_v2(
+            &open_regular_child(&self.root.file, name.as_os_str(), label)?,
+            label,
+        )?;
+        if current.object != opened.object {
+            return Err(FsCustodyError::IdentityChanged(label.to_owned()));
+        }
+        Ok((lease, current))
+    }
+
     fn begin_operation_with<E, F, H>(
         &self,
         label: &str,
@@ -1063,6 +1095,14 @@ impl JournalRootCustodyV2 {
         &self,
         label: &str,
     ) -> Result<JournalRootOperationV2<'_>, FsCustodyError> {
+        Err(FsCustodyError::Unsupported(label.to_owned()))
+    }
+
+    pub(crate) fn acquire_existing_regular_child_lease(
+        &self,
+        _name: &ChildNameV2,
+        label: &str,
+    ) -> Result<(crate::liveness::PersistentLockGuard, FileContentSnapshotV2), FsCustodyError> {
         Err(FsCustodyError::Unsupported(label.to_owned()))
     }
 }
@@ -5102,6 +5142,68 @@ mod tests {
             drop(operation);
             assert!(flock(&peer).unwrap());
             unlock(&peer);
+        }
+
+        #[test]
+        fn journal_route_custody_v2_existing_child_lease_refuses_wrong_route_and_type() {
+            let name = ChildNameV2::from_bytes(b"attempt.lock").unwrap();
+
+            let moved = route_case();
+            fs::write(moved.root.join(name.as_os_str()), b"").unwrap();
+            let custody = JournalRootCustodyV2::open(
+                &moved.anchor,
+                &moved.binding,
+                "existing child moved route",
+            )
+            .unwrap();
+            replace(&moved, Replaced::Root);
+            assert_identity_refusal(
+                custody.acquire_existing_regular_child_lease(&name, "existing child moved route"),
+            );
+            assert!(
+                !moved.root.join(name.as_os_str()).exists(),
+                "the accessor must not create a child in the replacement route"
+            );
+
+            let wrong_type = route_case();
+            fs::create_dir(wrong_type.root.join(name.as_os_str())).unwrap();
+            let custody = JournalRootCustodyV2::open(
+                &wrong_type.anchor,
+                &wrong_type.binding,
+                "existing child wrong type",
+            )
+            .unwrap();
+            assert!(matches!(
+                custody.acquire_existing_regular_child_lease(&name, "existing child wrong type"),
+                Err(FsCustodyError::Unsupported(_))
+            ));
+            assert!(wrong_type.root.join(name.as_os_str()).is_dir());
+        }
+
+        #[test]
+        fn journal_route_custody_v2_existing_child_lease_contends_and_releases() {
+            let case = route_case();
+            let name = ChildNameV2::from_bytes(b"attempt.lock").unwrap();
+            fs::write(case.root.join(name.as_os_str()), b"").unwrap();
+            let first_custody =
+                JournalRootCustodyV2::open(&case.anchor, &case.binding, "first lease").unwrap();
+            let second_custody =
+                JournalRootCustodyV2::open(&case.anchor, &case.binding, "second lease").unwrap();
+            let (first, snapshot) = first_custody
+                .acquire_existing_regular_child_lease(&name, "first lease")
+                .unwrap();
+            assert_eq!(snapshot.content_len, 0);
+            assert!(matches!(
+                second_custody.acquire_existing_regular_child_lease(&name, "contended lease"),
+                Err(FsCustodyError::Io(_, ref error))
+                    if error.kind() == std::io::ErrorKind::WouldBlock
+            ));
+            drop(first);
+            drop(
+                second_custody
+                    .acquire_existing_regular_child_lease(&name, "released lease")
+                    .unwrap(),
+            );
         }
 
         #[test]
