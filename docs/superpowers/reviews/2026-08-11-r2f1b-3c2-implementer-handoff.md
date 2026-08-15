@@ -956,3 +956,49 @@ that same finished state, so it cannot be republished.
 Only `remote_request_flight.rs` and this handoff changed. Tasks E-G, every
 production caller/route, provider/API/HTTP work, live smoke, compatibility,
 deployment, and production V3 remain unarmed and unchanged.
+
+
+## Task E: API cleanup cell and exact projection
+
+Date: 2026-08-15. Exact frozen input:
+`2697c43866db6a22549c9984f727fa911533b75d` (`2697c438`).
+
+### Admissible red evidence
+
+- `CARGO_INCREMENTAL=0 cargo test -p bridge-api --lib task_e_active_legacy_checked_cleanup_is_unknown -- --nocapture`
+  selected one test and failed its binding assertion: the old cleanup returned
+  `Complete`, not `Unknown` (45 filtered). This was an admissible behavior red.
+- `CARGO_INCREMENTAL=0 cargo test -p bridge-api --lib task_e_cleanup_cell_has_the_exact_closed_state_set -- --nocapture`
+  failed compilation with unresolved `ApiRequestCleanupStateV1`, specifically
+  the missing Task E API. This was an admissible compile red.
+
+An earlier Wiremock-wait version of the Legacy test and the pre-change
+terminal-refusal selector timed out in test setup before a Task E assertion;
+they were classified inadmissible and excluded from the red evidence.
+
+### Result, gates, and bounds
+
+The API backend now installs one backend-global, turn-keyed cleanup custodian
+under the session lock, binds exact Legacy/V3 request authority, transfers drop
+settlement and acceptance-aware diagnostic custody before clearing the slot,
+and observes through one immutable deadline with Tokio watch waits. Session
+removal retains refusal/timeout debt; cleanup snapshots exact old authorities,
+so same-ID recreation cannot signal, settle, or clean its successor.
+
+The exact projection table is pinned for positive pre-send absence, overlapping
+Legacy work, V3 publication acknowledgement, every non-complete terminal,
+refusal, and timeout. All void, checked, and observed forget/release paths use
+the cell and return the exact checked disposition to existing callers.
+
+- Focused Task E tests: 5 passed; full bridge-api executable suites: 86 passed,
+  0 failed, 1 intentionally ignored live-Ollama test.
+- Unchanged core selector: 45 passed, 0 failed, 614 filtered.
+- `cargo fmt --all -- --check`, `git diff --check`, and the zero-test
+  bridge-api doctest harness pass after exposing the installed toolchain bins.
+- Post-format churn versus `2697c438`: 481 production lines (445 additions/36
+  deletions), 346 focused-test lines (317/29), and this 46-line handoff; 873
+  total changed lines, below both binding caps.
+
+Only `backend.rs` and this handoff changed. The shared-flight adapter still
+compiles; Tasks F-G, API HTTP execution, production routing, and production V3
+remain unarmed. Production still constructs `resource_flight_route_v3 = None`.

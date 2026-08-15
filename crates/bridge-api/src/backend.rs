@@ -22,9 +22,7 @@ use bridge_core::ports::{
     AgentBackend, BackendCleanupDispositionV1, BackendObservers, BackendResourceFlightV1,
     BackendStream, DiagnosticObserver, PolicyEngine, RichEventSink, Update, STOP_REASON_CANCELLED,
 };
-use bridge_core::process::{
-    DurableRemoteRequestFlightV3, RemoteRequestFlightErrorV1, RemoteRequestSettlementV1,
-};
+use bridge_core::process::{DurableRemoteRequestFlightV3, RemoteRequestFlightErrorV1};
 use bridge_core::provider::ProviderEvidence;
 use bridge_core::resource_flight::{
     DedicatedRemoteRequestIdV1, ResourceActionDispositionV1, ResourceActionResultV1,
@@ -32,7 +30,7 @@ use bridge_core::resource_flight::{
 use bridge_core::retained_resource_flight::ResourceFlightOwnerV1;
 use futures::StreamExt;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use tokio::sync::watch;
 
@@ -253,11 +251,350 @@ enum ActiveRequestIdentity {
     Dedicated(DedicatedRemoteRequestIdV1),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ApiRequestCleanupStateV1 {
+    AdmissionPendingLegacy,
+    AdmissionPendingV3,
+    ActiveLegacy,
+    ActiveV3,
+    DropOwned,
+    Terminal,
+    SettlementRefused,
+    TimedOut,
+}
+
+struct ApiRequestCleanupInnerV1 {
+    state: ApiRequestCleanupStateV1,
+    v3: bool,
+    admission_started: bool,
+    identity: Option<ActiveRequestIdentity>,
+    accepted: bool,
+    overlapped_cleanup: bool,
+    terminal: Option<(ResourceActionDispositionV1, bool)>,
+    diagnostic: Option<(ApiLifecycle, RemoteRequestFlightErrorV1, bool)>,
+}
+
+/// Turn-keyed custody retained independently of the removable session slot.
+struct ApiRequestCleanupCustodianV1 {
+    turn_authority: u64,
+    session: SessionId,
+    deadline: tokio::time::Instant,
+    inner: StdMutex<ApiRequestCleanupInnerV1>,
+    changed: watch::Sender<u64>,
+    live_waiters: AtomicUsize,
+}
+
+impl ApiRequestCleanupCustodianV1 {
+    fn new(
+        turn_authority: u64,
+        session: SessionId,
+        v3: bool,
+        timeout: std::time::Duration,
+    ) -> Arc<Self> {
+        let (changed, _) = watch::channel(0);
+        Arc::new(Self {
+            turn_authority,
+            session,
+            deadline: tokio::time::Instant::now() + timeout,
+            inner: StdMutex::new(ApiRequestCleanupInnerV1 {
+                state: if v3 {
+                    ApiRequestCleanupStateV1::AdmissionPendingV3
+                } else {
+                    ApiRequestCleanupStateV1::AdmissionPendingLegacy
+                },
+                v3,
+                admission_started: false,
+                identity: None,
+                accepted: false,
+                overlapped_cleanup: false,
+                terminal: None,
+                diagnostic: None,
+            }),
+            changed,
+            live_waiters: AtomicUsize::new(0),
+        })
+    }
+
+    fn notify(&self) {
+        self.changed
+            .send_modify(|revision| *revision = revision.wrapping_add(1));
+    }
+
+    fn begin_admission(&self) -> Result<(), RemoteRequestFlightErrorV1> {
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|_| RemoteRequestFlightErrorV1::Admission("cleanup cell poisoned".into()))?;
+        if inner.state == ApiRequestCleanupStateV1::Terminal
+            && inner.terminal.as_ref().is_some_and(|(result, ack)| {
+                *result == ResourceActionDispositionV1::Complete && *ack
+            })
+        {
+            inner.state = if inner.v3 {
+                ApiRequestCleanupStateV1::AdmissionPendingV3
+            } else {
+                ApiRequestCleanupStateV1::AdmissionPendingLegacy
+            };
+            inner.admission_started = false;
+            inner.identity = None;
+            inner.accepted = false;
+            inner.overlapped_cleanup = false;
+            inner.terminal = None;
+        }
+        if !matches!(
+            inner.state,
+            ApiRequestCleanupStateV1::AdmissionPendingLegacy
+                | ApiRequestCleanupStateV1::AdmissionPendingV3
+        ) {
+            return Err(RemoteRequestFlightErrorV1::Admission(
+                "cleanup cell is not admitting".into(),
+            ));
+        }
+        inner.admission_started = true;
+        Ok(())
+    }
+
+    fn bind(&self, identity: &ActiveRequestIdentity) -> Result<(), RemoteRequestFlightErrorV1> {
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|_| RemoteRequestFlightErrorV1::Admission("cleanup cell poisoned".into()))?;
+        if !inner.admission_started
+            || !matches!(
+                inner.state,
+                ApiRequestCleanupStateV1::AdmissionPendingLegacy
+                    | ApiRequestCleanupStateV1::AdmissionPendingV3
+            )
+        {
+            return Err(RemoteRequestFlightErrorV1::Admission(
+                "cleanup cell bind refused".into(),
+            ));
+        }
+        inner.identity = Some(identity.clone());
+        inner.state = if inner.v3 {
+            ApiRequestCleanupStateV1::ActiveV3
+        } else {
+            ApiRequestCleanupStateV1::ActiveLegacy
+        };
+        drop(inner);
+        self.notify();
+        Ok(())
+    }
+
+    fn mark_accepted(&self, identity: &ActiveRequestIdentity) {
+        if let Ok(mut inner) = self.inner.lock() {
+            if inner.identity.as_ref() == Some(identity) {
+                inner.accepted = true;
+            }
+        }
+    }
+
+    fn finish_pending(&self, result: ResourceActionDispositionV1, acknowledged: bool) {
+        if let Ok(mut inner) = self.inner.lock() {
+            if matches!(
+                inner.state,
+                ApiRequestCleanupStateV1::AdmissionPendingLegacy
+                    | ApiRequestCleanupStateV1::AdmissionPendingV3
+                    | ApiRequestCleanupStateV1::DropOwned
+            ) {
+                inner.state = ApiRequestCleanupStateV1::Terminal;
+                inner.terminal = Some((result, acknowledged));
+                drop(inner);
+                self.notify();
+            }
+        }
+    }
+
+    fn finish(
+        &self,
+        identity: &ActiveRequestIdentity,
+        result: ResourceActionDispositionV1,
+        acknowledged: bool,
+    ) -> bool {
+        let Ok(mut inner) = self.inner.lock() else {
+            return false;
+        };
+        if inner.identity.as_ref() != Some(identity) {
+            return false;
+        }
+        inner.state = ApiRequestCleanupStateV1::Terminal;
+        inner.terminal = Some((result, acknowledged));
+        drop(inner);
+        self.notify();
+        true
+    }
+
+    fn refuse(
+        &self,
+        identity: Option<&ActiveRequestIdentity>,
+        error: RemoteRequestFlightErrorV1,
+        lifecycle: Option<ApiLifecycle>,
+    ) {
+        if let Ok(mut inner) = self.inner.lock() {
+            if identity.is_some() && inner.identity.as_ref() != identity {
+                return;
+            }
+            let accepted = inner.accepted;
+            inner.state = ApiRequestCleanupStateV1::SettlementRefused;
+            inner.diagnostic = lifecycle.map(|lifecycle| (lifecycle, error, accepted));
+            drop(inner);
+            self.notify();
+        }
+    }
+
+    fn begin_cleanup(&self) {
+        if let Ok(mut inner) = self.inner.lock() {
+            if matches!(
+                inner.state,
+                ApiRequestCleanupStateV1::AdmissionPendingLegacy
+                    | ApiRequestCleanupStateV1::AdmissionPendingV3
+            ) && !inner.admission_started
+            {
+                inner.state = ApiRequestCleanupStateV1::Terminal;
+                inner.terminal = Some((ResourceActionDispositionV1::Complete, true));
+            } else if matches!(
+                inner.state,
+                ApiRequestCleanupStateV1::AdmissionPendingLegacy
+                    | ApiRequestCleanupStateV1::AdmissionPendingV3
+                    | ApiRequestCleanupStateV1::ActiveLegacy
+                    | ApiRequestCleanupStateV1::ActiveV3
+            ) {
+                inner.overlapped_cleanup = true;
+                inner.state = ApiRequestCleanupStateV1::DropOwned;
+            }
+            drop(inner);
+            self.notify();
+        }
+    }
+
+    fn settle_drop(
+        &self,
+        identity: &ActiveRequestIdentity,
+        mut flight: Option<DurableRemoteRequestFlightV3>,
+        disposition: ResourceActionDispositionV1,
+        lifecycle: Option<ApiLifecycle>,
+        accepted: bool,
+    ) {
+        let Ok(mut inner) = self.inner.lock() else {
+            return;
+        };
+        if inner.identity.as_ref() != Some(identity)
+            || matches!(
+                inner.state,
+                ApiRequestCleanupStateV1::Terminal
+                    | ApiRequestCleanupStateV1::SettlementRefused
+                    | ApiRequestCleanupStateV1::TimedOut
+            )
+        {
+            return;
+        }
+        inner.state = ApiRequestCleanupStateV1::DropOwned;
+        inner.accepted |= accepted;
+        inner.overlapped_cleanup = true;
+        drop(inner);
+        self.notify();
+        let mut settle = || match &mut flight {
+            Some(flight) => flight.settle(disposition.clone()),
+            None => Ok(ResourceActionResultV1 {
+                disposition: disposition.clone(),
+                duration_ms: 0,
+                recovery_owner: None,
+                cause: None,
+            }),
+        };
+        let result = settle().or_else(|error| {
+            if tokio::time::Instant::now() < self.deadline {
+                settle()
+            } else {
+                Err(error)
+            }
+        });
+        match result {
+            Ok(result) => {
+                self.finish(identity, result.disposition, true);
+            }
+            Err(error) => self.refuse(Some(identity), error, lifecycle),
+        }
+    }
+
+    fn projection(&self) -> Option<BackendCleanupDispositionV1> {
+        let inner = self.inner.lock().ok()?;
+        match inner.state {
+            ApiRequestCleanupStateV1::SettlementRefused | ApiRequestCleanupStateV1::TimedOut => {
+                Some(BackendCleanupDispositionV1::Unknown)
+            }
+            ApiRequestCleanupStateV1::Terminal => {
+                let (result, acknowledged) = inner.terminal.as_ref()?;
+                Some(
+                    if *result == ResourceActionDispositionV1::Complete
+                        && (!inner.v3 || *acknowledged)
+                        && (inner.v3 || !inner.overlapped_cleanup)
+                    {
+                        BackendCleanupDispositionV1::Complete
+                    } else {
+                        BackendCleanupDispositionV1::Unknown
+                    },
+                )
+            }
+            _ => None,
+        }
+    }
+
+    fn reclaimable(&self) -> bool {
+        self.projection() == Some(BackendCleanupDispositionV1::Complete)
+    }
+
+    async fn observe(&self) -> BackendCleanupDispositionV1 {
+        struct Waiter<'a>(&'a AtomicUsize);
+        impl Drop for Waiter<'_> {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, Ordering::AcqRel);
+            }
+        }
+        self.live_waiters.fetch_add(1, Ordering::AcqRel);
+        let _waiter = Waiter(&self.live_waiters);
+        let mut changed = self.changed.subscribe();
+        loop {
+            if let Some(result) = self.projection() {
+                let diagnostic = self
+                    .inner
+                    .lock()
+                    .ok()
+                    .and_then(|mut inner| inner.diagnostic.take());
+                if let Some((lifecycle, error, accepted)) = diagnostic {
+                    if tokio::time::Instant::now() < self.deadline {
+                        let _ = tokio::time::timeout_at(
+                            self.deadline,
+                            lifecycle.request_flight_failure(error, accepted),
+                        )
+                        .await;
+                    }
+                }
+                return result;
+            }
+            if tokio::time::timeout_at(self.deadline, changed.changed())
+                .await
+                .is_err()
+            {
+                if let Ok(mut inner) = self.inner.lock() {
+                    if !matches!(
+                        inner.state,
+                        ApiRequestCleanupStateV1::Terminal
+                            | ApiRequestCleanupStateV1::SettlementRefused
+                    ) {
+                        inner.state = ApiRequestCleanupStateV1::TimedOut;
+                    }
+                }
+                return BackendCleanupDispositionV1::Unknown;
+            }
+        }
+    }
+}
+
 struct ActiveRequestSlot {
     turn_epoch: u64,
     identity: ActiveRequestIdentity,
     cancel_control: watch::Sender<bool>,
-    settlement: Option<RemoteRequestSettlementV1>,
 }
 
 /// Per-session model plus two deliberately separate cancellation scopes.
@@ -269,6 +606,7 @@ struct SessionState {
     cancelled_turn_epoch: Option<u64>,
     next_legacy_request: u64,
     active_request: Option<ActiveRequestSlot>,
+    cleanup_cell: Option<Arc<ApiRequestCleanupCustodianV1>>,
     request_flight_owner_attached: bool,
 }
 
@@ -287,6 +625,7 @@ impl Default for SessionState {
             cancelled_turn_epoch: None,
             next_legacy_request: 0,
             active_request: None,
+            cleanup_cell: None,
             request_flight_owner_attached: false,
         }
     }
@@ -364,11 +703,28 @@ impl RequestCancelCapability {
 struct RequestScope {
     cancel: RequestCancelCapability,
     cancel_control: watch::Sender<bool>,
+    cleanup: Arc<ApiRequestCleanupCustodianV1>,
+    identity: ActiveRequestIdentity,
     flight: Option<DurableRemoteRequestFlightV3>,
+    lifecycle: Option<ApiLifecycle>,
+    accepted: bool,
     dispatched: bool,
+    settled: bool,
 }
 
 impl RequestScope {
+    fn attach_lifecycle(&mut self, lifecycle: ApiLifecycle, accepted: bool) {
+        self.lifecycle = Some(lifecycle);
+        if accepted {
+            self.mark_accepted();
+        }
+    }
+
+    fn mark_accepted(&mut self) {
+        self.accepted = true;
+        self.cleanup.mark_accepted(&self.identity);
+    }
+
     fn begin_dispatch(&mut self) -> Result<(), RemoteRequestFlightErrorV1> {
         if let Some(flight) = &mut self.flight {
             flight.begin_dispatch()?;
@@ -391,24 +747,43 @@ impl RequestScope {
             },
         };
         self.flight = None;
+        if !self
+            .cleanup
+            .finish(&self.identity, result.disposition.clone(), true)
+        {
+            return Err(RemoteRequestFlightErrorV1::Admission(
+                "cleanup cell rejected exact terminal publication".into(),
+            ));
+        }
         self.cancel.clear_exact();
+        self.settled = true;
         Ok(result)
     }
 }
 
 impl Drop for RequestScope {
     fn drop(&mut self) {
-        if let Some(flight) = &mut self.flight {
-            let disposition = if !self.dispatched {
-                ResourceActionDispositionV1::Failed
-            } else if *self.cancel_control.borrow() {
-                ResourceActionDispositionV1::Partial
-            } else {
-                ResourceActionDispositionV1::Unknown
-            };
-            let _ = flight.settle(disposition);
+        if self.settled {
+            return;
         }
+        let disposition = if !self.dispatched {
+            ResourceActionDispositionV1::Failed
+        } else if *self.cancel_control.borrow() {
+            ResourceActionDispositionV1::Partial
+        } else {
+            ResourceActionDispositionV1::Unknown
+        };
+        // Transfer every piece of local cleanup authority before attempting a
+        // fallible settlement. The custodian, not this scope, owns the result.
+        self.cleanup.settle_drop(
+            &self.identity,
+            self.flight.take(),
+            disposition,
+            self.lifecycle.take(),
+            self.accepted,
+        );
         self.cancel.clear_exact();
+        self.settled = true;
     }
 }
 
@@ -493,7 +868,7 @@ impl RequestAdmission {
         // gap. No request identity or flight is minted in that case. Admission
         // is checked again after durable work and before publication to close
         // the race in the opposite direction.
-        {
+        let cleanup = {
             let sessions = self.sessions.lock().map_err(|_| {
                 RemoteRequestFlightErrorV1::Admission("session state poisoned".into())
             })?;
@@ -510,20 +885,40 @@ impl RequestAdmission {
                     "another request is active".into(),
                 ));
             }
-        }
-
-        let mut flight = match &self.route {
-            Some(route) => {
-                let request_id = self
-                    .request_ids
-                    .mint()
-                    .map_err(|_| RemoteRequestFlightErrorV1::IdentityUnavailable)?;
-                let owner = ResourceFlightOwnerV1::new(route.node_id.clone(), session.as_str())
-                    .map_err(|error| RemoteRequestFlightErrorV1::Admission(error.to_string()))?;
-                Some(route.attempt.bind_remote_request(request_id, owner)?)
-            }
-            None => None,
+            let cleanup = state
+                .cleanup_cell
+                .as_ref()
+                .filter(|cell| cell.turn_authority == turn_epoch)
+                .cloned()
+                .ok_or_else(|| {
+                    RemoteRequestFlightErrorV1::Admission(
+                        "turn cleanup authority is unavailable".into(),
+                    )
+                })?;
+            cleanup.begin_admission()?;
+            cleanup
         };
+
+        let mut flight: Option<DurableRemoteRequestFlightV3> = (|| {
+            Ok::<_, RemoteRequestFlightErrorV1>(match &self.route {
+                Some(route) => {
+                    let request_id = self
+                        .request_ids
+                        .mint()
+                        .map_err(|_| RemoteRequestFlightErrorV1::IdentityUnavailable)?;
+                    let owner = ResourceFlightOwnerV1::new(route.node_id.clone(), session.as_str())
+                        .map_err(|error| {
+                            RemoteRequestFlightErrorV1::Admission(error.to_string())
+                        })?;
+                    Some(route.attempt.bind_remote_request(request_id, owner)?)
+                }
+                None => None,
+            })
+        })()
+        .map_err(|error| {
+            cleanup.refuse(None, error.clone(), None);
+            error
+        })?;
 
         let active_conflict = {
             let mut sessions = self.sessions.lock().map_err(|_| {
@@ -553,28 +948,30 @@ impl RequestAdmission {
                             ActiveRequestIdentity::Legacy(state.next_legacy_request)
                         }
                     };
+                    cleanup.bind(&identity)?;
                     let (cancel_control, cancel_rx) = watch::channel(false);
-                    let settlement = flight
-                        .as_ref()
-                        .map(DurableRemoteRequestFlightV3::settlement_handle);
                     state.active_request = Some(ActiveRequestSlot {
                         turn_epoch,
                         identity: identity.clone(),
                         cancel_control: cancel_control.clone(),
-                        settlement,
                     });
                     let cancel = RequestCancelCapability {
                         sessions: Arc::clone(&self.sessions),
                         session: session.clone(),
                         turn_epoch,
-                        identity,
+                        identity: identity.clone(),
                     };
                     return Ok(PreparedRequest::Ready {
                         scope: RequestScope {
                             cancel,
                             cancel_control,
+                            cleanup: Arc::clone(&cleanup),
+                            identity,
                             flight,
+                            lifecycle: None,
+                            accepted: false,
                             dispatched: false,
+                            settled: false,
                         },
                         cancel_rx,
                     });
@@ -585,8 +982,18 @@ impl RequestAdmission {
         // Publication lost its race with cancellation, forget, or another
         // request. Settle outside the session lock so node aggregation may
         // re-enter unrelated bridge state without deadlocking this session.
-        if let Some(flight) = &mut flight {
-            flight.settle(ResourceActionDispositionV1::Failed)?;
+        let result = match &mut flight {
+            Some(flight) => flight.settle(ResourceActionDispositionV1::Failed),
+            None => Ok(ResourceActionResultV1 {
+                disposition: ResourceActionDispositionV1::Complete,
+                duration_ms: 0,
+                recovery_owner: None,
+                cause: None,
+            }),
+        };
+        match result {
+            Ok(result) => cleanup.finish_pending(result.disposition, true),
+            Err(error) => cleanup.refuse(None, error, None),
         }
         if active_conflict {
             Err(RemoteRequestFlightErrorV1::Admission(
@@ -603,6 +1010,7 @@ pub struct ApiBackend {
     client: reqwest::Client,
     policy: Arc<StdMutex<Arc<dyn PolicyEngine>>>,
     sessions: Arc<StdMutex<HashMap<SessionId, SessionState>>>,
+    cleanup_cells: Arc<StdMutex<HashMap<u64, Arc<ApiRequestCleanupCustodianV1>>>>,
     next_turn_authority: AtomicU64,
     request_ids: Arc<dyn RemoteRequestIdSource>,
 }
@@ -630,6 +1038,7 @@ impl ApiBackend {
             client,
             policy: Arc::new(StdMutex::new(Arc::new(AutoApprove) as Arc<dyn PolicyEngine>)),
             sessions: Arc::new(StdMutex::new(HashMap::new())),
+            cleanup_cells: Arc::new(StdMutex::new(HashMap::new())),
             next_turn_authority: AtomicU64::new(0),
             request_ids: Arc::new(SystemRemoteRequestIdSource),
         }
@@ -679,6 +1088,19 @@ impl ApiBackend {
         let epoch = prior
             .checked_add(1)
             .ok_or(BridgeError::InvalidStateTransition)?;
+        let cleanup_cell = ApiRequestCleanupCustodianV1::new(
+            epoch,
+            session.clone(),
+            self.cfg.resource_flight_route_v3.is_some(),
+            self.cfg.request_timeout,
+        );
+        let mut cleanup_cells = self
+            .cleanup_cells
+            .lock()
+            .map_err(|_| BridgeError::InvalidStateTransition)?;
+        cleanup_cells.retain(|_, cell| cell.session != *session || !cell.reclaimable());
+        cleanup_cells.insert(epoch, Arc::clone(&cleanup_cell));
+        state.cleanup_cell = Some(cleanup_cell);
         state.current_turn_epoch = Some(epoch);
         state.cancelled_turn_epoch = None;
         Ok(TurnScope {
@@ -728,36 +1150,59 @@ impl ApiBackend {
         &self,
         session: &SessionId,
     ) -> Result<BackendCleanupDispositionV1, BridgeError> {
-        let settlement = {
+        // Snapshot exact authorities while holding the session lock. A same-ID
+        // successor can begin immediately after removal, but is not in this
+        // cleanup's closed authority set and therefore cannot be touched by it.
+        let cells = {
             let mut sessions = self
                 .sessions
                 .lock()
                 .map_err(|_| BridgeError::InvalidStateTransition)?;
-            let settlement = sessions.get_mut(session).and_then(|state| {
+            let cleanup_cells = self
+                .cleanup_cells
+                .lock()
+                .map_err(|_| BridgeError::InvalidStateTransition)?;
+            if let Some(state) = sessions.get_mut(session) {
                 if let Some(epoch) = state.current_turn_epoch {
                     state.cancelled_turn_epoch = Some(epoch);
                 }
-                state.active_request.as_ref().and_then(|active| {
+                if let Some(active) = &state.active_request {
                     let _ = active.cancel_control.send(true);
-                    active.settlement.clone()
-                })
-            });
+                }
+            }
+            let cells = cleanup_cells
+                .values()
+                .filter(|cell| cell.session == *session)
+                .cloned()
+                .collect::<Vec<_>>();
+            for cell in &cells {
+                cell.begin_cleanup();
+            }
             sessions.remove(session);
-            settlement
+            cells
         };
 
-        let Some(settlement) = settlement else {
-            return Ok(BackendCleanupDispositionV1::Complete);
-        };
-        let join = tokio::task::spawn_blocking(move || settlement.join_blocking());
-        match tokio::time::timeout(self.cfg.request_timeout, join).await {
-            Ok(Ok(Ok(result))) if result.disposition == ResourceActionDispositionV1::Complete => {
-                Ok(BackendCleanupDispositionV1::Complete)
-            }
-            Ok(Ok(Ok(_))) | Ok(Ok(Err(_))) | Ok(Err(_)) | Err(_) => {
-                Ok(BackendCleanupDispositionV1::Unknown)
+        let mut disposition = BackendCleanupDispositionV1::Complete;
+        for cell in &cells {
+            if cell.observe().await == BackendCleanupDispositionV1::Unknown {
+                disposition = BackendCleanupDispositionV1::Unknown;
             }
         }
+
+        let mut cleanup_cells = self
+            .cleanup_cells
+            .lock()
+            .map_err(|_| BridgeError::InvalidStateTransition)?;
+        for cell in cells.iter().filter(|cell| cell.reclaimable()) {
+            let authority = cell.turn_authority;
+            if cleanup_cells
+                .get(&authority)
+                .is_some_and(|registered| Arc::ptr_eq(registered, cell))
+            {
+                cleanup_cells.remove(&authority);
+            }
+        }
+        Ok(disposition)
     }
 }
 
@@ -838,7 +1283,7 @@ impl ApiBackend {
                         .await)?,
                 };
                 let PreparedRequest::Ready {
-                    scope,
+                    mut scope,
                     mut cancel_rx,
                 } = prepared else {
                     if !acceptance_barrier_crossed {
@@ -856,6 +1301,7 @@ impl ApiBackend {
                     };
                     return;
                 };
+                scope.attach_lifecycle(lifecycle.clone(), acceptance_barrier_crossed);
                 let mut scope = Some(scope);
                 // Durable reservation, owner attachment, identity evidence,
                 // intent, and dispatch all precede installation of the POST future.
@@ -877,9 +1323,11 @@ impl ApiBackend {
                 let mut builder = client.post(&url).json(&req);
                 if let Some(k) = &api_key { builder = builder.bearer_auth(k); }
                 let send = if acceptance_barrier_crossed {
+                    scope.as_mut().expect("request scope exists").mark_accepted();
                     builder.send()
                 } else {
                     acceptance_barrier_crossed = true;
+                    scope.as_mut().expect("request scope exists").mark_accepted();
                     install_first_send(&lifecycle, || builder.send()).await?
                 };
                 if *cancel_rx.borrow() {
@@ -1409,17 +1857,7 @@ impl AgentBackend for ApiBackend {
     }
 
     async fn forget_session(&self, session: &SessionId) {
-        if let Ok(mut map) = self.sessions.lock() {
-            if let Some(state) = map.get_mut(session) {
-                if let Some(epoch) = state.current_turn_epoch {
-                    state.cancelled_turn_epoch = Some(epoch);
-                }
-                if let Some(active) = &state.active_request {
-                    let _ = active.cancel_control.send(true);
-                }
-            }
-            map.remove(session);
-        }
+        let _ = self.cleanup_session_checked(session).await;
     }
 
     async fn forget_session_checked(
@@ -1429,9 +1867,29 @@ impl AgentBackend for ApiBackend {
         self.cleanup_session_checked(session).await
     }
 
+    async fn forget_session_observed(
+        &self,
+        session: &SessionId,
+        _observer: Arc<dyn DiagnosticObserver>,
+    ) -> Result<BackendCleanupDispositionV1, BridgeError> {
+        self.cleanup_session_checked(session).await
+    }
+
+    async fn release_session(&self, session: &SessionId) {
+        let _ = self.cleanup_session_checked(session).await;
+    }
+
     async fn release_session_checked(
         &self,
         session: &SessionId,
+    ) -> Result<BackendCleanupDispositionV1, BridgeError> {
+        self.cleanup_session_checked(session).await
+    }
+
+    async fn release_session_observed(
+        &self,
+        session: &SessionId,
+        _observer: Arc<dyn DiagnosticObserver>,
     ) -> Result<BackendCleanupDispositionV1, BridgeError> {
         self.cleanup_session_checked(session).await
     }
@@ -1630,6 +2088,15 @@ mod tests {
             let session = SessionId::parse("forget-recreate-aba").unwrap();
             let old_turn = backend.begin_turn(&session).unwrap();
             let old_epoch = old_turn.epoch;
+            let old_cleanup = backend
+                .sessions
+                .lock()
+                .unwrap()
+                .get(&session)
+                .unwrap()
+                .cleanup_cell
+                .clone()
+                .unwrap();
             let stale = RequestCancelCapability {
                 sessions: Arc::clone(&backend.sessions),
                 session: session.clone(),
@@ -1651,10 +2118,25 @@ mod tests {
                 turn_epoch: new_epoch,
                 identity: identity.clone(),
                 cancel_control: new_cancel,
-                settlement: None,
             });
 
+            let new_cleanup = backend
+                .sessions
+                .lock()
+                .unwrap()
+                .get(&session)
+                .unwrap()
+                .cleanup_cell
+                .clone()
+                .unwrap();
             assert_ne!(old_epoch, new_epoch, "turn authority must never be reused");
+            assert!(!Arc::ptr_eq(&old_cleanup, &new_cleanup));
+            assert!(!old_cleanup.finish(&identity, ResourceActionDispositionV1::Complete, true,));
+            old_cleanup.begin_cleanup();
+            assert_eq!(
+                new_cleanup.inner.lock().unwrap().state,
+                ApiRequestCleanupStateV1::AdmissionPendingLegacy
+            );
             assert!(
                 !stale.cancel_exact(),
                 "stale cancel must refuse successor B"
@@ -2071,7 +2553,7 @@ mod tests {
                 .forget_session_checked(&session)
                 .await
                 .unwrap(),
-            BackendCleanupDispositionV1::Complete
+            BackendCleanupDispositionV1::Unknown
         );
     }
 
@@ -2377,6 +2859,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn task_e_active_legacy_checked_cleanup_is_unknown() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(stop_sse())
+                    .set_delay(Duration::from_secs(5)),
+            )
+            .mount(&server)
+            .await;
+        let backend = Arc::new(ApiBackend::new(crate::config::ApiConfig::new(format!(
+            "{}/v1",
+            server.uri()
+        ))));
+        let session = SessionId::parse("task-e-active-legacy").unwrap();
+        let task = spawn_drain(Arc::clone(&backend), session.clone());
+        wait_for_active_request(&backend, &session, &ActiveRequestIdentity::Legacy(1)).await;
+
+        assert_eq!(
+            backend.forget_session_checked(&session).await.unwrap(),
+            BackendCleanupDispositionV1::Unknown
+        );
+        assert!(matches!(
+            task.await.unwrap().last(),
+            Some(Ok(Update::Done { stop_reason, .. })) if stop_reason == STOP_REASON_CANCELLED
+        ));
+    }
+
+    #[tokio::test]
     async fn checked_forget_and_release_join_the_exact_request_winner() {
         for (operation, id_digit) in [("forget", 'c'), ("release", 'd')] {
             let server = MockServer::start().await;
@@ -2545,6 +3058,15 @@ mod tests {
             Err(BridgeError::AgentFailure { diagnostic })
                 if diagnostic.prompt_may_have_been_accepted()
         )));
+        assert_eq!(
+            fixture
+                .backend
+                .release_session_checked(&session)
+                .await
+                .unwrap(),
+            BackendCleanupDispositionV1::Unknown,
+            "terminal-refusal debt must outlive the removed session slot"
+        );
     }
 
     #[tokio::test]
@@ -2677,5 +3199,180 @@ mod tests {
             .with_policy(Arc::new(DenyAll));
         fn assert_send_sync<T: Send + Sync>(_: &T) {}
         assert_send_sync(&be);
+    }
+
+    #[tokio::test]
+    async fn task_e_exact_projection_and_deadline_leave_no_waiter() {
+        let session = SessionId::parse("task-e-projection").unwrap();
+        for v3 in [false, true] {
+            let cell =
+                ApiRequestCleanupCustodianV1::new(1, session.clone(), v3, Duration::from_secs(1));
+            cell.begin_cleanup();
+            assert_eq!(cell.observe().await, BackendCleanupDispositionV1::Complete);
+        }
+
+        let pending = ApiRequestCleanupCustodianV1::new(2, session.clone(), true, Duration::ZERO);
+        pending.begin_admission().unwrap();
+        pending.begin_cleanup();
+        assert_eq!(
+            pending.observe().await,
+            BackendCleanupDispositionV1::Unknown
+        );
+        assert_eq!(pending.live_waiters.load(Ordering::Acquire), 0);
+        assert_eq!(
+            pending.inner.lock().unwrap().state,
+            ApiRequestCleanupStateV1::TimedOut
+        );
+
+        for (disposition, acknowledged, expected) in [
+            (
+                ResourceActionDispositionV1::Complete,
+                true,
+                BackendCleanupDispositionV1::Complete,
+            ),
+            (
+                ResourceActionDispositionV1::Complete,
+                false,
+                BackendCleanupDispositionV1::Unknown,
+            ),
+            (
+                ResourceActionDispositionV1::Partial,
+                true,
+                BackendCleanupDispositionV1::Unknown,
+            ),
+            (
+                ResourceActionDispositionV1::Failed,
+                true,
+                BackendCleanupDispositionV1::Unknown,
+            ),
+            (
+                ResourceActionDispositionV1::Unknown,
+                true,
+                BackendCleanupDispositionV1::Unknown,
+            ),
+        ] {
+            let cell =
+                ApiRequestCleanupCustodianV1::new(3, session.clone(), true, Duration::from_secs(1));
+            let identity = ActiveRequestIdentity::Dedicated(request_id('e'));
+            cell.begin_admission().unwrap();
+            cell.bind(&identity).unwrap();
+            assert!(cell.finish(&identity, disposition, acknowledged));
+            cell.begin_cleanup();
+            assert_eq!(cell.observe().await, expected);
+        }
+
+        let legacy = ApiRequestCleanupCustodianV1::new(4, session, false, Duration::from_secs(1));
+        let identity = ActiveRequestIdentity::Legacy(1);
+        legacy.begin_admission().unwrap();
+        legacy.bind(&identity).unwrap();
+        legacy.begin_cleanup();
+        assert!(legacy.finish(&identity, ResourceActionDispositionV1::Complete, true));
+        assert_eq!(legacy.observe().await, BackendCleanupDispositionV1::Unknown);
+    }
+
+    #[tokio::test]
+    async fn task_e_all_cleanup_surfaces_share_authority_and_completed_work_does_not_taint() {
+        let backend = ApiBackend::new(crate::config::ApiConfig::new("http://127.0.0.1:1"));
+        let session = SessionId::parse("task-e-surfaces").unwrap();
+        let observer: Arc<dyn DiagnosticObserver> =
+            Arc::new(bridge_core::diagnostics::NoopDiagnosticObserver::default());
+        assert_eq!(
+            backend.forget_session_checked(&session).await.unwrap(),
+            BackendCleanupDispositionV1::Complete
+        );
+        let first = backend.begin_turn(&session).unwrap();
+        assert_eq!(
+            backend
+                .forget_session_observed(&session, Arc::clone(&observer))
+                .await
+                .unwrap(),
+            BackendCleanupDispositionV1::Complete
+        );
+        let second = backend.begin_turn(&session).unwrap();
+        assert_ne!(first.epoch, second.epoch);
+        assert_eq!(
+            backend.release_session_checked(&session).await.unwrap(),
+            BackendCleanupDispositionV1::Complete
+        );
+        assert_eq!(
+            backend
+                .release_session_observed(&session, observer)
+                .await
+                .unwrap(),
+            BackendCleanupDispositionV1::Complete
+        );
+        backend.forget_session(&session).await;
+        backend.release_session(&session).await;
+    }
+
+    #[tokio::test]
+    async fn task_e_drop_refusal_retains_acceptance_aware_diagnostic() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(5)))
+            .mount(&server)
+            .await;
+        let fixture = protected_backend(
+            format!("{}/v1", server.uri()),
+            vec![request_id('8')],
+            64,
+            4,
+            None,
+        );
+        let session = SessionId::parse("task-e-drop-diagnostic").unwrap();
+        fixture
+            .backend
+            .attach_resource_flight_owner_v1(&session)
+            .unwrap();
+        let observer =
+            Arc::new(bridge_core::diagnostics::InMemoryDiagnosticObserver::new(16).unwrap());
+        let mut stream = fixture
+            .backend
+            .prompt_with_observers(
+                &session,
+                vec![Part { text: "hi".into() }],
+                BackendObservers::diagnostic_only(observer.clone()),
+            )
+            .await
+            .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), stream.next())
+                .await
+                .is_err()
+        );
+        std::fs::rename(
+            &fixture.journal_root,
+            fixture._root.path().join("journal-refusing-drop"),
+        )
+        .unwrap();
+        drop(stream);
+        assert_eq!(
+            fixture
+                .backend
+                .forget_session_checked(&session)
+                .await
+                .unwrap(),
+            BackendCleanupDispositionV1::Unknown
+        );
+        assert!(observer.snapshot().await.iter().any(|event| event
+            .failure()
+            .is_some_and(|failure| failure.prompt_may_have_been_accepted())));
+    }
+
+    #[test]
+    fn task_e_cleanup_cell_has_the_exact_closed_state_set() {
+        use ApiRequestCleanupStateV1::*;
+        let states = [
+            AdmissionPendingLegacy,
+            AdmissionPendingV3,
+            ActiveLegacy,
+            ActiveV3,
+            DropOwned,
+            Terminal,
+            SettlementRefused,
+            TimedOut,
+        ];
+        assert_eq!(states.len(), 8);
     }
 }
