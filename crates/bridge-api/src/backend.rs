@@ -851,13 +851,12 @@ impl RequestScope {
     fn attach_lifecycle(&mut self, lifecycle: ApiLifecycle, accepted: bool) {
         self.lifecycle = Some(lifecycle);
         if accepted {
-            self.mark_accepted();
+            // The turn-wide acceptance barrier is diagnostic custody on the
+            // cleanup cell only. The request-local bit is set solely by the
+            // first-poll acceptance marker: a successor round's request must
+            // never inherit acceptance before its own send is polled.
+            self.cleanup.mark_accepted(&self.identity);
         }
-    }
-
-    fn mark_accepted(&mut self) {
-        self.accepted.store(true, Ordering::Release);
-        self.cleanup.mark_accepted(&self.identity);
     }
 
     fn acceptance_marker(
@@ -2660,6 +2659,157 @@ mod tests {
     #[tokio::test]
     async fn task_f_drop_after_dispatch_before_first_send_poll_is_failed_unaccepted() {
         task_f_exit_after_dispatch_before_first_send_poll(false).await;
+    }
+
+    async fn task_f_successor_round_exit_before_first_send_poll(cancelled: bool) {
+        let server = MockServer::start().await;
+        let fixture = protected_backend(format!("{}/v1", server.uri()), vec![], 64, 4, None);
+        let session = SessionId::parse(if cancelled {
+            "task-f-successor-cancel"
+        } else {
+            "task-f-successor-drop"
+        })
+        .unwrap();
+        fixture
+            .backend
+            .attach_resource_flight_owner_v1(&session)
+            .unwrap();
+        let turn = fixture.backend.begin_turn(&session).unwrap();
+        let PreparedRequest::Ready {
+            mut scope,
+            cancel_rx,
+        } = fixture
+            .backend
+            .request_admission()
+            .prepare(&session, turn.epoch)
+            .unwrap()
+        else {
+            panic!("Task F successor request must be admitted");
+        };
+        // A successor tool-call round attaches its lifecycle with the
+        // turn-wide acceptance barrier already crossed — the exact
+        // production round-loop call shape.
+        let observer: Arc<dyn DiagnosticObserver> =
+            Arc::new(bridge_core::diagnostics::NoopDiagnosticObserver::default());
+        scope.attach_lifecycle(ApiLifecycle::new(observer, None), true);
+        scope.begin_dispatch().unwrap();
+
+        let turn_accepted = Arc::new(AtomicBool::new(true));
+        let accepted = scope.acceptance_marker(Arc::clone(&turn_accepted));
+        let send = drive_provider_send(
+            scope.flight.as_ref(),
+            fixture
+                .backend
+                .client
+                .post(format!("{}/v1/chat/completions", server.uri()))
+                .send(),
+            accepted,
+        );
+        if cancelled {
+            fixture.backend.cancel(&session).await.unwrap();
+            assert!(*cancel_rx.borrow(), "the exact request must observe cancel");
+        }
+
+        drop(send);
+        assert!(
+            !scope.accepted.load(Ordering::Acquire),
+            "the successor request bit must stay request-local until its own first poll"
+        );
+        let cell = Arc::clone(&scope.cleanup);
+        drop(scope);
+        drop(turn);
+
+        assert!(server.received_requests().await.unwrap().is_empty());
+        let publications = fixture.publisher.0.lock().unwrap();
+        assert_eq!(publications.len(), 1);
+        assert_eq!(
+            publications[0].result().disposition,
+            ResourceActionDispositionV1::Failed,
+            "an unpolled successor exit must persist Failed, never Partial/Unknown"
+        );
+        assert!(!publications[0].prompt_may_have_been_accepted());
+        // The sticky turn acceptance is preserved as cleanup diagnostic
+        // custody even though the request row stayed unaccepted.
+        assert!(cell.inner.lock().unwrap().accepted);
+    }
+
+    #[tokio::test]
+    async fn task_f_successor_cancel_before_first_send_poll_is_failed_unaccepted() {
+        task_f_successor_round_exit_before_first_send_poll(true).await;
+    }
+
+    #[tokio::test]
+    async fn task_f_successor_drop_before_first_send_poll_is_failed_unaccepted() {
+        task_f_successor_round_exit_before_first_send_poll(false).await;
+    }
+
+    #[tokio::test]
+    async fn task_f_second_round_cancel_after_send_observed_stays_partial_accepted() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(tool_call_sse()),
+            )
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(stop_sse())
+                    .set_delay(Duration::from_secs(5)),
+            )
+            .mount(&server)
+            .await;
+        let fixture = protected_backend(
+            format!("{}/v1", server.uri()),
+            vec![request_id('a'), request_id('b')],
+            64,
+            4,
+            None,
+        );
+        let session = SessionId::parse("task-f-round-two-accepted-cancel").unwrap();
+        fixture
+            .backend
+            .attach_resource_flight_owner_v1(&session)
+            .unwrap();
+        let task = spawn_drain(Arc::clone(&fixture.backend), session.clone());
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if server.received_requests().await.unwrap().len() >= 2 {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("round two must reach the provider");
+        fixture.backend.cancel(&session).await.unwrap();
+
+        let updates = task.await.unwrap();
+        assert!(matches!(
+            updates.last(),
+            Some(Ok(Update::Done { stop_reason, .. })) if stop_reason == STOP_REASON_CANCELLED
+        ));
+        let publications = fixture.publisher.0.lock().unwrap();
+        assert_eq!(publications.len(), 2);
+        assert_eq!(
+            publications[0].result().disposition,
+            ResourceActionDispositionV1::Complete
+        );
+        assert!(publications[0].prompt_may_have_been_accepted());
+        assert_eq!(
+            publications[1].result().disposition,
+            ResourceActionDispositionV1::Partial,
+            "an accepted in-flight cancellation must stay Partial"
+        );
+        assert!(publications[1].prompt_may_have_been_accepted());
     }
 
     fn cleanup_request_flight(
