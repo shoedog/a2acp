@@ -1059,3 +1059,50 @@ Only `crates/bridge-api/src/backend.rs` and this handoff changed. Tasks F-G,
 API production V3 routing, bridge core, workflows, worktrees, and `bin/`
 remain unarmed and unchanged. Production still assigns
 `resource_flight_route_v3 = None`.
+
+### Operator completion: deadline-crossing settlement (2026-08-15)
+
+The repair's closure review confirmed one remaining blocker on frozen input
+`6b9788a6`: `settle_drop` keyed its post-settlement branch on a
+pre-settlement `timed_out` snapshot, so a settlement that began before the
+cleanup deadline and completed after it could route around the absorbing
+`TimedOut` — a successful V3 settlement overwrote `TimedOut` with `Terminal`
+and projected `Complete` (reclaimable), and a crossing refusal overwrote the
+state while the dropped flight's destructor performed the prohibited ignored
+after-deadline retry.
+
+This disclosed operator completion, inside the declared round:
+
+- keys the post-settlement branch on the CURRENT cell state under a single
+  lock acquisition; `TimedOut` is now absorbing — a crossing success records
+  `terminal` evidence without changing state (projection stays `Unknown`,
+  never reclaimable), and a crossing refusal stores the acceptance-aware
+  diagnostic and retains the flight in `retained_late_flight` so settlement
+  is attempted exactly once;
+- adds a `#[cfg(test)]`-only ordering gate between the snapshot and the
+  durable settlement so both crossing schedules are deterministic (compiled
+  out of production; the same discipline as the fs_custody ordering tokens).
+
+Red-first evidence (both failed behaviorally on `6b9788a6` with the gate and
+tests staged, log `e2-red.log`):
+
+- `cargo test -p bridge-api --lib -- task_e_settlement_crossing_expiry_cannot_upgrade_timed_out`
+  failed at the `TimedOut` assertion: the ordinary branch had overwritten the
+  state to `Terminal` and the projection upgraded to `Complete`.
+- `cargo test -p bridge-api --lib -- task_e_settlement_refusal_crossing_expiry_retains_flight_custody`
+  failed at the `TimedOut` assertion: `refuse()` had overwritten the state
+  and `retained_late_flight` stayed empty (the destructor retry ran).
+
+Post-change: both tests green; `cargo test -p bridge-api` fully green across
+all harnesses (56 lib tests among them); `cargo test -p bridge-core --lib --
+remote_request_flight` unchanged at 45 passed; fresh workspace
+all-target/all-feature locked Clippy with `-D warnings`, `cargo fmt --all --
+--check`, and `git diff --check` all exit 0.
+
+Post-format delta vs `6b9788a6`: production +35/-13 (48 changed lines, of
+which +15 are `#[cfg(test)]`-gated and absent from production builds),
+colocated tests +153/-0, this handoff section +54/-0. Only
+`crates/bridge-api/src/backend.rs` and this handoff changed. Tasks F-G, API
+production V3 routing, bridge core, workflows, worktrees, and `bin/` remain
+unarmed and unchanged. Production still assigns
+`resource_flight_route_v3 = None`.
