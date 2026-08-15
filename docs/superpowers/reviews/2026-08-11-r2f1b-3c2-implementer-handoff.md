@@ -627,3 +627,20 @@ A reduced capacity of 5 was used: eight sequential admit/acknowledge/retire cycl
 - Versus `d8ec93ad`, the module is 673 production plus 710 test-only additions, the existing `lib.rs` export is 2 production additions, and the handoff is 85 documentation additions; there are no deletions on that comparison.
 
 The attempt-bound authority identity remains Task C scope. Tasks C-G, production V3, every caller/route, providers, smoke, compatibility, deployment, fold, push, and the running operator remain unarmed and unchanged.
+
+## Task B2 targeted repair
+
+Date: 2026-08-15. Exact frozen input: `6115c93e78dd1bd35b0fcd56139e52f23d1dc5df`.
+### Admissible red evidence
+
+Exact pre-production command: `CARGO_INCREMENTAL=0 cargo test -p bridge-core --lib --locked --offline -- remote_request_flight --nocapture`; Cargo reached `bridge-core`, selected 19 tests, and exited 101 with 16 passed / 3 failed / 612 filtered, so this was neither dependency/network refusal nor zero selection.
+The issued-active regression failed because reopen wrote `PreSendFailure`; the gap/multiple-ahead regression accepted and mutated the census; the foreign-attempt interrupted-retirement regression ran Task A recovery and changed root bytes before returning `ForeignAttempt`. Thus repairs 1 and 2 each had a behavioral frozen-input red.
+The exact owner selector command used the same prefix with `remote_request_flight_owner_validation_precedes_mint_and_census_is_nonmutating --nocapture`; separately disabling the `WIRE_CAP + 1` and control-character predicates produced 0 passed / 1 failed behavior reds, and each mutation was immediately restored.
+Checkpoint schema, digest, and attempt identity are now read and validated before recovery. No checkpoint remains the shipped typed `Malformed("checkpoint is absent")` refusal, now without admitting recovery or mutation.
+Reopen leaves every active ordinal below `next_ordinal` byte-identical, heals only the unique active child exactly at `next_ordinal`, and refuses duplicate, gapped, or multiple-ahead censuses before mutation; the step-5 orphan remains idempotently healed.
+Fault injection now supplies raw journal/filesystem/namespace results to the production mappers; the publish regression proves the owned publish ran, and the retirement regression proves the real identity-bound removal ran, before raw result mapping.
+Post-unlink and post-zero-link Task A crash states have the same durable absent-capture surface and both reopen as typed `Retained` without root mutation, authority, or panic. Permanent retention is unchanged per the owner-ledgered later-slice residue-disposition item in “Task A3 owner-authorized targeted repair” above.
+### Verification and accounting
+
+The required aggregate command passed 137 / 0 with 494 filtered; focused `remote_request_flight` is 19 / 0 with 612 filtered, and production `cargo check -p bridge-core --lib --locked --offline` passes. `git diff --check` and direct `rustfmt --check --edition 2021` pass; required `cargo fmt --all -- --check` was run but this Cargo has no `fmt` subcommand, and no `rustfmt::skip` was added.
+Versus `6115c93e`: production +68/-31 (99 churn), colocated tests +259/-22 (281), and this handoff +17 = 397 total. Versus `6033fd34`: production +269/-33 (302), tests +563/-21 (584), and handoff +45 = 931 total. Tasks C-G, production V3, callers/routes, providers, smoke, compatibility, deployment, fold, push, and the running operator remain unarmed.
