@@ -491,3 +491,28 @@ Retire persists no digest because its held-descriptor zero-link proof establishe
 Changed paths: `namespace_transaction.rs`, narrow `fs_custody.rs`, and this handoff. Normal-format source delta: +116 net production (193 insertions/77 deletions) and +105 net focused tests (140/35); this 17-line handoff replaces the prior 42-line section.
 Focused aggregate: 93/0; `namespace_transaction` 9/0, `custody_v2` 18/0, `journal_route_custody_v2` 7/0, `fs_custody` 84/0. `git diff --check` and direct `rustfmt --check --edition 2021` are green; required `cargo fmt --all -- --check` cannot start because this Cargo has no `fmt` subcommand.
 A4, Task B, production V3, every production caller, live providers, smoke, compatibility, deployment, fold, push, and the running operator remain unarmed and unchanged.
+
+## Task A4 owned journal surface and candidate deletion
+
+Date: 2026-08-15. Frozen input: `6114596d58cce4ae3577afc6c015a212eb50c3c1`.
+
+### Admissible red evidence
+
+- `CARGO_INCREMENTAL=0 cargo test -p bridge-core --lib -- journal_owned_surface_v2_stage_publish_append_read_enumerate_and_sync --nocapture` reached `bridge-core` and failed with ten A4-specific compile errors naming the absent mutation outcome and `stage`, `publish`, `append`, `read`, `enumerate`, and `sync` methods; it was neither dependency refusal nor zero selection.
+- `CARGO_INCREMENTAL=0 cargo test -p bridge-core --lib -- namespace_transaction_recovery_rechecks_target_before_finish --nocapture` selected one test and failed because recovery returned `Complete` after the target was mutated between its first verification and `finish`, rather than retaining the predecessor capture. Temporarily degrading that `finish` expectation to `None` reproduced the same red; the mutation was immediately reversed.
+
+### Result, deletion inventory, and gates
+
+`JournalRootOperationV2` now owns staged writes, no-replace publication, verified-position append, bounded read/enumeration, and root sync. Write sessions retain the operation borrow and descriptor through file/root sync; partial or failed append settlement must prove rollback or leaves a synced reserved marker plus retained debt. `NamespaceTransactionV2` remains the owned replace/retire/recover surface. Every mutator blocks on retained residue until recovery is clean, and only recovery may inspect and reduce debt.
+
+Recovery now re-proves the committed replacement in `finish` after the fail-first target-mutation transition; the regression requires `Retained` and preserves the predecessor capture. Publication has an exact pre-rename route barrier and the target-appearance proof is protective, never success-flattened.
+
+Deleted `JournalRootCustodyV1` and its raw writable open, revalidate authority, replacing-target seam, name-based unlink, free-standing child lock, non-Unix stub, candidate-only helper/tests, and now-unused identity/unlink helpers. Repository search reports zero remaining references to `JournalRootCustodyV1`, `acquire_persistent_child_lock`, `verify_regular_file_identity`, and `unlink_regular_child_at`. The externally used `PinnedDirectoryV1` replacement API and global liveness lock type remain unchanged and outside Task A.
+
+Changed paths are `crates/bridge-core/src/fs_custody.rs`, `crates/bridge-core/src/namespace_transaction.rs`, and this handoff; `lib.rs` needed no broader export. Post-format accounting is production +280/-219 (net +61), focused tests +174/-312 (net -138), and handoff +25/-0: aggregate +479/-531 (net -52), within the 650-line insertion cap. Candidate deletion is the negative side, not retained dead surface.
+
+- Required focused aggregate: 93 passed, 0 failed.
+- `CARGO_INCREMENTAL=0 cargo check --workspace --all-features --locked`: exit 0. The broader all-target check reached changed `bridge-core`, then failed in unchanged `bridge-api` integration-test crate resolution (`E0463` for `bridge_api`/`wiremock`).
+- Direct `rustfmt --check --edition 2021` on both changed Rust files and `git diff --check`: exit 0. Required `cargo fmt --all -- --check` cannot start because this Cargo installation has no `fmt` subcommand, the same frozen-environment limitation recorded by A3; no `rustfmt::skip` was introduced.
+
+Task B, production V3, shared journal/request consumers, API/HTTP, providers, smoke, compatibility, deployment, fold, push, and the running operator remain unarmed and unchanged.
