@@ -7,11 +7,11 @@ use crate::{
     },
     ids::{AttemptId, AttemptIdentity, ExecutionId},
     namespace_transaction::{NamespaceTransactionOutcomeV2, NamespaceTransactionV2},
-    resource_flight::DedicatedRemoteRequestIdV1,
+    resource_flight::{DedicatedRemoteRequestIdV1, ResourceActionDispositionV1},
     retained_resource_flight::ResourceFlightOwnerV1,
 };
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
-use std::collections::BTreeSet;
+use std::{collections::BTreeSet, ops::Deref};
 const SCHEMA: u8 = 1;
 const CAPACITY: usize = 4096;
 const ADMISSION_FOOTPRINT: usize = 3;
@@ -46,6 +46,10 @@ pub enum RemoteRequestFlightRefusalV1 {
     OrdinalOverflow,
     #[error("request identity unavailable: {0}")]
     IdentityUnavailable(String),
+    #[error("only a complete terminal outcome may be acknowledged")]
+    TerminalNotComplete,
+    #[error("request child state refuses transition: {0}")]
+    InvalidStateTransition(&'static str),
     #[error("Task A {0:?}: {1}")]
     TaskA(TaskAProtectiveOutcomeV1, String),
     #[error("request journal requires B2 recovery: {0}")]
@@ -63,16 +67,11 @@ struct AttemptIdentityWireV1 {
     parent_attempt_id: Option<AttemptId>,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-enum TerminalOutcomeV1 {
-    Complete,
-    PreSendFailure,
-}
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
 enum ChildStateV1 {
-    Active,
-    TerminalAcknowledged { outcome: TerminalOutcomeV1 },
+    Active {},
+    PreSendFailure {},
+    TerminalAcknowledged {},
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -96,10 +95,20 @@ struct RequestChildWireV1 {
     owner: ResourceFlightOwnerV1,
     status: ChildStateV1,
 }
+struct CensusChildV1 {
+    wire: RequestChildWireV1,
+    snapshot: FileContentSnapshotV2,
+}
+impl Deref for CensusChildV1 {
+    type Target = RequestChildWireV1;
+    fn deref(&self) -> &Self::Target {
+        &self.wire
+    }
+}
 struct CensusV1 {
     checkpoint: CheckpointWireV1,
     checkpoint_snapshot: FileContentSnapshotV2,
-    children: Vec<RequestChildWireV1>,
+    children: Vec<CensusChildV1>,
     staged: bool,
 }
 pub struct RemoteRequestAuthorityV1 {
@@ -187,6 +196,16 @@ fn transaction(outcome: NamespaceTransactionOutcomeV2) -> FlightResult<()> {
         N::Ready => Err(protective(P::Refused, "unexpected ready")),
     }
 }
+fn recovery(outcome: NamespaceTransactionOutcomeV2) -> FlightResult<()> {
+    use NamespaceTransactionOutcomeV2 as N;
+    use TaskAProtectiveOutcomeV1 as P;
+    match outcome {
+        N::Ready | N::Complete(_) | N::NoEffect(_, _) => Ok(()),
+        N::Retained(_, reason) => Err(protective(P::Retained, reason)),
+        N::ProtectiveDebt(reason) => Err(protective(P::ProtectiveDebt, reason)),
+        N::Unsupported(reason) => Err(protective(P::Unsupported, reason)),
+    }
+}
 fn encoded<T: Serialize>(value: &T) -> FlightResult<Vec<u8>> {
     let bytes = serde_json::to_vec(value)
         .map_err(|error| RemoteRequestFlightRefusalV1::Malformed(format!("{error:?}")))?;
@@ -211,6 +230,15 @@ fn canonical(id: &DedicatedRemoteRequestIdV1) -> bool {
     let value = id.as_str();
     value.len() == DedicatedRemoteRequestIdV1::ENCODED_LEN
         && value.starts_with(DedicatedRemoteRequestIdV1::PREFIX)
+}
+fn validate_owner(owner: &ResourceFlightOwnerV1) -> FlightResult<()> {
+    let node_valid = crate::ids::NodeId::parse(owner.node_id.as_str()).is_ok();
+    let key_valid = !owner.owner_key.is_empty()
+        && owner.owner_key.len() <= WIRE_CAP
+        && !owner.owner_key.chars().any(char::is_control);
+    (node_valid && key_valid)
+        .then_some(())
+        .ok_or_else(|| Refusal::Malformed("invalid request owner".into()))
 }
 impl RemoteRequestJournalV1 {
     pub fn initialize(
@@ -271,17 +299,53 @@ impl RemoteRequestJournalV1 {
             .custody
             .begin_operation("open request journal")
             .map_err(fs)?;
+        recovery(NamespaceTransactionV2::recover(
+            &operation,
+            "recover request transaction",
+        ))?;
         let census = journal.scan(&operation)?;
-        if census.staged
-            || census
-                .children
-                .iter()
-                .any(|child| matches!(child.status, ChildStateV1::Active))
-        {
+        if census.staged {
             return Err(RemoteRequestFlightRefusalV1::ReopenRequired(
-                "staged or unowned active child",
+                "ambiguous staged child",
             ));
         }
+        let active_next = census
+            .children
+            .iter()
+            .filter(|child| child.status == ChildStateV1::Active {})
+            .map(|child| child.ordinal.checked_add(1).ok_or(Refusal::OrdinalOverflow))
+            .collect::<FlightResult<Vec<_>>>()?
+            .into_iter()
+            .max();
+        if active_next.is_some_and(|next| next > census.checkpoint.next_ordinal) {
+            let next = active_next.expect("compared as some");
+            let value = checkpoint(&journal.attempt, next);
+            #[cfg(test)]
+            task_a_boundary(TaskABoundaryV1::Replace)?;
+            transaction(NamespaceTransactionV2::replace(
+                &operation,
+                Self::checkpoint_name(),
+                census.checkpoint_snapshot.object,
+                &encoded(&value)?,
+                "heal orphan checkpoint",
+            ))?;
+            sync(operation.sync("sync healed checkpoint"))?;
+        }
+        for child in &census.children {
+            match child.status {
+                ChildStateV1::Active {} => Self::replace_child(
+                    &operation,
+                    child,
+                    ChildStateV1::PreSendFailure {},
+                    "close orphan request",
+                )?,
+                ChildStateV1::TerminalAcknowledged {} => {
+                    Self::retire_child(&operation, child, "retire acknowledged request")?
+                }
+                ChildStateV1::PreSendFailure {} => {}
+            }
+        }
+        sync(operation.sync("sync reopened request root"))?;
         drop(operation);
         Ok(journal)
     }
@@ -292,6 +356,38 @@ impl RemoteRequestJournalV1 {
     }
     fn checkpoint_name() -> ChildNameV2 {
         ChildNameV2::from_bytes(CHECKPOINT_CHILD_V1.as_bytes()).expect("portable checkpoint name")
+    }
+    fn replace_child(
+        op: &JournalRootOperationV2<'_>,
+        child: &CensusChildV1,
+        status: ChildStateV1,
+        label: &str,
+    ) -> FlightResult<()> {
+        let mut successor = child.wire.clone();
+        successor.status = status;
+        #[cfg(test)]
+        task_a_boundary(TaskABoundaryV1::Replace)?;
+        transaction(NamespaceTransactionV2::replace(
+            op,
+            request_name(&child.authority_digest),
+            child.snapshot.object,
+            &encoded(&successor)?,
+            label,
+        ))
+    }
+    fn retire_child(
+        op: &JournalRootOperationV2<'_>,
+        child: &CensusChildV1,
+        label: &str,
+    ) -> FlightResult<()> {
+        #[cfg(test)]
+        task_a_boundary(TaskABoundaryV1::Retire)?;
+        transaction(NamespaceTransactionV2::retire(
+            op,
+            request_name(&child.authority_digest),
+            child.snapshot.object,
+            label,
+        ))
     }
     fn scan(&self, op: &JournalRootOperationV2<'_>) -> FlightResult<CensusV1> {
         let names = match op.enumerate(self.capacity + 1, "request census") {
@@ -346,13 +442,14 @@ impl RemoteRequestJournalV1 {
             } else {
                 return Err(RemoteRequestFlightRefusalV1::Malformed(value.into()));
             };
-            let (wire, _snapshot): (RequestChildWireV1, _) = read_wire(op, &read_name)?;
+            let (wire, snapshot): (RequestChildWireV1, _) = read_wire(op, &read_name)?;
             if wire.schema != SCHEMA {
                 return Err(RemoteRequestFlightRefusalV1::ForeignSchema("request child"));
             }
             if wire.attempt != self.attempt {
                 return Err(RemoteRequestFlightRefusalV1::ForeignAttempt);
             }
+            validate_owner(&wire.owner)?;
             if wire.checkpoint_digest != checkpoint_digest(&self.attempt, wire.ordinal)
                 || wire.authority_digest != authority_digest(&wire)
                 || final_name != request_name(&wire.authority_digest)
@@ -371,7 +468,7 @@ impl RemoteRequestJournalV1 {
                     return Err(RemoteRequestFlightRefusalV1::IdentityCollision);
                 }
             } else {
-                children.push(wire);
+                children.push(CensusChildV1 { wire, snapshot });
             }
         }
         let (checkpoint, checkpoint_snapshot): (CheckpointWireV1, _) =
@@ -426,6 +523,7 @@ impl RemoteRequestJournalV1 {
     where
         F: FnOnce() -> Result<DedicatedRemoteRequestIdV1, crate::error::BridgeError>,
     {
+        validate_owner(&owner)?;
         if self.requires_reopen {
             return Err(RemoteRequestFlightRefusalV1::ReopenRequired(
                 "prior admission was interrupted",
@@ -475,24 +573,32 @@ impl RemoteRequestJournalV1 {
                 authority_digest: Sha256HexV1::digest(b"pending"),
                 request_id,
                 owner,
-                status: ChildStateV1::Active,
+                status: ChildStateV1::Active {},
             };
             wire.authority_digest = authority_digest(&wire);
             let name = request_name(&wire.authority_digest);
             #[cfg(test)]
             boundary(_cut, 0, "temporary write")?;
+            #[cfg(test)]
+            task_a_boundary(TaskABoundaryV1::Stage)?;
             let staged = mutation(op.stage(&name, &encoded(&wire)?, "stage request child"))?;
             #[cfg(test)]
             boundary(_cut, 1, "temporary sync")?;
             #[cfg(test)]
             boundary(_cut, 2, "no-replace publication")?;
+            #[cfg(test)]
+            task_a_boundary(TaskABoundaryV1::Publish)?;
             let _snapshot = mutation(op.publish(&name, staged, "publish request child"))?;
             #[cfg(test)]
             boundary(_cut, 3, "request root sync")?;
+            #[cfg(test)]
+            task_a_boundary(TaskABoundaryV1::Sync)?;
             sync(op.sync("sync request root"))?;
             #[cfg(test)]
             boundary(_cut, 4, "checkpoint advance")?;
             let checkpoint = checkpoint(&self.attempt, next);
+            #[cfg(test)]
+            task_a_boundary(TaskABoundaryV1::Replace)?;
             transaction(NamespaceTransactionV2::replace(
                 &op,
                 Self::checkpoint_name(),
@@ -502,11 +608,104 @@ impl RemoteRequestJournalV1 {
             ))?;
             #[cfg(test)]
             boundary(_cut, 5, "checkpoint sync")?;
+            #[cfg(test)]
+            task_a_boundary(TaskABoundaryV1::Sync)?;
             sync(op.sync("sync advanced checkpoint"))?;
             Ok(RemoteRequestAuthorityV1 {
                 request_id: wire.request_id,
             })
         })();
+        if result.is_err() {
+            self.requires_reopen = true;
+        }
+        result
+    }
+    fn child_for<'a>(
+        census: &'a CensusV1,
+        authority: &RemoteRequestAuthorityV1,
+    ) -> FlightResult<&'a CensusChildV1> {
+        census
+            .children
+            .iter()
+            .find(|child| child.request_id == *authority.request_id())
+            .ok_or(Refusal::InvalidStateTransition(
+                "request authority is absent",
+            ))
+    }
+    pub fn acknowledge(
+        &mut self,
+        authority: &RemoteRequestAuthorityV1,
+        disposition: ResourceActionDispositionV1,
+    ) -> FlightResult<()> {
+        if disposition != ResourceActionDispositionV1::Complete {
+            return Err(Refusal::TerminalNotComplete);
+        }
+        if self.requires_reopen {
+            return Err(Refusal::ReopenRequired("prior transition was interrupted"));
+        }
+        let op = self
+            .custody
+            .begin_operation("acknowledge remote request")
+            .map_err(fs)?;
+        let census = self.scan(&op)?;
+        if census.staged {
+            return Err(Refusal::ReopenRequired("ambiguous staged child"));
+        }
+        let child = Self::child_for(&census, authority)?;
+        let result = match child.status {
+            ChildStateV1::Active {} => Self::replace_child(
+                &op,
+                child,
+                ChildStateV1::TerminalAcknowledged {},
+                "acknowledge terminal request",
+            ),
+            ChildStateV1::TerminalAcknowledged {} => Ok(()),
+            ChildStateV1::PreSendFailure {} => Err(Refusal::InvalidStateTransition(
+                "pre-send failure cannot be acknowledged",
+            )),
+        };
+        drop(op);
+        if result.is_err() {
+            self.requires_reopen = true;
+        }
+        result
+    }
+    pub fn retire(&mut self, authority: &RemoteRequestAuthorityV1) -> FlightResult<()> {
+        self.retire_inner(authority, None)
+    }
+    fn retire_inner(
+        &mut self,
+        authority: &RemoteRequestAuthorityV1,
+        _cut: Option<u8>,
+    ) -> FlightResult<()> {
+        if self.requires_reopen {
+            return Err(Refusal::ReopenRequired("prior transition was interrupted"));
+        }
+        let op = self
+            .custody
+            .begin_operation("retire remote request")
+            .map_err(fs)?;
+        let census = self.scan(&op)?;
+        let child = Self::child_for(&census, authority)?;
+        if child.status != (ChildStateV1::TerminalAcknowledged {}) {
+            return Err(Refusal::InvalidStateTransition(
+                "request is not acknowledged",
+            ));
+        }
+        let result = (|| {
+            #[cfg(test)]
+            boundary(_cut, 0, "before acknowledged unlink")?;
+            Self::retire_child(&op, child, "unlink acknowledged request")?;
+            #[cfg(test)]
+            boundary(_cut, 1, "after acknowledged unlink")?;
+            #[cfg(test)]
+            task_a_boundary(TaskABoundaryV1::Sync)?;
+            sync(op.sync("sync acknowledged retirement"))?;
+            #[cfg(test)]
+            boundary(_cut, 2, "after acknowledged root sync")?;
+            Ok(())
+        })();
+        drop(op);
         if result.is_err() {
             self.requires_reopen = true;
         }
@@ -532,6 +731,13 @@ impl RemoteRequestJournalV1 {
     {
         self.admit_inner(owner, mint, Some(boundary))
     }
+    fn retire_with_boundary(
+        &mut self,
+        authority: &RemoteRequestAuthorityV1,
+        boundary: u8,
+    ) -> FlightResult<()> {
+        self.retire_inner(authority, Some(boundary))
+    }
 }
 #[cfg(test)]
 #[derive(Clone, Copy)]
@@ -539,7 +745,7 @@ enum InjectedTaskAOutcomeV1 {
     Complete,
     Refused,
     Retained,
-    Unknown,
+    IoUnknown,
     Unsupported,
     ProtectiveDebt,
 }
@@ -548,7 +754,7 @@ impl InjectedTaskAOutcomeV1 {
     const PROTECTIVE: [Self; 5] = [
         Self::Refused,
         Self::Retained,
-        Self::Unknown,
+        Self::IoUnknown,
         Self::Unsupported,
         Self::ProtectiveDebt,
     ];
@@ -559,11 +765,43 @@ fn consume_injected_task_a_outcome(outcome: InjectedTaskAOutcomeV1) -> FlightRes
         InjectedTaskAOutcomeV1::Complete => return Ok(()),
         InjectedTaskAOutcomeV1::Refused => TaskAProtectiveOutcomeV1::Refused,
         InjectedTaskAOutcomeV1::Retained => TaskAProtectiveOutcomeV1::Retained,
-        InjectedTaskAOutcomeV1::Unknown => TaskAProtectiveOutcomeV1::Unknown,
+        InjectedTaskAOutcomeV1::IoUnknown => TaskAProtectiveOutcomeV1::Unknown,
         InjectedTaskAOutcomeV1::Unsupported => TaskAProtectiveOutcomeV1::Unsupported,
         InjectedTaskAOutcomeV1::ProtectiveDebt => TaskAProtectiveOutcomeV1::ProtectiveDebt,
     };
     Err(protective(kind, "injected"))
+}
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TaskABoundaryV1 {
+    Stage,
+    Publish,
+    Replace,
+    Retire,
+    Sync,
+}
+#[cfg(test)]
+thread_local! {
+    static INJECTED_TASK_A_BOUNDARY: std::cell::RefCell<
+        Option<(TaskABoundaryV1, InjectedTaskAOutcomeV1)>,
+    > = const { std::cell::RefCell::new(None) };
+}
+#[cfg(test)]
+fn inject_task_a_boundary_for_test(boundary: TaskABoundaryV1, outcome: InjectedTaskAOutcomeV1) {
+    INJECTED_TASK_A_BOUNDARY.with(|slot| {
+        assert!(slot.borrow_mut().replace((boundary, outcome)).is_none());
+    });
+}
+#[cfg(test)]
+fn task_a_boundary(boundary: TaskABoundaryV1) -> FlightResult<()> {
+    INJECTED_TASK_A_BOUNDARY.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        if slot.as_ref().is_some_and(|value| value.0 == boundary) {
+            consume_injected_task_a_outcome(slot.take().expect("matched boundary").1)
+        } else {
+            Ok(())
+        }
+    })
 }
 #[cfg(test)]
 mod tests {
@@ -675,6 +913,11 @@ mod tests {
             capacity,
             requires_reopen: false,
         }
+    }
+    fn child(case: &Case) -> (PathBuf, RequestChildWireV1) {
+        let path = request_paths(case).pop().unwrap();
+        let wire = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        (path, wire)
     }
     #[test]
     fn remote_request_flight_checkpoint_and_census_are_strict_and_nonmutating() {
@@ -859,13 +1102,10 @@ mod tests {
             drop(journal);
             let reopened =
                 RemoteRequestJournalV1::open_with_capacity(custody(&case), attempt(), 16);
-            if boundary == 0 {
-                assert!(reopened.is_ok());
+            if [1, 2].contains(&boundary) {
+                assert!(reopened.is_err());
             } else {
-                assert!(matches!(
-                    reopened,
-                    Err(RemoteRequestFlightRefusalV1::ReopenRequired(_))
-                ));
+                assert!(reopened.is_ok());
             }
         }
     }
@@ -875,5 +1115,269 @@ mod tests {
             assert!(consume_injected_task_a_outcome(outcome).is_err());
         }
         assert!(consume_injected_task_a_outcome(InjectedTaskAOutcomeV1::Complete).is_ok());
+    }
+
+    #[test]
+    fn remote_request_flight_owner_validation_precedes_mint_and_census_is_nonmutating() {
+        let invalid = [
+            ResourceFlightOwnerV1 {
+                node_id: serde_json::from_str(r#""node""#).unwrap(),
+                owner_key: String::new(),
+            },
+            ResourceFlightOwnerV1 {
+                node_id: serde_json::from_str(r#""node with space""#).unwrap(),
+                owner_key: "owner".into(),
+            },
+        ];
+        for owner in invalid {
+            let case = case();
+            let mut journal = initialized(&case, 16);
+            let before = root_bytes(&case);
+            let mut minted = 0;
+            assert!(matches!(
+                journal.admit_with(owner, || {
+                    minted += 1;
+                    Ok(request(0))
+                }),
+                Err(RemoteRequestFlightRefusalV1::Malformed(_))
+            ));
+            assert_eq!(minted, 0);
+            assert_eq!(root_bytes(&case), before);
+        }
+
+        let case = case();
+        let mut journal = initialized(&case, 16);
+        journal.admit_with(owner(0), || Ok(request(0))).unwrap();
+        drop(journal);
+        let (path, mut wire) = child(&case);
+        wire.owner.owner_key.clear();
+        fs::write(&path, serde_json::to_vec(&wire).unwrap()).unwrap();
+        let before = root_bytes(&case);
+        assert!(matches!(
+            RemoteRequestJournalV1::open_with_capacity(custody(&case), attempt(), 16),
+            Err(RemoteRequestFlightRefusalV1::Malformed(_))
+        ));
+        assert_eq!(root_bytes(&case), before);
+    }
+
+    #[test]
+    fn remote_request_flight_child_corruption_refuses_without_authority_or_checkpoint_advance() {
+        for corrupt in ["schema", "digest", "name"] {
+            let case = case();
+            let mut journal = initialized(&case, 16);
+            journal.admit_with(owner(0), || Ok(request(0))).unwrap();
+            drop(journal);
+            let checkpoint_before = fs::read(case.root.join(CHECKPOINT_CHILD_V1)).unwrap();
+            let (path, mut wire) = child(&case);
+            match corrupt {
+                "schema" => wire.schema = 99,
+                "digest" => wire.authority_digest = Sha256HexV1::digest(b"corrupt"),
+                _ => {
+                    let wrong = request_name(&Sha256HexV1::digest(b"wrong-name"));
+                    fs::rename(&path, case.root.join(wrong.as_os_str())).unwrap();
+                }
+            }
+            if corrupt != "name" {
+                fs::write(&path, serde_json::to_vec(&wire).unwrap()).unwrap();
+            }
+            let before = root_bytes(&case);
+            let mut minted = 0;
+            assert!(unchecked(&case, 16)
+                .admit_with(owner(1), || {
+                    minted += 1;
+                    Ok(request(1))
+                })
+                .is_err());
+            assert_eq!(minted, 0);
+            assert_eq!(
+                fs::read(case.root.join(CHECKPOINT_CHILD_V1)).unwrap(),
+                checkpoint_before
+            );
+            assert_eq!(root_bytes(&case), before);
+        }
+    }
+
+    #[test]
+    fn remote_request_flight_terminal_state_unknown_fields_refuse_without_mutation() {
+        let case = case();
+        let mut journal = initialized(&case, 16);
+        journal.admit_with(owner(0), || Ok(request(0))).unwrap();
+        drop(journal);
+        let (path, wire) = child(&case);
+        let mut value = serde_json::to_value(wire).unwrap();
+        value["status"]["unexpected"] = serde_json::Value::Bool(true);
+        fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+        let before = root_bytes(&case);
+        let mut minted = 0;
+        assert!(unchecked(&case, 16)
+            .admit_with(owner(1), || {
+                minted += 1;
+                Ok(request(1))
+            })
+            .is_err());
+        assert_eq!(minted, 0);
+        assert_eq!(root_bytes(&case), before);
+    }
+
+    #[test]
+    fn remote_request_flight_reopen_closes_step_five_orphan_idempotently() {
+        for boundary in [4, 5] {
+            let case = case();
+            let mut journal = initialized(&case, 16);
+            assert!(journal
+                .admit_with_boundary(owner(0), || Ok(request(0)), boundary)
+                .is_err());
+            drop(journal);
+
+            let reopened =
+                RemoteRequestJournalV1::open_with_capacity(custody(&case), attempt(), 16).unwrap();
+            let op = reopened
+                .custody
+                .begin_operation("inspect healed request")
+                .unwrap();
+            let census = reopened.scan(&op).unwrap();
+            assert_eq!(census.checkpoint.next_ordinal, 1);
+            assert_eq!(census.children.len(), 1);
+            assert_eq!(census.children[0].status, ChildStateV1::PreSendFailure {});
+            drop(op);
+            drop(reopened);
+            let healed = root_bytes(&case);
+
+            drop(
+                RemoteRequestJournalV1::open_with_capacity(custody(&case), attempt(), 16).unwrap(),
+            );
+            assert_eq!(root_bytes(&case), healed);
+        }
+    }
+
+    #[test]
+    fn remote_request_flight_acknowledges_only_complete_and_retirement_frees_capacity() {
+        use crate::resource_flight::ResourceActionDispositionV1 as D;
+
+        let case = case();
+        let mut journal = initialized(&case, 5);
+        for index in 0..8 {
+            let authority = journal
+                .admit_with(owner(index), || Ok(request(index)))
+                .unwrap();
+            for refused in [D::Partial, D::Failed, D::Unknown, D::NotNeeded] {
+                let before = root_bytes(&case);
+                assert!(matches!(
+                    journal.acknowledge(&authority, refused),
+                    Err(RemoteRequestFlightRefusalV1::TerminalNotComplete)
+                ));
+                assert_eq!(root_bytes(&case), before);
+            }
+            journal.acknowledge(&authority, D::Complete).unwrap();
+            assert_eq!(child(&case).1.status, ChildStateV1::TerminalAcknowledged {});
+            journal.retire(&authority).unwrap();
+            assert!(request_paths(&case).is_empty());
+            let op = journal
+                .custody
+                .begin_operation("inspect sequential checkpoint")
+                .unwrap();
+            assert_eq!(
+                journal.scan(&op).unwrap().checkpoint.next_ordinal,
+                index as u64 + 1
+            );
+        }
+    }
+
+    #[test]
+    fn remote_request_flight_ack_before_unlink_and_after_unlink_reopen_self_heal() {
+        use crate::resource_flight::ResourceActionDispositionV1 as D;
+
+        let before_unlink = case();
+        let mut journal = initialized(&before_unlink, 8);
+        let authority = journal.admit_with(owner(0), || Ok(request(0))).unwrap();
+        journal.acknowledge(&authority, D::Complete).unwrap();
+        drop(journal);
+        drop(
+            RemoteRequestJournalV1::open_with_capacity(custody(&before_unlink), attempt(), 8)
+                .unwrap(),
+        );
+        assert!(request_paths(&before_unlink).is_empty());
+
+        for boundary in [1, 2] {
+            let after_unlink = case();
+            let mut journal = initialized(&after_unlink, 8);
+            let authority = journal.admit_with(owner(0), || Ok(request(0))).unwrap();
+            journal.acknowledge(&authority, D::Complete).unwrap();
+            assert!(journal.retire_with_boundary(&authority, boundary).is_err());
+            drop(journal);
+            assert!(request_paths(&after_unlink).is_empty());
+            drop(
+                RemoteRequestJournalV1::open_with_capacity(custody(&after_unlink), attempt(), 8)
+                    .unwrap(),
+            );
+            assert!(request_paths(&after_unlink).is_empty());
+        }
+    }
+
+    #[test]
+    fn remote_request_flight_real_task_a_boundaries_keep_typed_outcomes() {
+        use crate::resource_flight::ResourceActionDispositionV1 as D;
+
+        let outcomes = [
+            (
+                InjectedTaskAOutcomeV1::Refused,
+                TaskAProtectiveOutcomeV1::Refused,
+            ),
+            (
+                InjectedTaskAOutcomeV1::Retained,
+                TaskAProtectiveOutcomeV1::Retained,
+            ),
+            (
+                InjectedTaskAOutcomeV1::IoUnknown,
+                TaskAProtectiveOutcomeV1::Unknown,
+            ),
+            (
+                InjectedTaskAOutcomeV1::Unsupported,
+                TaskAProtectiveOutcomeV1::Unsupported,
+            ),
+            (
+                InjectedTaskAOutcomeV1::ProtectiveDebt,
+                TaskAProtectiveOutcomeV1::ProtectiveDebt,
+            ),
+        ];
+        for (outcome, expected) in outcomes {
+            let stage_case = case();
+            let mut stage_journal = initialized(&stage_case, 16);
+            let before = root_bytes(&stage_case);
+            inject_task_a_boundary_for_test(TaskABoundaryV1::Stage, outcome);
+            assert!(matches!(
+                stage_journal.admit_with(owner(0), || Ok(request(0))),
+                Err(RemoteRequestFlightRefusalV1::TaskA(kind, _)) if kind == expected
+            ));
+            assert!(request_paths(&stage_case).is_empty());
+            assert_eq!(root_bytes(&stage_case), before);
+
+            let acknowledge_case = case();
+            let mut acknowledge_journal = initialized(&acknowledge_case, 16);
+            let authority = acknowledge_journal
+                .admit_with(owner(0), || Ok(request(0)))
+                .unwrap();
+            let before = root_bytes(&acknowledge_case);
+            inject_task_a_boundary_for_test(TaskABoundaryV1::Replace, outcome);
+            assert!(matches!(
+                acknowledge_journal.acknowledge(&authority, D::Complete),
+                Err(RemoteRequestFlightRefusalV1::TaskA(kind, _)) if kind == expected
+            ));
+            assert_eq!(root_bytes(&acknowledge_case), before);
+
+            let retire_case = case();
+            let mut retire_journal = initialized(&retire_case, 16);
+            let authority = retire_journal
+                .admit_with(owner(0), || Ok(request(0)))
+                .unwrap();
+            retire_journal.acknowledge(&authority, D::Complete).unwrap();
+            let before = root_bytes(&retire_case);
+            inject_task_a_boundary_for_test(TaskABoundaryV1::Retire, outcome);
+            assert!(matches!(
+                retire_journal.retire(&authority),
+                Err(RemoteRequestFlightRefusalV1::TaskA(kind, _)) if kind == expected
+            ));
+            assert_eq!(root_bytes(&retire_case), before);
+        }
     }
 }
