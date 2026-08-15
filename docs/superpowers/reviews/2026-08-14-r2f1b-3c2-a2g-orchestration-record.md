@@ -1024,6 +1024,29 @@ All checks passed; no drift found.
   protective aggregate fold, and an in-repository wire-compatibility
   enumeration (caps 120/300; brief mirrored as
   [`2026-08-15-r2f1b-3c2-task-g2-brief.md`](2026-08-15-r2f1b-3c2-task-g2-brief.md)).
+- 2026-08-15: G2 run: candidate `737239ae` (171 total, within caps;
+  in-container verify fully green; the typed mapping adjudicated
+  CORRECT — only exact `Complete` serializes `"completed"`, protective
+  values fold to `"unknown"` without relying on the run backstop, three
+  behaviorally fail-first protective reds; persistence/workflow-stats/
+  compatibility readers traced compatible). Advisory REJECT on exactly
+  ONE blocker (99/100), operator-source-verified: `fallback-plan`'s
+  `validate_cleanup` gates cancel/release/retire through one shared
+  closure accepting only the old four-value vocabulary, so a genuine
+  protective artifact (`"release":"unknown"`) becomes a command error
+  BEFORE eligibility classification instead of structured
+  `eligible:false` — the brief's stop-and-report reader-break
+  condition, surfaced via review instead. Candidate preserved at
+  `salvage/r2f1b-3c2-g2-candidate`.
+- Operator ruling: `fallback-plan` does NOT collapse a disposition (it
+  fail-closes), so the one-consumer-per-task clause requires no further
+  split; the reader's release-vocabulary update is the same wire
+  change's blast radius. The operator authorized the narrow ownership
+  expansion (`fallback_plan.rs`, release-field validation only — the
+  Task C narrow-accessor precedent) and dispatched the contracted
+  targeted repair on frozen `737239ae` with per-value CLI reds and
+  old-vocabulary/pre-spawn pins (caps 60/200; brief mirrored as
+  [`2026-08-15-r2f1b-3c2-repair-g2-brief.md`](2026-08-15-r2f1b-3c2-repair-g2-brief.md)).
 
 ## Non-scope reaffirmed
 
