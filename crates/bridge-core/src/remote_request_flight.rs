@@ -1454,6 +1454,12 @@ impl RemoteRequestDriverV1 {
         })
     }
 }
+impl std::fmt::Debug for RemoteRequestDriverV1 {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("RemoteRequestDriverV1")
+    }
+}
+
 impl OwnedRemoteRequestV1 {
     fn lock(&self) -> FlightResult<MutexGuard<'_, RemoteRequestJournalV1>> {
         self.journal

@@ -22,8 +22,8 @@ use bridge_core::ports::{
     AgentBackend, BackendCleanupDispositionV1, BackendObservers, BackendResourceFlightV1,
     BackendStream, DiagnosticObserver, PolicyEngine, RichEventSink, Update, STOP_REASON_CANCELLED,
 };
-use bridge_core::process::{DurableRemoteRequestFlightV3, RemoteRequestFlightErrorV1};
 use bridge_core::provider::ProviderEvidence;
+use bridge_core::remote_request_flight::{OwnedRemoteRequestV1, RemoteRequestFlightRefusalV1};
 use bridge_core::resource_flight::{
     DedicatedRemoteRequestIdV1, ResourceActionDispositionV1, ResourceActionResultV1,
 };
@@ -133,7 +133,7 @@ impl ApiLifecycle {
 
     async fn request_flight_failure_recorded(
         &self,
-        error: RemoteRequestFlightErrorV1,
+        error: ApiRequestFlightErrorV1,
         prompt_may_have_been_accepted: bool,
     ) -> (BridgeError, bool) {
         let (failed_phase, last_completed_phase) = if prompt_may_have_been_accepted {
@@ -160,7 +160,7 @@ impl ApiLifecycle {
 
     async fn request_flight_failure(
         &self,
-        error: RemoteRequestFlightErrorV1,
+        error: ApiRequestFlightErrorV1,
         prompt_may_have_been_accepted: bool,
     ) -> BridgeError {
         self.request_flight_failure_recorded(error, prompt_may_have_been_accepted)
@@ -244,14 +244,29 @@ async fn install_first_send<F>(
     Ok(send)
 }
 
-pub(crate) trait RemoteRequestIdSource: Send + Sync {
-    fn mint(&self) -> Result<DedicatedRemoteRequestIdV1, BridgeError>;
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ApiRequestFlightErrorV1 {
+    Admission(String),
+    Driver(RemoteRequestFlightRefusalV1),
 }
 
-struct SystemRemoteRequestIdSource;
-impl RemoteRequestIdSource for SystemRemoteRequestIdSource {
-    fn mint(&self) -> Result<DedicatedRemoteRequestIdV1, BridgeError> {
-        DedicatedRemoteRequestIdV1::mint()
+impl std::fmt::Display for ApiRequestFlightErrorV1 {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Admission(detail) => {
+                write!(
+                    formatter,
+                    "remote request flight admission refused: {detail}"
+                )
+            }
+            Self::Driver(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl From<RemoteRequestFlightRefusalV1> for ApiRequestFlightErrorV1 {
+    fn from(error: RemoteRequestFlightRefusalV1) -> Self {
+        Self::Driver(error)
     }
 }
 
@@ -281,8 +296,8 @@ struct ApiRequestCleanupInnerV1 {
     accepted: bool,
     overlapped_cleanup: bool,
     terminal: Option<(ResourceActionDispositionV1, bool)>,
-    diagnostic: Option<(ApiLifecycle, RemoteRequestFlightErrorV1, bool)>,
-    retained_late_flight: Option<DurableRemoteRequestFlightV3>,
+    diagnostic: Option<(ApiLifecycle, ApiRequestFlightErrorV1, bool)>,
+    retained_late_flight: Option<OwnedRemoteRequestV1>,
 }
 
 /// Turn-keyed custody retained independently of the removable session slot.
@@ -338,11 +353,11 @@ impl ApiRequestCleanupCustodianV1 {
             .send_modify(|revision| *revision = revision.wrapping_add(1));
     }
 
-    fn begin_admission(&self) -> Result<(), RemoteRequestFlightErrorV1> {
+    fn begin_admission(&self) -> Result<(), ApiRequestFlightErrorV1> {
         let mut inner = self
             .inner
             .lock()
-            .map_err(|_| RemoteRequestFlightErrorV1::Admission("cleanup cell poisoned".into()))?;
+            .map_err(|_| ApiRequestFlightErrorV1::Admission("cleanup cell poisoned".into()))?;
         if inner.state == ApiRequestCleanupStateV1::Terminal
             && inner
                 .terminal
@@ -365,7 +380,7 @@ impl ApiRequestCleanupCustodianV1 {
             ApiRequestCleanupStateV1::AdmissionPendingLegacy
                 | ApiRequestCleanupStateV1::AdmissionPendingV3
         ) {
-            return Err(RemoteRequestFlightErrorV1::Admission(
+            return Err(ApiRequestFlightErrorV1::Admission(
                 "cleanup cell is not admitting".into(),
             ));
         }
@@ -373,11 +388,11 @@ impl ApiRequestCleanupCustodianV1 {
         Ok(())
     }
 
-    fn bind(&self, identity: &ActiveRequestIdentity) -> Result<(), RemoteRequestFlightErrorV1> {
+    fn bind(&self, identity: &ActiveRequestIdentity) -> Result<(), ApiRequestFlightErrorV1> {
         let mut inner = self
             .inner
             .lock()
-            .map_err(|_| RemoteRequestFlightErrorV1::Admission("cleanup cell poisoned".into()))?;
+            .map_err(|_| ApiRequestFlightErrorV1::Admission("cleanup cell poisoned".into()))?;
         if !inner.admission_started
             || !matches!(
                 inner.state,
@@ -385,7 +400,7 @@ impl ApiRequestCleanupCustodianV1 {
                     | ApiRequestCleanupStateV1::AdmissionPendingV3
             )
         {
-            return Err(RemoteRequestFlightErrorV1::Admission(
+            return Err(ApiRequestFlightErrorV1::Admission(
                 "cleanup cell bind refused".into(),
             ));
         }
@@ -448,7 +463,7 @@ impl ApiRequestCleanupCustodianV1 {
     fn refuse(
         &self,
         identity: Option<&ActiveRequestIdentity>,
-        error: RemoteRequestFlightErrorV1,
+        error: ApiRequestFlightErrorV1,
         lifecycle: Option<ApiLifecycle>,
     ) {
         if let Ok(mut inner) = self.inner.lock() {
@@ -491,7 +506,7 @@ impl ApiRequestCleanupCustodianV1 {
     fn settle_drop(
         &self,
         identity: &ActiveRequestIdentity,
-        mut flight: Option<DurableRemoteRequestFlightV3>,
+        flight: Option<OwnedRemoteRequestV1>,
         disposition: ResourceActionDispositionV1,
         lifecycle: Option<ApiLifecycle>,
         accepted: bool,
@@ -524,14 +539,25 @@ impl ApiRequestCleanupCustodianV1 {
         {
             gate();
         }
-        let mut settle = || match &mut flight {
-            Some(flight) => flight.settle(disposition.clone()),
-            None => Ok(ResourceActionResultV1 {
-                disposition: disposition.clone(),
-                duration_ms: 0,
-                recovery_owner: None,
-                cause: None,
-            }),
+        let settle = || match &flight {
+            Some(flight) => flight
+                .settle(ResourceActionResultV1 {
+                    disposition: disposition.clone(),
+                    duration_ms: 0,
+                    recovery_owner: None,
+                    cause: None,
+                })
+                .map(|outcome| (outcome.result().clone(), true))
+                .map_err(ApiRequestFlightErrorV1::from),
+            None => Ok((
+                ResourceActionResultV1 {
+                    disposition: disposition.clone(),
+                    duration_ms: 0,
+                    recovery_owner: None,
+                    cause: None,
+                },
+                false,
+            )),
         };
         let result = settle().or_else(|error| {
             if !timed_out && tokio::time::Instant::now() < self.deadline {
@@ -548,7 +574,9 @@ impl ApiRequestCleanupCustodianV1 {
             if inner.identity.as_ref() == Some(identity) {
                 if inner.state == ApiRequestCleanupStateV1::TimedOut {
                     match result {
-                        Ok(result) => inner.terminal = Some((result.disposition, false)),
+                        Ok((result, acknowledged)) => {
+                            inner.terminal = Some((result.disposition, acknowledged));
+                        }
                         Err(error) => {
                             inner.diagnostic =
                                 lifecycle.map(|lifecycle| (lifecycle, error, inner.accepted));
@@ -557,9 +585,9 @@ impl ApiRequestCleanupCustodianV1 {
                     }
                 } else {
                     match result {
-                        Ok(result) => {
+                        Ok((result, acknowledged)) => {
                             inner.state = ApiRequestCleanupStateV1::Terminal;
-                            inner.terminal = Some((result.disposition, false));
+                            inner.terminal = Some((result.disposition, acknowledged));
                         }
                         Err(error) => {
                             inner.state = ApiRequestCleanupStateV1::SettlementRefused;
@@ -777,13 +805,49 @@ struct RequestScope {
     cancel_control: watch::Sender<bool>,
     cleanup: Arc<ApiRequestCleanupCustodianV1>,
     identity: ActiveRequestIdentity,
-    flight: Option<DurableRemoteRequestFlightV3>,
+    flight: Option<OwnedRemoteRequestV1>,
     lifecycle: Option<ApiLifecycle>,
-    accepted: bool,
+    accepted: Arc<std::sync::atomic::AtomicBool>,
     dispatched: bool,
     settled: bool,
 }
+struct RequestAcceptanceMarker {
+    cleanup: Arc<ApiRequestCleanupCustodianV1>,
+    identity: ActiveRequestIdentity,
+    request_accepted: Arc<std::sync::atomic::AtomicBool>,
+    turn_accepted: Arc<std::sync::atomic::AtomicBool>,
+}
 
+impl RequestAcceptanceMarker {
+    fn mark(&self) {
+        self.turn_accepted.store(true, Ordering::Release);
+        self.request_accepted.store(true, Ordering::Release);
+        self.cleanup.mark_accepted(&self.identity);
+    }
+}
+
+async fn drive_provider_send<F>(
+    request: Option<&OwnedRemoteRequestV1>,
+    send: F,
+    accepted: RequestAcceptanceMarker,
+) -> Result<F::Output, ApiRequestFlightErrorV1>
+where
+    F: std::future::Future,
+{
+    match request {
+        Some(request) => request
+            .arm_provider_send(async move {
+                accepted.mark();
+                send.await
+            })
+            .await
+            .map_err(ApiRequestFlightErrorV1::from),
+        None => {
+            accepted.mark();
+            Ok(send.await)
+        }
+    }
+}
 impl RequestScope {
     fn attach_lifecycle(&mut self, lifecycle: ApiLifecycle, accepted: bool) {
         self.lifecycle = Some(lifecycle);
@@ -793,13 +857,26 @@ impl RequestScope {
     }
 
     fn mark_accepted(&mut self) {
-        self.accepted = true;
+        self.accepted.store(true, Ordering::Release);
         self.cleanup.mark_accepted(&self.identity);
     }
 
-    fn begin_dispatch(&mut self) -> Result<(), RemoteRequestFlightErrorV1> {
-        if let Some(flight) = &mut self.flight {
-            flight.begin_dispatch()?;
+    fn acceptance_marker(
+        &self,
+        turn_accepted: Arc<std::sync::atomic::AtomicBool>,
+    ) -> RequestAcceptanceMarker {
+        RequestAcceptanceMarker {
+            cleanup: Arc::clone(&self.cleanup),
+            identity: self.identity.clone(),
+            request_accepted: Arc::clone(&self.accepted),
+            turn_accepted,
+        }
+    }
+
+    fn begin_dispatch(&mut self) -> Result<(), ApiRequestFlightErrorV1> {
+        if let Some(flight) = &self.flight {
+            flight.journal_intent()?;
+            flight.authorize_dispatch()?;
         }
         self.dispatched = true;
         Ok(())
@@ -808,22 +885,32 @@ impl RequestScope {
     fn settle(
         mut self,
         disposition: ResourceActionDispositionV1,
-    ) -> Result<ResourceActionResultV1, RemoteRequestFlightErrorV1> {
-        let result = match &mut self.flight {
-            Some(flight) => flight.settle(disposition)?,
-            None => ResourceActionResultV1 {
-                disposition,
-                duration_ms: 0,
-                recovery_owner: None,
-                cause: None,
-            },
+    ) -> Result<ResourceActionResultV1, ApiRequestFlightErrorV1> {
+        let (result, acknowledged) = match self.flight.take() {
+            Some(flight) => {
+                let outcome = flight.settle(ResourceActionResultV1 {
+                    disposition,
+                    duration_ms: 0,
+                    recovery_owner: None,
+                    cause: None,
+                })?;
+                (outcome.result().clone(), true)
+            }
+            None => (
+                ResourceActionResultV1 {
+                    disposition,
+                    duration_ms: 0,
+                    recovery_owner: None,
+                    cause: None,
+                },
+                false,
+            ),
         };
-        self.flight = None;
         if !self
             .cleanup
-            .finish(&self.identity, result.disposition.clone(), false)
+            .finish(&self.identity, result.disposition.clone(), acknowledged)
         {
-            return Err(RemoteRequestFlightErrorV1::Admission(
+            return Err(ApiRequestFlightErrorV1::Admission(
                 "cleanup cell rejected exact terminal publication".into(),
             ));
         }
@@ -852,7 +939,7 @@ impl Drop for RequestScope {
             self.flight.take(),
             disposition,
             self.lifecycle.take(),
-            self.accepted,
+            self.accepted.load(Ordering::Acquire),
         );
         self.cancel.clear_exact();
         self.settled = true;
@@ -862,11 +949,11 @@ impl Drop for RequestScope {
 fn settle_request_scope(
     scope: &mut Option<RequestScope>,
     disposition: ResourceActionDispositionV1,
-) -> Result<ResourceActionResultV1, RemoteRequestFlightErrorV1> {
+) -> Result<ResourceActionResultV1, ApiRequestFlightErrorV1> {
     scope
         .take()
         .ok_or_else(|| {
-            RemoteRequestFlightErrorV1::Admission("request scope was already settled".into())
+            ApiRequestFlightErrorV1::Admission("request scope was already settled".into())
         })?
         .settle(disposition)
 }
@@ -928,7 +1015,6 @@ enum PreparedRequest {
 struct RequestAdmission {
     sessions: Arc<StdMutex<HashMap<SessionId, SessionState>>>,
     route: Option<ApiResourceFlightRouteV3>,
-    request_ids: Arc<dyn RemoteRequestIdSource>,
 }
 
 impl RequestAdmission {
@@ -936,15 +1022,16 @@ impl RequestAdmission {
         &self,
         session: &SessionId,
         turn_epoch: u64,
-    ) -> Result<PreparedRequest, RemoteRequestFlightErrorV1> {
+    ) -> Result<PreparedRequest, ApiRequestFlightErrorV1> {
         // First reject a cancellation already linearized in the between-round
         // gap. No request identity or flight is minted in that case. Admission
         // is checked again after durable work and before publication to close
         // the race in the opposite direction.
         let cleanup = {
-            let sessions = self.sessions.lock().map_err(|_| {
-                RemoteRequestFlightErrorV1::Admission("session state poisoned".into())
-            })?;
+            let sessions = self
+                .sessions
+                .lock()
+                .map_err(|_| ApiRequestFlightErrorV1::Admission("session state poisoned".into()))?;
             let Some(state) = sessions.get(session) else {
                 return Ok(PreparedRequest::TurnCancelled);
             };
@@ -954,7 +1041,7 @@ impl RequestAdmission {
                 return Ok(PreparedRequest::TurnCancelled);
             }
             if state.active_request.is_some() {
-                return Err(RemoteRequestFlightErrorV1::Admission(
+                return Err(ApiRequestFlightErrorV1::Admission(
                     "another request is active".into(),
                 ));
             }
@@ -964,7 +1051,7 @@ impl RequestAdmission {
                 .filter(|cell| cell.turn_authority == turn_epoch)
                 .cloned()
                 .ok_or_else(|| {
-                    RemoteRequestFlightErrorV1::Admission(
+                    ApiRequestFlightErrorV1::Admission(
                         "turn cleanup authority is unavailable".into(),
                     )
                 })?;
@@ -972,18 +1059,12 @@ impl RequestAdmission {
             cleanup
         };
 
-        let mut flight: Option<DurableRemoteRequestFlightV3> = (|| {
-            Ok::<_, RemoteRequestFlightErrorV1>(match &self.route {
+        let flight: Option<OwnedRemoteRequestV1> = (|| {
+            Ok::<_, ApiRequestFlightErrorV1>(match &self.route {
                 Some(route) => {
-                    let request_id = self
-                        .request_ids
-                        .mint()
-                        .map_err(|_| RemoteRequestFlightErrorV1::IdentityUnavailable)?;
                     let owner = ResourceFlightOwnerV1::new(route.node_id.clone(), session.as_str())
-                        .map_err(|error| {
-                            RemoteRequestFlightErrorV1::Admission(error.to_string())
-                        })?;
-                    Some(route.attempt.bind_remote_request(request_id, owner)?)
+                        .map_err(|error| ApiRequestFlightErrorV1::Admission(error.to_string()))?;
+                    Some(route.attempt.admit(owner)?)
                 }
                 None => None,
             })
@@ -991,9 +1072,10 @@ impl RequestAdmission {
         .inspect_err(|error| cleanup.refuse(None, error.clone(), None))?;
 
         let active_conflict = {
-            let mut sessions = self.sessions.lock().map_err(|_| {
-                RemoteRequestFlightErrorV1::Admission("session state poisoned".into())
-            })?;
+            let mut sessions = self
+                .sessions
+                .lock()
+                .map_err(|_| ApiRequestFlightErrorV1::Admission("session state poisoned".into()))?;
             match sessions.get_mut(session) {
                 None => false,
                 Some(state)
@@ -1011,7 +1093,7 @@ impl RequestAdmission {
                         None => {
                             state.next_legacy_request =
                                 state.next_legacy_request.checked_add(1).ok_or_else(|| {
-                                    RemoteRequestFlightErrorV1::Admission(
+                                    ApiRequestFlightErrorV1::Admission(
                                         "legacy request authority exhausted".into(),
                                     )
                                 })?;
@@ -1039,7 +1121,7 @@ impl RequestAdmission {
                             identity,
                             flight,
                             lifecycle: None,
-                            accepted: false,
+                            accepted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                             dispatched: false,
                             settled: false,
                         }),
@@ -1052,21 +1134,32 @@ impl RequestAdmission {
         // Publication lost its race with cancellation, forget, or another
         // request. Settle outside the session lock so node aggregation may
         // re-enter unrelated bridge state without deadlocking this session.
-        let result = match &mut flight {
-            Some(flight) => flight.settle(ResourceActionDispositionV1::Failed),
-            None => Ok(ResourceActionResultV1 {
-                disposition: ResourceActionDispositionV1::Complete,
-                duration_ms: 0,
-                recovery_owner: None,
-                cause: None,
-            }),
+        let result = match &flight {
+            Some(flight) => flight
+                .settle(ResourceActionResultV1 {
+                    disposition: ResourceActionDispositionV1::Failed,
+                    duration_ms: 0,
+                    recovery_owner: None,
+                    cause: None,
+                })
+                .map(|outcome| (outcome.result().clone(), true))
+                .map_err(ApiRequestFlightErrorV1::from),
+            None => Ok((
+                ResourceActionResultV1 {
+                    disposition: ResourceActionDispositionV1::Complete,
+                    duration_ms: 0,
+                    recovery_owner: None,
+                    cause: None,
+                },
+                false,
+            )),
         };
         match result {
-            Ok(result) => cleanup.finish_pending(result.disposition, true),
+            Ok((result, acknowledged)) => cleanup.finish_pending(result.disposition, acknowledged),
             Err(error) => cleanup.refuse(None, error, None),
         }
         if active_conflict {
-            Err(RemoteRequestFlightErrorV1::Admission(
+            Err(ApiRequestFlightErrorV1::Admission(
                 "another request won publication".into(),
             ))
         } else {
@@ -1082,7 +1175,6 @@ pub struct ApiBackend {
     sessions: Arc<StdMutex<HashMap<SessionId, SessionState>>>,
     cleanup_cells: Arc<StdMutex<HashMap<u64, Arc<ApiRequestCleanupCustodianV1>>>>,
     next_turn_authority: AtomicU64,
-    request_ids: Arc<dyn RemoteRequestIdSource>,
 }
 
 /// Default policy: approve everything (mirrors AcpBackend's default auto-approver).
@@ -1110,7 +1202,6 @@ impl ApiBackend {
             sessions: Arc::new(StdMutex::new(HashMap::new())),
             cleanup_cells: Arc::new(StdMutex::new(HashMap::new())),
             next_turn_authority: AtomicU64::new(0),
-            request_ids: Arc::new(SystemRemoteRequestIdSource),
         }
     }
 
@@ -1119,13 +1210,6 @@ impl ApiBackend {
         if let Ok(mut p) = self.policy.lock() {
             *p = policy;
         }
-        self
-    }
-
-    #[must_use]
-    #[cfg(test)]
-    pub(crate) fn with_request_id_source(mut self, source: Arc<dyn RemoteRequestIdSource>) -> Self {
-        self.request_ids = source;
         self
     }
 
@@ -1184,7 +1268,6 @@ impl ApiBackend {
         RequestAdmission {
             sessions: Arc::clone(&self.sessions),
             route: self.cfg.resource_flight_route_v3.clone(),
-            request_ids: Arc::clone(&self.request_ids),
         }
     }
 
@@ -1340,23 +1423,22 @@ impl ApiBackend {
                 .record(DiagnosticPhase::PromptStart, PhaseStatus::Started)
                 .await?;
 
-            // This operation-scoped acceptance barrier is crossed immediately
-            // before the first HTTP send future is installed. It is deliberately
-            // never cleared between tool rounds: once any request may have reached
-            // the provider, every later failure is fatal and non-replayable.
-            let mut acceptance_barrier_crossed = false;
+            // Task D crosses this operation-scoped barrier only after durable
+            // ProviderSendArmed and immediately before the actual send future's
+            // first poll. It remains sticky across every later tool round.
+            let acceptance_barrier_crossed = Arc::new(std::sync::atomic::AtomicBool::new(false));
             for round in 0..max_rounds {
                 let prepared = match request_admission.prepare(&session, turn_epoch) {
                     Ok(prepared) => prepared,
                     Err(error) => Err(lifecycle
-                        .request_flight_failure(error, acceptance_barrier_crossed)
+                        .request_flight_failure(error, acceptance_barrier_crossed.load(Ordering::Acquire))
                         .await)?,
                 };
                 let PreparedRequest::Ready {
                     mut scope,
                     mut cancel_rx,
                 } = prepared else {
-                    if !acceptance_barrier_crossed {
+                    if !acceptance_barrier_crossed.load(Ordering::Acquire) {
                         lifecycle
                             .record(DiagnosticPhase::PromptStart, PhaseStatus::Completed)
                             .await?;
@@ -1371,41 +1453,29 @@ impl ApiBackend {
                     };
                     return;
                 };
-                scope.attach_lifecycle(lifecycle.clone(), acceptance_barrier_crossed);
+                scope.attach_lifecycle(lifecycle.clone(), acceptance_barrier_crossed.load(Ordering::Acquire));
                 let mut scope = Some(*scope);
                 // Durable reservation, owner attachment, identity evidence,
                 // intent, and dispatch all precede installation of the POST future.
                 if let Err(error) = scope
                     .as_mut()
                     .ok_or_else(|| {
-                        RemoteRequestFlightErrorV1::Admission(
+                        ApiRequestFlightErrorV1::Admission(
                             "request scope disappeared before dispatch".into(),
                         )
                     })
                     .and_then(RequestScope::begin_dispatch)
                 {
                     Err(lifecycle
-                        .request_flight_failure(error, acceptance_barrier_crossed)
+                        .request_flight_failure(error, acceptance_barrier_crossed.load(Ordering::Acquire))
                         .await)?;
                 }
-                let req = ChatRequest { model: model.clone(), messages: messages.clone(),
-                    tools: vec![crate::tool::tool_def()], stream: do_stream };
-                let mut builder = client.post(&url).json(&req);
-                if let Some(k) = &api_key { builder = builder.bearer_auth(k); }
-                let send = if acceptance_barrier_crossed {
-                    scope.as_mut().expect("request scope exists").mark_accepted();
-                    builder.send()
-                } else {
-                    acceptance_barrier_crossed = true;
-                    scope.as_mut().expect("request scope exists").mark_accepted();
-                    install_first_send(&lifecycle, || builder.send()).await?
-                };
                 if *cancel_rx.borrow() {
                     settle_request_scope_or_fail(
                         &lifecycle,
                         &mut scope,
                         ResourceActionDispositionV1::Partial,
-                        true,
+                        acceptance_barrier_crossed.load(Ordering::Acquire),
                     )
                     .await?;
                     complete_prompt_lifecycle(&lifecycle).await?;
@@ -1415,16 +1485,36 @@ impl ApiBackend {
                     };
                     return;
                 }
-                tokio::pin!(send);
-                let send_result = loop {
-                    tokio::select! {
-                        biased;
-                        changed = cancel_rx.changed() => {
-                            if changed.is_ok() && *cancel_rx.borrow() {
-                                break None;
+                let req = ChatRequest { model: model.clone(), messages: messages.clone(),
+                    tools: vec![crate::tool::tool_def()], stream: do_stream };
+                let mut builder = client.post(&url).json(&req);
+                if let Some(k) = &api_key { builder = builder.bearer_auth(k); }
+                let send_result = {
+                    let scope_ref = scope.as_ref().expect("request scope exists");
+                    let accepted = scope_ref.acceptance_marker(Arc::clone(
+                        &acceptance_barrier_crossed,
+                    ));
+                    let send = drive_provider_send(
+                        scope_ref.flight.as_ref(),
+                        builder.send(),
+                        accepted,
+                    );
+                    let send = if acceptance_barrier_crossed.load(Ordering::Acquire) {
+                        send
+                    } else {
+                        install_first_send(&lifecycle, || send).await?
+                    };
+                    tokio::pin!(send);
+                    loop {
+                        tokio::select! {
+                            biased;
+                            changed = cancel_rx.changed() => {
+                                if changed.is_ok() && *cancel_rx.borrow() {
+                                    break None;
+                                }
                             }
+                            result = &mut send => break Some(result),
                         }
-                        result = &mut send => break Some(result),
                     }
                 };
                 let Some(send_result) = send_result else {
@@ -1432,7 +1522,7 @@ impl ApiBackend {
                         &lifecycle,
                         &mut scope,
                         ResourceActionDispositionV1::Partial,
-                        true,
+                        acceptance_barrier_crossed.load(Ordering::Acquire),
                     )
                     .await?;
                     complete_prompt_lifecycle(&lifecycle).await?;
@@ -1441,6 +1531,15 @@ impl ApiBackend {
                         prefix_attestation: Default::default(),
                     };
                     return;
+                };
+                let send_result = match send_result {
+                    Ok(result) => result,
+                    Err(error) => Err(lifecycle
+                        .request_flight_failure(
+                            error,
+                            acceptance_barrier_crossed.load(Ordering::Acquire),
+                        )
+                        .await)?,
                 };
                 let resp = match send_result {
                     Ok(response) => response,
@@ -1755,7 +1854,7 @@ impl ApiBackend {
                 }
                 // continue → re-POST with the appended tool results.
             }
-            if !acceptance_barrier_crossed {
+            if !acceptance_barrier_crossed.load(Ordering::Acquire) {
                 // Preserve the legacy `max_tool_rounds = 0` terminal shape. No
                 // provider request exists in this degenerate configuration.
                 lifecycle
@@ -1987,14 +2086,18 @@ mod tests {
         EffectiveConfig, PermissionDecision, PermissionRequest, SessionContext, SessionSpec,
     };
     use bridge_core::error::BridgeError;
-    use bridge_core::ids::{AttemptId, NodeId, SessionId};
-    use bridge_core::ports::{AgentBackend, DiagnosticObserver, PolicyEngine};
-    use bridge_core::process::DurableProcessFlightAttemptV3;
-    use bridge_core::resource_flight::{
-        FileResourceFlightJournal, NodeCleanupAggregationV1, ResourceFlightJournal,
-        ResourceFlightJournalEventV1, ResourceFlightKeyV1, ResourceFlightResultPublisher,
+    use bridge_core::fs_custody::{
+        required_object_identity_v2, BirthTimeV1, ChildNameV2, JournalRootBindingV2,
+        JournalRootCustodyV2, ObjectIdentityV2,
     };
-    use std::collections::VecDeque;
+    use bridge_core::ids::{AttemptIdentity, NodeId, SessionId};
+    use bridge_core::ports::{AgentBackend, DiagnosticObserver, PolicyEngine};
+    use bridge_core::remote_request_flight::{
+        RemoteRequestDeliveryIdV1, RemoteRequestDriverV1, RemoteRequestJournalV1,
+        RemoteRequestResultPublisherV1, RemoteRequestTerminalPublicationV1,
+    };
+    use std::fs;
+    use std::os::unix::fs::MetadataExt as _;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Arc;
@@ -2352,37 +2455,78 @@ mod tests {
         .unwrap()
     }
 
-    struct SequenceRequestIds {
-        ids: StdMutex<VecDeque<DedicatedRemoteRequestIdV1>>,
-        minted: AtomicUsize,
+    type RequestJournalRoute = (PathBuf, PathBuf, JournalRootBindingV2);
+
+    fn object(path: &std::path::Path) -> ObjectIdentityV2 {
+        let metadata = fs::metadata(path).unwrap();
+        required_object_identity_v2(
+            metadata.dev(),
+            metadata.ino(),
+            BirthTimeV1::from_metadata(&metadata),
+            "API request fixture",
+        )
+        .unwrap()
     }
 
-    impl SequenceRequestIds {
-        fn new(ids: impl IntoIterator<Item = DedicatedRemoteRequestIdV1>) -> Self {
-            Self {
-                ids: StdMutex::new(ids.into_iter().collect()),
-                minted: AtomicUsize::new(0),
-            }
-        }
+    fn request_journal_route(base: &std::path::Path) -> RequestJournalRoute {
+        let anchor = base.join("anchor");
+        let parent = anchor.join("parent");
+        let root = parent.join("requests");
+        let lock = parent.join("operation.lock");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(&lock, b"").unwrap();
+        let binding = JournalRootBindingV2::new(
+            object(&anchor),
+            ChildNameV2::from_bytes(b"parent").unwrap(),
+            object(&parent),
+            ChildNameV2::from_bytes(b"requests").unwrap(),
+            object(&root),
+            ChildNameV2::from_bytes(b"operation.lock").unwrap(),
+            object(&lock),
+        )
+        .unwrap();
+        (anchor, root, binding)
     }
 
-    impl RemoteRequestIdSource for SequenceRequestIds {
-        fn mint(&self) -> Result<DedicatedRemoteRequestIdV1, BridgeError> {
-            self.minted.fetch_add(1, Ordering::SeqCst);
-            self.ids
-                .lock()
-                .map_err(|_| BridgeError::IdentityUnavailable)?
-                .pop_front()
-                .ok_or(BridgeError::IdentityUnavailable)
-        }
+    fn request_custody(route: &RequestJournalRoute) -> JournalRootCustodyV2 {
+        JournalRootCustodyV2::open(&route.0, &route.2, "API request journal").unwrap()
+    }
+
+    fn request_driver(
+        route: &RequestJournalRoute,
+        capacity: usize,
+        publisher: Arc<dyn RemoteRequestResultPublisherV1>,
+    ) -> Arc<RemoteRequestDriverV1> {
+        let attempt = AttemptIdentity::initial().unwrap();
+        RemoteRequestJournalV1::initialize(request_custody(route), attempt.clone()).unwrap();
+        Arc::new(
+            RemoteRequestDriverV1::open_recovered(
+                request_custody(route),
+                attempt,
+                capacity,
+                publisher,
+            )
+            .unwrap(),
+        )
+    }
+
+    fn checkpoint_next_ordinal(root: &std::path::Path) -> u64 {
+        let value: serde_json::Value =
+            serde_json::from_slice(&fs::read(root.join("remote-request-checkpoint.json")).unwrap())
+                .unwrap();
+        value["next_ordinal"].as_u64().unwrap()
     }
 
     #[derive(Default)]
-    struct RecordingRequestPublisher(StdMutex<Vec<NodeCleanupAggregationV1>>);
+    struct RecordingRequestPublisher(StdMutex<Vec<RemoteRequestTerminalPublicationV1>>);
 
-    impl ResourceFlightResultPublisher for RecordingRequestPublisher {
-        fn publish(&self, aggregation: NodeCleanupAggregationV1) {
-            self.0.lock().unwrap().push(aggregation);
+    impl RemoteRequestResultPublisherV1 for RecordingRequestPublisher {
+        fn publish_idempotent(
+            &self,
+            publication: &RemoteRequestTerminalPublicationV1,
+        ) -> Result<RemoteRequestDeliveryIdV1, String> {
+            self.0.lock().unwrap().push(publication.clone());
+            Ok(publication.delivery_id().clone())
         }
     }
 
@@ -2391,17 +2535,19 @@ mod tests {
         release: Arc<std::sync::Barrier>,
     }
 
-    impl ResourceFlightResultPublisher for BlockingRequestPublisher {
-        fn publish(&self, _aggregation: NodeCleanupAggregationV1) {
+    impl RemoteRequestResultPublisherV1 for BlockingRequestPublisher {
+        fn publish_idempotent(
+            &self,
+            publication: &RemoteRequestTerminalPublicationV1,
+        ) -> Result<RemoteRequestDeliveryIdV1, String> {
             self.arrived.wait();
             self.release.wait();
+            Ok(publication.delivery_id().clone())
         }
     }
 
     struct ProtectedBackendFixture {
         backend: Arc<ApiBackend>,
-        ids: Arc<SequenceRequestIds>,
-        journal: Arc<FileResourceFlightJournal>,
         publisher: Arc<RecordingRequestPublisher>,
         _root: tempfile::TempDir,
         journal_root: PathBuf,
@@ -2409,38 +2555,30 @@ mod tests {
 
     fn protected_backend(
         base_url: String,
-        request_ids: Vec<DedicatedRemoteRequestIdV1>,
+        _request_ids: Vec<DedicatedRemoteRequestIdV1>,
         journal_cap: usize,
         max_tool_rounds: usize,
         policy: Option<Arc<dyn PolicyEngine>>,
     ) -> ProtectedBackendFixture {
         let root = tempfile::tempdir().unwrap();
-        let journal_root = root.path().join("journal");
-        std::fs::create_dir(&journal_root).unwrap();
-        let journal =
-            Arc::new(FileResourceFlightJournal::open(&journal_root, journal_cap).unwrap());
+        let route = request_journal_route(root.path());
+        let journal_root = route.1.clone();
         let publisher = Arc::new(RecordingRequestPublisher::default());
-        let publisher_port: Arc<dyn ResourceFlightResultPublisher> = publisher.clone();
-        let attempt =
-            DurableProcessFlightAttemptV3::new(AttemptId::mint().unwrap(), Arc::clone(&journal))
-                .with_result_publisher(publisher_port);
-        let ids = Arc::new(SequenceRequestIds::new(request_ids));
-        let request_id_source: Arc<dyn RemoteRequestIdSource> = ids.clone();
+        let publisher_port: Arc<dyn RemoteRequestResultPublisherV1> = publisher.clone();
+        let driver = request_driver(&route, journal_cap, publisher_port);
         let mut cfg = crate::config::ApiConfig::new(base_url);
         cfg.max_tool_rounds = max_tool_rounds;
         cfg.resource_flight_route_v3 = Some(ApiResourceFlightRouteV3::new(
-            Arc::new(attempt),
+            driver,
             NodeId::parse("api-node").unwrap(),
         ));
-        let backend = ApiBackend::new(cfg).with_request_id_source(request_id_source);
+        let backend = ApiBackend::new(cfg);
         let backend = match policy {
             Some(policy) => backend.with_policy(policy),
             None => backend,
         };
         ProtectedBackendFixture {
             backend: Arc::new(backend),
-            ids,
-            journal,
             publisher,
             journal_root,
             _root: root,
@@ -2448,21 +2586,24 @@ mod tests {
     }
 
     fn cleanup_request_flight(
-        journal_root: &std::path::Path,
+        base: &std::path::Path,
         session: &SessionId,
-        request_id: DedicatedRemoteRequestIdV1,
-    ) -> DurableRemoteRequestFlightV3 {
-        std::fs::create_dir(journal_root).unwrap();
-        let journal = Arc::new(FileResourceFlightJournal::open(journal_root, 64).unwrap());
-        let attempt = DurableProcessFlightAttemptV3::new(AttemptId::mint().unwrap(), journal);
+    ) -> (ActiveRequestIdentity, OwnedRemoteRequestV1, PathBuf) {
+        let route = request_journal_route(base);
+        let publisher: Arc<dyn RemoteRequestResultPublisherV1> =
+            Arc::new(RecordingRequestPublisher::default());
+        let driver = request_driver(&route, 64, publisher);
         let owner = ResourceFlightOwnerV1::new(
             NodeId::parse("task-e-cleanup-node").unwrap(),
             session.as_str(),
         )
         .unwrap();
-        let mut flight = attempt.bind_remote_request(request_id, owner).unwrap();
-        flight.begin_dispatch().unwrap();
-        flight
+        let flight = driver.admit(owner).unwrap();
+        let identity = ActiveRequestIdentity::Dedicated(flight.request_id().clone());
+        flight.journal_intent().unwrap();
+        flight.authorize_dispatch().unwrap();
+        futures::executor::block_on(flight.arm_provider_send(std::future::ready(()))).unwrap();
+        (identity, flight, route.1)
     }
 
     fn refused_cleanup_cell(
@@ -2477,7 +2618,7 @@ mod tests {
         cell.mark_accepted(&identity);
         cell.refuse(
             Some(&identity),
-            RemoteRequestFlightErrorV1::Admission("injected settlement refusal".into()),
+            ApiRequestFlightErrorV1::Admission("injected settlement refusal".into()),
             Some(ApiLifecycle::new(observer, None)),
         );
         cell
@@ -2486,7 +2627,7 @@ mod tests {
     async fn wait_for_active_request(
         backend: &Arc<ApiBackend>,
         session: &SessionId,
-        expected: &ActiveRequestIdentity,
+        prior: Option<&ActiveRequestIdentity>,
     ) -> RequestCancelCapability {
         tokio::time::timeout(Duration::from_secs(2), async {
             loop {
@@ -2494,7 +2635,7 @@ mod tests {
                     let sessions = backend.sessions.lock().unwrap();
                     sessions.get(session).and_then(|state| {
                         state.active_request.as_ref().and_then(|active| {
-                            (active.identity == *expected).then(|| RequestCancelCapability {
+                            (prior != Some(&active.identity)).then(|| RequestCancelCapability {
                                 sessions: Arc::clone(&backend.sessions),
                                 session: session.clone(),
                                 turn_epoch: active.turn_epoch,
@@ -2591,15 +2732,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let id_a = request_id('1');
-        let id_b = request_id('2');
-        let fixture = protected_backend(
-            format!("{}/v1", server.uri()),
-            vec![id_a.clone(), id_b.clone()],
-            64,
-            4,
-            None,
-        );
+        let fixture = protected_backend(format!("{}/v1", server.uri()), vec![], 64, 4, None);
         let session = SessionId::parse("stale-round").unwrap();
         assert_eq!(
             fixture
@@ -2609,18 +2742,10 @@ mod tests {
             BackendResourceFlightV1::ProtectedV3
         );
         let task = spawn_drain(Arc::clone(&fixture.backend), session.clone());
-        let stale_a = wait_for_active_request(
-            &fixture.backend,
-            &session,
-            &ActiveRequestIdentity::Dedicated(id_a.clone()),
-        )
-        .await;
-        let _current_b = wait_for_active_request(
-            &fixture.backend,
-            &session,
-            &ActiveRequestIdentity::Dedicated(id_b.clone()),
-        )
-        .await;
+        let stale_a = wait_for_active_request(&fixture.backend, &session, None).await;
+        let id_a = stale_a.identity.clone();
+        let current_b = wait_for_active_request(&fixture.backend, &session, Some(&id_a)).await;
+        let id_b = current_b.identity.clone();
 
         assert!(
             !stale_a.cancel_exact(),
@@ -2631,11 +2756,7 @@ mod tests {
             "a retained A settlement/drop must not clear successor B"
         );
         assert_eq!(
-            exact_request_cancelled(
-                &fixture.backend,
-                &session,
-                &ActiveRequestIdentity::Dedicated(id_b.clone())
-            ),
+            exact_request_cancelled(&fixture.backend, &session, &id_b),
             Some(false),
             "the mutation-sensitive positive state proves B remained live"
         );
@@ -2649,58 +2770,21 @@ mod tests {
         ));
         assert_eq!(server.received_requests().await.unwrap().len(), 2);
 
-        let aggregations = fixture.publisher.0.lock().unwrap().clone();
-        assert_eq!(aggregations.len(), 2);
-        assert_ne!(
-            aggregations[0].resource_flight_id,
-            aggregations[1].resource_flight_id
-        );
-        assert_eq!(aggregations[0].owner, aggregations[1].owner);
+        let publications = fixture.publisher.0.lock().unwrap().clone();
+        assert_eq!(publications.len(), 2);
+        assert_ne!(publications[0].delivery_id(), publications[1].delivery_id());
         assert_eq!(
-            aggregations[0].owner.node_id,
-            NodeId::parse("api-node").unwrap()
-        );
-        assert_eq!(aggregations[0].owner.owner_key, session.as_str());
-        assert_eq!(
-            aggregations[0].result.disposition,
+            publications[0].result().disposition,
             ResourceActionDispositionV1::Complete
         );
         assert_eq!(
-            aggregations[1].result.disposition,
+            publications[1].result().disposition,
             ResourceActionDispositionV1::Partial
         );
-
-        for (aggregation, expected) in aggregations.iter().zip([id_a, id_b]) {
-            let rows = fixture
-                .journal
-                .records(&aggregation.resource_flight_id)
-                .unwrap();
-            assert_eq!(
-                rows.iter()
-                    .filter(|row| matches!(
-                        &row.event,
-                        ResourceFlightJournalEventV1::Settled { .. }
-                    ))
-                    .count(),
-                1
-            );
-            assert!(rows.iter().any(|row| matches!(
-                &row.event,
-                ResourceFlightJournalEventV1::FlightReserved {
-                    key: ResourceFlightKeyV1::DedicatedRemoteRequest { request_id },
-                    ..
-                } if request_id == &expected
-            )));
-            assert!(rows.iter().any(|row| matches!(
-                &row.event,
-                ResourceFlightJournalEventV1::RemoteRequestIdentityCaptured {
-                    identity: bridge_core::resource_flight::ResourceIdentityV1::DedicatedRemoteRequest {
-                        request_id,
-                    },
-                    ..
-                } if request_id == &expected
-            )));
-        }
+        assert!(publications
+            .iter()
+            .all(RemoteRequestTerminalPublicationV1::prompt_may_have_been_accepted));
+        assert_eq!(checkpoint_next_ordinal(&fixture.journal_root), 2);
         assert_eq!(
             fixture
                 .backend
@@ -2746,7 +2830,7 @@ mod tests {
         });
         let fixture = protected_backend(
             format!("{}/v1", server.uri()),
-            vec![request_id('3'), request_id('4')],
+            vec![],
             64,
             4,
             Some(policy.clone()),
@@ -2774,13 +2858,14 @@ mod tests {
             Some(Ok(Update::Done { stop_reason, .. })) if stop_reason == STOP_REASON_CANCELLED
         ));
         assert_eq!(server.received_requests().await.unwrap().len(), 1);
-        assert_eq!(fixture.ids.minted.load(Ordering::SeqCst), 1);
-        let aggregations = fixture.publisher.0.lock().unwrap();
-        assert_eq!(aggregations.len(), 1);
+        assert_eq!(checkpoint_next_ordinal(&fixture.journal_root), 1);
+        let publications = fixture.publisher.0.lock().unwrap();
+        assert_eq!(publications.len(), 1);
         assert_eq!(
-            aggregations[0].result.disposition,
+            publications[0].result().disposition,
             ResourceActionDispositionV1::Complete
         );
+        assert!(publications[0].prompt_may_have_been_accepted());
     }
 
     struct BreakJournalBetweenRounds {
@@ -2812,13 +2897,7 @@ mod tests {
             )
             .mount(&server)
             .await;
-        let fixture = protected_backend(
-            format!("{}/v1", server.uri()),
-            vec![request_id('9'), request_id('a')],
-            64,
-            4,
-            None,
-        );
+        let fixture = protected_backend(format!("{}/v1", server.uri()), vec![], 64, 4, None);
         let moved_root = fixture._root.path().join("journal-disabled");
         *fixture.backend.policy.lock().unwrap() = Arc::new(BreakJournalBetweenRounds {
             journal_root: fixture.journal_root.clone(),
@@ -2845,35 +2924,34 @@ mod tests {
         assert!(diagnostic.prompt_may_have_been_accepted());
         assert_eq!(server.received_requests().await.unwrap().len(), 1);
         assert!(!fixture.journal_root.exists());
-        assert_eq!(fixture.ids.minted.load(Ordering::SeqCst), 2);
-        let aggregations = fixture.publisher.0.lock().unwrap();
-        assert_eq!(aggregations.len(), 1);
+        assert_eq!(checkpoint_next_ordinal(&moved_root), 1);
+        let publications = fixture.publisher.0.lock().unwrap();
+        assert_eq!(publications.len(), 1);
         assert_eq!(
-            aggregations[0].result.disposition,
+            publications[0].result().disposition,
             ResourceActionDispositionV1::Complete
         );
-        let moved_journal = FileResourceFlightJournal::open(moved_root, 64).unwrap();
-        let rows = moved_journal
-            .records(&aggregations[0].resource_flight_id)
-            .unwrap();
-        assert_eq!(
-            rows.iter()
-                .filter(|row| matches!(&row.event, ResourceFlightJournalEventV1::Settled { .. }))
-                .count(),
-            1
-        );
+        assert!(publications[0].prompt_may_have_been_accepted());
     }
 
     #[tokio::test]
     async fn request_capacity_refusal_precedes_flight_creation_and_post() {
         let server = MockServer::start().await;
-        let fixture = protected_backend(
-            format!("{}/v1", server.uri()),
-            vec![request_id('5')],
-            4,
-            4,
-            None,
-        );
+        let fixture = protected_backend(format!("{}/v1", server.uri()), vec![], 5, 4, None);
+        let owner = ResourceFlightOwnerV1::new(
+            NodeId::parse("capacity-prefill").unwrap(),
+            "capacity-prefill",
+        )
+        .unwrap();
+        let _held = fixture
+            .backend
+            .cfg
+            .resource_flight_route_v3
+            .as_ref()
+            .unwrap()
+            .attempt
+            .admit(owner)
+            .unwrap();
         let session = SessionId::parse("capacity-refusal").unwrap();
         fixture
             .backend
@@ -2893,59 +2971,10 @@ mod tests {
         assert_eq!(diagnostic.disposition(), FailureDisposition::Fatal);
         assert!(!diagnostic.prompt_may_have_been_accepted());
         assert_eq!(server.received_requests().await.unwrap().len(), 0);
-        assert_eq!(fixture.ids.minted.load(Ordering::SeqCst), 1);
+        assert_eq!(checkpoint_next_ordinal(&fixture.journal_root), 1);
         assert!(
             fixture.publisher.0.lock().unwrap().is_empty(),
             "capacity is reserved by FlightReserved, so refusal creates no live flight"
-        );
-    }
-
-    #[tokio::test]
-    async fn round_two_identity_collision_does_not_post_or_rewrite_round_one() {
-        let server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path("/v1/chat/completions"))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .insert_header("content-type", "text/event-stream")
-                    .set_body_string(tool_call_sse()),
-            )
-            .mount(&server)
-            .await;
-        let duplicate = request_id('6');
-        let fixture = protected_backend(
-            format!("{}/v1", server.uri()),
-            vec![duplicate.clone(), duplicate],
-            64,
-            4,
-            None,
-        );
-        let session = SessionId::parse("round-two-refusal").unwrap();
-        fixture
-            .backend
-            .attach_resource_flight_owner_v1(&session)
-            .unwrap();
-        let updates = spawn_drain(Arc::clone(&fixture.backend), session)
-            .await
-            .unwrap();
-        assert!(updates.iter().any(Result::is_err));
-        assert_eq!(server.received_requests().await.unwrap().len(), 1);
-        assert_eq!(fixture.ids.minted.load(Ordering::SeqCst), 2);
-        let aggregations = fixture.publisher.0.lock().unwrap();
-        assert_eq!(aggregations.len(), 1);
-        assert_eq!(
-            aggregations[0].result.disposition,
-            ResourceActionDispositionV1::Complete
-        );
-        let rows = fixture
-            .journal
-            .records(&aggregations[0].resource_flight_id)
-            .unwrap();
-        assert_eq!(
-            rows.iter()
-                .filter(|row| matches!(&row.event, ResourceFlightJournalEventV1::Settled { .. }))
-                .count(),
-            1
         );
     }
 
@@ -2962,26 +2991,14 @@ mod tests {
             )
             .mount(&server)
             .await;
-        let id = request_id('7');
-        let fixture = protected_backend(
-            format!("{}/v1", server.uri()),
-            vec![id.clone()],
-            64,
-            4,
-            None,
-        );
+        let fixture = protected_backend(format!("{}/v1", server.uri()), vec![], 64, 4, None);
         let session = SessionId::parse("consumer-drop").unwrap();
         fixture
             .backend
             .attach_resource_flight_owner_v1(&session)
             .unwrap();
         let task = spawn_drain(Arc::clone(&fixture.backend), session.clone());
-        wait_for_active_request(
-            &fixture.backend,
-            &session,
-            &ActiveRequestIdentity::Dedicated(id),
-        )
-        .await;
+        wait_for_active_request(&fixture.backend, &session, None).await;
         task.abort();
         let _ = task.await;
 
@@ -3004,10 +3021,10 @@ mod tests {
             .is_some_and(
                 |state| state.active_request.is_none() && state.current_turn_epoch.is_none()
             ));
-        let aggregations = fixture.publisher.0.lock().unwrap();
-        assert_eq!(aggregations.len(), 1);
+        let publications = fixture.publisher.0.lock().unwrap();
+        assert_eq!(publications.len(), 1);
         assert_eq!(
-            aggregations[0].result.disposition,
+            publications[0].result().disposition,
             ResourceActionDispositionV1::Unknown
         );
     }
@@ -3031,7 +3048,7 @@ mod tests {
         ))));
         let session = SessionId::parse("task-e-active-legacy").unwrap();
         let task = spawn_drain(Arc::clone(&backend), session.clone());
-        wait_for_active_request(&backend, &session, &ActiveRequestIdentity::Legacy(1)).await;
+        wait_for_active_request(&backend, &session, None).await;
 
         assert_eq!(
             backend.forget_session_checked(&session).await.unwrap(),
@@ -3045,7 +3062,7 @@ mod tests {
 
     #[tokio::test]
     async fn checked_forget_and_release_join_the_exact_request_winner() {
-        for (operation, id_digit) in [("forget", 'c'), ("release", 'd')] {
+        for operation in ["forget", "release"] {
             let server = MockServer::start().await;
             Mock::given(method("POST"))
                 .and(path("/v1/chat/completions"))
@@ -3057,26 +3074,14 @@ mod tests {
                 )
                 .mount(&server)
                 .await;
-            let id = request_id(id_digit);
-            let fixture = protected_backend(
-                format!("{}/v1", server.uri()),
-                vec![id.clone()],
-                64,
-                4,
-                None,
-            );
+            let fixture = protected_backend(format!("{}/v1", server.uri()), vec![], 64, 4, None);
             let session = SessionId::parse(format!("{operation}-exact")).unwrap();
             fixture
                 .backend
                 .attach_resource_flight_owner_v1(&session)
                 .unwrap();
             let task = spawn_drain(Arc::clone(&fixture.backend), session.clone());
-            wait_for_active_request(
-                &fixture.backend,
-                &session,
-                &ActiveRequestIdentity::Dedicated(id),
-            )
-            .await;
+            wait_for_active_request(&fixture.backend, &session, None).await;
             wait_for_provider_requests(&server, 1).await;
             let cleanup = if operation == "forget" {
                 fixture.backend.forget_session_checked(&session).await
@@ -3098,10 +3103,10 @@ mod tests {
                 .unwrap()
                 .contains_key(&session));
             {
-                let aggregations = fixture.publisher.0.lock().unwrap();
-                assert_eq!(aggregations.len(), 1);
+                let publications = fixture.publisher.0.lock().unwrap();
+                assert_eq!(publications.len(), 1);
                 assert_eq!(
-                    aggregations[0].result.disposition,
+                    publications[0].result().disposition,
                     ResourceActionDispositionV1::Partial
                 );
             }
@@ -3171,26 +3176,14 @@ mod tests {
             )
             .mount(&server)
             .await;
-        let id = request_id('b');
-        let fixture = protected_backend(
-            format!("{}/v1", server.uri()),
-            vec![id.clone()],
-            64,
-            4,
-            None,
-        );
+        let fixture = protected_backend(format!("{}/v1", server.uri()), vec![], 64, 4, None);
         let session = SessionId::parse("cleanup-terminal-refusal").unwrap();
         fixture
             .backend
             .attach_resource_flight_owner_v1(&session)
             .unwrap();
         let task = spawn_drain(Arc::clone(&fixture.backend), session.clone());
-        wait_for_active_request(
-            &fixture.backend,
-            &session,
-            &ActiveRequestIdentity::Dedicated(id),
-        )
-        .await;
+        wait_for_active_request(&fixture.backend, &session, None).await;
         wait_for_provider_requests(&server, 1).await;
         std::fs::rename(
             &fixture.journal_root,
@@ -3251,7 +3244,7 @@ mod tests {
                 .await,
             Err(BridgeError::ResourceFlightUnsupported)
         ));
-        assert_eq!(fixture.ids.minted.load(Ordering::SeqCst), 0);
+        assert_eq!(checkpoint_next_ordinal(&fixture.journal_root), 0);
     }
 
     #[tokio::test]
@@ -3276,7 +3269,7 @@ mod tests {
                 .await,
             Err(BridgeError::ResourceFlightUnsupported)
         ));
-        assert_eq!(fixture.ids.minted.load(Ordering::SeqCst), 0);
+        assert_eq!(checkpoint_next_ordinal(&fixture.journal_root), 0);
         fixture
             .backend
             .attach_resource_flight_owner_v1(&session)
@@ -3288,7 +3281,7 @@ mod tests {
             updates.last(),
             Some(Ok(Update::Done { stop_reason, .. })) if stop_reason == "max_tool_rounds"
         ));
-        assert_eq!(fixture.ids.minted.load(Ordering::SeqCst), 0);
+        assert_eq!(checkpoint_next_ordinal(&fixture.journal_root), 0);
         assert!(fixture.publisher.0.lock().unwrap().is_empty());
         assert!(server.received_requests().await.unwrap().is_empty());
 
@@ -3323,8 +3316,7 @@ mod tests {
         let session = SessionId::parse("fresh-after-cancel").unwrap();
 
         let first = spawn_drain(Arc::clone(&backend), session.clone());
-        let stale =
-            wait_for_active_request(&backend, &session, &ActiveRequestIdentity::Legacy(1)).await;
+        let stale = wait_for_active_request(&backend, &session, None).await;
         backend.cancel(&session).await.unwrap();
         let first_updates = first.await.unwrap();
         assert!(matches!(
@@ -3333,11 +3325,11 @@ mod tests {
         ));
 
         let second = spawn_drain(Arc::clone(&backend), session.clone());
-        wait_for_active_request(&backend, &session, &ActiveRequestIdentity::Legacy(2)).await;
+        let current = wait_for_active_request(&backend, &session, Some(&stale.identity)).await;
         assert!(!stale.cancel_exact());
         assert!(!stale.clear_exact());
         assert_eq!(
-            exact_request_cancelled(&backend, &session, &ActiveRequestIdentity::Legacy(2)),
+            exact_request_cancelled(&backend, &session, &current.identity),
             Some(false)
         );
         let second_updates = second.await.unwrap();
@@ -3368,27 +3360,22 @@ mod tests {
             .mount(&server)
             .await;
         let root = tempfile::tempdir().unwrap();
-        let journal_root = root.path().join("journal");
-        std::fs::create_dir(&journal_root).unwrap();
-        let journal = Arc::new(FileResourceFlightJournal::open(journal_root, 64).unwrap());
+        let route = request_journal_route(root.path());
         let arrived = Arc::new(std::sync::Barrier::new(2));
         let release = Arc::new(std::sync::Barrier::new(2));
-        let publisher: Arc<dyn ResourceFlightResultPublisher> =
+        let publisher: Arc<dyn RemoteRequestResultPublisherV1> =
             Arc::new(BlockingRequestPublisher {
                 arrived: Arc::clone(&arrived),
                 release: Arc::clone(&release),
             });
-        let attempt = DurableProcessFlightAttemptV3::new(AttemptId::mint().unwrap(), journal)
-            .with_result_publisher(publisher);
-        let ids = Arc::new(SequenceRequestIds::new([request_id('6')]));
-        let request_id_source: Arc<dyn RemoteRequestIdSource> = ids;
+        let driver = request_driver(&route, 64, publisher);
         let mut cfg = crate::config::ApiConfig::new(format!("{}/v1", server.uri()));
         cfg.request_timeout = Duration::from_millis(200);
         cfg.resource_flight_route_v3 = Some(ApiResourceFlightRouteV3::new(
-            Arc::new(attempt),
+            driver,
             NodeId::parse("api-node").unwrap(),
         ));
-        let backend = Arc::new(ApiBackend::new(cfg).with_request_id_source(request_id_source));
+        let backend = Arc::new(ApiBackend::new(cfg));
         let session = SessionId::parse("task-e-public-late-complete").unwrap();
         backend.attach_resource_flight_owner_v1(&session).unwrap();
         let task = spawn_drain(Arc::clone(&backend), session.clone());
@@ -3427,14 +3414,14 @@ mod tests {
         );
         assert_eq!(
             inner.terminal,
-            Some((ResourceActionDispositionV1::Complete, false))
+            Some((ResourceActionDispositionV1::Complete, true))
         );
         drop(inner);
         assert!(!cell.reclaimable());
     }
 
     #[tokio::test]
-    async fn task_e_noop_publisher_success_has_no_fabricated_acknowledgement() {
+    async fn task_e_exact_echo_projects_complete_acknowledgement() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/v1/chat/completions"))
@@ -3446,19 +3433,17 @@ mod tests {
             .mount(&server)
             .await;
         let root = tempfile::tempdir().unwrap();
-        let journal_root = root.path().join("journal");
-        std::fs::create_dir(&journal_root).unwrap();
-        let journal = Arc::new(FileResourceFlightJournal::open(journal_root, 64).unwrap());
-        let attempt = DurableProcessFlightAttemptV3::new(AttemptId::mint().unwrap(), journal);
-        let ids = Arc::new(SequenceRequestIds::new([request_id('7')]));
-        let request_id_source: Arc<dyn RemoteRequestIdSource> = ids;
+        let route = request_journal_route(root.path());
+        let publisher = Arc::new(RecordingRequestPublisher::default());
+        let publisher_port: Arc<dyn RemoteRequestResultPublisherV1> = publisher.clone();
+        let driver = request_driver(&route, 64, publisher_port);
         let mut cfg = crate::config::ApiConfig::new(format!("{}/v1", server.uri()));
         cfg.resource_flight_route_v3 = Some(ApiResourceFlightRouteV3::new(
-            Arc::new(attempt),
+            driver,
             NodeId::parse("api-node").unwrap(),
         ));
-        let backend = Arc::new(ApiBackend::new(cfg).with_request_id_source(request_id_source));
-        let session = SessionId::parse("task-e-noop-publication").unwrap();
+        let backend = Arc::new(ApiBackend::new(cfg));
+        let session = SessionId::parse("task-e-exact-publication").unwrap();
         backend.attach_resource_flight_owner_v1(&session).unwrap();
 
         let updates = spawn_drain(Arc::clone(&backend), session.clone())
@@ -3468,9 +3453,10 @@ mod tests {
             updates.last(),
             Some(Ok(Update::Done { stop_reason, .. })) if stop_reason == "stop"
         ));
+        assert_eq!(publisher.0.lock().unwrap().len(), 1);
         assert_eq!(
             backend.release_session_checked(&session).await.unwrap(),
-            BackendCleanupDispositionV1::Unknown
+            BackendCleanupDispositionV1::Complete
         );
     }
 
@@ -3673,11 +3659,8 @@ mod tests {
     #[tokio::test]
     async fn task_e_timeout_then_drop_records_success_without_upgrading_unknown() {
         let root = tempfile::tempdir().unwrap();
-        let journal_root = root.path().join("journal");
         let session = SessionId::parse("task-e-timeout-drop-success").unwrap();
-        let request_id = request_id('c');
-        let identity = ActiveRequestIdentity::Dedicated(request_id.clone());
-        let flight = cleanup_request_flight(&journal_root, &session, request_id);
+        let (identity, flight, _journal_root) = cleanup_request_flight(root.path(), &session);
         let cell = ApiRequestCleanupCustodianV1::new(92, session, true, Duration::ZERO);
         cell.begin_admission().unwrap();
         cell.bind(&identity).unwrap();
@@ -3697,7 +3680,7 @@ mod tests {
         assert!(inner.accepted);
         assert_eq!(
             inner.terminal,
-            Some((ResourceActionDispositionV1::Complete, false))
+            Some((ResourceActionDispositionV1::Complete, true))
         );
         drop(inner);
         assert_eq!(
@@ -3709,12 +3692,9 @@ mod tests {
     #[tokio::test]
     async fn task_e_timeout_then_drop_records_refusal_without_upgrading_unknown() {
         let root = tempfile::tempdir().unwrap();
-        let journal_root = root.path().join("journal");
         let moved_root = root.path().join("journal-moved");
         let session = SessionId::parse("task-e-timeout-drop-refusal").unwrap();
-        let request_id = request_id('f');
-        let identity = ActiveRequestIdentity::Dedicated(request_id.clone());
-        let flight = cleanup_request_flight(&journal_root, &session, request_id);
+        let (identity, flight, journal_root) = cleanup_request_flight(root.path(), &session);
         let observer = Arc::new(DiagnosticOutcomeObserver::new(
             DiagnosticRecordOutcome::Accept,
         ));
@@ -3752,11 +3732,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn task_e_settlement_crossing_expiry_cannot_upgrade_timed_out() {
         let root = tempfile::tempdir().unwrap();
-        let journal_root = root.path().join("journal");
         let session = SessionId::parse("task-e-crossing-success").unwrap();
-        let request_id = request_id('4');
-        let identity = ActiveRequestIdentity::Dedicated(request_id.clone());
-        let flight = cleanup_request_flight(&journal_root, &session, request_id);
+        let (identity, flight, _journal_root) = cleanup_request_flight(root.path(), &session);
         let cell = ApiRequestCleanupCustodianV1::new(94, session, true, Duration::from_millis(200));
         cell.begin_admission().unwrap();
         cell.bind(&identity).unwrap();
@@ -3810,7 +3787,7 @@ mod tests {
         );
         assert_eq!(
             inner.terminal,
-            Some((ResourceActionDispositionV1::Complete, false))
+            Some((ResourceActionDispositionV1::Complete, true))
         );
         drop(inner);
         assert_eq!(
@@ -3823,12 +3800,9 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn task_e_settlement_refusal_crossing_expiry_retains_flight_custody() {
         let root = tempfile::tempdir().unwrap();
-        let journal_root = root.path().join("journal");
         let moved_root = root.path().join("journal-moved");
         let session = SessionId::parse("task-e-crossing-refusal").unwrap();
-        let request_id = request_id('5');
-        let identity = ActiveRequestIdentity::Dedicated(request_id.clone());
-        let flight = cleanup_request_flight(&journal_root, &session, request_id);
+        let (identity, flight, journal_root) = cleanup_request_flight(root.path(), &session);
         let observer = Arc::new(DiagnosticOutcomeObserver::new(
             DiagnosticRecordOutcome::Accept,
         ));

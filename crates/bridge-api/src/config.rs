@@ -2,18 +2,18 @@
 //! backend resolves the key per-prompt (env) and the model per-session (stash);
 //! `ApiConfig` holds only the construction-time defaults.
 use bridge_core::ids::NodeId;
-use bridge_core::process::DurableProcessFlightAttemptV3;
+use bridge_core::remote_request_flight::RemoteRequestDriverV1;
 use std::sync::Arc;
 use std::time::Duration;
 
 #[derive(Debug, Clone)]
 pub struct ApiResourceFlightRouteV3 {
-    pub attempt: Arc<DurableProcessFlightAttemptV3>,
+    pub attempt: Arc<RemoteRequestDriverV1>,
     pub node_id: NodeId,
 }
 
 impl ApiResourceFlightRouteV3 {
-    pub fn new(attempt: Arc<DurableProcessFlightAttemptV3>, node_id: NodeId) -> Self {
+    pub fn new(attempt: Arc<RemoteRequestDriverV1>, node_id: NodeId) -> Self {
         Self { attempt, node_id }
     }
 }

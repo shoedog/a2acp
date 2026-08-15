@@ -1,11 +1,19 @@
 # R2f1b 3c2 implementer handoff — API request-flight authority
 
-Date: 2026-08-12
-Base: `42249b3d926b49afd9d0dbd213d0ee3d3e459af6`
+Date: 2026-08-15
+Base: `a1f1f8de8052385ecc837c6950fe856e331e65de`
 
 ## Outcome
 
-**Superseding status:** this code is a preserved, rejected partial artifact.
+**Task F candidate:** the API V3 route now carries `RemoteRequestDriverV1`; Task B owns atomic mint/admission and Task D arms the real send at its first poll.
+Frozen input was exactly `a1f1f8de`; the focused red command was `CARGO_INCREMENTAL=0 cargo test -p bridge-api --lib task_f_route_carries_the_owned_request_driver -- --nocapture`, admissibly failing E0308 because the route still required `Arc<DurableProcessFlightAttemptV3>`.
+Cleanup records `acknowledged=true` only after Task D returns the exact echoed delivery identity; no-ack remains `Unknown`, while exact echo now projects checked cleanup `Complete`.
+Post-format churn is 367 production lines and 870 total implementation lines (additions plus deletions); documentation and receipts remain accounted separately under the established handoff convention. The ignored fixture ID vector is inert and retained only to preserve cap accounting; Task B mints every exercised V3 ID.
+The cap-selected split is **Task F2**: delete the now crate-private, compiler-unreferenced shared request adapter and its request-only process/resource/retained-flight/reaper support.
+Task G remains unstarted and both production V3 routing and `AutomaticR2f1b` remain unarmed; default API execution is still `LegacyV2`.
+Verification: all `bridge-api` harnesses and docs pass; the remote-request, retained-flight, and reaper core lenses pass; process is 50/51 with only the untouched host-signal descendant test failing identically in isolation in this container.
+
+**Historical pre-salvage status:** this code is a preserved, rejected partial artifact.
 The design escalation has completed and approves salvage through a
 request-specific replacement, but this exact head remains non-foldable. The
 paragraphs below describe what the artifact implemented, not accepted delivery.
