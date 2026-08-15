@@ -278,6 +278,40 @@ All checks passed; no drift found.
   [`2026-08-14-r2f1b-3c2-task-a4-brief.md`](2026-08-14-r2f1b-3c2-task-a4-brief.md);
   it mandates the V1 `revalidate`/path-exposing-lock deletion per the A2
   review ruling and carries the A3 closure rider.
+- 2026-08-15: A4 attempt 1 was a null turn — Authenticate and session config
+  succeeded, the agent completed without edits, no tool trail; the agent's
+  final message is swallowed at info verbosity (the ledgered pipeline gap).
+  Clone `impl-10574-cn0ivrq4` retained clean as self-evidence. One
+  redispatch with debug ACP capture was declared, with a second null
+  parking A4.
+- 2026-08-15: A4 attempt 2 committed `04e5957949575bec053b0739b21d42dc670cbbcf`
+  on `implement/impl-13263-p27sdvl3` (fs_custody +321/−504,
+  namespace_transaction +133/−27, handoff +25). In-container verify PASS all
+  four stages. Advisory Sol/xhigh review REJECT with five claimed BLOCKERs;
+  operator source adjudication (all cited lines verified):
+  **W1 CONFIRMED** — write-blocking debt is an in-memory per-handle
+  `AtomicU8`: namespace `debt`/`protect` never set it, `recover` refuses
+  while set but never clears it (bricked handle), reopen resets it (bypass);
+  the residue-backed debt class remains sound, and residue-free durability
+  uncertainty partially self-heals via later successful route-proof+sync,
+  but the flag mechanics as shipped are internally inconsistent.
+  **W3 CONFIRMED** — admission at exactly 4,096 entries permits creating a
+  4,097th, after which enumeration refuses everywhere and the root is
+  permanently blocked; no per-operation headroom.
+  **W4 CONFIRMED** — `.a2a-v2-*` target names are admitted by
+  `ChildNameV2::from_bytes` and then classified as residue by guard and
+  recovery: a valid call self-poisons the root permanently.
+  **W2 REFUTED** — third instance of the accepted-impossibility
+  check-vs-syscall class under owner ruling 1, sustained by both counted
+  reviews (A2, A3).
+  **W5 CONFIRMED as process** — measured churn 499 production / 1,010 total
+  vs 280/650; the ~500 deletion lines are the mandate itself; content
+  verified in-scope with zero silent files; the implementer reinterpreted
+  the cap as insertions-only (second accounting reinterpretation in the
+  lane). SMELL (thin fail-first evidence on the owned surface) folds into
+  the repair. Population classification: W1/W3/W4 closed, enumerable,
+  bounded → eligible for the standing one-targeted-repair + one-closure
+  path; W5 requires owner size regularization. Awaiting the owner's call.
 
 ## Non-scope reaffirmed
 
