@@ -986,6 +986,44 @@ All checks passed; no drift found.
   the retention-completeness trace, the G2-naming adjudication, and the
   gate-repair disposition all explicit; brief mirrored as
   [`2026-08-15-r2f1b-3c2-task-g-closure-brief.md`](2026-08-15-r2f1b-3c2-task-g-closure-brief.md).
+- 2026-08-15: the G closure adjudicated **W2 and W3 FIXED, the
+  gate-repair disposition SUSTAINED** ("test hardening, rather than
+  Task G attribution, is the correct disposition"), and REJECTed on
+  **W1 PARTIAL** (97/100): the commissioned retention-completeness
+  trace found one more pre-acceptance exit — the preflight
+  turn-metadata mint (`generate_turn_id`/context/operation binding) ran
+  AFTER `configure_session`, and a failure there `?`-returned with
+  `retain_in_run_cache: false` and NO cleanup call, evicting the cell
+  with configured state behind. Two SMELL-DEFERs: the configure-clean
+  eviction regression (test-only) and the base-only churn-accounting
+  ambiguity (folded into the extension's handoff amendment). Artifact
+  mirrored as
+  [`2026-08-15-r2f1b-3c2-task-g-sol-closure.md`](2026-08-15-r2f1b-3c2-task-g-sol-closure.md).
+- Population 3→1 — shrinking, single bounded edge with a class-terminal
+  fix shape — so per the A4/B2/C precedent the operator folded it as
+  the **4th disclosed convergence extension** `2a912d18` (+158/−29),
+  red-first (log `g-ext-red.log`: an injected metadata fault via the
+  established `#[cfg(test)]` ordering-gate discipline drove
+  `preflight_metadata_failure_cannot_leave_configured_state_behind`,
+  which failed pre-hoist at `configures == 0` [actual 1] and passes
+  post-hoist with zero configures/prompts/forgets): every fallible
+  piece of turn metadata is constructed BEFORE the first backend
+  effect, making a metadata failure's eviction the proven-clean case by
+  construction. The extension carries a BINDING second look at the
+  aggregate round. Full bridge-workflow/worktree suites green;
+  workspace clippy clean. Preserved at `salvage/r2f1b-3c2-g-extended`.
+- Host gates on exact `2a912d18` all exit 0: **4,094 passed / 0 failed
+  / 13 ignored across 90 harnesses** (log `g-ext-host-gates.log`),
+  hygiene green, post-gate self-reap ran. **G ACCEPTED at exact
+  `2a912d18` — TASK G COMPLETE** (line `4c8e408b`→`be7baa29`→
+  `f04ec55e`→`2a912d18`; custody at g-candidate/g-repaired/g-final/
+  g-extended).
+- 2026-08-15: **Task G2 dispatched** from exact `2a912d18` — the named
+  one-consumer split: exact typed cleanup dispositions in the smoke
+  artifact's release step (`"completed"` narrowed to exact `Complete`),
+  protective aggregate fold, and an in-repository wire-compatibility
+  enumeration (caps 120/300; brief mirrored as
+  [`2026-08-15-r2f1b-3c2-task-g2-brief.md`](2026-08-15-r2f1b-3c2-task-g2-brief.md)).
 
 ## Non-scope reaffirmed
 
