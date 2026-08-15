@@ -225,6 +225,34 @@ All checks passed; no drift found.
   retire-needs-no-commitment reasoning), R3 mutex-test determinism + full
   retire crash-cut matrix with the residue-disposition ledger note, R4
   normal formatting. One closure review follows; no further rounds.
+- 2026-08-14/15: repair run executed. First dispatch was killed externally
+  mid-verify (owner confirmed not deliberate); the edit turn had already
+  committed, so `implement --resume` finished the deterministic tail without
+  a new model turn. Repair commit `af6d874d` (270 production / 492 total
+  churn, disclosed in-artifact). Advisory review REJECT (RW1-RW4 + 2S);
+  operator source adjudication: RW3 cap breach CONFIRMED → owner regularized
+  the measured sizes; RW4 REFUTED (all nine `rustfmt::skip` attributes
+  inherited from accepted A1/A2, zero introduced); RW1 DOWNGRADED
+  (ENOTSUP-crash-window `NoEffect` is provably true at emission and
+  self-corrects to typed `Unsupported` on the next attempt); RW2 addressed
+  by the completion below rather than refuted-only. In-container verify red
+  = the recorded whole-bin flock-EBADF hermetic class again.
+- 2026-08-15: disclosed operator completion `6114596d` (166/5, ~25
+  production): `finish()` re-verifies the staged commitment immediately
+  before predecessor removal on both replace call sites (red-first: the
+  post-digest in-place mutation test failed at its `Retained` assertion on
+  the pre-change tree, log `a3-t1-red.log`); mutex rider proves queuing via
+  ordering tokens (6/6 repeated); recovery-time unsupported typing,
+  missing-birthtime classification, and both wire commitment-presence
+  negatives pinned. Focused suites 97/0. Line preserved at
+  `salvage/r2f1b-3c2-a3-repaired`.
+- Host gates on exact `6114596d` in the run clone, all exit 0: **4,019
+  passed / 0 failed / 13 ignored across 90 harnesses**, deny green, hygiene
+  40/8 (log: session scratchpad `a3-host-gates.log`).
+- Counted closure review dispatched on the full `3890fa6c..6114596d` line —
+  brief committed beside this record as
+  [`2026-08-14-r2f1b-3c2-task-a3-closure-brief.md`](2026-08-14-r2f1b-3c2-task-a3-closure-brief.md);
+  all six operator adjudications disclosed for contest.
 
 ## Non-scope reaffirmed
 
