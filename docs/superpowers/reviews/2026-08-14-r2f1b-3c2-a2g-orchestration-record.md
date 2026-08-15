@@ -410,6 +410,35 @@ All checks passed; no drift found.
   retirement" (churn caps 500 production / 900 total, B2 split escape
   hatch; brief mirrored as
   [`2026-08-14-r2f1b-3c2-task-b-brief.md`](2026-08-14-r2f1b-3c2-task-b-brief.md)).
+- 2026-08-15: B1 base run: candidate `2815259d` (new module 745 lines +2
+  export; the implementer exercised the authorized B1/B2 split — retirement
+  named as B2). In-container verify red only at clippy (one
+  `needless_borrow`). Advisory review REJECT with six closed blockers, all
+  operator-verified at source (forgeable pub-field authority; nested
+  `AttemptIdentity` accepts unknown fields; duplicate mint published;
+  over-cap maps to a generic Task A refusal; the clippy lint; 505/500
+  production). Candidate preserved at `salvage/r2f1b-3c2-b1-candidate`;
+  targeted repair declared (120/300 churn; mirror
+  [`2026-08-14-r2f1b-3c2-task-b-repair-brief.md`](2026-08-14-r2f1b-3c2-task-b-repair-brief.md)).
+- 2026-08-15: targeted repair `02a14298` (+172/−38 module +26 handoff = 236
+  churn, within caps). Its advisory review confirmed ALL SIX repairs
+  delivered and the cap genuinely met (exactly 500 production vs
+  `d8ec93ad`), rejecting only on (a) a false handoff accounting line and
+  (b) the in-container aggregate red — the whole-bin flock-EBADF hermetic
+  class again (4th lane instance, same signature, untouched harness). One
+  SMELL deferred: duplicate-mint refusal leaves the handle requiring
+  reopen.
+- 2026-08-15: operator docs-only correction `6033fd34`: accounting fixed
+  (+43/−38 production churn; 381 test-only module additions recorded) and
+  the duplicate-mint fail-closed reopen recorded as intentional policy
+  (a repeated CSPRNG identity impeaches the identity source; freezing the
+  handle is protective) — submitted to the closure lens. Head preserved at
+  `salvage/r2f1b-3c2-b1-repaired`.
+- Host gates on exact `6033fd34` all exit 0: **4,034 passed / 0 failed /
+  13 ignored across 90 harnesses**, hygiene 40/8 (log `b-host-gates.log`).
+- Counted closure dispatched on the full `d8ec93ad..6033fd34` line; brief
+  mirrored as
+  [`2026-08-14-r2f1b-3c2-task-b-closure-brief.md`](2026-08-14-r2f1b-3c2-task-b-closure-brief.md).
 
 ## Non-scope reaffirmed
 
