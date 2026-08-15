@@ -1106,12 +1106,22 @@ impl JournalRootOperationV2<'_> {
             Ok(())
         }
     }
+    fn refuse_debt(&self, label: &str) -> Result<(), JournalMutationOutcomeV2> {
+        if self.debt() {
+            Err(JournalMutationOutcomeV2::ProtectiveDebt(format!(
+                "{label}: protective debt"
+            )))
+        } else {
+            Ok(())
+        }
+    }
     pub(crate) fn guard(
         &self,
         allowed: Option<&ChildNameV2>,
         footprint: usize,
         label: &str,
     ) -> Result<(), JournalMutationOutcomeV2> {
+        self.refuse_debt(label)?;
         self.prove_route_v2(label)
             .map_err(|error| self.failed(error, false))?;
         let names = match enumerate_directory_names(self.root_file(), 4096, label) {
@@ -1205,6 +1215,7 @@ impl JournalRootOperationV2<'_> {
         bytes: &[u8],
         label: &str,
     ) -> Result<FileContentSnapshotV2, JournalMutationOutcomeV2> {
+        self.refuse_debt(label)?;
         self.refuse_reserved_target(target)?;
         self.guard(None, 1, label)?;
         let name = ChildNameV2::reserved(ReservedNameNamespaceV2::Staging, target)
@@ -1233,6 +1244,7 @@ impl JournalRootOperationV2<'_> {
         label: &str,
         before_publish: F,
     ) -> Result<FileContentSnapshotV2, JournalMutationOutcomeV2> {
+        self.refuse_debt(label)?;
         self.refuse_reserved_target(target)?;
         let name = ChildNameV2::reserved(ReservedNameNamespaceV2::Staging, target)
             .map_err(|error| self.failed(error, false))?;
@@ -1273,6 +1285,7 @@ impl JournalRootOperationV2<'_> {
         bytes: &[u8],
         label: &str,
     ) -> Result<FileContentSnapshotV2, JournalMutationOutcomeV2> {
+        self.refuse_debt(label)?;
         self.refuse_reserved_target(name)?;
         self.guard(None, 1, label)?;
         let file = open_regular_child_for_update(self.root_file(), name.as_os_str(), true, label)
@@ -5328,6 +5341,78 @@ mod tests {
                     ));
                     assert_eq!(fs::read_dir(&case.root).unwrap().count(), 1);
                     assert_eq!(fs::read(case.root.join(target.as_os_str())).unwrap(), b"A");
+                }
+            }
+        }
+
+        #[test]
+        fn journal_recorded_debt_dominates_reserved_and_route_refusals() {
+            let case = route_case();
+            fill_root_to(&case, 4096);
+            let custody =
+                JournalRootCustodyV2::open(&case.anchor, &case.binding, "debt dominates").unwrap();
+            let operation = custody.begin_operation("debt dominates").unwrap();
+            let record = ChildNameV2::from_bytes(b"record").unwrap();
+            assert!(matches!(
+                operation.stage(&record, b"A", "capacity debt"),
+                Err(JournalMutationOutcomeV2::ProtectiveDebt(_))
+            ));
+            assert!(operation.debt());
+            let sample = required_file_content_snapshot_v2(
+                &File::open(case.root.join("ordinary-0")).unwrap(),
+                "sample",
+            )
+            .unwrap();
+            let reserved = ChildNameV2::from_bytes(b".a2a-v2-x").unwrap();
+            for outcome in [
+                operation.stage(&reserved, b"B", "reserved on debt"),
+                operation.publish(&reserved, sample, "reserved on debt"),
+                operation.append(
+                    &reserved,
+                    sample,
+                    sample.content_len,
+                    b"B",
+                    "reserved on debt",
+                ),
+            ] {
+                assert!(
+                    matches!(outcome, Err(JournalMutationOutcomeV2::ProtectiveDebt(_))),
+                    "{outcome:?}"
+                );
+            }
+            fs::rename(&case.root, case.root.with_file_name("journal-moved")).unwrap();
+            assert!(matches!(
+                operation.stage(&record, b"A", "route loss on debt"),
+                Err(JournalMutationOutcomeV2::ProtectiveDebt(_))
+            ));
+        }
+
+        #[test]
+        fn journal_append_reserves_capacity_headroom() {
+            for count in [4095, 4096] {
+                let case = route_case();
+                fs::write(case.root.join("record"), b"A").unwrap();
+                fill_root_to(&case, count);
+                let custody =
+                    JournalRootCustodyV2::open(&case.anchor, &case.binding, "append capacity")
+                        .unwrap();
+                let operation = custody.begin_operation("append capacity").unwrap();
+                let record = ChildNameV2::from_bytes(b"record").unwrap();
+                let expected = required_file_content_snapshot_v2(
+                    &File::open(case.root.join("record")).unwrap(),
+                    "append capacity",
+                )
+                .unwrap();
+                let outcome = operation.append(&record, expected, 1, b"B", "append capacity");
+                if count == 4095 {
+                    assert!(outcome.is_ok(), "{outcome:?}");
+                    assert_eq!(fs::read(case.root.join("record")).unwrap(), b"AB");
+                } else {
+                    assert!(matches!(
+                        outcome,
+                        Err(JournalMutationOutcomeV2::ProtectiveDebt(_))
+                    ));
+                    assert_eq!(fs::read(case.root.join("record")).unwrap(), b"A");
                 }
             }
         }
