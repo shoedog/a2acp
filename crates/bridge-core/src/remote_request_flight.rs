@@ -317,15 +317,34 @@ impl RemoteRequestJournalV1 {
             .collect::<Vec<_>>();
         let orphan = match ahead.as_slice() {
             [] => None,
+            // An active child at exactly the checkpoint ordinal is the proven
+            // step-5 orphan; a pre-send failure there is the resumable
+            // intermediate of an interrupted heal (relabel done, checkpoint
+            // advance pending).
             [child]
                 if child.ordinal == census.checkpoint.next_ordinal
-                    && child.status == (ChildStateV1::Active {}) =>
+                    && matches!(
+                        child.status,
+                        ChildStateV1::Active {} | ChildStateV1::PreSendFailure {}
+                    ) =>
             {
                 Some(*child)
             }
             _ => return Err(Refusal::ReopenRequired("ambiguous request ordinal census")),
         };
         if let Some(child) = orphan {
+            // Relabel first so a crash between the two durable steps leaves
+            // the recognizable resumable intermediate, never an active child
+            // stranded below the checkpoint.
+            if child.status == (ChildStateV1::Active {}) {
+                Self::replace_child(
+                    &operation,
+                    child,
+                    ChildStateV1::PreSendFailure {},
+                    "close orphan request",
+                )?;
+                sync(operation.sync("sync closed orphan"))?;
+            }
             let next = census
                 .checkpoint
                 .next_ordinal
@@ -340,16 +359,10 @@ impl RemoteRequestJournalV1 {
                 "heal orphan checkpoint",
             );
             #[cfg(test)]
-            task_a_transaction_boundary(TaskABoundaryV1::Replace, healed)?;
+            task_a_transaction_boundary(TaskABoundaryV1::HealCheckpoint, healed)?;
             #[cfg(not(test))]
             transaction(healed)?;
             sync(operation.sync("sync healed checkpoint"))?;
-            Self::replace_child(
-                &operation,
-                child,
-                ChildStateV1::PreSendFailure {},
-                "close orphan request",
-            )?;
         }
         for child in &census.children {
             match child.status {
@@ -637,26 +650,32 @@ impl RemoteRequestJournalV1 {
             let _snapshot = mutation(published)?;
             #[cfg(test)]
             boundary(_cut, 3, "request root sync")?;
+            let root_synced = op.sync("sync request root");
             #[cfg(test)]
-            task_a_boundary(TaskABoundaryV1::Sync)?;
-            sync(op.sync("sync request root"))?;
+            task_a_sync_boundary(TaskABoundaryV1::Sync, root_synced)?;
+            #[cfg(not(test))]
+            sync(root_synced)?;
             #[cfg(test)]
             boundary(_cut, 4, "checkpoint advance")?;
             let checkpoint = checkpoint(&self.attempt, next);
-            #[cfg(test)]
-            task_a_boundary(TaskABoundaryV1::Replace)?;
-            transaction(NamespaceTransactionV2::replace(
+            let advanced = NamespaceTransactionV2::replace(
                 &op,
                 Self::checkpoint_name(),
                 census.checkpoint_snapshot.object,
                 &encoded(&checkpoint)?,
                 "advance checkpoint",
-            ))?;
+            );
+            #[cfg(test)]
+            task_a_transaction_boundary(TaskABoundaryV1::Replace, advanced)?;
+            #[cfg(not(test))]
+            transaction(advanced)?;
             #[cfg(test)]
             boundary(_cut, 5, "checkpoint sync")?;
+            let checkpoint_synced = op.sync("sync advanced checkpoint");
             #[cfg(test)]
-            task_a_boundary(TaskABoundaryV1::Sync)?;
-            sync(op.sync("sync advanced checkpoint"))?;
+            task_a_sync_boundary(TaskABoundaryV1::Sync, checkpoint_synced)?;
+            #[cfg(not(test))]
+            sync(checkpoint_synced)?;
             Ok(RemoteRequestAuthorityV1 {
                 request_id: wire.request_id,
             })
@@ -744,9 +763,11 @@ impl RemoteRequestJournalV1 {
             Self::retire_child(&op, child, "unlink acknowledged request")?;
             #[cfg(test)]
             boundary(_cut, 1, "after acknowledged unlink")?;
+            let retirement_synced = op.sync("sync acknowledged retirement");
             #[cfg(test)]
-            task_a_boundary(TaskABoundaryV1::Sync)?;
-            sync(op.sync("sync acknowledged retirement"))?;
+            task_a_sync_boundary(TaskABoundaryV1::Sync, retirement_synced)?;
+            #[cfg(not(test))]
+            sync(retirement_synced)?;
             #[cfg(test)]
             boundary(_cut, 2, "after acknowledged root sync")?;
             Ok(())
@@ -812,6 +833,7 @@ enum TaskABoundaryV1 {
     Replace,
     Retire,
     Sync,
+    HealCheckpoint,
 }
 #[cfg(test)]
 thread_local! {
@@ -888,6 +910,28 @@ fn task_a_transaction_boundary(
 #[cfg(test)]
 fn task_a_boundary(boundary: TaskABoundaryV1) -> FlightResult<()> {
     task_a_journal_boundary(boundary, Ok(()))
+}
+#[cfg(test)]
+fn task_a_sync_boundary(
+    boundary: TaskABoundaryV1,
+    actual: JournalMutationOutcomeV2,
+) -> FlightResult<()> {
+    use InjectedTaskAOutcomeV1 as I;
+    use JournalMutationOutcomeV2 as J;
+    match take_task_a_boundary(boundary) {
+        None => sync(actual),
+        Some(I::IoUnknown) => Err(fs(FsCustodyError::Io(
+            "injected".into(),
+            std::io::Error::other("injected"),
+        ))),
+        Some(value) => sync(match value {
+            I::Refused => J::Refused("injected".into()),
+            I::Retained => J::Retained("injected".into()),
+            I::Unsupported => J::Unsupported("injected".into()),
+            I::ProtectiveDebt => J::ProtectiveDebt("injected".into()),
+            I::IoUnknown => unreachable!(),
+        }),
+    }
 }
 #[cfg(test)]
 mod tests {
@@ -1441,6 +1485,95 @@ mod tests {
             drop(reopened);
             assert_eq!(root_bytes(&case), before);
         }
+    }
+
+    #[test]
+    fn remote_request_flight_interrupted_orphan_heal_resumes_and_stays_idempotent() {
+        let case = case();
+        let mut journal = initialized(&case, 16);
+        assert!(journal
+            .admit_with_boundary(owner(0), || Ok(request(0)), 4)
+            .is_err());
+        // Construct the relabel-first intermediate: the orphan already closed
+        // as a pre-send failure, but the checkpoint has not advanced.
+        let op = journal
+            .custody
+            .begin_operation("construct heal intermediate")
+            .unwrap();
+        let census = journal.scan(&op).unwrap();
+        assert_eq!(census.checkpoint.next_ordinal, 0);
+        assert_eq!(census.children[0].status, ChildStateV1::Active {});
+        RemoteRequestJournalV1::replace_child(
+            &op,
+            &census.children[0],
+            ChildStateV1::PreSendFailure {},
+            "construct heal intermediate",
+        )
+        .unwrap();
+        drop(op);
+        drop(journal);
+
+        // Reopen must resume the interrupted heal by advancing the checkpoint
+        // past the already-closed orphan instead of refusing.
+        let reopened =
+            RemoteRequestJournalV1::open_with_capacity(custody(&case), attempt(), 16).unwrap();
+        let op = reopened
+            .custody
+            .begin_operation("inspect resumed heal")
+            .unwrap();
+        let census = reopened.scan(&op).unwrap();
+        assert_eq!(census.checkpoint.next_ordinal, 1);
+        assert_eq!(census.children[0].status, ChildStateV1::PreSendFailure {});
+        drop(op);
+        drop(reopened);
+        let healed = root_bytes(&case);
+        drop(RemoteRequestJournalV1::open_with_capacity(custody(&case), attempt(), 16).unwrap());
+        assert_eq!(root_bytes(&case), healed);
+    }
+
+    #[test]
+    fn remote_request_flight_heal_checkpoint_seam_runs_the_real_adapter() {
+        let case = case();
+        let mut journal = initialized(&case, 16);
+        assert!(journal
+            .admit_with_boundary(owner(0), || Ok(request(0)), 4)
+            .is_err());
+        drop(journal);
+        inject_task_a_boundary_for_test(
+            TaskABoundaryV1::HealCheckpoint,
+            InjectedTaskAOutcomeV1::IoUnknown,
+        );
+        assert!(RemoteRequestJournalV1::open_with_capacity(custody(&case), attempt(), 16).is_err());
+        // The real adapter executed under injection, so relabel and checkpoint
+        // advance are durable and the next reopen is clean.
+        let reopened =
+            RemoteRequestJournalV1::open_with_capacity(custody(&case), attempt(), 16).unwrap();
+        let op = reopened
+            .custody
+            .begin_operation("inspect seam heal")
+            .unwrap();
+        let census = reopened.scan(&op).unwrap();
+        assert_eq!(census.checkpoint.next_ordinal, 1);
+        assert_eq!(census.children[0].status, ChildStateV1::PreSendFailure {});
+        drop(op);
+        drop(reopened);
+    }
+
+    #[test]
+    fn remote_request_flight_admission_checkpoint_seam_runs_the_real_adapter() {
+        let case = case();
+        let mut journal = initialized(&case, 16);
+        let checkpoint_before = fs::read(case.root.join(CHECKPOINT_CHILD_V1)).unwrap();
+        inject_task_a_boundary_for_test(
+            TaskABoundaryV1::Replace,
+            InjectedTaskAOutcomeV1::IoUnknown,
+        );
+        assert!(journal.admit_with(owner(0), || Ok(request(0))).is_err());
+        assert_ne!(
+            fs::read(case.root.join(CHECKPOINT_CHILD_V1)).unwrap(),
+            checkpoint_before,
+            "the production checkpoint-advance adapter must execute"
+        );
     }
 
     #[test]

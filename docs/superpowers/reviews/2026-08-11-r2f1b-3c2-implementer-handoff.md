@@ -644,3 +644,32 @@ Post-unlink and post-zero-link Task A crash states have the same durable absent-
 
 The required aggregate command passed 137 / 0 with 494 filtered; focused `remote_request_flight` is 19 / 0 with 612 filtered, and production `cargo check -p bridge-core --lib --locked --offline` passes. `git diff --check` and direct `rustfmt --check --edition 2021` pass; required `cargo fmt --all -- --check` was run but this Cargo has no `fmt` subcommand, and no `rustfmt::skip` was added.
 Versus `6115c93e`: production +68/-31 (99 churn), colocated tests +259/-22 (281), and this handoff +17 = 397 total. Versus `6033fd34`: production +269/-33 (302), tests +563/-21 (584), and handoff +45 = 931 total. Tasks C-G, production V3, callers/routes, providers, smoke, compatibility, deployment, fold, push, and the running operator remain unarmed.
+
+### Task B2 operator completion and convergence extension (exact head record)
+
+Operator completion `2e472a09` (+43/-21) drove stage, acknowledgement
+replacement, and orphan-checkpoint healing through the wrap-actual injection
+seam red-first, fixed the three prescribed clippy lints, and narrowed the
+`request_paths` helper to published children. Cumulative accounting at that
+head versus `6033fd34`: module +859/-59 (production +279/-34, tests
++580/-25) plus handoff +45; versus `6115c93e` the repair-line churn was 455
+total (production 130), 55 above the originally declared 400 — recorded here
+as the disclosed operator authorization.
+
+The B2 closure review returned one blocker: heal ordering advanced the
+checkpoint before relabeling the orphan, so an interrupted heal stranded a
+proven never-issued child as active below the checkpoint. Under the
+disclosed operator convergence extension (population 3 -> 2 -> 1 across
+rounds, non-repeating classes), the current head reorders healing —
+relabel to pre-send failure first, sync, then advance the checkpoint — and
+reopen recognizes the unique pre-send-failure child at exactly
+`checkpoint.next_ordinal` as the resumable intermediate, completing it
+idempotently. The heal checkpoint advance carries its own injection
+boundary; admission checkpoint advance and all three root-sync sites now
+consume real adapter results through wrap-actual seams. Red evidence: the
+resume, heal-seam, and admission-checkpoint-seam regressions all failed on
+the pre-change head (retained log). The mid-retire permanent-`Retained`
+residual remains the accepted, owner-ledgered Task A semantics; the
+below-checkpoint send-state discrimination remains Task C scope, as does
+the attempt-bound authority identity. Tasks C-G and production V3 remain
+unarmed.
