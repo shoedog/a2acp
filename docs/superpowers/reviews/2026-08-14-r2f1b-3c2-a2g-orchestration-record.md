@@ -850,6 +850,26 @@ All checks passed; no drift found.
   restated inline because the salvage plan file is not in the clone's
   lineage; brief mirrored as
   [`2026-08-15-r2f1b-3c2-task-f-closure-brief.md`](2026-08-15-r2f1b-3c2-task-f-closure-brief.md).
+- 2026-08-15: **counted closure APPROVE — all three prior WRONGs FIXED,
+  every disclosed operator-completion concern sustained, no new WRONGs**
+  (95/100; source-confirmed: core appends `ProviderSendArmed` → marker
+  → first inner poll; exact-echo-only acknowledged `Complete`;
+  zero-round streams never reach admission; recovery table honored; the
+  seven F2 allowances scoped with zero production references; the
+  `Debug` impl semantics-free; production V3 `None` at `main.rs`). Two
+  SMELL-DEFERs to the aggregate ledger: a test-only poll barrier around
+  the real `RequestBuilder::send()` future (public-path first-poll
+  ordering), and refusing/mismatched-publisher end-to-end API cleanup
+  tests. **F ACCEPTED at exact `15912e3a` — TASK F COMPLETE**, with F2
+  removal mandatory before the aggregate round (custody at
+  `salvage/r2f1b-3c2-f-completed`; artifact mirrored as
+  [`2026-08-15-r2f1b-3c2-task-f-sol-closure.md`](2026-08-15-r2f1b-3c2-task-f-sol-closure.md)).
+- 2026-08-15: **Task F2 dispatched** from exact `15912e3a` — the named
+  split: delete the retained adapter population (the seven
+  host-enumerated items and their allowances), pure deletion with a
+  workspace-wide reference census as evidence; caps 50 added
+  production/600 total (brief mirrored as
+  [`2026-08-15-r2f1b-3c2-task-f2-brief.md`](2026-08-15-r2f1b-3c2-task-f2-brief.md)).
 
 ## Non-scope reaffirmed
 
