@@ -27,6 +27,8 @@ pub mod profile;
 pub mod provider;
 #[cfg(unix)]
 pub mod reaper;
+#[cfg(unix)]
+pub mod remote_request_flight;
 pub mod resource_flight;
 pub mod retained_resource_flight;
 #[cfg(unix)]
