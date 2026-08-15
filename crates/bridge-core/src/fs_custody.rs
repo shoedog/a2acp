@@ -356,6 +356,12 @@ where
     boundary(false);
     let captured = match rename(parent, &target_c, &custody_c) {
         Err(RenameNoReplaceRefusalV1::PlatformUnsupported) => return CompileUnsupported,
+        Err(RenameNoReplaceRefusalV1::Io(error))
+            if [libc::ENOSYS, libc::ENOTSUP, libc::EOPNOTSUPP]
+                .contains(&error.raw_os_error().unwrap_or_default()) =>
+        {
+            return RuntimeUnsupported(format!("{label}: {error}"))
+        }
         Err(RenameNoReplaceRefusalV1::Io(error)) => {
             return Unknown(format!("{label}: capture outcome is unknown: {error}"))
         }
@@ -951,19 +957,27 @@ impl JournalRootCustodyV2 {
         &self,
         label: &str,
     ) -> Result<JournalRootOperationV2<'_>, FsCustodyError> {
-        self.begin_operation_with(label, |file| crate::liveness::flock_nb(file, true), || {})
+        self.begin_operation_with(
+            label,
+            || {},
+            |file| crate::liveness::flock_nb(file, true),
+            || {},
+        )
     }
 
-    fn begin_operation_with<F, H>(
+    fn begin_operation_with<E, F, H>(
         &self,
         label: &str,
+        entered: E,
         try_flock: F,
         after_lock: H,
     ) -> Result<JournalRootOperationV2<'_>, FsCustodyError>
     where
+        E: FnOnce(),
         F: FnOnce(&File) -> std::io::Result<bool>,
         H: FnOnce(),
     {
+        entered();
         let mutex = self.operation_mutex.lock().map_err(|_| {
             FsCustodyError::Unsupported(format!("{label}: operation mutex is poisoned"))
         })?;
@@ -5215,6 +5229,7 @@ mod tests {
                 .unwrap();
                 assert_identity_refusal(custody.begin_operation_with(
                     "after-lock replacement",
+                    || {},
                     flock,
                     || replace(&case, replaced),
                 ));
@@ -5260,15 +5275,20 @@ mod tests {
             let custody =
                 JournalRootCustodyV2::open(&case.anchor, &case.binding, "stale route").unwrap();
             let held_new = std::cell::RefCell::new(None);
-            assert_identity_refusal(custody.begin_operation_with("stale route", flock, || {
-                replace(&case, Replaced::Root);
-                fs::rename(&case.lock, case.parent.join("old-operation.lock")).unwrap();
-                fs::write(&case.lock, b"new cell").unwrap();
-                let held = File::open(&case.lock).unwrap();
-                assert!(flock(&held).unwrap());
-                assert!(!flock(&File::open(&case.lock).unwrap()).unwrap());
-                *held_new.borrow_mut() = Some(held);
-            }));
+            assert_identity_refusal(custody.begin_operation_with(
+                "stale route",
+                || {},
+                flock,
+                || {
+                    replace(&case, Replaced::Root);
+                    fs::rename(&case.lock, case.parent.join("old-operation.lock")).unwrap();
+                    fs::write(&case.lock, b"new cell").unwrap();
+                    let held = File::open(&case.lock).unwrap();
+                    assert!(flock(&held).unwrap());
+                    assert!(!flock(&File::open(&case.lock).unwrap()).unwrap());
+                    *held_new.borrow_mut() = Some(held);
+                },
+            ));
             let new_binding = binding(&case);
             let current =
                 JournalRootCustodyV2::open(&case.anchor, &new_binding, "current route").unwrap();
@@ -5310,9 +5330,16 @@ mod tests {
             let (done_tx, done_rx) = mpsc::channel();
             let peer = Arc::clone(&custody);
             let thread = std::thread::spawn(move || {
-                entered_tx.send(()).unwrap();
                 done_tx
-                    .send(peer.begin_operation("queued same-cell operation").is_ok())
+                    .send(
+                        peer.begin_operation_with(
+                            "queued same-cell operation",
+                            || entered_tx.send(()).unwrap(),
+                            flock,
+                            || {},
+                        )
+                        .is_ok(),
+                    )
                     .unwrap();
             });
             entered_rx.recv().unwrap();
@@ -5351,6 +5378,7 @@ mod tests {
             let after_lock = Cell::new(0);
             let result = custody.begin_operation_with(
                 "unsupported flock",
+                || {},
                 |_| {
                     flock_calls.set(flock_calls.get() + 1);
                     Err(std::io::Error::from_raw_os_error(libc::ENOTSUP))
@@ -5782,6 +5810,7 @@ mod tests {
                 );
                 assert!(match case {
                     0 => matches!(outcome, CustodyCaptureOutcomeV2::CompileUnsupported),
+                    1 => matches!(outcome, CustodyCaptureOutcomeV2::RuntimeUnsupported(_)),
                     _ => matches!(outcome, CustodyCaptureOutcomeV2::Unknown(_)),
                 });
                 assert_eq!(calls.get(), 1, "one no-replace attempt and zero fallbacks");

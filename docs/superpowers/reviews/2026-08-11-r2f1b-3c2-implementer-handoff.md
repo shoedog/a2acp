@@ -474,45 +474,20 @@ Changed paths are `crates/bridge-core/src/fs_custody.rs`, the one visibility lin
 
 A3-A4, Task B, production V3, shared journal/request state, API/HTTP, live providers, smoke, compatibility, deployment, fold, push, and the running operator remain unarmed and unchanged.
 
-## Task A3 capture settlement and bounded crash recovery
+## Task A3 owner-authorized targeted repair
 
-Date: 2026-08-14.
-Frozen input: `3890fa6c295abcf92055940816c162c781d824bf`.
+Date: 2026-08-15. Frozen input: `b1b55a218c0b78213ec4a719ab96831cd766bd87`.
 
 ### Admissible red evidence
 
-Exact pre-production command:
-```text
-CARGO_INCREMENTAL=0 cargo test -p bridge-core --locked --offline namespace_transaction -- --nocapture
-```
-Cargo reached `bridge-core` and failed nonzero with three `E0425` errors naming only the absent `NamespaceTransactionV2`, `NamespaceRecoveryTicketV2`, and `NamespaceTransactionOutcomeV2` APIs.
-This was neither dependency/network refusal nor a zero-selected selector; an earlier malformed test scaffold is not counted.
-The four A2 riders are mutation-style regressions: removing anchor schedule coverage, the process mutex, the root/lock distinct-name check, or the non-Unix refusal makes its corresponding focused assertion fail.
+- `CARGO_INCREMENTAL=0 cargo test -p bridge-core --locked --offline namespace_transaction -- --nocapture`: 9 tests selected; the same-inode/same-length corruption regression failed because recovery returned `Complete`; the snapshot-only live path had the same defect.
+- `CARGO_INCREMENTAL=0 cargo test -p bridge-core --locked --offline custody_v2_compile_unsupported_and_io_are_typed_without_fallback -- --nocapture`: 1 test selected and failed because injected `ENOTSUP` was `Unknown`, not `RuntimeUnsupported`.
+- The namespace command's earlier compile-red named the absent deterministic identity/capture and mutex-entry seams. All reds reached `bridge-core`; none was dependency/network refusal or a zero-selected selector.
 
-### Result and limits
+### Result and verification
 
-Under the held `JournalRootOperationV2` lease, replace and retire now use synced immutable intents and distinct stage, swap, and del namespaces with descriptor-relative no-replace transitions.
-Replace rolls exact A back after a pre-publication crash, otherwise verifies the committed successor before identity-checked retirement and zero-link proof; retire rolls authorized capture forward.
-Malformed, duplicate, foreign, over-cap, substituted, or ambiguous residue is preserved as typed protective debt, and repeated recovery reaches a stable outcome.
-No drop cleanup, path/replacing rename, link/copy, unchecked unlink, success helper, or outcome-flattening `Result<(), _>` exists in the new surface.
-
-Changed paths:
-- `crates/bridge-core/src/namespace_transaction.rs` (new transaction/recovery surface and focused tests)
-- `crates/bridge-core/src/fs_custody.rs` (narrow custody access plus A2 riders)
-- `crates/bridge-core/src/lib.rs` (Unix module export)
-- this handoff
-
-Delta from the frozen input: 320 production + 281 colocated-test + 43 handoff = 644 changed lines.
-
-### Verification
-
-- `namespace_transaction`: 8 passed, 0 failed.
-- `journal_route_custody_v2`: 7 passed, 0 failed.
-- `custody_v2`: 18 passed, 0 failed.
-- `fs_custody`: 84 passed, 0 failed.
-- `git diff --check`: exit 0.
-- Required `cargo fmt --all -- --check` could not start because this Cargo installation has no `fmt` subcommand.
-- Available equivalent `rustfmt --check --edition 2021` on both changed implementation files: exit 0.
-
-Full workspace tests/check/clippy, release build, repository hygiene, live providers, smoke, compatibility, deployment, fold, push, and running-operator actions were excluded.
-A4, Task B, production V3, shared journal/request state, API/HTTP, and every production caller remain unarmed and unchanged.
+Typed custody failures now survive setup, cleanup, and recovery; pre-stage incapacity creates no residue, while runtime capture incapacity rolls back its synced stage/intent before returning `Unsupported`. Immutable replace intents bind streamed SHA-256 successor content; live/recovery mismatches retain swap and never complete.
+Retire persists no digest because its held-descriptor zero-link proof establishes exact predecessor removal. Its six-cut matrix pins `NoEffect`, `Complete`, `Retained`, or `Ready`; post-unlink/zero-link `Retained` remains permanent protective debt, with residue disposition reserved to the later-slice ledger.
+Changed paths: `namespace_transaction.rs`, narrow `fs_custody.rs`, and this handoff. Normal-format source delta: +116 net production (193 insertions/77 deletions) and +105 net focused tests (140/35); this 17-line handoff replaces the prior 42-line section.
+Focused aggregate: 93/0; `namespace_transaction` 9/0, `custody_v2` 18/0, `journal_route_custody_v2` 7/0, `fs_custody` 84/0. `git diff --check` and direct `rustfmt --check --edition 2021` are green; required `cargo fmt --all -- --check` cannot start because this Cargo has no `fmt` subcommand.
+A4, Task B, production V3, every production caller, live providers, smoke, compatibility, deployment, fold, push, and the running operator remain unarmed and unchanged.
