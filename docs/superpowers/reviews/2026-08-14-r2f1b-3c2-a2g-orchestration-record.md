@@ -439,6 +439,25 @@ All checks passed; no drift found.
 - Counted closure dispatched on the full `d8ec93ad..6033fd34` line; brief
   mirrored as
   [`2026-08-14-r2f1b-3c2-task-b-closure-brief.md`](2026-08-14-r2f1b-3c2-task-b-closure-brief.md).
+- 2026-08-15: **B1 ACCEPTED at exact `6033fd34`.** The counted closure
+  returned `VERDICT: APPROVE` — **0 WRONG / 3 SMELL-DEFER** at 92/100
+  (artifact SHA-256 `d3ba8b9e…cbdb`, mirrored as
+  [`2026-08-14-r2f1b-3c2-task-b1-sol-closure.md`](2026-08-14-r2f1b-3c2-task-b1-sol-closure.md)).
+  All six inherited findings FIXED; accounting resolved; admission
+  atomicity, protective consumption, capacity arithmetic, strict decoding,
+  sealed authority, and scope all passed; the B1/B2 split ruled valid with
+  nothing foreclosed; the duplicate-mint fail-closed reopen ruled sound
+  policy; the flock-EBADF classification called credible-but-inferred (the
+  lens noted no same-container base control was supplied — standing note:
+  the class blocks nothing and the control runs if any round disputes it).
+  Custody consolidated at `salvage/r2f1b-3c2-b1-accepted`.
+- Carry-forwards: B2 riders = real Task A fault seams (SMELL-1) + owner
+  validation (SMELL-2); Task C rider = attempt-bound authority identity
+  before any consumer integration (SMELL-3).
+- 2026-08-15: **Task B2 dispatched** from exact `6033fd34` — acknowledged
+  retirement, reopen self-healing, sequential throughput, both riders
+  (caps 350/700 churn; brief mirrored as
+  [`2026-08-14-r2f1b-3c2-task-b2-brief.md`](2026-08-14-r2f1b-3c2-task-b2-brief.md)).
 
 ## Non-scope reaffirmed
 
