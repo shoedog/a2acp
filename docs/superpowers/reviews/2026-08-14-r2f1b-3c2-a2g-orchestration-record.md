@@ -870,6 +870,34 @@ All checks passed; no drift found.
   workspace-wide reference census as evidence; caps 50 added
   production/600 total (brief mirrored as
   [`2026-08-15-r2f1b-3c2-task-f2-brief.md`](2026-08-15-r2f1b-3c2-task-f2-brief.md)).
+- 2026-08-15: F2 run: candidate `b3e354ab` (production +3/−395, total
+  451, within caps; in-container verify fully green with the allowances
+  gone). The advisory review verified the deletion correctly scoped —
+  census clean, live `RemoteRequestDriverV1` path byte-identical, two
+  deleted tests justified as only-deleted-seam — and REJECTed on
+  exactly ONE delivery finding: the implementer's handoff recorded the
+  mandatory focused core selector red (128/129 twice at
+  `term_ignoring_child_with_descendant_is_group_killed_host_signal_semantics`)
+  without a green exact-command run. Candidate preserved at
+  `salvage/r2f1b-3c2-f2-candidate`.
+- Operator adjudication: the exact selector on host at `b3e354ab` =
+  **129/129 green** with the disputed test explicitly ok (log
+  `f2-focused-host.log`); same-environment control — the same container
+  session's later verify test stage ran GREEN after the two failures;
+  the test is byte-identical to base, the diff deletion-only, and the
+  Task F line recorded the same sole in-container failure once before.
+  Classified: container signal-semantics flake (process-group kill
+  visibility), joining the hermetic ledger. Disclosed operator docs
+  completion `f17e2bd3` (+30 handoff lines, zero code) records the
+  dated exact-command evidence — the advisory reviewer's own stated
+  collapse condition. Preserved at `salvage/r2f1b-3c2-f2-completed`.
+- Host gates on exact `f17e2bd3` all exit 0: **4,088 passed / 0 failed
+  / 13 ignored across 90 harnesses** (log `f2-host-gates.log`; down
+  exactly the two deleted adapter-only tests), hygiene green, post-gate
+  self-reap ran.
+- Counted closure dispatched on the full `15912e3a..f17e2bd3` line;
+  brief mirrored as
+  [`2026-08-15-r2f1b-3c2-task-f2-closure-brief.md`](2026-08-15-r2f1b-3c2-task-f2-closure-brief.md).
 
 ## Non-scope reaffirmed
 
