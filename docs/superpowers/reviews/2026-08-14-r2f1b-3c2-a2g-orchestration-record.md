@@ -898,6 +898,26 @@ All checks passed; no drift found.
 - Counted closure dispatched on the full `15912e3a..f17e2bd3` line;
   brief mirrored as
   [`2026-08-15-r2f1b-3c2-task-f2-closure-brief.md`](2026-08-15-r2f1b-3c2-task-f2-closure-brief.md).
+- 2026-08-15: **counted closure APPROVE — the advisory blocker FIXED on
+  its own collapse condition, deletion census confirmed at both ends,
+  live path byte-identical** (98/100). One inherited SMELL-DEFER to the
+  aggregate ledger: the signal-semantics test's own construction (fixed
+  200 ms sleeps; strict process-entry absence while the leader
+  assertion accepts zombies) explains the container flake — bounded
+  test-only fix prescribed (poll with `Z`-as-terminated plus a
+  live-descendant negative control). **F2 ACCEPTED at exact `f17e2bd3`
+  — the mandatory pre-aggregate adapter removal is DISCHARGED**
+  (custody at `salvage/r2f1b-3c2-f2-completed`; artifact mirrored as
+  [`2026-08-15-r2f1b-3c2-task-f2-sol-closure.md`](2026-08-15-r2f1b-3c2-task-f2-sol-closure.md)).
+- 2026-08-15: **Task G dispatched** from exact `f17e2bd3` — the final
+  3c2 implementation task: exact-disposition return from
+  `cleanup_cold_session` with full caller/wrapper enumeration, retry
+  gated on exact `Complete` (`Ok(Unknown)` cannot redispatch),
+  post-acceptance persistence failure fatal/nonretryable, the two-field
+  `CleanupReportV1` contract guarded unchanged, and the
+  production-route assertion (caps 350/700, one-consumer-per-task
+  split; the binding G contract restated inline; brief mirrored as
+  [`2026-08-15-r2f1b-3c2-task-g-brief.md`](2026-08-15-r2f1b-3c2-task-g-brief.md)).
 
 ## Non-scope reaffirmed
 
