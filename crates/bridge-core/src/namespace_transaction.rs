@@ -1110,6 +1110,24 @@ mod mechanism {
 
         #[test]
         fn namespace_transaction_reserves_replace_and_retire_capacity_before_effect() {
+            // Highest safe census for replace's footprint of two: admission
+            // succeeds and completes; a `>=` boundary regression turns this red.
+            let headroom = case();
+            fill_root_to(&headroom, 4094);
+            let replaced = headroom.operate(|op| {
+                NamespaceTransactionV2::replace(
+                    op,
+                    target(),
+                    headroom.expected(),
+                    b"B",
+                    "replace at headroom",
+                )
+            });
+            assert!(matches!(replaced, O::Complete(_)), "{replaced:?}");
+            assert_eq!(fs::read(headroom.root.join("target")).unwrap(), b"B");
+            assert!(residue(&headroom).is_empty());
+            assert_eq!(fs::read_dir(&headroom.root).unwrap().count(), 4094);
+
             for count in [4095, 4096] {
                 let case = case();
                 fill_root_to(&case, count);

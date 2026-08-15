@@ -1245,17 +1245,18 @@ impl JournalRootOperationV2<'_> {
         before_publish: F,
     ) -> Result<FileContentSnapshotV2, JournalMutationOutcomeV2> {
         self.refuse_debt(label)?;
-        let name = ChildNameV2::reserved(ReservedNameNamespaceV2::Staging, target)
-            .map_err(|error| self.failed(error, false))?;
-        // A staging name derived from a reserved target must not be
-        // whitelisted: for reserved targets the census sees everything.
-        let allowed = if target.is_reserved_target() {
-            None
-        } else {
-            Some(&name)
+        // The census runs before every other fallible step: a failed staging
+        // name derivation or a reserved target must not preempt residue
+        // classification, and a staging name derived from a reserved target
+        // must not be whitelisted.
+        let derived = ChildNameV2::reserved(ReservedNameNamespaceV2::Staging, target);
+        let allowed = match &derived {
+            Ok(name) if !target.is_reserved_target() => Some(name),
+            _ => None,
         };
         self.guard(allowed, 0, label)?;
         self.refuse_reserved_target(target)?;
+        let name = derived.map_err(|error| self.failed(error, false))?;
         let file = open_regular_child(self.root_file(), name.as_os_str(), label)
             .map_err(|error| self.failed(error, true))?;
         let observed = required_file_content_snapshot_v2(&file, label)
@@ -5396,6 +5397,76 @@ mod tests {
                 Err(JournalMutationOutcomeV2::ProtectiveDebt(_))
             ));
             assert_eq!(fs::read_dir(&case.root).unwrap().count(), 1);
+        }
+
+        #[test]
+        fn journal_long_reserved_publish_targets_cannot_bypass_the_census() {
+            let mut long = b".a2a-v2-".to_vec();
+            long.resize(244, b'a');
+            let long = ChildNameV2::from_bytes(&long).unwrap();
+
+            // Residue-bearing root: the census classifies protectively even
+            // though staging-name derivation for this target fails.
+            let case = route_case();
+            fs::write(case.root.join(".a2a-v2-x"), b"A").unwrap();
+            let custody =
+                JournalRootCustodyV2::open(&case.anchor, &case.binding, "long reserved").unwrap();
+            let operation = custody.begin_operation("long reserved").unwrap();
+            let sample = required_file_content_snapshot_v2(
+                &File::open(case.root.join(".a2a-v2-x")).unwrap(),
+                "long reserved",
+            )
+            .unwrap();
+            assert!(matches!(
+                operation.publish(&long, sample, "long reserved"),
+                Err(JournalMutationOutcomeV2::ProtectiveDebt(_))
+            ));
+            assert!(operation.debt());
+            assert_eq!(fs::read_dir(&case.root).unwrap().count(), 1);
+            assert_eq!(fs::read(case.root.join(".a2a-v2-x")).unwrap(), b"A");
+
+            // Clean root: the reserved-name refusal names the actual reason.
+            let clean = route_case();
+            let custody =
+                JournalRootCustodyV2::open(&clean.anchor, &clean.binding, "long clean").unwrap();
+            let operation = custody.begin_operation("long clean").unwrap();
+            assert!(matches!(
+                operation.publish(&long, sample, "long clean"),
+                Err(JournalMutationOutcomeV2::Refused(ref reason))
+                    if reason.contains("reserved target")
+            ));
+            assert_eq!(fs::read_dir(&clean.root).unwrap().count(), 0);
+            assert!(!operation.debt());
+        }
+
+        #[test]
+        fn journal_each_mutator_classifies_residue_on_a_fresh_handle() {
+            for mutator in 0..3 {
+                let case = route_case();
+                fs::write(case.root.join("record"), b"A").unwrap();
+                fs::write(case.root.join(".a2a-v2-x"), b"R").unwrap();
+                let custody =
+                    JournalRootCustodyV2::open(&case.anchor, &case.binding, "fresh residue")
+                        .unwrap();
+                let operation = custody.begin_operation("fresh residue").unwrap();
+                assert!(!operation.debt());
+                let reserved = ChildNameV2::from_bytes(b".a2a-v2-x").unwrap();
+                let expected = required_file_content_snapshot_v2(
+                    &File::open(case.root.join("record")).unwrap(),
+                    "fresh residue",
+                )
+                .unwrap();
+                let outcome = match mutator {
+                    0 => operation.stage(&reserved, b"B", "fresh residue"),
+                    1 => operation.publish(&reserved, expected, "fresh residue"),
+                    _ => operation.append(&reserved, expected, 1, b"B", "fresh residue"),
+                };
+                assert!(
+                    matches!(outcome, Err(JournalMutationOutcomeV2::ProtectiveDebt(_))),
+                    "mutator {mutator}: {outcome:?}"
+                );
+                assert_eq!(fs::read_dir(&case.root).unwrap().count(), 2);
+            }
         }
 
         #[test]
