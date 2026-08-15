@@ -5,7 +5,7 @@ use crate::{
         FsCustodyError, JournalMutationOutcomeV2, JournalRootCustodyV2, JournalRootOperationV2,
         ReservedNameNamespaceV2,
     },
-    ids::AttemptIdentity,
+    ids::{AttemptId, AttemptIdentity, ExecutionId},
     namespace_transaction::{NamespaceTransactionOutcomeV2, NamespaceTransactionV2},
     resource_flight::DedicatedRemoteRequestIdV1,
     retained_resource_flight::ResourceFlightOwnerV1,
@@ -51,7 +51,17 @@ pub enum RemoteRequestFlightRefusalV1 {
     #[error("request journal requires B2 recovery: {0}")]
     ReopenRequired(&'static str),
 }
-type FlightResult<T> = std::result::Result<T, RemoteRequestFlightRefusalV1>;
+type Refusal = RemoteRequestFlightRefusalV1;
+type FlightResult<T> = std::result::Result<T, Refusal>;
+#[derive(Serialize, Deserialize)]
+#[serde(remote = "AttemptIdentity", deny_unknown_fields)]
+struct AttemptIdentityWireV1 {
+    execution_id: ExecutionId,
+    attempt_id: AttemptId,
+    ordinal: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    parent_attempt_id: Option<AttemptId>,
+}
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum TerminalOutcomeV1 {
@@ -68,6 +78,7 @@ enum ChildStateV1 {
 #[serde(deny_unknown_fields)]
 struct CheckpointWireV1 {
     schema: u8,
+    #[serde(with = "AttemptIdentityWireV1")]
     attempt: AttemptIdentity,
     next_ordinal: u64,
     identity_chain_digest: Sha256HexV1,
@@ -76,6 +87,7 @@ struct CheckpointWireV1 {
 #[serde(deny_unknown_fields)]
 struct RequestChildWireV1 {
     schema: u8,
+    #[serde(with = "AttemptIdentityWireV1")]
     attempt: AttemptIdentity,
     ordinal: u64,
     checkpoint_digest: Sha256HexV1,
@@ -89,10 +101,15 @@ struct CensusV1 {
     checkpoint_snapshot: FileContentSnapshotV2,
     children: Vec<RequestChildWireV1>,
     staged: bool,
-    count: usize,
 }
 pub struct RemoteRequestAuthorityV1 {
-    pub request_id: DedicatedRemoteRequestIdV1,
+    request_id: DedicatedRemoteRequestIdV1,
+}
+impl RemoteRequestAuthorityV1 {
+    #[must_use]
+    pub fn request_id(&self) -> &DedicatedRemoteRequestIdV1 {
+        &self.request_id
+    }
 }
 pub struct RemoteRequestJournalV1 {
     custody: JournalRootCustodyV2,
@@ -114,7 +131,6 @@ fn checkpoint(attempt: &AttemptIdentity, next_ordinal: u64) -> CheckpointWireV1 
         identity_chain_digest: checkpoint_digest(attempt, next_ordinal),
     }
 }
-
 fn authority_digest(wire: &RequestChildWireV1) -> Sha256HexV1 {
     hash(&(
         "a2a.remote-request.authority.v1",
@@ -129,20 +145,17 @@ fn request_name(digest: &Sha256HexV1) -> ChildNameV2 {
     ChildNameV2::from_bytes(format!("{REQUEST_CHILD_PREFIX_V1}{}.json", digest.as_str()).as_bytes())
         .expect("digest child name is portable")
 }
-fn protective(
-    kind: TaskAProtectiveOutcomeV1,
-    reason: impl ToString,
-) -> RemoteRequestFlightRefusalV1 {
-    RemoteRequestFlightRefusalV1::TaskA(kind, reason.to_string())
+fn protective(kind: TaskAProtectiveOutcomeV1, reason: impl ToString) -> Refusal {
+    Refusal::TaskA(kind, reason.to_string())
 }
-fn fs(error: FsCustodyError) -> RemoteRequestFlightRefusalV1 {
+fn fs(error: FsCustodyError) -> Refusal {
     let kind = match error {
         FsCustodyError::Unsupported(_) => TaskAProtectiveOutcomeV1::Unsupported,
         _ => TaskAProtectiveOutcomeV1::Unknown,
     };
     protective(kind, error)
 }
-fn journal(outcome: JournalMutationOutcomeV2) -> RemoteRequestFlightRefusalV1 {
+fn journal(outcome: JournalMutationOutcomeV2) -> Refusal {
     use JournalMutationOutcomeV2 as J;
     use TaskAProtectiveOutcomeV1 as P;
     match outcome {
@@ -196,14 +209,8 @@ fn read_wire<T: DeserializeOwned>(
 }
 fn canonical(id: &DedicatedRemoteRequestIdV1) -> bool {
     let value = id.as_str();
-    let Some(suffix) = value.strip_prefix(DedicatedRemoteRequestIdV1::PREFIX) else {
-        return false;
-    };
     value.len() == DedicatedRemoteRequestIdV1::ENCODED_LEN
-        && suffix.bytes().any(|byte| byte != b'0')
-        && suffix
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        && value.starts_with(DedicatedRemoteRequestIdV1::PREFIX)
 }
 impl RemoteRequestJournalV1 {
     pub fn initialize(
@@ -287,9 +294,11 @@ impl RemoteRequestJournalV1 {
         ChildNameV2::from_bytes(CHECKPOINT_CHILD_V1.as_bytes()).expect("portable checkpoint name")
     }
     fn scan(&self, op: &JournalRootOperationV2<'_>) -> FlightResult<CensusV1> {
-        let names = op
-            .enumerate(self.capacity + 1, "request census")
-            .map_err(fs)?;
+        let names = match op.enumerate(self.capacity + 1, "request census") {
+            Ok(names) => names,
+            Err(FsCustodyError::EnumerationLimitExceeded { .. }) => return Err(Refusal::Capacity),
+            Err(error) => return Err(fs(error)),
+        };
         if names.len() > self.capacity {
             return Err(RemoteRequestFlightRefusalV1::Capacity);
         }
@@ -310,7 +319,7 @@ impl RemoteRequestJournalV1 {
             let name = ChildNameV2::from_bytes(value.as_bytes())
                 .map_err(|error| RemoteRequestFlightRefusalV1::Malformed(format!("{error:?}")))?;
             if name == Self::checkpoint_name() {
-                checkpoint = Some(read_wire(&op, &name)?);
+                checkpoint = Some(read_wire(op, &name)?);
                 continue;
             }
             let (read_name, final_name, is_staged) = if value.starts_with(REQUEST_CHILD_PREFIX_V1) {
@@ -358,18 +367,15 @@ impl RemoteRequestJournalV1 {
                 ));
             }
             if is_staged {
-                if staged {
+                if std::mem::replace(&mut staged, true) {
                     return Err(RemoteRequestFlightRefusalV1::IdentityCollision);
                 }
-                staged = true;
             } else {
                 children.push(wire);
             }
         }
         let (checkpoint, checkpoint_snapshot): (CheckpointWireV1, _) =
-            checkpoint.ok_or_else(|| {
-                RemoteRequestFlightRefusalV1::Malformed("checkpoint is absent".into())
-            })?;
+            checkpoint.ok_or_else(|| Refusal::Malformed("checkpoint is absent".into()))?;
         if checkpoint.schema != SCHEMA {
             return Err(RemoteRequestFlightRefusalV1::ForeignSchema("checkpoint"));
         }
@@ -393,7 +399,6 @@ impl RemoteRequestJournalV1 {
             checkpoint_snapshot,
             children,
             staged,
-            count: names.len(),
         })
     }
     pub fn admit(
@@ -416,7 +421,7 @@ impl RemoteRequestJournalV1 {
         &mut self,
         owner: ResourceFlightOwnerV1,
         mint: F,
-        cut: Option<u8>,
+        _cut: Option<u8>,
     ) -> FlightResult<RemoteRequestAuthorityV1>
     where
         F: FnOnce() -> Result<DedicatedRemoteRequestIdV1, crate::error::BridgeError>,
@@ -432,8 +437,7 @@ impl RemoteRequestJournalV1 {
             .map_err(fs)?;
         let census = self.scan(&op)?;
         if census.staged
-            || census.count.saturating_add(ADMISSION_FOOTPRINT) > self.capacity
-            || census.children.len() >= self.capacity
+            || census.children.len().saturating_add(ADMISSION_FOOTPRINT) >= self.capacity
         {
             return Err(RemoteRequestFlightRefusalV1::Capacity);
         }
@@ -445,6 +449,13 @@ impl RemoteRequestJournalV1 {
                 return Err(RemoteRequestFlightRefusalV1::Malformed(
                     "mint returned a non-canonical identity".into(),
                 ));
+            }
+            if census
+                .children
+                .iter()
+                .any(|child| child.request_id == request_id)
+            {
+                return Err(RemoteRequestFlightRefusalV1::IdentityCollision);
             }
             let active_next = match census.children.iter().map(|child| child.ordinal).max() {
                 Some(ordinal) => ordinal
@@ -468,14 +479,19 @@ impl RemoteRequestJournalV1 {
             };
             wire.authority_digest = authority_digest(&wire);
             let name = request_name(&wire.authority_digest);
-            boundary(cut, 0, "temporary write")?;
+            #[cfg(test)]
+            boundary(_cut, 0, "temporary write")?;
             let staged = mutation(op.stage(&name, &encoded(&wire)?, "stage request child"))?;
-            boundary(cut, 1, "temporary sync")?;
-            boundary(cut, 2, "no-replace publication")?;
+            #[cfg(test)]
+            boundary(_cut, 1, "temporary sync")?;
+            #[cfg(test)]
+            boundary(_cut, 2, "no-replace publication")?;
             let _snapshot = mutation(op.publish(&name, staged, "publish request child"))?;
-            boundary(cut, 3, "request root sync")?;
+            #[cfg(test)]
+            boundary(_cut, 3, "request root sync")?;
             sync(op.sync("sync request root"))?;
-            boundary(cut, 4, "checkpoint advance")?;
+            #[cfg(test)]
+            boundary(_cut, 4, "checkpoint advance")?;
             let checkpoint = checkpoint(&self.attempt, next);
             transaction(NamespaceTransactionV2::replace(
                 &op,
@@ -484,7 +500,8 @@ impl RemoteRequestJournalV1 {
                 &encoded(&checkpoint)?,
                 "advance checkpoint",
             ))?;
-            boundary(cut, 5, "checkpoint sync")?;
+            #[cfg(test)]
+            boundary(_cut, 5, "checkpoint sync")?;
             sync(op.sync("sync advanced checkpoint"))?;
             Ok(RemoteRequestAuthorityV1 {
                 request_id: wire.request_id,
@@ -496,6 +513,7 @@ impl RemoteRequestJournalV1 {
         result
     }
 }
+#[cfg(test)]
 fn boundary(actual: Option<u8>, expected: u8, reason: &'static str) -> FlightResult<()> {
     (actual != Some(expected))
         .then_some(())
@@ -636,6 +654,28 @@ mod tests {
             })
             .collect()
     }
+    fn root_bytes(case: &Case) -> Vec<(String, Vec<u8>)> {
+        let mut entries = fs::read_dir(&case.root)
+            .unwrap()
+            .map(|entry| {
+                let path = entry.unwrap().path();
+                (
+                    path.file_name().unwrap().to_string_lossy().into_owned(),
+                    fs::read(path).unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        entries.sort_by(|left, right| left.0.cmp(&right.0));
+        entries
+    }
+    fn unchecked(case: &Case, capacity: usize) -> RemoteRequestJournalV1 {
+        RemoteRequestJournalV1 {
+            custody: custody(case),
+            attempt: attempt(),
+            capacity,
+            requires_reopen: false,
+        }
+    }
     #[test]
     fn remote_request_flight_checkpoint_and_census_are_strict_and_nonmutating() {
         for corrupt in ["unknown", "schema", "digest", "attempt"] {
@@ -683,6 +723,68 @@ mod tests {
         assert_eq!(fs::read_dir(&over_cap.root).unwrap().count(), before);
     }
     #[test]
+    fn remote_request_flight_nested_unknown_fields_refuse_before_mint_or_mutation() {
+        for child in [false, true] {
+            let case = case();
+            let mut journal = initialized(&case, 16);
+            let path = if child {
+                journal.admit_with(owner(0), || Ok(request(0))).unwrap();
+                request_paths(&case).pop().unwrap()
+            } else {
+                case.root.join(CHECKPOINT_CHILD_V1)
+            };
+            drop(journal);
+            let mut value: serde_json::Value =
+                serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+            value["attempt"]["extra"] = serde_json::json!(true);
+            fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+            let before = root_bytes(&case);
+            let mut minted = 0;
+            assert!(matches!(
+                unchecked(&case, 16).admit_with(owner(1), || {
+                    minted += 1;
+                    Ok(request(1))
+                }),
+                Err(RemoteRequestFlightRefusalV1::Malformed(_))
+            ));
+            assert_eq!(minted, 0);
+            assert_eq!(root_bytes(&case), before);
+        }
+    }
+    #[test]
+    fn remote_request_authority_is_borrowed_and_duplicate_mint_refuses_without_mutation() {
+        let case = case();
+        let mut journal = initialized(&case, 16);
+        let authority = journal.admit_with(owner(0), || Ok(request(0))).unwrap();
+        let borrowed: &DedicatedRemoteRequestIdV1 = authority.request_id();
+        assert_eq!(borrowed, &request(0));
+        let before = root_bytes(&case);
+        assert!(matches!(
+            journal.admit_with(owner(1), || Ok(request(0))),
+            Err(RemoteRequestFlightRefusalV1::IdentityCollision)
+        ));
+        assert_eq!(root_bytes(&case), before);
+    }
+    #[test]
+    fn remote_request_flight_capacity_plus_two_is_capacity_without_mutation() {
+        let case = case();
+        let mut journal = initialized(&case, 8);
+        for index in 0..9 {
+            fs::write(case.root.join(format!("unknown-{index}")), b"x").unwrap();
+        }
+        let before = root_bytes(&case);
+        let mut minted = 0;
+        assert!(matches!(
+            journal.admit_with(owner(0), || {
+                minted += 1;
+                Ok(request(0))
+            }),
+            Err(RemoteRequestFlightRefusalV1::Capacity)
+        ));
+        assert_eq!(minted, 0);
+        assert_eq!(root_bytes(&case), before);
+    }
+    #[test]
     fn remote_request_flight_capacity_precedes_id_mint_and_positive_edge_admits() {
         let case = case();
         let mut journal = initialized(&case, 8);
@@ -696,6 +798,12 @@ mod tests {
                 .unwrap();
         }
         assert_eq!(minted, 5);
+        let (checkpoint, _): (CheckpointWireV1, _) = read_wire(
+            &journal.custody.begin_operation("read checkpoint").unwrap(),
+            &RemoteRequestJournalV1::checkpoint_name(),
+        )
+        .unwrap();
+        assert_eq!(checkpoint.next_ordinal, 5);
         let before = fs::read_dir(&case.root).unwrap().count();
         assert!(matches!(
             journal.admit_with(owner(6), || {
@@ -706,6 +814,32 @@ mod tests {
         ));
         assert_eq!(minted, 5);
         assert_eq!(fs::read_dir(&case.root).unwrap().count(), before);
+    }
+    #[test]
+    fn remote_request_flight_real_task_a_protective_outcome_is_not_flattened() {
+        let case = case();
+        let mut journal = initialized(&case, 16);
+        let checkpoint_before = fs::read(case.root.join(CHECKPOINT_CHILD_V1)).unwrap();
+        assert!(matches!(
+            journal.admit_with(owner(0), || {
+                let residue = ChildNameV2::reserved(
+                    ReservedNameNamespaceV2::ReplacementCapture,
+                    &RemoteRequestJournalV1::checkpoint_name(),
+                )
+                .unwrap();
+                fs::write(case.root.join(residue.as_os_str()), b"injected").unwrap();
+                Ok(request(0))
+            }),
+            Err(RemoteRequestFlightRefusalV1::TaskA(
+                TaskAProtectiveOutcomeV1::ProtectiveDebt,
+                _
+            ))
+        ));
+        assert!(request_paths(&case).is_empty());
+        assert_eq!(
+            fs::read(case.root.join(CHECKPOINT_CHILD_V1)).unwrap(),
+            checkpoint_before
+        );
     }
     #[test]
     fn remote_request_flight_crash_cuts_never_create_partial_authority() {

@@ -573,3 +573,29 @@ Changed paths are `crates/bridge-core/src/remote_request_flight.rs`, the two-lin
 - No production caller, request route, shared-journal migration, provider send, API/HTTP surface, live smoke, or compatibility action was added.
 
 B2, Tasks C-G, production V3, every production caller, providers, smoke, compatibility, deployment, fold, push, and the running operator remain unarmed.
+
+## Task B1 targeted authority/admission repair
+
+Date: 2026-08-15. Exact frozen input: `2815259d3a7a3b2869f0968c33cea010a4a1ede1`.
+
+### Admissible red evidence
+
+Exact command: `CARGO_INCREMENTAL=0 cargo test -p bridge-core --lib --locked --offline -- remote_request_flight --nocapture`.
+Cargo selected eight tests and reached `bridge-core`; five passed and three failed on the nested-attempt unknown-field, duplicate-mint, and capacity-plus-two regressions. This was neither a compile/dependency/network refusal nor a zero-selected selector.
+
+### Repair result and limits
+
+`RemoteRequestAuthorityV1` now has only a private field, no public constructor, no `Clone`/`Copy` implementation, and one borrowed identity accessor. The sole construction expression remains the successful admission tail, so external code cannot construct or duplicate authority while the journal owns minting.
+Checkpoint and request-child decoding use a private Serde remote wire for `AttemptIdentity` with nested `deny_unknown_fields`. Admission refuses an already-censused minted identity before staging; exact enumeration-limit overflow is `Capacity`; other custody failures remain typed Task A outcomes; and the checkpoint read no longer adds a needless reference.
+
+Focused tests preserve complete root bytes and prove zero mint on strict-decode/capacity refusal, exact no-mutation duplicate refusal, the positive-edge `next_ordinal`, and a real Task A replacement-capture residue surfacing as `ProtectiveDebt` without publishing a request or changing the checkpoint.
+Versus the frozen input, the module delta is +172/-38 including tests; with this 26-line handoff the repair totals 236 changed lines. The production-region patch is +43/-42, below the 120-line repair stop. Versus `d8ec93ad`, production remains exactly 500 additions: 498 non-test module lines plus the existing two-line `lib.rs` export. B2 is still split and unimplemented.
+
+### Verification
+
+- Focused `remote_request_flight`: 8 passed, 0 failed, 612 filtered out.
+- Required combined Task A/B1 selectors: 126 passed, 0 failed, 494 filtered out.
+- Workspace all-target/all-feature clippy with `-D warnings`: exit 0 from a fresh disposable target; bridge-core's same gate also exits 0.
+- Direct `rustfmt --check --edition 2021` and `git diff --check`: exit 0. `cargo fmt --all -- --check` still cannot start because this Cargo installation has no `fmt` subcommand.
+
+B2, Tasks C-G, production V3, all callers/routes, providers, smoke, compatibility, deployment, fold, push, and the running operator remain unarmed and unchanged.
