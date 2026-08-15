@@ -633,6 +633,43 @@ All checks passed; no drift found.
   checked-cleanup projection table (caps 500/900 churn, E2 split escape
   hatch; brief mirrored as
   [`2026-08-14-r2f1b-3c2-task-e-brief.md`](2026-08-14-r2f1b-3c2-task-e-brief.md)).
+  The first dispatch was refused by the D-4 storage floor (25.5 GiB); the
+  build-target reap freed only 18.7 GiB; root cause was 380 GiB of Docker
+  volumes (319.7 reclaimable per-run a2a cache volumes). The operator's
+  bulk `docker volume rm` was denied by the permission classifier and
+  surfaced to the owner, who ran the removal personally (71 volumes;
+  `a2a-kiro-data` excluded) — redispatched at 54 GiB free.
+- 2026-08-15: E base run: candidate `05e9517e` — churn 873/900 total
+  (operator numstat: 762+65 `backend.rs`, +46 handoff; handoff split 481
+  production / 346 test / 46 docs), inside both caps but near the
+  ceiling. In-container verify FAILED at clippy and at the whole-bin
+  test target; advisory review REJECT with THREE WRONGs, all
+  operator-source-verified at the cited lines: (1) the committed
+  artifact fails the Clippy gate (`large_enum_variant` on
+  `PreparedRequest`, `manual_inspect` on the admission `map_err`);
+  (2) `observe()` destructively `take()`s the acceptance-aware
+  settlement diagnostic BEFORE the deadline check and discards the
+  recording result — an expired deadline or rejecting observer destroys
+  the `prompt_may_have_been_accepted=true` evidence; (3) a scope
+  dropping after cleanup timeout bypasses custody — `settle_drop`
+  early-returns in `TimedOut`, the moved flight dies in the bridge-core
+  destructor with its result ignored, and drop proceeds to
+  `clear_exact` — violating the binding never-ignore-after-transfer
+  requirement. One SMELL-DEFER (fail-first strength of the new-behavior
+  tests) goes to closure/aggregate, not the repair.
+- Operator enumeration before the state-changing retry: host clippy
+  over the full workspace found EXACTLY the two cited sites (population
+  closed; log `e-clippy-enum.log`). The in-container whole-bin failure
+  carries the ledgered flock-EBADF signature (`authority-state.lock`/
+  `owner-admission.lock`, os error 9; no per-test failure identity in
+  the captured output) — instance 7 of the hermetic class; host control
+  on exact `05e9517e`: **1,086 passed / 0 failed** (log
+  `e-wholebin-host.log`; class remains 7/7 host-green). Candidate
+  preserved at `salvage/r2f1b-3c2-e-candidate`.
+- Rejection classified CLOSED and enumerable → the contracted targeted
+  repair dispatched on frozen `05e9517e` (three repairs only; caps
+  150/400; brief mirrored as
+  [`2026-08-15-r2f1b-3c2-repair-e-brief.md`](2026-08-15-r2f1b-3c2-repair-e-brief.md)).
 
 ## Non-scope reaffirmed
 
