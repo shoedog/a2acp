@@ -3597,7 +3597,13 @@ mod tests {
             });
         let driver = request_driver(&route, 64, publisher);
         let mut cfg = crate::config::ApiConfig::new(format!("{}/v1", server.uri()));
-        cfg.request_timeout = Duration::from_millis(200);
+        // The barriers, not this clock, make the crossing deterministic: the
+        // publisher stays stalled until explicitly released, so the cleanup
+        // deadline always expires mid-settlement. The bound only needs to be
+        // large enough that the HTTP round never times out under full-suite
+        // parallel load (200ms was load-marginal and failed whole-workspace
+        // runs on unmodified accepted heads).
+        cfg.request_timeout = Duration::from_secs(2);
         cfg.resource_flight_route_v3 = Some(ApiResourceFlightRouteV3::new(
             driver,
             NodeId::parse("api-node").unwrap(),
