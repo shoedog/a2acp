@@ -1338,7 +1338,7 @@ async fn preserve_then_cleanup_cold_session(
     action: ColdCleanupAction,
     tracker: &WorkflowCleanupTracker,
     exit: ColdExitV1,
-) -> Result<(), BridgeError> {
+) -> Result<BackendCleanupDispositionV1, BridgeError> {
     preserve_checkout_before_signal(backend, node, session, exit).await;
     cleanup_cold_session(node, backend, session, observer, action, tracker).await
 }
@@ -1350,7 +1350,7 @@ async fn cleanup_cold_session(
     observer: &Arc<dyn DiagnosticObserver>,
     action: ColdCleanupAction,
     tracker: &WorkflowCleanupTracker,
-) -> Result<(), BridgeError> {
+) -> Result<BackendCleanupDispositionV1, BridgeError> {
     let started = std::time::Instant::now();
     let result = match action {
         ColdCleanupAction::Forget => {
@@ -1365,7 +1365,7 @@ async fn cleanup_cold_session(
         }
     };
     tracker.record(node, started, std::time::Instant::now(), &result);
-    result.map(|_| ())
+    result
 }
 
 async fn cancel_and_forget_preflight_session(
@@ -2099,7 +2099,7 @@ impl WorkflowExecutor {
                 result = attempt_use.configure_session(&session, ctx.session_cwd.clone()) => result,
             };
             if let Err(error) = configure_result {
-                let _ = preserve_then_cleanup_cold_session(
+                let cleanup_result = preserve_then_cleanup_cold_session(
                     &node.id,
                     attempt_use.backend(),
                     &session,
@@ -2115,9 +2115,21 @@ impl WorkflowExecutor {
                     model: model.clone(),
                     duration: started.elapsed(),
                     usage: None,
-                    reason: format!("configure error: {error:?}"),
+                    reason: match &cleanup_result {
+                        Ok(BackendCleanupDispositionV1::Complete) => {
+                            format!("configure error: {error:?}")
+                        }
+                        Ok(disposition) => format!(
+                            "configure error: {error:?}; cleanup incomplete: {disposition:?}"
+                        ),
+                        Err(cleanup_error) => {
+                            format!("configure error: {error:?}; cleanup error: {cleanup_error:?}")
+                        }
+                    },
                 });
-                if idx + 1 < candidates.len() {
+                if idx + 1 < candidates.len()
+                    && matches!(cleanup_result, Ok(BackendCleanupDispositionV1::Complete))
+                {
                     attempt_use
                         .into_retry_invalidation(&agent)
                         .apply(self.registry.as_ref())
@@ -2268,7 +2280,7 @@ impl WorkflowExecutor {
                         }
                         _ => true,
                     };
-                    if may_have_been_accepted {
+                    let cleanup_result = if may_have_been_accepted {
                         cancel_and_forget_preflight_session(
                             &node.id,
                             attempt_use.backend(),
@@ -2277,25 +2289,38 @@ impl WorkflowExecutor {
                             cleanup_tracker,
                         )
                         .await;
+                        None
                     } else {
-                        let _ = preserve_then_cleanup_cold_session(
-                            &node.id,
-                            attempt_use.backend(),
-                            &session,
-                            &diagnostic,
-                            ColdCleanupAction::Forget,
-                            cleanup_tracker,
-                            // R2f1b non-success cold exit (repair RC): preflight prompt-open failed and the prompt was provably not accepted.
-                            ColdExitV1::Failure,
+                        Some(
+                            preserve_then_cleanup_cold_session(
+                                &node.id,
+                                attempt_use.backend(),
+                                &session,
+                                &diagnostic,
+                                ColdCleanupAction::Forget,
+                                cleanup_tracker,
+                                // R2f1b non-success cold exit (repair RC): preflight prompt-open failed and the prompt was provably not accepted.
+                                ColdExitV1::Failure,
+                            )
+                            .await,
                         )
-                        .await;
-                    }
+                    };
                     attempts.push(AttemptSummary {
                         attempt: attempt_no,
                         model: model.clone(),
                         duration: started.elapsed(),
                         usage: None,
-                        reason: format!("prompt error: {error:?}"),
+                        reason: match cleanup_result.as_ref() {
+                            Some(Ok(BackendCleanupDispositionV1::Complete)) | None => {
+                                format!("prompt error: {error:?}")
+                            }
+                            Some(Ok(disposition)) => format!(
+                                "prompt error: {error:?}; cleanup incomplete: {disposition:?}"
+                            ),
+                            Some(Err(cleanup_error)) => {
+                                format!("prompt error: {error:?}; cleanup error: {cleanup_error:?}")
+                            }
+                        },
                     });
                     if may_have_been_accepted {
                         return Err(PreflightFailure::Hard {
@@ -2308,7 +2333,12 @@ impl WorkflowExecutor {
                             retain_in_run_cache: true,
                         });
                     }
-                    if idx + 1 < candidates.len() {
+                    if idx + 1 < candidates.len()
+                        && matches!(
+                            cleanup_result,
+                            Some(Ok(BackendCleanupDispositionV1::Complete))
+                        )
+                    {
                         attempt_use
                             .into_retry_invalidation(&agent)
                             .apply(self.registry.as_ref())
@@ -2374,11 +2404,11 @@ impl WorkflowExecutor {
             }
 
             // The preflight verdict, computed BEFORE the teardown so the exit can be named
-            // (repair RC). Its fourth conjunct below — `cleanup_error.is_none()` — cannot be part
-            // of it, because that is the teardown's own result; a preflight that answered PONG and
-            // then failed its cleanup is a cleanup failure, not a checkout to preserve.
+            // (repair RC). Its fourth conjunct below requires exact Complete cleanup; a preflight
+            // that answered PONG and then failed or protectively retained its cleanup is a cleanup
+            // failure, not a checkout to preserve.
             let preflight_ok = saw_done && reason.is_none() && is_exact_preflight_pong(&text);
-            let cleanup_error = if replay_barrier {
+            let cleanup_result = if replay_barrier {
                 cancel_and_forget_preflight_session(
                     &node.id,
                     attempt_use.backend(),
@@ -2389,27 +2419,31 @@ impl WorkflowExecutor {
                 .await;
                 None
             } else {
-                preserve_then_cleanup_cold_session(
-                    &node.id,
-                    attempt_use.backend(),
-                    &session,
-                    &diagnostic,
-                    ColdCleanupAction::Forget,
-                    cleanup_tracker,
-                    if preflight_ok {
-                        ColdExitV1::Success
-                    } else {
-                        ColdExitV1::Failure
-                    },
+                Some(
+                    preserve_then_cleanup_cold_session(
+                        &node.id,
+                        attempt_use.backend(),
+                        &session,
+                        &diagnostic,
+                        ColdCleanupAction::Forget,
+                        cleanup_tracker,
+                        if preflight_ok {
+                            ColdExitV1::Success
+                        } else {
+                            ColdExitV1::Failure
+                        },
+                    )
+                    .await,
                 )
-                .await
-                .err()
             };
 
             if saw_done
                 && reason.is_none()
                 && is_exact_preflight_pong(&text)
-                && cleanup_error.is_none()
+                && matches!(
+                    cleanup_result,
+                    Some(Ok(BackendCleanupDispositionV1::Complete))
+                )
             {
                 let substituted_from = if model != &primary_model {
                     Some(model_label(primary_model.as_deref()))
@@ -2447,8 +2481,9 @@ impl WorkflowExecutor {
                 return Ok(decision);
             }
 
-            let reason = match cleanup_error {
-                Some(error) => format!("cleanup error: {error:?}"),
+            let reason = match cleanup_result {
+                Some(Err(error)) => format!("cleanup error: {error:?}"),
+                Some(Ok(disposition)) => format!("cleanup incomplete: {disposition:?}"),
                 None => reason.unwrap_or_else(|| {
                     if !saw_done {
                         "stream ended before terminal Done".to_string()
@@ -3535,18 +3570,20 @@ impl WorkflowExecutor {
                             } else {
                                 ColdCleanupAction::Forget
                             };
-                            let cleanup_allows_retry = preserve_then_cleanup_cold_session(
-                                &node.id,
-                                attempt_use.backend(),
-                                &session,
-                                &diagnostic,
-                                action,
-                                cleanup_tracker,
-                                // R2f1b non-success cold exit (repair RC): configure failed transiently; the attempt will retry.
-                                ColdExitV1::Failure,
-                            )
-                            .await
-                            .is_ok();
+                            let cleanup_allows_retry = matches!(
+                                preserve_then_cleanup_cold_session(
+                                    &node.id,
+                                    attempt_use.backend(),
+                                    &session,
+                                    &diagnostic,
+                                    action,
+                                    cleanup_tracker,
+                                    // R2f1b non-success cold exit (repair RC): configure failed transiently; the attempt will retry.
+                                    ColdExitV1::Failure,
+                                )
+                                .await,
+                                Ok(BackendCleanupDispositionV1::Complete)
+                            );
                             break 'attempt Attempt::Transient {
                                 err: e,
                                 usage: None,
@@ -3592,7 +3629,7 @@ impl WorkflowExecutor {
                         )
                         .await
                         {
-                            Ok(()) => {
+                            Ok(_) => {
                                 attempt_harvest = node_harvest_meta(
                                     wf_id,
                                     node,
@@ -3738,7 +3775,8 @@ impl WorkflowExecutor {
                                     } else {
                                         ColdCleanupAction::Forget
                                     };
-                                    let cleanup_allows_retry = preserve_then_cleanup_cold_session(
+                                    let cleanup_allows_retry = matches!(
+                                        preserve_then_cleanup_cold_session(
                                         &node.id,
                                         attempt_use.backend(),
                                         &session,
@@ -3748,8 +3786,9 @@ impl WorkflowExecutor {
                                         // R2f1b non-success cold exit (repair RC): prompt failed transiently; the attempt will retry.
                                         ColdExitV1::Failure,
                                     )
-                                    .await
-                                    .is_ok();
+                                        .await,
+                                        Ok(BackendCleanupDispositionV1::Complete)
+                                    );
                                     break 'attempt Attempt::Transient {
                                         err: e,
                                         usage: None,
@@ -4123,18 +4162,20 @@ impl WorkflowExecutor {
                             } else {
                                 ColdCleanupAction::Forget
                             };
-                            let cleanup_allows_retry = preserve_then_cleanup_cold_session(
-                                &node.id,
-                                attempt_use.backend(),
-                                &session,
-                                &diagnostic,
-                                action,
-                                cleanup_tracker,
-                                // R2f1b non-success cold exit (repair RC): the stream failed transiently; the attempt will retry.
-                                ColdExitV1::Failure,
-                            )
-                            .await
-                            .is_ok();
+                            let cleanup_allows_retry = matches!(
+                                preserve_then_cleanup_cold_session(
+                                    &node.id,
+                                    attempt_use.backend(),
+                                    &session,
+                                    &diagnostic,
+                                    action,
+                                    cleanup_tracker,
+                                    // R2f1b non-success cold exit (repair RC): the stream failed transiently; the attempt will retry.
+                                    ColdExitV1::Failure,
+                                )
+                                .await,
+                                Ok(BackendCleanupDispositionV1::Complete)
+                            );
                             break 'attempt Attempt::Transient {
                                 err: e,
                                 usage,
@@ -4197,7 +4238,7 @@ impl WorkflowExecutor {
                     .await;
                     if ok {
                         match cleanup {
-                            Ok(()) => {
+                            Ok(_) => {
                                 attempt_harvest = node_harvest_meta_from_context(
                                     obs_ctx_ref.clone(),
                                     node,
@@ -5724,7 +5765,7 @@ mod tests {
                 _o: Arc<dyn DiagnosticObserver>,
             ) -> Result<bridge_core::ports::BackendCleanupDispositionV1, BridgeError> {
                 self.calls.seen.lock().unwrap().push("forget_observed");
-                Ok(bridge_core::ports::BackendCleanupDispositionV1::Complete)
+                Ok(bridge_core::ports::BackendCleanupDispositionV1::Retained)
             }
             async fn release_session_observed(
                 &self,
@@ -5732,7 +5773,7 @@ mod tests {
                 _o: Arc<dyn DiagnosticObserver>,
             ) -> Result<bridge_core::ports::BackendCleanupDispositionV1, BridgeError> {
                 self.calls.seen.lock().unwrap().push("release_observed");
-                Ok(bridge_core::ports::BackendCleanupDispositionV1::Complete)
+                Ok(bridge_core::ports::BackendCleanupDispositionV1::Unknown)
             }
             async fn retire(&self) -> Result<(), BridgeError> {
                 self.calls.seen.lock().unwrap().push("retire");
@@ -5750,10 +5791,20 @@ mod tests {
         let session = SessionId::parse("cold-cleanup-session").unwrap();
         let tracker = WorkflowCleanupTracker::default();
 
-        for action in [ColdCleanupAction::Forget, ColdCleanupAction::Release] {
-            cleanup_cold_session(&node, &backend, &session, &observer, action, &tracker)
-                .await
-                .unwrap();
+        for (action, expected) in [
+            (
+                ColdCleanupAction::Forget,
+                BackendCleanupDispositionV1::Retained,
+            ),
+            (
+                ColdCleanupAction::Release,
+                BackendCleanupDispositionV1::Unknown,
+            ),
+        ] {
+            assert_eq!(
+                cleanup_cold_session(&node, &backend, &session, &observer, action, &tracker).await,
+                Ok(expected)
+            );
         }
 
         assert_eq!(
@@ -7133,6 +7184,49 @@ mod tests {
             ["preserve", "forget"],
             "the no-cancel destroy site must still preserve before it tears the session down"
         );
+    }
+
+    /// Task G characterization: provider acceptance followed by persistence failure was already
+    /// fatal on the frozen input. A configured retry policy must not turn that accepted turn into
+    /// a second provider dispatch.
+    #[tokio::test]
+    async fn task_g_post_acceptance_persistence_failure_is_fatal_and_nonretryable() {
+        let rec = Arc::new(RetryRec::default());
+        let rich_sink = Arc::new(FailingRichSink::default());
+        let context = WorkflowRunContext {
+            make_rich_sink: Some(Arc::new(FailingRichFactory {
+                sink: rich_sink.clone(),
+            })),
+            ..WorkflowRunContext::default()
+        };
+        let ex = WorkflowExecutor::new(Arc::new(RetryRegistry {
+            behavior: RetryBehavior::SucceedsAfterInvalidates {
+                required_invalidates: 0,
+            },
+            rec: rec.clone(),
+        }));
+
+        let events = ex
+            .run_with_context(
+                retry_graph(Some(retry_policy(3, 0))),
+                "DIFF".into(),
+                "task-g-persistence".into(),
+                CancellationToken::new(),
+                context,
+            )
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()
+            .expect("persistence failure is a node terminal, not an executor error");
+        let (ok, output, _usage) = only_node_finished(&events);
+
+        assert!(!*ok);
+        assert!(output.contains("rich-flush failed"), "{output}");
+        assert_eq!(rich_sink.flushes.load(Ordering::SeqCst), 1);
+        assert_eq!(rec.resolve_count.load(Ordering::SeqCst), 1);
+        assert_eq!(rec.prompt_count.load(Ordering::SeqCst), 1);
+        assert_eq!(rec.invalidate_count.load(Ordering::SeqCst), 0);
     }
 
     /// Repair RC — the outcome→disposition mapping ITSELF, as a table. This is the centralization
@@ -9681,6 +9775,7 @@ mod tests {
         configures: AtomicUsize,
         prompts: AtomicUsize,
         cleanups: Mutex<Vec<(&'static str, Arc<dyn DiagnosticObserver>)>>,
+        cleanup_result: Result<BackendCleanupDispositionV1, BridgeError>,
     }
 
     #[async_trait::async_trait]
@@ -9738,7 +9833,7 @@ mod tests {
             observer: Arc<dyn DiagnosticObserver>,
         ) -> Result<bridge_core::ports::BackendCleanupDispositionV1, BridgeError> {
             self.cleanups.lock().unwrap().push(("release", observer));
-            Err(BridgeError::StoreFailure)
+            self.cleanup_result.clone()
         }
     }
 
@@ -9781,12 +9876,16 @@ mod tests {
         }
     }
 
-    async fn assert_cleanup_failure_vetoes_transient_retry(site: ColdTransientSite) {
+    async fn assert_cleanup_result_vetoes_transient_retry(
+        site: ColdTransientSite,
+        cleanup_result: Result<BackendCleanupDispositionV1, BridgeError>,
+    ) {
         let backend = Arc::new(ColdTransientCleanupBackend {
             site,
             configures: AtomicUsize::new(0),
             prompts: AtomicUsize::new(0),
             cleanups: Mutex::new(Vec::new()),
+            cleanup_result,
         });
         let registry = Arc::new(ColdTransientRetryRegistry {
             backend: backend.clone(),
@@ -9832,19 +9931,45 @@ mod tests {
 
     #[tokio::test]
     async fn final_review_configure_cleanup_failure_vetoes_transient_retry() {
-        assert_cleanup_failure_vetoes_transient_retry(ColdTransientSite::Configure).await;
+        assert_cleanup_result_vetoes_transient_retry(
+            ColdTransientSite::Configure,
+            Err(BridgeError::StoreFailure),
+        )
+        .await;
     }
 
     #[tokio::test]
     async fn final_review_prompt_open_cleanup_failure_vetoes_transient_retry() {
-        assert_cleanup_failure_vetoes_transient_retry(ColdTransientSite::PromptOpen).await;
+        assert_cleanup_result_vetoes_transient_retry(
+            ColdTransientSite::PromptOpen,
+            Err(BridgeError::StoreFailure),
+        )
+        .await;
     }
 
     #[tokio::test]
     async fn final_review_stream_cleanup_failure_vetoes_transient_retry() {
-        assert_cleanup_failure_vetoes_transient_retry(ColdTransientSite::Stream).await;
+        assert_cleanup_result_vetoes_transient_retry(
+            ColdTransientSite::Stream,
+            Err(BridgeError::StoreFailure),
+        )
+        .await;
     }
 
+    #[tokio::test]
+    async fn task_g_unknown_cleanup_disposition_vetoes_every_transient_redispatch() {
+        for site in [
+            ColdTransientSite::Configure,
+            ColdTransientSite::PromptOpen,
+            ColdTransientSite::Stream,
+        ] {
+            assert_cleanup_result_vetoes_transient_retry(
+                site,
+                Ok(BackendCleanupDispositionV1::Unknown),
+            )
+            .await;
+        }
+    }
     enum ColdReadyRace {
         PromptOpenError,
         StreamError,
