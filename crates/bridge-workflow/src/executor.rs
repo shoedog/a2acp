@@ -1923,11 +1923,11 @@ impl WorkflowExecutor {
                 .clone()
         };
 
-        // The cell single-flights concurrent first misses. Only successful
-        // decisions remain in the run cache. Cancellation and failures proved
-        // pre-acceptance are evicted below so they cannot poison later nodes;
-        // accepted or indeterminate prompt failures remain cached so another
-        // node in this run cannot replay possibly accepted work.
+        // The cell single-flights concurrent first misses. Successful decisions
+        // remain in the run cache. A failure is evicted only when it is both
+        // pre-acceptance and proven clean; every unproven or accepted failure
+        // remains cached so another node in this run cannot replay possibly
+        // accepted work or reuse a session with protective cleanup debt.
         let result = cell
             .get_or_init(|| async {
                 self.run_agent_preflight_uncached(
@@ -1978,6 +1978,7 @@ impl WorkflowExecutor {
         let agent = source.agent().clone();
         let primary_model = source.primary_model();
         let mut attempts = Vec::new();
+        let mut retain_exhausted_failure = false;
         for (idx, model) in candidates.iter().enumerate() {
             if cancel.is_cancelled() {
                 return Err(PreflightFailure::Canceled);
@@ -2127,9 +2128,9 @@ impl WorkflowExecutor {
                         }
                     },
                 });
-                if idx + 1 < candidates.len()
-                    && matches!(cleanup_result, Ok(BackendCleanupDispositionV1::Complete))
-                {
+                let cleanup_proven_complete =
+                    matches!(cleanup_result, Ok(BackendCleanupDispositionV1::Complete));
+                if idx + 1 < candidates.len() && cleanup_proven_complete {
                     attempt_use
                         .into_retry_invalidation(&agent)
                         .apply(self.registry.as_ref())
@@ -2142,6 +2143,7 @@ impl WorkflowExecutor {
                     );
                     continue;
                 }
+                retain_exhausted_failure = !cleanup_proven_complete;
                 break;
             }
             // ENUMERATED CHECKOUT SITE (preflight). A preflight session configures through the
@@ -2333,12 +2335,11 @@ impl WorkflowExecutor {
                             retain_in_run_cache: true,
                         });
                     }
-                    if idx + 1 < candidates.len()
-                        && matches!(
-                            cleanup_result,
-                            Some(Ok(BackendCleanupDispositionV1::Complete))
-                        )
-                    {
+                    let cleanup_proven_complete = matches!(
+                        cleanup_result,
+                        Some(Ok(BackendCleanupDispositionV1::Complete))
+                    );
+                    if idx + 1 < candidates.len() && cleanup_proven_complete {
                         attempt_use
                             .into_retry_invalidation(&agent)
                             .apply(self.registry.as_ref())
@@ -2351,6 +2352,7 @@ impl WorkflowExecutor {
                         );
                         continue;
                     }
+                    retain_exhausted_failure = !cleanup_proven_complete;
                     break;
                 }
             };
@@ -2483,16 +2485,18 @@ impl WorkflowExecutor {
 
             let reason = match cleanup_result {
                 Some(Err(error)) => format!("cleanup error: {error:?}"),
+                Some(Ok(BackendCleanupDispositionV1::Complete)) | None => {
+                    reason.unwrap_or_else(|| {
+                        if !saw_done {
+                            "stream ended before terminal Done".to_string()
+                        } else if text.trim().is_empty() {
+                            "empty final".to_string()
+                        } else {
+                            format!("unexpected smoke response: {text:?}")
+                        }
+                    })
+                }
                 Some(Ok(disposition)) => format!("cleanup incomplete: {disposition:?}"),
-                None => reason.unwrap_or_else(|| {
-                    if !saw_done {
-                        "stream ended before terminal Done".to_string()
-                    } else if text.trim().is_empty() {
-                        "empty final".to_string()
-                    } else {
-                        format!("unexpected smoke response: {text:?}")
-                    }
-                }),
             };
             attempts.push(AttemptSummary {
                 attempt: attempt_no,
@@ -2520,7 +2524,7 @@ impl WorkflowExecutor {
                 format_attempt_summaries(&attempts)
             ),
             failure_class: FailureClass::Other,
-            retain_in_run_cache: false,
+            retain_in_run_cache: retain_exhausted_failure,
         })
     }
 
@@ -7997,6 +8001,7 @@ mod tests {
 
     #[derive(Clone, Copy, Debug)]
     enum PreflightFault {
+        Configure,
         PromptAccepted,
         PromptRejected,
         StreamError,
@@ -8008,6 +8013,7 @@ mod tests {
 
     #[derive(Default)]
     struct PreflightFaultState {
+        configures: AtomicUsize,
         prompts: AtomicUsize,
         cancels: AtomicUsize,
         forgets: AtomicUsize,
@@ -8017,6 +8023,7 @@ mod tests {
     struct PreflightFaultBackend {
         fault: PreflightFault,
         state: Arc<PreflightFaultState>,
+        cleanup_result: Result<BackendCleanupDispositionV1, BridgeError>,
     }
 
     fn preflight_prompt_failure(accepted: bool) -> BridgeError {
@@ -8070,6 +8077,7 @@ mod tests {
                 return Ok(Box::pin(tokio_stream::iter(text_done("PONG"))));
             }
             match self.fault {
+                PreflightFault::Configure => Ok(Box::pin(tokio_stream::iter(text_done("PONG")))),
                 PreflightFault::PromptAccepted => Err(preflight_prompt_failure(true)),
                 PreflightFault::PromptRejected => Err(preflight_prompt_failure(false)),
                 PreflightFault::StreamError => Ok(Box::pin(tokio_stream::iter(vec![Err(
@@ -8099,16 +8107,28 @@ mod tests {
             session: &SessionId,
             spec: &SessionSpec,
         ) -> Result<(), BridgeError> {
+            self.state.configures.fetch_add(1, Ordering::SeqCst);
             self.state
                 .session_models
                 .lock()
                 .unwrap()
                 .insert(session.as_str().to_string(), spec.config.model.clone());
-            Ok(())
+            if matches!(self.fault, PreflightFault::Configure)
+                && spec.config.model.as_deref() == Some("bad")
+            {
+                Err(BridgeError::AgentTimedOut)
+            } else {
+                Ok(())
+            }
         }
 
-        async fn forget_session(&self, _session: &SessionId) {
+        async fn forget_session_observed(
+            &self,
+            _session: &SessionId,
+            _observer: Arc<dyn DiagnosticObserver>,
+        ) -> Result<BackendCleanupDispositionV1, BridgeError> {
             self.state.forgets.fetch_add(1, Ordering::SeqCst);
+            self.cleanup_result.clone()
         }
     }
 
@@ -8472,10 +8492,24 @@ mod tests {
         Arc<PreflightFaultState>,
         Arc<SharedBackendRegistry>,
     ) {
+        exercise_preflight_fault_with_cleanup(fault, Ok(BackendCleanupDispositionV1::Complete))
+            .await
+    }
+
+    async fn exercise_preflight_fault_with_cleanup(
+        fault: PreflightFault,
+        cleanup_result: Result<BackendCleanupDispositionV1, BridgeError>,
+    ) -> (
+        Result<PreflightDecision, PreflightFailure>,
+        Result<PreflightDecision, PreflightFailure>,
+        Arc<PreflightFaultState>,
+        Arc<SharedBackendRegistry>,
+    ) {
         let state = Arc::new(PreflightFaultState::default());
         let backend: Arc<dyn AgentBackend> = Arc::new(PreflightFaultBackend {
             fault,
             state: state.clone(),
+            cleanup_result,
         });
         let registry = Arc::new(SharedBackendRegistry {
             entry: preflight_entry("bad", &["good"]),
@@ -8561,26 +8595,86 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn preflight_terminal_failures_are_sticky_and_never_fall_back() {
-        for fault in [
-            PreflightFault::TerminalEmpty,
-            PreflightFault::TerminalUnexpected,
-            PreflightFault::TerminalCancelled,
+    async fn preflight_terminal_failures_preserve_response_reason_after_complete_cleanup() {
+        for (fault, expected_reason) in [
+            (PreflightFault::TerminalEmpty, "empty final"),
+            (
+                PreflightFault::TerminalUnexpected,
+                "unexpected smoke response",
+            ),
+            (
+                PreflightFault::TerminalCancelled,
+                "preflight canceled by agent",
+            ),
         ] {
             let (first, second, state, registry) = exercise_preflight_fault(fault).await;
+            let first_message = match &first {
+                Err(PreflightFailure::Hard { message, .. }) => message,
+                other => {
+                    panic!("{fault:?} must fail after the accepted terminal response: {other:?}")
+                }
+            };
+            let second_message = match &second {
+                Err(PreflightFailure::Hard { message, .. }) => message,
+                other => panic!("{fault:?} must remain sticky within the workflow run: {other:?}"),
+            };
+            assert!(first_message.contains(expected_reason), "{first_message}");
             assert!(
-                matches!(first, Err(PreflightFailure::Hard { .. })),
-                "{fault:?} must fail after the accepted terminal response"
+                !first_message.contains("cleanup incomplete: Complete"),
+                "{first_message}"
             );
-            assert!(
-                matches!(second, Err(PreflightFailure::Hard { .. })),
-                "{fault:?} must remain sticky within the workflow run"
-            );
+            assert_eq!(second_message, first_message, "{fault:?}");
             assert_eq!(state.prompts.load(Ordering::SeqCst), 1, "{fault:?}");
             assert_eq!(state.cancels.load(Ordering::SeqCst), 0, "{fault:?}");
             assert_eq!(state.forgets.load(Ordering::SeqCst), 1, "{fault:?}");
             assert_eq!(registry.invalidates.load(Ordering::SeqCst), 0, "{fault:?}");
         }
+    }
+
+    #[tokio::test]
+    async fn preflight_unproven_cleanup_is_sticky_after_pre_acceptance_failure() {
+        let mut redispatches = Vec::new();
+        for fault in [PreflightFault::Configure, PreflightFault::PromptRejected] {
+            for cleanup_result in [
+                Ok(BackendCleanupDispositionV1::Unknown),
+                Ok(BackendCleanupDispositionV1::Retained),
+                Ok(BackendCleanupDispositionV1::Preserved),
+                Err(BridgeError::AgentTimedOut),
+            ] {
+                let cleanup_label = format!("{cleanup_result:?}");
+                let (first, second, state, registry) =
+                    exercise_preflight_fault_with_cleanup(fault, cleanup_result).await;
+                assert!(
+                    matches!(first, Err(PreflightFailure::Hard { .. })),
+                    "{fault:?}"
+                );
+                assert!(
+                    matches!(second, Err(PreflightFailure::Hard { .. })),
+                    "{fault:?}"
+                );
+                let actual = (
+                    state.configures.load(Ordering::SeqCst),
+                    state.prompts.load(Ordering::SeqCst),
+                    state.cancels.load(Ordering::SeqCst),
+                    state.forgets.load(Ordering::SeqCst),
+                    registry.invalidates.load(Ordering::SeqCst),
+                );
+                let expected = (
+                    1,
+                    usize::from(matches!(fault, PreflightFault::PromptRejected)),
+                    0,
+                    1,
+                    0,
+                );
+                if actual != expected {
+                    redispatches.push(format!("{fault:?}/{cleanup_label}: {actual:?}"));
+                }
+            }
+        }
+        assert!(
+            redispatches.is_empty(),
+            "a second preflight dispatch occurred: {redispatches:#?}"
+        );
     }
 
     #[tokio::test]

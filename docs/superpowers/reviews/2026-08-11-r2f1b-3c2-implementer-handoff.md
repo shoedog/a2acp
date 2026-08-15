@@ -1,7 +1,85 @@
 # R2f1b 3c2 implementer handoff — API request-flight authority
 
 Date: 2026-08-15
-Base: `f17e2bd37868c398d5c04d175ffee2a5cc5c1a00`
+Frozen targeted-repair input: `4c8e408bc2290db9de9a3c31763cc0a0a2655c76`
+Original Task G base: `f17e2bd37868c398d5c04d175ffee2a5cc5c1a00`
+
+## Targeted repair closure
+
+The targeted repair closes two preflight-cache gaps left by Task G. A failed
+preflight is now evicted only when provider acceptance is disproven and
+observed cleanup is exactly `Ok(Complete)`. Configure failure and
+provably-unaccepted prompt failure remain cached when cleanup returns
+`Unknown`, `Retained`, `Preserved`, or an error, so a second node cannot
+dispatch into unresolved cleanup debt. Accepted or indeterminate failures keep
+their existing sticky behavior.
+
+Terminal empty, unexpected, and agent-canceled responses now retain their
+response-derived failure reason after exact `Ok(Complete)` cleanup. The
+protective cleanup dispositions still replace that reason with the existing
+`cleanup incomplete` diagnostic, and cleanup errors remain cleanup errors.
+
+### Targeted fail-first evidence
+
+The exact cleanup-retention red command was:
+
+```bash
+CARGO_INCREMENTAL=0 cargo test -p bridge-workflow --lib \
+  preflight_unproven_cleanup_is_sticky_after_pre_acceptance_failure -- --nocapture
+```
+
+It compiled, selected one test, and failed 0/1 on the frozen production input.
+For each of `Ok(Unknown)`, `Ok(Retained)`, `Ok(Preserved)`, and
+`Err(AgentTimedOut)`, configure failure measured
+`(configures, prompts, cancels, forgets, invalidates) = (2, 0, 0, 2, 0)`;
+provably-unaccepted prompt failure measured `(2, 2, 0, 2, 0)`. Every one of
+the eight rows therefore proved a second dispatch and a second cleanup.
+
+The exact response-reason red command was:
+
+```bash
+CARGO_INCREMENTAL=0 cargo test -p bridge-workflow --lib \
+  preflight_terminal_failures_preserve_response_reason_after_complete_cleanup \
+  -- --nocapture
+```
+
+It compiled, selected one test, and failed 0/1 on the first empty-terminal row
+because the reported reason was `cleanup incomplete: Complete`, not
+`empty final`. Both reds are admissible behavioral evidence: they compiled
+against the exact frozen input, selected the intended regression test, and
+failed on the production behavior under repair rather than setup or fixture
+failure.
+
+### Smoke consumer census and G2 boundary
+
+Read-only inspection of `bin/a2a-bridge/src/smoke.rs` found the ordinary smoke
+consumer at the `release_session_observed` call wrapped by generic
+`cleanup_step`. That generic helper maps every successful typed result —
+`Ok(Complete)`, `Ok(Unknown)`, `Ok(Retained)`, and `Ok(Preserved)` — to
+the same `("completed", None)` step. The ordinary-smoke aggregate remains
+conservative only because its active run backstop forces the aggregate
+`cleanup_disposition` to `unknown`; the generic release step does not
+preserve the typed distinction itself.
+
+**G2 is a separate follow-up:** preserve all four backend cleanup dispositions
+protectively in the smoke artifact, with an explicit wire-compatibility review
+before changing the serialized step or aggregate contract. This targeted
+repair does not edit `smoke.rs`, and both G2 and the 3c2 aggregate review
+remain ahead.
+
+### Targeted verification and accounting
+
+Both focused regression tests pass 1/1 after the repair. With the pinned Rust
+toolchain and `CARGO_INCREMENTAL=0`, full `bridge-workflow` passes 208 tests
+across its harnesses plus doctests (0), and full `bridge-worktree` passes 265
+tests across its harnesses plus doctests (0). `cargo fmt --all -- --check` and
+`git diff --check` pass.
+
+Post-format targeted code churn versus the exact frozen input is production
++28/-24 = 52 lines and +131/-37 = 168 lines including colocated tests. Including
+this handoff refresh, final total churn is +210/-38 = 248 lines, below the
+300-line stop limit. The production API remains `LegacyV2`, and the V3 route
+remains unarmed.
 
 ## Outcome
 
