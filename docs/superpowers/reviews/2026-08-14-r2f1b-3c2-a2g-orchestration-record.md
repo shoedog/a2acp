@@ -325,6 +325,33 @@ All checks passed; no drift found.
   population; on A4 acceptance the orchestration proceeds directly to
   Task B (A4 completes Task A) without a further owner round-trip, under
   the standing per-task cap discipline and the recorded non-scope.
+- 2026-08-15: A4 targeted repair executed: commit `6a6ea1f9` (342 total
+  churn, inside its declared 140/350... production within; see handoff),
+  in-container verify PASS. Advisory review REJECT with ONE remaining
+  WRONG: recorded debt could surface as ordinary `Refused`/`NoEffect` when
+  reserved-target validation or fallible preflights ran before the debt
+  check — verified at source (population collapsed 5 → 1).
+- 2026-08-15: disclosed operator completion `7a973866` (259 churn, ~35
+  production), red-first — three domination tests observed red on
+  `6a6ea1f9` (`a4c-red.log`): `refuse_debt` first in stage/publish/append
+  plus a debt-first line in `guard` (covers sync and the transaction
+  `ready` path); transaction outcomes record debt at the engine `*_with`
+  layer; reserved-target checks moved after admission. Semantic repin
+  disclosed to the closure lens: a reserved-named object present in the
+  root refuses protectively (residue by definition); the pure name refusal
+  now owns the clean-root case. One candidate fix self-refuted during
+  verification (append rollback-clear unreachable for prior debt — guard
+  blocks first); dropped, not churned. Full `bridge-core --lib` 610/0.
+  Line preserved at `salvage/r2f1b-3c2-a4-repaired`.
+- Host gates on exact `7a973866` in the run clone, all exit 0: **4,024
+  passed / 0 failed / 13 ignored across 90 harnesses**, deny green,
+  hygiene 40/8 (log: session scratchpad `a4-host-gates.log`).
+- Counted closure review dispatched on the full `6114596d..7a973866` line —
+  brief committed beside this record as
+  [`2026-08-14-r2f1b-3c2-task-a4-closure-brief.md`](2026-08-14-r2f1b-3c2-task-a4-closure-brief.md);
+  the four operator adjudications and the repin disclosed for contest. An
+  APPROVE completes Task A; Task B then freezes the accepted head per the
+  standing owner authorization.
 
 ## Non-scope reaffirmed
 
