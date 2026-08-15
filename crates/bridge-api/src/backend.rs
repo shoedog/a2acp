@@ -808,7 +808,6 @@ struct RequestScope {
     flight: Option<OwnedRemoteRequestV1>,
     lifecycle: Option<ApiLifecycle>,
     accepted: Arc<std::sync::atomic::AtomicBool>,
-    dispatched: bool,
     settled: bool,
 }
 struct RequestAcceptanceMarker {
@@ -873,12 +872,22 @@ impl RequestScope {
         }
     }
 
+    fn acceptance_keyed_disposition(
+        &self,
+        accepted_disposition: ResourceActionDispositionV1,
+    ) -> ResourceActionDispositionV1 {
+        if self.accepted.load(Ordering::Acquire) {
+            accepted_disposition
+        } else {
+            ResourceActionDispositionV1::Failed
+        }
+    }
+
     fn begin_dispatch(&mut self) -> Result<(), ApiRequestFlightErrorV1> {
         if let Some(flight) = &self.flight {
             flight.journal_intent()?;
             flight.authorize_dispatch()?;
         }
-        self.dispatched = true;
         Ok(())
     }
 
@@ -886,6 +895,7 @@ impl RequestScope {
         mut self,
         disposition: ResourceActionDispositionV1,
     ) -> Result<ResourceActionResultV1, ApiRequestFlightErrorV1> {
+        let disposition = self.acceptance_keyed_disposition(disposition);
         let (result, acknowledged) = match self.flight.take() {
             Some(flight) => {
                 let outcome = flight.settle(ResourceActionResultV1 {
@@ -925,13 +935,12 @@ impl Drop for RequestScope {
         if self.settled {
             return;
         }
-        let disposition = if !self.dispatched {
-            ResourceActionDispositionV1::Failed
-        } else if *self.cancel_control.borrow() {
+        let accepted_disposition = if *self.cancel_control.borrow() {
             ResourceActionDispositionV1::Partial
         } else {
             ResourceActionDispositionV1::Unknown
         };
+        let disposition = self.acceptance_keyed_disposition(accepted_disposition);
         // Transfer every piece of local cleanup authority before attempting a
         // fallible settlement. The custodian, not this scope, owns the result.
         self.cleanup.settle_drop(
@@ -1122,7 +1131,6 @@ impl RequestAdmission {
                             flight,
                             lifecycle: None,
                             accepted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-                            dispatched: false,
                             settled: false,
                         }),
                         cancel_rx,
@@ -2583,6 +2591,75 @@ mod tests {
             journal_root,
             _root: root,
         }
+    }
+
+    async fn task_f_exit_after_dispatch_before_first_send_poll(cancelled: bool) {
+        let server = MockServer::start().await;
+        let fixture = protected_backend(format!("{}/v1", server.uri()), vec![], 64, 4, None);
+        let session = SessionId::parse(if cancelled {
+            "task-f-unpolled-cancel"
+        } else {
+            "task-f-unpolled-drop"
+        })
+        .unwrap();
+        fixture
+            .backend
+            .attach_resource_flight_owner_v1(&session)
+            .unwrap();
+        let turn = fixture.backend.begin_turn(&session).unwrap();
+        let PreparedRequest::Ready {
+            mut scope,
+            cancel_rx,
+        } = fixture
+            .backend
+            .request_admission()
+            .prepare(&session, turn.epoch)
+            .unwrap()
+        else {
+            panic!("Task F request must be admitted");
+        };
+        scope.begin_dispatch().unwrap();
+
+        let turn_accepted = Arc::new(AtomicBool::new(false));
+        let accepted = scope.acceptance_marker(Arc::clone(&turn_accepted));
+        let send = drive_provider_send(
+            scope.flight.as_ref(),
+            fixture
+                .backend
+                .client
+                .post(format!("{}/v1/chat/completions", server.uri()))
+                .send(),
+            accepted,
+        );
+        if cancelled {
+            fixture.backend.cancel(&session).await.unwrap();
+            assert!(*cancel_rx.borrow(), "the exact request must observe cancel");
+        }
+
+        drop(send);
+        assert!(!turn_accepted.load(Ordering::Acquire));
+        assert!(!scope.accepted.load(Ordering::Acquire));
+        drop(scope);
+        drop(turn);
+
+        assert!(server.received_requests().await.unwrap().is_empty());
+        let publications = fixture.publisher.0.lock().unwrap();
+        assert_eq!(publications.len(), 1);
+        assert_eq!(
+            publications[0].result().disposition,
+            ResourceActionDispositionV1::Failed
+        );
+        assert!(!publications[0].prompt_may_have_been_accepted());
+    }
+
+    #[tokio::test]
+    async fn task_f_cancel_after_dispatch_before_first_send_poll_is_failed_unaccepted() {
+        task_f_exit_after_dispatch_before_first_send_poll(true).await;
+    }
+
+    #[tokio::test]
+    async fn task_f_drop_after_dispatch_before_first_send_poll_is_failed_unaccepted() {
+        task_f_exit_after_dispatch_before_first_send_poll(false).await;
     }
 
     fn cleanup_request_flight(
