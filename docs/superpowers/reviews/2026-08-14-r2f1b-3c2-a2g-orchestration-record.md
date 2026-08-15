@@ -583,6 +583,32 @@ All checks passed; no drift found.
   driver, first-poll admission token, durable-CAS settlement, bounded
   observation, refusal debt (caps 450/850 churn; brief mirrored as
   [`2026-08-14-r2f1b-3c2-task-d-brief.md`](2026-08-14-r2f1b-3c2-task-d-brief.md)).
+- 2026-08-15: D base run: candidate `bd29eddf` (428/735, in caps; verify
+  fully green). Advisory review REJECT with ONE blocker: the
+  effect-then-debt arming arm left the armed row un-terminalized, so
+  recovery reported `Unknown, accepted=true` despite the live path's
+  positive zero-poll knowledge. Candidate preserved at
+  `salvage/r2f1b-3c2-d-candidate`; repair declared (80/250; mirror
+  [`2026-08-14-r2f1b-3c2-task-d-repair-brief.md`](2026-08-14-r2f1b-3c2-task-d-repair-brief.md)).
+- 2026-08-15: targeted repair `a072aacb` (7 production/200 total)
+  delivered the fix with the documented conservative fallback; its
+  advisory review found the supporting CAS widening let ANY unaccepted
+  settlement consume an armed row — a stale acceptance flag racing the
+  arm/atomic handoff could durably misreport an accepted send as
+  `accepted=false` (the dangerous direction).
+- 2026-08-15: disclosed operator completion `08aa5531` (+71/−5),
+  red-first (the stale-flag regression PUBLISHED `accepted=false` over a
+  durably armed row on the pre-change head; log `dx-red.log`): the
+  armed-row allowance is a private `failed_arm` privilege confined to the
+  arming wrapper's zero-poll branch; ordinary settle/drop/recovery refuse
+  `InvalidStateTransition`. Full lib 656/0; clippy clean. Head preserved
+  at `salvage/r2f1b-3c2-d-repaired`. This completion is INSIDE D's
+  declared round — the counted closure reviews the full line including it.
+- Host gates on exact `08aa5531` all exit 0: **4,070 passed / 0 failed /
+  13 ignored across 90 harnesses**, hygiene 40/8 (log `d-host-gates.log`).
+- Counted closure dispatched on the full `832221c9..08aa5531` line; brief
+  mirrored as
+  [`2026-08-14-r2f1b-3c2-task-d-closure-brief.md`](2026-08-14-r2f1b-3c2-task-d-closure-brief.md).
 
 ## Non-scope reaffirmed
 
