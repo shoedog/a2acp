@@ -551,6 +551,38 @@ All checks passed; no drift found.
 - Counted closure dispatched on the full `dbf514bd..8e50669` line; brief
   mirrored as
   [`2026-08-14-r2f1b-3c2-task-c-closure-brief.md`](2026-08-14-r2f1b-3c2-task-c-closure-brief.md).
+- 2026-08-15: the C closure adjudicated BOTH round-1 blockers FIXED,
+  accepted the authorized custody accessor and the send-state resolution
+  of B2's ambiguity, and REJECTed on ONE fresh WRONG — recovery ran before
+  the full request census was validated, so an attempt containing both
+  legitimate Task A residue and an independently corrupt row could have
+  its residue mutated before the corrupt row refused (byte-preservation
+  contract broken). Two DEFERs (positive-edge and binding regression
+  strength). This is the validate-before-recover class at its terminal
+  scope.
+- 2026-08-15: **disclosed operator convergence extension** `832221c9`
+  (+107, incl. handoff): `open` now runs a residue-tolerant validation
+  pass (`scan_with`) over every ordinary row BEFORE any recovery; reserved
+  entries stay recovery's domain; the full scan still follows recovery.
+  Red-first: the composite regression (public-surface stage residue plus
+  corrupt sibling) observed recovery's
+  `ProtectiveDebt("missing or duplicate intent")` on the pre-change head
+  where `Malformed` was required; post-fix it refuses `Malformed`
+  byte-preserved, and the residue-only control keeps the recovery-side
+  classification. Class-terminal. Full lib 647/0; clippy clean. **BINDING
+  second look at the post-G aggregate round** (third extension in that
+  ledger).
+- Host gates on exact `832221c9` all exit 0: **4,061 passed / 0 failed /
+  13 ignored across 90 harnesses**, hygiene 40/8 (log
+  `c-host-gates-2.log`).
+- 2026-08-15: **C ACCEPTED at exact `832221c9` — TASK C COMPLETE**
+  (custody at `salvage/r2f1b-3c2-c-accepted`). D-round ledger: the two C
+  closure DEFERs (positive-edge admission proof; publication-level binding
+  regression) fold into D/E riders where their surfaces are touched.
+- 2026-08-15: **Task D dispatched** from exact `832221c9` — owned request
+  driver, first-poll admission token, durable-CAS settlement, bounded
+  observation, refusal debt (caps 450/850 churn; brief mirrored as
+  [`2026-08-14-r2f1b-3c2-task-d-brief.md`](2026-08-14-r2f1b-3c2-task-d-brief.md)).
 
 ## Non-scope reaffirmed
 
