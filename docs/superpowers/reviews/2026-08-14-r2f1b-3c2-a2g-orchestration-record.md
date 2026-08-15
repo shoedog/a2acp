@@ -523,6 +523,34 @@ All checks passed; no drift found.
   complete recovery table, idempotent outbox, authority-binding rider
   (caps 500/900 churn, C2 split escape hatch; brief mirrored as
   [`2026-08-14-r2f1b-3c2-task-c-brief.md`](2026-08-14-r2f1b-3c2-task-c-brief.md)).
+- 2026-08-15: C base run: candidate `4db414f0` (480 production / 845 total
+  churn, in caps; verify fully green in-container). Advisory review REJECT
+  with two closed blockers, both operator-verified (lease child omitted
+  from admission headroom → strandable attempt at maximum occupancy;
+  operation lock taken before the lifetime lease → contended openers get
+  `TaskA(Unknown)` instead of `AttemptLive`), plus one folded evidence
+  SMELL. Candidate preserved at `salvage/r2f1b-3c2-c-candidate`; repair
+  declared (180/450; one narrow route-proved fs_custody lease accessor
+  operator-authorized and disclosed; mirror
+  [`2026-08-14-r2f1b-3c2-task-c-repair-brief.md`](2026-08-14-r2f1b-3c2-task-c-repair-brief.md)).
+- 2026-08-15: the first repair dispatch was refused by the D-4 storage
+  admission floor (29.9 GiB free < 50): the lane's clone build targets had
+  accumulated ~99 GiB. Guarded reap executed (dry-run inspected; 26 build
+  targets, per-clone receipts) → 119 GiB free. Lesson recorded: reap clone
+  targets at each task acceptance, not only at folds.
+- 2026-08-15: targeted repair `8e50669` converged in one attempt
+  (fs_custody +102 = the authorized accessor with colocated tests; module
+  +140/−50; handoff +79; within caps): lease-aware headroom (footprint
+  four, positive-edge heal, cap-edge tests migrated red-first) and
+  lease-before-operation acquisition with exact `AttemptLive` and a
+  lock-order regression. In-container verify fully green; advisory review
+  APPROVE with two low-risk DEFERs. Head preserved at
+  `salvage/r2f1b-3c2-c-repaired`.
+- Host gates on exact `8e50669` all exit 0: **4,060 passed / 0 failed /
+  13 ignored across 90 harnesses**, hygiene 40/8 (log `c-host-gates.log`).
+- Counted closure dispatched on the full `dbf514bd..8e50669` line; brief
+  mirrored as
+  [`2026-08-14-r2f1b-3c2-task-c-closure-brief.md`](2026-08-14-r2f1b-3c2-task-c-closure-brief.md).
 
 ## Non-scope reaffirmed
 
