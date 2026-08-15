@@ -1079,6 +1079,26 @@ All checks passed; no drift found.
 - The exact combined diff for the aggregate dual-lens round is
   `42249b3d..50f3336e` (51 commits; `42249b3d` is the 3c1-folded main
   and the verified merge-base of the lane).
+- 2026-08-15: **aggregate dual-lens round DISPATCHED** on the exact
+  combined diff, one completed pass per lens, no automatic retry:
+  (1) Sol/xhigh via the bridge (concurrency and ownership; the four
+  BINDING extension second looks — A4 census/derivation, B2
+  relabel-first heal, C validate-before-recover, G
+  metadata-before-effects — explicitly commissioned; deferred
+  test-hardening items handed over for hides-a-blocker judgment only;
+  sustained threat-model rulings not reopened without a new
+  constructible WRONG; brief mirrored as
+  [`2026-08-15-r2f1b-3c2-aggregate-sol-brief.md`](2026-08-15-r2f1b-3c2-aggregate-sol-brief.md));
+  (2) Fable-orchestrated Opus/xhigh lens under a hard read-only
+  contract (release readiness incl. Cargo.lock across the whole range,
+  wire/schema compatibility incl. the smoke vocabulary + reader census
+  + A2A golden-wire tripwire, production-arming/rollback posture incl.
+  no-production-journal-root and clean revert, cross-slice authority
+  incl. the binding two-field `CleanupReportV1` fold and the disclosed
+  cross-crate operator touches, and handoff evidence hygiene).
+  Adjudication, the complete gate rerun on the exact final candidate,
+  byte-identical fold, and the land-or-stop decision follow per the
+  orchestration handoff.
 
 ## Non-scope reaffirmed
 
