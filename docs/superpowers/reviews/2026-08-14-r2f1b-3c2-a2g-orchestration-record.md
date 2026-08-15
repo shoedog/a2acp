@@ -762,6 +762,22 @@ All checks passed; no drift found.
 - Final counted closure dispatched on the full `2697c438..a1f1f8de`
   line; brief mirrored as
   [`2026-08-15-r2f1b-3c2-task-e-final-closure-brief.md`](2026-08-15-r2f1b-3c2-task-e-final-closure-brief.md).
+- 2026-08-15: **final closure APPROVE — both prior blockers FIXED, the
+  admission-reset relaxation ACCEPTED as mechanism-correct, no new
+  WRONGs** (96/100; two regression-hardening DEFERs to the aggregate
+  ledger: an admission-reset state-table fail-first test red on
+  `1f3c3a82` with the negative terminal cases, and a bound public-path
+  stale-cell recreation test). **E ACCEPTED at exact `a1f1f8de` — TASK
+  E COMPLETE** (custody at `salvage/r2f1b-3c2-e-repaired2`; artifact
+  mirrored as
+  [`2026-08-15-r2f1b-3c2-task-e-sol-closure-2.md`](2026-08-15-r2f1b-3c2-task-e-sol-closure-2.md)).
+- 2026-08-15: **Task F dispatched** from exact `a1f1f8de` — migrate API
+  request execution onto the Task B-D `RemoteRequest*` mechanism, wire
+  the exact-echo publication acknowledgement into the cleanup cell, and
+  remove the shared-flight adapter with its request-only core
+  additions (caps 500/900, F2 split escape hatch per the salvage plan;
+  brief mirrored as
+  [`2026-08-15-r2f1b-3c2-task-f-brief.md`](2026-08-15-r2f1b-3c2-task-f-brief.md)).
 
 ## Non-scope reaffirmed
 
