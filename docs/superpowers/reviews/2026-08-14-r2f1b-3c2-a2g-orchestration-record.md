@@ -253,6 +253,31 @@ All checks passed; no drift found.
   brief committed beside this record as
   [`2026-08-14-r2f1b-3c2-task-a3-closure-brief.md`](2026-08-14-r2f1b-3c2-task-a3-closure-brief.md);
   all six operator adjudications disclosed for contest.
+- 2026-08-15: **A3 ACCEPTED at exact `6114596d`.** The counted Sol/xhigh
+  closure (`exec-2e4b62d4453c6b53365819b5bd4e1b84` /
+  `attempt-a72fff5af4f86359485d1f7a092198f6`) returned `VERDICT: APPROVE`
+  with **0 WRONG / 1 SMELL-DEFER** at 94/100; artifact 9,822 bytes, SHA-256
+  `8f5a9e5bbd11b09a3603e99138d98decc93d4644863356056c398135b7d76e69`,
+  mirrored as
+  [`2026-08-14-r2f1b-3c2-task-a3-sol-closure.md`](2026-08-14-r2f1b-3c2-task-a3-sol-closure.md).
+  Adjudications: typed-`Unsupported` erasure FIXED; RW1 ACCEPTED-RESIDUAL;
+  RW2 FIXED with the post-check window ACCEPTED-RESIDUAL under the threat
+  model; W2/W3/RW4 operator rulings sustained; both operator commits
+  verified at source (reformat proven mechanical, completion matched to
+  declared scope); cap accounting accepted with no silent scope. A3's
+  amended cap closes with this review.
+- Ledger carried to A4: the closure's DEFER (recovery-specific fail-first
+  regression for the pre-removal commitment recheck, ~15-30 test/seam
+  lines) is a BINDING A4 rider. Standing ledger unchanged: residue
+  -disposition authority for permanent protective `Retained` debt is a
+  later-slice owner question; hygiene ban on module-level `rustfmt::skip`
+  is a separate slice.
+- 2026-08-15: A4 dispatched from exact `6114596d` — "owned journal API and
+  broken-method deletion" (caps 280 production / 650 total, post-format;
+  same declared review-cap shape). Brief committed beside this record as
+  [`2026-08-14-r2f1b-3c2-task-a4-brief.md`](2026-08-14-r2f1b-3c2-task-a4-brief.md);
+  it mandates the V1 `revalidate`/path-exposing-lock deletion per the A2
+  review ruling and carries the A3 closure rider.
 
 ## Non-scope reaffirmed
 
