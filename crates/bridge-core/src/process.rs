@@ -731,6 +731,8 @@ impl DurableProcessFlightV3 {
     }
 }
 
+// F2 removes this retained private request-flight error adapter.
+#[allow(dead_code)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum RemoteRequestFlightErrorV1 {
     IdentityUnavailable,
@@ -758,6 +760,8 @@ impl std::error::Error for RemoteRequestFlightErrorV1 {}
 /// the request identity, closed admission, and journaled intent before returning
 /// this value. `begin_dispatch` is the final pre-POST journal fence. Dropping a
 /// dispatched value settles `Unknown`; dropping before dispatch settles `Failed`.
+// F2 removes this retained private request-flight adapter.
+#[allow(dead_code)]
 pub(crate) struct DurableRemoteRequestFlightV3 {
     request_id: DedicatedRemoteRequestIdV1,
     flight: Arc<RetainedResourceFlight>,
@@ -767,12 +771,16 @@ pub(crate) struct DurableRemoteRequestFlightV3 {
 }
 
 /// Cloneable observation-only authority for joining the durable request winner.
+// F2 removes this retained private settlement adapter.
+#[allow(dead_code)]
 #[derive(Clone)]
 pub(crate) struct RemoteRequestSettlementV1 {
     flight: Arc<RetainedResourceFlight>,
 }
 
 impl RemoteRequestSettlementV1 {
+    // F2 removes this retained private adapter method.
+    #[allow(dead_code)]
     pub fn join_blocking(&self) -> Result<ResourceActionResultV1, RemoteRequestFlightErrorV1> {
         self.flight
             .join_blocking()
@@ -791,6 +799,8 @@ impl std::fmt::Debug for DurableRemoteRequestFlightV3 {
     }
 }
 
+// F2 removes these retained private adapter methods.
+#[allow(dead_code)]
 impl DurableRemoteRequestFlightV3 {
     #[must_use]
     pub fn request_id(&self) -> &DedicatedRemoteRequestIdV1 {
@@ -945,6 +955,8 @@ impl DurableProcessFlightAttemptV3 {
     /// Reserve one request through this attempt's exact registry and journal.
     /// A duplicate key is a collision/refusal, never a join: every POST owns a
     /// distinct identity and flight.
+    // F2 removes this retained private request-binding adapter.
+    #[allow(dead_code)]
     pub(crate) fn bind_remote_request(
         &self,
         request_id: DedicatedRemoteRequestIdV1,

@@ -1864,6 +1864,8 @@ impl RetainedResourceFlight {
         )
     }
 
+    // F2 removes this retained private request-owner adapter.
+    #[allow(dead_code)]
     pub(crate) fn attach_remote_request_owner(
         &self,
         owner: ResourceFlightOwnerV1,

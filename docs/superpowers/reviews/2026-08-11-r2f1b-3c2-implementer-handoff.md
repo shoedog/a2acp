@@ -1,17 +1,47 @@
 # R2f1b 3c2 implementer handoff — API request-flight authority
 
 Date: 2026-08-15
-Base: `a1f1f8de8052385ecc837c6950fe856e331e65de`
+Base: `f17e2958b934534173f60f90e4fe71de070a338a`
 
 ## Outcome
 
-**Task F candidate:** the API V3 route now carries `RemoteRequestDriverV1`; Task B owns atomic mint/admission and Task D arms the real send at its first poll.
-Frozen input was exactly `a1f1f8de`; the focused red command was `CARGO_INCREMENTAL=0 cargo test -p bridge-api --lib task_f_route_carries_the_owned_request_driver -- --nocapture`, admissibly failing E0308 because the route still required `Arc<DurableProcessFlightAttemptV3>`.
-Cleanup records `acknowledged=true` only after Task D returns the exact echoed delivery identity; no-ack remains `Unknown`, while exact echo now projects checked cleanup `Complete`.
-Post-format churn is 367 production lines and 870 total implementation lines (additions plus deletions); documentation and receipts remain accounted separately under the established handoff convention. The ignored fixture ID vector is inert and retained only to preserve cap accounting; Task B mints every exercised V3 ID.
-The cap-selected split is **Task F2**: delete the now crate-private, compiler-unreferenced shared request adapter and its request-only process/resource/retained-flight/reaper support.
-Task G remains unstarted and both production V3 routing and `AutomaticR2f1b` remain unarmed; default API execution is still `LegacyV2`.
-Verification: all `bridge-api` harnesses and docs pass; the remote-request, retained-flight, and reaper core lenses pass; process is 50/51 with only the untouched host-signal descendant test failing identically in isolation in this container.
+**Task F targeted repair:** terminal disposition is now keyed to actual provider-send
+acceptance, not merely to `begin_dispatch` authorization. The exact frozen input
+was `f17e2958b934534173f60f90e4fe71de070a338a`.
+
+The fail-first command was
+`NO_PROXY=127.0.0.1,localhost CARGO_INCREMENTAL=0 cargo test -p bridge-api --lib task_f_ -- --nocapture`.
+Both selected tests failed before the repair: cancellation produced
+`Partial,false` and drop produced `Unknown,false`, each instead of
+`Failed,false`. Both tests also proved that Wiremock received zero HTTP
+requests. This was admissible behavioral red evidence: the tests compiled,
+selected 2 tests, and failed 0/2 solely at the durable-disposition assertions.
+
+`RequestScope` now normalizes every terminal proposal through its acceptance
+marker. Cancellation or drop after authorization but before the first send
+poll therefore settles `Failed,false`; once the send future has actually been
+polled, cancellation retains `Partial,true` and drop retains `Unknown,true`.
+The `ProviderSendArmed` recovery row, its exact delivery-identity echo, zero-round
+behavior, and between-round cancellation behavior are unchanged.
+
+The frozen Task F artifact's post-format production churn is **371 lines by
+additions plus deletions**: 351 in `backend.rs`, 6 in `config.rs`, 8 in
+`process.rs`, and 6 in the remote-request module. The targeted repair itself is
+34 production lines and 149 total changed lines by the same convention,
+post-format and including the focused tests and this handoff refresh.
+
+The seven retained old-adapter `dead_code` diagnostics have the narrowest
+item/impl/method-level allows, each naming **F2** as the removal point. F2 still
+owns deletion of that private adapter. Task G remains unstarted, production V3
+routing and `AutomaticR2f1b` remain unarmed, and default API execution remains
+`LegacyV2`.
+
+Verification: the focused repair tests pass 2/2; all `bridge-api` harnesses and
+docs pass (95 passed, 1 ignored); the focused `bridge-core` remote-request lens
+passes 45/45; and workspace Clippy with all targets/features and `-D warnings`
+passes. The additional full-core run was 658/659, with only the untouched,
+previously documented host-signal descendant test failing; formatting and diff
+checks pass.
 
 **Historical pre-salvage status:** this code is a preserved, rejected partial artifact.
 The design escalation has completed and approves salvage through a
