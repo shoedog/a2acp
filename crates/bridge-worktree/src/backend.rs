@@ -150,8 +150,31 @@ struct PreparationFlightRecordV1 {
 struct MaterializationPreparationFlightV1 {
     id: PreparationFlightIdV1,
     state: StdMutex<PreparationFlightStateV1>,
+    /// The observing configure future owns the only guard that can set this flag. The detached
+    /// runner samples it exactly once between durable Open and add admission; after that sample,
+    /// caller departure cannot cancel a committed materialization.
+    caller_departed: Arc<AtomicBool>,
     #[cfg(test)]
     hooks: Arc<PreparationFlightTestHooks>,
+}
+
+struct PreparationFlightCallerGuardV1 {
+    caller_departed: Arc<AtomicBool>,
+    armed: bool,
+}
+
+impl PreparationFlightCallerGuardV1 {
+    fn disarm(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for PreparationFlightCallerGuardV1 {
+    fn drop(&mut self) {
+        if self.armed {
+            self.caller_departed.store(true, Ordering::Release);
+        }
+    }
 }
 
 impl MaterializationPreparationFlightV1 {
@@ -159,6 +182,7 @@ impl MaterializationPreparationFlightV1 {
         Ok(Self {
             id: PreparationFlightIdV1::mint()?,
             state: StdMutex::new(PreparationFlightStateV1::Open {}),
+            caller_departed: Arc::new(AtomicBool::new(false)),
             #[cfg(test)]
             hooks,
         })
@@ -170,6 +194,19 @@ impl MaterializationPreparationFlightV1 {
 
     fn record(&self, state: PreparationFlightStateV1) {
         *self.state.lock().unwrap_or_else(|error| error.into_inner()) = state;
+    }
+
+    fn caller_guard(&self) -> PreparationFlightCallerGuardV1 {
+        PreparationFlightCallerGuardV1 {
+            caller_departed: self.caller_departed.clone(),
+            armed: true,
+        }
+    }
+
+    /// This is the one and only cancellation observation for a claimed preparation flight.
+    /// A false sample commits the runner to phase-3 behavior for the rest of materialization.
+    fn caller_departed_at_add_admission(&self) -> bool {
+        self.caller_departed.load(Ordering::Acquire)
     }
 }
 
@@ -296,6 +333,23 @@ fn preparation_failure_state() -> PreparationFlightStateV1 {
     }
 }
 
+fn preparation_caller_departed_failure_state() -> PreparationFlightStateV1 {
+    PreparationFlightStateV1::Failed {
+        cause: BoundedCauseV1 {
+            failure_class: DiagnosticFailureClass::Canceled,
+            code: DiagnosticCode::build(
+                "bridge.worktree_preparation_caller_departed",
+                &DiagnosticRedactor::default(),
+            )
+            .expect("static preparation flight diagnostic code is valid"),
+            deepest_cause: None,
+            cause_truncated: false,
+            evidence_overflow: false,
+            dependency_set: None,
+        },
+    }
+}
+
 fn preparation_state_is_terminal(state: &PreparationFlightStateV1) -> bool {
     match state {
         PreparationFlightStateV1::Open {} | PreparationFlightStateV1::BarrierSynced {} => false,
@@ -337,7 +391,6 @@ struct PreparationFlightTestHooks {
     open: Notify,
     pause_after_open: AtomicBool,
     release_after_open: Notify,
-    fail_after_open: AtomicBool,
     fail_initial_open_parent_sync: AtomicBool,
     add_count: AtomicUsize,
     add: Notify,
@@ -350,13 +403,12 @@ struct PreparationFlightTestHooks {
 
 #[cfg(test)]
 impl PreparationFlightTestHooks {
-    async fn after_open(&self) -> bool {
+    async fn after_open(&self) {
         self.open_count.fetch_add(1, Ordering::SeqCst);
         self.open.notify_waiters();
         if self.pause_after_open.swap(false, Ordering::SeqCst) {
             self.release_after_open.notified().await;
         }
-        self.fail_after_open.load(Ordering::SeqCst)
     }
 
     fn take_initial_open_parent_sync_failure(&self) -> bool {
@@ -411,8 +463,8 @@ impl PreparationFlightTestHooks {
 
 #[cfg(test)]
 impl MaterializationPreparationFlightV1 {
-    async fn after_open_for_test(&self) -> bool {
-        self.hooks.after_open().await
+    async fn after_open_for_test(&self) {
+        self.hooks.after_open().await;
     }
 
     fn fail_initial_open_parent_sync_for_test(&self) -> bool {
@@ -2671,6 +2723,7 @@ impl WorktreeBackend {
             flights.insert(session_key.clone(), flight.clone());
         }
 
+        let caller_guard = flight.caller_guard();
         let provider = self.provider.clone();
         let map = self.map.clone();
         let flights = self.preparation_flights.clone();
@@ -2714,9 +2767,13 @@ impl WorktreeBackend {
             let result = match initial {
                 Ok(Some(journal)) => {
                     #[cfg(test)]
-                    let result = if task_flight.after_open_for_test().await {
+                    task_flight.after_open_for_test().await;
+                    let caller_departed_at_add_admission =
+                        task_flight.caller_departed_at_add_admission();
+                    let result = if caller_departed_at_add_admission {
                         Err(BridgeError::ConfigInvalid {
-                            reason: "injected preparation pre-effect refusal".into(),
+                            reason: "configure caller departed before worktree add admission"
+                                .into(),
                         })
                     } else {
                         WorktreeBackend::run_materialization_under_custody(
@@ -2728,15 +2785,6 @@ impl WorktreeBackend {
                         )
                         .await
                     };
-                    #[cfg(not(test))]
-                    let result = WorktreeBackend::run_materialization_under_custody(
-                        provider,
-                        custody,
-                        resolved,
-                        journal.clone(),
-                        task_flight.clone(),
-                    )
-                    .await;
                     match result {
                         Ok(materialized) => {
                             if materialized.0 == WtCustodyV1::Protected {
@@ -2762,7 +2810,11 @@ impl WorktreeBackend {
                                 .map(|()| materialized)
                         }
                         Err(error) => {
-                            let failed = preparation_failure_state();
+                            let failed = if caller_departed_at_add_admission {
+                                preparation_caller_departed_failure_state()
+                            } else {
+                                preparation_failure_state()
+                            };
                             debug_assert!(preparation_state_is_terminal(&failed));
                             match publish_preparation_state(
                                 journal,
@@ -2798,9 +2850,11 @@ impl WorktreeBackend {
                 active.remove(&session_key);
             }
         }));
-        result_rx.await.map_err(|_| {
+        let result = result_rx.await.map_err(|_| {
             BridgeError::agent_crashed("materialization preparation flight ended without a result")
-        })?
+        })?;
+        caller_guard.disarm();
+        result
     }
 
     /// The V3 writer's control flow (§2.5). Ordering is the property, so it is stated once here
@@ -8789,7 +8843,6 @@ mod tests {
         let (bound, target) = bound_spec_v3(&source, &cfg);
         let hooks = be.preparation_test_hooks.clone();
         hooks.pause_after_open.store(true, Ordering::SeqCst);
-        hooks.fail_after_open.store(true, Ordering::SeqCst);
         let session = SessionId::parse("preparation-after-claim").unwrap();
         let configure_be = be.clone();
         let configure =
@@ -8811,6 +8864,11 @@ mod tests {
         assert_eq!(
             preparation_flight_state_of(&target).as_deref(),
             Some("failed")
+        );
+        assert!(
+            std::fs::read_to_string(format!("{target}{PREPARATION_FLIGHT_RECORD_SUFFIX}"))
+                .unwrap()
+                .contains("bridge.worktree_preparation_caller_departed")
         );
         assert_eq!(record_state_of(&target), None);
         assert!(!Path::new(&target).exists());
