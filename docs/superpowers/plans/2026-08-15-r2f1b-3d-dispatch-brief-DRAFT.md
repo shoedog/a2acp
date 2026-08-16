@@ -257,3 +257,21 @@ orders; replacement/symlink negatives.
   post-return clock samples; pre-established terminal-capable control
   journal for the initial-op window; recovery-insert-before-completion;
   s1/s2 folds. Caps 600/900. Bounded re-look follows.
+- CLOSURE REPAIR DELIVERED at the 3-attempt bound: `435257ce`
+  (impl-37431-pai85310; verify PASS ×4; internal reviewer failed AGAIN —
+  Authenticate timeout, the synth itself ruled the probe inadmissible;
+  ROOT-CAUSED: host codex reviewer had the same credential class → config
+  fix `9a941531` adds pre_authenticated; 4 lost internal reviews ledgered).
+  Design: sticky phase CAS Preparing→TransferPublishing|BarrierPublishing;
+  failed Transferred write stays TransferPublishing debt; transfer =
+  durable-terminal → recovery-register(no-replace) → active-remove → wake;
+  control journal opened pre-runner (control dir, replace-exact-Open).
+  903 changed lines — 3 OVER the 900 hard cap, disclosed.
+- Operator controls: 6/6 regressions green; W2 red (post-return sample
+  severed) deterministic at the typed-refusal assertion; remaining
+  prescribed reds are multi-line — delegated to the re-look's source
+  verification, disclosed.
+- Gates on exact `435257ce`: fmt/clippy clean; full suite **4,131/0/13
+  across 90** (baseline 4,125).
+- BOUNDED SOL RE-LOOK dispatched (W1-W4 + s1/s2 + the T1-composition
+  question the closure left open + the W3 control-journal design).
