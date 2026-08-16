@@ -197,3 +197,16 @@ orders; replacement/symlink negatives.
   Verbatim: reviews/2026-08-16-r2f1b-3d-t1-sol-relook.md.
 - **T1 ROUND CLOSED — every WRONG fixed. PR #53 opened** (branch
   feat/r2f1b-3d-t1 = 6e6ad453); CI watch running; rebase-merge on green.
+- T1 LANDED: PR #53 rebase-merged → main `42dd555a`; local main ff'd;
+  19.2G T1-round targets reaped (receipt in session; clones retained).
+- POST-MERGE CI: Build/Lint/Coverage RED on ONE pre-existing whole-bin test
+  (`compatibility::tests::staged_candidate_exec_is_bound_to_the_verified_file_object`,
+  `smoke_process_launch_failed` = process-launch environmental failure).
+  Classification LOAD-FLAKE, new coverage-lane instance class: identical
+  content green ×2 on the PR runs minutes earlier, pre-T1 main green, host
+  suite green, T1's 3-file diff doesn't touch compatibility/smoke machinery.
+  Rerun of the failed job dispatched for a fresh same-SHA control. The
+  coverage-lane flake family now has two ledgered classes
+  (authority_mutation lock-release; staged-candidate smoke launch).
+- T2 DISPATCHED in parallel (base `42dd555a`; spec 81fc9472); its fold gate
+  holds until the rerun resolves green.
