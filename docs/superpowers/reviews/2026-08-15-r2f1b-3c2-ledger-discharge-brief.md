@@ -89,3 +89,13 @@ the fs_custody rustfmt hygiene slice, docs items S2/S3/S4/S8, ops items.
 - Counted Sol closure DISPATCHED (sol/max via `run-workflow code-review`,
   solmax config; brief + diff at
   `/private/tmp/a2a-r2f1b-ledger-discharge.2Oo9Ii/closure-brief.md`).
+- Sol closure returned: **APPROVE, 0 WRONG / 1 SMELL-DEFER** (F2-Z negative
+  controls use fabricated `Z`/`S` strings; prescribed live-descendant
+  pre-termination assertion + leader-only-kill mutation red — LEDGERED).
+  **F-1 adjudication SUSTAINED** on independent mechanism verification
+  (arming precedes inner poll; unaccepted privilege scoped to arming
+  failure). All ten items ruled discriminating; test-only constraint
+  confirmed; 652 changed lines (over 600 soft, under 800 hard, disclosed).
+  Verdict verbatim: `2026-08-16-r2f1b-ledger-discharge-sol-closure.md`.
+- Landed path: branch `test/r2f1b-3c2-ledger-discharge` = `ab911ae5` pushed;
+  **PR #52** opened onto main; CI watch running; rebase-merge on green.
