@@ -825,6 +825,67 @@ impl RequestAcceptanceMarker {
     }
 }
 
+#[cfg(test)]
+struct RequestSendPollBarrierForTest {
+    entered: tokio::sync::Notify,
+    release: tokio::sync::Semaphore,
+}
+
+#[cfg(test)]
+impl RequestSendPollBarrierForTest {
+    fn install() -> (Arc<Self>, RequestSendPollBarrierGuardForTest) {
+        let barrier = Arc::new(Self {
+            entered: tokio::sync::Notify::new(),
+            release: tokio::sync::Semaphore::new(0),
+        });
+        REQUEST_SEND_POLL_BARRIER_FOR_TEST.with(|slot| {
+            assert!(slot.borrow_mut().replace(Arc::clone(&barrier)).is_none());
+        });
+        (barrier, RequestSendPollBarrierGuardForTest)
+    }
+
+    async fn wait_until_entered(&self) {
+        self.entered.notified().await;
+    }
+
+    fn release(&self) {
+        self.release.add_permits(1);
+    }
+}
+
+#[cfg(test)]
+struct RequestSendPollBarrierGuardForTest;
+
+#[cfg(test)]
+impl Drop for RequestSendPollBarrierGuardForTest {
+    fn drop(&mut self) {
+        REQUEST_SEND_POLL_BARRIER_FOR_TEST.with(|slot| {
+            slot.borrow_mut().take();
+        });
+    }
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static REQUEST_SEND_POLL_BARRIER_FOR_TEST:
+        std::cell::RefCell<Option<Arc<RequestSendPollBarrierForTest>>> =
+            const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+async fn wait_for_request_send_poll_for_test() {
+    let barrier = REQUEST_SEND_POLL_BARRIER_FOR_TEST.with(|slot| slot.borrow().clone());
+    if let Some(barrier) = barrier {
+        barrier.entered.notify_one();
+        barrier
+            .release
+            .acquire()
+            .await
+            .expect("test poll barrier remains live")
+            .forget();
+    }
+}
+
 async fn drive_provider_send<F>(
     request: Option<&OwnedRemoteRequestV1>,
     send: F,
@@ -836,6 +897,8 @@ where
     match request {
         Some(request) => request
             .arm_provider_send(async move {
+                #[cfg(test)]
+                wait_for_request_send_poll_for_test().await;
                 accepted.mark();
                 send.await
             })
@@ -2553,6 +2616,38 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Copy, Debug)]
+    enum TerminalPublisherFault {
+        Refuse,
+        Mismatch,
+    }
+
+    struct FaultingRequestPublisher {
+        fault: TerminalPublisherFault,
+        calls: AtomicUsize,
+    }
+
+    impl RemoteRequestResultPublisherV1 for FaultingRequestPublisher {
+        fn publish_idempotent(
+            &self,
+            publication: &RemoteRequestTerminalPublicationV1,
+        ) -> Result<RemoteRequestDeliveryIdV1, String> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            match self.fault {
+                TerminalPublisherFault::Refuse => Err("injected terminal refusal".into()),
+                TerminalPublisherFault::Mismatch => {
+                    let mut receipt = serde_json::to_value(publication.delivery_id())
+                        .map_err(|error| error.to_string())?;
+                    let ordinal = receipt["ordinal"]
+                        .as_u64()
+                        .ok_or_else(|| "delivery ordinal missing".to_string())?;
+                    receipt["ordinal"] = serde_json::Value::from(ordinal.saturating_add(1));
+                    serde_json::from_value(receipt).map_err(|error| error.to_string())
+                }
+            }
+        }
+    }
+
     struct ProtectedBackendFixture {
         backend: Arc<ApiBackend>,
         publisher: Arc<RecordingRequestPublisher>,
@@ -2649,6 +2744,97 @@ mod tests {
             ResourceActionDispositionV1::Failed
         );
         assert!(!publications[0].prompt_may_have_been_accepted());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn task_f_reqwest_send_poll_barrier_distinguishes_unpolled_and_accepted_cancellation() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(stop_sse())
+                    .set_delay(Duration::from_secs(5)),
+            )
+            .mount(&server)
+            .await;
+        for (session_name, release_send, disposition, accepted) in [
+            (
+                "task-f-poll-barrier-before",
+                false,
+                ResourceActionDispositionV1::Failed,
+                false,
+            ),
+            (
+                "task-f-poll-barrier-after",
+                true,
+                ResourceActionDispositionV1::Partial,
+                true,
+            ),
+        ] {
+            let fixture = protected_backend(format!("{}/v1", server.uri()), vec![], 64, 4, None);
+            let session = SessionId::parse(session_name).unwrap();
+            fixture
+                .backend
+                .attach_resource_flight_owner_v1(&session)
+                .unwrap();
+            let turn = fixture.backend.begin_turn(&session).unwrap();
+            let PreparedRequest::Ready {
+                mut scope,
+                cancel_rx,
+            } = fixture
+                .backend
+                .request_admission()
+                .prepare(&session, turn.epoch)
+                .unwrap()
+            else {
+                panic!("Task F barrier request must be admitted");
+            };
+            scope.begin_dispatch().unwrap();
+            let turn_accepted = Arc::new(AtomicBool::new(false));
+            let (barrier, _reset) = RequestSendPollBarrierForTest::install();
+            {
+                let send = drive_provider_send(
+                    scope.flight.as_ref(),
+                    fixture
+                        .backend
+                        .client
+                        .post(format!("{}/v1/chat/completions", server.uri()))
+                        .send(),
+                    scope.acceptance_marker(Arc::clone(&turn_accepted)),
+                );
+                tokio::pin!(send);
+                tokio::select! {
+                    _ = barrier.wait_until_entered() => {}
+                    _ = &mut send => panic!("request completed before the poll barrier"),
+                }
+                if release_send {
+                    barrier.release();
+                    tokio::select! {
+                        _ = wait_for_provider_requests(&server, 1) => {}
+                        _ = &mut send => panic!("request completed before its first poll was observed"),
+                    }
+                }
+                fixture.backend.cancel(&session).await.unwrap();
+                assert!(*cancel_rx.borrow(), "the exact request must observe cancel");
+            }
+            assert_eq!(
+                server.received_requests().await.unwrap().len(),
+                if release_send { 1 } else { 0 }
+            );
+            assert_eq!(
+                turn_accepted.load(Ordering::Acquire),
+                accepted,
+                "only a released barrier may cross acceptance"
+            );
+            drop(scope);
+            drop(turn);
+            let publications = fixture.publisher.0.lock().unwrap();
+            assert_eq!(publications.len(), 1);
+            assert_eq!(publications[0].result().disposition, disposition);
+            assert_eq!(publications[0].prompt_may_have_been_accepted(), accepted);
+        }
     }
 
     #[tokio::test]
@@ -3444,6 +3630,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn task_f_refusing_and_mismatched_publishers_fail_prompt_and_cleanup_unknown() {
+        for (fault, session_name) in [
+            (TerminalPublisherFault::Refuse, "task-f-publisher-refusal"),
+            (
+                TerminalPublisherFault::Mismatch,
+                "task-f-publisher-mismatch",
+            ),
+        ] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/v1/chat/completions"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .insert_header("content-type", "text/event-stream")
+                        .set_body_string(stop_sse()),
+                )
+                .mount(&server)
+                .await;
+            let root = tempfile::tempdir().unwrap();
+            let route = request_journal_route(root.path());
+            let publisher = Arc::new(FaultingRequestPublisher {
+                fault,
+                calls: AtomicUsize::new(0),
+            });
+            let publisher_port: Arc<dyn RemoteRequestResultPublisherV1> = publisher.clone();
+            let driver = request_driver(&route, 64, publisher_port);
+            let mut cfg = crate::config::ApiConfig::new(format!("{}/v1", server.uri()));
+            cfg.resource_flight_route_v3 = Some(ApiResourceFlightRouteV3::new(
+                driver,
+                NodeId::parse("api-node").unwrap(),
+            ));
+            let backend = Arc::new(ApiBackend::new(cfg));
+            let session = SessionId::parse(session_name).unwrap();
+            backend.attach_resource_flight_owner_v1(&session).unwrap();
+
+            let updates = spawn_drain(Arc::clone(&backend), session.clone())
+                .await
+                .unwrap();
+            assert!(
+                updates
+                    .iter()
+                    .any(|update| matches!(update, Err(BridgeError::AgentFailure { .. }))),
+                "{fault:?}: terminal publisher fault must fail the prompt: {updates:?}"
+            );
+            assert_eq!(publisher.calls.load(Ordering::SeqCst), 1, "{fault:?}");
+            assert_eq!(
+                backend.forget_session_checked(&session).await.unwrap(),
+                BackendCleanupDispositionV1::Unknown,
+                "{fault:?}: publication debt must not project a false Complete cleanup"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn poisoned_request_owner_attachment_and_admission_refuse() {
         let fixture = protected_backend(
             "http://127.0.0.1:1/v1".into(),
@@ -3653,6 +3893,99 @@ mod tests {
         assert!(!cell.reclaimable());
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn task_e_timed_out_cleanup_recreation_keeps_successor_and_aggregates_old_unknown() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(stop_sse()),
+            )
+            .mount(&server)
+            .await;
+        let root = tempfile::tempdir().unwrap();
+        let route = request_journal_route(root.path());
+        let arrived = Arc::new(std::sync::Barrier::new(2));
+        let release = Arc::new(std::sync::Barrier::new(2));
+        let publisher: Arc<dyn RemoteRequestResultPublisherV1> =
+            Arc::new(BlockingRequestPublisher {
+                arrived: Arc::clone(&arrived),
+                release: Arc::clone(&release),
+            });
+        let driver = request_driver(&route, 64, publisher);
+        let mut cfg = crate::config::ApiConfig::new(format!("{}/v1", server.uri()));
+        cfg.request_timeout = Duration::from_secs(2);
+        cfg.resource_flight_route_v3 = Some(ApiResourceFlightRouteV3::new(
+            driver,
+            NodeId::parse("api-node").unwrap(),
+        ));
+        let backend = Arc::new(ApiBackend::new(cfg));
+        let session = SessionId::parse("task-e-recreate-after-timeout").unwrap();
+        backend.attach_resource_flight_owner_v1(&session).unwrap();
+        let first = spawn_drain(Arc::clone(&backend), session.clone());
+
+        let arrived_gate = Arc::clone(&arrived);
+        tokio::task::spawn_blocking(move || arrived_gate.wait())
+            .await
+            .unwrap();
+        let old_cell = backend
+            .sessions
+            .lock()
+            .unwrap()
+            .get(&session)
+            .unwrap()
+            .cleanup_cell
+            .clone()
+            .unwrap();
+        assert_eq!(
+            backend.forget_session_checked(&session).await.unwrap(),
+            BackendCleanupDispositionV1::Unknown
+        );
+        assert_eq!(
+            old_cell.inner.lock().unwrap().state,
+            ApiRequestCleanupStateV1::TimedOut
+        );
+
+        backend.attach_resource_flight_owner_v1(&session).unwrap();
+        let successor_turn = backend.begin_turn(&session).unwrap();
+        let successor_cell = backend
+            .sessions
+            .lock()
+            .unwrap()
+            .get(&session)
+            .unwrap()
+            .cleanup_cell
+            .clone()
+            .unwrap();
+        assert!(!Arc::ptr_eq(&old_cell, &successor_cell));
+
+        let release_gate = Arc::clone(&release);
+        tokio::task::spawn_blocking(move || release_gate.wait())
+            .await
+            .unwrap();
+        let first_updates = first.await.unwrap();
+        assert!(matches!(
+            first_updates.last(),
+            Some(Ok(Update::Done { stop_reason, .. })) if stop_reason == "stop"
+        ));
+        let live_successor = backend
+            .sessions
+            .lock()
+            .unwrap()
+            .get(&session)
+            .and_then(|state| state.cleanup_cell.clone())
+            .expect("late old publisher must not remove the recreated session");
+        assert!(Arc::ptr_eq(&live_successor, &successor_cell));
+        assert_eq!(
+            backend.forget_session_checked(&session).await.unwrap(),
+            BackendCleanupDispositionV1::Unknown,
+            "the later cleanup must retain the old timeout debt"
+        );
+        drop(successor_turn);
+    }
+
     #[tokio::test]
     async fn task_e_exact_echo_projects_complete_acknowledgement() {
         let server = MockServer::start().await;
@@ -3760,6 +4093,55 @@ mod tests {
         legacy.begin_cleanup();
         assert!(legacy.finish(&identity, ResourceActionDispositionV1::Complete, true));
         assert_eq!(legacy.observe().await, BackendCleanupDispositionV1::Unknown);
+    }
+
+    #[tokio::test]
+    async fn task_e_admission_reset_state_table_is_closed_over_terminal_outcomes() {
+        let session = SessionId::parse("task-e-admission-reset").unwrap();
+        let complete =
+            ApiRequestCleanupCustodianV1::new(1, session.clone(), true, Duration::from_secs(1));
+        complete.finish_pending(ResourceActionDispositionV1::Complete, false);
+        complete
+            .begin_admission()
+            .expect("Complete must re-admit even without acknowledgement");
+
+        for disposition in [
+            ResourceActionDispositionV1::Partial,
+            ResourceActionDispositionV1::Failed,
+            ResourceActionDispositionV1::Unknown,
+        ] {
+            let cell =
+                ApiRequestCleanupCustodianV1::new(2, session.clone(), true, Duration::from_secs(1));
+            cell.finish_pending(disposition.clone(), true);
+            assert!(
+                cell.begin_admission().is_err(),
+                "{disposition:?} must not re-admit"
+            );
+        }
+
+        let refused =
+            ApiRequestCleanupCustodianV1::new(3, session.clone(), true, Duration::from_secs(1));
+        refused.refuse(
+            None,
+            ApiRequestFlightErrorV1::Admission("injected refusal".into()),
+            None,
+        );
+        assert!(
+            refused.begin_admission().is_err(),
+            "SettlementRefused must not re-admit"
+        );
+
+        let timed_out = ApiRequestCleanupCustodianV1::new(4, session, true, Duration::ZERO);
+        timed_out.begin_admission().unwrap();
+        timed_out.begin_cleanup();
+        assert_eq!(
+            timed_out.observe().await,
+            BackendCleanupDispositionV1::Unknown
+        );
+        assert!(
+            timed_out.begin_admission().is_err(),
+            "TimedOut must not re-admit"
+        );
     }
 
     #[tokio::test]

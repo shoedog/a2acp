@@ -3266,6 +3266,23 @@ mod tests {
 
     #[tokio::test]
     async fn term_ignoring_child_with_descendant_is_group_killed_host_signal_semantics() {
+        fn terminated(state: Option<String>) -> bool {
+            state.is_none_or(|state| state.starts_with('Z'))
+        }
+
+        async fn wait_until_terminated(pid: u32, label: &str) {
+            tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    if terminated(proc_state(pid)) {
+                        return;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap_or_else(|_| panic!("{label} {pid} survived group kill"));
+        }
+
         // parent ignores TERM and has a child that sleeps; only a GROUP kill gets both.
         let child = Supervised::spawn(
             "/bin/sh",
@@ -3277,22 +3294,31 @@ mod tests {
         )
         .unwrap();
         let pid = child.pid();
-        tokio::time::sleep(Duration::from_millis(200)).await; // let descendant spawn
-        let desc = std::fs::read_to_string(format!("/tmp/a2a_desc_pid.{pid}"))
-            .ok()
-            .and_then(|s| s.trim().parse::<u32>().ok());
+        let desc = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Ok(contents) = std::fs::read_to_string(format!("/tmp/a2a_desc_pid.{pid}")) {
+                    if let Ok(descendant) = contents.trim().parse::<u32>() {
+                        return descendant;
+                    }
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("descendant readiness timed out");
         child.terminate(Duration::from_millis(300)).await; // grace then SIGKILL group
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        wait_until_terminated(pid, "leader").await;
+        wait_until_terminated(desc, "descendant").await;
+
+        // Red-first controls: strict pid absence would reject a killed child
+        // held as a zombie, while a genuinely running child remains a leak.
+        let zombie = Some("Z (sleep)".to_string());
+        assert!(zombie.is_some(), "strict absence would reject this zombie");
+        assert!(terminated(zombie), "zombies are terminated descendants");
         assert!(
-            proc_state(pid).is_none_or(|s| s.starts_with('Z')),
-            "leader still running"
+            !terminated(Some("S (sleep)".to_string())),
+            "a live descendant must remain a failure"
         );
-        if let Some(d) = desc {
-            assert!(
-                proc_state(d).is_none(),
-                "descendant {d} survived group kill"
-            );
-        }
         let _ = std::fs::remove_file(format!("/tmp/a2a_desc_pid.{pid}"));
     }
 

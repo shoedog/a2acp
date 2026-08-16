@@ -254,6 +254,8 @@ pub struct OwnedRemoteRequestV1 {
     settlement_attempted: AtomicBool,
     publication_flight: Mutex<PublicationFlightStateV1>,
     publication_settled: Condvar,
+    #[cfg(test)]
+    publication_waiter_latch: Mutex<Option<Arc<std::sync::Barrier>>>,
 }
 pub struct RemoteRequestObserverV1 {
     outcome_rx: tokio::sync::watch::Receiver<Option<RemoteRequestTerminalOutcomeV1>>,
@@ -1480,6 +1482,8 @@ impl RemoteRequestDriverV1 {
             settlement_attempted: AtomicBool::new(false),
             publication_flight: Mutex::new(PublicationFlightStateV1::Idle),
             publication_settled: Condvar::new(),
+            #[cfg(test)]
+            publication_waiter_latch: Mutex::new(None),
         })
     }
 }
@@ -1618,6 +1622,15 @@ impl OwnedRemoteRequestV1 {
                     break;
                 }
                 PublicationFlightStateV1::Driving => {
+                    #[cfg(test)]
+                    if let Some(latch) = self
+                        .publication_waiter_latch
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .clone()
+                    {
+                        latch.wait();
+                    }
                     flight = self
                         .publication_settled
                         .wait(flight)
@@ -1650,6 +1663,16 @@ impl OwnedRemoteRequestV1 {
     #[cfg(test)]
     fn crash_without_settlement_for_test(self) {
         self.settlement_attempted.store(true, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    fn install_publication_waiter_latch_for_test(&self, latch: Arc<std::sync::Barrier>) {
+        assert!(self
+            .publication_waiter_latch
+            .lock()
+            .unwrap()
+            .replace(latch)
+            .is_none());
     }
 }
 impl Drop for OwnedRemoteRequestV1 {
@@ -1955,8 +1978,7 @@ mod tests {
         fs::File,
         os::unix::fs::MetadataExt as _,
         path::PathBuf,
-        sync::{mpsc, Arc, Barrier, Mutex},
-        time::Duration,
+        sync::{Arc, Barrier, Mutex},
     };
     #[derive(Default)]
     pub(super) struct TestAckPublisherV1 {
@@ -3667,6 +3689,71 @@ mod tests {
         assert!(calls[0].prompt_may_have_been_accepted());
     }
 
+    #[test]
+    fn remote_request_flight_task_d_simultaneous_wrappers_claim_one_send_permit() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let case = case();
+        let publisher = RecordingPublisher::with_replies([]);
+        initialize_root(&case, attempt(), 16);
+        let driver =
+            RemoteRequestDriverV1::open_recovered(custody(&case), attempt(), 16, publisher.clone())
+                .unwrap();
+        let request = driver.admit(owner(0)).unwrap();
+        request.journal_intent().unwrap();
+        request.authorize_dispatch().unwrap();
+        let start = Arc::new(Barrier::new(3));
+        let inner_polls = Arc::new(AtomicUsize::new(0));
+        let request_ref = &request;
+        let (left, right) = std::thread::scope(|scope| {
+            let left_start = Arc::clone(&start);
+            let left_polls = Arc::clone(&inner_polls);
+            let left = scope.spawn(move || {
+                left_start.wait();
+                futures::executor::block_on(request_ref.arm_provider_send(std::future::poll_fn(
+                    move |_| {
+                        left_polls.fetch_add(1, Ordering::SeqCst);
+                        Poll::Ready(())
+                    },
+                )))
+            });
+            let right_start = Arc::clone(&start);
+            let right_polls = Arc::clone(&inner_polls);
+            let right = scope.spawn(move || {
+                right_start.wait();
+                futures::executor::block_on(request_ref.arm_provider_send(std::future::poll_fn(
+                    move |_| {
+                        right_polls.fetch_add(1, Ordering::SeqCst);
+                        Poll::Ready(())
+                    },
+                )))
+            });
+            start.wait();
+            (left.join().unwrap(), right.join().unwrap())
+        });
+        assert_eq!(inner_polls.load(Ordering::SeqCst), 1);
+        assert_eq!(left.is_ok() as usize + right.is_ok() as usize, 1);
+        assert!(matches!(
+            (&left, &right),
+            (
+                Err(RemoteRequestFlightRefusalV1::InvalidStateTransition(_)),
+                Ok(())
+            ) | (
+                Ok(()),
+                Err(RemoteRequestFlightRefusalV1::InvalidStateTransition(_))
+            )
+        ));
+        assert_eq!(
+            request_paths(&case).len(),
+            1,
+            "the loser must create no journal row"
+        );
+        assert!(
+            publisher.calls().is_empty(),
+            "the loser must not reach the publisher"
+        );
+        request.crash_without_settlement_for_test();
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn remote_request_flight_task_d_effect_then_debt_recovers_failed_unaccepted() {
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -3893,30 +3980,19 @@ mod tests {
             RemoteRequestDriverV1::open_recovered(custody(&case), attempt(), 16, publisher.clone())
                 .unwrap();
         let request = driver.admit(owner(0)).unwrap();
+        let waiter_latch = Arc::new(Barrier::new(2));
+        request.install_publication_waiter_latch_for_test(Arc::clone(&waiter_latch));
 
-        let (first, second, returned_early) = std::thread::scope(|scope| {
+        let (first, second) = std::thread::scope(|scope| {
             let first =
                 scope.spawn(|| request.settle(terminal(ResourceActionDispositionV1::Complete)));
             publisher.wait_until_entered();
-            let (started_tx, started_rx) = mpsc::channel();
-            let (done_tx, done_rx) = mpsc::channel();
-            let request_ref = &request;
-            let second = scope.spawn(move || {
-                started_tx.send(()).unwrap();
-                let result = request_ref.settle(terminal(ResourceActionDispositionV1::Partial));
-                done_tx.send(()).unwrap();
-                result
-            });
-            started_rx.recv().unwrap();
-            let returned_early = done_rx.recv_timeout(Duration::from_secs(1)).is_ok();
+            let second =
+                scope.spawn(|| request.settle(terminal(ResourceActionDispositionV1::Partial)));
+            waiter_latch.wait();
             publisher.release();
-            (
-                first.join().unwrap(),
-                second.join().unwrap(),
-                returned_early,
-            )
+            (first.join().unwrap(), second.join().unwrap())
         });
-        assert!(!returned_early, "a racer must join the live publication");
         assert_eq!(first, second);
         assert!(matches!(
             first,
@@ -3936,30 +4012,19 @@ mod tests {
             RemoteRequestDriverV1::open_recovered(custody(&case), attempt(), 16, publisher.clone())
                 .unwrap();
         let request = driver.admit(owner(0)).unwrap();
+        let waiter_latch = Arc::new(Barrier::new(2));
+        request.install_publication_waiter_latch_for_test(Arc::clone(&waiter_latch));
 
-        let (first, second, returned_early) = std::thread::scope(|scope| {
+        let (first, second) = std::thread::scope(|scope| {
             let first =
                 scope.spawn(|| request.settle(terminal(ResourceActionDispositionV1::Complete)));
             publisher.wait_until_entered();
-            let (started_tx, started_rx) = mpsc::channel();
-            let (done_tx, done_rx) = mpsc::channel();
-            let request_ref = &request;
-            let second = scope.spawn(move || {
-                started_tx.send(()).unwrap();
-                let result = request_ref.settle(terminal(ResourceActionDispositionV1::Partial));
-                done_tx.send(()).unwrap();
-                result
-            });
-            started_rx.recv().unwrap();
-            let returned_early = done_rx.recv_timeout(Duration::from_secs(1)).is_ok();
+            let second =
+                scope.spawn(|| request.settle(terminal(ResourceActionDispositionV1::Partial)));
+            waiter_latch.wait();
             publisher.release();
-            (
-                first.join().unwrap(),
-                second.join().unwrap(),
-                returned_early,
-            )
+            (first.join().unwrap(), second.join().unwrap())
         });
-        assert!(!returned_early, "a racer must join the live publication");
         assert_eq!(first, second);
         let outcome = first.unwrap();
         assert_eq!(
