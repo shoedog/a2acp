@@ -134,3 +134,21 @@ orders; replacement/symlink negatives.
   clean; full suite **4,117/0/13 across 90** (baseline 4,111/0/13).
 - Counted Sol closure DISPATCHED on full `c37338dd..e66b9085` (sol/max,
   solmax config). Host branch `feat/r2f1b-3d-t1` = `e66b9085`.
+- COUNTED SOL CLOSURE: **REJECT, 2 WRONG-BLOCKER / 1 SMELL-DEFER**
+  (verbatim: reviews/2026-08-16-r2f1b-3d-t1-sol-closure.md, commit
+  155e2d76). W1: ConfigureAdmission::Drop cleanup never joins a committed
+  flight → pops Reserving, CellContended not reinserted, runner `_ => {}`
+  silently accepts → LiveProtected+Settled with preservation identities
+  permanently lost; second schedule pre-`enter`. W2: post-departure terminal
+  publication failure discarded with the dead oneshot; owner removed;
+  durable BarrierSynced nonterminal, no diagnostic. SMELL: unbounded test
+  liveness waits (fold into repair). Closure VALIDATED: B21 amendment sound;
+  sample linearization sound (no bad schedule at the boundary itself);
+  phase-2 discriminating. Phases 3-4 false-positive for map/identity
+  retention; phase 5 misses the detached-receiver edge.
+- CLOSURE REPAIR dispatched on frozen `e66b9085` (the declared cap's one
+  targeted repair): R1 cleanup joins/defers to committed flight through
+  projection + loud missing-entry; R2 backend-owned joinable completion/debt
+  record surfacing detached terminal failures; R3 bounded test waits. Caps
+  450/650, single production file. Bounded Sol re-look on the repair delta
+  follows; then land.
