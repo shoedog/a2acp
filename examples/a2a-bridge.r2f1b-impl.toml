@@ -258,7 +258,7 @@ kind   = "container_rw"
 cmd    = "codex-acp"
 # Explicitly force the ChatGPT auth contract this image mounts; the bridge default
 # also prefers ChatGPT-style auth when advertised.
-auth_method = "chat-gpt"
+pre_authenticated = true  # 2026-08-16: post-refresh auth.json → codex-acp advertises NO auth methods (already-authed); any authenticate call now gets -32602. Was: auth_method = "chat-gpt". Single-token-family ledger class.
 model  = "gpt-5.6-terra"                       # 2c2 repair round — terra xhigh (owner directive 2026-08-09)
 effort = "xhigh"
 args   = ["-c", "sandbox_mode=\"danger-full-access\"", "-c", "approval_policy=\"never\""]

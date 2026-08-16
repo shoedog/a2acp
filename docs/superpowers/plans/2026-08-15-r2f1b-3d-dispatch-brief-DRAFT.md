@@ -152,3 +152,22 @@ orders; replacement/symlink negatives.
   record surfacing detached terminal failures; R3 bounded test waits. Caps
   450/650, single production file. Bounded Sol re-look on the repair delta
   follows; then land.
+- PIPELINE INCIDENT (credential class, diagnosed to mechanism): repair-2
+  dispatches a+b died pre-checkpoint ("workflow did not complete", NO
+  commit; agent container killed 1 s after start, exit 137 = bridge
+  teardown). Root cause chain, each link probed: (1) `models` probe isolated
+  it to the impl agent — `spawn codex-acp: Invalid params`; (2) RUST_LOG
+  trace pinned the -32602 to the `authenticate(methodId="chat-gpt")` call;
+  (3) auth.json (bridge cred copy) was rewritten 02:16 by the last
+  successful run and now carries OPENAI_API_KEY alongside the ChatGPT token
+  family; the containerized codex-acp now advertises EMPTY authMethods
+  (already-authed) so ANY authenticate call is rejected; (4) commenting
+  `auth_method` alone did NOT stop the bridge from sending authenticate
+  (falsified probe, logged); (5) `pre_authenticated = true` (the knob the
+  working solmax config uses) FIXED it — impl probe now lists the full
+  terra/sol roster. Config edit committed; the what-wrote-OPENAI_API_KEY
+  question joins the single-token-family credential ledger item. Sol-lens
+  probes were UNAFFECTED throughout (pre_authenticated already set there).
+- Repair-2 re-dispatched with the fixed config (same frozen spec; the two
+  dead clones impl-42693/impl-42978 left for the reaper — no commits, no
+  checkpoints).
