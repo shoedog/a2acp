@@ -89,6 +89,18 @@ mod mechanism {
     thread_local! {
         static SNAPSHOT_UNSUPPORTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
         static CAPTURE_UNSUPPORTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        static INTERRUPT_CAPTURED_REPLACE: std::cell::RefCell<Option<ChildNameV2>> = const {
+            std::cell::RefCell::new(None)
+        };
+    }
+    #[cfg(test)]
+    pub(crate) fn interrupt_replace_at_captured_for_test(target: ChildNameV2) {
+        INTERRUPT_CAPTURED_REPLACE.with(|slot| {
+            *slot.borrow_mut() = Some(
+                ChildNameV2::reserved(ReservedNameNamespaceV2::ReplacementCapture, &target)
+                    .expect("portable replacement capture"),
+            );
+        });
     }
     fn ticket(
         operation: CustodyOperationKindV2,
@@ -385,7 +397,26 @@ mod mechanism {
             successor: &[u8],
             label: &str,
         ) -> NamespaceTransactionOutcomeV2 {
-            Self::replace_with(op, target, expected, successor, label, |_, _| false)
+            Self::replace_with(
+                op,
+                target,
+                expected,
+                successor,
+                label,
+                |_transition, _name| {
+                    #[cfg(test)]
+                    if _transition == TransitionV2::Captured {
+                        return INTERRUPT_CAPTURED_REPLACE.with(|slot| {
+                            let matches = slot.borrow().as_ref() == Some(_name);
+                            if matches {
+                                slot.borrow_mut().take();
+                            }
+                            matches
+                        });
+                    }
+                    false
+                },
+            )
         }
         pub fn retire(
             op: &JournalRootOperationV2<'_>,
@@ -400,6 +431,83 @@ mod mechanism {
             label: &str,
         ) -> NamespaceTransactionOutcomeV2 {
             Self::recover_with(op, label, |_, _| false)
+        }
+        pub(crate) fn inspect_captured_replace_predecessor(
+            op: &JournalRootOperationV2<'_>,
+            target: &ChildNameV2,
+            max_bytes: u64,
+            label: &str,
+        ) -> Option<Vec<u8>> {
+            op.prove_route_v2(label).ok()?;
+            let root = op.root_file();
+            let names = enumerate_directory_names(root, CHILD_CAP, label).ok()?;
+            let mut reserved = Vec::new();
+            let mut intents = Vec::new();
+            for raw in names {
+                if !raw.as_bytes().starts_with(b".a2a-v2-") {
+                    continue;
+                }
+                let name = ChildNameV2::from_bytes(raw.as_bytes()).ok()?;
+                if ChildNameV2::parse_reserved(ReservedNameNamespaceV2::TransactionIntent, &name)
+                    .is_ok()
+                {
+                    intents.push(name.clone());
+                }
+                reserved.push(name);
+            }
+            let intent_name = match intents.as_slice() {
+                [name] => name,
+                _ => return None,
+            };
+            let (intent, _, commitment) = read_intent(root, intent_name, label).ok()?;
+            if intent.parts().0 != CustodyOperationKindV2::Replace || intent.parts().1 != target {
+                return None;
+            }
+            let expected_names: Vec<_> = ReservedNameNamespaceV2::ALL
+                .map(|namespace| intent.reserved_name(namespace))
+                .into_iter()
+                .collect();
+            if intent_name != intent.reserved_name(ReservedNameNamespaceV2::TransactionIntent)
+                || reserved.iter().any(|name| !expected_names.contains(&name))
+                || snapshot(root, target, label).ok()?.is_some()
+                || snapshot(
+                    root,
+                    intent.reserved_name(ReservedNameNamespaceV2::RetirementCapture),
+                    label,
+                )
+                .ok()?
+                .is_some()
+            {
+                return None;
+            }
+            let (mut captured, captured_snapshot) =
+                snapshot(root, intent.capture_name(), label).ok()??;
+            if captured_snapshot.object != *intent.parts().2
+                || captured_snapshot.content_len > max_bytes
+            {
+                return None;
+            }
+            if let Some((staged_file, staged_snapshot)) = snapshot(
+                root,
+                intent.reserved_name(ReservedNameNamespaceV2::Staging),
+                label,
+            )
+            .ok()?
+            {
+                if staged_snapshot != *intent.parts().3
+                    || sha256(&staged_file, label).ok()? != commitment?
+                {
+                    return None;
+                }
+            }
+            let mut bytes = Vec::new();
+            captured.read_to_end(&mut bytes).ok()?;
+            if bytes.len() as u64 != captured_snapshot.content_len
+                || required_file_content_snapshot_v2(&captured, label).ok()? != captured_snapshot
+            {
+                return None;
+            }
+            Some(bytes)
         }
         fn ready(
             op: &JournalRootOperationV2<'_>,
@@ -1841,6 +1949,8 @@ mod mechanism {
         }
     }
 }
+#[cfg(test)]
+pub(crate) use mechanism::interrupt_replace_at_captured_for_test;
 pub use mechanism::{
     NamespaceRecoveryTicketV2, NamespaceTransactionOutcomeV2, NamespaceTransactionV2,
 };

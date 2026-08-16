@@ -6,6 +6,58 @@ Frozen targeted-repair input: `4c8e408bc2290db9de9a3c31763cc0a0a2655c76`
 Task G2 fallback-plan repair input: `737239ae16efd6be1ca2cd474586c5d8c751e16f`
 Original Task G base: `f17e2bd37868c398d5c04d175ffee2a5cc5c1a00`
 
+## Frozen-input R2f1b captured-checkpoint authorization repair
+
+Date: 2026-08-16. Exact frozen input: `50f3336e4260f9e2bc3b6894eae6c6921baf4241`.
+
+Ordinary request-journal admission now treats an absent checkpoint as recoverable only
+when read-only inspection proves one exact checkpoint-replacement intent, its predecessor
+capture, and any surviving stage commitment. The captured bytes must decode as the
+existing strict checkpoint wire and pass the existing attempt/digest validation. Every
+ordinary request row is validated residue-tolerantly before recovery; the journal then
+uses the existing transaction recovery primitive and reruns ordinary authorization.
+Foreign, corrupt, incomplete, or multiply-intended captured states remain byte-for-byte
+unchanged refusals. No new public mutation authority was added.
+
+### Fail-first evidence
+
+The exact pre-production-change commands were:
+
+```bash
+CARGO_INCREMENTAL=0 cargo test -p bridge-core --lib -- \
+  remote_request_flight_captured_admission_checkpoint_recovers_before_authorization --nocapture
+CARGO_INCREMENTAL=0 cargo test -p bridge-core --lib -- \
+  remote_request_flight_captured_orphan_heal_checkpoint_recovers_twice --nocapture
+```
+
+Each command compiled the intended test against exact frozen input `50f3336e`, selected
+one test, and failed 0/1 at the first repaired-tree reopen with
+`Malformed("checkpoint is absent")` (659 filtered out). These were admissible behavioral
+reds: both tests used the real ordinary admission path and the exact B2 orphan-heal
+checkpoint replacement path, with the transaction seam interrupting at
+`TransitionV2::Captured`; neither failure was setup, dependency, network, or zero-test
+selection noise.
+
+### Regression coverage and verification
+
+- The admission and B2 tests now recover on the next reopen, validate the healed
+  checkpoint/child state, and reopen successfully a second time.
+- The refusal matrix covers foreign attempt, digest mismatch, bad stage commitment,
+  missing capture, missing intent, another target, multiple intents, and a corrupt
+  ordinary row; each rejected tree is byte-for-byte unchanged.
+- The existing normal-checkpoint invalid-row test and the absent-checkpoint corrupt-row
+  case both prove row validation precedes recovery.
+- The required aggregate selector passed 154 tests with 0 failures and 506 filtered out.
+- `cargo fmt --all -- --check` and `git diff --check` pass; no formatter-skip attribute
+  was added.
+
+Post-format churn versus `50f3336e` is production +131/-16 (147 changed lines),
+focused test seams/tests +186/-0, and this handoff +52/-0. Total churn is
++369/-16 = 385 changed lines, below the 150-production and 450-total stop limits.
+No live provider, billable smoke, compatibility run, release, deployment, or
+running-operator action occurred. The 3c2 aggregate review remains ahead, and production
+V3 remains unarmed.
+
 ## Task G2 targeted repair: fallback-plan protective release vocabulary
 
 Against exact frozen input `737239ae`, fallback-plan cleanup validation now
