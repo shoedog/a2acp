@@ -58,6 +58,23 @@ const PREPARATION_CALLER_COMMITTED: u8 = 2;
 const PREPARATION_ACTION_BOUND_MS: u64 = 30_000;
 const PREPARATION_CONTROL_BOUND_MS: u64 = 31_000;
 
+/// Exactly one pre-effect publisher owns a preparation flight. The phase is intentionally
+/// sticky: a failed transfer publication remains transfer-owned debt rather than allowing a
+/// barrier writer to race in and claim a different terminal outcome.
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PreparationPublicationPhaseV1 {
+    Preparing = 0,
+    TransferPublishing = 1,
+    BarrierPublishing = 2,
+}
+
+impl PreparationPublicationPhaseV1 {
+    const fn as_u8(self) -> u8 {
+        self as u8
+    }
+}
+
 /// The pre-barrier blocking population is intentionally closed. A future slice may add a
 /// blocking operation only by giving it a durable name here and placing a one-sample observation
 /// on both sides of that operation.
@@ -211,8 +228,7 @@ struct MaterializationPreparationFlightV1 {
     bound: Option<PreparationBoundV1>,
     operation: StdMutex<Option<PreparationOperationV1>>,
     journal: StdMutex<Option<Arc<PreparationFlightJournalV1>>>,
-    transferred: AtomicBool,
-    prepared_barrier: AtomicBool,
+    phase: AtomicU8,
     /// The observing configure future owns the only guard that can set this flag. The detached
     /// runner samples it exactly once between durable Open and add admission; after that sample,
     /// caller departure cannot cancel a committed materialization.
@@ -245,6 +261,37 @@ impl Drop for PreparationFlightCallerGuardV1 {
     }
 }
 
+/// A detached runner may panic or be aborted after its result sender has been installed in the
+/// active owner. The exit guard makes that failure observable to a backend-owned terminalizer;
+/// otherwise the retained sender would leave configure waiting forever.
+struct PreparationRunnerExitGuardV1 {
+    exit: Option<oneshot::Sender<()>>,
+    completed: bool,
+}
+
+impl PreparationRunnerExitGuardV1 {
+    fn new(exit: oneshot::Sender<()>) -> Self {
+        Self {
+            exit: Some(exit),
+            completed: false,
+        }
+    }
+
+    fn complete(&mut self) {
+        self.completed = true;
+    }
+}
+
+impl Drop for PreparationRunnerExitGuardV1 {
+    fn drop(&mut self) {
+        if !self.completed {
+            if let Some(exit) = self.exit.take() {
+                let _ = exit.send(());
+            }
+        }
+    }
+}
+
 impl MaterializationPreparationFlightV1 {
     fn claim(
         #[cfg(test)] hooks: Arc<PreparationFlightTestHooks>,
@@ -258,8 +305,7 @@ impl MaterializationPreparationFlightV1 {
             bound,
             operation: StdMutex::new(None),
             journal: StdMutex::new(None),
-            transferred: AtomicBool::new(false),
-            prepared_barrier: AtomicBool::new(false),
+            phase: AtomicU8::new(PreparationPublicationPhaseV1::Preparing.as_u8()),
             caller_departed: Arc::new(AtomicU8::new(PREPARATION_CALLER_PRESENT)),
             #[cfg(test)]
             hooks,
@@ -291,7 +337,7 @@ impl MaterializationPreparationFlightV1 {
     fn expired_pre_barrier(
         &self,
     ) -> Option<(PreparationOperationV1, BoundedPreparationTransferReasonV1)> {
-        if self.prepared_barrier.load(Ordering::Acquire) || self.transferred() {
+        if self.phase.load(Ordering::Acquire) != PreparationPublicationPhaseV1::Preparing.as_u8() {
             return None;
         }
         let operation = (*self
@@ -305,23 +351,39 @@ impl MaterializationPreparationFlightV1 {
     }
 
     fn begin_transfer(&self) -> bool {
-        !self.prepared_barrier.load(Ordering::Acquire)
-            && self
-                .transferred
-                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-                .is_ok()
+        self.phase
+            .compare_exchange(
+                PreparationPublicationPhaseV1::Preparing.as_u8(),
+                PreparationPublicationPhaseV1::TransferPublishing.as_u8(),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
     }
 
-    fn transferred(&self) -> bool {
-        self.transferred.load(Ordering::Acquire)
+    fn transfer_owned(&self) -> bool {
+        self.phase.load(Ordering::Acquire)
+            == PreparationPublicationPhaseV1::TransferPublishing.as_u8()
     }
 
-    fn prepared_barrier(&self) {
-        self.prepared_barrier.store(true, Ordering::Release);
+    fn begin_barrier_publication(&self) -> bool {
+        if self
+            .phase
+            .compare_exchange(
+                PreparationPublicationPhaseV1::Preparing.as_u8(),
+                PreparationPublicationPhaseV1::BarrierPublishing.as_u8(),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_err()
+        {
+            return false;
+        }
         *self
             .operation
             .lock()
             .unwrap_or_else(|error| error.into_inner()) = None;
+        true
     }
 
     fn journal(&self) -> Option<Arc<PreparationFlightJournalV1>> {
@@ -408,7 +470,7 @@ impl ActivePreparationFlightV1 {
         }
     }
 
-    fn complete_with_result(
+    async fn complete_with_result(
         &self,
         completion: Result<(), BridgeError>,
         result: MaterializationResultV1,
@@ -422,7 +484,19 @@ impl ActivePreparationFlightV1 {
         {
             let _ = sender.send(result);
         }
+        #[cfg(test)]
+        self.flight.after_result_publication_for_test().await;
     }
+}
+
+/// The runner's transfer inputs are grouped so the custody helper keeps the exact active owner
+/// coupled to the registries it may transfer into. The flight itself is always derived from that
+/// owner, avoiding a mismatched flight/owner pair across the transfer-versus-barrier boundary.
+struct PreparationFlightRunContextV1<'a> {
+    flights: &'a Arc<StdMutex<HashMap<String, Arc<ActivePreparationFlightV1>>>>,
+    recovery_flights: &'a Arc<StdMutex<HashMap<String, Arc<TransferredPreparationFlightV1>>>>,
+    session_key: &'a str,
+    owner: &'a Arc<ActivePreparationFlightV1>,
 }
 
 /// Recovery owns this exact active owner after a pre-effect transfer. Its `runner` field retains
@@ -500,6 +574,50 @@ impl PreparationFlightJournalV1 {
             CustodyPublicationV1::ParentSyncAmbiguous(_)
             | CustodyPublicationV1::TargetIdentityUnverified(_)
             | CustodyPublicationV1::RenameOutcomeUnverified(_) => Err(BridgeError::StoreFailure),
+        }
+    }
+
+    /// Transfer can win while the runner's initial `Open` publication is blocked. In that case
+    /// this already-open control journal writes the first durable record itself; if `Open` won
+    /// the filesystem race, it replaces only that exact record. A terminal or foreign occupant
+    /// is never overwritten.
+    fn publish_transferred_from_preparing(
+        &self,
+        state: PreparationFlightStateV1,
+    ) -> Result<(), BridgeError> {
+        let has_exact_open = || -> Result<bool, BridgeError> {
+            if !self
+                .root
+                .child_entry_exists(&self.record_name, "preparation flight record")
+                .map_err(|_| BridgeError::StoreFailure)?
+            {
+                return Ok(false);
+            }
+            let mut existing = self
+                .root
+                .open_regular_file(&self.record_name, "preparation flight record")
+                .map_err(|_| BridgeError::StoreFailure)?;
+            let mut bytes = Vec::new();
+            existing
+                .read_to_end(&mut bytes)
+                .map_err(|_| BridgeError::StoreFailure)?;
+            let record: PreparationFlightRecordV1 =
+                serde_json::from_slice(&bytes).map_err(|_| BridgeError::StoreFailure)?;
+            if record.schema_version != PREPARATION_FLIGHT_RECORD_SCHEMA_V1
+                || record.flight_id != self.flight_id
+            {
+                return Err(BridgeError::StoreFailure);
+            }
+            Ok(matches!(record.state, PreparationFlightStateV1::Open {}))
+        };
+
+        if has_exact_open()? {
+            return self.publish(state, false);
+        }
+        match self.publish(state.clone(), true) {
+            Ok(()) => Ok(()),
+            Err(_error) if has_exact_open()? => self.publish(state, false),
+            Err(error) => Err(error),
         }
     }
 
@@ -595,9 +713,15 @@ async fn publish_preparation_state(
     }
     let terminal = preparation_state_is_terminal(&state);
     let durable_state = state.clone();
-    tokio::task::spawn_blocking(move || journal.publish(durable_state, first))
-        .await
-        .map_err(|_| BridgeError::StoreFailure)??;
+    tokio::task::spawn_blocking(move || {
+        if matches!(&durable_state, PreparationFlightStateV1::Transferred { .. }) {
+            journal.publish_transferred_from_preparing(durable_state)
+        } else {
+            journal.publish(durable_state, first)
+        }
+    })
+    .await
+    .map_err(|_| BridgeError::StoreFailure)??;
     flight.record(state);
     #[cfg(test)]
     if terminal {
@@ -606,6 +730,71 @@ async fn publish_preparation_state(
     #[cfg(not(test))]
     let _ = terminal;
     Ok(())
+}
+
+async fn publish_runner_exit_failure(
+    journal: Arc<PreparationFlightJournalV1>,
+    flight: Arc<MaterializationPreparationFlightV1>,
+) -> Result<(), BridgeError> {
+    let failed = preparation_failure_state();
+    let durable_state = failed.clone();
+    match tokio::task::spawn_blocking(move || journal.publish_failed_after_initial_open_failure())
+        .await
+        .map_err(|_| BridgeError::StoreFailure)?
+    {
+        Ok(()) => {
+            flight.record(durable_state);
+            #[cfg(test)]
+            flight.terminal_recorded_for_test();
+            Ok(())
+        }
+        Err(_) => {
+            publish_preparation_state(
+                flight
+                    .journal()
+                    .expect("control journal exists for a claimed preparation flight"),
+                flight,
+                failed,
+                false,
+            )
+            .await
+        }
+    }
+}
+
+async fn terminalize_preparation_runner_exit(
+    flights: Arc<StdMutex<HashMap<String, Arc<ActivePreparationFlightV1>>>>,
+    session_key: String,
+    owner: Arc<ActivePreparationFlightV1>,
+) {
+    // Transfer has its own durable terminal publication and recovery-owner transition. A runner
+    // that exits after transfer started must never replace that result.
+    if owner.flight.transfer_owned() {
+        return;
+    }
+    let runner_error =
+        BridgeError::agent_crashed("materialization preparation runner exited unexpectedly");
+    let completion = if owner.flight.has_durable_terminal() {
+        Ok(())
+    } else if let Some(journal) = owner.flight.journal() {
+        match publish_runner_exit_failure(journal, owner.flight.clone()).await {
+            Ok(()) => Ok(()),
+            Err(error) => Err(error),
+        }
+    } else {
+        Err(BridgeError::StoreFailure)
+    };
+    let result = Err(completion.as_ref().err().cloned().unwrap_or(runner_error));
+    owner.complete_with_result(completion.clone(), result).await;
+    if completion.is_ok() {
+        let mut active = flights.lock().unwrap_or_else(|error| error.into_inner());
+        if active
+            .get(&session_key)
+            .is_some_and(|current| Arc::ptr_eq(current, &owner))
+        {
+            active.remove(&session_key);
+        }
+    }
 }
 
 /// Move an expired pre-effect runner into the backend's recovery inventory.
@@ -621,40 +810,70 @@ async fn transfer_preparation_flight(
         return Ok(false);
     }
     let Some(journal) = owner.flight.journal() else {
+        owner
+            .complete_with_result(
+                Err(BridgeError::StoreFailure),
+                Err(BridgeError::StoreFailure),
+            )
+            .await;
         return Err(BridgeError::StoreFailure);
     };
     let state = PreparationFlightStateV1::Transferred {
         reason: reason.clone(),
     };
-    publish_preparation_state(journal, owner.flight.clone(), state, false).await?;
-    owner.complete_with_result(
-        Ok(()),
-        Err(BridgeError::ConfigInvalid {
-            reason: format!(
-                "preparation transferred before effect admission at {}",
-                operation.as_str()
-            ),
-        }),
-    );
-    let mut active = flights.lock().unwrap_or_else(|error| error.into_inner());
-    if active
-        .get(session_key)
-        .is_some_and(|current| Arc::ptr_eq(current, owner))
+    if let Err(error) = publish_preparation_state(journal, owner.flight.clone(), state, false).await
     {
-        active.remove(session_key);
+        owner
+            .complete_with_result(Err(error.clone()), Err(error.clone()))
+            .await;
+        return Err(error);
     }
-    drop(active);
-    recovery_flights
-        .lock()
-        .unwrap_or_else(|error| error.into_inner())
-        .insert(
-            session_key.to_owned(),
-            Arc::new(TransferredPreparationFlightV1 {
-                owner: owner.clone(),
-                operation,
-                reason,
+    let recovered = Arc::new(TransferredPreparationFlightV1 {
+        owner: owner.clone(),
+        operation,
+        reason,
+    });
+    let registry_moved = {
+        let mut recovery = recovery_flights
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if recovery.contains_key(session_key) {
+            false
+        } else {
+            recovery.insert(session_key.to_owned(), recovered);
+            let mut active = flights.lock().unwrap_or_else(|error| error.into_inner());
+            if active
+                .get(session_key)
+                .is_some_and(|current| Arc::ptr_eq(current, owner))
+            {
+                active.remove(session_key);
+                true
+            } else {
+                recovery.remove(session_key);
+                false
+            }
+        }
+    };
+    if !registry_moved {
+        owner
+            .complete_with_result(
+                Err(BridgeError::StoreFailure),
+                Err(BridgeError::StoreFailure),
+            )
+            .await;
+        return Err(BridgeError::StoreFailure);
+    }
+    owner
+        .complete_with_result(
+            Ok(()),
+            Err(BridgeError::ConfigInvalid {
+                reason: format!(
+                    "preparation transferred before effect admission at {}",
+                    operation.as_str()
+                ),
             }),
-        );
+        )
+        .await;
     Ok(true)
 }
 #[cfg(test)]
@@ -665,6 +884,15 @@ struct PreparationFlightTestHooks {
     pause_after_open: AtomicBool,
     release_after_open: Notify,
     fail_initial_open_parent_sync: AtomicBool,
+    block_initial_open_publish: AtomicBool,
+    initial_open_publish_entered_count: AtomicUsize,
+    initial_open_publish_entered: Notify,
+    initial_open_publish_released: StdMutex<bool>,
+    initial_open_publish_release: Condvar,
+    result_publication_count: AtomicUsize,
+    result_published: Notify,
+    pause_after_result_publication: AtomicBool,
+    release_after_result_publication: Notify,
     add_admission_count: AtomicUsize,
     add_admission: Notify,
     pause_after_add_admission: AtomicBool,
@@ -696,6 +924,71 @@ impl PreparationFlightTestHooks {
     fn take_initial_open_parent_sync_failure(&self) -> bool {
         self.fail_initial_open_parent_sync
             .swap(false, Ordering::SeqCst)
+    }
+
+    fn arm_nonreturning_initial_open_publish(&self) {
+        *self
+            .initial_open_publish_released
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = false;
+        self.block_initial_open_publish
+            .store(true, Ordering::SeqCst);
+    }
+
+    fn block_initial_open_publish_if_armed(&self) {
+        if self
+            .block_initial_open_publish
+            .swap(false, Ordering::SeqCst)
+        {
+            self.initial_open_publish_entered_count
+                .fetch_add(1, Ordering::SeqCst);
+            self.initial_open_publish_entered.notify_waiters();
+            let mut released = self
+                .initial_open_publish_released
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            while !*released {
+                released = self
+                    .initial_open_publish_release
+                    .wait(released)
+                    .unwrap_or_else(|error| error.into_inner());
+            }
+        }
+    }
+
+    async fn wait_for_initial_open_publish(&self) {
+        while self
+            .initial_open_publish_entered_count
+            .load(Ordering::SeqCst)
+            == 0
+        {
+            self.initial_open_publish_entered.notified().await;
+        }
+    }
+
+    fn release_initial_open_publish(&self) {
+        *self
+            .initial_open_publish_released
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = true;
+        self.initial_open_publish_release.notify_all();
+    }
+
+    async fn after_result_publication(&self) {
+        self.result_publication_count.fetch_add(1, Ordering::SeqCst);
+        self.result_published.notify_waiters();
+        if self
+            .pause_after_result_publication
+            .swap(false, Ordering::SeqCst)
+        {
+            self.release_after_result_publication.notified().await;
+        }
+    }
+
+    async fn wait_for_result_publication(&self) {
+        while self.result_publication_count.load(Ordering::SeqCst) == 0 {
+            self.result_published.notified().await;
+        }
     }
 
     async fn after_add_admission(&self) {
@@ -825,6 +1118,14 @@ impl MaterializationPreparationFlightV1 {
 
     fn fail_initial_open_parent_sync_for_test(&self) -> bool {
         self.hooks.take_initial_open_parent_sync_failure()
+    }
+
+    fn block_initial_open_publish_for_test(&self) {
+        self.hooks.block_initial_open_publish_if_armed();
+    }
+
+    async fn after_result_publication_for_test(&self) {
+        self.hooks.after_result_publication().await;
     }
 
     async fn after_add_admission_for_test(&self) {
@@ -1953,6 +2254,23 @@ impl WorktreeBackend {
             .unwrap_or_else(|error| error.into_inner())
             .get(session.as_str())
             .cloned()
+    }
+
+    #[cfg(test)]
+    async fn join_transferred_preparation_runner_for_test(&self, session: &SessionId) {
+        let recovery = self
+            .transferred_preparation_for_test(session)
+            .expect("the transferred owner remains recovery-inventoriable");
+        let runner = recovery
+            .owner
+            .runner
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take()
+            .expect("recovery owns the exact runner handle");
+        runner
+            .await
+            .expect("the released preparation runner must not panic");
     }
 
     #[cfg(test)]
@@ -3251,6 +3569,15 @@ impl WorktreeBackend {
         )?);
         #[cfg(not(test))]
         let flight = Arc::new(MaterializationPreparationFlightV1::claim()?);
+        // This control journal is opened before the first bounded operation. Its parent is the
+        // already-established worktree control root, so a transfer can durably terminalize even
+        // while the initial Open publication itself is stuck.
+        let journal = Arc::new(PreparationFlightJournalV1::open(
+            &worktree_root,
+            &resolved.worktree_path,
+            flight.id().clone(),
+        )?);
+        flight.set_journal(journal.clone());
         let active_flight = Arc::new(ActivePreparationFlightV1::new(flight.clone()));
         {
             let mut flights = self
@@ -3275,31 +3602,32 @@ impl WorktreeBackend {
         let expected_worktree_path = resolved.worktree_path.clone();
         let task_flight = flight.clone();
         let task_owner = active_flight.clone();
+        let task_journal = journal.clone();
         let (result_tx, result_rx) = oneshot::channel();
         active_flight.install_result(result_tx);
+        let (runner_exit_tx, runner_exit_rx) = oneshot::channel();
+        let runner_exit_flights = self.preparation_flights.clone();
+        let runner_exit_owner = active_flight.clone();
+        let runner_exit_session = session_key.clone();
         let runner = tokio::spawn(async move {
+            let mut runner_exit_guard = PreparationRunnerExitGuardV1::new(runner_exit_tx);
+            task_flight.begin_operation(PreparationOperationV1::JournalOpenPublish);
             let initial = tokio::task::spawn_blocking({
-                task_flight.begin_operation(PreparationOperationV1::JournalOpenPublish);
                 #[cfg(test)]
                 let initial_flight = task_flight.clone();
-                let flight_id = task_flight.id().clone();
-                let worktree_root = worktree_root.clone();
-                let worktree_path = resolved.worktree_path.clone();
-                move || -> Result<Option<Arc<PreparationFlightJournalV1>>, BridgeError> {
-                    let journal = Arc::new(PreparationFlightJournalV1::open(
-                        &worktree_root,
-                        &worktree_path,
-                        flight_id,
-                    )?);
+                let journal = task_journal.clone();
+                move || -> Result<(), BridgeError> {
+                    #[cfg(test)]
+                    initial_flight.block_initial_open_publish_for_test();
                     #[cfg(test)]
                     if initial_flight.fail_initial_open_parent_sync_for_test() {
                         journal.fail_next_parent_sync_for_test();
                     }
                     match journal.publish(PreparationFlightStateV1::Open {}, true) {
-                        Ok(()) => Ok(Some(journal)),
+                        Ok(()) => Ok(()),
                         Err(_) => {
                             journal.publish_failed_after_initial_open_failure()?;
-                            Ok(None)
+                            Err(BridgeError::StoreFailure)
                         }
                     }
                 }
@@ -3308,9 +3636,16 @@ impl WorktreeBackend {
             .map_err(|_| BridgeError::StoreFailure)
             .and_then(|result| result);
 
+            // A transfer may have written the first control record while initial Open was blocked.
+            // It owns completion and recovery publication; this released runner must not overwrite it.
+            if task_flight.transfer_owned() {
+                runner_exit_guard.complete();
+                return;
+            }
+
             let result = match initial {
-                Ok(Some(journal)) => {
-                    task_flight.set_journal(journal.clone());
+                Ok(()) => {
+                    let journal = task_journal.clone();
                     if let Some((operation, reason)) = task_flight.expired_pre_barrier() {
                         match transfer_preparation_flight(
                             &flights,
@@ -3322,10 +3657,16 @@ impl WorktreeBackend {
                         )
                         .await
                         {
-                            Ok(true) => return,
+                            Ok(true) => {
+                                runner_exit_guard.complete();
+                                return;
+                            }
                             Ok(false) => {}
                             Err(error) => {
-                                task_owner.complete_with_result(Err(error.clone()), Err(error));
+                                task_owner
+                                    .complete_with_result(Err(error.clone()), Err(error))
+                                    .await;
+                                runner_exit_guard.complete();
                                 return;
                             }
                         }
@@ -3344,10 +3685,16 @@ impl WorktreeBackend {
                         )
                         .await
                         {
-                            Ok(true) => return,
+                            Ok(true) => {
+                                runner_exit_guard.complete();
+                                return;
+                            }
                             Ok(false) => {}
                             Err(error) => {
-                                task_owner.complete_with_result(Err(error.clone()), Err(error));
+                                task_owner
+                                    .complete_with_result(Err(error.clone()), Err(error))
+                                    .await;
+                                runner_exit_guard.complete();
                                 return;
                             }
                         }
@@ -3366,7 +3713,12 @@ impl WorktreeBackend {
                             custody,
                             resolved,
                             journal.clone(),
-                            task_flight.clone(),
+                            PreparationFlightRunContextV1 {
+                                flights: &flights,
+                                recovery_flights: &recovery_flights,
+                                session_key: &session_key,
+                                owner: &task_owner,
+                            },
                         )
                         .await
                     };
@@ -3418,7 +3770,7 @@ impl WorktreeBackend {
                             }
                         }
                         Err(error) => {
-                            if task_flight.transferred() {
+                            if task_flight.transfer_owned() {
                                 Err(error)
                             } else {
                                 let failed = if caller_departed_at_add_admission {
@@ -3442,17 +3794,17 @@ impl WorktreeBackend {
                         }
                     }
                 }
-                Ok(None) => {
+                Err(error) => {
                     task_flight.record(preparation_failure_state());
                     #[cfg(test)]
                     task_flight.terminal_recorded_for_test();
-                    Err(BridgeError::StoreFailure)
-                }
-                Err(error) => {
-                    task_flight.record(preparation_failure_state());
                     Err(error)
                 }
             };
+            if task_flight.transfer_owned() {
+                runner_exit_guard.complete();
+                return;
+            }
             let completion = if task_flight.has_durable_terminal() {
                 Ok(())
             } else {
@@ -3462,7 +3814,9 @@ impl WorktreeBackend {
                     )
                 }))
             };
-            task_owner.complete_with_result(completion.clone(), result);
+            task_owner
+                .complete_with_result(completion.clone(), result)
+                .await;
             if completion.is_ok() {
                 let mut active = flights.lock().unwrap_or_else(|error| error.into_inner());
                 if active
@@ -3472,8 +3826,19 @@ impl WorktreeBackend {
                     active.remove(&session_key);
                 }
             }
+            runner_exit_guard.complete();
         });
         active_flight.install_runner(runner);
+        tokio::spawn(async move {
+            if runner_exit_rx.await.is_ok() {
+                terminalize_preparation_runner_exit(
+                    runner_exit_flights,
+                    runner_exit_session,
+                    runner_exit_owner,
+                )
+                .await;
+            }
+        });
         let result = result_rx.await.map_err(|_| {
             BridgeError::agent_crashed("materialization preparation flight ended without a result")
         })?;
@@ -3498,8 +3863,9 @@ impl WorktreeBackend {
         custody: bridge_core::execution_policy::BoundWorktreeCustodyV1,
         resolved: ResolvedWorktree,
         journal: Arc<PreparationFlightJournalV1>,
-        flight: Arc<MaterializationPreparationFlightV1>,
+        context: PreparationFlightRunContextV1<'_>,
     ) -> Result<(WtCustodyV1, Option<Box<ProtectedCheckoutV1>>), BridgeError> {
+        let flight = context.owner.flight.clone();
         let worktree_root = Path::new(&resolved.worktree_path)
             .parent()
             .ok_or(BridgeError::ConfigMismatch {
@@ -3512,15 +3878,13 @@ impl WorktreeBackend {
         // Blocking: every step is descriptor-level filesystem work behind two blocking file
         // locks. `custody_lock.rs` requires offloading, and the pinned root and both guards are
         // `Send`, so the custodian moves back out.
-        let custodian = tokio::task::spawn_blocking({
+        let custody_result = tokio::task::spawn_blocking({
             let worktree_path = worktree_path.clone();
-            #[cfg(test)]
             let custody_flight = flight.clone();
             move || -> Result<WorktreeCustodianV1, CustodyWriteRefusalV1> {
                 #[cfg(test)]
                 custody_flight.block_custody_sync_for_test();
-                #[cfg(test)]
-                if custody_flight.transferred() {
+                if custody_flight.transfer_owned() {
                     return Err(CustodyWriteRefusalV1::Failed(
                         "preparation transferred before custody entry".to_owned(),
                     ));
@@ -3535,14 +3899,33 @@ impl WorktreeBackend {
         .await
         .map_err(|error| {
             BridgeError::agent_crashed(format!("custody preparation task failed: {error}"))
-        })?
-        .map_err(custody_write_error)?;
-        if flight.transferred() {
+        })?;
+
+        // The post-return sample closes the slow-return window: a custody operation that crossed
+        // the action bound may transfer, but neither terminal state nor a provider effect may be
+        // admitted after that transfer wins.
+        if let Some((operation, reason)) = flight.expired_pre_barrier() {
+            let transferred = transfer_preparation_flight(
+                context.flights,
+                context.recovery_flights,
+                context.session_key,
+                context.owner,
+                operation,
+                reason,
+            )
+            .await?;
+            if transferred || flight.transfer_owned() {
+                return Err(BridgeError::ConfigInvalid {
+                    reason: "preparation transferred before custody effect admission".into(),
+                });
+            }
+        }
+        let custodian = custody_result.map_err(custody_write_error)?;
+        if !flight.begin_barrier_publication() {
             return Err(BridgeError::ConfigInvalid {
-                reason: "preparation transferred before custody effect admission".into(),
+                reason: "preparation transferred before barrier publication".into(),
             });
         }
-
         publish_preparation_state(
             journal.clone(),
             flight.clone(),
@@ -3550,7 +3933,6 @@ impl WorktreeBackend {
             false,
         )
         .await?;
-        flight.prepared_barrier();
         flight.begin_operation(PreparationOperationV1::IdentityCapture);
 
         // A runtime `Err` here (a git spawn failure, say) is NOT allowed to propagate raw: the
@@ -9369,6 +9751,42 @@ mod tests {
         }
     }
 
+    /// A panic after the barrier used to strand the configure waiter behind the active owner's
+    /// retained result sender. The runner-exit guard must terminalize that exact flight instead.
+    struct PanickingCustodyAddProv {
+        rec: Arc<Rec>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::provider::WorktreeProvider for PanickingCustodyAddProv {
+        fn supports_custody_add(&self) -> bool {
+            true
+        }
+
+        async fn add(&self, _repo: &str, _worktree_path: &str) -> Result<String, BridgeError> {
+            unreachable!("the V3 path never uses the V2 add")
+        }
+
+        async fn add_under_custody(
+            &self,
+            _repo: &str,
+            worktree_path: &str,
+        ) -> Result<CustodyAddOutcomeV1, BridgeError> {
+            self.rec.add_count.fetch_add(1, Ordering::SeqCst);
+            note_ordering(&self.rec, worktree_path);
+            panic!("panicking custody provider regression");
+        }
+
+        async fn remove(&self, _repo: &str, _worktree_path: &str) -> Result<(), BridgeError> {
+            self.rec.remove_count.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        async fn is_git_repo(&self, _path: &str) -> bool {
+            true
+        }
+    }
+
     struct BlockingCustodyAddProv {
         rec: Arc<Rec>,
         entered: Arc<Notify>,
@@ -11309,6 +11727,268 @@ mod tests {
             preparation_flight_state_of(&target).as_deref(),
             Some("settled")
         );
+        std::fs::remove_dir_all(tmp).unwrap();
+    }
+
+    /// W1, both deterministic schedules: one CAS phase owns either transfer or barrier
+    /// publication. A released transfer loser never adds, and neither schedule can publish two
+    /// preparation terminals.
+    #[tokio::test]
+    async fn preparation_phase_linearizes_transfer_and_barrier_races() {
+        let (be, rec, tmp, source, cfg) = backend_fixture("preparation-phase-transfer-wins");
+        let (bound, target) = bound_spec_v3(&source, &cfg);
+        let clock = Arc::new(ManualPreparationClock::new(0));
+        be.arm_preparation_bound_for_test(PreparationClockV1::new(clock.clone()));
+        let hooks = be.preparation_test_hooks.clone();
+        hooks.arm_nonreturning_custody_sync();
+        let session = SessionId::parse("preparation-phase-transfer-wins").unwrap();
+        let configure_be = be.clone();
+        let configure_session = session.clone();
+        let configure = tokio::spawn(async move {
+            configure_be
+                .configure_bound_session(&configure_session, &bound)
+                .await
+        });
+
+        hooks.wait_for_custody_sync().await;
+        clock.set(PREPARATION_CONTROL_BOUND_MS);
+        assert!(be.observe_preparation_bound_for_test(&session).await);
+        assert!(matches!(
+            configure.await.unwrap(),
+            Err(BridgeError::ConfigInvalid { .. })
+        ));
+        hooks.release_custody_sync();
+        be.join_transferred_preparation_runner_for_test(&session)
+            .await;
+        assert_eq!(
+            preparation_flight_state_of(&target).as_deref(),
+            Some("transferred")
+        );
+        assert_eq!(hooks.terminal_count.load(Ordering::SeqCst), 1);
+        assert_eq!(rec.add_count.load(Ordering::SeqCst), 0);
+        std::fs::remove_dir_all(tmp).unwrap();
+
+        let tmp = unique_temp_dir("preparation-phase-barrier-wins");
+        let (be, rec, source, cfg, provider) = blocking_custody_fixture(&tmp);
+        let (bound, target) = bound_spec_v3(&source, &cfg);
+        let clock = Arc::new(ManualPreparationClock::new(0));
+        be.arm_preparation_bound_for_test(PreparationClockV1::new(clock.clone()));
+        let session = SessionId::parse("preparation-phase-barrier-wins").unwrap();
+        let configure_be = be.clone();
+        let configure_session = session.clone();
+        let configure = tokio::spawn(async move {
+            configure_be
+                .configure_bound_session(&configure_session, &bound)
+                .await
+        });
+
+        provider.entered.notified().await;
+        clock.set(PREPARATION_CONTROL_BOUND_MS);
+        assert!(
+            !be.observe_preparation_bound_for_test(&session).await,
+            "the barrier phase owns admission before the transfer observer can publish"
+        );
+        provider.release.notify_one();
+        configure.await.unwrap().unwrap();
+        assert_eq!(
+            preparation_flight_state_of(&target).as_deref(),
+            Some("settled")
+        );
+        assert_eq!(
+            be.preparation_test_hooks
+                .terminal_count
+                .load(Ordering::SeqCst),
+            1
+        );
+        assert_eq!(rec.add_count.load(Ordering::SeqCst), 1);
+        std::fs::remove_dir_all(tmp).unwrap();
+    }
+
+    /// W2: the sole post-return sample sees a custody operation cross the action bound without a
+    /// cfg(test) observer. It transfers before barrier publication and provider admission.
+    #[tokio::test]
+    async fn slow_returning_custody_operation_transfers_before_barrier_admission() {
+        let (be, rec, tmp, source, cfg) = backend_fixture("preparation-slow-custody-return");
+        let (bound, target) = bound_spec_v3(&source, &cfg);
+        let clock = Arc::new(ManualPreparationClock::new(
+            PREPARATION_ACTION_BOUND_MS - 100,
+        ));
+        be.arm_preparation_bound_for_test(PreparationClockV1::new(clock.clone()));
+        let hooks = be.preparation_test_hooks.clone();
+        hooks.arm_nonreturning_custody_sync();
+        let session = SessionId::parse("preparation-slow-custody-return").unwrap();
+        let configure_be = be.clone();
+        let configure_session = session.clone();
+        let configure = tokio::spawn(async move {
+            configure_be
+                .configure_bound_session(&configure_session, &bound)
+                .await
+        });
+
+        hooks.wait_for_custody_sync().await;
+        clock.set(PREPARATION_ACTION_BOUND_MS + 100);
+        hooks.release_custody_sync();
+        assert!(matches!(
+            configure.await.unwrap(),
+            Err(BridgeError::ConfigInvalid { .. })
+        ));
+        be.join_transferred_preparation_runner_for_test(&session)
+            .await;
+        assert_eq!(
+            preparation_flight_state_of(&target).as_deref(),
+            Some("transferred")
+        );
+        assert_eq!(rec.add_count.load(Ordering::SeqCst), 0);
+        std::fs::remove_dir_all(tmp).unwrap();
+    }
+
+    /// W3: the control journal exists before initial Open. Transfer can therefore terminalize a
+    /// blocked initial publication and leave the exact blocked runner in recovery ownership.
+    #[tokio::test]
+    async fn blocked_initial_open_transfers_through_control_journal() {
+        let (be, rec, tmp, source, cfg) = backend_fixture("preparation-control-journal");
+        let (bound, target) = bound_spec_v3(&source, &cfg);
+        let clock = Arc::new(ManualPreparationClock::new(0));
+        be.arm_preparation_bound_for_test(PreparationClockV1::new(clock.clone()));
+        let hooks = be.preparation_test_hooks.clone();
+        hooks.arm_nonreturning_initial_open_publish();
+        let session = SessionId::parse("preparation-control-journal").unwrap();
+        let configure_be = be.clone();
+        let configure_session = session.clone();
+        let configure = tokio::spawn(async move {
+            configure_be
+                .configure_bound_session(&configure_session, &bound)
+                .await
+        });
+
+        hooks.wait_for_initial_open_publish().await;
+        let exact_flight = be
+            .preparation_guard_for_test(&session)
+            .expect("the active owner retains the blocked runner");
+        clock.set(PREPARATION_CONTROL_BOUND_MS);
+        assert!(be.observe_preparation_bound_for_test(&session).await);
+        assert!(matches!(
+            configure.await.unwrap(),
+            Err(BridgeError::ConfigInvalid { .. })
+        ));
+        let recovery = be
+            .transferred_preparation_for_test(&session)
+            .expect("transfer is recovery-owned before configure observes its result");
+        assert!(Arc::ptr_eq(&exact_flight, &recovery.owner.flight));
+        assert!(recovery.owner.runner.lock().unwrap().is_some());
+        hooks.release_initial_open_publish();
+        be.join_transferred_preparation_runner_for_test(&session)
+            .await;
+        assert_eq!(
+            preparation_flight_state_of(&target).as_deref(),
+            Some("transferred")
+        );
+        assert_eq!(rec.add_count.load(Ordering::SeqCst), 0);
+        std::fs::remove_dir_all(tmp).unwrap();
+    }
+
+    /// W4: pausing immediately after result publication proves recovery is visible before the
+    /// configure waiter wakes; the old completion-first ordering exposed an empty inventory here.
+    #[tokio::test]
+    async fn transfer_registers_recovery_before_publishing_configure_result() {
+        let (be, _rec, tmp, source, cfg) = backend_fixture("preparation-recovery-before-result");
+        let (bound, _target) = bound_spec_v3(&source, &cfg);
+        let clock = Arc::new(ManualPreparationClock::new(0));
+        be.arm_preparation_bound_for_test(PreparationClockV1::new(clock.clone()));
+        let hooks = be.preparation_test_hooks.clone();
+        hooks.arm_nonreturning_initial_open_publish();
+        hooks
+            .pause_after_result_publication
+            .store(true, Ordering::SeqCst);
+        let session = SessionId::parse("preparation-recovery-before-result").unwrap();
+        let configure_be = be.clone();
+        let configure_session = session.clone();
+        let configure = tokio::spawn(async move {
+            configure_be
+                .configure_bound_session(&configure_session, &bound)
+                .await
+        });
+
+        hooks.wait_for_initial_open_publish().await;
+        clock.set(PREPARATION_CONTROL_BOUND_MS);
+        let observer_be = be.clone();
+        let observer_session = session.clone();
+        let observer = tokio::spawn(async move {
+            observer_be
+                .observe_preparation_bound_for_test(&observer_session)
+                .await
+        });
+        hooks.wait_for_result_publication().await;
+        assert!(matches!(
+            configure.await.unwrap(),
+            Err(BridgeError::ConfigInvalid { .. })
+        ));
+        assert!(
+            be.transferred_preparation_for_test(&session).is_some(),
+            "the result is visible only after the exact owner reached recovery"
+        );
+        hooks.release_after_result_publication.notify_one();
+        assert!(observer.await.unwrap());
+        hooks.release_initial_open_publish();
+        be.join_transferred_preparation_runner_for_test(&session)
+            .await;
+        std::fs::remove_dir_all(tmp).unwrap();
+    }
+
+    /// s1: a provider panic no longer leaves configure waiting forever behind the active owner's
+    /// sender; the exit guard records a terminal failure and returns a typed crash.
+    #[tokio::test]
+    async fn panicking_provider_terminalizes_the_preparation_runner() {
+        let tmp = unique_temp_dir("preparation-panicking-provider");
+        let (be, rec, source, cfg) =
+            provider_fixture(&tmp, |rec| Arc::new(PanickingCustodyAddProv { rec }));
+        let (bound, target) = bound_spec_v3(&source, &cfg);
+        let session = SessionId::parse("preparation-panicking-provider").unwrap();
+        let error = tokio::time::timeout(
+            Duration::from_secs(2),
+            be.configure_bound_session(&session, &bound),
+        )
+        .await
+        .expect("runner exit guard must wake configure")
+        .unwrap_err();
+
+        assert!(matches!(error, BridgeError::AgentCrashed { .. }));
+        assert_eq!(
+            preparation_flight_state_of(&target).as_deref(),
+            Some("failed")
+        );
+        assert_eq!(rec.add_count.load(Ordering::SeqCst), 1);
+        std::fs::remove_dir_all(tmp).unwrap();
+    }
+
+    /// s2: a failed Transferred publication is typed active debt, never a recovery success or a
+    /// provider effect. Removing this failure branch turns the retained debt into a false claim.
+    #[tokio::test]
+    async fn transfer_terminal_publication_failure_retains_active_debt_without_recovery() {
+        let (be, rec, tmp, source, cfg) =
+            backend_fixture("preparation-transfer-publication-failure");
+        let (bound, target) = bound_spec_v3(&source, &cfg);
+        let clock = Arc::new(ManualPreparationClock::new(PREPARATION_ACTION_BOUND_MS));
+        be.arm_preparation_bound_for_test(PreparationClockV1::new(clock));
+        be.preparation_test_hooks
+            .fail_terminal_publication
+            .store(true, Ordering::SeqCst);
+        let session = SessionId::parse("preparation-transfer-publication-failure").unwrap();
+
+        assert_eq!(
+            be.configure_bound_session(&session, &bound).await,
+            Err(BridgeError::StoreFailure)
+        );
+        assert_eq!(
+            preparation_flight_state_of(&target).as_deref(),
+            Some("open")
+        );
+        assert_eq!(
+            be.preparation_flight_debt_for_test(&session),
+            Some(BridgeError::StoreFailure)
+        );
+        assert!(be.transferred_preparation_for_test(&session).is_none());
+        assert_eq!(rec.add_count.load(Ordering::SeqCst), 0);
         std::fs::remove_dir_all(tmp).unwrap();
     }
 }
