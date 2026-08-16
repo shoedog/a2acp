@@ -210,3 +210,6 @@ orders; replacement/symlink negatives.
   (authority_mutation lock-release; staged-candidate smoke launch).
 - T2 DISPATCHED in parallel (base `42dd555a`; spec 81fc9472); its fold gate
   holds until the rerun resolves green.
+- Rerun GREEN on exact `42dd555a` — same-SHA control confirms the
+  load-flake classification; main CI green; T1 fully closed. T2 fold gate
+  clear (T2 round still in flight).
