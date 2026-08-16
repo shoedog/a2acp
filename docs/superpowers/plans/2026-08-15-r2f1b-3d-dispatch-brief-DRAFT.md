@@ -335,3 +335,76 @@ without owner word.
 Carried regardless: s1 abort residue DEFER; slice-4 binding observer
 obligation; the 4-lost-internal-reviews credential note (fixed 9a941531);
 cap-breach hygiene note (903>900) on the first repair.
+
+## T2 UNPARKED — owner authorized a second extension (2026-08-16)
+
+Owner authorized "an extension" on the parked T2. Operator (opus) took
+option 1 and, per the convergence discipline's no-restart clause, continued
+on `f66016e0` rather than restarting from `435257ce` — a restart would have
+discarded delivered E1/E2/E3 work with no evidence the artifact was
+unsalvageable.
+
+**The park's evidence was re-examined at source and largely does not hold.**
+
+- **The three reds are MECHANICAL, not design.** `unique_temp_dir()` only
+  computes a path; it never creates the directory (every other caller
+  creates it via `provider_fixture`/`backend_fixture`). All three new tests
+  construct the control root against a nonexistent path — two fail at
+  `open_claimed_for_session_admission()` with `StoreFailure`, the third at a
+  non-recursive `std::fs::create_dir(&root)` with `NotFound`. Adding
+  `std::fs::create_dir_all(&tmp)` to the three takes bridge-worktree lib
+  from **270/3 to 273/0** (host, run-verified, worktree `.claude/worktrees/t2ext`).
+- **Gates on `f66016e0` + that 3-line harness fix (host, run-verified):**
+  `cargo fmt --all -- --check` clean; `cargo clippy --workspace
+  --all-targets -- -D warnings` clean; bridge-worktree lib 273/0. Whole
+  workspace run surfaced ONE failure outside T2's scope —
+  `cli_tests::guarded_spawn_ignores_retargeted_static_cwd_for_native_mcp` in
+  `bin/a2a-bridge` — which PASSES in isolation on the same tree; T2's diff
+  touches neither the bin nor MCP spawn code, and this repo carries a known
+  whole-bin parallel-flake class (`fix/whole-bin-parallel-flakes`).
+  Classified parallel-load flake; a full `--no-fail-fast` count is the
+  fold-gate control.
+- **The pipeline was NOT broken.** The impl agent's `a2a-lf` HTTP 403 is the
+  implement-lane egress allowlist working as designed (ADR-0013): the
+  implement proxy permits model APIs ONLY, crates.io is deliberately absent,
+  and the dependency-capable verify container is the compile lane. The agent
+  therefore had no local compile loop — which is why a trivial harness
+  omission survived three attempts. Not a regression; a standing constraint
+  now stated explicitly in the repair spec.
+- **Line cap held**: `git diff --numstat 435257ce..f66016e0` = 736 changed
+  lines against the extension's 500 soft / 750 hard. No breach this time.
+- **E2's core IS delivered**: the active flight is inserted into
+  `preparation_flights` before the root pin is claimed, and the blocking open
+  is moved into a detached `spawn_blocking`, so an observer finds and can
+  terminalize the exact owner during the stall (proven by
+  `stalled_control_root_pin_is_observable_before_terminalization`).
+
+**ONE real WRONG survives, and it is closed and enumerable.** Proven on the
+host with a diagnostic probe (arm the nonreturning root pin, remove the
+control root while blocked, release):
+
+```
+owner published before the blocking pin = true
+first  configure = Err(StoreFailure)          <- correct
+entry retained after failure = true           <- THE DEFECT
+second configure = Err(AgentOverloaded)       <- permanent, process lifetime
+```
+
+The runner's `root_ready` error arm completes the caller but calls
+`runner_exit_guard.complete()`, disarming the only path that removes the map
+entry (`terminalize_preparation_runner_exit`). The reservation leaks, and the
+admission check refuses every later configure for that session. It leaks for
+every flight parked on the same failed pin, not just the one that claimed it.
+The review's other residual — per-flight blocking waits persist — names no
+incorrect output and is a **SMELL**, deferred with a ledger entry.
+
+**DECLARED CAP FOR THIS ROUND (declared before dispatch):** ONE targeted
+repair on frozen `f66016e0` + ONE bounded Sol re-look on the repair delta.
+Caps 150 soft / 250 hard changed lines, production confined to
+`backend.rs`. If this round does not converge, T2 goes to option 2
+(re-scope E1/E2/E3 as a designed sub-slice) — there is no third extension.
+
+- Repair spec written: `plans/2026-08-16-r2f1b-3d-t2-extension-repair2-task.md`
+  (R1 harness fix; R2 reservation release composed with E1's phase claim,
+  guarded by `Arc::ptr_eq`, publishing no durable record because the control
+  root is precisely what failed; red-first T-A/T-B/T-C).
