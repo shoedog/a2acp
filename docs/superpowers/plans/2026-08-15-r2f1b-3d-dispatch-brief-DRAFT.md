@@ -118,3 +118,19 @@ orders; replacement/symlink negatives.
   phase-3 unchanged; no timers/watchers); R2 honest phase-2 test red-first on
   `545103a4`; R3 `fail_after_open` hygiene. Caps 120/300, single file.
   Counted Sol closure follows the repair.
+- REPAIR DELIVERED first-attempt: `e66b9085` (impl-95834-kqsue52b; 109
+  changed lines, single file + handoff; container verify PASS ×4; internal
+  reviewer glitched → inconclusive, advisory only). Operator inspection:
+  Drop-guard (Release) owned by the configure future w/ disarm-on-completion;
+  ONE Acquire sample at the add-admission boundary; departed → typed durable
+  `Failed{Canceled, bridge.worktree_preparation_caller_departed}`, zero add;
+  present → committed, phase-3 unchanged; `fail_after_open` REMOVED; phase-2
+  test drives the real abort and pins the typed code in the durable record.
+- Operator red/green controls (host, run-verified; container red run was
+  egress-blocked and disclosed in the handoff): phase-2 GREEN on `e66b9085`;
+  RED under the single-line sample-severing mutation with exactly the
+  predicted `left: Some("settled")` / `right: Some("failed")`.
+- Gates on exact `e66b9085`: fmt clean; workspace clippy `-D warnings`
+  clean; full suite **4,117/0/13 across 90** (baseline 4,111/0/13).
+- Counted Sol closure DISPATCHED on full `c37338dd..e66b9085` (sol/max,
+  solmax config). Host branch `feat/r2f1b-3d-t1` = `e66b9085`.
