@@ -1099,6 +1099,44 @@ All checks passed; no drift found.
   Adjudication, the complete gate rerun on the exact final candidate,
   byte-identical fold, and the land-or-stop decision follow per the
   orchestration handoff.
+- 2026-08-15: **both aggregate lenses returned; operator adjudication
+  complete.** OPUS lens: **APPROVE, zero WRONGs, eight SMELLs**
+  (88/100) — all five dimensions SUSTAINED; the two lane-record
+  corrections operator-verified at source: (S1) the "Cargo.lock
+  unchanged" claim is FALSE — one benign dev-dependency edge
+  (tempfile→bridge-api dev-deps, zero new packages) — and (S5) eight
+  item-level production `rustfmt::skip` in fs_custody are new vs the
+  merge-base (extends the ledgered A3 hygiene item). Carried
+  correction: revert is persistence-clean but not behaviorally inert
+  (the live API lifecycle was rewritten). Result mirrored as
+  [`2026-08-15-r2f1b-3c2-aggregate-opus-result.md`](2026-08-15-r2f1b-3c2-aggregate-opus-result.md).
+  SOL lens: **REJECT with ONE cross-module blocker** (98/100; A4/C/G
+  second looks SUSTAINED, **B2 BROKEN**; four test-hardening SMELLs
+  deferred with sharpened prescriptions). The blocker,
+  operator-CONFIRMED at source at every link: the checkpoint-replace
+  transaction's durable `Captured` window (intent present, ordinary
+  checkpoint renamed to its capture name, successor unpublished) is
+  unrecoverable because `open_base` runs `authorize_checkpoint` BEFORE
+  `NamespaceTransactionV2::recover`, and the absent-checkpoint branch
+  refuses `Malformed` with no transaction-awareness — the namespace
+  recovery that handles `Captured` is unreachable, permanently
+  bricking the journal on every reopen. Reachability today is nil
+  (zero production journal roots — Opus-verified independently), but
+  the binding B2 crash-resumability requirement is violated in the
+  delivered surface. The existing tests miss it: the namespace test
+  drives recovery directly; the B2 integration seam injects only
+  after the checkpoint adapter returns. Result mirrored as
+  [`2026-08-15-r2f1b-3c2-aggregate-sol-result.md`](2026-08-15-r2f1b-3c2-aggregate-sol-result.md).
+- Aggregate population across both lenses: ONE WRONG. Prescribed fix
+  (Sol): a read-only transaction-inspection path in the
+  absent-checkpoint branch — accept exactly one replacement intent
+  targeting the checkpoint, validate attempt identity from the exact
+  predecessor capture and content commitment, validate every ordinary
+  row, then invoke recovery, preserving the strict post-recovery scan;
+  integrated crash-cut reds at the REAL admission and heal call sites
+  (reopen and repeated reopen must succeed; foreign/corrupt captured
+  checkpoint must refuse byte-preserved). Medium, authority-sensitive
+  — beyond disclosed-extension scale. Disposition is the owner's.
 
 ## Non-scope reaffirmed
 
