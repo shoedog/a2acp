@@ -37,6 +37,15 @@ to those three tests takes `cargo test -p bridge-worktree --lib` from
 `cargo fmt --all -- --check` and `cargo clippy --workspace --all-targets -- -D warnings`
 both clean.** Apply exactly that; do not redesign the tests.
 
+**Falsification license.** That result is an operator claim, not ground
+truth. If the verify stage shows those three tests still failing after the
+`create_dir_all` fix, or failing for a different reason than the one
+described above, then this diagnosis is WRONG — say so plainly in your
+handoff with the exact failure output, and do not paper over it by
+rewriting, weakening, or deleting the tests. The same license applies to
+every claim in R2 below: if the mechanism described there does not match the
+code you are reading, report the mismatch instead of forcing the change.
+
 **Your container cannot compile.** The implement-lane egress allowlist
 permits model APIs only — crates.io is deliberately excluded (ADR-0013), so
 `cargo` will fail with an HTTP 403 on an uncached dependency download. This
@@ -151,6 +160,70 @@ production code path to make the tests reachable.
 - No new public API. No changes to the frozen custody transition table.
 - `cargo fmt` clean and `cargo clippy --workspace --all-targets -- -D warnings`
   clean.
+
+## Acceptance Criteria
+
+1. `cargo test -p bridge-worktree --lib` is green with **zero** failures, and
+   the three tests named in R1 are among the passing tests (not removed, not
+   `#[ignore]`d, not weakened).
+2. New test **T-A** exists and passes: with the control-root pin forced to
+   fail, `configure_bound_session` returns the typed error,
+   `preparation_guard_for_test(&session)` is `None` afterward, and a second
+   `configure_bound_session` for that same session is admitted rather than
+   refused with `AgentOverloaded`. The handoff records T-A's exact failure
+   output on unmodified `f66016e0`.
+3. New test **T-B** exists and passes: when a transfer has already claimed
+   the phase and the pin then fails, the transferred owner remains in the
+   recovery inventory and its terminal stands — the failing-pin path removes
+   and completes nothing.
+4. New test **T-C** exists and passes: two flights parked on one failing pin
+   both release their reservations and both callers receive the typed error.
+5. The failing-pin path claims the terminal phase before doing anything, and
+   removes the `preparation_flights` entry only under an `Arc::ptr_eq` guard
+   against its own owner.
+6. No durable flight record is written on the failing-pin path, and the
+   handoff states why.
+7. `cargo fmt --all -- --check` clean; `cargo clippy --workspace
+   --all-targets -- -D warnings` clean.
+8. `git diff --numstat f66016e0..HEAD` totals at most 250 changed lines
+   (added + deleted), with the number reported in the handoff; production
+   changes confined to `crates/bridge-worktree/src/backend.rs`.
+9. Nothing in the "Out of scope" list is changed.
+
+## Files
+
+- `crates/bridge-worktree/src/backend.rs` — the only production file this
+  repair may change; also hosts the three R1 tests and the new T-A/T-B/T-C.
+
+## Spec Refs
+
+- `docs/superpowers/plans/2026-08-15-r2f1b-3d-dispatch-brief-DRAFT.md` —
+  §"T2 UNPARKED" carries this round's declared cap and the evidence behind
+  R1 and R2.
+- `docs/superpowers/reviews/2026-08-16-r2f1b-3d-t2-sol-relook.md` — the
+  counted re-look whose E1/E2/E3 findings `f66016e0` was built to close.
+- `docs/adr/0013-containerized-agents-egress.md` — why your container has no
+  crates.io access.
+
+## Commit Message
+
+```
+fix: release the preparation reservation when the control-root pin fails
+
+The runner's root_ready error arm completed the caller but disarmed the exit
+guard, so terminalize_preparation_runner_exit — the only path that removes the
+preparation_flights entry — never ran. The reservation leaked and every later
+configure_bound_session for that session was refused AgentOverloaded for the
+life of the process, for every flight parked on the same failed pin.
+
+The arm now claims the terminal phase first, composing with the pre-barrier
+phase CAS, and removes its own entry under an Arc::ptr_eq guard. No durable
+record is written: the control root is precisely what failed to open, and the
+path admits zero effects.
+
+Also creates the temp root in three tests that built a control root against a
+path unique_temp_dir never created.
+```
 
 ## Handoff must record
 
