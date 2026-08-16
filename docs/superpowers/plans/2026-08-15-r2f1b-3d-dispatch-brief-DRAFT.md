@@ -297,3 +297,41 @@ orders; replacement/symlink negatives.
   refusing terminal replacement (narrow fs_custody primitive authorized if
   needed, Task-C precedent); E4 caps 500/750 hard-respected. s1 abort
   residue + slice-4 observer obligation unchanged.
+
+## T2 PARKED — owner escalation (2026-08-16)
+
+The disclosed convergence extension did NOT converge: the extension repair
+(impl-85729-fb3gv2wd) reached its 3-attempt bound at `f66016e0` with its
+OWN three new regressions red on its own head
+(failure_owned_runner_exit_completes_configure_result,
+preparation_control_root_refuses_identity_replacement,
+terminal_replacement_serializes_exact_open_writers — bridge-worktree lib
+270/3), verify FAIL at test, and the internal review ruling E2 undelivered
+(root-pin failure orphans the active flight; per-flight blocking waits
+persist). Per the declared extension boundary: PARKED, no further rounds
+without owner word.
+
+**State of record:**
+- main = `42dd555a` (T1 landed; production untouched by T2; V3 unarmed).
+- Last fully-gated T2 artifact: `435257ce` on `feat/r2f1b-3d-t2` (pushed) —
+  re-look ruled W1/W2/W4/s2 FIXED there; 3 surviving blockers (E1 phase
+  bypass by failure writers, E2 root-open stall, E3 exact-Open TOCTOU), all
+  closed-class, all production-unreachable today (bounds unarmed; no
+  transfer trigger exists in production).
+- Parked extension candidate: `f66016e0` on
+  `salvage/r2f1b-3d-t2-extension-candidate` (pushed) — E1/E3 partially
+  built, 3 of its own tests red; E2 undelivered.
+
+**Owner options:**
+1. Authorize a second extension: one more targeted repair, either finishing
+   `f66016e0` (its reds may be mechanical) or restarting the extension from
+   frozen `435257ce`.
+2. Park-and-redesign: re-scope E1/E2/E3 as their own sub-slice with a fresh
+   cap and design pass (the steering's escalate-to-design path) — E2's
+   ownership ripple is the strongest argument here.
+3. Hold T2 unlanded and let T3 planning proceed on paper only (T3 depends
+   on T2's recovery inventory, so no T3 dispatch before T2 resolves).
+
+Carried regardless: s1 abort residue DEFER; slice-4 binding observer
+obligation; the 4-lost-internal-reviews credential note (fixed 9a941531);
+cap-breach hygiene note (903>900) on the first repair.
