@@ -21,6 +21,7 @@ use std::ffi::CStr;
 use std::ffi::CString;
 use std::ffi::{OsStr, OsString};
 use std::fs::{File, OpenOptions};
+#[cfg(unix)]
 use std::io::{Read, Write};
 #[cfg(unix)]
 use std::os::unix::ffi::OsStrExt as _;
@@ -206,6 +207,7 @@ impl ChildNameV2 {
     pub fn as_os_str(&self) -> &OsStr {
         &self.0
     }
+    #[cfg_attr(not(unix), allow(dead_code))]
     pub(crate) fn is_reserved_target(&self) -> bool {
         self.0.as_encoded_bytes().starts_with(b".a2a-v2-")
     }
@@ -831,6 +833,7 @@ impl PinnedDirectoryV1 {
 pub type ObjectIdentityV2 = RequiredObjectIdentityV2;
 
 #[derive(Clone, Debug)]
+#[cfg_attr(not(unix), allow(dead_code))]
 pub struct JournalRootBindingV2 {
     anchor: ObjectIdentityV2,
     parent_name: ChildNameV2,
@@ -1095,14 +1098,6 @@ impl JournalRootCustodyV2 {
         &self,
         label: &str,
     ) -> Result<JournalRootOperationV2<'_>, FsCustodyError> {
-        Err(FsCustodyError::Unsupported(label.to_owned()))
-    }
-
-    pub(crate) fn acquire_existing_regular_child_lease(
-        &self,
-        _name: &ChildNameV2,
-        label: &str,
-    ) -> Result<(crate::liveness::PersistentLockGuard, FileContentSnapshotV2), FsCustodyError> {
         Err(FsCustodyError::Unsupported(label.to_owned()))
     }
 }
@@ -1944,6 +1939,7 @@ pub(crate) fn enumerate_directory_names(
     Ok(names)
 }
 #[cfg(not(all(unix, any(target_os = "linux", target_os = "macos"))))]
+#[cfg_attr(not(unix), allow(dead_code))]
 pub(crate) fn enumerate_directory_names(
     _directory: &File,
     _limit: usize,
