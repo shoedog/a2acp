@@ -11,9 +11,14 @@ use crate::provider_path::{
     resolve_worktree, sidecar_path, validate_bound_worktree, write_sidecar, ResolvedWorktree,
     WorktreeConfig, WorktreeSidecar,
 };
+use bridge_core::diagnostics::{DiagnosticCode, DiagnosticFailureClass, DiagnosticRedactor};
 use bridge_core::domain::{Part, SessionSpec};
 use bridge_core::error::BridgeError;
-use bridge_core::execution_policy::{BoundSessionSpecV1, FrozenCheckoutEffectV1};
+use bridge_core::execution_policy::{BoundSessionSpecV1, BoundedCauseV1, FrozenCheckoutEffectV1};
+use bridge_core::fs_custody::{
+    open_options_create_new_owner_private, CustodyPublicationV1, PinnedDirectoryV1,
+    RegularChildRefV1,
+};
 use bridge_core::ids::SessionId;
 use bridge_core::orch::{AgentSessionCaps, ReconcileOutcome};
 use bridge_core::permission::TurnMeta;
@@ -22,20 +27,26 @@ use bridge_core::ports::{
     BackendStream, CheckoutPreservationReasonV1, CheckoutPreservationV1, CheckoutSettlementV1,
     DiagnosticObserver, RichEventSink, WorkflowCheckoutOutcomeV1,
 };
+use bridge_core::preparation_flight::{PreparationFlightIdV1, PreparationFlightStateV1};
 use bridge_core::terminal_evidence::{AcpChildLiveness, EvidenceCapability};
 use bridge_core::SessionCwd;
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::ffi::{OsStr, OsString};
+use std::io::{Read as _, Write as _};
+use std::path::{Path, PathBuf};
 #[cfg(test)]
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
-use tokio::sync::{watch, Mutex, Notify};
+use tokio::sync::{oneshot, watch, Mutex, Notify};
 
 const FAILED_CONFIGURE_RETRY_INITIAL: Duration = Duration::from_secs(1);
 const FAILED_CONFIGURE_RETRY_MAX: Duration = Duration::from_secs(30);
 const MAX_WORKTREE_CONFIGURES_IN_FLIGHT: u64 = 64;
+const PREPARATION_FLIGHT_RECORD_SUFFIX: &str = ".preparation-flight.v1.json";
+const PREPARATION_FLIGHT_RECORD_SCHEMA_V1: u16 = 1;
 
 #[derive(Clone)]
 pub struct WorktreeIdentity {
@@ -120,6 +131,305 @@ struct WtEntry {
     /// fail-closed answer there is *refuse the deletion AND refuse to mint a claim*, not one or
     /// the other.
     protection: Option<Box<ProtectedCheckoutV1>>,
+}
+
+/// One durable snapshot of the materialization preparation flight. It is deliberately a
+/// companion to the custody record: preparation owns the runner lifecycle while custody remains
+/// the sole authority for checkout state transitions.
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct PreparationFlightRecordV1 {
+    schema_version: u16,
+    flight_id: PreparationFlightIdV1,
+    state: PreparationFlightStateV1,
+}
+
+/// The in-process claim is made before the detached task can perform a filesystem effect. The
+/// durable companion record below is the cross-process truth; this mutex only lets the owner
+/// retain an exact state while a caller drops its observer future.
+struct MaterializationPreparationFlightV1 {
+    id: PreparationFlightIdV1,
+    state: StdMutex<PreparationFlightStateV1>,
+    #[cfg(test)]
+    hooks: Arc<PreparationFlightTestHooks>,
+}
+
+impl MaterializationPreparationFlightV1 {
+    fn claim(#[cfg(test)] hooks: Arc<PreparationFlightTestHooks>) -> Result<Self, BridgeError> {
+        Ok(Self {
+            id: PreparationFlightIdV1::mint()?,
+            state: StdMutex::new(PreparationFlightStateV1::Open {}),
+            #[cfg(test)]
+            hooks,
+        })
+    }
+
+    fn id(&self) -> &PreparationFlightIdV1 {
+        &self.id
+    }
+
+    fn record(&self, state: PreparationFlightStateV1) {
+        *self.state.lock().unwrap_or_else(|error| error.into_inner()) = state;
+    }
+}
+
+/// Descriptor-safe, parent-synced companion record for one materialization flight. It is not a
+/// custody transition and therefore cannot add an edge to the frozen custody table.
+struct PreparationFlightJournalV1 {
+    root: PinnedDirectoryV1,
+    root_path: PathBuf,
+    record_name: OsString,
+    flight_id: PreparationFlightIdV1,
+}
+
+impl PreparationFlightJournalV1 {
+    fn open(
+        worktree_root: &Path,
+        worktree_path: &str,
+        flight_id: PreparationFlightIdV1,
+    ) -> Result<Self, BridgeError> {
+        let record_path = format!("{worktree_path}{PREPARATION_FLIGHT_RECORD_SUFFIX}");
+        let record_name = Path::new(&record_path)
+            .file_name()
+            .map(OsStr::to_os_string)
+            .ok_or(BridgeError::StoreFailure)?;
+        let root = PinnedDirectoryV1::open(worktree_root, "preparation flight root")
+            .map_err(|_| BridgeError::StoreFailure)?;
+        Ok(Self {
+            root,
+            root_path: worktree_root.to_path_buf(),
+            record_name,
+            flight_id,
+        })
+    }
+
+    fn publish(&self, state: PreparationFlightStateV1, first: bool) -> Result<(), BridgeError> {
+        let bytes = serde_json::to_vec(&PreparationFlightRecordV1 {
+            schema_version: PREPARATION_FLIGHT_RECORD_SCHEMA_V1,
+            flight_id: self.flight_id.clone(),
+            state,
+        })
+        .map_err(|_| BridgeError::StoreFailure)?;
+        let nonce = PreparationFlightIdV1::mint().map_err(|_| BridgeError::StoreFailure)?;
+        let suffix = &nonce.as_str()[PreparationFlightIdV1::PREFIX.len()..];
+        let mut staged_name = self.record_name.clone();
+        staged_name.push(format!(".staging-{suffix}"));
+        let staged_path = self.root_path.join(&staged_name);
+        let mut staged = open_options_create_new_owner_private()
+            .open(&staged_path)
+            .map_err(|_| BridgeError::StoreFailure)?;
+        staged
+            .write_all(&bytes)
+            .and_then(|()| staged.sync_all())
+            .map_err(|_| BridgeError::StoreFailure)?;
+        let source = RegularChildRefV1::new(&staged_name, &staged);
+        let published = if first {
+            self.root.publish_new_regular_child(
+                source,
+                &self.record_name,
+                "preparation flight record",
+            )
+        } else {
+            self.root
+                .replace_regular_child(source, &self.record_name, "preparation flight record")
+        }
+        .map_err(|_| BridgeError::StoreFailure)?;
+        match published {
+            CustodyPublicationV1::Durable { .. } => Ok(()),
+            CustodyPublicationV1::ParentSyncAmbiguous(_)
+            | CustodyPublicationV1::TargetIdentityUnverified(_)
+            | CustodyPublicationV1::RenameOutcomeUnverified(_) => Err(BridgeError::StoreFailure),
+        }
+    }
+
+    /// Make a claimed flight terminal after its initial no-replace `Open` publication reports a
+    /// failure. If that publication became visible despite the error, replace only our exact
+    /// `Open` record; otherwise make the first durable record a `Failed` terminal. A foreign or
+    /// malformed occupant is never overwritten.
+    fn publish_failed_after_initial_open_failure(&self) -> Result<(), BridgeError> {
+        let exists = self
+            .root
+            .child_entry_exists(&self.record_name, "preparation flight record")
+            .map_err(|_| BridgeError::StoreFailure)?;
+        let first = !exists;
+        if exists {
+            let mut existing = self
+                .root
+                .open_regular_file(&self.record_name, "preparation flight record")
+                .map_err(|_| BridgeError::StoreFailure)?;
+            let mut bytes = Vec::new();
+            existing
+                .read_to_end(&mut bytes)
+                .map_err(|_| BridgeError::StoreFailure)?;
+            let record: PreparationFlightRecordV1 =
+                serde_json::from_slice(&bytes).map_err(|_| BridgeError::StoreFailure)?;
+            if record.schema_version != PREPARATION_FLIGHT_RECORD_SCHEMA_V1
+                || record.flight_id != self.flight_id
+                || !matches!(record.state, PreparationFlightStateV1::Open {})
+            {
+                return Err(BridgeError::StoreFailure);
+            }
+        }
+        self.publish(preparation_failure_state(), first)
+    }
+
+    #[cfg(test)]
+    fn fail_next_parent_sync_for_test(&self) {
+        self.root.fail_sync_on_nth_call_for_test(1);
+    }
+}
+
+fn preparation_failure_state() -> PreparationFlightStateV1 {
+    PreparationFlightStateV1::Failed {
+        cause: BoundedCauseV1 {
+            failure_class: DiagnosticFailureClass::Persistence,
+            code: DiagnosticCode::build(
+                "bridge.worktree_preparation_failed",
+                &DiagnosticRedactor::default(),
+            )
+            .expect("static preparation flight diagnostic code is valid"),
+            deepest_cause: None,
+            cause_truncated: false,
+            evidence_overflow: false,
+            dependency_set: None,
+        },
+    }
+}
+
+fn preparation_state_is_terminal(state: &PreparationFlightStateV1) -> bool {
+    match state {
+        PreparationFlightStateV1::Open {} | PreparationFlightStateV1::BarrierSynced {} => false,
+        PreparationFlightStateV1::Settled {}
+        | PreparationFlightStateV1::Transferred { .. }
+        | PreparationFlightStateV1::Failed { .. } => true,
+    }
+}
+
+async fn publish_preparation_state(
+    journal: Arc<PreparationFlightJournalV1>,
+    flight: Arc<MaterializationPreparationFlightV1>,
+    state: PreparationFlightStateV1,
+    first: bool,
+) -> Result<(), BridgeError> {
+    #[cfg(test)]
+    if preparation_state_is_terminal(&state) && flight.terminal_publication_fails_for_test() {
+        return Err(BridgeError::StoreFailure);
+    }
+    let terminal = preparation_state_is_terminal(&state);
+    let durable_state = state.clone();
+    tokio::task::spawn_blocking(move || journal.publish(durable_state, first))
+        .await
+        .map_err(|_| BridgeError::StoreFailure)??;
+    flight.record(state);
+    #[cfg(test)]
+    if terminal {
+        flight.terminal_recorded_for_test();
+    }
+    #[cfg(not(test))]
+    let _ = terminal;
+    Ok(())
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct PreparationFlightTestHooks {
+    open_count: AtomicUsize,
+    open: Notify,
+    pause_after_open: AtomicBool,
+    release_after_open: Notify,
+    fail_after_open: AtomicBool,
+    fail_initial_open_parent_sync: AtomicBool,
+    add_count: AtomicUsize,
+    add: Notify,
+    pause_after_add: AtomicBool,
+    release_after_add: Notify,
+    terminal_count: AtomicUsize,
+    terminal: Notify,
+    fail_terminal_publication: AtomicBool,
+}
+
+#[cfg(test)]
+impl PreparationFlightTestHooks {
+    async fn after_open(&self) -> bool {
+        self.open_count.fetch_add(1, Ordering::SeqCst);
+        self.open.notify_waiters();
+        if self.pause_after_open.swap(false, Ordering::SeqCst) {
+            self.release_after_open.notified().await;
+        }
+        self.fail_after_open.load(Ordering::SeqCst)
+    }
+
+    fn take_initial_open_parent_sync_failure(&self) -> bool {
+        self.fail_initial_open_parent_sync
+            .swap(false, Ordering::SeqCst)
+    }
+
+    async fn after_add(&self) {
+        self.add_count.fetch_add(1, Ordering::SeqCst);
+        self.add.notify_waiters();
+        if self.pause_after_add.swap(false, Ordering::SeqCst) {
+            self.release_after_add.notified().await;
+        }
+    }
+
+    fn terminal_publication_fails(&self) -> bool {
+        self.fail_terminal_publication.load(Ordering::SeqCst)
+    }
+
+    fn terminal_recorded(&self) {
+        self.terminal_count.fetch_add(1, Ordering::SeqCst);
+        self.terminal.notify_waiters();
+    }
+
+    async fn wait_for_open(&self) {
+        while self.open_count.load(Ordering::SeqCst) == 0 {
+            let notified = self.open.notified();
+            if self.open_count.load(Ordering::SeqCst) == 0 {
+                notified.await;
+            }
+        }
+    }
+
+    async fn wait_for_add(&self) {
+        while self.add_count.load(Ordering::SeqCst) == 0 {
+            let notified = self.add.notified();
+            if self.add_count.load(Ordering::SeqCst) == 0 {
+                notified.await;
+            }
+        }
+    }
+
+    async fn wait_for_terminal(&self) {
+        while self.terminal_count.load(Ordering::SeqCst) == 0 {
+            let notified = self.terminal.notified();
+            if self.terminal_count.load(Ordering::SeqCst) == 0 {
+                notified.await;
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+impl MaterializationPreparationFlightV1 {
+    async fn after_open_for_test(&self) -> bool {
+        self.hooks.after_open().await
+    }
+
+    fn fail_initial_open_parent_sync_for_test(&self) -> bool {
+        self.hooks.take_initial_open_parent_sync_failure()
+    }
+
+    async fn after_add_for_test(&self) {
+        self.hooks.after_add().await;
+    }
+
+    fn terminal_publication_fails_for_test(&self) -> bool {
+        self.hooks.terminal_publication_fails()
+    }
+
+    fn terminal_recorded_for_test(&self) {
+        self.hooks.terminal_recorded();
+    }
 }
 
 /// Everything a later preservation transition needs, captured at materialization under the custody
@@ -955,6 +1265,11 @@ pub struct WorktreeBackend {
     allowed_root: Option<SessionCwd>,
     identity: WorktreeIdentity,
     map: Arc<Mutex<HashMap<String, WtState>>>,
+    /// Claimed flights outlive an observing configure future. This map owns only active runners;
+    /// their durable companion records remain after terminal settlement.
+    preparation_flights: Arc<StdMutex<HashMap<String, Arc<MaterializationPreparationFlightV1>>>>,
+    #[cfg(test)]
+    preparation_test_hooks: Arc<PreparationFlightTestHooks>,
     cleanup_cells: Arc<StdMutex<HashMap<String, Arc<CleanupCell>>>>,
     sealed: Arc<AtomicBool>,
     configure_inflight: AtomicU64,
@@ -1007,6 +1322,9 @@ impl WorktreeBackend {
             identity,
             next_checkout_disposition: Arc::new(AtomicU64::new(1)),
             map: Arc::new(Mutex::new(HashMap::new())),
+            preparation_flights: Arc::new(StdMutex::new(HashMap::new())),
+            #[cfg(test)]
+            preparation_test_hooks: Arc::new(PreparationFlightTestHooks::default()),
             cleanup_cells: Arc::new(StdMutex::new(HashMap::new())),
             sealed: Arc::new(AtomicBool::new(false)),
             configure_inflight: AtomicU64::new(0),
@@ -2288,6 +2606,7 @@ impl WorktreeBackend {
     /// failure and `write_sidecar` failure ran byte-identical recovery at the call site.
     async fn materialize_checkout(
         &self,
+        session: &SessionId,
         spec: &BoundSessionSpecV1,
         resolved: &ResolvedWorktree,
     ) -> Result<(WtCustodyV1, Option<Box<ProtectedCheckoutV1>>), BridgeError> {
@@ -2308,8 +2627,180 @@ impl WorktreeBackend {
             })?;
             return Ok((WtCustodyV1::Legacy, None));
         };
-        self.materialize_under_custody(custody.clone(), resolved)
+        self.materialize_under_custody(session, custody.clone(), resolved)
             .await
+    }
+
+    /// Claim and detach the V3 materialization before the first filesystem effect. The returned
+    /// receiver observes the independently owned runner; dropping it cannot abort its custody
+    /// publication, provider add, map projection, or terminal record.
+    async fn materialize_under_custody(
+        &self,
+        session: &SessionId,
+        custody: bridge_core::execution_policy::BoundWorktreeCustodyV1,
+        resolved: &ResolvedWorktree,
+    ) -> Result<(WtCustodyV1, Option<Box<ProtectedCheckoutV1>>), BridgeError> {
+        // This preflight is effect-free. A refusing provider gets no preparation claim, no
+        // companion record, no custody record, and no add.
+        if !self.provider.supports_custody_add() {
+            return Err(BridgeError::ConfigInvalid {
+                reason: "worktree provider does not implement the R2f1b custody-aware add".into(),
+            });
+        }
+        let worktree_root = Path::new(&resolved.worktree_path)
+            .parent()
+            .ok_or(BridgeError::ConfigMismatch {
+                field: "bound worktree target has no enclosing root",
+            })?
+            .to_path_buf();
+        let session_key = session.as_str().to_owned();
+        #[cfg(test)]
+        let flight = Arc::new(MaterializationPreparationFlightV1::claim(
+            self.preparation_test_hooks.clone(),
+        )?);
+        #[cfg(not(test))]
+        let flight = Arc::new(MaterializationPreparationFlightV1::claim()?);
+        {
+            let mut flights = self
+                .preparation_flights
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            if flights.contains_key(&session_key) {
+                return Err(BridgeError::AgentOverloaded);
+            }
+            flights.insert(session_key.clone(), flight.clone());
+        }
+
+        let provider = self.provider.clone();
+        let map = self.map.clone();
+        let flights = self.preparation_flights.clone();
+        let resolved = ResolvedWorktree {
+            canonical_source: resolved.canonical_source.clone(),
+            worktree_path: resolved.worktree_path.clone(),
+        };
+        let expected_worktree_path = resolved.worktree_path.clone();
+        let task_flight = flight.clone();
+        let (result_tx, result_rx) = oneshot::channel();
+        std::mem::drop(tokio::spawn(async move {
+            let initial = tokio::task::spawn_blocking({
+                #[cfg(test)]
+                let initial_flight = task_flight.clone();
+                let flight_id = task_flight.id().clone();
+                let worktree_root = worktree_root.clone();
+                let worktree_path = resolved.worktree_path.clone();
+                move || -> Result<Option<Arc<PreparationFlightJournalV1>>, BridgeError> {
+                    let journal = Arc::new(PreparationFlightJournalV1::open(
+                        &worktree_root,
+                        &worktree_path,
+                        flight_id,
+                    )?);
+                    #[cfg(test)]
+                    if initial_flight.fail_initial_open_parent_sync_for_test() {
+                        journal.fail_next_parent_sync_for_test();
+                    }
+                    match journal.publish(PreparationFlightStateV1::Open {}, true) {
+                        Ok(()) => Ok(Some(journal)),
+                        Err(_) => {
+                            journal.publish_failed_after_initial_open_failure()?;
+                            Ok(None)
+                        }
+                    }
+                }
+            })
+            .await
+            .map_err(|_| BridgeError::StoreFailure)
+            .and_then(|result| result);
+
+            let result = match initial {
+                Ok(Some(journal)) => {
+                    #[cfg(test)]
+                    let result = if task_flight.after_open_for_test().await {
+                        Err(BridgeError::ConfigInvalid {
+                            reason: "injected preparation pre-effect refusal".into(),
+                        })
+                    } else {
+                        WorktreeBackend::run_materialization_under_custody(
+                            provider,
+                            custody,
+                            resolved,
+                            journal.clone(),
+                            task_flight.clone(),
+                        )
+                        .await
+                    };
+                    #[cfg(not(test))]
+                    let result = WorktreeBackend::run_materialization_under_custody(
+                        provider,
+                        custody,
+                        resolved,
+                        journal.clone(),
+                        task_flight.clone(),
+                    )
+                    .await;
+                    match result {
+                        Ok(materialized) => {
+                            if materialized.0 == WtCustodyV1::Protected {
+                                if let Some(protection) = &materialized.1 {
+                                    let mut entries = map.lock().await;
+                                    match entries.get_mut(&session_key) {
+                                        Some(WtState::Reserving { entry, .. })
+                                        | Some(WtState::Ready(entry))
+                                        | Some(WtState::Retained { entry, .. })
+                                            if entry.worktree_path == expected_worktree_path =>
+                                        {
+                                            entry.custody = WtCustodyV1::Protected;
+                                            entry.protection = Some(protection.clone());
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                            }
+                            let settled = PreparationFlightStateV1::Settled {};
+                            debug_assert!(preparation_state_is_terminal(&settled));
+                            publish_preparation_state(journal, task_flight.clone(), settled, false)
+                                .await
+                                .map(|()| materialized)
+                        }
+                        Err(error) => {
+                            let failed = preparation_failure_state();
+                            debug_assert!(preparation_state_is_terminal(&failed));
+                            match publish_preparation_state(
+                                journal,
+                                task_flight.clone(),
+                                failed,
+                                false,
+                            )
+                            .await
+                            {
+                                Ok(()) => Err(error),
+                                Err(publication_error) => Err(publication_error),
+                            }
+                        }
+                    }
+                }
+                Ok(None) => {
+                    task_flight.record(preparation_failure_state());
+                    #[cfg(test)]
+                    task_flight.terminal_recorded_for_test();
+                    Err(BridgeError::StoreFailure)
+                }
+                Err(error) => {
+                    task_flight.record(preparation_failure_state());
+                    Err(error)
+                }
+            };
+            let _ = result_tx.send(result);
+            let mut active = flights.lock().unwrap_or_else(|error| error.into_inner());
+            if active
+                .get(&session_key)
+                .is_some_and(|current| Arc::ptr_eq(current, &task_flight))
+            {
+                active.remove(&session_key);
+            }
+        }));
+        result_rx.await.map_err(|_| {
+            BridgeError::agent_crashed("materialization preparation flight ended without a result")
+        })?
     }
 
     /// The V3 writer's control flow (§2.5). Ordering is the property, so it is stated once here
@@ -2324,10 +2815,12 @@ impl WorktreeBackend {
     /// The custody cells are held across the add on purpose: the record must stay this
     /// custodian's for the whole window in which the checkout is half-made. The add itself never
     /// takes a custody cell, so this cannot deadlock.
-    async fn materialize_under_custody(
-        &self,
+    async fn run_materialization_under_custody(
+        provider: Arc<dyn WorktreeProvider>,
         custody: bridge_core::execution_policy::BoundWorktreeCustodyV1,
-        resolved: &ResolvedWorktree,
+        resolved: ResolvedWorktree,
+        journal: Arc<PreparationFlightJournalV1>,
+        flight: Arc<MaterializationPreparationFlightV1>,
     ) -> Result<(WtCustodyV1, Option<Box<ProtectedCheckoutV1>>), BridgeError> {
         let worktree_root = Path::new(&resolved.worktree_path)
             .parent()
@@ -2337,18 +2830,6 @@ impl WorktreeBackend {
             .to_path_buf();
         let worktree_path = resolved.worktree_path.clone();
         let canonical_source = resolved.canonical_source.clone();
-
-        // ---- CAPABILITY PREFLIGHT, before ANY record effect (repair R4) ----------------------
-        // A provider that takes `add_under_custody`'s refusing default must produce zero records
-        // and zero provider effects. Discovering the refusal after `ProtectionPrepared` and
-        // `Materializing` were published would leave a durable record asserting a materialization
-        // that never began — and `Materializing` is a LIVE state, so the sweep classifies it
-        // `Recover` and nothing would ever resolve it.
-        if !self.provider.supports_custody_add() {
-            return Err(BridgeError::ConfigInvalid {
-                reason: "worktree provider does not implement the R2f1b custody-aware add".into(),
-            });
-        }
 
         // Blocking: every step is descriptor-level filesystem work behind two blocking file
         // locks. `custody_lock.rs` requires offloading, and the pinned root and both guards are
@@ -2369,14 +2850,21 @@ impl WorktreeBackend {
         })?
         .map_err(custody_write_error)?;
 
+        publish_preparation_state(
+            journal.clone(),
+            flight.clone(),
+            PreparationFlightStateV1::BarrierSynced {},
+            false,
+        )
+        .await?;
+
         // A runtime `Err` here (a git spawn failure, say) is NOT allowed to propagate raw: the
         // record is already `Materializing`, and returning without settling would leave a durable
         // live state for a materialization that is over. Normalize it into the same classified
         // failure the settlement arm already handles, with the most protective answers available:
         // the target is Unproven (so it is treated as present and never touched) and registration
         // is unproven (so no definite locator is invented from an operation that never reported).
-        let outcome = match self
-            .provider
+        let outcome = match provider
             .add_under_custody(&canonical_source, &worktree_path)
             .await
         {
@@ -2388,6 +2876,8 @@ impl WorktreeBackend {
                 recovery_locator: crate::custody::RecoveryLocatorV1::RegistrationUnproven {},
             }),
         };
+        #[cfg(test)]
+        flight.after_add_for_test().await;
 
         let root_path = custodian.worktree_root().to_string_lossy().into_owned();
         let binding = custodian.binding().clone();
@@ -2575,7 +3065,10 @@ impl WorktreeBackend {
         // (§2.2 "Record naming"; brief §4): an older binary enumerates only `*.meta.json`, so it
         // cannot name a V3 checkout, and emitting both names would hand the same checkout to the
         // legacy boot arm, which deletes.
-        let (custody_kind, protection) = match self.materialize_checkout(spec, &resolved).await {
+        let (custody_kind, protection) = match self
+            .materialize_checkout(session, spec, &resolved)
+            .await
+        {
             Ok(materialized) => materialized,
             Err(error) => {
                 admission.retain_failed_configure_cleanup();
@@ -8060,6 +8553,16 @@ mod tests {
         observed_record_state(target)
     }
 
+    fn preparation_flight_state_of(target: &str) -> Option<String> {
+        let path = format!("{target}{PREPARATION_FLIGHT_RECORD_SUFFIX}");
+        let value: serde_json::Value = serde_json::from_slice(&std::fs::read(path).ok()?).ok()?;
+        value
+            .get("state")?
+            .get("state")?
+            .as_str()
+            .map(str::to_owned)
+    }
+
     /// `backend_fixture`, with a caller-chosen provider. Extracted so the V3 tests can swap the
     /// provider without duplicating the four-directory layout every fixture needs.
     fn provider_fixture(
@@ -8130,6 +8633,77 @@ mod tests {
         }
     }
 
+    struct BlockingCustodyAddProv {
+        rec: Arc<Rec>,
+        entered: Arc<Notify>,
+        release: Arc<Notify>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::provider::WorktreeProvider for BlockingCustodyAddProv {
+        fn supports_custody_add(&self) -> bool {
+            true
+        }
+
+        async fn add(&self, _repo: &str, _worktree_path: &str) -> Result<String, BridgeError> {
+            unreachable!("the V3 cancellation tests use only the custody-aware add")
+        }
+
+        async fn add_under_custody(
+            &self,
+            repo: &str,
+            worktree_path: &str,
+        ) -> Result<CustodyAddOutcomeV1, BridgeError> {
+            self.rec.add_count.fetch_add(1, Ordering::SeqCst);
+            note_ordering(&self.rec, worktree_path);
+            self.entered.notify_one();
+            self.release.notified().await;
+            std::fs::create_dir_all(worktree_path).unwrap();
+            let common_dir = format!("{repo}/.git");
+            std::fs::create_dir_all(&common_dir).unwrap();
+            Ok(CustodyAddOutcomeV1::Materialized { common_dir })
+        }
+
+        async fn remove(&self, _repo: &str, _worktree_path: &str) -> Result<(), BridgeError> {
+            self.rec.remove_count.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        async fn is_git_repo(&self, _path: &str) -> bool {
+            true
+        }
+    }
+
+    fn blocking_custody_fixture(
+        tmp: &Path,
+    ) -> (
+        Arc<WorktreeBackend>,
+        Arc<Rec>,
+        PathBuf,
+        crate::provider_path::WorktreeConfig,
+        Arc<BlockingCustodyAddProv>,
+    ) {
+        let holder = Arc::new(StdMutex::new(None));
+        let holder_for_provider = holder.clone();
+        let (backend, rec, source, cfg) = provider_fixture(tmp, move |rec| {
+            let provider = Arc::new(BlockingCustodyAddProv {
+                rec,
+                entered: Arc::new(Notify::new()),
+                release: Arc::new(Notify::new()),
+            });
+            *holder_for_provider
+                .lock()
+                .unwrap_or_else(|error| error.into_inner()) = Some(provider.clone());
+            provider
+        });
+        let provider = holder
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take()
+            .expect("provider fixture records its exact provider");
+        (backend, rec, source, cfg, provider)
+    }
+
     fn partial_add_fixture(
         tmp: &Path,
         target_absent: bool,
@@ -8145,6 +8719,209 @@ mod tests {
                 partial_target_absent: AtomicBool::new(target_absent),
             })
         })
+    }
+
+    /// M13 phase 1. The capability preflight happens before the preparation claim, so a refusing
+    /// provider leaves neither a companion flight record nor a custody record.
+    #[tokio::test]
+    async fn preparation_before_claim_creates_no_flight_or_filesystem_effect() {
+        let tmp = unique_temp_dir("preparation-before-claim");
+        let (be, rec, source, cfg) = provider_fixture(&tmp, |rec| {
+            Arc::new(BlockingProv {
+                rec,
+                add_entered: Arc::new(Notify::new()),
+                allow_add: Arc::new(Notify::new()),
+            })
+        });
+        let (bound, target) = bound_spec_v3(&source, &cfg);
+
+        let result = be
+            .configure_bound_session(
+                &SessionId::parse("preparation-before-claim").unwrap(),
+                &bound,
+            )
+            .await;
+
+        assert!(matches!(result, Err(BridgeError::ConfigInvalid { .. })));
+        assert_eq!(preparation_flight_state_of(&target), None);
+        assert_eq!(record_state_of(&target), None);
+        assert!(!Path::new(&target).exists());
+        assert_eq!(rec.add_count.load(Ordering::SeqCst), 0);
+        std::fs::remove_dir_all(tmp).unwrap();
+    }
+
+    /// A claimed flight is still terminal if Open became visible but its parent sync reported
+    /// ambiguous. The writer verifies that the visible record is its own Open before replacing it
+    /// with Failed, so no provider effect can follow an initial journal failure.
+    #[tokio::test]
+    async fn initial_open_publication_failure_is_durably_terminalized_as_failed() {
+        let (be, rec, tmp, source, cfg) = backend_fixture("preparation-open-publication-failure");
+        let (bound, target) = bound_spec_v3(&source, &cfg);
+        be.preparation_test_hooks
+            .fail_initial_open_parent_sync
+            .store(true, Ordering::SeqCst);
+
+        let error = be
+            .configure_bound_session(
+                &SessionId::parse("preparation-open-publication-failure").unwrap(),
+                &bound,
+            )
+            .await
+            .unwrap_err();
+
+        assert_eq!(error, BridgeError::StoreFailure);
+        assert_eq!(
+            preparation_flight_state_of(&target).as_deref(),
+            Some("failed"),
+            "the claimed flight must have a durable Failed terminal"
+        );
+        assert_eq!(record_state_of(&target), None);
+        assert_eq!(rec.add_count.load(Ordering::SeqCst), 0);
+        assert!(!Path::new(&target).exists());
+        std::fs::remove_dir_all(tmp).unwrap();
+    }
+
+    /// M13 phase 2. Once Open is durable, an observer cancellation cannot admit the provider
+    /// effect. The retained runner reaches its own typed Failed terminal instead.
+    #[tokio::test]
+    async fn dropped_configure_after_claim_before_add_reaches_failed_without_add() {
+        let (be, rec, tmp, source, cfg) = backend_fixture("preparation-after-claim");
+        let (bound, target) = bound_spec_v3(&source, &cfg);
+        let hooks = be.preparation_test_hooks.clone();
+        hooks.pause_after_open.store(true, Ordering::SeqCst);
+        hooks.fail_after_open.store(true, Ordering::SeqCst);
+        let session = SessionId::parse("preparation-after-claim").unwrap();
+        let configure_be = be.clone();
+        let configure =
+            tokio::spawn(
+                async move { configure_be.configure_bound_session(&session, &bound).await },
+            );
+
+        hooks.wait_for_open().await;
+        assert_eq!(
+            preparation_flight_state_of(&target).as_deref(),
+            Some("open")
+        );
+        assert_eq!(rec.add_count.load(Ordering::SeqCst), 0);
+        configure.abort();
+        let _ = configure.await;
+        hooks.release_after_open.notify_one();
+        hooks.wait_for_terminal().await;
+
+        assert_eq!(
+            preparation_flight_state_of(&target).as_deref(),
+            Some("failed")
+        );
+        assert_eq!(record_state_of(&target), None);
+        assert!(!Path::new(&target).exists());
+        assert_eq!(rec.add_count.load(Ordering::SeqCst), 0);
+        std::fs::remove_dir_all(tmp).unwrap();
+    }
+
+    /// M13 phase 3. Aborting the caller while the provider is paused does not abort the claimed
+    /// task: the provider completes, the custody record becomes live, and the flight Settles.
+    #[tokio::test]
+    async fn dropped_configure_mid_add_runs_claimed_materialization_to_settled() {
+        let tmp = unique_temp_dir("preparation-mid-add");
+        let (be, rec, source, cfg, provider) = blocking_custody_fixture(&tmp);
+        let (bound, target) = bound_spec_v3(&source, &cfg);
+        let hooks = be.preparation_test_hooks.clone();
+        let session = SessionId::parse("preparation-mid-add").unwrap();
+        let configure_be = be.clone();
+        let configure =
+            tokio::spawn(
+                async move { configure_be.configure_bound_session(&session, &bound).await },
+            );
+
+        provider.entered.notified().await;
+        assert_eq!(record_state_of(&target).as_deref(), Some("materializing"));
+        assert_eq!(
+            preparation_flight_state_of(&target).as_deref(),
+            Some("barrier_synced")
+        );
+        configure.abort();
+        let _ = configure.await;
+        provider.release.notify_one();
+        hooks.wait_for_terminal().await;
+
+        assert_eq!(
+            preparation_flight_state_of(&target).as_deref(),
+            Some("settled")
+        );
+        assert_eq!(record_state_of(&target).as_deref(), Some("live_protected"));
+        assert!(Path::new(&target).is_dir());
+        assert_eq!(rec.remove_count.load(Ordering::SeqCst), 0);
+        std::fs::remove_dir_all(tmp).unwrap();
+    }
+
+    /// M13 phase 4. The provider has materialized the target but the terminal evidence has not
+    /// yet been published. A dropped observer cannot erase that truth or fabricate LiveProtected
+    /// before descriptor evidence is captured.
+    #[tokio::test]
+    async fn dropped_configure_after_add_before_evidence_preserves_truth_until_settlement() {
+        let (be, rec, tmp, source, cfg) = backend_fixture("preparation-after-add");
+        let (bound, target) = bound_spec_v3(&source, &cfg);
+        let hooks = be.preparation_test_hooks.clone();
+        hooks.pause_after_add.store(true, Ordering::SeqCst);
+        let session = SessionId::parse("preparation-after-add").unwrap();
+        let configure_be = be.clone();
+        let configure =
+            tokio::spawn(
+                async move { configure_be.configure_bound_session(&session, &bound).await },
+            );
+
+        hooks.wait_for_add().await;
+        assert!(
+            Path::new(&target).is_dir(),
+            "the provider effect really occurred"
+        );
+        assert_eq!(record_state_of(&target).as_deref(), Some("materializing"));
+        assert_eq!(
+            preparation_flight_state_of(&target).as_deref(),
+            Some("barrier_synced")
+        );
+        configure.abort();
+        let _ = configure.await;
+        hooks.release_after_add.notify_one();
+        hooks.wait_for_terminal().await;
+
+        assert_eq!(
+            preparation_flight_state_of(&target).as_deref(),
+            Some("settled")
+        );
+        assert_eq!(record_state_of(&target).as_deref(), Some("live_protected"));
+        assert_eq!(rec.remove_count.load(Ordering::SeqCst), 0);
+        std::fs::remove_dir_all(tmp).unwrap();
+    }
+
+    /// M13 phase 5. A terminal companion-record failure is not swallowed: the caller receives a
+    /// typed StoreFailure while the already materialized custody record remains the durable truth.
+    #[tokio::test]
+    async fn preparation_terminal_publication_failure_is_typed_and_loud() {
+        let (be, rec, tmp, source, cfg) = backend_fixture("preparation-terminal-failure");
+        let (bound, target) = bound_spec_v3(&source, &cfg);
+        be.preparation_test_hooks
+            .fail_terminal_publication
+            .store(true, Ordering::SeqCst);
+
+        let error = be
+            .configure_bound_session(
+                &SessionId::parse("preparation-terminal-failure").unwrap(),
+                &bound,
+            )
+            .await
+            .unwrap_err();
+
+        assert_eq!(error, BridgeError::StoreFailure);
+        assert_eq!(
+            preparation_flight_state_of(&target).as_deref(),
+            Some("barrier_synced"),
+            "a refused terminal write cannot be reported as settled"
+        );
+        assert_eq!(record_state_of(&target).as_deref(), Some("live_protected"));
+        assert!(Path::new(&target).is_dir());
+        assert_eq!(rec.remove_count.load(Ordering::SeqCst), 0);
+        std::fs::remove_dir_all(tmp).unwrap();
     }
 
     /// THE ordering property (§2.5, R-3): the custody record is durable and past

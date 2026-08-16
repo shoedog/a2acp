@@ -115,6 +115,10 @@ impl<'de> Deserialize<'de> for BoundedPreparationTransferReasonV1 {
 pub enum PreparationFlightStateV1 {
     Open {},
     BarrierSynced {},
+    /// Successful preparation is a terminal state in its own right. A transfer is reserved
+    /// for handing the exact guard to recovery; consumers must never infer success from a
+    /// free-text transfer reason.
+    Settled {},
     Transferred {
         reason: BoundedPreparationTransferReasonV1,
     },
@@ -351,7 +355,7 @@ mod tests {
         assert_eq!(sorted.into_iter().collect::<Vec<_>>(), vec![a, b]);
     }
 
-    /// Discriminates: drift in the internally-tagged wire shape of the two
+    /// Discriminates: drift in the internally-tagged wire shape of the three
     /// unit variants (e.g. `#[serde(tag = "state")]` accidentally dropped, or
     /// `rename_all` removed so the tag value stops being snake_case).
     #[test]
@@ -372,6 +376,14 @@ mod tests {
             serde_json::from_str::<PreparationFlightStateV1>(r#"{"state":"barrier_synced"}"#)
                 .unwrap(),
             PreparationFlightStateV1::BarrierSynced {}
+        );
+        assert_eq!(
+            serde_json::to_string(&PreparationFlightStateV1::Settled {}).unwrap(),
+            r#"{"state":"settled"}"#
+        );
+        assert_eq!(
+            serde_json::from_str::<PreparationFlightStateV1>(r#"{"state":"settled"}"#).unwrap(),
+            PreparationFlightStateV1::Settled {}
         );
     }
 
@@ -415,7 +427,7 @@ mod tests {
     /// keys there, not silently ignore them). Uses `Transferred`, a
     /// struct-payload variant -- see the test immediately below, which
     /// covers the same guarantee for the (as of this slice) empty-struct
-    /// variant `Open`.
+    /// variants `Open` and `Settled`.
     #[test]
     fn preparation_flight_state_rejects_unknown_field_on_struct_variant() {
         assert!(serde_json::from_str::<PreparationFlightStateV1>(
@@ -443,6 +455,10 @@ mod tests {
             serde_json::from_str::<PreparationFlightStateV1>(r#"{"state":"open","extra":1}"#)
                 .is_err()
         );
+        assert!(serde_json::from_str::<PreparationFlightStateV1>(
+            r#"{"state":"settled","extra":1}"#
+        )
+        .is_err());
     }
 
     /// Discriminates: an unrecognized `"state"` tag value being silently
