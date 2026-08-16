@@ -3775,9 +3775,20 @@ impl WorktreeBackend {
                     .map_err(|_| BridgeError::StoreFailure)
                     .and_then(|result| result);
             if let Err(error) = root_ready {
+                if !task_flight.begin_failure_publication() {
+                    runner_exit_guard.complete();
+                    return;
+                }
                 task_owner
                     .complete_with_result(Err(error.clone()), Err(error))
                     .await;
+                let mut active = flights.lock().unwrap_or_else(|error| error.into_inner());
+                if active
+                    .get(&session_key)
+                    .is_some_and(|current| Arc::ptr_eq(current, &task_owner))
+                {
+                    active.remove(&session_key);
+                }
                 runner_exit_guard.complete();
                 return;
             }
@@ -12152,6 +12163,7 @@ mod tests {
     #[tokio::test]
     async fn failure_owned_runner_exit_completes_configure_result() {
         let tmp = unique_temp_dir("preparation-failure-exit-result");
+        std::fs::create_dir_all(&tmp).unwrap();
         let target = tmp.join("target").to_string_lossy().into_owned();
         let hooks = Arc::new(PreparationFlightTestHooks::default());
         let control = Arc::new(PreparationControlRootV1::new(tmp.clone(), hooks.clone()));
@@ -12198,7 +12210,41 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stalled_control_root_pin_is_observable_before_terminalization() {
+    async fn failing_control_root_pin_releases_its_reservation() {
+        let (be, rec, tmp, source, cfg) = backend_fixture("preparation-failing-control-root");
+        let (bound, target) = bound_spec_v3(&source, &cfg);
+        let hooks = be.preparation_test_hooks.clone();
+        hooks.arm_nonreturning_control_root_pin();
+        let session = SessionId::parse("preparation-failing-control-root").unwrap();
+        let configure_be = be.clone();
+        let configure_session = session.clone();
+        let configure = tokio::spawn(async move {
+            configure_be
+                .configure_bound_session(&configure_session, &bound)
+                .await
+        });
+
+        hooks.wait_for_control_root_pin().await;
+        std::fs::remove_dir(&cfg.root).unwrap();
+        hooks.release_control_root_pin();
+        assert!(matches!(
+            configure.await.unwrap(),
+            Err(BridgeError::StoreFailure)
+        ));
+        assert!(be.preparation_guard_for_test(&session).is_none());
+        assert_eq!(preparation_flight_state_of(&target), None);
+        assert_eq!(rec.add_count.load(Ordering::SeqCst), 0);
+        std::fs::create_dir(&cfg.root).unwrap();
+        let (retry_bound, _) = bound_spec_v3(&source, &cfg);
+        be.configure_bound_session(&session, &retry_bound)
+            .await
+            .unwrap();
+        assert_eq!(rec.add_count.load(Ordering::SeqCst), 1);
+        std::fs::remove_dir_all(tmp).unwrap();
+    }
+
+    #[tokio::test]
+    async fn transferred_owner_survives_failing_control_root_pin() {
         let (be, rec, tmp, source, cfg) = backend_fixture("preparation-stalled-control-root");
         let (bound, target) = bound_spec_v3(&source, &cfg);
         let clock = Arc::new(ManualPreparationClock::new(0));
@@ -12242,18 +12288,65 @@ mod tests {
             configure.await.unwrap(),
             Err(BridgeError::ConfigInvalid { .. })
         ));
+        std::fs::remove_dir(&cfg.root).unwrap();
         hooks.release_control_root_pin();
-        hooks.wait_for_terminal().await;
         let recovery = be
             .transferred_preparation_for_test(&session)
             .expect("transfer retains the owner that was visible during root pinning");
         assert!(Arc::ptr_eq(&exact_flight, &recovery.owner.flight));
+        assert_eq!(
+            recovery.owner.flight.phase(),
+            PreparationPublicationPhaseV1::TransferPublishing
+        );
         be.join_transferred_preparation_runner_for_test(&session)
             .await;
-        assert_eq!(
-            preparation_flight_state_of(&target).as_deref(),
-            Some("transferred")
-        );
+        assert!(be.transferred_preparation_for_test(&session).is_some());
+        assert_eq!(preparation_flight_state_of(&target), None);
+        assert_eq!(rec.add_count.load(Ordering::SeqCst), 0);
+        std::fs::remove_dir_all(tmp).unwrap();
+    }
+
+    #[tokio::test]
+    async fn failing_control_root_pin_releases_all_waiting_reservations() {
+        let (be, rec, tmp, source, cfg) = backend_fixture("preparation-failing-control-root-all");
+        let (first_bound, target) = bound_spec_v3(&source, &cfg);
+        let (second_bound, _) = bound_spec_v3(&source, &cfg);
+        let hooks = be.preparation_test_hooks.clone();
+        hooks.arm_nonreturning_control_root_pin();
+        let first = SessionId::parse("preparation-failing-control-root-one").unwrap();
+        let first_be = be.clone();
+        let first_session = first.clone();
+        let first_configure = tokio::spawn(async move {
+            first_be
+                .configure_bound_session(&first_session, &first_bound)
+                .await
+        });
+
+        hooks.wait_for_control_root_pin().await;
+        let second = SessionId::parse("preparation-failing-control-root-two").unwrap();
+        let second_be = be.clone();
+        let second_session = second.clone();
+        let second_configure = tokio::spawn(async move {
+            second_be
+                .configure_bound_session(&second_session, &second_bound)
+                .await
+        });
+        while be.preparation_guard_for_test(&second).is_none() {
+            tokio::task::yield_now().await;
+        }
+        std::fs::remove_dir(&cfg.root).unwrap();
+        hooks.release_control_root_pin();
+        assert!(matches!(
+            first_configure.await.unwrap(),
+            Err(BridgeError::StoreFailure)
+        ));
+        assert!(matches!(
+            second_configure.await.unwrap(),
+            Err(BridgeError::StoreFailure)
+        ));
+        assert!(be.preparation_guard_for_test(&first).is_none());
+        assert!(be.preparation_guard_for_test(&second).is_none());
+        assert_eq!(preparation_flight_state_of(&target), None);
         assert_eq!(rec.add_count.load(Ordering::SeqCst), 0);
         std::fs::remove_dir_all(tmp).unwrap();
     }
@@ -12261,6 +12354,7 @@ mod tests {
     #[tokio::test]
     async fn terminal_replacement_serializes_exact_open_writers() {
         let tmp = unique_temp_dir("preparation-terminal-replacement");
+        std::fs::create_dir_all(&tmp).unwrap();
         let target = tmp.join("target").to_string_lossy().into_owned();
         let hooks = Arc::new(PreparationFlightTestHooks::default());
         let control = Arc::new(PreparationControlRootV1::new(tmp.clone(), hooks.clone()));
@@ -12299,6 +12393,7 @@ mod tests {
     #[test]
     fn preparation_control_root_refuses_identity_replacement() {
         let tmp = unique_temp_dir("preparation-control-root-replacement");
+        std::fs::create_dir_all(&tmp).unwrap();
         let root = tmp.join("root");
         let former = tmp.join("former-root");
         let replacement = tmp.join("replacement-root");
