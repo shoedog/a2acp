@@ -1,0 +1,50 @@
+I’m treating this as the single bounded correctness round. I’ll keep the checkout frozen, inspect only repository files and read-only Git history, and use repository-local search because no Prism/LSP navigation surface is exposed in this session; the external skill files are outside your explicit read boundary. I will not run any gates.The checkout is exactly candidate `c5d9390c76d6…` on parent `42dd555ac543…`, and only the two declared files differ. I’m now tracing the changed owner/result/runner lifecycle through the full materialization path and its durable journal, then I’ll inventory the production callers and evaluate the five tests against the supplied mutation evidence.The central race is now concrete: transfer and prepared-barrier admission are represented by two independent atomics. A runner can pass the `transferred` check, an observer can then win `begin_transfer`, and the runner can still publish `BarrierSynced` and later `Settled` over the durable `Transferred` record. I’m checking every adjacent owner/debt and cleanup path before deciding whether that is one root finding or exposes additional independently actionable failures.Correctness review found four blockers.
+
+### WRONG findings
+
+1. **WRONG — transfer and barrier admission are not linearizable. BLOCKER.**  
+   At [backend.rs:307](/Users/wesleyjinks/code/.a2a-implement/impl-90946-s08a7nvl/crates/bridge-worktree/src/backend.rs:307), `begin_transfer` checks `prepared_barrier` and CASes a different atomic. A runner can read `transferred == false` at [backend.rs:3540](/Users/wesleyjinks/code/.a2a-implement/impl-90946-s08a7nvl/crates/bridge-worktree/src/backend.rs:3540), then an observer can publish `Transferred`, return `ConfigInvalid`, and move the owner, while the runner publishes `BarrierSynced`, admits `add_under_custody`, and finally publishes `Settled` through the unchecked success arm at [backend.rs:3406](/Users/wesleyjinks/code/.a2a-implement/impl-90946-s08a7nvl/crates/bridge-worktree/src/backend.rs:3406). The reverse race also exists: `prepared_barrier` can become true between transfer’s load and CAS. Final durable state depends on competing renames.
+
+   Trigger: an armed V3 worktree whose custody sync finishes near the 31-second observation. Likelihood: **rare but credible**; the asynchronous journal publication widens the race. Impact: severe—users can receive a pre-effect refusal while a worktree is created, and `Transferred` can be overwritten. Fix: replace the two booleans with one CAS-controlled phase (`Preparing → TransferPublishing | BarrierPublishing`) so exactly one terminal writer/admission owner wins. Medium, backend-local blast radius. Red tests must deterministically drive both orders and, after joining the released runner, assert one terminal state and zero provider adds when transfer wins.
+
+2. **WRONG — a slow returning custody operation crosses the 30-second action bound without observation. BLOCKER.**  
+   The only clock sample for `CustodyEntryPublish` is before the blocking operation at [backend.rs:3335](/Users/wesleyjinks/code/.a2a-implement/impl-90946-s08a7nvl/crates/bridge-worktree/src/backend.rs:3335). After it returns, [backend.rs:3540](/Users/wesleyjinks/code/.a2a-implement/impl-90946-s08a7nvl/crates/bridge-worktree/src/backend.rs:3540) checks only whether an external observer already transferred it. With clock 29.9 seconds before entry and 30.1 seconds on return, no external 31-second control wake has occurred, so the runner publishes the barrier and admits the provider effect instead of transferring.
+
+   Trigger: lock/fsync work lasting across the internal deadline but returning before the control observer. Likelihood: **rare**, explicitly credible in the design. Impact: severe zero-effect contract violation. Fix: sample the clock immediately after the blocking operation and run the linearized transfer before barrier admission. Low-to-medium cost alongside finding 1. Red test: advance the manual clock while the custody hook is blocked, release it without calling `observe_preparation_bound_for_test`, and require `Transferred`, `ConfigInvalid`, and zero adds.
+
+3. **WRONG — a nonreturning initial journal operation cannot durably transfer. BLOCKER.**  
+   `JournalOpenPublish` starts at [backend.rs:3282](/Users/wesleyjinks/code/.a2a-implement/impl-90946-s08a7nvl/crates/bridge-worktree/src/backend.rs:3282), but the journal is installed only after that blocking operation returns at [backend.rs:3313](/Users/wesleyjinks/code/.a2a-implement/impl-90946-s08a7nvl/crates/bridge-worktree/src/backend.rs:3313). An observer acting while root-open, write, or sync is stuck makes `begin_transfer` irreversible and then receives `StoreFailure` because [backend.rs:623](/Users/wesleyjinks/code/.a2a-implement/impl-90946-s08a7nvl/crates/bridge-worktree/src/backend.rs:623) finds no journal. No durable `Transferred` or recovery owner appears; a permanently stuck operation leaves the configure attempt permanently stuck.
+
+   Trigger: wedged root open or initial journal fsync. Likelihood: **rare**, but it is the design’s named filesystem-stall risk. Impact: the observable-control guarantee is absent. Fix: make a terminal-capable durable control journal available before entering the first bounded operation; if opening that destination is itself in the population, use an already-established control/task journal rather than the file being opened. Medium-high blast radius. Red test must block inside initial open/publish, advance to 31 seconds, and prove the attempt terminalizes while the exact runner remains recovery-owned.
+
+4. **WRONG — the attempt result is published before ownership reaches recovery. BLOCKER.**  
+   `complete_with_result` wakes the configure caller at [backend.rs:630](/Users/wesleyjinks/code/.a2a-implement/impl-90946-s08a7nvl/crates/bridge-worktree/src/backend.rs:630); active removal and recovery insertion occur afterward at lines 639–657. On a multithreaded runtime, the configure attempt can return `ConfigInvalid`, run cleanup or retirement, and inspect an empty recovery inventory while the owner is still classified active. That contradicts the requirement that the attempt terminalize while the stuck operation is already recovery-owned.
+
+   Trigger: any transfer plus ordinary task scheduling. Likelihood: **plausible**. Impact: T3 can miss the owner or retirement can report before custody is handed off. Fix: insert recovery first—preferably through one owner-registry transition that cannot overwrite an existing owner—then remove active and only then publish completion/result. Low cost. Red test: pause after result publication and prove the current code lets configure return before recovery is visible.
+
+### SMELL findings
+
+- **SMELL — abnormal runner exit no longer closes the result channel. DEFER.** The sender moved from the runner future into the active owner at [backend.rs:391](/Users/wesleyjinks/code/.a2a-implement/impl-90946-s08a7nvl/crates/bridge-worktree/src/backend.rs:391). If the runner panics or is later aborted, the active map retains the sender, so the crash branch at lines 3477–3479 cannot wake. Trigger likelihood is **theoretical-only** for the current HostGit implementation, but all V3 runs would hang. Add a runner-exit guard or JoinError monitor and a panicking-provider regression. Low-medium cost.
+
+- **SMELL — no transfer-specific terminal-publication-failure regression. DEFER.** A storage failure while publishing `Transferred` is rare but affects future armed runs and T1 completion-debt custody. Add a fault-injected test requiring `StoreFailure`, retained active debt, no recovery success claim, and zero provider effects. Low cost.
+
+### Evidence assessment
+
+I rule **(b), correctly deferred**, on who schedules mid-operation observation. The checked-in authority explicitly leaves production arming to slice 4 and says the slice-3 gate certifies mechanisms, not production arming ([slice-3 brief:485](/Users/wesleyjinks/code/.a2a-implement/impl-90946-s08a7nvl/docs/superpowers/plans/2026-08-09-r2f1b-slice3-brief.md:485)); the clock contract likewise assigns later slices scheduling/cancellation ([preparation_flight.rs:1](/Users/wesleyjinks/code/.a2a-implement/impl-90946-s08a7nvl/crates/bridge-core/src/preparation_flight.rs:1)). The binding slice-4 obligation is: inject the production bound, schedule the 31-second control wake, call the same corrected phase transition, and add an end-to-end nonreturning test that never calls the cfg(test) observer. This defers the caller, not findings 1–4 in the transfer mechanism itself.
+
+Identity capture is correctly non-transferring: `BarrierSynced` and the prepared flag precede provider add and descriptor identity capture at lines 3546–3588. The table’s post-barrier ruling therefore matches §2.5.
+
+Structural checks confirm no production bound parameter, no added production timer/`tokio::time`, no enum/wire change, and no custody-table edge. The T1 departure CAS and cleanup join are unchanged; completion multiplexing changed, and finding 1 prevents concluding its semantics remain intact.
+
+Test discrimination:
+
+- Journal-boundary test is genuinely mutation-red, but covers only a returning initial operation.
+- Nonreturning-custody test exercises the production transfer helper and exact owner, but its cfg(test) trigger explains why severing both runner checks leaves it green. It neither proves production observation nor re-joins and rechecks state after release.
+- Unadvanced-clock control correctly covers the negative threshold case.
+- Post-barrier control covers a stable post-barrier state, not the transition race.
+- Production-default control corroborates zero arming; the cfg-stripped constructor supplies the stronger structural proof.
+
+I did not rerun gates under the read-only contract. The exact-head host result—4,125 passed, 0 failed, 13 ignored—and mutation outcomes are supplied evidence, not independently reproduced here.
+
+VERDICT: REJECT
+SUMMARY: Transfer, barrier admission, durable publication, and recovery ownership are not linearizable; slow or stuck preparation can admit effects or fail to transfer.
