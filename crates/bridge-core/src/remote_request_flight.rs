@@ -552,7 +552,7 @@ impl RemoteRequestJournalV1 {
             .begin_operation("open request journal")
             .map_err(fs)?;
         journal.authorize_checkpoint(&operation)?;
-        journal.scan_with(&operation, true)?;
+        let _ = journal.scan_with(&operation, true)?;
         recovery(NamespaceTransactionV2::recover(
             &operation,
             "recover request transaction",
@@ -672,7 +672,22 @@ impl RemoteRequestJournalV1 {
         }
         let name = Self::checkpoint_name();
         if !names.iter().any(|candidate| candidate == name.as_os_str()) {
-            return Err(Refusal::Malformed("checkpoint is absent".into()));
+            let _ = self.scan_with(op, true)?;
+            let captured = NamespaceTransactionV2::inspect_captured_replace_predecessor(
+                op,
+                &name,
+                WIRE_CAP as u64,
+                "inspect captured request checkpoint",
+            )
+            .ok_or_else(|| Refusal::Malformed("checkpoint is absent".into()))?;
+            let checkpoint: CheckpointWireV1 = serde_json::from_slice(&captured)
+                .map_err(|error| Refusal::Malformed(format!("{error:?}")))?;
+            self.validate_checkpoint(&checkpoint)?;
+            recovery(NamespaceTransactionV2::recover(
+                op,
+                "recover captured request checkpoint",
+            ))?;
+            return self.authorize_checkpoint(op);
         }
         let (checkpoint, _): (CheckpointWireV1, _) = read_wire(op, &name)?;
         self.validate_checkpoint(&checkpoint)
@@ -716,7 +731,8 @@ impl RemoteRequestJournalV1 {
         transaction(outcome)
     }
     fn scan(&self, op: &JournalRootOperationV2<'_>) -> FlightResult<CensusV1> {
-        self.scan_with(op, false)
+        self.scan_with(op, false)?
+            .ok_or_else(|| Refusal::Malformed("checkpoint is absent".into()))
     }
     /// Residue-tolerant validation pass: with `tolerate_residue`, reserved
     /// Task A entries are skipped (recovery owns their classification) while
@@ -726,7 +742,7 @@ impl RemoteRequestJournalV1 {
         &self,
         op: &JournalRootOperationV2<'_>,
         tolerate_residue: bool,
-    ) -> FlightResult<CensusV1> {
+    ) -> FlightResult<Option<CensusV1>> {
         let names = match op.enumerate(self.capacity + 1, "request census") {
             Ok(names) => names,
             Err(FsCustodyError::EnumerationLimitExceeded { .. }) => return Err(Refusal::Capacity),
@@ -829,25 +845,38 @@ impl RemoteRequestJournalV1 {
                 children.push(CensusChildV1 { wire, snapshot });
             }
         }
-        let (checkpoint, checkpoint_snapshot): (CheckpointWireV1, _) =
-            checkpoint.ok_or_else(|| Refusal::Malformed("checkpoint is absent".into()))?;
+        let unique_children = |children: &[CensusChildV1]| -> FlightResult<()> {
+            let mut ordinals = BTreeSet::new();
+            let mut requests = BTreeSet::new();
+            for child in children {
+                if !ordinals.insert(child.ordinal) || !requests.insert(child.request_id.as_str()) {
+                    return Err(RemoteRequestFlightRefusalV1::IdentityCollision);
+                }
+            }
+            Ok(())
+        };
+        let (checkpoint, checkpoint_snapshot): (CheckpointWireV1, _) = match checkpoint {
+            Some(checkpoint) => checkpoint,
+            None if tolerate_residue => {
+                if !lease {
+                    return Err(Refusal::Malformed("attempt lease is absent".into()));
+                }
+                unique_children(&children)?;
+                return Ok(None);
+            }
+            None => return Err(Refusal::Malformed("checkpoint is absent".into())),
+        };
         if !lease {
             return Err(Refusal::Malformed("attempt lease is absent".into()));
         }
         self.validate_checkpoint(&checkpoint)?;
-        let mut ordinals = BTreeSet::new();
-        let mut requests = BTreeSet::new();
-        for child in children.iter() {
-            if !ordinals.insert(child.ordinal) || !requests.insert(child.request_id.as_str()) {
-                return Err(RemoteRequestFlightRefusalV1::IdentityCollision);
-            }
-        }
-        Ok(CensusV1 {
+        unique_children(&children)?;
+        Ok(Some(CensusV1 {
             checkpoint,
             checkpoint_snapshot,
             children,
             staged,
-        })
+        }))
     }
     fn authority_for(wire: &RequestChildWireV1) -> RemoteRequestAuthorityV1 {
         RemoteRequestAuthorityV1 {
@@ -1917,6 +1946,7 @@ mod tests {
             JournalRootBindingV2, ObjectIdentityV2,
         },
         ids::{AttemptId, ExecutionId, NodeId},
+        namespace_transaction::interrupt_replace_at_captured_for_test,
         resource_flight::ResourceActionResultV1,
     };
     use std::{
@@ -2147,6 +2177,16 @@ mod tests {
         if !keep_capture {
             fs::remove_file(capture).unwrap();
         }
+    }
+    fn interrupt_checkpoint_replace_at_captured() {
+        interrupt_replace_at_captured_for_test(RemoteRequestJournalV1::checkpoint_name());
+    }
+    fn captured_admission_checkpoint(case: &Case) {
+        let mut journal = initialized(case, 16);
+        interrupt_checkpoint_replace_at_captured();
+        assert!(journal.admit_with(owner(0), || Ok(request(0))).is_err());
+        drop(journal);
+        assert!(!case.root.join(CHECKPOINT_CHILD_V1).exists());
     }
     #[test]
     fn remote_request_flight_checkpoint_and_census_are_strict_and_nonmutating() {
@@ -2602,6 +2642,157 @@ mod tests {
             checkpoint_before,
             "the production checkpoint-advance adapter must execute"
         );
+    }
+    #[test]
+    fn remote_request_flight_captured_admission_checkpoint_recovers_before_authorization() {
+        let case = case();
+        captured_admission_checkpoint(&case);
+
+        let reopened =
+            RemoteRequestJournalV1::open_with_capacity(custody(&case), attempt(), 16).unwrap();
+        let op = reopened
+            .custody
+            .begin_operation("inspect captured admission recovery")
+            .unwrap();
+        let census = reopened.scan(&op).unwrap();
+        assert_eq!(census.checkpoint.next_ordinal, 1);
+        assert_eq!(census.children.len(), 1);
+        assert_eq!(census.children[0].status, ChildStateV1::PreSendFailure {});
+        drop(op);
+        drop(reopened);
+        drop(RemoteRequestJournalV1::open_with_capacity(custody(&case), attempt(), 16).unwrap());
+    }
+
+    #[test]
+    fn remote_request_flight_captured_orphan_heal_checkpoint_recovers_twice() {
+        let case = case();
+        let mut journal = initialized(&case, 16);
+        assert!(journal
+            .admit_with_boundary(owner(0), || Ok(request(0)), 4)
+            .is_err());
+        drop(journal);
+
+        interrupt_checkpoint_replace_at_captured();
+        assert!(RemoteRequestJournalV1::open_with_capacity(custody(&case), attempt(), 16).is_err());
+        assert!(!case.root.join(CHECKPOINT_CHILD_V1).exists());
+
+        let reopened =
+            RemoteRequestJournalV1::open_with_capacity(custody(&case), attempt(), 16).unwrap();
+        let op = reopened
+            .custody
+            .begin_operation("inspect captured orphan-heal recovery")
+            .unwrap();
+        let census = reopened.scan(&op).unwrap();
+        assert_eq!(census.checkpoint.next_ordinal, 1);
+        assert_eq!(census.children.len(), 1);
+        assert_eq!(census.children[0].status, ChildStateV1::PreSendFailure {});
+        drop(op);
+        drop(reopened);
+        drop(RemoteRequestJournalV1::open_with_capacity(custody(&case), attempt(), 16).unwrap());
+    }
+
+    #[test]
+    fn remote_request_flight_invalid_captured_checkpoint_states_are_byte_preserved() {
+        for corrupt in [
+            "attempt",
+            "digest",
+            "commitment",
+            "missing-capture",
+            "no-intent",
+            "other-target",
+            "ordinary-row",
+        ] {
+            let case = case();
+            captured_admission_checkpoint(&case);
+            let checkpoint = RemoteRequestJournalV1::checkpoint_name();
+            let capture =
+                ChildNameV2::reserved(ReservedNameNamespaceV2::ReplacementCapture, &checkpoint)
+                    .unwrap();
+            let staged =
+                ChildNameV2::reserved(ReservedNameNamespaceV2::Staging, &checkpoint).unwrap();
+            let intent =
+                ChildNameV2::reserved(ReservedNameNamespaceV2::TransactionIntent, &checkpoint)
+                    .unwrap();
+            match corrupt {
+                "attempt" | "digest" => {
+                    let path = case.root.join(capture.as_os_str());
+                    let mut value: serde_json::Value =
+                        serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+                    if corrupt == "attempt" {
+                        value["attempt"]["ordinal"] = serde_json::json!(8);
+                    } else {
+                        value["identity_chain_digest"] = serde_json::json!("0".repeat(64));
+                    }
+                    fs::write(path, serde_json::to_vec(&value).unwrap()).unwrap();
+                }
+                "commitment" => fs::write(case.root.join(staged.as_os_str()), b"wrong").unwrap(),
+                "missing-capture" => fs::remove_file(case.root.join(capture.as_os_str())).unwrap(),
+                "no-intent" => fs::remove_file(case.root.join(intent.as_os_str())).unwrap(),
+                "other-target" => {
+                    let path = case.root.join(intent.as_os_str());
+                    let mut value: serde_json::Value =
+                        serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+                    let other_target = ChildNameV2::from_bytes(b"other.json").unwrap();
+                    let reserved = ReservedNameNamespaceV2::ALL.map(|namespace| {
+                        ChildNameV2::reserved(namespace, &other_target)
+                            .unwrap()
+                            .as_os_str()
+                            .to_str()
+                            .unwrap()
+                            .to_owned()
+                    });
+                    value["target"] = serde_json::json!("other.json");
+                    value["reserved"] = serde_json::json!(reserved);
+                    let other_intent = ChildNameV2::reserved(
+                        ReservedNameNamespaceV2::TransactionIntent,
+                        &other_target,
+                    )
+                    .unwrap();
+                    fs::write(
+                        case.root.join(other_intent.as_os_str()),
+                        serde_json::to_vec(&value).unwrap(),
+                    )
+                    .unwrap();
+                    fs::remove_file(path).unwrap();
+                }
+                _ => fs::write(request_paths(&case).pop().unwrap(), b"junk").unwrap(),
+            }
+            let before = root_bytes(&case);
+            let outcome = RemoteRequestJournalV1::open_with_capacity(custody(&case), attempt(), 16)
+                .err()
+                .unwrap();
+            match corrupt {
+                "attempt" => assert_eq!(outcome, Refusal::ForeignAttempt),
+                "digest" => assert_eq!(outcome, Refusal::DigestMismatch("checkpoint")),
+                "ordinary-row" => assert!(
+                    matches!(outcome, Refusal::Malformed(ref reason) if reason != "checkpoint is absent"),
+                    "{outcome:?}"
+                ),
+                _ => {}
+            }
+            assert_eq!(root_bytes(&case), before, "{corrupt}");
+        }
+
+        let case = case();
+        captured_admission_checkpoint(&case);
+        let intent = ChildNameV2::reserved(
+            ReservedNameNamespaceV2::TransactionIntent,
+            &RemoteRequestJournalV1::checkpoint_name(),
+        )
+        .unwrap();
+        let other = ChildNameV2::reserved(
+            ReservedNameNamespaceV2::TransactionIntent,
+            &ChildNameV2::from_bytes(b"other.json").unwrap(),
+        )
+        .unwrap();
+        fs::copy(
+            case.root.join(intent.as_os_str()),
+            case.root.join(other.as_os_str()),
+        )
+        .unwrap();
+        let before = root_bytes(&case);
+        assert!(RemoteRequestJournalV1::open_with_capacity(custody(&case), attempt(), 16).is_err());
+        assert_eq!(root_bytes(&case), before, "multiple intents");
     }
 
     #[test]
