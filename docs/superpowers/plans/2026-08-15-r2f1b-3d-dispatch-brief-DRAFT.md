@@ -91,3 +91,30 @@ orders; replacement/symlink negatives.
 - Exit gate for the slice = slice-3 brief §6 rows that 3d owns:
   `unused_candidate_settles_only_after_exact_absence` green; both marker
   populations served; preparation-finiteness under manual clocks.
+
+## T1 execution log (2026-08-16)
+
+- T1 dispatched (impl-91867-53y2udsc, base `c37338dd`); 3-attempt bound
+  reached with candidate `545103a4` (+890/−24: preparation_flight +20,
+  worktree backend +821, handoff doc). Final verify PASS all four stages.
+- Attempt-2 blockers (clippy red; durable `Failed` missing on Open-publication
+  failure; collapsed red-first evidence) FIXED by attempt 3 — verified at
+  source (the `Err(_) => publish_failed_after_initial_open_failure()` branch;
+  per-test red-first entries in the handoff).
+- Part 1 operator-inspected: `Settled {}` amendment exactly per B21 — doc
+  comment carries the success-vs-transfer rationale; wire golden
+  `{"state":"settled"}`; deny-unknown-fields negative; exhaustive-match
+  comments updated.
+- Final internal review REJECT, ONE blocker — CONFIRMED at source: no
+  production caller-departure observation between durable `Open` and the add
+  (only the cfg(test) `after_open_for_test` injected refusal, backend.rs
+  ~:2714); the phase-2 test's real `configure.abort()` is causally inert —
+  the asserted `Failed` comes from `hooks.fail_after_open` (the handoff's own
+  red-first entry documents the caller-owned-runner mutation, not a
+  drop-observation red). False-positive test + unimplemented contract.
+- TARGETED REPAIR dispatched on frozen `545103a4` (host branch
+  `feat/r2f1b-3d-t1`): R1 one-sample caller-departure check at the
+  add-admission boundary (departed → typed Failed, zero add; else committed,
+  phase-3 unchanged; no timers/watchers); R2 honest phase-2 test red-first on
+  `545103a4`; R3 `fail_after_open` hygiene. Caps 120/300, single file.
+  Counted Sol closure follows the repair.
