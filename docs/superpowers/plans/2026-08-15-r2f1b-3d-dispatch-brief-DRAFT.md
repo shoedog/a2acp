@@ -408,3 +408,19 @@ Caps 150 soft / 250 hard changed lines, production confined to
   (R1 harness fix; R2 reservation release composed with E1's phase claim,
   guarded by `Arc::ptr_eq`, publishing no durable record because the control
   root is precisely what failed; red-first T-A/T-B/T-C).
+- **FULL-WORKSPACE CONTROL on clean `f66016e0`** (host, unloaded,
+  `cargo test --workspace --no-fail-fast`) — never run before this round,
+  because the implement container structurally cannot compile and fable's
+  host runs were scoped to `bridge-worktree --lib`: **4,133 passed / 3 failed
+  / 13 ignored across 90 targets**, and the ONLY three failures in the entire
+  workspace are the three mechanically-broken new tests. Zero regression
+  anywhere else in the tree (baseline `435257ce` = 4,131/0/13 across 90; the
+  extension is +5 tests net). The whole-bin parallel flake seen under load
+  (`guarded_spawn_ignores_retargeted_static_cwd_for_native_mcp`) did NOT
+  recur in this unloaded run, confirming the load-flake classification.
+  Evidence: scratchpad `t2ext-baseline-nff.log`.
+  Net: the parked artifact is three test-harness lines away from a fully
+  green workspace suite, plus the one proven WRONG that R2 closes.
+- Dispatch 2 running: clone `impl-91809-nf10irod`, base
+  `salvage/r2f1b-3d-t2-extension-candidate` (`f66016e0`), terra/xhigh,
+  `--depth light --strict-brief`.

@@ -1,0 +1,75 @@
+diff --git a/crates/bridge-worktree/src/backend.rs b/crates/bridge-worktree/src/backend.rs
+index 03cf9a3f..d997e46a 100644
+--- a/crates/bridge-worktree/src/backend.rs
++++ b/crates/bridge-worktree/src/backend.rs
+@@ -12152,6 +12152,7 @@ mod tests {
+     #[tokio::test]
+     async fn failure_owned_runner_exit_completes_configure_result() {
+         let tmp = unique_temp_dir("preparation-failure-exit-result");
++        std::fs::create_dir_all(&tmp).unwrap();
+         let target = tmp.join("target").to_string_lossy().into_owned();
+         let hooks = Arc::new(PreparationFlightTestHooks::default());
+         let control = Arc::new(PreparationControlRootV1::new(tmp.clone(), hooks.clone()));
+@@ -12258,9 +12259,54 @@ mod tests {
+         std::fs::remove_dir_all(tmp).unwrap();
+     }
+ 
++    // DIAGNOSTIC PROBE (not a deliverable): does a FAILING root pin leave the active flight
++    // entry behind? Prediction if the review's orphan claim holds: configure returns
++    // StoreFailure, the map entry survives, and a second configure for the same session is
++    // permanently AgentOverloaded.
++    #[tokio::test]
++    async fn probe_root_pin_failure_orphans_the_active_flight() {
++        let (be, _rec, tmp, source, cfg) = backend_fixture("probe-root-pin-failure");
++        let (bound, _target) = bound_spec_v3(&source, &cfg);
++        let hooks = be.preparation_test_hooks.clone();
++        hooks.arm_nonreturning_control_root_pin();
++        let session = SessionId::parse("probe-root-pin-failure").unwrap();
++        let configure_be = be.clone();
++        let configure_session = session.clone();
++        let configure = tokio::spawn(async move {
++            configure_be
++                .configure_bound_session(&configure_session, &bound)
++                .await
++        });
++
++        hooks.wait_for_control_root_pin().await;
++        eprintln!(
++            "PROBE owner published before the blocking pin = {}",
++            be.preparation_guard_for_test(&session).is_some()
++        );
++        // Make the pin itself fail: the hook blocks BEFORE the open, so the open now hits ENOENT.
++        std::fs::remove_dir_all(&cfg.root).unwrap();
++        hooks.release_control_root_pin();
++
++        let first = configure.await.unwrap();
++        eprintln!("PROBE first configure = {first:?}");
++        eprintln!(
++            "PROBE entry retained after failure = {}",
++            be.preparation_guard_for_test(&session).is_some()
++        );
++        let (bound_again, _t2) = bound_spec_v3(&source, &cfg);
++        let second = tokio::time::timeout(
++            Duration::from_secs(2),
++            be.configure_bound_session(&session, &bound_again),
++        )
++        .await;
++        eprintln!("PROBE second configure = {second:?}");
++        std::fs::remove_dir_all(tmp).ok();
++    }
++
+     #[tokio::test]
+     async fn terminal_replacement_serializes_exact_open_writers() {
+         let tmp = unique_temp_dir("preparation-terminal-replacement");
++        std::fs::create_dir_all(&tmp).unwrap();
+         let target = tmp.join("target").to_string_lossy().into_owned();
+         let hooks = Arc::new(PreparationFlightTestHooks::default());
+         let control = Arc::new(PreparationControlRootV1::new(tmp.clone(), hooks.clone()));
+@@ -12299,6 +12345,7 @@ mod tests {
+     #[test]
+     fn preparation_control_root_refuses_identity_replacement() {
+         let tmp = unique_temp_dir("preparation-control-root-replacement");
++        std::fs::create_dir_all(&tmp).unwrap();
+         let root = tmp.join("root");
+         let former = tmp.join("former-root");
+         let replacement = tmp.join("replacement-root");
