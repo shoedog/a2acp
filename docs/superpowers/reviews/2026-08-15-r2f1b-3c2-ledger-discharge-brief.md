@@ -57,3 +57,35 @@ the fs_custody rustfmt hygiene slice, docs items S2/S3/S4/S8, ops items.
 
 - Dispatch workspace holds the spec; clone lives under `~/code/.a2a-implement`
   (reaper-covered). Salvage branch on rejection, per lane practice.
+
+## Execution log (2026-08-16)
+
+- Dispatch 1 (impl-35732-yre4mrr8): EMPTY — cloned stale local `main`
+  (42249b3d; the ref lives checked out in `.claude/worktrees/fold` and the
+  3c2 merge never moved it). Terra found no target files, made no changes.
+  GOTCHA ledgered: verify `local main == origin/main` before any
+  `--base-ref main` dispatch. Fix: ff inside the fold worktree → `6ad88565`.
+- Dispatch 2 (impl-36634-o9ndkzwa, base `6ad88565`): 3-attempt bound reached
+  with candidate `69f144f1` — ALL TEN items delivered, per-item mutation
+  evidence in the commit message; in-container verify red on exactly one
+  assertion (original F-1), internal light review REJECT with a correct
+  mechanism diagnosis.
+- Operator adjudication: the F-1 before-case constructs a SILENT-DROP
+  schedule; D's zero-poll privilege (rrf:1551 acceptance from
+  `provider_send_armed`; :1562 privilege comment) makes the conservative
+  possibly-accepted publication CORRECT production behavior; the literal
+  `Failed,false` reading of F's DEFER applies to the wrapper-path window the
+  passing siblings already pin. Operator completion `ab911ae5` splits the
+  marker-bit assertion (false — fence held, zero POSTs) from the publication
+  claim (true — armed-row custody), flagged for the closure to sustain or
+  overturn.
+- Test-only audit (operator): every production-region hunk across the five
+  files is `#[cfg(test)]`-gated or in-test-module; workspace clippy
+  `-D warnings` green proves no leakage. Terra's in-turn crates.io
+  CONNECT-403 = egress lock by design (verify cache compiled everything);
+  NOT a proxy-degradation event.
+- Gates on exact `ab911ae5`: fmt clean; workspace clippy `-D warnings`
+  clean; full suite **4,111/0/13 across 90** (3c2 baseline 4,104/0/13).
+- Counted Sol closure DISPATCHED (sol/max via `run-workflow code-review`,
+  solmax config; brief + diff at
+  `/private/tmp/a2a-r2f1b-ledger-discharge.2Oo9Ii/closure-brief.md`).
