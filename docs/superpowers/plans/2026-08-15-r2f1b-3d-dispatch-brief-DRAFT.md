@@ -171,3 +171,29 @@ orders; replacement/symlink negatives.
 - Repair-2 re-dispatched with the fixed config (same frozen spec; the two
   dead clones impl-42693/impl-42978 left for the reaper — no commits, no
   checkpoints).
+- CLOSURE REPAIR DELIVERED (after the credential incident): `6e6ad453`
+  (impl-44659-l0tumoxb, first attempt, verify PASS ×4, internal reviewer
+  glitched again → advisory-inconclusive). Design: cleanup joins a
+  backend-owned watch completion record of COMMITTED (or errored) flights
+  after configure drains, before entry_for_cleanup can pop; commitment =
+  one CAS raced by the caller guard and runner; terminal-write failure
+  persists as typed backend debt consumed by cleanup/retirement; `_ => {}`
+  projection → typed AgentCrashed; test waits bounded 2 s. 595 changed
+  lines (>450 soft, <650 hard, disclosed).
+- Operator controls (host, run-verified; container reds egress-blocked
+  again): 3 greens; Red A (join severed) both R1 red at the join latch;
+  Red A2 (wait skipped, latch kept) both R1 red at the joinable-cleanup
+  expectation; Red B (completion omitted + unconditional removal) R2 red
+  losing the typed StoreFailure. Divergence from the handoff's predicted
+  final-assertion shapes DISCLOSED to the re-look.
+- Gates on exact `6e6ad453`: fmt/clippy clean; full suite **4,120/0/13
+  across 90**.
+- BOUNDED SOL RE-LOOK: **APPROVE — W1 FIXED both schedules (CAS at :217 +
+  subscribe-before-pop at :2351), W2 FIXED (typed debt; conditional
+  removal at :3061; retirement inventory at :4160), join scope SOUND;
+  red-shape divergence ruled no-ledger-item.** 2 SMELL-DEFERs ledgered:
+  R1a-latch/R2-retirement waits still unbounded; explicit pre-sample
+  non-join coverage (~15–25 lines, red = join-every-flight mutation).
+  Verbatim: reviews/2026-08-16-r2f1b-3d-t1-sol-relook.md.
+- **T1 ROUND CLOSED — every WRONG fixed. PR #53 opened** (branch
+  feat/r2f1b-3d-t1 = 6e6ad453); CI watch running; rebase-merge on green.
