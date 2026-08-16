@@ -6,15 +6,16 @@ use crate::ids::AttemptId;
 use ring::rand::{SecureRandom, SystemRandom};
 use serde::{Deserialize, Serialize};
 
+#[cfg(unix)]
+pub use crate::retained_resource_flight::FileResourceFlightJournal;
 pub use crate::retained_resource_flight::{
-    CleanupDeadlineTransferV1, ContainerRemovalObservationV1, FileResourceFlightJournal,
-    InMemoryResourceFlightJournal, JournaledDispatchAdmissionV1, NodeCleanupAggregationV1,
-    NoopResourceFlightResultPublisher, OwnedProcessTreeV1, ProcessBindingStageV1,
-    ProcessSignalObservationV1, ResourceActionIntentV1, ResourceFlightJournal,
-    ResourceFlightJournalError, ResourceFlightJournalEventV1, ResourceFlightJournalRecordV1,
-    ResourceFlightKeyV1, ResourceFlightOwnerV1, ResourceFlightRegistryV1,
-    ResourceFlightReservationOutcomeV1, ResourceFlightReservationRecordV1,
-    ResourceFlightReservationV1, ResourceFlightResultPublisher,
+    CleanupDeadlineTransferV1, ContainerRemovalObservationV1, InMemoryResourceFlightJournal,
+    JournaledDispatchAdmissionV1, NodeCleanupAggregationV1, NoopResourceFlightResultPublisher,
+    OwnedProcessTreeV1, ProcessBindingStageV1, ProcessSignalObservationV1, ResourceActionIntentV1,
+    ResourceFlightJournal, ResourceFlightJournalError, ResourceFlightJournalEventV1,
+    ResourceFlightJournalRecordV1, ResourceFlightKeyV1, ResourceFlightOwnerV1,
+    ResourceFlightRegistryV1, ResourceFlightReservationOutcomeV1,
+    ResourceFlightReservationRecordV1, ResourceFlightReservationV1, ResourceFlightResultPublisher,
     ResourceFlightTerminalAppendOutcomeV1, RetainedResourceFlight, RetainedResourceFlightConfigV1,
     RetainedResourceFlightError, RetainedResourceFlightGuardV1,
 };

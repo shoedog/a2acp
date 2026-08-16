@@ -34,9 +34,13 @@ use crate::resource_flight::{
 use ring::digest::{digest, SHA256};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
+#[cfg(unix)]
 use std::fs::{File, OpenOptions};
+#[cfg(unix)]
 use std::io::Write;
-use std::path::{Path, PathBuf};
+#[cfg(unix)]
+use std::path::Path;
+use std::path::PathBuf;
 use std::sync::{Arc, Condvar, Mutex};
 
 pub const RESOURCE_FLIGHT_JOURNAL_SCHEMA_V1: u16 = 1;
@@ -569,6 +573,7 @@ impl ResourceFlightJournal for InMemoryResourceFlightJournal {
 
 /// Durable JSONL journal. The attempt persistence owner must create and pin its
 /// root before use; `open` refuses an absent/non-directory root.
+#[cfg(unix)]
 pub struct FileResourceFlightJournal {
     root: PathBuf,
     lock_path: PathBuf,
@@ -576,6 +581,7 @@ pub struct FileResourceFlightJournal {
     append_lock: Mutex<()>,
 }
 
+#[cfg(unix)]
 impl FileResourceFlightJournal {
     pub fn open(root: impl Into<PathBuf>, cap: usize) -> Result<Self, ResourceFlightJournalError> {
         let root = root.into();
@@ -733,6 +739,7 @@ impl FileResourceFlightJournal {
     }
 }
 
+#[cfg(unix)]
 impl ResourceFlightJournal for FileResourceFlightJournal {
     fn reserve_flight(
         &self,
