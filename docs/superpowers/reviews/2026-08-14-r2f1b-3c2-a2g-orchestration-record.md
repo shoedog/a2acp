@@ -1260,6 +1260,51 @@ All checks passed; no drift found.
   unsupported-target Windows) were unaffected and run on the branch
   head; merge on green completes 3c2.
 
+### First CI round on PR #51 — two failures, one fix (2026-08-15)
+
+- **Windows unsupported-target lane: WRONG, branch-introduced,
+  FIXED.** `bridge-core` fails to compile with `cfg(unix)` `liveness`
+  absent: 4× E0433 (`fs_custody.rs:1105` — the Task C child-lease
+  accessor's signature names `PersistentLockGuard` inside the
+  `cfg(not(unix))` stub impl; `retained_resource_flight.rs:593/617/626`
+  — the flock-backed `FileResourceFlightJournal`) plus 2 unused-import
+  errors. Same-environment control: main's lane on `42249b3d` green —
+  the break is the branch's. Same class as the 3a and 3c1 incidents
+  (host gate runs on macOS = unix; only this lane sees non-unix).
+  Fix commit **`790b4191`** on the PR branch (branch head now
+  `790b4191` = gated tree `3b0e2d1e`/`85690adb` + this guard commit):
+  accessor dropped from the non-unix stub, journal moved whole under
+  `cfg(unix)` (struct/impls/re-export), established
+  `cfg_attr(not(unix), allow(dead_code))` guards on the second-order
+  population (`is_reserved_target`, `JournalRootBindingV2` fields,
+  non-unix `enumerate_directory_names` stub). First-error masking was
+  enumerated to a fixed point locally before pushing: windows-msvc
+  `cargo check -p bridge-core` under `-D warnings` red→green via a
+  signature-only ring stub (`[patch.crates-io]`, probe-only — ring's C
+  build script cannot cross-compile from macOS; bridge-core source is
+  what the probe checks). Unix targets are semantically identical:
+  every edit is a unix-side no-op attribute or a deletion inside a
+  `cfg(not(unix))` block. Host verification on the fix: workspace
+  `cargo check` green, `cargo clippy -p bridge-core --all-targets
+  -D warnings` green, `fmt --check` clean, bridge-core tests
+  **717/0/0** (8 harnesses). Not re-run locally: the full 90-harness
+  gate and workspace clippy (CI re-runs both; the unchanged crates
+  were green on this tree in the same round's second run).
+- **Build/Lint/Coverage lane: load-flake, NOT a branch regression.**
+  `compatibility_schedule_state::tests::authority_mutation_lock_release_failure_is_loud_not_silent`
+  (pre-existing test, file unchanged by the branch) failed in the
+  push-triggered run and **passed in the pull-request-triggered run on
+  the same tree in the same environment**; main's same-day run
+  (`b986108c`) green. The liveness diff under it is additive-only
+  (visibility + two new functions; the release path is untouched).
+  Classified with the lane's existing load-sensitivity precedent (the
+  E crossing-test gate-load reds). **Ledger item:** if this test
+  recurs red under gate load, it joins the hermetic/load flake ledger
+  with an isolation-controls run; no fix on this round.
+- The fix push fires `pull_request_target: synchronize`, re-running
+  cla-assistant against main's updated allowlist — the CLA gate is
+  expected to clear without a manual `recheck`.
+
 ## Non-scope reaffirmed
 
 No OpenRouter/OpenCode implementation, live/billable provider turn beyond the
