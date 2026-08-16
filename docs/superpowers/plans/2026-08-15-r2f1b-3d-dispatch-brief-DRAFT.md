@@ -275,3 +275,25 @@ orders; replacement/symlink negatives.
   across 90** (baseline 4,125).
 - BOUNDED SOL RE-LOOK dispatched (W1-W4 + s1/s2 + the T1-composition
   question the closure left open + the W3 control-journal design).
+- BOUNDED RE-LOOK: **REJECT — CONVERGING** (verbatim: reviews/
+  2026-08-16-r2f1b-3d-t2-sol-relook.md, b2df332f). W1/W2/W4/s2 FIXED and
+  sustained; s1 folded w/ abort residue DEFERRED. Surviving population, all
+  closed: E1 pre-barrier FAILURE writers (departure/custody-error/runner-
+  exit) bypass the phase CAS — check-then-publish can clobber a durable
+  Transferred (T1-composition answered: every terminal writer must claim
+  the phase); E2 W3-not-fixed-at-root — the control-journal OPEN is itself
+  the first stall-capable op, now stalling with NO owner published; E3
+  exact-Open replacement is advisory TOCTOU (fs_custody replacing rename
+  clobbers). Plus the 903-line cap breach ruled a contract SMELL-blocker.
+- **DISCLOSED CONVERGENCE EXTENSION (one line, per the owner-promoted
+  discipline): the T2 cap (one round + one repair) is extended by ONE
+  second targeted repair on the frozen artifact — classification
+  CONVERGING (4 of 6 findings fixed and sustained; remainder closed,
+  enumerable, non-repeating), a binding second look follows, and a
+  non-converging result PARKS the slice and escalates to the owner.**
+- Extension repair dispatched on frozen `435257ce`: E1 failure-arm in the
+  same phase CAS claimed by every pre-barrier terminal writer; E2
+  pre-owned control root + publish-flight-before-blocking-ops; E3 atomic/
+  refusing terminal replacement (narrow fs_custody primitive authorized if
+  needed, Task-C precedent); E4 caps 500/750 hard-respected. s1 abort
+  residue + slice-4 observer obligation unchanged.
