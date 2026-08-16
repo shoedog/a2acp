@@ -237,3 +237,23 @@ orders; replacement/symlink negatives.
   across 90** (baseline 4,120).
 - Counted Sol closure DISPATCHED (sol/max) with the (a)/(b) question and
   all control evidence disclosed.
+- COUNTED SOL CLOSURE: **REJECT, 4 WRONG-BLOCKER / 2 SMELL-DEFER**
+  (verbatim: reviews/2026-08-16-r2f1b-3d-t2-sol-closure.md, commit
+  4f8c4eb7). W1 transfer/barrier on two independent atomics — Settled can
+  overwrite durable Transferred, both race orders; W2 action bound sampled
+  only pre-op — slow-returning op admits effects; W3 nonreturning INITIAL
+  journal op has no journal to transfer into — irreversible begin_transfer
+  then StoreFailure, configure stuck; W4 completion published before
+  recovery insertion — T3/retirement can miss the owner. SMELLs: runner-exit
+  sender guard; transfer terminal-publication-failure regression. THE
+  OBSERVER QUESTION RULED (b) DEFERRED with a BINDING slice-4 obligation
+  (inject bound + 31s control wake + call the corrected phase transition +
+  end-to-end nonreturning test w/o the cfg(test) observer). Identity-capture
+  post-barrier ruling SUSTAINED. Operator's exit-gate mutation evidence
+  incorporated (its green traced to the cfg(test) trigger; deferral covers
+  the trigger, NOT findings 1-4).
+- CLOSURE REPAIR dispatched on frozen `c5d9390c` (the cap's one repair):
+  single CAS phase enum (Preparing → TransferPublishing|BarrierPublishing);
+  post-return clock samples; pre-established terminal-capable control
+  journal for the initial-op window; recovery-insert-before-completion;
+  s1/s2 folds. Caps 600/900. Bounded re-look follows.
