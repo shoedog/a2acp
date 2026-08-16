@@ -1176,6 +1176,65 @@ All checks passed; no drift found.
   integration boundary, the land-or-stop decision (owner authority),
   same-turn record reconciliation, and post-landing CI green before
   3c2 is declared complete.
+- 2026-08-15: the owner selected **fold + branch; owner pushes and
+  opens the PR**. The guarded `a2a-bridge merge` computed the
+  operator-re-authored landing commit but pushed toward the run's
+  parent CLONE (this lane's clone-from-clone lineage is a shape the
+  boundary tool's push target does not cover — ledgered as a bridge
+  gap); the operator completed the fold by fetching the tool's own
+  landing commit `3b0e2d1e` (tree `efba6435` = `85690adb^{tree}`,
+  parent `50f3336e`, author = operator) into the host repository.
+  **`feat/r2f1b-3c2-request-flight` = `3b0e2d1e`; byte-identity
+  verified: ZERO bytes of diff against the gated candidate.**
+
+## Land-ready handoff (3c2)
+
+- **Branch to push:** `feat/r2f1b-3c2-request-flight` (local, host
+  repo) — 52 commits over merge-base `42249b3d` (main), final landing
+  commit `3b0e2d1e` re-authored to the operator, tree byte-identical
+  to gated `85690adb`.
+- **What lands:** the complete 3c2 API request-flight custody feature —
+  journal-root custody V2 + namespace transactions + SHA-256 staged
+  commitment (A), the durable request journal with atomic admission
+  and bounded retirement (B), attempt lease + full recovery table +
+  acknowledged outbox (C), the owned request driver with first-poll
+  arming fence, send permit, and joinable publication (D), the API
+  cleanup cell with absorbing TimedOut and honest acknowledgement (E),
+  the API send path migrated onto the owned mechanism with the old
+  adapter deleted (F/F2), exact-disposition retry gating with
+  fallible-metadata-before-effects (G), typed protective smoke
+  dispositions with the fallback-plan vocabulary (G2), and the
+  aggregate-round captured-checkpoint recovery fix. Production remains
+  `LegacyV2`; `resource_flight_route_v3 = None`; V3 unarmed; zero
+  production journal roots; revert is persistence-clean (not
+  behaviorally inert — the live API lifecycle was rewritten).
+- **Review trail:** eleven implementation rounds each with counted
+  Sol/xhigh closures; the aggregate dual-lens round (Sol REJECT→fixed;
+  Opus APPROVE) closed with EVERY WRONG across both lenses FIXED; the
+  bounded re-look APPROVEd the final fix (96/100). Complete gate on
+  exact `85690adb`: **4,104 passed / 0 failed / 13 ignored across 90
+  harnesses**, workspace clippy `-D warnings`, locked release build,
+  `cargo deny check`, hygiene.
+- **Owner steps:** push the branch, open the PR onto `main`, CI green
+  → 3c2 complete. (The 13 ignored tests are the pre-existing ignores;
+  the two hermetic container flake classes — flock-EBADF 10/10
+  host-green, signal-semantics — do not run in CI's environment
+  shape.)
+- **Ledger carried forward (not blockers):** test-hardening backlog —
+  D simultaneous-wrapper barrier + publication-waiter latch; E
+  admission-reset state table + bound stale-cell recreation; F reqwest
+  poll barrier + refusing/mismatched-publisher cleanup tests; F2
+  signal-test poll-with-Z fix; G configure-clean eviction regression;
+  aggregate equal-length commitment regression. Hygiene — eight
+  item-level production `rustfmt::skip` in fs_custody (separate slice
+  with the A3 module-level ban). Docs — compatibility CHANGELOG line +
+  mutation rows (S2), pinned-baseline re-pin or normalize (S3),
+  rollback ergonomics release note (S4), history-schema fidelity (S8).
+  Ops — bridge merge push-target gap for clone-of-clone lineages;
+  single-token-family bridge credential flaw; residue-disposition
+  authority for permanent Retained debt (owner question, later slice).
+  Records — the "Cargo.lock unchanged" claim corrected (one benign
+  dev-dependency edge).
 
 ## Non-scope reaffirmed
 
