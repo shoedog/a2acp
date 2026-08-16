@@ -8777,6 +8777,20 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn preflight_configure_failure_with_complete_cleanup_falls_back_and_caches() {
+        let (first, second, state, registry) =
+            exercise_preflight_fault(PreflightFault::Configure).await;
+
+        assert_eq!(first.unwrap().selected_model.as_deref(), Some("good"));
+        assert_eq!(second.unwrap().selected_model.as_deref(), Some("good"));
+        assert_eq!(state.configures.load(Ordering::SeqCst), 2);
+        assert_eq!(state.prompts.load(Ordering::SeqCst), 1);
+        assert_eq!(state.cancels.load(Ordering::SeqCst), 0);
+        assert_eq!(state.forgets.load(Ordering::SeqCst), 2);
+        assert_eq!(registry.invalidates.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
     async fn preflight_proven_rejection_substitutes_fallback_and_records_progress() {
         let rec = Arc::new(PreflightRec::default());
         let backend = Arc::new(PreflightBackend {

@@ -1522,6 +1522,54 @@ mod mechanism {
         }
 
         #[test]
+        fn namespace_transaction_equal_length_commitment_rewrite_refuses_reopen() {
+            let case = case();
+            let expected = case.expected();
+            let root = case.root.clone();
+            let outcome = case.operate(|op| {
+                NamespaceTransactionV2::replace_with(
+                    op,
+                    target(),
+                    expected,
+                    b"B",
+                    "equal-length commitment",
+                    |transition, _| {
+                        if transition == TransitionV2::Published {
+                            let staged = root.join("target");
+                            let before = required_file_content_snapshot_v2(
+                                &File::open(&staged).unwrap(),
+                                "staged commitment before rewrite",
+                            )
+                            .unwrap();
+                            fs::write(&staged, b"C").unwrap();
+                            let after = required_file_content_snapshot_v2(
+                                &File::open(&staged).unwrap(),
+                                "staged commitment after rewrite",
+                            )
+                            .unwrap();
+                            assert_eq!(before.object, after.object);
+                            assert_eq!(before.content_len, after.content_len);
+                        }
+                        false
+                    },
+                )
+            });
+            assert!(matches!(outcome, O::Retained(_, _)), "{outcome:?}");
+            assert_eq!(fs::read(case.root.join("target")).unwrap(), b"C");
+            assert_eq!(
+                fs::read(
+                    case.root
+                        .join(reserved(ReservedNameNamespaceV2::ReplacementCapture).as_os_str())
+                )
+                .unwrap(),
+                b"A"
+            );
+            let reopened = case.operate(|op| NamespaceTransactionV2::recover(op, "reopen"));
+            assert!(matches!(reopened, O::Retained(_, _)), "{reopened:?}");
+            assert_eq!(fs::read(case.root.join("target")).unwrap(), b"C");
+        }
+
+        #[test]
         fn namespace_transaction_every_replace_crash_cut_has_a_stable_recovery_outcome() {
             let cuts = [
                 TransitionV2::StageCreated,
