@@ -2759,17 +2759,29 @@ mod tests {
             )
             .mount(&server)
             .await;
-        for (session_name, release_send, disposition, accepted) in [
+        // `accepted` is the first-poll marker bit; `published_accepted` is the
+        // publication's custody claim. They diverge in the held-barrier case:
+        // the wrapper future is dropped without running, so the zero-poll
+        // privilege (the arming wrapper alone may settle an unaccepted
+        // terminal over a durably armed row) is never exercised, and the
+        // scope's drop settlement must conservatively publish
+        // possibly-accepted over the armed row. The provably-unpolled
+        // `Failed,false` window is pinned by the
+        // `task_f_*_after_dispatch_before_first_send_poll_is_failed_unaccepted`
+        // siblings, where the wrapper is never armed at all.
+        for (session_name, release_send, disposition, accepted, published_accepted) in [
             (
                 "task-f-poll-barrier-before",
                 false,
                 ResourceActionDispositionV1::Failed,
                 false,
+                true,
             ),
             (
                 "task-f-poll-barrier-after",
                 true,
                 ResourceActionDispositionV1::Partial,
+                true,
                 true,
             ),
         ] {
@@ -2833,7 +2845,10 @@ mod tests {
             let publications = fixture.publisher.0.lock().unwrap();
             assert_eq!(publications.len(), 1);
             assert_eq!(publications[0].result().disposition, disposition);
-            assert_eq!(publications[0].prompt_may_have_been_accepted(), accepted);
+            assert_eq!(
+                publications[0].prompt_may_have_been_accepted(),
+                published_accepted
+            );
         }
     }
 
