@@ -1305,6 +1305,28 @@ All checks passed; no drift found.
   cla-assistant against main's updated allowlist — the CLA gate is
   expected to clear without a manual `recheck`.
 
+### 3c2 COMPLETE (2026-08-15)
+
+- Second CI round on head `790b4191`: **every check green** —
+  cla-assistant PASS (allowlist, no manual recheck), Windows lane PASS
+  ×2 (the guard fix confirmed in CI's own environment), Build/Lint/
+  Coverage PASS ×2 (two more green runs of the flake-classified test),
+  Bridge Store macOS PASS ×2. PR mergeStateStatus CLEAN.
+- **PR #51 MERGED by rebase** (repo precedent for multi-commit PRs,
+  e.g. #12; main stays linear; custody trail preserved commit-for-
+  commit). Main advanced `b986108c` → **`6ad88565`** (53 rebased
+  commits; branch SHAs rewritten as rebase always does — the exact
+  gated SHAs remain addressable on the preserved branch
+  `feat/r2f1b-3c2-request-flight` = `790b4191`). Tree control:
+  `git diff 790b4191 origin/main` = only the cla.yml allowlist line —
+  merged content byte-exact to the gated tree + platform guard.
+- **Post-merge CI on main `6ad88565`: success, all three jobs green.**
+  Per the land-ready contract ("push branch + PR onto main + CI green
+  → declare 3c2 complete"): **3c2 is COMPLETE.**
+- Carried ledger unchanged (see Land-ready handoff above), plus this
+  round's additions: the coverage-lane load-flake watch item and the
+  cla.yml `a2a-implement` allowlist note.
+
 ## Non-scope reaffirmed
 
 No OpenRouter/OpenCode implementation, live/billable provider turn beyond the
