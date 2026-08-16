@@ -213,3 +213,27 @@ orders; replacement/symlink negatives.
 - Rerun GREEN on exact `42dd555a` — same-SHA control confirms the
   load-flake classification; main CI green; T1 fully closed. T2 fold gate
   clear (T2 round still in flight).
+
+## T2 execution log (2026-08-16)
+
+- T2 delivered FIRST DISPATCH: `c5d9390c` (impl-90946-s08a7nvl; 682 changed
+  lines, >500 soft <800 hard, disclosed; verify PASS ×4; internal reviewer
+  glitched a THIRD consecutive time → inconclusive-advisory; recurring
+  pipeline note for the ops ledger).
+- Operator inspection: zero production arming is STRUCTURAL (production
+  claim() has no bound parameter); transfer path = CAS begin_transfer →
+  durable Transferred{reason w/ 30s/31s values} → typed ConfigInvalid
+  refusal → owner (owning the runner JoinHandle) moved into
+  preparation_recovery_flights (T3 = first consumer). Handoff population
+  table rules identity capture post-BarrierSynced non-transferring.
+- Host controls: 5/5 greens; mutation severing BOTH production boundary
+  checks reddens the journal-open test (production boundaries honestly
+  covered) but the NAMED EXIT-GATE nonreturning test STAYS GREEN — its
+  transfer is driven by cfg(test) observe_preparation_bound_for_test
+  (~:1921). Framed for the closure as the round's main question:
+  (a) production observation seam required NOW (T1-phase-2 class) vs
+  (b) correctly deferred to slice-4 arming w/ a binding obligation.
+- Gates on exact `c5d9390c`: fmt/clippy clean; full suite **4,125/0/13
+  across 90** (baseline 4,120).
+- Counted Sol closure DISPATCHED (sol/max) with the (a)/(b) question and
+  all control evidence disclosed.
