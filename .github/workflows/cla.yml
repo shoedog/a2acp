@@ -26,4 +26,8 @@ jobs:
           path-to-signatures: ".github/cla-signatures.json"
           path-to-document: "https://github.com/${{ github.repository }}/blob/main/CLA.md"
           branch: "cla-signatures"
-          allowlist: "shoedog,dependabot[bot]"
+          # a2a-implement is the repository owner's local bridge automation
+          # identity (implement@a2a-bridge.local) — commits it authors are the
+          # owner's own contributions, so it is exempt from the CLA like
+          # dependabot.
+          allowlist: "shoedog,dependabot[bot],a2a-implement"
