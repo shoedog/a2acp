@@ -1137,6 +1137,45 @@ All checks passed; no drift found.
   (reopen and repeated reopen must succeed; foreign/corrupt captured
   checkpoint must refuse byte-preserved). Medium, authority-sensitive
   — beyond disclosed-extension scale. Disposition is the owner's.
+- 2026-08-15: the owner authorized **one aggregate repair round**.
+  Delivered first-attempt: `85690adb` (production 206+15
+  `remote_request_flight.rs` + 111+1 `namespace_transaction.rs`, +52
+  handoff = 385/450; in-container verify fully green; advisory APPROVE
+  with one equal-length commitment-test DEFER; brief mirrored as
+  [`2026-08-15-r2f1b-3c2-aggregate-repair-brief.md`](2026-08-15-r2f1b-3c2-aggregate-repair-brief.md)).
+  Operator source verification: validation-before-recovery preserved;
+  the new READ-ONLY `inspect_captured_replace_predecessor` accessor
+  gates on the single checkpoint-targeting intent; `validate_checkpoint`
+  on the captured predecessor bytes byte-preserved; recovery then
+  re-authorization; all other absent states refuse exactly as before;
+  crash-cut reds drive the REAL admission and heal paths via the new
+  test-only `interrupt_replace_at_captured_for_test` hook with the
+  on-disk brick state asserted. Preserved at
+  `salvage/r2f1b-3c2-aggregate-repaired`.
+- Host gates on exact `85690adb` all exit 0: **4,104 passed / 0 failed
+  / 13 ignored across 90 harnesses** (log `agg-host-gates.log`; +3 =
+  the crash-cut and refusal regressions) — this run IS the complete
+  gate on the exact final candidate required by the aggregate contract.
+- 2026-08-15: the bounded Sol re-look returned **APPROVE — the blocker
+  FIXED at both real crash windows** (96/100): trust root passes (the
+  accessor is read-only and every refusal path — foreign attempt,
+  digest, commitment, missing capture/intent, other-target,
+  multi-intent, invalid rows — leaves namespace bytes unchanged);
+  recursion bounded (recovery restores the predecessor and returns
+  `NoEffect`; no successful branch leaves the name absent); `scan_with`
+  blast radius complete across its three callers; scope exact. One
+  SMELL-DEFER to the ledger: an equal-length same-inode commitment
+  regression (~10-15 test lines). Result mirrored as
+  [`2026-08-15-r2f1b-3c2-aggregate-relook-result.md`](2026-08-15-r2f1b-3c2-aggregate-relook-result.md);
+  brief as
+  [`2026-08-15-r2f1b-3c2-aggregate-relook-brief.md`](2026-08-15-r2f1b-3c2-aggregate-relook-brief.md).
+- **THE AGGREGATE ROUND IS CLOSED: every WRONG across both lenses is
+  FIXED. The exact final candidate of 3c2 is `85690adb`** (52 commits
+  over merge-base `42249b3d`; complete gate green). Remaining per the
+  orchestration handoff: byte-identical fold through the controlled
+  integration boundary, the land-or-stop decision (owner authority),
+  same-turn record reconciliation, and post-landing CI green before
+  3c2 is declared complete.
 
 ## Non-scope reaffirmed
 
