@@ -215,6 +215,7 @@ args = ["--repo", "{cwd}", "--lang", "auto", "--target-cache", "/Users/wesleyjin
 id  = "codex"
 cmd = "codex-acp"
 model = "gpt-5.5"   # reviewer pinned (dogfood)
+pre_authenticated = true  # 2026-08-16: same credential class as impl — authenticate now times out/rejects post-refresh; reviewer node lost 4 consecutive internal reviews to it.
 args = ["-c", "sandbox_mode=\"read-only\"", "-c", "approval_policy=\"never\""]
 [[agents.mcp]]
 name = "prism"
