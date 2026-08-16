@@ -37,7 +37,7 @@ use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
 #[cfg(test)]
 use std::sync::atomic::AtomicUsize;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 use tokio::sync::{oneshot, watch, Mutex, Notify};
@@ -47,6 +47,9 @@ const FAILED_CONFIGURE_RETRY_MAX: Duration = Duration::from_secs(30);
 const MAX_WORKTREE_CONFIGURES_IN_FLIGHT: u64 = 64;
 const PREPARATION_FLIGHT_RECORD_SUFFIX: &str = ".preparation-flight.v1.json";
 const PREPARATION_FLIGHT_RECORD_SCHEMA_V1: u16 = 1;
+const PREPARATION_CALLER_PRESENT: u8 = 0;
+const PREPARATION_CALLER_DEPARTED: u8 = 1;
+const PREPARATION_CALLER_COMMITTED: u8 = 2;
 
 #[derive(Clone)]
 pub struct WorktreeIdentity {
@@ -153,13 +156,13 @@ struct MaterializationPreparationFlightV1 {
     /// The observing configure future owns the only guard that can set this flag. The detached
     /// runner samples it exactly once between durable Open and add admission; after that sample,
     /// caller departure cannot cancel a committed materialization.
-    caller_departed: Arc<AtomicBool>,
+    caller_departed: Arc<AtomicU8>,
     #[cfg(test)]
     hooks: Arc<PreparationFlightTestHooks>,
 }
 
 struct PreparationFlightCallerGuardV1 {
-    caller_departed: Arc<AtomicBool>,
+    caller_departed: Arc<AtomicU8>,
     armed: bool,
 }
 
@@ -172,7 +175,12 @@ impl PreparationFlightCallerGuardV1 {
 impl Drop for PreparationFlightCallerGuardV1 {
     fn drop(&mut self) {
         if self.armed {
-            self.caller_departed.store(true, Ordering::Release);
+            let _ = self.caller_departed.compare_exchange(
+                PREPARATION_CALLER_PRESENT,
+                PREPARATION_CALLER_DEPARTED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            );
         }
     }
 }
@@ -182,7 +190,7 @@ impl MaterializationPreparationFlightV1 {
         Ok(Self {
             id: PreparationFlightIdV1::mint()?,
             state: StdMutex::new(PreparationFlightStateV1::Open {}),
-            caller_departed: Arc::new(AtomicBool::new(false)),
+            caller_departed: Arc::new(AtomicU8::new(PREPARATION_CALLER_PRESENT)),
             #[cfg(test)]
             hooks,
         })
@@ -203,10 +211,50 @@ impl MaterializationPreparationFlightV1 {
         }
     }
 
-    /// This is the one and only cancellation observation for a claimed preparation flight.
-    /// A false sample commits the runner to phase-3 behavior for the rest of materialization.
-    fn caller_departed_at_add_admission(&self) -> bool {
-        self.caller_departed.load(Ordering::Acquire)
+    /// This is the one and only cancellation observation for a claimed preparation flight. The
+    /// successful compare-and-exchange IS the false sample and commits the runner in one atomic
+    /// transition, so cleanup cannot observe an uncommitted gap before custody admission.
+    fn commit_add_admission(&self) -> bool {
+        self.caller_departed
+            .compare_exchange(
+                PREPARATION_CALLER_PRESENT,
+                PREPARATION_CALLER_COMMITTED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_err()
+    }
+
+    fn committed(&self) -> bool {
+        self.caller_departed.load(Ordering::Acquire) == PREPARATION_CALLER_COMMITTED
+    }
+
+    fn has_durable_terminal(&self) -> bool {
+        preparation_state_is_terminal(&self.state.lock().unwrap_or_else(|error| error.into_inner()))
+    }
+}
+
+/// Backend-owned completion for a claimed preparation flight. A normal terminal publication
+/// releases the active-flight entry; a publication failure leaves its typed debt here for the
+/// cleanup/retirement owner to observe. This is intentionally separate from the caller's
+/// one-shot result: observer departure must not erase a nonterminal durable-record failure.
+struct ActivePreparationFlightV1 {
+    flight: Arc<MaterializationPreparationFlightV1>,
+    completion: watch::Sender<Option<Result<(), BridgeError>>>,
+}
+
+impl ActivePreparationFlightV1 {
+    fn new(flight: Arc<MaterializationPreparationFlightV1>) -> Self {
+        let (completion, _receiver) = watch::channel(None);
+        Self { flight, completion }
+    }
+
+    fn completion(&self) -> watch::Receiver<Option<Result<(), BridgeError>>> {
+        self.completion.subscribe()
+    }
+
+    fn complete(&self, result: Result<(), BridgeError>) {
+        self.completion.send_replace(Some(result));
     }
 }
 
@@ -392,6 +440,10 @@ struct PreparationFlightTestHooks {
     pause_after_open: AtomicBool,
     release_after_open: Notify,
     fail_initial_open_parent_sync: AtomicBool,
+    add_admission_count: AtomicUsize,
+    add_admission: Notify,
+    pause_after_add_admission: AtomicBool,
+    release_after_add_admission: Notify,
     add_count: AtomicUsize,
     add: Notify,
     pause_after_add: AtomicBool,
@@ -416,6 +468,14 @@ impl PreparationFlightTestHooks {
             .swap(false, Ordering::SeqCst)
     }
 
+    async fn after_add_admission(&self) {
+        self.add_admission_count.fetch_add(1, Ordering::SeqCst);
+        self.add_admission.notify_waiters();
+        if self.pause_after_add_admission.swap(false, Ordering::SeqCst) {
+            self.release_after_add_admission.notified().await;
+        }
+    }
+
     async fn after_add(&self) {
         self.add_count.fetch_add(1, Ordering::SeqCst);
         self.add.notify_waiters();
@@ -434,30 +494,55 @@ impl PreparationFlightTestHooks {
     }
 
     async fn wait_for_open(&self) {
-        while self.open_count.load(Ordering::SeqCst) == 0 {
-            let notified = self.open.notified();
-            if self.open_count.load(Ordering::SeqCst) == 0 {
-                notified.await;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while self.open_count.load(Ordering::SeqCst) == 0 {
+                let notified = self.open.notified();
+                if self.open_count.load(Ordering::SeqCst) == 0 {
+                    notified.await;
+                }
             }
-        }
+        })
+        .await
+        .expect("preparation test timed out waiting for durable Open");
+    }
+
+    async fn wait_for_add_admission(&self) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while self.add_admission_count.load(Ordering::SeqCst) == 0 {
+                let notified = self.add_admission.notified();
+                if self.add_admission_count.load(Ordering::SeqCst) == 0 {
+                    notified.await;
+                }
+            }
+        })
+        .await
+        .expect("preparation test timed out waiting for committed add admission");
     }
 
     async fn wait_for_add(&self) {
-        while self.add_count.load(Ordering::SeqCst) == 0 {
-            let notified = self.add.notified();
-            if self.add_count.load(Ordering::SeqCst) == 0 {
-                notified.await;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while self.add_count.load(Ordering::SeqCst) == 0 {
+                let notified = self.add.notified();
+                if self.add_count.load(Ordering::SeqCst) == 0 {
+                    notified.await;
+                }
             }
-        }
+        })
+        .await
+        .expect("preparation test timed out waiting for custody-aware add");
     }
 
     async fn wait_for_terminal(&self) {
-        while self.terminal_count.load(Ordering::SeqCst) == 0 {
-            let notified = self.terminal.notified();
-            if self.terminal_count.load(Ordering::SeqCst) == 0 {
-                notified.await;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while self.terminal_count.load(Ordering::SeqCst) == 0 {
+                let notified = self.terminal.notified();
+                if self.terminal_count.load(Ordering::SeqCst) == 0 {
+                    notified.await;
+                }
             }
-        }
+        })
+        .await
+        .expect("preparation test timed out waiting for terminal publication");
     }
 }
 
@@ -469,6 +554,10 @@ impl MaterializationPreparationFlightV1 {
 
     fn fail_initial_open_parent_sync_for_test(&self) -> bool {
         self.hooks.take_initial_open_parent_sync_failure()
+    }
+
+    async fn after_add_admission_for_test(&self) {
+        self.hooks.after_add_admission().await;
     }
 
     async fn after_add_for_test(&self) {
@@ -1317,9 +1406,10 @@ pub struct WorktreeBackend {
     allowed_root: Option<SessionCwd>,
     identity: WorktreeIdentity,
     map: Arc<Mutex<HashMap<String, WtState>>>,
-    /// Claimed flights outlive an observing configure future. This map owns only active runners;
-    /// their durable companion records remain after terminal settlement.
-    preparation_flights: Arc<StdMutex<HashMap<String, Arc<MaterializationPreparationFlightV1>>>>,
+    /// Claimed flights outlive an observing configure future. A normal terminal publication
+    /// releases an entry; a terminal-publication debt remains joinable until cleanup or retirement
+    /// reports it.
+    preparation_flights: Arc<StdMutex<HashMap<String, Arc<ActivePreparationFlightV1>>>>,
     #[cfg(test)]
     preparation_test_hooks: Arc<PreparationFlightTestHooks>,
     cleanup_cells: Arc<StdMutex<HashMap<String, Arc<CleanupCell>>>>,
@@ -1343,6 +1433,10 @@ pub struct WorktreeBackend {
     cleanup_waiting_reservation_count: Arc<AtomicU64>,
     #[cfg(test)]
     cleanup_waiting_reservation: Arc<Notify>,
+    #[cfg(test)]
+    cleanup_waiting_preparation_count: Arc<AtomicU64>,
+    #[cfg(test)]
+    cleanup_waiting_preparation: Arc<Notify>,
     #[cfg(test)]
     cleanup_flight_started_count: AtomicU64,
     #[cfg(test)]
@@ -1393,6 +1487,10 @@ impl WorktreeBackend {
             cleanup_waiting_reservation_count: Arc::new(AtomicU64::new(0)),
             #[cfg(test)]
             cleanup_waiting_reservation: Arc::new(Notify::new()),
+            #[cfg(test)]
+            cleanup_waiting_preparation_count: Arc::new(AtomicU64::new(0)),
+            #[cfg(test)]
+            cleanup_waiting_preparation: Arc::new(Notify::new()),
             #[cfg(test)]
             cleanup_flight_started_count: AtomicU64::new(0),
             #[cfg(test)]
@@ -1486,6 +1584,34 @@ impl WorktreeBackend {
         {
             self.cleanup_waiting_reservation.notified().await;
         }
+    }
+
+    #[cfg(test)]
+    async fn wait_for_cleanup_waiting_preparation(&self) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while self
+                .cleanup_waiting_preparation_count
+                .load(Ordering::SeqCst)
+                == 0
+            {
+                self.cleanup_waiting_preparation.notified().await;
+            }
+        })
+        .await
+        .expect("cleanup test timed out waiting to join a committed preparation flight");
+    }
+
+    #[cfg(test)]
+    fn preparation_flight_debt_for_test(&self, session: &SessionId) -> Option<BridgeError> {
+        let owner = self
+            .preparation_flights
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .get(session.as_str())
+            .cloned()?;
+        let completion = owner.completion();
+        let completed = completion.borrow().clone();
+        completed.and_then(Result::err)
     }
 
     #[cfg(test)]
@@ -1871,6 +1997,7 @@ impl WorktreeBackend {
         let provider = self.provider.clone();
         let map = self.map.clone();
         let notify = self.notify.clone();
+        let preparation_flights = self.preparation_flights.clone();
         let worker_session = session.clone();
         let session_key = session.as_str().to_owned();
         let flight_id = self.next_cleanup_flight.fetch_add(1, Ordering::Relaxed);
@@ -1879,6 +2006,10 @@ impl WorktreeBackend {
         let cleanup_waiting_reservation_count = self.cleanup_waiting_reservation_count.clone();
         #[cfg(test)]
         let cleanup_waiting_reservation = self.cleanup_waiting_reservation.clone();
+        #[cfg(test)]
+        let cleanup_waiting_preparation_count = self.cleanup_waiting_preparation_count.clone();
+        #[cfg(test)]
+        let cleanup_waiting_preparation = self.cleanup_waiting_preparation.clone();
         #[cfg(test)]
         let failed_configure_retry_now = self.failed_configure_retry_now.clone();
         #[cfg(test)]
@@ -1907,11 +2038,16 @@ impl WorktreeBackend {
             let provider = provider.clone();
             let map = map.clone();
             let notify = notify.clone();
+            let preparation_flights = preparation_flights.clone();
             let worker_session = worker_session.clone();
             #[cfg(test)]
             let cleanup_waiting_reservation_count = cleanup_waiting_reservation_count.clone();
             #[cfg(test)]
             let cleanup_waiting_reservation = cleanup_waiting_reservation.clone();
+            #[cfg(test)]
+            let cleanup_waiting_preparation_count = cleanup_waiting_preparation_count.clone();
+            #[cfg(test)]
+            let cleanup_waiting_preparation = cleanup_waiting_preparation.clone();
             #[cfg(test)]
             let removal_tombstone_parent_sync_fault = removal_tombstone_parent_sync_fault.clone();
             async move {
@@ -1921,6 +2057,7 @@ impl WorktreeBackend {
                     provider,
                     map,
                     notify,
+                    preparation_flights,
                     worker_session,
                     requested,
                     disposition,
@@ -1930,6 +2067,10 @@ impl WorktreeBackend {
                     cleanup_waiting_reservation_count,
                     #[cfg(test)]
                     cleanup_waiting_reservation,
+                    #[cfg(test)]
+                    cleanup_waiting_preparation_count,
+                    #[cfg(test)]
+                    cleanup_waiting_preparation,
                     #[cfg(test)]
                     removal_tombstone_parent_sync_fault,
                 )
@@ -2064,12 +2205,18 @@ impl WorktreeBackend {
                     let provider = provider.clone();
                     let map = map.clone();
                     let notify = notify.clone();
+                    let preparation_flights = preparation_flights.clone();
                     let worker_session = worker_session.clone();
                     #[cfg(test)]
                     let cleanup_waiting_reservation_count =
                         cleanup_waiting_reservation_count.clone();
                     #[cfg(test)]
                     let cleanup_waiting_reservation = cleanup_waiting_reservation.clone();
+                    #[cfg(test)]
+                    let cleanup_waiting_preparation_count =
+                        cleanup_waiting_preparation_count.clone();
+                    #[cfg(test)]
+                    let cleanup_waiting_preparation = cleanup_waiting_preparation.clone();
                     #[cfg(test)]
                     let removal_tombstone_parent_sync_fault =
                         removal_tombstone_parent_sync_fault.clone();
@@ -2080,6 +2227,7 @@ impl WorktreeBackend {
                             provider,
                             map,
                             notify,
+                            preparation_flights,
                             worker_session,
                             CleanupStrength::Release,
                             retry_disposition,
@@ -2089,6 +2237,10 @@ impl WorktreeBackend {
                             cleanup_waiting_reservation_count,
                             #[cfg(test)]
                             cleanup_waiting_reservation,
+                            #[cfg(test)]
+                            cleanup_waiting_preparation_count,
+                            #[cfg(test)]
+                            cleanup_waiting_preparation,
                             #[cfg(test)]
                             removal_tombstone_parent_sync_fault,
                         )
@@ -2162,6 +2314,7 @@ impl WorktreeBackend {
         provider: Arc<dyn WorktreeProvider>,
         map: Arc<Mutex<HashMap<String, WtState>>>,
         notify: Arc<Notify>,
+        preparation_flights: Arc<StdMutex<HashMap<String, Arc<ActivePreparationFlightV1>>>>,
         session: SessionId,
         strength: CleanupStrength,
         disposition: CheckoutDispositionV1,
@@ -2169,6 +2322,8 @@ impl WorktreeBackend {
         preservation_reason: Option<PreservationReasonV1>,
         #[cfg(test)] cleanup_waiting_reservation_count: Arc<AtomicU64>,
         #[cfg(test)] cleanup_waiting_reservation: Arc<Notify>,
+        #[cfg(test)] cleanup_waiting_preparation_count: Arc<AtomicU64>,
+        #[cfg(test)] cleanup_waiting_preparation: Arc<Notify>,
         #[cfg(test)] removal_tombstone_parent_sync_fault: Arc<AtomicUsize>,
     ) -> CleanupReportV1 {
         // Configure admission is published synchronously, before its first
@@ -2191,6 +2346,42 @@ impl WorktreeBackend {
                 cleanup_waiting_reservation.notify_waiters();
             }
             settled.await;
+        }
+
+        // A false cancellation sample commits the detached runner before it enters the
+        // custody cells. Its reservation carries the only retained identities that can later
+        // mint a preservation claim, so cleanup must join that runner before `entry_for_cleanup`
+        // can pop the reservation. A pre-sample departure is deliberately not joined: it cannot
+        // have started a custody or provider effect.
+        let preparation_completion = {
+            let flights = preparation_flights
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            flights.get(session.as_str()).and_then(|owner| {
+                let completion = owner.completion();
+                if owner.flight.committed()
+                    || completion.borrow().as_ref().is_some_and(Result::is_err)
+                {
+                    Some(completion)
+                } else {
+                    None
+                }
+            })
+        };
+        if let Some(completion) = preparation_completion {
+            #[cfg(test)]
+            {
+                cleanup_waiting_preparation_count.fetch_add(1, Ordering::SeqCst);
+                cleanup_waiting_preparation.notify_waiters();
+            }
+            if let Err(error) = wait_for_preparation_completion(completion).await {
+                let state = cell.state.lock().await;
+                return CleanupReportV1::settled(
+                    CheckoutCleanupDispositionV1::NotNeeded,
+                    state.inner_disposition,
+                    Some(error),
+                );
+            }
         }
 
         // This mutex is the per-session single-flight boundary. A stronger
@@ -2712,6 +2903,7 @@ impl WorktreeBackend {
         )?);
         #[cfg(not(test))]
         let flight = Arc::new(MaterializationPreparationFlightV1::claim()?);
+        let active_flight = Arc::new(ActivePreparationFlightV1::new(flight.clone()));
         {
             let mut flights = self
                 .preparation_flights
@@ -2720,7 +2912,7 @@ impl WorktreeBackend {
             if flights.contains_key(&session_key) {
                 return Err(BridgeError::AgentOverloaded);
             }
-            flights.insert(session_key.clone(), flight.clone());
+            flights.insert(session_key.clone(), active_flight.clone());
         }
 
         let caller_guard = flight.caller_guard();
@@ -2733,6 +2925,7 @@ impl WorktreeBackend {
         };
         let expected_worktree_path = resolved.worktree_path.clone();
         let task_flight = flight.clone();
+        let task_owner = active_flight.clone();
         let (result_tx, result_rx) = oneshot::channel();
         std::mem::drop(tokio::spawn(async move {
             let initial = tokio::task::spawn_blocking({
@@ -2768,14 +2961,15 @@ impl WorktreeBackend {
                 Ok(Some(journal)) => {
                     #[cfg(test)]
                     task_flight.after_open_for_test().await;
-                    let caller_departed_at_add_admission =
-                        task_flight.caller_departed_at_add_admission();
+                    let caller_departed_at_add_admission = task_flight.commit_add_admission();
                     let result = if caller_departed_at_add_admission {
                         Err(BridgeError::ConfigInvalid {
                             reason: "configure caller departed before worktree add admission"
                                 .into(),
                         })
                     } else {
+                        #[cfg(test)]
+                        task_flight.after_add_admission_for_test().await;
                         WorktreeBackend::run_materialization_under_custody(
                             provider,
                             custody,
@@ -2787,27 +2981,50 @@ impl WorktreeBackend {
                     };
                     match result {
                         Ok(materialized) => {
-                            if materialized.0 == WtCustodyV1::Protected {
-                                if let Some(protection) = &materialized.1 {
-                                    let mut entries = map.lock().await;
-                                    match entries.get_mut(&session_key) {
-                                        Some(WtState::Reserving { entry, .. })
-                                        | Some(WtState::Ready(entry))
-                                        | Some(WtState::Retained { entry, .. })
-                                            if entry.worktree_path == expected_worktree_path =>
-                                        {
-                                            entry.custody = WtCustodyV1::Protected;
-                                            entry.protection = Some(protection.clone());
+                            let projection = if materialized.0 == WtCustodyV1::Protected {
+                                match &materialized.1 {
+                                    None => Err(BridgeError::agent_crashed(
+                                        "protected preparation flight omitted retained identities",
+                                    )),
+                                    Some(protection) => {
+                                        let mut entries = map.lock().await;
+                                        match entries.get_mut(&session_key) {
+                                            Some(WtState::Reserving { entry, .. })
+                                            | Some(WtState::Ready(entry))
+                                            | Some(WtState::Retained { entry, .. })
+                                                if entry.worktree_path == expected_worktree_path =>
+                                            {
+                                                entry.custody = WtCustodyV1::Protected;
+                                                entry.protection = Some(protection.clone());
+                                                Ok(())
+                                            }
+                                            Some(_) => Err(BridgeError::agent_crashed(
+                                                "preparation flight map ownership changed before projection",
+                                            )),
+                                            None => Err(BridgeError::agent_crashed(
+                                                "committed preparation flight lost its map entry before projection",
+                                            )),
                                         }
-                                        _ => {}
                                     }
                                 }
+                            } else {
+                                Ok(())
+                            };
+                            match projection {
+                                Ok(()) => {
+                                    let settled = PreparationFlightStateV1::Settled {};
+                                    debug_assert!(preparation_state_is_terminal(&settled));
+                                    publish_preparation_state(
+                                        journal,
+                                        task_flight.clone(),
+                                        settled,
+                                        false,
+                                    )
+                                    .await
+                                    .map(|()| materialized)
+                                }
+                                Err(error) => Err(error),
                             }
-                            let settled = PreparationFlightStateV1::Settled {};
-                            debug_assert!(preparation_state_is_terminal(&settled));
-                            publish_preparation_state(journal, task_flight.clone(), settled, false)
-                                .await
-                                .map(|()| materialized)
                         }
                         Err(error) => {
                             let failed = if caller_departed_at_add_admission {
@@ -2841,13 +3058,25 @@ impl WorktreeBackend {
                     Err(error)
                 }
             };
+            let completion = if task_flight.has_durable_terminal() {
+                Ok(())
+            } else {
+                Err(result.as_ref().err().cloned().unwrap_or_else(|| {
+                    BridgeError::agent_crashed(
+                        "preparation flight completed without a durable terminal record",
+                    )
+                }))
+            };
+            task_owner.complete(completion.clone());
             let _ = result_tx.send(result);
-            let mut active = flights.lock().unwrap_or_else(|error| error.into_inner());
-            if active
-                .get(&session_key)
-                .is_some_and(|current| Arc::ptr_eq(current, &task_flight))
-            {
-                active.remove(&session_key);
+            if completion.is_ok() {
+                let mut active = flights.lock().unwrap_or_else(|error| error.into_inner());
+                if active
+                    .get(&session_key)
+                    .is_some_and(|current| Arc::ptr_eq(current, &task_owner))
+                {
+                    active.remove(&session_key);
+                }
             }
         }));
         let result = result_rx.await.map_err(|_| {
@@ -3226,6 +3455,21 @@ async fn wait_for_cleanup_report(mut report: CleanupReportReceiver) -> CleanupRe
                 )),
                 checkout: CheckoutCleanupDispositionV1::RemovalFailed,
             };
+        }
+    }
+}
+
+async fn wait_for_preparation_completion(
+    mut completion: watch::Receiver<Option<Result<(), BridgeError>>>,
+) -> Result<(), BridgeError> {
+    loop {
+        if let Some(result) = completion.borrow().clone() {
+            return result;
+        }
+        if completion.changed().await.is_err() {
+            return Err(BridgeError::agent_crashed(
+                "active preparation flight ended without a completion record",
+            ));
         }
     }
 }
@@ -3908,6 +4152,13 @@ impl AgentBackend for WorktreeBackend {
         let mut sessions: Vec<String> = self.map.lock().await.keys().cloned().collect();
         sessions.extend(
             self.cleanup_cells
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .keys()
+                .cloned(),
+        );
+        sessions.extend(
+            self.preparation_flights
                 .lock()
                 .unwrap_or_else(|error| error.into_inner())
                 .keys()
@@ -8845,10 +9096,12 @@ mod tests {
         hooks.pause_after_open.store(true, Ordering::SeqCst);
         let session = SessionId::parse("preparation-after-claim").unwrap();
         let configure_be = be.clone();
-        let configure =
-            tokio::spawn(
-                async move { configure_be.configure_bound_session(&session, &bound).await },
-            );
+        let configure_session = session.clone();
+        let configure = tokio::spawn(async move {
+            configure_be
+                .configure_bound_session(&configure_session, &bound)
+                .await
+        });
 
         hooks.wait_for_open().await;
         assert_eq!(
@@ -8886,10 +9139,12 @@ mod tests {
         let hooks = be.preparation_test_hooks.clone();
         let session = SessionId::parse("preparation-mid-add").unwrap();
         let configure_be = be.clone();
-        let configure =
-            tokio::spawn(
-                async move { configure_be.configure_bound_session(&session, &bound).await },
-            );
+        let configure_session = session.clone();
+        let configure = tokio::spawn(async move {
+            configure_be
+                .configure_bound_session(&configure_session, &bound)
+                .await
+        });
 
         provider.entered.notified().await;
         assert_eq!(record_state_of(&target).as_deref(), Some("materializing"));
@@ -8912,6 +9167,159 @@ mod tests {
         std::fs::remove_dir_all(tmp).unwrap();
     }
 
+    /// R2f1b 3d repair R1a: once the cancellation sample commits an in-progress add, cleanup
+    /// joins the runner instead of consuming the reservation while its custody cell is contended.
+    /// The assertion is a real preservation claim over the retained identities, not merely the
+    /// on-disk `LiveProtected` state.
+    #[tokio::test]
+    async fn canceled_committed_add_retains_exact_evidence_through_cleanup_projection() {
+        let tmp = unique_temp_dir("preparation-committed-add-projection");
+        let (be, rec, source, cfg, provider) = blocking_custody_fixture(&tmp);
+        let (bound, target) = bound_spec_v3(&source, &cfg);
+        let hooks = be.preparation_test_hooks.clone();
+        let session = SessionId::parse("preparation-committed-add-projection").unwrap();
+        let configure_be = be.clone();
+        let configure_session = session.clone();
+        let configure = tokio::spawn(async move {
+            configure_be
+                .configure_bound_session(&configure_session, &bound)
+                .await
+        });
+
+        provider.entered.notified().await;
+        configure.abort();
+        assert!(configure.await.unwrap_err().is_cancelled());
+        be.wait_for_cleanup_waiting_preparation().await;
+        let cleanup = be
+            .cleanup_flight_report(&session)
+            .expect("dropped configure starts a joinable cleanup flight");
+
+        provider.release.notify_one();
+        hooks.wait_for_terminal().await;
+        let report = tokio::time::timeout(Duration::from_secs(2), wait_for_cleanup_report(cleanup))
+            .await
+            .expect("cleanup must report after the committed add projects");
+        assert!(
+            report.is_ok(),
+            "cleanup must retain the projected protected entry"
+        );
+        assert_eq!(
+            be.preserve_checkout_v1(&session, CheckoutPreservationReasonV1::NodeFailure)
+                .await,
+            CheckoutPreservationV1::Preserved,
+            "the retained descriptor identities must mint a real preservation claim"
+        );
+        assert_eq!(
+            be.settle_workflow_checkout_v1(
+                &session,
+                WorkflowCheckoutOutcomeV1::NotHealthy(CheckoutPreservationReasonV1::NodeFailure),
+            )
+            .await,
+            CheckoutSettlementV1::Preserved,
+            "the workflow settlement must find the same retained exact identities"
+        );
+        assert_eq!(record_state_of(&target).as_deref(), Some("preserved"));
+        assert_eq!(rec.remove_count.load(Ordering::SeqCst), 0);
+        std::fs::remove_dir_all(tmp).unwrap();
+    }
+
+    /// R2f1b 3d repair R1b: the false sample has committed the runner even before
+    /// `WorktreeCustodianV1::enter`. Cleanup must not take that still-unmaterialized reservation.
+    #[tokio::test]
+    async fn canceled_committed_pre_enter_flight_keeps_its_reservation_for_projection() {
+        let (be, rec, tmp, source, cfg) = backend_fixture("preparation-pre-enter-projection");
+        let (bound, target) = bound_spec_v3(&source, &cfg);
+        let hooks = be.preparation_test_hooks.clone();
+        hooks
+            .pause_after_add_admission
+            .store(true, Ordering::SeqCst);
+        let session = SessionId::parse("preparation-pre-enter-projection").unwrap();
+        let configure_be = be.clone();
+        let configure_session = session.clone();
+        let configure = tokio::spawn(async move {
+            configure_be
+                .configure_bound_session(&configure_session, &bound)
+                .await
+        });
+
+        hooks.wait_for_add_admission().await;
+        configure.abort();
+        assert!(configure.await.unwrap_err().is_cancelled());
+        be.wait_for_cleanup_waiting_preparation().await;
+        let cleanup = be
+            .cleanup_flight_report(&session)
+            .expect("dropped configure starts a joinable cleanup flight");
+
+        hooks.release_after_add_admission.notify_one();
+        hooks.wait_for_terminal().await;
+        let report = tokio::time::timeout(Duration::from_secs(2), wait_for_cleanup_report(cleanup))
+            .await
+            .expect("cleanup must report after the pre-enter runner projects");
+        assert!(
+            report.is_ok(),
+            "cleanup must wait for the pre-enter committed runner to project the reservation"
+        );
+        assert_eq!(
+            be.settle_workflow_checkout_v1(
+                &session,
+                WorkflowCheckoutOutcomeV1::NotHealthy(CheckoutPreservationReasonV1::Cancellation),
+            )
+            .await,
+            CheckoutSettlementV1::Preserved,
+            "the runner must retain exact identities across the pre-enter cancellation window"
+        );
+        assert_eq!(record_state_of(&target).as_deref(), Some("preserved"));
+        assert_eq!(rec.remove_count.load(Ordering::SeqCst), 0);
+        std::fs::remove_dir_all(tmp).unwrap();
+    }
+
+    /// R2f1b 3d repair R2: a departed receiver cannot swallow a failed terminal journal write.
+    /// Cleanup observes the retained typed debt, and retirement reports it too.
+    #[tokio::test]
+    async fn departed_terminal_publication_failure_remains_backend_owned_and_loud() {
+        let (be, _rec, tmp, source, cfg) = backend_fixture("preparation-detached-terminal-debt");
+        let (bound, target) = bound_spec_v3(&source, &cfg);
+        let hooks = be.preparation_test_hooks.clone();
+        hooks.pause_after_add.store(true, Ordering::SeqCst);
+        let session = SessionId::parse("preparation-detached-terminal-debt").unwrap();
+        let configure_be = be.clone();
+        let configure_session = session.clone();
+        let configure = tokio::spawn(async move {
+            configure_be
+                .configure_bound_session(&configure_session, &bound)
+                .await
+        });
+
+        hooks.wait_for_add().await;
+        configure.abort();
+        assert!(configure.await.unwrap_err().is_cancelled());
+        be.wait_for_cleanup_waiting_preparation().await;
+        let cleanup = be
+            .cleanup_flight_report(&session)
+            .expect("dropped configure starts a joinable cleanup flight");
+        hooks
+            .fail_terminal_publication
+            .store(true, Ordering::SeqCst);
+        hooks.release_after_add.notify_one();
+
+        let report = tokio::time::timeout(Duration::from_secs(2), wait_for_cleanup_report(cleanup))
+            .await
+            .expect("cleanup must report the retained terminal-publication debt");
+        assert_eq!(report.result, Err(BridgeError::StoreFailure));
+        assert_eq!(
+            be.preparation_flight_debt_for_test(&session),
+            Some(BridgeError::StoreFailure),
+            "the active owner survives a departed one-shot receiver"
+        );
+        assert_eq!(
+            preparation_flight_state_of(&target).as_deref(),
+            Some("barrier_synced")
+        );
+        assert_eq!(record_state_of(&target).as_deref(), Some("live_protected"));
+        assert_eq!(be.retire().await, Err(BridgeError::StoreFailure));
+        std::fs::remove_dir_all(tmp).unwrap();
+    }
+
     /// M13 phase 4. The provider has materialized the target but the terminal evidence has not
     /// yet been published. A dropped observer cannot erase that truth or fabricate LiveProtected
     /// before descriptor evidence is captured.
@@ -8923,10 +9331,12 @@ mod tests {
         hooks.pause_after_add.store(true, Ordering::SeqCst);
         let session = SessionId::parse("preparation-after-add").unwrap();
         let configure_be = be.clone();
-        let configure =
-            tokio::spawn(
-                async move { configure_be.configure_bound_session(&session, &bound).await },
-            );
+        let configure_session = session.clone();
+        let configure = tokio::spawn(async move {
+            configure_be
+                .configure_bound_session(&configure_session, &bound)
+                .await
+        });
 
         hooks.wait_for_add().await;
         assert!(
