@@ -993,29 +993,32 @@ async fn transfer_preparation_flight(
 const TEST_GATE_RELEASE_BOUND: Duration = Duration::from_secs(30);
 
 /// Wait for a blocking test gate's release flag, bounded by [`TEST_GATE_RELEASE_BOUND`].
-/// Sticky record of a gate that blew its deadline, so a timeout can never be silent.
+/// Wait for a gate's release, bounded, recording a timeout on the OWNING hooks instance.
 ///
 /// Releasing the blocking thread is necessary — otherwise runtime drop hangs — but releasing it
 /// SILENTLY lets a test pass for the wrong reason. Concretely, in
 /// `terminal_replacement_serializes_exact_open_writers`, if the controller stalls past the bound
 /// the first writer publishes its terminal and drops its lease; the second writer then gets the
 /// expected `StoreFailure` because the record is already terminal, NOT because it contended — and
-/// every assertion still passes, with the serialization schedule never exercised. So the timeout
-/// is recorded here and asserted when the hooks drop.
+/// every assertion still passes, with the serialization schedule never exercised.
+///
+/// The record lives on the hooks instance, NOT in a process-global: tests run in parallel, each
+/// with its own hooks, so a global would let one test's timeout fail whichever test dropped first
+/// while the owning test passed — an attribution bug inside an attribution fix.
 #[cfg(test)]
-static TEST_GATE_TIMED_OUT: StdMutex<Option<String>> = StdMutex::new(None);
-
-#[cfg(test)]
-fn await_test_gate_release(released: &StdMutex<bool>, release: &Condvar, gate: &str) {
+fn await_test_gate_release(
+    timed_out: &StdMutex<Option<String>>,
+    released: &StdMutex<bool>,
+    release: &Condvar,
+    gate: &str,
+) {
     // ONE absolute deadline. Passing the full bound to each `wait_timeout` would restart the
     // clock on every spurious wakeup, so the "bound" could be extended indefinitely.
     let deadline = std::time::Instant::now() + TEST_GATE_RELEASE_BOUND;
     let mut held = released.lock().unwrap_or_else(|error| error.into_inner());
     while !*held {
         let Some(remaining) = deadline.checked_duration_since(std::time::Instant::now()) else {
-            *TEST_GATE_TIMED_OUT
-                .lock()
-                .unwrap_or_else(|error| error.into_inner()) = Some(gate.to_owned());
+            *timed_out.lock().unwrap_or_else(|error| error.into_inner()) = Some(gate.to_owned());
             eprintln!(
                 "test gate `{gate}` was never released within {TEST_GATE_RELEASE_BOUND:?} — \
                  releasing the blocking thread so the real failure can surface; the owning test \
@@ -1037,7 +1040,8 @@ impl Drop for PreparationFlightTestHooks {
         if std::thread::panicking() {
             return;
         }
-        let timed_out = TEST_GATE_TIMED_OUT
+        let timed_out = self
+            .timed_out_gate
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .take();
@@ -1053,6 +1057,8 @@ impl Drop for PreparationFlightTestHooks {
 #[cfg(test)]
 #[derive(Default)]
 struct PreparationFlightTestHooks {
+    /// Set when one of this instance's gates blew its deadline; asserted on drop.
+    timed_out_gate: StdMutex<Option<String>>,
     open_count: AtomicUsize,
     open: Notify,
     pause_after_open: AtomicBool,
@@ -1123,6 +1129,7 @@ impl PreparationFlightTestHooks {
                 .fetch_add(1, Ordering::SeqCst);
             self.initial_open_publish_entered.notify_waiters();
             await_test_gate_release(
+                &self.timed_out_gate,
                 &self.initial_open_publish_released,
                 &self.initial_open_publish_release,
                 "initial_open_publish",
@@ -1162,6 +1169,7 @@ impl PreparationFlightTestHooks {
                 .fetch_add(1, Ordering::SeqCst);
             self.control_root_pin_entered.notify_waiters();
             await_test_gate_release(
+                &self.timed_out_gate,
                 &self.control_root_pin_released,
                 &self.control_root_pin_release,
                 "control_root_pin",
@@ -1231,6 +1239,7 @@ impl PreparationFlightTestHooks {
                 .fetch_add(1, Ordering::SeqCst);
             self.custody_sync_entered.notify_waiters();
             await_test_gate_release(
+                &self.timed_out_gate,
                 &self.custody_sync_released,
                 &self.custody_sync_release,
                 "custody_sync",

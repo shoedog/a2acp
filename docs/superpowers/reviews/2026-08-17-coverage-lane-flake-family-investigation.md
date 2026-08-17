@@ -105,10 +105,14 @@ easily a plausible story here is wrong. Rather than "fix" a test on a guess:
 1. **Add a plain, non-instrumented `cargo test --workspace` step to CI.** This
    is the highest-value change and is independently justified: today a genuine
    test regression and an instrumentation artifact are indistinguishable,
-   because there is no uninstrumented control. If a class recurs on the plain
-   step too, it is a real test defect; if it only ever fails under `llvm-cov`,
-   that is evidence for — not confirmation of — the instrumented lane's resource
-   profile; correlation across two lanes does not establish causation.
+   because there is no uninstrumented control. Recurrence on the plain step
+   would establish only that instrumentation is not a NECESSARY condition — it
+   does not distinguish a test defect from a shared runner/process-limit,
+   filesystem, kernel, runtime, or production race, all of which fail both lanes
+   equally. Failing only under `llvm-cov` is likewise evidence for, not
+   confirmation of, the instrumented lane's resource profile. Either way the
+   captured failing assertion plus same-environment controls are required before
+   attributing a cause.
 2. **On the next occurrence, capture the log first**, then read the actual
    assertion. One real assertion is worth more than this whole document.
 3. Only then consider a targeted fix — e.g. bounding parallelism for the

@@ -51,7 +51,15 @@ fi
 WORK="$(mktemp -d)"
 readonly WORK
 cleanup() { rm -rf "${WORK}"; }
-trap cleanup EXIT INT TERM HUP
+# `cleanup` runs on EXIT only. A trapped signal does NOT inherently terminate bash: with cleanup
+# installed as the whole INT/TERM/HUP handler, signalling the script PID while the foreground cargo
+# child ran on to succeed would clean up, fall through, print the success banner and exit zero —
+# turning a cancellation into a false green. Each signal now exits with its conventional status,
+# and the EXIT trap still removes the workspace.
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+trap 'exit 129' HUP
 
 # Copy the workspace source, INCLUDING uncommitted changes (this is a pre-commit gate, so checking
 # only committed state would miss exactly the edit being gated). Exclude the build and VCS
@@ -66,9 +74,15 @@ tar -C "${REPO_ROOT}" \
 echo "==> cargo check ${PACKAGES[*]} --target ${TARGET} (-D warnings, ring stubbed, isolated)"
 # -D warnings matters: the class shows up as dead_code on non-unix as often as E0433, and CI's
 # Windows lane is warning-clean.
+#
+# RUSTFLAGS is SET, not appended to. Inheriting ambient flags let `RUSTFLAGS="--cap-lints allow"`
+# cap the appended deny straight back to allow, so a Windows-only dead_code warning — exactly the
+# class this gate advertises — would exit zero and print the success banner. CARGO_ENCODED_RUSTFLAGS
+# takes precedence over RUSTFLAGS when set, so it is cleared too.
 (
   cd "${WORK}"
-  RUSTFLAGS="${RUSTFLAGS:-} -D warnings" \
+  unset CARGO_ENCODED_RUSTFLAGS
+  RUSTFLAGS="-D warnings" \
   CARGO_TARGET_DIR="${WORK}/target" \
     cargo --config "patch.crates-io.ring.path='${WORK}/tools/ring-stub'" \
     check "${PACKAGES[@]}" --target "${TARGET}"
