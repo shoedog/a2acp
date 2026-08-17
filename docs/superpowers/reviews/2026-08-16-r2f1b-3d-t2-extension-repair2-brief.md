@@ -103,4 +103,59 @@ remain pushed: `435257ce` (`feat/r2f1b-3d-t2`), `f66016e0`
 
 - Dispatch 1: refused pre-clone by the task-spec gate (see above). No clone, no
   spawn, no cost.
-- Dispatch 2: running (`--strict-brief` passed; lsp warm-deps ok).
+- Dispatch 2 (`impl-91809-nf10irod`, base `f66016e0`): candidate `a84c8b57`,
+  107 changed lines, single file — inside the 150 soft cap.
+  **R1 delivered verbatim** (all three `create_dir_all`). **R2 production fix
+  delivered exactly as specified**: claims the terminal phase first and returns
+  doing nothing when the claim fails, `Arc::ptr_eq`-guarded removal, no durable
+  record, exit guard left disarmed. **T-A** exceeds the spec — it recreates the
+  root and proves the retry actually succeeds (`add_count == 1`), not merely
+  that admission stops refusing. **T-C** delivered.
+- **RUN WEDGED — verify hung ~3 h.** The `bridge_worktree` test binary sat at
+  **0.00 % CPU** in the toolchain container. Reproduced on the host and
+  root-caused to mechanism, not guessed:
+  - `transferred_owner_survives_failing_control_root_pin` (T-B) calls
+    `std::fs::remove_dir(&cfg.root)`. That call is **non-recursive** and the
+    control root is populated by then, so it returns
+    `ENOTEMPTY` (`code: 66, DirectoryNotEmpty`) — instrumented markers put the
+    panic at `backend.rs:12292`, before `release_control_root_pin()`.
+  - The panic unwinds, `Runtime` is dropped, and `BlockingPool::shutdown` waits
+    forever on the pin-hook thread parked in
+    `block_control_root_pin_for_test`'s condvar — only the never-reached
+    release could free it. Sampled stacks confirm all three parked tasks
+    (pin hook, runner `pinned_root`, transfer's detached `publish_terminal`).
+  - **A clean assertion failure therefore becomes an unbounded hang.** This is
+    why verify burned 3 h instead of reporting a red.
+  - Per-test classification on the host: **T-A PASS, T-C PASS, T-B HANG**.
+- **OPERATOR COMPLETION `85658e01`** (branch
+  `salvage/r2f1b-3d-t2-extension-repair2`, pushed) — mechanical, no design
+  content, per the 3a/3c1 repair-tail precedent:
+  1. T-B `remove_dir` → `remove_dir_all`, mechanism recorded at the call site.
+  2. **Restored `stalled_control_root_pin_is_observable_before_terminalization`**,
+     which the agent deleted by converting it into T-B. That deletion dropped
+     E2's positive proof — the stall-then-SUCCEEDS path asserting the durable
+     record reaches `Some("transferred")`. T-B's pin fails, so it asserts
+     `None`; it cannot cover that path. Fixture/session strings disambiguated
+     so the two cannot share a temp dir.
+  - **Red-first control on the restoration** (host, run-verified): mutating
+    `publish_terminal` to skip the durable write fails **only** the restored
+    test — `left: Some("open")` vs `right: Some("transferred")` — while the
+    other four control-root tests still pass. The restored coverage is real and
+    non-redundant.
+  - Operator delta: 70 changed lines on top of `a84c8b57`; combined round delta
+    stays inside the 250 hard cap.
+
+## Ledger items raised this round
+
+- **Test-harness hang amplifier (SMELL, recommend fixing next round).** Any
+  panic in a pin-hook-driven test before `release_control_root_pin()` converts
+  a clean failure into an unbounded process hang, because the hook's condvar
+  wait is unbounded and runtime drop joins the blocking pool. A bounded
+  `wait_timeout` in the `#[cfg(test)]` hook would convert every future instance
+  into a bounded red. Deliberately NOT folded into this round: it is not needed
+  for artifact correctness, it widens the delta the re-look must review, and
+  the re-look may have a view on the right shape.
+- **Commit-message hygiene**: the agent copied the spec's fenced commit message
+  literally, so `a84c8b57`'s subject begins with a ``` fence. Reword at landing.
+- **Verify has no effective timeout** for a hung test binary — 3 h elapsed with
+  no bound. Ops item.
