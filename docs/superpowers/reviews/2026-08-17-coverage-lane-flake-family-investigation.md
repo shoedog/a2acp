@@ -47,7 +47,7 @@ slower and add profraw writes, which widens every fork/exec window.
 This is a coherent shared mechanism, and it is consistent with all three
 observations — but see finding 3 before treating it as established.
 
-## Finding 3 — the tempting explanation is RULED OUT
+## Finding 3 — the tempting explanation is UNRESOLVED (corrected 2026-08-17)
 
 The passing job log carries, three times:
 
@@ -57,20 +57,29 @@ ERROR bridge_core::liveness: releasing an advisory lock failed;
   lease="authority-state.lock" error="Bad file descriptor (os error 9)"
 ```
 
-That diagnostic names fd-inheritance-across-fork, which is exactly class 1's
-subject, and it is very tempting to call it the root cause.
+That names fd-inheritance-across-fork, which is class 1's subject, and it is
+tempting to call it the root cause.
 
-**It is not.** Those lines appear in the run where every test PASSED. They are
-logged-only noise present on green runs, so they do not discriminate between
-pass and fail. Two further notes for whoever picks this up:
+**These messages are INJECTED BY TESTS. They are not evidence of anything in
+production.** `bin/a2a-bridge/src/compatibility_schedule_state.rs:60` calls
+`bridge_core::liveness::report_unlock_failure(label,
+std::io::Error::from_raw_os_error(libc::EBADF))` and then returns early,
+deliberately skipping the real `flock_unlock`. The
+`*_lock_release_failure_is_loud_not_silent` tests arm exactly that path, so the
+diagnostics are expected output on a green run.
 
-- The errno is `EBADF`, not `EWOULDBLOCK`. EBADF on release means the descriptor
-  was already invalid, which points at a lock lifecycle/ordering question rather
-  than at a child holding a duplicate — the message's own theory and its errno
-  disagree. Worth resolving on its own merits; it is a real (if currently
-  benign) inconsistency.
-- Rust's std sets `O_CLOEXEC` by default, so plain inheritance would only span
-  the fork→exec window, not outlive it.
+**Correction.** An earlier revision of this document used their presence on a
+green run to RULE OUT the inheritance mechanism, and read the `EBADF` errno as
+evidence of "a real descriptor lifecycle inconsistency" worth resolving. Both
+inferences were wrong: there is no real `EBADF` here, and expected, injected,
+non-discriminating output can neither rule a mechanism in nor out. The
+inheritance hypothesis is **unresolved**, not excluded.
+
+What still holds: Rust's std sets `O_CLOEXEC` by default, so plain inheritance
+would span only the fork→exec window.
+
+**Before attributing any future instance of this family, capture the failing
+assertion.** Log noise that a test deliberately emits is not a signal.
 
 ## Finding 4 — the specific failure's assertion is UNRECOVERABLE, and that is my error
 
@@ -98,7 +107,8 @@ easily a plausible story here is wrong. Rather than "fix" a test on a guess:
    test regression and an instrumentation artifact are indistinguishable,
    because there is no uninstrumented control. If a class recurs on the plain
    step too, it is a real test defect; if it only ever fails under `llvm-cov`,
-   the instrumented lane's resource profile is confirmed as the cause.
+   that is evidence for — not confirmation of — the instrumented lane's resource
+   profile; correlation across two lanes does not establish causation.
 2. **On the next occurrence, capture the log first**, then read the actual
    assertion. One real assertion is worth more than this whole document.
 3. Only then consider a targeted fix — e.g. bounding parallelism for the
@@ -110,6 +120,9 @@ destroy the signal before its cause is known.
 
 ## Status
 
-Investigation only — no code change. Findings 1, 3 and 4 are established;
-finding 2 is a live hypothesis. The family remains three ledgered classes, now
+Investigation only — no code change. Finding 1 (the lane has no uninstrumented
+control) is established by reading CI config. Finding 4 (the failing assertion
+was destroyed by a re-run) is established. Findings 2 and 3 are **live
+hypotheses, neither confirmed nor excluded** — the correction above retracts an
+earlier claim that finding 3's mechanism had been ruled out. The family remains three ledgered classes, now
 with a structural explanation for the lane and a named next probe.

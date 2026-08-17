@@ -993,20 +993,59 @@ async fn transfer_preparation_flight(
 const TEST_GATE_RELEASE_BOUND: Duration = Duration::from_secs(30);
 
 /// Wait for a blocking test gate's release flag, bounded by [`TEST_GATE_RELEASE_BOUND`].
+/// Sticky record of a gate that blew its deadline, so a timeout can never be silent.
+///
+/// Releasing the blocking thread is necessary — otherwise runtime drop hangs — but releasing it
+/// SILENTLY lets a test pass for the wrong reason. Concretely, in
+/// `terminal_replacement_serializes_exact_open_writers`, if the controller stalls past the bound
+/// the first writer publishes its terminal and drops its lease; the second writer then gets the
+/// expected `StoreFailure` because the record is already terminal, NOT because it contended — and
+/// every assertion still passes, with the serialization schedule never exercised. So the timeout
+/// is recorded here and asserted when the hooks drop.
+#[cfg(test)]
+static TEST_GATE_TIMED_OUT: StdMutex<Option<String>> = StdMutex::new(None);
+
 #[cfg(test)]
 fn await_test_gate_release(released: &StdMutex<bool>, release: &Condvar, gate: &str) {
+    // ONE absolute deadline. Passing the full bound to each `wait_timeout` would restart the
+    // clock on every spurious wakeup, so the "bound" could be extended indefinitely.
+    let deadline = std::time::Instant::now() + TEST_GATE_RELEASE_BOUND;
     let mut held = released.lock().unwrap_or_else(|error| error.into_inner());
     while !*held {
-        let (next, timeout) = release
-            .wait_timeout(held, TEST_GATE_RELEASE_BOUND)
-            .unwrap_or_else(|error| error.into_inner());
-        held = next;
-        if timeout.timed_out() && !*held {
+        let Some(remaining) = deadline.checked_duration_since(std::time::Instant::now()) else {
+            *TEST_GATE_TIMED_OUT
+                .lock()
+                .unwrap_or_else(|error| error.into_inner()) = Some(gate.to_owned());
             eprintln!(
                 "test gate `{gate}` was never released within {TEST_GATE_RELEASE_BOUND:?} — \
-                 proceeding so the real failure can surface instead of hanging the suite"
+                 releasing the blocking thread so the real failure can surface; the owning test \
+                 will fail on this record"
             );
             return;
+        };
+        let (next, _timeout) = release
+            .wait_timeout(held, remaining)
+            .unwrap_or_else(|error| error.into_inner());
+        held = next;
+    }
+}
+
+#[cfg(test)]
+impl Drop for PreparationFlightTestHooks {
+    fn drop(&mut self) {
+        // Never panic while already unwinding: the test's own failure is the better diagnostic.
+        if std::thread::panicking() {
+            return;
+        }
+        let timed_out = TEST_GATE_TIMED_OUT
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take();
+        if let Some(gate) = timed_out {
+            panic!(
+                "test gate `{gate}` blew its {TEST_GATE_RELEASE_BOUND:?} deadline; the gated \
+                 schedule was NOT exercised, so this test's result is not evidence"
+            );
         }
     }
 }
