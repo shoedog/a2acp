@@ -453,6 +453,13 @@ mod tests {
         let src = repo(&tmp);
         let canonical_worktree_root = tmp.join("worktrees");
         std::fs::create_dir(&canonical_worktree_root).unwrap();
+        // `std::env::temp_dir()` is itself symlinked on macOS (`/var` -> `/private/var`), so the
+        // root must be resolved before it can be called canonical. git always records the fully
+        // canonical path, so an unresolved fixture root makes this test compare
+        // `/var/...` against git's `/private/var/...` and fail for its own reasons — on the very
+        // platform whose symlinked temp dir this test exists to exercise. Linux `/tmp` is not
+        // symlinked, which is why the container lane never saw it.
+        let canonical_worktree_root = std::fs::canonicalize(&canonical_worktree_root).unwrap();
         #[cfg(unix)]
         let worktree_root = {
             let symlinked_root = tmp.join("worktrees-through-symlink");
