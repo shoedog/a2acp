@@ -490,3 +490,54 @@ silent extension.
   task spec gets copied literally, so the agent commits a bare ``` subject
   (`a84c8b57`, now `c336d9c7`). The repair spec states the subject line
   unfenced instead.
+
+### T3a repair 1 + the operator host controls that changed the picture
+
+- Repair 1 CONVERGED (`impl-45652-ewibypmp`, `87a03ed0`): verify PASS ×4,
+  internal review **APPROVE**, sidecar guards reused rather than reimplemented.
+  199 lines against the 200 cap.
+- **Out-of-scope rider caught and REVERTED (`5cbfddf2`).** The repair, scoped to
+  `sweep.rs`, also rewrote `observe_container_identity` in
+  `bridge-core/src/reaper.rs` — swapping drop-based `kill_on_drop` for an
+  explicit `child.kill().await` on timeout — to chase
+  `reaper::tests::production_timeout_kills_child_before_delayed_side_effect`
+  failing in container verify. That test PASSES on the host in both full-suite
+  runs this session. It is the process-spawn-under-load flake profile, and
+  because this instance is in the CONTAINER VERIFY lane rather than the coverage
+  lane, **the family is not coverage-specific** — a correction to the framing in
+  `reviews/2026-08-17-coverage-lane-flake-family-investigation.md`. The change may
+  still be a real fix (`kill_on_drop` signals without awaiting, so a delayed side
+  effect can race a dropped future); filed as its own follow-up rather than
+  landed as a silent rider.
+- **THE CONTAINER'S `verify: PASS ×4` DID NOT HOLD ON THE HOST.** Operator bench
+  at frozen `c336d9c7`: two of the four `exact_absence` tests FAIL, and one of
+  them HUNG the suite before the bounded-gate follow-up was cherry-picked in.
+  Applying that follow-up converted the hang into a clean 30 s diagnosable
+  failure — the fix earning its keep within the hour, and the reason both
+  defects below are legible at all.
+- **Finding 1 — WRONG, fails OPEN.** `host_git.rs:448`,
+  `left: BothAbsent / right: RegisteredButAbsent`.
+  `registration_absent_sync` compares `candidate.worktree_path` byte-for-byte
+  against the path git prints. Git prints its CANONICAL path; the candidate
+  carries its original spelling. Verified against the host toolchain (git
+  2.50.1): after `rm -rf` of the worktree dir, `git worktree list --porcelain`
+  still lists it as `prunable` at `/private/var/…` while the candidate holds
+  `/var/…`. Unmatched ⇒ "registration absent" ⇒ with an absent target ⇒
+  `BothAbsent` ⇒ **Authorized**. A fail-closed proof failing open. THIRD
+  instance of raw-vs-canonical path divergence in this lane (T2's control root
+  was the second). The container cannot see it: Linux has no `/var`→`/private/var`
+  indirection, so the textual compare happens to match there.
+- **Finding 2 — WRONG.** `backend.rs:11971`,
+  `left: Authorized / right: Refused(CannotProve)` — a recovery-owned candidate
+  is authorized. This is precisely the coupling that made T3 depend on T2, and
+  it is the finding attempt 1's internal review raised; it was NOT actually
+  fixed. Before the bounded gate it presented as a hang, not a failure.
+- **DISCLOSED CAP EXTENSION (one line, per the discipline): T3a's declared
+  "one pre-closure repair" is extended by ONE second pre-closure repair.**
+  Classification: these are GATE failures surfaced by controls that did not
+  exist when the cap was declared, not review findings from a counted round;
+  both are closed, enumerable and non-repeating; and sending a
+  not-host-green artifact into the counted Sol closure would waste the counted
+  round. A non-converging result parks T3a and escalates.
+- Repair 2 dispatched on frozen `5cbfddf2` (caps 300 lines) for both findings,
+  with the container-verify-is-not-sufficient warning stated in the spec.
