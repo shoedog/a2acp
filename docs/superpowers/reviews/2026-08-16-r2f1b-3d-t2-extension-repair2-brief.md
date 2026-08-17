@@ -145,6 +145,20 @@ remain pushed: `435257ce` (`feat/r2f1b-3d-t2`), `f66016e0`
   - Operator delta: 70 changed lines on top of `a84c8b57`; combined round delta
     stays inside the 250 hard cap.
 
+- **GATES GREEN on exact `85658e01`** (host, unloaded):
+  `cargo fmt --all -- --check` clean; `cargo clippy --workspace --all-targets
+  -- -D warnings` clean; full workspace suite
+  **4,139 passed / 0 failed / 13 ignored across 90 targets**
+  (`--no-fail-fast`, exit 0). Progression: `435257ce` 4,131/0/13 →
+  `f66016e0` 4,133/**3**/13 → `85658e01` **4,139/0/13**. Count reconciles
+  exactly: 4,136 tests at `f66016e0`, agent converted the stall test into T-B
+  (net 0) and added T-A + T-C (+2), operator restored the stall test (+1) =
+  4,139. The whole-bin parallel flake did not recur.
+- **Review scope**: the last REVIEWED state is `435257ce` (the re-look that
+  produced E1/E2/E3). `f66016e0` was parked before any review, so the counted
+  re-look must cover `435257ce..85658e01` — 900 changed lines across
+  `backend.rs`, `fs_custody.rs`, and the handoff — not merely the repair delta.
+
 ## Ledger items raised this round
 
 - **Test-harness hang amplifier (SMELL, recommend fixing next round).** Any
