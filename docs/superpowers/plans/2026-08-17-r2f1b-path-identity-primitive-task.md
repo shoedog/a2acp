@@ -93,9 +93,18 @@ you place it elsewhere, justify it.
 
 **`bridge-core` compiles for Windows in CI** (via `bridge-store`), and
 `liveness` / `namespace_transaction` are `#[cfg(unix)]` while `fs_custody` is
-not. This lane has lost five landing rounds to exactly that boundary. Run
-`tools/check-nonunix.sh` — it takes ~3 s — and keep the primitive either
-portable or correctly gated.
+not. This lane has lost five landing rounds to exactly that boundary, and
+**there is no local gate for it** — one was attempted and withdrawn
+(`plans/2026-08-17-nonunix-gate-hermetic-task.md`). So you must reason about it
+rather than test it:
+
+- Do not reference `crate::liveness` or `crate::namespace_transaction` from
+  `fs_custody` without a `#[cfg(unix)]` guard on the referencing item.
+- Anything that becomes unused on non-unix needs
+  `#[cfg_attr(not(unix), allow(dead_code))]` — the lane is warning-clean under
+  `-D warnings`, so a non-unix `dead_code` fails it just as hard as `E0433`.
+- The established fix shape is commit `790b4191`. Follow it.
+- State in your handoff which items you gated and why.
 
 ## Callers to migrate
 
@@ -164,7 +173,8 @@ deviation rather than forcing this shape.
    unchanged.
 6. No production behavior outside the named callers changes.
 7. `cargo fmt --all -- --check` clean; `cargo clippy --workspace --all-targets
-   -- -D warnings` clean; workspace suite green; `tools/check-nonunix.sh` passes.
+   -- -D warnings` clean; workspace suite green. The non-unix lane has no local
+   gate — see the cfg guidance above and state what you gated.
 8. `git diff --numstat <base>..HEAD` at most **700** changed lines, reported and
    reconciled in the handoff.
 9. The handoff states, per test, whether it was executed, and names the
