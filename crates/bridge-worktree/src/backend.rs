@@ -12243,6 +12243,71 @@ mod tests {
         std::fs::remove_dir_all(tmp).unwrap();
     }
 
+    /// E2 positive proof: a STALLED (not failing) control-root pin is observable, and when the
+    /// pin then SUCCEEDS the transfer publishes its durable `transferred` terminal. The failing-pin
+    /// sibling below cannot cover this: with no root there is no record to write.
+    #[tokio::test]
+    async fn stalled_control_root_pin_is_observable_before_terminalization() {
+        let (be, rec, tmp, source, cfg) =
+            backend_fixture("preparation-stalled-control-root-success");
+        let (bound, target) = bound_spec_v3(&source, &cfg);
+        let clock = Arc::new(ManualPreparationClock::new(0));
+        be.arm_preparation_bound_for_test(PreparationClockV1::new(clock.clone()));
+        let hooks = be.preparation_test_hooks.clone();
+        hooks.arm_nonreturning_control_root_pin();
+        let session = SessionId::parse("preparation-stalled-control-root-success").unwrap();
+        let configure_be = be.clone();
+        let configure_session = session.clone();
+        let configure = tokio::spawn(async move {
+            configure_be
+                .configure_bound_session(&configure_session, &bound)
+                .await
+        });
+
+        hooks.wait_for_control_root_pin().await;
+        let exact_flight = be
+            .preparation_guard_for_test(&session)
+            .expect("the stalled root pin has an active exact owner");
+        clock.set(PREPARATION_CONTROL_BOUND_MS);
+        let observer_be = be.clone();
+        let observer_session = session.clone();
+        let observer = tokio::spawn(async move {
+            observer_be
+                .observe_preparation_bound_for_test(&observer_session)
+                .await
+        });
+        for _ in 0..8 {
+            if exact_flight.phase() == PreparationPublicationPhaseV1::TransferPublishing {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            exact_flight.phase(),
+            PreparationPublicationPhaseV1::TransferPublishing,
+            "the observer claims before root pinning can publish"
+        );
+        assert!(observer.await.unwrap());
+        assert!(matches!(
+            configure.await.unwrap(),
+            Err(BridgeError::ConfigInvalid { .. })
+        ));
+        hooks.release_control_root_pin();
+        hooks.wait_for_terminal().await;
+        let recovery = be
+            .transferred_preparation_for_test(&session)
+            .expect("transfer retains the owner that was visible during root pinning");
+        assert!(Arc::ptr_eq(&exact_flight, &recovery.owner.flight));
+        be.join_transferred_preparation_runner_for_test(&session)
+            .await;
+        assert_eq!(
+            preparation_flight_state_of(&target).as_deref(),
+            Some("transferred")
+        );
+        assert_eq!(rec.add_count.load(Ordering::SeqCst), 0);
+        std::fs::remove_dir_all(tmp).unwrap();
+    }
+
     #[tokio::test]
     async fn transferred_owner_survives_failing_control_root_pin() {
         let (be, rec, tmp, source, cfg) = backend_fixture("preparation-stalled-control-root");
@@ -12288,7 +12353,11 @@ mod tests {
             configure.await.unwrap(),
             Err(BridgeError::ConfigInvalid { .. })
         ));
-        std::fs::remove_dir(&cfg.root).unwrap();
+        // `remove_dir` is non-recursive: by this point the transfer has populated the control
+        // root, so it returns ENOTEMPTY. The resulting panic unwinds before
+        // `release_control_root_pin` below, leaving the pin hook parked forever and turning a
+        // clean assertion failure into an unbounded hang at runtime drop.
+        std::fs::remove_dir_all(&cfg.root).unwrap();
         hooks.release_control_root_pin();
         let recovery = be
             .transferred_preparation_for_test(&session)
