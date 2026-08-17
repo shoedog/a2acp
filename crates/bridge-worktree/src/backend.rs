@@ -3779,16 +3779,21 @@ impl WorktreeBackend {
                     runner_exit_guard.complete();
                     return;
                 }
-                task_owner
-                    .complete_with_result(Err(error.clone()), Err(error))
-                    .await;
-                let mut active = flights.lock().unwrap_or_else(|error| error.into_inner());
-                if active
-                    .get(&session_key)
-                    .is_some_and(|current| Arc::ptr_eq(current, &task_owner))
+                // Release the reservation BEFORE publishing the caller's result. Publishing
+                // first lets the caller resume and retry the same session while this entry is
+                // still present, so the admission check refuses it `AgentOverloaded` for a
+                // flight that wrote no record and admitted no effect.
+                task_owner.complete(Err(error.clone()));
                 {
-                    active.remove(&session_key);
+                    let mut active = flights.lock().unwrap_or_else(|error| error.into_inner());
+                    if active
+                        .get(&session_key)
+                        .is_some_and(|current| Arc::ptr_eq(current, &task_owner))
+                    {
+                        active.remove(&session_key);
+                    }
                 }
+                task_owner.send_result(Err(error)).await;
                 runner_exit_guard.complete();
                 return;
             }
@@ -12241,6 +12246,48 @@ mod tests {
             .unwrap();
         assert_eq!(rec.add_count.load(Ordering::SeqCst), 1);
         std::fs::remove_dir_all(tmp).unwrap();
+    }
+
+    /// Re-look-2 finding 2: the reservation must be released BEFORE the caller's result is
+    /// published. Otherwise a caller that retries the instant `configure_bound_session` returns
+    /// reaches the admission check while the entry is still present and is refused
+    /// `AgentOverloaded` — for a flight that wrote no record and admitted no effect.
+    ///
+    /// The post-result pause makes that window explicit rather than timing-dependent: the runner
+    /// parks inside `send_result` immediately after handing the caller its result, which is
+    /// exactly the state a retrying caller observes.
+    #[tokio::test]
+    async fn failing_control_root_pin_releases_before_publishing_its_result() {
+        let (be, _rec, tmp, source, cfg) = backend_fixture("preparation-failing-root-result-order");
+        let (bound, _target) = bound_spec_v3(&source, &cfg);
+        let hooks = be.preparation_test_hooks.clone();
+        hooks.arm_nonreturning_control_root_pin();
+        hooks
+            .pause_after_result_publication
+            .store(true, Ordering::SeqCst);
+        let session = SessionId::parse("preparation-failing-root-result-order").unwrap();
+        let configure_be = be.clone();
+        let configure_session = session.clone();
+        let configure = tokio::spawn(async move {
+            configure_be
+                .configure_bound_session(&configure_session, &bound)
+                .await
+        });
+
+        hooks.wait_for_control_root_pin().await;
+        std::fs::remove_dir_all(&cfg.root).unwrap();
+        hooks.release_control_root_pin();
+
+        assert!(matches!(
+            configure.await.unwrap(),
+            Err(BridgeError::StoreFailure)
+        ));
+        assert!(
+            be.preparation_guard_for_test(&session).is_none(),
+            "the reservation must already be released when the caller observes its result"
+        );
+        hooks.release_after_result_publication.notify_one();
+        std::fs::remove_dir_all(tmp).ok();
     }
 
     /// E2 positive proof: a STALLED (not failing) control-root pin is observable, and when the
