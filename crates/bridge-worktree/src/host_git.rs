@@ -3,12 +3,12 @@ use crate::provider::{
     add_argv, is_repo_argv, list_porcelain_argv, prune_argv, remove_argv, CustodyAddFailureV1,
     CustodyAddOutcomeV1, CustodyAddTargetV1, WorktreeProvider,
 };
+use crate::sweep::{
+    compare_path_identities, ExactAbsenceCandidateV1, ExactAbsenceObservationV1,
+    ExactAbsenceProbeV1, PathIdentityComparisonV1,
+};
 #[cfg(test)]
 use crate::sweep::{decide_unused_candidate, UnusedCandidateDecisionV1, UnusedCandidateRefusalV1};
-use crate::sweep::{
-    paths_resolve_to_same_identity, ExactAbsenceCandidateV1, ExactAbsenceObservationV1,
-    ExactAbsenceProbeV1,
-};
 use bridge_core::error::BridgeError;
 use std::path::Path;
 use std::process::{Command as StdCommand, Output};
@@ -129,9 +129,11 @@ fn removal_is_complete(
 }
 
 fn registration_absent_from_porcelain(output: &[u8], wt: &str) -> Result<bool, BridgeError> {
-    // Resolve the candidate even when Git has no worktree records. A malformed candidate is not
-    // evidence of absence, and `paths_resolve_to_same_identity` intentionally refuses it.
-    paths_resolve_to_same_identity(wt, wt)?;
+    if compare_path_identities(wt, wt) != PathIdentityComparisonV1::Same {
+        return Err(BridgeError::ConfigInvalid {
+            reason: "worktree path has no provable identity".to_string(),
+        });
+    }
     for field in output.split(|byte| *byte == 0) {
         let Some(path) = field.strip_prefix(b"worktree ") else {
             continue;
@@ -139,8 +141,11 @@ fn registration_absent_from_porcelain(output: &[u8], wt: &str) -> Result<bool, B
         let path = std::str::from_utf8(path).map_err(|_| BridgeError::ConfigInvalid {
             reason: "worktree registration path is not valid UTF-8".to_string(),
         })?;
-        if paths_resolve_to_same_identity(path, wt)? {
-            return Ok(false);
+        match compare_path_identities(path, wt) {
+            PathIdentityComparisonV1::Different => {}
+            PathIdentityComparisonV1::Same | PathIdentityComparisonV1::CannotProve => {
+                return Ok(false)
+            }
         }
     }
     Ok(true)
@@ -177,6 +182,7 @@ impl ExactAbsenceProbeV1 for HostGitWorktree {
         &self,
         candidate: &ExactAbsenceCandidateV1,
     ) -> Result<ExactAbsenceObservationV1, BridgeError> {
+        candidate.revalidate_source()?;
         if !target_absent_from_probe(Path::new(&candidate.worktree_path))? {
             return Ok(ExactAbsenceObservationV1::TargetPresent);
         }
@@ -422,6 +428,90 @@ mod tests {
         assert!(!registration_absent_from_porcelain(output, "/managed/wt").unwrap());
         assert!(registration_absent_from_porcelain(output, "/managed/other").unwrap());
         assert!(registration_absent_from_porcelain(output, "/managed/w").unwrap());
+
+        let tmp = unique_temp_dir("porcelain-path-identity");
+        let managed = tmp.join("managed");
+        let unrelated = tmp.join("unrelated");
+        std::fs::create_dir_all(&managed).unwrap();
+        for (registered, candidate, absent) in [
+            (managed.join("WT"), managed.join("wt"), false),
+            (
+                managed.join("résumé"),
+                managed.join("re\u{301}sume\u{301}"),
+                false,
+            ),
+            (managed.join("wt"), unrelated.join("wt"), true),
+        ] {
+            let output = [
+                b"worktree ".as_slice(),
+                registered.to_string_lossy().as_bytes(),
+                b"\0HEAD def\0locked reason\0\0",
+            ]
+            .concat();
+            assert_eq!(
+                registration_absent_from_porcelain(&output, &candidate.to_string_lossy()).unwrap(),
+                absent,
+                "only a proven different ancestor may skip a registration"
+            );
+        }
+        std::fs::remove_dir_all(tmp).unwrap();
+    }
+
+    #[test]
+    fn source_replacement_refuses_before_a_replacement_repository_can_be_queried() {
+        let tmp = unique_temp_dir("exact-absence-source-replacement");
+        let source = repo(&tmp);
+        let replacement = tmp.join("replacement");
+        std::fs::create_dir_all(&replacement).unwrap();
+        git(&replacement, &["init", "-q"]);
+        let candidate = ExactAbsenceCandidateV1::new(
+            source.to_string_lossy(),
+            tmp.join("absent").to_string_lossy(),
+        )
+        .unwrap();
+        std::fs::rename(&source, tmp.join("original-source")).unwrap();
+        std::fs::rename(&replacement, &source).unwrap();
+        assert_eq!(
+            decide_unused_candidate(&candidate, false, &HostGitWorktree::new()),
+            UnusedCandidateDecisionV1::Refused(UnusedCandidateRefusalV1::CannotProve),
+            "a replacement repository with no registration cannot authorize the captured source"
+        );
+        std::fs::remove_dir_all(tmp).unwrap();
+    }
+
+    #[test]
+    fn legacy_source_from_another_repository_refuses() {
+        let tmp = unique_temp_dir("exact-absence-wrong-repository");
+        let source_a = repo(&tmp);
+        let source_b = tmp.join("other");
+        std::fs::create_dir_all(&source_b).unwrap();
+        git(&source_b, &["init", "-q"]);
+        let target = tmp.join("absent");
+        git(
+            &source_a,
+            &[
+                "worktree",
+                "add",
+                "--detach",
+                target.to_str().unwrap(),
+                "HEAD",
+            ],
+        );
+        std::fs::remove_dir_all(&target).unwrap();
+        let decision = ExactAbsenceCandidateV1::from_legacy(
+            source_b.to_string_lossy(),
+            source_a.join(".git").to_string_lossy(),
+            target.to_string_lossy(),
+        )
+        .map(|candidate| decide_unused_candidate(&candidate, false, &HostGitWorktree::new()))
+        .unwrap_or(UnusedCandidateDecisionV1::Refused(
+            UnusedCandidateRefusalV1::CannotProve,
+        ));
+        assert_eq!(
+            decision,
+            UnusedCandidateDecisionV1::Refused(UnusedCandidateRefusalV1::CannotProve)
+        );
+        std::fs::remove_dir_all(tmp).unwrap();
     }
 
     #[test]
@@ -438,10 +528,9 @@ mod tests {
 
         let tmp = unique_temp_dir("unresolvable-exact-absence");
         let src = repo(&tmp);
-        let candidate = ExactAbsenceCandidateV1::new(src.to_string_lossy(), "relative-target");
-        assert_eq!(
-            decide_unused_candidate(&candidate, false, &HostGitWorktree::new()),
-            UnusedCandidateDecisionV1::Refused(UnusedCandidateRefusalV1::CannotProve)
+        assert!(
+            ExactAbsenceCandidateV1::new(src.to_string_lossy(), "relative-target").is_err(),
+            "a relative target cannot construct an exact-absence candidate"
         );
         std::fs::remove_dir_all(tmp).unwrap();
     }
@@ -471,7 +560,7 @@ mod tests {
         let target = worktree_root.join("target");
         let canonical_target = canonical_worktree_root.join("target");
         let candidate =
-            ExactAbsenceCandidateV1::new(src.to_string_lossy(), target.to_string_lossy());
+            ExactAbsenceCandidateV1::new(src.to_string_lossy(), target.to_string_lossy()).unwrap();
         let provider = HostGitWorktree::new();
 
         assert_eq!(

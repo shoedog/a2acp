@@ -5,14 +5,18 @@ use crate::custody::{
 use crate::provider::{prune_argv, remove_argv};
 use crate::provider_path::{canonicalize_lenient, read_sidecar, sidecar_path};
 use bridge_core::error::BridgeError;
-use bridge_core::fs_custody::PinnedDirectoryV1;
+use bridge_core::execution_policy::WorktreeObjectIdentityV1;
 #[cfg(unix)]
-use bridge_core::fs_custody::{BirthTimeV1, DirectoryIdentityV1};
+use bridge_core::fs_custody::BirthTimeV1;
+use bridge_core::fs_custody::{
+    verify_payload_directory_identity, DirectoryIdentityV1, PinnedDirectoryV1,
+};
 use bridge_core::liveness::LeaseProbe;
 use bridge_core::run_identity::{classify, Verdict};
 use bridge_core::SessionCwd;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 /// The source and target a recovery-side unused-marker decision is about.
 ///
@@ -22,83 +26,186 @@ use std::path::{Path, PathBuf};
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ExactAbsenceCandidateV1 {
     pub canonical_source: String,
+    source_identity: DirectoryIdentityV1,
     pub worktree_path: String,
 }
 
 impl ExactAbsenceCandidateV1 {
-    #[must_use]
-    pub fn new(canonical_source: impl Into<String>, worktree_path: impl Into<String>) -> Self {
-        Self {
-            canonical_source: canonical_source.into(),
-            worktree_path: worktree_path.into(),
+    pub fn new(source: impl AsRef<str>, worktree: impl AsRef<str>) -> Result<Self, BridgeError> {
+        Self::from_bound_source(
+            capture_directory_identity(Path::new(source.as_ref()), "source")?,
+            worktree.as_ref(),
+        )
+    }
+
+    pub fn from_legacy(
+        source: impl AsRef<str>,
+        common_dir: impl AsRef<str>,
+        worktree: impl AsRef<str>,
+    ) -> Result<Self, BridgeError> {
+        let source = capture_directory_identity(Path::new(source.as_ref()), "source")?;
+        let common_dir =
+            capture_directory_identity(Path::new(common_dir.as_ref()), "source common directory")?;
+        if !common_dir.matches(&source_common_dir_identity(&source.canonical_path)?) {
+            return Err(invalid("source does not own the recorded common directory"));
+        }
+        Self::from_bound_source(source, worktree.as_ref())
+    }
+
+    pub fn from_claim(
+        source: &WorktreeObjectIdentityV1,
+        _common_dir: &WorktreeObjectIdentityV1,
+        worktree: &WorktreeObjectIdentityV1,
+    ) -> Result<Self, BridgeError> {
+        if source.canonical_path != source.directory_identity.canonical_path {
+            return Err(invalid("claim source path and identity disagree"));
+        }
+        let observed = capture_directory_identity(Path::new(&source.canonical_path), "source")?;
+        if !source.directory_identity.matches(&observed) {
+            return Err(invalid("claim source identity no longer matches its path"));
+        }
+        Self::from_bound_source(source.directory_identity.clone(), &worktree.canonical_path)
+    }
+
+    fn from_bound_source(
+        source_identity: DirectoryIdentityV1,
+        worktree: &str,
+    ) -> Result<Self, BridgeError> {
+        let worktree = PathBuf::from(worktree);
+        if !worktree.is_absolute() {
+            return Err(invalid("worktree path has no absolute identity"));
+        }
+        if source_identity.dev.is_none() || source_identity.ino.is_none() {
+            return Err(invalid("source has no bound object identity"));
+        }
+        Ok(Self {
+            canonical_source: source_identity.canonical_path.clone(),
+            source_identity,
+            worktree_path: worktree.to_string_lossy().into_owned(),
+        })
+    }
+
+    pub(crate) fn revalidate_source(&self) -> Result<(), BridgeError> {
+        if self.source_identity.matches(&capture_directory_identity(
+            Path::new(&self.canonical_source),
+            "source",
+        )?) {
+            Ok(())
+        } else {
+            Err(invalid("exact-absence source identity changed"))
         }
     }
 }
+fn invalid(reason: impl Into<String>) -> BridgeError {
+    BridgeError::ConfigInvalid {
+        reason: reason.into(),
+    }
+}
 
-/// Compare two absolute paths by the identity of their resolved existing ancestor and missing
-/// tail, never by their original spelling.
-///
-/// Exact-absence decisions routinely inspect targets that are already absent, so ordinary
-/// `canonicalize` is insufficient: it would reject the intended missing final component. We
-/// resolve the nearest existing ancestor and append the missing tail. Any non-`NotFound` probe
-/// failure, invalid relative spelling, or missing ancestor traversal that cannot be represented
-/// is a failure to prove identity and must remain a refusal at the caller.
-pub(crate) fn paths_resolve_to_same_identity(left: &str, right: &str) -> Result<bool, BridgeError> {
-    fn resolve(path: &str) -> Result<PathBuf, BridgeError> {
+fn capture_directory_identity(path: &Path, kind: &str) -> Result<DirectoryIdentityV1, BridgeError> {
+    if !path.is_absolute() {
+        return Err(invalid(format!("{kind} path has no absolute identity")));
+    }
+    let canonical = std::fs::canonicalize(path)
+        .map_err(|error| invalid(format!("{kind} identity probe failed: {error}")))?;
+    let identity = verify_payload_directory_identity(&canonical)
+        .map_err(|refusal| invalid(format!("{kind} identity probe failed: {refusal:?}")))?;
+    if identity.dev.is_none() || identity.ino.is_none() {
+        return Err(invalid(format!("{kind} has no bound object identity")));
+    }
+    Ok(identity)
+}
+
+fn source_common_dir_identity(source: &str) -> Result<DirectoryIdentityV1, BridgeError> {
+    let output = Command::new("git")
+        .args(["-C", source, "rev-parse", "--git-common-dir"])
+        .output()
+        .map_err(|error| invalid(format!("source authority probe failed: {error}")))?;
+    if !output.status.success() {
+        return Err(invalid(
+            "source authority probe did not identify a Git common directory",
+        ));
+    }
+    let common_dir = std::str::from_utf8(&output.stdout)
+        .map_err(|_| invalid("source authority probe returned a non-UTF-8 common directory"))?
+        .trim();
+    if common_dir.is_empty() {
+        return Err(invalid(
+            "source authority probe returned an empty common directory",
+        ));
+    }
+    capture_directory_identity(
+        &Path::new(source).join(common_dir),
+        "source common directory",
+    )
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PathIdentityComparisonV1 {
+    Same,
+    Different,
+    CannotProve,
+}
+
+pub(crate) fn compare_path_identities(left: &str, right: &str) -> PathIdentityComparisonV1 {
+    struct ResolvedPathV1 {
+        ancestor: DirectoryIdentityV1,
+        missing_tail: Vec<std::ffi::OsString>,
+    }
+
+    fn resolve(path: &str) -> Option<ResolvedPathV1> {
         let mut current = PathBuf::from(path);
         if !current.is_absolute() {
-            return Err(BridgeError::ConfigInvalid {
-                reason: "worktree path has no absolute identity".to_string(),
-            });
+            return None;
         }
 
         let mut missing_tail = Vec::new();
         loop {
             match std::fs::canonicalize(&current) {
-                Ok(mut resolved) => {
-                    for component in missing_tail.iter().rev() {
-                        resolved.push(component);
+                Ok(resolved) => {
+                    let ancestor = verify_payload_directory_identity(&resolved).ok()?;
+                    if ancestor.dev.is_none() || ancestor.ino.is_none() {
+                        return None;
                     }
-                    return Ok(resolved);
+                    return Some(ResolvedPathV1 {
+                        ancestor,
+                        missing_tail,
+                    });
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                     match current.symlink_metadata() {
-                        Ok(_) => {
-                            return Err(BridgeError::ConfigInvalid {
-                                reason: "worktree path has no resolvable identity".to_string(),
-                            })
-                        }
+                        Ok(_) => return None,
                         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                        Err(error) => {
-                            return Err(BridgeError::ConfigInvalid {
-                                reason: format!("worktree path identity probe failed: {error}"),
-                            })
-                        }
+                        Err(_) => return None,
                     }
-                    let component =
-                        current
-                            .file_name()
-                            .ok_or_else(|| BridgeError::ConfigInvalid {
-                                reason: "worktree path has no resolvable identity".to_string(),
-                            })?;
+                    let component = current.file_name()?;
                     missing_tail.push(component.to_os_string());
-                    current = current.parent().map(Path::to_path_buf).ok_or_else(|| {
-                        BridgeError::ConfigInvalid {
-                            reason: "worktree path has no resolvable identity".to_string(),
-                        }
-                    })?;
+                    current = current.parent().map(Path::to_path_buf)?;
                 }
-                Err(error) => {
-                    return Err(BridgeError::ConfigInvalid {
-                        reason: format!("worktree path identity probe failed: {error}"),
-                    });
-                }
+                Err(_) => return None,
             }
         }
     }
 
-    Ok(resolve(left)? == resolve(right)?)
+    let (Some(left), Some(right)) = (resolve(left), resolve(right)) else {
+        return PathIdentityComparisonV1::CannotProve;
+    };
+    let same_ancestor = left.ancestor.dev == right.ancestor.dev
+        && left.ancestor.ino == right.ancestor.ino
+        && match (left.ancestor.btime, right.ancestor.btime) {
+            (Some(left), Some(right)) => left == right,
+            _ => true,
+        };
+    if !same_ancestor {
+        return PathIdentityComparisonV1::Different;
+    }
+    if left.missing_tail == right.missing_tail {
+        PathIdentityComparisonV1::Same
+    } else {
+        PathIdentityComparisonV1::CannotProve
+    }
 }
+
 /// The three successful observations a synchronous host recovery capability can return.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ExactAbsenceObservationV1 {
@@ -533,10 +640,43 @@ fn decide_unused_legacy_sidecar(
         return UnusedCandidateDecisionV1::Refused(UnusedCandidateRefusalV1::CannotProve);
     }
 
-    let marker = ExactAbsenceCandidateV1::new(
+    let Ok(marker) = ExactAbsenceCandidateV1::from_legacy(
         sidecar.canonical_source.as_str(),
+        sidecar.common_dir.as_str(),
         sidecar.worktree_path.as_str(),
-    );
+    ) else {
+        return UnusedCandidateDecisionV1::Refused(UnusedCandidateRefusalV1::CannotProve);
+    };
+    decide_unused_marker(&marker, exact_absence_probe)
+}
+
+fn custody_record_file_names_worktree(record_file: &str, worktree_path: &str) -> bool {
+    matches!(
+        (std::fs::canonicalize(record_file), std::fs::canonicalize(custody_record_path(worktree_path))),
+        (Ok(record_file), Ok(expected)) if record_file == expected
+    )
+}
+
+fn decide_unused_custody_record(
+    root: &SessionCwd,
+    record_file: &str,
+    record: &WorktreeCustodyRecordV1,
+    exact_absence_probe: &dyn ExactAbsenceProbeV1,
+) -> UnusedCandidateDecisionV1 {
+    let worktree_path = record.worktree.canonical_path.as_str();
+    if !custody_record_file_names_worktree(record_file, worktree_path)
+        || !worktree_under_root(root, worktree_path)
+    {
+        return UnusedCandidateDecisionV1::Refused(UnusedCandidateRefusalV1::CannotProve);
+    }
+    let Some(claim) = record.claim.as_ref() else {
+        return UnusedCandidateDecisionV1::Refused(UnusedCandidateRefusalV1::CannotProve);
+    };
+    let Ok(marker) =
+        ExactAbsenceCandidateV1::from_claim(&claim.source, &claim.common_dir, &claim.worktree)
+    else {
+        return UnusedCandidateDecisionV1::Refused(UnusedCandidateRefusalV1::CannotProve);
+    };
     decide_unused_marker(&marker, exact_absence_probe)
 }
 
@@ -561,17 +701,17 @@ pub fn sweep_orphans_with_exact_absence(root: &str, exact_absence_probe: &dyn Ex
                     "made an effect-free exact-absence decision for a legacy marker"
                 );
             }
-            ScannedWorktreeRecordV1::Custody(_) | ScannedWorktreeRecordV1::UnreadableCustody(_) => {
-                // V3's existing marker schema deliberately carries no canonical source. T3a does
-                // not rewrite it just to make this answer convenient: registration is unprovable,
-                // so the only safe answer is a refusal. T3b receives a source-bearing candidate
-                // explicitly when it owns the later acting path.
+            ScannedWorktreeRecordV1::Custody(record) => {
+                let _ =
+                    decide_unused_custody_record(&root_cwd, &path, &record, exact_absence_probe);
+            }
+            ScannedWorktreeRecordV1::UnreadableCustody(_) => {
                 let decision =
                     UnusedCandidateDecisionV1::Refused(UnusedCandidateRefusalV1::CannotProve);
                 tracing::info!(
                     record = path,
                     decision = ?decision,
-                    "refused an exact-absence decision for a source-less V3 custody marker"
+                    "refused an exact-absence decision for an unreadable V3 custody marker"
                 );
             }
         }
@@ -722,9 +862,9 @@ impl Drop for WorktreeRunEndGuard {
 #[cfg(test)]
 mod tests {
     use super::{
-        decide_unused_candidate, decide_unused_marker, ExactAbsenceCandidateV1,
-        ExactAbsenceObservationV1, ExactAbsenceProbeV1, UnusedCandidateDecisionV1,
-        UnusedCandidateRefusalV1,
+        compare_path_identities, decide_unused_candidate, decide_unused_marker,
+        ExactAbsenceCandidateV1, ExactAbsenceObservationV1, ExactAbsenceProbeV1,
+        PathIdentityComparisonV1, UnusedCandidateDecisionV1, UnusedCandidateRefusalV1,
     };
     use crate::provider_path::{sidecar_path, write_sidecar, WorktreeSidecar};
     use bridge_core::error::BridgeError;
@@ -773,6 +913,11 @@ mod tests {
             "a2a-bridge-worktree-sweep-{name}-{}-{nanos}",
             std::process::id()
         ))
+    }
+
+    fn exact_candidate(source: &Path, worktree_path: &Path) -> ExactAbsenceCandidateV1 {
+        ExactAbsenceCandidateV1::new(source.to_string_lossy(), worktree_path.to_string_lossy())
+            .expect("the fixture source has a stable absolute identity")
     }
 
     fn write_worktree_sidecar(
@@ -1098,8 +1243,9 @@ mod tests {
     /// returns the typed authorization that T3b will later consume under its lock window.
     #[test]
     fn unused_candidate_settles_only_after_exact_absence() {
-        let candidate = ExactAbsenceCandidateV1::new("/source", "/root/candidate");
-        let marker = ExactAbsenceCandidateV1::new("/source", "/root/marker");
+        let source = std::env::current_dir().unwrap();
+        let candidate = exact_candidate(&source, &std::env::temp_dir().join("candidate"));
+        let marker = exact_candidate(&source, &std::env::temp_dir().join("marker"));
         let record = custody_record(
             "/root/marker",
             WorktreeCustodyStateV1::ProtectionPrepared {},
@@ -1166,21 +1312,111 @@ mod tests {
         );
     }
 
-    /// The marker and in-memory-candidate populations share one state-free predicate. Deliberately
-    /// use a state that can never be settled by T3a: the proof must not inspect state to decide.
+    fn write_absent_preservation_unknown_record(
+        root: &Path,
+        source: &Path,
+        name: &str,
+    ) -> (PathBuf, Vec<u8>) {
+        let target = root.join(name);
+        let target_text = target.to_string_lossy().into_owned();
+        let mut record = custody_record(
+            &target_text,
+            WorktreeCustodyStateV1::PreservationUnknown {
+                reason: PreservationReasonV1::MaterializationInFlight,
+            },
+        );
+        let claim = record
+            .claim
+            .as_mut()
+            .expect("preservation unknown requires a claim");
+        claim.source = object_with(&source.to_string_lossy(), false);
+        claim.root = object_with(&root.to_string_lossy(), false);
+        claim.worktree = object_with(&target_text, true);
+        claim.common_dir = object_with(&source.join(".git").to_string_lossy(), true);
+        record.worktree = claim.worktree.clone();
+        let bytes = record.encode_canonical().unwrap();
+        let record_path = PathBuf::from(custody_record_path(&target_text));
+        fs::write(&record_path, &bytes).unwrap();
+        (record_path, bytes)
+    }
+
+    fn scanned_persisted_record(root: &Path, record_path: &Path) -> WorktreeCustodyRecordV1 {
+        let records = super::scan_worktree_records(&root.to_string_lossy());
+        let Some((_, super::ScannedWorktreeRecordV1::Custody(record))) = records
+            .into_iter()
+            .find(|(path, _)| Path::new(path) == record_path)
+        else {
+            panic!("the persisted V3 record must be scanned and canonically decoded");
+        };
+        *record
+    }
+
     #[test]
     fn exact_absence_proof_serves_marker_and_candidate_populations() {
-        let candidate = ExactAbsenceCandidateV1::new("/source", "/root/candidate");
-        let marker = ExactAbsenceCandidateV1::new("/source", "/root/marker");
-        let record = custody_record("/root/marker", WorktreeCustodyStateV1::LiveProtected {});
-        let record_before = record.encode_canonical().unwrap();
-        let probe = ExactAbsenceTestProbe(ExactAbsenceTestAnswer::Observation(
+        let root = unique_temp_dir("exact-absence-real-v3");
+        let source = root.join("source");
+        fs::create_dir_all(&source).unwrap();
+        let root = fs::canonicalize(root).unwrap();
+        let source = fs::canonicalize(source).unwrap();
+        let (record_path, record_before) =
+            write_absent_preservation_unknown_record(&root, &source, "absent-v3");
+        let root_cwd = crate::provider_path::canonicalize_lenient(&root.to_string_lossy()).unwrap();
+        let record = scanned_persisted_record(&root, &record_path);
+        let candidate = exact_candidate(&source, &root.join("candidate"));
+
+        let authorize = ExactAbsenceTestProbe(ExactAbsenceTestAnswer::Observation(
             ExactAbsenceObservationV1::BothAbsent,
         ));
+        assert!(decide_unused_candidate(&candidate, false, &authorize).is_authorized());
+        let record_file = record_path.to_string_lossy();
+        assert!(
+            super::decide_unused_custody_record(&root_cwd, &record_file, &record, &authorize)
+                .is_authorized()
+        );
+        assert_eq!(fs::read(&record_path).unwrap(), record_before);
+        super::sweep_orphans_with_exact_absence(&root.to_string_lossy(), &authorize);
+        assert_eq!(fs::read(&record_path).unwrap(), record_before);
 
-        assert!(decide_unused_candidate(&candidate, false, &probe).is_authorized());
-        assert!(decide_unused_marker(&marker, &probe).is_authorized());
-        assert_eq!(record.encode_canonical().unwrap(), record_before);
+        for answer in [
+            ExactAbsenceTestAnswer::Observation(ExactAbsenceObservationV1::TargetPresent),
+            ExactAbsenceTestAnswer::Observation(ExactAbsenceObservationV1::RegisteredButAbsent),
+            ExactAbsenceTestAnswer::Failure,
+        ] {
+            assert!(!super::decide_unused_custody_record(
+                &root_cwd,
+                &record_file,
+                &record,
+                &ExactAbsenceTestProbe(answer),
+            )
+            .is_authorized());
+            assert_eq!(fs::read(&record_path).unwrap(), record_before);
+        }
+
+        let mut degraded = record.clone();
+        degraded.claim.as_mut().unwrap().source = object_with(&source.to_string_lossy(), true);
+        assert!(!super::decide_unused_custody_record(
+            &root_cwd,
+            &record_file,
+            &degraded,
+            &authorize
+        )
+        .is_authorized());
+        assert_eq!(fs::read(&record_path).unwrap(), record_before);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn missing_suffixes_below_one_parent_are_ambiguous_not_different() {
+        let root = unique_temp_dir("ambiguous-missing-suffix");
+        fs::create_dir_all(&root).unwrap();
+        assert_eq!(
+            compare_path_identities(
+                &root.join("wt").to_string_lossy(),
+                &root.join("WT").to_string_lossy()
+            ),
+            PathIdentityComparisonV1::CannotProve
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 
     /// A legacy sidecar whose sibling lives outside the sweep root is not trustworthy evidence,
@@ -1275,10 +1511,16 @@ mod tests {
     #[test]
     fn exact_absence_sweep_authorizes_a_valid_in_root_legacy_sidecar() {
         let root = unique_temp_dir("exact-absence-valid-sidecar");
-        fs::create_dir_all(&root).unwrap();
+        let source = root.join("source");
+        fs::create_dir_all(&source).unwrap();
+        assert!(std::process::Command::new("git")
+            .args(["init", "-q", source.to_str().unwrap()])
+            .status()
+            .unwrap()
+            .success());
         let sidecar = WorktreeSidecar {
-            canonical_source: root.join("source").to_string_lossy().into_owned(),
-            common_dir: root.join("source/.git").to_string_lossy().into_owned(),
+            canonical_source: source.to_string_lossy().into_owned(),
+            common_dir: source.join(".git").to_string_lossy().into_owned(),
             worktree_path: root.join("absent").to_string_lossy().into_owned(),
             owner: "owner".into(),
             run_id: "run-a".into(),
@@ -1310,6 +1552,36 @@ mod tests {
         );
 
         fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn exact_absence_sweep_refuses_a_relative_legacy_source() {
+        let root = unique_temp_dir("exact-absence-relative-source");
+        fs::create_dir_all(&root).unwrap();
+        let root = fs::canonicalize(root).unwrap();
+        let sidecar = WorktreeSidecar {
+            canonical_source: ".".into(),
+            common_dir: root.join("source/.git").to_string_lossy().into_owned(),
+            worktree_path: root.join("absent").to_string_lossy().into_owned(),
+            owner: "owner".into(),
+            run_id: "run-a".into(),
+            host: "my-host".into(),
+            lease: "/leases/dead.lock".into(),
+        };
+        write_sidecar(&sidecar).unwrap();
+        let root_cwd = crate::provider_path::canonicalize_lenient(&root.to_string_lossy()).unwrap();
+        assert_eq!(
+            super::decide_unused_legacy_sidecar(
+                &root_cwd,
+                &sidecar_path(&sidecar.worktree_path),
+                &sidecar,
+                &ExactAbsenceTestProbe(ExactAbsenceTestAnswer::Observation(
+                    ExactAbsenceObservationV1::BothAbsent,
+                )),
+            ),
+            UnusedCandidateDecisionV1::Refused(UnusedCandidateRefusalV1::CannotProve)
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 
     /// Materialize a V3 checkout: the worktree directory plus its sibling

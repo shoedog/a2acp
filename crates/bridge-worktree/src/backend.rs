@@ -12,9 +12,9 @@ use crate::provider_path::{
     WorktreeConfig, WorktreeSidecar,
 };
 use crate::sweep::{
-    decide_unused_candidate as decide_exact_absence, paths_resolve_to_same_identity,
-    ExactAbsenceCandidateV1, ExactAbsenceProbeV1, UnusedCandidateDecisionV1,
-    UnusedCandidateRefusalV1,
+    compare_path_identities, decide_unused_candidate as decide_exact_absence,
+    ExactAbsenceCandidateV1, ExactAbsenceProbeV1, PathIdentityComparisonV1,
+    UnusedCandidateDecisionV1, UnusedCandidateRefusalV1,
 };
 use bridge_core::diagnostics::{DiagnosticCode, DiagnosticFailureClass, DiagnosticRedactor};
 use bridge_core::domain::{Part, SessionSpec};
@@ -471,10 +471,24 @@ fn same_exact_absence_candidate_identity(
     left: &ExactAbsenceCandidateV1,
     right: &ExactAbsenceCandidateV1,
 ) -> Result<bool, BridgeError> {
-    Ok(
-        paths_resolve_to_same_identity(&left.canonical_source, &right.canonical_source)?
-            && paths_resolve_to_same_identity(&left.worktree_path, &right.worktree_path)?,
-    )
+    left.revalidate_source()?;
+    right.revalidate_source()?;
+    match compare_path_identities(&left.canonical_source, &right.canonical_source) {
+        PathIdentityComparisonV1::Same => {}
+        PathIdentityComparisonV1::Different => return Ok(false),
+        PathIdentityComparisonV1::CannotProve => {
+            return Err(BridgeError::ConfigInvalid {
+                reason: "recovery candidate source identity is ambiguous".to_string(),
+            })
+        }
+    }
+    match compare_path_identities(&left.worktree_path, &right.worktree_path) {
+        PathIdentityComparisonV1::Same => Ok(true),
+        PathIdentityComparisonV1::Different => Ok(false),
+        PathIdentityComparisonV1::CannotProve => Err(BridgeError::ConfigInvalid {
+            reason: "recovery candidate worktree identity is ambiguous".to_string(),
+        }),
+    }
 }
 
 fn recovery_owner_matches_candidate(
@@ -3789,6 +3803,10 @@ impl WorktreeBackend {
                 reason: "worktree provider does not implement the R2f1b custody-aware add".into(),
             });
         }
+        let exact_absence_candidate = ExactAbsenceCandidateV1::new(
+            resolved.canonical_source.as_str(),
+            resolved.worktree_path.as_str(),
+        )?;
         let session_key = session.as_str().to_owned();
         #[cfg(test)]
         let preparation_bound = self
@@ -3811,10 +3829,7 @@ impl WorktreeBackend {
         flight.set_journal(journal.clone());
         let active_flight = Arc::new(ActivePreparationFlightV1::new_for_candidate(
             flight.clone(),
-            Some(ExactAbsenceCandidateV1::new(
-                resolved.canonical_source.as_str(),
-                resolved.worktree_path.as_str(),
-            )),
+            Some(exact_absence_candidate),
         ));
         {
             let mut flights = self
@@ -11969,6 +11984,13 @@ mod tests {
 
         let (be, rec, tmp, source, cfg) = backend_fixture("recovery-owned-exact-absence");
         let (bound, target) = bound_spec_v3(&source, &cfg);
+        let candidate =
+            ExactAbsenceCandidateV1::new(source.to_string_lossy(), target.as_str()).unwrap();
+        assert_eq!(
+            be.decide_unused_candidate_for_recovery(&candidate, &BothAbsentProbe),
+            UnusedCandidateDecisionV1::Authorized,
+            "a non-recovery-owned backend candidate remains eligible for the shared proof"
+        );
         let clock = Arc::new(ManualPreparationClock::new(0));
         be.arm_preparation_bound_for_test(PreparationClockV1::new(clock.clone()));
         let hooks = be.preparation_test_hooks.clone();
@@ -11985,16 +12007,6 @@ mod tests {
         hooks.wait_for_custody_sync().await;
         clock.set(PREPARATION_CONTROL_BOUND_MS);
         assert!(be.observe_preparation_bound_for_test(&session).await);
-        #[cfg(unix)]
-        let candidate_source = {
-            let symlinked_source = tmp.join("source-through-symlink");
-            std::os::unix::fs::symlink(&source, &symlinked_source).unwrap();
-            symlinked_source
-        };
-        #[cfg(not(unix))]
-        let candidate_source = source.clone();
-        let candidate =
-            ExactAbsenceCandidateV1::new(candidate_source.to_string_lossy(), target.as_str());
         assert_eq!(
             be.decide_unused_candidate_for_recovery(&candidate, &BothAbsentProbe),
             UnusedCandidateDecisionV1::Refused(crate::sweep::UnusedCandidateRefusalV1::CannotProve),
@@ -12026,7 +12038,8 @@ mod tests {
 
         let (be, rec, tmp, source, cfg) = backend_fixture("transfer-owned-exact-absence");
         let (_bound, target) = bound_spec_v3(&source, &cfg);
-        let candidate = ExactAbsenceCandidateV1::new(source.to_string_lossy(), target.as_str());
+        let candidate =
+            ExactAbsenceCandidateV1::new(source.to_string_lossy(), target.as_str()).unwrap();
         let flight = Arc::new(
             MaterializationPreparationFlightV1::claim(be.preparation_test_hooks.clone(), None)
                 .unwrap(),
