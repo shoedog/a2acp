@@ -309,6 +309,34 @@ Fixed in `bf17005a` with the established 4-line `#[cfg(unix)]` guard.
   **4,140/0/13 across 90** — byte-identical totals before and after the guard,
   confirming it is a no-op on unix.
 
+## T2 LANDED — `main` = `1d7826dd`
+
+PR #54 squash-merged 2026-08-17. Merged content **byte-exact to the gated
+tree** (`git diff bf17005a origin/main` empty). Local `main` fast-forwarded.
+
+Final CI on `bf17005a`: cla-assistant pass; Bridge Store (macOS 14) pass ×2;
+**Bridge Store Unsupported Target (Windows) pass ×2** (the guard worked);
+Build/Lint/Coverage pass. `mergeable=MERGEABLE state=CLEAN`.
+
+**Coverage-lane load-flake, third named class.**
+`cli_tests::operator_container_authority_reports_failed_exact_id_removal`
+failed once, on the `push` run of `bf17005a`. Classified LOAD-FLAKE on four
+independent pieces of evidence, not on assumption:
+
+1. **Same-SHA control, no rerun needed**: the `pull_request` run of the
+   identical SHA `bf17005a` PASSED while the `push` run failed.
+2. **Same-SHA rerun control**: re-running the failed job on `bf17005a`
+   returned `success`.
+3. The test PASSED in the operator's host suite on the exact tree (4,140/0/13).
+4. It lives in `bin/a2a-bridge` container-operator CLI code; T2's diff touches
+   only `bridge-worktree` and `bridge-core`.
+
+The coverage-lane flake family now has THREE ledgered classes:
+`authority_mutation` lock-release, staged-candidate smoke-launch, and this one.
+The pattern — always the coverage lane, always a different test — is itself
+worth a look; the shared cause is more likely the instrumented lane's load
+profile than any individual test.
+
 ## Ledger items raised this round
 
 - **Test-harness hang amplifier (SMELL, recommend fixing next round).** Any
