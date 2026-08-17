@@ -12,7 +12,7 @@ use bridge_core::liveness::LeaseProbe;
 use bridge_core::run_identity::{classify, Verdict};
 use bridge_core::SessionCwd;
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// The source and target a recovery-side unused-marker decision is about.
 ///
@@ -35,6 +35,70 @@ impl ExactAbsenceCandidateV1 {
     }
 }
 
+/// Compare two absolute paths by the identity of their resolved existing ancestor and missing
+/// tail, never by their original spelling.
+///
+/// Exact-absence decisions routinely inspect targets that are already absent, so ordinary
+/// `canonicalize` is insufficient: it would reject the intended missing final component. We
+/// resolve the nearest existing ancestor and append the missing tail. Any non-`NotFound` probe
+/// failure, invalid relative spelling, or missing ancestor traversal that cannot be represented
+/// is a failure to prove identity and must remain a refusal at the caller.
+pub(crate) fn paths_resolve_to_same_identity(left: &str, right: &str) -> Result<bool, BridgeError> {
+    fn resolve(path: &str) -> Result<PathBuf, BridgeError> {
+        let mut current = PathBuf::from(path);
+        if !current.is_absolute() {
+            return Err(BridgeError::ConfigInvalid {
+                reason: "worktree path has no absolute identity".to_string(),
+            });
+        }
+
+        let mut missing_tail = Vec::new();
+        loop {
+            match std::fs::canonicalize(&current) {
+                Ok(mut resolved) => {
+                    for component in missing_tail.iter().rev() {
+                        resolved.push(component);
+                    }
+                    return Ok(resolved);
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    match current.symlink_metadata() {
+                        Ok(_) => {
+                            return Err(BridgeError::ConfigInvalid {
+                                reason: "worktree path has no resolvable identity".to_string(),
+                            })
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(error) => {
+                            return Err(BridgeError::ConfigInvalid {
+                                reason: format!("worktree path identity probe failed: {error}"),
+                            })
+                        }
+                    }
+                    let component =
+                        current
+                            .file_name()
+                            .ok_or_else(|| BridgeError::ConfigInvalid {
+                                reason: "worktree path has no resolvable identity".to_string(),
+                            })?;
+                    missing_tail.push(component.to_os_string());
+                    current = current.parent().map(Path::to_path_buf).ok_or_else(|| {
+                        BridgeError::ConfigInvalid {
+                            reason: "worktree path has no resolvable identity".to_string(),
+                        }
+                    })?;
+                }
+                Err(error) => {
+                    return Err(BridgeError::ConfigInvalid {
+                        reason: format!("worktree path identity probe failed: {error}"),
+                    });
+                }
+            }
+        }
+    }
+
+    Ok(resolve(left)? == resolve(right)?)
+}
 /// The three successful observations a synchronous host recovery capability can return.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ExactAbsenceObservationV1 {

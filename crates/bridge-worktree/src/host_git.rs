@@ -3,7 +3,12 @@ use crate::provider::{
     add_argv, is_repo_argv, list_porcelain_argv, prune_argv, remove_argv, CustodyAddFailureV1,
     CustodyAddOutcomeV1, CustodyAddTargetV1, WorktreeProvider,
 };
-use crate::sweep::{ExactAbsenceCandidateV1, ExactAbsenceObservationV1, ExactAbsenceProbeV1};
+#[cfg(test)]
+use crate::sweep::{decide_unused_candidate, UnusedCandidateDecisionV1, UnusedCandidateRefusalV1};
+use crate::sweep::{
+    paths_resolve_to_same_identity, ExactAbsenceCandidateV1, ExactAbsenceObservationV1,
+    ExactAbsenceProbeV1,
+};
 use bridge_core::error::BridgeError;
 use std::path::Path;
 use std::process::{Command as StdCommand, Output};
@@ -123,13 +128,22 @@ fn removal_is_complete(
     prune_succeeded && target_absent && registration_absent
 }
 
-fn registration_absent_from_porcelain(output: &[u8], wt: &str) -> bool {
-    let target = wt.as_bytes();
-    !output.split(|byte| *byte == 0).any(|field| {
-        field
-            .strip_prefix(b"worktree ")
-            .is_some_and(|path| path == target)
-    })
+fn registration_absent_from_porcelain(output: &[u8], wt: &str) -> Result<bool, BridgeError> {
+    // Resolve the candidate even when Git has no worktree records. A malformed candidate is not
+    // evidence of absence, and `paths_resolve_to_same_identity` intentionally refuses it.
+    paths_resolve_to_same_identity(wt, wt)?;
+    for field in output.split(|byte| *byte == 0) {
+        let Some(path) = field.strip_prefix(b"worktree ") else {
+            continue;
+        };
+        let path = std::str::from_utf8(path).map_err(|_| BridgeError::ConfigInvalid {
+            reason: "worktree registration path is not valid UTF-8".to_string(),
+        })?;
+        if paths_resolve_to_same_identity(path, wt)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 async fn registration_absent(repo: &str, wt: &str) -> Result<bool, BridgeError> {
@@ -142,7 +156,7 @@ async fn registration_absent(repo: &str, wt: &str) -> Result<bool, BridgeError> 
             ),
         });
     }
-    Ok(registration_absent_from_porcelain(&listed.stdout, wt))
+    registration_absent_from_porcelain(&listed.stdout, wt)
 }
 
 fn registration_absent_sync(repo: &str, wt: &str) -> Result<bool, BridgeError> {
@@ -155,7 +169,7 @@ fn registration_absent_sync(repo: &str, wt: &str) -> Result<bool, BridgeError> {
             ),
         });
     }
-    Ok(registration_absent_from_porcelain(&listed.stdout, wt))
+    registration_absent_from_porcelain(&listed.stdout, wt)
 }
 
 impl ExactAbsenceProbeV1 for HostGitWorktree {
@@ -405,18 +419,50 @@ mod tests {
     fn porcelain_registration_check_is_exact_and_handles_locked_records() {
         let output =
             b"worktree /repo\0HEAD abc\0\0worktree /managed/wt\0HEAD def\0locked reason\0\0";
-        assert!(!registration_absent_from_porcelain(output, "/managed/wt"));
-        assert!(registration_absent_from_porcelain(output, "/managed/other"));
-        assert!(registration_absent_from_porcelain(output, "/managed/w"));
+        assert!(!registration_absent_from_porcelain(output, "/managed/wt").unwrap());
+        assert!(registration_absent_from_porcelain(output, "/managed/other").unwrap());
+        assert!(registration_absent_from_porcelain(output, "/managed/w").unwrap());
     }
 
+    #[test]
+    fn unresolvable_registration_paths_refuse_exact_absence() {
+        assert!(
+            registration_absent_from_porcelain(b"worktree /repo\0", "relative-target").is_err()
+        );
+        #[cfg(unix)]
+        assert!(registration_absent_from_porcelain(
+            b"worktree /tmp/invalid-utf8-\xff\0",
+            "/tmp/target"
+        )
+        .is_err());
+
+        let tmp = unique_temp_dir("unresolvable-exact-absence");
+        let src = repo(&tmp);
+        let candidate = ExactAbsenceCandidateV1::new(src.to_string_lossy(), "relative-target");
+        assert_eq!(
+            decide_unused_candidate(&candidate, false, &HostGitWorktree::new()),
+            UnusedCandidateDecisionV1::Refused(UnusedCandidateRefusalV1::CannotProve)
+        );
+        std::fs::remove_dir_all(tmp).unwrap();
+    }
     /// The B18 sync capability observes the same three facts as the private async registration
     /// helper without entering a Tokio runtime from the sweep.
     #[tokio::test]
     async fn synchronous_exact_absence_capability_distinguishes_all_host_observations() {
         let tmp = unique_temp_dir("sync-exact-absence");
         let src = repo(&tmp);
-        let target = tmp.join("target");
+        let canonical_worktree_root = tmp.join("worktrees");
+        std::fs::create_dir(&canonical_worktree_root).unwrap();
+        #[cfg(unix)]
+        let worktree_root = {
+            let symlinked_root = tmp.join("worktrees-through-symlink");
+            std::os::unix::fs::symlink(&canonical_worktree_root, &symlinked_root).unwrap();
+            symlinked_root
+        };
+        #[cfg(not(unix))]
+        let worktree_root = canonical_worktree_root.clone();
+        let target = worktree_root.join("target");
+        let canonical_target = canonical_worktree_root.join("target");
         let candidate =
             ExactAbsenceCandidateV1::new(src.to_string_lossy(), target.to_string_lossy());
         let provider = HostGitWorktree::new();
@@ -444,7 +490,27 @@ mod tests {
             ExactAbsenceObservationV1::TargetPresent
         );
 
-        std::fs::remove_dir_all(&target).unwrap();
+        std::fs::remove_dir_all(&canonical_target).unwrap();
+        #[cfg(unix)]
+        {
+            let listed = std::process::Command::new("git")
+                .args(list_porcelain_argv(src.to_str().unwrap()))
+                .output()
+                .unwrap();
+            assert!(listed.status.success());
+            assert!(listed.stdout.split(|byte| *byte == 0).any(|field| {
+                field
+                    == [
+                        b"worktree ".as_slice(),
+                        canonical_target.to_string_lossy().as_bytes(),
+                    ]
+                    .concat()
+            }));
+            assert_ne!(
+                target, canonical_target,
+                "the candidate retains a noncanonical spelling"
+            );
+        }
         assert_eq!(
             provider.observe_exact_absence(&candidate).unwrap(),
             ExactAbsenceObservationV1::RegisteredButAbsent

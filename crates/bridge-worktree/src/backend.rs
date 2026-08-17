@@ -12,8 +12,9 @@ use crate::provider_path::{
     WorktreeConfig, WorktreeSidecar,
 };
 use crate::sweep::{
-    decide_unused_candidate as decide_exact_absence, ExactAbsenceCandidateV1, ExactAbsenceProbeV1,
-    UnusedCandidateDecisionV1,
+    decide_unused_candidate as decide_exact_absence, paths_resolve_to_same_identity,
+    ExactAbsenceCandidateV1, ExactAbsenceProbeV1, UnusedCandidateDecisionV1,
+    UnusedCandidateRefusalV1,
 };
 use bridge_core::diagnostics::{DiagnosticCode, DiagnosticFailureClass, DiagnosticRedactor};
 use bridge_core::domain::{Part, SessionSpec};
@@ -466,6 +467,25 @@ struct ActivePreparationFlightV1 {
     result: StdMutex<Option<oneshot::Sender<MaterializationResultV1>>>,
 }
 
+fn same_exact_absence_candidate_identity(
+    left: &ExactAbsenceCandidateV1,
+    right: &ExactAbsenceCandidateV1,
+) -> Result<bool, BridgeError> {
+    Ok(
+        paths_resolve_to_same_identity(&left.canonical_source, &right.canonical_source)?
+            && paths_resolve_to_same_identity(&left.worktree_path, &right.worktree_path)?,
+    )
+}
+
+fn recovery_owner_matches_candidate(
+    candidate: &ExactAbsenceCandidateV1,
+    owner_candidate: Option<&ExactAbsenceCandidateV1>,
+) -> Result<bool, BridgeError> {
+    let owner_candidate = owner_candidate.ok_or_else(|| BridgeError::ConfigInvalid {
+        reason: "recovery owner has no exact-absence candidate".to_string(),
+    })?;
+    same_exact_absence_candidate_identity(candidate, owner_candidate)
+}
 impl ActivePreparationFlightV1 {
     fn new_for_candidate(
         flight: Arc<MaterializationPreparationFlightV1>,
@@ -2273,23 +2293,39 @@ impl WorktreeBackend {
         candidate: &ExactAbsenceCandidateV1,
         probe: &dyn ExactAbsenceProbeV1,
     ) -> UnusedCandidateDecisionV1 {
-        let recovery = self
-            .preparation_recovery_flights
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        let active = self
-            .preparation_flights
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        let recovery_owned = recovery
-            .values()
-            .any(|flight| flight.candidate.as_ref() == Some(candidate))
-            || active.values().any(|flight| {
-                flight.candidate.as_ref() == Some(candidate) && flight.flight.transfer_owned()
-            });
-        drop(active);
-        drop(recovery);
-        decide_exact_absence(candidate, recovery_owned, probe)
+        let recovery_owned = {
+            let recovery = self
+                .preparation_recovery_flights
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            let active = self
+                .preparation_flights
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            let mut owned = Ok(false);
+            for flight in recovery.values() {
+                owned = recovery_owner_matches_candidate(candidate, flight.candidate.as_ref());
+                if owned.is_err() || owned.as_ref().is_ok_and(|owned| *owned) {
+                    break;
+                }
+            }
+            if owned.as_ref().is_ok_and(|owned| !*owned) {
+                for flight in active
+                    .values()
+                    .filter(|flight| flight.flight.transfer_owned())
+                {
+                    owned = recovery_owner_matches_candidate(candidate, flight.candidate.as_ref());
+                    if owned.is_err() || owned.as_ref().is_ok_and(|owned| *owned) {
+                        break;
+                    }
+                }
+            }
+            owned
+        };
+        match recovery_owned {
+            Ok(recovery_owned) => decide_exact_absence(candidate, recovery_owned, probe),
+            Err(_) => UnusedCandidateDecisionV1::Refused(UnusedCandidateRefusalV1::CannotProve),
+        }
     }
 
     fn admit_configure(&self, session: &SessionId) -> Result<ConfigureAdmission<'_>, BridgeError> {
@@ -11949,7 +11985,16 @@ mod tests {
         hooks.wait_for_custody_sync().await;
         clock.set(PREPARATION_CONTROL_BOUND_MS);
         assert!(be.observe_preparation_bound_for_test(&session).await);
-        let candidate = ExactAbsenceCandidateV1::new(source.to_string_lossy(), target.as_str());
+        #[cfg(unix)]
+        let candidate_source = {
+            let symlinked_source = tmp.join("source-through-symlink");
+            std::os::unix::fs::symlink(&source, &symlinked_source).unwrap();
+            symlinked_source
+        };
+        #[cfg(not(unix))]
+        let candidate_source = source.clone();
+        let candidate =
+            ExactAbsenceCandidateV1::new(candidate_source.to_string_lossy(), target.as_str());
         assert_eq!(
             be.decide_unused_candidate_for_recovery(&candidate, &BothAbsentProbe),
             UnusedCandidateDecisionV1::Refused(crate::sweep::UnusedCandidateRefusalV1::CannotProve),

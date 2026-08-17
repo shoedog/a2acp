@@ -141,3 +141,33 @@ existing exact-absence predicate.
   Unconditionally refusing legacy sidecars should make it red.
 - Cargo test, Clippy, and the workspace suite — not run, no local toolchain; crates.io-dependent
   Cargo work is blocked by the configured HTTP 403 egress policy.
+
+## Repair 2 — resolved identity and recovery inventory consultation
+
+The shared exact-absence path comparator now resolves each absolute path through its nearest
+existing canonical ancestor before re-appending an absent tail. Both porcelain registration checks
+(sync and async) and recovery-candidate ownership use that one definition. Thus Git's canonical
+`worktree` spelling and a candidate's original `/var`, symlinked-parent, trailing-slash, or
+existing-parent `..` spelling compare as the same registration. Invalid UTF-8 porcelain paths,
+relative candidates, or an identity probe error refuse as `CannotProve`; none can become
+`BothAbsent`.
+
+Recovery ownership is consulted at one linearization point: T3a holds
+`preparation_recovery_flights` and then `preparation_flights`, the same recovery-to-active order
+used by T2's transfer move. While both guards are held it compares the exact frozen source/target
+identities. T2 either has not won `begin_transfer`, has a transfer-owned active entry, or has
+inserted the recovery entry before removing that active entry while holding those same two guards.
+The consultation therefore cannot observe a post-transfer half-published owner. The guards are
+released before the host probe; a later transfer remains harmless because this T3a result is
+decision-only and T3b must prove again inside its action window.
+
+### Repair 2 verification
+
+- `cargo fmt --all -- --check` and `git diff --check` — passed.
+- `CARGO_INCREMENTAL=0 cargo test -p bridge-worktree --lib exact_absence -- --nocapture` —
+  attempted, but no test compiled or ran: Cargo could not fetch uncached `a2a-lf` because the
+  configured CONNECT tunnel returned HTTP 403.
+- `cargo clippy --workspace --all-targets -- -D warnings` — not run after that identical
+  dependency preflight failure; it requires the dependency-capable host control.
+- `git diff --numstat 5cbfddf2` — 240 added / 36 deleted (276 total changed lines); the
+  `crates/bridge-core/src/reaper.rs` diff is empty.
