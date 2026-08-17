@@ -14,7 +14,6 @@
 //! 2. **Policy** ([`PinnedDirectoryV1`] and the `verify_*`/`VerifiedRemovalV1` boundary): the
 //!    custody contract used by R2f1b and by both storage reapers.
 
-use icu_normalizer::ComposingNormalizer;
 use serde::{Deserialize, Serialize};
 #[cfg(unix)]
 use std::ffi::CStr;
@@ -1589,22 +1588,19 @@ fn compare_missing_tail(
     if left.len() != right.len() {
         return PathIdentityComparisonV1::Different;
     }
-    let normalizer = ComposingNormalizer::new_nfc();
     for (left, right) in left.iter().zip(right) {
         if left == right {
             continue;
         }
+        if case_sensitive {
+            return PathIdentityComparisonV1::Different;
+        }
         let (Some(left), Some(right)) = (left.to_str(), right.to_str()) else {
             return PathIdentityComparisonV1::CannotProve;
         };
-        let left = normalizer.normalize(left);
-        let right = normalizer.normalize(right);
-        if left == right
-            || (!case_sensitive
-                && left
-                    .chars()
-                    .flat_map(char::to_lowercase)
-                    .eq(right.chars().flat_map(char::to_lowercase)))
+        if left.bytes().any(|byte| !byte.is_ascii())
+            || right.bytes().any(|byte| !byte.is_ascii())
+            || left.eq_ignore_ascii_case(right)
         {
             return PathIdentityComparisonV1::CannotProve;
         }
@@ -2945,8 +2941,8 @@ mod tests {
     #[test]
     fn path_identity_compares_existing_and_absent_paths_without_spelling_assumptions() {
         let root = tempfile::tempdir().unwrap();
-        let first = root.join("first");
-        let second = root.join("second");
+        let first = root.path().join("first");
+        let second = root.path().join("second");
         fs::create_dir(&first).unwrap();
         fs::create_dir(&second).unwrap();
         assert_eq!(
@@ -2967,18 +2963,46 @@ mod tests {
     fn path_identity_treats_missing_case_and_unicode_aliases_conservatively() {
         let root = tempfile::tempdir().unwrap();
         assert_eq!(
-            compare_path_identities(root.join("équipe"), root.join("other")),
+            compare_path_identities(root.path().join("wt"), root.path().join("other")),
             PathIdentityComparisonV1::Different,
-            "distinct Unicode names must not be over-refused"
+            "distinct ASCII names must not be over-refused"
         );
         assert_eq!(
-            compare_path_identities(root.join("résumé"), root.join("re\u{301}sume\u{301}")),
-            PathIdentityComparisonV1::CannotProve
+            compare_missing_tail(
+                &[OsString::from("résumé")],
+                &[OsString::from("re\u{301}sume\u{301}")],
+                true,
+            ),
+            PathIdentityComparisonV1::Different,
+            "a case-sensitive ancestor lets byte-different names decide"
         );
         assert_eq!(
             compare_missing_tail(&[OsString::from("wt")], &[OsString::from("WT")], false),
             PathIdentityComparisonV1::CannotProve,
             "the case-insensitive branch must refuse on every test platform"
+        );
+        assert_eq!(
+            compare_missing_tail(
+                &[OsString::from("résumé")],
+                &[OsString::from("re\u{301}sume\u{301}")],
+                false,
+            ),
+            PathIdentityComparisonV1::CannotProve,
+            "a non-ASCII difference may be normalization-equivalent"
+        );
+        assert_eq!(
+            compare_missing_tail(
+                &[OsString::from("équipe")],
+                &[OsString::from("other")],
+                false,
+            ),
+            PathIdentityComparisonV1::CannotProve,
+            "any non-ASCII component difference is ambiguous"
+        );
+        assert_eq!(
+            compare_missing_tail(&[OsString::from("wt")], &[OsString::from("other")], false),
+            PathIdentityComparisonV1::Different,
+            "ASCII names that are not equal under ASCII case folding are distinct"
         );
     }
     #[cfg(unix)]
