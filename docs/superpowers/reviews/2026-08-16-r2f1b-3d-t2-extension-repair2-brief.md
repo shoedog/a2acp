@@ -270,6 +270,45 @@ activates when the V3 path becomes reachable. So the sub-slice gates the
 V3-arming slice, not T2's landing. The lens's real contribution here stands:
 the defect does not depend on transfer arming.
 
+## Landing — PR #54, and the Windows lane (recurrence #4 of a known class)
+
+Squash merge chosen over rebase: the branch carries three rejected intermediate
+states (`c5d9390c`, `435257ce`, `f66016e0`) and `a84c8b57`'s subject begins
+with a stray ``` fence (the agent copied the spec's fenced Commit Message block
+verbatim). A squash lands one coherent commit and authors the message fresh,
+which disposes of both problems.
+
+`cla-assistant` passed first try — `main`'s allowlist entry `b986108c` from the
+3c2 landing covered the `a2a-implement` authorship on `a84c8b57`.
+
+**Windows CI failed, exactly as this lane's history predicts.** `pub mod
+liveness` is `#[cfg(unix)]` in `lib.rs` while `fs_custody` is not, and the new
+`with_existing_regular_child_lease` calls
+`crate::liveness::acquire_persistent_lock_file` unconditionally. `bridge-store`
+depends on `bridge-core`, so the Windows job compiles it. This is the FOURTH
+instance of the class (3a, 3b1, 3c1, the 3c2 landing guard `790b4191`) — the
+fs_custody/liveness cfg boundary catches every slice that adds a flock-backed
+accessor, and no gate catches it before CI.
+
+Fixed in `bf17005a` with the established 4-line `#[cfg(unix)]` guard.
+
+**Red→green control (host, local windows-msvc probe):**
+
+- Rebuilt the signature-only `ring` stub via `[patch.crates-io]` — ring's C
+  build script cannot cross-compile from macOS, and the prior stub was
+  ephemeral scratch. Probe-only; never committed. `Cargo.toml` and `Cargo.lock`
+  both restored afterwards, leaving only the 4-line guard in the tree.
+- Making the probe CLEAN took three iterations (dependent-requested feature
+  names, `ring::hmac`, `Copy` on the hmac algorithm). This mattered: an unclean
+  probe mixes stub artifacts with the real defect and cannot serve as a control.
+- **RED**: exactly one error —
+  `E0433: could not find liveness in the crate root` at `fs_custody.rs:717`.
+- **GREEN** under `-D warnings` after the guard, with **no** second-order
+  dead-code population (unlike `790b4191`, which had to chase a masked one).
+- Unix unchanged: fmt clean, workspace clippy `-D warnings` clean, suite
+  **4,140/0/13 across 90** — byte-identical totals before and after the guard,
+  confirming it is a no-op on unix.
+
 ## Ledger items raised this round
 
 - **Test-harness hang amplifier (SMELL, recommend fixing next round).** Any
@@ -284,3 +323,14 @@ the defect does not depend on transfer arming.
   literally, so `a84c8b57`'s subject begins with a ``` fence. Reword at landing.
 - **Verify has no effective timeout** for a hung test binary — 3 h elapsed with
   no bound. Ops item.
+- **No pre-CI gate for the non-unix lane (RECOMMEND FIXING — 4th recurrence).**
+  Every local gate (`fmt`, `clippy --workspace --all-targets`, the 90-target
+  suite) runs unix-only, so a `cfg(unix)` boundary violation in `bridge-core` is
+  structurally invisible until Windows CI. It has now cost a landing round in
+  3a, 3b1, 3c1, 3c2 and 3d-T2. Cheapest durable fix: add
+  `cargo check -p bridge-core --target x86_64-pc-windows-msvc` to the local
+  verify triad, which needs the committed `ring` stub problem solved once —
+  either a vendored signature-only stub behind a probe-only feature, or
+  swapping bridge-core's `ring` usage for a dependency that cross-compiles.
+  Until then, every slice touching `fs_custody`/`liveness` should run the
+  scratchpad probe before opening its PR.

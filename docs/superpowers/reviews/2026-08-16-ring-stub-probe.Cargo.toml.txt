@@ -1,0 +1,17 @@
+[package]
+name = "ring"
+version = "0.17.14"
+edition = "2021"
+
+[features]
+default = ["alloc", "dev_urandom_fallback"]
+alloc = []
+dev_urandom_fallback = []
+std = ["alloc"]
+wasm32_unknown_unknown_js = []
+less-safe-getrandom-custom-or-rdrand = []
+less-safe-getrandom-espidf = []
+slow_tests = []
+test_logging = []
+unstable-testing-arm-no-hw = []
+unstable-testing-arm-no-neon = []
