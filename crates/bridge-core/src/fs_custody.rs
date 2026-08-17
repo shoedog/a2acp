@@ -14,6 +14,7 @@
 //! 2. **Policy** ([`PinnedDirectoryV1`] and the `verify_*`/`VerifiedRemovalV1` boundary): the
 //!    custody contract used by R2f1b and by both storage reapers.
 
+use icu_normalizer::ComposingNormalizer;
 use serde::{Deserialize, Serialize};
 #[cfg(unix)]
 use std::ffi::CStr;
@@ -1476,6 +1477,161 @@ fn directory_path_identity(
     })
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PathIdentityComparisonV1 {
+    Same,
+    Different,
+    CannotProve,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PathObjectIdentityV1 {
+    #[cfg(unix)]
+    Unix { dev: u64, ino: u64 },
+}
+fn path_object_identity(metadata: &std::fs::Metadata) -> Option<PathObjectIdentityV1> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        Some(PathObjectIdentityV1::Unix {
+            dev: metadata.dev(),
+            ino: metadata.ino(),
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = metadata;
+        None
+    }
+}
+struct DeepestExistingPathV1 {
+    canonical: PathBuf,
+    identity: PathObjectIdentityV1,
+    missing_tail: Vec<OsString>,
+}
+fn deepest_existing_path(path: &Path) -> Option<DeepestExistingPathV1> {
+    if !path.is_absolute() {
+        return None;
+    }
+    let mut current = path.to_path_buf();
+    let mut missing_tail = Vec::new();
+    loop {
+        match std::fs::metadata(&current) {
+            Ok(metadata) => {
+                let identity = path_object_identity(&metadata)?;
+                let canonical = std::fs::canonicalize(&current).ok()?;
+                if path_object_identity(&std::fs::metadata(&canonical).ok()?)? != identity {
+                    return None;
+                }
+                missing_tail.reverse();
+                return Some(DeepestExistingPathV1 {
+                    canonical,
+                    identity,
+                    missing_tail,
+                });
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                match std::fs::symlink_metadata(&current) {
+                    Ok(_) => return None,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(_) => return None,
+                }
+                missing_tail.push(current.file_name()?.to_os_string());
+                current = current.parent()?.to_path_buf();
+            }
+            Err(_) => return None,
+        }
+    }
+}
+fn alternate_ascii_case(name: &std::ffi::OsStr) -> Option<OsString> {
+    let mut bytes = name.to_str()?.as_bytes().to_vec();
+    let byte = bytes.iter_mut().find(|byte| byte.is_ascii_alphabetic())?;
+    *byte = if byte.is_ascii_lowercase() {
+        byte.to_ascii_uppercase()
+    } else {
+        byte.to_ascii_lowercase()
+    };
+    Some(String::from_utf8(bytes).ok()?.into())
+}
+fn probe_case_sensitivity(
+    parent: &Path,
+    name: &std::ffi::OsStr,
+    expected: PathObjectIdentityV1,
+) -> Option<bool> {
+    let alternate = alternate_ascii_case(name)?;
+    match std::fs::symlink_metadata(parent.join(alternate)) {
+        Ok(metadata) => Some(path_object_identity(&metadata)? != expected),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Some(true),
+        Err(_) => None,
+    }
+}
+fn case_sensitive_at(ancestor: &Path) -> Option<bool> {
+    if let (Some(parent), Some(name)) = (ancestor.parent(), ancestor.file_name()) {
+        let expected = path_object_identity(&std::fs::symlink_metadata(ancestor).ok()?)?;
+        if let Some(answer) = probe_case_sensitivity(parent, name, expected) {
+            return Some(answer);
+        }
+    }
+    let entries = std::fs::read_dir(ancestor).ok()?;
+    for entry in entries.take(64) {
+        let entry = entry.ok()?;
+        let expected = path_object_identity(&std::fs::symlink_metadata(entry.path()).ok()?)?;
+        if let Some(answer) = probe_case_sensitivity(ancestor, &entry.file_name(), expected) {
+            return Some(answer);
+        }
+    }
+    None
+}
+fn compare_missing_tail(
+    left: &[OsString],
+    right: &[OsString],
+    case_sensitive: bool,
+) -> PathIdentityComparisonV1 {
+    if left.len() != right.len() {
+        return PathIdentityComparisonV1::Different;
+    }
+    let normalizer = ComposingNormalizer::new_nfc();
+    for (left, right) in left.iter().zip(right) {
+        if left == right {
+            continue;
+        }
+        let (Some(left), Some(right)) = (left.to_str(), right.to_str()) else {
+            return PathIdentityComparisonV1::CannotProve;
+        };
+        let left = normalizer.normalize(left);
+        let right = normalizer.normalize(right);
+        if left == right
+            || (!case_sensitive
+                && left
+                    .chars()
+                    .flat_map(char::to_lowercase)
+                    .eq(right.chars().flat_map(char::to_lowercase)))
+        {
+            return PathIdentityComparisonV1::CannotProve;
+        }
+    }
+    PathIdentityComparisonV1::Different
+}
+pub fn compare_path_identities(
+    left: impl AsRef<Path>,
+    right: impl AsRef<Path>,
+) -> PathIdentityComparisonV1 {
+    let (Some(left), Some(right)) = (
+        deepest_existing_path(left.as_ref()),
+        deepest_existing_path(right.as_ref()),
+    ) else {
+        return PathIdentityComparisonV1::CannotProve;
+    };
+    if left.identity != right.identity {
+        return PathIdentityComparisonV1::Different;
+    }
+    if left.missing_tail == right.missing_tail {
+        return PathIdentityComparisonV1::Same;
+    }
+    let Some(case_sensitive) = case_sensitive_at(&left.canonical) else {
+        return PathIdentityComparisonV1::CannotProve;
+    };
+    compare_missing_tail(&left.missing_tail, &right.missing_tail, case_sensitive)
+}
 /// The workspace's one path-addressed directory open: read-only, `O_DIRECTORY`, `O_NOFOLLOW`,
 /// `O_CLOEXEC`. A final symlink is refused rather than followed, and a non-directory is refused
 /// by the kernel (`ENOTDIR`) before any content is read — which also means a FIFO substituted for
@@ -2783,6 +2939,104 @@ mod tests {
         assert_eq!(
             BirthTimeV1::from_system_time(time),
             BirthTimeV1::new(-1, 999_999_999)
+        );
+    }
+
+    #[test]
+    fn path_identity_compares_existing_and_absent_paths_without_spelling_assumptions() {
+        let root = tempfile::tempdir().unwrap();
+        let first = root.join("first");
+        let second = root.join("second");
+        fs::create_dir(&first).unwrap();
+        fs::create_dir(&second).unwrap();
+        assert_eq!(
+            compare_path_identities(&first, &second),
+            PathIdentityComparisonV1::Different
+        );
+        assert_eq!(
+            compare_path_identities(first.join("wt"), first.join("other")),
+            PathIdentityComparisonV1::Different,
+            "clearly distinct absent siblings must not be over-refused"
+        );
+        assert_eq!(
+            compare_path_identities(first.join("wt"), second.join("wt")),
+            PathIdentityComparisonV1::Different
+        );
+    }
+    #[test]
+    fn path_identity_treats_missing_case_and_unicode_aliases_conservatively() {
+        let root = tempfile::tempdir().unwrap();
+        assert_eq!(
+            compare_path_identities(root.join("équipe"), root.join("other")),
+            PathIdentityComparisonV1::Different,
+            "distinct Unicode names must not be over-refused"
+        );
+        assert_eq!(
+            compare_path_identities(root.join("résumé"), root.join("re\u{301}sume\u{301}")),
+            PathIdentityComparisonV1::CannotProve
+        );
+        assert_eq!(
+            compare_missing_tail(&[OsString::from("wt")], &[OsString::from("WT")], false),
+            PathIdentityComparisonV1::CannotProve,
+            "the case-insensitive branch must refuse on every test platform"
+        );
+    }
+    #[cfg(unix)]
+    #[test]
+    fn path_identity_refuses_an_unreadable_ancestor() {
+        const ROOT_ENV: &str = "BRIDGE_CORE_UNREADABLE_PATH_ROOT";
+        if let Some(root) = std::env::var_os(ROOT_ENV) {
+            let ancestor = PathBuf::from(root).join("unreadable");
+            assert_eq!(
+                compare_path_identities(ancestor.join("wt"), ancestor.join("other")),
+                PathIdentityComparisonV1::CannotProve
+            );
+            return;
+        }
+        use std::os::unix::{fs::PermissionsExt as _, process::CommandExt as _};
+        let root = tempfile::tempdir().unwrap();
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o755)).unwrap();
+        let ancestor = root.path().join("unreadable");
+        fs::create_dir(&ancestor).unwrap();
+        fs::set_permissions(&ancestor, fs::Permissions::from_mode(0o000)).unwrap();
+        let uid = unsafe { libc::geteuid() };
+        let test = format!(
+            "{}::path_identity_refuses_an_unreadable_ancestor",
+            module_path!().strip_prefix("bridge_core::").unwrap()
+        );
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg(test)
+            .env(ROOT_ENV, root.path())
+            .uid(if uid == 0 { 65_534 } else { uid })
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
+    #[cfg(unix)]
+    #[test]
+    fn path_identity_follows_a_symlinked_parent_for_existing_paths() {
+        let root = tempfile::tempdir().unwrap();
+        let real = root.path().join("real");
+        let alias = root.path().join("alias");
+        let child = real.join("child");
+        fs::create_dir(&real).unwrap();
+        fs::create_dir(&child).unwrap();
+        std::os::unix::fs::symlink(&real, &alias).unwrap();
+        assert_eq!(
+            compare_path_identities(child, alias.join("child")),
+            PathIdentityComparisonV1::Same
+        );
+        let dangling = root.path().join("dangling");
+        std::os::unix::fs::symlink(root.path().join("missing"), &dangling).unwrap();
+        assert_eq!(
+            compare_path_identities(dangling.join("child"), root.path().join("other")),
+            PathIdentityComparisonV1::CannotProve
+        );
+        #[cfg(target_os = "macos")]
+        assert_eq!(
+            compare_path_identities("/var", "/private/var"),
+            PathIdentityComparisonV1::Same
         );
     }
 
