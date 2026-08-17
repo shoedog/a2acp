@@ -424,3 +424,69 @@ Caps 150 soft / 250 hard changed lines, production confined to
 - Dispatch 2 running: clone `impl-91809-nf10irod`, base
   `salvage/r2f1b-3d-t2-extension-candidate` (`f66016e0`), terra/xhigh,
   `--depth light --strict-brief`.
+
+## T3 — SPLIT into T3a/T3b; T3a execution log (2026-08-17)
+
+**SPLIT DECISION (operator, before dispatch).** §3d(c)+(d) bundles the absence
+proof, an async/trait seam, a refusing lock window, a descriptor-safe removal
+and a two-population marker authority into one task. T2 was 682 delivered lines
+and consumed four review rounds, a park, an extension and two operator
+completions; (c)+(d) is larger. The standing discipline is to split before
+dispatch rather than after rejection, so:
+
+- **T3a DECIDES** — the state-agnostic exact-absence proof, the B18 seam, the
+  fail-closed tri-state, the recovery-inventory coupling, boot wiring. **Zero
+  record mutation, no transition-table edge.** Effect-free is safe to land by
+  construction (`custody_writer.rs:20-27` precedent).
+- **T3b ACTS** — the refusing lock window across proof→transition→unlink, the
+  `UnusedSettled` transition, descriptor-safe removal (B20), and the
+  two-population marker authority.
+
+**DECLARED CAP for T3a (before dispatch):** one pre-closure targeted repair on
+operator-verified findings → ONE counted Sol closure → at most ONE targeted
+repair on closed enumerable findings. Non-convergence parks and escalates; no
+silent extension.
+
+- T3a dispatched (`impl-41288-epg2lw7h`, base `main` `1d7826dd`, terra/xhigh).
+  Reached its 3-attempt bound at `c336d9c7`, **verify PASS ×4** (fmt, clippy,
+  build, test). Internal review functioned this round (three consecutive
+  glitch-free rounds after the `pre_authenticated` fix) and rejected each
+  attempt with a *different* real finding — attempt 1 compile/lint + a recovery
+  race, attempt 2 a symlink-following probe, attempt 3 the sidecar guard.
+  699 changed lines, inside the 750 cap. Preserved on pushed branch
+  `salvage/r2f1b-3d-t3a-first`.
+- **Operator verification at source on `c336d9c7`:**
+  - DELIVERED: the B18 seam + `ExactAbsenceProbeV1`; the tri-state; the
+    recovery coupling (`decide_unused_candidate_for_recovery`, `backend.rs:2271`)
+    with a passing test; population sharing; effect-free by construction.
+  - **Attempt 2's symlink finding is FIXED** — `target_absent_from_probe`
+    (`host_git.rs:108`) uses `symlink_metadata()`, so a dangling symlink reads
+    as present. Verified at source, not taken on the reviewer's word.
+  - **SURVIVING WRONG (confirmed):** `sweep_orphans_with_exact_absence`
+    (`sweep.rs:460`) builds its candidate straight from a
+    `ScannedWorktreeRecordV1::Legacy` sidecar without the
+    `sidecar_file_matches` / `worktree_under_root` guards `sweep_orphans`
+    applies, so a forged or stale `*.meta.json` naming an out-of-root absent
+    path can reach `Authorized`. Effect-free today, but the decision value IS
+    T3a's deliverable and T3b will act on it.
+- **THE REVIEWER'S SECOND CLAIM, CORRECTED.** It said the handoff "lacks the
+  mandated exact pre-change failure output". The handoff HAS a red-first
+  section — but every entry is a **compilation error**
+  (`error[E0425]: cannot find function ...`). A compile error proves only that
+  an API did not exist; it is not evidence a test discriminates behavior. So
+  AC 7 is unmet in substance while the reviewer's wording was imprecise.
+- **ROOT CAUSE IS THE OPERATOR'S SPEC, and it is structural.** An implement
+  agent on this lane has **no compile loop** (implement-lane egress is model
+  APIs only, ADR-0013). It therefore *cannot* produce behavioral red-first
+  evidence — only compile-error "reds". Demanding it in acceptance criteria
+  invites exactly the misleading transcript that appeared. **Standing
+  correction: the OPERATOR owns discriminating red/green controls on the host;
+  the agent is asked for an honest "not run, no local toolchain" plus the
+  mutation that should redden.** The T3a repair spec now says this outright.
+- Pre-closure targeted repair dispatched on frozen `c336d9c7` for the ONE
+  surviving WRONG (caps 200 lines, single file). Operator host controls run in
+  parallel.
+- GOTCHA, second occurrence: a fenced ```` ``` ```` Commit Message block in a
+  task spec gets copied literally, so the agent commits a bare ``` subject
+  (`a84c8b57`, now `c336d9c7`). The repair spec states the subject line
+  unfenced instead.
