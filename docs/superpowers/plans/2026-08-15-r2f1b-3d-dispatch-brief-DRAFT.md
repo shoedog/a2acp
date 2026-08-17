@@ -541,3 +541,58 @@ silent extension.
   round. A non-converging result parks T3a and escalates.
 - Repair 2 dispatched on frozen `5cbfddf2` (caps 300 lines) for both findings,
   with the container-verify-is-not-sufficient warning stated in the spec.
+
+### T3a repair 2 + operator completion — HOST GREEN, counted closure dispatched
+
+- Repair 2 CONVERGED in 2 attempts (`impl-50263-tbkfenrg`, `2e4dfb37`): verify
+  PASS ×4, internal review APPROVE, 277 lines against the 300 cap. Attempt 1 was
+  rejected only for unused imports under `clippy -D warnings`; the reviewer
+  traced the core logic and found no correctness defect.
+- **Finding 2 (recovery-owned Authorized) FIXED** — host-verified.
+- **Finding 1 (byte-exact path comparison) FIXED** by a shared
+  `paths_resolve_to_same_identity` comparator used by both the sync and async
+  probes, plus an `unresolvable_registration_paths_refuse_exact_absence` test.
+- **THE CONTAINER'S PASS FAILED TO HOLD A SECOND TIME.** Host bench at
+  `2e4dfb37`: 7 of 8 `exact_absence` tests green, one still red. Root-caused to
+  a **TEST-fixture defect, not production** —
+  `synchronous_exact_absence_capability_distinguishes_all_host_observations`
+  builds a deliberate symlinked worktree root, then derives
+  `canonical_worktree_root` from `std::env::temp_dir()`, which on macOS is
+  ITSELF symlinked (`/var` → `/private/var`). So the value named "canonical"
+  resolved the fixture's own symlink hop but not the platform's, and the test
+  compared `/var/…` against git's `/private/var/…`. Verified git's actual
+  behavior against the host toolchain (2.50.1): git ALWAYS records the fully
+  canonical path, including when the worktree is added through a non-canonical
+  absolute path. Linux `/tmp` is not symlinked — which is why the container
+  passed this test twice, the same environment-masking that hid the production
+  defect the test exists to catch.
+- **OPERATOR COMPLETION `b255cba5`**: resolve the fixture root. One line plus
+  the reasoning. The test then passes, which is the confirmation that the
+  comparator, the fail-closed probes and the recovery refusal are all correct
+  through a symlinked root.
+- **GATES GREEN on exact `b255cba5`** (host, unloaded): fmt clean; workspace
+  clippy `-D warnings` clean; full suite **4,149 passed / 0 failed / 13 ignored
+  across 90 targets** (+9 tests over `main`). Non-unix gate N/A — T3a touches
+  zero `bridge-core` files, and the Windows job compiles only
+  `bridge-store` → `bridge-core`.
+- Pushed: `salvage/r2f1b-3d-t3a-complete` = `b255cba5`.
+- **Counted Sol closure dispatched** on the full `1d7826dd..b255cba5` delta.
+
+**SIZING LESSON, recorded against my own estimate.** I split T3 specifically so
+each half would be convergently sized, and estimated T3a at 450–600 lines. It
+came in at **1,106** — roughly double. The split was still right (undivided
+(c)+(d) would have been ~2,000), but the estimate was not, and the counted round
+is again reviewing more than the discipline's own advice would like. For T3b:
+size from the delivered T3a delta, not from the brief's prose.
+
+**PROCESS NOTES against myself this round:**
+- I wrote `./tools/check-nonunix.sh | tail -2; echo "EXIT=$?"`, which captured
+  `tail`'s exit — so a missing script reported a false `exit 0`. That is exactly
+  the "prints errors, exits 0" failure I had warned about one round earlier.
+  Harmless here (the gate is N/A) but it reported success without running.
+- The commit-subject defect recurred a THIRD time and is now root-caused: the
+  typed task-spec schema treats the entire `## Commit Message` section as the
+  message, so instruction prose placed inside it becomes the subject. First a
+  fence produced a bare ```; then a warning sentence produced the warning
+  sentence. **The section must contain the message and nothing else**; guidance
+  belongs outside it. Fix this in the T3b spec.
