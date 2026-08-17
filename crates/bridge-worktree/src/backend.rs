@@ -978,9 +978,87 @@ async fn transfer_preparation_flight(
     }
     Ok(true)
 }
+/// How long a blocking test gate waits to be released before giving up and proceeding.
+///
+/// These gates park a blocking-pool thread until the test releases them. If the test panics
+/// FIRST — an assertion failure, or a `remove_dir` that returns `ENOTEMPTY` — the unwind drops
+/// the runtime and `BlockingPool::shutdown` joins the parked thread forever, so a clean red
+/// becomes an unbounded hang with the test binary at 0% CPU. That turned one 3d-T2 assertion
+/// failure into a 3-hour CI verify before anyone learned what had failed.
+///
+/// The bound is orders of magnitude above any legitimate hold (tests hold these gates across a
+/// few assertions), so it never changes the behavior of a passing test. It only converts "hang
+/// forever" into "proceed, and let the real failure surface".
+#[cfg(test)]
+const TEST_GATE_RELEASE_BOUND: Duration = Duration::from_secs(30);
+
+/// Wait for a blocking test gate's release flag, bounded by [`TEST_GATE_RELEASE_BOUND`].
+/// Wait for a gate's release, bounded, recording a timeout on the OWNING hooks instance.
+///
+/// Releasing the blocking thread is necessary — otherwise runtime drop hangs — but releasing it
+/// SILENTLY lets a test pass for the wrong reason. Concretely, in
+/// `terminal_replacement_serializes_exact_open_writers`, if the controller stalls past the bound
+/// the first writer publishes its terminal and drops its lease; the second writer then gets the
+/// expected `StoreFailure` because the record is already terminal, NOT because it contended — and
+/// every assertion still passes, with the serialization schedule never exercised.
+///
+/// The record lives on the hooks instance, NOT in a process-global: tests run in parallel, each
+/// with its own hooks, so a global would let one test's timeout fail whichever test dropped first
+/// while the owning test passed — an attribution bug inside an attribution fix.
+#[cfg(test)]
+fn await_test_gate_release(
+    timed_out: &StdMutex<Option<String>>,
+    released: &StdMutex<bool>,
+    release: &Condvar,
+    gate: &str,
+) {
+    // ONE absolute deadline. Passing the full bound to each `wait_timeout` would restart the
+    // clock on every spurious wakeup, so the "bound" could be extended indefinitely.
+    let deadline = std::time::Instant::now() + TEST_GATE_RELEASE_BOUND;
+    let mut held = released.lock().unwrap_or_else(|error| error.into_inner());
+    while !*held {
+        let Some(remaining) = deadline.checked_duration_since(std::time::Instant::now()) else {
+            *timed_out.lock().unwrap_or_else(|error| error.into_inner()) = Some(gate.to_owned());
+            eprintln!(
+                "test gate `{gate}` was never released within {TEST_GATE_RELEASE_BOUND:?} — \
+                 releasing the blocking thread so the real failure can surface; the owning test \
+                 will fail on this record"
+            );
+            return;
+        };
+        let (next, _timeout) = release
+            .wait_timeout(held, remaining)
+            .unwrap_or_else(|error| error.into_inner());
+        held = next;
+    }
+}
+
+#[cfg(test)]
+impl Drop for PreparationFlightTestHooks {
+    fn drop(&mut self) {
+        // Never panic while already unwinding: the test's own failure is the better diagnostic.
+        if std::thread::panicking() {
+            return;
+        }
+        let timed_out = self
+            .timed_out_gate
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take();
+        if let Some(gate) = timed_out {
+            panic!(
+                "test gate `{gate}` blew its {TEST_GATE_RELEASE_BOUND:?} deadline; the gated \
+                 schedule was NOT exercised, so this test's result is not evidence"
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 #[derive(Default)]
 struct PreparationFlightTestHooks {
+    /// Set when one of this instance's gates blew its deadline; asserted on drop.
+    timed_out_gate: StdMutex<Option<String>>,
     open_count: AtomicUsize,
     open: Notify,
     pause_after_open: AtomicBool,
@@ -1050,16 +1128,12 @@ impl PreparationFlightTestHooks {
             self.initial_open_publish_entered_count
                 .fetch_add(1, Ordering::SeqCst);
             self.initial_open_publish_entered.notify_waiters();
-            let mut released = self
-                .initial_open_publish_released
-                .lock()
-                .unwrap_or_else(|error| error.into_inner());
-            while !*released {
-                released = self
-                    .initial_open_publish_release
-                    .wait(released)
-                    .unwrap_or_else(|error| error.into_inner());
-            }
+            await_test_gate_release(
+                &self.timed_out_gate,
+                &self.initial_open_publish_released,
+                &self.initial_open_publish_release,
+                "initial_open_publish",
+            );
         }
     }
 
@@ -1094,16 +1168,12 @@ impl PreparationFlightTestHooks {
             self.control_root_pin_entered_count
                 .fetch_add(1, Ordering::SeqCst);
             self.control_root_pin_entered.notify_waiters();
-            let mut released = self
-                .control_root_pin_released
-                .lock()
-                .unwrap_or_else(|error| error.into_inner());
-            while !*released {
-                released = self
-                    .control_root_pin_release
-                    .wait(released)
-                    .unwrap_or_else(|error| error.into_inner());
-            }
+            await_test_gate_release(
+                &self.timed_out_gate,
+                &self.control_root_pin_released,
+                &self.control_root_pin_release,
+                "control_root_pin",
+            );
         }
     }
 
@@ -1168,16 +1238,12 @@ impl PreparationFlightTestHooks {
             self.custody_sync_entered_count
                 .fetch_add(1, Ordering::SeqCst);
             self.custody_sync_entered.notify_waiters();
-            let mut released = self
-                .custody_sync_released
-                .lock()
-                .unwrap_or_else(|error| error.into_inner());
-            while !*released {
-                released = self
-                    .custody_sync_release
-                    .wait(released)
-                    .unwrap_or_else(|error| error.into_inner());
-            }
+            await_test_gate_release(
+                &self.timed_out_gate,
+                &self.custody_sync_released,
+                &self.custody_sync_release,
+                "custody_sync",
+            );
         }
     }
 

@@ -50,6 +50,16 @@ the change instead, and it may get implemented independently.
 - Gates that must stay green: `cargo fmt --check`, `cargo clippy --workspace
   --all-targets -- -D warnings`, `cargo deny check`, per-crate coverage floors (see
   `.github/workflows/ci.yml`), and `a2a-bridge validate --repo-hygiene`.
+- **Non-unix lane — no local gate exists yet; be careful when touching
+  `crates/bridge-core`.** All the gates above are unix-only on a developer
+  machine, but CI compiles `bridge-core` for Windows (via `bridge-store`).
+  `liveness` and `namespace_transaction` are `#[cfg(unix)]` while `fs_custody`
+  is not, so a new `fs_custody` helper that calls into them type-checks locally
+  and fails CI with `E0433` or a non-unix `dead_code` warning. That has cost a
+  landing round five times (3a, 3b1, 3c1, 3c2, 3d-T2). A local gate was
+  attempted and withdrawn — see
+  `docs/superpowers/plans/2026-08-17-nonunix-gate-hermetic-task.md` for why and
+  what a sound one requires.
 - Architecture orientation: `README.md`, then `docs/adr/` (decisions), then
   `docs/2026-07-03-strategic-analysis.md` (current priorities).
 - Agent-facing quickstart: `AGENTS.md`.
