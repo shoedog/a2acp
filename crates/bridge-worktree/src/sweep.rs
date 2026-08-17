@@ -452,24 +452,45 @@ pub fn sweep_orphans(root: &str, my_host: &str, probe: &dyn LeaseProbe) {
     }
 }
 
+/// Decide whether a legacy sidecar can supply an exact-absence candidate.
+///
+/// A sidecar is only evidence after the same sibling and root guards used by the legacy
+/// reclamation sweep have vouched for it. This remains effect-free: an untrusted sidecar simply
+/// cannot prove absence.
+fn decide_unused_legacy_sidecar(
+    root: &SessionCwd,
+    sidecar_file: &str,
+    sidecar: &crate::provider_path::WorktreeSidecar,
+    exact_absence_probe: &dyn ExactAbsenceProbeV1,
+) -> UnusedCandidateDecisionV1 {
+    if !sidecar_file_matches(sidecar_file, &sidecar.worktree_path)
+        || !worktree_under_root(root, &sidecar.worktree_path)
+    {
+        return UnusedCandidateDecisionV1::Refused(UnusedCandidateRefusalV1::CannotProve);
+    }
+
+    let marker = ExactAbsenceCandidateV1::new(
+        sidecar.canonical_source.as_str(),
+        sidecar.worktree_path.as_str(),
+    );
+    decide_unused_marker(&marker, exact_absence_probe)
+}
+
 /// Produce effect-free exact-absence decisions during the synchronous boot sweep.
 ///
 /// This T3a path never reclaims legacy worktrees, publishes `UnusedSettled`, removes a marker,
 /// or changes a custody record. Existing legacy reclamation stays isolated in [`sweep_orphans`];
 /// T3b owns every action and repeats this proof under its refusing lock window.
 pub fn sweep_orphans_with_exact_absence(root: &str, exact_absence_probe: &dyn ExactAbsenceProbeV1) {
-    let Ok(_root_cwd) = canonicalize_lenient(root) else {
+    let Ok(root_cwd) = canonicalize_lenient(root) else {
         tracing::warn!(root, "skipping exact-absence sweep with non-canonical root");
         return;
     };
     for (path, scanned) in scan_worktree_records(root) {
         match scanned {
             ScannedWorktreeRecordV1::Legacy(sidecar) => {
-                let marker = ExactAbsenceCandidateV1::new(
-                    sidecar.canonical_source.as_str(),
-                    sidecar.worktree_path.as_str(),
-                );
-                let decision = decide_unused_marker(&marker, exact_absence_probe);
+                let decision =
+                    decide_unused_legacy_sidecar(&root_cwd, &path, &sidecar, exact_absence_probe);
                 tracing::info!(
                     sidecar = path,
                     decision = ?decision,
@@ -1096,6 +1117,135 @@ mod tests {
         assert!(decide_unused_candidate(&candidate, false, &probe).is_authorized());
         assert!(decide_unused_marker(&marker, &probe).is_authorized());
         assert_eq!(record.encode_canonical().unwrap(), record_before);
+    }
+
+    /// A legacy sidecar whose sibling lives outside the sweep root is not trustworthy evidence,
+    /// even when both absence facts would otherwise authorize its candidate.
+    #[test]
+    fn exact_absence_sweep_refuses_an_out_of_root_legacy_sidecar() {
+        let root = unique_temp_dir("exact-absence-out-of-root");
+        let outside = unique_temp_dir("exact-absence-out-of-root-sidecar");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        let sidecar = WorktreeSidecar {
+            canonical_source: root.join("source").to_string_lossy().into_owned(),
+            common_dir: root.join("source/.git").to_string_lossy().into_owned(),
+            worktree_path: outside.join("absent").to_string_lossy().into_owned(),
+            owner: "owner".into(),
+            run_id: "run-a".into(),
+            host: "my-host".into(),
+            lease: "/leases/dead.lock".into(),
+        };
+        write_sidecar(&sidecar).unwrap();
+        let root_cwd = crate::provider_path::canonicalize_lenient(&root.to_string_lossy()).unwrap();
+        let sidecar_file = sidecar_path(&sidecar.worktree_path);
+
+        assert!(super::sidecar_file_matches(
+            &sidecar_file,
+            &sidecar.worktree_path
+        ));
+        assert!(
+            !super::worktree_under_root(&root_cwd, &sidecar.worktree_path),
+            "the sibling guard passes, so the root guard must be what refuses this sidecar"
+        );
+        assert_eq!(
+            super::decide_unused_legacy_sidecar(
+                &root_cwd,
+                &sidecar_file,
+                &sidecar,
+                &ExactAbsenceTestProbe(ExactAbsenceTestAnswer::Observation(
+                    ExactAbsenceObservationV1::BothAbsent,
+                )),
+            ),
+            UnusedCandidateDecisionV1::Refused(UnusedCandidateRefusalV1::CannotProve)
+        );
+
+        fs::remove_dir_all(&root).unwrap();
+        fs::remove_dir_all(&outside).unwrap();
+    }
+
+    /// A sidecar that does not name its own sibling cannot supply a candidate, even when its
+    /// named path is in the sweep root and exact absence is otherwise proved.
+    #[test]
+    fn exact_absence_sweep_refuses_a_sidecar_that_does_not_match_its_file() {
+        let root = unique_temp_dir("exact-absence-file-mismatch");
+        fs::create_dir_all(&root).unwrap();
+        let sidecar = WorktreeSidecar {
+            canonical_source: root.join("source").to_string_lossy().into_owned(),
+            common_dir: root.join("source/.git").to_string_lossy().into_owned(),
+            worktree_path: root.join("absent").to_string_lossy().into_owned(),
+            owner: "owner".into(),
+            run_id: "run-a".into(),
+            host: "my-host".into(),
+            lease: "/leases/dead.lock".into(),
+        };
+        let forged = root.join("forged.meta.json");
+        fs::write(&forged, serde_json::to_vec(&sidecar).unwrap()).unwrap();
+        let root_cwd = crate::provider_path::canonicalize_lenient(&root.to_string_lossy()).unwrap();
+
+        assert!(
+            !super::sidecar_file_matches(&forged.to_string_lossy(), &sidecar.worktree_path),
+            "the forged file must fail the sibling guard"
+        );
+        assert!(
+            super::worktree_under_root(&root_cwd, &sidecar.worktree_path),
+            "the root guard passes, so the sibling guard must be what refuses this sidecar"
+        );
+        assert_eq!(
+            super::decide_unused_legacy_sidecar(
+                &root_cwd,
+                &forged.to_string_lossy(),
+                &sidecar,
+                &ExactAbsenceTestProbe(ExactAbsenceTestAnswer::Observation(
+                    ExactAbsenceObservationV1::BothAbsent,
+                )),
+            ),
+            UnusedCandidateDecisionV1::Refused(UnusedCandidateRefusalV1::CannotProve)
+        );
+
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// The guards remain permissive for a genuine legacy sidecar: both absence facts still
+    /// produce the authorization T3b will later consume under its lock window.
+    #[test]
+    fn exact_absence_sweep_authorizes_a_valid_in_root_legacy_sidecar() {
+        let root = unique_temp_dir("exact-absence-valid-sidecar");
+        fs::create_dir_all(&root).unwrap();
+        let sidecar = WorktreeSidecar {
+            canonical_source: root.join("source").to_string_lossy().into_owned(),
+            common_dir: root.join("source/.git").to_string_lossy().into_owned(),
+            worktree_path: root.join("absent").to_string_lossy().into_owned(),
+            owner: "owner".into(),
+            run_id: "run-a".into(),
+            host: "my-host".into(),
+            lease: "/leases/dead.lock".into(),
+        };
+        write_sidecar(&sidecar).unwrap();
+        let root_cwd = crate::provider_path::canonicalize_lenient(&root.to_string_lossy()).unwrap();
+        let sidecar_file = sidecar_path(&sidecar.worktree_path);
+
+        assert!(super::sidecar_file_matches(
+            &sidecar_file,
+            &sidecar.worktree_path
+        ));
+        assert!(super::worktree_under_root(
+            &root_cwd,
+            &sidecar.worktree_path
+        ));
+        assert_eq!(
+            super::decide_unused_legacy_sidecar(
+                &root_cwd,
+                &sidecar_file,
+                &sidecar,
+                &ExactAbsenceTestProbe(ExactAbsenceTestAnswer::Observation(
+                    ExactAbsenceObservationV1::BothAbsent,
+                )),
+            ),
+            UnusedCandidateDecisionV1::Authorized
+        );
+
+        fs::remove_dir_all(&root).unwrap();
     }
 
     /// Materialize a V3 checkout: the worktree directory plus its sibling

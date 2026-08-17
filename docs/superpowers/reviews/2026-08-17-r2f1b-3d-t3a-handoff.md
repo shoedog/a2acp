@@ -120,3 +120,24 @@ recovery inventory entry exists.
 
 `git diff --cached --numstat 1d7826dd` reports 679 added and 20 deleted lines across source and
 this handoff, below the 750-line cap.
+
+## Legacy-sidecar validation repair
+
+The exact-absence sweep now passes legacy records through the existing `sidecar_file_matches` and
+`worktree_under_root` guards before creating a candidate. A failed guard returns
+`Refused(CannotProve)`; this path remains decision-only. Valid in-root sidecars still use the
+existing exact-absence predicate.
+
+### Repair verification
+
+- `rustfmt --check crates/bridge-worktree/src/sweep.rs` — passed.
+- `git diff --check` — passed.
+- Post-fold `git diff --numstat c336d9c7..HEAD`: `156/6` in `sweep.rs`, `10/6` in `reaper.rs`, `21/0` here; 199 changed lines.
+- `exact_absence_sweep_refuses_an_out_of_root_legacy_sidecar` — not run, no local toolchain.
+  Removing `worktree_under_root` should make it red by returning `Authorized`.
+- `exact_absence_sweep_refuses_a_sidecar_that_does_not_match_its_file` — not run, no local
+  toolchain. Removing `sidecar_file_matches` should make it red by returning `Authorized`.
+- `exact_absence_sweep_authorizes_a_valid_in_root_legacy_sidecar` — not run, no local toolchain.
+  Unconditionally refusing legacy sidecars should make it red.
+- Cargo test, Clippy, and the workspace suite — not run, no local toolchain; crates.io-dependent
+  Cargo work is blocked by the configured HTTP 403 egress policy.
