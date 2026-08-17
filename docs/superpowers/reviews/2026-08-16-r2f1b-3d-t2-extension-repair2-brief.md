@@ -232,6 +232,44 @@ REJECT. Classifying before acting, per the discipline:
 fix, and escalate finding 1 to design as its own sub-slice. No third extension
 is taken unilaterally — per the declared boundary, this goes to the owner.
 
+## Split executed (owner-approved)
+
+**Finding 2 — FIXED, `582e832b`** (operator, red-first). The root-pin failure
+arm now does `complete` → guarded `Arc::ptr_eq` removal → `send_result`, with
+the removal scoped so the std mutex guard drops before the await.
+
+- Red-first control: the new test
+  `failing_control_root_pin_releases_before_publishing_its_result` was written
+  BEFORE the fix and failed on unmodified `85658e01` at exactly
+  `the reservation must already be released when the caller observes its result`.
+  It drives the existing `pause_after_result_publication` hook, so the window
+  is **deterministic** rather than a timing race — which is precisely why the
+  earlier T-A/T-C could not catch it: a `#[tokio::test]` current-thread runtime
+  cannot expose the race by parallelism alone.
+- Gates on exact `582e832b` (host, unloaded): fmt clean; workspace clippy
+  `-D warnings` clean; full suite **4,140 passed / 0 failed / 13 ignored across
+  90 targets**.
+- Attribution recorded plainly: this defect came from the operator's repair
+  spec prescribing complete-then-remove. The agent implemented what it was told.
+
+**Finding 1 — ESCALATED to a design sub-slice**, spec at
+`plans/2026-08-16-r2f1b-3d-t2-root-identity-subslice.md`. It is the third
+distinct control-root/journal-root defect in three rounds (W3 → E2 →
+root-alias binding) — the open-class signature — and its fix binds and carries
+a root identity through `PreparationFlightJournalV1`. Not folded into a
+consumed cap.
+
+**Reachability of finding 1 — RESOLVED, not left open.** The lens called it
+"production-reachable now" but could not observe deployment state. Against the
+tree: `materialize_under_custody` runs only for an admitted
+`BoundWorktreeCustodyV1` (else `backend.rs:3686` returns `Legacy` before any
+flight is claimed); that requires a `FrozenR2f1bContractV1`; and the only
+constructor of one is `execution_policy.rs:2621`, inside the `#[cfg(test)]`
+module opening at `execution_policy.rs:2580`. The defect is **latent** — it
+activates when the V3 path becomes reachable. So the sub-slice gates the
+V3-arming slice, not T2's landing. The lens's real contribution here stands:
+the defect does not depend on transfer arming.
+
 ## Ledger items raised this round
 
 - **Test-harness hang amplifier (SMELL, recommend fixing next round).** Any
