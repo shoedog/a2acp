@@ -704,6 +704,34 @@ impl PinnedDirectoryV1 {
         open_regular_child(&self.file, name, label)
     }
 
+    /// Unix-only: the lease is `flock`-backed, and `crate::liveness` is itself `cfg(unix)`.
+    /// Its only caller (the preparation flight's terminal replacement) is unix-gated too. This
+    /// follows the established 3b1/3c1/3c2 guard pattern for the non-unix lane.
+    #[cfg(unix)]
+    pub fn with_existing_regular_child_lease<T, F>(
+        &self,
+        name: &OsStr,
+        label: &str,
+        operation: F,
+    ) -> Result<T, FsCustodyError>
+    where
+        F: FnOnce(&File) -> T,
+    {
+        let opened = self.open_regular_file(name, label)?;
+        let _lease = crate::liveness::acquire_persistent_lock_file(
+            opened
+                .try_clone()
+                .map_err(|error| FsCustodyError::Io(label.to_owned(), error))?,
+            self.canonical_path.join(Path::new(name)),
+        )
+        .map_err(|error| FsCustodyError::Io(label.to_owned(), error))?;
+        let current = self.open_regular_file(name, label)?;
+        if !same_regular_file(&opened, &current, label)? {
+            return Err(FsCustodyError::IdentityChanged(label.to_owned()));
+        }
+        Ok(operation(&opened))
+    }
+
     /// Does a directory entry of ANY kind exist at `name` beneath this pinned directory?
     ///
     /// Descriptor-relative and no-follow, so a dangling symlink at `name` answers `true`: the
