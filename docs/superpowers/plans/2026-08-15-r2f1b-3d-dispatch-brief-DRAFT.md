@@ -596,3 +596,75 @@ size from the delivered T3a delta, not from the brief's prose.
   fence produced a bare ```; then a warning sentence produced the warning
   sentence. **The section must contain the message and nothing else**; guidance
   belongs outside it. Fix this in the T3b spec.
+
+## T3a PARKED at the path-identity boundary — owner escalation (2026-08-17)
+
+Counted Sol closure on `1d7826dd..b255cba5` (1,106 lines): **REJECT, 3 WRONG /
+3 SMELL-DEFER** (verbatim: `reviews/2026-08-17-r2f1b-3d-t3a-sol-closure.md`).
+All three operator-verified at source:
+
+1. The real 2b2 V3 population never reached the proof — `sweep.rs:564` refused
+   every V3 record claiming the schema carries no source. **That claim is false:**
+   `custody.rs:196` makes the claim `Required` for `PreservationUnknown`, and
+   `PreservedWorktreeClaimV1` carries `source`/`root`/`worktree`/`common_dir`.
+   The "serves both populations" test fabricated its second population, so it
+   was a false positive as well as a delivery gap.
+2. Unchecked candidate strings reach `git -C`, so a legacy sidecar with a
+   relative source queries whatever repo the bridge launched in and authorizes.
+3. Missing-tail byte equality is not identity: on a case-insensitive filesystem
+   `/root/wt` and `/root/WT` compare unequal and authorize.
+
+**Repair 3 (`impl-4355-lyhk4i8p`, `ad60db53`) did NOT converge** — 3-attempt
+bound, verify FAIL at test, review REJECT. Exactly 600 changed lines against a
+600 hard cap, and no handoff update. Delivered R1 and R3; **R2 remains unmet and
+R3 is over-conservative**:
+
+- `ExactAbsenceCandidateV1::from_claim` takes `common_dir` as `_common_dir` and
+  **drops it**. Replace only the `source/.git` common-dir object while leaving
+  the source inode intact: `revalidate_source()` passes, `git -C` queries the
+  replacement repo, and T3a authorizes a target still registered under the
+  original. That is the fifth path-identity instance.
+- The tri-state comparator refuses EVERY missing-tail comparison, which breaks
+  the pre-existing `porcelain_registration_check_is_exact_and_handles_locked_records`
+  (host suite 289/1). Its data is synthetic: listed `/repo` and `/managed/wt`,
+  queried `/managed/other`, none of which exist on disk. Clearly-distinct names
+  ought to be a PROVEN difference; refusing them means the proof can never
+  authorize whenever the repo holds any other registration. Fail-closed, but
+  functionally inert — and it silently changes the semantics of the existing
+  removal-verification path that shares the parser.
+
+**PARKED, per the boundary I declared myself.** The sub-slice note written
+earlier today says: *"If a fifth instance appears, stop patching and build the
+primitive here."* It has appeared. The owner's standing authorization covered
+one more repair round; it was spent on repair 3. Taking a fourth would exceed
+both that authorization and my own declared rule, so this goes to the owner.
+
+**State of record:**
+- `main` = `1d7826dd` (T1+T2). T3a has never touched it.
+- Last HOST-GREEN T3a artifact: `b255cba5`
+  (`salvage/r2f1b-3d-t3a-complete`) — fmt/clippy clean, 4,149/0/13 across 90,
+  carrying the closure's three WRONGs.
+- Parked repair: `ad60db53` (`salvage/r2f1b-3d-t3a-repair3`) — R1 + R3
+  delivered, R2 unmet, host suite 289/1.
+
+**Owner options:**
+1. **Build the path-identity primitive as its own designed sub-slice** (the
+   widened `plans/2026-08-16-r2f1b-3d-t2-root-identity-subslice.md`), then
+   finish T3a on top of it. Operator recommendation: five instances across two
+   slices, three of them failing open, and the remaining question — *when are
+   two possibly-nonexistent paths provably different?* — is precisely the
+   primitive's design question, not a repair detail.
+2. **Authorize a fourth, narrowly scoped repair**: bind `common_dir`, and make
+   the comparator prove difference for clearly-distinct names (deepest existing
+   ancestors differ ⇒ different; same ancestor ⇒ compare remaining components
+   under the filesystem's own case semantics; only case/normalization aliases
+   are ambiguous). Both items are enumerable, so this is defensible if momentum
+   matters more than the boundary.
+3. **Land R1 alone** — take the V3-population fix onto the host-green
+   `b255cba5` base, revert R2/R3, and carry the path-identity findings to the
+   sub-slice. Smallest landable increment; leaves two known fail-open holes in
+   an unreachable path.
+
+Carried regardless: the three closure SMELLs (unbounded sync I/O on async boot
+paths; regression evidence not behaviorally fail-first; handoff cap
+unreconciled), and T3b remains unstarted.
