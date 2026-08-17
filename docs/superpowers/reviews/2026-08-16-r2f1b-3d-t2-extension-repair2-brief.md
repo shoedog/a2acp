@@ -314,6 +314,11 @@ Fixed in `bf17005a` with the established 4-line `#[cfg(unix)]` guard.
 PR #54 squash-merged 2026-08-17. Merged content **byte-exact to the gated
 tree** (`git diff bf17005a origin/main` empty). Local `main` fast-forwarded.
 
+**POST-MERGE CI on `main` `1d7826dd`: SUCCESS, all three jobs** (Build/Lint/
+Coverage, Bridge Store macOS 14, Bridge Store Unsupported Target Windows). No
+post-merge flake this round — contract satisfied (push + PR + CI green).
+**T2 DECLARED COMPLETE.**
+
 Final CI on `bf17005a`: cla-assistant pass; Bridge Store (macOS 14) pass ×2;
 **Bridge Store Unsupported Target (Windows) pass ×2** (the guard worked);
 Build/Lint/Coverage pass. `mergeable=MERGEABLE state=CLEAN`.
