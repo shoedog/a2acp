@@ -704,6 +704,10 @@ impl PinnedDirectoryV1 {
         open_regular_child(&self.file, name, label)
     }
 
+    /// Unix-only: the lease is `flock`-backed, and `crate::liveness` is itself `cfg(unix)`.
+    /// Its only caller (the preparation flight's terminal replacement) is unix-gated too. This
+    /// follows the established 3b1/3c1/3c2 guard pattern for the non-unix lane.
+    #[cfg(unix)]
     pub fn with_existing_regular_child_lease<T, F>(
         &self,
         name: &OsStr,
