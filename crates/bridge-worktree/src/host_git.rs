@@ -3,9 +3,10 @@ use crate::provider::{
     add_argv, is_repo_argv, list_porcelain_argv, prune_argv, remove_argv, CustodyAddFailureV1,
     CustodyAddOutcomeV1, CustodyAddTargetV1, WorktreeProvider,
 };
+use crate::sweep::{ExactAbsenceCandidateV1, ExactAbsenceObservationV1, ExactAbsenceProbeV1};
 use bridge_core::error::BridgeError;
 use std::path::Path;
-use std::process::Output;
+use std::process::{Command as StdCommand, Output};
 use std::time::Duration;
 use tokio::process::Command;
 
@@ -29,6 +30,20 @@ async fn run_git(argv: &[&str]) -> Result<Output, BridgeError> {
     command
         .output()
         .await
+        .map_err(|e| BridgeError::ConfigInvalid {
+            reason: format!("git spawn: {e}"),
+        })
+}
+
+/// The synchronous half of the recovery capability.
+///
+/// The boot sweep is synchronous (and may be reached from `Drop`), so it must not enter a Tokio
+/// runtime just to reuse `run_git`. This explicit blocking `Command::output` mirrors the async
+/// helper's error contract without creating a nested executor.
+fn run_git_sync(argv: &[&str]) -> Result<Output, BridgeError> {
+    StdCommand::new("git")
+        .args(argv)
+        .output()
         .map_err(|e| BridgeError::ConfigInvalid {
             reason: format!("git spawn: {e}"),
         })
@@ -86,12 +101,18 @@ async fn common_dir(repo: &str) -> String {
         .unwrap_or_default()
 }
 
-fn target_absent_from_probe(probe: std::io::Result<bool>) -> Result<bool, BridgeError> {
-    probe
-        .map(|exists| !exists)
-        .map_err(|error| BridgeError::ConfigInvalid {
+/// Prove the target path has no directory entry without following a final symlink.
+///
+/// `Path::try_exists` follows links, so it reports a dangling final link as missing. A link is
+/// still an extant target that T3a must refuse; `symlink_metadata` observes that entry itself.
+fn target_absent_from_probe(target: &Path) -> Result<bool, BridgeError> {
+    match target.symlink_metadata() {
+        Ok(_) => Ok(false),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(true),
+        Err(error) => Err(BridgeError::ConfigInvalid {
             reason: format!("worktree target metadata failed: {error}"),
-        })
+        }),
+    }
 }
 
 fn removal_is_complete(
@@ -124,6 +145,34 @@ async fn registration_absent(repo: &str, wt: &str) -> Result<bool, BridgeError> 
     Ok(registration_absent_from_porcelain(&listed.stdout, wt))
 }
 
+fn registration_absent_sync(repo: &str, wt: &str) -> Result<bool, BridgeError> {
+    let listed = run_git_sync(&list_porcelain_argv(repo))?;
+    if !listed.status.success() {
+        return Err(BridgeError::ConfigInvalid {
+            reason: format!(
+                "worktree list failed: {}",
+                String::from_utf8_lossy(&listed.stderr).trim()
+            ),
+        });
+    }
+    Ok(registration_absent_from_porcelain(&listed.stdout, wt))
+}
+
+impl ExactAbsenceProbeV1 for HostGitWorktree {
+    fn observe_exact_absence(
+        &self,
+        candidate: &ExactAbsenceCandidateV1,
+    ) -> Result<ExactAbsenceObservationV1, BridgeError> {
+        if !target_absent_from_probe(Path::new(&candidate.worktree_path))? {
+            return Ok(ExactAbsenceObservationV1::TargetPresent);
+        }
+        if !registration_absent_sync(&candidate.canonical_source, &candidate.worktree_path)? {
+            return Ok(ExactAbsenceObservationV1::RegisteredButAbsent);
+        }
+        Ok(ExactAbsenceObservationV1::BothAbsent)
+    }
+}
+
 /// `git worktree remove` + `prune`, then the two post-conditions §5.1 names: the target is absent
 /// and the registration is gone.
 ///
@@ -140,7 +189,7 @@ async fn registration_absent(repo: &str, wt: &str) -> Result<bool, BridgeError> 
 async fn remove_and_verify(repo: &str, wt: &str) -> Result<(), BridgeError> {
     let remove = run_git(&remove_argv(repo, wt)).await?;
     let prune = run_git(&prune_argv(repo)).await?;
-    let target_absent = target_absent_from_probe(Path::new(wt).try_exists())?;
+    let target_absent = target_absent_from_probe(Path::new(wt))?;
     let registration_absent = registration_absent(repo, wt).await?;
 
     if removal_is_complete(prune.status.success(), target_absent, registration_absent) {
@@ -169,9 +218,9 @@ async fn remove_and_verify(repo: &str, wt: &str) -> Result<(), BridgeError> {
 /// production and record every ambiguous probe as a definite answer — the exact failure mode
 /// §5.7's ambiguity rows exist to prevent.
 async fn classify_custody_add_failure(repo: &str, wt: &str, reason: String) -> CustodyAddFailureV1 {
-    let target = match Path::new(wt).try_exists() {
-        Ok(true) => CustodyAddTargetV1::Present,
-        Ok(false) => CustodyAddTargetV1::ProvablyAbsent,
+    let target = match target_absent_from_probe(Path::new(wt)) {
+        Ok(false) => CustodyAddTargetV1::Present,
+        Ok(true) => CustodyAddTargetV1::ProvablyAbsent,
         Err(_) => CustodyAddTargetV1::Unproven,
     };
     let recovery_locator = match registration_absent(repo, wt).await {
@@ -321,6 +370,18 @@ mod tests {
         );
     }
 
+    fn repo(tmp: &Path) -> PathBuf {
+        let src = tmp.join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        git(&src, &["init", "-q"]);
+        git(&src, &["config", "user.email", "a@b.c"]);
+        git(&src, &["config", "user.name", "x"]);
+        std::fs::write(src.join("file.txt"), "base\n").unwrap();
+        git(&src, &["add", "-A"]);
+        git(&src, &["commit", "-q", "-m", "init"]);
+        src
+    }
+
     #[test]
     fn cleanup_success_requires_absent_target_registration_and_successful_prune() {
         assert!(
@@ -330,13 +391,14 @@ mod tests {
         assert!(!removal_is_complete(false, true, true));
         assert!(!removal_is_complete(true, false, true));
         assert!(!removal_is_complete(true, true, false));
-        assert!(target_absent_from_probe(Ok(false)).unwrap());
-        assert!(target_absent_from_probe(Ok(true)).is_ok_and(|absent| !absent));
-        assert!(target_absent_from_probe(Err(std::io::Error::new(
-            std::io::ErrorKind::PermissionDenied,
-            "denied",
-        )))
-        .is_err());
+        let tmp = unique_temp_dir("target-absence-probe");
+        std::fs::create_dir_all(&tmp).unwrap();
+        let target = tmp.join("target");
+        assert!(target_absent_from_probe(&target).unwrap());
+        std::fs::create_dir(&target).unwrap();
+        assert!(!target_absent_from_probe(&target).unwrap());
+        std::fs::remove_dir(&target).unwrap();
+        std::fs::remove_dir_all(&tmp).unwrap();
     }
 
     #[test]
@@ -346,6 +408,53 @@ mod tests {
         assert!(!registration_absent_from_porcelain(output, "/managed/wt"));
         assert!(registration_absent_from_porcelain(output, "/managed/other"));
         assert!(registration_absent_from_porcelain(output, "/managed/w"));
+    }
+
+    /// The B18 sync capability observes the same three facts as the private async registration
+    /// helper without entering a Tokio runtime from the sweep.
+    #[tokio::test]
+    async fn synchronous_exact_absence_capability_distinguishes_all_host_observations() {
+        let tmp = unique_temp_dir("sync-exact-absence");
+        let src = repo(&tmp);
+        let target = tmp.join("target");
+        let candidate =
+            ExactAbsenceCandidateV1::new(src.to_string_lossy(), target.to_string_lossy());
+        let provider = HostGitWorktree::new();
+
+        assert_eq!(
+            provider.observe_exact_absence(&candidate).unwrap(),
+            ExactAbsenceObservationV1::BothAbsent
+        );
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(tmp.join("missing-target"), &target).unwrap();
+            assert_eq!(
+                provider.observe_exact_absence(&candidate).unwrap(),
+                ExactAbsenceObservationV1::TargetPresent,
+                "a dangling link is an extant target and must not authorize exact absence"
+            );
+            std::fs::remove_file(&target).unwrap();
+        }
+        provider
+            .add(src.to_str().unwrap(), target.to_str().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            provider.observe_exact_absence(&candidate).unwrap(),
+            ExactAbsenceObservationV1::TargetPresent
+        );
+
+        std::fs::remove_dir_all(&target).unwrap();
+        assert_eq!(
+            provider.observe_exact_absence(&candidate).unwrap(),
+            ExactAbsenceObservationV1::RegisteredButAbsent
+        );
+        git(&src, &["worktree", "prune"]);
+        assert_eq!(
+            provider.observe_exact_absence(&candidate).unwrap(),
+            ExactAbsenceObservationV1::BothAbsent
+        );
+        std::fs::remove_dir_all(tmp).unwrap();
     }
 
     #[tokio::test]

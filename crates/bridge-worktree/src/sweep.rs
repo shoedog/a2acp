@@ -4,6 +4,7 @@ use crate::custody::{
 };
 use crate::provider::{prune_argv, remove_argv};
 use crate::provider_path::{canonicalize_lenient, read_sidecar, sidecar_path};
+use bridge_core::error::BridgeError;
 use bridge_core::fs_custody::PinnedDirectoryV1;
 #[cfg(unix)]
 use bridge_core::fs_custody::{BirthTimeV1, DirectoryIdentityV1};
@@ -12,6 +13,116 @@ use bridge_core::run_identity::{classify, Verdict};
 use bridge_core::SessionCwd;
 use std::collections::HashMap;
 use std::path::Path;
+
+/// The source and target a recovery-side unused-marker decision is about.
+///
+/// This carries no custody state deliberately. The exact-absence predicate answers only whether
+/// this source still registers this target and whether the target exists; T3b owns deciding which
+/// state/population may consume an authorized decision.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExactAbsenceCandidateV1 {
+    pub canonical_source: String,
+    pub worktree_path: String,
+}
+
+impl ExactAbsenceCandidateV1 {
+    #[must_use]
+    pub fn new(canonical_source: impl Into<String>, worktree_path: impl Into<String>) -> Self {
+        Self {
+            canonical_source: canonical_source.into(),
+            worktree_path: worktree_path.into(),
+        }
+    }
+}
+
+/// The three successful observations a synchronous host recovery capability can return.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExactAbsenceObservationV1 {
+    /// A directory entry exists at the candidate target.
+    TargetPresent,
+    /// The target is absent, but `git worktree list --porcelain -z` still names it.
+    RegisteredButAbsent,
+    /// The target is absent and Git proved no registration names it.
+    BothAbsent,
+}
+
+/// The host recovery capability used by the synchronous sweep.
+///
+/// This is intentionally a synchronous trait, like `LeaseProbe`: the boot and run-end sweep are
+/// synchronous callers, including a `Drop` path. Implementations must perform an explicit
+/// synchronous host observation rather than trying to block an async runtime worker on
+/// `host_git`'s private async probe.
+pub trait ExactAbsenceProbeV1: Send + Sync {
+    fn observe_exact_absence(
+        &self,
+        candidate: &ExactAbsenceCandidateV1,
+    ) -> Result<ExactAbsenceObservationV1, BridgeError>;
+}
+
+/// T3a's effect-free, fail-closed answer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UnusedCandidateDecisionV1 {
+    /// Both absence facts were proved at the decision point. T3b may consume this only under its
+    /// refusing proof-to-transition-to-unlink window.
+    Authorized,
+    /// No marker, record, provider, or directory was changed. The refusal reason is deliberately
+    /// coarse: an unavailable probe and recovery ownership are both "cannot prove".
+    Refused(UnusedCandidateRefusalV1),
+}
+
+impl UnusedCandidateDecisionV1 {
+    #[must_use]
+    pub fn is_authorized(self) -> bool {
+        matches!(self, Self::Authorized)
+    }
+}
+
+/// Why exact absence did not authorize an unused-marker settlement.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UnusedCandidateRefusalV1 {
+    TargetPresent,
+    RegisteredButAbsent,
+    CannotProve,
+}
+
+/// Decide exact absence without inspecting or mutating a custody state.
+///
+/// `recovery_owned` is sampled by the backend from T2's recovery inventory before this function
+/// is called. A live transferred runner makes an otherwise absent target unprovable. This routine
+/// has no filesystem write, lock acquisition, record transition, or provider call.
+#[must_use]
+pub fn decide_unused_candidate(
+    candidate: &ExactAbsenceCandidateV1,
+    recovery_owned: bool,
+    probe: &dyn ExactAbsenceProbeV1,
+) -> UnusedCandidateDecisionV1 {
+    if recovery_owned {
+        return UnusedCandidateDecisionV1::Refused(UnusedCandidateRefusalV1::CannotProve);
+    }
+    match probe.observe_exact_absence(candidate) {
+        Ok(ExactAbsenceObservationV1::TargetPresent) => {
+            UnusedCandidateDecisionV1::Refused(UnusedCandidateRefusalV1::TargetPresent)
+        }
+        Ok(ExactAbsenceObservationV1::RegisteredButAbsent) => {
+            UnusedCandidateDecisionV1::Refused(UnusedCandidateRefusalV1::RegisteredButAbsent)
+        }
+        Ok(ExactAbsenceObservationV1::BothAbsent) => UnusedCandidateDecisionV1::Authorized,
+        Err(_) => UnusedCandidateDecisionV1::Refused(UnusedCandidateRefusalV1::CannotProve),
+    }
+}
+
+/// Decide a marker-population member with the shared state-agnostic predicate.
+///
+/// A marker is represented by the same source/target pair as an in-memory candidate. Its custody
+/// record is intentionally absent from this signature: T3a must not read state as a proxy for
+/// absence, and must not mutate a marker byte.
+#[must_use]
+pub fn decide_unused_marker(
+    marker: &ExactAbsenceCandidateV1,
+    probe: &dyn ExactAbsenceProbeV1,
+) -> UnusedCandidateDecisionV1 {
+    decide_unused_candidate(marker, false, probe)
+}
 
 // Stays sync (not de-blocked like host_git.rs's run_git): this call runs inside
 // `WorktreeRunEndGuard::drop` (a `Drop` impl cannot await) and during the
@@ -341,6 +452,47 @@ pub fn sweep_orphans(root: &str, my_host: &str, probe: &dyn LeaseProbe) {
     }
 }
 
+/// Produce effect-free exact-absence decisions during the synchronous boot sweep.
+///
+/// This T3a path never reclaims legacy worktrees, publishes `UnusedSettled`, removes a marker,
+/// or changes a custody record. Existing legacy reclamation stays isolated in [`sweep_orphans`];
+/// T3b owns every action and repeats this proof under its refusing lock window.
+pub fn sweep_orphans_with_exact_absence(root: &str, exact_absence_probe: &dyn ExactAbsenceProbeV1) {
+    let Ok(_root_cwd) = canonicalize_lenient(root) else {
+        tracing::warn!(root, "skipping exact-absence sweep with non-canonical root");
+        return;
+    };
+    for (path, scanned) in scan_worktree_records(root) {
+        match scanned {
+            ScannedWorktreeRecordV1::Legacy(sidecar) => {
+                let marker = ExactAbsenceCandidateV1::new(
+                    sidecar.canonical_source.as_str(),
+                    sidecar.worktree_path.as_str(),
+                );
+                let decision = decide_unused_marker(&marker, exact_absence_probe);
+                tracing::info!(
+                    sidecar = path,
+                    decision = ?decision,
+                    "made an effect-free exact-absence decision for a legacy marker"
+                );
+            }
+            ScannedWorktreeRecordV1::Custody(_) | ScannedWorktreeRecordV1::UnreadableCustody(_) => {
+                // V3's existing marker schema deliberately carries no canonical source. T3a does
+                // not rewrite it just to make this answer convenient: registration is unprovable,
+                // so the only safe answer is a refusal. T3b receives a source-bearing candidate
+                // explicitly when it owns the later acting path.
+                let decision =
+                    UnusedCandidateDecisionV1::Refused(UnusedCandidateRefusalV1::CannotProve);
+                tracing::info!(
+                    record = path,
+                    decision = ?decision,
+                    "refused an exact-absence decision for a source-less V3 custody marker"
+                );
+            }
+        }
+    }
+}
+
 /// Run-end backstop for worktrees created by a single bridge process run.
 ///
 /// **Unconditionally non-destructive for V3 custody records** (focused boundary §5.2
@@ -484,7 +636,13 @@ impl Drop for WorktreeRunEndGuard {
 
 #[cfg(test)]
 mod tests {
+    use super::{
+        decide_unused_candidate, decide_unused_marker, ExactAbsenceCandidateV1,
+        ExactAbsenceObservationV1, ExactAbsenceProbeV1, UnusedCandidateDecisionV1,
+        UnusedCandidateRefusalV1,
+    };
     use crate::provider_path::{sidecar_path, write_sidecar, WorktreeSidecar};
+    use bridge_core::error::BridgeError;
     use bridge_core::liveness::LeaseProbe;
     use std::collections::HashMap;
     use std::fs;
@@ -496,6 +654,28 @@ mod tests {
     impl LeaseProbe for FakeProbe {
         fn try_state(&self, lease_path: &str) -> Option<bool> {
             self.0.get(lease_path).copied().flatten()
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    enum ExactAbsenceTestAnswer {
+        Observation(ExactAbsenceObservationV1),
+        Failure,
+    }
+
+    struct ExactAbsenceTestProbe(ExactAbsenceTestAnswer);
+
+    impl ExactAbsenceProbeV1 for ExactAbsenceTestProbe {
+        fn observe_exact_absence(
+            &self,
+            _candidate: &ExactAbsenceCandidateV1,
+        ) -> Result<ExactAbsenceObservationV1, BridgeError> {
+            match self.0 {
+                ExactAbsenceTestAnswer::Observation(answer) => Ok(answer),
+                ExactAbsenceTestAnswer::Failure => Err(BridgeError::ConfigInvalid {
+                    reason: "injected exact-absence probe failure".to_string(),
+                }),
+            }
         }
     }
 
@@ -827,6 +1007,95 @@ mod tests {
             state,
             claim,
         }
+    }
+
+    /// The T3a exit gate: each refusing arm is effect-free, and only an exact two-part absence
+    /// returns the typed authorization that T3b will later consume under its lock window.
+    #[test]
+    fn unused_candidate_settles_only_after_exact_absence() {
+        let candidate = ExactAbsenceCandidateV1::new("/source", "/root/candidate");
+        let marker = ExactAbsenceCandidateV1::new("/source", "/root/marker");
+        let record = custody_record(
+            "/root/marker",
+            WorktreeCustodyStateV1::ProtectionPrepared {},
+        );
+        let record_before = record.encode_canonical().unwrap();
+        assert_eq!(
+            decide_unused_candidate(
+                &candidate,
+                false,
+                &ExactAbsenceTestProbe(ExactAbsenceTestAnswer::Observation(
+                    ExactAbsenceObservationV1::TargetPresent,
+                )),
+            ),
+            UnusedCandidateDecisionV1::Refused(UnusedCandidateRefusalV1::TargetPresent)
+        );
+        assert_eq!(
+            record.encode_canonical().unwrap(),
+            record_before,
+            "a present-target refusal must not change a custody marker byte"
+        );
+
+        assert_eq!(
+            decide_unused_marker(
+                &marker,
+                &ExactAbsenceTestProbe(ExactAbsenceTestAnswer::Observation(
+                    ExactAbsenceObservationV1::RegisteredButAbsent,
+                )),
+            ),
+            UnusedCandidateDecisionV1::Refused(UnusedCandidateRefusalV1::RegisteredButAbsent)
+        );
+        assert_eq!(
+            record.encode_canonical().unwrap(),
+            record_before,
+            "a refusing decision must not change a custody marker byte"
+        );
+
+        assert_eq!(
+            decide_unused_candidate(
+                &candidate,
+                false,
+                &ExactAbsenceTestProbe(ExactAbsenceTestAnswer::Failure),
+            ),
+            UnusedCandidateDecisionV1::Refused(UnusedCandidateRefusalV1::CannotProve)
+        );
+        assert_eq!(
+            record.encode_canonical().unwrap(),
+            record_before,
+            "a cannot-prove refusal must not change a custody marker byte"
+        );
+
+        assert_eq!(
+            decide_unused_marker(
+                &marker,
+                &ExactAbsenceTestProbe(ExactAbsenceTestAnswer::Observation(
+                    ExactAbsenceObservationV1::BothAbsent,
+                )),
+            ),
+            UnusedCandidateDecisionV1::Authorized
+        );
+        assert_eq!(
+            record.encode_canonical().unwrap(),
+            record_before,
+            "an authorized T3a decision must not change a custody marker byte"
+        );
+    }
+
+    /// The marker and in-memory-candidate populations share one state-free predicate. Deliberately
+    /// use a state that can never be settled by T3a: the proof must not inspect state to decide.
+    #[test]
+    fn exact_absence_proof_serves_marker_and_candidate_populations() {
+        let candidate = ExactAbsenceCandidateV1::new("/source", "/root/candidate");
+        let marker = ExactAbsenceCandidateV1::new("/source", "/root/marker");
+        let record = custody_record("/root/marker", WorktreeCustodyStateV1::LiveProtected {});
+        let record_before = record.encode_canonical().unwrap();
+        let probe = ExactAbsenceTestProbe(ExactAbsenceTestAnswer::Observation(
+            ExactAbsenceObservationV1::BothAbsent,
+        ));
+
+        assert!(decide_unused_candidate(&candidate, false, &probe).is_authorized());
+        assert!(decide_unused_marker(&marker, &probe).is_authorized());
+        assert_eq!(record.encode_canonical().unwrap(), record_before);
     }
 
     /// Materialize a V3 checkout: the worktree directory plus its sibling

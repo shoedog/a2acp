@@ -11,6 +11,10 @@ use crate::provider_path::{
     resolve_worktree, sidecar_path, validate_bound_worktree, write_sidecar, ResolvedWorktree,
     WorktreeConfig, WorktreeSidecar,
 };
+use crate::sweep::{
+    decide_unused_candidate as decide_exact_absence, ExactAbsenceCandidateV1, ExactAbsenceProbeV1,
+    UnusedCandidateDecisionV1,
+};
 use bridge_core::diagnostics::{DiagnosticCode, DiagnosticFailureClass, DiagnosticRedactor};
 use bridge_core::domain::{Part, SessionSpec};
 use bridge_core::error::BridgeError;
@@ -453,6 +457,9 @@ impl MaterializationPreparationFlightV1 {
 /// one-shot result: observer departure must not erase a nonterminal durable-record failure.
 struct ActivePreparationFlightV1 {
     flight: Arc<MaterializationPreparationFlightV1>,
+    /// The frozen source/target pair is retained with the owner, so a transferred runner can
+    /// continue to block a recovery-side unused-candidate proof for this exact checkout.
+    candidate: Option<ExactAbsenceCandidateV1>,
     completion: watch::Sender<Option<Result<(), BridgeError>>>,
     #[allow(dead_code)] // Read by T3 recovery; this slice must retain it without consuming it.
     runner: StdMutex<Option<tokio::task::JoinHandle<()>>>,
@@ -460,10 +467,14 @@ struct ActivePreparationFlightV1 {
 }
 
 impl ActivePreparationFlightV1 {
-    fn new(flight: Arc<MaterializationPreparationFlightV1>) -> Self {
+    fn new_for_candidate(
+        flight: Arc<MaterializationPreparationFlightV1>,
+        candidate: Option<ExactAbsenceCandidateV1>,
+    ) -> Self {
         let (completion, _receiver) = watch::channel(None);
         Self {
             flight,
+            candidate,
             completion,
             runner: StdMutex::new(None),
             result: StdMutex::new(None),
@@ -532,6 +543,7 @@ struct PreparationFlightRunContextV1<'a> {
 #[allow(dead_code)] // T3 is the first production recovery/inventory consumer.
 struct TransferredPreparationFlightV1 {
     owner: Arc<ActivePreparationFlightV1>,
+    candidate: Option<ExactAbsenceCandidateV1>,
     operation: PreparationOperationV1,
     reason: BoundedPreparationTransferReasonV1,
 }
@@ -932,6 +944,7 @@ async fn transfer_preparation_flight(
     }
     let recovered = Arc::new(TransferredPreparationFlightV1 {
         owner: owner.clone(),
+        candidate: owner.candidate.clone(),
         operation,
         reason,
     });
@@ -2242,6 +2255,41 @@ impl WorktreeBackend {
             #[cfg(test)]
             removal_tombstone_parent_sync_fault: Arc::new(AtomicUsize::new(0)),
         }
+    }
+
+    /// Decide whether one frozen recovery candidate is unused, without acting on the answer.
+    ///
+    /// T2's transfer claim is the first ownership fact: it changes the active flight's phase to
+    /// `TransferPublishing` before the durable state and recovery inventory are published. Sample
+    /// the recovery inventory and active-flight map under the same recovery→active lock order T2
+    /// uses to move the owner. That makes the three transfer moments closed-set: an inventory
+    /// entry is recovery-owned; a transfer-owned active entry is already recovery-owned; and an
+    /// ordinary active entry has not transferred. A transfer after this sample cannot make T3a
+    /// destructive because this function returns only a typed decision; T3b must re-prove it
+    /// while holding its separate refusing action window.
+    #[must_use]
+    pub fn decide_unused_candidate_for_recovery(
+        &self,
+        candidate: &ExactAbsenceCandidateV1,
+        probe: &dyn ExactAbsenceProbeV1,
+    ) -> UnusedCandidateDecisionV1 {
+        let recovery = self
+            .preparation_recovery_flights
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let active = self
+            .preparation_flights
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let recovery_owned = recovery
+            .values()
+            .any(|flight| flight.candidate.as_ref() == Some(candidate))
+            || active.values().any(|flight| {
+                flight.candidate.as_ref() == Some(candidate) && flight.flight.transfer_owned()
+            });
+        drop(active);
+        drop(recovery);
+        decide_exact_absence(candidate, recovery_owned, probe)
     }
 
     fn admit_configure(&self, session: &SessionId) -> Result<ConfigureAdmission<'_>, BridgeError> {
@@ -3725,7 +3773,13 @@ impl WorktreeBackend {
             flight.id().clone(),
         )?);
         flight.set_journal(journal.clone());
-        let active_flight = Arc::new(ActivePreparationFlightV1::new(flight.clone()));
+        let active_flight = Arc::new(ActivePreparationFlightV1::new_for_candidate(
+            flight.clone(),
+            Some(ExactAbsenceCandidateV1::new(
+                resolved.canonical_source.as_str(),
+                resolved.worktree_path.as_str(),
+            )),
+        ));
         {
             let mut flights = self
                 .preparation_flights
@@ -11861,6 +11915,101 @@ mod tests {
         std::fs::remove_dir_all(tmp).unwrap();
     }
 
+    /// A T2-transferred exact owner makes its frozen candidate unprovable even when the host
+    /// capability says both the target and Git registration are absent. The decision reads the
+    /// recovery inventory and performs no record transition.
+    #[tokio::test]
+    async fn recovery_owned_candidate_refuses_even_when_exact_absence_is_observed() {
+        struct BothAbsentProbe;
+
+        impl ExactAbsenceProbeV1 for BothAbsentProbe {
+            fn observe_exact_absence(
+                &self,
+                _candidate: &ExactAbsenceCandidateV1,
+            ) -> Result<crate::sweep::ExactAbsenceObservationV1, BridgeError> {
+                Ok(crate::sweep::ExactAbsenceObservationV1::BothAbsent)
+            }
+        }
+
+        let (be, rec, tmp, source, cfg) = backend_fixture("recovery-owned-exact-absence");
+        let (bound, target) = bound_spec_v3(&source, &cfg);
+        let clock = Arc::new(ManualPreparationClock::new(0));
+        be.arm_preparation_bound_for_test(PreparationClockV1::new(clock.clone()));
+        let hooks = be.preparation_test_hooks.clone();
+        hooks.arm_nonreturning_custody_sync();
+        let session = SessionId::parse("recovery-owned-exact-absence").unwrap();
+        let configure_be = be.clone();
+        let configure_session = session.clone();
+        let configure = tokio::spawn(async move {
+            configure_be
+                .configure_bound_session(&configure_session, &bound)
+                .await
+        });
+
+        hooks.wait_for_custody_sync().await;
+        clock.set(PREPARATION_CONTROL_BOUND_MS);
+        assert!(be.observe_preparation_bound_for_test(&session).await);
+        let candidate = ExactAbsenceCandidateV1::new(source.to_string_lossy(), target.as_str());
+        assert_eq!(
+            be.decide_unused_candidate_for_recovery(&candidate, &BothAbsentProbe),
+            UnusedCandidateDecisionV1::Refused(crate::sweep::UnusedCandidateRefusalV1::CannotProve),
+            "the retained recovery runner owns this otherwise-absent candidate"
+        );
+        assert_eq!(rec.add_count.load(Ordering::SeqCst), 0);
+        hooks.release_custody_sync();
+        assert!(matches!(
+            configure.await.unwrap(),
+            Err(BridgeError::ConfigInvalid { .. })
+        ));
+        std::fs::remove_dir_all(tmp).unwrap();
+    }
+
+    /// The transfer claim is ownership immediately, not only after the later durable publication
+    /// and inventory insertion. This pins the exact window that used to authorize incorrectly.
+    #[test]
+    fn transfer_owned_active_candidate_refuses_before_recovery_inventory_publish() {
+        struct BothAbsentProbe;
+
+        impl ExactAbsenceProbeV1 for BothAbsentProbe {
+            fn observe_exact_absence(
+                &self,
+                _candidate: &ExactAbsenceCandidateV1,
+            ) -> Result<crate::sweep::ExactAbsenceObservationV1, BridgeError> {
+                Ok(crate::sweep::ExactAbsenceObservationV1::BothAbsent)
+            }
+        }
+
+        let (be, rec, tmp, source, cfg) = backend_fixture("transfer-owned-exact-absence");
+        let (_bound, target) = bound_spec_v3(&source, &cfg);
+        let candidate = ExactAbsenceCandidateV1::new(source.to_string_lossy(), target.as_str());
+        let flight = Arc::new(
+            MaterializationPreparationFlightV1::claim(be.preparation_test_hooks.clone(), None)
+                .unwrap(),
+        );
+        let owner = Arc::new(ActivePreparationFlightV1::new_for_candidate(
+            flight.clone(),
+            Some(candidate.clone()),
+        ));
+        be.preparation_flights
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .insert("transfer-owned-exact-absence".to_string(), owner);
+        assert!(flight.begin_transfer());
+        assert!(
+            be.preparation_recovery_flights
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .is_empty(),
+            "this is the interval before transfer inserts the recovery inventory entry"
+        );
+        assert_eq!(
+            be.decide_unused_candidate_for_recovery(&candidate, &BothAbsentProbe),
+            UnusedCandidateDecisionV1::Refused(crate::sweep::UnusedCandidateRefusalV1::CannotProve),
+        );
+        assert_eq!(rec.add_count.load(Ordering::SeqCst), 0);
+        std::fs::remove_dir_all(tmp).unwrap();
+    }
+
     /// Red-first mutation: change the bound comparison to zero; the normal `Settled` assertion fails.
     #[tokio::test]
     async fn unadvanced_preparation_clock_settles_normally() {
@@ -12183,7 +12332,7 @@ mod tests {
             .publish(PreparationFlightStateV1::Open {}, true)
             .unwrap();
         assert!(flight.begin_failure_publication());
-        let owner = Arc::new(ActivePreparationFlightV1::new(flight));
+        let owner = Arc::new(ActivePreparationFlightV1::new_for_candidate(flight, None));
         let (result_tx, result_rx) = oneshot::channel();
         owner.install_result(result_tx);
         let session = "preparation-failure-exit-result".to_owned();

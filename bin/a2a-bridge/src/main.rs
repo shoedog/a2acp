@@ -3413,6 +3413,8 @@ async fn implement_cmd(args: &[String]) -> Result<(), BoxError> {
             &host,
             &bridge_core::liveness::FsLeaseProbe,
         );
+        let exact_absence_probe = bridge_worktree::host_git::HostGitWorktree::new();
+        bridge_worktree::sweep::sweep_orphans_with_exact_absence(&wc.root, &exact_absence_probe);
     }
     // Label-scoped END-sweep backstop (THIS run's `a2a.run` only, clean-exit/panic path ONLY — see
     // recover_orphans above for the SIGKILL path). Declared BEFORE `warm` → drops AFTER it (the warm
@@ -3775,6 +3777,8 @@ async fn implement_resume_cmd(
             &host,
             &bridge_core::liveness::FsLeaseProbe,
         );
+        let exact_absence_probe = bridge_worktree::host_git::HostGitWorktree::new();
+        bridge_worktree::sweep::sweep_orphans_with_exact_absence(&wc.root, &exact_absence_probe);
     }
     let _run_guard = RunEndGuard {
         runtimes: run_guard_runtimes(
@@ -4400,6 +4404,8 @@ async fn run_workflow_cmd(args: &[String]) -> Result<(), BoxError> {
             &host,
             &bridge_core::liveness::FsLeaseProbe,
         );
+        let exact_absence_probe = bridge_worktree::host_git::HostGitWorktree::new();
+        bridge_worktree::sweep::sweep_orphans_with_exact_absence(&wc.root, &exact_absence_probe);
     }
     let _wt_run_guard = worktree_cfg.as_ref().and_then(|wc| {
         wc.enabled.then(|| {
@@ -8084,6 +8090,8 @@ async fn mcp_cmd(args: &[String]) -> Result<(), BoxError> {
             &host,
             &bridge_core::liveness::FsLeaseProbe,
         );
+        let exact_absence_probe = bridge_worktree::host_git::HostGitWorktree::new();
+        bridge_worktree::sweep::sweep_orphans_with_exact_absence(&wc.root, &exact_absence_probe);
     }
     let registry = Arc::new(Registry::new_bound_observed(snapshot, spawn)?);
 
@@ -9769,6 +9777,8 @@ async fn main() -> Result<(), BoxError> {
             &host,
             &bridge_core::liveness::FsLeaseProbe,
         );
+        let exact_absence_probe = bridge_worktree::host_git::HostGitWorktree::new();
+        bridge_worktree::sweep::sweep_orphans_with_exact_absence(&wc.root, &exact_absence_probe);
     }
     // Fan-out source label (wire-observable in fan-out artifacts): the default
     // entry's `name` if set, else the default agent id, so a non-Kiro default
