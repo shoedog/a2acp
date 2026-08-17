@@ -574,7 +574,6 @@ dependencies = [
  "async-stream",
  "async-trait",
  "futures",
- "icu_normalizer",
  "libc",
  "ring",
  "serde",
