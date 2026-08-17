@@ -902,10 +902,10 @@ async fn observe_container_identity(
         .stderr(Stdio::null())
         .kill_on_drop(true);
     let mut child = command.spawn().map_err(|_| ReapFailure::Spawn)?;
-    let mut stdout = child.stdout.take().ok_or(ReapFailure::Spawn)?;
-    let observation = async {
+    let stdout = child.stdout.take().ok_or(ReapFailure::Spawn)?;
+    let observation = async move {
         let mut bytes = Vec::new();
-        (&mut stdout)
+        stdout
             .take(CONTAINER_IDENTITY_MAX_BYTES + 1)
             .read_to_end(&mut bytes)
             .await
@@ -913,13 +913,9 @@ async fn observe_container_identity(
         let status = child.wait().await.map_err(|_| ReapFailure::Spawn)?;
         Ok((status.success(), bytes))
     };
-    let (inspect_succeeded, bytes) = match tokio::time::timeout(timeout, observation).await {
-        Ok(result) => result?,
-        Err(_) => {
-            let _ = child.kill().await;
-            return Err(ReapFailure::Timeout);
-        }
-    };
+    let (inspect_succeeded, bytes) = tokio::time::timeout(timeout, observation)
+        .await
+        .map_err(|_| ReapFailure::Timeout)??;
     if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > CONTAINER_IDENTITY_MAX_BYTES {
         return Err(ReapFailure::IdentityUnavailable);
     }
