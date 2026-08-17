@@ -978,6 +978,39 @@ async fn transfer_preparation_flight(
     }
     Ok(true)
 }
+/// How long a blocking test gate waits to be released before giving up and proceeding.
+///
+/// These gates park a blocking-pool thread until the test releases them. If the test panics
+/// FIRST — an assertion failure, or a `remove_dir` that returns `ENOTEMPTY` — the unwind drops
+/// the runtime and `BlockingPool::shutdown` joins the parked thread forever, so a clean red
+/// becomes an unbounded hang with the test binary at 0% CPU. That turned one 3d-T2 assertion
+/// failure into a 3-hour CI verify before anyone learned what had failed.
+///
+/// The bound is orders of magnitude above any legitimate hold (tests hold these gates across a
+/// few assertions), so it never changes the behavior of a passing test. It only converts "hang
+/// forever" into "proceed, and let the real failure surface".
+#[cfg(test)]
+const TEST_GATE_RELEASE_BOUND: Duration = Duration::from_secs(30);
+
+/// Wait for a blocking test gate's release flag, bounded by [`TEST_GATE_RELEASE_BOUND`].
+#[cfg(test)]
+fn await_test_gate_release(released: &StdMutex<bool>, release: &Condvar, gate: &str) {
+    let mut held = released.lock().unwrap_or_else(|error| error.into_inner());
+    while !*held {
+        let (next, timeout) = release
+            .wait_timeout(held, TEST_GATE_RELEASE_BOUND)
+            .unwrap_or_else(|error| error.into_inner());
+        held = next;
+        if timeout.timed_out() && !*held {
+            eprintln!(
+                "test gate `{gate}` was never released within {TEST_GATE_RELEASE_BOUND:?} — \
+                 proceeding so the real failure can surface instead of hanging the suite"
+            );
+            return;
+        }
+    }
+}
+
 #[cfg(test)]
 #[derive(Default)]
 struct PreparationFlightTestHooks {
@@ -1050,16 +1083,11 @@ impl PreparationFlightTestHooks {
             self.initial_open_publish_entered_count
                 .fetch_add(1, Ordering::SeqCst);
             self.initial_open_publish_entered.notify_waiters();
-            let mut released = self
-                .initial_open_publish_released
-                .lock()
-                .unwrap_or_else(|error| error.into_inner());
-            while !*released {
-                released = self
-                    .initial_open_publish_release
-                    .wait(released)
-                    .unwrap_or_else(|error| error.into_inner());
-            }
+            await_test_gate_release(
+                &self.initial_open_publish_released,
+                &self.initial_open_publish_release,
+                "initial_open_publish",
+            );
         }
     }
 
@@ -1094,16 +1122,11 @@ impl PreparationFlightTestHooks {
             self.control_root_pin_entered_count
                 .fetch_add(1, Ordering::SeqCst);
             self.control_root_pin_entered.notify_waiters();
-            let mut released = self
-                .control_root_pin_released
-                .lock()
-                .unwrap_or_else(|error| error.into_inner());
-            while !*released {
-                released = self
-                    .control_root_pin_release
-                    .wait(released)
-                    .unwrap_or_else(|error| error.into_inner());
-            }
+            await_test_gate_release(
+                &self.control_root_pin_released,
+                &self.control_root_pin_release,
+                "control_root_pin",
+            );
         }
     }
 
@@ -1168,16 +1191,11 @@ impl PreparationFlightTestHooks {
             self.custody_sync_entered_count
                 .fetch_add(1, Ordering::SeqCst);
             self.custody_sync_entered.notify_waiters();
-            let mut released = self
-                .custody_sync_released
-                .lock()
-                .unwrap_or_else(|error| error.into_inner());
-            while !*released {
-                released = self
-                    .custody_sync_release
-                    .wait(released)
-                    .unwrap_or_else(|error| error.into_inner());
-            }
+            await_test_gate_release(
+                &self.custody_sync_released,
+                &self.custody_sync_release,
+                "custody_sync",
+            );
         }
     }
 
