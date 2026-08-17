@@ -159,6 +159,79 @@ remain pushed: `435257ce` (`feat/r2f1b-3d-t2`), `f66016e0`
   re-look must cover `435257ce..85658e01` — 900 changed lines across
   `backend.rs`, `fs_custody.rs`, and the handoff — not merely the repair delta.
 
+## COUNTED RE-LOOK RESULT — REJECT, 2 WRONG / 1 SMELL-DEFER
+
+Verbatim: `reviews/2026-08-16-r2f1b-3d-t2-sol-relook2.md` (sol/max, scope
+`435257ce..85658e01`, 900 lines). LSP nav was unavailable (ambiguous repo root;
+`run-workflow` has no `--lang` flag), so the lens used read-only git + search —
+the same limitation as the prior re-look, but worth weighting on a delta this
+size.
+
+**All three carried blockers are CLOSED:**
+
+- **E1 FIXED** — transfer, failure, and barrier publication share one sticky
+  phase CAS; root-failure, runner-exit, custody-error and initial-error writers
+  all participate.
+- **E2 FIXED for the original blocker** — the exact owner enters
+  `preparation_flights` before the pin claim and the detached blocking open.
+- **E3 FIXED for the complete in-repository writer inventory** — the
+  exact-child lease reopens the name, verifies identical file identity, and
+  holds the lease across the transition check, so competing protocol writers
+  refuse rather than clobber.
+
+**Two NEW WRONG blockers, both verified at source by the operator:**
+
+1. **Root alias divergence (production-reachable now).** The backend builds the
+   shared control root from the raw configured spelling
+   (`backend.rs:2194`, `PathBuf::from(&cfg.root)`) while bound validation
+   canonicalizes it (`provider_path.rs:102`). With a symlinked worktree root
+   retargeted between admission and the lazy pin, the journal publishes `Open`
+   / `Settled` under one root while custody, provider materialization, and the
+   served map use the frozen canonical target under another. Transfer arming is
+   irrelevant — this is reachable today. Fix per the lens: bind the shared pin
+   to the frozen canonical root, carry that identity through
+   `PreparationFlightJournalV1`, refuse before first publication on mismatch.
+2. **Result published before reservation release.** The root-error arm calls
+   `complete_with_result` (`backend.rs:3782`), which sends the caller's result
+   (`backend.rs:510`), and only then performs the `Arc::ptr_eq` removal
+   (`backend.rs:3785`). On the production multi-thread runtime the caller can
+   resume, retry the same session, and hit the still-present `contains_key`
+   check — receiving `AgentOverloaded` after a failed configure that produced
+   no record and no effect. **This defect originates in the operator's repair
+   spec**, which prescribed "complete the caller … then remove the entry"; the
+   agent implemented exactly that. Correct order is remove-then-publish. The
+   `#[tokio::test]` current-thread runtime cannot expose it.
+
+**SMELL — DEFER (lens's ruling, operator concurs):** the converted T-B is a
+false-positive — it waits until recovery is registered and configure returned
+before failing the pin, so it would also pass on pre-`a84c8b57` code. And
+`preparation_transfer_and_failure_claims_have_one_winner_in_both_orders` loops
+over `_failure_source` without executing any caller-departure, custody-error,
+or runner-exit path — it exercises the CAS helper, not those writers. This
+independently corroborates the operator's finding that T-B was a converted
+test rather than new coverage.
+
+## Convergence classification at the declared cap
+
+The cap (one repair + one bounded re-look) is now CONSUMED, and the result is
+REJECT. Classifying before acting, per the discipline:
+
+- **Trend is converging on findings count and on the carried population**:
+  4 blockers (closure) → 3 (re-look) → 2 (this round), with W1/W2/W4/s2 fixed
+  and sustained, and now E1/E2/E3 all fixed. Nothing previously fixed regressed.
+- **But finding 1 is the THIRD distinct defect in control-root/journal-root
+  handling** (W3 → E2 → root-alias binding). For that sub-area specifically,
+  each round has surfaced a new instance of the same kind — the open-class
+  signature. Its fix is an ownership/API change (bind and carry a root
+  identity), which is precisely the "E2 ownership ripple" argument originally
+  raised for option 2.
+- **Finding 2 is closed and trivial** — a three-line reordering, and the
+  operator's own spec error, not an artifact defect.
+
+**Operator recommendation to the owner: split.** Take finding 2 as a mechanical
+fix, and escalate finding 1 to design as its own sub-slice. No third extension
+is taken unilaterally — per the declared boundary, this goes to the owner.
+
 ## Ledger items raised this round
 
 - **Test-harness hang amplifier (SMELL, recommend fixing next round).** Any
