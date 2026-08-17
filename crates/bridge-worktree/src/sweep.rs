@@ -4,15 +4,192 @@ use crate::custody::{
 };
 use crate::provider::{prune_argv, remove_argv};
 use crate::provider_path::{canonicalize_lenient, read_sidecar, sidecar_path};
-use bridge_core::fs_custody::PinnedDirectoryV1;
+use bridge_core::error::BridgeError;
+use bridge_core::execution_policy::WorktreeObjectIdentityV1;
 #[cfg(unix)]
-use bridge_core::fs_custody::{BirthTimeV1, DirectoryIdentityV1};
+use bridge_core::fs_custody::BirthTimeV1;
+use bridge_core::fs_custody::{
+    verify_payload_directory_identity, DirectoryIdentityV1, PinnedDirectoryV1,
+};
 use bridge_core::liveness::LeaseProbe;
 use bridge_core::run_identity::{classify, Verdict};
 use bridge_core::SessionCwd;
 use std::collections::HashMap;
 use std::path::Path;
+use std::process::Command;
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExactAbsenceCandidateV1 {
+    pub canonical_source: String,
+    source_identity: DirectoryIdentityV1,
+    common_dir: String,
+    common_dir_identity: DirectoryIdentityV1,
+    pub worktree_path: String,
+}
+impl ExactAbsenceCandidateV1 {
+    pub fn from_legacy(
+        source: impl AsRef<str>,
+        common_dir: impl AsRef<str>,
+        worktree: impl AsRef<str>,
+    ) -> Result<Self, BridgeError> {
+        let source = capture_directory_identity(Path::new(source.as_ref()), "source")?;
+        let common_dir =
+            capture_directory_identity(Path::new(common_dir.as_ref()), "source common directory")?;
+        if !common_dir.matches(&source_common_dir_identity(&source.canonical_path)?) {
+            return Err(invalid("source does not own the recorded common directory"));
+        }
+        Self::from_bound(source, common_dir, worktree.as_ref())
+    }
+    pub fn from_claim(
+        source: &WorktreeObjectIdentityV1,
+        common_dir: &WorktreeObjectIdentityV1,
+        worktree: &WorktreeObjectIdentityV1,
+    ) -> Result<Self, BridgeError> {
+        for (kind, object) in [
+            ("source", source),
+            ("source common directory", common_dir),
+            ("worktree", worktree),
+        ] {
+            if object.canonical_path != object.directory_identity.canonical_path {
+                return Err(invalid(format!("claim {kind} path and identity disagree")));
+            }
+        }
+        let observed_source =
+            capture_directory_identity(Path::new(&source.canonical_path), "source")?;
+        let observed_common = capture_directory_identity(
+            Path::new(&common_dir.canonical_path),
+            "source common directory",
+        )?;
+        if !source.directory_identity.matches(&observed_source)
+            || !common_dir.directory_identity.matches(&observed_common)
+            || !observed_common.matches(&source_common_dir_identity(
+                &observed_source.canonical_path,
+            )?)
+        {
+            return Err(invalid("claim source or common directory identity changed"));
+        }
+        Self::from_bound(observed_source, observed_common, &worktree.canonical_path)
+    }
+    fn from_bound(
+        source_identity: DirectoryIdentityV1,
+        common_dir_identity: DirectoryIdentityV1,
+        worktree: &str,
+    ) -> Result<Self, BridgeError> {
+        if !Path::new(worktree).is_absolute() {
+            return Err(invalid("worktree path has no absolute identity"));
+        }
+        if source_identity.dev.is_none()
+            || source_identity.ino.is_none()
+            || common_dir_identity.dev.is_none()
+            || common_dir_identity.ino.is_none()
+        {
+            return Err(invalid(
+                "source or common directory has no bound object identity",
+            ));
+        }
+        Ok(Self {
+            canonical_source: source_identity.canonical_path.clone(),
+            source_identity,
+            common_dir: common_dir_identity.canonical_path.clone(),
+            common_dir_identity,
+            worktree_path: worktree.to_owned(),
+        })
+    }
+    pub(crate) fn revalidate_source(&self) -> Result<(), BridgeError> {
+        let source = capture_directory_identity(Path::new(&self.canonical_source), "source")?;
+        let common_dir =
+            capture_directory_identity(Path::new(&self.common_dir), "source common directory")?;
+        if self.source_identity.matches(&source)
+            && self.common_dir_identity.matches(&common_dir)
+            && common_dir.matches(&source_common_dir_identity(&source.canonical_path)?)
+        {
+            Ok(())
+        } else {
+            Err(invalid(
+                "exact-absence source or common-directory identity changed",
+            ))
+        }
+    }
+}
+fn invalid(reason: impl Into<String>) -> BridgeError {
+    BridgeError::ConfigInvalid {
+        reason: reason.into(),
+    }
+}
+fn capture_directory_identity(path: &Path, kind: &str) -> Result<DirectoryIdentityV1, BridgeError> {
+    if !path.is_absolute() {
+        return Err(invalid(format!("{kind} path has no absolute identity")));
+    }
+    let canonical = std::fs::canonicalize(path)
+        .map_err(|error| invalid(format!("{kind} identity probe failed: {error}")))?;
+    let identity = verify_payload_directory_identity(&canonical)
+        .map_err(|refusal| invalid(format!("{kind} identity probe failed: {refusal:?}")))?;
+    if identity.dev.is_none() || identity.ino.is_none() {
+        return Err(invalid(format!("{kind} has no bound object identity")));
+    }
+    Ok(identity)
+}
+fn source_common_dir_identity(source: &str) -> Result<DirectoryIdentityV1, BridgeError> {
+    let output = Command::new("git")
+        .args([
+            "-C",
+            source,
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-common-dir",
+        ])
+        .output()
+        .map_err(|error| invalid(format!("source authority probe failed: {error}")))?;
+    if !output.status.success() {
+        return Err(invalid(
+            "source authority probe did not identify a Git common directory",
+        ));
+    }
+    let common_dir = std::str::from_utf8(&output.stdout)
+        .map_err(|_| invalid("source authority probe returned a non-UTF-8 common directory"))?
+        .trim();
+    if common_dir.is_empty() || !Path::new(common_dir).is_absolute() {
+        return Err(invalid(
+            "source authority probe returned no absolute common directory",
+        ));
+    }
+    capture_directory_identity(Path::new(common_dir), "source common directory")
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExactAbsenceObservationV1 {
+    TargetPresent,
+    RegisteredButAbsent,
+    BothAbsent,
+}
+pub trait ExactAbsenceProbeV1: Send + Sync {
+    fn observe_exact_absence(
+        &self,
+        candidate: &ExactAbsenceCandidateV1,
+    ) -> Result<ExactAbsenceObservationV1, BridgeError>;
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UnusedCandidateDecisionV1 {
+    Authorized,
+    Refused,
+}
+#[must_use]
+pub fn decide_unused_candidate(
+    candidate: &ExactAbsenceCandidateV1,
+    recovery_owned: bool,
+    probe: &dyn ExactAbsenceProbeV1,
+) -> UnusedCandidateDecisionV1 {
+    if recovery_owned {
+        return UnusedCandidateDecisionV1::Refused;
+    }
+    match probe.observe_exact_absence(candidate) {
+        Ok(ExactAbsenceObservationV1::BothAbsent) => UnusedCandidateDecisionV1::Authorized,
+        Ok(
+            ExactAbsenceObservationV1::TargetPresent
+            | ExactAbsenceObservationV1::RegisteredButAbsent,
+        )
+        | Err(_) => UnusedCandidateDecisionV1::Refused,
+    }
+}
 // Stays sync (not de-blocked like host_git.rs's run_git): this call runs inside
 // `WorktreeRunEndGuard::drop` (a `Drop` impl cannot await) and during the
 // startup/boot sweep — not a per-turn path. See spec
@@ -305,10 +482,72 @@ fn report_custody_entry(
     }
 }
 
+fn decide_unused_legacy_sidecar(
+    root: &SessionCwd,
+    sidecar_file: &str,
+    sidecar: &crate::provider_path::WorktreeSidecar,
+    probe: &dyn ExactAbsenceProbeV1,
+) -> UnusedCandidateDecisionV1 {
+    if !sidecar_file_matches(sidecar_file, &sidecar.worktree_path)
+        || !worktree_under_root(root, &sidecar.worktree_path)
+    {
+        return UnusedCandidateDecisionV1::Refused;
+    }
+    ExactAbsenceCandidateV1::from_legacy(
+        &sidecar.canonical_source,
+        &sidecar.common_dir,
+        &sidecar.worktree_path,
+    )
+    .map(|candidate| decide_unused_candidate(&candidate, false, probe))
+    .unwrap_or(UnusedCandidateDecisionV1::Refused)
+}
+fn decide_unused_custody_record(
+    root: &SessionCwd,
+    record_file: &str,
+    record: &WorktreeCustodyRecordV1,
+    probe: &dyn ExactAbsenceProbeV1,
+) -> UnusedCandidateDecisionV1 {
+    let worktree = &record.worktree.canonical_path;
+    if !worktree_under_root(root, worktree)
+        || !matches!(
+            (std::fs::canonicalize(record_file), std::fs::canonicalize(custody_record_path(worktree))),
+            (Ok(record_file), Ok(expected)) if record_file == expected
+        )
+    {
+        return UnusedCandidateDecisionV1::Refused;
+    }
+    record
+        .claim
+        .as_ref()
+        .and_then(|claim| {
+            ExactAbsenceCandidateV1::from_claim(&claim.source, &claim.common_dir, &claim.worktree)
+                .ok()
+        })
+        .map(|candidate| decide_unused_candidate(&candidate, false, probe))
+        .unwrap_or(UnusedCandidateDecisionV1::Refused)
+}
+pub fn sweep_orphans_with_exact_absence(root: &str, probe: &dyn ExactAbsenceProbeV1) {
+    let Ok(root) = canonicalize_lenient(root) else {
+        return;
+    };
+    for (path, scanned) in scan_worktree_records(root.as_str()) {
+        let decision = match scanned {
+            ScannedWorktreeRecordV1::Legacy(sidecar) => {
+                decide_unused_legacy_sidecar(&root, &path, &sidecar, probe)
+            }
+            ScannedWorktreeRecordV1::Custody(record) => {
+                decide_unused_custody_record(&root, &path, &record, probe)
+            }
+            ScannedWorktreeRecordV1::UnreadableCustody(_) => UnusedCandidateDecisionV1::Refused,
+        };
+        tracing::info!(record = path, ?decision, "made exact-absence decision");
+    }
+}
 /// Reap only same-host **legacy** worktrees whose owner lease is free.
 ///
 /// V3 custody records are recognized and classified, never deleted (§5.2).
 pub fn sweep_orphans(root: &str, my_host: &str, probe: &dyn LeaseProbe) {
+    sweep_orphans_with_exact_absence(root, &crate::host_git::HostGitWorktree::new());
     let Ok(root_cwd) = canonicalize_lenient(root) else {
         tracing::warn!(root, "skipping worktree sweep with non-canonical root");
         return;
@@ -510,6 +749,61 @@ mod tests {
         ))
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn exact_absence_claim_refuses_a_replaced_common_directory() {
+        let root = unique_temp_dir("replaced-common-dir");
+        let source = root.join("source");
+        fs::create_dir_all(&source).unwrap();
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&source)
+            .args(["init", "-q"])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let source_identity = super::capture_directory_identity(&source, "source").unwrap();
+        let common_identity =
+            super::capture_directory_identity(&source.join(".git"), "source common directory")
+                .unwrap();
+        let worktree = root.join("worktree");
+        fs::create_dir(&worktree).unwrap();
+        let worktree_identity = super::capture_directory_identity(&worktree, "worktree").unwrap();
+        let source_claim = WorktreeObjectIdentityV1 {
+            canonical_path: source_identity.canonical_path.clone(),
+            directory_identity: source_identity,
+        };
+        let common_claim = WorktreeObjectIdentityV1 {
+            canonical_path: common_identity.canonical_path.clone(),
+            directory_identity: common_identity,
+        };
+        let worktree_claim = WorktreeObjectIdentityV1 {
+            canonical_path: worktree_identity.canonical_path.clone(),
+            directory_identity: worktree_identity,
+        };
+        let candidate = super::ExactAbsenceCandidateV1::from_claim(
+            &source_claim,
+            &common_claim,
+            &worktree_claim,
+        )
+        .unwrap();
+        fs::rename(source.join(".git"), root.join("original-common")).unwrap();
+        let replacement = root.join("replacement");
+        fs::create_dir(&replacement).unwrap();
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&replacement)
+            .args(["init", "-q"])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        fs::rename(replacement.join(".git"), source.join(".git")).unwrap();
+        assert!(
+            candidate.revalidate_source().is_err(),
+            "a common-directory replacement must refuse while the source inode is unchanged"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
     fn write_worktree_sidecar(
         root: &Path,
         name: &str,

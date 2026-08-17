@@ -3,9 +3,11 @@ use crate::provider::{
     add_argv, is_repo_argv, list_porcelain_argv, prune_argv, remove_argv, CustodyAddFailureV1,
     CustodyAddOutcomeV1, CustodyAddTargetV1, WorktreeProvider,
 };
+use crate::sweep::{ExactAbsenceCandidateV1, ExactAbsenceObservationV1, ExactAbsenceProbeV1};
 use bridge_core::error::BridgeError;
+use bridge_core::fs_custody::{compare_path_identities, PathIdentityComparisonV1};
 use std::path::Path;
-use std::process::Output;
+use std::process::{Command as StdCommand, Output};
 use std::time::Duration;
 use tokio::process::Command;
 
@@ -29,6 +31,15 @@ async fn run_git(argv: &[&str]) -> Result<Output, BridgeError> {
     command
         .output()
         .await
+        .map_err(|e| BridgeError::ConfigInvalid {
+            reason: format!("git spawn: {e}"),
+        })
+}
+
+fn run_git_sync(argv: &[&str]) -> Result<Output, BridgeError> {
+    StdCommand::new("git")
+        .args(argv)
+        .output()
         .map_err(|e| BridgeError::ConfigInvalid {
             reason: format!("git spawn: {e}"),
         })
@@ -86,12 +97,14 @@ async fn common_dir(repo: &str) -> String {
         .unwrap_or_default()
 }
 
-fn target_absent_from_probe(probe: std::io::Result<bool>) -> Result<bool, BridgeError> {
-    probe
-        .map(|exists| !exists)
-        .map_err(|error| BridgeError::ConfigInvalid {
+fn target_absent_from_probe(target: &Path) -> Result<bool, BridgeError> {
+    match target.symlink_metadata() {
+        Ok(_) => Ok(false),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(true),
+        Err(error) => Err(BridgeError::ConfigInvalid {
             reason: format!("worktree target metadata failed: {error}"),
-        })
+        }),
+    }
 }
 
 fn removal_is_complete(
@@ -102,17 +115,27 @@ fn removal_is_complete(
     prune_succeeded && target_absent && registration_absent
 }
 
-fn registration_absent_from_porcelain(output: &[u8], wt: &str) -> bool {
-    let target = wt.as_bytes();
-    !output.split(|byte| *byte == 0).any(|field| {
-        field
-            .strip_prefix(b"worktree ")
-            .is_some_and(|path| path == target)
-    })
+fn registration_absent_from_porcelain(output: &[u8], wt: &str) -> Result<bool, BridgeError> {
+    if compare_path_identities(wt, wt) != PathIdentityComparisonV1::Same {
+        return Err(BridgeError::ConfigInvalid {
+            reason: "worktree path has no provable identity".to_string(),
+        });
+    }
+    for field in output.split(|byte| *byte == 0) {
+        let Some(path) = field.strip_prefix(b"worktree ") else {
+            continue;
+        };
+        let path = std::str::from_utf8(path).map_err(|_| BridgeError::ConfigInvalid {
+            reason: "worktree registration path is not valid UTF-8".to_string(),
+        })?;
+        if compare_path_identities(path, wt) != PathIdentityComparisonV1::Different {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
-async fn registration_absent(repo: &str, wt: &str) -> Result<bool, BridgeError> {
-    let listed = run_git(&list_porcelain_argv(repo)).await?;
+fn registration_absent_from_output(listed: Output, wt: &str) -> Result<bool, BridgeError> {
     if !listed.status.success() {
         return Err(BridgeError::ConfigInvalid {
             reason: format!(
@@ -121,7 +144,31 @@ async fn registration_absent(repo: &str, wt: &str) -> Result<bool, BridgeError> 
             ),
         });
     }
-    Ok(registration_absent_from_porcelain(&listed.stdout, wt))
+    registration_absent_from_porcelain(&listed.stdout, wt)
+}
+
+async fn registration_absent(repo: &str, wt: &str) -> Result<bool, BridgeError> {
+    registration_absent_from_output(run_git(&list_porcelain_argv(repo)).await?, wt)
+}
+
+fn registration_absent_sync(repo: &str, wt: &str) -> Result<bool, BridgeError> {
+    registration_absent_from_output(run_git_sync(&list_porcelain_argv(repo))?, wt)
+}
+
+impl ExactAbsenceProbeV1 for HostGitWorktree {
+    fn observe_exact_absence(
+        &self,
+        candidate: &ExactAbsenceCandidateV1,
+    ) -> Result<ExactAbsenceObservationV1, BridgeError> {
+        candidate.revalidate_source()?;
+        if !target_absent_from_probe(Path::new(&candidate.worktree_path))? {
+            return Ok(ExactAbsenceObservationV1::TargetPresent);
+        }
+        if !registration_absent_sync(&candidate.canonical_source, &candidate.worktree_path)? {
+            return Ok(ExactAbsenceObservationV1::RegisteredButAbsent);
+        }
+        Ok(ExactAbsenceObservationV1::BothAbsent)
+    }
 }
 
 /// `git worktree remove` + `prune`, then the two post-conditions §5.1 names: the target is absent
@@ -140,7 +187,7 @@ async fn registration_absent(repo: &str, wt: &str) -> Result<bool, BridgeError> 
 async fn remove_and_verify(repo: &str, wt: &str) -> Result<(), BridgeError> {
     let remove = run_git(&remove_argv(repo, wt)).await?;
     let prune = run_git(&prune_argv(repo)).await?;
-    let target_absent = target_absent_from_probe(Path::new(wt).try_exists())?;
+    let target_absent = target_absent_from_probe(Path::new(wt))?;
     let registration_absent = registration_absent(repo, wt).await?;
 
     if removal_is_complete(prune.status.success(), target_absent, registration_absent) {
@@ -169,9 +216,9 @@ async fn remove_and_verify(repo: &str, wt: &str) -> Result<(), BridgeError> {
 /// production and record every ambiguous probe as a definite answer — the exact failure mode
 /// §5.7's ambiguity rows exist to prevent.
 async fn classify_custody_add_failure(repo: &str, wt: &str, reason: String) -> CustodyAddFailureV1 {
-    let target = match Path::new(wt).try_exists() {
-        Ok(true) => CustodyAddTargetV1::Present,
-        Ok(false) => CustodyAddTargetV1::ProvablyAbsent,
+    let target = match target_absent_from_probe(Path::new(wt)) {
+        Ok(false) => CustodyAddTargetV1::Present,
+        Ok(true) => CustodyAddTargetV1::ProvablyAbsent,
         Err(_) => CustodyAddTargetV1::Unproven,
     };
     let recovery_locator = match registration_absent(repo, wt).await {
@@ -330,22 +377,49 @@ mod tests {
         assert!(!removal_is_complete(false, true, true));
         assert!(!removal_is_complete(true, false, true));
         assert!(!removal_is_complete(true, true, false));
-        assert!(target_absent_from_probe(Ok(false)).unwrap());
-        assert!(target_absent_from_probe(Ok(true)).is_ok_and(|absent| !absent));
-        assert!(target_absent_from_probe(Err(std::io::Error::new(
-            std::io::ErrorKind::PermissionDenied,
-            "denied",
-        )))
-        .is_err());
+        let target = unique_temp_dir("target-absence-probe");
+        std::fs::create_dir_all(&target).unwrap();
+        assert!(target_absent_from_probe(&target.join("absent")).unwrap());
+        std::fs::create_dir(target.join("present")).unwrap();
+        assert!(!target_absent_from_probe(&target.join("present")).unwrap());
+        std::fs::remove_dir_all(&target).unwrap();
     }
 
     #[test]
     fn porcelain_registration_check_is_exact_and_handles_locked_records() {
-        let output =
-            b"worktree /repo\0HEAD abc\0\0worktree /managed/wt\0HEAD def\0locked reason\0\0";
-        assert!(!registration_absent_from_porcelain(output, "/managed/wt"));
-        assert!(registration_absent_from_porcelain(output, "/managed/other"));
-        assert!(registration_absent_from_porcelain(output, "/managed/w"));
+        let root = unique_temp_dir("porcelain-registration");
+        let managed = root.join("managed");
+        std::fs::create_dir_all(&managed).unwrap();
+        let registered = managed.join("wt");
+        let output = [
+            b"worktree /repo\0HEAD abc\0\0worktree ".as_slice(),
+            registered.to_string_lossy().as_bytes(),
+            b"\0HEAD def\0locked reason\0\0",
+        ]
+        .concat();
+        assert!(
+            !registration_absent_from_porcelain(&output, &registered.to_string_lossy()).unwrap()
+        );
+        assert!(registration_absent_from_porcelain(
+            &output,
+            &managed.join("other").to_string_lossy()
+        )
+        .unwrap());
+        assert!(
+            registration_absent_from_porcelain(&output, &managed.join("w").to_string_lossy())
+                .unwrap()
+        );
+
+        #[cfg(unix)]
+        {
+            let alias = root.join("managed-alias");
+            std::os::unix::fs::symlink(&managed, &alias).unwrap();
+            assert!(
+                !registration_absent_from_porcelain(&output, &alias.join("wt").to_string_lossy()).unwrap(),
+                "a canonical Git spelling and a symlinked-parent spelling name the same registration"
+            );
+        }
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[tokio::test]
