@@ -50,6 +50,16 @@ the change instead, and it may get implemented independently.
 - Gates that must stay green: `cargo fmt --check`, `cargo clippy --workspace
   --all-targets -- -D warnings`, `cargo deny check`, per-crate coverage floors (see
   `.github/workflows/ci.yml`), and `a2a-bridge validate --repo-hygiene`.
+- **Non-unix lane — run `tools/check-nonunix.sh` when you touch
+  `crates/bridge-core`.** All the gates above are unix-only on a developer machine, but CI
+  compiles `bridge-core` for Windows (via `bridge-store`). `liveness` and
+  `namespace_transaction` are `#[cfg(unix)]` while `fs_custody` is not, so a new
+  `fs_custody` helper that calls into them type-checks locally and fails CI with `E0433`
+  or a non-unix `dead_code` warning. That has cost a landing round five times
+  (3a, 3b1, 3c1, 3c2, 3d-T2). The script cross-checks the target in ~3 s using the
+  signature-only `ring` stub in `tools/ring-stub` (`ring`'s C build script cannot
+  cross-compile from macOS). One-time setup:
+  `rustup target add x86_64-pc-windows-msvc`.
 - Architecture orientation: `README.md`, then `docs/adr/` (decisions), then
   `docs/2026-07-03-strategic-analysis.md` (current priorities).
 - Agent-facing quickstart: `AGENTS.md`.
