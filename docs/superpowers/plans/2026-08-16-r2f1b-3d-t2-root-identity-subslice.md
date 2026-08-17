@@ -96,6 +96,33 @@ exact-child lease); s1 abort residue; the slice-4 binding observer obligation;
 the per-flight blocking-wait SMELL; the test-harness hang amplifier. Each stays
 on its existing ledger line.
 
+## UPDATE 2026-08-17 — this is a CLASS, not one defect (four instances)
+
+T3a's counted closure added two more, so the count now stands at four across two
+slices, all the same shape: a path compared by spelling where identity was
+required.
+
+| # | Where | Failure |
+|---|-------|---------|
+| 1 | T2 control root (`backend.rs:2194`) | raw configured spelling vs canonicalized bound validation |
+| 2 | T3a registration probe | byte-exact compare against git's canonical output ⇒ fail OPEN |
+| 3 | T3a missing-tail comparator (`sweep.rs:46`) | reconstructed absent suffix compared bytewise ⇒ case-insensitive aliases read as different ⇒ fail OPEN |
+| 4 | T3a candidate source | unchecked string reaches `git -C`, so a relative source queries the wrong repository ⇒ fail OPEN |
+
+Three of the four **fail open** in a proof whose contract is fail-closed, and
+instances 2–4 were invisible to the container lane because Linux has neither the
+`/var`→`/private/var` indirection nor a case-insensitive filesystem.
+
+**Consequence for this sub-slice's scope.** It should no longer be framed as
+"bind the control root". The deliverable is **one shared path-identity primitive**
+for the whole worktree lane, with the tri-state the T3a closure specified —
+`Same` / `Different` / `CannotProve`, where only a proven difference lets a
+caller skip something, and ambiguity refuses. The control-root binding then
+becomes one caller of it rather than its own mechanism.
+
+T3a's repair 3 patches instances 2–4 in place to unblock the slice. If a fifth
+instance appears, stop patching and build the primitive here.
+
 ## Does this block T2 landing? — ANSWERED: no, the defect is latent
 
 The re-look called finding 1 "production-reachable now." The operator resolved

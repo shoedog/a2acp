@@ -1,0 +1,62 @@
+I’m using the Prism and LSP navigation skills because this review explicitly requires structural and type-resolved caller inventories. I’ll keep the repository inspection strictly read-only, review the entire frozen diff and requested artifacts, and treat the supplied green gates only as corroboration.Prism/LSP are not callable in this session, so I’m taking the permitted read-only fallback: freeze the commit pair, enumerate the full diff, then use targeted symbol searches plus direct caller reads. My first check is identity/scope: I expect exactly the stated five artifacts and will treat any mismatch as a review-scope defect.Identity/scope matched: HEAD is exact `b255cba5`, and the five-file diff is 1,074 insertions plus 32 deletions (1,106 changed lines). The three referenced plan documents are untracked inputs, so I’ll use them as supplied review material but not confuse them with committed production evidence. Next I’m tracing boot wiring and recovery inventory publication/visibility before judging the proof.The boot path calls a synchronous exact-absence sweep in all five production entry points, while the backend adds a separate recovery-aware decision method. The key question is now whether those two paths are actually coupled: if the sweep invokes only the state-agnostic helper, recovery ownership can still be bypassed despite the backend unit tests. I’m reading the complete sweep diff and all call sites to resolve that mechanism.The state machine itself is fail-closed, but two areas need proof before classification: the identity comparator reconstructs missing suffixes with bytewise `PathBuf` equality (important on case-insensitive filesystems), and the “sync” bridge executes blocking `git` from async CLI entry points without a bound. I’m checking the task’s exact B18 requirements and the production path/sidecar construction so I can distinguish a demonstrated WRONG from a deferred robustness smell.The targeted inventory confirms there are only two production decision entrances: the boot legacy-sidecar sweep and the backend recovery-aware method (currently caller-free pending T3b). I’m now checking ordering against the pre-existing legacy reclaimer and the exact record scanner, because calling the decision pass after a mutating sweep could erase the very marker population T3a claims to wire.The authoritative slice text identifies the second population as V3 `PreservationUnknown` pre-target add-failure records—not legacy `.meta.json` sidecars. The current boot path explicitly refuses every V3 record because it lacks a canonical source, while the “shared populations” test substitutes an arbitrary in-memory marker. I’m tracing the persisted schema and its writers now; if no production source can reconstruct the exact candidate, the claimed two-population delivery is not merely deferred action—it is an unimplemented decision input.The correctness pass has established three fail-open/task-delivery defects: the real 2b2 V3 marker population is unconditionally refused despite carrying its source in the required claim; a relative/unbound `canonical_source` can query the launch repo and return `Authorized`; and the missing-tail comparator treats bytewise spelling inequality as proof of distinct identity, which fails on case-insensitive filesystems. I’m finishing severity/trigger analysis and the regression-evidence audit; no repository changes or gates are being run.## WRONG findings
+
+1. **WRONG — BLOCKER: the specified 2b2 V3 marker population never reaches the proof.**
+
+   [sweep.rs:564](/Users/wesleyjinks/code/a2a-bridge/.claude/worktrees/t3a/crates/bridge-worktree/src/sweep.rs:564) unconditionally maps every V3 custody record to `Refused(CannotProve)`, claiming the schema has no source. That is false for the relevant `PreservationUnknown` population: its required claim contains `source` and `worktree` identities ([custody.rs:461](/Users/wesleyjinks/code/a2a-bridge/.claude/worktrees/t3a/crates/bridge-worktree/src/custody.rs:461), [custody_writer.rs:664](/Users/wesleyjinks/code/a2a-bridge/.claude/worktrees/t3a/crates/bridge-worktree/src/custody_writer.rs:664)). A pre-target add failure writes exactly this record ([backend.rs:4285](/Users/wesleyjinks/code/a2a-bridge/.claude/worktrees/t3a/crates/bridge-worktree/src/backend.rs:4285)).
+
+   - Trigger/impact: once V3 is armed, an add failure before target creation followed by a boot sweep. Likelihood is presently `theoretical-only`, then `plausible`; affected runs retain the marker forever and T3b receives no T3a decision to act on. This is missing decision work, not merely T3b’s deferred mutation.
+   - Fix: validate the actual claim-bearing V3 marker, construct the candidate from its source/worktree identities, and pass it through the shared state-agnostic predicate. Require sufficient source identity or refuse. Medium, localized sweep/custody-test blast radius.
+   - Red regression: persist a real `PreservationUnknown(MaterializationInFlight)` record with absent target and registration; assert `Authorized` and byte-for-byte unchanged record. Present, registered, degraded-source, and probe-error controls must refuse.
+
+2. **WRONG — BLOCKER: an unbound or relative source can query the wrong repository and authorize.**
+
+   `ExactAbsenceCandidateV1::new` accepts unchecked strings ([sweep.rs:23](/Users/wesleyjinks/code/a2a-bridge/.claude/worktrees/t3a/crates/bridge-worktree/src/sweep.rs:23)); the legacy path copies `canonical_source` from sidecar JSON after validating only the marker/target relationship ([sweep.rs:524](/Users/wesleyjinks/code/a2a-bridge/.claude/worktrees/t3a/crates/bridge-worktree/src/sweep.rs:524)). `HostGitWorktree` then passes that value directly to `git -C`, while only the target path receives absolute-path validation ([host_git.rs:162](/Users/wesleyjinks/code/a2a-bridge/.claude/worktrees/t3a/crates/bridge-worktree/src/host_git.rs:162)).
+
+   Constructible input: a sibling-matching, in-root legacy marker names an absent absolute target but has `canonical_source: "."`; the bridge is launched inside unrelated repo B, while repo A still registers the target. Repo B’s list lacks the target, so the result is `BothAbsent → Authorized`. This contradicts the handoff’s claim that relative candidates refuse.
+
+   - Trigger/impact: corrupt, stale, or operator-edited legacy sidecar left live/unknown so the preceding legacy sweep retains it. Likelihood `rare`, but reachable in all five worktree-enabled boot paths today. T3a currently logs a false authorization; T3b acting on it would remove custody incorrectly.
+   - Fix: use a fallible candidate constructor and bind the source/common-dir object identity. Relative or identity-unbound legacy sources must refuse; an absolute path alone is insufficient after source replacement. Medium blast radius across candidate construction and probing.
+   - Red regression: relative source, wrong-repo source, and rename/replacement of the captured source must all produce `CannotProve`, even when the queried replacement repository reports no registration.
+
+3. **WRONG — BLOCKER: missing-tail byte equality is not filesystem identity equality.**
+
+   [sweep.rs:46](/Users/wesleyjinks/code/a2a-bridge/.claude/worktrees/t3a/crates/bridge-worktree/src/sweep.rs:46) canonicalizes the nearest existing ancestor, appends absent components verbatim, then compares `PathBuf`s bytewise. [host_git.rs:131](/Users/wesleyjinks/code/a2a-bridge/.claude/worktrees/t3a/crates/bridge-worktree/src/host_git.rs:131) treats `false` as proof that a Git registration is different.
+
+   On a case-insensitive filesystem, let the absent candidate be `/root/wt` and Git’s retained registration be `/root/WT`. Both names denote the same directory entry, but the reconstructed paths compare unequal; the parser reports registration absent and the probe returns `BothAbsent`. Unicode-normalization aliases have the same mechanism.
+
+   - Trigger/impact: macOS/Windows or a case-insensitive mounted volume, absent target, retained registration with spelling drift. Likelihood `plausible`; exposed paths include the new authorization and existing removal verification. Impact is false authorization or falsely completed cleanup.
+   - Fix: return `Same`, `Different`, or `CannotProve`; only proven difference may skip a registration. Compare existing ancestor object identities and filesystem name semantics, conservatively refusing ambiguous missing suffixes. Medium host-git/backend blast radius.
+   - Red regression: case-only and normalization-different absent names on a case-insensitive volume must classify `RegisteredButAbsent`; a conservative platform-independent test can require ambiguous same-parent missing suffixes to return `CannotProve`.
+
+## SMELL findings
+
+1. **SMELL — DEFER: synchronous unbounded I/O can stall async boot and recovery locks.**
+
+   [host_git.rs:47](/Users/wesleyjinks/code/a2a-bridge/.claude/worktrees/t3a/crates/bridge-worktree/src/host_git.rs:47) uses blocking `Command::output` with no deadline, directly from async CLI entry points. It runs once per absent legacy marker. Separately, [backend.rs:2296](/Users/wesleyjinks/code/a2a-bridge/.claude/worktrees/t3a/crates/bridge-worktree/src/backend.rs:2296) performs filesystem canonicalization while holding both recovery mutexes.
+
+   Slow Git/FUSE/NFS or a large stale-marker population makes this `plausible`; users see stalled startup or delayed transfer publication. No incorrect custody result is established, so this remains a smell.
+
+   Bounded fix: cache/batch one list per source, add a subprocess deadline, invoke boot work through `spawn_blocking`, and precompute in-memory candidate keys before locking. Medium cost. Regression: a delayed injected runner must not stop a current-thread Tokio ticker, and N same-source candidates must issue one bounded list.
+
+2. **SMELL — DEFER: the regression evidence is not behaviorally fail-first.**
+
+   The handoff’s red evidence is compilation failure ([handoff:74](/Users/wesleyjinks/code/a2a-bridge/.claude/worktrees/t3a/docs/superpowers/reviews/2026-08-17-r2f1b-3d-t3a-handoff.md:74)), which is inadmissible behavioral evidence. The zero-mutation test compares an unrelated in-memory record never passed to the decision; the population test uses an arbitrary marker and `LiveProtected`, not the actual 2b2 marker; and both backend recovery tests still pass if that wrapper always refuses.
+
+   This is an always-present maintenance risk with moderate impact. Add the three red regressions above, a positive non-recovery-owned backend authorization, and filesystem byte snapshots around the real sweep path. Low-to-medium cost; deferred as an independent blocker, but required alongside the WRONG repairs.
+
+3. **SMELL — DEFER: final size evidence violates the task cap and is unreconciled.**
+
+   The final diff is 1,074 additions plus 32 deletions, exceeding the task’s 750-line cap ([task:152](/Users/wesleyjinks/code/a2a-bridge/.claude/worktrees/t3a/docs/superpowers/plans/2026-08-17-r2f1b-3d-t3a-task.md:152)). The committed handoff reports only the earlier 699-line artifact plus per-repair deltas, not the final aggregate. The owner prompt discloses the true size, so this did not hide scope from this review, but the durable handoff is stale.
+
+   Fix by recording the final numstat and explicit owner waiver; add a review-size gate requiring either the cap or a checked waiver. Trivial blast radius.
+
+## Evidence assessment
+
+I read the complete 1,106-line diff at exact HEAD `b255cba5`. Prism/LSP were unavailable, so caller inventory used read-only search and direct caller reads.
+
+The declared observation match itself is fail-closed, dangling final symlinks are correctly treated as present, and no new custody writer, marker unlink, or transition-table edge exists. Recovery→active lock ordering prevents observing the inventory half-moved. A transfer can still win after those locks are released and before the host probe returns; that is harmless only because T3a does not act, and T3b must recheck inside B19 rather than treating this `Copy` decision as durable authority.
+
+I did not run or rely on supplied gates. The reported 4,149/0/13 host suite remains operator-supplied evidence, and the container PASS does not discriminate the defects above.
+
+VERDICT: REJECT
+SUMMARY: Three BLOCKER WRONGs remain: the real V3 marker is not decided, source identity is unbound, and missing-tail comparison can fail open; blocking, regression-evidence, and handoff-cap smells are deferred.
