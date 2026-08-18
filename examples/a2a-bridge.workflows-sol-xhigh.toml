@@ -1,0 +1,122 @@
+# Sol at xhigh, for authoring and reviewing specs/plans.
+#
+# Why this exists alongside a2a-bridge.workflows-solmax.toml: that config pins sol to
+# effort=max under a standing owner directive for the 3b1 destructive-surface REVIEW lens,
+# and it defines no `design` workflow. The `design` workflow in the impl configs runs its
+# `codex` agent on gpt-5.5, not sol. Neither gives sol at xhigh for planning work, which is
+# what this config is for (owner directive 2026-08-18: "use sol xhigh to spec/plan").
+#
+# Every node here is sol. The two-lens shape (executability + structure) is kept from the
+# established design workflow because the lenses ask different questions; running both on
+# one model is a deliberate consequence of the directive, and it means the usual
+# cross-model disagreement signal is NOT available — weigh the output accordingly.
+
+default = "codex"
+
+[[agents]]
+id = "codex"
+cmd = "codex-acp"
+pre_authenticated = true
+model = "gpt-5.6-sol"
+effort = "xhigh"
+mode = "read-only"
+args = ["-c", "sandbox_mode=\"read-only\"", "-c", "approval_policy=\"never\""]
+
+[[prompts]]
+id = "design-executability"
+file = "../prompts/design-executability.md"
+description = "design draft — executability lens"
+
+[[prompts]]
+id = "design-structure"
+file = "../prompts/design-structure.md"
+description = "design draft — structure lens"
+
+[[prompts]]
+id = "design-executability-refine"
+file = "../prompts/design-executability-refine.md"
+description = "design refine — executability lens"
+
+[[prompts]]
+id = "design-structure-refine"
+file = "../prompts/design-structure-refine.md"
+description = "design refine — structure lens"
+
+[[prompts]]
+id = "design-synth"
+file = "../prompts/design-synth.md"
+description = "design synthesis"
+
+[[prompts]]
+id = "plan-review-exec"
+file = "../prompts/plan-review-exec.md"
+description = "plan-review executability lens"
+
+[[prompts]]
+id = "plan-review-coverage"
+file = "../prompts/plan-review-coverage.md"
+description = "plan-review coverage lens"
+
+[[prompts]]
+id = "plan-review-synth"
+file = "../prompts/plan-review-synth.md"
+description = "plan-review synthesis prompt"
+
+# design: two lenses drafted then refined, then synthesised into one plan.
+[[workflows]]
+id = "design"
+
+[[workflows.nodes]]
+id = "executabilitydraft"
+agent = "codex"
+prompt = "design-executability"
+inputs = []
+
+[[workflows.nodes]]
+id = "structuredraft"
+agent = "codex"
+prompt = "design-structure"
+inputs = []
+
+[[workflows.nodes]]
+id = "executability"
+agent = "codex"
+prompt = "design-executability-refine"
+inputs = ["executabilitydraft"]
+
+[[workflows.nodes]]
+id = "structure"
+agent = "codex"
+prompt = "design-structure-refine"
+inputs = ["structuredraft"]
+
+[[workflows.nodes]]
+id = "synth"
+agent = "codex"
+prompt = "design-synth"
+inputs = ["executability", "structure"]
+
+# plan-review: executability + coverage -> synth. For reviewing the plan the design produced.
+[[workflows]]
+id = "plan-review"
+
+[[workflows.nodes]]
+id = "exec"
+agent = "codex"
+prompt = "plan-review-exec"
+inputs = []
+
+[[workflows.nodes]]
+id = "coverage"
+agent = "codex"
+prompt = "plan-review-coverage"
+inputs = []
+
+[[workflows.nodes]]
+id = "synth"
+agent = "codex"
+prompt = "plan-review-synth"
+inputs = ["exec", "coverage"]
+
+[server]
+addr = "127.0.0.1:8080"
