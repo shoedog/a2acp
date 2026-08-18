@@ -48,6 +48,21 @@ file = "../prompts/design-synth.md"
 description = "design synthesis"
 
 [[prompts]]
+id = "spec-review-rigor"
+file = "../prompts/spec-review-rigor.md"
+description = "spec-review rigor lens"
+
+[[prompts]]
+id = "spec-review-soundness"
+file = "../prompts/spec-review-soundness.md"
+description = "spec-review soundness lens"
+
+[[prompts]]
+id = "spec-review-synth"
+file = "../prompts/spec-review-synth.md"
+description = "spec-review synthesis prompt"
+
+[[prompts]]
 id = "plan-review-exec"
 file = "../prompts/plan-review-exec.md"
 description = "plan-review executability lens"
@@ -95,6 +110,28 @@ id = "synth"
 agent = "codex"
 prompt = "design-synth"
 inputs = ["executability", "structure"]
+
+# spec-review: rigor (completeness/ambiguity) + soundness (design) -> synth.
+[[workflows]]
+id = "spec-review"
+
+[[workflows.nodes]]
+id = "rigor"
+agent = "codex"
+prompt = "spec-review-rigor"
+inputs = []
+
+[[workflows.nodes]]
+id = "soundness"
+agent = "codex"
+prompt = "spec-review-soundness"
+inputs = []
+
+[[workflows.nodes]]
+id = "synth"
+agent = "codex"
+prompt = "spec-review-synth"
+inputs = ["rigor", "soundness"]
 
 # plan-review: executability + coverage -> synth. For reviewing the plan the design produced.
 [[workflows]]
