@@ -16,8 +16,29 @@ a counted closure confirmed **six of the seven** repaired defects closed. This i
 a small, precisely-specified repair of the seventh plus three test-evidence gaps.
 
 **Do not redesign anything.** The comparison rule (A1–A8, reproduced below) is
-pinned and was confirmed by the closure to be implemented correctly. This task
-changes *when a computed verdict may be trusted*, not what the verdict is.
+pinned. This task changes *when a computed verdict may be trusted*, not what the
+verdict is.
+
+**Falsification license — everything empirical above and below is a claim you may
+disprove.** The host-gate figures, the "six of seven closed" assessment, the
+constructible state in W1, and the three SMELL diagnoses are all findings from a
+previous round and a read-only reviewer who could not execute anything. Treat them
+as hypotheses with evidence attached, not as settled fact:
+
+- If W1's symlink schedule does **not** reproduce — if the bracket already refuses,
+  or the resolver never yields the described snapshots — **say so and stop**. Do
+  not manufacture a fix for a defect you cannot construct. A repair that changes
+  behavior no test can distinguish is worse than no repair.
+- If any of S1–S3 is already adequately covered, or the prescribed fix would make
+  the test weaker, say which and why rather than applying it mechanically.
+- If you find that a defect the closure ruled **closed** (B1, B3–B7) is in fact
+  still open, that outranks everything in this task. Report it prominently.
+
+The one thing **not** open to falsification is the A1–A8 verdict table itself, and
+that is a spec decision rather than an empirical claim: three attempts at deriving
+that rule were rejected and the third refuted, so it is fixed by the operator. If
+you believe a row is unsound, report it and stop — do not implement a different
+rule.
 
 ### The pinned rule, unchanged and NOT up for revision
 
