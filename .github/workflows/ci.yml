@@ -6,6 +6,13 @@ on:
   pull_request:
     branches: ["main"]
 
+# Supersede in-flight runs for the same ref. Never cancel on main: a main run is the
+# post-merge record for that commit, and re-running it replaces the log we would need
+# to read on a failure. PR refs are free to be superseded.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: "-D warnings"
@@ -109,6 +116,44 @@ jobs:
 
       - name: Coverage — bridge-mcp (≥70% line coverage)
         run: cargo llvm-cov --package bridge-mcp --fail-under-lines 70
+
+  test-uninstrumented:
+    name: Test (uninstrumented control)
+    runs-on: ubuntu-latest
+
+    # The workspace's only other full-suite execution is `cargo llvm-cov --workspace` in the
+    # `ci` job. Coverage instrumentation has its own failure modes (see
+    # docs/superpowers/reviews/2026-08-17-coverage-lane-flake-family-investigation.md), so a
+    # red there is ambiguous between a real regression and an instrumentation artifact. This
+    # job is the control that disambiguates them: same suite, no instrumentation. If this is
+    # green and the coverage lane is red, the defect is in the instrumented lane.
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.94.0
+
+      - name: Print rustc version
+        run: rustc --version
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          # Distinct from the `ci` job's key: that target dir holds llvm-cov-instrumented
+          # artifacts, and sharing it would defeat the point of this job.
+          key: ${{ runner.os }}-cargo-uninstrumented-${{ hashFiles('**/Cargo.lock') }}
+
+      # --no-fail-fast so a red run reports the complete failure population in one pass.
+      # Enumerating the whole population before the next retry is a standing lane rule.
+      - name: Test workspace (no coverage instrumentation)
+        run: cargo test --workspace --locked --no-fail-fast
 
   bridge-store-macos:
     name: Bridge Store (macOS 14)
