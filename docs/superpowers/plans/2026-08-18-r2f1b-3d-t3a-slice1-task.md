@@ -48,9 +48,9 @@ construction and **before** any probing.
 ### Owner decisions already taken — implement these, do not reopen
 
 1. **Bare `ProtectionPrepared` residue refuses.** A process that crashes after
-   publishing `ProtectionPrepared` leaves a record with no claim, and the
-   companion preparation journal carries only `{flight_id, state}` — insufficient
-   authority for a positive proof. T3a **refuses** that residue. Durable candidate
+   publishing `ProtectionPrepared` may leave a record with no claim, and the
+   companion preparation journal carries only a schema version, flight id and
+   state — no candidate authority, and so insufficient for a positive proof. T3a **refuses** that residue. Durable candidate
    evidence (a preparation-journal v2, or a record digest) is a **separately
    chartered prerequisite for T3b** and is explicitly NOT built here.
 2. **Do not infer pre-target status from a state name.** Assess every
@@ -87,13 +87,7 @@ pub enum ExactAbsenceDecisionV1 {
     Refused(ExactAbsenceRefusalV1),
 }
 
-pub enum UnusedCandidatePopulationV1 {
-    ProtectionPrepared,
-    MaterializationInFlightMarker,
-}
-
 pub struct UnusedCandidateSubjectV1 {
-    pub population: UnusedCandidatePopulationV1,
     pub custody_id: WorktreeCustodyIdV1,
     pub checkout_fingerprint: Sha256HexV1,
     pub candidate: ExactAbsenceCandidateV1,
@@ -126,20 +120,68 @@ with the table it already implements: `BothAbsent` ⇒ `ProvedAtObservation`;
 `TargetPresent` and `RegisteredButAbsent` ⇒ the corresponding refusal; probe
 `Err` or ambiguity ⇒ `CannotProve`. **A probe `Err` is never absence.**
 
+**No public population enum.** Only one population is eligible in this slice, so do
+**not** publish a `UnusedCandidatePopulationV1` advertising `ProtectionPrepared` as
+a possible subject when the admission table makes it refusal-only. Prefer a
+**private** projection returning `Result<UnusedCandidateSubjectV1,
+UnusedCandidateRefusalV1>`. Add a population enum later, when a second population
+actually becomes eligible.
+
 `LocallyOwned` and `OwnershipCannotProve` are part of the vocabulary this slice
 defines but are **not constructed here** — slice 2 wires the backend ownership
 observer that produces them. State that in a comment so a reviewer does not read
 them as dead vocabulary.
 
-**Population projection.** Project a scanned record to a population before
-constructing a subject:
+**Signature migration — state it exactly, do not improvise.** `decide_unused_candidate`
+today is `pub fn decide_unused_candidate(candidate: &ExactAbsenceCandidateV1,
+recovery_owned: bool, probe: &dyn ExactAbsenceProbeV1) -> UnusedCandidateDecisionV1`,
+and it refuses when `recovery_owned` is true. **Measured: both production call sites
+pass a hardcoded `false` and no caller anywhere passes `true`**, so no current path
+loses a refusal — but the capability must not silently disappear either. Therefore:
 
-- `PreservationUnknown { reason: MaterializationInFlight }` ⇒
-  `MaterializationInFlightMarker`, eligible.
-- `ProtectionPrepared {}` ⇒ the `ProtectionPrepared` population, but with no claim
-  it cannot yield a constructible subject ⇒ `CannotConstructSubject` (decision 1).
-- Every other state ⇒ `IneligiblePopulation`. **Refuse before constructing a
-  candidate and before calling the probe.**
+- Keep a refusal path for recovery ownership reachable through the V3 assessment,
+  even though nothing constructs it in this slice, so slice 2 wires an observer into
+  an existing hole rather than reintroducing a dropped concept.
+- If you remove or rename `decide_unused_candidate`, say so explicitly in the
+  handoff and show that every caller moved. Do not leave two proof entry points.
+- **V3 and legacy dispatch separately.** The legacy adapter keeps returning its own
+  decision type; do not force legacy and V3 through one combined match. The
+  top-level sweep loop may map both to a common reporting shape, but the two
+  branches stay distinct.
+
+**Population projection — the admission table is exhaustive, and it is a table.**
+Project a scanned V3 record to an admission outcome **before** constructing an
+`ExactAbsenceCandidateV1` and **before** calling the probe. Admission is decided by
+`(state, claim presence)` jointly, not by state alone:
+
+| Record state | Claim | Outcome |
+|---|---|---|
+| `PreservationUnknown { reason: MaterializationInFlight }` | present (schema `Required`) | **eligible** — construct subject, then probe |
+| `ProtectionPrepared {}` | **absent** | refuse `CannotConstructSubject` |
+| `ProtectionPrepared {}` | **present** | refuse `IneligiblePopulation` |
+| `PreservationUnknown` with any other `reason` | present | refuse `IneligiblePopulation` |
+| `PreservationPrepared`, `Preserved` | present | refuse `IneligiblePopulation` |
+| `UnusedSettled`, `Materializing`, `LiveProtected`, `DeleteAuthorized`, `Removed`, `RecoveredLive` | forbidden | refuse `IneligiblePopulation` |
+
+**`ProtectionPrepared` is the schema's one `ClaimPresenceV1::Optional` state**
+(`custody.rs`, `claim_presence`), so a claim-bearing `ProtectionPrepared` record is
+schema-valid and would otherwise be constructible and probeable. Both forms refuse.
+The refusal is not conditional on the claim being unusable — do **not** write a rule
+of the form "refuse because no claim exists", because that rule silently admits the
+claimed form.
+
+Handle the enumeration **exhaustively over the state enum**, so that adding a state
+later fails to compile rather than defaulting into eligibility. No `_ =>` catch-all
+that maps to eligible.
+
+**Guards that must survive the refactor.** `decide_unused_custody_record` already
+refuses when the worktree is not under the sweep root (`worktree_under_root`) and
+when the scanned record file is not the canonical custody-record sibling of that
+worktree (the `canonicalize(record_file) == canonicalize(custody_record_path(..))`
+check). **Both must remain, and both must run ahead of subject construction and
+probing.** Map each to a fixed refusal reason and cover each with a zero-probe
+regression test. A refactor that drops either would return a positive result for an
+out-of-root or mismatched record while still satisfying every other test here.
 
 **Legacy stays separate.** Do not fold `decide_unused_legacy_sidecar` into the V3
 population projection; keep its behavior as-is.
@@ -149,33 +191,94 @@ unlink a custody record, a marker, a sidecar, or a checkout directory.
 
 ## Red-first battery
 
-Per owner decision 3, be precise about what is genuinely red:
+Per owner decision 3, be exact about what is genuinely red and what is not.
 
-**Behaviorally red on `9aedf175` — these must fail on the unmodified tree:**
+**Genuinely red on `9aedf175` — these must fail on the unmodified tree:**
 
 - `only_materialization_inflight_records_enter_unused_marker_proof` — construct
-  **real** claim-bearing records in `Preserved`, `PreservationPrepared`, an
-  unrelated `PreservationUnknown` reason, and the eligible
-  `PreservationUnknown { reason: MaterializationInFlight }`. Assert that **only**
-  the eligible record causes the probe to be invoked, using a counting probe. This
-  is red today because every claim-bearing record routes to the proof.
-- `degraded_materialization_marker_refuses_without_probing` — an eligible-state
-  record whose claim is absent or degraded, written through the real
-  provider-error writer shape. Assert `CannotConstructSubject`, **zero** probe
-  invocations, and unchanged record bytes.
+  **real** claim-bearing records in `Preserved`, `PreservationPrepared`, and a
+  `PreservationUnknown` with a reason other than `MaterializationInFlight`, plus
+  the eligible `PreservationUnknown { reason: MaterializationInFlight }`. Assert
+  with a counting probe that only the eligible record causes a probe invocation.
+  Red today because every claim-bearing record routes to the proof.
+- `claim_bearing_protection_prepared_refuses_before_probing` — a **claim-bearing**
+  `ProtectionPrepared` record. `ProtectionPrepared` is the schema's one
+  `ClaimPresenceV1::Optional` state, so this record is valid, is constructible
+  today, and **currently reaches the probe**. It must newly refuse
+  `IneligiblePopulation` with **zero** probe invocations. This is the second
+  genuinely-red case.
 
-**Accepted as regression and exit coverage, not claimed as red:**
+**Guard regressions — zero probe invocations, each behaviorally red only if the
+corresponding guard is dropped, so treat them as regression coverage:**
 
-- `unused_candidate_settles_only_after_exact_absence` — the slice's named exit
-  gate. A real eligible record, with four arms: target-present refuses;
-  registered-but-absent refuses; probe-error refuses; both-absent yields
-  `ReadyForLockedReproof`. **"Settles" here means the proof result only.** Every
-  arm must snapshot the record bytes and the directory entries before and after
-  and assert both unchanged. Its truth table already exists in substance, so do
-  **not** contort the API to force it red — say plainly in the handoff that it is
-  regression coverage and name the two tests above as the genuinely red evidence.
+- An eligible-state record whose worktree is not under the sweep root.
+- An eligible-state record whose scanned file is not the canonical custody-record
+  sibling of its worktree.
 
-For each red test, record the exact pre-change failure output in the handoff.
+**Regression and exit coverage, not claimed as red:**
+
+- `unused_candidate_settles_only_after_exact_absence` — the named exit gate. Four
+  arms: target-present refuses; registered-but-absent refuses; probe-error
+  refuses; both-absent yields `ReadyForLockedReproof`. **"Settles" means the proof
+  result only.** Every arm must run through the **real V3 production adapter and
+  the scanned-record sweep path** with a programmable probe — not by calling
+  `decide_exact_absence` directly, which would pass even if the adapter mutated
+  records. Snapshot record bytes and the enclosing directory entries before and
+  after each arm and assert both unchanged. Say plainly in the handoff that this
+  is regression coverage and that the two tests above are the red evidence.
+
+**Degraded-claim handling — specify it, do not test the impossible.** The original
+draft of this spec mandated a `degraded_materialization_marker_refuses_without_probing`
+test. That test has **no constructible red fixture** and has been withdrawn:
+`PreservationUnknown` requires a claim (`ClaimPresenceV1::Required`), so an absent
+claim is schema-invalid; an unbound common-directory claim already refuses without
+probing today; and a target-degraded but authority-bound claim remains
+constructible and is legitimately probed. Instead, state per field which degraded
+claims are constructible and which already refuse, and cover the constructible ones
+as regression coverage only.
+
+### Proving projection happens BEFORE construction
+
+Counting probe invocations does **not** prove ordering. A candidate-first
+implementation can construct `ExactAbsenceCandidateV1::from_claim` — which performs
+filesystem and Git authority binding — then reject the state, and still record zero
+probe calls. AC1 requires refusal before construction, so it needs its own evidence.
+Use **one** of:
+
+- an instrumentable construction seam that counts `from_claim` invocations, asserted
+  to be zero for every ineligible row; **or**
+- an ineligible record whose source/common-dir authority is invalid, so that a
+  candidate-first implementation fails distinctly rather than returning
+  `IneligiblePopulation`. Assert the exact refusal reason is `IneligiblePopulation`
+  and not a binding failure.
+
+State which you chose and why it discriminates.
+
+### What the snapshots do and do not prove
+
+Before/after byte and directory-entry snapshots prove **final-state equality**. They
+cannot detect a transient write, rename, or unlink that is restored before the
+snapshot. Describe them in the handoff as final-state evidence. For the stronger
+claim that *no mutation operation occurred*, either add an operation-recording seam
+or give source-level verification that the touched paths contain no write, rename,
+or unlink call — and say which you did.
+
+## Who runs which gate
+
+Your container has **no compile loop**, so it cannot produce base-red output or
+final gate totals. Do not treat that as a reason to skip them, and do not fabricate
+them.
+
+- **You** write the tests, state per test whether you executed it, and record
+  whatever your verify stage reports.
+- **The operator runs, on the host:** the exact pre-change failure output for both
+  genuinely-red tests against unmodified `9aedf175`, and the full post-change gate
+  (`cargo fmt --all -- --check`; `cargo clippy --workspace --all-targets --locked
+  -- -D warnings`; `cargo test --workspace --locked --no-fail-fast`).
+- **The handoff must contain a clearly-marked section** for that operator-supplied
+  evidence, with a placeholder line per item saying it is pending operator
+  execution. Leave the placeholders in rather than guessing values; the operator
+  fills them before closure.
 
 ## On evidence
 
@@ -208,43 +311,64 @@ to revision is the T3a-decides / T3b-acts split.
 
 ## Acceptance Criteria
 
-1. Population projection admits **only**
-   `PreservationUnknown { reason: MaterializationInFlight }` to subject
-   construction and probing; every other state refuses with an explicit reason
-   **before** a candidate is constructed and **before** the probe is called.
-2. Bare `ProtectionPrepared` residue refuses as `CannotConstructSubject`; no
-   preparation-journal change and no durable-schema work is included.
-3. Exact-absence observation and unused-candidate assessment are separate types,
-   and there remains exactly **one** exact-absence proof definition.
-4. The positive result is named `ReadyForLockedReproof` (or an equally explicit
-   non-authority name) and its doc comment states that it is advisory and that
-   T3b must re-prove under its lock.
-5. `LocallyOwned` and `OwnershipCannotProve` exist in the vocabulary, are
-   documented as slice-2 wiring, and are constructed nowhere in this slice.
-6. **Zero mutation.** No custody record, marker, sidecar, or checkout directory is
-   written, renamed, or unlinked on any path this slice touches. The named exit
-   gate asserts unchanged bytes and unchanged directory entries in every arm.
-7. No new edge in the frozen custody transition table; no new
-   `ScannedWorktreeRecordV1` variant; no async exact-absence trait; no nested
-   runtime; no change to `compare_path_identities` or to `host_git.rs`'s proof.
-8. Legacy sidecar behavior is unchanged.
-9. Both genuinely-red tests exist and their exact pre-change failure output is
-   recorded; the named exit gate exists and is honestly labelled regression
-   coverage.
-10. `cargo fmt --all -- --check` clean; `cargo clippy --workspace --all-targets
-    --locked -- -D warnings` clean; `cargo test --workspace --locked
-    --no-fail-fast` green with totals reported. Report totals as the count of test
-    binaries and doc-test suites, not by summing `test result:` lines — a
-    bridge-core test re-executes the test binary as a filtered subprocess and its
-    nested harness line inflates a naive sum.
-11. `git diff --numstat 9aedf175..HEAD` at most **250** changed lines including
-    tests and handoff. A breach requires an explicit pre-closure operator waiver.
+1. The admission table above is implemented **exhaustively over the state enum**,
+   keyed on `(state, claim presence)` jointly. **Both** forms of
+   `ProtectionPrepared` refuse; neither is constructible or probeable. No `_ =>`
+   catch-all maps to eligible.
+2. Refusal happens **before** `ExactAbsenceCandidateV1` construction and **before**
+   any probe call, and the handoff shows the evidence chosen from "Proving
+   projection happens BEFORE construction" — a counting probe alone does not
+   satisfy this.
+3. `worktree_under_root` and the canonical record-file/sibling check both survive,
+   both run ahead of subject construction, each maps to a fixed refusal reason, and
+   each has a zero-probe regression test.
+4. Exact-absence observation and unused-candidate assessment are separate types,
+   with exactly **one** exact-absence proof definition. V3 and legacy dispatch
+   remain distinct branches.
+5. The positive result is named `ReadyForLockedReproof` (or an equally explicit
+   non-authority name), and its doc comment states it is advisory and that T3b must
+   re-prove under its lock.
+6. A recovery-ownership refusal path remains reachable in the V3 assessment for
+   slice 2 to wire; `LocallyOwned` and `OwnershipCannotProve` are documented as
+   slice-2 wiring and constructed nowhere here. If `decide_unused_candidate` is
+   removed or renamed, the handoff shows every caller moved and that only one proof
+   entry point remains.
+7. **Zero mutation.** No custody record, marker, sidecar, or checkout directory is
+   written, renamed, or unlinked on any path this slice touches. The named exit gate
+   runs all four arms through the **real V3 adapter and scanned-record sweep path**
+   and asserts unchanged record bytes and directory entries. The handoff states
+   plainly that snapshots are final-state evidence and gives the stronger
+   no-operation evidence it chose.
+8. No new edge in the frozen custody transition table; no new
+   `ScannedWorktreeRecordV1` variant; no public population enum; no async
+   exact-absence trait; no nested runtime; no change to `compare_path_identities` or
+   to `host_git.rs`'s proof; no preparation-journal or durable-schema change.
+9. Legacy sidecar behavior is unchanged.
+10. Both genuinely-red tests exist —
+    `only_materialization_inflight_records_enter_unused_marker_proof` and
+    `claim_bearing_protection_prepared_refuses_before_probing` — and the named exit
+    gate exists and is honestly labelled regression coverage. The withdrawn
+    degraded-claim test is not reintroduced; degraded claims are specified
+    field-by-field instead.
+11. The handoff is written to
+    `docs/superpowers/reviews/2026-08-18-r2f1b-3d-t3a-slice1-handoff.md` (create it),
+    and contains the marked operator-evidence section with pending placeholders per
+    "Who runs which gate".
+12. `git diff --numstat 9aedf175..HEAD` at most **400** changed lines including tests
+    and the handoff. The cap was raised from 250 after the spec review added the
+    exhaustive admission table, two surviving guards with regression tests, the
+    production-path exit gate, and the construction-ordering evidence. A breach still
+    requires an explicit pre-closure operator waiver.
+13. Report test totals as the count of test binaries plus doc-test suites, not by
+    summing `test result:` lines — a bridge-core test re-executes the test binary as
+    a filtered subprocess and its nested harness line inflates a naive sum.
 
 ## Files
 
 - `crates/bridge-worktree/src/sweep.rs` — the vocabulary, the population projection, the split, and the tests.
 - `crates/bridge-worktree/src/custody.rs` — read for the state and reason enums; **do not modify**.
 - `crates/bridge-worktree/src/host_git.rs` — the probe implementation; read only.
+- `docs/superpowers/reviews/2026-08-18-r2f1b-3d-t3a-slice1-handoff.md` — the handoff to create.
 
 ## Spec Refs
 
