@@ -10741,12 +10741,19 @@ mod tests {
 
         let (bound, target) = bound_spec_v3(&source, &cfg);
         let target_path = PathBuf::from(&target);
-        let stale = target_path.with_file_name(
-            target_path
-                .file_name()
-                .unwrap()
-                .to_string_lossy()
-                .replacen("run", "rún", 1),
+        // The stale sibling must differ from `target` by a NON-ASCII component, so the
+        // comparator reaches row A6. Deriving it by substring replacement is fragile: the
+        // leaf is `{owner}-{run}-{hash}`, and a run label without the searched substring
+        // makes `replacen` a no-op, so `stale == target` and the fixture silently builds
+        // "the target itself is registered and locked" instead of an A6 ambiguity.
+        // Append instead — that cannot fail to produce a distinct non-ASCII sibling.
+        let stale = target_path.with_file_name(format!(
+            "{}-stále",
+            target_path.file_name().unwrap().to_string_lossy()
+        ));
+        assert_ne!(
+            stale, target_path,
+            "the fixture must build a sibling distinct from the target"
         );
         git(
             &source,
