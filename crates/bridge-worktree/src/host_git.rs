@@ -152,6 +152,12 @@ enum RegistrationAbsenceV1 {
     CannotProve,
 }
 
+/// The explicit `compare_path_identities(wt, wt) != Same` guard this function used to open
+/// with is deliberately gone, not accidentally dropped. B2 gave the comparator a
+/// byte-identical short-circuit that returns `Same` before resolving anything, so a path
+/// compared against itself is now unconditionally `Same` and the guard could never fire.
+/// Keeping it would have implied the self-compare is still fallible, which is exactly the
+/// ambiguity B2 removed.
 fn registration_absent_from_porcelain(
     output: &[u8],
     wt: &str,
