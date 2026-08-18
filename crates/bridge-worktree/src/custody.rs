@@ -90,12 +90,10 @@ impl PreservationReasonV1 {
 /// `host_git.rs`'s registration probes can give (`registration_absent_from_porcelain`
 /// `:103`, `registration_absent` `:112`): registered, provably unregistered, unprovable.
 ///
-/// **2b2 obligation.** `registration_absent` returns `Result<bool, BridgeError>`, and its
-/// `Err` arm is the *only* producer of [`RecoveryLocatorV1::RegistrationUnproven`]. The
-/// writer must map that `Err` explicitly to this variant rather than propagating the
-/// error or collapsing it into `UnregisteredDirectory`. Otherwise the third variant is
-/// unreachable in production and every ambiguous probe is durably recorded as a definite
-/// answer — the exact failure mode §5.7's ambiguity rows exist to prevent.
+/// `registration_absent` retains `Absent`, `Present`, and `CannotProve` in addition to
+/// transport errors. Both `CannotProve` and `Err` produce
+/// [`RecoveryLocatorV1::RegistrationUnproven`]; neither may be collapsed into a definite
+/// registered or unregistered claim.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "locator", rename_all = "snake_case", deny_unknown_fields)]
 pub enum RecoveryLocatorV1 {
@@ -2090,6 +2088,27 @@ mod tests {
             probe_custody_record_presence(&checkout.to_string_lossy()),
             CustodyRecordPresenceV1::Present
         );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// `try_exists` treats a dangling final parent symlink as absent only after the pinned open
+    /// has refused to follow it. The missing checkout therefore authorizes no record protection.
+    #[cfg(unix)]
+    #[test]
+    fn a_dangling_final_parent_symlink_probes_provably_absent() {
+        let root = probe_root("dangling-parent");
+        let dangling_parent = root.join("dangling-parent");
+        std::os::unix::fs::symlink(root.join("missing-parent"), &dangling_parent).unwrap();
+
+        let checkout = dangling_parent.join("ownr-run7-abc");
+        let presence = probe_custody_record_presence(&checkout.to_string_lossy());
+
+        assert_eq!(
+            presence,
+            CustodyRecordPresenceV1::ProvablyAbsent,
+            "a dangling final parent cannot contain a custody record"
+        );
+        assert!(presence.authorizes_checkout_removal());
         std::fs::remove_dir_all(&root).unwrap();
     }
 

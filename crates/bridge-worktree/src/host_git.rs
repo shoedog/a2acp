@@ -3,11 +3,36 @@ use crate::provider::{
     add_argv, is_repo_argv, list_porcelain_argv, prune_argv, remove_argv, CustodyAddFailureV1,
     CustodyAddOutcomeV1, CustodyAddTargetV1, WorktreeProvider,
 };
+use crate::sweep::{ExactAbsenceCandidateV1, ExactAbsenceObservationV1, ExactAbsenceProbeV1};
 use bridge_core::error::BridgeError;
+use bridge_core::fs_custody::{compare_path_identities, PathIdentityComparisonV1};
 use std::path::Path;
-use std::process::Output;
+use std::process::{Command as StdCommand, Output};
 use std::time::Duration;
 use tokio::process::Command;
+
+#[cfg(test)]
+thread_local! {
+    static EXACT_ABSENCE_AFTER_INITIAL_REVALIDATION_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn set_exact_absence_after_initial_revalidation_hook(hook: impl FnOnce() + 'static) {
+    EXACT_ABSENCE_AFTER_INITIAL_REVALIDATION_HOOK.with(|slot| {
+        assert!(slot.borrow().is_none(), "a test hook is already installed");
+        *slot.borrow_mut() = Some(Box::new(hook));
+    });
+}
+
+#[cfg(test)]
+fn run_exact_absence_after_initial_revalidation_hook() {
+    if let Some(hook) =
+        EXACT_ABSENCE_AFTER_INITIAL_REVALIDATION_HOOK.with(|slot| slot.borrow_mut().take())
+    {
+        hook();
+    }
+}
 
 pub struct HostGitWorktree;
 
@@ -32,6 +57,14 @@ async fn run_git(argv: &[&str]) -> Result<Output, BridgeError> {
         .map_err(|e| BridgeError::ConfigInvalid {
             reason: format!("git spawn: {e}"),
         })
+}
+
+fn run_git_sync(argv: &[&str]) -> Result<Output, BridgeError> {
+    let mut command = StdCommand::new("git");
+    command.args(argv);
+    command.output().map_err(|e| BridgeError::ConfigInvalid {
+        reason: format!("git spawn: {e}"),
+    })
 }
 
 fn retryable_lock_error(err: &str) -> bool {
@@ -86,12 +119,14 @@ async fn common_dir(repo: &str) -> String {
         .unwrap_or_default()
 }
 
-fn target_absent_from_probe(probe: std::io::Result<bool>) -> Result<bool, BridgeError> {
-    probe
-        .map(|exists| !exists)
-        .map_err(|error| BridgeError::ConfigInvalid {
+fn target_absent_from_probe(target: &Path) -> Result<bool, BridgeError> {
+    match target.symlink_metadata() {
+        Ok(_) => Ok(false),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(true),
+        Err(error) => Err(BridgeError::ConfigInvalid {
             reason: format!("worktree target metadata failed: {error}"),
-        })
+        }),
+    }
 }
 
 fn removal_is_complete(
@@ -102,17 +137,48 @@ fn removal_is_complete(
     prune_succeeded && target_absent && registration_absent
 }
 
-fn registration_absent_from_porcelain(output: &[u8], wt: &str) -> bool {
-    let target = wt.as_bytes();
-    !output.split(|byte| *byte == 0).any(|field| {
-        field
-            .strip_prefix(b"worktree ")
-            .is_some_and(|path| path == target)
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RegistrationAbsenceV1 {
+    Absent,
+    Present,
+    CannotProve,
+}
+
+/// The explicit `compare_path_identities(wt, wt) != Same` guard this function used to open
+/// with is deliberately gone, not accidentally dropped. B2 gave the comparator a
+/// byte-identical short-circuit that returns `Same` before resolving anything, so a path
+/// compared against itself is now unconditionally `Same` and the guard could never fire.
+/// Keeping it would have implied the self-compare is still fallible, which is exactly the
+/// ambiguity B2 removed.
+pub(crate) fn registration_absent_from_porcelain(
+    output: &[u8],
+    wt: &str,
+) -> Result<RegistrationAbsenceV1, BridgeError> {
+    let mut ambiguous = false;
+    for field in output.split(|byte| *byte == 0) {
+        let Some(path) = field.strip_prefix(b"worktree ") else {
+            continue;
+        };
+        let path = std::str::from_utf8(path).map_err(|_| BridgeError::ConfigInvalid {
+            reason: "worktree registration path is not valid UTF-8".to_string(),
+        })?;
+        match compare_path_identities(path, wt) {
+            PathIdentityComparisonV1::Same => return Ok(RegistrationAbsenceV1::Present),
+            PathIdentityComparisonV1::Different => {}
+            PathIdentityComparisonV1::CannotProve => ambiguous = true,
+        }
+    }
+    Ok(if ambiguous {
+        RegistrationAbsenceV1::CannotProve
+    } else {
+        RegistrationAbsenceV1::Absent
     })
 }
 
-async fn registration_absent(repo: &str, wt: &str) -> Result<bool, BridgeError> {
-    let listed = run_git(&list_porcelain_argv(repo)).await?;
+fn registration_absent_from_output(
+    listed: Output,
+    wt: &str,
+) -> Result<RegistrationAbsenceV1, BridgeError> {
     if !listed.status.success() {
         return Err(BridgeError::ConfigInvalid {
             reason: format!(
@@ -121,7 +187,46 @@ async fn registration_absent(repo: &str, wt: &str) -> Result<bool, BridgeError> 
             ),
         });
     }
-    Ok(registration_absent_from_porcelain(&listed.stdout, wt))
+    registration_absent_from_porcelain(&listed.stdout, wt)
+}
+
+async fn registration_absent(repo: &str, wt: &str) -> Result<RegistrationAbsenceV1, BridgeError> {
+    registration_absent_from_output(run_git(&list_porcelain_argv(repo)).await?, wt)
+}
+
+fn registration_absent_sync(repo: &str, wt: &str) -> Result<RegistrationAbsenceV1, BridgeError> {
+    registration_absent_from_output(run_git_sync(&list_porcelain_argv(repo))?, wt)
+}
+
+impl ExactAbsenceProbeV1 for HostGitWorktree {
+    fn observe_exact_absence(
+        &self,
+        candidate: &ExactAbsenceCandidateV1,
+    ) -> Result<ExactAbsenceObservationV1, BridgeError> {
+        candidate.revalidate_source()?;
+        let target = Path::new(&candidate.worktree_path);
+        if !target_absent_from_probe(target)? {
+            return Ok(ExactAbsenceObservationV1::TargetPresent);
+        }
+        #[cfg(test)]
+        run_exact_absence_after_initial_revalidation_hook();
+        let registration =
+            registration_absent_sync(&candidate.canonical_source, &candidate.worktree_path)?;
+        // The Git subprocess reads source/.git while the target can independently reappear.
+        // Revalidate every observation before it becomes exact-absence evidence. These are
+        // string-path brackets, not descriptor binding, so strict ABA safety remains unclaimed.
+        candidate.revalidate_source()?;
+        if !target_absent_from_probe(target)? {
+            return Ok(ExactAbsenceObservationV1::TargetPresent);
+        }
+        match registration {
+            RegistrationAbsenceV1::Absent => Ok(ExactAbsenceObservationV1::BothAbsent),
+            RegistrationAbsenceV1::Present => Ok(ExactAbsenceObservationV1::RegisteredButAbsent),
+            RegistrationAbsenceV1::CannotProve => Err(BridgeError::ConfigInvalid {
+                reason: "worktree registration has no provable identity".to_string(),
+            }),
+        }
+    }
 }
 
 /// `git worktree remove` + `prune`, then the two post-conditions §5.1 names: the target is absent
@@ -140,10 +245,14 @@ async fn registration_absent(repo: &str, wt: &str) -> Result<bool, BridgeError> 
 async fn remove_and_verify(repo: &str, wt: &str) -> Result<(), BridgeError> {
     let remove = run_git(&remove_argv(repo, wt)).await?;
     let prune = run_git(&prune_argv(repo)).await?;
-    let target_absent = target_absent_from_probe(Path::new(wt).try_exists())?;
+    let target_absent = target_absent_from_probe(Path::new(wt))?;
     let registration_absent = registration_absent(repo, wt).await?;
 
-    if removal_is_complete(prune.status.success(), target_absent, registration_absent) {
+    if removal_is_complete(
+        prune.status.success(),
+        target_absent,
+        registration_absent == RegistrationAbsenceV1::Absent,
+    ) {
         return Ok(());
     }
 
@@ -151,7 +260,7 @@ async fn remove_and_verify(repo: &str, wt: &str) -> Result<(), BridgeError> {
     let prune_error = String::from_utf8_lossy(&prune.stderr).trim().to_owned();
     Err(BridgeError::ConfigInvalid {
         reason: format!(
-            "worktree remove failed (remove_status={}, remove_stderr={remove_error:?}, prune_status={}, prune_stderr={prune_error:?}, target_absent={target_absent}, registration_absent={registration_absent})",
+            "worktree remove failed (remove_status={}, remove_stderr={remove_error:?}, prune_status={}, prune_stderr={prune_error:?}, target_absent={target_absent}, registration_absent={registration_absent:?})",
             remove.status, prune.status
         ),
     })
@@ -162,22 +271,21 @@ async fn remove_and_verify(repo: &str, wt: &str) -> Result<(), BridgeError> {
 /// The two probes answer independent questions and are kept independent: `target` decides whether
 /// there is work to preserve, `recovery_locator` decides how a recovery consumer reaches it.
 ///
-/// **2a's docstring'd obligation, discharged here.** `registration_absent` returns
-/// `Result<bool, BridgeError>` and its `Err` arm is the ONLY producer of
-/// [`RecoveryLocatorV1::RegistrationUnproven`]. Collapsing that `Err` into
-/// `UnregisteredDirectory` (or propagating it) would make the third variant unreachable in
-/// production and record every ambiguous probe as a definite answer — the exact failure mode
-/// §5.7's ambiguity rows exist to prevent.
+/// `registration_absent` retains all three answers through the porcelain parser. Its
+/// `CannotProve` and `Err` arms both project to [`RecoveryLocatorV1::RegistrationUnproven`];
+/// neither may become a definite registration claim.
 async fn classify_custody_add_failure(repo: &str, wt: &str, reason: String) -> CustodyAddFailureV1 {
-    let target = match Path::new(wt).try_exists() {
-        Ok(true) => CustodyAddTargetV1::Present,
-        Ok(false) => CustodyAddTargetV1::ProvablyAbsent,
+    let target = match target_absent_from_probe(Path::new(wt)) {
+        Ok(false) => CustodyAddTargetV1::Present,
+        Ok(true) => CustodyAddTargetV1::ProvablyAbsent,
         Err(_) => CustodyAddTargetV1::Unproven,
     };
     let recovery_locator = match registration_absent(repo, wt).await {
-        Ok(true) => RecoveryLocatorV1::UnregisteredDirectory {},
-        Ok(false) => RecoveryLocatorV1::RegisteredWorktree {},
-        Err(_) => RecoveryLocatorV1::RegistrationUnproven {},
+        Ok(RegistrationAbsenceV1::Absent) => RecoveryLocatorV1::UnregisteredDirectory {},
+        Ok(RegistrationAbsenceV1::Present) => RecoveryLocatorV1::RegisteredWorktree {},
+        Ok(RegistrationAbsenceV1::CannotProve) | Err(_) => {
+            RecoveryLocatorV1::RegistrationUnproven {}
+        }
     };
     let common_dir = common_dir(repo).await;
     CustodyAddFailureV1 {
@@ -321,6 +429,29 @@ mod tests {
         );
     }
 
+    fn initialized_repo(root: &Path, name: &str) -> PathBuf {
+        let source = root.join(name);
+        std::fs::create_dir_all(&source).unwrap();
+        git(&source, &["init", "-q"]);
+        git(&source, &["config", "user.email", "a@b.c"]);
+        git(&source, &["config", "user.name", "x"]);
+        std::fs::write(source.join("file.txt"), "base\n").unwrap();
+        git(&source, &["add", "-A"]);
+        git(&source, &["commit", "-q", "-m", "init"]);
+        source
+    }
+
+    fn exact_absence_candidate(source: &Path, target: &Path) -> ExactAbsenceCandidateV1 {
+        ExactAbsenceCandidateV1::from_legacy(
+            source.to_string_lossy(),
+            std::fs::canonicalize(source.join(".git"))
+                .unwrap()
+                .to_string_lossy(),
+            target.to_string_lossy(),
+        )
+        .unwrap()
+    }
+
     #[test]
     fn cleanup_success_requires_absent_target_registration_and_successful_prune() {
         assert!(
@@ -330,22 +461,140 @@ mod tests {
         assert!(!removal_is_complete(false, true, true));
         assert!(!removal_is_complete(true, false, true));
         assert!(!removal_is_complete(true, true, false));
-        assert!(target_absent_from_probe(Ok(false)).unwrap());
-        assert!(target_absent_from_probe(Ok(true)).is_ok_and(|absent| !absent));
-        assert!(target_absent_from_probe(Err(std::io::Error::new(
-            std::io::ErrorKind::PermissionDenied,
-            "denied",
-        )))
-        .is_err());
+        let target = unique_temp_dir("target-absence-probe");
+        std::fs::create_dir_all(&target).unwrap();
+        assert!(target_absent_from_probe(&target.join("absent")).unwrap());
+        std::fs::create_dir(target.join("present")).unwrap();
+        assert!(!target_absent_from_probe(&target.join("present")).unwrap());
+        std::fs::remove_dir_all(&target).unwrap();
     }
 
     #[test]
     fn porcelain_registration_check_is_exact_and_handles_locked_records() {
-        let output =
-            b"worktree /repo\0HEAD abc\0\0worktree /managed/wt\0HEAD def\0locked reason\0\0";
-        assert!(!registration_absent_from_porcelain(output, "/managed/wt"));
-        assert!(registration_absent_from_porcelain(output, "/managed/other"));
-        assert!(registration_absent_from_porcelain(output, "/managed/w"));
+        let root = unique_temp_dir("porcelain-registration");
+        let managed = root.join("managed");
+        std::fs::create_dir_all(&managed).unwrap();
+        let registered = managed.join("wt");
+        let output = [
+            b"worktree /repo\0HEAD abc\0\0worktree ".as_slice(),
+            registered.to_string_lossy().as_bytes(),
+            b"\0HEAD def\0locked reason\0\0",
+        ]
+        .concat();
+        assert_eq!(
+            registration_absent_from_porcelain(&output, &registered.to_string_lossy()).unwrap(),
+            RegistrationAbsenceV1::Present
+        );
+        assert_eq!(
+            registration_absent_from_porcelain(&output, &managed.join("other").to_string_lossy())
+                .unwrap(),
+            RegistrationAbsenceV1::Absent
+        );
+        assert_eq!(
+            registration_absent_from_porcelain(&output, &managed.join("w").to_string_lossy())
+                .unwrap(),
+            RegistrationAbsenceV1::Absent
+        );
+
+        let non_ascii = managed.join("résumé");
+        let non_ascii_output = [
+            b"worktree ".as_slice(),
+            non_ascii.to_string_lossy().as_bytes(),
+            b"\0",
+        ]
+        .concat();
+        assert_eq!(
+            registration_absent_from_porcelain(
+                &non_ascii_output,
+                &managed.join("resume").to_string_lossy()
+            )
+            .unwrap(),
+            RegistrationAbsenceV1::CannotProve,
+            "an unrelated non-ASCII registration is not a definite registered worktree"
+        );
+
+        let exact_after_ambiguous = [
+            non_ascii_output.as_slice(),
+            b"worktree ",
+            registered.to_string_lossy().as_bytes(),
+            b"\0",
+        ]
+        .concat();
+        assert_eq!(
+            registration_absent_from_porcelain(
+                &exact_after_ambiguous,
+                &registered.to_string_lossy()
+            )
+            .unwrap(),
+            RegistrationAbsenceV1::Present,
+            "a later exact registration outranks an earlier ambiguous unrelated one"
+        );
+
+        #[cfg(unix)]
+        {
+            let alias = root.join("managed-alias");
+            std::os::unix::fs::symlink(&managed, &alias).unwrap();
+            assert_eq!(
+                registration_absent_from_porcelain(&output, &alias.join("wt").to_string_lossy()).unwrap(),
+                RegistrationAbsenceV1::Present,
+                "a canonical Git spelling and a symlinked-parent spelling name the same registration"
+            );
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn exact_absence_refuses_a_target_created_while_git_lists_worktrees() {
+        let root = unique_temp_dir("target-created-during-list");
+        let source = initialized_repo(&root, "source");
+        let target = root.join("worktree");
+        let candidate = exact_absence_candidate(&source, &target);
+        let target_for_hook = target.clone();
+        set_exact_absence_after_initial_revalidation_hook(move || {
+            std::fs::create_dir(&target_for_hook).unwrap();
+        });
+
+        assert_eq!(
+            HostGitWorktree::new()
+                .observe_exact_absence(&candidate)
+                .unwrap(),
+            ExactAbsenceObservationV1::TargetPresent,
+            "the target's post-git identity must agree with its first absence observation"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn exact_absence_refuses_a_common_dir_swap_during_git_observation() {
+        let root = unique_temp_dir("common-dir-swap-during-list");
+        let source = initialized_repo(&root, "source");
+        let replacement = initialized_repo(&root, "replacement");
+        let target = root.join("worktree");
+        let candidate = exact_absence_candidate(&source, &target);
+        let source_for_hook = source.clone();
+        let replacement_for_hook = replacement.clone();
+        let original_common = root.join("original-common");
+        set_exact_absence_after_initial_revalidation_hook(move || {
+            std::fs::rename(source_for_hook.join(".git"), &original_common).unwrap();
+            std::fs::rename(
+                replacement_for_hook.join(".git"),
+                source_for_hook.join(".git"),
+            )
+            .unwrap();
+        });
+
+        let error = HostGitWorktree::new()
+            .observe_exact_absence(&candidate)
+            .expect_err("the post-Git common-directory revalidation must refuse the replacement");
+        assert!(
+            matches!(
+                error,
+                BridgeError::ConfigInvalid { reason }
+                    if reason == "exact-absence source or common-directory identity changed"
+            ),
+            "the test must reach the specific post-Git source/common-dir revalidation"
+        );
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[tokio::test]
