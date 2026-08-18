@@ -26,7 +26,7 @@ You are **not** being asked to re-litigate the design. See "The rule is pinned"
 below — that part is settled, and re-opening it is the specific failure this
 slice has already suffered three times.
 
-## The rule is PINNED — read this before judging any verdict
+### The rule is PINNED — read this before judging any verdict
 
 This slice previously died three times because the *spec* demanded a proof that
 needed Unicode tables while forbidding any Unicode dependency. Three rules were
@@ -62,7 +62,7 @@ Correspondingly, one test's assertion was **deliberately flipped** from
 `Different` to `CannotProve` for a non-ASCII pair under a case-sensitive ancestor.
 That flip is the repair, not a regression.
 
-### Severity rule for this lane — asymmetric fix authority
+#### Severity rule for this lane — asymmetric fix authority
 
 - A wrong `Different` is **fail-open**: it authorizes a caller to skip or remove.
 - A wrong `CannotProve` is **fail-closed**: it refuses.
@@ -78,7 +78,7 @@ wrong thing — name the input or state and the incorrect result. SMELL is a ris
 gap with no demonstrated incorrect behaviour. A finding without a concrete failure
 scenario is a SMELL, never a blocker.
 
-## The six blockers this repair must close
+### The six blockers this repair must close
 
 Each was proved against `be7c6708` with the state named. Confirm closure.
 
@@ -115,7 +115,7 @@ Each was proved against `be7c6708` with the state named. Confirm closure.
 and the alternate-case lookup made a case-*insensitive* directory report
 case-sensitive — fail-open. Expect the sampled entry to be revalidated.
 
-## What the operator already ran and found
+### What the operator already ran and found
 
 Treat this as supplied evidence, not as your own.
 
@@ -145,7 +145,7 @@ Treat this as supplied evidence, not as your own.
   and disclosures this same closure asked for as MINOR findings. No code was added
   after the waiver.
 
-## What to weigh hardest
+### What to weigh hardest
 
 - **Did any fix open a new hole?** Especially B2's stability re-check and B4's
   post-command revalidation — both add windows and branches to a fail-closed
@@ -163,10 +163,49 @@ Treat this as supplied evidence, not as your own.
   to that boundary and there is no local gate. Check the cfg gating by reasoning;
   an ungated reference or a non-unix `dead_code` fails CI under `-D warnings`.
 
-## Verdict
+## Acceptance Criteria
 
-`APPROVE` or `REJECT` with the blockers enumerated. If you REJECT, each blocker
-must name the input or state and the incorrect result, so the repair is bounded.
-If the only surviving items are SMELLs, say so and APPROVE — a deferred SMELL with
-a ledger entry is a valid outcome, and manufacturing a blocker to avoid approving
-is itself a failure mode here.
+A useful review of this repair must:
+
+1. **Rule the verdict `APPROVE` or `REJECT`**, with every blocker enumerated. Each
+   blocker must name the input or state and the incorrect result, so the repair is
+   bounded and the loop can converge. If the only surviving items are SMELLs, say
+   so and APPROVE — a deferred SMELL with a ledger entry is a valid outcome, and
+   manufacturing a blocker to avoid approving is itself a failure mode here.
+2. **State, per blocker B1–B6 and B7, whether it is closed** — closed, not
+   plausibly addressed. Cite the code that closes it. A blocker you cannot confirm
+   closed is a REJECT.
+3. **Confirm the implementation matches the pinned A1–A8 table row for row**, and
+   report any deviation as a spec violation. Do not propose an alternative rule.
+4. **Report anything the repair itself introduced**, especially in B2's stability
+   re-check and B4's post-command revalidation — both add branches and windows to
+   a fail-closed proof. A path that now yields `Different` on some schedule is a
+   blocker; a path that now refuses more is not.
+5. **Judge whether the new tests construct the states they name.** For each
+   barrier and real-subprocess test, say whether the barrier actually interleaves
+   with the observation it claims to bracket, or whether it could fire before or
+   after and still pass. The B5 fixture defect described above is precedent: a test
+   two reviewers cited as confirming B5 was building a different scenario entirely.
+6. **Assess the `#[cfg(unix)]` gating by reasoning**, since no non-unix gate
+   exists. Name any item that would fail Windows CI under `-D warnings`, whether by
+   an ungated reference or by becoming dead code.
+7. **Tag every finding WRONG or SMELL**, and attach a soundness argument to any
+   finding whose remedy would widen `Different`.
+
+Do not raise the delta size, and do not raise A6's non-ASCII refusals as
+over-refusal. Both are settled above by explicit operator decision.
+
+## Files
+
+- `crates/bridge-core/src/fs_custody.rs` — the primitive, the comparator, the case probe.
+- `crates/bridge-worktree/src/host_git.rs` — the tri-state and the Git call site.
+- `crates/bridge-worktree/src/backend.rs` — the durable locator projection and the B5 end-to-end test.
+- `crates/bridge-worktree/src/custody.rs` — the recovery-locator type.
+- `docs/superpowers/reviews/2026-08-17-r2f1b-3d-t3a-path-identity-handoff.md` — the artifact's own handoff, including its per-row execution table and its disclosed limits. Judge whether its claims match the code.
+
+## Spec Refs
+
+- The pinned A1–A8 table and the asymmetric fix-authority rule are reproduced in
+  full in the Description above; they are normative for this review. The spec they
+  come from lives on a planning branch and is not in this checkout — its absence is
+  not a missing input.
