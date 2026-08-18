@@ -24,11 +24,12 @@ refuted at closure. The amendment exists so that a fourth is not attempted.
 Implement the table exactly. If you believe a row is unsound, **stop and say so
 in your handoff** — do not implement a different rule.
 
-Read `docs/superpowers/plans/2026-08-17-r2f1b-path-identity-primitive-task.md`
-§ AMENDMENT 1 before writing any code. It is reproduced in condensed form below,
-but the spec is authoritative.
+**This task carries the authoritative copy of the rule.** The primitive spec that
+holds Amendment 1 lives on a planning branch and is **NOT present in your
+checkout** — do not go looking for it, and do not treat its absence as a missing
+input. Everything normative is reproduced below in full.
 
-### The pinned rule, condensed
+### The pinned rule — NORMATIVE, implement exactly this
 
 | # | Condition | Verdict |
 |---|---|---|
@@ -41,8 +42,60 @@ but the spec is authoritative.
 | A7 | Same ancestor; every differing pair pure-ASCII and ASCII-casefold-equal | sensitive ⇒ `Different`; insensitive ⇒ `CannotProve`; **undeterminable ⇒ `CannotProve`** |
 | A8 | Unresolvable — permission error, unreadable ancestor, ambiguous probe | `CannotProve`, never `Different` |
 
-A5 is evaluated **before** A6. `CannotProve` refuses; only a proven `Different`
-lets a caller skip or remove.
+**Evaluation order.** A5 is evaluated **before** A6: a pure-ASCII pair that
+differs under both case modes proves the paths differ no matter what any other
+component contains. `CannotProve` refuses; only a proven `Different` lets a
+caller skip or remove.
+
+**A6 is unconditional — this is the whole point.** "Both case branches" means it
+applies on case-**sensitive** ancestors too. The rejected artifact refused
+non-ASCII only in the case-insensitive branch and let raw bytes decide in the
+case-sensitive one. Case sensitivity does **not** imply normalization
+sensitivity: HFSX and case-sensitive APFS are case-sensitive *and*
+normalization-insensitive, so a byte comparison there is fail-open.
+
+**Why A5 and A6 need no Unicode tables.** Canonical decomposition of an ASCII
+character is the identity, so two distinct pure-ASCII strings are never canonical
+equivalents; and Unicode simple case folding restricted to ASCII inputs is ASCII
+case folding. That is the entire proof obligation — implement nothing more.
+
+**Do not derive further Unicode facts.** In particular, do not special-case the
+three characters that are canonically ASCII-equivalent (U+037E, U+1FEF, U+212A).
+That refinement is sound and is deliberately **rejected**: it is another
+hand-derived, table-versioned theorem of exactly the species that has now died
+three times in this slice.
+
+**Distinguish ENOENT from EACCES.** A2's soundness rests on the absent side being
+genuinely absent. A lookup that fails for permission reasons is row A8, not
+absence.
+
+**Excluded by assumption.** Filesystems that alias two pure-ASCII names differing
+by more than case (vfat 8.3 short names and kin) break A5. No string rule
+survives them. State the assumption "no ASCII-aliasing filesystem under the
+managed root" in a comment at the primitive; add no machinery for it.
+
+**A6's functional cost is bounded — do not "fix" it.** A6 does not make the lane
+refuse whenever a non-ASCII registration exists. When the other registration's
+directory **exists** and the target is absent, row A2 or A3 proves `Different`
+with no name reasoning at all — an existing entry and an ENOENT lookup can never
+alias. And `remove_and_verify` runs `git worktree prune` first, clearing stale
+registrations unless they are locked. The entire residual refusal surface is: **a
+locked, stale, absent, non-ASCII registration sharing the deepest existing
+ancestor with the target.** That is accepted, and it is the declared trigger for
+escalation — not a defect to engineer around.
+
+### Severity rule for this lane — asymmetric fix authority
+
+Both directions can be WRONG, but they are **not** symmetric:
+
+- A wrong `Different` is **fail-open**: it authorizes a caller to skip or remove.
+- A wrong `CannotProve` is **fail-closed**: it refuses.
+
+**A fail-closed WRONG may never be repaired by widening `Different` without an
+explicit soundness argument for the widening.** Review pressure toward
+`Different` is precisely what generated the three dead rules. If you find
+yourself reasoning "this refusal is too broad, so it should return `Different`" —
+stop; that is the failure mode, and A6's refusals are pinned as correct behavior.
 
 ## The six blockers
 
@@ -253,7 +306,7 @@ gated.
 
 1. B1–B7 are each fixed, and the handoff names the fix and the test per item.
 2. `ascii_skeletons_could_normalize_alike` no longer exists.
-3. The implementation matches Amendment 1's A1–A8 table row for row. Any
+3. The implementation matches the A1–A8 table in this task row for row. Any
    deviation is a spec violation reported in the handoff, not a design choice.
 4. Row A6 refusals are present in **both** case branches, and the test that
    asserted otherwise has been flipped and identified as a flip.
@@ -284,12 +337,20 @@ gated.
 
 ## Spec Refs
 
-- `docs/superpowers/plans/2026-08-17-r2f1b-path-identity-primitive-task.md` —
-  the contract, including **Amendment 1**, which is normative here.
+**These live on a planning branch and are NOT in your checkout.** They are listed
+for provenance only. Everything you need is in this task; their absence is not a
+missing input and is not a reason to pause.
+
+- `docs/superpowers/plans/2026-08-17-r2f1b-path-identity-primitive-task.md`
+  § AMENDMENT 1 — the contract this task reproduces.
 - `docs/superpowers/reviews/2026-08-17-path-identity-sol-closure.md` — the counted
   closure that rejected `be7c6708`, with each blocker's constructible state.
 - `docs/superpowers/reviews/2026-08-17-decision-analysis-fable.md` — the decision
   record behind Amendment 1, and the source of B7.
+
+The one file in this list you **do** have and must rewrite is
+`docs/superpowers/reviews/2026-08-17-r2f1b-3d-t3a-path-identity-handoff.md`
+(SMELL 3, above).
 
 ## Commit Message
 
