@@ -3423,8 +3423,28 @@ mod tests {
         let original = root.path().join("sample");
         fs::write(&original, b"old").unwrap();
         let expected = path_object_identity(&fs::symlink_metadata(&original).unwrap()).unwrap();
+
+        // Pin the original inode with a second link before unlinking the name. Without this the
+        // test is a coin flip decided by the filesystem: ext4 routinely hands the just-freed
+        // inode straight back to the next create, so the "replacement" gets the SAME identity,
+        // revalidation correctly sees no change, and the probe answers `Some(_)`. That is the
+        // ABA case this primitive explicitly does NOT claim to detect — identity comparison
+        // cannot — so asserting `None` there would pin a guarantee the code does not make.
+        // APFS does not recycle inodes that way, which is the only reason this passed on macOS.
+        let keepalive = root.path().join("keepalive");
+        fs::hard_link(&original, &keepalive).unwrap();
         fs::remove_file(&original).unwrap();
         fs::write(&original, b"new").unwrap();
+
+        // Self-check the precondition. If some filesystem still recycles the identity, this
+        // fails loudly as "the fixture is invalid" rather than silently testing nothing or
+        // reporting a defect in the probe.
+        assert_ne!(
+            path_object_identity(&fs::symlink_metadata(&original).unwrap()).unwrap(),
+            expected,
+            "the replacement must have a distinct identity or this test proves nothing"
+        );
+
         fs::write(root.path().join("Sample"), b"alternate").unwrap();
         assert_eq!(
             probe_case_sensitivity(root.path(), original.file_name().unwrap(), expected),
