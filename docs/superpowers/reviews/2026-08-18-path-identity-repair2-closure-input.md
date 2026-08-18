@@ -6,8 +6,8 @@ task-type: code-review
 
 ## Description
 
-Review `git diff be7c6708..HEAD` in this checkout — the **repair delta**, roughly
-927 changed lines across `crates/bridge-core/src/fs_custody.rs` (the primitive),
+Review `git diff be7c6708..HEAD` in this checkout — the **repair delta**, 1,014
+changed lines (820 additions, 194 deletions) across `crates/bridge-core/src/fs_custody.rs` (the primitive),
 `crates/bridge-worktree/src/host_git.rs` and `.../backend.rs` and `.../custody.rs`
 (the migrated callers), plus the artifact handoff.
 
@@ -137,10 +137,13 @@ Treat this as supplied evidence, not as your own.
   a non-ASCII component and asserts its own precondition. **Scrutinise that fix:
   a fixture that silently tests nothing is exactly what let a red gate look like
   a code defect.**
-- **AC11's 500-line cap is waived by explicit operator decision** at 927 lines.
-  Do not raise the delta size as a finding; the waiver is on the record and its
-  reason is that the largest additions are the discriminating regressions the
-  previous closure demanded.
+- **AC11's 500-line cap is waived by explicit operator decision.** Do not raise
+  the delta size as a finding; the waiver is on the record and its reason is that
+  the largest additions are the discriminating regressions the previous closure
+  demanded. The waiver was granted at 927 lines and the delta is now 1,014: the
+  additional ~87 lines are **documentation only** — the per-row execution table
+  and disclosures this same closure asked for as MINOR findings. No code was added
+  after the waiver.
 
 ## What to weigh hardest
 
