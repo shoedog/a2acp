@@ -8,11 +8,11 @@ the managed root. Owner/run are not ASCII-validated; the primitive makes no
 ASCII-leaf inference and A6 refuses every non-ASCII differing pair.
 
 - **B1/A6:** deleted the false skeleton proof. `missing_tail_comparison_follows_the_pinned_a3_to_a7_order` includes the `á b dot` counterexample in both case branches; its former case-sensitive `Different` assertion is intentionally flipped to `CannotProve`.
-- **B2:** byte-identical spellings short-circuit before lookup; different spellings use a bracketing re-resolution. `path_identity_refuses_a_genuinely_different_pair_after_ancestor_drift` forces the second ancestor to change and expects `CannotProve`.
+- **B2/W1:** byte-identical spellings short-circuit before lookup; different spellings use a bracketing re-resolution that compares the complete deepest-existing-path snapshot: identity, canonical path, and missing tail. `path_identity_refuses_missing_tail_drift_with_unchanged_ancestor_identity` models `/R/link/foo` becoming an alias of `/R/foo` after the initial A3 result; `path_identity_refuses_canonical_path_drift_with_unchanged_ancestor_identity` covers canonical-only drift; `path_identity_preserves_a_stable_resolver_verdict` is the anti-over-refusal control.
 - **B3/B6:** the probe only samples entries inside the shared ancestor and is reached only for A7. `case_sensitive_at_samples_the_shared_ancestor_not_its_parent` injects an insensitive casefold-child result through the production wrapper and fails if it probes the sensitive parent. `path_identity_pipeline_resolves_a3_and_a5_when_case_mode_is_undeterminable` drives empty-`123` A5 and differing-count A3 rows through `compare_path_identities` while the real mode probe returns `None`.
-- **B4 plus target race:** source, common-dir, and target absence are all revalidated after Git returns. `exact_absence_refuses_a_common_dir_swap_during_git_observation` and `exact_absence_refuses_a_target_created_while_git_lists_worktrees` change state after the Git child has spawned and refuse rather than return `BothAbsent`.
-- **B5:** porcelain carries `Absent`/`Present`/`CannotProve`, and exact matches outrank earlier ambiguity. `host_git_ambiguous_registration_publishes_registration_unproven` creates a real locked stale non-ASCII worktree registration, drives real porcelain through `HostGitWorktree`, and decodes the durable V3 record as `RegistrationUnproven`.
-- **B7 and follow-up:** both alternate `ENOENT` and alternate-hit branches revalidate their original sampled entry. The deleted- and replaced-sample tests each expect `None`.
+- **B4 plus target race:** source, common-dir, and target absence are all revalidated after Git returns. The common-dir seam now fires after the initial revalidation and before Git spawns, so Git observes the replacement; the test keeps captured output and asserts the specific post-Git source/common-dir revalidation error. `exact_absence_refuses_a_target_created_while_git_lists_worktrees` uses the same pre-spawn seam.
+- **B5:** porcelain carries `Absent`/`Present`/`CannotProve`, and exact matches outrank earlier ambiguity. `host_git_ambiguous_registration_publishes_registration_unproven` now first asserts that real porcelain succeeds, contains the exact stale path, and parses to `CannotProve`; the durable V3 `RegistrationUnproven` assertion is an independent second check.
+- **B7 and follow-up:** both alternate `ENOENT` and alternate-hit branches revalidate their original sampled entry. The deleted- and replaced-sample tests each expect `None`; `case_probe_keeps_an_unchanged_sample` supplies the real-probe `Some(_)` control.
 - **SMELL 1:** `a_dangling_final_parent_symlink_probes_provably_absent` covers the `try_exists` fallback after a no-follow pinned open rejects a dangling final symlink.
 
 ### Correction folded after the first counted closure
@@ -38,9 +38,9 @@ was confirming nothing — the row is the reason AC10 was red.
 
 ### Known limits, stated rather than claimed away
 
-The B2, B4, and target checks are string-path/metadata brackets, not descriptor
-binding: an ABA replacement that restores the expected identity before the
-second check remains unproved and therefore outside any claim of ABA safety.
+The B2/W1, B4, and target checks are string-path/metadata brackets, not descriptor
+binding: an ABA replacement that restores the expected resolution snapshot before
+the second check remains unproved and therefore outside any claim of ABA safety.
 
 **B7 shares that same limit**, and it was not previously disclosed alongside it.
 `sampled_entry_still_matches` re-stats the original entry by path and compares
@@ -67,8 +67,8 @@ the same function. The behavioural intent of AC8 is met; the literal word
 
 ## Verification
 
-**Host gate, run by the operator on this artifact** (`4d2eca75`, the fixture
-correction above; superseding every earlier statement in this section):
+**Prior host gate, run by the operator before this repair** (`4d2eca75`, the fixture
+correction above; this revision has not run a host compile gate):
 
 | Gate | Command | Result |
 |---|---|---|
@@ -81,6 +81,10 @@ subsystem: the container lane is Linux and has neither a case-insensitive
 filesystem nor the `/var`→`/private/var` indirection, and three of this lane's
 worst defects were invisible to it. Non-Unix remains reasoning-only — there is no
 local gate for it and none was run.
+This repair ran only `cargo fmt --all -- --check` in the container. Clippy and
+tests were not run here, so the new and strengthened test rows below are not
+presented as green evidence.
+
 
 The earlier statement in this section — that the implementing agent could not
 start Cargo tests because the online resolver returned HTTP 403 for `a2a-lf`, and
@@ -89,8 +93,8 @@ is now superseded by the table above.
 
 ### AC7 — per-row execution status
 
-Every row below was **executed on the host** in the workspace run above. None is
-claimed on inspection alone.
+Earlier rows were executed on the host in the workspace run above. Rows marked
+not executed or not re-executed state the evidence available for this repair.
 
 | Red-first row | Test | Status |
 |---|---|---|
@@ -103,25 +107,19 @@ claimed on inspection alone.
 | Differing tail component counts ⇒ `Different`, no probe (A3) | `path_identity_pipeline_resolves_a3_and_a5_when_case_mode_is_undeterminable` | executed, pass |
 | Identical spelling compared with itself ⇒ `Same` via short-circuit (B2) | `path_identity_short_circuits_an_identical_missing_spelling` | executed, pass |
 | Genuinely different pair under ancestor drift ⇒ `CannotProve`, never `Different` (B2) | `path_identity_refuses_a_genuinely_different_pair_after_ancestor_drift` | executed, pass |
+| Missing-tail drift with unchanged ancestor identity ⇒ `CannotProve` (W1) | `path_identity_refuses_missing_tail_drift_with_unchanged_ancestor_identity` | not executed in this container; requires operator host gate |
+| Canonical-path-only drift with unchanged identity and tail ⇒ `CannotProve` (W1) | `path_identity_refuses_canonical_path_drift_with_unchanged_ancestor_identity` | not executed in this container; requires operator host gate |
+| Stable snapshot preserves its A5 `Different` verdict (W1 control) | `path_identity_preserves_a_stable_resolver_verdict` | not executed in this container; requires operator host gate |
 | Casefold ancestor under a case-sensitive parent ⇒ probe does not report sensitive (B3) | `case_sensitive_at_samples_the_shared_ancestor_not_its_parent` | executed, pass |
 | Sample deleted before the alternate lookup ⇒ `None`, not `Some(true)` (B7) | `case_probe_voids_a_sample_deleted_before_alternate_lookup` | executed, pass |
 | Sample replaced before an alternate hit ⇒ `None` (B7 follow-up) | `case_probe_voids_a_replaced_sample_before_an_alternate_hit` | executed, pass |
-| `common_dir` replaced **during** the Git observation ⇒ refuse, not `BothAbsent` (B4) | `exact_absence_refuses_a_common_dir_swap_during_git_observation` | executed, pass |
-| Target created while Git lists worktrees ⇒ refuse (B4 sibling race) | `exact_absence_refuses_a_target_created_while_git_lists_worktrees` | executed, pass |
-| Unregistered target + non-ASCII registration forcing A6 ⇒ persisted `RegistrationUnproven` (B5) | `host_git_ambiguous_registration_publishes_registration_unproven` | executed, pass **after the fixture correction above** |
+| Unchanged ASCII sample leaves the real case-mode probe usable (B7 control) | `case_probe_keeps_an_unchanged_sample` | not executed in this container; requires operator host gate |
+| `common_dir` replaced before the observed Git child runs ⇒ specific post-Git revalidation refusal (B4) | `exact_absence_refuses_a_common_dir_swap_during_git_observation` | not re-executed after this test strengthening; requires operator host gate |
+| Target created before Git lists worktrees ⇒ refuse (B4 sibling race) | `exact_absence_refuses_a_target_created_while_git_lists_worktrees` | not re-executed after seam relocation; requires operator host gate |
+| Successful porcelain output with the exact stale non-ASCII path parses to A6 `CannotProve`, then persists `RegistrationUnproven` (B5) | `host_git_ambiguous_registration_publishes_registration_unproven` | not re-executed after this fixture strengthening; requires operator host gate |
 | Dangling final symlink under the `try_exists` migration (SMELL 1) | `a_dangling_final_parent_symlink_probes_provably_absent` | executed, pass |
 | Pre-existing exactness/locked-record contract still holds (AC8) | `porcelain_registration_check_is_exact_and_handles_locked_records` | executed, pass (see AC8 note above) |
 
 ## Repair-delta size
 
-`git diff --numstat be7c6708..HEAD` reports 733 additions and 194 deletions:
-**927 changed lines**, against AC11's 500-line cap.
-
-**The operator granted an explicit waiver** on 2026-08-18, on the criterion's own
-terms: the cap exists so the review loop converges, and it did — the counted
-closure read the complete range in one pass and returned a closed, enumerable
-finding set with **zero production correctness blockers**. The largest additions
-are the two real-subprocess barrier tests and the durable-record end-to-end test,
-which are precisely the discriminating regressions the closure's SMELL 1 demanded,
-and the end-to-end test is what surfaced the fixture defect. Trimming to reach the
-number would have deleted the evidence.
+`git diff --numstat 39f8c3e1..HEAD` reports 171 additions and 52 deletions: **223 changed lines**, within the 250-line repair cap.

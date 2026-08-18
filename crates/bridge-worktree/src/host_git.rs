@@ -13,21 +13,25 @@ use tokio::process::Command;
 
 #[cfg(test)]
 thread_local! {
-    static RUN_GIT_SYNC_AFTER_SPAWN_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+    static EXACT_ABSENCE_AFTER_INITIAL_REVALIDATION_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
         const { std::cell::RefCell::new(None) };
 }
 
 #[cfg(test)]
-fn set_run_git_sync_after_spawn_hook(hook: impl FnOnce() + 'static) {
-    RUN_GIT_SYNC_AFTER_SPAWN_HOOK.with(|slot| {
+fn set_exact_absence_after_initial_revalidation_hook(hook: impl FnOnce() + 'static) {
+    EXACT_ABSENCE_AFTER_INITIAL_REVALIDATION_HOOK.with(|slot| {
         assert!(slot.borrow().is_none(), "a test hook is already installed");
         *slot.borrow_mut() = Some(Box::new(hook));
     });
 }
 
 #[cfg(test)]
-fn take_run_git_sync_after_spawn_hook() -> Option<Box<dyn FnOnce()>> {
-    RUN_GIT_SYNC_AFTER_SPAWN_HOOK.with(|slot| slot.borrow_mut().take())
+fn run_exact_absence_after_initial_revalidation_hook() {
+    if let Some(hook) =
+        EXACT_ABSENCE_AFTER_INITIAL_REVALIDATION_HOOK.with(|slot| slot.borrow_mut().take())
+    {
+        hook();
+    }
 }
 
 pub struct HostGitWorktree;
@@ -58,18 +62,6 @@ async fn run_git(argv: &[&str]) -> Result<Output, BridgeError> {
 fn run_git_sync(argv: &[&str]) -> Result<Output, BridgeError> {
     let mut command = StdCommand::new("git");
     command.args(argv);
-    #[cfg(test)]
-    if let Some(hook) = take_run_git_sync_after_spawn_hook() {
-        let child = command.spawn().map_err(|e| BridgeError::ConfigInvalid {
-            reason: format!("git spawn: {e}"),
-        })?;
-        hook();
-        return child
-            .wait_with_output()
-            .map_err(|e| BridgeError::ConfigInvalid {
-                reason: format!("git wait: {e}"),
-            });
-    }
     command.output().map_err(|e| BridgeError::ConfigInvalid {
         reason: format!("git spawn: {e}"),
     })
@@ -146,7 +138,7 @@ fn removal_is_complete(
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum RegistrationAbsenceV1 {
+pub(crate) enum RegistrationAbsenceV1 {
     Absent,
     Present,
     CannotProve,
@@ -158,7 +150,7 @@ enum RegistrationAbsenceV1 {
 /// compared against itself is now unconditionally `Same` and the guard could never fire.
 /// Keeping it would have implied the self-compare is still fallible, which is exactly the
 /// ambiguity B2 removed.
-fn registration_absent_from_porcelain(
+pub(crate) fn registration_absent_from_porcelain(
     output: &[u8],
     wt: &str,
 ) -> Result<RegistrationAbsenceV1, BridgeError> {
@@ -216,6 +208,8 @@ impl ExactAbsenceProbeV1 for HostGitWorktree {
         if !target_absent_from_probe(target)? {
             return Ok(ExactAbsenceObservationV1::TargetPresent);
         }
+        #[cfg(test)]
+        run_exact_absence_after_initial_revalidation_hook();
         let registration =
             registration_absent_sync(&candidate.canonical_source, &candidate.worktree_path)?;
         // The Git subprocess reads source/.git while the target can independently reappear.
@@ -556,7 +550,7 @@ mod tests {
         let target = root.join("worktree");
         let candidate = exact_absence_candidate(&source, &target);
         let target_for_hook = target.clone();
-        set_run_git_sync_after_spawn_hook(move || {
+        set_exact_absence_after_initial_revalidation_hook(move || {
             std::fs::create_dir(&target_for_hook).unwrap();
         });
 
@@ -580,7 +574,7 @@ mod tests {
         let source_for_hook = source.clone();
         let replacement_for_hook = replacement.clone();
         let original_common = root.join("original-common");
-        set_run_git_sync_after_spawn_hook(move || {
+        set_exact_absence_after_initial_revalidation_hook(move || {
             std::fs::rename(source_for_hook.join(".git"), &original_common).unwrap();
             std::fs::rename(
                 replacement_for_hook.join(".git"),
@@ -589,11 +583,16 @@ mod tests {
             .unwrap();
         });
 
+        let error = HostGitWorktree::new()
+            .observe_exact_absence(&candidate)
+            .expect_err("the post-Git common-directory revalidation must refuse the replacement");
         assert!(
-            HostGitWorktree::new()
-                .observe_exact_absence(&candidate)
-                .is_err(),
-            "a common-dir replacement after Git starts must refuse rather than report BothAbsent"
+            matches!(
+                error,
+                BridgeError::ConfigInvalid { reason }
+                    if reason == "exact-absence source or common-directory identity changed"
+            ),
+            "the test must reach the specific post-Git source/common-dir revalidation"
         );
         std::fs::remove_dir_all(root).unwrap();
     }

@@ -1502,6 +1502,7 @@ fn path_object_identity(metadata: &std::fs::Metadata) -> Option<PathObjectIdenti
         None
     }
 }
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct DeepestExistingPathV1 {
     canonical: PathBuf,
     identity: PathObjectIdentityV1,
@@ -1724,7 +1725,7 @@ fn ancestors_are_stable_with_resolver(
     let (Some(now_left), Some(now_right)) = (resolver(left_path), resolver(right_path)) else {
         return false;
     };
-    now_left.identity == left.identity && now_right.identity == right.identity
+    now_left == *left && now_right == *right
 }
 
 fn compare_path_identities_with_resolver(
@@ -1760,7 +1761,8 @@ fn compare_path_identities_with_resolver(
     };
 
     // This is a string-path bracketing check, not descriptor binding. An ABA replacement that
-    // restores the same `(dev, ino)` before re-resolution remains outside this primitive's proof.
+    // restores the same resolution snapshot before re-resolution remains outside this primitive's
+    // proof.
     if ancestors_are_stable_with_resolver(left_path, right_path, &left, &right, resolver) {
         verdict
     } else {
@@ -3069,6 +3071,22 @@ mod tests {
     use std::sync::atomic::AtomicBool;
     use std::sync::Arc;
     use std::time::{Duration, Instant};
+    #[cfg(unix)]
+    fn resolved_deepest_path(
+        canonical: &str,
+        dev: u64,
+        ino: u64,
+        missing_tail: &[&str],
+    ) -> DeepestExistingPathV1 {
+        DeepestExistingPathV1 {
+            canonical: PathBuf::from(canonical),
+            identity: PathObjectIdentityV1::Unix { dev, ino },
+            missing_tail: missing_tail
+                .iter()
+                .map(|component| OsString::from(*component))
+                .collect(),
+        }
+    }
 
     /// Guarantees a racer thread is signalled to stop and joined even if the calling test panics
     /// while the race is in flight. A bare `stop.store(...); handle.join()` placed only after
@@ -3264,6 +3282,73 @@ mod tests {
             "a deleted read_dir sample cannot prove the directory is case-sensitive"
         );
     }
+    #[cfg(unix)]
+    #[test]
+    fn path_identity_refuses_missing_tail_drift_with_unchanged_ancestor_identity() {
+        let left = Path::new("/R/link/foo");
+        let right = Path::new("/R/foo");
+        let mut resolutions = vec![
+            Some(resolved_deepest_path("/R", 1, 1, &["link", "foo"])),
+            Some(resolved_deepest_path("/R", 1, 1, &["foo"])),
+            Some(resolved_deepest_path("/R", 1, 1, &["foo"])),
+            Some(resolved_deepest_path("/R", 1, 1, &["foo"])),
+        ]
+        .into_iter();
+
+        assert_eq!(
+            compare_path_identities_with_resolver(left, right, &mut |_| {
+                resolutions.next().expect("four barrier resolutions")
+            }),
+            PathIdentityComparisonV1::CannotProve,
+            "the A3 verdict must not survive when /R/link becomes a symlink to /R"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn path_identity_refuses_canonical_path_drift_with_unchanged_ancestor_identity() {
+        let left = Path::new("/R/left");
+        let right = Path::new("/R/right");
+        let mut resolutions = vec![
+            Some(resolved_deepest_path("/R", 1, 1, &["left"])),
+            Some(resolved_deepest_path("/R", 1, 1, &["right"])),
+            Some(resolved_deepest_path("/R-renamed", 1, 1, &["left"])),
+            Some(resolved_deepest_path("/R", 1, 1, &["right"])),
+        ]
+        .into_iter();
+
+        assert_eq!(
+            compare_path_identities_with_resolver(left, right, &mut |_| {
+                resolutions.next().expect("four barrier resolutions")
+            }),
+            PathIdentityComparisonV1::CannotProve,
+            "an A5 verdict must not survive a canonical-path change"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn path_identity_preserves_a_stable_resolver_verdict() {
+        let left = Path::new("/R/left");
+        let right = Path::new("/R/right");
+        let left_resolution = resolved_deepest_path("/R", 1, 1, &["left"]);
+        let right_resolution = resolved_deepest_path("/R", 1, 1, &["right"]);
+        let mut resolutions = vec![
+            Some(left_resolution.clone()),
+            Some(right_resolution.clone()),
+            Some(left_resolution),
+            Some(right_resolution),
+        ]
+        .into_iter();
+
+        assert_eq!(
+            compare_path_identities_with_resolver(left, right, &mut |_| {
+                resolutions.next().expect("four barrier resolutions")
+            }),
+            PathIdentityComparisonV1::Different,
+            "a stable A5 comparison must preserve its computed verdict"
+        );
+    }
 
     #[cfg(unix)]
     #[test]
@@ -3345,6 +3430,19 @@ mod tests {
             probe_case_sensitivity(root.path(), original.file_name().unwrap(), expected),
             None,
             "an alternate hit cannot prove case mode after the original sample was replaced"
+        );
+    }
+    #[cfg(unix)]
+    #[test]
+    fn case_probe_keeps_an_unchanged_sample() {
+        let root = tempfile::tempdir().unwrap();
+        let original = root.path().join("sample");
+        fs::write(&original, b"x").unwrap();
+        let expected = path_object_identity(&fs::symlink_metadata(&original).unwrap()).unwrap();
+
+        assert!(
+            probe_case_sensitivity(root.path(), original.file_name().unwrap(), expected).is_some(),
+            "an unchanged ASCII sample must leave the real case-mode probe usable"
         );
     }
 

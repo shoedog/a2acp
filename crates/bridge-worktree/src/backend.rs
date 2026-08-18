@@ -10781,6 +10781,30 @@ mod tests {
         // `worktree list` still enumerates registrations with an invalid source HEAD, while
         // `worktree add ... HEAD` rejects it before materializing `target`.
         std::fs::write(source.join(".git/HEAD"), "ref: refs/heads/missing\n").unwrap();
+        let listed = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&source)
+            .args(["worktree", "list", "--porcelain", "-z"])
+            .output()
+            .unwrap();
+        assert!(
+            listed.status.success(),
+            "the porcelain precondition must succeed: {}",
+            String::from_utf8_lossy(&listed.stderr).trim()
+        );
+        assert!(
+            listed.stdout.split(|byte| *byte == 0).any(|field| {
+                field.strip_prefix(b"worktree ") == Some(stale.to_string_lossy().as_bytes())
+            }),
+            "the successful porcelain output must include the exact stale registration"
+        );
+        assert_eq!(
+            crate::host_git::registration_absent_from_porcelain(&listed.stdout, &target)
+                .expect("the stale registration spelling is valid UTF-8"),
+            crate::host_git::RegistrationAbsenceV1::CannotProve,
+            "the parser must classify the real non-ASCII stale registration as A6 ambiguity"
+        );
+
         let result = be
             .configure_bound_session(
                 &SessionId::parse("host-git-ambiguous-registration").unwrap(),
