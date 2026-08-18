@@ -1588,6 +1588,10 @@ fn compare_missing_tail(
     if left.len() != right.len() {
         return PathIdentityComparisonV1::Different;
     }
+    // Scan EVERY differing component. A single proven-different component settles the whole
+    // path, so returning `CannotProve` at the first ambiguous one would refuse pairs like
+    // ["wt", "child-a"] vs ["WT", "child-b"], whose second component is plainly different.
+    let mut ambiguous = false;
     for (left, right) in left.iter().zip(right) {
         if left == right {
             continue;
@@ -1596,16 +1600,56 @@ fn compare_missing_tail(
             return PathIdentityComparisonV1::Different;
         }
         let (Some(left), Some(right)) = (left.to_str(), right.to_str()) else {
-            return PathIdentityComparisonV1::CannotProve;
+            ambiguous = true;
+            continue;
         };
-        if left.bytes().any(|byte| !byte.is_ascii())
-            || right.bytes().any(|byte| !byte.is_ascii())
-            || left.eq_ignore_ascii_case(right)
-        {
-            return PathIdentityComparisonV1::CannotProve;
+        if left.eq_ignore_ascii_case(right) || ascii_skeletons_could_normalize_alike(left, right) {
+            ambiguous = true;
+            continue;
         }
+        return PathIdentityComparisonV1::Different;
     }
-    PathIdentityComparisonV1::Different
+    if ambiguous {
+        PathIdentityComparisonV1::CannotProve
+    } else {
+        PathIdentityComparisonV1::Different
+    }
+}
+
+/// Could these two names be canonical-equivalent spellings of one entry, without consulting a
+/// Unicode table?
+///
+/// Canonical decomposition only ever ADDS ASCII base letters — NFC `é` decomposes to ASCII `e`
+/// plus a combining acute — and never removes one. So if two names are canonical equivalents,
+/// one's ASCII-letter skeleton must be a subsequence of the other's. That is a NECESSARY
+/// condition, so failing it PROVES the names differ.
+///
+/// Refusing on any non-ASCII byte instead (the previous rule) was sound but far too blunt: it
+/// classified `équipe` vs `other` as `CannotProve`, which would leave the exact-absence proof
+/// unable to authorize in any repository holding a single non-ASCII name.
+fn ascii_skeletons_could_normalize_alike(left: &str, right: &str) -> bool {
+    fn skeleton(value: &str) -> Vec<u8> {
+        value
+            .bytes()
+            .filter(u8::is_ascii)
+            .map(|byte| byte.to_ascii_lowercase())
+            .collect()
+    }
+    fn is_subsequence(needle: &[u8], haystack: &[u8]) -> bool {
+        let mut haystack = haystack.iter();
+        needle
+            .iter()
+            .all(|wanted| haystack.any(|candidate| candidate == wanted))
+    }
+    // Pure-ASCII names have NO canonical-equivalent spellings, so normalization cannot relate
+    // them and the skeleton test must not be consulted: `w` and `wt` are plainly different names,
+    // yet `w`'s skeleton IS a subsequence of `wt`'s. Only reach for the skeleton once a non-ASCII
+    // byte is actually in play.
+    if left.is_ascii() && right.is_ascii() {
+        return false;
+    }
+    let (left, right) = (skeleton(left), skeleton(right));
+    is_subsequence(&left, &right) || is_subsequence(&right, &left)
 }
 pub fn compare_path_identities(
     left: impl AsRef<Path>,
@@ -2840,6 +2884,88 @@ pub fn open_options_create_new_owner_private() -> OpenOptions {
 /// regardless of whether the underlying fsync is actually effective.
 #[cfg(test)]
 mod tests {
+
+    /// The comparator must be wrong in NEITHER direction. Over-refusal is not "safe": it would
+    /// leave the exact-absence proof unable to authorize whenever a repository holds any other
+    /// registration, which is how T3a's earlier attempt failed.
+    #[test]
+    fn missing_tail_comparison_proves_difference_without_over_refusing() {
+        fn tail(parts: &[&str]) -> Vec<OsString> {
+            parts.iter().map(OsString::from).collect()
+        }
+        let insensitive = false;
+        let sensitive = true;
+
+        // Proven different — these must NOT refuse.
+        for (left, right, why) in [
+            (tail(&["wt"]), tail(&["other"]), "plain ASCII siblings"),
+            (
+                tail(&["w"]),
+                tail(&["wt"]),
+                "ASCII prefix vs longer ASCII: no normalization relates them",
+            ),
+            (
+                tail(&["\u{e9}quipe"]),
+                tail(&["other"]),
+                "non-ASCII vs unrelated ASCII",
+            ),
+            (
+                tail(&["\u{e9}a"]),
+                tail(&["\u{e9}b"]),
+                "shared non-ASCII prefix, different ASCII",
+            ),
+            (
+                tail(&["wt", "child-a"]),
+                tail(&["WT", "child-b"]),
+                "ambiguous first component, provably different second",
+            ),
+            (
+                tail(&["a"]),
+                tail(&["a", "b"]),
+                "different component counts",
+            ),
+        ] {
+            assert_eq!(
+                compare_missing_tail(&left, &right, insensitive),
+                PathIdentityComparisonV1::Different,
+                "{why}: must be provably different on a case-insensitive ancestor"
+            );
+        }
+
+        // Genuinely ambiguous — these MUST refuse.
+        for (left, right, why) in [
+            (tail(&["WT"]), tail(&["wt"]), "case-only difference"),
+            (
+                tail(&["caf\u{e9}"]),
+                tail(&["cafe\u{301}"]),
+                "NFC vs NFD spelling of one name",
+            ),
+            (
+                tail(&["r\u{e9}sum\u{e9}"]),
+                tail(&["resume"]),
+                "decomposable vs plain: skeleton is a subsequence",
+            ),
+        ] {
+            assert_eq!(
+                compare_missing_tail(&left, &right, insensitive),
+                PathIdentityComparisonV1::CannotProve,
+                "{why}: must refuse on a case-insensitive ancestor"
+            );
+        }
+
+        // A case-sensitive ancestor lets bytes decide — NFC and NFD are different filenames there.
+        assert_eq!(
+            compare_missing_tail(&tail(&["caf\u{e9}"]), &tail(&["cafe\u{301}"]), sensitive),
+            PathIdentityComparisonV1::Different,
+            "case-sensitive ancestor: distinct byte sequences are distinct names"
+        );
+        assert_eq!(
+            compare_missing_tail(&tail(&["WT"]), &tail(&["wt"]), sensitive),
+            PathIdentityComparisonV1::Different,
+            "case-sensitive ancestor: case is significant"
+        );
+    }
+
     use super::*;
     use std::fs;
     use std::sync::atomic::AtomicBool;
@@ -2990,14 +3116,18 @@ mod tests {
             PathIdentityComparisonV1::CannotProve,
             "a non-ASCII difference may be normalization-equivalent"
         );
+        // Superseded by the counted review: blanket-refusing on any non-ASCII byte was sound but
+        // functionally inert, since one non-ASCII name anywhere in the repository would stop the
+        // exact-absence proof authorizing at all. Canonical decomposition only ADDS ASCII base
+        // letters, so `équipe` (skeleton `quipe`) cannot be a spelling of `other`.
         assert_eq!(
             compare_missing_tail(
                 &[OsString::from("équipe")],
                 &[OsString::from("other")],
                 false,
             ),
-            PathIdentityComparisonV1::CannotProve,
-            "any non-ASCII component difference is ambiguous"
+            PathIdentityComparisonV1::Different,
+            "a non-ASCII name is still provably different from an unrelated one"
         );
         assert_eq!(
             compare_missing_tail(&[OsString::from("wt")], &[OsString::from("other")], false),
