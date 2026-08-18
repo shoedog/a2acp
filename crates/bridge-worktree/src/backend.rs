@@ -10709,6 +10709,96 @@ mod tests {
         std::fs::remove_dir_all(&tmp).unwrap();
     }
 
+    /// The real host-Git route must carry a non-ASCII ambiguity into the durable V3 claim.
+    /// A hand-rolled provider can prove only the writer projection; this constructs Git's locked
+    /// stale registration, makes the target add fail before it materializes, then decodes the
+    /// actual published record.
+    #[tokio::test]
+    async fn host_git_ambiguous_registration_publishes_registration_unproven() {
+        fn git(dir: &Path, args: &[&str]) {
+            let output = std::process::Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+
+        let tmp = unique_temp_dir("host-git-ambiguous-registration");
+        let (be, _rec, source, cfg) =
+            provider_fixture(&tmp, |_| Arc::new(crate::host_git::HostGitWorktree::new()));
+        git(&source, &["init", "-q"]);
+        git(&source, &["config", "user.email", "a@b.c"]);
+        git(&source, &["config", "user.name", "x"]);
+        std::fs::write(source.join("file.txt"), "base\n").unwrap();
+        git(&source, &["add", "-A"]);
+        git(&source, &["commit", "-q", "-m", "init"]);
+
+        let (bound, target) = bound_spec_v3(&source, &cfg);
+        let target_path = PathBuf::from(&target);
+        let stale = target_path.with_file_name(
+            target_path
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .replacen("run", "rún", 1),
+        );
+        git(
+            &source,
+            &[
+                "worktree",
+                "add",
+                "--detach",
+                stale.to_str().unwrap(),
+                "HEAD",
+            ],
+        );
+        std::fs::remove_dir_all(&stale).unwrap();
+        let stale_record = std::fs::read_dir(source.join(".git/worktrees"))
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.path())
+            .find(|entry| {
+                std::fs::read_to_string(entry.join("gitdir"))
+                    .map(|gitdir| gitdir.contains(stale.to_string_lossy().as_ref()))
+                    .unwrap_or(false)
+            })
+            .expect("the real stale worktree registration is present");
+        std::fs::write(stale_record.join("locked"), b"retain stale registration").unwrap();
+
+        // `worktree list` still enumerates registrations with an invalid source HEAD, while
+        // `worktree add ... HEAD` rejects it before materializing `target`.
+        std::fs::write(source.join(".git/HEAD"), "ref: refs/heads/missing\n").unwrap();
+        let result = be
+            .configure_bound_session(
+                &SessionId::parse("host-git-ambiguous-registration").unwrap(),
+                &bound,
+            )
+            .await;
+        assert!(
+            result.is_err(),
+            "the deliberately unresolvable add must settle protectively"
+        );
+        let record = crate::custody::WorktreeCustodyRecordV1::decode_canonical(
+            &std::fs::read(crate::custody::custody_record_path(&target)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            record
+                .claim
+                .expect("the settled unknown state retains a claim")
+                .recovery_locator,
+            crate::custody::RecoveryLocatorV1::RegistrationUnproven {},
+            "real porcelain A6 ambiguity must not become RegisteredWorktree"
+        );
+        std::fs::remove_dir_all(&tmp).unwrap();
+    }
+
     /// The REFUSING default is reachable and refuses BEFORE any effect. Discriminates a default
     /// that returns a successful-looking outcome, which would let an unmodified provider silently
     /// materialize a V3 checkout with no custody-aware handling at all.

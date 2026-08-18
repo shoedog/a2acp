@@ -1551,6 +1551,15 @@ fn alternate_ascii_case(name: &std::ffi::OsStr) -> Option<OsString> {
     };
     Some(String::from_utf8(bytes).ok()?.into())
 }
+fn sampled_entry_still_matches(
+    parent: &Path,
+    name: &std::ffi::OsStr,
+    expected: PathObjectIdentityV1,
+) -> Option<()> {
+    let metadata = std::fs::symlink_metadata(parent.join(name)).ok()?;
+    (path_object_identity(&metadata)? == expected).then_some(())
+}
+
 fn probe_case_sensitivity(
     parent: &Path,
     name: &std::ffi::OsStr,
@@ -1558,119 +1567,213 @@ fn probe_case_sensitivity(
 ) -> Option<bool> {
     let alternate = alternate_ascii_case(name)?;
     match std::fs::symlink_metadata(parent.join(alternate)) {
-        Ok(metadata) => Some(path_object_identity(&metadata)? != expected),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Some(true),
+        Ok(metadata) => {
+            // `read_dir` supplied `expected` from a snapshot. The alternate result is only
+            // meaningful while that original sample still names the same object.
+            sampled_entry_still_matches(parent, name, expected)?;
+            Some(path_object_identity(&metadata)? != expected)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            // A deleted/replaced sample's alternate ENOENT says nothing about case mode.
+            sampled_entry_still_matches(parent, name, expected)?;
+            Some(true)
+        }
         Err(_) => None,
     }
 }
-fn case_sensitive_at(ancestor: &Path) -> Option<bool> {
-    if let (Some(parent), Some(name)) = (ancestor.parent(), ancestor.file_name()) {
-        let expected = path_object_identity(&std::fs::symlink_metadata(ancestor).ok()?)?;
-        if let Some(answer) = probe_case_sensitivity(parent, name, expected) {
-            return Some(answer);
-        }
-    }
+
+fn case_sensitive_at_with_probe(
+    ancestor: &Path,
+    probe: &mut dyn FnMut(&Path, &std::ffi::OsStr, PathObjectIdentityV1) -> Option<bool>,
+) -> Option<bool> {
     let entries = std::fs::read_dir(ancestor).ok()?;
     for entry in entries.take(64) {
         let entry = entry.ok()?;
         let expected = path_object_identity(&std::fs::symlink_metadata(entry.path()).ok()?)?;
-        if let Some(answer) = probe_case_sensitivity(ancestor, &entry.file_name(), expected) {
+        if let Some(answer) = probe(ancestor, &entry.file_name(), expected) {
             return Some(answer);
         }
     }
     None
 }
+
+fn case_sensitive_at(ancestor: &Path) -> Option<bool> {
+    #[cfg(test)]
+    if let Some(mut probe) = take_case_sensitivity_test_probe() {
+        return case_sensitive_at_with_probe(ancestor, &mut probe);
+    }
+    let mut probe = probe_case_sensitivity;
+    case_sensitive_at_with_probe(ancestor, &mut probe)
+}
+
+#[cfg(test)]
+type CaseSensitivityTestProbeV1 =
+    Box<dyn FnMut(&Path, &OsStr, PathObjectIdentityV1) -> Option<bool>>;
+
+#[cfg(test)]
+thread_local! {
+    static CASE_SENSITIVITY_TEST_PROBE: std::cell::RefCell<Option<CaseSensitivityTestProbeV1>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(all(test, unix))]
+fn set_case_sensitivity_test_probe(
+    probe: impl FnMut(&Path, &OsStr, PathObjectIdentityV1) -> Option<bool> + 'static,
+) {
+    CASE_SENSITIVITY_TEST_PROBE.with(|slot| {
+        assert!(
+            slot.borrow().is_none(),
+            "a case-sensitivity test probe is already installed"
+        );
+        *slot.borrow_mut() = Some(Box::new(probe));
+    });
+}
+
+#[cfg(test)]
+fn take_case_sensitivity_test_probe() -> Option<CaseSensitivityTestProbeV1> {
+    CASE_SENSITIVITY_TEST_PROBE.with(|slot| slot.borrow_mut().take())
+}
+
+#[derive(Clone, Copy)]
+enum MissingTailComparisonV1 {
+    Verdict(PathIdentityComparisonV1),
+    NeedsCaseSensitivity,
+}
+
+/// Compare the parts of two paths below their same deepest existing ancestor.
+///
+/// A5 assumes no ASCII-aliasing filesystem (for example, vfat 8.3 aliases) exists below the
+/// managed root. Managed worktree leaves are conventionally ASCII, but their owner/run prefixes
+/// are not validated as such; this primitive makes no ASCII-leaf inference and refuses every
+/// differing pair with a non-ASCII byte instead.
+fn compare_missing_tail_without_case_probe(
+    left: &[OsString],
+    right: &[OsString],
+) -> MissingTailComparisonV1 {
+    // A3: a shared ancestor cannot give the same path to tails with different component counts.
+    if left.len() != right.len() {
+        return MissingTailComparisonV1::Verdict(PathIdentityComparisonV1::Different);
+    }
+
+    let mut has_non_ascii_difference = false;
+    let mut has_case_only_difference = false;
+    for (left, right) in left.iter().zip(right) {
+        // A4 includes an exactly byte-equal tail.
+        if left == right {
+            continue;
+        }
+        let (Some(left), Some(right)) = (left.to_str(), right.to_str()) else {
+            has_non_ascii_difference = true;
+            continue;
+        };
+        if !left.is_ascii() || !right.is_ascii() {
+            has_non_ascii_difference = true;
+            continue;
+        }
+        // A5 is checked before A6 across *every* pair. One ASCII pair which differs under
+        // both case modes proves the full paths differ, regardless of any other component.
+        if !left.eq_ignore_ascii_case(right) {
+            return MissingTailComparisonV1::Verdict(PathIdentityComparisonV1::Different);
+        }
+        has_case_only_difference = true;
+    }
+
+    // A6 is unconditional: case sensitivity does not imply normalization sensitivity.
+    if has_non_ascii_difference {
+        return MissingTailComparisonV1::Verdict(PathIdentityComparisonV1::CannotProve);
+    }
+    if has_case_only_difference {
+        MissingTailComparisonV1::NeedsCaseSensitivity
+    } else {
+        MissingTailComparisonV1::Verdict(PathIdentityComparisonV1::Same)
+    }
+}
+
+fn resolve_missing_tail_comparison(
+    comparison: MissingTailComparisonV1,
+    case_sensitive: Option<bool>,
+) -> PathIdentityComparisonV1 {
+    match comparison {
+        MissingTailComparisonV1::Verdict(verdict) => verdict,
+        MissingTailComparisonV1::NeedsCaseSensitivity if case_sensitive == Some(true) => {
+            PathIdentityComparisonV1::Different
+        }
+        MissingTailComparisonV1::NeedsCaseSensitivity => PathIdentityComparisonV1::CannotProve,
+    }
+}
+
+#[cfg(test)]
 fn compare_missing_tail(
     left: &[OsString],
     right: &[OsString],
     case_sensitive: bool,
 ) -> PathIdentityComparisonV1 {
-    if left.len() != right.len() {
-        return PathIdentityComparisonV1::Different;
+    resolve_missing_tail_comparison(
+        compare_missing_tail_without_case_probe(left, right),
+        Some(case_sensitive),
+    )
+}
+
+fn ancestors_are_stable_with_resolver(
+    left_path: &Path,
+    right_path: &Path,
+    left: &DeepestExistingPathV1,
+    right: &DeepestExistingPathV1,
+    resolver: &mut dyn FnMut(&Path) -> Option<DeepestExistingPathV1>,
+) -> bool {
+    let (Some(now_left), Some(now_right)) = (resolver(left_path), resolver(right_path)) else {
+        return false;
+    };
+    now_left.identity == left.identity && now_right.identity == right.identity
+}
+
+fn compare_path_identities_with_resolver(
+    left_path: &Path,
+    right_path: &Path,
+    resolver: &mut dyn FnMut(&Path) -> Option<DeepestExistingPathV1>,
+) -> PathIdentityComparisonV1 {
+    // A byte-identical spelling needs no filesystem observation. This also keeps a concurrent
+    // rename from making a path compare different from itself.
+    if left_path.as_os_str() == right_path.as_os_str() {
+        return PathIdentityComparisonV1::Same;
     }
-    // Scan EVERY differing component. A single proven-different component settles the whole
-    // path, so returning `CannotProve` at the first ambiguous one would refuse pairs like
-    // ["wt", "child-a"] vs ["WT", "child-b"], whose second component is plainly different.
-    let mut ambiguous = false;
-    for (left, right) in left.iter().zip(right) {
-        if left == right {
-            continue;
-        }
-        if case_sensitive {
-            return PathIdentityComparisonV1::Different;
-        }
-        let (Some(left), Some(right)) = (left.to_str(), right.to_str()) else {
-            ambiguous = true;
-            continue;
-        };
-        if left.eq_ignore_ascii_case(right) || ascii_skeletons_could_normalize_alike(left, right) {
-            ambiguous = true;
-            continue;
-        }
-        return PathIdentityComparisonV1::Different;
-    }
-    if ambiguous {
-        PathIdentityComparisonV1::CannotProve
-    } else {
+    let (Some(left), Some(right)) = (resolver(left_path), resolver(right_path)) else {
+        return PathIdentityComparisonV1::CannotProve;
+    };
+
+    let verdict = if left.identity != right.identity {
+        // A2: separately existing ancestors prove difference only after the second observation
+        // confirms neither path changed beneath this comparison.
         PathIdentityComparisonV1::Different
+    } else {
+        let comparison =
+            compare_missing_tail_without_case_probe(&left.missing_tail, &right.missing_tail);
+        match comparison {
+            MissingTailComparisonV1::Verdict(_) => {
+                resolve_missing_tail_comparison(comparison, None)
+            }
+            // A7 is the only row that needs the case-mode probe.
+            MissingTailComparisonV1::NeedsCaseSensitivity => {
+                resolve_missing_tail_comparison(comparison, case_sensitive_at(&left.canonical))
+            }
+        }
+    };
+
+    // This is a string-path bracketing check, not descriptor binding. An ABA replacement that
+    // restores the same `(dev, ino)` before re-resolution remains outside this primitive's proof.
+    if ancestors_are_stable_with_resolver(left_path, right_path, &left, &right, resolver) {
+        verdict
+    } else {
+        PathIdentityComparisonV1::CannotProve
     }
 }
 
-/// Could these two names be canonical-equivalent spellings of one entry, without consulting a
-/// Unicode table?
-///
-/// Canonical decomposition only ever ADDS ASCII base letters — NFC `é` decomposes to ASCII `e`
-/// plus a combining acute — and never removes one. So if two names are canonical equivalents,
-/// one's ASCII-letter skeleton must be a subsequence of the other's. That is a NECESSARY
-/// condition, so failing it PROVES the names differ.
-///
-/// Refusing on any non-ASCII byte instead (the previous rule) was sound but far too blunt: it
-/// classified `équipe` vs `other` as `CannotProve`, which would leave the exact-absence proof
-/// unable to authorize in any repository holding a single non-ASCII name.
-fn ascii_skeletons_could_normalize_alike(left: &str, right: &str) -> bool {
-    fn skeleton(value: &str) -> Vec<u8> {
-        value
-            .bytes()
-            .filter(u8::is_ascii)
-            .map(|byte| byte.to_ascii_lowercase())
-            .collect()
-    }
-    fn is_subsequence(needle: &[u8], haystack: &[u8]) -> bool {
-        let mut haystack = haystack.iter();
-        needle
-            .iter()
-            .all(|wanted| haystack.any(|candidate| candidate == wanted))
-    }
-    // Pure-ASCII names have NO canonical-equivalent spellings, so normalization cannot relate
-    // them and the skeleton test must not be consulted: `w` and `wt` are plainly different names,
-    // yet `w`'s skeleton IS a subsequence of `wt`'s. Only reach for the skeleton once a non-ASCII
-    // byte is actually in play.
-    if left.is_ascii() && right.is_ascii() {
-        return false;
-    }
-    let (left, right) = (skeleton(left), skeleton(right));
-    is_subsequence(&left, &right) || is_subsequence(&right, &left)
-}
 pub fn compare_path_identities(
     left: impl AsRef<Path>,
     right: impl AsRef<Path>,
 ) -> PathIdentityComparisonV1 {
-    let (Some(left), Some(right)) = (
-        deepest_existing_path(left.as_ref()),
-        deepest_existing_path(right.as_ref()),
-    ) else {
-        return PathIdentityComparisonV1::CannotProve;
-    };
-    if left.identity != right.identity {
-        return PathIdentityComparisonV1::Different;
-    }
-    if left.missing_tail == right.missing_tail {
-        return PathIdentityComparisonV1::Same;
-    }
-    let Some(case_sensitive) = case_sensitive_at(&left.canonical) else {
-        return PathIdentityComparisonV1::CannotProve;
-    };
-    compare_missing_tail(&left.missing_tail, &right.missing_tail, case_sensitive)
+    let mut resolver = deepest_existing_path;
+    compare_path_identities_with_resolver(left.as_ref(), right.as_ref(), &mut resolver)
 }
 /// The workspace's one path-addressed directory open: read-only, `O_DIRECTORY`, `O_NOFOLLOW`,
 /// `O_CLOEXEC`. A final symlink is refused rather than followed, and a non-directory is refused
@@ -2889,35 +2992,23 @@ mod tests {
     /// leave the exact-absence proof unable to authorize whenever a repository holds any other
     /// registration, which is how T3a's earlier attempt failed.
     #[test]
-    fn missing_tail_comparison_proves_difference_without_over_refusing() {
+    fn missing_tail_comparison_follows_the_pinned_a3_to_a7_order() {
         fn tail(parts: &[&str]) -> Vec<OsString> {
             parts.iter().map(OsString::from).collect()
         }
-        let insensitive = false;
-        let sensitive = true;
 
-        // Proven different — these must NOT refuse.
         for (left, right, why) in [
             (tail(&["wt"]), tail(&["other"]), "plain ASCII siblings"),
-            (
-                tail(&["w"]),
-                tail(&["wt"]),
-                "ASCII prefix vs longer ASCII: no normalization relates them",
-            ),
-            (
-                tail(&["\u{e9}quipe"]),
-                tail(&["other"]),
-                "non-ASCII vs unrelated ASCII",
-            ),
-            (
-                tail(&["\u{e9}a"]),
-                tail(&["\u{e9}b"]),
-                "shared non-ASCII prefix, different ASCII",
-            ),
+            (tail(&["w"]), tail(&["wt"]), "ASCII prefix siblings"),
             (
                 tail(&["wt", "child-a"]),
                 tail(&["WT", "child-b"]),
-                "ambiguous first component, provably different second",
+                "an A5 pair wins over an earlier case-only pair",
+            ),
+            (
+                tail(&["child-a", "résumé"]),
+                tail(&["child-b", "resume"]),
+                "A5 is evaluated before A6 across all differing pairs",
             ),
             (
                 tail(&["a"]),
@@ -2926,43 +3017,50 @@ mod tests {
             ),
         ] {
             assert_eq!(
-                compare_missing_tail(&left, &right, insensitive),
+                compare_missing_tail(&left, &right, false),
                 PathIdentityComparisonV1::Different,
-                "{why}: must be provably different on a case-insensitive ancestor"
+                "{why}: must be provably different without a case-mode decision"
             );
         }
 
-        // Genuinely ambiguous — these MUST refuse.
         for (left, right, why) in [
             (tail(&["WT"]), tail(&["wt"]), "case-only difference"),
             (
-                tail(&["caf\u{e9}"]),
-                tail(&["cafe\u{301}"]),
-                "NFC vs NFD spelling of one name",
+                tail(&["\u{e1}b\u{307}"]),
+                tail(&["a\u{301}\u{1e03}"]),
+                "the former skeleton counterexample",
             ),
             (
-                tail(&["r\u{e9}sum\u{e9}"]),
-                tail(&["resume"]),
-                "decomposable vs plain: skeleton is a subsequence",
+                tail(&["caf\u{e9}"]),
+                tail(&["cafe\u{301}"]),
+                "NFC versus NFD spelling",
+            ),
+            (
+                tail(&["équipe"]),
+                tail(&["other"]),
+                "unrelated non-ASCII pair",
             ),
         ] {
             assert_eq!(
-                compare_missing_tail(&left, &right, insensitive),
+                compare_missing_tail(&left, &right, false),
                 PathIdentityComparisonV1::CannotProve,
-                "{why}: must refuse on a case-insensitive ancestor"
+                "{why}: case-insensitive ancestors must refuse"
             );
         }
 
-        // A case-sensitive ancestor lets bytes decide — NFC and NFD are different filenames there.
         assert_eq!(
-            compare_missing_tail(&tail(&["caf\u{e9}"]), &tail(&["cafe\u{301}"]), sensitive),
-            PathIdentityComparisonV1::Different,
-            "case-sensitive ancestor: distinct byte sequences are distinct names"
+            compare_missing_tail(
+                &tail(&["\u{e1}b\u{307}"]),
+                &tail(&["a\u{301}\u{1e03}"]),
+                true,
+            ),
+            PathIdentityComparisonV1::CannotProve,
+            "flipped assertion: A6 also refuses under a case-sensitive ancestor"
         );
         assert_eq!(
-            compare_missing_tail(&tail(&["WT"]), &tail(&["wt"]), sensitive),
+            compare_missing_tail(&tail(&["WT"]), &tail(&["wt"]), true),
             PathIdentityComparisonV1::Different,
-            "case-sensitive ancestor: case is significant"
+            "A7 lets a case-sensitive ancestor distinguish an ASCII case-only pair"
         );
     }
 
@@ -3091,50 +3189,165 @@ mod tests {
         assert_eq!(
             compare_path_identities(root.path().join("wt"), root.path().join("other")),
             PathIdentityComparisonV1::Different,
-            "distinct ASCII names must not be over-refused"
+            "A5 does not consult the case probe for unrelated ASCII siblings"
         );
-        assert_eq!(
-            compare_missing_tail(
-                &[OsString::from("résumé")],
-                &[OsString::from("re\u{301}sume\u{301}")],
-                true,
-            ),
-            PathIdentityComparisonV1::Different,
-            "a case-sensitive ancestor lets byte-different names decide"
-        );
+        for case_sensitive in [false, true] {
+            assert_eq!(
+                compare_missing_tail(
+                    &[OsString::from("résumé")],
+                    &[OsString::from("re\u{301}sume\u{301}")],
+                    case_sensitive,
+                ),
+                PathIdentityComparisonV1::CannotProve,
+                "A6 refuses non-ASCII differences in both case branches"
+            );
+        }
         assert_eq!(
             compare_missing_tail(&[OsString::from("wt")], &[OsString::from("WT")], false),
             PathIdentityComparisonV1::CannotProve,
-            "the case-insensitive branch must refuse on every test platform"
-        );
-        assert_eq!(
-            compare_missing_tail(
-                &[OsString::from("résumé")],
-                &[OsString::from("re\u{301}sume\u{301}")],
-                false,
-            ),
-            PathIdentityComparisonV1::CannotProve,
-            "a non-ASCII difference may be normalization-equivalent"
-        );
-        // Superseded by the counted review: blanket-refusing on any non-ASCII byte was sound but
-        // functionally inert, since one non-ASCII name anywhere in the repository would stop the
-        // exact-absence proof authorizing at all. Canonical decomposition only ADDS ASCII base
-        // letters, so `équipe` (skeleton `quipe`) cannot be a spelling of `other`.
-        assert_eq!(
-            compare_missing_tail(
-                &[OsString::from("équipe")],
-                &[OsString::from("other")],
-                false,
-            ),
-            PathIdentityComparisonV1::Different,
-            "a non-ASCII name is still provably different from an unrelated one"
-        );
-        assert_eq!(
-            compare_missing_tail(&[OsString::from("wt")], &[OsString::from("other")], false),
-            PathIdentityComparisonV1::Different,
-            "ASCII names that are not equal under ASCII case folding are distinct"
+            "A7 refuses an ASCII case-only pair when the ancestor is insensitive"
         );
     }
+
+    #[test]
+    fn path_identity_pipeline_resolves_a3_and_a5_when_case_mode_is_undeterminable() {
+        let root = tempfile::tempdir().unwrap();
+        let numeric_ancestor = root.path().join("123");
+        fs::create_dir(&numeric_ancestor).unwrap();
+
+        assert_eq!(
+            case_sensitive_at(&numeric_ancestor),
+            None,
+            "an empty numeric ancestor gives the mode probe no answer"
+        );
+        assert_eq!(
+            compare_path_identities(numeric_ancestor.join("wt"), numeric_ancestor.join("other")),
+            PathIdentityComparisonV1::Different,
+            "A5 must resolve through the public comparator without a case-mode answer"
+        );
+
+        let missing_parent = root.path().join("a");
+        assert_eq!(
+            case_sensitive_at(root.path()),
+            None,
+            "the only root entry is non-alphabetic, so the mode probe remains undeterminable"
+        );
+        assert_eq!(
+            compare_path_identities(&missing_parent, missing_parent.join("b")),
+            PathIdentityComparisonV1::Different,
+            "A3 must resolve different tail component counts without a case-mode answer"
+        );
+    }
+
+    #[test]
+    fn path_identity_short_circuits_an_identical_missing_spelling() {
+        let root = tempfile::tempdir().unwrap();
+        let missing = root.path().join("missing");
+        assert_eq!(
+            compare_path_identities(&missing, &missing),
+            PathIdentityComparisonV1::Same,
+            "identical byte spelling must not depend on a racing ancestor resolution"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn case_probe_voids_a_sample_deleted_before_alternate_lookup() {
+        let root = tempfile::tempdir().unwrap();
+        let original = root.path().join("sample");
+        fs::write(&original, b"x").unwrap();
+        let expected = path_object_identity(&fs::symlink_metadata(&original).unwrap()).unwrap();
+        fs::remove_file(&original).unwrap();
+        assert_eq!(
+            probe_case_sensitivity(root.path(), original.file_name().unwrap(), expected),
+            None,
+            "a deleted read_dir sample cannot prove the directory is case-sensitive"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn path_identity_refuses_a_genuinely_different_pair_after_ancestor_drift() {
+        fn resolved(path: &str, dev: u64, ino: u64) -> DeepestExistingPathV1 {
+            DeepestExistingPathV1 {
+                canonical: PathBuf::from(path),
+                identity: PathObjectIdentityV1::Unix { dev, ino },
+                missing_tail: vec![OsString::from("wt")],
+            }
+        }
+
+        let left = Path::new("/left/wt");
+        let right = Path::new("/right/wt");
+        let mut resolutions = vec![
+            Some(resolved("/left", 1, 1)),
+            Some(resolved("/right", 1, 2)),
+            Some(resolved("/left", 1, 1)),
+            Some(resolved("/right-replaced", 1, 3)),
+        ]
+        .into_iter();
+        assert_eq!(
+            compare_path_identities_with_resolver(left, right, &mut |_| {
+                resolutions.next().expect("four barrier resolutions")
+            }),
+            PathIdentityComparisonV1::CannotProve,
+            "A2 cannot return Different after its second ancestor changes"
+        );
+
+        let mut called = false;
+        assert_eq!(
+            compare_path_identities_with_resolver(left, left, &mut |_| {
+                called = true;
+                None
+            }),
+            PathIdentityComparisonV1::Same
+        );
+        assert!(!called, "byte-identical inputs must bypass the resolver");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn case_sensitive_at_samples_the_shared_ancestor_not_its_parent() {
+        let root = tempfile::tempdir().unwrap();
+        let ancestor = root.path().join("casefold-child");
+        fs::create_dir(&ancestor).unwrap();
+        fs::write(ancestor.join("sample"), b"x").unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_for_probe = Arc::clone(&calls);
+        let expected_ancestor = ancestor.clone();
+        set_case_sensitivity_test_probe(move |parent, _name, _expected| {
+            calls_for_probe.fetch_add(1, Ordering::SeqCst);
+            assert_eq!(
+                parent, expected_ancestor,
+                "the production wrapper must sample child entries, never the parent"
+            );
+            Some(false)
+        });
+
+        assert_eq!(
+            case_sensitive_at(&ancestor),
+            Some(false),
+            "injected casefold semantics under a sensitive parent stay insensitive"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn case_probe_voids_a_replaced_sample_before_an_alternate_hit() {
+        let root = tempfile::tempdir().unwrap();
+        let original = root.path().join("sample");
+        fs::write(&original, b"old").unwrap();
+        let expected = path_object_identity(&fs::symlink_metadata(&original).unwrap()).unwrap();
+        fs::remove_file(&original).unwrap();
+        fs::write(&original, b"new").unwrap();
+        fs::write(root.path().join("Sample"), b"alternate").unwrap();
+        assert_eq!(
+            probe_case_sensitivity(root.path(), original.file_name().unwrap(), expected),
+            None,
+            "an alternate hit cannot prove case mode after the original sample was replaced"
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn path_identity_refuses_an_unreadable_ancestor() {
