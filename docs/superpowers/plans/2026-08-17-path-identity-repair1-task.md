@@ -18,12 +18,19 @@ artifact as unchecked, including the parts this repair does not name.
 
 ## R1 — remove the dependency; this lane cannot add one
 
-**You cannot add a crate.** The implement lane's egress permits model APIs only
-(ADR-0013), so there is no crates.io access and no compile loop: you cannot
-resolve a new dependency, and you cannot regenerate `Cargo.lock`. Hand-editing
-the lock produces exactly the lock-sync failure above. This is a property of the
-pipeline, not something to work around — do not attempt to hand-write lock
-entries.
+**You cannot add a crate — but the operator can.** The implement lane's egress
+permits model APIs only (ADR-0013), so *you* have no crates.io access and no
+compile loop: you cannot resolve a new dependency or regenerate `Cargo.lock`,
+and hand-editing the lock produces exactly the lock-sync failure above.
+
+CORRECTION to an earlier overstatement in this lane's record: that does NOT make
+a new dependency structurally impossible. The operator can provision one on the
+host (`cargo add` + a real lock update + `cargo deny check`) and dispatch on a
+base where it is already resolved; `egress = "open"` on the impl sandbox also
+exists (`examples/a2a-bridge.m4-slice3a-impl-openegress.toml`) though it breaks
+the deliberate creds-XOR-registries split. For THIS task the owner decided
+against the crate on its merits — `icu_normalizer` pulls a large tree through a
+`cargo deny` gate for a question whose safe answer is free — so do not add one.
 
 Remove `icu_normalizer` from `crates/bridge-core/Cargo.toml` and revert the
 `Cargo.lock` edit. `git diff --numstat <base>..HEAD` must show **no change** to
