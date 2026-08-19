@@ -1346,9 +1346,19 @@ separate estimate and task spec before dispatch.
 ### A1 handoff and verification
 
 Create
-`docs/superpowers/reviews/2026-08-18-r2f1b-3d-t3a-inc1-sliceA1-handoff.md`
-from the installed `~/.claude/handoff-template.md`. Resolve and read that file; do
-not recreate it from memory. Preserve every required template heading.
+`docs/superpowers/reviews/2026-08-18-r2f1b-3d-t3a-inc1-sliceA1-handoff.md`.
+
+**Do not look for a handoff template outside the repository.** Your container mounts
+only the code tree; `$HOME` is `/root` and there is no `~/.claude`. An earlier
+revision of this spec told you to read an installed template at a host path, which
+is unsatisfiable here — a previous dispatch correctly refused and made no changes
+because of it. Write the handoff from the content requirements below; the operator
+applies the installed template on the host, which is an operator obligation and not
+yours.
+
+Use these headings, in this order: `## Summary`, `## What changed`,
+`## Evidence`, `## OPERATOR EVIDENCE — PENDING`, `## Limits and disclosures`,
+`## Sizing`.
 
 The handoff must state:
 
@@ -1512,7 +1522,8 @@ running one.
 - `crates/bridge-worktree/src/sweep/checked_scan.rs` — reserved for A2; do not create
   or modify in A1.
 - `docs/superpowers/reviews/2026-08-18-r2f1b-3d-t3a-inc1-sliceA1-handoff.md`
-  — create from the installed template.
+  — create, using the headings named in "A1 handoff and verification". Do not read
+  any file outside the repository; nothing outside the code tree is mounted.
 
 ## Spec Refs
 
