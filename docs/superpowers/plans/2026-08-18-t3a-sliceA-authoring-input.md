@@ -2,169 +2,221 @@
 task-type: design
 ---
 
-# Author revision 3 of the T3a increment 1 slice A task spec
+# Author revision 4 of the T3a increment 1 slice A1 task spec
 
 ## Description
 
-Fold the round-3 findings below into the document you authored, and emit the
-**complete revised spec** between the extraction markers. You own the whole document:
-remove every sentence, table row, declaration and acceptance criterion that a folded
-finding supersedes. The session cwd is at `main` = `9aedf175` and is authoritative.
+Fold the round-4 findings into the document you authored and emit the **complete
+revised spec** between the extraction markers. You own the whole document. The
+session cwd is at `main` = `9aedf175` and is authoritative.
 
-### Where the last revision stood
+### Where this stands — close
 
-Your revision scored **5 blockers / 10 findings**, against 7/12 for the operator's
-previous hand-folded version. The four hand-folding contradictions were gone, the
-twenty literal declarations landed, and both the characterization matrix and the
-filtered-`effective()` mechanism were accepted.
+Round 4 adjudicated your round-3 fixes as **FIXED**: the removed-accessor demand, the
+fifteen-type count, authority-lifetime naming, readiness-seam testability and module
+visibility do not recur, and **no characterization-matrix row remains disputed**.
 
-### Findings 5 and 6 are NOT yours — do not fold them
+Only **two** items gate the verdict, and **both are in the A2 outline, not A1**. The
+six others are MAJOR/MINOR. A1 itself drew no blocking finding.
 
-They target the operator's **review-wrapper**, not your spec, and both are already
-fixed in the wrapper:
+### The two gating items — both operator-verified against the code
 
-- Finding 5 says the outer "What must not be undone" still demands
-  `effective_decision_at()` return `Some(Refused)`. That was stale operator text left
-  over from before you replaced that accessor with the filtered `effective()` view.
-  **Do not reintroduce `effective_decision_at`.** The invariant is what you wrote:
-  slice A's `effective()` yields no entries at all.
-- Finding 6 says the outer criterion said fourteen public types. The wrapper was
-  wrong; **fifteen is correct** and stays.
+**AC 17 — "zero wrapper canonicalization" is too broad and would delete a live
+guard.** Verified: `sweep_orphans` calls `canonicalize_lenient(root)` into `root_cwd`
+and **returns early if it fails**, then passes the **raw** `root` to
+`scan_worktree_records`. So the guard-root canonicalization must be preserved
+exactly, including its early return; only `scan_worktree_records` and its enumeration
+input stay raw and uncanonicalized. Rewrite AC 17 to say that precisely.
 
-Fold findings **1, 2, 3, 4, 7, 8, 9 and 10 only**.
+**AC 19 — the mutation audit inventory is incomplete.** Verified:
+`registration_absent_from_porcelain` calls `compare_path_identities`, which reaches
+`deepest_existing_path` (metadata, `symlink_metadata`, canonicalization) and the case
+probe (`read_dir`, `symlink_metadata`). Add that branch and its full observation tree
+to the normative audit, plus the scanner's `PinnedDirectoryV1::open` observation, and
+extend the acceptance criterion to require them.
 
-### The four blockers that are yours
+### The six non-gating findings
 
-1. **T3b authority lifetime.** `finish` drops the pinned scan session while the report
-   still presents authority. Resolve what authority a returned report can honestly
-   carry once the session that observed it is gone — and keep it consistent with T3a
-   being decide-only and T3b re-proving under its own lock.
-2. **Readiness is untestable.** The policy-readiness gate is a private constant fixed
-   to `false`, so no test can exercise the ready path. Give it a form the tests can
-   drive while keeping production `false` until increment 2's admission rule lands.
-3. **Crate-private declarations lack visibility and module placement.** Say where each
-   lives and with what visibility.
-4. **"Call `canonicalize_lenient` exactly once" reads globally**, but the compatibility
-   wrapper must not canonicalize at all — it enumerates the caller's raw spelling.
-   Scope the statement to the exact-absence entry point.
-
-Findings 7–10 are MAJOR/MINOR: the 980-line estimate may be materially low; several
-increment-2 enums become public before production constructs them; the mutation audit
-does not name `std::fs::canonicalize` and target `symlink_metadata`; and byte-exact
-`requested_root` preservation lacks direct evidence. Finding 7 in particular invites
-you to take the A1/A2 split now rather than keep a cap you do not believe — **do
-that if the honest estimate says so**, and emit the spec for A1 alone with A2
-specified in outline, saying plainly that is what you did.
+Fold them too where they improve the document: A1 public-API verification (specify
+filtering `entries().iter()` with the private predicate and pointer-comparing the
+borrowed entry); A2 compatibility scanner design; A2 scan-lifetime terminology; the
+A2 missing-root claim; snapshot-projection documentation; and the A1 yielded-entry
+test. Where one is wrong about the code, say so in the document with evidence rather
+than folding it.
 
 ### Settled — do not re-open
 
-T3a decides, T3b acts; slice A of two; behavior-preserving with today's eager
-two-phase ordering and the pin-failure-retained compatibility semantics; no NEW
-ownership plumbing; the policy-readiness gate concept; the characterization matrix
-including the `Preserved` + vanished target + `BothAbsent` ⇒ raw `Authorized` row and
-the silently-omitted malformed legacy sidecar; no behavioral red for slice A; the
-operator runs the host gates and the `## OPERATOR EVIDENCE — PENDING` block stays;
-literal declarations stay literal.
+The A1/A2 split and A1's scope; `has_authoritative_scan()` and the snapshot-not-
+authority framing; the production readiness constant `false` plus the parameterized
+predicate; `sweep/report.rs` placement and the fifteen re-exports; no
+`effective_decision_at`; the filtered `effective()` view; the characterization matrix;
+no behavioral red for A1; the operator-run gates and the
+`## OPERATOR EVIDENCE — PENDING` block; literal declarations stay literal.
 
 ```
-ROUND 3 FINDINGS
-Prior-round adjudication: PARTIAL — the forbidden accessor was reduced but remains in “What must not be undone”; FIXED — the public/root-observation privacy contradiction, superseded ordering bullet, and duplicate line caps; FIXED — the separable-Copy problem through borrowed effective entries; FIXED — pin-failure evidence through the real compatibility source; FIXED — literal public/private declarations are now supplied.
+ROUND 4 FINDINGS
+Prior-round adjudication: FIXED — removed accessor demand, fifteen-type count, authority-lifetime naming, readiness-seam testability, and module visibility concerns do not recur. No characterization-matrix row remains disputed.
 
-Disagreements resolved: Soundness is right that the T3a/T3b authority gap is blocking because it permits action against a replaced root; Soundness is also right that sizing, the type-count mismatch, and mutation-audit wording are non-blocking because the stop rule, explicit declarations, and broad metadata allowance prevent those issues from forcing incorrect implementation.
+BLOCKER
 
-1. BLOCKER — WRONG — “Effective-projection safety” / “T3a decides; T3b acts.” Issue: `finish` drops the pinned scan session, while the report retains only strings, names, and a `Pinned` classification. If the root is replaced after scanning, future T3b code following the instruction to act on an `effective()` entry cannot prove it is acting on the scanned object and could remove the replacement. Suggested resolution: make `effective()` explicitly diagnostic/snapshot eligibility and require action-time re-decision under T3b’s lock, or retain an opaque, non-`Clone`, descriptor-bound authority consumed by T3b.
+1. WRONG — A2 compatibility/action scan separation, AC 17
 
-2. BLOCKER — WRONG — “Required deterministic seam and projection tests.” Issue: readiness is a private constant permanently fixed to `false`, so the required ready-projection legacy test cannot construct the stated condition. An implementer must either weaken the test or alter the normative API without permission. Suggested resolution: specify a private parameterized authorization predicate that production calls with the constant and tests call with explicit readiness, or define a precise test-only seam.
+Issue: “Zero wrapper canonicalization” contradicts the existing `sweep_orphans` guard-root canonicalization. A literal implementation could remove that call, changing current guard behavior even though enumeration must continue using the raw root spelling.
 
-3. BLOCKER — WRONG — “File organization” / “Literal crate-private scanner and classifier declarations.” Issue: declarations without visibility modifiers are private to `sweep::checked_scan`, but parent `sweep.rs` is required to own traversal integration and use those types. The specified layout therefore cannot compile. Suggested resolution: mark the complete cross-module seam and every signature-exposed type `pub(super)` or `pub(crate)`, or move traversal ownership into `checked_scan.rs`.
+Suggested resolution: Preserve the existing guard-root `canonicalize_lenient` call. Require only `scan_worktree_records` and its enumeration input to remain raw and free of canonicalization.
 
-4. BLOCKER — WRONG — “Scan flow,” step 2. Issue: “call `canonicalize_lenient` exactly once” can be read globally, although the preserved legacy and custody paths call it per record through `worktree_under_root`. Following the global reading would remove or rewrite guards and could change matrix decisions. Suggested resolution: say exactly one call is made for the supplied sweep root, while all existing per-record guard canonicalizations remain unchanged.
+2. WRONG — A2 mutation audit, AC 19
 
-5. BLOCKER — WRONG — Outer “What must not be undone.” Issue: it contractually requires `effective_decision_at()` to return `Some(Refused)`, while the normative API removes that method and requires `effective()` to be empty in slice A. An implementer could reintroduce the forbidden scalar accessor or violate the wrapper. Suggested resolution: delete the stale sentence and state the actual invariant: slice A’s `effective()` yields no entries.
+Issue: The supposedly complete inventory omits the reachable `registration_absent_from_porcelain → compare_path_identities` branch. When a target is absent and porcelain reports no registration, that branch performs additional metadata, symlink-metadata, canonicalization, and possible directory/case-sensitivity observations; the stated audit could therefore certify an incomplete production path.
 
-6. MAJOR — SMELL — Outer Acceptance Criterion 5. Issue: it says fourteen public types, while the normative declarations and inner acceptance criteria say fifteen. The declarations are individually implementable, but the mismatch can cause a mechanical review failure. Suggested resolution: change the outer count to fifteen and preferably name the set.
+Suggested resolution: Add that branch and its full observation tree, plus the scanner’s `PinnedDirectoryV1::open` observation, to the normative audit and acceptance criterion.
 
-7. MAJOR — SMELL — “Sizing and mandatory pre-edit stop.” Issue: the 980-line estimate appears materially low for the literal declarations, compatibility source, traversal, extensive fixtures, and handoff. Suggested resolution: use the proposed A1 vocabulary/projections → A2 traversal/characterization split before dispatch, or provide revised component estimates with credible contingency. The existing pre-edit stop prevents this from being a blocker.
+MAJOR
 
-8. MAJOR — SMELL — “Literal public API.” Issue: several exhaustive increment-2 enums become public before production constructs them, making newly discovered admission outcomes either breaking V1 changes or lossy mappings. Suggested resolution: keep dormant assessment vocabulary private until increment 2 or make genuinely extensible outer enums non-exhaustive.
+3. SMELL — A1 public API verification, AC 1–2 and 15
 
-9. MINOR — SMELL — “Mutation audit.” Issue: ordinary `std::fs::canonicalize` and target `symlink_metadata` are not named explicitly, although “descriptor and metadata observation” is broad enough to admit them. Suggested resolution: enumerate those concrete leaves and call edges to make the audit unambiguous.
+Issue: Tests inside private `report` can pass even if the promised `bridge_worktree::sweep::*` re-exports are absent or private.
 
-10. MINOR — SMELL — “Scan flow” evidence. Issue: byte-exact `requested_root` preservation and the precise lenient `canonical_root` result are public semantics without direct assertions. Suggested resolution: add a non-canonical-root test asserting exact requested spelling, the expected canonical value, and `None` only on canonicalization refusal.
+Suggested resolution: Add an external-path compile assertion or retained compiler probe covering all fifteen public names.
 
-Both lenses independently confirmed the characterization matrix, including `Preserved` plus valid claim plus vanished target plus `BothAbsent` producing raw `Authorized`, malformed legacy silent omission, eager read-before-assess ordering, and canonical exact-scan versus raw compatibility-scan roots.
+4. SMELL — A2 compatibility scanner design
 
-VERDICT: Not ready to plan; first resolve the T3b authority lifetime, testable readiness, cross-module visibility, root-only canonicalization wording, and stale accessor contract.
+Issue: The checked scanner duplicates selection, legacy-read, custody-read, and omission policy independently from `scan_worktree_records`, allowing later policy changes to make reporting and action scans disagree.
+
+Suggested resolution: Share per-entry machinery where feasible, or require a same-root conformance matrix while separately testing canonical-versus-raw enumeration roots.
+
+5. SMELL — A2 scan lifetime terminology
+
+Issue: Because `finish` precedes phase-2 assessment, `Complete + Pinned + Authorized` is historical sequence evidence rather than one coherent point-in-time snapshot. T3b re-decision prevents an incorrect effect, but the current terminology may invite stronger interpretations.
+
+Suggested resolution: State this limitation explicitly; if coherent snapshot eligibility is intended, bracket phase 2 with the final root-identity check.
+
+MINOR
+
+6. WRONG — A2 missing-root claim
+
+Issue: “A missing root is not a lenient-canonicalization failure” is too broad. A missing relative input such as `new-root` can fail while resolving its empty parent.
+
+Suggested resolution: Scope `CannotEnumerate` to an absolute missing path beneath an existing ancestor and retain `CannotCanonicalize` for the relative failure case.
+
+7. SMELL — Snapshot projection documentation
+
+Issue: Borrowing does not type-enforce inseparability because entries are cloneable and both the name and decision can be copied out.
+
+Suggested resolution: Describe borrowing as ergonomic coupling; identify absence of live authority and mandatory T3b re-decision as the actual safety boundary.
+
+8. SMELL — A1 yielded-entry test
+
+Issue: “A yielded test entry” is ambiguous because production `effective()` yields nothing and the private seam returns a boolean.
+
+Suggested resolution: Specify filtering `entries().iter()` with the private predicate and pointer-comparing the borrowed entry.
+
+Disagreement resolution: Rigor is right that AC 17 and AC 19 block this normative spec; Soundness is right that the phase-2 lifetime concern is non-blocking because T3b must independently re-establish authority before acting.
+
+VERDICT: Changes required before planning: correct AC 17’s wrapper-canonicalization rule and complete AC 19’s production observation audit.
 ```
 
 ### The document to revise
 
 ```markdown
-# R2f1b 3d T3a increment 1, slice A — public shape, projections, and a compatibility-backed report
+# R2f1b 3d T3a increment 1, slice A1 — public reporting vocabulary and snapshot projections
 
 ## Description
 
 Base: `main` = `9aedf175`.
 
-This is **slice A of two**. It lands the complete public reporting vocabulary, raw
-and effective projections, a compatibility-backed report, an injectable scanner
-seam, the private three-capture classifier shape, and the characterization matrix.
-**Slice B** later supplies descriptor enumeration, populates the three root
-observations, wires authoritative pinned-root classification, adds platform gating,
-and provides real-Git authority evidence.
+This revision takes the A1/A2 split because the prior combined estimate was not
+credible beneath its cap. This document specifies **A1 only**. A1 lands the complete
+public reporting vocabulary, raw and filtered snapshot projections, the testable
+policy-readiness predicate, module re-exports, projection tests, and its handoff.
+It does not change traversal or the return type of
+`sweep_orphans_with_exact_absence`.
 
-**Slice A is behavior-preserving.** It changes no raw decision, admission rule, or
-refusal. Its compatibility source returns an empty root-observation set, so
-production root authority truthfully remains `Unavailable`.
+A2 is specified in outline below. A2 will add the compatibility scanner seam,
+compatibility-backed report population, exact-name traversal, characterization
+matrix, ordering evidence, report return-type migration, and mutation audit. After
+A2, the original slice A is complete. The later slice B supplies descriptor
+enumeration, populates the three root observations, wires authoritative pinned-root
+classification, adds platform gating, and provides real-Git authority evidence.
 
-**T3a decides; T3b acts.** No path introduced or changed here writes, renames,
-unlinks, removes, prunes, publishes, settles, or transitions custody state. Existing
-action paths remain separate.
+A1 is behavior-preserving. It changes no raw decision, admission rule, refusal,
+scan, event, action, custody transition, or CLI behavior. Production does not
+construct the new report types until A2.
 
 ### Settled boundaries
 
+- T3a decides; T3b acts. T3a reports snapshot decisions and never conveys durable
+  action authority.
+- A returned report retains no open directory, descriptor, lock, lease, or opaque
+  authority token. Once the scan session is consumed by `finish`, even a stored
+  `CustodyRootObservationV1::Pinned` value is only historical evidence about that
+  completed scan.
+- `effective()` is a filtered **snapshot-eligibility** view. It is not action
+  authority. T3b must re-read and re-decide the yielded candidate under T3b’s own
+  action lock before any effect.
 - Add no NEW ownership input, variant, or plumbing. `decide_unused_candidate` keeps
   `recovery_owned: bool`, and both production call sites continue to pass `false`.
 - Increment 2 installs population admission and construction guards. Increment 3
-  supplies retained authority. Their public vocabulary lands now, but their
+  supplies retained action authority. Their vocabulary lands now, but their
   production behavior does not.
-- The effective-projection readiness gate remains `false` through slice B and may
-  become true only in the same change that lands increment 2’s refusing admission
-  rule.
-- Add no `bridge-core` surface, `libc`, `fdopendir`, descriptor enumeration, or
-  platform-conditional production functionality.
-- Slice A adds no authoritative enumeration-root pinning beyond the existing
-  `PinnedDirectoryV1` used for custody-record reads.
-- `#[cfg_attr(not(unix), allow(dead_code))]` remains permitted where a private seam
-  is necessarily unused on non-Unix, and `#[cfg(unix)]` remains permitted for
-  inherently Unix-only tests.
-- Preserve the eager two-phase traversal: enumerate and read all records first;
-  assess, probe, and log only after enumeration has finished.
-- Preserve compatibility pin failure: successful `read_dir` plus failed
-  `PinnedDirectoryV1::open` still permits legacy rows and emits each custody row as
-  the existing `"sweep root is not pinnable"` unreadable refusal.
+- The production policy-readiness constant remains `false` through A1, A2, and
+  slice B. It may become true only in the same change that lands increment 2’s
+  refusing population-admission rule.
+- Add no `bridge-core` surface, `libc`, `fdopendir`, descriptor enumeration,
+  authoritative enumeration-root pinning, or platform-conditional production
+  functionality.
+- A1 does not create `sweep/checked_scan.rs`, alter
+  `scan_worktree_records`, change `sweep_orphans_with_exact_absence`, or modify
+  `sweep_orphans`.
+- A2 must preserve today’s eager two-phase behavior, compatibility pin-failure
+  semantics, raw-spelling action scan, malformed-legacy omission, and exact
+  characterization matrix.
+- `#[cfg_attr(not(unix), allow(dead_code))]` remains permitted where a later private
+  scanner seam is necessarily unused on non-Unix, and `#[cfg(unix)]` remains
+  permitted for inherently Unix-only tests.
 
-### File organization
+### A1 file organization and public path
 
-Keep the public path `bridge_worktree::sweep::*`, but split the new implementation
-to keep the existing large `sweep.rs` reviewable:
+A1 uses the existing public path `bridge_worktree::sweep::*`:
 
 - `sweep/report.rs` owns the fifteen public types, accessors, conversions, raw
-  projection, effective projection, and readiness gate.
-- `sweep/checked_scan.rs` owns crate-private scanner traits, compatibility source,
-  pin-opener seam, raw root observations, and classifier.
-- `sweep.rs` re-exports the public vocabulary, owns traversal integration and the
-  reporting helper, and retains tests whose fixtures exercise existing private
-  sweep logic.
+  projection, filtered snapshot projection, readiness constant, parameterized
+  readiness predicate, and unit tests.
+- `sweep.rs` declares the private `report` module and re-exports exactly the fifteen
+  public types. No existing function body changes in A1.
+- `sweep/checked_scan.rs` is reserved for A2 and must not be created in A1.
 
-This decomposition does not expand `bridge-core` or change the public module path.
+Add this module declaration and re-export list in `sweep.rs`:
+
+```rust
+mod report;
+
+pub use report::{
+    CannotConstructSubjectV1, ClaimAuthorityObjectV1,
+    ClaimAuthorityUnavailableReasonV1, ClaimAuthorityUnavailableV1,
+    CustodyExactAbsenceAssessmentV1, CustodyRecordAssessmentV1,
+    CustodyRootObservationV1, CustodyStateSnapshotV1,
+    ExactAbsenceEnumerationV1, ExactAbsenceRecordAssessmentV1,
+    ExactAbsenceRootRefusalV1, ExactAbsenceScanStatusV1,
+    ExactAbsenceSweepEntryV1, ExactAbsenceSweepReportV1,
+    IneligiblePopulationV1,
+};
+```
+
+This decomposition adds no `bridge-core` surface and does not change the public
+module path.
 
 ### Literal public API
 
-The following declarations are normative. Implement them literally, including
-names, variants, payloads, fields, derives, visibility, accessors, conversions, and
-method signatures. These are the fifteen new public types; do not add another public
-report, capability, or observation type.
+The following declarations are normative for `sweep/report.rs`. Implement them
+literally, including names, variants, payloads, fields, derives, visibility,
+accessors, conversions, signatures, non-exhaustive annotations, and the four
+temporary dead-code allowances on A1’s not-yet-wired crate constructors. These are
+the fifteen new public types; do not add another public report, capability,
+authority, or observation type.
+
+A2 removes the four temporary constructor allowances when it adds their production
+callers.
 
 ```rust
 use std::ffi::{OsStr, OsString};
@@ -176,7 +228,7 @@ use crate::custody::{
 
 use super::UnusedCandidateDecisionV1;
 
-/// False in slice A and slice B. Increment 2 may change this only in the same
+/// False in A1, A2, and slice B. Increment 2 may change this only in the same
 /// change that installs its refusing population-admission rule.
 const EXACT_ABSENCE_POLICY_READY_V1: bool = false;
 
@@ -190,6 +242,8 @@ pub struct ExactAbsenceSweepReportV1 {
 }
 
 impl ExactAbsenceSweepReportV1 {
+    /// A1 lands the vocabulary before A2 supplies the production caller.
+    #[allow(dead_code)]
     pub(crate) fn new(
         requested_root: String,
         canonical_root: Option<String>,
@@ -224,8 +278,9 @@ impl ExactAbsenceSweepReportV1 {
         &self.entries
     }
 
-    /// Reports scan authority only. It does not imply policy readiness or action
-    /// eligibility.
+    /// Reports only whether the completed scan observed a complete enumeration
+    /// through matching pinned root evidence. The returned report retains no
+    /// descriptor, lock, or action authority.
     #[must_use]
     pub fn has_authoritative_scan(&self) -> bool {
         matches!(
@@ -234,26 +289,38 @@ impl ExactAbsenceSweepReportV1 {
         ) && self.scan.custody_root() == CustodyRootObservationV1::Pinned
     }
 
-    /// Yields only effectively authorized entries. Refused entries are absent.
+    /// Yields entries that satisfy the report's snapshot-eligibility filter.
+    /// Refused and legacy entries are absent.
     ///
     /// This deliberately returns borrowed entries rather than `(entry, decision)`
     /// tuples or copyable effective-decision values. The exact enumerated name and
-    /// its authorization therefore remain one object. Future action code must
-    /// consume these yielded entries and use `enumerated_name()` directly.
+    /// its snapshot decision therefore remain one object.
     ///
-    /// Slice A yields no entries because root authority is `Unavailable` and the
-    /// policy-readiness gate is false.
+    /// The scan session has ended before this iterator can be consumed. A yielded
+    /// entry is input to a future T3b action-time re-decision, not authority to act.
+    /// T3b must acquire its own lock, re-read the exact entry, re-establish root and
+    /// record identity, apply current admission policy, and repeat the exact-absence
+    /// decision before any effect.
+    ///
+    /// Production A1, A2, and slice B yield no entries because policy readiness is
+    /// false.
     pub fn effective(&self) -> impl Iterator<Item = &ExactAbsenceSweepEntryV1> {
-        self.entries
-            .iter()
-            .filter(move |entry| self.entry_is_effectively_authorized(entry))
+        self.entries.iter().filter(move |entry| {
+            self.entry_is_effectively_authorized_for_policy(
+                entry,
+                EXACT_ABSENCE_POLICY_READY_V1,
+            )
+        })
     }
 
-    fn entry_is_effectively_authorized(
+    /// Private deterministic seam. Production supplies the constant above; tests
+    /// supply explicit readiness so both branches are exercised before increment 2.
+    fn entry_is_effectively_authorized_for_policy(
         &self,
         entry: &ExactAbsenceSweepEntryV1,
+        policy_ready: bool,
     ) -> bool {
-        EXACT_ABSENCE_POLICY_READY_V1
+        policy_ready
             && self.has_authoritative_scan()
             && !matches!(
                 entry.assessment(),
@@ -271,6 +338,8 @@ pub struct ExactAbsenceScanStatusV1 {
 }
 
 impl ExactAbsenceScanStatusV1 {
+    /// A1 lands the vocabulary before A2 supplies the production caller.
+    #[allow(dead_code)]
     pub(crate) fn new(
         enumeration: ExactAbsenceEnumerationV1,
         custody_root: CustodyRootObservationV1,
@@ -320,6 +389,8 @@ pub struct ExactAbsenceSweepEntryV1 {
 }
 
 impl ExactAbsenceSweepEntryV1 {
+    /// A1 lands the vocabulary before A2 supplies the production caller.
+    #[allow(dead_code)]
     pub(crate) fn new(
         record_path: String,
         enumerated_name: OsString,
@@ -356,9 +427,8 @@ pub enum ExactAbsenceRecordAssessmentV1 {
 }
 
 impl ExactAbsenceRecordAssessmentV1 {
-    /// Raw, behavior-compatible reporting projection. This is not action
-    /// eligibility; action-facing code must iterate the report's `effective()`
-    /// projection.
+    /// Raw, behavior-compatible reporting projection. This is neither snapshot
+    /// eligibility nor action authority.
     #[must_use]
     pub fn decision(&self) -> UnusedCandidateDecisionV1 {
         match self {
@@ -384,6 +454,8 @@ pub struct CustodyRecordAssessmentV1 {
 }
 
 impl CustodyRecordAssessmentV1 {
+    /// A1 lands the vocabulary before A2 supplies the production caller.
+    #[allow(dead_code)]
     pub(crate) fn new(
         state: CustodyStateSnapshotV1,
         assessment: CustodyExactAbsenceAssessmentV1,
@@ -402,16 +474,18 @@ impl CustodyRecordAssessmentV1 {
     }
 }
 
+#[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CustodyExactAbsenceAssessmentV1 {
     /// Increment 2 constructs this after population admission refuses.
     IneligiblePopulation(IneligiblePopulationV1),
     /// Increment 2 constructs this when a guard or authority construction refuses.
     CannotConstructSubject(CannotConstructSubjectV1),
-    /// Slice A constructs this to retain the current raw decision.
+    /// A2 constructs this to retain the current raw decision.
     Assessed(UnusedCandidateDecisionV1),
 }
 
+#[non_exhaustive]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum IneligiblePopulationV1 {
     /// `ProtectionPrepared` without a claim. Its claim is schema-optional, so this
@@ -422,6 +496,7 @@ pub enum IneligiblePopulationV1 {
     StateNotCandidate,
 }
 
+#[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CannotConstructSubjectV1 {
     RecordedWorktreePathNotAbsolute,
@@ -550,20 +625,24 @@ impl From<WorktreeCustodyStateV1> for CustodyStateSnapshotV1 {
 ```
 
 Public structs have private fields and read-only accessors. Public enum payloads
-remain ordinary public payloads, as Rust requires. Production in slice A constructs
-only `Legacy`, `UnreadableCustody`, and
-`Custody(CustodyRecordAssessmentV1 { assessment: Assessed(..), .. })`. Do not
-production-construct the increment-2 arms, hide them behind `cfg(test)`, or remove
-them.
+remain ordinary public payloads, as Rust requires. The increment-2 assessment enums
+are non-exhaustive so later admission outcomes can be added without requiring a
+lossy mapping or an exhaustive downstream match break.
+
+A1 production constructs none of these report values. A2 production constructs only
+`Legacy`, `UnreadableCustody`, and
+`Custody(CustodyRecordAssessmentV1 { assessment: Assessed(..), .. })`. Increment 2
+constructs the dormant admission and subject-construction arms. Do not hide dormant
+arms behind `cfg(test)` or remove them.
 
 `CustodyStateSnapshotV1` retains neither an entire custody record nor
 `RecoveredLive`’s predecessor digest. Its conversion explicitly names all ten
 custody states, and only `PreservationUnknown` retains a
 `PreservationReasonV1`.
 
-### Effective-projection safety
+### Snapshot projection and authority lifetime
 
-`has_authoritative_scan()` means exactly:
+`has_authoritative_scan()` implements this historical scan-evidence table:
 
 | Enumeration | Custody-root observation | Result |
 |---|---|---|
@@ -571,39 +650,100 @@ custody states, and only `PreservationUnknown` retains a
 | `Complete` | `IdentityChanged` or `Unavailable` | `false` |
 | `Incomplete` or `Refused` | any value | `false` |
 
-It describes scan evidence, not action authority. Public raw `decision()` remains
-available for reporting and compatibility assertions.
+A `true` result says that the completed scan observed matching pinned-root evidence.
+It does not say that the root is still the same object. `finish` consumes and drops
+the scan session before the report is returned, and the report stores only values.
+Neither `has_authoritative_scan()` nor raw `decision()` can authorize an action.
 
-`effective()` is an authorization-capable filtered view, not a tuple-valued decision
-map:
+The private parameterized predicate implements this snapshot filter:
 
-| Condition | `effective()` result for the row |
+| Condition | Predicate result |
 |---|---|
-| Enumeration is not `Complete` | row omitted |
-| Custody root is not `Pinned` | row omitted |
-| Policy readiness is false | row omitted |
-| Scan authoritative and ready, but row is `Legacy` | row omitted |
-| Scan authoritative and ready, non-legacy raw decision is `Refused` | row omitted |
-| Scan authoritative and ready, non-legacy raw decision is `Authorized` | borrowed entry yielded |
+| Policy readiness is false | `false` |
+| Enumeration is not `Complete` | `false` |
+| Custody root is not `Pinned` | `false` |
+| Scan was complete and pinned, but row is `Legacy` | `false` |
+| Scan was complete and pinned, non-legacy raw decision is `Refused` | `false` |
+| Scan was complete and pinned, policy ready, non-legacy raw decision is `Authorized` | `true` |
 
-This resolves the separable-`Copy` problem mechanically: no effective
-`UnusedCandidateDecisionV1` value leaves the report. The only positive effective
-projection is the borrowed entry containing the exact enumerated name. Future action
-code must iterate this view and act on the yielded entry itself.
+Production `effective()` passes `EXACT_ABSENCE_POLICY_READY_V1`. Unit tests in
+`report.rs` call `entry_is_effectively_authorized_for_policy` with explicit `false`
+and `true` values. This makes the ready path testable without changing production
+readiness.
 
-The raw `decision()` remains intentionally unsuitable for action. Combining it with
-`has_authoritative_scan()` still does not establish readiness; the method’s name and
-doc comment must make that boundary explicit.
+`effective()` returns borrowed entries and exposes no separable effective-decision
+scalar. Its positive result means only that an entry satisfied the report’s
+snapshot filter. T3b may use the yielded `enumerated_name()` as candidate input, but
+must perform this action-time sequence under its own lock:
 
-The readiness constant remains false in slice A and slice B. Otherwise, after slice
-B first produces `Pinned`, a `Preserved` record with valid claim, vanished target,
-and `BothAbsent` could become effectively authorized before increment 2 installs its
-admission rule. Test an otherwise authoritative report containing a non-legacy raw
-`Authorized` row and assert that `effective().next()` is `None`.
+1. Re-open the selected sweep root and establish its current object identity.
+2. Re-read the exact record named by `enumerated_name()` without reconstructing the
+   name from `record_path()`.
+3. Re-establish record/sibling placement and source, root, worktree, common-directory,
+   and source/common-directory binding evidence.
+4. Apply the current population-admission rule.
+5. Repeat the exact-absence observation against the current target and Git
+   registration.
+6. Refuse if any root, record, object, policy, or absence observation changed.
+7. Keep the T3b lock and its action-time authority alive through the authorized
+   effect.
 
-### Literal crate-private scanner and classifier declarations
+No T3b implementation may remove, prune, settle, transition, or publish solely
+because a report entry appeared in `effective()`.
 
-The following private declarations are also normative:
+### A1 required tests and evidence
+
+Place the projection tests beside the implementation in `sweep/report.rs`. They
+must cover:
+
+- all accessors on the report, scan status, entry, custody assessment, authority
+  refusal, and custody snapshot;
+- both `From` implementations for every one of the ten custody states;
+- `PreservationUnknown` retaining each of the six reasons;
+- `RecoveredLive` retaining no predecessor digest;
+- every `ExactAbsenceRecordAssessmentV1::decision()` arm;
+- `IneligiblePopulation`, `CannotConstructSubject`, and unreadable custody mapping
+  to raw `Refused`;
+- custody `Assessed(Authorized)` and `Assessed(Refused)` retaining their raw
+  decisions;
+- every combination in the `has_authoritative_scan()` table;
+- production `effective()` returning no entries for an otherwise complete,
+  pinned, non-legacy raw-`Authorized` report;
+- the private predicate returning `false` for explicit false readiness;
+- the private predicate returning `true` for explicit true readiness only for a
+  complete, pinned, non-legacy raw-`Authorized` entry;
+- the private predicate excluding legacy and raw-`Refused` rows even with explicit
+  true readiness;
+- a yielded test entry remaining the same borrowed object containing its
+  `enumerated_name()`.
+
+A1 has no behavioral red. Its pre-change failure is compiler/API-shape evidence:
+the fifteen public types, module, methods, and re-exports do not exist at the base.
+Do not describe that as decision-behavior evidence.
+
+A1’s production mutation audit is bounded and mechanical: the `sweep.rs` diff may
+add only `mod report` and the re-exports. Existing production function bodies,
+including `scan_worktree_records`, `sweep_orphans_with_exact_absence`,
+`sweep_orphans`, `decide_unused_candidate`, and both `false` ownership call sites,
+must remain byte-for-byte unchanged apart from formatting forced by the new module
+declaration location.
+
+### A2 outline — not part of A1 implementation
+
+A2 owns all traversal, compatibility-source, report-population, characterization,
+event-ordering, return-type, exact-root, and mutation-audit work described below.
+Do not partially implement it in A1.
+
+#### A2 module placement and visibility
+
+`sweep/checked_scan.rs` owns the scanner traits, compatibility source, pin-opener
+seam, compatibility session, raw observations, and classifier. Every item used by
+parent `sweep.rs`, and every type exposed through one of those signatures, is
+`pub(super)`. The concrete compatibility session stays private to
+`checked_scan.rs`. Observation fields and `complete_identity` stay private because
+classification and its construction tests live in that module.
+
+The following declarations are the A2 cross-module seam:
 
 ```rust
 use std::ffi::{OsStr, OsString};
@@ -617,23 +757,23 @@ use crate::provider_path::WorktreeSidecar;
 use super::report::CustodyRootObservationV1;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum CheckedScanOpenRefusalV1 {
+pub(super) enum CheckedScanOpenRefusalV1 {
     CannotEnumerate,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum CheckedScanEntryRefusalV1 {
+pub(super) enum CheckedScanEntryRefusalV1 {
     CannotReadEntry,
 }
 
-trait CheckedScanSourceV1 {
+pub(super) trait CheckedScanSourceV1 {
     fn open(
         &self,
         enumeration_root: &Path,
     ) -> Result<Box<dyn CheckedScanRootSessionV1>, CheckedScanOpenRefusalV1>;
 }
 
-trait CheckedScanRootSessionV1 {
+pub(super) trait CheckedScanRootSessionV1 {
     fn next_name(
         &mut self,
     ) -> Option<Result<OsString, CheckedScanEntryRefusalV1>>;
@@ -655,12 +795,12 @@ trait CheckedScanRootSessionV1 {
 /// Test injection is below the real compatibility source. Tests replace only the
 /// pin-open result while retaining production `read_dir`, name selection, legacy
 /// reading, custody handling, session state, and finish behavior.
-trait CompatibilityPinOpenerV1 {
+pub(super) trait CompatibilityPinOpenerV1 {
     fn open_pin(&self, enumeration_root: &Path) -> Option<PinnedDirectoryV1>;
 }
 
 #[derive(Clone, Copy, Debug, Default)]
-struct FilesystemCompatibilityPinOpenerV1;
+pub(super) struct FilesystemCompatibilityPinOpenerV1;
 
 impl CompatibilityPinOpenerV1 for FilesystemCompatibilityPinOpenerV1 {
     fn open_pin(&self, enumeration_root: &Path) -> Option<PinnedDirectoryV1> {
@@ -668,8 +808,18 @@ impl CompatibilityPinOpenerV1 for FilesystemCompatibilityPinOpenerV1 {
     }
 }
 
+pub(super) struct CompatibilityCheckedScanSourceV1<P> {
+    pin_opener: P,
+}
+
+impl<P: CompatibilityPinOpenerV1> CompatibilityCheckedScanSourceV1<P> {
+    pub(super) const fn new(pin_opener: P) -> Self {
+        Self { pin_opener }
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
-struct RootIdentityCaptureV1 {
+pub(super) struct RootIdentityCaptureV1 {
     dev: Option<u64>,
     ino: Option<u64>,
     birthtime: Option<BirthTimeV1>,
@@ -682,13 +832,13 @@ impl RootIdentityCaptureV1 {
 }
 
 #[derive(Clone, Copy, Debug, Default)]
-struct RootObservationSetV1 {
+pub(super) struct RootObservationSetV1 {
     retained_enumeration_object: Option<RootIdentityCaptureV1>,
     pinned_custody_directory: Option<RootIdentityCaptureV1>,
     final_named_root: Option<RootIdentityCaptureV1>,
 }
 
-fn classify_root_observations(
+pub(super) fn classify_root_observations(
     observations: &RootObservationSetV1,
 ) -> CustodyRootObservationV1 {
     let (
@@ -720,23 +870,21 @@ fn classify_root_observations(
 }
 ```
 
-All scanner-seam and raw-observation types are crate-private.
-`CustodyRootObservationV1` is the public classified result.
+`CompatibilityCheckedScanRootSessionV1` is module-private and implements the
+`pub(super)` session trait. `sweep.rs` sees only the trait object and
+`RootObservationSetV1`; it does not inspect session internals or observation fields.
 
-The classifier deliberately does not use `DirectoryIdentityV1::matches`. At the
-base commit, that method treats missing birthtime on either side as a wildcard,
-whereas this authority classification requires complete `(dev, ino, birthtime)`
-captures. A missing capture or any incomplete tuple yields `Unavailable`; only
-three complete tuples can yield `Pinned` or `IdentityChanged`. `Unavailable`
-therefore outranks mismatch.
+The classifier does not use `DirectoryIdentityV1::matches`. At the base commit,
+that method treats missing birthtime on either side as a wildcard, whereas this
+classification requires complete `(dev, ino, birthtime)` captures. A missing
+capture or incomplete tuple yields `Unavailable`; only three complete tuples can
+yield `Pinned` or `IdentityChanged`. `Unavailable` outranks mismatch.
 
-The classifier remains in slice A because its exact private handoff shape and public
-classification semantics must be frozen before slice B replaces the source.
-Production still passes an empty set and therefore returns `Unavailable`. This is
-the project’s fail-closed object-identity model, not a claim that filesystem object
-IDs can never be reused.
+A2’s compatibility source returns `RootObservationSetV1::default()`, so production
+classification remains `Unavailable`. Slice B replaces the source and populates
+the three captures.
 
-### Compatibility source and deterministic pin-failure evidence
+#### A2 compatibility source and deterministic pin-failure evidence
 
 Implement `CompatibilityCheckedScanSourceV1<P>` over the current
 `std::fs::read_dir`, parameterized only by `P: CompatibilityPinOpenerV1`.
@@ -751,28 +899,27 @@ Its open sequence is exact:
 5. `read_legacy` continues through path-based `read_sidecar` regardless of the pin.
 6. With no pin, `read_custody` returns
    `CustodyReadRefusalV1::Unreadable("sweep root is not pinnable".to_string())`.
-7. `finish` returns `RootObservationSetV1::default()`.
+7. `finish` returns `RootObservationSetV1::default()` and consumes the session.
 
 The generic fake scanner proves iterator states and ordering, but it is not
-admissible evidence for compatibility pin behavior. Add a separate test that
-constructs the real `CompatibilityCheckedScanSourceV1` with a deterministic failing
-pin opener. Use an actual readable directory containing a valid legacy sidecar and
-a custody-named entry. The test must prove:
+admissible evidence for compatibility pin behavior. A separate test constructs the
+real compatibility source with a deterministic failing pin opener and an actual
+readable directory containing a valid legacy sidecar and a custody-named entry. It
+must prove:
 
-- the real source’s actual `read_dir` succeeds;
+- the real source’s `read_dir` succeeds;
 - open returns a session rather than `CannotEnumerate`;
-- the legacy row is present and read through the production legacy implementation;
+- the legacy row is present and read through production `read_sidecar`;
 - the custody row is present as the exact not-pinnable refusal;
 - enumeration is `Complete`;
-- the compatibility source’s production `finish` still classifies as
-  `Unavailable`.
+- production `finish` classifies as `Unavailable`.
 
-This test replaces only pin creation. It must not replace the compatibility source,
-its session, enumeration, row selection, reads, or finish behavior.
+Only pin creation is replaced. The test must not replace the compatibility source,
+session, enumeration, selection, reads, or finish behavior.
 
-### Scan flow
+#### A2 scan flow and root-spelling evidence
 
-Change:
+A2 changes the signature to:
 
 ```rust
 pub fn sweep_orphans_with_exact_absence(
@@ -783,52 +930,64 @@ pub fn sweep_orphans_with_exact_absence(
 
 Its behavior is:
 
-1. Retain the supplied `root` byte-for-byte as `requested_root`.
-2. Call the existing `canonicalize_lenient` exactly once. Do not substitute
-   `std::fs::canonicalize`.
-3. On lenient-canonicalization failure, return `canonical_root: None`,
+1. Copy the supplied `root` directly into `requested_root`, preserving its UTF-8
+   bytes exactly.
+2. At the exact-absence entry point, invoke the existing
+   `canonicalize_lenient(root)` exactly once for the supplied sweep root.
+   This count applies only to that entry-point root conversion. It does not include
+   the existing per-record `worktree_under_root` calls, the
+   `std::fs::canonicalize` calls in sibling guards, or the internal ancestor loop
+   inside `canonicalize_lenient`.
+3. Do not substitute a direct `std::fs::canonicalize` call for the entry-point
+   helper.
+4. On lenient-canonicalization failure, return `canonical_root: None`,
    `Refused(CannotCanonicalize)`, root `Unavailable`, and no entries.
-4. Open the compatibility source on the canonical root.
-5. On source-open failure, return the canonical root,
+5. Open the compatibility source on the canonical root.
+6. On source-open failure, return the canonical root,
    `Refused(CannotEnumerate)`, root `Unavailable`, and no entries.
-6. Phase 1 drains `next_name`. For every successful yielded name, construct the
-   current lossy display path, apply the existing display-based selection
-   predicates, immediately perform the applicable legacy or custody read, and
-   collect an intermediate row before requesting the next name.
-7. Count only `next_name` item errors in `skipped_entries`. A malformed or otherwise
+7. Phase 1 drains `next_name`. For every successful yielded name, construct the
+   current lossy display path, apply existing display-based selection predicates,
+   immediately perform the applicable legacy or custody read, and collect an
+   intermediate row before requesting the next name.
+8. Count only `next_name` item errors in `skipped_entries`. A malformed or otherwise
    unreadable custody record becomes an emitted unreadable row and does not increase
    that count.
-8. Continue until `next_name` returns `None`, then call `finish`.
-9. Only after `finish` completes may phase 2 assess, invoke the exact-absence probe,
-   or emit a decision event.
-10. Phase 2 assesses the collected rows in enumeration order, constructs the public
+9. Continue until `next_name` returns `None`, then call `finish`.
+10. Only after `finish` completes may phase 2 assess, invoke the exact-absence probe,
+    or emit a decision event.
+11. Phase 2 assesses collected rows in enumeration order, constructs public
     entries, and logs each raw `assessment.decision()` through the unchanged event
     shape.
-11. Return `Complete` when no iterator-item error occurred; otherwise return
+12. Return `Complete` when no iterator-item error occurred; otherwise return
     `Incomplete { skipped_entries }`. Root classification is independent of that
     enumeration result.
 
-The ordering tests must assert two different properties:
+Ordering tests must independently prove:
 
-- every selected successful name is read and collected before the next
+- every selected successful name is read and collected before the following
   `next_name` invocation; and
 - no assessment, probe call, or decision event occurs until `next_name` has returned
   `None` and `finish` has completed.
 
-A single assertion that a row is “processed” before the next name is insufficient
-because it could incorrectly permit probing or logging during enumeration.
+Legacy `read_sidecar` returns `None` on either read or JSON failure at the base.
+Preserve that as silent omission: no public entry, probe call, or decision event.
 
-Legacy `read_sidecar` returns `None` on either read or JSON failure at the base
-commit. Preserve that as silent omission: no public entry, probe call, or decision
-event.
+A missing root is not a lenient-canonicalization failure. The helper canonicalizes
+the nearest existing ancestor and appends the missing tail, so a missing root
+reaches source open and reports `CannotEnumerate`.
 
-A missing root is not a lenient-canonicalization failure: the helper canonicalizes
-the nearest existing ancestor and appends the missing tail. It must therefore reach
-source open and report `CannotEnumerate`.
+Add a direct non-canonical-root test that supplies a deliberately non-canonical
+string spelling and asserts all three public semantics:
 
-### Compatibility/action scan separation
+- `requested_root().as_bytes()` equals the supplied string’s bytes exactly;
+- `canonical_root()` equals the precise expected lenient canonical value; and
+- `canonical_root()` is `None` only in the separate canonicalization-refusal case,
+  not for a merely missing root.
 
-`scan_worktree_records(root)` keeps every existing observable:
+#### A2 compatibility/action scan separation
+
+`scan_worktree_records(root)` retains every existing observable and invokes no
+root canonicalization helper:
 
 - it enumerates the caller’s raw spelling;
 - `read_dir` failure returns an empty vector;
@@ -838,9 +997,10 @@ source open and report `CannotEnumerate`.
 - iterator-item errors are flattened;
 - the return type remains `Vec<(String, ScannedWorktreeRecordV1)>`.
 
-The exact-absence report enumerates the canonical root. The compatibility/action
-scan continues to enumerate its caller’s raw spelling. A symlinked-root alias test
-must assert both entry points retain today’s distinct path behavior.
+The exact-absence entry point enumerates its canonical root. The compatibility/action
+wrapper enumerates the caller’s raw spelling and must not call
+`canonicalize_lenient` itself. A symlinked-root alias test asserts both entry points
+retain those distinct path behaviors.
 
 `sweep_orphans` explicitly discards the report:
 
@@ -855,13 +1015,13 @@ It then performs its existing independent compatibility/action scan unchanged.
 `WorktreeRunEndGuard`, custody locking, recovery classification, and deletion paths
 continue to consume only the compatibility result.
 
-The return-type change affects more than statement-position callers: audit explicit
-unit bindings, unit-returning function pointers, unit-constrained closures,
-function-body tail expressions, unified `if`/`match` branches, generic consumers
-that inferred unit, and macro expression contexts. The five binary boot callers call
+The return-type audit covers statement-position callers, explicit unit bindings,
+unit-returning function pointers, unit-constrained closures, function-body tail
+expressions, unified `if` and `match` branches, generic consumers that inferred
+unit, and macro expression contexts. The five binary boot callers invoke
 `sweep_orphans` in statement position and require no CLI behavior change.
 
-### Characterization matrix
+#### A2 characterization matrix
 
 For a readable custody record whose path guards pass and whose valid complete claim
 constructs an `ExactAbsenceCandidateV1`:
@@ -899,89 +1059,77 @@ Guards and legacy:
 
 The load-bearing fixture is a real persisted `Preserved` custody record with a valid
 complete claim, a vanished target, and `BothAbsent`. Its raw result remains
-`Authorized`. Its effective projection in slice A yields no entry because the root
-is `Unavailable` and policy readiness is false. Do not weaken or reinterpret this
-row.
+`Authorized`. Its production `effective()` projection yields no entry because
+policy readiness is false. Even after a future ready report yields it as a snapshot
+candidate, T3b must re-prove the candidate under its own action lock.
 
 `MultiLink` is asserted only on Unix. Permission-dependent unreadability is
 supplementary; primary refusal tests use deterministic entry type, symlink,
 injected-open, or decode failures.
 
-### Required evidence
+A2’s deterministic tests additionally cover:
 
-Slice A has exactly one base-compatible runtime red, and it is an API-shape
-assertion:
-
-```rust
-let report = sweep_orphans_with_exact_absence(root, probe);
-assert!(std::mem::size_of_val(&report) > 0);
-```
-
-On the base, the returned unit value has size zero. Label this as API-shape evidence,
-not decision-behavior evidence. Slice A has no behavioral red and must not
-manufacture one.
-
-Raw behavior is supported by runtime characterization. Exhaustive production and
-test-side matches provide compiler totality. Record these as separate claims.
-
-Required deterministic seam and projection tests:
-
-- lenient canonicalization failure;
-- missing root reaches `CannotEnumerate`;
-- source-open refusal makes zero custody-pin calls;
+- lenient canonicalization refusal;
+- missing root reaching `CannotEnumerate`;
+- source-open refusal making zero custody-pin calls;
 - complete enumeration;
-- injected `Ok, Err, Ok, Err` produces
+- injected `Ok, Err, Ok, Err` producing
   `Incomplete { skipped_entries: 2 }`;
-- every yielded selected row is read before the following `next_name`;
-- no assessment, probe, or decision event occurs before `None` and completed
-  `finish`;
-- equal complete three-capture identities classify `Pinned`;
-- unequal complete identities classify `IdentityChanged`;
-- any absent capture, absent `dev`, absent `ino`, or absent birthtime classifies
+- every selected row read before the following name;
+- no assessment, probe, or decision event before `None` and completed `finish`;
+- equal complete three-capture identities classifying `Pinned`;
+- unequal complete identities classifying `IdentityChanged`;
+- any absent capture, absent `dev`, absent `ino`, or absent birthtime classifying
   `Unavailable`;
-- iterator incompleteness remains independent of root classification;
-- the real compatibility source with only its pin opener forced to fail preserves
-  legacy rows and emits custody rows as not-pinnable;
-- malformed legacy omission causes zero probe calls and zero matching decision
-  events;
-- malformed custody inclusion does not increment `skipped_entries`;
-- exact non-UTF-8 custody-name identity survives from enumeration into
+- iterator incompleteness remaining independent of root classification;
+- real compatibility pin failure preserving legacy rows and emitting custody rows
+  as not-pinnable;
+- malformed legacy omission causing zero probe calls and decision events;
+- malformed custody inclusion not incrementing `skipped_entries`;
+- exact non-UTF-8 custody-name identity surviving from enumeration into
   `enumerated_name()`;
-- a symlinked-root alias preserves canonical exact-scan paths and raw
-  compatibility-scan paths;
-- every scan/root combination in the `has_authoritative_scan()` table;
-- policy readiness false makes an otherwise authoritative raw-`Authorized` custody
-  row absent from `effective()`;
-- legacy rows never appear in `effective()`, even under an otherwise authoritative,
-  ready test-only projection.
+- canonical exact-scan paths versus raw compatibility-scan paths;
+- exact requested-root spelling and canonical-root values;
+- every scan/root combination in the historical scan-evidence table.
 
 For decision-event observation, route production’s existing per-row tracing call
-through a crate-private helper and install a test-only thread-local counter or sink
-at that helper. Do not add a public reporter API or alter the tracing event’s fields,
+through a private helper in `sweep.rs` and install a test-only thread-local counter
+or sink there. Do not add a public reporter API or alter the tracing event’s fields,
 level, or message.
 
-### Mutation audit
+#### A2 mutation audit
 
 Audit only the concrete production route through
 `HostGitWorktree::observe_exact_absence`. A downstream implementation of the public
 `ExactAbsenceProbeV1` can perform arbitrary effects and is outside this proof.
 
-Allowed observations and effects on the concrete route are:
+The allowed concrete observations and effects are:
 
-- lenient canonicalization;
-- `read_dir` traversal;
-- existing unbounded legacy `std::fs::read`;
-- bounded custody reads and canonical decoding;
-- descriptor and metadata observation;
-- allocation and collection;
-- `git rev-parse`;
+- the exact-absence entry-point call to `canonicalize_lenient`, including its
+  internal `std::fs::canonicalize` calls while finding the nearest existing
+  ancestor;
+- `std::fs::read_dir` traversal;
+- existing unbounded legacy `std::fs::read` through `read_sidecar`;
+- bounded descriptor-relative custody reads and canonical decoding;
+- per-record `worktree_under_root` calls to `canonicalize_lenient`;
+- the ordinary `std::fs::canonicalize` calls in legacy and custody
+  record/sibling-placement guards;
+- `ExactAbsenceCandidateV1::from_legacy` and `from_claim` flowing through
+  `capture_directory_identity`, including `std::fs::canonicalize`,
+  `verify_payload_directory_identity`, and metadata observation;
+- `source_common_dir_identity` invoking `git rev-parse --git-common-dir`;
+- `HostGitWorktree::observe_exact_absence` revalidating source and common-directory
+  identity;
+- both target checks through `Path::symlink_metadata`, before and after the Git
+  registration probe;
 - `git worktree list --porcelain -z`;
-- tracing.
+- allocation, collection, and tracing.
 
-Record the call-path evidence showing no application edge from the report traversal
-to provider remove or prune, worktree removal, `remove_dir_all`, unlink, rename,
-custody publication or replacement, settlement, transition, backend cleanup, or
-T3b action.
+Record symbol-to-symbol call-path evidence showing no application edge from the
+report traversal to provider remove or prune, `remove_worktree`,
+`remove_worktree_if_safe`, `remove_dir_all`, `remove_file`, rename, custody
+publication or replacement, settlement, transition, backend cleanup, or any T3b
+action.
 
 Do not call the path globally effect-free: Git subprocesses and tracing exist, and a
 configured tracing sink may write. Byte snapshots are corroborating final-content
@@ -989,59 +1137,62 @@ evidence only; they cannot exclude mutation followed by restoration.
 
 ### Falsification license
 
-Every anchor, symbol, caller count, matrix row, and behavioral statement in this
-task is an operator claim measured against `9aedf175`; the checked-out repository is
+Every symbol, caller count, matrix row, and behavioral statement in this task is an
+operator claim measured against `9aedf175`; the checked-out repository is
 authoritative. If a symbol is absent, `read_sidecar` does not silently omit, the two
 entry points do not enumerate different root spellings, the state decoder admits a
-different population, or any matrix result is wrong, record the exact source
-evidence and stop rather than forcing the implementation to match this task.
-Finding the work smaller than described is a good outcome.
+different population, a listed call edge differs, or any matrix result is wrong,
+record the exact source evidence and stop rather than forcing the implementation to
+match this task.
 
-The T3a-decides/T3b-acts boundary and exclusion of new ownership plumbing remain
-settled even if another factual anchor is disproved.
+Finding the work smaller than described is a good outcome. The A1/A2 split,
+T3a-decides/T3b-acts boundary, action-time T3b re-decision, and exclusion of new
+ownership plumbing remain settled even if another factual anchor is disproved.
 
-### Sizing and mandatory pre-edit stop
+### A1 sizing and mandatory stop
 
-Single limit: at most **1,000 added-plus-deleted lines**, including production,
-tests, module glue, and handoff, measured by the operator from
-`9aedf175..<final SHA>` with `git diff --numstat` on a clean committed tree.
+A1 line cap: at most **700 added-plus-deleted lines**, including production, tests, module glue, and handoff, measured by the operator from `9aedf175..<final SHA>` with `git diff --numstat` on a clean committed tree.
 
-Indicative component budget:
-
-| Component | Lines |
+| A1 component | Estimated lines |
 |---|---:|
-| Public vocabulary, accessors, conversions, re-export | 285 |
-| Raw/effective projections and readiness gate | 55 |
-| Scanner seam, compatibility source, pin opener, classifier | 145 |
-| Traversal, wiring, and private reporting helper | 80 |
-| Characterization tests | 190 |
-| Seam, ordering, projection, and classifier tests | 120 |
-| Installed-template handoff | 105 |
-| Total estimate | 980 |
+| Public vocabulary, documentation, accessors, conversions | 330 |
+| Raw and filtered projections plus readiness seam | 50 |
+| Module declaration and fifteen-type re-export | 20 |
+| Projection, conversion, and API-shape tests | 125 |
+| Installed-template handoff | 90 |
+| Contingency | 35 |
+| Total estimate | 650 |
 
-Before editing, produce a component estimate using the literal declarations above.
-If it exceeds the single limit, stop and propose a follow-up split of
-A1 vocabulary/projections from A2 compatibility traversal/characterization. Do not
-compress declarations, binding, tests, evidence, or the handoff to fit. Proceeding
-above the limit requires explicit operator waiver.
+This is the recorded pre-edit estimate. If repository facts make A1 exceed the
+declared cap, stop before implementation and report the changed component estimate.
+Do not compress declarations, tests, evidence, or the handoff to fit. A2 receives a
+separate estimate and task spec before dispatch.
 
-### Handoff and verification
+### A1 handoff and verification
 
 Create
-`docs/superpowers/reviews/2026-08-18-r2f1b-3d-t3a-inc1-sliceA-handoff.md` from the
-installed `~/.claude/handoff-template.md`. Resolve and read that file; do not
-recreate it from memory. Preserve every required template heading.
+`docs/superpowers/reviews/2026-08-18-r2f1b-3d-t3a-inc1-sliceA1-handoff.md`
+from the installed `~/.claude/handoff-template.md`. Resolve and read that file; do
+not recreate it from memory. Preserve every required template heading.
 
 The handoff must state:
 
-- slice A has no behavioral red;
-- the sole red is the non-unit API-shape assertion;
-- root authority is `Unavailable` and `effective()` yields no entries;
-- raw characterization and compiler totality are different evidence claims;
+- this revision deliberately split the prior slice A into A1 and A2;
+- A1 has no behavioral red and changes no production traversal or decision;
+- A1’s pre-change failure is compiler/API-shape evidence;
+- production policy readiness is false;
+- the explicit-ready private predicate is test-only mechanism evidence;
+- `effective()` is snapshot eligibility, not retained action authority;
+- a returned report owns no live scan authority and T3b must re-decide under its own
+  lock;
+- A1 production constructs none of the report values;
+- A2 owns production construction, report return wiring, exact names,
+  characterization, and the concrete mutation audit;
 - which tests the implementer executed and which it did not;
-- every non-Unix lint allowance and Unix-only test;
-- the report return-type compatibility audit;
-- the production mutation-audit call path;
+- the four temporary unconditional constructor dead-code allowances;
+- every non-Unix lint allowance and Unix-only test, recording “none” if there are
+  none;
+- the `sweep.rs` production-body no-change audit;
 - final numstat and clean-tree evidence belong in an external receipt keyed to the
   final SHA because a committed handoff cannot attest its own final commit.
 
@@ -1062,92 +1213,91 @@ every `test result:` line: a `bridge-core` test re-executes a filtered test bina
 and its nested harness output would inflate that sum.
 
 `bridge-core` compiles for Windows in CI while existing worktree areas contain
-Unix-only code and tests. Apply non-Unix dead-code allowances where required, but do
-not claim a green Windows all-target baseline without running one.
+Unix-only code and tests. Do not claim a green Windows all-target baseline without
+running one.
 
 ## Acceptance Criteria
 
-1. The fifteen public types match the normative Rust declarations exactly, including
-   all variants, payloads, private struct fields, derives, accessors, constructors,
-   conversions, and non-exhaustive annotations.
-2. The public path remains `bridge_worktree::sweep::*`; internal module
-   decomposition adds no `bridge-core` surface.
-3. `CustodyRootObservationV1` is public. Scanner-seam types,
-   `RootObservationSetV1`, and root identity captures are crate-private.
-4. `ExactAbsenceSweepEntryV1` retains both `record_path: String` and
-   `enumerated_name: OsString`; its exact-name accessor returns `&OsStr`, and future
-   guards do not reconstruct a name from lossy display text.
-5. `CustodyStateSnapshotV1` exhaustively converts all ten custody states, retains a
-   reason only for `PreservationUnknown`, and retains no predecessor digest or whole
-   record.
-6. `ClaimAuthorityUnavailableV1` has private fields and the declared constructor and
-   accessors. Its object and reason enums are non-exhaustive.
-7. Raw `decision()` exhaustively matches every assessment arm without a wildcard.
-   Its results match the stated projection.
-8. `has_authoritative_scan()` implements every row of its truth table and is
-   documented as scan evidence, not action authority.
-9. `effective()` returns only borrowed effectively authorized entries and exposes no
-   separable effective-decision scalar. Readiness remains false, legacy rows are
-   excluded, and the specified projection tests pass.
-10. The crate-private scanner traits, refusal enums, compatibility pin-opener seam,
-    root-observation declarations, and classifier match their literal declarations.
-11. The classifier compares three complete `(dev, ino, birthtime)` tuples directly;
-    missing or incomplete evidence yields `Unavailable`.
-12. Compatibility open refuses only when `read_dir` fails. The real compatibility
-    source, with only its pin opener deterministically failed, proves that legacy
-    rows remain present, custody rows use the existing not-pinnable refusal, and
-    enumeration completes.
-13. Enumeration/read collection and assessment/logging remain two explicit phases.
-    The event-order test proves both the per-name read ordering and the absence of
-    assessment, probe, or decision events before `finish`.
-14. `skipped_entries` counts only iterator-item failures. Unreadable custody is
-    emitted without incrementing it; malformed legacy remains silently omitted.
-15. `canonicalize_lenient` remains the canonicalization helper, and a merely missing
-    root reports `CannotEnumerate`.
-16. `scan_worktree_records` retains every stated raw-spelling compatibility
-    behavior. `sweep_orphans` explicitly discards the report and leaves its
-    independent action scan unchanged.
-17. The complete characterization matrix exists, including the load-bearing
-    `Preserved` plus valid claim plus vanished target plus `BothAbsent` raw
-    `Authorized` result and malformed-legacy silent omission.
-18. Slice A production constructs only `Legacy`, `UnreadableCustody`, and custody
-    `Assessed` results. Increment-2 arms remain public and test-constructible but
-    dormant in production.
-19. `decide_unused_candidate` retains `recovery_owned` and both `false` call sites.
-    No ownership, custody state, transition, publication, settlement, deletion, or
-    CLI behavior changes.
-20. No `libc`, `fdopendir`, descriptor enumeration, authoritative enumeration-root
-    pinning, or platform-conditional production functionality is added.
-21. The sole base-compatible red is identified as API-shape evidence. No behavioral
-    red is claimed; runtime characterization and compiler totality are reported
-    separately.
-22. The mutation audit is scoped to concrete `HostGitWorktree` production wiring,
-    lists the allowed leaves, and makes no global effect-freedom claim.
-23. The installed-template handoff exists at the required path, preserves the
-    operator-evidence block verbatim, and records execution and platform exclusions
-    honestly.
-24. The pre-edit estimate is recorded beneath the sizing limit. If it is not, work
-    stops before implementation and proposes the specified A1/A2 split.
-25. Final operator totals count test binaries and doc-test suites without
+1. A1 creates `sweep/report.rs` and exposes exactly the fifteen named public types
+   through `bridge_worktree::sweep::*`.
+2. The fifteen public types match the normative Rust declarations, including every
+   variant, payload, private field, derive, visibility, accessor, constructor,
+   conversion, non-exhaustive annotation, and temporary constructor allowance.
+3. `CustodyExactAbsenceAssessmentV1`, `IneligiblePopulationV1`, and
+   `CannotConstructSubjectV1` are non-exhaustive while their increment-2 production
+   arms remain dormant.
+4. Public structs have private fields. `ClaimAuthorityUnavailableV1` has only its
+   declared constructor and read-only accessors.
+5. `ExactAbsenceSweepEntryV1` retains both `record_path: String` and
+   `enumerated_name: OsString`; its exact-name accessor returns `&OsStr`.
+6. `CustodyStateSnapshotV1` exhaustively converts all ten custody states, retains a
+   reason only for `PreservationUnknown`, and retains neither a whole record nor a
+   predecessor digest.
+7. Raw `decision()` explicitly matches every assessment arm without a wildcard and
+   implements the stated raw projection.
+8. `has_authoritative_scan()` implements every row of its table and is documented
+   as historical scan evidence that retains no live authority.
+9. The private parameterized predicate accepts explicit readiness. Its tests
+   exercise both readiness branches, legacy exclusion, raw refusal, scan status,
+   and the positive non-legacy raw-`Authorized` case.
+10. Public `effective()` passes the production readiness constant, returns only
+    borrowed entries, exposes no separable decision scalar, and yields no entries
+    while production readiness is false.
+11. Documentation states the concrete T3b action-time re-decision sequence and
+    forbids treating a report or filtered entry as authority to act.
+12. A1 does not create `checked_scan.rs`, change
+    `sweep_orphans_with_exact_absence`, alter `scan_worktree_records`, or modify any
+    existing sweep decision or action body.
+13. `decide_unused_candidate` retains `recovery_owned`, both production call sites
+    retain `false`, and no ownership, custody, publication, settlement, deletion,
+    or CLI behavior changes.
+14. A1 adds no `bridge-core` surface, `libc`, `fdopendir`, descriptor enumeration,
+    root pinning, Git invocation, filesystem observation, or platform-conditional
+    production functionality.
+15. A1 claims no behavioral red. Compiler/API-shape evidence and projection
+    mechanism tests are reported separately.
+16. The A2 outline fixes every scanner cross-module declaration at
+    `pub(super)`, keeps the concrete session and observation fields private to
+    `checked_scan.rs`, and assigns traversal integration to parent `sweep.rs`.
+17. The A2 outline scopes the single entry-point `canonicalize_lenient` invocation
+    to the supplied exact-scan root while preserving per-record helper calls,
+    ordinary `std::fs::canonicalize` guards, and zero wrapper canonicalization.
+18. The A2 outline requires direct evidence for exact `requested_root` spelling,
+    the expected lenient `canonical_root`, and `None` only on canonicalization
+    refusal.
+19. The A2 mutation audit explicitly names ordinary `std::fs::canonicalize`,
+    target `Path::symlink_metadata`, their call edges, Git observations, and the
+    absence of action edges.
+20. The complete A2 characterization matrix remains intact, including
+    `Preserved` plus valid claim plus vanished target plus `BothAbsent` producing
+    raw `Authorized`, and malformed legacy being silently omitted.
+21. The installed-template A1 handoff exists at the required path, preserves the
+    operator-evidence block verbatim, and records tests, allowances, exclusions,
+    deferred A2 work, and authority limits honestly.
+22. The implementation remains beneath the declared A1 cap. If the estimate no
+    longer fits, work stops before editing.
+23. Final operator totals count test binaries and doc-test suites without
     double-counting nested harness output.
 
 ## Files
 
-- `crates/bridge-worktree/src/sweep.rs` — public re-exports, traversal integration,
-  compatibility/action separation, reporting helper, and integration tests.
+- `crates/bridge-worktree/src/sweep.rs` — add the private `report` module declaration
+  and the literal fifteen-type public re-export; do not change existing function
+  bodies.
 - `crates/bridge-worktree/src/sweep/report.rs` — create; literal public vocabulary,
-  conversions, and projections.
-- `crates/bridge-worktree/src/sweep/checked_scan.rs` — create; private scanner,
-  compatibility source, pin-opener seam, raw observations, and classifier.
+  conversions, projections, testable readiness predicate, and A1 unit tests.
 - `crates/bridge-worktree/src/custody.rs` — read for custody states, reasons, kinds,
-  records, and read refusals; do not modify.
-- `crates/bridge-worktree/src/provider_path.rs` — read for
-  `canonicalize_lenient`, `WorktreeSidecar`, and `read_sidecar`; do not modify.
-- `crates/bridge-worktree/src/host_git.rs` — read for the concrete exact-absence
-  probe and mutation audit; do not modify.
-- `bin/a2a-bridge/src/main.rs` — read for boot-caller compatibility; do not modify.
-- `docs/superpowers/reviews/2026-08-18-r2f1b-3d-t3a-inc1-sliceA-handoff.md` —
-  create from the installed template.
+  and read refusals; do not modify.
+- `crates/bridge-worktree/src/provider_path.rs` — read for A2 factual
+  falsification only; do not modify.
+- `crates/bridge-worktree/src/host_git.rs` — read for A2 factual falsification only;
+  do not modify.
+- `bin/a2a-bridge/src/main.rs` — read for the deferred A2 caller audit only; do not
+  modify.
+- `crates/bridge-worktree/src/sweep/checked_scan.rs` — reserved for A2; do not create
+  or modify in A1.
+- `docs/superpowers/reviews/2026-08-18-r2f1b-3d-t3a-inc1-sliceA1-handoff.md`
+  — create from the installed template.
 
 ## Spec Refs
 
@@ -1161,24 +1311,20 @@ Authoritative at the base commit:
 
 ## Commit Message
 
-feat(worktree): return a typed exact-absence sweep report
+feat(worktree): add exact-absence report vocabulary
 
-The exact-absence sweep returned unit and exposed each decision only through
-tracing. It now returns a typed report containing scan status, exact record identity,
-typed assessments, and an exhaustive raw projection that preserves every current
-decision.
+Introduce the fifteen public exact-absence reporting types, exhaustive raw decision
+projection, custody-state snapshot conversion, and borrowed snapshot-eligibility
+view without changing production traversal or decisions.
 
-The action-facing projection yields only borrowed effectively authorized entries,
-so effective authority cannot be detached as a copyable decision and paired with a
-different row. Policy readiness remains false, and root authority remains
-Unavailable until the later descriptor slice, so slice A yields no effective
-entries.
+Production readiness remains false, while a private parameterized predicate makes
+the future ready branch deterministic to test. Reports retain no live scan
+authority: a future T3b consumer must re-read and re-decide the exact candidate
+under its own action lock.
 
-The compatibility source preserves eager two-phase ordering, malformed-legacy
-omission, and pin-failure behavior. Characterization includes the current
-Preserved-record fail-open: a valid claim, vanished target, and BothAbsent still
-produce raw Authorized. A later increment closes that behavior with genuine
-behavioral-red evidence.
+This is A1 of the split former slice A. A2 will populate the compatibility-backed
+report, preserve eager traversal and characterization behavior, and migrate the
+exact-absence entry point to return it.
 ```
 
 ## Acceptance Criteria
@@ -1187,19 +1333,19 @@ The document you emit must:
 
 1. Begin with `---`, `task-type: implement`, `---`, a `#` title, then
    `## Description`, `## Acceptance Criteria`, `## Files`, `## Spec Refs`,
-   `## Commit Message` — those headings, that order, commit message only under the
-   last.
-2. Resolve blockers 1–4 with concrete mechanisms, not cautions.
-3. Keep all fifteen public types as literal declarations, keep `effective()` as the
-   filtered view, and contain **no** `effective_decision_at`.
-4. Be internally consistent: no surviving reference to anything a folded finding
-   removed, one line cap stated once, counts agreeing everywhere.
-5. Either defend the sizing estimate per component, or take the A1/A2 split and emit
-   A1's spec with A2 in outline — whichever the honest estimate supports.
-6. Keep the falsification license, and prefer symbol names to line-number anchors.
+   `## Commit Message` — those headings, that order.
+2. Correct AC 17 so the `sweep_orphans` guard-root `canonicalize_lenient` call and its
+   early return are explicitly preserved, while `scan_worktree_records` and its
+   enumeration input stay raw.
+3. Complete AC 19's audit inventory with the
+   `registration_absent_from_porcelain → compare_path_identities` branch, its full
+   observation tree, and `PinnedDirectoryV1::open`.
+4. Stay internally consistent: nothing surviving that a folded finding removed, one
+   cap stated once, counts agreeing everywhere.
+5. Keep everything listed as settled above.
 
 ## Spec Refs
 
 Authoritative in this checkout: `crates/bridge-worktree/src/sweep.rs`,
-`crates/bridge-worktree/src/custody.rs`, `crates/bridge-worktree/src/provider_path.rs`,
-`crates/bridge-worktree/src/host_git.rs`, `bin/a2a-bridge/src/main.rs`.
+`crates/bridge-worktree/src/host_git.rs`, `crates/bridge-worktree/src/custody.rs`,
+`crates/bridge-worktree/src/provider_path.rs`, `crates/bridge-core/src/fs_custody.rs`.
