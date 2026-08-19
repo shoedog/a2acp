@@ -35,8 +35,8 @@ estimate before editing, and if it exceeds the 700-line cap, stop and propose a
 split. An agent obeying that would make no edits. Weakened, but not excluded, by the
 absence of any written proposal or handoff.
 
-**Not discriminable from the retained artifacts.** No agent transcript is kept for
-this run. Recording the gap rather than asserting a cause.
+**Not discriminable from the retained artifacts** — and the reason is a bridge gap,
+not bad luck. See "Observability gap" below.
 
 ## Finding
 
@@ -57,3 +57,38 @@ remains the normative record; the dispatch brief is derived from it.
 Cap the dispatched brief, not just the diff it produces. A spec over ~400 lines
 should be treated as a dispatch risk on this lane's evidence, and split or condensed
 before dispatch rather than after a null run.
+
+## Observability gap — the implement agent leaves no transcript
+
+`MEASURED`. Host-side agents do leave transcripts: `~/.codex/sessions/2026/08/18/`
+holds rollouts at 23:04, 23:07 and 23:08, which are the three nodes of the
+spec-review workflow that ran immediately before this dispatch. The implement run
+wrote its brief at 23:09 and left **no rollout at all**.
+
+The cause is structural. Reviewers run host-side, so codex writes its rollout into
+the host `CODEX_HOME`. The implement agent runs `codex-acp` inside a `--rm`
+container whose only `.codex` mount is
+`/Users/wesleyjinks/.config/a2a-creds/codex/auth.json:/root/.codex/auth.json`, so
+`/root/.codex/sessions/*.jsonl` is created inside the container and destroyed with
+it. `git grep` over `bin/a2a-bridge` and `crates/` finds **no** provision that
+mounts, copies out, or otherwise persists it.
+
+Consequence: **a null implement run is currently undiagnosable.** The only survivors
+are the bridge's own artifacts under the clone's `.git/a2a-bridge/`, and on a run
+that produces no turn even the checkpoint is absent.
+
+### The pattern to copy already exists
+
+The same impl agent config deliberately routes the lsp-mcp call log to
+`{cwd}/.git/a2a-bridge/lsp-mcp-calls.log` with the comment that it "lands under the
+clone's `.git/` (survives `--rm`, fetched at hand-off)", and `main.rs` already
+appends per-clone named volumes rather than static ones. The agent's own session
+rollout simply was not given the same treatment.
+
+**Proposed fix:** mount a per-run host path at `/root/.codex/sessions` (or otherwise
+land the rollout under the clone's `.git/a2a-bridge/`) using the existing per-clone
+volume mechanism. Prefer the mount over repointing `CODEX_HOME`, since `CODEX_HOME`
+also anchors the mounted `auth.json`.
+
+This is a bridge defect worth its own slice, independent of T3a. Its absence is why
+the two hypotheses above cannot be separated.
