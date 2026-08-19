@@ -47,8 +47,10 @@ behaviour previous caps punished.
 
 The spec deliberately declares that its only base-compatible red is an API-shape
 assertion and that no behavioral red exists for slice A; that it defines arms
-production never constructs; and that `effective_decision_at` always returns
-`Some(Refused)` in slice A. Those are the contract, not gaps. "Add a behavioral red
+production never constructs; and that **`effective()` yields no entries at all in
+slice A**, because root authority is `Unavailable` and the readiness gate is false.
+Those are the contract, not gaps. There is deliberately **no** scalar
+`effective_decision_at` accessor — do not ask for one back. "Add a behavioral red
 test", "remove the unused arms", or "make the effective decision meaningful now"
 would each undo a re-scope already paid for twice. If you think the shape is wrong,
 say so as a design objection rather than as a spec defect.
@@ -1159,9 +1161,9 @@ A useful review must:
 4. **Check the slice boundary.** Is anything here slice B's work, and is anything B
    needs — particularly the frozen public shapes and the crate-private seam — absent
    or shaped so B would require a breaking API change?
-5. **Verify the frozen public API is sufficient and implementable**: the fourteen
-   types, the privacy split between structs and enum payloads, the `#[non_exhaustive]`
-   payloads, and the `OsString` identity.
+5. **Verify the frozen public API is sufficient and implementable**: the fifteen
+   public types, the privacy split between structs and enum payloads, the
+   `#[non_exhaustive]` payloads, and the `OsString` identity.
 6. **Judge the evidence honestly.** Is the API-shape-only red claim true for slice
    A? Are the seam tests deterministic as specified? Is the mutation audit
    completable with the stated allowed leaves?
