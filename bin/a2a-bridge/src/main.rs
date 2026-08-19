@@ -2872,6 +2872,41 @@ fn apply_warm_lsp(
     volumes.push(format!("{target_vol}:/lsp-target"));
 }
 
+/// Land the in-container agent's own session rollout under the clone so it survives teardown.
+///
+/// The warm implement loop shares ONE container and ONE agent session across the edit turn and every
+/// fix turn, and the container is removed when the run ends. Codex writes its rollout to
+/// `$CODEX_HOME/sessions`, which inside the container is `/root/.codex/sessions` — a path with no
+/// mount behind it, so the entire multi-turn transcript is destroyed with the container. Host-side
+/// agents (the reviewers) are unaffected: they write into the host `CODEX_HOME` and their rollouts
+/// persist. The asymmetry meant a run that ended with `made no changes` left nothing to diagnose from.
+///
+/// This binds the clone's `.git/a2a-bridge/codex-sessions` over that directory, which is the same
+/// trick the lsp MCP call log already uses: write under the clone's `.git/`, survive `--rm`, get
+/// fetched at hand-off. `.git/` specifically, so the capture is invisible to `git status` and cannot
+/// dirty the tree the diff is taken from.
+///
+/// S6 constrains volume DESTINATIONS from nesting under the sandbox `mount`; `/root/.codex/sessions`
+/// is outside it, so this is a legal extra volume. It deliberately does NOT repoint `CODEX_HOME`,
+/// which also anchors the mounted `auth.json`.
+///
+/// Best-effort: if the directory cannot be created the mount is skipped and the run proceeds. Losing
+/// a transcript must never fail a dispatch.
+fn apply_agent_session_capture(volumes: &mut Vec<String>, clone_cwd: &bridge_core::SessionCwd) {
+    let host_dir = std::path::Path::new(clone_cwd.as_str())
+        .join(".git")
+        .join("a2a-bridge")
+        .join("codex-sessions");
+    if std::fs::create_dir_all(&host_dir).is_err() {
+        tracing::warn!(
+            dir = %host_dir.display(),
+            "could not create the agent session capture dir; the container transcript will not persist"
+        );
+        return;
+    }
+    volumes.push(format!("{}:/root/.codex/sessions", host_dir.display()));
+}
+
 /// Give the main write-capable agent process the selected profile's offline dependency environment.
 /// The dependency volume is already mounted read-only by [`apply_warm_lsp`]; this only selects it for
 /// shell commands by wrapping the inner ACP command as `env K=V ... <agent> <args>`. The wrapper is
@@ -2950,6 +2985,7 @@ async fn build_warm_impl(
         repo,
     );
     apply_warm_writer_env(&mut ccfg.cmd, &mut ccfg.args, profile, impl_lsp_cache_vol);
+    apply_agent_session_capture(&mut ccfg.sandbox.volumes, clone_cwd);
     let warm_owner = container_owner(
         owner_config_path,
         ccfg.sandbox.mount.as_str(),
@@ -10129,6 +10165,50 @@ async fn main() -> Result<(), BoxError> {
 mod cli_tests {
     use super::*;
     use crate::turn::TurnRunner;
+
+    /// The warm implement container shares ONE agent session across the edit turn and every fix turn,
+    /// then is removed. Without this mount the rollout lives only at `/root/.codex/sessions` inside
+    /// the container and dies with it, which is why a `made no changes` run left nothing to diagnose.
+    #[test]
+    fn agent_session_capture_binds_the_clone_over_the_container_codex_sessions() {
+        let clone = tempfile::tempdir().unwrap();
+        let cwd = bridge_core::SessionCwd::parse(&clone.path().to_string_lossy()).unwrap();
+        let mut volumes = Vec::new();
+
+        apply_agent_session_capture(&mut volumes, &cwd);
+
+        let spec = volumes
+            .iter()
+            .find(|v| v.ends_with(":/root/.codex/sessions"))
+            .expect("the agent session rollout must be bound out of the container");
+        let host = spec.rsplit_once(':').unwrap().0;
+
+        // Under the clone's .git/, so it survives `--rm`, is fetched at hand-off, and never dirties
+        // the tree the diff is taken from.
+        assert!(
+            std::path::Path::new(host).starts_with(clone.path().join(".git")),
+            "capture dir must live under the clone's .git/, got {host}"
+        );
+        assert!(
+            std::path::Path::new(host).is_dir(),
+            "capture dir must exist before the container starts, or docker creates it root-owned"
+        );
+    }
+
+    /// Losing a transcript must never fail a dispatch.
+    #[test]
+    fn agent_session_capture_is_skipped_when_the_dir_cannot_be_created() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let cwd = bridge_core::SessionCwd::parse(&file.path().to_string_lossy()).unwrap();
+        let mut volumes = Vec::new();
+
+        apply_agent_session_capture(&mut volumes, &cwd);
+
+        assert!(
+            volumes.is_empty(),
+            "an uncreatable capture dir must skip the mount, not panic or emit a broken spec"
+        );
+    }
 
     /// Discriminates a `storage reap` that defaults to a payload class. This command deletes; an
     /// operator who did not name what may reap must get a refusal, not an inference. Asserted BEFORE
