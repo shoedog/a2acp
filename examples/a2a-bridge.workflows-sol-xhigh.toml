@@ -48,6 +48,11 @@ file = "../prompts/design-synth.md"
 description = "design synthesis"
 
 [[prompts]]
+id = "author-artifact"
+file = "../prompts/author-artifact.md"
+description = "author a document verbatim between extraction markers; no design/review framing"
+
+[[prompts]]
 id = "spec-review-rigor"
 file = "../prompts/spec-review-rigor.md"
 description = "spec-review rigor lens"
@@ -110,6 +115,19 @@ id = "synth"
 agent = "codex"
 prompt = "design-synth"
 inputs = ["executability", "structure"]
+
+# author: one node that emits the requested document between extraction markers.
+# Exists because `design` imposes a design-document shape on its output, so asking it
+# for a task spec yields a design doc instead. Single node on purpose — authoring is
+# not a two-lens problem, and a synth step would re-impose a shape.
+[[workflows]]
+id = "author"
+
+[[workflows.nodes]]
+id = "author"
+agent = "codex"
+prompt = "author-artifact"
+inputs = []
 
 # spec-review: rigor (completeness/ambiguity) + soundness (design) -> synth.
 [[workflows]]
