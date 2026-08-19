@@ -1,7 +1,7 @@
 # Handoff — R2f1b 3d T3a: A1 landed, A2 next; bridge observability repaired mid-lane
 
 **Written:** 2026-08-19 · **By:** session_012SUgPvVNbwpuGQKxWtxLgr (Claude Opus 5, 1M) · **Provider:** claude
-**Workspace:** a2a-bridge · agent/r2f1b-pre-slice2-custody-plan · **Measured state:** `[MEASURED]` HEAD `482e9b4a` · Tree CLEAN · Probe `git status --porcelain && git rev-parse HEAD` · Output inline this turn
+**Workspace:** a2a-bridge · agent/r2f1b-pre-slice2-custody-plan · **Measured state:** `[MEASURED]` HEAD `904c89fb` · Tree CLEAN · Probe `git status --porcelain && git rev-parse HEAD` · Output inline this turn
 **Predecessor:** the 2026-08-17 3d handoff (`docs/superpowers/2026-08-17-r2f1b-3d-HANDOFF.md`), superseded for everything below
 **Truth ordering:** measured live state > explicit owner/contract authority within its scope > this handoff for current operational state > earlier handoffs and non-authoritative summaries. A conflict between tiers stays OPEN in §0 — never resolved by document class alone.
 **Provenance:** written live by the worker. `[MEASURED]` claims were probed by this writer; `[INHERITED]` claims were not.
@@ -18,7 +18,7 @@
 
 ## 1. Resume order
 
-1. **A2 spec authoring is the active task.** Author it with sol via the `author` workflow (§5 names the invariant). Ground it in the API that ACTUALLY landed (`crates/bridge-worktree/src/sweep/report.rs` on main), not in the A1 spec's outline of A2 — those can differ.
+1. **A2 spec review is the active task.** v1 is authored and committed (`4234517d`). Round 1 of a declared **2-round cap** is in flight (`spec-review`, sol xhigh, session cwd `.claude/worktrees/fold` now at `c637e493`). When it returns, fold its findings AND the operator findings (`docs/superpowers/reviews/2026-08-19-a2-spec-operator-findings.md`) by dispatching both to sol via `author` — never by hand (§5).
 2. Then A2 implement → host gate → PR, same loop as A1.
 3. The config swap window (worktrees + container writer) is independent and can happen any time — see §4 #2.
 4. The flake fix (§4 #3) is independent and increasingly worth doing.
@@ -38,7 +38,7 @@
 | agent reply surfacing | **LANDED** | PR #61 → `c637e493`; host gate 4,169/0/13 |
 | operator serve | **SWAPPED, RUNNING** | PID 23161, release `ee3b5966ad3b35ef`, binary-only swap, all 5 post-swap checks passed |
 | operator config candidate | **STAGED, NOT APPLIED** | `operator/a2a-bridge.candidate.toml`, SHA `67f3bf01…`; validate pass, doctor 31 ok/1 warn/0 fail |
-| T3a inc1 slice **A2** | **NOT STARTED** | this is the next work |
+| T3a inc1 slice **A2** | **SPEC v1 AUTHORED, REVIEW ROUND 1 IN FLIGHT** | spec `4234517d`, 679 lines, cap 1,650 logical; operator findings `904c89fb`; nine anchors verified against `c637e493` |
 
 ## 3. Corrections to standing documents and memory
 
@@ -53,7 +53,7 @@
 
 | # | Work | State | Exact next action | Blocked by | Identifiers |
 |---:|---|---|---|---|---|
-| 1 | **T3a inc1 slice A2** | not started | Author the spec with sol via the `author` workflow, grounded in the landed `report.rs` API | none | A1 outline in `plans/2026-08-18-r2f1b-3d-t3a-inc1-sliceA-task.md` §"A2 outline" |
+| 1 | **T3a inc1 slice A2** | spec v1 in review | Harvest spec-review round 1; dispatch its findings + the operator findings to sol via `author`; re-extract, re-verify, commit v2 | round 1 in flight | spec `docs/superpowers/plans/2026-08-19-r2f1b-3d-t3a-inc1-sliceA2-task.md`; operator findings `docs/superpowers/reviews/2026-08-19-a2-spec-operator-findings.md` |
 | 2 | Operator config swap | staged | Open a pause window; re-take the drained store backup; apply `a2a-bridge.candidate.toml`; verify; update SERVICE.md + manifest | owner window | manifest §"Staged follow-on" |
 | 3 | `force_next_release_failure_for` flake | open | Fix or quarantine the 3-test group | none | `bin/a2a-bridge/src/compatibility_schedule_state.rs` ~1538/1575/1608 |
 | 4 | Cap rule change (owner-proposed) | agreed, not written | Write into steering: literal byte-for-byte spec lines exempt; count logical LOC for the rest | none | owner turn 2026-08-19 |
@@ -71,14 +71,19 @@
 - **Never mutation-skip a load-bearing test.** This lane has shipped four tests that proved less than they claimed. Revert the fix, confirm the test reds.
 - **Never count test totals by summing `test result:` lines** — a bridge-core test re-executes the binary as a filtered subprocess and inflates the sum by one. Count `Running` binaries + `Doc-tests` suites.
 - **Never stop the operator serve without checking `pane_current_command` first.** Its tmux pane runs the binary directly, so `C-c` ends the session; you then need `tmux new-session`, which may be permission-gated.
+- **Never dispatch an authoring or review run without checking what commit its `--session-cwd` is actually on.** `[MEASURED]` 2026-08-19: `.claude/worktrees/fold` sat at `9aedf175` while the A2 spec was authored against a stated base of `c637e493`; `sweep/report.rs` does not exist at `9aedf175`, so the agent could not have inspected the surface it claimed to inspect (it restated the authoring input, which supplied the same facts). Caught before the review round only because the same probe was run for the reviewer. Local `main` had silently lagged three merges behind `origin/main`. Probe: `git -C <cwd> rev-parse HEAD` and confirm one file the work depends on exists there.
+- **A backgrounded `nohup ... &` reports exit 0 the instant it detaches.** `[MEASURED]` the spec-review task notified "completed (exit code 0)" while PID 95068 was still mid-run with both lenses started. Confirm with `pgrep -fl` and the presence of the `--out` artifact, never the notification.
 - Container `verify: PASS` is not host-green. Run the host gate.
 
 ## 6. Identifiers
 
 | Item | Verbatim |
 |---|---|
-| main | `c637e493544a2e2edd1ca3ae20842a86dcb58f3f` |
-| planning branch | `agent/r2f1b-pre-slice2-custody-plan` = `482e9b4a` (pushed) |
+| main (== origin/main; local ref FF-ed 2026-08-19) | `c637e493544a2e2edd1ca3ae20842a86dcb58f3f` |
+| A2 spec v1 | `4234517d` · `docs/superpowers/plans/2026-08-19-r2f1b-3d-t3a-inc1-sliceA2-task.md` |
+| A2 operator findings | `904c89fb` · `docs/superpowers/reviews/2026-08-19-a2-spec-operator-findings.md` |
+| fold worktree | `.claude/worktrees/fold`, branch `main`, at `c637e493` |
+| planning branch | `agent/r2f1b-pre-slice2-custody-plan` = `904c89fb` |
 | A1 artifact | `feat/r2f1b-3d-t3a-inc1-sliceA1` = `b28c1aef` |
 | operator serve | PID 23161, `:18080`, release `ee3b5966ad3b35ef` |
 | staged config candidate | `operator/a2a-bridge.candidate.toml` SHA `67f3bf0183f9e6db3654fe56dbd6f29f6bb0d58f5c855c76d1190956c11c3d7a` |
