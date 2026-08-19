@@ -44,8 +44,11 @@ Hence: vocabulary and characterization now, behavioral change later.
 - Increment 2 implements the admission table and guards; increment 3 does retained
   authority. **Do not pull their work forward** — but the public shapes they need
   are frozen here so neither needs a breaking API change.
-- No new `bridge-core` surface. No `libc`, no `fdopendir`, no platform gating in
-  slice A — all of that is slice B.
+- No new `bridge-core` surface. No `libc`, no `fdopendir`, and no
+  **platform-conditional production functionality** in slice A — all of that is
+  slice B. This does **not** forbid `#[cfg_attr(not(unix), allow(dead_code))]` lint
+  annotations, nor `#[cfg(unix)]` on tests that are inherently Unix-only; both
+  remain required where they apply.
 
 ## What to build
 
@@ -60,16 +63,36 @@ All in `crates/bridge-worktree/src/sweep.rs`.
 - `scan: ExactAbsenceScanStatusV1`
 - `entries: Vec<ExactAbsenceSweepEntryV1>`
 
-Expose read-only accessors, `is_authoritative()`, and:
+Expose read-only accessors, `is_authoritative()`, and a **bound-pair** effective
+accessor:
 
 ```rust
-pub fn effective_decision_at(
+pub fn is_authoritative(&self) -> bool;
+
+/// Yields each entry together with its effective decision, so a decision can never
+/// be separated from the entry that governs it.
+pub fn effective(
     &self,
-    index: usize,
-) -> Option<UnusedCandidateDecisionV1>;
+) -> impl Iterator<Item = (&ExactAbsenceSweepEntryV1, UnusedCandidateDecisionV1)>;
 ```
 
-The remaining public vocabulary, all of which must exist after slice A:
+**Do not expose an index-keyed `effective_decision_at(index)`.** Filtering or
+reordering entries would let one row's `Authorized` be applied to another. The pair
+must travel together.
+
+`is_authoritative()` truth table — define it exactly, and cover every combination in
+tests:
+
+| enumeration | custody root | `is_authoritative()` |
+|---|---|---|
+| `Complete` | `Pinned` | `true` |
+| `Complete` | `IdentityChanged` or `Unavailable` | `false` |
+| `Incomplete` or `Refused` | any | `false` |
+
+In slice A it is always `false`, because root authority is always `Unavailable`.
+
+**There are fifteen public types**: `ExactAbsenceSweepReportV1` plus the fourteen
+below. All must exist after slice A.
 
 `ExactAbsenceScanStatusV1`, `ExactAbsenceEnumerationV1`, `ExactAbsenceRootRefusalV1`,
 `CustodyRootObservationV1`, `ExactAbsenceSweepEntryV1`,
@@ -82,6 +105,20 @@ The remaining public vocabulary, all of which must exist after slice A:
 read-only accessors. Public *enums* use ordinary public payloads — a public enum's
 variant fields cannot be private, so do not attempt it. `CustodyRecordAssessmentV1`
 provides the private-field evolution point for the custody state/assessment pair.
+
+**Public vs crate-private observation types — these are different things.**
+`CustodyRootObservationV1` is **public**: it is the classified, three-valued result
+(`Pinned` / `IdentityChanged` / `Unavailable`) that appears in the report. The **raw**
+observation types the classifier consumes — `RootObservationSetV1` and the identity
+captures inside it — are **crate-private**. Earlier wording said "all observation
+types stay crate-private"; that was wrong and is corrected here.
+
+**Supply literal Rust declarations for all fifteen public types**, including every
+variant, payload, field, derive, accessor signature, and each `From`/conversion. Do
+not leave any of them to implementer choice: slice B and increment 2 both build on
+this surface, and an incompatible shape here forces a breaking change later. Derive
+at minimum `Debug`, `Clone`, `PartialEq`, `Eq` on the value types so tests can assert
+them directly.
 
 Each public entry retains:
 
@@ -122,14 +159,14 @@ populates it. Do not remove them, `cfg(test)`-gate them, or fake-construct one.
 - Custody `Assessed(d)` ⇒ `d`
 - unreadable, ineligible, and cannot-construct ⇒ `Refused`
 
-`effective_decision_at` is **stricter**:
+The **effective** decision paired with each entry by `effective()` is stricter:
 
 ```text
-out-of-range                                -> None
-enumeration not Complete                    -> Some(Refused)
-custody root not Pinned                     -> Some(Refused)
-Complete + Pinned + Legacy                  -> Some(Refused)
-Complete + Pinned + non-Legacy assessment   -> Some(raw decision)
+enumeration not Complete                    -> Refused
+custody root not Pinned                     -> Refused
+policy not ready (see below)                -> Refused
+Complete + Pinned + ready + Legacy          -> Refused
+Complete + Pinned + ready + non-Legacy      -> the raw decision
 ```
 
 Rationale to carry in doc comments: an incomplete scan may have skipped a
@@ -137,8 +174,18 @@ conflicting sibling record, so it is not future action authority; `Pinned` binds
 enumeration and descriptor-relative custody reads but **not** legacy bytes reopened
 through `read_sidecar`; and raw legacy decisions plus log output stay unchanged.
 
-**In slice A, root authority is always `Unavailable`,** so `effective_decision_at`
-returns `Some(Refused)` for every row. That is correct and must be stated in the
+**Policy-readiness gate — required, and this is a cross-slice safety property.**
+Add a crate-private readiness flag that the effective projection requires and that
+**is `false` in slice A and stays `false` until increment 2's refusing admission
+rule lands**. Without it, the moment slice B can produce `Pinned`, a
+`Complete + Pinned` scan over a `Preserved` record with a vanished target and
+`BothAbsent` would become *effectively* `Authorized` — the exact fail-open increment
+2 exists to close — during the interval between the slices. Document the flag with
+that reason, and add a test asserting the effective decision is `Refused` while it
+is `false` even when the scan is otherwise authoritative.
+
+**In slice A, root authority is always `Unavailable` and the readiness flag is
+`false`,** so the effective decision is `Refused` for every row. That is correct and must be stated in the
 doc comment and the handoff — slice B is what can produce `Pinned`. Note the
 consequence explicitly: **future action code must consume only
 `effective_decision_at`, never the raw `decision()`.**
@@ -183,27 +230,69 @@ Slice A ships **one** implementation: a compatibility source over the existing
 `finish` returns a `RootObservationSetV1` with no observations, which the classifier
 maps to `Unavailable`.
 
+**`open()` refuses ONLY when `read_dir` fails.** Today the code does
+`PinnedDirectoryV1::open(..).ok()` and carries an `Option`: when the pin fails,
+legacy rows still proceed normally and each custody row becomes
+`UnreadableCustody(Unreadable("sweep root is not pinnable"))`. So a pin failure must
+be **retained in session state**, not turned into `CannotEnumerate` — refusing the
+whole open would omit rows and log lines that exist today. `read_custody` returns
+that same refusal per entry when the pin is absent, and `read_legacy` is unaffected.
+Cover this with a test: `read_dir` succeeds, pin fails, legacy rows present, custody
+rows unreadable, enumeration `Complete`.
+
 Provide an **injectable** test source so enumeration outcomes are deterministic. A
 per-item `ReadDir` error is not reliably constructible on ordinary local
 filesystems, so `Incomplete { skipped_entries }` must be tested through injection,
 not by trying to provoke a real fault.
 
-Include the pure classifier now, with slice B's contract, even though slice A can
-only produce `Unavailable`: `Pinned` only when every required observation exists and
-all identities match; `IdentityChanged` when a complete set proves a mismatch;
-`Unavailable` when any required identity is absent or unusable.
+Include the pure classifier now with slice B's full contract, even though slice A
+can only produce `Unavailable`. Define `RootObservationSetV1` (crate-private) as
+**three** optional identity captures, each recorded with its capture point:
+
+1. the **retained enumeration object** — the directory actually enumerated;
+2. the **pinned custody directory** — the object descriptor-relative custody reads
+   went through;
+3. the **final no-follow open of the named root**, taken after enumeration finishes.
+
+Identity comparison uses the repository's required `(dev, ino, birthtime)` tuple.
+Classification, with complete precedence:
+
+| condition | result |
+|---|---|
+| all three captures present **and** all three identities equal | `Pinned` |
+| all three present and any pair differs | `IdentityChanged` |
+| any capture absent, or any identity unusable (e.g. birthtime unavailable) | `Unavailable` |
+
+`Unavailable` takes precedence over `IdentityChanged`: a mismatch cannot be asserted
+from an incomplete set. Two captures are **not** sufficient for `Pinned` — with only
+enumeration and final observations, custody reads could have gone through a
+different object. State in the doc comment that this is the project's fail-closed
+identity model, not a claim of immunity to filesystem object-ID reuse.
+
+In slice A the set is empty, so the classifier yields `Unavailable`; slice B
+populates it.
 
 ### 4. Scan flow, slice A
 
 `sweep_orphans_with_exact_absence`:
 
 1. Retains `requested_root` verbatim.
-2. Canonicalizes once. On failure ⇒ `Refused(CannotCanonicalize)`, root
+2. Canonicalizes once **with `canonicalize_lenient`, the helper the current code
+   uses** — not `std::fs::canonicalize`. Only a `canonicalize_lenient` failure is
+   `Refused(CannotCanonicalize)`; a root that is merely missing must still reach
+   enumeration and yield today's `CannotEnumerate`. On `CannotCanonicalize`: root
    `Unavailable`, no entries.
 3. Opens the compatibility source on the **canonical** root. If enumeration cannot
    start ⇒ `Refused(CannotEnumerate)`, no entries.
-4. Requests one exact `OsString` name at a time and **processes that record fully,
-   emitting its row, before requesting the next name.**
+4. **Two phases, preserving today's ordering exactly.** Today
+   `scan_worktree_records` returns a `Vec` — it enumerates and reads *everything*
+   first, and only then does the caller probe and log. **Phase 1:** drain the
+   session, reading each legacy or custody record, and collect the intermediate rows.
+   **Phase 2:** after enumeration has finished, assess and log each row in order.
+   Do **not** interleave probing with enumeration: probing runs `git worktree list`
+   and target probes, and a streaming order would let those observe filesystem state
+   that today's eager enumeration has already captured. That would be a behavior
+   change in a behavior-preserving slice.
 5. Builds the display path from the canonical root using today's lossy conversion,
    and applies the existing display-based selection predicates.
 6. Reads legacy entries through the existing path-based `read_sidecar`. **`None`
@@ -312,7 +401,11 @@ Seam tests, all deterministic through injection:
   `IdentityChanged`; any missing ⇒ `Unavailable`;
 - iterator incompleteness independent of root classification;
 - each row processed before the next `next_name` call;
-- malformed legacy omission with zero probe and zero log-helper calls;
+- malformed legacy omission with zero probe calls and **no emitted decision
+  event** — production logs through `tracing`, so make the observable concrete:
+  either assert zero matching `tracing` events with a capturing subscriber, or route
+  production's per-row emission through a crate-private reporter seam the test can
+  count. Say which you chose;
 - malformed custody inclusion **without** incrementing `skipped_entries`;
 - exact non-UTF-8 custody-name identity survives the round trip;
 - symlinked-root alias: canonical exact scan versus raw compatibility scan both
@@ -347,8 +440,17 @@ fabricate them, and do not treat that as licence to skip them.
 - **The operator, on the host**: `cargo fmt --all -- --check`; `cargo clippy
   --workspace --all-targets --locked -- -D warnings`; `CARGO_INCREMENTAL=0 cargo
   test --workspace --locked --no-fail-fast`.
-- The handoff carries a **marked operator-evidence section** with a pending
-  placeholder per item. Leave the placeholders; the operator fills them.
+- The handoff carries a **marked operator-evidence section**, using exactly this
+  heading and placeholder form so the operator can find and fill it mechanically:
+
+  ```markdown
+  ## OPERATOR EVIDENCE — PENDING
+  - [ ] `cargo fmt --all -- --check` — PENDING OPERATOR
+  - [ ] `cargo clippy --workspace --all-targets --locked -- -D warnings` — PENDING OPERATOR
+  - [ ] `CARGO_INCREMENTAL=0 cargo test --workspace --locked --no-fail-fast` — PENDING OPERATOR
+  ```
+
+  Leave the checkboxes unticked and the `PENDING OPERATOR` markers in place.
 - **Final numstat and clean-tree status cannot live in the handoff**, because a
   committed handoff cannot attest the state of its own final commit. The operator
   records them in an external receipt keyed to the final SHA. Say so in the handoff
@@ -379,10 +481,16 @@ T3a-decides / T3b-acts split, and the exclusion of ownership.
 
 ## Acceptance Criteria
 
-1. All fourteen public types exist. Public structs have private fields with
-   read-only accessors; public enum variant payloads are ordinary and public.
-2. `ExactAbsenceSweepReportV1` exposes accessors, `is_authoritative()`, and
-   `effective_decision_at`.
+1. All **fifteen** public types exist, each given as a literal Rust declaration
+   with its variants, payloads, fields, derives, accessors and conversions — none
+   left to implementer choice. Public structs have private fields with read-only
+   accessors; public enum variant payloads are ordinary and public.
+1b. `CustodyRootObservationV1` is public; `RootObservationSetV1` and its raw identity
+   captures are crate-private.
+2. `ExactAbsenceSweepReportV1` exposes accessors, `is_authoritative()` implementing
+   the stated truth table, and a **bound-pair** `effective()` iterator. There is **no**
+   index-keyed `effective_decision_at`. Every scan/root combination in the truth
+   table has a test.
 3. Entries retain `record_path: String` **and** `enumerated_name: OsString`, with
    the accessor returning `&OsStr`. No `to_string_lossy()` on the enumerated name.
 4. `CustodyStateSnapshotV1` is `{ kind, preservation_reason }`, its conversion
@@ -391,13 +499,20 @@ T3a-decides / T3b-acts split, and the exclusion of ownership.
 5. `ClaimAuthorityObjectV1` and `ClaimAuthorityUnavailableReasonV1` are
    `#[non_exhaustive]`; `ClaimAuthorityUnavailableV1` has private fields with
    accessors.
-6. `decision()` is exhaustive with no wildcard; `effective_decision_at` implements
-   the stated table, and its doc comment records that slice A always yields
-   `Some(Refused)` because root authority is `Unavailable`, and that action code
-   must use it rather than the raw decision.
+6. `decision()` is exhaustive with no wildcard; the effective projection implements
+   the stated table including the **policy-readiness gate**, which is `false` in
+   slice A and documented as staying `false` until increment 2's admission rule
+   lands. A test asserts the effective decision is `Refused` while the gate is
+   `false` even for an otherwise authoritative scan. Doc comments record that slice A
+   always yields `Refused`, and that action code must use the effective pair rather
+   than the raw decision.
 7. The crate-private seam traits exist with a compatibility implementation and an
-   injectable test implementation; the pure classifier exists with slice B's
-   contract.
+   injectable test implementation. `open()` refuses **only** on `read_dir` failure;
+   a pin failure is retained in session state and reproduces today's per-entry
+   outcomes (legacy rows proceed, custody rows become the "not pinnable" refusal,
+   enumeration `Complete`), with a test. The pure classifier implements the
+   three-capture contract and precedence, `Unavailable` outranking
+   `IdentityChanged`.
 8. **No decision changes.** The characterization matrix above exists with these
    expected values, including the `Preserved` + valid claim + vanished target +
    `BothAbsent` ⇒ **raw `Authorized`** row and the silently-omitted malformed legacy
@@ -406,8 +521,11 @@ T3a-decides / T3b-acts split, and the exclusion of ownership.
    enumerating the raw spelling; a symlinked-root alias test asserts both entry
    points still produce today's paths.
 10. `skipped_entries` counts only iterator-item errors; a decode failure is emitted
-    as an entry and does not increment it; each row is emitted before the next name
-    is requested.
+    as an entry and does not increment it. **Enumeration and assessment stay in two
+    phases** — all rows are enumerated and read before any is assessed or logged,
+    matching today's eager `Vec` ordering. Canonicalization uses
+    `canonicalize_lenient`, and a merely-missing root still yields `CannotEnumerate`,
+    not `CannotCanonicalize`.
 11. `sweep_orphans` discards the report with an explicit `let _ =` and its
     independent action scan is unchanged.
 12. The one API-shape red exists and is labelled as such; no other red is
@@ -418,18 +536,25 @@ T3a-decides / T3b-acts split, and the exclusion of ownership.
 14. Increment-2 arms exist, are documented, and are neither removed,
     `cfg(test)`-gated, nor fake-constructed. No NEW ownership plumbing;
     `decide_unused_candidate` keeps `recovery_owned` and its two `false` call sites.
-15. No `libc`, `fdopendir`, descriptor enumeration, root pinning, or platform gating
-    — all slice B. No new `bridge-core` surface. No custody state, transition,
-    publication, settlement, deletion, or CLI behavior change.
+15. No `libc`, `fdopendir`, descriptor enumeration, root pinning, or
+    platform-conditional **production functionality** — all slice B. Lint-only
+    `cfg_attr` annotations and inherently Unix-only tests remain permitted. No new
+    `bridge-core` surface. No custody state, transition, publication, settlement,
+    deletion, or CLI behavior change.
 16. The handoff is created from the installed template at
     `~/.claude/handoff-template.md` (resolve it; do not recreate it from memory) at
-    `docs/superpowers/reviews/2026-08-18-r2f1b-3d-t3a-inc1-sliceA-handoff.md`, with
-    the marked operator-evidence section, and states plainly that slice A has no
-    behavioral red and why.
-17. Target **at most 600 changed lines** including tests and handoff, measured by
-    the operator on a clean committed tree. If your pre-edit estimate exceeds it,
-    **say so before implementing** and propose the split — do not compress evidence,
-    binding, or handoff work to fit. A breach requires an explicit operator waiver.
+    `docs/superpowers/reviews/2026-08-18-r2f1b-3d-t3a-inc1-sliceA-handoff.md`, carries
+    the `## OPERATOR EVIDENCE — PENDING` block verbatim with its markers intact, and
+    states plainly that slice A has no behavioral red and why.
+17. Target **at most 700 changed lines** including tests and handoff, measured by
+    the operator on a clean committed tree. Indicative per-component budget:
+    ~230 the fifteen public types with derives and accessors; ~60 projections and the
+    readiness gate; ~90 the seam traits, compatibility source and classifier; ~40
+    traversal and `sweep_orphans` wiring; ~180 characterization; ~60 seam tests; ~100
+    handoff (the installed template is roughly that size before content). **Do a
+    pre-edit estimate and stop before implementing if it exceeds the cap**, proposing
+    the split — never compress evidence, binding, or handoff work to fit. A breach
+    requires an explicit operator waiver.
 18. Report test totals as the count of test binaries plus doc-test suites, not by
     summing `test result:` lines — a bridge-core test re-executes the test binary as
     a filtered subprocess and its nested harness line inflates a naive sum.
