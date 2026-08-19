@@ -18,6 +18,16 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::process::Command;
 
+mod report;
+
+pub use report::{
+    CannotConstructSubjectV1, ClaimAuthorityObjectV1, ClaimAuthorityUnavailableReasonV1,
+    ClaimAuthorityUnavailableV1, CustodyExactAbsenceAssessmentV1, CustodyRecordAssessmentV1,
+    CustodyRootObservationV1, CustodyStateSnapshotV1, ExactAbsenceEnumerationV1,
+    ExactAbsenceRecordAssessmentV1, ExactAbsenceRootRefusalV1, ExactAbsenceScanStatusV1,
+    ExactAbsenceSweepEntryV1, ExactAbsenceSweepReportV1, IneligiblePopulationV1,
+};
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ExactAbsenceCandidateV1 {
     pub canonical_source: String,
