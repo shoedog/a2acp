@@ -10,32 +10,33 @@ Review the implementation task spec reproduced verbatim below, before dispatch.
 Approve it or send it back. The session cwd is checked out at `main` = `9aedf175`,
 the base it targets, and the repository is authoritative.
 
-### Provenance — sol authored this, and it took the split
+### Provenance — revision 4, authored by sol
 
-Round 3 on sol's first authored revision returned 5 blockers / 10 findings, against
-7/12 for the operator's earlier hand-folded version. **Two of those five were defects
-in this review wrapper, not in the spec** — stale operator text demanding an accessor
-sol had correctly removed, and a wrong type count. Both were fixed in the wrapper and
-deliberately **not** sent to sol, because folding them would have made it reintroduce
-the removed API.
+Round 4 adjudicated every round-3 fix as **FIXED** — removed-accessor demand,
+fifteen-type count, authority-lifetime naming, readiness-seam testability, module
+visibility — and disputed **no characterization-matrix row**. Eight findings, only two
+gating, and both were in the **A2 outline** rather than A1. A1 itself drew no blocking
+finding.
 
-Sol folded the remaining eight findings and, invited to take the split rather than
-defend a cap it did not believe, **took it**. This document specifies **A1 only** —
-the public reporting vocabulary and snapshot projections — with A2 (compatibility
-scanner seam, traversal, characterization) in outline.
+Sol folded all eight. The two gating corrections, both operator-verified against the
+code before dispatch and again after extraction:
 
-A1 is now narrower than anything reviewed before it: it adds a private `sweep/report.rs`
-module and re-exports, and **changes no existing function body**. Production does not
-construct the new report types until A2.
+- **AC 17** no longer says "zero wrapper canonicalization". `sweep_orphans` calls
+  `canonicalize_lenient(root)` into `root_cwd` and returns early on failure; that guard
+  and its early return are now explicitly preserved, while only `scan_worktree_records`
+  and its enumeration input stay raw.
+- **AC 19**'s audit inventory now includes the
+  `registration_absent_from_porcelain → compare_path_identities` branch with its full
+  observation tree, plus `PinnedDirectoryV1::open`.
 
-Operator-verified on the extracted document: zero references to the removed
-`effective_decision_at`; "fifteen public types" stated consistently; fifteen literal
-declarations across five Rust blocks; one cap (700 lines) stated once. The four
-round-3 blockers were resolved with mechanisms rather than cautions —
-`has_authoritative_scan()` replaces the authority-sounding name and documents that
-`finish` drops the session so the report holds only values; a parameterized readiness
-predicate makes the ready path testable while production stays `false`; and module
-placement and visibility are specified explicitly.
+Operator-verified on the extracted document: one cap stated once (700 lines); the only
+mention of `effective_decision_at` is a prohibition against adding one, not a
+reintroduction; the guard-root rule and the audit branch are present.
+
+**This is the fifth review of this document's lineage.** Earlier rounds went 5 → 7 → 5
+→ 2 gating, the 7 being the one the operator hand-folded. Weigh accordingly: findings
+that merely restate a settled decision cost more than they are worth now. If A1 is
+sound, say so.
 
 ### What must not be undone
 
@@ -61,8 +62,8 @@ Base: `main` = `9aedf175`.
 This revision takes the A1/A2 split because the prior combined estimate was not
 credible beneath its cap. This document specifies **A1 only**. A1 lands the complete
 public reporting vocabulary, raw and filtered snapshot projections, the testable
-policy-readiness predicate, module re-exports, projection tests, and its handoff.
-It does not change traversal or the return type of
+policy-readiness predicate, module re-exports, projection tests, external public-API
+compile evidence, and its handoff. It does not change traversal or the return type of
 `sweep_orphans_with_exact_absence`.
 
 A2 is specified in outline below. A2 will add the compatibility scanner seam,
@@ -80,6 +81,9 @@ construct the new report types until A2.
 
 - T3a decides; T3b acts. T3a reports snapshot decisions and never conveys durable
   action authority.
+- In this document, “snapshot” means an owned projection of values observed during
+  an ordered scan-and-assessment sequence. It does not mean one coherent,
+  simultaneous point-in-time filesystem snapshot.
 - A returned report retains no open directory, descriptor, lock, lease, or opaque
   authority token. Once the scan session is consumed by `finish`, even a stored
   `CustodyRootObservationV1::Pinned` value is only historical evidence about that
@@ -87,6 +91,12 @@ construct the new report types until A2.
 - `effective()` is a filtered **snapshot-eligibility** view. It is not action
   authority. T3b must re-read and re-decide the yielded candidate under T3b’s own
   action lock before any effect.
+- Borrowed entries provide ergonomic coupling between a row, its exact enumerated
+  name, and its assessment. They do not type-enforce inseparability: entries are
+  cloneable, names can be copied, and raw decisions are copyable. The safety
+  boundary is the absence of retained live authority and the mandatory T3b
+  action-time re-decision.
+- Add no `effective_decision_at` accessor or other public effective-decision scalar.
 - Add no NEW ownership input, variant, or plumbing. `decide_unused_candidate` keeps
   `recovery_owned: bool`, and both production call sites continue to pass `false`.
 - Increment 2 installs population admission and construction guards. Increment 3
@@ -102,8 +112,9 @@ construct the new report types until A2.
   `scan_worktree_records`, change `sweep_orphans_with_exact_absence`, or modify
   `sweep_orphans`.
 - A2 must preserve today’s eager two-phase behavior, compatibility pin-failure
-  semantics, raw-spelling action scan, malformed-legacy omission, and exact
-  characterization matrix.
+  semantics, the `sweep_orphans` guard-root canonicalization and early return,
+  raw-spelling action scan, malformed-legacy omission, and exact characterization
+  matrix.
 - `#[cfg_attr(not(unix), allow(dead_code))]` remains permitted where a later private
   scanner seam is necessarily unused on non-Unix, and `#[cfg(unix)]` remains
   permitted for inherently Unix-only tests.
@@ -117,6 +128,9 @@ A1 uses the existing public path `bridge_worktree::sweep::*`:
   readiness predicate, and unit tests.
 - `sweep.rs` declares the private `report` module and re-exports exactly the fifteen
   public types. No existing function body changes in A1.
+- `tests/r2f1b_exact_absence_report_api.rs` is an external integration-test crate
+  that imports all fifteen names through `bridge_worktree::sweep::*` and therefore
+  fails to compile if any promised re-export is absent or private.
 - `sweep/checked_scan.rs` is reserved for A2 and must not be created in A1.
 
 Add this module declaration and re-export list in `sweep.rs`:
@@ -225,9 +239,11 @@ impl ExactAbsenceSweepReportV1 {
     /// Yields entries that satisfy the report's snapshot-eligibility filter.
     /// Refused and legacy entries are absent.
     ///
-    /// This deliberately returns borrowed entries rather than `(entry, decision)`
-    /// tuples or copyable effective-decision values. The exact enumerated name and
-    /// its snapshot decision therefore remain one object.
+    /// Borrowing keeps the entry, its exact enumerated name, and its assessment
+    /// ergonomically coupled for ordinary callers. It does not type-enforce
+    /// inseparability: the entry is cloneable, its name can be copied, and its raw
+    /// decision is copyable. This API deliberately adds no separate effective-
+    /// decision scalar.
     ///
     /// The scan session has ended before this iterator can be consumed. A yielded
     /// entry is input to a future T3b action-time re-decision, not authority to act.
@@ -604,16 +620,28 @@ Production `effective()` passes `EXACT_ABSENCE_POLICY_READY_V1`. Unit tests in
 and `true` values. This makes the ready path testable without changing production
 readiness.
 
-`effective()` returns borrowed entries and exposes no separable effective-decision
-scalar. Its positive result means only that an entry satisfied the report’s
-snapshot filter. T3b may use the yielded `enumerated_name()` as candidate input, but
-must perform this action-time sequence under its own lock:
+`effective()` returns borrowed entries and adds no separate effective-decision
+scalar. That borrowing is an ergonomic projection, not the safety boundary: callers
+can clone an entry, copy its name, and copy its raw decision. A positive filter
+result means only that an entry satisfied the report’s ordered historical
+snapshot-eligibility conditions.
+
+A2 calls `finish` before phase-2 assessment. Consequently,
+`Complete + Pinned + Authorized` combines root evidence captured by the completed
+scan with a decision assessed later; it is historical sequence evidence, not one
+coherent point-in-time snapshot. A2 makes no stronger claim. A design that wanted
+coherent snapshot eligibility would have to bracket phase 2 with another final
+root-identity check. This slice instead relies on the stronger settled boundary:
+T3b independently re-establishes authority and re-decides immediately before acting.
+
+T3b may use a yielded `enumerated_name()` as candidate input, but must perform this
+action-time sequence under its own lock:
 
 1. Re-open the selected sweep root and establish its current object identity.
 2. Re-read the exact record named by `enumerated_name()` without reconstructing the
    name from `record_path()`.
-3. Re-establish record/sibling placement and source, root, worktree, common-directory,
-   and source/common-directory binding evidence.
+3. Re-establish record/sibling placement and source, root, worktree,
+   common-directory, and source/common-directory binding evidence.
 4. Apply the current population-admission rule.
 5. Repeat the exact-absence observation against the current target and Git
    registration.
@@ -647,8 +675,54 @@ must cover:
   complete, pinned, non-legacy raw-`Authorized` entry;
 - the private predicate excluding legacy and raw-`Refused` rows even with explicit
   true readiness;
-- a yielded test entry remaining the same borrowed object containing its
+- the borrowed-entry seam unambiguously: construct a report with distinguishable
+  entries, filter `report.entries().iter()` by calling
+  `entry_is_effectively_authorized_for_policy(entry, true)`, take the positive row,
+  assert `std::ptr::eq` against the corresponding element of `report.entries()`,
+  and assert that same borrowed object carries the expected
   `enumerated_name()`.
+
+Create `crates/bridge-worktree/tests/r2f1b_exact_absence_report_api.rs` with this
+external-path compile assertion:
+
+```rust
+use bridge_worktree::sweep::{
+    CannotConstructSubjectV1, ClaimAuthorityObjectV1,
+    ClaimAuthorityUnavailableReasonV1, ClaimAuthorityUnavailableV1,
+    CustodyExactAbsenceAssessmentV1, CustodyRecordAssessmentV1,
+    CustodyRootObservationV1, CustodyStateSnapshotV1,
+    ExactAbsenceEnumerationV1, ExactAbsenceRecordAssessmentV1,
+    ExactAbsenceRootRefusalV1, ExactAbsenceScanStatusV1,
+    ExactAbsenceSweepEntryV1, ExactAbsenceSweepReportV1,
+    IneligiblePopulationV1,
+};
+
+fn assert_public<T>() {}
+
+#[test]
+fn exact_absence_report_vocabulary_is_public() {
+    assert_public::<CannotConstructSubjectV1>();
+    assert_public::<ClaimAuthorityObjectV1>();
+    assert_public::<ClaimAuthorityUnavailableReasonV1>();
+    assert_public::<ClaimAuthorityUnavailableV1>();
+    assert_public::<CustodyExactAbsenceAssessmentV1>();
+    assert_public::<CustodyRecordAssessmentV1>();
+    assert_public::<CustodyRootObservationV1>();
+    assert_public::<CustodyStateSnapshotV1>();
+    assert_public::<ExactAbsenceEnumerationV1>();
+    assert_public::<ExactAbsenceRecordAssessmentV1>();
+    assert_public::<ExactAbsenceRootRefusalV1>();
+    assert_public::<ExactAbsenceScanStatusV1>();
+    assert_public::<ExactAbsenceSweepEntryV1>();
+    assert_public::<ExactAbsenceSweepReportV1>();
+    assert_public::<IneligiblePopulationV1>();
+}
+```
+
+Because this integration test is compiled as an external crate, it cannot succeed
+through private `report` visibility. It is the public re-export check; the unit tests
+inside `report.rs` remain responsible for private construction seams and projection
+behavior.
 
 A1 has no behavioral red. Its pre-change failure is compiler/API-shape evidence:
 the fifteen public types, module, methods, and re-exports do not exist at the base.
@@ -817,10 +891,18 @@ A2’s compatibility source returns `RootObservationSetV1::default()`, so produc
 classification remains `Unavailable`. Slice B replaces the source and populates
 the three captures.
 
-#### A2 compatibility source and deterministic pin-failure evidence
+#### A2 compatibility source, shared policy, and deterministic pin-failure evidence
 
 Implement `CompatibilityCheckedScanSourceV1<P>` over the current
 `std::fs::read_dir`, parameterized only by `P: CompatibilityPinOpenerV1`.
+
+Do not introduce a second independent selection or read-policy vocabulary. Extract
+one private display-path classifier for legacy, custody, or ignored entries and use
+it from both `scan_worktree_records` and the compatibility report traversal. Both
+paths must continue to use the existing production `read_sidecar`,
+`is_custody_record_name`, and `read_custody_record_in` machinery. Their wrappers may
+differ only where this outline explicitly requires a distinct accumulation or
+status projection.
 
 Its open sequence is exact:
 
@@ -850,6 +932,24 @@ must prove:
 Only pin creation is replaced. The test must not replace the compatibility source,
 session, enumeration, selection, reads, or finish behavior.
 
+Add a same-root conformance matrix using one real readable directory and the same
+root spelling for `scan_worktree_records` and the compatibility source:
+
+| Fixture | Required conformance |
+|---|---|
+| Valid matching legacy sidecar | both select it and read the same sidecar |
+| Malformed or unreadable legacy sidecar | both omit it |
+| Valid custody record | both select it and decode the same record |
+| Unreadable, malformed, over-bound, symlinked, directory-shaped, or multiply-linked custody entry | both retain a custody row with the same refusal classification |
+| Unrelated filename | both omit it |
+| Pin failure with valid legacy and custody names | both preserve the legacy row and retain the custody row with the exact not-pinnable refusal |
+
+Iterator-item status remains an intentional projection difference:
+`scan_worktree_records` flattens item errors, while the report records
+`Incomplete { skipped_entries }`. Test that distinction separately. The same-root
+matrix must not replace the separate canonical-exact-root versus raw-action-root
+test.
+
 #### A2 scan flow and root-spelling evidence
 
 A2 changes the signature to:
@@ -868,9 +968,9 @@ Its behavior is:
 2. At the exact-absence entry point, invoke the existing
    `canonicalize_lenient(root)` exactly once for the supplied sweep root.
    This count applies only to that entry-point root conversion. It does not include
-   the existing per-record `worktree_under_root` calls, the
-   `std::fs::canonicalize` calls in sibling guards, or the internal ancestor loop
-   inside `canonicalize_lenient`.
+   the existing `sweep_orphans` guard-root conversion, per-record
+   `worktree_under_root` calls, the `std::fs::canonicalize` calls in sibling guards,
+   or the internal ancestor loop inside `canonicalize_lenient`.
 3. Do not substitute a direct `std::fs::canonicalize` call for the entry-point
    helper.
 4. On lenient-canonicalization failure, return `canonical_root: None`,
@@ -879,7 +979,7 @@ Its behavior is:
 6. On source-open failure, return the canonical root,
    `Refused(CannotEnumerate)`, root `Unavailable`, and no entries.
 7. Phase 1 drains `next_name`. For every successful yielded name, construct the
-   current lossy display path, apply existing display-based selection predicates,
+   current lossy display path, apply the shared display-path classifier,
    immediately perform the applicable legacy or custody read, and collect an
    intermediate row before requesting the next name.
 8. Count only `next_name` item errors in `skipped_entries`. A malformed or otherwise
@@ -902,28 +1002,44 @@ Ordering tests must independently prove:
 - no assessment, probe call, or decision event occurs until `next_name` has returned
   `None` and `finish` has completed.
 
+Because `finish` precedes phase-2 assessment, the resulting root observation and
+later row decision are ordered historical evidence. A2 must not describe them as
+one coherent point-in-time snapshot or as retained authority.
+
 Legacy `read_sidecar` returns `None` on either read or JSON failure at the base.
 Preserve that as silent omission: no public entry, probe call, or decision event.
 
-A missing root is not a lenient-canonicalization failure. The helper canonicalizes
-the nearest existing ancestor and appends the missing tail, so a missing root
-reaches source open and reports `CannotEnumerate`.
+Missing-root behavior is input-shape dependent:
+
+- An absolute missing path beneath an existing ancestor is accepted by
+  `canonicalize_lenient`, which canonicalizes that ancestor and appends the missing
+  tail. It reaches source open and reports `CannotEnumerate`.
+- A missing relative input such as `new-root` can fail while the helper attempts to
+  resolve its empty parent. That case reports `CannotCanonicalize` with
+  `canonical_root: None`.
 
 Add a direct non-canonical-root test that supplies a deliberately non-canonical
-string spelling and asserts all three public semantics:
+string spelling and asserts:
 
-- `requested_root().as_bytes()` equals the supplied string’s bytes exactly;
-- `canonical_root()` equals the precise expected lenient canonical value; and
-- `canonical_root()` is `None` only in the separate canonicalization-refusal case,
-  not for a merely missing root.
+- `requested_root().as_bytes()` equals the supplied string’s bytes exactly; and
+- `canonical_root()` equals the precise expected lenient canonical value.
+
+Add separate missing-root tests that assert:
+
+- an absolute missing path below an existing ancestor retains the expected lenient
+  canonical value and reports `CannotEnumerate`; and
+- an absent relative leaf whose empty parent cannot be resolved has
+  `canonical_root() == None` and reports `CannotCanonicalize`.
 
 #### A2 compatibility/action scan separation
 
-`scan_worktree_records(root)` retains every existing observable and invokes no
-root canonicalization helper:
+`scan_worktree_records(root)` retains every existing observable and performs no
+root canonicalization of its enumeration input:
 
-- it enumerates the caller’s raw spelling;
+- it passes the caller’s raw spelling directly to `std::fs::read_dir`;
 - `read_dir` failure returns an empty vector;
+- after successful `read_dir`, it calls `PinnedDirectoryV1::open` on that same raw
+  root for custody reads;
 - pin failure does not prevent legacy reads;
 - display selection and legacy reads use the current lossy full path;
 - custody reads use the exact `DirEntry::file_name()`;
@@ -931,20 +1047,36 @@ root canonicalization helper:
 - the return type remains `Vec<(String, ScannedWorktreeRecordV1)>`.
 
 The exact-absence entry point enumerates its canonical root. The compatibility/action
-wrapper enumerates the caller’s raw spelling and must not call
-`canonicalize_lenient` itself. A symlinked-root alias test asserts both entry points
-retain those distinct path behaviors.
-
-`sweep_orphans` explicitly discards the report:
+wrapper must preserve its separate guard-root canonicalization while keeping the
+action scan raw. Its sequence remains:
 
 ```rust
 let _ = sweep_orphans_with_exact_absence(
     root,
     &crate::host_git::HostGitWorktree::new(),
 );
+let Ok(root_cwd) = canonicalize_lenient(root) else {
+    tracing::warn!(root, "skipping worktree sweep with non-canonical root");
+    return;
+};
+for (path, scanned) in scan_worktree_records(root) {
+    // Existing compatibility/action handling remains unchanged.
+}
 ```
 
-It then performs its existing independent compatibility/action scan unchanged.
+The `canonicalize_lenient(root)` result remains the guard and supplies `root_cwd` to
+the existing compatibility decisions. Its warning and early return must remain
+exactly protective. It must not become the enumeration argument:
+`scan_worktree_records` continues to receive the raw `root`.
+
+A symlinked-root alias test asserts all three distinct facts:
+
+- the exact-absence entry point enumerates the canonical root;
+- `sweep_orphans` still performs its guard-root canonicalization and would return
+  early if that guard failed; and
+- after the guard succeeds, the compatibility/action scan enumerates the raw alias
+  spelling rather than `root_cwd`.
+
 `WorktreeRunEndGuard`, custody locking, recovery classification, and deletion paths
 continue to consume only the compatibility result.
 
@@ -1002,8 +1134,10 @@ injected-open, or decode failures.
 
 A2’s deterministic tests additionally cover:
 
-- lenient canonicalization refusal;
-- missing root reaching `CannotEnumerate`;
+- lenient canonicalization refusal, including an absent relative leaf whose empty
+  parent cannot be resolved;
+- an absolute missing root beneath an existing ancestor reaching
+  `CannotEnumerate`;
 - source-open refusal making zero custody-pin calls;
 - complete enumeration;
 - injected `Ok, Err, Ok, Err` producing
@@ -1017,12 +1151,15 @@ A2’s deterministic tests additionally cover:
 - iterator incompleteness remaining independent of root classification;
 - real compatibility pin failure preserving legacy rows and emitting custody rows
   as not-pinnable;
+- the same-root compatibility/action conformance matrix;
 - malformed legacy omission causing zero probe calls and decision events;
 - malformed custody inclusion not incrementing `skipped_entries`;
 - exact non-UTF-8 custody-name identity surviving from enumeration into
   `enumerated_name()`;
-- canonical exact-scan paths versus raw compatibility-scan paths;
-- exact requested-root spelling and canonical-root values;
+- canonical exact-scan paths versus raw compatibility-scan paths while preserving
+  the wrapper guard-root canonicalization;
+- exact requested-root spelling and canonical-root values for non-canonical,
+  absolute-missing, and relative-refusal inputs;
 - every scan/root combination in the historical scan-evidence table.
 
 For decision-event observation, route production’s existing per-row tracing call
@@ -1032,31 +1169,72 @@ level, or message.
 
 #### A2 mutation audit
 
-Audit only the concrete production route through
+Audit only the concrete report-production route through
 `HostGitWorktree::observe_exact_absence`. A downstream implementation of the public
-`ExactAbsenceProbeV1` can perform arbitrary effects and is outside this proof.
+`ExactAbsenceProbeV1` can perform arbitrary effects and is outside this proof. The
+independent compatibility/action handling that follows the discarded report in
+`sweep_orphans` is also outside the report-traversal no-action proof; its existing
+effects remain separately guarded.
 
-The allowed concrete observations and effects are:
+The normative inventory of concrete observations and effects is:
 
-- the exact-absence entry-point call to `canonicalize_lenient`, including its
-  internal `std::fs::canonicalize` calls while finding the nearest existing
-  ancestor;
-- `std::fs::read_dir` traversal;
-- existing unbounded legacy `std::fs::read` through `read_sidecar`;
-- bounded descriptor-relative custody reads and canonical decoding;
-- per-record `worktree_under_root` calls to `canonicalize_lenient`;
-- the ordinary `std::fs::canonicalize` calls in legacy and custody
-  record/sibling-placement guards;
+- The exact-absence entry-point call to `canonicalize_lenient`, including its
+  repeated `std::fs::canonicalize` observations while finding the nearest existing
+  ancestor.
+- Compatibility enumeration through `std::fs::read_dir`, including iterator item
+  reads.
+- The scanner’s post-`read_dir` `PinnedDirectoryV1::open` observation tree:
+  `Path::canonicalize`; the first `directory_path_identity` call using
+  `std::fs::symlink_metadata`; read-only no-follow directory open
+  (`O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC` on Unix); descriptor `File::metadata`
+  through `directory_identity`; the second `directory_path_identity` call using
+  `std::fs::symlink_metadata`; and comparison of the before, descriptor, and after
+  identities. This branch opens and observes; it does not call a sync or mutation
+  method.
+- Existing unbounded legacy `std::fs::read` through `read_sidecar`.
+- Descriptor-relative custody open and bounded reads through
+  `read_custody_record_in`, including file metadata, link-count and length
+  observation, bounded byte reading, and canonical decoding.
+- Per-record `worktree_under_root` calls to `canonicalize_lenient`.
+- The ordinary `std::fs::canonicalize` calls in legacy and custody
+  record/sibling-placement guards.
 - `ExactAbsenceCandidateV1::from_legacy` and `from_claim` flowing through
-  `capture_directory_identity`, including `std::fs::canonicalize`,
-  `verify_payload_directory_identity`, and metadata observation;
-- `source_common_dir_identity` invoking `git rev-parse --git-common-dir`;
+  `capture_directory_identity`: absolute-path checks,
+  `std::fs::canonicalize`, `verify_payload_directory_identity`,
+  `std::fs::symlink_metadata`, its second `std::fs::canonicalize` self-resolution
+  check, and metadata-derived directory identity.
+- `source_common_dir_identity` invoking
+  `git -C <source> rev-parse --path-format=absolute --git-common-dir`, followed by
+  the same `capture_directory_identity` observation tree for the returned common
+  directory.
 - `HostGitWorktree::observe_exact_absence` revalidating source and common-directory
-  identity;
-- both target checks through `Path::symlink_metadata`, before and after the Git
-  registration probe;
-- `git worktree list --porcelain -z`;
-- allocation, collection, and tracing.
+  identity before and after the registration probe, including the same
+  canonicalization, symlink-metadata, metadata, and Git common-directory
+  observations.
+- Both target checks through `Path::symlink_metadata`, before and after the Git
+  registration probe.
+- The synchronous `git worktree list --porcelain -z` registration observation.
+- For each non-byte-identical porcelain registration path,
+  `registration_absent_from_porcelain → compare_path_identities →
+  compare_path_identities_with_resolver`.
+- The comparator’s initial and final stability-bracket calls to
+  `deepest_existing_path` for both the porcelain path and candidate target. Each
+  resolver walk performs `std::fs::metadata` on successive ancestors; on
+  `NotFound`, `std::fs::symlink_metadata` distinguishes a genuinely missing
+  component from another unresolved object; at the deepest existing ancestor it
+  captures object identity, calls `std::fs::canonicalize`, calls
+  `std::fs::metadata` on the canonical result, and verifies that the canonical
+  object identity matches. The final pair of resolver calls repeats the complete
+  snapshots before a computed verdict is retained; drift yields `CannotProve`.
+- When missing tails differ only by ASCII case and therefore require the case-mode
+  branch, `case_sensitive_at` calls `std::fs::read_dir` on the resolved ancestor
+  and examines at most 64 entries. For each attempted sample it calls
+  `std::fs::symlink_metadata` on the enumerated entry, probes the alternate-case
+  name with `std::fs::symlink_metadata`, and rechecks the original sampled name
+  with `std::fs::symlink_metadata` before accepting either an existing-alternate
+  or `NotFound` answer. Pure tail comparison and ASCII-case transformation add no
+  filesystem effect.
+- Allocation, collection, subprocess execution, and tracing.
 
 Record symbol-to-symbol call-path evidence showing no application edge from the
 report traversal to provider remove or prune, `remove_worktree`,
@@ -1074,9 +1252,12 @@ Every symbol, caller count, matrix row, and behavioral statement in this task is
 operator claim measured against `9aedf175`; the checked-out repository is
 authoritative. If a symbol is absent, `read_sidecar` does not silently omit, the two
 entry points do not enumerate different root spellings, the state decoder admits a
-different population, a listed call edge differs, or any matrix result is wrong,
-record the exact source evidence and stop rather than forcing the implementation to
-match this task.
+different population, the `sweep_orphans` guard-root canonicalization or early
+return differs, `registration_absent_from_porcelain` does not reach the stated
+path-identity observation tree, `PinnedDirectoryV1::open` differs from the stated
+observation tree, a listed call edge differs, or any matrix result is wrong, record
+the exact source evidence and stop rather than forcing the implementation to match
+this task.
 
 Finding the work smaller than described is a good outcome. The A1/A2 split,
 T3a-decides/T3b-acts boundary, action-time T3b re-decision, and exclusion of new
@@ -1084,16 +1265,18 @@ ownership plumbing remain settled even if another factual anchor is disproved.
 
 ### A1 sizing and mandatory stop
 
-A1 line cap: at most **700 added-plus-deleted lines**, including production, tests, module glue, and handoff, measured by the operator from `9aedf175..<final SHA>` with `git diff --numstat` on a clean committed tree.
+A1 line cap: at most **700 added-plus-deleted lines**, including production, tests,
+module glue, and handoff, measured by the operator from
+`9aedf175..<final SHA>` with `git diff --numstat` on a clean committed tree.
 
 | A1 component | Estimated lines |
 |---|---:|
 | Public vocabulary, documentation, accessors, conversions | 330 |
 | Raw and filtered projections plus readiness seam | 50 |
 | Module declaration and fifteen-type re-export | 20 |
-| Projection, conversion, and API-shape tests | 125 |
+| Projection, conversion, and external API-shape tests | 145 |
 | Installed-template handoff | 90 |
-| Contingency | 35 |
+| Contingency | 15 |
 | Total estimate | 650 |
 
 This is the recorded pre-edit estimate. If repository facts make A1 exceed the
@@ -1113,9 +1296,12 @@ The handoff must state:
 - this revision deliberately split the prior slice A into A1 and A2;
 - A1 has no behavioral red and changes no production traversal or decision;
 - A1’s pre-change failure is compiler/API-shape evidence;
+- the external integration test compiles all fifteen names through
+  `bridge_worktree::sweep::*`;
 - production policy readiness is false;
 - the explicit-ready private predicate is test-only mechanism evidence;
 - `effective()` is snapshot eligibility, not retained action authority;
+- borrowing is ergonomic coupling, not type-enforced inseparability;
 - a returned report owns no live scan authority and T3b must re-decide under its own
   lock;
 - A1 production constructs none of the report values;
@@ -1152,7 +1338,8 @@ running one.
 ## Acceptance Criteria
 
 1. A1 creates `sweep/report.rs` and exposes exactly the fifteen named public types
-   through `bridge_worktree::sweep::*`.
+   through `bridge_worktree::sweep::*`; the external integration test imports and
+   compile-asserts every name through that public path.
 2. The fifteen public types match the normative Rust declarations, including every
    variant, payload, private field, derive, visibility, accessor, constructor,
    conversion, non-exhaustive annotation, and temporary constructor allowance.
@@ -1173,43 +1360,63 @@ running one.
 9. The private parameterized predicate accepts explicit readiness. Its tests
    exercise both readiness branches, legacy exclusion, raw refusal, scan status,
    and the positive non-legacy raw-`Authorized` case.
-10. Public `effective()` passes the production readiness constant, returns only
-    borrowed entries, exposes no separable decision scalar, and yields no entries
-    while production readiness is false.
-11. Documentation states the concrete T3b action-time re-decision sequence and
+10. Public `effective()` passes the production readiness constant, returns borrowed
+    entries, adds no separate effective-decision scalar, and yields no entries while
+    production readiness is false. Documentation states that borrowing is ergonomic
+    coupling rather than type-enforced inseparability.
+11. The explicit-ready borrowed-entry test filters `entries().iter()` through the
+    private predicate, pointer-compares the yielded reference with its source slice
+    element, and checks the exact name on that same borrowed object.
+12. Documentation states the concrete T3b action-time re-decision sequence and
     forbids treating a report or filtered entry as authority to act.
-12. A1 does not create `checked_scan.rs`, change
+13. A1 does not create `checked_scan.rs`, change
     `sweep_orphans_with_exact_absence`, alter `scan_worktree_records`, or modify any
     existing sweep decision or action body.
-13. `decide_unused_candidate` retains `recovery_owned`, both production call sites
+14. `decide_unused_candidate` retains `recovery_owned`, both production call sites
     retain `false`, and no ownership, custody, publication, settlement, deletion,
     or CLI behavior changes.
-14. A1 adds no `bridge-core` surface, `libc`, `fdopendir`, descriptor enumeration,
+15. A1 adds no `bridge-core` surface, `libc`, `fdopendir`, descriptor enumeration,
     root pinning, Git invocation, filesystem observation, or platform-conditional
     production functionality.
-15. A1 claims no behavioral red. Compiler/API-shape evidence and projection
-    mechanism tests are reported separately.
-16. The A2 outline fixes every scanner cross-module declaration at
+16. A1 claims no behavioral red. Compiler/API-shape evidence, the external public
+    re-export compile assertion, and projection mechanism tests are reported
+    separately.
+17. The A2 outline fixes every scanner cross-module declaration at
     `pub(super)`, keeps the concrete session and observation fields private to
-    `checked_scan.rs`, and assigns traversal integration to parent `sweep.rs`.
-17. The A2 outline scopes the single entry-point `canonicalize_lenient` invocation
-    to the supplied exact-scan root while preserving per-record helper calls,
-    ordinary `std::fs::canonicalize` guards, and zero wrapper canonicalization.
-18. The A2 outline requires direct evidence for exact `requested_root` spelling,
-    the expected lenient `canonical_root`, and `None` only on canonicalization
-    refusal.
-19. The A2 mutation audit explicitly names ordinary `std::fs::canonicalize`,
-    target `Path::symlink_metadata`, their call edges, Git observations, and the
-    absence of action edges.
-20. The complete A2 characterization matrix remains intact, including
+    `checked_scan.rs`, assigns traversal integration to parent `sweep.rs`, shares
+    selection/read policy with `scan_worktree_records`, and requires the same-root
+    conformance matrix.
+18. The A2 outline scopes the exact-scan entry-point
+    `canonicalize_lenient` invocation to the supplied exact-scan root while
+    preserving per-record helper calls and ordinary `std::fs::canonicalize` guards.
+    It also explicitly preserves `sweep_orphans`’s separate guard-root
+    `canonicalize_lenient` call, warning, and early return, while requiring
+    `scan_worktree_records` and its enumeration argument to remain the raw supplied
+    root.
+19. The A2 outline requires direct evidence for exact `requested_root` spelling,
+    the expected lenient `canonical_root`, absolute-missing-root
+    `CannotEnumerate`, and relative empty-parent `CannotCanonicalize`.
+20. The A2 mutation audit explicitly names the
+    `PinnedDirectoryV1::open` observation tree; ordinary
+    `std::fs::canonicalize`; target `Path::symlink_metadata`; the
+    `registration_absent_from_porcelain → compare_path_identities` branch; every
+    initial and final `deepest_existing_path` metadata, symlink-metadata, and
+    canonicalization observation; the conditional case-sensitivity
+    `read_dir`/`symlink_metadata` tree; Git observations; and the absence of action
+    edges.
+21. The A2 outline states that `finish` precedes phase-2 assessment, so complete,
+    pinned, authorized output is ordered historical evidence rather than one
+    coherent point-in-time snapshot; T3b’s independent action-time re-decision
+    remains the safety boundary.
+22. The complete A2 characterization matrix remains intact, including
     `Preserved` plus valid claim plus vanished target plus `BothAbsent` producing
     raw `Authorized`, and malformed legacy being silently omitted.
-21. The installed-template A1 handoff exists at the required path, preserves the
+23. The installed-template A1 handoff exists at the required path, preserves the
     operator-evidence block verbatim, and records tests, allowances, exclusions,
-    deferred A2 work, and authority limits honestly.
-22. The implementation remains beneath the declared A1 cap. If the estimate no
+    deferred A2 work, public-API evidence, and authority limits honestly.
+24. The implementation remains beneath the declared A1 cap. If the estimate no
     longer fits, work stops before editing.
-23. Final operator totals count test binaries and doc-test suites without
+25. Final operator totals count test binaries and doc-test suites without
     double-counting nested harness output.
 
 ## Files
@@ -1219,12 +1426,17 @@ running one.
   bodies.
 - `crates/bridge-worktree/src/sweep/report.rs` — create; literal public vocabulary,
   conversions, projections, testable readiness predicate, and A1 unit tests.
+- `crates/bridge-worktree/tests/r2f1b_exact_absence_report_api.rs` — create; external
+  compile assertion for all fifteen `bridge_worktree::sweep::*` public names.
 - `crates/bridge-worktree/src/custody.rs` — read for custody states, reasons, kinds,
   and read refusals; do not modify.
 - `crates/bridge-worktree/src/provider_path.rs` — read for A2 factual
   falsification only; do not modify.
 - `crates/bridge-worktree/src/host_git.rs` — read for A2 factual falsification only;
   do not modify.
+- `crates/bridge-core/src/fs_custody.rs` — read for A2
+  `PinnedDirectoryV1::open`, path-identity comparator, resolver, and
+  case-sensitivity observation-tree falsification only; do not modify.
 - `bin/a2a-bridge/src/main.rs` — read for the deferred A2 caller audit only; do not
   modify.
 - `crates/bridge-worktree/src/sweep/checked_scan.rs` — reserved for A2; do not create
@@ -1237,9 +1449,10 @@ running one.
 Authoritative at the base commit:
 
 - `crates/bridge-worktree/src/sweep.rs`
+- `crates/bridge-worktree/src/host_git.rs`
 - `crates/bridge-worktree/src/custody.rs`
 - `crates/bridge-worktree/src/provider_path.rs`
-- `crates/bridge-worktree/src/host_git.rs`
+- `crates/bridge-core/src/fs_custody.rs`
 - `bin/a2a-bridge/src/main.rs`
 
 ## Commit Message
