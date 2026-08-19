@@ -2588,6 +2588,85 @@ fn direct_diagnostic_observer() -> Arc<dyn bridge_core::ports::DiagnosticObserve
     )
 }
 
+/// The agent's own last message, recovered from the session rollout the container now leaves
+/// behind under the clone.
+///
+/// Three of `implement`'s four terminals — `Abort`, `NoCommitClean`, `NoCommitDirty` — used to
+/// report only a path. When an agent stopped deliberately (a spec instruction it could not
+/// satisfy, a cap it was told to respect), the operator saw `made no changes` and an `Ok(())`
+/// exit, and the reason was discarded even though the agent had stated it plainly. That cost a
+/// real misdiagnosis: two null runs were attributed to spec size before the persisted rollout
+/// showed the agent had been blocked on a file that does not exist inside the container.
+///
+/// Best-effort by construction. The rollout is written by codex-acp; an agent that writes no
+/// rollout simply yields `None` and the caller says so. Never fails a run.
+fn last_agent_message(clone: &std::path::Path) -> Option<String> {
+    const MAX_LINE: usize = 1 << 20;
+    const MAX_CHARS: usize = 1200;
+
+    let root = clone.join(".git").join("a2a-bridge").join("codex-sessions");
+    // Newest rollout under the date-partitioned tree.
+    let mut newest: Option<(std::time::SystemTime, std::path::PathBuf)> = None;
+    let mut stack = vec![root];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Ok(meta) = entry.metadata() else { continue };
+            if meta.is_dir() {
+                stack.push(path);
+            } else if path.extension().is_some_and(|e| e == "jsonl") {
+                let when = meta.modified().unwrap_or(std::time::UNIX_EPOCH);
+                if newest.as_ref().is_none_or(|(best, _)| when >= *best) {
+                    newest = Some((when, path));
+                }
+            }
+        }
+    }
+    let (_, path) = newest?;
+
+    use std::io::BufRead as _;
+    let file = std::fs::File::open(&path).ok()?;
+    let mut last: Option<String> = None;
+    for line in std::io::BufReader::new(file).lines().map_while(Result::ok) {
+        if line.len() > MAX_LINE || !line.contains("\"agent_message\"") {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue;
+        };
+        let payload = &value["payload"];
+        if payload["type"] == "agent_message" {
+            if let Some(message) = payload["message"].as_str() {
+                last = Some(message.to_string());
+            }
+        }
+    }
+    last.map(|message| {
+        let trimmed = message.trim();
+        if trimmed.chars().count() > MAX_CHARS {
+            let head: String = trimmed.chars().take(MAX_CHARS).collect();
+            format!("{head}… [truncated]")
+        } else {
+            trimmed.to_string()
+        }
+    })
+}
+
+/// Print the agent's parting message under a terminal that produced no commit, so a deliberate
+/// refusal is legible instead of looking like a silent no-op.
+fn report_agent_reply(clone: &std::path::Path) {
+    match last_agent_message(clone) {
+        Some(message) => eprintln!("[implement] agent's last message:\n{message}"),
+        None => eprintln!(
+            "[implement] no agent message recovered from {}",
+            clone.join(".git/a2a-bridge/codex-sessions").display()
+        ),
+    }
+}
+
 async fn run_direct_implement_turn(
     runner: &dyn turn::TurnRunner,
     session: &bridge_core::ids::SessionId,
@@ -3576,6 +3655,7 @@ async fn implement_cmd(args: &[String]) -> Result<(), BoxError> {
                     "[implement] {reason} — NO commit; clone left at {}",
                     clone.display()
                 );
+                report_agent_reply(&clone);
                 let _ = warm_runner.retire().await; // sole warm reap site; RunEndGuard is the backstop
                 Err(format!("implement: {reason}").into())
             }
@@ -3584,6 +3664,7 @@ async fn implement_cmd(args: &[String]) -> Result<(), BoxError> {
                     "implement: made no changes; clone left at {}",
                     clone.display()
                 );
+                report_agent_reply(&clone);
                 let _ = warm_runner.retire().await;
                 Ok(())
             }
@@ -3593,6 +3674,7 @@ async fn implement_cmd(args: &[String]) -> Result<(), BoxError> {
                  Clone left at {} for inspection.",
                 clone.display()
             );
+                report_agent_reply(&clone);
                 let _ = warm_runner.retire().await;
                 Ok(())
             }
@@ -10165,6 +10247,78 @@ async fn main() -> Result<(), BoxError> {
 mod cli_tests {
     use super::*;
     use crate::turn::TurnRunner;
+
+    fn write_rollout(dir: &std::path::Path, name: &str, messages: &[&str]) {
+        let day = dir
+            .join(".git/a2a-bridge/codex-sessions")
+            .join("2026")
+            .join("08")
+            .join("19");
+        std::fs::create_dir_all(&day).unwrap();
+        let mut body =
+            String::from("{\"type\":\"session_meta\",\"payload\":{\"type\":\"session_meta\"}}\n");
+        for m in messages {
+            body.push_str(&format!(
+                "{{\"type\":\"event_msg\",\"payload\":{{\"type\":\"agent_message\",\"message\":\"{m}\"}}}}\n"
+            ));
+        }
+        std::fs::write(day.join(name), body).unwrap();
+    }
+
+    /// Discriminates the defect this exists for: three of implement's four terminals printed only
+    /// a path, so a deliberate refusal read as a silent no-op and its stated reason was lost.
+    #[test]
+    fn last_agent_message_recovers_the_agents_parting_words() {
+        let clone = tempfile::tempdir().unwrap();
+        write_rollout(
+            clone.path(),
+            "rollout-a.jsonl",
+            &["first thing", "blocked: file absent"],
+        );
+
+        assert_eq!(
+            last_agent_message(clone.path()).as_deref(),
+            Some("blocked: file absent"),
+            "must return the LAST agent message, not the first"
+        );
+    }
+
+    #[test]
+    fn last_agent_message_prefers_the_newest_rollout() {
+        let clone = tempfile::tempdir().unwrap();
+        write_rollout(clone.path(), "rollout-old.jsonl", &["stale"]);
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        write_rollout(clone.path(), "rollout-new.jsonl", &["current"]);
+
+        assert_eq!(last_agent_message(clone.path()).as_deref(), Some("current"));
+    }
+
+    /// Losing a transcript must never fail a run: no rollout is a None, not a panic.
+    #[test]
+    fn last_agent_message_is_none_without_a_rollout() {
+        let clone = tempfile::tempdir().unwrap();
+        assert_eq!(last_agent_message(clone.path()), None);
+        std::fs::create_dir_all(clone.path().join(".git/a2a-bridge/codex-sessions")).unwrap();
+        assert_eq!(
+            last_agent_message(clone.path()),
+            None,
+            "an empty session dir is still None"
+        );
+    }
+
+    #[test]
+    fn last_agent_message_truncates_a_runaway_message() {
+        let clone = tempfile::tempdir().unwrap();
+        let long = "x".repeat(5000);
+        write_rollout(clone.path(), "rollout-long.jsonl", &[&long]);
+
+        let got = last_agent_message(clone.path()).unwrap();
+        assert!(
+            got.ends_with("… [truncated]"),
+            "long messages must be bounded"
+        );
+        assert!(got.chars().count() < 1300, "bound must actually apply");
+    }
 
     /// The warm implement container shares ONE agent session across the edit turn and every fix turn,
     /// then is removed. Without this mount the rollout lives only at `/root/.codex/sessions` inside
