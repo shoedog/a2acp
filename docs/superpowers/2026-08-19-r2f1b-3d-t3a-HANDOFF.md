@@ -1,7 +1,7 @@
 # Handoff — R2f1b 3d T3a: A1 landed, A2 next; bridge observability repaired mid-lane
 
 **Written:** 2026-08-19 · **By:** session_012SUgPvVNbwpuGQKxWtxLgr (Claude Opus 5, 1M) · **Provider:** claude
-**Workspace:** a2a-bridge · agent/r2f1b-pre-slice2-custody-plan · **Measured state:** `[MEASURED]` HEAD `904c89fb` · Tree CLEAN · Probe `git status --porcelain && git rev-parse HEAD` · Output inline this turn
+**Workspace:** a2a-bridge · agent/r2f1b-pre-slice2-custody-plan · **Measured state:** `[MEASURED]` HEAD `see §6` · Tree CLEAN · Probe `git status --porcelain && git rev-parse HEAD` · Output inline this turn
 **Predecessor:** the 2026-08-17 3d handoff (`docs/superpowers/2026-08-17-r2f1b-3d-HANDOFF.md`), superseded for everything below
 **Truth ordering:** measured live state > explicit owner/contract authority within its scope > this handoff for current operational state > earlier handoffs and non-authoritative summaries. A conflict between tiers stays OPEN in §0 — never resolved by document class alone.
 **Provenance:** written live by the worker. `[MEASURED]` claims were probed by this writer; `[INHERITED]` claims were not.
@@ -18,8 +18,8 @@
 
 ## 1. Resume order
 
-1. **A2 spec review is the active task.** v1 is authored and committed (`4234517d`). Round 1 of a declared **2-round cap** is in flight (`spec-review`, sol xhigh, session cwd `.claude/worktrees/fold` now at `c637e493`). When it returns, fold its findings AND the operator findings (`docs/superpowers/reviews/2026-08-19-a2-spec-operator-findings.md`) by dispatching both to sol via `author` — never by hand (§5).
-2. Then A2 implement → host gate → PR, same loop as A1.
+1. **A2a spec authoring is the active task.** Owner decision at the cap: SPLIT, not a third fold. Boundary is sol's own: A2a = production-bound scan engine + compatibility-source refactor + preserved action-scanner projection + same-root conformance, **no public return-type change**; A2b = report return/population, root/capability evidence, platform matrix, mutation audit, on top of the accepted A2a commit. Input `docs/superpowers/plans/2026-08-19-t3a-sliceA2a-authoring-input.md`. When it returns: extract, verify anchors, `rustfmt --check` the seam subset, commit, then spec-review under a fresh 2-round cap.
+2. Then A2a implement → host gate → PR, same loop as A1. A2b is specced only after A2a is ACCEPTED — it is defined as building on the accepted A2a commit.
 3. The config swap window (worktrees + container writer) is independent and can happen any time — see §4 #2.
 4. The flake fix (§4 #3) is independent and increasingly worth doing.
 
@@ -38,7 +38,7 @@
 | agent reply surfacing | **LANDED** | PR #61 → `c637e493`; host gate 4,169/0/13 |
 | operator serve | **SWAPPED, RUNNING** | PID 23161, release `ee3b5966ad3b35ef`, binary-only swap, all 5 post-swap checks passed |
 | operator config candidate | **STAGED, NOT APPLIED** | `operator/a2a-bridge.candidate.toml`, SHA `67f3bf01…`; validate pass, doctor 31 ok/1 warn/0 fail |
-| T3a inc1 slice **A2** | **SPEC v1 AUTHORED, REVIEW ROUND 1 IN FLIGHT** | spec `4234517d`, 679 lines, cap 1,650 logical; operator findings `904c89fb`; nine anchors verified against `c637e493` |
+| T3a inc1 slice **A2** | **SPLIT into A2a/A2b at the 2-round cap** | v1 `4234517d` (11 findings) → v2 `2323866f` (8 valid, 1 blocker refuted) → owner chose split, not a 3rd fold. A2a spec authoring in flight |
 
 ## 3. Corrections to standing documents and memory
 
@@ -71,6 +71,7 @@
 - **Never mutation-skip a load-bearing test.** This lane has shipped four tests that proved less than they claimed. Revert the fix, confirm the test reds.
 - **Never count test totals by summing `test result:` lines** — a bridge-core test re-executes the binary as a filtered subprocess and inflates the sum by one. Count `Running` binaries + `Doc-tests` suites.
 - **Never stop the operator serve without checking `pane_current_command` first.** Its tmux pane runs the binary directly, so `C-c` ends the session; you then need `tmux new-session`, which may be permission-gated.
+- **Never accept a review finding without probing it when it is mechanically checkable.** `[MEASURED]` A2 round 2 raised a BLOCKER claiming rustfmt would rewrite the normative seam block. Under the pinned 1.94.0 toolchain, `rustfmt --check` exits **0** on the v2 block and **1** on the v1 block — the probe discriminates, and the reviewer was re-raising a fixed finding against the fixed artifact. Folding it would have reintroduced the round-1 defect. Reviewers regress too.
 - **Never dispatch an authoring or review run without checking what commit its `--session-cwd` is actually on.** `[MEASURED]` 2026-08-19: `.claude/worktrees/fold` sat at `9aedf175` while the A2 spec was authored against a stated base of `c637e493`; `sweep/report.rs` does not exist at `9aedf175`, so the agent could not have inspected the surface it claimed to inspect (it restated the authoring input, which supplied the same facts). Caught before the review round only because the same probe was run for the reviewer. Local `main` had silently lagged three merges behind `origin/main`. Probe: `git -C <cwd> rev-parse HEAD` and confirm one file the work depends on exists there.
 - **A backgrounded `nohup ... &` reports exit 0 the instant it detaches.** `[MEASURED]` the spec-review task notified "completed (exit code 0)" while PID 95068 was still mid-run with both lenses started. Confirm with `pgrep -fl` and the presence of the `--out` artifact, never the notification.
 - Container `verify: PASS` is not host-green. Run the host gate.
