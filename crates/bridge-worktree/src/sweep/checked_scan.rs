@@ -257,7 +257,7 @@ mod tests {
         custody_record_path, PreservationReasonV1, PreservedWorktreeClaimV1, RecoveryLocatorV1,
         WORKTREE_CUSTODY_RECORD_SCHEMA_V1,
     };
-    use crate::provider_path::{sidecar_path, write_sidecar};
+    use crate::provider_path::{read_sidecar, sidecar_path, write_sidecar};
     use crate::sweep::{
         ExactAbsenceObservationV1, ExactAbsenceProbeV1, ExactAbsenceRootRefusalV1,
         UnusedCandidateDecisionV1,
@@ -265,7 +265,7 @@ mod tests {
     use bridge_core::error::BridgeError;
     use bridge_core::execution_policy::{PolicyNodeRefV1, Sha256HexV1, WorktreeObjectIdentityV1};
     use bridge_core::fs_custody::verify_payload_directory_identity;
-    use std::collections::VecDeque;
+    use std::collections::{HashMap, VecDeque};
     use std::path::PathBuf;
     use std::sync::{
         atomic::{AtomicUsize, Ordering},
@@ -367,6 +367,8 @@ mod tests {
         names: VecDeque<Result<OsString, CheckedScanEntryRefusalV1>>,
         legacy: Option<WorktreeSidecar>,
         custody: Result<WorktreeCustodyRecordV1, CustodyReadRefusalV1>,
+        custody_by_name: HashMap<OsString, Result<WorktreeCustodyRecordV1, CustodyReadRefusalV1>>,
+        observations: RootObservationSetV1,
         log: Log,
     }
 
@@ -375,6 +377,8 @@ mod tests {
             names,
             legacy: None,
             custody: Ok(decoded_custody()),
+            custody_by_name: HashMap::new(),
+            observations: RootObservationSetV1::default(),
             log,
         }
     }
@@ -399,14 +403,20 @@ mod tests {
             self.legacy.clone()
         }
 
-        fn read_custody(&self, _: &OsStr) -> Result<WorktreeCustodyRecordV1, CustodyReadRefusalV1> {
+        fn read_custody(
+            &self,
+            enumerated_name: &OsStr,
+        ) -> Result<WorktreeCustodyRecordV1, CustodyReadRefusalV1> {
             note(&self.log, "custody");
-            self.custody.clone()
+            self.custody_by_name
+                .get(enumerated_name)
+                .unwrap_or(&self.custody)
+                .clone()
         }
 
         fn finish(self: Box<Self>) -> RootObservationSetV1 {
             note(&self.log, "finish");
-            RootObservationSetV1::default()
+            self.observations
         }
     }
 
@@ -451,6 +461,13 @@ mod tests {
             *self.0.lock().unwrap() = Some(enumeration_root.to_path_buf());
             None
         }
+    }
+
+    fn pin_failure_records(root: &Path) -> WorktreeSidecar {
+        let legacy = sidecar(&root.join("source"), &root.join("legacy"));
+        write_sidecar(&legacy).unwrap();
+        std::fs::write(root.join("bad.custody.v1.json"), b"ignored").unwrap();
+        legacy
     }
 
     #[test]
@@ -700,6 +717,364 @@ mod tests {
             supplied.to_str().unwrap(),
             &probe(None, Arc::new(Mutex::new(Vec::new()))),
         );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    // Evidence: characterization; catches classifier precedence or suffix-boundary changes.
+    #[test]
+    fn checked_scan_classifier_preserves_full_path_precedence_and_boundaries() {
+        let root = temp_root("classifier");
+        let classify = |name| classify_record_display(&root.join(name).to_string_lossy());
+        assert_eq!(
+            classify("legacy.meta.json"),
+            Some(CheckedScanRecordKindV1::Legacy)
+        );
+        assert_eq!(classify(".custody.v1.json"), None);
+        assert_eq!(classify("dir/.custody.v1.json"), None);
+        assert_eq!(
+            classify(r"dir\.custody.v1.json"),
+            Some(CheckedScanRecordKindV1::Custody)
+        );
+    }
+
+    // Evidence: characterization; catches malformed-legacy retention or lost custody refusals.
+    #[test]
+    fn checked_scan_silently_omits_bad_legacy_and_retains_bad_custody() {
+        let root = temp_root("bad-records");
+        std::fs::create_dir_all(&root).unwrap();
+        let malformed = root.join("bad.meta.json");
+        std::fs::write(&malformed, b"not json").unwrap();
+        assert_eq!(read_sidecar(&malformed.to_string_lossy()), None);
+        let refusal = CustodyReadRefusalV1::Unreadable("preserved refusal".to_string());
+        let mut source = script(
+            Arc::new(Mutex::new(Vec::new())),
+            VecDeque::from([
+                Ok(OsString::from("bad.meta.json")),
+                Ok(OsString::from("bad.custody.v1.json")),
+            ]),
+        );
+        source.custody = Err(refusal.clone());
+        let rows =
+            super::super::project_action_scan_result(scan_checked_rows_for_test(&root, &source));
+        assert_eq!(rows.len(), 1);
+        assert!(
+            matches!(&rows[0].1, ScannedWorktreeRecordV1::UnreadableCustody(actual) if actual == &refusal)
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    // Evidence: characterization; catches skipped iterator errors or reordered injected traversal.
+    #[test]
+    fn checked_scan_counts_iterator_errors_and_continues_in_injected_order() {
+        let root = temp_root("iterator-errors");
+        std::fs::create_dir_all(&root).unwrap();
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let mut source = script(
+            log.clone(),
+            VecDeque::from([
+                Ok(OsString::from("second.custody.v1.json")),
+                Err(CheckedScanEntryRefusalV1::CannotReadEntry),
+                Ok(OsString::from("first.custody.v1.json")),
+                Err(CheckedScanEntryRefusalV1::CannotReadEntry),
+            ]),
+        );
+        source.custody = Err(CustodyReadRefusalV1::Unreadable("refusal".to_string()));
+        let outcome = super::super::project_exact_scan_result(
+            crate::provider_path::canonicalize_lenient(root.to_str().unwrap()).unwrap(),
+            scan_checked_rows_for_test(&root, &source),
+            &probe(None, log.clone()),
+        );
+        let (_, errors, _, rows) = outcome.into_exact_parts().unwrap();
+        assert_eq!(errors, 2);
+        let paths = rows
+            .iter()
+            .map(|row| row.checked.record_path().to_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            paths,
+            vec![
+                root.join("second.custody.v1.json")
+                    .to_string_lossy()
+                    .into_owned(),
+                root.join("first.custody.v1.json")
+                    .to_string_lossy()
+                    .into_owned(),
+            ]
+        );
+        assert_eq!(
+            log.lock().unwrap().as_slice(),
+            ["next", "custody", "next", "next", "custody", "next", "next", "finish"]
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    // Evidence: injected-seam mechanism; catches loss of exact-only root observations.
+    #[test]
+    fn nondefault_root_observations_survive_exact_without_changing_rows_or_decisions() {
+        let root = temp_root("observations");
+        std::fs::create_dir_all(&root).unwrap();
+        let legacy = sidecar(&root.join("source"), &root.join("legacy"));
+        let observations = RootObservationSetV1 {
+            retained_enumeration_object: Some(RootIdentityCaptureV1 {
+                dev: Some(1),
+                ino: Some(2),
+                birthtime: None,
+            }),
+            pinned_custody_directory: None,
+            final_named_root: Some(RootIdentityCaptureV1 {
+                dev: Some(3),
+                ino: Some(4),
+                birthtime: None,
+            }),
+        };
+        let names = VecDeque::from([Ok(OsString::from("legacy.meta.json"))]);
+        let mut default_source = script(Arc::new(Mutex::new(Vec::new())), names.clone());
+        default_source.legacy = Some(legacy.clone());
+        let mut observed_source = script(Arc::new(Mutex::new(Vec::new())), names);
+        observed_source.legacy = Some(legacy);
+        observed_source.observations = observations;
+        let canonical = crate::provider_path::canonicalize_lenient(root.to_str().unwrap()).unwrap();
+        let default = super::super::project_exact_scan_result(
+            canonical.clone(),
+            scan_checked_rows_for_test(&root, &default_source),
+            &probe(None, Arc::new(Mutex::new(Vec::new()))),
+        );
+        let observed = super::super::project_exact_scan_result(
+            canonical,
+            scan_checked_rows_for_test(&root, &observed_source),
+            &probe(None, Arc::new(Mutex::new(Vec::new()))),
+        );
+        let (_, default_errors, default_observations, default_rows) =
+            default.into_exact_parts().unwrap();
+        let (_, observed_errors, observed_observations, observed_rows) =
+            observed.into_exact_parts().unwrap();
+        assert_eq!(default_errors, observed_errors);
+        assert_eq!(default_observations, RootObservationSetV1::default());
+        assert_eq!(observed_observations, observations);
+        assert_eq!(default_rows.len(), 1);
+        for (before, after) in default_rows.iter().zip(observed_rows.iter()) {
+            assert_eq!(before.checked.parts().0, after.checked.parts().0);
+            assert_eq!(before.checked.parts().1, after.checked.parts().1);
+            assert_eq!(before.decision, after.decision);
+            assert!(
+                matches!((before.checked.parts().2, after.checked.parts().2), (ScannedWorktreeRecordV1::Legacy(left), ScannedWorktreeRecordV1::Legacy(right)) if left == right)
+            );
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    // Evidence: characterization; catches loss of a canonical root on enumeration refusal.
+    #[test]
+    fn enumeration_refusal_retains_canonical_root_and_skips_assessment() {
+        let root = temp_root("enumeration-refusal");
+        std::fs::write(&root, b"not a directory").unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let probe = probe(None, log.clone());
+        let outcome = super::super::sweep_orphans_with_exact_absence_with_pin_opener(
+            root.to_str().unwrap(),
+            &probe,
+            Pin(calls.clone()),
+        );
+        assert!(matches!(
+            outcome.into_exact_parts(),
+            Err((Some(canonical), ExactAbsenceRootRefusalV1::CannotEnumerate))
+                if canonical.as_str() == std::fs::canonicalize(&root).unwrap().to_str().unwrap()
+        ));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(probe.calls.load(Ordering::SeqCst), 0);
+        assert!(log.lock().unwrap().is_empty());
+        std::fs::remove_file(root).unwrap();
+    }
+
+    // Evidence: projection characterization; catches action-only metadata retention or exact loss.
+    #[test]
+    fn action_projection_erases_only_action_metadata() {
+        let root = temp_root("action-erasure");
+        std::fs::create_dir_all(&root).unwrap();
+        let legacy = sidecar(&root.join("source"), &root.join("legacy"));
+        let names = VecDeque::from([
+            Ok(OsString::from("legacy.meta.json")),
+            Err(CheckedScanEntryRefusalV1::CannotReadEntry),
+            Ok(OsString::from("custody.custody.v1.json")),
+        ]);
+        let mut action_source = script(Arc::new(Mutex::new(Vec::new())), names.clone());
+        action_source.legacy = Some(legacy.clone());
+        let action: Vec<(String, ScannedWorktreeRecordV1)> =
+            scan_checked_rows_for_test(&root, &action_source)
+                .unwrap()
+                .into_action_rows();
+        let mut exact_source = script(Arc::new(Mutex::new(Vec::new())), names);
+        exact_source.legacy = Some(legacy);
+        exact_source.observations = RootObservationSetV1 {
+            retained_enumeration_object: None,
+            pinned_custody_directory: Some(RootIdentityCaptureV1 {
+                dev: Some(5),
+                ino: Some(6),
+                birthtime: None,
+            }),
+            final_named_root: None,
+        };
+        let (rows, errors, observations) = scan_checked_rows_for_test(&root, &exact_source)
+            .unwrap()
+            .into_exact_parts();
+        let action_paths = action
+            .iter()
+            .map(|(path, _)| path.to_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            action_paths,
+            vec![
+                root.join("legacy.meta.json").to_string_lossy().into_owned(),
+                root.join("custody.custody.v1.json")
+                    .to_string_lossy()
+                    .into_owned(),
+            ]
+        );
+        assert_eq!(
+            rows.iter().map(|row| row.parts().1).collect::<Vec<_>>(),
+            [
+                OsStr::new("legacy.meta.json"),
+                OsStr::new("custody.custody.v1.json"),
+            ]
+        );
+        assert_eq!(errors, 1);
+        assert!(observations.pinned_custody_directory.is_some());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    // Evidence: injected-seam mechanism; catches test-only projection reimplementation.
+    #[test]
+    fn injected_sources_use_production_action_and_exact_projections() {
+        let root = temp_root("production-projections");
+        std::fs::create_dir_all(&root).unwrap();
+        let names = VecDeque::from([Ok(OsString::from("bad.custody.v1.json"))]);
+        let action = super::super::project_action_scan_result(scan_checked_rows_for_test(
+            &root,
+            &script(Arc::new(Mutex::new(Vec::new())), names.clone()),
+        ));
+        let exact = super::super::project_exact_scan_result(
+            crate::provider_path::canonicalize_lenient(root.to_str().unwrap()).unwrap(),
+            scan_checked_rows_for_test(&root, &script(Arc::new(Mutex::new(Vec::new())), names)),
+            &probe(None, Arc::new(Mutex::new(Vec::new()))),
+        );
+        let (_, _, _, rows) = exact.into_exact_parts().unwrap();
+        assert_eq!(action[0].0, rows[0].checked.record_path());
+        assert!(matches!(
+            (&action[0].1, rows[0].checked.parts().2),
+            (ScannedWorktreeRecordV1::Custody(left), ScannedWorktreeRecordV1::Custody(right)) if left == right
+        ));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    // Evidence: projection characterization; catches divergence between action and exact records.
+    #[test]
+    fn injected_sources_prove_action_and_exact_projection_equivalence() {
+        let root = temp_root("projection-equivalence");
+        std::fs::create_dir_all(&root).unwrap();
+        let names = VecDeque::from([
+            Ok(OsString::from("legacy.meta.json")),
+            Ok(OsString::from("decoded.custody.v1.json")),
+            Ok(OsString::from("unreadable.custody.v1.json")),
+        ]);
+        let legacy = sidecar(&root.join("source"), &root.join("legacy"));
+        let custody = decoded_custody();
+        let refusal = CustodyReadRefusalV1::Unreadable("same refusal".to_string());
+        let mut source = script(Arc::new(Mutex::new(Vec::new())), names);
+        source.legacy = Some(legacy);
+        source
+            .custody_by_name
+            .insert(OsString::from("unreadable.custody.v1.json"), Err(refusal));
+        source.custody = Ok(custody);
+        let action =
+            super::super::project_action_scan_result(scan_checked_rows_for_test(&root, &source));
+        let exact = super::super::project_exact_scan_result(
+            crate::provider_path::canonicalize_lenient(root.to_str().unwrap()).unwrap(),
+            scan_checked_rows_for_test(&root, &source),
+            &probe(None, Arc::new(Mutex::new(Vec::new()))),
+        );
+        let (_, _, _, rows) = exact.into_exact_parts().unwrap();
+        assert_eq!(
+            action.iter().map(|(path, _)| path).collect::<Vec<_>>(),
+            rows.iter()
+                .map(|row| row.checked.record_path())
+                .collect::<Vec<_>>()
+        );
+        for ((_, action_record), exact_row) in action.iter().zip(rows.iter()) {
+            match (action_record, exact_row.checked.parts().2) {
+                (ScannedWorktreeRecordV1::Legacy(left), ScannedWorktreeRecordV1::Legacy(right)) => {
+                    assert_eq!(left, right)
+                }
+                (
+                    ScannedWorktreeRecordV1::Custody(left),
+                    ScannedWorktreeRecordV1::Custody(right),
+                ) => {
+                    assert_eq!(left, right)
+                }
+                (
+                    ScannedWorktreeRecordV1::UnreadableCustody(left),
+                    ScannedWorktreeRecordV1::UnreadableCustody(right),
+                ) => {
+                    assert_eq!(left, right)
+                }
+                _ => panic!("action and exact record kinds diverged"),
+            }
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    // Evidence: post-canonicalization opener seam; catches pin failure before canonicalization.
+    #[test]
+    fn report_side_pin_failure_uses_post_canonicalization_opener_seam() {
+        let root = temp_root("report-pin-failure");
+        std::fs::create_dir_all(&root).unwrap();
+        let legacy = pin_failure_records(&root);
+        let opened = Arc::new(Mutex::new(None));
+        let outcome = super::super::sweep_orphans_with_exact_absence_with_pin_opener(
+            root.join(".").to_str().unwrap(),
+            &probe(None, Arc::new(Mutex::new(Vec::new()))),
+            RootPin(opened.clone()),
+        );
+        let (canonical, _, _, rows) = outcome.into_exact_parts().unwrap();
+        assert_eq!(
+            canonical.as_str(),
+            std::fs::canonicalize(&root).unwrap().to_str().unwrap()
+        );
+        assert_eq!(
+            opened.lock().unwrap().as_deref(),
+            Some(std::path::Path::new(canonical.as_str()))
+        );
+        assert!(rows.iter().any(|row| matches!(
+            row.checked.parts().2,
+            ScannedWorktreeRecordV1::Legacy(actual) if actual == &legacy
+        )));
+        assert!(rows.iter().any(|row| matches!(
+            row.checked.parts().2,
+            ScannedWorktreeRecordV1::UnreadableCustody(CustodyReadRefusalV1::Unreadable(message)) if message == "sweep root is not pinnable"
+        )));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    // Evidence: action-projection seam; catches loss of legacy rows after deterministic pin failure.
+    #[test]
+    fn compatibility_pin_failure_preserves_legacy_and_refuses_custody() {
+        let root = temp_root("action-pin-failure");
+        std::fs::create_dir_all(&root).unwrap();
+        let legacy = pin_failure_records(&root);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let rows = super::super::project_action_scan_result(scan_compatibility_with_pin_opener(
+            &root,
+            Pin(calls.clone()),
+        ));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(rows.iter().any(|(_, record)| matches!(
+            record,
+            ScannedWorktreeRecordV1::Legacy(actual) if actual == &legacy
+        )));
+        assert!(rows.iter().any(|(_, record)| matches!(
+            record,
+            ScannedWorktreeRecordV1::UnreadableCustody(CustodyReadRefusalV1::Unreadable(message)) if message == "sweep root is not pinnable"
+        )));
         std::fs::remove_dir_all(root).unwrap();
     }
 }
