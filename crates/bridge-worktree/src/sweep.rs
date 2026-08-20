@@ -1,16 +1,13 @@
 use crate::custody::{
-    custody_record_path, is_custody_record_name, read_custody_record_in, CustodyReadRefusalV1,
-    CustodySweepDispositionV1, WorktreeCustodyRecordV1,
+    custody_record_path, CustodyReadRefusalV1, CustodySweepDispositionV1, WorktreeCustodyRecordV1,
 };
 use crate::provider::{prune_argv, remove_argv};
-use crate::provider_path::{canonicalize_lenient, read_sidecar, sidecar_path};
+use crate::provider_path::{canonicalize_lenient, sidecar_path};
 use bridge_core::error::BridgeError;
 use bridge_core::execution_policy::WorktreeObjectIdentityV1;
 #[cfg(unix)]
 use bridge_core::fs_custody::BirthTimeV1;
-use bridge_core::fs_custody::{
-    verify_payload_directory_identity, DirectoryIdentityV1, PinnedDirectoryV1,
-};
+use bridge_core::fs_custody::{verify_payload_directory_identity, DirectoryIdentityV1};
 use bridge_core::liveness::LeaseProbe;
 use bridge_core::run_identity::{classify, Verdict};
 use bridge_core::SessionCwd;
@@ -18,7 +15,13 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::process::Command;
 
+mod checked_scan;
 mod report;
+
+use checked_scan::{
+    CheckedScanCompletedV1, CheckedScanOpenRefusalV1, CheckedScanRowV1, CompatibilityPinOpenerV1,
+    FilesystemCompatibilityPinOpenerV1, RootObservationSetV1,
+};
 
 pub use report::{
     CannotConstructSubjectV1, ClaimAuthorityObjectV1, ClaimAuthorityUnavailableReasonV1,
@@ -340,32 +343,28 @@ pub enum ScannedWorktreeRecordV1 {
 /// V3 entries are read through a single pinned handle on `root`, so the record open is
 /// descriptor-relative, no-follow, regular-file-only, single-link-only and byte-bounded.
 pub fn scan_worktree_records(root: &str) -> Vec<(String, ScannedWorktreeRecordV1)> {
-    let mut out = Vec::new();
-    let Ok(rd) = std::fs::read_dir(root) else {
-        return out;
-    };
-    let pinned = PinnedDirectoryV1::open(Path::new(root), "worktree sweep root").ok();
-    for e in rd.flatten() {
-        let p = e.path();
-        let ps = p.to_string_lossy().to_string();
-        if ps.ends_with(".meta.json") {
-            if let Some(s) = read_sidecar(&ps) {
-                out.push((ps, ScannedWorktreeRecordV1::Legacy(s)));
-            }
-        } else if is_custody_record_name(&ps) {
-            let scanned = match pinned.as_ref() {
-                Some(dir) => match read_custody_record_in(dir, &e.file_name()) {
-                    Ok(record) => ScannedWorktreeRecordV1::Custody(Box::new(record)),
-                    Err(refusal) => ScannedWorktreeRecordV1::UnreadableCustody(refusal),
-                },
-                None => ScannedWorktreeRecordV1::UnreadableCustody(
-                    CustodyReadRefusalV1::Unreadable("sweep root is not pinnable".to_string()),
-                ),
-            };
-            out.push((ps, scanned));
-        }
-    }
-    out
+    scan_worktree_records_with_pin_opener(root, FilesystemCompatibilityPinOpenerV1)
+}
+
+fn project_action_scan_result(
+    result: Result<CheckedScanCompletedV1, CheckedScanOpenRefusalV1>,
+) -> Vec<(String, ScannedWorktreeRecordV1)> {
+    result
+        .map(CheckedScanCompletedV1::into_action_rows)
+        .unwrap_or_default()
+}
+
+fn scan_worktree_records_with_pin_opener<P>(
+    root: &str,
+    pin_opener: P,
+) -> Vec<(String, ScannedWorktreeRecordV1)>
+where
+    P: CompatibilityPinOpenerV1,
+{
+    project_action_scan_result(checked_scan::scan_compatibility_with_pin_opener(
+        Path::new(root),
+        pin_opener,
+    ))
 }
 
 /// Does `record_file` name the custody record of its own existing worktree sibling?
@@ -536,22 +535,125 @@ fn decide_unused_custody_record(
         .map(|candidate| decide_unused_candidate(&candidate, false, probe))
         .unwrap_or(UnusedCandidateDecisionV1::Refused)
 }
-pub fn sweep_orphans_with_exact_absence(root: &str, probe: &dyn ExactAbsenceProbeV1) {
-    let Ok(root) = canonicalize_lenient(root) else {
-        return;
-    };
-    for (path, scanned) in scan_worktree_records(root.as_str()) {
-        let decision = match scanned {
-            ScannedWorktreeRecordV1::Legacy(sidecar) => {
-                decide_unused_legacy_sidecar(&root, &path, &sidecar, probe)
-            }
-            ScannedWorktreeRecordV1::Custody(record) => {
-                decide_unused_custody_record(&root, &path, &record, probe)
-            }
-            ScannedWorktreeRecordV1::UnreadableCustody(_) => UnusedCandidateDecisionV1::Refused,
-        };
-        tracing::info!(record = path, ?decision, "made exact-absence decision");
+struct ExactScanProjectionRowV1 {
+    checked: CheckedScanRowV1,
+    decision: UnusedCandidateDecisionV1,
+}
+
+struct ExactScanCompleteV1 {
+    canonical_root: SessionCwd,
+    iterator_error_count: usize,
+    root_observations: RootObservationSetV1,
+    rows: Vec<ExactScanProjectionRowV1>,
+}
+
+enum ExactScanOutcomeV1 {
+    Refused {
+        canonical_root: Option<SessionCwd>,
+        refusal: ExactAbsenceRootRefusalV1,
+    },
+    Complete(ExactScanCompleteV1),
+}
+
+type ExactScanCompletePartsV1 = (
+    SessionCwd,
+    usize,
+    RootObservationSetV1,
+    Vec<ExactScanProjectionRowV1>,
+);
+type ExactScanRefusalPartsV1 = (Option<SessionCwd>, ExactAbsenceRootRefusalV1);
+
+impl ExactScanOutcomeV1 {
+    fn into_exact_parts(self) -> Result<ExactScanCompletePartsV1, ExactScanRefusalPartsV1> {
+        match self {
+            Self::Refused {
+                canonical_root,
+                refusal,
+            } => Err((canonical_root, refusal)),
+            Self::Complete(complete) => Ok((
+                complete.canonical_root,
+                complete.iterator_error_count,
+                complete.root_observations,
+                complete.rows,
+            )),
+        }
     }
+}
+
+fn project_exact_scan_result(
+    canonical_root: SessionCwd,
+    result: Result<CheckedScanCompletedV1, CheckedScanOpenRefusalV1>,
+    probe: &dyn ExactAbsenceProbeV1,
+) -> ExactScanOutcomeV1 {
+    let Ok((checked_rows, iterator_error_count, root_observations)) =
+        result.map(CheckedScanCompletedV1::into_exact_parts)
+    else {
+        return ExactScanOutcomeV1::Refused {
+            canonical_root: Some(canonical_root),
+            refusal: ExactAbsenceRootRefusalV1::CannotEnumerate,
+        };
+    };
+    let mut rows = Vec::with_capacity(checked_rows.len());
+    for checked in checked_rows {
+        let decision = match checked.parts() {
+            (path, _, ScannedWorktreeRecordV1::Legacy(sidecar)) => {
+                decide_unused_legacy_sidecar(&canonical_root, path, sidecar, probe)
+            }
+            (path, _, ScannedWorktreeRecordV1::Custody(record)) => {
+                decide_unused_custody_record(&canonical_root, path, record, probe)
+            }
+            (_, _, ScannedWorktreeRecordV1::UnreadableCustody(_)) => {
+                UnusedCandidateDecisionV1::Refused
+            }
+        };
+        let projection_row = ExactScanProjectionRowV1 { checked, decision };
+        let path = projection_row.checked.record_path();
+        let decision = projection_row.decision;
+        tracing::info!(record = path, ?decision, "made exact-absence decision");
+        rows.push(projection_row);
+    }
+    ExactScanOutcomeV1::Complete(ExactScanCompleteV1 {
+        canonical_root,
+        iterator_error_count,
+        root_observations,
+        rows,
+    })
+}
+
+fn sweep_orphans_with_exact_absence_with_pin_opener<P>(
+    root: &str,
+    probe: &dyn ExactAbsenceProbeV1,
+    pin_opener: P,
+) -> ExactScanOutcomeV1
+where
+    P: CompatibilityPinOpenerV1,
+{
+    let canonical_root = match canonicalize_lenient(root) {
+        Ok(canonical_root) => canonical_root,
+        Err(_) => {
+            return ExactScanOutcomeV1::Refused {
+                canonical_root: None,
+                refusal: ExactAbsenceRootRefusalV1::CannotCanonicalize,
+            };
+        }
+    };
+    project_exact_scan_result(
+        canonical_root.clone(),
+        checked_scan::scan_compatibility_with_pin_opener(
+            Path::new(canonical_root.as_str()),
+            pin_opener,
+        ),
+        probe,
+    )
+}
+
+pub fn sweep_orphans_with_exact_absence(root: &str, probe: &dyn ExactAbsenceProbeV1) {
+    let outcome = sweep_orphans_with_exact_absence_with_pin_opener(
+        root,
+        probe,
+        FilesystemCompatibilityPinOpenerV1,
+    );
+    drop(outcome.into_exact_parts());
 }
 /// Reap only same-host **legacy** worktrees whose owner lease is free.
 ///
