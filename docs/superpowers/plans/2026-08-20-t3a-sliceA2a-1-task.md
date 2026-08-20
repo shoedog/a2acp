@@ -17,19 +17,24 @@ re-derive the seam, do not restructure modules. This slice adds correctness
 evidence and the mandatory handoff. Nothing else.
 
 Verify before editing. You should find `crates/bridge-worktree/src/sweep/checked_scan.rs`
-at 492 lines — 199 nonblank production lines, a `mod tests` beginning at line
-254 containing 108 nonblank lines of shared harness (`Script`, `sidecar`,
-`decoded_custody`, `temp_root`) and exactly **four** `#[test]` functions
-totalling 110 nonblank lines. `sweep.rs` is already routed through the child
-module and has 29 `#[test]` functions, unchanged from the original base.
+present, containing a `#[cfg(test)] mod tests` with shared harness (`Script`,
+`sidecar`, `decoded_custody`, `temp_root`) and exactly **four** `#[test]`
+functions, named in Part 1 and Part 2 below. `sweep.rs` is already routed
+through the child module.
+
+Line counts are deliberately not stated as anchors here. Measure whatever you
+need yourself; nothing in this task depends on a line-count claim by the
+operator.
 
 ### Why this slice is scoped the way it is
 
-A previous retry stopped correctly at the mandatory sizing checkpoint. Measured
-at the candidate, the four landed tests cost **27.5 nonblank lines each**, so
-the full ~20-scenario matrix projects to ~630 lines against a 220-line row — the
-cap was mis-estimated by roughly 2.9x, and the same factor applies to the
-`sweep.rs` test row. That was invisible until real tests existed to measure.
+A previous retry stopped correctly at the mandatory sizing checkpoint. Measuring
+the four landed tests gave roughly 28 nonblank lines each, so the full
+~20-scenario matrix projects to about 630 lines against the original 220-line
+row — the cap was mis-estimated by roughly 2.9x, and the same factor applies to
+the `sweep.rs` test row. That was invisible until real tests existed to measure.
+Treat that ratio as background for why this slice is scoped narrowly, not as an
+anchor to validate.
 
 The evidence has therefore been split. **This slice owns correctness evidence:**
 the claims the refactor exists to preserve. A sibling slice owns characterization
@@ -198,8 +203,9 @@ line, no contingency, no borrowing.
 | Interim A2a-1 handoff | 88 | 100 |
 | **Total** | **288** | **390** |
 
-These caps derive from a **measured** 27.5 nonblank lines per test at this
-candidate, not an estimate. If a row will exceed its cap, stop and report the
+These caps derive from the observed cost of the tests already in this file —
+roughly 28 nonblank lines each — rather than from a guess. Re-measure against
+the real base before editing. If a row will exceed its cap, stop and report the
 revised estimate rather than compressing tests or evidence.
 
 ## Completion
