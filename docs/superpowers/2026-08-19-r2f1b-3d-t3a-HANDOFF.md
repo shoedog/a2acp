@@ -18,8 +18,8 @@
 
 ## 1. Resume order
 
-1. **A2a spec authoring is the active task.** Owner decision at the cap: SPLIT, not a third fold. Boundary is sol's own: A2a = production-bound scan engine + compatibility-source refactor + preserved action-scanner projection + same-root conformance, **no public return-type change**; A2b = report return/population, root/capability evidence, platform matrix, mutation audit, on top of the accepted A2a commit. Input `docs/superpowers/plans/2026-08-19-t3a-sliceA2a-authoring-input.md`. When it returns: extract, verify anchors, `rustfmt --check` the seam subset, commit, then spec-review under a fresh 2-round cap.
-2. Then A2a implement → host gate → PR, same loop as A1. A2b is specced only after A2a is ACCEPTED — it is defined as building on the accepted A2a commit.
+1. **A2a-2 is the next work.** A2a-1 is COMPLETE and pushed as `a2a/a2a1-complete` (`c0ac87ce`): production refactor + 3 test fixes + 5 correctness tests + operator-filled handoff, all four gates green on host with a same-environment control. A2a-2 owns the TEN deferred characterization scenarios, listed in the A2a-1 task under "Deferred to A2a-2". Size it from the MEASURED ~28 nonblank lines per test, not an estimate.
+2. A2a-1 is not yet merged to `main` — open a PR from `a2a/a2a1-complete` when ready. A2b is specced only after the whole of A2a is accepted.
 3. The config swap window (worktrees + container writer) is independent and can happen any time — see §4 #2.
 4. The flake fix (§4 #3) is independent and increasingly worth doing.
 
@@ -38,7 +38,7 @@
 | agent reply surfacing | **LANDED** | PR #61 → `c637e493`; host gate 4,169/0/13 |
 | operator serve | **SWAPPED, RUNNING** | PID 23161, release `ee3b5966ad3b35ef`, binary-only swap, all 5 post-swap checks passed |
 | operator config candidate | **STAGED, NOT APPLIED** | `operator/a2a-bridge.candidate.toml`, SHA `67f3bf01…`; validate pass, doctor 31 ok/1 warn/0 fail |
-| T3a inc1 slice **A2** | **SPLIT into A2a/A2b at the 2-round cap** | v1 `4234517d` (11 findings) → v2 `2323866f` (8 valid, 1 blocker refuted) → owner chose split, not a 3rd fold. A2a spec authoring in flight |
+| T3a inc1 slice **A2** | **SPLIT: A2a-1 COMPLETE, A2a-2 pending; A2b after** | A2 v1-v2 (11 then 8 findings) → split to A2a → A2a v1-v4 (17→11→7→0 gating) → split again into A2a-1 (correctness) + A2a-2 (characterization). A2a-1 branch `a2a/a2a1-complete` = `c0ac87ce`, all gates green, two-commit custody complete |
 
 ## 3. Corrections to standing documents and memory
 
@@ -71,6 +71,8 @@
 - **Never mutation-skip a load-bearing test.** This lane has shipped four tests that proved less than they claimed. Revert the fix, confirm the test reds.
 - **Never count test totals by summing `test result:` lines** — a bridge-core test re-executes the binary as a filtered subprocess and inflates the sum by one. Count `Running` binaries + `Doc-tests` suites.
 - **Never stop the operator serve without checking `pane_current_command` first.** Its tmux pane runs the binary directly, so `C-c` ends the session; you then need `tmux new-session`, which may be permission-gated.
+- **Never write a fact into a spec that the task does not need.** `[MEASURED]` A falsification license makes EVERY stated fact load-bearing, so decorative precision is pure liability. Two dispatches were burned on operator line-count anchors (199/108/110 vs the true 218/107/111) that told the implementer nothing it could not measure itself. Root causes were an awk boundary left over from an exploratory command, and an off-by-one on the first `#[test]` line. State only what the work depends on.
+- **Never assume the implement container can run the gates.** `[MEASURED]` Its egress denies the pinned `a2a-lf` dependency, so `cargo` cannot build there; the harness verify container CAN, because it has a warmed read-only `CARGO_HOME`. Gates are operator-owned: the implementer marks them `PENDING OPERATOR`, the operator runs them on the host and makes the handoff-only evidence commit. Spec v2 had this split; v3/v4 lost it and one dispatch was rejected for it.
 - **Never accept a review finding without probing it when it is mechanically checkable.** `[MEASURED]` A2 round 2 raised a BLOCKER claiming rustfmt would rewrite the normative seam block. Under the pinned 1.94.0 toolchain, `rustfmt --check` exits **0** on the v2 block and **1** on the v1 block — the probe discriminates, and the reviewer was re-raising a fixed finding against the fixed artifact. Folding it would have reintroduced the round-1 defect. Reviewers regress too.
 - **Never dispatch an authoring or review run without checking what commit its `--session-cwd` is actually on.** `[MEASURED]` 2026-08-19: `.claude/worktrees/fold` sat at `9aedf175` while the A2 spec was authored against a stated base of `c637e493`; `sweep/report.rs` does not exist at `9aedf175`, so the agent could not have inspected the surface it claimed to inspect (it restated the authoring input, which supplied the same facts). Caught before the review round only because the same probe was run for the reviewer. Local `main` had silently lagged three merges behind `origin/main`. Probe: `git -C <cwd> rev-parse HEAD` and confirm one file the work depends on exists there.
 - **A backgrounded `nohup ... &` reports exit 0 the instant it detaches.** `[MEASURED]` the spec-review task notified "completed (exit code 0)" while PID 95068 was still mid-run with both lenses started. Confirm with `pgrep -fl` and the presence of the `--out` artifact, never the notification.
