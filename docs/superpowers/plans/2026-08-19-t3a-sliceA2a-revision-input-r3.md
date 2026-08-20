@@ -1,0 +1,1091 @@
+---
+task-type: implement
+---
+
+# Revise the A2a task spec to v3 — resolve the seam-visibility question, fold ten findings
+
+## Description
+
+Your A2a spec v2 drew 11 valid findings in its second review. The reviewer
+adjudicated every round-1 finding **FIXED** and re-reported none, so this is a
+converging loop, not a restart. The owner has authorized one disclosed round
+past the declared 2-round cap on that basis.
+
+Produce the **complete revised A2a task spec v3**. Not a review response, not a
+changelog, not a diff — the whole spec, ready for an implementer.
+
+Emit it between the extraction markers, nothing outside them.
+
+### The one decision that drives this round
+
+Five of the eleven findings (B2, B3, B4, M7, M8, and N11) are instances of a
+single unresolved question:
+
+> **What exactly does `checked_scan.rs` expose to `sweep.rs`, with what
+> visibility, and how do tests reach it?**
+
+v2 answered "as little as possible," which is a defensible instinct — it is why
+you moved the engine into the child module in the first place, and that
+structural choice was right. But v2 then required the parent to match a
+child-private enum variant, required an injected-source conformance matrix that
+no declared interface can construct, and required an unchanged-decision test
+that cannot observe the decisions it checks.
+
+**Resolve the whole question once, deliberately, and let the five findings fall
+out of that single decision.** Do not patch them individually — that is how a
+seam ends up with five ad-hoc accessors.
+
+Design the private seam so that:
+
+- every type named in a `pub(super)` signature is itself at least `pub(super)`;
+- the mandatory injected conformance matrix runs through the **real** production
+  projections, not through duplicated test logic;
+- the unchanged-decision evidence observes **production-computed** decisions;
+- values A2b immediately needs — iterator status, root observations, and the
+  canonical root observed before an enumeration refusal — survive rather than
+  being erased by a lossy `into_rows`;
+- the public `sweep_orphans_with_exact_absence` still returns `()`.
+
+You may restructure the seam block freely to achieve this. It is not frozen
+across rounds — only its *formatting* is constrained, per the standing
+requirement below.
+
+### Environment facts
+
+Your working tree is at `c637e493`, the base commit, and the repository is
+authoritative. Read the code; where you assert a fact you may be asked which
+file and line you read it from.
+
+You cannot read anything outside the repository — no `~`, no `$HOME`, no
+installed templates — and the spec must never name a path outside the
+repository, because the implementer runs in a container with only the code tree
+mounted.
+
+---
+
+## Operator-verified findings — measured, not open to reinterpretation
+
+### B2 (BLOCKER) — CONFIRMED, and it is a hard error, not a lint
+
+v2 declares `enum CheckedScanOpenRefusalV1` child-private (spec line 155), makes
+`scan_compatibility_with_pin_opener` `pub(super)` returning it (line 309), and
+requires the parent to match `CannotEnumerate` (line 374).
+
+Compiled under the pinned 1.94.0 toolchain, treatment against control:
+
+| Arm | Enum visibility | Result |
+|---|---|---|
+| as v2 specifies | private | **exit 1 — `error[E0603]: enum CheckedScanOpenRefusalV1 is private`** |
+| suggested fix | `pub(super)` | **exit 0** |
+
+The review described this as something `-D warnings` "can reject." That
+understates it: **E0603 is a hard error** and fires at any lint level. The
+specified module structure does not compile.
+
+Apply the visibility rule stated above to every type in the seam, not only to
+this enum.
+
+### B6 (BLOCKER) — CONFIRMED against in-repo steering
+
+`AGENTS.md` lines 31-35 state: *"Before committing local changes in this repo,
+run the repository hygiene guard: `cargo run -p a2a-bridge -- validate
+--repo-hygiene`."*
+
+v2's "only completion rule" names four commands and omits it, so following the
+two-commit protocol as written produces commits that violate the repository
+contract. `AGENTS.md` is in the repository and readable in the container.
+
+Add the hygiene guard at **both** pre-commit points — before the
+implementation-candidate commit and before the handoff-only evidence commit —
+and require its result be recorded. Keep it distinct from the four gates: it is
+a pre-commit guard, not a test gate.
+
+### B5 (BLOCKER) — **REFUTED. Do not fold it as written.**
+
+The review claims v2's instruction not to consult an external template conflicts
+with "repository steering requiring every stable handoff to use
+`handoff-template.md`."
+
+Measured exhaustively:
+
+- `grep -rn -i 'handoff-template'` across every repo `*.md`, `*.toml`, and
+  `*.rs`: **no such requirement**. The only hits are this lane's own documents
+  describing a past failure, plus `prompts/dispatch-brief-contract.md:78`.
+- **No `handoff-template*` file exists in this repository at all.**
+- `AGENTS.md` never mentions it.
+- The requirement lives in the operator's **user-level** global steering, which
+  is not repository steering and is unreadable in the container (`HOME=/root`,
+  only the code tree mounted).
+
+**This is the exact defect that cost this lane two null dispatches.** An earlier
+spec in this lane told the agent to read `~/.claude/handoff-template.md`; the
+file does not exist in the container; the agent refused and produced nothing,
+twice. v2's instruction is the **fix**, not a violation. An instruction to read
+an unreachable template must never re-enter this spec.
+
+**Fold the reviewer's first suggested option instead:** state explicitly, in the
+handoff section, that the complete inline schema is the **owner-approved
+in-container replacement** for any external template, and that the host-side
+operator separately applies the installed template to the operator's own lane
+handoff. Make that explicit so a future reviewer does not re-raise it.
+
+---
+
+## Closed findings to fold
+
+### B3 (BLOCKER) — the injected matrix is not constructible
+
+Injected sources and completed results are confined to `checked_scan.rs` while
+the production helpers accept only a root and a pin opener. The mandatory
+injected cases — source-open refusal, iterator-error streams — therefore cannot
+traverse the real production projections; an implementer would have to duplicate
+projection logic in tests, which proves nothing about production.
+
+Freeze the production-used result-to-projection interfaces, including
+source-open refusal handling, and specify one authorized test-only
+completed-result construction path. Both the filesystem wrappers and the
+injected tests must call the same interfaces.
+
+### B4 (BLOCKER) — the unchanged-decision test cannot observe decisions
+
+`ExactScanProjectionV1` returns rows but not production-computed
+`UnusedCandidateDecisionV1` values; tracing capture is forbidden in A2a; and
+probe logs cannot observe early-refusal decisions. An implementation can assign
+the wrong decision to an `UnreadableCustody` row, keep identical rows and probe
+activity, and still pass.
+
+Return a decision-bearing private projection row, or provide a production-used
+decision observer — and drive the unchanged event from that same captured
+decision so the event and the assertion cannot diverge.
+
+### M7 (MAJOR) — the central contracts are unpinned
+
+Row and completed-result contracts omit literal field names, visibility, the
+iterator-error count type, construction rules, the exact `into_rows` signature,
+and the test factory the injected matrix needs. A2a and A2b can pick
+incompatible shapes.
+
+Freeze the complete private definitions and signatures. Use `usize` for the
+error count unless you have a stated reason otherwise, and specify the
+authorized test construction path.
+
+### M8 (MAJOR) — `into_rows` destroys what A2b needs
+
+Forcing both projections through `into_rows` discards iterator status and root
+observations, and on `CannotEnumerate` it also discards the canonical root that
+was already successfully observed. A2b needs all three immediately and would
+otherwise have to replace the seam or re-canonicalize against filesystem state
+that may have changed.
+
+Let only the **action** projection erase metadata. Retain iterator status,
+observations, canonical root, rows, and decisions in a richer private exact
+outcome, while the public A2a wrapper still returns `()`.
+
+### M9 (MAJOR) — the whitespace check is vacuous
+
+Bare `git diff --check` at a clean implementation commit inspects nothing, and
+it never sees the staged handoff. Record `git diff --check <base>..<candidate>`
+and run `git diff --cached --check` immediately before the handoff-only commit.
+
+### M10 (MAJOR) — event preservation is not event correctness
+
+Preserving the event literal does not prove exactly one event per retained row,
+emitted after that row's assessment. Duplicates or premature emission satisfy
+v2's evidence.
+
+Without adding tracing capture, require a source audit proving exactly one
+unguarded exact-absence event call site, inside the post-`finish` row loop,
+after decision computation, with no duplicate emitter.
+
+### N11 (MINOR) — duplicated refusal vocabulary
+
+`ExactScanProjectionRefusalV1` duplicates the existing
+`ExactAbsenceRootRefusalV1` and is slated for immediate translation or removal
+in A2b. Reuse the existing vocabulary where sufficient, or fold it into the one
+richer private exact outcome from M8 that also preserves canonical-root
+evidence.
+
+### N12 (MINOR) — an acceptance criterion reads repository-wide
+
+"Only the six pinned field-scoped allowances are present" can be read across the
+repository, contradicting the four unchanged constructor allowances in
+`report.rs`. Scope the constraint explicitly to `checked_scan.rs` and state that
+`report.rs`'s four existing allowances remain additional and unchanged.
+
+---
+
+## Standing constraints
+
+**Formatting.** Any Rust text the spec declares normative must pass
+`rustfmt --check --edition 2021` under the pinned 1.94.0 toolchain exactly as
+written. The operator verifies this mechanically every round.
+
+You are restructuring the seam this round, so re-derive its formatting rather
+than copying v2's block. Two measured cautions from this lane's history:
+
+- a signature that fits on one line **at exactly 100 characters** will be
+  wrapped by rustfmt onto a continuation line — `read_legacy` in v2 was
+  reformatted for precisely this reason, and the v2 text you emitted had
+  reverted to a hand-split form that `rustfmt --check` rejected;
+- an earlier review raised a rustfmt BLOCKER against a block that was already
+  clean; that finding was **refuted by measurement**. Do not reformat normative
+  text in response to a formatting *assertion* — only in response to a
+  formatting *measurement*.
+
+**Sizing.** Keep v2's deterministic counted-line metric — added nonblank
+physical lines after the fmt gate, one row per line, no contingency, no
+borrowing. Re-derive every row for v3. v2 estimated 500 against a 595 cap. A
+richer exact outcome and the pinned contracts will add lines; the hygiene guard
+and audits add a few more. Report an honest estimate against a cap you set, and
+if it exceeds v2's cap say so plainly and justify it rather than compressing
+evidence to fit.
+
+**Deferred.** Keep v2's `### Deferred` section, covering both A2b's inherited
+items and the future attestation slice's four findings.
+
+## Output contract
+
+Emit the complete A2a task spec v3 between the markers, with:
+
+- the same front matter (`task-type: implement`);
+- `## Description`, `## Acceptance Criteria`, `## Files`, `## Spec Refs`,
+  `## Commit Message`;
+- a single coherent statement of the private seam: what is exposed, at what
+  visibility, and how tests construct and observe it;
+- every finding above folded, each resolved to one answer, not a menu;
+- the explicit owner-approved inline-handoff-schema statement from B5;
+- `### Deferred` carried forward;
+- a falsification license: the repository is authoritative, and an implementer
+  who finds a stated anchor false must stop and report rather than adapt;
+- no path outside the repository anywhere in the document.
+
+---
+
+## Reference — A2a spec v2, verbatim
+
+Revise the document below. Reproduce heading levels as they appear. This
+reference ends at the end of the document.
+
+
+# R2f1b 3d T3a increment 1, slice A2a v2 — production-bound compatibility scan engine
+
+## Description
+
+Implement slice A2a against exact base commit `c637e493544a2e2edd1ca3ae20842a86dcb58f3f`.
+
+Direct read-only inspection of the clean repository tree at that commit confirmed:
+
+- `sweep_orphans_with_exact_absence` returns `()`, canonicalizes the supplied root with `canonicalize_lenient`, drains `scan_worktree_records`, makes the existing decisions, and emits the existing per-row event;
+- `scan_worktree_records` eagerly returns `Vec<(String, ScannedWorktreeRecordV1)>`;
+- that scanner calls `std::fs::read_dir` before attempting `PinnedDirectoryV1::open`;
+- a `read_dir` failure returns an empty vector;
+- iterator-item errors are flattened;
+- malformed or unreadable legacy sidecars are silently omitted through `read_sidecar`;
+- custody-named entries remain represented as decoded custody records or `UnreadableCustody`;
+- custody pin failure preserves legacy reads and yields
+  `CustodyReadRefusalV1::Unreadable("sweep root is not pinnable".to_string())`
+  for custody names;
+- the exact-absence route passes its lenient-canonical root to the scanner;
+- `sweep_orphans`, `WorktreeRunEndGuard`, and the custody-lock test use the public action scanner with the raw root supplied by their caller;
+- `sweep_orphans` calls `sweep_orphans_with_exact_absence` in statement position, then independently canonicalizes its action guard root;
+- `EXACT_ABSENCE_POLICY_READY_V1` remains false;
+- the A1 report module remains 598 lines and retains four constructor `dead_code` allowances;
+- `crates/bridge-worktree/Cargo.toml` has exactly two dev-dependencies: `bridge-coordinator` and `bridge-controller`;
+- the pinned toolchain is Rust 1.94.0 with rustfmt, clippy, and LLVM tools;
+- `PinnedDirectoryV1` exposes captured identity and descriptor-relative custody reads, while bridge-core’s descriptor-name enumerator is crate-private and unavailable to `bridge-worktree`;
+- `deepest_existing_path` is defined at `crates/bridge-core/src/fs_custody.rs:1511` and installed as the production resolver at line 1777;
+- the checked-in CI coverage job runs `cargo llvm-cov --workspace` on `ubuntu-latest`.
+
+These are source-tree anchors, not build or test evidence. No build or test was run while authoring this specification.
+
+Before editing, verify the exact base commit, require a clean worktree, and re-read every authoritative file under “Spec Refs.” If any factual anchor is false at that commit, apply the falsification license instead of adapting the implementation to a stale claim.
+
+### Scope and settled boundary
+
+A2a owns:
+
+- one private checked-scan module containing the compatibility source, session, mandatory engine, completed result, and deterministic injected source tests;
+- one production-bound checked-scan engine used by both the exact-absence and compatibility/action projections;
+- one shared display-name selection and read policy;
+- a private exact-route pin-opener seam below supplied-root canonicalization;
+- deterministic injected-source equivalence evidence for both projections, including source-open refusal, pin failure, malformed legacy input, unreadable custody input, iterator errors, exact names, and ordered enumeration;
+- preservation of the public action scanner’s eager vector projection and raw-root behavior;
+- preservation of the public exact-absence function’s unit return and current assessment and event behavior;
+- the decision about enumeration-descriptor ownership on the A2a/A2b boundary;
+- external compile-time assertions for the visibility and complete signatures of both public scan functions;
+- the exact `effective()` iterator item-type assertion;
+- structural, mechanism, characterization, and injected conformance evidence for the refactor;
+- an interim A2a handoff durably recording the exact implementation commit, source audit, gate evidence, exclusions, and final counted-line worksheet.
+
+A2a does not:
+
+- change the public signature or return type of `sweep_orphans_with_exact_absence`;
+- populate an `ExactAbsenceSweepReportV1`;
+- change any public report type, accessor, iterator, readiness rule, or constructor allowance;
+- add report refusal, requested-root, canonical-root, iterator-status, entry, root-observation, or effective-entry behavior;
+- add eager report assessment or new tracing behavior;
+- add scoped tracing capture or a `tracing-subscriber` dependency;
+- add any filesystem observation, filesystem-attestation utility, platform-labelled fixture gate, or new dependency;
+- populate authoritative root captures in production;
+- characterize registration-path UTF-8 behavior;
+- perform the final mutation audit or final combined A2 handoff;
+- add the increment-2 population-admission rule;
+- set `EXACT_ABSENCE_POLICY_READY_V1` to true;
+- construct `IneligiblePopulation` or `CannotConstructSubject` production assessments;
+- add ownership, locking, transition, publication, settlement, unlink, removal, prune, rename, backend-cleanup, or T3b authority;
+- change CLI behavior;
+- claim that a scan result is action authority.
+
+A2b starts from the accepted two-commit A2a tip and owns report return and population, eager assessment and tracing evidence, retained enumeration-descriptor and root evidence, birthtime-capability evidence, UTF-8 characterization, the complete platform matrix, the mutation audit, and the final combined A2 handoff.
+
+T3a decides and reports. T3b will independently re-open, re-read, re-bind, re-apply admission, re-prove exact absence, and retain its own lock and action-time authority through any later effect.
+
+### Filesystem evidence posture
+
+A2a makes no new claim about filesystem identity, mount identity, filesystem type, or real-directory traversal ordering. It adds no filesystem observation and preserves the existing `read_dir`, `read_sidecar`, `read_custody_record_in`, and custody pin-open semantics exactly. Genuine runtime red is forbidden because both public behaviors and return types remain unchanged.
+
+A2a’s projection-equivalence claim is proved with injected deterministic sources. Those sources can force exact ordered name streams, source-open refusal, pin failure, malformed or unreadable legacy input, every required custody refusal, iterator errors, exact non-UTF-8 names, and non-default root observations. This is stronger evidence for the projection claim than relying on conditions a real directory cannot reliably or portably reproduce.
+
+The checked-in CI coverage lane runs the workspace suite on Ubuntu, and the operator’s established host gate runs the same suite on macOS. When those existing lanes execute the accepted A2a tree, the unchanged compatibility source is exercised on their respective filesystems. Those executions are ordinary suite evidence, not bespoke A2a filesystem attestations.
+
+Attested real-filesystem conformance is a separate future slice sequenced with A2b’s platform matrix, where the birthtime-capability question already belongs. That slice must not be inferred complete from A2a’s deterministic projection evidence.
+
+Two independent real `read_dir` traversals have no specified relative order. A2a therefore has no ordered-equality oracle across real traversals. It proves exact order preservation only against injected deterministic name streams.
+
+### Public API preservation
+
+The public exact-absence declaration remains exactly:
+
+```rust
+pub fn sweep_orphans_with_exact_absence(root: &str, probe: &dyn ExactAbsenceProbeV1)
+```
+
+It continues to return `()`. Do not add a report-returning overload, compatibility wrapper, new public scanner, or public test seam.
+
+The public action scanner remains exactly:
+
+```rust
+pub fn scan_worktree_records(root: &str) -> Vec<(String, ScannedWorktreeRecordV1)>
+```
+
+Every existing caller continues to compile without source changes unless an import or internal routing change is mechanically necessary. The fifteen report types, `effective()` iterator, false readiness gate, four A1 constructor allowances, and stale A1-to-A2 constructor comments remain untouched for A2b.
+
+Add this external integration-test assertion in `crates/bridge-worktree/tests/r2f1b_exact_absence_report_api.rs` so both `pub` visibility and the complete function types are compiler-enforced from outside the crate:
+
+```rust
+#[test]
+fn public_scan_functions_keep_visibility_and_exact_signatures() {
+    let _: fn(&str) -> Vec<(String, ScannedWorktreeRecordV1)> = scan_worktree_records;
+    let _: fn(&str, &dyn ExactAbsenceProbeV1) = sweep_orphans_with_exact_absence;
+}
+```
+
+Import the four referenced public names through `bridge_worktree::sweep`. An accidental visibility reduction or signature change must fail compilation of the integration-test crate.
+
+Replace the existing untyped `let _ = report.effective();` check with this exact test-only item-type assertion, leaving production report code unchanged:
+
+```rust
+fn assert_effective_item_type<'a>(
+    _: impl Iterator<Item = &'a ExactAbsenceSweepEntryV1>,
+) {
+}
+```
+
+Within `assert_public_accessor_signatures`, invoke it as:
+
+```rust
+assert_effective_item_type(report.effective());
+```
+
+Because A2a adds no public break and no new observable behavior, it has no genuine behavioral-red test against the untouched base. Its evidence is base-green characterization, new-private-seam mechanism evidence, production-route structural evidence, injected conformance evidence, evidence-infrastructure mechanism evidence, and compiler API-preservation evidence. Do not manufacture a runtime-red claim.
+
+### Private checked-scan module and pinned seam
+
+Create `crates/bridge-worktree/src/sweep/checked_scan.rs` and declare it as a private child module of `sweep.rs`.
+
+The engine, source trait, session trait, concrete source, concrete session, and injected source stay inside `checked_scan.rs`. `sweep.rs` may receive only the completed scan result and row vocabulary exposed by that child. This placement is chosen because Rust module privacy prevents the parent from driving a session directly; the durable source audit therefore corroborates exclusivity instead of carrying it alone.
+
+Land the following v2 seam exactly as written. It is the rustfmt-clean A2a/A2b declaration boundary:
+
+```rust
+use std::ffi::{OsStr, OsString};
+use std::path::Path;
+
+use bridge_core::fs_custody::{BirthTimeV1, PinnedDirectoryV1};
+
+use crate::custody::{CustodyReadRefusalV1, WorktreeCustodyRecordV1};
+use crate::provider_path::WorktreeSidecar;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CheckedScanOpenRefusalV1 {
+    CannotEnumerate,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CheckedScanEntryRefusalV1 {
+    CannotReadEntry,
+}
+
+trait CheckedScanSourceV1 {
+    fn open(
+        &self,
+        enumeration_root: &Path,
+    ) -> Result<Box<dyn CheckedScanRootSessionV1>, CheckedScanOpenRefusalV1>;
+}
+
+trait CheckedScanRootSessionV1 {
+    fn next_name(&mut self) -> Option<Result<OsString, CheckedScanEntryRefusalV1>>;
+
+    fn read_legacy(&self, enumerated_name: &OsStr, record_display: &str)
+        -> Option<WorktreeSidecar>;
+
+    fn read_custody(
+        &self,
+        enumerated_name: &OsStr,
+    ) -> Result<WorktreeCustodyRecordV1, CustodyReadRefusalV1>;
+
+    fn finish(self: Box<Self>) -> RootObservationSetV1;
+}
+
+pub(super) trait CompatibilityPinOpenerV1 {
+    fn open_pin(&self, enumeration_root: &Path) -> Option<PinnedDirectoryV1>;
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub(super) struct FilesystemCompatibilityPinOpenerV1;
+
+impl CompatibilityPinOpenerV1 for FilesystemCompatibilityPinOpenerV1 {
+    fn open_pin(&self, enumeration_root: &Path) -> Option<PinnedDirectoryV1> {
+        PinnedDirectoryV1::open(enumeration_root, "worktree sweep root").ok()
+    }
+}
+
+struct CompatibilityCheckedScanSourceV1<P> {
+    pin_opener: P,
+}
+
+impl<P: CompatibilityPinOpenerV1> CompatibilityCheckedScanSourceV1<P> {
+    const fn new(pin_opener: P) -> Self {
+        Self { pin_opener }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct RootIdentityCaptureV1 {
+    #[allow(dead_code)]
+    dev: Option<u64>,
+    #[allow(dead_code)]
+    ino: Option<u64>,
+    #[allow(dead_code)]
+    birthtime: Option<BirthTimeV1>,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct RootObservationSetV1 {
+    #[allow(dead_code)]
+    retained_enumeration_object: Option<RootIdentityCaptureV1>,
+    #[allow(dead_code)]
+    pinned_custody_directory: Option<RootIdentityCaptureV1>,
+    #[allow(dead_code)]
+    final_named_root: Option<RootIdentityCaptureV1>,
+}
+```
+
+Do not place `#[allow(dead_code)]` on the module. The only allowances are the six field-scoped attributes above, which cannot conceal unrelated dead code.
+
+A2a intentionally omits the v1 block’s unused `CustodyRootObservationV1` import, `complete_identity`, and `classify_root_observations`. A2b adds those declarations when it consumes them for report population. A2a still carries `RootIdentityCaptureV1` and `RootObservationSetV1` because `finish`, the completed engine result, and the non-default-observation projection test consume that boundary.
+
+Any seam text A2a lands must pass `cargo fmt --all -- --check` under the pinned Rust 1.94.0 toolchain. Do not reformat the pinned text merely because an earlier review asserted a formatting problem; that assertion was refuted by mechanical measurement.
+
+### Compatibility source
+
+Implement `CompatibilityCheckedScanSourceV1<P>` with the current filesystem policy and parameterize only custody pin opening.
+
+Its A2a open sequence is exact:
+
+1. Call `std::fs::read_dir(enumeration_root)`.
+2. Return `CheckedScanOpenRefusalV1::CannotEnumerate` only if that call fails.
+3. After successful `read_dir`, call `open_pin(enumeration_root)`.
+4. Retain the `ReadDir` and returned `Option<PinnedDirectoryV1>` in the private session.
+5. Permit legacy reads through path-based `read_sidecar` regardless of pin outcome.
+6. With no custody pin, return
+   `CustodyReadRefusalV1::Unreadable("sweep root is not pinnable".to_string())`
+   for every custody read.
+7. Consume the session in `finish` and return `RootObservationSetV1::default()`.
+
+A pin failure is not a source-open failure. A readable directory with a failed custody pin must still enumerate completely, preserve valid legacy rows, and retain every custody-named row with the exact not-pinnable refusal.
+
+`next_name` maps each successful `ReadDir` item to its exact `OsString`, maps each iterator error to `CheckedScanEntryRefusalV1::CannotReadEntry`, and returns `None` only when enumeration ends. It must not reconstruct an exact name from lossy display text.
+
+`read_legacy` calls the existing `read_sidecar(record_display)`. `read_custody` calls the existing `read_custody_record_in` with the retained custody pin and exact enumerated name. No new legacy decoder, custody decoder, selection vocabulary, or read policy is permitted.
+
+### Shared selection and mandatory engine
+
+Define the private row and completed-result types in `checked_scan.rs`.
+
+Each row owns:
+
+- the lossy full display path;
+- the exact enumerated `OsString`;
+- the selected `ScannedWorktreeRecordV1`.
+
+The completed result owns:
+
+- the ordered rows;
+- the iterator-error count;
+- the `RootObservationSetV1`.
+
+Expose the completed result and row only as `pub(super)` types needed by `sweep.rs`. Do not expose the source or session traits. The completed result must provide one consuming `into_rows` operation used by both production projections; that operation deliberately drops the iterator-error count and root observations. It must not make either detail public.
+
+The engine declaration is exactly:
+
+```rust
+fn scan_checked_rows_with_source(
+    enumeration_root: &Path,
+    source: &dyn CheckedScanSourceV1,
+) -> Result<CheckedScanCompletedV1, CheckedScanOpenRefusalV1>
+```
+
+The engine borrows the source only for `open`, owns the returned boxed session, and returns one owned completed result. It performs no canonicalization and passes `CheckedScanOpenRefusalV1::CannotEnumerate` through unchanged.
+
+Its protocol is exact:
+
+1. Call `source.open(enumeration_root)`.
+2. Repeatedly call `next_name`.
+3. Count an `Err` item and continue.
+4. For each successful name, retain the exact `OsString`.
+5. Construct the lossy full display path by joining `enumeration_root` with that exact name.
+6. Apply one shared classifier preserving the base legacy suffix and custody-name rules.
+7. Immediately perform the selected legacy or custody read before requesting the next name.
+8. Silently omit a legacy row when `read_sidecar` returns `None`.
+9. Retain decoded custody and custody-refusal rows in injected or filesystem enumeration order.
+10. Ignore unrelated names.
+11. Call `finish` exactly once after `next_name` returns `None`.
+12. Return the ordered rows, iterator-error count, and observation set.
+
+A custody read or decode refusal is a retained row, not an iterator error. A malformed or unreadable legacy sidecar remains silently omitted and contributes neither a row nor an iterator error.
+
+Add this child-module production entry point:
+
+```rust
+pub(super) fn scan_compatibility_with_pin_opener<P>(
+    enumeration_root: &Path,
+    pin_opener: P,
+) -> Result<CheckedScanCompletedV1, CheckedScanOpenRefusalV1>
+where
+    P: CompatibilityPinOpenerV1,
+```
+
+It constructs `CompatibilityCheckedScanSourceV1`, invokes `scan_checked_rows_with_source`, and does nothing else.
+
+No production code outside `checked_scan.rs` can name `CheckedScanSourceV1`, `CheckedScanRootSessionV1`, or their methods. Within the non-test portion of `checked_scan.rs`, `scan_checked_rows_with_source` is the only function permitted to call `next_name`, `read_legacy`, `read_custody`, or `finish`.
+
+### Production projections and refusal mappings
+
+Add the private action helper with this complete signature:
+
+```rust
+fn scan_worktree_records_with_pin_opener<P>(
+    root: &str,
+    pin_opener: P,
+) -> Vec<(String, ScannedWorktreeRecordV1)>
+where
+    P: CompatibilityPinOpenerV1,
+```
+
+It:
+
+- passes `Path::new(root)` directly to `scan_compatibility_with_pin_opener`;
+- returns an empty vector on `CheckedScanOpenRefusalV1::CannotEnumerate`;
+- consumes a successful completed result through `into_rows`;
+- discards iterator-error and root-observation details;
+- projects every retained row into the existing `(String, ScannedWorktreeRecordV1)` shape.
+
+Production `scan_worktree_records` delegates to this helper with `FilesystemCompatibilityPinOpenerV1`.
+
+Define these private exact-route types in `sweep.rs`:
+
+```rust
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ExactScanProjectionRefusalV1 {
+    CannotCanonicalize,
+    CannotEnumerate,
+}
+
+struct ExactScanProjectionV1 {
+    rows: Vec<CheckedScanRowV1>,
+}
+```
+
+`ExactScanProjectionV1` exists only so in-module tests can inspect the full selected rows after assessment. It is not public, is not a report, and exposes no action authority.
+
+Add the report-side helper with this complete signature:
+
+```rust
+fn sweep_orphans_with_exact_absence_with_pin_opener<P>(
+    root: &str,
+    probe: &dyn ExactAbsenceProbeV1,
+    pin_opener: P,
+) -> Result<ExactScanProjectionV1, ExactScanProjectionRefusalV1>
+where
+    P: CompatibilityPinOpenerV1,
+```
+
+Its order and mappings are fixed:
+
+1. Invoke `canonicalize_lenient(root)`.
+2. Map failure to `Err(ExactScanProjectionRefusalV1::CannotCanonicalize)` without consulting the opener or source.
+3. After successful canonicalization, call `scan_compatibility_with_pin_opener` with the canonical root and supplied opener.
+4. Map `CheckedScanOpenRefusalV1::CannotEnumerate` to
+   `Err(ExactScanProjectionRefusalV1::CannotEnumerate)`.
+5. On success, consume the completed result through the same `into_rows` operation as the action projection, thereby discarding iterator-error and root-observation details.
+6. Only after the entire engine has enumerated, read every selected record, observed `None`, and called `finish`, iterate the retained rows by reference and perform the existing assessments.
+7. Emit the existing event unchanged for every retained row:
+   `tracing::info!(record = path, ?decision, "made exact-absence decision");`.
+8. Return `Ok(ExactScanProjectionV1 { rows })` after assessment.
+
+Production `sweep_orphans_with_exact_absence` evaluates this helper with `FilesystemCompatibilityPinOpenerV1`, explicitly discards either private result, and returns `()`.
+
+Module tests inspect exact-route success through the private `ExactScanProjectionV1.rows` field. They inspect canonicalization and source-open refusals by matching the exact private enum variants. No sentinel, `Option`, public exposure, or untyped refusal is permitted.
+
+The injected engine tests construct completed results with non-default root observations and pass them through the same consuming `into_rows` path used by both production projections. They must show unchanged ordered rows and unchanged exact-route probe calls relative to a default-observation control. This is the test-only projection seam selected to resolve the otherwise untestable discard claim; it does not alter the production opener contract.
+
+### Preserved action projection
+
+The public action scanner retains every existing observable:
+
+- the exact public signature and eager vector return;
+- raw-root `read_dir` and raw-root pin opening;
+- no canonicalization of its enumeration argument;
+- source-open failure producing an empty vector;
+- iterator-item errors being flattened;
+- legacy reads using the lossy full display path;
+- malformed or unreadable legacy sidecars being omitted;
+- custody selection using `is_custody_record_name`;
+- custody reads using the exact enumerated `OsString`;
+- decoded custody records retaining full structural equality;
+- custody refusals retaining their exact variants and messages;
+- pin failure preserving legacy rows and refusing custody rows as not pinnable;
+- source enumeration order.
+
+Existing consumers of `scan_worktree_records`, including the run-end guard and custody-lock coverage, continue to use only this public projection.
+
+### Preserved exact/action root separation
+
+The exact-absence route continues to canonicalize the supplied root before enumeration. The action scanner continues to enumerate the caller’s raw root spelling.
+
+`sweep_orphans` remains behaviorally equivalent to:
+
+```rust
+sweep_orphans_with_exact_absence(
+    root,
+    &crate::host_git::HostGitWorktree::new(),
+);
+let Ok(root_cwd) = canonicalize_lenient(root) else {
+    tracing::warn!(root, "skipping worktree sweep with non-canonical root");
+    return;
+};
+for (path, scanned) in scan_worktree_records(root) {
+    // Existing compatibility/action behavior remains unchanged.
+}
+```
+
+A2a does not extract or alter the action phase, guard warning, removal decisions, custody classification, locking, or cleanup behavior.
+
+The refactor must preserve the eager ordering present at the base: the engine drains enumeration and performs selected reads before the exact route assesses or logs any row. An injected operation log must prove that no probe assessment occurs before `next_name` returns `None` and `finish` completes.
+
+### Injected deterministic conformance matrix
+
+The full A2a projection-equivalence matrix is driven by two equivalent injected source sessions with the same explicitly ordered stream. One completed result passes through the production action projection; the other passes through the production exact assessment projection. The exact projection’s private returned rows are the comparison point for decoded custody values that are not visible in a decision alone.
+
+Compare ordered projections as follows:
+
+| Injected condition | Required evidence |
+|---|---|
+| Valid matching legacy sidecar | Both projections select the same display path and structurally equal `WorktreeSidecar`. |
+| Malformed or unreadable legacy sidecar | `read_legacy` returns `None`; both projections omit the name. |
+| Valid custody record | Both projections select the same display path and retain structurally equal decoded `WorktreeCustodyRecordV1` values before exact assessment. |
+| Malformed custody record | Both projections retain the same `CustodyReadRefusalV1::Decode` value. |
+| Over-bound custody record | Both projections retain `CustodyReadRefusalV1::OverBound`. |
+| Multiply-linked custody record | Both projections retain `CustodyReadRefusalV1::MultiLink`. |
+| Unreadable custody record | Both projections retain the same exact `CustodyReadRefusalV1::Unreadable` value. |
+| Unrelated name | Both projections omit it. |
+| Pin failure with valid legacy and custody names | Both preserve the legacy row and retain the custody row with the exact not-pinnable refusal. |
+| `Ok, Err, Ok, Err` name stream | Both retain the two successful selected rows in injected order; the engine records exactly two iterator errors and continues. |
+| Exact non-UTF-8 name on Unix | The engine retains the original `OsString`; no reconstruction from display text occurs. |
+| Non-default root observations | Both projections retain identical rows and exact-route decisions while discarding the observations. |
+| Source-open refusal | The action projection is empty; the exact projection maps to `CannotEnumerate` and performs zero assessments. |
+
+The scripted session also records every `next_name`, selected read, `finish`, and probe-assessment operation. Its expected log is literal: each selected read follows its corresponding successful name before the next name request; `finish` follows the terminal `None` exactly once; all exact assessments follow `finish`.
+
+Do not create a real-filesystem ordering comparison, infer one traversal’s order from another, or label injected entry-kind refusals as filesystem-attested observations.
+
+The compatibility-source tests remain responsible for proving that the real source calls `read_dir` before the pin opener, preserves legacy reads on opener failure, uses descriptor-relative custody reads when pinned, and emits the exact not-pinnable refusal when not pinned.
+
+### Enumeration-descriptor ownership decision
+
+A2a deliberately retains `std::fs::ReadDir` in the compatibility session to preserve behavior. It does not claim that `ReadDir` exposes an inspectable identity for the directory object being enumerated.
+
+The meaning of `RootObservationSetV1::retained_enumeration_object` remains:
+
+> The field may contain an identity only when it was captured from the exact retained directory descriptor whose duplicated descriptor drives name enumeration. Identity read from the root path, from the separate custody pin, or from a descriptor that did not drive enumeration does not satisfy the field.
+
+Accordingly:
+
+- A2a production leaves `retained_enumeration_object` as `None`;
+- A2a production leaves all three root observations as `None`;
+- A2a production `finish` returns `RootObservationSetV1::default()`;
+- A2a does not present `std::fs::ReadDir` as retained identity evidence;
+- A2a does not populate the field from `PinnedDirectoryV1`, because that is the separate custody-read descriptor;
+- A2a does not weaken the field to mean path metadata observed near enumeration.
+
+A2b must replace A2a’s `ReadDir` storage on the required Unix lanes with a bridge-core retained-directory enumerator that:
+
+- opens and retains one directory descriptor independently of the custody pin opener;
+- enumerates names from a duplicate of that same descriptor;
+- exposes metadata from the retained descriptor for `retained_enumeration_object`;
+- preserves independent custody pin-failure behavior;
+- preserves raw-root alias acceptance for the action projection;
+- leaves the observation unavailable on a target where descriptor-owned enumeration cannot be provided without changing scan behavior.
+
+A2b must reserve a distinct 140-counted-line worksheet row for that bridge-core enumerator, worktree integration, and focused tests. That budget is not part of A2a and may not be borrowed to extend A2a.
+
+### Tracing infrastructure decision
+
+A2a changes no event and requires no scoped tracing assertion. Its tests do not inspect event level, message, fields, count, or order.
+
+Do not add `tracing-subscriber`, a public reporter, or a global test subscriber. The existing exact-absence event remains byte-for-byte in production source and is covered as source-preservation evidence.
+
+A2b owns scoped, panic-safe tracing capture when it adds report population and event-order evidence. A2b must explicitly authorize any required test dependency or shared test utility at that time.
+
+A2a adds no dependency. `crates/bridge-worktree/Cargo.toml` remains byte-for-byte unchanged, its dev-dependency set remains exactly `bridge-coordinator` and `bridge-controller`, and `Cargo.lock` remains untouched.
+
+### Required tests and evidence classification
+
+Use these test names or equally specific names preserving the stated evidence:
+
+| Required test | Category | Evidence against untouched `c637e493` | Production or evidence-infrastructure mutation caught |
+|---|---|---|---|
+| `compatibility_open_refusal_never_calls_pin_opener` | New-private-seam mechanism | The seam does not compile on the base | Calling the custody pin opener before successful `read_dir`, or treating pin failure as source-open failure |
+| `compatibility_pin_failure_preserves_legacy_and_refuses_custody` | New-private-seam compatibility | The opener seam does not exist on the base | Suppressing all rows on pin failure, refusing legacy reads, or losing the exact not-pinnable refusal |
+| `checked_scan_reads_each_selected_name_before_next_and_finishes_once` | New-private-seam ordering | The engine does not exist on the base | Prefetching the next name, duplicating or skipping `finish`, or reading outside the engine |
+| `checked_scan_counts_iterator_errors_and_continues_in_injected_order` | New-private-seam status | The injected source does not compile on the base | Stopping at the first item error, counting a custody refusal as an iterator error, or reordering successful rows |
+| `checked_scan_silently_omits_bad_legacy_and_retains_bad_custody` | Refactor characterization | Equivalent base behavior is green | Emitting malformed legacy rows, dropping custody refusals, or coupling decode refusal to iterator status |
+| `report_side_pin_failure_uses_post_canonicalization_opener_seam` | New-private-seam routing | The helper does not exist on the base | Consulting the opener before canonicalization or hardcoding the production opener inside the helper |
+| `scan_worktree_records_preserves_raw_root_and_public_projection` | Base-green characterization | Existing behavior is green on the base | Canonicalizing the action root, changing the vector shape, or exposing iterator/root details |
+| `exact_route_preserves_canonical_scan_root_and_unit_return` | Base-green characterization and compiler evidence | Existing behavior is green on the base | Passing the raw root to exact enumeration or changing the public return type |
+| `injected_sources_prove_action_and_exact_projection_equivalence` | Injected refactor conformance | No genuine runtime red; the injected seam is absent on the base | Drifting selection, omission, decoded custody content, refusal classification, injected order, or pin-failure policy |
+| `checked_scan_retains_exact_non_utf8_name_internally` | New-private-seam exact-name evidence | The engine does not exist on the base | Reconstructing the exact name from lossy display text |
+| `both_projections_discard_nondefault_root_observations` | Evidence-infrastructure mechanism | The completed-result injection seam is absent on the base | Gating, reordering, or otherwise changing either projection based on A2a root observations |
+| `public_scan_functions_keep_visibility_and_exact_signatures` | Compiler API preservation | Base signatures compile; the new external assertion does not exist | Reducing either function’s visibility or changing either complete function type |
+| Exact `effective()` iterator item assertion | Compiler API preservation | The production iterator is already green | Changing the item from `&ExactAbsenceSweepEntryV1` while leaving a merely callable iterator |
+| Existing sweep and custody-lock tests | Existing base-green regression | Existing behavior is green | Changing legacy deletion, V3 protection, run-end handling, custody locking, or public scanner consumers |
+
+Every new test must state its evidence category and the production or evidence-infrastructure mutation it catches. Evidence-infrastructure tests are not required to invent a production mutation.
+
+The injected suite must additionally cover:
+
+- source-open refusal;
+- zero pin calls on source-open refusal;
+- complete enumeration;
+- literal `Ok, Err, Ok, Err` ordering;
+- ignored names;
+- malformed and unreadable legacy omission;
+- custody refusal retention without increasing iterator errors;
+- decoded custody structural equality before assessment;
+- exact non-UTF-8 name retention on Unix;
+- selected read before the next name request;
+- `finish` after terminal `None`;
+- `finish` exactly once;
+- default and non-default root observations;
+- both projections discarding iterator and root details;
+- canonicalization refusal before opener consultation;
+- source-open refusal before assessment;
+- both public functions retaining their existing return types.
+
+No A2a test may be labelled genuine runtime red.
+
+### Gates and single completion rule
+
+The mandatory acceptance gates are:
+
+- `cargo fmt --all -- --check`;
+- `CARGO_INCREMENTAL=0 cargo clippy --workspace --all-targets --locked -- -D warnings`;
+- `CARGO_INCREMENTAL=0 cargo test --workspace --locked --no-fail-fast`;
+- `CARGO_INCREMENTAL=0 cargo test -p bridge-worktree --locked --no-fail-fast`.
+
+All four commands must exit zero against the exact implementation-candidate commit. The full and package suites must report passed, failed, ignored, measured, and filtered totals, plus the number of test binaries and doc-test suites. Do not double-count nested or filtered subprocess output.
+
+This is the only completion rule: a missing, blocked, killed, incomplete, or red mandatory gate leaves A2a pending and cannot be converted into acceptance by writing an exclusion. Labelled exclusions are permitted only for supplementary observations that are not one of the four gates, such as an unavailable additional platform run. Every supplementary exclusion must identify the unrun command or observation and the reason; it must not be relabelled green.
+
+Also require:
+
+- `git diff --check`;
+- a source diff proving `crates/bridge-worktree/Cargo.toml` and `Cargo.lock` are unchanged from the base;
+- the external integration-test crate to compile as part of the mandatory suites;
+- the final counted-line worksheet to remain within every row cap and the total cap.
+
+### Interim A2a handoff and two-commit custody
+
+Create:
+
+`docs/superpowers/reviews/2026-08-19-r2f1b-3d-t3a-inc1-sliceA2a-handoff.md`
+
+Write its requirements inline; do not consult or cite an external template.
+
+Use this two-commit protocol:
+
+1. Implement and verify the source and test changes.
+2. Commit them as the implementation-candidate commit.
+3. Re-run all mandatory gates against that exact clean commit.
+4. Author the interim handoff with the literal implementation-candidate SHA and evidence below.
+5. Commit only the handoff as a second, handoff-only evidence commit.
+6. Do not make the handoff self-name its own commit SHA. The final operator receipt may name that SHA after the commit exists.
+7. A2b begins from the handoff-only commit, while the handoff binds behavioral evidence to the implementation-candidate commit and states that the second commit changes documentation only.
+
+The handoff must contain:
+
+- the exact base SHA and implementation-candidate SHA;
+- the implementation commit subject and the handoff-only commit subject;
+- clean-tree status before editing and at the implementation candidate;
+- `rustc --version --verbose`, `cargo --version`, `rustfmt --version`, and `cargo clippy --version`;
+- every mandatory command exactly as run, its exit status, and its complete totals;
+- separate counts for test binaries and doc-test suites;
+- the source diff proving the crate manifest and lockfile remained unchanged;
+- the final actual counted-line worksheet, with every added nonblank line assigned exactly once;
+- the evidence category and mutation caught by every new test;
+- all labelled supplementary exclusions;
+- a source-audit table with file-and-line evidence for these exact edges:
+  - `sweep_orphans_with_exact_absence` →
+    `sweep_orphans_with_exact_absence_with_pin_opener` →
+    `checked_scan::scan_compatibility_with_pin_opener`;
+  - `scan_worktree_records` →
+    `scan_worktree_records_with_pin_opener` →
+    `checked_scan::scan_compatibility_with_pin_opener`;
+  - `scan_compatibility_with_pin_opener` →
+    `scan_checked_rows_with_source`;
+- confirmation that the concrete compatibility session remains private;
+- confirmation that the non-test production region has exactly one call site for each session-driving operation—`next_name`, `read_legacy`, `read_custody`, and `finish`—and that all four are inside `scan_checked_rows_with_source`;
+- confirmation that the external integration test imports and pins both public functions;
+- the exact `effective()` iterator item-type assertion;
+- the unchanged event literal;
+- the raw-action/canonical-exact root split;
+- the A2b and future-attestation obligations from “Deferred.”
+
+The source audit is PASS only if all listed edges and counts hold. A mismatch stops acceptance. Module privacy remains the enforcement mechanism preventing `sweep.rs` from opening or driving a checked-scan session.
+
+A2b may replace this interim handoff with the final combined A2 handoff after completing report population, platform evidence, mutation audit, and its own gates.
+
+### Deferred
+
+Deferred to A2b:
+
+- **F4-of-A2 — reproducible behavioral-red control.** A2a has no genuine runtime red because it preserves both public behaviors and the unit return. When A2b changes the return type, it must supply a frozen test-only patch against an exact recorded base tree, record that tree’s identity and patch diff, and run the genuine-red controls reproducibly before relying on them.
+- **F6-of-A2 — source-incompatible public return change.** A2a makes no public break. A2b’s planned change from `()` to `ExactAbsenceSweepReportV1` remains source-incompatible for unit-constrained callers at workspace version `0.3.1`. A2b must resolve and record the release-version boundary as a blocking pre-publication obligation rather than relying only on handoff prose.
+- **F8-of-A2 — birthtime-capability result visibility.** A2a adds neither filesystem attestation nor the birthtime-capability row. A2b must make the observed `Some` or `None` result visible through a captured probe or machine-readable artifact; a passing test whose evidence does not reveal the observed branch is insufficient.
+- **F9-of-A2 — possible versus guaranteed resolver observations.** A2b’s mutation inventory must distinguish possible call edges from observations guaranteed on every comparator result. `compare_path_identities` installs `deepest_existing_path` as its resolver, but an unavailable initial resolution can return `CannotProve` before the final stability-bracket calls. The final calls must not be listed as unconditional observations.
+- A2b owns the retained enumeration-descriptor implementation, root-observation classification and population, the distinct 140-counted-line retained-enumerator row, scoped tracing evidence, UTF-8 characterization, complete platform matrix, final mutation audit, and final combined A2 handoff.
+
+Deferred to the separate attested real-filesystem slice sequenced with A2b’s platform matrix:
+
+- **F3 — same-mount object replacement.** The future utility must prove how replacement of a fixture-root object on the same mount is detected rather than treating a stable mount label as stable object identity.
+- **F7 — distro and environment labelling.** Future platform evidence must record a precise environment identity and must not infer a distribution or filesystem from an ambiguous runner label.
+- **F12 — attestation record schema.** The future slice must define the complete durable machine-readable schema, required fields, versioning, refusal states, and completion binding before emitting platform claims.
+- **F13 — synthetic coverage injection boundary.** The future utility must define the boundary that injects derived platform observations for deterministic refusal coverage without allowing injected values to green real-platform evidence.
+- That slice owns real-filesystem fixture custody, independent derivation and comparison of platform observations, preflight-before-mutation proof, cleanup proof, same-root object-stability proof, and any dependency it separately justifies.
+
+None of these deferred items may add scope, dependencies, worksheet lines, or acceptance rows to A2a.
+
+### Sizing and mandatory pre-edit stop
+
+Use this deterministic counted-line metric:
+
+1. Measure the final two-commit A2a tree against base `c637e493544a2e2edd1ca3ae20842a86dcb58f3f`.
+2. For every owned changed file, count each added nonblank physical line after the fmt gate.
+3. A replacement counts its added side. Deleted lines do not consume the cap.
+4. Exclude only the complete literal v2 Rust seam block under “Private checked-scan module and pinned seam,” and only when it is byte-identical to this specification.
+5. Imports, attributes outside that block, declarations, macro invocations, assertions, comments, parameterized rows, test utilities, and nested constructs count by their nonblank added lines.
+6. Assign every counted line to exactly one worksheet row by file and purpose.
+7. If a line plausibly spans purposes, assign it to the first applicable row from top to bottom.
+8. `git diff --numstat` may corroborate changed files but is not the final count because it includes blank and exempt lines.
+9. The handoff file is counted like every other owned file.
+10. `crates/bridge-worktree/Cargo.toml` and `Cargo.lock` have no row because they must not change.
+
+There is no contingency row and no borrowing between rows.
+
+Pre-edit worksheet:
+
+| Counted component | Pre-edit estimate | Counted-line cap |
+|---|---:|---:|
+| `checked_scan.rs` compatibility source, session, completed result, classifier, and engine outside the pinned seam | 115 | 135 |
+| `sweep.rs` action and exact projections, refusal mapping, routing, and preserved assessment integration | 90 | 105 |
+| `checked_scan.rs` injected source harness, ordering/status tests, and full deterministic conformance matrix | 165 | 190 |
+| `sweep.rs` routing, raw/canonical root, pin-failure, and public-projection tests | 60 | 70 |
+| External public-signature and exact `effective()` item-type assertions | 10 | 15 |
+| Interim A2a handoff | 60 | 80 |
+| **Total counted lines** | **500** | **595** |
+
+The 500-line estimate is 156 lines below v1’s 656-line estimate. The 595-line cap is 165 lines below v1’s 760-line cap. The reduction is intentional and reflects removal of all bespoke real-filesystem attestation infrastructure, platform fixture tests, and dependency work.
+
+Before editing, re-estimate every row against the exact base. Stop if any row or the total will exceed its cap. Report the revised estimates and propose a narrower follow-up split; do not compress tests, declarations, evidence, or the handoff and do not silently extend A2a.
+
+### Falsification license
+
+Every symbol, caller, matrix row, and behavioral statement in this task is an anchored claim against `c637e493544a2e2edd1ca3ae20842a86dcb58f3f`. The repository is authoritative.
+
+If the base identity differs; the worktree is not clean; either public signature differs; `scan_worktree_records` does not use `read_dir` before pin opening; `read_sidecar` does not silently omit failures; `read_custody_record_in` does not retain the stated refusals; the exact and action routes do not enumerate canonical and raw root spellings respectively; the current exact route does not drain before assessment; the existing event differs; the report surface, readiness gate, or constructor allowances differ; the dev-dependency set differs; bridge-core already exposes a cross-crate retained-descriptor enumerator suitable for this source; a listed production caller differs; the literal v2 seam is not valid or rustfmt-clean; the checked-in CI lane does not run the stated workspace coverage command; or any injected conformance expectation is wrong, record the exact repository evidence and stop before editing.
+
+Do not adapt the implementation around a false anchor. Finding the work smaller is acceptable. The A2a/A2b split, unit-return boundary for A2a, T3a-decides/T3b-acts boundary, no-new-dependency rule, and T3b action-time re-decision remain settled.
+
+## Acceptance Criteria
+
+1. Work begins only from exact clean base `c637e493544a2e2edd1ca3ae20842a86dcb58f3f`, after factual and sizing checks.
+2. `crates/bridge-worktree/src/sweep/checked_scan.rs` exists and contains the complete literal v2 seam.
+3. The literal seam passes rustfmt unchanged.
+4. No module-wide `dead_code` allowance is added; only the six pinned field-scoped allowances are present.
+5. The source and session traits and concrete compatibility session remain private to `checked_scan.rs`.
+6. `sweep.rs` receives only completed rows/results and cannot drive a checked-scan session.
+7. The compatibility source calls `read_dir` before the custody pin opener and refuses source open only when `read_dir` fails.
+8. Pin failure preserves legacy reads and retains custody names with the exact not-pinnable refusal.
+9. Production `finish` returns `RootObservationSetV1::default()`.
+10. A2a does not classify or populate any production root observation.
+11. One shared classifier preserves the base legacy and custody selection rules.
+12. `scan_checked_rows_with_source` has the exact pinned signature and exclusively owns the production `next_name` → immediate selected read → `finish` protocol.
+13. The engine returns an owned completed result and passes only `CannotEnumerate` from source open.
+14. Iterator-item errors are counted and skipped; custody refusals remain rows and malformed or unreadable legacy sidecars remain omitted.
+15. Exact `OsString` names survive engine enumeration without reconstruction from lossy display text.
+16. Both production projections use `scan_compatibility_with_pin_opener` and the same consuming `into_rows` operation.
+17. `scan_worktree_records_with_pin_opener` has the exact pinned signature and maps source-open refusal to an empty vector.
+18. `sweep_orphans_with_exact_absence_with_pin_opener` has the exact pinned signature and maps canonicalization and source-open failure to the exact private refusal variants.
+19. Exact-route canonicalization completes before opener consultation.
+20. Exact assessment begins only after complete enumeration, selected reads, terminal `None`, and exactly one `finish`.
+21. Module tests inspect the private exact projection’s owned rows after assessment.
+22. Injected non-default root observations demonstrably do not change either projection.
+23. The deterministic conformance matrix compares full legacy values, full decoded custody values, exact custody refusals, omission, injected ordering, iterator continuation, and pin-failure policy.
+24. No ordered-equality oracle compares independent real `read_dir` traversals.
+25. `scan_worktree_records` retains its public visibility, exact signature, eager vector projection, raw-root behavior, flattened iterator errors, and existing callers.
+26. `sweep_orphans_with_exact_absence` retains its public visibility, exact unit-returning signature, canonical scan root, existing decision behavior, and unchanged event.
+27. The external integration test compiler-enforces both public scan declarations.
+28. The external compile-time assertion pins `effective()` to `Iterator<Item = &ExactAbsenceSweepEntryV1>`.
+29. `sweep_orphans` retains its statement-position exact call, independent guard, warning, early return, canonical `root_cwd` decisions, and raw action-scan argument.
+30. No public report type, constructor allowance, readiness rule, API documentation, or production report code changes in A2a.
+31. No tracing capture, public reporter, global subscriber, or new dependency is added.
+32. `crates/bridge-worktree/Cargo.toml` remains unchanged with exactly its two existing dev-dependencies.
+33. `Cargo.lock` remains unchanged.
+34. No filesystem-attestation utility, platform fixture gate, real-traversal ordering oracle, or platform-labelled A2a acceptance row is added.
+35. No test is labelled genuine runtime red; every new test names its evidence category and production or evidence-infrastructure mutation.
+36. The retained-enumeration-object meaning remains identity from the exact enumeration descriptor, and A2a does not fabricate it from `ReadDir`, a path, or the custody pin.
+37. A2b’s retained-descriptor obligation and distinct 140-line budget remain recorded.
+38. The interim handoff binds the exact implementation-candidate commit, commands, toolchain, outcomes, source audit, exclusions, and final worksheet.
+39. The final A2a tip consists of the implementation-candidate commit followed by a handoff-only evidence commit that does not self-name.
+40. Fmt, clippy, the full locked workspace suite, and the locked `bridge-worktree` suite all exit zero; no exclusion substitutes for a mandatory gate.
+41. Test totals are reported as test binaries plus doc-test suites without nested-output double counting.
+42. Every counted worksheet row and the 595-line total remains within cap.
+43. No ownership, locking, transition, publication, settlement, deletion, prune, rename, backend-cleanup, or T3b authority is introduced.
+44. The resulting two-commit A2a tip is suitable as A2b’s base without changing either public scan signature.
+
+## Files
+
+- `crates/bridge-worktree/src/sweep.rs`
+  - declare the private checked-scan module without a module-wide allowance;
+  - add the private exact projection and refusal types;
+  - implement `scan_worktree_records_with_pin_opener` with its pinned signature;
+  - delegate the public action scanner through the completed engine result;
+  - implement `sweep_orphans_with_exact_absence_with_pin_opener` with its pinned signature and refusal mappings;
+  - delegate the public unit-returning exact route through that helper;
+  - preserve all exact-decision, event, action, guard, removal, and run-end behavior;
+  - add routing, raw/canonical-root, pin-failure, and projection tests.
+- `crates/bridge-worktree/src/sweep/checked_scan.rs`
+  - create with the complete literal v2 seam;
+  - implement the private `ReadDir`-backed compatibility session;
+  - implement the real compatibility source;
+  - implement the shared classifier, row, completed result, consuming row projection, and mandatory engine;
+  - preserve independent custody pin failure;
+  - return default production root observations;
+  - add the injected source harness, full deterministic conformance matrix, ordering/status tests, exact-name test, and non-default-observation test seam.
+- `crates/bridge-worktree/tests/r2f1b_exact_absence_report_api.rs`
+  - import and compile-assert both public scan functions with their complete signatures;
+  - replace the untyped `effective()` call check with the exact iterator item-type assertion;
+  - leave production report code unchanged.
+- `docs/superpowers/reviews/2026-08-19-r2f1b-3d-t3a-inc1-sliceA2a-handoff.md`
+  - create after the implementation-candidate commit;
+  - record exact commit identity, source audit, toolchain, gates, totals, classifications, exclusions, and final worksheet;
+  - commit as the sole change in the handoff-only evidence commit;
+  - do not self-name the handoff commit.
+- `crates/bridge-worktree/Cargo.toml`
+  - read-only dependency reference;
+  - do not modify.
+- `Cargo.lock`
+  - read-only locked-resolution reference;
+  - do not modify.
+- `crates/bridge-worktree/src/sweep/report.rs`
+  - read-only reference for the A1 report surface;
+  - do not modify in A2a.
+- `crates/bridge-worktree/src/provider_path.rs`
+  - read-only production reference for `canonicalize_lenient`, `read_sidecar`, and `WorktreeSidecar`;
+  - do not modify.
+- `crates/bridge-worktree/src/custody.rs`
+  - read-only production reference for name selection, custody decoding, and custody refusals;
+  - do not modify.
+- `crates/bridge-worktree/src/custody_lock.rs`
+  - read-only caller and regression reference for the public action scanner;
+  - do not modify.
+- `crates/bridge-core/src/fs_custody.rs`
+  - read-only reference for `PinnedDirectoryV1`, descriptor reads, the crate-private enumerator, and the deferred comparator inventory;
+  - do not modify in A2a.
+- `Cargo.toml`
+  - read-only workspace version and dependency reference;
+  - do not modify.
+- `rust-toolchain.toml`
+  - read-only pinned-toolchain reference;
+  - do not modify.
+- `.github/workflows/ci.yml`
+  - read-only reference for the existing Ubuntu workspace coverage lane;
+  - do not modify.
+- `bin/a2a-bridge/src/main.rs`
+  - read-only caller-audit reference;
+  - no CLI changes.
+
+## Spec Refs
+
+Authoritative at base commit `c637e493544a2e2edd1ca3ae20842a86dcb58f3f`:
+
+- `Cargo.toml`
+- `Cargo.lock`
+- `rust-toolchain.toml`
+- `.github/workflows/ci.yml`
+- `crates/bridge-worktree/Cargo.toml`
+- `crates/bridge-worktree/src/sweep.rs`
+- `crates/bridge-worktree/src/sweep/report.rs`
+- `crates/bridge-worktree/src/provider_path.rs`
+- `crates/bridge-worktree/src/custody.rs`
+- `crates/bridge-worktree/src/custody_lock.rs`
+- `crates/bridge-core/src/fs_custody.rs`
+- `crates/bridge-worktree/tests/r2f1b_exact_absence_report_api.rs`
+- `bin/a2a-bridge/src/main.rs`
+- `docs/superpowers/reviews/2026-08-18-r2f1b-3d-t3a-inc1-sliceA1-handoff.md`
+
+## Commit Message
+
+Implementation-candidate commit:
+
+```text
+refactor(worktree): unify exact and action scans
+
+Add one private production-bound checked-scan engine and route both the
+unit-returning exact-absence path and the existing action scanner through it.
+
+Preserve raw action-root behavior, canonical exact-root behavior, legacy
+omission, custody refusals, eager ordering, and public return types while adding
+deterministic injected-source conformance and exact API assertions for A2b.
+```
+
+Handoff-only evidence commit:
+
+```text
+docs(worktree): record A2a scan evidence
+
+Bind the accepted scan-engine candidate to its source audit, pinned toolchain,
+mandatory gate totals, evidence classifications, exclusions, and final
+counted-line worksheet.
+```
