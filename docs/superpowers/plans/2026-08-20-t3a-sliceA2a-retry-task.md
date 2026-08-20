@@ -23,7 +23,9 @@ the missing tests, and produce the handoff.
 
 Verify the base before editing. You should find `crates/bridge-worktree/src/sweep/checked_scan.rs`
 already present (~492 lines), `sweep.rs` already routed through it, and exactly
-five test functions in `checked_scan.rs`'s `mod tests`.
+four `#[test]` functions in `checked_scan.rs`'s `mod tests`, alongside test
+helpers including `decoded_custody()`, `sidecar()`, `temp_root()`, and the
+injected `Script` source.
 
 ### Measured starting state
 
@@ -97,7 +99,7 @@ why that input produces it.
 
 ## Part 2 — write the missing evidence
 
-Five tests exist. The specification's evidence table names roughly twenty, and
+Four `#[test]` functions exist. The specification's evidence table names roughly twenty, and
 `sweep.rs` currently has **zero** new tests despite carrying its own worksheet
 row. Write the rest, one test per named scenario.
 
