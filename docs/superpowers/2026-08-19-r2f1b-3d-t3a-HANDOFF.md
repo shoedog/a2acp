@@ -38,7 +38,7 @@
 | agent reply surfacing | **LANDED** | PR #61 → `c637e493`; host gate 4,169/0/13 |
 | operator serve | **SWAPPED, RUNNING** | PID 23161, release `ee3b5966ad3b35ef`, binary-only swap, all 5 post-swap checks passed |
 | operator config candidate | **STAGED, NOT APPLIED** | `operator/a2a-bridge.candidate.toml`, SHA `67f3bf01…`; validate pass, doctor 31 ok/1 warn/0 fail |
-| T3a inc1 slice **A2** | **SPLIT: A2a-1 COMPLETE, A2a-2 pending; A2b after** | A2 v1-v2 (11 then 8 findings) → split to A2a → A2a v1-v4 (17→11→7→0 gating) → split again into A2a-1 (correctness) + A2a-2 (characterization). A2a-1 branch `a2a/a2a1-complete` = `c0ac87ce`, all gates green, two-commit custody complete |
+| T3a inc1 slice **A2** | **A2a COMPLETE (A2a-1 #62 + A2a-2 #63, both merged)** | A2b is next: it flips the public return type and cashes the report |
 
 ## 3. Corrections to standing documents and memory
 
@@ -82,7 +82,7 @@
 
 | Item | Verbatim |
 |---|---|
-| main (== origin/main; local ref FF-ed 2026-08-19) | `c637e493544a2e2edd1ca3ae20842a86dcb58f3f` |
+| main | `8d271d21` (A2a-2, PR #63) |
 | A2 spec v1 | `4234517d` · `docs/superpowers/plans/2026-08-19-r2f1b-3d-t3a-inc1-sliceA2-task.md` |
 | A2 operator findings | `904c89fb` · `docs/superpowers/reviews/2026-08-19-a2-spec-operator-findings.md` |
 | fold worktree | `.claude/worktrees/fold`, branch `main`, at `c637e493` |
