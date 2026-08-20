@@ -64,12 +64,12 @@
 
 The implement container's egress cannot fetch `a2a-lf`; the host operator runs these gates and fills the results.
 
-- [ ] `cargo fmt --all -- --check` — PENDING OPERATOR
-- [ ] `CARGO_INCREMENTAL=0 cargo clippy --workspace --all-targets --locked -- -D warnings` — PENDING OPERATOR
-- [ ] `CARGO_INCREMENTAL=0 cargo test --workspace --locked --no-fail-fast` — PENDING OPERATOR
-- [ ] `CARGO_INCREMENTAL=0 cargo test -p bridge-worktree --locked --no-fail-fast` — PENDING OPERATOR
-- [ ] `cargo run -p a2a-bridge -- validate --repo-hygiene` (implementation point) — PENDING OPERATOR
-- [ ] `cargo run -p a2a-bridge -- validate --repo-hygiene` (handoff point) — PENDING OPERATOR
+- [x] `cargo fmt --all -- --check` — **exit 0** (operator, host, 2026-08-20)
+- [x] `CARGO_INCREMENTAL=0 cargo clippy --workspace --all-targets --locked -- -D warnings` — **exit 0**, zero warnings (operator, host, 2026-08-20)
+- [x] `CARGO_INCREMENTAL=0 cargo test --workspace --locked --no-fail-fast` — **exit 0**, 0 failures across **75 test binaries + 16 doc-test suites** (operator, host, 2026-08-20)
+- [x] `CARGO_INCREMENTAL=0 cargo test -p bridge-worktree --locked --no-fail-fast` — **exit 0**; lib 292 passed / 0 failed, plus 12 / 5 / 2 / 0 (operator, host, 2026-08-20)
+- [x] `cargo run -p a2a-bridge -- validate --repo-hygiene` (implementation point) — **exit 0**; 40 tracked artifacts, 8 validated example configs (operator, host, 2026-08-20)
+- [x] `cargo run -p a2a-bridge -- validate --repo-hygiene` (handoff point) — **exit 0** (operator, host, 2026-08-20)
 
 ## Whitespace, manifest, and counts
 
@@ -86,3 +86,55 @@ The implement container's egress cannot fetch `a2a-lf`; the host operator runs t
 - This inline handoff is the owner-approved implementer-side replacement for any external template; the host operator separately owns its lane template.
 - The handoff-only evidence commit is operator-owned; this handoff deliberately leaves all gate results unfilled until that operator completes the pending block.
 - Historical custody note: the already-created `cb4d9c29` combines source and handoff, so its recorded staged checks were not an isolated handoff-only protocol. This repair cannot split that commit under the current no-reset/no-commit contract; operator action must rebuild the two commits from `2e4bba41` in the required order.
+
+
+---
+
+## Operator evidence — filled 2026-08-20
+
+Run by the host operator, outside the implement container, because that
+container's egress cannot fetch the pinned `a2a-lf` dependency and therefore
+cannot build. The implementer correctly reported these as blocked rather than
+fabricating totals.
+
+**Implementation-candidate commit:** `c7fd0e2ba835db74486364c821cc7ea230e713ed`
+**Production base:** `2e4bba41c9d55b6d517b0379f74585192736ad84`
+**Original slice base:** `c637e493544a2e2edd1ca3ae20842a86dcb58f3f`
+
+Toolchain, as pinned by `rust-toolchain.toml`:
+
+- `rustc 1.94.0 (4a4ef493e 2026-03-02)`
+- `cargo 1.94.0 (85eff7c80 2026-01-15)`
+- `rustfmt 1.8.0-stable (4a4ef493e3 2026-03-02)`
+- `clippy 0.1.94 (4a4ef493e3 2026-03-02)`
+
+Additional operator checks:
+
+- `git diff --check 2e4bba41..HEAD` — exit 0, no whitespace defects.
+- `git diff --stat 2e4bba41..HEAD -- Cargo.toml Cargo.lock crates/bridge-worktree/Cargo.toml`
+  — empty. No manifest or lockfile change, as required.
+- `test public_scan_functions_keep_visibility_and_exact_signatures ... ok` — the
+  external-visibility test runs from the integration test crate, where it can
+  actually distinguish `pub` from `pub(crate)`.
+
+**Attribution control.** The same package suite on the original slice base
+`c637e493`, same host and same pinned toolchain, exits 0 with 284 passed. This
+candidate reports 292 passed — a net +8 tests across the two implementation
+commits, with zero failures either side.
+
+### Limits of this evidence
+
+- These results attest the tree at `c7fd0e2b` only. The handoff-only evidence
+  commit that carries this section changes documentation, not behavior.
+- This handoff does not name its own commit SHA, which cannot exist before the
+  commit does.
+- Provisional `git diff --cached --check` on the staged handoff: **exit 0**.
+  That result checked provisional bytes — the bytes present before this very
+  line was written.
+- The final `git diff --cached --check` before the evidence commit is
+  intentionally unrecorded: recording its result would alter the bytes it
+  checked. A provisional check was run and recorded; the final check covers the
+  final bytes and its result is deliberately absent. Nothing here implies the
+  provisional result self-verifies the committed bytes.
+- Characterization evidence — the ten scenarios listed as deferred — is owned by
+  A2a-2 and is not claimed here.
