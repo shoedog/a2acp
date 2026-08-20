@@ -253,13 +253,18 @@ fn scan_checked_rows_for_test(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::custody::{
+        custody_record_path, PreservationReasonV1, PreservedWorktreeClaimV1, RecoveryLocatorV1,
+        WORKTREE_CUSTODY_RECORD_SCHEMA_V1,
+    };
     use crate::provider_path::{sidecar_path, write_sidecar};
     use crate::sweep::{
         ExactAbsenceObservationV1, ExactAbsenceProbeV1, ExactAbsenceRootRefusalV1,
         UnusedCandidateDecisionV1,
     };
     use bridge_core::error::BridgeError;
-    use bridge_core::SessionCwd;
+    use bridge_core::execution_policy::{PolicyNodeRefV1, Sha256HexV1, WorktreeObjectIdentityV1};
+    use bridge_core::fs_custody::verify_payload_directory_identity;
     use std::collections::VecDeque;
     use std::path::PathBuf;
     use std::sync::{
@@ -279,7 +284,70 @@ mod tests {
     }
 
     fn decoded_custody() -> WorktreeCustodyRecordV1 {
-        WorktreeCustodyRecordV1::decode_canonical(br#"{"schema_version":1,"custody_id":"custody-3333333333333333333333333333333333333333333333333333333333333333","checkout_fingerprint":"6666666666666666666666666666666666666666666666666666666666666666","current_attempt":{"execution_id":"exec-11111111111111111111111111111111","attempt_id":"attempt-22222222222222222222222222222222","ordinal":0},"worktree":{"canonical_path":"/worktree","directory_identity":{"canonical_path":"/worktree","dev":null,"ino":null}},"state":{"state":"protection_prepared"},"claim":null}"#).unwrap()
+        let record: WorktreeCustodyRecordV1 = serde_json::from_value(serde_json::json!({
+            "schema_version": 1,
+            "custody_id": format!("custody-{}", "3".repeat(64)),
+            "checkout_fingerprint": "6".repeat(64),
+            "current_attempt": {"execution_id": format!("exec-{}", "1".repeat(32)), "attempt_id": format!("attempt-{}", "2".repeat(32)), "ordinal": 0},
+            "worktree": {"canonical_path": "/worktree", "directory_identity": {"canonical_path": "/worktree"}},
+            "state": {"state": "protection_prepared"},
+            "claim": null,
+        }))
+        .unwrap();
+        WorktreeCustodyRecordV1::decode_canonical(&record.encode_canonical().unwrap()).unwrap()
+    }
+
+    fn identity(path: &Path) -> WorktreeObjectIdentityV1 {
+        let directory_identity =
+            verify_payload_directory_identity(&std::fs::canonicalize(path).unwrap()).unwrap();
+        WorktreeObjectIdentityV1 {
+            canonical_path: directory_identity.canonical_path.clone(),
+            directory_identity,
+        }
+    }
+
+    fn valid_records(root: &Path) -> (WorktreeSidecar, WorktreeCustodyRecordV1) {
+        let source = root.join("source");
+        let legacy_worktree = root.join("legacy");
+        let custody_worktree = root.join("custody");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::create_dir_all(&legacy_worktree).unwrap();
+        std::fs::create_dir_all(&custody_worktree).unwrap();
+        assert!(std::process::Command::new("git")
+            .args(["-C", source.to_str().unwrap(), "init", "-q"])
+            .status()
+            .unwrap()
+            .success());
+        let legacy = sidecar(&source, &legacy_worktree);
+        write_sidecar(&legacy).unwrap();
+        let mut custody = decoded_custody();
+        custody.worktree = identity(&custody_worktree);
+        let attempt = custody.current_attempt.clone();
+        custody.claim = Some(PreservedWorktreeClaimV1 {
+            schema_version: WORKTREE_CUSTODY_RECORD_SCHEMA_V1,
+            custody_id: custody.custody_id.clone(),
+            execution_id: custody.current_attempt.execution_id.clone(),
+            origin_attempt_id: custody.current_attempt.attempt_id.clone(),
+            current_attempt: attempt,
+            node: PolicyNodeRefV1 {
+                sorted_ordinal: 0,
+                id_sha256: Sha256HexV1::parse("5".repeat(64)).unwrap(),
+            },
+            checkout_fingerprint: Sha256HexV1::parse("6".repeat(64)).unwrap(),
+            source: identity(&source),
+            root: identity(root),
+            worktree: custody.worktree.clone(),
+            common_dir: identity(&source.join(".git")),
+            reason: PreservationReasonV1::NodeFailure,
+            created_wall_ms: 1_700_000_000_000,
+            recovery_locator: RecoveryLocatorV1::RegisteredWorktree {},
+        });
+        std::fs::write(
+            custody_record_path(&custody.worktree.canonical_path),
+            custody.encode_canonical().unwrap(),
+        )
+        .unwrap();
+        (legacy, custody)
     }
 
     fn sidecar(source: &Path, worktree: &Path) -> WorktreeSidecar {
@@ -376,6 +444,15 @@ mod tests {
         }
     }
 
+    struct RootPin(Arc<Mutex<Option<PathBuf>>>);
+
+    impl CompatibilityPinOpenerV1 for RootPin {
+        fn open_pin(&self, enumeration_root: &Path) -> Option<PinnedDirectoryV1> {
+            *self.0.lock().unwrap() = Some(enumeration_root.to_path_buf());
+            None
+        }
+    }
+
     #[test]
     fn compatibility_open_refusal_never_calls_pin_opener() {
         let root = temp_root("missing");
@@ -422,7 +499,7 @@ mod tests {
         let mut exact_source = script(log.clone(), names);
         exact_source.legacy = Some(legacy);
         let outcome = super::super::project_exact_scan_result(
-            SessionCwd::parse(root.to_str().unwrap()).unwrap(),
+            crate::provider_path::canonicalize_lenient(root.to_str().unwrap()).unwrap(),
             scan_checked_rows_for_test(&root, &exact_source),
             &probe(Some(ExactAbsenceObservationV1::BothAbsent), log.clone()),
         );
@@ -445,30 +522,43 @@ mod tests {
     #[test]
     fn exact_route_pin_failure_preserves_legacy_and_refuses_custody() {
         let root = temp_root("pin-failure");
+        let source = root.join("source");
         let worktree = root.join("legacy");
+        std::fs::create_dir_all(&source).unwrap();
         std::fs::create_dir_all(&worktree).unwrap();
-        let legacy = sidecar(&root.join("source"), &worktree);
-        write_sidecar(&legacy).unwrap();
-        std::fs::write(root.join("bad.custody.v1.json"), b"ignored").unwrap();
+        let legacy = sidecar(&source, &worktree);
         let calls = Arc::new(AtomicUsize::new(0));
         let probe = Probe {
             result: None,
             calls: calls.clone(),
             log: Arc::new(Mutex::new(Vec::new())),
         };
-        let outcome = super::super::sweep_orphans_with_exact_absence_with_pin_opener(
-            &root.to_string_lossy(),
+        let mut source = script(
+            Arc::new(Mutex::new(Vec::new())),
+            VecDeque::from([
+                Ok(OsString::from("legacy.meta.json")),
+                Ok(OsString::from("bad.custody.v1.json")),
+            ]),
+        );
+        source.legacy = Some(legacy);
+        source.custody = Err(CustodyReadRefusalV1::Unreadable(
+            "sweep root is not pinnable".to_string(),
+        ));
+        let outcome = super::super::project_exact_scan_result(
+            crate::provider_path::canonicalize_lenient(root.to_str().unwrap()).unwrap(),
+            scan_checked_rows_for_test(&root, &source),
             &probe,
-            Pin(Arc::new(AtomicUsize::new(0))),
         );
         let (_, _, _, rows) = outcome.into_exact_parts().unwrap();
+        assert_eq!(rows.len(), 2);
         assert!(matches!(
             rows[0].checked.parts().2,
             ScannedWorktreeRecordV1::Legacy(_)
         ));
-        assert!(
-            matches!(rows[1].checked.parts().2, ScannedWorktreeRecordV1::UnreadableCustody(CustodyReadRefusalV1::Unreadable(message)) if message == "sweep root is not pinnable")
-        );
+        assert!(matches!(
+            rows[1].checked.parts().2,
+            ScannedWorktreeRecordV1::UnreadableCustody(CustodyReadRefusalV1::Unreadable(message)) if message == "sweep root is not pinnable"
+        ));
         assert_eq!(rows[1].decision, UnusedCandidateDecisionV1::Refused);
         assert_eq!(calls.load(Ordering::SeqCst), 0);
         std::fs::remove_dir_all(root).unwrap();
@@ -476,10 +566,9 @@ mod tests {
 
     #[test]
     fn exact_route_cannot_canonicalize_without_opening_pin() {
-        let root = temp_root("cannot-canonicalize");
         let calls = Arc::new(AtomicUsize::new(0));
         let outcome = super::super::sweep_orphans_with_exact_absence_with_pin_opener(
-            &root.to_string_lossy(),
+            "",
             &probe(None, Arc::new(Mutex::new(Vec::new()))),
             Pin(calls.clone()),
         );
@@ -488,5 +577,129 @@ mod tests {
             Err((None, ExactAbsenceRootRefusalV1::CannotCanonicalize))
         ));
         assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    // Evidence: infrastructure mechanism; catches dropped or incorrectly retained decisions.
+    #[test]
+    fn exact_projection_retains_production_computed_decisions() {
+        let root = temp_root("retained-decisions");
+        let (legacy, custody) = valid_records(&root);
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let mut source = script(
+            log.clone(),
+            VecDeque::from([
+                Ok(OsString::from("legacy.meta.json")),
+                Ok(OsString::from("custody.custody.v1.json")),
+            ]),
+        );
+        source.legacy = Some(legacy);
+        source.custody = Ok(custody);
+        let probe = probe(Some(ExactAbsenceObservationV1::BothAbsent), log);
+        let outcome = super::super::project_exact_scan_result(
+            crate::provider_path::canonicalize_lenient(root.to_str().unwrap()).unwrap(),
+            scan_checked_rows_for_test(&root, &source),
+            &probe,
+        );
+        let (_, _, _, rows) = outcome.into_exact_parts().unwrap();
+        assert_eq!(
+            rows.iter().map(|row| row.decision).collect::<Vec<_>>(),
+            [
+                UnusedCandidateDecisionV1::Authorized,
+                UnusedCandidateDecisionV1::Authorized,
+            ]
+        );
+        assert_eq!(probe.calls.load(Ordering::SeqCst), 2);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    // Evidence: refactor characterization; catches an incorrect valid-record decision mapping.
+    #[test]
+    fn exact_projection_preserves_legacy_and_custody_decision_matrix() {
+        let root = temp_root("decision-matrix");
+        let (legacy, custody) = valid_records(&root);
+        for (observation, expected) in [
+            (
+                Some(ExactAbsenceObservationV1::BothAbsent),
+                UnusedCandidateDecisionV1::Authorized,
+            ),
+            (
+                Some(ExactAbsenceObservationV1::TargetPresent),
+                UnusedCandidateDecisionV1::Refused,
+            ),
+            (
+                Some(ExactAbsenceObservationV1::RegisteredButAbsent),
+                UnusedCandidateDecisionV1::Refused,
+            ),
+            (None, UnusedCandidateDecisionV1::Refused),
+        ] {
+            for (name, legacy_record, custody_record) in [
+                (
+                    "legacy.meta.json",
+                    Some(legacy.clone()),
+                    Ok(decoded_custody()),
+                ),
+                ("custody.custody.v1.json", None, Ok(custody.clone())),
+            ] {
+                let log = Arc::new(Mutex::new(Vec::new()));
+                let mut source = script(log.clone(), VecDeque::from([Ok(OsString::from(name))]));
+                source.legacy = legacy_record;
+                source.custody = custody_record;
+                let outcome = super::super::project_exact_scan_result(
+                    crate::provider_path::canonicalize_lenient(root.to_str().unwrap()).unwrap(),
+                    scan_checked_rows_for_test(&root, &source),
+                    &probe(observation, log),
+                );
+                let (_, _, _, rows) = outcome.into_exact_parts().unwrap();
+                assert_eq!(rows[0].decision, expected, "{name}: {observation:?}");
+            }
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    // Evidence: refactor characterization; catches probing an unreadable custody record.
+    #[test]
+    fn unreadable_custody_refuses_without_probe() {
+        let root = temp_root("unreadable-custody");
+        std::fs::create_dir_all(&root).unwrap();
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let mut source = script(
+            log.clone(),
+            VecDeque::from([Ok(OsString::from("bad.custody.v1.json"))]),
+        );
+        source.custody = Err(CustodyReadRefusalV1::Unreadable("test refusal".to_string()));
+        let probe = probe(Some(ExactAbsenceObservationV1::BothAbsent), log);
+        let outcome = super::super::project_exact_scan_result(
+            crate::provider_path::canonicalize_lenient(root.to_str().unwrap()).unwrap(),
+            scan_checked_rows_for_test(&root, &source),
+            &probe,
+        );
+        let (_, _, _, rows) = outcome.into_exact_parts().unwrap();
+        assert_eq!(rows[0].decision, UnusedCandidateDecisionV1::Refused);
+        assert_eq!(probe.calls.load(Ordering::SeqCst), 0);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    // Evidence: base-green behavior; catches raw-root exact enumeration or a non-unit wrapper.
+    #[test]
+    fn exact_route_preserves_canonical_scan_root_and_unit_return() {
+        let root = temp_root("canonical-root");
+        std::fs::create_dir_all(&root).unwrap();
+        let canonical = std::fs::canonicalize(&root).unwrap();
+        let opened = Arc::new(Mutex::new(None));
+        let supplied = root.join(".");
+        let outcome = super::super::sweep_orphans_with_exact_absence_with_pin_opener(
+            supplied.to_str().unwrap(),
+            &probe(None, Arc::new(Mutex::new(Vec::new()))),
+            RootPin(opened.clone()),
+        );
+        let (scan_root, _, _, rows) = outcome.into_exact_parts().unwrap();
+        assert_eq!(scan_root.as_str(), canonical.to_str().unwrap());
+        assert!(rows.is_empty());
+        assert_eq!(opened.lock().unwrap().as_deref(), Some(canonical.as_path()));
+        let _: () = super::super::sweep_orphans_with_exact_absence(
+            supplied.to_str().unwrap(),
+            &probe(None, Arc::new(Mutex::new(Vec::new()))),
+        );
+        std::fs::remove_dir_all(root).unwrap();
     }
 }
