@@ -4,7 +4,7 @@
 
 - Task base: `2e4bba41c9d55b6d517b0379f74585192736ad84`; the accepted production refactor landed in this prior commit.
 - Original reference base: `c637e493544a2e2edd1ca3ae20842a86dcb58f3f`; `git rev-list` reports one accepted production commit between it and the task base.
-- This task changes only correctness evidence in `checked_scan.rs` plus this handoff. It does not rewrite production, dependencies, or lockfiles.
+- This completion preserves the external API-preservation evidence and amends this handoff; it does not rewrite production, dependencies, or lockfiles.
 - The bridge owns the next commit and this handoff intentionally does not self-name that commit.
 
 ## Pre-edit checkpoint (verbatim)
@@ -31,6 +31,7 @@
 - Legacy/custody matrix evidence catches an incorrect production decision mapping for every observation class.
 - Unreadable-custody no-probe evidence catches any assessment of a refusal row: it asserts `Refused` and zero probe calls.
 - Exact-route root/return evidence catches raw-root forwarding or public-return drift: it proves the canonical root reaches the opener and the wrapper remains unit-returning.
+- `public_scan_functions_keep_visibility_and_exact_signatures` is the external compiler assertion for visibility and complete function types; it was already present at the task base, so this completion adds no duplicate scenario.
 - The existing external signature/API evidence catches visibility, exact function-type, and `effective()` item-type drift; it remains the fifth required correctness assertion.
 
 ## Source audit
@@ -59,22 +60,20 @@
 - `rustfmt --version`: rustfmt 1.8.0-stable (4a4ef493e3, 2026-03-02).
 - `cargo clippy --version`: clippy 0.1.94 (4a4ef493e3, 2026-03-02).
 
-## Gates and guards
+## OPERATOR EVIDENCE — PENDING
 
-| Command | Result | Totals |
-| --- | --- | --- |
-| `cargo fmt --all -- --check` | exit 0 | formatter gate passed. |
-| `CARGO_INCREMENTAL=0 cargo clippy --workspace --all-targets --locked -- -D warnings` | exit 101, blocked | crates.io proxy returned 403 fetching `a2a-lf`; no compilation, test binary, or doc-test suite started. |
-| `CARGO_INCREMENTAL=0 cargo test --workspace --locked --no-fail-fast` | exit 101, blocked | same dependency-resolution failure; no totals produced. |
-| `CARGO_INCREMENTAL=0 cargo test -p bridge-worktree --locked --no-fail-fast` | exit 101, blocked | same dependency-resolution failure; no totals produced. |
-| `cargo run -p a2a-bridge -- validate --repo-hygiene` (implementation point) | exit 101, blocked | same dependency-resolution failure; guard is not a test gate. |
-| `cargo run -p a2a-bridge -- validate --repo-hygiene` (handoff point) | exit 101, blocked | same dependency-resolution failure; guard is not a test gate. |
+The implement container's egress cannot fetch `a2a-lf`; the host operator runs these gates and fills the results.
 
-The offline control also failed before compilation because `arc-swap` is absent from the local index. The blocked mandatory gates leave this evidence pending; no exclusion is treated as acceptance.
+- [ ] `cargo fmt --all -- --check` — PENDING OPERATOR
+- [ ] `CARGO_INCREMENTAL=0 cargo clippy --workspace --all-targets --locked -- -D warnings` — PENDING OPERATOR
+- [ ] `CARGO_INCREMENTAL=0 cargo test --workspace --locked --no-fail-fast` — PENDING OPERATOR
+- [ ] `CARGO_INCREMENTAL=0 cargo test -p bridge-worktree --locked --no-fail-fast` — PENDING OPERATOR
+- [ ] `cargo run -p a2a-bridge -- validate --repo-hygiene` (implementation point) — PENDING OPERATOR
+- [ ] `cargo run -p a2a-bridge -- validate --repo-hygiene` (handoff point) — PENDING OPERATOR
 
 ## Whitespace, manifest, and counts
 
-- `cargo fmt --all -- --check` and the staged-equivalent `git diff --check HEAD` exit 0.
+- The current staged-equivalent `git diff --check HEAD` exits 0; formatter-gate evidence remains pending with the operator block above.
 - `git diff --exit-code HEAD -- crates/bridge-worktree/Cargo.toml Cargo.lock` exits 0; both remain unchanged.
 - The bridge contract forbids the implementer from creating the candidate commit, so the base-to-candidate commit-range check cannot run before bridge commit; the current diff check is recorded instead.
 - Final worksheet (added nonblank physical lines versus task base): 53/60 test-fix lines; 126/190 correctness-evidence lines; 40/40 shared-harness lines (`identity` and the reusable portion of `valid_records`); 71/100 handoff lines; total 290/390. The remaining record-specific custody-claim materialization is assigned to its decision-matrix evidence.
@@ -85,4 +84,5 @@ The offline control also failed before compilation because `arc-swap` is absent 
 - A2a-2 owns the deferred classifier, malformed-record, iterator, root-observation, action-projection, and report-side characterization scenarios listed by the task.
 - A2b still owns retained-descriptor observations, report population, tracing evidence, platform matrix, and the final combined handoff.
 - This inline handoff is the owner-approved implementer-side replacement for any external template; the host operator separately owns its lane template.
+- The handoff-only evidence commit is operator-owned; this handoff deliberately leaves all gate results unfilled until that operator completes the pending block.
 - Historical custody note: the already-created `cb4d9c29` combines source and handoff, so its recorded staged checks were not an isolated handoff-only protocol. This repair cannot split that commit under the current no-reset/no-commit contract; operator action must rebuild the two commits from `2e4bba41` in the required order.
