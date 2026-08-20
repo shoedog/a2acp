@@ -1,14 +1,17 @@
 use bridge_worktree::custody::{PreservationReasonV1, WorktreeCustodyStateKindV1};
 use bridge_worktree::sweep::{
-    CannotConstructSubjectV1, ClaimAuthorityObjectV1, ClaimAuthorityUnavailableReasonV1,
-    ClaimAuthorityUnavailableV1, CustodyExactAbsenceAssessmentV1, CustodyRecordAssessmentV1,
-    CustodyRootObservationV1, CustodyStateSnapshotV1, ExactAbsenceEnumerationV1,
+    scan_worktree_records, sweep_orphans_with_exact_absence, CannotConstructSubjectV1,
+    ClaimAuthorityObjectV1, ClaimAuthorityUnavailableReasonV1, ClaimAuthorityUnavailableV1,
+    CustodyExactAbsenceAssessmentV1, CustodyRecordAssessmentV1, CustodyRootObservationV1,
+    CustodyStateSnapshotV1, ExactAbsenceEnumerationV1, ExactAbsenceProbeV1,
     ExactAbsenceRecordAssessmentV1, ExactAbsenceRootRefusalV1, ExactAbsenceScanStatusV1,
     ExactAbsenceSweepEntryV1, ExactAbsenceSweepReportV1, IneligiblePopulationV1,
-    UnusedCandidateDecisionV1,
+    ScannedWorktreeRecordV1, UnusedCandidateDecisionV1,
 };
 
 fn assert_public<T>() {}
+
+fn assert_effective_item_type<'a>(_: impl Iterator<Item = &'a ExactAbsenceSweepEntryV1>) {}
 
 #[allow(dead_code)]
 fn assert_public_accessor_signatures(
@@ -25,7 +28,7 @@ fn assert_public_accessor_signatures(
     let _: &ExactAbsenceScanStatusV1 = report.scan();
     let _: &[ExactAbsenceSweepEntryV1] = report.entries();
     let _: bool = report.has_authoritative_scan();
-    let _ = report.effective();
+    assert_effective_item_type(report.effective());
 
     let _: &ExactAbsenceEnumerationV1 = scan.enumeration();
     let _: CustodyRootObservationV1 = scan.custody_root();
@@ -64,4 +67,10 @@ fn exact_absence_report_vocabulary_is_public() {
     assert_public::<ExactAbsenceSweepEntryV1>();
     assert_public::<ExactAbsenceSweepReportV1>();
     assert_public::<IneligiblePopulationV1>();
+}
+
+#[test]
+fn public_scan_functions_keep_visibility_and_exact_signatures() {
+    let _: fn(&str) -> Vec<(String, ScannedWorktreeRecordV1)> = scan_worktree_records;
+    let _: fn(&str, &dyn ExactAbsenceProbeV1) = sweep_orphans_with_exact_absence;
 }
