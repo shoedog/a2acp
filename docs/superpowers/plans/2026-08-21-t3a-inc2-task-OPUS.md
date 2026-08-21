@@ -1,0 +1,866 @@
+---
+task-type: implement
+---
+
+# T3a increment 2 — population admission and typed construction guards
+
+## Description
+
+T3a increment 1 and slice B are merged at `bade9866278877923de0f247e95d7bd5d813b2b9`.
+`sweep_orphans_with_exact_absence` returns a populated `ExactAbsenceSweepReportV1`
+with real root observations, and `has_authoritative_scan()` can now be `true`.
+
+But **every readable custody record still reaches the exact-absence probe and becomes
+`Assessed(decision)`**, whatever its custody state, and the three placement guards of
+`CannotConstructSubjectV1` are dormant — production has never constructed any of them.
+
+Increment 2 closes exactly that, and nothing else.
+
+---
+
+## What is actually at your base — verified, with two operator claims corrected
+
+Everything below was read on `origin/main` at `bade9866`. Two claims carried in the
+authoring input are **wrong** and are corrected here; the spec is written against what
+the code does.
+
+### Verified true
+
+| Anchor | Evidence at your base |
+|---|---|
+| The assessment construction site | `crates/bridge-worktree/src/sweep.rs:653` `report_exact_scan_projection_row`, whose `ScannedWorktreeRecordV1::Custody(record)` arm builds `Custody(CustodyRecordAssessmentV1::new(CustodyStateSnapshotV1::from(&record.state), CustodyExactAbsenceAssessmentV1::Assessed(decision)))` — verbatim as circulated. |
+| Ten custody states | `WorktreeCustodyStateV1` (`custody.rs:125`): `ProtectionPrepared{}`, `UnusedSettled{}`, `Materializing{}`, `LiveProtected{}`, `PreservationPrepared{}`, `Preserved{}`, `DeleteAuthorized{}`, `Removed{}`, `RecoveredLive{predecessor_claim_digest}`, `PreservationUnknown{reason}`. |
+| Six preservation reasons | `PreservationReasonV1` (`custody.rs:59`): `NodeFailure`, `Cancellation`, `AmbiguousCleanup`, `MaterializationInFlight`, `PostConditionDisagreement`, `RemovalFailed`. `PreservationReasonV1::ALL` has 6 members. |
+| `claim_presence()` exists and is the split | `custody.rs:189`, returns `ClaimPresenceV1::{Forbidden, Optional, Required}`. `ProtectionPrepared` → `Optional`; `PreservationPrepared`/`Preserved`/`PreservationUnknown{..}` → `Required`; the other six → `Forbidden`. |
+| Sixteen populations, arithmetic confirmed | 9 non-`PreservationUnknown` states + 6 `PreservationUnknown` reasons = 15, plus the `ProtectionPrepared` claim split = **16**. |
+| `IneligiblePopulationV1` arms | `report.rs:266` — exactly two: `BareProtectionPrepared`, `StateNotCandidate`. `#[non_exhaustive]`. |
+| `CannotConstructSubjectV1` arms | `report.rs:277` — exactly four: `RecordedWorktreePathNotAbsolute`, `OutsideSweepRoot`, `RecordFileNotExpectedSibling`, `ClaimAuthorityUnavailable(ClaimAuthorityUnavailableV1)`. `#[non_exhaustive]`. |
+| Invalid claim pairs never decode | `WorktreeCustodyRecordV1::validate` (`custody.rs:605`) returns `ClaimRequired` / `ClaimForbidden`; `decode_canonical` runs it, so such records surface as `ScannedWorktreeRecordV1::UnreadableCustody(Decode(..))`. **Do not add an `InvalidStateClaimPair` arm** — it would be unreachable by construction. |
+| `effective()` has zero production consumers | Its only three call sites are test assertions: `sweep.rs:1496`, `report.rs:564`, `tests/r2f1b_exact_absence_report_api.rs:31`. |
+| Readiness is the sole remaining gate | `entry_is_effectively_authorized_for_policy` = `policy_ready && self.has_authoritative_scan() && !Legacy && decision()==Authorized`; slice B made `has_authoritative_scan()` true on a healthy root. |
+| `record_path` is lossy | `checked_scan.rs:237`: `enumeration_root.join(&name).to_string_lossy().into_owned()`. `CheckedScanRowV1` separately retains the exact `enumerated_name: OsString`. |
+
+### CORRECTED — claim 1: "`ClaimAuthorityUnavailable` already has production construction"
+
+**It does not.** `ClaimAuthorityUnavailableV1::new` is called in exactly two places, both
+tests: `report.rs:453` and `tests/r2f1b_exact_absence_report_api.rs:47`. **All four**
+`CannotConstructSubjectV1` arms are dormant in production at your base.
+
+This does **not** widen increment 2's scope. The claim-authority arm stays dormant here:
+retyping the string-valued claim-construction errors is increment 3's named work
+("Replace string-valued claim-construction errors with the closed typed mapping"). See
+*What increment 2 deliberately does not retype*.
+
+### CORRECTED — claim 2: admission cannot be installed where the brief points
+
+The brief says increment 2 "interposes the admission table before" the construction site
+in `report_exact_scan_projection_row`. Read the call path: **`report_exact_scan_projection_row`
+runs strictly after every probe call for every row.**
+
+```
+sweep_orphans_with_exact_absence
+ └ sweep_orphans_with_exact_absence_with_pin_opener        (canonicalize_lenient(root))
+    └ project_exact_scan_result(canonical_root, scan, probe)        [sweep.rs:677]
+       └ for checked in checked_rows:
+            Legacy(..)  → decide_unused_legacy_sidecar → decide_unused_candidate → PROBE
+            Custody(..) → decide_unused_custody_record → decide_unused_candidate → PROBE
+            Unreadable  → Refused, no probe
+            rows.push(ExactScanProjectionRowV1 { checked, decision })
+ └ ExactScanOutcomeV1::into_report(requested_root)                  [sweep.rs:585]
+    └ rows.into_iter().map(report_exact_scan_projection_row)        [sweep.rs:653]  ← construction
+```
+
+An admission table installed in `report_exact_scan_projection_row` is provably a
+**post-hoc filter**: the whole row vector, including every probe call, is already
+complete before `into_report` is entered. It cannot suppress a single probe call. That
+placement is **ruled out**, and a test that asserts only the final decision cannot tell
+the two placements apart — which is why the zero-probe-call assertions in this spec are
+load-bearing.
+
+---
+
+## Q1 resolved — where admission belongs
+
+**Admission and the guards go inside `decide_unused_custody_record` (`sweep.rs:513`),
+renamed `assess_custody_record`, before its call to `decide_unused_candidate`.**
+
+That function is the **sole** path from a `ScannedWorktreeRecordV1::Custody` row to the
+probe. It already owns the two untyped guards this increment types
+(`worktree_under_root`, and the canonicalize-both-sides record/sibling comparison), and
+its tail — `record.claim.as_ref().and_then(from_claim).map(decide_unused_candidate)` — is
+the only probe call reachable from a custody row.
+
+Required shape:
+
+```rust
+fn assess_custody_record(
+    canonical_root: &SessionCwd,
+    enumerated_name: &OsStr,
+    record: &WorktreeCustodyRecordV1,
+    probe: &dyn ExactAbsenceProbeV1,
+) -> CustodyExactAbsenceAssessmentV1
+```
+
+1. `construction_guards(canonical_root, enumerated_name, &record.worktree.canonical_path)?`
+   → `CannotConstructSubject(..)` on failure.
+2. `admit_custody_population(&record.state, record.claim.is_some())?`
+   → `IneligiblePopulation(..)` on failure.
+3. Claim construction and `decide_unused_candidate` — the existing tail, unchanged, now
+   wrapped as `Assessed(..)`.
+
+**Note the `record_file: &str` parameter is deleted.** `record_path` is `to_string_lossy`
+output; a non-UTF-8 child name is silently mangled there. The guard's input is
+`enumerated_name: &OsStr`, the exact bytes the enumeration yielded. Removing the
+parameter makes that structural rather than a convention.
+
+### The row carrier
+
+`ExactScanProjectionRowV1` is private; change it to carry the finished assessment, so
+after this increment **no assessment is constructed after any probe call anywhere**:
+
+```rust
+struct ExactScanProjectionRowV1 {
+    checked: CheckedScanRowV1,
+    assessment: ExactAbsenceRecordAssessmentV1,
+}
+```
+
+`project_exact_scan_result`'s loop builds all three record kinds
+(`Legacy(decide_unused_legacy_sidecar(..))`, `UnreadableCustody(refusal.clone())`,
+`Custody(CustodyRecordAssessmentV1::new(CustodyStateSnapshotV1::from(&record.state), assess_custody_record(..)))`)
+and `report_exact_scan_projection_row` is reduced to a carrier:
+
+```rust
+fn report_exact_scan_projection_row(row: ExactScanProjectionRowV1) -> ExactAbsenceSweepEntryV1 {
+    let ExactScanProjectionRowV1 { checked, assessment } = row;
+    let (record_path, enumerated_name, _) = checked.parts();
+    ExactAbsenceSweepEntryV1::new(record_path.to_owned(), enumerated_name.to_os_string(), assessment)
+}
+```
+
+Keep the per-row log line byte-identical by deriving `let decision = row.assessment.decision();`
+— `ExactAbsenceRecordAssessmentV1::decision()` already exists and already maps both
+`IneligiblePopulation` and `CannotConstructSubject` to `Refused` (`report.rs:211`). Do not
+write a second decision projection.
+
+---
+
+## The sixteen populations
+
+One exhaustive match over `(&WorktreeCustodyStateV1, bool)`, **with no `_` arm over the
+state discriminant and every `PreservationReasonV1` named**. `Ok(())` admits.
+
+```rust
+/// `Ok(())` admits the record to construction; `Err(..)` is the reported population.
+fn admit_custody_population(
+    state: &WorktreeCustodyStateV1,
+    claim_present: bool,
+) -> Result<(), IneligiblePopulationV1>
+```
+
+| # | Population | Claim rule | Result |
+|--:|---|---|---|
+| 1 | `ProtectionPrepared {}`, claim present | Optional | **admit** |
+| 2 | `ProtectionPrepared {}`, no claim | Optional | `IneligiblePopulation(BareProtectionPrepared)` |
+| 3 | `PreservationUnknown { MaterializationInFlight }`, claim present | Required | **admit** |
+| 4 | `PreservationUnknown { NodeFailure }` | Required | `StateNotCandidate` |
+| 5 | `PreservationUnknown { Cancellation }` | Required | `StateNotCandidate` |
+| 6 | `PreservationUnknown { AmbiguousCleanup }` | Required | `StateNotCandidate` |
+| 7 | `PreservationUnknown { PostConditionDisagreement }` | Required | `StateNotCandidate` |
+| 8 | `PreservationUnknown { RemovalFailed }` | Required | `StateNotCandidate` |
+| 9 | `PreservationPrepared {}` | Required | `StateNotCandidate` |
+| 10 | `Preserved {}` | Required | `StateNotCandidate` |
+| 11 | `UnusedSettled {}` | Forbidden | `StateNotCandidate` |
+| 12 | `Materializing {}` | Forbidden | `StateNotCandidate` |
+| 13 | `LiveProtected {}` | Forbidden | `StateNotCandidate` |
+| 14 | `DeleteAuthorized {}` | Forbidden | `StateNotCandidate` |
+| 15 | `Removed {}` | Forbidden | `StateNotCandidate` |
+| 16 | `RecoveredLive { .. }` | Forbidden | `StateNotCandidate` |
+
+**2 candidate populations, 14 ineligible.** Narrowing toward refusal is the safe
+direction.
+
+Three rulings that make the match total without a dormant arm:
+
+- **`(PreservationUnknown { MaterializationInFlight }, false)` shares row 4–8's arm and
+  reports `StateNotCandidate`.** The canonical decoder rejects it (`ClaimRequired`), so
+  it is unreachable through `read_custody_record_in`; folding it into the existing arm
+  keeps the function total without adding a branch that can never fire. Do not invent a
+  name for it.
+- **The claim boolean is not a population axis except for `ProtectionPrepared`.** Using
+  `_` for the boolean on rows 4–16 is correct and required; it is not the wildcard the
+  design forbids. `RecoveredLive { .. }` likewise ignores its digest payload — the digest
+  is not a population axis.
+- Bare `ProtectionPrepared` is **not** a missing-required-claim result. Its claim is
+  schema-**optional** (`ClaimPresenceV1::Optional`), so this is a legitimate record that
+  is simply not a candidate. Claim-bearing `ProtectionPrepared` stays admitted because
+  the durable schema permits it; record in the handoff that it is schema-boundary
+  evidence — the present writer publishes `ProtectionPrepared` without a claim.
+
+---
+
+## Q2 resolved — guard precedence
+
+**Fixed order, first failure wins, and it is not negotiable:**
+
+1. `RecordedWorktreePathNotAbsolute`
+2. `OutsideSweepRoot`
+3. `RecordFileNotExpectedSibling`
+
+Then admission (step 4), then construction (step 5), then the probe (step 6). This is the
+rescope design's precedence verbatim, and increment 3's construction precedence continues
+from step 5, so do not reorder it.
+
+Justification, so a reviewer can check the reasoning and not just the order:
+
+- **1 before 2 and 3.** Absoluteness is a pure syntactic property of the recorded string
+  requiring no filesystem access, and the other two questions are ill-posed without it:
+  `worktree_under_root` on a relative path resolves against the process CWD, and the
+  expected sibling name of a relative path is not a child of this root at all.
+- **2 before 3.** Containment is the scoping question — whether this root has any
+  business interpreting this record. A path that resolves outside the frozen root must
+  not have its *name* read as naming one of the root's children, even when it does.
+- **3 last.** It is the placement question, and it is the only one that consumes the
+  enumerated child name.
+
+**Cross-class precedence is also fixed: guards outrank admission.** A `Preserved` record
+that also resolves outside the sweep root reports `OutsideSweepRoot`, **not**
+`StateNotCandidate`. Reporting a state-policy answer for a record that is not this root's
+record would assert the record was well-placed and merely in the wrong state. A test pins
+this (T5b).
+
+Guards 1 and 3 perform **zero** filesystem calls. Guard 2 retains the existing
+`worktree_under_root` → `canonicalize_lenient` symlink-resolving behavior unchanged.
+
+---
+
+## Q3 resolved — exact child-name matching
+
+**What is matched:** the exact `OsStr` child name the directory enumeration yielded
+(`CheckedScanRowV1::parts().1`).
+
+**Against what:** the lexically derived expected record name,
+`<file_name of record.worktree.canonical_path>` + `CUSTODY_RECORD_SUFFIX`, built as an
+`OsString`, compared byte-for-byte. **Neither side is canonicalized.**
+
+Plus a placement component: the recorded worktree path's `parent()` must equal the
+canonical sweep root, compared as `Path` (component-wise).
+
+```rust
+fn construction_guards(
+    canonical_root: &SessionCwd,
+    enumerated_name: &OsStr,
+    recorded_worktree: &str,
+) -> Result<(), CannotConstructSubjectV1> {
+    let worktree = Path::new(recorded_worktree);
+    if !worktree.is_absolute() {
+        return Err(CannotConstructSubjectV1::RecordedWorktreePathNotAbsolute);
+    }
+    if !worktree_under_root(canonical_root, recorded_worktree) {
+        return Err(CannotConstructSubjectV1::OutsideSweepRoot);
+    }
+    let (Some(parent), Some(stem)) = (worktree.parent(), worktree.file_name()) else {
+        return Err(CannotConstructSubjectV1::RecordFileNotExpectedSibling);
+    };
+    let mut expected = stem.to_os_string();
+    expected.push(CUSTODY_RECORD_SUFFIX);
+    if parent != Path::new(canonical_root.as_str()) || enumerated_name != expected.as_os_str() {
+        return Err(CannotConstructSubjectV1::RecordFileNotExpectedSibling);
+    }
+    Ok(())
+}
+```
+
+### Why canonicalization is the hole
+
+Today `decide_unused_custody_record` canonicalizes **both** sides
+(`sweep.rs:521-524`). Construct: a real single-link regular record file at
+`<root>/alias.custody.v1.json` whose decoded `worktree.canonical_path` is `<root>/wt`,
+with `<root>/wt.custody.v1.json` a **symlink** pointing back at
+`<root>/alias.custody.v1.json`. Then
+
+- `canonicalize("<root>/alias.custody.v1.json")` = itself, and
+- `canonicalize(custody_record_path("<root>/wt"))` follows the symlink to the same path,
+
+so the two compare **equal**, the guard passes, and a record named for one target is
+accepted as the custody record of another and probed. Exact child-name matching refuses
+it. This is the increment's strongest behavioral red (T3a).
+
+### Why the parent component is mandatory
+
+Dropping canonicalization **without** the parent check would be a regression, not a
+narrowing. A record file enumerated at `<root>/wt.custody.v1.json` whose recorded
+worktree is the nested `<root>/sub/wt` has expected child name `wt.custody.v1.json` — it
+would match on name alone. Today the canonicalize-both-sides check refuses it (the
+expected sibling `<root>/sub/wt.custody.v1.json` either does not exist or is a different
+path). The parent check preserves that refusal. Pinned by T3b.
+
+### What must NOT be imported
+
+`custody_record_file_matches` (`sweep.rs:375`) opens with
+`if !Path::new(worktree_path).is_dir() { return false; }`. **Do not carry that
+precondition into this guard.** It belongs to the recovery-classification path
+(`custody_entry_disposition`), where a vanished checkout is a missing pair. Here, an
+absent target is precisely the condition the exact-absence probe exists to observe;
+importing `is_dir` would refuse every record the increment is meant to admit.
+
+### Non-UTF-8 names
+
+`record.worktree.canonical_path` is a `String`, so the expected name is always valid
+UTF-8. An on-disk child name that is not valid UTF-8 can never equal it, and is refused
+as `RecordFileNotExpectedSibling`. That is correct and safe; do not add a lossy
+comparison to "fix" it.
+
+---
+
+## What increment 2 deliberately does not retype
+
+When a record is admitted and the guards pass but
+`ExactAbsenceCandidateV1::from_claim` fails, increment 2 **keeps today's behavior
+exactly**: the existing `.unwrap_or(UnusedCandidateDecisionV1::Refused)` tail, reported
+as `Assessed(Refused)`. `ClaimAuthorityUnavailable` stays dormant.
+
+This is deliberate. The typed object/reason mapping is increment 3's named work, and the
+`ClaimAuthorityObjectV1` / `ClaimAuthorityUnavailableReasonV1` product cannot be filled
+correctly from `from_claim`'s current string errors without inventing a mapping. Carry
+the imprecision — that a construction failure reports as `Assessed` although nothing was
+assessed — into the handoff as a recorded open item. **Do not repair it here.**
+
+---
+
+## SCOPE RULING — readiness does not flip in this increment
+
+**`EXACT_ABSENCE_POLICY_READY_V1` stays `false`.** Earlier specs assigned the readiness
+flip to increment 2; the owner has ruled otherwise, on evidence measured at your base:
+
+- `effective()` has **zero production consumers** — its only three call sites are test
+  assertions (`sweep.rs:1496`, `report.rs:564`,
+  `tests/r2f1b_exact_absence_report_api.rs:31`). Flipping readiness would change no
+  production behavior at all today.
+- Since slice B, `has_authoritative_scan()` returns `true` for a healthy root, so
+  readiness is the **sole remaining gate** in
+  `entry_is_effectively_authorized_for_policy`. Flipping it removes the last one.
+
+Flipping buys nothing now and costs the final guard. It belongs with the slice that
+actually consumes `effective()` — T3b — under that slice's own review. **This fence is
+recorded so a later reader does not "fix" it back.** A test must still prove
+`effective().count() == 0` on a root that classifies `Pinned` and now contains at least
+one `Assessed(Authorized)` entry.
+
+---
+
+## Scope fences
+
+Increment 2 does **not**:
+
+- set `EXACT_ABSENCE_POLICY_READY_V1` to `true`, or change `effective()` or
+  `entry_is_effectively_authorized_for_policy`;
+- change the public signature of `sweep_orphans_with_exact_absence` or **any** public
+  type, variant, field, or accessor in `crates/bridge-worktree/src/sweep/report.rs` — the
+  A1 vocabulary is settled and increment 2 fills arms that already exist;
+- construct `CannotConstructSubjectV1::ClaimAuthorityUnavailable`, or add
+  `ClaimIdentityFieldV1` / `ClaimIdentityFailureV1` / any increment-3 vocabulary;
+- add an `InvalidStateClaimPair` arm, or any new `IneligiblePopulationV1` arm;
+- change `classify_root_observations`, `root_capture_has_object_identity`, the retained
+  enumerator, or any root-observation behavior landed by slice B;
+- change `custody_entry_disposition`, `custody_record_file_matches`,
+  `recorded_identity_matches_sibling`, `report_custody_entry`, `remove_worktree_if_safe`,
+  `sweep_orphans`, or `WorktreeRunEndGuard` — the action path is untouched;
+- change `decide_unused_legacy_sidecar`, `decide_unused_candidate`,
+  `ExactAbsenceCandidateV1`, or `ExactAbsenceProbeV1`;
+- add ownership, locking, transition, unlink, or removal authority. **T3a decides and
+  reports; T3b acts.** A later actor must re-open, re-read, re-bind, and re-prove exact
+  absence under its own lock regardless of what the report says;
+- repair the Unix-only separator guard in `is_custody_record_name`
+  (`!stem.is_empty() && !stem.ends_with('/')`), characterized by A2a-2 and deliberately
+  unrepaired;
+- add any dependency. `Cargo.toml`, `Cargo.lock`, `crates/bridge-core/Cargo.toml`, and
+  `crates/bridge-worktree/Cargo.toml` must be byte-for-byte unchanged.
+
+### Inherited open items — record, do not act
+
+- **`Assessed` overstates a construction failure** (see above); increment 3 retypes it.
+- **The Unix-only separator guard** in `is_custody_record_name`, carried forward
+  unrepaired from A2a-2, A2b, and slice B.
+- **The non-latching entry-error loop** in the checked-scan engine, carried forward from
+  slice B.
+- **Fewer boot-time `git` subprocesses.** `sweep_orphans` passes the real
+  `HostGitWorktree` probe; after this change 14 of 16 populations no longer reach it, so
+  boot sweeps spawn fewer `git worktree list` invocations. `observe_exact_absence` is
+  read-only (`host_git.rs:202`), so no effect is lost. Record it; no test is required.
+
+---
+
+## Behavior that must not change
+
+### Mechanical, compile-only edits — assertions unchanged
+
+Seven test sites read the private field `ExactScanProjectionRowV1::decision`. Each
+becomes `row.assessment.decision()`. **Every asserted value stays identical**; these are
+not colour changes and must not be reported as such. In
+`crates/bridge-worktree/src/sweep/checked_scan.rs`:
+
+| Line | Test | Row kind |
+|---:|---|---|
+| 620, 624 | `pin_failure_leaves_the_root_observation_unavailable` | legacy |
+| 718 | `checked_scan_reads_each_selected_name_before_next_and_finishes_once` | legacy |
+| 772 | `exact_route_pin_failure_preserves_legacy_and_refuses_custody` | unreadable custody |
+| 815 | `exact_projection_retains_production_computed_decisions` | legacy + custody |
+| 863 | `exact_projection_preserves_legacy_and_custody_decision_matrix` | legacy + custody |
+| 887 | `unreadable_custody_refuses_without_probe` | unreadable custody |
+| 1081 | `nondefault_root_observations_survive_exact_without_changing_rows_or_decisions` | legacy |
+
+The two custody-bearing ones stay green **on their values** because `valid_records`
+(`checked_scan.rs:339`) publishes `state: protection_prepared` **with** a complete claim
+built from a real `git init` source — population 1, a candidate. Its enumerated name
+`custody.custody.v1.json` matches `file_name(canonicalize(root/custody)) + suffix`, and
+`canonicalize(root/custody).parent()` equals the canonical root the projection receives.
+Guards pass, admission admits, the probe still fires. **`exact_projection_retains_production_computed_decisions`
+must still observe exactly 2 probe calls.** If it does not, stop: a guard is wrong.
+
+`decoded_custody()` (`checked_scan.rs:316`) is population 2 — bare `ProtectionPrepared` at
+`/worktree`. It is refused before the probe today (outside root) and refused before the
+probe after (guard 2 → `OutsideSweepRoot`). No test asserts its assessment, so no colour
+changes; `injected_sources_use_production_action_and_exact_projections` and
+`injected_sources_prove_action_and_exact_projection_equivalence` stay green unedited.
+
+All ten A2a-2 characterization scenarios and the A2b/slice B root-observation tests must
+still hold, unedited except where the table above names a mechanical field read:
+
+`checked_scan_classifier_preserves_full_path_precedence_and_boundaries`,
+`checked_scan_silently_omits_bad_legacy_and_retains_bad_custody`,
+`checked_scan_counts_iterator_errors_and_continues_in_injected_order`,
+`nondefault_root_observations_survive_exact_without_changing_rows_or_decisions`,
+`enumeration_refusal_retains_canonical_root_and_skips_assessment`,
+`action_projection_erases_only_action_metadata`,
+`injected_sources_use_production_action_and_exact_projections`,
+`injected_sources_prove_action_and_exact_projection_equivalence`,
+`report_side_pin_failure_uses_post_canonicalization_opener_seam`,
+`compatibility_pin_failure_preserves_legacy_and_refuses_custody`,
+`compatibility_open_refusal_never_calls_pin_opener`,
+`exact_route_cannot_canonicalize_without_opening_pin`,
+`exact_route_preserves_canonical_scan_root_and_report_return`,
+`exact_projection_reports_forced_iterator_errors`,
+`production_scan_populates_all_three_root_captures`,
+`retained_capture_is_not_the_pin_and_not_path_metadata`,
+`root_capture_birthtime_capability_is_homogeneous_across_the_three_captures`,
+`root_observation_classifier_reports_pinned_captures`,
+`root_observation_classifier_reports_identity_changes_including_birthtime`,
+`root_observation_classifier_refuses_incomplete_captures`,
+`exact_absence_sweep_reports_cannot_canonicalize`.
+
+The entire action-path suite in `sweep.rs` (`sweep_recognizes_live_v3_record_as_recovery_…`
+through `a_clean_drop_of_an_unsettled_guard_counts_as_a_handled_settlement`) and both
+integration suites (`tests/r2f1b_claim_exchange.rs`, `tests/r2f1b_deletion_gate.rs`) must
+be unedited and green. `tests/r2f1b_exact_absence_report_api.rs` is compile-shape only
+and must be unedited.
+
+### Q4 resolved — the one assertion that legitimately changes
+
+**Exactly one pre-existing assertion changes**, and it must be named and justified
+individually in the handoff:
+
+`exact_absence_sweep_reports_the_stored_runtime_decision`, `crates/bridge-worktree/src/sweep.rs:1463`,
+lines 1514–1524. Its custody fixture is `WorktreeCustodyStateV1::LiveProtected {}` —
+population 13, claim-forbidden, ineligible. It asserts
+
+```rust
+super::CustodyExactAbsenceAssessmentV1::Assessed(super::UnusedCandidateDecisionV1::Refused)
+```
+
+which becomes
+
+```rust
+super::CustodyExactAbsenceAssessmentV1::IneligiblePopulation(
+    super::IneligiblePopulationV1::StateNotCandidate,
+)
+```
+
+**Justification to record:** `LiveProtected` is a live, sweep-excluded checkout whose
+state forbids a claim. Under increment 1 it was probed and refused on the *evidence*
+(no claim → `unwrap_or(Refused)`); under increment 2 it is refused on the *policy*, before
+any observation. `assessment.state().kind() == LiveProtected` and the entry's
+`decision()` both stay unchanged, `report.entries().len()` stays 3, and
+`report.effective().count()` stays 0. Extend the test to assert
+`report.has_authoritative_scan() == true` still holds. Nothing else in the test changes.
+
+**If any other existing test changes colour, that is a behavior change: stop and report.**
+
+---
+
+## Required tests
+
+All new tests live in `crates/bridge-worktree/src/sweep.rs`'s `mod tests`, which already
+carries `unique_temp_dir`, `object_with`, `attempt_identity`, `custody_record`, and
+`write_custody_checkout`.
+
+Two shared helpers are needed and must be added:
+
+- **A recording probe.** `struct RecordingProbe { calls: AtomicUsize, result: ExactAbsenceObservationV1 }`
+  implementing `ExactAbsenceProbeV1`, exposing the call count. `BothAbsentProbe`
+  (`sweep.rs:1358`) counts nothing and cannot carry the load-bearing assertions.
+- **Real claim authority.** A fixture that `git init`s a source inside the sweep root and
+  builds `PreservedWorktreeClaimV1` identities from `verify_payload_directory_identity`
+  over the canonicalized source, `source/.git`, and the root — **complete `dev`/`ino`, not
+  degraded**. `DirectoryIdentityV1::matches` requires exact `dev`/`ino` equality
+  (`fs_custody.rs:132`), so a degraded claim identity fails `from_claim` before the probe
+  and would make every zero-probe assertion vacuous. The existing `custody_record` helper
+  builds fake `/src`, `/root`, `/src/.git` identities and only attaches a claim when
+  `claim_presence() == Required`; extend or parameterize it — do not silently reuse it.
+  `from_claim` never stats the worktree, so target directories need not exist.
+
+| # | Test | Evidence category | What it catches |
+|---|---|---|---|
+| T1 | `population_admission_covers_every_decodable_population_and_probes_only_candidates` | **genuine runtime red** | Sixteen records under one sweep root, one `sweep_orphans_with_exact_absence` call, every claim built with real complete authority. Asserts each entry's exact `CustodyExactAbsenceAssessmentV1` against the sixteen-row table **and** that the recording probe was called **exactly twice** — populations 1 and 3 only. Uniform real authority is what makes the fourteen zeroes attributable to admission rather than to failed construction. Catches a missing or mis-assigned population, a wildcard arm, and admission placed after the probe. |
+| T2 | `a_canonical_preserved_record_stops_before_the_probe_with_a_matched_control` | **genuine runtime red** | The rescope design's headline row. `Preserved {}` + complete claim + real authority + `BothAbsent`: base gives `Assessed(Authorized)` and 1 probe call, this gives `IneligiblePopulation(StateNotCandidate)` and **0**. The matched control in the same test is a `ProtectionPrepared` + claim record built from the same authority, which must reach the probe **once** and yield `Assessed(Authorized)`. |
+| T3a | `an_expected_sibling_symlink_alias_is_refused_with_a_matched_control` | **genuine runtime red** | The canonicalization hole. Real record at `<root>/alias.custody.v1.json` naming `<root>/wt`, with `<root>/wt.custody.v1.json` a symlink back to it. Base: `Assessed(Authorized)`, 1 probe. This: `CannotConstructSubject(RecordFileNotExpectedSibling)`, 0 probes. The control places the same record at `<root>/wt.custody.v1.json` with no symlink and requires one probe and `Assessed(Authorized)`. Also assert the symlink-named row is `UnreadableCustody(..)` — `read_custody_record_in` is `O_NOFOLLOW`. |
+| T3b | `a_nested_target_whose_record_sits_at_the_root_is_not_an_expected_sibling` | **genuine runtime red** (report value) | The parent component. Record enumerated at `<root>/wt.custody.v1.json` naming `<root>/sub/wt`. Base refuses via canonicalization with 0 probes; this must still refuse with 0 probes and now report `RecordFileNotExpectedSibling`. Catches a name-only comparison. |
+| T4 | `a_target_resolving_outside_the_sweep_root_is_typed_outside_root` | **genuine runtime red** (report value) | `<root>/alias` is a symlink to a directory outside the root; the record is the exact sibling `<root>/alias.custody.v1.json`. The sibling guard would pass, so only containment refuses. Base: `Assessed(Refused)`; this: `CannotConstructSubject(OutsideSweepRoot)`. 0 probes both ways. |
+| T5a | `a_relative_recorded_target_reports_the_first_guard_only` | **genuine runtime red** (report value) | Guard precedence within the class. Record enumerated at `<root>/p.custody.v1.json` whose `worktree.canonical_path` is `relative/target` — it fails all three guards. Must report `RecordedWorktreePathNotAbsolute`. |
+| T5b | `a_preserved_record_outside_the_root_reports_the_guard_not_the_population` | **genuine runtime red** (report value) | Cross-class precedence. `Preserved {}` + claim, recorded target resolving outside the root. Must report `OutsideSweepRoot`, **not** `StateNotCandidate`. Two implementations cannot disagree after this. |
+| T6 | `invalid_persisted_claim_pairs_stay_unreadable_and_never_probe` | **characterization** | Write a claim-forbidden state carrying a claim, and a claim-required state with `claim: null`, using `serde_json::to_vec` to bypass `encode_canonical`'s validation. Both must surface as `UnreadableCustody(Decode(ClaimForbidden))` / `(Decode(ClaimRequired))` with 0 probes, not as constructed assessments. Catches an implementer adding an `InvalidStateClaimPair` arm. |
+| T7 | `exact_absence_sweep_reports_the_stored_runtime_decision` (amended) | **amendment** | See *Q4 resolved* above. |
+
+Every zero-probe assertion must read the recording probe's counter. A test that asserts
+only the resulting `CustodyExactAbsenceAssessmentV1` cannot distinguish admission from a
+post-hoc filter and does not discharge this requirement.
+
+**macOS fixture warning.** `std::env::temp_dir()` is under `/var` on macOS, which is a
+symlink to `/private/var`. Every recorded `worktree.canonical_path` and every expected
+parent must be derived from `std::fs::canonicalize(&root)`, not from the raw temp path,
+or the parent component of guard 3 will fire spuriously on macOS while passing on Linux.
+This lane has already lost a slice to a three-filesystem divergence; assume nothing.
+
+---
+
+## The frozen genuine-red control
+
+Create `docs/superpowers/reviews/2026-08-21-r2f1b-3d-t3a-inc2-genuine-red-control.patch`,
+following the shape of
+`docs/superpowers/reviews/2026-08-21-r2f1b-3d-t3a-inc1-sliceB-genuine-red-control.patch`
+already in the tree:
+
+- a `#` header naming the base tree `bade9866278877923de0f247e95d7bd5d813b2b9`, the
+  `git apply` command, and the run command;
+- **test-only** hunks that apply cleanly to the untouched base and add tests prefixed
+  `inc2_control_`;
+- at minimum controls for T2 (zero probe calls on canonical `Preserved`) and T3a (the
+  symlink alias refused). Those two are the natural runtime oracles: on the base they
+  fail behaviorally — the probe is called and `Assessed(Authorized)` is produced — not by
+  failing to compile.
+
+Record the patch's SHA-256 and the exact run command in the handoff, e.g.
+`CARGO_INCREMENTAL=0 cargo test -p bridge-worktree --locked inc2_control_ -- --nocapture`.
+
+**You cannot run `cargo` in this container, so a claimed red observation is a
+fabrication.** Freeze the control and hand it to the operator; do not assert what it did.
+
+---
+
+## Handoff and custody
+
+Create `docs/superpowers/reviews/2026-08-21-r2f1b-3d-t3a-inc2-handoff.md`.
+
+**You make the implementation-candidate commit only.** The implement container's egress
+cannot fetch the pinned `a2a-lf` dependency, so `cargo` cannot build here. Gate execution
+and the handoff-only evidence commit belong to the host operator. Do not attempt the
+gates, do not run `git diff --cached --check`, and do not invent totals. Reporting a gate
+as blocked is correct; inventing a total is not.
+
+Carry these six lines unticked under `## OPERATOR EVIDENCE — PENDING`:
+
+- [ ] `cargo fmt --all -- --check` — PENDING OPERATOR
+- [ ] `CARGO_INCREMENTAL=0 cargo clippy --workspace --all-targets --locked -- -D warnings` — PENDING OPERATOR
+- [ ] `CARGO_INCREMENTAL=0 cargo test --workspace --locked --no-fail-fast` — PENDING OPERATOR
+- [ ] `CARGO_INCREMENTAL=0 cargo test -p bridge-worktree --locked --no-fail-fast` — PENDING OPERATOR
+- [ ] `cargo run -p a2a-bridge -- validate --repo-hygiene` (implementation point) — PENDING OPERATOR
+- [ ] `cargo run -p a2a-bridge -- validate --repo-hygiene` (handoff point) — PENDING OPERATOR
+
+Plus, separately headed `## OPERATOR PROBE — PENDING`, the frozen-control apply-and-run
+command against the untouched base.
+
+The handoff must record: base identity and clean-tree status; a pre-edit checkpoint
+giving each factual anchor's disposition and source location (including the two corrected
+operator claims above, confirmed or re-refuted against the code you actually read); the
+per-row estimates and the proceed-or-stop decision; every changed file; the
+test-name-to-evidence-category table with the control's base tree identity and patch
+hash; the seven mechanical field reads listed as mechanical and **not** as colour changes;
+`exact_absence_sweep_reports_the_stored_runtime_decision` named as the single legitimate
+assertion change with its individual justification; the readiness scope fence and its
+reason; the four inherited open items; that no manifest or lockfile changed; and the
+final counted-line worksheet.
+
+Do not consult a template outside the repository; none exists there and these inline
+requirements are the owner-approved replacement.
+
+---
+
+## Sizing
+
+Counted lines are added nonblank physical lines after the fmt gate, one row per line, no
+contingency, no borrowing.
+
+**Measured at your base, not estimated.** `crates/bridge-worktree/src/sweep.rs`'s
+`mod tests` holds 34 tests totalling 1316 nonblank lines between `#[test]` markers —
+**mean 38.7**, range 8–169 (the range includes interleaved helper functions, which count).
+Brace-matched, the closest analogue to this increment's tests,
+`exact_absence_sweep_reports_the_stored_runtime_decision`, is **68**.
+`checked_scan.rs`'s 23 tests total 766 — mean 33.3, range 9–57. The circulated figure of
+"roughly 28–35" is right for `checked_scan.rs` and low for `sweep.rs`. Plan real-filesystem
+sweep tests at **40** and table-driven ones higher. **Re-measure before editing.**
+
+**C1 — production**
+
+| Counted component | Estimate | Cap |
+|---|---:|---:|
+| C1-1 `construction_guards` + `admit_custody_population` + `assess_custody_record` (replacing `decide_unused_custody_record`), with doc comments | 70 | 100 |
+| C1-2 `ExactScanProjectionRowV1` carries the record assessment; `project_exact_scan_result` loop builds all three arms; `report_exact_scan_projection_row` reduced to a carrier | 30 | 45 |
+| **C1 subtotal** | **100** | **145** |
+
+**C2 — tests**
+
+| Counted component | Estimate | Cap |
+|---|---:|---:|
+| C2-1 `RecordingProbe` + real-claim-authority fixture | 50 | 75 |
+| C2-2 T1 sixteen-population table | 80 | 115 |
+| C2-3 T2 preserved + matched control | 40 | 60 |
+| C2-4 T3a/T3b sibling guard + matched control | 60 | 85 |
+| C2-5 T4 outside-root symlink | 35 | 55 |
+| C2-6 T5a/T5b guard precedence | 45 | 65 |
+| C2-7 T6 invalid-pair characterization | 30 | 45 |
+| C2-8 T7 amendment + the seven mechanical field reads | 15 | 25 |
+| **C2 subtotal** | **355** | **525** |
+
+**Code + tests: 455 against the design's 450-line anchor — a 1.01× match, not a breach.**
+The anchor is stated as "450 changed lines including tests", so the evidence artifacts sit
+outside it, exactly as slice B's worksheet separated them:
+
+**C3 — evidence artifacts**
+
+| Counted component | Estimate | Cap |
+|---|---:|---:|
+| C3-1 frozen genuine-red control patch | 60 | 95 |
+| C3-2 increment 2 handoff | 115 | 150 |
+| **C3 subtotal** | **175** | **245** |
+
+| **Total** | **630** | **915** |
+
+**The split, and its trigger.** The guards block (C1-1's guard half, C1-2, C2-1, C2-4,
+C2-5, C2-6) is coherent on its own: it types the three placement arms and leaves every
+admitted record on `Assessed(..)` exactly as today. **If any C1 or C2 row exceeds its cap,
+or the C1+C2 subtotal exceeds 670, stop after the guards block and hand it off as a
+complete slice**, reporting the revised admission estimate. Do not compress the sixteen-row
+table, the matched controls, or the probe counters to fit — those are what make this
+increment falsifiable. Two slices in this lane have already been split for exactly this
+reason and both splits were right.
+
+---
+
+## Acceptance Criteria
+
+Gates are operator-owned; these are the conditions you are responsible for.
+
+1. Population admission and the three placement guards execute inside
+   `assess_custody_record` (the renamed `decide_unused_custody_record`), **before** its
+   call to `decide_unused_candidate`. `report_exact_scan_projection_row` contains no
+   reference to `IneligiblePopulationV1`, `CannotConstructSubjectV1`,
+   `WorktreeCustodyStateV1`, or any probe, and performs no filesystem access.
+2. `decide_unused_candidate` has exactly two call sites — `decide_unused_legacy_sidecar`
+   and `assess_custody_record` — and in the latter it is reachable only after both
+   `construction_guards` and `admit_custody_population` return `Ok`.
+3. `admit_custody_population` matches on `(&WorktreeCustodyStateV1, bool)` with **no `_`
+   arm over the state discriminant**, names all six `PreservationReasonV1` variants
+   explicitly, and reproduces the sixteen-row table exactly: two admits, one
+   `BareProtectionPrepared`, thirteen `StateNotCandidate`.
+4. No new arm is added to `IneligiblePopulationV1` or `CannotConstructSubjectV1`, and no
+   `InvalidStateClaimPair`-shaped arm exists anywhere.
+5. Guard precedence is `RecordedWorktreePathNotAbsolute` → `OutsideSweepRoot` →
+   `RecordFileNotExpectedSibling`, first failure wins, and guards outrank admission.
+   T5a and T5b pin both orderings.
+6. The sibling guard compares the exact `OsStr` enumerated child name against
+   `file_name(record.worktree.canonical_path) + CUSTODY_RECORD_SUFFIX`, canonicalizing
+   neither side, and additionally requires the recorded target's parent to equal the
+   canonical sweep root. `assess_custody_record` takes no `record_file: &str` parameter
+   and no guard reads `CheckedScanRowV1::record_path`.
+7. No `is_dir` precondition is imported into the sibling guard.
+8. `CannotConstructSubjectV1::ClaimAuthorityUnavailable` is still constructed nowhere in
+   production; claim-construction failure still reports `Assessed(Refused)`, and the
+   imprecision is recorded as an open item rather than repaired.
+9. `EXACT_ABSENCE_POLICY_READY_V1` remains `false`; `effective()`,
+   `entry_is_effectively_authorized_for_policy`, and every public item in `report.rs` are
+   byte-unchanged; a test proves `effective().count() == 0` on a `Pinned` root that now
+   contains an `Assessed(Authorized)` entry.
+10. Every test in *Required tests* exists, each classified as genuine runtime red,
+    compiler-only evidence, or characterization, with no misclassification. Every
+    zero-probe claim is backed by a recording-probe call count, and every zero-probe
+    fixture has a matched control that reaches the probe once.
+11. The frozen genuine-red control exists with a recorded base tree, patch SHA-256, and
+    run command, and applies cleanly to the untouched base. No red result is claimed.
+12. The seven mechanical `row.decision` reads are updated with **identical asserted
+    values**, and are reported as mechanical, not as colour changes.
+    `exact_projection_retains_production_computed_decisions` still observes exactly two
+    probe calls.
+13. Exactly one pre-existing assertion changes —
+    `exact_absence_sweep_reports_the_stored_runtime_decision`'s `Assessed(Refused)` →
+    `IneligiblePopulation(StateNotCandidate)` — and it is named and justified
+    individually. Every other listed test is unedited and green, and the run stopped and
+    reported if any other changed colour.
+14. Every scope fence holds, and the four inherited open items are carried forward
+    unrepaired.
+15. No dependency, manifest, or lockfile change: `Cargo.toml`, `Cargo.lock`,
+    `crates/bridge-core/Cargo.toml`, and `crates/bridge-worktree/Cargo.toml` are
+    byte-for-byte unchanged.
+16. The handoff exists with the six `PENDING OPERATOR` lines unticked plus the separate
+    operator probe line, and exactly one implementation-candidate commit exists — or the
+    split trigger fired and the run reported instead.
+17. Every counted worksheet row and each subtotal is within cap, or the run stopped and
+    reported the revised estimate.
+
+Do not claim any gate result. Do not tick a pending box.
+
+---
+
+## Files
+
+- `crates/bridge-worktree/src/sweep.rs` — the whole increment's production change:
+  `assess_custody_record` (replacing `decide_unused_custody_record`),
+  `construction_guards`, `admit_custody_population`, the
+  `ExactScanProjectionRowV1` carrier, `project_exact_scan_result`'s loop, and
+  `report_exact_scan_projection_row`'s reduction; plus tests T1–T6, the two shared test
+  helpers, and the T7 amendment. New imports: `std::ffi::OsStr`, and
+  `crate::custody::{CUSTODY_RECORD_SUFFIX, PreservationReasonV1, WorktreeCustodyStateV1}`.
+  `custody_entry_disposition`, `custody_record_file_matches`,
+  `recorded_identity_matches_sibling`, `remove_worktree_if_safe`, `sweep_orphans`,
+  `WorktreeRunEndGuard`, `classify_root_observations`, and
+  `root_capture_has_object_identity` must not change.
+- `crates/bridge-worktree/src/sweep/checked_scan.rs` — **only** the seven mechanical
+  `row.decision` → `row.assessment.decision()` reads listed above. The scan engine,
+  `CheckedScanRowV1`, `RootObservationSetV1`, and every asserted value are unchanged.
+- `crates/bridge-worktree/src/sweep/report.rs` — **read-only.** The vocabulary,
+  `decision()`, `has_authoritative_scan`, `effective`,
+  `entry_is_effectively_authorized_for_policy`, and `EXACT_ABSENCE_POLICY_READY_V1` are
+  settled.
+- `crates/bridge-worktree/src/custody.rs` — read-only reference for
+  `WorktreeCustodyStateV1`, `PreservationReasonV1`, `claim_presence`,
+  `identity_completeness`, `WorktreeCustodyRecordV1::validate`, `custody_record_path`,
+  `CUSTODY_RECORD_SUFFIX`, `read_custody_record_in`, `is_custody_record_name`.
+- `crates/bridge-worktree/src/provider_path.rs` — read-only reference for
+  `canonicalize_lenient`.
+- `crates/bridge-core/src/session_cwd.rs` — read-only reference for `SessionCwd::is_under`
+  (component-wise, lexical, symlinks unresolved).
+- `crates/bridge-core/src/fs_custody.rs` — read-only reference for
+  `DirectoryIdentityV1::matches` and `verify_payload_directory_identity`.
+- `crates/bridge-worktree/src/host_git.rs` — read-only reference for
+  `HostGitWorktree::observe_exact_absence`.
+- `crates/bridge-worktree/tests/r2f1b_exact_absence_report_api.rs`,
+  `crates/bridge-worktree/tests/r2f1b_claim_exchange.rs`,
+  `crates/bridge-worktree/tests/r2f1b_deletion_gate.rs` — must not change.
+- `bin/a2a-bridge/src/main.rs` — read-only reference for the five `sweep_orphans` boot
+  callers; must not change.
+- `docs/superpowers/reviews/2026-08-21-r2f1b-3d-t3a-inc2-handoff.md` — create.
+- `docs/superpowers/reviews/2026-08-21-r2f1b-3d-t3a-inc2-genuine-red-control.patch` — create.
+- `Cargo.toml`, `Cargo.lock`, `crates/bridge-core/Cargo.toml`,
+  `crates/bridge-worktree/Cargo.toml` — must not change.
+
+---
+
+## Spec Refs
+
+Authoritative at your base commit `bade9866`:
+
+- `crates/bridge-worktree/src/sweep.rs` — `decide_unused_custody_record` (:513),
+  `decide_unused_legacy_sidecar` (:494), `decide_unused_candidate` (:189),
+  `ExactScanProjectionRowV1` (:538), `report_exact_scan_projection_row` (:653),
+  `project_exact_scan_result` (:677), `ExactScanOutcomeV1::into_report` (:585),
+  `worktree_under_root` (:235), `custody_record_file_matches` (:375),
+  `custody_entry_disposition` (:401), `ExactAbsenceCandidateV1::from_claim` (:56) and
+  `from_bound` (:86)
+- `crates/bridge-worktree/src/sweep/report.rs` — `IneligiblePopulationV1` (:266),
+  `CannotConstructSubjectV1` (:277), `CustodyExactAbsenceAssessmentV1` (:255),
+  `ExactAbsenceRecordAssessmentV1::decision` (:211), `CustodyStateSnapshotV1::from` (:349),
+  `EXACT_ABSENCE_POLICY_READY_V1` (:11), `effective` (:93),
+  `entry_is_effectively_authorized_for_policy` (:101)
+- `crates/bridge-worktree/src/sweep/checked_scan.rs` — `CheckedScanRowV1::parts` (:100),
+  `scan_checked_rows_with_source` (:222), `valid_records` (:339), `decoded_custody` (:316)
+- `crates/bridge-worktree/src/custody.rs` — `PreservationReasonV1` (:59),
+  `WorktreeCustodyStateV1` (:125), `ClaimPresenceV1` (:156), `claim_presence` (:189),
+  `identity_completeness` (:215), `WorktreeCustodyRecordV1::validate` (:599),
+  `decode_canonical` (:659), `custody_record_path` (:688), `CUSTODY_RECORD_SUFFIX` (:41),
+  `read_custody_record_in` (:822)
+- `crates/bridge-core/src/session_cwd.rs` — `SessionCwd::is_under` (:62)
+- `crates/bridge-core/src/fs_custody.rs` — `DirectoryIdentityV1::matches` (:132)
+- `docs/superpowers/plans/2026-08-18-r2f1b-3d-t3a-rescope-design.md` — "Scan and guard
+  flow" (guard precedence 1–6, the sibling-canonicalization hole, the isolation
+  fixtures), "Population admission" (the sixteen-row table), "Increment 2 — guards and
+  exhaustive population admission" (the 450 anchor and the five behavioral-red bullets),
+  "Increment 3" (the typed claim-identity mapping this increment must not pre-empt)
+- `docs/superpowers/plans/2026-08-21-t3a-sliceB-task.md` — the operator-owned-gate and
+  frozen-red-control conventions this spec follows
+- `docs/superpowers/reviews/2026-08-21-r2f1b-3d-t3a-inc1-sliceB-genuine-red-control.patch`
+  — the control patch format
+- `docs/superpowers/reviews/2026-08-21-r2f1b-3d-t3a-inc1-sliceB-handoff.md` — the handoff
+  format, and slice B's record that readiness and admission were deferred to this
+  increment
+
+---
+
+## Commit Message
+
+feat(worktree): admit only candidate populations and type the placement guards
+
+Interpose population admission and the three placement guards inside the custody
+arm's decision function, before it can reach the exact-absence probe. Fourteen of
+the sixteen canonically decodable populations now report
+`IneligiblePopulation(..)` without any observation: bare `ProtectionPrepared`
+reports `BareProtectionPrepared`, and every other non-candidate state — including
+canonical `Preserved` with a complete claim — reports `StateNotCandidate`. Only
+claim-bearing `ProtectionPrepared` and `PreservationUnknown { materialization_in_flight }`
+still reach the probe, once each.
+
+Populate the three dormant guard arms. Precedence is fixed as
+`RecordedWorktreePathNotAbsolute`, then `OutsideSweepRoot`, then
+`RecordFileNotExpectedSibling`, with the guards outranking admission so a
+misplaced record is never reported as a state-policy answer. The sibling guard
+compares the exact enumerated child name against the lexically derived
+`<target>.custody.v1.json` and canonicalizes neither side: canonical equality
+accepted a wrong regular record whenever the expected sibling was a symlink back
+to it, and the recorded target's parent must now be the sweep root itself.
+
+The scan row carries its finished assessment, so no assessment is constructed
+after any probe call. `ClaimAuthorityUnavailable` stays dormant — the typed
+claim-identity mapping is increment 3's.
+
+`EXACT_ABSENCE_POLICY_READY_V1` stays false and `effective()` stays empty:
+`effective()` has no production consumer, and since slice B readiness is the sole
+remaining gate, so flipping it here would buy nothing and remove the last one.
+The report still carries ordered historical evidence, not authority — a later
+actor must re-open, re-read, re-bind, and re-prove exact absence under its own
+lock.
+
+No dependency, manifest, or lockfile change.
+
+---
+
+## Falsification license
+
+Every symbol, line number, signature, count, and behavioral statement above is a claim
+measured against your base. **The repository is authoritative.** Two claims circulated
+with this work have already been corrected here — that `ClaimAuthorityUnavailable` has
+production construction, and that admission can be installed at the assessment
+construction site — so treat the rest as fallible in the same way.
+
+Stop before editing, and record the exact repository evidence, if: any
+`ClaimAuthorityUnavailableV1::new` call site exists outside the two named tests; the
+probe is reachable from a custody row by any path other than
+`decide_unused_custody_record` → `decide_unused_candidate`; `WorktreeCustodyStateV1` or
+`PreservationReasonV1` has a different variant set, making the arithmetic other than 16;
+`claim_presence()` assigns differently than the table above; `IneligiblePopulationV1` or
+`CannotConstructSubjectV1` has arms other than the two and four named; `decode_canonical`
+does not reject invalid claim pairs; `effective()` has a production consumer;
+`CheckedScanRowV1` does not retain the exact `enumerated_name`;
+`exact_projection_retains_production_computed_decisions` does not assert two probe calls
+against a claim-bearing `ProtectionPrepared` record; or
+`exact_absence_sweep_reports_the_stored_runtime_decision` does not use `LiveProtected`.
+
+Do not adapt the design to a false anchor. Finding the work smaller than described is a
+finding to report, not a licence to broaden it.
