@@ -83,7 +83,7 @@
 
 | Item | Verbatim |
 |---|---|
-| main | `9ce2074ec4e0cf8bfb4dbe11a15bb0b18b19b0dd` (A2b, PR #65) |
+| main | `9ce2074ef2a4e7b7bb81b9561b79ba672f9db9db` (A2b, PR #65) |
 | A2 spec v1 | `4234517d` · `docs/superpowers/plans/2026-08-19-r2f1b-3d-t3a-inc1-sliceA2-task.md` |
 | A2 operator findings | `904c89fb` · `docs/superpowers/reviews/2026-08-19-a2-spec-operator-findings.md` |
 | fold worktree | `.claude/worktrees/fold`, branch `main`, at `c637e493` |
