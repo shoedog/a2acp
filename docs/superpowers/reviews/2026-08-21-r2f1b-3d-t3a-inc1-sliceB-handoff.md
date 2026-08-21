@@ -67,12 +67,12 @@ Inherited open items remain unchanged: a persistent `readdir` error can remain n
 
 ## OPERATOR EVIDENCE — PENDING
 
-- [ ] `cargo fmt --all -- --check` — PENDING OPERATOR
-- [ ] `CARGO_INCREMENTAL=0 cargo clippy --workspace --all-targets --locked -- -D warnings` — PENDING OPERATOR
-- [ ] `CARGO_INCREMENTAL=0 cargo test --workspace --locked --no-fail-fast` — PENDING OPERATOR
-- [ ] `CARGO_INCREMENTAL=0 cargo test -p bridge-worktree --locked --no-fail-fast` — PENDING OPERATOR
-- [ ] `cargo run -p a2a-bridge -- validate --repo-hygiene` (implementation point) — PENDING OPERATOR
-- [ ] `cargo run -p a2a-bridge -- validate --repo-hygiene` (handoff point) — PENDING OPERATOR
+- [x] `cargo fmt --all -- --check` — **exit 0** (operator, macOS host, 2026-08-21)
+- [x] `CARGO_INCREMENTAL=0 cargo clippy --workspace --all-targets --locked -- -D warnings` — **exit 0**, zero warnings
+- [x] `CARGO_INCREMENTAL=0 cargo test --workspace --locked --no-fail-fast` — **exit 0**, 0 failures across **75 test binaries + 16 doc-test suites**
+- [x] `CARGO_INCREMENTAL=0 cargo test -p bridge-worktree --locked --no-fail-fast` — **exit 0**; lib **312 passed** / 0 failed
+- [x] `cargo run -p a2a-bridge -- validate --repo-hygiene` (implementation point) — **exit 0**
+- [x] `cargo run -p a2a-bridge -- validate --repo-hygiene` (handoff point) — **exit 0**
 
 ## OPERATOR PROBE — PENDING
 
@@ -95,3 +95,94 @@ Counts are added nonblank physical lines measured from this candidate before the
 | B2-5 handoff | 110 | 71 | 145 |
 | B2 subtotal | 435 | 324 | 600 |
 | Total | 680 | 531 | 935 |
+
+
+---
+
+## Operator evidence — filled 2026-08-21
+
+Run on the host, outside the implement container, whose egress cannot fetch the
+pinned `a2a-lf` dependency.
+
+**Implementation commits:** `750cd8f3` (slice B) then `caf2430b` (fixture repair)
+**Base:** `9ce2074ef2a4e7b7bb81b9561b79ba672f9db9db`
+Toolchain: `rustc 1.94.0`, `cargo 1.94.0`, `rustfmt 1.8.0-stable`, `clippy 0.1.94`.
+
+**Attribution control.** `bridge-worktree` on base `9ce2074e`, same host and
+toolchain, gives 308 passed. This candidate gives **312** — +4, zero failures
+either side.
+
+### F8 — the classifier-policy stop condition did NOT fire
+
+Probe run, output verbatim:
+
+```
+SLICE-B-F8 fixture_dev=16777229 fixture_ino=171356351   retained_birthtime=some pinned_birthtime=some final_named_birthtime=some result=Pinned
+```
+
+All three captures report `some`. **Availability is homogeneous**, so the
+mixed-availability condition that would have stopped this slice is not present on
+this host.
+
+**Ruling, as the spec requires it be made explicitly:** A2b's strict-equality
+policy — whole-value `RootIdentityCaptureV1` comparison including birthtime —
+**stands unchanged**. `classify_root_observations` is not edited by this slice.
+
+**Limit of that ruling.** It rests on one observation, on macOS/APFS, where
+birthtime is available. The ext4 lane is expected to report `none/none/none`,
+which is also homogeneous and also classifies `Pinned` — but that has **not been
+observed with the `SLICE-B-F8` line captured**, because CI does not run the suite
+with `--nocapture`. A mixed result remains theoretically reachable on a
+filesystem where the three capture paths disagree, and would re-open this ruling.
+
+### The non-UTF-8 fixture skip fired here, as designed
+
+```
+SLICE-B-NON-UTF8-FIXTURE-SKIPPED: Illegal byte sequence (os error 92)
+```
+
+So on this host the enumeration-equivalence test proves the **portable subset
+only**. Non-UTF-8 round-tripping is covered on the ext4 lanes and not here. That
+is a real, disclosed coverage reduction.
+
+### `git diff --check` — flagged, benign, and NOT reported as clean
+
+`git diff --check 9ce2074e..HEAD` exits **2**, flagging exactly one line:
+
+```
+docs/superpowers/reviews/2026-08-21-...-sliceB-genuine-red-control.patch:12: trailing whitespace.
++<SP>          <- a '+' followed by one space, shown here as <SP> so this
+                 quotation does not itself trip the whitespace linter
+```
+
+That line is `' '` — a single space, the canonical unified-diff representation of
+an empty **context** line, which `git diff` itself emits. No source file is
+flagged; the only hit is inside a stored `.patch`.
+
+I hypothesised that stripping it would corrupt the frozen control and **probed
+that hypothesis: it is false.** `git apply --check` succeeds both with the space
+and with it stripped. So the space is neither load-bearing nor harmful — it is
+canonical git output that the whitespace linter flags when a diff is stored as a
+file.
+
+Recording the gate as **flagged-and-explained rather than clean**, since
+relabelling a non-zero check as green is exactly the failure this lane's
+completion rule forbids.
+
+### Limits
+
+- These results attest the tree at `caf2430b` only.
+- This handoff does not name its own commit SHA, which cannot exist before the
+  commit does.
+- Provisional `git diff --cached --check` on the staged handoff: **exit 0**,
+  after correcting one line of trailing whitespace that my own verbatim quotation
+  of the patch's flagged line had introduced. That checked provisional bytes.
+- The final staged `git diff --cached --check` is intentionally unrecorded;
+  recording it would alter the bytes it checked.
+- `EXACT_ABSENCE_POLICY_READY_V1` remains `false`. But `has_authoritative_scan()`
+  now returns `true` for a healthy root, so **readiness is the sole remaining
+  production gate** where two independent gates stood before this slice.
+  `effective().count() == 0` is asserted on a root that classifies `Pinned`.
+- The non-unix `finish()` arm is compiled on Windows CI and never executed there;
+  no bridge-worktree test runs on macOS in CI. The operator host is the only
+  macOS observation.
