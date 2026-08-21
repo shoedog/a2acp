@@ -51,39 +51,90 @@ impl ExactAbsenceCandidateV1 {
         let common_dir =
             capture_directory_identity(Path::new(common_dir.as_ref()), "source common directory")?;
         if !common_dir.matches(&source_common_dir_identity(&source.canonical_path, probe)?) {
-            return Err(invalid("source does not own the recorded common directory"));
+            return Err(legacy_claim_authority_error(claim_authority_unavailable(
+                ClaimAuthorityObjectV1::SourceCommonDirectoryBinding,
+                ClaimAuthorityUnavailableReasonV1::OwnershipUnproven,
+            )));
         }
         Self::from_bound(source, common_dir, worktree.as_ref())
+            .map_err(legacy_claim_authority_error)
     }
     pub fn from_claim(
         source: &WorktreeObjectIdentityV1,
         common_dir: &WorktreeObjectIdentityV1,
         worktree: &WorktreeObjectIdentityV1,
         probe: &dyn ExactAbsenceProbeV1,
-    ) -> Result<Self, BridgeError> {
-        for (kind, object) in [
-            ("source", source),
-            ("source common directory", common_dir),
-            ("worktree", worktree),
+    ) -> Result<Self, ClaimAuthorityUnavailableV1> {
+        for (object, claim) in [
+            (ClaimAuthorityObjectV1::Source, source),
+            (ClaimAuthorityObjectV1::Worktree, worktree),
+            (ClaimAuthorityObjectV1::CommonDirectory, common_dir),
         ] {
-            if object.canonical_path != object.directory_identity.canonical_path {
-                return Err(invalid(format!("claim {kind} path and identity disagree")));
+            if claim.canonical_path != claim.directory_identity.canonical_path {
+                return Err(claim_authority_unavailable(
+                    object,
+                    ClaimAuthorityUnavailableReasonV1::PathMismatch,
+                ));
             }
         }
-        let observed_source =
-            capture_directory_identity(Path::new(&source.canonical_path), "source")?;
-        let observed_common = capture_directory_identity(
-            Path::new(&common_dir.canonical_path),
-            "source common directory",
+        for (object, claim) in [
+            (ClaimAuthorityObjectV1::Source, source),
+            (ClaimAuthorityObjectV1::Worktree, worktree),
+            (ClaimAuthorityObjectV1::CommonDirectory, common_dir),
+        ] {
+            if !Path::new(&claim.canonical_path).is_absolute() {
+                return Err(claim_authority_unavailable(
+                    object,
+                    ClaimAuthorityUnavailableReasonV1::NotAbsolute,
+                ));
+            }
+        }
+        for (object, identity) in [
+            (ClaimAuthorityObjectV1::Source, &source.directory_identity),
+            (
+                ClaimAuthorityObjectV1::CommonDirectory,
+                &common_dir.directory_identity,
+            ),
+        ] {
+            if identity.dev.is_none() || identity.ino.is_none() {
+                return Err(claim_authority_unavailable(
+                    object,
+                    ClaimAuthorityUnavailableReasonV1::IdentityIncomplete,
+                ));
+            }
+        }
+        let observed_source = observe_claim_directory_identity(
+            &source.canonical_path,
+            ClaimAuthorityObjectV1::Source,
         )?;
-        if !source.directory_identity.matches(&observed_source)
-            || !common_dir.directory_identity.matches(&observed_common)
-            || !observed_common.matches(&source_common_dir_identity(
-                &observed_source.canonical_path,
-                probe,
-            )?)
-        {
-            return Err(invalid("claim source or common directory identity changed"));
+        if !source.directory_identity.matches(&observed_source) {
+            return Err(claim_authority_unavailable(
+                ClaimAuthorityObjectV1::Source,
+                ClaimAuthorityUnavailableReasonV1::IdentityChanged,
+            ));
+        }
+        let observed_common = observe_claim_directory_identity(
+            &common_dir.canonical_path,
+            ClaimAuthorityObjectV1::CommonDirectory,
+        )?;
+        if !common_dir.directory_identity.matches(&observed_common) {
+            return Err(claim_authority_unavailable(
+                ClaimAuthorityObjectV1::CommonDirectory,
+                ClaimAuthorityUnavailableReasonV1::IdentityChanged,
+            ));
+        }
+        let observed_authority = source_common_dir_identity(&observed_source.canonical_path, probe)
+            .map_err(|_| {
+                claim_authority_unavailable(
+                    ClaimAuthorityObjectV1::SourceCommonDirectoryBinding,
+                    ClaimAuthorityUnavailableReasonV1::ObservationUnavailable,
+                )
+            })?;
+        if !observed_common.matches(&observed_authority) {
+            return Err(claim_authority_unavailable(
+                ClaimAuthorityObjectV1::SourceCommonDirectoryBinding,
+                ClaimAuthorityUnavailableReasonV1::OwnershipUnproven,
+            ));
         }
         Self::from_bound(observed_source, observed_common, &worktree.canonical_path)
     }
@@ -91,17 +142,23 @@ impl ExactAbsenceCandidateV1 {
         source_identity: DirectoryIdentityV1,
         common_dir_identity: DirectoryIdentityV1,
         worktree: &str,
-    ) -> Result<Self, BridgeError> {
+    ) -> Result<Self, ClaimAuthorityUnavailableV1> {
         if !Path::new(worktree).is_absolute() {
-            return Err(invalid("worktree path has no absolute identity"));
+            return Err(claim_authority_unavailable(
+                ClaimAuthorityObjectV1::Worktree,
+                ClaimAuthorityUnavailableReasonV1::NotAbsolute,
+            ));
         }
-        if source_identity.dev.is_none()
-            || source_identity.ino.is_none()
-            || common_dir_identity.dev.is_none()
-            || common_dir_identity.ino.is_none()
-        {
-            return Err(invalid(
-                "source or common directory has no bound object identity",
+        if source_identity.dev.is_none() || source_identity.ino.is_none() {
+            return Err(claim_authority_unavailable(
+                ClaimAuthorityObjectV1::Source,
+                ClaimAuthorityUnavailableReasonV1::IdentityIncomplete,
+            ));
+        }
+        if common_dir_identity.dev.is_none() || common_dir_identity.ino.is_none() {
+            return Err(claim_authority_unavailable(
+                ClaimAuthorityObjectV1::CommonDirectory,
+                ClaimAuthorityUnavailableReasonV1::IdentityIncomplete,
             ));
         }
         Ok(Self {
@@ -131,10 +188,57 @@ impl ExactAbsenceCandidateV1 {
         }
     }
 }
+fn claim_authority_unavailable(
+    object: ClaimAuthorityObjectV1,
+    reason: ClaimAuthorityUnavailableReasonV1,
+) -> ClaimAuthorityUnavailableV1 {
+    ClaimAuthorityUnavailableV1::new(object, reason)
+}
+
+fn legacy_claim_authority_error(refusal: ClaimAuthorityUnavailableV1) -> BridgeError {
+    if refusal.object() == ClaimAuthorityObjectV1::SourceCommonDirectoryBinding
+        && refusal.reason() == ClaimAuthorityUnavailableReasonV1::OwnershipUnproven
+    {
+        return invalid("source does not own the recorded common directory");
+    }
+    invalid(format!("legacy claim authority unavailable: {refusal:?}"))
+}
+
 fn invalid(reason: impl Into<String>) -> BridgeError {
     BridgeError::ConfigInvalid {
         reason: reason.into(),
     }
+}
+
+fn observe_claim_directory_identity(
+    path: &str,
+    object: ClaimAuthorityObjectV1,
+) -> Result<DirectoryIdentityV1, ClaimAuthorityUnavailableV1> {
+    if !Path::new(path).is_absolute() {
+        return Err(claim_authority_unavailable(
+            object,
+            ClaimAuthorityUnavailableReasonV1::NotAbsolute,
+        ));
+    }
+    let canonical = std::fs::canonicalize(path).map_err(|_| {
+        claim_authority_unavailable(
+            object,
+            ClaimAuthorityUnavailableReasonV1::ObservationUnavailable,
+        )
+    })?;
+    let identity = verify_payload_directory_identity(&canonical).map_err(|_| {
+        claim_authority_unavailable(
+            object,
+            ClaimAuthorityUnavailableReasonV1::ObservationUnavailable,
+        )
+    })?;
+    if identity.dev.is_none() || identity.ino.is_none() {
+        return Err(claim_authority_unavailable(
+            object,
+            ClaimAuthorityUnavailableReasonV1::IdentityIncomplete,
+        ));
+    }
+    Ok(identity)
 }
 pub(crate) fn capture_directory_identity(
     path: &Path,
@@ -595,21 +699,22 @@ fn assess_custody_record(
     if let Err(population) = admit_custody_population(&record.state, record.claim.is_some()) {
         return CustodyExactAbsenceAssessmentV1::IneligiblePopulation(population);
     }
-    let decision = record
-        .claim
-        .as_ref()
-        .and_then(|claim| {
-            ExactAbsenceCandidateV1::from_claim(
-                &claim.source,
-                &claim.common_dir,
-                &claim.worktree,
-                probe,
-            )
-            .ok()
-        })
-        .map(|candidate| decide_unused_candidate(&candidate, false, probe))
-        .unwrap_or(UnusedCandidateDecisionV1::Refused);
-    CustodyExactAbsenceAssessmentV1::Assessed(decision)
+    let Some(claim) = record.claim.as_ref() else {
+        return CustodyExactAbsenceAssessmentV1::Assessed(UnusedCandidateDecisionV1::Refused);
+    };
+    match ExactAbsenceCandidateV1::from_claim(
+        &claim.source,
+        &claim.common_dir,
+        &claim.worktree,
+        probe,
+    ) {
+        Ok(candidate) => CustodyExactAbsenceAssessmentV1::Assessed(decide_unused_candidate(
+            &candidate, false, probe,
+        )),
+        Err(refusal) => CustodyExactAbsenceAssessmentV1::CannotConstructSubject(
+            CannotConstructSubjectV1::ClaimAuthorityUnavailable(refusal),
+        ),
+    }
 }
 struct ExactScanProjectionRowV1 {
     checked: CheckedScanRowV1,
@@ -1008,6 +1113,7 @@ impl Drop for WorktreeRunEndGuard {
 
 #[cfg(test)]
 mod tests {
+    use super::{ClaimAuthorityObjectV1 as Object, ClaimAuthorityUnavailableReasonV1 as Reason};
     use crate::provider_path::{sidecar_path, write_sidecar, WorktreeSidecar};
     use bridge_core::liveness::LeaseProbe;
     use std::collections::HashMap;
@@ -1459,6 +1565,9 @@ mod tests {
 
     struct RecordingProbe {
         calls: AtomicUsize,
+        authority_calls: AtomicUsize,
+        authority: Option<DirectoryIdentityV1>,
+        authority_fails: bool,
         result: super::ExactAbsenceObservationV1,
     }
 
@@ -1466,12 +1575,33 @@ mod tests {
         fn both_absent() -> Self {
             Self {
                 calls: AtomicUsize::new(0),
+                authority_calls: AtomicUsize::new(0),
+                authority: None,
+                authority_fails: false,
                 result: super::ExactAbsenceObservationV1::BothAbsent,
+            }
+        }
+
+        fn with_authority(authority: DirectoryIdentityV1) -> Self {
+            Self {
+                authority: Some(authority),
+                ..Self::both_absent()
+            }
+        }
+
+        fn with_authority_failure() -> Self {
+            Self {
+                authority_fails: true,
+                ..Self::both_absent()
             }
         }
 
         fn calls(&self) -> usize {
             self.calls.load(Ordering::SeqCst)
+        }
+
+        fn authority_calls(&self) -> usize {
+            self.authority_calls.load(Ordering::SeqCst)
         }
     }
 
@@ -1480,6 +1610,13 @@ mod tests {
             &self,
             source: &str,
         ) -> Result<DirectoryIdentityV1, bridge_core::error::BridgeError> {
+            self.authority_calls.fetch_add(1, Ordering::SeqCst);
+            if self.authority_fails {
+                return Err(bridge_core::error::BridgeError::StoreFailure);
+            }
+            if let Some(authority) = &self.authority {
+                return Ok(authority.clone());
+            }
             super::ExactAbsenceProbeV1::observe_source_common_dir_identity(
                 &crate::host_git::HostGitWorktree::new(),
                 source,
@@ -1584,6 +1721,43 @@ mod tests {
             _ => panic!("record must remain a readable custody row"),
         }
     }
+    fn candidate_claim_record(root: &Path, name: &str) -> WorktreeCustodyRecordV1 {
+        let target = root.join(name);
+        fs::create_dir_all(&target).unwrap();
+        real_custody_record(
+            root,
+            &target,
+            WorktreeCustodyStateV1::ProtectionPrepared {},
+            true,
+        )
+    }
+
+    fn claim_object_mut(
+        claim: &mut PreservedWorktreeClaimV1,
+        object: super::ClaimAuthorityObjectV1,
+    ) -> &mut WorktreeObjectIdentityV1 {
+        match object {
+            super::ClaimAuthorityObjectV1::Source => &mut claim.source,
+            super::ClaimAuthorityObjectV1::Worktree => &mut claim.worktree,
+            super::ClaimAuthorityObjectV1::CommonDirectory => &mut claim.common_dir,
+            super::ClaimAuthorityObjectV1::Root
+            | super::ClaimAuthorityObjectV1::SourceCommonDirectoryBinding => unreachable!(),
+        }
+    }
+
+    fn claim_refusal(
+        record: &WorktreeCustodyRecordV1,
+        probe: &RecordingProbe,
+    ) -> super::ClaimAuthorityUnavailableV1 {
+        let claim = record.claim.as_ref().unwrap();
+        super::ExactAbsenceCandidateV1::from_claim(
+            &claim.source,
+            &claim.common_dir,
+            &claim.worktree,
+            probe,
+        )
+        .unwrap_err()
+    }
 
     fn assert_candidate_control(root: &Path) {
         let control = write_expected_custody_record(
@@ -1606,8 +1780,151 @@ mod tests {
         ));
         assert_eq!(report.effective().count(), 0);
         assert_eq!(probe.calls(), 1);
+        assert_eq!(probe.authority_calls(), 1);
     }
 
+    #[test]
+    fn claim_authority_maps_claim_field_failures() {
+        let root = unique_temp_dir("claim-authority-fields");
+        fs::create_dir_all(&root).unwrap();
+        for (name, object, reason) in [
+            ("source-mismatch", Object::Source, Reason::PathMismatch),
+            ("worktree-mismatch", Object::Worktree, Reason::PathMismatch),
+            (
+                "common-mismatch",
+                Object::CommonDirectory,
+                Reason::PathMismatch,
+            ),
+            ("source-relative", Object::Source, Reason::NotAbsolute),
+            ("worktree-relative", Object::Worktree, Reason::NotAbsolute),
+            (
+                "common-relative",
+                Object::CommonDirectory,
+                Reason::NotAbsolute,
+            ),
+            (
+                "source-incomplete",
+                Object::Source,
+                Reason::IdentityIncomplete,
+            ),
+            (
+                "common-incomplete",
+                Object::CommonDirectory,
+                Reason::IdentityIncomplete,
+            ),
+            ("source-changed", Object::Source, Reason::IdentityChanged),
+            (
+                "common-changed",
+                Object::CommonDirectory,
+                Reason::IdentityChanged,
+            ),
+        ] {
+            let mut record = candidate_claim_record(&root, name);
+            let field = claim_object_mut(record.claim.as_mut().unwrap(), object);
+            match reason {
+                super::ClaimAuthorityUnavailableReasonV1::PathMismatch => {
+                    field.canonical_path.push_str(".mismatch");
+                }
+                super::ClaimAuthorityUnavailableReasonV1::NotAbsolute => {
+                    field.canonical_path = "relative".to_string();
+                    field.directory_identity.canonical_path = "relative".to_string();
+                }
+                super::ClaimAuthorityUnavailableReasonV1::IdentityIncomplete => {
+                    field.directory_identity.dev = None;
+                    field.directory_identity.ino = None;
+                    field.directory_identity.btime = None;
+                }
+                super::ClaimAuthorityUnavailableReasonV1::IdentityChanged => {
+                    field.directory_identity.ino = Some(0);
+                }
+                _ => unreachable!(),
+            }
+            let probe = RecordingProbe::both_absent();
+            assert_eq!(
+                claim_refusal(&record, &probe),
+                super::ClaimAuthorityUnavailableV1::new(object, reason),
+                "{name}"
+            );
+            assert_eq!(probe.authority_calls(), 0, "{name}");
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn claim_construction_failure_is_not_assessed() {
+        let root = unique_temp_dir("claim-authority-report");
+        fs::create_dir_all(&root).unwrap();
+        let mut record = candidate_claim_record(&root, "source-missing");
+        let missing = root.join("missing-source").to_string_lossy().into_owned();
+        let source = &mut record.claim.as_mut().unwrap().source;
+        source.canonical_path = missing.clone();
+        source.directory_identity.canonical_path = missing;
+        let record_path = PathBuf::from(custody_record_path(&record.worktree.canonical_path));
+        fs::write(&record_path, record.encode_canonical().unwrap()).unwrap();
+        let probe = RecordingProbe::both_absent();
+        let report = super::sweep_orphans_with_exact_absence(&root.to_string_lossy(), &probe);
+        assert!(matches!(
+            custody_assessment(&report, &record_path),
+            super::CustodyExactAbsenceAssessmentV1::CannotConstructSubject(
+                super::CannotConstructSubjectV1::ClaimAuthorityUnavailable(refusal)
+            ) if refusal.object() == Object::Source
+                && refusal.reason() == Reason::ObservationUnavailable
+        ));
+        assert_eq!(probe.calls(), 0);
+        assert_eq!(probe.authority_calls(), 0);
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn claim_authority_maps_common_and_binding_observations() {
+        let root = unique_temp_dir("claim-authority-observations");
+        fs::create_dir_all(&root).unwrap();
+
+        let mut common_missing = candidate_claim_record(&root, "common-missing");
+        let missing = root.join("missing-common").to_string_lossy().into_owned();
+        let common_dir = &mut common_missing.claim.as_mut().unwrap().common_dir;
+        common_dir.canonical_path = missing.clone();
+        common_dir.directory_identity.canonical_path = missing;
+        let probe = RecordingProbe::both_absent();
+        assert_eq!(
+            claim_refusal(&common_missing, &probe),
+            super::ClaimAuthorityUnavailableV1::new(
+                Object::CommonDirectory,
+                Reason::ObservationUnavailable,
+            )
+        );
+        assert_eq!(probe.authority_calls(), 0);
+
+        let authority_failure = candidate_claim_record(&root, "authority-failure");
+        let probe = RecordingProbe::with_authority_failure();
+        assert_eq!(
+            claim_refusal(&authority_failure, &probe),
+            super::ClaimAuthorityUnavailableV1::new(
+                Object::SourceCommonDirectoryBinding,
+                Reason::ObservationUnavailable,
+            )
+        );
+        assert_eq!(probe.calls(), 0);
+        assert_eq!(probe.authority_calls(), 1);
+
+        let authority_mismatch = candidate_claim_record(&root, "authority-mismatch");
+        let wrong_common_dir = authority_mismatch
+            .claim
+            .as_ref()
+            .unwrap()
+            .source
+            .directory_identity
+            .clone();
+        let probe = RecordingProbe::with_authority(wrong_common_dir);
+        assert_eq!(
+            claim_refusal(&authority_mismatch, &probe),
+            super::ClaimAuthorityUnavailableV1::new(
+                Object::SourceCommonDirectoryBinding,
+                Reason::OwnershipUnproven,
+            )
+        );
+        assert_eq!(probe.calls(), 0);
+        assert_eq!(probe.authority_calls(), 1);
+        fs::remove_dir_all(root).unwrap();
+    }
     fn root_capture(
         dev: Option<u64>,
         ino: Option<u64>,
@@ -1922,6 +2239,7 @@ mod tests {
             assert_eq!(custody_assessment(&report, record), expected, "{record:?}");
         }
         assert_eq!(probe.calls(), 2);
+        assert_eq!(probe.authority_calls(), 2);
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -1945,6 +2263,7 @@ mod tests {
             )
         );
         assert_eq!(probe.calls(), 0);
+        assert_eq!(probe.authority_calls(), 0);
         assert_candidate_control(&root);
         fs::remove_dir_all(root).unwrap();
     }
