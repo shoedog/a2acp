@@ -72,5 +72,6 @@ fn exact_absence_report_vocabulary_is_public() {
 #[test]
 fn public_scan_functions_keep_visibility_and_exact_signatures() {
     let _: fn(&str) -> Vec<(String, ScannedWorktreeRecordV1)> = scan_worktree_records;
-    let _: fn(&str, &dyn ExactAbsenceProbeV1) = sweep_orphans_with_exact_absence;
+    let _: fn(&str, &dyn ExactAbsenceProbeV1) -> ExactAbsenceSweepReportV1 =
+        sweep_orphans_with_exact_absence;
 }

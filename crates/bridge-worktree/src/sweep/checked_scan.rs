@@ -77,21 +77,15 @@ struct CompatibilityCheckedScanRootSessionV1 {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct RootIdentityCaptureV1 {
-    #[allow(dead_code)]
     pub(super) dev: Option<u64>,
-    #[allow(dead_code)]
     pub(super) ino: Option<u64>,
-    #[allow(dead_code)]
     pub(super) birthtime: Option<BirthTimeV1>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(super) struct RootObservationSetV1 {
-    #[allow(dead_code)]
     pub(super) retained_enumeration_object: Option<RootIdentityCaptureV1>,
-    #[allow(dead_code)]
     pub(super) pinned_custody_directory: Option<RootIdentityCaptureV1>,
-    #[allow(dead_code)]
     pub(super) final_named_root: Option<RootIdentityCaptureV1>,
 }
 
@@ -259,8 +253,8 @@ mod tests {
     };
     use crate::provider_path::{read_sidecar, sidecar_path, write_sidecar};
     use crate::sweep::{
-        ExactAbsenceObservationV1, ExactAbsenceProbeV1, ExactAbsenceRootRefusalV1,
-        UnusedCandidateDecisionV1,
+        ExactAbsenceEnumerationV1, ExactAbsenceObservationV1, ExactAbsenceProbeV1,
+        ExactAbsenceRootRefusalV1, UnusedCandidateDecisionV1,
     };
     use bridge_core::error::BridgeError;
     use bridge_core::execution_policy::{PolicyNodeRefV1, Sha256HexV1, WorktreeObjectIdentityV1};
@@ -696,9 +690,9 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
-    // Evidence: base-green behavior; catches raw-root exact enumeration or a non-unit wrapper.
+    // Evidence: canonical-root characterization plus compiler-only report-return shape.
     #[test]
-    fn exact_route_preserves_canonical_scan_root_and_unit_return() {
+    fn exact_route_preserves_canonical_scan_root_and_report_return() {
         let root = temp_root("canonical-root");
         std::fs::create_dir_all(&root).unwrap();
         let canonical = std::fs::canonicalize(&root).unwrap();
@@ -713,10 +707,11 @@ mod tests {
         assert_eq!(scan_root.as_str(), canonical.to_str().unwrap());
         assert!(rows.is_empty());
         assert_eq!(opened.lock().unwrap().as_deref(), Some(canonical.as_path()));
-        let _: () = super::super::sweep_orphans_with_exact_absence(
-            supplied.to_str().unwrap(),
-            &probe(None, Arc::new(Mutex::new(Vec::new()))),
-        );
+        let _: super::super::ExactAbsenceSweepReportV1 =
+            super::super::sweep_orphans_with_exact_absence(
+                supplied.to_str().unwrap(),
+                &probe(None, Arc::new(Mutex::new(Vec::new()))),
+            );
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -805,6 +800,35 @@ mod tests {
             log.lock().unwrap().as_slice(),
             ["next", "custody", "next", "next", "custody", "next", "next", "finish"]
         );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    // Evidence: report projection; the injected scan forces otherwise hard-to-produce iterator failures.
+    #[test]
+    fn exact_projection_reports_forced_iterator_errors() {
+        let root = temp_root("reported-iterator-errors");
+        std::fs::create_dir_all(&root).unwrap();
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let source = script(
+            log.clone(),
+            VecDeque::from([
+                Err(CheckedScanEntryRefusalV1::CannotReadEntry),
+                Err(CheckedScanEntryRefusalV1::CannotReadEntry),
+            ]),
+        );
+
+        let report = super::super::project_exact_scan_result(
+            crate::provider_path::canonicalize_lenient(root.to_str().unwrap()).unwrap(),
+            scan_checked_rows_for_test(&root, &source),
+            &probe(None, log),
+        )
+        .into_report(root.to_string_lossy().into_owned());
+
+        assert!(matches!(
+            report.scan().enumeration(),
+            ExactAbsenceEnumerationV1::Incomplete { skipped_entries: 2 }
+        ));
+        assert!(report.entries().is_empty());
         std::fs::remove_dir_all(root).unwrap();
     }
 

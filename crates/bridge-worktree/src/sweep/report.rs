@@ -20,8 +20,6 @@ pub struct ExactAbsenceSweepReportV1 {
 }
 
 impl ExactAbsenceSweepReportV1 {
-    /// A1 lands the vocabulary before A2 supplies the production caller.
-    #[allow(dead_code)]
     pub(crate) fn new(
         requested_root: String,
         canonical_root: Option<String>,
@@ -122,8 +120,6 @@ pub struct ExactAbsenceScanStatusV1 {
 }
 
 impl ExactAbsenceScanStatusV1 {
-    /// A1 lands the vocabulary before A2 supplies the production caller.
-    #[allow(dead_code)]
     pub(crate) fn new(
         enumeration: ExactAbsenceEnumerationV1,
         custody_root: CustodyRootObservationV1,
@@ -173,8 +169,6 @@ pub struct ExactAbsenceSweepEntryV1 {
 }
 
 impl ExactAbsenceSweepEntryV1 {
-    /// A1 lands the vocabulary before A2 supplies the production caller.
-    #[allow(dead_code)]
     pub(crate) fn new(
         record_path: String,
         enumerated_name: OsString,
@@ -238,8 +232,6 @@ pub struct CustodyRecordAssessmentV1 {
 }
 
 impl CustodyRecordAssessmentV1 {
-    /// A1 lands the vocabulary before A2 supplies the production caller.
-    #[allow(dead_code)]
     pub(crate) fn new(
         state: CustodyStateSnapshotV1,
         assessment: CustodyExactAbsenceAssessmentV1,
