@@ -555,15 +555,18 @@ enum ExactScanOutcomeV1 {
     Complete(ExactScanCompleteV1),
 }
 
+#[cfg(test)]
 type ExactScanCompletePartsV1 = (
     SessionCwd,
     usize,
     RootObservationSetV1,
     Vec<ExactScanProjectionRowV1>,
 );
+#[cfg(test)]
 type ExactScanRefusalPartsV1 = (Option<SessionCwd>, ExactAbsenceRootRefusalV1);
 
 impl ExactScanOutcomeV1 {
+    #[cfg(test)]
     fn into_exact_parts(self) -> Result<ExactScanCompletePartsV1, ExactScanRefusalPartsV1> {
         match self {
             Self::Refused {
@@ -578,6 +581,97 @@ impl ExactScanOutcomeV1 {
             )),
         }
     }
+
+    fn into_report(self, requested_root: String) -> ExactAbsenceSweepReportV1 {
+        match self {
+            Self::Refused {
+                canonical_root,
+                refusal,
+            } => ExactAbsenceSweepReportV1::new(
+                requested_root,
+                canonical_root.map(|root| root.as_str().to_owned()),
+                ExactAbsenceScanStatusV1::new(
+                    ExactAbsenceEnumerationV1::Refused(refusal),
+                    CustodyRootObservationV1::Unavailable,
+                ),
+                Vec::new(),
+            ),
+            Self::Complete(complete) => {
+                let enumeration = if complete.iterator_error_count == 0 {
+                    ExactAbsenceEnumerationV1::Complete
+                } else {
+                    ExactAbsenceEnumerationV1::Incomplete {
+                        skipped_entries: complete.iterator_error_count,
+                    }
+                };
+                let entries = complete
+                    .rows
+                    .into_iter()
+                    .map(report_exact_scan_projection_row)
+                    .collect();
+                ExactAbsenceSweepReportV1::new(
+                    requested_root,
+                    Some(complete.canonical_root.as_str().to_owned()),
+                    ExactAbsenceScanStatusV1::new(
+                        enumeration,
+                        classify_root_observations(complete.root_observations),
+                    ),
+                    entries,
+                )
+            }
+        }
+    }
+}
+
+fn classify_root_observations(observations: RootObservationSetV1) -> CustodyRootObservationV1 {
+    let (Some(retained_enumeration_object), Some(pinned_custody_directory), Some(final_named_root)) = (
+        observations.retained_enumeration_object,
+        observations.pinned_custody_directory,
+        observations.final_named_root,
+    ) else {
+        return CustodyRootObservationV1::Unavailable;
+    };
+    if !(root_capture_has_object_identity(retained_enumeration_object)
+        && root_capture_has_object_identity(pinned_custody_directory)
+        && root_capture_has_object_identity(final_named_root))
+    {
+        return CustodyRootObservationV1::Unavailable;
+    }
+    if retained_enumeration_object == pinned_custody_directory
+        && pinned_custody_directory == final_named_root
+    {
+        CustodyRootObservationV1::Pinned
+    } else {
+        CustodyRootObservationV1::IdentityChanged
+    }
+}
+
+fn root_capture_has_object_identity(capture: checked_scan::RootIdentityCaptureV1) -> bool {
+    capture.dev.is_some() && capture.ino.is_some()
+}
+
+fn report_exact_scan_projection_row(
+    projection_row: ExactScanProjectionRowV1,
+) -> ExactAbsenceSweepEntryV1 {
+    let decision = projection_row.decision;
+    let (record_path, enumerated_name, scanned) = projection_row.checked.parts();
+    let assessment = match scanned {
+        ScannedWorktreeRecordV1::Legacy(_) => ExactAbsenceRecordAssessmentV1::Legacy(decision),
+        ScannedWorktreeRecordV1::UnreadableCustody(refusal) => {
+            ExactAbsenceRecordAssessmentV1::UnreadableCustody(refusal.clone())
+        }
+        ScannedWorktreeRecordV1::Custody(record) => {
+            ExactAbsenceRecordAssessmentV1::Custody(CustodyRecordAssessmentV1::new(
+                CustodyStateSnapshotV1::from(&record.state),
+                CustodyExactAbsenceAssessmentV1::Assessed(decision),
+            ))
+        }
+    };
+    ExactAbsenceSweepEntryV1::new(
+        record_path.to_owned(),
+        enumerated_name.to_os_string(),
+        assessment,
+    )
 }
 
 fn project_exact_scan_result(
@@ -647,19 +741,22 @@ where
     )
 }
 
-pub fn sweep_orphans_with_exact_absence(root: &str, probe: &dyn ExactAbsenceProbeV1) {
+pub fn sweep_orphans_with_exact_absence(
+    root: &str,
+    probe: &dyn ExactAbsenceProbeV1,
+) -> ExactAbsenceSweepReportV1 {
     let outcome = sweep_orphans_with_exact_absence_with_pin_opener(
         root,
         probe,
         FilesystemCompatibilityPinOpenerV1,
     );
-    drop(outcome.into_exact_parts());
+    outcome.into_report(root.to_owned())
 }
 /// Reap only same-host **legacy** worktrees whose owner lease is free.
 ///
 /// V3 custody records are recognized and classified, never deleted (§5.2).
 pub fn sweep_orphans(root: &str, my_host: &str, probe: &dyn LeaseProbe) {
-    sweep_orphans_with_exact_absence(root, &crate::host_git::HostGitWorktree::new());
+    let _ = sweep_orphans_with_exact_absence(root, &crate::host_git::HostGitWorktree::new());
     let Ok(root_cwd) = canonicalize_lenient(root) else {
         tracing::warn!(root, "skipping worktree sweep with non-canonical root");
         return;
@@ -1144,7 +1241,7 @@ mod tests {
     use crate::custody::{
         custody_record_path, CustodySweepDispositionV1, PreservationReasonV1,
         PreservedWorktreeClaimV1, RecoveryLocatorV1, WorktreeCustodyRecordV1,
-        WorktreeCustodyStateV1, WORKTREE_CUSTODY_RECORD_SCHEMA_V1,
+        WorktreeCustodyStateKindV1, WorktreeCustodyStateV1, WORKTREE_CUSTODY_RECORD_SCHEMA_V1,
     };
     use bridge_core::execution_policy::{
         PolicyNodeRefV1, Sha256HexV1, WorktreeCustodyIdV1, WorktreeObjectIdentityV1,
@@ -1256,6 +1353,179 @@ mod tests {
 
     fn dead_probe(lease: &str) -> FakeProbe {
         FakeProbe(HashMap::from([(lease.to_string(), Some(true))]))
+    }
+
+    struct BothAbsentProbe;
+
+    impl super::ExactAbsenceProbeV1 for BothAbsentProbe {
+        fn observe_exact_absence(
+            &self,
+            _candidate: &super::ExactAbsenceCandidateV1,
+        ) -> Result<super::ExactAbsenceObservationV1, bridge_core::error::BridgeError> {
+            Ok(super::ExactAbsenceObservationV1::BothAbsent)
+        }
+    }
+
+    fn root_capture(
+        dev: Option<u64>,
+        ino: Option<u64>,
+        birthtime: Option<bridge_core::fs_custody::BirthTimeV1>,
+    ) -> super::checked_scan::RootIdentityCaptureV1 {
+        super::checked_scan::RootIdentityCaptureV1 {
+            dev,
+            ino,
+            birthtime,
+        }
+    }
+
+    fn root_observations(
+        retained_enumeration_object: super::checked_scan::RootIdentityCaptureV1,
+        pinned_custody_directory: super::checked_scan::RootIdentityCaptureV1,
+        final_named_root: super::checked_scan::RootIdentityCaptureV1,
+    ) -> super::RootObservationSetV1 {
+        super::RootObservationSetV1 {
+            retained_enumeration_object: Some(retained_enumeration_object),
+            pinned_custody_directory: Some(pinned_custody_directory),
+            final_named_root: Some(final_named_root),
+        }
+    }
+
+    #[test]
+    fn root_observation_classifier_reports_pinned_captures() {
+        let capture = root_capture(Some(1), Some(2), None);
+        assert_eq!(
+            super::classify_root_observations(root_observations(capture, capture, capture)),
+            super::CustodyRootObservationV1::Pinned
+        );
+    }
+
+    #[test]
+    fn root_observation_classifier_reports_identity_changes_including_birthtime() {
+        let birthtime = bridge_core::fs_custody::BirthTimeV1::new(1, 2).unwrap();
+        let capture = root_capture(Some(1), Some(2), Some(birthtime));
+        assert_eq!(
+            super::classify_root_observations(root_observations(
+                capture,
+                root_capture(Some(1), Some(3), Some(birthtime)),
+                capture,
+            )),
+            super::CustodyRootObservationV1::IdentityChanged
+        );
+        assert_eq!(
+            super::classify_root_observations(root_observations(
+                capture,
+                root_capture(Some(1), Some(2), None),
+                capture,
+            )),
+            super::CustodyRootObservationV1::IdentityChanged
+        );
+    }
+
+    #[test]
+    fn root_observation_classifier_refuses_incomplete_captures() {
+        let capture = root_capture(Some(1), Some(2), None);
+        assert_eq!(
+            super::classify_root_observations(root_observations(
+                capture,
+                root_capture(None, Some(2), None),
+                capture,
+            )),
+            super::CustodyRootObservationV1::Unavailable
+        );
+    }
+
+    #[test]
+    fn exact_absence_sweep_reports_cannot_canonicalize() {
+        let root = unique_temp_dir("exact-absence-cannot-canonicalize");
+        assert!(!root.exists());
+        let requested_root = root.to_string_lossy().into_owned();
+
+        let report = super::sweep_orphans_with_exact_absence(&requested_root, &BothAbsentProbe);
+
+        assert_eq!(report.requested_root(), requested_root);
+        assert_eq!(report.canonical_root(), None);
+        assert!(matches!(
+            report.scan().enumeration(),
+            super::ExactAbsenceEnumerationV1::Refused(
+                super::ExactAbsenceRootRefusalV1::CannotCanonicalize
+            )
+        ));
+        assert_eq!(
+            report.scan().custody_root(),
+            super::CustodyRootObservationV1::Unavailable
+        );
+        assert!(report.entries().is_empty());
+    }
+
+    // Evidence: genuine runtime report projection with a frozen base-tree control.
+    #[test]
+    fn exact_absence_sweep_reports_the_stored_runtime_decision() {
+        let root = unique_temp_dir("exact-absence-report");
+        fs::create_dir_all(root.join("source")).unwrap();
+        assert!(std::process::Command::new("git")
+            .args(["-C", root.join("source").to_str().unwrap(), "init", "-q"])
+            .status()
+            .unwrap()
+            .success());
+        let legacy = write_worktree_sidecar(&root, "legacy", "host", "/leases/live", "run");
+        let (_, custody_record) =
+            write_custody_checkout(&root, "custody", WorktreeCustodyStateV1::LiveProtected {});
+        let unreadable_record = root.join("unreadable.custody.v1.json");
+        fs::write(&unreadable_record, b"not canonical custody JSON").unwrap();
+        let requested_root = root.join(".").to_string_lossy().into_owned();
+        let canonical_root = fs::canonicalize(&root)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+
+        let report = super::sweep_orphans_with_exact_absence(&requested_root, &BothAbsentProbe);
+
+        assert_eq!(report.requested_root(), requested_root);
+        assert_eq!(report.canonical_root(), Some(canonical_root.as_str()));
+        assert!(matches!(
+            report.scan().enumeration(),
+            super::ExactAbsenceEnumerationV1::Complete
+        ));
+        assert_eq!(
+            report.scan().custody_root(),
+            super::CustodyRootObservationV1::Unavailable
+        );
+        assert_eq!(report.entries().len(), 3);
+        assert_eq!(report.effective().count(), 0);
+
+        let entry = |path: &Path| {
+            let path = fs::canonicalize(path).unwrap();
+            report
+                .entries()
+                .iter()
+                .find(|entry| entry.record_path() == path.to_string_lossy())
+                .unwrap()
+        };
+        let legacy_entry = entry(Path::new(&sidecar_path(&legacy.worktree_path)));
+        assert!(matches!(
+            legacy_entry.assessment(),
+            super::ExactAbsenceRecordAssessmentV1::Legacy(
+                super::UnusedCandidateDecisionV1::Authorized
+            )
+        ));
+        let custody_entry = entry(&custody_record);
+        assert!(matches!(
+            custody_entry.assessment(),
+            super::ExactAbsenceRecordAssessmentV1::Custody(assessment)
+                if assessment.state().kind() == WorktreeCustodyStateKindV1::LiveProtected
+                    && matches!(
+                        assessment.assessment(),
+                        super::CustodyExactAbsenceAssessmentV1::Assessed(
+                            super::UnusedCandidateDecisionV1::Refused
+                        )
+                    )
+        ));
+        let unreadable_entry = entry(&unreadable_record);
+        assert!(matches!(
+            unreadable_entry.assessment(),
+            super::ExactAbsenceRecordAssessmentV1::UnreadableCustody(_)
+        ));
+        fs::remove_dir_all(root).unwrap();
     }
 
     fn scanned_disposition(root: &Path, record_path: &Path) -> CustodySweepDispositionV1 {

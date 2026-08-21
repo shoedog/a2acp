@@ -1,0 +1,63 @@
+diff --git a/crates/bridge-worktree/src/sweep.rs b/crates/bridge-worktree/src/sweep.rs
+index 1aea569c..30ebae5f 100644
+--- a/crates/bridge-worktree/src/sweep.rs
++++ b/crates/bridge-worktree/src/sweep.rs
+@@ -1258,6 +1258,58 @@ mod tests {
+         FakeProbe(HashMap::from([(lease.to_string(), Some(true))]))
+     }
+
++    struct BothAbsentProbe;
++
++    impl super::ExactAbsenceProbeV1 for BothAbsentProbe {
++        fn observe_exact_absence(
++            &self,
++            _candidate: &super::ExactAbsenceCandidateV1,
++        ) -> Result<super::ExactAbsenceObservationV1, bridge_core::error::BridgeError> {
++            Ok(super::ExactAbsenceObservationV1::BothAbsent)
++        }
++    }
++
++    #[test]
++    fn exact_absence_sweep_reports_the_stored_runtime_decision() {
++        let root = unique_temp_dir("exact-absence-report-control");
++        fs::create_dir_all(root.join("source")).unwrap();
++        assert!(std::process::Command::new("git")
++            .args(["-C", root.join("source").to_str().unwrap(), "init", "-q"])
++            .status()
++            .unwrap()
++            .success());
++        let sidecar = write_worktree_sidecar(&root, "legacy", "host", "/leases/live", "run");
++        let requested_root = root.join(".").to_string_lossy().into_owned();
++        let canonical_root = fs::canonicalize(&root).unwrap().to_string_lossy().into_owned();
++
++        let report = super::sweep_orphans_with_exact_absence(&requested_root, &BothAbsentProbe);
++
++        assert_eq!(report.requested_root(), requested_root);
++        assert_eq!(report.canonical_root(), Some(canonical_root.as_str()));
++        assert!(matches!(
++            report.scan().enumeration(),
++            super::ExactAbsenceEnumerationV1::Complete
++        ));
++        assert_eq!(
++            report.scan().custody_root(),
++            super::CustodyRootObservationV1::Unavailable
++        );
++        assert_eq!(report.entries().len(), 1);
++        assert_eq!(
++            report.entries()[0].record_path(),
++            fs::canonicalize(sidecar_path(&sidecar.worktree_path))
++                .unwrap()
++                .to_string_lossy()
++        );
++        assert!(matches!(
++            report.entries()[0].assessment(),
++            super::ExactAbsenceRecordAssessmentV1::Legacy(
++                super::UnusedCandidateDecisionV1::Authorized
++            )
++        ));
++        fs::remove_dir_all(root).unwrap();
++    }
++
+     fn scanned_disposition(root: &Path, record_path: &Path) -> CustodySweepDispositionV1 {
+         let root_cwd = crate::provider_path::canonicalize_lenient(&root.to_string_lossy()).unwrap();
+         let scanned = super::scan_worktree_records(&root.to_string_lossy());
