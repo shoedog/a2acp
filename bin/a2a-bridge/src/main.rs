@@ -3684,6 +3684,12 @@ async fn implement_cmd(args: &[String]) -> Result<(), BoxError> {
                 let sha = match implement::host_commit(&clone, &message) {
                     Ok(s) => s,
                     Err(e) => {
+                        // Abort/NoCommitClean/NoCommitDirty all print the clone path; this path did
+                        // not, so a failed commit stranded the agent's complete work with no pointer.
+                        eprintln!(
+                            "[implement] commit failed; clone left at {}",
+                            clone.display()
+                        );
                         let _ = warm_runner.retire().await;
                         return Err(e.into());
                     }

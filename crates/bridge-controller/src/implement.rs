@@ -451,6 +451,24 @@ pub fn head_guard(clone: &Path, expect_branch: &str, pre_sha: &str) -> Result<()
 
 /// Run a prepared commit argv with `git -C <clone>`: the bounded index-lock retry, the stale-`.git/index.
 /// lock` clear after retries, and reading the new sha. Shared by `host_commit` (fresh) + `host_amend_commit`.
+/// Why a failed `git commit` needs BOTH streams: git reports "nothing to commit" on **stdout**
+/// and exits non-zero, leaving stderr empty. Formatting the error from stderr alone therefore
+/// produced the bare string `git commit failed: ` and discarded the only text git wrote — an
+/// operator then has no way to tell an empty index from a real git error.
+fn commit_failure_detail(out: &std::process::Output) -> String {
+    let err = String::from_utf8_lossy(&out.stderr);
+    let err = err.trim();
+    if !err.is_empty() {
+        return err.to_string();
+    }
+    let out_s = String::from_utf8_lossy(&out.stdout);
+    let out_s = out_s.trim();
+    if !out_s.is_empty() {
+        return out_s.to_string();
+    }
+    format!("no output; exit status {}", out.status)
+}
+
 fn host_commit_argv_run(clone: &Path, argv: &[String]) -> Result<String, String> {
     let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
     for _ in 0..5 {
@@ -460,7 +478,10 @@ fn host_commit_argv_run(clone: &Path, argv: &[String]) -> Result<String, String>
         }
         let err = String::from_utf8_lossy(&out.stderr);
         if !(err.contains("index.lock") || err.contains("Another git process")) {
-            return Err(format!("git commit failed: {}", err.trim()));
+            return Err(format!(
+                "git commit failed: {}",
+                commit_failure_detail(&out)
+            ));
         }
         std::thread::sleep(Duration::from_millis(200));
     }
@@ -471,7 +492,7 @@ fn host_commit_argv_run(clone: &Path, argv: &[String]) -> Result<String, String>
     } else {
         Err(format!(
             "git commit failed after lock retries: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
+            commit_failure_detail(&out)
         ))
     }
 }
@@ -633,6 +654,55 @@ mod tests {
         // identity-free: no user.name / user.email here
         assert!(!joined.contains("user.name"));
         assert!(!joined.contains("user.email"));
+    }
+
+    // ── commit failure detail (regression: "git commit failed: " with the cause dropped) ──
+
+    fn fake_output(code: i32, stdout: &str, stderr: &str) -> std::process::Output {
+        use std::os::unix::process::ExitStatusExt;
+        std::process::Output {
+            status: std::process::ExitStatus::from_raw(code << 8),
+            stdout: stdout.as_bytes().to_vec(),
+            stderr: stderr.as_bytes().to_vec(),
+        }
+    }
+
+    /// The exact shape that stranded slice A2a-2: `git commit` with an empty index exits
+    /// non-zero, writes its explanation to STDOUT, and leaves stderr empty. Reading stderr
+    /// alone yielded `git commit failed: ` — the operator could not tell an empty index from
+    /// a real git error.
+    #[test]
+    fn commit_failure_detail_falls_back_to_stdout_when_stderr_is_empty() {
+        let out = fake_output(
+            1,
+            "On branch implement/impl-1-ab\nno changes added to commit (use \"git add\")\n",
+            "",
+        );
+        let detail = commit_failure_detail(&out);
+        assert!(
+            detail.contains("no changes added to commit"),
+            "stdout must be surfaced when stderr is empty, got {detail:?}"
+        );
+        assert!(!detail.is_empty());
+    }
+
+    #[test]
+    fn commit_failure_detail_prefers_stderr_when_present() {
+        let out = fake_output(1, "ignored stdout", "fatal: could not open index");
+        assert_eq!(commit_failure_detail(&out), "fatal: could not open index");
+    }
+
+    /// Neither stream has anything: the operator still gets the exit status rather than a
+    /// bare trailing colon.
+    #[test]
+    fn commit_failure_detail_reports_status_when_both_streams_are_empty() {
+        let out = fake_output(128, "", "");
+        let detail = commit_failure_detail(&out);
+        assert!(!detail.is_empty());
+        assert!(
+            detail.contains("exit status"),
+            "expected an exit-status fallback, got {detail:?}"
+        );
     }
 
     #[test]
