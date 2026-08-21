@@ -2,7 +2,7 @@ diff --git a/crates/bridge-worktree/src/sweep.rs b/crates/bridge-worktree/src/sw
 index 1aea569c..30ebae5f 100644
 --- a/crates/bridge-worktree/src/sweep.rs
 +++ b/crates/bridge-worktree/src/sweep.rs
-@@ -1258,6 +1258,58 @@ mod tests {
+@@ -1258,6 +1258,101 @@ mod tests {
          FakeProbe(HashMap::from([(lease.to_string(), Some(true))]))
      }
 
@@ -56,6 +56,49 @@ index 1aea569c..30ebae5f 100644
 +            )
 +        ));
 +        fs::remove_dir_all(root).unwrap();
++    }
++
++    #[test]
++    fn exact_absence_sweep_reports_cannot_canonicalize() {
++        let unique_root = unique_temp_dir("exact-absence-cannot-canonicalize");
++        let root = PathBuf::from(unique_root.file_name().unwrap());
++        assert!(!root.exists());
++        let requested_root = root.to_string_lossy().into_owned();
++
++        let report = super::sweep_orphans_with_exact_absence(&requested_root, &BothAbsentProbe);
++
++        assert_eq!(report.requested_root(), requested_root);
++        assert_eq!(report.canonical_root(), None);
++        assert!(matches!(
++            report.scan().enumeration(),
++            super::ExactAbsenceEnumerationV1::Refused(
++                super::ExactAbsenceRootRefusalV1::CannotCanonicalize
++            )
++        ));
++        assert_eq!(
++            report.scan().custody_root(),
++            super::CustodyRootObservationV1::Unavailable
++        );
++        assert!(report.entries().is_empty());
++    }
++
++    #[test]
++    fn a2b_public_report_return_compiler_barrier() {
++        let _: super::ExactAbsenceSweepReportV1 =
++            super::sweep_orphans_with_exact_absence("", &BothAbsentProbe);
++    }
++
++    #[test]
++    fn a2b_exact_projection_report_compiler_barrier() {
++        let _: fn(
++            super::ExactScanOutcomeV1,
++            String,
++        ) -> super::ExactAbsenceSweepReportV1 = super::ExactScanOutcomeV1::into_report;
++    }
++
++    #[test]
++    fn a2b_root_observation_classifier_compiler_barrier() {
++        let _ = super::classify_root_observations(super::RootObservationSetV1::default());
 +    }
 +
      fn scanned_disposition(root: &Path, record_path: &Path) -> CustodySweepDispositionV1 {

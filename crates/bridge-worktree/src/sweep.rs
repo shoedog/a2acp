@@ -1436,7 +1436,8 @@ mod tests {
 
     #[test]
     fn exact_absence_sweep_reports_cannot_canonicalize() {
-        let root = unique_temp_dir("exact-absence-cannot-canonicalize");
+        let unique_root = unique_temp_dir("exact-absence-cannot-canonicalize");
+        let root = PathBuf::from(unique_root.file_name().unwrap());
         assert!(!root.exists());
         let requested_root = root.to_string_lossy().into_owned();
 
