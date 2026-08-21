@@ -1195,7 +1195,7 @@ is deliberately **not** repaired in the slice that found it.
 | **The F8 birthtime ruling rests on one filesystem.** Slice B's probe observed `retained=some pinned=some final_named=some → Pinned` on macOS/APFS — homogeneous, so the classifier-policy stop did not fire and A2b's strict-equality policy stands. | The ext4 lane is *expected* to report `none/none/none`, also homogeneous, also `Pinned`, but that line has never been captured because CI does not run `--nocapture`. | **Opportunistic, not a slice.** One `cargo test -p bridge-worktree --locked root_capture_birthtime_capability_is_homogeneous_across_the_three_captures -- --exact --nocapture` on any Linux run closes it. Ride it along with the next CI touch. A **mixed** result would re-open the ruling and escalate to the classifier-policy question. |
 | **`force_next_release_failure_for` flake.** A 3-test group in `compatibility_schedule_state.rs` that historically forced a CI re-run on 2 of 3 PRs. | `[MEASURED]` Dormant across **seven consecutive PRs** (#62-#68), every one green on first run. | **Propose closing as dormant** rather than spending a slice. Seven clean runs is stronger evidence than the original intermittent signal. If it recurs, it re-opens with fresh evidence and a same-environment control; the mechanism hypothesis (thread-local leak across reused harness threads) was never proven and should not be revived without one. |
 
-### Deferred incident: `implement` attempts a commit with nothing staged
+### Resolved incident: `implement` attempted a commit with nothing staged
 
 **Sightings:** 2 (R2f1b 3d — slice A2a-2, then increment 3A). **Partially fixed** by
 PR #64; the residual is scheduled below.
@@ -1221,12 +1221,33 @@ declined to stage an invalid candidate, and said so in its transcript — so not
 emptied the index; it was never filled. That removes the earlier ambiguity about an
 external mutation between the stage check and the commit.
 
-**Prescription** (small, ~20 lines): re-check `stage_state` immediately before
-`host_commit` and fall through to `NoCommitDirty` rather than attempting a commit
-that cannot succeed. **Slot: inline, before the next R2f dispatch** — it fires on
-every implement run, so the cost is per-dispatch noise for every remaining slice in
-R2f, R2g, and beyond. PR #64 set the precedent for fixing implement-harness defects
-inline rather than queuing them.
+**RESOLVED at `be6df2e4` by PR #69 — and the root cause was not what this entry
+first assumed.**
+
+`stage_state` read `git status --porcelain` through `git_ok`, which `.trim()`s stdout.
+Porcelain's **first column is the index status**, and for a tracked-but-unstaged edit
+that column is a **space** (` M path`). Trimming deleted it, shifting the *worktree*
+column into byte 0, so ` M` was read as `M`, the tree was classified `Staged`, and
+`decide` chose `Commit` against an empty index.
+
+**Nothing ever emptied the index.** The check misread it. That also explains the
+apparent intermittency recorded above: untracked-only trees (`?? path`) were
+unaffected, because `?` is not whitespace. Both sightings fit exactly, and the
+`NoCommitDirty` path — which exists to report *"the agent edited but staged
+nothing"* — had never once fired in this lane.
+
+**The prescription this entry originally carried was inert.** It proposed re-checking
+`stage_state` immediately before `host_commit`. That fix was implemented first and a
+new test proved it does nothing: the re-check calls the same misreading function, so
+it returns `Staged` for precisely the case it was meant to catch. It was reverted and
+the cause fixed instead — `stage_state` now reads the porcelain output raw, while
+`git_ok` keeps its trim for `head_sha` and `current_branch`.
+
+Mutation-checked: restoring the trimming version turns
+`stage_state_reports_dirty_unstaged_for_an_unstaged_edit` red.
+
+**Standing lesson:** a fix aimed at a symptom can call the defect. The re-check would
+have shipped, passed review, and changed nothing.
 
 ### Active incident: served Codex terminal failure did not reach `submit`
 
