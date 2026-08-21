@@ -1183,6 +1183,51 @@ separation, and a non-disruptive generation drain/rotate design that never inter
 sessions. R3d remains one-shot only and may later display, but never act on, a separate R2f health artifact.
 Do not automatically replay the failed request or treat the isolated review as compatibility evidence.
 
+### R2f1b 3d T3a carried ledger — three lane items and their slots
+
+Recorded 2026-08-21 after T3a increment 1, slice B, increment 2, and 3A-1 merged
+(PRs #60, #62-#68). Each item is real, none blocks the remaining T3a work, and each
+is deliberately **not** repaired in the slice that found it.
+
+| Item | Evidence | Slot, and why |
+|---|---|---|
+| **Unix-only separator guard.** `is_custody_record_name` guards the empty-basename case with `!stem.ends_with('/')`, testing the forward slash only. A backslash-spelled path leaves a stem ending in `'\'`, so the guard does not fire and classification diverges from the Unix spelling. | Characterized deliberately by A2a-2 and carried unrepaired through A2b, slice B, and increment 2. | **After T3b, as its own small slice.** It sits in the code T3a/T3b are actively changing, so repairing it now would conflict with in-flight work. It is latent rather than live: CI runs `bridge-store` only on Windows, so no supported lane exercises a backslash sweep root today. Repair needs its own review because it changes classification. |
+| **The F8 birthtime ruling rests on one filesystem.** Slice B's probe observed `retained=some pinned=some final_named=some → Pinned` on macOS/APFS — homogeneous, so the classifier-policy stop did not fire and A2b's strict-equality policy stands. | The ext4 lane is *expected* to report `none/none/none`, also homogeneous, also `Pinned`, but that line has never been captured because CI does not run `--nocapture`. | **Opportunistic, not a slice.** One `cargo test -p bridge-worktree --locked root_capture_birthtime_capability_is_homogeneous_across_the_three_captures -- --exact --nocapture` on any Linux run closes it. Ride it along with the next CI touch. A **mixed** result would re-open the ruling and escalate to the classifier-policy question. |
+| **`force_next_release_failure_for` flake.** A 3-test group in `compatibility_schedule_state.rs` that historically forced a CI re-run on 2 of 3 PRs. | `[MEASURED]` Dormant across **seven consecutive PRs** (#62-#68), every one green on first run. | **Propose closing as dormant** rather than spending a slice. Seven clean runs is stronger evidence than the original intermittent signal. If it recurs, it re-opens with fresh evidence and a same-environment control; the mechanism hypothesis (thread-local leak across reused harness threads) was never proven and should not be revived without one. |
+
+### Deferred incident: `implement` attempts a commit with nothing staged
+
+**Sightings:** 2 (R2f1b 3d — slice A2a-2, then increment 3A). **Partially fixed** by
+PR #64; the residual is scheduled below.
+
+`stage_state` classifies the clone via `git status --porcelain` and `decide` maps
+`DirtyUnstaged` to `Action::NoCommitDirty`, which prints *"agent edited but staged
+NOTHING — NOT committing (agent owns staging)"* and returns `Ok(())`. That path did
+not run in either sighting; `decide` chose `Commit`, and the commit failed because
+the index was empty.
+
+**What PR #64 fixed.** The failure was previously invisible and destructive: the
+error read `git commit failed: ` with the cause discarded — `git commit` writes
+"nothing to commit" to **stdout** while the formatter read **stderr** only — and the
+`Action::Commit` error path returned without printing the clone path, unlike the
+other three actions. A complete, correct 380-line work product was left in a
+quarantine clone with no pointer to it and was recovered only because the operator
+went looking. #64 surfaces stdout when stderr is empty and always prints the clone
+path.
+
+**What remains.** The commit is still attempted when it cannot succeed. The second
+sighting is the cleaner reproduction: the agent had hit its cap gate, **deliberately**
+declined to stage an invalid candidate, and said so in its transcript — so nothing
+emptied the index; it was never filled. That removes the earlier ambiguity about an
+external mutation between the stage check and the commit.
+
+**Prescription** (small, ~20 lines): re-check `stage_state` immediately before
+`host_commit` and fall through to `NoCommitDirty` rather than attempting a commit
+that cannot succeed. **Slot: inline, before the next R2f dispatch** — it fires on
+every implement run, so the cost is per-dispatch noise for every remaining slice in
+R2f, R2g, and beyond. PR #64 set the precedent for fixing implement-harness defects
+inline rather than queuing them.
+
 ### Active incident: served Codex terminal failure did not reach `submit`
 
 [GitHub #47](https://github.com/shoedog/a2acp/issues/47) records a served-unary Codex request that reached
@@ -1350,6 +1395,22 @@ mark `MERGED` from a local commit or open PR.
 - Run the repository's complete suite, not only focused tests. Report exact passed/failed/ignored totals
   and every unexercised live gate.
 - A failure outside slice scope is reported, not re-baselined or silently fixed.
+- **Size caps from measurement, not estimation, and expect the estimate to run low.**
+  `[MEASURED]` R2f1b 3d missed three consecutive caps in the same direction:
+  increment 2 projected 455 and delivered **673** against a 670 trigger; increment 3A
+  projected 420 and passed **509** against 500 *while still incomplete*; increment 3
+  as a whole projected 600 and measured **995**. The projections were not careless —
+  3A's was grounded in measured current-crate regions — so the estimating model
+  under-counts **evidence**, not implementation. Measure per-test cost in the target
+  crate before setting a cap, add headroom, and treat a cap as a stop signal rather
+  than a target. A projected breach is split **before** implementation; a breach
+  discovered after review is an override that must be disclosed, not a finding that
+  the cap was wrong.
+- **Count added nonblank lines once.** `[MEASURED]` `grep -cE '^\+[^+]'` already
+  excludes blank added lines; subtracting them again understated increment 2 by 37
+  lines and led an operator to refute a correct cap-breach finding. The implementer
+  caught the arithmetic and escalated under its falsification license rather than
+  complying.
 
 ### Required merge gates
 
