@@ -3293,19 +3293,30 @@ mod tests {
             OsStr::new("beta"),
             OsStr::new(".hidden"),
             OsStr::new("alpha"),
-            OsStr::from_bytes(b"non-utf8-\xff"),
         ] {
             fs::write(directory.path().join(name), b"entry").unwrap();
         }
+        let non_utf8_name = OsStr::from_bytes(b"non-utf8-\xff");
+        let includes_non_utf8 = match fs::write(directory.path().join(non_utf8_name), b"entry") {
+            Ok(()) => true,
+            Err(error) => {
+                eprintln!("SLICE-B-NON-UTF8-FIXTURE-SKIPPED: {error}");
+                false
+            }
+        };
 
         let expected = fs::read_dir(directory.path())
             .unwrap()
             .map(|entry| entry.unwrap().file_name())
+            .filter(|name| includes_non_utf8 || name.as_os_str() != non_utf8_name)
             .collect::<Vec<_>>();
         let mut retained = RetainedDirectoryEnumerationV1::open(directory.path()).unwrap();
         let actual = std::iter::from_fn(|| retained.next_name())
             .collect::<Result<Vec<_>, _>>()
-            .unwrap();
+            .unwrap()
+            .into_iter()
+            .filter(|name| includes_non_utf8 || name.as_os_str() != non_utf8_name)
+            .collect::<Vec<_>>();
 
         assert_eq!(actual, expected);
     }
