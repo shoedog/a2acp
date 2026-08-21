@@ -1,5 +1,6 @@
 use crate::custody::{
-    custody_record_path, CustodyReadRefusalV1, CustodySweepDispositionV1, WorktreeCustodyRecordV1,
+    custody_record_path, CustodyReadRefusalV1, CustodySweepDispositionV1, PreservationReasonV1,
+    WorktreeCustodyRecordV1, WorktreeCustodyStateV1, CUSTODY_RECORD_SUFFIX,
 };
 use crate::provider::{prune_argv, remove_argv};
 use crate::provider_path::{canonicalize_lenient, sidecar_path};
@@ -12,6 +13,7 @@ use bridge_core::liveness::LeaseProbe;
 use bridge_core::run_identity::{classify, Verdict};
 use bridge_core::SessionCwd;
 use std::collections::HashMap;
+use std::ffi::OsStr;
 use std::path::Path;
 use std::process::Command;
 
@@ -510,22 +512,96 @@ fn decide_unused_legacy_sidecar(
     .map(|candidate| decide_unused_candidate(&candidate, false, probe))
     .unwrap_or(UnusedCandidateDecisionV1::Refused)
 }
-fn decide_unused_custody_record(
-    root: &SessionCwd,
-    record_file: &str,
+/// Reject records whose target cannot be constructed as this root's child.
+///
+/// The order is significant: containment and sibling questions only make sense
+/// after the recorded target is known to be absolute.
+fn construction_guards(
+    canonical_root: &SessionCwd,
+    enumerated_name: &OsStr,
+    recorded_worktree: &str,
+) -> Result<(), CannotConstructSubjectV1> {
+    let worktree = Path::new(recorded_worktree);
+    if !worktree.is_absolute() {
+        return Err(CannotConstructSubjectV1::RecordedWorktreePathNotAbsolute);
+    }
+    if !worktree_under_root(canonical_root, recorded_worktree) {
+        return Err(CannotConstructSubjectV1::OutsideSweepRoot);
+    }
+    let (Some(parent), Some(stem)) = (worktree.parent(), worktree.file_name()) else {
+        return Err(CannotConstructSubjectV1::RecordFileNotExpectedSibling);
+    };
+    let mut expected = stem.to_os_string();
+    expected.push(CUSTODY_RECORD_SUFFIX);
+    if parent != Path::new(canonical_root.as_str()) || enumerated_name != expected.as_os_str() {
+        return Err(CannotConstructSubjectV1::RecordFileNotExpectedSibling);
+    }
+    Ok(())
+}
+
+/// `Ok(())` admits the record to construction; `Err(..)` is the reported population.
+fn admit_custody_population(
+    state: &WorktreeCustodyStateV1,
+    claim_present: bool,
+) -> Result<(), IneligiblePopulationV1> {
+    match (state, claim_present) {
+        (WorktreeCustodyStateV1::ProtectionPrepared {}, true) => Ok(()),
+        (WorktreeCustodyStateV1::ProtectionPrepared {}, false) => {
+            Err(IneligiblePopulationV1::BareProtectionPrepared)
+        }
+        (
+            WorktreeCustodyStateV1::PreservationUnknown {
+                reason: PreservationReasonV1::MaterializationInFlight,
+            },
+            true,
+        ) => Ok(()),
+        (
+            WorktreeCustodyStateV1::PreservationUnknown {
+                reason: PreservationReasonV1::MaterializationInFlight,
+            },
+            false,
+        )
+        | (
+            WorktreeCustodyStateV1::PreservationUnknown {
+                reason:
+                    PreservationReasonV1::NodeFailure
+                    | PreservationReasonV1::Cancellation
+                    | PreservationReasonV1::AmbiguousCleanup
+                    | PreservationReasonV1::PostConditionDisagreement
+                    | PreservationReasonV1::RemovalFailed,
+            },
+            _,
+        )
+        | (WorktreeCustodyStateV1::PreservationPrepared {}, _)
+        | (WorktreeCustodyStateV1::Preserved {}, _)
+        | (WorktreeCustodyStateV1::UnusedSettled {}, _)
+        | (WorktreeCustodyStateV1::Materializing {}, _)
+        | (WorktreeCustodyStateV1::LiveProtected {}, _)
+        | (WorktreeCustodyStateV1::DeleteAuthorized {}, _)
+        | (WorktreeCustodyStateV1::Removed {}, _)
+        | (WorktreeCustodyStateV1::RecoveredLive { .. }, _) => {
+            Err(IneligiblePopulationV1::StateNotCandidate)
+        }
+    }
+}
+
+fn assess_custody_record(
+    canonical_root: &SessionCwd,
+    enumerated_name: &OsStr,
     record: &WorktreeCustodyRecordV1,
     probe: &dyn ExactAbsenceProbeV1,
-) -> UnusedCandidateDecisionV1 {
-    let worktree = &record.worktree.canonical_path;
-    if !worktree_under_root(root, worktree)
-        || !matches!(
-            (std::fs::canonicalize(record_file), std::fs::canonicalize(custody_record_path(worktree))),
-            (Ok(record_file), Ok(expected)) if record_file == expected
-        )
-    {
-        return UnusedCandidateDecisionV1::Refused;
+) -> CustodyExactAbsenceAssessmentV1 {
+    if let Err(refusal) = construction_guards(
+        canonical_root,
+        enumerated_name,
+        &record.worktree.canonical_path,
+    ) {
+        return CustodyExactAbsenceAssessmentV1::CannotConstructSubject(refusal);
     }
-    record
+    if let Err(population) = admit_custody_population(&record.state, record.claim.is_some()) {
+        return CustodyExactAbsenceAssessmentV1::IneligiblePopulation(population);
+    }
+    let decision = record
         .claim
         .as_ref()
         .and_then(|claim| {
@@ -533,11 +609,12 @@ fn decide_unused_custody_record(
                 .ok()
         })
         .map(|candidate| decide_unused_candidate(&candidate, false, probe))
-        .unwrap_or(UnusedCandidateDecisionV1::Refused)
+        .unwrap_or(UnusedCandidateDecisionV1::Refused);
+    CustodyExactAbsenceAssessmentV1::Assessed(decision)
 }
 struct ExactScanProjectionRowV1 {
     checked: CheckedScanRowV1,
-    decision: UnusedCandidateDecisionV1,
+    assessment: ExactAbsenceRecordAssessmentV1,
 }
 
 struct ExactScanCompleteV1 {
@@ -650,23 +727,12 @@ fn root_capture_has_object_identity(capture: checked_scan::RootIdentityCaptureV1
     capture.dev.is_some() && capture.ino.is_some()
 }
 
-fn report_exact_scan_projection_row(
-    projection_row: ExactScanProjectionRowV1,
-) -> ExactAbsenceSweepEntryV1 {
-    let decision = projection_row.decision;
-    let (record_path, enumerated_name, scanned) = projection_row.checked.parts();
-    let assessment = match scanned {
-        ScannedWorktreeRecordV1::Legacy(_) => ExactAbsenceRecordAssessmentV1::Legacy(decision),
-        ScannedWorktreeRecordV1::UnreadableCustody(refusal) => {
-            ExactAbsenceRecordAssessmentV1::UnreadableCustody(refusal.clone())
-        }
-        ScannedWorktreeRecordV1::Custody(record) => {
-            ExactAbsenceRecordAssessmentV1::Custody(CustodyRecordAssessmentV1::new(
-                CustodyStateSnapshotV1::from(&record.state),
-                CustodyExactAbsenceAssessmentV1::Assessed(decision),
-            ))
-        }
-    };
+fn report_exact_scan_projection_row(row: ExactScanProjectionRowV1) -> ExactAbsenceSweepEntryV1 {
+    let ExactScanProjectionRowV1 {
+        checked,
+        assessment,
+    } = row;
+    let (record_path, enumerated_name, _) = checked.parts();
     ExactAbsenceSweepEntryV1::new(
         record_path.to_owned(),
         enumerated_name.to_os_string(),
@@ -689,20 +755,31 @@ fn project_exact_scan_result(
     };
     let mut rows = Vec::with_capacity(checked_rows.len());
     for checked in checked_rows {
-        let decision = match checked.parts() {
+        let assessment = match checked.parts() {
             (path, _, ScannedWorktreeRecordV1::Legacy(sidecar)) => {
-                decide_unused_legacy_sidecar(&canonical_root, path, sidecar, probe)
+                ExactAbsenceRecordAssessmentV1::Legacy(decide_unused_legacy_sidecar(
+                    &canonical_root,
+                    path,
+                    sidecar,
+                    probe,
+                ))
             }
-            (path, _, ScannedWorktreeRecordV1::Custody(record)) => {
-                decide_unused_custody_record(&canonical_root, path, record, probe)
+            (_, enumerated_name, ScannedWorktreeRecordV1::Custody(record)) => {
+                ExactAbsenceRecordAssessmentV1::Custody(CustodyRecordAssessmentV1::new(
+                    CustodyStateSnapshotV1::from(&record.state),
+                    assess_custody_record(&canonical_root, enumerated_name, record, probe),
+                ))
             }
-            (_, _, ScannedWorktreeRecordV1::UnreadableCustody(_)) => {
-                UnusedCandidateDecisionV1::Refused
+            (_, _, ScannedWorktreeRecordV1::UnreadableCustody(refusal)) => {
+                ExactAbsenceRecordAssessmentV1::UnreadableCustody(refusal.clone())
             }
         };
-        let projection_row = ExactScanProjectionRowV1 { checked, decision };
+        let projection_row = ExactScanProjectionRowV1 {
+            checked,
+            assessment,
+        };
         let path = projection_row.checked.record_path();
-        let decision = projection_row.decision;
+        let decision = projection_row.assessment.decision();
         tracing::info!(record = path, ?decision, "made exact-absence decision");
         rows.push(projection_row);
     }
@@ -937,6 +1014,7 @@ mod tests {
     use std::collections::HashMap;
     use std::fs;
     use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     struct FakeProbe(HashMap<String, Option<bool>>);
@@ -1246,7 +1324,9 @@ mod tests {
     use bridge_core::execution_policy::{
         PolicyNodeRefV1, Sha256HexV1, WorktreeCustodyIdV1, WorktreeObjectIdentityV1,
     };
-    use bridge_core::fs_custody::{BirthTimeV1, DirectoryIdentityV1};
+    use bridge_core::fs_custody::{
+        verify_payload_directory_identity, BirthTimeV1, DirectoryIdentityV1,
+    };
     use bridge_core::ids::{AttemptId, AttemptIdentity, ExecutionId};
 
     fn sha(digit: char) -> Sha256HexV1 {
@@ -1364,6 +1444,144 @@ mod tests {
         ) -> Result<super::ExactAbsenceObservationV1, bridge_core::error::BridgeError> {
             Ok(super::ExactAbsenceObservationV1::BothAbsent)
         }
+    }
+
+    struct RecordingProbe {
+        calls: AtomicUsize,
+        result: super::ExactAbsenceObservationV1,
+    }
+
+    impl RecordingProbe {
+        fn both_absent() -> Self {
+            Self {
+                calls: AtomicUsize::new(0),
+                result: super::ExactAbsenceObservationV1::BothAbsent,
+            }
+        }
+
+        fn calls(&self) -> usize {
+            self.calls.load(Ordering::SeqCst)
+        }
+    }
+
+    impl super::ExactAbsenceProbeV1 for RecordingProbe {
+        fn observe_exact_absence(
+            &self,
+            _candidate: &super::ExactAbsenceCandidateV1,
+        ) -> Result<super::ExactAbsenceObservationV1, bridge_core::error::BridgeError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(self.result)
+        }
+    }
+
+    fn real_custody_record(
+        root: &Path,
+        target: &Path,
+        state: WorktreeCustodyStateV1,
+        claim_present: bool,
+    ) -> WorktreeCustodyRecordV1 {
+        let source = root.join("source");
+        fs::create_dir_all(&source).unwrap();
+        assert!(std::process::Command::new("git")
+            .args(["-C", source.to_str().unwrap(), "init", "-q"])
+            .status()
+            .unwrap()
+            .success());
+        let target = fs::canonicalize(target).unwrap();
+        let identity = |path: &Path| {
+            let directory_identity =
+                verify_payload_directory_identity(&fs::canonicalize(path).unwrap()).unwrap();
+            WorktreeObjectIdentityV1 {
+                canonical_path: directory_identity.canonical_path.clone(),
+                directory_identity,
+            }
+        };
+        let reason = match &state {
+            WorktreeCustodyStateV1::PreservationUnknown { reason } => *reason,
+            _ => PreservationReasonV1::NodeFailure,
+        };
+        let mut record = custody_record(&target.to_string_lossy(), state);
+        record.worktree = identity(&target);
+        record.claim = claim_present.then(|| PreservedWorktreeClaimV1 {
+            schema_version: WORKTREE_CUSTODY_RECORD_SCHEMA_V1,
+            custody_id: record.custody_id.clone(),
+            execution_id: record.current_attempt.execution_id.clone(),
+            origin_attempt_id: record.current_attempt.attempt_id.clone(),
+            current_attempt: record.current_attempt.clone(),
+            node: PolicyNodeRefV1 {
+                sorted_ordinal: 0,
+                id_sha256: sha('5'),
+            },
+            checkout_fingerprint: record.checkout_fingerprint.clone(),
+            source: identity(&source),
+            root: identity(root),
+            worktree: record.worktree.clone(),
+            common_dir: identity(&source.join(".git")),
+            reason,
+            created_wall_ms: 1_700_000_000_000,
+            recovery_locator: RecoveryLocatorV1::RegisteredWorktree {},
+        });
+        record
+    }
+
+    fn write_real_custody_record(
+        root: &Path,
+        record_path: &Path,
+        target: &Path,
+        state: WorktreeCustodyStateV1,
+        claim_present: bool,
+    ) {
+        let record = real_custody_record(root, target, state, claim_present);
+        fs::write(record_path, record.encode_canonical().unwrap()).unwrap();
+    }
+
+    fn write_expected_custody_record(
+        root: &Path,
+        name: &str,
+        state: WorktreeCustodyStateV1,
+        claim_present: bool,
+    ) -> PathBuf {
+        let target = root.join(name);
+        fs::create_dir_all(&target).unwrap();
+        let target = fs::canonicalize(target).unwrap();
+        let record_path = PathBuf::from(custody_record_path(&target.to_string_lossy()));
+        write_real_custody_record(root, &record_path, &target, state, claim_present);
+        record_path
+    }
+
+    fn custody_assessment<'a>(
+        report: &'a super::ExactAbsenceSweepReportV1,
+        record_path: &Path,
+    ) -> &'a super::CustodyExactAbsenceAssessmentV1 {
+        let entry = report
+            .entries()
+            .iter()
+            .find(|entry| entry.record_path() == record_path.to_string_lossy())
+            .expect("record must appear in the exact scan");
+        match entry.assessment() {
+            super::ExactAbsenceRecordAssessmentV1::Custody(assessment) => assessment.assessment(),
+            _ => panic!("record must remain a readable custody row"),
+        }
+    }
+
+    fn assert_candidate_control(root: &Path) {
+        let control = write_expected_custody_record(
+            root,
+            "control",
+            WorktreeCustodyStateV1::ProtectionPrepared {},
+            true,
+        );
+        let probe = RecordingProbe::both_absent();
+        let report = super::sweep_orphans_with_exact_absence(&root.to_string_lossy(), &probe);
+        assert_eq!(
+            custody_assessment(&report, &control),
+            &super::CustodyExactAbsenceAssessmentV1::Assessed(
+                super::UnusedCandidateDecisionV1::Authorized,
+            )
+        );
+        assert!(matches!(report.scan().custody_root(), super::CustodyRootObservationV1::Pinned));
+        assert_eq!(report.effective().count(), 0);
+        assert_eq!(probe.calls(), 1);
     }
 
     fn root_capture(
@@ -1517,8 +1735,8 @@ mod tests {
                 if assessment.state().kind() == WorktreeCustodyStateKindV1::LiveProtected
                     && matches!(
                         assessment.assessment(),
-                        super::CustodyExactAbsenceAssessmentV1::Assessed(
-                            super::UnusedCandidateDecisionV1::Refused
+                        super::CustodyExactAbsenceAssessmentV1::IneligiblePopulation(
+                            super::IneligiblePopulationV1::StateNotCandidate
                         )
                     )
         ));
@@ -1527,6 +1745,420 @@ mod tests {
             unreadable_entry.assessment(),
             super::ExactAbsenceRecordAssessmentV1::UnreadableCustody(_)
         ));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn population_admission_covers_every_decodable_population_and_probes_only_candidates() {
+        enum Expected {
+            Candidate,
+            BareProtectionPrepared,
+            StateNotCandidate,
+        }
+
+        let root = unique_temp_dir("population-admission");
+        fs::create_dir_all(&root).unwrap();
+        let mut records = Vec::new();
+        for (name, state, claim_present, expected) in [
+            (
+                "protection-with-claim",
+                WorktreeCustodyStateV1::ProtectionPrepared {},
+                true,
+                Expected::Candidate,
+            ),
+            (
+                "protection-bare",
+                WorktreeCustodyStateV1::ProtectionPrepared {},
+                false,
+                Expected::BareProtectionPrepared,
+            ),
+            (
+                "unknown-in-flight",
+                WorktreeCustodyStateV1::PreservationUnknown {
+                    reason: PreservationReasonV1::MaterializationInFlight,
+                },
+                true,
+                Expected::Candidate,
+            ),
+            (
+                "unknown-node-failure",
+                WorktreeCustodyStateV1::PreservationUnknown {
+                    reason: PreservationReasonV1::NodeFailure,
+                },
+                true,
+                Expected::StateNotCandidate,
+            ),
+            (
+                "unknown-cancellation",
+                WorktreeCustodyStateV1::PreservationUnknown {
+                    reason: PreservationReasonV1::Cancellation,
+                },
+                true,
+                Expected::StateNotCandidate,
+            ),
+            (
+                "unknown-ambiguous",
+                WorktreeCustodyStateV1::PreservationUnknown {
+                    reason: PreservationReasonV1::AmbiguousCleanup,
+                },
+                true,
+                Expected::StateNotCandidate,
+            ),
+            (
+                "unknown-postcondition",
+                WorktreeCustodyStateV1::PreservationUnknown {
+                    reason: PreservationReasonV1::PostConditionDisagreement,
+                },
+                true,
+                Expected::StateNotCandidate,
+            ),
+            (
+                "unknown-removal-failed",
+                WorktreeCustodyStateV1::PreservationUnknown {
+                    reason: PreservationReasonV1::RemovalFailed,
+                },
+                true,
+                Expected::StateNotCandidate,
+            ),
+            (
+                "preservation-prepared",
+                WorktreeCustodyStateV1::PreservationPrepared {},
+                true,
+                Expected::StateNotCandidate,
+            ),
+            (
+                "preserved",
+                WorktreeCustodyStateV1::Preserved {},
+                true,
+                Expected::StateNotCandidate,
+            ),
+            (
+                "unused-settled",
+                WorktreeCustodyStateV1::UnusedSettled {},
+                false,
+                Expected::StateNotCandidate,
+            ),
+            (
+                "materializing",
+                WorktreeCustodyStateV1::Materializing {},
+                false,
+                Expected::StateNotCandidate,
+            ),
+            (
+                "live-protected",
+                WorktreeCustodyStateV1::LiveProtected {},
+                false,
+                Expected::StateNotCandidate,
+            ),
+            (
+                "delete-authorized",
+                WorktreeCustodyStateV1::DeleteAuthorized {},
+                false,
+                Expected::StateNotCandidate,
+            ),
+            (
+                "removed",
+                WorktreeCustodyStateV1::Removed {},
+                false,
+                Expected::StateNotCandidate,
+            ),
+            (
+                "recovered-live",
+                WorktreeCustodyStateV1::RecoveredLive {
+                    predecessor_claim_digest: sha('7'),
+                },
+                false,
+                Expected::StateNotCandidate,
+            ),
+        ] {
+            let expected = match expected {
+                Expected::Candidate => super::CustodyExactAbsenceAssessmentV1::Assessed(
+                    super::UnusedCandidateDecisionV1::Authorized,
+                ),
+                Expected::BareProtectionPrepared => {
+                    super::CustodyExactAbsenceAssessmentV1::IneligiblePopulation(
+                        super::IneligiblePopulationV1::BareProtectionPrepared,
+                    )
+                }
+                Expected::StateNotCandidate => {
+                    super::CustodyExactAbsenceAssessmentV1::IneligiblePopulation(
+                        super::IneligiblePopulationV1::StateNotCandidate,
+                    )
+                }
+            };
+            records.push((
+                write_expected_custody_record(&root, name, state, claim_present),
+                expected,
+            ));
+        }
+        let probe = RecordingProbe::both_absent();
+        let report = super::sweep_orphans_with_exact_absence(&root.to_string_lossy(), &probe);
+
+        for (record, expected) in &records {
+            assert_eq!(custody_assessment(&report, record), expected, "{record:?}");
+        }
+        assert_eq!(probe.calls(), 2);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_canonical_preserved_record_stops_before_the_probe_with_a_matched_control() {
+        let root = unique_temp_dir("preserved-admission");
+        fs::create_dir_all(&root).unwrap();
+        let preserved = write_expected_custody_record(
+            &root,
+            "preserved",
+            WorktreeCustodyStateV1::Preserved {},
+            true,
+        );
+        let probe = RecordingProbe::both_absent();
+        let report = super::sweep_orphans_with_exact_absence(&root.to_string_lossy(), &probe);
+
+        assert_eq!(
+            custody_assessment(&report, &preserved),
+            &super::CustodyExactAbsenceAssessmentV1::IneligiblePopulation(
+                super::IneligiblePopulationV1::StateNotCandidate,
+            )
+        );
+        assert_eq!(probe.calls(), 0);
+        assert_candidate_control(&root);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_expected_sibling_symlink_alias_is_refused_with_a_matched_control() {
+        use std::os::unix::fs::symlink;
+
+        let root = unique_temp_dir("sibling-symlink-alias");
+        fs::create_dir_all(&root).unwrap();
+        let canonical_root = fs::canonicalize(&root).unwrap();
+        let target = canonical_root.join("wt");
+        fs::create_dir_all(&target).unwrap();
+        let alias = canonical_root.join("alias.custody.v1.json");
+        write_real_custody_record(
+            &root,
+            &alias,
+            &target,
+            WorktreeCustodyStateV1::ProtectionPrepared {},
+            true,
+        );
+        let expected = PathBuf::from(custody_record_path(&target.to_string_lossy()));
+        symlink(&alias, &expected).unwrap();
+        let probe = RecordingProbe::both_absent();
+        let report = super::sweep_orphans_with_exact_absence(&root.to_string_lossy(), &probe);
+
+        assert_eq!(
+            custody_assessment(&report, &alias),
+            &super::CustodyExactAbsenceAssessmentV1::CannotConstructSubject(
+                super::CannotConstructSubjectV1::RecordFileNotExpectedSibling,
+            )
+        );
+        let symlink_entry = report
+            .entries()
+            .iter()
+            .find(|entry| entry.record_path() == expected.to_string_lossy())
+            .expect("symlink must be retained as an unreadable custody row");
+        assert!(matches!(
+            symlink_entry.assessment(),
+            super::ExactAbsenceRecordAssessmentV1::UnreadableCustody(_)
+        ));
+        assert_eq!(probe.calls(), 0);
+
+        assert_candidate_control(&root);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_nested_target_whose_record_sits_at_the_root_is_not_an_expected_sibling() {
+        let root = unique_temp_dir("nested-target-sibling");
+        fs::create_dir_all(&root).unwrap();
+        let canonical_root = fs::canonicalize(&root).unwrap();
+        let target = canonical_root.join("sub/wt");
+        fs::create_dir_all(&target).unwrap();
+        let record = canonical_root.join("wt.custody.v1.json");
+        write_real_custody_record(
+            &root,
+            &record,
+            &target,
+            WorktreeCustodyStateV1::ProtectionPrepared {},
+            true,
+        );
+        let probe = RecordingProbe::both_absent();
+        let report = super::sweep_orphans_with_exact_absence(&root.to_string_lossy(), &probe);
+
+        assert_eq!(
+            custody_assessment(&report, &record),
+            &super::CustodyExactAbsenceAssessmentV1::CannotConstructSubject(
+                super::CannotConstructSubjectV1::RecordFileNotExpectedSibling,
+            )
+        );
+        assert_eq!(probe.calls(), 0);
+
+        assert_candidate_control(&root);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_target_resolving_outside_the_sweep_root_is_typed_outside_root() {
+        use std::os::unix::fs::symlink;
+
+        let root = unique_temp_dir("outside-sweep-root");
+        let outside = unique_temp_dir("outside-sweep-root-target");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        let canonical_root = fs::canonicalize(&root).unwrap();
+        let alias = canonical_root.join("alias");
+        symlink(&outside, &alias).unwrap();
+        let record = canonical_root.join("alias.custody.v1.json");
+        write_real_custody_record(
+            &root,
+            &record,
+            &alias,
+            WorktreeCustodyStateV1::ProtectionPrepared {},
+            true,
+        );
+        let probe = RecordingProbe::both_absent();
+        let report = super::sweep_orphans_with_exact_absence(&root.to_string_lossy(), &probe);
+
+        assert_eq!(
+            custody_assessment(&report, &record),
+            &super::CustodyExactAbsenceAssessmentV1::CannotConstructSubject(
+                super::CannotConstructSubjectV1::OutsideSweepRoot,
+            )
+        );
+        assert_eq!(probe.calls(), 0);
+
+        assert_candidate_control(&root);
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(outside).unwrap();
+    }
+
+    #[test]
+    fn a_relative_recorded_target_reports_the_first_guard_only() {
+        let root = unique_temp_dir("relative-target-guard");
+        fs::create_dir_all(&root).unwrap();
+        let canonical_root = fs::canonicalize(&root).unwrap();
+        let record = canonical_root.join("p.custody.v1.json");
+        let relative = custody_record(
+            "relative/target",
+            WorktreeCustodyStateV1::ProtectionPrepared {},
+        );
+        fs::write(&record, relative.encode_canonical().unwrap()).unwrap();
+        let probe = RecordingProbe::both_absent();
+        let report = super::sweep_orphans_with_exact_absence(&root.to_string_lossy(), &probe);
+
+        assert_eq!(
+            custody_assessment(&report, &record),
+            &super::CustodyExactAbsenceAssessmentV1::CannotConstructSubject(
+                super::CannotConstructSubjectV1::RecordedWorktreePathNotAbsolute,
+            )
+        );
+        assert_eq!(probe.calls(), 0);
+
+        assert_candidate_control(&root);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_preserved_record_outside_the_root_reports_the_guard_not_the_population() {
+        use std::os::unix::fs::symlink;
+
+        let root = unique_temp_dir("preserved-outside-root");
+        let outside = unique_temp_dir("preserved-outside-root-target");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        let canonical_root = fs::canonicalize(&root).unwrap();
+        let alias = canonical_root.join("alias");
+        symlink(&outside, &alias).unwrap();
+        let record = canonical_root.join("alias.custody.v1.json");
+        write_real_custody_record(
+            &root,
+            &record,
+            &alias,
+            WorktreeCustodyStateV1::Preserved {},
+            true,
+        );
+        let probe = RecordingProbe::both_absent();
+        let report = super::sweep_orphans_with_exact_absence(&root.to_string_lossy(), &probe);
+
+        assert_eq!(
+            custody_assessment(&report, &record),
+            &super::CustodyExactAbsenceAssessmentV1::CannotConstructSubject(
+                super::CannotConstructSubjectV1::OutsideSweepRoot,
+            )
+        );
+        assert_eq!(probe.calls(), 0);
+
+        assert_candidate_control(&root);
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(outside).unwrap();
+    }
+
+    #[test]
+    fn invalid_persisted_claim_pairs_stay_unreadable_and_never_probe() {
+        let root = unique_temp_dir("invalid-claim-pairs");
+        fs::create_dir_all(&root).unwrap();
+        let canonical_root = fs::canonicalize(&root).unwrap();
+        let forbidden_target = canonical_root.join("forbidden");
+        let required_target = canonical_root.join("required");
+        fs::create_dir_all(&forbidden_target).unwrap();
+        fs::create_dir_all(&required_target).unwrap();
+        let forbidden_path = PathBuf::from(custody_record_path(
+            &fs::canonicalize(&forbidden_target)
+                .unwrap()
+                .to_string_lossy(),
+        ));
+        let required_path = PathBuf::from(custody_record_path(
+            &fs::canonicalize(&required_target)
+                .unwrap()
+                .to_string_lossy(),
+        ));
+        let forbidden = real_custody_record(
+            &root,
+            &forbidden_target,
+            WorktreeCustodyStateV1::LiveProtected {},
+            true,
+        );
+        let mut required = real_custody_record(
+            &root,
+            &required_target,
+            WorktreeCustodyStateV1::Preserved {},
+            true,
+        );
+        required.claim = None;
+        fs::write(&forbidden_path, serde_json::to_vec(&forbidden).unwrap()).unwrap();
+        fs::write(&required_path, serde_json::to_vec(&required).unwrap()).unwrap();
+        let probe = RecordingProbe::both_absent();
+        let report = super::sweep_orphans_with_exact_absence(&root.to_string_lossy(), &probe);
+
+        for (path, expected) in [
+            (
+                &forbidden_path,
+                crate::custody::CustodyRecordDecodeErrorV1::ClaimForbidden,
+            ),
+            (
+                &required_path,
+                crate::custody::CustodyRecordDecodeErrorV1::ClaimRequired,
+            ),
+        ] {
+            let entry = report
+                .entries()
+                .iter()
+                .find(|entry| entry.record_path() == path.to_string_lossy())
+                .expect("invalid record must be reported as unreadable");
+            assert!(matches!(
+                entry.assessment(),
+                super::ExactAbsenceRecordAssessmentV1::UnreadableCustody(
+                    crate::custody::CustodyReadRefusalV1::Decode(actual)
+                ) if actual == &expected
+            ));
+        }
+        assert_eq!(probe.calls(), 0);
+
+        assert_candidate_control(&root);
         fs::remove_dir_all(root).unwrap();
     }
 
