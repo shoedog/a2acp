@@ -15,7 +15,6 @@ use bridge_core::SessionCwd;
 use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::path::Path;
-use std::process::Command;
 
 mod checked_scan;
 mod report;
@@ -46,11 +45,12 @@ impl ExactAbsenceCandidateV1 {
         source: impl AsRef<str>,
         common_dir: impl AsRef<str>,
         worktree: impl AsRef<str>,
+        probe: &dyn ExactAbsenceProbeV1,
     ) -> Result<Self, BridgeError> {
         let source = capture_directory_identity(Path::new(source.as_ref()), "source")?;
         let common_dir =
             capture_directory_identity(Path::new(common_dir.as_ref()), "source common directory")?;
-        if !common_dir.matches(&source_common_dir_identity(&source.canonical_path)?) {
+        if !common_dir.matches(&source_common_dir_identity(&source.canonical_path, probe)?) {
             return Err(invalid("source does not own the recorded common directory"));
         }
         Self::from_bound(source, common_dir, worktree.as_ref())
@@ -59,6 +59,7 @@ impl ExactAbsenceCandidateV1 {
         source: &WorktreeObjectIdentityV1,
         common_dir: &WorktreeObjectIdentityV1,
         worktree: &WorktreeObjectIdentityV1,
+        probe: &dyn ExactAbsenceProbeV1,
     ) -> Result<Self, BridgeError> {
         for (kind, object) in [
             ("source", source),
@@ -79,6 +80,7 @@ impl ExactAbsenceCandidateV1 {
             || !common_dir.directory_identity.matches(&observed_common)
             || !observed_common.matches(&source_common_dir_identity(
                 &observed_source.canonical_path,
+                probe,
             )?)
         {
             return Err(invalid("claim source or common directory identity changed"));
@@ -110,13 +112,16 @@ impl ExactAbsenceCandidateV1 {
             worktree_path: worktree.to_owned(),
         })
     }
-    pub(crate) fn revalidate_source(&self) -> Result<(), BridgeError> {
+    pub(crate) fn revalidate_source(
+        &self,
+        probe: &dyn ExactAbsenceProbeV1,
+    ) -> Result<(), BridgeError> {
         let source = capture_directory_identity(Path::new(&self.canonical_source), "source")?;
         let common_dir =
             capture_directory_identity(Path::new(&self.common_dir), "source common directory")?;
         if self.source_identity.matches(&source)
             && self.common_dir_identity.matches(&common_dir)
-            && common_dir.matches(&source_common_dir_identity(&source.canonical_path)?)
+            && common_dir.matches(&source_common_dir_identity(&source.canonical_path, probe)?)
         {
             Ok(())
         } else {
@@ -131,7 +136,10 @@ fn invalid(reason: impl Into<String>) -> BridgeError {
         reason: reason.into(),
     }
 }
-fn capture_directory_identity(path: &Path, kind: &str) -> Result<DirectoryIdentityV1, BridgeError> {
+pub(crate) fn capture_directory_identity(
+    path: &Path,
+    kind: &str,
+) -> Result<DirectoryIdentityV1, BridgeError> {
     if !path.is_absolute() {
         return Err(invalid(format!("{kind} path has no absolute identity")));
     }
@@ -144,31 +152,11 @@ fn capture_directory_identity(path: &Path, kind: &str) -> Result<DirectoryIdenti
     }
     Ok(identity)
 }
-fn source_common_dir_identity(source: &str) -> Result<DirectoryIdentityV1, BridgeError> {
-    let output = Command::new("git")
-        .args([
-            "-C",
-            source,
-            "rev-parse",
-            "--path-format=absolute",
-            "--git-common-dir",
-        ])
-        .output()
-        .map_err(|error| invalid(format!("source authority probe failed: {error}")))?;
-    if !output.status.success() {
-        return Err(invalid(
-            "source authority probe did not identify a Git common directory",
-        ));
-    }
-    let common_dir = std::str::from_utf8(&output.stdout)
-        .map_err(|_| invalid("source authority probe returned a non-UTF-8 common directory"))?
-        .trim();
-    if common_dir.is_empty() || !Path::new(common_dir).is_absolute() {
-        return Err(invalid(
-            "source authority probe returned no absolute common directory",
-        ));
-    }
-    capture_directory_identity(Path::new(common_dir), "source common directory")
+fn source_common_dir_identity(
+    source: &str,
+    probe: &dyn ExactAbsenceProbeV1,
+) -> Result<DirectoryIdentityV1, BridgeError> {
+    probe.observe_source_common_dir_identity(source)
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ExactAbsenceObservationV1 {
@@ -177,6 +165,11 @@ pub enum ExactAbsenceObservationV1 {
     BothAbsent,
 }
 pub trait ExactAbsenceProbeV1: Send + Sync {
+    fn observe_source_common_dir_identity(
+        &self,
+        source: &str,
+    ) -> Result<DirectoryIdentityV1, BridgeError>;
+
     fn observe_exact_absence(
         &self,
         candidate: &ExactAbsenceCandidateV1,
@@ -508,6 +501,7 @@ fn decide_unused_legacy_sidecar(
         &sidecar.canonical_source,
         &sidecar.common_dir,
         &sidecar.worktree_path,
+        probe,
     )
     .map(|candidate| decide_unused_candidate(&candidate, false, probe))
     .unwrap_or(UnusedCandidateDecisionV1::Refused)
@@ -605,8 +599,13 @@ fn assess_custody_record(
         .claim
         .as_ref()
         .and_then(|claim| {
-            ExactAbsenceCandidateV1::from_claim(&claim.source, &claim.common_dir, &claim.worktree)
-                .ok()
+            ExactAbsenceCandidateV1::from_claim(
+                &claim.source,
+                &claim.common_dir,
+                &claim.worktree,
+                probe,
+            )
+            .ok()
         })
         .map(|candidate| decide_unused_candidate(&candidate, false, probe))
         .unwrap_or(UnusedCandidateDecisionV1::Refused);
@@ -1068,10 +1067,12 @@ mod tests {
             canonical_path: worktree_identity.canonical_path.clone(),
             directory_identity: worktree_identity,
         };
+        let probe = crate::host_git::HostGitWorktree::new();
         let candidate = super::ExactAbsenceCandidateV1::from_claim(
             &source_claim,
             &common_claim,
             &worktree_claim,
+            &probe,
         )
         .unwrap();
         fs::rename(source.join(".git"), root.join("original-common")).unwrap();
@@ -1086,7 +1087,7 @@ mod tests {
         assert!(output.status.success());
         fs::rename(replacement.join(".git"), source.join(".git")).unwrap();
         assert!(
-            candidate.revalidate_source().is_err(),
+            candidate.revalidate_source(&probe).is_err(),
             "a common-directory replacement must refuse while the source inode is unchanged"
         );
         fs::remove_dir_all(root).unwrap();
@@ -1438,6 +1439,16 @@ mod tests {
     struct BothAbsentProbe;
 
     impl super::ExactAbsenceProbeV1 for BothAbsentProbe {
+        fn observe_source_common_dir_identity(
+            &self,
+            source: &str,
+        ) -> Result<DirectoryIdentityV1, bridge_core::error::BridgeError> {
+            super::ExactAbsenceProbeV1::observe_source_common_dir_identity(
+                &crate::host_git::HostGitWorktree::new(),
+                source,
+            )
+        }
+
         fn observe_exact_absence(
             &self,
             _candidate: &super::ExactAbsenceCandidateV1,
@@ -1465,6 +1476,16 @@ mod tests {
     }
 
     impl super::ExactAbsenceProbeV1 for RecordingProbe {
+        fn observe_source_common_dir_identity(
+            &self,
+            source: &str,
+        ) -> Result<DirectoryIdentityV1, bridge_core::error::BridgeError> {
+            super::ExactAbsenceProbeV1::observe_source_common_dir_identity(
+                &crate::host_git::HostGitWorktree::new(),
+                source,
+            )
+        }
+
         fn observe_exact_absence(
             &self,
             _candidate: &super::ExactAbsenceCandidateV1,

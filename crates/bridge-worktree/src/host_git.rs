@@ -3,9 +3,14 @@ use crate::provider::{
     add_argv, is_repo_argv, list_porcelain_argv, prune_argv, remove_argv, CustodyAddFailureV1,
     CustodyAddOutcomeV1, CustodyAddTargetV1, WorktreeProvider,
 };
-use crate::sweep::{ExactAbsenceCandidateV1, ExactAbsenceObservationV1, ExactAbsenceProbeV1};
+use crate::sweep::{
+    capture_directory_identity, ExactAbsenceCandidateV1, ExactAbsenceObservationV1,
+    ExactAbsenceProbeV1,
+};
 use bridge_core::error::BridgeError;
-use bridge_core::fs_custody::{compare_path_identities, PathIdentityComparisonV1};
+use bridge_core::fs_custody::{
+    compare_path_identities, DirectoryIdentityV1, PathIdentityComparisonV1,
+};
 use std::path::Path;
 use std::process::{Command as StdCommand, Output};
 use std::time::Duration;
@@ -199,11 +204,46 @@ fn registration_absent_sync(repo: &str, wt: &str) -> Result<RegistrationAbsenceV
 }
 
 impl ExactAbsenceProbeV1 for HostGitWorktree {
+    fn observe_source_common_dir_identity(
+        &self,
+        source: &str,
+    ) -> Result<DirectoryIdentityV1, BridgeError> {
+        let output = StdCommand::new("git")
+            .args([
+                "-C",
+                source,
+                "rev-parse",
+                "--path-format=absolute",
+                "--git-common-dir",
+            ])
+            .output()
+            .map_err(|error| BridgeError::ConfigInvalid {
+                reason: format!("source authority probe failed: {error}"),
+            })?;
+        if !output.status.success() {
+            return Err(BridgeError::ConfigInvalid {
+                reason: "source authority probe did not identify a Git common directory"
+                    .to_string(),
+            });
+        }
+        let common_dir = std::str::from_utf8(&output.stdout)
+            .map_err(|_| BridgeError::ConfigInvalid {
+                reason: "source authority probe returned a non-UTF-8 common directory".to_string(),
+            })?
+            .trim();
+        if common_dir.is_empty() || !Path::new(common_dir).is_absolute() {
+            return Err(BridgeError::ConfigInvalid {
+                reason: "source authority probe returned no absolute common directory".to_string(),
+            });
+        }
+        capture_directory_identity(Path::new(common_dir), "source common directory")
+    }
+
     fn observe_exact_absence(
         &self,
         candidate: &ExactAbsenceCandidateV1,
     ) -> Result<ExactAbsenceObservationV1, BridgeError> {
-        candidate.revalidate_source()?;
+        candidate.revalidate_source(self)?;
         let target = Path::new(&candidate.worktree_path);
         if !target_absent_from_probe(target)? {
             return Ok(ExactAbsenceObservationV1::TargetPresent);
@@ -215,7 +255,7 @@ impl ExactAbsenceProbeV1 for HostGitWorktree {
         // The Git subprocess reads source/.git while the target can independently reappear.
         // Revalidate every observation before it becomes exact-absence evidence. These are
         // string-path brackets, not descriptor binding, so strict ABA safety remains unclaimed.
-        candidate.revalidate_source()?;
+        candidate.revalidate_source(self)?;
         if !target_absent_from_probe(target)? {
             return Ok(ExactAbsenceObservationV1::TargetPresent);
         }
@@ -442,12 +482,14 @@ mod tests {
     }
 
     fn exact_absence_candidate(source: &Path, target: &Path) -> ExactAbsenceCandidateV1 {
+        let probe = HostGitWorktree::new();
         ExactAbsenceCandidateV1::from_legacy(
             source.to_string_lossy(),
             std::fs::canonicalize(source.join(".git"))
                 .unwrap()
                 .to_string_lossy(),
             target.to_string_lossy(),
+            &probe,
         )
         .unwrap()
     }
