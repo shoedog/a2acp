@@ -63,12 +63,12 @@ The one legitimate existing assertion change is `exact_absence_sweep_reports_the
 
 ## OPERATOR EVIDENCE — PENDING
 
-- [ ] `cargo fmt --all -- --check` — PENDING OPERATOR
-- [ ] `CARGO_INCREMENTAL=0 cargo clippy --workspace --all-targets --locked -- -D warnings` — PENDING OPERATOR
-- [ ] `CARGO_INCREMENTAL=0 cargo test --workspace --locked --no-fail-fast` — PENDING OPERATOR
-- [ ] `CARGO_INCREMENTAL=0 cargo test -p bridge-worktree --locked --no-fail-fast` — PENDING OPERATOR
-- [ ] `cargo run -p a2a-bridge -- validate --repo-hygiene` (implementation point) — PENDING OPERATOR
-- [ ] `cargo run -p a2a-bridge -- validate --repo-hygiene` (handoff point) — PENDING OPERATOR
+- [x] `cargo fmt --all -- --check` — **exit 0** (operator, host, 2026-08-21)
+- [x] `CARGO_INCREMENTAL=0 cargo clippy --workspace --all-targets --locked -- -D warnings` — **exit 0**, zero warnings
+- [x] `CARGO_INCREMENTAL=0 cargo test --workspace --locked --no-fail-fast` — **exit 0**, zero failures
+- [x] `CARGO_INCREMENTAL=0 cargo test -p bridge-worktree --locked --no-fail-fast` — **exit 0**; lib **320 passed** / 0 failed
+- [x] `cargo run -p a2a-bridge -- validate --repo-hygiene` (implementation point) — **exit 0**
+- [x] `cargo run -p a2a-bridge -- validate --repo-hygiene` (handoff point) — **exit 0**
 
 ## OPERATOR PROBE — PENDING
 
@@ -120,3 +120,82 @@ The task-cited `docs/superpowers/plans/2026-08-21-t3a-inc2-task.md` and `docs/su
 | C3-2 handoff | 115 | 92 | 150 |
 | C3 subtotal | 175 | 151 | 245 |
 | Total | 630 | 824 | 915 |
+
+
+---
+
+## Operator evidence — filled 2026-08-21
+
+**Implementation commits:** `3f2e2cf1` (increment 2) then `1f2e8c11` (format + worksheet)
+**Base:** `bade9866278877923de0f247e95d7bd5d813b2b9`
+
+All gates green. `bridge-worktree` **320 passed** against the base control's 312 — +8,
+zero failures either side. `git diff --check` clean; no manifest or lockfile change.
+
+### The frozen control is behavioural red, verified independently
+
+Recorded SHA-256 `51c7f84b519b4613f5a20b9c59c7d95bbe7100665a0da138f18b69ad81c31f13`
+recomputed from the patch: **identical**. Applied to a detached worktree at the untouched
+base and run:
+
+```
+test sweep::tests::inc2_control_canonical_preserved_stops_before_the_probe ... FAILED
+test sweep::tests::inc2_control_sibling_symlink_alias_is_refused ... FAILED
+test result: FAILED. 0 passed; 2 failed
+```
+
+Both **compile and run**, then fail their assertions. This is genuine behavioural red, not
+a compile barrier — the correct evidence for a behaviour-changing increment, and distinct
+from A2b, whose control was a compile barrier and was labelled as such.
+
+### DISCLOSED CAP EXTENSION — the stop condition fired and was overridden
+
+The specification's trigger is "any C1 or C2 row exceeds its cap, or the C1+C2 subtotal
+exceeds 670." **It fired.** Re-measured against the formatted tree:
+
+| Row | Counted | Cap |
+|---|---:|---:|
+| C2-1 recording probe and real authority | **137** | 75 |
+| C2-2 sixteen-population table | **150** | 115 |
+| C2-7 invalid-pair test | **61** | 45 |
+| C2-8 amendment and mechanical reads | **33** | 25 |
+| C2 subtotal | **557** | 525 |
+| **C1 + C2** | **673** | **670** |
+
+**The owner accepted this as a disclosed extension rather than splitting.** The reasoning,
+recorded so it can be challenged: the artifact is gate-green with zero failures, both
+reviewers judged the production logic sound, C1 is comfortably inside cap (116/145), and
+every breach sits in **test infrastructure** — the `RecordingProbe` and real-claim-authority
+fixture, and the sixteen-population table. The caps under-estimated the evidence this
+increment demands; the implementation did not sprawl. Splitting a passing artifact to
+satisfy an estimate would have divided coherent work without improving it.
+
+This is an override of a stop condition, not a finding that the condition was wrong.
+
+### Operator error, recorded
+
+The round-3 review's cap-breach finding was **correct**, and the operator refuted it with a
+wrong measurement: `grep -cE '^\+[^+]'` already excludes blank added lines, so subtracting
+the 37 blanks again produced 605 instead of 642 and a false total of 636. The repair task
+was dispatched carrying that refutation and an explicit "do not split, do not delete or
+shorten any test" instruction.
+
+**The implementer caught it**, stated the arithmetic precisely, declined to act on the
+wrong instruction, and escalated under the falsification license instead of either
+complying or silently splitting. The corrected figure is 673. The instruction not to reduce
+tests happened to be right for a different reason than the one given.
+
+### Limits
+
+- Provisional `git diff --cached --check` on the staged handoff: **exit 0**, covering
+  provisional bytes. The final staged check is intentionally unrecorded, since recording
+  its result would alter the bytes it checked.
+- These results attest the tree at `1f2e8c11` only.
+- `EXACT_ABSENCE_POLICY_READY_V1` remains `false`. `has_authoritative_scan()` can be
+  `true` since slice B, so readiness stays the sole remaining production gate.
+- The `3f2e2cf1` commit message asserts the refuted 636-line figure. It is not rewritten —
+  amending a reviewed commit to fix a message would break the handoff's SHA claim. This
+  section is the correction of record.
+- Four inherited open items carry forward unrepaired: the `Assessed` overstatement on
+  construction failure (increment 3 retypes it), the Unix-only separator guard, the
+  non-latching entry-error loop, and fewer boot-time `git` subprocesses.
