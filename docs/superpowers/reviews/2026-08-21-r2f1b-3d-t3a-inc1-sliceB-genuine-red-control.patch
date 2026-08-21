@@ -1,0 +1,59 @@
+# Frozen test-only control for base 9ce2074ef2a4e7b7bb81b9561b79ba672f9db9db.
+# Apply with: git apply docs/superpowers/reviews/2026-08-21-r2f1b-3d-t3a-inc1-sliceB-genuine-red-control.patch
+# Run with: CARGO_INCREMENTAL=0 cargo test -p bridge-worktree --locked slice_b_control_ -- --nocapture
+
+diff --git a/crates/bridge-worktree/src/sweep/checked_scan.rs b/crates/bridge-worktree/src/sweep/checked_scan.rs
+index 5c9009e9..95a74951 100644
+--- a/crates/bridge-worktree/src/sweep/checked_scan.rs
++++ b/crates/bridge-worktree/src/sweep/checked_scan.rs
+@@ -464,6 +464,50 @@ mod tests {
+         legacy
+     }
+ 
++    #[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
++    #[test]
++    fn slice_b_control_production_scan_populates_all_three_root_captures() {
++        let root = temp_root("slice-b-control-root-captures");
++        std::fs::create_dir_all(&root).unwrap();
++        let (_, _, observations) = scan_compatibility_with_pin_opener(&root, FilesystemCompatibilityPinOpenerV1).unwrap().into_exact_parts();
++        assert!(observations.retained_enumeration_object.is_some());
++        std::fs::remove_dir_all(root).unwrap();
++    }
++    #[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
++    #[test]
++    fn slice_b_control_retained_capture_is_not_path_metadata() {
++        let root = temp_root("slice-b-control-retained-capture");
++        let replacement = root.with_file_name("slice-b-control-replacement");
++        let original = root.with_file_name("slice-b-control-original");
++        std::fs::create_dir_all(&root).unwrap();
++        std::fs::create_dir(&replacement).unwrap();
++        let source = CompatibilityCheckedScanSourceV1::new(FilesystemCompatibilityPinOpenerV1);
++        let session = source.open(&root).unwrap();
++        std::fs::rename(&root, &original).unwrap();
++        std::fs::rename(&replacement, &root).unwrap();
++        assert!(session.finish().retained_enumeration_object.is_some());
++        std::fs::remove_dir_all(root).unwrap();
++        std::fs::remove_dir_all(original).unwrap();
++    }
++    #[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
++    #[test]
++    fn slice_b_control_pin_failure_requires_a_pinned_success_observation() {
++        let root = temp_root("slice-b-control-pin-failure");
++        std::fs::create_dir_all(&root).unwrap();
++        let (_, _, observations) = scan_compatibility_with_pin_opener(&root, FilesystemCompatibilityPinOpenerV1).unwrap().into_exact_parts();
++        assert_eq!(super::super::classify_root_observations(observations), super::super::CustodyRootObservationV1::Pinned);
++        std::fs::remove_dir_all(root).unwrap();
++    }
++    #[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
++    #[test]
++    fn slice_b_control_f8_captures_are_present_for_homogeneity() {
++        let root = temp_root("slice-b-control-f8");
++        std::fs::create_dir_all(&root).unwrap();
++        let (_, _, observations) = scan_compatibility_with_pin_opener(&root, FilesystemCompatibilityPinOpenerV1).unwrap().into_exact_parts();
++        let _ = observations.retained_enumeration_object.unwrap();
++        std::fs::remove_dir_all(root).unwrap();
++    }
++
+     #[test]
+     fn compatibility_open_refusal_never_calls_pin_opener() {
+         let root = temp_root("missing");

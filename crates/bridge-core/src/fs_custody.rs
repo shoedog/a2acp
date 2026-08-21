@@ -2211,6 +2211,109 @@ fn errno_location() -> *mut libc::c_int {
         libc::__error()
     }
 }
+
+/// The identity observed from the retained directory descriptor that drives an enumeration.
+///
+/// The descriptor is intentionally distinct from any separately opened custody pin and from
+/// metadata resolved through the original path name.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RetainedObjectIdentityV1 {
+    pub dev: u64,
+    pub ino: u64,
+    pub birthtime: Option<BirthTimeV1>,
+}
+
+/// A lazy directory-name iterator backed by a duplicate of one retained descriptor.
+///
+/// On Linux and macOS, the retained descriptor remains available for `fstat` while its duplicate
+/// is owned by `fdopendir`. Other targets preserve `ReadDir` traversal behavior but cannot
+/// provide descriptor-owned identity evidence.
+pub struct RetainedDirectoryEnumerationV1 {
+    #[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
+    retained: File,
+    #[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
+    stream: DirectoryStreamV1,
+    #[cfg(not(all(unix, any(target_os = "linux", target_os = "macos"))))]
+    names: std::fs::ReadDir,
+}
+
+impl RetainedDirectoryEnumerationV1 {
+    #[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
+    pub fn open(path: &Path) -> Result<Self, std::io::Error> {
+        use std::os::fd::AsRawFd as _;
+        use std::os::unix::fs::OpenOptionsExt as _;
+
+        let retained = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NONBLOCK)
+            .open(path)?;
+        let fd = unsafe { libc::fcntl(retained.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
+        if fd == -1 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let stream = unsafe { libc::fdopendir(fd) };
+        if stream.is_null() {
+            let error = std::io::Error::last_os_error();
+            unsafe { libc::close(fd) };
+            return Err(error);
+        }
+        let stream = DirectoryStreamV1(stream);
+        unsafe { libc::rewinddir(stream.0) };
+        Ok(Self { retained, stream })
+    }
+
+    #[cfg(not(all(unix, any(target_os = "linux", target_os = "macos"))))]
+    pub fn open(path: &Path) -> Result<Self, std::io::Error> {
+        Ok(Self {
+            names: std::fs::read_dir(path)?,
+        })
+    }
+
+    #[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
+    #[must_use]
+    pub fn retained_object_identity(&self) -> Option<RetainedObjectIdentityV1> {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let metadata = self.retained.metadata().ok()?;
+        Some(RetainedObjectIdentityV1 {
+            dev: metadata.dev(),
+            ino: metadata.ino(),
+            birthtime: BirthTimeV1::from_metadata(&metadata),
+        })
+    }
+
+    #[cfg(not(all(unix, any(target_os = "linux", target_os = "macos"))))]
+    #[must_use]
+    pub fn retained_object_identity(&self) -> Option<RetainedObjectIdentityV1> {
+        None
+    }
+
+    #[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
+    pub fn next_name(&mut self) -> Option<Result<OsString, std::io::Error>> {
+        use std::os::unix::ffi::OsStringExt as _;
+
+        loop {
+            unsafe { *errno_location() = 0 };
+            let entry = unsafe { libc::readdir(self.stream.0) };
+            if entry.is_null() {
+                let errno = unsafe { *errno_location() };
+                return (errno != 0).then(|| Err(std::io::Error::from_raw_os_error(errno)));
+            }
+            let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) }.to_bytes();
+            if name != b"." && name != b".." {
+                return Some(Ok(OsString::from_vec(name.to_vec())));
+            }
+        }
+    }
+
+    #[cfg(not(all(unix, any(target_os = "linux", target_os = "macos"))))]
+    pub fn next_name(&mut self) -> Option<Result<OsString, std::io::Error>> {
+        self.names
+            .next()
+            .map(|entry| entry.map(|entry| entry.file_name()))
+    }
+}
+
 #[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
 pub(crate) fn enumerate_directory_names(
     directory: &File,
@@ -3178,6 +3281,141 @@ mod tests {
             BirthTimeV1::from_system_time(time),
             BirthTimeV1::new(-1, 999_999_999)
         );
+    }
+
+    #[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
+    #[test]
+    fn retained_enumeration_matches_read_dir_selection_and_order() {
+        use std::os::unix::ffi::OsStrExt as _;
+
+        let directory = tempfile::tempdir().unwrap();
+        for name in [
+            OsStr::new("beta"),
+            OsStr::new(".hidden"),
+            OsStr::new("alpha"),
+            OsStr::from_bytes(b"non-utf8-\xff"),
+        ] {
+            fs::write(directory.path().join(name), b"entry").unwrap();
+        }
+
+        let expected = fs::read_dir(directory.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        let mut retained = RetainedDirectoryEnumerationV1::open(directory.path()).unwrap();
+        let actual = std::iter::from_fn(|| retained.next_name())
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+
+        assert_eq!(actual, expected);
+    }
+
+    #[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
+    #[test]
+    fn retained_enumeration_identity_is_the_object_the_names_came_from() {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("root");
+        let replacement = directory.path().join("replacement");
+        let original = directory.path().join("original");
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("original-name"), b"original").unwrap();
+        fs::create_dir(&replacement).unwrap();
+        fs::write(replacement.join("replacement-name"), b"replacement").unwrap();
+        let original_metadata = fs::metadata(&root).unwrap();
+        let replacement_metadata = fs::metadata(&replacement).unwrap();
+        assert_ne!(
+            (original_metadata.dev(), original_metadata.ino()),
+            (replacement_metadata.dev(), replacement_metadata.ino()),
+            "fixture directories must be distinct before either name is replaced"
+        );
+
+        let mut retained = RetainedDirectoryEnumerationV1::open(&root).unwrap();
+        fs::rename(&root, &original).unwrap();
+        fs::rename(&replacement, &root).unwrap();
+
+        let identity = retained.retained_object_identity().unwrap();
+        assert_eq!(identity.dev, original_metadata.dev());
+        assert_eq!(identity.ino, original_metadata.ino());
+        assert_eq!(
+            identity.birthtime,
+            BirthTimeV1::from_metadata(&original_metadata)
+        );
+        let names = std::iter::from_fn(|| retained.next_name())
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(names, vec![OsString::from("original-name")]);
+
+        let named_metadata = fs::metadata(&root).unwrap();
+        assert_eq!(named_metadata.dev(), replacement_metadata.dev());
+        assert_eq!(named_metadata.ino(), replacement_metadata.ino());
+        assert_ne!(
+            (identity.dev, identity.ino),
+            (named_metadata.dev(), named_metadata.ino()),
+            "retained identity must not be re-resolved through the replaced path"
+        );
+    }
+
+    #[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
+    #[test]
+    fn retained_enumeration_has_no_child_cap() {
+        let directory = tempfile::tempdir().unwrap();
+        for index in 0..4097 {
+            fs::write(directory.path().join(format!("entry-{index:04}")), b"entry").unwrap();
+        }
+
+        let mut retained = RetainedDirectoryEnumerationV1::open(directory.path()).unwrap();
+        let names = std::iter::from_fn(|| retained.next_name())
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+
+        assert_eq!(names.len(), 4097);
+    }
+
+    #[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
+    #[test]
+    fn retained_enumeration_follows_a_symlinked_root_like_read_dir() {
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory.path().join("target");
+        let link = directory.path().join("link");
+        fs::create_dir(&target).unwrap();
+        fs::write(target.join("entry"), b"entry").unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let expected = fs::read_dir(&link)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        let mut retained = RetainedDirectoryEnumerationV1::open(&link).unwrap();
+        let actual = std::iter::from_fn(|| retained.next_name())
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+
+        assert_eq!(actual, expected);
+    }
+
+    #[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
+    #[test]
+    fn retained_enumeration_refuses_a_non_directory_without_blocking() {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt as _;
+
+        let directory = tempfile::tempdir().unwrap();
+        let regular = directory.path().join("regular");
+        fs::write(&regular, b"regular").unwrap();
+        assert!(RetainedDirectoryEnumerationV1::open(&regular).is_err());
+
+        let fifo = directory.path().join("fifo");
+        let fifo_path = CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo_path.as_ptr(), 0o600) }, 0);
+        let (sent, received) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = sent.send(RetainedDirectoryEnumerationV1::open(&fifo).is_err());
+        });
+        assert!(received
+            .recv_timeout(Duration::from_secs(10))
+            .expect("a FIFO root must refuse promptly rather than block"));
     }
 
     #[test]

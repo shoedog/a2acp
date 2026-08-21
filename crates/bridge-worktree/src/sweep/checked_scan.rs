@@ -1,7 +1,7 @@
 use std::ffi::{OsStr, OsString};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-use bridge_core::fs_custody::{BirthTimeV1, PinnedDirectoryV1};
+use bridge_core::fs_custody::{BirthTimeV1, PinnedDirectoryV1, RetainedDirectoryEnumerationV1};
 
 use crate::custody::{
     is_custody_record_name, read_custody_record_in, CustodyReadRefusalV1, WorktreeCustodyRecordV1,
@@ -71,7 +71,8 @@ impl<P: CompatibilityPinOpenerV1> CompatibilityCheckedScanSourceV1<P> {
 }
 
 struct CompatibilityCheckedScanRootSessionV1 {
-    names: std::fs::ReadDir,
+    names: RetainedDirectoryEnumerationV1,
+    enumeration_root: PathBuf,
     custody_root: Option<PinnedDirectoryV1>,
 }
 
@@ -129,11 +130,12 @@ impl<P: CompatibilityPinOpenerV1> CheckedScanSourceV1 for CompatibilityCheckedSc
         &self,
         enumeration_root: &Path,
     ) -> Result<Box<dyn CheckedScanRootSessionV1>, CheckedScanOpenRefusalV1> {
-        let names = std::fs::read_dir(enumeration_root)
+        let names = RetainedDirectoryEnumerationV1::open(enumeration_root)
             .map_err(|_| CheckedScanOpenRefusalV1::CannotEnumerate)?;
         let custody_root = self.pin_opener.open_pin(enumeration_root);
         Ok(Box::new(CompatibilityCheckedScanRootSessionV1 {
             names,
+            enumeration_root: enumeration_root.to_path_buf(),
             custody_root,
         }))
     }
@@ -141,11 +143,9 @@ impl<P: CompatibilityPinOpenerV1> CheckedScanSourceV1 for CompatibilityCheckedSc
 
 impl CheckedScanRootSessionV1 for CompatibilityCheckedScanRootSessionV1 {
     fn next_name(&mut self) -> Option<Result<OsString, CheckedScanEntryRefusalV1>> {
-        self.names.next().map(|entry| {
-            entry
-                .map(|entry| entry.file_name())
-                .map_err(|_| CheckedScanEntryRefusalV1::CannotReadEntry)
-        })
+        self.names
+            .next_name()
+            .map(|entry| entry.map_err(|_| CheckedScanEntryRefusalV1::CannotReadEntry))
     }
 
     fn read_legacy(
@@ -169,7 +169,43 @@ impl CheckedScanRootSessionV1 for CompatibilityCheckedScanRootSessionV1 {
     }
 
     fn finish(self: Box<Self>) -> RootObservationSetV1 {
-        RootObservationSetV1::default()
+        let retained_enumeration_object =
+            self.names
+                .retained_object_identity()
+                .map(|identity| RootIdentityCaptureV1 {
+                    dev: Some(identity.dev),
+                    ino: Some(identity.ino),
+                    birthtime: identity.birthtime,
+                });
+        let pinned_custody_directory = self.custody_root.as_ref().map(|root| {
+            let identity = root.identity();
+            RootIdentityCaptureV1 {
+                dev: identity.dev,
+                ino: identity.ino,
+                birthtime: identity.btime,
+            }
+        });
+        #[cfg(unix)]
+        let final_named_root = std::fs::metadata(&self.enumeration_root)
+            .ok()
+            .map(|metadata| {
+                use std::os::unix::fs::MetadataExt as _;
+                RootIdentityCaptureV1 {
+                    dev: Some(metadata.dev()),
+                    ino: Some(metadata.ino()),
+                    birthtime: BirthTimeV1::from_metadata(&metadata),
+                }
+            });
+        #[cfg(not(unix))]
+        let final_named_root = {
+            let _ = std::fs::metadata(&self.enumeration_root);
+            None
+        };
+        RootObservationSetV1 {
+            retained_enumeration_object,
+            pinned_custody_directory,
+            final_named_root,
+        }
     }
 }
 
@@ -253,8 +289,8 @@ mod tests {
     };
     use crate::provider_path::{read_sidecar, sidecar_path, write_sidecar};
     use crate::sweep::{
-        ExactAbsenceEnumerationV1, ExactAbsenceObservationV1, ExactAbsenceProbeV1,
-        ExactAbsenceRootRefusalV1, UnusedCandidateDecisionV1,
+        CustodyRootObservationV1, ExactAbsenceEnumerationV1, ExactAbsenceObservationV1,
+        ExactAbsenceProbeV1, ExactAbsenceRootRefusalV1, UnusedCandidateDecisionV1,
     };
     use bridge_core::error::BridgeError;
     use bridge_core::execution_policy::{PolicyNodeRefV1, Sha256HexV1, WorktreeObjectIdentityV1};
@@ -462,6 +498,169 @@ mod tests {
         write_sidecar(&legacy).unwrap();
         std::fs::write(root.join("bad.custody.v1.json"), b"ignored").unwrap();
         legacy
+    }
+
+    #[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
+    #[test]
+    fn production_scan_populates_all_three_root_captures() {
+        let root = temp_root("production-root-captures");
+        std::fs::create_dir_all(&root).unwrap();
+
+        let (_, _, observations) =
+            scan_compatibility_with_pin_opener(&root, FilesystemCompatibilityPinOpenerV1)
+                .unwrap()
+                .into_exact_parts();
+
+        for capture in [
+            observations.retained_enumeration_object,
+            observations.pinned_custody_directory,
+            observations.final_named_root,
+        ] {
+            let capture = capture.expect("a healthy Unix root must produce every capture");
+            assert!(capture.dev.is_some());
+            assert!(capture.ino.is_some());
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
+    #[test]
+    fn retained_capture_is_not_the_pin_and_not_path_metadata() {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let root = temp_root("retained-root-capture");
+        let replacement = root.with_file_name("retained-root-capture-replacement");
+        let original = root.with_file_name("retained-root-capture-original");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("original-name"), b"original").unwrap();
+        std::fs::create_dir(&replacement).unwrap();
+        std::fs::write(replacement.join("replacement-name"), b"replacement").unwrap();
+        let original_metadata = std::fs::metadata(&root).unwrap();
+        let replacement_metadata = std::fs::metadata(&replacement).unwrap();
+        assert_ne!(
+            (original_metadata.dev(), original_metadata.ino()),
+            (replacement_metadata.dev(), replacement_metadata.ino()),
+            "fixture directories must have distinct identities before the replacement"
+        );
+
+        let source = CompatibilityCheckedScanSourceV1::new(FilesystemCompatibilityPinOpenerV1);
+        let session = source.open(&root).unwrap();
+        std::fs::rename(&root, &original).unwrap();
+        std::fs::rename(&replacement, &root).unwrap();
+        let observations = session.finish();
+
+        let retained = observations.retained_enumeration_object.unwrap();
+        let pinned = observations.pinned_custody_directory.unwrap();
+        let final_named = observations.final_named_root.unwrap();
+        assert_eq!(retained.dev, Some(original_metadata.dev()));
+        assert_eq!(retained.ino, Some(original_metadata.ino()));
+        assert_eq!(pinned.dev, Some(original_metadata.dev()));
+        assert_eq!(pinned.ino, Some(original_metadata.ino()));
+        assert_eq!(final_named.dev, Some(replacement_metadata.dev()));
+        assert_eq!(final_named.ino, Some(replacement_metadata.ino()));
+        assert_eq!(
+            super::super::classify_root_observations(observations),
+            CustodyRootObservationV1::IdentityChanged
+        );
+
+        std::fs::remove_dir_all(root).unwrap();
+        std::fs::remove_dir_all(original).unwrap();
+    }
+
+    #[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
+    #[test]
+    fn pin_failure_leaves_the_root_observation_unavailable() {
+        let root = temp_root("unavailable-root-capture");
+        let source = root.join("source");
+        let worktree = root.join("legacy");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::create_dir_all(&worktree).unwrap();
+        assert!(std::process::Command::new("git")
+            .args(["-C", source.to_str().unwrap(), "init", "-q"])
+            .status()
+            .unwrap()
+            .success());
+        let legacy = sidecar(&source, &worktree);
+        write_sidecar(&legacy).unwrap();
+        let canonical = crate::provider_path::canonicalize_lenient(root.to_str().unwrap()).unwrap();
+
+        let success = super::super::project_exact_scan_result(
+            canonical.clone(),
+            scan_compatibility_with_pin_opener(&root, FilesystemCompatibilityPinOpenerV1),
+            &probe(
+                Some(ExactAbsenceObservationV1::BothAbsent),
+                Arc::new(Mutex::new(Vec::new())),
+            ),
+        );
+        let failure = super::super::project_exact_scan_result(
+            canonical,
+            scan_compatibility_with_pin_opener(&root, Pin(Arc::new(AtomicUsize::new(0)))),
+            &probe(
+                Some(ExactAbsenceObservationV1::BothAbsent),
+                Arc::new(Mutex::new(Vec::new())),
+            ),
+        );
+        let (_, _, successful_observations, successful_rows) = success.into_exact_parts().unwrap();
+        let (_, _, failed_observations, failed_rows) = failure.into_exact_parts().unwrap();
+
+        assert_eq!(
+            super::super::classify_root_observations(successful_observations),
+            CustodyRootObservationV1::Pinned
+        );
+        assert_eq!(
+            super::super::classify_root_observations(failed_observations),
+            CustodyRootObservationV1::Unavailable
+        );
+        assert!(failed_observations.retained_enumeration_object.is_some());
+        assert!(failed_observations.pinned_custody_directory.is_none());
+        assert!(failed_observations.final_named_root.is_some());
+        assert_eq!(
+            successful_rows
+                .iter()
+                .map(|row| (row.checked.parts().0, row.checked.parts().1, row.decision))
+                .collect::<Vec<_>>(),
+            failed_rows
+                .iter()
+                .map(|row| (row.checked.parts().0, row.checked.parts().1, row.decision))
+                .collect::<Vec<_>>()
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
+    #[test]
+    fn root_capture_birthtime_capability_is_homogeneous_across_the_three_captures() {
+        let root = temp_root("birthtime-capability");
+        std::fs::create_dir_all(&root).unwrap();
+
+        let (_, _, observations) =
+            scan_compatibility_with_pin_opener(&root, FilesystemCompatibilityPinOpenerV1)
+                .unwrap()
+                .into_exact_parts();
+        let retained = observations.retained_enumeration_object.unwrap();
+        let pinned = observations.pinned_custody_directory.unwrap();
+        let final_named = observations.final_named_root.unwrap();
+        let result = super::super::classify_root_observations(observations);
+        let availability = |capture: RootIdentityCaptureV1| {
+            if capture.birthtime.is_some() {
+                "some"
+            } else {
+                "none"
+            }
+        };
+        eprintln!(
+            "SLICE-B-F8 fixture_dev={} fixture_ino={} retained_birthtime={} pinned_birthtime={} final_named_birthtime={} result={result:?}",
+            retained.dev.unwrap(),
+            retained.ino.unwrap(),
+            availability(retained),
+            availability(pinned),
+            availability(final_named),
+        );
+        assert_eq!(retained.birthtime.is_some(), pinned.birthtime.is_some());
+        assert_eq!(pinned.birthtime.is_some(), final_named.birthtime.is_some());
+        assert_eq!(result, CustodyRootObservationV1::Pinned);
+
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

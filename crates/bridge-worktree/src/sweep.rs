@@ -1489,8 +1489,9 @@ mod tests {
         ));
         assert_eq!(
             report.scan().custody_root(),
-            super::CustodyRootObservationV1::Unavailable
+            super::CustodyRootObservationV1::Pinned
         );
+        assert!(report.has_authoritative_scan());
         assert_eq!(report.entries().len(), 3);
         assert_eq!(report.effective().count(), 0);
 
