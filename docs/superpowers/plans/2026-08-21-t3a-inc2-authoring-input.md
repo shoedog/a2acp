@@ -27,8 +27,16 @@ ScannedWorktreeRecordV1::Custody(record) => {
 }
 ```
 
-Every custody record becomes `Assessed(decision)`. Increment 2 interposes the
-admission table before that, so most records never become an assessment at all.
+Every custody record becomes `Assessed(decision)`. Increment 2 must interpose
+admission before the **probe** — which is **not** here.
+`report_exact_scan_projection_row` runs inside `into_report`, strictly after
+`project_exact_scan_result` has already called the probe for every row, so
+admission installed at this construction site is a post-hoc filter that cannot
+suppress a single probe call. The sole custody path to the probe is
+`decide_unused_custody_record` → `decide_unused_candidate`; admission belongs there.
+`[CORRECTED 2026-08-21 — the original pointed at this construction site. Both
+authors traced the call path and refuted it; verified on main. The error would have
+produced a cosmetic gate passing any decision-only test.]`
 
 ### The 16 populations
 
@@ -61,8 +69,12 @@ construction.
 
 Populate the guard arms of `CannotConstructSubjectV1` that production does not
 yet build: `RecordedWorktreePathNotAbsolute`, `OutsideSweepRoot`, and
-`RecordFileNotExpectedSibling`. `ClaimAuthorityUnavailable` already has
-production construction — check what exists before adding.
+`RecordFileNotExpectedSibling`. `ClaimAuthorityUnavailable` is **also dormant**: its only two
+`ClaimAuthorityUnavailableV1::new` call sites are tests, so all four arms are
+unbuilt in production. It stays dormant here — retyping the string-valued
+claim-construction errors is increment 3's named work.
+`[CORRECTED 2026-08-21 — the original said it already had production construction.
+Both authors refuted it; verified on main.]`
 
 Typed guard **precedence** matters and must be stated once, unambiguously: when a
 record could fail more than one guard, the spec must fix which one it reports, so
