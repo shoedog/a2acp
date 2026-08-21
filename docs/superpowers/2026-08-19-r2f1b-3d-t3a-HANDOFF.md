@@ -1,7 +1,7 @@
 # Handoff — R2f1b 3d T3a: A1 landed, A2 next; bridge observability repaired mid-lane
 
 **Written:** 2026-08-19 · **By:** session_012SUgPvVNbwpuGQKxWtxLgr (Claude Opus 5, 1M) · **Provider:** claude
-**Workspace:** a2a-bridge · agent/r2f1b-pre-slice2-custody-plan · **Measured state:** `[MEASURED]` HEAD `see §6` · Tree CLEAN · Probe `git status --porcelain && git rev-parse HEAD` · Output inline this turn
+**Workspace:** a2a-bridge · agent/r2f1b-pre-slice2-custody-plan · **Measured state:** `[MEASURED]` main `9ce2074e` · T3a increment 1 COMPLETE · Tree CLEAN · Probe `git status --porcelain && git rev-parse HEAD` · Output inline this turn
 **Predecessor:** the 2026-08-17 3d handoff (`docs/superpowers/2026-08-17-r2f1b-3d-HANDOFF.md`), superseded for everything below
 **Truth ordering:** measured live state > explicit owner/contract authority within its scope > this handoff for current operational state > earlier handoffs and non-authoritative summaries. A conflict between tiers stays OPEN in §0 — never resolved by document class alone.
 **Provenance:** written live by the worker. `[MEASURED]` claims were probed by this writer; `[INHERITED]` claims were not.
@@ -18,10 +18,11 @@
 
 ## 1. Resume order
 
-1. **A2a-2 is the next work.** A2a-1 is COMPLETE and pushed as `a2a/a2a1-complete` (`c0ac87ce`): production refactor + 3 test fixes + 5 correctness tests + operator-filled handoff, all four gates green on host with a same-environment control. A2a-2 owns the TEN deferred characterization scenarios, listed in the A2a-1 task under "Deferred to A2a-2". Size it from the MEASURED ~28 nonblank lines per test, not an estimate.
-2. A2a-1 is not yet merged to `main` — open a PR from `a2a/a2a1-complete` when ready. A2b is specced only after the whole of A2a is accepted.
-3. The config swap window (worktrees + container writer) is independent and can happen any time — see §4 #2.
-4. The flake fix (§4 #3) is independent and increasingly worth doing.
+1. **T3a increment 1 is DONE.** The next substantive work is increment 2 or slice B per the 3d brief; neither is specced. The open items below are independent and none of them blocks that.
+2. **Open: the index-emptying mystery.** `[MEASURED]` PR #64 made a failed implement commit legible and non-destructive but did NOT diagnose what empties the index between `stage_state` and `host_commit`. `decide()` maps `DirtyUnstaged` to a friendly message and that path did not fire. Two candidates are named in `reviews/2026-08-20-implement-commit-failed-nothing-staged.md`; neither is proven.
+3. **Open: the Unix-only separator guard.** `is_custody_record_name` guards the empty-basename case by testing only the forward slash, so a backslash-spelled path diverges from the Unix spelling. Characterized by A2a-2 and deliberately unrepaired; it needs its own slice.
+4. **Open: the `force_next_release_failure_for` flake.** It has not fired across four consecutive PRs (#62-#65). Still unfixed; possibly worth closing as dormant rather than spending a slice.
+5. The operator config swap window (worktrees + container writer) remains staged and unapplied — see §4.
 
 **STOP conditions:** a spec that fails two counted review rounds → park and escalate, do not fold a third time by hand (§5). An implement run that returns "made no changes" → read the agent's message, which is now printed; do not theorise. Any instruction naming a path outside the repo in a container-bound spec → unsatisfiable, fix the spec.
 
@@ -29,7 +30,7 @@
 
 | Item | State | Evidence |
 |---|---|---|
-| main | `c637e493` | `[MEASURED]` |
+| main | `9ce2074e` (A2b, PR #65) | `[MEASURED]` |
 | path-identity primitive | **LANDED** | PR #57 → `9aedf175`; 8 defects closed, closure APPROVE 0W/0S |
 | CI uninstrumented control | **LANDED** | PR #56 → `1f14342a` |
 | h2 RUSTSEC-2026-0258 | **LANDED** | PR #58 → `c14813b7` |
@@ -38,7 +39,7 @@
 | agent reply surfacing | **LANDED** | PR #61 → `c637e493`; host gate 4,169/0/13 |
 | operator serve | **SWAPPED, RUNNING** | PID 23161, release `ee3b5966ad3b35ef`, binary-only swap, all 5 post-swap checks passed |
 | operator config candidate | **STAGED, NOT APPLIED** | `operator/a2a-bridge.candidate.toml`, SHA `67f3bf01…`; validate pass, doctor 31 ok/1 warn/0 fail |
-| T3a inc1 slice **A2** | **A2a COMPLETE (A2a-1 #62 + A2a-2 #63, both merged)** | A2b is next: it flips the public return type and cashes the report |
+| T3a increment 1 | **COMPLETE** | A1 #60 -> A2a-1 #62 -> A2a-2 #63 -> A2b #65. `sweep_orphans_with_exact_absence` returns the report; all four A1 `dead_code` allowances consumed; readiness still `false` |
 
 ## 3. Corrections to standing documents and memory
 
@@ -82,7 +83,7 @@
 
 | Item | Verbatim |
 |---|---|
-| main | `8d271d21` (A2a-2, PR #63) |
+| main | `9ce2074ec4e0cf8bfb4dbe11a15bb0b18b19b0dd` (A2b, PR #65) |
 | A2 spec v1 | `4234517d` · `docs/superpowers/plans/2026-08-19-r2f1b-3d-t3a-inc1-sliceA2-task.md` |
 | A2 operator findings | `904c89fb` · `docs/superpowers/reviews/2026-08-19-a2-spec-operator-findings.md` |
 | fold worktree | `.claude/worktrees/fold`, branch `main`, at `c637e493` |
