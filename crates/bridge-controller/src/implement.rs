@@ -376,7 +376,22 @@ fn git_ok(cwd: Option<&Path>, argv: &[&str]) -> Result<String, String> {
 /// Classify the working tree via `git status --porcelain` (detects UNTRACKED files, unlike
 /// `git diff --quiet`). Staged = any line whose index column (X) is not ' ' and not '?'.
 pub fn stage_state(clone: &Path) -> Result<StageState, String> {
-    let text = git_ok(Some(clone), &["status", "--porcelain"])?;
+    // Read the porcelain output RAW. `git_ok` trims, and porcelain's first column is the index
+    // status — for a tracked-but-unstaged edit that column is a SPACE (` M path`). Trimming
+    // deletes it, shifting the worktree column into byte 0, so ` M` was read as `M` and the tree
+    // was misclassified `Staged`. `decide` then chose `Commit` against an empty index and the
+    // commit failed with its explanation on stdout. That is the whole of the twice-seen
+    // "index emptied between the check and the commit" behaviour: nothing emptied it, and the
+    // check simply misread. Untracked-only trees were unaffected because `?` is not whitespace.
+    let out = run_git(Some(clone), &["status", "--porcelain"])
+        .map_err(|e| format!("git status --porcelain: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "git status --porcelain failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    let text = String::from_utf8_lossy(&out.stdout).into_owned();
     let mut any = false;
     let mut staged = false;
     for line in text.lines() {
@@ -654,6 +669,56 @@ mod tests {
         // identity-free: no user.name / user.email here
         assert!(!joined.contains("user.name"));
         assert!(!joined.contains("user.email"));
+    }
+
+    // ── stage re-check before commit (regression: a commit attempted against an empty index) ──
+
+    /// The shape seen twice in R2f1b 3d: the working tree is dirty and the index is empty,
+    /// because the agent owns staging and did not stage. `decide` must route this to
+    /// `NoCommitDirty`, never to `Commit` — a commit here cannot succeed, and its failure
+    /// reads as a bridge fault rather than the agent's choice.
+    #[test]
+    fn dirty_unstaged_tree_decides_no_commit_not_commit() {
+        let msg = ("subject".to_string(), CommitSource::Derived);
+        assert!(matches!(
+            decide(true, Ok(()), StageState::DirtyUnstaged, msg.clone()),
+            Action::NoCommitDirty
+        ));
+        assert!(matches!(
+            decide(true, Ok(()), StageState::Staged, msg),
+            Action::Commit(_)
+        ));
+    }
+
+    /// `stage_state` must classify a tracked-but-unstaged edit as `DirtyUnstaged`, so the
+    /// re-check before `host_commit` can fall through. A misclassification here would let an
+    /// impossible commit be attempted.
+    #[test]
+    fn stage_state_reports_dirty_unstaged_for_an_unstaged_edit() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path();
+        for argv in [
+            vec!["init", "-q"],
+            vec!["config", "user.name", "t"],
+            vec!["config", "user.email", "t@t"],
+        ] {
+            run_git(Some(p), &argv).unwrap();
+        }
+        std::fs::write(p.join("A.md"), "one").unwrap();
+        run_git(Some(p), &["add", "A.md"]).unwrap();
+        run_git(
+            Some(p),
+            &["-c", "commit.gpgsign=false", "commit", "-q", "-m", "base"],
+        )
+        .unwrap();
+
+        // edit without staging — exactly the failing shape
+        std::fs::write(p.join("A.md"), "two").unwrap();
+        assert!(matches!(stage_state(p).unwrap(), StageState::DirtyUnstaged));
+
+        // and once staged, it flips
+        run_git(Some(p), &["add", "A.md"]).unwrap();
+        assert!(matches!(stage_state(p).unwrap(), StageState::Staged));
     }
 
     // ── commit failure detail (regression: "git commit failed: " with the cause dropped) ──
