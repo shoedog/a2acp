@@ -44,8 +44,11 @@ already works and is tested:
   `retained_enumeration_object`, `pinned_custody_directory`, `final_named_root`.
 - `RootIdentityCaptureV1` carries `dev`, `ino`, `birthtime`, each `Option`.
 - `classify_root_observations` in `crates/bridge-worktree/src/sweep.rs` requires
-  **three complete `(dev, ino, birthtime)` tuples**; any absent capture or
-  incomplete tuple yields `Unavailable`, and `Unavailable` outranks a mismatch.
+  three present captures each carrying **`dev` and `ino`** — `root_capture_has_object_identity`
+  is `capture.dev.is_some() && capture.ino.is_some()`. **Birthtime is NOT required**;
+  it participates only through whole-value equality of `RootIdentityCaptureV1`.
+  `[CORRECTED 2026-08-21 — the original text claimed three complete (dev, ino, birthtime)
+  tuples. Both authors refuted it and the operator verified the refutation on main.]`
   It deliberately does **not** use `DirectoryIdentityV1::matches`, whose
   absent-birthtime wildcard would weaken the proof. A2b already landed
   `root_observation_classifier_*` tests covering pinned, identity-changed, and
@@ -70,7 +73,19 @@ object it enumerates, and the custody pin is a different descriptor.
 
 ### What the implementer must build
 
-A bridge-core retained-directory enumerator that:
+A bridge-core retained-directory enumerator. **Note that most of the mechanism
+already exists**: `crates/bridge-core/src/fs_custody.rs` carries `DirectoryStreamV1`,
+`errno_location`, and `enumerate_directory_names`, which already does
+`F_DUPFD_CLOEXEC` -> `fdopendir` -> `rewinddir`; `libc` is already a `bridge-core`
+dependency and is NOT a `bridge-worktree` one, so no lockfile change is needed.
+`enumerate_directory_names` cannot be reused as-is — it is eager, child-capped,
+name-filtered, and aborts the whole enumeration on a `readdir` error where `ReadDir`
+surfaces per-entry errors the engine counts. A streaming sibling reusing
+`DirectoryStreamV1` and `errno_location` is the shape.
+`[CORRECTED 2026-08-21 — the original text implied this had to be built from nothing.
+Caught by the Opus author only; verified on main.]`
+
+The enumerator must:
 
 - opens and retains one directory descriptor, independently of the custody pin
   opener;
@@ -96,8 +111,13 @@ not always obtainable, and `Pinned` is not always reachable — by design.
 Two consequences the spec must address:
 
 1. Declare the supported filesystem-capability boundary. On a birthtime-less
-   filesystem the correct result is `Unavailable`, and that is a **supported
-   outcome**, not a failure.
+   filesystem, uniform absence with equal `dev`/`ino` classifies as **`Pinned`** —
+   `root_observation_classifier_reports_pinned_captures` asserts exactly that with
+   `root_capture(Some(1), Some(2), None)`. The hazard is **mixed** birthtime
+   availability across the three captures, which manufactures a false
+   `IdentityChanged`.
+   `[CORRECTED 2026-08-21 — the original text claimed absent birthtime yields
+   Unavailable. Refuted by both authors and verified on main.]`
 2. A capability test that passes for either `Some` or `None` proves nothing if
    the observed branch is invisible in captured output. Require a targeted
    `--nocapture` probe or a machine-readable artifact recording the fixture
