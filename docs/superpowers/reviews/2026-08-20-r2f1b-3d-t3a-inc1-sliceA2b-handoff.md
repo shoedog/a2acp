@@ -80,12 +80,12 @@ The classifier tests are not characterization: their capture data types pre-date
 
 ## OPERATOR EVIDENCE — PENDING
 
-- [ ] `cargo fmt --all -- --check` — PENDING OPERATOR
-- [ ] `CARGO_INCREMENTAL=0 cargo clippy --workspace --all-targets --locked -- -D warnings` — PENDING OPERATOR
-- [ ] `CARGO_INCREMENTAL=0 cargo test --workspace --locked --no-fail-fast` — PENDING OPERATOR
-- [ ] `CARGO_INCREMENTAL=0 cargo test -p bridge-worktree --locked --no-fail-fast` — PENDING OPERATOR
-- [ ] `cargo run -p a2a-bridge -- validate --repo-hygiene` (implementation point) — PENDING OPERATOR
-- [ ] `cargo run -p a2a-bridge -- validate --repo-hygiene` (handoff point) — PENDING OPERATOR
+- [x] `cargo fmt --all -- --check` — **exit 0** (operator, host, 2026-08-20)
+- [x] `CARGO_INCREMENTAL=0 cargo clippy --workspace --all-targets --locked -- -D warnings` — **exit 0**, zero warnings (operator, host, 2026-08-20)
+- [x] `CARGO_INCREMENTAL=0 cargo test --workspace --locked --no-fail-fast` — **exit 0**, 0 failures across **75 test binaries + 16 doc-test suites** (operator, host, 2026-08-20)
+- [x] `CARGO_INCREMENTAL=0 cargo test -p bridge-worktree --locked --no-fail-fast` — **exit 0**; lib **308 passed** / 0 failed, plus 12 / 5 / 2 / 0 (operator, host, 2026-08-20)
+- [x] `cargo run -p a2a-bridge -- validate --repo-hygiene` (implementation point) — **exit 0**; 40 tracked artifacts, 8 validated example configs (operator, host, 2026-08-20)
+- [x] `cargo run -p a2a-bridge -- validate --repo-hygiene` (handoff point) — **exit 0** (operator, host, 2026-08-20)
 
 ## Counted-line worksheet
 
@@ -110,3 +110,62 @@ These are the current candidate’s nonblank physical additions measured against
 | Targeted retry total | 74 | 150 |
 
 All operator gates above remain pending; the host operator must remeasure if a later gate changes them.
+
+
+---
+
+## Operator evidence — filled 2026-08-20
+
+Run by the host operator outside the implement container, whose egress cannot
+fetch the pinned `a2a-lf` dependency.
+
+**Implementation-candidate commit:** `078a05a0` (fix) on `80b76dff` (feature)
+**Base:** `a8b13fe685c9e261106498b9d3237da7d295a6ca`
+
+Toolchain: `rustc 1.94.0 (4a4ef493e 2026-03-02)`, `cargo 1.94.0`,
+`rustfmt 1.8.0-stable`, `clippy 0.1.94`.
+
+- `git diff --check a8b13fe6..HEAD` — exit 0, no whitespace defects.
+- `git diff --stat a8b13fe6..HEAD -- Cargo.toml Cargo.lock crates/bridge-worktree/Cargo.toml`
+  — empty. No dependency or manifest change.
+
+**Attribution control.** `bridge-worktree` on base `a8b13fe6`, same host and
+toolchain, gives 302 passed. This candidate gives **308** — +6, zero failures
+either side.
+
+### The genuine-red control was independently reproduced
+
+The operator did not take the control on trust:
+
+- Recorded SHA-256 in the handoff:
+  `9c9a7409db7d29d5cc54efaac5e2d7ddcf8adfbe6ef7736a9c0a15869fddad76`.
+- Recomputed from the patch file: **identical**.
+- Applied the frozen patch to a detached worktree at the untouched base
+  `a8b13fe6` and ran `cargo test -p bridge-worktree --locked`: **exit 101**, with
+  16 compiler errors including `no method named 'requested_root' found for unit
+  type '()'`, `no method named 'canonical_root' found for unit type '()'`, and
+  `'()' is not an iterator`.
+
+That is a **compiler barrier**, not a runtime failure, and the handoff labels it
+as such rather than reporting it as a runtime observation. The barrier is the
+correct evidence for a return-type change: these assertions could not have been
+written, let alone passed, before this slice.
+
+### Limits of this evidence
+
+- These results attest the tree at `078a05a0` only. The handoff-only evidence
+  commit carrying this section changes documentation, not behavior.
+- This handoff does not name its own commit SHA, which cannot exist before the
+  commit does.
+- Provisional `git diff --cached --check` on the staged handoff: **exit 0**.
+  That checked provisional bytes — those present before this line was written.
+- The final staged `git diff --cached --check` is intentionally unrecorded:
+  recording its result would alter the bytes it checked. A provisional check was
+  run and recorded; nothing here implies the provisional result self-verifies the
+  committed bytes.
+- `EXACT_ABSENCE_POLICY_READY_V1` remains `false` and production root
+  observations remain `Unavailable`. The report carries ordered historical
+  evidence, not authority: a later actor must re-open, re-read, re-bind, and
+  re-prove exact absence under its own lock.
+- The Unix-only separator divergence in `is_custody_record_name` is carried
+  forward unrepaired, as characterized by A2a-2.
