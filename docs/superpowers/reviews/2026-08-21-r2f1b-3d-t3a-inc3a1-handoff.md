@@ -51,3 +51,50 @@ The post-format total is 105 nonblank added Rust lines, within the 220-line hard
 - [ ] PENDING OPERATOR — `CARGO_INCREMENTAL=0 cargo test -p bridge-worktree --locked --no-fail-fast`
 - [ ] PENDING OPERATOR — `cargo run -p a2a-bridge -- validate --repo-hygiene` (implementation point)
 - [ ] PENDING OPERATOR — `cargo run -p a2a-bridge -- validate --repo-hygiene` (handoff point)
+
+
+---
+
+## Operator evidence — filled 2026-08-21
+
+**Implementation commit:** `228e15de` · **Base:** `84a48a4cff85fc7b1aba50c3a569ae79f6074a52`
+
+All gates green. `bridge-worktree` **320 passed — identical to base**, which is the
+expected result for a behaviour-preserving port: no new tests, no changed decisions.
+
+### Behaviour preservation, verified independently
+
+- `source_common_dir_identity` now delegates to
+  `probe.observe_source_common_dir_identity(source)`; it invokes no Git command.
+- `sweep.rs` retains five `Command::new("git")` sites. Four are test fixtures. The
+  fifth is `run_git_sync`, the **action path** (`worktree remove`, `prune`), which
+  is unchanged from base — `git show base | grep -c run_git_sync` returns 4 at both
+  ends. It is outside candidate construction, so the acceptance criterion holds.
+- All four probe implementations supply the new method: `HostGitWorktree`, `Probe`,
+  `BothAbsentProbe`, `RecordingProbe`.
+- All four `source authority probe …` messages appear exactly once before and once
+  after.
+
+### Counted lines — 105 against a 220 cap
+
+Reviewers disagreed 100 vs 105. **105 is correct**: independently measured per file
+as 51 (`sweep.rs`) + 45 (`host_git.rs`) + 9 (`checked_scan.rs`), matching this
+handoff's own worksheet exactly. Blank added lines are zero, and the count does not
+subtract them twice — the error that produced a false 636 for increment 2.
+
+### Why this half exists
+
+3A's first dispatch stopped at its cap: 509 nonblank lines against 500, before
+formatting and before finishing. 3A was split at an **ordered** seam, not the
+obvious one — four of the messages 3A-2 must retype live inside the function this
+half relocates, so retyping first would type them where the port then moves them.
+
+**3A-2 rebinds to this accepted head** and carries all of 3A's behavioural red.
+
+### Limits
+
+- These results attest the tree at `228e15de` only.
+- `EXACT_ABSENCE_POLICY_READY_V1` remains `false`; readiness is still the sole
+  remaining production gate.
+- No typed-vocabulary arm was added, removed, or newly constructed; the
+  admitted-record `.ok()` discard is unchanged. Both are 3A-2's.
