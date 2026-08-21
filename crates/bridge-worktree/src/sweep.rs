@@ -1579,7 +1579,10 @@ mod tests {
                 super::UnusedCandidateDecisionV1::Authorized,
             )
         );
-        assert!(matches!(report.scan().custody_root(), super::CustodyRootObservationV1::Pinned));
+        assert!(matches!(
+            report.scan().custody_root(),
+            super::CustodyRootObservationV1::Pinned
+        ));
         assert_eq!(report.effective().count(), 0);
         assert_eq!(probe.calls(), 1);
     }

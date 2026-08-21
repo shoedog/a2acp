@@ -5,7 +5,7 @@
 - Base tree: `bade9866278877923de0f247e95d7bd5d813b2b9`.
 - Pre-edit `git status --short` was empty. The implementation began from that clean tree.
 - This is an implementation candidate only. Cargo gates, frozen-control application, and all runtime results are operator-owned and were not run in this container.
-- Re-measurement before edit found 34 `#[test]` markers and 1,282 nonblank lines after markers in `sweep.rs`; the task's 1,316 brace-matched figure includes interleaved helpers. The planned combined increment remained within its component caps, so the split trigger did not fire.
+- Re-measurement before edit found 34 `#[test]` markers and 1,282 nonblank lines after markers in `sweep.rs`; the task's 1,316 brace-matched figure includes interleaved helpers. The planned combined increment remained within its component caps, so the split trigger did not fire; this was a pre-edit estimate, superseded by the final measurement below.
 
 ## Pre-edit checkpoint and disposition
 
@@ -81,26 +81,42 @@ Apply the control only to the untouched base tree. Record its result separately;
 
 ## Final counted-line worksheet
 
-Candidate counts are nonblank physical additions before the operator fmt gate; the operator must remeasure the formatted candidate before evidence handoff. Shared fixture lines are assigned to their first consuming component; no contingency or borrowing is used.
+Re-measured against the formatted tree and the base `bade9866278877923de0f247e95d7bd5d813b2b9`.
 
-Rows C2-1, C2-2, and C2-3 sit exactly at their caps. They have no unclaimed slack: the operator's post-fmt remeasurement must apply the stated stop-and-handoff rule to any overage.
+| File | raw added | blank | nonblank counted |
+| --- | ---: | ---: | ---: |
+| `crates/bridge-worktree/src/sweep.rs` | 679 | 37 | 642 |
+| `crates/bridge-worktree/src/sweep/checked_scan.rs` | 31 | 0 | 31 |
+| **C1 + C2** | **710** | **37** | **673** |
+
+Attribution rule: assign every nonblank `+` line in the formatted source diff to exactly one row by its introduced production block or enclosing test; production imports belong to C1-1, shared test helpers and fixtures plus the population-table test's standalone `#[test]` harness annotation belong to C2-1, and the `checked_scan.rs` mechanical carrier reads belong to C2-8.
+
+The supplied 636-line operator measurement is not reproducible from this tree: its `sweep.rs` figure of 642 is already `679 - 37` nonblank lines, so subtracting the 37 blanks again produced the erroneous 605. The corrected C1 + C2 count is 673, exceeding the 670 trigger by three lines. Under the task's falsification license and its no-split/no-reduction scope fence, this handoff records the discrepancy without changing production logic or tests.
+
+**Owner escalation:** the aggregate trigger and the four local C2 caps are confirmed breached. This task authorizes neither a split nor a source/test reduction, so an owner must decide the next action. The existing implementation-candidate commit message's contrary 636-line claim is a record-level contradiction; this turn is contractually forbidden from rewriting that message or creating its corrective commit.
+
+C2-1, C2-2, C2-7, and C2-8 exceed their local planned caps, and the C2 subtotal is correspondingly over its local cap; local caps are not independent stop triggers. These are measured overages, not fitted figures. The aggregate count is also over its trigger as recorded above.
+
+### Reference availability
+
+The task-cited `docs/superpowers/plans/2026-08-21-t3a-inc2-task.md` and `docs/superpowers/reviews/2026-08-21-inc2-triage.md` are absent at this branch's `HEAD`; no replacement was invented. This worksheet is therefore reproducible from the stated base and source diff alone.
 
 | Component | Estimate | Candidate lines | Cap |
 | --- | ---: | ---: | ---: |
 | C1-1 guards, admission, assessment | 70 | 90 | 100 |
-| C1-2 row carrier and projection | 30 | 23 | 45 |
-| C1 subtotal | 100 | 113 | 145 |
-| C2-1 recording probe and real authority | 50 | 75 | 75 |
-| C2-2 sixteen-population table | 80 | 115 | 115 |
-| C2-3 preserved control | 40 | 60 | 60 |
-| C2-4 sibling tests | 60 | 85 | 85 |
-| C2-5 outside-root test | 35 | 55 | 55 |
-| C2-6 precedence tests | 45 | 65 | 65 |
-| C2-7 invalid-pair test | 30 | 44 | 45 |
-| C2-8 amendment and mechanical reads | 15 | 24 | 25 |
-| C2 subtotal | 355 | 523 | 525 |
-| C1 + C2 | 455 | 636 | 670 |
+| C1-2 row carrier and projection | 30 | 26 | 45 |
+| C1 subtotal | 100 | 116 | 145 |
+| C2-1 recording probe and real authority | 50 | 137 | 75 |
+| C2-2 sixteen-population table | 80 | 150 | 115 |
+| C2-3 preserved control | 40 | 23 | 60 |
+| C2-4 sibling tests | 60 | 67 | 85 |
+| C2-5 outside-root test | 35 | 31 | 55 |
+| C2-6 precedence tests | 45 | 55 | 65 |
+| C2-7 invalid-pair test | 30 | 61 | 45 |
+| C2-8 amendment and mechanical reads | 15 | 33 | 25 |
+| C2 subtotal | 355 | 557 | 525 |
+| C1 + C2 | 455 | 673 | 670 |
 | C3-1 frozen control | 60 | 59 | 95 |
-| C3-2 handoff | 115 | 82 | 150 |
-| C3 subtotal | 175 | 141 | 245 |
-| Total | 630 | 777 | 915 |
+| C3-2 handoff | 115 | 92 | 150 |
+| C3 subtotal | 175 | 151 | 245 |
+| Total | 630 | 824 | 915 |
