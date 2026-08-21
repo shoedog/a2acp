@@ -617,11 +617,19 @@ mod tests {
         assert_eq!(
             successful_rows
                 .iter()
-                .map(|row| (row.checked.parts().0, row.checked.parts().1, row.decision))
+                .map(|row| (
+                    row.checked.parts().0,
+                    row.checked.parts().1,
+                    row.assessment.decision()
+                ))
                 .collect::<Vec<_>>(),
             failed_rows
                 .iter()
-                .map(|row| (row.checked.parts().0, row.checked.parts().1, row.decision))
+                .map(|row| (
+                    row.checked.parts().0,
+                    row.checked.parts().1,
+                    row.assessment.decision()
+                ))
                 .collect::<Vec<_>>()
         );
         std::fs::remove_dir_all(root).unwrap();
@@ -715,7 +723,10 @@ mod tests {
         );
         let (_, errors, _observed, rows) = outcome.into_exact_parts().unwrap();
         assert_eq!(errors, 2usize);
-        assert_eq!(rows[0].decision, UnusedCandidateDecisionV1::Authorized);
+        assert_eq!(
+            rows[0].assessment.decision(),
+            UnusedCandidateDecisionV1::Authorized
+        );
         assert!(
             matches!(rows[1].checked.parts().2, ScannedWorktreeRecordV1::Custody(actual) if actual.as_ref() == &expected)
         );
@@ -769,7 +780,10 @@ mod tests {
             rows[1].checked.parts().2,
             ScannedWorktreeRecordV1::UnreadableCustody(CustodyReadRefusalV1::Unreadable(message)) if message == "sweep root is not pinnable"
         ));
-        assert_eq!(rows[1].decision, UnusedCandidateDecisionV1::Refused);
+        assert_eq!(
+            rows[1].assessment.decision(),
+            UnusedCandidateDecisionV1::Refused
+        );
         assert_eq!(calls.load(Ordering::SeqCst), 0);
         std::fs::remove_dir_all(root).unwrap();
     }
@@ -812,7 +826,9 @@ mod tests {
         );
         let (_, _, _, rows) = outcome.into_exact_parts().unwrap();
         assert_eq!(
-            rows.iter().map(|row| row.decision).collect::<Vec<_>>(),
+            rows.iter()
+                .map(|row| row.assessment.decision())
+                .collect::<Vec<_>>(),
             [
                 UnusedCandidateDecisionV1::Authorized,
                 UnusedCandidateDecisionV1::Authorized,
@@ -860,7 +876,11 @@ mod tests {
                     &probe(observation, log),
                 );
                 let (_, _, _, rows) = outcome.into_exact_parts().unwrap();
-                assert_eq!(rows[0].decision, expected, "{name}: {observation:?}");
+                assert_eq!(
+                    rows[0].assessment.decision(),
+                    expected,
+                    "{name}: {observation:?}"
+                );
             }
         }
         std::fs::remove_dir_all(root).unwrap();
@@ -884,7 +904,10 @@ mod tests {
             &probe,
         );
         let (_, _, _, rows) = outcome.into_exact_parts().unwrap();
-        assert_eq!(rows[0].decision, UnusedCandidateDecisionV1::Refused);
+        assert_eq!(
+            rows[0].assessment.decision(),
+            UnusedCandidateDecisionV1::Refused
+        );
         assert_eq!(probe.calls.load(Ordering::SeqCst), 0);
         std::fs::remove_dir_all(root).unwrap();
     }
@@ -1078,7 +1101,7 @@ mod tests {
         for (before, after) in default_rows.iter().zip(observed_rows.iter()) {
             assert_eq!(before.checked.parts().0, after.checked.parts().0);
             assert_eq!(before.checked.parts().1, after.checked.parts().1);
-            assert_eq!(before.decision, after.decision);
+            assert_eq!(before.assessment.decision(), after.assessment.decision());
             assert!(
                 matches!((before.checked.parts().2, after.checked.parts().2), (ScannedWorktreeRecordV1::Legacy(left), ScannedWorktreeRecordV1::Legacy(right)) if left == right)
             );

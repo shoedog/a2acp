@@ -1,0 +1,61 @@
+# Frozen test-only control for base bade9866278877923de0f247e95d7bd5d813b2b9.
+# Apply with: git apply docs/superpowers/reviews/2026-08-21-r2f1b-3d-t3a-inc2-genuine-red-control.patch
+# Run with: CARGO_INCREMENTAL=0 cargo test -p bridge-worktree --locked inc2_control_ -- --nocapture
+
+diff --git a/crates/bridge-worktree/src/sweep.rs b/crates/bridge-worktree/src/sweep.rs
+--- a/crates/bridge-worktree/src/sweep.rs
++++ b/crates/bridge-worktree/src/sweep.rs
+@@ -1365,6 +1365,53 @@ mod tests {
+             Ok(super::ExactAbsenceObservationV1::BothAbsent)
+         }
+     }
++    struct Inc2ControlProbe(std::sync::atomic::AtomicUsize);
++    impl Inc2ControlProbe {
++        fn calls(&self) -> usize { self.0.load(std::sync::atomic::Ordering::SeqCst) }
++    }
++    impl super::ExactAbsenceProbeV1 for Inc2ControlProbe {
++        fn observe_exact_absence(&self, _: &super::ExactAbsenceCandidateV1) -> Result<super::ExactAbsenceObservationV1, bridge_core::error::BridgeError> {
++            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
++            Ok(super::ExactAbsenceObservationV1::BothAbsent)
++        }
++    }
++    fn inc2_control_record(root: &Path, target: &Path, state: WorktreeCustodyStateV1) -> WorktreeCustodyRecordV1 {
++        let source = root.join("source"); fs::create_dir_all(&source).unwrap();
++        assert!(std::process::Command::new("git").args(["-C", source.to_str().unwrap(), "init", "-q"]).status().unwrap().success());
++        let target = fs::canonicalize(target).unwrap();
++        let object = |path: &Path| { let directory_identity = bridge_core::fs_custody::verify_payload_directory_identity(&fs::canonicalize(path).unwrap()).unwrap(); WorktreeObjectIdentityV1 { canonical_path: directory_identity.canonical_path.clone(), directory_identity } };
++        let mut record = custody_record(&target.to_string_lossy(), WorktreeCustodyStateV1::Preserved {});
++        record.worktree = object(&target);
++        let claim = record.claim.as_mut().unwrap();
++        claim.source = object(&source); claim.root = object(root); claim.worktree = record.worktree.clone(); claim.common_dir = object(&source.join(".git"));
++        record.state = state; record
++    }
++    #[test]
++    fn inc2_control_canonical_preserved_stops_before_the_probe() {
++        let root = unique_temp_dir("inc2-control-preserved"); fs::create_dir_all(&root).unwrap();
++        let target = root.join("preserved"); fs::create_dir_all(&target).unwrap(); let target = fs::canonicalize(target).unwrap();
++        let record_path = PathBuf::from(custody_record_path(&target.to_string_lossy()));
++        fs::write(&record_path, inc2_control_record(&root, &target, WorktreeCustodyStateV1::Preserved {}).encode_canonical().unwrap()).unwrap();
++        let probe = Inc2ControlProbe(std::sync::atomic::AtomicUsize::new(0));
++        let report = super::sweep_orphans_with_exact_absence(&root.to_string_lossy(), &probe);
++        let entry = report.entries().iter().find(|entry| entry.record_path() == record_path.to_string_lossy()).unwrap();
++        assert!(matches!(entry.assessment(), super::ExactAbsenceRecordAssessmentV1::Custody(assessment) if matches!(assessment.assessment(), super::CustodyExactAbsenceAssessmentV1::IneligiblePopulation(super::IneligiblePopulationV1::StateNotCandidate))));
++        assert_eq!(probe.calls(), 0); fs::remove_dir_all(root).unwrap();
++    }
++    #[cfg(unix)]
++    #[test]
++    fn inc2_control_sibling_symlink_alias_is_refused() {
++        use std::os::unix::fs::symlink;
++        let root = unique_temp_dir("inc2-control-symlink"); fs::create_dir_all(&root).unwrap(); let canonical_root = fs::canonicalize(&root).unwrap();
++        let target = canonical_root.join("wt"); fs::create_dir_all(&target).unwrap(); let alias = canonical_root.join("alias.custody.v1.json");
++        fs::write(&alias, inc2_control_record(&root, &target, WorktreeCustodyStateV1::ProtectionPrepared {}).encode_canonical().unwrap()).unwrap();
++        let expected = PathBuf::from(custody_record_path(&target.to_string_lossy())); symlink(&alias, &expected).unwrap();
++        let probe = Inc2ControlProbe(std::sync::atomic::AtomicUsize::new(0));
++        let report = super::sweep_orphans_with_exact_absence(&root.to_string_lossy(), &probe);
++        let entry = report.entries().iter().find(|entry| entry.record_path() == alias.to_string_lossy()).unwrap();
++        assert!(matches!(entry.assessment(), super::ExactAbsenceRecordAssessmentV1::Custody(assessment) if matches!(assessment.assessment(), super::CustodyExactAbsenceAssessmentV1::CannotConstructSubject(super::CannotConstructSubjectV1::RecordFileNotExpectedSibling))));
++        assert_eq!(probe.calls(), 0); fs::remove_dir_all(root).unwrap();
++    }
+
+     fn root_capture(
+         dev: Option<u64>,

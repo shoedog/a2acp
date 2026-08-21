@@ -1,0 +1,201 @@
+# T3a increment 2 handoff — population admission and typed placement guards
+
+## Candidate checkpoint
+
+- Base tree: `bade9866278877923de0f247e95d7bd5d813b2b9`.
+- Pre-edit `git status --short` was empty. The implementation began from that clean tree.
+- This is an implementation candidate only. Cargo gates, frozen-control application, and all runtime results are operator-owned and were not run in this container.
+- Re-measurement before edit found 34 `#[test]` markers and 1,282 nonblank lines after markers in `sweep.rs`; the task's 1,316 brace-matched figure includes interleaved helpers. The planned combined increment remained within its component caps, so the split trigger did not fire; this was a pre-edit estimate, superseded by the final measurement below.
+
+## Pre-edit checkpoint and disposition
+
+| Anchor | Repository evidence | Disposition |
+| --- | --- | --- |
+| Custody probe path | `sweep.rs`, `decide_unused_custody_record` was the sole custody path to `decide_unused_candidate` | Replaced with `assess_custody_record`; guards and admission precede its only probe call. |
+| Row timing | `project_exact_scan_result` completed probing before `report_exact_scan_projection_row` | Move finished assessment construction into the projection loop; report conversion is now a carrier. |
+| Population vocabulary | `custody.rs`, the ten state variants, all six `PreservationReasonV1` variants, and `claim_presence()` matched the sixteen-population table | Confirmed; exhaustive admission match names every state and reason. |
+| Placement vocabulary | `report.rs`, exactly two `IneligiblePopulationV1` and four `CannotConstructSubjectV1` arms | Confirmed; no public vocabulary was changed. |
+| Invalid claim pairs | `WorktreeCustodyRecordV1::decode_canonical` validates `ClaimRequired` and `ClaimForbidden` before scan construction | Confirmed; invalid persisted pairs remain unreadable, with no new invalid-pair arm. |
+| Corrected claim-authority assertion | `ClaimAuthorityUnavailableV1::new` appeared only in `report.rs` and `r2f1b_exact_absence_report_api.rs` tests | Re-refuted: no production construction existed and none is added. |
+| Corrected placement assertion | The loop in `project_exact_scan_result`, not `report_exact_scan_projection_row`, reaches the custody probe | Re-refuted: post-hoc report filtering cannot suppress a probe, so admission is installed in the custody decision path. |
+| Stored exact child name | `CheckedScanRowV1` retains `enumerated_name: OsString` beside lossy `record_path` | Confirmed; guards take `&OsStr`, never the lossy display path. |
+| Readiness | `effective()` had only test consumers; healthy roots could be `Pinned` after slice B | Fence retained: readiness remains false and no report API changed. |
+
+Proceed decision: all factual anchors matched the base. The implementation includes 2A and 2B in one candidate; it did not broaden into increment 3 or an action-path change.
+
+## Implementation and scope fences
+
+- `construction_guards` reports, in fixed order, `RecordedWorktreePathNotAbsolute`, `OutsideSweepRoot`, then `RecordFileNotExpectedSibling`. It canonicalizes only the containment check through existing `worktree_under_root`; matching uses the exact enumerated `OsStr`, lexical target file name plus `CUSTODY_RECORD_SUFFIX`, and exact parent equality with the canonical root.
+- `admit_custody_population` is exhaustive over `(&WorktreeCustodyStateV1, bool)`. Only claim-bearing `ProtectionPrepared` and `PreservationUnknown { MaterializationInFlight }` admit. Bare `ProtectionPrepared` reports `BareProtectionPrepared`; the other thirteen policy rows report `StateNotCandidate`.
+- `assess_custody_record` runs placement guards, admission, then unchanged claim construction and `decide_unused_candidate`. A failed `from_claim` remains `Assessed(Refused)`; `ClaimAuthorityUnavailable` remains dormant for increment 3's typed mapping.
+- `ExactScanProjectionRowV1` now carries `ExactAbsenceRecordAssessmentV1`. Per-row logs derive their unchanged decision via `assessment.decision()`, and `report_exact_scan_projection_row` does no probe, filesystem operation, state match, or typed-refusal construction.
+- `EXACT_ABSENCE_POLICY_READY_V1` remains `false`; `effective()` and `entry_is_effectively_authorized_for_policy` are untouched. The matched custody control in `a_canonical_preserved_record_stops_before_the_probe_with_a_matched_control` proves a `Pinned` root containing a custody-side `Assessed(Authorized)` entry still has `effective().count() == 0`.
+- Changed files: `crates/bridge-worktree/src/sweep.rs`, `crates/bridge-worktree/src/sweep/checked_scan.rs`, this handoff, and the frozen control patch. `Cargo.toml`, `Cargo.lock`, `crates/bridge-core/Cargo.toml`, and `crates/bridge-worktree/Cargo.toml` are unchanged.
+
+## Tests and evidence classification
+
+| Test | Evidence category | Coverage |
+| --- | --- | --- |
+| `population_admission_covers_every_decodable_population_and_probes_only_candidates` | Genuine runtime red | Sixteen actual records with complete real claim authority; exact assessment table and exactly two probe calls. |
+| `a_canonical_preserved_record_stops_before_the_probe_with_a_matched_control` | Genuine runtime red | Canonical `Preserved` is zero-probe; its matched claim-bearing custody control is `Pinned`, reaches once as `Assessed(Authorized)`, and leaves `effective()` empty. |
+| `an_expected_sibling_symlink_alias_is_refused_with_a_matched_control` | Genuine runtime red | Types the alias hole, retains the symlink as unreadable, and proves its control probes once. |
+| `a_nested_target_whose_record_sits_at_the_root_is_not_an_expected_sibling` | Genuine runtime red | Preserves the mandatory parent component check. |
+| `a_target_resolving_outside_the_sweep_root_is_typed_outside_root` | Genuine runtime red | Types containment refusal before sibling matching. |
+| `a_relative_recorded_target_reports_the_first_guard_only` | Genuine runtime red | Pins guard-class precedence. |
+| `a_preserved_record_outside_the_root_reports_the_guard_not_the_population` | Genuine runtime red | Pins guard-over-admission precedence. |
+| `invalid_persisted_claim_pairs_stay_unreadable_and_never_probe` | Characterization | `ClaimForbidden` and `ClaimRequired` remain decode refusals with zero probes. |
+| `exact_absence_sweep_reports_the_stored_runtime_decision` | Characterization amendment | The sole pre-existing assessment-colour change. |
+
+The seven named mechanical `ExactScanProjectionRowV1` reads in `checked_scan.rs` now use `row.assessment.decision()` with identical asserted values: `pin_failure_leaves_the_root_observation_unavailable` (its two tuple maps), `checked_scan_reads_each_selected_name_before_next_and_finishes_once`, `exact_route_pin_failure_preserves_legacy_and_refuses_custody`, `exact_projection_retains_production_computed_decisions`, `exact_projection_preserves_legacy_and_custody_decision_matrix`, `unreadable_custody_refuses_without_probe`, and `nondefault_root_observations_survive_exact_without_changing_rows_or_decisions`. They are mechanical carrier reads, not colour changes. `exact_projection_retains_production_computed_decisions` retains its two probe-call assertion.
+
+The one legitimate existing assertion change is `exact_absence_sweep_reports_the_stored_runtime_decision`: its `LiveProtected` custody row changes from `Assessed(Refused)` to `IneligiblePopulation(StateNotCandidate)`. That live, claim-forbidden state is now refused by policy before observation; its state snapshot, raw `decision()`, three-entry report size, authoritative scan, and empty effective iterator remain unchanged.
+
+## Frozen genuine-red control
+
+[`2026-08-21-r2f1b-3d-t3a-inc2-genuine-red-control.patch`](2026-08-21-r2f1b-3d-t3a-inc2-genuine-red-control.patch) is test-only and targets `bade9866278877923de0f247e95d7bd5d813b2b9`. Its SHA-256 is `51c7f84b519b4613f5a20b9c59c7d95bbe7100665a0da138f18b69ad81c31f13`; it contains the `inc2_control_` canonical-`Preserved` and sibling-symlink-alias runtime oracles. It was applicability-checked against a disposable extraction of that base but was neither applied nor run here, so no red observation is claimed.
+
+## Inherited open items
+
+- `Assessed(Refused)` still overstates a claim-authority construction failure; increment 3 owns the closed typed mapping.
+- The Unix-only separator guard in `is_custody_record_name` remains intentionally unrepaired.
+- The checked-scan entry-error loop remains non-latching.
+- Boot sweeps now avoid up to fourteen unnecessary read-only exact-absence `git` observations; fewer subprocesses are expected, but no measurement is claimed.
+
+## OPERATOR EVIDENCE — PENDING
+
+- [x] `cargo fmt --all -- --check` — **exit 0** (operator, host, 2026-08-21)
+- [x] `CARGO_INCREMENTAL=0 cargo clippy --workspace --all-targets --locked -- -D warnings` — **exit 0**, zero warnings
+- [x] `CARGO_INCREMENTAL=0 cargo test --workspace --locked --no-fail-fast` — **exit 0**, zero failures
+- [x] `CARGO_INCREMENTAL=0 cargo test -p bridge-worktree --locked --no-fail-fast` — **exit 0**; lib **320 passed** / 0 failed
+- [x] `cargo run -p a2a-bridge -- validate --repo-hygiene` (implementation point) — **exit 0**
+- [x] `cargo run -p a2a-bridge -- validate --repo-hygiene` (handoff point) — **exit 0**
+
+## OPERATOR PROBE — PENDING
+
+```text
+git apply docs/superpowers/reviews/2026-08-21-r2f1b-3d-t3a-inc2-genuine-red-control.patch
+CARGO_INCREMENTAL=0 cargo test -p bridge-worktree --locked inc2_control_ -- --nocapture
+```
+
+Apply the control only to the untouched base tree. Record its result separately; this candidate asserts only the frozen artifact and command.
+
+## Final counted-line worksheet
+
+Re-measured against the formatted tree and the base `bade9866278877923de0f247e95d7bd5d813b2b9`.
+
+| File | raw added | blank | nonblank counted |
+| --- | ---: | ---: | ---: |
+| `crates/bridge-worktree/src/sweep.rs` | 679 | 37 | 642 |
+| `crates/bridge-worktree/src/sweep/checked_scan.rs` | 31 | 0 | 31 |
+| **C1 + C2** | **710** | **37** | **673** |
+
+Attribution rule: assign every nonblank `+` line in the formatted source diff to exactly one row by its introduced production block or enclosing test; production imports belong to C1-1, shared test helpers and fixtures plus the population-table test's standalone `#[test]` harness annotation belong to C2-1, and the `checked_scan.rs` mechanical carrier reads belong to C2-8.
+
+The supplied 636-line operator measurement is not reproducible from this tree: its `sweep.rs` figure of 642 is already `679 - 37` nonblank lines, so subtracting the 37 blanks again produced the erroneous 605. The corrected C1 + C2 count is 673, exceeding the 670 trigger by three lines. Under the task's falsification license and its no-split/no-reduction scope fence, this handoff records the discrepancy without changing production logic or tests.
+
+**Owner escalation:** the aggregate trigger and the four local C2 caps are confirmed breached. This task authorizes neither a split nor a source/test reduction, so an owner must decide the next action. The existing implementation-candidate commit message's contrary 636-line claim is a record-level contradiction; this turn is contractually forbidden from rewriting that message or creating its corrective commit.
+
+C2-1, C2-2, C2-7, and C2-8 exceed their local planned caps, and the C2 subtotal is correspondingly over its local cap; local caps are not independent stop triggers. These are measured overages, not fitted figures. The aggregate count is also over its trigger as recorded above.
+
+### Reference availability
+
+The task-cited `docs/superpowers/plans/2026-08-21-t3a-inc2-task.md` and `docs/superpowers/reviews/2026-08-21-inc2-triage.md` are absent at this branch's `HEAD`; no replacement was invented. This worksheet is therefore reproducible from the stated base and source diff alone.
+
+| Component | Estimate | Candidate lines | Cap |
+| --- | ---: | ---: | ---: |
+| C1-1 guards, admission, assessment | 70 | 90 | 100 |
+| C1-2 row carrier and projection | 30 | 26 | 45 |
+| C1 subtotal | 100 | 116 | 145 |
+| C2-1 recording probe and real authority | 50 | 137 | 75 |
+| C2-2 sixteen-population table | 80 | 150 | 115 |
+| C2-3 preserved control | 40 | 23 | 60 |
+| C2-4 sibling tests | 60 | 67 | 85 |
+| C2-5 outside-root test | 35 | 31 | 55 |
+| C2-6 precedence tests | 45 | 55 | 65 |
+| C2-7 invalid-pair test | 30 | 61 | 45 |
+| C2-8 amendment and mechanical reads | 15 | 33 | 25 |
+| C2 subtotal | 355 | 557 | 525 |
+| C1 + C2 | 455 | 673 | 670 |
+| C3-1 frozen control | 60 | 59 | 95 |
+| C3-2 handoff | 115 | 92 | 150 |
+| C3 subtotal | 175 | 151 | 245 |
+| Total | 630 | 824 | 915 |
+
+
+---
+
+## Operator evidence — filled 2026-08-21
+
+**Implementation commits:** `3f2e2cf1` (increment 2) then `1f2e8c11` (format + worksheet)
+**Base:** `bade9866278877923de0f247e95d7bd5d813b2b9`
+
+All gates green. `bridge-worktree` **320 passed** against the base control's 312 — +8,
+zero failures either side. `git diff --check` clean; no manifest or lockfile change.
+
+### The frozen control is behavioural red, verified independently
+
+Recorded SHA-256 `51c7f84b519b4613f5a20b9c59c7d95bbe7100665a0da138f18b69ad81c31f13`
+recomputed from the patch: **identical**. Applied to a detached worktree at the untouched
+base and run:
+
+```
+test sweep::tests::inc2_control_canonical_preserved_stops_before_the_probe ... FAILED
+test sweep::tests::inc2_control_sibling_symlink_alias_is_refused ... FAILED
+test result: FAILED. 0 passed; 2 failed
+```
+
+Both **compile and run**, then fail their assertions. This is genuine behavioural red, not
+a compile barrier — the correct evidence for a behaviour-changing increment, and distinct
+from A2b, whose control was a compile barrier and was labelled as such.
+
+### DISCLOSED CAP EXTENSION — the stop condition fired and was overridden
+
+The specification's trigger is "any C1 or C2 row exceeds its cap, or the C1+C2 subtotal
+exceeds 670." **It fired.** Re-measured against the formatted tree:
+
+| Row | Counted | Cap |
+|---|---:|---:|
+| C2-1 recording probe and real authority | **137** | 75 |
+| C2-2 sixteen-population table | **150** | 115 |
+| C2-7 invalid-pair test | **61** | 45 |
+| C2-8 amendment and mechanical reads | **33** | 25 |
+| C2 subtotal | **557** | 525 |
+| **C1 + C2** | **673** | **670** |
+
+**The owner accepted this as a disclosed extension rather than splitting.** The reasoning,
+recorded so it can be challenged: the artifact is gate-green with zero failures, both
+reviewers judged the production logic sound, C1 is comfortably inside cap (116/145), and
+every breach sits in **test infrastructure** — the `RecordingProbe` and real-claim-authority
+fixture, and the sixteen-population table. The caps under-estimated the evidence this
+increment demands; the implementation did not sprawl. Splitting a passing artifact to
+satisfy an estimate would have divided coherent work without improving it.
+
+This is an override of a stop condition, not a finding that the condition was wrong.
+
+### Operator error, recorded
+
+The round-3 review's cap-breach finding was **correct**, and the operator refuted it with a
+wrong measurement: `grep -cE '^\+[^+]'` already excludes blank added lines, so subtracting
+the 37 blanks again produced 605 instead of 642 and a false total of 636. The repair task
+was dispatched carrying that refutation and an explicit "do not split, do not delete or
+shorten any test" instruction.
+
+**The implementer caught it**, stated the arithmetic precisely, declined to act on the
+wrong instruction, and escalated under the falsification license instead of either
+complying or silently splitting. The corrected figure is 673. The instruction not to reduce
+tests happened to be right for a different reason than the one given.
+
+### Limits
+
+- Provisional `git diff --cached --check` on the staged handoff: **exit 0**, covering
+  provisional bytes. The final staged check is intentionally unrecorded, since recording
+  its result would alter the bytes it checked.
+- These results attest the tree at `1f2e8c11` only.
+- `EXACT_ABSENCE_POLICY_READY_V1` remains `false`. `has_authoritative_scan()` can be
+  `true` since slice B, so readiness stays the sole remaining production gate.
+- The `3f2e2cf1` commit message asserts the refuted 636-line figure. It is not rewritten —
+  amending a reviewed commit to fix a message would break the handoff's SHA claim. This
+  section is the correction of record.
+- Four inherited open items carry forward unrepaired: the `Assessed` overstatement on
+  construction failure (increment 3 retypes it), the Unix-only separator guard, the
+  non-latching entry-error loop, and fewer boot-time `git` subprocesses.
