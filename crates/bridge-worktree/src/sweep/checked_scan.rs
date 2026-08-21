@@ -457,6 +457,16 @@ mod tests {
     }
 
     impl ExactAbsenceProbeV1 for Probe {
+        fn observe_source_common_dir_identity(
+            &self,
+            source: &str,
+        ) -> Result<bridge_core::fs_custody::DirectoryIdentityV1, BridgeError> {
+            super::super::ExactAbsenceProbeV1::observe_source_common_dir_identity(
+                &crate::host_git::HostGitWorktree::new(),
+                source,
+            )
+        }
+
         fn observe_exact_absence(
             &self,
             _: &super::super::ExactAbsenceCandidateV1,
