@@ -1,7 +1,7 @@
 # Handoff — R2f1b 3d T3a: A1 landed, A2 next; bridge observability repaired mid-lane
 
 **Written:** 2026-08-19 · **By:** session_012SUgPvVNbwpuGQKxWtxLgr (Claude Opus 5, 1M) · **Provider:** claude
-**Workspace:** a2a-bridge · agent/r2f1b-pre-slice2-custody-plan · **Measured state:** `[MEASURED]` main `9ce2074e` · T3a increment 1 COMPLETE · Tree CLEAN · Probe `git status --porcelain && git rev-parse HEAD` · Output inline this turn
+**Workspace:** a2a-bridge · agent/r2f1b-pre-slice2-custody-plan · **Measured state:** `[MEASURED]` main `bade9866` · T3a increment 1 COMPLETE · slice B LANDED · Tree CLEAN · Probe `git status --porcelain && git rev-parse HEAD` · Output inline this turn
 **Predecessor:** the 2026-08-17 3d handoff (`docs/superpowers/2026-08-17-r2f1b-3d-HANDOFF.md`), superseded for everything below
 **Truth ordering:** measured live state > explicit owner/contract authority within its scope > this handoff for current operational state > earlier handoffs and non-authoritative summaries. A conflict between tiers stays OPEN in §0 — never resolved by document class alone.
 **Provenance:** written live by the worker. `[MEASURED]` claims were probed by this writer; `[INHERITED]` claims were not.
@@ -18,11 +18,13 @@
 
 ## 1. Resume order
 
-1. **T3a increment 1 is DONE.** The next substantive work is increment 2 or slice B per the 3d brief; neither is specced. The open items below are independent and none of them blocks that.
-2. **Open: the index-emptying mystery.** `[MEASURED]` PR #64 made a failed implement commit legible and non-destructive but did NOT diagnose what empties the index between `stage_state` and `host_commit`. `decide()` maps `DirtyUnstaged` to a friendly message and that path did not fire. Two candidates are named in `reviews/2026-08-20-implement-commit-failed-nothing-staged.md`; neither is proven.
-3. **Open: the Unix-only separator guard.** `is_custody_record_name` guards the empty-basename case by testing only the forward slash, so a backslash-spelled path diverges from the Unix spelling. Characterized by A2a-2 and deliberately unrepaired; it needs its own slice.
-4. **Open: the `force_next_release_failure_for` flake.** It has not fired across four consecutive PRs (#62-#65). Still unfixed; possibly worth closing as dormant rather than spending a slice.
-5. The operator config swap window (worktrees + container writer) remains staged and unapplied — see §4.
+1. **T3a increment 1 and slice B are DONE.** Next substantive work is increment 2, which owns `EXACT_ABSENCE_POLICY_READY_V1` and the population-admission rule. Not specced.
+2. **SAFETY — read before increment 2.** `[MEASURED]` `entry_is_effectively_authorized_for_policy` is `policy_ready && has_authoritative_scan() && ...`. Before slice B, `has_authoritative_scan()` was `false` on every production input, so `effective()` was double-gated. It is now `true` for a healthy root, making `EXACT_ABSENCE_POLICY_READY_V1 == false` the **sole** remaining gate. Flipping it in increment 2 removes the last one.
+3. **Open: the F8 ruling rests on one filesystem.** `[MEASURED]` `SLICE-B-F8 ... retained=some pinned=some final_named=some result=Pinned` on macOS/APFS — homogeneous, so the classifier-policy stop did not fire and A2b's strict-equality policy stands. The ext4 lane is *expected* to be `none/none/none` but has never been captured; CI does not run `--nocapture`. A mixed result would re-open the ruling.
+4. **Open: the index-emptying mystery.** PR #64 made a failed implement commit legible and non-destructive but did not diagnose what empties the index between `stage_state` and `host_commit`.
+5. **Open: the Unix-only separator guard**, characterized by A2a-2, unrepaired.
+6. **Open: `force_next_release_failure_for`** — dormant across five PRs (#62-#66).
+7. The operator config swap window remains staged and unapplied — see §4.
 
 **STOP conditions:** a spec that fails two counted review rounds → park and escalate, do not fold a third time by hand (§5). An implement run that returns "made no changes" → read the agent's message, which is now printed; do not theorise. Any instruction naming a path outside the repo in a container-bound spec → unsatisfiable, fix the spec.
 
@@ -30,7 +32,7 @@
 
 | Item | State | Evidence |
 |---|---|---|
-| main | `9ce2074e` (A2b, PR #65) | `[MEASURED]` |
+| main | `bade9866` (slice B, PR #66) | `[MEASURED]` |
 | path-identity primitive | **LANDED** | PR #57 → `9aedf175`; 8 defects closed, closure APPROVE 0W/0S |
 | CI uninstrumented control | **LANDED** | PR #56 → `1f14342a` |
 | h2 RUSTSEC-2026-0258 | **LANDED** | PR #58 → `c14813b7` |
@@ -39,7 +41,7 @@
 | agent reply surfacing | **LANDED** | PR #61 → `c637e493`; host gate 4,169/0/13 |
 | operator serve | **SWAPPED, RUNNING** | PID 23161, release `ee3b5966ad3b35ef`, binary-only swap, all 5 post-swap checks passed |
 | operator config candidate | **STAGED, NOT APPLIED** | `operator/a2a-bridge.candidate.toml`, SHA `67f3bf01…`; validate pass, doctor 31 ok/1 warn/0 fail |
-| T3a increment 1 | **COMPLETE** | A1 #60 -> A2a-1 #62 -> A2a-2 #63 -> A2b #65. `sweep_orphans_with_exact_absence` returns the report; all four A1 `dead_code` allowances consumed; readiness still `false` |
+| T3a increment 1 + slice B | **COMPLETE** | A1 #60 -> A2a-1 #62 -> A2a-2 #63 -> A2b #65 -> slice B #66. Root observations are real; readiness still `false` |
 
 ## 3. Corrections to standing documents and memory
 
@@ -83,7 +85,7 @@
 
 | Item | Verbatim |
 |---|---|
-| main | `9ce2074ef2a4e7b7bb81b9561b79ba672f9db9db` (A2b, PR #65) |
+| main | `bade9866` (slice B, PR #66) — resolve the full SHA with `git rev-parse`, never by extending the short form |
 | A2 spec v1 | `4234517d` · `docs/superpowers/plans/2026-08-19-r2f1b-3d-t3a-inc1-sliceA2-task.md` |
 | A2 operator findings | `904c89fb` · `docs/superpowers/reviews/2026-08-19-a2-spec-operator-findings.md` |
 | fold worktree | `.claude/worktrees/fold`, branch `main`, at `c637e493` |
