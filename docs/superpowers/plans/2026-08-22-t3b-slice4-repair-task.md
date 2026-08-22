@@ -17,11 +17,20 @@ Confirmed correct by operator probe and not to be disturbed: 748 counted lines u
 re-prove gate; the `CustodyRetirementResidue` operator-visible category exists in `storage_report.rs` and
 `MarkerRetirementOutcomeV1::CapturedRetained` is handled; the frozen transition table is untouched.
 
-### Falsification license
+### Falsification license — scoped to load-bearing anchors
 
-Every claim below is a tripwire. If an anchor is false, **stop and report** rather than adapting around it.
-The previous dispatch of this slice correctly stopped and reported when the task demanded something
-impossible; that behaviour is wanted, not penalised.
+**Stop and report** if a *load-bearing* anchor is false: a named symbol is absent, a visibility or signature
+differs from what is stated, a described behaviour does not hold, or a requirement cannot be satisfied as
+written. That behaviour is wanted, not penalised — an earlier dispatch of this slice correctly refused when
+the task demanded something impossible.
+
+**Do not stop for immaterial measurement differences.** Counts, sizes and totals in this task are the
+operator's advisory measurements, not contracts. Only the **cap** is binding. If your measurement of a count
+differs from the operator's, record both numbers in the handoff and continue; a difference that does not
+cross the cap is not a falsified anchor.
+
+This scoping is itself a correction: a previous dispatch stopped because it measured 747 added lines where
+the operator stated 748. Both are far under the cap and the difference changes nothing.
 
 ## Defect 1 — the test-isolation race (the only code defect)
 
@@ -82,8 +91,13 @@ problem; a disclosed and justified one is not.
 
 ## Size
 
-A repair. Expect well under **30** added nonblank Rust lines on top of `e9c0d4c5`. Cumulative cap is 790 and
-the candidate is at 748, leaving **42 lines** of headroom. If it will not fit, stop and report before editing.
+A repair. Expect well under **30** added nonblank Rust lines on top of `e9c0d4c5`.
+
+**The binding constraint is the cumulative cap of 790.** The operator measured the pre-repair candidate at
+**748** added nonblank Rust lines against `c343e563`, by two independent methods, with zero whitespace-only
+added lines; an implementer measurement of 747 was also reported. Treat any figure in this range as
+equivalent — roughly **40 lines** of headroom remain. Report your own measured total in the handoff. Stop
+only if the repair would cross **790**.
 
 ## Frozen control
 
