@@ -18,12 +18,12 @@
 
 ## 1. Resume order
 
-1. **T3a increment 1 and slice B are DONE.** Next substantive work is increment 2, which owns `EXACT_ABSENCE_POLICY_READY_V1` and the population-admission rule. Not specced.
-2. **SAFETY — read before increment 2.** `[MEASURED]` `entry_is_effectively_authorized_for_policy` is `policy_ready && has_authoritative_scan() && ...`. Before slice B, `has_authoritative_scan()` was `false` on every production input, so `effective()` was double-gated. It is now `true` for a healthy root, making `EXACT_ABSENCE_POLICY_READY_V1 == false` the **sole** remaining gate. Flipping it in increment 2 removes the last one.
-3. **Open: the F8 ruling rests on one filesystem.** `[MEASURED]` `SLICE-B-F8 ... retained=some pinned=some final_named=some result=Pinned` on macOS/APFS — homogeneous, so the classifier-policy stop did not fire and A2b's strict-equality policy stands. The ext4 lane is *expected* to be `none/none/none` but has never been captured; CI does not run `--nocapture`. A mixed result would re-open the ruling.
-4. **Open: the index-emptying mystery.** PR #64 made a failed implement commit legible and non-destructive but did not diagnose what empties the index between `stage_state` and `host_commit`.
-5. **Open: the Unix-only separator guard**, characterized by A2a-2, unrepaired.
-6. **Open: `force_next_release_failure_for`** — dormant across five PRs (#62-#66).
+1. **T3a is COMPLETE at `cafeae13`.** Increments 1-3 and slice B are merged. `Root` has 6 production constructors and `OwnershipUnproven` 3; `sweep/report.rs` carries zero `dead_code` allowances; the `.ok()` discard is gone. `bridge-worktree` 284 → 331 passed.
+2. **T3b is the next substantive work** and is not specced. It inherits an unchanged boundary: T3a decides and reports, T3b acts. The report carries ordered historical evidence, not authority — a later actor must re-open, re-read, re-bind, and re-prove exact absence under its own lock.
+3. **SAFETY, read before T3b or increment 2 of anything downstream.** `entry_is_effectively_authorized_for_policy` is `policy_ready && has_authoritative_scan() && ...`. Since slice B, `has_authoritative_scan()` is `true` for a healthy root, so `EXACT_ABSENCE_POLICY_READY_V1 == false` is the **sole** remaining gate. `effective()` still has **no production consumer** — flipping readiness belongs with the slice that consumes it.
+4. **Due after T3b:** the Unix-only separator guard in `is_custody_record_name`, characterized by A2a-2 and carried unrepaired through four slices since.
+5. **Opportunistic:** capture the `SLICE-B-F8` line on any Linux run to close the birthtime ruling's single-filesystem limit.
+6. **Propose closing as dormant:** the `force_next_release_failure_for` flake, now clean across ten consecutive PRs (#62-#71).
 7. The operator config swap window remains staged and unapplied — see §4.
 
 **STOP conditions:** a spec that fails two counted review rounds → park and escalate, do not fold a third time by hand (§5). An implement run that returns "made no changes" → read the agent's message, which is now printed; do not theorise. Any instruction naming a path outside the repo in a container-bound spec → unsatisfiable, fix the spec.
@@ -32,7 +32,7 @@
 
 | Item | State | Evidence |
 |---|---|---|
-| main | `bade9866` (slice B, PR #66) | `[MEASURED]` |
+| main | `cafeae13` (3B, PR #71) — resolve full SHAs with `git rev-parse`, never by extending the short form | `[MEASURED]` |
 | path-identity primitive | **LANDED** | PR #57 → `9aedf175`; 8 defects closed, closure APPROVE 0W/0S |
 | CI uninstrumented control | **LANDED** | PR #56 → `1f14342a` |
 | h2 RUSTSEC-2026-0258 | **LANDED** | PR #58 → `c14813b7` |
@@ -41,7 +41,7 @@
 | agent reply surfacing | **LANDED** | PR #61 → `c637e493`; host gate 4,169/0/13 |
 | operator serve | **SWAPPED, RUNNING** | PID 23161, release `ee3b5966ad3b35ef`, binary-only swap, all 5 post-swap checks passed |
 | operator config candidate | **STAGED, NOT APPLIED** | `operator/a2a-bridge.candidate.toml`, SHA `67f3bf01…`; validate pass, doctor 31 ok/1 warn/0 fail |
-| T3a increment 1 + slice B | **COMPLETE** | A1 #60 -> A2a-1 #62 -> A2a-2 #63 -> A2b #65 -> slice B #66. Root observations are real; readiness still `false` |
+| **T3a (all of it)** | **COMPLETE** | A1 #60 → A2a #62/#63 → A2b #65 → slice B #66 → inc2 #67 → 3A #68/#70 → 3B #71. No dormant vocabulary; readiness still `false` |
 
 ## 3. Corrections to standing documents and memory
 

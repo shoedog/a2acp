@@ -1183,6 +1183,67 @@ separation, and a non-disruptive generation drain/rotate design that never inter
 sessions. R3d remains one-shot only and may later display, but never act on, a separate R2f health artifact.
 Do not automatically replay the failed request or treat the isolated review as compatibility evidence.
 
+### R2f1b 3d T3a — COMPLETE at `cafeae13` (2026-08-22)
+
+Increment 1, slice B, increment 2, and increment 3 are all merged. Verified on
+`main`, not asserted:
+
+| Closing check | Result |
+|---|---|
+| `sweep_orphans_with_exact_absence` returns a populated report | yes |
+| Production root observations are real | yes — retained descriptor, custody pin, re-resolved root |
+| `ClaimAuthorityObjectV1::Root` production constructors | **6** |
+| `ClaimAuthorityUnavailableReasonV1::OwnershipUnproven` production constructors | **3** |
+| `#[allow(dead_code)]` remaining in `sweep/report.rs` | **0** |
+| The admitted-record `.ok()` discard | **gone** |
+| `EXACT_ABSENCE_POLICY_READY_V1` | still `false` |
+
+**No object or reason arm remains dormant.** The vocabulary A1 landed behind
+`dead_code` allowances in PR #60 is now fully exercised by production, which is
+the condition T3a existed to reach.
+
+`bridge-worktree`: **284 → 331 passed**, zero regressions, with a
+same-environment control at every gate.
+
+| PR | Slice |
+|---|---|
+| #60 | A1 — exact-absence report vocabulary |
+| #62 / #63 | A2a-1 / A2a-2 — one checked-scan engine, then its characterization |
+| #65 | A2b — return the report |
+| #66 | slice B — real root observations from a retained descriptor |
+| #67 | increment 2 — population admission and typed placement guards |
+| #68 / #70 | 3A-1 / 3A-2 — repository-authority port, then typed claim authority |
+| #71 | 3B — retained root identity and bracketed Host Git |
+| #64 / #69 | implement harness — failure legibility, then the `stage_state` root cause |
+
+**T3b inherits an unchanged boundary:** T3a decides and reports; the report carries
+ordered historical evidence, not authority. A later actor must re-open, re-read,
+re-bind, and re-prove exact absence under its own lock. `effective()` still has no
+production consumer, and readiness remains the sole remaining gate.
+
+#### Sizing: the model failed four times, then a derived cap held
+
+Stated plainly rather than letting the eventual convergence flatter the process.
+Increment 3 was planned as **one 600-line slice** and took **five dispatches** —
+3A, 3A-1, 3A-2, 3B, 3B-repair — because its measured surface was 995.
+
+| Slice | Projected | Delivered | Ratio |
+|---|---:|---:|---:|
+| increment 2 | 455 | 673 | 1.48x |
+| 3A (whole) | 420 | 509 (floor — stopped at cap, incomplete) | ≥1.21x |
+| 3A-1 | 80 | 105 | 1.31x |
+| 3A-2 | 285 | 353 | 1.24x |
+| 3B | 575 | 800 | 1.39x |
+
+Every projection was grounded in measured current-crate regions, so the model
+under-counts **evidence**, not implementation.
+
+3B was the first cap **derived** rather than inherited: 850, from the worst
+observed ratio applied to the measured projection. It held at 800. The inherited
+600 anchor would have fired before a line was written and forced a split of work
+that fits. That derivation is now the rule in *Universal slice rules →
+Implementation discipline*.
+
 ### R2f1b 3d T3a carried ledger — three lane items and their slots
 
 Recorded 2026-08-21 after T3a increment 1, slice B, increment 2, and 3A-1 merged
@@ -1191,7 +1252,7 @@ is deliberately **not** repaired in the slice that found it.
 
 | Item | Evidence | Slot, and why |
 |---|---|---|
-| **Unix-only separator guard.** `is_custody_record_name` guards the empty-basename case with `!stem.ends_with('/')`, testing the forward slash only. A backslash-spelled path leaves a stem ending in `'\'`, so the guard does not fire and classification diverges from the Unix spelling. | Characterized deliberately by A2a-2 and carried unrepaired through A2b, slice B, and increment 2. | **After T3b, as its own small slice.** It sits in the code T3a/T3b are actively changing, so repairing it now would conflict with in-flight work. It is latent rather than live: CI runs `bridge-store` only on Windows, so no supported lane exercises a backslash sweep root today. Repair needs its own review because it changes classification. |
+| **Unix-only separator guard.** `is_custody_record_name` guards the empty-basename case with `!stem.ends_with('/')`, testing the forward slash only. A backslash-spelled path leaves a stem ending in `'\'`, so the guard does not fire and classification diverges from the Unix spelling. | Characterized deliberately by A2a-2 and carried unrepaired through A2b, slice B, and increment 2. | **After T3b, as its own small slice. T3a is now COMPLETE (`cafeae13`), so this is due once T3b lands.** It sits in the code T3b is still changing, so repairing it now would conflict with in-flight work. It is latent rather than live: CI runs `bridge-store` only on Windows, so no supported lane exercises a backslash sweep root today. Repair needs its own review because it changes classification. |
 | **The F8 birthtime ruling rests on one filesystem.** Slice B's probe observed `retained=some pinned=some final_named=some → Pinned` on macOS/APFS — homogeneous, so the classifier-policy stop did not fire and A2b's strict-equality policy stands. | The ext4 lane is *expected* to report `none/none/none`, also homogeneous, also `Pinned`, but that line has never been captured because CI does not run `--nocapture`. | **Opportunistic, not a slice.** One `cargo test -p bridge-worktree --locked root_capture_birthtime_capability_is_homogeneous_across_the_three_captures -- --exact --nocapture` on any Linux run closes it. Ride it along with the next CI touch. A **mixed** result would re-open the ruling and escalate to the classifier-policy question. |
 | **`force_next_release_failure_for` flake.** A 3-test group in `compatibility_schedule_state.rs` that historically forced a CI re-run on 2 of 3 PRs. | `[MEASURED]` Dormant across **seven consecutive PRs** (#62-#68), every one green on first run. | **Propose closing as dormant** rather than spending a slice. Seven clean runs is stronger evidence than the original intermittent signal. If it recurs, it re-opens with fresh evidence and a same-environment control; the mechanism hypothesis (thread-local leak across reused harness threads) was never proven and should not be revived without one. |
 
