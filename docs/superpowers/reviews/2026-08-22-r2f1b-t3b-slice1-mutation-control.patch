@@ -1,0 +1,17 @@
+diff --git a/crates/bridge-worktree/src/settle.rs b/crates/bridge-worktree/src/settle.rs
+--- a/crates/bridge-worktree/src/settle.rs
++++ b/crates/bridge-worktree/src/settle.rs
+@@ -130,13 +130,5 @@ impl SettlementWindowV1 {
+         let record = read_custody_record_in(&root, &record_name)?;
+         let second_bytes = canonical_bytes(&record)?;
+-        if first_bytes != second_bytes {
+-            return Err(SettlementWindowRefusalV1::RecordChangedUnderWindow(
+-                format!(
+-                    "{} changed between the publication-only and both-cell reads",
+-                    record_name.to_string_lossy()
+-                ),
+-            ));
+-        }
+         if record.worktree.canonical_path != canonical_worktree_path {
+             return Err(SettlementWindowRefusalV1::SubjectNotConstructible(format!(
+                 "record worktree path {} does not match requested path {canonical_worktree_path}",

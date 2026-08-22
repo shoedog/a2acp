@@ -44,6 +44,9 @@
 //! * the context-free deletion gate and every sweep-side caller take the PUBLICATION cell only,
 //!   with the refusing acquirer — `backend::CheckoutRemovalWindowV1` and
 //!   `sweep::remove_worktree_if_safe`.
+//! * the settlement window takes the publication cell then the custody cell, both with the
+//!   refusing acquirers, and retains them across its later decide-and-act sequence
+//!   (`settle::SettlementWindowV1`).
 //!
 //! **File lock inside in-process mutex.** There are THREE deliberate inverse nestings. The
 //! deletion gate takes the publication cell while holding the cleanup cell's async `state` mutex
