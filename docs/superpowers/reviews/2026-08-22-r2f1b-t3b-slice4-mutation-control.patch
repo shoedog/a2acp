@@ -1,0 +1,13 @@
+diff --git a/crates/bridge-worktree/src/custody_writer.rs b/crates/bridge-worktree/src/custody_writer.rs
+index 5c9aad93..5ad41589 100644
+--- a/crates/bridge-worktree/src/custody_writer.rs
++++ b/crates/bridge-worktree/src/custody_writer.rs
+@@ -727,7 +727,7 @@ impl WorktreeCustodianV1 {
+         };
+         match retire_captured_regular_child_v2(
+             proof.pinned_root(),
+-            proof.record_name(),
++            OsStr::new("not-the-settled-marker"),
+             expected,
+             "settled custody marker",
+         ) {

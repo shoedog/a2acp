@@ -80,6 +80,9 @@ use crate::custody_lock::{
     acquire_custody_lock_blocking_in, acquire_publication_lock_blocking_in, CustodyLockGuardV1,
     CustodyLockRefusalV1, PublicationLockGuardV1,
 };
+use crate::host_git::HostGitWorktree;
+use crate::settle::{reprove_under_window, ProvenSettlementV1, SettlementWindowV1};
+use crate::sweep::{ExactAbsenceProbeV1, ExactAbsenceSweepEntryV1, ExactAbsenceSweepReportV1};
 use bridge_core::execution_policy::{
     select_custody_plan_v1, BoundWorktreeCustodyV1, FrozenCheckoutEffectV1, WorktreeCustodyIdV1,
     WorktreeObjectIdentityV1,
@@ -87,8 +90,10 @@ use bridge_core::execution_policy::{
 #[cfg(unix)]
 use bridge_core::fs_custody::BirthTimeV1;
 use bridge_core::fs_custody::{
-    open_options_create_new_owner_private, ChildNameV2, CustodyPublicationV1, DirectoryIdentityV1,
-    FsCustodyError, PinnedDirectoryV1, RegularChildRefV1, ReservedNameNamespaceV2,
+    open_options_create_new_owner_private, required_file_content_snapshot_v2,
+    retire_captured_regular_child_v2, ChildNameV2, CustodyPublicationV1, DirectoryIdentityV1,
+    FsCustodyError, MarkerRetirementOutcomeV1, PinnedDirectoryV1, RegularChildRefV1,
+    ReservedNameNamespaceV2,
 };
 use bridge_core::liveness::{acquire_lease_in, LeaseGuard};
 use bridge_workflow::run_spec::WorkflowSnapshotV3;
@@ -119,6 +124,76 @@ impl From<FsCustodyError> for CustodyWriteRefusalV1 {
     fn from(error: FsCustodyError) -> Self {
         Self::Failed(error.to_string())
     }
+}
+
+/// The outcome of attempting the one frozen `ProtectionPrepared -> UnusedSettled`
+/// transition and then retiring only its custody marker.
+///
+/// `StrandedUnusedSettled` is deliberately distinct from a generic refusal: the transition is
+/// known durable and the marker remains. It is an operator-visible, fail-closed residual; no
+/// later sweep can reconstruct the forbidden claim needed to authorize a second retirement.
+#[derive(Debug)]
+#[must_use = "a settlement result records whether marker retirement completed or left durable residue"]
+pub enum UnusedSettlementOutcomeV1 {
+    /// The marker was retired after the durable `UnusedSettled` transition.
+    Settled,
+    /// The durable `UnusedSettled` marker remains and requires operator visibility.
+    StrandedUnusedSettled(String),
+    /// The replace may have published `UnusedSettled`; the marker was not retired and no retry
+    /// is authorized because the durable transition state cannot be established.
+    TransitionUncertain(String),
+    /// Retirement may have moved or unlinked the marker but could not establish its terminal
+    /// durability. No retry is authorized from this result.
+    RetirementUncertain(String),
+    /// No transition was proven durable.
+    Refused(String),
+}
+
+impl UnusedSettlementOutcomeV1 {
+    #[must_use]
+    pub fn report_category(&self) -> &'static str {
+        match self {
+            Self::Settled => "unused-settled-retired",
+            Self::StrandedUnusedSettled(_) => "stranded-unused-settled",
+            Self::TransitionUncertain(_) => "unused-settlement-transition-uncertain",
+            Self::RetirementUncertain(_) => "unused-settlement-retirement-uncertain",
+            Self::Refused(_) => "unused-settlement-refused",
+        }
+    }
+}
+
+fn stranded_unused_settled(proof: &ProvenSettlementV1, detail: &str) -> UnusedSettlementOutcomeV1 {
+    tracing::warn!(
+        category = "stranded-unused-settled",
+        custody_id = proof.custody_id().as_str(),
+        worktree_path = proof.worktree_path(),
+        detail,
+        "unused settlement left a durable marker for operator disposition"
+    );
+    UnusedSettlementOutcomeV1::StrandedUnusedSettled(detail.to_string())
+}
+
+#[cfg(test)]
+static INTERRUPT_UNUSED_SETTLEMENT_AFTER_TRANSITION: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(test)]
+pub(crate) fn arm_unused_settlement_interruption_for_test() {
+    assert!(
+        !INTERRUPT_UNUSED_SETTLEMENT_AFTER_TRANSITION
+            .swap(true, std::sync::atomic::Ordering::SeqCst,),
+        "unused-settlement interruption is already armed"
+    );
+}
+
+#[cfg(test)]
+fn interrupt_unused_settlement_after_transition_for_test() -> bool {
+    INTERRUPT_UNUSED_SETTLEMENT_AFTER_TRANSITION.swap(false, std::sync::atomic::Ordering::SeqCst)
+}
+
+#[cfg(not(test))]
+fn interrupt_unused_settlement_after_transition_for_test() -> bool {
+    false
 }
 
 /// What one `preserve_after_cancel` sequence settled on.
@@ -559,6 +634,124 @@ impl WorktreeCustodianV1 {
     #[must_use]
     pub fn pinned_root(&self) -> &PinnedDirectoryV1 {
         &self.root
+    }
+
+    /// Settle one report-selected, exactly absent candidate through the production read-only
+    /// Git probe. The probe can spawn only the two query verbs pinned by the colocated test; this
+    /// method itself never starts a process and never asks Git to mutate a worktree.
+    ///
+    /// This is an associated function rather than an instance method because `ProvenSettlementV1`
+    /// already owns the held publication and custody cells. Entering another writer custodian
+    /// here would block on those same cells and break the one-window proof-to-retirement rule.
+    pub fn replace_unused_settled(
+        worktree_root: &Path,
+        canonical_worktree_path: &str,
+        report: &ExactAbsenceSweepReportV1,
+        entry: &ExactAbsenceSweepEntryV1,
+    ) -> UnusedSettlementOutcomeV1 {
+        let probe = HostGitWorktree::new();
+        Self::replace_unused_settled_with_probe(
+            worktree_root,
+            canonical_worktree_path,
+            report,
+            entry,
+            &probe,
+        )
+    }
+
+    /// The same settlement route with an injected read-only probe for focused tests. Production
+    /// uses [`Self::replace_unused_settled`], which supplies [`HostGitWorktree`].
+    pub(crate) fn replace_unused_settled_with_probe(
+        worktree_root: &Path,
+        canonical_worktree_path: &str,
+        report: &ExactAbsenceSweepReportV1,
+        entry: &ExactAbsenceSweepEntryV1,
+        probe: &dyn ExactAbsenceProbeV1,
+    ) -> UnusedSettlementOutcomeV1 {
+        let window = match SettlementWindowV1::open(worktree_root, canonical_worktree_path) {
+            Ok(window) => window,
+            Err(refusal) => return UnusedSettlementOutcomeV1::Refused(refusal.to_string()),
+        };
+        let proof = match reprove_under_window(window, report, entry, probe) {
+            Ok(proof) => proof,
+            Err(refusal) => return UnusedSettlementOutcomeV1::Refused(refusal.to_string()),
+        };
+        Self::replace_proven_unused_settled(proof)
+    }
+
+    fn replace_proven_unused_settled(proof: ProvenSettlementV1) -> UnusedSettlementOutcomeV1 {
+        let mut settled = proof.record().clone();
+        if settled.state.kind() != WorktreeCustodyStateKindV1::ProtectionPrepared
+            || !transition_is_legal(
+                WorktreeCustodyStateKindV1::ProtectionPrepared,
+                WorktreeCustodyStateKindV1::UnusedSettled,
+            )
+        {
+            return UnusedSettlementOutcomeV1::Refused(
+                "the frozen custody table does not permit unused settlement".to_string(),
+            );
+        }
+        settled.state = WorktreeCustodyStateV1::UnusedSettled {};
+        settled.claim = None;
+        if let Err(error) = settled.validate_for_publication() {
+            return UnusedSettlementOutcomeV1::Refused(error.to_string());
+        }
+        match publish_custody_record_in(
+            proof.pinned_root(),
+            proof.record_name(),
+            &settled,
+            PublicationModeV1::Replace,
+        ) {
+            Ok(()) => {}
+            Err(CustodyWriteRefusalV1::Ambiguous(detail)) => {
+                return UnusedSettlementOutcomeV1::TransitionUncertain(detail)
+            }
+            Err(error) => return UnusedSettlementOutcomeV1::Refused(error.to_string()),
+        }
+        if interrupt_unused_settlement_after_transition_for_test() {
+            return stranded_unused_settled(
+                &proof,
+                "test interruption after durable transition and before marker retirement",
+            );
+        }
+        let marker = match proof
+            .pinned_root()
+            .open_regular_file(proof.record_name(), "settled custody marker")
+        {
+            Ok(marker) => marker,
+            Err(error) => return stranded_unused_settled(&proof, &error.to_string()),
+        };
+        let expected = match required_file_content_snapshot_v2(&marker, "settled custody marker") {
+            Ok(snapshot) => snapshot.object,
+            Err(error) => return stranded_unused_settled(&proof, &error.to_string()),
+        };
+        match retire_captured_regular_child_v2(
+            proof.pinned_root(),
+            proof.record_name(),
+            expected,
+            "settled custody marker",
+        ) {
+            MarkerRetirementOutcomeV1::Retired => UnusedSettlementOutcomeV1::Settled,
+            MarkerRetirementOutcomeV1::RefusedNoEffect(error)
+            | MarkerRetirementOutcomeV1::CapturedRetained(error)
+            | MarkerRetirementOutcomeV1::RuntimeUnsupported(error) => {
+                stranded_unused_settled(&proof, &error)
+            }
+            MarkerRetirementOutcomeV1::CompileUnsupported => {
+                stranded_unused_settled(&proof, "marker retirement is unsupported on this platform")
+            }
+            MarkerRetirementOutcomeV1::CaptureUncertain(error)
+            | MarkerRetirementOutcomeV1::RetiredUnsynced(error) => {
+                UnusedSettlementOutcomeV1::RetirementUncertain(error)
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn replace_proven_unused_settled_for_test(
+        proof: ProvenSettlementV1,
+    ) -> UnusedSettlementOutcomeV1 {
+        Self::replace_proven_unused_settled(proof)
     }
 
     /// Publish `ProtectionPrepared` with the NO-REPLACE primitive, before any provider effect.
@@ -1068,103 +1261,101 @@ impl WorktreeCustodianV1 {
         record: &WorktreeCustodyRecordV1,
         mode: PublicationModeV1,
     ) -> Result<(), CustodyWriteRefusalV1> {
-        let bytes = record.encode_canonical()?;
-        let staged_name = staged_record_name(&self.record_name)?;
-        let staged_path = self.root_path.join(&staged_name);
-        let mut file = open_options_create_new_owner_private()
-            .open(&staged_path)
-            .map_err(|error| {
-                CustodyWriteRefusalV1::Failed(format!(
-                    "custody record could not be staged: {error}"
-                ))
-            })?;
-        let staged = (|| -> Result<(), CustodyWriteRefusalV1> {
-            file.write_all(&bytes).map_err(|error| {
-                CustodyWriteRefusalV1::Failed(format!(
-                    "custody record could not be written: {error}"
-                ))
-            })?;
-            // The publication primitives sync the DIRECTORY; syncing the file's own bytes is the
-            // documented caller obligation, and skipping it would publish a name that can survive
-            // a crash pointing at empty content.
-            file.sync_all().map_err(|error| {
-                CustodyWriteRefusalV1::Failed(format!(
-                    "custody record could not be synced: {error}"
-                ))
-            })
-        })();
-        if let Err(error) = staged {
-            // No unlink here either. The tempting argument — "nothing was published, so the
-            // staged object is provably ours" — is FALSE: what we hold is a descriptor, and the
-            // NAME can have been exchanged since `create_new` returned. `remove_file` addresses
-            // the name, not our descriptor, so it would delete whatever now occupies it.
-            self.quarantine_residue(&staged_path, &error.to_string());
-            return Err(error);
-        }
-
-        let source = RegularChildRefV1::new(OsStr::new(&staged_name), &file);
-        let published = match mode {
-            PublicationModeV1::NoReplace => self.root.publish_new_regular_child(
-                source,
-                &self.record_name,
-                "worktree custody record",
-            ),
-            PublicationModeV1::Replace => self.root.replace_regular_child(
-                source,
-                &self.record_name,
-                "worktree custody record",
-            ),
-        };
-        match published {
-            // A true `Err` PROVES the rename did not happen (for a no-replace publish that
-            // includes the ordinary `EEXIST`, where another owner published first). The staged
-            // object is provably still ours — but §5.7 row 2 says "quarantine temp", so it is
-            // left in place, not unlinked: an unreferenced, inert, named artifact is a better
-            // recovery signal than a silent deletion, and the residue naming rules make it
-            // harmless.
-            Err(error) => {
-                self.quarantine_residue(&staged_path, &error.to_string());
-                Err(error.into())
-            }
-            Ok(outcome) => {
-                self.settle_residue(&staged_path, &outcome);
-                match outcome.ambiguity() {
-                    None => Ok(()),
-                    Some(detail) => Err(CustodyWriteRefusalV1::Ambiguous(detail.to_string())),
-                }
-            }
-        }
+        publish_custody_record_in(&self.root, &self.record_name, record, mode)
     }
 
-    /// The staged-source residue policy, in one place. See the module docs.
-    ///
-    /// **This function unlinks nothing, in any arm, and that is the whole rule.** The durable arm
-    /// used to `remove_file(staged_path)` on the reasoning that "a committed rename frees the
-    /// source name, so the unlink is a harmless no-op". That reasoning is exactly backwards: if
-    /// the name is free the call does nothing, and the ONLY circumstance in which it does
-    /// anything is the one where another actor has created a file at that name since the rename —
-    /// i.e. it deletes a foreign object, and one whose identity was never checked. Pinned by
-    /// `a_durable_publication_never_unlinks_the_staging_pathname`.
+    #[cfg(test)]
     fn settle_residue(&self, staged_path: &Path, outcome: &CustodyPublicationV1) {
-        if outcome.is_durable() {
-            // The rename consumed the source name. Nothing to do — and nothing we are entitled
-            // to do to whatever may occupy that name now.
-            return;
-        }
-        self.quarantine_residue(staged_path, outcome.ambiguity().unwrap_or_default());
+        settle_custody_staging_residue(&self.root, &self.record_name, staged_path, outcome);
+    }
+}
+
+/// Stage one custody record through the sole publication derivation shared by writers and
+/// unused-marker settlement. The pinned root and one-component record name make every write and
+/// parent sync descriptor-relative; staging residue is deliberately quarantined, never unlinked.
+fn publish_custody_record_in(
+    pin: &PinnedDirectoryV1,
+    name: &OsStr,
+    record: &WorktreeCustodyRecordV1,
+    mode: PublicationModeV1,
+) -> Result<(), CustodyWriteRefusalV1> {
+    let bytes = record.encode_canonical()?;
+    let staged_name = staged_record_name(name)?;
+    let staged_path = pin.canonical_path().join(&staged_name);
+    let mut file = open_options_create_new_owner_private()
+        .open(&staged_path)
+        .map_err(|error| {
+            CustodyWriteRefusalV1::Failed(format!("custody record could not be staged: {error}"))
+        })?;
+    let staged = (|| -> Result<(), CustodyWriteRefusalV1> {
+        file.write_all(&bytes).map_err(|error| {
+            CustodyWriteRefusalV1::Failed(format!("custody record could not be written: {error}"))
+        })?;
+        // Publication synchronizes the parent directory; the caller must synchronize the new
+        // file before it is named or a crash can leave a durable empty record.
+        file.sync_all().map_err(|error| {
+            CustodyWriteRefusalV1::Failed(format!("custody record could not be synced: {error}"))
+        })
+    })();
+    if let Err(error) = staged {
+        quarantine_custody_residue(pin, name, &staged_path, &error.to_string());
+        return Err(error);
     }
 
-    fn quarantine_residue(&self, staged_path: &Path, detail: &str) {
-        tracing::warn!(
-            worktree_path = self.worktree_path,
-            staged = %staged_path.display(),
-            detail,
-            "quarantining a staged custody record: unlinking an object whose identity or effect \
-             is unproven is a destructive act on unknown evidence. The residue matches neither \
-             sweep pattern, carries a unique nonce so no later attempt collides with it, and is \
-             surfaced by the storage report for owner disposition."
-        );
+    let source = RegularChildRefV1::new(OsStr::new(&staged_name), &file);
+    let published = match mode {
+        PublicationModeV1::NoReplace => {
+            pin.publish_new_regular_child(source, name, "worktree custody record")
+        }
+        PublicationModeV1::Replace => {
+            pin.replace_regular_child(source, name, "worktree custody record")
+        }
+    };
+    match published {
+        Err(error) => {
+            quarantine_custody_residue(pin, name, &staged_path, &error.to_string());
+            Err(error.into())
+        }
+        Ok(outcome) => {
+            settle_custody_staging_residue(pin, name, &staged_path, &outcome);
+            match outcome.ambiguity() {
+                None => Ok(()),
+                Some(detail) => Err(CustodyWriteRefusalV1::Ambiguous(detail.to_string())),
+            }
+        }
     }
+}
+
+fn settle_custody_staging_residue(
+    pin: &PinnedDirectoryV1,
+    name: &OsStr,
+    staged_path: &Path,
+    outcome: &CustodyPublicationV1,
+) {
+    if outcome.is_durable() {
+        return;
+    }
+    quarantine_custody_residue(
+        pin,
+        name,
+        staged_path,
+        outcome.ambiguity().unwrap_or_default(),
+    );
+}
+
+fn quarantine_custody_residue(
+    pin: &PinnedDirectoryV1,
+    name: &OsStr,
+    staged_path: &Path,
+    detail: &str,
+) {
+    tracing::warn!(
+        root = %pin.canonical_path().display(),
+        custody_record = %name.to_string_lossy(),
+        staged = %staged_path.display(),
+        detail,
+        "quarantining a staged custody record; it is left as inert recovery evidence"
+    );
 }
 
 /// Return the exact frozen checkout effect that a custody binding selected from a snapshot.

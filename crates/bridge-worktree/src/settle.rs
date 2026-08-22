@@ -269,6 +269,11 @@ impl ProvenSettlementV1 {
     pub fn worktree_path(&self) -> &str {
         self.window.worktree_path()
     }
+
+    #[must_use]
+    pub(crate) fn pinned_root(&self) -> &PinnedDirectoryV1 {
+        self.window.pinned_root()
+    }
 }
 
 /// Re-prove a report entry under its held window before any later settlement effect.
@@ -339,13 +344,18 @@ mod tests {
         custody_lock_dir, custody_lock_id, custody_publication_lock_id,
         try_acquire_custody_lock_in, try_acquire_publication_lock_in,
     };
-    use crate::custody_writer::planned_identity;
+    use crate::custody_writer::{
+        arm_unused_settlement_interruption_for_test, planned_identity, UnusedSettlementOutcomeV1,
+        WorktreeCustodianV1,
+    };
     use crate::sweep::{
         sweep_orphans_with_exact_absence, CustodyRootObservationV1, ExactAbsenceEnumerationV1,
-        ExactAbsenceScanStatusV1, ExactAbsenceSweepReportV1,
+        ExactAbsenceObservationV1, ExactAbsenceScanStatusV1, ExactAbsenceSweepReportV1,
     };
     use bridge_core::execution_policy::{PolicyNodeRefV1, Sha256HexV1, WorktreeObjectIdentityV1};
-    use bridge_core::fs_custody::{verify_payload_directory_identity, DirectoryIdentityV1};
+    use bridge_core::fs_custody::{
+        verify_payload_directory_identity, DirectoryIdentityV1, PublicationRenameFaultV1,
+    };
     use bridge_core::ids::{AttemptId, AttemptIdentity, ExecutionId};
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -489,12 +499,55 @@ mod tests {
 
     fn authoritative_report(
         root: &Path,
-        probe: &CurrentAbsenceProbeV1,
+        probe: &dyn ExactAbsenceProbeV1,
     ) -> ExactAbsenceSweepReportV1 {
         let report = sweep_orphans_with_exact_absence(&root.to_string_lossy(), probe);
         assert!(report.has_authoritative_scan());
         assert_eq!(report.entries().len(), 1);
         report
+    }
+
+    struct ScriptedAbsenceProbeV1 {
+        source_common_dir: DirectoryIdentityV1,
+        observations: std::sync::Mutex<std::collections::VecDeque<ExactAbsenceObservationV1>>,
+    }
+
+    impl ExactAbsenceProbeV1 for ScriptedAbsenceProbeV1 {
+        fn observe_source_common_dir_identity(
+            &self,
+            _: &str,
+        ) -> Result<DirectoryIdentityV1, bridge_core::error::BridgeError> {
+            Ok(self.source_common_dir.clone())
+        }
+
+        fn observe_exact_absence(
+            &self,
+            _: &crate::sweep::ExactAbsenceCandidateV1,
+        ) -> Result<ExactAbsenceObservationV1, bridge_core::error::BridgeError> {
+            self.observations
+                .lock()
+                .unwrap()
+                .pop_front()
+                .ok_or_else(|| bridge_core::error::BridgeError::ConfigInvalid {
+                    reason: "test exact-absence probe exhausted".to_string(),
+                })
+        }
+    }
+
+    fn scripted_probe(
+        record: &WorktreeCustodyRecordV1,
+        observations: impl IntoIterator<Item = ExactAbsenceObservationV1>,
+    ) -> ScriptedAbsenceProbeV1 {
+        ScriptedAbsenceProbeV1 {
+            source_common_dir: record
+                .claim
+                .as_ref()
+                .unwrap()
+                .common_dir
+                .directory_identity
+                .clone(),
+            observations: std::sync::Mutex::new(observations.into_iter().collect()),
+        }
     }
 
     /// A settlement actor that uses the writer's fixed publication-then-custody ordering. This
@@ -895,9 +948,363 @@ mod tests {
         remove_root(&root);
     }
 
+    /// Mutation-proof: all three exact-absence arms reach the transition only through a fresh
+    /// report-equivalent re-proof. A present checkout and a registered-but-absent checkout leave
+    /// their marker untouched; only both absent retires the marker, never the source checkout.
+    #[test]
+    fn unused_candidate_settles_only_after_exact_absence() {
+        for (name, current, create_target) in [
+            (
+                "target-present",
+                ExactAbsenceObservationV1::TargetPresent,
+                true,
+            ),
+            (
+                "registered-but-absent",
+                ExactAbsenceObservationV1::RegisteredButAbsent,
+                false,
+            ),
+            ("both-absent", ExactAbsenceObservationV1::BothAbsent, false),
+        ] {
+            let root = root(name);
+            let target = root.join("ownr-run7-abc");
+            let record = write_authorized_record(&root, &target, '2');
+            let probe = scripted_probe(&record, [ExactAbsenceObservationV1::BothAbsent, current]);
+            let report = authoritative_report(&root, &probe);
+            let marker = root.join(custody_record_name(&target.to_string_lossy()).unwrap());
+            let before = fs::read(&marker).unwrap();
+            if create_target {
+                fs::create_dir(&target).unwrap();
+            }
+
+            let outcome = WorktreeCustodianV1::replace_unused_settled_with_probe(
+                &root,
+                &target.to_string_lossy(),
+                &report,
+                &report.entries()[0],
+                &probe,
+            );
+
+            if current == ExactAbsenceObservationV1::BothAbsent {
+                assert!(matches!(outcome, UnusedSettlementOutcomeV1::Settled));
+                assert!(!marker.exists(), "only the custody marker may be retired");
+                assert!(
+                    root.join("source-2").is_dir(),
+                    "settlement must not touch the source checkout directory"
+                );
+                assert!(
+                    !target.exists(),
+                    "the exact-absence target was never materialized"
+                );
+            } else {
+                assert!(matches!(outcome, UnusedSettlementOutcomeV1::Refused(_)));
+                assert_eq!(fs::read(&marker).unwrap(), before);
+                if create_target {
+                    assert!(
+                        target.is_dir(),
+                        "a refused settlement must not delete a checkout"
+                    );
+                }
+            }
+            remove_root(&root);
+        }
+    }
+
+    /// Mutation-proof: an in-flight materialization must not reuse the unused-candidate route
+    /// even when a scan could otherwise report exact absence.
+    #[test]
+    fn a_materialization_in_flight_candidate_is_never_settled() {
+        let root = root("materialization-in-flight");
+        let target = root.join("ownr-run7-abc");
+        let mut record = write_authorized_record(&root, &target, '3');
+        record.state = WorktreeCustodyStateV1::PreservationUnknown {
+            reason: PreservationReasonV1::MaterializationInFlight,
+        };
+        record.claim.as_mut().unwrap().reason = PreservationReasonV1::MaterializationInFlight;
+        let marker = root.join(custody_record_name(&target.to_string_lossy()).unwrap());
+        fs::write(&marker, record.encode_canonical().unwrap()).unwrap();
+        let before = fs::read(&marker).unwrap();
+        let probe = scripted_probe(
+            &record,
+            [
+                ExactAbsenceObservationV1::BothAbsent,
+                ExactAbsenceObservationV1::BothAbsent,
+            ],
+        );
+        let report = authoritative_report(&root, &probe);
+
+        let outcome = WorktreeCustodianV1::replace_unused_settled_with_probe(
+            &root,
+            &target.to_string_lossy(),
+            &report,
+            &report.entries()[0],
+            &probe,
+        );
+
+        assert!(matches!(outcome, UnusedSettlementOutcomeV1::Refused(_)));
+        assert_eq!(fs::read(marker).unwrap(), before);
+        remove_root(&root);
+    }
+
+    /// Fault-proof: uncertain replace publication is never collapsed into a no-effect refusal.
+    /// Parent-sync ambiguity proves the new marker name exists but not its durability; the
+    /// rename seam proves neither candidate state. Both must stop before marker retirement.
+    #[test]
+    fn ambiguous_unused_publication_is_transition_uncertain() {
+        #[derive(Clone, Copy)]
+        enum Fault {
+            ParentSync,
+            RenameOutcome,
+        }
+
+        for (name, fault) in [
+            ("unused-parent-sync", Fault::ParentSync),
+            ("unused-rename-outcome", Fault::RenameOutcome),
+        ] {
+            let root = root(name);
+            let target = root.join("ownr-run7-abc");
+            let record = write_authorized_record(&root, &target, '4');
+            let probe = scripted_probe(
+                &record,
+                [
+                    ExactAbsenceObservationV1::BothAbsent,
+                    ExactAbsenceObservationV1::BothAbsent,
+                ],
+            );
+            let report = authoritative_report(&root, &probe);
+            let marker = root.join(custody_record_name(&target.to_string_lossy()).unwrap());
+            let window = SettlementWindowV1::open(&root, &target.to_string_lossy()).unwrap();
+            let proof =
+                reprove_under_window(window, &report, &report.entries()[0], &probe).unwrap();
+            match fault {
+                Fault::ParentSync => proof.pinned_root().fail_sync_on_nth_call_for_test(1),
+                Fault::RenameOutcome => proof
+                    .pinned_root()
+                    .fail_publication_rename_on_nth_call_for_test(
+                        1,
+                        PublicationRenameFaultV1::UnlinkSourceOnly,
+                    ),
+            }
+
+            let outcome = WorktreeCustodianV1::replace_proven_unused_settled_for_test(proof);
+
+            assert!(matches!(
+                outcome,
+                UnusedSettlementOutcomeV1::TransitionUncertain(_)
+            ));
+            assert_eq!(
+                outcome.report_category(),
+                "unused-settlement-transition-uncertain"
+            );
+            if matches!(fault, Fault::ParentSync) {
+                assert!(matches!(
+                    WorktreeCustodyRecordV1::decode_canonical(&fs::read(marker).unwrap())
+                        .unwrap()
+                        .state,
+                    WorktreeCustodyStateV1::UnusedSettled {}
+                ));
+            }
+            remove_root(&root);
+        }
+    }
+
+    /// Mutation-proof: the settlement writer relies on the ten already-frozen transitions and
+    /// adds neither a new edge nor any edge out of `UnusedSettled`.
+    #[test]
+    fn the_frozen_transition_table_is_unchanged() {
+        use crate::custody::WorktreeCustodyStateKindV1 as K;
+        use crate::custody::LEGAL_CUSTODY_TRANSITIONS_V1;
+
+        let expected: &[(K, K)] = &[
+            (K::ProtectionPrepared, K::UnusedSettled),
+            (K::ProtectionPrepared, K::Materializing),
+            (K::Materializing, K::LiveProtected),
+            (K::Materializing, K::PreservationUnknown),
+            (K::LiveProtected, K::PreservationPrepared),
+            (K::LiveProtected, K::DeleteAuthorized),
+            (K::LiveProtected, K::RecoveredLive),
+            (K::PreservationPrepared, K::Preserved),
+            (K::PreservationPrepared, K::PreservationUnknown),
+            (K::DeleteAuthorized, K::Removed),
+        ];
+        assert_eq!(LEGAL_CUSTODY_TRANSITIONS_V1.len(), 10);
+        assert_eq!(LEGAL_CUSTODY_TRANSITIONS_V1, expected);
+        assert!(
+            !LEGAL_CUSTODY_TRANSITIONS_V1
+                .iter()
+                .any(|(from, _)| *from == K::UnusedSettled),
+            "the stranded marker must remain terminal"
+        );
+    }
+
+    /// Mutation-proof: an interruption after durable transition but before marker retirement
+    /// leaves the state legible, reports its distinct category, and never deletes checkout data.
+    #[test]
+    fn interruption_between_unused_transition_and_marker_retirement_strands_a_recognizable_marker()
+    {
+        let root = root("stranded-unused-settled");
+        let target = root.join("ownr-run7-abc");
+        let record = write_authorized_record(&root, &target, '4');
+        let probe = scripted_probe(
+            &record,
+            [
+                ExactAbsenceObservationV1::BothAbsent,
+                ExactAbsenceObservationV1::BothAbsent,
+            ],
+        );
+        let report = authoritative_report(&root, &probe);
+        let marker = root.join(custody_record_name(&target.to_string_lossy()).unwrap());
+        arm_unused_settlement_interruption_for_test();
+
+        let outcome = WorktreeCustodianV1::replace_unused_settled_with_probe(
+            &root,
+            &target.to_string_lossy(),
+            &report,
+            &report.entries()[0],
+            &probe,
+        );
+
+        assert!(matches!(
+            outcome,
+            UnusedSettlementOutcomeV1::StrandedUnusedSettled(_)
+        ));
+        assert_eq!(outcome.report_category(), "stranded-unused-settled");
+        let stranded =
+            WorktreeCustodyRecordV1::decode_canonical(&fs::read(marker).unwrap()).unwrap();
+        assert!(matches!(
+            stranded.state,
+            WorktreeCustodyStateV1::UnusedSettled {}
+        ));
+        assert!(stranded.claim.is_none());
+        assert_eq!(
+            stranded.sweep_disposition().report_category(),
+            "stranded-unused-settled"
+        );
+        assert!(
+            root.join("source-4").is_dir(),
+            "marker retirement must never remove the source checkout directory"
+        );
+        remove_root(&root);
+    }
+
+    /// Mutation-proof: the refusing window blocks settlement before re-proof or publication.
+    #[test]
+    fn settlement_is_refused_when_the_window_is_not_held() {
+        let root = root("settlement-window-held");
+        let target = root.join("ownr-run7-abc");
+        let record = write_authorized_record(&root, &target, '5');
+        let probe = scripted_probe(&record, [ExactAbsenceObservationV1::BothAbsent]);
+        let report = authoritative_report(&root, &probe);
+        let marker = root.join(custody_record_name(&target.to_string_lossy()).unwrap());
+        let before = fs::read(&marker).unwrap();
+        let held = try_acquire_publication_lock_in(&root, &target.to_string_lossy()).unwrap();
+
+        let outcome = WorktreeCustodianV1::replace_unused_settled_with_probe(
+            &root,
+            &target.to_string_lossy(),
+            &report,
+            &report.entries()[0],
+            &probe,
+        );
+
+        assert!(matches!(outcome, UnusedSettlementOutcomeV1::Refused(_)));
+        assert_eq!(fs::read(marker).unwrap(), before);
+        drop(held);
+        remove_root(&root);
+    }
+
+    /// The production settlement route wires `HostGitWorktree`; its two reachable Git verbs are
+    /// read-only queries, so adding remove, prune, or add to this probe path fails here.
+    #[test]
+    fn settlement_probe_git_verbs_are_query_only() {
+        let source = include_str!("host_git.rs");
+        let implementation = source
+            .split_once("impl ExactAbsenceProbeV1 for HostGitWorktree")
+            .unwrap_or_else(|| panic!("source slice is missing HostGitWorktree probe anchor"))
+            .1
+            .split_once("/// `git worktree remove`")
+            .unwrap_or_else(|| panic!("source slice is missing HostGitWorktree probe end anchor"))
+            .0;
+        let registration = source
+            .split_once("fn registration_absent_sync")
+            .unwrap_or_else(|| panic!("source slice is missing registration probe anchor"))
+            .1
+            .split_once("impl ExactAbsenceProbeV1 for HostGitWorktree")
+            .unwrap_or_else(|| panic!("source slice is missing registration probe end anchor"))
+            .0;
+        let probe = format!("{implementation}{registration}");
+        let reachable_query_operations = [
+            ("rev-parse", probe.contains("\"rev-parse\"")),
+            ("list_porcelain_argv", probe.contains("list_porcelain_argv")),
+        ];
+        assert_eq!(
+            reachable_query_operations
+                .iter()
+                .filter_map(|(name, present)| present.then_some(*name))
+                .collect::<Vec<_>>(),
+            vec!["rev-parse", "list_porcelain_argv"],
+            "the settlement probe has exactly the two approved query operations"
+        );
+        assert_eq!(
+            crate::provider::list_porcelain_argv("/repo"),
+            vec!["-C", "/repo", "worktree", "list", "--porcelain", "-z"]
+        );
+        for mutating_builder in ["remove_argv", "prune_argv", "add_argv"] {
+            assert!(
+                !probe.contains(mutating_builder),
+                "settlement probe must not reach mutating builder {mutating_builder}"
+            );
+        }
+    }
+
+    /// The added settlement code performs only custody publication and marker retirement. It
+    /// originates no Git, prune, recursive-directory removal, or process spawn; the read-only
+    /// probe is audited separately above. Missing source anchors name the broken audit boundary.
+    #[test]
+    fn settlement_effect_audit_forbids_unrelated_mutation_and_process_origins() {
+        fn source_slice<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
+            let after_start = source
+                .split_once(start)
+                .unwrap_or_else(|| panic!("source slice is missing start anchor: {start}"));
+            after_start
+                .1
+                .split_once(end)
+                .unwrap_or_else(|| panic!("source slice is missing end anchor: {end}"))
+                .0
+        }
+
+        let writer = include_str!("custody_writer.rs");
+        let settlement = source_slice(
+            writer,
+            "/// The outcome of attempting the one frozen `ProtectionPrepared -> UnusedSettled`",
+            "/// Publish `ProtectionPrepared`",
+        );
+        let publication = source_slice(
+            writer,
+            "fn publish_custody_record_in",
+            "/// Return the exact frozen checkout effect",
+        );
+        for forbidden in [
+            "std::process::Command",
+            "std::fs::remove_dir_all",
+            "std::fs::remove_file",
+            "std::fs::rename",
+            "remove_argv",
+            "prune_argv",
+            "add_argv",
+        ] {
+            assert!(
+                !settlement.contains(forbidden) && !publication.contains(forbidden),
+                "settlement source must not originate {forbidden}"
+            );
+        }
+        assert!(settlement.contains("reprove_under_window"));
+        assert!(settlement.contains("retire_captured_regular_child_v2"));
+    }
+
     /// Discriminates a later proof path gaining a mutation edge while still returning a capability.
-    /// Effect-freedom is conditional on the caller-supplied `ExactAbsenceProbeV1`; this slice has no
-    /// production caller, and any reachable spawn can arrive only through that supplied probe.
+    /// Effect-freedom is conditional on the caller-supplied `ExactAbsenceProbeV1`: re-proof itself
+    /// constructs no probe, and the production caller's query-only Git route is pinned separately.
     #[test]
     fn the_reproof_mints_no_effect() {
         let root = root("reproof-effect-audit");
