@@ -125,18 +125,27 @@ plan asserted did not exist — it claimed `is_custody_record_name` already reje
 between capture and unlink left nothing a scan would read as a record. It did not. Staging is deliberately
 untouched, so the exclusion is narrow.
 
-## Birthtime environment record
+## Birthtime environment record — five environments, all measured
 
-| Environment | Status |
-|---|---|
-| Implementation container, `fuseblk` (aarch64 orbstack) | **MEASURED** — `SLICE-3-BTIME capability=present outcome=retired` |
-| macOS/APFS host | **MEASURED by the operator** — `SLICE-3-BTIME capability=present outcome=retired` |
-| Verify container overlayfs | **EXCLUDED** — not observed under `--nocapture` |
-| Ubuntu/ext4 | **EXCLUDED** — not observed |
+`required_object_identity_v2` refuses without a birthtime, so on a `btime`-less filesystem this primitive
+refuses entirely. The plan required this be **measured in three environments, not inferred from one**. It is
+now measured in five, each by running the owning test with its fixture root on that filesystem under
+`--nocapture`:
 
-Two of four measured, both reporting a present birthtime. **Ubuntu/ext4 remains unmeasured and is named as
-excluded, not implied.** That is the lane's historically dangerous cell: a fixture once passed on macOS/APFS
-and on the container's overlayfs and was caught only by ubuntu/ext4. Nothing here is evidence about ext4.
+| Environment | How obtained | Result |
+|---|---|---|
+| Implementation container, `fuseblk` | implementer | `SLICE-3-BTIME capability=present outcome=retired` |
+| macOS/APFS host | operator | `SLICE-3-BTIME capability=present outcome=retired` |
+| **ext4** | operator — real ext4 built on a loopback image (`mkfs.ext4`, `mount -o loop`) inside a privileged container, `TMPDIR` pointed at the mount | `SLICE-3-BTIME capability=present outcome=retired`, and **all 10 marker-retirement tests pass there** |
+| overlayfs | operator — container root, `TMPDIR=/tmp` | `SLICE-3-BTIME capability=present outcome=retired` |
+| btrfs | operator — Docker named volume | `SLICE-3-BTIME capability=present outcome=retired` |
+
+**No environment is excluded, and none is inferred.** The ext4 cell is the one that matters: this lane
+previously shipped a fixture that passed on macOS/APFS *and* on the container's overlayfs and was caught only
+by ubuntu/ext4, so two agreeing environments have already proved insufficient here once. ext4 was measured
+directly rather than assumed to agree.
+
+The `fstype` was confirmed with `findmnt -no FSTYPE` at each mount rather than taken from how it was created.
 
 ## Counted lines
 
