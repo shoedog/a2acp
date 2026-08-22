@@ -336,6 +336,20 @@ mod tests {
         }
     }
 
+    fn complete_root_observations(root: &Path) -> RootObservationSetV1 {
+        let root = identity(root).directory_identity;
+        let capture = RootIdentityCaptureV1 {
+            dev: root.dev,
+            ino: root.ino,
+            birthtime: root.btime,
+        };
+        RootObservationSetV1 {
+            retained_enumeration_object: Some(capture),
+            pinned_custody_directory: Some(capture),
+            final_named_root: Some(capture),
+        }
+    }
+
     fn valid_records(root: &Path) -> (WorktreeSidecar, WorktreeCustodyRecordV1) {
         let source = root.join("source");
         let legacy_worktree = root.join("legacy");
@@ -828,6 +842,7 @@ mod tests {
         );
         source.legacy = Some(legacy);
         source.custody = Ok(custody);
+        source.observations = complete_root_observations(&root);
         let probe = probe(Some(ExactAbsenceObservationV1::BothAbsent), log);
         let outcome = super::super::project_exact_scan_result(
             crate::provider_path::canonicalize_lenient(root.to_str().unwrap()).unwrap(),
@@ -880,6 +895,7 @@ mod tests {
                 let mut source = script(log.clone(), VecDeque::from([Ok(OsString::from(name))]));
                 source.legacy = legacy_record;
                 source.custody = custody_record;
+                source.observations = complete_root_observations(&root);
                 let outcome = super::super::project_exact_scan_result(
                     crate::provider_path::canonicalize_lenient(root.to_str().unwrap()).unwrap(),
                     scan_checked_rows_for_test(&root, &source),
@@ -893,6 +909,51 @@ mod tests {
                 );
             }
         }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn complete_disagreeing_root_observation_is_typed_identity_changed() {
+        let root = temp_root("disagreeing-root-observation");
+        let (_, custody) = valid_records(&root);
+        let custody_path = PathBuf::from(custody_record_path(&custody.worktree.canonical_path));
+        let custody_bytes = std::fs::read(&custody_path).unwrap();
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let mut source = script(
+            log.clone(),
+            VecDeque::from([Ok(OsString::from("custody.custody.v1.json"))]),
+        );
+        source.custody = Ok(custody);
+        let mut observations = complete_root_observations(&root);
+        observations.final_named_root.as_mut().unwrap().ino = Some(
+            observations
+                .final_named_root
+                .unwrap()
+                .ino
+                .unwrap()
+                .checked_add(1)
+                .unwrap(),
+        );
+        source.observations = observations;
+        let probe = probe(Some(ExactAbsenceObservationV1::BothAbsent), log);
+        let outcome = super::super::project_exact_scan_result(
+            crate::provider_path::canonicalize_lenient(root.to_str().unwrap()).unwrap(),
+            scan_checked_rows_for_test(&root, &source),
+            &probe,
+        );
+        let (_, _, _, rows) = outcome.into_exact_parts().unwrap();
+        let super::ExactAbsenceRecordAssessmentV1::Custody(assessment) = &rows[0].assessment else {
+            panic!("row must remain a readable custody row");
+        };
+        assert!(matches!(
+            assessment.assessment(),
+            crate::sweep::CustodyExactAbsenceAssessmentV1::CannotConstructSubject(
+                crate::sweep::CannotConstructSubjectV1::ClaimAuthorityUnavailable(refusal)
+            ) if refusal.object() == crate::sweep::ClaimAuthorityObjectV1::Root
+                && refusal.reason() == crate::sweep::ClaimAuthorityUnavailableReasonV1::IdentityChanged
+        ));
+        assert_eq!(probe.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(std::fs::read(&custody_path).unwrap(), custody_bytes);
         std::fs::remove_dir_all(root).unwrap();
     }
 

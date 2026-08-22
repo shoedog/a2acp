@@ -38,6 +38,7 @@ pub struct ExactAbsenceCandidateV1 {
     source_identity: DirectoryIdentityV1,
     common_dir: String,
     common_dir_identity: DirectoryIdentityV1,
+    custody_root_identity: Option<DirectoryIdentityV1>,
     pub worktree_path: String,
 }
 impl ExactAbsenceCandidateV1 {
@@ -56,17 +57,21 @@ impl ExactAbsenceCandidateV1 {
                 ClaimAuthorityUnavailableReasonV1::OwnershipUnproven,
             )));
         }
-        Self::from_bound(source, common_dir, worktree.as_ref())
+        Self::from_bound(source, common_dir, None, worktree.as_ref())
             .map_err(legacy_claim_authority_error)
     }
-    pub fn from_claim(
+
+    pub(crate) fn from_claim(
         source: &WorktreeObjectIdentityV1,
+        root: &WorktreeObjectIdentityV1,
         common_dir: &WorktreeObjectIdentityV1,
         worktree: &WorktreeObjectIdentityV1,
+        retained_root: &RetainedCustodyRootAuthorityV1,
         probe: &dyn ExactAbsenceProbeV1,
     ) -> Result<Self, ClaimAuthorityUnavailableV1> {
         for (object, claim) in [
             (ClaimAuthorityObjectV1::Source, source),
+            (ClaimAuthorityObjectV1::Root, root),
             (ClaimAuthorityObjectV1::Worktree, worktree),
             (ClaimAuthorityObjectV1::CommonDirectory, common_dir),
         ] {
@@ -79,6 +84,7 @@ impl ExactAbsenceCandidateV1 {
         }
         for (object, claim) in [
             (ClaimAuthorityObjectV1::Source, source),
+            (ClaimAuthorityObjectV1::Root, root),
             (ClaimAuthorityObjectV1::Worktree, worktree),
             (ClaimAuthorityObjectV1::CommonDirectory, common_dir),
         ] {
@@ -91,6 +97,7 @@ impl ExactAbsenceCandidateV1 {
         }
         for (object, identity) in [
             (ClaimAuthorityObjectV1::Source, &source.directory_identity),
+            (ClaimAuthorityObjectV1::Root, &root.directory_identity),
             (
                 ClaimAuthorityObjectV1::CommonDirectory,
                 &common_dir.directory_identity,
@@ -102,6 +109,27 @@ impl ExactAbsenceCandidateV1 {
                     ClaimAuthorityUnavailableReasonV1::IdentityIncomplete,
                 ));
             }
+        }
+        let custody_root_identity = match retained_root {
+            RetainedCustodyRootAuthorityV1::Stable(identity) => identity,
+            RetainedCustodyRootAuthorityV1::Unavailable => {
+                return Err(claim_authority_unavailable(
+                    ClaimAuthorityObjectV1::Root,
+                    ClaimAuthorityUnavailableReasonV1::ObservationUnavailable,
+                ));
+            }
+            RetainedCustodyRootAuthorityV1::IdentityChanged => {
+                return Err(claim_authority_unavailable(
+                    ClaimAuthorityObjectV1::Root,
+                    ClaimAuthorityUnavailableReasonV1::IdentityChanged,
+                ));
+            }
+        };
+        if !root.directory_identity.matches(custody_root_identity) {
+            return Err(claim_authority_unavailable(
+                ClaimAuthorityObjectV1::Root,
+                ClaimAuthorityUnavailableReasonV1::IdentityChanged,
+            ));
         }
         let observed_source = observe_claim_directory_identity(
             &source.canonical_path,
@@ -136,11 +164,18 @@ impl ExactAbsenceCandidateV1 {
                 ClaimAuthorityUnavailableReasonV1::OwnershipUnproven,
             ));
         }
-        Self::from_bound(observed_source, observed_common, &worktree.canonical_path)
+        Self::from_bound(
+            observed_source,
+            observed_common,
+            Some(custody_root_identity.clone()),
+            &worktree.canonical_path,
+        )
     }
+
     fn from_bound(
         source_identity: DirectoryIdentityV1,
         common_dir_identity: DirectoryIdentityV1,
+        custody_root_identity: Option<DirectoryIdentityV1>,
         worktree: &str,
     ) -> Result<Self, ClaimAuthorityUnavailableV1> {
         if !Path::new(worktree).is_absolute() {
@@ -166,27 +201,54 @@ impl ExactAbsenceCandidateV1 {
             source_identity,
             common_dir: common_dir_identity.canonical_path.clone(),
             common_dir_identity,
+            custody_root_identity,
             worktree_path: worktree.to_owned(),
         })
     }
-    pub(crate) fn revalidate_source(
-        &self,
-        probe: &dyn ExactAbsenceProbeV1,
-    ) -> Result<(), BridgeError> {
+
+    pub(crate) fn revalidate_filesystem_identities(&self) -> Result<(), BridgeError> {
         let source = capture_directory_identity(Path::new(&self.canonical_source), "source")?;
         let common_dir =
             capture_directory_identity(Path::new(&self.common_dir), "source common directory")?;
-        if self.source_identity.matches(&source)
-            && self.common_dir_identity.matches(&common_dir)
-            && common_dir.matches(&source_common_dir_identity(&source.canonical_path, probe)?)
+        if !(self.source_identity.matches(&source) && self.common_dir_identity.matches(&common_dir))
         {
+            return Err(invalid(
+                "exact-absence source or common-directory identity changed",
+            ));
+        }
+        if let Some(custody_root_identity) = &self.custody_root_identity {
+            let custody_root = capture_directory_identity(
+                Path::new(&custody_root_identity.canonical_path),
+                "custody root",
+            )?;
+            if !custody_root_identity.matches(&custody_root) {
+                return Err(invalid("exact-absence custody-root identity changed"));
+            }
+        }
+        Ok(())
+    }
+
+    /// Compares a fresh Host Git common-directory observation supplied by the caller.
+    ///
+    /// This is intentionally a pure comparison; Host Git performs the observation.
+    pub(crate) fn revalidate_repository_authority(
+        &self,
+        observed_common_dir: &DirectoryIdentityV1,
+    ) -> Result<(), BridgeError> {
+        if self.common_dir_identity.matches(observed_common_dir) {
             Ok(())
         } else {
             Err(invalid(
-                "exact-absence source or common-directory identity changed",
+                "exact-absence repository-authority common-directory identity changed",
             ))
         }
     }
+}
+
+pub(crate) enum RetainedCustodyRootAuthorityV1 {
+    Stable(DirectoryIdentityV1),
+    Unavailable,
+    IdentityChanged,
 }
 fn claim_authority_unavailable(
     object: ClaimAuthorityObjectV1,
@@ -687,6 +749,7 @@ fn assess_custody_record(
     canonical_root: &SessionCwd,
     enumerated_name: &OsStr,
     record: &WorktreeCustodyRecordV1,
+    retained_root: &RetainedCustodyRootAuthorityV1,
     probe: &dyn ExactAbsenceProbeV1,
 ) -> CustodyExactAbsenceAssessmentV1 {
     if let Err(refusal) = construction_guards(
@@ -704,8 +767,10 @@ fn assess_custody_record(
     };
     match ExactAbsenceCandidateV1::from_claim(
         &claim.source,
+        &claim.root,
         &claim.common_dir,
         &claim.worktree,
+        retained_root,
         probe,
     ) {
         Ok(candidate) => CustodyExactAbsenceAssessmentV1::Assessed(decide_unused_candidate(
@@ -827,6 +892,29 @@ fn classify_root_observations(observations: RootObservationSetV1) -> CustodyRoot
     }
 }
 
+fn retained_custody_root_authority(
+    observations: RootObservationSetV1,
+    canonical_root: &SessionCwd,
+) -> RetainedCustodyRootAuthorityV1 {
+    match classify_root_observations(observations) {
+        CustodyRootObservationV1::Pinned => {
+            let Some(retained_enumeration_object) = observations.retained_enumeration_object else {
+                return RetainedCustodyRootAuthorityV1::Unavailable;
+            };
+            RetainedCustodyRootAuthorityV1::Stable(DirectoryIdentityV1 {
+                canonical_path: canonical_root.as_str().to_owned(),
+                dev: retained_enumeration_object.dev,
+                ino: retained_enumeration_object.ino,
+                btime: retained_enumeration_object.birthtime,
+            })
+        }
+        CustodyRootObservationV1::Unavailable => RetainedCustodyRootAuthorityV1::Unavailable,
+        CustodyRootObservationV1::IdentityChanged => {
+            RetainedCustodyRootAuthorityV1::IdentityChanged
+        }
+    }
+}
+
 fn root_capture_has_object_identity(capture: checked_scan::RootIdentityCaptureV1) -> bool {
     capture.dev.is_some() && capture.ino.is_some()
 }
@@ -857,6 +945,7 @@ fn project_exact_scan_result(
             refusal: ExactAbsenceRootRefusalV1::CannotEnumerate,
         };
     };
+    let retained_root = retained_custody_root_authority(root_observations, &canonical_root);
     let mut rows = Vec::with_capacity(checked_rows.len());
     for checked in checked_rows {
         let assessment = match checked.parts() {
@@ -871,7 +960,13 @@ fn project_exact_scan_result(
             (_, enumerated_name, ScannedWorktreeRecordV1::Custody(record)) => {
                 ExactAbsenceRecordAssessmentV1::Custody(CustodyRecordAssessmentV1::new(
                     CustodyStateSnapshotV1::from(&record.state),
-                    assess_custody_record(&canonical_root, enumerated_name, record, probe),
+                    assess_custody_record(
+                        &canonical_root,
+                        enumerated_name,
+                        record,
+                        &retained_root,
+                        probe,
+                    ),
                 ))
             }
             (_, _, ScannedWorktreeRecordV1::UnreadableCustody(refusal)) => {
@@ -1161,6 +1256,7 @@ mod tests {
         let worktree = root.join("worktree");
         fs::create_dir(&worktree).unwrap();
         let worktree_identity = super::capture_directory_identity(&worktree, "worktree").unwrap();
+        let root_identity = super::capture_directory_identity(&root, "custody root").unwrap();
         let source_claim = WorktreeObjectIdentityV1 {
             canonical_path: source_identity.canonical_path.clone(),
             directory_identity: source_identity,
@@ -1169,6 +1265,11 @@ mod tests {
             canonical_path: common_identity.canonical_path.clone(),
             directory_identity: common_identity,
         };
+        let root_claim = WorktreeObjectIdentityV1 {
+            canonical_path: root_identity.canonical_path.clone(),
+            directory_identity: root_identity.clone(),
+        };
+        let retained_root = super::RetainedCustodyRootAuthorityV1::Stable(root_identity);
         let worktree_claim = WorktreeObjectIdentityV1 {
             canonical_path: worktree_identity.canonical_path.clone(),
             directory_identity: worktree_identity,
@@ -1176,8 +1277,10 @@ mod tests {
         let probe = crate::host_git::HostGitWorktree::new();
         let candidate = super::ExactAbsenceCandidateV1::from_claim(
             &source_claim,
+            &root_claim,
             &common_claim,
             &worktree_claim,
+            &retained_root,
             &probe,
         )
         .unwrap();
@@ -1193,7 +1296,7 @@ mod tests {
         assert!(output.status.success());
         fs::rename(replacement.join(".git"), source.join(".git")).unwrap();
         assert!(
-            candidate.revalidate_source(&probe).is_err(),
+            candidate.revalidate_filesystem_identities().is_err(),
             "a common-directory replacement must refuse while the source inode is unchanged"
         );
         fs::remove_dir_all(root).unwrap();
@@ -1632,6 +1735,44 @@ mod tests {
         }
     }
 
+    struct RecordingHostGitProbe {
+        exact_absence_calls: AtomicUsize,
+        authority_calls: AtomicUsize,
+    }
+
+    impl RecordingHostGitProbe {
+        const fn new() -> Self {
+            Self {
+                exact_absence_calls: AtomicUsize::new(0),
+                authority_calls: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl super::ExactAbsenceProbeV1 for RecordingHostGitProbe {
+        fn observe_source_common_dir_identity(
+            &self,
+            source: &str,
+        ) -> Result<DirectoryIdentityV1, bridge_core::error::BridgeError> {
+            self.authority_calls.fetch_add(1, Ordering::SeqCst);
+            super::ExactAbsenceProbeV1::observe_source_common_dir_identity(
+                &crate::host_git::HostGitWorktree::new(),
+                source,
+            )
+        }
+
+        fn observe_exact_absence(
+            &self,
+            candidate: &super::ExactAbsenceCandidateV1,
+        ) -> Result<super::ExactAbsenceObservationV1, bridge_core::error::BridgeError> {
+            self.exact_absence_calls.fetch_add(1, Ordering::SeqCst);
+            super::ExactAbsenceProbeV1::observe_exact_absence(
+                &crate::host_git::HostGitWorktree::new(),
+                candidate,
+            )
+        }
+    }
+
     fn real_custody_record(
         root: &Path,
         target: &Path,
@@ -1707,6 +1848,51 @@ mod tests {
         record_path
     }
 
+    fn write_host_git_custody_record(root: &Path, name: &str) -> (PathBuf, PathBuf, Vec<u8>) {
+        fs::create_dir_all(root).unwrap();
+        let target = root.join(name);
+        fs::create_dir(&target).unwrap();
+        let record = real_custody_record(
+            root,
+            &target,
+            WorktreeCustodyStateV1::PreservationUnknown {
+                reason: PreservationReasonV1::MaterializationInFlight,
+            },
+            true,
+        );
+        let source = root.join("source");
+        for args in [
+            ["config", "user.email", "a@b.c"].as_slice(),
+            ["config", "user.name", "x"].as_slice(),
+        ] {
+            assert!(std::process::Command::new("git")
+                .arg("-C")
+                .arg(&source)
+                .args(args)
+                .status()
+                .unwrap()
+                .success());
+        }
+        fs::write(source.join("file.txt"), "base\n").unwrap();
+        for args in [
+            ["add", "-A"].as_slice(),
+            ["commit", "-q", "-m", "init"].as_slice(),
+        ] {
+            assert!(std::process::Command::new("git")
+                .arg("-C")
+                .arg(&source)
+                .args(args)
+                .status()
+                .unwrap()
+                .success());
+        }
+        let record_path = PathBuf::from(custody_record_path(&record.worktree.canonical_path));
+        let custody_bytes = record.encode_canonical().unwrap();
+        fs::write(&record_path, custody_bytes).unwrap();
+        let custody_bytes = fs::read(&record_path).unwrap();
+        (target, record_path, custody_bytes)
+    }
+
     fn custody_assessment<'a>(
         report: &'a super::ExactAbsenceSweepReportV1,
         record_path: &Path,
@@ -1739,9 +1925,9 @@ mod tests {
         match object {
             super::ClaimAuthorityObjectV1::Source => &mut claim.source,
             super::ClaimAuthorityObjectV1::Worktree => &mut claim.worktree,
+            super::ClaimAuthorityObjectV1::Root => &mut claim.root,
             super::ClaimAuthorityObjectV1::CommonDirectory => &mut claim.common_dir,
-            super::ClaimAuthorityObjectV1::Root
-            | super::ClaimAuthorityObjectV1::SourceCommonDirectoryBinding => unreachable!(),
+            super::ClaimAuthorityObjectV1::SourceCommonDirectoryBinding => unreachable!(),
         }
     }
 
@@ -1750,10 +1936,14 @@ mod tests {
         probe: &RecordingProbe,
     ) -> super::ClaimAuthorityUnavailableV1 {
         let claim = record.claim.as_ref().unwrap();
+        let retained_root =
+            super::RetainedCustodyRootAuthorityV1::Stable(claim.root.directory_identity.clone());
         super::ExactAbsenceCandidateV1::from_claim(
             &claim.source,
+            &claim.root,
             &claim.common_dir,
             &claim.worktree,
+            &retained_root,
             probe,
         )
         .unwrap_err()
@@ -1784,11 +1974,12 @@ mod tests {
     }
 
     #[test]
-    fn claim_authority_maps_claim_field_failures() {
+    fn claim_authority_mapping_covers_every_constructible_object_and_reason() {
         let root = unique_temp_dir("claim-authority-fields");
         fs::create_dir_all(&root).unwrap();
         for (name, object, reason) in [
             ("source-mismatch", Object::Source, Reason::PathMismatch),
+            ("root-mismatch", Object::Root, Reason::PathMismatch),
             ("worktree-mismatch", Object::Worktree, Reason::PathMismatch),
             (
                 "common-mismatch",
@@ -1796,12 +1987,14 @@ mod tests {
                 Reason::PathMismatch,
             ),
             ("source-relative", Object::Source, Reason::NotAbsolute),
+            ("root-relative", Object::Root, Reason::NotAbsolute),
             ("worktree-relative", Object::Worktree, Reason::NotAbsolute),
             (
                 "common-relative",
                 Object::CommonDirectory,
                 Reason::NotAbsolute,
             ),
+            ("root-incomplete", Object::Root, Reason::IdentityIncomplete),
             (
                 "source-incomplete",
                 Object::Source,
@@ -1847,10 +2040,46 @@ mod tests {
             );
             assert_eq!(probe.authority_calls(), 0, "{name}");
         }
+        let mut root_changed = candidate_claim_record(&root, "root-changed");
+        let claim = root_changed.claim.as_mut().unwrap();
+        let retained_root =
+            super::RetainedCustodyRootAuthorityV1::Stable(claim.root.directory_identity.clone());
+        claim.root.directory_identity.ino = Some(0);
+        let probe = RecordingProbe::both_absent();
+        assert_eq!(
+            super::ExactAbsenceCandidateV1::from_claim(
+                &claim.source,
+                &claim.root,
+                &claim.common_dir,
+                &claim.worktree,
+                &retained_root,
+                &probe,
+            )
+            .unwrap_err(),
+            super::ClaimAuthorityUnavailableV1::new(Object::Root, Reason::IdentityChanged),
+        );
+        assert_eq!(probe.authority_calls(), 0);
+
+        let unavailable = candidate_claim_record(&root, "root-unavailable");
+        let claim = unavailable.claim.as_ref().unwrap();
+        let probe = RecordingProbe::both_absent();
+        assert_eq!(
+            super::ExactAbsenceCandidateV1::from_claim(
+                &claim.source,
+                &claim.root,
+                &claim.common_dir,
+                &claim.worktree,
+                &super::RetainedCustodyRootAuthorityV1::Unavailable,
+                &probe,
+            )
+            .unwrap_err(),
+            super::ClaimAuthorityUnavailableV1::new(Object::Root, Reason::ObservationUnavailable),
+        );
+        assert_eq!(probe.authority_calls(), 0);
         fs::remove_dir_all(root).unwrap();
     }
     #[test]
-    fn claim_construction_failure_is_not_assessed() {
+    fn claim_authority_errors_are_typed_and_never_reported_as_assessed() {
         let root = unique_temp_dir("claim-authority-report");
         fs::create_dir_all(&root).unwrap();
         let mut record = candidate_claim_record(&root, "source-missing");
@@ -1859,7 +2088,9 @@ mod tests {
         source.canonical_path = missing.clone();
         source.directory_identity.canonical_path = missing;
         let record_path = PathBuf::from(custody_record_path(&record.worktree.canonical_path));
-        fs::write(&record_path, record.encode_canonical().unwrap()).unwrap();
+        let custody_bytes = record.encode_canonical().unwrap();
+        fs::write(&record_path, custody_bytes).unwrap();
+        let custody_bytes = fs::read(&record_path).unwrap();
         let probe = RecordingProbe::both_absent();
         let report = super::sweep_orphans_with_exact_absence(&root.to_string_lossy(), &probe);
         assert!(matches!(
@@ -1871,6 +2102,7 @@ mod tests {
         ));
         assert_eq!(probe.calls(), 0);
         assert_eq!(probe.authority_calls(), 0);
+        assert_eq!(fs::read(&record_path).unwrap(), custody_bytes);
         fs::remove_dir_all(root).unwrap();
     }
     #[test]
@@ -1925,6 +2157,504 @@ mod tests {
         assert_eq!(probe.authority_calls(), 1);
         fs::remove_dir_all(root).unwrap();
     }
+    #[test]
+    fn degraded_claim_authority_matrix_has_sixteen_rows_and_only_worktree_degradation_probes() {
+        let rows = [
+            (
+                "1",
+                false,
+                false,
+                false,
+                false,
+                Some(Object::Source),
+                0,
+                0,
+                false,
+            ),
+            (
+                "2",
+                false,
+                false,
+                false,
+                true,
+                Some(Object::Source),
+                0,
+                0,
+                false,
+            ),
+            (
+                "3",
+                false,
+                false,
+                true,
+                false,
+                Some(Object::Source),
+                0,
+                0,
+                false,
+            ),
+            (
+                "4",
+                false,
+                false,
+                true,
+                true,
+                Some(Object::Source),
+                0,
+                0,
+                false,
+            ),
+            (
+                "5",
+                false,
+                true,
+                false,
+                false,
+                Some(Object::Source),
+                0,
+                0,
+                false,
+            ),
+            (
+                "6",
+                false,
+                true,
+                false,
+                true,
+                Some(Object::Source),
+                0,
+                0,
+                false,
+            ),
+            (
+                "7",
+                false,
+                true,
+                true,
+                false,
+                Some(Object::Source),
+                0,
+                0,
+                false,
+            ),
+            (
+                "8",
+                false,
+                true,
+                true,
+                true,
+                Some(Object::Source),
+                0,
+                0,
+                false,
+            ),
+            (
+                "9",
+                true,
+                false,
+                false,
+                false,
+                Some(Object::Root),
+                0,
+                0,
+                false,
+            ),
+            (
+                "10",
+                true,
+                false,
+                false,
+                true,
+                Some(Object::Root),
+                0,
+                0,
+                false,
+            ),
+            (
+                "11",
+                true,
+                false,
+                true,
+                false,
+                Some(Object::Root),
+                0,
+                0,
+                false,
+            ),
+            (
+                "12",
+                true,
+                false,
+                true,
+                true,
+                Some(Object::Root),
+                0,
+                0,
+                false,
+            ),
+            (
+                "13",
+                true,
+                true,
+                false,
+                false,
+                Some(Object::CommonDirectory),
+                0,
+                0,
+                false,
+            ),
+            (
+                "14",
+                true,
+                true,
+                false,
+                true,
+                Some(Object::CommonDirectory),
+                0,
+                0,
+                false,
+            ),
+            ("15", true, true, true, false, None, 1, 1, false),
+            ("16", true, true, true, true, None, 1, 1, true),
+        ];
+
+        for (
+            name,
+            source,
+            root_complete,
+            common_dir,
+            worktree,
+            expected,
+            authority,
+            exact,
+            historical,
+        ) in rows
+        {
+            let root = unique_temp_dir(&format!("degraded-matrix-{name}"));
+            fs::create_dir_all(&root).unwrap();
+            let target = root.join(format!("worktree-{name}"));
+            fs::create_dir(&target).unwrap();
+            let mut record = real_custody_record(
+                &root,
+                &target,
+                WorktreeCustodyStateV1::PreservationUnknown {
+                    reason: PreservationReasonV1::MaterializationInFlight,
+                },
+                true,
+            );
+            let degrade = |identity: &mut WorktreeObjectIdentityV1| {
+                identity.directory_identity.dev = None;
+                identity.directory_identity.ino = None;
+                identity.directory_identity.btime = None;
+            };
+            let claim = record.claim.as_mut().unwrap();
+            if !source {
+                degrade(&mut claim.source);
+            }
+            if !root_complete {
+                degrade(&mut claim.root);
+            }
+            if !common_dir {
+                degrade(&mut claim.common_dir);
+            }
+            if !worktree {
+                degrade(&mut claim.worktree);
+            }
+            let record_path = PathBuf::from(custody_record_path(&record.worktree.canonical_path));
+            let custody_bytes = record.encode_canonical().unwrap();
+            fs::write(&record_path, custody_bytes).unwrap();
+            let custody_bytes = fs::read(&record_path).unwrap();
+            if historical {
+                fs::remove_dir_all(&target).unwrap();
+            }
+
+            let probe = RecordingProbe::both_absent();
+            let report = super::sweep_orphans_with_exact_absence(&root.to_string_lossy(), &probe);
+            let assessment = custody_assessment(&report, &record_path);
+            match expected {
+                Some(object) => assert!(
+                    matches!(
+                        assessment,
+                        super::CustodyExactAbsenceAssessmentV1::CannotConstructSubject(
+                            super::CannotConstructSubjectV1::ClaimAuthorityUnavailable(refusal)
+                        ) if refusal.object() == object
+                            && refusal.reason() == Reason::IdentityIncomplete
+                    ),
+                    "row {name} must be the requested typed construction refusal: {assessment:?}"
+                ),
+                None => assert_eq!(
+                    assessment,
+                    &super::CustodyExactAbsenceAssessmentV1::Assessed(
+                        super::UnusedCandidateDecisionV1::Authorized,
+                    ),
+                    "row {name} must reach exact absence"
+                ),
+            }
+            assert_eq!(probe.authority_calls(), authority, "row {name}");
+            assert_eq!(probe.calls(), exact, "row {name}");
+            assert_eq!(fs::read(&record_path).unwrap(), custody_bytes, "row {name}");
+            fs::remove_dir_all(&root).unwrap();
+        }
+    }
+
+    #[test]
+    fn persisted_record_host_git_exact_absence_matrix_preserves_bytes() {
+        enum Expected {
+            Authorized,
+            Refused,
+        }
+
+        for (name, registered, expected) in [
+            ("target-present", false, Expected::Refused),
+            ("registered-absent", true, Expected::Refused),
+            ("both-absent", false, Expected::Authorized),
+        ] {
+            let root = unique_temp_dir(&format!("host-git-{name}"));
+            let (target, record_path, custody_bytes) = write_host_git_custody_record(&root, name);
+            if name != "target-present" {
+                fs::remove_dir_all(&target).unwrap();
+            }
+            if registered {
+                let source = root.join("source");
+                assert!(std::process::Command::new("git")
+                    .arg("-C")
+                    .arg(&source)
+                    .args(["worktree", "add", "--detach", target.to_str().unwrap()])
+                    .status()
+                    .unwrap()
+                    .success());
+                fs::remove_dir_all(&target).unwrap();
+            }
+
+            let report = super::sweep_orphans_with_exact_absence(
+                &root.to_string_lossy(),
+                &crate::host_git::HostGitWorktree::new(),
+            );
+            let assessment = custody_assessment(&report, &record_path);
+            match expected {
+                Expected::Authorized => assert_eq!(
+                    assessment,
+                    &super::CustodyExactAbsenceAssessmentV1::Assessed(
+                        super::UnusedCandidateDecisionV1::Authorized,
+                    ),
+                    "{name} must retain only the real BothAbsent outcome"
+                ),
+                Expected::Refused => assert_eq!(
+                    assessment,
+                    &super::CustodyExactAbsenceAssessmentV1::Assessed(
+                        super::UnusedCandidateDecisionV1::Refused,
+                    ),
+                    "{name} must not produce BothAbsent"
+                ),
+            }
+            assert_eq!(fs::read(&record_path).unwrap(), custody_bytes, "{name}");
+            fs::remove_dir_all(&root).unwrap();
+        }
+    }
+
+    #[test]
+    fn persisted_record_degraded_worktree_reaches_host_git_and_preserves_bytes() {
+        let root = unique_temp_dir("host-git-degraded-worktree");
+        let (target, record_path, _) = write_host_git_custody_record(&root, "worktree");
+        let mut record =
+            WorktreeCustodyRecordV1::decode_canonical(&fs::read(&record_path).unwrap()).unwrap();
+        let worktree = &mut record.claim.as_mut().unwrap().worktree.directory_identity;
+        worktree.dev = None;
+        worktree.ino = None;
+        worktree.btime = None;
+        let custody_bytes = record.encode_canonical().unwrap();
+        fs::write(&record_path, custody_bytes).unwrap();
+        let custody_bytes = fs::read(&record_path).unwrap();
+        fs::remove_dir_all(&target).unwrap();
+
+        let report = super::sweep_orphans_with_exact_absence(
+            &root.to_string_lossy(),
+            &crate::host_git::HostGitWorktree::new(),
+        );
+        assert_eq!(
+            custody_assessment(&report, &record_path),
+            &super::CustodyExactAbsenceAssessmentV1::Assessed(
+                super::UnusedCandidateDecisionV1::Authorized,
+            )
+        );
+        assert_eq!(fs::read(&record_path).unwrap(), custody_bytes);
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn persisted_record_historical_complete_worktree_reaches_host_git_and_preserves_bytes() {
+        let root = unique_temp_dir("host-git-historical-worktree");
+        let (target, record_path, custody_bytes) = write_host_git_custody_record(&root, "worktree");
+        fs::remove_dir_all(&target).unwrap();
+
+        let report = super::sweep_orphans_with_exact_absence(
+            &root.to_string_lossy(),
+            &crate::host_git::HostGitWorktree::new(),
+        );
+        assert_eq!(
+            custody_assessment(&report, &record_path),
+            &super::CustodyExactAbsenceAssessmentV1::Assessed(
+                super::UnusedCandidateDecisionV1::Authorized,
+            )
+        );
+        assert_eq!(fs::read(&record_path).unwrap(), custody_bytes);
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn persisted_record_wrong_repository_binding_is_typed_and_preserves_bytes() {
+        let root = unique_temp_dir("wrong-repository-binding");
+        let (_, record_path, _) = write_host_git_custody_record(&root, "worktree");
+        let repository_b = root.join("repository-b");
+        fs::create_dir(&repository_b).unwrap();
+        assert!(std::process::Command::new("git")
+            .arg("-C")
+            .arg(&repository_b)
+            .args(["init", "-q"])
+            .status()
+            .unwrap()
+            .success());
+        let mut record =
+            WorktreeCustodyRecordV1::decode_canonical(&fs::read(&record_path).unwrap()).unwrap();
+        let common_dir = verify_payload_directory_identity(
+            &fs::canonicalize(repository_b.join(".git")).unwrap(),
+        )
+        .unwrap();
+        record.claim.as_mut().unwrap().common_dir = WorktreeObjectIdentityV1 {
+            canonical_path: common_dir.canonical_path.clone(),
+            directory_identity: common_dir,
+        };
+        let custody_bytes = record.encode_canonical().unwrap();
+        fs::write(&record_path, custody_bytes).unwrap();
+        let custody_bytes = fs::read(&record_path).unwrap();
+
+        let probe = RecordingHostGitProbe::new();
+        let report = super::sweep_orphans_with_exact_absence(&root.to_string_lossy(), &probe);
+        assert!(matches!(
+            custody_assessment(&report, &record_path),
+            super::CustodyExactAbsenceAssessmentV1::CannotConstructSubject(
+                super::CannotConstructSubjectV1::ClaimAuthorityUnavailable(refusal)
+            ) if refusal.object() == Object::SourceCommonDirectoryBinding
+                && refusal.reason() == Reason::OwnershipUnproven
+        ));
+        assert_eq!(probe.authority_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(probe.exact_absence_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(fs::read(&record_path).unwrap(), custody_bytes);
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn persisted_record_root_replacement_during_git_refuses_and_preserves_bytes() {
+        let root = unique_temp_dir("root-replacement-during-git");
+        let (target, record_path, custody_bytes) = write_host_git_custody_record(&root, "worktree");
+        fs::remove_dir_all(&target).unwrap();
+        let replacement_root = root.with_file_name(format!(
+            "{}-original",
+            root.file_name().unwrap().to_string_lossy()
+        ));
+        let record_name = record_path.file_name().unwrap().to_os_string();
+        let record_name_after = record_name.clone();
+        let original_root = replacement_root.clone();
+        let root_for_hook = root.clone();
+        crate::host_git::set_exact_absence_after_initial_revalidation_hook(move || {
+            fs::rename(&root_for_hook, &replacement_root).unwrap();
+            fs::create_dir(&root_for_hook).unwrap();
+            fs::rename(
+                replacement_root.join("source"),
+                root_for_hook.join("source"),
+            )
+            .unwrap();
+            fs::rename(
+                replacement_root.join(&record_name),
+                root_for_hook.join(&record_name),
+            )
+            .unwrap();
+        });
+
+        let report = super::sweep_orphans_with_exact_absence(
+            &root.to_string_lossy(),
+            &crate::host_git::HostGitWorktree::new(),
+        );
+        assert_eq!(
+            custody_assessment(&report, &record_path),
+            &super::CustodyExactAbsenceAssessmentV1::Assessed(
+                super::UnusedCandidateDecisionV1::Refused,
+            )
+        );
+        assert_eq!(
+            fs::read(root.join(record_name_after)).unwrap(),
+            custody_bytes
+        );
+        fs::remove_dir_all(&root).unwrap();
+        fs::remove_dir_all(&original_root).unwrap();
+    }
+
+    #[test]
+    fn stale_source_root_and_common_directory_objects_refuse_without_exact_absence() {
+        for (name, object) in [
+            ("source", Object::Source),
+            ("root", Object::Root),
+            ("common-directory", Object::CommonDirectory),
+        ] {
+            let root = unique_temp_dir(&format!("stale-{name}"));
+            let (_, record_path, custody_bytes) = write_host_git_custody_record(&root, "worktree");
+            let mut original_root = None;
+            match object {
+                Object::Source => {
+                    fs::rename(root.join("source"), root.join("original-source")).unwrap();
+                    fs::create_dir(root.join("source")).unwrap();
+                    assert!(std::process::Command::new("git")
+                        .arg("-C")
+                        .arg(root.join("source"))
+                        .args(["init", "-q"])
+                        .status()
+                        .unwrap()
+                        .success());
+                }
+                Object::Root => {
+                    let old_root = root.with_file_name(format!(
+                        "{}-original",
+                        root.file_name().unwrap().to_string_lossy()
+                    ));
+                    let record_name = record_path.file_name().unwrap().to_os_string();
+                    fs::rename(&root, &old_root).unwrap();
+                    fs::create_dir(&root).unwrap();
+                    fs::rename(old_root.join("source"), root.join("source")).unwrap();
+                    fs::rename(old_root.join(record_name), &record_path).unwrap();
+                    original_root = Some(old_root);
+                }
+                Object::CommonDirectory => {
+                    fs::rename(root.join("source/.git"), root.join("original-common")).unwrap();
+                    assert!(std::process::Command::new("git")
+                        .arg("-C")
+                        .arg(root.join("source"))
+                        .args(["init", "-q"])
+                        .status()
+                        .unwrap()
+                        .success());
+                }
+                _ => unreachable!(),
+            }
+
+            let probe = RecordingProbe::both_absent();
+            let report = super::sweep_orphans_with_exact_absence(&root.to_string_lossy(), &probe);
+            assert!(matches!(
+                custody_assessment(&report, &record_path),
+                super::CustodyExactAbsenceAssessmentV1::CannotConstructSubject(
+                    super::CannotConstructSubjectV1::ClaimAuthorityUnavailable(refusal)
+                ) if refusal.object() == object
+                    && refusal.reason() == Reason::IdentityChanged
+            ));
+            assert_eq!(probe.authority_calls(), 0, "{name}");
+            assert_eq!(probe.calls(), 0, "{name}");
+            assert_eq!(fs::read(&record_path).unwrap(), custody_bytes, "{name}");
+            fs::remove_dir_all(&root).unwrap();
+            if let Some(original_root) = original_root {
+                fs::remove_dir_all(original_root).unwrap();
+            }
+        }
+    }
+
     fn root_capture(
         dev: Option<u64>,
         ino: Option<u64>,

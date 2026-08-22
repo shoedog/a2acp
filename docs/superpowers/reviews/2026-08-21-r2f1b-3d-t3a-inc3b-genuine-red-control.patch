@@ -1,0 +1,35 @@
+--- a/crates/bridge-worktree/src/sweep.rs
++++ b/crates/bridge-worktree/src/sweep.rs
+@@ -1925,6 +1925,32 @@
+         assert_eq!(probe.authority_calls(), 1);
+         fs::remove_dir_all(root).unwrap();
+     }
++    #[test]
++    fn inc3b_control_degraded_claim_root_never_reaches_exact_absence() {
++        let root = unique_temp_dir("inc3b-control-degraded-root");
++        fs::create_dir_all(&root).unwrap();
++        let mut record = candidate_claim_record(&root, "worktree");
++        let claim = record.claim.as_mut().unwrap();
++        claim.root.directory_identity.dev = None;
++        claim.root.directory_identity.ino = None;
++        claim.root.directory_identity.btime = None;
++        let record_path = PathBuf::from(custody_record_path(&record.worktree.canonical_path));
++        fs::write(&record_path, record.encode_canonical().unwrap()).unwrap();
++        let probe = RecordingProbe::both_absent();
++        let report = super::sweep_orphans_with_exact_absence(&root.to_string_lossy(), &probe);
++
++        assert!(matches!(
++            custody_assessment(&report, &record_path),
++            super::CustodyExactAbsenceAssessmentV1::CannotConstructSubject(
++                super::CannotConstructSubjectV1::ClaimAuthorityUnavailable(refusal)
++            ) if refusal.object() == Object::Root
++                && refusal.reason() == Reason::IdentityIncomplete
++        ));
++        assert_eq!(probe.authority_calls(), 0);
++        assert_eq!(probe.calls(), 0);
++        fs::remove_dir_all(root).unwrap();
++    }
++
+     fn root_capture(
+         dev: Option<u64>,
+         ino: Option<u64>,

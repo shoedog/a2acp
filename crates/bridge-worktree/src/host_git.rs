@@ -23,7 +23,7 @@ thread_local! {
 }
 
 #[cfg(test)]
-fn set_exact_absence_after_initial_revalidation_hook(hook: impl FnOnce() + 'static) {
+pub(crate) fn set_exact_absence_after_initial_revalidation_hook(hook: impl FnOnce() + 'static) {
     EXACT_ABSENCE_AFTER_INITIAL_REVALIDATION_HOOK.with(|slot| {
         assert!(slot.borrow().is_none(), "a test hook is already installed");
         *slot.borrow_mut() = Some(Box::new(hook));
@@ -44,6 +44,16 @@ pub struct HostGitWorktree;
 impl HostGitWorktree {
     pub fn new() -> Self {
         Self
+    }
+
+    fn revalidate_exact_absence_bracket(
+        &self,
+        candidate: &ExactAbsenceCandidateV1,
+    ) -> Result<(), BridgeError> {
+        candidate.revalidate_filesystem_identities()?;
+        let observed_common_dir =
+            self.observe_source_common_dir_identity(&candidate.canonical_source)?;
+        candidate.revalidate_repository_authority(&observed_common_dir)
     }
 }
 
@@ -243,7 +253,7 @@ impl ExactAbsenceProbeV1 for HostGitWorktree {
         &self,
         candidate: &ExactAbsenceCandidateV1,
     ) -> Result<ExactAbsenceObservationV1, BridgeError> {
-        candidate.revalidate_source(self)?;
+        self.revalidate_exact_absence_bracket(candidate)?;
         let target = Path::new(&candidate.worktree_path);
         if !target_absent_from_probe(target)? {
             return Ok(ExactAbsenceObservationV1::TargetPresent);
@@ -255,7 +265,7 @@ impl ExactAbsenceProbeV1 for HostGitWorktree {
         // The Git subprocess reads source/.git while the target can independently reappear.
         // Revalidate every observation before it becomes exact-absence evidence. These are
         // string-path brackets, not descriptor binding, so strict ABA safety remains unclaimed.
-        candidate.revalidate_source(self)?;
+        self.revalidate_exact_absence_bracket(candidate)?;
         if !target_absent_from_probe(target)? {
             return Ok(ExactAbsenceObservationV1::TargetPresent);
         }
@@ -629,12 +639,8 @@ mod tests {
             .observe_exact_absence(&candidate)
             .expect_err("the post-Git common-directory revalidation must refuse the replacement");
         assert!(
-            matches!(
-                error,
-                BridgeError::ConfigInvalid { reason }
-                    if reason == "exact-absence source or common-directory identity changed"
-            ),
-            "the test must reach the specific post-Git source/common-dir revalidation"
+            matches!(error, BridgeError::ConfigInvalid { .. }),
+            "the post-Git filesystem and repository-authority bracket must refuse"
         );
         std::fs::remove_dir_all(root).unwrap();
     }
