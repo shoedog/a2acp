@@ -4,8 +4,9 @@
 
 - Implementation base: `f7e2e8e289b432a708bf954ca393a29958d38c84`.
 - This implementation candidate changes only `crates/bridge-worktree/src/sweep.rs`, `crates/bridge-worktree/src/sweep/checked_scan.rs`, `crates/bridge-worktree/src/host_git.rs`, this handoff, and its frozen control. Manifests and `Cargo.lock` are untouched.
-- The current candidate adds 793 nonblank physical Rust lines, measured from the final formatted diff; this is within the 850-line cap.
+- The current candidate adds 800 nonblank physical Rust lines, measured from the final formatted diff; this is within the 850-line cap.
 - No Cargo build, test, clippy, or repository-hygiene gate was run in this implementation container. All listed operator gates remain pending.
+- The initial compile error in `checked_scan.rs` prevented every slice test from executing. The two degraded-worktree fixture failures exposed after that repair are first-execution results, not regressions: `WorktreeCustodyRecordV1::validate` requires exact structural equality between envelope `worktree` and claim `worktree`, so degrading only the claim made `encode_canonical` reject the inconsistent record with `ClaimIdentityMismatch`. Both fixtures now degrade the two copies identically.
 
 ## Implementation
 

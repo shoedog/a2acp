@@ -942,7 +942,8 @@ mod tests {
             &probe,
         );
         let (_, _, _, rows) = outcome.into_exact_parts().unwrap();
-        let super::ExactAbsenceRecordAssessmentV1::Custody(assessment) = &rows[0].assessment else {
+        let crate::sweep::ExactAbsenceRecordAssessmentV1::Custody(assessment) = &rows[0].assessment
+        else {
             panic!("row must remain a readable custody row");
         };
         assert!(matches!(

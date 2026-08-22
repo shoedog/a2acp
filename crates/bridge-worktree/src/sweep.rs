@@ -2347,6 +2347,9 @@ mod tests {
                 identity.directory_identity.ino = None;
                 identity.directory_identity.btime = None;
             };
+            if !worktree {
+                degrade(&mut record.worktree);
+            }
             let claim = record.claim.as_mut().unwrap();
             if !source {
                 degrade(&mut claim.source);
@@ -2458,10 +2461,13 @@ mod tests {
         let (target, record_path, _) = write_host_git_custody_record(&root, "worktree");
         let mut record =
             WorktreeCustodyRecordV1::decode_canonical(&fs::read(&record_path).unwrap()).unwrap();
-        let worktree = &mut record.claim.as_mut().unwrap().worktree.directory_identity;
-        worktree.dev = None;
-        worktree.ino = None;
-        worktree.btime = None;
+        let degrade = |identity: &mut WorktreeObjectIdentityV1| {
+            identity.directory_identity.dev = None;
+            identity.directory_identity.ino = None;
+            identity.directory_identity.btime = None;
+        };
+        degrade(&mut record.worktree);
+        degrade(&mut record.claim.as_mut().unwrap().worktree);
         let custody_bytes = record.encode_canonical().unwrap();
         fs::write(&record_path, custody_bytes).unwrap();
         let custody_bytes = fs::read(&record_path).unwrap();
