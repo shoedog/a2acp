@@ -36,16 +36,35 @@ source plan has already been wrong three times, once about a safety property, so
 - `bridge_core::fs_custody::retire_captured_regular_child_v2` exists (T3b slice 3) and has **no**
   `bridge-worktree` caller yet.
 
-### Correction to the plan's carry-forward — this obligation lands HERE, not on slice 5
+### The probe requirement — READ-ONLY, not spawn-free (operator amendment)
 
 The plan assigns the read-only-probe obligation to slice 5. **That is one slice too late.** The operator
 confirmed at `c343e563` that `reprove_under_window` still has **no production caller** — the only mention
 outside its own module is a doc comment in `sweep.rs`. This slice introduces the first one.
 
-`reprove_under_window` takes `probe: &dyn ExactAbsenceProbeV1`. The production implementor `HostGitWorktree`
-spawns `git rev-parse`. **The probe this slice supplies must be read-only and must not spawn a process from
-the settlement path.** State in the handoff which probe is supplied and why it is read-only. If the only
-available production probe spawns, stop and report rather than wiring it.
+An earlier revision of this task additionally required that the settlement path **not spawn a process**. That
+was wrong and it blocked the first dispatch, which correctly stopped and reported rather than wiring
+something the spec forbade. The requirement is corrected here.
+
+**The property that matters is read-only, not spawn-free.** The operator enumerated every `git` invocation
+reachable from `ExactAbsenceProbeV1` on the production `HostGitWorktree`:
+
+| Probe method | git invocation | Mutating? |
+|---|---|---|
+| `observe_source_common_dir_identity` | `git -C <source> rev-parse --path-format=absolute --git-common-dir` | **No** — query |
+| `observe_exact_absence` → `registration_absent_sync` → `list_porcelain_argv` | `git -C <repo> worktree list --porcelain -z` | **No** — query |
+
+Neither mutates. There is no `worktree remove`, no `prune`, no `add` on that path. **`HostGitWorktree` is
+therefore an acceptable probe for the settlement path** — wire it.
+
+This matches slice 2's amended convention exactly: forbid the **mutating** effects by name, require that the
+added code **originates** no spawn, and accept that a spawn may arrive through a caller-supplied probe.
+Requiring a spawn-free probe would instead force a settlement-only probe, and a second observation path is
+precisely the acting-versus-reporting drift this whole boundary exists to prevent.
+
+**Convert the concern into a checkable invariant.** Add a test asserting that the git verbs reachable from the
+probe used by settlement are **query-only**, so that a later change adding `remove` or `prune` to that path
+is caught rather than silently inherited by a destructive caller. Record the two verbs in the handoff.
 
 ## What this slice builds
 
@@ -86,7 +105,8 @@ Each must document the production mutation it catches.
    that the ten pairs are exactly as they are today.
 4. A crash between transition and retirement leaves a **durable** `UnusedSettled` and **loses nothing** — the
    checkout survives, the residue is recognizable, and the stranded category is reported.
-5. The settlement path supplies a read-only probe and spawns no process.
+5. The settlement path supplies a read-only probe, and a test asserts the git verbs reachable from it are
+   query-only — no `remove`, no `prune`, no `add`.
 6. A bounded no-effect audit proving the added path reaches no `git`, `prune`, `remove_dir_all`, or process
    spawn. Follow slice 2's amended convention: forbid the **mutating** effects by name, assert the added code
    **originates** no spawn, and make the audit report a **named** missing anchor rather than panicking on an
@@ -139,7 +159,9 @@ and compare it against the base rather than treating it as this slice's regressi
 - [ ] Settlement retires the **marker only**; a test proves the checkout directory is untouched.
 - [ ] The added path reaches no `git`, `prune`, `remove_dir_all`, or process spawn, proved by an audit that
       names a missing anchor instead of panicking.
-- [ ] The settlement path supplies a **read-only** probe, and the handoff says which and why.
+- [ ] The settlement path supplies a **read-only** probe (`HostGitWorktree` is acceptable), and the handoff
+      records the two reachable git verbs and that neither mutates.
+- [ ] A test asserts the git verbs reachable from settlement's probe are query-only.
 - [ ] A crash between transition and retirement is covered by a test and surfaces a distinct
       operator-visible stranded-marker category.
 - [ ] `stage_and_settle`'s body is extracted so settler and custodian share **one** publication derivation.
