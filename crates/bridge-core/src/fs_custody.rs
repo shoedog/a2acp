@@ -288,6 +288,211 @@ pub enum CustodyCaptureOutcomeV2 {
     CompileUnsupported,
     RuntimeUnsupported(String),
 }
+
+/// The result of retiring one durable marker through its private capture name.
+///
+/// A terminal outcome other than [`Self::Retired`] deliberately preserves enough information to
+/// distinguish a refusal before capture from residue that now needs recovery, a completed
+/// namespace change whose parent durability barrier failed, and an unavailable primitive.
+#[must_use]
+#[derive(Debug)]
+pub enum MarkerRetirementOutcomeV1 {
+    Retired,
+    RefusedNoEffect(String),
+    CapturedRetained(String),
+    CaptureUncertain(String),
+    RetiredUnsynced(String),
+    CompileUnsupported,
+    RuntimeUnsupported(String),
+}
+
+/// Retire a captured regular marker only after descriptor-bound identity proof.
+///
+/// The public marker name is moved once into its private retirement-capture namespace. Only that
+/// freshly minted capture name is ever passed to `unlinkat`; a failed or ambiguous capture
+/// therefore retains the marker or its residue and performs no unlink.
+pub fn retire_captured_regular_child_v2(
+    pin: &PinnedDirectoryV1,
+    name: &OsStr,
+    expected: RequiredObjectIdentityV2,
+    label: &str,
+) -> MarkerRetirementOutcomeV1 {
+    #[cfg(unix)]
+    {
+        retire_captured_regular_child_v2_with(
+            pin,
+            name,
+            expected,
+            label,
+            required_file_content_snapshot_v2,
+            || {},
+            capture_target_no_replace_v2,
+            |_| Ok(()),
+        )
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (pin, name, expected, label);
+        MarkerRetirementOutcomeV1::CompileUnsupported
+    }
+}
+
+#[cfg(unix)]
+#[allow(clippy::too_many_arguments)]
+fn retire_captured_regular_child_v2_with<S, B, C, A>(
+    pin: &PinnedDirectoryV1,
+    name: &OsStr,
+    expected: RequiredObjectIdentityV2,
+    label: &str,
+    snapshot: S,
+    before_capture: B,
+    capture: C,
+    after_capture: A,
+) -> MarkerRetirementOutcomeV1
+where
+    S: FnOnce(&File, &str) -> Result<FileContentSnapshotV2, FsCustodyError>,
+    B: FnOnce(),
+    C: FnOnce(&File, &CustodyIntentV2, &str) -> CustodyCaptureOutcomeV2,
+    A: FnOnce(&ChildNameV2) -> Result<(), String>,
+{
+    use std::os::fd::AsRawFd as _;
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let target = match ChildNameV2::from_bytes(name.as_bytes()) {
+        Ok(value) => value,
+        Err(error) => {
+            return MarkerRetirementOutcomeV1::RefusedNoEffect(format!("{label}: {error:?}"))
+        }
+    };
+    let target_c = match child_name_cstring(name, label) {
+        Ok(value) => value,
+        Err(error) => return MarkerRetirementOutcomeV1::RefusedNoEffect(error.to_string()),
+    };
+    let file = match open_child_no_follow(
+        &pin.file,
+        &target_c,
+        ChildOpenOptionsV1 {
+            nonblocking: true,
+            ..ChildOpenOptionsV1::default()
+        },
+    ) {
+        Ok(value) => value,
+        Err(error) => {
+            return MarkerRetirementOutcomeV1::RefusedNoEffect(format!(
+                "{label}: marker open refused: {error}"
+            ))
+        }
+    };
+    let snapshot = match snapshot(&file, label) {
+        Ok(value) => value,
+        Err(FsCustodyError::Unsupported(reason)) => {
+            return MarkerRetirementOutcomeV1::RuntimeUnsupported(reason)
+        }
+        Err(error) => return MarkerRetirementOutcomeV1::RefusedNoEffect(error.to_string()),
+    };
+    let links = match file.metadata() {
+        Ok(metadata) => {
+            use std::os::unix::fs::MetadataExt as _;
+            metadata.nlink()
+        }
+        Err(error) => {
+            return MarkerRetirementOutcomeV1::RefusedNoEffect(format!(
+                "{label}: marker link count unavailable: {error}"
+            ))
+        }
+    };
+    if links != 1 {
+        return MarkerRetirementOutcomeV1::RefusedNoEffect(format!(
+            "{label}: marker has {links} links"
+        ));
+    }
+    let snapshot_object = snapshot.object;
+    if snapshot_object != expected {
+        return MarkerRetirementOutcomeV1::RefusedNoEffect(format!(
+            "{label}: descriptor snapshot does not match expected identity"
+        ));
+    }
+    let intent =
+        match CustodyIntentV2::new(CustodyOperationKindV2::Retire, target, expected, snapshot) {
+            Ok(value) => value,
+            Err(error) => return MarkerRetirementOutcomeV1::RefusedNoEffect(error.to_string()),
+        };
+    before_capture();
+    let captured = match capture(&pin.file, &intent, label) {
+        CustodyCaptureOutcomeV2::ExpectedCaptured(value) => value,
+        CustodyCaptureOutcomeV2::RefusedNoEffect(reason) => {
+            return MarkerRetirementOutcomeV1::RefusedNoEffect(reason)
+        }
+        CustodyCaptureOutcomeV2::UnexpectedRestored(_) => {
+            return MarkerRetirementOutcomeV1::CapturedRetained(format!(
+                "{label}: capture restored unexpectedly"
+            ));
+        }
+        CustodyCaptureOutcomeV2::Retained(_, reason) => {
+            return MarkerRetirementOutcomeV1::CapturedRetained(reason)
+        }
+        CustodyCaptureOutcomeV2::Unknown(reason) => {
+            return MarkerRetirementOutcomeV1::CaptureUncertain(reason)
+        }
+        CustodyCaptureOutcomeV2::CompileUnsupported => {
+            return MarkerRetirementOutcomeV1::CompileUnsupported
+        }
+        CustodyCaptureOutcomeV2::RuntimeUnsupported(reason) => {
+            return MarkerRetirementOutcomeV1::RuntimeUnsupported(reason)
+        }
+    };
+    if captured != snapshot_object {
+        return MarkerRetirementOutcomeV1::CapturedRetained(format!(
+            "{label}: captured dev/ino/birthtime differs from the descriptor snapshot"
+        ));
+    }
+    if let Err(reason) = after_capture(intent.capture_name()) {
+        return MarkerRetirementOutcomeV1::CapturedRetained(reason);
+    }
+    let capture_c = match child_name_cstring(intent.capture_name().as_os_str(), label) {
+        Ok(value) => value,
+        Err(error) => return MarkerRetirementOutcomeV1::CapturedRetained(error.to_string()),
+    };
+    let links_after_capture = match file.metadata() {
+        Ok(metadata) => {
+            use std::os::unix::fs::MetadataExt as _;
+            metadata.nlink()
+        }
+        Err(error) => {
+            return MarkerRetirementOutcomeV1::CapturedRetained(format!(
+                "{label}: captured marker link count unavailable: {error}"
+            ))
+        }
+    };
+    if links_after_capture != 1 {
+        return MarkerRetirementOutcomeV1::CapturedRetained(format!(
+            "{label}: captured marker has {links_after_capture} links"
+        ));
+    }
+    // SAFETY: `pin.file` is a live pinned directory descriptor, `capture_c` is a
+    // NUL-terminated one-component name, and `unlinkat` retains neither pointer.
+    let unlink_error = (unsafe { libc::unlinkat(pin.file.as_raw_fd(), capture_c.as_ptr(), 0) }
+        == -1)
+        .then(std::io::Error::last_os_error);
+    match stat_child_no_follow(&pin.file, &capture_c) {
+        Ok(None) => match pin.sync(label) {
+            Ok(()) => MarkerRetirementOutcomeV1::Retired,
+            Err(error) => MarkerRetirementOutcomeV1::RetiredUnsynced(error.to_string()),
+        },
+        Ok(Some(_)) => match unlink_error {
+            Some(error) => MarkerRetirementOutcomeV1::CapturedRetained(format!(
+                "{label}: capture unlink refused: {error}"
+            )),
+            None => MarkerRetirementOutcomeV1::CaptureUncertain(format!(
+                "{label}: capture remained after unlink success"
+            )),
+        },
+        Err(error) => MarkerRetirementOutcomeV1::CaptureUncertain(format!(
+            "{label}: capture absence is unknown: {error}"
+        )),
+    }
+}
+
 #[cfg(unix)]
 #[rustfmt::skip]
 pub(crate) fn required_identity_at_v2(parent: &File, name: &OsStr, label: &str) -> Result<RequiredObjectIdentityV2, FsCustodyError> {
@@ -7085,6 +7290,406 @@ mod tests {
                     !custody.exists(),
                     "no outcome may fall back to replacing rename"
                 );
+            }
+        }
+
+        fn marker_identity(ino: u64) -> RequiredObjectIdentityV2 {
+            required_object_identity_v2(7, ino, BirthTimeV1::new(11, 13), "marker identity")
+                .unwrap()
+        }
+
+        fn marker_snapshot(ino: u64) -> FileContentSnapshotV2 {
+            FileContentSnapshotV2 {
+                object: marker_identity(ino),
+                content_len: 17,
+            }
+        }
+
+        fn retirement_capture_path(root: &Path, name: &str) -> PathBuf {
+            let target = ChildNameV2::from_bytes(name.as_bytes()).unwrap();
+            root.join(
+                ChildNameV2::reserved(ReservedNameNamespaceV2::RetirementCapture, &target)
+                    .unwrap()
+                    .as_os_str(),
+            )
+        }
+
+        fn capture_marker_as(
+            parent: &File,
+            intent: &CustodyIntentV2,
+            identity: RequiredObjectIdentityV2,
+        ) -> CustodyCaptureOutcomeV2 {
+            let (_, target, _, _) = intent.parts();
+            let target = child_name_cstring(target.as_os_str(), "test capture").unwrap();
+            let capture =
+                child_name_cstring(intent.capture_name().as_os_str(), "test capture").unwrap();
+            rename_child_no_replace(parent, &target, &capture).unwrap();
+            CustodyCaptureOutcomeV2::ExpectedCaptured(identity)
+        }
+
+        /// Discriminates a stale caller identity moving the public marker before descriptor
+        /// identity is proved: capture must not be reached and the name remains in place.
+        #[test]
+        fn marker_retirement_refuses_stale_expected_before_capture() {
+            let dir = tempfile::tempdir().unwrap();
+            let marker = dir.path().join("record.custody.v1.json");
+            fs::write(&marker, b"old").unwrap();
+            let pin = PinnedDirectoryV1::open(dir.path(), "stale expected").unwrap();
+
+            let outcome = retire_captured_regular_child_v2_with(
+                &pin,
+                OsStr::new("record.custody.v1.json"),
+                marker_identity(22),
+                "stale expected",
+                |_, _| Ok(marker_snapshot(21)),
+                || panic!("stale expected must refuse before capture"),
+                |_, _, _| panic!("stale expected must not capture"),
+                |_| Ok(()),
+            );
+
+            assert!(matches!(
+                outcome,
+                MarkerRetirementOutcomeV1::RefusedNoEffect(_)
+            ));
+            assert_eq!(fs::read(&marker).unwrap(), b"old");
+            assert!(!retirement_capture_path(dir.path(), "record.custody.v1.json").exists());
+        }
+
+        /// Discriminates accepting a same-name replacement after the descriptor snapshot: the
+        /// replacement can be captured, but its capture must never be unlinked as the old marker.
+        #[test]
+        fn marker_retirement_retains_a_same_name_replacement_after_capture() {
+            let dir = tempfile::tempdir().unwrap();
+            let marker = dir.path().join("record.custody.v1.json");
+            let original = dir.path().join("original");
+            let sibling = dir.path().join("sibling");
+            fs::write(&marker, b"old").unwrap();
+            fs::write(&sibling, b"untouched").unwrap();
+            let pin = PinnedDirectoryV1::open(dir.path(), "replacement").unwrap();
+            let expected = marker_identity(21);
+            let capture = retirement_capture_path(dir.path(), "record.custody.v1.json");
+
+            let outcome = retire_captured_regular_child_v2_with(
+                &pin,
+                OsStr::new("record.custody.v1.json"),
+                expected,
+                "replacement",
+                |_, _| Ok(marker_snapshot(21)),
+                || {
+                    fs::rename(&marker, &original).unwrap();
+                    fs::write(&marker, b"replacement").unwrap();
+                },
+                |parent, intent, _| {
+                    let (_, target, _, _) = intent.parts();
+                    let target = child_name_cstring(target.as_os_str(), "test capture").unwrap();
+                    let capture =
+                        child_name_cstring(intent.capture_name().as_os_str(), "test capture")
+                            .unwrap();
+                    rename_child_no_replace(parent, &target, &capture).unwrap();
+                    CustodyCaptureOutcomeV2::Unknown(
+                        "replacement identity differs from descriptor snapshot".into(),
+                    )
+                },
+                |_| panic!("uncertain capture must precede unlink"),
+            );
+
+            assert!(matches!(
+                outcome,
+                MarkerRetirementOutcomeV1::CaptureUncertain(_)
+            ));
+            assert!(
+                !marker.exists(),
+                "the public name is captured, not unlinked"
+            );
+            assert_eq!(fs::read(&original).unwrap(), b"old");
+            assert_eq!(fs::read(&capture).unwrap(), b"replacement");
+            assert_eq!(fs::read(&sibling).unwrap(), b"untouched");
+        }
+
+        /// Discriminates an open that follows a symlink and could retire a marker outside the
+        /// pinned parent rather than refusing before capture.
+        #[test]
+        fn marker_retirement_refuses_a_symlink_without_unlinking() {
+            let dir = tempfile::tempdir().unwrap();
+            let outside = dir.path().join("outside");
+            let marker = dir.path().join("record.custody.v1.json");
+            fs::write(&outside, b"outside").unwrap();
+            std::os::unix::fs::symlink(&outside, &marker).unwrap();
+            let pin = PinnedDirectoryV1::open(dir.path(), "symlink").unwrap();
+
+            let outcome = retire_captured_regular_child_v2(
+                &pin,
+                OsStr::new("record.custody.v1.json"),
+                marker_identity(30),
+                "symlink",
+            );
+
+            assert!(matches!(
+                outcome,
+                MarkerRetirementOutcomeV1::RefusedNoEffect(_)
+            ));
+            assert!(marker.is_symlink());
+            assert_eq!(fs::read(&outside).unwrap(), b"outside");
+            assert!(!retirement_capture_path(dir.path(), "record.custody.v1.json").exists());
+        }
+
+        /// Discriminates omitting the single-link demand: unlinking one name of a hard-linked
+        /// marker would make a retained alias silently authoritative.
+        #[test]
+        fn marker_retirement_refuses_a_multiply_linked_marker_without_capture() {
+            let dir = tempfile::tempdir().unwrap();
+            let marker = dir.path().join("record.custody.v1.json");
+            let alias = dir.path().join("alias");
+            fs::write(&marker, b"shared").unwrap();
+            fs::hard_link(&marker, &alias).unwrap();
+            let pin = PinnedDirectoryV1::open(dir.path(), "hard link").unwrap();
+
+            let outcome = retire_captured_regular_child_v2_with(
+                &pin,
+                OsStr::new("record.custody.v1.json"),
+                marker_identity(40),
+                "hard link",
+                |_, _| Ok(marker_snapshot(40)),
+                || panic!("link-count refusal must precede capture"),
+                |_, _, _| panic!("link-count refusal must not capture"),
+                |_| Ok(()),
+            );
+
+            assert!(matches!(
+                outcome,
+                MarkerRetirementOutcomeV1::RefusedNoEffect(_)
+            ));
+            assert_eq!(fs::read(&marker).unwrap(), b"shared");
+            assert_eq!(fs::read(&alias).unwrap(), b"shared");
+            assert!(!retirement_capture_path(dir.path(), "record.custody.v1.json").exists());
+        }
+
+        /// Discriminates trusting the initial link-count observation after a no-replace capture:
+        /// a hard link made after capture leaves proven residue rather than an alias mistaken for
+        /// a fully retired marker.
+        #[test]
+        fn marker_retirement_retains_capture_when_hard_link_appears_after_capture() {
+            let dir = tempfile::tempdir().unwrap();
+            let marker = dir.path().join("record.custody.v1.json");
+            let alias = dir.path().join("late-alias");
+            fs::write(&marker, b"marker").unwrap();
+            let pin = PinnedDirectoryV1::open(dir.path(), "late hard link").unwrap();
+            let expected = marker_identity(45);
+            let capture = retirement_capture_path(dir.path(), "record.custody.v1.json");
+
+            let outcome = retire_captured_regular_child_v2_with(
+                &pin,
+                OsStr::new("record.custody.v1.json"),
+                expected,
+                "late hard link",
+                |_, _| Ok(marker_snapshot(45)),
+                || {},
+                |parent, intent, _| capture_marker_as(parent, intent, expected),
+                |_| {
+                    fs::hard_link(&capture, &alias).unwrap();
+                    Ok(())
+                },
+            );
+
+            assert!(matches!(
+                outcome,
+                MarkerRetirementOutcomeV1::CapturedRetained(_)
+            ));
+            assert!(!marker.exists());
+            assert_eq!(fs::read(&capture).unwrap(), b"marker");
+            assert_eq!(fs::read(&alias).unwrap(), b"marker");
+        }
+
+        /// Discriminates flattening unavailable birthtime into an ordinary failure: the caller
+        /// must learn that this filesystem cannot provide the identity the operation requires.
+        #[test]
+        fn marker_retirement_reports_missing_birthtime_as_runtime_unsupported() {
+            let dir = tempfile::tempdir().unwrap();
+            let marker = dir.path().join("record.custody.v1.json");
+            fs::write(&marker, b"marker").unwrap();
+            let pin = PinnedDirectoryV1::open(dir.path(), "missing birthtime").unwrap();
+
+            let outcome = retire_captured_regular_child_v2_with(
+                &pin,
+                OsStr::new("record.custody.v1.json"),
+                marker_identity(50),
+                "missing birthtime",
+                |_, label| Err(FsCustodyError::Unsupported(label.into())),
+                || panic!("birthtime refusal must precede capture"),
+                |_, _, _| panic!("birthtime refusal must not capture"),
+                |_| Ok(()),
+            );
+
+            assert!(matches!(
+                outcome,
+                MarkerRetirementOutcomeV1::RuntimeUnsupported(_)
+            ));
+            assert_eq!(fs::read(&marker).unwrap(), b"marker");
+            assert!(!retirement_capture_path(dir.path(), "record.custody.v1.json").exists());
+        }
+
+        /// Discriminates unlink running after a process interruption: a crash after capture must
+        /// leave only recognizable retirement residue while preserving every unrelated sibling.
+        #[test]
+        fn marker_retirement_interrupt_after_capture_leaves_only_residue() {
+            let dir = tempfile::tempdir().unwrap();
+            let marker = dir.path().join("record.custody.v1.json");
+            fs::write(&marker, b"marker").unwrap();
+            fs::write(dir.path().join("sibling-a"), b"a").unwrap();
+            fs::write(dir.path().join("sibling-b"), b"b").unwrap();
+            let pin = PinnedDirectoryV1::open(dir.path(), "interrupt").unwrap();
+            let expected = marker_identity(60);
+            let capture = retirement_capture_path(dir.path(), "record.custody.v1.json");
+
+            let outcome = retire_captured_regular_child_v2_with(
+                &pin,
+                OsStr::new("record.custody.v1.json"),
+                expected,
+                "interrupt",
+                |_, _| Ok(marker_snapshot(60)),
+                || {},
+                |parent, intent, _| capture_marker_as(parent, intent, expected),
+                |_| Err("simulated interrupt after capture".into()),
+            );
+
+            assert!(matches!(
+                outcome,
+                MarkerRetirementOutcomeV1::CapturedRetained(_)
+            ));
+            assert!(!marker.exists());
+            assert_eq!(fs::read(&capture).unwrap(), b"marker");
+            let mut names = fs::read_dir(dir.path())
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect::<Vec<_>>();
+            names.sort();
+            assert_eq!(
+                names,
+                [
+                    OsString::from(".a2a-v2-rtc-record.custody.v1.json"),
+                    OsString::from("sibling-a"),
+                    OsString::from("sibling-b"),
+                ]
+            );
+        }
+
+        /// Discriminates moving the parent durability barrier before the capture-name unlink or
+        /// dropping it altogether: the injected barrier must observe an already-removed marker.
+        #[test]
+        fn marker_retirement_syncs_parent_after_capture_unlink() {
+            let dir = tempfile::tempdir().unwrap();
+            let marker = dir.path().join("record.custody.v1.json");
+            fs::write(&marker, b"marker").unwrap();
+            let pin = PinnedDirectoryV1::open(dir.path(), "sync").unwrap();
+            pin.fail_sync_on_nth_call_for_test(1);
+            let expected = marker_identity(70);
+
+            let outcome = retire_captured_regular_child_v2_with(
+                &pin,
+                OsStr::new("record.custody.v1.json"),
+                expected,
+                "sync",
+                |_, _| Ok(marker_snapshot(70)),
+                || {},
+                |parent, intent, _| capture_marker_as(parent, intent, expected),
+                |_| Ok(()),
+            );
+
+            assert!(matches!(
+                outcome,
+                MarkerRetirementOutcomeV1::RetiredUnsynced(_)
+            ));
+            assert!(!marker.exists());
+            assert!(!retirement_capture_path(dir.path(), "record.custody.v1.json").exists());
+        }
+
+        /// Discriminates unlinking the public name or a sibling after capture: a success removes
+        /// exactly the marker and the transient capture name, leaving all sibling entries intact.
+        #[test]
+        fn marker_retirement_removes_exactly_one_marker_and_preserves_siblings() {
+            let dir = tempfile::tempdir().unwrap();
+            let marker = dir.path().join("record.custody.v1.json");
+            let sibling_a = dir.path().join("sibling-a");
+            let sibling_b = dir.path().join("sibling-b");
+            fs::write(&marker, b"marker").unwrap();
+            fs::write(&sibling_a, b"a").unwrap();
+            fs::write(&sibling_b, b"b").unwrap();
+            let pin = PinnedDirectoryV1::open(dir.path(), "success").unwrap();
+            let expected = marker_identity(80);
+
+            let outcome = retire_captured_regular_child_v2_with(
+                &pin,
+                OsStr::new("record.custody.v1.json"),
+                expected,
+                "success",
+                |_, _| Ok(marker_snapshot(80)),
+                || {},
+                |parent, intent, _| capture_marker_as(parent, intent, expected),
+                |_| Ok(()),
+            );
+
+            assert!(matches!(outcome, MarkerRetirementOutcomeV1::Retired));
+            assert!(!marker.exists());
+            assert!(!retirement_capture_path(dir.path(), "record.custody.v1.json").exists());
+            assert_eq!(fs::read(&sibling_a).unwrap(), b"a");
+            assert_eq!(fs::read(&sibling_b).unwrap(), b"b");
+            let mut names = fs::read_dir(dir.path())
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect::<Vec<_>>();
+            names.sort();
+            assert_eq!(
+                names,
+                [OsString::from("sibling-a"), OsString::from("sibling-b")]
+            );
+        }
+
+        /// Measures this test environment rather than assuming another filesystem exposes the
+        /// required birthtime, and reports the actual retirement result under `--nocapture`.
+        #[test]
+        fn marker_retirement_reports_birthtime_capability() {
+            let dir = tempfile::tempdir().unwrap();
+            let marker = dir.path().join("record.custody.v1.json");
+            fs::write(&marker, b"marker").unwrap();
+            let pin = PinnedDirectoryV1::open(dir.path(), "birthtime measure").unwrap();
+            let observed = required_file_content_snapshot_v2(
+                &File::open(&marker).unwrap(),
+                "birthtime measure",
+            );
+            let (capability, outcome) = match observed {
+                Ok(snapshot) => (
+                    "present",
+                    retire_captured_regular_child_v2(
+                        &pin,
+                        OsStr::new("record.custody.v1.json"),
+                        snapshot.object,
+                        "birthtime measure",
+                    ),
+                ),
+                Err(FsCustodyError::Unsupported(_)) => (
+                    "absent",
+                    retire_captured_regular_child_v2(
+                        &pin,
+                        OsStr::new("record.custody.v1.json"),
+                        marker_identity(90),
+                        "birthtime measure",
+                    ),
+                ),
+                Err(error) => panic!("unexpected birthtime observation error: {error}"),
+            };
+            let outcome_name = match &outcome {
+                MarkerRetirementOutcomeV1::Retired => "retired",
+                MarkerRetirementOutcomeV1::RuntimeUnsupported(_) => "runtime_unsupported",
+                _ => "other",
+            };
+            println!("SLICE-3-BTIME capability={capability} outcome={outcome_name}");
+            match capability {
+                "present" => assert!(matches!(outcome, MarkerRetirementOutcomeV1::Retired)),
+                "absent" => assert!(matches!(
+                    outcome,
+                    MarkerRetirementOutcomeV1::RuntimeUnsupported(_)
+                )),
+                _ => unreachable!(),
             }
         }
     }

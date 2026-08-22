@@ -71,9 +71,9 @@
 //! call 3 = the terminal replace (`LiveProtected` / `PreservationUnknown`).
 
 use crate::custody::{
-    custody_record_path, read_custody_record_in, transition_is_legal, ClaimPresenceV1,
-    CustodyReadRefusalV1, IdentityCompletenessV1, PreservationReasonV1, PreservedWorktreeClaimV1,
-    RecoveryLocatorV1, WorktreeCustodyRecordV1, WorktreeCustodyStateKindV1, WorktreeCustodyStateV1,
+    read_custody_record_in, transition_is_legal, ClaimPresenceV1, CustodyReadRefusalV1,
+    IdentityCompletenessV1, PreservationReasonV1, PreservedWorktreeClaimV1, RecoveryLocatorV1,
+    WorktreeCustodyRecordV1, WorktreeCustodyStateKindV1, WorktreeCustodyStateV1,
     CUSTODY_RECORD_SUFFIX, WORKTREE_CUSTODY_RECORD_SCHEMA_V1,
 };
 use crate::custody_lock::{
@@ -87,8 +87,8 @@ use bridge_core::execution_policy::{
 #[cfg(unix)]
 use bridge_core::fs_custody::BirthTimeV1;
 use bridge_core::fs_custody::{
-    open_options_create_new_owner_private, CustodyPublicationV1, DirectoryIdentityV1,
-    FsCustodyError, PinnedDirectoryV1, RegularChildRefV1,
+    open_options_create_new_owner_private, ChildNameV2, CustodyPublicationV1, DirectoryIdentityV1,
+    FsCustodyError, PinnedDirectoryV1, RegularChildRefV1, ReservedNameNamespaceV2,
 };
 use bridge_core::liveness::{acquire_lease_in, LeaseGuard};
 use bridge_workflow::run_spec::WorkflowSnapshotV3;
@@ -1469,14 +1469,22 @@ enum PublicationModeV1 {
 }
 
 fn record_file_name(worktree_path: &str) -> Result<OsString, CustodyWriteRefusalV1> {
-    Path::new(&custody_record_path(worktree_path))
-        .file_name()
-        .map(OsStr::to_os_string)
-        .ok_or_else(|| {
-            CustodyWriteRefusalV1::Failed(format!(
-                "worktree target has no file name: {worktree_path}"
-            ))
-        })
+    let name = Path::new(worktree_path).file_name().ok_or_else(|| {
+        CustodyWriteRefusalV1::Failed(format!("worktree target has no file name: {worktree_path}"))
+    })?;
+    let name = ChildNameV2::from_bytes(name.as_encoded_bytes()).map_err(|error| {
+        CustodyWriteRefusalV1::Failed(format!(
+            "worktree target has an invalid child name: {error:?}"
+        ))
+    })?;
+    if ChildNameV2::parse_reserved(ReservedNameNamespaceV2::RetirementCapture, &name).is_ok() {
+        return Err(CustodyWriteRefusalV1::Failed(
+            "worktree target uses the reserved retirement-capture namespace".into(),
+        ));
+    }
+    let mut record = name.as_os_str().to_os_string();
+    record.push(CUSTODY_RECORD_SUFFIX);
+    Ok(record)
 }
 
 /// `<record name>.staging-<32 hex>`.
@@ -1531,7 +1539,7 @@ fn const_format_staging_marker() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::custody::{read_custody_record_in, WorktreeCustodyStateKindV1};
+    use crate::custody::{custody_record_path, read_custody_record_in, WorktreeCustodyStateKindV1};
     use bridge_core::execution_policy::{
         FrozenWorktreeCustodyPlanV1, PolicyNodeRefV1, Sha256HexV1,
     };
@@ -1746,6 +1754,29 @@ mod tests {
                 "the staging name must stay a single path component"
             );
         }
+        std::fs::remove_dir_all(&worktree_root).unwrap();
+    }
+
+    /// Discriminates treating a retirement-residue spelling as a valid checkout basename: this
+    /// reservation makes the scanner's exact residue classification unambiguous.
+    #[test]
+    fn a_retirement_capture_basename_cannot_mint_a_custody_record() {
+        let worktree_root = root("retirement-capture-basename");
+        let target = worktree_root.join(".a2a-v2-rtc-ordinary");
+        std::fs::create_dir(&target).unwrap();
+
+        let refused = record_file_name(&target.to_string_lossy());
+        assert!(
+            matches!(&refused, Err(CustodyWriteRefusalV1::Failed(reason)) if reason.contains("retirement-capture")),
+            "reserved checkout basename must not mint an ambiguous marker: {refused:?}"
+        );
+        assert!(
+            !crate::custody::is_custody_record_name(&custody_record_path(
+                &target.to_string_lossy()
+            )),
+            "the reserved spelling is reserved for core retirement residue"
+        );
+
         std::fs::remove_dir_all(&worktree_root).unwrap();
     }
 

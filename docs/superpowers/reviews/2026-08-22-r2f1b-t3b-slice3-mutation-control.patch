@@ -1,0 +1,14 @@
+diff --git a/crates/bridge-core/src/fs_custody.rs b/crates/bridge-core/src/fs_custody.rs
+--- a/crates/bridge-core/src/fs_custody.rs
++++ b/crates/bridge-core/src/fs_custody.rs
+@@ -408,10 +408,5 @@ where
+     }
+     let snapshot_object = snapshot.object;
+-    if snapshot_object != expected {
+-        return MarkerRetirementOutcomeV1::RefusedNoEffect(format!(
+-            "{label}: descriptor snapshot does not match expected identity"
+-        ));
+-    }
+     let intent =
+         match CustodyIntentV2::new(CustodyOperationKindV2::Retire, target, expected, snapshot) {
+             Ok(value) => value,
