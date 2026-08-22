@@ -1,0 +1,15 @@
+diff --git a/crates/bridge-worktree/src/sweep.rs b/crates/bridge-worktree/src/sweep.rs
+--- a/crates/bridge-worktree/src/sweep.rs
++++ b/crates/bridge-worktree/src/sweep.rs
+@@ -1047,10 +1047,10 @@ pub(crate) fn reprove_exact_absence_entry(
+     let held_entry = ExactAbsenceSweepEntryV1::new(
+         refreshed.record_path().to_owned(),
+         refreshed.enumerated_name().to_os_string(),
+         refreshed.assessment().clone(),
+         Some(held_bytes),
+     );
+-    if refreshed != *report_entry || refreshed != held_entry {
++    if refreshed != held_entry {
+         return ReprovedExactAbsenceOutcomeV1::Refused("record or report evidence changed");
+     }
+     match evidence {

@@ -221,6 +221,7 @@ fn classify_record_display(record_display: &str) -> Option<CheckedScanRecordKind
 
 fn scan_checked_rows_with_source(
     enumeration_root: &Path,
+    selected_name: Option<&OsStr>,
     source: &dyn CheckedScanSourceV1,
 ) -> Result<CheckedScanCompletedV1, CheckedScanOpenRefusalV1> {
     let mut session = source.open(enumeration_root)?;
@@ -230,10 +231,18 @@ fn scan_checked_rows_with_source(
         let name = match name {
             Ok(name) => name,
             Err(CheckedScanEntryRefusalV1::CannotReadEntry) => {
-                iterator_error_count += 1;
+                if selected_name.is_none() {
+                    iterator_error_count += 1;
+                }
                 continue;
             }
         };
+        if selected_name
+            .map(|selected| name.as_os_str() != selected)
+            .unwrap_or(false)
+        {
+            continue;
+        }
         let record_path = enumeration_root.join(&name).to_string_lossy().into_owned();
         let scanned = match classify_record_display(&record_path) {
             Some(CheckedScanRecordKindV1::Legacy) => session
@@ -263,13 +272,14 @@ fn scan_checked_rows_with_source(
 
 pub(super) fn scan_compatibility_with_pin_opener<P>(
     enumeration_root: &Path,
+    selected_name: Option<&OsStr>,
     pin_opener: P,
 ) -> Result<CheckedScanCompletedV1, CheckedScanOpenRefusalV1>
 where
     P: CompatibilityPinOpenerV1,
 {
     let source = CompatibilityCheckedScanSourceV1::new(pin_opener);
-    scan_checked_rows_with_source(enumeration_root, &source)
+    scan_checked_rows_with_source(enumeration_root, selected_name, &source)
 }
 
 #[cfg(test)]
@@ -277,7 +287,7 @@ fn scan_checked_rows_for_test(
     enumeration_root: &Path,
     source: &dyn CheckedScanSourceV1,
 ) -> Result<CheckedScanCompletedV1, CheckedScanOpenRefusalV1> {
-    scan_checked_rows_with_source(enumeration_root, source)
+    scan_checked_rows_with_source(enumeration_root, None, source)
 }
 
 #[cfg(test)]
@@ -531,7 +541,7 @@ mod tests {
         std::fs::create_dir_all(&root).unwrap();
 
         let (_, _, observations) =
-            scan_compatibility_with_pin_opener(&root, FilesystemCompatibilityPinOpenerV1)
+            scan_compatibility_with_pin_opener(&root, None, FilesystemCompatibilityPinOpenerV1)
                 .unwrap()
                 .into_exact_parts();
 
@@ -610,7 +620,7 @@ mod tests {
 
         let success = super::super::project_exact_scan_result(
             canonical.clone(),
-            scan_compatibility_with_pin_opener(&root, FilesystemCompatibilityPinOpenerV1),
+            scan_compatibility_with_pin_opener(&root, None, FilesystemCompatibilityPinOpenerV1),
             &probe(
                 Some(ExactAbsenceObservationV1::BothAbsent),
                 Arc::new(Mutex::new(Vec::new())),
@@ -618,7 +628,7 @@ mod tests {
         );
         let failure = super::super::project_exact_scan_result(
             canonical,
-            scan_compatibility_with_pin_opener(&root, Pin(Arc::new(AtomicUsize::new(0)))),
+            scan_compatibility_with_pin_opener(&root, None, Pin(Arc::new(AtomicUsize::new(0)))),
             &probe(
                 Some(ExactAbsenceObservationV1::BothAbsent),
                 Arc::new(Mutex::new(Vec::new())),
@@ -666,7 +676,7 @@ mod tests {
         std::fs::create_dir_all(&root).unwrap();
 
         let (_, _, observations) =
-            scan_compatibility_with_pin_opener(&root, FilesystemCompatibilityPinOpenerV1)
+            scan_compatibility_with_pin_opener(&root, None, FilesystemCompatibilityPinOpenerV1)
                 .unwrap()
                 .into_exact_parts();
         let retained = observations.retained_enumeration_object.unwrap();
@@ -1382,6 +1392,7 @@ mod tests {
         let calls = Arc::new(AtomicUsize::new(0));
         let rows = super::super::project_action_scan_result(scan_compatibility_with_pin_opener(
             &root,
+            None,
             Pin(calls.clone()),
         ));
         assert_eq!(calls.load(Ordering::SeqCst), 1);

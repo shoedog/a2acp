@@ -17,10 +17,16 @@
 
 use crate::custody::{
     custody_record_path, read_custody_record_in, CustodyReadRefusalV1, WorktreeCustodyRecordV1,
+    WorktreeCustodyStateV1,
 };
 use crate::custody_lock::{
     try_acquire_custody_lock_in, try_acquire_publication_lock_in, CustodyLockGuardV1,
     CustodyLockRefusalV1, PublicationLockGuardV1,
+};
+use crate::sweep::{
+    reprove_exact_absence_entry, ExactAbsenceProbeV1, ExactAbsenceRecordAssessmentV1,
+    ExactAbsenceSweepEntryV1, ExactAbsenceSweepReportV1, ReprovedExactAbsenceOutcomeV1,
+    UnusedCandidateDecisionV1,
 };
 use bridge_core::execution_policy::WorktreeCustodyIdV1;
 use bridge_core::fs_custody::PinnedDirectoryV1;
@@ -209,16 +215,137 @@ fn canonical_bytes(record: &WorktreeCustodyRecordV1) -> Result<Vec<u8>, Settleme
         .map_err(SettlementWindowRefusalV1::RecordUnreadable)
 }
 
+/// Why a held settlement window could not establish current proof for its subject.
+///
+/// `Refused` is a proved-negative answer. `CannotProve` means the current evidence was
+/// unavailable, so a later settlement slice must not treat it as a negative conclusion.
+#[derive(Debug, thiserror::Error)]
+pub enum SettlementProofRefusalV1 {
+    /// The report entry, record, or renewed exact-absence observation proved the subject ineligible.
+    #[error("settlement subject is refused: {0}")]
+    Refused(String),
+    /// A fresh scan could not establish the current evidence needed for a decision.
+    #[error("settlement subject cannot be proved: {0}")]
+    CannotProve(String),
+}
+
+/// A settlement subject proved under, and owning, its refusing settlement window.
+///
+/// There is no public constructor. The contained window keeps both cells alive until this
+/// capability is dropped, so no later settlement action can retain proof after releasing them.
+#[must_use]
+pub struct ProvenSettlementV1 {
+    window: SettlementWindowV1,
+}
+
+impl std::fmt::Debug for ProvenSettlementV1 {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ProvenSettlementV1")
+            .field("worktree_path", &self.worktree_path())
+            .field("record_name", &self.record_name())
+            .field("custody_id", &self.custody_id().as_str())
+            .finish()
+    }
+}
+
+impl ProvenSettlementV1 {
+    #[must_use]
+    pub fn record(&self) -> &WorktreeCustodyRecordV1 {
+        self.window.record()
+    }
+
+    #[must_use]
+    pub fn record_name(&self) -> &OsStr {
+        self.window.record_name()
+    }
+
+    #[must_use]
+    pub fn custody_id(&self) -> &WorktreeCustodyIdV1 {
+        self.window.custody_id()
+    }
+
+    #[must_use]
+    pub fn worktree_path(&self) -> &str {
+        self.window.worktree_path()
+    }
+}
+
+/// Re-prove a report entry under its held window before any later settlement effect.
+///
+/// A report is historical evidence only. This gate first rejects any report that was not an
+/// authoritative snapshot, then binds the selected entry back to that report and re-runs the
+/// report's scan and projection under the held cells. Only the freshly re-proved decision can
+/// mint `ProvenSettlementV1`.
+pub fn reprove_under_window(
+    window: SettlementWindowV1,
+    report: &ExactAbsenceSweepReportV1,
+    entry: &ExactAbsenceSweepEntryV1,
+    probe: &dyn ExactAbsenceProbeV1,
+) -> Result<ProvenSettlementV1, SettlementProofRefusalV1> {
+    if !report.has_authoritative_scan() {
+        return Err(SettlementProofRefusalV1::Refused(
+            "report scan was not authoritative".to_string(),
+        ));
+    }
+    if !report.entries().iter().any(|reported| reported == entry) {
+        return Err(SettlementProofRefusalV1::Refused(
+            "selected entry does not belong to the report".to_string(),
+        ));
+    }
+    if !matches!(
+        &window.record().state,
+        WorktreeCustodyStateV1::ProtectionPrepared {}
+    ) || window.record().claim.is_none()
+    {
+        return Err(SettlementProofRefusalV1::Refused(
+            "held record is not protection-prepared with its required claim population".to_string(),
+        ));
+    }
+    if entry.assessment().decision() != UnusedCandidateDecisionV1::Authorized
+        || matches!(
+            entry.assessment(),
+            ExactAbsenceRecordAssessmentV1::Legacy(_)
+        )
+    {
+        return Err(SettlementProofRefusalV1::Refused(
+            "report entry is not an authorized custody subject".to_string(),
+        ));
+    }
+    match reprove_exact_absence_entry(
+        window.pinned_root().canonical_path(),
+        window.record(),
+        entry,
+        probe,
+    ) {
+        ReprovedExactAbsenceOutcomeV1::Authorized => Ok(ProvenSettlementV1 { window }),
+        ReprovedExactAbsenceOutcomeV1::Refused(reason) => {
+            Err(SettlementProofRefusalV1::Refused(reason.to_owned()))
+        }
+        ReprovedExactAbsenceOutcomeV1::CannotProve(reason) => {
+            Err(SettlementProofRefusalV1::CannotProve(reason.to_owned()))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::custody::{WorktreeCustodyStateV1, WORKTREE_CUSTODY_RECORD_SCHEMA_V1};
+    use crate::custody::{
+        PreservationReasonV1, PreservedWorktreeClaimV1, RecoveryLocatorV1,
+        WORKTREE_CUSTODY_RECORD_SCHEMA_V1,
+    };
     use crate::custody_lock::{
         custody_lock_dir, custody_lock_id, custody_publication_lock_id,
         try_acquire_custody_lock_in, try_acquire_publication_lock_in,
     };
     use crate::custody_writer::planned_identity;
-    use bridge_core::execution_policy::Sha256HexV1;
+    use crate::sweep::{
+        sweep_orphans_with_exact_absence, CustodyRootObservationV1, ExactAbsenceEnumerationV1,
+        ExactAbsenceScanStatusV1, ExactAbsenceSweepReportV1,
+    };
+    use bridge_core::execution_policy::{PolicyNodeRefV1, Sha256HexV1, WorktreeObjectIdentityV1};
+    use bridge_core::fs_custody::{verify_payload_directory_identity, DirectoryIdentityV1};
     use bridge_core::ids::{AttemptId, AttemptIdentity, ExecutionId};
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -226,6 +353,7 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
+    use std::fs;
     fn root(name: &str) -> PathBuf {
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -269,6 +397,104 @@ mod tests {
 
     fn remove_root(root: &Path) {
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    fn observed_identity(path: &Path) -> WorktreeObjectIdentityV1 {
+        let directory_identity =
+            verify_payload_directory_identity(&fs::canonicalize(path).unwrap()).unwrap();
+        WorktreeObjectIdentityV1 {
+            canonical_path: directory_identity.canonical_path.clone(),
+            directory_identity,
+        }
+    }
+
+    fn authorized_record(
+        root: &Path,
+        target: &Path,
+        custody_digit: char,
+    ) -> WorktreeCustodyRecordV1 {
+        let source = root.join(format!("source-{custody_digit}"));
+        let common_dir = source.join("common");
+        fs::create_dir_all(&common_dir).unwrap();
+        let mut record = record_for(target, custody_digit);
+        record.claim = Some(PreservedWorktreeClaimV1 {
+            schema_version: WORKTREE_CUSTODY_RECORD_SCHEMA_V1,
+            custody_id: record.custody_id.clone(),
+            execution_id: record.current_attempt.execution_id.clone(),
+            origin_attempt_id: record.current_attempt.attempt_id.clone(),
+            current_attempt: record.current_attempt.clone(),
+            node: PolicyNodeRefV1 {
+                sorted_ordinal: 0,
+                id_sha256: Sha256HexV1::parse("5".repeat(64)).unwrap(),
+            },
+            checkout_fingerprint: record.checkout_fingerprint.clone(),
+            source: observed_identity(&source),
+            root: observed_identity(root),
+            worktree: record.worktree.clone(),
+            common_dir: observed_identity(&common_dir),
+            reason: PreservationReasonV1::NodeFailure,
+            created_wall_ms: 1_700_000_000_000,
+            recovery_locator: RecoveryLocatorV1::RegisteredWorktree {},
+        });
+        record
+    }
+
+    fn write_authorized_record(
+        root: &Path,
+        target: &Path,
+        custody_digit: char,
+    ) -> WorktreeCustodyRecordV1 {
+        let record = authorized_record(root, target, custody_digit);
+        let name = custody_record_name(&target.to_string_lossy()).unwrap();
+        fs::write(root.join(name), record.encode_canonical().unwrap()).unwrap();
+        record
+    }
+
+    struct CurrentAbsenceProbeV1 {
+        source_common_dir: DirectoryIdentityV1,
+    }
+
+    impl ExactAbsenceProbeV1 for CurrentAbsenceProbeV1 {
+        fn observe_source_common_dir_identity(
+            &self,
+            _: &str,
+        ) -> Result<DirectoryIdentityV1, bridge_core::error::BridgeError> {
+            Ok(self.source_common_dir.clone())
+        }
+
+        fn observe_exact_absence(
+            &self,
+            candidate: &crate::sweep::ExactAbsenceCandidateV1,
+        ) -> Result<crate::sweep::ExactAbsenceObservationV1, bridge_core::error::BridgeError>
+        {
+            Ok(if Path::new(&candidate.worktree_path).exists() {
+                crate::sweep::ExactAbsenceObservationV1::TargetPresent
+            } else {
+                crate::sweep::ExactAbsenceObservationV1::BothAbsent
+            })
+        }
+    }
+
+    fn current_probe(record: &WorktreeCustodyRecordV1) -> CurrentAbsenceProbeV1 {
+        CurrentAbsenceProbeV1 {
+            source_common_dir: record
+                .claim
+                .as_ref()
+                .unwrap()
+                .common_dir
+                .directory_identity
+                .clone(),
+        }
+    }
+
+    fn authoritative_report(
+        root: &Path,
+        probe: &CurrentAbsenceProbeV1,
+    ) -> ExactAbsenceSweepReportV1 {
+        let report = sweep_orphans_with_exact_absence(&root.to_string_lossy(), probe);
+        assert!(report.has_authoritative_scan());
+        assert_eq!(report.entries().len(), 1);
+        report
     }
 
     /// A settlement actor that uses the writer's fixed publication-then-custody ordering. This
@@ -452,6 +678,333 @@ mod tests {
             );
         }
         drop(window);
+        remove_root(&root);
+    }
+    /// Discriminates a settlement actor accepting the report's historical absence after a target
+    /// was recreated. The fresh scan must see the replacement and leave custody bytes untouched.
+    #[test]
+    fn a_stale_report_is_never_authority_the_window_reproves() {
+        let root = root("stale-report");
+        let target = root.join("ownr-run7-abc");
+        let record = write_authorized_record(&root, &target, 'b');
+        let probe = current_probe(&record);
+        let report = authoritative_report(&root, &probe);
+        let before =
+            fs::read(root.join(custody_record_name(&target.to_string_lossy()).unwrap())).unwrap();
+        fs::create_dir(&target).unwrap();
+
+        let window = SettlementWindowV1::open(&root, &target.to_string_lossy()).unwrap();
+        let refusal =
+            reprove_under_window(window, &report, &report.entries()[0], &probe).unwrap_err();
+
+        assert!(matches!(refusal, SettlementProofRefusalV1::Refused(_)));
+        assert_eq!(
+            fs::read(root.join(custody_record_name(&target.to_string_lossy()).unwrap())).unwrap(),
+            before
+        );
+        remove_root(&root);
+    }
+
+    /// Discriminates proving a newly replaced decodable record merely because its new scan result
+    /// is also authorized. The report's retained canonical bytes must still bind the subject.
+    #[test]
+    fn a_record_replaced_between_report_and_window_refuses() {
+        let root = root("replaced-record");
+        let target = root.join("ownr-run7-abc");
+        let original = write_authorized_record(&root, &target, 'c');
+        let probe = current_probe(&original);
+        let report = authoritative_report(&root, &probe);
+        let mut replacement = original.clone();
+        replacement.checkout_fingerprint = Sha256HexV1::parse("7".repeat(64)).unwrap();
+        replacement.claim.as_mut().unwrap().checkout_fingerprint =
+            replacement.checkout_fingerprint.clone();
+        fs::write(
+            root.join(custody_record_name(&target.to_string_lossy()).unwrap()),
+            replacement.encode_canonical().unwrap(),
+        )
+        .unwrap();
+
+        let window = SettlementWindowV1::open(&root, &target.to_string_lossy()).unwrap();
+        let refusal =
+            reprove_under_window(window, &report, &report.entries()[0], &probe).unwrap_err();
+
+        assert!(matches!(refusal, SettlementProofRefusalV1::Refused(_)));
+        remove_root(&root);
+    }
+
+    /// Discriminates unavailable current scan evidence from a proved-negative eligibility result.
+    #[test]
+    fn an_unavailable_fresh_scan_is_cannot_prove() {
+        let root = root("cannot-prove");
+        let target = root.join("ownr-run7-abc");
+        let record = write_authorized_record(&root, &target, 'e');
+        let probe = current_probe(&record);
+        let report = authoritative_report(&root, &probe);
+        let window = SettlementWindowV1::open(&root, &target.to_string_lossy()).unwrap();
+        let relocated = root.with_file_name(format!(
+            "a2a-bridge-settlement-window-cannot-prove-relocated-{}",
+            std::process::id()
+        ));
+        fs::rename(&root, &relocated).unwrap();
+
+        let refusal =
+            reprove_under_window(window, &report, &report.entries()[0], &probe).unwrap_err();
+
+        assert!(matches!(refusal, SettlementProofRefusalV1::CannotProve(_)));
+        remove_root(&relocated);
+    }
+
+    /// Discriminates row-level claim-authority loss from a fresh proved-negative decision.
+    #[test]
+    fn a_row_level_authority_failure_is_cannot_prove() {
+        let root = root("row-level-cannot-prove");
+        let target = root.join("ownr-run7-abc");
+        let record = write_authorized_record(&root, &target, 'd');
+        let probe = current_probe(&record);
+        let report = authoritative_report(&root, &probe);
+        let unrelated_common_dir = root.join("unrelated-common-dir");
+        fs::create_dir(&unrelated_common_dir).unwrap();
+        let unavailable_probe = CurrentAbsenceProbeV1 {
+            source_common_dir: observed_identity(&unrelated_common_dir).directory_identity,
+        };
+        let window = SettlementWindowV1::open(&root, &target.to_string_lossy()).unwrap();
+        let refusal =
+            reprove_under_window(window, &report, &report.entries()[0], &unavailable_probe)
+                .unwrap_err();
+
+        assert!(matches!(refusal, SettlementProofRefusalV1::CannotProve(_)));
+        remove_root(&root);
+    }
+    /// Discriminates a non-authoritative report from reaching a later settlement mutation.
+    #[test]
+    fn a_non_authoritative_scan_refuses() {
+        let root = root("non-authoritative");
+        let target = root.join("ownr-run7-abc");
+        let record = write_authorized_record(&root, &target, 'f');
+        let probe = current_probe(&record);
+        let report = authoritative_report(&root, &probe);
+        let non_authoritative = ExactAbsenceSweepReportV1::new(
+            root.to_string_lossy().into_owned(),
+            Some(root.to_string_lossy().into_owned()),
+            ExactAbsenceScanStatusV1::new(
+                ExactAbsenceEnumerationV1::Incomplete { skipped_entries: 1 },
+                CustodyRootObservationV1::Pinned,
+            ),
+            vec![report.entries()[0].clone()],
+        );
+        let window = SettlementWindowV1::open(&root, &target.to_string_lossy()).unwrap();
+        let refusal = reprove_under_window(
+            window,
+            &non_authoritative,
+            &non_authoritative.entries()[0],
+            &probe,
+        )
+        .unwrap_err();
+
+        assert!(matches!(refusal, SettlementProofRefusalV1::Refused(_)));
+        remove_root(&root);
+    }
+
+    /// Discriminates a legacy assessment sharing the raw authorized decision from a custody proof.
+    #[test]
+    fn a_legacy_assessment_refuses() {
+        let root = root("legacy");
+        let target = root.join("ownr-run7-abc");
+        let record = write_authorized_record(&root, &target, '1');
+        let probe = current_probe(&record);
+        let name = custody_record_name(&target.to_string_lossy()).unwrap();
+        let legacy = ExactAbsenceSweepEntryV1::new(
+            root.join(&name).to_string_lossy().into_owned(),
+            name,
+            ExactAbsenceRecordAssessmentV1::Legacy(UnusedCandidateDecisionV1::Authorized),
+            None,
+        );
+        let report = ExactAbsenceSweepReportV1::new(
+            root.to_string_lossy().into_owned(),
+            Some(root.to_string_lossy().into_owned()),
+            ExactAbsenceScanStatusV1::new(
+                ExactAbsenceEnumerationV1::Complete,
+                CustodyRootObservationV1::Pinned,
+            ),
+            vec![legacy],
+        );
+        let window = SettlementWindowV1::open(&root, &target.to_string_lossy()).unwrap();
+        let refusal =
+            reprove_under_window(window, &report, &report.entries()[0], &probe).unwrap_err();
+
+        assert!(matches!(refusal, SettlementProofRefusalV1::Refused(_)));
+        remove_root(&root);
+    }
+
+    /// Discriminates a state accepted by the scan's candidate population from the narrower T3b
+    /// settlement population, and separately rejects a bare protection-prepared record.
+    #[test]
+    fn a_wrong_state_or_missing_claim_refuses() {
+        for missing_claim in [false, true] {
+            let root = root(if missing_claim {
+                "bare-claim"
+            } else {
+                "wrong-state"
+            });
+            let target = root.join("ownr-run7-abc");
+            let baseline =
+                write_authorized_record(&root, &target, if missing_claim { '2' } else { '3' });
+            let probe = current_probe(&baseline);
+            let mut record = baseline;
+            if missing_claim {
+                record.claim = None;
+            } else {
+                record.state = WorktreeCustodyStateV1::PreservationUnknown {
+                    reason: PreservationReasonV1::MaterializationInFlight,
+                };
+                record.claim.as_mut().unwrap().reason =
+                    PreservationReasonV1::MaterializationInFlight;
+            }
+            fs::write(
+                root.join(custody_record_name(&target.to_string_lossy()).unwrap()),
+                record.encode_canonical().unwrap(),
+            )
+            .unwrap();
+            let report = authoritative_report(&root, &probe);
+            let window = SettlementWindowV1::open(&root, &target.to_string_lossy()).unwrap();
+            let refusal =
+                reprove_under_window(window, &report, &report.entries()[0], &probe).unwrap_err();
+
+            assert!(matches!(refusal, SettlementProofRefusalV1::Refused(_)));
+            remove_root(&root);
+        }
+    }
+
+    /// Discriminates a proof that releases its window before the proof itself is dropped.
+    #[test]
+    fn the_proof_cannot_outlive_its_window() {
+        let root = root("proof-owns-window");
+        let target = root.join("ownr-run7-abc");
+        let record = write_authorized_record(&root, &target, '4');
+        let probe = current_probe(&record);
+        let report = authoritative_report(&root, &probe);
+        let window = SettlementWindowV1::open(&root, &target.to_string_lossy()).unwrap();
+        let proof = reprove_under_window(window, &report, &report.entries()[0], &probe).unwrap();
+
+        assert!(matches!(
+            SettlementWindowV1::open(&root, &target.to_string_lossy()),
+            Err(SettlementWindowRefusalV1::CellContended(_))
+        ));
+        drop(proof);
+        drop(SettlementWindowV1::open(&root, &target.to_string_lossy()).unwrap());
+        remove_root(&root);
+    }
+
+    /// Discriminates a later proof path gaining a mutation edge while still returning a capability.
+    /// Effect-freedom is conditional on the caller-supplied `ExactAbsenceProbeV1`; this slice has no
+    /// production caller, and any reachable spawn can arrive only through that supplied probe.
+    #[test]
+    fn the_reproof_mints_no_effect() {
+        let root = root("reproof-effect-audit");
+        let target = root.join("ownr-run7-abc");
+        let record = write_authorized_record(&root, &target, '5');
+        let probe = current_probe(&record);
+        let report = authoritative_report(&root, &probe);
+        let name = custody_record_name(&target.to_string_lossy()).unwrap();
+        let before = fs::read(root.join(&name)).unwrap();
+        let window = SettlementWindowV1::open(&root, &target.to_string_lossy()).unwrap();
+        let proof = reprove_under_window(window, &report, &report.entries()[0], &probe).unwrap();
+
+        assert_eq!(fs::read(root.join(name)).unwrap(), before);
+        assert_eq!(proof.worktree_path(), target.to_string_lossy());
+        let settlement_source = include_str!("settle.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap();
+        let sweep_source = include_str!("sweep.rs")
+            .split_once("pub(crate) fn reprove_exact_absence_entry")
+            .unwrap()
+            .1
+            .split_once("fn project_exact_scan_result")
+            .unwrap()
+            .0;
+        fn source_slice<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
+            let after_start = source
+                .split_once(start)
+                .unwrap_or_else(|| panic!("source slice is missing start anchor: {start}"));
+            after_start
+                .1
+                .split_once(end)
+                .unwrap_or_else(|| panic!("source slice is missing end anchor: {end}"))
+                .0
+        }
+        fn source_tail<'a>(source: &'a str, start: &str) -> &'a str {
+            source
+                .split_once(start)
+                .unwrap_or_else(|| panic!("source slice is missing start anchor: {start}"))
+                .1
+        }
+        let complete_sweep_source = include_str!("sweep.rs");
+        let checked_scan_source = include_str!("sweep/checked_scan.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap();
+        let audited_sources = [
+            settlement_source,
+            sweep_source,
+            source_slice(
+                complete_sweep_source,
+                "fn project_exact_scan_result",
+                "fn sweep_orphans_with_exact_absence_with_pin_opener",
+            ),
+            source_slice(
+                complete_sweep_source,
+                "fn report_exact_scan_projection_row",
+                "/// Re-run the report's exact scan",
+            ),
+            source_slice(
+                complete_sweep_source,
+                "fn assess_custody_record",
+                "struct ExactScanProjectionRowV1",
+            ),
+            source_slice(
+                complete_sweep_source,
+                "fn decide_unused_legacy_sidecar",
+                "/// Reject records whose target cannot be constructed",
+            ),
+            source_slice(
+                complete_sweep_source,
+                "fn decide_unused_candidate_evidence",
+                "#[must_use]",
+            ),
+            source_tail(checked_scan_source, "fn scan_checked_rows_with_source"),
+        ];
+        assert!(
+            settlement_source.contains("probe: &dyn ExactAbsenceProbeV1")
+                && !settlement_source.contains("impl ExactAbsenceProbeV1 for")
+                && !settlement_source.contains("HostGitWorktree"),
+            "settle.rs must not construct an ExactAbsenceProbeV1 implementation; the probe is caller-supplied"
+        );
+        for forbidden_edge in [
+            "std::fs::rename(",
+            "std::fs::remove_file(",
+            "std::fs::remove_dir_all(",
+            "custody_writer::",
+            "provider::",
+            ".publish_",
+            ".replace_",
+            "remove_argv",
+            "prune_argv",
+        ] {
+            assert!(
+                audited_sources
+                    .iter()
+                    .all(|source| !source.contains(forbidden_edge)),
+                "the re-proof path must not reach {forbidden_edge}"
+            );
+        }
+        assert!(
+            audited_sources
+                .iter()
+                .all(|source| !source.contains("std::process::Command")),
+            "the re-proof code must not originate a process spawn; any reachable spawn belongs to the caller-supplied probe"
+        );
+        drop(proof);
         remove_root(&root);
     }
 }

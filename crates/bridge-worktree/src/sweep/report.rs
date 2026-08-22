@@ -166,6 +166,7 @@ pub struct ExactAbsenceSweepEntryV1 {
     record_path: String,
     enumerated_name: OsString,
     assessment: ExactAbsenceRecordAssessmentV1,
+    custody_record_bytes: Option<Vec<u8>>,
 }
 
 impl ExactAbsenceSweepEntryV1 {
@@ -173,11 +174,13 @@ impl ExactAbsenceSweepEntryV1 {
         record_path: String,
         enumerated_name: OsString,
         assessment: ExactAbsenceRecordAssessmentV1,
+        custody_record_bytes: Option<Vec<u8>>,
     ) -> Self {
         Self {
             record_path,
             enumerated_name,
             assessment,
+            custody_record_bytes,
         }
     }
 
@@ -435,7 +438,7 @@ mod tests {
     }
 
     fn entry(name: &str, assessment: Record) -> ExactAbsenceSweepEntryV1 {
-        ExactAbsenceSweepEntryV1::new(name.into(), name.into(), assessment)
+        ExactAbsenceSweepEntryV1::new(name.into(), name.into(), assessment, None)
     }
 
     fn assert_snapshot(state: State, reason: Option<Reason>) {
