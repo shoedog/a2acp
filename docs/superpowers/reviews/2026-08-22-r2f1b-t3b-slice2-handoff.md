@@ -4,8 +4,9 @@
 
 - Base: `c65c8eca`.
 - Changed files: `crates/bridge-worktree/src/settle.rs`, `crates/bridge-worktree/src/sweep.rs`, `crates/bridge-worktree/src/sweep/checked_scan.rs`, `crates/bridge-worktree/src/sweep/report.rs`, this handoff, and the frozen mutation control.
+- This repair changes `crates/bridge-worktree/src/settle.rs` and this handoff only; the frozen mutation control is carried unchanged.
 - `Cargo.lock` and every manifest are untouched.
-- Post-format, this slice adds 697 nonblank physical Rust lines against the 770-line cap.
+- Post-format, this slice adds 711 nonblank physical Rust lines against the 770-line cap.
 - No full verification result is claimed here. The local focused build could not resolve the workspace's uncached registry packages, so the required gates remain operator-owned.
 
 ## Re-prove boundary
@@ -18,7 +19,11 @@
 
 The colocated tests cover a stale report with a recreated target, a decodable replacement record, root-level unavailable current scan evidence, row-level claim-authority unavailability, non-authoritative scans, legacy entries, wrong state/bare claim population, proof-held lock ownership, and a bounded no-effect audit.
 
-The added production route may acquire the existing refusing locks, pin/reopen directories, make descriptor-relative regular-file reads, canonically decode, run the existing scan/projection seam, allocate, and trace. The audit freezes the reproof seam and each transitive projection/assessment/checked-scan helper against rename, unlink, publication, transition, settlement effect, provider removal, prune, Host Git construction, or process spawn.
+The added production route may acquire the existing refusing locks, pin/reopen directories, make descriptor-relative regular-file reads, canonically decode, run the existing scan/projection seam, allocate, and trace. The audit freezes the reproof seam and each transitive projection/assessment/checked-scan helper against rename, unlink, publication, transition, settlement effect, provider removal, and prune. The added code originates no process spawn; `settle.rs` outside tests takes a caller-supplied `&dyn ExactAbsenceProbeV1` and constructs no implementation, so any reachable spawn can arrive only through that supplied probe. Effect-freedom is conditional on that probe, and this slice adds no production caller.
+
+## Carried to slice 5
+
+When `sweep_orphans` is wired to drive settlement, its caller must supply a read-only probe. Wiring a spawning probe into a settlement path is a slice-5 blocker; this slice adds no caller.
 
 ## Frozen single-mutation control
 
@@ -26,7 +31,7 @@ The added production route may acquire the existing refusing locks, pin/reopen d
 - SHA-256: `2fcc242ca810f5a5ba43965abd81720c1a19e6384219a2455ab33dbdc702be5b`.
 - Logical mutation: remove the comparison that binds the fresh scan entry to the report entry's retained canonical bytes.
 - Sole expected reddening test: `settle::tests::a_record_replaced_between_report_and_window_refuses`.
-- The control applies cleanly to this candidate. Its red run is reserved for the operator command in the task brief.
+- The control is carried unchanged: the repair alters none of its dependent lines, it still applies cleanly, and its red run is reserved for the operator command in the task brief.
 
 - [ ] `cargo fmt --all -- --check` — **PENDING OPERATOR**
 - [ ] `CARGO_INCREMENTAL=0 cargo clippy --workspace --all-targets --locked -- -D warnings` — **PENDING OPERATOR**

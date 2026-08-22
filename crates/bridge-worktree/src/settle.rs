@@ -775,6 +775,7 @@ mod tests {
         assert!(matches!(refusal, SettlementProofRefusalV1::CannotProve(_)));
         remove_root(&root);
     }
+    /// Discriminates a non-authoritative report from reaching a later settlement mutation.
     #[test]
     fn a_non_authoritative_scan_refuses() {
         let root = root("non-authoritative");
@@ -894,9 +895,9 @@ mod tests {
         remove_root(&root);
     }
 
-    /// Discriminates a later proof path gaining a mutation or process edge while still returning a
-    /// capability. Only locks, pinned reads, canonical decoding, scanning, allocation, and tracing
-    /// are permitted before a later slice owns settlement effects.
+    /// Discriminates a later proof path gaining a mutation edge while still returning a capability.
+    /// Effect-freedom is conditional on the caller-supplied `ExactAbsenceProbeV1`; this slice has no
+    /// production caller, and any reachable spawn can arrive only through that supplied probe.
     #[test]
     fn the_reproof_mints_no_effect() {
         let root = root("reproof-effect-audit");
@@ -923,13 +924,20 @@ mod tests {
             .unwrap()
             .0;
         fn source_slice<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
-            source
+            let after_start = source
                 .split_once(start)
-                .unwrap()
+                .unwrap_or_else(|| panic!("source slice is missing start anchor: {start}"));
+            after_start
                 .1
                 .split_once(end)
-                .unwrap()
+                .unwrap_or_else(|| panic!("source slice is missing end anchor: {end}"))
                 .0
+        }
+        fn source_tail<'a>(source: &'a str, start: &str) -> &'a str {
+            source
+                .split_once(start)
+                .unwrap_or_else(|| panic!("source slice is missing start anchor: {start}"))
+                .1
         }
         let complete_sweep_source = include_str!("sweep.rs");
         let checked_scan_source = include_str!("sweep/checked_scan.rs")
@@ -964,18 +972,18 @@ mod tests {
                 "fn decide_unused_candidate_evidence",
                 "#[must_use]",
             ),
-            source_slice(
-                checked_scan_source,
-                "fn scan_checked_rows_with_source",
-                "#[cfg(test)]",
-            ),
+            source_tail(checked_scan_source, "fn scan_checked_rows_with_source"),
         ];
+        assert!(
+            settlement_source.contains("probe: &dyn ExactAbsenceProbeV1")
+                && !settlement_source.contains("impl ExactAbsenceProbeV1 for")
+                && !settlement_source.contains("HostGitWorktree"),
+            "settle.rs must not construct an ExactAbsenceProbeV1 implementation; the probe is caller-supplied"
+        );
         for forbidden_edge in [
             "std::fs::rename(",
             "std::fs::remove_file(",
             "std::fs::remove_dir_all(",
-            "std::process::Command",
-            "HostGitWorktree",
             "custody_writer::",
             "provider::",
             ".publish_",
@@ -990,6 +998,12 @@ mod tests {
                 "the re-proof path must not reach {forbidden_edge}"
             );
         }
+        assert!(
+            audited_sources
+                .iter()
+                .all(|source| !source.contains("std::process::Command")),
+            "the re-proof code must not originate a process spawn; any reachable spawn belongs to the caller-supplied probe"
+        );
         drop(proof);
         remove_root(&root);
     }
