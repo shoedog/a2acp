@@ -12,7 +12,7 @@
 
 **(b) Custody exposure** — `[MEASURED]` `git status --porcelain` = 0 files; `git log origin/<branch>..HEAD` = 0 unpushed. Everything authored this session is pushed. The **only** single-copy artifact is the in-flight container's work product, which lives inside the quarantine clone and is not yet a commit — see (c). — **RESOLVED for committed work; the in-flight product is covered by (c)**
 
-**(c) In flight / irreversible** — `[MEASURED]` Slice 1's run COMPLETED and then **wedged post-completion** (0.0% CPU, log frozen 9.4h); operator killed it. Work product secured out of the clone as `refs/t3b/slice1-candidate` = `1efb3154`. PR #72 open, awaiting CI. — **RESOLVED (run terminated, product secured, PR open, 2026-08-22)**
+**(c) In flight / irreversible** — `[MEASURED]` Slices 1 and 2 are merged (`c65c8eca`, `bae894e3`). **T3b slice 3 `implement` is RUNNING**; log `<SCRATCH>/t3b3-implement.log`. Effect-free by design at the primitive level, and it adds no custody-layer caller. If it dies, fetch the candidate out of its clone before anything else. — **OPEN until the run terminates**
 
 **(d) Authorization granted but not exercised** — the owner's standing instruction for this turn, verbatim: **"merge slice 1 when green then dispatch slice 2"**. A successor may merge slice 1 on a green gate + green CI **without re-asking**, and may then dispatch slice 2. Slice 2 must be **authored first** (§4 #2) — the authorization covers dispatching it, not skipping its spec.
 
@@ -70,9 +70,11 @@
 
 | # | Work | State | Exact next action | Blocked by | Identifiers |
 |---:|---|---|---|---|---|
-| 1 | T3b slice 1 merge | next | Merge **PR #72** on CI green (owner-authorized), then update this file | CI | `1efb3154` + `71c7a3cf`; 415/790 lines |
-| 2 | **Author T3b slice 2 spec** | pending | Read slice 1's merged head for `SettlementWindowV1`'s real accessors, refusal type, and the guard shape it hands out; then write the spec. Do **not** pre-write it — it binds to an API that does not exist yet. | slice 1 merge | cap 770, projection 520 |
-| 3 | T3b slice 3 (descriptor-safe marker retirement) | pending | Author after slice 2. **No code dependency on slices 1–2 — may run in parallel** if throughput matters. | — | cap 740 |
+| 1 | T3b slice 1 | **done** | Merged `c65c8eca` (PR #72) | — | 415/790 lines |
+| 1b | T3b slice 2 | **done** | Merged `bae894e3` (PR #73), after a 1-round repair | — | 711/770 lines; 347 passed |
+| 1c | T3b slice 3 | **in flight** | Gate → evidence → PR → merge | run terminating | base `bae894e3`; cap 740, projection 500 |
+| 2 | T3b slice 4 (candidate settlement — **destructive**) | pending | Author against slices 1–3 merged. First slice that renames/unlinks for real. | slice 3 | cap 790 |
+| 3 | T3b slice 5 (boot wiring, legacy markers, readiness) | pending | **Binding obligation carried from slice 2:** the settlement caller MUST supply a read-only probe; wiring a spawning probe is a slice-5 blocker. Readiness flip is its own commit. | slice 4 | cap 790 |
 | 4 | T3b slice 4 (candidate settlement — **destructive**) | pending | Author after slice 3. First slice that renames/unlinks. | slices 1–3 | cap 790 |
 | 5 | T3b slice 5 (boot wiring, legacy markers, readiness flip) | pending | Readiness flip is its **own commit** with its own frozen control. | slice 4 | cap 790; flips `EXACT_ABSENCE_POLICY_READY_V1` |
 | 6 | Refresh roadmap T3a ledger (rows in §3) | pending | Edit `docs/reliability-execution-roadmap.md:1247` header + flake row | — | — |
@@ -100,6 +102,9 @@
 - **Run host gates from under `/Users/wesleyjinks/code`.** The 23 `r3d0_*` tests hard-fail in 0.03s from a scratchpad checkout: "current checkout must be an existing directory under the owner-approved trusted cwd root". Not a regression — a location precondition.
 - **The implement loop AMENDS, so a spec must never ask the implementer to record its own final head sha inside the artifact.** It is rewritten by the next amend. This cost slice 1 two of its three review rounds. The binding goes in the operator's evidence commit.
 - **A wedged `implement` process can outlive its own completion.** Slice 1 finished and then sat at 0% CPU for 9.4h. Check the log tail for `loop:`/`review:` terminal lines before assuming it is still working; the work product is a commit in the clone and should be fetched out immediately.
+- **The source plan is not a verified anchor set.** Slice 3's authoring falsified three plan claims, one load-bearing: the plan says `is_custody_record_name` rejects the `.a2a-v2-rtc-` retirement residue, and an executed probe returns `true` — the reserved name is `prefix ++ target`, the target already ends in `.custody.v1.json`, so the prefix is absorbed into the stem. Verify every plan claim by execution before writing it into a spec.
+- **Do not write an unsatisfiable contract.** Slice 2 was rejected partly because its task required routing through machinery that takes a probe while banning process-spawn edges; the production probe shells out to `git rev-parse`. Two slices in a row lost a round to an operator-authored contradiction — when a lane keeps losing rounds to one class, suspect the contract.
+- **A CI waiter must guard against the pre-registration race.** `gh pr checks | grep -c pending` returns 0 before jobs register, so a naive until-loop exits instantly. Require a minimum completed-job count as well.
 - **Check free disk before dispatching.** The floor is 50 GiB; a retry was blocked at 39. `[MEASURED]` now 56 GiB after reaping 18.8 GiB of build targets. Dry-run inspect before reaping.
 
 ## 6. Identifiers
