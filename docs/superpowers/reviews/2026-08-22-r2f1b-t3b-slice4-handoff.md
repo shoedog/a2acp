@@ -3,9 +3,9 @@
 ## Scope
 
 - Base `origin/main`: `c343e563`.
-- Changed implementation/test files: `bin/a2a-bridge/src/compatibility_resolution.rs`, `bin/a2a-bridge/src/compatibility_schedule_state.rs`, `bin/a2a-bridge/src/storage_report.rs`, `crates/bridge-worktree/src/custody_writer.rs`, and `crates/bridge-worktree/src/settle.rs`.
+- Changed implementation/test files: `bin/a2a-bridge/src/compatibility_resolution.rs`, `bin/a2a-bridge/src/compatibility_schedule_state.rs`, `bin/a2a-bridge/src/storage_report.rs`, `crates/bridge-worktree/src/custody.rs`, `crates/bridge-worktree/src/custody_writer.rs`, and `crates/bridge-worktree/src/settle.rs`.
 - Review artifacts: this handoff and `2026-08-22-r2f1b-t3b-slice4-mutation-control.patch`.
-- Rust added-line count: 747 nonblank lines, below the 790-line cap.
+- Rust added-line count: 753 nonblank lines, below the 790-line cap (measured with added nonblank lines in the cumulative diff against `c343e563`).
 - Cargo manifests and `Cargo.lock` are unchanged.
 
 ## Settlement boundary
@@ -14,9 +14,16 @@
 
 The durable marker is retired only with `retire_captured_regular_child_v2` after its descriptor-bound content snapshot. A post-transition interruption leaves an operator-visible `stranded-unused-settled` record; a captured retirement marker is separately reported by storage as `R2f1b retired custody marker residue (captured; recovery-owned)`. The new terminal state has no outgoing transition and no source field or claim.
 
-Driving integration remains intentionally deferred: a later sweep/backend slice must invoke this capability; this slice supplies the proof-bound production boundary only.
+The test-only post-transition interruption is thread-local: its arm and settlement run on the arming test's own thread, so a parallel test can neither consume its interruption nor trigger its already-armed assertion.
+
+Driving integration remains intentionally deferred to slice 5, the owner of making `sweep_orphans` drive settlement (including `sweep_orphans_async` and the five call sites). This slice supplies the proof-bound production boundary only; it does not wire a boot caller or `sweep_orphans`.
 
 The verification companion gives the descriptor-stress archive fixture 120 seconds of scheduling headroom and releases its real test descriptor before injecting an unlock-report failure, preventing unrelated parallel test scheduling or an expected panic from producing a false tree-drift or retained-lock failure.
+
+## Out-of-scope changes
+
+- `bin/a2a-bridge/src/compatibility_schedule_state.rs`: the `#[cfg(test)]` release-failure injector now releases the real descriptor before reporting its synthetic failure, so its expected debug panic cannot retain a process-local lock. The arm and synthetic report are both test-only.
+- `bin/a2a-bridge/src/compatibility_resolution.rs`: the `#[cfg(unix)] #[test]` wide archive stress fixture uses a 120-second local deadline so concurrent CPU-bound suite work does not exhaust fixture scheduling headroom. The changed deadline is local to that test fixture.
 
 ## Bounded-effect audit
 
@@ -36,6 +43,7 @@ Focused validation passed:
 
 - Control: `docs/superpowers/reviews/2026-08-22-r2f1b-t3b-slice4-mutation-control.patch`
 - SHA-256: `cb7667c947558e2d6fb041c565a9aa419ac0be8392db107e0e3226d817aeac3f`
+- The repair does not change a line the control depends on; the control is carried unchanged.
 - Logical mutation: pass a wrong child name to the descriptor-safe marker-retirement primitive.
 - Applying the control produces the single expected red test: `settle::tests::unused_candidate_settles_only_after_exact_absence`; the control was then reversed and the clean focused suite passed.
 

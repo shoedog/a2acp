@@ -173,22 +173,27 @@ fn stranded_unused_settled(proof: &ProvenSettlementV1, detail: &str) -> UnusedSe
     UnusedSettlementOutcomeV1::StrandedUnusedSettled(detail.to_string())
 }
 
+// Test-only crash injection. Thread-local because the test's arm and settlement run on the
+// arming test's own thread, so parallel tests cannot consume each other's interruption.
 #[cfg(test)]
-static INTERRUPT_UNUSED_SETTLEMENT_AFTER_TRANSITION: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+thread_local! {
+    static INTERRUPT_UNUSED_SETTLEMENT_AFTER_TRANSITION: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
 
 #[cfg(test)]
 pub(crate) fn arm_unused_settlement_interruption_for_test() {
-    assert!(
-        !INTERRUPT_UNUSED_SETTLEMENT_AFTER_TRANSITION
-            .swap(true, std::sync::atomic::Ordering::SeqCst,),
-        "unused-settlement interruption is already armed"
-    );
+    INTERRUPT_UNUSED_SETTLEMENT_AFTER_TRANSITION.with(|cell| {
+        assert!(
+            !cell.replace(true),
+            "unused-settlement interruption is already armed"
+        );
+    });
 }
 
 #[cfg(test)]
 fn interrupt_unused_settlement_after_transition_for_test() -> bool {
-    INTERRUPT_UNUSED_SETTLEMENT_AFTER_TRANSITION.swap(false, std::sync::atomic::Ordering::SeqCst)
+    INTERRUPT_UNUSED_SETTLEMENT_AFTER_TRANSITION.with(|cell| cell.replace(false))
 }
 
 #[cfg(not(test))]
