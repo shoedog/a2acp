@@ -25,7 +25,7 @@ Read these before editing. Each was verified at `cafeae13`; if any is false, sto
 - `crates/bridge-worktree/src/backend.rs:1463-1512` — `CheckoutRemovalWindowV1`, the existing refusing-window precedent, including the ruling that the root-existence check must precede the cell attempt because entering a cell `create_dir_all`s the lock directory.
 - `crates/bridge-worktree/src/custody_writer.rs:472-532` — `WorktreeCustodianV1`, its **blocking** entry, and the drop-order comment at `:478-483`: fields are declared in acquisition order so Rust's declaration-order drop releases in reverse.
 - `crates/bridge-worktree/src/custody.rs:822-850` — `read_custody_record_in(&PinnedDirectoryV1, &OsStr)`, which already enforces regular-file-only, `nlink != 1 → MultiLink`, the byte bound, and canonical decode. **Reuse it; write no new read logic.**
-- `crates/bridge-worktree/src/custody.rs:41` `CUSTODY_RECORD_SUFFIX`, `:688` `custody_record_path`, `:694` `is_custody_record_name`, `:804` `CustodyReadRefusalV1`.
+- `crates/bridge-worktree/src/custody.rs` — the symbols `CUSTODY_RECORD_SUFFIX`, `custody_record_path`, `is_custody_record_name`, and `CustodyReadRefusalV1`. Locate them by name; line numbers drift as prior slices land.
 - `crates/bridge-core/src/fs_custody.rs:626` `PinnedDirectoryV1::open`, `:648` `identity()`, `:2801` `pinned_root_unchanged`.
 - `crates/bridge-worktree/src/custody_lock.rs:378-435` — the in-process contention test pattern (`std::thread` + `mpsc` + a `waited` flag). `flock` is per open file description, so two acquisitions in one process **do** contend; you do not need a second process.
 
@@ -133,7 +133,9 @@ The base control is `bridge-worktree` **331 passed** at `cafeae13`. The operator
 - [ ] Record reading goes through `custody::read_custody_record_in`; no new read, bound, link-count or decode logic is introduced.
 - [ ] Every `open` failure path returns a typed `SettlementWindowRefusalV1`; none returns a value that could be read as authority.
 - [ ] `custody_lock.rs`'s "Who takes what" module documentation names the settlement window as a third acquirer class. No code in that file changes.
-- [ ] These six tests exist, named as given or with unambiguously equivalent names:
+- [ ] Add these six tests, named as given or with unambiguously equivalent names. Each is a
+      requirement of this slice, not a claim about the base — `settle.rs` does not exist at
+      `cafeae13`, so none of them is present before your change:
   - [ ] `the_window_refuses_a_held_publication_cell`
   - [ ] `the_window_refuses_a_held_custody_cell`
   - [ ] `a_transition_writer_waits_for_an_open_settlement_window` — the second contention order: the window holds; a blocking writer must **wait**, proven by an `on_contended` flag and a not-yet-finished thread, then complete after the window drops
