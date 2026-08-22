@@ -24,7 +24,7 @@
 use bridge_core::execution_policy::{
     PolicyNodeRefV1, Sha256HexV1, WorktreeCustodyIdV1, WorktreeObjectIdentityV1,
 };
-use bridge_core::fs_custody::PinnedDirectoryV1;
+use bridge_core::fs_custody::{ChildNameV2, PinnedDirectoryV1, ReservedNameNamespaceV2};
 use bridge_core::ids::{AttemptId, AttemptIdentity, ExecutionId};
 use serde::{Deserialize, Serialize};
 use std::ffi::OsStr;
@@ -695,7 +695,19 @@ pub fn is_custody_record_name(path: &str) -> bool {
     let Some(stem) = path.strip_suffix(CUSTODY_RECORD_SUFFIX) else {
         return false;
     };
-    !stem.is_empty() && !stem.ends_with('/')
+    // Scanner input is a directory-entry string; dots have no traversal semantics here.
+    let name = stem
+        .rsplit('/')
+        .next()
+        .expect("a string has a final segment");
+    !stem.is_empty()
+        && !stem.ends_with('/')
+        && !matches!(
+            ChildNameV2::from_bytes(name.as_encoded_bytes()),
+            Ok(name)
+                if ChildNameV2::parse_reserved(ReservedNameNamespaceV2::RetirementCapture, &name)
+                    .is_ok()
+        )
 }
 
 /// What a caller about to delete a checkout learns by asking whether a V3 custody record exists
@@ -2011,6 +2023,26 @@ mod tests {
         assert_eq!(CUSTODY_RECORD_SUFFIX, ".custody.v1.json");
         assert!(!path.ends_with(".meta.json"));
         assert!(is_custody_record_name(&path));
+        let target = ChildNameV2::from_bytes(b"ownr-run7-abc.custody.v1.json").unwrap();
+        let residue =
+            ChildNameV2::reserved(ReservedNameNamespaceV2::RetirementCapture, &target).unwrap();
+        assert!(
+            !is_custody_record_name(&format!("/root/{}", residue.as_os_str().to_string_lossy())),
+            "a retirement residue must never be read as a custody record"
+        );
+        let staging = ChildNameV2::reserved(ReservedNameNamespaceV2::Staging, &target).unwrap();
+        assert!(
+            is_custody_record_name(&format!("/root/{}", staging.as_os_str().to_string_lossy())),
+            "only retirement residue is excluded from custody record classification"
+        );
+        assert!(
+            is_custody_record_name("/root/.custody.v1.json"),
+            "a dot stem is a custody record name, not path traversal"
+        );
+        assert!(
+            is_custody_record_name("/root/..custody.v1.json"),
+            "a dot-dot stem is a custody record name, not path traversal"
+        );
         assert!(!is_custody_record_name("/root/ownr-run7-abc.meta.json"));
         assert!(!is_custody_record_name("/root/custody.v1.json"));
     }
