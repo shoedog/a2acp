@@ -71,9 +71,9 @@
 //! call 3 = the terminal replace (`LiveProtected` / `PreservationUnknown`).
 
 use crate::custody::{
-    custody_record_path, read_custody_record_in, transition_is_legal, ClaimPresenceV1,
-    CustodyReadRefusalV1, IdentityCompletenessV1, PreservationReasonV1, PreservedWorktreeClaimV1,
-    RecoveryLocatorV1, WorktreeCustodyRecordV1, WorktreeCustodyStateKindV1, WorktreeCustodyStateV1,
+    read_custody_record_in, transition_is_legal, ClaimPresenceV1, CustodyReadRefusalV1,
+    IdentityCompletenessV1, PreservationReasonV1, PreservedWorktreeClaimV1, RecoveryLocatorV1,
+    WorktreeCustodyRecordV1, WorktreeCustodyStateKindV1, WorktreeCustodyStateV1,
     CUSTODY_RECORD_SUFFIX, WORKTREE_CUSTODY_RECORD_SCHEMA_V1,
 };
 use crate::custody_lock::{
@@ -1539,7 +1539,7 @@ fn const_format_staging_marker() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::custody::{read_custody_record_in, WorktreeCustodyStateKindV1};
+    use crate::custody::{custody_record_path, read_custody_record_in, WorktreeCustodyStateKindV1};
     use bridge_core::execution_policy::{
         FrozenWorktreeCustodyPlanV1, PolicyNodeRefV1, Sha256HexV1,
     };

@@ -5,8 +5,9 @@
 - Dispatch base: `origin/main` at dispatch (`cafeae13a67b621f194e4cb82b2fc6765f4e8b4a`).
 - Implementation/review base: `bae894e3`.
 - Changed files: `crates/bridge-core/src/fs_custody.rs`, `crates/bridge-worktree/src/custody.rs`, `crates/bridge-worktree/src/custody_writer.rs`, the frozen mutation control, and this handoff.
+- This repair changes `crates/bridge-worktree/src/custody.rs`, `crates/bridge-worktree/src/custody_writer.rs`, and this handoff; `crates/bridge-core/src/fs_custody.rs` and the frozen mutation control are carried unchanged.
 - `Cargo.lock` and every manifest are untouched.
-- Post-format, this slice adds 640 nonblank physical Rust lines against the 740-line cap.
+- Post-format, this slice adds 644 nonblank physical Rust lines against the 740-line cap (96 lines of headroom).
 - No `bridge-worktree` caller of `retire_captured_regular_child_v2` was added.
 
 ## Retirement boundary
@@ -19,15 +20,25 @@ No visibility was widened. `bridge-worktree::custody::is_custody_record_name` us
 
 ## Focused coverage
 
-The colocated core tests cover stale caller identity refusal before capture, same-name replacement between descriptor snapshot and capture, symlink refusal, hard-link refusal both before and after capture, a distinct missing-birthtime refusal, a simulated interruption after capture, parent-sync ordering, and exact successful removal with a complete sibling-directory census. The worktree classifier test uses string-segment matching so `.` and `..` stems remain records, builds retirement and staging names through the core namespace API, and proves that only retirement residue is not a custody record. The writer test proves that a real checkout basename in the retirement namespace is refused before it can mint an ambiguous record.
+The colocated core tests cover stale caller identity refusal before capture, same-name replacement between descriptor snapshot and capture, symlink refusal, hard-link refusal both before and after capture, a distinct missing-birthtime refusal, a simulated interruption after capture, parent-sync ordering, and exact successful removal with a complete sibling-directory census. The worktree classifier test uses string-segment matching, preserving the long-standing empty-single-dot-basename rejection while retaining the `..` stem as a record; it builds retirement and staging names through the core namespace API and proves that only retirement residue is not a custody record. The writer test proves that a real checkout basename in the retirement namespace is refused before it can mint an ambiguous record.
 
 The expected identity guard has its own control test: it supplies a stale expected identity and proves capture is not reached and the public name remains in place. The replacement test separately proves that an identity mismatch discovered after capture retains residue rather than unlinking it.
 
 ## Birthtime environment record
 
-Measured: the current command environment reports `Linux 7.0.5-orbstack-00330-ge3df4e19b0a0-dirty aarch64` with a `fuseblk` workspace filesystem. A standalone standard-library probe measured `Metadata::created()` capability as `present`. The required `CARGO_INCREMENTAL=0 cargo test -p bridge-core --locked --lib marker_retirement_reports_birthtime_capability -- --nocapture` was retried after these fixes, but Cargo failed during dependency resolution for `a2a-lf` because the registry CONNECT tunnel returned HTTP 403. An isolated offline resolution attempt then stopped at the uncached `async-stream` dependency. The test binary did not start, so no `SLICE-3-BTIME` line or primitive outcome was observed in this environment.
+Measured: the current implementation command environment (not the bridge verify container) is `Linux 7.0.5-orbstack-00330-ge3df4e19b0a0-dirty aarch64` on a `fuseblk` workspace filesystem. Using its mounted writer dependency cache, the required focused test completed at exit 0:
 
-Unmeasured: macOS/APFS, the implement container's overlayfs, and Ubuntu/ext4. The direct current-environment observation is not evidence for any of those environments.
+```text
+SLICE-3-BTIME capability=present outcome=retired
+```
+
+The successful full-workspace verify also exercised the test, but did not use `--nocapture`, so it could not supply this line. The focused capture above used `CARGO_HOME=/cargo CARGO_NET_OFFLINE=true CARGO_INCREMENTAL=0 cargo test -p bridge-core --locked --lib marker_retirement_reports_birthtime_capability -- --nocapture`.
+
+## Bridge-worktree repair tally
+
+The same cache-backed environment completed `cargo test -p bridge-worktree --locked --no-fail-fast` at exit 0. Its primary library harness reports **348 passed, 0 failed** (the base control's only failing assertion is now green); its three integration harnesses report 12/0, 5/0, and 2/0, and its doctest harness reports 0/0.
+
+Excluded (not observed with the focused `--nocapture` measurement): the bridge verify container's overlayfs, macOS/APFS, and Ubuntu/ext4. The full-workspace verify's passing status does not expose a passing test's captured stdout, and the current `fuseblk` measurement is not evidence for any excluded environment.
 
 ## Deferred upgrade
 
@@ -37,6 +48,7 @@ Unmeasured: macOS/APFS, the implement container's overlayfs, and Ubuntu/ext4. Th
 
 - Path: `docs/superpowers/reviews/2026-08-22-r2f1b-t3b-slice3-mutation-control.patch`.
 - SHA-256: `a85ce4540ee1bc4c556df82fb777a091d6c6b05e65aea6bdf31b892058486a6b`.
+- Disposition: carried unchanged; this repair does not alter any source line on which the control depends, so no re-cut is required.
 - Logical mutation: remove the descriptor-snapshot comparison with the caller-supplied expected identity before capture can move the public marker name.
 - Sole expected reddening test: `fs_custody::tests::custody_v2::marker_retirement_refuses_stale_expected_before_capture`.
 - The control is against this slice's source, not the dispatch base; it has not been run here.

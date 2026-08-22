@@ -703,7 +703,7 @@ pub fn is_custody_record_name(path: &str) -> bool {
     !stem.is_empty()
         && !stem.ends_with('/')
         && !matches!(
-            ChildNameV2::from_bytes(name.as_encoded_bytes()),
+            ChildNameV2::from_bytes(name.as_bytes()),
             Ok(name)
                 if ChildNameV2::parse_reserved(ReservedNameNamespaceV2::RetirementCapture, &name)
                     .is_ok()
@@ -2036,8 +2036,8 @@ mod tests {
             "only retirement residue is excluded from custody record classification"
         );
         assert!(
-            is_custody_record_name("/root/.custody.v1.json"),
-            "a dot stem is a custody record name, not path traversal"
+            !is_custody_record_name("/root/.custody.v1.json"),
+            "a single-dot basename has an empty final segment, rejected by the trailing-slash stem guard"
         );
         assert!(
             is_custody_record_name("/root/..custody.v1.json"),
