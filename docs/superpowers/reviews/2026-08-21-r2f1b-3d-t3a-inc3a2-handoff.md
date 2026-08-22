@@ -29,9 +29,53 @@ CARGO_INCREMENTAL=0 cargo test -p bridge-worktree --locked inc3a_control_ -- --n
 
 ## Operator gates
 
-- [ ] `cargo fmt --all -- --check` — **PENDING OPERATOR**
-- [ ] `CARGO_INCREMENTAL=0 cargo clippy --workspace --all-targets --locked -- -D warnings` — **PENDING OPERATOR**
-- [ ] `CARGO_INCREMENTAL=0 cargo test --workspace --locked --no-fail-fast` — **PENDING OPERATOR**
-- [ ] `CARGO_INCREMENTAL=0 cargo test -p bridge-worktree --locked --no-fail-fast` — **PENDING OPERATOR**
-- [ ] `cargo run -p a2a-bridge -- validate --repo-hygiene` at the implementation point — **PENDING OPERATOR**
-- [ ] `cargo run -p a2a-bridge -- validate --repo-hygiene` at the handoff point — **PENDING OPERATOR**
+- [x] `cargo fmt --all -- --check` — **exit 0**
+- [x] `CARGO_INCREMENTAL=0 cargo clippy --workspace --all-targets --locked -- -D warnings` — **exit 0**
+- [x] `CARGO_INCREMENTAL=0 cargo test --workspace --locked --no-fail-fast` — **exit 0**
+- [x] `CARGO_INCREMENTAL=0 cargo test -p bridge-worktree --locked --no-fail-fast` — **exit 0**
+- [x] `cargo run -p a2a-bridge -- validate --repo-hygiene` at the implementation point — **exit 0**
+- [x] `cargo run -p a2a-bridge -- validate --repo-hygiene` at the handoff point — **exit 0**
+
+
+---
+
+## Operator evidence — filled 2026-08-21
+
+**Implementation commit:** `01ef7a91` · **Base:** `b73e0a5a`
+
+All gates green: fmt 0; clippy `--workspace --all-targets --locked -D warnings` 0 with
+zero warnings; full workspace suite 0 with zero failures; `bridge-worktree`
+**323 passed** against the base control's 320 — +3, zero failures either side; hygiene 0.
+
+**Counted 353 nonblank added Rust lines against a 380 cap**, measured independently
+per file.
+
+### The frozen control is behavioural red, verified independently
+
+Recorded SHA-256 `c5c235432c4e79ac00dbbe898e76d28ad9ed73208e9c2329b76ebb24fe40b01c`
+recomputed from the patch: identical. Applied to a detached worktree at the untouched
+base `b73e0a5a` and run:
+
+```
+test sweep::tests::inc3a_control_persisted_authority_failure_is_typed ... FAILED
+test result: FAILED. 0 passed; 1 failed
+```
+
+**Zero compile errors** — the test compiles and runs, then fails its assertion that a
+persisted authority failure is typed `CannotConstructSubject(ClaimAuthorityUnavailable(..))`.
+That is genuine behavioural red, which is the correct evidence for this half; 3A-1's
+port was behaviour-preserving and correctly had none.
+
+*Operator note:* the first control run used the filter `inc3a2_control_` and matched
+nothing — 321 filtered out, exit 0. That result was **inadmissible**, not a pass: the
+prefix is `inc3a_control_`. Re-run with the correct filter, as recorded above.
+
+### Limits
+
+- Attests the tree at `01ef7a91` only.
+- `EXACT_ABSENCE_POLICY_READY_V1` remains `false`; readiness is still the sole
+  remaining production gate.
+- Two non-blocking SMELLs were raised and neither has a demonstrated incorrect output:
+  one dead branch, one cosmetic error-string collapse. Carried, not repaired.
+- 3B still owns the retained root identity, Host Git brackets, the sixteen-row degraded
+  matrix, and persisted-record integration evidence.
