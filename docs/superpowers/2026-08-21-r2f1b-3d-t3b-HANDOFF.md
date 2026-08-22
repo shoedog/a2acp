@@ -12,7 +12,7 @@
 
 **(b) Custody exposure** — `[MEASURED]` `git status --porcelain` = 0 files; `git log origin/<branch>..HEAD` = 0 unpushed. Everything authored this session is pushed. The **only** single-copy artifact is the in-flight container's work product, which lives inside the quarantine clone and is not yet a commit — see (c). — **RESOLVED for committed work; the in-flight product is covered by (c)**
 
-**(c) In flight / irreversible** — `[MEASURED]` T3b slice 1 `implement` is RUNNING, 14m20s elapsed at last probe, in its agent-edit phase (log shows `lsp warm-deps: ok`, no `verify:`/`review:` lines yet). Nothing irreversible: slice 1 is **effect-free by design** and the pipeline writes only inside its quarantine clone until the host commit. Prior slices in this lane ran 40–90 minutes. If it dies, the work product may be recoverable from the clone — see §5. — **OPEN until the run terminates**
+**(c) In flight / irreversible** — `[MEASURED]` Slice 1's run COMPLETED and then **wedged post-completion** (0.0% CPU, log frozen 9.4h); operator killed it. Work product secured out of the clone as `refs/t3b/slice1-candidate` = `1efb3154`. PR #72 open, awaiting CI. — **RESOLVED (run terminated, product secured, PR open, 2026-08-22)**
 
 **(d) Authorization granted but not exercised** — the owner's standing instruction for this turn, verbatim: **"merge slice 1 when green then dispatch slice 2"**. A successor may merge slice 1 on a green gate + green CI **without re-asking**, and may then dispatch slice 2. Slice 2 must be **authored first** (§4 #2) — the authorization covers dispatching it, not skipping its spec.
 
@@ -48,7 +48,13 @@
 | T3a 3B (retain and bracket custody-root identity) | done | `[MEASURED]` PR #71 `cafeae13`, merged. **T3a is COMPLETE.** |
 | T3b plan (Opus + sol, two-author) | done | `[MEASURED]` `docs/superpowers/plans/2026-08-22-t3b-plan-OPUS.md`, `-SOL.md` |
 | T3b slice 1 spec | done | `[MEASURED]` `docs/superpowers/plans/2026-08-22-t3b-slice1-task.md`, committed `6e54817b` |
-| **T3b slice 1 implement** | **in flight** | `[MEASURED]` running 14m20s; log `<SCRATCH>/t3b1-implement.log`; clone `/Users/wesleyjinks/code/.a2a-implement/impl-92607-lz719c13` |
+| **T3b slice 1 implement** | done (REJECT at bound, adjudicated) | `[MEASURED]` candidate `1efb3154`; evidence commit `71c7a3cf`; **PR #72**. 3 rounds: R1 build-broken → R3 one docs-provenance defect. |
+| T3b slice 1 operator gates | done | `[MEASURED]` all 5 exit 0 at `1efb3154` from a trusted cwd root; workspace 0 FAILED/91 binaries; `bridge-worktree` 338 passed |
+| T3b slice 1 base control | done | `[MEASURED]` `bridge-worktree` @ `cafeae13` = 331 passed, same host/command. Delta **+7** |
+| T3b slice 1 frozen control | done | `[MEASURED]` SHA-256 matches; applies to real head; reddens exactly `the_window_refuses_a_record_that_changed_between_its_two_reads` |
+| Round-3 BLOCKER (stale control sha) | done | `[MEASURED]` CONFIRMED unreachable; corrected in `71c7a3cf`. Root cause = spec, see §5 |
+| Round-3 MAJOR (dead check) | done | `[MEASURED]` **REFUTED** — deleting it reddens 1 test (337/1) |
+| Round-3 MAJOR (red bridge-api test) | done | `[MEASURED]` **REFUTED** — no dep edge, byte-identical `backend.rs`, `Elapsed` timeout, candidate green on container re-run |
 | T3b slice 2 (re-prove gate) | next | Spec **not written.** Rebinds to slice 1's merged head. |
 | T3b slices 3–5 | pending | Planned only; see `2026-08-22-t3b-plan-OPUS.md` §4 |
 
@@ -64,7 +70,7 @@
 
 | # | Work | State | Exact next action | Blocked by | Identifiers |
 |---:|---|---|---|---|---|
-| 1 | T3b slice 1 gate → evidence → PR → merge | next | §1 steps 2–6 | slice 1 run terminating | cap 790, projection 535, base `cafeae13` |
+| 1 | T3b slice 1 merge | next | Merge **PR #72** on CI green (owner-authorized), then update this file | CI | `1efb3154` + `71c7a3cf`; 415/790 lines |
 | 2 | **Author T3b slice 2 spec** | pending | Read slice 1's merged head for `SettlementWindowV1`'s real accessors, refusal type, and the guard shape it hands out; then write the spec. Do **not** pre-write it — it binds to an API that does not exist yet. | slice 1 merge | cap 770, projection 520 |
 | 3 | T3b slice 3 (descriptor-safe marker retirement) | pending | Author after slice 2. **No code dependency on slices 1–2 — may run in parallel** if throughput matters. | — | cap 740 |
 | 4 | T3b slice 4 (candidate settlement — **destructive**) | pending | Author after slice 3. First slice that renames/unlinks. | slices 1–3 | cap 790 |
@@ -90,6 +96,10 @@
 - **Never FF-forget the fold worktree.** Sol authored an A2 spec claiming inspection it could not have done because its worktree was 3 merges behind. FF the worktree before every authoring dispatch — this is now a standing pre-dispatch probe.
 - **Never assume three green environments means three environments were tested.** macOS/APFS and the container's overlayfs both passed a fixture only ubuntu/ext4 caught (inode reuse after unlink+recreate).
 - **Summing `test result:` lines over-counts** (nested filtered subprocess). Trust exit status + FAILED count.
+- **Never hand-roll the verify container.** Three probes in a row died of their own setup: mounting at `/src` made `r2b1_diagnostics` treat every `tests/*.rs` as production (it flags any path component literally named `src`); `rustdoc` never launched, giving exit 101 with zero test failures; and a shared `/cache` target dir served a cached test binary with `CARGO_MANIFEST_DIR` baked to the *previous* mount path. Reproduce verify by running the pipeline, or accept that ad-hoc runs need their own controls.
+- **Run host gates from under `/Users/wesleyjinks/code`.** The 23 `r3d0_*` tests hard-fail in 0.03s from a scratchpad checkout: "current checkout must be an existing directory under the owner-approved trusted cwd root". Not a regression — a location precondition.
+- **The implement loop AMENDS, so a spec must never ask the implementer to record its own final head sha inside the artifact.** It is rewritten by the next amend. This cost slice 1 two of its three review rounds. The binding goes in the operator's evidence commit.
+- **A wedged `implement` process can outlive its own completion.** Slice 1 finished and then sat at 0% CPU for 9.4h. Check the log tail for `loop:`/`review:` terminal lines before assuming it is still working; the work product is a commit in the clone and should be fetched out immediately.
 - **Check free disk before dispatching.** The floor is 50 GiB; a retry was blocked at 39. `[MEASURED]` now 56 GiB after reaping 18.8 GiB of build targets. Dry-run inspect before reaping.
 
 ## 6. Identifiers
