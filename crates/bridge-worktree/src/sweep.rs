@@ -346,23 +346,48 @@ pub enum UnusedCandidateDecisionV1 {
     Authorized,
     Refused,
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ExactAbsenceEvidenceV1 {
+    Authorized,
+    Refused,
+    CannotProve,
+}
+
+impl ExactAbsenceEvidenceV1 {
+    fn report_decision(self) -> UnusedCandidateDecisionV1 {
+        match self {
+            Self::Authorized => UnusedCandidateDecisionV1::Authorized,
+            Self::Refused | Self::CannotProve => UnusedCandidateDecisionV1::Refused,
+        }
+    }
+}
+
+fn decide_unused_candidate_evidence(
+    candidate: &ExactAbsenceCandidateV1,
+    recovery_owned: bool,
+    probe: &dyn ExactAbsenceProbeV1,
+) -> ExactAbsenceEvidenceV1 {
+    if recovery_owned {
+        return ExactAbsenceEvidenceV1::Refused;
+    }
+    match probe.observe_exact_absence(candidate) {
+        Ok(ExactAbsenceObservationV1::BothAbsent) => ExactAbsenceEvidenceV1::Authorized,
+        Ok(
+            ExactAbsenceObservationV1::TargetPresent
+            | ExactAbsenceObservationV1::RegisteredButAbsent,
+        ) => ExactAbsenceEvidenceV1::Refused,
+        Err(_) => ExactAbsenceEvidenceV1::CannotProve,
+    }
+}
+
 #[must_use]
 pub fn decide_unused_candidate(
     candidate: &ExactAbsenceCandidateV1,
     recovery_owned: bool,
     probe: &dyn ExactAbsenceProbeV1,
 ) -> UnusedCandidateDecisionV1 {
-    if recovery_owned {
-        return UnusedCandidateDecisionV1::Refused;
-    }
-    match probe.observe_exact_absence(candidate) {
-        Ok(ExactAbsenceObservationV1::BothAbsent) => UnusedCandidateDecisionV1::Authorized,
-        Ok(
-            ExactAbsenceObservationV1::TargetPresent
-            | ExactAbsenceObservationV1::RegisteredButAbsent,
-        )
-        | Err(_) => UnusedCandidateDecisionV1::Refused,
-    }
+    decide_unused_candidate_evidence(candidate, recovery_owned, probe).report_decision()
 }
 // Stays sync (not de-blocked like host_git.rs's run_git): this call runs inside
 // `WorktreeRunEndGuard::drop` (a `Drop` impl cannot await) and during the
@@ -524,6 +549,7 @@ where
 {
     project_action_scan_result(checked_scan::scan_compatibility_with_pin_opener(
         Path::new(root),
+        None,
         pin_opener,
     ))
 }
@@ -745,25 +771,41 @@ fn admit_custody_population(
     }
 }
 
+struct CustodyAssessmentProjectionV1 {
+    assessment: CustodyExactAbsenceAssessmentV1,
+    evidence: ExactAbsenceEvidenceV1,
+}
+
 fn assess_custody_record(
     canonical_root: &SessionCwd,
     enumerated_name: &OsStr,
     record: &WorktreeCustodyRecordV1,
     retained_root: &RetainedCustodyRootAuthorityV1,
     probe: &dyn ExactAbsenceProbeV1,
-) -> CustodyExactAbsenceAssessmentV1 {
+) -> CustodyAssessmentProjectionV1 {
     if let Err(refusal) = construction_guards(
         canonical_root,
         enumerated_name,
         &record.worktree.canonical_path,
     ) {
-        return CustodyExactAbsenceAssessmentV1::CannotConstructSubject(refusal);
+        return CustodyAssessmentProjectionV1 {
+            assessment: CustodyExactAbsenceAssessmentV1::CannotConstructSubject(refusal),
+            evidence: ExactAbsenceEvidenceV1::Refused,
+        };
     }
     if let Err(population) = admit_custody_population(&record.state, record.claim.is_some()) {
-        return CustodyExactAbsenceAssessmentV1::IneligiblePopulation(population);
+        return CustodyAssessmentProjectionV1 {
+            assessment: CustodyExactAbsenceAssessmentV1::IneligiblePopulation(population),
+            evidence: ExactAbsenceEvidenceV1::Refused,
+        };
     }
     let Some(claim) = record.claim.as_ref() else {
-        return CustodyExactAbsenceAssessmentV1::Assessed(UnusedCandidateDecisionV1::Refused);
+        return CustodyAssessmentProjectionV1 {
+            assessment: CustodyExactAbsenceAssessmentV1::Assessed(
+                UnusedCandidateDecisionV1::Refused,
+            ),
+            evidence: ExactAbsenceEvidenceV1::Refused,
+        };
     };
     match ExactAbsenceCandidateV1::from_claim(
         &claim.source,
@@ -773,17 +815,25 @@ fn assess_custody_record(
         retained_root,
         probe,
     ) {
-        Ok(candidate) => CustodyExactAbsenceAssessmentV1::Assessed(decide_unused_candidate(
-            &candidate, false, probe,
-        )),
-        Err(refusal) => CustodyExactAbsenceAssessmentV1::CannotConstructSubject(
-            CannotConstructSubjectV1::ClaimAuthorityUnavailable(refusal),
-        ),
+        Ok(candidate) => {
+            let evidence = decide_unused_candidate_evidence(&candidate, false, probe);
+            CustodyAssessmentProjectionV1 {
+                assessment: CustodyExactAbsenceAssessmentV1::Assessed(evidence.report_decision()),
+                evidence,
+            }
+        }
+        Err(refusal) => CustodyAssessmentProjectionV1 {
+            assessment: CustodyExactAbsenceAssessmentV1::CannotConstructSubject(
+                CannotConstructSubjectV1::ClaimAuthorityUnavailable(refusal),
+            ),
+            evidence: ExactAbsenceEvidenceV1::CannotProve,
+        },
     }
 }
 struct ExactScanProjectionRowV1 {
     checked: CheckedScanRowV1,
     assessment: ExactAbsenceRecordAssessmentV1,
+    evidence: ExactAbsenceEvidenceV1,
 }
 
 struct ExactScanCompleteV1 {
@@ -923,13 +973,95 @@ fn report_exact_scan_projection_row(row: ExactScanProjectionRowV1) -> ExactAbsen
     let ExactScanProjectionRowV1 {
         checked,
         assessment,
+        ..
     } = row;
-    let (record_path, enumerated_name, _) = checked.parts();
+    let (record_path, enumerated_name, scanned) = checked.parts();
+    let custody_record_bytes = match scanned {
+        ScannedWorktreeRecordV1::Custody(record) => record.encode_canonical().ok(),
+        ScannedWorktreeRecordV1::Legacy(_) | ScannedWorktreeRecordV1::UnreadableCustody(_) => None,
+    };
     ExactAbsenceSweepEntryV1::new(
         record_path.to_owned(),
         enumerated_name.to_os_string(),
         assessment,
+        custody_record_bytes,
     )
+}
+
+/// Re-run the report's exact scan and projection for one report-selected record.
+///
+/// The returned tri-state outcome is freshly observed evidence only. It is deliberately not a report and
+/// carries no settlement authority; `settle::reprove_under_window` keeps the held cells and
+/// decides whether this evidence can mint a proved capability.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ReprovedExactAbsenceOutcomeV1 {
+    Authorized,
+    Refused(&'static str),
+    CannotProve(&'static str),
+}
+
+pub(crate) fn reprove_exact_absence_entry(
+    root: &Path,
+    held_record: &WorktreeCustodyRecordV1,
+    report_entry: &ExactAbsenceSweepEntryV1,
+    probe: &dyn ExactAbsenceProbeV1,
+) -> ReprovedExactAbsenceOutcomeV1 {
+    let canonical_root = match canonicalize_lenient(&root.to_string_lossy()) {
+        Ok(canonical_root) => canonical_root,
+        Err(_) => return ReprovedExactAbsenceOutcomeV1::CannotProve("root cannot canonicalize"),
+    };
+    let outcome = project_exact_scan_result(
+        canonical_root.clone(),
+        checked_scan::scan_compatibility_with_pin_opener(
+            Path::new(canonical_root.as_str()),
+            Some(report_entry.enumerated_name()),
+            FilesystemCompatibilityPinOpenerV1,
+        ),
+        probe,
+    );
+    let ExactScanOutcomeV1::Complete(complete) = outcome else {
+        return ReprovedExactAbsenceOutcomeV1::CannotProve("root cannot enumerate");
+    };
+    if complete.iterator_error_count != 0
+        || classify_root_observations(complete.root_observations)
+            != CustodyRootObservationV1::Pinned
+    {
+        return ReprovedExactAbsenceOutcomeV1::CannotProve("root evidence is unavailable");
+    }
+    let Some(row) = complete.rows.into_iter().next() else {
+        return ReprovedExactAbsenceOutcomeV1::CannotProve(
+            "selected record was not observed in the fresh scan",
+        );
+    };
+    let evidence = row.evidence;
+    if evidence == ExactAbsenceEvidenceV1::CannotProve {
+        return ReprovedExactAbsenceOutcomeV1::CannotProve(
+            "fresh subject authority or exact-absence observation is unavailable",
+        );
+    }
+    let refreshed = report_exact_scan_projection_row(row);
+    let held_bytes = match held_record.encode_canonical() {
+        Ok(held_bytes) => held_bytes,
+        Err(_) => return ReprovedExactAbsenceOutcomeV1::CannotProve("held record cannot encode"),
+    };
+    let held_entry = ExactAbsenceSweepEntryV1::new(
+        refreshed.record_path().to_owned(),
+        refreshed.enumerated_name().to_os_string(),
+        refreshed.assessment().clone(),
+        Some(held_bytes),
+    );
+    if refreshed != *report_entry || refreshed != held_entry {
+        return ReprovedExactAbsenceOutcomeV1::Refused("record or report evidence changed");
+    }
+    match evidence {
+        ExactAbsenceEvidenceV1::Authorized => ReprovedExactAbsenceOutcomeV1::Authorized,
+        ExactAbsenceEvidenceV1::Refused => {
+            ReprovedExactAbsenceOutcomeV1::Refused("fresh exact-absence decision refused")
+        }
+        ExactAbsenceEvidenceV1::CannotProve => ReprovedExactAbsenceOutcomeV1::CannotProve(
+            "fresh subject authority or exact-absence observation is unavailable",
+        ),
+    }
 }
 
 fn project_exact_scan_result(
@@ -948,34 +1080,39 @@ fn project_exact_scan_result(
     let retained_root = retained_custody_root_authority(root_observations, &canonical_root);
     let mut rows = Vec::with_capacity(checked_rows.len());
     for checked in checked_rows {
-        let assessment = match checked.parts() {
+        let (assessment, evidence) = match checked.parts() {
             (path, _, ScannedWorktreeRecordV1::Legacy(sidecar)) => {
-                ExactAbsenceRecordAssessmentV1::Legacy(decide_unused_legacy_sidecar(
-                    &canonical_root,
-                    path,
-                    sidecar,
-                    probe,
-                ))
+                let decision = decide_unused_legacy_sidecar(&canonical_root, path, sidecar, probe);
+                (
+                    ExactAbsenceRecordAssessmentV1::Legacy(decision),
+                    ExactAbsenceEvidenceV1::Refused,
+                )
             }
             (_, enumerated_name, ScannedWorktreeRecordV1::Custody(record)) => {
-                ExactAbsenceRecordAssessmentV1::Custody(CustodyRecordAssessmentV1::new(
-                    CustodyStateSnapshotV1::from(&record.state),
-                    assess_custody_record(
-                        &canonical_root,
-                        enumerated_name,
-                        record,
-                        &retained_root,
-                        probe,
-                    ),
-                ))
+                let custody = assess_custody_record(
+                    &canonical_root,
+                    enumerated_name,
+                    record,
+                    &retained_root,
+                    probe,
+                );
+                (
+                    ExactAbsenceRecordAssessmentV1::Custody(CustodyRecordAssessmentV1::new(
+                        CustodyStateSnapshotV1::from(&record.state),
+                        custody.assessment,
+                    )),
+                    custody.evidence,
+                )
             }
-            (_, _, ScannedWorktreeRecordV1::UnreadableCustody(refusal)) => {
-                ExactAbsenceRecordAssessmentV1::UnreadableCustody(refusal.clone())
-            }
+            (_, _, ScannedWorktreeRecordV1::UnreadableCustody(refusal)) => (
+                ExactAbsenceRecordAssessmentV1::UnreadableCustody(refusal.clone()),
+                ExactAbsenceEvidenceV1::CannotProve,
+            ),
         };
         let projection_row = ExactScanProjectionRowV1 {
             checked,
             assessment,
+            evidence,
         };
         let path = projection_row.checked.record_path();
         let decision = projection_row.assessment.decision();
@@ -1011,6 +1148,7 @@ where
         canonical_root.clone(),
         checked_scan::scan_compatibility_with_pin_opener(
             Path::new(canonical_root.as_str()),
+            None,
             pin_opener,
         ),
         probe,
