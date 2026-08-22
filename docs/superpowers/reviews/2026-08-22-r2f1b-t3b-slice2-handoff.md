@@ -33,9 +33,65 @@ When `sweep_orphans` is wired to drive settlement, its caller must supply a read
 - Sole expected reddening test: `settle::tests::a_record_replaced_between_report_and_window_refuses`.
 - The control is carried unchanged: the repair alters none of its dependent lines, it still applies cleanly, and its red run is reserved for the operator command in the task brief.
 
-- [ ] `cargo fmt --all -- --check` — **PENDING OPERATOR**
-- [ ] `CARGO_INCREMENTAL=0 cargo clippy --workspace --all-targets --locked -- -D warnings` — **PENDING OPERATOR**
-- [ ] `CARGO_INCREMENTAL=0 cargo test --workspace --locked --no-fail-fast` — **PENDING OPERATOR**
-- [ ] `CARGO_INCREMENTAL=0 cargo test -p bridge-worktree --locked --no-fail-fast` — **PENDING OPERATOR**
-- [ ] `cargo run -p a2a-bridge -- validate --repo-hygiene` at the implementation point — **PENDING OPERATOR**
-- [ ] `cargo run -p a2a-bridge -- validate --repo-hygiene` at the handoff point — **PENDING OPERATOR**
+- [x] `cargo fmt --all -- --check` — **see operator evidence below**
+- [x] `CARGO_INCREMENTAL=0 cargo clippy --workspace --all-targets --locked -- -D warnings` — **see operator evidence below**
+- [x] `CARGO_INCREMENTAL=0 cargo test --workspace --locked --no-fail-fast` — **see operator evidence below**
+- [x] `CARGO_INCREMENTAL=0 cargo test -p bridge-worktree --locked --no-fail-fast` — **see operator evidence below**
+- [x] `cargo run -p a2a-bridge -- validate --repo-hygiene` at the implementation point — **see operator evidence below**
+- [x] `cargo run -p a2a-bridge -- validate --repo-hygiene` at the handoff point — **see operator evidence below**
+
+
+---
+
+# Operator evidence
+
+Recorded by the operator at candidate `ca481820` (repair) over `37931561` (slice 2), parent `c65c8eca`.
+Run from a checkout under the owner-approved trusted cwd root. Exit status and FAILED counts are
+authoritative; per-binary `test result:` lines are not summed, because nested filtered subprocesses
+double-count them.
+
+## Gates — all green
+
+| Gate | Result |
+|---|---|
+| `cargo fmt --all -- --check` | **exit 0** |
+| `CARGO_INCREMENTAL=0 cargo clippy --workspace --all-targets --locked -- -D warnings` | **exit 0** |
+| `CARGO_INCREMENTAL=0 cargo test --workspace --locked --no-fail-fast` | **exit 0, 0 FAILED** |
+| `CARGO_INCREMENTAL=0 cargo test -p bridge-worktree --locked --no-fail-fast` | **exit 0, 347 passed / 0 failed** |
+| `cargo run -p a2a-bridge -- validate --repo-hygiene` (both points) | **exit 0** |
+
+## Same-environment base control
+
+`bridge-worktree` at `c65c8eca`, same host, same command: **338 passed / 0 failed**.
+Candidate: **347 passed / 0 failed**. Delta **+9**.
+
+## Frozen mutation control — RUN
+
+- SHA-256 recomputed by the operator: `2fcc242ca810f5a5ba43965abd81720c1a19e6384219a2455ab33dbdc702be5b` — **matches the recorded value**.
+- Applied to the actual head `ca481820`: **applies cleanly**.
+- Result: **346 passed / 1 failed**. The single reddened test is
+  `settle::tests::a_record_replaced_between_report_and_window_refuses` — one of the two mandated
+  report-versus-window boundary tests, and no other test moved.
+- Tree restored after the run.
+
+## Counted lines
+
+Added nonblank physical Rust lines against `origin/main`, post-fmt: **711**, against the **770** cap.
+59 lines of headroom.
+
+## Repair disposition
+
+The slice-2 run ended REJECT at the review bound with two blockers. Both were repaired on the existing
+artifact; nothing was restarted.
+
+| Blocker | Disposition |
+|---|---|
+| Red `the_reproof_mints_no_effect` | **Real defect, fixed.** The audit pre-truncated `checked_scan.rs` at `#[cfg(test)]` and then sliced the result using `#[cfg(test)]` as its end anchor, which can never match, so `split_once` returned `None` and the unwrap panicked. The operator enumerated all six anchor pairs before the repair: the population was **exactly one**. `source_slice` now reports the missing anchor by name instead of panicking. |
+| Effect-freedom bypassable via the production probe | **Mechanism accepted; root cause was the operator's contract.** The slice-2 task required routing through the existing scan and projection — machinery that takes a probe — while also forbidding any process-spawn edge; `HostGitWorktree::observe_source_common_dir_identity` shells out to `git rev-parse`, so both could not hold. Classified SMELL rather than WRONG for this artifact: `reprove_under_window` has no production caller and the only in-crate probe implementation is test-only, so no realized effect edge exists. The design stands — taking the probe as a parameter is what keeps the acting path identical to the reporting path. The audit's **claim** was amended instead. |
+
+The repair converged in **one** review round with verify PASS on all four commands.
+
+## Carried to slice 5
+
+When `sweep_orphans` is wired to drive settlement, the caller **must** supply a read-only probe. Wiring a
+spawning probe into a settlement path is a slice-5 blocker. This slice adds no caller.
