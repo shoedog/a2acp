@@ -83,6 +83,19 @@ file = "../prompts/plan-review-synth.md"
 description = "plan-review synthesis prompt"
 
 # design: two lenses drafted then refined, then synthesised into one plan.
+
+# ── opencode @ ox-alpha-free: the CONTENDER in the sol-vs-ox-alpha head-to-head. Same `author`
+#    prompt, same input, same workflow shape as the codex/sol node -- only the agent differs, so the
+#    comparison is controlled. pre_authenticated is required: opencode advertises an interactive auth
+#    method and the bridge would otherwise invoke it and hang. ──
+[[agents]]
+id   = "opencode"
+cmd  = "opencode"
+args = ["acp"]
+pre_authenticated = true
+model = "opencode-go/ox-alpha-free"
+fallback_models = ["opencode-go/kimi-k3"]
+
 [[workflows]]
 id = "design"
 
@@ -126,6 +139,17 @@ id = "author"
 [[workflows.nodes]]
 id = "author"
 agent = "codex"
+prompt = "author-artifact"
+inputs = []
+
+
+# author-oc: byte-identical to `author` except the agent. The head-to-head's controlled variable.
+[[workflows]]
+id = "author-oc"
+
+[[workflows.nodes]]
+id = "author"
+agent = "opencode"
 prompt = "author-artifact"
 inputs = []
 
