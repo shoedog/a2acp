@@ -180,7 +180,10 @@ cmd  = "npm test --if-present"   # honors the project's test script; no-op if ab
 [registry]
 # docker: the container runtime for the impl/kiro/verify sandboxes.
 # codex-acp + claude-agent-acp: host-side reviewer agents (codex/claude run without a sandbox block).
-allowed_cmds = ["docker", "codex-acp", "claude-agent-acp"]
+# opencode: host-side ACP agent (`opencode acp`). This list is a SPAWN ALLOWLIST -- a cmd absent from it
+# is refused by the registry with "cmd not allowed", so adding an agent is an explicit authorization,
+# not a side effect of declaring one. An absolute path does not bypass it; the entry must be listed.
+allowed_cmds = ["docker", "codex-acp", "claude-agent-acp", "opencode"]
 
 [server]
 addr = "127.0.0.1:8080"
@@ -327,7 +330,60 @@ id          = "openrouter"
 kind        = "api"
 base_url    = "https://openrouter.ai/api/v1"
 api_key_env = "OPENROUTER_API_KEY"
-model       = "anthropic/claude-sonnet-4.5"
+# FREE MODELS ONLY (owner directive). Verified against the live OpenRouter catalogue: 22 models price
+# prompt and completion at 0, of which 19 advertise `tools` in supported_parameters -- the rest are
+# music/audio models (google/lyria-*) and unusable for an agent. All ids below are from that filtered
+# set; anything without a `:free` suffix here is free because OpenRouter prices it at 0 outright.
+model       = "stealth/ox-alpha"
+# Free, tool-capable fallbacks: the 550B nemotron is the largest free flagship at 1M context, and
+# north-mini-code is the only explicitly code-specialised model in the free set.
+fallback_models = ["nvidia/nemotron-3-ultra-550b-a55b:free", "cohere/north-mini-code:free"]
+
+# ── opencode: ACP agent (github.com/anomalyco/opencode, formerly sst/opencode). Speaks ACP JSON-RPC
+#    over stdio via `opencode acp` — the same transport claude-agent-acp / codex-acp / gemini use, so
+#    it needs no adapter code, only this entry.
+#
+#    VERIFIED by a live handshake against opencode 1.18.21:
+#      protocolVersion: 1                  (matches the workspace pin agent-client-protocol = "=1.0.1")
+#      agentCapabilities: loadSession, mcp{http,sse}, prompt{embeddedContext,image},
+#                         session{close,fork,list,resume}
+#
+#    pre_authenticated: REQUIRED. opencode's `initialize` advertises an interactive auth method
+#    ("Run `opencode auth login` in the terminal"). Without this flag the bridge would invoke that
+#    method and hang — the same Authenticate-timeout class that cost the codex host reviewer four
+#    review rounds. opencode resolves credentials from the environment instead, so they are ambient.
+#
+#    MODEL SELECTION is standard ACP: opencode advertises a `SessionConfigOption` of category "model"
+#    and the bridge sets it via `session/set_config_option`, which bridge-acp already implements.
+#    Ids are "<provider>/<model>", and the model segment may itself contain a slash.
+#
+#    Providers are detected from the environment (`opencode auth list`). With OPENROUTER_API_KEY and
+#    OPENCODE_API_KEY exported, opencode sees OpenRouter (360 models), OpenCode Go, OpenCode Zen.
+#
+#    MODEL CHOICE: openrouter/stealth/ox-alpha is free (OpenRouter pricing 0/0, verified live) and is
+#    a REASONING model — models.dev reports reasoning=true, tool_call=true, 1M context. Give it real
+#    token headroom: with a tiny max_tokens it spends the whole budget on its reasoning field and
+#    returns EMPTY content, which looks exactly like a broken integration.
+#
+#    CAVEAT: ox-alpha is a temporary promotional "stealth" model with an unclaimed identity and a
+#    limited free window. It may disappear or be renamed. Alternatives already available on this
+#    machine: opencode-go/gpt-5.6-luna, opencode-go/kimi-k3, opencode-go/grok-4.5 (subscription). ──
+[[agents]]
+id   = "opencode"
+cmd  = "opencode"
+args = ["acp"]
+pre_authenticated = true
+model = "opencode-go/ox-alpha-free"
+# Fallback chosen on measured envelope + stability, not reputation. Every opencode-go model reports
+# tool_call and reasoning, so capability does not separate them; kimi-k3 is picked because its
+# envelope (1048576 ctx / 131072 out) is the closest match to ox-alpha-free's (1000000 / 131072), so a
+# failover does not change prompt or output budgeting, and it carries none of the disqualifiers on the
+# rest of the list: ox-alpha-free is limited-time, muse-spark is limited-region, and
+# deepseek-v4-flash-vision-exp is experimental. Runner-up: opencode-go/gpt-5.6-luna, which has the
+# largest context of the set (1050000) but slightly less output headroom (128000).
+# NOTE: models.dev supplies context/output/tool/reasoning. It does NOT rank coding quality, so this
+# choice is defensible on envelope and stability, not on a benchmark claim.
+fallback_models = ["opencode-go/kimi-k3"]
 
 [[prompts]]
 id = "review-implement"
