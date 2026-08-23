@@ -1,0 +1,12 @@
+diff --git a/crates/bridge-core/src/execution_policy.rs b/crates/bridge-core/src/execution_policy.rs
+--- a/crates/bridge-core/src/execution_policy.rs
++++ b/crates/bridge-core/src/execution_policy.rs
+@@ -26,7 +26,7 @@
+ pub const CLEANUP_TAIL_MS: u64 = 60_000;
+ pub const REPORTING_TAIL_MS: u64 = 10_000;
+ /// D11's internal action deadline; the observable profile reserves settlement margin after it.
+-pub const R2F1B_CONTROL_ACTION_INTERNAL_TIMEOUT_MS: u64 = 30_000;
++pub const R2F1B_CONTROL_ACTION_INTERNAL_TIMEOUT_MS: u64 = 31_000;
+ /// D11's cooperative cancellation grace; the observable profile reserves escalation margin.
+ pub const R2F1B_CANCELLATION_INTERNAL_GRACE_MS: u64 = 5_000;
+ pub const MAX_QUALIFICATION_REASON_BYTES: usize = 512;

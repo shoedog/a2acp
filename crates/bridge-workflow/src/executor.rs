@@ -691,9 +691,17 @@ impl WorkflowCleanupDisposition {
     }
 }
 
-#[derive(Default)]
 struct WorkflowCleanupTracker {
+    clock: Arc<dyn bridge_core::attempt_activity::MonotonicClock>,
     state: std::sync::Mutex<WorkflowCleanupState>,
+}
+
+impl Default for WorkflowCleanupTracker {
+    fn default() -> Self {
+        Self::new(Arc::new(
+            bridge_core::attempt_activity::SystemMonotonicClock::start(),
+        ))
+    }
 }
 
 #[derive(Default)]
@@ -701,7 +709,7 @@ struct WorkflowCleanupState {
     observed: u32,
     failed: bool,
     disposition: BackendCleanupDispositionV1,
-    intervals: Vec<(std::time::Instant, std::time::Instant)>,
+    intervals: Vec<(u64, u64)>,
     nodes: BTreeMap<NodeId, NodeCleanupState>,
 }
 
@@ -710,7 +718,7 @@ struct NodeCleanupState {
     observed: u32,
     failed: bool,
     disposition: BackendCleanupDispositionV1,
-    intervals: Vec<(std::time::Instant, std::time::Instant)>,
+    intervals: Vec<(u64, u64)>,
     failure: Option<BridgeError>,
     /// The sessions this node configured, and the backend that owns each one's checkout
     /// (slice 2c2, P3).
@@ -745,11 +753,31 @@ impl WorkflowCheckoutOwnerV1 {
 }
 
 impl WorkflowCleanupTracker {
+    fn new(clock: Arc<dyn bridge_core::attempt_activity::MonotonicClock>) -> Self {
+        Self {
+            clock,
+            state: std::sync::Mutex::new(WorkflowCleanupState::default()),
+        }
+    }
+
+    fn elapsed_ms(&self) -> u64 {
+        self.clock.elapsed_ms()
+    }
+
     fn record(
         &self,
         node: &NodeId,
-        started: std::time::Instant,
-        finished: std::time::Instant,
+        started_ms: u64,
+        result: &Result<BackendCleanupDispositionV1, BridgeError>,
+    ) {
+        self.record_interval(node, started_ms, self.elapsed_ms(), result);
+    }
+
+    fn record_interval(
+        &self,
+        node: &NodeId,
+        started_ms: u64,
+        finished_ms: u64,
         result: &Result<BackendCleanupDispositionV1, BridgeError>,
     ) {
         let mut state = self
@@ -761,14 +789,14 @@ impl WorkflowCleanupTracker {
         if let Ok(disposition) = result {
             state.disposition = state.disposition.combine(*disposition);
         }
-        state.intervals.push((started, finished));
+        state.intervals.push((started_ms, finished_ms));
         let node_state = state.nodes.entry(node.clone()).or_default();
         node_state.observed = node_state.observed.saturating_add(1);
         node_state.failed |= result.is_err();
         if let Ok(disposition) = result {
             node_state.disposition = node_state.disposition.combine(*disposition);
         }
-        node_state.intervals.push((started, finished));
+        node_state.intervals.push((started_ms, finished_ms));
         if node_state.failure.is_none() {
             node_state.failure = result.as_ref().err().cloned();
         }
@@ -968,22 +996,22 @@ async fn settle_materialized_workflow_checkouts(
     }
 }
 
-fn interval_union_ms(mut intervals: Vec<(std::time::Instant, std::time::Instant)>) -> u64 {
+fn interval_union_ms(mut intervals: Vec<(u64, u64)>) -> u64 {
     intervals.sort_unstable_by_key(|(started, _)| *started);
-    let mut total = std::time::Duration::ZERO;
+    let mut total = 0_u64;
     if let Some((mut current_start, mut current_end)) = intervals.first().copied() {
         for (started, finished) in intervals.into_iter().skip(1) {
             if started <= current_end {
                 current_end = current_end.max(finished);
             } else {
-                total = total.saturating_add(current_end.duration_since(current_start));
+                total = total.saturating_add(current_end.saturating_sub(current_start));
                 current_start = started;
                 current_end = finished;
             }
         }
-        total = total.saturating_add(current_end.duration_since(current_start));
+        total = total.saturating_add(current_end.saturating_sub(current_start));
     }
-    u64::try_from(total.as_millis()).unwrap_or(u64::MAX)
+    total
 }
 
 async fn cleanup_warm_turn(
@@ -993,13 +1021,13 @@ async fn cleanup_warm_turn(
     observer: Arc<dyn DiagnosticObserver>,
     tracker: &WorkflowCleanupTracker,
 ) -> Result<(), BridgeError> {
-    let started = std::time::Instant::now();
+    let started_ms = tracker.elapsed_ms();
     let result = cleanup.on_exit_observed(exit, observer).await;
     let tracked = result
         .as_ref()
         .map(|_| BackendCleanupDispositionV1::Complete)
         .map_err(Clone::clone);
-    tracker.record(node, started, std::time::Instant::now(), &tracked);
+    tracker.record(node, started_ms, &tracked);
     result
 }
 
@@ -1351,7 +1379,7 @@ async fn cleanup_cold_session(
     action: ColdCleanupAction,
     tracker: &WorkflowCleanupTracker,
 ) -> Result<BackendCleanupDispositionV1, BridgeError> {
-    let started = std::time::Instant::now();
+    let started_ms = tracker.elapsed_ms();
     let result = match action {
         ColdCleanupAction::Forget => {
             backend
@@ -1364,7 +1392,7 @@ async fn cleanup_cold_session(
                 .await
         }
     };
-    tracker.record(node, started, std::time::Instant::now(), &result);
+    tracker.record(node, started_ms, &result);
     result
 }
 
@@ -4842,7 +4870,14 @@ impl WorkflowExecutor {
                     }
                 }
             }
-            let cleanup_tracker = Arc::new(WorkflowCleanupTracker::default());
+            let cleanup_clock = ctx
+                .make_rich_sink
+                .as_ref()
+                .and_then(|factory| factory.monotonic_clock())
+                .unwrap_or_else(|| {
+                    Arc::new(bridge_core::attempt_activity::SystemMonotonicClock::start())
+                });
+            let cleanup_tracker = Arc::new(WorkflowCleanupTracker::new(cleanup_clock));
             // This macro is deliberately inside the stream, at every post-recording return site.
             // `async_stream` resumes only when the consumer polls; yielding the terminal error
             // before this await would allow a consumer drop to strand a materialized checkout.
@@ -5677,25 +5712,9 @@ mod tests {
     fn cleanup_duration_is_the_union_of_overlapping_intervals() {
         let tracker = WorkflowCleanupTracker::default();
         let node = NodeId::parse("cleanup-node").unwrap();
-        let base = std::time::Instant::now();
-        tracker.record(
-            &node,
-            base,
-            base + std::time::Duration::from_millis(30),
-            &Ok(BackendCleanupDispositionV1::Complete),
-        );
-        tracker.record(
-            &node,
-            base + std::time::Duration::from_millis(10),
-            base + std::time::Duration::from_millis(40),
-            &Err(BridgeError::StoreFailure),
-        );
-        tracker.record(
-            &node,
-            base + std::time::Duration::from_millis(60),
-            base + std::time::Duration::from_millis(70),
-            &Ok(BackendCleanupDispositionV1::Complete),
-        );
+        tracker.record_interval(&node, 0, 30, &Ok(BackendCleanupDispositionV1::Complete));
+        tracker.record_interval(&node, 10, 40, &Err(BridgeError::StoreFailure));
+        tracker.record_interval(&node, 60, 70, &Ok(BackendCleanupDispositionV1::Complete));
 
         assert_eq!(
             tracker.observation(),
@@ -5728,8 +5747,7 @@ mod tests {
         ] {
             let tracker = WorkflowCleanupTracker::default();
             let node = NodeId::parse("protective-cleanup-node").unwrap();
-            let now = std::time::Instant::now();
-            tracker.record(&node, now, now, &Ok(backend));
+            tracker.record_interval(&node, 0, 0, &Ok(backend));
 
             assert_eq!(tracker.observation().0, workflow);
             assert_eq!(

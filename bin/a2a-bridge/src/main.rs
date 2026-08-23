@@ -4280,6 +4280,28 @@ async fn run_workflow_serve_client(
     }
 }
 
+struct RunWorkflowAttemptTiming {
+    telemetry: Arc<bridge_core::attempt_activity::AttemptTelemetrySinkFactory>,
+    clock: Arc<dyn bridge_core::attempt_activity::MonotonicClock>,
+}
+
+impl RunWorkflowAttemptTiming {
+    fn new(attempt_id: impl Into<String>) -> Self {
+        let telemetry =
+            Arc::new(bridge_core::attempt_activity::AttemptTelemetrySinkFactory::new(attempt_id));
+        let clock = telemetry.clock();
+        Self { telemetry, clock }
+    }
+
+    fn elapsed_ms(&self) -> u64 {
+        self.clock.elapsed_ms()
+    }
+
+    fn rich_sink_factory(&self) -> Arc<dyn bridge_core::ports::RichEventSinkFactory> {
+        self.telemetry.clone()
+    }
+}
+
 async fn run_workflow_cmd(args: &[String]) -> Result<(), BoxError> {
     if args.iter().any(|a| a == "--help" || a == "-h") {
         println!("{RUN_WORKFLOW_USAGE}");
@@ -4723,22 +4745,16 @@ async fn run_workflow_cmd(args: &[String]) -> Result<(), BoxError> {
     };
     ctx.task_id = task_id;
     ctx.harvest_audit_store = harvest_audit_store;
-    let attempt_telemetry = Arc::new(
-        bridge_core::attempt_activity::AttemptTelemetrySinkFactory::new(
-            identity.attempt_id.as_str().to_string(),
-        ),
-    );
-    let activity_recorder = attempt_telemetry.recorder();
-    let terminal_evidence = attempt_telemetry.evidence();
-    ctx.make_rich_sink =
-        Some(attempt_telemetry as Arc<dyn bridge_core::ports::RichEventSinkFactory>);
+    let attempt_timing = RunWorkflowAttemptTiming::new(identity.attempt_id.as_str().to_string());
+    let activity_recorder = attempt_timing.telemetry.recorder();
+    let terminal_evidence = attempt_timing.telemetry.evidence();
+    ctx.make_rich_sink = Some(attempt_timing.rich_sink_factory());
     let _ = activity_recorder.record(
         bridge_core::attempt_activity::AttemptPhase::Configure,
         bridge_core::attempt_activity::ActivityReason::PhaseTransition,
         1,
     );
 
-    let workflow_started = std::time::Instant::now();
     let diagnostic_ctx = bridge_workflow::executor::WorkflowDiagnosticContext::in_memory(ctx);
     let diagnostic_ctx = match history_store.as_ref() {
         Some(store) => {
@@ -4989,10 +5005,10 @@ async fn run_workflow_cmd(args: &[String]) -> Result<(), BoxError> {
             }
         }
     }
-    let prefinal_ms = u64::try_from(workflow_started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    let prefinal_ms = attempt_timing.elapsed_ms();
     let cleanup_ms = cleanup_ms.min(prefinal_ms);
     let work_ms = prefinal_ms.saturating_sub(cleanup_ms);
-    let finalization_started = std::time::Instant::now();
+    let finalization_started_ms = attempt_timing.elapsed_ms();
     let structured_node_counts = if !structured_evidence_invalid
         && structured_terminals.len() == expected_node_count
     {
@@ -5132,14 +5148,14 @@ async fn run_workflow_cmd(args: &[String]) -> Result<(), BoxError> {
         ok = false;
         terminal_outcome = "failed";
     }
-    let finalization_ms =
-        u64::try_from(finalization_started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    let finalization_ms = attempt_timing
+        .elapsed_ms()
+        .saturating_sub(finalization_started_ms);
 
     // The resolved result/output is published before summary finalization; a
     // summary-store failure cannot roll back bytes already handed to the caller.
     if let Some(store) = history_store {
-        let end_to_end_ms =
-            u64::try_from(workflow_started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        let end_to_end_ms = attempt_timing.elapsed_ms();
         let _ = activity_recorder.record(
             bridge_core::attempt_activity::AttemptPhase::TerminalStore,
             bridge_core::attempt_activity::ActivityReason::PhaseTransition,
@@ -10258,6 +10274,19 @@ async fn main() -> Result<(), BoxError> {
 mod cli_tests {
     use super::*;
     use crate::turn::TurnRunner;
+
+    #[test]
+    fn run_workflow_reporting_and_rich_sink_share_attempt_clock() {
+        let timing = RunWorkflowAttemptTiming::new("offline-clock-identity");
+        assert!(Arc::ptr_eq(&timing.clock, &timing.telemetry.clock()));
+        assert!(Arc::ptr_eq(
+            &timing.clock,
+            &timing
+                .rich_sink_factory()
+                .monotonic_clock()
+                .expect("production workflow rich sink must expose its attempt clock"),
+        ));
+    }
 
     fn write_rollout(dir: &std::path::Path, name: &str, messages: &[&str]) {
         let day = dir

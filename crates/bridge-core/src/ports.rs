@@ -83,6 +83,14 @@ pub trait RichEventSink: Send + Sync {
 
 pub trait RichEventSinkFactory: Send + Sync {
     fn make(&self, node: &NodeId) -> std::sync::Arc<dyn RichEventSink>;
+
+    /// Return the attempt's identity-bearing monotonic source when this factory owns one.
+    /// Factory wrappers must forward it so downstream consumers do not create a second epoch.
+    fn monotonic_clock(
+        &self,
+    ) -> Option<std::sync::Arc<dyn crate::attempt_activity::MonotonicClock>> {
+        None
+    }
 }
 
 /// Operation-scoped lifecycle diagnostic sink.
