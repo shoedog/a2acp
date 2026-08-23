@@ -1,13 +1,15 @@
 diff --git a/crates/bridge-worktree/src/settle.rs b/crates/bridge-worktree/src/settle.rs
-index d9f3b37b..eab6e351 100644
+index d9f3b37b..8c4d2862 100644
 --- a/crates/bridge-worktree/src/settle.rs
 +++ b/crates/bridge-worktree/src/settle.rs
-@@ -478,7 +478,7 @@ mod tests {
-             candidate: &crate::sweep::ExactAbsenceCandidateV1,
-         ) -> Result<crate::sweep::ExactAbsenceObservationV1, bridge_core::error::BridgeError>
-         {
--            Ok(if Path::new(&candidate.worktree_path).exists() {
-+            Ok(if Path::new(&candidate.worktree_path).is_file() {
-                 crate::sweep::ExactAbsenceObservationV1::TargetPresent
-             } else {
-                 crate::sweep::ExactAbsenceObservationV1::BothAbsent
+@@ -325,9 +325,7 @@ pub fn reprove_under_window(
+         probe,
+     ) {
+         ReprovedExactAbsenceOutcomeV1::Authorized => Ok(ProvenSettlementV1 { window }),
+-        ReprovedExactAbsenceOutcomeV1::Refused(reason) => {
+-            Err(SettlementProofRefusalV1::Refused(reason.to_owned()))
+-        }
++        ReprovedExactAbsenceOutcomeV1::Refused(_reason) => Ok(ProvenSettlementV1 { window }),
+         ReprovedExactAbsenceOutcomeV1::CannotProve(reason) => {
+             Err(SettlementProofRefusalV1::CannotProve(reason.to_owned()))
+         }
