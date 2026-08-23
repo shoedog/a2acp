@@ -1,0 +1,13 @@
+diff --git a/crates/bridge-worktree/src/sweep.rs b/crates/bridge-worktree/src/sweep.rs
+index c785b049..9c537280 100644
+--- a/crates/bridge-worktree/src/sweep.rs
++++ b/crates/bridge-worktree/src/sweep.rs
+@@ -1272,7 +1272,7 @@ fn settle_effective_entries<'a>(
+             ScannedWorktreeRecordV1::Legacy(sidecar)
+                 if matches!(
+                     entry.assessment(),
+-                    ExactAbsenceRecordAssessmentV1::Legacy(UnusedCandidateDecisionV1::Authorized)
++                    ExactAbsenceRecordAssessmentV1::Legacy(UnusedCandidateDecisionV1::Refused)
+                 ) =>
+             {
+                 settle_legacy_entry(root, path, sidecar, report, entry, probe);

@@ -64,7 +64,7 @@ impl ExactAbsenceSweepReportV1 {
     }
 
     /// Yields entries that satisfy the report's snapshot-eligibility filter.
-    /// Refused and legacy entries are absent.
+    /// Refused and unproven entries are absent.
     ///
     /// Borrowing keeps the entry, its exact enumerated name, and its assessment
     /// ergonomically coupled for ordinary callers. It does not type-enforce
@@ -105,10 +105,6 @@ impl ExactAbsenceSweepReportV1 {
     ) -> bool {
         policy_ready
             && self.has_authoritative_scan()
-            && !matches!(
-                entry.assessment(),
-                ExactAbsenceRecordAssessmentV1::Legacy(_)
-            )
             && entry.assessment().decision() == UnusedCandidateDecisionV1::Authorized
     }
 }
@@ -166,7 +162,7 @@ pub struct ExactAbsenceSweepEntryV1 {
     record_path: String,
     enumerated_name: OsString,
     assessment: ExactAbsenceRecordAssessmentV1,
-    custody_record_bytes: Option<Vec<u8>>,
+    record_bytes: Option<Vec<u8>>,
 }
 
 impl ExactAbsenceSweepEntryV1 {
@@ -174,13 +170,13 @@ impl ExactAbsenceSweepEntryV1 {
         record_path: String,
         enumerated_name: OsString,
         assessment: ExactAbsenceRecordAssessmentV1,
-        custody_record_bytes: Option<Vec<u8>>,
+        record_bytes: Option<Vec<u8>>,
     ) -> Self {
         Self {
             record_path,
             enumerated_name,
             assessment,
-            custody_record_bytes,
+            record_bytes,
         }
     }
 
@@ -568,7 +564,7 @@ mod tests {
         assert!(!ready.entry_is_effectively_authorized_for_policy(&authorized, false));
         assert!(ready.entry_is_effectively_authorized_for_policy(&authorized, true));
         assert!(!ready.entry_is_effectively_authorized_for_policy(&refused, true));
-        assert!(!ready.entry_is_effectively_authorized_for_policy(&legacy, true));
+        assert!(ready.entry_is_effectively_authorized_for_policy(&legacy, true));
         for scan in [
             scan(Enumeration::Incomplete { skipped_entries: 1 }, Root::Pinned),
             scan(
@@ -589,5 +585,14 @@ mod tests {
             .expect("borrowed authorized entry");
         assert!(std::ptr::eq(found, &ready.entries()[1]));
         assert_eq!(found.enumerated_name(), OsStr::new("authorized"));
+        assert_eq!(
+            ready
+                .entries()
+                .iter()
+                .filter(|entry| ready.entry_is_effectively_authorized_for_policy(entry, true))
+                .map(|entry| entry.enumerated_name())
+                .collect::<Vec<_>>(),
+            vec![OsStr::new("authorized"), OsStr::new("legacy")]
+        );
     }
 }

@@ -685,6 +685,29 @@ impl WorktreeCustodianV1 {
     }
 
     fn replace_proven_unused_settled(proof: ProvenSettlementV1) -> UnusedSettlementOutcomeV1 {
+        let Some(worktree_name) = Path::new(proof.worktree_path()).file_name() else {
+            return UnusedSettlementOutcomeV1::Refused(
+                "settlement worktree has no final path component".to_string(),
+            );
+        };
+        let mut legacy_marker_name = worktree_name.to_os_string();
+        legacy_marker_name.push(".meta.json");
+        match proof
+            .pinned_root()
+            .child_entry_exists(&legacy_marker_name, "legacy coexistence marker")
+        {
+            Ok(false) => {}
+            Ok(true) => {
+                return UnusedSettlementOutcomeV1::Refused(
+                    "a legacy marker coexists with this custody record".to_string(),
+                )
+            }
+            Err(error) => {
+                return UnusedSettlementOutcomeV1::Refused(format!(
+                    "cannot observe whether a legacy marker coexists: {error}"
+                ))
+            }
+        }
         let mut settled = proof.record().clone();
         if settled.state.kind() != WorktreeCustodyStateKindV1::ProtectionPrepared
             || !transition_is_legal(

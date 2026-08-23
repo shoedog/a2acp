@@ -2,6 +2,7 @@ use crate::custody::{
     custody_record_path, CustodyReadRefusalV1, CustodySweepDispositionV1, PreservationReasonV1,
     WorktreeCustodyRecordV1, WorktreeCustodyStateV1, CUSTODY_RECORD_SUFFIX,
 };
+use crate::custody_writer::WorktreeCustodianV1;
 use crate::provider::{prune_argv, remove_argv};
 use crate::provider_path::{canonicalize_lenient, sidecar_path};
 use bridge_core::error::BridgeError;
@@ -424,10 +425,11 @@ fn worktree_under_root(root: &SessionCwd, worktree_path: &str) -> bool {
         .unwrap_or(false)
 }
 
-fn remove_worktree_if_safe(
+fn with_legacy_removal_guards(
     root: &SessionCwd,
     sidecar_file: &str,
     s: &crate::provider_path::WorktreeSidecar,
+    effect: impl FnOnce(),
 ) {
     // ---- STEP 1: the two forgery guards, FIRST ----------------------------------------------
     // Order matters, and this is a repair (2b2 review, opus S-8): the custody probe used to run
@@ -504,8 +506,17 @@ fn remove_worktree_if_safe(
         return;
     }
 
-    // ---- STEP 4: remove, still holding the cell ---------------------------------------------
-    remove_worktree(&s.canonical_source, &s.common_dir, &s.worktree_path);
+    effect();
+}
+
+fn remove_worktree_if_safe(
+    root: &SessionCwd,
+    sidecar_file: &str,
+    s: &crate::provider_path::WorktreeSidecar,
+) {
+    with_legacy_removal_guards(root, sidecar_file, s, || {
+        remove_worktree(&s.canonical_source, &s.common_dir, &s.worktree_path);
+    });
 }
 
 /// A record enumerated by the dual-pattern scan.
@@ -678,16 +689,16 @@ fn report_custody_entry(
     }
 }
 
-fn decide_unused_legacy_sidecar(
+fn decide_unused_legacy_sidecar_evidence(
     root: &SessionCwd,
     sidecar_file: &str,
     sidecar: &crate::provider_path::WorktreeSidecar,
     probe: &dyn ExactAbsenceProbeV1,
-) -> UnusedCandidateDecisionV1 {
+) -> ExactAbsenceEvidenceV1 {
     if !sidecar_file_matches(sidecar_file, &sidecar.worktree_path)
         || !worktree_under_root(root, &sidecar.worktree_path)
     {
-        return UnusedCandidateDecisionV1::Refused;
+        return ExactAbsenceEvidenceV1::Refused;
     }
     ExactAbsenceCandidateV1::from_legacy(
         &sidecar.canonical_source,
@@ -695,8 +706,8 @@ fn decide_unused_legacy_sidecar(
         &sidecar.worktree_path,
         probe,
     )
-    .map(|candidate| decide_unused_candidate(&candidate, false, probe))
-    .unwrap_or(UnusedCandidateDecisionV1::Refused)
+    .map(|candidate| decide_unused_candidate_evidence(&candidate, false, probe))
+    .unwrap_or(ExactAbsenceEvidenceV1::Refused)
 }
 /// Reject records whose target cannot be constructed as this root's child.
 ///
@@ -976,15 +987,16 @@ fn report_exact_scan_projection_row(row: ExactScanProjectionRowV1) -> ExactAbsen
         ..
     } = row;
     let (record_path, enumerated_name, scanned) = checked.parts();
-    let custody_record_bytes = match scanned {
+    let record_bytes = match scanned {
         ScannedWorktreeRecordV1::Custody(record) => record.encode_canonical().ok(),
-        ScannedWorktreeRecordV1::Legacy(_) | ScannedWorktreeRecordV1::UnreadableCustody(_) => None,
+        ScannedWorktreeRecordV1::Legacy(sidecar) => serde_json::to_vec(sidecar).ok(),
+        ScannedWorktreeRecordV1::UnreadableCustody(_) => None,
     };
     ExactAbsenceSweepEntryV1::new(
         record_path.to_owned(),
         enumerated_name.to_os_string(),
         assessment,
-        custody_record_bytes,
+        record_bytes,
     )
 }
 
@@ -1000,12 +1012,23 @@ pub(crate) enum ReprovedExactAbsenceOutcomeV1 {
     CannotProve(&'static str),
 }
 
+pub(crate) enum ExactAbsenceReproofSubjectV1<'a> {
+    Custody(&'a WorktreeCustodyRecordV1),
+    Legacy(&'a crate::provider_path::WorktreeSidecar),
+}
+
 pub(crate) fn reprove_exact_absence_entry(
     root: &Path,
-    held_record: &WorktreeCustodyRecordV1,
+    held: ExactAbsenceReproofSubjectV1<'_>,
+    report: &ExactAbsenceSweepReportV1,
     report_entry: &ExactAbsenceSweepEntryV1,
     probe: &dyn ExactAbsenceProbeV1,
 ) -> ReprovedExactAbsenceOutcomeV1 {
+    if !report.has_authoritative_scan() || !report.entries().contains(report_entry) {
+        return ReprovedExactAbsenceOutcomeV1::Refused(
+            "report is not an authoritative selected-sweep snapshot",
+        );
+    }
     let canonical_root = match canonicalize_lenient(&root.to_string_lossy()) {
         Ok(canonical_root) => canonical_root,
         Err(_) => return ReprovedExactAbsenceOutcomeV1::CannotProve("root cannot canonicalize"),
@@ -1040,9 +1063,23 @@ pub(crate) fn reprove_exact_absence_entry(
         );
     }
     let refreshed = report_exact_scan_projection_row(row);
-    let held_bytes = match held_record.encode_canonical() {
-        Ok(held_bytes) => held_bytes,
-        Err(_) => return ReprovedExactAbsenceOutcomeV1::CannotProve("held record cannot encode"),
+    let held_bytes = match held {
+        ExactAbsenceReproofSubjectV1::Custody(record) => match record.encode_canonical() {
+            Ok(bytes) => bytes,
+            Err(_) => {
+                return ReprovedExactAbsenceOutcomeV1::CannotProve(
+                    "held custody record cannot encode",
+                )
+            }
+        },
+        ExactAbsenceReproofSubjectV1::Legacy(sidecar) => match serde_json::to_vec(sidecar) {
+            Ok(bytes) => bytes,
+            Err(_) => {
+                return ReprovedExactAbsenceOutcomeV1::CannotProve(
+                    "held legacy sidecar cannot encode",
+                )
+            }
+        },
     };
     let held_entry = ExactAbsenceSweepEntryV1::new(
         refreshed.record_path().to_owned(),
@@ -1082,10 +1119,11 @@ fn project_exact_scan_result(
     for checked in checked_rows {
         let (assessment, evidence) = match checked.parts() {
             (path, _, ScannedWorktreeRecordV1::Legacy(sidecar)) => {
-                let decision = decide_unused_legacy_sidecar(&canonical_root, path, sidecar, probe);
+                let evidence =
+                    decide_unused_legacy_sidecar_evidence(&canonical_root, path, sidecar, probe);
                 (
-                    ExactAbsenceRecordAssessmentV1::Legacy(decision),
-                    ExactAbsenceEvidenceV1::Refused,
+                    ExactAbsenceRecordAssessmentV1::Legacy(evidence.report_decision()),
+                    evidence,
                 )
             }
             (_, enumerated_name, ScannedWorktreeRecordV1::Custody(record)) => {
@@ -1168,13 +1206,15 @@ pub fn sweep_orphans_with_exact_absence(
 }
 /// Reap only same-host **legacy** worktrees whose owner lease is free.
 ///
-/// V3 custody records are recognized and classified, never deleted (§5.2).
+/// V3 checkout directories are recognized and classified, never deleted (§5.2). Policy-selected marker settlement remains proof-bound.
 pub fn sweep_orphans(root: &str, my_host: &str, probe: &dyn LeaseProbe) {
-    let _ = sweep_orphans_with_exact_absence(root, &crate::host_git::HostGitWorktree::new());
+    let exact_absence_probe = crate::host_git::HostGitWorktree::new();
+    let report = sweep_orphans_with_exact_absence(root, &exact_absence_probe);
     let Ok(root_cwd) = canonicalize_lenient(root) else {
         tracing::warn!(root, "skipping worktree sweep with non-canonical root");
         return;
     };
+    settle_effective_entries(&root_cwd, &report, &exact_absence_probe, report.effective());
     for (path, scanned) in scan_worktree_records(root) {
         match scanned {
             ScannedWorktreeRecordV1::Legacy(s) => {
@@ -1201,6 +1241,101 @@ pub fn sweep_orphans(root: &str, my_host: &str, probe: &dyn LeaseProbe) {
             }
         }
     }
+}
+
+/// Offload the whole boot sweep, including its bounded settlement pass, from an async boot path.
+pub async fn sweep_orphans_async(root: String, my_host: String, probe: &'static dyn LeaseProbe) {
+    if let Err(error) =
+        tokio::task::spawn_blocking(move || sweep_orphans(&root, &my_host, probe)).await
+    {
+        tracing::warn!(?error, "orphan sweep blocking task did not complete");
+    }
+}
+
+fn settle_effective_entries<'a>(
+    root: &SessionCwd,
+    report: &'a ExactAbsenceSweepReportV1,
+    probe: &dyn ExactAbsenceProbeV1,
+    entries: impl Iterator<Item = &'a ExactAbsenceSweepEntryV1>,
+) {
+    let mut entries = entries.peekable();
+    if entries.peek().is_none() {
+        return;
+    }
+    let scanned = scan_worktree_records(root.as_str());
+    for entry in entries {
+        let Some((path, record)) = scanned.iter().find(|(path, _)| path == entry.record_path())
+        else {
+            continue;
+        };
+        match record {
+            ScannedWorktreeRecordV1::Legacy(sidecar)
+                if matches!(
+                    entry.assessment(),
+                    ExactAbsenceRecordAssessmentV1::Legacy(UnusedCandidateDecisionV1::Authorized)
+                ) =>
+            {
+                settle_legacy_entry(root, path, sidecar, report, entry, probe);
+            }
+            ScannedWorktreeRecordV1::Custody(record)
+                if entry.assessment().decision() == UnusedCandidateDecisionV1::Authorized =>
+            {
+                let outcome = WorktreeCustodianV1::replace_unused_settled(
+                    Path::new(root.as_str()),
+                    &record.worktree.canonical_path,
+                    report,
+                    entry,
+                );
+                tracing::info!(
+                    record_path = %path,
+                    worktree_path = %record.worktree.canonical_path,
+                    category = outcome.report_category(),
+                    outcome = ?outcome,
+                    "completed custody settlement attempt"
+                );
+            }
+            ScannedWorktreeRecordV1::Legacy(_)
+            | ScannedWorktreeRecordV1::Custody(_)
+            | ScannedWorktreeRecordV1::UnreadableCustody(_) => {}
+        }
+    }
+}
+
+fn settle_legacy_entry(
+    root: &SessionCwd,
+    sidecar_file: &str,
+    sidecar: &crate::provider_path::WorktreeSidecar,
+    report: &ExactAbsenceSweepReportV1,
+    entry: &ExactAbsenceSweepEntryV1,
+    probe: &dyn ExactAbsenceProbeV1,
+) {
+    with_legacy_removal_guards(
+        root,
+        sidecar_file,
+        sidecar,
+        || match reprove_exact_absence_entry(
+            Path::new(root.as_str()),
+            ExactAbsenceReproofSubjectV1::Legacy(sidecar),
+            report,
+            entry,
+            probe,
+        ) {
+            ReprovedExactAbsenceOutcomeV1::Authorized => {
+                remove_worktree(
+                    &sidecar.canonical_source,
+                    &sidecar.common_dir,
+                    &sidecar.worktree_path,
+                );
+            }
+            ReprovedExactAbsenceOutcomeV1::Refused(refusal)
+            | ReprovedExactAbsenceOutcomeV1::CannotProve(refusal) => tracing::info!(
+                sidecar = sidecar_file,
+                worktree_path = sidecar.worktree_path,
+                refusal,
+                "refusing legacy settlement after exact-absence re-proof"
+            ),
+        },
+    );
 }
 
 /// Run-end backstop for worktrees created by a single bridge process run.
@@ -4261,5 +4396,318 @@ mod tests {
             "a clean drop still performs the reclaim"
         );
         fs::remove_dir_all(&root).unwrap();
+    }
+
+    fn policy_selected_legacy_report(
+        root: &Path,
+        sidecar_file: &Path,
+    ) -> super::ExactAbsenceSweepReportV1 {
+        let entry = super::ExactAbsenceSweepEntryV1::new(
+            fs::canonicalize(sidecar_file)
+                .unwrap()
+                .to_string_lossy()
+                .into_owned(),
+            sidecar_file.file_name().unwrap().to_os_string(),
+            super::ExactAbsenceRecordAssessmentV1::Legacy(
+                super::UnusedCandidateDecisionV1::Authorized,
+            ),
+            None,
+        );
+        super::ExactAbsenceSweepReportV1::new(
+            root.to_string_lossy().into_owned(),
+            Some(
+                fs::canonicalize(root)
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
+            super::ExactAbsenceScanStatusV1::new(
+                super::ExactAbsenceEnumerationV1::Complete,
+                super::CustodyRootObservationV1::Pinned,
+            ),
+            vec![entry],
+        )
+    }
+
+    /// The boot sweep must retain its report and hand its policy-selected entries to settlement.
+    /// This catches a regression back to a discarded report, which would leave a proven unused
+    /// custody marker or legacy sidecar permanently stranded after the readiness gate opens.
+    #[test]
+    fn boot_sweep_drives_the_policy_selected_settlement_entries() {
+        let source = include_str!("sweep.rs");
+        let (_, sweep) = source
+            .split_once("pub fn sweep_orphans(")
+            .unwrap_or_else(|| panic!("source audit is missing sweep_orphans anchor"));
+        let (sweep, _) = sweep
+            .split_once("/// Offload the whole boot sweep")
+            .unwrap_or_else(|| panic!("source audit is missing async sweep anchor"));
+        assert!(
+            sweep.contains("let report = sweep_orphans_with_exact_absence")
+                && sweep.contains("settle_effective_entries(")
+                && sweep.contains("report.effective()"),
+            "the boot sweep must drive, rather than discard, its policy-selected report"
+        );
+    }
+
+    /// A policy-selected report must use its existing action-time proof for both marker
+    /// generations. This catches a future ready gate that settles V3 but strands a legacy marker.
+    #[test]
+    fn policy_selected_settlement_retires_v3_and_legacy_unused_markers() {
+        let root = unique_temp_dir("policy-selected-settlement");
+        fs::create_dir_all(&root).unwrap();
+
+        let v3_target = root.join("v3");
+        fs::create_dir(&v3_target).unwrap();
+        let v3_record = real_custody_record(
+            &root,
+            &v3_target,
+            WorktreeCustodyStateV1::ProtectionPrepared {},
+            true,
+        );
+        let v3_marker = PathBuf::from(custody_record_path(&v3_record.worktree.canonical_path));
+        fs::write(&v3_marker, v3_record.encode_canonical().unwrap()).unwrap();
+        fs::remove_dir_all(&v3_target).unwrap();
+
+        let legacy_target = root.join("legacy");
+        fs::create_dir(&legacy_target).unwrap();
+        let legacy = WorktreeSidecar {
+            canonical_source: root.join("source").to_string_lossy().into_owned(),
+            common_dir: root.join("source/.git").to_string_lossy().into_owned(),
+            worktree_path: legacy_target.to_string_lossy().into_owned(),
+            owner: "owner".into(),
+            run_id: "run".into(),
+            host: "host".into(),
+            lease: "/leases/live".into(),
+        };
+        write_sidecar(&legacy).unwrap();
+        let legacy_marker = fs::canonicalize(sidecar_path(&legacy.worktree_path)).unwrap();
+        fs::remove_dir_all(&legacy_target).unwrap();
+
+        let host_git = crate::host_git::HostGitWorktree::new();
+        let report = super::sweep_orphans_with_exact_absence(&root.to_string_lossy(), &host_git);
+        assert!(report.has_authoritative_scan());
+        assert_eq!(report.entries().len(), 2);
+        let legacy_entry = report
+            .entries()
+            .iter()
+            .find(|entry| entry.record_path() == legacy_marker.to_string_lossy())
+            .expect("the legacy marker must be selected in the exact-absence report");
+        assert!(matches!(
+            legacy_entry.assessment(),
+            super::ExactAbsenceRecordAssessmentV1::Legacy(
+                super::UnusedCandidateDecisionV1::Authorized
+            )
+        ));
+        let (_, current_legacy) = super::scan_worktree_records(&root.to_string_lossy())
+            .into_iter()
+            .find(|(path, _)| fs::canonicalize(path).unwrap() == legacy_marker)
+            .expect("the legacy marker must remain available to the action-time re-proof");
+        let super::ScannedWorktreeRecordV1::Legacy(current_legacy) = current_legacy else {
+            panic!("the selected legacy marker must not change record generation")
+        };
+        assert_eq!(
+            super::reprove_exact_absence_entry(
+                &root,
+                super::ExactAbsenceReproofSubjectV1::Legacy(&current_legacy),
+                &report,
+                legacy_entry,
+                &host_git,
+            ),
+            super::ReprovedExactAbsenceOutcomeV1::Authorized
+        );
+        let canonical_root = super::canonicalize_lenient(&root.to_string_lossy()).unwrap();
+        super::settle_effective_entries(
+            &canonical_root,
+            &report,
+            &host_git,
+            report.entries().iter(),
+        );
+
+        assert!(
+            !v3_marker.exists(),
+            "the proof-bound V3 settlement must retire its unused marker"
+        );
+        assert!(
+            !legacy_marker.exists(),
+            "the same proof-bound settlement must retire the legacy marker"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// The legacy settlement must not touch a sidecar unless its record names its own sibling.
+    #[test]
+    fn legacy_settlement_refuses_a_forged_non_sibling_marker() {
+        let root = unique_temp_dir("legacy-settlement-forged-sibling");
+        fs::create_dir_all(&root).unwrap();
+        let victim = root.join("victim");
+        fs::create_dir(&victim).unwrap();
+        fs::write(victim.join("keep"), "do not delete").unwrap();
+        let sidecar = WorktreeSidecar {
+            canonical_source: root.join("source").to_string_lossy().into_owned(),
+            common_dir: root.join("source/.git").to_string_lossy().into_owned(),
+            worktree_path: victim.to_string_lossy().into_owned(),
+            owner: "owner".into(),
+            run_id: "run".into(),
+            host: "host".into(),
+            lease: "/leases/dead".into(),
+        };
+        let forged = root.join("forged.meta.json");
+        fs::write(&forged, serde_json::to_vec(&sidecar).unwrap()).unwrap();
+        let report = policy_selected_legacy_report(&root, &forged);
+        let canonical_root = super::canonicalize_lenient(&root.to_string_lossy()).unwrap();
+        super::settle_effective_entries(
+            &canonical_root,
+            &report,
+            &crate::host_git::HostGitWorktree::new(),
+            report.entries().iter(),
+        );
+
+        assert!(victim.join("keep").exists());
+        assert!(forged.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// The legacy settlement must not follow a sibling-looking path outside the sweep root.
+    #[test]
+    #[cfg(unix)]
+    fn legacy_settlement_refuses_a_sibling_marker_pointing_outside_the_root() {
+        let root = unique_temp_dir("legacy-settlement-outside-root");
+        let outside = unique_temp_dir("legacy-settlement-outside-victim");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("keep"), "do not delete").unwrap();
+        let target = root.join("victim");
+        std::os::unix::fs::symlink(&outside, &target).unwrap();
+        let sidecar = WorktreeSidecar {
+            canonical_source: root.join("source").to_string_lossy().into_owned(),
+            common_dir: root.join("source/.git").to_string_lossy().into_owned(),
+            worktree_path: target.to_string_lossy().into_owned(),
+            owner: "owner".into(),
+            run_id: "run".into(),
+            host: "host".into(),
+            lease: "/leases/dead".into(),
+        };
+        write_sidecar(&sidecar).unwrap();
+        let marker = PathBuf::from(sidecar_path(&sidecar.worktree_path));
+        let report = policy_selected_legacy_report(&root, &marker);
+        let canonical_root = super::canonicalize_lenient(&root.to_string_lossy()).unwrap();
+        super::settle_effective_entries(
+            &canonical_root,
+            &report,
+            &crate::host_git::HostGitWorktree::new(),
+            report.entries().iter(),
+        );
+
+        assert!(outside.join("keep").exists());
+        assert!(marker.exists());
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(outside).unwrap();
+    }
+
+    /// A root containing both marker generations is protected by both coexistence guards. This
+    /// catches either arm retiring its marker and leaving the other generation actionable.
+    #[test]
+    fn policy_selected_settlement_preserves_coexisting_legacy_and_v3_markers() {
+        let root = unique_temp_dir("policy-selected-coexistence");
+        fs::create_dir_all(&root).unwrap();
+        let target = root.join("both");
+        fs::create_dir(&target).unwrap();
+        let record = real_custody_record(
+            &root,
+            &target,
+            WorktreeCustodyStateV1::ProtectionPrepared {},
+            true,
+        );
+        let custody_marker = PathBuf::from(custody_record_path(&record.worktree.canonical_path));
+        fs::write(&custody_marker, record.encode_canonical().unwrap()).unwrap();
+        let legacy = WorktreeSidecar {
+            canonical_source: root.join("source").to_string_lossy().into_owned(),
+            common_dir: root.join("source/.git").to_string_lossy().into_owned(),
+            worktree_path: target.to_string_lossy().into_owned(),
+            owner: "owner".into(),
+            run_id: "run".into(),
+            host: "host".into(),
+            lease: "/leases/live".into(),
+        };
+        write_sidecar(&legacy).unwrap();
+        let legacy_marker = PathBuf::from(sidecar_path(&legacy.worktree_path));
+        fs::remove_dir_all(&target).unwrap();
+
+        let host_git = crate::host_git::HostGitWorktree::new();
+        let report = super::sweep_orphans_with_exact_absence(&root.to_string_lossy(), &host_git);
+        assert!(report.has_authoritative_scan());
+        assert_eq!(report.entries().len(), 2);
+        let canonical_root = super::canonicalize_lenient(&root.to_string_lossy()).unwrap();
+        super::settle_effective_entries(
+            &canonical_root,
+            &report,
+            &host_git,
+            report.entries().iter(),
+        );
+
+        assert!(
+            custody_marker.exists(),
+            "the V3 coexistence guard must retain custody"
+        );
+        assert!(
+            legacy_marker.exists(),
+            "the legacy coexistence guard must retain its sidecar"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// All boot callers must offload the synchronous sweep. The added async wrapper may schedule
+    /// a blocking task, but it must not originate a subprocess or an unrelated filesystem effect.
+    #[test]
+    fn boot_sweep_call_sites_are_async_and_the_wrapper_has_no_process_or_mutation_origin() {
+        let main = include_str!("../../../bin/a2a-bridge/src/main.rs");
+        let async_calls = main
+            .match_indices("bridge_worktree::sweep::sweep_orphans_async(")
+            .collect::<Vec<_>>();
+        assert_eq!(
+            async_calls.len(),
+            5,
+            "all five async boot paths must await the sweep offload"
+        );
+        assert_eq!(
+            main.match_indices("sweep_orphans(").count(),
+            0,
+            "main.rs must have no direct synchronous boot-sweep call"
+        );
+        for (offset, _) in async_calls {
+            let invocation = main[offset..]
+                .split_once(";")
+                .unwrap_or_else(|| panic!("async boot-sweep invocation is missing its terminator"))
+                .0;
+            assert!(
+                invocation.contains(".await"),
+                "every async boot-sweep invocation must await its wrapper"
+            );
+        }
+        let source = include_str!("sweep.rs");
+        let (_, wrapper) = source
+            .split_once("pub async fn sweep_orphans_async")
+            .unwrap_or_else(|| panic!("source audit is missing async sweep wrapper anchor"));
+        let (wrapper, _) = wrapper
+            .split_once("fn settle_effective_entries")
+            .unwrap_or_else(|| panic!("source audit is missing settlement-driver anchor"));
+        assert!(wrapper.contains("tokio::task::spawn_blocking"));
+        assert!(
+            wrapper.contains("tracing::warn!"),
+            "the non-fatal blocking-task JoinError must remain observable"
+        );
+        for forbidden in [
+            "std::process::Command",
+            "std::fs::rename",
+            "std::fs::remove_file",
+            "std::fs::remove_dir_all",
+            "remove_argv",
+            "prune_argv",
+        ] {
+            assert!(
+                !wrapper.contains(forbidden),
+                "async boot wiring must not originate {forbidden}"
+            );
+        }
     }
 }
