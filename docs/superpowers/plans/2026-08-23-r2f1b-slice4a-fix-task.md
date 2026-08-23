@@ -90,10 +90,24 @@ existing entries for the deliberate exclusions.
 Projection: ~25. The cap is a stop boundary, not a target — if the change cannot be made within it,
 stop and report rather than growing it.
 
-## Acceptance
+## Acceptance Criteria
 
 - `cargo fmt --all -- --check`, `cargo clippy --all-targets --all-features --locked -- -D warnings`,
   `cargo build --locked`, and the configured test command are all green.
 - The new regression test **fails on the base tree** (`8dfb899e`) and passes after the change.
 - The frozen control patch still applies and still reddens its named test.
 - No behaviour change outside the clock-identity forward.
+
+## Files
+
+- `bin/a2a-bridge/src/main.rs` — `ImplementAttemptTelemetry` and its `RichEventSinkFactory` impl.
+- `docs/superpowers/reviews/2026-08-23-r2f1b-slice4a-handoff.md` — the one-line disclosure.
+
+## Spec Refs
+
+- `docs/superpowers/plans/2026-08-23-r2f1b-slice4a-task.md` — the slice 4A spec this fix completes.
+- `docs/superpowers/plans/2026-08-23-r2f1b-slice4-decomposition.md` — plan of record.
+
+## Commit Message
+
+Forward the attempt clock through ImplementAttemptTelemetry
