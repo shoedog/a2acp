@@ -1,0 +1,16 @@
+diff --git a/crates/bridge-worktree/src/custody.rs b/crates/bridge-worktree/src/custody.rs
+--- a/crates/bridge-worktree/src/custody.rs
++++ b/crates/bridge-worktree/src/custody.rs
+@@ -712,8 +712,11 @@ pub fn is_custody_record_name(path: &str) -> bool {
+         return false;
+     };
+     // Scanner input is a directory-entry string; dots have no traversal semantics here.
+-    let name = custody_record_terminal_segment(stem);
++    let name = stem
++        .rsplit('/')
++        .next()
++        .expect("a string has a final segment");
+     !name.is_empty()
+         && !matches!(
+             ChildNameV2::from_bytes(name.as_bytes()),
+             Ok(name)
