@@ -23,6 +23,11 @@ mode = "read-only"
 args = ["-c", "sandbox_mode=\"read-only\"", "-c", "approval_policy=\"never\""]
 
 [[prompts]]
+id = "review-implement"
+file = "../prompts/review-implement.md"
+description = "independent reviewer of a committed code change"
+
+[[prompts]]
 id = "design-executability"
 file = "../prompts/design-executability.md"
 description = "design draft — executability lens"
@@ -151,6 +156,25 @@ id = "author-oc"
 id = "author"
 agent = "opencode"
 prompt = "author-artifact"
+inputs = []
+
+
+# review-sol / review-oc: head-to-head #2. Identical prompt, identical input, single node each.
+# The ONLY controlled variable is the agent.
+[[workflows]]
+id = "review-sol"
+[[workflows.nodes]]
+id = "review"
+agent = "codex"
+prompt = "review-implement"
+inputs = []
+
+[[workflows]]
+id = "review-oc"
+[[workflows.nodes]]
+id = "review"
+agent = "opencode"
+prompt = "review-implement"
 inputs = []
 
 # spec-review: rigor (completeness/ambiguity) + soundness (design) -> synth.
