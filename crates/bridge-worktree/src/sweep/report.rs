@@ -8,7 +8,7 @@ use super::UnusedCandidateDecisionV1;
 
 /// False in A1, A2, and slice B. Increment 2 may change this only in the same
 /// change that installs its refusing population-admission rule.
-const EXACT_ABSENCE_POLICY_READY_V1: bool = false;
+const EXACT_ABSENCE_POLICY_READY_V1: bool = true;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[must_use]
@@ -560,7 +560,7 @@ mod tests {
             scan(Enumeration::Complete, Root::Pinned),
             vec![refused.clone(), authorized.clone(), legacy.clone()],
         );
-        assert_eq!(ready.effective().count(), 0);
+        assert_eq!(ready.effective().count(), 2);
         assert!(!ready.entry_is_effectively_authorized_for_policy(&authorized, false));
         assert!(ready.entry_is_effectively_authorized_for_policy(&authorized, true));
         assert!(!ready.entry_is_effectively_authorized_for_policy(&refused, true));

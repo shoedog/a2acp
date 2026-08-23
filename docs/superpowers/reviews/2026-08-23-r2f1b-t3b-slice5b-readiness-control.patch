@@ -1,0 +1,15 @@
+diff --git a/crates/bridge-worktree/src/settle.rs b/crates/bridge-worktree/src/settle.rs
+index d9f3b37b..8c4d2862 100644
+--- a/crates/bridge-worktree/src/settle.rs
++++ b/crates/bridge-worktree/src/settle.rs
+@@ -325,9 +325,7 @@ pub fn reprove_under_window(
+         probe,
+     ) {
+         ReprovedExactAbsenceOutcomeV1::Authorized => Ok(ProvenSettlementV1 { window }),
+-        ReprovedExactAbsenceOutcomeV1::Refused(reason) => {
+-            Err(SettlementProofRefusalV1::Refused(reason.to_owned()))
+-        }
++        ReprovedExactAbsenceOutcomeV1::Refused(_reason) => Ok(ProvenSettlementV1 { window }),
+         ReprovedExactAbsenceOutcomeV1::CannotProve(reason) => {
+             Err(SettlementProofRefusalV1::CannotProve(reason.to_owned()))
+         }

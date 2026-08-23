@@ -734,24 +734,32 @@ mod tests {
         drop(window);
         remove_root(&root);
     }
-    /// Discriminates a settlement actor accepting the report's historical absence after a target
-    /// was recreated. The fresh scan must see the replacement and leave custody bytes untouched.
+    /// Readiness selects the historical report entry but never gives it authority to settle a
+    /// target recreated before the actor opens and re-proves it under its own window.
     #[test]
-    fn a_stale_report_is_never_authority_the_window_reproves() {
+    fn readiness_true_still_refuses_a_stale_entry() {
         let root = root("stale-report");
         let target = root.join("ownr-run7-abc");
         let record = write_authorized_record(&root, &target, 'b');
         let probe = current_probe(&record);
         let report = authoritative_report(&root, &probe);
+        let entry = report
+            .effective()
+            .next()
+            .expect("readiness must select the authoritative report entry");
         let before =
             fs::read(root.join(custody_record_name(&target.to_string_lossy()).unwrap())).unwrap();
         fs::create_dir(&target).unwrap();
 
-        let window = SettlementWindowV1::open(&root, &target.to_string_lossy()).unwrap();
-        let refusal =
-            reprove_under_window(window, &report, &report.entries()[0], &probe).unwrap_err();
+        let outcome = WorktreeCustodianV1::replace_unused_settled_with_probe(
+            &root,
+            &target.to_string_lossy(),
+            &report,
+            entry,
+            &probe,
+        );
 
-        assert!(matches!(refusal, SettlementProofRefusalV1::Refused(_)));
+        assert!(matches!(outcome, UnusedSettlementOutcomeV1::Refused(_)));
         assert_eq!(
             fs::read(root.join(custody_record_name(&target.to_string_lossy()).unwrap())).unwrap(),
             before
