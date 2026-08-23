@@ -4480,7 +4480,7 @@ mod tests {
             lease: "/leases/live".into(),
         };
         write_sidecar(&legacy).unwrap();
-        let legacy_marker = PathBuf::from(sidecar_path(&legacy.worktree_path));
+        let legacy_marker = fs::canonicalize(sidecar_path(&legacy.worktree_path)).unwrap();
         fs::remove_dir_all(&legacy_target).unwrap();
 
         let host_git = crate::host_git::HostGitWorktree::new();
@@ -4500,7 +4500,7 @@ mod tests {
         ));
         let (_, current_legacy) = super::scan_worktree_records(&root.to_string_lossy())
             .into_iter()
-            .find(|(path, _)| path == legacy_entry.record_path())
+            .find(|(path, _)| fs::canonicalize(path).unwrap() == legacy_marker)
             .expect("the legacy marker must remain available to the action-time re-proof");
         let super::ScannedWorktreeRecordV1::Legacy(current_legacy) = current_legacy else {
             panic!("the selected legacy marker must not change record generation")

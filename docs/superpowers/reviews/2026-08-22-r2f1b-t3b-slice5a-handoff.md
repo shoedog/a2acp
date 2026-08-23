@@ -5,6 +5,7 @@
 - Base: `3d654a0eaa2edcce06515158c526870273a3461f`.
 - Changed implementation files: `bin/a2a-bridge/src/main.rs`, `crates/bridge-worktree/src/custody_writer.rs`, `crates/bridge-worktree/src/settle.rs`, `crates/bridge-worktree/src/sweep.rs`, and `crates/bridge-worktree/src/sweep/report.rs`.
 - Review artifacts: this handoff and `2026-08-22-r2f1b-t3b-slice5a-wiring-control.patch`.
+- Repaired files: `crates/bridge-worktree/src/sweep.rs` (test-only) and this handoff.
 - Rust added-line count: 547 nonblank lines, below the 790-line cap (measured against the stated base).
 - Cargo manifests and `Cargo.lock` are unchanged.
 
@@ -28,6 +29,7 @@ No `UnusedSettled` schema, residual handling, terminal-state semantics, or froze
 
 - The report-policy test now covers a future-ready authorized legacy entry.
 - `policy_selected_settlement_retires_v3_and_legacy_unused_markers` proves a valid selected report retires both marker generations after re-proof.
+- Its expected legacy-marker path and action-time scan lookup are canonicalized before comparison, so a macOS symlinked temp directory cannot change the path spelling; the other `record_path()` tests already construct canonical expected paths.
 - `legacy_settlement_refuses_a_forged_non_sibling_marker` and `legacy_settlement_refuses_a_sibling_marker_pointing_outside_the_root` exercise the two legacy guards.
 - `policy_selected_settlement_preserves_coexisting_legacy_and_v3_markers` proves bidirectional coexistence protection.
 - `a_dangling_legacy_sidecar_refuses_v3_settlement` proves the V3 descriptor-relative guard treats a dangling legacy symlink as an occupied name and preserves the `ProtectionPrepared` marker.
@@ -50,6 +52,8 @@ Focused verification passed:
 - New slice-5A SHA-256: `03a5632bcd44f9bf1931b19521027a27061754ec01bb9aa1f54dbf939be0ccd4`
 
 The new control changes the legacy policy match from `Authorized` to `Refused`. It applies cleanly to the restored implementation and produces the expected red test `sweep::tests::policy_selected_settlement_retires_v3_and_legacy_unused_markers`, whose legacy-marker retirement assertion fails. The control was then reversed and the focused positive test passed.
+
+The test-only path-shape repair changes no line the slice-5A control depends on, so the control is carried unchanged and its SHA-256 remains `03a5632bcd44f9bf1931b19521027a27061754ec01bb9aa1f54dbf939be0ccd4`.
 
 - [ ] `cargo fmt --all -- --check` — **PENDING OPERATOR**
 - [ ] `CARGO_INCREMENTAL=0 cargo clippy --workspace --all-targets --locked -- -D warnings` — **PENDING OPERATOR**
