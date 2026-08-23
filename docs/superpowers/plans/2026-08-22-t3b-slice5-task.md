@@ -4,6 +4,8 @@ task-type: implement
 
 # T3b slice 5 — boot wiring, legacy markers, and readiness
 
+## Description
+
 The last T3b slice. It makes settlement **reachable in production**, extends it to the legacy marker
 population, and then — as a **separate commit** — flips the policy gate that has held this whole subsystem
 inert since slice B.
