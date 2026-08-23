@@ -18,14 +18,18 @@
 ## Frozen single-mutation control
 
 - Path: `docs/superpowers/reviews/2026-08-23-r2f1b-custody-separator-mutation-control.patch`.
-- SHA-256: `38b1fdc480766cf4a7becd11de5c4171c24e6968f81bb8ac094092c0c9a185ab`.
+- SHA-256: `d1da3c9fdaad62922ff360c63246a1b8319656bcc9631982317ddd470557d3d7`.
 - Logical mutation: revert the classifier's shared dual-separator terminal-segment extraction to slash-only extraction.
 - The patch applies cleanly and alters production code in `is_custody_record_name` only.
 - Designated red tests:
   - `custody_record_path_is_invisible_to_the_legacy_sidecar_scanner`
   - `custody_record_name_rejects_retirement_residue_across_separator_spellings`
   - `custody_record_name_rejects_empty_stem_across_separator_spellings`
-- Applied control result: tests 1–3 each exited 101 and failed on their required backslash row; test 4 exited 0, so the red population was exactly tests 1–3.
+- Applied control result: run against the FULL `bridge-worktree` suite, the red population is **four** —
+  tests 1–3 plus `sweep::checked_scan::tests::checked_scan_classifier_preserves_full_path_precedence_and_boundaries`,
+  which joined the guard set when its defect-encoding expectation was corrected. An earlier revision of this
+  line said "exactly tests 1–3"; that figure came from running the named tests under filters and was wrong.
+  A population claim derived from a filtered run is not a population claim.
 - The non-divergence guard intentionally stays green under the frozen control because it covers only rows whose old and repaired classifications are identical.
 - The control was reversed after the run and the candidate source was restored; `git apply --check` confirms it reapplies cleanly.
 
@@ -68,7 +72,7 @@ Counted lines: **84** against the 260 cap.
 
 ## Frozen control — CORRECTION to the candidate's population claim
 
-SHA-256 `38b1fdc480766cf4a7becd11de5c4171c24e6968f81bb8ac094092c0c9a185ab` — matches the handoff exactly and
+SHA-256 `d1da3c9fdaad62922ff360c63246a1b8319656bcc9631982317ddd470557d3d7` — matches the handoff exactly and
 applies cleanly to `d932e5a1`.
 
 The candidate's handoff states the red population "was exactly tests 1–3". **That is incomplete.** It was
@@ -119,3 +123,23 @@ This spec was folded from two independently authored specs given byte-identical 
 (effort xhigh, 454s) and `opencode-go/ox-alpha-free` (109s). Both verified their anchors; neither
 hallucinated. Both independently required a **multi-test** reddening control without being asked — the very
 criterion the operator got wrong in T3b slice 5B.
+
+
+## Control re-cut (SMELL-3)
+
+The original control reverted the call site and left `custody_record_terminal_segment` unreferenced. Under
+`cargo test` that is invisible, but under `clippy -D warnings` it fails with
+`error: function \`custody_record_terminal_segment\` is never used` — **before reaching any of the intended
+red tests**, so the control would appear to "work" for the wrong reason.
+
+Re-cut with the same single logical mutation (slash-only segmentation at the call site) plus a discard that
+keeps the helper referenced. Verified on `origin/main`:
+
+- `cargo test -p bridge-worktree` → **362 passed, 4 failed** — the same four-test red population as before.
+- `clippy -p bridge-worktree --all-targets -- -D warnings` → **exit 0**, zero dead_code findings.
+
+New SHA-256: `d1da3c9fdaad62922ff360c63246a1b8319656bcc9631982317ddd470557d3d7`.
+
+Found by an independent reviewer (`opencode-go/ox-alpha-free`) during a head-to-head code-review comparison.
+It was missed by the implement loop's two reviewers, by `gpt-5.6-sol`, and by the operator, all of whom
+verified the control with `cargo test` only.
