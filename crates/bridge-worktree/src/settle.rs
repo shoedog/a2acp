@@ -25,8 +25,8 @@ use crate::custody_lock::{
 };
 use crate::sweep::{
     reprove_exact_absence_entry, ExactAbsenceProbeV1, ExactAbsenceRecordAssessmentV1,
-    ExactAbsenceSweepEntryV1, ExactAbsenceSweepReportV1, ReprovedExactAbsenceOutcomeV1,
-    UnusedCandidateDecisionV1,
+    ExactAbsenceReproofSubjectV1, ExactAbsenceSweepEntryV1, ExactAbsenceSweepReportV1,
+    ReprovedExactAbsenceOutcomeV1, UnusedCandidateDecisionV1,
 };
 use bridge_core::execution_policy::WorktreeCustodyIdV1;
 use bridge_core::fs_custody::PinnedDirectoryV1;
@@ -319,7 +319,8 @@ pub fn reprove_under_window(
     }
     match reprove_exact_absence_entry(
         window.pinned_root().canonical_path(),
-        window.record(),
+        ExactAbsenceReproofSubjectV1::Custody(window.record()),
+        report,
         entry,
         probe,
     ) {
@@ -1008,6 +1009,42 @@ mod tests {
             }
             remove_root(&root);
         }
+    }
+
+    /// A dangling legacy marker still occupies its name. The V3 arm must check that name below
+    /// the held root descriptor, rather than resolving the symlink as absent and publishing the
+    /// permanently unclearable `UnusedSettled` state.
+    #[cfg(unix)]
+    #[test]
+    fn a_dangling_legacy_sidecar_refuses_v3_settlement() {
+        let root = root("dangling-legacy-sidecar");
+        let target = root.join("ownr-run7-abc");
+        let record = write_authorized_record(&root, &target, '2');
+        let probe = current_probe(&record);
+        let report = authoritative_report(&root, &probe);
+        let custody_marker = root.join(custody_record_name(&target.to_string_lossy()).unwrap());
+        let before = fs::read(&custody_marker).unwrap();
+        let legacy_marker = crate::provider_path::sidecar_path(&target.to_string_lossy());
+        std::os::unix::fs::symlink(root.join("missing-legacy-target"), &legacy_marker).unwrap();
+
+        let outcome = WorktreeCustodianV1::replace_unused_settled_with_probe(
+            &root,
+            &target.to_string_lossy(),
+            &report,
+            &report.entries()[0],
+            &probe,
+        );
+
+        assert!(matches!(outcome, UnusedSettlementOutcomeV1::Refused(_)));
+        assert_eq!(fs::read(custody_marker).unwrap(), before);
+        assert!(
+            fs::symlink_metadata(legacy_marker)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "a dangling legacy marker still protects this custody record"
+        );
+        remove_root(&root);
     }
 
     /// Mutation-proof: an in-flight materialization must not reuse the unused-candidate route

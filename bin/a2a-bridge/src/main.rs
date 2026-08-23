@@ -3523,11 +3523,12 @@ async fn implement_cmd(args: &[String]) -> Result<(), BoxError> {
             .map(|(runtime, owner)| (runtime.as_str(), owner.as_str())),
     );
     if let Some(wc) = &worktree_cfg {
-        bridge_worktree::sweep::sweep_orphans(
-            &wc.root,
-            &host,
+        bridge_worktree::sweep::sweep_orphans_async(
+            wc.root.clone(),
+            host.clone(),
             &bridge_core::liveness::FsLeaseProbe,
-        );
+        )
+        .await;
     }
     // Label-scoped END-sweep backstop (THIS run's `a2a.run` only, clean-exit/panic path ONLY — see
     // recover_orphans above for the SIGKILL path). Declared BEFORE `warm` → drops AFTER it (the warm
@@ -3894,11 +3895,12 @@ async fn implement_resume_cmd(
             .map(|(runtime, owner)| (runtime.as_str(), owner.as_str())),
     );
     if let Some(wc) = &worktree_cfg {
-        bridge_worktree::sweep::sweep_orphans(
-            &wc.root,
-            &host,
+        bridge_worktree::sweep::sweep_orphans_async(
+            wc.root.clone(),
+            host.clone(),
             &bridge_core::liveness::FsLeaseProbe,
-        );
+        )
+        .await;
     }
     let _run_guard = RunEndGuard {
         runtimes: run_guard_runtimes(
@@ -4519,11 +4521,12 @@ async fn run_workflow_cmd(args: &[String]) -> Result<(), BoxError> {
         instance_id: instance_id.clone(),
     };
     if let Some(wc) = &worktree_cfg {
-        bridge_worktree::sweep::sweep_orphans(
-            &wc.root,
-            &host,
+        bridge_worktree::sweep::sweep_orphans_async(
+            wc.root.clone(),
+            host.clone(),
             &bridge_core::liveness::FsLeaseProbe,
-        );
+        )
+        .await;
     }
     let _wt_run_guard = worktree_cfg.as_ref().and_then(|wc| {
         wc.enabled.then(|| {
@@ -8203,11 +8206,12 @@ async fn mcp_cmd(args: &[String]) -> Result<(), BoxError> {
     // mcp never runs [verify] (implement-only) — nothing to include here.
     recover_orphans(&snapshot, &config_path, &host, None);
     if let Some(wc) = &worktree_cfg {
-        bridge_worktree::sweep::sweep_orphans(
-            &wc.root,
-            &host,
+        bridge_worktree::sweep::sweep_orphans_async(
+            wc.root.clone(),
+            host.clone(),
             &bridge_core::liveness::FsLeaseProbe,
-        );
+        )
+        .await;
     }
     let registry = Arc::new(Registry::new_bound_observed(snapshot, spawn)?);
 
@@ -9888,11 +9892,12 @@ async fn main() -> Result<(), BoxError> {
                                          // serve never runs [verify] (implement-only) — nothing to include here.
     recover_orphans(&snapshot, &config_path, &host, None);
     if let Some(wc) = &worktree_cfg {
-        bridge_worktree::sweep::sweep_orphans(
-            &wc.root,
-            &host,
+        bridge_worktree::sweep::sweep_orphans_async(
+            wc.root.clone(),
+            host.clone(),
             &bridge_core::liveness::FsLeaseProbe,
-        );
+        )
+        .await;
     }
     // Fan-out source label (wire-observable in fan-out artifacts): the default
     // entry's `name` if set, else the default agent id, so a non-Kiro default
