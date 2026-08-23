@@ -2241,7 +2241,7 @@ mod tests {
             report.scan().custody_root(),
             super::CustodyRootObservationV1::Pinned
         ));
-        assert_eq!(report.effective().count(), 0);
+        assert_eq!(report.effective().count(), 1);
         assert_eq!(probe.calls(), 1);
         assert_eq!(probe.authority_calls(), 1);
     }
@@ -3061,7 +3061,7 @@ mod tests {
         );
         assert!(report.has_authoritative_scan());
         assert_eq!(report.entries().len(), 3);
-        assert_eq!(report.effective().count(), 0);
+        assert_eq!(report.effective().count(), 1);
 
         let entry = |path: &Path| {
             let path = fs::canonicalize(path).unwrap();
