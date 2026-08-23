@@ -55,9 +55,103 @@ The new control changes the legacy policy match from `Authorized` to `Refused`. 
 
 The test-only path-shape repair changes no line the slice-5A control depends on, so the control is carried unchanged and its SHA-256 remains `03a5632bcd44f9bf1931b19521027a27061754ec01bb9aa1f54dbf939be0ccd4`.
 
-- [ ] `cargo fmt --all -- --check` — **PENDING OPERATOR**
-- [ ] `CARGO_INCREMENTAL=0 cargo clippy --workspace --all-targets --locked -- -D warnings` — **PENDING OPERATOR**
-- [ ] `CARGO_INCREMENTAL=0 cargo test --workspace --locked --no-fail-fast` — **PENDING OPERATOR**
-- [ ] `CARGO_INCREMENTAL=0 cargo test -p bridge-worktree --locked --no-fail-fast` — **PENDING OPERATOR**
-- [ ] `cargo run -p a2a-bridge -- validate --repo-hygiene` at the implementation point — **PENDING OPERATOR**
-- [ ] `cargo run -p a2a-bridge -- validate --repo-hygiene` at the handoff point — **PENDING OPERATOR**
+- [x] `cargo fmt --all -- --check` — **see operator evidence below**
+- [x] `CARGO_INCREMENTAL=0 cargo clippy --workspace --all-targets --locked -- -D warnings` — **see operator evidence below**
+- [x] `CARGO_INCREMENTAL=0 cargo test --workspace --locked --no-fail-fast` — **see operator evidence below**
+- [x] `CARGO_INCREMENTAL=0 cargo test -p bridge-worktree --locked --no-fail-fast` — **see operator evidence below**
+- [x] `cargo run -p a2a-bridge -- validate --repo-hygiene` at the implementation point — **see operator evidence below**
+- [x] `cargo run -p a2a-bridge -- validate --repo-hygiene` at the handoff point — **see operator evidence below**
+
+
+---
+
+# Operator evidence
+
+Recorded at candidate `24d671c4` (test-only repair) over `275ca88e` (slice 5A), parent `origin/main` =
+`3d654a0e`. Run from a checkout under the trusted cwd root. Exit status and FAILED counts are
+authoritative; per-binary `test result:` lines are not summed.
+
+## Gates
+
+| Gate | Result |
+|---|---|
+| `cargo fmt --all -- --check` | **exit 0** |
+| `clippy --workspace --all-targets --locked -- -D warnings` | **exit 0** |
+| `cargo test -p bridge-worktree --locked --no-fail-fast` | **exit 0, 363 passed / 0 failed** |
+| `validate --repo-hygiene` (both points) | **exit 0** |
+| `cargo test --workspace --locked --no-fail-fast` | exit 101 — population **identical to base**, see below |
+
+## The workspace gate, and a false alarm the operator raised and then refuted
+
+A first workspace run on the candidate showed **29** distinct failures against base's **11**, including
+`reaper::*`, `wrapper_*`, `submit_flushes_locator_*` and credential/oauth tests. Two hypotheses were
+tested and **both refuted**:
+
+1. **Operator `~/.zshenv` change** (provider keys added earlier that day) — refuted: the base control ran
+   *after* that change, so the environment was constant between the two runs.
+2. **A real ordering regression from the async conversion** — plausible, because 5A rewrites five
+   `main.rs` call sites from sync `sweep_orphans` to awaited `sweep_orphans_async`, and several failures
+   assert flush-before-block ordering. Refuted by isolation: `wrapper_propagates_bridge_stdin_eof_to_child`,
+   `submit_flushes_locator_to_a_pipe_before_a_blocked_network_response`,
+   `fresh_claude_oauth_does_not_block_adapter_spawn` and
+   `credential_shaped_process_error_is_redacted_and_bounded_in_text_and_json` all pass **identically on
+   base and candidate** when run alone.
+
+The cause was **transient load**: the first run began immediately after the implement pipeline finished.
+Re-run on a verified-idle machine, the candidate's population is **11 distinct failures — exactly base's,
+with zero failures present on the candidate that base does not also have.**
+
+Those 11 are the known pre-existing `bin/a2a-bridge` host system-integration failures. Reported, not
+re-baselined.
+
+## Same-environment base control
+
+`bridge-worktree` at `3d654a0e`: 362 passed. Candidate: **363 passed / 0 failed**. Delta **+1** — the
+repaired test.
+
+## Frozen control — RUN
+
+- SHA-256 recomputed: `03a5632bcd44f9bf1931b19521027a27061754ec01bb9aa1f54dbf939be0ccd4` — **matches the
+  recorded slice-5A value**. (The handoff also carries slice 4's `cb7667c9…`; they are distinct and the
+  operator initially compared against the wrong one.)
+- Applies cleanly to `24d671c4`.
+- Result: **362 passed / 1 failed**, the single reddened test being
+  `sweep::tests::policy_selected_settlement_retires_v3_and_legacy_unused_markers`. No other test moved.
+- Tree restored after the run.
+
+## Invariants
+
+| Invariant | Verified |
+|---|---|
+| `EXACT_ABSENCE_POLICY_READY_V1` | still **`false`** — 5A does not flip the gate |
+| Boot wiring | `sweep_orphans_async` × **5** in `main.rs`, **0** remaining sync calls |
+| Offload shape | `spawn_blocking(move \|\| sweep_orphans(...)).await`; no `async_trait`, no new trait |
+| `LEGAL_CUSTODY_TRANSITIONS_V1` | byte-identical `46cf2e4caa41ff6e`, 10 rows |
+| Counted lines | **547** / 790 |
+
+## The repair, and why it was needed
+
+The pre-repair candidate failed exactly one test on macOS while passing verify in the container. Cause:
+`/var` is a symlink to `private/var`, so `env::temp_dir()` yields `/var/folders/…` while canonicalisation
+yields `/private/var/folders/…`. The test compared an un-canonicalised expected path against the sweep's
+canonicalised `record_path()`. In the container `/tmp` is not a symlink, so the two coincide.
+
+**CI would not have caught this**: the main test job is `ubuntu-latest` and the macOS job covers only
+`bridge-store`. Ubuntu and the verify container agree; macOS was ungated.
+
+The repair is **test-only** — both hunks sit inside `mod tests` (which begins at line 865; hunks at 4483
+and 4503) — and canonicalises both sides rather than weakening the assertion to a filename check.
+Production canonicalisation is correct and was left untouched.
+
+## Review disposition
+
+The pipeline printed `review: inconclusive — no actionable signal`. The review body underneath reads
+**`VERDICT: APPROVE`** from both reviewers, with no BLOCKER and no MAJOR and a full acceptance-criteria
+walkthrough. That was a harness parsing failure, not a review outcome. The repair itself converged in one
+attempt with verify PASS and an explicit APPROVE.
+
+One surviving **MINOR/SMELL**: asymmetric proof-window timing between the legacy and V3 settlement paths.
+Correctly tagged — no concrete input produces a wrong settlement, exploiting it would require an external
+actor to delete-and-byte-identically-recreate a sidecar inside a narrow unlocked window, and the legacy
+path previously had *no* byte re-proof at all, so this is an improvement rather than a regression. Carried,
+not blocking.
