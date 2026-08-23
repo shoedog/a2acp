@@ -26,6 +26,7 @@
 - The detached durable/attempt factory wrapper forwards that exact clock identity. Legacy contexts with no attempt clock retain a system-clock fallback.
 - Offline `run-workflow` retains its telemetry factory's clock for prefinal/work, finalization, and end-to-end reporting, matching the cleanup and activity epoch.
 - Cleanup interval accounting now stores monotonic millisecond offsets from the attempt clock while preserving union semantics.
+- The production `ImplementAttemptTelemetry` is a converged `RichEventSinkFactory` wrapper: it forwards its underlying factory's exact clock identity.
 - Deliberate scope: `run_agent_preflight_uncached` and `run_node` retain paired `Instant` reads only for turn-local elapsed/TTFT diagnostics. Those durations are never compared across components or against an attempt epoch or policy bound, so threading them would expand this slice beyond its named scheduler, cleanup, and reporting consumers. The pre-existing direct `workflow_history::DirectAttemptBarrier` surface likewise remains excluded: its adjacent self-created recorder and terminal-report epochs are not reached by this slice and should be converged in a follow-up.
 
 ## Test-clock decision

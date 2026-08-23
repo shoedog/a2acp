@@ -2751,6 +2751,10 @@ impl bridge_core::ports::RichEventSinkFactory for ImplementAttemptTelemetry {
     fn make(&self, node: &bridge_core::ids::NodeId) -> Arc<dyn bridge_core::ports::RichEventSink> {
         bridge_core::ports::RichEventSinkFactory::make(&self.factory, node)
     }
+
+    fn monotonic_clock(&self) -> Option<Arc<dyn bridge_core::attempt_activity::MonotonicClock>> {
+        Some(self.factory.clock())
+    }
 }
 
 struct ProdEffects<'a> {
@@ -10274,6 +10278,16 @@ async fn main() -> Result<(), BoxError> {
 mod cli_tests {
     use super::*;
     use crate::turn::TurnRunner;
+    use bridge_core::ports::RichEventSinkFactory as _;
+
+    #[test]
+    fn implement_attempt_telemetry_forwards_its_factory_clock() {
+        let telemetry = ImplementAttemptTelemetry::new("implement-clock-identity");
+        assert!(Arc::ptr_eq(
+            &telemetry.factory.clock(),
+            &telemetry.monotonic_clock().unwrap(),
+        ));
+    }
 
     #[test]
     fn run_workflow_reporting_and_rich_sink_share_attempt_clock() {
