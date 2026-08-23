@@ -1030,10 +1030,7 @@ mod tests {
         );
         assert_eq!(classify(".custody.v1.json"), None);
         assert_eq!(classify("dir/.custody.v1.json"), None);
-        assert_eq!(
-            classify(r"dir\.custody.v1.json"),
-            Some(CheckedScanRecordKindV1::Custody)
-        );
+        assert_eq!(classify(r"dir\.custody.v1.json"), None);
     }
 
     // Evidence: characterization; catches malformed-legacy retention or lost custody refusals.

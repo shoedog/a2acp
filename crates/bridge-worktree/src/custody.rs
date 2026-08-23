@@ -699,6 +699,13 @@ pub fn custody_record_path(worktree_path: &str) -> String {
     format!("{worktree_path}{CUSTODY_RECORD_SUFFIX}")
 }
 
+/// A literal backslash in a POSIX display path is classified as a separator.
+fn custody_record_terminal_segment(stem: &str) -> &str {
+    stem.rsplit(['/', '\\'])
+        .next()
+        .expect("a string has a final segment")
+}
+
 /// Whether `path` names a V3 custody record with a non-empty target stem.
 #[must_use]
 pub fn is_custody_record_name(path: &str) -> bool {
@@ -706,12 +713,8 @@ pub fn is_custody_record_name(path: &str) -> bool {
         return false;
     };
     // Scanner input is a directory-entry string; dots have no traversal semantics here.
-    let name = stem
-        .rsplit('/')
-        .next()
-        .expect("a string has a final segment");
-    !stem.is_empty()
-        && !stem.ends_with('/')
+    let name = custody_record_terminal_segment(stem);
+    !name.is_empty()
         && !matches!(
             ChildNameV2::from_bytes(name.as_bytes()),
             Ok(name)
@@ -2036,11 +2039,18 @@ mod tests {
         assert_eq!(CUSTODY_RECORD_SUFFIX, ".custody.v1.json");
         assert!(!path.ends_with(".meta.json"));
         assert!(is_custody_record_name(&path));
+        assert!(is_custody_record_name(
+            r"\root\ownr-run7-abc.custody.v1.json"
+        ));
         let target = ChildNameV2::from_bytes(b"ownr-run7-abc.custody.v1.json").unwrap();
         let residue =
             ChildNameV2::reserved(ReservedNameNamespaceV2::RetirementCapture, &target).unwrap();
         assert!(
             !is_custody_record_name(&format!("/root/{}", residue.as_os_str().to_string_lossy())),
+            "a retirement residue must never be read as a custody record"
+        );
+        assert!(
+            !is_custody_record_name(&format!(r"\root\{}", residue.as_os_str().to_string_lossy())),
             "a retirement residue must never be read as a custody record"
         );
         let staging = ChildNameV2::reserved(ReservedNameNamespaceV2::Staging, &target).unwrap();
@@ -2049,15 +2059,87 @@ mod tests {
             "only retirement residue is excluded from custody record classification"
         );
         assert!(
+            is_custody_record_name(&format!(r"\root\{}", staging.as_os_str().to_string_lossy())),
+            "only retirement residue is excluded from custody record classification"
+        );
+        assert!(
             !is_custody_record_name("/root/.custody.v1.json"),
-            "a single-dot basename has an empty final segment, rejected by the trailing-slash stem guard"
+            "a single-dot basename has an empty terminal segment"
+        );
+        assert!(
+            !is_custody_record_name(r"\root\.custody.v1.json"),
+            "a single-dot basename has an empty terminal segment"
         );
         assert!(
             is_custody_record_name("/root/..custody.v1.json"),
             "a dot-dot stem is a custody record name, not path traversal"
         );
+        assert!(
+            is_custody_record_name(r"\root\..custody.v1.json"),
+            "a dot-dot stem is a custody record name, not path traversal"
+        );
         assert!(!is_custody_record_name("/root/ownr-run7-abc.meta.json"));
+        assert!(!is_custody_record_name(r"\root\ownr-run7-abc.meta.json"));
         assert!(!is_custody_record_name("/root/custody.v1.json"));
+        assert!(!is_custody_record_name(r"\root\custody.v1.json"));
+    }
+
+    #[test]
+    fn custody_record_name_rejects_retirement_residue_across_separator_spellings() {
+        let target = ChildNameV2::from_bytes(b"record.custody.v1.json").unwrap();
+        let residue =
+            ChildNameV2::reserved(ReservedNameNamespaceV2::RetirementCapture, &target).unwrap();
+        let residue = residue.as_os_str().to_string_lossy();
+
+        for path in [format!("/root/{residue}"), format!(r"\root\{residue}")] {
+            assert!(
+                !is_custody_record_name(&path),
+                "a retirement residue must never be classified as a custody record: {path}"
+            );
+        }
+    }
+
+    #[test]
+    fn custody_record_name_rejects_empty_stem_across_separator_spellings() {
+        for path in ["/root/.custody.v1.json", r"\root\.custody.v1.json"] {
+            assert!(
+                !is_custody_record_name(path),
+                "an empty terminal stem must not be classified as a custody record: {path}"
+            );
+        }
+    }
+
+    #[test]
+    fn custody_record_name_is_separator_neutral_for_nondivergent_rows() {
+        let target = ChildNameV2::from_bytes(b"record.custody.v1.json").unwrap();
+        let staging = ChildNameV2::reserved(ReservedNameNamespaceV2::Staging, &target).unwrap();
+        let staging = staging.as_os_str().to_string_lossy();
+
+        for (slash, backslash, expected) in [
+            (
+                "/root/record.custody.v1.json".to_string(),
+                r"\root\record.custody.v1.json".to_string(),
+                true,
+            ),
+            (
+                format!("/root/{staging}"),
+                format!(r"\root\{staging}"),
+                true,
+            ),
+            (
+                "/root/..custody.v1.json".to_string(),
+                r"\root\..custody.v1.json".to_string(),
+                true,
+            ),
+            (
+                "/root/record.meta.json".to_string(),
+                r"\root\record.meta.json".to_string(),
+                false,
+            ),
+        ] {
+            assert_eq!(is_custody_record_name(&slash), expected, "{slash}");
+            assert_eq!(is_custody_record_name(&backslash), expected, "{backslash}");
+        }
     }
 
     // -------------------------------------------------------------------------------------
