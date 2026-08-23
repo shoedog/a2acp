@@ -639,6 +639,14 @@ prompt_file = "../prompts/smoke-read.md"
 inputs = []
 
 [[workflows]]
+id = "smoke-opencode"
+[[workflows.nodes]]
+id = "go"
+agent = "opencode"
+prompt_file = "../prompts/opencode-custody-probe.md"
+inputs = []
+
+[[workflows]]
 id = "smoke-codex"
 [[workflows.nodes]]
 id = "go"
