@@ -1532,7 +1532,7 @@ pub fn scan_implement_root(root: &Path, notes: &mut Vec<String>) -> Vec<ReportIt
     items
 }
 
-/// The two record suffixes a worktree root can carry, and what each says about its sibling.
+/// The recognized custody records and residues a worktree root can carry, and what each says about its sibling.
 ///
 /// Added in R2f1b slice 2b2 because V3 publishes `<name>.custody.v1.json` INSTEAD OF
 /// `<name>.meta.json`: a report that knew only the legacy suffix would show every V3 record and
@@ -1549,6 +1549,9 @@ enum WorktreeRecordKindV1 {
     /// `<name>.custody.v1.json.staging-<hex>` — a quarantined staged publication (2b2's residue
     /// policy). Recovery-owned, never a checkout.
     CustodyStagingResidue,
+    /// `.a2a-v2-rtc-<name>.custody.v1.json` — a custody marker captured by a failed retirement.
+    /// Recovery-owned and deliberately distinct from unclassified debris.
+    CustodyRetirementResidue,
 }
 
 impl WorktreeRecordKindV1 {
@@ -1559,6 +1562,8 @@ impl WorktreeRecordKindV1 {
             Some(Self::CustodyRecord)
         } else if bridge_worktree::custody_writer::is_staged_custody_residue(name) {
             Some(Self::CustodyStagingResidue)
+        } else if is_custody_retirement_residue(name) {
+            Some(Self::CustodyRetirementResidue)
         } else {
             None
         }
@@ -1571,8 +1576,25 @@ impl WorktreeRecordKindV1 {
             Self::CustodyStagingResidue => {
                 "R2f1b staged custody publication (quarantined; recovery-owned)"
             }
+            Self::CustodyRetirementResidue => {
+                "R2f1b retired custody marker residue (captured; recovery-owned)"
+            }
         }
     }
+}
+
+fn is_custody_retirement_residue(name: &str) -> bool {
+    let base = name.rsplit_once('/').map_or(name, |(_, base)| base);
+    let Ok(capture) = bridge_core::fs_custody::ChildNameV2::from_bytes(base.as_bytes()) else {
+        return false;
+    };
+    let Ok(marker) = bridge_core::fs_custody::ChildNameV2::parse_reserved(
+        bridge_core::fs_custody::ReservedNameNamespaceV2::RetirementCapture,
+        &capture,
+    ) else {
+        return false;
+    };
+    bridge_worktree::custody::is_custody_record_name(&marker.as_os_str().to_string_lossy())
 }
 
 /// Record one holder answer for a path, combining it with any answer already there through the
@@ -1657,7 +1679,9 @@ pub fn scan_worktree_root(root: &Path, notes: &mut Vec<String>) -> Vec<ReportIte
                 }
                 record_holder(&mut sidecar_leases, display_path(entry), state);
             }
-            Some(WorktreeRecordKindV1::CustodyStagingResidue) | None => {}
+            Some(WorktreeRecordKindV1::CustodyStagingResidue)
+            | Some(WorktreeRecordKindV1::CustodyRetirementResidue)
+            | None => {}
         }
     }
     for entry in entries {
@@ -3932,6 +3956,41 @@ mod tests {
             !items.iter().any(|i| i.class == PayloadClass::Unclassified),
             "nothing in a V3 root may surface as unclassified: {items:#?}"
         );
+    }
+
+    /// A captured retirement marker is durable recovery evidence, not unclassified debris.
+    /// Discriminates a report that recognizes only public custody names and loses the marker
+    /// after the primitive moves it into the reserved retirement-capture namespace.
+    #[test]
+    fn a_captured_custody_marker_is_reported_as_distinct_evidence() {
+        let td = tempfile::tempdir().unwrap();
+        let root = td.path().join("wt-root");
+        std::fs::create_dir_all(&root).unwrap();
+        let marker =
+            bridge_core::fs_custody::ChildNameV2::from_bytes(b"ownr-run7-abc.custody.v1.json")
+                .unwrap();
+        let capture = bridge_core::fs_custody::ChildNameV2::reserved(
+            bridge_core::fs_custody::ReservedNameNamespaceV2::RetirementCapture,
+            &marker,
+        )
+        .unwrap();
+        std::fs::write(root.join(capture.as_os_str()), b"captured marker").unwrap();
+
+        let mut notes = Vec::new();
+        let items = scan_worktree_root(&root, &mut notes);
+        let residue = items
+            .iter()
+            .find(|item| item.path.ends_with(capture.as_os_str().to_str().unwrap()))
+            .expect("the retirement capture must be reported");
+
+        assert_eq!(residue.class, PayloadClass::Evidence);
+        assert_eq!(
+            residue.note.as_deref(),
+            Some("R2f1b retired custody marker residue (captured; recovery-owned)")
+        );
+        assert!(!items
+            .iter()
+            .any(|item| item.class == PayloadClass::Unclassified));
     }
 
     /// A preserved record still HOLDS: it awaits R2f2 disposition, so nothing may treat its

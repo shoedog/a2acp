@@ -358,11 +358,13 @@ impl WorktreeCustodyStateKindV1 {
             | Self::RecoveredLive => CustodySweepDispositionV1::Recover,
             Self::PreservationPrepared | Self::Preserved => CustodySweepDispositionV1::Preserved,
             Self::PreservationUnknown => CustodySweepDispositionV1::Unknown,
-            // `UnusedSettled` permits removal of the *marker* only, after exact absence
-            // and registration proof (§5.2); `Removed`'s record is a tombstone whose
-            // checkout is already gone. Neither is a checkout removal, and slice 2a acts
-            // on neither.
-            Self::UnusedSettled | Self::Removed => CustodySweepDispositionV1::MarkerOnly,
+            // `UnusedSettled` is a durable, operator-visible stranded-marker category. It
+            // permits removal of the *marker* only after a fresh exact-absence proof; no later
+            // sweep can re-prove it because the settled record forbids the claim containing the
+            // source authority. `Removed` is a tombstone whose checkout is already gone.
+            // Neither is a checkout removal, and slice 2a acts on neither.
+            Self::UnusedSettled => CustodySweepDispositionV1::StrandedUnusedSettled,
+            Self::Removed => CustodySweepDispositionV1::MarkerOnly,
         }
     }
 }
@@ -426,6 +428,10 @@ pub enum CustodySweepDispositionV1 {
     /// Unknown disposition — including every corrupt, missing, mismatched, symlinked, or
     /// multiply-linked record. Unknown is never deleted.
     Unknown,
+    /// A durable `UnusedSettled` marker remains after its transition but before retirement.
+    /// It is intentionally distinct from a `Removed` tombstone so an operator can find this
+    /// fail-closed residue without inferring it from a generic marker-only classification.
+    StrandedUnusedSettled,
     /// Marker metadata only; never a provider or git removal.
     MarkerOnly,
     /// A custody guard refused the record (e.g. it points outside the sweep root).
@@ -438,9 +444,12 @@ impl CustodySweepDispositionV1 {
     #[must_use]
     pub fn authorizes_checkout_removal(self) -> bool {
         match self {
-            Self::Recover | Self::Preserved | Self::Unknown | Self::MarkerOnly | Self::Refused => {
-                false
-            }
+            Self::Recover
+            | Self::Preserved
+            | Self::Unknown
+            | Self::StrandedUnusedSettled
+            | Self::MarkerOnly
+            | Self::Refused => false,
         }
     }
 
@@ -450,6 +459,7 @@ impl CustodySweepDispositionV1 {
             Self::Recover => "recovered",
             Self::Preserved => "preserved",
             Self::Unknown => "unknown",
+            Self::StrandedUnusedSettled => "stranded-unused-settled",
             Self::MarkerOnly => "marker-only",
             Self::Refused => "refused",
         }
@@ -1940,7 +1950,10 @@ mod tests {
         use WorktreeCustodyStateKindV1 as K;
         let expected = [
             (K::ProtectionPrepared, CustodySweepDispositionV1::Recover),
-            (K::UnusedSettled, CustodySweepDispositionV1::MarkerOnly),
+            (
+                K::UnusedSettled,
+                CustodySweepDispositionV1::StrandedUnusedSettled,
+            ),
             (K::Materializing, CustodySweepDispositionV1::Recover),
             (K::LiveProtected, CustodySweepDispositionV1::Recover),
             (

@@ -26,8 +26,9 @@ use bridge_core::liveness::flock_unlock;
 const OWNER_ADMISSION_LOCK_NAME: &str = "owner-admission.lock";
 const AUTHORITY_STATE_LOCK_NAME: &str = "authority-state.lock";
 
-// Test-only fault injection for `release`: arms the NEXT call whose `label` matches to report a
-// synthetic failure instead of performing the real `flock`. Thread-local because these guards'
+// Test-only fault injection for `release`: arms the NEXT call whose `label` matches to release the
+// real descriptor, then report a synthetic failure. That ordering keeps the test panic from retaining
+// the process-local lock. Thread-local because these guards'
 // drops always run on the arming test's own thread; matching by label (rather than "the very next
 // call regardless of label") lets a test target one specific lock family in a guard that releases
 // more than one (`OwnerAdmissionLock` releases its nested authority lock before its own).
@@ -57,6 +58,8 @@ fn release(file: &File, label: &'static str) {
             }
         });
         if armed {
+            // The forced report panics in debug builds; release the real test descriptor first.
+            flock_unlock(file, label);
             bridge_core::liveness::report_unlock_failure(
                 label,
                 std::io::Error::from_raw_os_error(libc::EBADF),

@@ -7844,6 +7844,9 @@ image = "reader-current"
         )
         .unwrap();
         let archive = test_wide_package_archive(DIRECTORY_COUNT);
+        // This intentionally wide stress fixture competes with the full binary suite's CPU-bound
+        // tests; its deadline must measure archive work, not unrelated parallel scheduling.
+        let stress_deadline = || std::time::Instant::now() + Duration::from_secs(120);
         let package = locked_package_for_test("node_modules/wide-package");
         let permissive_limits = ResolutionLimits {
             timeout_secs: 30,
@@ -7851,13 +7854,8 @@ image = "reader-current"
             max_unpacked_bytes: 1024 * 1024,
             max_files: 1024,
         };
-        let plan = package_archive_plan(
-            &archive,
-            &package,
-            test_archive_deadline(),
-            &permissive_limits,
-        )
-        .unwrap();
+        let plan = package_archive_plan(&archive, &package, stress_deadline(), &permissive_limits)
+            .unwrap();
         let mut state = TreeMaterializationState::new(&tree, &permissive_limits).unwrap();
         let layout = package_archive_layout(&package, &plan).unwrap();
         let limits = ResolutionLimits {
@@ -7869,14 +7867,8 @@ image = "reader-current"
         };
         reserve_complete_package_tree([(&package, plan.as_slice())], &mut state, &limits).unwrap();
 
-        materialize_package_archive(
-            &archive,
-            &package,
-            &plan,
-            &mut state,
-            test_archive_deadline(),
-        )
-        .unwrap();
+        materialize_package_archive(&archive, &package, &plan, &mut state, stress_deadline())
+            .unwrap();
 
         let package_root = tree.canonical_path().join("node_modules/wide-package");
         assert_eq!(
