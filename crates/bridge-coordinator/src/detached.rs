@@ -444,7 +444,7 @@ struct TerminalSummaryBarrierInner {
     task_store: Arc<dyn TaskStore>,
     task: TaskId,
     identity: bridge_core::ids::AttemptIdentity,
-    started: std::time::Instant,
+    clock: Arc<dyn bridge_core::attempt_activity::MonotonicClock>,
     queue_ms: u64,
     completion: WorkflowCompletionGuard,
     attempt_telemetry: Arc<bridge_core::attempt_activity::AttemptTelemetrySinkFactory>,
@@ -934,6 +934,12 @@ impl RichEventSinkFactory for DetachedCompositeRichSinkFactory {
             attempt: self.attempt.make(node),
         })
     }
+
+    fn monotonic_clock(&self) -> Option<Arc<dyn bridge_core::attempt_activity::MonotonicClock>> {
+        self.attempt
+            .monotonic_clock()
+            .or_else(|| self.durable.monotonic_clock())
+    }
 }
 /// Drop guard: if the runner exits without finalizing (early return, error, or
 /// **panic**), finalize `Failed` (via `finalize_detached`) and remove the cancel token.
@@ -1088,9 +1094,20 @@ mod sink_tests {
             std::time::Instant::now(),
             0,
         );
-        let rich = barrier
-            .rich_sink_factory()
-            .make(&bridge_core::ids::NodeId::parse("only").unwrap());
+        assert!(Arc::ptr_eq(
+            &barrier.inner.clock,
+            &barrier.inner.attempt_telemetry.clock(),
+        ));
+        let attempt = barrier.rich_sink_factory();
+        let production = DetachedCompositeRichSinkFactory {
+            durable: attempt.clone(),
+            attempt,
+        };
+        assert!(Arc::ptr_eq(
+            &barrier.inner.clock,
+            &production.monotonic_clock().unwrap(),
+        ));
+        let rich = production.make(&bridge_core::ids::NodeId::parse("only").unwrap());
         let sink = rich
             .terminal_evidence_for_turn(EvidenceCapability::V1, 1, "bridge-session", "bridge-turn")
             .unwrap()
@@ -2933,8 +2950,7 @@ impl TerminalSummaryBarrier {
     ) -> bridge_core::workflow_history::AttemptTerminal {
         use bridge_core::workflow_history::{LedgerUnavailableReason as R, NodeCounts};
 
-        let prefinal_ms =
-            u64::try_from(self.inner.started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        let prefinal_ms = self.inner.clock.elapsed_ms();
         let queue_ms = self.inner.queue_ms.min(prefinal_ms);
         let cleanup_ms = cleanup_ms.min(prefinal_ms.saturating_sub(queue_ms));
         let work_ms = prefinal_ms
@@ -3031,8 +3047,8 @@ impl TerminalSummaryBarrier {
             && node_counts_complete
             && trigger_complete
             && activity_complete;
-        let mut terminal = measured_workflow_terminal(
-            self.inner.started,
+        let mut terminal = measured_workflow_terminal_from_elapsed(
+            self.inner.clock.elapsed_ms(),
             work_ms,
             bridge_core::task_store::system_wall_now_ms(),
             outcome,
@@ -3161,9 +3177,12 @@ pub fn workflow_terminal_summary_barrier(
     queue_ms: u64,
 ) -> TerminalSummaryBarrier {
     let completion = WorkflowCompletionGuard::new(observer, identity.clone(), workflow);
+    let clock: Arc<dyn bridge_core::attempt_activity::MonotonicClock> =
+        Arc::new(bridge_core::attempt_activity::SystemMonotonicClock::starting_at(started));
     let attempt_telemetry = Arc::new(
-        bridge_core::attempt_activity::AttemptTelemetrySinkFactory::new(
+        bridge_core::attempt_activity::AttemptTelemetrySinkFactory::with_clock(
             identity.attempt_id.as_str(),
+            clock.clone(),
         ),
     );
     TerminalSummaryBarrier {
@@ -3173,7 +3192,7 @@ pub fn workflow_terminal_summary_barrier(
             task_store,
             task,
             identity,
-            started,
+            clock,
             queue_ms,
             completion,
             attempt_telemetry,
@@ -3398,6 +3417,7 @@ fn apply_workflow_terminal_evidence(
     }
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn measured_workflow_terminal(
     started: std::time::Instant,
@@ -3411,6 +3431,31 @@ pub(crate) fn measured_workflow_terminal(
     cleanup_disposition: &str,
 ) -> bridge_core::workflow_history::AttemptTerminal {
     let end_to_end_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    measured_workflow_terminal_from_elapsed(
+        end_to_end_ms,
+        work_ms,
+        completed_ms,
+        outcome,
+        node_counts,
+        telemetry_complete,
+        queue_ms,
+        cleanup_ms,
+        cleanup_disposition,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn measured_workflow_terminal_from_elapsed(
+    end_to_end_ms: u64,
+    work_ms: u64,
+    completed_ms: i64,
+    outcome: &str,
+    node_counts: bridge_core::workflow_history::NodeCounts,
+    telemetry_complete: bool,
+    queue_ms: u64,
+    cleanup_ms: u64,
+    cleanup_disposition: &str,
+) -> bridge_core::workflow_history::AttemptTerminal {
     let queue_ms = queue_ms.min(end_to_end_ms);
     let after_queue = end_to_end_ms.saturating_sub(queue_ms);
     let cleanup_ms = cleanup_ms.min(after_queue);

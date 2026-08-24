@@ -143,17 +143,65 @@ pub trait MonotonicClock: Send + Sync {
     fn elapsed_ms(&self) -> u64;
 }
 
+impl<T> MonotonicClock for std::sync::Arc<T>
+where
+    T: MonotonicClock + ?Sized,
+{
+    fn elapsed_ms(&self) -> u64 {
+        (**self).elapsed_ms()
+    }
+}
+
 pub struct SystemMonotonicClock(std::time::Instant);
 
 impl SystemMonotonicClock {
     pub fn start() -> Self {
         Self(std::time::Instant::now())
     }
+
+    /// Preserve an attempt epoch captured before its telemetry owner was assembled.
+    pub fn starting_at(started: std::time::Instant) -> Self {
+        Self(started)
+    }
 }
 
 impl MonotonicClock for SystemMonotonicClock {
     fn elapsed_ms(&self) -> u64 {
         u64::try_from(self.0.elapsed().as_millis()).unwrap_or(u64::MAX)
+    }
+}
+
+/// One synchronous observation of pure attempt schedule math. Constructing or
+/// observing a schedule never arms a timer or performs cancellation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AttemptScheduleObservationV1 {
+    pub elapsed_ms: u64,
+    pub remaining_ms: u64,
+    pub due: bool,
+}
+
+/// Pure schedule math over the same monotonic source used by the attempt
+/// recorder. Later slices may arm waits from these answers; this type does not.
+#[derive(Clone)]
+pub struct AttemptScheduleV1 {
+    clock: std::sync::Arc<dyn MonotonicClock>,
+}
+
+impl AttemptScheduleV1 {
+    #[must_use]
+    pub fn new(clock: std::sync::Arc<dyn MonotonicClock>) -> Self {
+        Self { clock }
+    }
+
+    /// Compute exact remaining time and due-ness for one monotonic start/bound.
+    #[must_use]
+    pub fn observe(&self, started_ms: u64, bound_ms: u64) -> AttemptScheduleObservationV1 {
+        let elapsed_ms = self.clock.elapsed_ms().saturating_sub(started_ms);
+        AttemptScheduleObservationV1 {
+            elapsed_ms,
+            remaining_ms: bound_ms.saturating_sub(elapsed_ms),
+            due: elapsed_ms >= bound_ms,
+        }
     }
 }
 
@@ -311,6 +359,7 @@ impl AttemptScopeOwner {
 
 #[derive(Clone)]
 pub struct AttemptTelemetrySinkFactory {
+    clock: std::sync::Arc<dyn MonotonicClock>,
     scopes: AttemptScopeOwner,
     evidence: std::sync::Arc<crate::terminal_evidence::WorkflowTurnEvidenceCollector>,
     attempt_id: String,
@@ -323,15 +372,39 @@ pub type AttemptTurnTelemetry = (
 
 impl AttemptTelemetrySinkFactory {
     pub fn new(attempt_id: impl Into<String>) -> Self {
+        Self::with_clock(
+            attempt_id,
+            std::sync::Arc::new(SystemMonotonicClock::start()),
+        )
+    }
+
+    /// Assemble one attempt around an already selected monotonic identity.
+    pub fn with_clock(
+        attempt_id: impl Into<String>,
+        clock: std::sync::Arc<dyn MonotonicClock>,
+    ) -> Self {
         Self {
             scopes: AttemptScopeOwner::new(std::sync::Arc::new(SharedAttemptRecorder::new(
-                SystemMonotonicClock::start(),
+                clock.clone(),
             ))),
+            clock,
             evidence: std::sync::Arc::new(
                 crate::terminal_evidence::WorkflowTurnEvidenceCollector::default(),
             ),
             attempt_id: attempt_id.into(),
         }
+    }
+
+    /// Return the identity-bearing monotonic source for this attempt.
+    #[must_use]
+    pub fn clock(&self) -> std::sync::Arc<dyn MonotonicClock> {
+        self.clock.clone()
+    }
+
+    /// Construct inert schedule math over the identity-bearing attempt clock.
+    #[must_use]
+    pub fn schedule(&self) -> AttemptScheduleV1 {
+        AttemptScheduleV1::new(self.clock())
     }
 
     pub fn recorder(&self) -> std::sync::Arc<dyn AttemptRecorder> {
@@ -489,6 +562,10 @@ impl crate::ports::RichEventSinkFactory for AttemptTelemetrySinkFactory {
             recorder: self.scopes.turn_scope(),
         })
     }
+
+    fn monotonic_clock(&self) -> Option<std::sync::Arc<dyn MonotonicClock>> {
+        Some(self.clock())
+    }
 }
 
 #[cfg(test)]
@@ -643,6 +720,72 @@ mod tests {
         assert_eq!(
             tally.activity.saturating_add(tally.meaningful_progress),
             MAX_ACTIVITY_RECORDS
+        );
+    }
+
+    #[test]
+    fn schedule_math_is_exact_at_the_bound_under_the_attempt_clock() {
+        use crate::execution_policy::R2F1B_CONTROL_ACTION_INTERNAL_TIMEOUT_MS;
+
+        let clock = std::sync::Arc::new(FakeClock(AtomicU64::new(40)));
+        let schedule = AttemptScheduleV1::new(clock.clone());
+
+        assert_eq!(
+            schedule.observe(40, R2F1B_CONTROL_ACTION_INTERNAL_TIMEOUT_MS),
+            AttemptScheduleObservationV1 {
+                elapsed_ms: 0,
+                remaining_ms: R2F1B_CONTROL_ACTION_INTERNAL_TIMEOUT_MS,
+                due: false,
+            }
+        );
+        clock.set(40 + R2F1B_CONTROL_ACTION_INTERNAL_TIMEOUT_MS - 1);
+        let before = schedule.observe(40, R2F1B_CONTROL_ACTION_INTERNAL_TIMEOUT_MS);
+        assert_eq!(before.remaining_ms, 1);
+        assert!(!before.due);
+        clock.set(40 + R2F1B_CONTROL_ACTION_INTERNAL_TIMEOUT_MS);
+        let exact = schedule.observe(40, R2F1B_CONTROL_ACTION_INTERNAL_TIMEOUT_MS);
+        assert_eq!(exact.remaining_ms, 0);
+        assert!(exact.due);
+    }
+
+    #[test]
+    fn constructing_schedule_math_is_inert() {
+        struct ReadCountingClock(AtomicU64);
+        impl MonotonicClock for ReadCountingClock {
+            fn elapsed_ms(&self) -> u64 {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                0
+            }
+        }
+
+        let clock = std::sync::Arc::new(ReadCountingClock(AtomicU64::new(0)));
+        let _schedule = AttemptScheduleV1::new(clock.clone());
+        assert_eq!(clock.0.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn one_attempt_clock_feeds_recorder_telemetry_and_schedule_math() {
+        let concrete = std::sync::Arc::new(FakeClock(AtomicU64::new(7)));
+        let shared: std::sync::Arc<dyn MonotonicClock> = concrete.clone();
+        let factory = AttemptTelemetrySinkFactory::with_clock("shared-clock", shared.clone());
+
+        assert!(std::sync::Arc::ptr_eq(&factory.clock(), &shared));
+        let observation = factory
+            .recorder()
+            .record(AttemptPhase::Admission, ActivityReason::PhaseTransition, 1)
+            .expect("shared recorder records against the attempt clock");
+        assert_eq!(observation.elapsed_ms, 7);
+        assert_eq!(factory.schedule().observe(0, 10).remaining_ms, 3);
+
+        concrete.set(10);
+        assert!(factory.schedule().observe(0, 10).due);
+        assert_eq!(
+            factory
+                .recorder()
+                .record(AttemptPhase::Waiter, ActivityReason::Heartbeat, 0)
+                .expect("shared recorder remains live")
+                .elapsed_ms,
+            10
         );
     }
 }

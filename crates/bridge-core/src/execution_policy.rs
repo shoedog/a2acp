@@ -25,6 +25,10 @@ pub const PROFILE_REVIEW_HIGH_XHIGH_V1: &str = "review_high_xhigh_v1";
 pub const DEFAULT_WORK_CUTOFF_MS: u64 = 7_200_000;
 pub const CLEANUP_TAIL_MS: u64 = 60_000;
 pub const REPORTING_TAIL_MS: u64 = 10_000;
+/// D11's internal action deadline; the observable profile reserves settlement margin after it.
+pub const R2F1B_CONTROL_ACTION_INTERNAL_TIMEOUT_MS: u64 = 30_000;
+/// D11's cooperative cancellation grace; the observable profile reserves escalation margin.
+pub const R2F1B_CANCELLATION_INTERNAL_GRACE_MS: u64 = 5_000;
 pub const MAX_QUALIFICATION_REASON_BYTES: usize = 512;
 pub const MAX_STATIC_CODE_BYTES: usize = 64;
 pub const MAX_DEEPEST_CAUSE_BYTES: usize = 512;
@@ -138,6 +142,31 @@ pub const fn liveness_profile_v1(id: LivenessProfileIdV1) -> LivenessProfileV1 {
         cleanup_tail_ms: CLEANUP_TAIL_MS,
         reporting_tail_ms: REPORTING_TAIL_MS,
         terminal_bound_ms: 7_270_000,
+    }
+}
+
+#[cfg(test)]
+mod r2f1b_slice4a_policy_tests {
+    use super::*;
+
+    #[test]
+    fn internal_action_timers_leave_observable_settlement_margin() {
+        let profile = liveness_profile_v1(LivenessProfileIdV1::ReviewHighXhighV1);
+        assert!(R2F1B_CONTROL_ACTION_INTERNAL_TIMEOUT_MS < profile.control_observable_ms);
+        assert!(R2F1B_CANCELLATION_INTERNAL_GRACE_MS < profile.cancel_observable_ms);
+    }
+
+    #[test]
+    fn observable_liveness_profile_remains_frozen_for_slice4a() {
+        let profile = liveness_profile_v1(LivenessProfileIdV1::ReviewHighXhighV1);
+        assert_eq!(profile.queue_wait_ms, 1_800_000);
+        assert_eq!(profile.control_observable_ms, 31_000);
+        assert_eq!(profile.no_progress_snapshot_ms, 1_800_000);
+        assert_eq!(profile.work_cutoff_ms, 7_200_000);
+        assert_eq!(profile.cancel_observable_ms, 6_000);
+        assert_eq!(profile.cleanup_tail_ms, 60_000);
+        assert_eq!(profile.reporting_tail_ms, 10_000);
+        assert_eq!(profile.terminal_bound_ms, 7_270_000);
     }
 }
 
