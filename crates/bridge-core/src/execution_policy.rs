@@ -233,10 +233,10 @@ pub enum ProfileSelectionSourceV1 {
     CompatibilityOmission,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum DeadlineActivationV1 {
-    ManualOnlyR2f1a,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SchedulerActivationReadinessV1 {
+    Disarmed,
+    Armed,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -455,6 +455,24 @@ pub enum PolicyActivationV1 {
     ManualTest,
 }
 
+#[must_use]
+pub const fn scheduler_activation_readiness_v1() -> SchedulerActivationReadinessV1 {
+    SchedulerActivationReadinessV1::Disarmed
+}
+
+#[must_use]
+pub const fn deadline_activation_v2_for(
+    readiness: SchedulerActivationReadinessV1,
+    policy_activation: PolicyActivationV1,
+) -> DeadlineActivationV2 {
+    match (readiness, policy_activation) {
+        (SchedulerActivationReadinessV1::Armed, PolicyActivationV1::Production) => {
+            DeadlineActivationV2::AutomaticR2f1b
+        }
+        _ => DeadlineActivationV2::ManualOnlyR2f1a,
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FrozenWorkflowControlsV1 {
     pub schema_version: u16,
@@ -465,7 +483,7 @@ pub struct FrozenWorkflowControlsV1 {
     pub max_qualification: Option<MaxQualificationV1>,
     pub fan_out: FanOutPolicyV1,
     pub synthesis: SynthesisModeV1,
-    pub deadline_activation: DeadlineActivationV1,
+    pub deadline_activation: DeadlineActivationV2,
 }
 
 impl FrozenWorkflowControlsV1 {
@@ -1396,6 +1414,23 @@ pub fn resolve_execution_policy_v1(
     any_max_effort: bool,
     activation: PolicyActivationV1,
 ) -> Result<FrozenWorkflowControlsV1, ExecutionPolicyError> {
+    resolve_execution_policy_with_readiness_v1(
+        workflow,
+        invocation,
+        any_max_effort,
+        scheduler_activation_readiness_v1(),
+        activation,
+    )
+}
+
+#[doc(hidden)]
+pub fn resolve_execution_policy_with_readiness_v1(
+    workflow: &WorkflowControlDefaultsV1,
+    invocation: &ExecutionPolicyInvocationV1,
+    any_max_effort: bool,
+    readiness: SchedulerActivationReadinessV1,
+    activation: PolicyActivationV1,
+) -> Result<FrozenWorkflowControlsV1, ExecutionPolicyError> {
     if workflow
         .task_class
         .zip(workflow.liveness_profile)
@@ -1457,7 +1492,7 @@ pub fn resolve_execution_policy_v1(
         max_qualification: qualification,
         fan_out,
         synthesis: workflow.synthesis.unwrap_or(SynthesisModeV1::Degraded),
-        deadline_activation: DeadlineActivationV1::ManualOnlyR2f1a,
+        deadline_activation: deadline_activation_v2_for(readiness, activation),
     };
 
     if let FanOutPolicyV1::FixedGrace { grace_ms } = controls.fan_out {

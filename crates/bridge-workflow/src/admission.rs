@@ -6,11 +6,12 @@ use async_trait::async_trait;
 use bridge_core::domain::AgentEntry;
 use bridge_core::error::BridgeError;
 use bridge_core::execution_policy::{
-    freeze_node_execution_identity_v1, freeze_provider_attempt_v1, resolve_execution_policy_v1,
+    deadline_activation_v2_for, freeze_node_execution_identity_v1, freeze_provider_attempt_v1,
+    resolve_execution_policy_with_readiness_v1, scheduler_activation_readiness_v1,
     select_custody_plan_v1, DeadlineActivationV2, ExecutionPolicyInvocationV1,
     FrozenCheckoutEffectV1, FrozenProviderLogicalSessionV1, FrozenR2f1bContractV1,
     LedgerAdmissionV1, PolicyActivationV1, PolicyNodeRefV1, ProviderEffectKeyV1,
-    ProviderFreezeInputV1, WorkflowControlDefaultsV1,
+    ProviderFreezeInputV1, SchedulerActivationReadinessV1, WorkflowControlDefaultsV1,
 };
 use bridge_core::ids::{AttemptId, AttemptIdentity};
 use bridge_core::ports::AgentRegistry;
@@ -158,6 +159,15 @@ impl WorkflowAdmissionV1 {
         &self,
         request: WorkflowAdmissionRequestV1,
     ) -> Result<AdmittedWorkflowRunV1, BridgeError> {
+        self.freeze_with_scheduler_readiness(request, scheduler_activation_readiness_v1())
+            .await
+    }
+
+    async fn freeze_with_scheduler_readiness(
+        &self,
+        request: WorkflowAdmissionRequestV1,
+        readiness: SchedulerActivationReadinessV1,
+    ) -> Result<AdmittedWorkflowRunV1, BridgeError> {
         request
             .graph
             .validate()
@@ -177,11 +187,20 @@ impl WorkflowAdmissionV1 {
                     .ok_or_else(|| invalid("workflow agent has no immutable registry snapshot"))
             })
             .collect::<Result<_, _>>()?;
+        let policy_activation = PolicyActivationV1::Production;
+        let deadline_activation = deadline_activation_v2_for(readiness, policy_activation);
+        if deadline_activation == DeadlineActivationV2::AutomaticR2f1b
+            && entries.iter().any(|entry| entry.watchdog.is_some())
+        {
+            return Err(invalid(
+                "automatic R2f1b deadline activation is incompatible with legacy agent watchdog settings",
+            ));
+        }
         let any_max_effort = entries.iter().any(|entry| {
             bridge_core::domain::effective_config(entry, None).effort
                 == Some(bridge_core::domain::Effort::Max)
         });
-        let controls = resolve_execution_policy_v1(
+        let controls = resolve_execution_policy_with_readiness_v1(
             request
                 .graph
                 .controls
@@ -189,7 +208,8 @@ impl WorkflowAdmissionV1 {
                 .unwrap_or(&WorkflowControlDefaultsV1::default()),
             &request.policy_invocation,
             any_max_effort,
-            PolicyActivationV1::Production,
+            readiness,
+            policy_activation,
         )
         .map_err(|error| invalid(&format!("workflow controls are invalid: {error}")))?;
 
@@ -386,5 +406,152 @@ fn resolve_source_cwd(
                 .join(configured_path)
                 .to_string_lossy(),
         )
+    }
+}
+
+#[cfg(test)]
+mod slice4b_tests {
+    use super::*;
+    use crate::graph::WorkflowNode;
+    use bridge_core::domain::{AgentKind, Effort, RegistrySnapshot, WatchdogConfig};
+    use bridge_core::execution_policy::HistoryAllocationKindV1;
+    use bridge_core::ids::{AgentId, AttemptIdentity, NodeId, WorkflowId};
+    use bridge_core::ports::Resolved;
+    use std::collections::BTreeMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[derive(Default)]
+    struct EffectCounts {
+        counts: [AtomicUsize; 4],
+    }
+
+    struct RefusalRegistry {
+        entry: Arc<AgentEntry>,
+        effects: Arc<EffectCounts>,
+    }
+
+    #[async_trait]
+    impl AgentRegistry for RefusalRegistry {
+        async fn resolve(&self, _id: &AgentId) -> Result<Resolved, BridgeError> {
+            self.effects.counts[2].fetch_add(1, Ordering::SeqCst);
+            panic!("watchdog refusal must not resolve a backend")
+        }
+
+        fn default_id(&self) -> AgentId {
+            self.entry.id.clone()
+        }
+
+        async fn apply(&self, _snapshot: RegistrySnapshot) -> Result<(), BridgeError> {
+            self.effects.counts[1].fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn entry_snapshot(&self, id: &AgentId) -> Option<Arc<AgentEntry>> {
+            self.effects.counts[0].fetch_add(1, Ordering::SeqCst);
+            (id == &self.entry.id).then(|| self.entry.clone())
+        }
+
+        fn list(&self) -> Vec<AgentId> {
+            vec![self.entry.id.clone()]
+        }
+    }
+
+    struct RefusalPlanner(Arc<EffectCounts>);
+
+    #[async_trait]
+    impl WorkflowCheckoutPlannerV1 for RefusalPlanner {
+        async fn freeze_checkout(
+            &self,
+            _entry: &AgentEntry,
+            input: &CheckoutPlanInputV1,
+        ) -> Result<FrozenCheckoutEffectV1, BridgeError> {
+            self.0.counts[3].fetch_add(1, Ordering::SeqCst);
+            Ok(bridge_core::execution_policy::freeze_direct_checkout_v1(
+                input.source_cwd.clone(),
+            ))
+        }
+    }
+
+    fn watchdog_entry() -> AgentEntry {
+        AgentEntry {
+            id: AgentId::parse("reader").unwrap(),
+            cmd: Some("reader".into()),
+            base_url: None,
+            api_key_env: None,
+            args: vec![],
+            kind: AgentKind::Acp,
+            model_provider: None,
+            model: Some("primary".into()),
+            effort: Some(Effort::Max),
+            mode: Some("read-only".into()),
+            preflight: false,
+            fallback_models: vec![],
+            cwd: None,
+            session_cwd: None,
+            sandbox: None,
+            watchdog: Some(WatchdogConfig {
+                idle_timeout: std::time::Duration::from_secs(30),
+                hard_wall_clock: std::time::Duration::from_secs(60),
+            }),
+            mcp: vec![],
+            mcp_delivery: Default::default(),
+            auth_method: None,
+            pre_authenticated: false,
+            host_fallback_eligible: false,
+            name: None,
+            description: None,
+            tags: vec![],
+            version: None,
+            extensions: BTreeMap::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn automatic_v3_refuses_legacy_watchdog_before_effects() {
+        let effects = Arc::new(EffectCounts::default());
+        let entry = Arc::new(watchdog_entry());
+        let admission = WorkflowAdmissionV1::new(
+            Arc::new(RefusalRegistry {
+                entry: entry.clone(),
+                effects: effects.clone(),
+            }),
+            Arc::new(RefusalPlanner(effects.clone())),
+            SessionCwd::parse("/launch").unwrap(),
+            None,
+        );
+        let request = WorkflowAdmissionRequestV1 {
+            attempt_id: AttemptIdentity::initial().unwrap().attempt_id,
+            graph: Arc::new(WorkflowGraph {
+                id: WorkflowId::parse("watchdog-refusal").unwrap(),
+                nodes: vec![WorkflowNode {
+                    id: NodeId::parse("inspect").unwrap(),
+                    agent: entry.id.clone(),
+                    prompt_template: "{{input}}".into(),
+                    inputs: vec![],
+                    retry: None,
+                    harvest_sanitization: None,
+                }],
+                panel: None,
+                controls: None,
+            }),
+            requested_session_cwd: None,
+            policy_invocation: ExecutionPolicyInvocationV1::default(),
+            ledger_admission: LedgerAdmissionV1::HistoryLedgerAdmitted {
+                kind: HistoryAllocationKindV1::Configured,
+            },
+            r2f1b: None,
+        };
+
+        let Err(BridgeError::ConfigInvalid { reason }) = admission
+            .freeze_with_scheduler_readiness(request, SchedulerActivationReadinessV1::Armed)
+            .await
+        else {
+            panic!("automatic activation with a legacy watchdog must refuse");
+        };
+        assert!(reason.contains("incompatible with legacy agent watchdog settings"));
+        assert_eq!(effects.counts[0].load(Ordering::SeqCst), 1);
+        assert_eq!(effects.counts[1].load(Ordering::SeqCst), 0);
+        assert_eq!(effects.counts[2].load(Ordering::SeqCst), 0);
+        assert_eq!(effects.counts[3].load(Ordering::SeqCst), 0);
     }
 }
