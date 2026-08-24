@@ -15,6 +15,7 @@ pub mod ids;
 #[cfg(unix)]
 pub mod liveness;
 pub mod mcp;
+pub mod mechanical_impossibility;
 #[cfg(unix)]
 pub mod namespace_transaction;
 pub mod orch;

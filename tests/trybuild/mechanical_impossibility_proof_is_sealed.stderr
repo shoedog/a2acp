@@ -1,0 +1,107 @@
+error[E0603]: function `prove_mechanical_impossibility_v1` is private
+ --> $WORKSPACE/tests/trybuild/mechanical_impossibility_proof_is_sealed.rs
+  |
+  |     prove_mechanical_impossibility_v1, ContainerSpawnSettlementV1,
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ private function
+  |
+note: the function `prove_mechanical_impossibility_v1` is defined here
+ --> src/mechanical_impossibility.rs
+  |
+  | / pub(crate) fn prove_mechanical_impossibility_v1(
+  | |     observation: MechanicalImpossibilityObservationV1<'_>,
+  | | ) -> Option<MechanicalImpossibilityProofV1> {
+  | |___________________________________________^
+
+error[E0603]: enum `ContainerSpawnSettlementV1` is private
+ --> $WORKSPACE/tests/trybuild/mechanical_impossibility_proof_is_sealed.rs
+  |
+  |     prove_mechanical_impossibility_v1, ContainerSpawnSettlementV1,
+  |                                        ^^^^^^^^^^^^^^^^^^^^^^^^^^ private enum
+  |
+note: the enum `ContainerSpawnSettlementV1` is defined here
+ --> src/mechanical_impossibility.rs
+  |
+  | pub(crate) enum ContainerSpawnSettlementV1 {
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+error[E0603]: enum `MechanicalImpossibilityObservationV1` is private
+ --> $WORKSPACE/tests/trybuild/mechanical_impossibility_proof_is_sealed.rs
+  |
+  |     MechanicalImpossibilityObservationV1, MechanicalImpossibilityProofV1,
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ private enum
+  |
+note: the enum `MechanicalImpossibilityObservationV1` is defined here
+ --> src/mechanical_impossibility.rs
+  |
+  | pub(crate) enum MechanicalImpossibilityObservationV1<'a> {
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+error[E0603]: struct `ProducerFinalRouteObservationV1` is private
+ --> $WORKSPACE/tests/trybuild/mechanical_impossibility_proof_is_sealed.rs
+  |
+  |     ProducerFinalRouteObservationV1, ProducerResultObservationV1, RouteStateV1,
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ private struct
+  |
+note: the struct `ProducerFinalRouteObservationV1` is defined here
+ --> src/mechanical_impossibility.rs
+  |
+  | pub(crate) struct ProducerFinalRouteObservationV1 {
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+error[E0603]: enum `ProducerResultObservationV1` is private
+ --> $WORKSPACE/tests/trybuild/mechanical_impossibility_proof_is_sealed.rs
+  |
+  |     ProducerFinalRouteObservationV1, ProducerResultObservationV1, RouteStateV1,
+  |                                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^ private enum
+  |
+note: the enum `ProducerResultObservationV1` is defined here
+ --> src/mechanical_impossibility.rs
+  |
+  | pub(crate) enum ProducerResultObservationV1 {
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+error[E0603]: enum `RouteStateV1` is private
+ --> $WORKSPACE/tests/trybuild/mechanical_impossibility_proof_is_sealed.rs
+  |
+  |     ProducerFinalRouteObservationV1, ProducerResultObservationV1, RouteStateV1,
+  |                                                                   ^^^^^^^^^^^^ private enum
+  |
+note: the enum `RouteStateV1` is defined here
+ --> src/mechanical_impossibility.rs
+  |
+  | pub(crate) enum RouteStateV1 {
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+error[E0603]: enum `TerminalResultObservationV1` is private
+ --> $WORKSPACE/tests/trybuild/mechanical_impossibility_proof_is_sealed.rs
+  |
+  |     TerminalResultObservationV1,
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^ private enum
+  |
+note: the enum `TerminalResultObservationV1` is defined here
+ --> src/mechanical_impossibility.rs
+  |
+  | pub(crate) enum TerminalResultObservationV1 {
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+error[E0599]: no function or associated item named `default` found for struct `MechanicalImpossibilityProofV1` in the current scope
+ --> $WORKSPACE/tests/trybuild/mechanical_impossibility_proof_is_sealed.rs
+  |
+  |     let _ = MechanicalImpossibilityProofV1::default();
+  |                                             ^^^^^^^ function or associated item not found in `MechanicalImpossibilityProofV1`
+
+error: cannot construct `MechanicalImpossibilityProofV1` with struct literal syntax due to private fields
+ --> $WORKSPACE/tests/trybuild/mechanical_impossibility_proof_is_sealed.rs
+  |
+  |     let _ = MechanicalImpossibilityProofV1 {};
+  |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  |
+  = note: private field `kind` that was not provided
+
+error[E0277]: the trait bound `MechanicalImpossibilityProofV1: From<bool>` is not satisfied
+ --> $WORKSPACE/tests/trybuild/mechanical_impossibility_proof_is_sealed.rs
+  |
+  |     let _: MechanicalImpossibilityProofV1 = false.into();
+  |                                                   ^^^^ the trait `From<bool>` is not implemented for `MechanicalImpossibilityProofV1`
+  |
+  = note: required for `bool` to implement `Into<MechanicalImpossibilityProofV1>`
