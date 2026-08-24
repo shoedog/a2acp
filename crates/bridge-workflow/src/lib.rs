@@ -6,4 +6,5 @@ pub mod executor;
 pub mod fanout;
 pub mod graph;
 pub mod run_spec;
+pub mod scheduler_arbitration;
 pub mod template;
