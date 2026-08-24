@@ -1,0 +1,11 @@
+diff --git a/crates/bridge-core/src/mechanical_impossibility.rs b/crates/bridge-core/src/mechanical_impossibility.rs
+--- a/crates/bridge-core/src/mechanical_impossibility.rs
++++ b/crates/bridge-core/src/mechanical_impossibility.rs
+@@ -134,7 +134,6 @@ fn retained_child_exit_is_unambiguous(
+     *pid != 0
+         && *pid == immutable_start.pid
+         && signal.pid == *pid
+-        && signal.expected_start_time_ticks == immutable_start.start_time_ticks
+         && signal.signal == 0
+         && signal.return_code == -1
+         && signal.errno == Some(libc::ESRCH)
