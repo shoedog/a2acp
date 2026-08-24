@@ -146,13 +146,15 @@ fn inconsistent_profile_and_inactive_fixed_grace_refuse() {
         ),
         Err(ExecutionPolicyError::FixedGraceInactive)
     );
-    assert!(resolve_execution_policy_v1(
-        &fixed,
-        &ExecutionPolicyInvocationV1::default(),
-        false,
-        PolicyActivationV1::ManualTest,
-    )
-    .is_ok());
+    assert_eq!(
+        resolve_execution_policy_v1(
+            &fixed,
+            &ExecutionPolicyInvocationV1::default(),
+            false,
+            PolicyActivationV1::ManualTest,
+        ),
+        Err(ExecutionPolicyError::FixedGraceInactive)
+    );
 }
 
 #[test]
