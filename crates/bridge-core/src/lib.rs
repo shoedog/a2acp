@@ -19,6 +19,7 @@ pub mod mcp;
 pub mod mechanical_impossibility;
 #[cfg(unix)]
 pub mod namespace_transaction;
+pub mod no_progress_warning;
 pub mod orch;
 pub mod permission;
 pub mod ports;

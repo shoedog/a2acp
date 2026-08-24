@@ -248,7 +248,8 @@ impl<C: MonotonicClock> AttemptActivityAccumulator<C> {
         let elapsed_ms = self.clock.elapsed_ms();
         let reason_index = reason_index(reason);
         let prior = self.high_water[phase.index()][reason_index];
-        let progresses = meaningful_reason(reason) && proposed_advance > prior;
+        let progresses =
+            activity_reason_supports_meaningful_progress_v1(reason) && proposed_advance > prior;
         if progresses {
             self.high_water[phase.index()][reason_index] = proposed_advance;
         }
@@ -320,8 +321,27 @@ const fn reason_index(reason: ActivityReason) -> usize {
     }
 }
 
-const fn meaningful_reason(reason: ActivityReason) -> bool {
-    !matches!(reason, ActivityReason::Heartbeat)
+/// Whether an advancing observation of `reason` is demonstrably meaningful progress.
+///
+/// This match is intentionally exhaustive and wildcard-free. A future activity reason must make
+/// an explicit progress-versus-activity decision before the crate can compile.
+#[must_use]
+pub const fn activity_reason_supports_meaningful_progress_v1(reason: ActivityReason) -> bool {
+    match reason {
+        ActivityReason::PhaseTransition => true,
+        ActivityReason::MessageDelta => true,
+        ActivityReason::ThoughtDelta => true,
+        ActivityReason::UsageHighWater => false,
+        ActivityReason::ToolTransition => true,
+        ActivityReason::OwnedChildTransition => true,
+        ActivityReason::OwnedChildOutput => false,
+        ActivityReason::RepositoryOrdinal => true,
+        ActivityReason::GateStarted => true,
+        ActivityReason::GateExited => true,
+        ActivityReason::CompletedSetGrowth => true,
+        ActivityReason::ProducerTerminal => true,
+        ActivityReason::Heartbeat => false,
+    }
 }
 
 /// One fixed-size attempt-scoping owner. It retains the single attempt-global

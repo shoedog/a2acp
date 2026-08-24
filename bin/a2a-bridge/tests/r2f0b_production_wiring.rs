@@ -1,6 +1,7 @@
 use bridge_api::{ApiBackend, ApiConfig};
 use bridge_core::attempt_activity::{
-    ActivityKind, ActivityReason, AttemptPhase, AttemptTelemetrySinkFactory,
+    activity_reason_supports_meaningful_progress_v1, ActivityKind, ActivityReason, AttemptPhase,
+    AttemptTelemetrySinkFactory,
 };
 use bridge_core::diagnostics::NoopDiagnosticObserver;
 use bridge_core::domain::Part;
@@ -111,14 +112,16 @@ fn independent_turn_scopes_advance_resetting_progress_without_accepting_replays(
         (AttemptPhase::Provider, ActivityReason::UsageHighWater),
         (AttemptPhase::Tool, ActivityReason::ToolTransition),
     ] {
-        assert_eq!(
-            first.record(phase, reason, 100).unwrap().kind,
+        let expected = if activity_reason_supports_meaningful_progress_v1(reason) {
             ActivityKind::MeaningfulProgress
-        );
+        } else {
+            ActivityKind::Activity
+        };
+        assert_eq!(first.record(phase, reason, 100).unwrap().kind, expected);
         assert_eq!(
             second.record(phase, reason, 1).unwrap().kind,
-            ActivityKind::MeaningfulProgress,
-            "a genuine nonempty later-turn advance must not collide with the first turn"
+            expected,
+            "the reason's classification must not depend on an earlier turn's high-water"
         );
         assert_eq!(
             second.record(phase, reason, 1).unwrap().kind,
@@ -133,8 +136,8 @@ fn independent_turn_scopes_advance_resetting_progress_without_accepting_replays(
     }
 
     let tally = factory.recorder().tally().unwrap();
-    assert_eq!(tally.meaningful_progress, 8);
-    assert_eq!(tally.activity, 8);
+    assert_eq!(tally.meaningful_progress, 6);
+    assert_eq!(tally.activity, 10);
     assert!(
         tally.encoded_len() <= bridge_core::attempt_activity::MAX_ATTACHMENT_ENCODING_BYTES,
         "the persisted attempt tally remains bounded and low-cardinality"
