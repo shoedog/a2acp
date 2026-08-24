@@ -21,3 +21,4 @@ tracing.workspace = true
 [dev-dependencies]
 tokio = { workspace = true }
 tokio-test = { workspace = true }
+trybuild = { workspace = true }

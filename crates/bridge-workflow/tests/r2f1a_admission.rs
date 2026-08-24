@@ -2,10 +2,10 @@ use async_trait::async_trait;
 use bridge_core::domain::{AgentEntry, AgentKind, Effort, RegistrySnapshot, WatchdogConfig};
 use bridge_core::error::BridgeError;
 use bridge_core::execution_policy::{
-    freeze_worktree_checkout_v1, DeadlineActivationV2, ExecutionPolicyInvocationV1,
-    FrozenCheckoutEffectV1, FrozenProviderLogicalSessionV1, HistoryAllocationKindV1,
-    LedgerAdmissionV1, LivenessProfileIdV1, ProviderEffectKeyV1, TaskClassV1,
-    WorkflowControlDefaultsV1, WorktreeCheckoutInputV1,
+    cleanup_deadline_after_cancellation_ms_v1, freeze_worktree_checkout_v1, DeadlineActivationV2,
+    ExecutionPolicyInvocationV1, FrozenCheckoutEffectV1, FrozenProviderLogicalSessionV1,
+    HistoryAllocationKindV1, LedgerAdmissionV1, LivenessProfileIdV1, ProviderEffectKeyV1,
+    TaskClassV1, WorkflowControlDefaultsV1, WorktreeCheckoutInputV1,
 };
 use bridge_core::ids::{AgentId, AttemptIdentity, NodeId, WorkflowId};
 use bridge_core::ports::{AgentRegistry, Resolved};
@@ -159,6 +159,10 @@ fn frozen_source(admitted: &bridge_workflow::admission::AdmittedWorkflowRunV1) -
 
 #[tokio::test]
 async fn disarmed_production_admission_never_obtains_automatic_activation() {
+    assert_eq!(
+        cleanup_deadline_after_cancellation_ms_v1(0, 7_200_000),
+        60_000
+    );
     let admitted = admission(entry(), "/launch")
         .freeze(request(
             AttemptIdentity::initial().unwrap().attempt_id,

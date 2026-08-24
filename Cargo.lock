@@ -672,6 +672,7 @@ dependencies = [
  "tokio-test",
  "tokio-util",
  "tracing",
+ "trybuild",
 ]
 
 [[package]]
