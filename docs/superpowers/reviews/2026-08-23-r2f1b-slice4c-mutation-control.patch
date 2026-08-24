@@ -1,0 +1,12 @@
+diff --git a/crates/bridge-core/src/execution_policy.rs b/crates/bridge-core/src/execution_policy.rs
+--- a/crates/bridge-core/src/execution_policy.rs
++++ b/crates/bridge-core/src/execution_policy.rs
+@@ -1030,7 +1030,7 @@ pub fn settle_node_cleanup_v2(
+     elapsed_after_cancellation_ms: u64,
+     cleanup_deadline_after_cancellation_ms: u64,
+ ) -> NodeCleanupV2 {
+-    let deadline_reached = elapsed_after_cancellation_ms >= cleanup_deadline_after_cancellation_ms;
++    let deadline_reached = elapsed_after_cancellation_ms > cleanup_deadline_after_cancellation_ms;
+     let observation = match observation {
+         NodeCleanupObservationV1::Complete(duration_ms, recovery_owner)
+         | NodeCleanupObservationV1::Failed(duration_ms, _, recovery_owner)

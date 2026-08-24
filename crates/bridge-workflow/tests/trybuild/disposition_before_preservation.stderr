@@ -1,0 +1,8 @@
+error[E0599]: no method named `into_disposition` found for struct `WorkflowNodeCancellationSettlementV1<PreservationRequiredV1>` in the current scope
+ --> tests/trybuild/disposition_before_preservation.rs:4:11
+  |
+4 |     value.into_disposition();
+  |           ^^^^^^^^^^^^^^^^ method not found in `WorkflowNodeCancellationSettlementV1<PreservationRequiredV1>`
+  |
+  = note: the method was found for
+          - `WorkflowNodeCancellationSettlementV1<PreservationTypedV1>`

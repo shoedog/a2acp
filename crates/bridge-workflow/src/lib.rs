@@ -1,6 +1,7 @@
 //! bridge-workflow — workflow-DAG agent orchestration (W1). See
 //! docs/superpowers/specs/2026-06-02-a2a-bridge-workflow-orchestration-design.md
 pub mod admission;
+pub mod cancellation_settlement;
 pub mod executor;
 pub mod fanout;
 pub mod graph;

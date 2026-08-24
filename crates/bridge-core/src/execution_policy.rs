@@ -11,6 +11,7 @@ use crate::domain::{
 };
 use crate::ids::{AgentId, AttemptId, AttemptIdentity};
 use crate::mcp::{render_codex_mcp_args, render_kiro_agent_config, McpDelivery, McpServerSpec};
+use crate::resource_flight::ResourceFlightIdV1;
 use crate::SessionCwd;
 use ring::rand::{SecureRandom, SystemRandom};
 use ring::{digest, hmac};
@@ -989,6 +990,124 @@ pub enum NodeCleanupV2 {
 impl NodeCleanupV2 {
     pub fn is_pending(&self) -> bool {
         matches!(self, Self::Pending { .. })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NodeCleanupObservationV1 {
+    Complete(u64, crate::resource_flight::RecoveryOwnerV1),
+    Failed(u64, BoundedCauseV1, crate::resource_flight::RecoveryOwnerV1),
+    NotNeeded,
+    Unsettled(u64, crate::resource_flight::RecoveryOwnerV1),
+    UnsettledUnknownOwned(u64, crate::resource_flight::RecoveryOwnerV1),
+    UnsettledUnknownOwnerless(u64, UnidentifiableCleanupOwnerProofV1),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnidentifiableCleanupOwnerProofV1(ResourceFlightIdV1);
+
+impl NodeCleanupObservationV1 {
+    #[must_use]
+    pub fn recovery_owner(&self) -> Option<&crate::resource_flight::RecoveryOwnerV1> {
+        match self {
+            Self::Complete(_, recovery_owner)
+            | Self::Failed(_, _, recovery_owner)
+            | Self::Unsettled(_, recovery_owner)
+            | Self::UnsettledUnknownOwned(_, recovery_owner) => Some(recovery_owner),
+            _ => None,
+        }
+    }
+}
+
+#[must_use]
+pub fn cleanup_deadline_after_cancellation_ms_v1(
+    cancellation_anchor_ms: u64,
+    work_cutoff_ms: u64,
+) -> u64 {
+    cancellation_anchor_ms
+        .saturating_add(CLEANUP_TAIL_MS)
+        .min(work_cutoff_ms.saturating_add(CLEANUP_TAIL_MS))
+        .saturating_sub(cancellation_anchor_ms)
+}
+
+#[must_use]
+pub fn settle_node_cleanup_v2(
+    observation: NodeCleanupObservationV1,
+    elapsed_after_cancellation_ms: u64,
+    cleanup_deadline_after_cancellation_ms: u64,
+) -> NodeCleanupV2 {
+    let deadline_reached = elapsed_after_cancellation_ms >= cleanup_deadline_after_cancellation_ms;
+    let observation = match observation {
+        NodeCleanupObservationV1::Complete(duration_ms, recovery_owner)
+        | NodeCleanupObservationV1::Failed(duration_ms, _, recovery_owner)
+            if duration_ms > cleanup_deadline_after_cancellation_ms
+                || duration_ms > elapsed_after_cancellation_ms =>
+        {
+            NodeCleanupObservationV1::Unsettled(duration_ms, recovery_owner)
+        }
+        observation => observation,
+    };
+    match observation {
+        NodeCleanupObservationV1::Complete(duration_ms, _) => {
+            NodeCleanupV2::Complete { duration_ms }
+        }
+        NodeCleanupObservationV1::Failed(duration_ms, cause, _) => {
+            NodeCleanupV2::Failed { duration_ms, cause }
+        }
+        NodeCleanupObservationV1::NotNeeded => NodeCleanupV2::NotNeeded,
+        NodeCleanupObservationV1::Unsettled(duration_ms, recovery_owner) if deadline_reached => {
+            NodeCleanupV2::Partial {
+                duration_ms,
+                recovery_owner,
+            }
+        }
+        NodeCleanupObservationV1::Unsettled(_, recovery_owner) => NodeCleanupV2::Pending {
+            resource_flight_id: recovery_owner.resource_flight_id,
+        },
+        NodeCleanupObservationV1::UnsettledUnknownOwned(duration_ms, recovery_owner)
+            if deadline_reached =>
+        {
+            NodeCleanupV2::Unknown {
+                duration_ms,
+                recovery_owner: Some(recovery_owner),
+            }
+        }
+        NodeCleanupObservationV1::UnsettledUnknownOwned(_, recovery_owner) => {
+            NodeCleanupV2::Pending {
+                resource_flight_id: recovery_owner.resource_flight_id,
+            }
+        }
+        NodeCleanupObservationV1::UnsettledUnknownOwnerless(duration_ms, _) if deadline_reached => {
+            NodeCleanupV2::Unknown {
+                duration_ms,
+                recovery_owner: None,
+            }
+        }
+        NodeCleanupObservationV1::UnsettledUnknownOwnerless(_, proof) => NodeCleanupV2::Pending {
+            resource_flight_id: proof.0,
+        },
+    }
+}
+
+#[cfg(test)]
+mod r2f1b_slice4c_cleanup_tests {
+    use super::*;
+
+    #[test]
+    fn ownerless_unknown_requires_sealed_unidentifiable_proof() {
+        let resource_flight_id =
+            ResourceFlightIdV1::parse(format!("resource-flight-{}", "3".repeat(64))).unwrap();
+        let observation = NodeCleanupObservationV1::UnsettledUnknownOwnerless(
+            1,
+            UnidentifiableCleanupOwnerProofV1(resource_flight_id),
+        );
+        assert!(matches!(
+            settle_node_cleanup_v2(observation, 2, 1),
+            NodeCleanupV2::Unknown {
+                recovery_owner: None,
+                ..
+            }
+        ));
     }
 }
 
