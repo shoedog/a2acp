@@ -1,0 +1,12 @@
+diff --git a/crates/bridge-core/src/execution_policy.rs b/crates/bridge-core/src/execution_policy.rs
+--- a/crates/bridge-core/src/execution_policy.rs
++++ b/crates/bridge-core/src/execution_policy.rs
+@@ -472,7 +472,7 @@ pub const fn deadline_activation_v2_for(
+ ) -> DeadlineActivationV2 {
+     match (readiness, policy_activation) {
+-        (SchedulerActivationReadinessV1::Armed, PolicyActivationV1::Production) => {
++        (SchedulerActivationReadinessV1::Disarmed, PolicyActivationV1::Production) => {
+             DeadlineActivationV2::AutomaticR2f1b
+         }
+         _ => DeadlineActivationV2::ManualOnlyR2f1a,
+     }

@@ -1,6 +1,10 @@
 //! Workflow DAG types + validation. Edges are implicit from each node's `inputs`.
 use bridge_core::attestation::HarvestSanitizationMode;
 use bridge_core::domain::{EffectiveConfig, Effort};
+use bridge_core::execution_policy::{
+    deadline_activation_v2_for, scheduler_activation_readiness_v1, DeadlineActivationV2,
+    PolicyActivationV1,
+};
 use bridge_core::ids::{AgentId, NodeId, WorkflowId};
 use bridge_core::ports::AgentRegistry;
 use std::collections::{BTreeMap, HashSet};
@@ -109,8 +113,9 @@ fn push_effective_config(target: &mut String, config: &EffectiveConfig) {
 /// Return a stable, prompt-free hash of the configured graph shape and whether
 /// every referenced agent's model/effort/mode configuration was observable
 /// without resolving a backend.
-pub fn workload_fingerprint_with(
+pub fn workload_fingerprint_with_activation(
     graph: &WorkflowGraph,
+    activation: DeadlineActivationV2,
     mut configured_effective: impl FnMut(&AgentId) -> Option<EffectiveConfig>,
 ) -> (String, bool) {
     use std::fmt::Write as _;
@@ -153,6 +158,13 @@ pub fn workload_fingerprint_with(
             None => canonical.push('0'),
         }
     }
+    match activation {
+        DeadlineActivationV2::ManualOnlyR2f1a => {}
+        DeadlineActivationV2::AutomaticR2f1b => {
+            canonical.push('a');
+            push_field(&mut canonical, "automatic_r2f1b");
+        }
+    }
     if let Some(panel) = &graph.panel {
         canonical.push('p');
         for (key, value) in &panel.weights {
@@ -165,6 +177,20 @@ pub fn workload_fingerprint_with(
     (
         bridge_core::workflow_history::fingerprint_workload_shape(canonical.as_bytes()),
         complete,
+    )
+}
+
+pub fn workload_fingerprint_with(
+    graph: &WorkflowGraph,
+    configured_effective: impl FnMut(&AgentId) -> Option<EffectiveConfig>,
+) -> (String, bool) {
+    workload_fingerprint_with_activation(
+        graph,
+        deadline_activation_v2_for(
+            scheduler_activation_readiness_v1(),
+            PolicyActivationV1::Production,
+        ),
+        configured_effective,
     )
 }
 
@@ -511,5 +537,36 @@ mod tests {
         });
         assert!(!unknown.1);
         assert_ne!(baseline.0, unknown.0);
+    }
+
+    #[test]
+    fn workload_fingerprint_partitions_deadline_activation_without_moving_manual_baseline() {
+        use DeadlineActivationV2::{AutomaticR2f1b, ManualOnlyR2f1a};
+
+        let graph = WorkflowGraph {
+            id: WorkflowId::parse("review").unwrap(),
+            nodes: vec![
+                node("draft", "codex", &[]),
+                node("synth", "claude", &["draft"]),
+            ],
+            panel: None,
+            controls: None,
+        };
+        let lookup = |agent: &AgentId| {
+            Some(configured(match agent.as_str() {
+                "codex" => "gpt-5.5",
+                _ => "claude-sonnet",
+            }))
+        };
+        let shipped = workload_fingerprint_with(&graph, lookup);
+        let manual = workload_fingerprint_with_activation(&graph, ManualOnlyR2f1a, lookup);
+        let automatic = workload_fingerprint_with_activation(&graph, AutomaticR2f1b, lookup);
+
+        assert_eq!(shipped, manual, "shipped readiness must remain manual");
+        assert_eq!(
+            manual.0,
+            "shape-9892a9f12f1daf2edcc832b7f85437b937abd389e6691cad09c2f0bb0467b1c4"
+        );
+        assert_ne!(manual.0, automatic.0);
     }
 }

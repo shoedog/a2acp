@@ -1,11 +1,11 @@
 use async_trait::async_trait;
-use bridge_core::domain::{AgentEntry, AgentKind, Effort, RegistrySnapshot};
+use bridge_core::domain::{AgentEntry, AgentKind, Effort, RegistrySnapshot, WatchdogConfig};
 use bridge_core::error::BridgeError;
 use bridge_core::execution_policy::{
-    freeze_worktree_checkout_v1, ExecutionPolicyInvocationV1, FrozenCheckoutEffectV1,
-    FrozenProviderLogicalSessionV1, HistoryAllocationKindV1, LedgerAdmissionV1,
-    LivenessProfileIdV1, ProviderEffectKeyV1, TaskClassV1, WorkflowControlDefaultsV1,
-    WorktreeCheckoutInputV1,
+    freeze_worktree_checkout_v1, DeadlineActivationV2, ExecutionPolicyInvocationV1,
+    FrozenCheckoutEffectV1, FrozenProviderLogicalSessionV1, HistoryAllocationKindV1,
+    LedgerAdmissionV1, LivenessProfileIdV1, ProviderEffectKeyV1, TaskClassV1,
+    WorkflowControlDefaultsV1, WorktreeCheckoutInputV1,
 };
 use bridge_core::ids::{AgentId, AttemptIdentity, NodeId, WorkflowId};
 use bridge_core::ports::{AgentRegistry, Resolved};
@@ -155,6 +155,43 @@ fn frozen_source(admitted: &bridge_workflow::admission::AdmittedWorkflowRunV1) -
     admitted.run_spec.node_execution_identities[0].provider_attempts[0]
         .checkout
         .source_cwd()
+}
+
+#[tokio::test]
+async fn disarmed_production_admission_never_obtains_automatic_activation() {
+    let admitted = admission(entry(), "/launch")
+        .freeze(request(
+            AttemptIdentity::initial().unwrap().attempt_id,
+            graph(),
+            None,
+        ))
+        .await
+        .expect("disarmed production admission must succeed");
+    assert_eq!(
+        admitted.run_spec.controls.deadline_activation,
+        DeadlineActivationV2::ManualOnlyR2f1a
+    );
+}
+
+#[tokio::test]
+async fn manual_activation_admits_legacy_watchdog_configuration() {
+    let mut configured = entry();
+    configured.watchdog = Some(WatchdogConfig {
+        idle_timeout: std::time::Duration::from_secs(30),
+        hard_wall_clock: std::time::Duration::from_secs(60),
+    });
+    let admitted = admission(configured, "/launch")
+        .freeze(request(
+            AttemptIdentity::initial().unwrap().attempt_id,
+            graph(),
+            None,
+        ))
+        .await
+        .expect("manual activation must retain legacy watchdog behavior");
+    assert_eq!(
+        admitted.run_spec.controls.deadline_activation,
+        DeadlineActivationV2::ManualOnlyR2f1a
+    );
 }
 
 #[tokio::test]

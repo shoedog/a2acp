@@ -2,15 +2,17 @@ use bridge_core::diagnostics::{DiagnosticCode, DiagnosticFailureClass, Diagnosti
 use bridge_core::domain::{AgentEntry, AgentKind, EffectiveConfig, Effort, Part};
 use bridge_core::error::BridgeError;
 use bridge_core::execution_policy::{
-    freeze_direct_checkout_v1, freeze_node_execution_identity_v1, freeze_provider_attempt_v1,
-    freeze_worktree_checkout_v1, resolve_execution_policy_v1, BoundMcpDeliveryPayloadV1,
-    BoundSessionSpecV1, ControlEventIdV1, ExecutionPolicyError, ExecutionPolicyInvocationV1,
+    deadline_activation_v2_for, freeze_direct_checkout_v1, freeze_node_execution_identity_v1,
+    freeze_provider_attempt_v1, freeze_worktree_checkout_v1, resolve_execution_policy_v1,
+    resolve_execution_policy_with_readiness_v1, BoundMcpDeliveryPayloadV1, BoundSessionSpecV1,
+    ControlEventIdV1, DeadlineActivationV2, ExecutionPolicyError, ExecutionPolicyInvocationV1,
     FanOutPolicyNameV1, FanOutPolicyV1, FrozenCheckoutEffectV1, FrozenProviderLogicalSessionV1,
-    LivenessProfileIdV1, NodeCauseV1, NodeCleanupDispositionV1, NodeCleanupV1,
-    NodePrimaryDispositionV1, NodeTerminalV1, PolicyActivationV1, PolicyNodeRefV1, PolicyTriggerV1,
-    ProfileSelectionSourceV1, ProviderEffectKeyV1, ProviderFreezeInputV1, SynthesisModeV1,
-    TaskClassV1, WorkflowControlDefaultsV1, WorktreeCheckoutInputV1, MAX_NODE_TERMINAL_JSON_BYTES,
-    MAX_POLICY_TRIGGER_JSON_BYTES, PROFILE_LEGACY_BOUNDED_V1, PROFILE_REVIEW_HIGH_XHIGH_V1,
+    FrozenWorkflowControlsV1, LivenessProfileIdV1, NodeCauseV1, NodeCleanupDispositionV1,
+    NodeCleanupV1, NodePrimaryDispositionV1, NodeTerminalV1, PolicyActivationV1, PolicyNodeRefV1,
+    PolicyTriggerV1, ProfileSelectionSourceV1, ProviderEffectKeyV1, ProviderFreezeInputV1,
+    SchedulerActivationReadinessV1, SynthesisModeV1, TaskClassV1, WorkflowControlDefaultsV1,
+    WorktreeCheckoutInputV1, MAX_NODE_TERMINAL_JSON_BYTES, MAX_POLICY_TRIGGER_JSON_BYTES,
+    PROFILE_LEGACY_BOUNDED_V1, PROFILE_REVIEW_HIGH_XHIGH_V1,
 };
 use bridge_core::ids::{AgentId, AttemptId, SessionId};
 use bridge_core::mcp::{McpDelivery, McpEnvValueSourceV1, McpServerSpec, SecretString};
@@ -21,6 +23,53 @@ use std::sync::Arc;
 
 fn attempt() -> AttemptId {
     AttemptId::parse("attempt-11111111111111111111111111111111").unwrap()
+}
+
+#[test]
+fn scheduler_readiness_and_policy_activation_select_deadline_activation() {
+    use DeadlineActivationV2::{AutomaticR2f1b, ManualOnlyR2f1a};
+    use PolicyActivationV1::{ManualTest, Production};
+    use SchedulerActivationReadinessV1::{Armed, Disarmed};
+
+    assert_eq!(
+        deadline_activation_v2_for(Armed, Production),
+        AutomaticR2f1b
+    );
+    let automatic_controls = resolve_execution_policy_with_readiness_v1(
+        &WorkflowControlDefaultsV1::default(),
+        &ExecutionPolicyInvocationV1::default(),
+        false,
+        Armed,
+        Production,
+    )
+    .expect("automatic activation must be admitted by frozen-controls validation");
+    assert_eq!(automatic_controls.deadline_activation, AutomaticR2f1b);
+    for (readiness, policy) in [
+        (Disarmed, Production),
+        (Disarmed, ManualTest),
+        (Armed, ManualTest),
+    ] {
+        assert_eq!(
+            deadline_activation_v2_for(readiness, policy),
+            ManualOnlyR2f1a
+        );
+    }
+}
+
+#[test]
+fn manual_deadline_activation_controls_retain_literal_wire_bytes() {
+    const LITERAL: &[u8] = br#"{"schema_version":1,"task_class":"other","profile":{"schema_version":1,"id":"legacy_bounded_v1","queue_wait_ms":1800000,"control_observable_ms":31000,"no_progress_snapshot_ms":1800000,"silence_cutoff":"none","work_cutoff_ms":7200000,"cancel_observable_ms":6000,"cleanup_tail_ms":60000,"reporting_tail_ms":10000,"terminal_bound_ms":7270000},"profile_source":"compatibility_omission","fan_out":{"kind":"bounded_independent"},"synthesis":"degraded","deadline_activation":"manual_only_r2f1a"}"#;
+
+    let decoded: FrozenWorkflowControlsV1 =
+        serde_json::from_slice(LITERAL).expect("persisted V1 manual controls must decode");
+    assert_eq!(
+        decoded.deadline_activation,
+        DeadlineActivationV2::ManualOnlyR2f1a
+    );
+    assert_eq!(
+        serde_json::to_vec(&decoded).expect("manual controls must encode"),
+        LITERAL
+    );
 }
 
 #[test]
