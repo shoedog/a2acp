@@ -330,14 +330,21 @@ id          = "openrouter"
 kind        = "api"
 base_url    = "https://openrouter.ai/api/v1"
 api_key_env = "OPENROUTER_API_KEY"
-# FREE MODELS ONLY (owner directive). Verified against the live OpenRouter catalogue: 22 models price
-# prompt and completion at 0, of which 19 advertise `tools` in supported_parameters -- the rest are
-# music/audio models (google/lyria-*) and unusable for an agent. All ids below are from that filtered
-# set; anything without a `:free` suffix here is free because OpenRouter prices it at 0 outright.
-model       = "stealth/ox-alpha"
+# FREE MODELS ONLY (owner directive). Originally verified against a live OpenRouter catalogue of 22
+# models priced 0/0, of which 19 advertised `tools` -- the rest were music/audio (google/lyria-*) and
+# unusable for an agent. RE-MEASURED 2026-08-23: the catalogue now reports 18 free models. The
+# catalogue drifts; re-check before trusting a model id here. Every id below was confirmed PRESENT on
+# that date. Anything without a `:free` suffix is free because OpenRouter prices it at 0 outright.
+# ox-alpha is PARKED (owner ruling 2026-08-23) and is no longer the default. Failure boundary is
+# clean and reproducible: trivial seconds-long requests succeed (READY smoke; a 17s operator probe
+# answered correctly), while every real working session is dropped by the promotional endpoint with
+# `network_error` -- five attempts across two serve instances and this openrouter route. Operator
+# probes today also measured 2 of 7 requests returning HTTP 429 from
+# `limit_source: upstream_provider_shared_pool`. Keep it reachable by explicit request only.
+model       = "nvidia/nemotron-3-ultra-550b-a55b:free"
 # Free, tool-capable fallbacks: the 550B nemotron is the largest free flagship at 1M context, and
 # north-mini-code is the only explicitly code-specialised model in the free set.
-fallback_models = ["nvidia/nemotron-3-ultra-550b-a55b:free", "cohere/north-mini-code:free"]
+fallback_models = ["cohere/north-mini-code:free"]
 
 # ── opencode: ACP agent (github.com/anomalyco/opencode, formerly sst/opencode). Speaks ACP JSON-RPC
 #    over stdio via `opencode acp` — the same transport claude-agent-acp / codex-acp / gemini use, so
@@ -373,7 +380,10 @@ id   = "opencode"
 cmd  = "opencode"
 args = ["acp"]
 pre_authenticated = true
-model = "opencode-go/ox-alpha-free"
+# ox-alpha-free is PARKED (owner ruling 2026-08-23) -- see the openrouter entry above for the
+# measured failure boundary. kimi-k3 was already the vetted fallback on envelope and stability; it
+# is now the default. ox-alpha-free stays available by explicit `--model` only.
+model = "opencode-go/kimi-k3"
 # Fallback chosen on measured envelope + stability, not reputation. Every opencode-go model reports
 # tool_call and reasoning, so capability does not separate them; kimi-k3 is picked because its
 # envelope (1048576 ctx / 131072 out) is the closest match to ox-alpha-free's (1000000 / 131072), so a
@@ -383,7 +393,7 @@ model = "opencode-go/ox-alpha-free"
 # largest context of the set (1050000) but slightly less output headroom (128000).
 # NOTE: models.dev supplies context/output/tool/reasoning. It does NOT rank coding quality, so this
 # choice is defensible on envelope and stability, not on a benchmark claim.
-fallback_models = ["opencode-go/kimi-k3"]
+fallback_models = ["opencode-go/gpt-5.6-luna"]   # runner-up on envelope (1050000 ctx / 128000 out)
 
 [[prompts]]
 id = "review-implement"
