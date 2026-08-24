@@ -9,6 +9,7 @@ pub mod domain;
 pub mod error;
 pub mod execution_policy;
 pub mod failure_wire;
+pub mod fixed_grace_timer;
 pub mod fs_custody;
 pub mod harvest;
 pub mod ids;

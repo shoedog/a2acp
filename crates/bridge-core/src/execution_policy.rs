@@ -1615,7 +1615,10 @@ pub fn resolve_execution_policy_with_readiness_v1(
     };
 
     if let FanOutPolicyV1::FixedGrace { grace_ms } = controls.fan_out {
-        if matches!(activation, PolicyActivationV1::Production) {
+        if matches!(
+            controls.deadline_activation,
+            DeadlineActivationV2::ManualOnlyR2f1a
+        ) {
             return Err(ExecutionPolicyError::FixedGraceInactive);
         }
         if grace_ms == 0 || grace_ms > controls.effective_work_cutoff_ms() {

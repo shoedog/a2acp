@@ -1,0 +1,11 @@
+diff --git a/crates/bridge-core/src/fixed_grace_timer.rs b/crates/bridge-core/src/fixed_grace_timer.rs
+--- a/crates/bridge-core/src/fixed_grace_timer.rs
++++ b/crates/bridge-core/src/fixed_grace_timer.rs
+@@ -101,6 +101,6 @@ impl FixedGraceTimerV1 {
+         recorded_node_deadline_elapsed_ms: u64,
+     ) -> Result<(), TimerError> {
+-        if !matches!(&self.0, FixedGraceTimerStateV1::Unarmed {}) {
++        if matches!(&self.0, FixedGraceTimerStateV1::Armed { .. }) {
+             return Err(TimerError::AlreadyArmedOrFired);
+         }
+         if grace_ms == 0 {
