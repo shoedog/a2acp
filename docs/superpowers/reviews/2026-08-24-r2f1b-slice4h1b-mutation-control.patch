@@ -1,0 +1,16 @@
+diff --git a/crates/bridge-core/src/retained_resource_flight.rs b/crates/bridge-core/src/retained_resource_flight.rs
+--- a/crates/bridge-core/src/retained_resource_flight.rs
++++ b/crates/bridge-core/src/retained_resource_flight.rs
+@@ -1735,7 +1735,11 @@ impl RetainedResourceFlight {
+                 return Ok(CleanupDeadlineTransferV1::Unknown {
+                     result: existing,
+                     guard,
+-                    proof: None,
++                    proof: Some(
++                        UnidentifiableCleanupOwnerProofV1::mint_at_ownerless_observation(
++                            self.id.clone(),
++                        ),
++                    ),
+                 });
+             }
+             if !matches!(state.state, ResourceFlightStateV1::Signaling {}) {

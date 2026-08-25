@@ -24,7 +24,9 @@
 //! `deletion_admission`, preserving the custody-lock prohibition.
 
 use crate::attempt_activity::MonotonicClock;
-use crate::execution_policy::{BoundedCauseV1, CollateralDispositionV1, Sha256HexV1};
+use crate::execution_policy::{
+    BoundedCauseV1, CollateralDispositionV1, Sha256HexV1, UnidentifiableCleanupOwnerProofV1,
+};
 use crate::ids::{AttemptId, NodeId};
 use crate::resource_flight::{
     BoundedRecoveryReasonV1, DedicatedRemoteRequestIdV1, ProcessStartIdentityV1, RecoveryOwnerV1,
@@ -1701,6 +1703,7 @@ impl RetainedResourceFlight {
             return Ok(CleanupDeadlineTransferV1::Unknown {
                 result: self.settle_unknown()?,
                 guard,
+                proof: None,
             });
         }
         let recovery_owner = RecoveryOwnerV1 {
@@ -1721,12 +1724,18 @@ impl RetainedResourceFlight {
                 return Ok(CleanupDeadlineTransferV1::Unknown {
                     result: self.settle_unknown()?,
                     guard,
+                    proof: Some(
+                        UnidentifiableCleanupOwnerProofV1::mint_at_ownerless_observation(
+                            self.id.clone(),
+                        ),
+                    ),
                 });
             }
             if let Some(existing) = self.adopt_durable_terminal_locked(&mut state)? {
                 return Ok(CleanupDeadlineTransferV1::Unknown {
                     result: existing,
                     guard,
+                    proof: None,
                 });
             }
             if !matches!(state.state, ResourceFlightStateV1::Signaling {}) {
@@ -1747,6 +1756,7 @@ impl RetainedResourceFlight {
                 return Ok(CleanupDeadlineTransferV1::Unknown {
                     result: existing,
                     guard,
+                    proof: None,
                 });
             }
             self.settle_locked(&mut state, result)?
@@ -1757,6 +1767,7 @@ impl RetainedResourceFlight {
             return Ok(CleanupDeadlineTransferV1::Unknown {
                 result: settlement.result,
                 guard,
+                proof: None,
             });
         }
         Ok(CleanupDeadlineTransferV1::Transferred {
@@ -1940,6 +1951,7 @@ pub enum CleanupDeadlineTransferV1 {
     Unknown {
         result: ResourceActionResultV1,
         guard: RetainedResourceFlightGuardV1,
+        proof: Option<UnidentifiableCleanupOwnerProofV1>,
     },
 }
 
@@ -2955,7 +2967,7 @@ mod tests {
     }
 
     #[test]
-    fn cleanup_deadline_adopts_recovered_terminal_without_transfer() {
+    fn cleanup_deadline_public_journal_preseed_carries_no_ownerless_proof() {
         let journal: Arc<dyn ResourceFlightJournal> =
             Arc::new(InMemoryResourceFlightJournal::new(24));
         let clock = Arc::new(ManualClock::new(8));
@@ -2978,28 +2990,30 @@ mod tests {
         let flight_id = flight.flight_id().clone();
         clock.set(60);
 
+        let preseeded = ResourceActionResultV1 {
+            disposition: ResourceActionDispositionV1::Unknown,
+            duration_ms: 60,
+            recovery_owner: None,
+            cause: None,
+        };
         assert!(matches!(
-            RetainedResourceFlight::recover_dead_journaled_intent_as_unknown(
-                journal.as_ref(),
-                &flight_id,
-                60,
-                publisher.as_ref(),
-            )
-            .unwrap(),
-            Some(ResourceActionResultV1 {
-                disposition: ResourceActionDispositionV1::Unknown,
-                ..
-            })
+            journal.append_terminal(&flight_id, &preseeded).unwrap(),
+            ResourceFlightTerminalAppendOutcomeV1::Appended { .. }
         ));
-        let CleanupDeadlineTransferV1::Unknown { result, guard } = flight
+        let CleanupDeadlineTransferV1::Unknown {
+            result,
+            guard,
+            proof,
+        } = flight
             .transfer_cleanup_deadline(60, guard, BoundedRecoveryReasonV1::new("deadline").unwrap())
             .unwrap()
         else {
-            panic!("adopting a recovery terminal must not report a transfer")
+            panic!("adopting a caller-preseeded terminal must not report a transfer")
         };
         assert_eq!(result.disposition, ResourceActionDispositionV1::Unknown);
         assert_eq!(guard.resource_flight_id(), flight.flight_id());
-        assert_eq!(publisher.0.lock().unwrap().len(), 1);
+        assert!(proof.is_none());
+        assert!(publisher.0.lock().unwrap().is_empty());
         assert!(!journal
             .records(&flight_id)
             .unwrap()
@@ -3017,7 +3031,11 @@ mod tests {
         clock.set(60);
         let (second, second_clock, _) = journaled();
         let foreign_guard = second.retain().unwrap();
-        let CleanupDeadlineTransferV1::Unknown { result, guard } = first
+        let CleanupDeadlineTransferV1::Unknown {
+            result,
+            guard,
+            proof,
+        } = first
             .transfer_cleanup_deadline(
                 60,
                 foreign_guard,
@@ -3028,6 +3046,7 @@ mod tests {
             panic!("foreign guard must survive a failed transfer")
         };
         assert_eq!(result.disposition, ResourceActionDispositionV1::Unknown);
+        assert!(proof.is_none());
         assert_eq!(publisher.0.lock().unwrap().len(), 1);
         second.begin_journaled_dispatch().unwrap();
         second_clock.set(60);
@@ -3041,6 +3060,65 @@ mod tests {
                 .unwrap(),
             CleanupDeadlineTransferV1::Transferred { .. }
         ));
+    }
+
+    #[test]
+    fn cleanup_deadline_missing_live_guard_token_mints_ownerless_proof() {
+        let (flight, clock, _) = journaled();
+        flight.begin_journaled_dispatch().unwrap();
+        let guard = flight.retain().unwrap();
+        assert!(flight
+            .transition
+            .lock()
+            .unwrap()
+            .guards
+            .remove(&guard.token));
+        clock.set(60);
+
+        let CleanupDeadlineTransferV1::Unknown {
+            result,
+            guard,
+            proof: Some(proof),
+        } = flight
+            .transfer_cleanup_deadline(60, guard, BoundedRecoveryReasonV1::new("deadline").unwrap())
+            .unwrap()
+        else {
+            panic!("the live missing-token observation must mint a proof")
+        };
+        assert_eq!(result.disposition, ResourceActionDispositionV1::Unknown);
+        assert_eq!(proof.resource_flight_id(), flight.flight_id());
+        assert_eq!(guard.resource_flight_id(), flight.flight_id());
+    }
+
+    #[test]
+    fn sequential_cleanup_deadline_transfers_do_not_mint_a_second_proof() {
+        let (flight, clock, _) = journaled();
+        flight.begin_journaled_dispatch().unwrap();
+        let first_guard = flight.retain().unwrap();
+        let second_guard = flight.retain().unwrap();
+        clock.set(60);
+
+        assert!(matches!(
+            flight
+                .transfer_cleanup_deadline(
+                    60,
+                    first_guard,
+                    BoundedRecoveryReasonV1::new("first deadline").unwrap(),
+                )
+                .unwrap(),
+            CleanupDeadlineTransferV1::Transferred { .. }
+        ));
+        let CleanupDeadlineTransferV1::Unknown { proof, .. } = flight
+            .transfer_cleanup_deadline(
+                60,
+                second_guard,
+                BoundedRecoveryReasonV1::new("second deadline").unwrap(),
+            )
+            .unwrap()
+        else {
+            panic!("the settled flight must not transfer a second guard")
+        };
+        assert!(proof.is_none());
     }
 
     #[test]

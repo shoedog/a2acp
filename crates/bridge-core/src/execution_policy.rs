@@ -1006,6 +1006,17 @@ pub enum NodeCleanupObservationV1 {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UnidentifiableCleanupOwnerProofV1(ResourceFlightIdV1);
 
+impl UnidentifiableCleanupOwnerProofV1 {
+    pub(crate) fn mint_at_ownerless_observation(resource_flight_id: ResourceFlightIdV1) -> Self {
+        Self(resource_flight_id)
+    }
+
+    #[must_use]
+    pub fn resource_flight_id(&self) -> &ResourceFlightIdV1 {
+        &self.0
+    }
+}
+
 impl NodeCleanupObservationV1 {
     #[must_use]
     pub fn recovery_owner(&self) -> Option<&crate::resource_flight::RecoveryOwnerV1> {
