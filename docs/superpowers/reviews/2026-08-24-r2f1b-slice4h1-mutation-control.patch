@@ -1,0 +1,12 @@
+diff --git a/crates/bridge-workflow/src/scheduler_arbitration.rs b/crates/bridge-workflow/src/scheduler_arbitration.rs
+--- a/crates/bridge-workflow/src/scheduler_arbitration.rs
++++ b/crates/bridge-workflow/src/scheduler_arbitration.rs
+@@ -88,7 +88,7 @@ pub fn arbitrate_scheduler_v1(
+     let mut post_cutoff_completions = Vec::new();
+     if readiness.absolute_cutoff_reached {
+         readiness.ready_node_completions.retain(|completion| {
+-            if completion.ready_at_ms <= tie_facts.absolute_cutoff_at_ms {
++            if completion.ready_at_ms <= tie_facts.absolute_cutoff_at_ms.saturating_add(1) {
+                 true
+             } else {
+                 post_cutoff_completions.push(completion.clone());

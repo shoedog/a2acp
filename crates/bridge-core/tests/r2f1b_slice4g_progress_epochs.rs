@@ -46,6 +46,22 @@ fn positive_ordinal_emits_once_and_duplicate_poll_does_not_reemit() {
 }
 
 #[test]
+fn delayed_first_poll_emits_only_highest_due_ordinal_and_records_the_skip() {
+    let interval = NO_PROGRESS_WARNING_INTERVAL_MS;
+    let mut epoch = NoProgressWarningEpochV1::new(0);
+    let warning = epoch
+        .poll_elapsed(2 * interval + 5 * 60_000)
+        .warning()
+        .unwrap();
+    assert_eq!(warning.ordinal, 2);
+    assert_eq!(warning.superseded_ordinal_count, 1);
+    assert_eq!(
+        epoch.poll_elapsed(2 * interval + 5 * 60_000).warning(),
+        None
+    );
+}
+
+#[test]
 fn non_progress_activity_updates_only_activity_clock_and_epoch_keeps_climbing() {
     let interval = NO_PROGRESS_WARNING_INTERVAL_MS;
     let mut epoch = NoProgressWarningEpochV1::new(0);

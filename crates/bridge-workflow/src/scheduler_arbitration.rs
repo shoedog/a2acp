@@ -53,6 +53,8 @@ pub struct SchedulerTieFactsV1 {
 pub struct SchedulerArbitrationV1 {
     pub winner: SchedulerArmV1,
     pub ready_node_completions: Vec<ReadyNodeCompletionV1>,
+    /// Completions observed strictly after cutoff; their nodes remain in the cancellation set.
+    pub post_cutoff_completions: Vec<ReadyNodeCompletionV1>,
     /// A cutoff tied with the winning completion batch cancels these nodes after the drain.
     pub nodes_to_cancel_after_winner: Vec<NodeId>,
 }
@@ -83,14 +85,21 @@ pub fn arbitrate_scheduler_v1(
     mut readiness: SchedulerArbitrationReadinessV1,
     mut tie_facts: SchedulerTieFactsV1,
 ) -> SchedulerArbitrationV1 {
+    let mut post_cutoff_completions = Vec::new();
     if readiness.absolute_cutoff_reached {
-        readiness
-            .ready_node_completions
-            .retain(|completion| completion.ready_at_ms <= tie_facts.absolute_cutoff_at_ms);
+        readiness.ready_node_completions.retain(|completion| {
+            if completion.ready_at_ms <= tie_facts.absolute_cutoff_at_ms {
+                true
+            } else {
+                post_cutoff_completions.push(completion.clone());
+                false
+            }
+        });
     }
     readiness
         .ready_node_completions
         .sort_by(|left, right| left.node_id.cmp(&right.node_id));
+    post_cutoff_completions.sort_by(|left, right| left.node_id.cmp(&right.node_id));
 
     let winner = SCHEDULER_ARM_PRIORITY_V1
         .into_iter()
@@ -121,6 +130,7 @@ pub fn arbitrate_scheduler_v1(
     SchedulerArbitrationV1 {
         winner,
         ready_node_completions: readiness.ready_node_completions,
+        post_cutoff_completions,
         nodes_to_cancel_after_winner,
     }
 }

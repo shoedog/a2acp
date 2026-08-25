@@ -24,6 +24,8 @@ pub const fn no_progress_warning_ordinal_v1(
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct NoProgressWarningV1 {
     pub ordinal: u64,
+    /// Earlier due ordinals represented by this warning rather than emitted as a catch-up burst.
+    pub superseded_ordinal_count: u64,
     pub observed_at_elapsed_ms: u64,
     pub last_activity_elapsed_ms: u64,
     pub last_meaningful_progress_elapsed_ms: u64,
@@ -107,9 +109,13 @@ impl NoProgressWarningEpochV1 {
             self.last_meaningful_progress_elapsed_ms,
         );
         let warning = if ordinal > self.last_emitted_ordinal {
+            let superseded_ordinal_count = ordinal
+                .saturating_sub(self.last_emitted_ordinal)
+                .saturating_sub(1);
             self.last_emitted_ordinal = ordinal;
             Some(NoProgressWarningV1 {
                 ordinal,
+                superseded_ordinal_count,
                 observed_at_elapsed_ms: now_elapsed_ms,
                 last_activity_elapsed_ms: self.last_activity_elapsed_ms,
                 last_meaningful_progress_elapsed_ms: self.last_meaningful_progress_elapsed_ms,
