@@ -1,0 +1,29 @@
+error[E0599]: no function or associated item named `default` found for struct `UnidentifiableCleanupOwnerProofV1` in the current scope
+ --> $WORKSPACE/tests/trybuild/unidentifiable_cleanup_owner_proof_is_sealed.rs
+  |
+  |     let _ = UnidentifiableCleanupOwnerProofV1::default();
+  |                                                ^^^^^^^ function or associated item not found in `UnidentifiableCleanupOwnerProofV1`
+
+error[E0423]: cannot initialize a tuple struct which contains private fields
+ --> $WORKSPACE/tests/trybuild/unidentifiable_cleanup_owner_proof_is_sealed.rs
+  |
+  |     let _ = UnidentifiableCleanupOwnerProofV1(resource_flight_id.clone());
+  |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  |
+note: constructor is not visible here due to private fields
+ --> src/execution_policy.rs
+  |
+  | pub struct UnidentifiableCleanupOwnerProofV1(ResourceFlightIdV1);
+  |                                              ^^^^^^^^^^^^^^^^^^ private field
+help: you might have meant to use the `mint_at_ownerless_observation` associated function
+  |
+8 |     let _ = UnidentifiableCleanupOwnerProofV1::mint_at_ownerless_observation(resource_flight_id.clone());
+  |                                              +++++++++++++++++++++++++++++++
+
+error[E0277]: the trait bound `UnidentifiableCleanupOwnerProofV1: From<ResourceFlightIdV1>` is not satisfied
+ --> $WORKSPACE/tests/trybuild/unidentifiable_cleanup_owner_proof_is_sealed.rs
+  |
+  |     let _: UnidentifiableCleanupOwnerProofV1 = resource_flight_id.into();
+  |                                                                   ^^^^ the trait `From<ResourceFlightIdV1>` is not implemented for `UnidentifiableCleanupOwnerProofV1`
+  |
+  = note: required for `ResourceFlightIdV1` to implement `Into<UnidentifiableCleanupOwnerProofV1>`
