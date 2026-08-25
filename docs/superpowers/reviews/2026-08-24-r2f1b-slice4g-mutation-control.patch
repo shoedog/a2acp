@@ -1,0 +1,17 @@
+diff --git a/crates/bridge-core/src/no_progress_warning.rs b/crates/bridge-core/src/no_progress_warning.rs
+--- a/crates/bridge-core/src/no_progress_warning.rs
++++ b/crates/bridge-core/src/no_progress_warning.rs
+@@ -88,9 +88,10 @@ impl NoProgressWarningEpochV1 {
+     /// arrive as [`ActivityKind::Activity`] from the accumulator and do not reset this epoch.
+     pub fn observe_activity(&mut self, activity: &AttemptActivity) {
+         self.last_activity_elapsed_ms = self.last_activity_elapsed_ms.max(activity.elapsed_ms);
+-        if activity.kind == ActivityKind::MeaningfulProgress
+-            && activity_reason_supports_meaningful_progress_v1(activity.reason)
+-            && activity.elapsed_ms > self.last_meaningful_progress_elapsed_ms
++        if activity.kind == ActivityKind::Activity
++            || (activity.kind == ActivityKind::MeaningfulProgress
++                && activity_reason_supports_meaningful_progress_v1(activity.reason)
++                && activity.elapsed_ms > self.last_meaningful_progress_elapsed_ms)
+         {
+             self.last_meaningful_progress_elapsed_ms = self
+                 .last_meaningful_progress_elapsed_ms

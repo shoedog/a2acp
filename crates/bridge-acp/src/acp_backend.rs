@@ -8431,10 +8431,13 @@ mod tests {
         let tally = recorder.tally().expect("tally");
         assert!(!tally.overflowed);
         assert_eq!(
-            tally.meaningful_progress, 1,
-            "first bounded sum is progress"
+            tally.meaningful_progress, 0,
+            "usage accounting is not attempt progress"
         );
-        assert_eq!(tally.activity, 1, "the identical snapshot stays activity");
+        assert_eq!(
+            tally.activity, 2,
+            "usage accounting remains activity even when its high-water advances"
+        );
     }
 
     #[test]
@@ -8717,23 +8720,20 @@ mod tests {
 
         tokio::time::timeout(Duration::from_secs(1), async {
             loop {
-                if recorder
-                    .tally()
-                    .is_some_and(|tally| tally.meaningful_progress > 0)
-                {
+                if recorder.tally().is_some_and(|tally| tally.activity > 0) {
                     break;
                 }
                 tokio::task::yield_now().await;
             }
         })
         .await
-        .expect("output progress is observed before child completion");
+        .expect("output activity is observed before child completion");
         assert!(child.child_mut().try_wait().unwrap().is_none());
         assert_eq!(ring.metadata_since(cursor).line_count(), 0);
         assert_eq!(ring.metadata_since(cursor).byte_count(), 5);
 
         tokio::time::sleep(Duration::from_millis(75)).await;
-        assert_eq!(recorder.tally().unwrap().meaningful_progress, 1);
+        assert_eq!(recorder.tally().unwrap().activity, 1);
 
         child
             .child_mut()
@@ -8750,7 +8750,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(75)).await;
         assert_eq!(ring.metadata_since(cursor).line_count(), 1);
         assert_eq!(ring.metadata_since(cursor).byte_count(), 6);
-        assert_eq!(recorder.tally().unwrap().meaningful_progress, 2);
+        assert_eq!(recorder.tally().unwrap().activity, 2);
 
         child
             .child_mut()
@@ -8763,7 +8763,7 @@ mod tests {
         assert_eq!(stdout.next_line().await.unwrap().as_deref(), Some("SECOND"));
         tokio::time::timeout(Duration::from_secs(1), async {
             loop {
-                if recorder.tally().unwrap().meaningful_progress == 3 {
+                if recorder.tally().unwrap().activity == 3 {
                     break;
                 }
                 tokio::task::yield_now().await;
@@ -8789,10 +8789,11 @@ mod tests {
         assert_eq!(ring.metadata_since(cursor).line_count(), 2);
         assert_eq!(ring.metadata_since(cursor).byte_count(), 12);
         assert_eq!(
-            recorder.tally().unwrap().meaningful_progress,
+            recorder.tally().unwrap().activity,
             3,
-            "EOF line publication must not recount already observed bytes"
+            "EOF line publication must not recount already observed output activity"
         );
+        assert_eq!(recorder.tally().unwrap().meaningful_progress, 0);
 
         drop(done);
     }
