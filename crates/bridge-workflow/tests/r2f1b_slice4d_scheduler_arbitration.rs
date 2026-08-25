@@ -223,6 +223,40 @@ fn completion_at_cutoff_cancels_unfinished_nodes_after_drain() {
 }
 
 #[test]
+fn completion_strictly_after_cutoff_is_dropped_and_its_node_is_cancelled() {
+    let result = arbitrate_scheduler_v1(
+        SchedulerArbitrationReadinessV1 {
+            ready_node_completions: vec![
+                completion("before", 49),
+                completion("at", 50),
+                completion("after", 51),
+            ],
+            absolute_cutoff_reached: true,
+            ..SchedulerArbitrationReadinessV1::default()
+        },
+        SchedulerTieFactsV1 {
+            absolute_cutoff_at_ms: 50,
+            inflight_nodes: vec![node("after"), node("at"), node("before")],
+        },
+    );
+
+    assert_eq!(result.winner, SchedulerArmV1::DrainReadyNodeCompletions);
+    assert_eq!(
+        result
+            .ready_node_completions
+            .iter()
+            .map(|completion| (completion.node_id.as_str(), completion.ready_at_ms))
+            .collect::<Vec<_>>(),
+        [("at", 50), ("before", 49)]
+    );
+    assert_eq!(
+        result.post_cutoff_completions,
+        vec![completion("after", 51)]
+    );
+    assert_eq!(result.nodes_to_cancel_after_winner, vec![node("after")]);
+}
+
+#[test]
 fn warning_loses_to_ready_completion() {
     let result = arbitrate_scheduler_v1(
         SchedulerArbitrationReadinessV1 {

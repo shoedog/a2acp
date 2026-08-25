@@ -1,8 +1,8 @@
 //! Constructive evidence that a pending producer can no longer yield a terminal result.
 //!
-//! The proof is deliberately sealed. This slice has no public mint: its adapters remain crate-private
-//! until the workflow owner can supply authoritative producer and route observations in 4H.
-//! Ambiguous observations and non-constructive liveness signals return `None`.
+//! The proof is deliberately sealed. Workflow code can submit authoritative producer and route
+//! observations, but it cannot construct the proof itself. Ambiguous observations and
+//! non-constructive liveness signals return `None`.
 
 #![allow(dead_code)]
 
@@ -31,44 +31,44 @@ impl MechanicalImpossibilityProofV1 {
     }
 }
 
-pub(crate) enum ProducerResultObservationV1 {
+pub enum ProducerResultObservationV1 {
     PendingSoleProducer,
     PendingMultipleProducers,
     TerminalResultObserved,
     Unknown,
 }
 
-pub(crate) enum ContainerSpawnSettlementV1 {
+pub enum ContainerSpawnSettlementV1 {
     Settled,
     Pending,
     Unknown,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum RouteStateV1 {
+pub enum RouteStateV1 {
     Open,
     IrreversiblyClosed,
     Unknown,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum TerminalResultObservationV1 {
+pub enum TerminalResultObservationV1 {
     Absent,
     Present,
     Unknown,
 }
 
-pub(crate) struct ProducerFinalRouteObservationV1 {
-    pub(crate) producer_routes: Vec<RouteStateV1>,
-    pub(crate) final_routes: Vec<RouteStateV1>,
-    pub(crate) terminal_result: TerminalResultObservationV1,
+pub struct ProducerFinalRouteObservationV1 {
+    pub producer_routes: Vec<RouteStateV1>,
+    pub final_routes: Vec<RouteStateV1>,
+    pub terminal_result: TerminalResultObservationV1,
 }
 
 /// The complete observation vocabulary accepted by the proof classifier.
 ///
 /// The last six variants are explicit non-proofs. Their presence prevents silence or incidental
 /// filesystem/process metadata from being reinterpreted as constructive evidence by a caller.
-pub(crate) enum MechanicalImpossibilityObservationV1<'a> {
+pub enum MechanicalImpossibilityObservationV1<'a> {
     RetainedChild {
         identity: &'a ResourceIdentityV1,
         signal: &'a ProcessSignalObservationV1,
@@ -88,7 +88,7 @@ pub(crate) enum MechanicalImpossibilityObservationV1<'a> {
     ProviderSlowness,
 }
 
-pub(crate) fn prove_mechanical_impossibility_v1(
+pub fn prove_mechanical_impossibility_v1(
     observation: MechanicalImpossibilityObservationV1<'_>,
 ) -> Option<MechanicalImpossibilityProofV1> {
     let kind = match observation {

@@ -1,88 +1,16 @@
-error[E0603]: function `prove_mechanical_impossibility_v1` is private
+warning: unused imports: `ContainerSpawnSettlementV1`, `MechanicalImpossibilityObservationV1`, `ProducerFinalRouteObservationV1`, `ProducerResultObservationV1`, `RouteStateV1`, `TerminalResultObservationV1`, and `prove_mechanical_impossibility_v1`
  --> $WORKSPACE/tests/trybuild/mechanical_impossibility_proof_is_sealed.rs
   |
   |     prove_mechanical_impossibility_v1, ContainerSpawnSettlementV1,
-  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ private function
-  |
-note: the function `prove_mechanical_impossibility_v1` is defined here
- --> src/mechanical_impossibility.rs
-  |
-  | / pub(crate) fn prove_mechanical_impossibility_v1(
-  | |     observation: MechanicalImpossibilityObservationV1<'_>,
-  | | ) -> Option<MechanicalImpossibilityProofV1> {
-  | |___________________________________________^
-
-error[E0603]: enum `ContainerSpawnSettlementV1` is private
- --> $WORKSPACE/tests/trybuild/mechanical_impossibility_proof_is_sealed.rs
-  |
-  |     prove_mechanical_impossibility_v1, ContainerSpawnSettlementV1,
-  |                                        ^^^^^^^^^^^^^^^^^^^^^^^^^^ private enum
-  |
-note: the enum `ContainerSpawnSettlementV1` is defined here
- --> src/mechanical_impossibility.rs
-  |
-  | pub(crate) enum ContainerSpawnSettlementV1 {
-  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-
-error[E0603]: enum `MechanicalImpossibilityObservationV1` is private
- --> $WORKSPACE/tests/trybuild/mechanical_impossibility_proof_is_sealed.rs
-  |
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^^^^^^^^^^
   |     MechanicalImpossibilityObservationV1, MechanicalImpossibilityProofV1,
-  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ private enum
-  |
-note: the enum `MechanicalImpossibilityObservationV1` is defined here
- --> src/mechanical_impossibility.rs
-  |
-  | pub(crate) enum MechanicalImpossibilityObservationV1<'a> {
-  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-
-error[E0603]: struct `ProducerFinalRouteObservationV1` is private
- --> $WORKSPACE/tests/trybuild/mechanical_impossibility_proof_is_sealed.rs
-  |
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
   |     ProducerFinalRouteObservationV1, ProducerResultObservationV1, RouteStateV1,
-  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ private struct
-  |
-note: the struct `ProducerFinalRouteObservationV1` is defined here
- --> src/mechanical_impossibility.rs
-  |
-  | pub(crate) struct ProducerFinalRouteObservationV1 {
-  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-
-error[E0603]: enum `ProducerResultObservationV1` is private
- --> $WORKSPACE/tests/trybuild/mechanical_impossibility_proof_is_sealed.rs
-  |
-  |     ProducerFinalRouteObservationV1, ProducerResultObservationV1, RouteStateV1,
-  |                                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^ private enum
-  |
-note: the enum `ProducerResultObservationV1` is defined here
- --> src/mechanical_impossibility.rs
-  |
-  | pub(crate) enum ProducerResultObservationV1 {
-  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-
-error[E0603]: enum `RouteStateV1` is private
- --> $WORKSPACE/tests/trybuild/mechanical_impossibility_proof_is_sealed.rs
-  |
-  |     ProducerFinalRouteObservationV1, ProducerResultObservationV1, RouteStateV1,
-  |                                                                   ^^^^^^^^^^^^ private enum
-  |
-note: the enum `RouteStateV1` is defined here
- --> src/mechanical_impossibility.rs
-  |
-  | pub(crate) enum RouteStateV1 {
-  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-
-error[E0603]: enum `TerminalResultObservationV1` is private
- --> $WORKSPACE/tests/trybuild/mechanical_impossibility_proof_is_sealed.rs
-  |
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^
   |     TerminalResultObservationV1,
-  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^ private enum
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^
   |
-note: the enum `TerminalResultObservationV1` is defined here
- --> src/mechanical_impossibility.rs
-  |
-  | pub(crate) enum TerminalResultObservationV1 {
-  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
 
 error[E0599]: no function or associated item named `default` found for struct `MechanicalImpossibilityProofV1` in the current scope
  --> $WORKSPACE/tests/trybuild/mechanical_impossibility_proof_is_sealed.rs
