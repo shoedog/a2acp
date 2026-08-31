@@ -401,6 +401,14 @@ pub trait AgentBackend: Send + Sync {
         Err(BridgeError::ResourceFlightUnsupported)
     }
 
+    fn transfer_cleanup_deadline_v1(
+        &self,
+        _session: &SessionId,
+        _reason: crate::resource_flight::BoundedRecoveryReasonV1,
+    ) -> Result<crate::retained_resource_flight::CleanupDeadlineTransferV1, BridgeError> {
+        Err(BridgeError::ResourceFlightUnsupported)
+    }
+
     /// Prefix-attestation capability for this resolved backend instance. The default is
     /// conservative: unsupported backends keep all text once sanitization is enabled.
     fn prefix_attestation_capability(&self) -> PrefixAttestationCapability {

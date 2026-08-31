@@ -13,7 +13,7 @@ pub enum SchedulerArmV1 {
 }
 
 /// The sole executable representation of scheduler priority.
-const SCHEDULER_ARM_PRIORITY_V1: [SchedulerArmV1; 8] = [
+pub(crate) const SCHEDULER_ARM_PRIORITY_V1: [SchedulerArmV1; 8] = [
     SchedulerArmV1::DrainReadyNodeCompletions,
     SchedulerArmV1::DurableTriggerBarrierAcknowledgements,
     SchedulerArmV1::WorkflowOrExternalCancellation,

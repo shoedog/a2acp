@@ -1687,6 +1687,14 @@ impl RetainedResourceFlight {
         Ok(settlement.result)
     }
 
+    pub fn transfer_cleanup_deadline_now(
+        self: &Arc<Self>,
+        reason: BoundedRecoveryReasonV1,
+    ) -> Result<CleanupDeadlineTransferV1, RetainedResourceFlightError> {
+        let guard = self.retain()?;
+        self.transfer_cleanup_deadline(self.clock.elapsed_ms(), guard, reason)
+    }
+
     /// No production timer is started here. At a supplied clock deadline this
     /// consumes the exact guard, journals transfer before terminal settlement,
     /// and returns that guard to the recovery owner.

@@ -31,6 +31,8 @@ use bridge_core::preparation_flight::{
     BoundedPreparationTransferReasonV1, PreparationClockV1, PreparationFlightIdV1,
     PreparationFlightStateV1,
 };
+use bridge_core::resource_flight::BoundedRecoveryReasonV1;
+use bridge_core::retained_resource_flight::CleanupDeadlineTransferV1;
 use bridge_core::terminal_evidence::{AcpChildLiveness, EvidenceCapability};
 use bridge_core::SessionCwd;
 use serde::{Deserialize, Serialize};
@@ -4609,6 +4611,14 @@ impl AgentBackend for WorktreeBackend {
         session: &SessionId,
     ) -> Result<BackendResourceFlightV1, BridgeError> {
         self.inner.attach_resource_flight_owner_v1(session)
+    }
+
+    fn transfer_cleanup_deadline_v1(
+        &self,
+        session: &SessionId,
+        reason: BoundedRecoveryReasonV1,
+    ) -> Result<CleanupDeadlineTransferV1, BridgeError> {
+        self.inner.transfer_cleanup_deadline_v1(session, reason)
     }
 
     async fn cancel(&self, session: &SessionId) -> Result<(), BridgeError> {
