@@ -3,9 +3,11 @@
 use crate::attempt_activity::{MonotonicClock, SystemMonotonicClock};
 use crate::execution_policy::Sha256HexV1;
 use crate::ids::{AttemptId, NodeId};
+use crate::resource_flight::BoundedRecoveryReasonV1;
 use crate::resource_flight::{
     ResourceActionDispositionV1, ResourceActionResultV1, ResourceFlightIdV1, ResourceIdentityV1,
 };
+use crate::retained_resource_flight::CleanupDeadlineTransferV1;
 use crate::retained_resource_flight::{
     ContainerRemovalObservationV1, InMemoryResourceFlightJournal,
     NoopResourceFlightResultPublisher, ResourceActionIntentV1, ResourceFlightJournal,
@@ -533,6 +535,21 @@ impl ReapController {
             }
             Some(_) => Err(ReapFailure::OwnershipLabelsChanged),
         }
+    }
+
+    pub fn transfer_cleanup_deadline(
+        &self,
+        reason: BoundedRecoveryReasonV1,
+    ) -> Result<CleanupDeadlineTransferV1, ReapFailure> {
+        let managed = self
+            .managed
+            .as_ref()
+            .filter(|managed| managed.protected_v3)
+            .ok_or(ReapFailure::FlightRefused)?;
+        managed
+            .flight
+            .transfer_cleanup_deadline_now(reason)
+            .map_err(|_| ReapFailure::FlightRefused)
     }
 
     pub fn attach_owner(&self, owner: ResourceFlightOwnerV1) -> Result<bool, ReapFailure> {

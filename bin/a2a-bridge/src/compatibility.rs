@@ -5463,11 +5463,15 @@ pub(crate) async fn compatibility_cmd(
 mod tests {
     use super::*;
     use std::collections::VecDeque;
+    use std::ffi::OsStr;
     use std::io::{Seek, SeekFrom};
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt as _;
+    use std::process::Command;
     use std::sync::atomic::AtomicBool;
     use std::sync::{Arc, Mutex};
+
+    const ISOLATED_STAGED_CANDIDATE_TEST: &str = "A2A_BRIDGE_ISOLATED_STAGED_CANDIDATE_TEST";
 
     #[cfg(unix)]
     fn running_as_root() -> bool {
@@ -5535,6 +5539,53 @@ mod tests {
         )
         .unwrap();
         create_scratch_dir(&pin).unwrap()
+    }
+
+    fn isolated_test_name(test_name: &str) -> String {
+        let module = module_path!()
+            .split_once("::")
+            .map(|(_, module)| module)
+            .unwrap_or_else(|| module_path!());
+        format!("{module}::{test_name}")
+    }
+
+    fn bounded_child_output(bytes: &[u8]) -> String {
+        const LIMIT: usize = 4096;
+        let retained = bytes.len().min(LIMIT);
+        let mut output = String::from_utf8_lossy(&bytes[..retained]).into_owned();
+        if bytes.len() > LIMIT {
+            output.push_str("\n... output truncated ...");
+        }
+        output
+    }
+
+    fn run_in_isolated_test_child(test_name: &str) -> bool {
+        let exact_name = isolated_test_name(test_name);
+        if std::env::var_os(ISOLATED_STAGED_CANDIDATE_TEST).as_deref()
+            == Some(OsStr::new(&exact_name))
+        {
+            return false;
+        }
+        let output = Command::new(std::env::current_exe().expect("current test executable"))
+            .arg("--exact")
+            .arg(&exact_name)
+            .arg("--test-threads=1")
+            .env(ISOLATED_STAGED_CANDIDATE_TEST, &exact_name)
+            .output()
+            .unwrap_or_else(|error| panic!("isolated child {exact_name}: spawn failed: {error}"));
+        let stdout = bounded_child_output(&output.stdout);
+        let stderr = bounded_child_output(&output.stderr);
+        assert!(
+            stdout.contains("running 1 test"),
+            "isolated child {exact_name} did not select exactly one test\nstatus: {:?}\nstdout:\n{stdout}\nstderr:\n{stderr}",
+            output.status
+        );
+        assert!(
+            output.status.success(),
+            "isolated child {exact_name} failed\nstatus: {:?}\nstdout:\n{stdout}\nstderr:\n{stderr}",
+            output.status
+        );
+        true
     }
 
     fn case(id: &str, expected_status: EvidenceStatus) -> CompatibilityCase {
@@ -8677,6 +8728,11 @@ agent_cli = "@openai/codex=0.144.1"
     #[tokio::test]
     async fn staged_candidate_is_owner_executable_nonwritable_and_digest_drift_refuses_before_spawn(
     ) {
+        if run_in_isolated_test_child(
+            "staged_candidate_is_owner_executable_nonwritable_and_digest_drift_refuses_before_spawn",
+        ) {
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
         let bytes = b"#!/bin/sh\nexit 0\n".to_vec();
         let source = dir.path().join("source");
@@ -8744,6 +8800,10 @@ agent_cli = "@openai/codex=0.144.1"
     #[cfg(unix)]
     #[tokio::test]
     async fn staged_candidate_exec_is_bound_to_the_verified_file_object() {
+        if run_in_isolated_test_child("staged_candidate_exec_is_bound_to_the_verified_file_object")
+        {
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
         let snapshot = local_file::read_regular_file_bounded(
             Path::new("/usr/bin/true"),
@@ -8795,6 +8855,9 @@ agent_cli = "@openai/codex=0.144.1"
     #[cfg(unix)]
     #[tokio::test]
     async fn staged_candidate_nonzero_exit_retains_process_status() {
+        if run_in_isolated_test_child("staged_candidate_nonzero_exit_retains_process_status") {
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
         let snapshot = local_file::read_regular_file_bounded(
             Path::new("/usr/bin/false"),
@@ -8840,6 +8903,11 @@ agent_cli = "@openai/codex=0.144.1"
     #[cfg(unix)]
     #[tokio::test]
     async fn staged_candidate_cannot_be_overwritten_in_place_after_digest_check() {
+        if run_in_isolated_test_child(
+            "staged_candidate_cannot_be_overwritten_in_place_after_digest_check",
+        ) {
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
         let snapshot = local_file::read_regular_file_bounded(
             Path::new("/usr/bin/true"),
@@ -8885,6 +8953,31 @@ agent_cli = "@openai/codex=0.144.1"
             .await;
 
         assert!(result.process_success);
+    }
+
+    #[test]
+    fn staged_candidate_isolated_child_failure_propagates_to_outer_failure() {
+        let test_name = "staged_candidate_isolated_child_failure_propagates_to_outer_failure";
+        if std::env::var_os(ISOLATED_STAGED_CANDIDATE_TEST).as_deref()
+            == Some(OsStr::new(&isolated_test_name(test_name)))
+        {
+            panic!("intentional isolated staged-candidate child failure");
+        }
+        let result = std::panic::catch_unwind(|| {
+            assert!(run_in_isolated_test_child(test_name));
+        });
+        let panic = result.expect_err("outer test must observe the isolated child failure");
+        let message = panic
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| panic.downcast_ref::<&'static str>().copied())
+            .unwrap_or("<non-string panic>");
+        assert!(
+            message.contains("isolated child")
+                && message.contains("failed")
+                && message.contains("intentional isolated staged-candidate child failure"),
+            "{message}"
+        );
     }
 
     #[test]

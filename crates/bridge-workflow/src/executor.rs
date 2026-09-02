@@ -1,12 +1,17 @@
 //! WorkflowExecutor — runs a validated DAG over the registry. Each node: configure_session
 //! → prompt → concatenate Update::Text into the node output. Cancel via token.
+use crate::cancellation_settlement as cs;
 use crate::fanout::{
     classify_offline_barrier_error_v1, FanOutControllerV1, PolicyActionV1,
     PolicyTriggerBarrierResultV1, ReadyNodeTerminalV1,
 };
 use crate::graph::{WorkflowGraph, WorkflowNode};
 use crate::run_spec::WorkflowRunSpecV1;
+use crate::scheduler_arbitration as sa;
 use crate::template::render;
+use bridge_core::attempt_activity::{
+    ActivityKind, ActivityReason, AttemptActivity, AttemptPhase, AttemptScheduleV1,
+};
 use bridge_core::attestation::{
     append_prompt_contract, prefix_attestation_request_for_capability, HarvestSanitizationMode,
     PrefixAttestationCapability, PrefixAttestationStatus,
@@ -15,6 +20,7 @@ use bridge_core::domain::{
     effective_config, AgentEntry, AgentOverride, EffectiveConfig, Part, SessionSpec,
 };
 use bridge_core::error::BridgeError;
+use bridge_core::execution_policy as ep;
 use bridge_core::execution_policy::{
     freeze_provider_attempt_v1, BoundProviderEffectV1, BoundSessionSpecV1, DependencySetRefV1,
     FrozenNodeExecutionIdentityV1, FrozenProviderLogicalSessionV1, LedgerAdmissionV1, NodeCauseV1,
@@ -22,10 +28,13 @@ use bridge_core::execution_policy::{
     PolicyNodeRefV1, PolicyTriggerV1, ProviderEffectKeyV1, ProviderFreezeInputV1, Sha256HexV1,
     SynthesisModeV1, EXECUTION_POLICY_SCHEMA_V1,
 };
+use bridge_core::fixed_grace_timer::FixedGraceTimerV1;
 use bridge_core::harvest::{
     commit_harvested_completion, CompletionBodyOrigin, HarvestAuditStore, NoopHarvestAuditStore,
 };
 use bridge_core::ids::{ContextId, NodeId, OperationId, SessionId};
+use bridge_core::mechanical_impossibility as mi;
+use bridge_core::no_progress_warning::{NoProgressWarningEpochV1, NO_PROGRESS_WARNING_INTERVAL_MS};
 use bridge_core::orch::UsageSnapshot;
 use bridge_core::permission::TurnMeta;
 use bridge_core::ports::{
@@ -35,6 +44,8 @@ use bridge_core::ports::{
     RichEventSinkFactory, TurnContext, TurnOutcome, Update, UsageFinalization,
     WorkflowCheckoutOutcomeV1, STOP_REASON_CANCELLED,
 };
+use bridge_core::resource_flight::BoundedRecoveryReasonV1;
+use bridge_core::retained_resource_flight::CleanupDeadlineTransferV1;
 use bridge_core::SessionCwd;
 use futures::stream::FuturesUnordered;
 use futures::{FutureExt, StreamExt};
@@ -53,6 +64,21 @@ enum PostRecordingExitFaultForTest {
     PolicyFinalize,
     Encode,
     Invariant,
+    SchedulerArmed(bool),
+    AcknowledgementExternalCancel(bool),
+}
+
+#[cfg(test)]
+fn inject_acknowledgement_external_cancel_for_test(
+    ctx: &WorkflowRunContext,
+    cancel: &CancellationToken,
+) {
+    if matches!(
+        ctx.post_recording_exit_fault,
+        Some(PostRecordingExitFaultForTest::AcknowledgementExternalCancel(_))
+    ) {
+        cancel.cancel();
+    }
 }
 
 /// Per-request context forwarded opaquely through the executor to each node's
@@ -112,6 +138,7 @@ pub type PolicyTriggerBarrier = Arc<
         + Send
         + Sync,
 >;
+type BarrierFut = futures::future::BoxFuture<'static, PolicyTriggerBarrierResultV1>;
 
 async fn reach_policy_trigger_barrier_v1(
     admission: &LedgerAdmissionV1,
@@ -543,9 +570,187 @@ pub trait WorkflowNodeDispatcher: Send + Sync {
 /// Uniform future type used in the per-run `FuturesUnordered` pool.
 /// Each fan-out node is boxed to this type so `FuturesUnordered` can hold
 /// futures of different async-block monomorphisations in one collection.
-type NodeFut<'a> = std::pin::Pin<
-    Box<dyn futures::Future<Output = (NodeId, Result<NodeRunOutput, BridgeError>)> + Send + 'a>,
->;
+type NodeFut<'a> =
+    std::pin::Pin<Box<dyn futures::Future<Output = TimedNodeCompletionV1> + Send + 'a>>;
+type TimedNodeCompletionV1 = (NodeId, u64, Result<NodeRunOutput, BridgeError>);
+type ReadyEventEvidenceValueV1 = (String, Option<String>, Option<PolicyTriggerBarrierResultV1>);
+type ReadyEventEvidenceV1 = BTreeMap<NodeId, ReadyEventEvidenceValueV1>;
+
+enum SchedulerWakeV1<T> {
+    NodeCompletion(Option<T>),
+    BarrierAcknowledgement(PolicyTriggerBarrierResultV1),
+    Control(sa::SchedulerArmV1),
+}
+
+impl<T> SchedulerWakeV1<T> {
+    fn arm(&self) -> sa::SchedulerArmV1 {
+        match self {
+            Self::NodeCompletion(_) => sa::SchedulerArmV1::DrainReadyNodeCompletions,
+            Self::BarrierAcknowledgement(_) => {
+                sa::SchedulerArmV1::DurableTriggerBarrierAcknowledgements
+            }
+            Self::Control(arm) => *arm,
+        }
+    }
+}
+
+macro_rules! scheduler_select_v1 {
+    ($inflight:expr, $active:expr, $barrier:expr, $barrier_armed:expr, $ack:expr,
+     $cancel:expr, $cancel_seen:expr, $schedule:expr, $started:expr, $grace:expr,
+     $cutoff:expr, $proof:expr, $warning:expr, $wait:expr) => {{
+        use crate::scheduler_arbitration::SchedulerArmV1 as Arm;
+        use SchedulerWakeV1 as Wake;
+        tokio::select! {
+            biased;
+            first = ($inflight).next(), if !($inflight).is_empty() =>
+                Wake::NodeCompletion(first),
+            barrier = async {
+                ($barrier).as_mut().expect("the barrier arm is state-gated").await
+            }, if $active && $barrier_armed => Wake::BarrierAcknowledgement(barrier),
+            _ = std::future::ready(()), if $active && $ack =>
+                Wake::Control(Arm::DurableTriggerBarrierAcknowledgements),
+            _ = ($cancel).cancelled(), if $active && !$cancel_seen =>
+                Wake::Control(Arm::WorkflowOrExternalCancellation),
+            _ = wait_for_attempt_offset_v1($schedule, $started, $grace.unwrap_or(u64::MAX)),
+                if $active && $grace.is_some() => Wake::Control(Arm::FixedGraceExpiry),
+            _ = wait_for_attempt_offset_v1($schedule, $started, $cutoff.unwrap_or(u64::MAX)),
+                if $active && $cutoff.is_some() => Wake::Control(Arm::AbsoluteCutoff),
+            _ = std::future::ready(()), if $active && $proof =>
+                Wake::Control(Arm::MechanicallyProvedImpossibility),
+            _ = wait_for_attempt_offset_v1($schedule, $started, $warning), if $active =>
+                Wake::Control(Arm::DueNoProgressSnapshots),
+            _ = wait_for_attempt_offset_v1($schedule, $started, $wait),
+                if $active && $wait != u64::MAX =>
+                Wake::Control(Arm::WaitForNodeActivityControlOrClock),
+        }
+    }};
+}
+
+struct ArbitratedReadyBatchV1<T> {
+    winner: sa::SchedulerArmV1,
+    ready: Vec<(NodeId, u64, T)>,
+    nodes_to_cancel: Vec<NodeId>,
+    post_cutoff_nodes: HashSet<NodeId>,
+    cutoff_applied: bool,
+}
+
+fn arbitrate_ready_batch_v1<T>(
+    ready: Vec<(NodeId, u64, T)>,
+    mut readiness: sa::SchedulerArbitrationReadinessV1,
+    tie_facts: sa::SchedulerTieFactsV1,
+) -> ArbitratedReadyBatchV1<T> {
+    let mut ready = ready;
+    readiness
+        .ready_node_completions
+        .extend(
+            ready
+                .iter()
+                .map(|(node_id, ready_at_ms, _)| sa::ReadyNodeCompletionV1 {
+                    node_id: node_id.clone(),
+                    ready_at_ms: *ready_at_ms,
+                }),
+        );
+    let cutoff_reached = readiness.absolute_cutoff_reached;
+    let decision = sa::arbitrate_scheduler_v1(readiness, tie_facts);
+    let cutoff_applied = matches!(
+        decision.winner,
+        sa::SchedulerArmV1::DrainReadyNodeCompletions | sa::SchedulerArmV1::AbsoluteCutoff
+    ) && cutoff_reached;
+    let post_cutoff_nodes = decision
+        .post_cutoff_completions
+        .iter()
+        .map(|completion| completion.node_id.clone())
+        .collect();
+    ready.sort_by(|left, right| left.0.cmp(&right.0));
+    ArbitratedReadyBatchV1 {
+        winner: decision.winner,
+        ready,
+        nodes_to_cancel: decision.nodes_to_cancel_after_winner,
+        post_cutoff_nodes,
+        cutoff_applied,
+    }
+}
+
+async fn wait_for_attempt_offset_v1(schedule: &AttemptScheduleV1, started_ms: u64, bound_ms: u64) {
+    loop {
+        let remaining_ms = schedule.observe(started_ms, bound_ms).remaining_ms;
+        if remaining_ms == 0 {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(remaining_ms)).await;
+    }
+}
+
+fn scheduler_cleanup_record_v1(
+    transfer: &CleanupDeadlineTransferV1,
+    preservation: cs::TypedWorktreePreservationV1,
+    elapsed_ms: u64,
+    deadline_ms: u64,
+) -> Option<u64> {
+    let observation = match transfer {
+        CleanupDeadlineTransferV1::Transferred { recovery_owner, .. } => {
+            ep::NodeCleanupObservationV1::Unsettled(deadline_ms, recovery_owner.clone())
+        }
+        CleanupDeadlineTransferV1::Unknown { result, proof, .. } => match proof {
+            Some(proof) => ep::NodeCleanupObservationV1::UnsettledUnknownOwnerless(
+                result.duration_ms,
+                proof.clone(),
+            ),
+            None => ep::NodeCleanupObservationV1::UnsettledUnknownOwned(
+                result.duration_ms,
+                result.recovery_owner.clone()?,
+            ),
+        },
+        CleanupDeadlineTransferV1::NotDue { .. } => return None,
+    };
+    match cs::WorkflowNodeCancellationSettlementV1::new(
+        observation,
+        elapsed_ms,
+        deadline_ms,
+        cs::CleanupOwnershipAuditV1::default(),
+    )
+    .after_preservation(preservation)
+    .into_disposition()
+    .ok()?
+    .cleanup
+    {
+        ep::NodeCleanupV2::Partial { duration_ms, .. }
+        | ep::NodeCleanupV2::Unknown { duration_ms, .. } => Some(duration_ms),
+        _ => None,
+    }
+}
+
+fn scheduler_impossibility_proof_v1(
+    graph: &WorkflowGraph,
+    done: &HashSet<String>,
+    node_cancels: &BTreeMap<NodeId, CancellationToken>,
+    stop_scheduling: bool,
+) -> Option<mi::MechanicalImpossibilityProofV1> {
+    let route = |node: &WorkflowNode| {
+        if done.contains(node.id.as_str())
+            || (stop_scheduling && !node_cancels.contains_key(&node.id))
+        {
+            mi::RouteStateV1::IrreversiblyClosed
+        } else {
+            mi::RouteStateV1::Open
+        }
+    };
+    let terminal = graph.terminal()?;
+    let routes = mi::ProducerFinalRouteObservationV1 {
+        producer_routes: graph.nodes.iter().map(route).collect(),
+        final_routes: vec![route(terminal)],
+        terminal_result: if done.contains(terminal.id.as_str()) {
+            mi::TerminalResultObservationV1::Present
+        } else if stop_scheduling && !node_cancels.contains_key(&terminal.id) {
+            mi::TerminalResultObservationV1::Absent
+        } else {
+            mi::TerminalResultObservationV1::Unknown
+        },
+    };
+    mi::prove_mechanical_impossibility_v1(
+        mi::MechanicalImpossibilityObservationV1::ProducerAndFinalRoutes(&routes),
+    )
+}
 
 #[derive(Clone)]
 struct NodeHarvestMeta {
@@ -4877,7 +5082,7 @@ impl WorkflowExecutor {
                 .unwrap_or_else(|| {
                     Arc::new(bridge_core::attempt_activity::SystemMonotonicClock::start())
                 });
-            let cleanup_tracker = Arc::new(WorkflowCleanupTracker::new(cleanup_clock));
+            let cleanup_tracker = Arc::new(WorkflowCleanupTracker::new(cleanup_clock.clone()));
             // This macro is deliberately inside the stream, at every post-recording return site.
             // `async_stream` resumes only when the consumer polls; yielding the terminal error
             // before this await would allow a consumer drop to strand a materialized checkout.
@@ -5002,7 +5207,33 @@ impl WorkflowExecutor {
             let mut scheduled: HashSet<String> = HashSet::new();
             let mut stop_scheduling = false; // set on cancel: drain in-flight, schedule nothing new
             let mut node_cancels = BTreeMap::<NodeId, CancellationToken>::new();
-            let mut policy_canceled = HashSet::<String>::new();
+            use NodePrimaryDispositionV1::{CanceledPolicy, CanceledWorkflow};
+            let mut cancellation_primaries = BTreeMap::<NodeId, NodePrimaryDispositionV1>::new();
+            let mut root_cancellation_primary = cancel.is_cancelled().then_some(CanceledWorkflow);
+            macro_rules! observe_external_root_cancellation {
+                () => {{
+                    observe_external_root_cancellation!(cancel.is_cancelled());
+                }};
+                ($cancel_seen:expr) => {{
+                    if $cancel_seen && root_cancellation_primary.is_none() {
+                        root_cancellation_primary = Some(CanceledWorkflow);
+                        for running in node_cancels.keys() {
+                            cancellation_primaries
+                                .entry(running.clone())
+                                .or_insert(CanceledWorkflow);
+                        }
+                    }
+                }};
+            }
+            macro_rules! record_cancellation_primary {
+                ($node:expr, $primary:expr) => {{
+                    let primary = $primary;
+                    if primary == CanceledWorkflow {
+                        root_cancellation_primary.get_or_insert(primary);
+                    }
+                    cancellation_primaries.entry($node.clone()).or_insert(primary);
+                }};
+            }
             let mut node_terminals = structured_seed
                 .as_ref()
                 .map(|structured| {
@@ -5147,6 +5378,7 @@ impl WorkflowExecutor {
                                             let node_id = n.id.clone();
                                             inflight.push(Box::pin(futures::future::ready((
                                                 node_id,
+                                                cleanup_clock.elapsed_ms(),
                                                 Err(error),
                                             ))) as NodeFut);
                                             continue;
@@ -5162,6 +5394,7 @@ impl WorkflowExecutor {
                                             let node_id = n.id.clone();
                                             inflight.push(Box::pin(futures::future::ready((
                                                 node_id,
+                                                cleanup_clock.elapsed_ms(),
                                                 Err(BridgeError::InvalidStateTransition),
                                             ))) as NodeFut);
                                             continue;
@@ -5184,6 +5417,7 @@ impl WorkflowExecutor {
                                     );
                                     inflight.push(Box::pin(futures::future::ready((
                                         n.id.clone(),
+                                        cleanup_clock.elapsed_ms(),
                                         output,
                                     ))) as NodeFut);
                                     continue;
@@ -5233,6 +5467,7 @@ impl WorkflowExecutor {
                                 let dispatcher = dispatcher.clone();
                                 let preflight_cache = preflight_cache.clone();
                                 let frozen_authority = frozen_authority.clone();
+                                let scheduler_clock = cleanup_clock.clone();
                                 let this = &this;
                                 inflight.push(Box::pin(async move {
                                     let vars: HashMap<&str, &str> =
@@ -5251,7 +5486,11 @@ impl WorkflowExecutor {
                                         &preflight_cache,
                                         frozen_authority.as_ref(),
                                     ).await;
-                                    (node.id.clone(), output)
+                                    (
+                                        node.id.clone(),
+                                        scheduler_clock.elapsed_ms(),
+                                        output,
+                                    )
                                 }) as NodeFut);
                             }
                         }
@@ -5260,27 +5499,377 @@ impl WorkflowExecutor {
                 }};
             }
 
+            let scheduler_started_ms = cleanup_clock.elapsed_ms();
             for node in schedule_ready!() {
                 yield Ok(WorkflowEvent::NodeStarted { node });
             }
-            loop {
-                let workflow_cancel_observable_before_wait = cancel.is_cancelled();
-                let Some(first) = inflight.next().await else {
-                    break;
+            use crate::scheduler_arbitration::SchedulerArmV1 as Arm;
+            let scheduler_active = ep::scheduler_activation_readiness_v1()
+                == ep::SchedulerActivationReadinessV1::Armed
+                && frozen_authority.as_ref().is_some_and(|authority| {
+                    authority.run_spec.controls.deadline_activation
+                        == ep::DeadlineActivationV2::AutomaticR2f1b
+                });
+            #[cfg(test)]
+            let scheduler_active = scheduler_active
+                || matches!(
+                    ctx.post_recording_exit_fault,
+                    Some(PostRecordingExitFaultForTest::SchedulerArmed(_))
+                        | Some(PostRecordingExitFaultForTest::AcknowledgementExternalCancel(true))
+                );
+            let scheduler_schedule = AttemptScheduleV1::new(cleanup_clock.clone());
+            let scheduler_work_cutoff_ms = frozen_authority
+                .as_ref()
+                .map(|authority| authority.run_spec.controls.effective_work_cutoff_ms())
+                .unwrap_or(u64::MAX);
+            let mut durable_trigger_acknowledgement = None;
+            let mut durable_trigger_barrier: Option<BarrierFut> = None;
+            let mut barrier_selected_evidence: Option<(NodeId, ReadyEventEvidenceValueV1)> =
+                None;
+            let mut retained_completed = Vec::new();
+            let mut retained_event_evidence = ReadyEventEvidenceV1::new();
+            let mut observed_arms = HashSet::new();
+            let mut fixed_grace_timer = FixedGraceTimerV1::new();
+            let mut fixed_grace_due_ms = None;
+            let mut no_progress_epoch = NoProgressWarningEpochV1::new(0);
+            let mut next_warning_due_ms = NO_PROGRESS_WARNING_INTERVAL_MS;
+            let mut scheduler_cleanup: Option<(u64, u64)> = None;
+            let mut scheduler_cleanup_durations = BTreeMap::<NodeId, u64>::new();
+            macro_rules! arm_scheduler_cleanup {
+                () => {
+                    if scheduler_cleanup.is_none() {
+                        let anchor = cleanup_clock.elapsed_ms();
+                        let deadline = ep::cleanup_deadline_after_cancellation_ms_v1(
+                            anchor.saturating_sub(scheduler_started_ms),
+                            scheduler_work_cutoff_ms,
+                        );
+                        scheduler_cleanup = Some((anchor, deadline));
+                    }
                 };
-                let mut ready = vec![first];
-                while let Some(Some(next)) = inflight.next().now_or_never() {
-                    ready.push(next);
+            }
+            loop {
+                observe_external_root_cancellation!();
+                if node_cancels.is_empty() {
+                    scheduler_cleanup = None;
+                    fixed_grace_due_ms = None;
                 }
-                ready.sort_by(|left, right| left.0.cmp(&right.0));
+
+                if inflight.is_empty()
+                    && durable_trigger_barrier.is_none()
+                    && durable_trigger_acknowledgement.is_none()
+                    && retained_completed.is_empty()
+                {
+                    break;
+                }
+                let workflow_cancel_observable_before_wait = cancel.is_cancelled();
+                let mut impossibility_proof = scheduler_active
+                    .then(|| scheduler_impossibility_proof_v1(
+                        graph.as_ref(), &done, &node_cancels, stop_scheduling,
+                    ))
+                    .flatten()
+                    .filter(|_| !observed_arms.contains(&Arm::MechanicallyProvedImpossibility));
+                let cleanup_due_ms = scheduler_cleanup
+                    .map(|(anchor, deadline)| anchor.saturating_add(deadline))
+                    .map(|due| due.saturating_sub(scheduler_started_ms))
+                    .unwrap_or(u64::MAX);
+                let wait_due_ms = fixed_grace_due_ms
+                    .unwrap_or(u64::MAX)
+                    .min(if !observed_arms.contains(&Arm::AbsoluteCutoff) {
+                        scheduler_work_cutoff_ms
+                    } else {
+                        u64::MAX
+                    })
+                    .min(next_warning_due_ms)
+                    .min(cleanup_due_ms);
+                let barrier_armed = durable_trigger_barrier.is_some();
+                let scheduler_wake = scheduler_select_v1!(
+                    &mut inflight,
+                    scheduler_active,
+                    &mut durable_trigger_barrier,
+                    barrier_armed,
+                    durable_trigger_acknowledgement.is_some(),
+                    cancel,
+                    observed_arms.contains(&Arm::WorkflowOrExternalCancellation),
+                    &scheduler_schedule,
+                    scheduler_started_ms,
+                    fixed_grace_due_ms,
+                    (!observed_arms.contains(&Arm::AbsoluteCutoff))
+                        .then_some(scheduler_work_cutoff_ms),
+                    impossibility_proof.is_some(),
+                    next_warning_due_ms,
+                    wait_due_ms
+                );
+                let mut selected_arm = scheduler_wake.arm();
+                let mut ready = match scheduler_wake {
+                    SchedulerWakeV1::NodeCompletion(Some(first)) => {
+                        observe_external_root_cancellation!();
+                        let mut ready = vec![first];
+                        while let Some(Some(next)) = inflight.next().now_or_never() {
+                            ready.push(next);
+                        }
+                        ready
+                    }
+                    SchedulerWakeV1::BarrierAcknowledgement(acknowledgement) => {
+                        durable_trigger_barrier = None;
+                        durable_trigger_acknowledgement = Some(acknowledgement);
+                        Vec::new()
+                    }
+                    SchedulerWakeV1::NodeCompletion(None) | SchedulerWakeV1::Control(_) => Vec::new(),
+                };
+                let mut post_cutoff_nodes = HashSet::new();
+                if !ready.is_empty() && durable_trigger_acknowledgement.is_none() {
+                    if let Some(barrier) = durable_trigger_barrier.as_mut() {
+                        if let Some(acknowledgement) = barrier.as_mut().now_or_never() {
+                            durable_trigger_barrier = None;
+                            durable_trigger_acknowledgement = Some(acknowledgement);
+                        }
+                    }
+                }
+                #[cfg(test)]
+                if !ready.is_empty()
+                    && ctx.post_recording_exit_fault
+                        == Some(PostRecordingExitFaultForTest::SchedulerArmed(true))
+                {
+                    durable_trigger_barrier = None;
+                    durable_trigger_acknowledgement =
+                        Some(PolicyTriggerBarrierResultV1::ServedPrimaryCommitted);
+                }
+                if scheduler_active && selected_arm == Arm::DrainReadyNodeCompletions {
+                    let arbitration = arbitrate_ready_batch_v1(
+                        ready,
+                        sa::SchedulerArbitrationReadinessV1 {
+                            ready_node_completions: Vec::new(),
+                            durable_trigger_barrier_acknowledgements:
+                                durable_trigger_acknowledgement.is_some(),
+                            workflow_or_external_cancellation: cancel.is_cancelled()
+                                && !observed_arms
+                                    .contains(&Arm::WorkflowOrExternalCancellation),
+                            fixed_grace_expired: fixed_grace_due_ms.is_some_and(|bound| {
+                                scheduler_schedule.observe(scheduler_started_ms, bound).due
+                            }),
+                            absolute_cutoff_reached: !observed_arms.contains(&Arm::AbsoluteCutoff)
+                                && scheduler_schedule
+                                    .observe(scheduler_started_ms, scheduler_work_cutoff_ms)
+                                    .due,
+                            mechanical_impossibility_proved: impossibility_proof.is_some(),
+                            no_progress_snapshot_due: scheduler_schedule
+                                .observe(scheduler_started_ms, next_warning_due_ms)
+                                .due,
+                        },
+                        sa::SchedulerTieFactsV1 {
+                            absolute_cutoff_at_ms:
+                                scheduler_started_ms.saturating_add(scheduler_work_cutoff_ms),
+                            inflight_nodes: node_cancels.keys().cloned().collect(),
+                        },
+                    );
+                    if arbitration.cutoff_applied {
+                        arm_scheduler_cleanup!();
+                    }
+                    for node in &arbitration.nodes_to_cancel {
+                        if let Some(token) = node_cancels.get(node) {
+                            record_cancellation_primary!(node, CanceledPolicy);
+                            token.cancel();
+                        }
+                    }
+                    if arbitration.cutoff_applied {
+                        observed_arms.insert(Arm::AbsoluteCutoff);
+                        stop_scheduling = true;
+                    }
+                    selected_arm = arbitration.winner;
+                    post_cutoff_nodes = arbitration.post_cutoff_nodes;
+                    ready = arbitration.ready;
+                } else {
+                    ready.sort_by(|left, right| left.0.cmp(&right.0));
+                }
+
+                match selected_arm {
+                    Arm::DrainReadyNodeCompletions => {}
+                    Arm::DurableTriggerBarrierAcknowledgements => {
+                        let barrier = durable_trigger_acknowledgement
+                            .take()
+                            .expect("the acknowledgement arm is state-gated");
+                        if let Some((node, mut evidence)) =
+                            barrier_selected_evidence.take()
+                        {
+                            evidence.2 = Some(barrier.clone());
+                            retained_event_evidence.insert(node, evidence);
+                        }
+                        #[cfg(test)]
+                        inject_acknowledgement_external_cancel_for_test(&ctx, &cancel);
+                        let acknowledgement_cancelled = cancel.is_cancelled();
+                        observe_external_root_cancellation!(acknowledgement_cancelled);
+                        let action = fanout_controller.as_mut().map_or(
+                            PolicyActionV1::None,
+                            |controller| {
+                                controller.acknowledge_barrier(barrier, acknowledgement_cancelled)
+                            },
+                        );
+                        match action {
+                            PolicyActionV1::CancelRunningSiblings => {
+                                arm_scheduler_cleanup!();
+                                for (node, token) in &node_cancels {
+                                    record_cancellation_primary!(node, CanceledPolicy);
+                                    token.cancel();
+                                }
+                            }
+                            PolicyActionV1::GlobalCancelAndDrain => {
+                                arm_scheduler_cleanup!();
+                                for node in node_cancels.keys() {
+                                    record_cancellation_primary!(node, CanceledPolicy);
+                                }
+                                root_cancellation_primary.get_or_insert(CanceledPolicy);
+                                cancel.cancel();
+                            }
+                            PolicyActionV1::ArmManualGrace { grace_ms } => {
+                                let now = scheduler_schedule
+                                    .observe(scheduler_started_ms, u64::MAX)
+                                    .elapsed_ms;
+                                let Some(trigger) = fanout_controller
+                                    .as_ref()
+                                    .and_then(FanOutControllerV1::trigger)
+                                else {
+                                    settle_error_before_yield!(
+                                        BridgeError::InvalidStateTransition
+                                    );
+                                };
+                                if fixed_grace_timer
+                                    .arm(
+                                        trigger.node.clone(),
+                                        trigger.id.clone(),
+                                        grace_ms,
+                                        now,
+                                        scheduler_work_cutoff_ms,
+                                    )
+                                    .is_err()
+                                {
+                                    settle_error_before_yield!(
+                                        BridgeError::InvalidStateTransition
+                                    );
+                                }
+                                fixed_grace_due_ms = Some(now.saturating_add(grace_ms));
+                            }
+                            PolicyActionV1::None => {}
+                        }
+                    }
+                    Arm::WorkflowOrExternalCancellation
+                    | Arm::AbsoluteCutoff
+                    | Arm::MechanicallyProvedImpossibility => {
+                        observed_arms.insert(selected_arm);
+                        if selected_arm == Arm::MechanicallyProvedImpossibility {
+                            let _proof = impossibility_proof
+                                .take()
+                                .expect("the impossibility arm requires a minted proof");
+                        }
+                        stop_scheduling = true;
+                        arm_scheduler_cleanup!();
+                        let primary = if selected_arm == Arm::WorkflowOrExternalCancellation {
+                            CanceledWorkflow
+                        } else {
+                            CanceledPolicy
+                        };
+                        for (node, token) in &node_cancels {
+                            record_cancellation_primary!(node, primary);
+                            token.cancel();
+                        }
+                    }
+                    Arm::FixedGraceExpiry => {
+                        fixed_grace_due_ms = None;
+                        let now = scheduler_schedule
+                            .observe(scheduler_started_ms, u64::MAX)
+                            .elapsed_ms;
+                        if fixed_grace_timer.observe_elapsed(now).is_err()
+                            || fanout_controller
+                                .as_mut()
+                                .map_or(
+                                    PolicyActionV1::None,
+                                    FanOutControllerV1::expire_manual_grace,
+                                )
+                                != PolicyActionV1::CancelRunningSiblings
+                        {
+                            settle_error_before_yield!(BridgeError::InvalidStateTransition);
+                        }
+                        arm_scheduler_cleanup!();
+                        for (node, token) in &node_cancels {
+                            record_cancellation_primary!(node, CanceledPolicy);
+                            token.cancel();
+                        }
+                    }
+                    Arm::DueNoProgressSnapshots => {
+                        let warning = no_progress_epoch
+                            .poll_elapsed(
+                                scheduler_schedule
+                                    .observe(scheduler_started_ms, next_warning_due_ms)
+                                    .elapsed_ms,
+                            )
+                            .warning()
+                            .expect("a reached warning boundary has a due ordinal");
+                        tracing::warn!(
+                            ordinal = warning.ordinal,
+                            superseded = warning.superseded_ordinal_count,
+                            "workflow attempt has made no meaningful progress"
+                        );
+                        next_warning_due_ms = warning
+                            .ordinal
+                            .saturating_add(1)
+                            .saturating_mul(NO_PROGRESS_WARNING_INTERVAL_MS)
+                            .saturating_add(warning.last_meaningful_progress_elapsed_ms);
+                    }
+                    Arm::WaitForNodeActivityControlOrClock => {
+                        if let Some((anchor, deadline)) = scheduler_cleanup.take() {
+                            let now = cleanup_clock.elapsed_ms();
+                            for (node, owner) in cleanup_tracker.materialized_checkouts() {
+                                if !node_cancels.contains_key(&node) {
+                                    continue;
+                                }
+                                use ep::WorktreePreservationDispositionV1 as Preservation;
+                                let disposition = match owner
+                                    .backend
+                                    .preserve_checkout_v1(
+                                        &owner.session,
+                                        CheckoutPreservationReasonV1::Cancellation,
+                                    )
+                                    .await
+                                {
+                                    CheckoutPreservationV1::NoCheckoutUnderCustody => Preservation::NotNeeded,
+                                    CheckoutPreservationV1::Preserved => Preservation::Preserved,
+                                    _ => Preservation::Unknown,
+                                };
+                                let transfer = match owner.backend.transfer_cleanup_deadline_v1(
+                                    &owner.session,
+                                    BoundedRecoveryReasonV1::new("workflow cleanup deadline")
+                                        .expect("static recovery reason is bounded"),
+                                ) {
+                                    Ok(transfer) => transfer,
+                                    Err(error) => settle_error_before_yield!(error),
+                                };
+                                if let Some(duration) = scheduler_cleanup_record_v1(
+                                    &transfer,
+                                    cs::TypedWorktreePreservationV1::new(
+                                        ep::WorktreePreservationResultV1 {
+                                            disposition,
+                                            custody_id: None,
+                                            claim_digest: None,
+                                        },
+                                    )
+                                    .expect("scheduler preservation is terminal"),
+                                    now.saturating_sub(anchor),
+                                    deadline,
+                                ) {
+                                    scheduler_cleanup_durations.insert(node, duration);
+                                }
+                            }
+                        }
+                        observe_external_root_cancellation!();
+                    }
+                }
+                if ready.is_empty() && retained_completed.is_empty() {
+                    continue;
+                }
 
                 let mut completed = Vec::with_capacity(ready.len());
                 let mut ready_terminals = Vec::with_capacity(ready.len());
-                let mut ready_event_evidence = BTreeMap::<
-                    NodeId,
-                    (String, Option<String>, Option<PolicyTriggerBarrierResultV1>),
-                >::new();
-                for (node_id, raw_output) in ready {
+                let mut ready_event_evidence = ReadyEventEvidenceV1::new();
+                for (node_id, _ready_at_ms, raw_output) in ready {
                     node_cancels.remove(&node_id);
                     let raw_output = match raw_output {
                         Ok(output) => output,
@@ -5300,6 +5889,13 @@ impl WorkflowExecutor {
                         .remove(&node_id)
                         .unwrap_or(false);
                     let dependency_set = scheduled_dependency_sets.remove(&node_id);
+                    let post_cutoff = post_cutoff_nodes.remove(&node_id);
+                    let disposition = if post_cutoff {
+                        NodeDisposition::Canceled
+                    } else {
+                        disposition
+                    };
+                    let ok = ok && !post_cutoff;
                     let disposition = if disposition == NodeDisposition::Completed
                         && degraded_ancestry
                     {
@@ -5357,8 +5953,17 @@ impl WorkflowExecutor {
                     } else {
                         raw_text
                     };
-                    let (cleanup, cleanup_error) = cleanup_tracker.node_observation(&node_id);
+                    let (mut cleanup, cleanup_error) = cleanup_tracker.node_observation(&node_id);
+                    if let Some(duration) = scheduler_cleanup_durations.remove(&node_id) {
+                        cleanup.duration_ms = cleanup.duration_ms.max(duration);
+                        if cleanup.disposition != NodeCleanupDispositionV1::Failed {
+                            cleanup.disposition = NodeCleanupDispositionV1::UnknownLegacy;
+                        }
+                    }
                     let terminal_error = primary_error.as_ref().or(cleanup_error.as_ref());
+                    if disposition == NodeDisposition::Canceled {
+                        observe_external_root_cancellation!();
+                    }
                     let primary = match disposition {
                         NodeDisposition::Completed | NodeDisposition::CompletedDegraded => {
                             NodePrimaryDispositionV1::Completed
@@ -5369,12 +5974,14 @@ impl WorkflowExecutor {
                             NodePrimaryDispositionV1::TimedOut
                         }
                         NodeDisposition::Failed => NodePrimaryDispositionV1::Failed,
-                        NodeDisposition::Canceled
-                            if policy_canceled.contains(node_id.as_str()) =>
-                        {
-                            NodePrimaryDispositionV1::CanceledPolicy
-                        }
-                        NodeDisposition::Canceled => NodePrimaryDispositionV1::CanceledWorkflow,
+                        NodeDisposition::Canceled => cancellation_primaries
+                            .get(&node_id)
+                            .copied()
+                            .unwrap_or(if root_cancellation_primary == Some(CanceledWorkflow) {
+                                CanceledWorkflow
+                            } else {
+                                NodePrimaryDispositionV1::CanceledNode
+                            }),
                         NodeDisposition::SkippedDependency => {
                             NodePrimaryDispositionV1::SkippedDependency
                         }
@@ -5401,7 +6008,8 @@ impl WorkflowExecutor {
                 }
 
                 let mut action = PolicyActionV1::None;
-                if let (Some(controller), Some(authority)) =
+                if ready_terminals.is_empty() {
+                } else if let (Some(controller), Some(authority)) =
                     (fanout_controller.as_mut(), frozen_authority.as_ref())
                 {
                     #[cfg(test)]
@@ -5469,27 +6077,55 @@ impl WorkflowExecutor {
                         else {
                             settle_error_before_yield!(BridgeError::InvalidStateTransition);
                         };
-                        let Some((terminal_json, _, barrier_slot)) =
-                            ready_event_evidence.get_mut(&selected_node)
+                        let Some((terminal_json, _, _)) =
+                            ready_event_evidence.get(&selected_node)
                         else {
                             settle_error_before_yield!(BridgeError::InvalidStateTransition);
                         };
                         let checkpoint = PolicyTriggerCheckpointV1 {
-                            node: selected_node,
+                            node: selected_node.clone(),
                             output: output.clone(),
                             ok: *ok,
                             usage: usage.clone(),
                             terminal_json: terminal_json.clone(),
                             policy_trigger_json: trigger_json,
                         };
-                        let barrier = reach_policy_trigger_barrier_v1(
-                            &authority.run_spec.ledger_admission,
-                            policy_trigger_barrier.as_ref(),
-                            checkpoint,
-                        )
-                        .await;
-                        *barrier_slot = Some(barrier.clone());
-                        action = controller.acknowledge_barrier(barrier, cancel.is_cancelled());
+                        if scheduler_active {
+                            if durable_trigger_barrier.is_some() {
+                                settle_error_before_yield!(BridgeError::InvalidStateTransition);
+                            }
+                            let admission = authority.run_spec.ledger_admission.clone();
+                            let barrier = policy_trigger_barrier.clone();
+                            durable_trigger_barrier = Some(Box::pin(async move {
+                                reach_policy_trigger_barrier_v1(
+                                    &admission,
+                                    barrier.as_ref(),
+                                    checkpoint,
+                                )
+                                .await
+                            }));
+                            let evidence = ready_event_evidence
+                                .remove(&selected_node)
+                                .expect("the selected completion has evidence");
+                            barrier_selected_evidence = Some((selected_node, evidence));
+                        } else {
+                            let barrier = reach_policy_trigger_barrier_v1(
+                                &authority.run_spec.ledger_admission,
+                                policy_trigger_barrier.as_ref(),
+                                checkpoint,
+                            )
+                            .await;
+                            #[cfg(test)]
+                            inject_acknowledgement_external_cancel_for_test(&ctx, &cancel);
+                            let acknowledgement_cancelled = cancel.is_cancelled();
+                            observe_external_root_cancellation!(acknowledgement_cancelled);
+                            ready_event_evidence
+                                .get_mut(&selected_node)
+                                .expect("the selected completion has evidence")
+                                .2 = Some(barrier.clone());
+                            action = controller
+                                .acknowledge_barrier(barrier, acknowledgement_cancelled);
+                        }
                     }
                     for ready in selection.terminals {
                         node_terminals.insert(ready.node, ready.terminal);
@@ -5502,16 +6138,43 @@ impl WorkflowExecutor {
                 }
 
                 match action {
-                    PolicyActionV1::CancelRunningSiblings => {
-                        for (node, token) in &node_cancels {
-                            policy_canceled.insert(node.as_str().to_owned());
-                            token.cancel();
+                    PolicyActionV1::CancelRunningSiblings => for (node, token) in &node_cancels {
+                        record_cancellation_primary!(node, CanceledPolicy);
+                        token.cancel();
+                    },
+                    PolicyActionV1::GlobalCancelAndDrain => {
+                        for node in node_cancels.keys() {
+                            record_cancellation_primary!(node, CanceledPolicy);
                         }
+                        root_cancellation_primary.get_or_insert(CanceledPolicy);
+                        cancel.cancel();
                     }
-                    PolicyActionV1::GlobalCancelAndDrain => cancel.cancel(),
                     PolicyActionV1::None | PolicyActionV1::ArmManualGrace { .. } => {}
                 }
+                retained_completed.append(&mut completed);
+                retained_event_evidence.append(&mut ready_event_evidence);
+                if durable_trigger_barrier.is_some() {
+                    continue;
+                }
+                let mut completed = std::mem::take(&mut retained_completed);
+                completed.sort_by(|left, right| left.0.cmp(&right.0));
+                let mut ready_event_evidence = std::mem::take(&mut retained_event_evidence);
+                let scheduler_elapsed_ms = scheduler_schedule
+                    .observe(scheduler_started_ms, u64::MAX).elapsed_ms;
 
+                if scheduler_active && !completed.is_empty() {
+                    let elapsed_ms = scheduler_elapsed_ms;
+                    no_progress_epoch.observe_activity(&AttemptActivity {
+                        phase: AttemptPhase::Waiter,
+                        reason: ActivityReason::CompletedSetGrowth,
+                        kind: ActivityKind::MeaningfulProgress,
+                        elapsed_ms,
+                        advance: done.len().saturating_add(completed.len()) as u64,
+                    });
+                    next_warning_due_ms = no_progress_epoch
+                        .last_meaningful_progress_elapsed_ms()
+                        .saturating_add(NO_PROGRESS_WARNING_INTERVAL_MS);
+                }
                 for (node_id, text, ok, usage, disposition) in completed {
                     let (terminal_json, policy_trigger_json, policy_trigger_barrier_result) =
                         ready_event_evidence
@@ -5533,6 +6196,7 @@ impl WorkflowExecutor {
                     dispositions.insert(node_id.as_str().to_string(), disposition);
                     outputs.insert(node_id.as_str().to_string(), (text, ok, usage));
                 }
+                observe_external_root_cancellation!();
                 if cancel.is_cancelled() {
                     // Stop scheduling NEW nodes, but keep draining so every already-in-flight
                     // sibling completes its run_node cancel branch (backend.cancel() +
@@ -5544,6 +6208,7 @@ impl WorkflowExecutor {
                     yield Ok(WorkflowEvent::NodeStarted { node });
                 }
             }
+            observe_external_root_cancellation!();
             if frozen_authority.is_some() {
                 let mut missing = graph
                     .nodes
@@ -5553,9 +6218,9 @@ impl WorkflowExecutor {
                     .collect::<Vec<_>>();
                 missing.sort();
                 for node in missing {
-                    let (primary, disposition, text) = if cancel.is_cancelled() {
+                    let (primary, disposition, text) = if root_cancellation_primary == Some(CanceledWorkflow) {
                         (
-                            NodePrimaryDispositionV1::CanceledWorkflow,
+                            CanceledWorkflow,
                             NodeDisposition::Canceled,
                             format!("[node {} canceled: workflow]", node.as_str()),
                         )
@@ -11454,15 +12119,31 @@ mod tests {
         });
         let synth_rec = reg.backends.get("synth").unwrap().1.clone();
         let ex = WorkflowExecutor::new(reg);
-        let evs: Vec<_> = ex
-            .run(
+        let evs: Vec<_> = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            ex.run(
                 review_graph(),
                 "DIFF".into(),
                 "r".into(),
                 CancellationToken::new(),
             )
-            .collect::<Vec<_>>()
-            .await;
+            .collect(),
+        )
+        .await
+        .expect("an exhausted FuturesUnordered terminates");
+        let order = evs
+            .iter()
+            .map(|event| match event.as_ref().unwrap() {
+                WorkflowEvent::NodeStarted { node } => format!("start:{}", node.as_str()),
+                WorkflowEvent::NodeFinished { node, .. } => format!("finish:{}", node.as_str()),
+                WorkflowEvent::CleanupObserved { .. } => "cleanup".into(),
+                WorkflowEvent::Terminal { .. } => "terminal".into(),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            order.join("|"),
+            "start:codex|start:claude|finish:claude|finish:codex|start:synth|finish:synth|cleanup|terminal"
+        );
         let last = evs.last().unwrap().as_ref().unwrap();
         assert!(
             matches!(last, WorkflowEvent::Terminal { outcome: WorkflowOutcome::Completed, output } if output == "FINAL")
@@ -13312,10 +13993,24 @@ mod tests {
 
     /// Records every workflow-level settlement, and fails whichever node it is told to.
     #[derive(Default)]
+    struct SchedulerSignals {
+        other_gate: tokio::sync::Notify,
+        other_entered: tokio::sync::Notify,
+        fail_gate: tokio::sync::Notify,
+        barrier_entered: tokio::sync::Notify,
+        barrier_gate: tokio::sync::Notify,
+        cancel_gate: tokio::sync::Notify,
+        hold_cancel: bool,
+        gate_failure: Option<bool>,
+        cancel_seen: tokio::sync::Notify,
+    }
+
+    #[derive(Default)]
     struct SettlementBackend {
         settlements: Mutex<Vec<(String, WorkflowCheckoutOutcomeV1)>>,
         fail_prompt_for: Option<&'static str>,
         cleanups: AtomicUsize,
+        scheduler: Option<Arc<SchedulerSignals>>,
     }
 
     #[async_trait::async_trait]
@@ -13329,7 +14024,29 @@ mod tests {
                 .fail_prompt_for
                 .is_some_and(|node| session.as_str().contains(node))
             {
+                if let Some(signals) = self
+                    .scheduler
+                    .as_ref()
+                    .filter(|state| state.gate_failure == Some(true))
+                {
+                    signals.fail_gate.notified().await;
+                }
                 return Err(BridgeError::StoreFailure);
+            }
+            if let Some(signals) = self
+                .scheduler
+                .as_ref()
+                .filter(|state| state.gate_failure.is_some() && session.as_str().contains("claude"))
+            {
+                signals.other_entered.notify_one();
+                let signals = signals.clone();
+                return Ok(Box::pin(futures::stream::once(async move {
+                    signals.other_gate.notified().await;
+                    Ok(Update::Done {
+                        stop_reason: "end_turn".into(),
+                        prefix_attestation: Default::default(),
+                    })
+                })));
             }
             Ok(Box::pin(tokio_stream::iter(vec![
                 Ok(Update::FinalAnswer("OK".into())),
@@ -13341,6 +14058,12 @@ mod tests {
         }
 
         async fn cancel(&self, _session: &SessionId) -> Result<(), BridgeError> {
+            if let Some(signals) = &self.scheduler {
+                signals.cancel_seen.notify_one();
+                if signals.hold_cancel {
+                    signals.cancel_gate.notified().await;
+                }
+            }
             Ok(())
         }
         async fn configure_bound_session(
@@ -13443,11 +14166,12 @@ mod tests {
             controls: None,
         })
     }
-    fn frozen_settlement_run_spec() -> Arc<WorkflowRunSpecV1> {
-        let mut graph = (*settlement_graph("second")).clone();
-        graph.controls = Some(WorkflowControlDefaultsV1::default());
-        let agent = AgentId::parse("codex").unwrap();
-        let entry = minimal_entry(&agent);
+    fn frozen_test_run_spec(
+        graph: WorkflowGraph,
+        controls: bridge_core::execution_policy::FrozenWorkflowControlsV1,
+        ledger: LedgerAdmissionV1,
+    ) -> Arc<WorkflowRunSpecV1> {
+        let entry = minimal_entry(&AgentId::parse("codex").unwrap());
         let attempt_id = AttemptId::parse("attempt-35111111111111111111111111111111").unwrap();
         let source = SessionCwd::parse("/repo/source").unwrap();
         let mut nodes = graph.nodes.iter().collect::<Vec<_>>();
@@ -13474,13 +14198,7 @@ mod tests {
                 freeze_node_execution_identity_v1(node, vec![provider]).unwrap()
             })
             .collect();
-        let controls = resolve_execution_policy_v1(
-            graph.controls.as_ref().unwrap(),
-            &ExecutionPolicyInvocationV1::default(),
-            false,
-            PolicyActivationV1::Production,
-        )
-        .unwrap();
+
         Arc::new(
             WorkflowRunSpecV1::build(
                 attempt_id,
@@ -13488,11 +14206,27 @@ mod tests {
                 controls,
                 Some(source),
                 identities,
-                LedgerAdmissionV1::HistoryLedgerAdmitted {
-                    kind: HistoryAllocationKindV1::Configured,
-                },
+                ledger,
             )
             .unwrap(),
+        )
+    }
+    fn frozen_settlement_run_spec() -> Arc<WorkflowRunSpecV1> {
+        let mut graph = (*settlement_graph("second")).clone();
+        graph.controls = Some(WorkflowControlDefaultsV1::default());
+        let controls = resolve_execution_policy_v1(
+            graph.controls.as_ref().unwrap(),
+            &ExecutionPolicyInvocationV1::default(),
+            false,
+            PolicyActivationV1::Production,
+        )
+        .unwrap();
+        frozen_test_run_spec(
+            graph,
+            controls,
+            LedgerAdmissionV1::HistoryLedgerAdmitted {
+                kind: HistoryAllocationKindV1::Configured,
+            },
         )
     }
 
@@ -13877,6 +14611,537 @@ mod tests {
             NodeCleanupDispositionV1::NotNeeded,
             "recording a checkout must not look like a cleanup observation"
         );
+    }
+    mod slice4h2_mux {
+        use super::*;
+        use bridge_core::attempt_activity::SystemMonotonicClock;
+        use bridge_core::execution_policy::{
+            resolve_execution_policy_with_readiness_v1, DeadlineActivationV2::ManualOnlyR2f1a,
+            FanOutPolicyV1, SchedulerActivationReadinessV1 as Readiness,
+        };
+        use NodePrimaryDispositionV1::{
+            CanceledPolicy, CanceledWorkflow, Failed, NotStartedPolicy,
+        };
+
+        fn fail_fast_spec(
+            mut graph: WorkflowGraph,
+            readiness: Readiness,
+        ) -> Arc<WorkflowRunSpecV1> {
+            let defaults = WorkflowControlDefaultsV1 {
+                fan_out: Some(FanOutPolicyV1::FailFast),
+                ..Default::default()
+            };
+            let controls = resolve_execution_policy_with_readiness_v1(
+                &defaults,
+                &ExecutionPolicyInvocationV1::default(),
+                false,
+                readiness,
+                PolicyActivationV1::Production,
+            )
+            .unwrap();
+            graph.controls = Some(defaults);
+            frozen_test_run_spec(graph, controls, LedgerAdmissionV1::DurablePrimaryTaskStore)
+        }
+
+        fn review_fail_fast_spec(readiness: Readiness) -> Arc<WorkflowRunSpecV1> {
+            let mut graph = (*review_graph()).clone();
+            graph
+                .nodes
+                .iter_mut()
+                .for_each(|node| node.agent = AgentId::parse("codex").unwrap());
+            fail_fast_spec(graph, readiness)
+        }
+
+        fn backend(gate_failure: Option<bool>) -> Arc<SettlementBackend> {
+            Arc::new(SettlementBackend {
+                fail_prompt_for: Some("codex"),
+                scheduler: Some(Arc::new(SchedulerSignals {
+                    gate_failure,
+                    ..Default::default()
+                })),
+                ..Default::default()
+            })
+        }
+
+        async fn collect_scheduler_with_spec(
+            spec: Arc<WorkflowRunSpecV1>,
+            backend: Arc<SettlementBackend>,
+            cancel: CancellationToken,
+            barrier: PolicyTriggerBarrier,
+            fault: Option<PostRecordingExitFaultForTest>,
+        ) -> Vec<Result<WorkflowEvent, BridgeError>> {
+            let context = WorkflowDiagnosticContext::in_memory(WorkflowRunContext {
+                session_cwd: spec.requested_session_cwd.clone(),
+                post_recording_exit_fault: fault,
+                ..Default::default()
+            })
+            .with_policy_trigger_barrier(barrier)
+            .with_frozen_run_spec(spec.clone(), None)
+            .unwrap();
+            WorkflowExecutor::new(Arc::new(SettlementRegistry { backend }))
+                .run_with_diagnostic_context(
+                    Arc::new(spec.graph.clone()),
+                    "input".into(),
+                    "scheduler-regression".into(),
+                    cancel,
+                    context,
+                )
+                .collect()
+                .await
+        }
+
+        async fn collect_scheduler(
+            backend: Arc<SettlementBackend>,
+            cancel: CancellationToken,
+            barrier: PolicyTriggerBarrier,
+            fault: Option<PostRecordingExitFaultForTest>,
+        ) -> Vec<Result<WorkflowEvent, BridgeError>> {
+            collect_scheduler_with_spec(
+                review_fail_fast_spec(Readiness::Armed),
+                backend,
+                cancel,
+                barrier,
+                fault,
+            )
+            .await
+        }
+
+        async fn soon<T>(future: impl Future<Output = T>) -> T {
+            tokio::time::timeout(std::time::Duration::from_secs(2), future)
+                .await
+                .unwrap()
+        }
+
+        type MuxFut = Pin<Box<dyn Future<Output = ()> + Send>>;
+
+        #[tokio::test]
+        async fn pending_barrier_keeps_cancellation_arm_live() {
+            let backend = backend(Some(false));
+            let signals = backend.scheduler.as_ref().unwrap().clone();
+            let barrier: PolicyTriggerBarrier = Arc::new({
+                let signals = signals.clone();
+                move |_| {
+                    let signals = signals.clone();
+                    Box::pin(async move {
+                        signals.fail_gate.notify_one();
+                        signals.other_gate.notified().await;
+                        PolicyTriggerBarrierResultV1::PrimaryFailed
+                    })
+                }
+            });
+            let cancel = CancellationToken::new();
+            let task = tokio::spawn(collect_scheduler(
+                backend,
+                cancel.clone(),
+                barrier,
+                Some(PostRecordingExitFaultForTest::SchedulerArmed(false)),
+            ));
+            soon(signals.fail_gate.notified()).await;
+            cancel.cancel();
+            let observed = tokio::time::timeout(
+                std::time::Duration::from_millis(100),
+                signals.cancel_seen.notified(),
+            )
+            .await
+            .is_ok();
+            assert!(
+                observed && !task.is_finished(),
+                "cancellation was blocked or the unresolved barrier was dropped"
+            );
+            signals.other_gate.notify_waiters();
+            soon(task).await.unwrap();
+        }
+
+        #[tokio::test]
+        async fn exhausted_nodes_still_consume_global_cancel_acknowledgement() {
+            let cancel = CancellationToken::new();
+            let barrier: PolicyTriggerBarrier =
+                Arc::new(|_| Box::pin(async { PolicyTriggerBarrierResultV1::PrimaryFailed }));
+            let events = soon(collect_scheduler(
+                backend(None),
+                cancel.clone(),
+                barrier,
+                Some(PostRecordingExitFaultForTest::SchedulerArmed(false)),
+            ))
+            .await;
+            let evidence = events
+                .iter()
+                .filter(|event| {
+                    matches!(
+                        event,
+                        Ok(WorkflowEvent::NodeFinished {
+                            policy_trigger_barrier_result: Some(
+                                PolicyTriggerBarrierResultV1::PrimaryFailed
+                            ),
+                            ..
+                        })
+                    )
+                })
+                .count();
+            assert!(
+                cancel.is_cancelled() && evidence == 1,
+                "GlobalCancelAndDrain or its single-shot evidence was lost: {evidence}"
+            );
+        }
+
+        #[tokio::test]
+        async fn acknowledgement_winner_retains_simultaneous_completion_once() {
+            let backend = backend(Some(true));
+            let signals = backend.scheduler.as_ref().unwrap().clone();
+            let barrier: PolicyTriggerBarrier = Arc::new({
+                let signals = signals.clone();
+                move |_| {
+                    signals.other_gate.notify_one();
+                    Box::pin(futures::future::pending())
+                }
+            });
+            let task = tokio::spawn(collect_scheduler(
+                backend,
+                CancellationToken::new(),
+                barrier,
+                Some(PostRecordingExitFaultForTest::SchedulerArmed(true)),
+            ));
+            soon(signals.other_entered.notified()).await;
+            signals.fail_gate.notify_one();
+            let events = soon(task).await.unwrap();
+            let terminals = events
+                .iter()
+                .filter(|event| {
+                    matches!(
+                        event,
+                        Ok(WorkflowEvent::NodeFinished {
+                            node, ok: false, terminal_json: Some(_), ..
+                        }) if node.as_str() == "claude"
+                    )
+                })
+                .count();
+            assert_eq!(terminals, 1, "completion terminal/event count");
+        }
+
+        async fn mux(index: usize, polls: Arc<AtomicUsize>) -> sa::SchedulerArmV1 {
+            let mut inflight = FuturesUnordered::<MuxFut>::new();
+            inflight.push(Box::pin(futures::future::poll_fn(move |_| {
+                polls.fetch_add(1, Ordering::SeqCst);
+                if index == 0 {
+                    std::task::Poll::Ready(())
+                } else {
+                    std::task::Poll::Pending
+                }
+            })));
+            let ready = |last| index <= last;
+            let cancel = CancellationToken::new();
+            if ready(2) {
+                cancel.cancel();
+            }
+            let mut barrier = ready(1).then(|| {
+                Box::pin(async { PolicyTriggerBarrierResultV1::PrimaryFailed }) as BarrierFut
+            });
+            let barrier_armed = barrier.is_some();
+            let schedule = AttemptScheduleV1::new(Arc::new(SystemMonotonicClock::start()));
+            scheduler_select_v1!(
+                &mut inflight,
+                true,
+                &mut barrier,
+                barrier_armed,
+                false,
+                cancel,
+                false,
+                &schedule,
+                0,
+                ready(3).then_some(0),
+                ready(4).then_some(0),
+                ready(5),
+                if ready(6) { 0 } else { u64::MAX },
+                if index == 8 { 60_000 } else { 0 }
+            )
+            .arm()
+        }
+
+        enum CancellationOrder {
+            PolicyThenWorkflow,
+            WorkflowThenPolicy,
+            PolicyOnly,
+        }
+
+        async fn cancellation_order(
+            order: CancellationOrder,
+        ) -> Vec<Result<WorkflowEvent, BridgeError>> {
+            let signals = Arc::new(SchedulerSignals {
+                gate_failure: Some(false),
+                hold_cancel: true,
+                ..Default::default()
+            });
+            let backend = Arc::new(SettlementBackend {
+                fail_prompt_for: Some("codex"),
+                scheduler: Some(signals.clone()),
+                ..Default::default()
+            });
+            let barrier: PolicyTriggerBarrier = match order {
+                CancellationOrder::WorkflowThenPolicy => Arc::new({
+                    let signals = signals.clone();
+                    move |_| {
+                        let signals = signals.clone();
+                        Box::pin(async move {
+                            signals.barrier_entered.notify_one();
+                            signals.barrier_gate.notified().await;
+                            PolicyTriggerBarrierResultV1::PrimaryFailed
+                        })
+                    }
+                }),
+                CancellationOrder::PolicyThenWorkflow => Arc::new(|_| {
+                    Box::pin(async { PolicyTriggerBarrierResultV1::ServedPrimaryCommitted })
+                }),
+                CancellationOrder::PolicyOnly => {
+                    Arc::new(|_| Box::pin(async { PolicyTriggerBarrierResultV1::PrimaryFailed }))
+                }
+            };
+            let fault = (!matches!(&order, CancellationOrder::WorkflowThenPolicy))
+                .then_some(PostRecordingExitFaultForTest::SchedulerArmed(false));
+            let cancel = CancellationToken::new();
+            let task = tokio::spawn(collect_scheduler(backend, cancel.clone(), barrier, fault));
+            match order {
+                CancellationOrder::PolicyThenWorkflow => {
+                    soon(signals.cancel_seen.notified()).await;
+                    cancel.cancel();
+                    tokio::task::yield_now().await;
+                    tokio::task::yield_now().await;
+                }
+                CancellationOrder::WorkflowThenPolicy => {
+                    soon(signals.barrier_entered.notified()).await;
+                    cancel.cancel();
+                    signals.barrier_gate.notify_one();
+                    soon(signals.cancel_seen.notified()).await;
+                }
+                CancellationOrder::PolicyOnly => {
+                    soon(signals.cancel_seen.notified()).await;
+                }
+            }
+            assert!(!task.is_finished());
+            signals.cancel_gate.notify_waiters();
+            soon(task).await.unwrap()
+        }
+
+        type Events = [Result<WorkflowEvent, BridgeError>];
+
+        fn primary(events: &Events, node: &str) -> NodePrimaryDispositionV1 {
+            let terminals = events
+                .iter()
+                .filter_map(|event| match event {
+                    Ok(WorkflowEvent::NodeFinished {
+                        node: finished,
+                        terminal_json: Some(terminal),
+                        ..
+                    }) if finished.as_str() == node => Some(terminal),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(terminals.len(), 1);
+            NodeTerminalV1::decode_canonical(terminals[0].as_bytes())
+                .unwrap()
+                .primary
+        }
+
+        fn assert_exact_primaries(events: &Events, expected: &[(&str, NodePrimaryDispositionV1)]) {
+            let terminal_count = events
+                .iter()
+                .filter_map(|event| event.as_ref().ok())
+                .filter(|event| {
+                    matches!(
+                        event,
+                        WorkflowEvent::NodeFinished {
+                            terminal_json: Some(_),
+                            ..
+                        }
+                    )
+                })
+                .count();
+            assert_eq!(terminal_count, expected.len());
+            for (node, expected_primary) in expected {
+                assert_eq!(primary(events, node), *expected_primary);
+            }
+        }
+
+        #[tokio::test]
+        async fn disarmed_external_root_cancel_marks_running_and_descendants_workflow_canceled() {
+            let signals = Arc::new(SchedulerSignals {
+                gate_failure: Some(false),
+                hold_cancel: true,
+                ..Default::default()
+            });
+            let backend = Arc::new(SettlementBackend {
+                scheduler: Some(signals.clone()),
+                ..Default::default()
+            });
+            let cancel = CancellationToken::new();
+            let spec = review_fail_fast_spec(Readiness::Disarmed);
+            assert_eq!(spec.controls.deadline_activation, ManualOnlyR2f1a);
+            let task = tokio::spawn(collect_scheduler_with_spec(
+                spec,
+                backend,
+                cancel.clone(),
+                Arc::new(|_| Box::pin(async { PolicyTriggerBarrierResultV1::PrimaryFailed })),
+                None,
+            ));
+            soon(signals.other_entered.notified()).await;
+            cancel.cancel();
+            soon(signals.cancel_seen.notified()).await;
+            signals.cancel_gate.notify_waiters();
+            let events = soon(task).await.unwrap();
+            assert_exact_primaries(
+                &events,
+                &[
+                    ("claude", CanceledWorkflow),
+                    ("codex", NodePrimaryDispositionV1::Completed),
+                    ("synth", CanceledWorkflow),
+                ],
+            );
+        }
+
+        #[tokio::test]
+        async fn external_root_cancel_during_empty_passive_barrier_marks_downstream_workflow_canceled(
+        ) {
+            let signals = Arc::new(SchedulerSignals::default());
+            let backend = Arc::new(SettlementBackend {
+                fail_prompt_for: Some("first"),
+                scheduler: Some(signals.clone()),
+                ..Default::default()
+            });
+            let barrier: PolicyTriggerBarrier = Arc::new({
+                let signals = signals.clone();
+                move |_| {
+                    let signals = signals.clone();
+                    Box::pin(async move {
+                        signals.barrier_entered.notify_one();
+                        signals.barrier_gate.notified().await;
+                        PolicyTriggerBarrierResultV1::PrimaryFailed
+                    })
+                }
+            });
+            let cancel = CancellationToken::new();
+            let task = tokio::spawn(collect_scheduler_with_spec(
+                fail_fast_spec((*settlement_graph("synth")).clone(), Readiness::Armed),
+                backend,
+                cancel.clone(),
+                barrier,
+                Some(PostRecordingExitFaultForTest::SchedulerArmed(false)),
+            ));
+            soon(signals.barrier_entered.notified()).await;
+            cancel.cancel();
+            signals.barrier_gate.notify_one();
+            let events = soon(task).await.unwrap();
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| matches!(event, Ok(WorkflowEvent::NodeStarted { .. })))
+                    .count(),
+                1,
+            );
+            assert_exact_primaries(&events, &[("first", Failed), ("synth", CanceledWorkflow)]);
+        }
+
+        #[tokio::test]
+        async fn passive_external_cancellation_precedes_later_policy() {
+            let events = cancellation_order(CancellationOrder::WorkflowThenPolicy).await;
+            assert_eq!(primary(&events, "codex"), Failed);
+            assert_eq!(primary(&events, "claude"), CanceledWorkflow);
+            assert_eq!(primary(&events, "synth"), CanceledWorkflow);
+        }
+
+        #[tokio::test]
+        async fn policy_global_drain_keeps_unscheduled_node_policy_stopped() {
+            let events = cancellation_order(CancellationOrder::PolicyOnly).await;
+            assert_eq!(primary(&events, "codex"), Failed);
+            assert_eq!(primary(&events, "claude"), CanceledPolicy);
+            assert_eq!(primary(&events, "synth"), NotStartedPolicy);
+        }
+
+        #[tokio::test]
+        async fn passive_acknowledgement_external_cancel_records_workflow_provenance() {
+            let backend = Arc::new(SettlementBackend {
+                fail_prompt_for: Some("first"),
+                ..Default::default()
+            });
+            let events = soon(collect_scheduler_with_spec(
+                fail_fast_spec((*settlement_graph("synth")).clone(), Readiness::Disarmed),
+                backend,
+                CancellationToken::new(),
+                Arc::new(|_| Box::pin(async { PolicyTriggerBarrierResultV1::PrimaryFailed })),
+                Some(PostRecordingExitFaultForTest::AcknowledgementExternalCancel(false)),
+            ))
+            .await;
+
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| matches!(event, Ok(WorkflowEvent::NodeStarted { .. })))
+                    .count(),
+                1,
+            );
+            assert_exact_primaries(&events, &[("first", Failed), ("synth", CanceledWorkflow)]);
+        }
+
+        #[tokio::test]
+        async fn active_acknowledgement_external_cancel_records_workflow_provenance() {
+            let signals = Arc::new(SchedulerSignals {
+                gate_failure: Some(false),
+                hold_cancel: true,
+                ..Default::default()
+            });
+            let backend = Arc::new(SettlementBackend {
+                fail_prompt_for: Some("codex"),
+                scheduler: Some(signals.clone()),
+                ..Default::default()
+            });
+            let task = tokio::spawn(collect_scheduler(
+                backend,
+                CancellationToken::new(),
+                Arc::new(|_| Box::pin(async { PolicyTriggerBarrierResultV1::PrimaryFailed })),
+                Some(PostRecordingExitFaultForTest::AcknowledgementExternalCancel(true)),
+            ));
+
+            soon(signals.cancel_seen.notified()).await;
+            assert!(!task.is_finished());
+            signals.cancel_gate.notify_waiters();
+            let events = soon(task).await.unwrap();
+
+            assert_exact_primaries(
+                &events,
+                &[
+                    ("codex", Failed),
+                    ("claude", CanceledWorkflow),
+                    ("synth", CanceledWorkflow),
+                ],
+            );
+        }
+
+        #[tokio::test]
+        async fn cancellation_primary_is_the_first_scheduler_cause() {
+            let events = cancellation_order(CancellationOrder::PolicyThenWorkflow).await;
+            assert_eq!(primary(&events, "codex"), Failed);
+            assert_eq!(primary(&events, "claude"), CanceledPolicy);
+            assert_eq!(primary(&events, "synth"), CanceledWorkflow);
+
+            let cancel = CancellationToken::new();
+            cancel.cancel();
+            let events = collect_scheduler(
+                backend(None),
+                cancel,
+                Arc::new(|_| Box::pin(async { PolicyTriggerBarrierResultV1::PrimaryFailed })),
+                Some(PostRecordingExitFaultForTest::SchedulerArmed(false)),
+            )
+            .await;
+            assert_eq!(primary(&events, "codex"), CanceledWorkflow);
+            assert_eq!(primary(&events, "claude"), CanceledWorkflow);
+            assert_eq!(primary(&events, "synth"), CanceledWorkflow);
+        }
+
+        #[tokio::test]
+        async fn active_armed_wait_path_polls_once_then_parks() {
+            let polls = Arc::new(AtomicUsize::new(0));
+            let mut waiting = Box::pin(mux(8, polls.clone()));
+            assert!(futures::poll!(&mut waiting).is_pending());
+            assert_eq!(polls.load(Ordering::SeqCst), 1);
+        }
     }
 }
 

@@ -79,8 +79,9 @@ use bridge_core::ports::{
     BackendStream, DiagnosticObserver, PolicyEngine, PolicyOutcome, RichEventSink, Update,
     STOP_REASON_CANCELLED,
 };
+use bridge_core::resource_flight::BoundedRecoveryReasonV1;
 use bridge_core::resource_flight::{ResourceActionDispositionV1, ResourceActionResultV1};
-use bridge_core::retained_resource_flight::ResourceFlightOwnerV1;
+use bridge_core::retained_resource_flight::{CleanupDeadlineTransferV1, ResourceFlightOwnerV1};
 
 use bridge_core::process::{
     DurableProcessFlightAttemptV3, DurableProcessFlightV3, OwnedProcessTreeV1, ProcessStderrCursor,
@@ -7069,6 +7070,20 @@ impl AgentBackend for AcpBackend {
         // Keep this check adjacent to the attachment.
         self.attach_process_flight_owner(session)?;
         self.resource_flight_v1()
+    }
+
+    fn transfer_cleanup_deadline_v1(
+        &self,
+        _session: &SessionId,
+        reason: BoundedRecoveryReasonV1,
+    ) -> Result<CleanupDeadlineTransferV1, BridgeError> {
+        self.supervised
+            .lock()
+            .map_err(|_| BridgeError::agent_crashed("ACP supervised process lock is poisoned"))?
+            .as_ref()
+            .ok_or(BridgeError::ResourceFlightUnsupported)?
+            .transfer_cleanup_deadline(reason)
+            .map_err(|error| BridgeError::agent_crashed(error.to_string()))
     }
 
     async fn cancel_observed(

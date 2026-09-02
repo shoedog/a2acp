@@ -28,8 +28,8 @@ use bridge_core::reaper::{
     spawn_detached, ContainerIdentityProbeFn, ContainerRuntimeIdentityV1,
     ContainerSubordinateCleanupFn, ReapAttemptFn, ReapController, ReapFailure, ReapFn,
 };
-use bridge_core::resource_flight::ResourceIdentityV1;
-use bridge_core::retained_resource_flight::ResourceFlightOwnerV1;
+use bridge_core::resource_flight::{BoundedRecoveryReasonV1, ResourceIdentityV1};
+use bridge_core::retained_resource_flight::{CleanupDeadlineTransferV1, ResourceFlightOwnerV1};
 use bridge_core::run_identity::{CanonicalContainerOwnershipV1, ContainerLabels, RunHandle};
 use bridge_core::sandbox::{
     a2a_name, check_rw_target, compose_container_rw, compose_container_rw_with_source,
@@ -321,6 +321,16 @@ impl SpawnAuthority {
                 }
             }
             notified.await;
+        }
+    }
+    fn bound_controller(&self) -> Option<ReapController> {
+        match &*self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        {
+            SpawnAuthorityState::Bound(controller) => Some(controller.as_ref().clone()),
+            _ => None,
         }
     }
 }
@@ -1703,6 +1713,18 @@ impl AgentBackend for ContainerRwBackend {
                 .map_err(|failure| BridgeError::agent_crashed(failure.code()))?;
         }
         self.resource_flight_v1()
+    }
+
+    fn transfer_cleanup_deadline_v1(
+        &self,
+        session: &SessionId,
+        reason: BoundedRecoveryReasonV1,
+    ) -> Result<CleanupDeadlineTransferV1, BridgeError> {
+        self.current_reap_owner(session)
+            .and_then(|owner| owner.authority.bound_controller())
+            .ok_or(BridgeError::ResourceFlightUnsupported)?
+            .transfer_cleanup_deadline(reason)
+            .map_err(|failure| BridgeError::agent_crashed(failure.code()))
     }
 
     async fn cancel(&self, session: &SessionId) -> Result<(), BridgeError> {

@@ -1,0 +1,13 @@
+--- a/crates/bridge-workflow/src/executor.rs
++++ b/crates/bridge-workflow/src/executor.rs
+@@ -592,8 +592,8 @@ macro_rules! scheduler_select_v1 {
+             biased;
+             first = ($inflight).next() => Wake::NodeCompletion(first),
++            _ = ($cancel).cancelled(), if $active && !$cancel_seen =>
++                Wake::Control(Arm::WorkflowOrExternalCancellation),
+             _ = std::future::ready(()), if $active && $ack =>
+                 Wake::Control(Arm::DurableTriggerBarrierAcknowledgements),
+-            _ = ($cancel).cancelled(), if $active && !$cancel_seen =>
+-                Wake::Control(Arm::WorkflowOrExternalCancellation),
+             _ = wait_for_attempt_offset_v1($schedule, $started, $grace.unwrap_or(u64::MAX)),
+                 if $active && $grace.is_some() => Wake::Control(Arm::FixedGraceExpiry),

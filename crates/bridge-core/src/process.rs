@@ -43,6 +43,7 @@ use crate::resource_flight::{
     ProcessStartIdentityV1, ResourceActionDispositionV1, ResourceActionResultV1,
     ResourceFlightIdV1, ResourceFlightStateV1, ResourceIdentityV1,
 };
+use crate::retained_resource_flight::CleanupDeadlineTransferV1;
 pub use crate::retained_resource_flight::OwnedProcessTreeV1;
 use crate::retained_resource_flight::{
     FileResourceFlightJournal, InMemoryResourceFlightJournal, NoopResourceFlightResultPublisher,
@@ -2483,6 +2484,22 @@ impl OwnedProcessTreeV1 {
             ProcessFlightModeV1::ProtectedV3 => state.flight.detach_owner(owner),
         }
         .map_err(|error| ProcessAuthorityErrorV1::Flight(error.to_string()))
+    }
+
+    pub fn transfer_cleanup_deadline(
+        &self,
+        reason: crate::resource_flight::BoundedRecoveryReasonV1,
+    ) -> Result<CleanupDeadlineTransferV1, ProcessAuthorityErrorV1> {
+        let state = self.live()?;
+        match state.mode {
+            ProcessFlightModeV1::LegacyV2 => Err(ProcessAuthorityErrorV1::Flight(
+                "cleanup-deadline transfer requires a protected V3 flight".into(),
+            )),
+            ProcessFlightModeV1::ProtectedV3 => state
+                .flight
+                .transfer_cleanup_deadline_now(reason)
+                .map_err(|error| ProcessAuthorityErrorV1::Flight(error.to_string())),
+        }
     }
 
     pub async fn terminate(
