@@ -127,17 +127,89 @@ After live evidence passes:
 Rollback restores the recorded Node package tree, config bytes, release binary, and immutable image IDs,
 then repeats the provider-free served checks. Never use a floating selector as the rollback target.
 
-## Automation track
+## Deterministic automation track
 
-The existing floating-current resolver already provides the strongest deterministic path for Codex and
-Claude. A follow-on `provider-refresh plan/apply` workflow should reuse that resolver and add:
+The typed automation is intentionally staged. Slice A implements offline `plan` and captured-evidence `check`;
+it does not implement `capture` or `promote`. That limitation is an authority boundary, not an invitation to
+wrap effects in a shell script.
 
-- a single-package OpenCode resolution target plus a captured models.dev catalog identity;
-- Kiro stable-manifest parsing with version, archive path, size, and SHA-256 bound into the plan;
-- an OpenRouter catalog snapshot that enforces free pricing and tool support for selected fallbacks;
-- a provider-free `check` phase that emits one redacted receipt for raw ACP, doctor, and models;
-- an explicit, separately authorized `promote` phase with before/after custody and rollback objects.
+### 1. Resolve under separate authority
 
-Keep resolution, live execution, and promotion as separate commands and authorities. Automation must not
-turn a version-discovery request into a package install, billable prompt, shared-tag move, or operator
-restart.
+Use the floating-current resolver for Codex and Claude and the manual resolution sources above for OpenCode,
+Kiro, and OpenRouter. Keep every resulting executable, config, catalog snapshot, and rollback file outside
+production and record it as an absolute regular-file binding with its exact SHA-256. Resolution retains its own
+network/download acknowledgement and grants no provider, billing, promotion, or restart authority.
+
+### 2. Compile the semantic plan
+
+```bash
+./target/release/a2a-bridge provider-refresh plan \
+  --request /private/operator/provider-refresh-request.json \
+  --out /private/operator/provider-refresh-plan.json
+```
+
+The version-2 request contains:
+
+- exact semantic-versioned components for Codex, Claude, OpenCode, and Kiro, including source, size, and
+  integrity; a Kiro archive must contain its exact version and may not use `/latest/`;
+- exactly five provider targets. Codex, Claude, and Kiro use `mode: "acp"`, a bound agent ID, an exact
+  content-addressed candidate-manifest `source_binding`, and nonempty selected models. That manifest owns the
+  executable/tree/config/image identities. OpenCode and OpenRouter use
+  `mode: "deferred_catalog"` because R3e/R3f are not integrated;
+- a nonempty operator-asserted `opencode_subscription_models` set. OpenCode's nonempty selection must be a
+  subset. The assertion is retained as operator input; it is not inferred from a generic catalog;
+- bounded OpenRouter resolution claims plus a target whose default is exactly `openrouter/free`. Price and tools
+  truth is not inferred from caller JSON: `check` revalidates those properties from the exact bound catalog
+  envelope;
+- exact candidate, production, and rollback regular-file bindings;
+- ordered typed declarations. Slice A accepts only `atomic_file_replace` and
+  `operator_restart_required`. The latter is a marker, never restart authority.
+
+The request cannot contain `required_checks`, an executable, argv, shell text, environment, or a generic command
+escape hatch. Required checks are derived: raw ACP initialize, doctor, and models for each current ACP target,
+plus one catalog check for each deferred provider. The output is create-only mode `0600` beneath an existing
+owner-private directory.
+
+`plan_id` hashes the canonical semantic plan, including ordered operations, but excludes the separately retained
+raw `request_sha256`. Reformatting JSON or reordering an unordered set changes the raw hash without changing the
+semantic identity.
+
+### 3. Capture provider-free evidence under its own authority
+
+Slice A does not produce evidence. Until a dedicated `provider-refresh capture` slice exists, any capture must
+be separately authorized for the exact candidate, agent, probe, and new private output and must allow only
+provider-free initialize/doctor/models or catalog observation. It grants zero prompts, zero billing permission,
+no resolution/download, no production mutation, and no service lifecycle action.
+
+Each captured JSON envelope must contain schema version 1, the exact `plan_id`, provider, source-binding ID and
+SHA-256, check kind, agent when applicable, `prompt_calls: 0`, `session_created: false`, and a `payload`. The ACP
+payload must prove initialize-only protocol version 1; doctor must contain green bound-agent provenance; models
+must contain every selected model. OpenCode catalog entries must be in the asserted subscription set and mark
+`subscription_included: true`. Every selected OpenRouter entry must report exact string prices `"0"` for prompt
+and completion plus `supports_tools: true`.
+
+### 4. Check the complete captured set
+
+```bash
+./target/release/a2a-bridge provider-refresh check \
+  --plan /private/operator/provider-refresh-plan.json \
+  --evidence /private/operator/provider-refresh-evidence.json \
+  --out /private/operator/provider-refresh-receipt.json
+```
+
+The evidence request names every derived check exactly once and binds each artifact path and SHA-256. `check`
+revalidates plan semantics, current binding bytes, every envelope, provider policy, selected model, and the exact
+complete check set. Its receipt has authority `provider_free_verification_only` and
+`promotion_ready: false`. It is not support evidence for deferred R3e/R3f and cannot be consumed by a promoter.
+
+### 5. Stop before production
+
+`provider-refresh promote` fails closed in slice A. A later promoter must first consume a fresh exact
+operator-drain/stop receipt from a separate lifecycle authority, then use only closed typed operations with
+independent rollback verification. Image tags additionally need canonical runtime-store identity; CLI changes
+need immutable staged package/tree and registration identities. Operator restart and any served smoke remain
+separate decisions after promotion.
+
+Keep resolution, provider-free capture, checking, promotion, restart, and billable live execution as separate
+commands and authorities. Automation must not turn a version-discovery request into a package install, prompt,
+shared-tag move, or operator restart.

@@ -24,12 +24,17 @@ rounds. Adding more forbidden argv tokens or cleanup heuristics would extend tha
 therefore starts from the frozen base, preserves the rejected commit for audit, and replaces its core request
 and action schema. No partially reviewed bytes are discarded or rewritten.
 
+The rejected commit is not wholly unusable. Slice A intentionally reuses its bounded no-follow readers,
+deny-unknown versioned envelopes, create-new owner-private outputs, canonical set ordering, content hashes, and
+negative custody tests. Only the arbitrary-command promotion core and evidence-to-candidate binding are replaced.
+
 ## Authority boundaries
 
 | Command or phase | May resolve/download | May run provider/model | May mutate production | May restart operator |
 |---|---:|---:|---:|---:|
 | upstream/manual resolution | only with its own acknowledgement | no | candidate storage only | no |
 | `provider-refresh plan` | no | no | no | no |
+| future `provider-refresh capture` | no | provider-free initialize/doctor/models only; zero prompts | no | no |
 | `provider-refresh check` | no | no; reads captured artifacts | no | no |
 | future typed `provider-refresh promote` | no | no | exact typed operations only | no |
 | future operator restart | no | no | service state only | yes, under separate authority |
@@ -44,7 +49,8 @@ The caller supplies provider targets, not an arbitrary check list. The compiler 
 checks for every target:
 
 - `codex`, `claude`, and `kiro` are current ACP targets and require one exact `raw_acp_initialize`, `doctor`, and
-  `models` artifact for their bound agent IDs;
+  `models` artifact for their bound agent IDs and a content-addressed candidate manifest that owns the exact
+  executable/tree/config/image identities;
 - `opencode` is a deferred R3f target and requires a captured non-prompt catalog whose exact selected IDs are a
   subset of the operator-asserted OpenCode Go subscription set;
 - `openrouter` is a deferred R3e target and requires a captured catalog whose selected concrete models have
@@ -54,24 +60,26 @@ checks for every target:
 All five targets are mandatory in one refresh pass. Deferred targets remain `promotion_ready: false` until
 their independent roadmap slices define and integrate their runtime checks. A green slice-A receipt means only
 that all currently applicable provider-free evidence matched; it cannot be consumed by a production promoter.
+Every captured envelope repeats the exact plan ID, provider, candidate-manifest or catalog-resolution binding,
+agent when applicable, probe kind, and zero-prompt/zero-session counters. Slice A only consumes such envelopes. A later
+`capture` slice must own production of ACP/doctor/models envelopes under a distinct exact-candidate,
+provider-free authority; neither resolution nor live-smoke authority may be borrowed for that purpose.
 
 ## Typed promotion plan
 
 The request contains declarative future operations only. It has no executable, argv, shell text, environment,
-or timeout fields. The closed operation vocabulary is:
+or timeout fields. Slice A accepts only the closed declarations whose identities are complete now:
 
 1. `atomic_file_replace`: candidate, production, and rollback regular-file bindings;
-2. `atomic_tree_link_switch`: candidate directory identity, production link location, and rollback identity;
-3. `image_tag_move`: immutable candidate image ID, exact production tag, and rollback image ID;
-4. `standalone_cli_transition`: provider, exact package-manager kind, candidate version, installed version, and
-   rollback version;
-5. `operator_restart_required`: a marker emitted for a separately authorized restart, never an executable
+2. `operator_restart_required`: a marker emitted for a separately authorized drain/restart, never an executable
    promotion operation.
 
-Slice A validates and content-addresses these declarations but implements no effects. Slice B may implement the
-filesystem operations with descriptor-relative primitives. Slice C may implement a fixed runtime adapter for
-image tags and package-manager transitions. Operator restart remains a different command and authority. A slice
-must not add a generic command escape hatch.
+Tree-link, image-tag, and CLI-tree operations are deliberately not accepted until their later schema slices bind
+directory object identities, canonical runtime-store identity, or immutable staged package/tree identity. Slice
+A validates and content-addresses its two declarations but implements no effects. No promoter may be added until
+a separately authorized lifecycle slice can issue and immediately revalidate a fresh exact operator-drain and
+stop receipt. Later filesystem and runtime operations must consume that receipt. Restart remains a different
+command and authority. A slice must not add a generic command escape hatch.
 
 ## Slice A: deterministic plan and check
 
@@ -83,8 +91,9 @@ must not add a generic command escape hatch.
 - Deny unknown JSON fields and bound all arrays and strings.
 - Require exact semantic component versions, sizes, sources, and integrity values. Kiro must use a versioned
   archive whose path contains its exact version.
-- Canonicalize unordered input sets before hashing. The plan ID covers every component, provider target,
-  catalog selection, binding, operation, and source request hash.
+- Canonicalize unordered input sets before hashing. The semantic plan ID covers every component, provider
+  target, catalog selection, binding, and ordered operation, but excludes the separately retained raw
+  `source_request_sha256`; whitespace or unordered-set order changes the latter without changing the former.
 - Derive required checks from the five closed provider targets; do not accept caller-authored required checks.
 - Re-read and hash every evidence artifact in `check`, validate its provider-specific schema, and emit a
   content-addressed provider-free receipt.
@@ -98,22 +107,28 @@ behavioral negatives:
 1. one Codex-only evidence set cannot satisfy a five-provider plan;
 2. omitting any closed provider target refuses planning;
 3. caller-supplied `required_checks`, executable, argv, shell, or environment fields refuse as unknown;
-4. a paid or tool-less OpenRouter selection refuses planning and checking;
+4. planning requires an exact independently resolved OpenRouter catalog-envelope binding and the
+   `openrouter/free` default; paid or tool-less truth is enforced from that bound envelope during checking;
 5. an OpenRouter evidence artifact that drifts price or tools support refuses checking;
 6. an OpenCode selection outside the operator-asserted subscription set refuses planning;
 7. an OpenCode catalog that omits a selected subscription model refuses checking;
-8. raw ACP evidence with a session or prompt, failing doctor provenance, unavailable/empty models, artifact
-   drift, plan drift, existing output, symlink input, or non-private output parent refuses closed;
+8. raw ACP evidence with a stale candidate identity, session, or prompt, failing doctor provenance,
+   unavailable/empty models, artifact drift, plan drift, existing output, symlink input, or non-private output
+   parent refuses closed;
 9. help states the separate authorities and the missing slice-A promotion authority.
+10. whitespace and unordered-set reordering change `source_request_sha256` but not the semantic plan ID.
 
 Each accepted path gets a negative or edge control. Source-text-only assertions are not production proof.
 
 ## Later slices and stop conditions
 
-- **Slice B:** descriptor-bound filesystem promotion plus rollback; no child process and no restart.
-- **Slice C:** fixed typed runtime/package-manager adapters with an unconditional process owner that terminates
-  and reaps the complete group after every direct-child disposition, including redirected descendants.
-- **Slice D:** separately authorized operator drain/restart and post-restart provider-free verification.
+- **Slice B:** exact-candidate provider-free evidence capture; zero prompts and no production effects.
+- **Slice C:** separately authorized operator drain/stop receipt plus descriptor-bound filesystem promotion and
+  rollback; no child process and no restart.
+- **Slice D:** fixed typed runtime adapters with canonical runtime-store identity and an unconditional process
+  owner that terminates and reaps the complete group after every direct-child disposition, including redirected
+  descendants.
+- **Slice E:** separately authorized operator restart and post-restart provider-free verification.
 
 Stop before any live prompt, registry lookup, download, shared tag movement, package-manager mutation, service
 stop/start, compatibility baseline change, or production-config write. Those actions need their own exact

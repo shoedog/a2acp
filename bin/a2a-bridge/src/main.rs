@@ -58,6 +58,7 @@ mod containers;
 mod doctor;
 mod fallback_plan;
 mod local_file;
+mod provider_refresh;
 mod route;
 mod slice;
 mod smoke;
@@ -309,6 +310,7 @@ enum TopSubcommand {
     Mcp,
     TaskSpec,
     ProviderEffectKey,
+    ProviderRefresh,
     Prompt,
     Doctor,
     Smoke,
@@ -338,6 +340,7 @@ fn parse_top_subcommand(raw_args: &[String]) -> TopSubcommand {
         Some("mcp") => TopSubcommand::Mcp,
         Some("task-spec") => TopSubcommand::TaskSpec,
         Some("provider-effect-key") => TopSubcommand::ProviderEffectKey,
+        Some("provider-refresh") => TopSubcommand::ProviderRefresh,
         Some("prompt") => TopSubcommand::Prompt,
         Some("doctor") => TopSubcommand::Doctor,
         Some("smoke") => TopSubcommand::Smoke,
@@ -377,6 +380,7 @@ fn dispatcher_help(sub: &TopSubcommand, raw_args: &[String]) -> Option<&'static 
         TopSubcommand::Smoke => Some(SMOKE_USAGE),
         TopSubcommand::FallbackPlan => Some(fallback_plan::USAGE),
         TopSubcommand::ProviderEffectKey => Some(PROVIDER_EFFECT_KEY_USAGE),
+        TopSubcommand::ProviderRefresh => Some(provider_refresh::USAGE),
         _ => None,
     }
 }
@@ -9798,6 +9802,9 @@ async fn main() -> Result<(), BoxError> {
         TopSubcommand::Mcp => return mcp_cmd(&raw_args[2..]).await,
         TopSubcommand::TaskSpec => return task_spec_cmd(&raw_args[2..]),
         TopSubcommand::ProviderEffectKey => return provider_effect_key_cmd(&raw_args[2..]),
+        TopSubcommand::ProviderRefresh => {
+            return provider_refresh::provider_refresh_cmd(&raw_args[2..])
+        }
         TopSubcommand::Prompt => return prompt_cmd(&raw_args[2..]),
         TopSubcommand::Doctor => return doctor::doctor_cmd(&raw_args[2..]),
         TopSubcommand::Smoke => return smoke::smoke_cmd(&raw_args[2..]).await,
@@ -9812,7 +9819,7 @@ async fn main() -> Result<(), BoxError> {
         // would otherwise be swallowed and the default served).
         TopSubcommand::Unknown(other) => {
             return Err(format!(
-                "a2a-bridge: unknown subcommand {other:?} (expected: serve | mcp | run-workflow | run-batch | batch | models | compatibility | smoke | fallback-plan | implement | merge | containers | storage | workflow-stats | submit | task | task-spec | provider-effect-key | prompt | session | init | validate | doctor | help)"
+                "a2a-bridge: unknown subcommand {other:?} (expected: serve | mcp | run-workflow | run-batch | batch | models | compatibility | smoke | fallback-plan | implement | merge | containers | storage | workflow-stats | submit | task | task-spec | provider-effect-key | provider-refresh | prompt | session | init | validate | doctor | help)"
             )
             .into());
         }
