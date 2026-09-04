@@ -1,18 +1,23 @@
 # Bridge reliability execution and handoff roadmap
 
 - **Program status:** active P0
-- **Current main lineage:** R2f1b's inactive V3 foundation is **MERGED** by PR #50 at
-  `aedd2c2fde659c89ec7c47e96bc82dcf0492a429`, exact tree
-  `de53676206b411bd6261c0bd80fe50bc7dd647ad`, with parent
-  `9a0bf6e9a62efd240c74fae3635bd21bf172e77a`.
-- **Completed through:** R2f1b inactive V3 foundation **MERGED** at `aedd2c2fde659c89ec7c47e96bc82dcf0492a429`;
-  R2f1a **MERGED** at `56334e98291c96c69f5a6fc37a15a8fdaf9634e0`; R2f0b **MERGED** at `4ffcd5607a308ed9b1c73fe59bf2ff71b3f72889`, with green post-merge
-  fixture repair `2744cb13db336b8fa99db9c48e638b99c161fd82`; R2f0p **MERGED** at `cc9e4ca49fb6e9c193508254ccc0341ea2974d78`; R2f0a **MERGED** by PR #48 at `2685ffb78ef21c987b3f63f7aba1ddc096b01189`
-  (final PR head `630b9cc9d7ae86c323b183763b3d4e83bdbfc792`); R3d3 **MERGED** at `3c02bf3f`;
-  standalone issues #35/#39 **MERGED** at `0f84a5ca`, issue #30 **MERGED** at `0d628271`, issue #36
-  **MERGED** by PR #46 at `345941db`, and R2f incident intake **MERGED** by PR #45 at `db0eb28f`. R2e remains
-  deferred and off the critical path.
-- **Active slice:** **R2f1b SLICE 2 COMPLETE (2026-08-09): all six sub-slices + PARKED-1 folded and pushed — 2a `b4fc1ff3` → 2b1 `3d1fef9c` → PARKED-1 `8255cf5f` → 2b2 `a9962e25` → 2c1 `23909d5c` → 2c2 `c13ff663` → 2d `f58862a5`; workspace suite 3618 → 3826/0/12 across 90; slice-3 entry gate (focused-boundary §5.7 rows 1–6+12) DISCHARGED; per-sub-slice dual-review records under `docs/superpowers/reviews/2026-08-09-*.md`. Pre-slice-2 phase 0 + Track A (S1–S5, S4b, A1–A5, F1–F3) all landed earlier (through `cffd8e60`/`b6049132`). SLICE 3 IN PROGRESS per `docs/superpowers/plans/2026-08-09-r2f1b-slice3-brief.md` (rev 2): **3s FOLDED (2026-08-09, `01e7b677`/allowlist `a7b016d6`; workspace 3834/0/12 across 90)** — exactly-once settlement epilogue + linearized deletion admission (guard spans the removal projection, repair R1 both lenses); record `docs/superpowers/reviews/2026-08-09-r2f1b-3s-dual-review.md`. **3a FOLDED (2026-08-10, `4597feb9`; workspace 3866/0/12 across 90; coverage core 87.69/workflow 84.90)** — retained-resource-flight runner + durable journal (terminal CAS, typed join refusal, crash-window hardening) + OwnedProcessTreeV1 shell; record `docs/superpowers/reviews/2026-08-10-r2f1b-3a-dual-review.md`. **3b1 FOLDED (2026-08-10, `3c4dbe15`; workspace 3904/0/12 across 90; coverage lib-scope core 85.70/workflow 84.90)** — process authority I: Supervised internal to OwnedProcessTreeV1, join-or-refuse signal paths, anchor-based verified-stop containment, capacity-before-spawn, truthful reap timeout, join convergence; three bridge runs + dual-lens (opus REVISE / sol-max REJECT, all 8 WRONGs adjudicated real) + one-round repair; record `docs/superpowers/reviews/2026-08-10-r2f1b-3b1-dual-review.md`. **3b2 FOLDED (2026-08-10, `40e2e64c`; workspace 3,935/0/12 across 90; coverage workspace-lib-scope core 90.90 (+5.20 — the real-host V3 closure obligation measurably discharged; CI ≥86 floor watch item resolved)/workflow 87.17)** — process authority II: THE one AgentBackend trait pass (resource_flight_v1/attach_resource_flight_owner_v1 refusing defaults + BackendCleanupDispositionV1 on the four checked cleanups, 120-impl census swept once), destructive wrappers join-or-refuse (registry ×5 funnel, ResilientWarm, session-manager, coordinator detached), WorktreeBackend flight forwarding + composition tests, Replay V3 refusal, protective dispositions settle durably in BOTH history stores (repair R1, red-first proven by control), slots goldens byte-identical; dual-lens opus SHIP 0W/9S vs sol/max REJECT 2W → sol-1 repaired in-round, sol-2 mechanism-proven pre-existing (parked); records `docs/superpowers/reviews/2026-08-10-r2f1b-3b2-*.md`. Remaining: 3c1 → 3c2 → 3d; every fold updates this cursor.**
+- **Current main lineage:** provider refresh PR #90 is **MERGED** at
+  `52b05d70f14fc1080707fde1de4e9818a9d81d0f`, whose sole parent is the R2f1b 4H-2 merge
+  `54529b1d83a9fbe97d400cded02dcfbdf69683e3` from PR #89. The 4H-2 merge has sole parent
+  `fd1f66f253c0f5128fed438f96b79dfabadc4d2f` and exact tree
+  `1baaccba6b5a41f53411a422678b0421ca3d8cfd`.
+- **Completed through:** R2f1b 4H-2 is **MERGED** by PR #89 at `54529b1d83a9fbe97d400cded02dcfbdf69683e3`;
+  its approved review and configured-suite evidence remain in the
+  [4H-2 handoff](superpowers/reviews/2026-08-24-r2f1b-slice4h2-handoff.md). PR #90 changes provider tooling
+  after that reliability boundary but does not discharge 4I or authorize 4J.
+- **Active slice:** **R2f1b 4I RESIDUAL CONFIRMED / IMPLEMENTATION AND REVIEW NOT YET AUTHORIZED / 4J AND R3
+  REMAIN DISARMED (2026-09-04).** The current-main census is recorded in the
+  [bounded 4I task](superpowers/plans/2026-09-04-r2f1b-slice4i-task.md). `WRONG`: with the scheduler active,
+  an early failed root can durably trigger sibling cancellation, yet a sibling future that remains pending after
+  cleanup-deadline transfer stays in `FuturesUnordered`; the executor's only normal loop exit still requires that
+  set to become empty, so no node-complete set or workflow terminal is emitted for that state. Current 4H-2 tests
+  pass **11 / 0 / 152 filtered**, but they release every blocked sibling and contain no post-transfer
+  nonterminating-sibling terminalization case. `scheduler_activation_readiness_v1()` remains `Disarmed`.
   [ADR-0040](adr/0040-parallel-implementor-flight.md) owns the frozen-base ownership protocol,
   explicit current-target integration, per-run resume/merge lock, conflict retention, and aggregate verification
   boundary. R2f design is **APPROVED** and R2f0a is merged. Its integrated
