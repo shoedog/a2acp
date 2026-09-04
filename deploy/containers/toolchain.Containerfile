@@ -5,10 +5,15 @@
 #
 # BUILD CONTEXT = repo ROOT (so the lspbuild stage can compile crates/lsp-mcp from the workspace):
 #   docker build -t a2a-toolchain:latest -f deploy/containers/toolchain.Containerfile .
+# Candidate/release builds should pass `--build-arg READER_IMAGE=a2a-agent-reader:<unique-candidate-tag>`
+# after verifying that tag's image ID, then verify the tag has the same ID after the build. Docker
+# BuildKit interprets a bare `sha256:<local-image-id>` as a registry repository, not a local `FROM` object.
 # The repo-root `.dockerignore` excludes target/ (99G) etc. — without it the context upload is catastrophic.
 
+ARG READER_IMAGE=a2a-agent-reader:latest
+
 # ── Builder: compile the Linux lsp-mcp binary from the workspace (L3 Slice B). ──
-FROM a2a-agent-reader:latest AS lspbuild
+FROM ${READER_IMAGE} AS lspbuild
 ENV RUSTUP_HOME=/usr/local/rustup CARGO_HOME=/usr/local/cargo PATH=/usr/local/cargo/bin:$PATH
 RUN apt-get update && apt-get install -y --no-install-recommends \
       build-essential pkg-config libssl-dev \
@@ -22,7 +27,7 @@ RUN cargo build --release --locked -p lsp-mcp && cp target/release/lsp-mcp /lsp-
 # ADR-0040 requires `git merge-tree --write-tree --merge-base=<base>`. Debian bookworm's Git 2.39
 # lacks the explicit merge-base option, which makes the implementor/verifier's merge tests fail for an
 # image-only reason. Build the reviewed-capable Git release separately and copy only its installed tree.
-FROM a2a-agent-reader:latest AS gitbuild
+FROM ${READER_IMAGE} AS gitbuild
 ARG GIT_VERSION=2.54.0
 ARG GIT_SHA256=f689162364c10de79ef89aa8dbf48731eb057e34edbbd20aca510ce0154681a3
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -37,7 +42,7 @@ RUN curl --proto '=https' --tlsv1.2 -sSfL \
  && make -C "/tmp/git-${GIT_VERSION}" prefix=/opt/git NO_TCLTK=YesPlease install
 
 # ── Final toolchain image ──
-FROM a2a-agent-reader:latest
+FROM ${READER_IMAGE}
 
 # Native build deps node:24-slim (debian bookworm) lacks: a C toolchain + linker for cargo's codegen.
 RUN apt-get update && apt-get install -y --no-install-recommends \

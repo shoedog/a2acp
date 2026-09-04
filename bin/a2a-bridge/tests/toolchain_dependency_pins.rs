@@ -4,6 +4,8 @@ use std::path::{Path, PathBuf};
 const GLOBAL_BASEDPYRIGHT_PIN: &str = "npm install -g basedpyright@1.39.8";
 const MISE_BASEDPYRIGHT_SELECTOR: &str = "npm:basedpyright@";
 const RELOCATED_BASEDPYRIGHT_LOOKUP: &str = "mise which basedpyright";
+const TOOLCHAIN_READER_IMAGE_ARG: &str = "ARG READER_IMAGE=a2a-agent-reader:latest";
+const TOOLCHAIN_READER_IMAGE_FROM: &str = "FROM ${READER_IMAGE}";
 const TOOLCHAIN_GIT_VERSION: &str = "ARG GIT_VERSION=2.54.0";
 const TOOLCHAIN_GIT_SHA256: &str =
     "ARG GIT_SHA256=f689162364c10de79ef89aa8dbf48731eb057e34edbbd20aca510ce0154681a3";
@@ -42,6 +44,25 @@ fn validate_basedpyright_install(containerfile: &str) -> Result<(), Vec<&'static
     }
 }
 
+fn validate_reader_base_override(containerfile: &str) -> Result<(), Vec<&'static str>> {
+    let mut problems = Vec::new();
+    if !containerfile.contains(TOOLCHAIN_READER_IMAGE_ARG) {
+        problems.push("missing reader image build argument");
+    }
+    if containerfile.matches(TOOLCHAIN_READER_IMAGE_FROM).count() != 3 {
+        problems.push("all three stages must use the reader image build argument");
+    }
+    if containerfile.contains("FROM a2a-agent-reader:latest") {
+        problems.push("toolchain stage hard-codes the shared reader tag");
+    }
+
+    if problems.is_empty() {
+        Ok(())
+    } else {
+        Err(problems)
+    }
+}
+
 fn has_primary_bridge_default_run(manifest: &str) -> bool {
     manifest
         .parse::<toml::Value>()
@@ -55,6 +76,33 @@ fn has_primary_bridge_default_run(manifest: &str) -> bool {
         })
         .as_deref()
         == Some("a2a-bridge")
+}
+
+#[test]
+fn toolchain_all_stages_accept_an_exact_reader_candidate() {
+    let path = repo_root().join("deploy/containers/toolchain.Containerfile");
+    let containerfile = fs::read_to_string(&path).unwrap();
+    validate_reader_base_override(&containerfile).unwrap_or_else(|problems| {
+        panic!(
+            "{} cannot bind every stage to one reader candidate: {problems:?}",
+            path.display()
+        )
+    });
+}
+
+#[test]
+fn reader_base_override_guard_rejects_one_hard_coded_stage() {
+    let valid = format!(
+        "{TOOLCHAIN_READER_IMAGE_ARG}\n{TOOLCHAIN_READER_IMAGE_FROM}\n{TOOLCHAIN_READER_IMAGE_FROM}\n{TOOLCHAIN_READER_IMAGE_FROM}"
+    );
+    assert!(validate_reader_base_override(&valid).is_ok());
+
+    let hard_coded = valid.replacen(
+        TOOLCHAIN_READER_IMAGE_FROM,
+        "FROM a2a-agent-reader:latest",
+        1,
+    );
+    assert!(validate_reader_base_override(&hard_coded).is_err());
 }
 
 #[test]

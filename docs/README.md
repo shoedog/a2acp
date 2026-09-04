@@ -21,6 +21,7 @@
 |---|---|
 | Agent-oriented quickstart and workflow commands | [`../AGENTS.md`](../AGENTS.md) |
 | Install, configure, authenticate, and run | [`onboarding.md`](onboarding.md) |
+| Refresh agent adapters, CLIs, and model defaults | [`provider-refresh-runbook.md`](provider-refresh-runbook.md) |
 | Choose host vs container and understand fallback limits | [`adr/0032-sandbox-tier-model.md`](adr/0032-sandbox-tier-model.md) |
 | Container images, credentials, egress, Docker/Podman | [`containerized-agents.md`](containerized-agents.md) |
 | Container MCP/LSP environment failure | [`containerized-mcp-env-trap.md`](containerized-mcp-env-trap.md) |
