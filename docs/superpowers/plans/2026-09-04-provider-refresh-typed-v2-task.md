@@ -1,14 +1,13 @@
 # Provider-refresh typed automation v2 task
 
-- **Status:** owner-authorized design restart; slice A authorized for implementation; no live or production
-  authority
+- **Status:** slice A implemented and approved for publication; no live, production, restart, or merge authority
 - **Frozen base:** `52b05d70f14fc1080707fde1de4e9818a9d81d0f` (`origin/main`, provider refresh PR #90)
 - **Branch:** `feat/provider-refresh-typed-v2-20260904`
 - **Worktree:** `/private/tmp/a2a-provider-refresh-typed-v2-20260904`
 - **Preserved rejected artifact:** `d22c385c852c074edef39af270faff8a3cb1bfff` on
   `feat/provider-refresh-automation-20260904`
-- **Review-round cap:** two bounded rounds per slice. At the cap, classify before acting; an open-class result
-  parks the slice.
+- **Review-round cap:** two bounded rounds per slice. Round 2 was classified converging, so one disclosed targeted
+  extension was used; its implementation verdict was approved. An open-class result would have parked the slice.
 
 ## Why the previous artifact is not incrementally repairable
 
