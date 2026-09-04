@@ -2703,7 +2703,12 @@ fn parse_package_lock(
                 .unwrap_or(false),
         });
 
-        if package_identity.name == expected_adapter {
+        if path_name == expected_adapter {
+            if package_identity.name != expected_adapter {
+                return Err(
+                    "reviewed adapter install path has a different package identity".into(),
+                );
+            }
             if adapter.is_some() {
                 return Err("package lock contains multiple reviewed adapter installations".into());
             }
@@ -2721,7 +2726,12 @@ fn parse_package_lock(
                 package,
             )?);
         }
-        if package_identity.name == expected_cli {
+        if path_name == expected_cli {
+            if package_identity.name != expected_cli {
+                return Err(
+                    "reviewed CLI/SDK install path has a different package identity".into(),
+                );
+            }
             if agent_cli.is_some() {
                 return Err("package lock contains multiple nested CLI/SDK installations".into());
             }
@@ -4543,10 +4553,14 @@ fn prepare_case_source(input: ResolutionCaseInput) -> Result<PreparedCase, Strin
                 ConfigTemplate::CodexReaderReadOnlyV1 => {
                     BTreeSet::from(["/root/.codex/auth.json".to_owned()])
                 }
-                ConfigTemplate::ClaudeReaderReadOnlyV1 => BTreeSet::from([
-                    "/root/.claude/.credentials.json".to_owned(),
-                    "/root/.claude/settings.json".to_owned(),
-                ]),
+                ConfigTemplate::ClaudeReaderReadOnlyV1 => {
+                    let mut destinations =
+                        BTreeSet::from(["/root/.claude/.credentials.json".to_owned()]);
+                    if input.component_pins.contains_key("fable-settings") {
+                        destinations.insert("/root/.claude/settings.json".to_owned());
+                    }
+                    destinations
+                }
                 _ => unreachable!("reader match excludes host templates"),
             };
             let mut destinations = BTreeSet::new();
@@ -4601,10 +4615,13 @@ fn prepare_case_source(input: ResolutionCaseInput) -> Result<PreparedCase, Strin
                     return Err("Codex reader template must not carry component pins".into())
                 }
                 ConfigTemplate::ClaudeReaderReadOnlyV1
-                    if input.component_pins.len() != 1 || settings.is_none() =>
+                    if !matches!(
+                        (input.component_pins.len(), settings.is_some()),
+                        (0, false) | (1, true)
+                    ) =>
                 {
                     return Err(
-                        "Claude reader template requires exactly the Fable settings pin".into(),
+                        "Claude reader component pins do not match its settings mount".into(),
                     )
                 }
                 _ => {}
@@ -6930,6 +6947,33 @@ image = "reader-current"
         assert_eq!(lock.agent_cli.version, "0.150.1");
         assert_eq!(lock.sha256.len(), 64);
 
+        for (from, to, expected) in [
+            (
+                "\"node_modules/@agentclientprotocol/codex-acp\": {\n      \"version\":",
+                "\"node_modules/@agentclientprotocol/codex-acp\": {\n      \"name\": \"@agentclientprotocol/wrong-acp\",\n      \"version\":",
+                "reviewed adapter install path has a different package identity",
+            ),
+            (
+                "\"node_modules/@openai/codex\": {\n      \"version\":",
+                "\"node_modules/@openai/codex\": {\n      \"name\": \"@openai/wrong-codex\",\n      \"version\":",
+                "reviewed CLI/SDK install path has a different package identity",
+            ),
+        ] {
+            let mismatched = String::from_utf8(valid_package_lock())
+                .unwrap()
+                .replace(from, to);
+            assert!(
+                parse_package_lock(
+                    mismatched.as_bytes(),
+                    "@agentclientprotocol/codex-acp",
+                    "@openai/codex",
+                    100,
+                )
+                .unwrap_err()
+                .contains(expected)
+            );
+        }
+
         let tilde_range = String::from_utf8(valid_package_lock())
             .unwrap()
             .replace("\"^0.150.0\"", "\"~0.150.0\"");
@@ -7010,9 +7054,22 @@ image = "reader-current"
 
     #[test]
     fn package_lock_preserves_explicit_archive_identity_for_alias_install_paths() {
-        let alias_lock = String::from_utf8(valid_package_lock()).unwrap().replace(
-            "\"node_modules/@openai/codex\": {\n      \"version\":",
-            "\"node_modules/codex-alias\": {\n      \"name\": \"@openai/codex\",\n      \"version\":",
+        let lock = String::from_utf8(valid_package_lock()).unwrap();
+        let (prefix, _) = lock.rsplit_once("\n  }\n}").unwrap();
+        let alias_lock = format!(
+            r#"{prefix},
+    "node_modules/@openai/codex-darwin-arm64": {{
+      "name": "@openai/codex",
+      "version": "0.150.1-darwin-arm64",
+      "resolved": "https://registry.npmjs.org/@openai/codex/-/codex-0.150.1-darwin-arm64.tgz",
+      "integrity": {integrity:?},
+      "optional": true,
+      "os": ["darwin"],
+      "cpu": ["arm64"]
+    }}
+  }}
+}}"#,
+            integrity = canonical_integrity('C'),
         );
         let parsed = parse_package_lock(
             alias_lock.as_bytes(),
@@ -7021,13 +7078,16 @@ image = "reader-current"
             100,
         )
         .unwrap();
+        assert_eq!(parsed.agent_cli.version, "0.150.1");
         let alias = parsed
             .installations
             .iter()
-            .find(|package| package.install_path == Path::new("node_modules/codex-alias"))
+            .find(|package| {
+                package.install_path == Path::new("node_modules/@openai/codex-darwin-arm64")
+            })
             .unwrap();
         assert_eq!(alias.name, "@openai/codex");
-        assert_eq!(alias.version, "0.150.1");
+        assert_eq!(alias.version, "0.150.1-darwin-arm64");
 
         let non_string_name = alias_lock.replace("\"name\": \"@openai/codex\"", "\"name\": 7");
         assert!(parse_package_lock(
@@ -8482,6 +8542,7 @@ image = "reader-current"
             mode: Option<&'a str>,
             auth_path: &'a str,
             package_set: &'a str,
+            fable_settings: bool,
         }
 
         let fixtures = [
@@ -8495,6 +8556,7 @@ image = "reader-current"
                 mode: Some("read-only"),
                 auth_path: "pre_authenticated",
                 package_set: "codex-current",
+                fable_settings: false,
             },
             Fixture {
                 file: "codex-reader.toml",
@@ -8506,6 +8568,7 @@ image = "reader-current"
                 mode: None,
                 auth_path: "pre_authenticated",
                 package_set: "codex-current",
+                fable_settings: false,
             },
             Fixture {
                 file: "claude-host-044.toml",
@@ -8517,6 +8580,7 @@ image = "reader-current"
                 mode: None,
                 auth_path: "automatic",
                 package_set: "claude-current",
+                fable_settings: false,
             },
             Fixture {
                 file: "claude-reader-055.toml",
@@ -8528,6 +8592,19 @@ image = "reader-current"
                 mode: None,
                 auth_path: "pre_authenticated",
                 package_set: "claude-current",
+                fable_settings: true,
+            },
+            Fixture {
+                file: "claude-sonnet-low-reader.toml",
+                template: ConfigTemplate::ClaudeReaderReadOnlyV1,
+                target: FloatingTarget::ContainerRoImage,
+                agent: "claude-sonnet-low-reader",
+                model: "sonnet",
+                effort: Some("low"),
+                mode: None,
+                auth_path: "pre_authenticated",
+                package_set: "claude-current",
+                fable_settings: false,
             },
         ];
         let parent = tempfile::tempdir().unwrap();
@@ -8602,17 +8679,14 @@ image = "reader-current"
                     sha256: snapshot.sha256,
                     bytes: snapshot.bytes,
                 },
-                component_pins: if fixture.template == ConfigTemplate::ClaudeReaderReadOnlyV1 {
+                component_pins: if fixture.fable_settings {
                     BTreeMap::from([("fable-settings".into(), format!("sha256:{settings_sha256}"))])
                 } else {
                     BTreeMap::new()
                 },
             })
             .unwrap_or_else(|error| panic!("{}: {error}", fixture.file));
-            assert_eq!(
-                prepared.settings.is_some(),
-                fixture.template == ConfigTemplate::ClaudeReaderReadOnlyV1
-            );
+            assert_eq!(prepared.settings.is_some(), fixture.fable_settings);
             if fixture.template == ConfigTemplate::ClaudeReaderReadOnlyV1 {
                 let mut package = valid_resolution().packages.remove(0);
                 package.id = "claude-current".into();
@@ -8635,13 +8709,27 @@ image = "reader-current"
                     Some(&image),
                     &parent.path().join("bundle"),
                     Path::new("/trusted/bin/docker"),
-                    Some(&settings_path),
+                    fixture.fable_settings.then_some(settings_path.as_path()),
                 )
                 .unwrap();
                 let generated = String::from_utf8(generated).unwrap();
-                assert!(generated.contains("/definitely-missing-r3c-credential-3"));
-                assert!(generated.contains(settings_path.to_str().unwrap()));
+                assert!(generated.contains(&format!("/definitely-missing-r3c-credential-{index}")));
+                assert_eq!(
+                    generated.contains(settings_path.to_str().unwrap()),
+                    fixture.fable_settings
+                );
                 assert!(generated.contains("/opt/a2a/packages/claude-current/"));
+                if !fixture.fable_settings {
+                    let mut fable_without_settings = prepared.input.clone();
+                    fable_without_settings.component_pins = BTreeMap::from([(
+                        "fable-settings".into(),
+                        format!("sha256:{settings_sha256}"),
+                    )]);
+                    assert_eq!(
+                        prepare_case_source(fable_without_settings).unwrap_err(),
+                        "baseline sandbox is missing a required closed-template volume"
+                    );
+                }
             }
         }
     }
