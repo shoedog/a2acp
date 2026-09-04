@@ -788,7 +788,8 @@ fn check_rejects_prompted_initialize_and_missing_selected_model() {
             "protocol_version":1,
             "initialized":true,
             "session_created":true,
-            "prompt_calls":1
+            "prompt_calls":1,
+            "agent_info":{"version":"1.2.3"}
         }),
     );
     let rejected = prompted.check();
@@ -957,7 +958,7 @@ fn plan_rejects_role_aliases_unknown_sources_and_missing_restart_marker() {
     source.set_request(&request);
     let rejected = source.plan();
     assert!(!rejected.status.success());
-    assert!(stderr(&rejected).contains("typed manifest role"));
+    assert!(stderr(&rejected).contains("exactly the five target source bindings"));
 
     let restart = Fixture::new();
     let mut request = restart.request_value();
@@ -969,6 +970,96 @@ fn plan_rejects_role_aliases_unknown_sources_and_missing_restart_marker() {
     let rejected = restart.plan();
     assert!(!rejected.status.success());
     assert!(stderr(&rejected).contains("exactly one operator restart-required marker"));
+}
+
+#[test]
+fn plan_rejects_unreferenced_manifests_and_incomplete_operation_graphs() {
+    let unreferenced = Fixture::new();
+    let mut request = unreferenced.request_value();
+    let source = request["bindings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|binding| binding["id"] == "codex-source")
+        .unwrap();
+    let extra_path = unreferenced.root.join("extra-source.json");
+    fs::copy(PathBuf::from(source["path"].as_str().unwrap()), &extra_path).unwrap();
+    request["bindings"].as_array_mut().unwrap().push(json!({
+        "id":"extra-source","role":"candidate_manifest","path":extra_path,
+        "sha256":sha256(&fs::read(&extra_path).unwrap())
+    }));
+    unreferenced.set_request(&request);
+    let rejected = unreferenced.plan();
+    assert!(!rejected.status.success());
+    assert!(stderr(&rejected).contains("exactly the five target source bindings"));
+
+    let dangling_owner = Fixture::new();
+    dangling_owner.mutate_source_manifest("codex-source", |manifest| {
+        manifest["promotion_payload_bindings"] = json!(["candidate-config", "missing-payload"]);
+    });
+    let rejected = dangling_owner.plan();
+    assert!(!rejected.status.success());
+    assert!(stderr(&rejected).contains("promotion-payload binding"));
+
+    let restart_only = Fixture::new();
+    let mut request = restart_only.request_value();
+    request["promotion_operations"]
+        .as_array_mut()
+        .unwrap()
+        .retain(|operation| operation["type"] == "operator_restart_required");
+    restart_only.set_request(&request);
+    let rejected = restart_only.plan();
+    assert!(!rejected.status.success());
+    assert!(stderr(&rejected).contains("at least one atomic replacement"));
+
+    let orphaned_role = Fixture::new();
+    let extra_production = orphaned_role.root.join("extra-production.bin");
+    fs::write(&extra_production, b"extra-production").unwrap();
+    let mut request = orphaned_role.request_value();
+    request["bindings"].as_array_mut().unwrap().push(json!({
+        "id":"extra-production","role":"production","path":extra_production,
+        "sha256":sha256(&fs::read(&extra_production).unwrap())
+    }));
+    orphaned_role.set_request(&request);
+    let rejected = orphaned_role.plan();
+    assert!(!rejected.status.success());
+    assert!(stderr(&rejected).contains("orphaned operation-role binding"));
+}
+
+#[test]
+fn plan_rejects_nested_artifact_and_managed_executable_authority_aliases() {
+    let nested = Fixture::new();
+    let production = nested.production.clone();
+    nested.mutate_source_manifest("codex-source", |manifest| {
+        let config = manifest["artifacts"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|artifact| artifact["kind"] == "config")
+            .unwrap();
+        config["path"] = json!(production);
+        config["size_bytes"] = json!(fs::metadata(&production).unwrap().len());
+        config["sha256"] = json!(sha256(&fs::read(&production).unwrap()));
+    });
+    let rejected = nested.plan();
+    assert!(!rejected.status.success());
+    assert!(stderr(&rejected).contains("authority path alias"));
+
+    let managed = Fixture::new();
+    let mut request = managed.request_value();
+    let component = request["components"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|component| component["kind"] == "codex_standalone_cli")
+        .unwrap();
+    component["source"]["path"] = json!(managed.production);
+    component["source"]["size_bytes"] = json!(fs::metadata(&managed.production).unwrap().len());
+    component["source"]["sha256"] = json!(sha256(&fs::read(&managed.production).unwrap()));
+    managed.set_request(&request);
+    let rejected = managed.plan();
+    assert!(!rejected.status.success());
+    assert!(stderr(&rejected).contains("managed executable authority path alias"));
 }
 
 #[test]
@@ -1069,6 +1160,12 @@ fn check_binds_raw_adapter_version_doctor_packages_and_host_executable() {
     assert!(camel_case.plan().status.success());
     camel_case.create_green_evidence();
     camel_case.mutate_evidence_payload("kiro.raw_acp_initialize", |payload| {
+        let protocol_version = payload
+            .as_object_mut()
+            .unwrap()
+            .remove("protocol_version")
+            .unwrap();
+        payload["protocolVersion"] = protocol_version;
         let agent_info = payload
             .as_object_mut()
             .unwrap()
@@ -1114,6 +1211,66 @@ fn check_binds_raw_adapter_version_doctor_packages_and_host_executable() {
     let rejected = executable.check();
     assert!(!rejected.status.success());
     assert!(stderr(&rejected).contains("exact host executable"));
+}
+
+#[test]
+fn check_rejects_ambiguous_raw_acp_aliases_and_substring_doctor_fields() {
+    let duplicate_protocol = Fixture::new();
+    assert!(duplicate_protocol.plan().status.success());
+    duplicate_protocol.create_green_evidence();
+    duplicate_protocol.mutate_evidence_payload("codex.raw_acp_initialize", |payload| {
+        payload["protocolVersion"] = json!(9);
+    });
+    let rejected = duplicate_protocol.check();
+    assert!(!rejected.status.success());
+    assert!(stderr(&rejected).contains("exactly one spelling"));
+
+    let duplicate_agent = Fixture::new();
+    assert!(duplicate_agent.plan().status.success());
+    duplicate_agent.create_green_evidence();
+    duplicate_agent.mutate_evidence_payload("claude.raw_acp_initialize", |payload| {
+        payload["agentInfo"] = json!({"version":"9.9.9"});
+    });
+    let rejected = duplicate_agent.check();
+    assert!(!rejected.status.success());
+    assert!(stderr(&rejected).contains("exactly one spelling"));
+
+    let host = Fixture::new();
+    assert!(host.plan().status.success());
+    host.create_green_evidence();
+    host.mutate_evidence_payload("kiro.doctor", |payload| {
+        let row = &mut payload.as_array_mut().unwrap()[0];
+        let detail = row["detail"].as_str().unwrap();
+        row["detail"] = json!(detail
+            .replace("execution=host", "notexecution=host")
+            .replace("executable=", "notexecutable="));
+    });
+    let rejected = host.check();
+    assert!(!rejected.status.success());
+    assert!(stderr(&rejected).contains("exact host executable"));
+
+    let container = Fixture::new();
+    let image_receipt = container.root.join("codex-image.json");
+    fs::write(&image_receipt, b"immutable image receipt").unwrap();
+    container.mutate_source_manifest("codex-source", |manifest| {
+        manifest["artifacts"].as_array_mut().unwrap().push(json!({
+            "id":"codex-image","kind":"image_receipt","path":image_receipt,
+            "size_bytes":fs::metadata(&image_receipt).unwrap().len(),
+            "sha256":sha256(&fs::read(&image_receipt).unwrap())
+        }));
+        manifest["execution"] = json!({
+            "type":"container","image_artifact":"codex-image",
+            "immutable_id":format!("sha256:{}","a".repeat(64))
+        });
+    });
+    assert!(container.plan().status.success());
+    container.create_green_evidence();
+    container.mutate_evidence_payload("codex.doctor", |payload| {
+        payload[0]["detail"] = json!("kind=acp notexecution=container runtime=docker");
+    });
+    let rejected = container.check();
+    assert!(!rejected.status.success());
+    assert!(stderr(&rejected).contains("immutable candidate image"));
 }
 
 #[test]

@@ -951,13 +951,35 @@ fn validate_source_manifests(
     bindings: &[FileBinding],
     manifests: &mut BTreeMap<String, SourceManifest>,
 ) -> Result<(), BoxError> {
-    let mut source_bindings = BTreeSet::new();
-    for target in targets {
-        if !source_bindings.insert(target.source_binding.as_str()) {
-            return Err(
-                "provider-refresh: provider targets require distinct source bindings".into(),
-            );
+    let source_bindings: BTreeSet<_> = targets
+        .iter()
+        .map(|target| target.source_binding.clone())
+        .collect();
+    if source_bindings.len() != targets.len() {
+        return Err("provider-refresh: provider targets require distinct source bindings".into());
+    }
+    if manifests.keys().cloned().collect::<BTreeSet<_>>() != source_bindings {
+        return Err(
+            "provider-refresh: typed manifests must be exactly the five target source bindings"
+                .into(),
+        );
+    }
+    let authority_paths: BTreeSet<_> = bindings
+        .iter()
+        .map(|binding| binding.path.clone())
+        .collect();
+    let mut managed_paths = BTreeSet::new();
+    for component in components {
+        if let ComponentSource::ManagedExecutable { path, .. } = &component.source {
+            if authority_paths.contains(path) || !managed_paths.insert(path.clone()) {
+                return Err(
+                    "provider-refresh: managed executable authority path alias is forbidden".into(),
+                );
+            }
         }
+    }
+    let mut shared_candidate_paths = BTreeMap::new();
+    for target in targets {
         let expected_role = match target.mode {
             TargetMode::Acp => BindingRole::CandidateManifest,
             TargetMode::DeferredCatalog => BindingRole::CatalogResolution,
@@ -1006,6 +1028,24 @@ fn validate_source_manifests(
                 &item.sha256,
                 &format!("manifest artifact {}", item.id),
             )?;
+            if authority_paths.contains(&snapshot.canonical_path)
+                || managed_paths.contains(&snapshot.canonical_path)
+            {
+                return Err(
+                    "provider-refresh: manifest artifact authority path alias is forbidden".into(),
+                );
+            }
+            let shared_identity = (item.kind, item.size_bytes, item.sha256.clone());
+            if shared_candidate_paths
+                .get(&snapshot.canonical_path)
+                .is_some_and(|existing| existing != &shared_identity)
+            {
+                return Err(
+                    "provider-refresh: shared candidate artifact path has conflicting identities"
+                        .into(),
+                );
+            }
+            shared_candidate_paths.insert(snapshot.canonical_path.clone(), shared_identity);
             if snapshot.bytes.len() as u64 != item.size_bytes
                 || !artifact_ids.insert(item.id.clone())
                 || !artifact_paths.insert(snapshot.canonical_path.clone())
@@ -1028,10 +1068,16 @@ fn validate_source_manifests(
             .any(|id| require_id(id, "manifest promotion payload binding").is_err())
             || manifest
                 .promotion_payload_bindings
+                .iter()
+                .any(|id| !binding_has_role(bindings, id, BindingRole::PromotionPayload))
+            || manifest
+                .promotion_payload_bindings
                 .windows(2)
                 .any(|pair| pair[0] == pair[1])
         {
-            return Err("provider-refresh: manifest promotion payload bindings are invalid".into());
+            return Err(
+                "provider-refresh: manifest promotion-payload binding is invalid or unbound".into(),
+            );
         }
 
         match target.mode {
@@ -1108,6 +1154,26 @@ fn validate_operations(
     }
     let mut ids = BTreeSet::new();
     let mut restart_markers = 0_usize;
+    let mut atomic_replacements = 0_usize;
+    let mut used_payloads = BTreeSet::new();
+    let mut used_production = BTreeSet::new();
+    let mut used_rollbacks = BTreeSet::new();
+    let mut owned_payloads = BTreeMap::new();
+    for (source_binding, manifest) in manifests {
+        if manifest.kind == SourceManifestKind::CandidateManifest {
+            for payload in &manifest.promotion_payload_bindings {
+                if owned_payloads
+                    .insert(payload.as_str(), source_binding.as_str())
+                    .is_some()
+                {
+                    return Err(
+                        "provider-refresh: promotion-payload binding has multiple manifest owners"
+                            .into(),
+                    );
+                }
+            }
+        }
+    }
     for operation in operations {
         require_id(operation.id(), "promotion operation id")?;
         if !ids.insert(operation.id()) {
@@ -1121,16 +1187,15 @@ fn validate_operations(
                 rollback_binding,
                 ..
             } => {
+                atomic_replacements += 1;
                 if !binding_has_role(bindings, candidate_binding, BindingRole::PromotionPayload)
                     || !binding_has_role(bindings, production_binding, BindingRole::Production)
                     || !binding_has_role(bindings, rollback_binding, BindingRole::Rollback)
-                    || manifests.get(owner_source_binding).is_none_or(|manifest| {
-                        manifest.kind != SourceManifestKind::CandidateManifest
-                            || manifest
-                                .promotion_payload_bindings
-                                .binary_search(candidate_binding)
-                                .is_err()
-                    })
+                    || owned_payloads.get(candidate_binding.as_str())
+                        != Some(&owner_source_binding.as_str())
+                    || !used_payloads.insert(candidate_binding.as_str())
+                    || !used_production.insert(production_binding.as_str())
+                    || !used_rollbacks.insert(rollback_binding.as_str())
                 {
                     return Err(
                         "provider-refresh: atomic replacement payload must be owned by its candidate manifest and bind production/rollback roles"
@@ -1148,6 +1213,23 @@ fn validate_operations(
         return Err(
             "provider-refresh: exactly one operator restart-required marker is required".into(),
         );
+    }
+    if atomic_replacements == 0 {
+        return Err("provider-refresh: at least one atomic replacement is required".into());
+    }
+    let role_bindings = |role| {
+        bindings
+            .iter()
+            .filter(|binding| binding.role == role)
+            .map(|binding| binding.id.as_str())
+            .collect::<BTreeSet<_>>()
+    };
+    if used_payloads != role_bindings(BindingRole::PromotionPayload)
+        || used_payloads != owned_payloads.keys().copied().collect()
+        || used_production != role_bindings(BindingRole::Production)
+        || used_rollbacks != role_bindings(BindingRole::Rollback)
+    {
+        return Err("provider-refresh: orphaned operation-role binding is forbidden".into());
     }
     Ok(())
 }
@@ -1316,21 +1398,25 @@ fn validate_raw_acp(
     agent: &str,
     value: &Value,
 ) -> Result<(), BoxError> {
-    let protocol = value
-        .get("protocol_version")
-        .or_else(|| value.get("protocolVersion"))
-        .and_then(Value::as_u64);
+    let exactly_one_alias = |snake, camel| match (value.get(snake), value.get(camel)) {
+        (Some(field), None) | (None, Some(field)) => Some(field),
+        _ => None,
+    };
+    let protocol = exactly_one_alias("protocol_version", "protocolVersion")
+        .ok_or(
+            "provider-refresh: raw ACP evidence requires exactly one spelling per aliased field",
+        )?
+        .as_u64();
+    let agent_info = exactly_one_alias("agent_info", "agentInfo").ok_or(
+        "provider-refresh: raw ACP evidence requires exactly one spelling per aliased field",
+    )?;
     let expected_version = &component(plan, acp_version_component(provider)?)?.version;
     if protocol != Some(1)
         || value.get("agent").and_then(Value::as_str) != Some(agent)
         || value.get("initialized").and_then(Value::as_bool) != Some(true)
         || value.get("session_created").and_then(Value::as_bool) != Some(false)
         || value.get("prompt_calls").and_then(Value::as_u64) != Some(0)
-        || value
-            .pointer("/agent_info/version")
-            .or_else(|| value.pointer("/agentInfo/version"))
-            .and_then(Value::as_str)
-            != Some(expected_version.as_str())
+        || agent_info.get("version").and_then(Value::as_str) != Some(expected_version.as_str())
     {
         return Err(
             "provider-refresh: raw ACP evidence is not initialize-only protocol v1 for the exact candidate version"
@@ -1411,10 +1497,10 @@ fn validate_doctor(
         } => {
             let executable = artifact(manifest, executable_artifact)
                 .ok_or("provider-refresh: candidate executable artifact is missing")?;
-            let exact_path = format!("executable={:?}", executable.path);
-            if !execution_detail.contains("execution=host")
-                || execution_detail.matches("executable=").count() != 1
-                || !execution_detail.contains(&exact_path)
+            let exact_path = format!(" executable={:?}", executable.path);
+            if unique_detail_field(execution_detail, "execution") != Some("host")
+                || execution_detail.matches(" executable=").count() != 1
+                || !execution_detail.ends_with(&exact_path)
             {
                 return Err(
                     "provider-refresh: doctor execution does not match the exact host executable"
@@ -1428,7 +1514,7 @@ fn validate_doctor(
                 .get("detail")
                 .and_then(Value::as_str)
                 .ok_or("provider-refresh: doctor image provenance lacks detail")?;
-            if !execution_detail.contains("execution=container")
+            if unique_detail_field(execution_detail, "execution") != Some("container")
                 || unique_detail_field(image_detail, "immutable_id") != Some(immutable_id.as_str())
             {
                 return Err(
