@@ -177,6 +177,8 @@ SUBCOMMANDS:
   fallback-plan       Validate a local failed artifact and emit a host fallback recommendation.
                       --from <artifact> --host-agent <id> --config <f> --trusted-session-cwd <repo>
                       [--confirm-trusted-own-repo-read-only]
+  provider-refresh    Compile exact provider-refresh plans or check captured provider-free evidence.
+                      plan | check  (promotion, restart, resolution, and billable turns are separate)
   implement --input <file|-> Clone a repo, implement the task on a warm containerized agent, verify+review, hand off.
                       --repo <path> [--config <f>] [--base-ref <ref>] [--workflow <id>] [--strict-brief] [--merge [--onto <branch>]]
   merge <id>          Land an Approved run's commit into its source repo, re-authored to the operator.

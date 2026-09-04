@@ -43,7 +43,7 @@ negative custody tests. Only the arbitrary-command promotion core and evidence-t
 Neither a plan, receipt, nor promotion record grants billing authority. A promotion receipt never authorizes an
 operator restart. R3e OpenRouter, R3f OpenCode, and R4 promotion remain disarmed by the reliability roadmap.
 
-## Provider-complete evidence model
+## Closed graph and exact applicable evidence
 
 The caller supplies provider targets, not an arbitrary check list. The compiler derives the complete required
 checks for every target:
@@ -57,9 +57,11 @@ checks for every target:
   exact zero prompt and completion prices plus tools support. Its durable default is exactly
   `openrouter/free`.
 
-All five targets are mandatory in one refresh pass. Deferred targets remain `promotion_ready: false` until
-their independent roadmap slices define and integrate their runtime checks. A green slice-A receipt means only
-that all currently applicable provider-free evidence matched; it cannot be consumed by a production promoter.
+All five targets and all nine local component surfaces are mandatory in one refresh plan. The closed graph is
+Codex ACP/nested/standalone, Claude ACP/SDK/bundled/standalone, OpenCode, and Kiro. Standalone Codex, standalone
+Claude, and OpenCode runtime remain explicitly listed as deferred; the receipt status is therefore
+`pass_with_deferred_components`, never an unqualified provider-complete pass. It cannot be consumed by a
+production promoter.
 Every captured envelope repeats the exact plan ID, provider, candidate-manifest or catalog-resolution binding,
 agent when applicable, probe kind, and zero-prompt/zero-session counters. Slice A only consumes such envelopes. A later
 `capture` slice must own production of ACP/doctor/models envelopes under a distinct exact-candidate,
@@ -70,7 +72,7 @@ provider-free authority; neither resolution nor live-smoke authority may be borr
 The request contains declarative future operations only. It has no executable, argv, shell text, environment,
 or timeout fields. Slice A accepts only the closed declarations whose identities are complete now:
 
-1. `atomic_file_replace`: candidate, production, and rollback regular-file bindings;
+1. `atomic_file_replace`: a manifest-owned promotion-payload binding plus production and rollback bindings;
 2. `operator_restart_required`: a marker emitted for a separately authorized drain/restart, never an executable
    promotion operation.
 
@@ -89,14 +91,19 @@ command and authority. A slice must not add a generic command escape hatch.
 - Accept only absolute bounded regular-file inputs.
 - Create output artifacts once, mode `0600`, under an existing owner-private directory.
 - Deny unknown JSON fields and bound all arrays and strings.
-- Require exact semantic component versions, sizes, sources, and integrity values. Kiro must use a versioned
-  archive whose path contains its exact version.
+- Require the exact closed component-kind set and tagged sources: canonical npm package/tarball plus SHA-512 SRI,
+  architecture-specific stable Kiro archive plus SHA-256, exact managed standalone executable, or exact
+  SDK-owned bundled CLI.
+- Require five distinct typed source manifests. Candidate manifests bind components and exact execution,
+  config/tree/image artifacts; catalog-resolution manifests bind one exact catalog snapshot. Opaque or reused
+  provider source files refuse.
 - Canonicalize unordered input sets before hashing. The semantic plan ID covers every component, provider
   target, catalog selection, binding, and ordered operation, but excludes the separately retained raw
-  `source_request_sha256`; whitespace or unordered-set order changes the latter without changing the former.
+  informational `request_sha256`; whitespace or unordered-set order changes the latter without changing the former.
 - Derive required checks from the five closed provider targets; do not accept caller-authored required checks.
-- Re-read and hash every evidence artifact in `check`, validate its provider-specific schema, and emit a
-  content-addressed provider-free receipt.
+- Hash and parse each evidence artifact from the same descriptor snapshot; validate exact ACP/doctor component
+  provenance and exact catalog-snapshot equality before provider policy; emit a content-addressed provider-free
+  receipt with explicit deferred components.
 - Expose no `promote` subcommand in slice A.
 
 ### RED-first regressions
@@ -116,7 +123,10 @@ behavioral negatives:
    unavailable/empty models, artifact drift, plan drift, existing output, symlink input, or non-private output
    parent refuses closed;
 9. help states the separate authorities and the missing slice-A promotion authority.
-10. whitespace and unordered-set reordering change `source_request_sha256` but not the semantic plan ID.
+10. whitespace and unordered-set reordering change `request_sha256` but not the semantic plan ID.
+11. incomplete component graphs, noncanonical npm/Kiro sources, opaque/wrong/reused manifests, unowned promotion
+    payloads, raw/doctor component drift, catalog detachment, image drift, and post-open pathname replacement all
+    refuse or retain the originally hashed bytes as appropriate.
 
 Each accepted path gets a negative or edge control. Source-text-only assertions are not production proof.
 

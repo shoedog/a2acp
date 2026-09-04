@@ -150,18 +150,23 @@ network/download acknowledgement and grants no provider, billing, promotion, or 
 
 The version-2 request contains:
 
-- exact semantic-versioned components for Codex, Claude, OpenCode, and Kiro, including source, size, and
-  integrity; a Kiro archive must contain its exact version and may not use `/latest/`;
+- the closed nine-component graph: Codex ACP, nested Codex, standalone Codex, Claude ACP, Agent SDK, bundled
+  Claude Code, standalone Claude, OpenCode, and Kiro. Npm components require their exact canonical npmjs
+  tarball and SHA-512 SRI; Kiro requires one architecture-tagged stable versioned archive and SHA-256;
+  standalone CLIs bind an exact managed executable, while bundled Claude binds its exact parent SDK manifest;
 - exactly five provider targets. Codex, Claude, and Kiro use `mode: "acp"`, a bound agent ID, an exact
-  content-addressed candidate-manifest `source_binding`, and nonempty selected models. That manifest owns the
-  executable/tree/config/image identities. OpenCode and OpenRouter use
-  `mode: "deferred_catalog"` because R3e/R3f are not integrated;
+  distinct content-addressed `candidate_manifest` source binding, and nonempty selected models. Host manifests
+  bind an executable; container manifests bind an immutable image receipt. Both bind config and applicable
+  package-tree artifacts. OpenCode and OpenRouter use distinct `catalog_resolution` manifests with one exact
+  catalog snapshot because R3e/R3f are not integrated;
 - a nonempty operator-asserted `opencode_subscription_models` set. OpenCode's nonempty selection must be a
   subset. The assertion is retained as operator input; it is not inferred from a generic catalog;
 - bounded OpenRouter resolution claims plus a target whose default is exactly `openrouter/free`. Price and tools
   truth is not inferred from caller JSON: `check` revalidates those properties from the exact bound catalog
   envelope;
-- exact candidate, production, and rollback regular-file bindings;
+- separate `candidate_manifest`, `catalog_resolution`, `promotion_payload`, `production`, and `rollback`
+  regular-file binding roles. A promotion payload is not a provider source and must be named as owned by the
+  exact candidate manifest referenced by its future operation;
 - ordered typed declarations. Slice A accepts only `atomic_file_replace` and
   `operator_restart_required`. The latter is a marker, never restart authority.
 
@@ -171,8 +176,8 @@ plus one catalog check for each deferred provider. The output is create-only mod
 owner-private directory.
 
 `plan_id` hashes the canonical semantic plan, including ordered operations, but excludes the separately retained
-raw `request_sha256`. Reformatting JSON or reordering an unordered set changes the raw hash without changing the
-semantic identity.
+raw `request_sha256`. That field is informational provenance, not a custody or authorization digest. Reformatting
+JSON or reordering an unordered set changes the raw hash without changing the semantic identity.
 
 ### 3. Capture provider-free evidence under its own authority
 
@@ -183,8 +188,9 @@ no resolution/download, no production mutation, and no service lifecycle action.
 
 Each captured JSON envelope must contain schema version 1, the exact `plan_id`, provider, source-binding ID and
 SHA-256, check kind, agent when applicable, `prompt_calls: 0`, `session_created: false`, and a `payload`. The ACP
-payload must prove initialize-only protocol version 1; doctor must contain green bound-agent provenance; models
-must contain every selected model. OpenCode catalog entries must be in the asserted subscription set and mark
+payload must prove initialize-only protocol version 1 and the exact adapter/CLI version. Doctor must match the
+candidate's host executable or immutable image plus exact adapter, nested CLI/SDK, and bundled-Claude identities;
+models must contain every selected model. OpenCode catalog entries must be in the asserted subscription set and mark
 `subscription_included: true`. Every selected OpenRouter entry must report exact string prices `"0"` for prompt
 and completion plus `supports_tools: true`.
 
@@ -198,9 +204,11 @@ and completion plus `supports_tools: true`.
 ```
 
 The evidence request names every derived check exactly once and binds each artifact path and SHA-256. `check`
-revalidates plan semantics, current binding bytes, every envelope, provider policy, selected model, and the exact
-complete check set. Its receipt has authority `provider_free_verification_only` and
-`promotion_ready: false`. It is not support evidence for deferred R3e/R3f and cannot be consumed by a promoter.
+hashes and parses each evidence artifact from one descriptor snapshot, revalidates plan/manifests/artifacts, and
+requires each catalog payload to equal its exact bound catalog-snapshot bytes before applying provider policy.
+Its receipt has authority `provider_free_verification_only`, status `pass_with_deferred_components`, and
+`promotion_ready: false`. The receipt explicitly lists standalone Codex, standalone Claude, and OpenCode runtime
+as deferred. It is not support evidence for deferred R3e/R3f and cannot be consumed by a promoter.
 
 ### 5. Stop before production
 
