@@ -1,6 +1,36 @@
 # R2f1b slice 4H-2 repair handoff
 
-## Amendment 8 approved and locally landed (current)
+## Public merge closure and 4I residual census (current)
+
+Custody was rebound on 2026-09-04 in isolated branch `docs/r2f1b-4i-census-20260904` from freshly fetched
+`origin/main` `52b05d70f14fc1080707fde1de4e9818a9d81d0f`. PR #89 publicly merged 4H-2 as
+`54529b1d83a9fbe97d400cded02dcfbdf69683e3`, sole parent `fd1f66f253c0f5128fed438f96b79dfabadc4d2f`,
+tree `1baaccba6b5a41f53411a422678b0421ca3d8cfd`. PR #90 then advanced `main` to the measured head above without
+changing the 4H-2 reliability obligation. The publication gate described below is closed; the historical local
+landing remains provenance rather than current operating direction.
+
+**4I census verdict: RESIDUAL CONFIRMED / IMPLEMENTATION NOT AUTHORIZED.** `WRONG`: in the active fail-fast state,
+an early failed root can pass its durable trigger barrier and cancel a running sibling. If that sibling's node
+future does not resolve after cleanup-deadline transfer, the handler at the scheduler cleanup deadline records the
+transfer but neither removes nor terminalizes the sibling. The loop's normal break still requires `inflight` to be
+empty. The incorrect result for that concrete state is an absent sibling terminal, absent downstream
+not-started-by-policy terminal, and absent workflow terminal instead of bounded failed terminalization. This is the
+workflow-scheduler mechanism reported by issue #22; it is not an adapter-only inference.
+
+The exact current-main 4H-2 module passed **11 / 0 / 152 filtered** on 2026-09-04. Source and test census found
+barrier, cancellation, exhaustion, first-cause, and parking coverage, but every blocked sibling is eventually
+released; no test retains a sibling beyond cleanup transfer and requires complete terminal projection. That green
+module therefore proves preserved 4H-2 mux behavior, not 4I closure. The bounded implementation contract is
+[`2026-09-04-r2f1b-slice4i-task.md`](../plans/2026-09-04-r2f1b-slice4i-task.md). A genuine current-main RED through
+the production executor path is the first implementation gate. No 4I Rust edit, provider turn, live smoke,
+compatibility execution, release, deployment, or operator mutation occurred in this census.
+
+Repository-wide readiness remains `Disarmed`. 4J is a separate, minimal, independently revertable arming decision
+only after an implemented and reviewed 4I discharge. The former raw evidence path
+`/private/tmp/a2a-r2f1b-4h2-am8-compat-diagnostic` is now absent; only its historical hashes below remain, and this
+handoff no longer describes the disposable path as current custody.
+
+## Amendment 8 approved and locally landed (historical; superseded by public merge)
 
 Landing custody: the owner approved continuation after the terminal Amendment 8 review. The controller fetched exact remote `main` `fd1f66f253c0f5128fed438f96b79dfabadc4d2f`, created local branch `feat/r2f1b-4h2-multiplexer` at that SHA, preserved the original implementation checkpoint at SHA-256 `de68d8b0deb80bbb768e2483ce8ad2c447ee0cfd69f8e68da3751f8f4bb9a8c1`, rebound only its stale base/current custody pointers, and invoked the repository's exact-base merge workflow once. Operator-authored code landing commit `b541e2ad8f04ae50a9fd9c782eaabe8c8b8e3826` has sole parent `fd1f66f2` and tree `5695b42a57ba5f29166189d754c6b50c3d57215f`, exactly equal to reviewed post-handoff candidate `a98846da`. Existing checked-out `main` `cafeae13` and controller `4701acd9` remained unchanged. The bridge landed successfully but initially could not reap intentionally unreadable test-fixture directories; retained run metadata was already archived at SHA-256 `0af87008a626a7420d882b8a668a9d2b2451f0300a810e9f663b17a36cdf235f`, owner traversal was restored only on that exact clone, and the clone was then removed. This docs-only successor changes no Rust bytes. No GitHub push, pull request, R3 work, release, deployment, live smoke, billable compatibility execution, or running-operator mutation occurred.
 
