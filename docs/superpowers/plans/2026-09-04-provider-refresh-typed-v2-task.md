@@ -1,6 +1,7 @@
 # Provider-refresh typed automation v2 task
 
-- **Status:** slice A published as PR #92; CI pending; no live, production, restart, or merge authority
+- **Status:** slice A published as PR #92; CI run `33867264068` green at `ac27b08e`; no live, production,
+  restart, or merge authority
 - **Frozen base:** `52b05d70f14fc1080707fde1de4e9818a9d81d0f` (`origin/main`, provider refresh PR #90)
 - **Branch:** `feat/provider-refresh-typed-v2-20260904`
 - **Worktree:** `/private/tmp/a2a-provider-refresh-typed-v2-20260904`

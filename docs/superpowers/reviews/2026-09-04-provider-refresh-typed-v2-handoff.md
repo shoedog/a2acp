@@ -1,11 +1,13 @@
 # Provider-refresh typed automation v2 handoff
 
-- **Status:** published as PR #92; all local non-billable gates green; CI pending; merge remains separate
+- **Status:** published as PR #92; local gates and exact-tip CI evidence green; merge remains separate
 - **Base:** `52b05d70f14fc1080707fde1de4e9818a9d81d0f`
 - **Approved implementation candidate:** `9072734e60f3828a3b6dd5252b0930233bcae15b`
 - **Branch/worktree:** `feat/provider-refresh-typed-v2-20260904` at
   `/private/tmp/a2a-provider-refresh-typed-v2-20260904`
 - **Pull request:** `https://github.com/shoedog/a2acp/pull/92`
+- **CI evidence:** run `33867264068` passed all four jobs for custody tip
+  `ac27b08e089c6386ce5b03989a9fce1f07cf4e5a`; this status-only reconciliation follows that tip
 - **Preserved rejected commit:** `d22c385c852c074edef39af270faff8a3cb1bfff`; clean and unpublished
 - **Review cap:** two bounded rounds plus one disclosed converging extension
 - **Design preflight:** round 1 `REVISE`; seven closed WRONG findings accepted for the task contract
@@ -90,6 +92,6 @@ general 512 MiB artifact limit. All three remain fail-closed or explicitly defer
 
 ## Next action
 
-Wait for PR #92 CI and report its exact result. Merge requires a separate owner decision. Do not resolve/download
-packages, run a provider or model, spend a billable turn, restart the operator, promote production, or change
-compatibility evidence under this authority.
+Verify the status-only tip checks, then await a separate owner merge decision. Do not resolve/download packages,
+run a provider or model, spend a billable turn, restart the operator, promote production, or change compatibility
+evidence under this authority.
