@@ -301,7 +301,7 @@ async fn probe_agent(entry: &AgentEntry, cwd: &Path) -> Result<AgentCaps, Catalo
     result.map_err(|error| CatalogProbeFailure::build(entry, strategy, error))
 }
 
-/// kiro native list: `kiro-cli chat --list-models` (auth-free, no container needed).
+/// kiro native list: `kiro-cli chat --list-models` (host-side; requires current CLI login state).
 async fn probe_kiro(entry: &AgentEntry) -> Result<AgentCaps, ProbeError> {
     let cmd = entry.cmd.clone().unwrap_or_else(|| "kiro-cli".into());
     let out = tokio::process::Command::new(&cmd)
