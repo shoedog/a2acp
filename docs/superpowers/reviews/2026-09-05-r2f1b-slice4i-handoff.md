@@ -1,11 +1,12 @@
-# Handoff — R2f1b slice 4I approved pending publication
+# Handoff — R2f1b slice 4I integrated and verified pending publication
 
-**Written:** 2026-09-05T18:55:25Z · **By:** `/root/r2f1b_4i_implementation` · **Provider:** codex
-**Workspace:** `a2a-bridge` · `feat/r2f1b-4i-terminalization-20260905`
+**Written:** 2026-09-05T20:28:58Z · **By:** `/root` · **Provider:** codex
+**Workspace:** `a2a-bridge` · `integrate/r2f1b-4i-current-20260905`
 **Prior reviewed state:** `[INHERITED FROM CONTROLLER]` candidate `f7917e3acc5128f289681476ec1061b1f1a2fd7a` · tree `15cb0a8208679af10a4a048eb36d542afe3511a2` · verdict `REVISE — 1 remaining WRONG / 0 SMELL`
 **Current implementation code state:** `[MEASURED]` checkpoint `59896688f350fa6413740a2254ff0a4d610ece33` · tree `e81f0256cec386a444fc56d282d4c36beeba2fde` · executor blob `7c59d597ed5c80382bef6a2c4c3ce81e23ed06be` · frozen base `936534d8cffb225249a5eeccd5874552dc97e961` · 418 / 420 added nonblank formatted Rust lines
 **Current public main:** `[MEASURED]` `636979e27eee428981712c506435e0e151ee80a1` · PR #98 merge parents `936534d8cffb225249a5eeccd5874552dc97e961` and `91606a956284447d8fad83eef78f99c3675650ba` · does not contain 4I
 **Final reviewed state:** `[INHERITED FROM CONTROLLER]` candidate `0132e6bdb8724b29013b5fc2f740bc83c3cba21d` · tree `5da71fcb9d2fe7083246c033d884a4eb07663fec` · executor blob `7c59d597ed5c80382bef6a2c4c3ce81e23ed06be` · verdict `APPROVE — 0 WRONG / 1 SMELL-DEFER`
+**Current-target integration:** `[MEASURED]` commit `7169948a3d150694c2f367c53f7c6ce6ce0c4041` · parent `636979e27eee428981712c506435e0e151ee80a1` · tree `b11d37e35357182e3444a3859a34d1c3cc722448` · executor blob unchanged · aggregate green
 **Predecessor:** `docs/superpowers/reviews/2026-08-24-r2f1b-slice4h2-handoff.md`
 **Final review:** `docs/superpowers/reviews/2026-09-05-r2f1b-slice4i-astra-final-rereview.md`
 **Truth ordering:** measured live state > explicit owner/contract authority within scope > this handoff > earlier handoffs. Unresolved conflicts remain open.
@@ -14,20 +15,19 @@
 
 **(a) Verdict** — `[INHERITED FROM CONTROLLER; reviewer /root/r2f1b_4i_astra_review, model gpt-6-astra, hard-read-only]` **APPROVE — 0 WRONG / 1 SMELL-DEFER.**
 
-**(b) Convergence** — W1 guard custody, W2 interval union, and S1 boundary/cardinality are `FIXED`. The sole smell is a deferred documentation-scope qualification reconciled in this fold. The renewed repair and final rereview are consumed. — **4I APPROVED / PENDING PUBLICATION; NO FURTHER RUST EDIT OR REVIEW NEEDED**
+**(b) Convergence** — W1 guard custody, W2 interval union, and S1 boundary/cardinality are `FIXED`. The sole smell is a deferred documentation-scope qualification reconciled in this fold. The renewed repair and final rereview are consumed. — **4I APPROVED / CURRENT-TARGET INTEGRATED / AGGREGATE VERIFIED / PENDING PUBLICATION; NO FURTHER RUST EDIT OR REVIEW NEEDED**
 
-**(c) Custody exposure** — `[MEASURED/INHERITED]` reviewed candidate `0132e6bd` and the 4I branch remain local and unpushed on frozen base `936534d8`; public main advanced independently to `636979e2` through compatibility/runbook PR #98. — **OPEN pending a separately authorized current-target integration decision and aggregate verification**
+**(c) Custody exposure** — `[MEASURED/INHERITED]` reviewed candidate `0132e6bd` remains on the local frozen-base branch. Its complete delta is composed without conflict onto public-main target `636979e2` at local commit `7169948a`; normalized source and integrated patch bytes match at SHA-256 `6da5b5a3c1528731534cc5228c63e515485e570689499a550784d97e0d07c8f3`. Both branches remain unpushed. — **OPEN pending publication authority only**
 
-**(d) In flight / irreversible** — `[MEASURED]` no Cargo or provider process is in flight. No provider, registry/image, compatibility, live smoke, release, deployment, operator, push, PR, merge, or 4J effect occurred. — **RESOLVED; no irreversible action in flight**
+**(d) In flight / irreversible** — `[MEASURED]` no Cargo or provider process is in flight. No provider, registry/image, compatibility, live smoke, release publication, deployment, operator, push, PR, merge, or 4J effect occurred. — **RESOLVED; no irreversible action in flight**
 
 ## 1. Resume order
 
-1. Verify the docs-only closure successor is clean, descends from reviewed `0132e6bd`, preserves executor blob `7c59d597ed5c80382bef6a2c4c3ce81e23ed06be`, and remains linear from frozen implementation base `936534d8`.
-2. Preserve `APPROVED / PENDING PUBLICATION`. Do not dispatch another review or edit Rust.
-3. At publication time, rebind the public target and await separate owner authority for current-target integration;
-   the resulting aggregate requires verification before merge. Do not infer 4J activation from 4I approval.
+1. Verify the integration branch is clean, descends directly from current public main `636979e2`, and preserves executor blob `7c59d597ed5c80382bef6a2c4c3ce81e23ed06be`.
+2. Preserve `APPROVED / CURRENT-TARGET INTEGRATED / AGGREGATE VERIFIED / PENDING PUBLICATION`. Do not dispatch another review or edit Rust.
+3. Await separate owner authority before push/PR. Rebind the public target again before publication; target movement requires a new integration decision and aggregate verification. Do not infer merge or 4J activation from publication authority.
 
-**STOP conditions:** any production edit, another review, more than 420 added nonblank Rust lines, dirty custody, publication/merge, provider/operator action, or 4J arming without new explicit authority.
+**STOP conditions:** any production edit, another review, more than 420 added nonblank Rust lines, dirty custody, target movement, publication/merge, provider/operator action, or 4J arming without new explicit authority.
 
 ## 2. State ledger
 
@@ -44,6 +44,8 @@
 | Static/build/hygiene | green | `[MEASURED]` format, diff, locked workspace check, warnings-denied locked all-target/all-feature Clippy, locked all-target/all-feature build, release-bin build, and hygiene **41 / 9** passed. |
 | Exposure | fenced | `[MEASURED]` readiness remains `Disarmed`; no live/provider/operator effect ran. |
 | Final rereview | approved | `[INHERITED]` exact `0132e6bd`, tree `5da71fcb`, blob `7c59d597`: **0 WRONG / 1 SMELL-DEFER**. Reviewer independently ran **4 / 0** focused tests and recomputed retained hashes/totals as **102 groups / 4,388 / 0 / 13 / 714**. |
+| Current-target integration | done | `[MEASURED]` exact `7169948a`, parent `636979e2`, tree `b11d37e3`; seven intended paths, no conflicts, executor blob unchanged, source/integration normalized patch SHA-256 `6da5b5a3...d07c8f3`. |
+| Integrated aggregate | green | `[MEASURED]` format/diff, locked check, warnings-denied locked Clippy, locked all-target/all-feature build, release-bin build, and candidate-built hygiene **41 / 9** passed; all-target suite **86 / 4,390 / 0 / 13 / 714**, doctests **16 / 2 / 0**, combined **102 / 4,392 / 0 / 13 / 714**. |
 
 The trusted-root all-target and doctest logs are retained at
 `/private/tmp/a2a-r2f1b-4i-full-all-targets-20260905.log` and
@@ -54,6 +56,12 @@ logs are `/private/tmp/a2a-r2f1b-4i-red-exact-20260905.log` and
 `/private/tmp/a2a-r2f1b-4i-mutation-duration-space-20260905.log`, SHA-256
 `1e511d06080dc414794cc42749ec8fd6ecd47d70b38f1e64bf97231a1c814d5f` and
 `3aad58d34890d725f6a8d7fce24ddb3c441d24f4f775437bd5753d4e305a3e66`.
+
+The current-target aggregate logs are retained at
+`/private/tmp/a2a-r2f1b-4i-integrated.9GzeTJ/workspace-tests.log` and
+`/private/tmp/a2a-r2f1b-4i-integrated.9GzeTJ/doctests.log`, SHA-256
+`c54a3438476e02f914b28c4e04e18333e2d3cad864a8add7f2b7b90c3df35885` and
+`eabd59f763c606d75b313ad88f67242bb4c37b4dd9a6ff68a842a36d40714fcb`.
 
 Hypothesis-probe-result closure:
 
@@ -66,7 +74,7 @@ Hypothesis-probe-result closure:
 
 | # | Work | State | Exact next action | Blocked by |
 |---:|---|---|---|---|
-| 1 | Current-target integration / publication | pending authority | Retain the clean local branch; rebind the target only after the owner authorizes an integration decision, then require aggregate verification. | No integration or publication authority. |
+| 1 | Publication | pending authority | Retain the clean local integration branch; rebind public main before any push/PR and stop if it moved. | No publication authority. |
 | 2 | 4J | prohibited | None under current authority. | 4J activation remains separate. |
 
 ## 4. Invariants and traps
@@ -89,6 +97,11 @@ Hypothesis-probe-result closure:
 | PR #98 second parent | `91606a956284447d8fad83eef78f99c3675650ba` |
 | Worktree | `/private/tmp/a2a-r2f1b-4i-20260905` |
 | Branch | `feat/r2f1b-4i-terminalization-20260905` |
+| Integration worktree | `/private/tmp/a2a-r2f1b-4i-integrated-20260905` |
+| Integration branch | `integrate/r2f1b-4i-current-20260905` |
+| Integration commit | `7169948a3d150694c2f367c53f7c6ce6ce0c4041` |
+| Integration tree | `b11d37e35357182e3444a3859a34d1c3cc722448` |
+| Normalized patch SHA-256 | `6da5b5a3c1528731534cc5228c63e515485e570689499a550784d97e0d07c8f3` |
 | Original RED | `842925af` |
 | Initial review target | `83e15dc2` |
 | Repair mechanism | `40031742` |
@@ -106,6 +119,6 @@ Hypothesis-probe-result closure:
 ## 6. Refutation verdict and owner questions
 
 **§2c verdict:** `APPROVE — 0 WRONG / 1 SMELL-DEFER` on exact `0132e6bd`. The deferred documentation scope is
-reconciled without changing Rust. PR #98 advanced public main but did not contain or discharge 4I. The local branch
-remains approved pending a separately authorized current-target integration decision and aggregate verification; no
-further Rust edit, review, merge, 4J activation, provider, or operator effect is implied.
+reconciled without changing Rust. The approved delta is locally integrated onto exact current main at `7169948a`,
+and its aggregate gates are green. It remains pending separate publication authority; no further Rust edit, review,
+push, PR, merge, 4J activation, provider, or operator effect is implied.

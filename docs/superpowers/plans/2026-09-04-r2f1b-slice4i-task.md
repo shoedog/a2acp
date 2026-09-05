@@ -6,7 +6,7 @@ task-type: implement
 
 ## Status and custody
 
-**APPROVED / PENDING PUBLICATION / NOT MERGED.** Before implementation, live
+**APPROVED / CURRENT-TARGET INTEGRATED LOCALLY / AGGREGATE VERIFIED / PENDING PUBLICATION / NOT MERGED.** Before implementation, live
 `origin/main` was rebound to `936534d8cffb225249a5eeccd5874552dc97e961`, and the worktree census found no
 competing 4I implementation owner. The owner later renewed the parked artifact for exactly one narrow
 interval-endpoint/union repair and one final hard-read-only cumulative rereview, raising the exact-base cap to
@@ -21,9 +21,15 @@ measures **418 / 420** in `crates/bridge-workflow/src/executor.rs` only. No push
 registry/image effect, compatibility execution, live smoke, release, deployment, running-operator mutation, or 4J
 arming occurred. Public `origin/main` subsequently advanced through compatibility/runbook PR #98 to exact
 `636979e27eee428981712c506435e0e151ee80a1`, with parents the frozen implementation base and reviewed PR #98 head
-`91606a956284447d8fad83eef78f99c3675650ba`; that merge neither contains nor discharges 4I. The 4I branch remains
-local and unpushed. Approval does not authorize publication or those other effects; publication now requires a
-separately authorized current-target integration decision plus aggregate verification.
+`91606a956284447d8fad83eef78f99c3675650ba`; that merge neither contained nor discharged 4I. The owner then
+authorized current-target integration and aggregate verification. The approved delta was composed without conflict
+onto exact `636979e27eee428981712c506435e0e151ee80a1` as local integration commit
+`7169948a3d150694c2f367c53f7c6ce6ce0c4041`, tree
+`b11d37e35357182e3444a3859a34d1c3cc722448`, on branch `integrate/r2f1b-4i-current-20260905`. Its executor blob
+remains exact `7c59d597ed5c80382bef6a2c4c3ce81e23ed06be`; normalized `git diff` output for both the frozen-base 4I delta
+and current-target integration delta has SHA-256
+`6da5b5a3c1528731534cc5228c63e515485e570689499a550784d97e0d07c8f3`. The original 4I and integration branches
+remain local and unpushed. Approval does not authorize publication, merge, 4J, or any provider/operator effect.
 
 ### Measured implementation evidence — 2026-09-05
 
@@ -77,6 +83,16 @@ Static, build, release, formatting, diff, and hygiene results remain implementat
 was the overbroad same-node documentation claim narrowed above; no Rust change was requested or made. The
 [final review record](../reviews/2026-09-05-r2f1b-slice4i-astra-final-rereview.md) retains exact provenance and
 adjudication.
+
+The separately authorized current-target aggregate ran from detached exact integration commit `7169948a`. Format
+and diff checks, locked workspace check, warnings-denied locked all-target/all-feature Clippy, locked
+all-target/all-feature build, release-bin build, and candidate-built hygiene **41 / 9** are green. The serialized
+all-target suite passed **86 summaries / 4,390 passed / 0 failed / 13 ignored / 714 filtered**; doctests passed **16
+summaries / 2 / 0**; combined totals are **102 summaries / 4,392 passed / 0 failed / 13 ignored / 714 filtered**.
+Logs are retained privately at `/private/tmp/a2a-r2f1b-4i-integrated.9GzeTJ/workspace-tests.log` and
+`/private/tmp/a2a-r2f1b-4i-integrated.9GzeTJ/doctests.log`, SHA-256
+`c54a3438476e02f914b28c4e04e18333e2d3cad864a8add7f2b7b90c3df35885` and
+`eabd59f763c606d75b313ad88f67242bb4c37b4dd9a6ff68a842a36d40714fcb`. No ignored live-provider test was forced.
 
 ## Original concrete residual — terminalization fixed
 
@@ -163,8 +179,8 @@ task completion or exit status.
 ## Gates and convergence
 
 The implementation/review cap was renewed once for the narrow interval-union repair and one final rereview. Both are
-now consumed. No further Rust edit or review is authorized or needed; current-target integration and aggregate
-verification remain a separate publication boundary.
+now consumed. No further Rust edit or review is authorized or needed. Current-target integration and aggregate
+verification are complete; publication remains a separate authority boundary.
 
 Before presenting the implementation as complete, run and record:
 
