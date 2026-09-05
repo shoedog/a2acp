@@ -1,6 +1,57 @@
 # R2f1b slice 4H-2 repair handoff
 
-## Public merge closure and 4I residual census (current)
+## 4I successor approved pending publication (current)
+
+On 2026-09-05, the owner authorized the current-main 4I implementation/review lane. Live `origin/main` was rebound
+to `936534d8cffb225249a5eeccd5874552dc97e961`; no competing 4I implementation owner was found. After prior exact
+candidate `f7917e3a` parked at rereview `REVISE`, the owner explicitly renewed exactly one narrow interval-union
+repair and one final hard-read-only rereview, raising the exact-base cap to 420 without other scope expansion.
+Isolated branch `feat/r2f1b-4i-terminalization-20260905` now has clean code checkpoint
+`59896688f350fa6413740a2254ff0a4d610ece33`, tree `e81f0256cec386a444fc56d282d4c36beeba2fde`, based exactly on that
+main. The only changed Rust path is `crates/bridge-workflow/src/executor.rs`, with **418 / 420** added nonblank
+formatted Rust lines.
+
+The required production-path RED failed **0 / 1 / 164 filtered** because the workflow remained pending after a real
+cleanup owner transferred successfully. A pre-boundary real completion stayed authoritative. After repair, the
+primary regression and external/bounded edge coverage are green. The first Astra review of `83e15dc2` returned
+`REVISE` with two `WRONG` findings and one `SMELL`: transfer-guard custody ended before terminalizer signaling,
+workflow cleanup omitted the transferred interval, and exact-boundary/cardinality proof was weak. The sole bounded
+repair retains the guard through workflow projection, marks transferred cleanup `Unknown` without overriding
+`Failed`, and strengthens full artifact/cardinality assertions at both sides of the boundary. Both
+reviewer-derived exact REDs failed **0 / 1 / 165 filtered** before mechanism repair. The full 4H-2 mux module now
+passes **14 / 0 / 152 filtered**, and the full `bridge-workflow` library passes **166 / 0**. Disabling only the
+production terminalizer signal restores the exact wedge at **0 / 1 / 165 filtered**, and restoration returns green.
+
+The [prior Astra rereview](2026-09-05-r2f1b-slice4i-astra-rereview.md) returned **REVISE — 1 remaining WRONG / 0
+SMELL** because duration-only `max` undercounted disjoint intervals. The renewed production-path RED constructs
+failed-root teardown `[0,1000]` plus sibling transfer interval `[1000,61000]` and failed **0 / 1 / 165 filtered** on
+actual workflow `Unknown/60000` versus required `Unknown/61000`; the exact-boundary negative control passed **1 / 0
+/ 165 filtered**. The repair records exact scheduler `(anchor, now)` endpoints through the existing cleanup tracker
+and removes both duration-only overlays, so node and workflow projections use the established interval union. The
+repaired primary passes **1 / 0 / 165 filtered**, mux passes **14 / 0 / 152 filtered**, and duration-space mutation
+reproduces **0 / 1 / 165 filtered**. Guard custody, `Failed` precedence, first-write terminal ownership, exact-boundary
+real-completion priority, cause mapping, bounded-independent cutoff, and no-replay behavior remain intact.
+
+Format, diff, locked workspace check, warnings-denied locked all-target/all-feature Clippy, locked
+all-target/all-feature build, release-bin build, and candidate-built hygiene **41 / 9** are green. A detached
+trusted-root checkout of exact `59896688` passes the complete serialized all-target and doctest surface at **102
+summaries / 4,388 passed / 0 failed / 13 ignored / 0 measured / 714 filtered**. The 13 ignored tests remain explicit
+authenticated/live ACP-provider, local Ollama, and Docker-image cases; no provider turn was run.
+
+The [final owner-renewed Astra rereview](2026-09-05-r2f1b-slice4i-astra-final-rereview.md) bound exact candidate
+`0132e6bdb8724b29013b5fc2f740bc83c3cba21d`, tree `5da71fcb9d2fe7083246c033d884a4eb07663fec`, executor blob
+`7c59d597ed5c80382bef6a2c4c3ce81e23ed06be`, and returned **APPROVE — 0 WRONG / 1 SMELL-DEFER**. It independently
+ran four focused tests (**4 / 0**) and recomputed the retained log hashes and aggregate totals (**102 groups / 4,388
+/ 0 / 13 / 714**). The sole deferred smell was documentation scope: the tested one-active-prompt fixture has no
+earlier same-node teardown, but node-future lifetime alone does not rule out prior preflight/retry cleanup. The
+node-keyed tracker unions those intervals; no Rust change was requested or made.
+
+**Current disposition: 4H-2 MERGED / 4I APPROVED AND PENDING PUBLICATION / 4J AND R3 DISARMED.** No push, PR, merge,
+provider, registry/image, compatibility, live smoke, release, deployment, or running-operator effect occurred. The
+repair and review rounds are consumed; no further Rust edit or review is authorized or needed. Publication and merge
+remain separately unauthorized.
+
+## Public merge closure and 4I residual census (historical; superseded above)
 
 Custody was rebound on 2026-09-04 in isolated branch `docs/r2f1b-4i-census-20260904` from freshly fetched
 `origin/main` `52b05d70f14fc1080707fde1de4e9818a9d81d0f`. PR #89 publicly merged 4H-2 as
