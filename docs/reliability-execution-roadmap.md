@@ -10,8 +10,8 @@
   its approved review and configured-suite evidence remain in the
   [4H-2 handoff](superpowers/reviews/2026-08-24-r2f1b-slice4h2-handoff.md). PR #90 changes provider tooling
   after that reliability boundary but does not discharge 4I or authorize 4J.
-- **Active slice:** **R2f1b 4I APPROVED / CURRENT-TARGET INTEGRATED LOCALLY / AGGREGATE VERIFIED /
-  PENDING PUBLICATION / NOT MERGED / 4J AND R3 REMAIN DISARMED (2026-09-05).**
+- **Active slice:** **R2f1b 4I APPROVED / CURRENT-TARGET INTEGRATED / AGGREGATE VERIFIED /
+  PUBLISHED AS PR #99 / CI PENDING / NOT MERGED / 4J AND R3 REMAIN DISARMED (2026-09-05).**
   The prior
   [Astra cumulative rereview](superpowers/reviews/2026-09-05-r2f1b-slice4i-astra-rereview.md) returned **REVISE — 1
   remaining WRONG / 0 SMELL** at exact `f7917e3a`: duration-only `max` composition emitted `Unknown/60000` for
@@ -37,9 +37,10 @@
   totals. Its sole deferred smell was an overbroad documentation inference from node-future lifetime; the current
   docs narrow that claim to the tested one-active-prompt fixture because preflight/retry paths can contribute earlier
   same-node cleanup intervals. No Rust correction was requested or made. No provider, registry/image, compatibility,
-  live smoke, release, deployment, publication, merge, or running-operator effect was exercised.
+  live smoke, release, deployment, merge, or running-operator effect was exercised; the only public effect was the
+  separately authorized branch push and PR creation.
   The approved delta is now composed without conflict onto exact current target
-  `636979e27eee428981712c506435e0e151ee80a1` as local integration commit
+  `636979e27eee428981712c506435e0e151ee80a1` as integration commit
   `7169948a3d150694c2f367c53f7c6ce6ce0c4041`, tree
   `b11d37e35357182e3444a3859a34d1c3cc722448`. Its executor blob remains exact
   `7c59d597ed5c80382bef6a2c4c3ce81e23ed06be`, and the current-target delta is byte-identical to the approved 4I
@@ -48,8 +49,9 @@
   green: format/diff, locked workspace check, warnings-denied locked all-target/all-feature Clippy, locked
   all-target/all-feature build, release-bin build, and candidate-built hygiene **41 / 9**; the serialized all-target
   suite passed **86 summaries / 4,390 / 0 / 13 ignored / 714 filtered**, and doctests passed **16 summaries / 2 / 0**,
-  for **102 summaries / 4,392 passed / 0 failed / 13 ignored / 714 filtered**. The integration branch remains local
-  and unpushed; publication requires separate authority.
+  for **102 summaries / 4,392 passed / 0 failed / 13 ignored / 714 filtered**. Branch
+  `integrate/r2f1b-4i-current-20260905` is published as [PR #99](https://github.com/shoedog/a2acp/pull/99);
+  CI and merge remain pending and separately gated.
   `scheduler_activation_readiness_v1()` remains `Disarmed`; 4J stays parked behind an approved 4I closure.
   [ADR-0040](adr/0040-parallel-implementor-flight.md) owns the frozen-base ownership protocol,
   explicit current-target integration, per-run resume/merge lock, conflict retention, and aggregate verification

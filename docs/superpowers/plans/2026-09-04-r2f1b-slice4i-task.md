@@ -6,7 +6,7 @@ task-type: implement
 
 ## Status and custody
 
-**APPROVED / CURRENT-TARGET INTEGRATED LOCALLY / AGGREGATE VERIFIED / PENDING PUBLICATION / NOT MERGED.** Before implementation, live
+**APPROVED / CURRENT-TARGET INTEGRATED / AGGREGATE VERIFIED / PUBLISHED AS PR #99 / CI PENDING / NOT MERGED.** Before implementation, live
 `origin/main` was rebound to `936534d8cffb225249a5eeccd5874552dc97e961`, and the worktree census found no
 competing 4I implementation owner. The owner later renewed the parked artifact for exactly one narrow
 interval-endpoint/union repair and one final hard-read-only cumulative rereview, raising the exact-base cap to
@@ -17,19 +17,20 @@ frozen implementation base. Final Astra review bound exact docs-inclusive candid
 `0132e6bdb8724b29013b5fc2f740bc83c3cba21d`, tree
 `5da71fcb9d2fe7083246c033d884a4eb07663fec`, executor blob
 `7c59d597ed5c80382bef6a2c4c3ce81e23ed06be`, and returned **APPROVE — 0 WRONG / 1 SMELL-DEFER**. The Rust delta
-measures **418 / 420** in `crates/bridge-workflow/src/executor.rs` only. No push, pull request, merge, provider turn,
-registry/image effect, compatibility execution, live smoke, release, deployment, running-operator mutation, or 4J
-arming occurred. Public `origin/main` subsequently advanced through compatibility/runbook PR #98 to exact
+measures **418 / 420** in `crates/bridge-workflow/src/executor.rs` only. No merge, provider turn, registry/image
+effect, compatibility execution, live smoke, release, deployment, running-operator mutation, or 4J arming occurred.
+Public `origin/main` subsequently advanced through compatibility/runbook PR #98 to exact
 `636979e27eee428981712c506435e0e151ee80a1`, with parents the frozen implementation base and reviewed PR #98 head
 `91606a956284447d8fad83eef78f99c3675650ba`; that merge neither contained nor discharged 4I. The owner then
 authorized current-target integration and aggregate verification. The approved delta was composed without conflict
-onto exact `636979e27eee428981712c506435e0e151ee80a1` as local integration commit
+onto exact `636979e27eee428981712c506435e0e151ee80a1` as integration commit
 `7169948a3d150694c2f367c53f7c6ce6ce0c4041`, tree
 `b11d37e35357182e3444a3859a34d1c3cc722448`, on branch `integrate/r2f1b-4i-current-20260905`. Its executor blob
 remains exact `7c59d597ed5c80382bef6a2c4c3ce81e23ed06be`; normalized `git diff` output for both the frozen-base 4I delta
 and current-target integration delta has SHA-256
-`6da5b5a3c1528731534cc5228c63e515485e570689499a550784d97e0d07c8f3`. The original 4I and integration branches
-remain local and unpushed. Approval does not authorize publication, merge, 4J, or any provider/operator effect.
+`6da5b5a3c1528731534cc5228c63e515485e570689499a550784d97e0d07c8f3`. The integration branch is published as
+[PR #99](https://github.com/shoedog/a2acp/pull/99). CI and merge remain pending; publication does not authorize
+merge, 4J, or any provider/operator effect.
 
 ### Measured implementation evidence — 2026-09-05
 
