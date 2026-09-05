@@ -16,6 +16,7 @@
 // for check 1, exactly as the spec requires), builds a `LoadedConfig`, and renders the result.
 
 use std::collections::BTreeMap;
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -316,20 +317,37 @@ fn is_executable_file(p: &Path) -> bool {
     p.is_file()
 }
 
-pub(crate) fn resolved_executable_impl(cmd: &str) -> Option<PathBuf> {
+fn anchor_selected_executable(path: PathBuf, cwd: Option<&Path>) -> Option<PathBuf> {
+    if path.is_absolute() {
+        Some(path)
+    } else {
+        cwd.map(|cwd| cwd.join(path))
+    }
+}
+
+fn selected_executable_in_path(cmd: &str, path_var: &OsStr, cwd: Option<&Path>) -> Option<PathBuf> {
+    std::env::split_paths(path_var)
+        .map(|dir| dir.join(cmd))
+        .filter_map(|candidate| anchor_selected_executable(candidate, cwd))
+        .find(|candidate| is_executable_file(candidate))
+}
+
+pub(crate) fn selected_executable_impl(cmd: &str) -> Option<PathBuf> {
     if cmd.is_empty() {
         return None;
     }
-    let selected = if cmd.contains('/') {
-        let path = PathBuf::from(cmd);
-        is_executable_file(&path).then_some(path)
+    let cwd = std::env::current_dir().ok();
+    if cmd.contains('/') {
+        let selected = anchor_selected_executable(PathBuf::from(cmd), cwd.as_deref())?;
+        is_executable_file(&selected).then_some(selected)
     } else {
         let path_var = std::env::var_os("PATH")?;
-        std::env::split_paths(&path_var)
-            .map(|dir| dir.join(cmd))
-            .find(|candidate| is_executable_file(candidate))
-    };
-    selected.map(|path| std::fs::canonicalize(&path).unwrap_or(path))
+        selected_executable_in_path(cmd, &path_var, cwd.as_deref())
+    }
+}
+
+pub(crate) fn resolved_executable_impl(cmd: &str) -> Option<PathBuf> {
+    selected_executable_impl(cmd).map(|path| std::fs::canonicalize(&path).unwrap_or(path))
 }
 
 fn which_on_path_impl(cmd: &str) -> bool {
@@ -2462,6 +2480,28 @@ mod tests {
     use bridge_core::ids::AgentId;
     use bridge_core::mcp::McpServerSpec;
     use std::collections::{HashMap, HashSet};
+
+    #[cfg(unix)]
+    #[test]
+    fn selected_executable_anchors_relative_path_entries_without_resolving_the_target() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let cwd = tempfile::tempdir().unwrap();
+        let tools = cwd.path().join("tools");
+        std::fs::create_dir(&tools).unwrap();
+        let target = tools.join("podman");
+        std::fs::write(&target, b"#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        let selected = selected_executable_in_path(
+            "podman",
+            OsStr::new("tools:/usr/bin:/bin"),
+            Some(cwd.path()),
+        )
+        .unwrap();
+        assert_eq!(selected, target);
+        assert!(selected.is_absolute());
+    }
 
     // ---- fixtures ----
 

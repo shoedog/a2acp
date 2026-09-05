@@ -230,6 +230,7 @@ pub(super) struct ProviderFreeResolutionRequest {
     pub(super) os: String,
     pub(super) architecture: String,
     pub(super) runtime: RuntimeKind,
+    pub(super) runtime_invocation_path: PathBuf,
     pub(super) runtime_executable: ExecutableIdentity,
     pub(super) base_resolver_executable: PathBuf,
     pub(super) npm_executable: PathBuf,
@@ -317,6 +318,8 @@ pub(super) struct ResolutionEnvironment {
     pub(super) os: String,
     pub(super) architecture: String,
     pub(super) runtime: RuntimeKind,
+    #[serde(default)]
+    pub(super) runtime_invocation_path: String,
     pub(super) runtime_executable: ExecutableIdentity,
 }
 
@@ -1187,6 +1190,18 @@ pub(super) fn validate_resolution(artifact: &ResolutionArtifact) -> Result<(), S
         "compatibility resolution runtime_executable",
         &artifact.environment.runtime_executable,
     )?;
+    if !artifact.environment.runtime_invocation_path.is_empty() {
+        let runtime_invocation_path = Path::new(&artifact.environment.runtime_invocation_path);
+        artifact_path(
+            "compatibility resolution runtime_invocation_path",
+            runtime_invocation_path,
+        )?;
+        if !runtime_invocation_path.is_absolute() {
+            return Err(
+                "compatibility resolution: runtime_invocation_path must be absolute".into(),
+            );
+        }
+    }
     validate_limits("compatibility resolution limits", &artifact.limits)?;
     if artifact.protected_inputs.len() > MAX_PROTECTED_INPUTS {
         return Err(format!(
@@ -1837,6 +1852,7 @@ struct ResolutionCommandSpec {
     family: ResolutionCommandFamily,
     kind: ResolutionCommandKind,
     program: PathBuf,
+    argv0: Option<OsString>,
     args: Vec<OsString>,
     cwd: PathBuf,
     env: BTreeMap<OsString, OsString>,
@@ -2345,6 +2361,9 @@ async fn execute_bounded_command(
             environment.extend(npm_proxy_environment(proxy));
         }
         let mut command = tokio::process::Command::new(&spec.program);
+        if let Some(argv0) = &spec.argv0 {
+            command.as_std_mut().arg0(argv0);
+        }
         command
             .args(&spec.args)
             .current_dir(&spec.cwd)
@@ -2548,6 +2567,7 @@ fn npm_lock_command(
         family: ResolutionCommandFamily::Npm,
         kind: ResolutionCommandKind::NpmLock,
         program: npm.to_path_buf(),
+        argv0: None,
         args,
         cwd,
         env,
@@ -4996,19 +5016,26 @@ fn resolve_base_command(
     cwd: PathBuf,
     timeout: Duration,
 ) -> ResolutionCommandSpec {
-    let args = match runtime {
-        RuntimeKind::Docker => vec!["buildx", "imagetools", "inspect", "--raw", NODE_READER_BASE],
-        RuntimeKind::Podman => vec![
-            "inspect",
-            "--raw",
-            "docker://docker.io/library/node:24-slim",
-        ],
+    let (argv0, args) = match runtime {
+        RuntimeKind::Docker => (
+            "docker-buildx",
+            vec!["imagetools", "inspect", "--raw", NODE_READER_BASE],
+        ),
+        RuntimeKind::Podman => (
+            "skopeo",
+            vec![
+                "inspect",
+                "--raw",
+                "docker://docker.io/library/node:24-slim",
+            ],
+        ),
     };
     let env = runtime_env(safe_path, &cwd);
     ResolutionCommandSpec {
         family: ResolutionCommandFamily::Runtime,
         kind: ResolutionCommandKind::ResolveBase,
         program: executable.to_path_buf(),
+        argv0: Some(OsString::from(argv0)),
         args: args.into_iter().map(OsString::from).collect(),
         cwd,
         env,
@@ -5042,6 +5069,7 @@ fn image_tag_absence_command(
         family: ResolutionCommandFamily::Runtime,
         kind: ResolutionCommandKind::EnsureImageTagAbsent,
         program: executable.to_path_buf(),
+        argv0: Some(OsString::from(runtime.wire())),
         args,
         cwd,
         env,
@@ -5169,6 +5197,7 @@ fn image_build_command(input: ImageBuildCommand<'_>) -> ResolutionCommandSpec {
         family: ResolutionCommandFamily::Runtime,
         kind: ResolutionCommandKind::BuildImage,
         program: input.executable.to_path_buf(),
+        argv0: Some(OsString::from(input.runtime.wire())),
         args,
         cwd: input.cwd,
         env,
@@ -5285,6 +5314,7 @@ async fn materialize_image(
         .await?;
     let inspect = executor
         .execute(&image_inspect_command(
+            input.runtime,
             input.runtime_executable,
             input.safe_path,
             input.bundle.pin.acp_session_cwd(),
@@ -5308,6 +5338,7 @@ async fn materialize_image(
 }
 
 fn image_inspect_command(
+    runtime: RuntimeKind,
     executable: &Path,
     safe_path: OsString,
     cwd: PathBuf,
@@ -5319,6 +5350,7 @@ fn image_inspect_command(
         family: ResolutionCommandFamily::Runtime,
         kind: ResolutionCommandKind::InspectImage,
         program: executable.to_path_buf(),
+        argv0: Some(OsString::from(runtime.wire())),
         args: ["image", "inspect", tag]
             .into_iter()
             .map(OsString::from)
@@ -5449,6 +5481,31 @@ fn revalidate_executable(
     Ok(())
 }
 
+fn revalidate_executable_invocation(
+    invocation_path: &str,
+    identity: &ExecutableIdentity,
+    failure: RevalidationFailure,
+) -> Result<(), RevalidationFailure> {
+    let invocation_path = Path::new(invocation_path);
+    if !invocation_path.is_absolute() {
+        return Err(failure);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let metadata = fs::metadata(invocation_path).map_err(|_| failure)?;
+        if !metadata.is_file() || metadata.permissions().mode() & 0o111 == 0 {
+            return Err(failure);
+        }
+    }
+    let canonical_path = fs::canonicalize(invocation_path).map_err(|_| failure)?;
+    if canonical_path.to_str() != Some(identity.canonical_path.as_str()) {
+        return Err(failure);
+    }
+    revalidate_executable(identity, failure)
+}
+
 fn resolution_bundle_root(loaded: &LoadedResolution) -> Result<PathBuf, RevalidationFailure> {
     let root = loaded
         .canonical_path
@@ -5542,6 +5599,25 @@ pub(super) fn revalidate_resolution_global(
         RevalidationFailure::CandidateBinaryChanged,
     )?;
     revalidate_executable(
+        &loaded.artifact.environment.runtime_executable,
+        RevalidationFailure::RuntimeExecutableChanged,
+    )?;
+    let runtime_invocation_path = if loaded
+        .artifact
+        .environment
+        .runtime_invocation_path
+        .is_empty()
+    {
+        &loaded
+            .artifact
+            .environment
+            .runtime_executable
+            .canonical_path
+    } else {
+        &loaded.artifact.environment.runtime_invocation_path
+    };
+    revalidate_executable_invocation(
+        runtime_invocation_path,
         &loaded.artifact.environment.runtime_executable,
         RevalidationFailure::RuntimeExecutableChanged,
     )?;
@@ -5756,6 +5832,7 @@ async fn revalidate_resolution_case_with_executor(
         .map_err(|_| RevalidationFailure::RuntimeExecutableChanged)?;
         let inspected = executor
             .execute(&image_inspect_command(
+                loaded.artifact.environment.runtime,
                 runtime_path,
                 safe_path,
                 root,
@@ -5769,6 +5846,7 @@ async fn revalidate_resolution_case_with_executor(
         if immutable_id != image.final_image_id {
             return Err(RevalidationFailure::ImageChanged);
         }
+        revalidate_resolution_global(loaded, environment_owner)?;
     }
     Ok(())
 }
@@ -5945,6 +6023,17 @@ fn prepare_resolution_request(
         &request.runtime_executable,
     )
     .map_err(|error| format!("compatibility resolve: {error}"))?;
+    revalidate_executable_invocation(
+        request
+            .runtime_invocation_path
+            .to_str()
+            .ok_or("compatibility resolve: runtime invocation path must be UTF-8")?,
+        &request.runtime_executable,
+        RevalidationFailure::RuntimeExecutableChanged,
+    )
+    .map_err(|_| {
+        "compatibility resolve: runtime invocation path does not match the protected executable"
+    })?;
     if request.cases.is_empty() || request.cases.len() > MAX_CASES {
         return Err(
             "compatibility resolve: selection must contain a bounded non-empty case set".into(),
@@ -6049,9 +6138,6 @@ fn prepare_resolution_request(
     }
     if !protected.contains_key(&request.npm_executable)
         || !protected.contains_key(&request.base_resolver_executable)
-        || (request.runtime == RuntimeKind::Docker
-            && request.base_resolver_executable.as_path()
-                != Path::new(&request.runtime_executable.canonical_path))
     {
         return Err(
             "compatibility resolve: resolver tool identities are not fully protected".into(),
@@ -6094,6 +6180,10 @@ fn setup_resolution_artifact(
             os: request.os.clone(),
             architecture: request.architecture.clone(),
             runtime: request.runtime,
+            runtime_invocation_path: artifact_path(
+                "resolution runtime invocation path",
+                &request.runtime_invocation_path,
+            )?,
             runtime_executable: request.runtime_executable.clone(),
         },
         limits: request.recipes.recipes.limits.clone(),
@@ -6277,7 +6367,7 @@ async fn materialize_resolution_body(
             package,
             image,
             &publisher.canonical_path,
-            &tooling.runtime_executable,
+            &request.runtime_invocation_path,
             settings_path.as_deref(),
         )
         .map_err(|_| ResolutionFailureCode::ConfigTemplateMismatch)?;
@@ -6415,7 +6505,15 @@ async fn resolve_with_executor(
         materialize_resolution_body(&request, &prepared, &publisher, executor, &mut artifact).await;
     let (protected_inputs, protected_changed) = protected_evidence(&protected, true);
     artifact.protected_inputs = protected_inputs;
-    let failure = if protected_changed {
+    let invocation_changed = request.runtime_invocation_path.to_str().is_none_or(|path| {
+        revalidate_executable_invocation(
+            path,
+            &request.runtime_executable,
+            RevalidationFailure::RuntimeExecutableChanged,
+        )
+        .is_err()
+    });
+    let failure = if protected_changed || invocation_changed {
         Some(ResolutionFailureCode::ProtectedStateChanged)
     } else {
         body_result.err()
@@ -6717,6 +6815,7 @@ image = "reader-current"
                 os: "macos".into(),
                 architecture: "aarch64".into(),
                 runtime: RuntimeKind::Docker,
+                runtime_invocation_path: "/usr/local/bin/docker".into(),
                 runtime_executable: executable("/usr/local/bin/docker", 'd'),
             },
             limits: ResolutionLimits {
@@ -6901,6 +7000,19 @@ image = "reader-current"
         let mut unknown_resource = valid;
         unknown_resource["owned_resources"][0]["kind"] = serde_json::json!("shared_operator");
         assert!(serde_json::from_value::<ResolutionArtifact>(unknown_resource).is_err());
+    }
+
+    #[test]
+    fn schema_v1_resolution_without_runtime_invocation_uses_canonical_legacy_fallback() {
+        let mut legacy = serde_json::to_value(valid_resolution()).unwrap();
+        legacy["environment"]
+            .as_object_mut()
+            .unwrap()
+            .remove("runtime_invocation_path");
+
+        let artifact = serde_json::from_value::<ResolutionArtifact>(legacy).unwrap();
+        assert!(artifact.environment.runtime_invocation_path.is_empty());
+        validate_resolution(&artifact).unwrap();
     }
 
     fn setup_resolution(bundle_path: &Path) -> ResolutionArtifact {
@@ -9198,6 +9310,7 @@ image = "reader-current"
             labels: &labels,
         });
         assert_eq!(docker.kind, ResolutionCommandKind::BuildImage);
+        assert_eq!(docker.argv0.as_deref(), Some(OsStr::new("docker")));
         assert!(docker.args.iter().any(|arg| arg == "--pull=false"));
         assert!(docker.args.iter().any(|arg| arg == "--network=none"));
         assert!(docker.args.iter().all(|arg| arg != "sh" && arg != "-c"));
@@ -9224,12 +9337,16 @@ image = "reader-current"
 
         let resolve = resolve_base_command(
             RuntimeKind::Docker,
-            Path::new("/trusted/bin/docker"),
+            Path::new("/trusted/bin/docker-tools"),
             OsString::from("/trusted/bin:/usr/bin"),
             PathBuf::from("/private/bundle"),
             Duration::from_secs(30),
         );
         assert_eq!(resolve.kind, ResolutionCommandKind::ResolveBase);
+        assert_eq!(resolve.program, Path::new("/trusted/bin/docker-tools"));
+        assert_eq!(resolve.argv0.as_deref(), Some(OsStr::new("docker-buildx")));
+        assert_eq!(resolve.args.first().unwrap(), "imagetools");
+        assert!(resolve.args.iter().all(|arg| arg != "buildx"));
         assert_eq!(resolve.args.last().unwrap(), NODE_READER_BASE);
         let podman_resolve = resolve_base_command(
             RuntimeKind::Podman,
@@ -9239,6 +9356,7 @@ image = "reader-current"
             Duration::from_secs(30),
         );
         assert_eq!(podman_resolve.program, Path::new("/trusted/bin/skopeo"));
+        assert_eq!(podman_resolve.argv0.as_deref(), Some(OsStr::new("skopeo")));
         assert_eq!(
             podman_resolve.args,
             [
@@ -9270,6 +9388,7 @@ image = "reader-current"
             ResolutionFailureCode::ImageTagAlreadyExists
         );
         let inspect = image_inspect_command(
+            RuntimeKind::Docker,
             Path::new("/trusted/bin/docker"),
             OsString::from("/trusted/bin:/usr/bin"),
             PathBuf::from("/private/bundle"),
@@ -9413,6 +9532,37 @@ image = "reader-current"
         tag_exists: bool,
         tag_query_fails: bool,
         mutate_path: Option<PathBuf>,
+    }
+
+    #[cfg(unix)]
+    struct RuntimeInvocationRetargetingExecutor {
+        inner: ResolutionFakeExecutor,
+        invocation_path: PathBuf,
+        replacement_target: PathBuf,
+    }
+
+    #[cfg(unix)]
+    #[async_trait]
+    impl ResolutionExecutor for RuntimeInvocationRetargetingExecutor {
+        async fn execute(
+            &self,
+            command: &ResolutionCommandSpec,
+        ) -> Result<Vec<u8>, ResolutionFailureCode> {
+            let result = self.inner.execute(command).await;
+            if command.kind == ResolutionCommandKind::NpmLock {
+                std::fs::remove_file(&self.invocation_path).unwrap();
+                std::os::unix::fs::symlink(&self.replacement_target, &self.invocation_path)
+                    .unwrap();
+            }
+            result
+        }
+
+        async fn materialize_package_tree(
+            &self,
+            request: &PackageTreeMaterialization<'_>,
+        ) -> Result<(), ResolutionFailureCode> {
+            self.inner.materialize_package_tree(request).await
+        }
     }
 
     #[async_trait]
@@ -9592,6 +9742,11 @@ addr = "127.0.0.1:8080"
         fs::write(&candidate_path, b"test candidate").unwrap();
         fs::write(&runtime_path, b"test runtime").unwrap();
         fs::write(&npm_path, b"test npm").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            fs::set_permissions(&runtime_path, fs::Permissions::from_mode(0o700)).unwrap();
+        }
         let npm_snapshot =
             local_file::read_regular_file_bounded(&npm_path, "test npm", 1024 * 1024).unwrap();
         let owner = "test-runner".to_owned();
@@ -9678,6 +9833,7 @@ addr = "127.0.0.1:8080"
             os,
             architecture,
             runtime: RuntimeKind::Docker,
+            runtime_invocation_path: runtime_path,
             runtime_executable,
             base_resolver_executable,
             npm_executable: npm_snapshot.canonical_path.clone(),
@@ -9739,9 +9895,100 @@ addr = "127.0.0.1:8080"
         assert!(!output.join("packages/codex-current/cache").exists());
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn provider_free_resolver_preserves_symlinked_runtime_invocation_in_reader_config() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let parent = tempfile::tempdir().unwrap();
+        let mut request = provider_free_request(parent.path(), true);
+        let runtime_target = request.runtime_invocation_path.clone();
+        fs::set_permissions(&runtime_target, fs::Permissions::from_mode(0o700)).unwrap();
+        let runtime_invocation = parent.path().join("docker-invocation");
+        std::os::unix::fs::symlink(&runtime_target, &runtime_invocation).unwrap();
+        request.runtime_invocation_path = runtime_invocation.clone();
+        let output = request.output.clone();
+        let executor = ResolutionFakeExecutor {
+            calls: std::sync::Mutex::new(Vec::new()),
+            labels: std::sync::Mutex::new(BTreeMap::new()),
+            tag_exists: false,
+            tag_query_fails: false,
+            mutate_path: None,
+        };
+
+        let artifact = resolve_with_executor(request, &executor).await.unwrap();
+        assert_eq!(
+            artifact.environment.runtime_invocation_path,
+            runtime_invocation.to_string_lossy()
+        );
+        let reader =
+            fs::read_to_string(output.join("configs/codex-reader-floating-current.toml")).unwrap();
+        assert!(reader.contains(&runtime_invocation.to_string_lossy().to_string()));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn provider_free_resolver_rejects_runtime_invocation_retarget_before_publication() {
+        let parent = tempfile::tempdir().unwrap();
+        let mut request = provider_free_request(parent.path(), true);
+        let original_target = request.runtime_invocation_path.clone();
+        let invocation_path = parent.path().join("docker-invocation");
+        use std::os::unix::fs::PermissionsExt as _;
+        fs::set_permissions(&original_target, fs::Permissions::from_mode(0o700)).unwrap();
+        std::os::unix::fs::symlink(&original_target, &invocation_path).unwrap();
+        request.runtime_invocation_path = invocation_path.clone();
+        let replacement_target = parent.path().join("replacement-runtime");
+        fs::write(&replacement_target, b"replacement-runtime").unwrap();
+        fs::set_permissions(&replacement_target, fs::Permissions::from_mode(0o700)).unwrap();
+        let output = request.output.clone();
+        let executor = RuntimeInvocationRetargetingExecutor {
+            inner: ResolutionFakeExecutor {
+                calls: std::sync::Mutex::new(Vec::new()),
+                labels: std::sync::Mutex::new(BTreeMap::new()),
+                tag_exists: false,
+                tag_query_fails: false,
+                mutate_path: None,
+            },
+            invocation_path,
+            replacement_target,
+        };
+
+        let error = resolve_with_executor(request, &executor).await.unwrap_err();
+        assert!(
+            output.join("resolution.json").is_file(),
+            "terminal failure artifact missing after: {error}"
+        );
+        let loaded = load_resolution(&output.join("resolution.json")).unwrap();
+        assert_eq!(loaded.artifact.state, ResolutionState::Failed);
+        assert_eq!(
+            loaded.artifact.failure.unwrap().code,
+            ResolutionFailureCode::ProtectedStateChanged
+        );
+    }
+
     struct ImageRevalidationExecutor {
         id: String,
         labels: BTreeMap<String, String>,
+    }
+
+    #[cfg(unix)]
+    struct RetargetingImageRevalidationExecutor {
+        inner: ImageRevalidationExecutor,
+        invocation_path: PathBuf,
+        replacement_target: PathBuf,
+    }
+
+    #[cfg(unix)]
+    #[async_trait]
+    impl ResolutionExecutor for RetargetingImageRevalidationExecutor {
+        async fn execute(
+            &self,
+            command: &ResolutionCommandSpec,
+        ) -> Result<Vec<u8>, ResolutionFailureCode> {
+            fs::remove_file(&self.invocation_path).unwrap();
+            std::os::unix::fs::symlink(&self.replacement_target, &self.invocation_path).unwrap();
+            self.inner.execute(command).await
+        }
     }
 
     #[async_trait]
@@ -9757,6 +10004,54 @@ addr = "127.0.0.1:8080"
             }]))
             .unwrap())
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn image_revalidation_rejects_runtime_alias_retargeted_during_inspection() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let parent = tempfile::tempdir().unwrap();
+        let mut request = provider_free_request(parent.path(), true);
+        let runtime_target = request.runtime_invocation_path.clone();
+        fs::set_permissions(&runtime_target, fs::Permissions::from_mode(0o700)).unwrap();
+        let runtime_invocation = parent.path().join("docker-invocation");
+        std::os::unix::fs::symlink(&runtime_target, &runtime_invocation).unwrap();
+        request.runtime_invocation_path = runtime_invocation.clone();
+        let output = request.output.clone();
+        let resolver = ResolutionFakeExecutor {
+            calls: std::sync::Mutex::new(Vec::new()),
+            labels: std::sync::Mutex::new(BTreeMap::new()),
+            tag_exists: false,
+            tag_query_fails: false,
+            mutate_path: None,
+        };
+        resolve_with_executor(request, &resolver).await.unwrap();
+        let loaded = load_resolution(&output.join("resolution.json")).unwrap();
+        let image = &loaded.artifact.images[0];
+        let replacement_target = parent.path().join("replacement-runtime");
+        fs::write(&replacement_target, b"replacement-runtime").unwrap();
+        fs::set_permissions(&replacement_target, fs::Permissions::from_mode(0o700)).unwrap();
+        let inspector = RetargetingImageRevalidationExecutor {
+            inner: ImageRevalidationExecutor {
+                id: image.final_image_id.clone(),
+                labels: image.labels.clone(),
+            },
+            invocation_path: runtime_invocation,
+            replacement_target,
+        };
+
+        assert_eq!(
+            revalidate_resolution_case_with_executor(
+                &loaded,
+                "test-runner",
+                "codex-reader-floating-current",
+                &inspector,
+            )
+            .await
+            .unwrap_err(),
+            RevalidationFailure::RuntimeExecutableChanged
+        );
     }
 
     #[cfg(unix)]
@@ -10108,6 +10403,7 @@ addr = "127.0.0.1:8080"
             family: ResolutionCommandFamily::Runtime,
             kind: ResolutionCommandKind::InspectImage,
             program: program.to_path_buf(),
+            argv0: None,
             args: args.iter().map(OsString::from).collect(),
             cwd: PathBuf::from("/"),
             env: BTreeMap::new(),
@@ -10128,6 +10424,14 @@ addr = "127.0.0.1:8080"
             Duration::from_secs(1),
         );
         assert_eq!(executor.execute(&command).await.unwrap(), b"bounded");
+
+        command = command_for_test(
+            Path::new("/bin/sh"),
+            &["-c", "printf %s \"$0\""],
+            Duration::from_secs(1),
+        );
+        command.argv0 = Some(OsString::from("docker"));
+        assert_eq!(executor.execute(&command).await.unwrap(), b"docker");
 
         command.max_output_bytes = 3;
         assert_eq!(

@@ -5076,10 +5076,119 @@ fn find_resolution_executable(
     ),
     BoxError,
 > {
-    let path = crate::doctor::resolved_executable_impl(command).ok_or_else(|| {
+    let path = crate::doctor::selected_executable_impl(command).ok_or_else(|| {
         format!("compatibility resolve: required {label} {command:?} is not executable on PATH")
     })?;
-    snapshot_resolution_executable(&path, label)
+    snapshot_resolution_invocation(&path, label)
+}
+
+fn snapshot_resolution_invocation(
+    path: &Path,
+    label: &str,
+) -> Result<
+    (
+        PathBuf,
+        compatibility_resolution::ExecutableIdentity,
+        compatibility_resolution::ProtectedFileInput,
+    ),
+    BoxError,
+> {
+    let canonical_path = std::fs::canonicalize(path).map_err(|error| {
+        format!("compatibility resolve: cannot canonicalize required {label}: {error}")
+    })?;
+    let (_, identity, protected) = snapshot_resolution_executable(&canonical_path, label)?;
+    Ok((path.to_path_buf(), identity, protected))
+}
+
+fn docker_buildx_candidate_paths(
+    runtime_invocation_path: &Path,
+    runtime_executable_path: &Path,
+    docker_config: Option<&OsStr>,
+    home: Option<&OsStr>,
+    path_candidate: Option<PathBuf>,
+) -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    let mut seen = BTreeSet::new();
+    let mut add = |candidate: PathBuf| {
+        if seen.insert(candidate.clone()) {
+            candidates.push(candidate);
+        }
+    };
+    for runtime in [runtime_invocation_path, runtime_executable_path] {
+        if let Some(parent) = runtime.parent() {
+            add(parent.join("docker-buildx"));
+        }
+    }
+    if let Some(directory) = docker_config.map(PathBuf::from) {
+        add(directory.join("cli-plugins/docker-buildx"));
+    }
+    if let Some(directory) = home.map(PathBuf::from) {
+        add(directory.join(".docker/cli-plugins/docker-buildx"));
+    }
+    for directory in [
+        "/usr/local/lib/docker/cli-plugins",
+        "/usr/local/libexec/docker/cli-plugins",
+        "/usr/lib/docker/cli-plugins",
+        "/usr/libexec/docker/cli-plugins",
+        "/opt/homebrew/lib/docker/cli-plugins",
+    ] {
+        add(Path::new(directory).join("docker-buildx"));
+    }
+    if let Some(candidate) = path_candidate {
+        add(candidate);
+    }
+    candidates
+}
+
+fn find_docker_buildx_executable_in(
+    runtime_invocation_path: &Path,
+    runtime_executable_path: &Path,
+    docker_config: Option<&OsStr>,
+    home: Option<&OsStr>,
+    path_candidate: Option<PathBuf>,
+) -> Result<
+    (
+        PathBuf,
+        compatibility_resolution::ExecutableIdentity,
+        compatibility_resolution::ProtectedFileInput,
+    ),
+    BoxError,
+> {
+    for candidate in docker_buildx_candidate_paths(
+        runtime_invocation_path,
+        runtime_executable_path,
+        docker_config,
+        home,
+        path_candidate,
+    ) {
+        let Some(raw) = candidate.to_str() else {
+            continue;
+        };
+        if let Some(selected) = crate::doctor::selected_executable_impl(raw) {
+            return snapshot_resolution_invocation(&selected, "raw registry manifest resolver");
+        }
+    }
+    Err("compatibility resolve: required raw registry manifest resolver \"docker-buildx\" was not executable beside Docker, in a Docker CLI plugin directory, or on PATH".into())
+}
+
+fn find_docker_buildx_executable(
+    runtime_invocation_path: &Path,
+    runtime_executable_path: &Path,
+) -> Result<
+    (
+        PathBuf,
+        compatibility_resolution::ExecutableIdentity,
+        compatibility_resolution::ProtectedFileInput,
+    ),
+    BoxError,
+> {
+    find_docker_buildx_executable_in(
+        runtime_invocation_path,
+        runtime_executable_path,
+        std::env::var_os("DOCKER_CONFIG").as_deref(),
+        std::env::var_os("HOME").as_deref(),
+        crate::doctor::selected_executable_impl("docker-buildx"),
+    )
 }
 
 fn closed_resolution_path(paths: &[&Path]) -> Result<OsString, BoxError> {
@@ -5291,30 +5400,39 @@ async fn resolve_command(args: ResolveArgs) -> Result<(), BoxError> {
     })?;
     let (_, candidate, _) =
         snapshot_resolution_executable(&current_executable, "compatibility candidate binary")?;
-    let (runtime_path, runtime_executable, _) =
+    let (runtime_invocation_path, runtime_executable, _) =
         find_resolution_executable(args.runtime.wire(), "container runtime")?;
-    let (npm_path, _, npm_protected) = find_resolution_executable("npm", "npm executable")?;
-    let (node_path, _, node_protected) = find_resolution_executable("node", "node executable")?;
-    let (base_resolver_executable, base_resolver_protected) = match args.runtime {
-        RuntimeKind::Docker => (runtime_path.clone(), None),
-        RuntimeKind::Podman => {
-            let (path, _, protected) =
-                find_resolution_executable("skopeo", "raw registry manifest resolver")?;
-            (path, Some(protected))
-        }
-    };
+    let (npm_invocation_path, npm_identity, npm_protected) =
+        find_resolution_executable("npm", "npm executable")?;
+    let (node_invocation_path, node_identity, node_protected) =
+        find_resolution_executable("node", "node executable")?;
+    let runtime_executable_path = PathBuf::from(&runtime_executable.canonical_path);
+    let (base_resolver_invocation_path, base_resolver_identity, base_resolver_protected) =
+        match args.runtime {
+            RuntimeKind::Docker => {
+                find_docker_buildx_executable(&runtime_invocation_path, &runtime_executable_path)?
+            }
+            RuntimeKind::Podman => {
+                find_resolution_executable("skopeo", "raw registry manifest resolver")?
+            }
+        };
+    let base_resolver_executable = PathBuf::from(&base_resolver_identity.canonical_path);
+    let npm_executable = PathBuf::from(&npm_identity.canonical_path);
+    let node_executable = PathBuf::from(&node_identity.canonical_path);
     let safe_path = closed_resolution_path(&[
-        &runtime_path,
+        &runtime_invocation_path,
+        &runtime_executable_path,
+        &base_resolver_invocation_path,
         &base_resolver_executable,
-        &npm_path,
-        &node_path,
+        &npm_invocation_path,
+        &npm_executable,
+        &node_invocation_path,
+        &node_executable,
     ])?;
     let mut protected = protected_repository_inputs(&pinned.canonical_path)?;
     protected.push(npm_protected);
     protected.push(node_protected);
-    if let Some(base_resolver_protected) = base_resolver_protected {
-        protected.push(base_resolver_protected);
-    }
+    protected.push(base_resolver_protected);
     let request = compatibility_resolution::ProviderFreeResolutionRequest {
         output: args.out,
         recipes,
@@ -5328,9 +5446,10 @@ async fn resolve_command(args: ResolveArgs) -> Result<(), BoxError> {
         os: std::env::consts::OS.into(),
         architecture: std::env::consts::ARCH.into(),
         runtime: args.runtime,
+        runtime_invocation_path,
         runtime_executable,
         base_resolver_executable,
-        npm_executable: npm_path,
+        npm_executable,
         safe_path,
         budget: compatibility_resolution::ResolutionBudgetInput {
             timeout_secs: pinned.manifest.budget.timeout_secs,
@@ -5477,6 +5596,62 @@ mod tests {
     fn running_as_root() -> bool {
         // SAFETY: geteuid has no preconditions and only reads the process credential.
         unsafe { libc::geteuid() == 0 }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn docker_buildx_discovery_accepts_runtime_sibling_and_cli_plugin_layouts() {
+        use std::os::unix::fs::{symlink, PermissionsExt as _};
+
+        let root = tempfile::tempdir().unwrap();
+        let runtime_dir = root.path().join("runtime");
+        let invocation_dir = root.path().join("bin");
+        std::fs::create_dir(&runtime_dir).unwrap();
+        std::fs::create_dir(&invocation_dir).unwrap();
+        let runtime_target = runtime_dir.join("docker-tools");
+        std::fs::write(&runtime_target, b"#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&runtime_target, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let runtime_invocation = invocation_dir.join("docker");
+        symlink(&runtime_target, &runtime_invocation).unwrap();
+        let (_, runtime_identity, _) =
+            snapshot_resolution_executable(&runtime_target, "test container runtime executable")
+                .unwrap();
+
+        let sibling = runtime_dir.join("docker-buildx");
+        symlink(&runtime_target, &sibling).unwrap();
+        let (selected_sibling, sibling_identity, _) = find_docker_buildx_executable_in(
+            &runtime_invocation,
+            Path::new(&runtime_identity.canonical_path),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            selected_sibling,
+            Path::new(&runtime_identity.canonical_path)
+                .parent()
+                .unwrap()
+                .join("docker-buildx")
+        );
+        assert_eq!(sibling_identity, runtime_identity);
+
+        std::fs::remove_file(&sibling).unwrap();
+        let docker_config = root.path().join("docker-config");
+        let plugin_dir = docker_config.join("cli-plugins");
+        std::fs::create_dir_all(&plugin_dir).unwrap();
+        let plugin = plugin_dir.join("docker-buildx");
+        symlink(&runtime_target, &plugin).unwrap();
+        let (selected_plugin, plugin_identity, _) = find_docker_buildx_executable_in(
+            &runtime_invocation,
+            Path::new(&runtime_identity.canonical_path),
+            Some(docker_config.as_os_str()),
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(selected_plugin, plugin);
+        assert_eq!(plugin_identity, runtime_identity);
     }
 
     #[test]
@@ -5816,6 +5991,7 @@ mod tests {
                     os: std::env::consts::OS.into(),
                     architecture: std::env::consts::ARCH.into(),
                     runtime: RuntimeKind::Docker,
+                    runtime_invocation_path: dir.join("runtime").to_string_lossy().into_owned(),
                     runtime_executable: compatibility_resolution::ExecutableIdentity {
                         canonical_path: dir.join("runtime").to_string_lossy().into_owned(),
                         sha256: "5".repeat(64),
