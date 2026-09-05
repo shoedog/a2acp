@@ -4686,6 +4686,7 @@ fn validate_bound_execution(
         if package.requested.adapter != recipe.adapter
             || package.requested.adapter_selector != recipe.adapter_selector
             || package.requested.agent_cli != recipe.agent_cli
+            || package.requested.agent_cli_selector != recipe.agent_cli_selector
         {
             return Err(resolution_binding_mismatch());
         }
@@ -5920,6 +5921,7 @@ mod tests {
                     adapter: "@agentclientprotocol/codex-acp".into(),
                     adapter_selector: "latest".into(),
                     agent_cli: "@openai/codex".into(),
+                    agent_cli_selector: "adapter-declared".into(),
                 }],
                 images: Vec::new(),
                 cases: vec![compatibility_resolution::FloatingCaseRecipe {
@@ -5942,6 +5944,7 @@ mod tests {
                 adapter: "@agentclientprotocol/codex-acp".into(),
                 adapter_selector: "latest".into(),
                 agent_cli: "@openai/codex".into(),
+                agent_cli_selector: "adapter-declared".into(),
             },
             adapter: compatibility_resolution::ExactNpmPackage {
                 name: "@agentclientprotocol/codex-acp".into(),
@@ -6749,6 +6752,10 @@ agent_cli = "@openai/codex=0.144.1"
 
         let (resolution, mut recipes, production, execution) = bound_execution_fixture(dir.path());
         recipes.recipes.package_sets[0].adapter = "@agentclientprotocol/claude-agent-acp".into();
+        assert!(validate_bound_execution(&resolution, &recipes, &production, &execution).is_err());
+
+        let (resolution, mut recipes, production, execution) = bound_execution_fixture(dir.path());
+        recipes.recipes.package_sets[0].agent_cli_selector = "0.149.0".into();
         assert!(validate_bound_execution(&resolution, &recipes, &production, &execution).is_err());
 
         let (mut resolution, recipes, production, execution) = bound_execution_fixture(dir.path());
