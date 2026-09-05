@@ -546,6 +546,168 @@ fn secret_free_raw(label: &str, raw: &str) -> Result<(), String> {
     Ok(())
 }
 
+struct UniqueJsonValue(serde_json::Value);
+
+impl<'de> Deserialize<'de> for UniqueJsonValue {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct UniqueJsonVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for UniqueJsonVisitor {
+            type Value = UniqueJsonValue;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a JSON value without duplicate object keys")
+            }
+
+            fn visit_bool<E>(self, value: bool) -> Result<Self::Value, E> {
+                Ok(UniqueJsonValue(serde_json::Value::Bool(value)))
+            }
+
+            fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E> {
+                Ok(UniqueJsonValue(serde_json::Value::Number(value.into())))
+            }
+
+            fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E> {
+                Ok(UniqueJsonValue(serde_json::Value::Number(value.into())))
+            }
+
+            fn visit_f64<E>(self, value: f64) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                let value = serde_json::Number::from_f64(value)
+                    .ok_or_else(|| E::custom("non-finite JSON number"))?;
+                Ok(UniqueJsonValue(serde_json::Value::Number(value)))
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E> {
+                Ok(UniqueJsonValue(serde_json::Value::String(value.to_owned())))
+            }
+
+            fn visit_string<E>(self, value: String) -> Result<Self::Value, E> {
+                Ok(UniqueJsonValue(serde_json::Value::String(value)))
+            }
+
+            fn visit_none<E>(self) -> Result<Self::Value, E> {
+                Ok(UniqueJsonValue(serde_json::Value::Null))
+            }
+
+            fn visit_unit<E>(self) -> Result<Self::Value, E> {
+                Ok(UniqueJsonValue(serde_json::Value::Null))
+            }
+
+            fn visit_some<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+            where
+                D: serde::Deserializer<'de>,
+            {
+                UniqueJsonValue::deserialize(deserializer)
+            }
+
+            fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+            where
+                A: serde::de::SeqAccess<'de>,
+            {
+                let mut values = Vec::new();
+                while let Some(UniqueJsonValue(value)) = sequence.next_element()? {
+                    values.push(value);
+                }
+                Ok(UniqueJsonValue(serde_json::Value::Array(values)))
+            }
+
+            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+            where
+                A: serde::de::MapAccess<'de>,
+            {
+                let mut values = serde_json::Map::new();
+                while let Some(key) = map.next_key::<String>()? {
+                    if values.contains_key(&key) {
+                        return Err(<A::Error as serde::de::Error>::custom(
+                            "duplicate JSON object key",
+                        ));
+                    }
+                    let UniqueJsonValue(value) = map.next_value()?;
+                    values.insert(key, value);
+                }
+                Ok(UniqueJsonValue(serde_json::Value::Object(values)))
+            }
+        }
+
+        deserializer.deserialize_any(UniqueJsonVisitor)
+    }
+}
+
+fn parse_unique_package_lock_json(bytes: &[u8]) -> Result<serde_json::Value, String> {
+    serde_json::from_slice::<UniqueJsonValue>(bytes)
+        .map(|value| value.0)
+        .map_err(|error| {
+            if error.to_string().contains("duplicate JSON object key") {
+                "package lock contains duplicate JSON object key".into()
+            } else {
+                "package lock is invalid JSON".into()
+            }
+        })
+}
+
+fn package_lock_key_looks_secret(key: &str) -> bool {
+    if compatibility::sensitive_json_key(key) || compatibility::looks_like_secret(key) {
+        return true;
+    }
+    compatibility::looks_like_secret(&format!("{key}=value"))
+}
+
+fn secret_free_package_lock(value: &serde_json::Value) -> Result<(), String> {
+    #[derive(Clone, Copy)]
+    enum Context {
+        Root,
+        PackageEntries,
+        PackageEntry,
+        DependencyNames,
+        General,
+    }
+
+    let mut pending = vec![(value, Context::Root)];
+    while let Some((value, context)) = pending.pop() {
+        match value {
+            serde_json::Value::String(value) => {
+                if compatibility::looks_like_secret(value) {
+                    return Err("package lock contains secret-shaped material".into());
+                }
+            }
+            serde_json::Value::Array(values) => {
+                pending.extend(values.iter().map(|value| (value, Context::General)));
+            }
+            serde_json::Value::Object(values) => {
+                for (key, value) in values {
+                    if !matches!(context, Context::PackageEntries | Context::DependencyNames)
+                        && package_lock_key_looks_secret(key)
+                    {
+                        return Err("package lock contains secret-shaped material".into());
+                    }
+                    let child_context = match (context, key.as_str()) {
+                        (Context::Root, "packages") => Context::PackageEntries,
+                        (Context::PackageEntries, _) => Context::PackageEntry,
+                        (
+                            Context::PackageEntry,
+                            "dependencies"
+                            | "optionalDependencies"
+                            | "peerDependencies"
+                            | "devDependencies",
+                        ) => Context::DependencyNames,
+                        _ => Context::General,
+                    };
+                    pending.push((value, child_context));
+                }
+            }
+            serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {
+            }
+        }
+    }
+    Ok(())
+}
+
 fn valid_sha256(value: &str) -> bool {
     value.len() == 64
         && value == value.to_ascii_lowercase()
@@ -2594,10 +2756,9 @@ fn parse_package_lock(
             "package lock must be a non-empty file of at most {MAX_LOCK_BYTES} bytes"
         ));
     }
-    let raw = std::str::from_utf8(bytes).map_err(|_| "package lock must be UTF-8")?;
-    secret_free_raw("package lock", raw)?;
-    let root: serde_json::Value =
-        serde_json::from_slice(bytes).map_err(|_| "package lock is invalid JSON")?;
+    std::str::from_utf8(bytes).map_err(|_| "package lock must be UTF-8")?;
+    let root = parse_unique_package_lock_json(bytes)?;
+    secret_free_package_lock(&root)?;
     let root = root
         .as_object()
         .ok_or("package lock root must be an object")?;
@@ -7138,6 +7299,64 @@ image = "reader-current"
         )
         .unwrap_err()
         .contains("multiple nested"));
+    }
+
+    #[test]
+    fn package_lock_secret_scan_allows_dependency_names_but_rejects_secret_material() {
+        let public_dependencies = String::from_utf8(valid_package_lock()).unwrap().replace(
+            "\"dependencies\": {\n        \"@openai/codex\": \"^0.150.0\"\n      }",
+            "\"dependencies\": {\n        \"@openai/codex\": \"^0.150.0\",\n        \"cookie\": \"^0.7.1\"\n      },\n      \"optionalDependencies\": {\"token\": \"1.0.0\"},\n      \"peerDependencies\": {\"password\": \"2.0.0\"},\n      \"devDependencies\": {\"secret\": \"3.0.0\"}",
+        );
+        let public_dependencies = public_dependencies.replace(
+            "\"node_modules/@openai/codex\": {",
+            &format!(
+                "\"node_modules/cookie\": {{\n      \"version\": \"0.7.1\",\n      \"resolved\": \"https://registry.npmjs.org/cookie/-/cookie-0.7.1.tgz\",\n      \"integrity\": {:?}\n    }},\n    \"node_modules/@openai/codex\": {{",
+                canonical_integrity('C')
+            ),
+        );
+        parse_package_lock(
+            public_dependencies.as_bytes(),
+            "@agentclientprotocol/codex-acp",
+            "@openai/codex",
+            100,
+        )
+        .unwrap();
+
+        let credential_field = public_dependencies.replace(
+            "\"requires\": true",
+            "\"cookie\": \"ordinary-value\", \"requires\": true",
+        );
+        assert!(parse_package_lock(
+            credential_field.as_bytes(),
+            "@agentclientprotocol/codex-acp",
+            "@openai/codex",
+            100,
+        )
+        .unwrap_err()
+        .contains("secret-shaped"));
+
+        let secret_selector = public_dependencies.replace("\"^0.7.1\"", "\"sk-secret-value\"");
+        assert!(parse_package_lock(
+            secret_selector.as_bytes(),
+            "@agentclientprotocol/codex-acp",
+            "@openai/codex",
+            100,
+        )
+        .unwrap_err()
+        .contains("secret-shaped"));
+
+        let shadowed_secret = public_dependencies.replace(
+            "\"requires\": true",
+            "\"note\": \"sk-secret-value\", \"note\": \"ordinary-value\", \"requires\": true",
+        );
+        assert!(parse_package_lock(
+            shadowed_secret.as_bytes(),
+            "@agentclientprotocol/codex-acp",
+            "@openai/codex",
+            100,
+        )
+        .unwrap_err()
+        .contains("duplicate JSON object key"));
     }
 
     enum TestArchiveEntry<'a> {
