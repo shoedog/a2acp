@@ -54,6 +54,44 @@ mode-`0700` private prefix that is absent from `PATH`. For a Codex adapter with 
 pin the nested `@openai/codex` version. For Claude, use the exact Agent SDK declared by the selected adapter
 and record its `claudeCodeVersion`; do not substitute a newer standalone SDK without a separate test lane.
 
+### Deterministic hybrid isolation after a floating failure
+
+When a floating candidate fails but the same-environment pinned control passes, do not re-resolve the same
+bundle and call it isolation. Copy the recipe into private operator storage and create one new resolution per
+diagnostic case. A package-set request accepts either `latest` or one complete semantic version in
+`adapter_selector`. Omit `agent_cli_selector` (or set it to `adapter-declared`) to retain the adapter's declared
+nested dependency; set it to one complete semantic version to emit an npm override and require that exact
+resolved CLI/SDK. A reader image accepts `docker.io/library/node:24-slim` or an exact
+`docker.io/library/node:24.x.y-slim` base. Other tags, ranges, registries, and Node major versions fail closed.
+
+For example, this private request pins all three independently:
+
+```toml
+[[package_sets]]
+id = "codex-hybrid"
+ecosystem = "npm"
+registry = "npmjs"
+adapter = "@agentclientprotocol/codex-acp"
+adapter_selector = "1.10.0"
+agent_cli = "@openai/codex"
+agent_cli_selector = "0.145.0"
+
+[[images]]
+id = "reader-hybrid"
+template = "node-acp-reader-v1"
+base = "docker.io/library/node:24.18.0-slim"
+package_sets = ["codex-hybrid"]
+```
+
+Start from the exact passing-control adapter, nested CLI/SDK, and Node base, then change only one axis per
+case: adapter, nested CLI/SDK, or Node base. Give every case and owned image tag a unique ID, use a new private
+output directory, and retain the complete `resolution.json`. The resolver verifies the requested adapter and
+nested CLI/SDK against the exact lock result, resolves the requested base to immutable index and platform
+digests, and emits bound diagnostic configs without starting an ACP or provider session. Run each diagnostic
+case under a separately authorized compatibility verification; compare each one independently with its pinned
+baseline because the manifest intentionally rejects duplicate baseline mappings. Resolution is not verification,
+and neither grants promotion, restart, cleanup, or billable prompt authority.
+
 If an existing standalone updater stalls, record its process tree and the exact child command, terminate
 only the stale updater tree after excluding live agent/operator processes, and rerun the installed binary
 with a bound. If it remains unusable, install the exact replacement under a private prefix and verify both

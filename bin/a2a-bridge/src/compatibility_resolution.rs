@@ -44,6 +44,7 @@ const MAX_UNPACKED_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 const MAX_FILES: u64 = 500_000;
 const MAX_RETENTION_DAYS: u16 = 90;
 const NODE_READER_BASE: &str = "docker.io/library/node:24-slim";
+const ADAPTER_DECLARED_CLI_SELECTOR: &str = "adapter-declared";
 const NPM_REGISTRY: &str = "https://registry.npmjs.org/";
 const NPM_REGISTRY_AUTHORITY: &str = "registry.npmjs.org:443";
 const MAX_PROXY_HEADER_BYTES: usize = 16 * 1024;
@@ -114,6 +115,11 @@ pub(super) struct PackageSetRecipe {
     pub(super) adapter: String,
     pub(super) adapter_selector: String,
     pub(super) agent_cli: String,
+    #[serde(
+        default = "default_agent_cli_selector",
+        skip_serializing_if = "is_default_agent_cli_selector"
+    )]
+    pub(super) agent_cli_selector: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -329,6 +335,8 @@ pub(super) struct RequestedPackageSet {
     pub(super) adapter: String,
     pub(super) adapter_selector: String,
     pub(super) agent_cli: String,
+    #[serde(default = "default_agent_cli_selector")]
+    pub(super) agent_cli_selector: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -782,6 +790,63 @@ fn validate_exact_npm_package(label: &str, package: &ExactNpmPackage) -> Result<
     Ok(())
 }
 
+fn default_agent_cli_selector() -> String {
+    ADAPTER_DECLARED_CLI_SELECTOR.to_owned()
+}
+
+fn is_default_agent_cli_selector(selector: &str) -> bool {
+    selector == ADAPTER_DECLARED_CLI_SELECTOR
+}
+
+fn validate_adapter_selector(label: &str, selector: &str) -> Result<(), String> {
+    bounded_text(label, selector, MAX_TEXT_BYTES)?;
+    if selector == "latest" {
+        return Ok(());
+    }
+    semver::Version::parse(selector)
+        .map_err(|_| format!("{label} must be \"latest\" or one complete semantic version"))?;
+    Ok(())
+}
+
+fn validate_agent_cli_selector(label: &str, selector: &str) -> Result<(), String> {
+    bounded_text(label, selector, MAX_TEXT_BYTES)?;
+    if selector == ADAPTER_DECLARED_CLI_SELECTOR {
+        return Ok(());
+    }
+    semver::Version::parse(selector).map_err(|_| {
+        format!(
+            "{label} must be {ADAPTER_DECLARED_CLI_SELECTOR:?} or one complete semantic version"
+        )
+    })?;
+    Ok(())
+}
+
+fn validate_node_reader_base(label: &str, base: &str) -> Result<(), String> {
+    bounded_text(label, base, MAX_TEXT_BYTES)?;
+    if base == NODE_READER_BASE {
+        return Ok(());
+    }
+    let version = base
+        .strip_prefix("docker.io/library/node:")
+        .and_then(|tag| tag.strip_suffix("-slim"))
+        .ok_or_else(|| {
+            format!(
+                "{label} must be {NODE_READER_BASE:?} or an exact docker.io/library/node:24.x.y-slim request"
+            )
+        })?;
+    let version = semver::Version::parse(version).map_err(|_| {
+        format!(
+            "{label} must be {NODE_READER_BASE:?} or an exact docker.io/library/node:24.x.y-slim request"
+        )
+    })?;
+    if version.major != 24 {
+        return Err(format!(
+            "{label} exact Node base must remain on the reviewed major version 24"
+        ));
+    }
+    Ok(())
+}
+
 fn validate_limits(label: &str, limits: &ResolutionLimits) -> Result<(), String> {
     if !(1..=MAX_TIMEOUT_SECS).contains(&limits.timeout_secs) {
         return Err(format!(
@@ -921,12 +986,20 @@ pub(super) fn validate_recipes(recipes: &FloatingRecipeManifest) -> Result<(), S
                 package.id
             ));
         }
-        if package.adapter_selector != "latest" {
-            return Err(format!(
-                "floating recipes: package set {:?} adapter_selector must be the reviewed literal \"latest\"",
+        validate_adapter_selector(
+            &format!(
+                "floating recipes: package set {:?} adapter_selector",
                 package.id
-            ));
-        }
+            ),
+            &package.adapter_selector,
+        )?;
+        validate_agent_cli_selector(
+            &format!(
+                "floating recipes: package set {:?} agent_cli_selector",
+                package.id
+            ),
+            &package.agent_cli_selector,
+        )?;
         package_by_id.insert(package.id.as_str(), package);
     }
 
@@ -940,12 +1013,10 @@ pub(super) fn validate_recipes(recipes: &FloatingRecipeManifest) -> Result<(), S
                 image.id
             ));
         }
-        if image.base != NODE_READER_BASE {
-            return Err(format!(
-                "floating recipes: image {:?} must use the reviewed Node 24 slim base request",
-                image.id
-            ));
-        }
+        validate_node_reader_base(
+            &format!("floating recipes: image {:?} base", image.id),
+            &image.base,
+        )?;
         if image.package_sets.is_empty() {
             return Err(format!(
                 "floating recipes: image {:?} must contain at least one package set",
@@ -1267,12 +1338,14 @@ pub(super) fn validate_resolution(artifact: &ResolutionArtifact) -> Result<(), S
                 package.id
             ));
         }
-        if package.requested.adapter_selector != "latest" {
-            return Err(
-                "compatibility resolution: requested adapter selector must remain the literal \"latest\""
-                    .into(),
-            );
-        }
+        validate_adapter_selector(
+            "compatibility resolution requested adapter selector",
+            &package.requested.adapter_selector,
+        )?;
+        validate_agent_cli_selector(
+            "compatibility resolution requested agent CLI selector",
+            &package.requested.agent_cli_selector,
+        )?;
         validate_exact_npm_package("resolved adapter", &package.adapter)?;
         validate_exact_npm_package("resolved agent CLI", &package.agent_cli)?;
         if package.requested.adapter != package.adapter.name
@@ -1281,6 +1354,22 @@ pub(super) fn validate_resolution(artifact: &ResolutionArtifact) -> Result<(), S
         {
             return Err(
                 "compatibility resolution: resolved package identities do not match the requested reviewed pair"
+                    .into(),
+            );
+        }
+        if package.requested.adapter_selector != "latest"
+            && package.requested.adapter_selector != package.adapter.version
+        {
+            return Err(
+                "compatibility resolution: resolved adapter version does not match the exact requested selector"
+                    .into(),
+            );
+        }
+        if package.requested.agent_cli_selector != ADAPTER_DECLARED_CLI_SELECTOR
+            && package.requested.agent_cli_selector != package.agent_cli.version
+        {
+            return Err(
+                "compatibility resolution: resolved agent CLI version does not match the exact requested selector"
                     .into(),
             );
         }
@@ -1317,12 +1406,10 @@ pub(super) fn validate_resolution(artifact: &ResolutionArtifact) -> Result<(), S
                 image.id
             ));
         }
-        if image.requested_base != NODE_READER_BASE {
-            return Err(
-                "compatibility resolution: requested image base does not match the reviewed template"
-                    .into(),
-            );
-        }
+        validate_node_reader_base(
+            "compatibility resolution requested image base",
+            &image.requested_base,
+        )?;
         if image.package_sets.is_empty() || image.package_sets.len() > MAX_PACKAGE_SETS {
             return Err(
                 "compatibility resolution: image requires a bounded non-empty package set".into(),
@@ -2765,10 +2852,29 @@ fn parse_platform_selector(
         .collect()
 }
 
+#[cfg(test)]
 fn parse_package_lock(
     bytes: &[u8],
     expected_adapter: &str,
     expected_cli: &str,
+    max_packages: u64,
+) -> Result<ParsedPackageLock, String> {
+    parse_package_lock_with_selectors(
+        bytes,
+        expected_adapter,
+        "latest",
+        expected_cli,
+        ADAPTER_DECLARED_CLI_SELECTOR,
+        max_packages,
+    )
+}
+
+fn parse_package_lock_with_selectors(
+    bytes: &[u8],
+    expected_adapter: &str,
+    expected_adapter_selector: &str,
+    expected_cli: &str,
+    expected_cli_selector: &str,
     max_packages: u64,
 ) -> Result<ParsedPackageLock, String> {
     if bytes.is_empty() || bytes.len() as u64 > MAX_LOCK_BYTES {
@@ -2809,9 +2915,9 @@ fn parse_package_lock(
         || root_dependencies
             .get(expected_adapter)
             .and_then(serde_json::Value::as_str)
-            != Some("latest")
+            != Some(expected_adapter_selector)
     {
-        return Err("package lock root must request exactly the reviewed adapter at latest".into());
+        return Err("package lock root must request exactly the reviewed adapter selector".into());
     }
 
     let mut adapter = None;
@@ -2923,9 +3029,21 @@ fn parse_package_lock(
             )?);
         }
     }
+    let adapter = adapter.ok_or("package lock is missing the reviewed adapter")?;
+    let agent_cli = agent_cli.ok_or("package lock is missing the reviewed nested CLI/SDK")?;
+    if expected_adapter_selector != "latest" && adapter.version != expected_adapter_selector {
+        return Err("resolved adapter version does not match the exact requested selector".into());
+    }
+    if expected_cli_selector != ADAPTER_DECLARED_CLI_SELECTOR
+        && agent_cli.version != expected_cli_selector
+    {
+        return Err(
+            "resolved agent CLI version does not match the exact requested selector".into(),
+        );
+    }
     Ok(ParsedPackageLock {
-        adapter: adapter.ok_or("package lock is missing the reviewed adapter")?,
-        agent_cli: agent_cli.ok_or("package lock is missing the reviewed nested CLI/SDK")?,
+        adapter,
+        agent_cli,
         installations,
         sha256: local_file::sha256_hex(bytes),
     })
@@ -4268,18 +4386,37 @@ fn node_package_manifest(tree: &Path, package: &str) -> PathBuf {
 }
 
 fn package_json_bytes(recipe: &PackageSetRecipe) -> Result<Vec<u8>, ResolutionFailureCode> {
+    validate_adapter_selector("package request adapter selector", &recipe.adapter_selector)
+        .map_err(|_| ResolutionFailureCode::PackageIdentityMismatch)?;
+    validate_agent_cli_selector(
+        "package request agent CLI selector",
+        &recipe.agent_cli_selector,
+    )
+    .map_err(|_| ResolutionFailureCode::PackageIdentityMismatch)?;
     let mut dependencies = serde_json::Map::new();
     dependencies.insert(
         recipe.adapter.clone(),
         serde_json::Value::String(recipe.adapter_selector.clone()),
     );
-    let mut bytes = serde_json::to_vec_pretty(&serde_json::json!({
+    let mut request = serde_json::json!({
         "name": format!("a2a-bridge-r3c-{}", recipe.id),
         "private": true,
         "version": "0.0.0",
         "dependencies": dependencies,
-    }))
-    .map_err(|_| ResolutionFailureCode::PackageIdentityMismatch)?;
+    });
+    if recipe.agent_cli_selector != ADAPTER_DECLARED_CLI_SELECTOR {
+        request
+            .as_object_mut()
+            .ok_or(ResolutionFailureCode::PackageIdentityMismatch)?
+            .insert(
+                "overrides".into(),
+                serde_json::json!({
+                    recipe.agent_cli.clone(): recipe.agent_cli_selector.clone()
+                }),
+            );
+    }
+    let mut bytes = serde_json::to_vec_pretty(&request)
+        .map_err(|_| ResolutionFailureCode::PackageIdentityMismatch)?;
     bytes.push(b'\n');
     Ok(bytes)
 }
@@ -4369,10 +4506,12 @@ async fn materialize_package_set(
         MAX_LOCK_BYTES,
     )
     .map_err(|_| ResolutionFailureCode::PackageIdentityMismatch)?;
-    let parsed_lock = parse_package_lock(
+    let parsed_lock = parse_package_lock_with_selectors(
         &lock_snapshot.bytes,
         &recipe.adapter,
+        &recipe.adapter_selector,
         &recipe.agent_cli,
+        &recipe.agent_cli_selector,
         limits.max_files,
     )
     .map_err(|_| ResolutionFailureCode::PackageIdentityMismatch)?;
@@ -4507,6 +4646,7 @@ async fn materialize_package_set(
             adapter: recipe.adapter.clone(),
             adapter_selector: recipe.adapter_selector.clone(),
             agent_cli: recipe.agent_cli.clone(),
+            agent_cli_selector: recipe.agent_cli_selector.clone(),
         },
         adapter: parsed_lock.adapter,
         agent_cli: parsed_lock.agent_cli,
@@ -5015,18 +5155,24 @@ fn resolve_base_command(
     safe_path: OsString,
     cwd: PathBuf,
     timeout: Duration,
+    base: &str,
 ) -> ResolutionCommandSpec {
     let (argv0, args) = match runtime {
         RuntimeKind::Docker => (
             "docker-buildx",
-            vec!["imagetools", "inspect", "--raw", NODE_READER_BASE],
+            vec![
+                OsString::from("imagetools"),
+                OsString::from("inspect"),
+                OsString::from("--raw"),
+                OsString::from(base),
+            ],
         ),
         RuntimeKind::Podman => (
             "skopeo",
             vec![
-                "inspect",
-                "--raw",
-                "docker://docker.io/library/node:24-slim",
+                OsString::from("inspect"),
+                OsString::from("--raw"),
+                OsString::from(format!("docker://{base}")),
             ],
         ),
     };
@@ -5036,7 +5182,7 @@ fn resolve_base_command(
         kind: ResolutionCommandKind::ResolveBase,
         program: executable.to_path_buf(),
         argv0: Some(OsString::from(argv0)),
-        args: args.into_iter().map(OsString::from).collect(),
+        args,
         cwd,
         env,
         timeout,
@@ -5245,6 +5391,7 @@ async fn materialize_image(
             input.safe_path.clone(),
             input.bundle.pin.acp_session_cwd(),
             input.timeout,
+            &input.recipe.base,
         ))
         .await?;
     let base = parse_base_manifest(&raw_manifest, "linux", platform_architecture)
@@ -5649,10 +5796,12 @@ fn revalidate_package(
     {
         return Err(RevalidationFailure::PackageLockChanged);
     }
-    let parsed = parse_package_lock(
+    let parsed = parse_package_lock_with_selectors(
         &lock.bytes,
         &package.requested.adapter,
+        &package.requested.adapter_selector,
         &package.requested.agent_cli,
+        &package.requested.agent_cli_selector,
         loaded.artifact.limits.max_files,
     )
     .map_err(|_| RevalidationFailure::PackageLockChanged)?;
@@ -6643,14 +6792,34 @@ image = "reader-current"
 
     #[test]
     fn recipe_contract_accepts_only_closed_package_image_and_config_templates() {
-        parse_recipes(&valid_recipes()).unwrap();
+        let recipes = parse_recipes(&valid_recipes()).unwrap();
+        assert_eq!(
+            recipes.package_sets[0].agent_cli_selector,
+            ADAPTER_DECLARED_CLI_SELECTOR
+        );
 
         for (from, to) in [
             ("registry = \"npmjs\"", "registry = \"attacker\""),
             ("adapter_selector = \"latest\"", "adapter_selector = \"^1\""),
             (
+                "agent_cli = \"@openai/codex\"",
+                "agent_cli = \"@openai/codex\"\nagent_cli_selector = \"latest\"",
+            ),
+            (
+                "agent_cli = \"@openai/codex\"",
+                "agent_cli = \"@openai/codex\"\nagent_cli_selector = \"^0.145\"",
+            ),
+            (
                 "base = \"docker.io/library/node:24-slim\"",
                 "base = \"attacker.example/node:latest\"",
+            ),
+            (
+                "base = \"docker.io/library/node:24-slim\"",
+                "base = \"docker.io/library/node:25.0.0-slim\"",
+            ),
+            (
+                "base = \"docker.io/library/node:24-slim\"",
+                "base = \"docker.io/library/node:24.18-slim\"",
             ),
             (
                 "config_template = \"codex-host-read-only-v1\"",
@@ -6663,6 +6832,50 @@ image = "reader-current"
                 "mutation {from:?} -> {to:?} must fail closed"
             );
         }
+    }
+
+    #[test]
+    fn recipe_contract_accepts_independent_exact_adapter_cli_and_node_base_inputs() {
+        let hybrid = valid_recipes()
+            .replacen(
+                "adapter_selector = \"latest\"",
+                "adapter_selector = \"1.9.0\"\nagent_cli_selector = \"0.145.0\"",
+                1,
+            )
+            .replacen(
+                "base = \"docker.io/library/node:24-slim\"",
+                "base = \"docker.io/library/node:24.18.0-slim\"",
+                1,
+            );
+
+        let recipes = parse_recipes(&hybrid).unwrap();
+        assert_eq!(recipes.package_sets[0].adapter_selector, "1.9.0");
+        assert_eq!(recipes.package_sets[0].agent_cli_selector, "0.145.0");
+        assert_eq!(
+            recipes.images[0].base,
+            "docker.io/library/node:24.18.0-slim"
+        );
+    }
+
+    #[test]
+    fn recipe_serialization_preserves_legacy_default_but_binds_exact_cli_selector() {
+        let legacy = parse_recipes(&valid_recipes()).unwrap();
+        let legacy_package = serde_json::to_value(&legacy.package_sets[0]).unwrap();
+        assert!(legacy_package.get("agent_cli_selector").is_none());
+
+        let exact = valid_recipes().replacen(
+            "adapter_selector = \"latest\"",
+            "adapter_selector = \"latest\"\nagent_cli_selector = \"0.145.0\"",
+            1,
+        );
+        let exact = parse_recipes(&exact).unwrap();
+        let exact_package = serde_json::to_value(&exact.package_sets[0]).unwrap();
+        assert_eq!(
+            exact_package
+                .get("agent_cli_selector")
+                .and_then(serde_json::Value::as_str),
+            Some("0.145.0")
+        );
     }
 
     #[test]
@@ -6834,6 +7047,7 @@ image = "reader-current"
                     adapter: "@agentclientprotocol/codex-acp".into(),
                     adapter_selector: "latest".into(),
                     agent_cli: "@openai/codex".into(),
+                    agent_cli_selector: default_agent_cli_selector(),
                 },
                 adapter: exact_package("@agentclientprotocol/codex-acp", "1.2.3"),
                 agent_cli: exact_package("@openai/codex", "0.150.0"),
@@ -6902,6 +7116,20 @@ image = "reader-current"
         assert!(validate_resolution(&malformed_integrity)
             .unwrap_err()
             .contains("canonical sha512"));
+
+        let mut adapter_selector_drift = valid_resolution();
+        adapter_selector_drift.packages[0]
+            .requested
+            .adapter_selector = "1.2.2".into();
+        assert!(validate_resolution(&adapter_selector_drift)
+            .unwrap_err()
+            .contains("resolved adapter version"));
+
+        let mut cli_selector_drift = valid_resolution();
+        cli_selector_drift.packages[0].requested.agent_cli_selector = "0.149.0".into();
+        assert!(validate_resolution(&cli_selector_drift)
+            .unwrap_err()
+            .contains("resolved agent CLI version"));
 
         let mut duplicate_proof = valid_resolution();
         duplicate_proof
@@ -7003,15 +7231,23 @@ image = "reader-current"
     }
 
     #[test]
-    fn schema_v1_resolution_without_runtime_invocation_uses_canonical_legacy_fallback() {
+    fn schema_v1_resolution_defaults_legacy_runtime_invocation_and_cli_selector() {
         let mut legacy = serde_json::to_value(valid_resolution()).unwrap();
         legacy["environment"]
             .as_object_mut()
             .unwrap()
             .remove("runtime_invocation_path");
+        legacy["packages"][0]["requested"]
+            .as_object_mut()
+            .unwrap()
+            .remove("agent_cli_selector");
 
         let artifact = serde_json::from_value::<ResolutionArtifact>(legacy).unwrap();
         assert!(artifact.environment.runtime_invocation_path.is_empty());
+        assert_eq!(
+            artifact.packages[0].requested.agent_cli_selector,
+            ADAPTER_DECLARED_CLI_SELECTOR
+        );
         validate_resolution(&artifact).unwrap();
     }
 
@@ -7205,6 +7441,89 @@ image = "reader-current"
             cli_integrity = canonical_integrity('B'),
         )
         .into_bytes()
+    }
+
+    #[test]
+    fn package_request_pins_adapter_and_independently_overrides_nested_cli() {
+        let mut recipe = parse_recipes(&valid_recipes())
+            .unwrap()
+            .package_sets
+            .remove(0);
+        let floating: serde_json::Value =
+            serde_json::from_slice(&package_json_bytes(&recipe).unwrap()).unwrap();
+        assert_eq!(
+            floating["dependencies"]["@agentclientprotocol/codex-acp"],
+            "latest"
+        );
+        assert!(floating.get("overrides").is_none());
+
+        recipe.adapter_selector = "1.2.3".into();
+        let adapter_only: serde_json::Value =
+            serde_json::from_slice(&package_json_bytes(&recipe).unwrap()).unwrap();
+        assert_eq!(
+            adapter_only["dependencies"]["@agentclientprotocol/codex-acp"],
+            "1.2.3"
+        );
+        assert!(adapter_only.get("overrides").is_none());
+
+        recipe.adapter_selector = "latest".into();
+        recipe.agent_cli_selector = "0.150.1".into();
+        let cli_only: serde_json::Value =
+            serde_json::from_slice(&package_json_bytes(&recipe).unwrap()).unwrap();
+        assert_eq!(
+            cli_only["dependencies"]["@agentclientprotocol/codex-acp"],
+            "latest"
+        );
+        assert_eq!(cli_only["overrides"]["@openai/codex"], "0.150.1");
+    }
+
+    #[test]
+    fn package_lock_binds_each_exact_selector_to_the_resolved_version() {
+        let exact =
+            String::from_utf8(valid_package_lock())
+                .unwrap()
+                .replacen("\"latest\"", "\"1.2.3\"", 1);
+        parse_package_lock_with_selectors(
+            exact.as_bytes(),
+            "@agentclientprotocol/codex-acp",
+            "1.2.3",
+            "@openai/codex",
+            ADAPTER_DECLARED_CLI_SELECTOR,
+            100,
+        )
+        .unwrap();
+        parse_package_lock_with_selectors(
+            &valid_package_lock(),
+            "@agentclientprotocol/codex-acp",
+            "latest",
+            "@openai/codex",
+            "0.150.1",
+            100,
+        )
+        .unwrap();
+
+        let wrong_adapter = exact.replacen("\"1.2.3\"", "\"1.2.2\"", 1);
+        assert!(parse_package_lock_with_selectors(
+            wrong_adapter.as_bytes(),
+            "@agentclientprotocol/codex-acp",
+            "1.2.2",
+            "@openai/codex",
+            "0.150.1",
+            100,
+        )
+        .unwrap_err()
+        .contains("resolved adapter version"));
+
+        assert!(parse_package_lock_with_selectors(
+            exact.as_bytes(),
+            "@agentclientprotocol/codex-acp",
+            "1.2.3",
+            "@openai/codex",
+            "0.150.0",
+            100,
+        )
+        .unwrap_err()
+        .contains("resolved agent CLI version"));
     }
 
     #[test]
@@ -9335,25 +9654,28 @@ image = "reader-current"
         assert!(podman.args.iter().any(|arg| arg == "--pull=missing"));
         assert!(podman.args.iter().all(|arg| arg != "--pull=never"));
 
+        let exact_base = "docker.io/library/node:24.18.0-slim";
         let resolve = resolve_base_command(
             RuntimeKind::Docker,
             Path::new("/trusted/bin/docker-tools"),
             OsString::from("/trusted/bin:/usr/bin"),
             PathBuf::from("/private/bundle"),
             Duration::from_secs(30),
+            exact_base,
         );
         assert_eq!(resolve.kind, ResolutionCommandKind::ResolveBase);
         assert_eq!(resolve.program, Path::new("/trusted/bin/docker-tools"));
         assert_eq!(resolve.argv0.as_deref(), Some(OsStr::new("docker-buildx")));
         assert_eq!(resolve.args.first().unwrap(), "imagetools");
         assert!(resolve.args.iter().all(|arg| arg != "buildx"));
-        assert_eq!(resolve.args.last().unwrap(), NODE_READER_BASE);
+        assert_eq!(resolve.args.last().unwrap(), exact_base);
         let podman_resolve = resolve_base_command(
             RuntimeKind::Podman,
             Path::new("/trusted/bin/skopeo"),
             OsString::from("/trusted/bin:/usr/bin"),
             PathBuf::from("/private/bundle"),
             Duration::from_secs(30),
+            exact_base,
         );
         assert_eq!(podman_resolve.program, Path::new("/trusted/bin/skopeo"));
         assert_eq!(podman_resolve.argv0.as_deref(), Some(OsStr::new("skopeo")));
@@ -9362,7 +9684,7 @@ image = "reader-current"
             [
                 "inspect",
                 "--raw",
-                "docker://docker.io/library/node:24-slim"
+                "docker://docker.io/library/node:24.18.0-slim"
             ]
             .into_iter()
             .map(OsString::from)
