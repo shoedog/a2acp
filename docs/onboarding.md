@@ -65,6 +65,7 @@ Each `[[agents]]` entry is one backend:
 | kiro   | `kiro-cli` `["acp"]` | none (local default)        |
 | codex  | `codex-acp`        | `codex login` + `pre_authenticated = true` |
 | claude | `claude-agent-acp` | claude subscription / login   |
+| opencode | `opencode` `["acp"]` | OpenCode/provider credential + `pre_authenticated = true` |
 | api    | —                  | `OPENAI_API_KEY` (env var name) |
 
 Set `pre_authenticated = true` when an ACP process already has credentials from its host profile or a
@@ -114,6 +115,74 @@ native model list is currently discovery-only under ACP SDK 1.x.
 | `effort` | `session/set_config_option` (thought-level)   | Applied to **any** agent that advertises one (codex `reasoning_effort`, claude `effort`). Falls back to the highest supported level **≤** requested; skipped with a warn if the agent advertises none. Values: minimal/low/medium/high/xhigh/max |
 | `mode`   | `session/set_mode`                            | **HARD-fails** on an unknown/invalid mode id — set only to a mode your agent advertises (the reference config omits it) |
 | api      | only `model` is applied                       | `effort`/`mode` are ignored for `kind="api"` |
+
+### OpenCode ACP: keep the provider in the model ID
+
+OpenCode is one ACP process (`cmd = "opencode"`, `args = ["acp"]`) that can route to several model
+providers. Changing the model prefix changes the provider *inside OpenCode*; it does not change the bridge
+agent kind. In particular, OpenCode Go is not Ollama and is not OpenRouter:
+
+| intended route | bridge agent kind | exact model shape | prerequisite |
+|---|---|---|---|
+| OpenCode Go subscription through OpenCode | `acp` | `opencode-go/<model>`, for example `opencode-go/gpt-5.6-luna` | OpenCode Go access; `OPENCODE_API_KEY` visible to the bridge process |
+| free OpenRouter routing through OpenCode | `acp` | `openrouter/openrouter/free` | `OPENROUTER_API_KEY`; owner policy permits free models only |
+| local Ollama through OpenCode | `acp` | `ollama/<configured-model-id>` | a running Ollama server plus an explicit `provider.ollama` block in `opencode.json` |
+| OpenRouter directly through the bridge | `api` | `openrouter/free` | `base_url = "https://openrouter.ai/api/v1"`; no `opencode` process |
+| local Ollama directly through the bridge | `api` | the server model ID, for example `qwen3.5:9b` | `base_url = "http://localhost:11434/v1"`; no `opencode` process |
+
+The doubled `openrouter` in `openrouter/openrouter/free` is intentional: the first component is OpenCode's
+provider ID and the remaining `openrouter/free` is OpenRouter's model ID. Conversely, a direct bridge
+`kind = "api"` entry sends only `openrouter/free` to OpenRouter. Do not put `ollama/...` or
+`openrouter/...` in an OpenCode Go entry; use the literal `opencode-go/...` prefix.
+
+Use [`examples/a2a-bridge.opencode-go.toml`](../examples/a2a-bridge.opencode-go.toml) as the minimal
+copyable OpenCode Go config. `pre_authenticated = true` prevents the bridge from invoking OpenCode's
+interactive login method; it does not create credentials. The environment or OpenCode's credential store must
+already make the selected provider available.
+
+Discover provider-qualified IDs before pinning one:
+
+```sh
+opencode auth list
+opencode models opencode-go --refresh
+opencode models openrouter
+opencode models ollama
+
+a2a-bridge validate --config examples/a2a-bridge.opencode-go.toml
+a2a-bridge models --config examples/a2a-bridge.opencode-go.toml --agent opencode-go
+```
+
+The `models` commands list catalogs and send no model prompt. `opencode models <provider>` filters OpenCode's
+catalog by provider. In contrast, `a2a-bridge models --agent opencode-go` filters by bridge agent ID, so that ACP
+probe reports OpenCode's combined multi-provider catalog and intentionally does not apply the configured model.
+Require `model_configurable: true` and the selected `opencode-go/...` ID to be present; the probe's `current`
+field is OpenCode's discovery-session default, not evidence that the configured pin was ignored. Catalog
+membership is not live-inference proof.
+On 2026-09-04, OpenCode 1.18.27 exposed 27 active OpenCode Go IDs on this operator; the current command output,
+not this dated snapshot, is authoritative:
+
+```text
+deepseek-v4-flash                 deepseek-v4-flash-vision-exp
+deepseek-v4-pro                   glm-5.1
+glm-5.2                           glm-5.3
+glm-5.3-flash                     gpt-5.6-luna
+grok-4.6                          hy3
+hy4-preview                       kimi-k2.6
+kimi-k2.7-code                    kimi-k3
+longcat-2.0                       mimo-v2.5
+mimo-v2.5-pro                     minimax-m2.7
+minimax-m3                        muse-spark-1.2-contributor
+muse-spark-1.3-contributor        omen-alpha
+qwen3.6-plus                      qwen3.7-max
+qwen3.7-plus                      qwen3.8-flash
+qwen3.8-max
+```
+
+Operator policy allows any exact model currently returned under `opencode-go` by the subscribed plan. OpenRouter
+remains free-only: prefer `openrouter/openrouter/free`, or independently recheck zero pricing and tool support
+before selecting a concrete `:free` model. Local Ollama is configuration-defined rather than automatically
+available. Follow the [official OpenCode provider guide](https://opencode.ai/docs/providers/) for its required
+`provider.ollama` block and verify the exact ID with `opencode models ollama`.
 
 ### Workflow preflight and fallback models
 

@@ -1,6 +1,7 @@
 examples/a2a-bridge.containerized.podman.toml
 examples/a2a-bridge.containerized.toml
 examples/a2a-bridge.multi-agent.toml
+examples/a2a-bridge.opencode-go.toml
 examples/a2a-bridge.panel.toml
 examples/a2a-bridge.r2f1b-impl.toml
 examples/a2a-bridge.slicing-implement.toml

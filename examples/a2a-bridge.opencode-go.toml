@@ -1,0 +1,32 @@
+# Minimal OpenCode Go ACP example.
+#
+# This is intentionally not an OpenRouter or Ollama example. OpenCode routes by
+# the full provider/model ID, so keep the `opencode-go/` prefix.
+#
+# Before starting the bridge:
+#   1. install OpenCode (`opencode --version`);
+#   2. make OpenCode Go credentials available to that same process environment;
+#   3. verify the current subscription catalog with
+#      `opencode models opencode-go --refresh`;
+#   4. validate this file and probe the no-prompt ACP catalog:
+#      `a2a-bridge validate --config examples/a2a-bridge.opencode-go.toml`
+#      `a2a-bridge models --config examples/a2a-bridge.opencode-go.toml --agent opencode-go`
+
+default = "opencode-go"
+
+[registry]
+allowed_cmds = ["opencode"]
+
+[server]
+addr = "127.0.0.1:8080"
+
+[[agents]]
+id = "opencode-go"
+cmd = "opencode"
+args = ["acp"]
+# OpenCode advertises an interactive auth method. The host process already owns
+# provider credentials, so the bridge must not initiate that login flow.
+pre_authenticated = true
+# Any exact ID currently returned by `opencode models opencode-go` is allowed by
+# operator policy. This active model was verified in the 2026-09-04 catalog.
+model = "opencode-go/gpt-5.6-luna"
