@@ -1235,6 +1235,20 @@ mod tests {
     };
     use std::sync::atomic::AtomicUsize;
 
+    const SUCCESSFUL_RUNTIME_TEST_TIMEOUT: Duration = Duration::from_secs(5);
+
+    #[cfg(unix)]
+    static PRODUCTION_RUNTIME_FIXTURE_PERMIT: tokio::sync::Semaphore =
+        tokio::sync::Semaphore::const_new(1);
+
+    #[cfg(unix)]
+    async fn production_runtime_fixture_permit() -> tokio::sync::SemaphorePermit<'static> {
+        PRODUCTION_RUNTIME_FIXTURE_PERMIT
+            .acquire()
+            .await
+            .expect("production-runtime fixture semaphore is never closed")
+    }
+
     #[derive(Default)]
     struct RecordingPublisher(
         StdMutex<Vec<crate::retained_resource_flight::NodeCleanupAggregationV1>>,
@@ -1505,6 +1519,7 @@ mod tests {
     async fn production_start_probe_is_bounded_and_requires_exact_status() {
         use std::os::unix::fs::PermissionsExt;
 
+        let _fixture_permit = production_runtime_fixture_permit().await;
         let temp = tempfile::tempdir().unwrap();
         let runtime = temp.path().join("runtime");
         std::fs::write(
@@ -1565,9 +1580,40 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn production_runtime_fixture_permit_serializes_and_allows_execution() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let first_permit = production_runtime_fixture_permit().await;
+        let second_permit = production_runtime_fixture_permit();
+        tokio::pin!(second_permit);
+        assert!(matches!(
+            futures::poll!(second_permit.as_mut()),
+            std::task::Poll::Pending
+        ));
+        drop(first_permit);
+        let _second_permit = second_permit.await;
+
+        let temp = tempfile::tempdir().unwrap();
+        let runtime = temp.path().join("runtime");
+        std::fs::write(&runtime, "#!/bin/sh\nprintf created\n").unwrap();
+        let mut permissions = std::fs::metadata(&runtime).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&runtime, permissions).unwrap();
+
+        let runtime = runtime.to_string_lossy().into_owned();
+        let probe = production_start_probe(SUCCESSFUL_RUNTIME_TEST_TIMEOUT);
+        assert_eq!(
+            probe(runtime, "serialized-fixture".into()).await,
+            ContainerStartState::NotStarted
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn missing_container_completes_for_docker_and_podman_without_stderr_matching() {
         use std::os::unix::fs::PermissionsExt;
 
+        let _fixture_permit = production_runtime_fixture_permit().await;
         let temp = tempfile::tempdir().unwrap();
         for runtime_name in ["docker", "podman"] {
             let runtime = temp.path().join(runtime_name);
@@ -1587,7 +1633,7 @@ mod tests {
             let controller = ReapController::production_with_timeout(
                 runtime.to_string_lossy(),
                 "missing-name",
-                Duration::from_secs(1),
+                SUCCESSFUL_RUNTIME_TEST_TIMEOUT,
             );
             assert_eq!(controller.reap_observed().await, Ok(()));
             assert!(
@@ -1602,6 +1648,7 @@ mod tests {
     async fn failed_inventory_keeps_missing_selector_classification_unknown() {
         use std::os::unix::fs::PermissionsExt;
 
+        let _fixture_permit = production_runtime_fixture_permit().await;
         let temp = tempfile::tempdir().unwrap();
         let runtime = temp.path().join("runtime");
         std::fs::write(
@@ -1616,7 +1663,7 @@ mod tests {
         let controller = ReapController::production_with_timeout(
             runtime.to_string_lossy(),
             "unresolved-name",
-            Duration::from_secs(1),
+            SUCCESSFUL_RUNTIME_TEST_TIMEOUT,
         );
         assert_eq!(
             controller.reap_observed().await,
@@ -1629,6 +1676,7 @@ mod tests {
     async fn ro_production_controller_spares_a_recycled_name() {
         use std::os::unix::fs::PermissionsExt;
 
+        let _fixture_permit = production_runtime_fixture_permit().await;
         let temp = tempfile::tempdir().unwrap();
         let runtime = temp.path().join("runtime");
         let successor = temp.path().join("successor");
@@ -1649,7 +1697,7 @@ mod tests {
         let controller = ReapController::production_with_timeout(
             runtime.to_string_lossy(),
             "stable-name",
-            Duration::from_secs(1),
+            SUCCESSFUL_RUNTIME_TEST_TIMEOUT,
         );
         assert_eq!(controller.capture_production_identity().await, Ok(()));
         std::fs::write(&successor, b"ready").unwrap();
@@ -1783,6 +1831,7 @@ mod tests {
     async fn production_timeout_kills_child_before_delayed_side_effect() {
         use std::os::unix::fs::PermissionsExt;
 
+        let _fixture_permit = production_runtime_fixture_permit().await;
         let temp = tempfile::tempdir().unwrap();
         let runtime = temp.path().join("hung-runtime");
         let marker = temp.path().join("late-side-effect");
