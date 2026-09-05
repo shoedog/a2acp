@@ -1,23 +1,58 @@
 # Bridge reliability execution and handoff roadmap
 
 - **Program status:** active P0
-- **Current main lineage:** provider refresh PR #90 is **MERGED** at
-  `52b05d70f14fc1080707fde1de4e9818a9d81d0f`, whose sole parent is the R2f1b 4H-2 merge
-  `54529b1d83a9fbe97d400cded02dcfbdf69683e3` from PR #89. The 4H-2 merge has sole parent
-  `fd1f66f253c0f5128fed438f96b79dfabadc4d2f` and exact tree
-  `1baaccba6b5a41f53411a422678b0421ca3d8cfd`.
+- **Current main lineage:** `origin/main` is `636979e27eee428981712c506435e0e151ee80a1`, the merge of provider
+  compatibility/runbook PR #98 with parents `936534d8cffb225249a5eeccd5874552dc97e961` and
+  `91606a956284447d8fad83eef78f99c3675650ba`. Its ancestry contains OpenCode Go documentation PR #97, provider
+  runtime-dispatch PR #96, provider refresh PRs #90-#95, and R2f1b 4H-2 merge PR #89 at
+  `54529b1d83a9fbe97d400cded02dcfbdf69683e3`. PR #98 does not contain, discharge, or merge 4I.
 - **Completed through:** R2f1b 4H-2 is **MERGED** by PR #89 at `54529b1d83a9fbe97d400cded02dcfbdf69683e3`;
   its approved review and configured-suite evidence remain in the
   [4H-2 handoff](superpowers/reviews/2026-08-24-r2f1b-slice4h2-handoff.md). PR #90 changes provider tooling
   after that reliability boundary but does not discharge 4I or authorize 4J.
-- **Active slice:** **R2f1b 4I RESIDUAL CONFIRMED / IMPLEMENTATION AND REVIEW NOT YET AUTHORIZED / 4J AND R3
-  REMAIN DISARMED (2026-09-04).** The current-main census is recorded in the
-  [bounded 4I task](superpowers/plans/2026-09-04-r2f1b-slice4i-task.md). `WRONG`: with the scheduler active,
-  an early failed root can durably trigger sibling cancellation, yet a sibling future that remains pending after
-  cleanup-deadline transfer stays in `FuturesUnordered`; the executor's only normal loop exit still requires that
-  set to become empty, so no node-complete set or workflow terminal is emitted for that state. Current 4H-2 tests
-  pass **11 / 0 / 152 filtered**, but they release every blocked sibling and contain no post-transfer
-  nonterminating-sibling terminalization case. `scheduler_activation_readiness_v1()` remains `Disarmed`.
+- **Active slice:** **R2f1b 4I APPROVED / CURRENT-TARGET INTEGRATED / AGGREGATE VERIFIED /
+  PUBLISHED AS PR #99 / CI PENDING / NOT MERGED / 4J AND R3 REMAIN DISARMED (2026-09-05).**
+  The prior
+  [Astra cumulative rereview](superpowers/reviews/2026-09-05-r2f1b-slice4i-astra-rereview.md) returned **REVISE — 1
+  remaining WRONG / 0 SMELL** at exact `f7917e3a`: duration-only `max` composition emitted `Unknown/60000` for
+  disjoint cleanup intervals `[0,1000]` and `[1000,61000]`, rather than the required union `Unknown/61000`. The owner
+  then explicitly renewed exactly one interval-endpoint/union repair and one final hard-read-only rereview, raising
+  the exact-base cap to **420 added nonblank formatted Rust lines** without any other scope expansion. Clean code
+  checkpoint `59896688f350fa6413740a2254ff0a4d610ece33`, tree
+  `e81f0256cec386a444fc56d282d4c36beeba2fde`, intentionally remains linear from frozen implementation base
+  `936534d8cffb225249a5eeccd5874552dc97e961` and measures **418 / 420**. Successful scheduler transfer settlement now
+  records exact `(anchor, now)` endpoints in the cleanup tracker's shared monotonic-clock domain; existing node and
+  workflow projections therefore use the established interval union while preserving `Failed` precedence and
+  transferred `Unknown` disposition. The production-path RED proved actual `Unknown/60000` at **0 / 1 / 165
+  filtered**; endpoint repair and the complete mux pass **1 / 0 / 165 filtered** and **14 / 0 / 152 filtered**. A
+  duration-space mutation reproduced **0 / 1 / 165 filtered**. Exact trusted-root all-target plus doctest evidence is
+  **102 summaries / 4,388 passed / 0 failed / 13 ignored / 714 filtered**; format, diff, locked check, warnings-denied
+  all-target/all-feature Clippy, locked all-target/all-feature build, release-bin build, and hygiene **41 / 9** are
+  green. The
+  [final owner-renewed Astra rereview](superpowers/reviews/2026-09-05-r2f1b-slice4i-astra-final-rereview.md) bound
+  exact candidate `0132e6bdb8724b29013b5fc2f740bc83c3cba21d`, tree
+  `5da71fcb9d2fe7083246c033d884a4eb07663fec`, executor blob
+  `7c59d597ed5c80382bef6a2c4c3ce81e23ed06be`, and returned **APPROVE — 0 WRONG / 1 SMELL-DEFER**. It independently
+  ran four focused tests (**4 / 0**) and recomputed the retained log hashes and **102 groups / 4,388 / 0 / 13 / 714**
+  totals. Its sole deferred smell was an overbroad documentation inference from node-future lifetime; the current
+  docs narrow that claim to the tested one-active-prompt fixture because preflight/retry paths can contribute earlier
+  same-node cleanup intervals. No Rust correction was requested or made. No provider, registry/image, compatibility,
+  live smoke, release, deployment, merge, or running-operator effect was exercised; the only public effect was the
+  separately authorized branch push and PR creation.
+  The approved delta is now composed without conflict onto exact current target
+  `636979e27eee428981712c506435e0e151ee80a1` as integration commit
+  `7169948a3d150694c2f367c53f7c6ce6ce0c4041`, tree
+  `b11d37e35357182e3444a3859a34d1c3cc722448`. Its executor blob remains exact
+  `7c59d597ed5c80382bef6a2c4c3ce81e23ed06be`, and the current-target delta is byte-identical to the approved 4I
+  branch delta under normalized `git diff` output (SHA-256
+  `6da5b5a3c1528731534cc5228c63e515485e570689499a550784d97e0d07c8f3`). Exact integrated aggregate gates are
+  green: format/diff, locked workspace check, warnings-denied locked all-target/all-feature Clippy, locked
+  all-target/all-feature build, release-bin build, and candidate-built hygiene **41 / 9**; the serialized all-target
+  suite passed **86 summaries / 4,390 / 0 / 13 ignored / 714 filtered**, and doctests passed **16 summaries / 2 / 0**,
+  for **102 summaries / 4,392 passed / 0 failed / 13 ignored / 714 filtered**. Branch
+  `integrate/r2f1b-4i-current-20260905` is published as [PR #99](https://github.com/shoedog/a2acp/pull/99);
+  CI and merge remain pending and separately gated.
+  `scheduler_activation_readiness_v1()` remains `Disarmed`; 4J stays parked behind an approved 4I closure.
   [ADR-0040](adr/0040-parallel-implementor-flight.md) owns the frozen-base ownership protocol,
   explicit current-target integration, per-run resume/merge lock, conflict retention, and aggregate verification
   boundary. R2f design is **APPROVED** and R2f0a is merged. Its integrated

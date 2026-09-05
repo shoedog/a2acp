@@ -5207,6 +5207,7 @@ impl WorkflowExecutor {
             let mut scheduled: HashSet<String> = HashSet::new();
             let mut stop_scheduling = false; // set on cancel: drain in-flight, schedule nothing new
             let mut node_cancels = BTreeMap::<NodeId, CancellationToken>::new();
+            let mut post_transfer_terminalizers = BTreeMap::<NodeId, CancellationToken>::new();
             use NodePrimaryDispositionV1::{CanceledPolicy, CanceledWorkflow};
             let mut cancellation_primaries = BTreeMap::<NodeId, NodePrimaryDispositionV1>::new();
             let mut root_cancellation_primary = cancel.is_cancelled().then_some(CanceledWorkflow);
@@ -5458,6 +5459,9 @@ impl WorkflowExecutor {
                                 let run_id = run_id.clone();
                                 let node_cancel = cancel.child_token();
                                 node_cancels.insert(n.id.clone(), node_cancel.clone());
+                                let terminalizer = CancellationToken::new();
+                                post_transfer_terminalizers
+                                    .insert(n.id.clone(), terminalizer.clone());
                                 let cancel = node_cancel;
                                 let wf_id = graph.id.as_str().to_string();
                                 let ctx = ctx.clone();
@@ -5472,20 +5476,21 @@ impl WorkflowExecutor {
                                 inflight.push(Box::pin(async move {
                                     let vars: HashMap<&str, &str> =
                                         owned.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
-                                    let output = this.run_node(
-                                        &wf_id,
-                                        &node,
-                                        &vars,
-                                        &run_id,
-                                        &cancel,
-                                        &ctx,
-                                        &diagnostic_factory,
-                                        &prompt_dispatch,
-                                        cleanup_tracker.as_ref(),
-                                        dispatcher.as_ref(),
-                                        &preflight_cache,
-                                        frozen_authority.as_ref(),
-                                    ).await;
+                                    let output = tokio::select! {
+                                        biased;
+                                        output = this.run_node(
+                                            &wf_id, &node, &vars, &run_id, &cancel, &ctx,
+                                            &diagnostic_factory, &prompt_dispatch,
+                                            cleanup_tracker.as_ref(), dispatcher.as_ref(),
+                                            &preflight_cache, frozen_authority.as_ref(),
+                                        ) => output,
+                                        _ = terminalizer.cancelled() => node_run_output(
+                                            &wf_id, &node, &run_id, &ctx,
+                                            format!("[node {} canceled after cleanup transfer]", node.id.as_str()),
+                                            false, None, NodeDisposition::Canceled,
+                                            CompletionBodyOrigin::BridgeSyntheticCancellation,
+                                        ),
+                                    };
                                     (
                                         node.id.clone(),
                                         scheduler_clock.elapsed_ms(),
@@ -5534,7 +5539,7 @@ impl WorkflowExecutor {
             let mut no_progress_epoch = NoProgressWarningEpochV1::new(0);
             let mut next_warning_due_ms = NO_PROGRESS_WARNING_INTERVAL_MS;
             let mut scheduler_cleanup: Option<(u64, u64)> = None;
-            let mut scheduler_cleanup_durations = BTreeMap::<NodeId, u64>::new();
+            let mut retained_cleanup_transfers = Vec::new();
             macro_rules! arm_scheduler_cleanup {
                 () => {
                     if scheduler_cleanup.is_none() {
@@ -5817,10 +5822,16 @@ impl WorkflowExecutor {
                     Arm::WaitForNodeActivityControlOrClock => {
                         if let Some((anchor, deadline)) = scheduler_cleanup.take() {
                             let now = cleanup_clock.elapsed_ms();
+                            let mut transferred_nodes = node_cancels
+                                .keys()
+                                .cloned()
+                                .collect::<HashSet<_>>();
+                            let mut represented_nodes = HashSet::new();
                             for (node, owner) in cleanup_tracker.materialized_checkouts() {
                                 if !node_cancels.contains_key(&node) {
                                     continue;
                                 }
+                                represented_nodes.insert(node.clone());
                                 use ep::WorktreePreservationDispositionV1 as Preservation;
                                 let disposition = match owner
                                     .backend
@@ -5842,7 +5853,7 @@ impl WorkflowExecutor {
                                     Ok(transfer) => transfer,
                                     Err(error) => settle_error_before_yield!(error),
                                 };
-                                if let Some(duration) = scheduler_cleanup_record_v1(
+                                if scheduler_cleanup_record_v1(
                                     &transfer,
                                     cs::TypedWorktreePreservationV1::new(
                                         ep::WorktreePreservationResultV1 {
@@ -5854,8 +5865,24 @@ impl WorkflowExecutor {
                                     .expect("scheduler preservation is terminal"),
                                     now.saturating_sub(anchor),
                                     deadline,
-                                ) {
-                                    scheduler_cleanup_durations.insert(node, duration);
+                                )
+                                .is_some()
+                                {
+                                    cleanup_tracker.record_interval(
+                                        &node,
+                                        anchor,
+                                        now,
+                                        &Ok(BackendCleanupDispositionV1::Unknown),
+                                    );
+                                } else {
+                                    transferred_nodes.remove(&node);
+                                }
+                                retained_cleanup_transfers.push(transfer);
+                            }
+                            transferred_nodes.retain(|node| represented_nodes.contains(node));
+                            for node in transferred_nodes {
+                                if let Some(terminalizer) = post_transfer_terminalizers.get(&node) {
+                                    terminalizer.cancel();
                                 }
                             }
                         }
@@ -5871,6 +5898,7 @@ impl WorkflowExecutor {
                 let mut ready_event_evidence = ReadyEventEvidenceV1::new();
                 for (node_id, _ready_at_ms, raw_output) in ready {
                     node_cancels.remove(&node_id);
+                    post_transfer_terminalizers.remove(&node_id);
                     let raw_output = match raw_output {
                         Ok(output) => output,
                         Err(error) => {
@@ -5953,13 +5981,7 @@ impl WorkflowExecutor {
                     } else {
                         raw_text
                     };
-                    let (mut cleanup, cleanup_error) = cleanup_tracker.node_observation(&node_id);
-                    if let Some(duration) = scheduler_cleanup_durations.remove(&node_id) {
-                        cleanup.duration_ms = cleanup.duration_ms.max(duration);
-                        if cleanup.disposition != NodeCleanupDispositionV1::Failed {
-                            cleanup.disposition = NodeCleanupDispositionV1::UnknownLegacy;
-                        }
-                    }
+                    let (cleanup, cleanup_error) = cleanup_tracker.node_observation(&node_id);
                     let terminal_error = primary_error.as_ref().or(cleanup_error.as_ref());
                     if disposition == NodeDisposition::Canceled {
                         observe_external_root_cancellation!();
@@ -6224,9 +6246,9 @@ impl WorkflowExecutor {
                             NodeDisposition::Canceled,
                             format!("[node {} canceled: workflow]", node.as_str()),
                         )
-                    } else if fanout_controller
-                        .as_ref()
-                        .is_some_and(|controller| {
+                    } else if observed_arms.contains(&Arm::AbsoluteCutoff)
+                        || observed_arms.contains(&Arm::MechanicallyProvedImpossibility)
+                        || fanout_controller.as_ref().is_some_and(|controller| {
                             controller.admission_stopped() && controller.trigger().is_some()
                         })
                     {
@@ -6358,7 +6380,14 @@ mod tests {
     use bridge_core::error::BridgeError;
     use bridge_core::ids::{AgentId, AttemptId, NodeId, SessionId, WorkflowId};
     use bridge_core::ports::{
-        AgentBackend, AgentRegistry, BackendStream, BoundEntryUseV1, Lease, Resolved, Update,
+        AgentBackend, AgentRegistry, BackendResourceFlightV1, BackendStream, BoundEntryUseV1,
+        Lease, Resolved, Update,
+    };
+    use bridge_core::resource_flight::{BoundedRecoveryReasonV1, ResourceFlightIdV1};
+    use bridge_core::retained_resource_flight::{
+        InMemoryResourceFlightJournal, NoopResourceFlightResultPublisher, ResourceActionIntentV1,
+        ResourceFlightKeyV1, ResourceFlightOwnerV1, ResourceFlightRegistryV1,
+        RetainedResourceFlight, RetainedResourceFlightConfigV1,
     };
     use futures::StreamExt;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -14005,12 +14034,88 @@ mod tests {
         cancel_seen: tokio::sync::Notify,
     }
 
+    struct TerminalizationHarness {
+        clock: Arc<dyn bridge_core::attempt_activity::MonotonicClock>,
+        flight: Mutex<Option<(Arc<RetainedResourceFlight>, bool, bool)>>,
+        cancel_release: tokio::sync::Notify,
+        cancel_started: tokio::sync::Notify,
+        cancel_calls: AtomicUsize,
+        cancel_completed: AtomicUsize,
+    }
+
+    impl TerminalizationHarness {
+        fn attach(&self, session: &SessionId) {
+            let attempt = AttemptId::parse("attempt-35111111111111111111111111111111").unwrap();
+            let reservation = ResourceFlightRegistryV1::new(attempt.clone())
+                .reserve(RetainedResourceFlightConfigV1 {
+                    flight_id: ResourceFlightIdV1::mint().unwrap(),
+                    attempt_id: attempt,
+                    key: ResourceFlightKeyV1::AcpGeneration {
+                        generation: session.as_str().to_owned(),
+                    },
+                    journal: Arc::new(InMemoryResourceFlightJournal::new(16)),
+                    clock: self.clock.clone(),
+                    result_publisher: Arc::new(NoopResourceFlightResultPublisher),
+                })
+                .unwrap();
+            let flight = reservation.flight().unwrap().clone();
+            let owner = ResourceFlightOwnerV1::new(
+                NodeId::parse("claude").unwrap(),
+                session.as_str().to_owned(),
+            )
+            .unwrap();
+            flight.attach_owner(owner).unwrap();
+            *self.flight.lock().unwrap() = Some((flight, false, false));
+        }
+
+        fn begin_cancel(&self, session: &SessionId) {
+            let flight = self.flight.lock().unwrap().as_ref().unwrap().0.clone();
+            let owner = ResourceFlightOwnerV1::new(
+                NodeId::parse("claude").unwrap(),
+                session.as_str().to_owned(),
+            )
+            .unwrap();
+            flight.close_admission().unwrap();
+            flight
+                .journal_intent(ResourceActionIntentV1 {
+                    initiator: owner,
+                    capability_digest: Sha256HexV1::parse("1".repeat(64)).unwrap(),
+                    cause: None,
+                })
+                .unwrap();
+            flight.begin_journaled_dispatch().unwrap();
+        }
+
+        fn transfer(&self, reason: BoundedRecoveryReasonV1) -> CleanupDeadlineTransferV1 {
+            let flight = self.flight.lock().unwrap().as_ref().unwrap().0.clone();
+            let transfer = flight.transfer_cleanup_deadline_now(reason).unwrap();
+            if matches!(transfer, CleanupDeadlineTransferV1::Transferred { .. }) {
+                self.flight.lock().unwrap().as_mut().unwrap().1 = true;
+            }
+            transfer
+        }
+    }
+
+    impl RichEventSinkFactory for TerminalizationHarness {
+        fn make(&self, _node: &NodeId) -> Arc<dyn bridge_core::ports::RichEventSink> {
+            Arc::new(RecordingRichSink::default())
+        }
+
+        fn monotonic_clock(
+            &self,
+        ) -> Option<Arc<dyn bridge_core::attempt_activity::MonotonicClock>> {
+            Some(self.clock.clone())
+        }
+    }
+
     #[derive(Default)]
     struct SettlementBackend {
         settlements: Mutex<Vec<(String, WorkflowCheckoutOutcomeV1)>>,
         fail_prompt_for: Option<&'static str>,
         cleanups: AtomicUsize,
+        root_cleanup_advance_ms: u64,
         scheduler: Option<Arc<SchedulerSignals>>,
+        terminalization: Option<Arc<TerminalizationHarness>>,
     }
 
     #[async_trait::async_trait]
@@ -14057,7 +14162,18 @@ mod tests {
             ])))
         }
 
-        async fn cancel(&self, _session: &SessionId) -> Result<(), BridgeError> {
+        async fn cancel(&self, session: &SessionId) -> Result<(), BridgeError> {
+            if let Some(harness) = self
+                .terminalization
+                .as_ref()
+                .filter(|_| session.as_str().contains("claude"))
+            {
+                harness.begin_cancel(session);
+                harness.cancel_calls.fetch_add(1, Ordering::SeqCst);
+                harness.cancel_started.notify_one();
+                harness.cancel_release.notified().await;
+                harness.cancel_completed.fetch_add(1, Ordering::SeqCst);
+            }
             if let Some(signals) = &self.scheduler {
                 signals.cancel_seen.notify_one();
                 if signals.hold_cancel {
@@ -14068,16 +14184,49 @@ mod tests {
         }
         async fn configure_bound_session(
             &self,
-            _session: &SessionId,
+            session: &SessionId,
             _spec: &bridge_core::execution_policy::BoundSessionSpecV1,
         ) -> Result<(), BridgeError> {
+            if let Some(harness) = self
+                .terminalization
+                .as_ref()
+                .filter(|_| session.as_str().contains("claude"))
+            {
+                harness.attach(session);
+            }
             Ok(())
+        }
+
+        fn resource_flight_v1(&self) -> Result<BackendResourceFlightV1, BridgeError> {
+            Ok(self
+                .terminalization
+                .as_ref()
+                .map_or(BackendResourceFlightV1::LegacyV2, |_| {
+                    BackendResourceFlightV1::ProtectedV3
+                }))
+        }
+
+        fn transfer_cleanup_deadline_v1(
+            &self,
+            _session: &SessionId,
+            reason: BoundedRecoveryReasonV1,
+        ) -> Result<CleanupDeadlineTransferV1, BridgeError> {
+            self.terminalization
+                .as_ref()
+                .map(|harness| harness.transfer(reason))
+                .ok_or(BridgeError::ResourceFlightUnsupported)
         }
 
         async fn forget_session_checked(
             &self,
-            _session: &SessionId,
+            session: &SessionId,
         ) -> Result<bridge_core::ports::BackendCleanupDispositionV1, BridgeError> {
+            if session.as_str().contains("codex") && self.root_cleanup_advance_ms > 0 {
+                tokio::time::advance(std::time::Duration::from_millis(
+                    self.root_cleanup_advance_ms,
+                ))
+                .await;
+            }
             self.cleanups.fetch_add(1, Ordering::SeqCst);
             Ok(bridge_core::ports::BackendCleanupDispositionV1::Complete)
         }
@@ -14087,6 +14236,15 @@ mod tests {
             session: &SessionId,
             outcome: WorkflowCheckoutOutcomeV1,
         ) -> CheckoutSettlementV1 {
+            if let Some(harness) = self
+                .terminalization
+                .as_ref()
+                .filter(|_| session.as_str().contains("claude"))
+            {
+                let mut flight = harness.flight.lock().unwrap();
+                let state = flight.as_mut().unwrap();
+                state.2 = Arc::strong_count(&state.0) > 1;
+            }
             self.settlements
                 .lock()
                 .unwrap()
@@ -14619,16 +14777,27 @@ mod tests {
             resolve_execution_policy_with_readiness_v1, DeadlineActivationV2::ManualOnlyR2f1a,
             FanOutPolicyV1, SchedulerActivationReadinessV1 as Readiness,
         };
+        use NodeCleanupDispositionV1::{Complete as Clean, UnknownLegacy as Xfer};
         use NodePrimaryDispositionV1::{
             CanceledPolicy, CanceledWorkflow, Failed, NotStartedPolicy,
         };
+        use WorkflowOutcome::{Canceled as WfCanceled, Failed as WfFailed};
 
-        fn fail_fast_spec(
+        struct PausedSchedulerClock(tokio::time::Instant);
+
+        impl bridge_core::attempt_activity::MonotonicClock for PausedSchedulerClock {
+            fn elapsed_ms(&self) -> u64 {
+                self.0.elapsed().as_millis().try_into().unwrap_or(u64::MAX)
+            }
+        }
+
+        fn fanout_spec(
             mut graph: WorkflowGraph,
+            fan_out: FanOutPolicyV1,
             readiness: Readiness,
         ) -> Arc<WorkflowRunSpecV1> {
             let defaults = WorkflowControlDefaultsV1 {
-                fan_out: Some(FanOutPolicyV1::FailFast),
+                fan_out: Some(fan_out),
                 ..Default::default()
             };
             let controls = resolve_execution_policy_with_readiness_v1(
@@ -14641,6 +14810,10 @@ mod tests {
             .unwrap();
             graph.controls = Some(defaults);
             frozen_test_run_spec(graph, controls, LedgerAdmissionV1::DurablePrimaryTaskStore)
+        }
+
+        fn fail_fast_spec(graph: WorkflowGraph, readiness: Readiness) -> Arc<WorkflowRunSpecV1> {
+            fanout_spec(graph, FanOutPolicyV1::FailFast, readiness)
         }
 
         fn review_fail_fast_spec(readiness: Readiness) -> Arc<WorkflowRunSpecV1> {
@@ -14683,6 +14856,43 @@ mod tests {
                     Arc::new(spec.graph.clone()),
                     "input".into(),
                     "scheduler-regression".into(),
+                    cancel,
+                    context,
+                )
+                .collect()
+                .await
+        }
+
+        async fn collect_terminalization(
+            spec: Arc<WorkflowRunSpecV1>,
+            backend: Arc<SettlementBackend>,
+            cancel: CancellationToken,
+        ) -> Vec<Result<WorkflowEvent, BridgeError>> {
+            let harness = backend.terminalization.as_ref().unwrap();
+            let signals = backend.scheduler.as_ref().unwrap().clone();
+            let context = WorkflowDiagnosticContext::in_memory(WorkflowRunContext {
+                session_cwd: spec.requested_session_cwd.clone(),
+                make_rich_sink: Some(harness.clone()),
+                post_recording_exit_fault: Some(PostRecordingExitFaultForTest::SchedulerArmed(
+                    false,
+                )),
+                ..Default::default()
+            })
+            .with_policy_trigger_barrier(Arc::new(move |_| {
+                let signals = signals.clone();
+                Box::pin(async move {
+                    signals.barrier_entered.notify_one();
+                    signals.barrier_gate.notified().await;
+                    PolicyTriggerBarrierResultV1::PrimaryFailed
+                })
+            }))
+            .with_frozen_run_spec(spec.clone(), None)
+            .unwrap();
+            WorkflowExecutor::new(Arc::new(SettlementRegistry { backend }))
+                .run_with_diagnostic_context(
+                    Arc::new(spec.graph.clone()),
+                    "input".into(),
+                    "slice4i-terminalization".into(),
                     cancel,
                     context,
                 )
@@ -14923,22 +15133,26 @@ mod tests {
 
         type Events = [Result<WorkflowEvent, BridgeError>];
 
+        fn terminal_json<'a>(events: &'a Events, node: &str) -> &'a str {
+            let mut terminals = events.iter().filter_map(|event| match event {
+                Ok(WorkflowEvent::NodeFinished {
+                    node: finished,
+                    terminal_json: Some(terminal),
+                    ..
+                }) if finished.as_str() == node => Some(terminal.as_str()),
+                _ => None,
+            });
+            let terminal = terminals.next().unwrap();
+            assert!(terminals.next().is_none(), "duplicate terminal for {node}");
+            terminal
+        }
+
+        fn terminal(events: &Events, node: &str) -> NodeTerminalV1 {
+            NodeTerminalV1::decode_canonical(terminal_json(events, node).as_bytes()).unwrap()
+        }
+
         fn primary(events: &Events, node: &str) -> NodePrimaryDispositionV1 {
-            let terminals = events
-                .iter()
-                .filter_map(|event| match event {
-                    Ok(WorkflowEvent::NodeFinished {
-                        node: finished,
-                        terminal_json: Some(terminal),
-                        ..
-                    }) if finished.as_str() == node => Some(terminal),
-                    _ => None,
-                })
-                .collect::<Vec<_>>();
-            assert_eq!(terminals.len(), 1);
-            NodeTerminalV1::decode_canonical(terminals[0].as_bytes())
-                .unwrap()
-                .primary
+            terminal(events, node).primary
         }
 
         fn assert_exact_primaries(events: &Events, expected: &[(&str, NodePrimaryDispositionV1)]) {
@@ -14959,6 +15173,186 @@ mod tests {
             for (node, expected_primary) in expected {
                 assert_eq!(primary(events, node), *expected_primary);
             }
+        }
+
+        fn is_workflow_terminal(event: &&Result<WorkflowEvent, BridgeError>) -> bool {
+            matches!(event, Ok(WorkflowEvent::Terminal { .. }))
+        }
+
+        fn artifact(
+            events: &Events,
+            claude: NodePrimaryDispositionV1,
+            synth: NodePrimaryDispositionV1,
+            outcome: WorkflowOutcome,
+            cleanup: NodeCleanupDispositionV1,
+        ) {
+            assert_exact_primaries(
+                events,
+                &[("claude", claude), ("codex", Failed), ("synth", synth)],
+            );
+            assert_eq!(events.iter().filter(is_workflow_terminal).count(), 1);
+            assert_eq!(workflow_terminal(events), outcome);
+            assert_eq!(terminal(events, "claude").cleanup.disposition, cleanup);
+            assert_eq!(
+                terminal(events, "codex").cause,
+                Some(NodeCauseV1::from_bridge_error(&BridgeError::StoreFailure))
+            );
+        }
+
+        fn terminalization_backend(
+            clock: Arc<PausedSchedulerClock>,
+            root_cleanup_advance_ms: u64,
+        ) -> (Arc<SettlementBackend>, Arc<TerminalizationHarness>) {
+            let harness = Arc::new(TerminalizationHarness {
+                clock,
+                flight: Mutex::new(None),
+                cancel_release: tokio::sync::Notify::new(),
+                cancel_started: tokio::sync::Notify::new(),
+                cancel_calls: AtomicUsize::new(0),
+                cancel_completed: AtomicUsize::new(0),
+            });
+            let backend = Arc::new(SettlementBackend {
+                fail_prompt_for: Some("codex"),
+                root_cleanup_advance_ms,
+                scheduler: Some(Arc::new(SchedulerSignals {
+                    gate_failure: Some(false),
+                    ..Default::default()
+                })),
+                terminalization: Some(harness.clone()),
+                ..Default::default()
+            });
+            (backend, harness)
+        }
+
+        fn release_barrier(backend: &SettlementBackend) {
+            backend
+                .scheduler
+                .as_ref()
+                .unwrap()
+                .barrier_gate
+                .notify_one();
+        }
+
+        macro_rules! spawn_terminalization {
+            ($spec:expr, $cancel:expr, $root_cleanup_advance_ms:expr) => {{
+                let clock = Arc::new(PausedSchedulerClock(tokio::time::Instant::now()));
+                let (backend, harness) = terminalization_backend(clock, $root_cleanup_advance_ms);
+                let task = tokio::spawn(collect_terminalization($spec, backend.clone(), $cancel));
+                (backend, harness, task)
+            }};
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn cleanup_transfer_terminalizes_a_pending_sibling_once() {
+            let (baseline_backend, baseline_harness, baseline_task) = spawn_terminalization!(
+                review_fail_fast_spec(Readiness::Armed),
+                CancellationToken::new(),
+                1_000
+            );
+            release_barrier(&baseline_backend);
+            soon(baseline_harness.cancel_started.notified()).await;
+            baseline_harness.cancel_release.notify_waiters();
+            let baseline = soon(baseline_task).await.unwrap();
+            let baseline_root = terminal_json(&baseline, "codex").to_owned();
+            let (backend, harness, task) = spawn_terminalization!(
+                review_fail_fast_spec(Readiness::Armed),
+                CancellationToken::new(),
+                1_000
+            );
+            release_barrier(&backend);
+
+            soon(harness.cancel_started.notified()).await;
+            assert_eq!(harness.cancel_calls.load(Ordering::SeqCst), 1);
+            tokio::time::advance(std::time::Duration::from_millis(59_999)).await;
+            tokio::task::yield_now().await;
+            assert!(!harness.flight.lock().unwrap().as_ref().unwrap().1);
+            assert!(!task.is_finished());
+            tokio::time::advance(std::time::Duration::from_millis(1)).await;
+            tokio::task::yield_now().await;
+            assert!(harness.flight.lock().unwrap().as_ref().unwrap().1);
+            let events = tokio::time::timeout(std::time::Duration::from_millis(1), task)
+                .await
+                .expect("workflow stayed pending after successful cleanup-deadline transfer")
+                .unwrap();
+
+            assert_eq!(terminal_json(&events, "codex"), baseline_root);
+            assert_eq!(terminal(&events, "codex").cleanup.duration_ms, 1_000);
+            artifact(&events, CanceledPolicy, NotStartedPolicy, WfFailed, Xfer);
+            assert_eq!(
+                terminal(&events, "claude").cleanup,
+                NodeCleanupV1 {
+                    disposition: NodeCleanupDispositionV1::UnknownLegacy,
+                    duration_ms: 60_000,
+                }
+            );
+            assert!(
+                events.iter().any(|event| matches!(
+                    event,
+                    Ok(WorkflowEvent::CleanupObserved {
+                        disposition: WorkflowCleanupDisposition::Unknown,
+                        duration_ms: 61_000,
+                    })
+                )),
+                "{events:#?}"
+            );
+            assert!(harness.flight.lock().unwrap().as_ref().unwrap().2);
+            harness.cancel_release.notify_waiters();
+            tokio::task::yield_now().await;
+            assert_eq!(harness.cancel_completed.load(Ordering::SeqCst), 0);
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn real_sibling_terminal_at_or_before_transfer_boundary_wins() {
+            for exact_boundary in [false, true] {
+                let (backend, harness, task) = spawn_terminalization!(
+                    review_fail_fast_spec(Readiness::Armed),
+                    CancellationToken::new(),
+                    0
+                );
+                release_barrier(&backend);
+                soon(harness.cancel_started.notified()).await;
+                tokio::time::advance(std::time::Duration::from_millis(59_999)).await;
+                harness.cancel_release.notify_waiters();
+                if exact_boundary {
+                    tokio::time::advance(std::time::Duration::from_millis(1)).await;
+                }
+                let events = soon(task).await.unwrap();
+                assert!(!harness.flight.lock().unwrap().as_ref().unwrap().1);
+                assert_eq!(harness.cancel_completed.load(Ordering::SeqCst), 1);
+                artifact(&events, CanceledPolicy, NotStartedPolicy, WfFailed, Clean);
+            }
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn post_transfer_terminals_preserve_external_precedence_and_bounded_cutoff() {
+            let cancel = CancellationToken::new();
+            let (backend, harness, task) =
+                spawn_terminalization!(review_fail_fast_spec(Readiness::Armed), cancel.clone(), 0);
+            let signals = backend.scheduler.as_ref().unwrap().clone();
+            soon(signals.barrier_entered.notified()).await;
+            cancel.cancel();
+            signals.barrier_gate.notify_one();
+            soon(harness.cancel_started.notified()).await;
+            tokio::time::advance(std::time::Duration::from_millis(60_000)).await;
+            let ev = soon(task).await.unwrap();
+            artifact(&ev, CanceledWorkflow, CanceledWorkflow, WfCanceled, Xfer);
+
+            let graph = review_fail_fast_spec(Readiness::Armed).graph.clone();
+            let spec = fanout_spec(graph, FanOutPolicyV1::BoundedIndependent, Readiness::Armed);
+            let cutoff = spec.controls.effective_work_cutoff_ms();
+            let (backend, harness, task) =
+                spawn_terminalization!(spec, CancellationToken::new(), 0);
+            let signals = backend.scheduler.as_ref().unwrap().clone();
+            release_barrier(&backend);
+            soon(signals.other_entered.notified()).await;
+            tokio::time::advance(std::time::Duration::from_millis(cutoff - 1)).await;
+            tokio::task::yield_now().await;
+            assert_eq!(harness.cancel_calls.load(Ordering::SeqCst), 0);
+            tokio::time::advance(std::time::Duration::from_millis(1)).await;
+            soon(harness.cancel_started.notified()).await;
+            tokio::time::advance(std::time::Duration::from_millis(60_000)).await;
+            let events = soon(task).await.unwrap();
+            artifact(&events, CanceledPolicy, NotStartedPolicy, WfFailed, Xfer);
         }
 
         #[tokio::test]
