@@ -2,6 +2,7 @@
 
 use crate::graph::WorkflowGraph;
 use crate::run_spec::WorkflowRunSpecV1;
+use crate::run_spec::WorkflowSnapshotV3;
 use async_trait::async_trait;
 use bridge_core::domain::AgentEntry;
 use bridge_core::error::BridgeError;
@@ -10,12 +11,14 @@ use bridge_core::execution_policy::{
     resolve_execution_policy_with_readiness_v1, scheduler_activation_readiness_v1,
     select_custody_plan_v1, DeadlineActivationV2, ExecutionPolicyInvocationV1,
     FrozenCheckoutEffectV1, FrozenProviderLogicalSessionV1, FrozenR2f1bContractV1,
-    LedgerAdmissionV1, PolicyActivationV1, PolicyNodeRefV1, ProviderEffectKeyV1,
-    ProviderFreezeInputV1, SchedulerActivationReadinessV1, WorkflowControlDefaultsV1,
+    FrozenWorktreeCustodyPlanV1, LedgerAdmissionV1, PolicyActivationV1, PolicyNodeRefV1,
+    ProviderEffectKeyV1, ProviderFreezeInputV1, SchedulerActivationReadinessV1,
+    WorkflowControlDefaultsV1, WorktreeCustodyIdV1,
 };
 use bridge_core::ids::{AttemptId, AttemptIdentity};
 use bridge_core::ports::AgentRegistry;
 use bridge_core::SessionCwd;
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -65,13 +68,25 @@ pub struct WorkflowAdmissionV1 {
 pub struct AdmittedWorkflowRunV1 {
     pub run_spec: Arc<WorkflowRunSpecV1>,
     pub provider_effect_key: Option<Arc<ProviderEffectKeyV1>>,
-    /// The admitted R2f1b contract, or `None` for every V2 run.
-    ///
-    /// Production admission has no way to populate this: every caller of [`WorkflowAdmissionV1::
-    /// freeze`] passes `r2f1b: None` (see the §2c unreachability argument in the slice handoff),
-    /// and the one activation that could arm timers is refused outright by
-    /// [`admit_r2f1b_contract_v1`]. Slice 4 owns making it reachable.
+    /// The admitted R2f1b contract, or `None` for a V2 run.
     pub r2f1b: Option<Arc<R2f1bAdmissionV1>>,
+    pub(crate) fresh_r2f1b_admission: Option<Arc<FreshR2f1bAdmissionProofV1>>,
+}
+
+#[derive(Clone)]
+pub(crate) struct FreshR2f1bAdmissionProofV1 {
+    run_spec: Arc<WorkflowRunSpecV1>,
+    r2f1b: Arc<R2f1bAdmissionV1>,
+}
+
+impl FreshR2f1bAdmissionProofV1 {
+    pub(crate) fn admits_run_spec(&self, run_spec: &Arc<WorkflowRunSpecV1>) -> bool {
+        Arc::ptr_eq(&self.run_spec, run_spec)
+    }
+
+    pub(crate) fn admits_contract(&self, r2f1b: &Arc<R2f1bAdmissionV1>) -> bool {
+        Arc::ptr_eq(&self.r2f1b, r2f1b)
+    }
 }
 
 /// One R2f1b contract offered to admission, with the attempt that will execute it.
@@ -81,33 +96,42 @@ pub struct R2f1bAdmissionV1 {
     pub contract: FrozenR2f1bContractV1,
 }
 
-/// The single production admission rule for an R2f1b contract (slice-2 brief §3, Sol 13).
+/// The explicit-contract admission rule for one R2f1b contract.
 ///
-/// **Deliberately NOT in [`FrozenR2f1bContractV1::validate`].** Putting the activation refusal in
-/// `validate` would make `with_computed_fingerprint` fail for `AutomaticR2f1b` and break the
-/// already-landed A3/A5 offline construction, encoding, decoding, and workload-identity tests —
-/// which must stay legal, because slice 4 needs to build and persist automatic contracts before
-/// it is allowed to run them. The refusal belongs at the boundary where a contract becomes
-/// *effective*, and this is that boundary.
-///
-/// It is also half of the reachability argument the whole slice rests on: with automatic
-/// activation refused here and no production caller offering a `ManualOnlyR2f1a` contract, no
-/// production path can route a custody plan to the backend at all.
+/// Caller-supplied automatic contracts are still refused here. The fresh V3 builder admits its
+/// own automatic contract through a private proof consumed by the canonical executor binder.
 pub fn admit_r2f1b_contract_v1(
     attempt_id: &AttemptId,
     admission: &R2f1bAdmissionV1,
+) -> Result<(), BridgeError> {
+    admit_r2f1b_contract_with_activation_v1(attempt_id, admission, false)
+}
+
+pub(crate) fn admit_fresh_r2f1b_contract_v1(
+    attempt_id: &AttemptId,
+    admission: &R2f1bAdmissionV1,
+) -> Result<(), BridgeError> {
+    admit_r2f1b_contract_with_activation_v1(attempt_id, admission, true)
+}
+
+fn admit_r2f1b_contract_with_activation_v1(
+    attempt_id: &AttemptId,
+    admission: &R2f1bAdmissionV1,
+    builder_owned_automatic: bool,
 ) -> Result<(), BridgeError> {
     admission.contract.validate().map_err(|error| {
         invalid(&format!(
             "R2f1b contract is not admissible: {error}, contract is invalid"
         ))
     })?;
-    if admission.contract.activation == DeadlineActivationV2::AutomaticR2f1b {
+    let automatic = admission.contract.activation == DeadlineActivationV2::AutomaticR2f1b;
+    if automatic && !builder_owned_automatic {
         return Err(invalid(
-            "automatic R2f1b deadline activation is refused at admission: no slice-2 \
+            "automatic R2f1b deadline activation is refused at admission: no caller-supplied \
              production path may arm it",
         ));
     }
+    debug_assert!(automatic || !builder_owned_automatic);
     // Fresh admission only. Resume mints a successor identity and exchanges the custody claim —
     // §5.8, owned by 2d (mechanism) and slice 5 (production). A successor arriving here would
     // route a claim-less V3 write over a predecessor's live checkout.
@@ -131,6 +155,12 @@ pub struct WorkflowAdmissionRequestV1 {
     /// The R2f1b contract for this run. **Every production construction site passes `None`** —
     /// the field is explicit rather than defaulted precisely so that stays greppable.
     pub r2f1b: Option<R2f1bAdmissionV1>,
+}
+
+#[derive(Clone)]
+pub struct FreshWorkflowAdmissionV3 {
+    pub admitted: AdmittedWorkflowRunV1,
+    pub snapshot: WorkflowSnapshotV3,
 }
 
 impl WorkflowAdmissionV1 {
@@ -161,6 +191,80 @@ impl WorkflowAdmissionV1 {
     ) -> Result<AdmittedWorkflowRunV1, BridgeError> {
         self.freeze_with_scheduler_readiness(request, scheduler_activation_readiness_v1())
             .await
+    }
+
+    pub async fn freeze_fresh_v3(
+        &self,
+        attempt: AttemptIdentity,
+        request: WorkflowAdmissionRequestV1,
+    ) -> Result<FreshWorkflowAdmissionV3, BridgeError> {
+        self.freeze_fresh_v3_with_policy_activation(
+            attempt,
+            request,
+            scheduler_activation_readiness_v1(),
+            PolicyActivationV1::Production,
+        )
+        .await
+    }
+
+    async fn freeze_fresh_v3_with_policy_activation(
+        &self,
+        attempt: AttemptIdentity,
+        request: WorkflowAdmissionRequestV1,
+        readiness: SchedulerActivationReadinessV1,
+        policy_activation: PolicyActivationV1,
+    ) -> Result<FreshWorkflowAdmissionV3, BridgeError> {
+        if attempt.ordinal != 0
+            || attempt.parent_attempt_id.is_some()
+            || attempt.attempt_id != request.attempt_id
+        {
+            return Err(invalid(
+                "fresh V3 admission accepts only an initial attempt identity matching the run attempt",
+            ));
+        }
+        if request.r2f1b.is_some() {
+            return Err(invalid(
+                "fresh V3 admission owns R2f1b contract construction and refuses caller-supplied contracts",
+            ));
+        }
+        if deadline_activation_v2_for(readiness, policy_activation)
+            != DeadlineActivationV2::AutomaticR2f1b
+        {
+            return Err(invalid(
+                "fresh V3 admission requires automatic R2f1b production readiness",
+            ));
+        }
+
+        let admitted = self
+            .freeze_with_scheduler_readiness(request, readiness)
+            .await?;
+        let contract = fresh_r2f1b_contract_for_run(&admitted)?;
+        let r2f1b = Arc::new(R2f1bAdmissionV1 {
+            attempt: attempt.clone(),
+            contract: contract.clone(),
+        });
+        let snapshot = WorkflowSnapshotV3 {
+            attempt,
+            delivery_spec: (*admitted.run_spec).clone(),
+            predecessor_snapshot_digest: None,
+            r2f1b: contract,
+        };
+        snapshot
+            .validate()
+            .map_err(|error| invalid(&format!("fresh V3 workflow snapshot is invalid: {error}")))?;
+        let run_spec = admitted.run_spec.clone();
+        Ok(FreshWorkflowAdmissionV3 {
+            admitted: AdmittedWorkflowRunV1 {
+                run_spec: admitted.run_spec,
+                provider_effect_key: admitted.provider_effect_key,
+                r2f1b: Some(r2f1b.clone()),
+                fresh_r2f1b_admission: Some(Arc::new(FreshR2f1bAdmissionProofV1 {
+                    run_spec,
+                    r2f1b,
+                })),
+            },
+            snapshot,
+        })
     }
 
     async fn freeze_with_scheduler_readiness(
@@ -320,6 +424,7 @@ impl WorkflowAdmissionV1 {
             run_spec,
             provider_effect_key: self.provider_effect_key.clone(),
             r2f1b: request.r2f1b.map(Arc::new),
+            fresh_r2f1b_admission: None,
         })
     }
 
@@ -363,6 +468,7 @@ impl WorkflowAdmissionV1 {
             // wrapped OUTSIDE `WorkflowRunSpecV1` (in `WorkflowSnapshotV3`), and this entry takes
             // only the V2 spec. Restoring a V3 snapshot is slice 5's.
             r2f1b: None,
+            fresh_r2f1b_admission: None,
         })
     }
 
@@ -378,6 +484,50 @@ impl WorkflowAdmissionV1 {
         }
         Ok(())
     }
+}
+
+fn fresh_r2f1b_contract_for_run(
+    admitted: &AdmittedWorkflowRunV1,
+) -> Result<FrozenR2f1bContractV1, BridgeError> {
+    let mut custody_by_digest: BTreeMap<_, FrozenWorktreeCustodyPlanV1> = BTreeMap::new();
+    for identity in &admitted.run_spec.node_execution_identities {
+        for attempt in &identity.provider_attempts {
+            let FrozenCheckoutEffectV1::Worktree {
+                target_cwd,
+                checkout_digest,
+                ..
+            } = &attempt.checkout
+            else {
+                continue;
+            };
+            match custody_by_digest.get(checkout_digest) {
+                Some(plan)
+                    if plan.target_cwd != *target_cwd
+                        || plan.checkout_fingerprint != *checkout_digest =>
+                {
+                    return Err(invalid(
+                        "fresh V3 admission found conflicting targets for one checkout digest",
+                    ));
+                }
+                Some(_) => {}
+                None => {
+                    custody_by_digest.insert(
+                        checkout_digest.clone(),
+                        FrozenWorktreeCustodyPlanV1 {
+                            custody_id: WorktreeCustodyIdV1::mint()?,
+                            checkout_fingerprint: checkout_digest.clone(),
+                            target_cwd: target_cwd.clone(),
+                        },
+                    );
+                }
+            }
+        }
+    }
+    FrozenR2f1bContractV1::with_computed_fingerprint(
+        DeadlineActivationV2::AutomaticR2f1b,
+        custody_by_digest.into_values().collect(),
+    )
+    .map_err(|error| invalid(&format!("fresh R2f1b contract is invalid: {error}")))
 }
 
 fn invalid(reason: &str) -> BridgeError {
@@ -506,26 +656,18 @@ mod slice4b_tests {
         }
     }
 
-    #[tokio::test]
-    async fn automatic_v3_refuses_legacy_watchdog_before_effects() {
-        let effects = Arc::new(EffectCounts::default());
-        let entry = Arc::new(watchdog_entry());
-        let admission = WorkflowAdmissionV1::new(
-            Arc::new(RefusalRegistry {
-                entry: entry.clone(),
-                effects: effects.clone(),
-            }),
-            Arc::new(RefusalPlanner(effects.clone())),
-            SessionCwd::parse("/launch").unwrap(),
-            None,
-        );
-        let request = WorkflowAdmissionRequestV1 {
-            attempt_id: AttemptIdentity::initial().unwrap().attempt_id,
+    fn refusal_request(
+        attempt_id: AttemptId,
+        agent: AgentId,
+        id: &str,
+    ) -> WorkflowAdmissionRequestV1 {
+        WorkflowAdmissionRequestV1 {
+            attempt_id,
             graph: Arc::new(WorkflowGraph {
-                id: WorkflowId::parse("watchdog-refusal").unwrap(),
+                id: WorkflowId::parse(id).unwrap(),
                 nodes: vec![WorkflowNode {
                     id: NodeId::parse("inspect").unwrap(),
-                    agent: entry.id.clone(),
+                    agent,
                     prompt_template: "{{input}}".into(),
                     inputs: vec![],
                     retry: None,
@@ -540,7 +682,78 @@ mod slice4b_tests {
                 kind: HistoryAllocationKindV1::Configured,
             },
             r2f1b: None,
-        };
+        }
+    }
+
+    #[tokio::test]
+    async fn fresh_v3_refuses_disarmed_and_manual_test_before_planning() {
+        let effects = Arc::new(EffectCounts::default());
+        let mut configured = watchdog_entry();
+        configured.effort = None;
+        configured.watchdog = None;
+        let entry = Arc::new(configured);
+        let admission = WorkflowAdmissionV1::new(
+            Arc::new(RefusalRegistry {
+                entry: entry.clone(),
+                effects: effects.clone(),
+            }),
+            Arc::new(RefusalPlanner(effects.clone())),
+            SessionCwd::parse("/launch").unwrap(),
+            None,
+        );
+        let attempt = AttemptIdentity::initial().unwrap();
+        for (readiness, activation) in [
+            (
+                SchedulerActivationReadinessV1::Disarmed,
+                PolicyActivationV1::Production,
+            ),
+            (
+                SchedulerActivationReadinessV1::Armed,
+                PolicyActivationV1::ManualTest,
+            ),
+        ] {
+            let refused = admission
+                .freeze_fresh_v3_with_policy_activation(
+                    attempt.clone(),
+                    refusal_request(
+                        attempt.attempt_id.clone(),
+                        entry.id.clone(),
+                        "fresh-v3-readiness-refusal",
+                    ),
+                    readiness,
+                    activation,
+                )
+                .await;
+            assert!(matches!(
+                refused,
+                Err(BridgeError::ConfigInvalid { reason })
+                    if reason.contains("automatic R2f1b production readiness")
+            ));
+        }
+        assert!(effects
+            .counts
+            .iter()
+            .all(|count| count.load(Ordering::SeqCst) == 0));
+    }
+
+    #[tokio::test]
+    async fn automatic_v3_refuses_legacy_watchdog_before_effects() {
+        let effects = Arc::new(EffectCounts::default());
+        let entry = Arc::new(watchdog_entry());
+        let admission = WorkflowAdmissionV1::new(
+            Arc::new(RefusalRegistry {
+                entry: entry.clone(),
+                effects: effects.clone(),
+            }),
+            Arc::new(RefusalPlanner(effects.clone())),
+            SessionCwd::parse("/launch").unwrap(),
+            None,
+        );
+        let request = refusal_request(
+            AttemptIdentity::initial().unwrap().attempt_id,
+            entry.id.clone(),
+            "watchdog-refusal",
+        );
 
         let Err(BridgeError::ConfigInvalid { reason }) = admission
             .freeze_with_scheduler_readiness(request, SchedulerActivationReadinessV1::Armed)

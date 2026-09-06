@@ -377,11 +377,17 @@ impl WorkflowDiagnosticContext {
             run_spec,
             provider_effect_key,
             r2f1b,
+            fresh_r2f1b_admission,
         } = admitted;
         let context = self.with_frozen_run_spec(run_spec, provider_effect_key)?;
-        match r2f1b {
-            None => Ok(context),
-            Some(r2f1b) => context.with_frozen_r2f1b_contract(r2f1b),
+        match (r2f1b, fresh_r2f1b_admission) {
+            (None, None) => Ok(context),
+            (None, Some(_)) => Err(BridgeError::ConfigInvalid {
+                reason: "fresh R2f1b admission proof without its admitted contract".into(),
+            }),
+            (Some(r2f1b), fresh_r2f1b_admission) => {
+                context.with_admitted_r2f1b_contract(r2f1b, fresh_r2f1b_admission)
+            }
         }
     }
 
@@ -438,8 +444,16 @@ impl WorkflowDiagnosticContext {
     /// rather than trusted from admission, because this is a second boundary a caller can reach
     /// (it is `pub`), and a rule enforced at one of two entrances is not enforced.
     pub fn with_frozen_r2f1b_contract(
+        self,
+        r2f1b: Arc<crate::admission::R2f1bAdmissionV1>,
+    ) -> Result<Self, BridgeError> {
+        self.with_admitted_r2f1b_contract(r2f1b, None)
+    }
+
+    fn with_admitted_r2f1b_contract(
         mut self,
         r2f1b: Arc<crate::admission::R2f1bAdmissionV1>,
+        fresh_r2f1b_admission: Option<Arc<crate::admission::FreshR2f1bAdmissionProofV1>>,
     ) -> Result<Self, BridgeError> {
         let authority =
             self.frozen_authority
@@ -447,7 +461,27 @@ impl WorkflowDiagnosticContext {
                 .ok_or_else(|| BridgeError::ConfigInvalid {
                     reason: "an R2f1b contract needs its frozen run specification first".into(),
                 })?;
-        crate::admission::admit_r2f1b_contract_v1(&authority.run_spec.attempt_id, &r2f1b)?;
+        if let Some(proof) = fresh_r2f1b_admission {
+            if !proof.admits_run_spec(&authority.run_spec) {
+                return Err(BridgeError::ConfigInvalid {
+                    reason:
+                        "fresh R2f1b admission proof does not match the admitted run specification"
+                            .into(),
+                });
+            }
+            if !proof.admits_contract(&r2f1b) {
+                return Err(BridgeError::ConfigInvalid {
+                    reason: "fresh R2f1b admission proof does not match the admitted contract"
+                        .into(),
+                });
+            }
+            crate::admission::admit_fresh_r2f1b_contract_v1(
+                &authority.run_spec.attempt_id,
+                &r2f1b,
+            )?;
+        } else {
+            crate::admission::admit_r2f1b_contract_v1(&authority.run_spec.attempt_id, &r2f1b)?;
+        }
         for identity in &authority.run_spec.node_execution_identities {
             for attempt in &identity.provider_attempts {
                 bridge_core::execution_policy::select_custody_plan_v1(
