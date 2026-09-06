@@ -1,6 +1,6 @@
 # R2f1b slice 4H-2 repair handoff
 
-## 4I successor published as PR #99 pending CI and merge (current)
+## 4I successor merged as PR #99; bounded 4J lane authorized (current)
 
 On 2026-09-05, the owner authorized the current-main 4I implementation/review lane. Live `origin/main` was rebound
 to `936534d8cffb225249a5eeccd5874552dc97e961`; no competing 4I implementation owner was found. After prior exact
@@ -46,10 +46,10 @@ ran four focused tests (**4 / 0**) and recomputed the retained log hashes and ag
 earlier same-node teardown, but node-future lifetime alone does not rule out prior preflight/retry cleanup. The
 node-keyed tracker unions those intervals; no Rust change was requested or made.
 
-**Current disposition: 4H-2 MERGED / 4I APPROVED AND PUBLISHED AS PR #99 / CI AND MERGE PENDING / 4J AND R3
-DISARMED.** The separately authorized push and PR creation occurred; no merge, provider, registry/image,
-compatibility, live smoke, release, deployment, or running-operator effect occurred. The repair and review rounds are
-consumed; no further Rust edit or review is authorized or needed. Merge remains separately gated.
+**Current disposition: 4H-2 MERGED / 4I APPROVED AND MERGED AS PR #99 AT `065935e0` / 4J IMPLEMENTATION AND ONE
+REVIEW AUTHORIZED UNDER AN 80-LINE RUST CAP / R3 DISARMED.** All required PR #99 checks succeeded. No provider,
+registry/image, compatibility, live smoke, release, deployment, or running-operator effect occurred. The 4I repair
+and review rounds are consumed; the separately authorized 4J lane is the only successor Rust scope.
 
 ## Public merge closure and 4I residual census (historical; superseded above)
 

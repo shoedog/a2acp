@@ -12,11 +12,11 @@
 use bridge_core::domain::{AgentEntry, AgentKind};
 use bridge_core::execution_policy::{
     freeze_direct_checkout_v1, freeze_node_execution_identity_v1, freeze_provider_attempt_v1,
-    resolve_execution_policy_v1, DeadlineActivationV2, ExecutionPolicyInvocationV1,
+    resolve_execution_policy_with_readiness_v1, DeadlineActivationV2, ExecutionPolicyInvocationV1,
     FrozenProviderLogicalSessionV1, FrozenR2f1bContractV1, FrozenWorktreeCustodyPlanV1,
     HistoryAllocationKindV1, LedgerAdmissionV1, PolicyActivationV1, PolicyNodeRefV1,
-    ProviderFreezeInputV1, Sha256HexV1, WorkflowControlDefaultsV1, WorktreeCustodyIdV1,
-    R2F1B_RESOURCE_CONTRACT_VERSION_V1,
+    ProviderFreezeInputV1, SchedulerActivationReadinessV1, Sha256HexV1, WorkflowControlDefaultsV1,
+    WorktreeCustodyIdV1, R2F1B_RESOURCE_CONTRACT_VERSION_V1,
 };
 use bridge_core::ids::{AgentId, AttemptId, AttemptIdentity, ExecutionId, NodeId, WorkflowId};
 use bridge_core::mcp::McpDelivery;
@@ -111,10 +111,11 @@ fn run_spec_with_node(node_id: &str) -> WorkflowRunSpecV1 {
     })
     .unwrap();
     let identity = freeze_node_execution_identity_v1(node, vec![bundle]).unwrap();
-    let controls = resolve_execution_policy_v1(
+    let controls = resolve_execution_policy_with_readiness_v1(
         graph.controls.as_ref().unwrap(),
         &ExecutionPolicyInvocationV1::default(),
         false,
+        SchedulerActivationReadinessV1::Disarmed,
         PolicyActivationV1::Production,
     )
     .unwrap();

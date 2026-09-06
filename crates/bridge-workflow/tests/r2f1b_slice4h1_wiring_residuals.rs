@@ -9,7 +9,7 @@ use bridge_core::mechanical_impossibility::{
 };
 
 #[test]
-fn wiring_inputs_are_reachable_while_production_remains_disarmed() {
+fn wiring_inputs_are_reachable_when_production_is_armed() {
     let routes = ProducerFinalRouteObservationV1 {
         producer_routes: vec![RouteStateV1::IrreversiblyClosed],
         final_routes: vec![RouteStateV1::IrreversiblyClosed],
@@ -23,9 +23,9 @@ fn wiring_inputs_are_reachable_while_production_remains_disarmed() {
     let _ = ContainerSpawnSettlementV1::Settled;
 
     let readiness = scheduler_activation_readiness_v1();
-    assert_eq!(readiness, SchedulerActivationReadinessV1::Disarmed);
+    assert_eq!(readiness, SchedulerActivationReadinessV1::Armed);
     assert_eq!(
         deadline_activation_v2_for(readiness, PolicyActivationV1::Production),
-        DeadlineActivationV2::ManualOnlyR2f1a
+        DeadlineActivationV2::AutomaticR2f1b
     );
 }

@@ -562,7 +562,7 @@ mod tests {
         let manual = workload_fingerprint_with_activation(&graph, ManualOnlyR2f1a, lookup);
         let automatic = workload_fingerprint_with_activation(&graph, AutomaticR2f1b, lookup);
 
-        assert_eq!(shipped, manual, "shipped readiness must remain manual");
+        assert_eq!(shipped, automatic, "shipped readiness must be automatic");
         assert_eq!(
             manual.0,
             "shape-9892a9f12f1daf2edcc832b7f85437b937abd389e6691cad09c2f0bb0467b1c4"

@@ -6,7 +6,7 @@ task-type: implement
 
 ## Status and custody
 
-**APPROVED / CURRENT-TARGET INTEGRATED / AGGREGATE VERIFIED / PUBLISHED AS PR #99 / CI PENDING / NOT MERGED.** Before implementation, live
+**APPROVED / CURRENT-TARGET INTEGRATED / AGGREGATE VERIFIED / MERGED AS PR #99.** Before implementation, live
 `origin/main` was rebound to `936534d8cffb225249a5eeccd5874552dc97e961`, and the worktree census found no
 competing 4I implementation owner. The owner later renewed the parked artifact for exactly one narrow
 interval-endpoint/union repair and one final hard-read-only cumulative rereview, raising the exact-base cap to
@@ -29,8 +29,9 @@ onto exact `636979e27eee428981712c506435e0e151ee80a1` as integration commit
 remains exact `7c59d597ed5c80382bef6a2c4c3ce81e23ed06be`; normalized `git diff` output for both the frozen-base 4I delta
 and current-target integration delta has SHA-256
 `6da5b5a3c1528731534cc5228c63e515485e570689499a550784d97e0d07c8f3`. The integration branch is published as
-[PR #99](https://github.com/shoedog/a2acp/pull/99). CI and merge remain pending; publication does not authorize
-merge, 4J, or any provider/operator effect.
+[PR #99](https://github.com/shoedog/a2acp/pull/99), which merged after all required checks succeeded as exact
+`065935e0b3dccfa4338c6fdbedbfda03658cca70`. That merge did not itself authorize 4J or any provider/operator
+effect; the owner separately authorized the bounded 4J implementation/review lane on 2026-09-06.
 
 ### Measured implementation evidence — 2026-09-05
 

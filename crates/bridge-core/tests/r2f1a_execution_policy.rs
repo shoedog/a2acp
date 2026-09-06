@@ -117,7 +117,7 @@ fn omission_and_invocation_precedence_freeze_exact_profiles() {
 }
 
 #[test]
-fn inconsistent_profile_and_inactive_fixed_grace_refuse() {
+fn inconsistent_profile_and_manual_fixed_grace_refuse() {
     let mismatch = WorkflowControlDefaultsV1 {
         task_class: Some(TaskClassV1::Other),
         liveness_profile: Some(LivenessProfileIdV1::ReviewHighXhighV1),
@@ -137,14 +137,16 @@ fn inconsistent_profile_and_inactive_fixed_grace_refuse() {
         fan_out: Some(FanOutPolicyV1::FixedGrace { grace_ms: 30_000 }),
         ..Default::default()
     };
+    let automatic = resolve_execution_policy_v1(
+        &fixed,
+        &ExecutionPolicyInvocationV1::default(),
+        false,
+        PolicyActivationV1::Production,
+    )
+    .unwrap();
     assert_eq!(
-        resolve_execution_policy_v1(
-            &fixed,
-            &ExecutionPolicyInvocationV1::default(),
-            false,
-            PolicyActivationV1::Production,
-        ),
-        Err(ExecutionPolicyError::FixedGraceInactive)
+        automatic.deadline_activation,
+        DeadlineActivationV2::AutomaticR2f1b
     );
     assert_eq!(
         resolve_execution_policy_v1(

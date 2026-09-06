@@ -458,7 +458,7 @@ pub enum PolicyActivationV1 {
 
 #[must_use]
 pub const fn scheduler_activation_readiness_v1() -> SchedulerActivationReadinessV1 {
-    SchedulerActivationReadinessV1::Disarmed
+    SchedulerActivationReadinessV1::Armed
 }
 
 #[must_use]

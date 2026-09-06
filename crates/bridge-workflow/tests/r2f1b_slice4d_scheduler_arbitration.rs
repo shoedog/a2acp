@@ -321,11 +321,11 @@ fn completion_outprioritizes_durable_barrier_acknowledgement() {
 }
 
 #[test]
-fn disarmed_production_still_cannot_construct_automatic_attempt() {
+fn shipped_production_constructs_an_automatic_attempt() {
     let readiness = scheduler_activation_readiness_v1();
-    assert_eq!(readiness, SchedulerActivationReadinessV1::Disarmed);
+    assert_eq!(readiness, SchedulerActivationReadinessV1::Armed);
     assert_eq!(
         deadline_activation_v2_for(readiness, PolicyActivationV1::Production),
-        DeadlineActivationV2::ManualOnlyR2f1a
+        DeadlineActivationV2::AutomaticR2f1b
     );
 }

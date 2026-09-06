@@ -1,17 +1,17 @@
 # Bridge reliability execution and handoff roadmap
 
 - **Program status:** active P0
-- **Current main lineage:** `origin/main` is `636979e27eee428981712c506435e0e151ee80a1`, the merge of provider
-  compatibility/runbook PR #98 with parents `936534d8cffb225249a5eeccd5874552dc97e961` and
-  `91606a956284447d8fad83eef78f99c3675650ba`. Its ancestry contains OpenCode Go documentation PR #97, provider
-  runtime-dispatch PR #96, provider refresh PRs #90-#95, and R2f1b 4H-2 merge PR #89 at
-  `54529b1d83a9fbe97d400cded02dcfbdf69683e3`. PR #98 does not contain, discharge, or merge 4I.
-- **Completed through:** R2f1b 4H-2 is **MERGED** by PR #89 at `54529b1d83a9fbe97d400cded02dcfbdf69683e3`;
-  its approved review and configured-suite evidence remain in the
-  [4H-2 handoff](superpowers/reviews/2026-08-24-r2f1b-slice4h2-handoff.md). PR #90 changes provider tooling
-  after that reliability boundary but does not discharge 4I or authorize 4J.
-- **Active slice:** **R2f1b 4I APPROVED / CURRENT-TARGET INTEGRATED / AGGREGATE VERIFIED /
-  PUBLISHED AS PR #99 / CI PENDING / NOT MERGED / 4J AND R3 REMAIN DISARMED (2026-09-05).**
+- **Current main lineage:** `origin/main` is `065935e0b3dccfa4338c6fdbedbfda03658cca70`, the merge of R2f1b 4I
+  PR #99 with parents `636979e27eee428981712c506435e0e151ee80a1` and
+  `47883bad2b2170e15d37c02573aaedbe3e134314`. Its ancestry contains provider compatibility/runbook PR #98,
+  OpenCode Go documentation PR #97, provider runtime-dispatch PR #96, provider refresh PRs #90-#95, and R2f1b
+  4H-2 merge PR #89 at `54529b1d83a9fbe97d400cded02dcfbdf69683e3`.
+- **Completed through:** R2f1b 4I is **MERGED** by PR #99 at
+  `065935e0b3dccfa4338c6fdbedbfda03658cca70`; its approved review and aggregate verification remain in the
+  [4I handoff](superpowers/reviews/2026-09-05-r2f1b-slice4i-handoff.md).
+- **Active slice:** **R2f1b 4J PRODUCTION ARMING APPROVED / PENDING PUBLICATION / ASTRA REVIEW 1 OF 1 CONSUMED /
+  58 OF 80 ADDED NONBLANK FORMATTED RUST LINES / NO LIVE, PROVIDER, OR OPERATOR EFFECTS
+  (2026-09-06).**
   The prior
   [Astra cumulative rereview](superpowers/reviews/2026-09-05-r2f1b-slice4i-astra-rereview.md) returned **REVISE — 1
   remaining WRONG / 0 SMELL** at exact `f7917e3a`: duration-only `max` composition emitted `Unknown/60000` for
@@ -37,8 +37,7 @@
   totals. Its sole deferred smell was an overbroad documentation inference from node-future lifetime; the current
   docs narrow that claim to the tested one-active-prompt fixture because preflight/retry paths can contribute earlier
   same-node cleanup intervals. No Rust correction was requested or made. No provider, registry/image, compatibility,
-  live smoke, release, deployment, merge, or running-operator effect was exercised; the only public effect was the
-  separately authorized branch push and PR creation.
+  live smoke, release, deployment, or running-operator effect was exercised by the 4I lane.
   The approved delta is now composed without conflict onto exact current target
   `636979e27eee428981712c506435e0e151ee80a1` as integration commit
   `7169948a3d150694c2f367c53f7c6ce6ce0c4041`, tree
@@ -50,9 +49,25 @@
   all-target/all-feature build, release-bin build, and candidate-built hygiene **41 / 9**; the serialized all-target
   suite passed **86 summaries / 4,390 / 0 / 13 ignored / 714 filtered**, and doctests passed **16 summaries / 2 / 0**,
   for **102 summaries / 4,392 passed / 0 failed / 13 ignored / 714 filtered**. Branch
-  `integrate/r2f1b-4i-current-20260905` is published as [PR #99](https://github.com/shoedog/a2acp/pull/99);
-  CI and merge remain pending and separately gated.
-  `scheduler_activation_readiness_v1()` remains `Disarmed`; 4J stays parked behind an approved 4I closure.
+  `integrate/r2f1b-4i-current-20260905` was merged as [PR #99](https://github.com/shoedog/a2acp/pull/99) at
+  `065935e0b3dccfa4338c6fdbedbfda03658cca70` after Build/Lint/Coverage, Test uninstrumented, Bridge Store macOS,
+  Windows unsupported target, and CLA checks all succeeded. The separately authorized 4J candidate at code
+  checkpoint `04a8e519789fb56498c5cc3c53838565cef817c9`, tree
+  `4d8aaf1a51a130a90079e62b4d4ddc3a29f6e6ed`, now changes only the production readiness function from `Disarmed`
+  to `Armed` plus expectation-only tests, measuring **58 / 80** added nonblank formatted Rust lines. Exact-base RED
+  was **0 / 1**. Its trusted-root production mutation passed warnings-denied Clippy and reddened exactly 10
+  arming-sensitive tests across 9 targets (**86 summaries / 4,380 / 10 / 13 ignored / 714 filtered**); restoration
+  passed the same full population (**86 / 4,390 / 0 / 13 / 714**) plus doctests (**16 / 2 / 0**), for aggregate
+  **102 summaries / 4,392 / 0 / 13 / 714**. Format/diff, locked workspace check, warnings-denied locked
+  all-target/all-feature Clippy, locked all-target/all-feature build, release-bin build, and candidate-built hygiene
+  **41 / 9** are green. The
+  [single authorized Astra review](superpowers/reviews/2026-09-06-r2f1b-slice4j-astra-review.md) bound exact candidate
+  `d74ccbe9b95cfbdf66ef87427a89300e4591cc2c`, tree
+  `e69212bc236c33aa43bb3cc96d2e8212b24a6813`, independently confirmed the **58 / 80** Rust count, and returned
+  **APPROVE — 0 WRONG / 1 SMELL-DEFER**. Its deferred smell is that normal-production cleanup-deadline coverage is
+  indirect: fixtures force activation with a protected backend while normal CLI/coordinator admission carries no
+  supplied R2f1b contract. It found no shipped trigger with an incorrect result. The review cap is consumed; no live,
+  provider, deployment, or running-operator effect was exercised, and publication remains separately unauthorized.
   [ADR-0040](adr/0040-parallel-implementor-flight.md) owns the frozen-base ownership protocol,
   explicit current-target integration, per-run resume/merge lock, conflict retention, and aggregate verification
   boundary. R2f design is **APPROVED** and R2f0a is merged. Its integrated
