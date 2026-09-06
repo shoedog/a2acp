@@ -10,8 +10,10 @@ effects; no publication authority.
 ## Current disposition
 
 PR #99 is merged and its required CI is green. The four inherited custody documents have been reconciled to
-that public fact. 4J is **IMPLEMENTED / FOCUSED GREEN / HOST FULL GATES PENDING**: the sole production change
-makes `scheduler_activation_readiness_v1()` return `Armed`; expectation-only test changes preserve explicit
+that public fact. 4J is **IMPLEMENTED / FULLY VERIFIED / ASTRA REVIEW 1 OF 1 PENDING** at code checkpoint
+`04a8e519789fb56498c5cc3c53838565cef817c9`, tree
+`4d8aaf1a51a130a90079e62b4d4ddc3a29f6e6ed`: the sole production change makes
+`scheduler_activation_readiness_v1()` return `Armed`; expectation-only test changes preserve explicit
 `Disarmed`, `ManualTest`, watchdog-refusal, and manual workload-identity controls.
 
 ## Bound implementation
@@ -24,10 +26,10 @@ fallback.
 
 ## Resume order
 
-1. Preserve the exact-base documentation checkpoint `98fbca42` and this code checkpoint.
-2. Run and restore the production-`Disarmed` host full-suite mutation control; its control must pass Clippy.
-3. Run the complete candidate host gate set and record exact totals.
-4. Commit the frozen verified candidate and dispatch exactly one Astra hard-read-only review.
+1. Preserve exact-base documentation checkpoint `98fbca42` and verified code checkpoint `04a8e519`.
+2. Commit this evidence-only custody refresh and dispatch exactly one Astra hard-read-only review of the frozen
+   exact-base candidate.
+3. At the one-round cap, record and classify the verdict. Do not publish, deploy, smoke, or mutate the operator.
 
 ## Stop conditions
 
@@ -44,7 +46,7 @@ merge, smoke, compatibility execution, release, deployment, and running-operator
 | Production flip | done | One production line: `Disarmed` to `Armed`; no second switch or mechanism. |
 | Rust cap | green | 58 / 80 added nonblank formatted lines across production and tests. |
 | Focused gates | green | 65 passed / 0 failed across readiness, policy, fixed grace, admission/watchdog, scheduler, wiring, ownerless proof, graph fingerprint, and V3 workload identity. |
-| Full mutation population | pending | — |
-| Full candidate gates | host pending | Sandbox runs reproduced 19 failing targets on candidate and exact base; candidate-only four stale arming assertions were corrected. Logs: candidate `de92887b...e1139c59e`, base `4dbc96a0...ac86fc`, serialized candidate after repair `b551a968...5d0fcf7`. The remaining failures are sandbox-denied loopback/process probes and unavailable Go LSP; they are not a green full gate. |
+| Full mutation population | red as required | The one-line `Armed` to `Disarmed` mutation passed warnings-denied Clippy, then the trusted-root serialized full suite produced exactly **86 summaries / 4,380 passed / 10 failed / 13 ignored / 714 filtered** across 9 arming-sensitive targets. Mutation-suite log SHA-256 `bd49cf618eaacd199cdfd62c1a59e17e4f2845f17e7de18a66dc1719c21a9264`; mutation-Clippy log SHA-256 `7ab65d6abad217e0bab0686577f492d10392680d0ace39cd49556e09e2f49f9f`. An earlier outside-trusted-root run also failed the foundation CLI for its own cwd-refusal reason and is inadmissible; the trusted-root rerun supersedes it and passed that target 33 / 0. |
+| Full candidate gates | green | Restored trusted-root serialized all-target suite: **86 summaries / 4,390 passed / 0 failed / 13 ignored / 714 filtered**, log SHA-256 `9006ea7871cc07365cb5ef56dca64dae6b9b5a94396deccaaedc011640c88ca8`. Doctests: **16 summaries / 2 / 0 / 0 ignored**, for aggregate **102 summaries / 4,392 passed / 0 failed / 13 ignored / 714 filtered**. Format, diff, locked all-target/all-feature check, warnings-denied Clippy, locked all-target/all-feature build, release-bin build, and candidate-built hygiene **41 / 9** are green. The 13 ignored tests require live authenticated ACP/Kiro/Ollama or a Docker daemon and were not run under this no-effects authority. |
 | Astra review round 1/1 | pending | — |
 | External effects | fenced | No live/provider/operator effect authorized. |

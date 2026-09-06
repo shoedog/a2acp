@@ -9,8 +9,8 @@
 - **Completed through:** R2f1b 4I is **MERGED** by PR #99 at
   `065935e0b3dccfa4338c6fdbedbfda03658cca70`; its approved review and aggregate verification remain in the
   [4I handoff](superpowers/reviews/2026-09-05-r2f1b-slice4i-handoff.md).
-- **Active slice:** **R2f1b 4J PRODUCTION ARMING IMPLEMENTATION/REVIEW AUTHORIZED FROM CURRENT MAIN /
-  80 ADDED NONBLANK FORMATTED RUST LINES / ONE REVIEW ROUND / NO LIVE, PROVIDER, OR OPERATOR EFFECTS
+- **Active slice:** **R2f1b 4J PRODUCTION ARMING IMPLEMENTED AND FULLY VERIFIED FROM CURRENT MAIN / ASTRA REVIEW
+  1 OF 1 PENDING / 58 OF 80 ADDED NONBLANK FORMATTED RUST LINES / NO LIVE, PROVIDER, OR OPERATOR EFFECTS
   (2026-09-06).**
   The prior
   [Astra cumulative rereview](superpowers/reviews/2026-09-05-r2f1b-slice4i-astra-rereview.md) returned **REVISE — 1
@@ -51,9 +51,17 @@
   for **102 summaries / 4,392 passed / 0 failed / 13 ignored / 714 filtered**. Branch
   `integrate/r2f1b-4i-current-20260905` was merged as [PR #99](https://github.com/shoedog/a2acp/pull/99) at
   `065935e0b3dccfa4338c6fdbedbfda03658cca70` after Build/Lint/Coverage, Test uninstrumented, Bridge Store macOS,
-  Windows unsupported target, and CLA checks all succeeded. `scheduler_activation_readiness_v1()` remains
-  `Disarmed` on merged main; the separately authorized 4J lane may now implement and review only, with no live,
-  provider, deployment, or running-operator effect.
+  Windows unsupported target, and CLA checks all succeeded. The separately authorized 4J candidate at code
+  checkpoint `04a8e519789fb56498c5cc3c53838565cef817c9`, tree
+  `4d8aaf1a51a130a90079e62b4d4ddc3a29f6e6ed`, now changes only the production readiness function from `Disarmed`
+  to `Armed` plus expectation-only tests, measuring **58 / 80** added nonblank formatted Rust lines. Exact-base RED
+  was **0 / 1**. Its trusted-root production mutation passed warnings-denied Clippy and reddened exactly 10
+  arming-sensitive tests across 9 targets (**86 summaries / 4,380 / 10 / 13 ignored / 714 filtered**); restoration
+  passed the same full population (**86 / 4,390 / 0 / 13 / 714**) plus doctests (**16 / 2 / 0**), for aggregate
+  **102 summaries / 4,392 / 0 / 13 / 714**. Format/diff, locked workspace check, warnings-denied locked
+  all-target/all-feature Clippy, locked all-target/all-feature build, release-bin build, and candidate-built hygiene
+  **41 / 9** are green. The only remaining lane gate is the single authorized Astra hard-read-only review; no live,
+  provider, deployment, or running-operator effect was exercised.
   [ADR-0040](adr/0040-parallel-implementor-flight.md) owns the frozen-base ownership protocol,
   explicit current-target integration, per-run resume/merge lock, conflict retention, and aggregate verification
   boundary. R2f design is **APPROVED** and R2f0a is merged. Its integrated
