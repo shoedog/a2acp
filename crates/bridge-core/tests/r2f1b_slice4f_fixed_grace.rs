@@ -52,20 +52,22 @@ fn armed_timer(ordinal: u32) -> FixedGraceTimerV1 {
 }
 
 #[test]
-fn fixed_grace_admission_and_shipped_refusal_are_gated_by_frozen_activation() {
+fn fixed_grace_admission_and_shipped_activation_are_gated_by_frozen_readiness() {
     let readiness = scheduler_activation_readiness_v1();
-    assert_eq!(readiness, Readiness::Disarmed);
-    let inactive = resolve(GRACE_MS, readiness).unwrap_err();
+    assert_eq!(readiness, Readiness::Armed);
+    let inactive = resolve(GRACE_MS, Readiness::Disarmed).unwrap_err();
     assert_eq!(inactive, PolicyError::FixedGraceInactive);
     let shipped = resolve_execution_policy_v1(
         &workflow(GRACE_MS),
         &ExecutionPolicyInvocationV1::default(),
         false,
         PolicyActivationV1::Production,
+    )
+    .unwrap();
+    assert_eq!(
+        shipped.deadline_activation,
+        DeadlineActivationV2::AutomaticR2f1b
     );
-    assert_eq!(shipped.unwrap_err(), PolicyError::FixedGraceInactive);
-    let activation = resolve(GRACE_MS, Readiness::Armed).unwrap();
-    assert_eq!(activation, DeadlineActivationV2::AutomaticR2f1b);
     for grace_ms in [0, NODE_DEADLINE_MS + 1] {
         let invalid = resolve(grace_ms, Readiness::Armed).unwrap_err();
         assert_eq!(invalid, PolicyError::InvalidFixedGrace);

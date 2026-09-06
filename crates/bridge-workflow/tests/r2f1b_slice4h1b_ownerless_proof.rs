@@ -28,7 +28,7 @@ fn bridge_workflow_constructs_ownerless_observation_only_from_transfer_mint() {
 }
 
 #[test]
-fn ownerless_proof_wiring_keeps_production_disarmed() {
+fn ownerless_proof_wiring_survives_production_arming() {
     let _proof_slot = |transfer: CleanupDeadlineTransferV1| {
         matches!(
             transfer,
@@ -36,9 +36,9 @@ fn ownerless_proof_wiring_keeps_production_disarmed() {
         )
     };
     let readiness = scheduler_activation_readiness_v1();
-    assert_eq!(readiness, SchedulerActivationReadinessV1::Disarmed);
+    assert_eq!(readiness, SchedulerActivationReadinessV1::Armed);
     assert_eq!(
         deadline_activation_v2_for(readiness, PolicyActivationV1::Production),
-        DeadlineActivationV2::ManualOnlyR2f1a
+        DeadlineActivationV2::AutomaticR2f1b
     );
 }

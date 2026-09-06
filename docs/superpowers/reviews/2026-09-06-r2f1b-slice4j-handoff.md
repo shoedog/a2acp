@@ -10,8 +10,9 @@ effects; no publication authority.
 ## Current disposition
 
 PR #99 is merged and its required CI is green. The four inherited custody documents have been reconciled to
-that public fact. 4J is **AUTHORIZED / PRE-RUST**: the production change is still absent and
-`scheduler_activation_readiness_v1()` still returns `Disarmed`.
+that public fact. 4J is **IMPLEMENTED / FOCUSED GREEN / HOST FULL GATES PENDING**: the sole production change
+makes `scheduler_activation_readiness_v1()` return `Armed`; expectation-only test changes preserve explicit
+`Disarmed`, `ManualTest`, watchdog-refusal, and manual workload-identity controls.
 
 ## Bound implementation
 
@@ -23,12 +24,10 @@ fallback.
 
 ## Resume order
 
-1. Commit this merge reconciliation and 4J task boundary as a stable documentation checkpoint.
-2. Establish the exact-base shipped-readiness RED before changing production.
-3. Flip only the readiness return value, repair expectation-only regressions, enforce the 80-line cap, and run
-   focused plus full candidate gates.
-4. Run and restore the production-Disarmed full-suite mutation control.
-5. Commit the frozen candidate and dispatch exactly one Astra hard-read-only review.
+1. Preserve the exact-base documentation checkpoint `98fbca42` and this code checkpoint.
+2. Run and restore the production-`Disarmed` host full-suite mutation control; its control must pass Clippy.
+3. Run the complete candidate host gate set and record exact totals.
+4. Commit the frozen verified candidate and dispatch exactly one Astra hard-read-only review.
 
 ## Stop conditions
 
@@ -41,11 +40,11 @@ merge, smoke, compatibility execution, release, deployment, and running-operator
 | Gate | State | Evidence |
 |---|---|---|
 | PR #99 merge reconciliation | done | Merge `065935e0`; required GitHub checks succeeded. |
-| Exact-base RED | pending | — |
-| Production flip | pending | — |
-| Rust cap | pending | Maximum 80. |
-| Focused gates | pending | — |
+| Exact-base RED | done | `0 / 1`, observed `Disarmed` versus required `Armed`; log SHA-256 `18a7e3d98dca2e0c0ecc2ba2f6437f5153d97b70f758fc77331f60ef803b1604`. |
+| Production flip | done | One production line: `Disarmed` to `Armed`; no second switch or mechanism. |
+| Rust cap | green | 58 / 80 added nonblank formatted lines across production and tests. |
+| Focused gates | green | 65 passed / 0 failed across readiness, policy, fixed grace, admission/watchdog, scheduler, wiring, ownerless proof, graph fingerprint, and V3 workload identity. |
 | Full mutation population | pending | — |
-| Full candidate gates | pending | — |
+| Full candidate gates | host pending | Sandbox runs reproduced 19 failing targets on candidate and exact base; candidate-only four stale arming assertions were corrected. Logs: candidate `de92887b...e1139c59e`, base `4dbc96a0...ac86fc`, serialized candidate after repair `b551a968...5d0fcf7`. The remaining failures are sandbox-denied loopback/process probes and unavailable Go LSP; they are not a green full gate. |
 | Astra review round 1/1 | pending | — |
 | External effects | fenced | No live/provider/operator effect authorized. |

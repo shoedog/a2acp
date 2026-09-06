@@ -158,7 +158,7 @@ fn frozen_source(admitted: &bridge_workflow::admission::AdmittedWorkflowRunV1) -
 }
 
 #[tokio::test]
-async fn disarmed_production_admission_never_obtains_automatic_activation() {
+async fn armed_production_admission_obtains_automatic_activation() {
     assert_eq!(
         cleanup_deadline_after_cancellation_ms_v1(0, 7_200_000),
         60_000
@@ -170,31 +170,33 @@ async fn disarmed_production_admission_never_obtains_automatic_activation() {
             None,
         ))
         .await
-        .expect("disarmed production admission must succeed");
+        .expect("armed production admission must succeed");
     assert_eq!(
         admitted.run_spec.controls.deadline_activation,
-        DeadlineActivationV2::ManualOnlyR2f1a
+        DeadlineActivationV2::AutomaticR2f1b
     );
 }
 
 #[tokio::test]
-async fn manual_activation_admits_legacy_watchdog_configuration() {
+async fn automatic_activation_refuses_legacy_watchdog_configuration() {
     let mut configured = entry();
     configured.watchdog = Some(WatchdogConfig {
         idle_timeout: std::time::Duration::from_secs(30),
         hard_wall_clock: std::time::Duration::from_secs(60),
     });
-    let admitted = admission(configured, "/launch")
+    let refused = admission(configured, "/launch")
         .freeze(request(
             AttemptIdentity::initial().unwrap().attempt_id,
             graph(),
             None,
         ))
-        .await
-        .expect("manual activation must retain legacy watchdog behavior");
-    assert_eq!(
-        admitted.run_spec.controls.deadline_activation,
-        DeadlineActivationV2::ManualOnlyR2f1a
+        .await;
+    let Err(BridgeError::ConfigInvalid { reason }) = refused else {
+        panic!("automatic activation with a legacy watchdog must refuse");
+    };
+    assert!(
+        reason.contains("automatic R2f1b deadline activation is incompatible"),
+        "unexpected refusal: {reason}"
     );
 }
 
