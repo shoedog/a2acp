@@ -9,8 +9,8 @@
 - **Completed through:** R2f1b 4I is **MERGED** by PR #99 at
   `065935e0b3dccfa4338c6fdbedbfda03658cca70`; its approved review and aggregate verification remain in the
   [4I handoff](superpowers/reviews/2026-09-05-r2f1b-slice4i-handoff.md).
-- **Active slice:** **R2f1b 4J PRODUCTION ARMING IMPLEMENTED AND FULLY VERIFIED FROM CURRENT MAIN / ASTRA REVIEW
-  1 OF 1 PENDING / 58 OF 80 ADDED NONBLANK FORMATTED RUST LINES / NO LIVE, PROVIDER, OR OPERATOR EFFECTS
+- **Active slice:** **R2f1b 4J PRODUCTION ARMING APPROVED / PENDING PUBLICATION / ASTRA REVIEW 1 OF 1 CONSUMED /
+  58 OF 80 ADDED NONBLANK FORMATTED RUST LINES / NO LIVE, PROVIDER, OR OPERATOR EFFECTS
   (2026-09-06).**
   The prior
   [Astra cumulative rereview](superpowers/reviews/2026-09-05-r2f1b-slice4i-astra-rereview.md) returned **REVISE — 1
@@ -60,8 +60,14 @@
   passed the same full population (**86 / 4,390 / 0 / 13 / 714**) plus doctests (**16 / 2 / 0**), for aggregate
   **102 summaries / 4,392 / 0 / 13 / 714**. Format/diff, locked workspace check, warnings-denied locked
   all-target/all-feature Clippy, locked all-target/all-feature build, release-bin build, and candidate-built hygiene
-  **41 / 9** are green. The only remaining lane gate is the single authorized Astra hard-read-only review; no live,
-  provider, deployment, or running-operator effect was exercised.
+  **41 / 9** are green. The
+  [single authorized Astra review](superpowers/reviews/2026-09-06-r2f1b-slice4j-astra-review.md) bound exact candidate
+  `d74ccbe9b95cfbdf66ef87427a89300e4591cc2c`, tree
+  `e69212bc236c33aa43bb3cc96d2e8212b24a6813`, independently confirmed the **58 / 80** Rust count, and returned
+  **APPROVE — 0 WRONG / 1 SMELL-DEFER**. Its deferred smell is that normal-production cleanup-deadline coverage is
+  indirect: fixtures force activation with a protected backend while normal CLI/coordinator admission carries no
+  supplied R2f1b contract. It found no shipped trigger with an incorrect result. The review cap is consumed; no live,
+  provider, deployment, or running-operator effect was exercised, and publication remains separately unauthorized.
   [ADR-0040](adr/0040-parallel-implementor-flight.md) owns the frozen-base ownership protocol,
   explicit current-target integration, per-run resume/merge lock, conflict retention, and aggregate verification
   boundary. R2f design is **APPROVED** and R2f0a is merged. Its integrated
