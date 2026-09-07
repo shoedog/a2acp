@@ -1,8 +1,9 @@
-# Handoff - R2f1b slice 5B V3 detached storage repair
+# Handoff - R2f1b slice 5B V3 detached storage repair stop
 
 **Written:** 2026-09-07
 **Workspace:** `/Users/wesleyjinks/code/.a2a-implement/impl-14595-hlw4mgvd`
 **Pre-repair candidate:** `6193f63022ac10c8057f398deba3c9abb0c2e7ce`, tree `9d59475c49f6af3bc654d59947dfafdf312825bb`
+**Reviewed repaired candidate:** `abb881b90850ec01ca3ba8dd274002ac23e227cd`, tree `7b924e1ecb109bc527cd050eedceee4484262ca5`
 **Exact base:** `43b65d42a83b02ab4041a6680ea5c85fc6d00d82` (PR #101 / Slice 5A), tree `21103adb5a4916043d8802d01ac63408a41abbd8`
 **Required commit subject:** `feat: reserve R2f1b V3 detached storage`
 
@@ -12,15 +13,17 @@ This repair keeps Slice 5B storage-only and production-unwired. No served coordi
 
 The checkout was verified clean at pre-repair HEAD `6193f63022ac10c8057f398deba3c9abb0c2e7ce` and tree `9d59475c49f6af3bc654d59947dfafdf312825bb` before edits.
 
-## Repaired findings
+## Repair contents and final disposition
 
-1. Fresh automatic admission custody now has a public narrow verifier in `bridge-workflow::admission` that consumes the builder-owned private proof identity and requires the exact admitted run-spec `Arc` and exact admitted R2f1b contract `Arc`. `detached_v3_attempt_reservation` calls it before deriving the reservation. Tests cover exact builder-to-constructor-to-canonical-binder custody, direct construction refusal, and an equal-valued rewrapped public authority refusal.
-2. Atomic task admission now rejects opaque nonempty `workflow_spec_json`. The Memory and SQLite atomic V3 admission path validates compact canonical JSON shaped as V3, checks the root attempt, controls, graph roster, automatic R2f1b contract fingerprint, and binds the delivery workload plus contract fingerprint to the typed reservation workload before any task or history mutation. Tests cover malformed JSON, V2 bytes, noncanonical V3 bytes, and a different valid V3-shaped snapshot, with store state unchanged after each refusal.
-3. V3 task admission now persists a complete atomic-admission marker: Memory keeps an exact `(task_id, attempt_id)` marker, and SQLite stores `task_v3_atomic_admissions`. The marker binds the exact task/attempt, canonical snapshot JSON, and full node/resource-flight roster. Detached terminal CAS requires the marker and exact roster; staged-only rows, incomplete rows, and V1/V2 task paths cannot satisfy V3 terminal admission.
+1. Fresh automatic admission custody now has a public narrow verifier in `bridge-workflow::admission` that consumes the builder-owned private proof identity and requires the exact admitted run-spec `Arc` and exact admitted R2f1b contract `Arc`. `detached_v3_attempt_reservation` calls it before deriving the reservation. The final review found this mechanism closed.
+2. The candidate adds JSON-shape validation and selected-field binding before atomic task mutation, but the final review proved it is not the authoritative typed `WorkflowSnapshotV3` decoder: genuine builder-encoded bytes can be refused, while fabricated selectively valid bytes can pass.
+3. The candidate persists a complete atomic-admission marker in Memory and SQLite, and the initial apply path requires it. The final review proved both replay branches run before that requirement, so matching V1/V2 or staged legacy-terminal states can incorrectly return `Replayed` without V3 admission.
 4. Terminal projection readiness no longer erases immutable replay evidence. Memory retains a replay copy after `mark_terminal_projection_ready`; SQLite leaves `terminal_projection_attempt_id`, `terminal_projection_json`, terminal sequence, and workflow outcome intact. Apply -> mark-ready -> exact replay returns the original sequence and writes no second journal row, including after SQLite reopen; changed payloads still conflict without mutation.
 5. Resource-flight identity uniqueness is now global across existing task-side V3 reservations in Memory and SQLite. Both atomic admission and staged row reservation refuse a second task attempting to reuse an existing V3 resource flight before partial mutation.
 
 The stale-writer regression remains explicitly guarded by the exact current-attempt predicate in `compare_set_detached_terminal_v3` and by the parity test `memory_and_sqlite_v3_stale_terminal_writer_is_rejected_without_mutation`, which asserts the successor locator remains current and no task, pending projection, journal, or node-evidence mutation occurs after a stale attempt write.
+
+Final hard-read-only review execution `exec-d1698e074e060fcb38ab30687e9f8d27`, attempt `attempt-1a671927756a5f036c183c54a3552119`, used raw `gpt-5.6-sol`/`xhigh` and returned **VERDICT: REJECT / WRONG_COUNT: 2 / SMELL_COUNT: 2**. The two WRONG blockers are the non-authoritative snapshot decoder and replay-before-marker classification above. The two deferred SMELLs are missing staged/concurrent resource-flight uniqueness coverage and missing upgraded pre-5B database lifecycle coverage.
 
 ## Evidence
 
@@ -48,6 +51,6 @@ Changed-tree verification in the same immutable offline image:
 
 Production Rust line count against `43b65d42a83b02ab4041a6680ea5c85fc6d00d82`: **922 added production logical lines**. Method: `git diff --unified=0 43b65d42 --` over the five allowed production Rust files, exclude tests and additions after their test-module boundaries, then exclude blank lines, comments/docstrings, `#[cfg(test)]`, and delimiter-only structural lines. Documentation and test additions are excluded.
 
-## Remaining controller-owned gates
+## Convergence stop
 
-One final `gpt-5.6-sol`/`xhigh` hard-read-only rereview remains. No publication, push, PR, merge, release, deployment, live smoke, compatibility case, or running-operator mutation is authorized or claimed.
+The authorized one repair turn and one final rereview are exhausted. The reviewed code commit `abb881b90850ec01ca3ba8dd274002ac23e227cd` remains rejected and must not be published or merged. No further repair, review, push, PR, merge, release, deployment, live smoke, compatibility case, or running-operator mutation is authorized or claimed. A new owner-authorized bounded repair must address both WRONG findings on this existing artifact; it must not restart from scratch.
