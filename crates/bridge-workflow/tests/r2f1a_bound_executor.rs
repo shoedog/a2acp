@@ -1594,11 +1594,17 @@ impl bridge_workflow::admission::WorkflowCheckoutPlannerV1 for WorktreeAdmission
     }
 }
 
-/// Drive the REAL `WorkflowAdmissionV1::freeze`, optionally offering a contract covering every
-/// frozen worktree checkout it produces.
+#[derive(Clone, Copy)]
+enum BinderAdmissionCase {
+    V2,
+    ManualContract,
+    FreshV3,
+}
+
+/// Drive the REAL admission API used by production binders.
 async fn admit_through_production_admission(
     registry: Arc<dyn AgentRegistry>,
-    with_contract: bool,
+    admission_case: BinderAdmissionCase,
 ) -> bridge_workflow::admission::AdmittedWorkflowRunV1 {
     use bridge_core::execution_policy::{
         FrozenCheckoutEffectV1, FrozenR2f1bContractV1, FrozenWorktreeCustodyPlanV1,
@@ -1638,8 +1644,15 @@ async fn admit_through_production_admission(
         },
         r2f1b,
     };
+    if matches!(admission_case, BinderAdmissionCase::FreshV3) {
+        return admission
+            .freeze_fresh_v3(attempt, request(None))
+            .await
+            .unwrap()
+            .admitted;
+    }
     let probe = admission.freeze(request(None)).await.unwrap();
-    if !with_contract {
+    if matches!(admission_case, BinderAdmissionCase::V2) {
         return probe;
     }
     let plans = probe.run_spec.node_execution_identities[0]
@@ -1678,7 +1691,7 @@ async fn admit_through_production_admission(
 }
 
 async fn run_through_production_binder(
-    with_contract: bool,
+    admission_case: BinderAdmissionCase,
 ) -> (Arc<Calls>, Arc<WorkflowRunSpecV1>) {
     let entry = Arc::new(entry());
     let calls = Arc::new(Calls::default());
@@ -1694,7 +1707,7 @@ async fn run_through_production_binder(
     });
     let admitted = admit_through_production_admission(
         registry.clone() as Arc<dyn AgentRegistry>,
-        with_contract,
+        admission_case,
     )
     .await;
     let run_spec = admitted.run_spec.clone();
@@ -1718,20 +1731,7 @@ async fn run_through_production_binder(
     (calls, run_spec)
 }
 
-/// R1's red test. An admitted `ManualOnlyR2f1a` contract must survive the real production binder
-/// and reach the backend as a custody binding.
-///
-/// Discriminates exactly the shipped defect: with the consumers calling `with_frozen_run_spec`
-/// (which hardcodes `r2f1b: None`) this asserts `custody().is_some()` on a spec that carries
-/// `None`, and it is the ONLY test that can — every other V3 test binds the contract by hand and
-/// so never exercises the handoff at all. A dropped contract means the worktree backend takes the
-/// V2 leg: legacy `add`, `.meta.json`, no custody record (pinned separately by
-/// `v3_path_writes_no_legacy_meta_json` at the backend boundary, which keys on this same
-/// `custody()` discriminator).
-#[tokio::test]
-async fn an_admitted_contract_survives_the_production_authority_binder() {
-    let (calls, run_spec) = run_through_production_binder(true).await;
-
+fn assert_single_worktree_custody(calls: &Calls, run_spec: &WorkflowRunSpecV1) {
     let specs = calls.bound_specs.lock().unwrap();
     assert_eq!(specs.len(), 1);
     let custody = specs[0]
@@ -1751,11 +1751,207 @@ async fn an_admitted_contract_survives_the_production_authority_binder() {
     assert_eq!(calls.legacy_configures.load(Ordering::SeqCst), 0);
 }
 
+/// An admitted `ManualOnlyR2f1a` contract must survive the real production binder.
+#[tokio::test]
+async fn an_admitted_contract_survives_the_production_authority_binder() {
+    let (calls, run_spec) =
+        run_through_production_binder(BinderAdmissionCase::ManualContract).await;
+    assert_single_worktree_custody(&calls, &run_spec);
+}
+
+#[tokio::test]
+async fn fresh_v3_automatic_contract_survives_the_production_authority_binder() {
+    let (calls, run_spec) = run_through_production_binder(BinderAdmissionCase::FreshV3).await;
+    assert_single_worktree_custody(&calls, &run_spec);
+}
+
+#[tokio::test]
+async fn fresh_v3_binder_refuses_missing_contract_for_fresh_proof() {
+    let entry = Arc::new(entry());
+    let calls = Arc::new(Calls::default());
+    let registry = Arc::new(BoundOnlyRegistry {
+        entry,
+        backend: Arc::new(RecordingBackend {
+            calls: calls.clone(),
+        }),
+        slot: Arc::new(()),
+        calls,
+        fail_preflight_ordinal: None,
+    });
+    let mut admitted = admit_through_production_admission(
+        registry as Arc<dyn AgentRegistry>,
+        BinderAdmissionCase::FreshV3,
+    )
+    .await;
+    let _removed_contract = admitted
+        .r2f1b
+        .take()
+        .expect("fresh V3 admission includes a public contract");
+
+    let run_spec = admitted.run_spec.clone();
+    let request = WorkflowRunContext {
+        session_cwd: run_spec.requested_session_cwd.clone(),
+        ..WorkflowRunContext::default()
+    };
+    let refused =
+        WorkflowDiagnosticContext::in_memory(request).with_admitted_workflow_run(admitted);
+    assert!(matches!(
+        refused,
+        Err(BridgeError::ConfigInvalid { reason })
+            if reason.contains("fresh R2f1b admission proof without its admitted contract")
+    ));
+}
+
+#[tokio::test]
+async fn fresh_v3_binder_refuses_replaced_equal_automatic_contract() {
+    let entry = Arc::new(entry());
+    let calls = Arc::new(Calls::default());
+    let registry = Arc::new(BoundOnlyRegistry {
+        entry,
+        backend: Arc::new(RecordingBackend {
+            calls: calls.clone(),
+        }),
+        slot: Arc::new(()),
+        calls,
+        fail_preflight_ordinal: None,
+    });
+    let mut admitted = admit_through_production_admission(
+        registry as Arc<dyn AgentRegistry>,
+        BinderAdmissionCase::FreshV3,
+    )
+    .await;
+    let original = admitted.r2f1b.as_ref().unwrap().clone();
+    let replacement = Arc::new((*original).clone());
+    assert_eq!(replacement.as_ref(), original.as_ref());
+    assert!(!Arc::ptr_eq(&replacement, &original));
+    admitted.r2f1b = Some(replacement);
+
+    let run_spec = admitted.run_spec.clone();
+    let request = WorkflowRunContext {
+        session_cwd: run_spec.requested_session_cwd.clone(),
+        ..WorkflowRunContext::default()
+    };
+    let refused =
+        WorkflowDiagnosticContext::in_memory(request).with_admitted_workflow_run(admitted);
+    assert!(matches!(
+        refused,
+        Err(BridgeError::ConfigInvalid { reason })
+            if reason.contains("proof does not match the admitted contract")
+    ));
+}
+
+#[tokio::test]
+async fn fresh_v3_binder_refuses_run_spec_from_another_genuine_admission() {
+    use bridge_core::execution_policy::HistoryAllocationKindV1;
+
+    fn direct_graph(workflow_id: &str, node_id: &str, prompt_template: &str) -> Arc<WorkflowGraph> {
+        Arc::new(WorkflowGraph {
+            id: WorkflowId::parse(workflow_id).unwrap(),
+            nodes: vec![WorkflowNode {
+                id: NodeId::parse(node_id).unwrap(),
+                agent: AgentId::parse("codex").unwrap(),
+                prompt_template: prompt_template.into(),
+                inputs: vec![],
+                retry: None,
+                harvest_sanitization: None,
+            }],
+            panel: None,
+            controls: Some(WorkflowControlDefaultsV1::default()),
+        })
+    }
+
+    let entry = Arc::new(entry());
+    let calls = Arc::new(Calls::default());
+    let registry = Arc::new(BoundOnlyRegistry {
+        entry,
+        backend: Arc::new(RecordingBackend {
+            calls: calls.clone(),
+        }),
+        slot: Arc::new(()),
+        calls,
+        fail_preflight_ordinal: None,
+    });
+    let source_cwd = SessionCwd::parse("/repo/source").unwrap();
+    let admission = bridge_workflow::admission::WorkflowAdmissionV1::new(
+        registry as Arc<dyn AgentRegistry>,
+        Arc::new(bridge_workflow::admission::DirectWorkflowCheckoutPlannerV1),
+        source_cwd.clone(),
+        None,
+    );
+    let attempt = bridge_core::ids::AttemptIdentity::initial().unwrap();
+    let attempt_id = attempt.attempt_id.clone();
+    let request = |graph| bridge_workflow::admission::WorkflowAdmissionRequestV1 {
+        attempt_id: attempt_id.clone(),
+        graph,
+        requested_session_cwd: Some(source_cwd.clone()),
+        policy_invocation: ExecutionPolicyInvocationV1::default(),
+        ledger_admission: LedgerAdmissionV1::HistoryLedgerAdmitted {
+            kind: HistoryAllocationKindV1::Configured,
+        },
+        r2f1b: None,
+    };
+    let fresh_a = admission
+        .freeze_fresh_v3(
+            attempt.clone(),
+            request(direct_graph("review-a", "review-node-a", "{{input}}")),
+        )
+        .await
+        .unwrap();
+    let fresh_b = admission
+        .freeze_fresh_v3(
+            attempt.clone(),
+            request(direct_graph(
+                "review-b",
+                "review-node-b",
+                "DIFFERENT {{input}}",
+            )),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(fresh_a.snapshot.attempt, attempt);
+    assert_eq!(fresh_b.snapshot.attempt, attempt);
+    assert_eq!(
+        fresh_a.admitted.run_spec.requested_session_cwd,
+        fresh_b.admitted.run_spec.requested_session_cwd
+    );
+    assert!(!Arc::ptr_eq(
+        &fresh_a.admitted.run_spec,
+        &fresh_b.admitted.run_spec
+    ));
+    assert_ne!(
+        serde_json::to_vec(&fresh_a.snapshot.delivery_spec).unwrap(),
+        serde_json::to_vec(&fresh_b.snapshot.delivery_spec).unwrap(),
+        "the fixture must produce two distinct delivery specs before mixing"
+    );
+    assert!(matches!(
+        fresh_a.admitted.run_spec.node_execution_identities[0].provider_attempts[0].checkout,
+        bridge_core::execution_policy::FrozenCheckoutEffectV1::Direct { .. }
+    ));
+    assert!(matches!(
+        fresh_b.admitted.run_spec.node_execution_identities[0].provider_attempts[0].checkout,
+        bridge_core::execution_policy::FrozenCheckoutEffectV1::Direct { .. }
+    ));
+
+    let mut mixed = fresh_a.admitted;
+    mixed.run_spec = fresh_b.admitted.run_spec.clone();
+    let request = WorkflowRunContext {
+        session_cwd: mixed.run_spec.requested_session_cwd.clone(),
+        ..WorkflowRunContext::default()
+    };
+    let refused = WorkflowDiagnosticContext::in_memory(request).with_admitted_workflow_run(mixed);
+    assert!(matches!(
+        refused,
+        Err(BridgeError::ConfigInvalid { reason })
+            if reason == "fresh R2f1b admission proof does not match the admitted run specification"
+    ));
+}
+
 /// The V2 negative through the SAME binder: admission with no contract still routes V2, so the
 /// test above cannot pass by making every run look V3.
 #[tokio::test]
 async fn an_admission_with_no_contract_still_routes_v2_through_the_same_binder() {
-    let (calls, _run_spec) = run_through_production_binder(false).await;
+    let (calls, _run_spec) = run_through_production_binder(BinderAdmissionCase::V2).await;
 
     let specs = calls.bound_specs.lock().unwrap();
     assert_eq!(specs.len(), 1);

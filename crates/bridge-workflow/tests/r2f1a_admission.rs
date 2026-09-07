@@ -2,10 +2,11 @@ use async_trait::async_trait;
 use bridge_core::domain::{AgentEntry, AgentKind, Effort, RegistrySnapshot, WatchdogConfig};
 use bridge_core::error::BridgeError;
 use bridge_core::execution_policy::{
-    cleanup_deadline_after_cancellation_ms_v1, freeze_worktree_checkout_v1, DeadlineActivationV2,
-    ExecutionPolicyInvocationV1, FrozenCheckoutEffectV1, FrozenProviderLogicalSessionV1,
-    HistoryAllocationKindV1, LedgerAdmissionV1, LivenessProfileIdV1, ProviderEffectKeyV1,
-    TaskClassV1, WorkflowControlDefaultsV1, WorktreeCheckoutInputV1,
+    cleanup_deadline_after_cancellation_ms_v1, freeze_direct_checkout_v1,
+    freeze_worktree_checkout_v1, DeadlineActivationV2, ExecutionPolicyInvocationV1,
+    FrozenCheckoutEffectV1, FrozenProviderLogicalSessionV1, HistoryAllocationKindV1,
+    LedgerAdmissionV1, LivenessProfileIdV1, ProviderEffectKeyV1, Sha256HexV1, TaskClassV1,
+    WorkflowControlDefaultsV1, WorktreeCheckoutInputV1,
 };
 use bridge_core::ids::{AgentId, AttemptIdentity, NodeId, WorkflowId};
 use bridge_core::ports::{AgentRegistry, Resolved};
@@ -17,6 +18,7 @@ use bridge_workflow::admission::{
 use bridge_workflow::graph::{WorkflowGraph, WorkflowNode};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 struct SnapshotRegistry {
@@ -643,4 +645,183 @@ async fn a_successor_attempt_identity_is_refused_by_fresh_admission() {
         reason.contains("fresh attempt identity"),
         "unexpected refusal reason: {reason}"
     );
+}
+
+struct FreshPlanner(Arc<AtomicUsize>, bool, bool);
+
+#[async_trait]
+impl WorkflowCheckoutPlannerV1 for FreshPlanner {
+    async fn freeze_checkout(
+        &self,
+        _entry: &AgentEntry,
+        input: &CheckoutPlanInputV1,
+    ) -> Result<FrozenCheckoutEffectV1, BridgeError> {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        if self.1 {
+            return Ok(freeze_direct_checkout_v1(input.source_cwd.clone()));
+        }
+        let second = matches!(
+            input.logical_session,
+            FrozenProviderLogicalSessionV1::Execute { .. }
+        );
+        Ok(FrozenCheckoutEffectV1::Worktree {
+            source_cwd: input.source_cwd.clone(),
+            canonical_source_cwd: SessionCwd::parse("/allowed/repo")?,
+            canonical_worktree_root: SessionCwd::parse("/worktrees")?,
+            worktree_owner: "owner1".into(),
+            target_cwd: SessionCwd::parse(if self.2 && second {
+                "/worktrees/second"
+            } else {
+                "/worktrees/first"
+            })?,
+            checkout_digest: Sha256HexV1::digest(b"same-checkout-digest"),
+        })
+    }
+}
+
+fn fresh_planner(
+    calls: &Arc<AtomicUsize>,
+    direct: bool,
+    conflict: bool,
+) -> Arc<dyn WorkflowCheckoutPlannerV1> {
+    Arc::new(FreshPlanner(calls.clone(), direct, conflict))
+}
+
+fn admission_with_planner(planner: Arc<dyn WorkflowCheckoutPlannerV1>) -> WorkflowAdmissionV1 {
+    WorkflowAdmissionV1::new(
+        Arc::new(SnapshotRegistry {
+            entry: Arc::new(entry()),
+        }),
+        planner,
+        SessionCwd::parse("/launch").unwrap(),
+        None,
+    )
+}
+
+async fn freeze_fresh_with(
+    planner: Arc<dyn WorkflowCheckoutPlannerV1>,
+    attempt: AttemptIdentity,
+) -> Result<bridge_workflow::admission::FreshWorkflowAdmissionV3, BridgeError> {
+    admission_with_planner(planner)
+        .freeze_fresh_v3(
+            attempt.clone(),
+            request(
+                attempt.attempt_id,
+                graph(),
+                Some(SessionCwd::parse("/allowed/repo").unwrap()),
+            ),
+        )
+        .await
+}
+
+#[tokio::test]
+async fn fresh_v3_admission_mints_automatic_worktree_contract_and_snapshot_in_one_pass() {
+    let attempt = AttemptIdentity::initial().unwrap();
+    let result = freeze_fresh_with(Arc::new(WorktreePlanner), attempt.clone())
+        .await
+        .unwrap();
+
+    let admitted_contract = &result.admitted.r2f1b.as_ref().unwrap().contract;
+    assert_eq!(result.snapshot.attempt, attempt);
+    assert_eq!(result.snapshot.r2f1b, *admitted_contract);
+    assert_eq!(*result.admitted.run_spec, result.snapshot.delivery_spec);
+    assert_eq!(
+        serde_json::to_vec(&*result.admitted.run_spec).unwrap(),
+        serde_json::to_vec(&result.snapshot.delivery_spec).unwrap()
+    );
+    assert_eq!(
+        admitted_contract.activation,
+        DeadlineActivationV2::AutomaticR2f1b
+    );
+    assert_eq!(admitted_contract.custody_plans.len(), 4);
+    assert_eq!(
+        result.snapshot.workload_identity().unwrap(),
+        bridge_workflow::run_spec::bound_workload_fingerprint_v2(
+            &result.snapshot.delivery_spec.workload_fingerprint,
+            DeadlineActivationV2::AutomaticR2f1b,
+            &admitted_contract.contract_fingerprint,
+        )
+    );
+    let encoded = result.snapshot.encode().unwrap();
+    assert_eq!(
+        bridge_workflow::run_spec::WorkflowSnapshotV3::decode(&encoded).unwrap(),
+        result.snapshot
+    );
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let deduped = freeze_fresh_with(
+        fresh_planner(&calls, false, false),
+        AttemptIdentity::initial().unwrap(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(calls.load(Ordering::SeqCst), 4);
+    assert_eq!(deduped.snapshot.r2f1b.custody_plans.len(), 1);
+    let direct_calls = Arc::new(AtomicUsize::new(0));
+    let direct = freeze_fresh_with(
+        fresh_planner(&direct_calls, true, false),
+        AttemptIdentity::initial().unwrap(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(direct_calls.load(Ordering::SeqCst), 4);
+    assert!(direct.snapshot.r2f1b.custody_plans.is_empty());
+}
+
+#[tokio::test]
+async fn fresh_v3_admission_refuses_bad_identity_and_supplied_contract_before_planning() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let admission = admission_with_planner(fresh_planner(&calls, true, false));
+    let attempt = AttemptIdentity::initial().unwrap();
+    for bad_attempt in [
+        attempt.clone().resume().unwrap(),
+        AttemptIdentity::initial().unwrap(),
+    ] {
+        let refused = admission
+            .freeze_fresh_v3(
+                bad_attempt,
+                request(
+                    attempt.attempt_id.clone(),
+                    graph(),
+                    Some(SessionCwd::parse("/allowed/repo").unwrap()),
+                ),
+            )
+            .await;
+        assert!(matches!(
+            refused,
+            Err(BridgeError::ConfigInvalid { reason }) if reason.contains("initial attempt identity")
+        ));
+    }
+
+    let mut supplied = request(
+        attempt.attempt_id.clone(),
+        graph(),
+        Some(SessionCwd::parse("/allowed/repo").unwrap()),
+    );
+    supplied.r2f1b = Some(bridge_workflow::admission::R2f1bAdmissionV1 {
+        attempt: attempt.clone(),
+        contract: bridge_core::execution_policy::FrozenR2f1bContractV1::with_computed_fingerprint(
+            DeadlineActivationV2::AutomaticR2f1b,
+            vec![],
+        )
+        .unwrap(),
+    });
+    let refused = admission.freeze_fresh_v3(attempt, supplied).await;
+    assert!(matches!(
+        refused,
+        Err(BridgeError::ConfigInvalid { reason }) if reason.contains("refuses caller-supplied contracts")
+    ));
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+    let conflict_calls = Arc::new(AtomicUsize::new(0));
+    let refused = freeze_fresh_with(
+        fresh_planner(&conflict_calls, false, true),
+        AttemptIdentity::initial().unwrap(),
+    )
+    .await;
+    assert!(matches!(
+        refused,
+        Err(BridgeError::ConfigInvalid { reason }) if reason.contains("conflicting targets")
+    ));
+    assert_eq!(conflict_calls.load(Ordering::SeqCst), 4);
 }

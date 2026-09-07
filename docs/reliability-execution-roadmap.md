@@ -1,89 +1,58 @@
 # Bridge reliability execution and handoff roadmap
 
 - **Program status:** active P0
-- **Current main lineage:** `origin/main` is `065935e0b3dccfa4338c6fdbedbfda03658cca70`, the merge of R2f1b 4I
-  PR #99 with parents `636979e27eee428981712c506435e0e151ee80a1` and
-  `47883bad2b2170e15d37c02573aaedbe3e134314`. Its ancestry contains provider compatibility/runbook PR #98,
-  OpenCode Go documentation PR #97, provider runtime-dispatch PR #96, provider refresh PRs #90-#95, and R2f1b
-  4H-2 merge PR #89 at `54529b1d83a9fbe97d400cded02dcfbdf69683e3`.
-- **Completed through:** R2f1b 4I is **MERGED** by PR #99 at
-  `065935e0b3dccfa4338c6fdbedbfda03658cca70`; its approved review and aggregate verification remain in the
-  [4I handoff](superpowers/reviews/2026-09-05-r2f1b-slice4i-handoff.md).
-- **Active slice:** **R2f1b 4J PRODUCTION ARMING APPROVED / PENDING PUBLICATION / ASTRA REVIEW 1 OF 1 CONSUMED /
-  58 OF 80 ADDED NONBLANK FORMATTED RUST LINES / NO LIVE, PROVIDER, OR OPERATOR EFFECTS
-  (2026-09-06).**
-  The prior
-  [Astra cumulative rereview](superpowers/reviews/2026-09-05-r2f1b-slice4i-astra-rereview.md) returned **REVISE — 1
-  remaining WRONG / 0 SMELL** at exact `f7917e3a`: duration-only `max` composition emitted `Unknown/60000` for
-  disjoint cleanup intervals `[0,1000]` and `[1000,61000]`, rather than the required union `Unknown/61000`. The owner
-  then explicitly renewed exactly one interval-endpoint/union repair and one final hard-read-only rereview, raising
-  the exact-base cap to **420 added nonblank formatted Rust lines** without any other scope expansion. Clean code
-  checkpoint `59896688f350fa6413740a2254ff0a4d610ece33`, tree
-  `e81f0256cec386a444fc56d282d4c36beeba2fde`, intentionally remains linear from frozen implementation base
-  `936534d8cffb225249a5eeccd5874552dc97e961` and measures **418 / 420**. Successful scheduler transfer settlement now
-  records exact `(anchor, now)` endpoints in the cleanup tracker's shared monotonic-clock domain; existing node and
-  workflow projections therefore use the established interval union while preserving `Failed` precedence and
-  transferred `Unknown` disposition. The production-path RED proved actual `Unknown/60000` at **0 / 1 / 165
-  filtered**; endpoint repair and the complete mux pass **1 / 0 / 165 filtered** and **14 / 0 / 152 filtered**. A
-  duration-space mutation reproduced **0 / 1 / 165 filtered**. Exact trusted-root all-target plus doctest evidence is
-  **102 summaries / 4,388 passed / 0 failed / 13 ignored / 714 filtered**; format, diff, locked check, warnings-denied
-  all-target/all-feature Clippy, locked all-target/all-feature build, release-bin build, and hygiene **41 / 9** are
-  green. The
-  [final owner-renewed Astra rereview](superpowers/reviews/2026-09-05-r2f1b-slice4i-astra-final-rereview.md) bound
-  exact candidate `0132e6bdb8724b29013b5fc2f740bc83c3cba21d`, tree
-  `5da71fcb9d2fe7083246c033d884a4eb07663fec`, executor blob
-  `7c59d597ed5c80382bef6a2c4c3ce81e23ed06be`, and returned **APPROVE — 0 WRONG / 1 SMELL-DEFER**. It independently
-  ran four focused tests (**4 / 0**) and recomputed the retained log hashes and **102 groups / 4,388 / 0 / 13 / 714**
-  totals. Its sole deferred smell was an overbroad documentation inference from node-future lifetime; the current
-  docs narrow that claim to the tested one-active-prompt fixture because preflight/retry paths can contribute earlier
-  same-node cleanup intervals. No Rust correction was requested or made. No provider, registry/image, compatibility,
-  live smoke, release, deployment, or running-operator effect was exercised by the 4I lane.
-  The approved delta is now composed without conflict onto exact current target
-  `636979e27eee428981712c506435e0e151ee80a1` as integration commit
-  `7169948a3d150694c2f367c53f7c6ce6ce0c4041`, tree
-  `b11d37e35357182e3444a3859a34d1c3cc722448`. Its executor blob remains exact
-  `7c59d597ed5c80382bef6a2c4c3ce81e23ed06be`, and the current-target delta is byte-identical to the approved 4I
-  branch delta under normalized `git diff` output (SHA-256
-  `6da5b5a3c1528731534cc5228c63e515485e570689499a550784d97e0d07c8f3`). Exact integrated aggregate gates are
-  green: format/diff, locked workspace check, warnings-denied locked all-target/all-feature Clippy, locked
-  all-target/all-feature build, release-bin build, and candidate-built hygiene **41 / 9**; the serialized all-target
-  suite passed **86 summaries / 4,390 / 0 / 13 ignored / 714 filtered**, and doctests passed **16 summaries / 2 / 0**,
-  for **102 summaries / 4,392 passed / 0 failed / 13 ignored / 714 filtered**. Branch
-  `integrate/r2f1b-4i-current-20260905` was merged as [PR #99](https://github.com/shoedog/a2acp/pull/99) at
-  `065935e0b3dccfa4338c6fdbedbfda03658cca70` after Build/Lint/Coverage, Test uninstrumented, Bridge Store macOS,
-  Windows unsupported target, and CLA checks all succeeded. The separately authorized 4J candidate at code
-  checkpoint `04a8e519789fb56498c5cc3c53838565cef817c9`, tree
-  `4d8aaf1a51a130a90079e62b4d4ddc3a29f6e6ed`, now changes only the production readiness function from `Disarmed`
-  to `Armed` plus expectation-only tests, measuring **58 / 80** added nonblank formatted Rust lines. Exact-base RED
-  was **0 / 1**. Its trusted-root production mutation passed warnings-denied Clippy and reddened exactly 10
-  arming-sensitive tests across 9 targets (**86 summaries / 4,380 / 10 / 13 ignored / 714 filtered**); restoration
-  passed the same full population (**86 / 4,390 / 0 / 13 / 714**) plus doctests (**16 / 2 / 0**), for aggregate
-  **102 summaries / 4,392 / 0 / 13 / 714**. Format/diff, locked workspace check, warnings-denied locked
-  all-target/all-feature Clippy, locked all-target/all-feature build, release-bin build, and candidate-built hygiene
-  **41 / 9** are green. The
-  [single authorized Astra review](superpowers/reviews/2026-09-06-r2f1b-slice4j-astra-review.md) bound exact candidate
-  `d74ccbe9b95cfbdf66ef87427a89300e4591cc2c`, tree
-  `e69212bc236c33aa43bb3cc96d2e8212b24a6813`, independently confirmed the **58 / 80** Rust count, and returned
-  **APPROVE — 0 WRONG / 1 SMELL-DEFER**. Its deferred smell is that normal-production cleanup-deadline coverage is
-  indirect: fixtures force activation with a protected backend while normal CLI/coordinator admission carries no
-  supplied R2f1b contract. It found no shipped trigger with an incorrect result. The review cap is consumed; no live,
-  provider, deployment, or running-operator effect was exercised, and publication remains separately unauthorized.
-  [ADR-0040](adr/0040-parallel-implementor-flight.md) owns the frozen-base ownership protocol,
-  explicit current-target integration, per-run resume/merge lock, conflict retention, and aggregate verification
-  boundary. R2f design is **APPROVED** and R2f0a is merged. Its integrated
-  [native macOS verification](superpowers/reviews/2026-07-25-r2f0a-integrated-native-verification.md),
-  [Sol/xhigh](superpowers/reviews/2026-07-25-r2f0a-integrated-final-sol-review.md), and
-  [Fable/xhigh](superpowers/reviews/2026-07-25-r2f0a-integrated-final-fable-review.md) evidence is green; both
-  reviews returned `APPROVE`, and PR #48's Build/Lint/Coverage, macOS store, Windows unsupported-target, and CLA
-  checks passed. The [initial R2f0p Sol review](superpowers/reviews/2026-07-30-r2f0p-sol-review.md) returned
-  `REVISE` on two closed concurrency `WRONG` findings and no `SMELL`; both bounded corrections and the
-  [corrected native gate](superpowers/reviews/2026-07-30-r2f0p-native-verification.md) are green. The
-  [Sol closure review](superpowers/reviews/2026-07-30-r2f0p-sol-closure-review.md) marked both inherited findings
-  `FIXED`, found no fresh `WRONG` or `SMELL`, and returned `APPROVE`. Exact closure head `cc9e4ca` passed the final
-  canonical suite and advanced `origin/main` from the frozen base with an exact force-with-lease. R2f0b's
-  [focused implementation boundary](superpowers/plans/2026-07-30-r2f0b-focused-boundary.md) was implemented from
-  exact main `1a8cfc0`; the operator-authored merge boundary is `4ffcd560`, with exact verified tree `8bc7e3c4`,
-  and post-merge fixture repair boundary is `2744cb1`.
+- **Current main lineage:** `origin/main` is `34ced0f93526f981a835c237c56d7ba580e989f4`, the merge of R2f1b
+  4J PR #100 with tree `192ba759a98eccbc9c5f21c187beddf8996c4463`. Its ancestry contains PR #99
+  (`065935e0`, R2f1b 4I), provider compatibility/runbook PR #98, OpenCode Go documentation PR #97, provider
+  runtime-dispatch PR #96, provider refresh PRs #90-#95, and R2f1b 4H-2 PR #89.
+- **Completed through:** R2f1b 4J is **MERGED** by PR #100 at
+  `34ced0f93526f981a835c237c56d7ba580e989f4`; its approved review and aggregate verification remain in the
+  [4J handoff](superpowers/reviews/2026-09-06-r2f1b-slice4j-handoff.md).
+- **Active slice:** **R2f1b 5A FRESH V3 ADMISSION AUTHORITY EXACT RUN-SPEC PROOF-BINDING REPAIR /
+  RETAINED PREDECESSOR `7d5cd283` / 120-LINE CONTINUATION / 656 CUMULATIVE RUST-LINE ARTIFACT / PRODUCTION-UNWIRED /
+  NO LIVE, PROVIDER, OR OPERATOR EFFECTS (2026-09-06).** 5A adds `WorkflowAdmissionV1::freeze_fresh_v3`,
+  an owned automatic-contract builder that validates a fresh root attempt, refuses caller-supplied contracts on this
+  path, performs one checkout-planning pass, mints custody plans with nonzero CSPRNG `WorktreeCustodyIdV1` values,
+  deduplicates identical checkout digests, refuses same-digest target conflicts, and returns matching
+  `AdmittedWorkflowRunV1` plus canonical `WorkflowSnapshotV3`. The final hard-read-only review of exact candidate
+  `7d5cd2839a034410b0b289e7972065d1d5850c17` was host Codex `gpt-5.6-sol`/`xhigh` hard-read-only execution
+  `exec-52e6aa6c7b9d1ca997c3dc204f2b52eb`, attempt `attempt-77929e6e9065ae97803dec6906bfc058`, result
+  `/private/tmp/r2f1b-slice5a-final-rereview-result-20260906.md`, SHA-256
+  `725bcccb87643371377f106c1310918d4b1aa73d9e049e2d8273234239d344a6`. It returned one `WRONG` blocker: the private
+  fresh proof authenticated the retained `Arc<R2f1bAdmissionV1>` contract but not the exact
+  `Arc<WorkflowRunSpecV1>` produced beside it, so two genuine same-attempt fresh V3 admissions could be mixed and the
+  canonical binder accepted B's public run spec under A's proof/contract. It also returned one deferred evidence-
+  provenance `SMELL`; this repair closes only the blocker. The repaired continuation is limited to
+  `crates/bridge-workflow/src/admission.rs`,
+  `crates/bridge-workflow/src/executor.rs`, and the already-staged
+  `crates/bridge-workflow/tests/r2f1a_bound_executor.rs`; the prior admission-test artifact remains unchanged. The
+  fresh proof now retains both exact Arcs minted from the same successful `freeze_fresh_v3` result, and the canonical
+  binder requires `Arc::ptr_eq` for both before binding custody. A run-spec mismatch returns typed `ConfigInvalid` with
+  stable reason `fresh R2f1b admission proof does not match the admitted run specification`; the existing contract
+  mismatch reason, `(None, None)` V2 path, `(None, Some)` refusal, and `(Some, None)` explicit/manual path remain
+  unchanged. Same-host RED on candidate `7d5cd283` with only the preserved staged test selected one test, constructed
+  two genuine same-attempt fresh V3 admissions with distinct direct workflow specs, and failed **0 passed / 1 failed /
+  22 filtered** because the mixed admission was accepted; retained log SHA-256
+  `b183db1d5e90912f2c9a5970c43054c6321eeb14da2729a5f6316e57e955e618`. The exact Rust continuation adds **120**
+  nonblank formatted lines versus `7d5cd283`; the cumulative 5A Rust artifact measures **656** added nonblank
+  formatted lines versus merged main `34ced0f93526f981a835c237c56d7ba580e989f4`. Every real production construction
+  site remains explicitly V2/unwired with `r2f1b: None`, and `freeze_fresh_v3` remains absent from production callers.
+  Controller focused GREEN after repair is recorded for the exact mixed-admission selector **1 passed / 0 failed / 22
+  filtered**, complete bound-executor binary **23 passed / 0 failed**, and fresh-V3 admission selectors **2 passed / 0
+  failed / 12 filtered**; corresponding log SHA-256 values are
+  `dbfbe06f065b14dff4598bd6c6513de62131a810172199c0d4e8dadfd12f5174`,
+  `a4fdebf973d8f07cfeb7137b3c7b9b791d50a4be2336dcba9aa8c27df1a99841`, and
+  `02041b0c968bf369f81c61d28c3ddb3a0430438e46fa2d56ef811fe711964525`. The final post-doc controller gate passed
+  with diff-check, Cargo fmt, workspace all-target check, workspace all-target/all-feature Clippy with `-D warnings`,
+  workspace all-target tests, doctests, workspace all-target/all-feature build, release bridge build, and repository
+  hygiene all exiting zero. All-target totals were **86 binaries / 4,397 passed /
+  0 failed / 13 ignored** with log SHA-256
+  `494ceb97163ac52e2668b2fac24a5f2da8925c6cef226dceab29a79dd8d0fbc4`; the 13 ignored tests are explicit live-
+  provider/auth lanes. Doctests were **16 crates / 2 passed / 0 failed / 0 ignored** with log SHA-256
+  `5fb7ab0a7c0343c698613e270ef23fbe1514fe9617369c39620a13775458329f`. Hygiene reported **41 tracked artifacts / 9
+  configs** with log SHA-256 `6e14f1b773562dcb92caa6c245532dce4fb238fe72f06c7745d9121dae232125`. One final Sol/xhigh hard-read-only rereview
+  of the repaired candidate remains pending; no approval, publication, merge, deployment, operator restart, live
+  smoke, or production wiring is claimed.
 - **R2f0b verification and review (2026-08-01):** [native verification](superpowers/reviews/2026-08-01-r2f0b-native-verification.md)
   records format, warnings-denied all-target/all-feature Clippy, four changed-config validations, and repository
   hygiene **39 tracked artifacts / 7 validated example configs** green. The initial full workspace emitted

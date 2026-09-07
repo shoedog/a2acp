@@ -1,0 +1,42 @@
+# R2f1b slice 5 - persistence and serving parity decomposition
+
+**Base:** merged `origin/main` `34ced0f93526f981a835c237c56d7ba580e989f4` (PR #100, R2f1b 4J), tree `192ba759a98eccbc9c5f21c187beddf8996c4463`.
+
+## 0. Scope
+
+Slice 5 makes the R2f1b V3 authority production-reachable without changing the already-approved scheduler semantics. The slice is deliberately split so each sub-slice leaves production either unwired or wired behind one audited boundary. V3 task/history reservation and detached terminal CAS happen before any real surface can ask for a V3 run.
+
+No live smoke, compatibility case, provider session, registry/image mutation, release, deployment, served-bridge restart, running-operator change, or GitHub publication is implied by this decomposition.
+
+## 1. Ordering
+
+| Slice | Purpose | Production reachability | Primary proof |
+|---|---|---|---|
+| 5A | Fresh automatic V3 admission authority plus canonical binder proof/run-spec/contract repair, still production-unwired | None; all real callers keep `r2f1b: None` | One-pass admission returns matching `AdmittedWorkflowRunV1` and canonical `WorkflowSnapshotV3`; custody ids are internally minted and deduped by checkout digest; the binder accepts fresh proof only with the exact retained run spec and contract, and rejects missing or mixed public authority. |
+| 5B | Reserve V3 task/history storage and detached terminal CAS | None; storage accepts reserved shapes only | V3 rows cannot be confused with V1/V2; detached terminal compare-and-set is exact and idempotent. |
+| 5C | Coordinator and served A2A/MCP admission wiring | Served trusted production surfaces only | Fresh V3 snapshot is persisted before provider effects; refusal paths leave no reservation or checkout effect. |
+| 5D | Batch, offline CLI, and implement entrypoint wiring | Explicit operator-selected non-served surfaces | Existing V2 behavior remains for unwired modes; each newly wired mode persists and restores V3 authority through the same contract path. |
+| 5E | Resume and boot ownership | V3 resumes only through claim exchange | Successor snapshots preserve delivery bytes and contract bytes; boot recovery never remints custody and refuses incomplete exchange evidence. |
+| 5F | Slice-5 aggregate gate and handoff | All slice-5 intended surfaces | Cross-surface full suite, combined diff review, and no production regression from V2 fallback paths. |
+
+## 2. 5A exact task
+
+5A started as the fresh admission-builder task implemented from PR #100 base. It adds one public `WorkflowAdmissionV1::freeze_fresh_v3` entrypoint that accepts an initial `AttemptIdentity` plus frozen admission inputs, performs one checkout-planning pass, and returns both admitted authority and a canonical root `WorkflowSnapshotV3`. It owns custody-plan construction: worktree checkouts get internally minted nonzero `WorktreeCustodyIdV1` values, identical checkout digests dedupe to one plan, conflicting same-digest targets refuse, and direct checkouts produce no custody plan.
+
+The retained 5A artifact continues from exact candidate `7d5cd2839a034410b0b289e7972065d1d5850c17`. The final hard-read-only review was host Codex `gpt-5.6-sol`/`xhigh` execution `exec-52e6aa6c7b9d1ca997c3dc204f2b52eb`, attempt `attempt-77929e6e9065ae97803dec6906bfc058`, result `/private/tmp/r2f1b-slice5a-final-rereview-result-20260906.md`, SHA-256 `725bcccb87643371377f106c1310918d4b1aa73d9e049e2d8273234239d344a6`. It returned one `WRONG` blocker: a proof from one genuine same-attempt fresh V3 admission could be paired with another genuine admission's public run spec because the proof retained only the exact `Arc<R2f1bAdmissionV1>` contract and not the exact admitted `Arc<WorkflowRunSpecV1>`. It also returned one deferred evidence-provenance `SMELL`; this repair closes only the blocker. Same-host RED on unchanged production candidate `7d5cd283` with the preserved staged test selected one test, constructed two genuine same-attempt fresh V3 admissions with distinct direct workflow specs, and failed 0 passed / 1 failed / 22 filtered because the mixed admission was accepted; retained log SHA-256 `b183db1d5e90912f2c9a5970c43054c6321eeb14da2729a5f6316e57e955e618`.
+
+The repaired continuation is limited to `crates/bridge-workflow/src/admission.rs`, `crates/bridge-workflow/src/executor.rs`, and the already-staged `crates/bridge-workflow/tests/r2f1a_bound_executor.rs`; the prior admission-test artifact remains unchanged. The fresh proof now retains both exact Arcs minted from the same successful `freeze_fresh_v3` result, and the canonical binder requires `Arc::ptr_eq` for both before binding custody. A run-spec mismatch returns typed `ConfigInvalid` with stable reason `fresh R2f1b admission proof does not match the admitted run specification`; the existing contract mismatch reason, `(None, None)` V2 path, `(None, Some)` refusal, and `(Some, None)` explicit/manual path remain unchanged. The exact Rust continuation adds 120 nonblank formatted lines versus `7d5cd283`; the cumulative 5A Rust artifact measures 656 added nonblank formatted lines versus `34ced0f93526f981a835c237c56d7ba580e989f4`.
+
+5A must continue to refuse successors, mismatched attempts, caller-supplied contracts on the owned-builder path, `Disarmed` readiness, `ManualTest` policy activation, and watchdog-incompatible automatic admission before checkout planning. It must not modify coordinator, A2A, MCP, batch, offline/CLI, implement, boot/resume, task store, history store, backend, worktree custody, or operator code. Every shipped production construction site remains greppable as `r2f1b: None`, and `freeze_fresh_v3` remains absent from production callers. Controller focused GREEN after repair is recorded for the exact mixed-admission selector 1 passed / 0 failed / 22 filtered, complete bound-executor binary 23 passed / 0 failed, and fresh-V3 admission selectors 2 passed / 0 failed / 12 filtered; corresponding log SHA-256 values are `dbfbe06f065b14dff4598bd6c6513de62131a810172199c0d4e8dadfd12f5174`, `a4fdebf973d8f07cfeb7137b3c7b9b791d50a4be2336dcba9aa8c27df1a99841`, and `02041b0c968bf369f81c61d28c3ddb3a0430438e46fa2d56ef811fe711964525`. The final post-doc controller gate passed with diff-check, Cargo fmt, workspace all-target check, workspace all-target/all-feature Clippy with `-D warnings`, workspace all-target tests, doctests, workspace all-target/all-feature build, release bridge build, and repository hygiene all exiting zero. All-target totals were 86 binaries / 4,397 passed / 0 failed / 13 ignored with log SHA-256 `494ceb97163ac52e2668b2fac24a5f2da8925c6cef226dceab29a79dd8d0fbc4`; the 13 ignored tests are explicit live-provider/auth lanes. Doctests were 16 crates / 2 passed / 0 failed / 0 ignored with log SHA-256 `5fb7ab0a7c0343c698613e270ef23fbe1514fe9617369c39620a13775458329f`. Hygiene reported 41 tracked artifacts / 9 configs with log SHA-256 `6e14f1b773562dcb92caa6c245532dce4fb238fe72f06c7745d9121dae232125`. One final Sol/xhigh hard-read-only rereview of the repaired candidate remains pending; no approval, live smoke, production/operator action, push, PR, merge, release, deployment, or running-operator mutation occurred.
+
+## 3. Boundaries for later slices
+
+5B owns durable V3 reservation and detached terminal CAS. It must land before 5C through 5E because a real surface cannot ask for automatic V3 admission until storage can retain the snapshot and terminal result without falling back to a V2-only claim.
+
+5C owns served coordinator, A2A, and MCP routing. It should consume the 5A API rather than recreating contract minting, and it must prove request refusal ordering before any provider/session/process/worktree effect.
+
+5D owns batch, offline CLI, and implement wiring. It should reuse the same reservation and admission components rather than giving each entrypoint a local V3 construction path.
+
+5E owns resume and boot ownership. It must exchange custody claims for successor attempts, validate predecessor digests, and recover incomplete reservations without reminting custody ids.
+
+Slice 6 remains the place for aggregate migration, rollback, and fault-matrix closure. Slice 5 must not absorb those closure tasks.
