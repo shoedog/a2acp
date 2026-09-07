@@ -349,114 +349,62 @@ pub fn validate_atomic_v3_admission_marker(
         .as_deref()
         .filter(|value| !value.is_empty())
         .ok_or(BridgeError::StoreFailure)?;
-    let snapshot: serde_json::Value =
-        serde_json::from_str(snapshot_json).map_err(|_| BridgeError::StoreFailure)?;
-    if serde_json::to_string(&snapshot).map_err(|_| BridgeError::StoreFailure)? != snapshot_json
-        || snapshot.get("v").and_then(serde_json::Value::as_u64) != Some(3)
-    {
-        return Err(BridgeError::StoreFailure);
-    }
-
-    let attempt = snapshot
-        .get("attempt")
-        .and_then(serde_json::Value::as_object)
-        .ok_or(BridgeError::StoreFailure)?;
-    if attempt
-        .get("execution_id")
-        .and_then(serde_json::Value::as_str)
-        != Some(locator.identity.execution_id.as_str())
-        || attempt
-            .get("attempt_id")
-            .and_then(serde_json::Value::as_str)
-            != Some(locator.identity.attempt_id.as_str())
-        || attempt.get("ordinal").and_then(serde_json::Value::as_u64)
-            != Some(u64::from(locator.identity.ordinal))
-        || attempt.contains_key("parent_attempt_id")
-    {
-        return Err(BridgeError::StoreFailure);
-    }
-
-    let delivery = snapshot
-        .get("delivery_spec")
-        .and_then(serde_json::Value::as_object)
-        .ok_or(BridgeError::StoreFailure)?;
-    let delivery_workload = delivery
-        .get("workload_fingerprint")
-        .and_then(serde_json::Value::as_str)
-        .ok_or(BridgeError::StoreFailure)?;
-    let contract: crate::execution_policy::FrozenR2f1bContractV1 = serde_json::from_value(
+    let snapshot = crate::run_spec::WorkflowSnapshotV3::decode(snapshot_json.as_bytes())
+        .map_err(|_| BridgeError::StoreFailure)?;
+    let controls_json = String::from_utf8(
         snapshot
-            .get("r2f1b")
-            .cloned()
-            .ok_or(BridgeError::StoreFailure)?,
+            .delivery_spec
+            .controls
+            .encode_canonical()
+            .map_err(|_| BridgeError::StoreFailure)?,
     )
     .map_err(|_| BridgeError::StoreFailure)?;
-    contract.validate().map_err(|_| BridgeError::StoreFailure)?;
-    let mut canonical = Vec::new();
-    for value in [
-        b"a2a-bridge/workflow-run-spec/bound-workload/v2".as_slice(),
-        delivery_workload.as_bytes(),
-        match contract.activation {
-            crate::execution_policy::DeadlineActivationV2::ManualOnlyR2f1a => {
-                b"manual_only_r2f1a".as_slice()
-            }
-            crate::execution_policy::DeadlineActivationV2::AutomaticR2f1b => {
-                b"automatic_r2f1b".as_slice()
-            }
-        },
-        contract.contract_fingerprint.as_str().as_bytes(),
-    ] {
-        canonical.extend_from_slice(&(value.len() as u64).to_be_bytes());
-        canonical.extend_from_slice(value);
-    }
-    let bound_workload = format!(
-        "bound-{}",
-        crate::execution_policy::Sha256HexV1::digest(&canonical).as_str()
-    );
-    let controls: serde_json::Value =
-        serde_json::from_str(&reservation.controls_json).map_err(|_| BridgeError::StoreFailure)?;
-    let graph = delivery
-        .get("graph")
-        .and_then(serde_json::Value::as_object)
-        .ok_or(BridgeError::StoreFailure)?;
-    let mut snapshot_nodes = graph
-        .get("nodes")
-        .and_then(serde_json::Value::as_array)
-        .ok_or(BridgeError::StoreFailure)?
+    let mut graph_nodes = snapshot
+        .delivery_spec
+        .graph
+        .nodes
         .iter()
-        .map(|node| {
-            node.get("id")
-                .and_then(serde_json::Value::as_str)
-                .map(str::to_owned)
-                .ok_or(BridgeError::StoreFailure)
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    snapshot_nodes.sort();
+        .map(|node| node.id.clone())
+        .collect::<Vec<_>>();
+    graph_nodes.sort();
     let reservation_nodes = reservation
         .nodes
         .iter()
-        .map(|node| node.node.as_str().to_owned())
+        .map(|node| node.node.clone())
         .collect::<Vec<_>>();
-    if delivery
-        .get("attempt_id")
-        .and_then(serde_json::Value::as_str)
-        != Some(locator.identity.attempt_id.as_str())
-        || delivery
-            .get("controls_fingerprint")
-            .and_then(serde_json::Value::as_str)
-            != Some(reservation.controls_fingerprint.as_str())
-        || delivery.get("controls") != Some(&controls)
-        || graph.get("id").and_then(serde_json::Value::as_str) != Some(rec.workflow.as_str())
-        || bound_workload != reservation.reservation.workload_fingerprint
-        || snapshot_nodes != reservation_nodes
-        || usize::try_from(reservation.expected_node_count).ok() != Some(snapshot_nodes.len())
+    let reservation_ordinals_match = reservation
+        .nodes
+        .iter()
+        .enumerate()
+        .all(|(ordinal, node)| u32::try_from(ordinal).ok() == Some(node.sorted_ordinal));
+
+    if snapshot.attempt != locator.identity
+        || snapshot.delivery_spec.attempt_id != locator.identity.attempt_id
+        || snapshot.predecessor_snapshot_digest.is_some()
+        || snapshot.r2f1b.activation
+            != crate::execution_policy::DeadlineActivationV2::AutomaticR2f1b
+        || snapshot.delivery_spec.graph.id.as_str() != rec.workflow.as_str()
+        || snapshot.delivery_spec.controls_fingerprint != reservation.controls_fingerprint
+        || controls_json != reservation.controls_json
         || snapshot
-            .get("predecessor_snapshot_digest")
-            .is_some_and(|value| !value.is_null())
-        || contract.activation != crate::execution_policy::DeadlineActivationV2::AutomaticR2f1b
+            .workload_identity()
+            .map_err(|_| BridgeError::StoreFailure)?
+            != reservation.reservation.workload_fingerprint
+        || !locator.belongs_to(&rec.id)
+        || locator.telemetry_unavailable.is_some()
+        || reservation.reservation.task_id.as_ref() != Some(&rec.id)
+        || reservation.reservation.workflow != rec.workflow
+        || reservation.reservation.identity != locator.identity
+        || locator.identity.ordinal != 0
+        || locator.identity.parent_attempt_id.is_some()
+        || usize::try_from(reservation.expected_node_count).ok() != Some(graph_nodes.len())
+        || graph_nodes != reservation_nodes
+        || !reservation_ordinals_match
+        || reservation.validate().is_err()
     {
         return Err(BridgeError::StoreFailure);
     }
+
     Ok(AtomicV3AdmissionMarker {
         workflow_snapshot_json: snapshot_json.to_owned(),
         roster_json: atomic_v3_roster_json(reservation)?,
@@ -3150,34 +3098,6 @@ impl TaskStore for MemoryTaskStore {
             return Err(BridgeError::StoreFailure);
         }
         let _guard = self.journal_fold_guard.lock().unwrap();
-        for replay in [
-            self.pending_terminal
-                .lock()
-                .unwrap()
-                .get(task.as_str())
-                .cloned(),
-            self.terminal_replay
-                .lock()
-                .unwrap()
-                .get(task.as_str())
-                .cloned(),
-        ] {
-            let Some(pending) = replay else {
-                continue;
-            };
-            let compatible = pending.attempt_id == *attempt_id
-                && pending.terminal == *terminal
-                && pending.task.status == status
-                && pending.task.result.as_deref() == result
-                && pending.task.error.as_deref() == error;
-            return Ok(if compatible {
-                DetachedTerminalCas::Replayed {
-                    seq: pending.terminal_seq,
-                }
-            } else {
-                DetachedTerminalCas::Conflict
-            });
-        }
         let locator_matches = self
             .attempt_locators
             .lock()
@@ -3270,6 +3190,34 @@ impl TaskStore for MemoryTaskStore {
                     }
                 }
             }
+        }
+        for replay in [
+            self.pending_terminal
+                .lock()
+                .unwrap()
+                .get(task.as_str())
+                .cloned(),
+            self.terminal_replay
+                .lock()
+                .unwrap()
+                .get(task.as_str())
+                .cloned(),
+        ] {
+            let Some(pending) = replay else {
+                continue;
+            };
+            let compatible = pending.attempt_id == *attempt_id
+                && pending.terminal == *terminal
+                && pending.task.status == status
+                && pending.task.result.as_deref() == result
+                && pending.task.error.as_deref() == error;
+            return Ok(if compatible {
+                DetachedTerminalCas::Replayed {
+                    seq: pending.terminal_seq,
+                }
+            } else {
+                DetachedTerminalCas::Conflict
+            });
         }
         let artifact_ms = self.retention_now_ms();
         {

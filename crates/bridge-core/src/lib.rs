@@ -11,6 +11,7 @@ pub mod execution_policy;
 pub mod failure_wire;
 pub mod fixed_grace_timer;
 pub mod fs_custody;
+pub mod graph;
 pub mod harvest;
 pub mod ids;
 #[cfg(unix)]
@@ -36,6 +37,7 @@ pub mod resource_flight;
 pub mod retained_resource_flight;
 #[cfg(unix)]
 pub mod run_identity;
+pub mod run_spec;
 pub mod sandbox;
 pub mod session;
 pub mod session_cwd;

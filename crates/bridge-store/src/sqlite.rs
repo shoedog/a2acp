@@ -6510,6 +6510,7 @@ impl bridge_core::task_store::TaskStore for SqliteStore {
         let tx = immediate_transaction(&conn)?;
         let current: Option<(
             String,
+            String,
             Option<String>,
             Option<String>,
             Option<i64>,
@@ -6523,7 +6524,7 @@ impl bridge_core::task_store::TaskStore for SqliteStore {
             Option<String>,
         )> = tx
             .query_row(
-                "SELECT t.status, t.result, t.error, t.terminal_seq,
+                "SELECT t.status, t.workflow, t.result, t.error, t.terminal_seq,
                         t.terminal_projection_ready, t.terminal_projection_attempt_id,
                         t.terminal_projection_json, t.workflow_outcome, l.locator_json,
                         t.workflow_spec_json, a.workflow_snapshot_json, a.roster_json
@@ -6547,6 +6548,7 @@ impl bridge_core::task_store::TaskStore for SqliteStore {
                         row.get(9)?,
                         row.get(10)?,
                         row.get(11)?,
+                        row.get(12)?,
                     ))
                 },
             )
@@ -6554,6 +6556,7 @@ impl bridge_core::task_store::TaskStore for SqliteStore {
             .map_err(|_| BridgeError::StoreFailure)?;
         let Some((
             current_status,
+            current_workflow,
             current_result,
             current_error,
             current_terminal_seq,
@@ -6573,32 +6576,33 @@ impl bridge_core::task_store::TaskStore for SqliteStore {
         if !matches!(ready, 0 | 1) {
             return Err(BridgeError::StoreFailure);
         }
-        if ready == 0 || current_status != "working" {
-            let compatible = current_status == status.as_str()
-                && current_result.as_deref() == result
-                && current_error.as_deref() == error
-                && pending_attempt.as_deref() == Some(attempt_id.as_str())
-                && pending_json.as_deref() == Some(terminal_json.as_str())
-                && current_workflow_outcome.as_deref() == Some(workflow_outcome.as_str());
-            let seq = current_terminal_seq.ok_or(BridgeError::StoreFailure)?;
-            tx.commit().map_err(|_| BridgeError::StoreFailure)?;
-            return Ok(if compatible {
-                DetachedTerminalCas::Replayed { seq }
-            } else {
-                DetachedTerminalCas::Conflict
-            });
-        }
         let locator: bridge_core::task_store::TaskAttemptLocator =
             serde_json::from_str(&locator_json).map_err(|_| BridgeError::StoreFailure)?;
+        let Some(admission_snapshot_json) = admission_snapshot_json.as_deref() else {
+            tx.commit().map_err(|_| BridgeError::StoreFailure)?;
+            return Ok(DetachedTerminalCas::Conflict);
+        };
+        let Some(admission_roster_json) = admission_roster_json.as_deref() else {
+            tx.commit().map_err(|_| BridgeError::StoreFailure)?;
+            return Ok(DetachedTerminalCas::Conflict);
+        };
+        let snapshot = match bridge_core::run_spec::WorkflowSnapshotV3::decode(
+            admission_snapshot_json.as_bytes(),
+        ) {
+            Ok(snapshot) => snapshot,
+            Err(_) => {
+                tx.commit().map_err(|_| BridgeError::StoreFailure)?;
+                return Ok(DetachedTerminalCas::Conflict);
+            }
+        };
         if !locator.belongs_to(task)
             || locator.identity.attempt_id != *attempt_id
-            || current_status != "working"
-            || current_terminal_seq.is_some()
-            || pending_attempt.is_some()
-            || pending_json.is_some()
-            || current_workflow_outcome.is_some()
-            || workflow_spec_json.as_deref() != admission_snapshot_json.as_deref()
-            || admission_roster_json.is_none()
+            || workflow_spec_json.as_deref() != Some(admission_snapshot_json)
+            || snapshot.attempt != locator.identity
+            || snapshot.delivery_spec.graph.id.as_str() != current_workflow.as_str()
+            || snapshot.predecessor_snapshot_digest.is_some()
+            || snapshot.r2f1b.activation
+                != bridge_core::execution_policy::DeadlineActivationV2::AutomaticR2f1b
         {
             tx.commit().map_err(|_| BridgeError::StoreFailure)?;
             return Ok(DetachedTerminalCas::Conflict);
@@ -6638,7 +6642,7 @@ impl bridge_core::task_store::TaskStore for SqliteStore {
                 .collect::<Vec<_>>(),
         )
         .map_err(|_| BridgeError::StoreFailure)?;
-        if admission_roster_json.as_deref() != Some(roster_json.as_str()) {
+        if admission_roster_json != roster_json.as_str() {
             tx.commit().map_err(|_| BridgeError::StoreFailure)?;
             return Ok(DetachedTerminalCas::Conflict);
         }
@@ -6671,6 +6675,29 @@ impl bridge_core::task_store::TaskStore for SqliteStore {
                     return Ok(DetachedTerminalCas::Conflict);
                 }
             }
+        }
+        if ready == 0 || current_status != "working" {
+            let compatible = current_status == status.as_str()
+                && current_result.as_deref() == result
+                && current_error.as_deref() == error
+                && pending_attempt.as_deref() == Some(attempt_id.as_str())
+                && pending_json.as_deref() == Some(terminal_json.as_str())
+                && current_workflow_outcome.as_deref() == Some(workflow_outcome.as_str());
+            let seq = current_terminal_seq.ok_or(BridgeError::StoreFailure)?;
+            tx.commit().map_err(|_| BridgeError::StoreFailure)?;
+            return Ok(if compatible {
+                DetachedTerminalCas::Replayed { seq }
+            } else {
+                DetachedTerminalCas::Conflict
+            });
+        }
+        if current_terminal_seq.is_some()
+            || pending_attempt.is_some()
+            || pending_json.is_some()
+            || current_workflow_outcome.is_some()
+        {
+            tx.commit().map_err(|_| BridgeError::StoreFailure)?;
+            return Ok(DetachedTerminalCas::Conflict);
         }
         let changed = tx
             .execute(
@@ -15744,19 +15771,29 @@ impl SqliteStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bridge_core::domain::{PeerTaskId, PendingKind, PendingRequest};
-    use bridge_core::execution_policy::{
-        ControlEventIdV1, FanOutPolicyNameV1, NodeCleanupDispositionV1, NodeCleanupV1,
-        NodePrimaryDispositionV1, NodeTerminalV1, PolicyNodeRefV1, PolicyTriggerV1,
+    use async_trait::async_trait;
+    use bridge_core::domain::{
+        AgentEntry, AgentKind, Effort, PeerTaskId, PendingKind, PendingRequest, RegistrySnapshot,
     };
-    use bridge_core::ids::{AttemptId, BatchId, ContextId, NodeId, SessionId, TaskId, TurnId};
+    use bridge_core::execution_policy::{
+        ControlEventIdV1, ExecutionPolicyInvocationV1, FanOutPolicyNameV1, HistoryAllocationKindV1,
+        LedgerAdmissionV1, NodeCleanupDispositionV1, NodeCleanupV1, NodePrimaryDispositionV1,
+        NodeTerminalV1, PolicyNodeRefV1, PolicyTriggerV1,
+    };
+    use bridge_core::ids::{
+        AgentId, AttemptId, BatchId, ContextId, ExecutionId, NodeId, SessionId, TaskId, TurnId,
+        WorkflowId,
+    };
     use bridge_core::orch::{TerminalUsage, UsageCost, UsageSnapshot};
-    use bridge_core::ports::{FailureClass, SessionStore, TraceParent, TurnContext, TurnOutcome};
+    use bridge_core::ports::{
+        AgentRegistry, FailureClass, Resolved, SessionStore, TraceParent, TurnContext, TurnOutcome,
+    };
     use bridge_core::task_store::{
         BatchRecord, BatchStatus, ChildClaim, MemoryTaskStore, TaskRecord, TaskRecordStatus,
         TaskStore, TurnLogFinalized, TurnLogFinished, TurnUsageFinalization,
         RETENTION_NEVER_ELIGIBLE_MS,
     };
+    use std::collections::BTreeMap;
     use std::sync::atomic::{AtomicI64, Ordering};
     use std::sync::Arc;
 
@@ -15788,6 +15825,213 @@ mod tests {
             item_id: None,
             artifacts_purged_at: None,
         }
+    }
+
+    struct SnapshotRegistry {
+        entry: Arc<AgentEntry>,
+    }
+
+    #[async_trait]
+    impl AgentRegistry for SnapshotRegistry {
+        async fn resolve(&self, _id: &AgentId) -> Result<Resolved, BridgeError> {
+            panic!("fresh V3 admission must not resolve a backend")
+        }
+
+        fn default_id(&self) -> AgentId {
+            self.entry.id.clone()
+        }
+
+        async fn apply(&self, _snapshot: RegistrySnapshot) -> Result<(), BridgeError> {
+            panic!("fresh V3 admission must not mutate the registry")
+        }
+
+        fn entry_snapshot(&self, id: &AgentId) -> Option<Arc<AgentEntry>> {
+            (id == &self.entry.id).then(|| self.entry.clone())
+        }
+
+        fn list(&self) -> Vec<AgentId> {
+            vec![self.entry.id.clone()]
+        }
+    }
+
+    fn admission_entry() -> AgentEntry {
+        AgentEntry {
+            id: AgentId::parse("reader").unwrap(),
+            cmd: Some("reader".into()),
+            base_url: None,
+            api_key_env: None,
+            args: vec![],
+            kind: AgentKind::Acp,
+            model_provider: None,
+            model: Some("primary".into()),
+            effort: Some(Effort::High),
+            mode: Some("read-only".into()),
+            preflight: false,
+            fallback_models: vec![],
+            cwd: None,
+            session_cwd: None,
+            sandbox: None,
+            watchdog: None,
+            auth_method: None,
+            pre_authenticated: false,
+            host_fallback_eligible: false,
+            name: None,
+            description: None,
+            tags: vec![],
+            version: None,
+            mcp: vec![],
+            mcp_delivery: Default::default(),
+            extensions: BTreeMap::new(),
+        }
+    }
+
+    fn v3_builder_graph() -> Arc<bridge_workflow::graph::WorkflowGraph> {
+        Arc::new(bridge_workflow::graph::WorkflowGraph {
+            id: WorkflowId::parse("review").unwrap(),
+            nodes: vec![bridge_workflow::graph::WorkflowNode {
+                id: NodeId::parse("root").unwrap(),
+                agent: AgentId::parse("reader").unwrap(),
+                prompt_template: "{{input}}".into(),
+                inputs: vec![],
+                retry: None,
+                harvest_sanitization: None,
+            }],
+            panel: None,
+            controls: None,
+        })
+    }
+
+    fn attempt_identity(task: &TaskId, attempt: &AttemptId) -> bridge_core::ids::AttemptIdentity {
+        bridge_core::ids::AttemptIdentity {
+            execution_id: ExecutionId::parse(task.as_str()).unwrap(),
+            attempt_id: attempt.clone(),
+            ordinal: 0,
+            parent_attempt_id: None,
+        }
+    }
+
+    async fn fresh_v3_task_fixture(
+        task: &TaskId,
+        attempt: &AttemptId,
+        ms: i64,
+        flight: char,
+    ) -> (
+        bridge_core::task_store::TaskAttemptLocator,
+        bridge_core::workflow_history::AttemptReservationV3,
+        TaskRecord,
+    ) {
+        use bridge_core::workflow_history::{
+            AttemptReservation, AttemptReservationV3, ExecutionSurface, HistoryNodeReservationV3,
+            WORKFLOW_HISTORY_EVIDENCE_SCHEMA_V3,
+        };
+
+        let identity = attempt_identity(task, attempt);
+        let admission = bridge_workflow::admission::WorkflowAdmissionV1::new(
+            Arc::new(SnapshotRegistry {
+                entry: Arc::new(admission_entry()),
+            }),
+            Arc::new(bridge_workflow::admission::DirectWorkflowCheckoutPlannerV1),
+            bridge_core::SessionCwd::parse("/repo").unwrap(),
+            None,
+        );
+        let fresh = admission
+            .freeze_fresh_v3(
+                identity.clone(),
+                bridge_workflow::admission::WorkflowAdmissionRequestV1 {
+                    attempt_id: attempt.clone(),
+                    graph: v3_builder_graph(),
+                    requested_session_cwd: None,
+                    policy_invocation: ExecutionPolicyInvocationV1::default(),
+                    ledger_admission: LedgerAdmissionV1::HistoryLedgerAdmitted {
+                        kind: HistoryAllocationKindV1::Configured,
+                    },
+                    r2f1b: None,
+                },
+            )
+            .await
+            .unwrap();
+        let snapshot = fresh.snapshot;
+        let snapshot_json = String::from_utf8(snapshot.encode().unwrap()).unwrap();
+        let controls_json =
+            String::from_utf8(snapshot.delivery_spec.controls.encode_canonical().unwrap()).unwrap();
+        let nodes = snapshot
+            .delivery_spec
+            .graph
+            .nodes
+            .iter()
+            .map(|node| node.id.clone())
+            .collect::<Vec<_>>();
+        let expected_node_count = u32::try_from(nodes.len()).unwrap();
+        let reservation_nodes = nodes
+            .into_iter()
+            .enumerate()
+            .map(|(ordinal, node)| HistoryNodeReservationV3 {
+                node,
+                sorted_ordinal: u32::try_from(ordinal).unwrap(),
+                resource_flight_id: bridge_core::resource_flight::ResourceFlightIdV1::parse(
+                    format!("resource-flight-{}", flight.to_string().repeat(64)),
+                )
+                .unwrap(),
+            })
+            .collect::<Vec<_>>();
+        let reservation = AttemptReservationV3 {
+            schema_version: WORKFLOW_HISTORY_EVIDENCE_SCHEMA_V3,
+            reservation: AttemptReservation {
+                identity: identity.clone(),
+                task_id: Some(task.clone()),
+                workflow: snapshot.delivery_spec.graph.id.as_str().to_owned(),
+                task_class: "workflow".into(),
+                surface: ExecutionSurface::ServedTask,
+                policy: "r2f1b".into(),
+                workload_fingerprint: snapshot.workload_identity().unwrap(),
+                started_ms: ms,
+                workload_fingerprint_complete: true,
+                prompt_acceptance: "not_dispatched".into(),
+                pinned: false,
+            },
+            controls_fingerprint: snapshot.delivery_spec.controls_fingerprint.clone(),
+            expected_node_count,
+            nodes: reservation_nodes,
+            controls_json,
+        };
+        reservation.validate().unwrap();
+        let locator = bridge_core::task_store::TaskAttemptLocator {
+            identity,
+            telemetry_unavailable: None,
+        };
+        let mut record = trec(task.as_str(), ms);
+        record.workflow = snapshot.delivery_spec.graph.id.as_str().to_owned();
+        record.workflow_spec_json = Some(snapshot_json);
+        (locator, reservation, record)
+    }
+
+    async fn legacy_v2_spec_json(attempt: &AttemptId) -> String {
+        let admission = bridge_workflow::admission::WorkflowAdmissionV1::new(
+            Arc::new(SnapshotRegistry {
+                entry: Arc::new(admission_entry()),
+            }),
+            Arc::new(bridge_workflow::admission::DirectWorkflowCheckoutPlannerV1),
+            bridge_core::SessionCwd::parse("/repo").unwrap(),
+            None,
+        );
+        let admitted = admission
+            .freeze(bridge_workflow::admission::WorkflowAdmissionRequestV1 {
+                attempt_id: attempt.clone(),
+                graph: v3_builder_graph(),
+                requested_session_cwd: None,
+                policy_invocation: ExecutionPolicyInvocationV1::default(),
+                ledger_admission: LedgerAdmissionV1::HistoryLedgerAdmitted {
+                    kind: HistoryAllocationKindV1::Configured,
+                },
+                r2f1b: None,
+            })
+            .await
+            .unwrap();
+        String::from_utf8(admitted.run_spec.encode_snapshot_v2().unwrap()).unwrap()
+    }
+
+    fn legacy_v1_spec_json() -> String {
+        serde_json::to_string(v3_builder_graph().as_ref()).unwrap()
     }
     fn task_v3_reservation(
         task: &TaskId,
@@ -16027,66 +16271,6 @@ mod tests {
         exercise_v3_task_store(&SqliteStore::open_in_memory().unwrap()).await;
     }
 
-    fn v3_task_record(
-        task: &TaskId,
-        ms: i64,
-        locator: &bridge_core::task_store::TaskAttemptLocator,
-        reservation: &bridge_core::workflow_history::AttemptReservationV3,
-    ) -> TaskRecord {
-        let mut record = trec(task.as_str(), ms);
-        record.workflow = "review".into();
-        let controls: serde_json::Value = serde_json::from_str(&reservation.controls_json).unwrap();
-        let nodes = reservation
-            .nodes
-            .iter()
-            .map(|node| {
-                serde_json::json!({
-                    "agent": "reader",
-                    "id": node.node.as_str(),
-                    "inputs": [],
-                    "prompt_template": "{{input}}",
-                })
-            })
-            .collect::<Vec<_>>();
-        let mut attempt = serde_json::json!({
-            "attempt_id": locator.identity.attempt_id.as_str(),
-            "execution_id": locator.identity.execution_id.as_str(),
-            "ordinal": locator.identity.ordinal,
-        });
-        if let Some(parent) = locator.identity.parent_attempt_id.as_ref() {
-            attempt.as_object_mut().unwrap().insert(
-                "parent_attempt_id".to_owned(),
-                serde_json::json!(parent.as_str()),
-            );
-        }
-        record.workflow_spec_json = Some(
-            serde_json::to_string(&serde_json::json!({
-                "attempt": attempt,
-                "delivery_spec": {
-                    "attempt_id": locator.identity.attempt_id.as_str(),
-                    "controls": controls,
-                    "controls_fingerprint": reservation.controls_fingerprint.as_str(),
-                    "graph": {
-                        "id": "review",
-                        "nodes": nodes,
-                    },
-                    "ledger_admission": {
-                        "admission": "history_ledger_admitted",
-                        "kind": "configured",
-                    },
-                    "node_execution_identities": [],
-                    "schema_version": 1,
-                    "workload_fingerprint": v3_delivery_workload_fingerprint(),
-                },
-                "predecessor_snapshot_digest": null,
-                "r2f1b": serde_json::to_value(v3_r2f1b_contract()).unwrap(),
-                "v": 3,
-            }))
-            .unwrap(),
-        );
-        record
-    }
-
     fn v3_locator(
         task: &TaskId,
         attempt: &AttemptId,
@@ -16102,20 +16286,6 @@ mod tests {
             },
             telemetry_unavailable: None,
         }
-    }
-
-    fn v3_reservation_for_locator(
-        task: &TaskId,
-        locator: &bridge_core::task_store::TaskAttemptLocator,
-        flight: char,
-    ) -> bridge_core::workflow_history::AttemptReservationV3 {
-        let mut reservation = task_v3_reservation(task, &locator.identity.attempt_id, flight);
-        reservation.reservation.identity = locator.identity.clone();
-        reservation.reservation.task_id = Some(task.clone());
-        reservation.reservation.workflow = "review".into();
-        reservation.reservation.surface =
-            bridge_core::workflow_history::ExecutionSurface::ServedTask;
-        reservation
     }
 
     fn v3_terminal() -> bridge_core::workflow_history::AttemptTerminal {
@@ -16155,9 +16325,7 @@ mod tests {
         use bridge_core::task_store::DetachedTerminalCas;
         let attempt = AttemptId::parse("attempt-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap();
         let task = TaskId::parse("exec-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap();
-        let locator = v3_locator(&task, &attempt, 0, None);
-        let reservation = v3_reservation_for_locator(&task, &locator, 'a');
-        let record = v3_task_record(&task, 10, &locator, &reservation);
+        let (locator, reservation, record) = fresh_v3_task_fixture(&task, &attempt, 10, 'a').await;
         store
             .create_with_attempt_locator_and_v3_reservation(&record, &locator, &reservation)
             .await
@@ -16275,14 +16443,9 @@ mod tests {
         use bridge_core::task_store::{DetachedTerminalCas, ResumeClaim};
         let attempt = AttemptId::parse("attempt-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb").unwrap();
         let task = TaskId::parse("exec-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb").unwrap();
-        let locator = v3_locator(&task, &attempt, 0, None);
-        let reservation = v3_reservation_for_locator(&task, &locator, 'b');
+        let (locator, reservation, record) = fresh_v3_task_fixture(&task, &attempt, 20, 'b').await;
         store
-            .create_with_attempt_locator_and_v3_reservation(
-                &v3_task_record(&task, 20, &locator, &reservation),
-                &locator,
-                &reservation,
-            )
+            .create_with_attempt_locator_and_v3_reservation(&record, &locator, &reservation)
             .await
             .unwrap();
         let next_attempt = AttemptId::parse("attempt-cccccccccccccccccccccccccccccccc").unwrap();
@@ -16330,9 +16493,8 @@ mod tests {
     async fn exercise_v3_admission_refusals_are_atomic<S: TaskStore + ?Sized>(store: &S) {
         let attempt = AttemptId::parse("attempt-dddddddddddddddddddddddddddddddd").unwrap();
         let task = TaskId::parse("exec-dddddddddddddddddddddddddddddddd").unwrap();
-        let locator = v3_locator(&task, &attempt, 0, None);
-        let reservation = v3_reservation_for_locator(&task, &locator, 'd');
-        let mut bad_record = v3_task_record(&task, 30, &locator, &reservation);
+        let (locator, reservation, record) = fresh_v3_task_fixture(&task, &attempt, 30, 'd').await;
+        let mut bad_record = record.clone();
         bad_record.workflow_spec_json = None;
         assert!(store
             .create_with_attempt_locator_and_v3_reservation(&bad_record, &locator, &reservation)
@@ -16345,7 +16507,6 @@ mod tests {
             .await
             .is_err());
 
-        let record = v3_task_record(&task, 30, &locator, &reservation);
         let mut wrong = reservation.clone();
         wrong.reservation.workflow = "other".into();
         assert!(store
@@ -16359,12 +16520,12 @@ mod tests {
             .await
             .unwrap();
         let collision = TaskId::parse("exec-eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee").unwrap();
-        let collision_reservation = v3_reservation_for_locator(&collision, &locator, 'e');
-        let collision_record = v3_task_record(&collision, 31, &locator, &collision_reservation);
+        let (collision_locator, collision_reservation, collision_record) =
+            fresh_v3_task_fixture(&collision, &attempt, 31, 'e').await;
         assert!(store
             .create_with_attempt_locator_and_v3_reservation(
                 &collision_record,
-                &locator,
+                &collision_locator,
                 &collision_reservation,
             )
             .await
@@ -16377,12 +16538,8 @@ mod tests {
     ) {
         let attempt = AttemptId::parse("attempt-12121212121212121212121212121212").unwrap();
         let task = TaskId::parse("exec-12121212121212121212121212121212").unwrap();
-        let locator = v3_locator(&task, &attempt, 0, None);
-        let reservation = v3_reservation_for_locator(&task, &locator, '1');
-        let canonical = v3_task_record(&task, 32, &locator, &reservation)
-            .workflow_spec_json
-            .clone()
-            .unwrap();
+        let (locator, reservation, record) = fresh_v3_task_fixture(&task, &attempt, 32, '1').await;
+        let canonical = record.workflow_spec_json.clone().unwrap();
         let canonical_value: serde_json::Value = serde_json::from_str(&canonical).unwrap();
         let valid_v2 = serde_json::to_string(&serde_json::json!({
             "run_spec": canonical_value.get("delivery_spec").unwrap().clone(),
@@ -16390,39 +16547,66 @@ mod tests {
         }))
         .unwrap();
         let noncanonical_v3 = serde_json::to_string_pretty(&canonical_value).unwrap();
+        let mut missing_required = canonical_value.clone();
+        missing_required.as_object_mut().unwrap().remove("r2f1b");
+        let missing_required = serde_json::to_string(&missing_required).unwrap();
+        let mut unknown_field = canonical_value.clone();
+        unknown_field
+            .as_object_mut()
+            .unwrap()
+            .insert("unexpected".into(), serde_json::json!(true));
+        let unknown_field = serde_json::to_string(&unknown_field).unwrap();
+        let mut invalid_roster = canonical_value.clone();
+        invalid_roster["delivery_spec"]["node_execution_identities"] = serde_json::json!([]);
+        let invalid_roster = serde_json::to_string(&invalid_roster).unwrap();
+        let mut bad_fingerprint = canonical_value.clone();
+        bad_fingerprint["delivery_spec"]["controls_fingerprint"] = serde_json::json!(
+            "controls-0000000000000000000000000000000000000000000000000000000000000000"
+        );
+        let bad_fingerprint = serde_json::to_string(&bad_fingerprint).unwrap();
         let other_task = TaskId::parse("exec-34343434343434343434343434343434").unwrap();
         let other_attempt = AttemptId::parse("attempt-34343434343434343434343434343434").unwrap();
-        let other_locator = v3_locator(&other_task, &other_attempt, 0, None);
-        let other_reservation = v3_reservation_for_locator(&other_task, &other_locator, '3');
-        let different_valid_v3 =
-            v3_task_record(&other_task, 32, &other_locator, &other_reservation)
-                .workflow_spec_json
-                .unwrap();
-        for workflow_spec_json in [
-            "{not-json".to_owned(),
-            valid_v2,
-            noncanonical_v3,
-            different_valid_v3,
+        let (_, _, other_record) =
+            fresh_v3_task_fixture(&other_task, &other_attempt, 32, '3').await;
+        let different_valid_v3 = other_record.workflow_spec_json.unwrap();
+        for (case, workflow_spec_json) in [
+            ("malformed-json", "{not-json".to_owned()),
+            ("legacy-v2", valid_v2),
+            ("noncanonical-v3", noncanonical_v3),
+            ("missing-required-field", missing_required),
+            ("unknown-field", unknown_field),
+            ("invalid-node-identity-roster", invalid_roster),
+            ("bad-fingerprint", bad_fingerprint),
+            ("different-valid-v3", different_valid_v3),
         ] {
-            let mut record = v3_task_record(&task, 32, &locator, &reservation);
-            record.workflow_spec_json = Some(workflow_spec_json);
+            let mut candidate = record.clone();
+            candidate.workflow_spec_json = Some(workflow_spec_json);
             assert!(
                 store
                     .create_with_attempt_locator_and_v3_reservation(
-                        &record,
+                        &candidate,
                         &locator,
                         &reservation,
                     )
                     .await
                     .is_err(),
-                "invalid or unbound workflow snapshot bytes must refuse atomically"
+                "{case}: invalid or unbound workflow snapshot bytes must refuse atomically"
             );
-            assert!(store.get(&task).await.unwrap().is_none());
-            assert!(store.get_attempt_locator(&task).await.unwrap().is_none());
-            assert!(store
-                .node_terminal_evidence_v3(&task, &attempt)
-                .await
-                .is_err());
+            assert!(
+                store.get(&task).await.unwrap().is_none(),
+                "{case}: task row leaked"
+            );
+            assert!(
+                store.get_attempt_locator(&task).await.unwrap().is_none(),
+                "{case}: locator row leaked"
+            );
+            assert!(
+                store
+                    .node_terminal_evidence_v3(&task, &attempt)
+                    .await
+                    .is_err(),
+                "{case}: node rows leaked"
+            );
         }
     }
 
@@ -16433,9 +16617,7 @@ mod tests {
 
         let attempt = AttemptId::parse("attempt-56565656565656565656565656565656").unwrap();
         let task = TaskId::parse("exec-56565656565656565656565656565656").unwrap();
-        let locator = v3_locator(&task, &attempt, 0, None);
-        let reservation = v3_reservation_for_locator(&task, &locator, '5');
-        let record = v3_task_record(&task, 33, &locator, &reservation);
+        let (locator, reservation, record) = fresh_v3_task_fixture(&task, &attempt, 33, '5').await;
         store
             .create_with_attempt_locator(&record, &locator)
             .await
@@ -16469,14 +16651,95 @@ mod tests {
         assert!(store.journal_from(&task, -1).await.unwrap().is_empty());
     }
 
+    async fn exercise_legacy_or_staged_terminal_replay_requires_v3_admission<
+        S: TaskStore + ?Sized,
+    >(
+        store: &S,
+        case: &str,
+        workflow_spec_json: String,
+        staged_rows: bool,
+        mark_ready: bool,
+        task_seed: &str,
+        attempt_seed: &str,
+    ) {
+        use bridge_core::task_store::DetachedTerminalCas;
+
+        let task = TaskId::parse(task_seed).unwrap();
+        let attempt = AttemptId::parse(attempt_seed).unwrap();
+        let (locator, reservation, mut record) =
+            fresh_v3_task_fixture(&task, &attempt, 45, '6').await;
+        record.workflow_spec_json = Some(workflow_spec_json);
+        store
+            .create_with_attempt_locator(&record, &locator)
+            .await
+            .unwrap();
+        if staged_rows {
+            store
+                .reserve_node_terminal_rows_v3(&task, &attempt, &reservation)
+                .await
+                .unwrap();
+        }
+        let op = bridge_core::ids::OperationId::parse(format!("op-{case}")).unwrap();
+        let terminal = v3_terminal();
+        store
+            .set_terminal_sequenced_pending(
+                &task,
+                &op,
+                TaskRecordStatus::Completed,
+                Some("legacy-done"),
+                None,
+                terminal.completed_ms,
+                &attempt,
+                &terminal,
+            )
+            .await
+            .unwrap();
+        if mark_ready {
+            store
+                .mark_terminal_projection_ready(&task, &attempt)
+                .await
+                .unwrap();
+        }
+        let before_record = store.get(&task).await.unwrap();
+        let before_pending = store.pending_terminal_projection(&task).await.unwrap();
+        let before_journal_len = store.journal_from(&task, -1).await.unwrap().len();
+        let result = store
+            .compare_set_detached_terminal_v3(
+                &task,
+                &attempt,
+                &op,
+                TaskRecordStatus::Completed,
+                Some("legacy-done"),
+                None,
+                terminal.completed_ms,
+                &terminal,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            result,
+            DetachedTerminalCas::Conflict,
+            "{case}: terminal replay without a complete atomic V3 marker must conflict"
+        );
+        assert_eq!(store.get(&task).await.unwrap(), before_record);
+        assert_eq!(
+            store.pending_terminal_projection(&task).await.unwrap(),
+            before_pending
+        );
+        assert_eq!(
+            store.journal_from(&task, -1).await.unwrap().len(),
+            before_journal_len
+        );
+    }
+
     async fn exercise_v3_resource_flights_are_globally_unique<S: TaskStore + ?Sized>(store: &S) {
         let first_attempt = AttemptId::parse("attempt-78787878787878787878787878787878").unwrap();
         let first_task = TaskId::parse("exec-78787878787878787878787878787878").unwrap();
-        let first_locator = v3_locator(&first_task, &first_attempt, 0, None);
-        let first_reservation = v3_reservation_for_locator(&first_task, &first_locator, '7');
+        let (first_locator, first_reservation, first_record) =
+            fresh_v3_task_fixture(&first_task, &first_attempt, 34, '7').await;
         store
             .create_with_attempt_locator_and_v3_reservation(
-                &v3_task_record(&first_task, 34, &first_locator, &first_reservation),
+                &first_record,
                 &first_locator,
                 &first_reservation,
             )
@@ -16485,11 +16748,11 @@ mod tests {
 
         let second_attempt = AttemptId::parse("attempt-89898989898989898989898989898989").unwrap();
         let second_task = TaskId::parse("exec-89898989898989898989898989898989").unwrap();
-        let second_locator = v3_locator(&second_task, &second_attempt, 0, None);
-        let second_reservation = v3_reservation_for_locator(&second_task, &second_locator, '7');
+        let (second_locator, second_reservation, second_record) =
+            fresh_v3_task_fixture(&second_task, &second_attempt, 35, '7').await;
         assert!(store
             .create_with_attempt_locator_and_v3_reservation(
-                &v3_task_record(&second_task, 35, &second_locator, &second_reservation),
+                &second_record,
                 &second_locator,
                 &second_reservation,
             )
@@ -16542,6 +16805,89 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn memory_and_sqlite_legacy_terminal_replay_requires_complete_v3_marker() {
+        let v1 = legacy_v1_spec_json();
+        let attempt_v2 = AttemptId::parse("attempt-11115656565656565656565656565656").unwrap();
+        let v2 = legacy_v2_spec_json(&attempt_v2).await;
+        for (case, spec, staged_rows, task, attempt) in [
+            (
+                "legacy-v1-pending",
+                v1.clone(),
+                false,
+                "exec-11115656565656565656565656565656",
+                "attempt-21115656565656565656565656565656",
+            ),
+            (
+                "legacy-v1-ready",
+                v1.clone(),
+                false,
+                "exec-11115656565656565656565656565657",
+                "attempt-21115656565656565656565656565657",
+            ),
+            (
+                "legacy-v2-pending",
+                v2.clone(),
+                false,
+                "exec-11115656565656565656565656565658",
+                "attempt-11115656565656565656565656565656",
+            ),
+            (
+                "legacy-v2-ready",
+                v2.clone(),
+                false,
+                "exec-11115656565656565656565656565659",
+                "attempt-11115656565656565656565656565656",
+            ),
+            (
+                "v3-staged-only-pending",
+                String::new(),
+                true,
+                "exec-11115656565656565656565656565660",
+                "attempt-21115656565656565656565656565660",
+            ),
+            (
+                "v3-staged-only-ready",
+                String::new(),
+                true,
+                "exec-11115656565656565656565656565661",
+                "attempt-21115656565656565656565656565661",
+            ),
+        ] {
+            let spec = if spec.is_empty() {
+                let task_id = TaskId::parse(task).unwrap();
+                let attempt_id = AttemptId::parse(attempt).unwrap();
+                fresh_v3_task_fixture(&task_id, &attempt_id, 45, '6')
+                    .await
+                    .2
+                    .workflow_spec_json
+                    .unwrap()
+            } else {
+                spec
+            };
+            exercise_legacy_or_staged_terminal_replay_requires_v3_admission(
+                &MemoryTaskStore::new(),
+                &format!("memory-{case}"),
+                spec.clone(),
+                staged_rows,
+                case.ends_with("ready"),
+                task,
+                attempt,
+            )
+            .await;
+            exercise_legacy_or_staged_terminal_replay_requires_v3_admission(
+                &SqliteStore::open_in_memory().unwrap(),
+                &format!("sqlite-{case}"),
+                spec,
+                staged_rows,
+                case.ends_with("ready"),
+                task,
+                attempt,
+            )
+            .await;
+        }
+    }
+
+    #[tokio::test]
     async fn memory_and_sqlite_v3_resource_flights_are_globally_unique() {
         exercise_v3_resource_flights_are_globally_unique(&MemoryTaskStore::new()).await;
         exercise_v3_resource_flights_are_globally_unique(&SqliteStore::open_in_memory().unwrap())
@@ -16555,18 +16901,13 @@ mod tests {
         let path = directory.path().join("v3-cas.sqlite");
         let attempt = AttemptId::parse("attempt-eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee").unwrap();
         let task = TaskId::parse("exec-ffffffffffffffffffffffffffffffff").unwrap();
-        let locator = v3_locator(&task, &attempt, 0, None);
-        let reservation = v3_reservation_for_locator(&task, &locator, 'f');
+        let (locator, reservation, record) = fresh_v3_task_fixture(&task, &attempt, 40, 'f').await;
         let terminal = v3_terminal();
         let op = bridge_core::ids::OperationId::parse("op-v3-reopen-cas").unwrap();
         let seq = {
             let store = SqliteStore::open_shared_history(&path).unwrap();
             store
-                .create_with_attempt_locator_and_v3_reservation(
-                    &v3_task_record(&task, 40, &locator, &reservation),
-                    &locator,
-                    &reservation,
-                )
+                .create_with_attempt_locator_and_v3_reservation(&record, &locator, &reservation)
                 .await
                 .unwrap();
             match store

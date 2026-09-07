@@ -645,6 +645,7 @@ version = "0.3.1"
 dependencies = [
  "async-trait",
  "bridge-core",
+ "bridge-workflow",
  "fs2",
  "libc",
  "rusqlite",
