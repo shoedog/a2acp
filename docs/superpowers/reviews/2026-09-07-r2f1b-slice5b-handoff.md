@@ -1,4 +1,4 @@
-# Handoff - R2f1b slice 5B V3 detached storage repair candidate
+# Handoff - R2f1b slice 5B V3 detached storage repair stop
 
 **Written:** 2026-09-07
 **Workspace:** `/Users/wesleyjinks/code/.a2a-implement/impl-14595-hlw4mgvd`
@@ -13,7 +13,7 @@ This repair keeps Slice 5B storage-only and production-unwired. No served coordi
 
 The authorized repair continued the existing rejected artifact rather than restarting. One Tier-3 provider repair turn used execution `exec-76ec188ce092da3e964eef5fa70a2e77`, attempt `attempt-2bff0bb4bcfe73bb750d215f184e5b67`, immutable image `sha256:f20be11bdc3cef088fe5c69ea13428d149d282f0babc57fc2d5412255f9db380`, Codex `gpt-5.5`/`high`, and no network. Its Cargo probes failed for unavailable registry/cache inputs and are inadmissible; the controller established the behavioral RED and all GREEN evidence below in one same-host environment.
 
-## Repair contents and pending disposition
+## Repair contents and final disposition
 
 1. Atomic V3 admission now calls the authoritative `WorkflowSnapshotV3::decode`, then binds its exact attempt, delivery attempt, contract activation and fingerprint, graph workflow and canonical bytes, controls, workload identity, locator, reservation, node roster, and node order before any store mutation.
 2. Memory and SQLite terminal CAS now validate the exact V3 locator, reservation, atomic-admission marker, typed snapshot, roster, and persisted node rows before either first apply or replay classification. Legacy V1/V2 rows and staged-only V3 rows therefore cannot return `Replayed` without complete V3 admission.
@@ -21,7 +21,11 @@ The authorized repair continued the existing rejected artifact rather than resta
 4. The earlier exact-Arc admission proof, post-readiness immutable replay evidence, stale-writer guard, and global resource-flight uniqueness mechanisms remain intact.
 5. `graph` and `run_spec` moved mechanically from `bridge-workflow` to `bridge-core` to let the store use the single authoritative decoder without a production dependency cycle. `bridge-workflow` re-exports both modules; the moved bodies were audited as behaviorally identical apart from crate-path/import normalization.
 
-The prior review's two deferred SMELLs remain outside this repair: staged/concurrent resource-flight uniqueness coverage and upgraded pre-5B database lifecycle coverage. They were not blockers and did not authorize scope expansion.
+The prior review's two deferred SMELLs remain: staged/concurrent resource-flight uniqueness coverage and upgraded pre-5B database lifecycle coverage. The final reviewer found no constructible incorrect result for either and kept both nonblocking.
+
+Final hard-read-only review of exact docs-inclusive head `be1ff0221a247157df949f445755da462c923f1e`, tree `7d8a67564f0c7a9a2b50e5844f64209134b4973e`, used execution `exec-5a8067bfc258b48ae4925a50c38fc2f7`, attempt `attempt-b6134fa8d183d8b4839397903d966d27`, raw Codex `gpt-5.6-sol`/`xhigh`, and returned **VERDICT: REJECT / WRONG_COUNT: 1 / SMELL_COUNT: 2**. Result artifact SHA-256 is `33a44b70163c4af1c781d42de540022090bd8c84752fe0bb85332521079b61ce`.
+
+The reviewer established one new blocker: `AttemptReservationV3` binds attempt, workflow, controls, workload fingerprint, roster, and minted resource-flight IDs, but not the canonical snapshot digest. Prompt content is absent from the workload fingerprint. Two genuine fresh admissions can therefore share the same attempt and reservation-visible fields while differing only in a node prompt. Pairing reservation A with snapshot B passes the authoritative decoder and current field comparisons, so Memory and SQLite persist a snapshot under custody minted for a different admission. The bounded repair is to add the canonical snapshot digest to `AttemptReservationV3`, mint it with the reservation, require an exact match before atomic admission, and add a two-genuine-same-attempt prompt-substitution RED for both stores.
 
 ## Evidence
 
@@ -52,6 +56,6 @@ Full verification from exact changed HEAD `79eccc470793427735034eb88dffd1feeba6e
 
 Production Rust accounting against `43b65d42a83b02ab4041a6680ea5c85fc6d00d82` is **1,035 logical lines**: the reviewed artifact's 922 plus 113 behavioral repair LLOC. The mechanically moved 1,094 lines and two re-export lines are excluded, as authorized, along with tests, comments, docstrings, blank lines, and delimiter-only structure. The candidate remains below the 1,050 production-LLOC cap.
 
-## Convergence gate
+## Convergence stop
 
-The one authorized repair turn is spent. One final hard-read-only Sol/xhigh rereview remains and must inspect the exact docs-inclusive candidate diff before any acceptance claim. Until that rereview returns, this artifact is neither accepted nor publishable. No further repair, push, PR, merge, release, deployment, live smoke, compatibility case, or running-operator mutation is authorized or claimed.
+The authorized one repair turn and one final hard-read-only rereview are exhausted. Code commit `79eccc470793427735034eb88dffd1feeba6eef4` remains rejected and must not be published or merged. No further repair, review, push, PR, merge, release, deployment, live smoke, compatibility case, or running-operator mutation is authorized or claimed. A new owner-authorized bounded repair must continue this existing artifact, bind the reservation to the exact canonical snapshot, and add the two-genuine-object behavioral RED; it must not restart from scratch.
