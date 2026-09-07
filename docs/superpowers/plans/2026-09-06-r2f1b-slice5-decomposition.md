@@ -1,6 +1,6 @@
 # R2f1b slice 5 - persistence and serving parity decomposition
 
-**Base:** merged `origin/main` `34ced0f93526f981a835c237c56d7ba580e989f4` (PR #100, R2f1b 4J), tree `192ba759a98eccbc9c5f21c187beddf8996c4463`.
+**Base:** Slice 5 started from merged `origin/main` `34ced0f93526f981a835c237c56d7ba580e989f4` (PR #100, R2f1b 4J), tree `192ba759a98eccbc9c5f21c187beddf8996c4463`. Slice 5B is bound to merged Slice 5A / PR #101 at `43b65d42a83b02ab4041a6680ea5c85fc6d00d82`, tree `21103adb5a4916043d8802d01ac63408a41abbd8`.
 
 ## 0. Scope
 
@@ -32,6 +32,19 @@ The repaired continuation is limited to `crates/bridge-workflow/src/admission.rs
 ## 3. Boundaries for later slices
 
 5B owns durable V3 reservation and detached terminal CAS. It must land before 5C through 5E because a real surface cannot ask for automatic V3 admission until storage can retain the snapshot and terminal result without falling back to a V2-only claim.
+
+### 5B candidate evidence (2026-09-07)
+
+Repair turn R2f1b Slice 5B continues from pre-repair candidate `6193f63022ac10c8057f398deba3c9abb0c2e7ce`, tree `9d59475c49f6af3bc654d59947dfafdf312825bb`, on base `43b65d42a83b02ab4041a6680ea5c85fc6d00d82`, tree `21103adb5a4916043d8802d01ac63408a41abbd8`. The checkout was clean at that candidate before repair edits.
+
+5B remains storage-only and production-unwired. The repair adds exact fresh automatic proof verification at the coordinator constructor boundary; atomic V3 snapshot JSON validation bound to the typed reservation; a durable complete-admission marker for exact task/attempt/snapshot/full roster; mark-ready replay preservation across Memory and SQLite reopen; and global resource-flight uniqueness across existing V3 task-side reservations. V1/V2 behavior is preserved, and staged/incomplete V3 rows cannot satisfy detached V3 terminal CAS. The stale-writer path keeps the exact-attempt predicate guard and mutation assertions.
+
+Same-image base RED on exact `6193f630` failed on all five intended mechanisms: equal-valued rewrapped admission authority was accepted; invalid/unbound V3 snapshot bytes were accepted; staged rows could satisfy terminal CAS without a complete admission marker; exact terminal replay after readiness/reopen conflicted; and resource-flight identity was reusable across tasks. Zero-selection crates.io/cache failures from the worker are explicitly inadmissible and are not used as RED evidence.
+
+Changed-tree verification in immutable Tier-3 image `sha256:f20be11bdc3cef088fe5c69ea13428d149d282f0babc57fc2d5412255f9db380` is green: focused store **11/11**, coordinator **1/1**, workflow refusal **1/1**; workspace Clippy with all targets/features and warnings denied; full suite **4,407 passed / 0 failed / 13 ignored / 714 filtered**; doctests **2 passed / 0 failed**; maximal workspace build; release bridge build; repository hygiene (`41` tracked artifacts, `9` example configs); `cargo fmt --all -- --check`; and `git diff --check`. Production Rust delta is **922 added logical lines** against `43b65d42` by the handoff method, under the 1,050 cap. One final Sol/xhigh hard-read-only rereview remains pending. No live smoke, compatibility case, provider session, registry/image mutation, release, deployment, served-bridge restart, running-operator change, push, PR, or merge is claimed.
+
+
+5C may start only after 5B merges. It should call the 5A fresh admission API and reuse the 5B typed reservation/CAS seams; it must not recreate a second reservation or make provider/session/worktree effects before successful storage reservation.
 
 5C owns served coordinator, A2A, and MCP routing. It should consume the 5A API rather than recreating contract minting, and it must prove request refusal ordering before any provider/session/process/worktree effect.
 

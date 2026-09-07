@@ -89,6 +89,32 @@ impl FreshR2f1bAdmissionProofV1 {
     }
 }
 
+pub fn verify_fresh_r2f1b_admission_v1(
+    admitted: &AdmittedWorkflowRunV1,
+) -> Result<(), BridgeError> {
+    let Some(r2f1b) = admitted.r2f1b.as_ref() else {
+        return Err(invalid(
+            "fresh R2f1b admission proof requires its admitted contract",
+        ));
+    };
+    let Some(proof) = admitted.fresh_r2f1b_admission.as_ref() else {
+        return Err(invalid(
+            "fresh R2f1b admission proof is required for automatic V3 custody",
+        ));
+    };
+    if !proof.admits_run_spec(&admitted.run_spec) {
+        return Err(invalid(
+            "fresh R2f1b admission proof does not match the admitted run specification",
+        ));
+    }
+    if !proof.admits_contract(r2f1b) {
+        return Err(invalid(
+            "fresh R2f1b admission proof does not match the admitted contract",
+        ));
+    }
+    admit_fresh_r2f1b_contract_v1(&admitted.run_spec.attempt_id, r2f1b)
+}
+
 /// One R2f1b contract offered to admission, with the attempt that will execute it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct R2f1bAdmissionV1 {

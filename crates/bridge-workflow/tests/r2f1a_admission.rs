@@ -742,6 +742,15 @@ async fn fresh_v3_admission_mints_automatic_worktree_contract_and_snapshot_in_on
             &admitted_contract.contract_fingerprint,
         )
     );
+    bridge_workflow::admission::verify_fresh_r2f1b_admission_v1(&result.admitted)
+        .expect("fresh proof must authenticate its exact admitted authority");
+    let context = bridge_workflow::executor::WorkflowRunContext {
+        session_cwd: Some(SessionCwd::parse("/allowed/repo").unwrap()),
+        ..Default::default()
+    };
+    bridge_workflow::executor::WorkflowDiagnosticContext::in_memory(context)
+        .with_admitted_workflow_run(result.admitted.clone())
+        .expect("exact fresh authority must bind into the canonical executor context");
     let encoded = result.snapshot.encode().unwrap();
     assert_eq!(
         bridge_workflow::run_spec::WorkflowSnapshotV3::decode(&encoded).unwrap(),
@@ -766,6 +775,18 @@ async fn fresh_v3_admission_mints_automatic_worktree_contract_and_snapshot_in_on
     .unwrap();
     assert_eq!(direct_calls.load(Ordering::SeqCst), 4);
     assert!(direct.snapshot.r2f1b.custody_plans.is_empty());
+}
+
+#[tokio::test]
+async fn fresh_r2f1b_verifier_refuses_direct_constructed_authority() {
+    let admitted = admit_with_contract(DeadlineActivationV2::ManualOnlyR2f1a)
+        .await
+        .expect("manual public authority is otherwise admissible");
+
+    assert!(
+        bridge_workflow::admission::verify_fresh_r2f1b_admission_v1(&admitted).is_err(),
+        "a caller-constructed public contract must not satisfy fresh V3 custody"
+    );
 }
 
 #[tokio::test]
