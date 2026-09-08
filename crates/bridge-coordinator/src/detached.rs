@@ -638,6 +638,9 @@ pub fn detached_v3_attempt_reservation(
         },
         controls_json,
         controls_fingerprint: snapshot.delivery_spec.controls_fingerprint.clone(),
+        workflow_snapshot_digest: snapshot
+            .digest()
+            .map_err(|_| BridgeError::InvalidStateTransition)?,
         expected_node_count,
         nodes,
     };

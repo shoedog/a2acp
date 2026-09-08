@@ -15885,13 +15885,15 @@ mod tests {
         }
     }
 
-    fn v3_builder_graph() -> Arc<bridge_workflow::graph::WorkflowGraph> {
+    fn v3_builder_graph_with_prompt(
+        prompt_template: &str,
+    ) -> Arc<bridge_workflow::graph::WorkflowGraph> {
         Arc::new(bridge_workflow::graph::WorkflowGraph {
             id: WorkflowId::parse("review").unwrap(),
             nodes: vec![bridge_workflow::graph::WorkflowNode {
                 id: NodeId::parse("root").unwrap(),
                 agent: AgentId::parse("reader").unwrap(),
-                prompt_template: "{{input}}".into(),
+                prompt_template: prompt_template.into(),
                 inputs: vec![],
                 retry: None,
                 harvest_sanitization: None,
@@ -15899,6 +15901,10 @@ mod tests {
             panel: None,
             controls: None,
         })
+    }
+
+    fn v3_builder_graph() -> Arc<bridge_workflow::graph::WorkflowGraph> {
+        v3_builder_graph_with_prompt("{{input}}")
     }
 
     fn attempt_identity(task: &TaskId, attempt: &AttemptId) -> bridge_core::ids::AttemptIdentity {
@@ -15920,6 +15926,24 @@ mod tests {
         bridge_core::workflow_history::AttemptReservationV3,
         TaskRecord,
     ) {
+        let (locator, reservation, record, _, _) =
+            fresh_v3_task_fixture_with_prompt(task, attempt, ms, flight, "{{input}}").await;
+        (locator, reservation, record)
+    }
+
+    async fn fresh_v3_task_fixture_with_prompt(
+        task: &TaskId,
+        attempt: &AttemptId,
+        ms: i64,
+        flight: char,
+        prompt_template: &str,
+    ) -> (
+        bridge_core::task_store::TaskAttemptLocator,
+        bridge_core::workflow_history::AttemptReservationV3,
+        TaskRecord,
+        bridge_workflow::admission::AdmittedWorkflowRunV1,
+        bridge_workflow::run_spec::WorkflowSnapshotV3,
+    ) {
         use bridge_core::workflow_history::{
             AttemptReservation, AttemptReservationV3, ExecutionSurface, HistoryNodeReservationV3,
             WORKFLOW_HISTORY_EVIDENCE_SCHEMA_V3,
@@ -15939,7 +15963,7 @@ mod tests {
                 identity.clone(),
                 bridge_workflow::admission::WorkflowAdmissionRequestV1 {
                     attempt_id: attempt.clone(),
-                    graph: v3_builder_graph(),
+                    graph: v3_builder_graph_with_prompt(prompt_template),
                     requested_session_cwd: None,
                     policy_invocation: ExecutionPolicyInvocationV1::default(),
                     ledger_admission: LedgerAdmissionV1::HistoryLedgerAdmitted {
@@ -15950,7 +15974,9 @@ mod tests {
             )
             .await
             .unwrap();
-        let snapshot = fresh.snapshot;
+        bridge_workflow::admission::verify_fresh_r2f1b_admission_v1(&fresh.admitted).unwrap();
+        fresh.snapshot.validate().unwrap();
+        let snapshot = fresh.snapshot.clone();
         let snapshot_json = String::from_utf8(snapshot.encode().unwrap()).unwrap();
         let controls_json =
             String::from_utf8(snapshot.delivery_spec.controls.encode_canonical().unwrap()).unwrap();
@@ -15990,6 +16016,7 @@ mod tests {
                 pinned: false,
             },
             controls_fingerprint: snapshot.delivery_spec.controls_fingerprint.clone(),
+            workflow_snapshot_digest: snapshot.digest().unwrap(),
             expected_node_count,
             nodes: reservation_nodes,
             controls_json,
@@ -16002,7 +16029,7 @@ mod tests {
         let mut record = trec(task.as_str(), ms);
         record.workflow = snapshot.delivery_spec.graph.id.as_str().to_owned();
         record.workflow_spec_json = Some(snapshot_json);
-        (locator, reservation, record)
+        (locator, reservation, record, fresh.admitted, snapshot)
     }
 
     async fn legacy_v2_spec_json(attempt: &AttemptId) -> String {
@@ -16087,6 +16114,7 @@ mod tests {
                 "controls-{}",
                 Sha256HexV1::digest(controls_json.as_bytes()).as_str()
             ),
+            workflow_snapshot_digest: Sha256HexV1::digest(b"sqlite-task-v3-snapshot"),
             expected_node_count: 1,
             nodes: vec![HistoryNodeReservationV3 {
                 node: NodeId::parse("root").unwrap(),
@@ -16533,6 +16561,121 @@ mod tests {
         assert!(store.get(&collision).await.unwrap().is_none());
     }
 
+    async fn assert_v3_admission_public_absent<S: TaskStore + ?Sized>(
+        store: &S,
+        task: &TaskId,
+        attempt: &AttemptId,
+    ) {
+        assert!(store.get(task).await.unwrap().is_none());
+        assert!(store.get_attempt_locator(task).await.unwrap().is_none());
+        assert!(store
+            .pending_terminal_projection(task)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(store
+            .node_terminal_evidence_v3(task, attempt)
+            .await
+            .is_err());
+    }
+
+    fn assert_sqlite_v3_admission_private_absent(
+        store: &SqliteStore,
+        task: &TaskId,
+        attempt: &AttemptId,
+    ) {
+        let conn = store.conn.lock().unwrap();
+        for sql in [
+            "SELECT COUNT(*) FROM tasks WHERE id=?1",
+            "SELECT COUNT(*) FROM task_attempt_locators WHERE task_id=?1",
+            "SELECT COUNT(*) FROM task_v3_atomic_admissions WHERE task_id=?1",
+            "SELECT COUNT(*) FROM task_node_terminals_v3 WHERE task_id=?1",
+            "SELECT COUNT(*) FROM task_journal WHERE task_id=?1",
+        ] {
+            let count: i64 = conn
+                .query_row(sql, rusqlite::params![task.as_str()], |row| row.get(0))
+                .unwrap();
+            assert_eq!(count, 0, "{sql}");
+        }
+        for sql in [
+            "SELECT COUNT(*) FROM attempt_identities WHERE attempt_id=?1",
+            "SELECT COUNT(*) FROM workflow_attempt_summaries WHERE attempt_id=?1",
+            "SELECT COUNT(*) FROM workflow_history_attachment WHERE attempt_id=?1",
+        ] {
+            let count: i64 = conn
+                .query_row(sql, rusqlite::params![attempt.as_str()], |row| row.get(0))
+                .unwrap();
+            assert_eq!(count, 0, "{sql}");
+        }
+    }
+
+    async fn exercise_v3_reservation_snapshot_digest_binds_exact_snapshot() {
+        let attempt = AttemptId::parse("attempt-90909090909090909090909090909090").unwrap();
+        let task = TaskId::parse("exec-90909090909090909090909090909090").unwrap();
+        let (locator_a, reservation_a, record_a, admitted_a, snapshot_a) =
+            fresh_v3_task_fixture_with_prompt(&task, &attempt, 36, '9', "{{input}}").await;
+        let (locator_b, reservation_b, record_b, admitted_b, snapshot_b) =
+            fresh_v3_task_fixture_with_prompt(&task, &attempt, 36, '9', "altered {{input}}").await;
+
+        bridge_workflow::admission::verify_fresh_r2f1b_admission_v1(&admitted_a).unwrap();
+        bridge_workflow::admission::verify_fresh_r2f1b_admission_v1(&admitted_b).unwrap();
+        snapshot_a.validate().unwrap();
+        snapshot_b.validate().unwrap();
+        let encoded_a = snapshot_a.encode().unwrap();
+        let encoded_b = snapshot_b.encode().unwrap();
+        assert_ne!(encoded_a, encoded_b);
+        assert_ne!(snapshot_a.digest().unwrap(), snapshot_b.digest().unwrap());
+        assert_eq!(
+            record_a.workflow_spec_json.as_deref().unwrap().as_bytes(),
+            encoded_a.as_slice()
+        );
+        assert_eq!(
+            record_b.workflow_spec_json.as_deref().unwrap().as_bytes(),
+            encoded_b.as_slice()
+        );
+        assert_eq!(locator_a, locator_b);
+        assert_eq!(reservation_a.reservation, reservation_b.reservation);
+        assert_eq!(reservation_a.controls_json, reservation_b.controls_json);
+        assert_eq!(
+            reservation_a.controls_fingerprint,
+            reservation_b.controls_fingerprint
+        );
+        assert_eq!(
+            reservation_a.expected_node_count,
+            reservation_b.expected_node_count
+        );
+        assert_eq!(reservation_a.nodes, reservation_b.nodes);
+
+        let memory_accept = MemoryTaskStore::new();
+        memory_accept
+            .create_with_attempt_locator_and_v3_reservation(&record_a, &locator_a, &reservation_a)
+            .await
+            .unwrap();
+        let memory_reject = MemoryTaskStore::new();
+        assert!(memory_reject
+            .create_with_attempt_locator_and_v3_reservation(&record_b, &locator_b, &reservation_a)
+            .await
+            .is_err());
+        assert_v3_admission_public_absent(&memory_reject, &task, &attempt).await;
+        assert!(memory_reject
+            .journal_from(&task, -1)
+            .await
+            .is_ok_and(|events| events.is_empty()));
+
+        let sqlite_accept = SqliteStore::open_in_memory().unwrap();
+        sqlite_accept
+            .create_with_attempt_locator_and_v3_reservation(&record_a, &locator_a, &reservation_a)
+            .await
+            .unwrap();
+        let sqlite_reject = SqliteStore::open_in_memory().unwrap();
+        assert!(sqlite_reject
+            .create_with_attempt_locator_and_v3_reservation(&record_b, &locator_b, &reservation_a)
+            .await
+            .is_err());
+        assert_v3_admission_public_absent(&sqlite_reject, &task, &attempt).await;
+        assert_sqlite_v3_admission_private_absent(&sqlite_reject, &task, &attempt);
+    }
+
     async fn exercise_v3_atomic_admission_rejects_bad_snapshot_bytes<S: TaskStore + ?Sized>(
         store: &S,
     ) {
@@ -16783,6 +16926,11 @@ mod tests {
     async fn memory_and_sqlite_v3_atomic_admission_refuses_mismatch_without_partial_rows() {
         exercise_v3_admission_refusals_are_atomic(&MemoryTaskStore::new()).await;
         exercise_v3_admission_refusals_are_atomic(&SqliteStore::open_in_memory().unwrap()).await;
+    }
+
+    #[tokio::test]
+    async fn memory_and_sqlite_v3_reservation_snapshot_digest_binds_exact_snapshot() {
+        exercise_v3_reservation_snapshot_digest_binds_exact_snapshot().await;
     }
 
     #[tokio::test]
@@ -23078,6 +23226,7 @@ mod r2f0a_history_tests {
             reservation: reservation(),
             controls_json,
             controls_fingerprint,
+            workflow_snapshot_digest: Sha256HexV1::digest(b"sqlite-structured-history-v3-snapshot"),
             expected_node_count: 2,
             nodes: vec![
                 HistoryNodeReservationV3 {

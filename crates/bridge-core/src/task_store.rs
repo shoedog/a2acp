@@ -378,7 +378,9 @@ pub fn validate_atomic_v3_admission_marker(
         .enumerate()
         .all(|(ordinal, node)| u32::try_from(ordinal).ok() == Some(node.sorted_ordinal));
 
-    if snapshot.attempt != locator.identity
+    if snapshot.digest().map_err(|_| BridgeError::StoreFailure)?
+        != reservation.workflow_snapshot_digest
+        || snapshot.attempt != locator.identity
         || snapshot.delivery_spec.attempt_id != locator.identity.attempt_id
         || snapshot.predecessor_snapshot_digest.is_some()
         || snapshot.r2f1b.activation
@@ -5737,6 +5739,7 @@ mod tests {
                     "controls-{}",
                     Sha256HexV1::digest(controls_json.as_bytes()).as_str()
                 ),
+                workflow_snapshot_digest: Sha256HexV1::digest(b"task-store-v3-snapshot"),
                 expected_node_count: 1,
                 nodes: vec![HistoryNodeReservationV3 {
                     node: NodeId::parse("root").unwrap(),
