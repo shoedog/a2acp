@@ -1,4 +1,4 @@
-# Handoff - R2f1b slice 5B V3 detached storage snapshot-digest repair candidate
+# Handoff - R2f1b slice 5B approved local candidate
 
 **Written:** 2026-09-07
 **Workspace:** `/Users/wesleyjinks/code/.a2a-implement/impl-14595-hlw4mgvd`
@@ -22,11 +22,11 @@ The authorized repair continued the existing rejected artifact rather than resta
 5. The earlier exact-Arc admission proof, terminal replay controls, stale-writer guard, and global resource-flight uniqueness mechanisms remain intact.
 6. `graph` and `run_spec` remain mechanically located in `bridge-core` and re-exported from `bridge-workflow` to avoid a production dependency cycle.
 
-The prior review's two deferred SMELLs remain: staged/concurrent resource-flight uniqueness coverage and upgraded pre-5B database lifecycle coverage. The final reviewer found no constructible incorrect result for either and kept both nonblocking.
+Three deferred SMELLs remain: end-to-end coverage through the production reservation minter, staged/concurrent resource-flight uniqueness coverage, and upgraded pre-5B database lifecycle coverage. The final reviewer found no current reachable incorrect result for any of them and kept all nonblocking.
 
-Final hard-read-only review of exact docs-inclusive head `be1ff0221a247157df949f445755da462c923f1e`, tree `7d8a67564f0c7a9a2b50e5844f64209134b4973e`, used execution `exec-5a8067bfc258b48ae4925a50c38fc2f7`, attempt `attempt-b6134fa8d183d8b4839397903d966d27`, raw Codex `gpt-5.6-sol`/`xhigh`, and returned **VERDICT: REJECT / WRONG_COUNT: 1 / SMELL_COUNT: 2**. Result artifact SHA-256 is `33a44b70163c4af1c781d42de540022090bd8c84752fe0bb85332521079b61ce`.
+The prior hard-read-only review of exact docs-inclusive head `be1ff0221a247157df949f445755da462c923f1e`, tree `7d8a67564f0c7a9a2b50e5844f64209134b4973e`, used execution `exec-5a8067bfc258b48ae4925a50c38fc2f7`, attempt `attempt-b6134fa8d183d8b4839397903d966d27`, raw Codex `gpt-5.6-sol`/`xhigh`, and returned **VERDICT: REJECT / WRONG_COUNT: 1 / SMELL_COUNT: 2**. Result artifact SHA-256 is `33a44b70163c4af1c781d42de540022090bd8c84752fe0bb85332521079b61ce`.
 
-The reviewer established one new blocker: `AttemptReservationV3` binds attempt, workflow, controls, workload fingerprint, roster, and minted resource-flight IDs, but not the canonical snapshot digest. Prompt content is absent from the workload fingerprint. Two genuine fresh admissions can therefore share the same attempt and reservation-visible fields while differing only in a node prompt. Pairing reservation A with snapshot B passes the authoritative decoder and current field comparisons, so Memory and SQLite persist a snapshot under custody minted for a different admission. The bounded repair is to add the canonical snapshot digest to `AttemptReservationV3`, mint it with the reservation, require an exact match before atomic admission, and add a two-genuine-same-attempt prompt-substitution RED for both stores.
+That prior reviewer established one new blocker: `AttemptReservationV3` bound attempt, workflow, controls, workload fingerprint, roster, and minted resource-flight IDs, but not the canonical snapshot digest. Prompt content was absent from the workload fingerprint. Two genuine fresh admissions could therefore share the same attempt and reservation-visible fields while differing only in a node prompt. Pairing reservation A with snapshot B passed the authoritative decoder and field comparisons, so Memory and SQLite could persist a snapshot under custody minted for a different admission. The bounded continuation below closes that exact mechanism.
 
 ## Evidence
 
@@ -63,6 +63,6 @@ Full verification from exact changed HEAD `6338bc1628fed52b772026b604a1bbdd710ef
 
 Production Rust accounting against `43b65d42a83b02ab4041a6680ea5c85fc6d00d82` is **1,038 logical lines**: the prior 1,035 plus three snapshot-digest binding LLOC. The mechanically moved 1,094 lines and two re-export lines are excluded, as authorized, along with tests, comments, docstrings, blank lines, and delimiter-only structure. The candidate remains below the 1,050 production-LLOC cap.
 
-## Final rereview gate
+## Final rereview and convergence stop
 
-The authorized bounded continuation repair turn is exhausted. Exactly one final Sol/xhigh hard-read-only rereview remains; its result must be recorded here without silently extending either cap. Until that adjudication, code commit `6338bc1628fed52b772026b604a1bbdd710efa8c` is a local candidate only. No push, PR, merge, release, deployment, live smoke, compatibility case, registry/image mutation, or running-operator change is authorized or claimed.
+Final Sol/xhigh hard-read-only rereview of exact docs-inclusive head `1b30ed45b68b6b95cde07103c174af22470d78fb`, tree `e6669e8c1e58cf6fab9a1dd3be709380ccc395d8`, used execution `exec-614a60456fdf620dd445d82842d57534`, attempt `attempt-c546b5e336c1b3855e62b54b3d713795`, raw Codex `gpt-5.6-sol`/`xhigh`, and returned **VERDICT: APPROVE / WRONG_COUNT: 0 / SMELL_COUNT: 3**. Result artifact SHA-256 is `3818cc2bf69ced8de1b7fb66680e1d6b941627d8b914f352b5a6b58d0955d93b1`. The reviewer traced all constructors and both stores, confirmed the required digest is minted from and checked against the exact canonical snapshot before mutation, confirmed the behavioral RED is discriminating, and confirmed all production callers remain unwired. The authorized one repair and one final rereview are exhausted. Code commit `6338bc1628fed52b772026b604a1bbdd710efa8c` is an approved local candidate; no further repair or review is authorized. No push, PR, merge, release, deployment, live smoke, compatibility case, registry/image mutation, or running-operator change is authorized or claimed.
