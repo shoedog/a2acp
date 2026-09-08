@@ -1,6 +1,6 @@
 # R2f1b slice 5 - persistence and serving parity decomposition
 
-**Base:** merged `origin/main` `34ced0f93526f981a835c237c56d7ba580e989f4` (PR #100, R2f1b 4J), tree `192ba759a98eccbc9c5f21c187beddf8996c4463`.
+**Base:** Slice 5 started from merged `origin/main` `34ced0f93526f981a835c237c56d7ba580e989f4` (PR #100, R2f1b 4J), tree `192ba759a98eccbc9c5f21c187beddf8996c4463`. Slice 5B is bound to merged Slice 5A / PR #101 at `43b65d42a83b02ab4041a6680ea5c85fc6d00d82`, tree `21103adb5a4916043d8802d01ac63408a41abbd8`.
 
 ## 0. Scope
 
@@ -32,6 +32,21 @@ The repaired continuation is limited to `crates/bridge-workflow/src/admission.rs
 ## 3. Boundaries for later slices
 
 5B owns durable V3 reservation and detached terminal CAS. It must land before 5C through 5E because a real surface cannot ask for automatic V3 admission until storage can retain the snapshot and terminal result without falling back to a V2-only claim.
+
+### 5B candidate evidence (2026-09-07)
+
+R2f1b Slice 5B continues from pre-repair candidate `6193f63022ac10c8057f398deba3c9abb0c2e7ce`, tree `9d59475c49f6af3bc654d59947dfafdf312825bb`, on base `43b65d42a83b02ab4041a6680ea5c85fc6d00d82`, tree `21103adb5a4916043d8802d01ac63408a41abbd8`. The prior repaired candidate `abb881b90850ec01ca3ba8dd274002ac23e227cd` was rejected for two WRONG findings: non-authoritative snapshot validation and replay-before-marker classification.
+
+Current repaired code commit `6338bc1628fed52b772026b604a1bbdd710efa8c`, tree `44616d3e8f05a2ec4607911048128221f7914221`, keeps 5B storage-only and production-unwired. It retains the prior authoritative decoder and terminal-state repairs, and now makes `AttemptReservationV3.workflow_snapshot_digest` a required strongly typed field minted from the same canonical snapshot. Memory and SQLite reject a decoded snapshot whose digest does not exactly match the reservation before any mutation.
+
+Same-host behavioral RED on exact prior rejected commit `abb881b9` selected one test per blocker: fabricated unknown-field V3 bytes were admitted (**0/1/270 filtered**), and legacy memory V1 pending state returned `Replayed { seq: 2 }` instead of `Conflict` (**0/1/270 filtered**). The repaired candidate passes each selector plus SQLite reopen and genuine-builder/CAS controls (**4/4**, each with 270 filtered). Zero-selection, registry/cache, and sandbox-denied probes are explicitly inadmissible.
+
+The bounded continuation's behavioral RED copied only its regression onto exact pre-change docs head `55f59950`: **0 passed / 1 failed / 271 filtered** because genuine admission B's snapshot was accepted with genuine reservation A in Memory. Exact code HEAD `6338bc16` passes the same Memory-and-SQLite selector **1 passed / 0 failed / 271 filtered**; the test also proves distinct canonical bytes and digests and absence of task, history, snapshot, reservation, marker, roster, and node-row mutation on rejection.
+
+Full verification from exact code HEAD `6338bc16` is green: workspace all-target/all-feature check and warnings-denied Clippy; all-target suite **4,408 passed / 0 failed / 13 ignored / 726 filtered** across 86 records; doctests **2 passed / 0 failed** across 16 crate records; maximal workspace build; release bridge build; repository hygiene (`41` tracked artifacts, `9` example configs); `cargo fmt --all -- --check`; and `git diff --check`. Production accounting is **1,038 logical lines** against `43b65d42`, excluding tests, comments, docstrings, blank/delimiter-only lines and the previously authorized mechanical move, under the 1,050 cap. Final Sol/xhigh hard-read-only review of docs-inclusive head `1b30ed45`, tree `e6669e8c`, used execution `exec-614a60456fdf620dd445d82842d57534`, attempt `attempt-c546b5e336c1b3855e62b54b3d713795`, and returned **APPROVE / 0 WRONG / 3 SMELL**. The minter-coverage, staged/concurrent uniqueness-coverage, and upgraded pre-5B database-lifecycle SMELLs are deferred because none has a current reachable incorrect result. The repair/review cap is exhausted; no live smoke, compatibility case, registry/image mutation, release, deployment, served-bridge restart, running-operator change, push, PR, or merge is authorized or claimed.
+
+
+5C may start only after 5B merges. It should call the 5A fresh admission API and reuse the 5B typed reservation/CAS seams; it must not recreate a second reservation or make provider/session/worktree effects before successful storage reservation.
 
 5C owns served coordinator, A2A, and MCP routing. It should consume the 5A API rather than recreating contract minting, and it must prove request refusal ordering before any provider/session/process/worktree effect.
 

@@ -303,6 +303,7 @@ pub struct AttemptReservationV3 {
     pub reservation: AttemptReservation,
     pub controls_json: String,
     pub controls_fingerprint: String,
+    pub workflow_snapshot_digest: crate::execution_policy::Sha256HexV1,
     pub expected_node_count: u32,
     pub nodes: Vec<HistoryNodeReservationV3>,
 }
@@ -2553,6 +2554,7 @@ mod tests {
             reservation: served_reservation(identity, ExecutionSurface::Offline),
             controls_json,
             controls_fingerprint,
+            workflow_snapshot_digest: Sha256HexV1::digest(b"structured-reservation-v3-snapshot"),
             expected_node_count: 2,
             nodes: vec![
                 HistoryNodeReservationV3 {

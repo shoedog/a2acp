@@ -5,54 +5,13 @@
   4J PR #100 with tree `192ba759a98eccbc9c5f21c187beddf8996c4463`. Its ancestry contains PR #99
   (`065935e0`, R2f1b 4I), provider compatibility/runbook PR #98, OpenCode Go documentation PR #97, provider
   runtime-dispatch PR #96, provider refresh PRs #90-#95, and R2f1b 4H-2 PR #89.
-- **Completed through:** R2f1b 4J is **MERGED** by PR #100 at
-  `34ced0f93526f981a835c237c56d7ba580e989f4`; its approved review and aggregate verification remain in the
+- **Completed through:** R2f1b 5A is **MERGED** by PR #101 at
+  `43b65d42a83b02ab4041a6680ea5c85fc6d00d82`; 4J remains merged by PR #100 at
+  `34ced0f93526f981a835c237c56d7ba580e989f4`, with approved review and aggregate verification in the
   [4J handoff](superpowers/reviews/2026-09-06-r2f1b-slice4j-handoff.md).
-- **Active slice:** **R2f1b 5A FRESH V3 ADMISSION AUTHORITY EXACT RUN-SPEC PROOF-BINDING REPAIR /
-  RETAINED PREDECESSOR `7d5cd283` / 120-LINE CONTINUATION / 656 CUMULATIVE RUST-LINE ARTIFACT / PRODUCTION-UNWIRED /
-  NO LIVE, PROVIDER, OR OPERATOR EFFECTS (2026-09-06).** 5A adds `WorkflowAdmissionV1::freeze_fresh_v3`,
-  an owned automatic-contract builder that validates a fresh root attempt, refuses caller-supplied contracts on this
-  path, performs one checkout-planning pass, mints custody plans with nonzero CSPRNG `WorktreeCustodyIdV1` values,
-  deduplicates identical checkout digests, refuses same-digest target conflicts, and returns matching
-  `AdmittedWorkflowRunV1` plus canonical `WorkflowSnapshotV3`. The final hard-read-only review of exact candidate
-  `7d5cd2839a034410b0b289e7972065d1d5850c17` was host Codex `gpt-5.6-sol`/`xhigh` hard-read-only execution
-  `exec-52e6aa6c7b9d1ca997c3dc204f2b52eb`, attempt `attempt-77929e6e9065ae97803dec6906bfc058`, result
-  `/private/tmp/r2f1b-slice5a-final-rereview-result-20260906.md`, SHA-256
-  `725bcccb87643371377f106c1310918d4b1aa73d9e049e2d8273234239d344a6`. It returned one `WRONG` blocker: the private
-  fresh proof authenticated the retained `Arc<R2f1bAdmissionV1>` contract but not the exact
-  `Arc<WorkflowRunSpecV1>` produced beside it, so two genuine same-attempt fresh V3 admissions could be mixed and the
-  canonical binder accepted B's public run spec under A's proof/contract. It also returned one deferred evidence-
-  provenance `SMELL`; this repair closes only the blocker. The repaired continuation is limited to
-  `crates/bridge-workflow/src/admission.rs`,
-  `crates/bridge-workflow/src/executor.rs`, and the already-staged
-  `crates/bridge-workflow/tests/r2f1a_bound_executor.rs`; the prior admission-test artifact remains unchanged. The
-  fresh proof now retains both exact Arcs minted from the same successful `freeze_fresh_v3` result, and the canonical
-  binder requires `Arc::ptr_eq` for both before binding custody. A run-spec mismatch returns typed `ConfigInvalid` with
-  stable reason `fresh R2f1b admission proof does not match the admitted run specification`; the existing contract
-  mismatch reason, `(None, None)` V2 path, `(None, Some)` refusal, and `(Some, None)` explicit/manual path remain
-  unchanged. Same-host RED on candidate `7d5cd283` with only the preserved staged test selected one test, constructed
-  two genuine same-attempt fresh V3 admissions with distinct direct workflow specs, and failed **0 passed / 1 failed /
-  22 filtered** because the mixed admission was accepted; retained log SHA-256
-  `b183db1d5e90912f2c9a5970c43054c6321eeb14da2729a5f6316e57e955e618`. The exact Rust continuation adds **120**
-  nonblank formatted lines versus `7d5cd283`; the cumulative 5A Rust artifact measures **656** added nonblank
-  formatted lines versus merged main `34ced0f93526f981a835c237c56d7ba580e989f4`. Every real production construction
-  site remains explicitly V2/unwired with `r2f1b: None`, and `freeze_fresh_v3` remains absent from production callers.
-  Controller focused GREEN after repair is recorded for the exact mixed-admission selector **1 passed / 0 failed / 22
-  filtered**, complete bound-executor binary **23 passed / 0 failed**, and fresh-V3 admission selectors **2 passed / 0
-  failed / 12 filtered**; corresponding log SHA-256 values are
-  `dbfbe06f065b14dff4598bd6c6513de62131a810172199c0d4e8dadfd12f5174`,
-  `a4fdebf973d8f07cfeb7137b3c7b9b791d50a4be2336dcba9aa8c27df1a99841`, and
-  `02041b0c968bf369f81c61d28c3ddb3a0430438e46fa2d56ef811fe711964525`. The final post-doc controller gate passed
-  with diff-check, Cargo fmt, workspace all-target check, workspace all-target/all-feature Clippy with `-D warnings`,
-  workspace all-target tests, doctests, workspace all-target/all-feature build, release bridge build, and repository
-  hygiene all exiting zero. All-target totals were **86 binaries / 4,397 passed /
-  0 failed / 13 ignored** with log SHA-256
-  `494ceb97163ac52e2668b2fac24a5f2da8925c6cef226dceab29a79dd8d0fbc4`; the 13 ignored tests are explicit live-
-  provider/auth lanes. Doctests were **16 crates / 2 passed / 0 failed / 0 ignored** with log SHA-256
-  `5fb7ab0a7c0343c698613e270ef23fbe1514fe9617369c39620a13775458329f`. Hygiene reported **41 tracked artifacts / 9
-  configs** with log SHA-256 `6e14f1b773562dcb92caa6c245532dce4fb238fe72f06c7745d9121dae232125`. One final Sol/xhigh hard-read-only rereview
-  of the repaired candidate remains pending; no approval, publication, merge, deployment, operator restart, live
-  smoke, or production wiring is claimed.
+- **Active slice:** **R2f1b 5B V3 DETACHED TASK/HISTORY RESERVATION AND TERMINAL CAS APPROVED LOCAL CANDIDATE / CODE COMMIT `6338bc1628fed52b772026b604a1bbdd710efa8c` TREE `44616d3e8f05a2ec4607911048128221f7914221` / REVIEW HEAD `1b30ed45b68b6b95cde07103c174af22470d78fb` TREE `e6669e8c1e58cf6fab9a1dd3be709380ccc395d8` / BASE PR #101 `43b65d42a83b02ab4041a6680ea5c85fc6d00d82` / FULL VERIFICATION GREEN / FINAL SOL XHIGH REREVIEW APPROVED 0 WRONG 3 SMELL / STORAGE-ONLY / PRODUCTION-UNWIRED / LOCAL-ONLY / NO PUBLICATION OR OPERATOR EFFECTS (2026-09-07).** The reservation now binds the exact canonical snapshot digest, and the two-genuine-admission substitution regression closes the inherited blocker for Memory and SQLite. Same-host exact-`55f59950` RED is **0 passed / 1 failed / 271 filtered**; exact-`6338bc16` GREEN is **1 / 0 / 271**. Full verification is **4,408 passed / 0 failed / 13 ignored / 726 filtered**, with all other gates green and production accounting **1,038 logical lines** under the 1,050 cap. Final review execution `exec-614a60456fdf620dd445d82842d57534`, attempt `attempt-c546b5e336c1b3855e62b54b3d713795`, returned **APPROVE / 0 WRONG / 3 SMELL**. The repair and rereview caps are exhausted. Stop: do not push, open a PR, merge, or mutate the running operator without new owner authority.
+
+
 - **R2f0b verification and review (2026-08-01):** [native verification](superpowers/reviews/2026-08-01-r2f0b-native-verification.md)
   records format, warnings-denied all-target/all-feature Clippy, four changed-config validations, and repository
   hygiene **39 tracked artifacts / 7 validated example configs** green. The initial full workspace emitted

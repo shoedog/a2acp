@@ -333,6 +333,102 @@ pub struct PendingTerminalProjection {
     pub terminal: crate::workflow_history::AttemptTerminal,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AtomicV3AdmissionMarker {
+    pub workflow_snapshot_json: String,
+    pub roster_json: String,
+}
+
+pub fn validate_atomic_v3_admission_marker(
+    rec: &TaskRecord,
+    locator: &TaskAttemptLocator,
+    reservation: &crate::workflow_history::AttemptReservationV3,
+) -> Result<AtomicV3AdmissionMarker, BridgeError> {
+    let snapshot_json = rec
+        .workflow_spec_json
+        .as_deref()
+        .filter(|value| !value.is_empty())
+        .ok_or(BridgeError::StoreFailure)?;
+    let snapshot = crate::run_spec::WorkflowSnapshotV3::decode(snapshot_json.as_bytes())
+        .map_err(|_| BridgeError::StoreFailure)?;
+    let controls_json = String::from_utf8(
+        snapshot
+            .delivery_spec
+            .controls
+            .encode_canonical()
+            .map_err(|_| BridgeError::StoreFailure)?,
+    )
+    .map_err(|_| BridgeError::StoreFailure)?;
+    let mut graph_nodes = snapshot
+        .delivery_spec
+        .graph
+        .nodes
+        .iter()
+        .map(|node| node.id.clone())
+        .collect::<Vec<_>>();
+    graph_nodes.sort();
+    let reservation_nodes = reservation
+        .nodes
+        .iter()
+        .map(|node| node.node.clone())
+        .collect::<Vec<_>>();
+    let reservation_ordinals_match = reservation
+        .nodes
+        .iter()
+        .enumerate()
+        .all(|(ordinal, node)| u32::try_from(ordinal).ok() == Some(node.sorted_ordinal));
+
+    if snapshot.digest().map_err(|_| BridgeError::StoreFailure)?
+        != reservation.workflow_snapshot_digest
+        || snapshot.attempt != locator.identity
+        || snapshot.delivery_spec.attempt_id != locator.identity.attempt_id
+        || snapshot.predecessor_snapshot_digest.is_some()
+        || snapshot.r2f1b.activation
+            != crate::execution_policy::DeadlineActivationV2::AutomaticR2f1b
+        || snapshot.delivery_spec.graph.id.as_str() != rec.workflow.as_str()
+        || snapshot.delivery_spec.controls_fingerprint != reservation.controls_fingerprint
+        || controls_json != reservation.controls_json
+        || snapshot
+            .workload_identity()
+            .map_err(|_| BridgeError::StoreFailure)?
+            != reservation.reservation.workload_fingerprint
+        || !locator.belongs_to(&rec.id)
+        || locator.telemetry_unavailable.is_some()
+        || reservation.reservation.task_id.as_ref() != Some(&rec.id)
+        || reservation.reservation.workflow != rec.workflow
+        || reservation.reservation.identity != locator.identity
+        || locator.identity.ordinal != 0
+        || locator.identity.parent_attempt_id.is_some()
+        || usize::try_from(reservation.expected_node_count).ok() != Some(graph_nodes.len())
+        || graph_nodes != reservation_nodes
+        || !reservation_ordinals_match
+        || reservation.validate().is_err()
+    {
+        return Err(BridgeError::StoreFailure);
+    }
+
+    Ok(AtomicV3AdmissionMarker {
+        workflow_snapshot_json: snapshot_json.to_owned(),
+        roster_json: atomic_v3_roster_json(reservation)?,
+    })
+}
+
+pub fn atomic_v3_roster_json(
+    reservation: &crate::workflow_history::AttemptReservationV3,
+) -> Result<String, BridgeError> {
+    let roster = reservation
+        .nodes
+        .iter()
+        .map(|node| {
+            (
+                node.node.as_str().to_owned(),
+                node.resource_flight_id.as_str().to_owned(),
+            )
+        })
+        .collect::<Vec<_>>();
+    serde_json::to_string(&roster).map_err(|_| BridgeError::StoreFailure)
+}
+
 impl TaskAttemptLocator {
     pub fn belongs_to(&self, task: &TaskId) -> bool {
         self.identity.execution_id.as_str() == task.as_str()
@@ -354,6 +450,13 @@ pub enum ResumeClaim {
     Resumable { attempt: u32 },
     /// The cap has been reached; this task must be marked `Interrupted` instead.
     Exhausted,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DetachedTerminalCas {
+    Applied { seq: i64 },
+    Replayed { seq: i64 },
+    Conflict,
 }
 
 #[async_trait::async_trait]
@@ -382,6 +485,14 @@ pub trait TaskStore: HarvestAuditStore + Send + Sync {
         // two-call fallback can expose a primary row without its authoritative
         // locator when the second write fails. Implementations that support
         // served workflows must provide one atomic admission primitive.
+        Err(BridgeError::StoreFailure)
+    }
+    async fn create_with_attempt_locator_and_v3_reservation(
+        &self,
+        _rec: &TaskRecord,
+        _locator: &TaskAttemptLocator,
+        _reservation: &crate::workflow_history::AttemptReservationV3,
+    ) -> Result<(), BridgeError> {
         Err(BridgeError::StoreFailure)
     }
     /// Set the terminal status + result/error on an existing row.
@@ -746,6 +857,21 @@ pub trait TaskStore: HarvestAuditStore + Send + Sync {
         Err(BridgeError::StoreFailure)
     }
 
+    #[allow(clippy::too_many_arguments)]
+    async fn compare_set_detached_terminal_v3(
+        &self,
+        _task: &TaskId,
+        _attempt_id: &crate::ids::AttemptId,
+        _operation_id: &OperationId,
+        _status: TaskRecordStatus,
+        _result: Option<&str>,
+        _error: Option<&str>,
+        _ts: i64,
+        _terminal: &crate::workflow_history::AttemptTerminal,
+    ) -> Result<DetachedTerminalCas, BridgeError> {
+        Err(BridgeError::StoreFailure)
+    }
+
     /// Return one pending terminal projection, including its exact persisted
     /// terminal evidence. This is an internal recovery read and is intentionally
     /// not subject to the public Working projection.
@@ -1007,6 +1133,7 @@ struct MemoryNodeTerminalV3 {
     cleanup_json: String,
     primary_seq: Option<i64>,
     cleanup_seq: Option<i64>,
+    resource_flight_id: String,
 }
 
 /// In-memory `TaskStore` (the default when no DB path is configured). Production
@@ -1035,6 +1162,7 @@ pub struct MemoryTaskStore {
     node_terminals_v3: Mutex<HashMap<(String, String, String), MemoryNodeTerminalV3>>,
     node_v3_reservations:
         Mutex<HashMap<(String, String), crate::workflow_history::AttemptReservationV3>>,
+    atomic_v3_admissions: Mutex<HashMap<(String, String), AtomicV3AdmissionMarker>>,
     /// Additive task-level R2f1a outcome/trigger evidence.
     workflow_evidence: Mutex<HashMap<String, WorkflowTaskEvidenceV1>>,
     /// Per-task monotonic seq counter. Key: task_id.
@@ -1045,6 +1173,7 @@ pub struct MemoryTaskStore {
     /// Terminal rows withheld until summary/marker reconciliation succeeds.
     /// Key: task id.
     pending_terminal: Mutex<HashMap<String, PendingTerminalProjection>>,
+    terminal_replay: Mutex<HashMap<String, PendingTerminalProjection>>,
     starts: Mutex<HashMap<(String, String), (i64, i64)>>,
     turn_log: Mutex<HashMap<String, TurnLogRow>>,
     /// Per-task durable orchestration journal rows. Key: task_id.
@@ -1077,15 +1206,49 @@ impl MemoryTaskStore {
             node_policy_triggers: Mutex::new(HashMap::new()),
             node_terminals_v3: Mutex::new(HashMap::new()),
             node_v3_reservations: Mutex::new(HashMap::new()),
+            atomic_v3_admissions: Mutex::new(HashMap::new()),
             workflow_evidence: Mutex::new(HashMap::new()),
             seq_counters: Mutex::new(HashMap::new()),
             terminal_seqs: Mutex::new(HashMap::new()),
             starts: Mutex::new(HashMap::new()),
             pending_terminal: Mutex::new(HashMap::new()),
+            terminal_replay: Mutex::new(HashMap::new()),
             turn_log: Mutex::new(HashMap::new()),
             journals: Mutex::new(HashMap::new()),
             harvest: Mutex::new(HarvestMemoryState::default()),
         }
+    }
+
+    fn validate_v3_root_admission(
+        rec: &TaskRecord,
+        locator: &TaskAttemptLocator,
+        reservation: &crate::workflow_history::AttemptReservationV3,
+    ) -> Result<(), BridgeError> {
+        reservation
+            .validate()
+            .map_err(|_| BridgeError::StoreFailure)?;
+        if rec.status != TaskRecordStatus::Working
+            || rec.workflow_spec_json.as_deref().is_none_or(str::is_empty)
+            || !locator.belongs_to(&rec.id)
+            || locator.telemetry_unavailable.is_some()
+            || reservation.reservation.task_id.as_ref() != Some(&rec.id)
+            || reservation.reservation.workflow != rec.workflow
+            || reservation.reservation.identity != locator.identity
+            || locator.identity.ordinal != 0
+            || locator.identity.parent_attempt_id.is_some()
+        {
+            return Err(BridgeError::StoreFailure);
+        }
+        let mut flights = HashSet::with_capacity(reservation.nodes.len());
+        for node in &reservation.nodes {
+            if !flights.insert(node.resource_flight_id.as_str()) {
+                return Err(BridgeError::StoreFailure);
+            }
+            crate::execution_policy::NodeCleanupRecordV2::pending(node.resource_flight_id.clone())
+                .validate_for_attempt(&locator.identity.attempt_id, &node.resource_flight_id)
+                .map_err(|_| BridgeError::StoreFailure)?;
+        }
+        Ok(())
     }
 
     fn retention_now_ms(&self) -> i64 {
@@ -1279,6 +1442,102 @@ impl TaskStore for MemoryTaskStore {
                 rec.id.as_str().to_owned(),
             ),
         );
+        self.birth
+            .lock()
+            .unwrap()
+            .insert(rec.id.as_str().to_owned());
+        Ok(())
+    }
+
+    async fn create_with_attempt_locator_and_v3_reservation(
+        &self,
+        rec: &TaskRecord,
+        locator: &TaskAttemptLocator,
+        reservation: &crate::workflow_history::AttemptReservationV3,
+    ) -> Result<(), BridgeError> {
+        Self::validate_v3_root_admission(rec, locator, reservation)?;
+        let marker = validate_atomic_v3_admission_marker(rec, locator, reservation)?;
+        let cleanup_rows = reservation
+            .nodes
+            .iter()
+            .map(|node| {
+                let cleanup = crate::execution_policy::NodeCleanupRecordV2::pending(
+                    node.resource_flight_id.clone(),
+                );
+                let cleanup_json = String::from_utf8(
+                    cleanup
+                        .encode_canonical()
+                        .map_err(|_| BridgeError::StoreFailure)?,
+                )
+                .map_err(|_| BridgeError::StoreFailure)?;
+                Ok::<_, BridgeError>((node.node.as_str().to_owned(), cleanup_json))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let _guard = self.journal_fold_guard.lock().unwrap();
+        let mut tasks = self.inner.lock().unwrap();
+        let mut locators = self.attempt_locators.lock().unwrap();
+        let mut identities = self.attempt_identities.lock().unwrap();
+        let mut reservations = self.node_v3_reservations.lock().unwrap();
+        let mut markers = self.atomic_v3_admissions.lock().unwrap();
+        let mut rows = self.node_terminals_v3.lock().unwrap();
+        let reservation_key = (
+            rec.id.as_str().to_owned(),
+            locator.identity.attempt_id.as_str().to_owned(),
+        );
+        if tasks.contains_key(rec.id.as_str())
+            || locators.contains_key(rec.id.as_str())
+            || identities.contains_key(locator.identity.attempt_id.as_str())
+            || identities.values().any(|(execution, ordinal, _)| {
+                execution == locator.identity.execution_id.as_str()
+                    && *ordinal == locator.identity.ordinal
+            })
+            || reservations.contains_key(&reservation_key)
+            || markers.contains_key(&reservation_key)
+            || reservation.nodes.iter().any(|node| {
+                rows.values()
+                    .any(|row| row.resource_flight_id == node.resource_flight_id.as_str())
+            })
+            || rows.keys().any(|(task, attempt, _)| {
+                task == rec.id.as_str() && attempt == locator.identity.attempt_id.as_str()
+            })
+        {
+            return Err(BridgeError::StoreFailure);
+        }
+        tasks.insert(rec.id.as_str().to_owned(), rec.clone());
+        locators.insert(rec.id.as_str().to_owned(), locator.clone());
+        identities.insert(
+            locator.identity.attempt_id.as_str().to_owned(),
+            (
+                locator.identity.execution_id.as_str().to_owned(),
+                locator.identity.ordinal,
+                rec.id.as_str().to_owned(),
+            ),
+        );
+        markers.insert(reservation_key.clone(), marker);
+        let placeholder = crate::workflow_history::node_primary_placeholder_v3();
+        for (node_id, cleanup_json) in cleanup_rows {
+            let resource_flight_id = reservation
+                .node(&NodeId::parse(&node_id).map_err(|_| BridgeError::StoreFailure)?)
+                .ok_or(BridgeError::StoreFailure)?
+                .resource_flight_id
+                .as_str()
+                .to_owned();
+            rows.insert(
+                (
+                    rec.id.as_str().to_owned(),
+                    locator.identity.attempt_id.as_str().to_owned(),
+                    node_id,
+                ),
+                MemoryNodeTerminalV3 {
+                    primary_json: placeholder.clone(),
+                    cleanup_json,
+                    primary_seq: None,
+                    cleanup_seq: None,
+                    resource_flight_id,
+                },
+            );
+        }
+        reservations.insert(reservation_key, reservation.clone());
         self.birth
             .lock()
             .unwrap()
@@ -2350,7 +2609,9 @@ impl TaskStore for MemoryTaskStore {
                 task.as_str().to_owned(),
                 attempt.as_str().to_owned(),
                 node.node.as_str().to_owned(),
-            ))
+            )) || rows
+                .values()
+                .any(|row| row.resource_flight_id == node.resource_flight_id.as_str())
         }) {
             return Err(BridgeError::StoreFailure);
         }
@@ -2376,6 +2637,7 @@ impl TaskStore for MemoryTaskStore {
                     cleanup_json,
                     primary_seq: None,
                     cleanup_seq: None,
+                    resource_flight_id: node.resource_flight_id.as_str().to_owned(),
                 },
             );
         }
@@ -2780,15 +3042,20 @@ impl TaskStore for MemoryTaskStore {
             .entry(task.as_str().to_owned())
             .or_default()
             .push((seq, event));
-        self.pending_terminal.lock().unwrap().insert(
-            task.as_str().to_owned(),
-            PendingTerminalProjection {
-                task: task_record,
-                attempt_id: attempt_id.clone(),
-                terminal_seq: seq,
-                terminal: terminal.clone(),
-            },
-        );
+        let projection = PendingTerminalProjection {
+            task: task_record,
+            attempt_id: attempt_id.clone(),
+            terminal_seq: seq,
+            terminal: terminal.clone(),
+        };
+        self.pending_terminal
+            .lock()
+            .unwrap()
+            .insert(task.as_str().to_owned(), projection.clone());
+        self.terminal_replay
+            .lock()
+            .unwrap()
+            .insert(task.as_str().to_owned(), projection);
         self.workflow_evidence
             .lock()
             .unwrap()
@@ -2796,6 +3063,235 @@ impl TaskStore for MemoryTaskStore {
             .or_default()
             .workflow_outcome = Some(workflow_outcome);
         Ok(seq)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn compare_set_detached_terminal_v3(
+        &self,
+        task: &TaskId,
+        attempt_id: &crate::ids::AttemptId,
+        operation_id: &OperationId,
+        status: TaskRecordStatus,
+        result: Option<&str>,
+        error: Option<&str>,
+        ts: i64,
+        terminal: &crate::workflow_history::AttemptTerminal,
+    ) -> Result<DetachedTerminalCas, BridgeError> {
+        if !status.is_terminal() || terminal.validate().is_err() {
+            return Err(BridgeError::StoreFailure);
+        }
+        let workflow_outcome =
+            crate::execution_policy::WorkflowDurableOutcomeV1::parse_closed(&terminal.outcome)
+                .ok_or(BridgeError::StoreFailure)?;
+        let expected_status = match workflow_outcome {
+            crate::execution_policy::WorkflowDurableOutcomeV1::Completed
+            | crate::execution_policy::WorkflowDurableOutcomeV1::CompletedDegraded => {
+                TaskRecordStatus::Completed
+            }
+            crate::execution_policy::WorkflowDurableOutcomeV1::Failed => TaskRecordStatus::Failed,
+            crate::execution_policy::WorkflowDurableOutcomeV1::Canceled => {
+                TaskRecordStatus::Canceled
+            }
+            crate::execution_policy::WorkflowDurableOutcomeV1::Interrupted => {
+                TaskRecordStatus::Interrupted
+            }
+        };
+        if status != expected_status {
+            return Err(BridgeError::StoreFailure);
+        }
+        let _guard = self.journal_fold_guard.lock().unwrap();
+        let locator_matches = self
+            .attempt_locators
+            .lock()
+            .unwrap()
+            .get(task.as_str())
+            .is_some_and(|locator| {
+                locator.belongs_to(task) && locator.identity.attempt_id == *attempt_id
+            });
+        if !locator_matches {
+            return Ok(DetachedTerminalCas::Conflict);
+        }
+        let reservation_key = (task.as_str().to_owned(), attempt_id.as_str().to_owned());
+        let reservation = match self
+            .node_v3_reservations
+            .lock()
+            .unwrap()
+            .get(&reservation_key)
+            .cloned()
+        {
+            Some(reservation) => reservation,
+            None => return Ok(DetachedTerminalCas::Conflict),
+        };
+        let marker = match self
+            .atomic_v3_admissions
+            .lock()
+            .unwrap()
+            .get(&reservation_key)
+            .cloned()
+        {
+            Some(marker) => marker,
+            None => return Ok(DetachedTerminalCas::Conflict),
+        };
+        if reservation.validate().is_err()
+            || reservation.reservation.task_id.as_ref() != Some(task)
+            || reservation.reservation.identity.attempt_id != *attempt_id
+            || atomic_v3_roster_json(&reservation).ok().as_deref()
+                != Some(marker.roster_json.as_str())
+            || self
+                .inner
+                .lock()
+                .unwrap()
+                .get(task.as_str())
+                .and_then(|row| row.workflow_spec_json.as_deref())
+                != Some(marker.workflow_snapshot_json.as_str())
+        {
+            return Ok(DetachedTerminalCas::Conflict);
+        }
+        {
+            let rows = self.node_terminals_v3.lock().unwrap();
+            if rows
+                .keys()
+                .filter(|(row_task, row_attempt, _)| {
+                    row_task == task.as_str() && row_attempt == attempt_id.as_str()
+                })
+                .count()
+                != reservation.nodes.len()
+            {
+                return Ok(DetachedTerminalCas::Conflict);
+            }
+            let placeholder = crate::workflow_history::node_primary_placeholder_v3();
+            for node in &reservation.nodes {
+                let Some(row) = rows.get(&(
+                    task.as_str().to_owned(),
+                    attempt_id.as_str().to_owned(),
+                    node.node.as_str().to_owned(),
+                )) else {
+                    return Ok(DetachedTerminalCas::Conflict);
+                };
+                if row.resource_flight_id != node.resource_flight_id.as_str() {
+                    return Ok(DetachedTerminalCas::Conflict);
+                }
+                let cleanup = crate::execution_policy::NodeCleanupRecordV2::decode_canonical(
+                    row.cleanup_json.as_bytes(),
+                )
+                .map_err(|_| BridgeError::StoreFailure)?;
+                cleanup
+                    .validate_for_attempt(attempt_id, &node.resource_flight_id)
+                    .map_err(|_| BridgeError::StoreFailure)?;
+                if row.primary_json == placeholder {
+                    if row.primary_seq.is_some() || row.cleanup_seq.is_some() {
+                        return Ok(DetachedTerminalCas::Conflict);
+                    }
+                } else {
+                    crate::execution_policy::NodePrimaryRecordV3::decode_canonical(
+                        row.primary_json.as_bytes(),
+                    )
+                    .map_err(|_| BridgeError::StoreFailure)?;
+                    if row.primary_seq.is_none() {
+                        return Ok(DetachedTerminalCas::Conflict);
+                    }
+                }
+            }
+        }
+        for replay in [
+            self.pending_terminal
+                .lock()
+                .unwrap()
+                .get(task.as_str())
+                .cloned(),
+            self.terminal_replay
+                .lock()
+                .unwrap()
+                .get(task.as_str())
+                .cloned(),
+        ] {
+            let Some(pending) = replay else {
+                continue;
+            };
+            let compatible = pending.attempt_id == *attempt_id
+                && pending.terminal == *terminal
+                && pending.task.status == status
+                && pending.task.result.as_deref() == result
+                && pending.task.error.as_deref() == error;
+            return Ok(if compatible {
+                DetachedTerminalCas::Replayed {
+                    seq: pending.terminal_seq,
+                }
+            } else {
+                DetachedTerminalCas::Conflict
+            });
+        }
+        let artifact_ms = self.retention_now_ms();
+        {
+            let mut inner = self.inner.lock().unwrap();
+            let row = inner
+                .get_mut(task.as_str())
+                .ok_or(BridgeError::StoreFailure)?;
+            if row.status != TaskRecordStatus::Working {
+                return Ok(DetachedTerminalCas::Conflict);
+            }
+            Self::bump_last_artifact(row, artifact_ms);
+        }
+        let _marker_seq = self.next_seq(task.as_str());
+        let seq = self.next_seq(task.as_str());
+        let task_record = {
+            let mut inner = self.inner.lock().unwrap();
+            let row = inner
+                .get_mut(task.as_str())
+                .ok_or(BridgeError::StoreFailure)?;
+            row.status = status;
+            row.result = result.map(str::to_owned);
+            row.error = error.map(str::to_owned);
+            row.updated_ms = durable_retention_ms(ts);
+            row.clone()
+        };
+        self.terminal_seqs
+            .lock()
+            .unwrap()
+            .insert(task.as_str().to_owned(), seq);
+        self.starts
+            .lock()
+            .unwrap()
+            .retain(|(task_id, _), _| task_id != task.as_str());
+        let event = crate::orch::OrchEvent {
+            v: crate::orch::ORCH_V,
+            seq,
+            ts_ms: ts,
+            operation_id: operation_id.clone(),
+            session: None,
+            source: None,
+            kind: crate::orch::OrchEventKind::Terminal {
+                status: terminal_status_from_record(&status),
+                output: result.or(error).unwrap_or("").to_owned(),
+            },
+        };
+        self.journals
+            .lock()
+            .unwrap()
+            .entry(task.as_str().to_owned())
+            .or_default()
+            .push((seq, event));
+        let projection = PendingTerminalProjection {
+            task: task_record,
+            attempt_id: attempt_id.clone(),
+            terminal_seq: seq,
+            terminal: terminal.clone(),
+        };
+        self.pending_terminal
+            .lock()
+            .unwrap()
+            .insert(task.as_str().to_owned(), projection.clone());
+        self.terminal_replay
+            .lock()
+            .unwrap()
+            .insert(task.as_str().to_owned(), projection);
+        self.workflow_evidence
+            .lock()
+            .unwrap()
+            .entry(task.as_str().to_owned())
+            .or_default()
+            .workflow_outcome = Some(workflow_outcome);
+        Ok(DetachedTerminalCas::Applied { seq })
     }
 
     async fn pending_terminal_projection(
@@ -5243,6 +5739,7 @@ mod tests {
                     "controls-{}",
                     Sha256HexV1::digest(controls_json.as_bytes()).as_str()
                 ),
+                workflow_snapshot_digest: Sha256HexV1::digest(b"task-store-v3-snapshot"),
                 expected_node_count: 1,
                 nodes: vec![HistoryNodeReservationV3 {
                     node: NodeId::parse("root").unwrap(),

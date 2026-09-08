@@ -558,6 +558,98 @@ pub fn structured_history_reservation_v1(
     Ok(structured)
 }
 
+pub fn detached_v3_attempt_reservation(
+    authority: &bridge_workflow::admission::AdmittedWorkflowRunV1,
+    snapshot: &bridge_workflow::run_spec::WorkflowSnapshotV3,
+    started_ms: i64,
+) -> Result<bridge_core::workflow_history::AttemptReservationV3, BridgeError> {
+    use bridge_core::execution_policy::DeadlineActivationV2;
+    use bridge_core::workflow_history::{
+        AttemptReservation, AttemptReservationV3, ExecutionSurface, HistoryNodeReservationV3,
+        WORKFLOW_HISTORY_EVIDENCE_SCHEMA_V3,
+    };
+
+    snapshot
+        .validate()
+        .map_err(|_| BridgeError::InvalidStateTransition)?;
+    bridge_workflow::admission::verify_fresh_r2f1b_admission_v1(authority)
+        .map_err(|_| BridgeError::InvalidStateTransition)?;
+    let Some(r2f1b) = authority.r2f1b.as_ref() else {
+        return Err(BridgeError::InvalidStateTransition);
+    };
+    if started_ms <= 0
+        || snapshot.attempt.ordinal != 0
+        || snapshot.attempt.parent_attempt_id.is_some()
+        || snapshot.delivery_spec != *authority.run_spec
+        || r2f1b.attempt != snapshot.attempt
+        || r2f1b.contract != snapshot.r2f1b
+        || snapshot.r2f1b.activation != DeadlineActivationV2::AutomaticR2f1b
+    {
+        return Err(BridgeError::InvalidStateTransition);
+    }
+
+    let task = TaskId::parse(snapshot.attempt.execution_id.as_str())?;
+    let controls_json = String::from_utf8(
+        snapshot
+            .delivery_spec
+            .controls
+            .encode_canonical()
+            .map_err(|_| BridgeError::InvalidStateTransition)?,
+    )
+    .map_err(|_| BridgeError::InvalidStateTransition)?;
+    let mut nodes = snapshot
+        .delivery_spec
+        .graph
+        .nodes
+        .iter()
+        .map(|node| node.id.clone())
+        .collect::<Vec<_>>();
+    nodes.sort();
+    let expected_node_count =
+        u32::try_from(nodes.len()).map_err(|_| BridgeError::InvalidStateTransition)?;
+    let nodes = nodes
+        .into_iter()
+        .enumerate()
+        .map(|(ordinal, node)| {
+            Ok(HistoryNodeReservationV3 {
+                node,
+                sorted_ordinal: u32::try_from(ordinal)
+                    .map_err(|_| BridgeError::InvalidStateTransition)?,
+                resource_flight_id: bridge_core::resource_flight::ResourceFlightIdV1::mint()?,
+            })
+        })
+        .collect::<Result<Vec<_>, BridgeError>>()?;
+    let structured = AttemptReservationV3 {
+        schema_version: WORKFLOW_HISTORY_EVIDENCE_SCHEMA_V3,
+        reservation: AttemptReservation {
+            identity: snapshot.attempt.clone(),
+            task_id: Some(task),
+            workflow: snapshot.delivery_spec.graph.id.as_str().to_owned(),
+            task_class: "workflow".into(),
+            surface: ExecutionSurface::ServedTask,
+            policy: "r2f1b".into(),
+            workload_fingerprint: snapshot
+                .workload_identity()
+                .map_err(|_| BridgeError::InvalidStateTransition)?,
+            started_ms,
+            workload_fingerprint_complete: true,
+            prompt_acceptance: "not_dispatched".into(),
+            pinned: false,
+        },
+        controls_json,
+        controls_fingerprint: snapshot.delivery_spec.controls_fingerprint.clone(),
+        workflow_snapshot_digest: snapshot
+            .digest()
+            .map_err(|_| BridgeError::InvalidStateTransition)?,
+        expected_node_count,
+        nodes,
+    };
+    structured
+        .validate()
+        .map_err(|_| BridgeError::InvalidStateTransition)?;
+    Ok(structured)
+}
+
 /// Detached progress sink: persists each event via the sequenced store methods
 /// (durable-first), then publishes a `WorkflowProgressFrame` to the task's
 /// in-memory `TaskProgressHub`. A durable-write `Err` propagates (aborts the
@@ -6190,6 +6282,72 @@ mod resume_tests {
             panel: None,
             controls: None,
         })
+    }
+
+    #[tokio::test]
+    async fn detached_v3_reservation_uses_exact_fresh_authority_and_snapshot() {
+        use bridge_core::execution_policy::{
+            ExecutionPolicyInvocationV1, HistoryAllocationKindV1, LedgerAdmissionV1,
+        };
+        use bridge_workflow::admission::{
+            DirectWorkflowCheckoutPlannerV1, WorkflowAdmissionRequestV1, WorkflowAdmissionV1,
+        };
+
+        let identity = bridge_core::ids::AttemptIdentity::initial().unwrap();
+        let graph = single_retry_graph();
+        let admission = WorkflowAdmissionV1::new(
+            Arc::new(RecordingRegistry {
+                synth: Arc::new(PromptRec::default()),
+            }),
+            Arc::new(DirectWorkflowCheckoutPlannerV1),
+            bridge_core::SessionCwd::parse("/tmp").unwrap(),
+            None,
+        );
+        let fresh = admission
+            .freeze_fresh_v3(
+                identity.clone(),
+                WorkflowAdmissionRequestV1 {
+                    attempt_id: identity.attempt_id.clone(),
+                    graph: graph.clone(),
+                    requested_session_cwd: Some(bridge_core::SessionCwd::parse("/tmp").unwrap()),
+                    policy_invocation: ExecutionPolicyInvocationV1::default(),
+                    ledger_admission: LedgerAdmissionV1::HistoryLedgerAdmitted {
+                        kind: HistoryAllocationKindV1::Configured,
+                    },
+                    r2f1b: None,
+                },
+            )
+            .await
+            .unwrap();
+        let reservation = detached_v3_attempt_reservation(&fresh.admitted, &fresh.snapshot, 123)
+            .expect("fresh authority and snapshot must derive one V3 reservation");
+        assert_eq!(reservation.reservation.identity, identity);
+        assert_eq!(
+            reservation.reservation.task_id.as_ref().unwrap().as_str(),
+            identity.execution_id.as_str()
+        );
+        assert_eq!(reservation.reservation.workflow, graph.id.as_str());
+        assert_eq!(reservation.reservation.started_ms, 123);
+        assert_eq!(
+            reservation.controls_fingerprint,
+            fresh.snapshot.delivery_spec.controls_fingerprint
+        );
+        assert_eq!(reservation.expected_node_count, 1);
+        assert_eq!(reservation.nodes[0].node.as_str(), "only");
+        assert!(reservation.validate().is_ok());
+
+        let mut successor = fresh.snapshot.clone();
+        successor.attempt = identity.resume().unwrap();
+        assert!(detached_v3_attempt_reservation(&fresh.admitted, &successor, 123).is_err());
+        assert!(detached_v3_attempt_reservation(&fresh.admitted, &fresh.snapshot, 0).is_err());
+
+        let mut rewrapped = fresh.admitted.clone();
+        let public = rewrapped.r2f1b.as_ref().unwrap().as_ref().clone();
+        rewrapped.r2f1b = Some(Arc::new(public));
+        assert!(
+            detached_v3_attempt_reservation(&rewrapped, &fresh.snapshot, 123).is_err(),
+            "equal-valued rewrapped public R2f1b authority must not satisfy fresh custody"
+        );
     }
 
     fn two_provider_turn_graph() -> Arc<WorkflowGraph> {
