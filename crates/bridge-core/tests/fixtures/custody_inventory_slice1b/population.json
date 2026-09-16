@@ -1,0 +1,22 @@
+{
+  "current": [
+    {"unit_id":"current.clone.resolved","kind":"standalone_clone","components":[[99,108,111,110,101,45,114,101,115,111,108,118,101,100]]},
+    {"unit_id":"current.clone.changed","kind":"linked_worktree","components":[[99,108,111,110,101,45,99,104,97,110,103,101,100]]},
+    {"unit_id":"current.ambiguous.a","kind":"evidence_directory","components":[[97,109,98,105,103,117,111,117,115]]},
+    {"unit_id":"current.ambiguous.b","kind":"evidence_directory","components":[[97,109,98,105,103,117,111,117,115]]},
+    {"unit_id":"current.non_utf8","kind":"evidence_directory","components":[[101,118,105,100,101,110,99,101,45,255]]},
+    {"unit_id":"current.symlink","kind":"source_local_refs","components":[[115,121,109,108,105,110,107,45,102,105,110,97,108]]},
+    {"unit_id":"current.probe_error","kind":"standalone_clone","components":[[112,114,111,98,101,45,101,114,114,111,114]]},
+    {"unit_id":"current.only","kind":"source_local_refs","components":[[110,101,119,45,99,117,114,114,101,110,116,45,111,110,108,121]]}
+  ],
+  "historical": [
+    {"historical_id":"historical.01.resolved","components":[[99,108,111,110,101,45,114,101,115,111,108,118,101,100]],"identity_setup":"capture_runtime","expected_identity":null},
+    {"historical_id":"historical.02.changed","components":[[99,108,111,110,101,45,99,104,97,110,103,101,100]],"identity_setup":"literal_changed","expected_identity":{"kind":"other","dev":0,"ino":0,"birthtime":null}},
+    {"historical_id":"historical.03.ambiguous","components":[[97,109,98,105,103,117,111,117,115]],"identity_setup":"none","expected_identity":null},
+    {"historical_id":"historical.04.absent","components":[[97,98,115,101,110,116]],"identity_setup":"none","expected_identity":null},
+    {"historical_id":"historical.05.legacy_claim_only","components":[[108,101,103,97,99,121,45,99,108,97,105,109,45,97,98,115,101,110,116]],"identity_setup":"none","expected_identity":null,"note":"test-only legacy removal claim; no admissible deletion evidence"},
+    {"historical_id":"historical.06.non_utf8","components":[[101,118,105,100,101,110,99,101,45,255]],"identity_setup":"capture_runtime","expected_identity":null},
+    {"historical_id":"historical.07.symlink","components":[[115,121,109,108,105,110,107,45,102,105,110,97,108]],"identity_setup":"none","expected_identity":null},
+    {"historical_id":"historical.08.probe_error","components":[[112,114,111,98,101,45,101,114,114,111,114]],"identity_setup":"none","expected_identity":null}
+  ]
+}
