@@ -19,7 +19,10 @@
   passed 4,423 / 0 / 13 ignored, and all nine collector tests passed on native Linux with a real `0xff` directory.
   One hard-read-only Sol/xhigh code-review round APPROVED with 0 WRONG / 2 deferred schema SMELLs and no blocker.
   The exact branch `feat/adr0041-custody-inventory-slices-1a-1b-20260916` contains doctor repair
-  `288cacd1` and custody foundation `0431e57e`; PR #104 targets current `main`. Merge, adoption,
+  `288cacd1`, custody foundation `0431e57e`, and the owner-authorized rustls security lock repair
+  `1ba72900` (`rustls` 0.23.45 / `rustls-webpki` 0.103.15). The repaired branch passes `cargo deny check`,
+  full locked/offline workspace verification at 4,422 passed / 0 failed / 13 ignored, warnings-denied Clippy,
+  format, diff, and repository hygiene 41/9. PR #104 targets current `main`. Merge, adoption,
   sealing/restoration, remote promotion/verification,
   quarantine/reap, source-ref mutation, and running-operator effects remain separate gates.
 
