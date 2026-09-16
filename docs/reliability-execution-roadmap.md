@@ -1,15 +1,30 @@
 # Bridge reliability execution and handoff roadmap
 
 - **Program status:** active P0
-- **Current main lineage:** `origin/main` is `34ced0f93526f981a835c237c56d7ba580e989f4`, the merge of R2f1b
-  4J PR #100 with tree `192ba759a98eccbc9c5f21c187beddf8996c4463`. Its ancestry contains PR #99
-  (`065935e0`, R2f1b 4I), provider compatibility/runbook PR #98, OpenCode Go documentation PR #97, provider
-  runtime-dispatch PR #96, provider refresh PRs #90-#95, and R2f1b 4H-2 PR #89.
-- **Completed through:** R2f1b 5A is **MERGED** by PR #101 at
-  `43b65d42a83b02ab4041a6680ea5c85fc6d00d82`; 4J remains merged by PR #100 at
-  `34ced0f93526f981a835c237c56d7ba580e989f4`, with approved review and aggregate verification in the
-  [4J handoff](superpowers/reviews/2026-09-06-r2f1b-slice4j-handoff.md).
-- **Active slice:** **R2f1b 5B V3 DETACHED TASK/HISTORY RESERVATION AND TERMINAL CAS APPROVED LOCAL CANDIDATE / CODE COMMIT `6338bc1628fed52b772026b604a1bbdd710efa8c` TREE `44616d3e8f05a2ec4607911048128221f7914221` / REVIEW HEAD `1b30ed45b68b6b95cde07103c174af22470d78fb` TREE `e6669e8c1e58cf6fab9a1dd3be709380ccc395d8` / BASE PR #101 `43b65d42a83b02ab4041a6680ea5c85fc6d00d82` / FULL VERIFICATION GREEN / FINAL SOL XHIGH REREVIEW APPROVED 0 WRONG 3 SMELL / STORAGE-ONLY / PRODUCTION-UNWIRED / LOCAL-ONLY / NO PUBLICATION OR OPERATOR EFFECTS (2026-09-07).** The reservation now binds the exact canonical snapshot digest, and the two-genuine-admission substitution regression closes the inherited blocker for Memory and SQLite. Same-host exact-`55f59950` RED is **0 passed / 1 failed / 271 filtered**; exact-`6338bc16` GREEN is **1 / 0 / 271**. Full verification is **4,408 passed / 0 failed / 13 ignored / 726 filtered**, with all other gates green and production accounting **1,038 logical lines** under the 1,050 cap. Final review execution `exec-614a60456fdf620dd445d82842d57534`, attempt `attempt-c546b5e336c1b3855e62b54b3d713795`, returned **APPROVE / 0 WRONG / 3 SMELL**. The repair and rereview caps are exhausted. Stop: do not push, open a PR, merge, or mutate the running operator without new owner authority.
+- **Current main lineage:** `origin/main` is `d2cbf4e0561d0db8fd829e3776186d75f38e0715`, the merge of ADR-0041
+  custody-lifecycle documentation PR #103. Its ancestry includes R2f1b 5B PR #102
+  (`edcda181ad94daad6ddaf9d3c9d4dd63fd2dce00`), 5A PR #101, 4J PR #100, 4I PR #99,
+  the provider compatibility/runbook PR #98, OpenCode Go documentation PR #97, provider runtime-dispatch PR #96,
+  provider refresh PRs #90-#95, and R2f1b 4H-2 PR #89.
+- **Completed through:** R2f1b 5B is **MERGED** by PR #102 at
+  `edcda181ad94daad6ddaf9d3c9d4dd63fd2dce00`. Its approved storage-only code candidate is
+  `6338bc1628fed52b772026b604a1bbdd710efa8c`; the final Sol/xhigh rereview recorded 0 WRONG and 3 SMELL,
+  with full verification at 4,408 passed / 0 failed / 13 ignored / 726 filtered. The candidate remains
+  production-unwired; its historical handoff's pre-publication stop is superseded by the recorded PR #102 merge.
+- **Active slice:** **ADR-0041 Slices 1A and 1B — published candidate PR #104, open and unmerged
+  (owner-authorized 2026-09-14/15; publication authorized 2026-09-16).** Slice 1A defines canonical lossless records without I/O; Slice 1B adds an
+  explicitly capped 8+8 metadata collector and synthetic historical reconciliation, with every missing row still
+  unverified. The Opus 5/high spec review reported 4 WRONG and 9 SMELL; Sol/high folded all four WRONG and the
+  required SMELLs before implementation. Structural and behavioral RED were captured; the host full workspace
+  passed 4,423 / 0 / 13 ignored, and all nine collector tests passed on native Linux with a real `0xff` directory.
+  One hard-read-only Sol/xhigh code-review round APPROVED with 0 WRONG / 2 deferred schema SMELLs and no blocker.
+  The exact branch `feat/adr0041-custody-inventory-slices-1a-1b-20260916` contains doctor repair
+  `288cacd1`, custody foundation `0431e57e`, and the owner-authorized rustls security lock repair
+  `1ba72900` (`rustls` 0.23.45 / `rustls-webpki` 0.103.15). The repaired branch passes `cargo deny check`,
+  full locked/offline workspace verification at 4,422 passed / 0 failed / 13 ignored, warnings-denied Clippy,
+  format, diff, and repository hygiene 41/9. PR #104 targets current `main`. Merge, adoption,
+  sealing/restoration, remote promotion/verification,
+  quarantine/reap, source-ref mutation, and running-operator effects remain separate gates.
 
 
 - **R2f0b verification and review (2026-08-01):** [native verification](superpowers/reviews/2026-08-01-r2f0b-native-verification.md)
