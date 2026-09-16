@@ -11,14 +11,16 @@
   `6338bc1628fed52b772026b604a1bbdd710efa8c`; the final Sol/xhigh rereview recorded 0 WRONG and 3 SMELL,
   with full verification at 4,408 passed / 0 failed / 13 ignored / 726 filtered. The candidate remains
   production-unwired; its historical handoff's pre-publication stop is superseded by the recorded PR #102 merge.
-- **Active slice:** **ADR-0041 Slices 1A and 1B — local, uncommitted read-only custody foundation
-  (owner-authorized 2026-09-14/15).** Slice 1A defines canonical lossless records without I/O; Slice 1B adds an
+- **Active slice:** **ADR-0041 Slices 1A and 1B — published candidate PR #104, open and unmerged
+  (owner-authorized 2026-09-14/15; publication authorized 2026-09-16).** Slice 1A defines canonical lossless records without I/O; Slice 1B adds an
   explicitly capped 8+8 metadata collector and synthetic historical reconciliation, with every missing row still
   unverified. The Opus 5/high spec review reported 4 WRONG and 9 SMELL; Sol/high folded all four WRONG and the
   required SMELLs before implementation. Structural and behavioral RED were captured; the host full workspace
   passed 4,423 / 0 / 13 ignored, and all nine collector tests passed on native Linux with a real `0xff` directory.
   One hard-read-only Sol/xhigh code-review round APPROVED with 0 WRONG / 2 deferred schema SMELLs and no blocker.
-  Commit, publication, integration, sealing/restoration, remote promotion/verification,
+  The exact branch `feat/adr0041-custody-inventory-slices-1a-1b-20260916` contains doctor repair
+  `288cacd1` and custody foundation `0431e57e`; PR #104 targets current `main`. Merge, adoption,
+  sealing/restoration, remote promotion/verification,
   quarantine/reap, source-ref mutation, and running-operator effects remain separate gates.
 
 
