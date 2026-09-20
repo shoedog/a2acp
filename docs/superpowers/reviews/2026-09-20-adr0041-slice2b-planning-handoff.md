@@ -1,7 +1,7 @@
 # Handoff — ADR-0041 Slice 2B local capsule planning
 
 **Written:** 2026-09-20T22:07:39Z · **By:** Codex `/root` · **Provider:** codex
-**Workspace:** `/Users/wesleyjinks/code/a2a-bridge/.claude/worktrees/slice2b-plan-20260920` · `docs/adr0041-slice2b-plan-20260920` · **Measured state:** `[MEASURED]` HEAD `27a885f6d4af6a517c2a8899aa5bfe36605b8fb7` plus uncommitted planning/reconciliation delta · Tree DIRTY · Probe `git status --short --branch` · Output to be refreshed after local commit
+**Workspace:** `/Users/wesleyjinks/code/a2a-bridge/.claude/worktrees/slice2b-plan-20260920` · `docs/adr0041-slice2b-plan-20260920` · **Measured state:** `[MEASURED]` planning content HEAD `0ddfbb489d39e7c8367292df2cdf85b3cd3b18b4` · Tree CLEAN before this handoff refresh · Probe `git status --short --branch` · Output `## docs/adr0041-slice2b-plan-20260920`
 **Predecessor:** `docs/superpowers/reviews/2026-09-16-adr0041-slice2a-handoff.md`
 **Truth ordering:** measured live state > explicit owner/contract authority within its scope > this handoff for current operational state > earlier handoffs and non-authoritative summaries. A conflict between tiers stays OPEN in §0 — never resolved by document class alone.
 **Provenance:** written live by the worker from GitHub/remote-main probes, merged ADR/code, and predecessor handoffs. `[MEASURED]` claims were probed by this writer; `[INHERITED]` claims were not.
@@ -9,7 +9,7 @@
 ## 0. Gating facts — settle these before starting anything below
 
 **(a) Lane ownership** — `[MEASURED]` no subagent or bridge workflow was dispatched for this planning lane; `/root` owns the isolated worktree — **RESOLVED 2026-09-20.**
-**(b) Custody exposure** — `[MEASURED]` the plan, roadmap reconciliation, and handoff reconciliations are currently uncommitted in this worktree; no push exists — **OPEN until the exact local planning commit is recorded below.**
+**(b) Custody exposure** — `[MEASURED]` the plan, roadmap reconciliation, and handoff reconciliations are committed locally at `0ddfbb48`; no push exists — **RESOLVED for local durable custody; OPEN for any publication decision.**
 **(c) In flight / irreversible** — `[MEASURED]` no provider turn, filesystem capsule/restore effect, Git source mutation, cleanup, remote promotion, deletion, merge, or operator mutation was started — **RESOLVED for planning 2026-09-20.**
 **(d) Authorization granted but not exercised** — owner instruction: “merged, proceed to planning slice 2b”. This authorizes planning, not implementation, review dispatch, provider spend, publication, merge, cleanup, or running-operator mutation.
 
@@ -49,7 +49,7 @@
 
 | # | Work | State | Exact next action | Blocked by | Identifiers |
 |---:|---|---|---|---|---|
-| 1 | Planning custody | next | Create one local commit, then refresh this handoff with the exact commit. | None. | Branch `docs/adr0041-slice2b-plan-20260920`; plan digest in §6. |
+| 1 | Planning custody | done | Preserve the local commit and this handoff refresh; do not push without separate authority. | None. | Commit `0ddfbb48`; branch `docs/adr0041-slice2b-plan-20260920`; plan digest in §6. |
 | 2 | Spec review | pending | Dispatch one hard-read-only review of the full parent plan plus detailed 2B1 contract; cap two admitted rounds. | Owner/reviewer dispatch gate. | Plan path in §6. |
 | 3 | Child 2B1 implementation | pending | Implement only after plan approval and separate implementation authority. | Approved spec and authority. | Base `27a885f6`; §4 of the plan. |
 | 4 | Children 2B2/2B3 | parked | Proceed serially only after each predecessor is approved. | 2B1 then 2B2 approval; effect authority. | §§5–6 of the plan. |
@@ -76,7 +76,7 @@
 | Planning worktree | `/Users/wesleyjinks/code/a2a-bridge/.claude/worktrees/slice2b-plan-20260920` |
 | Parent plan | `docs/superpowers/plans/2026-09-20-adr0041-slice2b-local-capsule-plan.md` |
 | Predecessor handoff | `docs/superpowers/reviews/2026-09-16-adr0041-slice2a-handoff.md` |
-| Planning commit / plan SHA-256 | pending local commit / `24a99946f4bab284c11089ea4b1f0b32eeb4fc7e13734e096a1d986e3973784a` |
+| Planning content commit / plan SHA-256 | `0ddfbb489d39e7c8367292df2cdf85b3cd3b18b4` / `24a99946f4bab284c11089ea4b1f0b32eeb4fc7e13734e096a1d986e3973784a` |
 
 ## 7. Refutation verdict and owner questions
 
