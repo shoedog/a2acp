@@ -6,6 +6,7 @@ pub mod brief_lint;
 pub mod catalog;
 pub mod custody_inventory;
 pub mod custody_inventory_collector;
+pub mod custody_seal;
 pub mod diagnostics;
 pub mod domain;
 pub mod error;

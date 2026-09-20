@@ -9,15 +9,15 @@
 ## 0. Gating facts — settle these before starting anything below
 
 **(a) Lane ownership** — `[MEASURED]` the owner directed custody of this `fold` worktree; the one Sol fold process terminated and its output exists. No concurrent code editor was dispatched in this lane — **RESOLVED 2026-09-15.**
-**(b) Custody exposure** — `[MEASURED]` the owner authorized commit/push/PR and later explicitly authorized folding the rustls 0.23.45 lock repair into PR #104 on 2026-09-16. Doctor repair `288cacd1`, custody foundation `0431e57e`, publication reconciliation `4e00b76f`, and lock repair `1ba72900` are on the branch in §6 and PR #104 is open; the exact local checkpoint and private Sol/Opus/test artifacts remain as secondary evidence. Publication is not merge or running-operator adoption — **RESOLVED for branch publication; OPEN for merge/adoption.**
+**(b) Custody exposure** — `[MEASURED]` the owner authorized commit/push/PR and later the bounded rustls repair on 2026-09-16. Doctor repair `288cacd1`, custody foundation `0431e57e`, publication reconciliation `4e00b76f`, rustls repair `1ba72900`, and dependency-repair reconciliation `01594083` are pushed on the branch in §6; PR #104 is open. The repair updates `rustls` to 0.23.45 and `rustls-webpki` to 0.103.15 and clears the local dependency-policy gate. Replacement GitHub Build/Lint/Coverage, uninstrumented, macOS, Windows, and CLA checks all pass and merge state is `CLEAN`. CI success is not merge or running-operator adoption — **RESOLVED for branch publication/dependency disposition/replacement CI; OPEN for merge/adoption.**
 **(c) In flight / irreversible** — `[MEASURED]` the Sol fold, structural and behavioral RED, restored GREEN, and one hard-read-only Sol/xhigh code review all completed. No provider turn, seal, removal, operator change, or review remains in flight — **RESOLVED 2026-09-15.**
-**(d) Authorization boundary** — the owner authorized the Slice 2A review and the PR #104 rustls fold, commit, and push. Merge, worktree cleanup, and running-operator effects remain unexercised separate gates.
+**(d) Authorization boundary** — the owner authorized the Slice 2A review and PR #104 rustls fold, commit, and push. Merge, worktree cleanup, and running-operator effects remain unexercised separate gates.
 
 ## 1. Resume order
 
 1. Read the folded task `/private/tmp/a2a-bridge-adr0041-slice1b-folded-spec-20260915.md` (SHA-256 in §6), this handoff, and ADR-0041 §§9/14. Check `git status --short` and the hard Slice 1A digests before any edit.
 2. Read the round-one Sol/xhigh review in §6: APPROVE, 0 WRONG / 2 deferred SMELL, no blocker. No round two was dispatched. Keep the six owned Slice 1B paths separate from the pre-existing Slice 1A and doctor repair before any stage operation.
-3. Treat PR #104 as published but unmerged. The owner-authorized rustls lock repair is on its branch and locally clears the exact dependency-policy failure; monitor replacement CI/review separately and do not merge or deploy without distinct authority. Bound ADR-0041 Slice 2A under local sealing/restoration before adding any code.
+3. Treat PR #104 as published, CI-green, `CLEAN`, and unmerged at `01594083`; its owner-authorized rustls repair clears `RUSTSEC-2026-0285`. Do not merge or deploy without distinct authority. Slice 2A is a separate local stacked candidate with its own 2026-09-16 handoff.
 
 **STOP conditions:** No schema widening, extra path discovery, Git/provider/CLI wiring, write/seal/quarantine/reap/delete/source-ref effects, raising the 8+8 cap, or silently extending the two-round review cap. Any cap overflow, open-class finding, or material authority expansion stops for owner disposition.
 
@@ -34,7 +34,7 @@
 | Focused verification | done | `[MEASURED]` host collector 9/0, preserved Slice 1A 2/0, native-Linux collector 9/0 with real raw-`0xff` directory. Host APFS refused direct raw-name creation with `Illegal byte sequence`; the macOS test-only stand-in/injected probe is disclosed, not counted as concrete raw-name evidence. |
 | Full verification | done | `[MEASURED]` host workspace 88 targets, 4,423 passed / 0 failed / 13 ignored / 0 measured / 729 filtered; doctests 3/0 including privacy `compile_fail`; strict Clippy, default format, diff check, and repository hygiene passed. Full log in §6. |
 | Independent code review | done | `[MEASURED]` one admitted Sol/xhigh hard-read-only round APPROVED: 0 WRONG / 2 SMELL, both schema-bound DEFER, no blocker. The earlier missing-`{{input}}` attempt refused before prompt and consumed no review round; no round two was dispatched. |
-| Commit and publication | done | `[MEASURED]` the two original logical commits and owner-authorized rustls lock repair `1ba72900` are on the PR #104 branch. Local `cargo deny check` clears RUSTSEC-2026-0285 and the repaired tree passes 4,422 / 0 / 13 ignored plus Clippy/format/diff/hygiene 41/9. Replacement GitHub CI, merge, and operator adoption remain separate facts. |
+| Commit and publication | done | `[MEASURED]` the original commits plus rustls repair `1ba72900` and reconciliation `01594083` are pushed to GitHub PR #104 against `main`. Local `cargo deny check`, full workspace 4,422 / 0 / 13 ignored, Clippy, format, diff, and hygiene 41/9 are green on the repaired branch. Replacement GitHub CI and CLA are green and merge state is `CLEAN`; merge and operator adoption remain separate facts. |
 
 ## 3. Corrections to standing documents and memory
 
@@ -48,8 +48,8 @@
 
 | # | Work | State | Exact next action | Blocked by | Identifiers |
 |---:|---|---|---|---|---|
-| 1 | PR #104 CI/review | pending | Confirm replacement GitHub checks for the pushed rustls repair; repair only another closed, attributable finding on this branch. | External CI/review completion. | PR #104 / lock repair `1ba72900`. |
-| 2 | ADR-0041 Slice 2A | next | Author a bounded provider-free local sealing/restoration task with RED-first fixtures and no remote/destructive authority. | Exact slice spec and independent review. | ADR-0041 §14 stage 2. |
+| 1 | PR #104 merge decision | ready / unexercised | Preserve green head `01594083`; merge only under distinct owner authority. | Owner merge decision. | PR #104 / head `01594083`; repair `1ba72900`; GitHub `CLEAN`. |
+| 2 | ADR-0041 Slice 2A | locally approved | Preserve the two-round Sol/high closure and current verification in its handoff; publication remains separate. | Owner publication decision. | ADR-0041 §14 stage 2; 2026-09-16 Slice 2A handoff. |
 | 3 | Worktree administrative cleanup | parked | Keep stale/missing metadata under future custody reconciliation; do not prune or delete based on merged branch alone. | Validated population plus owner cleanup authority. | ADR-0041 §§11/13/14. |
 
 ## 5. Invariants and traps — do not do these
@@ -68,7 +68,7 @@
 | Item | Verbatim |
 |---|---|
 | Published base / branch | `d2cbf4e0561d0db8fd829e3776186d75f38e0715` / `feat/adr0041-custody-inventory-slices-1a-1b-20260916` |
-| Published commits | `288cacd1` doctor repair; `0431e57e` ADR-0041 Slices 1A/1B implementation and evidence; `4e00b76f` publication reconciliation; `1ba72900` rustls 0.23.45 lock repair; this docs reconciliation |
+| Published commits | `288cacd1` doctor repair; `0431e57e` ADR-0041 Slices 1A/1B implementation and evidence; `4e00b76f` publication reconciliation; `1ba72900` rustls 0.23.45 lock repair; `01594083` dependency-repair reconciliation |
 | Pull request | `https://github.com/shoedog/a2acp/pull/104` · open against `main`; merge and CI status are separate facts |
 | Rustls repair verification | `cargo deny check` green; full locked/offline workspace 4,422 passed / 0 failed / 13 ignored; warnings-denied Clippy, format, diff, and hygiene 41/9 green |
 | Hard Slice 1A digests | `lib.rs` pre-edit `e73a56975e89a0606d5813822c8b9417da9d297e489208625ddbdf0398344ee6`; module `367bf2b68173a4e5fc70d76cbd1ae56a58ba6077062ed2ac991bcb2abb93f012`; test `5ec7112c7c91df57e35767dc76c3e0d8f7f1fd744ba674b9b5728147a457cc17` |
