@@ -1,8 +1,10 @@
 # Bridge reliability execution and handoff roadmap
 
 - **Program status:** active P0
-- **Current main lineage:** `origin/main` is `d2cbf4e0561d0db8fd829e3776186d75f38e0715`, the merge of ADR-0041
-  custody-lifecycle documentation PR #103. Its ancestry includes R2f1b 5B PR #102
+- **Current main lineage:** `origin/main` is `27a885f6d4af6a517c2a8899aa5bfe36605b8fb7`, the merge of ADR-0041
+  Slices 1A, 1B, and 2A in PR #104. Its second parent is the reviewed/published PR head
+  `65a572df40f07316124a70b7ec353a2d38dd334d`; that tree is identical to the merge result. Its ancestry includes
+  ADR-0041 custody-lifecycle documentation PR #103, R2f1b 5B PR #102
   (`edcda181ad94daad6ddaf9d3c9d4dd63fd2dce00`), 5A PR #101, 4J PR #100, 4I PR #99,
   the provider compatibility/runbook PR #98, OpenCode Go documentation PR #97, provider runtime-dispatch PR #96,
   provider refresh PRs #90-#95, and R2f1b 4H-2 PR #89.
@@ -11,8 +13,8 @@
   `6338bc1628fed52b772026b604a1bbdd710efa8c`; the final Sol/xhigh rereview recorded 0 WRONG and 3 SMELL,
   with full verification at 4,408 passed / 0 failed / 13 ignored / 726 filtered. The candidate remains
   production-unwired; its historical handoff's pre-publication stop is superseded by the recorded PR #102 merge.
-- **Active slice:** **ADR-0041 Slices 1A, 1B, and 2A — published together in PR #104, open and unmerged
-  (owner-authorized through Slice 2A integration on 2026-09-20).** Slice 1A defines canonical lossless records without I/O; Slice 1B adds an
+- **Active slice:** **ADR-0041 Slice 2B planning — Slices 1A, 1B, and 2A merged in PR #104 at `27a885f6`; no
+  Slice 2B implementation or effects have begun.** Slice 1A defines canonical lossless records without I/O; Slice 1B adds an
   explicitly capped 8+8 metadata collector and synthetic historical reconciliation, with every missing row still
   unverified. The Opus 5/high spec review reported 4 WRONG and 9 SMELL; Sol/high folded all four WRONG and the
   required SMELLs before implementation. Structural and behavioral RED were captured; the host full workspace
@@ -20,11 +22,10 @@
   One hard-read-only Sol/xhigh code-review round APPROVED with 0 WRONG / 2 deferred schema SMELLs and no blocker.
   The exact branch `feat/adr0041-custody-inventory-slices-1a-1b-20260916` contains doctor repair
   `288cacd1`, custody foundation `0431e57e`, publication reconciliation `4e00b76f`, owner-authorized rustls repair
-  `1ba72900`, dependency-repair reconciliation `01594083`, and Slice 2A content commit `64545d45`; PR #104 targets
-  current `main`. The repair updates
+  `1ba72900`, dependency-repair reconciliation `01594083`, Slice 2A content commit `64545d45`, and documentation
+  reconciliation `65a572df`; PR #104 merged those commits into `main` on 2026-09-20. The repair updates
   `rustls` to 0.23.45 and `rustls-webpki` to 0.103.15, clears local `cargo deny check`, and passes its local full and
-  static gates. The replacement GitHub checks for dependency-repair head `01594083` passed; checks for the live PR
-  head remain external state and must be queried directly. Merge, adoption,
+  static gates. The replacement GitHub checks for dependency-repair head `01594083` passed. Adoption,
   sealing/restoration, remote promotion/verification,
   quarantine/reap, source-ref mutation, and running-operator effects remain separate gates. Slice 2A is a
   provider-free, effect-free implementation of canonical `custody-manifest.v1` / `custody-seal.v1` contracts,
@@ -35,8 +36,10 @@
   restored/repaired. Round-one Sol/high review returned REJECT with 2 WRONG / 3 SMELL; both WRONG and all three
   SMELL dispositions received bounded repairs on the same artifact. Final round two returned APPROVE with 0 WRONG /
   2 SMELL. At the exhausted cap, the converging residuals received test/docs-only closure without a third review:
-  exact deduplication and manifest digest inputs are covered. Slice 2A is committed and published in PR #104;
-  merge, adoption, Slice 2B effects, and running-operator mutation remain unexercised.
+  exact deduplication and manifest digest inputs are covered. PR #104 is merged; adoption, Slice 2B effects, and
+  running-operator mutation remain unexercised. The Slice 2B planning candidate decomposes local capsule work into
+  three serial children: pure contracts (2B1), isolated export/object closure (2B2), and inert restore/hidden-state
+  proof (2B3). Independent spec review is the next gate; this planning state grants no implementation or effects.
 
 
 - **R2f0b verification and review (2026-08-01):** [native verification](superpowers/reviews/2026-08-01-r2f0b-native-verification.md)

@@ -1,6 +1,6 @@
 # Handoff — ADR-0041 Slice 2A local seal contracts
 
-**Written:** 2026-09-16; reconciled 2026-09-20 · **By:** Codex `/root` · **Workspace:**
+**Written:** 2026-09-16; merge reconciled 2026-09-20 · **By:** Codex `/root` · **Workspace:**
 `/Users/wesleyjinks/code/a2a-bridge/.claude/worktrees/rustls-pr104-20260916`
 
 **Integrated predecessor:** PR #104 head `015940832ea05eb9b8eba627b5460f70d13cc8a4`
@@ -9,12 +9,12 @@
 
 ## 0. Gating facts
 
-- **PR #104:** open and unmerged; Slice 2A content commit `64545d45` is published on its branch. Owner-authorized lock
+- **PR #104:** merged on 2026-09-20 at `27a885f6`; Slice 2A content commit `64545d45` and documentation reconciliation
+  `65a572df` are its second-parent lineage. The merge tree is identical to reviewed head `65a572df`. Owner-authorized lock
   repair `1ba72900` updates `rustls` to 0.23.45 and `rustls-webpki` to 0.103.15; local `cargo deny check`, the
   repaired branch's full/static gates, and replacement GitHub Build/Lint/Coverage, uninstrumented, macOS, Windows,
-  and CLA checks were green at dependency-repair head `01594083`. Live checks for the current head are external
-  state and must be queried directly. Slice 2A was integrated onto exact predecessor `01594083`; merge remains
-  separate and unexercised.
+  and CLA checks were green at dependency-repair head `01594083`. Slice 2A was integrated onto exact predecessor
+  `01594083`; merge is now exercised. Running-operator adoption remains separate and unexercised.
 - **Implementation:** local, provider-free, and effect-free. No filesystem/Git capture, encryption, restore,
   promotion, provider, authorization, quarantine, reap, deletion, merge, or running-operator path exists.
 - **Independent review:** round one Sol/high hard-read-only review completed as `REJECT`, 2 WRONG / 3 SMELL. Both
@@ -34,8 +34,9 @@
    third review. The two round-two SMELLs are closed by tests/docs only and the final direct gates below.
 4. Preserve the exact seven-path Slice 2A population and re-run focused verification if any bound code/test/task
    digest changes.
-5. Query PR #104 checks directly. Do not merge, start Slice 2B effects, clean worktrees, or mutate the running
-   operator without separate authority.
+5. Treat PR #104 merge commit `27a885f6` as the completed predecessor. Use the Slice 2B planning handoff for current
+   work. Do not start Slice 2B implementation/effects, clean worktrees, or mutate the running operator without the
+   next applicable gate.
 
 ## 2. State ledger
 
@@ -78,6 +79,11 @@ exact sealed artifacts, proves Git object closure without alternates, and restor
 executable config disabled. It must obtain a separately reviewed spec before adding filesystem writes, snapshot
 assumptions, encryption interfaces, or restore execution. Remote promotion and all destructive authority remain
 later ADR stages.
+
+The planning candidate now lives at
+`docs/superpowers/plans/2026-09-20-adr0041-slice2b-local-capsule-plan.md`. It decomposes this boundary into serial
+2B1 contracts, 2B2 isolated export/object closure, and 2B3 inert restore/hidden-state proof. It is not yet
+independently reviewed and grants no implementation or effect authority.
 
 ## 5. Owned paths and status
 
