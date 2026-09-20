@@ -1,7 +1,7 @@
 # Handoff — ADR-0041 Slice 2B local capsule planning
 
-**Written:** 2026-09-20T22:47:59Z · **By:** Codex `/root` · **Provider:** codex + Claude ACP review
-**Workspace:** `/Users/wesleyjinks/code/a2a-bridge/.claude/worktrees/slice2b-plan-20260920` · `docs/adr0041-slice2b-plan-20260920` · **Measured state:** `[MEASURED]` final-review input HEAD `02635ca2e01177849bf6741abe08d11ac5f92b8a` · approval closure present and not yet committed at this refresh
+**Written:** 2026-09-20T22:51:32Z · **By:** Codex `/root` · **Provider:** codex + Claude ACP review
+**Workspace:** `/Users/wesleyjinks/code/a2a-bridge/.claude/worktrees/slice2b-plan-20260920` · `docs/adr0041-slice2b-plan-20260920` · **Measured state:** `[MEASURED]` implementation-task HEAD `81c292ceee9fcb1221747d606f862929c5e880e7` · Tree CLEAN before this handoff seal refresh
 **Predecessor:** `docs/superpowers/reviews/2026-09-16-adr0041-slice2a-handoff.md`
 **Truth ordering:** measured live state > explicit owner/contract authority within its scope > this handoff for current operational state > earlier handoffs and non-authoritative summaries. A conflict between tiers stays OPEN in §0 — never resolved by document class alone.
 **Provenance:** written live by the worker from GitHub/remote-main probes, merged ADR/code, and predecessor handoffs. `[MEASURED]` claims were probed by this writer; `[INHERITED]` claims were not.
@@ -9,7 +9,7 @@
 ## 0. Gating facts — settle these before starting anything below
 
 **(a) Lane ownership** — `[MEASURED]` `/root` owns the isolated worktree. Two bridge reviews ran to completion under the execution IDs in §6; no implementation agent is in flight — **RESOLVED 2026-09-20.**
-**(b) Custody exposure** — `[MEASURED]` round-1 repair is committed through `02635ca2`; the final review record and six residual closures are uncommitted; no push exists — **OPEN until approval-closure commit; publication remains OPEN.**
+**(b) Custody exposure** — `[MEASURED]` final approval/residual closure is committed at `56922bdd`; the validated implementation task is committed at `81c292ce`; no push exists — **RESOLVED for local custody; publication remains OPEN.**
 **(c) In flight / irreversible** — `[MEASURED]` both authorized billable Opus reviews completed. No filesystem capsule/restore effect, Git source mutation, cleanup, remote promotion, deletion, merge, or operator mutation was started — **RESOLVED for spec review 2026-09-20.**
 **(d) Authorization granted but not exercised** — owner authorized Opus/Fable review, folding findings, and implementation orchestration once clear. Publication, merge, cleanup, capsule/restore effects beyond the pure 2B1 contracts, and running-operator mutation remain unauthorized.
 
@@ -17,9 +17,8 @@
 
 1. In this exact worktree run `git status --short --branch`, bind HEAD/base to the identifiers in §6, and require no code paths outside the planning delta.
 2. Read ADR-0041 §§4, 8, 9, 11, 14, and 17; the Slice 2A handoff §4; and the complete plan in §6.
-3. Bind both review records in §6 and verify the final documentation closure and approval.
-4. Write a typed 2B1 implementation task bound to the final approved predecessor, including structural RED,
-   discriminating behavioral mutations, exact owned paths, full gates, and no 2B2 effects.
+3. Bind both review records, the final approved closure, and the typed implementation task in §6.
+4. Validate the write-capable implementation config, doctor the exact lane, and bind its live model/capabilities.
 5. Orchestrate implementation in a write-capable quarantine, inspect the terminal result and diff, and integrate
    only an approved commit into a local stacked 2B1 branch. Do not publish or begin 2B2 in the same dispatch.
 
@@ -36,7 +35,7 @@
 | Durable-state reconciliation | done | `[MEASURED]` roadmap plus Slice 1B/2A handoffs now record PR #104 merged and preserve adoption/effects as separate gates. |
 | Documentation gates | done | `[MEASURED]` `git diff --check` exits 0; locked/offline repository hygiene reports 41 tracked artifacts / 9 validated example configs. No code changed, so no implementation/full-suite claim is made. |
 | Independent spec review | approved | `[MEASURED]` Opus 5/high round 2 returned `APPROVE`: all 4 inherited WRONG RESOLVED, 0 new WRONG, 6 non-blocking SMELL. The converging two-round cap is exhausted; residuals were folded without extension. |
-| Implementation/effects | next | Owner authorized 2B1 implementation orchestration. No code implementation or capsule/restore effect has started; 2B1 remains effect-free and 2B2/2B3 remain unauthorized. |
+| Implementation/effects | task ready | Owner authorized 2B1 implementation orchestration. The typed task validates and is committed at `81c292ce`; no code implementation or capsule/restore effect has started. |
 
 ## 3. Corrections to standing documents and memory
 
@@ -51,9 +50,9 @@
 
 | # | Work | State | Exact next action | Blocked by | Identifiers |
 |---:|---|---|---|---|---|
-| 1 | Planning custody | closure pending | Commit final approval, residual folds, and refreshed handoff; do not push without separate authority. | Documentation gates. | Final-review input `02635ca2`; final plan digest in §6. |
+| 1 | Planning custody | done | Preserve the approved closure, implementation task, and this handoff seal; do not push without separate authority. | None. | Approval `56922bdd`; task `81c292ce`; final plan digest in §6. |
 | 2 | Spec review | approved | Preserve both review records; no third round. | None. | Round-1 and round-2 records in §6. |
-| 3 | Child 2B1 implementation | authorized, next | Orchestrate pure contracts only from the final approved planning predecessor. | Approval-closure commit. | Code base `27a885f6`; §4 of the plan. |
+| 3 | Child 2B1 implementation | authorized, next | Validate the containerized config, then orchestrate pure contracts only from this stacked planning branch. | None. | Task and code base in §6; §4 of the plan. |
 | 4 | Children 2B2/2B3 | parked | Proceed serially only after each predecessor is approved. | 2B1 then 2B2 approval; effect authority. | §§5–6 of the plan. |
 | 5 | Worktree cleanup/operator adoption | parked | Keep separate from Slice 2B planning and implementation. | Separate exact authority and custody proof. | ADR-0041 stages 3–5. |
 
@@ -86,6 +85,8 @@
 | Round-2 review record | `docs/superpowers/reviews/2026-09-20-adr0041-slice2b-spec-review-round2.md` |
 | Round-2 execution / attempt | `exec-4f668e0a4d8b406c07f79001174a2452` / `attempt-fac52a4c94cfc419a2e0edf582e01e16` |
 | Final approved closure plan SHA-256 | `fd865c357fad25980fd23bf16f7af2d9cff10dc429de6a55577d09ae6be5fa71` |
+| Approval-closure commit | `56922bdd66a6f92522848f2167647e9576e74d8a` |
+| 2B1 implementation task / commit | `docs/superpowers/plans/2026-09-20-adr0041-slice2b1-implementation-task.md` / `81c292ceee9fcb1221747d606f862929c5e880e7` |
 
 ## 7. Refutation verdict and owner questions
 
