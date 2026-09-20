@@ -1360,6 +1360,12 @@ fn claude_credential_source(
     if entry.auth_method.is_some() {
         return Ok(None);
     }
+    // An explicit host pre-authentication declaration authorizes reuse of the host profile
+    // (including credential stores that do not materialize legacy `.credentials.json`).
+    // Container entries are handled above and still require their exact regular-file bind.
+    if entry.pre_authenticated {
+        return Ok(None);
+    }
     if CLAUDE_EXPLICIT_AUTH_ENVS.iter().any(|name| {
         probes
             .env_var_value(name)
@@ -3651,6 +3657,24 @@ mod tests {
             CheckStatus::Fail
         );
         assert!(provenance_blocks_smoke_spawn(&empty_rows));
+    }
+
+    #[test]
+    fn pre_authenticated_host_claude_bypasses_legacy_file_oauth_gate() {
+        let mut host = acp_entry("claude", "claude-agent-acp");
+        host.pre_authenticated = true;
+        let snapshot = snapshot("claude", vec![host], vec!["claude-agent-acp"]);
+        let probes = FakeProbes::new().with_host_home("/home/test").at_time(10);
+
+        let mut rows = Vec::new();
+        check_provenance(&snapshot, &probes, &mut rows);
+
+        assert!(
+            rows.iter()
+                .all(|row| row.check != "provenance:claude:oauth-credential"),
+            "an explicitly pre-authenticated host entry must not require legacy file OAuth"
+        );
+        assert!(!provenance_blocks_smoke_spawn(&rows));
     }
 
     #[test]
