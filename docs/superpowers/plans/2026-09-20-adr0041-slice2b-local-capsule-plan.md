@@ -1,6 +1,6 @@
 # ADR-0041 Slice 2B — local capsule and inert restoration plan
 
-**Status:** planning candidate; independent spec review not yet run
+**Status:** round-1 reviewed; repaired candidate pending the final admitted review round
 
 **Exact base:** `27a885f6d4af6a517c2a8899aa5bfe36605b8fb7` (`origin/main`, PR #104 merge)
 
@@ -17,7 +17,8 @@ its alternates, sibling clones, caches, credentials, or network.
 
 The completed parent slice must establish all of the following:
 
-1. every `captured` coverage class maps to one or more exact sealed artifacts;
+1. every `captured` coverage class maps to one or more exact sealed artifacts; `object_database` is `captured` only
+   when its exact object inventory is non-empty;
 2. every sealed artifact has one declared role, and no manifest coverage row or artifact is silently omitted;
 3. the capsule's Git object pack contains exactly the manifest's object inventory and is transitively closed;
 4. closure is verified from a fresh isolated object database with no alternates or lazy fetch;
@@ -61,9 +62,11 @@ implementation.
 
 ### 3.1 Physical layout
 
-The v1 capsule is a directory of independently sealed opaque artifacts, not a tar/zip stream. This avoids adding an
-archive parser, path-extraction policy, compression nondeterminism, and aggregate-memory risk to the first local
-proof. `custody-seal.v1` remains the exterior descriptor and is not listed as an artifact inside itself.
+The v1 capsule exterior is a directory of independently sealed opaque artifacts, not a tar/zip stream. This avoids
+adding an exterior archive parser or exterior path-extraction policy, compression nondeterminism, and
+aggregate-memory risk to the first local proof. A later reviewed 2B2 child may define bounded interior framing for
+a coverage payload; it must not turn artifact names into extraction paths. `custody-seal.v1` remains the exterior
+descriptor and is not listed as an artifact inside itself.
 
 Reserved logical artifact names are portable slash-delimited names already admitted by
 `CustodySealedArtifactV1`:
@@ -76,9 +79,10 @@ git/objects.pack.enc
 payload/<coverage-class>.bin.enc
 ```
 
-Names are logical identifiers, not paths accepted directly from an untrusted archive. Materialization walks their
-validated components beneath retained destination descriptors. V1 has no symlink, hardlink, device, FIFO, socket,
-absolute-path, `..`, platform-prefix, or case-fold alias entry type.
+Names are logical identifiers, not paths accepted directly from an untrusted archive. Exterior materialization
+walks their validated components beneath retained destination descriptors. The v1 capsule exterior has no symlink,
+hardlink, device, FIFO, socket, absolute-path, `..`, platform-prefix, or case-fold alias entry type. Interior
+coverage framing and its separate path/mode policy remain a reviewed 2B2 decision.
 
 ### 3.2 Artifact roles and total mapping
 
@@ -110,16 +114,21 @@ An artifact cannot cover two classes. Cross-class deduplication and multi-artifa
 excluded from v1 because they make completeness, bounds, and restore ownership ambiguous. Zero-byte payloads
 remain valid artifacts.
 
-The object-database row and inventory must agree: non-empty original objects require `captured`; `empty` requires
-an empty object inventory; `excluded_reproducible` is not accepted for this self-contained v1 object database. An
-`unknown` object kind refuses layout construction because exact kind equality cannot otherwise be proved.
+The object-database row and inventory must agree bidirectionally: a non-empty original-object inventory requires
+`captured`; `object_database` `captured` requires a non-empty inventory; and an empty inventory requires state
+`empty`. `excluded_reproducible` is not accepted for this self-contained v1 object database. An `unknown` object
+kind refuses layout construction because exact kind equality cannot otherwise be proved.
 
 ### 3.3 Encryption boundary
 
-Production code sees a narrow opaque envelope port with separate `seal` and `open` methods. Each operation binds
-the logical artifact name, manifest digest, capsule format, and recipient set as authenticated context. The port
-returns or consumes bounded byte streams and an exact non-empty format/tool identity; it cannot claim success
-without producing ciphertext bytes and recipient metadata compatible with `CustodySealV1`.
+Production code sees a narrow opaque envelope port with separate `seal` and `open` methods. Both accept the same
+validated `CustodyEnvelopeContextV1` canonical encoding as authenticated context. That record binds the logical
+artifact name, manifest digest, capsule format, and the canonical non-empty recipient set exactly as
+`CustodySealV1` stores it: empty recipients refuse, duplicates collapse, and remaining recipient strings sort by
+their UTF-8 bytes. Seal-time context uses the exact values the exterior seal will carry; open-time context is
+re-derived from that seal and must encode byte-identically. The port returns or consumes bounded byte streams and
+an exact non-empty capsule-format, sealing-tool, and sealing-tool-version identity; it cannot claim success without
+producing ciphertext bytes and recipient metadata compatible with `CustodySealV1`.
 
 Slice 2B ships no real key discovery, key storage, password prompt, recipient resolver, or crypto provider. A
 deterministic test-only envelope implementation is allowed only under fixture/test support and must identify itself
@@ -159,13 +168,23 @@ and content digests:
 - `CustodyCapsuleIndexV1` with literal schema, manifest digest, and canonical artifact-role rows;
 - `CustodyCapsuleArtifactRoleV1` with the closed roles in §3.2;
 - `CustodyCapsuleLayoutV1`, constructed from a validated, sealable manifest before effects and enforcing the exact
-  reserved names, the 17-artifact cap, and the state/inventory rules in §3.2;
+  reserved names and state/inventory rules in §3.2; because the manifest vocabulary is closed, the constructor
+  asserts the derived invariant of exactly 17 artifacts when all 14 classes are captured and exactly three when
+  every class is empty rather than exposing an unreachable caller-selected cap branch;
 - `CustodyCapsuleBindingV1`, constructed only after effects from a validated manifest, index, restore policy, and
-  seal, enforcing manifest/seal digest equality and exact two-way index/seal artifact equality;
+  seal; it re-derives the expected layout from the manifest, requires the supplied index to equal that layout,
+  enforces three-way digest agreement (`manifest.content_digest() == index.manifest_digest ==
+  seal.manifest_digest`), and enforces exact two-way index/seal artifact equality;
 - `CustodyRestorePolicyV1`, accepting only the inert v1 policy in §3.4;
-- `CustodyEnvelopeFormatV1`, which records opaque format/tool identity but performs no cryptography;
+- `CustodyEnvelopeFormatV1`, which records opaque capsule-format, sealing-tool, and sealing-tool-version identity
+  but performs no cryptography;
+- `CustodyEnvelopeContextV1`, which validates and canonically encodes the logical artifact name, manifest digest,
+  capsule format, and canonical recipient set specified in §3.3;
 - sealed `CustodyEnvelopeSealerV1` and `CustodyEnvelopeOpenerV1` port traits whose production implementations must
-  supply bounded opaque bytes and exact format/recipient identity; 2B1 supplies no implementation;
+  accept that context and supply bounded opaque bytes and exact format/recipient identity; 2B1 supplies no
+  implementation. The later deterministic fixture adapter must live inside `bridge-core` behind test/fixture
+  support and be covered by in-crate unit tests; an external integration-test crate does not implement the sealed
+  traits;
 - typed refusal reasons that distinguish invalid input, non-sealable manifest, manifest/seal digest mismatch,
   missing/duplicate/unmapped artifacts, coverage-state mismatch, and unsupported restore behavior.
 
@@ -181,15 +200,19 @@ Capture the current-base structural RED before production code. Then run and rec
 mutations against compiling code, restoring each mutation:
 
 1. omit the `worktree` coverage row from the mapping and prove the layout would otherwise accept it;
-2. allow one seal artifact to remain unmapped and prove the planner would otherwise accept it;
-3. map one artifact to both `index` and `worktree` and prove duplicate ownership is rejected;
+2. allow one seal artifact to remain unmapped and prove the post-effect binding would otherwise accept it;
+3. temporarily disable the exact duplicate-class-ownership check and give two distinct canonical artifact names
+   the same `coverage_payload(worktree)` role while retaining all required control roles; count the mutation only
+   if the focused test changes from failing to passing, otherwise repair the fixture/branch before using it;
 4. treat `unresolved` coverage as empty and prove the planner refuses before any later effect;
 5. allow an active hook or executable-config restore value and prove the closed restore policy rejects it;
-6. change the manifest digest while retaining the same artifact map and prove the post-effect binding refuses;
+6. independently change the index manifest digest and the seal manifest digest while retaining the same artifact
+   map, proving each foreign-generation substitution is refused by the post-effect binding;
 7. accept `unknown` as a proved object kind and prove layout construction refuses it.
 
-Tests also cover empty-object manifests, mandatory/non-mandatory Git-pack role cardinality, the 17-artifact cap,
-object-database state/inventory disagreement, zero-byte artifacts,
+Tests also cover seal-time/open-time envelope-context byte equality under unsorted and duplicate recipient input;
+empty-object manifests; mandatory/non-mandatory Git-pack role cardinality; exact 3- and 17-artifact invariants;
+`object_database=captured` with an empty inventory; zero-byte artifacts;
 non-UTF-8 logical names, order-independent canonicalization, duplicate rows, wrong schemas, unknown fields,
 non-canonical encodings, every constructor error branch, and digest sensitivity for every bound field.
 
@@ -319,6 +342,7 @@ Every child runs its focused target, `bridge-core`, and the full locked/offline 
 cargo test --locked --offline -p bridge-core --test <child-target>
 cargo test --locked --offline -p bridge-core
 cargo test --locked --offline --workspace --all-targets
+cargo test --locked --offline --workspace
 cargo clippy --locked --offline --workspace --all-targets -- -D warnings
 cargo fmt --all -- --check
 git diff --check
@@ -326,10 +350,11 @@ cargo deny check
 cargo run --locked --offline -p a2a-bridge -- validate --repo-hygiene
 ```
 
-2B2/2B3 additionally run their real-Git fixtures on host macOS and native Linux. Platform-specific exclusions are
-named with exact test counts and mechanisms. A fixture/setup/subprocess failure, zero-test selection, or invalid
-flag is inadmissible and must be repaired before it informs the result. The exact pre-change artifact must run in
-the same environment before attributing a new failure to the child.
+2B2/2B3 additionally run their real-Git fixtures on host macOS and a native Linux filesystem such as ext4; a
+container overlayfs result does not substitute for the native-filesystem identity-drift control. Platform-specific
+exclusions are named with exact test counts and mechanisms. A fixture/setup/subprocess failure, zero-test selection,
+or invalid flag is inadmissible and must be repaired before it informs the result. The exact pre-change artifact
+must run in the same environment before attributing a new failure to the child.
 
 Declare a **two-admitted-round review cap per child** before dispatch. Reviews are hard-read-only and report WRONG
 before SMELL. A WRONG must name a constructible state/input, wrong result, mechanism, bounded repair, and realistic
