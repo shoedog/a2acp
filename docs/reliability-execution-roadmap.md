@@ -13,7 +13,7 @@
   `6338bc1628fed52b772026b604a1bbdd710efa8c`; the final Sol/xhigh rereview recorded 0 WRONG and 3 SMELL,
   with full verification at 4,408 passed / 0 failed / 13 ignored / 726 filtered. The candidate remains
   production-unwired; its historical handoff's pre-publication stop is superseded by the recorded PR #102 merge.
-- **Active slice:** **ADR-0041 Slice 2B spec repair — Slices 1A, 1B, and 2A merged in PR #104 at `27a885f6`; no
+- **Active slice:** **ADR-0041 Slice 2B1 implementation orchestration — Slices 1A, 1B, and 2A merged in PR #104 at `27a885f6`; no
   Slice 2B implementation or effects have begun.** Slice 1A defines canonical lossless records without I/O; Slice 1B adds an
   explicitly capped 8+8 metadata collector and synthetic historical reconciliation, with every missing row still
   unverified. The Opus 5/high spec review reported 4 WRONG and 9 SMELL; Sol/high folded all four WRONG and the
@@ -42,9 +42,11 @@
   proof (2B3). Opus 5/high hard-read-only review round 1 returned `REJECT` with three blocking contract WRONGs, one
   deferred evidence-control WRONG, and eight SMELLs. The closed population was folded on the same artifact: canonical
   authenticated envelope context, three-way manifest/index/seal digest binding, bidirectional object-database
-  state/inventory rules, discriminating mutations, layout re-derivation, and bounded gate clarifications. One
-  admitted spec-review round remains. The owner authorized 2B1 implementation orchestration once that review is
-  clear; 2B2/2B3 effects, publication, and running-operator mutation remain separate gates.
+  state/inventory rules, discriminating mutations, layout re-derivation, and bounded gate clarifications. Final
+  round 2 APPROVED with 0 WRONG / 6 non-blocking SMELL; all four inherited WRONG were mechanism-level RESOLVED.
+  The cap is exhausted with a converging population, and the six one-clause documentation/evidence residuals were
+  folded without a third review. The owner authorized 2B1 implementation orchestration, which is now the active
+  gate; 2B2/2B3 effects, publication, and running-operator mutation remain separate gates.
 
 
 - **R2f0b verification and review (2026-08-01):** [native verification](superpowers/reviews/2026-08-01-r2f0b-native-verification.md)

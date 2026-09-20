@@ -1,13 +1,14 @@
 # ADR-0041 Slice 2B — local capsule and inert restoration plan
 
-**Status:** round-1 reviewed; repaired candidate pending the final admitted review round
+**Status:** approved at the two-round review cap; 2B1 is implementation-ready
 
 **Exact base:** `27a885f6d4af6a517c2a8899aa5bfe36605b8fb7` (`origin/main`, PR #104 merge)
 
-**Authority and limits:** The owner authorized planning Slice 2B. This document grants no implementation,
-provider turn, filesystem effect, source mutation, remote promotion, project publication, merge, cleanup,
-quarantine, reap, deletion, restore into a user-selected path, or running-operator mutation. ADR-0041 and the
-Slice 2A handoff require a separately reviewed spec before any Slice 2B effect is implemented.
+**Authority and limits:** The owner authorized planning, independent review, and implementation orchestration of
+the pure/effect-free 2B1 child after spec approval. No 2B2/2B3 filesystem or Git effect, source mutation, remote
+promotion, project publication, merge, cleanup, quarantine, reap, deletion, restore into a user-selected path, or
+running-operator mutation is authorized. ADR-0041 and the Slice 2A handoff require a separately reviewed child spec
+before any later Slice 2B effect is implemented.
 
 ## 1. Outcome
 
@@ -17,13 +18,13 @@ its alternates, sibling clones, caches, credentials, or network.
 
 The completed parent slice must establish all of the following:
 
-1. every `captured` coverage class maps to one or more exact sealed artifacts; `object_database` is `captured` only
-   when its exact object inventory is non-empty;
+1. every `captured` coverage class maps to exactly one sealed class artifact: a coverage payload, except
+   `object_database`, whose non-empty inventory maps to the single Git pack;
 2. every sealed artifact has one declared role, and no manifest coverage row or artifact is silently omitted;
 3. the capsule's Git object pack contains exactly the manifest's object inventory and is transitively closed;
 4. closure is verified from a fresh isolated object database with no alternates or lazy fetch;
-5. an isolated restore reproduces the covered hidden state and ordinary working state byte-for-byte where the
-   manifest says it is captured;
+5. an isolated restore reproduces captured logical payload bytes exactly; inert hidden-state evidence may be placed
+   outside its original active location, while ordinary working state is reconstructed byte-for-byte where safe;
 6. archived hooks and behavior-affecting Git configuration are retained as evidence but are never executed or
    activated by export, verification, or restore;
 7. restored linked-worktree, nested-repository, in-progress-operation, and workflow-resume state is inert until a
@@ -158,7 +159,7 @@ config is synthesized from the safe closed policy rather than copied from the ar
 - `crates/bridge-core/src/custody_seal.rs` (read-only accessors only; no v1 validation weakening)
 - `crates/bridge-core/src/lib.rs` (module export only)
 - `crates/bridge-core/tests/custody_capsule.rs` (new)
-- this plan, the Slice 2B handoff, and the reliability roadmap for reconciliation only
+- ADR-0041's schema table, this plan, the Slice 2B handoff, and the reliability roadmap for reconciliation only
 
 ### 4.2 Required API
 
@@ -185,8 +186,9 @@ and content digests:
   implementation. The later deterministic fixture adapter must live inside `bridge-core` behind test/fixture
   support and be covered by in-crate unit tests; an external integration-test crate does not implement the sealed
   traits;
-- typed refusal reasons that distinguish invalid input, non-sealable manifest, manifest/seal digest mismatch,
-  missing/duplicate/unmapped artifacts, coverage-state mismatch, and unsupported restore behavior.
+- typed refusal reasons that distinguish invalid input, non-sealable manifest, three-way manifest-digest mismatch,
+  derived-layout mismatch, missing/duplicate/unmapped artifacts, coverage-state mismatch, unknown object kind, and
+  unsupported restore behavior.
 
 Add only the minimum immutable accessors needed to compare existing private Slice 2A records. All direct Serde
 deserialization must route through the same validation path; unknown fields and non-canonical JSON refuse.
@@ -207,7 +209,8 @@ mutations against compiling code, restoring each mutation:
 4. treat `unresolved` coverage as empty and prove the planner refuses before any later effect;
 5. allow an active hook or executable-config restore value and prove the closed restore policy rejects it;
 6. independently change the index manifest digest and the seal manifest digest while retaining the same artifact
-   map, proving each foreign-generation substitution is refused by the post-effect binding;
+   map, proving each foreign-generation substitution is refused; then substitute a different valid manifest while
+   index and seal still agree on the old digest, proving the binding actually computes the manifest leg;
 7. accept `unknown` as a proved object kind and prove layout construction refuses it.
 
 Tests also cover seal-time/open-time envelope-context byte equality under unsorted and duplicate recipient input;
@@ -336,7 +339,8 @@ ciphertext byte, destination replacement, and attempted activation of an archive
 
 ## 8. Verification and review gates
 
-Every child runs its focused target, `bridge-core`, and the full locked/offline workspace, reporting exact totals:
+Every child directly invokes its focused target, `bridge-core`, and the full locked/offline workspace, reporting
+exact totals. Completion-gate commands are not piped through `tee` or another process that can mask their status:
 
 ```text
 cargo test --locked --offline -p bridge-core --test <child-target>
