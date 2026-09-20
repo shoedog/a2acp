@@ -1,7 +1,7 @@
 # Handoff — ADR-0041 Slice 2B local capsule planning
 
-**Written:** 2026-09-20T22:37:10Z · **By:** Codex `/root` · **Provider:** codex + Claude ACP review
-**Workspace:** `/Users/wesleyjinks/code/a2a-bridge/.claude/worktrees/slice2b-plan-20260920` · `docs/adr0041-slice2b-plan-20260920` · **Measured state:** `[MEASURED]` review-input HEAD `522aac0793a4c5c0a6c07a6cf57a25b55ea517d5` · round-1 repairs present and not yet committed at this refresh
+**Written:** 2026-09-20T22:38:59Z · **By:** Codex `/root` · **Provider:** codex + Claude ACP review
+**Workspace:** `/Users/wesleyjinks/code/a2a-bridge/.claude/worktrees/slice2b-plan-20260920` · `docs/adr0041-slice2b-plan-20260920` · **Measured state:** `[MEASURED]` repaired-content HEAD `9d982940ed9bd030a42e7284eb3a6c92f0e940f8` · Tree CLEAN before this handoff seal refresh
 **Predecessor:** `docs/superpowers/reviews/2026-09-16-adr0041-slice2a-handoff.md`
 **Truth ordering:** measured live state > explicit owner/contract authority within its scope > this handoff for current operational state > earlier handoffs and non-authoritative summaries. A conflict between tiers stays OPEN in §0 — never resolved by document class alone.
 **Provenance:** written live by the worker from GitHub/remote-main probes, merged ADR/code, and predecessor handoffs. `[MEASURED]` claims were probed by this writer; `[INHERITED]` claims were not.
@@ -9,7 +9,7 @@
 ## 0. Gating facts — settle these before starting anything below
 
 **(a) Lane ownership** — `[MEASURED]` `/root` owns the isolated worktree. One bridge review ran to completion under execution `exec-4206c5c65ea2dd11959c4c1b34546e2b`; no implementation agent is in flight — **RESOLVED 2026-09-20.**
-**(b) Custody exposure** — `[MEASURED]` the original plan/handoff are committed locally through `522aac07`; the round-1 review record and repairs are currently uncommitted; no push exists — **OPEN until repair commit, then RESOLVED for local custody; publication remains OPEN.**
+**(b) Custody exposure** — `[MEASURED]` the round-1 review record and folded repairs are committed locally at `9d982940`; no push exists — **RESOLVED for local custody; publication remains OPEN.**
 **(c) In flight / irreversible** — `[MEASURED]` the authorized billable Opus review completed. No filesystem capsule/restore effect, Git source mutation, cleanup, remote promotion, deletion, merge, or operator mutation was started — **RESOLVED for review 2026-09-20.**
 **(d) Authorization granted but not exercised** — owner authorized Opus/Fable review, folding findings, and implementation orchestration once clear. Publication, merge, cleanup, capsule/restore effects beyond the pure 2B1 contracts, and running-operator mutation remain unauthorized.
 
@@ -49,7 +49,7 @@
 
 | # | Work | State | Exact next action | Blocked by | Identifiers |
 |---:|---|---|---|---|---|
-| 1 | Planning custody | repair pending | Commit the folded round-1 repair and refreshed handoff; do not push without separate authority. | Documentation gates. | Review-input commit `522aac07`; branch `docs/adr0041-slice2b-plan-20260920`; repaired digest in §6. |
+| 1 | Planning custody | done | Preserve the folded round-1 repair and this handoff seal; do not push without separate authority. | None. | Repaired-content commit `9d982940`; branch `docs/adr0041-slice2b-plan-20260920`; repaired digest in §6. |
 | 2 | Spec review | round 1 rejected | After the repair commit, dispatch the one remaining hard-read-only round against the exact repaired artifact. | Durable repair commit. | Round-1 record in §6. |
 | 3 | Child 2B1 implementation | authorized, gated | Orchestrate only after final spec approval; implement pure contracts and no 2B2 effects. | Approved spec. | Code base `27a885f6`; §4 of the plan. |
 | 4 | Children 2B2/2B3 | parked | Proceed serially only after each predecessor is approved. | 2B1 then 2B2 approval; effect authority. | §§5–6 of the plan. |
@@ -77,6 +77,7 @@
 | Parent plan | `docs/superpowers/plans/2026-09-20-adr0041-slice2b-local-capsule-plan.md` |
 | Predecessor handoff | `docs/superpowers/reviews/2026-09-16-adr0041-slice2a-handoff.md` |
 | Planning content commit / plan SHA-256 | `0ddfbb489d39e7c8367292df2cdf85b3cd3b18b4` / `24a99946f4bab284c11089ea4b1f0b32eeb4fc7e13734e096a1d986e3973784a` |
+| Round-1 repaired-content commit | `9d982940ed9bd030a42e7284eb3a6c92f0e940f8` |
 | Repaired candidate plan SHA-256 | `deac1ef6edae6c6ebcb3a37b1422114b811b2e3b365b83b586517c37aedb4162` |
 | Round-1 review record | `docs/superpowers/reviews/2026-09-20-adr0041-slice2b-spec-review-round1.md` |
 | Round-1 execution / attempt | `exec-4206c5c65ea2dd11959c4c1b34546e2b` / `attempt-b299fb54e0b360d808021749f8d3291c` |
