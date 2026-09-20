@@ -11,9 +11,8 @@
   `6338bc1628fed52b772026b604a1bbdd710efa8c`; the final Sol/xhigh rereview recorded 0 WRONG and 3 SMELL,
   with full verification at 4,408 passed / 0 failed / 13 ignored / 726 filtered. The candidate remains
   production-unwired; its historical handoff's pre-publication stop is superseded by the recorded PR #102 merge.
-- **Active slice:** **ADR-0041 Slices 1A and 1B — published candidate PR #104, open and unmerged;
-  Slice 2A local seal-contract candidate stacked on its exact head (owner-authorized 2026-09-14/15;
-  publication authorized for 1A/1B on 2026-09-16).** Slice 1A defines canonical lossless records without I/O; Slice 1B adds an
+- **Active slice:** **ADR-0041 Slices 1A, 1B, and 2A — published together in PR #104, open and unmerged
+  (owner-authorized through Slice 2A integration on 2026-09-20).** Slice 1A defines canonical lossless records without I/O; Slice 1B adds an
   explicitly capped 8+8 metadata collector and synthetic historical reconciliation, with every missing row still
   unverified. The Opus 5/high spec review reported 4 WRONG and 9 SMELL; Sol/high folded all four WRONG and the
   required SMELLs before implementation. Structural and behavioral RED were captured; the host full workspace
@@ -21,22 +20,23 @@
   One hard-read-only Sol/xhigh code-review round APPROVED with 0 WRONG / 2 deferred schema SMELLs and no blocker.
   The exact branch `feat/adr0041-custody-inventory-slices-1a-1b-20260916` contains doctor repair
   `288cacd1`, custody foundation `0431e57e`, publication reconciliation `4e00b76f`, owner-authorized rustls repair
-  `1ba72900`, and dependency-repair reconciliation `01594083`; PR #104 targets current `main`. The repair updates
+  `1ba72900`, dependency-repair reconciliation `01594083`, and Slice 2A content commit `64545d45`; PR #104 targets
+  current `main`. The repair updates
   `rustls` to 0.23.45 and `rustls-webpki` to 0.103.15, clears local `cargo deny check`, and passes its local full and
-  static gates. Replacement GitHub Build/Lint/Coverage, uninstrumented, macOS, Windows, and CLA checks all pass;
-  GitHub reports merge state `CLEAN`. Merge, adoption,
+  static gates. The replacement GitHub checks for dependency-repair head `01594083` passed; checks for the live PR
+  head remain external state and must be queried directly. Merge, adoption,
   sealing/restoration, remote promotion/verification,
-  quarantine/reap, source-ref mutation, and running-operator effects remain separate gates. Slice 2A now has a
-  provider-free local implementation of canonical `custody-manifest.v1` / `custody-seal.v1` contracts on branch
-  `feat/adr0041-slice2a-local-seal-contracts-20260916`, retaining `4e00b76f` as the immutable delta base after PR #104
-  advanced independently. Its focused target passes 22 / 0, `bridge-core` passes 842 / 0 / 0, strict
-  Clippy/format/diff/hygiene are green, and the final direct full workspace passes 4,444 / 0 / 13 ignored across 88
+  quarantine/reap, source-ref mutation, and running-operator effects remain separate gates. Slice 2A is a
+  provider-free, effect-free implementation of canonical `custody-manifest.v1` / `custody-seal.v1` contracts,
+  integrated from reviewed commit `9b0f1c7c` onto exact predecessor `01594083` as PR content commit `64545d45`.
+  Post-integration focused verification passes 22 / 0, `bridge-core` passes 842 / 0 / 0, strict
+  Clippy/format/diff/dependency-policy/hygiene are green, and the direct full workspace passes 4,444 / 0 / 13 ignored across 88
   targets. Four planned behavioral mutations plus both round-one review mechanisms failed as required and were
   restored/repaired. Round-one Sol/high review returned REJECT with 2 WRONG / 3 SMELL; both WRONG and all three
   SMELL dispositions received bounded repairs on the same artifact. Final round two returned APPROVE with 0 WRONG /
   2 SMELL. At the exhausted cap, the converging residuals received test/docs-only closure without a third review:
-  exact deduplication and manifest digest inputs are covered, and the older Slice 1B handoff is reconciled to PR
-  head `01594083`. This local candidate is not committed, published, merged, or adopted.
+  exact deduplication and manifest digest inputs are covered. Slice 2A is committed and published in PR #104;
+  merge, adoption, Slice 2B effects, and running-operator mutation remain unexercised.
 
 
 - **R2f0b verification and review (2026-08-01):** [native verification](superpowers/reviews/2026-08-01-r2f0b-native-verification.md)

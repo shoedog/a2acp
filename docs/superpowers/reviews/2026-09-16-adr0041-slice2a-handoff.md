@@ -1,38 +1,41 @@
 # Handoff — ADR-0041 Slice 2A local seal contracts
 
-**Written:** 2026-09-16 · **By:** Codex `/root` · **Workspace:**
-`/Users/wesleyjinks/code/a2a-bridge/.claude/worktrees/fold`
+**Written:** 2026-09-16; reconciled 2026-09-20 · **By:** Codex `/root` · **Workspace:**
+`/Users/wesleyjinks/code/a2a-bridge/.claude/worktrees/rustls-pr104-20260916`
 
-**Stacked base:** PR #104 head `4e00b76fdcc86627dd1f328d7087b546f619255b`
+**Integrated predecessor:** PR #104 head `015940832ea05eb9b8eba627b5460f70d13cc8a4`
 
-**Branch:** `feat/adr0041-slice2a-local-seal-contracts-20260916`
+**Branch:** `feat/adr0041-custody-inventory-slices-1a-1b-20260916` · **Content commit:** `64545d45`
 
 ## 0. Gating facts
 
-- **PR #104:** open and unmerged at published head `015940832ea05eb9b8eba627b5460f70d13cc8a4`. Owner-authorized lock
+- **PR #104:** open and unmerged; Slice 2A content commit `64545d45` is published on its branch. Owner-authorized lock
   repair `1ba72900` updates `rustls` to 0.23.45 and `rustls-webpki` to 0.103.15; local `cargo deny check`, the
   repaired branch's full/static gates, and replacement GitHub Build/Lint/Coverage, uninstrumented, macOS, Windows,
-  and CLA checks are green. GitHub reports merge state `CLEAN`. Slice 2A retains `4e00b76f` as its immutable
-  comparison base and is not added to PR #104; merge remains separate and unexercised.
+  and CLA checks were green at dependency-repair head `01594083`. Live checks for the current head are external
+  state and must be queried directly. Slice 2A was integrated onto exact predecessor `01594083`; merge remains
+  separate and unexercised.
 - **Implementation:** local, provider-free, and effect-free. No filesystem/Git capture, encryption, restore,
   promotion, provider, authorization, quarantine, reap, deletion, merge, or running-operator path exists.
 - **Independent review:** round one Sol/high hard-read-only review completed as `REJECT`, 2 WRONG / 3 SMELL. Both
   WRONG mechanisms reproduced under focused behavioral RED and were repaired. Final round two returned `APPROVE`,
   0 WRONG / 2 SMELL. At the exhausted cap the loop was converging; both remaining nonblocking SMELLs received
   bounded test/docs repairs without a third review or production-code change.
-- **Publication:** not authorized or performed for Slice 2A. The branch has not been committed or pushed.
+- **Publication:** owner-authorized and exercised. Reviewed checkpoint `9b0f1c7c` was transplanted onto `01594083`
+  with docs-only conflict reconciliation as content commit `64545d45`, then pushed to PR #104.
 - **Review cap:** two admitted rounds. Closed enumerable WRONG findings are repaired on this artifact; an open-class
   finding parks the slice for design rather than restarting it.
 
 ## 1. Resume order
 
-1. Bind cwd, branch, HEAD, and base above; require only the seven owned paths in §5 to be dirty.
+1. Bind cwd, branch, HEAD, integrated predecessor, and content commit above; require a clean worktree.
 2. Read the task, ADR-0041 §§4/9/14, and this handoff. Re-run focused tests if any byte drifted.
 3. Read both review artifacts recorded in §2. The cap is exhausted; do not replay either attempt or dispatch a
    third review. The two round-two SMELLs are closed by tests/docs only and the final direct gates below.
-4. Preserve the exact seven-path population and re-run focused verification if any bound code/test/task digest
-   changes.
-5. Commit/push/open a stacked PR only under separate publication authority; never add Slice 2A to PR #104.
+4. Preserve the exact seven-path Slice 2A population and re-run focused verification if any bound code/test/task
+   digest changes.
+5. Query PR #104 checks directly. Do not merge, start Slice 2B effects, clean worktrees, or mutate the running
+   operator without separate authority.
 
 ## 2. State ledger
 
@@ -55,6 +58,8 @@
 | Full workspace | done | Final direct invocation: 4,444 passed / 0 failed / 13 ignored across 88 targets; current harness list contains 4,457 tests. |
 | Strict gates | done | Workspace/all-target Clippy with `-D warnings`, format check, diff check, and repository hygiene all pass; hygiene reports 41 tracked artifacts / 9 validated example configs. |
 | Independent review | done | Two admitted Sol/high rounds exhausted the cap: REJECT 2 WRONG / 3 SMELL, then APPROVE 0 WRONG / 2 SMELL. The earlier policy refusal was pre-spawn/pre-prompt and is not review evidence. |
+| Integration and publication | done | Reviewed checkpoint `9b0f1c7c` was committed from the original seven-path worktree, cherry-picked onto exact PR predecessor `01594083`, resolved only duplicate roadmap/Slice 1B handoff reconciliation blocks, and published as `64545d45`. |
+| Post-integration verification | done | Focused 22 / 0; `bridge-core` 842 / 0 / 0; direct full workspace 4,444 / 0 / 13 ignored across 88 targets; warnings-denied Clippy, format, diff, `cargo deny check`, and hygiene 41/9 all pass. |
 
 ## 3. Full-suite probe incident
 
@@ -90,4 +95,4 @@ Final SHA-256 bindings: production module
 `469831ee5fe5af6618a339a94a6e57e88fcf404de2cab11945032d5b7d280a37`.
 
 STOP on schema widening outside these records, any source discovery/capture/write path, provider or remote effect,
-authority token, restore execution, CLI/store wiring, PR #104 mutation, destructive action, or review-cap overflow.
+authority token, restore execution, CLI/store wiring, merge, destructive action, or review-cap overflow.
