@@ -35,7 +35,7 @@
 | Durable-state reconciliation | done | `[MEASURED]` roadmap plus Slice 1B/2A handoffs now record PR #104 merged and preserve adoption/effects as separate gates. |
 | Documentation gates | done | `[MEASURED]` `git diff --check` exits 0; locked/offline repository hygiene reports 41 tracked artifacts / 9 validated example configs. No code changed, so no implementation/full-suite claim is made. |
 | Independent spec review | approved | `[MEASURED]` Opus 5/high round 2 returned `APPROVE`: all 4 inherited WRONG RESOLVED, 0 new WRONG, 6 non-blocking SMELL. The converging two-round cap is exhausted; residuals were folded without extension. |
-| Implementation/effects | task ready | Owner authorized 2B1 implementation orchestration. The typed task validates and is committed at `81c292ce`; no code implementation or capsule/restore effect has started. |
+| Implementation/effects | 2B1 second repair host-verified | Owner authorized the retained-candidate second repair on `77a6598a1990b03f01f3bf7b0f12df2f1027101f` under `/contract/repair.md` SHA-256 `0b4d51bacb7a9c5578f5e3a13155501a95c256870cd0a220d0e176e95a283ec9`. The repair addresses R1/R2/R3 in the owned paths; three discriminating mutations failed as expected, focused tests passed 25/25, both full workspace modes passed with zero failures, and all remaining host gates are green. Amendment and any separately authorized review decision remain next. No capsule/restore filesystem or Git effect has started. |
 
 ## 3. Corrections to standing documents and memory
 
@@ -52,7 +52,7 @@
 |---:|---|---|---|---|---|
 | 1 | Planning custody | done | Preserve the approved closure, implementation task, and this handoff seal; do not push without separate authority. | None. | Approval `56922bdd`; task `81c292ce`; final plan digest in §6. |
 | 2 | Spec review | approved | Preserve both review records; no third round. | None. | Round-1 and round-2 records in §6. |
-| 3 | Child 2B1 implementation | authorized, next | Validate the containerized config, then orchestrate pure contracts only from this stacked planning branch. | None. | Task and code base in §6; §4 of the plan. |
+| 3 | Child 2B1 implementation | second repair host-verified | Controller amends the retained candidate, preserves the exact gate evidence, and stops for a separately authorized review decision before any 2B2 work. | Independent approval. | Incoming candidate `77a6598a`; repair SHA-256 `0b4d51ba`; implementation handoff in §6. |
 | 4 | Children 2B2/2B3 | parked | Proceed serially only after each predecessor is approved. | 2B1 then 2B2 approval; effect authority. | §§5–6 of the plan. |
 | 5 | Worktree cleanup/operator adoption | parked | Keep separate from Slice 2B planning and implementation. | Separate exact authority and custody proof. | ADR-0041 stages 3–5. |
 
