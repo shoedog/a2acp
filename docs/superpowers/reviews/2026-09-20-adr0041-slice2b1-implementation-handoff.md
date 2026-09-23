@@ -134,7 +134,14 @@ cargo run --locked --offline -p a2a-bridge -- validate --repo-hygiene
 The all-target total is one lower than rejected candidate `8d9d4c45` because receipt-dependent external tests
 were consolidated into crate-private unit coverage; the default total is one higher because the same
 consolidation removes one runtime test while adding two compile-fail doctests. This count change is review-visible,
-not treated as evidence by itself. The exact staged candidate remains pending commit and independent review.
+not treated as evidence by itself. Exact candidate `88013eb4408d5afecb0b9101ef43c9c398226ef5`
+(tree `6159fa2f95e95d5976f7738e5a5e49d7ecf4f48a`) then received one host Sol/xhigh hard-read-only review:
+`exec-e7ee36345656679aec8923c4be9d25b6` / `attempt-86036c5afb97c003d9f62bb2fc0c9163`.
+The result SHA-256 is `ae10a401186fc9933a959a17ff6da1c8d5727f0e2ee79440ab63306663fb2eb0`.
+The review **APPROVED** with inherited RESOLVED 3 / UNRESOLVED 0 / DEFERRED 0, new WRONG 0 / SMELL 2,
+and dispositions BLOCKER 0 / DEFER 5. This docs-only successor folds the review's stale-custody finding before
+publication. Four dropped public negative tests and the three retained evidence families remain explicitly
+deferred; no production behavior changed after review.
 
 ## Second retained-candidate repair update - 2026-09-23
 
