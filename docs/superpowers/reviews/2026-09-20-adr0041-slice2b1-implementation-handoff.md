@@ -8,6 +8,23 @@
 **Reading order:** the Tier-3 update and host closure evidence below supersede the historical
 pre-addendum implementation and verification narrative later in this file where they conflict.
 
+## Second closure review - 2026-09-23
+
+Exact code candidate `8d9d4c45d93ef6441aef52fea2fc35db4b2316b9` received the sole authorized host
+Codex `gpt-5.6-sol`/`xhigh` hard-read-only closure review as
+`exec-6fb6dc2200ad44563d487e3e2ee96408` / `attempt-0c3b24562fa60b0e6c9fd6dd1e850641`.
+The review returned **REJECT**: R2 and R3 are RESOLVED, while R1 is UNRESOLVED with one BLOCKER WRONG and
+four deferred SMELLs. Raw result SHA-256 is
+`574c9481eb6a9fe4a862b55d001b5fe57142f472577b38c5a3a044a7fa7c46bb`; the durable disposition is
+`docs/superpowers/reviews/2026-09-23-adr0041-slice2b1-second-closure-review.md`.
+
+The remaining R1 mechanism is type-level provenance: source and sink validators both return the same public
+`CustodyEnvelopeStreamReceiptV1`, and public `CustodyEnvelopeSealReceiptV1::new` accepts either. Private fields
+block raw struct construction but do not stop a source/decoy receipt from being relabeled as ciphertext and
+used to assemble an accepted capsule proof/binding. The prior R1 mutation proved faithful copying of the
+supplied receipt, not that it came from the ciphertext sink. No repair or rereview is authorized; preserve
+reviewed code `8d9d4c45` and this docs-only custody successor.
+
 ## Second retained-candidate repair update - 2026-09-23
 
 The owner authorized one write-capable retained-candidate repair round on branch
@@ -122,9 +139,9 @@ cargo run --locked --offline -p a2a-bridge -- validate --repo-hygiene
 # passed: 41 tracked artifacts; 9 validated example configs
 ```
 
-This round does not claim independent review approval. No dependency, persisted wire schema, effect adapter,
+This round did not obtain independent approval. No dependency, persisted wire schema, effect adapter,
 provider call, network access, cleanup, merge, publication, or 2B2/2B3 work was performed. The repaired
-candidate is host-verified and awaits a separately authorized review decision.
+candidate is host-verified but rejected by the second closure review described above.
 
 ## Tier-3 retained-candidate repair update - 2026-09-21
 
