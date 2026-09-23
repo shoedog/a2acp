@@ -1,12 +1,10 @@
 use bridge_core::custody_capsule::{
-    CustodyCapsuleArtifactRoleRowV1, CustodyCapsuleArtifactRoleV1 as Role, CustodyCapsuleBindingV1,
+    CustodyCapsuleArtifactRoleRowV1, CustodyCapsuleArtifactRoleV1 as Role,
     CustodyCapsuleErrorV1 as Error, CustodyCapsuleIndexV1, CustodyCapsuleLayoutV1,
     CustodyCapsuleSealProofV1, CustodyEnvelopeChunkV1, CustodyEnvelopeContextV1,
-    CustodyEnvelopeFormatV1, CustodyEnvelopeMetadataV1, CustodyEnvelopeOpenRequestV1,
-    CustodyEnvelopeSealReceiptV1, CustodyEnvelopeSinkValidatorV1,
+    CustodyEnvelopeFormatV1, CustodyEnvelopeMetadataV1, CustodyEnvelopeSinkValidatorV1,
     CustodyEnvelopeSourceDescriptorV1, CustodyEnvelopeSourceValidatorV1,
-    CustodyEnvelopeStreamLimitsV1, CustodyEnvelopeStreamReceiptV1, CustodyRestorePolicyV1,
-    RestoreDisabledV1, RestoreForbiddenV1,
+    CustodyEnvelopeStreamLimitsV1, CustodyRestorePolicyV1, RestoreDisabledV1, RestoreForbiddenV1,
 };
 use bridge_core::custody_inventory::{
     CustodyReasonCodeV1 as Reason, CustodyStateClassV1 as State, LosslessPathV1,
@@ -77,21 +75,6 @@ fn coverage_with(default: State) -> Vec<CustodyCoverageEntryV1> {
         .collect()
 }
 
-fn set_coverage(
-    mut rows: Vec<CustodyCoverageEntryV1>,
-    class: Coverage,
-    state: State,
-) -> Vec<CustodyCoverageEntryV1> {
-    let position = rows.iter().position(|row| row.class() == class).unwrap();
-    let reasons = if state == State::Unresolved {
-        vec![Reason::ContentUnresolved]
-    } else {
-        vec![]
-    };
-    rows[position] = CustodyCoverageEntryV1::new(class, state, reasons, None).unwrap();
-    rows
-}
-
 fn make_manifest(
     coverage: Vec<CustodyCoverageEntryV1>,
     objects: Vec<CustodyOriginalObjectV1>,
@@ -119,49 +102,6 @@ fn full_manifest() -> CustodyManifestV1 {
         coverage_with(State::Captured),
         vec![object('a', ObjectKind::Commit)],
     )
-}
-
-fn stream_receipt(bytes: &[u8]) -> CustodyEnvelopeStreamReceiptV1 {
-    let mut sink = CustodyEnvelopeSinkValidatorV1::new(
-        CustodyEnvelopeStreamLimitsV1::new(bytes.len() as u64, bytes.len() as u64, 1).unwrap(),
-    );
-    sink.accept_chunk(&CustodyEnvelopeChunkV1::new(0, bytes.to_vec(), true).unwrap())
-        .unwrap();
-    sink.finish().unwrap()
-}
-
-fn receipt_for(
-    name: &LosslessPathV1,
-    manifest_digest: Sha256HexV1,
-    format: CustodyEnvelopeFormatV1,
-    recipients: Vec<String>,
-    bytes: &[u8],
-) -> CustodyEnvelopeSealReceiptV1 {
-    let context =
-        CustodyEnvelopeContextV1::new(name.clone(), manifest_digest, format, recipients).unwrap();
-    CustodyEnvelopeSealReceiptV1::new(&context, stream_receipt(bytes)).unwrap()
-}
-
-fn proof_for(
-    index: &CustodyCapsuleIndexV1,
-    manifest_digest: Sha256HexV1,
-) -> CustodyCapsuleSealProofV1 {
-    let format = CustodyEnvelopeFormatV1::new("capsule-v1", "a2a-bridge", "0.1.0").unwrap();
-    let receipts = index
-        .artifacts()
-        .iter()
-        .enumerate()
-        .map(|(offset, row)| {
-            receipt_for(
-                row.name(),
-                manifest_digest.clone(),
-                format.clone(),
-                vec!["recipient-b".to_owned(), "recipient-a".to_owned()],
-                &[u8::try_from(offset + 1).unwrap()],
-            )
-        })
-        .collect();
-    CustodyCapsuleSealProofV1::from_receipts(receipts).unwrap()
 }
 
 fn envelope_format() -> CustodyEnvelopeFormatV1 {
@@ -244,255 +184,6 @@ fn layout_refuses_unknown_object_kind() {
     assert_eq!(
         CustodyCapsuleLayoutV1::derive(&manifest).unwrap_err(),
         Error::UnknownObjectKind
-    );
-}
-
-#[test]
-fn binding_accepts_matching_manifest_index_policy_and_seal() {
-    let manifest = full_manifest();
-    let layout = CustodyCapsuleLayoutV1::derive(&manifest).unwrap();
-    let manifest_digest = manifest.content_digest().unwrap();
-    let proof = proof_for(layout.index(), manifest_digest.clone());
-    let binding = CustodyCapsuleBindingV1::new(
-        &manifest,
-        layout.index(),
-        &CustodyRestorePolicyV1::default(),
-        &proof,
-    )
-    .unwrap();
-    assert_eq!(binding.manifest_digest(), &manifest_digest);
-    assert_eq!(binding.artifact_names().len(), 17);
-}
-
-#[test]
-fn binding_refuses_a_foreign_index_manifest_digest() {
-    let manifest = full_manifest();
-    let layout = CustodyCapsuleLayoutV1::derive(&manifest).unwrap();
-    let manifest_digest = manifest.content_digest().unwrap();
-    let proof = proof_for(layout.index(), manifest_digest);
-    let foreign_index =
-        CustodyCapsuleIndexV1::new(digest(8), layout.index().artifacts().to_vec()).unwrap();
-
-    assert_eq!(
-        CustodyCapsuleBindingV1::new(
-            &manifest,
-            &foreign_index,
-            &CustodyRestorePolicyV1::default(),
-            &proof,
-        )
-        .unwrap_err(),
-        Error::ThreeWayDigestMismatch
-    );
-}
-
-#[test]
-fn binding_refuses_a_foreign_seal_manifest_digest() {
-    let manifest = full_manifest();
-    let layout = CustodyCapsuleLayoutV1::derive(&manifest).unwrap();
-    let foreign_proof = proof_for(layout.index(), digest(7));
-
-    assert_eq!(
-        CustodyCapsuleBindingV1::new(
-            &manifest,
-            layout.index(),
-            &CustodyRestorePolicyV1::default(),
-            &foreign_proof,
-        )
-        .unwrap_err(),
-        Error::ThreeWayDigestMismatch
-    );
-}
-
-#[test]
-fn binding_refuses_a_foreign_manifest_while_index_and_seal_agree() {
-    let manifest = full_manifest();
-    let layout = CustodyCapsuleLayoutV1::derive(&manifest).unwrap();
-    let proof = proof_for(layout.index(), manifest.content_digest().unwrap());
-    let other_manifest = make_manifest(
-        set_coverage(
-            coverage_with(State::Captured),
-            Coverage::Worktree,
-            State::Empty,
-        ),
-        vec![object('a', ObjectKind::Commit)],
-    );
-
-    assert_eq!(
-        CustodyCapsuleBindingV1::new(
-            &other_manifest,
-            layout.index(),
-            &CustodyRestorePolicyV1::default(),
-            &proof,
-        )
-        .unwrap_err(),
-        Error::ThreeWayDigestMismatch
-    );
-}
-
-#[test]
-fn capsule_seal_proof_requires_receipt_derived_shared_identity() {
-    let name = LosslessPathV1::from_bytes(b"control/manifest.json.enc".to_vec());
-    let context = envelope_context();
-    let baseline = CustodyEnvelopeSealReceiptV1::new(&context, stream_receipt(&[1, 2, 3])).unwrap();
-    let valid = CustodyCapsuleSealProofV1::from_receipts(vec![baseline.clone()]).unwrap();
-    assert_eq!(valid.seal().manifest_digest(), context.manifest_digest());
-    assert_eq!(valid.seal().artifacts()[0].name(), &name);
-    assert_eq!(valid.seal().artifacts()[0].byte_length(), 3);
-    assert_eq!(
-        valid.seal().artifacts()[0].sha256(),
-        &Sha256HexV1::digest(&[1, 2, 3])
-    );
-    let second_name = LosslessPathV1::from_bytes(b"control/capsule-index.json.enc".to_vec());
-
-    for changed in [
-        CustodyEnvelopeContextV1::new(
-            second_name.clone(),
-            digest(8),
-            context.format().clone(),
-            context.recipients().to_vec(),
-        )
-        .unwrap(),
-        CustodyEnvelopeContextV1::new(
-            second_name.clone(),
-            context.manifest_digest().clone(),
-            CustodyEnvelopeFormatV1::new("other", "tool", "1").unwrap(),
-            context.recipients().to_vec(),
-        )
-        .unwrap(),
-        CustodyEnvelopeContextV1::new(
-            second_name.clone(),
-            context.manifest_digest().clone(),
-            CustodyEnvelopeFormatV1::new("capsule-v1", "other", "1").unwrap(),
-            context.recipients().to_vec(),
-        )
-        .unwrap(),
-        CustodyEnvelopeContextV1::new(
-            second_name.clone(),
-            context.manifest_digest().clone(),
-            CustodyEnvelopeFormatV1::new("capsule-v1", "tool", "2").unwrap(),
-            context.recipients().to_vec(),
-        )
-        .unwrap(),
-        CustodyEnvelopeContextV1::new(
-            second_name,
-            context.manifest_digest().clone(),
-            context.format().clone(),
-            vec!["other-recipient".to_owned()],
-        )
-        .unwrap(),
-    ] {
-        let changed = CustodyEnvelopeSealReceiptV1::new(&changed, stream_receipt(&[4])).unwrap();
-        assert_eq!(
-            CustodyCapsuleSealProofV1::from_receipts(vec![baseline.clone(), changed]).unwrap_err(),
-            Error::InvalidInput
-        );
-    }
-}
-
-#[test]
-fn binding_reports_missing_extra_unmapped_and_duplicate_artifacts() {
-    let manifest = full_manifest();
-    let layout = CustodyCapsuleLayoutV1::derive(&manifest).unwrap();
-    let manifest_digest = manifest.content_digest().unwrap();
-    let proof = proof_for(layout.index(), manifest_digest.clone());
-
-    let mut missing_rows = layout.index().artifacts().to_vec();
-    missing_rows.retain(|row| row.name().as_bytes() != b"payload/worktree.bin.enc");
-    let missing_index = CustodyCapsuleIndexV1::new(manifest_digest.clone(), missing_rows).unwrap();
-    assert_eq!(
-        CustodyCapsuleBindingV1::new(
-            &manifest,
-            &missing_index,
-            &CustodyRestorePolicyV1::default(),
-            &proof,
-        )
-        .unwrap_err(),
-        Error::MissingArtifact
-    );
-
-    let extra_row = CustodyCapsuleArtifactRoleRowV1::new(
-        LosslessPathV1::from_bytes(b"payload/reproducible_outputs.bin.enc".to_vec()),
-        Role::CoveragePayload(Coverage::ReproducibleOutputs),
-    )
-    .unwrap();
-    let mut empty_rows = CustodyCapsuleLayoutV1::derive(&empty_manifest())
-        .unwrap()
-        .index()
-        .artifacts()
-        .to_vec();
-    empty_rows.push(extra_row);
-    let extra_index =
-        CustodyCapsuleIndexV1::new(empty_manifest().content_digest().unwrap(), empty_rows).unwrap();
-    let empty_proof = proof_for(&extra_index, empty_manifest().content_digest().unwrap());
-    assert_eq!(
-        CustodyCapsuleBindingV1::new(
-            &empty_manifest(),
-            &extra_index,
-            &CustodyRestorePolicyV1::default(),
-            &empty_proof,
-        )
-        .unwrap_err(),
-        Error::ExtraArtifact
-    );
-
-    let empty = empty_manifest();
-    let empty_layout = CustodyCapsuleLayoutV1::derive(&empty).unwrap();
-    let empty_digest = empty.content_digest().unwrap();
-    let format = CustodyEnvelopeFormatV1::new("capsule-v1", "a2a-bridge", "0.1.0").unwrap();
-    let mut extra_receipts: Vec<_> = empty_layout
-        .index()
-        .artifacts()
-        .iter()
-        .enumerate()
-        .map(|(offset, row)| {
-            receipt_for(
-                row.name(),
-                empty_digest.clone(),
-                format.clone(),
-                vec!["recipient".to_owned()],
-                &[u8::try_from(offset + 1).unwrap()],
-            )
-        })
-        .collect();
-    extra_receipts.push(receipt_for(
-        &LosslessPathV1::from_bytes(b"payload/worktree.bin.enc".to_vec()),
-        empty_digest,
-        format,
-        vec!["recipient".to_owned()],
-        &[9],
-    ));
-    let extra_proof = CustodyCapsuleSealProofV1::from_receipts(extra_receipts).unwrap();
-    assert_eq!(
-        CustodyCapsuleBindingV1::new(
-            &empty,
-            empty_layout.index(),
-            &CustodyRestorePolicyV1::default(),
-            &extra_proof,
-        )
-        .unwrap_err(),
-        Error::UnmappedArtifact
-    );
-
-    let duplicate_rows = vec![
-        CustodyCapsuleArtifactRoleRowV1::new(
-            LosslessPathV1::from_bytes(b"payload/worktree.bin.enc".to_vec()),
-            Role::CoveragePayload(Coverage::Worktree),
-        )
-        .unwrap(),
-        CustodyCapsuleArtifactRoleRowV1::new(
-            LosslessPathV1::from_bytes(b"payload/worktree.bin.enc".to_vec()),
-            Role::CoveragePayload(Coverage::Worktree),
-        )
-        .unwrap(),
-    ];
-    assert_eq!(
-        CustodyCapsuleIndexV1::new(digest(1), duplicate_rows).unwrap_err(),
-        Error::DuplicateArtifactName
-    );
-
-    assert_eq!(
-        CustodyCapsuleIndexV1::new(digest(1), vec![]).unwrap_err(),
-        Error::MissingArtifact
     );
 }
 
@@ -614,28 +305,6 @@ fn envelope_context_matches_seal_canonical_recipient_encoding() {
     )
     .unwrap();
     assert_eq!(direct.recipients(), &["a".to_owned(), "z".to_owned()]);
-
-    let context = CustodyEnvelopeContextV1::new(
-        name.clone(),
-        digest(1),
-        envelope_format(),
-        vec!["z".to_owned(), "a".to_owned(), "a".to_owned()],
-    )
-    .unwrap();
-    let proof = CustodyCapsuleSealProofV1::from_receipts(vec![CustodyEnvelopeSealReceiptV1::new(
-        &context,
-        stream_receipt(&[2]),
-    )
-    .unwrap()])
-    .unwrap();
-    let from_seal = CustodyEnvelopeOpenRequestV1::from_seal_artifact(&proof, name)
-        .unwrap()
-        .context()
-        .clone();
-    assert_eq!(
-        direct.encode_canonical().unwrap(),
-        from_seal.encode_canonical().unwrap()
-    );
 
     for recipients in [vec![], vec![String::new()]] {
         assert_eq!(
@@ -867,77 +536,6 @@ fn envelope_budget_sink_enforces_budget_finality_and_zero_byte_rules() {
 }
 
 #[test]
-fn seal_derived_open_request_binds_membership_limits_and_ciphertext_identity() {
-    let name = LosslessPathV1::from_bytes(b"control/manifest.json.enc".to_vec());
-    let context = CustodyEnvelopeContextV1::new(
-        name.clone(),
-        digest(1),
-        envelope_format(),
-        vec!["recipient".to_owned()],
-    )
-    .unwrap();
-    let proof = CustodyCapsuleSealProofV1::from_receipts(vec![CustodyEnvelopeSealReceiptV1::new(
-        &context,
-        stream_receipt(&[1, 2, 3, 4, 5]),
-    )
-    .unwrap()])
-    .unwrap();
-    let request = CustodyEnvelopeOpenRequestV1::from_seal_artifact(&proof, name.clone()).unwrap();
-    assert_eq!(request.context().artifact_name(), &name);
-    assert_eq!(request.context().format(), &envelope_format());
-    assert_eq!(request.ciphertext_length(), 5);
-    assert_eq!(
-        request.ciphertext_sha256(),
-        &Sha256HexV1::digest(&[1, 2, 3, 4, 5])
-    );
-
-    assert_eq!(
-        CustodyEnvelopeOpenRequestV1::from_seal_artifact(
-            &proof,
-            LosslessPathV1::from_bytes(b"control/capsule-index.json.enc".to_vec()),
-        )
-        .unwrap_err(),
-        Error::MissingArtifact
-    );
-
-    let oversized_format = CustodySealV1::new(
-        digest(1),
-        vec![CustodySealedArtifactV1::new(name.clone(), 5, digest(2)).unwrap()],
-        vec!["recipient".to_owned()],
-        "c".repeat(4097),
-        "tool",
-        "1",
-    )
-    .unwrap();
-    assert_eq!(
-        CustodyCapsuleSealProofV1::preflight_generic_seal_artifact_for_capsule_v1(
-            &oversized_format,
-            &name,
-        )
-        .unwrap_err(),
-        Error::SealExceedsV1Limits
-    );
-
-    let oversized_artifact = CustodySealV1::new(
-        digest(1),
-        vec![CustodySealedArtifactV1::new(name.clone(), 10_737_418_241, digest(2)).unwrap()],
-        vec!["recipient".to_owned()],
-        "capsule-v1",
-        "tool",
-        "1",
-    )
-    .unwrap();
-    assert_eq!(
-        CustodyCapsuleSealProofV1::preflight_generic_seal_artifact_for_capsule_v1(
-            &oversized_artifact,
-            &name,
-        )
-        .unwrap_err(),
-        Error::SealExceedsV1Limits
-    );
-}
-
-#[test]
 fn generic_capsule_preflight_refuses_over_limit_recipients_without_proportional_allocation() {
     let name = LosslessPathV1::from_bytes(b"control/manifest.json.enc".to_vec());
     let mut too_many_recipients = Vec::new();
@@ -963,39 +561,6 @@ fn generic_capsule_preflight_refuses_over_limit_recipients_without_proportional_
 
     assert_eq!(result.unwrap_err(), Error::SealExceedsV1Limits);
     assert_eq!(allocation_count, 0, "capsule preflight allocated");
-}
-
-#[test]
-fn seal_receipt_derives_authenticated_context_and_finalized_ciphertext_identity() {
-    let context = envelope_context();
-    let finalized = stream_receipt(&[1, 2, 3]);
-    let receipt = CustodyEnvelopeSealReceiptV1::new(&context, finalized.clone()).unwrap();
-    let cloned = CustodyEnvelopeSealReceiptV1::new(&context, finalized).unwrap();
-
-    assert_eq!(receipt, cloned);
-    assert_eq!(receipt.artifact_name(), context.artifact_name());
-    assert_eq!(receipt.manifest_digest(), context.manifest_digest());
-    assert_eq!(receipt.format(), context.format());
-    assert_eq!(receipt.recipients(), context.recipients());
-    assert_eq!(receipt.ciphertext_length(), 3);
-    assert_eq!(
-        receipt.ciphertext_sha256(),
-        &Sha256HexV1::digest(&[1, 2, 3])
-    );
-    assert_eq!(
-        receipt.to_sealed_artifact().unwrap().sha256(),
-        receipt.ciphertext_sha256()
-    );
-
-    let zero_limits = CustodyEnvelopeStreamLimitsV1::new(1, 1, 1).unwrap();
-    let mut zero_sink = CustodyEnvelopeSinkValidatorV1::new(zero_limits);
-    zero_sink
-        .accept_chunk(&CustodyEnvelopeChunkV1::new(0, vec![], true).unwrap())
-        .unwrap();
-    assert_eq!(
-        CustodyEnvelopeSealReceiptV1::new(&context, zero_sink.finish().unwrap()).unwrap_err(),
-        Error::InvalidInput
-    );
 }
 
 #[test]

@@ -1042,11 +1042,29 @@ impl CustodyEnvelopeChunkV1 {
     }
 }
 
-/// Finalized receipt returned by the streaming validators.
+/// Finalized receipt returned by the exact-total source validator.
 ///
 /// The receipt cannot be constructed outside this module; callers may only clone values
-/// returned by `CustodyEnvelopeSourceValidatorV1::finish` or
-/// `CustodyEnvelopeSinkValidatorV1::finish`.
+/// returned by `CustodyEnvelopeSourceValidatorV1::finish`. Source receipts are intentionally
+/// distinct from ciphertext sink completions and cannot authorize a capsule seal.
+///
+/// ```compile_fail
+/// use bridge_core::custody_capsule::{
+///     CustodyEnvelopeChunkV1, CustodyEnvelopeCiphertextReceiptV1,
+///     CustodyEnvelopeSourceDescriptorV1, CustodyEnvelopeSourceValidatorV1,
+///     CustodyEnvelopeStreamLimitsV1,
+/// };
+///
+/// fn requires_ciphertext(_: CustodyEnvelopeCiphertextReceiptV1) {}
+///
+/// let limits = CustodyEnvelopeStreamLimitsV1::new(1, 1, 1).unwrap();
+/// let descriptor = CustodyEnvelopeSourceDescriptorV1::new(1, limits).unwrap();
+/// let mut source = CustodyEnvelopeSourceValidatorV1::new(descriptor);
+/// source
+///     .accept_chunk(&CustodyEnvelopeChunkV1::new(0, b"p".to_vec(), true).unwrap())
+///     .unwrap();
+/// requires_ciphertext(source.finish().unwrap());
+/// ```
 ///
 /// ```compile_fail
 /// use bridge_core::custody_capsule::CustodyEnvelopeStreamReceiptV1;
@@ -1064,6 +1082,35 @@ pub struct CustodyEnvelopeStreamReceiptV1 {
 }
 
 impl CustodyEnvelopeStreamReceiptV1 {
+    #[must_use]
+    pub const fn total_bytes(&self) -> u64 {
+        self.total_bytes
+    }
+
+    #[must_use]
+    pub fn sha256(&self) -> &Sha256HexV1 {
+        &self.sha256
+    }
+}
+
+/// Finalized completion returned by the budget-only ciphertext sink validator.
+///
+/// The completion is minted only by `CustodyEnvelopeSinkValidatorV1::finish` after observing
+/// the exact ciphertext bytes accepted by the sink.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CustodyEnvelopeCiphertextReceiptV1 {
+    total_bytes: u64,
+    sha256: Sha256HexV1,
+}
+
+impl CustodyEnvelopeCiphertextReceiptV1 {
+    fn from_stream_receipt(receipt: CustodyEnvelopeStreamReceiptV1) -> Self {
+        Self {
+            total_bytes: receipt.total_bytes,
+            sha256: receipt.sha256,
+        }
+    }
+
     #[must_use]
     pub const fn total_bytes(&self) -> u64 {
         self.total_bytes
@@ -1215,11 +1262,41 @@ impl CustodyEnvelopeSinkValidatorV1 {
         self.state.accept_chunk(chunk)
     }
 
-    pub fn finish(self) -> Result<CustodyEnvelopeStreamReceiptV1, CustodyCapsuleErrorV1> {
-        self.state.finish()
+    pub fn finish(self) -> Result<CustodyEnvelopeCiphertextReceiptV1, CustodyCapsuleErrorV1> {
+        self.state
+            .finish()
+            .map(CustodyEnvelopeCiphertextReceiptV1::from_stream_receipt)
     }
 }
 
+/// Production seal receipt for one sealed envelope artifact.
+///
+/// Public callers can inspect genuine receipts, but production construction is crate-private and
+/// consumes only a ciphertext sink completion minted from bytes accepted by the sink validator.
+///
+/// ```compile_fail
+/// use bridge_core::custody_capsule::{
+///     CustodyEnvelopeChunkV1, CustodyEnvelopeContextV1, CustodyEnvelopeFormatV1,
+///     CustodyEnvelopeSealReceiptV1, CustodyEnvelopeSinkValidatorV1,
+///     CustodyEnvelopeStreamLimitsV1,
+/// };
+/// use bridge_core::custody_inventory::LosslessPathV1;
+/// use bridge_core::execution_policy::Sha256HexV1;
+///
+/// let context = CustodyEnvelopeContextV1::new(
+///     LosslessPathV1::from_bytes(b"control/manifest.json.enc".to_vec()),
+///     Sha256HexV1::digest(b"manifest"),
+///     CustodyEnvelopeFormatV1::new("capsule-v1", "tool", "1").unwrap(),
+///     vec!["recipient".to_owned()],
+/// )
+/// .unwrap();
+/// let mut sink = CustodyEnvelopeSinkValidatorV1::new(
+///     CustodyEnvelopeStreamLimitsV1::new(1, 1, 1).unwrap(),
+/// );
+/// sink.accept_chunk(&CustodyEnvelopeChunkV1::new(0, b"c".to_vec(), true).unwrap())
+///     .unwrap();
+/// let _receipt = CustodyEnvelopeSealReceiptV1::new(&context, sink.finish().unwrap());
+/// ```
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CustodyEnvelopeSealReceiptV1 {
     artifact_name: LosslessPathV1,
@@ -1231,13 +1308,16 @@ pub struct CustodyEnvelopeSealReceiptV1 {
 }
 
 impl CustodyEnvelopeSealReceiptV1 {
-    pub fn new(
+    // Slice 2B1 defines the crate-private construction seam before the first in-crate
+    // sealer adapter is implemented in 2B2. Module tests exercise it in the interim.
+    #[allow(dead_code)]
+    pub(crate) fn new(
         context: &CustodyEnvelopeContextV1,
-        stream_receipt: CustodyEnvelopeStreamReceiptV1,
+        ciphertext_receipt: CustodyEnvelopeCiphertextReceiptV1,
     ) -> Result<Self, CustodyCapsuleErrorV1> {
         context.validate()?;
-        if stream_receipt.total_bytes() == 0
-            || stream_receipt.total_bytes() > MAX_ENVELOPE_TOTAL_BYTES_V1
+        if ciphertext_receipt.total_bytes() == 0
+            || ciphertext_receipt.total_bytes() > MAX_ENVELOPE_TOTAL_BYTES_V1
         {
             return Err(CustodyCapsuleErrorV1::InvalidInput);
         }
@@ -1246,8 +1326,8 @@ impl CustodyEnvelopeSealReceiptV1 {
             manifest_digest: context.manifest_digest().clone(),
             format: context.format().clone(),
             recipients: context.recipients().to_vec(),
-            ciphertext_length: stream_receipt.total_bytes(),
-            ciphertext_sha256: stream_receipt.sha256().clone(),
+            ciphertext_length: ciphertext_receipt.total_bytes(),
+            ciphertext_sha256: ciphertext_receipt.sha256().clone(),
         })
     }
 
@@ -1704,6 +1784,9 @@ pub enum CustodyCapsuleErrorV1 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::custody_seal::{
+        CustodyCoverageEntryV1, CustodyGitObjectFormatV1, CustodyOriginalObjectV1,
+    };
 
     #[test]
     fn pre_canonical_duplicate_owner_helper_uses_distinct_path_safe_names() {
@@ -1757,5 +1840,459 @@ mod tests {
             ),
         ];
         assert!(validate_candidate_ownership(&focused_branch_flipped).is_ok());
+    }
+
+    fn digest(byte: u8) -> Sha256HexV1 {
+        Sha256HexV1::digest(&[byte])
+    }
+
+    fn object(kind: CustodyGitObjectKindV1) -> CustodyOriginalObjectV1 {
+        CustodyOriginalObjectV1::new(CustodyGitObjectFormatV1::Sha1, "a".repeat(40), kind).unwrap()
+    }
+
+    fn coverage_with(default: CustodyStateClassV1) -> Vec<CustodyCoverageEntryV1> {
+        CustodyCoverageClassV1::ALL
+            .into_iter()
+            .map(|class| {
+                let reasons = if default == CustodyStateClassV1::Unresolved {
+                    vec![crate::custody_inventory::CustodyReasonCodeV1::ContentUnresolved]
+                } else {
+                    vec![]
+                };
+                CustodyCoverageEntryV1::new(class, default, reasons, None).unwrap()
+            })
+            .collect()
+    }
+
+    fn set_coverage(
+        mut rows: Vec<CustodyCoverageEntryV1>,
+        class: CustodyCoverageClassV1,
+        state: CustodyStateClassV1,
+    ) -> Vec<CustodyCoverageEntryV1> {
+        let position = rows.iter().position(|row| row.class() == class).unwrap();
+        let reasons = if state == CustodyStateClassV1::Unresolved {
+            vec![crate::custody_inventory::CustodyReasonCodeV1::ContentUnresolved]
+        } else {
+            vec![]
+        };
+        rows[position] = CustodyCoverageEntryV1::new(class, state, reasons, None).unwrap();
+        rows
+    }
+
+    fn make_manifest(
+        coverage: Vec<CustodyCoverageEntryV1>,
+        objects: Vec<CustodyOriginalObjectV1>,
+    ) -> CustodyManifestV1 {
+        CustodyManifestV1::new(
+            "unit",
+            "run",
+            "materialization",
+            "generation",
+            coverage,
+            vec![],
+            objects,
+            vec![],
+            vec![],
+        )
+        .unwrap()
+    }
+
+    fn empty_manifest() -> CustodyManifestV1 {
+        make_manifest(coverage_with(CustodyStateClassV1::Empty), vec![])
+    }
+
+    fn full_manifest() -> CustodyManifestV1 {
+        make_manifest(
+            coverage_with(CustodyStateClassV1::Captured),
+            vec![object(CustodyGitObjectKindV1::Commit)],
+        )
+    }
+
+    fn envelope_format() -> CustodyEnvelopeFormatV1 {
+        CustodyEnvelopeFormatV1::new("capsule-v1", "tool", "1").unwrap()
+    }
+
+    fn envelope_context() -> CustodyEnvelopeContextV1 {
+        CustodyEnvelopeContextV1::new(
+            LosslessPathV1::from_bytes(b"control/manifest.json.enc".to_vec()),
+            digest(1),
+            envelope_format(),
+            vec!["recipient".to_owned()],
+        )
+        .unwrap()
+    }
+
+    fn ciphertext_receipt(bytes: &[u8]) -> CustodyEnvelopeCiphertextReceiptV1 {
+        let max_total = u64::try_from(bytes.len().max(1)).unwrap();
+        let max_chunk = u64::try_from(bytes.len().max(1)).unwrap();
+        let mut sink = CustodyEnvelopeSinkValidatorV1::new(
+            CustodyEnvelopeStreamLimitsV1::new(max_total, max_chunk, 1).unwrap(),
+        );
+        sink.accept_chunk(&CustodyEnvelopeChunkV1::new(0, bytes.to_vec(), true).unwrap())
+            .unwrap();
+        sink.finish().unwrap()
+    }
+
+    fn source_receipt(bytes: &[u8]) -> CustodyEnvelopeStreamReceiptV1 {
+        let max_total = u64::try_from(bytes.len()).unwrap();
+        let limits = CustodyEnvelopeStreamLimitsV1::new(max_total, max_total, 1).unwrap();
+        let descriptor = CustodyEnvelopeSourceDescriptorV1::new(max_total, limits).unwrap();
+        let mut source = CustodyEnvelopeSourceValidatorV1::new(descriptor);
+        source
+            .accept_chunk(&CustodyEnvelopeChunkV1::new(0, bytes.to_vec(), true).unwrap())
+            .unwrap();
+        source.finish().unwrap()
+    }
+
+    fn receipt_for(
+        name: &LosslessPathV1,
+        manifest_digest: Sha256HexV1,
+        format: CustodyEnvelopeFormatV1,
+        recipients: Vec<String>,
+        bytes: &[u8],
+    ) -> CustodyEnvelopeSealReceiptV1 {
+        let context =
+            CustodyEnvelopeContextV1::new(name.clone(), manifest_digest, format, recipients)
+                .unwrap();
+        CustodyEnvelopeSealReceiptV1::new(&context, ciphertext_receipt(bytes)).unwrap()
+    }
+
+    fn proof_for(
+        index: &CustodyCapsuleIndexV1,
+        manifest_digest: Sha256HexV1,
+    ) -> CustodyCapsuleSealProofV1 {
+        let format = CustodyEnvelopeFormatV1::new("capsule-v1", "a2a-bridge", "0.1.0").unwrap();
+        let receipts = index
+            .artifacts()
+            .iter()
+            .enumerate()
+            .map(|(offset, row)| {
+                receipt_for(
+                    row.name(),
+                    manifest_digest.clone(),
+                    format.clone(),
+                    vec!["recipient-b".to_owned(), "recipient-a".to_owned()],
+                    &[u8::try_from(offset + 1).unwrap()],
+                )
+            })
+            .collect();
+        CustodyCapsuleSealProofV1::from_receipts(receipts).unwrap()
+    }
+
+    #[test]
+    fn seal_receipt_requires_ciphertext_sink_completion_and_binds_exact_bytes() {
+        let context = envelope_context();
+        let ciphertext = b"ciphertext";
+        let receipt =
+            CustodyEnvelopeSealReceiptV1::new(&context, ciphertext_receipt(ciphertext)).unwrap();
+        let cloned =
+            CustodyEnvelopeSealReceiptV1::new(&context, ciphertext_receipt(ciphertext)).unwrap();
+
+        assert_eq!(receipt, cloned);
+        assert_eq!(receipt.artifact_name(), context.artifact_name());
+        assert_eq!(receipt.manifest_digest(), context.manifest_digest());
+        assert_eq!(receipt.format(), context.format());
+        assert_eq!(receipt.recipients(), context.recipients());
+        assert_eq!(receipt.ciphertext_length(), 10);
+        assert_eq!(
+            receipt.ciphertext_sha256(),
+            &Sha256HexV1::digest(ciphertext)
+        );
+
+        let proof = CustodyCapsuleSealProofV1::from_receipts(vec![receipt.clone()]).unwrap();
+        let request = CustodyEnvelopeOpenRequestV1::from_seal_artifact(
+            &proof,
+            context.artifact_name().clone(),
+        )
+        .unwrap();
+        assert_eq!(request.ciphertext_length(), 10);
+        assert_eq!(
+            request.ciphertext_sha256(),
+            &Sha256HexV1::digest(ciphertext)
+        );
+        assert_eq!(
+            receipt.to_sealed_artifact().unwrap().sha256(),
+            &Sha256HexV1::digest(ciphertext)
+        );
+    }
+
+    #[test]
+    fn decoy_sink_bytes_cannot_authorize_a_different_ciphertext_identity() {
+        let context = envelope_context();
+        let ciphertext = b"ciphertext";
+        let decoy = b"plaintext";
+        let source = source_receipt(decoy);
+        assert_eq!(source.total_bytes(), u64::try_from(decoy.len()).unwrap());
+        assert_eq!(source.sha256(), &Sha256HexV1::digest(decoy));
+
+        let decoy_receipt =
+            CustodyEnvelopeSealReceiptV1::new(&context, ciphertext_receipt(decoy)).unwrap();
+        let artifact = decoy_receipt.to_sealed_artifact().unwrap();
+        assert_eq!(artifact.byte_length(), u64::try_from(decoy.len()).unwrap());
+        assert_eq!(artifact.sha256(), &Sha256HexV1::digest(decoy));
+        assert_ne!(
+            artifact.byte_length(),
+            u64::try_from(ciphertext.len()).unwrap()
+        );
+        assert_ne!(artifact.sha256(), &Sha256HexV1::digest(ciphertext));
+    }
+
+    #[test]
+    fn zero_byte_ciphertext_sink_completion_cannot_mint_a_seal_receipt() {
+        assert_eq!(
+            CustodyEnvelopeSealReceiptV1::new(&envelope_context(), ciphertext_receipt(b""))
+                .unwrap_err(),
+            CustodyCapsuleErrorV1::InvalidInput
+        );
+    }
+
+    #[test]
+    fn capsule_seal_proof_requires_receipt_derived_shared_identity() {
+        let name = LosslessPathV1::from_bytes(b"control/manifest.json.enc".to_vec());
+        let context = envelope_context();
+        let baseline =
+            CustodyEnvelopeSealReceiptV1::new(&context, ciphertext_receipt(&[1, 2, 3])).unwrap();
+        let valid = CustodyCapsuleSealProofV1::from_receipts(vec![baseline.clone()]).unwrap();
+        assert_eq!(valid.seal().manifest_digest(), context.manifest_digest());
+        assert_eq!(valid.seal().artifacts()[0].name(), &name);
+        assert_eq!(valid.seal().artifacts()[0].byte_length(), 3);
+        assert_eq!(
+            valid.seal().artifacts()[0].sha256(),
+            &Sha256HexV1::digest(&[1, 2, 3])
+        );
+        let second_name = LosslessPathV1::from_bytes(b"control/capsule-index.json.enc".to_vec());
+
+        for changed in [
+            CustodyEnvelopeContextV1::new(
+                second_name.clone(),
+                digest(8),
+                context.format().clone(),
+                context.recipients().to_vec(),
+            )
+            .unwrap(),
+            CustodyEnvelopeContextV1::new(
+                second_name.clone(),
+                context.manifest_digest().clone(),
+                CustodyEnvelopeFormatV1::new("other", "tool", "1").unwrap(),
+                context.recipients().to_vec(),
+            )
+            .unwrap(),
+            CustodyEnvelopeContextV1::new(
+                second_name.clone(),
+                context.manifest_digest().clone(),
+                CustodyEnvelopeFormatV1::new("capsule-v1", "other", "1").unwrap(),
+                context.recipients().to_vec(),
+            )
+            .unwrap(),
+            CustodyEnvelopeContextV1::new(
+                second_name.clone(),
+                context.manifest_digest().clone(),
+                CustodyEnvelopeFormatV1::new("capsule-v1", "tool", "2").unwrap(),
+                context.recipients().to_vec(),
+            )
+            .unwrap(),
+            CustodyEnvelopeContextV1::new(
+                second_name,
+                context.manifest_digest().clone(),
+                context.format().clone(),
+                vec!["other-recipient".to_owned()],
+            )
+            .unwrap(),
+        ] {
+            let changed =
+                CustodyEnvelopeSealReceiptV1::new(&changed, ciphertext_receipt(&[4])).unwrap();
+            assert_eq!(
+                CustodyCapsuleSealProofV1::from_receipts(vec![baseline.clone(), changed])
+                    .unwrap_err(),
+                CustodyCapsuleErrorV1::InvalidInput
+            );
+        }
+    }
+
+    #[test]
+    fn binding_accepts_and_rejects_receipt_derived_proofs() {
+        let manifest = full_manifest();
+        let layout = CustodyCapsuleLayoutV1::derive(&manifest).unwrap();
+        let manifest_digest = manifest.content_digest().unwrap();
+        let proof = proof_for(layout.index(), manifest_digest.clone());
+        let binding = CustodyCapsuleBindingV1::new(
+            &manifest,
+            layout.index(),
+            &CustodyRestorePolicyV1::default(),
+            &proof,
+        )
+        .unwrap();
+        assert_eq!(binding.manifest_digest(), &manifest_digest);
+        assert_eq!(binding.artifact_names().len(), 17);
+
+        let foreign_index =
+            CustodyCapsuleIndexV1::new(digest(8), layout.index().artifacts().to_vec()).unwrap();
+        assert_eq!(
+            CustodyCapsuleBindingV1::new(
+                &manifest,
+                &foreign_index,
+                &CustodyRestorePolicyV1::default(),
+                &proof,
+            )
+            .unwrap_err(),
+            CustodyCapsuleErrorV1::ThreeWayDigestMismatch
+        );
+
+        let foreign_proof = proof_for(layout.index(), digest(7));
+        assert_eq!(
+            CustodyCapsuleBindingV1::new(
+                &manifest,
+                layout.index(),
+                &CustodyRestorePolicyV1::default(),
+                &foreign_proof,
+            )
+            .unwrap_err(),
+            CustodyCapsuleErrorV1::ThreeWayDigestMismatch
+        );
+
+        let other_manifest = make_manifest(
+            set_coverage(
+                coverage_with(CustodyStateClassV1::Captured),
+                CustodyCoverageClassV1::Worktree,
+                CustodyStateClassV1::Empty,
+            ),
+            vec![object(CustodyGitObjectKindV1::Commit)],
+        );
+        assert_eq!(
+            CustodyCapsuleBindingV1::new(
+                &other_manifest,
+                layout.index(),
+                &CustodyRestorePolicyV1::default(),
+                &proof,
+            )
+            .unwrap_err(),
+            CustodyCapsuleErrorV1::ThreeWayDigestMismatch
+        );
+    }
+
+    #[test]
+    fn binding_reports_missing_extra_and_unmapped_receipt_artifacts() {
+        let manifest = full_manifest();
+        let layout = CustodyCapsuleLayoutV1::derive(&manifest).unwrap();
+        let manifest_digest = manifest.content_digest().unwrap();
+        let proof = proof_for(layout.index(), manifest_digest.clone());
+
+        let mut missing_rows = layout.index().artifacts().to_vec();
+        missing_rows.retain(|row| row.name().as_bytes() != b"payload/worktree.bin.enc");
+        let missing_index = CustodyCapsuleIndexV1::new(manifest_digest, missing_rows).unwrap();
+        assert_eq!(
+            CustodyCapsuleBindingV1::new(
+                &manifest,
+                &missing_index,
+                &CustodyRestorePolicyV1::default(),
+                &proof,
+            )
+            .unwrap_err(),
+            CustodyCapsuleErrorV1::MissingArtifact
+        );
+
+        let extra_row = CustodyCapsuleArtifactRoleRowV1::new(
+            LosslessPathV1::from_bytes(b"payload/reproducible_outputs.bin.enc".to_vec()),
+            CustodyCapsuleArtifactRoleV1::CoveragePayload(
+                CustodyCoverageClassV1::ReproducibleOutputs,
+            ),
+        )
+        .unwrap();
+        let mut empty_rows = CustodyCapsuleLayoutV1::derive(&empty_manifest())
+            .unwrap()
+            .index()
+            .artifacts()
+            .to_vec();
+        empty_rows.push(extra_row);
+        let extra_index =
+            CustodyCapsuleIndexV1::new(empty_manifest().content_digest().unwrap(), empty_rows)
+                .unwrap();
+        let empty_proof = proof_for(&extra_index, empty_manifest().content_digest().unwrap());
+        assert_eq!(
+            CustodyCapsuleBindingV1::new(
+                &empty_manifest(),
+                &extra_index,
+                &CustodyRestorePolicyV1::default(),
+                &empty_proof,
+            )
+            .unwrap_err(),
+            CustodyCapsuleErrorV1::ExtraArtifact
+        );
+
+        let empty = empty_manifest();
+        let empty_layout = CustodyCapsuleLayoutV1::derive(&empty).unwrap();
+        let empty_digest = empty.content_digest().unwrap();
+        let format = CustodyEnvelopeFormatV1::new("capsule-v1", "a2a-bridge", "0.1.0").unwrap();
+        let mut extra_receipts: Vec<_> = empty_layout
+            .index()
+            .artifacts()
+            .iter()
+            .enumerate()
+            .map(|(offset, row)| {
+                receipt_for(
+                    row.name(),
+                    empty_digest.clone(),
+                    format.clone(),
+                    vec!["recipient".to_owned()],
+                    &[u8::try_from(offset + 1).unwrap()],
+                )
+            })
+            .collect();
+        extra_receipts.push(receipt_for(
+            &LosslessPathV1::from_bytes(b"payload/worktree.bin.enc".to_vec()),
+            empty_digest,
+            format,
+            vec!["recipient".to_owned()],
+            &[9],
+        ));
+        let extra_proof = CustodyCapsuleSealProofV1::from_receipts(extra_receipts).unwrap();
+        assert_eq!(
+            CustodyCapsuleBindingV1::new(
+                &empty,
+                empty_layout.index(),
+                &CustodyRestorePolicyV1::default(),
+                &extra_proof,
+            )
+            .unwrap_err(),
+            CustodyCapsuleErrorV1::UnmappedArtifact
+        );
+    }
+
+    #[test]
+    fn seal_derived_open_request_binds_membership_limits_and_ciphertext_identity() {
+        let name = LosslessPathV1::from_bytes(b"control/manifest.json.enc".to_vec());
+        let context = CustodyEnvelopeContextV1::new(
+            name.clone(),
+            digest(1),
+            envelope_format(),
+            vec!["z".to_owned(), "a".to_owned(), "a".to_owned()],
+        )
+        .unwrap();
+        let proof =
+            CustodyCapsuleSealProofV1::from_receipts(vec![CustodyEnvelopeSealReceiptV1::new(
+                &context,
+                ciphertext_receipt(&[1, 2, 3, 4, 5]),
+            )
+            .unwrap()])
+            .unwrap();
+        let request =
+            CustodyEnvelopeOpenRequestV1::from_seal_artifact(&proof, name.clone()).unwrap();
+        assert_eq!(
+            request.context().encode_canonical().unwrap(),
+            context.encode_canonical().unwrap()
+        );
+        assert_eq!(request.ciphertext_length(), 5);
+        assert_eq!(
+            request.ciphertext_sha256(),
+            &Sha256HexV1::digest(&[1, 2, 3, 4, 5])
+        );
+        assert_eq!(
+            CustodyEnvelopeOpenRequestV1::from_seal_artifact(
+                &proof,
+                LosslessPathV1::from_bytes(b"payload/worktree.bin.enc".to_vec()),
+            )
+            .unwrap_err(),
+            CustodyCapsuleErrorV1::MissingArtifact
+        );
     }
 }

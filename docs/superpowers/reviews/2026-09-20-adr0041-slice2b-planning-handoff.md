@@ -1,7 +1,7 @@
 # Handoff — ADR-0041 Slice 2B local capsule planning
 
-**Written:** 2026-09-20T22:51:32Z; refreshed 2026-09-23 after second closure review · **By:** Codex `/root` · **Provider:** codex + Claude ACP review
-**Workspace:** retained implementation clone plus planning worktree · **Measured state:** `[MEASURED]` reviewed code `8d9d4c45` · second closure review REJECT · docs-only custody reconciliation in progress
+**Written:** 2026-09-20T22:51:32Z; refreshed 2026-09-23 after R1 provenance repair cycle 1 · **By:** Codex `/root` · **Provider:** codex + Claude ACP review
+**Workspace:** retained implementation clone plus planning worktree · **Measured state:** `[MEASURED]` retained clone HEAD `99df794c` · R1 provenance repair host-verified pending commit/review
 **Predecessor:** `docs/superpowers/reviews/2026-09-16-adr0041-slice2a-handoff.md`
 **Truth ordering:** measured live state > explicit owner/contract authority within its scope > this handoff for current operational state > earlier handoffs and non-authoritative summaries. A conflict between tiers stays OPEN in §0 — never resolved by document class alone.
 **Provenance:** written live by the worker from GitHub/remote-main probes, merged ADR/code, and predecessor handoffs. `[MEASURED]` claims were probed by this writer; `[INHERITED]` claims were not.
@@ -11,15 +11,15 @@
 **(a) Lane ownership** — `[MEASURED]` the sole authorized second closure review completed; no agent is in flight — **RESOLVED 2026-09-23.**
 **(b) Custody exposure** — `[MEASURED]` reviewed code `8d9d4c45` is locally committed and unpushed; the raw review is retained under `/private/tmp` and this docs-only successor records its digest — **RESOLVED for local custody; publication remains OPEN.**
 **(c) In flight / irreversible** — `[MEASURED]` review terminal and cleanup were complete. No capsule/restore effect, cleanup, remote promotion, merge, or operator mutation was started — **RESOLVED 2026-09-23.**
-**(d) Authorization granted but not exercised** — None. The one-review cap is exhausted; repair, rereview, 2B2/2B3, publication, cleanup, and operator mutation need new owner direction.
+**(d) Authorization granted but not exercised** — The owner-authorized R1 repair and controller verification were exercised in the retained clone. Independent review and approval-gated PR publication remain authorized but unexercised. Merge, cleanup, 2B2/2B3, and operator mutation remain unauthorized.
 
 ## 1. Resume order
 
 1. In this exact worktree run `git status --short --branch`, bind HEAD/base to the identifiers in §6, and require no code paths outside the planning delta.
 2. Read ADR-0041 §§4, 8, 9, 11, 14, and 17; the Slice 2A handoff §4; and the complete plan in §6.
 3. Bind both review records, the final approved closure, and the typed implementation task in §6.
-4. Preserve reviewed code `8d9d4c45` and read the 2026-09-23 second-closure disposition.
-5. Stop. Do not repair, rereview, publish, or begin 2B2 without a new owner decision.
+4. Preserve reviewed predecessor `8d9d4c45`, docs-only custody successor `99df794c`, and the staged R1 provenance repair cycle 1 result.
+5. Stop. Do not claim approval, commit, review, publish, or begin 2B2 without controller action and a new owner decision.
 
 **STOP conditions:** Do not start 2B2/2B3 effects, use a bare path as a quiescence/capture capability, add remote/provider/destructive authority, clean worktrees, push, merge, or mutate the running operator. An open-class review population or exhausted nonconverging cap parks the plan.
 
@@ -34,7 +34,7 @@
 | Durable-state reconciliation | done | `[MEASURED]` roadmap plus Slice 1B/2A handoffs now record PR #104 merged and preserve adoption/effects as separate gates. |
 | Documentation gates | done | `[MEASURED]` `git diff --check` exits 0; locked/offline repository hygiene reports 41 tracked artifacts / 9 validated example configs. No code changed, so no implementation/full-suite claim is made. |
 | Independent spec review | approved | `[MEASURED]` Opus 5/high round 2 returned `APPROVE`: all 4 inherited WRONG RESOLVED, 0 new WRONG, 6 non-blocking SMELL. The converging two-round cap is exhausted; residuals were folded without extension. |
-| Implementation/effects | 2B1 second repair rejected | `[MEASURED]` host-verified code `8d9d4c45` received the one authorized Sol/xhigh closure review. R2/R3 RESOLVED; R1 UNRESOLVED because source/sink receipts are type-indistinguishable at the public seal constructor. Verdict REJECT, 1 BLOCKER WRONG / 4 DEFER SMELL. No capsule/restore filesystem or Git effect started. |
+| Implementation/effects | R1 provenance repair host-verified pending commit/review | `[MEASURED]` cycle 1 repaired only inherited R1: source and ciphertext-sink completions are distinct and seal receipt construction is crate-private. Two controller mutations failed only their intended compile-fail controls and were restored. Full host suites passed 4,471/0 and 4,477/0 with 13 ignored; Clippy, format, dependency policy, and hygiene are green. No capsule/restore filesystem or Git effect started. |
 
 ## 3. Corrections to standing documents and memory
 
@@ -51,7 +51,7 @@
 |---:|---|---|---|---|---|
 | 1 | Planning custody | done | Preserve the approved closure, implementation task, and this handoff seal; do not push without separate authority. | None. | Approval `56922bdd`; task `81c292ce`; final plan digest in §6. |
 | 2 | Spec review | approved | Preserve both review records; no third round. | None. | Round-1 and round-2 records in §6. |
-| 3 | Child 2B1 implementation | parked after review rejection | Preserve reviewed code and the docs-only custody successor. Any repair/rereview needs new owner direction. | R1 repair and independent approval. | Reviewed code `8d9d4c45`; review execution `exec-6fb6dc2200ad44563d487e3e2ee96408`. |
+| 3 | Child 2B1 implementation | host-verified pending independent review | Commit the exact restored repair, then obtain the authorized Sol/xhigh review. Push/open PR only if approved. | Independent approval. | Incoming HEAD `99df794c`; predecessor `8d9d4c45`; base `80d45868`; repair SHA `4dd06fae`. |
 | 4 | Children 2B2/2B3 | parked | Proceed serially only after each predecessor is approved. | 2B1 then 2B2 approval; effect authority. | §§5–6 of the plan. |
 | 5 | Worktree cleanup/operator adoption | parked | Keep separate from Slice 2B planning and implementation. | Separate exact authority and custody proof. | ADR-0041 stages 3–5. |
 
@@ -87,6 +87,7 @@
 | Approval-closure commit | `56922bdd66a6f92522848f2167647e9576e74d8a` |
 | 2B1 implementation task / commit | `docs/superpowers/plans/2026-09-20-adr0041-slice2b1-implementation-task.md` / `81c292ceee9fcb1221747d606f862929c5e880e7` |
 | Second repaired code candidate / base | `8d9d4c45d93ef6441aef52fea2fc35db4b2316b9` / `80d4586828aca7d5959b3931f3d30d2cd593e662` |
+| R1 provenance repair cycle 1 incoming HEAD / repair contract SHA-256 | `99df794cac012ce35dc9d33b4ac8182fe29fe407` / `4dd06fae44e072fdfdd8e650e9cc8ce2a4e8c6ee9a7d855c74737fc59b2f9b13` |
 | Second closure review | `docs/superpowers/reviews/2026-09-23-adr0041-slice2b1-second-closure-review.md` |
 | Second closure execution / attempt | `exec-6fb6dc2200ad44563d487e3e2ee96408` / `attempt-0c3b24562fa60b0e6c9fd6dd1e850641` |
 | Second closure raw result SHA-256 | `574c9481eb6a9fe4a862b55d001b5fe57142f472577b38c5a3a044a7fa7c46bb` |
@@ -95,4 +96,4 @@
 
 **§2c verdict:** REFUTED — corrected in place · claim: "The second repair closes all three inherited Slice 2B1 WRONG mechanisms." · pass: INDEPENDENT · evidence tier: STATIC-ONLY plus inherited mutation/full-gate evidence · record: `docs/superpowers/reviews/2026-09-23-adr0041-slice2b1-second-closure-review.md`
 
-**Questions the owner owes an answer to:** 1. Whether to authorize a bounded R1 receipt-provenance repair and one new review; until then 2B1 and all successors remain parked.
+**Cycle-1 repair status:** The bounded R1 repair and controller host gates are complete. Independent review is next; no approval, publication, cleanup, 2B2/2B3, or operator mutation is claimed.

@@ -22,8 +22,119 @@ The remaining R1 mechanism is type-level provenance: source and sink validators 
 `CustodyEnvelopeStreamReceiptV1`, and public `CustodyEnvelopeSealReceiptV1::new` accepts either. Private fields
 block raw struct construction but do not stop a source/decoy receipt from being relabeled as ciphertext and
 used to assemble an accepted capsule proof/binding. The prior R1 mutation proved faithful copying of the
-supplied receipt, not that it came from the ciphertext sink. No repair or rereview is authorized; preserve
-reviewed code `8d9d4c45` and this docs-only custody successor.
+supplied receipt, not that it came from the ciphertext sink. At that disposition point no repair or
+rereview was authorized; preserve reviewed code `8d9d4c45` and this docs-only custody successor.
+
+
+## R1 provenance repair cycle 1 update - 2026-09-23
+
+The owner authorized this single write-capable repair turn on retained branch
+`implement/impl-16580-ybg5ha5r`, incoming custody HEAD
+`99df794cac012ce35dc9d33b4ac8182fe29fe407`, reviewed code predecessor
+`8d9d4c45d93ef6441aef52fea2fc35db4b2316b9`, exact base
+`80d4586828aca7d5959b3931f3d30d2cd593e662`, and `/contract/repair.md`
+SHA-256 `4dd06fae44e072fdfdd8e650e9cc8ce2a4e8c6ee9a7d855c74737fc59b2f9b13`.
+Pre-edit custody checks matched the exact branch, clean worktree, HEAD, predecessor parent, base merge
+point, and repair-contract digest.
+
+Repair summary:
+
+- Source and ciphertext-sink completions are now distinct types.
+  `CustodyEnvelopeSourceValidatorV1::finish` returns `CustodyEnvelopeStreamReceiptV1`;
+  `CustodyEnvelopeSinkValidatorV1::finish` returns `CustodyEnvelopeCiphertextReceiptV1`.
+- Production `CustodyEnvelopeSealReceiptV1::new` is crate-private and consumes only the ciphertext
+  sink completion. Public callers can inspect genuine seal receipts, but no public constructor or
+  composition helper can manufacture a seal receipt from a source receipt, caller-supplied digest/length,
+  or decoy evidence.
+- Compile-fail doctests document both API boundaries: a source receipt is not accepted where a
+  ciphertext completion is required, and an external caller cannot invoke the production seal-receipt
+  constructor. Receipt/proof behavioral tests that need crate-private construction were moved into
+  in-crate test support without adding a public test helper or feature escape hatch.
+- In-crate behavioral coverage now includes exact-ciphertext positive evidence, a source/decoy negative
+  proving decoy bytes cannot claim a different ciphertext length/SHA-256, and zero-byte ciphertext
+  refusal through the genuine sink-derived construction path. Existing R2/R3 and approved 2B1a public
+  boundary tests remain in scope.
+
+RED-first evidence limit: a temporary focused RED control was added before the production split to assert
+that a source-derived plaintext receipt could not mint a seal receipt. On the incoming code, the focused
+command below failed before compiling because this retained container's offline cargo cache cannot resolve
+`arc-swap`, required by `bridge-a2a-inbound v0.3.1`; therefore no admissible behavioral RED test count was
+produced in this environment. The intended failure remains source-level captured by the temporary test diff
+and must be executed by the controller in a host/cache environment that can compile.
+
+```text
+cargo test --locked --offline -p bridge-core --test custody_capsule \
+  seal_receipt_derives_authenticated_context_and_finalized_ciphertext_identity
+# failed before compilation: no matching package named `arc-swap` found
+```
+
+Focused verification available in this repair environment:
+
+```text
+rustfmt crates/bridge-core/src/custody_capsule.rs crates/bridge-core/tests/custody_capsule.rs
+# passed
+
+rustfmt --check crates/bridge-core/src/custody_capsule.rs crates/bridge-core/tests/custody_capsule.rs
+# passed
+
+cargo test --locked --offline -p bridge-core --test custody_capsule
+# failed before compilation: no matching package named `arc-swap` found
+
+cargo test --manifest-path crates/bridge-core/Cargo.toml --locked --offline --test custody_capsule
+# failed before compilation: no matching package named `arc-swap` found
+```
+
+No dependency, feature, persisted wire schema, provider, adapter/effect, network access, commit, reset,
+cleanup, branch switch, bridge checkpoint/config edit, publication, review approval, or 2B2/2B3 work was
+performed by this repair turn.
+
+Controller host verification then used the same retained clone and restored candidate. The first package
+suite compiled and passed but exposed a `dead_code` warning at the intentionally dormant crate-private
+constructor. The controller added a narrow documented allowance because the first in-crate sealer adapter is
+deferred to 2B2; warnings-denied Clippy then passed. One subsequent focused probe was inadmissible because an
+over-broad mutation restoration changed the unrelated public artifact-role constructor. Exact source inspection
+identified that controller error, both constructors were restored with symbol-qualified patches, and the focused
+gate was rerun before any belief update.
+
+Two independent controller mutations were discriminating and restored:
+
+- changing source `finish` to return the ciphertext receipt made only the source-substitution compile-fail
+  doctest fail: 4 passed / 1 failed because the forbidden example compiled;
+- changing only `CustodyEnvelopeSealReceiptV1::new` from `pub(crate)` to `pub` made only the constructor-privacy
+  compile-fail doctest fail: 4 passed / 1 failed because the forbidden external call compiled.
+
+Restored host gates:
+
+```text
+cargo test --locked --offline -p bridge-core custody_capsule::tests:: --quiet
+# 8 passed / 0 failed / 731 filtered
+
+cargo test --locked --offline -p bridge-core --doc --quiet
+# 5 passed / 0 failed
+
+cargo test --locked --offline --workspace --all-targets --quiet
+# 4,471 passed / 0 failed / 13 ignored across 90 result groups
+
+cargo test --locked --offline --workspace --quiet
+# 4,477 passed / 0 failed / 13 ignored across 106 result groups
+
+cargo clippy --locked --offline --workspace --all-targets -- -D warnings
+# passed
+
+cargo fmt --all -- --check
+# passed
+
+cargo deny check --disable-fetch
+# passed: advisories, bans, licenses, and sources ok; allowlisted duplicate warnings remain
+
+cargo run --locked --offline -p a2a-bridge -- validate --repo-hygiene
+# passed: 41 tracked artifacts / 9 validated example configs
+```
+
+The all-target total is one lower than rejected candidate `8d9d4c45` because receipt-dependent external tests
+were consolidated into crate-private unit coverage; the default total is one higher because the same
+consolidation removes one runtime test while adding two compile-fail doctests. This count change is review-visible,
+not treated as evidence by itself. The exact staged candidate remains pending commit and independent review.
 
 ## Second retained-candidate repair update - 2026-09-23
 
