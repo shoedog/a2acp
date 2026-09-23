@@ -143,6 +143,10 @@ and dispositions BLOCKER 0 / DEFER 5. This docs-only successor folds the review'
 publication. Four dropped public negative tests and the three retained evidence families remain explicitly
 deferred; no production behavior changed after review.
 
+The approved branch `feat/adr0041-slice2b1-capsule-contracts-20260923` was pushed without force and PR #105 was
+opened against current `main` `27a885f6`: `https://github.com/shoedog/a2acp/pull/105`. Merge, 2B2/2B3 effects,
+cleanup, release, deployment, and running-operator adoption remain unexercised.
+
 ## Second retained-candidate repair update - 2026-09-23
 
 The owner authorized one write-capable retained-candidate repair round on branch
