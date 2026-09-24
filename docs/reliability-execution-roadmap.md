@@ -1,9 +1,9 @@
 # Bridge reliability execution and handoff roadmap
 
 - **Program status:** active P0
-- **Current main lineage:** `origin/main` is `27a885f6d4af6a517c2a8899aa5bfe36605b8fb7`, the merge of ADR-0041
-  Slices 1A, 1B, and 2A in PR #104. Its second parent is the reviewed/published PR head
-  `65a572df40f07316124a70b7ec353a2d38dd334d`; that tree is identical to the merge result. Its ancestry includes
+- **Current main lineage:** `origin/main` is `5e431f4f2dd6f77c66d64fa28dc48054f396edf9`, the merge of ADR-0041
+  Slice 2B1 in PR #105. Its ancestry includes PR #104 at `27a885f6d4af6a517c2a8899aa5bfe36605b8fb7`, which merged
+  Slices 1A, 1B, and 2A with reviewed/published head `65a572df40f07316124a70b7ec353a2d38dd334d`, plus
   ADR-0041 custody-lifecycle documentation PR #103, R2f1b 5B PR #102
   (`edcda181ad94daad6ddaf9d3c9d4dd63fd2dce00`), 5A PR #101, 4J PR #100, 4I PR #99,
   the provider compatibility/runbook PR #98, OpenCode Go documentation PR #97, provider runtime-dispatch PR #96,
@@ -13,8 +13,8 @@
   `6338bc1628fed52b772026b604a1bbdd710efa8c`; the final Sol/xhigh rereview recorded 0 WRONG and 3 SMELL,
   with full verification at 4,408 passed / 0 failed / 13 ignored / 726 filtered. The candidate remains
   production-unwired; its historical handoff's pre-publication stop is superseded by the recorded PR #102 merge.
-- **Active slice:** **ADR-0041 Slice 2B1 implementation repair — Slices 1A, 1B, and 2A merged in PR #104 at `27a885f6`; pure
-  Slice 2B1 contracts have begun in the implementation quarantine, while Slice 2B effects remain unstarted.** Slice 1A defines canonical lossless records without I/O; Slice 1B adds an
+- **Active slice:** **ADR-0041 Slice 2B2 planning — Slice 2B1 merged in PR #105 at `5e431f4f`; isolated local export
+  and exact Git-object closure are documented for independent review, while 2B2 effects remain unstarted.** Slice 1A defines canonical lossless records without I/O; Slice 1B adds an
   explicitly capped 8+8 metadata collector and synthetic historical reconciliation, with every missing row still
   unverified. The Opus 5/high spec review reported 4 WRONG and 9 SMELL; Sol/high folded all four WRONG and the
   required SMELLs before implementation. Structural and behavioral RED were captured; the host full workspace
@@ -45,7 +45,7 @@
   state/inventory rules, discriminating mutations, layout re-derivation, and bounded gate clarifications. Final
   round 2 APPROVED with 0 WRONG / 6 non-blocking SMELL; all four inherited WRONG were mechanism-level RESOLVED.
   The cap is exhausted with a converging population, and the six one-clause documentation/evidence residuals were
-  folded without a third review. The owner authorized a second retained-candidate 2B1 repair round. The first implementation artifact `a210d5d5`, retained candidate `9e2fd7e1`, and amended candidate `77a6598a` remained rejected for the three closure-review WRONG findings. Repaired code candidate `8d9d4c45` addressed R1/R2/R3 under `/contract/repair.md` SHA-256 `0b4d51ba`; three discriminating controller mutations failed as expected, the restored focused suite passed 25/25, both full workspace modes passed (4,472 and 4,476 tests; zero failures), and all static/policy/hygiene gates were green. The one authorized Sol/xhigh hard-read-only closure review (`exec-6fb6dc2200ad44563d487e3e2ee96408`) **REJECTED**: R2/R3 RESOLVED, but R1 remained UNRESOLVED because source and sink validators minted the same receipt type accepted by the public seal-receipt constructor. The owner then authorized one retained-candidate R1 provenance repair cycle on docs-only custody HEAD `99df794c` under `/contract/repair.md` SHA-256 `4dd06fae`. Reviewed candidate `88013eb4` splits source/ciphertext receipt types and makes production seal-receipt construction crate-private. Two independent controller mutations failed only their intended compile-fail controls and were restored; full host suites passed 4,471/0 and 4,477/0 with 13 ignored, and warnings-denied Clippy, format, dependency policy, and hygiene are green. Sol/xhigh review `exec-e7ee36345656679aec8923c4be9d25b6` **APPROVED**: inherited RESOLVED 3 / UNRESOLVED 0 / DEFERRED 0, new WRONG 0 / SMELL 2, BLOCKER 0 / DEFER 5. PR #105 is open from the approved branch; 2B2/2B3 effects, merge, cleanup, and running-operator mutation remain unstarted.
+  folded without a third review. The owner authorized a second retained-candidate 2B1 repair round. The first implementation artifact `a210d5d5`, retained candidate `9e2fd7e1`, and amended candidate `77a6598a` remained rejected for the three closure-review WRONG findings. Repaired code candidate `8d9d4c45` addressed R1/R2/R3 under `/contract/repair.md` SHA-256 `0b4d51ba`; three discriminating controller mutations failed as expected, the restored focused suite passed 25/25, both full workspace modes passed (4,472 and 4,476 tests; zero failures), and all static/policy/hygiene gates were green. The one authorized Sol/xhigh hard-read-only closure review (`exec-6fb6dc2200ad44563d487e3e2ee96408`) **REJECTED**: R2/R3 RESOLVED, but R1 remained UNRESOLVED because source and sink validators minted the same receipt type accepted by the public seal-receipt constructor. The owner then authorized one retained-candidate R1 provenance repair cycle on docs-only custody HEAD `99df794c` under `/contract/repair.md` SHA-256 `4dd06fae`. Reviewed candidate `88013eb4` splits source/ciphertext receipt types and makes production seal-receipt construction crate-private. Two independent controller mutations failed only their intended compile-fail controls and were restored; full host suites passed 4,471/0 and 4,477/0 with 13 ignored, and warnings-denied Clippy, format, dependency policy, and hygiene are green. Sol/xhigh review `exec-e7ee36345656679aec8923c4be9d25b6` **APPROVED**: inherited RESOLVED 3 / UNRESOLVED 0 / DEFERRED 0, new WRONG 0 / SMELL 2, BLOCKER 0 / DEFER 5. PR #105 merged at `5e431f4f` on 2026-09-24. The Slice 2B1 implementation and planning worktrees were retired only after ancestry, clean-state, liveness, and custody checks; the planning branch remains as historical custody. Slice 2B2 is specified in `docs/superpowers/plans/2026-09-23-adr0041-slice2b2-isolated-export-task.md`; 2B2/2B3 effects and running-operator mutation remain unstarted.
 
 
 - **R2f0b verification and review (2026-08-01):** [native verification](superpowers/reviews/2026-08-01-r2f0b-native-verification.md)
