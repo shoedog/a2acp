@@ -14,7 +14,7 @@
   with full verification at 4,408 passed / 0 failed / 13 ignored / 726 filtered. The candidate remains
   production-unwired; its historical handoff's pre-publication stop is superseded by the recorded PR #102 merge.
 - **Active slice:** **ADR-0041 Slice 2B2 planning — Slice 2B1 merged in PR #105 at `5e431f4f`; isolated local export
-  and exact Git-object closure are documented (revision 2, pre-review audit folded 2026-09-24: 7 WRONG / 10 SMELL, plus an owner-approved 2B2b framing child between 2B2 and 2B3) for independent review, while 2B2 effects remain unstarted.** Slice 1A defines canonical lossless records without I/O; Slice 1B adds an
+  and exact Git-object closure are at task revision 3: the pre-review audit (7 WRONG / 10 SMELL) and independent review round 1 (Sol/xhigh REJECT, 5 WRONG / 9 SMELL, closed population) are both folded, and an owner-approved 2B2b framing child sits between 2B2 and 2B3. Round 2 of 2 is next; 2B2 effects remain unstarted.** Slice 1A defines canonical lossless records without I/O; Slice 1B adds an
   explicitly capped 8+8 metadata collector and synthetic historical reconciliation, with every missing row still
   unverified. The Opus 5/high spec review reported 4 WRONG and 9 SMELL; Sol/high folded all four WRONG and the
   required SMELLs before implementation. Structural and behavioral RED were captured; the host full workspace

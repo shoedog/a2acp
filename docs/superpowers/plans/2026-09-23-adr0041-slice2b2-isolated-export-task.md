@@ -3,9 +3,10 @@ task-type: implement
 ---
 # ADR-0041 Slice 2B2 — isolated local export and Git-object closure
 
-**Status:** review candidate, revision 2; planning/documentation only. Implementation is not authorized by this
-file. Revision 2 folds a pre-review audit (§12). The owner approved revision 2 and the §3 2B2b framing amendment on
-2026-09-24 and directed the independent hard-read-only review to proceed; implementation remains unauthorized.
+**Status:** review candidate, revision 3; planning/documentation only. Implementation is not authorized by this
+file. Revision 2 folded a pre-review audit (§12). The owner approved revision 2 and the §3 2B2b framing amendment on
+2026-09-24 and directed the independent hard-read-only review to proceed. Round 1 of 2 rejected with 5 WRONG / 9 SMELL;
+revision 3 folds all 14 on this artifact (§13). Round 2 is the final admitted round.
 
 **Exact predecessor:** `5e431f4f2dd6f77c66d64fa28dc48054f396edf9` (`origin/main`, PR #105 merge).
 
@@ -33,8 +34,9 @@ The child is complete only when:
    from commit/tag roots — is present;
 6. the exterior seal is published last and is derived from destination-owned sink receipts for the exact bytes each
    destination durably accepted;
-7. every failure is typed, leaves the source unchanged, and reports an incomplete local outcome; a failure after the
-   seal commit point is reported as its own durability-unconfirmed outcome, never as success and never as "no seal".
+7. every failure is typed, leaves the source unchanged, and reports an incomplete local outcome; a seal rename whose
+   effect cannot be verified, and a failure after the seal commit point, are each reported as their own outcome
+   (§6), never as success and never as "no seal".
 
 ## 2. Authority and effect boundary
 
@@ -43,11 +45,21 @@ empty scratch root, plus hardened local Git subprocesses. Publication is descrip
 create-new/no-replace. The implementation must retain and recheck source, alternate, scratch-root, and destination
 identities across every effect boundary.
 
+Preflight refuses a scratch root that is, contains, or lies inside the source repository, its git directory, or any
+pinned alternate store. The check compares canonical paths in both directions and the directory identity of every
+ancestor captured at preflight, so no exporter write can land in a source store.
+
 The scratch root has exactly two top-level children, both created by the exporter:
 
 - `capsule/` — only the reserved 2B1 logical artifact names plus `custody-seal.v1`;
 - `work/` — the plaintext Git-pack staging file, the verification object database, the private `HOME`/XDG
   directories, and the synthesized Git directory from §4. Nothing under `work/` is a capsule member.
+
+Every directory the exporter itself creates — `capsule/`, `work/`, the nested `control/`, `git/`, and `payload/`
+directories, and the `HOME`/XDG directories — is created with the descriptor-relative directory primitive added to
+`fs_custody` (§6) beneath a retained parent descriptor, never by pathname. Git creates the interior of the git
+directories it initializes under `work/`. Those paths are derived by the exporter from the retained `work/` descriptor
+and rechecked before each spawn; the caller never supplies them.
 
 The exporter never deletes anything, including its own `work/` contents; a completed or failed run leaves `work/`
 as inert, typed scratch evidence. Plaintext in `work/` is acceptable only because 2B2 makes no confidentiality claim
@@ -58,10 +70,13 @@ caller budgets, a sealer, and a non-cloneable generation-bound `CustodyCaptureCa
 `CustodyCapsuleLayoutV1` itself from the manifest; it does not accept a caller layout. Caller budgets are validated
 to be at or below the fixed §3 ceilings and are otherwise refused.
 
-The capability owns retained descriptors and a fixed source/alternate/object population. Before any write the
-exporter requires the capability's `unit_id`, `run_id`, `materialization_id`, and `generation_id` to equal the
+The capability owns retained descriptors and a fixed source/alternate/object population. Before deriving the layout,
+the exporter preflights the manifest's canonical encoding with a bounded streaming serializer and refuses one over the
+1 MiB canonical-JSON ceiling. This check comes first because `CustodyCapsuleLayoutV1::derive` calls
+`manifest.content_digest()`, which allocates the full encoding. Before any write the exporter requires the capability's `unit_id`, `run_id`, `materialization_id`, and `generation_id` to equal the
 manifest's, its object format to equal the format of every manifest object, and its `(format, object_id, kind)`
-inventory to equal `manifest.original_objects()` exactly. The capability can be minted only by a supported snapshot
+inventory to equal `manifest.original_objects()` exactly. These comparisons use new crate-private read-only
+accessors on `CustodyManifestV1` and `CustodyOriginalObjectV1` (§8), not canonical-JSON re-parsing. The capability can be minted only by a supported snapshot
 or exclusive managed-writer quiescence decision. If the production quiescence primitive is not yet available, expose
 only a crate-private fixture constructor. Never substitute a bool, repeated inventory, a canonical path string, or
 creation of a new lock file for that gate. With a crate-private capability constructor and only a test-only sealer,
@@ -94,11 +109,24 @@ V1 ceilings are fixed before allocation or file creation:
   index. This is the ADR-0041 seal-staging cap; it bounds disk use, not only capsule size;
 - canonical JSON metadata at most 1 MiB, with existing 2B1 field/name/recipient limits unchanged.
 
-One scratch-wide ledger uses checked arithmetic. Each write reserves against it before issue, including the
-`pack-objects` stdout reader (§4) and a pre-spawn reservation for the verification copy equal to the staged pack
-length plus a fixed bounded index allowance; the verification database's actual on-disk size is re-measured after
-`index-pack` and must fit the reservation. Envelope overhead means a plaintext near the per-artifact ceiling refuses at
-the sink; that is correct behavior, not an off-by-one.
+One scratch-wide ledger counts **logical** file bytes with checked arithmetic, plus a fixed 64 KiB allocation
+allowance per created file or directory. The set of created files is fixed and small, so allocated-block overhead
+stays bounded. The exporter reserves bytes before each write it issues itself, including every `pack-objects` stdout
+chunk. Before spawning a Git child that writes under `work/`, the exporter reserves that child's complete proven upper
+bound:
+
+- **each `git init --bare --template=`:** the enumerated `HEAD`, `config`, and empty `objects/` and `refs/` tree, at
+  the per-entry allowance;
+- **`index-pack --stdin`:** its temporary and final pack together count once at the staged pack length L, because the
+  temporary pack is renamed rather than copied. For N objects and hash length H, the version-2 index is at most
+  `1072 + N·(H + 8) + 8·N + 2·H` bytes, the reverse index at most `12 + 4·N + 2·H`, and the bitmap and `.keep` files
+  are absent because neither is requested;
+- **the read-only verification commands** (`verify-pack`, `cat-file`, `rev-list`, `fsck`): zero, with no
+  `--write`-style flags.
+
+After each child exits, the exporter re-measures every file under the git directory it wrote to. An unexpected file,
+or a total above the reservation, is a typed budget refusal. Envelope overhead means a plaintext near the per-artifact
+ceiling refuses at the sink; that is correct behavior, not an off-by-one.
 
 Limits are policy ceilings, not allocation requests. No `Vec` or path population is sized from an unvalidated length.
 Ceiling boundaries (max and max+1) are tested through validator/ledger arithmetic and small caller budgets, never by
@@ -122,8 +150,10 @@ one object format, or a format different from the source's, refuses with a typed
 
 ### 4.1 Closed child environment
 
-Every Git child — source and verification — is spawned from one absolute Git binary path resolved once, with
-`env_clear()` followed by this allowlist and nothing else:
+Every Git child — source and verification — is spawned from one absolute Git binary path resolved once. Its file
+identity (device, inode, size, and modification time) and SHA-256 are recorded at the version probe and rechecked
+before every spawn; a mismatch refuses before the next child starts. Each child starts from `env_clear()` followed
+by this allowlist and nothing else:
 
 - `GIT_OPTIONAL_LOCKS=0`, `GIT_NO_REPLACE_OBJECTS=1`, `GIT_NO_LAZY_FETCH=1`, `GIT_TERMINAL_PROMPT=0`;
 - `GIT_CONFIG_NOSYSTEM=1`, `GIT_CONFIG_GLOBAL=/dev/null`;
@@ -135,8 +165,13 @@ Every Git child — source and verification — is spawned from one absolute Git
 No `GIT_CONFIG_PARAMETERS`, `GIT_CONFIG_COUNT`, askpass, SSH, `GIT_EXEC_PATH`, work-tree, index, namespace, or
 ceiling variable is inherited.
 
-Source children never run against the source's own git directory, so the source's `config`, its includes, and its
-`info/` files are never read. The exporter creates `work/source-git/` with `git init --bare --template=
+Source children never run against the source's own git directory, so the source repository's `config`, its
+includes, and its git-directory `info/` files (attributes, exclude, grafts) and `shallow` file are never read. The one
+deliberate exception is the object stores themselves. For every store named by `GIT_OBJECT_DIRECTORY` or
+`GIT_ALTERNATE_OBJECT_DIRECTORIES`, Git reads that store's own `objects/info/alternates`, `objects/info/packs`,
+commit-graph, and multi-pack-index files as part of object access. The alternates files are covered by the
+capability's recursive identity and content pinning. The other object-store info files can change only how objects
+are found, never object bytes, and §5 proves the exact result. The exporter creates `work/source-git/` with `git init --bare --template=
 --object-format=<format>`, writes nothing else into its config, and points its object lookups at the pinned source
 stores through the environment above. Every child carries:
 
@@ -162,8 +197,11 @@ claim and turns drift into a typed incomplete outcome.
    ledger or per-artifact ceiling plus one byte kills the child and refuses. The file is synced, its length and
    SHA-256 are recorded as the **verified-pack identity**, and it is never rewritten.
 4. `pack-objects` is not run a second time for any purpose. §5 verifies this file, and §6 seals from this file with
-   its recorded length as the source descriptor's declared total; the sealer's plaintext-source receipt SHA-256 and
-   length must equal the verified-pack identity or the export refuses.
+   its recorded length as the source descriptor's declared total. The sealer trait returns only a ciphertext
+   receipt, so the plaintext-source receipt comes from an exporter-owned wrapper. That wrapper feeds every chunk the
+   sealer pulls through a `CustodyEnvelopeSourceValidatorV1` and is finished after `seal()` returns. A sealer that
+   stops early fails `finish`. A finished source receipt whose SHA-256 or length differs from the verified-pack
+   identity refuses the export.
 
 The implementation records the exact argv, Git version, closed environment keys, object format, child status,
 bounded parsed output, and verified-pack identity. Exit status alone is never evidence.
@@ -175,8 +213,11 @@ credentials, source path, sibling path, object cache, promisor configuration, or
 children receive the §4.1 environment without `GIT_OBJECT_DIRECTORY` or `GIT_ALTERNATE_OBJECT_DIRECTORIES`, and
 inherit no source descriptor.
 
-1. **Strict indexing:** feed `work/objects.pack` to `git index-pack --strict --stdin` without `--fix-thin`, then run
-   `git verify-pack -v` on the created index.
+1. **Strict indexing:** stream `work/objects.pack` from its retained descriptor into
+   `git index-pack --strict --stdin` without `--fix-thin`, through an exporter-owned hashing and counting writer.
+   After stdin closes, the verification input's length and SHA-256 must equal the verified-pack identity, or the
+   proof refuses. The bytes that were verified are therefore the recorded bytes, and §4.2 step 4 separately proves
+   the sealed bytes are the recorded bytes. Then run `git verify-pack -v` on the created index.
 2. **Exact inventory:** run `git cat-file --batch-all-objects --batch-check='%(objectname) %(objecttype)'` in
    `verify.git` and parse it into a bounded set. It must equal the manifest inventory exactly: no missing, extra,
    duplicate, or kind-mismatched row. `verify-pack` output is parsed only for its integrity result.
@@ -203,15 +244,29 @@ In that same environment:
 Filesystem effects reuse the existing descriptor-relative primitives in `crates/bridge-core/src/fs_custody.rs`
 (`PinnedDirectoryV1`, `publish_new_regular_child`/`publish_new_regular_child_with_before_rename`,
 `rename_child_no_replace`, `create_new_regular_child_at`, `open_options_create_new_owner_private`,
-`CustodyPublicationV1`, and the existing rename/sync fault countdowns). The new module must not reimplement raw
-custody syscalls. If a required primitive is missing, stop for a reviewed seam amendment rather than adding one
-inside `custody_export.rs`.
+`open_child_no_follow`, `CustodyPublicationV1`, and the existing rename/sync fault countdowns). The new module must
+not reimplement raw custody syscalls.
+
+`fs_custody` has no descriptor-relative directory creation, and `PinnedDirectoryV1` exposes no child-directory handle
+because its directory `File` is private. This task therefore owns exactly one narrow, reviewed addition to
+`fs_custody.rs`: two `PinnedDirectoryV1` methods.
+
+- `create_new_child_directory(name, label) -> PinnedDirectoryV1`: takes a validated single-component name; runs
+  `mkdirat` at mode `0700`, refusing any existing entry; opens the new entry with `open_child_no_follow` plus
+  `O_DIRECTORY`; records identity from the opened descriptor, requiring it to be a directory; and syncs the parent;
+- `open_existing_child_directory(name, label) -> PinnedDirectoryV1`: the same no-follow open and identity capture,
+  without creating anything.
+
+Both methods carry in-module `fs_custody` tests. Any other `fs_custody` change is a stop condition.
 
 Each artifact is sealed into a unique create-new staging name below `capsule/`. The destination sink owns its own
 `CustodyEnvelopeSinkValidatorV1` and admits a chunk to the validator only after that chunk's `write_all` succeeds. After
-the sealer returns, the file is synced and identity-rechecked, and the destination validator is finished. The sealer's
-returned `CustodyEnvelopeSealReceiptV1` must equal the destination receipt in ciphertext length and SHA-256 and carry
-exactly the context's format and recipients; any disagreement refuses. The staging file is then renamed without
+the sealer returns, the file is synced and identity-rechecked, and the destination validator is finished. The exporter
+then constructs the expected `CustodyEnvelopeSealReceiptV1` itself, through the crate-private constructor, from the
+exact context it passed to that `seal()` call and that destination's own ciphertext receipt. The sealer's returned
+receipt must equal the expected one in **every** field: artifact name, manifest digest, format, recipients,
+ciphertext length, and SHA-256. Any disagreement refuses, so a receipt cannot be attributed to another artifact's
+destination. The staging file is then renamed without
 replacement to its reserved logical name, and `capsule/` is synced. `CustodySealedArtifactV1` values come only from
 these cross-checked receipts.
 
@@ -222,6 +277,9 @@ The Git-pack artifact is sealed only after §5 succeeds, from the verified file.
 presence is the only completeness signal; a `capsule/` without a seal is an incomplete capsule by definition.
 
 - A fault at or before the seal rename returns a typed incomplete outcome, and no seal exists.
+- A seal rename whose effect cannot be verified, meaning `CustodyPublicationV1::RenameOutcomeUnverified` where
+  neither the staged source nor the target proves whether the rename happened, returns a distinct
+  `SealPublicationUnverified` outcome. It claims neither a published seal nor an absent one.
 - A fault after the seal rename, such as the final directory sync, returns a distinct
   `PublishedDurabilityUnconfirmed` outcome that names the seal. It is never reported as success and never claimed to
   have left no seal. It maps onto the existing `CustodyPublicationV1` durability/ambiguity classification.
@@ -251,24 +309,43 @@ the fixture is repaired.
 | 2 | manifest and pack omit an unreachable tree's blob child | §5 step 3 closure | missing-object closure refusal |
 | 3 | orphan blob in manifest, dropped from the staged pack | §5 step 2 equality | inventory mismatch |
 | 4 | orphan blob present and valid (positive) | §5 step 4 `--no-dangling` | success; must not refuse |
-| 5 | remove or retarget a pinned alternate or alternates file after capability construction | §4.1 pre/post-spawn recheck | identity drift |
+| 5 | remove or retarget a pinned alternate, or rewrite an alternates file to name an unbound store holding a needed object, after capability construction | §4.1 pre/post-spawn recheck | identity drift; the unbound store contributes no object |
 | 6 | inject one extra packed object | §5 step 2 equality | inventory mismatch |
 | 7 | truncate or corrupt `work/objects.pack` after staging | §5 step 1 strict indexing | strict pack refusal |
-| 8 | promisor pre-refusal bypassed, with a local `file://` promisor holding a sentinel object that the source lacks | `--no-lazy-fetch` / `GIT_NO_LAZY_FETCH` / `protocol.allow=never` | missing object; no fetch observed |
+| 8a | lazy-fetch fixture (below); only `--no-lazy-fetch` active | the `--no-lazy-fetch` flag | missing object; no fetch |
+| 8b | lazy-fetch fixture; only `GIT_NO_LAZY_FETCH=1` active | the environment variable | missing object; no fetch |
+| 8c | lazy-fetch fixture; only `protocol.allow=never` active | the protocol override | missing object; no fetch |
+| 8d | source repository carries promisor config; all three flags above bypassed; mutation copies source remote/extension config into the synthesized git dir | §4.1 synthesis writes no source config | missing object; no fetch |
 | 9 | swap source identity after preflight | §4.1 recheck | identity drift |
 | 10 | destination component replaced by a symlink or a case-fold/path-prefix alias | `fs_custody` no-follow/no-replace | typed publication refusal |
-| 11 | max/max+1 on artifact count, chunk bytes, chunk count, per-artifact ciphertext, the scratch-wide ledger, and pack stdout | §3 ledger and validators | typed budget refusal |
+| 11 | max/max+1 on artifact count, chunk bytes, chunk count, per-artifact ciphertext, the scratch-wide ledger (including each enumerated Git-child reservation), pack stdout, and the canonical manifest encoding | §3 ledger, validators, §2 preflight | typed budget refusal |
 | 12 | each pre-commit fault point | §6 commit point | incomplete outcome; no seal present |
 | 13 | post-seal directory-sync fault | §6 commit point | `PublishedDurabilityUnconfirmed`; seal present |
-| 14 | sealer receipt disagrees with the destination receipt (length, digest, format, or recipients) | §6 cross-check | receipt mismatch |
-| 15 | sealer plaintext receipt digest differs from the verified-pack identity | §4.2 step 4 | pack identity mismatch |
-| 16 | capability generation/inventory differs from the manifest, or a mixed-format manifest | §2 binding / §4 | typed refusal before any write |
-| 17 | historical zero-padded file-mode tree | §5 step 4 | `StrictObjectCheck` refusal |
-| 18 | source object/ref/config/worktree bytes compared before and after a full export | no-mutation guarantee | byte-identical source |
-| 19 | reconnect a source-stream receipt to seal publication | existing provenance compile-fail doctest | that doctest fails |
+| 14 | existing `UnlinkSourceOnly` rename fault plus target-identity ambiguity on the seal rename | §6 unverified-rename arm | `SealPublicationUnverified` |
+| 15 | a fixture sealer returns receipts built from each other's contexts for two differently hashed artifacts; separately, each single receipt field altered | §6 whole-receipt equality | receipt mismatch before any seal |
+| 16 | the sealer reads substituted bytes, or stops early, while sealing the pack | §4.2 step 4 source wrapper | pack identity mismatch or source `finish` refusal |
+| 17 | verify a byte-distinct pack B with the same inventory, then seal the recorded pack A | §5 step 1 verification-input hash | verification input identity mismatch |
+| 18 | capability generation/inventory differs from the manifest, or a mixed-format manifest | §2 binding / §4 | typed refusal before any write |
+| 19 | two captured non-Git streams of equal length exchanged between roles, layout checks bypassed | capability stream binding (class, generation, length, SHA-256) | capability-binding refusal |
+| 20 | historical zero-padded file-mode tree | §5 step 4 | `StrictObjectCheck` refusal |
+| 21 | scratch root placed inside the source git directory, disjointness check disabled | §2 scratch/source disjointness preflight | typed refusal before any write; with the guard disabled, source bytes change |
+| 22 | Git executable replaced at its path after the version probe | §4.1 binary identity recheck | refusal before the next spawn |
+| 23 | pinned root's pathname replaced before nested directory creation | `fs_custody` directory primitive | creation continues only under the retained descriptor; nothing appears in the replacement |
+| 24 | a prohibited external use of each new public or crate-private boundary: forged capability, external sealed-trait implementation, public seal-receipt construction | compile-fail doctests on `src/custody_export.rs` items | that doctest fails when its barrier is widened |
+| 25 | reconnect a source-stream receipt to seal publication | existing provenance compile-fail doctest | that doctest fails |
 
-Control 8 is enabled on a platform only after a probe proves the fixture's lazy fetch succeeds with the guard
-removed. Otherwise it is a named exclusion with that mechanism.
+**Lazy-fetch fixture (8a–8c):** the source object store lacks one manifest object. A test-only promisor remote
+(`extensions.partialClone` plus `remote.p.promisor=true` and `remote.p.url=file://<fixture>`, where the fixture holds
+that object) is injected into the synthesized git directory; that injection is the fixture-level bypass of the 8d
+guard. The capability's promisor pre-refusal is also bypassed. Each
+row leaves exactly one of the three guards active. With that guard active the object stays missing and the export
+refuses. With it removed the lazy fetch succeeds, which the test observes as the object appearing in the fixture's
+source store. Each of 8a–8d is enabled on a platform only after a probe proves that flip. Otherwise it is a named
+exclusion with its mechanism.
+
+**No-mutation observation:** separately from control 21, every real-Git success test compares the source's object,
+ref, config, and worktree bytes before and after the export and requires them to be identical. This is an end-to-end
+observation, not a discriminating control.
 
 Before or with the first dependent 2B2 code change, restore the four dropped 2B1 public negative tests (oversized
 capsule format, oversized selected-artifact length, duplicate index names, and an empty index) in
@@ -287,17 +364,22 @@ existing `#[path = "..._tests.rs"] mod tests;` convention. An external integrati
 no feature may be added to expose them.
 
 - `crates/bridge-core/src/custody_export.rs` — new effect boundary, capture capability, destination sink, Git runner,
-  and isolated closure proof;
+  and isolated closure proof. Control 24's compile-fail doctests live on its public items; rustdoc does not run
+  doctests from `tests/` targets;
 - `crates/bridge-core/src/custody_export_tests.rs` — in-crate real-Git fixtures, the `#[cfg(test)]` deterministic
-  fixture sealer and capture constructor, fault injection, and controls 1–18;
-- `crates/bridge-core/tests/custody_export.rs` — public-API refusals and compile-fail doctests only; no real-Git
+  fixture sealer and capture constructor, fault injection, and controls 1–22;
+- `crates/bridge-core/tests/custody_export.rs` — runtime public-API refusal tests only; no doctests and no real-Git
   success path;
 - `crates/bridge-core/src/custody_capsule.rs` — only: change `mod sealed` to `pub(crate) mod sealed` so
   `custody_export` can implement the source/sink traits, minimal crate-private accessors, and the deferred 2B1
   compile-fail/unit controls;
 - `crates/bridge-core/tests/custody_capsule.rs` — restoration of the four dropped 2B1 public negatives only;
 - `crates/bridge-core/src/lib.rs` — module export only;
-- `crates/bridge-core/src/fs_custody.rs` — read-only dependency; editing it is a stop condition (§10);
+- `crates/bridge-core/src/fs_custody.rs` — only the two §6 `PinnedDirectoryV1` directory methods and their
+  in-module tests (control 23); any other edit is a stop condition (§10);
+- `crates/bridge-core/src/custody_seal.rs` — only crate-private read-only accessors for the manifest's `unit_id`,
+  `run_id`, `materialization_id`, and `generation_id`, and for `CustodyOriginalObjectV1` `format` and `object_id`, with
+  focused unit tests; no validation or wire change;
 - `docs/superpowers/reviews/2026-09-23-adr0041-slice2b2-implementation-handoff.md` — evidence and lane handoff;
 - this task, the Slice 2B planning handoff, and the reliability roadmap — status reconciliation only.
 
@@ -310,7 +392,10 @@ Run directly and report exact totals:
 
 ```text
 cargo test --locked --offline -p bridge-core --lib custody_export
+cargo test --locked --offline -p bridge-core --doc custody_export
 cargo test --locked --offline -p bridge-core --test custody_export
+cargo test --locked --offline -p bridge-core --lib fs_custody
+cargo test --locked --offline -p bridge-core --lib custody_seal
 cargo test --locked --offline -p bridge-core --lib custody_capsule
 cargo test --locked --offline -p bridge-core --test custody_capsule
 cargo test --locked --offline -p bridge-core
@@ -325,7 +410,8 @@ cargo run --locked --offline -p a2a-bridge -- validate --repo-hygiene
 
 Run real-Git fixtures on host macOS and on a native Linux ext4 filesystem. The GitHub Actions ubuntu runner is the
 named ext4 lane; it previously caught inode reuse that both macOS/APFS and the implement container's overlayfs
-missed. Overlayfs does not substitute for the native identity-drift control. Record the Git version in each lane.
+missed. The runner label alone is not evidence. The fixture records the scratch filesystem type via `statfs` and
+admits the lane as ext4 only when the magic is `0xEF53`. Any other type is a named exclusion with the observed type. Overlayfs does not substitute for the native identity-drift control. Record the Git version in each lane.
 Before attributing any failure, run exact predecessor `5e431f4f` in the same environment. Name every exclusion and
 its mechanism; an unrunnable gate is not green.
 
@@ -344,7 +430,7 @@ Stop for spec/design review if:
 - the minimum Git version cannot honor §4.1;
 - a new dependency or archive/crypto format is required;
 - production non-Git framing becomes necessary;
-- an `fs_custody` primitive must be added or changed;
+- an `fs_custody` change is needed beyond the two §6 directory methods;
 - the scratch-wide ledger cannot account for a Git child's writes;
 - the diff escapes the owned paths.
 
@@ -408,3 +494,28 @@ the Linux lane still apply.
 | S8 | SMELL | identity recheck only before spawn | §4.1 post-exit recheck with rationale |
 | S9 | SMELL | strict fsck rejection of legitimate history would surface as generic ambiguity | §5 `StrictObjectCheck`; control 17 |
 | S10 | SMELL | Linux lane unnamed | §9 GitHub Actions ubuntu ext4 lane |
+
+## 13. Revision 3 — independent review round 1 fold (2026-09-24)
+
+Round 1 of 2 was a host Codex `gpt-5.6-sol`/`xhigh`/read-only turn on revision 2 at `1c22d0d0`. Its verdict was
+**REJECT** with 5 WRONG / 9 SMELL (BLOCKER 5 / DEFER 9). The full record is
+`docs/superpowers/reviews/2026-09-24-adr0041-slice2b2-spec-review-round1.md`. The findings form a closed, enumerable
+population, and each names a bounded fix, so all 14 are folded on this artifact. Every WRONG was checked against the
+source before folding.
+
+| ID | Finding | Fold |
+|---|---|---|
+| W1 | `fs_custody` cannot create or open child directories from a retained descriptor; the private `PinnedDirectoryV1` handle blocks nested `capsule/` and `work/` creation | §2, §6 two directory methods; §8 ownership; control 23 |
+| W2 | the receipt cross-check omitted artifact name and manifest digest, so swapped contexts would pass | §6 whole-receipt equality against an exporter-built expected receipt; control 15 |
+| W3 | the bytes streamed to `index-pack` were not bound to the recorded pack identity | §5 step 1 verification-input hash; control 17 |
+| W4 | compile-fail doctests were placed in a `tests/` target, which rustdoc never runs | §8 doctests on `src/custody_export.rs`; §9 `--doc` gate; control 24 |
+| W5 | the lazy-fetch control named three layered guards, and the no-mutation control named none | §7 controls 8a–8d with a test-only promisor fixture; control 21 plus §2 disjointness preflight; the observation kept separate |
+| S1 | unverified seal rename outcome missing | §6 `SealPublicationUnverified`; control 14 |
+| S2 | manifest identity/object accessors absent | §2, §8 crate-private `custody_seal` accessors |
+| S3 | ledger imprecise for Git-owned writes | §3 logical-byte ledger, enumerated per-child upper bounds, post-exit re-measure |
+| S4 | object-store `info/` reads contradicted "never read" | §4.1 deliberate object-store exception |
+| S5 | plaintext receipt source unnamed | §4.2 step 4 exporter-owned source wrapper; control 16 |
+| S6 | no role-replay control | control 19 |
+| S7 | ext4 lane unverified | §9 `statfs` magic admission |
+| S8 | Git binary path-pinned only | §4.1 identity and SHA-256 recheck; control 22 |
+| S9 | canonical-manifest ceiling after the allocating `derive` | §2 bounded preflight; control 11 |
