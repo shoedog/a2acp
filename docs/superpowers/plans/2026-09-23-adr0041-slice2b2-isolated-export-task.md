@@ -3,10 +3,11 @@ task-type: implement
 ---
 # ADR-0041 Slice 2B2 — isolated local export and Git-object closure
 
-**Status:** review candidate, revision 6; planning/documentation only. Implementation is not authorized by this file.
-Revision 5 applied the owner's 2026-09-24 threat-model ruling (§2.1, §15). The owner-approved extension round 3
-rejected revision 5 with 6 WRONG / 2 SMELL, a closed population of wording and test-coverage defects. Revision 6
-folds all eight (§16). No further review round runs without owner direction.
+**Status:** revision 7, **split**; planning/documentation only. Implementation is not authorized by this file. On
+2026-09-24 the owner chose to split the descriptor seam and hardened Git runner out into child **2B2a**
+(`docs/superpowers/plans/2026-09-24-adr0041-slice2b2a-git-runner-seam-task.md`). This task now owns only the exporter, capture binding, pack production, closure proof, ledger, sealing, and
+publication, built on 2B2a's API (§17). 2B2 review resumes only after 2B2a is approved, as a new two-round cap scoped
+to the post-split artifact. That cap is disclosed here as a consequence of the owner-approved split.
 
 - Revision 2 folded a pre-review audit (§12). The owner approved revision 2 and the §3 2B2b framing amendment on
   2026-09-24.
@@ -18,7 +19,8 @@ folds all eight (§16). No further review round runs without owner direction.
 - On 2026-09-24 the owner ruled a hostile same-user check-to-use racer **out of scope** (§14 option A). Revision 5
   applies that ruling.
 
-**Exact predecessor:** `5e431f4f2dd6f77c66d64fa28dc48054f396edf9` (`origin/main`, PR #105 merge).
+**Exact predecessor:** the 2B2a merge commit, to be bound when 2B2a lands. The planning base is
+`5e431f4f2dd6f77c66d64fa28dc48054f396edf9` (`origin/main`, PR #105 merge).
 
 **Reviewed 2B1 content:** `88013eb4408d5afecb0b9101ef43c9c398226ef5`; final review
 `exec-e7ee36345656679aec8923c4be9d25b6` / `attempt-86036c5afb97c003d9f62bb2fc0c9163`, APPROVE with
@@ -84,18 +86,12 @@ The scratch root has exactly two top-level children, both created by the exporte
 - `work/` — the plaintext Git-pack staging file, the verification object database, the private `HOME`/XDG
   directories, and the synthesized Git directory from §4. Nothing under `work/` is a capsule member.
 
-Every regular file the exporter itself creates — `work/objects.pack`, capsule staging files, and the seal staging
-file — is created by the §6 `create_new_regular_child` method on a retained parent descriptor, never by pathname.
-Every directory the exporter itself creates — `capsule/`, `work/`, the nested `control/`, `git/`, and `payload/`
-directories, and the `HOME`/XDG directories — is created with the descriptor-relative directory primitive added to
-`fs_custody` (§6) beneath a retained parent descriptor, never by pathname. Git creates the interior of the git
-directories it initializes under `work/`. Every Git child is **rooted** at the retained `work/` descriptor: its
-working directory is set by the §6 `root_command` method, which calls `fchdir` on that descriptor in the child after
-`fork` and before `exec`. Every internal path the child receives is **relative** to that root, including `GIT_DIR`,
-the init target, `HOME`, and `XDG_CONFIG_HOME`. A swap of any ancestor pathname therefore cannot redirect the child's
-writes. The one exception is an environment variable that Git requires to be absolute; the implementation-time probe
-must identify any such variable, and it becomes honest limit HL1 covered by the post-exit recheck. The caller never
-supplies any of these paths.
+Every regular file and directory the exporter itself creates is created through the 2B2a `PinnedDirectoryV1` methods
+(`create_new_regular_child`, `create_new_child_directory`) on a retained parent descriptor, never by pathname. This
+covers `work/objects.pack`, capsule staging files, the seal staging file, `capsule/`, `work/`, the nested `control/`,
+`git/`, and `payload/` directories, and the `HOME`/XDG directories. Every Git child runs through the 2B2a runner,
+rooted at the retained `work/` descriptor with relative internal paths. The caller never supplies any of these
+paths.
 
 The exporter never deletes anything, including its own `work/` contents; a completed or failed run leaves `work/`
 as inert, typed scratch evidence. Plaintext in `work/` is acceptable only because 2B2 makes no confidentiality claim
@@ -184,72 +180,32 @@ observed. Shallow/grafted state or an unresolved promisor boundary refuses befor
 preserved as manifest evidence but never applied while packing or verifying. A manifest whose objects use more than
 one object format, or a format different from the source's, refuses with a typed error before any spawn.
 
-### 4.1 Closed child environment
+### 4.1 Git children through the 2B2a runner
 
-Every Git child — source and verification — is spawned from one admitted absolute Git binary path, resolved once in
-two phases.
+Every Git child runs through the 2B2a `custody_git` runner. The runner owns route admission, the closed environment
+and flags, the closed `GitCommandV1` set, rooted spawning, bounded I/O and deadline, and the binary rechecks. 2B2
+neither reimplements nor extends any of these. 2B2 supplies only four things:
 
-1. **Bootstrap discovery.** A candidate absolute path is metadata-checked against the route rule below; on macOS the
-   candidate may be the `xcrun` trampoline `/usr/bin/git`. That candidate is used for exactly one discovery child,
-   `<candidate> --exec-path`. The discovery child runs with the §4.1 closed environment and is rooted at an empty
-   `work/probe/` directory. It inherits no source or scratch descriptor, receives no source path, and its stdout is
-   bounded.
-2. **Admission.** The exporter derives `<exec-path>/git`, canonicalizes it, and applies the route rule to that
-   target. The target must be a fixed point: its own `--exec-path` must map back to the same file identity. The
-   **target** is admitted, never the candidate. This handles the macOS trampoline, which hashes nothing useful because
-   it execs a binary chosen by developer-directory state, and it is uniform on Linux. The candidate and the target
-   are both recorded as evidence. Only the admitted target runs the version probe or any functional or source-bearing
-   child.
+- the `GitCommandV1` variant and its relative names;
+- a `GitObjectStoreRouteV1` built from the capability's pinned primary store and recursive alternate chain, for
+  source children only;
+- stdin, stdout, and stderr bounds that reserve against the §3 ledger, plus a deadline;
+- pre-spawn and post-exit callbacks that revalidate the source and alternate identities, every alternates-file
+  content hash, and the scratch-root and `work/` identities.
 
-The route rule requires all of these:
-
-- the final component is a regular file, not a symlink;
-- the file and every ancestor directory of its canonical path are owned by root (uid 0) **and** deny write access to
-  the executing user, checked with `faccessat(..., W_OK, AT_EACCESS)` so groups and ACLs count;
-- the exporter itself does not run as uid 0.
-
-A user-owned route, such as a Homebrew symlink, and any writable component are refused with a typed route refusal.
-
-Because an admitted route is root-owned and not writable by the executing user, no in-scope actor can swap it between
-the recheck and `exec`. The file identity (device, inode, size, and modification time) and SHA-256 are recorded at
-admission and rechecked **both before every spawn and after every child exits**. A mismatch before a spawn refuses
-before the child starts. A mismatch after a child exits is a typed incomplete outcome that blocks the seal, so an
-accidental privileged replacement during the final child is detected. A privileged replace-and-restore entirely
-within one child's window is honest limit HL3. Each child starts from `env_clear()` followed by this allowlist and
-nothing else:
-
-- `GIT_OPTIONAL_LOCKS=0`, `GIT_NO_REPLACE_OBJECTS=1`, `GIT_NO_LAZY_FETCH=1`, `GIT_TERMINAL_PROMPT=0`;
-- `GIT_CONFIG_NOSYSTEM=1`, `GIT_CONFIG_GLOBAL=/dev/null`;
-- `HOME` and `XDG_CONFIG_HOME` set to empty directories under `work/`;
-- the synthesized `GIT_DIR`, and for source children `GIT_OBJECT_DIRECTORY` plus
-  `GIT_ALTERNATE_OBJECT_DIRECTORIES` naming exactly the capability's pinned stores;
-- a fixed minimal `PATH` and locale, recorded in evidence.
-
-No `GIT_CONFIG_PARAMETERS`, `GIT_CONFIG_COUNT`, askpass, SSH, `GIT_EXEC_PATH`, work-tree, index, namespace, or
-ceiling variable is inherited.
+A callback failure, or a runner `BinaryDrift` outcome, is a typed incomplete outcome that blocks the seal.
 
 Source children never run against the source's own git directory, so the source repository's `config`, its
 includes, and its git-directory `info/` files (attributes, exclude, grafts) and `shallow` file are never read. The one
-deliberate exception is the object stores themselves. For every store named by `GIT_OBJECT_DIRECTORY` or
-`GIT_ALTERNATE_OBJECT_DIRECTORIES`, Git reads that store's own `objects/info/alternates`, `objects/info/packs`,
-commit-graph, and multi-pack-index files as part of object access. The alternates files are covered by the
-capability's recursive identity and content pinning. The other object-store info files can change only how objects
-are found, never object bytes, and §5 proves the exact result. The exporter creates `work/source-git/` with `git init --bare --template=
---object-format=<format>`, writes nothing else into its config, and points its object lookups at the pinned source
-stores through the environment above. Every child carries:
+deliberate exception is the object stores themselves. For every store in the object-store route, Git reads that
+store's own `objects/info/alternates`, `objects/info/packs`, commit-graph, and multi-pack-index files as part of object
+access. The alternates files are covered by the capability's recursive identity and content pinning. The other
+object-store info files can change only how objects are found, never object bytes, and §5 proves the exact result.
 
-```text
-git --no-optional-locks --no-replace-objects --no-lazy-fetch \
-  -c core.hooksPath=/dev/null -c core.fsmonitor=false -c protocol.allow=never \
-  <subcommand> ...
-```
-
-Before the first spawn the exporter runs `git version`, requires a pinned minimum version that honors every flag and
-variable above (confirmed by a probe at implementation time and recorded), and parks otherwise. The source and
-alternate identities, including every alternates-file content hash, are revalidated immediately before each spawn
-and again after each child exits. Because Git objects are content-addressed and §5 proves the exact inventory and
-closure, a store swap cannot corrupt the pack's integrity; the post-exit recheck protects the generation/quiescence
-claim and turns drift into a typed incomplete outcome.
+The exporter creates `work/source-git/` with the runner's `InitBare` command and writes nothing else into its config.
+Because Git objects are content-addressed and §5 proves the exact inventory and closure, a store swap cannot corrupt
+the pack's integrity. The post-exit callback protects the generation/quiescence claim and turns drift into a typed
+incomplete outcome. The residual windows are 2B2a honest limits HL1–HL3.
 
 ### 4.2 Pack production — exactly once
 
@@ -304,42 +260,10 @@ In that same environment:
 
 ## 6. Publication order, sink ownership, and commit point
 
-Filesystem effects reuse the existing descriptor-relative primitives in `crates/bridge-core/src/fs_custody.rs`
+Filesystem effects use the existing descriptor-relative primitives in `crates/bridge-core/src/fs_custody.rs`
 (`PinnedDirectoryV1`, `publish_new_regular_child`/`publish_new_regular_child_with_before_rename`,
-`rename_child_no_replace`, `create_new_regular_child_at`, `open_options_create_new_owner_private`,
-`open_child_no_follow`, `CustodyPublicationV1`, and the existing rename/sync fault countdowns). The new module must
-not reimplement raw custody syscalls.
-
-`fs_custody` has no descriptor-relative directory creation, and `PinnedDirectoryV1` exposes neither a child-directory
-handle nor a create-new regular-child method, because its directory `File` is private and it only opens existing
-regular children. This task therefore owns exactly one narrow, reviewed addition to `fs_custody.rs`: four
-`PinnedDirectoryV1` methods.
-
-- `create_new_child_directory(name, label) -> PinnedDirectoryV1`: takes a validated single-component name; runs
-  `mkdirat` at mode `0700`, refusing any existing entry; opens the new entry with `open_child_no_follow` plus
-  `O_DIRECTORY`; and records identity from the opened descriptor, requiring it to be a directory. It then detects
-  substitution with three guards:
-  - **emptiness:** enumerating a duplicated descriptor yields no entry other than `.` and `..`;
-  - **owner and mode:** the directory is owned by the effective user with mode `0700`;
-  - **parent-entry identity:** a no-follow `fstatat` of the name in the parent returns the opened identity.
-
-  No literal link count is required, because link counts are a convention some filesystems do not follow. Any
-  mismatch is a typed refusal. The method finally syncs the parent. An identical substitution is honest limit HL2;
-- `open_existing_child_directory(name, label) -> PinnedDirectoryV1`: the same no-follow open and identity capture,
-  without creating anything;
-- `create_new_regular_child(name, label) -> File`: wraps the existing `create_new_regular_child_at` on the retained
-  descriptor, creating an owner-private file that refuses an existing entry and follows no link;
-- `root_command(&self, command: &mut std::process::Command) -> Result<(), FsCustodyError>`: duplicates the retained
-  descriptor with `try_clone`, which keeps `O_CLOEXEC`. It moves that **owned** duplicate into a `pre_exec` closure
-  that calls `fchdir` on it and fails the spawn if `fchdir` fails. Because the command owns the descriptor, dropping
-  the pin or reusing a descriptor number cannot misroot a later spawn. `fchdir` is async-signal-safe. `O_CLOEXEC`
-  closes the duplicate only at a successful `exec`, after `fchdir`, so Git does not inherit it. A duplication failure
-  is returned as a typed error.
-
-All four carry in-module `fs_custody` tests. Any other `fs_custody` change is a stop condition. The `unsafe` code this
-task authorizes is exactly three audited boundaries, each with a safety comment: descriptor-relative `mkdirat`,
-directory enumeration on a duplicated descriptor (`fdopendir`/`readdir`) for the emptiness guard, and the `pre_exec`
-`fchdir` closure.
+`rename_child_no_replace`, `open_child_no_follow`, `CustodyPublicationV1`, and the existing rename/sync fault
+countdowns) plus the four methods 2B2a adds. 2B2 changes neither `fs_custody.rs` nor `custody_git.rs`.
 
 Each artifact is sealed into a unique create-new staging name below `capsule/`. The destination sink owns its own
 `CustodyEnvelopeSinkValidatorV1` and admits a chunk to the validator only after that chunk's `write_all` succeeds. After
@@ -380,7 +304,7 @@ not exhaustively.
 
 ## 7. Required RED and behavioral controls
 
-Capture structural RED on exact predecessor `5e431f4f` before production code. Once the seam compiles, each control
+Capture structural RED on the exact 2B2a merge predecessor before production code. Once the seam compiles, each control
 names the single guard it mutates and the typed refusal it expects. It must fail on that compiling targeted mutation
 and pass after restoration. Where defenses are layered, the fixture bypasses the outer layers so the mutation is the
 only thing between the fixture and a wrong success. A mutation that does not flip its control is inadmissible until
@@ -392,14 +316,10 @@ the fixture is repaired.
 | 2 | manifest and pack omit an unreachable tree's blob child | §5 step 3 closure | missing-object closure refusal |
 | 3 | orphan blob in manifest, dropped from the staged pack | §5 step 2 equality | inventory mismatch |
 | 4 | orphan blob present and valid (positive) | §5 step 4 `--no-dangling` | success; must not refuse |
-| 5 | remove or retarget a pinned alternate, or rewrite an alternates file to name an unbound store holding a needed object, after capability construction | §4.1 pre/post-spawn recheck | identity drift; the unbound store contributes no object |
+| 5 | remove or retarget a pinned alternate, or rewrite an alternates file to name an unbound store holding a needed object, after capability construction | §4.1 pre-spawn/post-exit callbacks | identity drift; the unbound store contributes no object |
 | 6 | inject one extra packed object | §5 step 2 equality | inventory mismatch |
 | 7 | truncate or corrupt `work/objects.pack` after staging | §5 step 1 strict indexing | strict pack refusal |
-| 8a | lazy-fetch fixture (below); only `--no-lazy-fetch` active | the `--no-lazy-fetch` flag | missing object; no fetch |
-| 8b | lazy-fetch fixture; only `GIT_NO_LAZY_FETCH=1` active | the environment variable | missing object; no fetch |
-| 8c | lazy-fetch fixture; only `protocol.allow=never` active | the protocol override | missing object; no fetch |
-| 8d | source repository carries promisor config; all three flags above bypassed; mutation copies source remote/extension config into the synthesized git dir | §4.1 synthesis writes no source config | missing object; no fetch |
-| 9 | swap source identity after preflight | §4.1 recheck | identity drift |
+| 9 | swap source identity after preflight | §4.1 callbacks | identity drift |
 | 10 | destination component replaced by a symlink or a case-fold/path-prefix alias | `fs_custody` no-follow/no-replace | typed publication refusal |
 | 11 | max/max+1 on artifact count, chunk bytes, chunk count, per-artifact ciphertext, the scratch-wide ledger (including each enumerated Git-child reservation), pack stdout, and the canonical manifest encoding. For the manifest, a crate-private call-counter seam also proves `CustodyCapsuleLayoutV1::derive` is never entered after an over-limit preflight; swapping preflight and derive must turn it red | §3 ledger, validators, §2 preflight ordering | typed budget refusal; derive not entered |
 | 12 | each pre-commit fault point, excluding any seal rename whose effect cannot be verified (control 14) | §6 commit point | incomplete outcome; no seal present |
@@ -412,33 +332,11 @@ the fixture is repaired.
 | 19 | two captured non-Git streams of equal length exchanged between roles, layout checks bypassed | capability stream binding (class, generation, length, SHA-256) | capability-binding refusal |
 | 20 | historical zero-padded file-mode tree | §5 step 4 | `StrictObjectCheck` refusal |
 | 21 | scratch root placed inside the source git directory, disjointness check disabled | §2 scratch/source disjointness preflight | typed refusal before any write; with the guard disabled, source bytes change |
-| 22 | Git executable replaced at its path after the version probe | §4.1 binary identity recheck | refusal before the next spawn |
-| 23 | pinned root's pathname replaced before nested directory creation and before staging-file creation | `fs_custody` directory and regular-child methods | creation continues only under the retained descriptor; nothing appears in the replacement |
 | 24 | a prohibited external use of each new public or crate-private boundary: forged capability, external sealed-trait implementation, public seal-receipt construction | compile-fail doctests on `src/custody_export.rs` items | that doctest fails when its barrier is widened |
 | 25 | reconnect a source-stream receipt to seal publication | existing provenance compile-fail doctest | that doctest fails |
-| 26 | a deterministic hook after the last parent-side recheck swaps `work/`'s pathname for a replacement directory before spawn | `root_command` rooting with relative internal paths | the child writes only under the retained `work/`; the replacement and the source are unchanged; the post-exit recheck reports drift |
-| 27a | a hook between `mkdirat` and open exchanges the new child for a non-empty directory | the emptiness guard | typed refusal; no pin |
-| 27b | a hook between `mkdirat` and open exchanges the new child for an empty directory with another mode; the owner arm is covered by an injected-metadata unit test | the owner and mode guard | typed refusal; no pin |
-| 27c | a hook after open and before `fstatat` renames the opened empty `0700` directory aside and installs an identical one at the name | the parent-entry identity guard | typed refusal; with the guard removed the method returns a pin to the detached directory |
-| 27d | an injected-metadata seam reports link count 1 for a genuinely empty exporter-created directory (positive) | no literal link-count requirement | success |
-| 28 | route-rule table: root-owned file with a mode-`0777` component; user-owned mode-`0555` file; user-owned Homebrew-style symlink; ACL-granted write; exporter running as uid 0; standard root-owned Linux `/usr/bin/git` (positive) | §4.1 route rule | typed route refusal before any functional spawn; the positive case is admitted |
-| 28a | a fake trampoline whose `--exec-path` names a distinct admitted target | §4.1 two-phase admission | only the discovery child runs the candidate; every functional argv uses the admitted target; a target that is not a fixed point refuses |
-| 28b | a test-admitted route replaced by an `exit 0` executable after the last pre-spawn recheck of the final child | §4.1 post-exit binary recheck | typed incomplete outcome; no seal |
-| 29 | admission-classifier table: `0xEF53` with a matching-device `ext4` entry (admit); a matching `ext2` or `ext3` entry; a wrong device; duplicate or ambiguous matches; malformed `mountinfo` | §9 ext4 admission | named exclusion for every non-admit row; deleting the fstype comparison turns the `ext3` row red |
 
-**Lazy-fetch fixture (8a–8c):** the source object store lacks one manifest object. A test-only promisor remote
-(`extensions.partialClone` plus `remote.p.promisor=true` and `remote.p.url=file://<fixture>`, where the fixture holds
-that object) is injected into the synthesized git directory; that injection is the fixture-level bypass of the 8d
-guard. The capability's promisor pre-refusal is also bypassed. Each
-row leaves exactly one of the three guards active. With that guard active the object stays missing and the export
-refuses. With it removed the lazy fetch succeeds, which the test observes as the object appearing in the fixture's
-source store. Each of 8a–8d is enabled on a platform only after a probe proves that flip. Otherwise it is a named
-exclusion with its mechanism.
-
-Because the guard-removed arm writes the fetched object into the fixture's source store, every arm of every 8a–8d row
-starts from a fresh disposable source store copied from one immutable template. The harness asserts that the missing
-object is absent before each arm and that the template's content hash is unchanged afterwards. Row order is
-randomized, and a reused or contaminated store is rejected as an inadmissible precondition.
+Controls 8a–8d, 22, 23, 26, 27a–27d, 28, 28a, 28b, and 29 moved to 2B2a as A1–A12. Their numbers are retired here
+and not reused.
 
 **No-mutation observation:** separately from control 21, every real-Git success test compares the source's object,
 ref, config, and worktree bytes before and after the export and requires them to be identical. This is an end-to-end
@@ -460,11 +358,11 @@ the real-Git, fault-injection, and fixture-sealer tests are **in-crate** `#[cfg(
 existing `#[path = "..._tests.rs"] mod tests;` convention. An external integration-test crate cannot reach them, and
 no feature may be added to expose them.
 
-- `crates/bridge-core/src/custody_export.rs` — new effect boundary, capture capability, destination sink, Git runner,
-  and isolated closure proof. Control 24's compile-fail doctests live on its public items; rustdoc does not run
+- `crates/bridge-core/src/custody_export.rs` — new effect boundary, capture capability, destination sink, runner
+  callbacks, and isolated closure proof. Control 24's compile-fail doctests live on its public items; rustdoc does not run
   doctests from `tests/` targets;
 - `crates/bridge-core/src/custody_export_tests.rs` — in-crate real-Git fixtures, the `#[cfg(test)]` deterministic
-  fixture sealer and capture constructor, fault injection, and controls 1–22, 28–28b, and 29;
+  fixture sealer and capture constructor, fault injection, and controls 1–21 (retired numbers excluded);
 - `crates/bridge-core/tests/custody_export.rs` — runtime public-API refusal tests only; no doctests and no real-Git
   success path;
 - `crates/bridge-core/src/custody_capsule.rs` — only: change `mod sealed` to `pub(crate) mod sealed` so
@@ -472,8 +370,8 @@ no feature may be added to expose them.
   compile-fail/unit controls;
 - `crates/bridge-core/tests/custody_capsule.rs` — restoration of the four dropped 2B1 public negatives only;
 - `crates/bridge-core/src/lib.rs` — module export only;
-- `crates/bridge-core/src/fs_custody.rs` — only the four §6 `PinnedDirectoryV1` methods and their in-module tests
-  (controls 23, 26, and 27a–27d); any other edit is a stop condition (§10);
+- `crates/bridge-core/src/fs_custody.rs` and `crates/bridge-core/src/custody_git.rs` — read-only 2B2a dependencies;
+  any edit is a stop condition (§10);
 - `crates/bridge-core/src/custody_seal.rs` — only crate-private read-only accessors for the manifest's `unit_id`,
   `run_id`, `materialization_id`, and `generation_id`, and for `CustodyOriginalObjectV1` `format` and `object_id`, with
   focused unit tests; no validation or wire change;
@@ -491,7 +389,6 @@ Run directly and report exact totals:
 cargo test --locked --offline -p bridge-core --lib custody_export
 cargo test --locked --offline -p bridge-core --doc custody_export
 cargo test --locked --offline -p bridge-core --test custody_export
-cargo test --locked --offline -p bridge-core --lib fs_custody
 cargo test --locked --offline -p bridge-core --lib custody_seal
 cargo test --locked --offline -p bridge-core --lib custody_capsule
 cargo test --locked --offline -p bridge-core --test custody_capsule
@@ -505,20 +402,11 @@ cargo deny check
 cargo run --locked --offline -p a2a-bridge -- validate --repo-hygiene
 ```
 
-Run real-Git fixtures on host macOS and on a native Linux ext4 filesystem. The GitHub Actions ubuntu runner is the
-named ext4 lane; it previously caught inode reuse that both macOS/APFS and the implement container's overlayfs
-missed. The runner label alone is not evidence, and `fstatfs` magic `0xEF53` alone covers the whole ext family.
-
-The fixture admits the lane as ext4 only when both of these hold:
-
-- `fstatfs` on the retained scratch descriptor reports `0xEF53`;
-- the `/proc/self/mountinfo` entry whose `major:minor` equals the descriptor's `st_dev` reports filesystem type
-  `ext4`.
-
-Anything else, including ext2 or ext3, is a named exclusion recording the observed values. Control 29 tests this
-classifier. Overlayfs does not substitute for the native identity-drift control. Record the Git version in each lane.
-Before attributing any failure, run exact predecessor `5e431f4f` in the same environment. Name every exclusion and
-its mechanism; an unrunnable gate is not green.
+Run real-Git fixtures on host macOS and on a native Linux ext4 lane, the GitHub Actions ubuntu runner. The lane is
+admitted by 2B2a's `#[cfg(test)]` ext4 classifier (2B2a §7, control A12). Overlayfs does not substitute for the
+native identity-drift control. Record the Git version and admitted route in each lane. Before attributing any
+failure, run the exact predecessor in the same environment. Name every exclusion and its mechanism; an unrunnable gate
+is not green.
 
 Declare a two-admitted-round hard-read-only review cap before implementation review. Report WRONG before SMELL.
 Repair a closed enumerable rejected population on the same artifact; park an open-class population or any exhausted
@@ -532,24 +420,17 @@ Stop for spec/design review if:
 - a subprocess needs a caller-supplied bare path;
 - exact pack/manifest equality or all-object closure cannot be proved;
 - the isolation control retains any source/alternate/cache/credential/network route;
-- the minimum Git version cannot honor §4.1;
+- the 2B2a runner cannot express a required Git step with its closed `GitCommandV1` set;
 - a new dependency or archive/crypto format is required;
 - production non-Git framing becomes necessary;
-- an `fs_custody` change is needed beyond the four §6 methods;
+- any change to `fs_custody.rs` or to 2B2a's API is needed (return it to 2B2a);
 - the scratch-wide ledger cannot account for a Git child's writes;
 - the diff escapes the owned paths.
 
-Next action: **owner direction on revision 6** (§16). The two-round cap and the one-round extension are both
-exhausted. Choose one:
-
-- authorize a narrow delta-only round 4 on the revision-6 changes;
-- authorize implementation with the revision 5–6 changes carried as explicit first-review focus items for the
-  implementation review;
-- split the slice before implementation.
-
-Implementation stays unauthorized until one of these is chosen. Only a separately authorized, approved task may begin 2B2
-implementation. Review approval does not authorize push, merge, cleanup, 2B3 restore, remote/provider effects, or
-running-operator mutation.
+Next action: complete 2B2a first. After 2B2a is approved and merged, review this revision-7 task under a new
+two-round cap scoped to the post-split exporter, bound to the 2B2a merge. Only a separately authorized, approved task
+may begin 2B2 implementation. Review approval does not authorize push, merge, cleanup, 2B3 restore,
+remote/provider effects, or running-operator mutation.
 
 ## 11. Source references
 
@@ -558,6 +439,7 @@ running-operator mutation.
 - `docs/superpowers/reviews/2026-09-20-adr0041-slice2b1-implementation-handoff.md`
 - `docs/adr/0041-durable-custody-local-clone-lifecycle.md`, especially §§4, 8, 9, 14, and 17
 - `crates/bridge-core/src/fs_custody.rs` (reused publication primitives)
+- `docs/superpowers/plans/2026-09-24-adr0041-slice2b2a-git-runner-seam-task.md` (the 2B2a seam and runner this task depends on)
 
 ## 12. Revision 2 — pre-review audit fold (2026-09-24)
 
@@ -730,3 +612,20 @@ defects in text written to fix the round before them. That pattern suggests dimi
 rounds relative to implementation review. It is also consistent with the slice being too large to converge within a
 two-round cap: about 730 lines, 37 controls, a Git runner, an `fs_custody` seam, and the exporter. §10 lists the
 choices.
+
+## 17. Revision 7 — split into 2B2a and 2B2 (2026-09-24)
+
+The owner chose §16 option 1, splitting the slice.
+
+**Moved to 2B2a** (`docs/superpowers/plans/2026-09-24-adr0041-slice2b2a-git-runner-seam-task.md`): the `fs_custody` `PinnedDirectoryV1` methods, and the Git route admission, closed
+environment, flags, rooting, rechecks, bounded I/O, and deadline. The corresponding controls moved as A1–A12.
+
+**Kept in 2B2:** the capture capability and manifest binding, the disjointness preflight, the scratch-wide ledger,
+single pack production, the isolated closure proof, sink ownership and whole-receipt equality, the commit point, and
+publication.
+
+**Historical sections:** §§12–16 are kept for provenance. Where they describe `fs_custody` methods, route rules, or
+controls now owned by 2B2a, 2B2a's text is authoritative.
+
+**Why the split:** review rounds 2 and 3 concentrated nearly all their defects in the moved seam, while the content
+kept here has held since revision 3. Splitting lets the seam converge under its own cap.
