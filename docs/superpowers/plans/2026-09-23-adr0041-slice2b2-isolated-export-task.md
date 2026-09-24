@@ -3,10 +3,16 @@ task-type: implement
 ---
 # ADR-0041 Slice 2B2 — isolated local export and Git-object closure
 
-**Status:** review candidate, revision 3; planning/documentation only. Implementation is not authorized by this
-file. Revision 2 folded a pre-review audit (§12). The owner approved revision 2 and the §3 2B2b framing amendment on
-2026-09-24 and directed the independent hard-read-only review to proceed. Round 1 of 2 rejected with 5 WRONG / 9 SMELL;
-revision 3 folds all 14 on this artifact (§13). Round 2 is the final admitted round.
+**Status:** **PARKED for an owner threat-model ruling**, revision 4; planning/documentation only. Implementation is not
+authorized by this file.
+
+- Revision 2 folded a pre-review audit (§12). The owner approved revision 2 and the §3 2B2b framing amendment on
+  2026-09-24.
+- Round 1 of 2 rejected with 5 WRONG / 9 SMELL; revision 3 folded all 14 (§13).
+- Round 2 of 2, the final admitted round, rejected with 6 WRONG / 3 SMELL. The review cap is exhausted.
+- Revision 4 folds the six closed, ruling-independent findings. It parks the open-class same-user check-to-use race
+  population (W3–W5) for an owner ruling (§14).
+- No further review round runs without owner approval.
 
 **Exact predecessor:** `5e431f4f2dd6f77c66d64fa28dc48054f396edf9` (`origin/main`, PR #105 merge).
 
@@ -55,6 +61,8 @@ The scratch root has exactly two top-level children, both created by the exporte
 - `work/` — the plaintext Git-pack staging file, the verification object database, the private `HOME`/XDG
   directories, and the synthesized Git directory from §4. Nothing under `work/` is a capsule member.
 
+Every regular file the exporter itself creates — `work/objects.pack`, capsule staging files, and the seal staging
+file — is created by the §6 `create_new_regular_child` method on a retained parent descriptor, never by pathname.
 Every directory the exporter itself creates — `capsule/`, `work/`, the nested `control/`, `git/`, and `payload/`
 directories, and the `HOME`/XDG directories — is created with the descriptor-relative directory primitive added to
 `fs_custody` (§6) beneath a retained parent descriptor, never by pathname. Git creates the interior of the git
@@ -247,17 +255,20 @@ Filesystem effects reuse the existing descriptor-relative primitives in `crates/
 `open_child_no_follow`, `CustodyPublicationV1`, and the existing rename/sync fault countdowns). The new module must
 not reimplement raw custody syscalls.
 
-`fs_custody` has no descriptor-relative directory creation, and `PinnedDirectoryV1` exposes no child-directory handle
-because its directory `File` is private. This task therefore owns exactly one narrow, reviewed addition to
-`fs_custody.rs`: two `PinnedDirectoryV1` methods.
+`fs_custody` has no descriptor-relative directory creation, and `PinnedDirectoryV1` exposes neither a child-directory
+handle nor a create-new regular-child method, because its directory `File` is private and it only opens existing
+regular children. This task therefore owns exactly one narrow, reviewed addition to `fs_custody.rs`: three
+`PinnedDirectoryV1` methods.
 
 - `create_new_child_directory(name, label) -> PinnedDirectoryV1`: takes a validated single-component name; runs
   `mkdirat` at mode `0700`, refusing any existing entry; opens the new entry with `open_child_no_follow` plus
   `O_DIRECTORY`; records identity from the opened descriptor, requiring it to be a directory; and syncs the parent;
 - `open_existing_child_directory(name, label) -> PinnedDirectoryV1`: the same no-follow open and identity capture,
-  without creating anything.
+  without creating anything;
+- `create_new_regular_child(name, label) -> File`: wraps the existing `create_new_regular_child_at` on the retained
+  descriptor, creating an owner-private file that refuses an existing entry and follows no link.
 
-Both methods carry in-module `fs_custody` tests. Any other `fs_custody` change is a stop condition.
+All three carry in-module `fs_custody` tests. Any other `fs_custody` change is a stop condition.
 
 Each artifact is sealed into a unique create-new staging name below `capsule/`. The destination sink owns its own
 `CustodyEnvelopeSinkValidatorV1` and admits a chunk to the validator only after that chunk's `write_all` succeeds. After
@@ -276,7 +287,8 @@ The Git-pack artifact is sealed only after §5 succeeds, from the verified file.
 **Commit point:** the no-replace rename of `custody-seal.v1` into `capsule/` is the single commit point. The seal's
 presence is the only completeness signal; a `capsule/` without a seal is an incomplete capsule by definition.
 
-- A fault at or before the seal rename returns a typed incomplete outcome, and no seal exists.
+- A fault before the seal rename, or a seal rename refused with proof that it took no effect, returns a typed
+  incomplete outcome, and no seal exists.
 - A seal rename whose effect cannot be verified, meaning `CustodyPublicationV1::RenameOutcomeUnverified` where
   neither the staged source nor the target proves whether the rename happened, returns a distinct
   `SealPublicationUnverified` outcome. It claims neither a published seal nor an absent one.
@@ -318,8 +330,8 @@ the fixture is repaired.
 | 8d | source repository carries promisor config; all three flags above bypassed; mutation copies source remote/extension config into the synthesized git dir | §4.1 synthesis writes no source config | missing object; no fetch |
 | 9 | swap source identity after preflight | §4.1 recheck | identity drift |
 | 10 | destination component replaced by a symlink or a case-fold/path-prefix alias | `fs_custody` no-follow/no-replace | typed publication refusal |
-| 11 | max/max+1 on artifact count, chunk bytes, chunk count, per-artifact ciphertext, the scratch-wide ledger (including each enumerated Git-child reservation), pack stdout, and the canonical manifest encoding | §3 ledger, validators, §2 preflight | typed budget refusal |
-| 12 | each pre-commit fault point | §6 commit point | incomplete outcome; no seal present |
+| 11 | max/max+1 on artifact count, chunk bytes, chunk count, per-artifact ciphertext, the scratch-wide ledger (including each enumerated Git-child reservation), pack stdout, and the canonical manifest encoding. For the manifest, a crate-private call-counter seam also proves `CustodyCapsuleLayoutV1::derive` is never entered after an over-limit preflight; swapping preflight and derive must turn it red | §3 ledger, validators, §2 preflight ordering | typed budget refusal; derive not entered |
+| 12 | each pre-commit fault point, excluding any seal rename whose effect cannot be verified (control 14) | §6 commit point | incomplete outcome; no seal present |
 | 13 | post-seal directory-sync fault | §6 commit point | `PublishedDurabilityUnconfirmed`; seal present |
 | 14 | existing `UnlinkSourceOnly` rename fault plus target-identity ambiguity on the seal rename | §6 unverified-rename arm | `SealPublicationUnverified` |
 | 15 | a fixture sealer returns receipts built from each other's contexts for two differently hashed artifacts; separately, each single receipt field altered | §6 whole-receipt equality | receipt mismatch before any seal |
@@ -330,7 +342,7 @@ the fixture is repaired.
 | 20 | historical zero-padded file-mode tree | §5 step 4 | `StrictObjectCheck` refusal |
 | 21 | scratch root placed inside the source git directory, disjointness check disabled | §2 scratch/source disjointness preflight | typed refusal before any write; with the guard disabled, source bytes change |
 | 22 | Git executable replaced at its path after the version probe | §4.1 binary identity recheck | refusal before the next spawn |
-| 23 | pinned root's pathname replaced before nested directory creation | `fs_custody` directory primitive | creation continues only under the retained descriptor; nothing appears in the replacement |
+| 23 | pinned root's pathname replaced before nested directory creation and before staging-file creation | `fs_custody` directory and regular-child methods | creation continues only under the retained descriptor; nothing appears in the replacement |
 | 24 | a prohibited external use of each new public or crate-private boundary: forged capability, external sealed-trait implementation, public seal-receipt construction | compile-fail doctests on `src/custody_export.rs` items | that doctest fails when its barrier is widened |
 | 25 | reconnect a source-stream receipt to seal publication | existing provenance compile-fail doctest | that doctest fails |
 
@@ -342,6 +354,11 @@ row leaves exactly one of the three guards active. With that guard active the ob
 refuses. With it removed the lazy fetch succeeds, which the test observes as the object appearing in the fixture's
 source store. Each of 8a–8d is enabled on a platform only after a probe proves that flip. Otherwise it is a named
 exclusion with its mechanism.
+
+Because the guard-removed arm writes the fetched object into the fixture's source store, every arm of every 8a–8d row
+starts from a fresh disposable source store copied from one immutable template. The harness asserts that the missing
+object is absent before each arm and that the template's content hash is unchanged afterwards. Row order is
+randomized, and a reused or contaminated store is rejected as an inadmissible precondition.
 
 **No-mutation observation:** separately from control 21, every real-Git success test compares the source's object,
 ref, config, and worktree bytes before and after the export and requires them to be identical. This is an end-to-end
@@ -375,8 +392,8 @@ no feature may be added to expose them.
   compile-fail/unit controls;
 - `crates/bridge-core/tests/custody_capsule.rs` — restoration of the four dropped 2B1 public negatives only;
 - `crates/bridge-core/src/lib.rs` — module export only;
-- `crates/bridge-core/src/fs_custody.rs` — only the two §6 `PinnedDirectoryV1` directory methods and their
-  in-module tests (control 23); any other edit is a stop condition (§10);
+- `crates/bridge-core/src/fs_custody.rs` — only the three §6 `PinnedDirectoryV1` methods and their in-module tests
+  (control 23); any other edit is a stop condition (§10);
 - `crates/bridge-core/src/custody_seal.rs` — only crate-private read-only accessors for the manifest's `unit_id`,
   `run_id`, `materialization_id`, and `generation_id`, and for `CustodyOriginalObjectV1` `format` and `object_id`, with
   focused unit tests; no validation or wire change;
@@ -410,8 +427,15 @@ cargo run --locked --offline -p a2a-bridge -- validate --repo-hygiene
 
 Run real-Git fixtures on host macOS and on a native Linux ext4 filesystem. The GitHub Actions ubuntu runner is the
 named ext4 lane; it previously caught inode reuse that both macOS/APFS and the implement container's overlayfs
-missed. The runner label alone is not evidence. The fixture records the scratch filesystem type via `statfs` and
-admits the lane as ext4 only when the magic is `0xEF53`. Any other type is a named exclusion with the observed type. Overlayfs does not substitute for the native identity-drift control. Record the Git version in each lane.
+missed. The runner label alone is not evidence, and `statfs` magic `0xEF53` alone covers the whole ext family.
+
+The fixture admits the lane as ext4 only when both of these hold:
+
+- `statfs` on the retained scratch descriptor reports `0xEF53`;
+- the `/proc/self/mountinfo` entry whose `major:minor` equals the descriptor's `st_dev` reports filesystem type
+  `ext4`.
+
+Anything else, including ext2 or ext3, is a named exclusion recording the observed values. Overlayfs does not substitute for the native identity-drift control. Record the Git version in each lane.
 Before attributing any failure, run exact predecessor `5e431f4f` in the same environment. Name every exclusion and
 its mechanism; an unrunnable gate is not green.
 
@@ -430,12 +454,13 @@ Stop for spec/design review if:
 - the minimum Git version cannot honor §4.1;
 - a new dependency or archive/crypto format is required;
 - production non-Git framing becomes necessary;
-- an `fs_custody` change is needed beyond the two §6 directory methods;
+- an `fs_custody` change is needed beyond the three §6 methods;
 - the scratch-wide ledger cannot account for a Git child's writes;
 - the diff escapes the owned paths.
 
-Next action: independently review revision 2 of this document under a declared two-admitted-round cap (owner
-approved the §3 2B2b framing amendment on 2026-09-24). Only a separately authorized, approved task may begin 2B2
+Next action: **owner ruling on the §14 threat-model question.** The two-round review cap is exhausted. After the
+ruling, revision 5 applies it to W3–W5. A further review round then requires explicit owner approval of a one-round
+extension. Only a separately authorized, approved task may begin 2B2
 implementation. Review approval does not authorize push, merge, cleanup, 2B3 restore, remote/provider effects, or
 running-operator mutation.
 
@@ -519,3 +544,55 @@ source before folding.
 | S7 | ext4 lane unverified | §9 `statfs` magic admission |
 | S8 | Git binary path-pinned only | §4.1 identity and SHA-256 recheck; control 22 |
 | S9 | canonical-manifest ceiling after the allocating `derive` | §2 bounded preflight; control 11 |
+
+## 14. Revision 4 — round 2 disposition and parked threat-model question (2026-09-24)
+
+Round 2 of 2 was a host Codex `gpt-5.6-sol`/`xhigh`/read-only turn on revision 3 at `a1177a66`. Its verdict was
+**REJECT**: inherited 11 RESOLVED / 3 UNRESOLVED (S1, S7, S8) / 0 DEFERRED, and new 6 WRONG / 3 SMELL (BLOCKER 6 /
+DEFER 3). The full record is `docs/superpowers/reviews/2026-09-24-adr0041-slice2b2-spec-review-round2.md`. The review
+cap is exhausted, and the population was classified before any action.
+
+**Closed and ruling-independent — folded in revision 4:**
+
+| ID | Finding | Fold |
+|---|---|---|
+| W1 | no descriptor-relative create-new regular child on `PinnedDirectoryV1` | §6 third method; §2; control 23 |
+| W2 | "at or before the seal rename" contradicted `SealPublicationUnverified` (reopened S1) | §6 arm narrowed; control 12 |
+| W6 | `statfs` magic `0xEF53` covers ext2/3/4 (reopened S7) | §9 magic plus `mountinfo` fstype `ext4` |
+| S1 | the lazy-fetch guard-off arm contaminates a reused source store | §7 fresh store per arm from an immutable template |
+| S2 | control 11 did not discriminate preflight-before-derive ordering | control 11 call-counter seam |
+| S3 | §10 still pointed at revision 2 | §10 |
+
+**Open-class — parked for an owner ruling:**
+
+| ID | Check-to-use window raced by a same-user actor |
+|---|---|
+| W3 | the exporter rechecks a `work/` path, then a Git child resolves that path itself |
+| W4 | `mkdirat` creates a directory, then `openat` opens whatever now sits at that name |
+| W5 | the Git binary is hashed, then `exec` reopens its path (reopened S8) |
+
+These are successive instances of one class. Each path-addressed boundary admits a race by an actor running as the
+same user, and every round has found new members of that class rather than fewer. No bounded, portable prevention
+exists for the whole class: macOS has no `fexecve`, and POSIX cannot atomically bind `mkdirat` to a descriptor. More
+boundaries remain unenumerated, for example the source `GIT_OBJECT_DIRECTORY` path lookup.
+
+The existing custody code already scopes this class out explicitly. See `fs_custody.rs`: the replacing-rename
+pre-check "catches caller error, not a hostile racer", and a PARKED reaper `remove_dir_all` swap window.
+
+**Owner question:** Is a hostile same-user actor racing a check-to-use window inside 2B2's threat model?
+
+- **Recommended — (A) out of scope, detect and refuse.** Adopt the `fs_custody` precedent. 2B2 defends against stale
+  paths, accidental concurrent mutation, and operator error through descriptor custody plus pre- and post-effect
+  identity rechecks that detect drift and refuse. W3–W5 are recorded as explicit HONEST LIMITs, with cheap
+  prevention where it is portable:
+  - fchdir-rooted Git children with relative internal paths (W3);
+  - a Git binary route that must be a non-symlink, not writable by the executing user, in ancestors not writable by
+    that user, checked before every spawn (W5);
+  - an emptiness, owner, and mode check on each newly opened directory (W4).
+
+  Rationale: a same-user actor can already rewrite the source repository, the binary, and the exporter's own memory,
+  so user-space prevention cannot give 2B2 a meaningfully stronger guarantee. The content-addressed §5 proof still
+  prevents a corrupted pack from being sealed.
+- **(B) in scope, prevent.** 2B2 is re-planned around descriptor-only effects: descriptor-rooted children
+  everywhere, `fexecve` (Linux only, so the macOS lane loses that guarantee), and a creation protocol that binds each
+  created entry. This is a design-level change that returns the child to spec planning.

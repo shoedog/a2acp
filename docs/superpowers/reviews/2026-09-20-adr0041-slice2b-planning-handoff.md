@@ -19,7 +19,7 @@
 2. Read ADR-0041 §§4, 8, 9, 11, 14, and 17; the Slice 2A handoff §4; and the complete plan in §6.
 3. Bind both 2B1 review records, the final approved closure, and the Slice 2B2 review candidate in §6.
 4. Preserve reviewed candidate `88013eb4`, merge `5e431f4f`, and the historical planning branch.
-5. Round 1 of 2 (Sol/xhigh, `docs/superpowers/reviews/2026-09-24-adr0041-slice2b2-spec-review-round1.md`) REJECTED revision 2 with 5 WRONG / 9 SMELL, a closed population; revision 3 folds all 14 (task §13). Run round 2, the final admitted round, on revision 3 and stop. The owner approved the §3 2B2b amendment on 2026-09-24. Do not implement 2B2 without new owner direction.
+5. **2B2 is PARKED for an owner threat-model ruling (task §14).** Round 1 rejected revision 2 (5 WRONG / 9 SMELL, all folded in revision 3). Round 2, the final admitted round, rejected revision 3 (6 WRONG / 3 SMELL; `docs/superpowers/reviews/2026-09-24-adr0041-slice2b2-spec-review-round2.md`). Revision 4 folds the closed residue and parks W3–W5, the open class of same-user check-to-use races. Do not run a third round or implement without owner direction. The owner approved the §3 2B2b amendment on 2026-09-24. Do not implement 2B2 without new owner direction.
 
 **STOP conditions:** Do not start 2B2/2B3 effects, use a bare path as a quiescence/capture capability, add remote/provider/destructive authority, publish the docs branch, or mutate the running operator. An open-class review population or exhausted nonconverging cap parks the plan.
 
@@ -96,11 +96,12 @@
 | Provenance review / execution / attempt | `docs/superpowers/reviews/2026-09-23-adr0041-slice2b1-provenance-review.md` / `exec-e7ee36345656679aec8923c4be9d25b6` / `attempt-86036c5afb97c003d9f62bb2fc0c9163` |
 | Provenance review raw result SHA-256 | `ae10a401186fc9933a959a17ff6da1c8d5727f0e2ee79440ab63306663fb2eb0` |
 | Published branch / PR | `feat/adr0041-slice2b1-capsule-contracts-20260923` / `https://github.com/shoedog/a2acp/pull/105` |
-| Slice 2B2 review candidate | `docs/superpowers/plans/2026-09-23-adr0041-slice2b2-isolated-export-task.md` (revision 3; rev 1 `c7536a56`, rev 2 `1c22d0d0`) |
+| Slice 2B2 review candidate | `docs/superpowers/plans/2026-09-23-adr0041-slice2b2-isolated-export-task.md` (revision 4, PARKED; rev 1 `c7536a56`, rev 2 `1c22d0d0`, rev 3 `a1177a66`) |
+| Slice 2B2 spec review round 2 | `docs/superpowers/reviews/2026-09-24-adr0041-slice2b2-spec-review-round2.md`; REJECT 6 WRONG / 3 SMELL; cap exhausted |
 | Slice 2B2 spec review round 1 | `docs/superpowers/reviews/2026-09-24-adr0041-slice2b2-spec-review-round1.md`; REJECT 5 WRONG / 9 SMELL, all folded in revision 3 |
 
 ## 7. Refutation verdict and owner questions
 
 **§2c verdict:** REFUTED — corrected in place · claim: "The second repair closes all three inherited Slice 2B1 WRONG mechanisms." · pass: INDEPENDENT · evidence tier: STATIC-ONLY plus inherited mutation/full-gate evidence · record: `docs/superpowers/reviews/2026-09-23-adr0041-slice2b1-second-closure-review.md`
 
-**Cycle-1 repair status:** APPROVED and merged as PR #105 at `5e431f4f`. R1/R2/R3 are RESOLVED with no blocker. Slice 2B2 is at revision 3 (round-1 review folded), awaiting round 2 of 2, and unimplemented; 2B2/2B3 effects and operator mutation remain separate gates.
+**Cycle-1 repair status:** APPROVED and merged as PR #105 at `5e431f4f`. R1/R2/R3 are RESOLVED with no blocker. Slice 2B2 is PARKED at revision 4 after the exhausted two-round cap, pending an owner threat-model ruling, and unimplemented; 2B2/2B3 effects and operator mutation remain separate gates.
