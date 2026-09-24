@@ -19,7 +19,7 @@
 2. Read ADR-0041 §§4, 8, 9, 11, 14, and 17; the Slice 2A handoff §4; and the complete plan in §6.
 3. Bind both 2B1 review records, the final approved closure, and the Slice 2B2 review candidate in §6.
 4. Preserve reviewed candidate `88013eb4`, merge `5e431f4f`, and the historical planning branch.
-5. Independently review revision 2 of the 2B2 task (its §12 records the folded pre-review audit; the §3 2B2b framing-child amendment needs owner acknowledgment) and stop. Do not implement 2B2 without new owner direction.
+5. Independently review revision 2 of the 2B2 task (its §12 records the folded pre-review audit; the owner approved revision 2 and the §3 2B2b framing-child amendment on 2026-09-24) and stop. Do not implement 2B2 without new owner direction.
 
 **STOP conditions:** Do not start 2B2/2B3 effects, use a bare path as a quiescence/capture capability, add remote/provider/destructive authority, publish the docs branch, or mutate the running operator. An open-class review population or exhausted nonconverging cap parks the plan.
 

@@ -50,6 +50,11 @@ independently reviewable children:
 | **2B2** | Local exporter plus isolated Git-object closure proof | New scratch-root writes and hardened local Git subprocesses only | 2B1 approved and merged into the Slice 2B branch |
 | **2B3** | New-root restore plus exact hidden-state fixture verification | New restore-root writes and hardened local Git subprocesses only | 2B2 approved and its capsule fixture sealed |
 
+**Amendment (owner-approved 2026-09-24):** production non-Git coverage framing is split out of 2B2 into a fourth
+serial child, **2B2b**, sequenced after 2B2 and before 2B3, so 2B2 exports opaque fixture-bound non-Git streams and 2B3
+carries only restore. 2B2b receives its own reviewed task. See
+`docs/superpowers/plans/2026-09-23-adr0041-slice2b2-isolated-export-task.md` §3.
+
 No child may begin on a merely plausible predecessor. Each binds the exact approved predecessor commit and reruns
 its focused tests. A conflict or schema gap returns to the owning child; it does not get patched opportunistically
 in a later child.

@@ -4,7 +4,8 @@ task-type: implement
 # ADR-0041 Slice 2B2 — isolated local export and Git-object closure
 
 **Status:** review candidate, revision 2; planning/documentation only. Implementation is not authorized by this
-file. Revision 2 folds a pre-review audit (§12); the independent hard-read-only review has not yet run.
+file. Revision 2 folds a pre-review audit (§12). The owner approved revision 2 and the §3 2B2b framing amendment on
+2026-09-24 and directed the independent hard-read-only review to proceed; implementation remains unauthorized.
 
 **Exact predecessor:** `5e431f4f2dd6f77c66d64fa28dc48054f396edf9` (`origin/main`, PR #105 merge).
 
@@ -107,8 +108,8 @@ For this child, non-Git coverage payloads are opaque bounded streams supplied by
 fixture capability binds each stream to one exact coverage class, source generation, declared length, and SHA-256 so
 a stream cannot be replayed under another artifact role. **Production filesystem-entry framing is owned by a
 separately reviewed child 2B2b, sequenced after 2B2 and before 2B3,** so 2B3 carries only restore. This amends the
-parent plan's three-child table and requires owner acknowledgment at review; if rejected, framing must be assigned to
-exactly one named child before 2B2 implementation starts.
+parent plan's three-child table; the owner approved it on 2026-09-24. 2B2b receives its own reviewed task before any
+framing code exists.
 
 ## 4. Git export contract
 
@@ -347,8 +348,8 @@ Stop for spec/design review if:
 - the scratch-wide ledger cannot account for a Git child's writes;
 - the diff escapes the owned paths.
 
-Next action: independently review revision 2 of this document under a declared two-admitted-round cap, including
-owner acknowledgment of the §3 2B2b framing amendment. Only a separately authorized, approved task may begin 2B2
+Next action: independently review revision 2 of this document under a declared two-admitted-round cap (owner
+approved the §3 2B2b framing amendment on 2026-09-24). Only a separately authorized, approved task may begin 2B2
 implementation. Review approval does not authorize push, merge, cleanup, 2B3 restore, remote/provider effects, or
 running-operator mutation.
 
@@ -403,7 +404,7 @@ the Linux lane still apply.
 | S4 | SMELL | sealer-minted receipt not cross-checked against a destination-owned validator | §6; control 14 |
 | S5 | SMELL | capability-to-manifest binding implicit; redundant caller layout; "explicit budgets" vs fixed limits | §2; control 16 |
 | S6 | SMELL | undefined "entry-count" control; controls did not name their guard; layered lazy-fetch defenses non-discriminating; exhaustive chunk-fault matrix | §7 table; §6 sampling |
-| S7 | SMELL | non-Git framing owner ambiguous ("2B3 or a 2B2 follow-up") | §3 2B2b amendment, owner acknowledgment required |
+| S7 | SMELL | non-Git framing owner ambiguous ("2B3 or a 2B2 follow-up") | §3 2B2b amendment; owner approved 2026-09-24 |
 | S8 | SMELL | identity recheck only before spawn | §4.1 post-exit recheck with rationale |
 | S9 | SMELL | strict fsck rejection of legitimate history would surface as generic ambiguity | §5 `StrictObjectCheck`; control 17 |
 | S10 | SMELL | Linux lane unnamed | §9 GitHub Actions ubuntu ext4 lane |
