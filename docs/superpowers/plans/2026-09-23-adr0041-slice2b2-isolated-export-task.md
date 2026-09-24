@@ -3,8 +3,9 @@ task-type: implement
 ---
 # ADR-0041 Slice 2B2 — isolated local export and Git-object closure
 
-**Status:** **PARKED for an owner threat-model ruling**, revision 4; planning/documentation only. Implementation is not
-authorized by this file.
+**Status:** review candidate, revision 5; planning/documentation only. Implementation is not authorized by this file.
+Revision 5 applies the owner's 2026-09-24 threat-model ruling (§2.1, §15). The two-round review cap is exhausted, so
+any further review round needs explicit owner approval of a one-round extension.
 
 - Revision 2 folded a pre-review audit (§12). The owner approved revision 2 and the §3 2B2b framing amendment on
   2026-09-24.
@@ -13,6 +14,8 @@ authorized by this file.
 - Revision 4 folds the six closed, ruling-independent findings. It parks the open-class same-user check-to-use race
   population (W3–W5) for an owner ruling (§14).
 - No further review round runs without owner approval.
+- On 2026-09-24 the owner ruled a hostile same-user check-to-use racer **out of scope** (§14 option A). Revision 5
+  applies that ruling.
 
 **Exact predecessor:** `5e431f4f2dd6f77c66d64fa28dc48054f396edf9` (`origin/main`, PR #105 merge).
 
@@ -51,6 +54,25 @@ empty scratch root, plus hardened local Git subprocesses. Publication is descrip
 create-new/no-replace. The implementation must retain and recheck source, alternate, scratch-root, and destination
 identities across every effect boundary.
 
+### 2.1 Threat model (owner ruling, 2026-09-24)
+
+**In scope:**
+
+- stale or retargeted paths;
+- accidental concurrent mutation by the bridge, the operator, or tools;
+- operator error and crashes;
+- a corrupted or substituted object source, which the content-addressed §5 proof catches.
+
+The defenses are descriptor custody, pre- and post-effect identity rechecks that detect drift and refuse with a
+typed incomplete outcome, and the portable preventions named below.
+
+**Out of scope:** a hostile process running as the same user, or a more privileged one, that deliberately races a
+check-to-use window. Such an actor can already rewrite the source repository, the Git binary route it controls, and
+the exporter's own memory, so user-space checks cannot give 2B2 a stronger guarantee. This follows the existing
+`fs_custody` precedent ("catches caller error, not a hostile racer"). The resulting honest limits are enumerated in
+§15 and must be restated verbatim in the implementation handoff. Detection code for these windows stays mandatory;
+only prevention is out of scope.
+
 Preflight refuses a scratch root that is, contains, or lies inside the source repository, its git directory, or any
 pinned alternate store. The check compares canonical paths in both directions and the directory identity of every
 ancestor captured at preflight, so no exporter write can land in a source store.
@@ -66,8 +88,13 @@ file — is created by the §6 `create_new_regular_child` method on a retained p
 Every directory the exporter itself creates — `capsule/`, `work/`, the nested `control/`, `git/`, and `payload/`
 directories, and the `HOME`/XDG directories — is created with the descriptor-relative directory primitive added to
 `fs_custody` (§6) beneath a retained parent descriptor, never by pathname. Git creates the interior of the git
-directories it initializes under `work/`. Those paths are derived by the exporter from the retained `work/` descriptor
-and rechecked before each spawn; the caller never supplies them.
+directories it initializes under `work/`. Every Git child is **rooted** at the retained `work/` descriptor: its
+working directory is set by the §6 `root_command` method, which calls `fchdir` on that descriptor in the child after
+`fork` and before `exec`. Every internal path the child receives is **relative** to that root, including `GIT_DIR`,
+the init target, `HOME`, and `XDG_CONFIG_HOME`. A swap of any ancestor pathname therefore cannot redirect the child's
+writes. The one exception is an environment variable that Git requires to be absolute; the implementation-time probe
+must identify any such variable, and it becomes honest limit HL1 covered by the post-exit recheck. The caller never
+supplies any of these paths.
 
 The exporter never deletes anything, including its own `work/` contents; a completed or failed run leaves `work/`
 as inert, typed scratch evidence. Plaintext in `work/` is acceptable only because 2B2 makes no confidentiality claim
@@ -158,9 +185,21 @@ one object format, or a format different from the source's, refuses with a typed
 
 ### 4.1 Closed child environment
 
-Every Git child — source and verification — is spawned from one absolute Git binary path resolved once. Its file
-identity (device, inode, size, and modification time) and SHA-256 are recorded at the version probe and rechecked
-before every spawn; a mismatch refuses before the next child starts. Each child starts from `env_clear()` followed
+Every Git child — source and verification — is spawned from one absolute Git binary path resolved once. The route is
+admitted only when all of these hold:
+
+- the final component is a regular file, not a symlink;
+- that file and every ancestor directory are owned by root, or have no write permission for the executing user;
+- on macOS, it is not the `xcrun` trampoline. `/usr/bin/git` is a small launcher that execs a binary chosen by
+  developer-directory state, so hashing it binds nothing. The admission check requires `<git --exec-path>/git` to
+  resolve to the same file identity as the chosen binary, and the Command Line Tools or Xcode binary is used instead.
+  On Linux, that identity is recorded as evidence;
+- a user-owned route such as a Homebrew symlink is refused with a typed route refusal.
+
+Because a non-writable route leaves no same-user swap window between the recheck and `exec`, the admission rule
+prevents the check-to-exec race for in-scope actors; a privileged actor is honest limit HL3. The file identity
+(device, inode, size, and modification time) and SHA-256 are recorded at the version probe and rechecked before every
+spawn. A mismatch refuses before the next child starts. Each child starts from `env_clear()` followed
 by this allowlist and nothing else:
 
 - `GIT_OPTIONAL_LOCKS=0`, `GIT_NO_REPLACE_OBJECTS=1`, `GIT_NO_LAZY_FETCH=1`, `GIT_TERMINAL_PROMPT=0`;
@@ -262,13 +301,20 @@ regular children. This task therefore owns exactly one narrow, reviewed addition
 
 - `create_new_child_directory(name, label) -> PinnedDirectoryV1`: takes a validated single-component name; runs
   `mkdirat` at mode `0700`, refusing any existing entry; opens the new entry with `open_child_no_follow` plus
-  `O_DIRECTORY`; records identity from the opened descriptor, requiring it to be a directory; and syncs the parent;
+  `O_DIRECTORY`; and records identity from the opened descriptor, requiring it to be a directory. It then detects
+  substitution. The opened directory must be empty, owned by the effective user, mode `0700`, and have link count 2.
+  A no-follow `fstatat` of the name in the parent must return the opened identity. Any mismatch is a typed
+  refusal. The method finally syncs the parent. An identical substitution is honest limit HL2;
 - `open_existing_child_directory(name, label) -> PinnedDirectoryV1`: the same no-follow open and identity capture,
   without creating anything;
 - `create_new_regular_child(name, label) -> File`: wraps the existing `create_new_regular_child_at` on the retained
-  descriptor, creating an owner-private file that refuses an existing entry and follows no link.
+  descriptor, creating an owner-private file that refuses an existing entry and follows no link;
+- `root_command(&self, command: &mut std::process::Command)`: installs a `pre_exec` hook that calls `fchdir` on this
+  retained descriptor and fails the spawn if `fchdir` fails. `fchdir` is async-signal-safe. The descriptor keeps
+  `O_CLOEXEC`, so it is still open between `fork` and `exec` but is not inherited by Git. This is the only new
+  `unsafe` block, and it carries a safety comment.
 
-All three carry in-module `fs_custody` tests. Any other `fs_custody` change is a stop condition.
+All four carry in-module `fs_custody` tests. Any other `fs_custody` change is a stop condition.
 
 Each artifact is sealed into a unique create-new staging name below `capsule/`. The destination sink owns its own
 `CustodyEnvelopeSinkValidatorV1` and admits a chunk to the validator only after that chunk's `write_all` succeeds. After
@@ -345,6 +391,9 @@ the fixture is repaired.
 | 23 | pinned root's pathname replaced before nested directory creation and before staging-file creation | `fs_custody` directory and regular-child methods | creation continues only under the retained descriptor; nothing appears in the replacement |
 | 24 | a prohibited external use of each new public or crate-private boundary: forged capability, external sealed-trait implementation, public seal-receipt construction | compile-fail doctests on `src/custody_export.rs` items | that doctest fails when its barrier is widened |
 | 25 | reconnect a source-stream receipt to seal publication | existing provenance compile-fail doctest | that doctest fails |
+| 26 | a deterministic hook after the last parent-side recheck swaps `work/`'s pathname for a replacement directory before spawn | `root_command` rooting with relative internal paths | the child writes only under the retained `work/`; the replacement and the source are unchanged; the post-exit recheck reports drift |
+| 27 | a deterministic hook between `mkdirat` and open exchanges the new child for a non-empty directory, or for one with another mode | the `create_new_child_directory` substitution checks | typed refusal; no pin to the replacement |
+| 28 | the Git route is the macOS `xcrun` trampoline, a user-owned symlink, or a user-writable file or ancestor | §4.1 route admission | typed route refusal before any spawn |
 
 **Lazy-fetch fixture (8a–8c):** the source object store lacks one manifest object. A test-only promisor remote
 (`extensions.partialClone` plus `remote.p.promisor=true` and `remote.p.url=file://<fixture>`, where the fixture holds
@@ -384,7 +433,7 @@ no feature may be added to expose them.
   and isolated closure proof. Control 24's compile-fail doctests live on its public items; rustdoc does not run
   doctests from `tests/` targets;
 - `crates/bridge-core/src/custody_export_tests.rs` — in-crate real-Git fixtures, the `#[cfg(test)]` deterministic
-  fixture sealer and capture constructor, fault injection, and controls 1–22;
+  fixture sealer and capture constructor, fault injection, and controls 1–22 and 28;
 - `crates/bridge-core/tests/custody_export.rs` — runtime public-API refusal tests only; no doctests and no real-Git
   success path;
 - `crates/bridge-core/src/custody_capsule.rs` — only: change `mod sealed` to `pub(crate) mod sealed` so
@@ -392,8 +441,8 @@ no feature may be added to expose them.
   compile-fail/unit controls;
 - `crates/bridge-core/tests/custody_capsule.rs` — restoration of the four dropped 2B1 public negatives only;
 - `crates/bridge-core/src/lib.rs` — module export only;
-- `crates/bridge-core/src/fs_custody.rs` — only the three §6 `PinnedDirectoryV1` methods and their in-module tests
-  (control 23); any other edit is a stop condition (§10);
+- `crates/bridge-core/src/fs_custody.rs` — only the four §6 `PinnedDirectoryV1` methods and their in-module tests
+  (controls 23, 26, and 27); any other edit is a stop condition (§10);
 - `crates/bridge-core/src/custody_seal.rs` — only crate-private read-only accessors for the manifest's `unit_id`,
   `run_id`, `materialization_id`, and `generation_id`, and for `CustodyOriginalObjectV1` `format` and `object_id`, with
   focused unit tests; no validation or wire change;
@@ -454,13 +503,13 @@ Stop for spec/design review if:
 - the minimum Git version cannot honor §4.1;
 - a new dependency or archive/crypto format is required;
 - production non-Git framing becomes necessary;
-- an `fs_custody` change is needed beyond the three §6 methods;
+- an `fs_custody` change is needed beyond the four §6 methods;
 - the scratch-wide ledger cannot account for a Git child's writes;
 - the diff escapes the owned paths.
 
-Next action: **owner ruling on the §14 threat-model question.** The two-round review cap is exhausted. After the
-ruling, revision 5 applies it to W3–W5. A further review round then requires explicit owner approval of a one-round
-extension. Only a separately authorized, approved task may begin 2B2
+Next action: **owner approval of a one-round review extension** (round 3), disclosed as an extension beyond the
+exhausted two-round cap. The extension is scoped to revision 5's application of the §2.1 ruling and the revision 4–5
+folds. Without that approval 2B2 stays at revision 5, unreviewed, and implementation cannot be authorized. Only a separately authorized, approved task may begin 2B2
 implementation. Review approval does not authorize push, merge, cleanup, 2B3 restore, remote/provider effects, or
 running-operator mutation.
 
@@ -596,3 +645,22 @@ pre-check "catches caller error, not a hostile racer", and a PARKED reaper `remo
 - **(B) in scope, prevent.** 2B2 is re-planned around descriptor-only effects: descriptor-rooted children
   everywhere, `fexecve` (Linux only, so the macOS lane loses that guarantee), and a creation protocol that binds each
   created entry. This is a design-level change that returns the child to spec planning.
+
+## 15. Revision 5 — owner threat-model ruling applied (2026-09-24)
+
+The owner chose §14 option A: a hostile same-user or privileged check-to-use racer is out of scope, and detection
+remains mandatory. Revision 5 applies it as follows:
+
+| Parked item | Prevention now required | Detection | Honest limit |
+|---|---|---|---|
+| W3 Git-child path lookups | `root_command` `fchdir` rooting plus relative internal paths (§2, §6); control 26 | post-exit recheck of `work/`, scratch-root, and source identities | **HL1:** absolute paths Git requires, and the source `GIT_OBJECT_DIRECTORY`/alternate lookups, are resolved by Git by path. A same-user swap between recheck and lookup is detected afterwards, not prevented, and §5's content proof keeps a substituted store from yielding a wrong pack. |
+| W4 `mkdirat` → `openat` | none portable | emptiness, owner, mode, link count, and parent-entry identity checks (§6); control 27 | **HL2:** an identical substitution (empty, same owner and mode) is undetectable. The substitute is necessarily a directory inside the retained parent at open time. |
+| W5 Git binary check-to-exec | route admission: regular file, not writable by the user in file or ancestors, no trampoline (§4.1); control 28 | identity and SHA-256 recheck before every spawn | **HL3:** root or another privileged user replacing the admitted route. |
+
+**Probe basis (this host, 2026-09-24):**
+
+- `/usr/bin/git` is a 118,640-byte root-owned Mach-O launcher with 78 hard links.
+- `xcrun --find git` resolves to `/Library/Developer/CommandLineTools/usr/bin/git`, root-owned.
+- That binary's `--exec-path` is `…/CommandLineTools/usr/libexec/git-core`, whose `git` links to `../../bin/git`, the
+  same file.
+- `/opt/homebrew/bin/git` is a user-owned symlink, which the route rule refuses.
