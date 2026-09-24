@@ -105,6 +105,11 @@ impl CustodyCoverageEntryV1 {
     pub const fn class(&self) -> CustodyCoverageClassV1 {
         self.class
     }
+
+    #[must_use]
+    pub const fn state(&self) -> CustodyStateClassV1 {
+        self.state
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -175,6 +180,11 @@ impl CustodyOriginalObjectV1 {
             object_id,
             kind,
         })
+    }
+
+    #[must_use]
+    pub const fn kind(&self) -> CustodyGitObjectKindV1 {
+        self.kind
     }
 }
 
@@ -558,6 +568,16 @@ impl CustodyManifestV1 {
     pub fn content_digest(&self) -> Result<Sha256HexV1, CustodySealErrorV1> {
         Ok(Sha256HexV1::digest(&self.encode_canonical()?))
     }
+
+    #[must_use]
+    pub fn coverage(&self) -> &[CustodyCoverageEntryV1] {
+        &self.coverage
+    }
+
+    #[must_use]
+    pub fn original_objects(&self) -> &[CustodyOriginalObjectV1] {
+        &self.original_objects
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -601,6 +621,21 @@ impl CustodySealedArtifactV1 {
             byte_length,
             sha256,
         })
+    }
+
+    #[must_use]
+    pub fn name(&self) -> &LosslessPathV1 {
+        &self.name
+    }
+
+    #[must_use]
+    pub const fn byte_length(&self) -> u64 {
+        self.byte_length
+    }
+
+    #[must_use]
+    pub fn sha256(&self) -> &Sha256HexV1 {
+        &self.sha256
     }
 }
 
@@ -691,9 +726,7 @@ impl CustodySealV1 {
     }
 
     pub fn validate(&self) -> Result<(), CustodySealErrorV1> {
-        if self.schema != SEAL_SCHEMA_V1 {
-            return Err(CustodySealErrorV1::WrongSealSchema);
-        }
+        self.validate_borrowed_canonical()?;
         let canonical = Self::new(
             self.manifest_digest.clone(),
             self.artifacts.clone(),
@@ -704,6 +737,58 @@ impl CustodySealV1 {
         )?;
         if canonical != *self {
             return Err(CustodySealErrorV1::NonCanonicalRecord);
+        }
+        Ok(())
+    }
+
+    pub fn validate_borrowed_canonical(&self) -> Result<(), CustodySealErrorV1> {
+        if self.schema != SEAL_SCHEMA_V1 {
+            return Err(CustodySealErrorV1::WrongSealSchema);
+        }
+        if self.artifacts.is_empty() {
+            return Err(CustodySealErrorV1::NoArtifacts);
+        }
+        for artifact in &self.artifacts {
+            validate_artifact_name(artifact.name().as_bytes())?;
+        }
+        for window in self.artifacts.windows(2) {
+            if window[0].name().as_bytes() >= window[1].name().as_bytes() {
+                return Err(CustodySealErrorV1::NonCanonicalRecord);
+            }
+        }
+        for (left_index, left) in self.artifacts.iter().enumerate() {
+            let left_name = left.name().as_bytes();
+            for right in self.artifacts.iter().skip(left_index + 1) {
+                let right_name = right.name().as_bytes();
+                if right_name.len() > left_name.len()
+                    && right_name.starts_with(left_name)
+                    && right_name.get(left_name.len()) == Some(&b'/')
+                {
+                    return Err(CustodySealErrorV1::ArtifactPrefixConflict);
+                }
+            }
+        }
+        if self.encryption_recipients.is_empty() {
+            return Err(CustodySealErrorV1::NoRecipients);
+        }
+        for recipient in &self.encryption_recipients {
+            if recipient.is_empty() {
+                return Err(CustodySealErrorV1::EmptyRecipient);
+            }
+        }
+        for window in self.encryption_recipients.windows(2) {
+            if window[0] >= window[1] {
+                return Err(CustodySealErrorV1::NonCanonicalRecord);
+            }
+        }
+        if self.capsule_format.is_empty() {
+            return Err(CustodySealErrorV1::EmptyCapsuleFormat);
+        }
+        if self.sealing_tool.is_empty() {
+            return Err(CustodySealErrorV1::EmptyTool);
+        }
+        if self.sealing_tool_version.is_empty() {
+            return Err(CustodySealErrorV1::EmptyToolVersion);
         }
         Ok(())
     }
@@ -725,6 +810,36 @@ impl CustodySealV1 {
 
     pub fn content_digest(&self) -> Result<Sha256HexV1, CustodySealErrorV1> {
         Ok(Sha256HexV1::digest(&self.encode_canonical()?))
+    }
+
+    #[must_use]
+    pub fn manifest_digest(&self) -> &Sha256HexV1 {
+        &self.manifest_digest
+    }
+
+    #[must_use]
+    pub fn artifacts(&self) -> &[CustodySealedArtifactV1] {
+        &self.artifacts
+    }
+
+    #[must_use]
+    pub fn encryption_recipients(&self) -> &[String] {
+        &self.encryption_recipients
+    }
+
+    #[must_use]
+    pub fn capsule_format(&self) -> &str {
+        &self.capsule_format
+    }
+
+    #[must_use]
+    pub fn sealing_tool(&self) -> &str {
+        &self.sealing_tool
+    }
+
+    #[must_use]
+    pub fn sealing_tool_version(&self) -> &str {
+        &self.sealing_tool_version
     }
 }
 
@@ -996,4 +1111,36 @@ pub enum CustodySealErrorV1 {
     EmptyTool,
     #[error("sealing tool version is empty")]
     EmptyToolVersion,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn digest(byte: u8) -> Sha256HexV1 {
+        Sha256HexV1::digest(&[byte])
+    }
+
+    #[test]
+    fn borrowed_seal_validation_rejects_noncanonical_artifact_order() {
+        let name_a = LosslessPathV1::from_bytes(b"a.enc".to_vec());
+        let name_b = LosslessPathV1::from_bytes(b"b.enc".to_vec());
+        let seal = CustodySealV1 {
+            schema: SEAL_SCHEMA_V1.to_owned(),
+            manifest_digest: digest(1),
+            artifacts: vec![
+                CustodySealedArtifactV1::new(name_b, 1, digest(2)).unwrap(),
+                CustodySealedArtifactV1::new(name_a, 1, digest(3)).unwrap(),
+            ],
+            encryption_recipients: vec!["recipient".to_owned()],
+            capsule_format: "capsule-v1".to_owned(),
+            sealing_tool: "tool".to_owned(),
+            sealing_tool_version: "1".to_owned(),
+        };
+
+        assert_eq!(
+            seal.validate_borrowed_canonical().unwrap_err(),
+            CustodySealErrorV1::NonCanonicalRecord
+        );
+    }
 }

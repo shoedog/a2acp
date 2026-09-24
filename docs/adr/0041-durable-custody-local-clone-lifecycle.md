@@ -216,6 +216,8 @@ Proposed schemas:
 |---|---|
 | `custody-manifest.v1` | Unit/run/materialization identity, state coverage, original refs/objects, dependency and exclusion inventories |
 | `custody-seal.v1` | Manifest digest, exact artifact bytes/digests, encryption recipients, format/tool versions |
+| `custody-capsule-index.v1` | Manifest digest and canonical total mapping from exact artifact names to closed capsule roles |
+| `custody-restore-policy.v1` | Closed inert behavior policy for hooks, executable config, filters, network, external paths, workflow resume and source mutation |
 | `custody-verification.v1` | Seal/manifest, remote identities and versions, full restore result, key-recovery check, retention guarantees, verifier signature |
 | `custody-plan.v1` | Fixed population, policy digest, evaluation time, order, intended effects and reason codes |
 | `custody-authorization.v1` | Principal, capability kind, plan/manifest/verification digests, exact units and paths, generations, destinations, expiry and replay scope |

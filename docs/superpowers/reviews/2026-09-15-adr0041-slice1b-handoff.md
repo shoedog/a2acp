@@ -9,15 +9,15 @@
 ## 0. Gating facts — settle these before starting anything below
 
 **(a) Lane ownership** — `[MEASURED]` the owner directed custody of this `fold` worktree; the one Sol fold process terminated and its output exists. No concurrent code editor was dispatched in this lane — **RESOLVED 2026-09-15.**
-**(b) Custody exposure** — `[MEASURED]` the owner authorized commit/push/PR and later the bounded rustls repair on 2026-09-16. Doctor repair `288cacd1`, custody foundation `0431e57e`, publication reconciliation `4e00b76f`, rustls repair `1ba72900`, and dependency-repair reconciliation `01594083` are pushed on the branch in §6; PR #104 is open. The repair updates `rustls` to 0.23.45 and `rustls-webpki` to 0.103.15 and clears the local dependency-policy gate. Replacement GitHub Build/Lint/Coverage, uninstrumented, macOS, Windows, and CLA checks all pass and merge state is `CLEAN`. CI success is not merge or running-operator adoption — **RESOLVED for branch publication/dependency disposition/replacement CI; OPEN for merge/adoption.**
+**(b) Custody exposure** — `[MEASURED]` the owner authorized commit/push/PR and later the bounded rustls repair on 2026-09-16. Doctor repair `288cacd1`, custody foundation `0431e57e`, publication reconciliation `4e00b76f`, rustls repair `1ba72900`, dependency-repair reconciliation `01594083`, Slice 2A content `64545d45`, and reconciliation `65a572df` are in PR #104's merged lineage. GitHub reports PR #104 merged at `27a885f6` on 2026-09-20, and remote `main` points to that exact commit. The repair updates `rustls` to 0.23.45 and `rustls-webpki` to 0.103.15 and clears the local dependency-policy gate. Merge is resolved; running-operator adoption is not implied — **RESOLVED for publication/dependency disposition/merge; OPEN for adoption.**
 **(c) In flight / irreversible** — `[MEASURED]` the Sol fold, structural and behavioral RED, restored GREEN, and one hard-read-only Sol/xhigh code review all completed. No provider turn, seal, removal, operator change, or review remains in flight — **RESOLVED 2026-09-15.**
-**(d) Authorization boundary** — the owner authorized the Slice 2A review, integration onto `01594083`, and inclusion in PR #104. Content commit `64545d45` is pushed. Merge, worktree cleanup, Slice 2B effects, and running-operator effects remain unexercised separate gates.
+**(d) Authorization boundary** — the owner authorized the Slice 2A review, integration onto `01594083`, inclusion in PR #104, and later reported that PR merged. Merge is exercised. Worktree cleanup, Slice 2B implementation/effects, and running-operator effects remain separate gates.
 
 ## 1. Resume order
 
 1. Read the folded task `/private/tmp/a2a-bridge-adr0041-slice1b-folded-spec-20260915.md` (SHA-256 in §6), this handoff, and ADR-0041 §§9/14. Check `git status --short` and the hard Slice 1A digests before any edit.
 2. Read the round-one Sol/xhigh review in §6: APPROVE, 0 WRONG / 2 deferred SMELL, no blocker. No round two was dispatched. Keep the six owned Slice 1B paths separate from the pre-existing Slice 1A and doctor repair before any stage operation.
-3. Treat PR #104 as published and unmerged with Slice 2A content commit `64545d45`; its owner-authorized rustls repair clears `RUSTSEC-2026-0285`. Query live checks directly and do not merge or deploy without distinct authority. Slice 2A's current custody is in its 2026-09-16 handoff.
+3. Treat PR #104 merge commit `27a885f6` as the completed Slice 1A/1B/2A predecessor. Its owner-authorized rustls repair clears `RUSTSEC-2026-0285`. Do not infer deployment or running-operator adoption from merge. Slice 2B's current planning state is in its 2026-09-20 handoff.
 
 **STOP conditions:** No schema widening, extra path discovery, Git/provider/CLI wiring, write/seal/quarantine/reap/delete/source-ref effects, raising the 8+8 cap, or silently extending the two-round review cap. Any cap overflow, open-class finding, or material authority expansion stops for owner disposition.
 
@@ -34,22 +34,22 @@
 | Focused verification | done | `[MEASURED]` host collector 9/0, preserved Slice 1A 2/0, native-Linux collector 9/0 with real raw-`0xff` directory. Host APFS refused direct raw-name creation with `Illegal byte sequence`; the macOS test-only stand-in/injected probe is disclosed, not counted as concrete raw-name evidence. |
 | Full verification | done | `[MEASURED]` host workspace 88 targets, 4,423 passed / 0 failed / 13 ignored / 0 measured / 729 filtered; doctests 3/0 including privacy `compile_fail`; strict Clippy, default format, diff check, and repository hygiene passed. Full log in §6. |
 | Independent code review | done | `[MEASURED]` one admitted Sol/xhigh hard-read-only round APPROVED: 0 WRONG / 2 SMELL, both schema-bound DEFER, no blocker. The earlier missing-`{{input}}` attempt refused before prompt and consumed no review round; no round two was dispatched. |
-| Commit and publication | done | `[MEASURED]` the original commits, rustls repair `1ba72900`, reconciliation `01594083`, and Slice 2A content `64545d45` are pushed to GitHub PR #104 against `main`. The integrated tree passes focused 22 / 0, `bridge-core` 842 / 0 / 0, full workspace 4,444 / 0 / 13 ignored, dependency policy, Clippy, format, diff, and hygiene 41/9. Live GitHub checks, merge, and operator adoption remain separate facts. |
+| Commit, publication, and merge | done | `[MEASURED]` GitHub reports PR #104 merged on 2026-09-20 at `27a885f6`, which has reviewed/published head `65a572df` as its second parent and an identical tree. The integrated tree previously passed focused 22 / 0, `bridge-core` 842 / 0 / 0, full workspace 4,444 / 0 / 13 ignored, dependency policy, Clippy, format, diff, and hygiene 41/9. Running-operator adoption remains separate. |
 
 ## 3. Corrections to standing documents and memory
 
 | Location | Stale or false assertion | Correction |
 |---|---|---|
 | Slice 1A handoff prior Opus-blocked state | The background file was read too early and called failed. | `[MEASURED]` already corrected in its living handoff before Slice 1B; Slice 1B preserved it byte-for-byte thereafter. |
-| `docs/reliability-execution-roadmap.md` active slice | Named only Slice 1A and a prospective first implementation. | `[MEASURED]` updated its active-slice paragraph to local Slice 1A/1B implementation, measured gates, and one-round code-review approval. |
+| `docs/reliability-execution-roadmap.md` active slice | Named PR #104 open and unmerged. | `[MEASURED]` reconciled it to merge commit `27a885f6` and Slice 2B planning as the next gate. |
 | Memory store | None. | No direct owner request to update memory; no memory write. |
 
 ## 4. Open work
 
 | # | Work | State | Exact next action | Blocked by | Identifiers |
 |---:|---|---|---|---|---|
-| 1 | PR #104 checks and merge decision | live / unexercised | Query the live head checks; merge only under distinct owner authority. | GitHub checks and owner merge decision. | PR #104; Slice 2A content `64545d45`; repair `1ba72900`. |
-| 2 | ADR-0041 Slice 2B | next / unauthorized | Specify and independently review the provider-free local export/restore boundary before effects. | Separate Slice 2B authority and reviewed spec. | ADR-0041 §14 stage 2; 2026-09-16 Slice 2A handoff §4. |
+| 1 | PR #104 merge | done | Preserve merge identity; do not conflate it with operator adoption. | None. | PR #104; merge `27a885f6`; reviewed head `65a572df`. |
+| 2 | ADR-0041 Slice 2B | next / planning | Independently review the provider-free local capsule plan; only then implement bounded child 2B1. | Reviewed parent/2B1 spec. | ADR-0041 §14 stage 2; `docs/superpowers/plans/2026-09-20-adr0041-slice2b-local-capsule-plan.md`. |
 | 3 | Worktree administrative cleanup | parked | Keep stale/missing metadata under future custody reconciliation; do not prune or delete based on merged branch alone. | Validated population plus owner cleanup authority. | ADR-0041 §§11/13/14. |
 
 ## 5. Invariants and traps — do not do these
@@ -69,7 +69,7 @@
 |---|---|
 | Published base / branch | `d2cbf4e0561d0db8fd829e3776186d75f38e0715` / `feat/adr0041-custody-inventory-slices-1a-1b-20260916` |
 | Published commits | `288cacd1` doctor repair; `0431e57e` ADR-0041 Slices 1A/1B implementation and evidence; `4e00b76f` publication reconciliation; `1ba72900` rustls 0.23.45 lock repair; `01594083` dependency-repair reconciliation; `64545d45` Slice 2A integration; this publication reconciliation |
-| Pull request | `https://github.com/shoedog/a2acp/pull/104` · open against `main`; merge and CI status are separate facts |
+| Pull request | `https://github.com/shoedog/a2acp/pull/104` · merged 2026-09-20 at `27a885f6d4af6a517c2a8899aa5bfe36605b8fb7`; head `65a572df40f07316124a70b7ec353a2d38dd334d` |
 | Rustls repair verification | `cargo deny check` green; full locked/offline workspace 4,422 passed / 0 failed / 13 ignored; warnings-denied Clippy, format, diff, and hygiene 41/9 green |
 | Hard Slice 1A digests | `lib.rs` pre-edit `e73a56975e89a0606d5813822c8b9417da9d297e489208625ddbdf0398344ee6`; module `367bf2b68173a4e5fc70d76cbd1ae56a58ba6077062ed2ac991bcb2abb93f012`; test `5ec7112c7c91df57e35767dc76c3e0d8f7f1fd744ba674b9b5728147a457cc17` |
 | Preserved doctor repair | `bin/a2a-bridge/src/doctor.rs` SHA-256 `582dcb1dee642015052cf76c2ba2292b11ff7f082e1a20239772979edf7306df` |
