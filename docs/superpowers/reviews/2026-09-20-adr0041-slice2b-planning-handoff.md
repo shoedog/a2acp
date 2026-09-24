@@ -1,7 +1,7 @@
 # Handoff — ADR-0041 Slice 2B local capsule planning
 
-**Written:** 2026-09-20T22:51:32Z; refreshed 2026-09-23 after PR #105 merge and Slice 2B2 task drafting · **By:** Codex `/root` · **Provider:** codex + Claude ACP review
-**Workspace:** primary checkout on docs branch from merged `main` · **Measured state:** `[MEASURED]` PR #105 merged at `5e431f4f`; Slice 2B2 review candidate written; no 2B2 effect started
+**Written:** 2026-09-20T22:51:32Z; refreshed 2026-09-24 after PR #105 merge, Slice 2B2 task drafting, and the revision-2 pre-review audit fold · **By:** Codex `/root` · **Provider:** codex + Claude ACP review
+**Workspace:** primary checkout on docs branch from merged `main` · **Measured state:** `[MEASURED]` PR #105 merged at `5e431f4f`; Slice 2B2 review candidate revision 2 written (pre-review audit folded); no 2B2 effect started
 **Predecessor:** `docs/superpowers/reviews/2026-09-16-adr0041-slice2a-handoff.md`
 **Truth ordering:** measured live state > explicit owner/contract authority within its scope > this handoff for current operational state > earlier handoffs and non-authoritative summaries. A conflict between tiers stays OPEN in §0 — never resolved by document class alone.
 **Provenance:** written live by the worker from GitHub/remote-main probes, merged ADR/code, and predecessor handoffs. `[MEASURED]` claims were probed by this writer; `[INHERITED]` claims were not.
@@ -19,7 +19,7 @@
 2. Read ADR-0041 §§4, 8, 9, 11, 14, and 17; the Slice 2A handoff §4; and the complete plan in §6.
 3. Bind both 2B1 review records, the final approved closure, and the Slice 2B2 review candidate in §6.
 4. Preserve reviewed candidate `88013eb4`, merge `5e431f4f`, and the historical planning branch.
-5. Independently review the 2B2 task and stop. Do not implement 2B2 without new owner direction.
+5. Independently review revision 2 of the 2B2 task (its §12 records the folded pre-review audit; the §3 2B2b framing-child amendment needs owner acknowledgment) and stop. Do not implement 2B2 without new owner direction.
 
 **STOP conditions:** Do not start 2B2/2B3 effects, use a bare path as a quiescence/capture capability, add remote/provider/destructive authority, publish the docs branch, or mutate the running operator. An open-class review population or exhausted nonconverging cap parks the plan.
 
@@ -96,10 +96,10 @@
 | Provenance review / execution / attempt | `docs/superpowers/reviews/2026-09-23-adr0041-slice2b1-provenance-review.md` / `exec-e7ee36345656679aec8923c4be9d25b6` / `attempt-86036c5afb97c003d9f62bb2fc0c9163` |
 | Provenance review raw result SHA-256 | `ae10a401186fc9933a959a17ff6da1c8d5727f0e2ee79440ab63306663fb2eb0` |
 | Published branch / PR | `feat/adr0041-slice2b1-capsule-contracts-20260923` / `https://github.com/shoedog/a2acp/pull/105` |
-| Slice 2B2 review candidate | `docs/superpowers/plans/2026-09-23-adr0041-slice2b2-isolated-export-task.md` |
+| Slice 2B2 review candidate | `docs/superpowers/plans/2026-09-23-adr0041-slice2b2-isolated-export-task.md` (revision 2; rev 1 `c7536a56`) |
 
 ## 7. Refutation verdict and owner questions
 
 **§2c verdict:** REFUTED — corrected in place · claim: "The second repair closes all three inherited Slice 2B1 WRONG mechanisms." · pass: INDEPENDENT · evidence tier: STATIC-ONLY plus inherited mutation/full-gate evidence · record: `docs/superpowers/reviews/2026-09-23-adr0041-slice2b1-second-closure-review.md`
 
-**Cycle-1 repair status:** APPROVED and merged as PR #105 at `5e431f4f`. R1/R2/R3 are RESOLVED with no blocker. Slice 2B2 is documented but unreviewed and unimplemented; 2B2/2B3 effects and operator mutation remain separate gates.
+**Cycle-1 repair status:** APPROVED and merged as PR #105 at `5e431f4f`. R1/R2/R3 are RESOLVED with no blocker. Slice 2B2 is documented (revision 2, pre-review audit folded) but not independently reviewed and unimplemented; 2B2/2B3 effects and operator mutation remain separate gates.
