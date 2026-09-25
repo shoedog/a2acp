@@ -202,7 +202,9 @@ store's own `objects/info/alternates`, `objects/info/packs`, commit-graph, and m
 access. The alternates files are covered by the capability's recursive identity and content pinning. The other
 object-store info files can change only how objects are found, never object bytes, and §5 proves the exact result.
 
-The exporter creates `work/source-git/` with the runner's `InitBare` command and writes nothing else into its config.
+The exporter creates `work/source-git/` with the runner's `InitBare` command, which takes no `GIT_DIR`, and writes
+nothing else into its config (control 30). The §5 verify-pack step uses `VerifyPack { git_dir, pack_hash }` with the
+hash parsed from `index-pack`'s `pack\t<hash>` stdout.
 Because Git objects are content-addressed and §5 proves the exact inventory and closure, a store swap cannot corrupt
 the pack's integrity. The post-exit callback protects the generation/quiescence claim and turns drift into a typed
 incomplete outcome. The residual windows are 2B2a honest limits HL1–HL3.
@@ -334,8 +336,10 @@ the fixture is repaired.
 | 21 | scratch root placed inside the source git directory, disjointness check disabled | §2 scratch/source disjointness preflight | typed refusal before any write; with the guard disabled, source bytes change |
 | 24 | a prohibited external use of each new public or crate-private boundary: forged capability, external sealed-trait implementation, public seal-receipt construction | compile-fail doctests on `src/custody_export.rs` items | that doctest fails when its barrier is widened |
 | 25 | reconnect a source-stream receipt to seal publication | existing provenance compile-fail doctest | that doctest fails |
+| 30 | the source repository carries promisor config (`extensions.partialClone`, a `remote.p.promisor=true` `file://` remote holding one manifest object the source store lacks); all three lazy-fetch guards disabled through 2B2a's `#[cfg(test)]` bypass seam; the mutation makes the exporter copy the source's config into `work/source-git/` | §4.1 synthesized git dir receives no source config | object reported missing, typed refusal, no fetch, source unchanged. Every arm uses a fresh source store from an immutable template |
 
-Controls 8a–8d, 22, 23, 26, 27a–27d, 28, 28a, 28b, and 29 moved to 2B2a as A1–A12. Their numbers are retired here
+Controls 8a–8c, 22, 23, 26, 27a–27d, 28, 28a, 28b, and 29 moved to 2B2a. The source-config half of 8d stays here
+as control 30, because only the exporter has source context (2B2a round 1, W5). Their numbers are retired here
 and not reused.
 
 **No-mutation observation:** separately from control 21, every real-Git success test compares the source's object,
@@ -362,7 +366,7 @@ no feature may be added to expose them.
   callbacks, and isolated closure proof. Control 24's compile-fail doctests live on its public items; rustdoc does not run
   doctests from `tests/` targets;
 - `crates/bridge-core/src/custody_export_tests.rs` — in-crate real-Git fixtures, the `#[cfg(test)]` deterministic
-  fixture sealer and capture constructor, fault injection, and controls 1–21 (retired numbers excluded);
+  fixture sealer and capture constructor, fault injection, and controls 1–21 and 30 (retired numbers excluded);
 - `crates/bridge-core/tests/custody_export.rs` — runtime public-API refusal tests only; no doctests and no real-Git
   success path;
 - `crates/bridge-core/src/custody_capsule.rs` — only: change `mod sealed` to `pub(crate) mod sealed` so

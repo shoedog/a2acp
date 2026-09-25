@@ -3,12 +3,15 @@ task-type: implement
 ---
 # ADR-0041 Slice 2B2a — descriptor seam and hardened Git runner
 
-**Status:** review candidate, revision 1; planning/documentation only. Implementation is not authorized by this file.
+**Status:** review candidate, revision 2; planning/documentation only. Implementation is not authorized by this file.
+Spec review round 1 of 2 rejected revision 1 with 5 WRONG / 5 SMELL, a closed population; revision 2 folds all ten
+(§13).
 On 2026-09-24 the owner chose to split this child out of Slice 2B2 (2B2 task revision 6, `cf93c7e4`, §16 option 1).
 2B2a delivers the filesystem seam and the Git runner that 2B2's exporter builds on. It carries requirements already
 shaped by the pre-review audit and three independent 2B2 review rounds (§12).
 
-**Exact predecessor:** `5e431f4f2dd6f77c66d64fa28dc48054f396edf9` (`origin/main`, PR #105 merge).
+**Implementation base:** `5e431f4f2dd6f77c66d64fa28dc48054f396edf9` (`origin/main`, PR #105 merge). This is the
+code base and the RED/attribution control. The task document itself descends from the 2B2 planning commits.
 
 **Sequence:** 2B2a → 2B2 (exporter and closure proof) → 2B2b (production non-Git framing) → 2B3 (restore). 2B2
 implementation starts only after 2B2a is approved and merged, and uses 2B2a's API unchanged.
@@ -84,32 +87,41 @@ descriptor-relative directory creation. 2B2a adds exactly these four `pub(crate)
     so the child does not inherit it;
   - a duplication failure is returned as a typed error.
 
-The `unsafe` code authorized is exactly three audited boundaries, each with a safety comment:
+The `unsafe` code authorized in `fs_custody.rs` is exactly these audited boundaries, each with a safety comment:
 
 - descriptor-relative `mkdirat`;
 - `fdopendir`/`readdir` on a duplicated descriptor for the emptiness guard;
+- `geteuid` for the owner guard;
 - the `pre_exec` `fchdir` closure.
 
-Any other `fs_custody` change is a stop condition.
+The `unsafe` code authorized in `custody_git.rs` is exactly:
+
+- `faccessat(..., W_OK, AT_EACCESS)` for the route rule;
+- `geteuid` for the production uid-0 refusal.
+
+No other `unsafe` site is permitted. Control A14 inventories them. Any other `fs_custody` change is a stop
+condition.
 
 ## 4. `custody_git` runner
 
 ### 4.1 Admitted Git route
 
-The runner resolves one admitted Git binary once, in two phases.
+The runner resolves one admitted Git binary once. **No Git binary executes before it is admitted.**
 
-1. **Bootstrap discovery.**
-   - A candidate absolute path is metadata-checked against the route rule. On macOS the candidate may be the `xcrun`
-     trampoline `/usr/bin/git`.
-   - The candidate runs exactly one discovery child, `<candidate> --exec-path`. It runs with the §4.2 environment,
-     rooted at an empty caller-provided probe directory, with no inherited descriptor and bounded stdout.
-2. **Admission.**
-   - The runner derives `<exec-path>/git`, canonicalizes it, and applies the route rule to that target.
-   - The target must be a fixed point: its own `--exec-path` must map back to the same file identity.
-   - The **target** is admitted, never the candidate. This handles the macOS trampoline, which execs a binary chosen
-     by developer-directory state, and it is uniform on Linux.
-   - The candidate and the target are both recorded as evidence. Only the admitted target runs the version probe or
-     any other child.
+1. **Locate without executing Git.**
+   - On macOS the runner runs only the fixed locator `/usr/bin/xcrun --find git`. That locator does not execute Git;
+     it prints the path chosen by the developer-directory selection.
+   - The locator is first admitted under the same route rule, with the same pre- and post-exit identity and SHA-256
+     rechecks, and runs with the §4.2 closed environment and bounded stdout.
+   - On Linux, and on macOS when the operator configures one explicitly, the candidate is a configured absolute path.
+     No locator runs.
+2. **Admit.** The runner canonicalizes the located or configured path and applies the route rule to it **before its
+   first execution**. A refusal leaves nothing executed.
+3. **Confirm the fixed point.** After admission, the admitted binary's `--exec-path` must contain a `git` that
+   resolves to the same file identity. A mismatch, such as a wrapper or trampoline, is a typed refusal.
+
+The locator path, the admitted path, and the fixed-point result are recorded as evidence. `/usr/bin/git` itself is
+never executed.
 
 **Route rule:**
 
@@ -133,9 +145,10 @@ recorded at admission. They are rechecked **before every spawn and after every c
 - A post-exit mismatch returns a typed `BinaryDrift` outcome, which the caller must treat as incomplete.
 - A privileged replace-and-restore entirely within one child's window is HL3.
 
-**Minimum version:** the runner runs `version` on the admitted target and requires a minimum version pinned at
-implementation time by a probe. The probe must show that version honors every flag and variable in §4.2. The runner
-parks below that version.
+**Minimum version:** the runner runs `version` on the admitted binary and requires a minimum version pinned at
+implementation time by a probe. The probe must show that version honors every flag and variable in §4.2. The parser
+accepts vendor suffixes such as `(Apple Git-157)`. Malformed output, a nonzero exit status, or a version below the
+minimum is a typed refusal (control A13).
 
 ### 4.2 Closed environment, flags, and rooting
 
@@ -143,10 +156,14 @@ Each child starts from `env_clear()` followed by exactly this allowlist:
 
 - `GIT_OPTIONAL_LOCKS=0`, `GIT_NO_REPLACE_OBJECTS=1`, `GIT_NO_LAZY_FETCH=1`, `GIT_TERMINAL_PROMPT=0`;
 - `GIT_CONFIG_NOSYSTEM=1`, `GIT_CONFIG_GLOBAL=/dev/null`;
-- `HOME`, `XDG_CONFIG_HOME`, and `GIT_DIR` as **relative** names validated as single components below the root;
+- `HOME`, `XDG_CONFIG_HOME`, and `GIT_DIR` as **relative** names validated as single components below the root.
+  `GIT_DIR` is **omitted** for `InitBare`, which names its directory only through the positional argument. Probe P4
+  showed that setting both is a precedence trap;
 - when the caller supplies a `GitObjectStoreRouteV1`, `GIT_OBJECT_DIRECTORY` and `GIT_ALTERNATE_OBJECT_DIRECTORIES`
   from that route. These are absolute by necessity (HL1). The route is an opaque, caller-built value; 2B2a does not
-  interpret source repositories;
+  interpret source repositories. Its constructor refuses, with a typed error, any path containing `:`, `"`, `\`, a
+  newline, or a NUL byte, so the colon-separated alternates encoding needs no quoting. Controls A15 cover each
+  refused byte, plus a two-entry round-trip;
 - a fixed minimal `PATH` and locale, recorded in evidence.
 
 Nothing else is inherited, including `GIT_CONFIG_PARAMETERS`, `GIT_CONFIG_COUNT`, askpass, SSH, `GIT_EXEC_PATH`,
@@ -159,6 +176,9 @@ git --no-optional-locks --no-replace-objects --no-lazy-fetch \
   -c core.hooksPath=/dev/null -c core.fsmonitor=false -c protocol.allow=never \
   <subcommand> ...
 ```
+
+For tests only, a `#[cfg(test)]` guard-bypass seam can disable the `--no-lazy-fetch` flag, `GIT_NO_LAZY_FETCH`, or
+`protocol.allow=never` individually. A11a–A11c use it, and so does 2B2 control 30. Production code has no bypass.
 
 Every child is rooted with `root_command` at the caller's retained directory. Every internal path is relative to that
 root, so swapping an ancestor pathname cannot redirect the child's writes. The implementation-time probe identifies
@@ -173,11 +193,11 @@ one fixed argv. Relative names are validated single components or fixed relative
 |---|---|
 | `ExecPath` | `--exec-path` (discovery only) |
 | `Version` | `version` |
-| `InitBare { dir, object_format }` | `init --bare --template= --object-format=<sha1\|sha256> <dir>` |
+| `InitBare { dir, object_format }` | `init --bare --template= --object-format=<sha1\|sha256> <dir>`, with no `GIT_DIR` |
 | `CatFileBatchCheck` | `cat-file --batch-check` |
 | `PackObjectsStdout` | `pack-objects --stdout` |
 | `IndexPackStrictStdin` | `index-pack --strict --stdin` |
-| `VerifyPack { index }` | `verify-pack -v <index>` |
+| `VerifyPack { git_dir, pack_hash }` | `verify-pack -v <git_dir>/objects/pack/pack-<pack_hash>.idx`. The runner builds this path; `pack_hash` is a validated lowercase hex object ID of the route's format, normally taken from `index-pack`'s parsed `pack\t<hash>` stdout |
 | `CatFileAllObjects` | `cat-file --batch-all-objects --batch-check=%(objectname) %(objecttype)` |
 | `RevListMissingPrint` | `rev-list --objects --no-object-names --missing=print --stdin` |
 | `FsckStrict` | `fsck --strict --full --no-reflogs --no-dangling --no-progress` |
@@ -191,15 +211,17 @@ check callbacks. It runs in this order:
 1. binary pre-spawn recheck, then the caller's pre-spawn check;
 2. rooted spawn;
 3. a stdin writer, a stdout reader, and a stderr reader run concurrently, so a full pipe cannot deadlock. Stdout
-   beyond its cap by one byte kills the child and returns a typed cap refusal;
+   or stderr beyond its cap by one byte kills the child and returns a typed cap refusal naming the stream;
 4. at the deadline, the child is killed and reaped, and a typed timeout is returned;
 5. wait for exit;
 6. binary post-exit recheck, then the caller's post-exit check;
 7. return a typed result.
 
 The result carries the bounded stdout (or its streamed digest when the caller consumes stdout incrementally), the
-bounded stderr, the exit status, and an evidence record. The evidence record holds the argv, the candidate and
-admitted routes, the Git version, the environment keys, the exit status, and the lengths and SHA-256 of each stream.
+bounded stderr, the exit status, and an evidence record. The evidence record holds the argv, the locator and
+admitted routes, the Git version, and every environment **key and value**. Relative names are recorded as given;
+object-store route paths are recorded as SHA-256 digests of their bytes, under the existing path-redaction policy. The
+record also holds the root directory identity, the exit status, and the lengths and SHA-256 of each stream.
 Exit status alone is never success evidence; the caller parses output.
 
 ## 5. Required RED and behavioral controls
@@ -219,26 +241,31 @@ inadmissible until the fixture is repaired.
 | A3 | a hook after the last parent-side recheck swaps the root's pathname for a replacement before spawn; the fixture binary writes a relative marker | `root_command` rooting and relative paths | the marker lands only under the retained root; the replacement is unchanged; the caller's post-exit check sees the drift | 2B2 #26 |
 | A4 | a `root_command` pin is dropped and its descriptor number reused before spawn | owned duplicate descriptor | the child is still rooted at the original directory | 2B2 R3 S1 |
 | A5 | route-rule table: trusted-owner file with a mode-`0777` component; untrusted-owner mode-`0555` file; symlink final component; ACL-granted write; production constructor as uid 0; standard root-owned Linux `/usr/bin/git` (positive, pure metadata) | §4.1 route rule | typed route refusal; the positive row is admitted | 2B2 #28 |
-| A5a | a fake trampoline whose `--exec-path` names a distinct admitted target, and a target that is not a fixed point | §4.1 two-phase admission | only discovery runs the candidate; functional argv uses the target; a non-fixed-point target refuses | 2B2 #28a |
+| A5a | a fake locator returns a user-owned target whose executable writes a marker; separately, an admitted target that is not a fixed point | §4.1 admit-before-execute and fixed point | refusal with no marker written; the non-fixed-point target refuses. Reverting to executing the candidate's `--exec-path` makes the marker appear | 2B2 #28a; 2B2a R1 W1 |
 | A5b | an admitted route replaced at its path after admission, before the next spawn | §4.1 pre-spawn recheck | refusal before the next spawn | 2B2 #22 |
 | A5c | an admitted fixture route replaced by an `exit 0` binary after the pre-spawn recheck, inside a deterministic hook | §4.1 post-exit recheck | typed `BinaryDrift` | 2B2 #28b |
 | A6 | a fixture binary dumps its environment and cwd | §4.2 allowlist | the environment equals exactly the allowlist and the cwd identity equals the root; adding one inherited variable turns it red | new |
 | A7 | golden argv per `GitCommandV1` variant | §4.3 fixed argv table | exact match; adding or removing one argument turns it red | new |
 | A8 | a fixture binary writes cap+1 stdout bytes, and separately exactly cap bytes | §4.4 stdout bound | typed cap refusal with the child killed; the exact-cap run succeeds | new |
+| A8b | the same for stderr | §4.4 stderr bound | typed cap refusal naming stderr; the exact-cap run succeeds; removing the stderr check lets cap+1 succeed | 2B2a R1 S2 |
 | A9 | a fixture binary sleeps past the deadline | §4.4 deadline | typed timeout; child killed and reaped; no zombie | new |
-| A10 | a fixture binary that floods stderr while blocking on stdin | §4.4 concurrent I/O | completes or times out as typed, with no deadlock | new |
+| A10 | a fixture binary writes 1 MiB to stderr (above any pipe buffer, below the stderr cap) before reading its stdin to EOF | §4.4 concurrent I/O | **success before the deadline**. A timeout fails the control; a serial write-then-drain mutation must time out | 2B2a R1 W4 |
 | A11a | lazy-fetch fixture (below); only `--no-lazy-fetch` active | the flag | object reported missing; no fetch | 2B2 #8a |
 | A11b | lazy-fetch fixture; only `GIT_NO_LAZY_FETCH=1` active | the environment variable | object reported missing; no fetch | 2B2 #8b |
 | A11c | lazy-fetch fixture; only `protocol.allow=never` active | the protocol override | object reported missing; no fetch | 2B2 #8c |
-| A11d | object-store route's repository carries promisor config; the three flags bypassed; the mutation copies that config into the `InitBare` directory | `InitBare` writes no foreign config | object reported missing; no fetch | 2B2 #8d |
+| A11d | `InitBare` into a fresh directory on both platforms | `InitBare` fixed argv, no config input, no `GIT_DIR` | the tree shape is exactly the Git-created `HEAD`, `config`, `objects/`, and `refs/` with no nested repository. The `config` contains no `remote.*` or `extensions.partialClone`. Adding `GIT_DIR` or a template turns it red. The source-config isolation control returns to 2B2 as control 30 | 2B2a R1 W5, S1 |
+| A13 | version parser table: minimum−1, minimum, an Apple suffix, malformed output, and a nonzero exit | §4.1 minimum version | typed refusal except minimum and above; deleting the comparison admits minimum−1 | 2B2a R1 S5 |
+| A14 | a syntax inventory of `unsafe` blocks in `fs_custody.rs` and `custody_git.rs` against the §3 list | §3 authorized unsafe scope | exact match; one unnamed `unsafe` site turns it red | 2B2a R1 W3 |
+| A15 | `GitObjectStoreRouteV1` with `:`, `"`, `\`, a newline, or a NUL in a path, plus a valid two-entry route | §4.2 route encoding | typed refusal per refused byte; the valid route round-trips to exactly two entries | 2B2a R1 S3 |
+| A16 | real `index-pack --stdin`, then `VerifyPack` built from the parsed `pack\t<hash>` | §4.3 `VerifyPack` path | exact golden argv and successful verification; deleting the fixed `objects/pack/` prefix fails | 2B2a R1 W2 |
 | A12 | admission-classifier table: `0xEF53` with a matching-device `ext4` entry (admit); matching `ext2` or `ext3`; wrong device; duplicate or ambiguous matches; malformed `mountinfo` | §7 ext4 admission | named exclusion for every non-admit row; deleting the fstype comparison turns the `ext3` row red | 2B2 #29 |
 
-**Lazy-fetch fixture (A11a–A11c):**
+**Lazy-fetch fixture (A11a–A11c, the three runner-owned guards):**
 
 - The fixture object store lacks one object, and `CatFileBatchCheck` is run for it.
 - A test-only promisor remote is injected into the `InitBare` directory: `extensions.partialClone` plus
   `remote.p.promisor=true` and `remote.p.url=file://<fixture>`, where the fixture holds the object. That injection is
-  the fixture-level bypass of A11d.
+  a fixture-level injection; config isolation of real source repositories is 2B2 control 30.
 - Each row leaves exactly one guard active. With it active, the object stays missing. With it removed, the lazy fetch
   succeeds, observed as the object appearing in the fixture store.
 - Every arm starts from a fresh disposable store copied from one immutable template. The harness asserts the object
@@ -255,7 +282,7 @@ child refusal before the behavior under test is inadmissible evidence.
 - `crates/bridge-core/src/custody_git.rs` — new `pub(crate)` runner: route admission, environment, `GitCommandV1`,
   the spawn protocol, and evidence;
 - `crates/bridge-core/src/custody_git_tests.rs` — in-crate tests via `#[path = "custody_git_tests.rs"] mod tests;`
-  (A5–A12), including fixture binaries created at test time and the reusable `#[cfg(test)]` ext4 admission
+  (A5–A16), including fixture binaries created at test time and the reusable `#[cfg(test)]` ext4 admission
   classifier that 2B2 will import;
 - `crates/bridge-core/src/lib.rs` — module declaration only;
 - `docs/superpowers/reviews/2026-09-24-adr0041-slice2b2a-implementation-handoff.md` — evidence and lane handoff;
@@ -298,7 +325,7 @@ Stop for spec or design review if any of these occurs:
 
 - an `fs_custody` change is needed beyond the four §3 methods;
 - the runner needs a free-form argv or an inherited environment variable;
-- a route cannot be admitted on standard macOS Command Line Tools or Ubuntu Git;
+- a route cannot be admitted on standard macOS Command Line Tools (through the `xcrun` locator) or Ubuntu Git;
 - the minimum Git version cannot honor §4.2;
 - rooting cannot be applied to a spawn;
 - a dependency or feature is required;
@@ -332,7 +359,7 @@ The following sections are carried from the 2B2 task, revision 6 (`cf93c7e4`):
 | §4.1 | §4.1 route and rechecks |
 | §4.2 | §4.1 environment, flags, and rooting |
 | §2 | §2.1 threat model |
-| §5 carried rows | the §7 rows named in the Origin column |
+| §5 carried rows | the §7 rows named in the Origin column (A11d replaced in rev 2) |
 | §7 ext4 rule | §9 ext4 rule |
 | §10 | §15 honest limits |
 
@@ -350,3 +377,34 @@ New in 2B2a, because the runner now stands alone:
 - the caller pre-spawn and post-exit check callbacks;
 - the trusted-owner test constructor;
 - controls A4 and A6–A10.
+
+## 13. Revision 2 — spec review round 1 fold (2026-09-24)
+
+Round 1 of 2 was a host Codex `gpt-5.6-sol`/`xhigh`/read-only turn on revision 1 at `054c889b`. Its verdict was
+**REJECT** with 5 WRONG / 5 SMELL (BLOCKER 5 / DEFER 5). The full record is
+`docs/superpowers/reviews/2026-09-24-adr0041-slice2b2a-spec-review-round1.md`. The findings are closed and each names a
+bounded fix, so all ten are folded here.
+
+| ID | Finding | Fold |
+|---|---|---|
+| W1 | bootstrap ran the trampoline, which executes an unadmitted selected Git | §4.1 locate with `xcrun --find git` (itself admitted), admit before first execution, fixed point after; A5a |
+| W2 | `VerifyPack { index }` had no usable path from the `work/` root | §4.3 `VerifyPack { git_dir, pack_hash }` with a runner-built path; A16 |
+| W3 | exactly three unsafe boundaries excluded the required `geteuid` and `faccessat` | §3 per-file authorized unsafe list; A14 inventory |
+| W4 | A10 accepted a timeout, so a serial deadlocking implementation passed | A10 requires success before the deadline |
+| W5 | A11d had no guard inside 2B2a | A11d replaced by the `InitBare` tree-shape control; source-config isolation returns to 2B2 as control 30 |
+| S1 | `InitBare` combined `GIT_DIR` with a positional directory | §4.2 and §4.3 omit `GIT_DIR` for `InitBare` (P4); A11d |
+| S2 | stderr cap semantics absent | §4.4 symmetric; A8b |
+| S3 | alternates encoding unspecified | §4.2 refuse separator/escape bytes; A15 |
+| S4 | evidence recorded keys, not values | §4.4 keys and values, with path digests |
+| S5 | no minimum-version control | §4.1 parser rules; A13 |
+
+**Probes (macOS Command Line Tools Git 2.54, `env -i`, 2026-09-24).** These cover the macOS lane only; Ubuntu remains
+unprobed.
+
+- **P3:** with the cwd set, relative `GIT_DIR`, `HOME`, and `XDG_CONFIG_HOME` work for `init`, writes, and
+  `cat-file --batch-all-objects`; nothing is written outside the cwd. `--batch-check=%(objectname) %(objecttype)`
+  works as a single argv element.
+- **P4:** `/usr/bin/xcrun` is root-owned, and `xcrun --find git` prints `/Library/Developer/CommandLineTools/usr/bin/git`
+  without executing Git. `GIT_DIR=a.git git init --bare b.git` created only `b.git`, which is the precedence trap
+  behind S1. `index-pack --stdin` printed `pack\t<hash>` and wrote `.idx`, `.pack`, and `.rev` files.
+  `verify-pack -v <git_dir>/objects/pack/pack-<hash>.idx` succeeded from the root.
