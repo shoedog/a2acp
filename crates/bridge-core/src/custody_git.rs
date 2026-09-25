@@ -740,6 +740,7 @@ pub(crate) struct GitRunEvidenceV1 {
     pub(crate) version: (u32, u32, u32),
     pub(crate) root_identity: DirectoryIdentityV1,
     pub(crate) exit_status: Option<i32>,
+    pub(crate) stdin: GitStreamEvidenceV1,
     pub(crate) stdout: GitStreamEvidenceV1,
     pub(crate) stderr: GitStreamEvidenceV1,
 }
@@ -1052,9 +1053,13 @@ impl GitRunnerV1 {
             }
             Err(StreamReaderError::Io(error)) => return Err(CustodyGitError::Stream(error)),
         };
-        if let Err(error) = write {
-            return Err(CustodyGitError::Stdin(error));
-        }
+        // The writer's own attestation is the only stdin evidence: it names the bytes this child
+        // accepted, so a caller descriptor that changed between construction and delivery is
+        // visible here rather than silently attested as what it used to hold.
+        let stdin_evidence = match write {
+            Ok(evidence) => evidence,
+            Err(error) => return Err(CustodyGitError::Stdin(error)),
+        };
 
         let evidence = GitRunEvidenceV1 {
             argv,
@@ -1064,6 +1069,7 @@ impl GitRunnerV1 {
             version: self.version,
             root_identity: root.identity().clone(),
             exit_status: status.code(),
+            stdin: stdin_evidence,
             stdout: stdout.evidence(),
             stderr: stream_evidence(&stderr),
         };
@@ -1622,20 +1628,89 @@ enum StreamReaderError {
     Io(std::io::Error),
 }
 
+/// The child's stdin pipe, attesting exactly the bytes the child received.
+///
+/// The digest and the byte count advance per **successful** write, never per byte offered, so the
+/// evidence always describes the prefix the child actually read — a short write, a closed pipe, or
+/// a killed child truncates the attestation the same way it truncates the input. 2B2 compares this
+/// with the pack identity it recorded, so an attestation of bytes that were merely *intended* would
+/// prove nothing about what `index-pack` verified.
+struct AttestedChildStdinV1 {
+    child_stdin: std::process::ChildStdin,
+    digest: digest::Context,
+    length: usize,
+}
+
+impl AttestedChildStdinV1 {
+    fn new(child_stdin: std::process::ChildStdin) -> Self {
+        Self {
+            child_stdin,
+            digest: digest::Context::new(&digest::SHA256),
+            length: 0,
+        }
+    }
+
+    /// Deliver every byte of `bytes`, attesting each accepted chunk as it is accepted.
+    ///
+    /// `write_all` cannot be used here: it discards how much of the buffer reached the pipe before
+    /// an error, which is precisely the fact the evidence has to carry.
+    fn deliver(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+        let mut remaining = bytes;
+        while !remaining.is_empty() {
+            match self.child_stdin.write(remaining) {
+                Ok(0) => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::WriteZero,
+                        "the child accepted no further stdin bytes",
+                    ));
+                }
+                Ok(count) => {
+                    self.digest.update(&remaining[..count]);
+                    self.length += count;
+                    remaining = &remaining[count..];
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(())
+    }
+
+    fn evidence(self) -> GitStreamEvidenceV1 {
+        GitStreamEvidenceV1 {
+            length: self.length,
+            sha256: self
+                .digest
+                .finish()
+                .as_ref()
+                .try_into()
+                .expect("SHA-256 size"),
+        }
+    }
+}
+
 fn copy_input(
     source: GitStdinSourceV1,
-    mut child_stdin: std::process::ChildStdin,
-) -> std::io::Result<u64> {
+    child_stdin: std::process::ChildStdin,
+) -> std::io::Result<GitStreamEvidenceV1> {
+    let mut attested = AttestedChildStdinV1::new(child_stdin);
     match source {
-        GitStdinSourceV1::Bytes(bytes) => {
-            child_stdin.write_all(&bytes)?;
-            Ok(bytes.len() as u64)
-        }
+        GitStdinSourceV1::Bytes(bytes) => attested.deliver(&bytes)?,
         GitStdinSourceV1::File { file, max_bytes } => {
             // `take` is the read bound itself: the writer never reads a byte past the caller's
             // limit, so a descriptor that grew after its `fstat` cannot extend the child's input.
             let mut bounded = file.take(max_bytes);
-            let copied = std::io::copy(&mut bounded, &mut child_stdin)?;
+            // The copy is explicit rather than `std::io::copy` because every chunk has to pass
+            // through the attesting writer; a kernel-side copy would deliver bytes this seam never
+            // observed and so could not attest.
+            let mut buffer = [0_u8; 8192];
+            loop {
+                let count = bounded.read(&mut buffer)?;
+                if count == 0 {
+                    break;
+                }
+                attested.deliver(&buffer[..count])?;
+            }
             // Re-`fstat` rather than read further. A file that outgrew its bound would have been
             // silently truncated, which corrupts a pack instead of refusing it.
             if bounded.into_inner().metadata()?.len() > max_bytes {
@@ -1643,9 +1718,9 @@ fn copy_input(
                     "stdin grew past its {max_bytes}-byte bound while the child ran"
                 )));
             }
-            Ok(copied)
         }
     }
+    Ok(attested.evidence())
 }
 
 /// Name the `fstat` type a refused stdin descriptor actually had, so the typed refusal says what
@@ -1673,8 +1748,8 @@ fn describe_file_type(file_type: &std::fs::FileType) -> &'static str {
 /// Join the stdin writer exactly once, whatever the schedule, and keep its I/O result for the
 /// caller-facing error precedence below.
 fn join_writer(
-    writer: &mut Option<thread::JoinHandle<std::io::Result<u64>>>,
-) -> Result<std::io::Result<u64>, CustodyGitError> {
+    writer: &mut Option<thread::JoinHandle<std::io::Result<GitStreamEvidenceV1>>>,
+) -> Result<std::io::Result<GitStreamEvidenceV1>, CustodyGitError> {
     writer
         .take()
         .expect("the stdin writer is joined once")

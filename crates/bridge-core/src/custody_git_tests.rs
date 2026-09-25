@@ -1959,6 +1959,176 @@ fn ir1w3_file_stdin_must_be_regular_and_within_its_bound() {
     );
 }
 
+/// R2-W1: the runner must attest the bytes it actually delivered to the child's stdin, not the
+/// bytes its caller's descriptor happened to hold when the request was built. 2B2 compares this
+/// evidence with the pack identity it records (2B2 control 17), so a same-length in-place
+/// replacement between construction and `run` must be visible in the evidence.
+#[test]
+fn ir2w1_stdin_evidence_attests_the_bytes_the_child_received() {
+    // Deliberately not a multiple of the writer's 8 KiB buffer, so the delivered bytes span
+    // several successful writes and end on a partial one.
+    const BOUND: u64 = 20_000;
+
+    fn sha256(bytes: &[u8]) -> [u8; 32] {
+        digest::digest(&digest::SHA256, bytes)
+            .as_ref()
+            .try_into()
+            .expect("SHA-256 size")
+    }
+
+    let (_root_temp, root) = root_fixture();
+    // `cat` echoes the received stdin to stdout, so the stdout evidence is an independent
+    // observation of the same byte stream the stdin evidence claims.
+    let (_fixture, runner) = fixture_runner(
+        "#!/bin/sh\ncase \"$*\" in *version*) echo 'git version 2.54.0';; *) cat;; esac\n",
+        &root,
+    );
+    let deadline = || Instant::now() + SUCCESS_PATH_DEADLINE;
+    let limits = 4 * BOUND as usize;
+
+    // 1. The blocker's constructible state: the request is built from file A, and A is rewritten
+    //    in place with a same-length B before `run`. The child therefore reads B, and the evidence
+    //    must say B.
+    let original: Vec<u8> = (0..BOUND as usize)
+        .map(|index| (index % 251) as u8)
+        .collect();
+    let replacement: Vec<u8> = (0..BOUND as usize)
+        .map(|index| (index % 241) as u8)
+        .collect();
+    assert_eq!(original.len(), replacement.len());
+    assert_ne!(sha256(&original), sha256(&replacement));
+
+    let input = root.canonical_path().join("ir2w1-input");
+    fs::write(&input, &original).expect("write input A");
+    let request = GitRunRequestV1::from_file(
+        GitCommandV1::IndexPackStrictStdin,
+        fs::File::open(&input).expect("open input A"),
+        BOUND,
+        limits,
+        limits,
+        deadline(),
+    )
+    .expect("a regular file within its bound is accepted");
+    // Same path, same inode, same length: the retained descriptor now reads B.
+    fs::write(&input, &replacement).expect("replace A with a same-length B");
+    let swapped = runner
+        .run(&root, &names(), request, || Ok(()), || Ok(()))
+        .expect("the swap run succeeds");
+    assert_eq!(
+        swapped.captured_stdout().expect("captured stdout"),
+        replacement.as_slice(),
+        "the fixture must echo the bytes it received"
+    );
+    assert_eq!(
+        swapped.evidence.stdin.length,
+        replacement.len(),
+        "the stdin evidence must count the delivered bytes"
+    );
+    assert_eq!(
+        swapped.evidence.stdin.sha256,
+        sha256(&replacement),
+        "the stdin evidence must digest the delivered bytes"
+    );
+    assert_ne!(
+        swapped.evidence.stdin.sha256,
+        sha256(&original),
+        "the stdin evidence must not describe the bytes the file held at construction"
+    );
+    assert_eq!(
+        (swapped.evidence.stdin.length, swapped.evidence.stdin.sha256),
+        (
+            swapped.evidence.stdout.length,
+            swapped.evidence.stdout.sha256
+        ),
+        "the echoed stdout evidence is the independent observation of the same stream"
+    );
+
+    // 2. Exact-bound positive: a regular file of exactly the bound is delivered whole and attested
+    //    whole.
+    let exact = root.canonical_path().join("ir2w1-exact");
+    fs::write(&exact, &original).expect("write exact-bound input");
+    let request = GitRunRequestV1::from_file(
+        GitCommandV1::IndexPackStrictStdin,
+        fs::File::open(&exact).expect("open exact-bound input"),
+        BOUND,
+        limits,
+        limits,
+        deadline(),
+    )
+    .expect("a regular file of exactly the bound is accepted");
+    let at_bound = runner
+        .run(&root, &names(), request, || Ok(()), || Ok(()))
+        .expect("exact-bound run");
+    assert_eq!(at_bound.evidence.stdin.length, BOUND as usize);
+    assert_eq!(at_bound.evidence.stdin.sha256, sha256(&original));
+    assert_eq!(
+        at_bound.evidence.stdin.sha256,
+        at_bound.evidence.stdout.sha256
+    );
+
+    // 3. Empty-stdin positives, for both stdin sources. An empty stream is the SHA-256 of no
+    //    bytes, never a zeroed or absent digest.
+    let empty_digest = sha256(&[]);
+    let empty_file = root.canonical_path().join("ir2w1-empty");
+    fs::write(&empty_file, b"").expect("write empty input");
+    let request = GitRunRequestV1::from_file(
+        GitCommandV1::IndexPackStrictStdin,
+        fs::File::open(&empty_file).expect("open empty input"),
+        BOUND,
+        limits,
+        limits,
+        deadline(),
+    )
+    .expect("an empty regular file is accepted");
+    let empty_from_file = runner
+        .run(&root, &names(), request, || Ok(()), || Ok(()))
+        .expect("empty-file run");
+    assert_eq!(empty_from_file.evidence.stdin.length, 0);
+    assert_eq!(empty_from_file.evidence.stdin.sha256, empty_digest);
+
+    let empty_in_memory = runner
+        .run(
+            &root,
+            &names(),
+            GitRunRequestV1::new(
+                GitCommandV1::IndexPackStrictStdin,
+                Vec::new(),
+                limits,
+                limits,
+                deadline(),
+            ),
+            || Ok(()),
+            || Ok(()),
+        )
+        .expect("empty in-memory run");
+    assert_eq!(empty_in_memory.evidence.stdin.length, 0);
+    assert_eq!(empty_in_memory.evidence.stdin.sha256, empty_digest);
+
+    // 4. In-memory stdin is attested by the same writer, so a bounded control input carries the
+    //    same evidence shape as a descriptor-backed pack.
+    let in_memory = runner
+        .run(
+            &root,
+            &names(),
+            GitRunRequestV1::new(
+                GitCommandV1::IndexPackStrictStdin,
+                replacement.clone(),
+                limits,
+                limits,
+                deadline(),
+            ),
+            || Ok(()),
+            || Ok(()),
+        )
+        .expect("in-memory run");
+    assert_eq!(in_memory.evidence.stdin.length, replacement.len());
+    assert_eq!(in_memory.evidence.stdin.sha256, sha256(&replacement));
+    assert_eq!(
+        in_memory.evidence.stdin.sha256,
+        in_memory.evidence.stdout.sha256
+    );
+}
+
 #[test]
 fn a14_ast_inventory_keeps_new_unsafe_boundaries_exact() {
     use std::collections::BTreeMap;
