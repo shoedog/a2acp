@@ -103,7 +103,9 @@ caller budgets, a sealer, a non-cloneable generation-bound `CustodyCaptureCapabi
 `GitRouteRequestV1`: the absolute Git path and its expected SHA-256 digest. 2B2 passes the route request to the
 runner unchanged. It never locates Git, never computes the expected digest itself, and has no production
 trust-on-first-use. Where the digest comes from is decided by the later wiring slice. Tests supply it through 2B2a's
-test-only trust-on-first-use helper. It derives the
+test-only trust-on-first-use helper. 2B2a keeps `GitRouteRequestV1` `pub(crate)`. If the 2B2 entry point is `pub`, the 2B2 review must
+decide between a crate-public entry point and a public opaque request type with controlled constructors, and add the
+matching compile doctest (2B2a delta round 6, S3). It derives the
 `CustodyCapsuleLayoutV1` itself from the manifest; it does not accept a caller layout. Caller budgets are validated
 to be at or below the fixed §3 ceilings and are otherwise refused.
 
@@ -438,7 +440,7 @@ Stop for spec/design review if:
 - the scratch-wide ledger cannot account for a Git child's writes;
 - the diff escapes the owned paths.
 
-Next action: complete 2B2a first. After 2B2a is approved and merged, review this revision-7 task under a new
+Next action: complete 2B2a first. After 2B2a is approved and merged, review this revision-8 task under a new
 two-round cap scoped to the post-split exporter, bound to the 2B2a merge. Only a separately authorized, approved task
 may begin 2B2 implementation. Review approval does not authorize push, merge, cleanup, 2B3 restore,
 remote/provider effects, or running-operator mutation.

@@ -3,8 +3,10 @@ task-type: implement
 ---
 # ADR-0041 Slice 2B2a — descriptor seam and hardened Git runner
 
-**Status:** review candidate, revision 6; planning/documentation only. Extension round 5 resolved round 4 and
-raised 4 WRONG / 1 SMELL, all closed consequences of the new digest mechanism. Revision 6 folds them (§17).
+**Status:** review candidate, revision 7; planning/documentation only.
+
+- Extension round 5 resolved round 4 and raised 4 WRONG / 1 SMELL, folded in revision 6 (§17).
+- Delta round 6 resolved three of those and refined one to 1 WRONG / 3 SMELL, folded in revision 7 (§18).
 
 - On 2026-09-24 the owner chose to split this child out of Slice 2B2 (2B2 task revision 6, `cf93c7e4`, §16
   option 1). 2B2a delivers the filesystem seam and the Git runner that 2B2's exporter builds on. It carries
@@ -134,7 +136,9 @@ re-pinning after Git updates — is decided by the later wiring slice. 2B2a only
    O_CLOEXEC`. All final-file facts come from that descriptor via `fstat`: that it is a regular file, its owner, its
    mode, and its identity.
 3. Apply the ancestor audit and the path-based `faccessat` write-denial checks. Then bind them to the opened object:
-   a no-follow `stat` of the canonical path, taken **after** those checks, must equal the descriptor's identity. Any
+   a no-follow `stat` of the canonical path, taken **after** those checks, must equal the descriptor's full
+   **route-fact set**: device, inode, file type, owner uid, group gid, mode, size, mtime, and ctime. A `chmod`,
+   ownership change, or ACL change on the same inode advances its ctime, which the executing user cannot reset. Any
    difference is a typed `RouteIdentityChanged` refusal.
 4. Stream the SHA-256 **from that same descriptor**. Require it to equal the expected digest, or return a typed
    `DigestMismatch` refusal. Record the expected and observed digests and the descriptor identity either way. The
@@ -168,8 +172,9 @@ Both test profiles use `faccessat` write denial when the effective uid is non-ze
 write access, so they instead require that no group or other write bits are set on the file or on any audited
 directory, and they record `write_check=mode_bits_as_root`. Production has neither profile; control A17 covers them.
 
-**Rechecks:** the admitted route's file identity (device, inode, size, and modification time) and its SHA-256
-(which equals the expected digest) are recorded at admission. They are rechecked **before every spawn and after every child exits**.
+**Rechecks:** the admitted route's full route-fact set (step 3) and its SHA-256 (which equals the expected digest)
+are recorded at admission. Before every spawn, the runner also re-runs the route rule, meaning the ancestor audit and
+effective write denial, and then re-binds the fact set. They are rechecked **before every spawn and after every child exits**.
 
 - A pre-spawn mismatch refuses before the child starts.
 - A post-exit mismatch returns a typed `BinaryDrift` outcome, which the caller must treat as incomplete.
@@ -298,9 +303,9 @@ inadmissible until the fixture is repaired.
 | A5a | a trusted-owner wrapper fixture (non-writable, valid `version` output) that runs a marker-writing program, admitted with the expected digest of a **different** file | §4.1 digest pin | typed `DigestMismatch` before any execution; no marker. A mutation that skips the digest comparison makes the marker appear. The same fixture with its own digest pinned is admitted, the caller's recorded decision | 2B2 #28a; 2B2a R3 W1, R4 W1 |
 | A5b | an admitted route replaced at its path after admission, before the next spawn | §4.1 pre-spawn recheck | refusal before the next spawn | 2B2 #22 |
 | A5c | an admitted fixture route replaced by an `exit 0` binary after the pre-spawn recheck, inside a deterministic hook | §4.1 post-exit recheck | typed `BinaryDrift` | 2B2 #28b |
-| A5e | a hook between the route audit (step 3) and the identity binding installs, at the path, a byte-identical file whose owner or mode fails the route rule | §4.1 step 3 identity binding | typed `RouteIdentityChanged` before `version`, no marker. Deleting the binding admits it and runs the marker | 2B2a R5 W2 |
+| A5e | a hook between the route audit (step 3) and the identity binding installs, at the path, a byte-identical file whose owner or mode fails the route rule | §4.1 step 3 identity binding | typed `RouteIdentityChanged` before `version`, no marker. Deleting the binding admits it and runs the marker. **Same-inode arm:** after the `faccessat` check, the hook `chmod`s the same file to `0777` with bytes and mtime preserved; this must also refuse, and deleting the mode and ctime comparison executes the marker. **Pre-spawn arm:** the same `chmod` after admission must refuse before the next spawn | 2B2a R5 W2; R6 W1 |
 | A5f | after admission and before the next spawn, rewrite the admitted fixture **in place** (same inode), same length, with its modification time restored | §4.1 pre-spawn rehash | typed `DigestMismatch` before spawn, no marker. Removing the pre-spawn rehash executes the rewritten marker binary | 2B2a R5 W3 |
-| A5g | during a child, a deterministic hook makes the same in-place, same-length, mtime-restored rewrite | §4.1 post-exit rehash | typed `BinaryDrift`. Removing the post-exit rehash returns success | 2B2a R5 W3 |
+| A5g | **fixture protocol:** the admitted route is a non-writable shell-wrapper fixture that signals readiness and then `exec`s `/bin/sleep`, so the wrapper file is not mapped as running text (a native fixture can hit `ETXTBSY` on Linux). While the child lives, a hook temporarily makes the wrapper writable, rewrites it in place at the same length, restores the mode, and restores the mtime with safe `File::set_modified`. The harness asserts the rewrite succeeded before accepting a result | §4.1 post-exit rehash | typed `BinaryDrift`. Removing the post-exit rehash returns success | 2B2a R5 W3 |
 | A6 | a fixture binary dumps its environment and cwd | §4.2 allowlist | the environment equals exactly the allowlist and the cwd identity equals the root; adding one inherited variable turns it red | new |
 | A7 | golden argv per `GitCommandV1` variant | §4.3 fixed argv table | exact match; adding or removing one argument turns it red | new |
 | A8 | a fixture binary writes cap+1 stdout bytes, and separately exactly cap bytes | §4.4 stdout bound | typed cap refusal with the child killed; the exact-cap run succeeds | new |
@@ -406,7 +411,7 @@ These must be restated verbatim in the handoff.
 
 ## 11. Next action
 
-Extension review round 5 is limited to the revision-5 delta. On 2026-09-24 the owner authorized implementation once
+Extension review round 7 is limited to the revision-7 delta. On 2026-09-24 the owner authorized implementation once
 this review clears. Implementation starts with the pre-code lane inventory in §4.1, and a failed inventory is a stop
 condition (§9). Approval does not authorize push, merge, cleanup, or running-operator mutation.
 
@@ -555,3 +560,16 @@ of the digest mechanism the owner chose, each with a bounded fix.
 | R5 W3 | no control discriminated the pre-spawn and post-exit rehash | A5f and A5g, same-inode, same-length, mtime-restored rewrites |
 | R5 W4 | `/usr/bin/git` was both forbidden and supported | §4.1: no default, fallback, locator, or `PATH` search; executes exactly the caller-supplied admitted route; §16 reconciled |
 | R5 S1 | roadmap token was stale | roadmap updated |
+
+## 18. Revision 7 — delta round 6 fold (2026-09-24)
+
+Delta round 6 was a host Codex `gpt-5.6-sol`/`xhigh`/read-only turn on revision 6 at `fb7c4aab`. Its verdict was
+**REJECT**: round-5 W1, W3, and W4 RESOLVED; W2 and S1 UNRESOLVED; new 1 WRONG / 3 SMELL. The full record is
+`docs/superpowers/reviews/2026-09-24-adr0041-slice2b2a-spec-review-round6.md`. WRONG went from 4 to 1, converging.
+
+| ID | Finding | Fold |
+|---|---|---|
+| R6 W1 (R5 W2 residue) | the binding compared only device, inode, size, and mtime, so a same-inode `chmod` or ACL change slipped through | §4.1 step 3 full route-fact set including owner, gid, mode, and ctime; route rule re-run before every spawn; A5e same-inode and pre-spawn arms |
+| R6 S1 | stale status tokens | roadmap, handoff, 2B2 §10, and 2B2a §11 updated |
+| R6 S2 | A5g fixture shape unstated (`ETXTBSY`) | A5g shell-wrapper `exec /bin/sleep` protocol, with a rewrite-succeeded assertion |
+| R6 S3 | route-request visibility across a public 2B2 entry point | deferred to the post-split 2B2 review; recorded in 2B2 §2. 2B2a keeps `GitRouteRequestV1` `pub(crate)` |
