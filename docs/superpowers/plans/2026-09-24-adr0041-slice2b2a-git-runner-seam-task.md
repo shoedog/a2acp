@@ -3,7 +3,8 @@ task-type: implement
 ---
 # ADR-0041 Slice 2B2a — descriptor seam and hardened Git runner
 
-**Status:** review candidate, revision 3; planning/documentation only.
+**Status:** review candidate, revision 4; planning/documentation only. Extension round 3 rejected revision 3 with
+1 WRONG / 3 SMELL, still converging; revision 4 folds them (§15).
 
 - Spec review round 1 of 2 rejected revision 1 with 5 WRONG / 5 SMELL; revision 2 folded all ten (§13).
 - Round 2 of 2 resolved all ten, but rejected with 2 new WRONG / 5 SMELL. That is a converging, closed population.
@@ -33,8 +34,11 @@ implementation starts only after 2B2a is approved and merged, and uses 2B2a's AP
 The child is complete only when:
 
 1. every item is `pub(crate)` and production-unwired: no caller outside tests exists until 2B2;
-2. the runner cannot execute an unadmitted binary, a free-form argv, an inherited environment variable, or an
-   unrooted child;
+2. every `exec` the runner itself performs targets only the admitted locator or the admitted Git route, with a
+   fixed argv, the closed environment, and a rooted cwd. An admitted route is a root-owned binary that the executing
+   user cannot write. Its own descendants are trusted exactly as any privileged installation is (HL3). 2B2a detects
+   the known `xcrun` trampoline pattern, but it does not prove that an admitted root-owned program is Git, or that it
+   never dispatches to other executables;
 3. every control in §5 discriminates its single guard on host macOS and on an admitted native Linux ext4 lane;
 4. every failure is typed and leaves no effect outside the caller-provided pinned root.
 
@@ -123,7 +127,9 @@ The runner resolves one admitted Git binary once. **No Git binary executes befor
 2. **Admit.** The runner first `lstat`s the located or configured path's **final component without following it**,
    and refuses a symlink. Only then does it canonicalize the path and apply the route rule to the canonical file and
    every ancestor. All of this happens **before the binary's first execution**; a refusal leaves nothing executed.
-3. **Confirm the fixed point.** After admission, the admitted binary's `--exec-path` must contain a `git` that is
+3. **Confirm the fixed point.** This is a trampoline and wrapper **heuristic** for the known locator pattern, not a
+   proof of Git identity (§1 item 2, HL3). After admission, the admitted binary's `--exec-path` must contain a `git`
+   that is
    either the same file identity, or a distinct regular file that is byte-identical (equal SHA-256) and itself
    passes the route rule. Debian packages `/usr/lib/git-core/git` as a separate byte-identical copy (probe P5). Both
    identities and digests are recorded. Anything else, such as a wrapper, trampoline, or differing content, is a
@@ -385,12 +391,24 @@ These must be restated verbatim in the handoff.
   store from yielding a wrong pack.
 - **HL2:** an identical substitution of a newly created directory (empty, same owner and mode) between `mkdirat` and
   `openat` is undetectable. The substitute is necessarily a directory inside the retained parent at open time.
-- **HL3:** root or another privileged user replacing and restoring the admitted route entirely within one child's
-  window. A persisting replacement is detected after the child.
+- **HL3:** privileged installation, in two forms:
+  - root or another privileged user replacing and restoring the admitted route entirely within one child's window.
+    A persisting replacement is detected after the child;
+  - a root-owned program admitted as Git that is not Git, or that dispatches to other executables. An example is a
+    privileged wrapper, including byte-identical copies that pass the fixed point. 2B2a trusts an admitted route's
+    descendants as it trusts any privileged installation, and it does not maintain a digest allowlist, because every
+    OS or Git update would change the digest. The admitted path, identity, SHA-256, version string, and fixed-point
+    result are recorded, so a wrong admission is auditable after the fact.
 
 ## 11. Next action
 
-Independently review this task, round 1 of 2. Only a separately authorized, approved task may begin implementation.
+Extension review round 4 is limited to the revision-4 delta. On 2026-09-24 the owner authorized implementation once
+this review clears. Implementation starts with the pre-code probes, and a failed probe is a stop condition (§9):
+
+- P7: `xcrun` executes nothing;
+- the GitHub ubuntu runner lane inventory;
+- the lane recording in §4.1.
+
 Approval does not authorize push, merge, cleanup, or running-operator mutation.
 
 ## 12. Provenance
@@ -487,3 +505,18 @@ admissible for package layout and flags only, not as native-filesystem evidence.
   `/private/var/folders`, and `/private/tmp` is 1777.
 - **P7 (required at implementation time):** run `xcrun --find git` with a controlled developer directory whose `git`
   writes a marker, and confirm no marker appears.
+
+## 15. Revision 4 — extension round 3 fold (2026-09-24)
+
+Extension round 3 was a host Codex `gpt-5.6-sol`/`xhigh`/read-only turn on revision 3 at `81b6a51f`. Its verdict was
+**REJECT**: round-2 items 5 RESOLVED / 0 UNRESOLVED / 2 DEFERRED (S4, S5, both fail-closed pre-code probes); new
+1 WRONG / 3 SMELL. The full record is `docs/superpowers/reviews/2026-09-24-adr0041-slice2b2a-spec-review-round3.md`.
+
+WRONG counts across the loop were 5 → 2 → 1, so it is converging.
+
+| ID | Finding | Fold |
+|---|---|---|
+| R3 W1 | byte-identical fixed-point admission can admit a copied wrapper that dispatches to an unadmitted program, which contradicts §1's categorical claim | Of the reviewer's two bounded options, the §1 claim is narrowed: the runner's own `exec`s target only admitted routes, and descendants of an admitted root-owned program are trusted as a privileged installation (HL3). The fixed point is documented as a heuristic. A digest allowlist was rejected because every OS or Git update would break admission. The same wrapper class already passed an identity-only fixed point, so revision 3 did not create this exposure; it only made the overclaim visible. The owner's ruling that privileged actors are out of scope governs. |
+| R3 S1 | P7 still unexecuted | unchanged: a fail-closed pre-code probe (§9, §11) |
+| R3 S2 | the GitHub ubuntu runner lane is unmeasured | unchanged: a fail-closed pre-code inventory (§4.1, §9, §11) |
+| R3 S3 | §11 was stale | §11 rewritten |
