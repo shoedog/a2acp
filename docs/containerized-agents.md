@@ -69,7 +69,9 @@ mount breaks refresh):
 
   `sync-creds.sh` falls back to that token when the host file is absent. It writes
   `~/.config/a2a-creds/claude/.credentials.json` owner-only, with no refresh token, so a container never rotates the
-  host login, and it never echoes the token.
+  host login, and it never echoes the token. It **preserves the file's inode**, skipping unchanged content and
+  overwriting in place: containers bind-mount this single file, and an atomic rename makes it vanish inside any
+  container that has not opened it yet, which surfaces as `Authentication required`.
 
   Caveats:
   - `a2a-bridge doctor`'s `provenance:claude:oauth-credential` check still reads only the host file, so it reports
