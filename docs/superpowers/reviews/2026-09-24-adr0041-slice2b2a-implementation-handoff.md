@@ -426,6 +426,42 @@ and no `unsafe` site was added, so the A14 inventory is unchanged. Gates run wit
 `custody_git` is 24 → 25 and the whole lib 764 → 765: the one new R2-W1 control. The workspace-wide
 gates listed under *Verification commands and results* remain not run in this container.
 
+## Independent implementation review — outcome (2026-09-25)
+
+The reviewer was host Codex `gpt-5.6-sol` / `xhigh` / `read-only` via `codex-acp`, using the operator binary at merge
+`d2cbf4e0`. Each brief stated the goal and required WRONG/SMELL and MATERIAL/IMMATERIAL tags. The declared cap was
+two rounds, plus narrow extensions the owner pre-authorized while the review converged.
+
+| Round | Reviewed | Verdict | Findings | Raw result SHA-256 |
+|---|---|---|---|---|
+| 1 | `90c5c247..14578f3b` | REJECT | 4 WRONG (all MATERIAL; W4 theoretical-only) / 3 SMELL | `28fa7142a9a8f5982f063b25298856ca8ad933a2e5ea76574c01dbc30f8fa9ab` |
+| 2 | `14578f3b..80553ffc` | REJECT | W1–W3 and S1 resolved; W4, S2, and S3 accepted as deferred; 1 MATERIAL WRONG (stdin not attested) | `7571341e8764d9b07191fdfe1887461dc79241e6632236965a507353e2f0b21e` |
+| 3 (extension, delta) | `80553ffc..d0bf020a` | **APPROVE** | R2-W1 and R2-S4 resolved; 1 IMMATERIAL SMELL | `1072dcabc3cbf9a83729a98c7bdd14a7061017d4e4d67cef43f8c24da81f05b9` |
+
+Material blockers went 4 → 1 → 0.
+
+**Final deferred ledger** (follow-up slices; none blocks merge):
+
+- **W4 — process-group ID reuse after the leader is reaped.** Theoretical-only. A later group signal could reach a
+  reused ID if the ID is reused inside the gap between the last pipe holder exiting and the drain completing. The fix
+  is an unreaped leader anchor, via `waitid(WNOWAIT)` or an equivalent, which adds an `unsafe` boundary and is a spec
+  amendment.
+- **S2 — signal branches.** An injectable signal-outcome state machine with deterministic tests for the
+  `EPERM`→success, `EPERM`→exited, and persistent-`EPERM` branches. Today they are covered by a fail-first
+  zombie-group regression plus stress evidence.
+- **S3 — A18 domain tags.** Exact-digest fixtures for the tags, plus a same-tag mutation.
+- **R3-S1 — writer negative paths.** A scripted `Write` harness for short writes, `Interrupted`, `WriteZero`, and a
+  partial write followed by `BrokenPipe`. Also reword the comments that call attested bytes "received": they are bytes
+  **accepted by the pipe**, not proof the child consumed them. 2B2 still requires real `index-pack` success.
+
+**Lanes:**
+
+| Lane | Status |
+|---|---|
+| macOS host | green (see the round-3 section) |
+| Linux implement container (overlayfs) | a named exclusion as native evidence; its gates are green |
+| Native ext4 (GitHub Actions ubuntu) | decided by PR CI: the live probe **asserts** `Admitted` under `GITHUB_ACTIONS=true` |
+
 ## Pre-code lane inventory
 
 | Lane | Route | inode / links | SHA-256 | Version | Status |
