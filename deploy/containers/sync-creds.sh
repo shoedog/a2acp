@@ -58,11 +58,32 @@ sync_claude() {
   mkdir -p "$DEST/claude"
   local expires tmp
   expires=$(( ( $(date +%s) + 330 * 86400 ) * 1000 ))
-  tmp="$(umask 077 && mktemp "$DEST/claude/.credentials.json.XXXXXX")"
+  # Preserve the destination INODE. Containers bind-mount this single file, and a bind mount pins the inode: an
+  # atomic `mv` replacement makes the file vanish inside any container that has not opened it yet, and the agent then
+  # reports "Authentication required". So skip the write when nothing changed (the token is stable, and only this
+  # script's expiry would move), and otherwise overwrite in place, as `sync_file`'s `cp` does.
+  tmp="$(umask 077 && mktemp "$DEST/claude/.credentials.XXXXXX")"
   printf '{"claudeAiOauth":{"accessToken":"%s","refreshToken":null,"expiresAt":%s,"scopes":["user:inference"],"subscriptionType":null}}' \
     "$token" "$expires" > "$tmp"
-  chmod 600 "$tmp"
-  mv -f "$tmp" "$dst"
+  if [ -f "$dst" ] && python3 - "$tmp" "$dst" <<'PY' 2>/dev/null
+import json, sys
+new, old = (json.load(open(p))["claudeAiOauth"] for p in sys.argv[1:3])
+same_token = new["accessToken"] == old.get("accessToken")
+# Keep the existing file while its expiry still has more than 30 days of runway.
+fresh = old.get("expiresAt", 0) - new["expiresAt"] > -300 * 86400 * 1000
+sys.exit(0 if same_token and fresh else 1)
+PY
+  then
+    rm -f "$tmp"
+    echo "kept   claude  (long-lived OAuth token copy unchanged; inode preserved)"
+    return
+  fi
+  if [ ! -f "$dst" ]; then
+    (umask 077 && : > "$dst")
+  fi
+  chmod 600 "$dst"
+  cat "$tmp" > "$dst"   # in place: keeps the inode that running containers have bind-mounted
+  rm -f "$tmp"
   echo "synced claude  <- long-lived OAuth token (no refresh token; never rotates the host login)"
 }
 
