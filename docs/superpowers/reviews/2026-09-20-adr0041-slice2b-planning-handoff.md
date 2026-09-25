@@ -19,7 +19,7 @@
 2. Read ADR-0041 §§4, 8, 9, 11, 14, and 17; the Slice 2A handoff §4; and the complete plan in §6.
 3. Bind both 2B1 review records, the final approved closure, and the Slice 2B2 review candidate in §6.
 4. Preserve reviewed candidate `88013eb4`, merge `5e431f4f`, and the historical planning branch.
-5. **The owner split 2B2 on 2026-09-24:** the descriptor seam and Git runner are now child **2B2a** (`docs/superpowers/plans/2026-09-24-adr0041-slice2b2a-git-runner-seam-task.md`, revision 2; round 1 REJECTED 5 WRONG / 5 SMELL, closed and folded, record `docs/superpowers/reviews/2026-09-24-adr0041-slice2b2a-spec-review-round1.md`; round 2 of 2 next). 2B2 is at revision 7 (split), depends on 2B2a, and resumes review under a new cap after 2B2a is approved. Earlier: 2B2 revisions 1–6 went through a pre-review audit plus three Sol/xhigh rounds (records `docs/superpowers/reviews/2026-09-24-adr0041-slice2b2-spec-review-round{1,2,3}.md`), and the owner ruled hostile same-user racers out of scope.
+5. **The owner split 2B2 on 2026-09-24:** the descriptor seam and Git runner are now child **2B2a** (`docs/superpowers/plans/2026-09-24-adr0041-slice2b2a-git-runner-seam-task.md`, revision 3; round 1 REJECTED 5 WRONG / 5 SMELL and round 2 REJECTED 2 WRONG / 5 SMELL, both converging, closed, and folded; records `docs/superpowers/reviews/2026-09-24-adr0041-slice2b2a-spec-review-round{1,2}.md`; the owner authorized a cap extension and implementation once the review clears; extension round 3 next). 2B2 is at revision 7 (split), depends on 2B2a, and resumes review under a new cap after 2B2a is approved. Earlier: 2B2 revisions 1–6 went through a pre-review audit plus three Sol/xhigh rounds (records `docs/superpowers/reviews/2026-09-24-adr0041-slice2b2-spec-review-round{1,2,3}.md`), and the owner ruled hostile same-user racers out of scope.
 
 **STOP conditions:** Do not start 2B2/2B3 effects, use a bare path as a quiescence/capture capability, add remote/provider/destructive authority, publish the docs branch, or mutate the running operator. An open-class review population or exhausted nonconverging cap parks the plan.
 
@@ -97,7 +97,7 @@
 | Provenance review raw result SHA-256 | `ae10a401186fc9933a959a17ff6da1c8d5727f0e2ee79440ab63306663fb2eb0` |
 | Published branch / PR | `feat/adr0041-slice2b1-capsule-contracts-20260923` / `https://github.com/shoedog/a2acp/pull/105` |
 | Slice 2B2 review candidate | `docs/superpowers/plans/2026-09-23-adr0041-slice2b2-isolated-export-task.md` (revision 7, split; rev 1 `c7536a56`, rev 2 `1c22d0d0`, rev 3 `a1177a66`, rev 4 `c91b35bf`, rev 5 `52e474fa`, rev 6 `cf93c7e4`) |
-| Slice 2B2a review candidate | `docs/superpowers/plans/2026-09-24-adr0041-slice2b2a-git-runner-seam-task.md` (revision 2; rev 1 `054c889b`) |
+| Slice 2B2a review candidate | `docs/superpowers/plans/2026-09-24-adr0041-slice2b2a-git-runner-seam-task.md` (revision 3; rev 1 `054c889b`, rev 2 `be10c255`) |
 | Slice 2B2 spec review round 2 | `docs/superpowers/reviews/2026-09-24-adr0041-slice2b2-spec-review-round2.md`; REJECT 6 WRONG / 3 SMELL; cap exhausted |
 | Slice 2B2 spec review round 3 (extension) | `docs/superpowers/reviews/2026-09-24-adr0041-slice2b2-spec-review-round3.md`; REJECT 6 WRONG / 2 SMELL, closed; folded in revision 6 |
 | Slice 2B2 spec review round 1 | `docs/superpowers/reviews/2026-09-24-adr0041-slice2b2-spec-review-round1.md`; REJECT 5 WRONG / 9 SMELL, all folded in revision 3 |
@@ -106,4 +106,4 @@
 
 **§2c verdict:** REFUTED — corrected in place · claim: "The second repair closes all three inherited Slice 2B1 WRONG mechanisms." · pass: INDEPENDENT · evidence tier: STATIC-ONLY plus inherited mutation/full-gate evidence · record: `docs/superpowers/reviews/2026-09-23-adr0041-slice2b1-second-closure-review.md`
 
-**Cycle-1 repair status:** APPROVED and merged as PR #105 at `5e431f4f`. R1/R2/R3 are RESOLVED with no blocker. Slice 2B2 was split on 2026-09-24: 2B2a (seam and Git runner) is at revision 2 after spec review round 1, and 2B2 is at revision 7 depending on 2B2a. Both are unimplemented; 2B2/2B3 effects and operator mutation remain separate gates.
+**Cycle-1 repair status:** APPROVED and merged as PR #105 at `5e431f4f`. R1/R2/R3 are RESOLVED with no blocker. Slice 2B2 was split on 2026-09-24: 2B2a (seam and Git runner) is at revision 3 after spec review rounds 1–2, with extension round 3 next, and 2B2 is at revision 7 depending on 2B2a. Both are unimplemented; 2B2/2B3 effects and operator mutation remain separate gates.

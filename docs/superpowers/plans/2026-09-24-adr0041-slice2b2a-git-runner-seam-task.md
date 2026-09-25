@@ -3,9 +3,14 @@ task-type: implement
 ---
 # ADR-0041 Slice 2B2a — descriptor seam and hardened Git runner
 
-**Status:** review candidate, revision 2; planning/documentation only. Implementation is not authorized by this file.
-Spec review round 1 of 2 rejected revision 1 with 5 WRONG / 5 SMELL, a closed population; revision 2 folds all ten
-(§13).
+**Status:** review candidate, revision 3; planning/documentation only.
+
+- Spec review round 1 of 2 rejected revision 1 with 5 WRONG / 5 SMELL; revision 2 folded all ten (§13).
+- Round 2 of 2 resolved all ten, but rejected with 2 new WRONG / 5 SMELL. That is a converging, closed population.
+- Revision 3 folds those seven, plus three host-probed defects: the Debian fixed point, the minimum-version lanes,
+  and admission for tests (§14).
+- On 2026-09-24 the owner authorized a cap extension if needed, and implementation once the review clears.
+  Extension round 3 reviews this revision.
 On 2026-09-24 the owner chose to split this child out of Slice 2B2 (2B2 task revision 6, `cf93c7e4`, §16 option 1).
 2B2a delivers the filesystem seam and the Git runner that 2B2's exporter builds on. It carries requirements already
 shaped by the pre-review audit and three independent 2B2 review rounds (§12).
@@ -115,10 +120,14 @@ The runner resolves one admitted Git binary once. **No Git binary executes befor
      rechecks, and runs with the §4.2 closed environment and bounded stdout.
    - On Linux, and on macOS when the operator configures one explicitly, the candidate is a configured absolute path.
      No locator runs.
-2. **Admit.** The runner canonicalizes the located or configured path and applies the route rule to it **before its
-   first execution**. A refusal leaves nothing executed.
-3. **Confirm the fixed point.** After admission, the admitted binary's `--exec-path` must contain a `git` that
-   resolves to the same file identity. A mismatch, such as a wrapper or trampoline, is a typed refusal.
+2. **Admit.** The runner first `lstat`s the located or configured path's **final component without following it**,
+   and refuses a symlink. Only then does it canonicalize the path and apply the route rule to the canonical file and
+   every ancestor. All of this happens **before the binary's first execution**; a refusal leaves nothing executed.
+3. **Confirm the fixed point.** After admission, the admitted binary's `--exec-path` must contain a `git` that is
+   either the same file identity, or a distinct regular file that is byte-identical (equal SHA-256) and itself
+   passes the route rule. Debian packages `/usr/lib/git-core/git` as a separate byte-identical copy (probe P5). Both
+   identities and digests are recorded. Anything else, such as a wrapper, trampoline, or differing content, is a
+   typed refusal.
 
 The locator path, the admitted path, and the fixed-point result are recorded as evidence. `/usr/bin/git` itself is
 never executed.
@@ -133,10 +142,20 @@ never executed.
 
 A user-owned route, such as a Homebrew symlink, and any writable component are refused with a typed route refusal.
 
-The rule is a pure function over collected metadata plus the trusted-owner uid. The production constructor fixes the
-trusted owner at uid 0. A `#[cfg(test)]` constructor takes the test user's uid, so fixture binaries can be admitted:
-mode-`0555` files in mode-`0555` directories owned by that user. With that uid, the executing user owns the fixture, so
-the test-only constructor skips the uid-0 check.
+The rule is a pure function over collected metadata plus an admission profile. The **production** profile trusts
+owner uid 0, audits every ancestor up to `/`, uses `faccessat` for write denial, and refuses to run as uid 0. Two
+`#[cfg(test)]` profiles exist because tests run both as an ordinary user (macOS host, GitHub runner) and as root
+(the implement/verify container, probe P6):
+
+- **`for_test_fixture(trust_anchor)`** — for fixture binaries created by tests. The trusted owner is the effective
+  uid. The ancestor audit covers the anchor and everything below it, and stops at the anchor, because temp-directory
+  ancestors such as `/tmp` (mode `1777`) or root-owned `/var/folders` can never pass a production audit.
+- **`for_test_system()`** — for real-Git tests. The trusted owner is uid 0, with a full ancestor audit and no uid-0
+  refusal.
+
+Both test profiles use `faccessat` write denial when the effective uid is non-zero. As root, `faccessat` cannot deny
+write access, so they instead require that no group or other write bits are set on the file or on any audited
+directory, and they record `write_check=mode_bits_as_root`. Production has neither profile; control A17 covers them.
 
 **Rechecks:** the admitted route's file identity (device, inode, size, and modification time) and SHA-256 are
 recorded at admission. They are rechecked **before every spawn and after every child exits**.
@@ -149,6 +168,19 @@ recorded at admission. They are rechecked **before every spawn and after every c
 implementation time by a probe. The probe must show that version honors every flag and variable in §4.2. The parser
 accepts vendor suffixes such as `(Apple Git-157)`. Malformed output, a nonzero exit status, or a version below the
 minimum is a typed refusal (control A13).
+
+The minimum is at least the first version that accepts `--no-lazy-fetch`. Probe P6 showed Debian 12's distro Git
+2.39.5 rejects it with exit 129, while Git 2.54 accepts it. Older distro Gits, such as Debian 12's and possibly
+Ubuntu 22.04's or 24.04's, are therefore refused with a typed version error, which is correct behavior. The supported
+lanes are:
+
+- macOS Command Line Tools Git, located through `xcrun`;
+- the GitHub Actions ubuntu runner's Git;
+- the implement and verify container's `/opt/git/bin/git` (2.54, root-owned, 148 hard links). This lane admits only
+  through the root test profile, and it is a non-native overlay lane.
+
+Before any production code, the implementation records each lane's device/inode, SHA-256, `--exec-path`, and version.
+If the GitHub runner's Git cannot be admitted, that is a stop condition.
 
 ### 4.2 Closed environment, flags, and rooting
 
@@ -222,6 +254,13 @@ bounded stderr, the exit status, and an evidence record. The evidence record hol
 admitted routes, the Git version, and every environment **key and value**. Relative names are recorded as given;
 object-store route paths are recorded as SHA-256 digests of their bytes, under the existing path-redaction policy. The
 record also holds the root directory identity, the exit status, and the lengths and SHA-256 of each stream.
+Object-store route evidence uses a fixed schema:
+
+- a primary-path SHA-256, domain-tagged `git-object-dir`;
+- an ordered, length-prefixed array of alternate-path SHA-256s, domain-tagged `git-alternate-dir`, all over the exact
+  Unix path bytes.
+
+Reordering alternates, or moving a path between the primary and alternate roles, therefore changes the evidence.
 Exit status alone is never success evidence; the caller parses output.
 
 ## 5. Required RED and behavioral controls
@@ -240,7 +279,8 @@ inadmissible until the fixture is repaired.
 | A2d | an injected-metadata seam reports link count 1 for a genuinely empty created directory (positive) | no literal link-count requirement | success | 2B2 #27d |
 | A3 | a hook after the last parent-side recheck swaps the root's pathname for a replacement before spawn; the fixture binary writes a relative marker | `root_command` rooting and relative paths | the marker lands only under the retained root; the replacement is unchanged; the caller's post-exit check sees the drift | 2B2 #26 |
 | A4 | a `root_command` pin is dropped and its descriptor number reused before spawn | owned duplicate descriptor | the child is still rooted at the original directory | 2B2 R3 S1 |
-| A5 | route-rule table: trusted-owner file with a mode-`0777` component; untrusted-owner mode-`0555` file; symlink final component; ACL-granted write; production constructor as uid 0; standard root-owned Linux `/usr/bin/git` (positive, pure metadata) | §4.1 route rule | typed route refusal; the positive row is admitted | 2B2 #28 |
+| A5 | route-rule table: trusted-owner file with a mode-`0777` component; untrusted-owner mode-`0555` file; a final symlink pointing to an admissible target; ACL-granted write; production constructor as uid 0; standard root-owned Linux `/usr/bin/git` (positive, pure metadata) | §4.1 route rule and pre-canonicalization `lstat` | typed route refusal; the positive row is admitted. A canonicalize-first mutation must admit the final-symlink row | 2B2 #28; 2B2a R2 W1 |
+| A5d | fixed-point table: same identity (admit); a distinct byte-identical copy that passes the route rule (admit, as on Debian); a distinct copy with different content; a byte-identical copy that fails the route rule | §4.1 fixed point | admit, admit, refuse, refuse; an identity-only mutation refuses the Debian row | P5 |
 | A5a | a fake locator returns a user-owned target whose executable writes a marker; separately, an admitted target that is not a fixed point | §4.1 admit-before-execute and fixed point | refusal with no marker written; the non-fixed-point target refuses. Reverting to executing the candidate's `--exec-path` makes the marker appear | 2B2 #28a; 2B2a R1 W1 |
 | A5b | an admitted route replaced at its path after admission, before the next spawn | §4.1 pre-spawn recheck | refusal before the next spawn | 2B2 #22 |
 | A5c | an admitted fixture route replaced by an `exit 0` binary after the pre-spawn recheck, inside a deterministic hook | §4.1 post-exit recheck | typed `BinaryDrift` | 2B2 #28b |
@@ -249,15 +289,17 @@ inadmissible until the fixture is repaired.
 | A8 | a fixture binary writes cap+1 stdout bytes, and separately exactly cap bytes | §4.4 stdout bound | typed cap refusal with the child killed; the exact-cap run succeeds | new |
 | A8b | the same for stderr | §4.4 stderr bound | typed cap refusal naming stderr; the exact-cap run succeeds; removing the stderr check lets cap+1 succeed | 2B2a R1 S2 |
 | A9 | a fixture binary sleeps past the deadline | §4.4 deadline | typed timeout; child killed and reaped; no zombie | new |
-| A10 | a fixture binary writes 1 MiB to stderr (above any pipe buffer, below the stderr cap) before reading its stdin to EOF | §4.4 concurrent I/O | **success before the deadline**. A timeout fails the control; a serial write-then-drain mutation must time out | 2B2a R1 W4 |
+| A10 | a fixture binary writes 1 MiB to stdout, then 1 MiB to stderr, then reads 1 MiB of stdin to EOF and exits 0; caps are above 1 MiB and each size exceeds any pipe buffer | §4.4 full-duplex I/O | **success before the deadline**; a timeout fails the control. Each of three mutations must time out: writing stdin before reading stdout, draining stdout after stdin completes, and draining stderr only after exit | 2B2a R1 W4; R2 W2 |
 | A11a | lazy-fetch fixture (below); only `--no-lazy-fetch` active | the flag | object reported missing; no fetch | 2B2 #8a |
 | A11b | lazy-fetch fixture; only `GIT_NO_LAZY_FETCH=1` active | the environment variable | object reported missing; no fetch | 2B2 #8b |
 | A11c | lazy-fetch fixture; only `protocol.allow=never` active | the protocol override | object reported missing; no fetch | 2B2 #8c |
-| A11d | `InitBare` into a fresh directory on both platforms | `InitBare` fixed argv, no config input, no `GIT_DIR` | the tree shape is exactly the Git-created `HEAD`, `config`, `objects/`, and `refs/` with no nested repository. The `config` contains no `remote.*` or `extensions.partialClone`. Adding `GIT_DIR` or a template turns it red. The source-config isolation control returns to 2B2 as control 30 | 2B2a R1 W5, S1 |
+| A11d | `InitBare` into a fresh directory on both platforms | `InitBare` fixed argv, no config input, no `GIT_DIR` | the tree shape is exactly the Git-created `HEAD`, `config`, `objects/`, and `refs/` with no nested repository; the `config` contains no `remote.*` or `extensions.partialClone`; the recorded environment map for the `InitBare` child has no `GIT_DIR` key. Mutations: adding `GIT_DIR` must fail the environment-map assertion; replacing `--template=` with a planted non-empty template directory must fail the tree-shape assertion. The source-config isolation control returns to 2B2 as control 30 | 2B2a R1 W5, S1; R2 S1 |
 | A13 | version parser table: minimum−1, minimum, an Apple suffix, malformed output, and a nonzero exit | §4.1 minimum version | typed refusal except minimum and above; deleting the comparison admits minimum−1 | 2B2a R1 S5 |
-| A14 | a syntax inventory of `unsafe` blocks in `fs_custody.rs` and `custody_git.rs` against the §3 list | §3 authorized unsafe scope | exact match; one unnamed `unsafe` site turns it red | 2B2a R1 W3 |
+| A14 | a `syn` AST inventory with two parts: (1) the exact `unsafe` sites inside the four new `fs_custody.rs` methods and any private helpers they add, plus all of `custody_git.rs`, matched against the §3 list; (2) a frozen per-function count of the implementation base's existing `fs_custody.rs` `unsafe` sites, 35 at base | §3 authorized unsafe scope | exact match on both parts; a compiling `unsafe { libc::getpid() }` added to an owned function turns it red | 2B2a R1 W3; R2 S2 |
 | A15 | `GitObjectStoreRouteV1` with `:`, `"`, `\`, a newline, or a NUL in a path, plus a valid two-entry route | §4.2 route encoding | typed refusal per refused byte; the valid route round-trips to exactly two entries | 2B2a R1 S3 |
 | A16 | real `index-pack --stdin`, then `VerifyPack` built from the parsed `pack\t<hash>` | §4.3 `VerifyPack` path | exact golden argv and successful verification; deleting the fixed `objects/pack/` prefix fails | 2B2a R1 W2 |
+| A17 | admission-profile table: a fixture under an anchored temp dir (admit only through `for_test_fixture`); the same fixture through the production profile (refuse); root with a group-writable audited directory (refuse); root with no group or other write bits (admit, recorded `mode_bits_as_root`); the production profile run as root (refuse) | §4.1 admission profiles | as listed; removing the anchor stop refuses the fixture row | P6 |
+| A18 | evidence schema table: two alternates reversed; one path moved between the primary and alternate roles | §4.4 route evidence | distinct evidence for each | 2B2a R2 S3 |
 | A12 | admission-classifier table: `0xEF53` with a matching-device `ext4` entry (admit); matching `ext2` or `ext3`; wrong device; duplicate or ambiguous matches; malformed `mountinfo` | §7 ext4 admission | named exclusion for every non-admit row; deleting the fstype comparison turns the `ext3` row red | 2B2 #29 |
 
 **Lazy-fetch fixture (A11a–A11c, the three runner-owned guards):**
@@ -282,7 +324,7 @@ child refusal before the behavior under test is inadmissible evidence.
 - `crates/bridge-core/src/custody_git.rs` — new `pub(crate)` runner: route admission, environment, `GitCommandV1`,
   the spawn protocol, and evidence;
 - `crates/bridge-core/src/custody_git_tests.rs` — in-crate tests via `#[path = "custody_git_tests.rs"] mod tests;`
-  (A5–A16), including fixture binaries created at test time and the reusable `#[cfg(test)]` ext4 admission
+  (A5–A18), including fixture binaries created at test time and the reusable `#[cfg(test)]` ext4 admission
   classifier that 2B2 will import;
 - `crates/bridge-core/src/lib.rs` — module declaration only;
 - `docs/superpowers/reviews/2026-09-24-adr0041-slice2b2a-implementation-handoff.md` — evidence and lane handoff;
@@ -325,7 +367,9 @@ Stop for spec or design review if any of these occurs:
 
 - an `fs_custody` change is needed beyond the four §3 methods;
 - the runner needs a free-form argv or an inherited environment variable;
-- a route cannot be admitted on standard macOS Command Line Tools (through the `xcrun` locator) or Ubuntu Git;
+- a route cannot be admitted on macOS Command Line Tools Git (through the `xcrun` locator) or the GitHub Actions
+  ubuntu runner's Git;
+- implementation-time probe P7 shows that `xcrun --find git` executes the selected tool;
 - the minimum Git version cannot honor §4.2;
 - rooting cannot be applied to a spawn;
 - a dependency or feature is required;
@@ -408,3 +452,38 @@ unprobed.
   without executing Git. `GIT_DIR=a.git git init --bare b.git` created only `b.git`, which is the precedence trap
   behind S1. `index-pack --stdin` printed `pack\t<hash>` and wrote `.idx`, `.pack`, and `.rev` files.
   `verify-pack -v <git_dir>/objects/pack/pack-<hash>.idx` succeeded from the root.
+
+## 14. Revision 3 — round 2 fold and host probes (2026-09-24)
+
+Round 2 of 2 was a host Codex `gpt-5.6-sol`/`xhigh`/read-only turn on revision 2 at `be10c255`. Its verdict was
+**REJECT**: inherited 10 RESOLVED / 0 UNRESOLVED; new 2 WRONG / 5 SMELL (BLOCKER 2 / DEFER 5). The full record is
+`docs/superpowers/reviews/2026-09-24-adr0041-slice2b2a-spec-review-round2.md`.
+
+**Classification:** converging. WRONG went from 5 to 2, none repeat, and each is closed and bounded. Using the owner's
+extension authorization, the findings are folded here and extension round 3 is disclosed in the status line.
+
+| ID | Finding | Fold |
+|---|---|---|
+| R2 W1 | canonicalization erased a final symlink before the route rule | §4.1 step 2 no-follow `lstat` first; A5 row with a canonicalize-first mutation |
+| R2 W2 | A10 did not force all three streams to be concurrent | A10 full-duplex fixture with three serialization mutations |
+| R2 S1 | A11d `GIT_DIR` mutation not observable | A11d environment-map assertion plus a planted template |
+| R2 S2 | A14 scope ambiguous against 35 existing base `unsafe` sites | A14 new-site inventory plus a frozen base count |
+| R2 S3 | route evidence role/order encoding undefined | §4.4 schema; A18 |
+| R2 S4 | the `xcrun` no-execution claim is unproven | §9 stop on implementation-time probe P7 |
+| R2 S5 | Ubuntu fixed point unmeasured | P5 fold; lane recording before code |
+| P5 | Debian `/usr/lib/git-core/git` is a distinct, byte-identical file (link count 1 each, equal SHA-256), which fails an identity-only fixed point | §4.1 step 3 byte-identical admission; A5d |
+| P6 | the implement/verify container runs as root with a root-owned 2.54 `/opt/git/bin/git`; `faccessat` cannot deny root, the production profile refuses root, and temp-dir fixture ancestors can never pass a production audit | §4.1 admission profiles; A17 |
+| P6b | distro Git 2.39.5 rejects `--no-lazy-fetch` (exit 129) | §4.1 minimum-version lanes; §9 stop condition |
+
+**Probes (2026-09-24, cached `a2a-toolchain:latest` image, Debian 12 on overlay, network none).** These are
+admissible for package layout and flags only, not as native-filesystem evidence.
+
+- **P5:** `/usr/bin/git --exec-path` is `/usr/lib/git-core`. `/usr/bin/git` (inode 81656939) and
+  `/usr/lib/git-core/git` (inode 81657551) each have 1 link, are both root-owned mode 755, and have identical SHA-256
+  `54af380b…`.
+- **P6:** `id -u` is 0. `/opt/git/bin/git` is root-owned mode 755 with 148 links, and its ancestors are root 755.
+  `/usr/bin/git --no-lazy-fetch version` fails "unknown option" (2.39.5), while `/opt/git/bin/git --no-lazy-fetch
+  version` succeeds (2.54.0). On the macOS host, the test `$TMPDIR` is user-owned 0700 under root-owned
+  `/private/var/folders`, and `/private/tmp` is 1777.
+- **P7 (required at implementation time):** run `xcrun --find git` with a controlled developer directory whose `git`
+  writes a marker, and confirm no marker appears.
