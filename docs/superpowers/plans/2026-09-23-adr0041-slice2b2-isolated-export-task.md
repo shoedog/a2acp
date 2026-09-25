@@ -3,7 +3,7 @@ task-type: implement
 ---
 # ADR-0041 Slice 2B2 — isolated local export and Git-object closure
 
-**Status:** revision 9, the review candidate after the split. Revision 7 split it; revision 8 added the 2B2a
+**Status:** revision 10, the review candidate after the split. Revision 10 folds rev-9 spec review round 1 (§22). Revision 7 split it; revision 8 added the 2B2a
 route-request input from 2B2a extension round 5, W1; revision 9 binds it to the merged 2B2a API. planning/documentation only. Implementation is not authorized by this file. On
 2026-09-24 the owner chose to split the descriptor seam and hardened Git runner out into child **2B2a**
 (`docs/superpowers/plans/2026-09-24-adr0041-slice2b2a-git-runner-seam-task.md`). This task now owns only the exporter, capture binding, pack production, closure proof, ledger, sealing, and
@@ -109,14 +109,21 @@ The exporter never deletes anything, including its own `work/` contents; a compl
 as inert, typed scratch evidence. Plaintext in `work/` is acceptable only because 2B2 makes no confidentiality claim
 (§2 exclusions); a production envelope provider must revisit this before any confidentiality claim.
 
-The public entry point accepts a validated sealable `CustodyManifestV1`, an explicit envelope format and recipients,
-caller budgets, a sealer, a non-cloneable generation-bound `CustodyCaptureCapabilityV1`, and a caller-supplied 2B2a
-`GitRouteRequestV1`: the absolute Git path and its expected SHA-256 digest. 2B2 passes the route request to the
-runner unchanged. It never locates Git, never computes the expected digest itself, and has no production
-trust-on-first-use. Where the digest comes from is decided by the later wiring slice. Tests supply it through 2B2a's
-test-only trust-on-first-use helper. 2B2a keeps `GitRouteRequestV1` `pub(crate)`. If the 2B2 entry point is `pub`, the 2B2 review must
-decide between a crate-public entry point and a public opaque request type with controlled constructors, and add the
-matching compile doctest (2B2a delta round 6, S3). It derives the
+The entry point is **crate-private**: `pub(crate) fn export_capsule_v1(...)` in the private module
+`custody_export`. `lib.rs` declares it with `mod custody_export;`, never `pub mod`. Its inputs are:
+
+- a validated sealable `CustodyManifestV1`;
+- an explicit envelope format and recipients;
+- caller budgets;
+- a sealer;
+- a non-cloneable generation-bound `CustodyCaptureCapabilityV1`;
+- a caller-supplied 2B2a `GitRouteRequestV1`: the absolute Git path and its expected SHA-256 digest.
+
+2B2 passes the route request to the runner unchanged. It never locates Git, never computes the expected digest itself,
+and has no production trust-on-first-use. Where the digest comes from is decided by the later wiring slice. Tests
+compute the lane Git's digest themselves, with a test-only helper in `custody_export_tests.rs`; 2B2a's own digest
+helper is private to its tests. There is no public exporter API in 2B2. A public, opaque wrapper for the route
+request is a later wiring decision. Control 24 proves the privacy with a discriminating compile-fail doctest. It derives the
 `CustodyCapsuleLayoutV1` itself from the manifest; it does not accept a caller layout. Caller budgets are validated
 to be at or below the fixed §3 ceilings and are otherwise refused.
 
@@ -130,7 +137,7 @@ accessors on `CustodyManifestV1` and `CustodyOriginalObjectV1` (§8), not canoni
 or exclusive managed-writer quiescence decision. If the production quiescence primitive is not yet available, expose
 only a crate-private fixture constructor. Never substitute a bool, repeated inventory, a canonical path string, or
 creation of a new lock file for that gate. With a crate-private capability constructor and only a test-only sealer,
-the public entry point is production-unreachable by design; that is expected and must be stated in the handoff.
+the crate-private entry point is production-unreachable by design; that is expected and must be stated in the handoff.
 
 The following remain excluded:
 
@@ -161,14 +168,18 @@ V1 ceilings are fixed before allocation or file creation:
 
 One scratch-wide ledger counts **logical** file bytes with checked arithmetic, plus a fixed 64 KiB allocation
 allowance per created file or directory. The set of created files is fixed and small, so allocated-block overhead
-stays bounded. The exporter reserves bytes before each write it issues itself, including every `pack-objects` stdout
-chunk. Before spawning a Git child that writes under `work/`, the exporter reserves that child's complete proven upper
-bound:
+stays bounded. The exporter reserves bytes before each write it issues itself. The runner owns the `pack-objects`
+stdout reads and file writes and exposes only a whole-stream `stdout_limit`. So before that spawn, the exporter
+reserves one complete **pack-output allowance** `A`: the smaller of the remaining scratch-ledger headroom and the
+per-artifact ceiling. It sets `stdout_limit = A`. The runner refuses with a typed `StdoutLimit` before writing byte
+`A + 1`. After the run, the exporter reconciles the reservation down to the returned streamed length `L`, releasing
+`A − L`. Before spawning a Git child that writes under `work/`, the exporter reserves that child's complete proven
+upper bound:
 
 - **each `git init --bare --template=`:** the enumerated `HEAD`, `config`, and empty `objects/` and `refs/` tree, at
   the per-entry allowance;
 - **`index-pack --stdin`:** its temporary and final pack together count once at the staged pack length L, because the
-  temporary pack is renamed rather than copied. For N objects and hash length H, the version-2 index is at most
+  temporary pack is renamed rather than copied. For N objects and a **raw** hash width H (20 bytes for SHA-1, 32 for SHA-256), the version-2 index is at most
   `1072 + N·(H + 8) + 8·N + 2·H` bytes, the reverse index at most `12 + 4·N + 2·H`, and the bitmap and `.keep` files
   are absent because neither is requested;
 - **the read-only verification commands** (`verify-pack`, `cat-file`, `rev-list`, `fsck`): zero, with no
@@ -233,15 +244,14 @@ incomplete outcome. The residual windows are 2B2a honest limits HL1–HL3.
 1. A bounded `git cat-file --batch-check` control proves every manifest object exists with the declared kind.
 2. The exporter writes the manifest object IDs, one per line in byte order, to a bounded stdin writer for one
    `git pack-objects --stdout` run. It does not use `--revs`, `--all`, `--thin`, bitmap reuse, or ref discovery.
-3. Stdout is streamed into one create-new `work/objects.pack` file through the scratch-wide ledger. Reaching the
-   ledger or per-artifact ceiling plus one byte kills the child and refuses. The file is synced, its length and
+3. Stdout is streamed by the runner into one create-new `work/objects.pack` file, with `stdout_limit` equal to the
+   pre-reserved pack-output allowance `A` (§3). Byte `A + 1` is refused with a typed `StdoutLimit` before it is
+   written, and the child is killed. The file is synced, its length and
    SHA-256 are recorded as the **verified-pack identity**, and it is never rewritten.
-4. `pack-objects` is not run a second time for any purpose. §5 verifies this file, and §6 seals from this file with
-   its recorded length as the source descriptor's declared total. The sealer trait returns only a ciphertext
-   receipt, so the plaintext-source receipt comes from an exporter-owned wrapper. That wrapper feeds every chunk the
-   sealer pulls through a `CustodyEnvelopeSourceValidatorV1` and is finished after `seal()` returns. A sealer that
-   stops early fails `finish`. A finished source receipt whose SHA-256 or length differs from the verified-pack
-   identity refuses the export.
+4. `pack-objects` is not run a second time for any purpose. A `#[cfg(test)]` invocation counter proves that; see
+   control 34. §5 verifies this file, and §6 seals from this file with its recorded length as the source descriptor's
+   declared total. Full-consumption checking applies to **every** artifact (§6); for the pack, the finished source
+   receipt must equal the verified-pack identity.
 
 The implementation records the exact argv, Git version, closed environment keys, object format, child status,
 bounded parsed output, and verified-pack identity. Exit status alone is never evidence.
@@ -270,7 +280,8 @@ inherit no source descriptor.
    created. `dangling` lines cannot occur with `--no-dangling`; any other output line refuses.
 
 A strict fsck-class rejection of a legitimate historical object, such as a zero-padded file mode, refuses with a
-dedicated typed `StrictObjectCheck` refusal carrying the bounded Git message id, not a generic ambiguity. V1 does not
+dedicated typed `StrictObjectCheck` refusal carrying the bounded Git message id, not a generic ambiguity. This applies
+whether step 1's `index-pack --strict` or step 4's `fsck` reports it. V1 does not
 relax fsck severities. The proof succeeds only when all four steps agree.
 
 The primary isolation control renames the source and every allowed alternate/cache out of reach before verification.
@@ -294,9 +305,32 @@ then constructs the expected `CustodyEnvelopeSealReceiptV1` itself, through the 
 exact context it passed to that `seal()` call and that destination's own ciphertext receipt. The sealer's returned
 receipt must equal the expected one in **every** field: artifact name, manifest digest, format, recipients,
 ciphertext length, and SHA-256. Any disagreement refuses, so a receipt cannot be attributed to another artifact's
-destination. The staging file is then renamed without
-replacement to its reserved logical name, and `capsule/` is synced. `CustodySealedArtifactV1` values come only from
-these cross-checked receipts.
+destination.
+
+**Full plaintext consumption, for every artifact.** Each `seal()` call reads its plaintext through an exporter-owned
+exact-total `CustodyEnvelopeSourceValidatorV1` wrapper. That wrapper is finished after `seal()` returns, and its
+length and SHA-256 must equal the expected plaintext identity:
+
+- for control artifacts, the canonical 2B1 bytes;
+- for non-Git payloads, the capture capability's bound length and digest for that exact role;
+- for the pack, the verified-pack identity.
+
+A sealer that consumes only a prefix, or nothing, fails `finish` or the identity comparison, and the export refuses
+before any exterior seal.
+
+**Content remeasurement.** After the sink is finished and the staging file is synced, the exporter re-reads that file
+from its retained descriptor (a positioned read from offset 0) and requires the exact length and SHA-256 of the
+destination receipt. Only then is the staging file renamed without replacement to its reserved logical name, and
+`capsule/` synced.
+
+**Seal barrier.** Immediately before the seal rename, every published artifact is re-opened descriptor-relatively
+(no-follow), synced, and re-hashed, and must equal its `CustodySealedArtifactV1` length and digest. A mismatch is a
+typed incomplete outcome with no seal. Re-reads do not write, so they consume no ledger. `CustodySealedArtifactV1`
+values come only from these cross-checked, remeasured receipts.
+
+**Receipt comparison view.** Production whole-receipt equality compares an exporter-owned `ReceiptFieldsV1` view,
+built through the receipt's public accessors: name, manifest digest, format, recipients, ciphertext length, and
+SHA-256. That view is what control 15 perturbs field by field.
 
 The Git-pack artifact is sealed only after §5 succeeds, from the verified file. Control artifacts are the canonical
 2B1 bytes. The completed `CustodyCapsuleBindingV1` must validate before `custody-seal.v1` is published.
@@ -334,29 +368,34 @@ the fixture is repaired.
 
 | # | Mutation / fixture | Guard under test | Expected refusal |
 |---|---|---|---|
-| 1 | manifest and pack omit a reflog-only commit's parent | §5 step 3 closure | missing-object closure refusal |
-| 2 | manifest and pack omit an unreachable tree's blob child | §5 step 3 closure | missing-object closure refusal |
+| 1 | manifest and pack omit a reflog-only commit's parent X. An exporter-local `#[cfg(test)]` seam seeds X as a loose object into `verify.git` before step 1, so `index-pack --strict` can resolve the link, and removes it after step 1, before step 2 | §5 step 3 closure | missing-object closure refusal; deleting only the `rev-list` guard yields wrong success |
+| 2 | manifest and pack omit an unreachable tree's blob child, using the same seed-then-remove seam | §5 step 3 closure | missing-object closure refusal; deleting only the `rev-list` guard yields wrong success |
 | 3 | orphan blob in manifest, dropped from the staged pack | §5 step 2 equality | inventory mismatch |
 | 4 | orphan blob present and valid (positive) | §5 step 4 `--no-dangling` | success; must not refuse |
-| 5 | remove or retarget a pinned alternate, or rewrite an alternates file to name an unbound store holding a needed object, after capability construction | §4.1 pre-spawn/post-exit callbacks | identity drift; the unbound store contributes no object |
+| 5 | 5a: remove or retarget a pinned alternate, or rewrite an alternates file to name an unbound store holding a needed object, **before spawn**, with the post-exit callback bypassed by a test seam. 5b: the same persistent mutation **during** the child, through a runner hook, with the pre-spawn callback bypassed | 5a the pre-spawn callback; 5b the post-exit callback | identity drift; the unbound store contributes no object; each arm flips only on its own callback |
 | 6 | inject one extra packed object | §5 step 2 equality | inventory mismatch |
 | 7 | truncate or corrupt `work/objects.pack` after staging | §5 step 1 strict indexing | strict pack refusal |
-| 9 | swap source identity after preflight | §4.1 callbacks | identity drift |
+| 9 | 9a: swap source identity before spawn, with the post-exit callback bypassed. 9b: swap it during the child, with the pre-spawn callback bypassed | 9a pre-spawn; 9b post-exit callback | identity drift; each arm flips only on its own callback |
 | 10 | destination component replaced by a symlink or a case-fold/path-prefix alias | `fs_custody` no-follow/no-replace | typed publication refusal |
 | 11 | max/max+1 on artifact count, chunk bytes, chunk count, per-artifact ciphertext, the scratch-wide ledger (including each enumerated Git-child reservation), pack stdout, and the canonical manifest encoding. For the manifest, a crate-private call-counter seam also proves `CustodyCapsuleLayoutV1::derive` is never entered after an over-limit preflight; swapping preflight and derive must turn it red | §3 ledger, validators, §2 preflight ordering | typed budget refusal; derive not entered |
 | 12 | each pre-commit fault point, excluding any seal rename whose effect cannot be verified (control 14) | §6 commit point | incomplete outcome; no seal present |
 | 13 | post-seal directory-sync fault | §6 commit point | `PublishedDurabilityUnconfirmed`; seal present |
 | 14 | existing `UnlinkSourceOnly` rename fault plus target-identity ambiguity on the seal rename | §6 unverified-rename arm | `SealPublicationUnverified` |
-| 15 | a fixture sealer returns receipts built from each other's contexts for two differently hashed artifacts; separately, each single receipt field altered | §6 whole-receipt equality | receipt mismatch before any seal |
-| 16 | the sealer reads substituted bytes, or stops early, while sealing the pack | §4.2 step 4 source wrapper | pack identity mismatch or source `finish` refusal |
+| 15 | a fixture sealer returns receipts built from each other's contexts for two differently hashed artifacts. Separately, each single `ReceiptFieldsV1` field is perturbed alone, including ciphertext length with the SHA-256 unchanged | §6 whole-receipt equality over the field view | receipt mismatch before any seal; a comparator mutation that ignores any one field turns that field's row red |
+| 16 | the sealer reads substituted bytes, or stops after its first chunk, for the pack, for one control artifact, and for one non-Git payload | §6 full-consumption source wrapper | source `finish` refusal or plaintext identity mismatch before any exterior seal |
 | 17 | verify a byte-distinct pack B with the same inventory, then seal the recorded pack A | §5 step 1 comparison of `GitRunEvidenceV1.stdin` with the verified-pack identity | verification input identity mismatch |
 | 18 | capability generation/inventory differs from the manifest, or a mixed-format manifest | §2 binding / §4 | typed refusal before any write |
 | 19 | two captured non-Git streams of equal length exchanged between roles, layout checks bypassed | capability stream binding (class, generation, length, SHA-256) | capability-binding refusal |
-| 20 | historical zero-padded file-mode tree | §5 step 4 | `StrictObjectCheck` refusal |
-| 21 | scratch root placed inside the source git directory, disjointness check disabled | §2 scratch/source disjointness preflight | typed refusal before any write; with the guard disabled, source bytes change |
-| 24 | a prohibited external use of each new public or crate-private boundary: forged capability, external sealed-trait implementation, public seal-receipt construction | compile-fail doctests on `src/custody_export.rs` items | that doctest fails when its barrier is widened |
+| 20 | 20a: a historical zero-padded file-mode tree reaches step 1 and is classified `StrictObjectCheck` there. 20b: an exporter-local `#[cfg(test)]` seam installs a pre-indexed pack plus `.idx` fixture in place of step 1, so step 4 `fsck` is the only strict-object guard for the same tree | 20a the step-1 classifier; 20b step 4 | `StrictObjectCheck` refusal; in 20b, deleting only the `fsck` guard yields wrong success |
+| 21 | table: scratch root equal to the source git directory; scratch root inside it; the source git directory inside the scratch root; the same three relations with a pinned alternate store. Disjointness is disabled per row | §2 scratch/source disjointness preflight | typed refusal before any write; with the guard disabled, each row writes into or under a source store |
+| 24 | a compile-fail doctest, on a public `custody_capsule` item, that names `bridge_core::custody_export::export_capsule_v1`; an external `impl` of a sealed envelope trait; the existing public seal-receipt construction doctest. A compile-pass in-crate caller test exercises `export_capsule_v1` | module privacy, trait sealing, and receipt constructor privacy | each compile-fail doctest fails only when its barrier is widened, e.g. `pub mod custody_export`; the in-crate caller compiles |
 | 25 | reconnect a source-stream receipt to seal publication | existing provenance compile-fail doctest | that doctest fails |
 | 31 | two otherwise identical export fixtures, one with a matching route pin and one with a mismatching pin; the Git route is a marker-writing fixture | §2 route-request pass-through to 2B2a admission | the mismatch refuses with `DigestMismatch` before `version` or any marker; removing the pin flow, or replacing it with trust-on-first-use, makes the negative arm fail |
+| 32 | after sink finish and staging sync, the hook overwrites the staging file **in place** with same-length different bytes | §6 content remeasurement | typed incomplete; no rename, no seal; deleting only the remeasurement lets a stale digest reach the seal |
+| 33 | after an artifact is published and before the seal barrier, the hook overwrites it in place with same-length bytes | §6 seal-barrier remeasurement | typed incomplete; no seal; deleting only the barrier lets a stale digest be sealed |
+| 34 | a `#[cfg(test)]` counter on `PackObjectsStdout` spawns, with a mutation that runs `pack-objects` a second time and discards the result | §4.2 step 4, pack production exactly once | the counter must equal 1; the duplicate-run mutation turns it red even though control 17's byte identity still passes |
+| 35 | the pack-output allowance: with remaining allowance B, a B-byte pack succeeds and a (B+1)-byte pack refuses with `StdoutLimit` before byte B+1 is written. A mutation sets the runner's `stdout_limit` above the reservation | §3 pack-output pre-reservation | typed refusal at B+1; the mutation turns the reservation check red |
+| 14b | the seal rename lands, but the target cannot be re-opened for identity (`CustodyPublicationV1::TargetIdentityUnverified`) | §6 commit-point lattice | a typed unverified-publication outcome naming the seal; never success, never "no seal" |
 | 30 | the source repository carries promisor config (`extensions.partialClone`, a `remote.p.promisor=true` `file://` remote holding one manifest object the source store lacks); all three lazy-fetch guards disabled through 2B2a's `#[cfg(test)]` bypass seam; the mutation makes the exporter copy the source's config into `work/source-git/` | §4.1 synthesized git dir receives no source config | object reported missing, typed refusal, no fetch, source unchanged. Every arm uses a fresh source store from an immutable template |
 
 Controls 8a–8c, 22, 23, 26, 27a–27d, 28, 28a, 28b, and 29 moved to 2B2a. The source-config half of 8d stays here
@@ -383,16 +422,15 @@ the real-Git, fault-injection, and fixture-sealer tests are **in-crate** `#[cfg(
 existing `#[path = "..._tests.rs"] mod tests;` convention. An external integration-test crate cannot reach them, and
 no feature may be added to expose them.
 
-- `crates/bridge-core/src/custody_export.rs` — new effect boundary, capture capability, destination sink, runner
-  callbacks, and isolated closure proof. Control 24's compile-fail doctests live on its public items; rustdoc does not run
-  doctests from `tests/` targets;
+- `crates/bridge-core/src/custody_export.rs` — the new crate-private effect boundary: `export_capsule_v1`, the capture
+  capability, the destination sink, the `ReceiptFieldsV1` comparison view, the runner callbacks, the closure proof,
+  and the exporter-local `#[cfg(test)]` seams named in §7. The module is private (`mod custody_export;`);
 - `crates/bridge-core/src/custody_export_tests.rs` — in-crate real-Git fixtures, the `#[cfg(test)]` deterministic
-  fixture sealer and capture constructor, fault injection, and controls 1–21, 30, and 31 (retired numbers excluded);
-- `crates/bridge-core/tests/custody_export.rs` — runtime public-API refusal tests only; no doctests and no real-Git
-  success path;
+  fixture sealer and capture constructor, the lane-Git digest helper, fault injection, the compile-pass caller, and
+  controls 1–21, 14b, 30–35 (retired numbers excluded);
 - `crates/bridge-core/src/custody_capsule.rs` — only: change `mod sealed` to `pub(crate) mod sealed` so
-  `custody_export` can implement the source/sink traits, minimal crate-private accessors, and the deferred 2B1
-  compile-fail/unit controls;
+  `custody_export` can implement the source/sink traits, minimal crate-private accessors, the deferred 2B1
+  compile-fail/unit controls, and control 24's compile-fail doctests on public items;
 - `crates/bridge-core/tests/custody_capsule.rs` — restoration of the four dropped 2B1 public negatives only;
 - `crates/bridge-core/src/lib.rs` — module export only;
 - `crates/bridge-core/src/fs_custody.rs` and `crates/bridge-core/src/custody_git.rs` — read-only 2B2a dependencies;
@@ -452,10 +490,10 @@ Stop for spec/design review if:
 - the scratch-wide ledger cannot account for a Git child's writes;
 - the diff escapes the owned paths.
 
-Next action: complete 2B2a first. After 2B2a is approved and merged, review this revision-8 task under a new
-two-round cap scoped to the post-split exporter, bound to the 2B2a merge. Only a separately authorized, approved task
-may begin 2B2 implementation. Review approval does not authorize push, merge, cleanup, 2B3 restore,
-remote/provider effects, or running-operator mutation.
+Next action: an independent review of revision 10, as round 2 of the new two-round cap, which was disclosed as a
+consequence of the owner-approved split. On approval, the owner's 2026-09-24 directive covers implementation by the
+Opus 5.5 containerized implementor, the review/fix loop while it converges, and PR plus merge when CI is green. It
+does not cover push outside that PR, cleanup, 2B3 restore, remote/provider effects, or running-operator mutation.
 
 ## 11. Source references
 
@@ -663,3 +701,26 @@ exporter-owned hashing writer. That is exactly the gap 2B2a implementation revie
 close.
 
 Review resumes under a new two-round cap scoped to this post-split artifact, as disclosed in the status line.
+
+## 22. Revision 10 — rev-9 spec review round 1 fold (2026-09-25)
+
+Round 1 of the new cap was a host Codex `gpt-5.6-sol`/`xhigh`/read-only turn on revision 9 at `b27904c6`. Its verdict
+was **REJECT**: 7 WRONG (6 MATERIAL blockers, 1 IMMATERIAL) and 6 SMELL (4 MATERIAL-defer, 2 IMMATERIAL). The raw
+result SHA-256 is `4c10c41a5782a0453485091f5616e6f61b88ec8d3dbeaed2bd79b8702cb37eac`. The reviewer confirmed that the
+merged 2B2a API facts in revision 9 are accurate. The findings are closed and bounded, and all are folded:
+
+| ID | Finding | Fold |
+|---|---|---|
+| W1 | per-chunk pack-output reservation is impossible through the runner | §3 and §4.2: one pre-reserved allowance `A`, `stdout_limit = A`, reconciled to `L`; control 35 |
+| W2 | full-consumption checking applied to the pack only | §6: an exact-total source wrapper for every artifact; control 16 extended |
+| W3 | a seal could attest bytes no longer in the file after an in-place overwrite | §6: remeasure after sync, plus a seal barrier re-hashing every published artifact; controls 32 and 33 |
+| W4 | entry-point visibility undecided | §2: crate-private `export_capsule_v1`; external `tests/custody_export.rs` dropped; control 24 made discriminating |
+| W5 | controls 1, 2, and 20 masked by `index-pack --strict` | seed-then-remove seam (1, 2); 20a step-1 classifier and 20b pre-indexed fixture |
+| W6 | control 15's length-only arm was unconstructible | §6: exporter-owned `ReceiptFieldsV1` comparison view |
+| W7 (IMMATERIAL) | §10 was stale | §10 rewritten |
+| S1 | controls 5 and 9 did not isolate the pre-spawn and post-exit callbacks | split into 5a/5b and 9a/9b |
+| S2 | control 21 covered one containment relation | control 21 relation table |
+| S3 | `TargetIdentityUnverified` arm untested | control 14b |
+| S4 | "pack exactly once" had no invocation-count regression | control 34 |
+| S5 | the trust-on-first-use helper location was wrong | §2: the helper lives in `custody_export_tests.rs` |
+| S6 | index hash width `H` was ambiguous | §3: raw width, 20 or 32 bytes |
