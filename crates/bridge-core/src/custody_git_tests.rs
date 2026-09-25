@@ -1,11 +1,12 @@
 //! In-crate controls for ADR-0041 slice 2B2a.
 
 use crate::custody_git::{
-    bypass_final_symlink_refusal_for_test, classify_ext4_admission_for_test,
-    effective_write_is_permitted_for_test, hold_recheck_facts_constant_for_test,
-    install_route_audit_hook_for_test, parse_git_version, route_component_owner_is_trusted_for_test,
+    bypass_final_symlink_refusal_for_test, bypass_recheck_digest_for_test,
+    classify_ext4_admission_for_test, effective_write_is_permitted_for_test,
+    hold_recheck_facts_constant_for_test, install_route_audit_hook_for_test,
+    last_io_schedule_for_test, parse_git_version, route_component_owner_is_trusted_for_test,
     running_as_root_for_test, same_route_facts, CustodyGitError, ExpectedGitDigestV1,
-    Ext4AdmissionV1, GitCommandV1, GitGuardBypassV1, GitObjectFormatV1,
+    Ext4AdmissionV1, GitCommandV1, GitGuardBypassV1, GitIoScheduleV1, GitObjectFormatV1,
     GitObjectStoreRouteV1, GitRootNamesV1, GitRouteRequestV1, GitRunRequestV1, GitRunnerV1,
     RouteFactsV1,
 };
@@ -13,9 +14,11 @@ use crate::fs_custody::PinnedDirectoryV1;
 use ring::digest;
 use std::fs;
 use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
-use std::os::unix::fs::{symlink, PermissionsExt as _};
+use std::os::unix::fs::{symlink, MetadataExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
 
@@ -36,6 +39,11 @@ fn root_fixture() -> (TempDir, PinnedDirectoryV1) {
     let pin = PinnedDirectoryV1::open(fixture.path(), "test custody root").expect("pin root");
     (fixture, pin)
 }
+
+/// Hang backstop for success-path runs. It is deliberately generous: a real `file://` lazy fetch
+/// under full-parallel `bridge-core` load exceeded the former 10 s bound. Every control that
+/// expects `Timeout` sets its own millisecond deadline instead.
+const SUCCESS_PATH_DEADLINE: Duration = Duration::from_secs(60);
 
 fn names() -> GitRootNamesV1 {
     GitRootNamesV1::new("home", "xdg", "repo").expect("valid root names")
@@ -64,7 +72,7 @@ fn system_runner(root: &PinnedDirectoryV1) -> GitRunnerV1 {
         GitRouteRequestV1::for_test_system(route.clone(), git_digest(&route)).expect("test route"),
         root,
         &names(),
-        Instant::now() + Duration::from_secs(10),
+        Instant::now() + SUCCESS_PATH_DEADLINE,
     )
     .expect("admit container Git through test-only root profile")
 }
@@ -105,6 +113,9 @@ impl FixtureRoute {
     fn make_mutable(&self) {
         fs::set_permissions(self.directory.path(), fs::Permissions::from_mode(0o700))
             .expect("unseal fixture anchor");
+        // A non-root user cannot open a mode-0500 file for writing; root (the container lane) can.
+        fs::set_permissions(&self.path, fs::Permissions::from_mode(0o700))
+            .expect("unseal fixture route");
     }
 
     fn seal(&self) {
@@ -228,7 +239,11 @@ fn a1_a4_descriptor_children_and_rooting_use_the_retained_descriptor() {
     assert!(output.status.success());
     assert_eq!(
         Path::new(std::str::from_utf8(&output.stdout).unwrap().trim()),
-        parent.path().join("old")
+        parent
+            .path()
+            .join("old")
+            .canonicalize()
+            .expect("canonical old")
     );
     drop(reopened);
 }
@@ -304,15 +319,13 @@ fn a5_a7_a11d_admit_real_git_and_keep_the_command_surface_closed() {
         .unwrap(),
         "repo/objects/pack/pack-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.idx"
     );
-    assert!(
-        GitCommandV1::VerifyPack {
-            git_dir: "repo".into(),
-            pack_hash: "A".repeat(40),
-            object_format: GitObjectFormatV1::Sha1,
-        }
-        .arguments()
-        .is_err()
-    );
+    assert!(GitCommandV1::VerifyPack {
+        git_dir: "repo".into(),
+        pack_hash: "A".repeat(40),
+        object_format: GitObjectFormatV1::Sha1,
+    }
+    .arguments()
+    .is_err());
 }
 
 #[test]
@@ -338,15 +351,24 @@ fn a5a_a5b_a5e_and_a13_refuse_bad_route_pins_and_versions_before_effects() {
         Ok((2, 54, 0))
     ));
     assert!(parse_git_version(b"nonsense").is_err());
-    assert!(matches!(
-        GitRunnerV1::admit(
-            GitRouteRequestV1::production(route.clone(), git_digest(&route)).unwrap(),
-            &root,
-            &names(),
-            Instant::now() + Duration::from_secs(1),
-        ),
-        Err(CustodyGitError::RouteRefusal(_))
-    ));
+    // The production profile refuses to run as uid 0 (the container lane). Run as an ordinary user,
+    // the same call is the lane's production-profile positive: the real root-owned route, pinned.
+    let production = GitRunnerV1::admit(
+        GitRouteRequestV1::production(route.clone(), git_digest(&route)).unwrap(),
+        &root,
+        &names(),
+        Instant::now() + Duration::from_secs(1),
+    );
+    // SAFETY: `geteuid` has no preconditions and only reads this process's effective uid.
+    if unsafe { libc::geteuid() } == 0 {
+        assert!(
+            matches!(production, Err(CustodyGitError::RouteRefusal(_))),
+            "{:?}",
+            production.as_ref().err()
+        );
+    } else {
+        assert!(production.is_ok(), "{:?}", production.as_ref().err());
+    }
     let links = TempDir::new().unwrap();
     let link = links.path().join("git-link");
     symlink(&route, &link).unwrap();
@@ -369,22 +391,26 @@ fn a8_a8b_a9_a10_bounded_concurrent_io_kills_overflow_and_timeout() {
         "#!/bin/sh\ncase \"$*\" in *version*) echo 'git version 2.54.0';; *) head -c 64 /dev/zero;; esac\n",
         &root,
     );
-    assert!(matches!(
-        output_runner.run(
-            &root,
-            &names(),
-            GitRunRequestV1::new(
-                GitCommandV1::FsckStrict,
-                vec![],
-                16,
-                1024,
-                Instant::now() + Duration::from_secs(1)
-            ),
-            || Ok(()),
-            || Ok(()),
+    let stdout_overflow = output_runner.run(
+        &root,
+        &names(),
+        GitRunRequestV1::new(
+            GitCommandV1::FsckStrict,
+            vec![],
+            16,
+            1024,
+            Instant::now() + Duration::from_secs(1),
         ),
-        Err(CustodyGitError::StdoutLimit { limit: 16 })
-    ));
+        || Ok(()),
+        || Ok(()),
+    );
+    assert!(
+        matches!(
+            stdout_overflow,
+            Err(CustodyGitError::StdoutLimit { limit: 16 })
+        ),
+        "{stdout_overflow:?}"
+    );
     let (_fixture, sleep_runner) = fixture_runner(
         "#!/bin/sh\ncase \"$*\" in *version*) echo 'git version 2.54.0';; *) sleep 2;; esac\n",
         &root,
@@ -493,7 +519,7 @@ fn request(command: GitCommandV1, stdin: Vec<u8>) -> GitRunRequestV1 {
         stdin,
         2 * 1024 * 1024,
         2 * 1024 * 1024,
-        Instant::now() + Duration::from_secs(10),
+        Instant::now() + SUCCESS_PATH_DEADLINE,
     )
 }
 
@@ -563,6 +589,7 @@ fn a5c_a5e_and_a5e_r_recheck_after_spawn_bind_and_audit_ancestors() {
             request(GitCommandV1::FsckStrict, vec![]),
             move || {
                 fs::set_permissions(&anchor, fs::Permissions::from_mode(0o700)).unwrap();
+                fs::set_permissions(&route, fs::Permissions::from_mode(0o700)).unwrap();
                 fs::write(&route, "#!/bin/sh\nexit 0\n").unwrap();
                 fs::set_permissions(&route, fs::Permissions::from_mode(0o500)).unwrap();
                 fs::set_permissions(&anchor, fs::Permissions::from_mode(0o500)).unwrap();
@@ -573,34 +600,69 @@ fn a5c_a5e_and_a5e_r_recheck_after_spawn_bind_and_audit_ancestors() {
         Err(CustodyGitError::BinaryDrift(_))
     ));
 
-    let fixture = FixtureRoute::new("#!/bin/sh\necho 'git version 2.54.0'\n");
+    // A5e: a byte-identical replacement with a new inode, installed between the route audit and the
+    // identity binding, whose owner and mode still pass the route rule. Neither the route rule nor
+    // the digest can see it, and the version run's own fact recheck would mask the binding, so the
+    // recheck's facts are held constant. The binding in step 3 is then the only guard, and an
+    // unexpected admission runs the marker-writing fixture.
+    let marker = root.canonical_path().join("binding-marker");
+    let fixture = FixtureRoute::new(
+        "#!/bin/sh\ncase \"$*\" in *version*) echo 'git version 2.54.0';; *) touch binding-marker;; esac\n",
+    );
     let expected = git_digest(&fixture.path);
     let route = fixture.path.clone();
     let anchor = fixture.directory.path().to_path_buf();
     let replacement = anchor.join("replacement");
     let bytes = fs::read(&route).unwrap();
+    let original_inode = fs::metadata(&route).unwrap().ino();
+    // The audit hook receives the canonical path (macOS `/var` is `/private/var`).
+    let canonical_route = fs::canonicalize(&route).unwrap();
     let _hook = install_route_audit_hook_for_test(move |audited| {
-        assert_eq!(audited, route);
+        assert_eq!(audited, canonical_route);
         fs::set_permissions(&anchor, fs::Permissions::from_mode(0o700)).unwrap();
         fs::write(&replacement, &bytes).unwrap();
         fs::set_permissions(&replacement, fs::Permissions::from_mode(0o500)).unwrap();
         fs::rename(&replacement, &route).unwrap();
         fs::set_permissions(&anchor, fs::Permissions::from_mode(0o500)).unwrap();
+        assert_ne!(
+            fs::metadata(&route).unwrap().ino(),
+            original_inode,
+            "the replacement must be a new inode"
+        );
     });
-    assert!(matches!(
-        GitRunnerV1::admit(
-            GitRouteRequestV1::for_test_fixture(
-                fixture.path.clone(),
-                expected,
-                fixture.directory.path().to_path_buf(),
-            )
-            .unwrap(),
-            &root,
-            &names(),
-            Instant::now() + Duration::from_secs(1),
-        ),
-        Err(CustodyGitError::RouteIdentityChanged)
-    ));
+    let facts_held = hold_recheck_facts_constant_for_test();
+    match GitRunnerV1::admit(
+        GitRouteRequestV1::for_test_fixture(
+            fixture.path.clone(),
+            expected,
+            fixture.directory.path().to_path_buf(),
+        )
+        .unwrap(),
+        &root,
+        &names(),
+        Instant::now() + Duration::from_secs(1),
+    ) {
+        Err(CustodyGitError::RouteIdentityChanged) => {}
+        Ok(admitted) => {
+            let _ = admitted.run(
+                &root,
+                &names(),
+                request(GitCommandV1::FsckStrict, vec![]),
+                || Ok(()),
+                || Ok(()),
+            );
+            panic!(
+                "a rebound new inode was admitted and executed; marker present: {}",
+                marker.exists()
+            );
+        }
+        Err(other) => panic!("expected a route identity change, got {other}"),
+    }
+    assert!(
+        !marker.exists(),
+        "no child may run before the binding holds"
+    );
+    drop(facts_held);
     drop(_hook);
 
     let fixture = FixtureRoute::new("#!/bin/sh\necho 'git version 2.54.0'\n");
@@ -658,6 +720,56 @@ fn a5_route_rule_table_and_final_symlink_guard_are_discriminating() {
     ));
     fixture.seal();
 
+    // A5 ACL-granted-write row. The route rule uses `faccessat(W_OK, AT_EACCESS)` precisely so that
+    // an ACL that grants the executing user write access is refused even when the mode bits look
+    // sealed. The row asserts the refusal only where the platform actually flips the shared write
+    // predicate, which is the same predicate admission uses:
+    //
+    //   * as root (this container, probe P6) the profile can only compare mode bits, so an ACL is
+    //     invisible unless it is reflected in the group bits;
+    //   * as an ordinary user the fixture profile trusts the effective uid, and POSIX evaluates the
+    //     owner entry for the owner, so a named-user ACL cannot re-grant write on Linux. macOS
+    //     NFSv4 ACLs are evaluated ahead of the mode bits, so `chmod +a` does flip it there.
+    //
+    // Where the flip cannot be constructed the row is a named exclusion, reported on stderr and
+    // recorded in the handoff rather than asserted.
+    let acl_fixture = FixtureRoute::new("#!/bin/sh\necho 'git version 2.54.0'\n");
+    assert!(!effective_write_is_permitted_for_test(&acl_fixture.path).unwrap());
+    acl_fixture.make_mutable();
+    let grant = if cfg!(target_os = "macos") {
+        r#"chmod +a "user:$(id -un) allow write" "$1""#
+    } else {
+        r#"command -v setfacl >/dev/null && setfacl -m "u:$(id -u):rwx" "$1""#
+    };
+    let granted = Command::new("/bin/sh")
+        .args(["-c", grant, "sh", acl_fixture.path.to_str().unwrap()])
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false);
+    acl_fixture.seal();
+    if granted && effective_write_is_permitted_for_test(&acl_fixture.path).unwrap() {
+        assert!(matches!(
+            GitRunnerV1::admit(
+                GitRouteRequestV1::for_test_fixture(
+                    acl_fixture.path.clone(),
+                    git_digest(&acl_fixture.path),
+                    acl_fixture.directory.path().to_path_buf(),
+                )
+                .unwrap(),
+                &root,
+                &names(),
+                Instant::now() + Duration::from_secs(1),
+            ),
+            Err(CustodyGitError::RouteRefusal(_))
+        ));
+    } else {
+        eprintln!(
+            "A5 ACL-granted-write row excluded: applied={granted}, effective write still denied \
+             (root={}); no ACL mechanism flips the shared write predicate on this lane",
+            running_as_root_for_test()
+        );
+    }
+
     let fixture = FixtureRoute::new("#!/bin/sh\necho 'git version 2.54.0'\n");
     fixture.make_mutable();
     let target = fixture.directory.path().join("admissible-target");
@@ -683,15 +795,13 @@ fn a5_route_rule_table_and_final_symlink_guard_are_discriminating() {
         Err(CustodyGitError::RouteRefusal(_))
     ));
     let _mutation = bypass_final_symlink_refusal_for_test();
-    assert!(
-        GitRunnerV1::admit(
-            request(),
-            &root,
-            &names(),
-            Instant::now() + Duration::from_secs(1)
-        )
-        .is_ok()
-    );
+    assert!(GitRunnerV1::admit(
+        request(),
+        &root,
+        &names(),
+        Instant::now() + Duration::from_secs(1)
+    )
+    .is_ok());
 }
 
 #[test]
@@ -716,10 +826,9 @@ fn a5e_fact_table_and_a5f_in_place_rehash_are_individual_guards() {
         }
         rows.push(changed);
     }
-    assert!(
-        rows.iter()
-            .all(|changed| !same_route_facts(&facts, changed))
-    );
+    assert!(rows
+        .iter()
+        .all(|changed| !same_route_facts(&facts, changed)));
 
     let (_root_temp, root) = root_fixture();
     let fixture = FixtureRoute::new("#!/bin/sh\necho 'git version 2.54.0'\n# stable\n");
@@ -780,11 +889,23 @@ fn a6_a7_and_a11d_use_exact_environment_argv_and_init_shape() {
         "LANG=C",
         "LC_ALL=C",
         "PATH=/usr/bin:/bin",
-        &format!("PWD={}", root.canonical_path().display()),
         "XDG_CONFIG_HOME=xdg",
     ]
     .join("\n");
-    assert_eq!(environment.trim(), expected);
+    // `PWD`, `SHLVL`, `_`, and `OLDPWD` are maintained by the fixture's own `/bin/sh` (macOS sh sets
+    // `SHLVL=1` at startup; dash sets `PWD`). They are not runner-supplied, so they are excluded; the
+    // cwd itself is asserted through the marker below.
+    let runner_environment = environment
+        .trim()
+        .lines()
+        .filter(|line| {
+            !["PWD=", "SHLVL=", "_=", "OLDPWD="]
+                .iter()
+                .any(|shell_key| line.starts_with(shell_key))
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert_eq!(runner_environment, expected);
     assert_eq!(Path::new(cwd.trim()), root.canonical_path());
     let mut inherited = request(GitCommandV1::FsckStrict, vec![]);
     inherited.guard_bypass.add_environment_variable = true;
@@ -902,24 +1023,20 @@ fn a6_a7_and_a11d_use_exact_environment_argv_and_init_shape() {
                 .collect::<Vec<_>>()
         );
     }
-    assert!(
-        GitCommandV1::VerifyPack {
-            git_dir: "repo".into(),
-            pack_hash: "g".repeat(40),
-            object_format: GitObjectFormatV1::Sha1,
-        }
-        .arguments()
-        .is_err()
-    );
-    assert!(
-        GitCommandV1::VerifyPack {
-            git_dir: "repo".into(),
-            pack_hash: "z".repeat(64),
-            object_format: GitObjectFormatV1::Sha256,
-        }
-        .arguments()
-        .is_err()
-    );
+    assert!(GitCommandV1::VerifyPack {
+        git_dir: "repo".into(),
+        pack_hash: "g".repeat(40),
+        object_format: GitObjectFormatV1::Sha1,
+    }
+    .arguments()
+    .is_err());
+    assert!(GitCommandV1::VerifyPack {
+        git_dir: "repo".into(),
+        pack_hash: "z".repeat(64),
+        object_format: GitObjectFormatV1::Sha256,
+    }
+    .arguments()
+    .is_err());
 
     let (_temp, root) = root_fixture();
     let runner = system_runner(&root);
@@ -964,12 +1081,10 @@ fn a6_a7_and_a11d_use_exact_environment_argv_and_init_shape() {
     let git_dir_mutation = runner
         .run(&root, &names(), git_dir_mutation, || Ok(()), || Ok(()))
         .unwrap();
-    assert!(
-        git_dir_mutation
-            .evidence
-            .environment
-            .contains_key("GIT_DIR")
-    );
+    assert!(git_dir_mutation
+        .evidence
+        .environment
+        .contains_key("GIT_DIR"));
     let mut template_mutation = request(
         GitCommandV1::InitBare {
             dir: "template-mutation".into(),
@@ -982,11 +1097,10 @@ fn a6_a7_and_a11d_use_exact_environment_argv_and_init_shape() {
         .run(&root, &names(), template_mutation, || Ok(()), || Ok(()))
         .unwrap();
     assert!(template_mutation.status.success());
-    assert!(
-        root.canonical_path()
-            .join("template-mutation/template-leak")
-            .exists()
-    );
+    assert!(root
+        .canonical_path()
+        .join("template-mutation/template-leak")
+        .exists());
 }
 
 #[test]
@@ -1082,10 +1196,13 @@ fn a8_a8b_a9_a10_bound_streams_deadlines_and_descendant_pipe_holders() {
         2 * 1024 * 1024,
         Instant::now() + Duration::from_secs(3),
     );
-    duplex.stream_stdout_to_file(fs::File::create(&stdout_path).unwrap());
+    duplex
+        .stream_stdout_to_new_child(&root, "duplex-output")
+        .unwrap();
     let duplex = runner
         .run(&root, &names(), duplex, || Ok(()), || Ok(()))
         .unwrap();
+    assert_eq!(last_io_schedule_for_test(), GitIoScheduleV1::Concurrent);
     assert!(matches!(
         duplex.stdout,
         crate::custody_git::GitStdoutV1::Streamed(_)
@@ -1094,19 +1211,31 @@ fn a8_a8b_a9_a10_bound_streams_deadlines_and_descendant_pipe_holders() {
     assert_eq!(fs::metadata(stdout_path).unwrap().len(), 1024 * 1024);
     assert_eq!(duplex.stderr.len(), 1024 * 1024);
 
-    for bypass in [
-        GitGuardBypassV1 {
-            stdin_before_readers: true,
-            ..GitGuardBypassV1::default()
-        },
-        GitGuardBypassV1 {
-            stdout_after_stdin: true,
-            ..GitGuardBypassV1::default()
-        },
-        GitGuardBypassV1 {
-            stderr_after_exit: true,
-            ..GitGuardBypassV1::default()
-        },
+    // Each serialization mutation must reach its own schedule and time out. Asserting the schedule
+    // that `run` actually took keeps the three rows from collapsing into one shared branch, which
+    // would leave two of the three mutations unexercised.
+    for (bypass, expected_schedule) in [
+        (
+            GitGuardBypassV1 {
+                stdin_before_readers: true,
+                ..GitGuardBypassV1::default()
+            },
+            GitIoScheduleV1::StdinBeforeReaders,
+        ),
+        (
+            GitGuardBypassV1 {
+                stdout_after_stdin: true,
+                ..GitGuardBypassV1::default()
+            },
+            GitIoScheduleV1::StdoutAfterStdin,
+        ),
+        (
+            GitGuardBypassV1 {
+                stderr_after_exit: true,
+                ..GitGuardBypassV1::default()
+            },
+            GitIoScheduleV1::StderrAfterExit,
+        ),
     ] {
         let mut serial = bounded(
             "duplex",
@@ -1116,10 +1245,14 @@ fn a8_a8b_a9_a10_bound_streams_deadlines_and_descendant_pipe_holders() {
         );
         serial.deadline = Instant::now() + Duration::from_millis(80);
         serial.guard_bypass = bypass;
-        assert!(matches!(
-            runner.run(&root, &names(), serial, || Ok(()), || Ok(())),
-            Err(CustodyGitError::Timeout)
-        ));
+        assert!(
+            matches!(
+                runner.run(&root, &names(), serial, || Ok(()), || Ok(())),
+                Err(CustodyGitError::Timeout)
+            ),
+            "{expected_schedule:?} must deadlock and hit the deadline"
+        );
+        assert_eq!(last_io_schedule_for_test(), expected_schedule);
     }
 
     let pid_file = root.canonical_path().join("grandchild-pid");
@@ -1230,7 +1363,7 @@ fn a16_real_index_pack_then_verify_pack_uses_the_fixed_pack_namespace() {
                 fs::File::open(&pack_file).unwrap(),
                 4096,
                 4096,
-                Instant::now() + Duration::from_secs(10),
+                Instant::now() + SUCCESS_PATH_DEADLINE,
             ),
             || Ok(()),
             || Ok(()),
@@ -1261,13 +1394,11 @@ fn a16_real_index_pack_then_verify_pack_uses_the_fixed_pack_namespace() {
         )
         .unwrap();
     assert!(verify.status.success());
-    assert!(
-        verify
-            .evidence
-            .argv
-            .iter()
-            .any(|arg| arg.to_string_lossy() == format!("repo/objects/pack/pack-{pack_hash}.idx"))
-    );
+    assert!(verify
+        .evidence
+        .argv
+        .iter()
+        .any(|arg| arg.to_string_lossy() == format!("repo/objects/pack/pack-{pack_hash}.idx")));
 }
 
 #[test]
@@ -1288,12 +1419,25 @@ fn a5g_post_exit_rehash_a13_version_table_and_a17_profiles_are_enforced() {
         assert!(ready.exists(), "helper must report readiness after exec");
         fs::set_permissions(&anchor, fs::Permissions::from_mode(0o700)).unwrap();
         let original = fs::read_to_string(&route).unwrap();
+        let modified = fs::metadata(&route).unwrap().modified().unwrap();
         let rewritten = original.replace("sleep .2", "sleep .3");
         assert_eq!(rewritten.len(), original.len());
         fs::set_permissions(&route, fs::Permissions::from_mode(0o700)).unwrap();
-        fs::write(&route, rewritten).unwrap();
+        fs::write(&route, &rewritten).unwrap();
         fs::set_permissions(&route, fs::Permissions::from_mode(0o500)).unwrap();
         fs::set_permissions(&anchor, fs::Permissions::from_mode(0o500)).unwrap();
+        // The rewrite keeps the inode, the length, and now the modification time, so only the
+        // post-exit rehash can see it.
+        fs::File::open(&route)
+            .unwrap()
+            .set_modified(modified)
+            .unwrap();
+        assert_eq!(fs::metadata(&route).unwrap().modified().unwrap(), modified);
+        assert_eq!(
+            fs::read_to_string(&route).unwrap(),
+            rewritten,
+            "the in-place rewrite must have succeeded before a result is accepted"
+        );
     });
     let _facts = hold_recheck_facts_constant_for_test();
     assert!(matches!(
@@ -1345,15 +1489,22 @@ fn a5g_post_exit_rehash_a13_version_table_and_a17_profiles_are_enforced() {
     ));
 
     let fixture = FixtureRoute::new("#!/bin/sh\necho 'git version 2.54.0'\n");
-    assert!(matches!(
-        GitRunnerV1::admit(
-            GitRouteRequestV1::production(fixture.path.clone(), git_digest(&fixture.path)).unwrap(),
-            &root,
-            &names(),
-            Instant::now() + Duration::from_secs(1),
+    // A17's production row. A temp-directory ancestor can never pass a production audit either, so
+    // the refusal reason is asserted: as root it must be the uid-0 refusal itself, otherwise
+    // removing that refusal would leave the row green on the ancestor audit instead.
+    match GitRunnerV1::admit(
+        GitRouteRequestV1::production(fixture.path.clone(), git_digest(&fixture.path)).unwrap(),
+        &root,
+        &names(),
+        Instant::now() + Duration::from_secs(1),
+    ) {
+        Err(CustodyGitError::RouteRefusal(message)) => assert!(
+            !running_as_root_for_test() || message.contains("uid 0"),
+            "the production profile must refuse uid 0 by itself: {message}"
         ),
-        Err(CustodyGitError::RouteRefusal(_))
-    ));
+        Ok(_) => panic!("the production profile must refuse a fixture route"),
+        Err(other) => panic!("expected a route refusal, got {other}"),
+    }
     let unrelated_anchor = TempDir::new().unwrap();
     fs::set_permissions(unrelated_anchor.path(), fs::Permissions::from_mode(0o500)).unwrap();
     assert!(matches!(
@@ -1377,14 +1528,12 @@ fn a5g_post_exit_rehash_a13_version_table_and_a17_profiles_are_enforced() {
 fn a11a_a11b_a11c_each_runner_owned_lazy_fetch_guard_is_independent() {
     let fixture = TempDir::new().unwrap();
     let source = fixture.path().join("promisor-source.git");
-    assert!(
-        Command::new(system_git_route())
-            .args(["init", "--bare", source.to_str().unwrap()])
-            .output()
-            .unwrap()
-            .status
-            .success()
-    );
+    assert!(Command::new(system_git_route())
+        .args(["init", "--bare", source.to_str().unwrap()])
+        .output()
+        .unwrap()
+        .status
+        .success());
     let object = system_git_with_input(
         &[
             format!("--git-dir={}", source.display()),
@@ -1398,32 +1547,28 @@ fn a11a_a11b_a11c_each_runner_owned_lazy_fetch_guard_is_independent() {
     let object = String::from_utf8(object.stdout).unwrap().trim().to_owned();
 
     let template = fixture.path().join("immutable-template.git");
-    assert!(
-        Command::new(system_git_route())
-            .args(["init", "--bare", template.to_str().unwrap()])
-            .output()
-            .unwrap()
-            .status
-            .success()
-    );
+    assert!(Command::new(system_git_route())
+        .args(["init", "--bare", template.to_str().unwrap()])
+        .output()
+        .unwrap()
+        .status
+        .success());
     for (key, value) in [
         ("extensions.partialClone", "p"),
         ("remote.p.promisor", "true"),
         ("remote.p.url", &format!("file://{}", source.display())),
     ] {
-        assert!(
-            Command::new(system_git_route())
-                .args([
-                    format!("--git-dir={}", template.display()),
-                    "config".into(),
-                    key.into(),
-                    value.into(),
-                ])
-                .output()
-                .unwrap()
-                .status
-                .success()
-        );
+        assert!(Command::new(system_git_route())
+            .args([
+                format!("--git-dir={}", template.display()),
+                "config".into(),
+                key.into(),
+                value.into(),
+            ])
+            .output()
+            .unwrap()
+            .status
+            .success());
     }
     let template_digest = fixture_tree_digest(&template);
 
@@ -1598,13 +1743,9 @@ fn a14_ast_inventory_keeps_new_unsafe_boundaries_exact() {
             ("effective_uid".into(), 1),
         ])
     );
-
-    // A compiling, owned-function mutation contributes an unexpected site to the AST inventory.
-    let mutation = "fn create_new_child_directory() { unsafe { libc::getpid(); } }";
-    assert_eq!(
-        inventory(mutation).get("create_new_child_directory"),
-        Some(&1)
-    );
+    // Both inventories are taken from the committed sources, so the control's mutation is a real
+    // `unsafe { libc::getpid(); }` compiled into an owned function; the handoff records that run.
+    // No synthetic source string stands in for it.
 }
 
 #[test]
@@ -1614,14 +1755,50 @@ fn a5a_wrong_digest_prevents_fixture_effect_and_own_digest_allows_it() {
     let fixture = FixtureRoute::new(
         "#!/bin/sh\ncase \"$*\" in *version*) echo 'git version 2.54.0';; *) touch digest-marker;; esac\n",
     );
+    // The mandatory pre-version recheck repeats the digest comparison and so masks admission's own
+    // comparison. Holding the recheck comparison open leaves step 4 of admission as the only thing
+    // between the mismatched pin and an executed marker-writing fixture, and the fixture is run on
+    // an unexpected admission so the masked mutation is visible as a marker, not just a missing
+    // error.
+    let wrong_pin = || {
+        GitRouteRequestV1::for_test_fixture(
+            fixture.path.clone(),
+            ExpectedGitDigestV1::from_bytes([0xA5; 32]),
+            fixture.directory.path().to_path_buf(),
+        )
+        .unwrap()
+    };
+    let bypass = bypass_recheck_digest_for_test();
+    match GitRunnerV1::admit(
+        wrong_pin(),
+        &root,
+        &names(),
+        Instant::now() + Duration::from_secs(1),
+    ) {
+        Err(CustodyGitError::DigestMismatch { .. }) => {}
+        Ok(admitted) => {
+            let _ = admitted.run(
+                &root,
+                &names(),
+                request(GitCommandV1::FsckStrict, vec![]),
+                || Ok(()),
+                || Ok(()),
+            );
+            panic!(
+                "a mismatched pin was admitted and executed; marker present: {}",
+                marker.exists()
+            );
+        }
+        Err(other) => panic!("expected a digest mismatch, got {other}"),
+    }
+    assert!(!marker.exists());
+    drop(bypass);
+
+    // Without the isolation, the pin is still refused, and the same fixture pinned to its own
+    // digest is the caller's recorded decision and does run.
     assert!(matches!(
         GitRunnerV1::admit(
-            GitRouteRequestV1::for_test_fixture(
-                fixture.path.clone(),
-                ExpectedGitDigestV1::from_bytes([0xA5; 32]),
-                fixture.directory.path().to_path_buf(),
-            )
-            .unwrap(),
+            wrong_pin(),
             &root,
             &names(),
             Instant::now() + Duration::from_secs(1),
@@ -1640,4 +1817,330 @@ fn a5a_wrong_digest_prevents_fixture_effect_and_own_digest_allows_it() {
         )
         .unwrap();
     assert!(marker.exists());
+}
+
+/// Review round 3 W1. A detected binary drift must not skip the caller's mandatory post-exit
+/// custody check: the drift outcome dominates, but source, alternate, scratch, and work identity
+/// still have to be evaluated and recorded for the run that already happened.
+#[test]
+fn w1_post_exit_caller_check_runs_even_when_the_binary_drifted() {
+    let (_root_temp, root) = root_fixture();
+    let fixture = FixtureRoute::new(
+        "#!/bin/sh\ncase \"$*\" in *version*) echo 'git version 2.54.0';; *) exit 0;; esac\n",
+    );
+    let runner = fixture.admit(&root);
+    let route = fixture.path.clone();
+    let anchor = fixture.directory.path().to_path_buf();
+    let after_exit_ran = Arc::new(AtomicBool::new(false));
+    let flag = after_exit_ran.clone();
+    let outcome = runner.run(
+        &root,
+        &names(),
+        request(GitCommandV1::FsckStrict, vec![]),
+        move || {
+            // Replace the admitted route after its pre-spawn recheck, so the post-exit recheck
+            // reports drift for a child that has already run.
+            fs::set_permissions(&anchor, fs::Permissions::from_mode(0o700)).unwrap();
+            fs::set_permissions(&route, fs::Permissions::from_mode(0o700)).unwrap();
+            fs::write(&route, "#!/bin/sh\nexit 0\n").unwrap();
+            fs::set_permissions(&route, fs::Permissions::from_mode(0o500)).unwrap();
+            fs::set_permissions(&anchor, fs::Permissions::from_mode(0o500)).unwrap();
+            Ok(())
+        },
+        move || {
+            flag.store(true, Ordering::SeqCst);
+            Ok(())
+        },
+    );
+    assert!(
+        matches!(outcome, Err(CustodyGitError::BinaryDrift(_))),
+        "drift must dominate the child outcome"
+    );
+    assert!(
+        after_exit_ran.load(Ordering::SeqCst),
+        "the caller's post-exit custody check must run even when the binary drifted"
+    );
+}
+
+/// Review round 3 W2, output half. A caller must not be able to point a child's stdout at a
+/// descriptor outside the root it supplied.
+#[test]
+fn w2_stdout_target_cannot_escape_the_pinned_root() {
+    let sibling = TempDir::new().expect("disposable sibling directory");
+    let outside = sibling.path().join("stdout-escape");
+    let (_root_temp, root) = root_fixture();
+    let (_fixture, runner) = fixture_runner(
+        "#!/bin/sh\ncase \"$*\" in *version*) echo 'git version 2.54.0';; *) head -c 32 /dev/zero;; esac\n",
+        &root,
+    );
+    let mut escape = request(GitCommandV1::FsckStrict, vec![]);
+    // The seam only accepts a validated single component, created through the root's retained
+    // descriptor, so no caller can name the sibling file at all.
+    for name in ["../stdout-escape", "/tmp/stdout-escape", ".", ""] {
+        assert!(
+            matches!(
+                escape.stream_stdout_to_new_child(&root, name),
+                Err(CustodyGitError::InvalidCommand(_))
+            ),
+            "{name}"
+        );
+    }
+    assert!(!outside.exists());
+
+    escape
+        .stream_stdout_to_new_child(&root, "stdout-capture")
+        .expect("create the stdout target under the pinned root");
+    let result = runner
+        .run(&root, &names(), escape, || Ok(()), || Ok(()))
+        .expect("stream stdout into the pinned root");
+    assert!(matches!(
+        result.stdout,
+        crate::custody_git::GitStdoutV1::Streamed(_)
+    ));
+    assert_eq!(result.evidence.stdout.length, 32);
+    assert_eq!(
+        fs::metadata(root.canonical_path().join("stdout-capture"))
+            .unwrap()
+            .len(),
+        32
+    );
+    assert!(
+        !outside.exists(),
+        "stdout must not be written outside the caller's pinned root"
+    );
+
+    // An existing entry is refused by the descriptor-relative creation, so a repeat cannot
+    // overwrite a child either.
+    let mut repeat = request(GitCommandV1::FsckStrict, vec![]);
+    assert!(matches!(
+        repeat.stream_stdout_to_new_child(&root, "stdout-capture"),
+        Err(CustodyGitError::Fs(_))
+    ));
+
+    // A target created under another pin would leave the run's recorded root identity describing a
+    // directory the output never reached, so the mismatch is refused before the spawn.
+    let (_other_temp, other_root) = root_fixture();
+    let mut crossed = request(GitCommandV1::FsckStrict, vec![]);
+    crossed
+        .stream_stdout_to_new_child(&other_root, "stdout-capture")
+        .unwrap();
+    assert!(matches!(
+        runner.run(&root, &names(), crossed, || Ok(()), || Ok(())),
+        Err(CustodyGitError::InvalidCommand(_))
+    ));
+    assert_eq!(
+        fs::metadata(other_root.canonical_path().join("stdout-capture"))
+            .unwrap()
+            .len(),
+        0
+    );
+}
+
+/// Review round 3 W2, object-store half. A mutating subcommand must not receive a caller
+/// object-store route: `index-pack` would write its pack and index into that absolute store,
+/// which is outside the caller's pinned root (HL1).
+#[test]
+fn w2_mutating_commands_refuse_a_caller_object_store_route() {
+    let sibling = TempDir::new().expect("disposable sibling store");
+    let store = sibling.path().join("objects");
+    fs::create_dir(&store).unwrap();
+    let store_before = fixture_tree_digest(sibling.path());
+
+    let source = TempDir::new().unwrap();
+    let source_path = source.path().join("source.git");
+    assert!(Command::new(system_git_route())
+        .args(["init", "--bare", source_path.to_str().unwrap()])
+        .output()
+        .unwrap()
+        .status
+        .success());
+    let object = system_git_with_input(
+        &[
+            format!("--git-dir={}", source_path.display()),
+            "hash-object".into(),
+            "-w".into(),
+            "--stdin".into(),
+        ],
+        b"object store escape fixture\n",
+    );
+    assert!(object.status.success(), "{:?}", object.stderr);
+    let object = String::from_utf8(object.stdout).unwrap().trim().to_owned();
+    let pack = system_git_with_input(
+        &[
+            format!("--git-dir={}", source_path.display()),
+            "pack-objects".into(),
+            "--stdout".into(),
+            "--revs".into(),
+        ],
+        format!("{object}\n").as_bytes(),
+    );
+    assert!(pack.status.success(), "{:?}", pack.stderr);
+
+    let (_root_temp, root) = root_fixture();
+    let runner = system_runner(&root);
+    runner
+        .run(
+            &root,
+            &names(),
+            request(
+                GitCommandV1::InitBare {
+                    dir: "repo".into(),
+                    object_format: GitObjectFormatV1::Sha1,
+                },
+                vec![],
+            ),
+            || Ok(()),
+            || Ok(()),
+        )
+        .unwrap();
+    let pack_file = root.canonical_path().join("incoming.pack");
+    fs::write(&pack_file, pack.stdout).unwrap();
+    let mut escape = GitRunRequestV1::from_file(
+        GitCommandV1::IndexPackStrictStdin,
+        fs::File::open(&pack_file).unwrap(),
+        4096,
+        4096,
+        Instant::now() + SUCCESS_PATH_DEADLINE,
+    );
+    escape.object_store = Some(GitObjectStoreRouteV1::new(store.clone(), vec![]).unwrap());
+    let outcome = runner.run(&root, &names(), escape, || Ok(()), || Ok(()));
+    assert!(
+        matches!(
+            outcome,
+            Err(CustodyGitError::ObjectStoreRouteRefused {
+                command: "index-pack --strict --stdin"
+            })
+        ),
+        "a mutating subcommand must refuse a caller object-store route, got {outcome:?}"
+    );
+    assert_eq!(
+        fixture_tree_digest(sibling.path()),
+        store_before,
+        "no pack or index may appear in the caller's object store"
+    );
+
+    // `init --bare` would create a whole repository in the route, and `version` has no source to
+    // read; the read-only source-reading subcommands keep accepting a route.
+    let route = GitObjectStoreRouteV1::new(store.clone(), vec![]).unwrap();
+    for (command, permitted) in [
+        (GitCommandV1::Version, false),
+        (
+            GitCommandV1::InitBare {
+                dir: "refused".into(),
+                object_format: GitObjectFormatV1::Sha1,
+            },
+            false,
+        ),
+        (GitCommandV1::IndexPackStrictStdin, false),
+        (GitCommandV1::CatFileBatchCheck, true),
+        (GitCommandV1::PackObjectsStdout, true),
+        (GitCommandV1::CatFileAllObjects, true),
+        (GitCommandV1::RevListMissingPrint, true),
+        (GitCommandV1::FsckStrict, true),
+        (
+            GitCommandV1::VerifyPack {
+                git_dir: "repo".into(),
+                pack_hash: "a".repeat(40),
+                object_format: GitObjectFormatV1::Sha1,
+            },
+            true,
+        ),
+    ] {
+        let mut routed = request(command.clone(), vec![]);
+        routed.object_store = Some(route.clone());
+        let refused = matches!(
+            runner.run(&root, &names(), routed, || Ok(()), || Ok(())),
+            Err(CustodyGitError::ObjectStoreRouteRefused { .. })
+        );
+        assert_eq!(!refused, permitted, "{command:?}");
+    }
+    assert_eq!(fixture_tree_digest(sibling.path()), store_before);
+}
+
+/// Review round 3 W3. A caller-supplied path operand must not be able to become a Git option.
+/// `InitBare { dir: "-q" }` leaves Git with no directory operand, so it initializes the rooted
+/// cwd instead of the requested child.
+#[test]
+fn w3_option_shaped_path_operands_are_refused_before_any_effect() {
+    let (_root_temp, root) = root_fixture();
+    let runner = system_runner(&root);
+    let entries_before = sorted_entry_names(root.canonical_path());
+    let outcome = runner.run(
+        &root,
+        &names(),
+        request(
+            GitCommandV1::InitBare {
+                dir: "-q".into(),
+                object_format: GitObjectFormatV1::Sha1,
+            },
+            vec![],
+        ),
+        || Ok(()),
+        || Ok(()),
+    );
+    assert!(
+        matches!(outcome, Err(CustodyGitError::InvalidCommand(_))),
+        "an option-shaped init directory must be a typed refusal"
+    );
+    assert!(
+        GitCommandV1::VerifyPack {
+            git_dir: "--upload-pack=/bin/sh".into(),
+            pack_hash: "a".repeat(40),
+            object_format: GitObjectFormatV1::Sha1,
+        }
+        .arguments()
+        .is_err(),
+        "an option-shaped verify-pack git directory must be a typed refusal"
+    );
+    assert!(
+        !root.canonical_path().join("HEAD").exists(),
+        "the pinned root must not become a repository"
+    );
+    assert!(!root.canonical_path().join("objects").exists());
+    assert_eq!(sorted_entry_names(root.canonical_path()), entries_before);
+}
+
+fn sorted_entry_names(path: &Path) -> Vec<String> {
+    let mut entries = fs::read_dir(path)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        .collect::<Vec<_>>();
+    entries.sort();
+    entries
+}
+
+#[test]
+fn a5_write_probe_errno_classification_admits_only_proven_denials() {
+    use crate::custody_git::classify_write_denial;
+    for errno in [libc::EACCES, libc::EROFS, libc::EPERM] {
+        assert!(
+            classify_write_denial(std::io::Error::from_raw_os_error(errno)).is_ok(),
+            "errno {errno} proves the component is not writable"
+        );
+    }
+    for errno in [libc::ENOENT, libc::EIO, libc::ELOOP, libc::ENAMETOOLONG] {
+        assert!(
+            matches!(
+                classify_write_denial(std::io::Error::from_raw_os_error(errno)),
+                Err(CustodyGitError::RouteRefusal(_))
+            ),
+            "errno {errno} leaves writability unproven"
+        );
+    }
+}
+
+#[test]
+fn terminating_a_group_whose_leader_already_exited_returns_its_status() {
+    use crate::custody_git::terminate_process_group;
+    use std::os::unix::process::CommandExt as _;
+    // The leader exits at once and stays an unreaped zombie. macOS then answers the group signal
+    // with `EPERM` rather than `ESRCH`; termination must still return the leader's exit status.
+    let mut child = Command::new("/bin/sh")
+        .args(["-c", "exit 7"])
+        .process_group(0)
+        .spawn()
+        .expect("spawn group leader");
+    std::thread::sleep(Duration::from_millis(200));
+    let status = terminate_process_group(&mut child).expect("terminate zombie-only group");
+    assert_eq!(status.code(), Some(7));
 }

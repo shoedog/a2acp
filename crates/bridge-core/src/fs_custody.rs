@@ -1050,7 +1050,11 @@ impl PinnedDirectoryV1 {
             .map_err(|error| FsCustodyError::Io(label.to_owned(), error))?
             .ok_or_else(|| FsCustodyError::IdentityChanged(label.to_owned()))
             .and_then(|entry| {
-                if entry.st_dev == identity.dev.unwrap_or_default()
+                // `dev_t` is `i32` on macOS and `u64` on Linux; widening to `u64` matches what
+                // `MetadataExt::dev` recorded in `identity`, and is a no-op cast on Linux only.
+                #[allow(clippy::unnecessary_cast)]
+                let entry_dev = entry.st_dev as u64;
+                if entry_dev == identity.dev.unwrap_or_default()
                     && entry.st_ino == identity.ino.unwrap_or_default()
                 {
                     Ok(())
@@ -7945,12 +7949,16 @@ mod tests {
                 fs::rename(created, &displaced).unwrap();
                 fs::create_dir(created).unwrap();
                 fs::write(created.join("non-empty"), b"x").unwrap();
+                // The substitute must pass the owner and mode guard and the parent-entry identity
+                // guard, or one of those masks the emptiness guard this arm isolates.
+                fs::set_permissions(created, fs::Permissions::from_mode(0o700)).unwrap();
             })),
             None,
         );
-        assert!(a2a_pin
-            .create_new_child_directory(OsStr::new("child"), "A2a")
-            .is_err());
+        assert!(matches!(
+            a2a_pin.create_new_child_directory(OsStr::new("child"), "A2a"),
+            Err(FsCustodyError::EnumerationLimitExceeded { .. })
+        ));
         drop(_hooks);
 
         let a2b = tempfile::tempdir().unwrap();
@@ -7991,6 +7999,11 @@ mod tests {
         assert!(created_child_owner_and_mode_is_valid(42, 0o700, 42, 1));
         assert!(created_child_owner_and_mode_is_valid(42, 0o700, 42, 2));
         assert!(!created_child_owner_and_mode_is_valid(42, 0o755, 42, 1));
+        // A2b's owner arm. A directory substituted by another user cannot be created through this
+        // retained descriptor without privilege, so the owner half of the guard is discriminated by
+        // injected metadata: same mode, same link count, different owner.
+        assert!(!created_child_owner_and_mode_is_valid(43, 0o700, 42, 2));
+        assert!(!created_child_owner_and_mode_is_valid(0, 0o700, 42, 2));
 
         let a3 = tempfile::tempdir().unwrap();
         let root = a3.path().join("root");
@@ -8023,9 +8036,10 @@ mod tests {
             .collect::<Vec<_>>();
         let output = command.output().unwrap();
         assert!(output.status.success());
+        // `/bin/pwd` reports the physical path (macOS `/var` is `/private/var`).
         assert_eq!(
             Path::new(std::str::from_utf8(&output.stdout).unwrap().trim()),
-            retained
+            fs::canonicalize(&retained).unwrap()
         );
     }
 

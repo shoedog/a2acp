@@ -154,6 +154,38 @@ impl GitCommandV1 {
         };
         Ok((arguments, !matches!(self, Self::InitBare { .. })))
     }
+
+    /// Only the read-only source-reading subcommands may be pointed at a caller object store.
+    ///
+    /// An object-store route is absolute by necessity (HL1), so it is the one input that can name
+    /// a location outside the caller's pinned root. A mutating subcommand handed such a route would
+    /// write repository, pack, or index data there — `index-pack --stdin` writes its pack and index
+    /// straight into `GIT_OBJECT_DIRECTORY` — which would defeat the root-confined effect boundary.
+    fn permits_object_store_route(&self) -> bool {
+        match self {
+            Self::CatFileBatchCheck
+            | Self::PackObjectsStdout
+            | Self::VerifyPack { .. }
+            | Self::CatFileAllObjects
+            | Self::RevListMissingPrint
+            | Self::FsckStrict => true,
+            Self::Version | Self::InitBare { .. } | Self::IndexPackStrictStdin => false,
+        }
+    }
+
+    fn label(&self) -> &'static str {
+        match self {
+            Self::Version => "version",
+            Self::InitBare { .. } => "init --bare",
+            Self::CatFileBatchCheck => "cat-file --batch-check",
+            Self::PackObjectsStdout => "pack-objects --stdout",
+            Self::IndexPackStrictStdin => "index-pack --strict --stdin",
+            Self::VerifyPack { .. } => "verify-pack",
+            Self::CatFileAllObjects => "cat-file --batch-all-objects",
+            Self::RevListMissingPrint => "rev-list --missing=print",
+            Self::FsckStrict => "fsck --strict",
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -294,7 +326,7 @@ enum GitAdmissionProfileV1 {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum WriteCheckV1 {
+pub(crate) enum WriteCheckV1 {
     Faccessat,
     ModeBitsAsRoot,
 }
@@ -319,7 +351,10 @@ impl RouteFactsV1 {
         Self {
             dev: metadata.dev(),
             ino: metadata.ino(),
-            file_type: metadata.mode() & libc::S_IFMT,
+            // The POSIX file-type mask is written as a literal rather than `libc::S_IFMT`, whose
+            // `mode_t` is `u16` on macOS and `u32` on Linux; a cast either way trips clippy on one
+            // of the two lanes.
+            file_type: metadata.mode() & 0o170000,
             uid: metadata.uid(),
             gid: metadata.gid(),
             mode: metadata.mode(),
@@ -375,6 +410,40 @@ fn facts_for_recheck(observed: RouteFactsV1, admitted: RouteFactsV1) -> RouteFac
 #[cfg(not(test))]
 fn facts_for_recheck(observed: RouteFactsV1, _: RouteFactsV1) -> RouteFactsV1 {
     observed
+}
+
+#[cfg(test)]
+thread_local! {
+    static RECHECK_DIGEST_BYPASS: RefCell<bool> = const { RefCell::new(false) };
+}
+
+#[cfg(test)]
+pub(crate) struct RecheckDigestBypassGuardV1(bool);
+
+#[cfg(test)]
+impl Drop for RecheckDigestBypassGuardV1 {
+    fn drop(&mut self) {
+        RECHECK_DIGEST_BYPASS.with(|slot| *slot.borrow_mut() = self.0);
+    }
+}
+
+/// Isolates A5a. The mandatory pre-spawn recheck repeats the digest comparison, so it masks
+/// admission's own comparison: with this bypass held, step 4 of admission is the only thing between
+/// a mismatched pin and an executed binary.
+#[cfg(test)]
+pub(crate) fn bypass_recheck_digest_for_test() -> RecheckDigestBypassGuardV1 {
+    let previous = RECHECK_DIGEST_BYPASS.with(|slot| slot.replace(true));
+    RecheckDigestBypassGuardV1(previous)
+}
+
+#[cfg(test)]
+fn recheck_digest_bypassed() -> bool {
+    RECHECK_DIGEST_BYPASS.with(|slot| *slot.borrow())
+}
+
+#[cfg(not(test))]
+fn recheck_digest_bypassed() -> bool {
+    false
 }
 
 #[cfg(test)]
@@ -471,6 +540,7 @@ pub(crate) struct GitRunRequestV1 {
     pub(crate) object_store: Option<GitObjectStoreRouteV1>,
     stdin: GitStdinSourceV1,
     stdout: GitStdoutTargetV1,
+    stdout_root_identity: Option<DirectoryIdentityV1>,
     pub(crate) stdout_limit: usize,
     pub(crate) stderr_limit: usize,
     pub(crate) deadline: Instant,
@@ -523,6 +593,7 @@ impl GitRunRequestV1 {
             object_store: None,
             stdin,
             stdout: GitStdoutTargetV1::Capture,
+            stdout_root_identity: None,
             stdout_limit,
             stderr_limit,
             deadline,
@@ -531,10 +602,54 @@ impl GitRunRequestV1 {
         }
     }
 
-    /// Send stdout directly to an owned descriptor and retain only its bounded stream evidence.
-    pub(crate) fn stream_stdout_to_file(&mut self, file: File) {
+    /// Send stdout to a **new** owner-private child of the caller's pinned root and retain only
+    /// its bounded stream evidence.
+    ///
+    /// The runner creates the target itself, through the root's retained descriptor and from a
+    /// validated single component, so no caller can hand the seam a descriptor that writes outside
+    /// the root it supplied. An existing entry is refused by the descriptor-relative creation.
+    pub(crate) fn stream_stdout_to_new_child(
+        &mut self,
+        root: &PinnedDirectoryV1,
+        name: &str,
+    ) -> Result<(), CustodyGitError> {
+        validate_component(name, "stdout target name")?;
+        let file =
+            root.create_new_regular_child(std::ffi::OsStr::new(name), "custody Git stdout target")?;
         self.stdout = GitStdoutTargetV1::File(file);
+        self.stdout_root_identity = Some(root.identity().clone());
+        Ok(())
     }
+}
+
+/// How the stdin writer and the two stream readers are scheduled around one child.
+///
+/// Production always uses `Concurrent`. The other three are A10's serialization mutations, kept as
+/// separate values so the control discriminates each one instead of one shared branch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum GitIoScheduleV1 {
+    Concurrent,
+    StdinBeforeReaders,
+    StdoutAfterStdin,
+    StderrAfterExit,
+}
+
+#[cfg(test)]
+thread_local! {
+    static LAST_IO_SCHEDULE: RefCell<GitIoScheduleV1> =
+        const { RefCell::new(GitIoScheduleV1::Concurrent) };
+}
+
+#[cfg(test)]
+fn record_io_schedule_for_test(schedule: GitIoScheduleV1) {
+    LAST_IO_SCHEDULE.with(|slot| *slot.borrow_mut() = schedule);
+}
+
+/// The schedule the most recent `run` on this thread actually used, so A10 can prove that its three
+/// mutations take three different paths.
+#[cfg(test)]
+pub(crate) fn last_io_schedule_for_test() -> GitIoScheduleV1 {
+    LAST_IO_SCHEDULE.with(|slot| *slot.borrow())
 }
 
 #[cfg(test)]
@@ -551,6 +666,21 @@ pub(crate) struct GitGuardBypassV1 {
     pub(crate) init_uses_template: bool,
     pub(crate) skip_stdout_limit: bool,
     pub(crate) skip_stderr_limit: bool,
+}
+
+#[cfg(test)]
+impl GitGuardBypassV1 {
+    fn io_schedule(self) -> GitIoScheduleV1 {
+        if self.stdin_before_readers {
+            GitIoScheduleV1::StdinBeforeReaders
+        } else if self.stdout_after_stdin {
+            GitIoScheduleV1::StdoutAfterStdin
+        } else if self.stderr_after_exit {
+            GitIoScheduleV1::StderrAfterExit
+        } else {
+            GitIoScheduleV1::Concurrent
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -638,6 +768,8 @@ pub(crate) enum CustodyGitError {
     InvalidCommand(String),
     #[error("invalid Git object-store route: {0}")]
     InvalidObjectStoreRoute(String),
+    #[error("Git command {command} may not receive a caller object-store route")]
+    ObjectStoreRouteRefused { command: &'static str },
     #[error("Git route refused: {0}")]
     RouteRefusal(String),
     #[error("Git route identity changed")]
@@ -760,9 +892,11 @@ impl GitRunnerV1 {
             ..
         } = request;
         #[cfg(test)]
-        let delay_stdout = guard_bypass.stdin_before_readers || guard_bypass.stdout_after_stdin;
+        let schedule = guard_bypass.io_schedule();
         #[cfg(not(test))]
-        let delay_stdout = false;
+        let schedule = GitIoScheduleV1::Concurrent;
+        #[cfg(test)]
+        record_io_schedule_for_test(schedule);
         #[cfg(test)]
         let stdout_reader_limit = if guard_bypass.skip_stdout_limit {
             usize::MAX
@@ -779,10 +913,6 @@ impl GitRunnerV1 {
         };
         #[cfg(not(test))]
         let stderr_reader_limit = stderr_limit;
-        #[cfg(test)]
-        let delay_stderr = guard_bypass.stderr_after_exit;
-        #[cfg(not(test))]
-        let delay_stderr = false;
         let drain_complete = Arc::new(AtomicBool::new(false));
         let drain_timed_out = Arc::new(AtomicBool::new(false));
         arm_drain_deadline(
@@ -791,72 +921,86 @@ impl GitRunnerV1 {
             drain_complete.clone(),
             drain_timed_out.clone(),
         );
-        let writer = thread::spawn(move || copy_input(stdin, child_stdin));
+        // The default schedule runs the stdin writer, the stdout reader, and the stderr reader
+        // concurrently, so no full pipe can deadlock. The three `#[cfg(test)]` schedules below are
+        // A10's mutations, and each one is a distinct serialization rather than a shared branch:
+        // `StdinBeforeReaders` completes the caller's input before any reader exists,
+        // `StdoutAfterStdin` keeps stderr concurrent but defers stdout until the writer is done, and
+        // `StderrAfterExit` defers stderr until the child has been reaped.
+        let mut writer = Some(thread::spawn(move || copy_input(stdin, child_stdin)));
+        let mut write = None;
         let mut stdout_target = Some(stdout_target);
-        let stdout_reader = if delay_stdout {
-            None
-        } else {
-            Some(spawn_reader(
+        let mut stdout_reader = None;
+        let mut stderr_reader = None;
+        if schedule == GitIoScheduleV1::StdinBeforeReaders {
+            write = Some(join_writer(&mut writer)?);
+        }
+        if schedule != GitIoScheduleV1::StdoutAfterStdin {
+            stdout_reader = Some(spawn_reader(
                 stdout.take().expect("stdout reader owns its pipe"),
                 stdout_reader_limit,
                 stdout_target.take().expect("stdout reader owns its target"),
                 child.clone(),
                 overflow.clone(),
-            ))
-        };
-        let stderr_reader = if delay_stderr {
-            None
-        } else {
-            Some(spawn_reader(
+            ));
+        }
+        if schedule != GitIoScheduleV1::StderrAfterExit {
+            stderr_reader = Some(spawn_reader(
                 stderr.take().expect("stderr reader owns its pipe"),
                 stderr_reader_limit,
                 GitStdoutTargetV1::Capture,
                 child.clone(),
                 overflow.clone(),
-            ))
-        };
-
-        let (status, timed_out) = wait_for_child(&child, &overflow, deadline)?;
-        let stdout = match stdout_reader {
-            Some(reader) => reader
-                .join()
-                .map_err(|_| CustodyGitError::Stream(thread_panic_error()))?,
-            None => spawn_reader(
-                stdout.take().expect("delayed stdout reader owns its pipe"),
+            ));
+        }
+        if schedule == GitIoScheduleV1::StdoutAfterStdin {
+            write = Some(join_writer(&mut writer)?);
+            stdout_reader = Some(spawn_reader(
+                stdout.take().expect("deferred stdout reader owns its pipe"),
                 stdout_reader_limit,
                 stdout_target
                     .take()
-                    .expect("delayed stdout reader owns its target"),
+                    .expect("deferred stdout reader owns its target"),
                 child.clone(),
                 overflow.clone(),
-            )
-            .join()
-            .map_err(|_| CustodyGitError::Stream(thread_panic_error()))?,
-        };
-        let stderr = match stderr_reader {
-            Some(reader) => reader
-                .join()
-                .map_err(|_| CustodyGitError::Stream(thread_panic_error()))?,
-            None => spawn_reader(
-                stderr.take().expect("delayed stderr reader owns its pipe"),
+            ));
+        }
+
+        let (status, timed_out) = wait_for_child(&child, &overflow, deadline)?;
+        if stderr_reader.is_none() {
+            stderr_reader = Some(spawn_reader(
+                stderr.take().expect("deferred stderr reader owns its pipe"),
                 stderr_reader_limit,
                 GitStdoutTargetV1::Capture,
                 child.clone(),
                 overflow.clone(),
-            )
+            ));
+        }
+        let stdout = stdout_reader
+            .expect("the stdout reader is started before the child is reaped")
             .join()
-            .map_err(|_| CustodyGitError::Stream(thread_panic_error()))?,
+            .map_err(|_| CustodyGitError::Stream(thread_panic_error()))?;
+        let stderr = stderr_reader
+            .expect("the stderr reader is started")
+            .join()
+            .map_err(|_| CustodyGitError::Stream(thread_panic_error()))?;
+        let write = match write {
+            Some(write) => write,
+            None => join_writer(&mut writer)?,
         };
-        let write = writer
-            .join()
-            .map_err(|_| CustodyGitError::Stdin(thread_panic_error()))?;
         drain_complete.store(true, Ordering::SeqCst);
 
         // A completed child is always followed by both custody rechecks, even when it overflowed
-        // a cap or timed out. A detected binary drift dominates its ordinary child outcome.
-        self.recheck()
-            .map_err(|error| CustodyGitError::BinaryDrift(error.to_string()))?;
-        after_exit()?;
+        // a cap or timed out, and even when the binary drifted: the caller's post-exit check is
+        // how source, alternate, scratch, and work identity are evaluated and recorded for a child
+        // that already ran. Both are therefore evaluated before either is reported, and detected
+        // binary drift then dominates every other outcome.
+        let drift = self
+            .recheck()
+            .map_err(|error| CustodyGitError::BinaryDrift(error.to_string()));
+        let caller_check = after_exit();
+        drift?;
+        caller_check?;
 
         if timed_out || drain_timed_out.load(Ordering::SeqCst) {
             return Err(CustodyGitError::Timeout);
@@ -909,6 +1053,20 @@ impl GitRunnerV1 {
         names: &GitRootNamesV1,
         request: &GitRunRequestV1,
     ) -> Result<BuiltGitCommandV1, CustodyGitError> {
+        if let Some(identity) = &request.stdout_root_identity {
+            // The evidence record names the root this child is rooted at, so a stdout child created
+            // under a different pin would misdescribe where the output went.
+            if !identity.matches(root.identity()) {
+                return Err(CustodyGitError::InvalidCommand(
+                    "the stdout target was created under a different pinned root".into(),
+                ));
+            }
+        }
+        if request.object_store.is_some() && !request.command.permits_object_store_route() {
+            return Err(CustodyGitError::ObjectStoreRouteRefused {
+                command: request.command.label(),
+            });
+        }
         let (subcommand, include_git_dir) = request.command.arguments()?;
         #[cfg(test)]
         let (subcommand, include_git_dir) = {
@@ -1029,7 +1187,7 @@ impl GitRunnerV1 {
             return Err(CustodyGitError::RouteIdentityChanged);
         }
         let observed = digest_file(file)?;
-        if observed != self.route.expected_digest.bytes() {
+        if observed != self.route.expected_digest.bytes() && !recheck_digest_bypassed() {
             return Err(CustodyGitError::DigestMismatch {
                 details: Box::new(GitDigestMismatchV1 {
                     expected: self.route.expected_digest,
@@ -1238,13 +1396,22 @@ fn deny_effective_write(
             "executing user can write a Git route component".into(),
         ));
     }
-    let error = std::io::Error::last_os_error();
-    if error.raw_os_error() != Some(libc::EACCES) {
-        return Err(CustodyGitError::RouteRefusal(format!(
+    classify_write_denial(std::io::Error::last_os_error())
+}
+
+/// Classifies a failed `faccessat(W_OK)` probe. `EACCES`, `EROFS`, and `EPERM` each prove the
+/// executing user cannot write the component: macOS reports `EROFS` for `/` on the sealed system
+/// volume and `EPERM` for SIP-protected paths. Any other errno leaves writability unproven, so the
+/// route is refused.
+pub(crate) fn classify_write_denial(
+    error: std::io::Error,
+) -> Result<WriteCheckV1, CustodyGitError> {
+    match error.raw_os_error() {
+        Some(libc::EACCES | libc::EROFS | libc::EPERM) => Ok(WriteCheckV1::Faccessat),
+        _ => Err(CustodyGitError::RouteRefusal(format!(
             "cannot check effective write access: {error}"
-        )));
+        ))),
     }
-    Ok(WriteCheckV1::Faccessat)
 }
 
 fn effective_uid() -> u32 {
@@ -1362,6 +1529,15 @@ fn validate_component(value: &str, label: &str) -> Result<(), CustodyGitError> {
             "{label} is not one relative component"
         )));
     }
+    // A component that reaches the fixed argv as a positional operand must not be able to become a
+    // Git option instead. `InitBare { dir: "-q" }` would otherwise leave `init` with no directory
+    // operand and initialize the rooted cwd. The closed argv table has no `--` terminator, so the
+    // refusal is here rather than in each variant.
+    if value.starts_with('-') {
+        return Err(CustodyGitError::InvalidCommand(format!(
+            "{label} must not begin with '-'"
+        )));
+    }
     Ok(())
 }
 
@@ -1420,6 +1596,18 @@ fn copy_input(
             std::io::copy(&mut file, &mut child_stdin)
         }
     }
+}
+
+/// Join the stdin writer exactly once, whatever the schedule, and keep its I/O result for the
+/// caller-facing error precedence below.
+fn join_writer(
+    writer: &mut Option<thread::JoinHandle<std::io::Result<u64>>>,
+) -> Result<std::io::Result<u64>, CustodyGitError> {
+    writer
+        .take()
+        .expect("the stdin writer is joined once")
+        .join()
+        .map_err(|_| CustodyGitError::Stdin(thread_panic_error()))
 }
 
 fn spawn_reader<R: std::io::Read + Send + 'static>(
@@ -1534,17 +1722,33 @@ fn signal_process_group(child: &mut Child, signal: i32) -> std::io::Result<()> {
     // `SystemProcessAuthorityV1` owns the audited Unix group-signal syscall. The process group
     // was created above with `process_group(0)`, so the direct child pid is this runner's group
     // leader and every inherited pipe holder is in the same group.
-    let outcome = SystemProcessAuthorityV1.signal_process_group(pgid as u32, signal);
-    if outcome.return_code == 0 || outcome.errno == Some(libc::ESRCH) {
-        Ok(())
-    } else {
-        Err(std::io::Error::from_raw_os_error(
-            outcome.errno.unwrap_or(libc::EIO),
-        ))
+    // macOS answers a group signal with `EPERM`, not `ESRCH`, while the group leader is exiting: a
+    // process that has begun exit, or an unreaped zombie, cannot be signalled, and `waitpid` may not
+    // report the leader for a moment. When the leader has exited, the signal is moot. A transient
+    // `EPERM` is retried for a bounded window; a persistent one is reported.
+    let retry_until = Instant::now() + Duration::from_millis(100);
+    loop {
+        let outcome = SystemProcessAuthorityV1.signal_process_group(pgid as u32, signal);
+        if outcome.return_code == 0 || outcome.errno == Some(libc::ESRCH) {
+            return Ok(());
+        }
+        if outcome.errno != Some(libc::EPERM) {
+            return Err(std::io::Error::from_raw_os_error(
+                outcome.errno.unwrap_or(libc::EIO),
+            ));
+        }
+        // `Child` caches a reaped status, so a later `try_wait`/`wait` still returns it.
+        if child.try_wait()?.is_some() {
+            return Ok(());
+        }
+        if Instant::now() >= retry_until {
+            return Err(std::io::Error::from_raw_os_error(libc::EPERM));
+        }
+        thread::sleep(Duration::from_millis(1));
     }
 }
 
-fn terminate_process_group(child: &mut Child) -> std::io::Result<ExitStatus> {
+pub(crate) fn terminate_process_group(child: &mut Child) -> std::io::Result<ExitStatus> {
     signal_process_group(child, libc::SIGTERM)?;
     let grace_deadline = Instant::now() + Duration::from_millis(25);
     let mut exited = None;
