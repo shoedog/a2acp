@@ -374,7 +374,9 @@ a2a-bridge containers reap  --config … --force a2a-rw-<owner>-<run>-0         
   workflows), or `a2a-bridge init`.
 - **Creds (containerized agents):** WRITABLE single-file copies in `~/.config/a2a-creds/{claude,codex}` —
   `cp ~/.codex/auth.json ~/.config/a2a-creds/codex/auth.json`, likewise claude (its OAuth token expires
-  ~hourly, so re-copy if a claude node starts failing). See `docs/containerized-agents.md`.
+  ~hourly, so re-copy if a claude node starts failing). On macOS hosts whose Claude login is Keychain-only,
+  `deploy/containers/sync-creds.sh` builds the claude copy from a long-lived `claude setup-token` token
+  (`CLAUDE_CODE_OAUTH_TOKEN` or `~/.config/a2a-creds/claude/oauth-token`). See `docs/containerized-agents.md`.
 - **Live model execution:** run `a2a-bridge doctor` first. A managed agent sandbox can lack DNS while
   approved host execution and computer-level auth remain healthy; repeat the exact minimal control via
   approved host execution before changing auth or packages. Do not trust an inherited network marker

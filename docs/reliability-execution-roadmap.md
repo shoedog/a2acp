@@ -13,8 +13,17 @@
   `6338bc1628fed52b772026b604a1bbdd710efa8c`; the final Sol/xhigh rereview recorded 0 WRONG and 3 SMELL,
   with full verification at 4,408 passed / 0 failed / 13 ignored / 726 filtered. The candidate remains
   production-unwired; its historical handoff's pre-publication stop is superseded by the recorded PR #102 merge.
-- **Active slice:** **ADR-0041 Slice 2B2 planning — Slice 2B1 merged in PR #105 at `5e431f4f`; isolated local export
-  and exact Git-object closure are at task revision 3: the pre-review audit (7 WRONG / 10 SMELL) and independent review round 1 (Sol/xhigh REJECT, 5 WRONG / 9 SMELL, closed population) are both folded, and an owner-approved 2B2b framing child sits between 2B2 and 2B3. Round 2 of 2 rejected revision 3 (6 WRONG / 3 SMELL) and exhausted the cap. Revision 4 folds the closed residue, The owner then ruled hostile same-user check-to-use races out of scope, and revision 5 applied that ruling (task §2.1, §15). The owner-approved extension round 3 rejected revision 5 with 6 WRONG / 2 SMELL, a closed population folded in revision 6 (task §16). The owner then split the slice: the descriptor seam and hardened Git runner are child **2B2a** (task revision 8; implementation approved; review rounds 1–3 rejected with 5, then 2, then 1 WRONG, converging and folded; the owner authorized cap extensions and implementation once the review clears; extension round 4 rejected the same wrapper-admission item again; the owner chose caller-pinned digest admission, applied in revision 5; extension round 5 raised 4 closed WRONG, folded in revision 6 (and 2B2 revision 8); delta round 6 raised 1 residual WRONG, folded in revision 7; delta round 7 found no production defect but 2 control-discrimination WRONG, folded in revision 8; after that escalation, the owner directed implementation of revision 8. The implementation was the terra `535cfb82`, then Opus 5.5 repairs, then controller macOS-lane fixes, ending at `d0bf020a`. The Sol implementation review ran rounds 1–2 plus a narrow extension, with MATERIAL blockers 4 → 1 → 0, and **APPROVED**; deferrals W4, S2, S3, and R3-S1 are recorded in the implementation handoff. A PR to `main` is opened and merged when CI is green), and 2B2 (revision 8) builds on it. The serial order is 2B2a → 2B2 → 2B2b → 2B3. 2B2a and 2B2 effects remain unstarted.** Slice 1A defines canonical lossless records without I/O; Slice 1B adds an
+- **Active slice:** **ADR-0041 Slice 2B2 exporter spec review.** Slice 2B2a (descriptor seam and hardened Git
+  runner) **merged in PR #106 at `67f414e7`** on 2026-09-25. All CI jobs were green. The native-ext4 lane is proven
+  by `live_ext4_lane_probe_records_admission`, which asserts `Admitted` under `GITHUB_ACTIONS`.
+  - **2B2a history:** terra implementation, Opus 5.5 repairs, then controller macOS-lane fixes (`EROFS`/`EPERM` write
+    denial, and `killpg` `EPERM` during exit).
+  - **2B2a review:** the Sol implementation review ran rounds 1–2 plus a narrow extension; MATERIAL blockers
+    4 → 1 → 0.
+  - **Next:** 2B2 revision 9, bound to the merged 2B2a API, is in spec review under a new two-round cap. The serial
+    order is 2B2a → 2B2 → 2B2b → 2B3.
+  - **Effects:** no 2B2 effect has started. The 2B2a deferrals are in the ledger below.
+  - **Earlier history:** Slice 1A defines canonical lossless records without I/O; Slice 1B adds an
   explicitly capped 8+8 metadata collector and synthetic historical reconciliation, with every missing row still
   unverified. The Opus 5/high spec review reported 4 WRONG and 9 SMELL; Sol/high folded all four WRONG and the
   required SMELLs before implementation. Structural and behavioral RED were captured; the host full workspace
@@ -979,6 +988,29 @@ history. The detailed design remains normative for R2; this roadmap owns sequenc
 and completion evidence. It is the sole volatile release-status cursor. The active design and plan mirror
 review-boundary evidence; `AGENTS.md`, CLI help, onboarding, and the operator skill are stable behavior/runbook
 surfaces that point here and do not duplicate changing commit hashes or gate totals.
+
+
+### ADR-0041 2B2a deferred follow-ups (ledger, 2026-09-25)
+
+Each item was accepted as deferred by the 2B2a implementation review, and none blocks 2B2. Detail is in
+`docs/superpowers/reviews/2026-09-24-adr0041-slice2b2a-implementation-handoff.md`.
+
+- **W4 — process-group ID reuse after the leader is reaped.** Theoretical-only. A later group signal could reach a
+  reused ID only inside the window between the last pipe holder exiting and the drain completing, or if a holder
+  escapes the group, which none of the closed Git subcommands do. **Fix:** keep the leader unreaped with
+  `waitid(WNOWAIT)` or an equivalent until draining completes. This adds an `unsafe` boundary, so it is a task-spec
+  amendment.
+- **S2 — deterministic signal-branch coverage.** An injectable signal-outcome state machine testing the
+  `EPERM`→success, `EPERM`→exited, and persistent-`EPERM` branches. Today they are covered by a fail-first
+  zombie-group regression plus stress evidence.
+- **S3 — A18 domain-tag discrimination.** Exact-digest fixtures, plus a same-tag mutation.
+- **R3-S1 — writer negative paths.** A scripted `Write` harness for short writes, `Interrupted`, `WriteZero`, and a
+  partial write followed by `BrokenPipe`. Also reword "received" to "accepted by the pipe" in the comments.
+- **Operations — Claude credential sources.** Host Claude Code now keeps OAuth in the macOS Keychain, so
+  `~/.claude/.credentials.json` is absent. `sync-creds.sh` therefore falls back to a long-lived
+  `CLAUDE_CODE_OAUTH_TOKEN` (see `docs/containerized-agents.md`). Still open: `a2a-bridge doctor`'s
+  `provenance:claude:oauth-credential` check reads only that file and reports FAIL on Keychain/token hosts. Teach it
+  the token path.
 
 ## Dependency graph
 
