@@ -3,7 +3,8 @@ task-type: implement
 ---
 # ADR-0041 Slice 2B2 — isolated local export and Git-object closure
 
-**Status:** revision 7, **split**; planning/documentation only. Implementation is not authorized by this file. On
+**Status:** revision 8 (revision 7 split it; revision 8 adds the 2B2a route-request input from 2B2a extension
+round 5, W1), **split**; planning/documentation only. Implementation is not authorized by this file. On
 2026-09-24 the owner chose to split the descriptor seam and hardened Git runner out into child **2B2a**
 (`docs/superpowers/plans/2026-09-24-adr0041-slice2b2a-git-runner-seam-task.md`). This task now owns only the exporter, capture binding, pack production, closure proof, ledger, sealing, and
 publication, built on 2B2a's API (§17). 2B2 review resumes only after 2B2a is approved, as a new two-round cap scoped
@@ -98,7 +99,11 @@ as inert, typed scratch evidence. Plaintext in `work/` is acceptable only becaus
 (§2 exclusions); a production envelope provider must revisit this before any confidentiality claim.
 
 The public entry point accepts a validated sealable `CustodyManifestV1`, an explicit envelope format and recipients,
-caller budgets, a sealer, and a non-cloneable generation-bound `CustodyCaptureCapabilityV1`. It derives the
+caller budgets, a sealer, a non-cloneable generation-bound `CustodyCaptureCapabilityV1`, and a caller-supplied 2B2a
+`GitRouteRequestV1`: the absolute Git path and its expected SHA-256 digest. 2B2 passes the route request to the
+runner unchanged. It never locates Git, never computes the expected digest itself, and has no production
+trust-on-first-use. Where the digest comes from is decided by the later wiring slice. Tests supply it through 2B2a's
+test-only trust-on-first-use helper. It derives the
 `CustodyCapsuleLayoutV1` itself from the manifest; it does not accept a caller layout. Caller budgets are validated
 to be at or below the fixed §3 ceilings and are otherwise refused.
 
@@ -184,8 +189,9 @@ one object format, or a format different from the source's, refuses with a typed
 
 Every Git child runs through the 2B2a `custody_git` runner. The runner owns route admission, the closed environment
 and flags, the closed `GitCommandV1` set, rooted spawning, bounded I/O and deadline, and the binary rechecks. 2B2
-neither reimplements nor extends any of these. 2B2 supplies only four things:
+neither reimplements nor extends any of these. 2B2 supplies only five things:
 
+- the caller's `GitRouteRequestV1` (§2), passed through unchanged for admission;
 - the `GitCommandV1` variant and its relative names;
 - a `GitObjectStoreRouteV1` built from the capability's pinned primary store and recursive alternate chain, for
   source children only;
@@ -336,6 +342,7 @@ the fixture is repaired.
 | 21 | scratch root placed inside the source git directory, disjointness check disabled | §2 scratch/source disjointness preflight | typed refusal before any write; with the guard disabled, source bytes change |
 | 24 | a prohibited external use of each new public or crate-private boundary: forged capability, external sealed-trait implementation, public seal-receipt construction | compile-fail doctests on `src/custody_export.rs` items | that doctest fails when its barrier is widened |
 | 25 | reconnect a source-stream receipt to seal publication | existing provenance compile-fail doctest | that doctest fails |
+| 31 | two otherwise identical export fixtures, one with a matching route pin and one with a mismatching pin; the Git route is a marker-writing fixture | §2 route-request pass-through to 2B2a admission | the mismatch refuses with `DigestMismatch` before `version` or any marker; removing the pin flow, or replacing it with trust-on-first-use, makes the negative arm fail |
 | 30 | the source repository carries promisor config (`extensions.partialClone`, a `remote.p.promisor=true` `file://` remote holding one manifest object the source store lacks); all three lazy-fetch guards disabled through 2B2a's `#[cfg(test)]` bypass seam; the mutation makes the exporter copy the source's config into `work/source-git/` | §4.1 synthesized git dir receives no source config | object reported missing, typed refusal, no fetch, source unchanged. Every arm uses a fresh source store from an immutable template |
 
 Controls 8a–8c, 22, 23, 26, 27a–27d, 28, 28a, 28b, and 29 moved to 2B2a. The source-config half of 8d stays here
@@ -366,7 +373,7 @@ no feature may be added to expose them.
   callbacks, and isolated closure proof. Control 24's compile-fail doctests live on its public items; rustdoc does not run
   doctests from `tests/` targets;
 - `crates/bridge-core/src/custody_export_tests.rs` — in-crate real-Git fixtures, the `#[cfg(test)]` deterministic
-  fixture sealer and capture constructor, fault injection, and controls 1–21 and 30 (retired numbers excluded);
+  fixture sealer and capture constructor, fault injection, and controls 1–21, 30, and 31 (retired numbers excluded);
 - `crates/bridge-core/tests/custody_export.rs` — runtime public-API refusal tests only; no doctests and no real-Git
   success path;
 - `crates/bridge-core/src/custody_capsule.rs` — only: change `mod sealed` to `pub(crate) mod sealed` so

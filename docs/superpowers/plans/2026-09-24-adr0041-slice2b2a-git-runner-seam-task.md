@@ -3,7 +3,8 @@ task-type: implement
 ---
 # ADR-0041 Slice 2B2a — descriptor seam and hardened Git runner
 
-**Status:** review candidate, revision 5; planning/documentation only.
+**Status:** review candidate, revision 6; planning/documentation only. Extension round 5 resolved round 4 and
+raised 4 WRONG / 1 SMELL, all closed consequences of the new digest mechanism. Revision 6 folds them (§17).
 
 - On 2026-09-24 the owner chose to split this child out of Slice 2B2 (2B2 task revision 6, `cf93c7e4`, §16
   option 1). 2B2a delivers the filesystem seam and the Git runner that 2B2's exporter builds on. It carries
@@ -120,18 +121,25 @@ The runner admits one Git binary once, from a caller-supplied `GitRouteRequestV1
 - an `ExpectedGitDigestV1`, the SHA-256 the caller expects the canonical file to have;
 - an admission profile.
 
-The runner **never locates Git itself**. It runs neither `/usr/bin/git` nor `/usr/bin/xcrun`, and it never searches
-`PATH`. The macOS lane's conventional path is `/Library/Developer/CommandLineTools/usr/bin/git`, but the caller
+The runner **never locates Git itself**. It has no built-in default path, fallback, or locator, never invokes
+`xcrun`, and never searches `PATH`. It executes exactly the absolute route the caller supplies once that route is
+admitted. That may be `/usr/bin/git` on Linux, when the caller pins that path and its digest. The macOS lane's conventional path is `/Library/Developer/CommandLineTools/usr/bin/git`, but the caller
 supplies both path and digest. Where production digests come from — operator configuration, a reviewed pin file, or
 re-pinning after Git updates — is decided by the later wiring slice. 2B2a only enforces the pin.
 
 **No binary executes before it is admitted.** Admission runs these steps in order:
 
 1. `lstat` the supplied path's **final component without following it**, and refuse a symlink.
-2. Canonicalize the path, and apply the route rule to the canonical file and every ancestor.
-3. Stream the canonical file's SHA-256 from an opened no-follow descriptor. Require it to equal the expected digest,
-   or return a typed `DigestMismatch` refusal. Record the expected and observed digests either way.
-4. Only then run `version` (see Minimum version below).
+2. Canonicalize the path, and open the canonical final component **once**, with `O_RDONLY | O_NOFOLLOW |
+   O_CLOEXEC`. All final-file facts come from that descriptor via `fstat`: that it is a regular file, its owner, its
+   mode, and its identity.
+3. Apply the ancestor audit and the path-based `faccessat` write-denial checks. Then bind them to the opened object:
+   a no-follow `stat` of the canonical path, taken **after** those checks, must equal the descriptor's identity. Any
+   difference is a typed `RouteIdentityChanged` refusal.
+4. Stream the SHA-256 **from that same descriptor**. Require it to equal the expected digest, or return a typed
+   `DigestMismatch` refusal. Record the expected and observed digests and the descriptor identity either way. The
+   recorded admitted identity is the descriptor's.
+5. Only then run `version` (see Minimum version below).
 
 A refusal at any step leaves nothing executed.
 
@@ -290,6 +298,9 @@ inadmissible until the fixture is repaired.
 | A5a | a trusted-owner wrapper fixture (non-writable, valid `version` output) that runs a marker-writing program, admitted with the expected digest of a **different** file | §4.1 digest pin | typed `DigestMismatch` before any execution; no marker. A mutation that skips the digest comparison makes the marker appear. The same fixture with its own digest pinned is admitted, the caller's recorded decision | 2B2 #28a; 2B2a R3 W1, R4 W1 |
 | A5b | an admitted route replaced at its path after admission, before the next spawn | §4.1 pre-spawn recheck | refusal before the next spawn | 2B2 #22 |
 | A5c | an admitted fixture route replaced by an `exit 0` binary after the pre-spawn recheck, inside a deterministic hook | §4.1 post-exit recheck | typed `BinaryDrift` | 2B2 #28b |
+| A5e | a hook between the route audit (step 3) and the identity binding installs, at the path, a byte-identical file whose owner or mode fails the route rule | §4.1 step 3 identity binding | typed `RouteIdentityChanged` before `version`, no marker. Deleting the binding admits it and runs the marker | 2B2a R5 W2 |
+| A5f | after admission and before the next spawn, rewrite the admitted fixture **in place** (same inode), same length, with its modification time restored | §4.1 pre-spawn rehash | typed `DigestMismatch` before spawn, no marker. Removing the pre-spawn rehash executes the rewritten marker binary | 2B2a R5 W3 |
+| A5g | during a child, a deterministic hook makes the same in-place, same-length, mtime-restored rewrite | §4.1 post-exit rehash | typed `BinaryDrift`. Removing the post-exit rehash returns success | 2B2a R5 W3 |
 | A6 | a fixture binary dumps its environment and cwd | §4.2 allowlist | the environment equals exactly the allowlist and the cwd identity equals the root; adding one inherited variable turns it red | new |
 | A7 | golden argv per `GitCommandV1` variant | §4.3 fixed argv table | exact match; adding or removing one argument turns it red | new |
 | A8 | a fixture binary writes cap+1 stdout bytes, and separately exactly cap bytes | §4.4 stdout bound | typed cap refusal with the child killed; the exact-cap run succeeds | new |
@@ -519,7 +530,7 @@ admission**.
 | Change | Where |
 |---|---|
 | admission requires a caller-supplied expected SHA-256 that must match before the first execution | §1 item 2; §4.1 steps 1–4 |
-| the `xcrun` locator is removed; `/usr/bin/git`, `/usr/bin/xcrun`, and `PATH` search are never used | §4.1 |
+| the `xcrun` locator is removed; the runner has no default route, fallback, `xcrun` invocation, or `PATH` search, and executes only the caller-supplied admitted route (revision 6 wording) | §4.1 |
 | the fixed-point heuristic is removed, which also retires P5's byte-identical rule and control A5d | §4.1; §5 |
 | P7 is retired: two inadmissible host attempts showed `/usr/bin/xcrun` dispatches through developer-directory state, and the locator is no longer used | §9 |
 | HL3 is restored to privileged replace-and-restore only | §10 |
@@ -529,3 +540,18 @@ admission**.
 
 Where production digests come from — configuration, a pin file, or rotation after Git updates — is deferred to the
 later wiring slice, because 2B2a is production-unwired.
+
+## 17. Revision 6 — extension round 5 fold (2026-09-24)
+
+Extension round 5 was a host Codex `gpt-5.6-sol`/`xhigh`/read-only turn on revision 5 at `c35a0120`. Its verdict was
+**REJECT**: round-4 W1, S1, and S2 RESOLVED; new 4 WRONG / 1 SMELL. The full record is
+`docs/superpowers/reviews/2026-09-24-adr0041-slice2b2a-spec-review-round5.md`. All four WRONG are closed consequences
+of the digest mechanism the owner chose, each with a bounded fix.
+
+| ID | Finding | Fold |
+|---|---|---|
+| R5 W1 | 2B2 has no route or digest input for mandatory admission | 2B2 task revision 8: the public entry point takes a caller `GitRouteRequestV1`, and 2B2 adds control 31 |
+| R5 W2 | the route-rule file was not bound to the hashed descriptor | §4.1 steps 2–4: single no-follow open, `fstat` facts, a post-audit identity binding, hashing from the same descriptor; A5e |
+| R5 W3 | no control discriminated the pre-spawn and post-exit rehash | A5f and A5g, same-inode, same-length, mtime-restored rewrites |
+| R5 W4 | `/usr/bin/git` was both forbidden and supported | §4.1: no default, fallback, locator, or `PATH` search; executes exactly the caller-supplied admitted route; §16 reconciled |
+| R5 S1 | roadmap token was stale | roadmap updated |
