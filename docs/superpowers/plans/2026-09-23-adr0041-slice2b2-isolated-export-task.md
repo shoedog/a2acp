@@ -3,7 +3,7 @@ task-type: implement
 ---
 # ADR-0041 Slice 2B2 — isolated local export and Git-object closure
 
-**Status:** revision 10, the review candidate after the split. Revision 10 folds rev-9 spec review round 1 (§22). Revision 7 split it; revision 8 added the 2B2a
+**Status:** revision 11, the review candidate after the split. Revision 10 folded rev-9 spec review round 1 (§22), and revision 11 folds round 2 (§23). Revision 7 split it; revision 8 added the 2B2a
 route-request input from 2B2a extension round 5, W1; revision 9 binds it to the merged 2B2a API. planning/documentation only. Implementation is not authorized by this file. On
 2026-09-24 the owner chose to split the descriptor seam and hardened Git runner out into child **2B2a**
 (`docs/superpowers/plans/2026-09-24-adr0041-slice2b2a-git-runner-seam-task.md`). This task now owns only the exporter, capture binding, pack production, closure proof, ledger, sealing, and
@@ -388,7 +388,7 @@ the fixture is repaired.
 | 19 | two captured non-Git streams of equal length exchanged between roles, layout checks bypassed | capability stream binding (class, generation, length, SHA-256) | capability-binding refusal |
 | 20 | 20a: a historical zero-padded file-mode tree reaches step 1 and is classified `StrictObjectCheck` there. 20b: an exporter-local `#[cfg(test)]` seam installs a pre-indexed pack plus `.idx` fixture in place of step 1, so step 4 `fsck` is the only strict-object guard for the same tree | 20a the step-1 classifier; 20b step 4 | `StrictObjectCheck` refusal; in 20b, deleting only the `fsck` guard yields wrong success |
 | 21 | table: scratch root equal to the source git directory; scratch root inside it; the source git directory inside the scratch root; the same three relations with a pinned alternate store. Disjointness is disabled per row | §2 scratch/source disjointness preflight | typed refusal before any write; with the guard disabled, each row writes into or under a source store |
-| 24 | a compile-fail doctest, on a public `custody_capsule` item, that names `bridge_core::custody_export::export_capsule_v1`; an external `impl` of a sealed envelope trait; the existing public seal-receipt construction doctest. A compile-pass in-crate caller test exercises `export_capsule_v1` | module privacy, trait sealing, and receipt constructor privacy | each compile-fail doctest fails only when its barrier is widened, e.g. `pub mod custody_export`; the in-crate caller compiles |
+| 24 | 24a: a compile-fail doctest, on a public `custody_capsule` item, whose only body is `use bridge_core::custody_export;`, so module privacy is its single barrier. 24b: an external `impl` of a sealed envelope trait. 24c: the existing public seal-receipt construction doctest. A compile-pass in-crate caller test exercises `export_capsule_v1` | 24a module privacy; 24b trait sealing; 24c receipt constructor privacy | changing only `mod custody_export` to `pub mod` makes 24a compile and fail; each arm flips only on its own barrier; the in-crate caller compiles. The unfiltered `--doc` gate in §9 selects them |
 | 25 | reconnect a source-stream receipt to seal publication | existing provenance compile-fail doctest | that doctest fails |
 | 31 | two otherwise identical export fixtures, one with a matching route pin and one with a mismatching pin; the Git route is a marker-writing fixture | §2 route-request pass-through to 2B2a admission | the mismatch refuses with `DigestMismatch` before `version` or any marker; removing the pin flow, or replacing it with trust-on-first-use, makes the negative arm fail |
 | 32 | after sink finish and staging sync, the hook overwrites the staging file **in place** with same-length different bytes | §6 content remeasurement | typed incomplete; no rename, no seal; deleting only the remeasurement lets a stale digest reach the seal |
@@ -450,8 +450,7 @@ Run directly and report exact totals:
 
 ```text
 cargo test --locked --offline -p bridge-core --lib custody_export
-cargo test --locked --offline -p bridge-core --doc custody_export
-cargo test --locked --offline -p bridge-core --test custody_export
+cargo test --locked --offline -p bridge-core --doc
 cargo test --locked --offline -p bridge-core --lib custody_seal
 cargo test --locked --offline -p bridge-core --lib custody_capsule
 cargo test --locked --offline -p bridge-core --test custody_capsule
@@ -724,3 +723,13 @@ merged 2B2a API facts in revision 9 are accurate. The findings are closed and bo
 | S4 | "pack exactly once" had no invocation-count regression | control 34 |
 | S5 | the trust-on-first-use helper location was wrong | §2: the helper lives in `custody_export_tests.rs` |
 | S6 | index hash width `H` was ambiguous | §3: raw width, 20 or 32 bytes |
+
+## 23. Revision 11 — rev-10 spec review round 2 fold (2026-09-25)
+
+Round 2 of the new cap (raw result SHA-256 `1842f05ef0736a2d9876c485d995390da22027f9b9d66814d350e7270bd0089b`) resolved
+12 of the 13 round-1 findings and raised 2 MATERIAL WRONG / 0 SMELL, both about control 24. Blockers went 6 → 2.
+
+| ID | Finding | Fold |
+|---|---|---|
+| R2-W1 | the §9 gate named the removed `--test custody_export` target, and its `--doc custody_export` filter would select zero doctests | §9: unfiltered `cargo test -p bridge-core --doc`; the removed target is dropped |
+| R2-W2 | the control 24 doctest crossed both module privacy and function privacy, so mutating only the module stayed green | control 24a imports only `bridge_core::custody_export`; trait sealing (24b) and receipt constructor (24c) are separate arms |
