@@ -829,6 +829,7 @@ impl std::fmt::Debug for PinnedDirectoryV1 {
     }
 }
 
+#[cfg(unix)]
 fn created_child_owner_and_mode_is_valid(
     owner: u32,
     mode: u32,
