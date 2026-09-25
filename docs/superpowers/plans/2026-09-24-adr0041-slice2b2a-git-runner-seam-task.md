@@ -3,18 +3,16 @@ task-type: implement
 ---
 # ADR-0041 Slice 2B2a — descriptor seam and hardened Git runner
 
-**Status:** review candidate, revision 4; planning/documentation only. Extension round 3 rejected revision 3 with
-1 WRONG / 3 SMELL, still converging; revision 4 folds them (§15).
+**Status:** review candidate, revision 5; planning/documentation only.
 
-- Spec review round 1 of 2 rejected revision 1 with 5 WRONG / 5 SMELL; revision 2 folded all ten (§13).
-- Round 2 of 2 resolved all ten, but rejected with 2 new WRONG / 5 SMELL. That is a converging, closed population.
-- Revision 3 folds those seven, plus three host-probed defects: the Debian fixed point, the minimum-version lanes,
-  and admission for tests (§14).
-- On 2026-09-24 the owner authorized a cap extension if needed, and implementation once the review clears.
-  Extension round 3 reviews this revision.
-On 2026-09-24 the owner chose to split this child out of Slice 2B2 (2B2 task revision 6, `cf93c7e4`, §16 option 1).
-2B2a delivers the filesystem seam and the Git runner that 2B2's exporter builds on. It carries requirements already
-shaped by the pre-review audit and three independent 2B2 review rounds (§12).
+- On 2026-09-24 the owner chose to split this child out of Slice 2B2 (2B2 task revision 6, `cf93c7e4`, §16
+  option 1). 2B2a delivers the filesystem seam and the Git runner that 2B2's exporter builds on. It carries
+  requirements already shaped by the pre-review audit and three independent 2B2 review rounds (§12).
+- Spec review rounds 1–2 and extension round 3 were folded as revisions 2–4 (§§13–15).
+- Extension round 4 held that revision 4's privileged-installation narrowing covered an in-scope operator error. On
+  2026-09-24 the owner chose **caller-pinned digest admission** (§16), and revision 5 applies it.
+- The owner authorized cap extensions if needed, and implementation once the review clears. Extension round 5
+  reviews this revision's delta.
 
 **Implementation base:** `5e431f4f2dd6f77c66d64fa28dc48054f396edf9` (`origin/main`, PR #105 merge). This is the
 code base and the RED/attribution control. The task document itself descends from the 2B2 planning commits.
@@ -34,11 +32,12 @@ implementation starts only after 2B2a is approved and merged, and uses 2B2a's AP
 The child is complete only when:
 
 1. every item is `pub(crate)` and production-unwired: no caller outside tests exists until 2B2;
-2. every `exec` the runner itself performs targets only the admitted locator or the admitted Git route, with a
-   fixed argv, the closed environment, and a rooted cwd. An admitted route is a root-owned binary that the executing
-   user cannot write. Its own descendants are trusted exactly as any privileged installation is (HL3). 2B2a detects
-   the known `xcrun` trampoline pattern, but it does not prove that an admitted root-owned program is Git, or that it
-   never dispatches to other executables;
+2. the runner executes only an admitted Git route, with a fixed argv, the closed environment, and a rooted cwd.
+   An admitted route is a trusted-owner binary that the executing user cannot write, **whose SHA-256 equals the
+   caller-supplied expected digest**, checked before its first execution and around every child. A mis-configured
+   path, including a root-owned wrapper, is refused unless the caller pinned that exact file. The pin is the
+   caller's reviewed decision and is recorded as evidence. No free-form argv, inherited environment variable, or
+   unrooted child is ever executed;
 3. every control in §5 discriminates its single guard on host macOS and on an admitted native Linux ext4 lane;
 4. every failure is typed and leaves no effect outside the caller-provided pinned root.
 
@@ -115,28 +114,26 @@ condition.
 
 ### 4.1 Admitted Git route
 
-The runner resolves one admitted Git binary once. **No Git binary executes before it is admitted.**
+The runner admits one Git binary once, from a caller-supplied `GitRouteRequestV1`:
 
-1. **Locate without executing Git.**
-   - On macOS the runner runs only the fixed locator `/usr/bin/xcrun --find git`. That locator does not execute Git;
-     it prints the path chosen by the developer-directory selection.
-   - The locator is first admitted under the same route rule, with the same pre- and post-exit identity and SHA-256
-     rechecks, and runs with the §4.2 closed environment and bounded stdout.
-   - On Linux, and on macOS when the operator configures one explicitly, the candidate is a configured absolute path.
-     No locator runs.
-2. **Admit.** The runner first `lstat`s the located or configured path's **final component without following it**,
-   and refuses a symlink. Only then does it canonicalize the path and apply the route rule to the canonical file and
-   every ancestor. All of this happens **before the binary's first execution**; a refusal leaves nothing executed.
-3. **Confirm the fixed point.** This is a trampoline and wrapper **heuristic** for the known locator pattern, not a
-   proof of Git identity (§1 item 2, HL3). After admission, the admitted binary's `--exec-path` must contain a `git`
-   that is
-   either the same file identity, or a distinct regular file that is byte-identical (equal SHA-256) and itself
-   passes the route rule. Debian packages `/usr/lib/git-core/git` as a separate byte-identical copy (probe P5). Both
-   identities and digests are recorded. Anything else, such as a wrapper, trampoline, or differing content, is a
-   typed refusal.
+- an absolute path;
+- an `ExpectedGitDigestV1`, the SHA-256 the caller expects the canonical file to have;
+- an admission profile.
 
-The locator path, the admitted path, and the fixed-point result are recorded as evidence. `/usr/bin/git` itself is
-never executed.
+The runner **never locates Git itself**. It runs neither `/usr/bin/git` nor `/usr/bin/xcrun`, and it never searches
+`PATH`. The macOS lane's conventional path is `/Library/Developer/CommandLineTools/usr/bin/git`, but the caller
+supplies both path and digest. Where production digests come from — operator configuration, a reviewed pin file, or
+re-pinning after Git updates — is decided by the later wiring slice. 2B2a only enforces the pin.
+
+**No binary executes before it is admitted.** Admission runs these steps in order:
+
+1. `lstat` the supplied path's **final component without following it**, and refuse a symlink.
+2. Canonicalize the path, and apply the route rule to the canonical file and every ancestor.
+3. Stream the canonical file's SHA-256 from an opened no-follow descriptor. Require it to equal the expected digest,
+   or return a typed `DigestMismatch` refusal. Record the expected and observed digests either way.
+4. Only then run `version` (see Minimum version below).
+
+A refusal at any step leaves nothing executed.
 
 **Route rule:**
 
@@ -163,8 +160,8 @@ Both test profiles use `faccessat` write denial when the effective uid is non-ze
 write access, so they instead require that no group or other write bits are set on the file or on any audited
 directory, and they record `write_check=mode_bits_as_root`. Production has neither profile; control A17 covers them.
 
-**Rechecks:** the admitted route's file identity (device, inode, size, and modification time) and SHA-256 are
-recorded at admission. They are rechecked **before every spawn and after every child exits**.
+**Rechecks:** the admitted route's file identity (device, inode, size, and modification time) and its SHA-256
+(which equals the expected digest) are recorded at admission. They are rechecked **before every spawn and after every child exits**.
 
 - A pre-spawn mismatch refuses before the child starts.
 - A post-exit mismatch returns a typed `BinaryDrift` outcome, which the caller must treat as incomplete.
@@ -180,13 +177,17 @@ The minimum is at least the first version that accepts `--no-lazy-fetch`. Probe 
 Ubuntu 22.04's or 24.04's, are therefore refused with a typed version error, which is correct behavior. The supported
 lanes are:
 
-- macOS Command Line Tools Git, located through `xcrun`;
+- macOS Command Line Tools Git at its conventional path, with a caller-pinned digest;
 - the GitHub Actions ubuntu runner's Git;
 - the implement and verify container's `/opt/git/bin/git` (2.54, root-owned, 148 hard links). This lane admits only
   through the root test profile, and it is a non-native overlay lane.
 
-Before any production code, the implementation records each lane's device/inode, SHA-256, `--exec-path`, and version.
-If the GitHub runner's Git cannot be admitted, that is a stop condition.
+Before any production code, the implementation records each lane's path, device/inode, SHA-256, and version. If
+the GitHub runner's Git cannot be admitted, that is a stop condition.
+
+Real-Git tests obtain their expected digest by hashing the lane's Git at test start, a test-only trust-on-first-use
+recorded in the evidence. Production code has no trust-on-first-use path, so the caller must always supply the
+digest.
 
 ### 4.2 Closed environment, flags, and rooting
 
@@ -229,7 +230,6 @@ one fixed argv. Relative names are validated single components or fixed relative
 
 | Variant | Fixed subcommand |
 |---|---|
-| `ExecPath` | `--exec-path` (discovery only) |
 | `Version` | `version` |
 | `InitBare { dir, object_format }` | `init --bare --template= --object-format=<sha1\|sha256> <dir>`, with no `GIT_DIR` |
 | `CatFileBatchCheck` | `cat-file --batch-check` |
@@ -256,8 +256,8 @@ check callbacks. It runs in this order:
 7. return a typed result.
 
 The result carries the bounded stdout (or its streamed digest when the caller consumes stdout incrementally), the
-bounded stderr, the exit status, and an evidence record. The evidence record holds the argv, the locator and
-admitted routes, the Git version, and every environment **key and value**. Relative names are recorded as given;
+bounded stderr, the exit status, and an evidence record. The evidence record holds the argv, the admitted route with
+its expected and observed digests, the Git version, and every environment **key and value**. Relative names are recorded as given;
 object-store route paths are recorded as SHA-256 digests of their bytes, under the existing path-redaction policy. The
 record also holds the root directory identity, the exit status, and the lengths and SHA-256 of each stream.
 Object-store route evidence uses a fixed schema:
@@ -286,8 +286,8 @@ inadmissible until the fixture is repaired.
 | A3 | a hook after the last parent-side recheck swaps the root's pathname for a replacement before spawn; the fixture binary writes a relative marker | `root_command` rooting and relative paths | the marker lands only under the retained root; the replacement is unchanged; the caller's post-exit check sees the drift | 2B2 #26 |
 | A4 | a `root_command` pin is dropped and its descriptor number reused before spawn | owned duplicate descriptor | the child is still rooted at the original directory | 2B2 R3 S1 |
 | A5 | route-rule table: trusted-owner file with a mode-`0777` component; untrusted-owner mode-`0555` file; a final symlink pointing to an admissible target; ACL-granted write; production constructor as uid 0; standard root-owned Linux `/usr/bin/git` (positive, pure metadata) | §4.1 route rule and pre-canonicalization `lstat` | typed route refusal; the positive row is admitted. A canonicalize-first mutation must admit the final-symlink row | 2B2 #28; 2B2a R2 W1 |
-| A5d | fixed-point table: same identity (admit); a distinct byte-identical copy that passes the route rule (admit, as on Debian); a distinct copy with different content; a byte-identical copy that fails the route rule | §4.1 fixed point | admit, admit, refuse, refuse; an identity-only mutation refuses the Debian row | P5 |
-| A5a | a fake locator returns a user-owned target whose executable writes a marker; separately, an admitted target that is not a fixed point | §4.1 admit-before-execute and fixed point | refusal with no marker written; the non-fixed-point target refuses. Reverting to executing the candidate's `--exec-path` makes the marker appear | 2B2 #28a; 2B2a R1 W1 |
+| A5d | *(retired in revision 5 with the fixed-point heuristic; the number is not reused)* | — | — | P5 |
+| A5a | a trusted-owner wrapper fixture (non-writable, valid `version` output) that runs a marker-writing program, admitted with the expected digest of a **different** file | §4.1 digest pin | typed `DigestMismatch` before any execution; no marker. A mutation that skips the digest comparison makes the marker appear. The same fixture with its own digest pinned is admitted, the caller's recorded decision | 2B2 #28a; 2B2a R3 W1, R4 W1 |
 | A5b | an admitted route replaced at its path after admission, before the next spawn | §4.1 pre-spawn recheck | refusal before the next spawn | 2B2 #22 |
 | A5c | an admitted fixture route replaced by an `exit 0` binary after the pre-spawn recheck, inside a deterministic hook | §4.1 post-exit recheck | typed `BinaryDrift` | 2B2 #28b |
 | A6 | a fixture binary dumps its environment and cwd | §4.2 allowlist | the environment equals exactly the allowlist and the cwd identity equals the root; adding one inherited variable turns it red | new |
@@ -373,9 +373,8 @@ Stop for spec or design review if any of these occurs:
 
 - an `fs_custody` change is needed beyond the four §3 methods;
 - the runner needs a free-form argv or an inherited environment variable;
-- a route cannot be admitted on macOS Command Line Tools Git (through the `xcrun` locator) or the GitHub Actions
-  ubuntu runner's Git;
-- implementation-time probe P7 shows that `xcrun --find git` executes the selected tool;
+- a route cannot be admitted on macOS Command Line Tools Git (at its conventional path, with a pinned digest) or on
+  the GitHub Actions ubuntu runner's Git;
 - the minimum Git version cannot honor §4.2;
 - rooting cannot be applied to a spawn;
 - a dependency or feature is required;
@@ -391,25 +390,14 @@ These must be restated verbatim in the handoff.
   store from yielding a wrong pack.
 - **HL2:** an identical substitution of a newly created directory (empty, same owner and mode) between `mkdirat` and
   `openat` is undetectable. The substitute is necessarily a directory inside the retained parent at open time.
-- **HL3:** privileged installation, in two forms:
-  - root or another privileged user replacing and restoring the admitted route entirely within one child's window.
-    A persisting replacement is detected after the child;
-  - a root-owned program admitted as Git that is not Git, or that dispatches to other executables. An example is a
-    privileged wrapper, including byte-identical copies that pass the fixed point. 2B2a trusts an admitted route's
-    descendants as it trusts any privileged installation, and it does not maintain a digest allowlist, because every
-    OS or Git update would change the digest. The admitted path, identity, SHA-256, version string, and fixed-point
-    result are recorded, so a wrong admission is auditable after the fact.
+- **HL3:** root or another privileged user replacing and restoring the admitted route entirely within one child's
+  window. A persisting replacement is detected after the child by the identity and digest recheck.
 
 ## 11. Next action
 
-Extension review round 4 is limited to the revision-4 delta. On 2026-09-24 the owner authorized implementation once
-this review clears. Implementation starts with the pre-code probes, and a failed probe is a stop condition (§9):
-
-- P7: `xcrun` executes nothing;
-- the GitHub ubuntu runner lane inventory;
-- the lane recording in §4.1.
-
-Approval does not authorize push, merge, cleanup, or running-operator mutation.
+Extension review round 5 is limited to the revision-5 delta. On 2026-09-24 the owner authorized implementation once
+this review clears. Implementation starts with the pre-code lane inventory in §4.1, and a failed inventory is a stop
+condition (§9). Approval does not authorize push, merge, cleanup, or running-operator mutation.
 
 ## 12. Provenance
 
@@ -520,3 +508,24 @@ WRONG counts across the loop were 5 → 2 → 1, so it is converging.
 | R3 S1 | P7 still unexecuted | unchanged: a fail-closed pre-code probe (§9, §11) |
 | R3 S2 | the GitHub ubuntu runner lane is unmeasured | unchanged: a fail-closed pre-code inventory (§4.1, §9, §11) |
 | R3 S3 | §11 was stale | §11 rewritten |
+
+## 16. Revision 5 — owner decision: caller-pinned digest admission (2026-09-24)
+
+Extension round 4 (record `docs/superpowers/reviews/2026-09-24-adr0041-slice2b2a-spec-review-round4.md`) held round-3
+W1 UNRESOLVED. Revision 4's privileged-installation narrowing covered an in-scope operator error: a mis-configured
+root-owned wrapper. Because the same item recurred, it was escalated. The owner chose **caller-pinned digest
+admission**.
+
+| Change | Where |
+|---|---|
+| admission requires a caller-supplied expected SHA-256 that must match before the first execution | §1 item 2; §4.1 steps 1–4 |
+| the `xcrun` locator is removed; `/usr/bin/git`, `/usr/bin/xcrun`, and `PATH` search are never used | §4.1 |
+| the fixed-point heuristic is removed, which also retires P5's byte-identical rule and control A5d | §4.1; §5 |
+| P7 is retired: two inadmissible host attempts showed `/usr/bin/xcrun` dispatches through developer-directory state, and the locator is no longer used | §9 |
+| HL3 is restored to privileged replace-and-restore only | §10 |
+| A5a becomes the round-4 regression: a trusted-owner wrapper with a mismatched pin refuses before execution | §5 |
+| real-Git tests use test-only trust-on-first-use digests; production has none | §4.1 |
+| the stale status line (R4 S1) is fixed | status |
+
+Where production digests come from — configuration, a pin file, or rotation after Git updates — is deferred to the
+later wiring slice, because 2B2a is production-unwired.
