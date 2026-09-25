@@ -17,7 +17,7 @@
 # Usage: sync-creds.sh [all|claude|codex|kiro]   (default: all)
 set -euo pipefail
 
-DEST="$HOME/.config/a2a-creds"
+DEST="${A2A_CREDS_DEST:-$HOME/.config/a2a-creds}"   # override only for testing
 want="${1:-all}"
 case "$want" in all|claude|codex|kiro) ;; *) echo "usage: $(basename "$0") [all|claude|codex|kiro]" >&2; exit 1 ;; esac
 
@@ -33,9 +33,42 @@ sync_file() { # <agent> <host-src> <copy-filename>
   fi
 }
 
-# claude (OAuth subscription) + codex (ChatGPT auth) are single host files → sync the copy.
+# claude: prefer the host credentials file when it exists (Linux hosts, older Claude Code). Newer macOS Claude Code
+# keeps its OAuth login in the Keychain and writes no file. In that case, fall back to a long-lived token from
+# `claude setup-token`, read from CLAUDE_CODE_OAUTH_TOKEN or from the owner-private file $DEST/claude/oauth-token
+# (the LaunchAgent does not source shell rc files). The token copy has no refresh token, so a container never
+# rotates the host login.
+sync_claude() {
+  local host="$HOME/.claude/.credentials.json" dst="$DEST/claude/.credentials.json"
+  local token="${CLAUDE_CODE_OAUTH_TOKEN:-}"
+  if [ -f "$host" ]; then
+    sync_file claude "$host" ".credentials.json"
+    return
+  fi
+  if [ -z "$token" ] && [ -f "$DEST/claude/oauth-token" ]; then
+    token="$(tr -d '\n\r ' < "$DEST/claude/oauth-token")"
+  fi
+  if [ -z "$token" ]; then
+    echo "skip   claude  (no host creds file and no long-lived token; run \`claude setup-token\`)"
+    return
+  fi
+  case "$token" in
+    *[!A-Za-z0-9_-]*) echo "skip   claude  (long-lived token has unexpected characters; not written)"; return ;;
+  esac
+  mkdir -p "$DEST/claude"
+  local expires tmp
+  expires=$(( ( $(date +%s) + 330 * 86400 ) * 1000 ))
+  tmp="$(umask 077 && mktemp "$DEST/claude/.credentials.json.XXXXXX")"
+  printf '{"claudeAiOauth":{"accessToken":"%s","refreshToken":null,"expiresAt":%s,"scopes":["user:inference"],"subscriptionType":null}}' \
+    "$token" "$expires" > "$tmp"
+  chmod 600 "$tmp"
+  mv -f "$tmp" "$dst"
+  echo "synced claude  <- long-lived OAuth token (no refresh token; never rotates the host login)"
+}
+
+# codex (ChatGPT auth) is a single host file, so sync the copy.
 if [ "$want" = all ] || [ "$want" = claude ]; then
-  sync_file claude "$HOME/.claude/.credentials.json" ".credentials.json"
+  sync_claude
 fi
 if [ "$want" = all ] || [ "$want" = codex ]; then
   sync_file codex "$HOME/.codex/auth.json" "auth.json"

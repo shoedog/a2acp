@@ -60,6 +60,24 @@ mount breaks refresh):
   chmod -R u+rw ~/.config/a2a-creds
   ```
 
+  **macOS hosts where Claude Code keeps its login in the Keychain.** Current Claude Code on macOS writes no
+  `~/.claude/.credentials.json`, so there is no file to copy. Use a long-lived, non-rotating token instead:
+  1. Run `claude setup-token`, which opens a browser OAuth flow and prints a one-year token.
+  2. Export it in your shell rc as `export CLAUDE_CODE_OAUTH_TOKEN=…`. Note the spelling: **OAUTH**.
+  3. Store the same token for the LaunchAgent, which does not read shell rc files:
+     `umask 077; printf '%s\n' "$CLAUDE_CODE_OAUTH_TOKEN" > ~/.config/a2a-creds/claude/oauth-token`.
+
+  `sync-creds.sh` falls back to that token when the host file is absent. It writes
+  `~/.config/a2a-creds/claude/.credentials.json` owner-only, with no refresh token, so a container never rotates the
+  host login, and it never echoes the token.
+
+  Caveats:
+  - `a2a-bridge doctor`'s `provenance:claude:oauth-credential` check still reads only the host file, so it reports
+    FAIL on such hosts. That is a known follow-up in the roadmap ledger.
+  - For a containerized **implementor** running as root, `claude-agent-acp` refuses `bypassPermissions`. Use
+    `mode = "acceptEdits"`; the bridge auto-approves tool permissions. Pin the model to a value the live session
+    advertises, for example `opus`.
+
   **Fable-specific settings mount.** The credential copy is sufficient for normal Claude models, but
   The historical `claude-agent-acp` 0.55.0 reader control did not advertise Fable from a
   credential-only reader home. The current 0.63.0 candidate has not yet replaced that live evidence, so
@@ -109,7 +127,7 @@ codex-acp's advertised browser-login action. Do not also set `auth_method` on th
 > The sync copies bytes; it does **not** authenticate or refresh an already expired host token. After a fresh
 > host login and post-login sync, require both Claude host and reader doctors green before requesting new
 > explicit authorization for one new four-case aggregate.
-> (claude/codex are host-file copies; **kiro** is the `a2a-kiro-data` volume — re-run its device-flow
+> (claude/codex are host-file copies, and claude falls back to a long-lived token when the host has no file; **kiro** is the `a2a-kiro-data` volume — re-run its device-flow
 > login if it has fully expired, not a host sync.)
 >
 > **Automate it (optional, macOS launchd).** Instead of running the pre-flight sync by hand, keep the

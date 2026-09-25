@@ -3,8 +3,8 @@ task-type: implement
 ---
 # ADR-0041 Slice 2B2 — isolated local export and Git-object closure
 
-**Status:** revision 8 (revision 7 split it; revision 8 adds the 2B2a route-request input from 2B2a extension
-round 5, W1), **split**; planning/documentation only. Implementation is not authorized by this file. On
+**Status:** revision 9, the review candidate after the split. Revision 7 split it; revision 8 added the 2B2a
+route-request input from 2B2a extension round 5, W1; revision 9 binds it to the merged 2B2a API. planning/documentation only. Implementation is not authorized by this file. On
 2026-09-24 the owner chose to split the descriptor seam and hardened Git runner out into child **2B2a**
 (`docs/superpowers/plans/2026-09-24-adr0041-slice2b2a-git-runner-seam-task.md`). This task now owns only the exporter, capture binding, pack production, closure proof, ledger, sealing, and
 publication, built on 2B2a's API (§17). 2B2 review resumes only after 2B2a is approved, as a new two-round cap scoped
@@ -20,8 +20,19 @@ to the post-split artifact. That cap is disclosed here as a consequence of the o
 - On 2026-09-24 the owner ruled a hostile same-user check-to-use racer **out of scope** (§14 option A). Revision 5
   applies that ruling.
 
-**Exact predecessor:** the 2B2a merge commit, to be bound when 2B2a lands. The planning base is
-`5e431f4f2dd6f77c66d64fa28dc48054f396edf9` (`origin/main`, PR #105 merge).
+**Exact predecessor:** `67f414e79905f38c2d472a6a36d3b6926d145612`, the PR #106 merge of 2B2a. This is the
+implementation base and the RED/attribution control.
+
+**Merged 2B2a API facts this task relies on** (`crates/bridge-core/src/custody_git.rs` at `67f414e7`):
+
+- `GitRouteRequestV1::production(path, digest)` provides caller-pinned admission.
+- `GitRunRequestV1::from_file(command, file, max_stdin_bytes, stdout_limit, stderr_limit, deadline)` is **fallible**.
+  It accepts only a regular file and enforces a byte bound.
+- `GitRunEvidenceV1.stdin` records the length and SHA-256 of the bytes **accepted by the child's stdin pipe**, alongside
+  the stdout and stderr evidence.
+- The runner's post-exit `BinaryDrift` outcome and the caller callbacks are as specified in the 2B2a task.
+
+The 2B2a deferrals W4, S2, S3, and R3-S1 are listed in the reliability roadmap; none changes this task's contract.
 
 **Reviewed 2B1 content:** `88013eb4408d5afecb0b9101ef43c9c398226ef5`; final review
 `exec-e7ee36345656679aec8923c4be9d25b6` / `attempt-86036c5afb97c003d9f62bb2fc0c9163`, APPROVE with
@@ -243,9 +254,10 @@ children receive the §4.1 environment without `GIT_OBJECT_DIRECTORY` or `GIT_AL
 inherit no source descriptor.
 
 1. **Strict indexing:** stream `work/objects.pack` from its retained descriptor into
-   `git index-pack --strict --stdin` without `--fix-thin`, through an exporter-owned hashing and counting writer.
-   After stdin closes, the verification input's length and SHA-256 must equal the verified-pack identity, or the
-   proof refuses. The bytes that were verified are therefore the recorded bytes, and §4.2 step 4 separately proves
+   `git index-pack --strict --stdin` without `--fix-thin`, through `GitRunRequestV1::from_file` with
+   `max_stdin_bytes` equal to the recorded pack length. After the run, the runner's `GitRunEvidenceV1.stdin` length
+   and SHA-256 must equal the verified-pack identity, or the proof refuses. No exporter-owned writer is needed:
+   2B2a attests the bytes the pipe accepted. The bytes that were verified are therefore the recorded bytes, and §4.2 step 4 separately proves
    the sealed bytes are the recorded bytes. Then run `git verify-pack -v` on the created index.
 2. **Exact inventory:** run `git cat-file --batch-all-objects --batch-check='%(objectname) %(objecttype)'` in
    `verify.git` and parse it into a bounded set. It must equal the manifest inventory exactly: no missing, extra,
@@ -337,7 +349,7 @@ the fixture is repaired.
 | 14 | existing `UnlinkSourceOnly` rename fault plus target-identity ambiguity on the seal rename | §6 unverified-rename arm | `SealPublicationUnverified` |
 | 15 | a fixture sealer returns receipts built from each other's contexts for two differently hashed artifacts; separately, each single receipt field altered | §6 whole-receipt equality | receipt mismatch before any seal |
 | 16 | the sealer reads substituted bytes, or stops early, while sealing the pack | §4.2 step 4 source wrapper | pack identity mismatch or source `finish` refusal |
-| 17 | verify a byte-distinct pack B with the same inventory, then seal the recorded pack A | §5 step 1 verification-input hash | verification input identity mismatch |
+| 17 | verify a byte-distinct pack B with the same inventory, then seal the recorded pack A | §5 step 1 comparison of `GitRunEvidenceV1.stdin` with the verified-pack identity | verification input identity mismatch |
 | 18 | capability generation/inventory differs from the manifest, or a mixed-format manifest | §2 binding / §4 | typed refusal before any write |
 | 19 | two captured non-Git streams of equal length exchanged between roles, layout checks bypassed | capability stream binding (class, generation, length, SHA-256) | capability-binding refusal |
 | 20 | historical zero-padded file-mode tree | §5 step 4 | `StrictObjectCheck` refusal |
@@ -642,3 +654,12 @@ controls now owned by 2B2a, 2B2a's text is authoritative.
 
 **Why the split:** review rounds 2 and 3 concentrated nearly all their defects in the moved seam, while the content
 kept here has held since revision 3. Splitting lets the seam converge under its own cap.
+
+## 21. Revision 9 — bound to merged 2B2a (2026-09-25)
+
+2B2a merged in PR #106 at `67f414e7`. This revision records the exact predecessor, and the runner API facts listed
+under the predecessor line. §5 step 1 and control 17 now use the runner's `GitRunEvidenceV1.stdin` rather than an
+exporter-owned hashing writer. That is exactly the gap 2B2a implementation review round 2 required the runner to
+close.
+
+Review resumes under a new two-round cap scoped to this post-split artifact, as disclosed in the status line.
