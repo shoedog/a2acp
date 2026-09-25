@@ -3,7 +3,9 @@ task-type: implement
 ---
 # ADR-0041 Slice 2B2a — descriptor seam and hardened Git runner
 
-**Status:** review candidate, revision 7; planning/documentation only.
+**Status:** revision 8; planning/documentation only. Delta round 7 resolved the route-fact requirement and raised
+2 WRONG / 2 SMELL, all about control discrimination; revision 8 folds them (§19). The recurring class of controls
+masked by other guards is escalated to the owner (§19).
 
 - Extension round 5 resolved round 4 and raised 4 WRONG / 1 SMELL, folded in revision 6 (§17).
 - Delta round 6 resolved three of those and refined one to 1 WRONG / 3 SMELL, folded in revision 7 (§18).
@@ -14,8 +16,7 @@ task-type: implement
 - Spec review rounds 1–2 and extension round 3 were folded as revisions 2–4 (§§13–15).
 - Extension round 4 held that revision 4's privileged-installation narrowing covered an in-scope operator error. On
   2026-09-24 the owner chose **caller-pinned digest admission** (§16), and revision 5 applies it.
-- The owner authorized cap extensions if needed, and implementation once the review clears. Extension round 5
-  reviews this revision's delta.
+- The owner authorized cap extensions if needed, and implementation once the review clears.
 
 **Implementation base:** `5e431f4f2dd6f77c66d64fa28dc48054f396edf9` (`origin/main`, PR #105 merge). This is the
 code base and the RED/attribution control. The task document itself descends from the 2B2 planning commits.
@@ -303,9 +304,11 @@ inadmissible until the fixture is repaired.
 | A5a | a trusted-owner wrapper fixture (non-writable, valid `version` output) that runs a marker-writing program, admitted with the expected digest of a **different** file | §4.1 digest pin | typed `DigestMismatch` before any execution; no marker. A mutation that skips the digest comparison makes the marker appear. The same fixture with its own digest pinned is admitted, the caller's recorded decision | 2B2 #28a; 2B2a R3 W1, R4 W1 |
 | A5b | an admitted route replaced at its path after admission, before the next spawn | §4.1 pre-spawn recheck | refusal before the next spawn | 2B2 #22 |
 | A5c | an admitted fixture route replaced by an `exit 0` binary after the pre-spawn recheck, inside a deterministic hook | §4.1 post-exit recheck | typed `BinaryDrift` | 2B2 #28b |
-| A5e | a hook between the route audit (step 3) and the identity binding installs, at the path, a byte-identical file whose owner or mode fails the route rule | §4.1 step 3 identity binding | typed `RouteIdentityChanged` before `version`, no marker. Deleting the binding admits it and runs the marker. **Same-inode arm:** after the `faccessat` check, the hook `chmod`s the same file to `0777` with bytes and mtime preserved; this must also refuse, and deleting the mode and ctime comparison executes the marker. **Pre-spawn arm:** the same `chmod` after admission must refuse before the next spawn | 2B2a R5 W2; R6 W1 |
-| A5f | after admission and before the next spawn, rewrite the admitted fixture **in place** (same inode), same length, with its modification time restored | §4.1 pre-spawn rehash | typed `DigestMismatch` before spawn, no marker. Removing the pre-spawn rehash executes the rewritten marker binary | 2B2a R5 W3 |
-| A5g | **fixture protocol:** the admitted route is a non-writable shell-wrapper fixture that signals readiness and then `exec`s `/bin/sleep`, so the wrapper file is not mapped as running text (a native fixture can hit `ETXTBSY` on Linux). While the child lives, a hook temporarily makes the wrapper writable, rewrites it in place at the same length, restores the mode, and restores the mtime with safe `File::set_modified`. The harness asserts the rewrite succeeded before accepting a result | §4.1 post-exit rehash | typed `BinaryDrift`. Removing the post-exit rehash returns success | 2B2a R5 W3 |
+| A5e | a hook between the route audit (step 3) and the identity binding installs, at the path, a byte-identical file with a **new inode** whose owner and mode pass the route rule, so neither the route rule nor the digest can catch it | §4.1 step 3 identity binding | typed `RouteIdentityChanged` before `version`, no marker. Deleting only the binding admits it and runs the marker | 2B2a R5 W2; R7 W1 |
+| A5e-t | pure route-fact comparison table: one row per fact (device, inode, type, uid, gid, mode, size, mtime, and ctime, including a ctime-only nanoseconds difference), each differing in exactly that field | §4.1 step 3 fact comparison | each row refuses. Deleting any single field's comparison admits exactly that row | 2B2a R6 W1; R7 W1 |
+| A5e-r | after admission, the hook adds group or other write permission to an **ancestor** directory, leaving the final file's facts and digest unchanged | §4.1 pre-spawn route-rule re-run | typed route refusal before the next spawn, no marker. Deleting only the re-run executes the marker | 2B2a R7 W1 |
+| A5f | after admission and before the next spawn, rewrite the admitted fixture **in place** (same inode), same length, with its modification time restored | §4.1 pre-spawn rehash; a `#[cfg(test)]` fact-observation seam holds the separately tested route facts constant, so the digest is the only guard | typed `DigestMismatch` before spawn, no marker. Removing the pre-spawn rehash executes the rewritten marker binary | 2B2a R5 W3; R7 W2 |
+| A5g | **fixture protocol:** the admitted route is a non-writable shell-wrapper fixture that `exec`s a helper that emits the readiness signal only **after** process-image replacement and then sleeps, so the wrapper is no longer being read or mapped as running text (a native fixture can hit `ETXTBSY` on Linux). While the child lives, a hook temporarily makes the wrapper writable, rewrites it in place at the same length, restores the mode, and restores the mtime with safe `File::set_modified`. The harness asserts the rewrite succeeded before accepting a result | §4.1 post-exit rehash; the same fact-observation seam holds route facts constant | typed `BinaryDrift`. Removing the post-exit rehash returns success | 2B2a R5 W3; R7 W2, S2 |
 | A6 | a fixture binary dumps its environment and cwd | §4.2 allowlist | the environment equals exactly the allowlist and the cwd identity equals the root; adding one inherited variable turns it red | new |
 | A7 | golden argv per `GitCommandV1` variant | §4.3 fixed argv table | exact match; adding or removing one argument turns it red | new |
 | A8 | a fixture binary writes cap+1 stdout bytes, and separately exactly cap bytes | §4.4 stdout bound | typed cap refusal with the child killed; the exact-cap run succeeds | new |
@@ -411,7 +414,7 @@ These must be restated verbatim in the handoff.
 
 ## 11. Next action
 
-Extension review round 7 is limited to the revision-7 delta. On 2026-09-24 the owner authorized implementation once
+Review status: see §19. The owner decides the next step. On 2026-09-24 the owner authorized implementation once
 this review clears. Implementation starts with the pre-code lane inventory in §4.1, and a failed inventory is a stop
 condition (§9). Approval does not authorize push, merge, cleanup, or running-operator mutation.
 
@@ -573,3 +576,26 @@ Delta round 6 was a host Codex `gpt-5.6-sol`/`xhigh`/read-only turn on revision 
 | R6 S1 | stale status tokens | roadmap, handoff, 2B2 §10, and 2B2a §11 updated |
 | R6 S2 | A5g fixture shape unstated (`ETXTBSY`) | A5g shell-wrapper `exec /bin/sleep` protocol, with a rewrite-succeeded assertion |
 | R6 S3 | route-request visibility across a public 2B2 entry point | deferred to the post-split 2B2 review; recorded in 2B2 §2. 2B2a keeps `GitRouteRequestV1` `pub(crate)` |
+
+## 19. Revision 8 — delta round 7 fold and escalation (2026-09-24)
+
+Delta round 7 was a host Codex `gpt-5.6-sol`/`xhigh`/read-only turn on revision 7 at `cc6f3b17`. Its verdict was
+**REJECT**: round-6 W1, S2, and S3 RESOLVED; S1 UNRESOLVED; new 2 WRONG / 2 SMELL. The full record is
+`docs/superpowers/reviews/2026-09-24-adr0041-slice2b2a-spec-review-round7.md`.
+
+| ID | Finding | Fold |
+|---|---|---|
+| R7 W1 | A5e could not discriminate the identity binding, the per-field comparison, or the pre-spawn route-rule re-run, because they mask one another | A5e becomes a valid-facts new-inode replacement (binding only); A5e-t is a per-field comparison table including ctime-only; A5e-r is an ancestor-permission drift (re-run only) |
+| R7 W2 | ctime masked the A5f and A5g digest rehash controls | a `#[cfg(test)]` fact-observation seam holds route facts constant in A5f and A5g |
+| R7 S1 | the status line still named round 5 | fixed |
+| R7 S2 | A5g readiness came before process-image replacement | the readiness signal is emitted after the helper `exec` |
+
+**Convergence classification, escalated to the owner:**
+
+- WRONG counts across the 2B2a rounds were 5 → 2 → 1 → 1 → 4 → 1 → 2. The production requirements have converged:
+  round 7 found no production-behavior defect.
+- The recurring class, in rounds 1, 2, 5, 6, and 7, is control discrimination: a control whose mutation is masked by
+  another guard. Each new guard reshuffles which controls discriminate, so the class is open-ended at spec level.
+- The implement brief already makes it empirical: every control needs recorded mutation evidence, and a
+  non-flipping mutation is inadmissible and must be reported. The implementation review then checks that evidence.
+- Continuing spec rounds has diminishing returns.
