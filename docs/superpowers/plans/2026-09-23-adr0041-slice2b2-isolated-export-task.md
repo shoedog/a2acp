@@ -3,7 +3,7 @@ task-type: implement
 ---
 # ADR-0041 Slice 2B2 — isolated local export and Git-object closure
 
-**Status:** revision 11, the review candidate after the split. Revision 10 folded rev-9 spec review round 1 (§22), and revision 11 folds round 2 (§23). Revision 7 split it; revision 8 added the 2B2a
+**Status:** revision 11, **APPROVED for implementation** (§24). Revision 10 folded rev-9 spec review round 1 (§22), and revision 11 folds round 2 (§23). Revision 7 split it; revision 8 added the 2B2a
 route-request input from 2B2a extension round 5, W1; revision 9 binds it to the merged 2B2a API. planning/documentation only. Implementation is not authorized by this file. On
 2026-09-24 the owner chose to split the descriptor seam and hardened Git runner out into child **2B2a**
 (`docs/superpowers/plans/2026-09-24-adr0041-slice2b2a-git-runner-seam-task.md`). This task now owns only the exporter, capture binding, pack production, closure proof, ledger, sealing, and
@@ -489,10 +489,14 @@ Stop for spec/design review if:
 - the scratch-wide ledger cannot account for a Git child's writes;
 - the diff escapes the owned paths.
 
-Next action: an independent review of revision 10, as round 2 of the new two-round cap, which was disclosed as a
-consequence of the owner-approved split. On approval, the owner's 2026-09-24 directive covers implementation by the
-Opus 5.5 containerized implementor, the review/fix loop while it converges, and PR plus merge when CI is green. It
-does not cover push outside that PR, cleanup, 2B3 restore, remote/provider effects, or running-operator mutation.
+Next action: **implementation** of revision 11, under the owner's 2026-09-24 directive:
+
+- Opus 5.5, through the containerized `a2a-bridge implement`, based on the merge that lands revision 11 on `main`;
+- the review/fix loop, while it converges;
+- a PR, merged when CI is green.
+
+The directive does not authorize push outside that PR, cleanup, 2B3 restore, remote/provider effects, or
+running-operator mutation.
 
 ## 11. Source references
 
@@ -727,9 +731,23 @@ merged 2B2a API facts in revision 9 are accurate. The findings are closed and bo
 ## 23. Revision 11 — rev-10 spec review round 2 fold (2026-09-25)
 
 Round 2 of the new cap (raw result SHA-256 `1842f05ef0736a2d9876c485d995390da22027f9b9d66814d350e7270bd0089b`) resolved
-12 of the 13 round-1 findings and raised 2 MATERIAL WRONG / 0 SMELL, both about control 24. Blockers went 6 → 2.
+12 of the 13 round-1 findings (the thirteenth, W4 entry-point visibility, was left UNRESOLVED only through its control and gate, and is resolved here) and raised 2 MATERIAL WRONG / 0 SMELL, both about control 24. Blockers went 6 → 2.
 
 | ID | Finding | Fold |
 |---|---|---|
 | R2-W1 | the §9 gate named the removed `--test custody_export` target, and its `--doc custody_export` filter would select zero doctests | §9: unfiltered `cargo test -p bridge-core --doc`; the removed target is dropped |
 | R2-W2 | the control 24 doctest crossed both module privacy and function privacy, so mutating only the module stayed green | control 24a imports only `bridge_core::custody_export`; trait sealing (24b) and receipt constructor (24c) are separate arms |
+
+## 24. Spec review outcome (2026-09-25)
+
+The post-split review cap was two rounds plus narrow owner-authorized extensions while converging. Material blockers
+went 6 → 2 → 0.
+
+| Round | Artifact | Verdict | Raw result SHA-256 |
+|---|---|---|---|
+| 1 | revision 9 (`b27904c6`) | REJECT, 6 MATERIAL / 7 other | `4c10c41a5782a0453485091f5616e6f61b88ec8d3dbeaed2bd79b8702cb37eac` |
+| 2 | revision 10 (`c58bfac8`) | REJECT, 2 MATERIAL | `1842f05ef0736a2d9876c485d995390da22027f9b9d66814d350e7270bd0089b` |
+| 3 (extension, delta) | revision 11 (`ef7045d7`) | **APPROVE** | `ce3d19600aee561e6d742984af13bd16db8890ae35de59b8c54f9e1ac0b8bd7d` |
+
+Round 3's two IMMATERIAL items, the stale §10 next action and §23's unnamed thirteenth finding, are corrected in this
+section's commit.

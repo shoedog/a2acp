@@ -20,8 +20,9 @@
     denial, and `killpg` `EPERM` during exit).
   - **2B2a review:** the Sol implementation review ran rounds 1–2 plus a narrow extension; MATERIAL blockers
     4 → 1 → 0.
-  - **Next:** 2B2 revision 9, bound to the merged 2B2a API, is in spec review under a new two-round cap. The serial
-    order is 2B2a → 2B2 → 2B2b → 2B3.
+  - **2B2 spec:** revision 11 **APPROVED** after rounds 1–2 plus one extension (MATERIAL blockers 6 → 2 → 0).
+    Implementation by the Opus 5.5 containerized implementor is next, with the review loop and merge on green CI.
+    The serial order is 2B2a (merged) → 2B2 → 2B2b → 2B3.
   - **Effects:** no 2B2 effect has started. The 2B2a deferrals are in the ledger below.
   - **Earlier history:** Slice 1A defines canonical lossless records without I/O; Slice 1B adds an
   explicitly capped 8+8 metadata collector and synthetic historical reconciliation, with every missing row still
