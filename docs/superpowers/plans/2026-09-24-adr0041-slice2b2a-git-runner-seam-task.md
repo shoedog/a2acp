@@ -3,7 +3,7 @@ task-type: implement
 ---
 # ADR-0041 Slice 2B2a — descriptor seam and hardened Git runner
 
-**Status:** revision 8; planning/documentation only. Delta round 7 resolved the route-fact requirement and raised
+**Status:** revision 8, **approved for implementation by owner decision** (2026-09-24, §20). Delta round 7 resolved the route-fact requirement and raised
 2 WRONG / 2 SMELL, all about control discrimination; revision 8 folds them (§19). The recurring class of controls
 masked by other guards is escalated to the owner (§19).
 
@@ -414,7 +414,9 @@ These must be restated verbatim in the handoff.
 
 ## 11. Next action
 
-Review status: see §19. The owner decides the next step. On 2026-09-24 the owner authorized implementation once
+Review status: §20. The owner directed implementation of revision 8. Control discrimination is settled
+empirically by the implementation's mutation evidence, then checked by the implementation review under its own
+two-round cap. On 2026-09-24 the owner authorized implementation once
 this review clears. Implementation starts with the pre-code lane inventory in §4.1, and a failed inventory is a stop
 condition (§9). Approval does not authorize push, merge, cleanup, or running-operator mutation.
 
@@ -599,3 +601,16 @@ Delta round 7 was a host Codex `gpt-5.6-sol`/`xhigh`/read-only turn on revision 
 - The implement brief already makes it empirical: every control needs recorded mutation evidence, and a
   non-flipping mutation is inadmissible and must be reported. The implementation review then checks that evidence.
 - Continuing spec rounds has diminishing returns.
+
+## 20. Owner decision — implement revision 8 (2026-09-24)
+
+After the §19 escalation, the owner directed implementation of revision 8 without a spec round 8. The production
+requirements have converged, and round 7 found no production-behavior defect.
+
+The open control-discrimination class is now resolved empirically:
+
+- every §5 control must carry recorded mutation evidence;
+- a mutation that does not flip its control is inadmissible and is reported, not hidden;
+- the implementation review, under a two-round cap, verifies that evidence.
+
+This decision authorizes neither push, merge, cleanup, 2B2 implementation, nor running-operator mutation.
