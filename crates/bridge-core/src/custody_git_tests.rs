@@ -45,6 +45,10 @@ fn root_fixture() -> (TempDir, PinnedDirectoryV1) {
 /// expects `Timeout` sets its own millisecond deadline instead.
 const SUCCESS_PATH_DEADLINE: Duration = Duration::from_secs(60);
 
+/// Explicit stdin bound for the A16 pack fixtures. The seam takes the bound from its caller, so
+/// the tests state one rather than inheriting a hidden default.
+const PACK_STDIN_BOUND: u64 = 1024 * 1024;
+
 fn names() -> GitRootNamesV1 {
     GitRootNamesV1::new("home", "xdg", "repo").expect("valid root names")
 }
@@ -510,6 +514,186 @@ fn a12_a15_a18_route_encoding_and_evidence_are_ordered_and_bounded() {
     assert_eq!(
         classify_ext4_admission_for_test(0x1234, (8, 1), matching_ext4),
         Ext4AdmissionV1::NotExt4Superblock
+    );
+
+    // A12 malformed-shape rows. Every one of these keeps the first three fields and `ext4`, which
+    // is exactly the truncated or hand-assembled lane evidence that must never be read as a native
+    // ext4 admission. The kernel writes six mandatory left-hand fields, zero or more optional
+    // fields, one `" - "` separator, and exactly three right-hand fields, so any other shape is
+    // evidence this text is not a `mountinfo` line and the lane stays unproven.
+    for malformed in [
+        // mandatory left-hand and right-hand fields both truncated away
+        "36 25 8:1 - ext4",
+        // nonnumeric mount ID, then nonnumeric parent ID
+        "x 25 8:1 / /fixture rw - ext4 /dev/sda1 rw",
+        "36 y 8:1 / /fixture rw - ext4 /dev/sda1 rw",
+        // nonnumeric major, then nonnumeric minor
+        "36 25 x:1 / /fixture rw - ext4 /dev/sda1 rw",
+        "36 25 8:y / /fixture rw - ext4 /dev/sda1 rw",
+        // missing mount point, then missing mount options
+        "36 25 8:1 / - ext4 /dev/sda1 rw",
+        "36 25 8:1 / /fixture - ext4 /dev/sda1 rw",
+        // missing super-options, then missing both source and super-options
+        "36 25 8:1 / /fixture rw - ext4 /dev/sda1",
+        "36 25 8:1 / /fixture rw - ext4",
+        // Two separators. The first shape is also caught by the right-hand field count, so the
+        // second one keeps exactly three fields after the *first* separator: only the
+        // single-separator requirement stands between it and an admission, which is what makes
+        // that requirement's own mutation discriminating.
+        "36 25 8:1 / /fixture rw - ext4 /dev/sda1 rw - ext4",
+        "36 25 8:1 / /fixture rw - ext4 - /dev/sda1",
+    ] {
+        assert_eq!(
+            classify_ext4_admission_for_test(0xEF53, (8, 1), malformed),
+            Ext4AdmissionV1::MalformedMountInfo,
+            "{malformed:?} is not a well-formed mountinfo line"
+        );
+        // A malformed line is refused even when a well-formed matching `ext4` line accompanies it,
+        // so partial evidence can never be salvaged into an admission.
+        assert_eq!(
+            classify_ext4_admission_for_test(
+                0xEF53,
+                (8, 1),
+                &format!("{matching_ext4}\n{malformed}")
+            ),
+            Ext4AdmissionV1::MalformedMountInfo,
+            "{malformed:?} alongside a well-formed line"
+        );
+    }
+    // Optional fields between the mount options and the separator are part of the format, so the
+    // strict shape check must keep admitting them.
+    assert_eq!(
+        classify_ext4_admission_for_test(
+            0xEF53,
+            (8, 1),
+            "36 25 8:1 / /fixture rw shared:1 master:2 - ext4 /dev/sda1 rw"
+        ),
+        Ext4AdmissionV1::Admitted
+    );
+}
+
+/// W1 — the native-ext4 lane probe.
+///
+/// A12's table is synthetic by design, so a green run on overlayfs, XFS, or an unmeasured
+/// filesystem is indistinguishable from the required native ext4 lane. This probe closes that gap
+/// with measured inputs: it opens a disposable fixture directory as a retained descriptor,
+/// measures `fstatfs` and `st_dev` **on that descriptor**, reads the live `/proc/self/mountinfo`,
+/// and feeds all three into the same production classifier the table exercises.
+///
+/// It asserts only that the classifier produced a well-formed outcome that agrees with the live
+/// inputs, because a developer machine is legitimately not ext4; the CI log line decides admission.
+/// Run the lane with `--nocapture` so `A12-LIVE-LANE` reaches the log.
+#[cfg(target_os = "linux")]
+#[test]
+fn live_ext4_lane_probe_records_admission() {
+    use std::os::fd::AsRawFd as _;
+
+    let fixture = TempDir::new().expect("lane probe fixture directory");
+    let pin = PinnedDirectoryV1::open(fixture.path(), "ext4 lane probe").expect("pin lane fixture");
+    // `PinnedDirectoryV1` keeps its directory descriptor private and 2B2a may not widen that seam,
+    // so the probe retains its own descriptor on the same directory and proves, by the pin's own
+    // recorded `fstat` facts, that the descriptor it measures is that pinned directory.
+    let retained = fs::File::open(fixture.path()).expect("retain the fixture directory descriptor");
+    let retained_facts = retained
+        .metadata()
+        .expect("fstat the retained fixture descriptor");
+    assert_eq!(pin.identity().dev, Some(retained_facts.dev()));
+    assert_eq!(pin.identity().ino, Some(retained_facts.ino()));
+
+    // SAFETY: `retained` is a live directory descriptor owned for the whole call, and `fstatfs`
+    // only writes the `statfs` it is given, which is initialized exactly when the call succeeds.
+    // This is the test-only measurement boundary named in the A14 inventory; there is no safe std
+    // or `libc` path to the superblock magic.
+    let measured = unsafe {
+        let mut buffer = std::mem::MaybeUninit::<libc::statfs>::uninit();
+        assert_eq!(
+            libc::fstatfs(retained.as_raw_fd(), buffer.as_mut_ptr()),
+            0,
+            "fstatfs on the retained fixture descriptor: {}",
+            std::io::Error::last_os_error()
+        );
+        buffer.assume_init()
+    };
+    let magic = measured.f_type;
+    let device = retained_facts.dev();
+    let live = (libc::major(device), libc::minor(device));
+    let mountinfo = fs::read_to_string("/proc/self/mountinfo").expect("read /proc/self/mountinfo");
+
+    let outcome = classify_ext4_admission_for_test(magic, live, &mountinfo);
+    // Reporting only: name the filesystem type the live mount table gives this device, so an
+    // excluded lane says what it actually ran on instead of only that it was not ext4.
+    let observed_types: Vec<&str> = mountinfo
+        .lines()
+        .filter_map(|line| {
+            let (left, right) = line.split_once(" - ")?;
+            let major_minor = left.split_whitespace().nth(2)?;
+            let (major, minor) = major_minor.split_once(':')?;
+            (major.parse::<u32>().ok()? == live.0 && minor.parse::<u32>().ok()? == live.1)
+                .then(|| right.split_whitespace().next())
+                .flatten()
+        })
+        .collect();
+    let fstype = if observed_types.is_empty() {
+        "<none>".to_owned()
+    } else {
+        observed_types.join("+")
+    };
+    let verdict = match outcome {
+        Ext4AdmissionV1::Admitted => "Admitted".to_owned(),
+        Ext4AdmissionV1::NotExt4Superblock => "Excluded(not-ext4-superblock)".to_owned(),
+        Ext4AdmissionV1::MissingMount => "Excluded(missing-mount)".to_owned(),
+        Ext4AdmissionV1::WrongFilesystemType => "Excluded(wrong-filesystem-type)".to_owned(),
+        Ext4AdmissionV1::AmbiguousMount => "Excluded(ambiguous-mount)".to_owned(),
+        Ext4AdmissionV1::MalformedMountInfo => "Excluded(malformed-mountinfo)".to_owned(),
+    };
+    println!(
+        "A12-LIVE-LANE: {verdict} magic=0x{magic:X} dev={}:{} fstype={fstype}",
+        live.0, live.1
+    );
+    // GitHub Actions ubuntu is the task's named native-ext4 lane (§7). A passing test's output is
+    // captured, so there the admission is asserted rather than only printed: a green CI run proves
+    // this fixture was measured and admitted as ext4, and a non-ext4 runner fails loudly instead of
+    // passing unmeasured. Elsewhere (developer machines, the overlayfs implement container) the lane
+    // is a named exclusion and only the consistency checks below apply.
+    if std::env::var_os("GITHUB_ACTIONS").is_some_and(|value| value == "true") {
+        assert_eq!(
+            outcome,
+            Ext4AdmissionV1::Admitted,
+            "A12-LIVE-LANE on GitHub Actions must be native ext4: {verdict} magic=0x{magic:X} \
+             dev={}:{} fstype={fstype}",
+            live.0,
+            live.1
+        );
+    }
+
+    // The outcome must agree with the measured inputs. Admission is only ever reported for a real
+    // ext4 superblock whose live mount entry is the single `ext4` entry for this device.
+    if outcome == Ext4AdmissionV1::Admitted {
+        assert_eq!(
+            magic, 0xEF53,
+            "admission requires the ext4 superblock magic"
+        );
+        assert_eq!(
+            observed_types,
+            ["ext4"],
+            "admission requires exactly one live ext4 mount for this device"
+        );
+    } else {
+        assert!(
+            magic != 0xEF53 || observed_types != ["ext4"],
+            "an ext4 superblock with one live ext4 mount must not be excluded"
+        );
+    }
+
+    // The same live mountinfo cannot produce an admission once either measured fact is falsified,
+    // so a lane can never be reported as ext4 on the strength of the mount table alone.
+    assert_eq!(
+        classify_ext4_admission_for_test(0x794C7630, live, &mountinfo),
+        Ext4AdmissionV1::NotExt4Superblock
+    );
+    assert_ne!(
+        classify_ext4_admission_for_test(magic, (live.0 + 4096, live.1 + 4096), &mountinfo),
+        Ext4AdmissionV1::Admitted
     );
 }
 
@@ -1192,10 +1376,12 @@ fn a8_a8b_a9_a10_bound_streams_deadlines_and_descendant_pipe_holders() {
             object_format: GitObjectFormatV1::Sha1,
         },
         fs::File::open(&stdin_path).unwrap(),
+        1024 * 1024,
         2 * 1024 * 1024,
         2 * 1024 * 1024,
         Instant::now() + Duration::from_secs(3),
-    );
+    )
+    .unwrap();
     duplex
         .stream_stdout_to_new_child(&root, "duplex-output")
         .unwrap();
@@ -1361,10 +1547,12 @@ fn a16_real_index_pack_then_verify_pack_uses_the_fixed_pack_namespace() {
             GitRunRequestV1::from_file(
                 GitCommandV1::IndexPackStrictStdin,
                 fs::File::open(&pack_file).unwrap(),
+                PACK_STDIN_BOUND,
                 4096,
                 4096,
                 Instant::now() + SUCCESS_PATH_DEADLINE,
-            ),
+            )
+            .unwrap(),
             || Ok(()),
             || Ok(()),
         )
@@ -1635,6 +1823,142 @@ fn a11a_a11b_a11c_each_runner_owned_lazy_fetch_guard_is_independent() {
     assert_eq!(fixture_tree_digest(&template), template_digest);
 }
 
+/// W3 — file-backed stdin is fallible, regular-only, and bounded.
+///
+/// The runner joins its stdin writer after the child deadline path, so a descriptor that can block
+/// forever defeats the mandatory deadline no matter how the child is terminated. Construction is
+/// therefore the guard: it `fstat`s the descriptor and refuses anything that is not a regular
+/// file, and it refuses a regular file larger than the caller's explicit bound. Both refusals are
+/// returned by the constructor, so no `run` call — and hence no child — can exist for a refused
+/// descriptor.
+#[test]
+fn ir1w3_file_stdin_must_be_regular_and_within_its_bound() {
+    use std::ffi::CString;
+
+    const BOUND: u64 = 4096;
+
+    let (_root_temp, root) = root_fixture();
+    // The fixture records the byte count it actually received, on stdout and in a rooted file, so
+    // the bound is observable both when the run succeeds and when it refuses.
+    let (_fixture, runner) = fixture_runner(
+        "#!/bin/sh\ncase \"$*\" in *version*) echo 'git version 2.54.0';; *) wc -c > stdin-count; cat stdin-count;; esac\n",
+        &root,
+    );
+    let received = || {
+        fs::read_to_string(root.canonical_path().join("stdin-count"))
+            .expect("the fixture records the bytes it received")
+            .trim()
+            .to_owned()
+    };
+    let command = |dir: &str| GitCommandV1::InitBare {
+        dir: dir.to_owned(),
+        object_format: GitObjectFormatV1::Sha1,
+    };
+    let deadline = || Instant::now() + SUCCESS_PATH_DEADLINE;
+
+    // 1. A FIFO with no writer and no data is the reviewed constructible input whose read never
+    //    returns. It is refused before any spawn.
+    let fifo_path = root.canonical_path().join("w3-fifo");
+    let fifo_name = CString::new(fifo_path.as_os_str().as_bytes()).expect("fifo path");
+    // SAFETY: a valid NUL-terminated path inside this test's disposable custody root.
+    assert_eq!(unsafe { libc::mkfifo(fifo_name.as_ptr(), 0o600) }, 0);
+    // `O_RDWR` keeps the open itself from blocking on a writerless FIFO, which is exactly how a
+    // caller would hand the seam a descriptor that reads forever.
+    let fifo = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&fifo_path)
+        .expect("open fifo");
+    assert!(matches!(
+        GitRunRequestV1::from_file(command("w3-fifo-run"), fifo, BOUND, 4096, 4096, deadline()),
+        Err(CustodyGitError::StdinNotRegular { observed: "fifo" })
+    ));
+
+    // 2. Any other non-regular descriptor is refused the same way; a directory covers the second
+    //    `fstat` type a caller can reach through `File::open`.
+    assert!(matches!(
+        GitRunRequestV1::from_file(
+            command("w3-dir-run"),
+            fs::File::open(root.canonical_path()).expect("open directory"),
+            BOUND,
+            4096,
+            4096,
+            deadline(),
+        ),
+        Err(CustodyGitError::StdinNotRegular {
+            observed: "directory"
+        })
+    ));
+    // No child can have run for either refusal: both are returned before a request value exists.
+    assert!(!root.canonical_path().join("w3-fifo-run").exists());
+    assert!(!root.canonical_path().join("w3-dir-run").exists());
+
+    // 3. A regular file of exactly the bound succeeds, and the child receives every byte.
+    let exact = root.canonical_path().join("w3-exact");
+    fs::write(&exact, vec![b'x'; BOUND as usize]).expect("write exact-bound input");
+    let request = GitRunRequestV1::from_file(
+        command("w3-exact-run"),
+        fs::File::open(&exact).expect("open exact-bound input"),
+        BOUND,
+        4096,
+        4096,
+        deadline(),
+    )
+    .expect("a regular file of exactly the bound is accepted");
+    let accepted = runner
+        .run(&root, &names(), request, || Ok(()), || Ok(()))
+        .expect("exact-bound run");
+    assert_eq!(
+        std::str::from_utf8(accepted.captured_stdout().unwrap())
+            .unwrap()
+            .trim(),
+        BOUND.to_string(),
+        "the child must receive exactly the bound"
+    );
+
+    // 4. A regular file of bound+1 refuses with a typed error, before any spawn.
+    let over = root.canonical_path().join("w3-over");
+    fs::write(&over, vec![b'x'; BOUND as usize + 1]).expect("write over-bound input");
+    assert!(matches!(
+        GitRunRequestV1::from_file(
+            command("w3-over-run"),
+            fs::File::open(&over).expect("open over-bound input"),
+            BOUND,
+            4096,
+            4096,
+            deadline(),
+        ),
+        Err(CustodyGitError::StdinLimit { limit: BOUND })
+    ));
+    assert!(!root.canonical_path().join("w3-over-run").exists());
+
+    // 5. The bound also holds at read time, not only at construction: a file that grows after its
+    //    `fstat` is never read past the bound, and the run refuses rather than silently truncating
+    //    the caller's input.
+    let growing = root.canonical_path().join("w3-growing");
+    fs::write(&growing, vec![b'x'; BOUND as usize]).expect("write growing input");
+    let grown = GitRunRequestV1::from_file(
+        command("w3-growing-run"),
+        fs::File::open(&growing).expect("open growing input"),
+        BOUND,
+        4096,
+        4096,
+        deadline(),
+    )
+    .expect("the growing file is within its bound when it is measured");
+    fs::write(&growing, vec![b'x'; BOUND as usize * 2]).expect("grow the input after its fstat");
+    let outcome = runner.run(&root, &names(), grown, || Ok(()), || Ok(()));
+    assert_eq!(
+        received(),
+        BOUND.to_string(),
+        "the writer must not read a byte past the caller's bound"
+    );
+    assert!(
+        matches!(outcome, Err(CustodyGitError::Stdin(_))),
+        "a descriptor that grew past its bound must refuse, got {outcome:?}"
+    );
+}
+
 #[test]
 fn a14_ast_inventory_keeps_new_unsafe_boundaries_exact() {
     use std::collections::BTreeMap;
@@ -1743,9 +2067,30 @@ fn a14_ast_inventory_keeps_new_unsafe_boundaries_exact() {
             ("effective_uid".into(), 1),
         ])
     );
-    // Both inventories are taken from the committed sources, so the control's mutation is a real
-    // `unsafe { libc::getpid(); }` compiled into an owned function; the handoff records that run.
-    // No synthetic source string stands in for it.
+
+    // The control module is inventoried too, so a test-only `unsafe` boundary is named here rather
+    // than escaping the A14 scope. Every site is a measurement or a fixture construction that has
+    // no safe std or `libc` equivalent: the effective-uid probe that selects the root-only route
+    // rows, the `fstatfs` superblock measurement the native-ext4 lane probe reports, and the
+    // `mkfifo` that builds W3's non-regular stdin descriptor.
+    let control_inventory = inventory(include_str!("custody_git_tests.rs"));
+    assert_eq!(
+        control_inventory,
+        BTreeMap::from([
+            (
+                "a5a_a5b_a5e_and_a13_refuse_bad_route_pins_and_versions_before_effects".into(),
+                1
+            ),
+            (
+                "ir1w3_file_stdin_must_be_regular_and_within_its_bound".into(),
+                1
+            ),
+            ("live_ext4_lane_probe_records_admission".into(), 1),
+        ])
+    );
+    // All three inventories are taken from the committed sources, so the control's mutation is a
+    // real `unsafe { libc::getpid(); }` compiled into an owned function; the handoff records that
+    // run. No synthetic source string stands in for it.
 }
 
 #[test]
@@ -1998,10 +2343,12 @@ fn w2_mutating_commands_refuse_a_caller_object_store_route() {
     let mut escape = GitRunRequestV1::from_file(
         GitCommandV1::IndexPackStrictStdin,
         fs::File::open(&pack_file).unwrap(),
+        PACK_STDIN_BOUND,
         4096,
         4096,
         Instant::now() + SUCCESS_PATH_DEADLINE,
-    );
+    )
+    .unwrap();
     escape.object_store = Some(GitObjectStoreRouteV1::new(store.clone(), vec![]).unwrap());
     let outcome = runner.run(&root, &names(), escape, || Ok(()), || Ok(()));
     assert!(

@@ -525,7 +525,7 @@ struct AdmittedGitRouteV1 {
 
 pub(crate) enum GitStdinSourceV1 {
     Bytes(Vec<u8>),
-    File(File),
+    File { file: File, max_bytes: u64 },
 }
 
 enum GitStdoutTargetV1 {
@@ -565,20 +565,44 @@ impl GitRunRequestV1 {
         )
     }
 
+    /// Build a request whose stdin is a regular file, bounded by `max_stdin_bytes`.
+    ///
+    /// The writer thread is joined after the deadline path, so a descriptor whose read can block
+    /// indefinitely — a FIFO, a device, a socket — would outlive the mandatory deadline however the
+    /// child itself is terminated. Construction is therefore fallible and fail-closed: it `fstat`s
+    /// the caller's descriptor and refuses anything that is not a regular file, and it refuses a
+    /// regular file longer than the caller's explicit bound. Both refusals precede any spawn, and
+    /// the writer never reads past the bound even if the file grows afterwards.
     pub(crate) fn from_file(
         command: GitCommandV1,
         stdin: File,
+        max_stdin_bytes: u64,
         stdout_limit: usize,
         stderr_limit: usize,
         deadline: Instant,
-    ) -> Self {
-        Self::with_stdin_source(
+    ) -> Result<Self, CustodyGitError> {
+        let metadata = stdin.metadata().map_err(CustodyGitError::Stdin)?;
+        let file_type = metadata.file_type();
+        if !file_type.is_file() {
+            return Err(CustodyGitError::StdinNotRegular {
+                observed: describe_file_type(&file_type),
+            });
+        }
+        if metadata.len() > max_stdin_bytes {
+            return Err(CustodyGitError::StdinLimit {
+                limit: max_stdin_bytes,
+            });
+        }
+        Ok(Self::with_stdin_source(
             command,
-            GitStdinSourceV1::File(stdin),
+            GitStdinSourceV1::File {
+                file: stdin,
+                max_bytes: max_stdin_bytes,
+            },
             stdout_limit,
             stderr_limit,
             deadline,
-        )
+        ))
     }
 
     fn with_stdin_source(
@@ -786,6 +810,10 @@ pub(crate) enum CustodyGitError {
     StderrLimit { limit: usize },
     #[error("Git child exceeded its deadline")]
     Timeout,
+    #[error("Git child stdin must be a regular file, not {observed}")]
+    StdinNotRegular { observed: &'static str },
+    #[error("Git child stdin exceeded its {limit}-byte bound")]
+    StdinLimit { limit: u64 },
     #[error("Git child stdin failed: {0}")]
     Stdin(std::io::Error),
     #[error("Git child stream failed: {0}")]
@@ -1457,13 +1485,23 @@ pub(crate) fn classify_ext4_admission_for_test(
     }
     let mut matched_types = Vec::new();
     for line in mountinfo.lines() {
-        let Some((left, right)) = line.split_once(" - ") else {
+        // The kernel writes exactly one `" - "` separator per line: every path-shaped field escapes
+        // whitespace as `\040`, so a second separator means this text was not produced by
+        // `/proc/<pid>/mountinfo` and no part of it is admissible lane evidence.
+        let mut halves = line.split(" - ");
+        let (Some(left), Some(right), None) = (halves.next(), halves.next(), halves.next()) else {
             return Ext4AdmissionV1::MalformedMountInfo;
         };
-        let mut left_fields = left.split_whitespace();
-        let _mount_id = left_fields.next();
-        let _parent_id = left_fields.next();
-        let Some(major_minor) = left_fields.next() else {
+        // Left-hand side: mount ID, parent ID, `major:minor`, root, mount point, and mount options
+        // are all mandatory. Any number of optional propagation fields may follow them.
+        let left_fields: Vec<&str> = left.split_whitespace().collect();
+        let [mount_id, parent_id, major_minor, _root, _mount_point, _options, ..] =
+            left_fields.as_slice()
+        else {
+            return Ext4AdmissionV1::MalformedMountInfo;
+        };
+        let (Ok(_mount_id), Ok(_parent_id)) = (mount_id.parse::<u64>(), parent_id.parse::<u64>())
+        else {
             return Ext4AdmissionV1::MalformedMountInfo;
         };
         let Some((major, minor)) = major_minor.split_once(':') else {
@@ -1472,11 +1510,13 @@ pub(crate) fn classify_ext4_admission_for_test(
         let (Ok(major), Ok(minor)) = (major.parse::<u32>(), minor.parse::<u32>()) else {
             return Ext4AdmissionV1::MalformedMountInfo;
         };
+        // Right-hand side: filesystem type, mount source, and super options, and nothing else.
+        let right_fields: Vec<&str> = right.split_whitespace().collect();
+        let [filesystem_type, _source, _super_options] = right_fields.as_slice() else {
+            return Ext4AdmissionV1::MalformedMountInfo;
+        };
         if (major, minor) == device {
-            let Some(filesystem_type) = right.split_whitespace().next() else {
-                return Ext4AdmissionV1::MalformedMountInfo;
-            };
-            matched_types.push(filesystem_type);
+            matched_types.push(*filesystem_type);
         }
     }
     match matched_types.as_slice() {
@@ -1591,10 +1631,42 @@ fn copy_input(
             child_stdin.write_all(&bytes)?;
             Ok(bytes.len() as u64)
         }
-        GitStdinSourceV1::File(file) => {
-            let mut file = file;
-            std::io::copy(&mut file, &mut child_stdin)
+        GitStdinSourceV1::File { file, max_bytes } => {
+            // `take` is the read bound itself: the writer never reads a byte past the caller's
+            // limit, so a descriptor that grew after its `fstat` cannot extend the child's input.
+            let mut bounded = file.take(max_bytes);
+            let copied = std::io::copy(&mut bounded, &mut child_stdin)?;
+            // Re-`fstat` rather than read further. A file that outgrew its bound would have been
+            // silently truncated, which corrupts a pack instead of refusing it.
+            if bounded.into_inner().metadata()?.len() > max_bytes {
+                return Err(std::io::Error::other(format!(
+                    "stdin grew past its {max_bytes}-byte bound while the child ran"
+                )));
+            }
+            Ok(copied)
         }
+    }
+}
+
+/// Name the `fstat` type a refused stdin descriptor actually had, so the typed refusal says what
+/// the caller handed the seam.
+fn describe_file_type(file_type: &std::fs::FileType) -> &'static str {
+    use std::os::unix::fs::FileTypeExt as _;
+
+    if file_type.is_dir() {
+        "directory"
+    } else if file_type.is_symlink() {
+        "symbolic link"
+    } else if file_type.is_fifo() {
+        "fifo"
+    } else if file_type.is_socket() {
+        "socket"
+    } else if file_type.is_char_device() {
+        "character device"
+    } else if file_type.is_block_device() {
+        "block device"
+    } else {
+        "a non-regular file"
     }
 }
 
