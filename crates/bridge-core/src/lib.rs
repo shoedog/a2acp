@@ -5,6 +5,11 @@ pub mod attestation;
 pub mod brief_lint;
 pub mod catalog;
 pub mod custody_capsule;
+#[cfg(unix)]
+#[allow(dead_code)] // 2B2a is intentionally production-unwired until the exporter slice.
+mod custody_git;
+#[cfg(all(test, unix))]
+mod custody_git_tests;
 pub mod custody_inventory;
 pub mod custody_inventory_collector;
 pub mod custody_seal;
