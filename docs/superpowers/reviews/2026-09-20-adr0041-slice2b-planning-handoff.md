@@ -1,27 +1,27 @@
 # Handoff — ADR-0041 Slice 2B local capsule planning
 
-**Written:** 2026-09-20T22:51:32Z; refreshed 2026-09-23 after R1 provenance repair cycle 1 · **By:** Codex `/root` · **Provider:** codex + Claude ACP review
-**Workspace:** retained implementation clone plus planning worktree · **Measured state:** `[MEASURED]` R1 provenance candidate `88013eb4` APPROVED; PR #105 open
+**Written:** 2026-09-20T22:51:32Z; refreshed 2026-09-24 after PR #105 merge, Slice 2B2 task drafting, and the revision-2 pre-review audit fold · **By:** Codex `/root` · **Provider:** codex + Claude ACP review
+**Workspace:** primary checkout on docs branch from merged `main` · **Measured state:** `[MEASURED]` PR #105 merged at `5e431f4f`; Slice 2B2 review candidate revision 2 written (pre-review audit folded); no 2B2 effect started
 **Predecessor:** `docs/superpowers/reviews/2026-09-16-adr0041-slice2a-handoff.md`
 **Truth ordering:** measured live state > explicit owner/contract authority within its scope > this handoff for current operational state > earlier handoffs and non-authoritative summaries. A conflict between tiers stays OPEN in §0 — never resolved by document class alone.
 **Provenance:** written live by the worker from GitHub/remote-main probes, merged ADR/code, and predecessor handoffs. `[MEASURED]` claims were probed by this writer; `[INHERITED]` claims were not.
 
 ## 0. Gating facts — settle these before starting anything below
 
-**(a) Lane ownership** — `[MEASURED]` provenance review cycle 1 completed APPROVE; no agent is in flight — **RESOLVED 2026-09-23.**
-**(b) Custody exposure** — `[MEASURED]` reviewed candidate `88013eb4` and docs successor `5f79427f` were pushed to `feat/adr0041-slice2b1-capsule-contracts-20260923`; PR #105 is open — **RESOLVED for local and remote branch custody.**
-**(c) In flight / irreversible** — `[MEASURED]` review terminal and cleanup were complete. No capsule/restore effect, cleanup, remote promotion, merge, or operator mutation was started — **RESOLVED 2026-09-23.**
-**(d) Authorization granted but not exercised** — The R1 repair, controller verification, independent approval, push, and PR creation are complete. Merge, cleanup, 2B2/2B3, and operator mutation remain unauthorized.
+**(a) Lane ownership** — `[MEASURED]` PR #105 merged; no implementation or review agent is in flight — **RESOLVED 2026-09-23.**
+**(b) Custody exposure** — `[MEASURED]` reviewed candidate `88013eb4` is reachable from merge `5e431f4f`; the historical planning branch remains after worktree retirement — **RESOLVED for Slice 2B1 cleanup.**
+**(c) In flight / irreversible** — `[MEASURED]` no capsule/restore, remote-promotion, or running-operator effect was started. The merged Slice 2B1 worktrees/builds were retired under explicit owner authority — **RESOLVED 2026-09-23.**
+**(d) Authorization granted but not exercised** — Slice 2B2 is documented for review only. No 2B2/2B3 implementation or operator mutation is authorized by this handoff.
 
 ## 1. Resume order
 
-1. In this exact worktree run `git status --short --branch`, bind HEAD/base to the identifiers in §6, and require no code paths outside the planning delta.
+1. In the primary checkout run `git status --short --branch`, bind the branch base to merge `5e431f4f`, and require no code paths outside the Slice 2B2 planning delta.
 2. Read ADR-0041 §§4, 8, 9, 11, 14, and 17; the Slice 2A handoff §4; and the complete plan in §6.
-3. Bind both review records, the final approved closure, and the typed implementation task in §6.
-4. Preserve reviewed candidate `88013eb4`, its review record, and the docs-only publication successor.
-5. Inspect PR #105 and stop. Do not merge or begin 2B2 without new owner direction.
+3. Bind both 2B1 review records, the final approved closure, and the Slice 2B2 review candidate in §6.
+4. Preserve reviewed candidate `88013eb4`, merge `5e431f4f`, and the historical planning branch.
+5. **The owner split 2B2 on 2026-09-24:** the descriptor seam and Git runner are now child **2B2a** (`docs/superpowers/plans/2026-09-24-adr0041-slice2b2a-git-runner-seam-task.md`, revision 8; round 1 REJECTED 5 WRONG / 5 SMELL and round 2 REJECTED 2 WRONG / 5 SMELL, both converging, closed, and folded; records `docs/superpowers/reviews/2026-09-24-adr0041-slice2b2a-spec-review-round{1,2}.md`; the owner authorized a cap extension and implementation once the review clears; extension round 3 REJECTED 1 WRONG / 3 SMELL, still converging and folded as revision 4 (record `docs/superpowers/reviews/2026-09-24-adr0041-slice2b2a-spec-review-round3.md`); narrow extension round 4 REJECTED again on the same wrapper-admission item (record `docs/superpowers/reviews/2026-09-24-adr0041-slice2b2a-spec-review-round4.md`), which was escalated; the owner chose caller-pinned digest admission, applied in revision 5; extension round 5 raised 4 closed WRONG, folded in revision 6 (and 2B2 revision 8; record `docs/superpowers/reviews/2026-09-24-adr0041-slice2b2a-spec-review-round5.md`); delta round 6 raised 1 residual WRONG, folded in revision 7 (record `docs/superpowers/reviews/2026-09-24-adr0041-slice2b2a-spec-review-round6.md`); delta round 7 found no production defect but 2 control-discrimination WRONG, folded in revision 8 (record `docs/superpowers/reviews/2026-09-24-adr0041-slice2b2a-spec-review-round7.md`); after the escalation, the owner directed implementation of revision 8 on 2026-09-24. The implementation (`535cfb82` → `d0bf020a`) was **APPROVED** by the Sol implementation review, with records in `docs/superpowers/reviews/2026-09-24-adr0041-slice2b2a-implementation-handoff.md`. A PR to `main` is next, merging when CI is green; after that, 2B2 revision 8 resumes spec review against the merged 2B2a API). 2B2 is at revision 8 (split, plus the route-request input), depends on 2B2a, and resumes review under a new cap after 2B2a is approved. Earlier: 2B2 revisions 1–6 went through a pre-review audit plus three Sol/xhigh rounds (records `docs/superpowers/reviews/2026-09-24-adr0041-slice2b2-spec-review-round{1,2,3}.md`), and the owner ruled hostile same-user racers out of scope.
 
-**STOP conditions:** Do not start 2B2/2B3 effects, use a bare path as a quiescence/capture capability, add remote/provider/destructive authority, clean worktrees, merge, or mutate the running operator. Publication is limited to the approved PR branch. An open-class review population or exhausted nonconverging cap parks the plan.
+**STOP conditions:** Do not start 2B2/2B3 effects, use a bare path as a quiescence/capture capability, add remote/provider/destructive authority, publish the docs branch, or mutate the running operator. An open-class review population or exhausted nonconverging cap parks the plan.
 
 ## 2. State ledger
 
@@ -34,7 +34,7 @@
 | Durable-state reconciliation | done | `[MEASURED]` roadmap plus Slice 1B/2A handoffs now record PR #104 merged and preserve adoption/effects as separate gates. |
 | Documentation gates | done | `[MEASURED]` `git diff --check` exits 0; locked/offline repository hygiene reports 41 tracked artifacts / 9 validated example configs. No code changed, so no implementation/full-suite claim is made. |
 | Independent spec review | approved | `[MEASURED]` Opus 5/high round 2 returned `APPROVE`: all 4 inherited WRONG RESOLVED, 0 new WRONG, 6 non-blocking SMELL. The converging two-round cap is exhausted; residuals were folded without extension. |
-| Implementation/effects | 2B1 approved; PR #105 open | `[MEASURED]` candidate `88013eb4` passed two discriminating mutations, full host suites 4,471/0 and 4,477/0 with 13 ignored, and static/policy/hygiene gates. Sol/xhigh review APPROVED with 0 WRONG / 5 deferred SMELLs. No capsule/restore filesystem or Git effect started. |
+| Implementation/effects | 2B1 merged; 2B2 planning | `[MEASURED]` PR #105 merged candidate `88013eb4` at `5e431f4f`. The 2B2 review candidate binds isolated export/object-closure scope and carries the four dropped public negatives forward. No 2B2/2B3 capsule/restore effect started. |
 
 ## 3. Corrections to standing documents and memory
 
@@ -51,9 +51,9 @@
 |---:|---|---|---|---|---|
 | 1 | Planning custody | done | Preserve the approved closure, implementation task, and this handoff seal; do not push without separate authority. | None. | Approval `56922bdd`; task `81c292ce`; final plan digest in §6. |
 | 2 | Spec review | approved | Preserve both review records; no third round. | None. | Round-1 and round-2 records in §6. |
-| 3 | Child 2B1 implementation | approved; PR #105 open | Preserve reviewed code `88013eb4` and monitor PR checks; do not merge without owner direction. | Merge authority. | `https://github.com/shoedog/a2acp/pull/105`; review `exec-e7ee36345656679aec8923c4be9d25b6`. |
-| 4 | Children 2B2/2B3 | parked | Proceed serially only after each predecessor is approved. | 2B1 then 2B2 approval; effect authority. | §§5–6 of the plan. |
-| 5 | Worktree cleanup/operator adoption | parked | Keep separate from Slice 2B planning and implementation. | Separate exact authority and custody proof. | ADR-0041 stages 3–5. |
+| 3 | Child 2B1 implementation | merged | Preserve merge `5e431f4f`, reviewed code `88013eb4`, and final review evidence. | None. | `https://github.com/shoedog/a2acp/pull/105`; review `exec-e7ee36345656679aec8923c4be9d25b6`. |
+| 4 | Child 2B2 | review candidate | Independently review the isolated-export/object-closure task; fold closed findings before seeking implementation authority. | Spec approval and separate effect authority. | `docs/superpowers/plans/2026-09-23-adr0041-slice2b2-isolated-export-task.md`. |
+| 5 | Child 2B3/operator adoption | parked | Proceed only after 2B2 approval; keep operator adoption separate. | 2B2 approval and separate authority. | §6 of the parent plan; ADR-0041 stages 3–5. |
 
 ## 5. Invariants and traps — do not do these
 
@@ -63,13 +63,14 @@
 - Never let Git consult alternates, promisor/lazy fetch, ambient config, hooks, filters, or credentials during proof — those recreate the laptop dependency or execute archived behavior.
 - Never restore raw config/hooks into the active plane — preserve originals as evidence and synthesize an inert active configuration.
 - Never implement 2B1 and filesystem/Git effects in one dispatch — the serial split is the review-convergence control.
-- The primary checkout is on an older unrelated branch; do not edit, reset, switch, or clean it.
+- Local `main` is fixed at merge `5e431f4f`; planning edits live on `docs/adr0041-slice2b2-task-20260923`.
 
 ## 6. Identifiers
 
 | Item | Verbatim |
 |---|---|
-| Merge commit / current remote main | `27a885f6d4af6a517c2a8899aa5bfe36605b8fb7` |
+| Merge commit / current remote main | `5e431f4f2dd6f77c66d64fa28dc48054f396edf9` |
+| PR #105 reviewed head / merge | `d7645dd517b54a0222028153d281684f8ba2e35b` / `5e431f4f2dd6f77c66d64fa28dc48054f396edf9` |
 | PR #104 reviewed head | `65a572df40f07316124a70b7ec353a2d38dd334d` |
 | PR URL / merged at | `https://github.com/shoedog/a2acp/pull/104` / `2026-09-20T22:01:16Z` |
 | Planning branch | `docs/adr0041-slice2b-plan-20260920` |
@@ -95,9 +96,14 @@
 | Provenance review / execution / attempt | `docs/superpowers/reviews/2026-09-23-adr0041-slice2b1-provenance-review.md` / `exec-e7ee36345656679aec8923c4be9d25b6` / `attempt-86036c5afb97c003d9f62bb2fc0c9163` |
 | Provenance review raw result SHA-256 | `ae10a401186fc9933a959a17ff6da1c8d5727f0e2ee79440ab63306663fb2eb0` |
 | Published branch / PR | `feat/adr0041-slice2b1-capsule-contracts-20260923` / `https://github.com/shoedog/a2acp/pull/105` |
+| Slice 2B2 review candidate | `docs/superpowers/plans/2026-09-23-adr0041-slice2b2-isolated-export-task.md` (revision 8, split; rev 1 `c7536a56`, rev 2 `1c22d0d0`, rev 3 `a1177a66`, rev 4 `c91b35bf`, rev 5 `52e474fa`, rev 6 `cf93c7e4`) |
+| Slice 2B2a review candidate | `docs/superpowers/plans/2026-09-24-adr0041-slice2b2a-git-runner-seam-task.md` (revision 8; rev 1 `054c889b`, rev 2 `be10c255`, rev 3 `81b6a51f`, rev 4 `c4175f47`, rev 5 `c35a0120`, rev 6 `fb7c4aab`, rev 7 `cc6f3b17`) |
+| Slice 2B2 spec review round 2 | `docs/superpowers/reviews/2026-09-24-adr0041-slice2b2-spec-review-round2.md`; REJECT 6 WRONG / 3 SMELL; cap exhausted |
+| Slice 2B2 spec review round 3 (extension) | `docs/superpowers/reviews/2026-09-24-adr0041-slice2b2-spec-review-round3.md`; REJECT 6 WRONG / 2 SMELL, closed; folded in revision 6 |
+| Slice 2B2 spec review round 1 | `docs/superpowers/reviews/2026-09-24-adr0041-slice2b2-spec-review-round1.md`; REJECT 5 WRONG / 9 SMELL, all folded in revision 3 |
 
 ## 7. Refutation verdict and owner questions
 
 **§2c verdict:** REFUTED — corrected in place · claim: "The second repair closes all three inherited Slice 2B1 WRONG mechanisms." · pass: INDEPENDENT · evidence tier: STATIC-ONLY plus inherited mutation/full-gate evidence · record: `docs/superpowers/reviews/2026-09-23-adr0041-slice2b1-second-closure-review.md`
 
-**Cycle-1 repair status:** APPROVED and published as PR #105. R1/R2/R3 are RESOLVED with no blocker. Merge, cleanup, 2B2/2B3, and operator mutation remain separate gates.
+**Cycle-1 repair status:** APPROVED and merged as PR #105 at `5e431f4f`. R1/R2/R3 are RESOLVED with no blocker. Slice 2B2 was split on 2026-09-24: 2B2a (seam and Git runner) is at revision 8 (caller-pinned digest admission, owner decision 2026-09-24), approved for implementation by owner decision (2026-09-24), and 2B2 is at revision 8 depending on 2B2a. Both are unimplemented; 2B2/2B3 effects and operator mutation remain separate gates.

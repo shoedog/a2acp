@@ -15,6 +15,8 @@
 //!    custody contract used by R2f1b and by both storage reapers.
 
 use serde::{Deserialize, Serialize};
+#[cfg(test)]
+use std::cell::RefCell;
 #[cfg(unix)]
 use std::ffi::CStr;
 #[cfg(unix)]
@@ -827,6 +829,64 @@ impl std::fmt::Debug for PinnedDirectoryV1 {
     }
 }
 
+#[cfg(unix)]
+fn created_child_owner_and_mode_is_valid(
+    owner: u32,
+    mode: u32,
+    effective_uid: u32,
+    _link_count: u64,
+) -> bool {
+    // The creation protocol requires an empty directory, owner, and mode. Its normal `.` and
+    // `..` links are filesystem topology, so no literal link-count predicate is admissible.
+    owner == effective_uid && (mode & 0o7777) == 0o700
+}
+
+#[cfg(test)]
+type CreateChildHookV1 = Box<dyn Fn(&Path)>;
+
+#[cfg(test)]
+#[derive(Default)]
+struct CreateChildHooksV1 {
+    after_mkdir: Option<CreateChildHookV1>,
+    after_open: Option<CreateChildHookV1>,
+}
+
+#[cfg(test)]
+thread_local! {
+    static CREATE_CHILD_HOOKS: RefCell<CreateChildHooksV1> = RefCell::new(CreateChildHooksV1::default());
+}
+
+#[cfg(test)]
+struct CreateChildHooksGuardV1 {
+    previous: CreateChildHooksV1,
+}
+
+#[cfg(test)]
+impl Drop for CreateChildHooksGuardV1 {
+    fn drop(&mut self) {
+        CREATE_CHILD_HOOKS.with(|hooks| {
+            *hooks.borrow_mut() = std::mem::take(&mut self.previous);
+        });
+    }
+}
+
+#[cfg(test)]
+fn install_create_child_hooks_for_test(
+    after_mkdir: Option<CreateChildHookV1>,
+    after_open: Option<CreateChildHookV1>,
+) -> CreateChildHooksGuardV1 {
+    let previous = CREATE_CHILD_HOOKS.with(|hooks| {
+        std::mem::replace(
+            &mut *hooks.borrow_mut(),
+            CreateChildHooksV1 {
+                after_mkdir,
+                after_open,
+            },
+        )
+    });
+    CreateChildHooksGuardV1 { previous }
+}
+
 impl PinnedDirectoryV1 {
     pub fn open(path: &Path, label: &str) -> Result<Self, FsCustodyError> {
         let canonical_path = path
@@ -907,6 +967,170 @@ impl PinnedDirectoryV1 {
 
     pub fn open_regular_file(&self, name: &OsStr, label: &str) -> Result<File, FsCustodyError> {
         open_regular_child(&self.file, name, label)
+    }
+
+    #[cfg(test)]
+    fn run_create_child_hook(after_mkdir: bool, path: &Path) {
+        CREATE_CHILD_HOOKS.with(|hooks| {
+            let hooks = hooks.borrow();
+            let hook = if after_mkdir {
+                hooks.after_mkdir.as_ref()
+            } else {
+                hooks.after_open.as_ref()
+            };
+            if let Some(hook) = hook {
+                hook(path);
+            }
+        });
+    }
+
+    /// Create one owner-private directory below this retained descriptor and pin the opened
+    /// object. The post-create checks make a substitution visible before the new pin escapes.
+    #[cfg(unix)]
+    #[allow(dead_code)] // 2B2a's caller lands in 2B2.
+    pub(crate) fn create_new_child_directory(
+        &self,
+        name: &OsStr,
+        label: &str,
+    ) -> Result<PinnedDirectoryV1, FsCustodyError> {
+        use std::os::fd::AsRawFd as _;
+        use std::os::unix::fs::MetadataExt as _;
+
+        let child_name = child_name_cstring(name, label)?;
+        // SAFETY: `self.file` is a live retained directory descriptor and `child_name` is one
+        // validated component whose C-string storage remains live for the syscall.
+        if unsafe { libc::mkdirat(self.file.as_raw_fd(), child_name.as_ptr(), 0o700) } == -1 {
+            let error = std::io::Error::last_os_error();
+            return if error.raw_os_error() == Some(libc::EEXIST) {
+                Err(FsCustodyError::TargetExists(label.to_owned()))
+            } else {
+                Err(FsCustodyError::Io(label.to_owned(), error))
+            };
+        }
+
+        #[cfg(test)]
+        Self::run_create_child_hook(true, &self.canonical_path.join(name));
+
+        let file = open_child_no_follow(
+            &self.file,
+            &child_name,
+            ChildOpenOptionsV1 {
+                nonblocking: false,
+                directory: true,
+            },
+        )
+        .map_err(|error| FsCustodyError::Io(label.to_owned(), error))?;
+        let identity = directory_identity(&self.canonical_path.join(name), &file, label)?;
+        #[cfg(test)]
+        Self::run_create_child_hook(false, &self.canonical_path.join(name));
+
+        // A duplicate-descriptor enumeration avoids consuming or depending on the pin's own
+        // directory offset. A zero-child bound is exactly the required emptiness predicate.
+        let empty = enumerate_directory_names(&file, 0, label).map(|_| ());
+        let metadata = file
+            .metadata()
+            .map_err(|error| FsCustodyError::Io(label.to_owned(), error));
+        let owner_and_mode = metadata.and_then(|metadata| {
+            // SAFETY: `geteuid` has no preconditions and returns the effective uid of this
+            // process; it is used only for the ownership comparison below.
+            let effective_uid = unsafe { libc::geteuid() };
+            created_child_owner_and_mode_is_valid(
+                metadata.uid(),
+                metadata.mode(),
+                effective_uid,
+                metadata.nlink(),
+            )
+            .then_some(())
+            .ok_or_else(|| {
+                FsCustodyError::Unsupported(format!(
+                    "{label}: created child is not owned by the effective user with mode 0700"
+                ))
+            })
+        });
+        let parent_entry = stat_child_no_follow(&self.file, &child_name)
+            .map_err(|error| FsCustodyError::Io(label.to_owned(), error))?
+            .ok_or_else(|| FsCustodyError::IdentityChanged(label.to_owned()))
+            .and_then(|entry| {
+                // `dev_t` is `i32` on macOS and `u64` on Linux; widening to `u64` matches what
+                // `MetadataExt::dev` recorded in `identity`, and is a no-op cast on Linux only.
+                #[allow(clippy::unnecessary_cast)]
+                let entry_dev = entry.st_dev as u64;
+                if entry_dev == identity.dev.unwrap_or_default()
+                    && entry.st_ino == identity.ino.unwrap_or_default()
+                {
+                    Ok(())
+                } else {
+                    Err(FsCustodyError::IdentityChanged(label.to_owned()))
+                }
+            });
+
+        // The directory entry was created even when a guard refuses it, so make the attempted
+        // mutation durable before reporting the guard's answer.
+        let guards = empty.and(owner_and_mode).and(parent_entry);
+        let sync = self.sync(label);
+        guards?;
+        sync?;
+        Ok(PinnedDirectoryV1 {
+            file,
+            canonical_path: self.canonical_path.join(name),
+            identity,
+            sync_failure_countdown: FailureCountdownV1::new(),
+            publication_rename_failure_countdown: FailureCountdownV1::new(),
+            publication_rename_failure_shape: AtomicU8::new(0),
+        })
+    }
+
+    /// Open an existing directory through this retained descriptor without following its final
+    /// component.
+    #[allow(dead_code)] // 2B2a's caller lands in 2B2.
+    #[cfg(unix)]
+    pub(crate) fn open_existing_child_directory(
+        &self,
+        name: &OsStr,
+        label: &str,
+    ) -> Result<PinnedDirectoryV1, FsCustodyError> {
+        open_directory_child(self, name, label)
+    }
+
+    #[allow(dead_code)] // 2B2a's caller lands in 2B2.
+    /// Create one owner-private regular child through this retained descriptor.
+    #[cfg(unix)]
+    pub(crate) fn create_new_regular_child(
+        &self,
+        name: &OsStr,
+        label: &str,
+    ) -> Result<File, FsCustodyError> {
+        create_new_regular_child_at(&self.file, name, label)
+    }
+
+    #[allow(dead_code)] // 2B2a's caller lands in 2B2.
+    /// Root a child process at an owned duplicate of this pin. The duplicate is captured by value
+    /// so dropping this pin or reusing its descriptor number cannot change the child's cwd.
+    #[cfg(unix)]
+    pub(crate) fn root_command(
+        &self,
+        command: &mut std::process::Command,
+        label: &str,
+    ) -> Result<(), FsCustodyError> {
+        use std::os::fd::AsRawFd as _;
+        use std::os::unix::process::CommandExt as _;
+
+        let rooted = self
+            .file
+            .try_clone()
+            .map_err(|error| FsCustodyError::Io(label.to_owned(), error))?;
+        // SAFETY: the closure owns an `O_CLOEXEC` duplicate of a live directory descriptor;
+        // `fchdir` is async-signal-safe and the closure performs no allocation or locking.
+        unsafe {
+            command.pre_exec(move || {
+                if libc::fchdir(rooted.as_raw_fd()) == -1 {
+                    Err(std::io::Error::last_os_error())
+                } else {
+                    Ok(())
+                }
+            });
+        }
+        Ok(())
     }
 
     /// Unix-only: the lease is `flock`-backed, and `crate::liveness` is itself `cfg(unix)`.
@@ -7692,6 +7916,132 @@ mod tests {
                 _ => unreachable!(),
             }
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a1_a2_a3_a4_descriptor_creation_and_rooting_controls() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let fixture = tempfile::tempdir().unwrap();
+        let named = fixture.path().join("root");
+        fs::create_dir(&named).unwrap();
+        let pin = PinnedDirectoryV1::open(&named, "A1 root").unwrap();
+        let retained = fixture.path().join("retained");
+        fs::rename(&named, &retained).unwrap();
+        fs::create_dir(&named).unwrap();
+        pin.create_new_child_directory(OsStr::new("child"), "A1 directory")
+            .unwrap();
+        pin.create_new_regular_child(OsStr::new("record"), "A1 regular")
+            .unwrap();
+        assert!(retained.join("child").is_dir());
+        assert!(retained.join("record").is_file());
+        assert!(!named.join("child").exists());
+        assert!(matches!(
+            pin.create_new_child_directory(OsStr::new("child"), "A1 duplicate"),
+            Err(FsCustodyError::TargetExists(_))
+        ));
+
+        let a2a = tempfile::tempdir().unwrap();
+        let a2a_pin = PinnedDirectoryV1::open(a2a.path(), "A2a root").unwrap();
+        let displaced = a2a.path().join("displaced");
+        let _hooks = install_create_child_hooks_for_test(
+            Some(Box::new(move |created| {
+                fs::rename(created, &displaced).unwrap();
+                fs::create_dir(created).unwrap();
+                fs::write(created.join("non-empty"), b"x").unwrap();
+                // The substitute must pass the owner and mode guard and the parent-entry identity
+                // guard, or one of those masks the emptiness guard this arm isolates.
+                fs::set_permissions(created, fs::Permissions::from_mode(0o700)).unwrap();
+            })),
+            None,
+        );
+        assert!(matches!(
+            a2a_pin.create_new_child_directory(OsStr::new("child"), "A2a"),
+            Err(FsCustodyError::EnumerationLimitExceeded { .. })
+        ));
+        drop(_hooks);
+
+        let a2b = tempfile::tempdir().unwrap();
+        let a2b_pin = PinnedDirectoryV1::open(a2b.path(), "A2b root").unwrap();
+        let displaced = a2b.path().join("displaced");
+        let _hooks = install_create_child_hooks_for_test(
+            Some(Box::new(move |created| {
+                fs::rename(created, &displaced).unwrap();
+                fs::create_dir(created).unwrap();
+                fs::set_permissions(created, fs::Permissions::from_mode(0o755)).unwrap();
+            })),
+            None,
+        );
+        assert!(a2b_pin
+            .create_new_child_directory(OsStr::new("child"), "A2b")
+            .is_err());
+        drop(_hooks);
+
+        let a2c = tempfile::tempdir().unwrap();
+        let a2c_pin = PinnedDirectoryV1::open(a2c.path(), "A2c root").unwrap();
+        let displaced = a2c.path().join("displaced");
+        let _hooks = install_create_child_hooks_for_test(
+            None,
+            Some(Box::new(move |created| {
+                fs::rename(created, &displaced).unwrap();
+                fs::create_dir(created).unwrap();
+                fs::set_permissions(created, fs::Permissions::from_mode(0o700)).unwrap();
+            })),
+        );
+        assert!(matches!(
+            a2c_pin.create_new_child_directory(OsStr::new("child"), "A2c"),
+            Err(FsCustodyError::IdentityChanged(_))
+        ));
+        drop(_hooks);
+
+        // A genuinely empty directory has link count two on this filesystem, which is deliberately
+        // irrelevant to the owner/mode predicate.
+        assert!(created_child_owner_and_mode_is_valid(42, 0o700, 42, 1));
+        assert!(created_child_owner_and_mode_is_valid(42, 0o700, 42, 2));
+        assert!(!created_child_owner_and_mode_is_valid(42, 0o755, 42, 1));
+        // A2b's owner arm. A directory substituted by another user cannot be created through this
+        // retained descriptor without privilege, so the owner half of the guard is discriminated by
+        // injected metadata: same mode, same link count, different owner.
+        assert!(!created_child_owner_and_mode_is_valid(43, 0o700, 42, 2));
+        assert!(!created_child_owner_and_mode_is_valid(0, 0o700, 42, 2));
+
+        let a3 = tempfile::tempdir().unwrap();
+        let root = a3.path().join("root");
+        fs::create_dir(&root).unwrap();
+        let pin = PinnedDirectoryV1::open(&root, "A3 root").unwrap();
+        let retained = a3.path().join("retained");
+        let mut command = std::process::Command::new("/bin/sh");
+        command.args(["-c", "touch rooted-marker; pwd"]);
+        pin.root_command(&mut command, "A3 root command").unwrap();
+        fs::rename(&root, &retained).unwrap();
+        fs::create_dir(&root).unwrap();
+        let output = command.output().unwrap();
+        assert!(output.status.success());
+        assert!(retained.join("rooted-marker").exists());
+        assert!(!root.join("rooted-marker").exists());
+        let replacement = PinnedDirectoryV1::open(&root, "A3 replacement").unwrap();
+        assert!(!pin.identity().matches(replacement.identity()));
+
+        let a4 = tempfile::tempdir().unwrap();
+        let root = a4.path().join("root");
+        fs::create_dir(&root).unwrap();
+        let pin = PinnedDirectoryV1::open(&root, "A4 root").unwrap();
+        let mut command = std::process::Command::new("/bin/pwd");
+        pin.root_command(&mut command, "A4 root command").unwrap();
+        let retained = a4.path().join("retained");
+        fs::rename(&root, &retained).unwrap();
+        drop(pin);
+        let _reused_descriptors = (0..64)
+            .map(|_| File::open("/dev/null").unwrap())
+            .collect::<Vec<_>>();
+        let output = command.output().unwrap();
+        assert!(output.status.success());
+        // `/bin/pwd` reports the physical path (macOS `/var` is `/private/var`).
+        assert_eq!(
+            Path::new(std::str::from_utf8(&output.stdout).unwrap().trim()),
+            fs::canonicalize(&retained).unwrap()
+        );
     }
 
     #[cfg(not(unix))]
