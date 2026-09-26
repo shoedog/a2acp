@@ -1019,8 +1019,10 @@ Each item was accepted as deferred by the 2B2a implementation review, and none b
 ### Provider refresh 2026-09-25 deferred follow-ups (ledger)
 
 These were accepted as deferred by the Sol review of the Opus 5.5 provider refresh (branch
-`chore/claude-acp-opus55-20260925`; review round 3 judged the disposition adequate). The evidence is in the
-2026-09-25 section of `docs/compatibility.md`.
+`chore/claude-acp-opus55-20260925`; review round 3 judged the disposition adequate). The review record, with its
+ranges, results, and dispositions, is
+`docs/superpowers/reviews/2026-09-25-provider-refresh-opus55-review.md`. Execution evidence is in the 2026-09-25
+section of `docs/compatibility.md`.
 
 - **Reader pin guard is substring-based (open-class).** `reader_dependency_pins.rs` now rejects additive
   explicit-version selectors, duplicate provenance labels, and duplicate Kiro build arguments. It cannot model npm semantics, though, so a later layer with a bare
