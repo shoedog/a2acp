@@ -15,6 +15,56 @@ Status meanings:
 - **STALE** — it passed previously, but a relevant component has changed or the evidence is too old for
   a release decision.
 
+## Provider refresh — 2026-09-25 (Opus 5.5)
+
+Motive: the previous production Claude tree (ACP 0.73.0 / Agent SDK 0.3.257 / bundled Claude Code 2.1.257)
+only knew `claude-opus-5`, so the `opus` alias served Opus 5, not Opus 5.5. The refresh followed
+[`provider-refresh-runbook.md`](provider-refresh-runbook.md) with the served operator's release binary
+(bridge 0.3.1, SHA-256 prefix `07aee33e487fdce6`), exact-version candidates in a private prefix, and
+reader image `sha256:af15780f686db44cc19c63d2a445bd61ac698f53284e43f40cdc05c3b0fb9f5e` (toolchain
+`sha256:3390cbe8a6388615645ca9fb462173c16da7423f3ef3013893a8c44b8eecb875`, built `FROM` that reader).
+
+Candidate components, all verified from the installed package manifests and the image labels:
+
+- Claude ACP 0.81.2, with its declared Agent SDK 0.3.280 (bundled Claude Code 2.1.280, which contains
+  `claude-opus-5-5`);
+- Codex ACP 1.13.1, with nested `@openai/codex` pinned to 0.157.1 (the adapter declares a range);
+- Kiro CLI 2.24.1 (the notarized macOS DMG on the host and the musl zip in the image, each checked against
+  the SHA-256 in Kiro's stable manifest);
+- OpenCode 1.18.32.
+
+Every lane ran exactly one fixed `PONG` prompt, with no retry of any prompt that might have been accepted:
+
+| Lane | Model / effort | Status | Evidence |
+|---|---|---|---|
+| Claude host (ACP 0.81.2) | `opus` / `low` | **PASS** | 3.4 s; 18,214 tokens; USD 0.067. The provider-side transcript records `claude-opus-5-5`. |
+| Claude reader (image `af15780f…`) | `opus` / `low` | **PASS** | 3.9 s; 15,897 tokens; USD 0.048. The container transcript records `claude-opus-5-5`. |
+| Codex host (ACP 1.13.1 / Codex 0.157.1) | `gpt-5.6-sol` / `xhigh` / `read-only` | **PASS** | 5.4 s; 34,013 tokens. |
+| Codex reader (image `af15780f…`) | `gpt-5.6-sol` / `xhigh` | **PASS** | 6.2 s; 24,159 tokens. |
+| Kiro host (2.24.1) | `auto` | **PASS** | 2.6 s. |
+| OpenCode host (1.18.32) | `opencode-go/gpt-5.6-luna` | **FAIL (provider quota)** | The turn timed out after 240 s. The OpenCode log shows the candidate reached the provider, which returned `Go usage limit exceeded`. Production 1.18.27 logged the same error on 2026-09-24, so this is a plan quota, not a candidate regression; the lane is unverified. |
+
+Two host Claude attempts before the passing one are inadmissible probe defects, and neither reached the
+prompt (both have `prompt_may_have_been_accepted=false`):
+
+1. The smoke's file-credential preflight refused, because host Claude authenticates through the Keychain or
+   token and no credential file existed. The fix was an owner-only `CLAUDE_CONFIG_DIR` holding the synced
+   token credential.
+2. `opus[1m]` was rejected at configuration, because with a token credential the adapter advertises
+   `default|sonnet|opus|haiku`. The Keychain-authenticated catalog lists `opus[1m]` instead of `opus`.
+
+Promotion: the host npm trees for Claude ACP, Codex ACP (with its nested Codex) and standalone Codex were
+promoted, along with the host Kiro app. The reader and toolchain `latest` tags moved to the IDs above, and
+`rollback-pre-20260925` tags keep the prior IDs (`5f7ac9ce…`, `f20be11b…`). **OpenCode stays at 1.18.27**
+until a live lane passes. The operator was drained (zero tasks, sessions, and connections) and restarted on
+the same binary and config.
+
+After the restart, doctor matched the pre-refresh baseline (28 ok, 2 known native-provenance warnings, and
+the 1 known Keychain-blind OAuth-file check). The served card advertises all five agents, including `opus`
+for Claude. No prompt was sent through the served listener. The checked-in compatibility manifest and
+pinned baseline (R3b, reader `79a7ded7…`) are unchanged; promoting them needs a separately authorized
+exact-candidate aggregate.
+
 ## v0.3.1 exact-candidate release verification — 2026-07-30
 
 The release-mode v0.3.1 candidate at
