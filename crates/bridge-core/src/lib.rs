@@ -11,6 +11,10 @@ pub mod custody_capsule;
 #[cfg(unix)]
 #[allow(dead_code)]
 mod custody_export;
+// 2B2b1's coverage-payload frame is pure and compiles on every target. It is production-unwired
+// until the 2B2b2 streaming producers consume it.
+#[allow(dead_code)]
+mod custody_frame;
 #[cfg(unix)]
 #[allow(dead_code)] // 2B2a is intentionally production-unwired until the exporter slice.
 mod custody_git;
