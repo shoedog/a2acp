@@ -20,6 +20,23 @@ const REQUIRED_READER_PINS: &[&str] = &[
 const FORBIDDEN_READER_SELECTORS: &[(&str, &str)] =
     &[("/latest/", "mutable /latest/ Kiro selector")];
 
+/// Each package selector, provenance label key, and Kiro build argument must appear exactly once, so a later layer
+/// cannot float or relabel a component while every required pin string survives.
+const SINGLE_OCCURRENCE_MARKERS: &[&str] = &[
+    "@agentclientprotocol/codex-acp@",
+    "@openai/codex@",
+    "@agentclientprotocol/claude-agent-acp@",
+    "@anthropic-ai/claude-agent-sdk@",
+    "io.a2a-bridge.provenance.codex.adapter=",
+    "io.a2a-bridge.provenance.codex.agent-cli=",
+    "io.a2a-bridge.provenance.claude.adapter=",
+    "io.a2a-bridge.provenance.claude.agent-cli=",
+    "io.a2a-bridge.provenance.kiro.agent-cli=",
+    "ARG KIRO_CLI_VERSION=",
+    "ARG KIRO_CLI_AMD64_SHA256=",
+    "ARG KIRO_CLI_ARM64_SHA256=",
+];
+
 const CURRENT_READER_IMAGE: &str =
     "sha256:79a7ded7f20c9cac640a331436ba0d01b198a82b98b980cf220c37f93e94960f";
 
@@ -68,6 +85,12 @@ fn validate_reader_pins(containerfile: &str) -> Result<(), Vec<&'static str>> {
             .iter()
             .filter_map(|(selector, problem)| containerfile.contains(selector).then_some(*problem)),
     );
+    problems.extend(
+        SINGLE_OCCURRENCE_MARKERS
+            .iter()
+            .copied()
+            .filter(|marker| containerfile.matches(marker).count() != 1),
+    );
     if problems.is_empty() {
         Ok(())
     } else {
@@ -100,6 +123,27 @@ fn reader_pin_guard_rejects_floating_or_mismatched_nested_versions() {
 
     let mutable_kiro = format!("{valid}\nhttps://example.invalid/latest/kirocli.zip");
     assert!(validate_reader_pins(&mutable_kiro).is_err());
+}
+
+#[test]
+fn reader_pin_guard_rejects_additive_selectors_and_duplicate_labels() {
+    let path = repo_root().join("deploy/containers/reader.Containerfile");
+    let containerfile = fs::read_to_string(&path).unwrap();
+    assert!(validate_reader_pins(&containerfile).is_ok());
+
+    // Every required pin survives, but a later layer floats the nested Codex CLI.
+    let additive_floating = format!(
+        "{containerfile}\nRUN npm install --prefix /usr/local/lib/node_modules/@agentclientprotocol/codex-acp @openai/codex@latest\n"
+    );
+    assert!(validate_reader_pins(&additive_floating).is_err());
+
+    let conflicting_label = format!(
+        "{containerfile}\nLABEL io.a2a-bridge.provenance.claude.adapter=\"@agentclientprotocol/claude-agent-acp=0.0.1\"\n"
+    );
+    assert!(validate_reader_pins(&conflicting_label).is_err());
+
+    let second_kiro_version = format!("{containerfile}\nARG KIRO_CLI_VERSION=9.9.9\n");
+    assert!(validate_reader_pins(&second_kiro_version).is_err());
 }
 
 #[test]

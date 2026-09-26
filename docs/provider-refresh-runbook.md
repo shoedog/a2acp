@@ -125,12 +125,17 @@ Run these gates against the private tree before touching production:
 An expired or absent Claude OAuth token blocks live verification even when `initialize` and `models` pass.
 Refresh the host login, sync the isolated reader credential copy when applicable, and rerun doctor.
 
-On a macOS host where Claude Code keeps its login in the Keychain (or uses `CLAUDE_CODE_OAUTH_TOKEN`),
-there is no `~/.claude/.credentials.json`, so a host Claude `smoke` refuses in its credential preflight
-before spawning anything. For the smoke, point `CLAUDE_CONFIG_DIR` at a new owner-only directory holding a
-copy of the synced token credential (`~/.config/a2a-creds/claude/.credentials.json`), and delete that copy
-afterwards. The token credential changes the advertised catalog to `default|sonnet|opus|haiku`, with no
-`opus[1m]`. Run `models` under the same environment and pass a model from that catalog.
+The host Claude credential-file preflight is skipped in two cases: the entry is `pre_authenticated`, or one
+of `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, or `CLAUDE_CODE_OAUTH_TOKEN` is non-empty in the smoke's own
+environment. Otherwise, on a macOS host where Claude Code keeps its login only in the Keychain, there is no
+`~/.claude/.credentials.json`, and a host Claude `smoke` refuses before spawning anything.
+
+A token exported only from an interactive shell rc file is absent from non-interactive shells. Either export it
+into the smoke's environment, or point `CLAUDE_CONFIG_DIR` at a new owner-only directory holding a copy of
+the synced token credential (`~/.config/a2a-creds/claude/.credentials.json`) and delete that copy afterwards.
+
+Token authentication changes the advertised catalog to `default|sonnet|opus|haiku`, with no `opus[1m]`. Run
+`models` under the same environment and pass a model from that catalog.
 
 Neither catalog names the concrete model behind an alias. To prove which one served a lane, read the
 `"model"` field in the Claude session transcript under that config directory's `projects/`; for a reader,

@@ -47,9 +47,9 @@ Every lane ran exactly one fixed `PONG` prompt, with no retry of any prompt that
 Two host Claude attempts before the passing one are inadmissible probe defects, and neither reached the
 prompt (both have `prompt_may_have_been_accepted=false`):
 
-1. The smoke's file-credential preflight refused, because host Claude authenticates through the Keychain or
-   token and no credential file existed. The fix was an owner-only `CLAUDE_CONFIG_DIR` holding the synced
-   token credential.
+1. The smoke's file-credential preflight refused. Host Claude authenticates through the Keychain, no credential
+   file existed, and the controller's non-interactive shell did not carry `CLAUDE_CODE_OAUTH_TOKEN`, which would
+   have bypassed the check. The fix was an owner-only `CLAUDE_CONFIG_DIR` holding the synced token credential.
 2. `opus[1m]` was rejected at configuration, because with a token credential the adapter advertises
    `default|sonnet|opus|haiku`. The Keychain-authenticated catalog lists `opus[1m]` instead of `opus`.
 
