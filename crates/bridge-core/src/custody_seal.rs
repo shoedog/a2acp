@@ -186,6 +186,26 @@ impl CustodyOriginalObjectV1 {
     pub const fn kind(&self) -> CustodyGitObjectKindV1 {
         self.kind
     }
+
+    /// Read-only object format, for the crate-private exporter's capability binding.
+    ///
+    /// The exporter must compare a capture capability's `(format, object_id, kind)` inventory
+    /// with the manifest's exactly. Re-parsing the canonical JSON to do that would make the
+    /// comparison depend on the encoder rather than on the record, so the two missing components
+    /// are exposed here as accessors alongside the existing [`Self::kind`]. Neither changes
+    /// validation or the wire format.
+    #[cfg(unix)] // Read only by the unix-only exporter.
+    #[must_use]
+    pub(crate) const fn format(&self) -> CustodyGitObjectFormatV1 {
+        self.format
+    }
+
+    /// Read-only object id. See [`Self::format`].
+    #[cfg(unix)] // Read only by the unix-only exporter.
+    #[must_use]
+    pub(crate) fn object_id(&self) -> &str {
+        &self.object_id
+    }
 }
 
 #[derive(Deserialize)]
@@ -577,6 +597,39 @@ impl CustodyManifestV1 {
     #[must_use]
     pub fn original_objects(&self) -> &[CustodyOriginalObjectV1] {
         &self.original_objects
+    }
+
+    /// Read-only manifest identity, for the crate-private exporter's capability binding.
+    ///
+    /// The exporter must prove a generation-bound capture capability describes the same
+    /// generation as the manifest before any write. These four accessors make that a record
+    /// comparison rather than a canonical-JSON re-parse. None of them changes validation or the
+    /// wire format.
+    #[cfg(unix)] // Read only by the unix-only exporter.
+    #[must_use]
+    pub(crate) fn unit_id(&self) -> &str {
+        &self.unit_id
+    }
+
+    /// See [`Self::unit_id`].
+    #[cfg(unix)] // Read only by the unix-only exporter.
+    #[must_use]
+    pub(crate) fn run_id(&self) -> &str {
+        &self.run_id
+    }
+
+    /// See [`Self::unit_id`].
+    #[cfg(unix)] // Read only by the unix-only exporter.
+    #[must_use]
+    pub(crate) fn materialization_id(&self) -> &str {
+        &self.materialization_id
+    }
+
+    /// See [`Self::unit_id`].
+    #[cfg(unix)] // Read only by the unix-only exporter.
+    #[must_use]
+    pub(crate) fn generation_id(&self) -> &str {
+        &self.generation_id
     }
 }
 
@@ -1142,5 +1195,104 @@ mod tests {
             seal.validate_borrowed_canonical().unwrap_err(),
             CustodySealErrorV1::NonCanonicalRecord
         );
+    }
+
+    fn coverage_all(state: CustodyStateClassV1) -> Vec<CustodyCoverageEntryV1> {
+        CustodyCoverageClassV1::ALL
+            .into_iter()
+            .map(|class| CustodyCoverageEntryV1::new(class, state, vec![], None).unwrap())
+            .collect()
+    }
+
+    /// The four manifest-identity accessors report the constructor's own values, and each one
+    /// reports a DIFFERENT field: a manifest whose four identities are pairwise distinct pins
+    /// the mapping, so an accessor wired to the wrong field is visible here rather than in the
+    /// exporter's capability binding.
+    #[test]
+    fn crate_private_manifest_identity_accessors_report_each_distinct_field() {
+        let manifest = CustodyManifestV1::new(
+            "unit-a",
+            "run-b",
+            "materialization-c",
+            "generation-d",
+            coverage_all(CustodyStateClassV1::Empty),
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+        )
+        .unwrap();
+
+        assert_eq!(manifest.unit_id(), "unit-a");
+        assert_eq!(manifest.run_id(), "run-b");
+        assert_eq!(manifest.materialization_id(), "materialization-c");
+        assert_eq!(manifest.generation_id(), "generation-d");
+
+        let observed = [
+            manifest.unit_id(),
+            manifest.run_id(),
+            manifest.materialization_id(),
+            manifest.generation_id(),
+        ];
+        assert_eq!(
+            BTreeSet::from(observed).len(),
+            4,
+            "the four identity accessors must not alias one field"
+        );
+    }
+
+    /// `format` and `object_id` report the constructor's own values for both object formats, and
+    /// the existing `kind` accessor still reports the third component. Together they are the
+    /// exact `(format, object_id, kind)` triple the exporter compares.
+    #[test]
+    fn crate_private_original_object_accessors_report_format_and_object_id() {
+        let sha1 = CustodyOriginalObjectV1::new(
+            CustodyGitObjectFormatV1::Sha1,
+            "a".repeat(40),
+            CustodyGitObjectKindV1::Blob,
+        )
+        .unwrap();
+        assert_eq!(sha1.format(), CustodyGitObjectFormatV1::Sha1);
+        assert_eq!(sha1.object_id(), "a".repeat(40));
+        assert_eq!(sha1.kind(), CustodyGitObjectKindV1::Blob);
+
+        let sha256 = CustodyOriginalObjectV1::new(
+            CustodyGitObjectFormatV1::Sha256,
+            "b".repeat(64),
+            CustodyGitObjectKindV1::Tree,
+        )
+        .unwrap();
+        assert_eq!(sha256.format(), CustodyGitObjectFormatV1::Sha256);
+        assert_eq!(sha256.object_id(), "b".repeat(64));
+        assert_eq!(sha256.kind(), CustodyGitObjectKindV1::Tree);
+
+        assert_ne!(sha1.format(), sha256.format());
+        assert_ne!(sha1.object_id(), sha256.object_id());
+    }
+
+    /// The accessors are read-only: they neither validate nor canonicalize, so the records they
+    /// describe still encode byte for byte as they did before the accessors were read.
+    #[test]
+    fn crate_private_accessors_do_not_change_the_canonical_encoding() {
+        let manifest = CustodyManifestV1::new(
+            "unit",
+            "run",
+            "materialization",
+            "generation",
+            coverage_all(CustodyStateClassV1::Empty),
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+        )
+        .unwrap();
+        let before = manifest.encode_canonical().unwrap();
+        let _ = (
+            manifest.unit_id(),
+            manifest.run_id(),
+            manifest.materialization_id(),
+            manifest.generation_id(),
+        );
+        assert_eq!(manifest.encode_canonical().unwrap(), before);
     }
 }
