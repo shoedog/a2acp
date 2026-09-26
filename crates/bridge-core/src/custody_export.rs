@@ -41,7 +41,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{OsStr, OsString};
 use std::fs::File;
 use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::Instant;
 
 // ---------------------------------------------------------------------------------------------
@@ -582,18 +582,16 @@ impl CustodyCaptureCapabilityV1 {
         .map_err(CustodyExportErrorV1::Git)
     }
 
-    /// The source paths no scratch root may be, contain, or lie inside: the repository root, its
-    /// git directory, the primary object store, and every pinned alternate store.
-    fn protected_paths(&self) -> Vec<PathBuf> {
-        let mut paths = vec![self.source_repository.canonical_path().to_path_buf()];
-        paths.push(self.source_git_dir.canonical_path().to_path_buf());
-        paths.push(self.primary_store.path().to_path_buf());
-        paths.extend(
-            self.alternate_stores
-                .iter()
-                .map(|store| store.path().to_path_buf()),
-        );
-        paths
+    /// The pinned source directories no scratch root may be, contain, or lie inside: the
+    /// repository root, its git directory, the primary object store, and every pinned alternate
+    /// store. Each is the retained descriptor, whose identity is the directory pinned at mint even
+    /// after its path has been renamed away.
+    fn protected_directories(&self) -> Vec<&PinnedDirectoryV1> {
+        let mut directories = vec![&self.source_repository];
+        directories.push(&self.source_git_dir);
+        directories.push(&self.primary_store.pin);
+        directories.extend(self.alternate_stores.iter().map(|store| &store.pin));
+        directories
     }
 
     /// The captured stream bound to exactly this coverage class, generation, declared length,
@@ -1484,6 +1482,10 @@ pub(crate) fn export_capsule_v1(
     }
 
     let scratch = preflight_scratch_root(scratch_root, &capability)?;
+    // A pinned source path may have been renamed or retargeted since mint. Recheck every pinned
+    // identity immediately before the first scratch write, so a stale capability refuses before
+    // the exporter creates anything.
+    capability.recheck()?;
     let ledger = RefCell::new(ScratchLedgerV1::new(budgets.max_scratch_bytes));
 
     ledger.borrow_mut().reserve_entries(2)?;
@@ -1756,9 +1758,15 @@ fn preflight_scratch_root(
 /// contain, or lie inside the source repository root (a non-bare source's worktree), the source
 /// git directory, the primary object store, or any pinned alternate store. Canonical paths are
 /// compared in both directions, and so are directory identities: every ancestor of the scratch
-/// root (itself included) against each protected path, and every ancestor of each protected path
-/// (itself included) against the scratch root, so an alias that path comparison cannot see is
-/// still refused.
+/// root (itself included) against the identity each protected descriptor retained at mint, and
+/// every ancestor of each protected path (itself included) against the scratch root, so an alias
+/// that path comparison cannot see is still refused.
+///
+/// The first identity comparison never re-derives a protected identity by reopening its path. A
+/// pinned directory renamed after mint leaves that path naming a replacement, while a scratch
+/// ancestor may still be the pinned directory itself. The second walks a pinned path. The
+/// capability recheck before the first scratch write refuses a path that no longer resolves to
+/// its descriptor, and the empty scratch root can contain no pinned directory.
 fn refuse_source_overlap(
     canonical: &Path,
     capability: &CustodyCaptureCapabilityV1,
@@ -1773,23 +1781,28 @@ fn refuse_source_overlap(
     let identity = |path: &Path| {
         crate::fs_custody::directory_dev_ino(path).map_err(CustodyExportErrorV1::ScratchPreflight)
     };
+    let retained = |pin: &PinnedDirectoryV1| match (pin.identity().dev, pin.identity().ino) {
+        (Some(dev), Some(ino)) => Ok((dev, ino)),
+        _ => Err(CustodyExportErrorV1::ScratchPreflight(format!(
+            "{}: the retained directory identity (dev/ino) is unavailable",
+            pin.canonical_path().display()
+        ))),
+    };
     let scratch_identity = identity(canonical)?;
-    for protected in capability.protected_paths() {
-        if canonical == protected
-            || canonical.starts_with(&protected)
-            || protected.starts_with(canonical)
-        {
-            return refuse("is, contains, or lies inside", &protected);
+    for protected in capability.protected_directories() {
+        let path = protected.canonical_path();
+        if canonical == path || canonical.starts_with(path) || path.starts_with(canonical) {
+            return refuse("is, contains, or lies inside", path);
         }
-        let protected_identity = identity(&protected)?;
+        let protected_identity = retained(protected)?;
         for ancestor in canonical.ancestors() {
             if identity(ancestor)? == protected_identity {
-                return refuse("is or lies inside", &protected);
+                return refuse("is or lies inside", path);
             }
         }
-        for ancestor in protected.ancestors() {
+        for ancestor in path.ancestors() {
             if identity(ancestor)? == scratch_identity {
-                return refuse("is or contains", &protected);
+                return refuse("is or contains", path);
             }
         }
     }

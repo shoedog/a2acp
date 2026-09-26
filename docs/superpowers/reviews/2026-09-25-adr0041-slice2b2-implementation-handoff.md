@@ -1,15 +1,23 @@
 # ADR-0041 Slice 2B2 implementation handoff — isolated local export and Git-object closure
 
-**Status:** implementation complete in the container lane, and staged, not committed (turn directive). Every §7
-control exists and passes; every control's guard mutation flipped its control (66/66, two full rounds). The
-controller-run **macOS host lane** and the **native Linux ext4 lane** (GitHub Actions ubuntu) are **not executed
-here** (§6).
+**Status:** the implementation is complete in the container lane and committed as `87570241`; `91d0bf13` adds the
+`#[cfg(unix)]` accessor gates. Every §7 control exists and passes. Every control's guard mutation flipped its control
+at turn 3 (66/66, two full rounds), and each repair round re-ran its new and affected rows (§11.3, §12.3). The
+controller ran the **macOS host lane** on the turn-3 tree (§10). The **native Linux ext4 lane** (GitHub Actions ubuntu)
+and `cargo deny` are not executed here (§6) and remain for CI (§9).
 
 **Repair round 1 (2026-09-26, §11):** the Sol implementation review of `87570241` found three WRONG blockers. All
-three are repaired RED-first on top of `91d0bf13`: the non-bare worktree root (W1), the `git init` logical bytes in
-the ledger (W2), and the format-aware `verify-pack -v` bound (W3). The matrix now defines 73 rows; the 7 new rows
-and the 17 existing rows they affect all FLIPPED. The repair is staged, not committed. Figures in §2 and §4 are
-the post-repair figures. §5's table is the turn-3 record, and §11.3 extends it.
+three were repaired RED-first on top of `91d0bf13`: the non-bare worktree root (W1), the `git init` logical bytes in
+the ledger (W2), and the format-aware `verify-pack -v` bound (W3). The matrix then defined 73 rows; the 7 new rows
+and the 17 existing rows they affect all FLIPPED. Repair round 1 is committed as `7842f620`.
+
+**Repair round 2 (2026-09-26, §12):** Sol implementation review round 2 of `7842f620` found W1 unresolved for a
+stale, renamed worktree (BLOCKER), and found stale commit-status text in this handoff (IMMATERIAL). Both are repaired
+on top of `7842f620`. The overlap preflight now compares scratch ancestors with the identities the capability's pinned
+descriptors retained, and the capability is rechecked immediately before the first scratch write. The matrix defines
+75 rows; the 2 new rows and the 11 existing rows they affect or whose targets lie in a changed function all FLIPPED.
+Repair round 2 lands in the commit that contains §12. Figures in §2 and §4 are the round-2 figures. §5's table is
+the turn-3 record, and §11.3 and §12.3 extend it.
 
 **Task (authoritative):** `docs/superpowers/plans/2026-09-23-adr0041-slice2b2-isolated-export-task.md`, revision 11,
 SHA-256 `b9f1215aaac592d3185e3c315929a6b3a996d387d19a1afd48ac3aeb8ad814e9`, as it stands at the clone's base commit
@@ -76,7 +84,7 @@ is absent; `FIXED`/`ADDED` landed this turn, with the named control and mutation
 | §2 | non-cloneable generation-bound `CustodyCaptureCapabilityV1`, crate-private fixture mint only | PRESENT | PRESENT |
 | §2 | capability↔manifest binding: four identities, one object format, exact inventory, via crate-private `custody_seal` accessors | PRESENT | PRESENT (18, M18-*) |
 | §2 | caller `GitRouteRequestV1` passed to 2B2a admission unchanged | PRESENT | PRESENT (31, M31) |
-| §2 | scratch-root disjointness: canonical paths both directions plus ancestor identity | PARTIAL: the identity comparison ran one direction only | FIXED: identity compared in both directions (21, M21; see §7 on the identity layer). **Repair 1 (W1):** the capability pins the source repository root (a non-bare worktree) apart from the git directory, and it joins the protected paths (21 worktree rows, M21-root) |
+| §2 | scratch-root disjointness: canonical paths both directions plus ancestor identity | PARTIAL: the identity comparison ran one direction only | FIXED: identity compared in both directions (21, M21; see §7 on the identity layer). **Repair 1 (W1):** the capability pins the source repository root (a non-bare worktree) apart from the git directory, and it joins the protected paths (21 worktree rows, M21-root). **Repair 2 (W1-stale):** scratch ancestors are compared with each pinned descriptor's retained identity, never one re-derived by reopening its path (21 stale-pin row, M21-retained) |
 | §2 | scratch root owner-private and empty | PRESENT | PRESENT |
 | §2 | exactly two top-level scratch children, created through `PinnedDirectoryV1` | PRESENT | PRESENT (asserted by `the_capsule_holds_exactly_the_reserved_names_plus_the_seal`) |
 | §2 | exporter never deletes anything | PRESENT | PRESENT |
@@ -88,7 +96,7 @@ is absent; `FIXED`/`ADDED` landed this turn, with the named control and mutation
 | §4 | mixed/foreign object format refused before any spawn | PRESENT | PRESENT (18, M18-format) |
 | §4 | shallow/grafted/promisor source state refused before `pack-objects` | PRESENT (fixture-supplied flags) | PRESENT (see §7) |
 | §4 | recursive alternate chain pinned by identity and alternates-file content | PRESENT | PRESENT (5a/5b) |
-| §4.1 | every Git child through the 2B2a runner, pre-spawn and post-exit callbacks | PRESENT | PRESENT (5a/5b/9a/9b, M05a, M05b). **Repair 1 (W1):** the callbacks also recheck the pinned source repository root (9a/9b worktree rows, M09-root) |
+| §4.1 | every Git child through the 2B2a runner, pre-spawn and post-exit callbacks | PRESENT | PRESENT (5a/5b/9a/9b, M05a, M05b). **Repair 1 (W1):** the callbacks also recheck the pinned source repository root (9a/9b worktree rows, M09-root). **Repair 2 (W1-stale):** the capability is also rechecked immediately before the first scratch write (9 pre-write rows, M09-prewrite) |
 | §4.1 | `work/source-git/` created by `InitBare`, no source config written | PRESENT | PRESENT (30, M30) |
 | §4.2 | `cat-file --batch-check` presence/kind proof | PRESENT | PRESENT (30) |
 | §4.2 | one `pack-objects --stdout` run into one create-new `work/objects.pack`, synced, recorded | PRESENT | PRESENT (34, M34) |
@@ -117,7 +125,7 @@ is absent; `FIXED`/`ADDED` landed this turn, with the named control and mutation
 | 5a / 5b | MISSING | `control_05a_pre_spawn_callback_refuses_alternate_drift` / `control_05b_post_exit_callback_refuses_alternate_drift` | M05a / M05b |
 | 6 | MISSING | `control_06_inventory_equality_refuses_an_extra_packed_object` | M06 |
 | 7 | MISSING | `control_07_strict_indexing_refuses_a_truncated_or_corrupt_staged_pack`, plus `step_1_refuses_a_staged_pack_that_grew_past_its_recorded_length` | M07, M07b |
-| 9a / 9b | MISSING | `control_09a_pre_spawn_callback_refuses_a_swapped_source` / `control_09b_post_exit_callback_refuses_a_swapped_source` (3 rows each; repair 1 adds the worktree-root row) | M05a / M05b; M09-root |
+| 9a / 9b | MISSING | `control_09a_pre_spawn_callback_refuses_a_swapped_source` / `control_09b_post_exit_callback_refuses_a_swapped_source` (3 rows each; repair 1 adds the worktree-root row); repair 2 adds `control_09_pre_write_recheck_refuses_a_source_drifted_before_the_export` (5 rows) | M05a / M05b; M09-root; M09-prewrite |
 | 10 | MISSING | `control_10a_…symlink_at_the_reserved_name`, `control_10b_…retargeted_capsule_directory`, `control_10c_a_case_fold_alias_is_refused_or_left_untouched`, `control_10d_…pre_planted_component_symlink` | M10a, M10b, M10d (10c: §7) |
 | 11 | MISSING | 16 `control_11_*` tests (13 at turn 3, where this row said 14): budget ceilings, plaintext budget, sink chunk bytes / chunk count / per-artifact, ledger, Git-child reservations, post-exit re-measure (unit and read-only child), alternates bound, end-to-end scratch budget against an independent census (repair 1), logical bound apart from allowances (repair 1), artifact count, canonical preflight before derive, and the `verify-pack` bound, unit and exact edge (repair 1) | M11a–M11m; M11n–M11r |
 | 12 | MISSING | `control_12_every_pre_commit_fault_leaves_no_seal` (31 fault sides + 6 chunk samples) | M12 |
@@ -130,7 +138,7 @@ is absent; `FIXED`/`ADDED` landed this turn, with the named control and mutation
 | 18 | MISSING | `control_18_capability_binding_refuses_before_any_write` (6 rows) | M18-unit/-run/-materialization/-generation/-inventory/-format |
 | 19 | MISSING | `control_19_the_capability_refuses_a_stream_replayed_under_another_role` | M19 |
 | 20a / 20b | MISSING | `control_20a_…strict_object_check` / `control_20b_…when_step_1_is_bypassed` | M20a / M20b |
-| 21 | MISSING | `control_21_disjointness_preflight_refuses_every_overlap_before_any_write` (9 relations; repair 1 adds 3 non-bare worktree relations) | M21; M21-root |
+| 21 | MISSING | `control_21_disjointness_preflight_refuses_every_overlap_before_any_write` (9 relations; repair 1 adds 3 non-bare worktree relations); repair 2 adds `control_21_a_renamed_worktree_is_refused_by_its_retained_identity_before_any_write` | M21; M21-root; M21-retained |
 | 24a | PRESENT (untested by mutation) | doctest on `custody_capsule::CustodyCapsuleLayoutV1` | M24a |
 | 24b | PRESENT (untested by mutation) | doctest on `custody_capsule::CustodyEnvelopeSealerV1` | M24b |
 | 24c | PRESENT at base | doctest on `custody_capsule::CustodyEnvelopeSealReceiptV1` | M24c |
@@ -200,24 +208,24 @@ doctests.
 ## 4. Verification totals
 
 Turn 3's results were on its final bytes, after mutation round 2 had restored and verified them. The rows that
-repair round 1 re-ran show its figures, taken on the repaired bytes after its matrix run had restored and verified
-them. Each earlier figure is kept in parentheses; the rest are turn 3's.
+repair round 2 re-ran show its figures, taken on the round-2 bytes after its matrix run had restored and verified
+them (§12.4). Each earlier figure is kept in parentheses; the rest are turn 3's.
 
 | Command | Result |
 |---|---|
-| `cargo fmt --all -- --check` | clean (repair 1: clean) |
-| `cargo clippy --locked --offline -p bridge-core --all-targets -- -D warnings` | clean (repair 1: clean) |
-| `cargo clippy --locked --offline --workspace --all-targets -- -D warnings` | clean (turn 3; not re-run in repair 1) |
+| `cargo fmt --all -- --check` | clean (repair 1 and repair 2: clean) |
+| `cargo clippy --locked --offline -p bridge-core --all-targets -- -D warnings` | clean (repair 1 and repair 2: clean) |
+| `cargo clippy --locked --offline --workspace --all-targets -- -D warnings` | clean (turn 3; not re-run in either repair round) |
 | `git diff --check` / `git diff --cached --check` | clean (see §8) |
-| `cargo test --locked --offline -p bridge-core --lib custody_export` | **60 passed**, 0 failed (turn 3: 54) |
+| `cargo test --locked --offline -p bridge-core --lib custody_export` | **62 passed**, 0 failed (repair 1: 60; turn 3: 54) |
 | `cargo test --locked --offline -p bridge-core --doc` | **9 passed**, 0 failed (unfiltered; 7 compile-fail in `custody_capsule`, 2 elsewhere) |
 | `cargo test --locked --offline -p bridge-core --lib custody_seal` | **4 passed** |
 | `cargo test --locked --offline -p bridge-core --lib custody_capsule` | **10 passed** |
 | `cargo test --locked --offline -p bridge-core --test custody_capsule` | **18 passed** |
-| `cargo test --locked --offline -p bridge-core --lib` | **830 passed** (turn 3: 824); see §11.4 for a pre-existing intermittent 2B2a fixture failure |
-| `cargo test --locked --offline -p bridge-core` | 17 targets, **968 passed**, 0 failed, 0 ignored (turn 3: 962) |
-| `cargo test --locked --offline --workspace --all-targets --no-fail-fast` (proxy variables unset, §6) | 90 targets, **4564 passed**, 0 failed, 13 ignored (turn 3: 4558) |
-| `cargo test --locked --offline --workspace --no-fail-fast` (proxy variables unset, §6) | 106 targets, **4574 passed**, 0 failed, 13 ignored (turn 3: 4568) |
+| `cargo test --locked --offline -p bridge-core --lib` | **832 passed** (repair 1: 830; turn 3: 824); see §11.4 for a pre-existing intermittent 2B2a fixture failure |
+| `cargo test --locked --offline -p bridge-core` | 17 targets, **970 passed**, 0 failed, 0 ignored (repair 1: 968; turn 3: 962) |
+| `cargo test --locked --offline --workspace --all-targets --no-fail-fast` (proxy variables unset, §6) | 90 targets, **4566 passed**, 0 failed, 13 ignored (repair 1: 4564; turn 3: 4558) |
+| `cargo test --locked --offline --workspace --no-fail-fast` (proxy variables unset, §6) | 106 targets, **4576 passed**, 0 failed, 13 ignored (repair 1: 4574; turn 3: 4568) |
 | the two workspace commands **with** the container's proxy variables set | 8 `a2a-bridge` failures and a `bridge-api` lib hang, all reproduced on the exact predecessor (§6) |
 | `cargo deny check` | **not run**: `cargo-deny` is not installed in the container (`no such command: deny`) — an unrunnable gate, not green |
 | `cargo run --locked --offline -p a2a-bridge -- validate --repo-hygiene` | `repository hygiene validated` |
@@ -226,8 +234,9 @@ them. Each earlier figure is kept in parentheses; the rest are turn 3's.
 
 ## 5. Mutation matrix
 
-This section is the turn-3 record: 66 rows, and the turn-3 snapshot. Repair round 1 adds 7 rows, so 73 are now
-defined, re-snapshots the repaired bytes, and re-runs 24 rows; see §11.3.
+This section is the turn-3 record: 66 rows, and the turn-3 snapshot. Repair round 1 adds 7 rows (73 defined),
+re-snapshots the repaired bytes, and re-runs 24 rows; see §11.3. Repair round 2 adds 2 rows (75 defined),
+re-snapshots its bytes, and re-runs 13 rows; see §12.3.
 
 **Harness:** `.git/a2a-bridge/mutation/matrix.py` (untracked; survives the container). Log `matrix.log`, per-mutation
 records `results.jsonl`, raw cargo output `output-<id>.txt`, pre-matrix `baseline.txt`, snapshot
@@ -379,8 +388,8 @@ asserts its own typed refusal, and the mutation removes exactly that guard.
    crate-private and production-unreachable.
 2. **`cargo deny check`:** unrunnable. `cargo-deny` is not installed in the image, so this gate is not green here. No
    dependency, feature, or `Cargo.lock` change was made (`git status` shows no `Cargo.*` change).
-3. **Host macOS lane:** **not executed here**; the controller runs it. It is the only lane that exercises control
-   10c's refusal arm (a case-insensitive filesystem).
+3. **Host macOS lane:** **not executed in this container**. The controller ran it on the turn-3 tree (§10). It is
+   the only lane that exercises control 10c's refusal arm (a case-insensitive filesystem).
 4. **Native Linux ext4 lane (GitHub Actions ubuntu):** **not executed here**. This lane is OrbStack **overlayfs**,
    which §9 says does not substitute for the native identity-drift control. Controls 5a/5b/9a/9b/10b ran and flipped
    on overlayfs, and still require the native ext4 run. 2B2a's `#[cfg(test)]` ext4 classifier was not invoked here.
@@ -416,9 +425,19 @@ makes no confidentiality claim, and `work/` holds plaintext only because 2B2 mak
   always carries the orphan blob.
 - **Control 10c** (case-fold alias) discriminates only on a case-insensitive filesystem. Here it asserts only that the
   alias is neither followed nor replaced. There is no mutation for it on this lane.
-- **Control 21** refuses every relation through the canonical-path comparison. The directory-identity layer, added in
-  both directions this turn, is reachable only through an alias that canonicalization cannot see, such as a bind
-  mount. It is therefore not independently discriminated. M21 disables the whole preflight.
+- **Control 21's** nine relation rows are all refused through the canonical-path comparison. The directory-identity
+  layer compares in two directions, updated in repair round 2 (§12):
+  - The forward comparison checks scratch ancestors against each pinned descriptor's retained identity. It is
+    independently discriminated by the stale-pin row: no path comparison can see that the scratch root lies inside a
+    renamed worktree (M21-retained).
+  - The reverse comparison checks the ancestors of each pinned path against the scratch root. It is reachable only
+    through an alias that canonicalization cannot see, such as a bind mount, so it is not independently
+    discriminated. It walks a pinned path, because `fs_custody` offers no `..` walk from a retained descriptor. A
+    stale path cannot lead it to admit a write: the recheck immediately before the first scratch write refuses a path
+    that no longer resolves to its descriptor (M09-prewrite), and an empty scratch root cannot contain a pinned
+    directory.
+
+  M21 disables the whole preflight.
 - **Controls 5b and 9b** place their "during the child" drift inside the pre-spawn callback with the pre-spawn check
   bypassed, so it is in place for the child's whole lifetime. 2B2a exposes no mid-child hook to the exporter.
 - **Control 14b** and control 13's `ParentSyncAmbiguous` row use a `#[cfg(test)]` publication-outcome override:
@@ -441,8 +460,8 @@ makes no confidentiality claim, and `work/` holds plaintext only because 2B2 mak
 ## 8. Owned paths and staged changes
 
 Only task §8 owned paths changed. No `Cargo.lock`, dependency, feature, CLI, config, store, runtime, container, operator,
-or 2B3 path is touched. The mutation harness and its artifacts live under `.git/` and are not part of the diff. Staged
-at the end of turn 3:
+or 2B3 path is touched. The mutation harness and its artifacts live under `.git/` and are not part of the diff. Turn 3
+changed these paths, committed as `87570241`:
 
 ```text
 crates/bridge-core/src/custody_capsule.rs           (modified)
@@ -454,19 +473,29 @@ crates/bridge-core/tests/custody_capsule.rs         (modified)
 docs/superpowers/reviews/2026-09-25-adr0041-slice2b2-implementation-handoff.md (new)
 ```
 
-The exact `git diff --cached --stat` and `git diff --cached --check` results are reported in the turn's final message.
-Nothing is committed.
+Turn 3's exact `git diff --cached --stat` and `git diff --cached --check` results were reported in that turn's final
+message.
 
-Repair round 1 stages only `crates/bridge-core/src/custody_export.rs`, `crates/bridge-core/src/custody_export_tests.rs`,
-and this handoff (§11.5). Nothing is committed.
+Repair round 1 changed only `crates/bridge-core/src/custody_export.rs`, `crates/bridge-core/src/custody_export_tests.rs`,
+and this handoff (§11.5), committed as `7842f620`. Repair round 2 changes the same three paths (§12.5), and lands in
+the commit that contains §12.
 
 ## 9. What remains for the controller
 
-1. Run the macOS host lane: the §9 gate list, plus control 10c's refusal arm on APFS. Record the Git version
-   (Apple Git) and the admitted route.
-2. Run the native Linux ext4 lane (GitHub Actions ubuntu) for the identity-drift controls.
-3. Run `cargo deny check` where `cargo-deny` is installed.
-4. Commit, then open the implementation review under the two-admitted-round cap (§9).
+**Committed:**
+- the implementation, `87570241`;
+- the `#[cfg(unix)]` accessor gates, `91d0bf13`;
+- repair round 1, `7842f620`.
+
+Repair round 2 (§12) lands in the commit that contains that section.
+
+**Done:** the macOS host lane (§10), run by the controller on the turn-3 tree: the §9 gate list, control 10c's
+refusal arm on APFS, the Git version, and the admitted route.
+
+**Remaining gates:**
+1. The native Linux ext4 lane (GitHub Actions ubuntu CI on the PR), for the identity-drift controls.
+2. `cargo deny check`, in CI, where `cargo-deny` is installed.
+3. The next implementation review round, under the §9 two-admitted-round cap.
 
 ## 10. Controller macOS host lane (2026-09-26)
 
@@ -709,5 +738,171 @@ crates/bridge-core/src/custody_export_tests.rs      (modified)
 docs/superpowers/reviews/2026-09-25-adr0041-slice2b2-implementation-handoff.md (modified)
 ```
 
-Nothing is committed. The two SMELLs remain DEFERRED (§7). What remains for the controller is unchanged from §9 and
-§10: the macOS host lane, the native Linux ext4 lane, and `cargo deny` in CI.
+Repair round 1 is committed as `7842f620`. Its two SMELLs remained DEFERRED (§7). What remains for the controller is
+listed in §9.
+
+## 12. Repair round 2 — Sol implementation review round 2 (2026-09-26)
+
+**Review:** Sol implementation review round 2 of `7842f620`. It resolved W2 and W3 and left two items, which the
+controller verified:
+- W1-stale, WRONG · MATERIAL · BLOCKER: repaired;
+- the handoff's commit status, WRONG · IMMATERIAL: rewritten.
+
+The SMELL on control 5b/9b timing stays DEFERRED (§7) and was not worked.
+
+**Base and scope:** HEAD `7842f620`, clean working tree. Only `custody_export.rs`, `custody_export_tests.rs`, and this
+handoff changed. `custody_git.rs` and `fs_custody.rs` equal `HEAD` (`git diff --quiet HEAD --`), with the §5 SHA-256
+values. The task is still revision 11, SHA-256 `b9f1215a…d814e9`.
+
+**Method: RED first.** Both controls in §12.2 were written and run while `custody_export.rs` was still byte-equal to
+`7842f620` (SHA-256 `0d47d8db…58bb09`). Raw outputs are in `.git/a2a-bridge/mutation/`:
+- RED: `repair2-red.txt`. `cargo test -p bridge-core --lib custody_export` selected 62 tests: **60 passed, 2 failed**,
+  exactly the two new controls.
+- GREEN: `repair2-green.txt`, **62 passed**, on the final bytes.
+
+Between RED and GREEN the test file changed only by `use std::path::PathBuf;`. The repaired exporter no longer imports
+`PathBuf`, which the tests had reached through `use super::*`.
+
+### 12.1 Findings, RED evidence, and fixes
+
+**W1-stale: a scratch root inside a renamed, descriptor-pinned worktree was admitted and written into.**
+`protected_paths()` kept only canonical path strings. `refuse_source_overlap` then derived each protected identity by
+reopening that path. The review's sequence: mint the capability, rename the worktree, and create a replacement at its
+old path. The reopened identity is then the replacement's, so no scratch ancestor matched it. The exporter created
+`capsule/`, `work/`, `work/home/`, and `work/xdg/` inside the source. Only then did the first Git pre-spawn callback
+refuse with `IdentityDrift`.
+
+- **RED, the review's regression:** `control_21_a_renamed_worktree_is_refused_by_its_retained_identity_before_any_write`
+  failed on `7842f620`. Verbatim, with the identity dump elided:
+  - `… was not refused by the preflight before any write: refused with IdentityDrift("pinned scan root …/wt now resolves to a different directory …"); worktree entries created: ["custody/capsule/", "custody/work/", "custody/work/home/", "custody/work/xdg/"]`
+  - The scratch root is a fresh, empty, owner-private `custody/`, so the production preflight runs with no bypass.
+  - The snapshot records entries as well as bytes (`snapshot_entries`). The writes that land before the callback are
+    empty directories, which the file-only `snapshot_tree` cannot see.
+- **RED, the pre-write recheck:** `control_09_pre_write_recheck_refuses_a_source_drifted_before_the_export` failed on
+  `7842f620` in all five rows, each with `scratch entries written: ["capsule/", "work/", "work/home/", "work/xdg/"]`:
+  - `RewriteAlternatesToUnboundStore: refused with IdentityDrift("the alternates file of …/src.git/objects changed content")`;
+  - `RetargetPinnedAlternate`, `SwapPrimaryObjectStore`, `SwapSourceGitDirectory`, and `SwapSourceWorktreeRoot`:
+    `refused with IdentityDrift("pinned scan root … now resolves to a different directory …")`.
+- **Fix, part 1: retained identities.**
+  - `protected_paths()` becomes `protected_directories()`. It returns the pinned descriptors themselves
+    (`&PinnedDirectoryV1`): the repository root, the git directory, the primary store's pin, and each alternate's pin.
+  - `refuse_source_overlap` compares every scratch ancestor with the `(dev, ino)` of each descriptor's `identity()`.
+    That identity is the `fstat` of the descriptor retained at mint. No protected identity is re-derived from a path.
+  - A descriptor with no dev/ino refuses as a typed `ScratchPreflight`.
+  - The canonical-path comparison and the reverse walk are unchanged.
+  - Whatever a pinned path names now, the forward comparison checks the directory the capability pinned. That closes
+    the path-staleness class for this comparison, not just the rename instance.
+- **Fix, part 2: a recheck before the first scratch write.** `export_capsule_v1` calls `capability.recheck()` right
+  after the preflight, before the ledger exists and before `capsule/` is created. A pinned path that no longer resolves
+  to its descriptor refuses with `IdentityDrift` before the exporter writes anything. That covers a renamed or
+  retargeted path and a rewritten alternates file, and it includes the paths the reverse walk used.
+- **Why the reverse walk stays path-based:** `fs_custody`, read-only under §8, offers no `..` walk from a retained
+  descriptor. The walk only has to be right when a write follows. A stale path is refused by the pre-write recheck,
+  and an empty scratch root cannot contain a pinned directory (§7).
+- **GREEN:**
+  - The regression refuses with `ScratchPreflight`. The renamed worktree and the git directory are unchanged, byte for
+    byte and entry for entry.
+  - Each pre-write row refuses with `IdentityDrift` and leaves the scratch root empty.
+  - The nine control-21 relation rows and controls 5a, 5b, 9a, and 9b are unchanged.
+- **Mutations:** M21-retained and M09-prewrite (§12.3).
+
+**Handoff status: the committed handoff reported pre-commit state as current.** RED
+(`repair2-handoff-red.txt`, grepped from the text committed in `7842f620`; the literal phrases are recorded there
+and not repeated here, so a phrase lint over this file stays meaningful):
+- lines 3 and 11 called the work staged but uncommitted;
+- lines 458, 461, and 712 said that no commit existed;
+- lines 465 and 713 listed the completed macOS lane as remaining work, and line 469 listed the commit itself.
+
+- **Fix:** the status paragraphs, §6.3, §8, §9, and §11.5 now describe committed state. Each names the commit that
+  holds its round (`87570241`, `91d0bf13`, `7842f620`). §9 lists only the gates that remain. Repair round 2 is
+  described as landing in the commit that contains this section, so the text stays true once that commit exists.
+- **GREEN:** the same grep finds no match in this handoff. The lint the review proposes would live outside the §8
+  owned paths, so it is not added here.
+- **Mutation:** none. This is a text fix with no code guard.
+
+### 12.2 Controls added or changed
+
+| Control | Test | Kind |
+|---|---|---|
+| 21 | `control_21_a_renamed_worktree_is_refused_by_its_retained_identity_before_any_write` (new): the review's regression | discriminating (M21-retained; M21 and M21-root also turn it red) |
+| 9 (pre-write) | `control_09_pre_write_recheck_refuses_a_source_drifted_before_the_export` (new): the five control-5/9 drifts, applied between mint and export | discriminating (M09-prewrite) |
+| fixture | `snapshot_entries` (new) records directories beside file bytes; `DriftTargetsV1::of` replaces the inline construction in `assert_callback_refuses_drift` | plumbing |
+
+### 12.3 Mutation matrix, repair round 2
+
+**Harness changes:**
+- M21's and M21-root's targets follow the renamed `protected_directories()`. M21 still disables the loop with
+  `.take(0)`, and M21-root still drops the repository root from the protected set.
+- Two rows are added.
+
+75 rows are defined, and `matrix.py check` finds every target unique. Round 1's results are kept as
+`results.repair1.jsonl`.
+
+**Snapshot of the round-2 bytes.** These hashes equal the staged bytes.
+
+| File | SHA-256 |
+|---|---|
+| `crates/bridge-core/src/custody_export.rs` | `3987f39d68b21b8da0ef8c2207f937cb3bdfb420db58eac052e46ffaad2ee988` |
+| `crates/bridge-core/src/custody_export_tests.rs` | `47d66a1256a3303b6de0fb323b2af651082d47a66c9940ae7e2a6d933c21f934` |
+| the other six snapshot files | unchanged from §11.3 |
+
+**Run:** one foreground `timeout 590` call, with an internal budget of 450 s and a 240 s cap on each cargo run, from
+07:58:47Z to 07:59:43Z. No background job was started. It covered 13 rows:
+- the 2 new rows;
+- the 5 affected rows:
+  - M21 and M21-root, whose targets were retargeted;
+  - M05a, M05b, and M09-root, whose controls use the refactored drift fixture, and whose guard, `recheck()`, the new
+    pre-write guard calls;
+- the 6 rows whose targets lie in the changed `export_capsule_v1`: M11j, M11l, M12, M30, M31, and M-version.
+
+**13 of 13 FLIPPED, 0 INADMISSIBLE.**
+
+Each mutation was restored byte-exactly with a fresh mtime. `matrix.py verify` then reported
+`VERIFY OK: 8 files equal their snapshot`, an independent re-hash of all eight files against `snapshot/manifest.json`
+agreed, and no `pending.json` exists. The other 62 rows were not re-run. Their targets lie outside the changed
+functions and fixtures, and their last verdict is FLIPPED (§5, §11.3).
+
+| ID | Guard mutated | Red | Named green | Outcome under mutation |
+|---|---|---|---|---|
+| M21-retained | the protected identity re-derived from the pinned path (`identity(path)`), not taken from the descriptor | 21 stale-pin row | 21 relation rows, 9 pre-write | refused one layer later: the pre-write recheck returns `IdentityDrift`, not `ScratchPreflight`, and no worktree entry is created (layered, below) |
+| M09-prewrite | the pre-write `capability.recheck()` deleted | 9 pre-write (all five rows) | 21 stale-pin row, 21 relation rows, 9a, 9b | every row writes `capsule/`, `work/`, `work/home/`, and `work/xdg/` into the scratch root before the first Git callback refuses |
+
+- **M21 and M21-root** now also turn the stale-pin row red. With the preflight disabled, or with the repository root
+  unprotected, the pre-write recheck refuses that row as `IdentityDrift`. Their relation rows show the same wrong
+  successes as in §11.3.
+- **M09-root**'s named greens now include the stale-pin row, which the retained-identity preflight still refuses.
+- Every other re-run row flips exactly as in §5 and §11.3.
+
+**Layered guard.** M21-retained flips by refusal type, like M07 and M20a (§5). The pre-write recheck is a second
+layer that stops a stale capability before any write, so once the retained-identity comparison is removed, a wrong
+write is unreachable in this scenario. The control therefore requires the §2 preflight's own `ScratchPreflight`
+refusal. The RED on `7842f620`, which had neither layer, shows the write that each layer prevents.
+
+### 12.4 Gates on the round-2 bytes
+
+All were run with `CARGO_HOME=/cargo CARGO_NET_OFFLINE=true CARGO_TARGET_DIR=/tmp/target`, after the matrix had
+restored and verified the sources.
+
+| Gate | Result |
+|---|---|
+| `cargo fmt --all -- --check` | clean |
+| `cargo clippy --locked --offline -p bridge-core --all-targets -- -D warnings` | clean |
+| `cargo test --locked --offline -p bridge-core --lib custody_export` | 62 passed, 0 failed |
+| `cargo test --locked --offline -p bridge-core --lib` | 832 passed, 0 failed, on the first run |
+| `cargo test --locked --offline -p bridge-core --doc` | 9 passed, 0 failed |
+| `cargo test --locked --offline -p bridge-core` | 17 targets, 970 passed, 0 failed |
+| `cargo test --locked --offline --workspace --no-fail-fast`, proxy variables unset (§6) | exit 0; 106 targets, **4576 passed**, 0 failed, 13 ignored |
+| `cargo test --locked --offline --workspace --all-targets --no-fail-fast`, proxy variables unset | exit 0; 90 targets, **4566 passed**, 0 failed, 13 ignored |
+
+The §11.4 intermittent 2B2a `ETXTBSY` failure did not recur in these runs.
+
+### 12.5 Changed paths (repair round 2)
+
+```text
+crates/bridge-core/src/custody_export.rs            (modified)
+crates/bridge-core/src/custody_export_tests.rs      (modified)
+docs/superpowers/reviews/2026-09-25-adr0041-slice2b2-implementation-handoff.md (modified)
+```
+
+The exact `git diff --cached --stat` and `git diff --cached --check` results are reported in the turn's final message.
+The remaining gates are listed in §9.

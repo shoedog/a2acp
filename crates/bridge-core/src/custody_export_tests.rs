@@ -17,6 +17,7 @@ use crate::custody_inventory::CustodyStateClassV1;
 use crate::custody_seal::{CustodyCoverageEntryV1, CustodyOriginalObjectV1};
 use crate::fs_custody::PublicationRenameFaultV1;
 use std::cell::Cell;
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
@@ -501,6 +502,32 @@ fn snapshot_tree(root: &Path) -> BTreeMap<String, Vec<u8>> {
                     relative,
                     std::fs::read(entry.path()).expect("fixture file is readable"),
                 );
+            }
+        }
+    }
+    snapshot
+}
+
+/// `snapshot_tree` plus every directory beneath `root`, each keyed with a trailing `/`: the
+/// byte-and-entry snapshot, which an effect that creates only empty directories still changes.
+fn snapshot_entries(root: &Path) -> BTreeMap<String, Vec<u8>> {
+    let mut snapshot = snapshot_tree(root);
+    let mut frontier = vec![root.to_path_buf()];
+    while let Some(path) = frontier.pop() {
+        let Ok(entries) = std::fs::read_dir(&path) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let metadata = std::fs::symlink_metadata(entry.path()).expect("fixture metadata");
+            if metadata.is_dir() {
+                let relative = entry
+                    .path()
+                    .strip_prefix(root)
+                    .expect("an entry beneath the snapshot root")
+                    .to_string_lossy()
+                    .into_owned();
+                snapshot.insert(format!("{relative}/"), Vec::new());
+                frontier.push(entry.path());
             }
         }
     }
@@ -1465,18 +1492,24 @@ struct DriftTargetsV1 {
     alternate: Option<PathBuf>,
 }
 
+impl DriftTargetsV1 {
+    fn of(harness: &HarnessV1) -> Self {
+        Self {
+            root: harness.root.clone(),
+            repository: harness.source.repository.clone(),
+            git_dir: harness.source.git_dir.clone(),
+            objects: harness.source.objects.clone(),
+            alternate: harness.source.alternate.clone(),
+        }
+    }
+}
+
 /// Run one drift row with one callback isolated, and require typed identity drift with no pack
 /// produced: the refusal lands before any source-reading child, so no store — bound or unbound —
 /// contributed an object.
 fn assert_callback_refuses_drift(drift: SourceDriftV1, bypass: ExportBypassV1) {
     let harness = drift.harness();
-    let targets = DriftTargetsV1 {
-        root: harness.root.clone(),
-        repository: harness.source.repository.clone(),
-        git_dir: harness.source.git_dir.clone(),
-        objects: harness.source.objects.clone(),
-        alternate: harness.source.alternate.clone(),
-    };
+    let targets = DriftTargetsV1::of(&harness);
     let _hook = install_export_hook_for_test(
         ExportHookPointV1::PreSpawnCallback,
         on_nth_call(1, move |_| drift.apply(&targets)),
@@ -1571,6 +1604,43 @@ fn control_09b_post_exit_callback_refuses_a_swapped_source() {
     ] {
         assert_callback_refuses_drift(drift, POST_EXIT_ONLY_V1);
     }
+}
+
+/// Control 9, pre-write rows: every control-5 and control-9 drift lands after the capability is
+/// minted and before the export starts, so the capability is already stale when the exporter is
+/// entered. The scratch root lies outside the source, so the §2 preflight passes. The capability
+/// recheck immediately before the first scratch write must refuse with typed identity drift and
+/// leave the scratch root empty. Without it the exporter creates `capsule/` and `work/` on a
+/// stale capability and refuses only at the first Git callback. Every row is evaluated, and
+/// every failing row is reported.
+#[test]
+fn control_09_pre_write_recheck_refuses_a_source_drifted_before_the_export() {
+    let mut failures = Vec::new();
+    for drift in [
+        SourceDriftV1::RewriteAlternatesToUnboundStore,
+        SourceDriftV1::RetargetPinnedAlternate,
+        SourceDriftV1::SwapPrimaryObjectStore,
+        SourceDriftV1::SwapSourceGitDirectory,
+        SourceDriftV1::SwapSourceWorktreeRoot,
+    ] {
+        let harness = drift.harness();
+        let capability = harness.capability();
+        drift.apply(&DriftTargetsV1::of(&harness));
+
+        let result = harness.run_with(&FixtureSealerV1::honest(), capability);
+        let written: Vec<String> = snapshot_entries(&harness.scratch).into_keys().collect();
+        if !matches!(result, Err(CustodyExportErrorV1::IdentityDrift(_))) || !written.is_empty() {
+            failures.push(format!(
+                "{drift:?}: {}; scratch entries written: {written:?}",
+                describe_run(&result)
+            ));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "a capability stale at entry was not refused before the first scratch write:\n{}",
+        failures.join("\n")
+    );
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -2781,6 +2851,49 @@ fn control_21_disjointness_preflight_refuses_every_overlap_before_any_write() {
         failures.is_empty(),
         "overlapping scratch roots were not refused before any write:\n{}",
         failures.join("\n")
+    );
+}
+
+/// Control 21, stale-pin row: the capability is minted for a `--separate-git-dir` worktree, which
+/// is then renamed, and a replacement directory is created at its old path. The scratch root is
+/// a fresh, empty, owner-private `custody/` inside the renamed worktree. The pinned path now
+/// names the replacement, but the retained descriptor still names the worktree the scratch root
+/// lies inside. The §2 preflight must compare against that retained identity and refuse before
+/// any write. The renamed worktree and the git directory stay unchanged, byte for byte and entry
+/// for entry.
+#[test]
+fn control_21_a_renamed_worktree_is_refused_by_its_retained_identity_before_any_write() {
+    let mut harness = HarnessV1::with_source(|root| {
+        SourceFixtureV1::build_non_bare(&root.join("wt"), &root.join("wt.git"))
+    });
+    let capability = harness.capability();
+    let renamed = harness.root.join("wt.renamed");
+    std::fs::rename(&harness.source.repository, &renamed)
+        .expect("the worktree is renamed after minting");
+    std::fs::create_dir(&harness.source.repository).expect("a replacement at the old path");
+    harness.scratch = renamed.join("custody");
+    std::fs::create_dir(&harness.scratch).expect("a scratch root inside the renamed worktree");
+    set_owner_private(&harness.scratch);
+    let worktree = snapshot_entries(&renamed);
+    let git_dir = snapshot_entries(&harness.source.git_dir);
+
+    let result = harness.run_with(&FixtureSealerV1::honest(), capability);
+
+    let after = snapshot_entries(&renamed);
+    let created: Vec<&String> = after
+        .keys()
+        .filter(|key| !worktree.contains_key(*key))
+        .collect();
+    assert!(
+        matches!(result, Err(CustodyExportErrorV1::ScratchPreflight(_))) && after == worktree,
+        "a scratch root inside the renamed, descriptor-pinned worktree was not refused by the \
+         preflight before any write: {}; worktree entries created: {created:?}",
+        describe_run(&result)
+    );
+    assert_eq!(
+        snapshot_entries(&harness.source.git_dir),
+        git_dir,
+        "the export changed the source git directory"
     );
 }
 
