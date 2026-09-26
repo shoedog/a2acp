@@ -1,8 +1,9 @@
 # Bridge reliability execution and handoff roadmap
 
 - **Program status:** active P0
-- **Current main lineage:** `origin/main` is `f16ca4749b8ac2cbf8c6b059270d446c881bff6d`, which merged docs
-  PR #112 after ADR-0041 Slice 2B2 merged in PR #111 at `90d3a208`. Its ancestry includes the provider refresh
+- **Current main lineage:** `origin/main` is `b8d2686d1cf15a41600099efbfbc50b63787d6c1`, which merged ADR-0041 Slice
+  2B2b1 in PR #114, after the 2B2b1 spec (PR #113 at `f3a4c0a8`), docs PR #112 (`f16ca474`), and Slice 2B2 (PR
+  #111 at `90d3a208`). Its ancestry includes the provider refresh
   (PR #110), Slice 2B2a (PR #106 at `67f414e7`), and Slice 2B1 (PR #105 at `5e431f4f`), plus PR #104 at `27a885f6d4af6a517c2a8899aa5bfe36605b8fb7`, which merged
   Slices 1A, 1B, and 2A with reviewed/published head `65a572df40f07316124a70b7ec353a2d38dd334d`, plus
   ADR-0041 custody-lifecycle documentation PR #103, R2f1b 5B PR #102
@@ -14,7 +15,10 @@
   `6338bc1628fed52b772026b604a1bbdd710efa8c`; the final Sol/xhigh rereview recorded 0 WRONG and 3 SMELL,
   with full verification at 4,408 passed / 0 failed / 13 ignored / 726 filtered. The candidate remains
   production-unwired; its historical handoff's pre-publication stop is superseded by the recorded PR #102 merge.
-- **Active slice:** **ADR-0041 Slice 2B2b1 (pure coverage-payload frame) — spec review.** The owner split 2B2b into 2B2b1 (frame) and 2B2b2 (walker, class selection, and exporter streaming) on 2026-09-26; the 2B2b1 task is `docs/superpowers/plans/2026-09-26-adr0041-slice2b2b1-coverage-frame-task.md`. Slice 2B2 (isolated local
+- **Active slice:** **ADR-0041 Slice 2B2b2 (walker, class selection, and exporter streaming) — spec drafting is next.**
+  Slice 2B2b1 (the pure coverage-payload frame) **merged in PR #114 at `b8d2686d`** on 2026-09-26: Opus 5.5 over one
+  implementation turn plus a finalizing continuation, 68/68 mutation rows flipped, and the Sol implementation review
+  approved at round 1. The spec was merged in PR #113. The owner split 2B2b into 2B2b1 and 2B2b2 on 2026-09-26.
   export and Git-object closure) **merged in PR #111 at `90d3a208`** on 2026-09-26, with all CI jobs green,
   including native ext4 and Windows. Slice 2B2a merged earlier in PR #106 at `67f414e7`.
   - **2B2 history:**
@@ -1041,6 +1045,17 @@ Accepted as deferred by the 2B2 implementation review (round 3 `APPROVE`; the ra
   - **Container proxy environment:** with `HTTP_PROXY`/`HTTPS_PROXY` set, 8 `a2a-bridge` tests fail and the
     `bridge-api` lib tests hang, because local HTTP mocks go through `reqwest`'s proxy. This reproduces on base
     `742e0a60`. Run the workspace suite with the proxy variables unset, or set `NO_PROXY` for loopback.
+
+### ADR-0041 2B2b1 deferred follow-ups (ledger, 2026-09-26)
+
+- **`M-io-read` probe-boundary coverage (SMELL, MATERIAL, DEFER).** No control builds a reader that fails exactly at
+  the final one-byte length probe. The implementor self-reported it, and the Sol implementation review deferred it.
+  Detail is in `docs/superpowers/reviews/2026-09-26-adr0041-slice2b2b1-implementation-handoff.md`.
+- **The 2B2a `ETXTBSY` fixture flake now costs CI cycles (recommended small fix).** It failed the coverage job of the
+  first PR #114 run (`custody_git_tests::a8_…`, `Text file busy`); the rerun passed. The mechanism is a fork/exec
+  race: another test thread forks while a freshly written fixture script is still open for writing. **Fix
+  (test-only):** a bounded retry on `ExecutableFileBusy` in the fixture admission paths of `custody_git_tests.rs` and
+  `custody_export_tests.rs`.
 
 ### Provider refresh 2026-09-25 deferred follow-ups (ledger)
 
