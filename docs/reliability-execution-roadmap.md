@@ -1,8 +1,9 @@
 # Bridge reliability execution and handoff roadmap
 
 - **Program status:** active P0
-- **Current main lineage:** `origin/main` is `5e431f4f2dd6f77c66d64fa28dc48054f396edf9`, the merge of ADR-0041
-  Slice 2B1 in PR #105. Its ancestry includes PR #104 at `27a885f6d4af6a517c2a8899aa5bfe36605b8fb7`, which merged
+- **Current main lineage:** `origin/main` is `f16ca4749b8ac2cbf8c6b059270d446c881bff6d`, which merged docs
+  PR #112 after ADR-0041 Slice 2B2 merged in PR #111 at `90d3a208`. Its ancestry includes the provider refresh
+  (PR #110), Slice 2B2a (PR #106 at `67f414e7`), and Slice 2B1 (PR #105 at `5e431f4f`), plus PR #104 at `27a885f6d4af6a517c2a8899aa5bfe36605b8fb7`, which merged
   Slices 1A, 1B, and 2A with reviewed/published head `65a572df40f07316124a70b7ec353a2d38dd334d`, plus
   ADR-0041 custody-lifecycle documentation PR #103, R2f1b 5B PR #102
   (`edcda181ad94daad6ddaf9d3c9d4dd63fd2dce00`), 5A PR #101, 4J PR #100, 4I PR #99,

@@ -3,7 +3,7 @@ task-type: implement
 ---
 # Implement ADR-0041 Slice 2B2b1: the pure coverage-payload frame
 
-**Revision:** 1 (draft for spec review)
+**Revision:** 2 (folds spec review round 1; see §12)
 **Predecessor (merged code base):** `f16ca474` (`main`, after PR #111 / 2B2 at `90d3a208` and docs PR #112)
 **Parent plan:** `docs/superpowers/plans/2026-09-20-adr0041-slice2b-local-capsule-plan.md`, as amended below
 
@@ -28,7 +28,8 @@ The serial order is 2B1 → 2B2a → 2B2 → 2B2b1 → 2B2b2 → 2B3.
 **Goal this child serves:** a coverage payload is a canonical, bounded, self-validating record of a set of
 filesystem entries.
 - Every accepted frame decodes to exactly the entries that were encoded.
-- Identical entry sets always encode to identical bytes.
+- The same class, generation, and canonical entry sequence always encode to identical bytes. A different class or
+  generation always yields different bytes, because the header binds both.
 - Every malformed, truncated, reordered, over-budget, or foreign frame is refused with a typed error, without a
   panic and without allocation sized from an unvalidated length.
 
@@ -116,9 +117,11 @@ The frame never turns a path into a filesystem operation. A path is data.
 
 ### 2.4 Mode policy
 
-- For directories and regular files, `mode` is exactly `st_mode & 0o777` of the captured entry.
-- The encoder refuses any requested mode with setuid, setgid, or sticky bits (`0o7000`) as `UnsupportedMode`.
-  Reachable callers treat that as "park the unit" (ADR-0041 §4: unsupported state parks).
+- For directories and regular files, the caller passes `st_mode & 0o7777`, which is the permission bits **and** the
+  setuid, setgid, and sticky bits. It must not pre-mask to `0o777`, because that would erase the evidence the
+  encoder needs.
+- The encoder refuses any `0o7000` bit as `UnsupportedMode` (reachable callers park the unit, per ADR-0041 §4: an
+  unsupported state parks). Otherwise it encodes exactly the `0o777` bits.
 - The decoder refuses any mode above `0o777`.
 - Symlinks carry no mode field.
 
@@ -178,7 +181,10 @@ v1 ceilings:
 
 New module `crates/bridge-core/src/custody_frame.rs`, declared in `lib.rs` as
 `#[allow(dead_code)] mod custody_frame;` because nothing in production uses it until 2B2b2. It is **not**
-`#[cfg(unix)]`: it is pure, and it must compile and pass its tests on every CI target, including the Windows job.
+`#[cfg(unix)]`: it is pure and must **compile** on every CI target. The CI Windows job builds `bridge-core` as a
+dependency (non-test), so it proves compilation only. The frame's **tests** run on Linux (CI and the container) and
+on macOS (controller lane). Running `bridge-core` tests on Windows is out of scope; custody export and restore are
+unix-only.
 
 - **`CustodyFrameHeaderV1::new(class, generation_id)`** validates the §2.2 class (refusing `object_database`) and the
   generation's length and UTF-8.
@@ -237,10 +243,23 @@ New module `crates/bridge-core/src/custody_frame.rs`, declared in `lib.rs` as
    - non-UTF-8 and backslash component bytes;
    - names differing only in case;
    - `a` / `a/b` / `a.b` ordering.
-2. **Determinism.** Two independent encodes of the same entry sequence produce byte-identical frames and equal
-   summaries. A golden-bytes test pins the exact encoding of a small frame (header, one of each entry type, and the
+2. **Determinism and binding.**
+   - Two independent encodes of the same class, generation, and entry sequence produce byte-identical frames and
+     equal summaries.
+   - Changing only the class, or only the generation, produces different bytes, and the frame is refused by a
+     decoder expecting the original header. A golden-bytes test pins the exact encoding of a small frame (header, one of each entry type, and the
    trailer) as a hex literal, so any format change is a deliberate, visible diff.
+   - The same test asserts every field of each `CustodyFrameFileReceiptV1` and of `CustodyFrameSummaryV1` (entries,
+     content bytes, frame bytes, frame SHA-256) against independently computed expected values. Equality between two
+     encodes is not enough.
+   - The same test also asserts that `frame_sha256` is the SHA-256 of the complete emitted bytes, trailer digest
+     included, and that the trailer digest covers magic through `total`.
 3. **Every refusal in §4 has a dedicated test** that triggers exactly that variant.
+   - **Class codes:** a table-driven test covers all 13 accepted class/code pairs, encoding and decoding each. Codes
+     0, 2, and 15, plus `object_database`, are refused.
+   - **Field boundaries:** min, max, and max+1 are covered for the generation length (1/1024/1025), path length
+     (1/4096/4097), component length (1/255/256), symlink target length (1/4095/4096), and mode (`0o777` accepted;
+     each of `0o1000`, `0o2000`, and `0o4000` refused by the encoder; a value above `0o777` refused by the decoder).
 4. **Truncation sweep.** For a small valid frame containing every entry type, decoding every proper prefix, at every
    byte offset, refuses with `Truncated`. None panics, and none returns `Ok(None)`.
 5. **Flip sweep.** For the same small frame, flipping any single bit of any byte never lets decoding complete: every
@@ -278,6 +297,8 @@ New module `crates/bridge-core/src/custody_frame.rs`, declared in `lib.rs` as
   - digest check off;
   - skip-drain verification off;
   - trailer count, total, or frame-digest check off;
+  - each receipt or summary field computed wrongly (content length, content digest, entries, content bytes, frame
+    bytes, frame SHA-256);
   - trailing-bytes check off;
   - class or generation comparison off;
   - each budget check off;
@@ -299,10 +320,12 @@ Run the parent plan §8 gates that apply to a pure child:
 ```text
 cargo test --locked --offline -p bridge-core --lib custody_frame
 cargo test --locked --offline -p bridge-core
+cargo test --locked --offline --workspace --all-targets --no-fail-fast
 cargo test --locked --offline --workspace --no-fail-fast
-cargo clippy --locked --offline -p bridge-core --all-targets -- -D warnings
+cargo clippy --locked --offline --workspace --all-targets -- -D warnings
 cargo fmt --all -- --check
 git diff --check
+cargo deny check          # where cargo-deny is installed; otherwise named as excluded, and CI runs it
 cargo run --locked --offline -p a2a-bridge -- validate --repo-hygiene
 ```
 
@@ -348,3 +371,20 @@ Implementation and repairs are by Opus 5.5 through the bridge.
 ```text
 feat(bridge-core): ADR-0041 Slice 2B2b1 coverage-payload frame
 ```
+
+## 12. Review history
+
+**Spec review round 1** (Sol/xhigh, read-only, on revision 1 at `86b51cc6`): REJECT. It reported WRONG 3 MATERIAL
+(blockers), WRONG 1 IMMATERIAL, SMELL 3 MATERIAL, and SMELL 1 IMMATERIAL, all DEFER. Revision 2 folds all of them,
+because each fix is small:
+
+- **W1:** the Windows job never runs `bridge-core` tests. §4 now claims Windows compilation only, and names Linux and
+  macOS as the test lanes.
+- **W2:** the roadmap's main-lineage line was stale. It is fixed to `f16ca474`.
+- **W3:** "identical entry sets encode identically" contradicted the header binding. Determinism is now qualified by
+  class and generation, and a binding test is added (§1.1, §5.2).
+- **W4** (IMMATERIAL): §7 is now the complete parent gate list.
+- **S1:** receipts and summaries are asserted against independent expected values, with mutation rows.
+- **S2:** a table covers all 13 class codes, plus min/max/max+1 field matrices.
+- **S3:** the caller supplies `st_mode & 0o7777`, so special bits are refused rather than masked away.
+- **S4:** the parent plan marks the older serial order as superseded.

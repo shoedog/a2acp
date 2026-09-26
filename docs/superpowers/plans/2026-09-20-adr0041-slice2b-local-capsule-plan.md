@@ -65,7 +65,8 @@ The serial order is 2B1 → 2B2a → 2B2 → 2B2b1 → 2B2b2 → 2B3. 2B2b1's ta
 `docs/superpowers/plans/2026-09-26-adr0041-slice2b2b1-coverage-frame-task.md`.
 
 **Amendment (owner-approved 2026-09-24):** the descriptor seam and hardened Git runner are split out of 2B2 into child
-**2B2a**, sequenced before 2B2. The serial order is 2B1 → 2B2a → 2B2 → 2B2b → 2B3. 2B2a's task is
+**2B2a**, sequenced before 2B2. The serial order then became 2B1 → 2B2a → 2B2 → 2B2b → 2B3; the 2026-09-26
+amendment above supersedes it with 2B2b1 and 2B2b2. 2B2a's task is
 `docs/superpowers/plans/2026-09-24-adr0041-slice2b2a-git-runner-seam-task.md`; 2B2 builds on its API unchanged.
 
 No child may begin on a merely plausible predecessor. Each binds the exact approved predecessor commit and reruns
