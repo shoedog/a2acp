@@ -5,6 +5,12 @@ pub mod attestation;
 pub mod brief_lint;
 pub mod catalog;
 pub mod custody_capsule;
+// The exporter's entry point is crate-private and, by design, production-unreachable: the capture
+// capability has only a crate-private fixture constructor and the only sealer is the in-crate
+// fixture. The wiring slice supplies the production mint and the Git route pin.
+#[cfg(unix)]
+#[allow(dead_code)]
+mod custody_export;
 #[cfg(unix)]
 #[allow(dead_code)] // 2B2a is intentionally production-unwired until the exporter slice.
 mod custody_git;

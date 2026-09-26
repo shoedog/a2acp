@@ -725,3 +725,117 @@ fn direct_deserialization_routes_through_capsule_validation() {
     context_value["recipients"] = serde_json::json!([]);
     assert!(serde_json::from_value::<CustodyEnvelopeContextV1>(context_value).is_err());
 }
+
+/// ADR-0041 slice 2B2 §7: the four public negatives the 2B1 test relocation dropped, restored with
+/// the first dependent 2B2 change. Each one exercises a limit or a bijection that only the public
+/// API can reach, so no in-crate test replaces it.
+///
+/// Rows one and two are the generic-seal preflight's V1 limits: a capsule format above the
+/// 4096-byte envelope-field ceiling, and a selected artifact above the 10 GiB envelope-total
+/// ceiling. Rows three and four are the index's own construction rules: two rows may not share a
+/// name, and an index may not be empty.
+#[test]
+fn restored_2b1_public_negatives_reject_oversized_seals_duplicate_names_and_an_empty_index() {
+    let name = LosslessPathV1::from_bytes(b"control/manifest.json.enc".to_vec());
+
+    // 1. Oversized capsule format. 4096 bytes is the ceiling, so 4097 is the first refusal.
+    let oversized_format = CustodySealV1::new(
+        digest(1),
+        vec![CustodySealedArtifactV1::new(name.clone(), 5, digest(2)).unwrap()],
+        vec!["recipient".to_owned()],
+        "c".repeat(4097),
+        "tool",
+        "1",
+    )
+    .unwrap();
+    assert_eq!(
+        CustodyCapsuleSealProofV1::preflight_generic_seal_artifact_for_capsule_v1(
+            &oversized_format,
+            &name,
+        )
+        .unwrap_err(),
+        Error::SealExceedsV1Limits
+    );
+    assert_eq!(
+        CustodyCapsuleSealProofV1::preflight_generic_seal_for_capsule_v1(&oversized_format)
+            .unwrap_err(),
+        Error::SealExceedsV1Limits
+    );
+    // Max, not max+1: the same seal at exactly 4096 bytes is admitted.
+    let at_ceiling_format = CustodySealV1::new(
+        digest(1),
+        vec![CustodySealedArtifactV1::new(name.clone(), 5, digest(2)).unwrap()],
+        vec!["recipient".to_owned()],
+        "c".repeat(4096),
+        "tool",
+        "1",
+    )
+    .unwrap();
+    assert!(
+        CustodyCapsuleSealProofV1::preflight_generic_seal_artifact_for_capsule_v1(
+            &at_ceiling_format,
+            &name,
+        )
+        .is_ok()
+    );
+
+    // 2. Oversized selected-artifact length. 10 GiB is the ceiling, so 10 GiB + 1 is the first
+    //    refusal, and no 10 GiB fixture is materialized to prove it.
+    let oversized_artifact = CustodySealV1::new(
+        digest(1),
+        vec![CustodySealedArtifactV1::new(name.clone(), 10_737_418_241, digest(2)).unwrap()],
+        vec!["recipient".to_owned()],
+        "capsule-v1",
+        "tool",
+        "1",
+    )
+    .unwrap();
+    assert_eq!(
+        CustodyCapsuleSealProofV1::preflight_generic_seal_artifact_for_capsule_v1(
+            &oversized_artifact,
+            &name,
+        )
+        .unwrap_err(),
+        Error::SealExceedsV1Limits
+    );
+    let at_ceiling_artifact = CustodySealV1::new(
+        digest(1),
+        vec![CustodySealedArtifactV1::new(name.clone(), 10_737_418_240, digest(2)).unwrap()],
+        vec!["recipient".to_owned()],
+        "capsule-v1",
+        "tool",
+        "1",
+    )
+    .unwrap();
+    assert!(
+        CustodyCapsuleSealProofV1::preflight_generic_seal_artifact_for_capsule_v1(
+            &at_ceiling_artifact,
+            &name,
+        )
+        .is_ok()
+    );
+
+    // 3. Duplicate index names.
+    let duplicate_rows = vec![
+        CustodyCapsuleArtifactRoleRowV1::new(
+            LosslessPathV1::from_bytes(b"payload/worktree.bin.enc".to_vec()),
+            Role::CoveragePayload(Coverage::Worktree),
+        )
+        .unwrap(),
+        CustodyCapsuleArtifactRoleRowV1::new(
+            LosslessPathV1::from_bytes(b"payload/worktree.bin.enc".to_vec()),
+            Role::CoveragePayload(Coverage::Worktree),
+        )
+        .unwrap(),
+    ];
+    assert_eq!(
+        CustodyCapsuleIndexV1::new(digest(1), duplicate_rows).unwrap_err(),
+        Error::DuplicateArtifactName
+    );
+
+    // 4. An empty index.
+    assert_eq!(
+        CustodyCapsuleIndexV1::new(digest(1), vec![]).unwrap_err(),
+        Error::MissingArtifact
+    );
+}

@@ -166,6 +166,17 @@ impl CustodyCapsuleIndexV1 {
     }
 }
 
+/// The derived 2B1 capsule layout: the complete exterior artifact population for one manifest.
+///
+/// ADR-0041 slice 2B2 control 24a. The doctest below has exactly one statement, so module privacy
+/// is its single barrier: `lib.rs` declares the exporter as `mod custody_export;`, which no
+/// external crate can name. Changing only that declaration to `pub mod custody_export;` makes this
+/// doctest compile and so turns the control red. It deliberately does not mention any item inside
+/// the module, so function privacy cannot mask the module barrier.
+///
+/// ```compile_fail
+/// use bridge_core::custody_export;
+/// ```
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CustodyCapsuleLayoutV1 {
     index: CustodyCapsuleIndexV1,
@@ -440,6 +451,86 @@ pub enum RestoreForbiddenV1 {
     Allowed,
 }
 
+/// The receipt-derived capsule seal proof: the only value the binding and the open request accept.
+///
+/// Deferred 2B1 control (retained through the 2B1 provenance review), added before 2B2 widens any
+/// capsule API: a generic [`CustodySealV1`] — one assembled from caller-chosen artifact rows rather
+/// than derived from sink receipts — cannot substitute for this proof. Each doctest below builds
+/// an otherwise valid call whose only error is that substitution, so reverting the one signature
+/// it targets to take `&CustodySealV1` makes exactly that doctest compile and so turns it red.
+///
+/// ```compile_fail
+/// use bridge_core::custody_capsule::{
+///     CustodyCapsuleBindingV1, CustodyCapsuleLayoutV1, CustodyRestorePolicyV1,
+/// };
+/// use bridge_core::custody_inventory::CustodyStateClassV1;
+/// use bridge_core::custody_seal::{
+///     CustodyCoverageClassV1, CustodyCoverageEntryV1, CustodyManifestV1, CustodySealV1,
+///     CustodySealedArtifactV1,
+/// };
+///
+/// let coverage = CustodyCoverageClassV1::ALL
+///     .into_iter()
+///     .map(|class| {
+///         CustodyCoverageEntryV1::new(class, CustodyStateClassV1::Empty, vec![], None).unwrap()
+///     })
+///     .collect();
+/// let manifest = CustodyManifestV1::new(
+///     "unit", "run", "materialization", "generation", coverage, vec![], vec![], vec![], vec![],
+/// )
+/// .unwrap();
+/// let layout = CustodyCapsuleLayoutV1::derive(&manifest).unwrap();
+/// let digest = manifest.content_digest().unwrap();
+/// let rows = layout
+///     .index()
+///     .artifacts()
+///     .iter()
+///     .map(|row| CustodySealedArtifactV1::new(row.name().clone(), 1, digest.clone()).unwrap())
+///     .collect();
+/// let generic = CustodySealV1::new(
+///     digest, rows, vec!["recipient".to_owned()], "capsule-v1", "tool", "1",
+/// )
+/// .unwrap();
+/// let _ = CustodyCapsuleBindingV1::new(
+///     &manifest,
+///     layout.index(),
+///     &CustodyRestorePolicyV1::inert(),
+///     &generic,
+/// );
+/// ```
+///
+/// ```compile_fail
+/// use bridge_core::custody_capsule::{CustodyCapsuleLayoutV1, CustodyEnvelopeOpenRequestV1};
+/// use bridge_core::custody_inventory::CustodyStateClassV1;
+/// use bridge_core::custody_seal::{
+///     CustodyCoverageClassV1, CustodyCoverageEntryV1, CustodyManifestV1, CustodySealV1,
+///     CustodySealedArtifactV1,
+/// };
+///
+/// let coverage = CustodyCoverageClassV1::ALL
+///     .into_iter()
+///     .map(|class| {
+///         CustodyCoverageEntryV1::new(class, CustodyStateClassV1::Empty, vec![], None).unwrap()
+///     })
+///     .collect();
+/// let manifest = CustodyManifestV1::new(
+///     "unit", "run", "materialization", "generation", coverage, vec![], vec![], vec![], vec![],
+/// )
+/// .unwrap();
+/// let layout = CustodyCapsuleLayoutV1::derive(&manifest).unwrap();
+/// let digest = manifest.content_digest().unwrap();
+/// let name = layout.index().artifacts()[0].name().clone();
+/// let generic = CustodySealV1::new(
+///     digest.clone(),
+///     vec![CustodySealedArtifactV1::new(name.clone(), 1, digest).unwrap()],
+///     vec!["recipient".to_owned()],
+///     "capsule-v1",
+///     "tool",
+///     "1",
+/// )
+/// .unwrap();
+/// let _ = CustodyEnvelopeOpenRequestV1::from_seal_artifact(&generic, name);
+/// ```
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CustodyCapsuleSealProofV1 {
     seal: CustodySealV1,
@@ -1412,6 +1503,35 @@ pub trait CustodyEnvelopeChunkSinkV1: sealed::Sealed {
     fn write_chunk(&mut self, chunk: CustodyEnvelopeChunkV1) -> Result<(), CustodyCapsuleErrorV1>;
 }
 
+/// The envelope sealer an exporter drives. Sealed: only this crate may implement it.
+///
+/// ADR-0041 slice 2B2 control 24b. The single barrier here is trait sealing: `sealed::Sealed` is
+/// `pub(crate)`, so an external crate cannot name it and therefore cannot satisfy the supertrait
+/// bound. Removing the `: sealed::Sealed` bound below makes this doctest compile and so turns the
+/// control red; module privacy (control 24a) and receipt-constructor privacy (control 24c) are
+/// separate arms on separate items.
+///
+/// ```compile_fail
+/// use bridge_core::custody_capsule::{
+///     CustodyCapsuleErrorV1, CustodyEnvelopeChunkSinkV1, CustodyEnvelopeChunkSourceV1,
+///     CustodyEnvelopeContextV1, CustodyEnvelopeMetadataV1, CustodyEnvelopeSealReceiptV1,
+///     CustodyEnvelopeSealerV1,
+/// };
+///
+/// struct ForeignSealer;
+///
+/// impl CustodyEnvelopeSealerV1 for ForeignSealer {
+///     fn seal(
+///         &self,
+///         _context: &CustodyEnvelopeContextV1,
+///         _plaintext: &mut dyn CustodyEnvelopeChunkSourceV1,
+///         _metadata: &CustodyEnvelopeMetadataV1,
+///         _ciphertext: &mut dyn CustodyEnvelopeChunkSinkV1,
+///     ) -> Result<CustodyEnvelopeSealReceiptV1, CustodyCapsuleErrorV1> {
+///         Err(CustodyCapsuleErrorV1::InvalidInput)
+///     }
+/// }
+/// ```
 pub trait CustodyEnvelopeSealerV1: sealed::Sealed {
     fn seal(
         &self,
@@ -1431,7 +1551,13 @@ pub trait CustodyEnvelopeOpenerV1: sealed::Sealed {
     ) -> Result<CustodyEnvelopeOpenReceiptV1, CustodyCapsuleErrorV1>;
 }
 
-mod sealed {
+/// The sealing module for the four envelope traits above.
+///
+/// `pub(crate)` rather than private so the sibling `custody_export` module can implement the
+/// source and sink traits for its own exporter-owned types. The inner trait is still unnameable
+/// from outside this crate, so no external `impl` of a sealed envelope trait can exist — control
+/// 24b's compile-fail doctest is the discriminating proof.
+pub(crate) mod sealed {
     pub trait Sealed {}
 }
 
@@ -2044,6 +2170,68 @@ mod tests {
                 .unwrap_err(),
             CustodyCapsuleErrorV1::InvalidInput
         );
+    }
+
+    /// Deferred 2B1 control: the capsule proof is derived from a NONEMPTY receipt population. An
+    /// empty population is refused directly, as a missing artifact, rather than reaching the
+    /// generic seal constructor.
+    #[test]
+    fn capsule_seal_proof_refuses_an_empty_receipt_population() {
+        assert_eq!(
+            CustodyCapsuleSealProofV1::from_receipts(Vec::new()).unwrap_err(),
+            CustodyCapsuleErrorV1::MissingArtifact
+        );
+    }
+
+    /// Deferred 2B1 control: exact V1 boundaries for the envelope constructors 2B2's exporter
+    /// drives. Each limit is admitted at its maximum and refused at maximum + 1, through the
+    /// validators' own arithmetic and without materializing a 10 GiB input.
+    #[test]
+    fn v1_envelope_limits_admit_max_and_refuse_max_plus_one() {
+        let total = MAX_ENVELOPE_TOTAL_BYTES_V1;
+        let chunk = MAX_ENVELOPE_CHUNK_BYTES_V1;
+        let chunks = MAX_ENVELOPE_CHUNKS_V1;
+        assert!(CustodyEnvelopeStreamLimitsV1::new(total, chunk, chunks).is_ok());
+        assert!(CustodyEnvelopeStreamLimitsV1::new(total + 1, chunk, chunks).is_err());
+        assert!(CustodyEnvelopeStreamLimitsV1::new(chunk, chunk + 1, chunks).is_err());
+        assert!(CustodyEnvelopeStreamLimitsV1::new(chunk, chunk, chunks + 1).is_err());
+
+        let chunk_len = usize::try_from(chunk).unwrap();
+        assert!(CustodyEnvelopeChunkV1::new(0, vec![0; chunk_len], true).is_ok());
+        assert_eq!(
+            CustodyEnvelopeChunkV1::new(0, vec![0; chunk_len + 1], true).unwrap_err(),
+            CustodyCapsuleErrorV1::InvalidInput
+        );
+
+        let field = "f".repeat(MAX_ENVELOPE_FIELD_BYTES_V1);
+        assert!(CustodyEnvelopeFormatV1::new(field.clone(), "tool", "1").is_ok());
+        assert!(CustodyEnvelopeFormatV1::new(format!("{field}f"), "tool", "1").is_err());
+
+        let recipients = |count: usize| -> Vec<String> {
+            (0..count)
+                .map(|index| format!("recipient-{index:03}"))
+                .collect()
+        };
+        let context = |count: usize| {
+            CustodyEnvelopeContextV1::new(
+                LosslessPathV1::from_bytes(b"control/manifest.json.enc".to_vec()),
+                digest(1),
+                envelope_format(),
+                recipients(count),
+            )
+        };
+        assert!(context(MAX_ENVELOPE_RECIPIENTS_V1).is_ok());
+        assert!(context(MAX_ENVELOPE_RECIPIENTS_V1 + 1).is_err());
+
+        let metadata = |count: usize| {
+            CustodyEnvelopeMetadataV1::new(
+                (0..count)
+                    .map(|index| (format!("key-{index:03}"), "value".to_owned()))
+                    .collect(),
+            )
+        };
+        assert!(metadata(MAX_ENVELOPE_METADATA_ROWS_V1).is_ok());
+        assert!(metadata(MAX_ENVELOPE_METADATA_ROWS_V1 + 1).is_err());
     }
 
     #[test]
