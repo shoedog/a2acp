@@ -125,9 +125,16 @@ Run these gates against the private tree before touching production:
 An expired or absent Claude OAuth token blocks live verification even when `initialize` and `models` pass.
 Refresh the host login, sync the isolated reader credential copy when applicable, and rerun doctor.
 
-The host Claude credential-file preflight is skipped in two cases: the entry is `pre_authenticated`, or one
-of `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, or `CLAUDE_CODE_OAUTH_TOKEN` is non-empty in the smoke's own
-environment. Otherwise, on a macOS host where Claude Code keeps its login only in the Keychain, there is no
+The host Claude credential-file preflight applies only to automatic first-party authentication.
+`claude_credential_source` in `bin/a2a-bridge/src/doctor.rs` is the authoritative list of exceptions. It
+skips the file check in these cases:
+- the entry configures an explicit `auth_method`, or is `pre_authenticated`;
+- an explicit auth variable (`ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `CLAUDE_CODE_OAUTH_TOKEN`) is
+  non-empty in the smoke's own environment;
+- an external-provider selector (`CLAUDE_CODE_USE_BEDROCK`, `_VERTEX`, `_FOUNDRY`, `_ANTHROPIC_AWS`,
+  `_MANTLE`) is truthy.
+
+Without any of these, on a macOS host where Claude Code keeps its login only in the Keychain, there is no
 `~/.claude/.credentials.json`, and a host Claude `smoke` refuses before spawning anything.
 
 A token exported only from an interactive shell rc file is absent from non-interactive shells. Either export it
