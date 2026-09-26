@@ -194,12 +194,14 @@ impl CustodyOriginalObjectV1 {
     /// comparison depend on the encoder rather than on the record, so the two missing components
     /// are exposed here as accessors alongside the existing [`Self::kind`]. Neither changes
     /// validation or the wire format.
+    #[cfg(unix)] // Read only by the unix-only exporter.
     #[must_use]
     pub(crate) const fn format(&self) -> CustodyGitObjectFormatV1 {
         self.format
     }
 
     /// Read-only object id. See [`Self::format`].
+    #[cfg(unix)] // Read only by the unix-only exporter.
     #[must_use]
     pub(crate) fn object_id(&self) -> &str {
         &self.object_id
@@ -603,24 +605,28 @@ impl CustodyManifestV1 {
     /// generation as the manifest before any write. These four accessors make that a record
     /// comparison rather than a canonical-JSON re-parse. None of them changes validation or the
     /// wire format.
+    #[cfg(unix)] // Read only by the unix-only exporter.
     #[must_use]
     pub(crate) fn unit_id(&self) -> &str {
         &self.unit_id
     }
 
     /// See [`Self::unit_id`].
+    #[cfg(unix)] // Read only by the unix-only exporter.
     #[must_use]
     pub(crate) fn run_id(&self) -> &str {
         &self.run_id
     }
 
     /// See [`Self::unit_id`].
+    #[cfg(unix)] // Read only by the unix-only exporter.
     #[must_use]
     pub(crate) fn materialization_id(&self) -> &str {
         &self.materialization_id
     }
 
     /// See [`Self::unit_id`].
+    #[cfg(unix)] // Read only by the unix-only exporter.
     #[must_use]
     pub(crate) fn generation_id(&self) -> &str {
         &self.generation_id
