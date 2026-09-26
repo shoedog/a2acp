@@ -5,6 +5,12 @@ control exists and passes; every control's guard mutation flipped its control (6
 controller-run **macOS host lane** and the **native Linux ext4 lane** (GitHub Actions ubuntu) are **not executed
 here** (§6).
 
+**Repair round 1 (2026-09-26, §11):** the Sol implementation review of `87570241` found three WRONG blockers. All
+three are repaired RED-first on top of `91d0bf13`: the non-bare worktree root (W1), the `git init` logical bytes in
+the ledger (W2), and the format-aware `verify-pack -v` bound (W3). The matrix now defines 73 rows; the 7 new rows
+and the 17 existing rows they affect all FLIPPED. The repair is staged, not committed. Figures in §2 and §4 are
+the post-repair figures. §5's table is the turn-3 record, and §11.3 extends it.
+
 **Task (authoritative):** `docs/superpowers/plans/2026-09-23-adr0041-slice2b2-isolated-export-task.md`, revision 11,
 SHA-256 `b9f1215aaac592d3185e3c315929a6b3a996d387d19a1afd48ac3aeb8ad814e9`, as it stands at the clone's base commit
 (re-verified at the start of turn 3).
@@ -70,25 +76,25 @@ is absent; `FIXED`/`ADDED` landed this turn, with the named control and mutation
 | §2 | non-cloneable generation-bound `CustodyCaptureCapabilityV1`, crate-private fixture mint only | PRESENT | PRESENT |
 | §2 | capability↔manifest binding: four identities, one object format, exact inventory, via crate-private `custody_seal` accessors | PRESENT | PRESENT (18, M18-*) |
 | §2 | caller `GitRouteRequestV1` passed to 2B2a admission unchanged | PRESENT | PRESENT (31, M31) |
-| §2 | scratch-root disjointness: canonical paths both directions plus ancestor identity | PARTIAL: the identity comparison ran one direction only | FIXED: identity compared in both directions (21, M21; see §7 on the identity layer) |
+| §2 | scratch-root disjointness: canonical paths both directions plus ancestor identity | PARTIAL: the identity comparison ran one direction only | FIXED: identity compared in both directions (21, M21; see §7 on the identity layer). **Repair 1 (W1):** the capability pins the source repository root (a non-bare worktree) apart from the git directory, and it joins the protected paths (21 worktree rows, M21-root) |
 | §2 | scratch root owner-private and empty | PRESENT | PRESENT |
 | §2 | exactly two top-level scratch children, created through `PinnedDirectoryV1` | PRESENT | PRESENT (asserted by `the_capsule_holds_exactly_the_reserved_names_plus_the_seal`) |
 | §2 | exporter never deletes anything | PRESENT | PRESENT |
-| §3 | scratch-wide ledger, checked arithmetic, 64 KiB per-entry allowance | PARTIAL: the `index-pack` bound used unchecked `+`/`*` | FIXED: `index_pack_reservation` is fully checked (11, M11f, M11g) |
+| §3 | scratch-wide ledger, checked arithmetic, 64 KiB per-entry allowance | PARTIAL: the `index-pack` bound used unchecked `+`/`*` | FIXED: the `index-pack` bound (now `index_pack_logical_bound`) is fully checked (11, M11f, M11g). **Repair 1 (W2):** each `git init` reserves a 4 KiB logical bound for `HEAD` and `config` beside its nine allowances, and the ledger equals an independent census of logical bytes plus allowances (11, M11n, M11o) |
 | §3 | one pre-reserved pack-output allowance `A`, `stdout_limit = A`, reconciled to `L` | PRESENT | PRESENT (35, M35) |
-| §3 | re-measure every file under the git directory after **each** child | PARTIAL: only after `init` and `index-pack`; `verify.git` compared with the `index-pack` reservation alone | FIXED: re-measured after all nine children against a cumulative per-directory budget (11, M11h, M11i) |
+| §3 | re-measure every file under the git directory after **each** child | PARTIAL: only after `init` and `index-pack`; `verify.git` compared with the `index-pack` reservation alone | FIXED: re-measured after all nine children against a per-directory budget (11, M11h, M11i). **Repair 1 (W2):** the budget keeps logical bytes apart from entries; each re-measure holds logical bytes to their own bound, then reconciles that bound and the ledger down to the measured bytes (11, M11o, M11p) |
 | §3 | no `Vec` sized from an unvalidated length | DEFECT: `read_alternates_digest` called `read_to_end` before its size check | FIXED: read through `take(MAX + 1)` (11, M11m) |
 | §3 | per-chunk ceilings enforced before a chunk is written or charged | PARTIAL: chunk bytes and chunk count were enforced only by the 2B1 validator *after* `write_all` | FIXED: sink pre-write checks (11, M11c, M11d, M11e) |
 | §4 | mixed/foreign object format refused before any spawn | PRESENT | PRESENT (18, M18-format) |
 | §4 | shallow/grafted/promisor source state refused before `pack-objects` | PRESENT (fixture-supplied flags) | PRESENT (see §7) |
 | §4 | recursive alternate chain pinned by identity and alternates-file content | PRESENT | PRESENT (5a/5b) |
-| §4.1 | every Git child through the 2B2a runner, pre-spawn and post-exit callbacks | PRESENT | PRESENT (5a/5b/9a/9b, M05a, M05b) |
+| §4.1 | every Git child through the 2B2a runner, pre-spawn and post-exit callbacks | PRESENT | PRESENT (5a/5b/9a/9b, M05a, M05b). **Repair 1 (W1):** the callbacks also recheck the pinned source repository root (9a/9b worktree rows, M09-root) |
 | §4.1 | `work/source-git/` created by `InitBare`, no source config written | PRESENT | PRESENT (30, M30) |
 | §4.2 | `cat-file --batch-check` presence/kind proof | PRESENT | PRESENT (30) |
 | §4.2 | one `pack-objects --stdout` run into one create-new `work/objects.pack`, synced, recorded | PRESENT | PRESENT (34, M34) |
 | §4.2 | evidence records the exact argv, **Git version**, environment keys, format, status, stream evidence | DEFECT: `git_version` hard-coded to `GitRunnerV1::MINIMUM_VERSION` | FIXED: every run record carries the runner's admitted version (M-version) |
 | §5 | step 1 from the **retained descriptor**, `max_stdin_bytes` = **recorded** length | PARTIAL: re-opened by name, bounded by the *current* `fstat` length | FIXED: `VerifiedPackV1` retains the descriptor for §5 and §6 (7, M07b) |
-| §5 | step 1 `GitRunEvidenceV1.stdin` equals the verified-pack identity, then `verify-pack -v` | PRESENT | PRESENT (17, M17) |
+| §5 | step 1 `GitRunEvidenceV1.stdin` equals the verified-pack identity, then `verify-pack -v` | PRESENT | PRESENT (17, M17). **Repair 1 (W3):** `verify-pack -v` output is bounded by the checked, format-aware `verify_pack_stdout_limit`, not the shared 128-byte line estimate (11, M11q, M11r) |
 | §5 | a typed strict-**pack** refusal at step 1 | MISSING: surfaced as generic `GitChild` | ADDED: `StrictPack` (7, M07) |
 | §5 | steps 2–4: exact inventory, all-object closure, `fsck --no-dangling` output check | PRESENT | PRESENT (1–4, 6, 20b; M01, M03, M06, M20b) |
 | §5 | `StrictObjectCheck` with the bounded message id, at step 1 and step 4, as **separable** classifiers | PARTIAL: the generic exit check also classified, so the two guards were not separable | FIXED: `classify_index_pack` (step 1) and `check_fsck_output` (step 4) own their classifiers (20a/20b, M20a, M20b) |
@@ -111,9 +117,9 @@ is absent; `FIXED`/`ADDED` landed this turn, with the named control and mutation
 | 5a / 5b | MISSING | `control_05a_pre_spawn_callback_refuses_alternate_drift` / `control_05b_post_exit_callback_refuses_alternate_drift` | M05a / M05b |
 | 6 | MISSING | `control_06_inventory_equality_refuses_an_extra_packed_object` | M06 |
 | 7 | MISSING | `control_07_strict_indexing_refuses_a_truncated_or_corrupt_staged_pack`, plus `step_1_refuses_a_staged_pack_that_grew_past_its_recorded_length` | M07, M07b |
-| 9a / 9b | MISSING | `control_09a_pre_spawn_callback_refuses_a_swapped_source` / `control_09b_post_exit_callback_refuses_a_swapped_source` | M05a / M05b |
+| 9a / 9b | MISSING | `control_09a_pre_spawn_callback_refuses_a_swapped_source` / `control_09b_post_exit_callback_refuses_a_swapped_source` (3 rows each; repair 1 adds the worktree-root row) | M05a / M05b; M09-root |
 | 10 | MISSING | `control_10a_…symlink_at_the_reserved_name`, `control_10b_…retargeted_capsule_directory`, `control_10c_a_case_fold_alias_is_refused_or_left_untouched`, `control_10d_…pre_planted_component_symlink` | M10a, M10b, M10d (10c: §7) |
-| 11 | MISSING | 14 `control_11_*` tests: budget ceilings, plaintext budget, sink chunk bytes / chunk count / per-artifact, ledger, Git-child reservations, post-exit re-measure (unit and read-only child), alternates bound, end-to-end scratch budget, artifact count, canonical preflight before derive | M11a–M11m |
+| 11 | MISSING | 16 `control_11_*` tests (13 at turn 3, where this row said 14): budget ceilings, plaintext budget, sink chunk bytes / chunk count / per-artifact, ledger, Git-child reservations, post-exit re-measure (unit and read-only child), alternates bound, end-to-end scratch budget against an independent census (repair 1), logical bound apart from allowances (repair 1), artifact count, canonical preflight before derive, and the `verify-pack` bound, unit and exact edge (repair 1) | M11a–M11m; M11n–M11r |
 | 12 | MISSING | `control_12_every_pre_commit_fault_leaves_no_seal` (31 fault sides + 6 chunk samples) | M12 |
 | 13 | MISSING | `control_13_a_post_seal_fault_is_published_durability_unconfirmed` | M13, M13b |
 | 14 | MISSING | `control_14_an_unverifiable_seal_rename_is_seal_publication_unverified` | M14 |
@@ -124,7 +130,7 @@ is absent; `FIXED`/`ADDED` landed this turn, with the named control and mutation
 | 18 | MISSING | `control_18_capability_binding_refuses_before_any_write` (6 rows) | M18-unit/-run/-materialization/-generation/-inventory/-format |
 | 19 | MISSING | `control_19_the_capability_refuses_a_stream_replayed_under_another_role` | M19 |
 | 20a / 20b | MISSING | `control_20a_…strict_object_check` / `control_20b_…when_step_1_is_bypassed` | M20a / M20b |
-| 21 | MISSING | `control_21_disjointness_preflight_refuses_every_overlap_before_any_write` (6 relations) | M21 |
+| 21 | MISSING | `control_21_disjointness_preflight_refuses_every_overlap_before_any_write` (9 relations; repair 1 adds 3 non-bare worktree relations) | M21; M21-root |
 | 24a | PRESENT (untested by mutation) | doctest on `custody_capsule::CustodyCapsuleLayoutV1` | M24a |
 | 24b | PRESENT (untested by mutation) | doctest on `custody_capsule::CustodyEnvelopeSealerV1` | M24b |
 | 24c | PRESENT at base | doctest on `custody_capsule::CustodyEnvelopeSealReceiptV1` | M24c |
@@ -148,7 +154,10 @@ opener receipt/metadata binding remains deferred and unreachable.
 Additional real-Git tests: `the_evidence_records_the_observed_git_version_and_every_child`,
 `the_evidence_records_the_admitted_git_version_not_the_minimum` (M-version),
 `the_capsule_holds_exactly_the_reserved_names_plus_the_seal`, `the_sealed_pack_is_the_verified_pack`,
-`an_export_through_a_pinned_alternate_store_seals`.
+`an_export_through_a_pinned_alternate_store_seals`. Repair 1 adds three positives:
+`an_export_from_a_non_bare_source_seals_and_leaves_its_worktree_untouched`,
+`a_delta_heavy_sha1_pack_seals_within_the_verify_pack_bound`, and
+`a_delta_heavy_sha256_pack_seals_within_the_verify_pack_bound`.
 
 ---
 
@@ -190,22 +199,25 @@ doctests.
 
 ## 4. Verification totals
 
-All results below are on the final bytes, after mutation round 2 had restored and verified them.
+Turn 3's results were on its final bytes, after mutation round 2 had restored and verified them. The rows that
+repair round 1 re-ran show its figures, taken on the repaired bytes after its matrix run had restored and verified
+them. Each earlier figure is kept in parentheses; the rest are turn 3's.
 
 | Command | Result |
 |---|---|
-| `cargo fmt --all -- --check` | clean |
-| `cargo clippy --locked --offline -p bridge-core --all-targets -- -D warnings` | clean |
-| `cargo clippy --locked --offline --workspace --all-targets -- -D warnings` | clean |
+| `cargo fmt --all -- --check` | clean (repair 1: clean) |
+| `cargo clippy --locked --offline -p bridge-core --all-targets -- -D warnings` | clean (repair 1: clean) |
+| `cargo clippy --locked --offline --workspace --all-targets -- -D warnings` | clean (turn 3; not re-run in repair 1) |
 | `git diff --check` / `git diff --cached --check` | clean (see §8) |
-| `cargo test --locked --offline -p bridge-core --lib custody_export` | **54 passed**, 0 failed |
+| `cargo test --locked --offline -p bridge-core --lib custody_export` | **60 passed**, 0 failed (turn 3: 54) |
 | `cargo test --locked --offline -p bridge-core --doc` | **9 passed**, 0 failed (unfiltered; 7 compile-fail in `custody_capsule`, 2 elsewhere) |
 | `cargo test --locked --offline -p bridge-core --lib custody_seal` | **4 passed** |
 | `cargo test --locked --offline -p bridge-core --lib custody_capsule` | **10 passed** |
 | `cargo test --locked --offline -p bridge-core --test custody_capsule` | **18 passed** |
-| `cargo test --locked --offline -p bridge-core` | 17 targets, **962 passed**, 0 failed, 0 ignored (lib 824) |
-| `cargo test --locked --offline --workspace --all-targets --no-fail-fast` (proxy variables unset, §6) | 90 targets, **4558 passed**, 0 failed, 13 ignored |
-| `cargo test --locked --offline --workspace --no-fail-fast` (proxy variables unset, §6) | 106 targets, **4568 passed**, 0 failed, 13 ignored |
+| `cargo test --locked --offline -p bridge-core --lib` | **830 passed** (turn 3: 824); see §11.4 for a pre-existing intermittent 2B2a fixture failure |
+| `cargo test --locked --offline -p bridge-core` | 17 targets, **968 passed**, 0 failed, 0 ignored (turn 3: 962) |
+| `cargo test --locked --offline --workspace --all-targets --no-fail-fast` (proxy variables unset, §6) | 90 targets, **4564 passed**, 0 failed, 13 ignored (turn 3: 4558) |
+| `cargo test --locked --offline --workspace --no-fail-fast` (proxy variables unset, §6) | 106 targets, **4574 passed**, 0 failed, 13 ignored (turn 3: 4568) |
 | the two workspace commands **with** the container's proxy variables set | 8 `a2a-bridge` failures and a `bridge-api` lib hang, all reproduced on the exact predecessor (§6) |
 | `cargo deny check` | **not run**: `cargo-deny` is not installed in the container (`no such command: deny`) — an unrunnable gate, not green |
 | `cargo run --locked --offline -p a2a-bridge -- validate --repo-hygiene` | `repository hygiene validated` |
@@ -213,6 +225,9 @@ All results below are on the final bytes, after mutation round 2 had restored an
 ---
 
 ## 5. Mutation matrix
+
+This section is the turn-3 record: 66 rows, and the turn-3 snapshot. Repair round 1 adds 7 rows, so 73 are now
+defined, re-snapshots the repaired bytes, and re-runs 24 rows; see §11.3.
 
 **Harness:** `.git/a2a-bridge/mutation/matrix.py` (untracked; survives the container). Log `matrix.log`, per-mutation
 records `results.jsonl`, raw cargo output `output-<id>.txt`, pre-matrix `baseline.txt`, snapshot
@@ -413,8 +428,9 @@ makes no confidentiality claim, and `work/` holds plaintext only because 2B2 mak
   none. Control 30 bypasses that outer layer and proves the synthesized git directory. The production detector
   belongs to the wiring slice's mint.
 - **The no-mutation observation** snapshots every byte of every watched store: objects, config, alternates, and for
-  control 30 the promisor. The fixture sources are bare repositories with no refs and no worktree, so "ref and
-  worktree bytes" are vacuously equal.
+  control 30 the promisor. The fixture sources have no refs, so "ref bytes" are vacuously equal. Most are bare, but
+  since repair round 1 `an_export_from_a_non_bare_source_seals_and_leaves_its_worktree_untouched` watches a real
+  worktree, so "worktree bytes" are observed there.
 - **Read-only path walks.** The post-exit git-directory re-measure and the scratch-root emptiness check enumerate by
   path (`std::fs::read_dir`). They only detect; they never write, and they fall within the HL1 class.
 - **The seal barrier** runs inside `fs_custody`'s last-chance hook, which can only return `FsCustodyError`. The typed
@@ -440,6 +456,9 @@ docs/superpowers/reviews/2026-09-25-adr0041-slice2b2-implementation-handoff.md (
 
 The exact `git diff --cached --stat` and `git diff --cached --check` results are reported in the turn's final message.
 Nothing is committed.
+
+Repair round 1 stages only `crates/bridge-core/src/custody_export.rs`, `crates/bridge-core/src/custody_export_tests.rs`,
+and this handoff (§11.5). Nothing is committed.
 
 ## 9. What remains for the controller
 
@@ -477,3 +496,218 @@ Darwin 25.6.0, APFS (case-insensitive), a non-root user, and Command Line Tools 
 - **Remaining lanes:**
   - native Linux ext4: the GitHub Actions ubuntu CI on the PR;
   - `cargo deny`: CI.
+
+## 11. Repair round 1 — Sol implementation review (2026-09-26)
+
+**Review:** an independent Sol review of `87570241` (HEAD `91d0bf13` adds only the `#[cfg(unix)]` accessor gates).
+It found three WRONG · MATERIAL · BLOCKER findings, which the controller verified and accepted. Its two SMELLs are
+DEFERRED and already listed in §7: control 5b/9b mutation timing, and control 21's identity layer. They were not
+worked.
+
+**Base and scope:** HEAD `91d0bf13`, clean working tree. Only `custody_export.rs`, `custody_export_tests.rs`, and
+this handoff changed. `custody_git.rs` and `fs_custody.rs` equal `HEAD` (`git diff --quiet HEAD --`), with the §5
+SHA-256 values. The task is still revision 11, SHA-256 `b9f1215a…d814e9`.
+
+**Method: RED first.** Every failing control was written against the unrepaired API. It ran with
+`custody_export.rs` still byte-equal to `91d0bf13`. Raw outputs are in `.git/a2a-bridge/mutation/`:
+- RED: `repair1-red.txt`. 58 tests were selected: **51 passed, 7 failed**, exactly the targeted controls.
+- GREEN: `repair1-green.txt`, **60 passed**.
+
+Between RED and GREEN the test file changed only in plumbing the repaired API needs:
+- the fixture mint also receives the repository root;
+- the reservation unit test follows the split constants;
+- the logical-bound control gains a `const` fixture-validity assertion;
+- two tests are added: the bound's unit test and the non-bare positive;
+- rustfmt reflowed the changed lines.
+
+### 11.1 Findings, RED evidence, and fixes
+
+**W1: a scratch root inside a non-bare source worktree was admitted and wrote into the source.** The capability
+pinned only the git directory, its object store, and its alternates. So `repo/custody`, beside `repo/.git`, matched
+no protected path.
+
+- **RED:** control 21 gained three non-bare relations, and controls 9a and 9b gained a worktree-root row. The RED
+  output, verbatim:
+  - `ScratchInsideSourceWorktree: wrong success: a capsule sealed; 15 source paths created, first …/repo/custody/capsule/control/capsule-index.json.enc`
+  - `ScratchIsSourceWorktree: wrong success: a capsule sealed; 15 source paths created, first …/wt/capsule/control/capsule-index.json.enc`
+  - `SourceWorktreeInsideScratch: wrong success: a capsule sealed; 0 source paths created`
+  - 9a and 9b: `SwapSourceWorktreeRoot: wrong success: a capsule sealed`
+
+  The first row is the reviewer's scenario. `repo/custody` is empty and owner-private, so that row runs the
+  production preflight with no bypass. The other two use a `--separate-git-dir` clone, whose worktree holds no git
+  directory to trip over. Without that layout they would not be distinguishable from the git-directory relation.
+  The emptiness bypass now applies only to rows whose scratch root already holds source bytes, and control 21
+  reports every failing row.
+- **Fix:** `CustodyCaptureCapabilityV1` gains a required `source_repository: PinnedDirectoryV1`. It is the worktree
+  of a non-bare source, or the git directory of a bare one. The fixture mint takes it. It is the first entry of
+  `protected_paths()`, so the existing loop compares it by canonical path and by directory identity in both
+  directions. `recheck()` also checks it, so the pre-spawn and post-exit callbacks recheck it. The refusal names a
+  "protected source path". The production mint must supply this pinned root; the capability shape now fixes that.
+- **GREEN:** all nine control-21 rows are refused with `ScratchPreflight` before any write. The 9a and 9b worktree
+  rows refuse with `IdentityDrift`, and no pack is produced. A new positive,
+  `an_export_from_a_non_bare_source_seals_and_leaves_its_worktree_untouched`, seals with the scratch root outside the
+  worktree, and the worktree bytes are unchanged.
+- **Mutations:** M21-root and M09-root (§11.3).
+
+**W2: both `git init` runs left their `HEAD` and `config` bytes out of the ledger.** Each init reserved only
+`9 × 64 KiB`. The re-measure compared its logical bytes with that same allowance and never charged them.
+
+- **RED:** `control_11_scratch_budget_end_to_end_admits_max_and_refuses_max_plus_one` now checks the ledger against
+  an independent census, `scratch_census`. It walks the scratch root, shares no code with the ledger, counts every
+  file and directory, and sums every file length. The RED output, verbatim:
+  - `census: the ledger reports 2366451 bytes, but the scratch root holds 7245 logical bytes in 36 entries, 2366541 bytes by §3`
+  - `exact-U arm (budget 2366451): wrong success: a capsule sealed; census footprint 2366541`
+  - `U - 1 arm (budget 2366540, one byte under the census): wrong success: a capsule sealed`
+  - `control_11_a_git_directory_is_held_to_its_logical_bound_not_its_entry_allowances`:
+    `wrong success: a capsule sealed`. Here `config` grew by 8 KiB after the source init and was absorbed by the
+    allowances.
+
+  The 90-byte gap has two parts:
+  - 178 bytes of `HEAD` and `config` were never charged: 2 × (23 + 66) for SHA-1;
+  - 88 bytes were over-reserved for the index and never reconciled: 40 + 8·N with N = 6.
+- **Fix:**
+  - `INIT_BARE_LOGICAL_BYTES_V1` (4 KiB) is reserved beside the nine allowances before each init.
+  - `GitDirectoryBudgetV1` keeps `logical_bytes` and `entries` apart.
+  - `index-pack` reserves `INDEX_PACK_ENTRIES_V1` (3) plus `index_pack_logical_bound`, the renamed
+    `index_pack_reservation` without its entries.
+  - `remeasure_git_directory` first holds the measured logical bytes to the logical bound, never to the allowances.
+    It then releases the unused part of the bound from the ledger and sets the budget to the measured bytes.
+  - The re-measure after `index-pack` is reconciled the same way. The census equality requires it: the §3
+    version-2 index bound exceeds the index Git writes by 40 + 8·N bytes when no offset needs the 64-bit table.
+  - Every bound is still reserved in full before its child runs, so no Git write goes unreserved.
+- **GREEN:** the ledger reports 2,366,541 bytes, equal to the census: 7,245 logical bytes in 36 entries. The exact-U
+  arm seals within its census, and the U − 1 arm refuses with `ScratchLedger`. The logical-bound control refuses with
+  `ScratchLedger` naming `source-git`.
+- **Figures changed:** `INIT_BARE_RESERVATION_V1` (`9 × 64 KiB`) is gone. An init is now 9 entries plus a 4 KiB
+  logical bound, reconciled to the measured bytes: 89 for SHA-1 and 125 for SHA-256 on this lane.
+- **Mutations:** M11n, M11o, and M11p.
+
+**W3: the shared 128-byte line estimate refused valid SHA-256 packs at `verify-pack -v`.**
+
+- **RED:**
+  - `a_delta_heavy_sha256_pack_seals_within_the_verify_pack_bound`: `the fixture export seals: Git(StdoutLimit { limit: 273152 })`.
+    The fixture has 2,006 objects: 2,000 related blobs from one `fast-import` stream, plus the standard six.
+  - The exact edge, `control_11_verify_pack_output_admits_its_exact_bound_and_refuses_one_byte_more`:
+    `exact bound (17698 bytes): refused with Git(StdoutLimit { limit: 17152 })` and
+    `bound + 1 (17699 bytes): refused with Git(StdoutLimit { limit: 17152 })`.
+  - `a_delta_heavy_sha1_pack_seals_within_the_verify_pack_bound` passed both before and after the repair; it is a
+    positive control.
+  - A lane probe outside the suite, with Git 2.54.0 and the same 2,000 blobs:
+    - SHA-256: 302,565 bytes, 1,960 of them delta rows, against the old 272,384 limit;
+    - SHA-1: 207,334 bytes.
+- **Fix:** `verify_pack_stdout_limit(objects, format)`, with checked arithmetic; an overflow is a typed `Io`
+  refusal. Per object, it allows:
+  - `2·W + 83` bytes for the widest delta row. That is two hex object names, the `%-6s` type, three 20-digit
+    `uintmax_t` fields, a 10-digit `%u` depth, six separators, and a newline.
+  - 56 bytes for the widest `chain length = %d: %lu objects` line, of which there is at most one per object.
+
+  On top of that, a 16 KiB floor covers the `non delta` line and the final `<pack>: ok` line. So SHA-1 is 219 bytes
+  per object and SHA-256 is 267. The runner fixes `LC_ALL=C`, so these are Git's untranslated formats. The other
+  listings keep the 128-byte estimate: each of their rows carries one object name, at most `W + 29` bytes.
+- **GREEN:**
+  - Both delta-heavy fixtures seal, and each asserts that at least 90% of its objects are delta rows.
+  - The SHA-256 fixture's `verify-pack` output exceeds `128·N + 16 KiB`, so the fixture is valid, and it fits the
+    new bound.
+  - The exact edge uses a sealed fixture route that prints a prepared file for `verify-pack` and runs the lane Git
+    otherwise. 17,698 bytes seals; 17,699 refuses with `StdoutLimit { limit: 17698 }`. The test computes the bound
+    itself, so it does not inherit a mutated bound.
+  - `control_11_verify_pack_bound_is_format_aware_and_checked` pins the widths against Git's own formats at their
+    widest values, and checks the overflow refusal.
+- **Mutations:** M11q and M11r.
+
+### 11.2 Controls added or changed
+
+| Control | Test | Kind |
+|---|---|---|
+| 21 | `control_21_…` gains `ScratchInsideSourceWorktree`, `ScratchIsSourceWorktree`, and `SourceWorktreeInsideScratch`, and now reports every failing row | discriminating (M21, M21-root) |
+| 9a / 9b | `control_09a_…` and `control_09b_…` gain `SwapSourceWorktreeRoot`. The worktree is replaced and `.git` is moved across intact, so only the root's identity changes | discriminating (M05a/M05b, M09-root) |
+| 11 | `control_11_scratch_budget_end_to_end_…`: census equality, exact-U, and U − 1 | discriminating (M11f, M11n, M11o) |
+| 11 | `control_11_a_git_directory_is_held_to_its_logical_bound_not_its_entry_allowances` (new) | discriminating (M11p) |
+| 11 | `control_11_git_child_reservations_are_exact_and_bounded`: the split constants | discriminating (M11f, M11g) |
+| 11 | `control_11_verify_pack_output_admits_its_exact_bound_and_refuses_one_byte_more` (new) | discriminating (M11q, M11r) |
+| 11 | `control_11_verify_pack_bound_is_format_aware_and_checked` (new) | unit |
+| positive | `a_delta_heavy_sha1_…`, `a_delta_heavy_sha256_…`, `an_export_from_a_non_bare_source_…` (new) | positive; M11q turns the SHA-256 one red |
+
+### 11.3 Mutation matrix, repair round 1
+
+**Harness changes:**
+- `text` may be a list, and every entry must appear;
+- the M11i and M30 targets follow the repaired call text: the re-measure call passes the ledger, and the init call
+  passes `&mut source_budget`;
+- seven rows are added.
+
+73 rows are defined, and `matrix.py check` finds every target unique. The turn-3 results are kept as
+`results.round2-turn3.jsonl`.
+
+**Snapshot of the repaired bytes.** These hashes equal the staged bytes.
+
+| File | SHA-256 |
+|---|---|
+| `crates/bridge-core/src/custody_export.rs` | `0d47d8db5d285bff70bfc3013e200241c4107d31dbc96627241aad734158bb09` |
+| `crates/bridge-core/src/custody_export_tests.rs` | `d6748c47591ac5386b65ba6fbfacfdba7540f852c9406c09cc1f414e2b6b2920` |
+| `crates/bridge-core/src/custody_seal.rs` (as at `91d0bf13`) | `1c474087735df94f4d8229bd4f1eb279dd7eb23bf7b87c1ca8c75bb571a2b887` |
+| `crates/bridge-core/src/custody_capsule.rs`, `lib.rs`, `tests/custody_capsule.rs`, `custody_git.rs`, `fs_custody.rs` | unchanged from the §5 table |
+
+**Run:** two foreground `timeout 590` calls, with an internal budget of 450 s and a 240 s cap on each cargo run. No
+background job was started. The run covered the 7 new rows plus the 17 existing rows that are affected or that
+touch a changed function: M01, M05a, M05b, M11f, M11g, M11h, M11i, M11j, M11l, M12, M20b, M21, M30, M31, M34, M35,
+and M-version. **24 of 24 FLIPPED, 0 INADMISSIBLE.**
+
+Each mutation was restored byte-exactly with a fresh mtime. `matrix.py verify` then reported
+`VERIFY OK: 8 files equal their snapshot`, and no `pending.json` exists. The other 42 rows were not re-run. Their
+targets and controls are untouched by this repair, and their last verdict is FLIPPED, from turn 3 round 2 (§5).
+
+| ID | Guard mutated | Red | Named green | Outcome under mutation |
+|---|---|---|---|---|
+| M21-root | the repository root dropped from `protected_paths()` | 21 (all three worktree rows, by text) | non-bare positive | wrong success: two rows write 15 paths into the worktree |
+| M09-root | the repository-root recheck dropped from `recheck()` | 9a, 9b (`SwapSourceWorktreeRoot`) | 5a, 5b, 21, non-bare positive | wrong success |
+| M11n | the init logical reservation dropped, so only allowances are charged | end-to-end census (census, exact-U, U − 1) | logical-bound control, reservations unit | the ledger is 8,192 bytes under the census; seals at census − 1 |
+| M11o | the reconciliation release dropped | end-to-end census (census row) | logical-bound control, reservations unit | the ledger is 8,102 bytes over the census |
+| M11p | the logical bound conflated with the entry allowances in the re-measure | logical-bound control | end-to-end census, re-measure unit | wrong success: an 8 KiB `config` growth is absorbed |
+| M11q | `verify-pack` bound reverted to `stdout_limit_for_objects` | SHA-256 delta-heavy, exact edge | SHA-1 delta-heavy, bound unit | `StdoutLimit { limit: 273152 }`; the exact bound is refused at 17,152 |
+| M11r | the `verify-pack` bound loosened by one byte at the call site | exact edge (the `bound + 1` arm) | SHA-1 and SHA-256 delta-heavy, bound unit | wrong success at 17,699 bytes |
+
+M11f's expected-red end-to-end test is now the census test, and it still turns red. M05a and M05b also turn the
+new 9a and 9b worktree rows red with their callbacks. Every other re-run row flips exactly as in §5.
+
+### 11.4 Gates on the repaired bytes
+
+All were run with `CARGO_HOME=/cargo CARGO_NET_OFFLINE=true CARGO_TARGET_DIR=/tmp/target`, after the matrix had
+restored and verified the sources.
+
+| Gate | Result |
+|---|---|
+| `cargo fmt --all -- --check` | clean |
+| `cargo clippy --locked --offline -p bridge-core --all-targets -- -D warnings` | clean |
+| `cargo test --locked --offline -p bridge-core --lib` | 830 passed, 0 failed, on five further full runs; the first run failed one 2B2a test (below) |
+| `cargo test --locked --offline -p bridge-core --doc` | 9 passed, 0 failed |
+| `cargo test --locked --offline -p bridge-core` | 17 targets, 968 passed, 0 failed |
+| `cargo test --locked --offline --workspace --no-fail-fast`, proxy variables unset (§6) | exit 0; 106 targets, **4574 passed**, 0 failed, 13 ignored |
+| `cargo test --locked --offline --workspace --all-targets --no-fail-fast`, proxy variables unset | exit 0; 90 targets, **4564 passed**, 0 failed, 13 ignored |
+
+**Observed intermittent failure: pre-existing and outside the owned paths.** In the first full `bridge-core --lib`
+run after the matrix, `custody_git_tests::a5c_a5e_and_a5e_r_recheck_after_spawn_bind_and_audit_ancestors` failed at
+`custody_git_tests.rs:114` (`admit fixture`).
+
+- **Mechanism.** Reproduced on this tree in 1 of 12 `--lib custody_` runs:
+  `Spawn(Os { code: 26, kind: ExecutableFileBusy, message: "Text file busy" })`. 2B2a's `FixtureRoute` writes a route
+  script and then executes it. If another test thread forks while the script's write descriptor is open, the child
+  inherits that descriptor until its own `exec`. For that window the kernel refuses to execute the script.
+- **Attribution.** The exact predecessor `91d0bf13` was extracted with `git archive` into `/tmp/base-91d0bf13` and
+  built into `/tmp/target-base`. In this same container it failed in 1 of 20 `--lib custody_` runs. The failure was
+  a different 2B2a test, `w2_stdout_target_cannot_escape_the_pinned_root`, at the same line with the same
+  `ETXTBSY`.
+- **Scope.** The fixture lives in `custody_git_tests.rs`, which is outside §8, so it is not changed here.
+- **Exposure in owned tests.** The new exact-edge route uses the same write-then-execute pattern as control 31 and
+  the version test, which already existed. None of them failed in the observed runs.
+
+### 11.5 Staged paths (repair round 1)
+
+```text
+crates/bridge-core/src/custody_export.rs            (modified)
+crates/bridge-core/src/custody_export_tests.rs      (modified)
+docs/superpowers/reviews/2026-09-25-adr0041-slice2b2-implementation-handoff.md (modified)
+```
+
+Nothing is committed. The two SMELLs remain DEFERRED (§7). What remains for the controller is unchanged from §9 and
+§10: the macOS host lane, the native Linux ext4 lane, and `cargo deny` in CI.

@@ -115,6 +115,17 @@ fn fixture_git_ok(git_dir: &Path, args: &[&str], stdin: Option<&[u8]>) -> String
 }
 
 fn fixture_init_bare(git_dir: &Path) {
+    fixture_init_bare_in(git_dir, CustodyGitObjectFormatV1::Sha1);
+}
+
+fn fixture_format_argument(format: CustodyGitObjectFormatV1) -> &'static str {
+    match format {
+        CustodyGitObjectFormatV1::Sha1 => "--object-format=sha1",
+        CustodyGitObjectFormatV1::Sha256 => "--object-format=sha256",
+    }
+}
+
+fn fixture_init_bare_in(git_dir: &Path, format: CustodyGitObjectFormatV1) {
     let parent = git_dir.parent().expect("a fixture git dir has a parent");
     std::fs::create_dir_all(parent).expect("the fixture parent exists");
     let init = fixture_git(
@@ -123,7 +134,7 @@ fn fixture_init_bare(git_dir: &Path) {
             "init",
             "--bare",
             "--template=",
-            "--object-format=sha1",
+            fixture_format_argument(format),
             git_dir.to_str().expect("utf-8 fixture path"),
         ],
         None,
@@ -165,6 +176,18 @@ fn swap_for_identical_copy(path: &Path) {
     copy_tree(&moved, path);
 }
 
+/// Swap a non-bare worktree root for a new directory at the same path, moving its `.git` across
+/// intact: the git directory and its object store keep their identities, and only the worktree
+/// root now resolves to a different directory object.
+fn swap_worktree_keeping_its_git_dir(worktree: &Path) {
+    let moved = worktree.with_extension("pinned-original");
+    std::fs::rename(worktree, &moved).expect("the fixture swap moves the worktree away");
+    std::fs::create_dir(worktree).expect("a new worktree root at the same path");
+    std::fs::rename(moved.join(".git"), worktree.join(".git"))
+        .expect("the git directory moves across intact");
+    copy_tree(&moved, worktree);
+}
+
 /// Overwrite a file in place with the same number of bytes, every one of them inverted.
 fn invert_in_place(path: &Path) {
     let mut bytes = std::fs::read(path).expect("an in-place overwrite target");
@@ -183,13 +206,20 @@ fn invert_in_place(path: &Path) {
 // The source fixture
 // ---------------------------------------------------------------------------------------------
 
-/// A bare source repository with NO refs at all, so the manifest inventory — not reachability —
-/// is the authority on what the capsule must contain. It holds an unreachable tree with two blob
+/// A source repository with NO refs at all, so the manifest inventory — not reachability — is the
+/// authority on what the capsule must contain. It holds an unreachable tree with two blob
 /// children, a two-commit chain over that tree (the reflog-only commit and its parent), and one
-/// orphan blob. Optionally every object lives in a pinned alternate store instead.
+/// orphan blob. Optionally every object lives in a pinned alternate store instead. It is bare
+/// unless built by `build_non_bare`.
 struct SourceFixtureV1 {
+    /// The source repository root: the worktree of a non-bare source, the git directory of a
+    /// bare one.
+    repository: PathBuf,
     git_dir: PathBuf,
     objects: PathBuf,
+    format: CustodyGitObjectFormatV1,
+    /// Further blobs the manifest declares, beyond the standard six objects.
+    extra_blobs: Vec<String>,
     /// The alternate object store the source's `objects/info/alternates` names, if any.
     alternate: Option<PathBuf>,
     /// Every store the no-mutation observation snapshots.
@@ -244,8 +274,11 @@ impl SourceFixtureV1 {
         objects: FixtureObjectsV1,
     ) -> Self {
         Self {
+            repository: git_dir.clone(),
             objects: git_dir.join("objects"),
             git_dir,
+            format: CustodyGitObjectFormatV1::Sha1,
+            extra_blobs: Vec::new(),
             alternate,
             watched,
             blob_a: objects.blob_a,
@@ -291,20 +324,101 @@ impl SourceFixtureV1 {
         Self::build_with_alternate_under(root, root)
     }
 
+    /// A non-bare source: `worktree` holds one file of worktree bytes, and `git_dir` holds the
+    /// objects. With `git_dir` at `worktree/.git` this is a normal clone; anywhere else it is a
+    /// `--separate-git-dir` layout, with a `.git` gitlink file in the worktree.
+    fn build_non_bare(worktree: &Path, git_dir: &Path) -> Self {
+        std::fs::create_dir_all(worktree).expect("the fixture worktree");
+        let gitlink = worktree.join(".git");
+        let separate = format!("--separate-git-dir={}", git_dir.display());
+        let mut args = vec!["init", "--template=", "--object-format=sha1"];
+        if git_dir != gitlink {
+            args.push(&separate);
+        }
+        args.push(worktree.to_str().expect("utf-8 fixture path"));
+        let init = fixture_git(&gitlink, &args, None);
+        assert!(
+            init.success,
+            "fixture non-bare init failed: {}",
+            String::from_utf8_lossy(&init.stderr)
+        );
+        let objects = write_fixture_objects(git_dir);
+        std::fs::write(
+            worktree.join("README"),
+            b"worktree bytes the export must not touch\n",
+        )
+        .expect("the worktree file");
+        let watched = if git_dir.starts_with(worktree) {
+            vec![worktree.to_path_buf()]
+        } else {
+            vec![worktree.to_path_buf(), git_dir.to_path_buf()]
+        };
+        let mut source = Self::from_objects(git_dir.to_path_buf(), None, watched, objects);
+        source.repository = worktree.to_path_buf();
+        source
+    }
+
+    /// The standard source in `format`, plus `count` blobs that share one 1.2 KiB body and differ
+    /// only in a final line, written by one `fast-import` stream. `pack-objects` stores nearly
+    /// all of them as deltas, so `verify-pack -v` prints a two-object-name row for each.
+    fn build_delta_heavy(root: &Path, format: CustodyGitObjectFormatV1, count: usize) -> Self {
+        let git_dir = root.join("src.git");
+        fixture_init_bare_in(&git_dir, format);
+        let objects = write_fixture_objects(&git_dir);
+        let body: String = (0..24)
+            .map(|line| format!("line {line:04} of the shared custody delta fixture body\n"))
+            .collect();
+        let mut stream = Vec::new();
+        for index in 0..count {
+            let data = format!("{body}variant {index}\n");
+            stream.extend(format!("blob\nmark :{}\ndata {}\n", index + 1, data.len()).bytes());
+            stream.extend(data.bytes());
+            stream.push(b'\n');
+        }
+        let marks = root.join("delta-marks");
+        let marks_argument = format!("--export-marks={}", marks.display());
+        let _ = fixture_git_ok(
+            &git_dir,
+            &["fast-import", "--quiet", &marks_argument],
+            Some(&stream),
+        );
+        let extra_blobs: Vec<String> = std::fs::read_to_string(&marks)
+            .expect("the fast-import marks")
+            .lines()
+            .map(|line| {
+                line.split_once(' ')
+                    .expect("a `:mark object-id` line")
+                    .1
+                    .to_owned()
+            })
+            .collect();
+        assert_eq!(extra_blobs.len(), count, "every delta blob was imported");
+        let mut source = Self::from_objects(git_dir.clone(), None, vec![git_dir], objects);
+        source.format = format;
+        source.extra_blobs = extra_blobs;
+        source
+    }
+
     fn rows(&self) -> Vec<(&str, CustodyGitObjectKindV1)> {
-        vec![
-            (&self.blob_a, CustodyGitObjectKindV1::Blob),
+        let mut rows = vec![
+            (self.blob_a.as_str(), CustodyGitObjectKindV1::Blob),
             (&self.blob_b, CustodyGitObjectKindV1::Blob),
             (&self.tree, CustodyGitObjectKindV1::Tree),
             (&self.parent_commit, CustodyGitObjectKindV1::Commit),
             (&self.child_commit, CustodyGitObjectKindV1::Commit),
             (&self.orphan_blob, CustodyGitObjectKindV1::Blob),
-        ]
+        ];
+        rows.extend(
+            self.extra_blobs
+                .iter()
+                .map(|id| (id.as_str(), CustodyGitObjectKindV1::Blob)),
+        );
+        rows
     }
 
     /// The complete `(format, object_id, kind)` inventory this fixture's manifest declares.
     fn full_inventory(&self) -> Vec<CustodyOriginalObjectV1> {
-        objects_from(&self.rows())
+        objects_in(self.format, &self.rows())
     }
 
     fn inventory_without(&self, omitted: &str) -> Vec<CustodyOriginalObjectV1> {
@@ -313,7 +427,7 @@ impl SourceFixtureV1 {
             .into_iter()
             .filter(|(id, _)| *id != omitted)
             .collect();
-        objects_from(&rows)
+        objects_in(self.format, &rows)
     }
 
     fn ids(&self) -> Vec<String> {
@@ -394,9 +508,16 @@ fn snapshot_tree(root: &Path) -> BTreeMap<String, Vec<u8>> {
 }
 
 fn objects_from(rows: &[(&str, CustodyGitObjectKindV1)]) -> Vec<CustodyOriginalObjectV1> {
+    objects_in(CustodyGitObjectFormatV1::Sha1, rows)
+}
+
+fn objects_in(
+    format: CustodyGitObjectFormatV1,
+    rows: &[(&str, CustodyGitObjectKindV1)],
+) -> Vec<CustodyOriginalObjectV1> {
     rows.iter()
         .map(|(id, kind)| {
-            CustodyOriginalObjectV1::new(CustodyGitObjectFormatV1::Sha1, *id, *kind)
+            CustodyOriginalObjectV1::new(format, *id, *kind)
                 .expect("a fixture object id is well formed")
         })
         .collect()
@@ -678,6 +799,7 @@ impl HarnessV1 {
         CustodyCaptureCapabilityV1::from_fixture_quiescence(
             CustodyQuiescenceDecisionV1::CoherentSnapshot,
             manifest,
+            &self.source.repository,
             &self.source.git_dir,
             &self.source.objects,
             self.streams.clone(),
@@ -793,6 +915,16 @@ fn expect_sealed(outcome: CustodyExportOutcomeV1) -> Box<CustodyExportSealedV1> 
     match outcome {
         CustodyExportOutcomeV1::Sealed(sealed) => sealed,
         other => panic!("expected a sealed capsule, observed {other:?}"),
+    }
+}
+
+/// A one-line account of an export result, so a wrong success names its row without dumping the
+/// whole sealed capsule.
+fn describe_run(result: &Result<CustodyExportOutcomeV1, CustodyExportErrorV1>) -> String {
+    match result {
+        Ok(CustodyExportOutcomeV1::Sealed(_)) => "wrong success: a capsule sealed".to_owned(),
+        Ok(other) => format!("wrong outcome: {other:?}"),
+        Err(error) => format!("refused with {error:?}"),
     }
 }
 
@@ -975,6 +1107,21 @@ fn the_sealed_pack_is_the_verified_pack() {
 #[test]
 fn an_export_through_a_pinned_alternate_store_seals() {
     let harness = HarnessV1::with_alternate();
+    let _ = harness.run_sealed();
+}
+
+/// A non-bare source, with the scratch root outside its worktree, seals. The no-mutation
+/// observation then covers real worktree bytes, not only the git directory.
+#[test]
+fn an_export_from_a_non_bare_source_seals_and_leaves_its_worktree_untouched() {
+    let harness = HarnessV1::with_source(|root| {
+        SourceFixtureV1::build_non_bare(&root.join("repo"), &root.join("repo/.git"))
+    });
+    assert!(harness
+        .source
+        .snapshot()
+        .keys()
+        .any(|key| key.ends_with("repo/README")));
     let _ = harness.run_sealed();
 }
 
@@ -1269,6 +1416,9 @@ enum SourceDriftV1 {
     SwapPrimaryObjectStore,
     /// 9: swap the source git directory for an identical copy.
     SwapSourceGitDirectory,
+    /// 9: swap a non-bare source's worktree root for a new directory, moving its `.git` across
+    /// intact, so the worktree root is the only source identity that changed.
+    SwapSourceWorktreeRoot,
 }
 
 impl SourceDriftV1 {
@@ -1278,6 +1428,9 @@ impl SourceDriftV1 {
                 HarnessV1::with_alternate()
             }
             Self::SwapPrimaryObjectStore | Self::SwapSourceGitDirectory => HarnessV1::new(),
+            Self::SwapSourceWorktreeRoot => HarnessV1::with_source(|root| {
+                SourceFixtureV1::build_non_bare(&root.join("repo"), &root.join("repo/.git"))
+            }),
         }
     }
 
@@ -1298,6 +1451,7 @@ impl SourceDriftV1 {
             }
             Self::SwapPrimaryObjectStore => swap_for_identical_copy(&targets.objects),
             Self::SwapSourceGitDirectory => swap_for_identical_copy(&targets.git_dir),
+            Self::SwapSourceWorktreeRoot => swap_worktree_keeping_its_git_dir(&targets.repository),
         }
     }
 }
@@ -1305,6 +1459,7 @@ impl SourceDriftV1 {
 /// The paths a drift row mutates, owned so the hook closure can outlive the harness borrow.
 struct DriftTargetsV1 {
     root: PathBuf,
+    repository: PathBuf,
     git_dir: PathBuf,
     objects: PathBuf,
     alternate: Option<PathBuf>,
@@ -1317,6 +1472,7 @@ fn assert_callback_refuses_drift(drift: SourceDriftV1, bypass: ExportBypassV1) {
     let harness = drift.harness();
     let targets = DriftTargetsV1 {
         root: harness.root.clone(),
+        repository: harness.source.repository.clone(),
         git_dir: harness.source.git_dir.clone(),
         objects: harness.source.objects.clone(),
         alternate: harness.source.alternate.clone(),
@@ -1327,7 +1483,14 @@ fn assert_callback_refuses_drift(drift: SourceDriftV1, bypass: ExportBypassV1) {
     );
     let _bypass = set_export_bypass_for_test(bypass);
 
-    let error = harness.refuse();
+    let error = match harness.run() {
+        Err(error) => error,
+        wrong => panic!("{drift:?}: {}", describe_run(&wrong)),
+    };
+    assert!(
+        !harness.seal_present(),
+        "{drift:?}: a refused export left a seal"
+    );
     assert!(
         matches!(error, CustodyExportErrorV1::IdentityDrift(_)),
         "{drift:?}: expected identity drift, observed {error:?}"
@@ -1385,11 +1548,13 @@ fn control_05b_post_exit_callback_refuses_alternate_drift() {
 }
 
 /// Control 9a: the source identity is swapped before spawn, with the post-exit callback bypassed.
+/// The worktree-root row changes only the non-bare source's pinned repository root.
 #[test]
 fn control_09a_pre_spawn_callback_refuses_a_swapped_source() {
     for drift in [
         SourceDriftV1::SwapPrimaryObjectStore,
         SourceDriftV1::SwapSourceGitDirectory,
+        SourceDriftV1::SwapSourceWorktreeRoot,
     ] {
         assert_callback_refuses_drift(drift, PRE_SPAWN_ONLY_V1);
     }
@@ -1402,6 +1567,7 @@ fn control_09b_post_exit_callback_refuses_a_swapped_source() {
     for drift in [
         SourceDriftV1::SwapPrimaryObjectStore,
         SourceDriftV1::SwapSourceGitDirectory,
+        SourceDriftV1::SwapSourceWorktreeRoot,
     ] {
         assert_callback_refuses_drift(drift, POST_EXIT_ONLY_V1);
     }
@@ -1863,30 +2029,31 @@ fn control_11_scratch_ledger_admits_max_and_refuses_max_plus_one() {
     assert_eq!(reconciled.used(), 30);
 }
 
-/// Control 11: the enumerated Git-child reservations. `init --bare` is nine entries at the
-/// allowance; `index-pack` is the pack once plus the exact version-2 index and reverse-index
-/// bounds plus three entries; each is admitted by a ledger with exactly that headroom and refused
-/// by one byte less.
+/// Control 11: the enumerated Git-child reservations, each a logical-byte bound plus, apart from
+/// it, entries at the allowance. `init --bare` is nine entries plus 4 KiB for `HEAD` and
+/// `config`; `index-pack` is three entries plus the pack once and the exact version-2 index and
+/// reverse-index bounds. Each is admitted by a ledger with exactly that headroom and refused by one
+/// byte less.
 #[test]
 fn control_11_git_child_reservations_are_exact_and_bounded() {
-    assert_eq!(INIT_BARE_RESERVATION_V1, 9 * 65_536);
+    assert_eq!(INIT_BARE_ENTRIES_V1, 9);
+    assert_eq!(INIT_BARE_LOGICAL_BYTES_V1, 4_096);
+    assert_eq!(INDEX_PACK_ENTRIES_V1, 3);
+    let init = 9 * 65_536 + 4_096;
 
     // N = 6 objects, raw SHA-1 width H = 20, pack length L = 315:
-    // index 1072 + 6·28 + 8·6 + 40 = 1328; reverse 12 + 4·6 + 40 = 76; entries 3·65536.
-    let reservation = index_pack_reservation(315, 6, 20).expect("the bound");
-    assert_eq!(reservation, 315 + 1_328 + 76 + 3 * 65_536);
+    // index 1072 + 6·28 + 8·6 + 40 = 1328; reverse 12 + 4·6 + 40 = 76.
+    let logical = index_pack_logical_bound(315, 6, 20).expect("the bound");
+    assert_eq!(logical, 315 + 1_328 + 76);
     // SHA-256 width H = 32: index 1072 + 6·40 + 48 + 64 = 1424; reverse 12 + 24 + 64 = 100.
     assert_eq!(
-        index_pack_reservation(315, 6, 32).expect("the bound"),
-        315 + 1_424 + 100 + 3 * 65_536
+        index_pack_logical_bound(315, 6, 32).expect("the bound"),
+        315 + 1_424 + 100
     );
-    assert!(index_pack_reservation(u64::MAX, 6, 20).is_err());
-    assert!(index_pack_reservation(0, u64::MAX, 20).is_err());
+    assert!(index_pack_logical_bound(u64::MAX, 6, 20).is_err());
+    assert!(index_pack_logical_bound(0, u64::MAX, 20).is_err());
 
-    for (label, bound) in [
-        ("init --bare", INIT_BARE_RESERVATION_V1),
-        ("index-pack", reservation),
-    ] {
+    for (label, bound) in [("init --bare", init), ("index-pack", logical + 3 * 65_536)] {
         let mut exact = ScratchLedgerV1::new(bound);
         assert!(exact.reserve(bound).is_ok(), "{label}: max");
         let mut short = ScratchLedgerV1::new(bound - 1);
@@ -1943,24 +2110,119 @@ fn control_11_a_read_only_child_is_re_measured_before_the_next_step() {
     );
 }
 
-/// Control 11: the scratch-wide ledger end to end. An export sealed under the V1 ceiling reports
-/// its exact ledger use U. The same export seals with a U-byte budget and refuses with U − 1.
+/// An independent census of everything below a scratch root, sharing no code with the ledger:
+/// `(entries, logical bytes)`, counting every file and directory (the root itself excluded) and
+/// the length of every regular file.
+fn scratch_census(root: &Path) -> (u64, u64) {
+    let (mut entries, mut bytes) = (0_u64, 0_u64);
+    let mut frontier = vec![root.to_path_buf()];
+    while let Some(directory) = frontier.pop() {
+        for entry in std::fs::read_dir(&directory).expect("a census directory") {
+            let path = entry.expect("a census entry").path();
+            let metadata = std::fs::symlink_metadata(&path).expect("census metadata");
+            entries += 1;
+            if metadata.is_dir() {
+                frontier.push(path);
+            } else {
+                bytes += metadata.len();
+            }
+        }
+    }
+    (entries, bytes)
+}
+
+/// §3's scratch use by census: every logical file byte plus the per-entry allowance for every
+/// created file and directory.
+fn census_use(root: &Path) -> u64 {
+    let (entries, bytes) = scratch_census(root);
+    bytes + entries * ENTRY_ALLOWANCE_BYTES_V1
+}
+
+/// Control 11: the scratch-wide ledger end to end, against an independent filesystem census. The
+/// reported ledger use U must equal every created file's logical length plus the per-entry
+/// allowance for every created file and directory, including the `HEAD` and `config` that both
+/// `git init` runs write. The exact-U arm must seal a capsule whose census fits its U-byte budget,
+/// and the U − 1 arm, one byte under the census, must refuse. Every arm is evaluated, and every
+/// failing arm is reported.
 #[test]
 fn control_11_scratch_budget_end_to_end_admits_max_and_refuses_max_plus_one() {
-    let used = HarnessV1::new().run_sealed().evidence.scratch_bytes_used;
+    let probe = HarnessV1::new();
+    let used = probe.run_sealed().evidence.scratch_bytes_used;
+    let (entries, bytes) = scratch_census(&probe.scratch);
+    let census = census_use(&probe.scratch);
+    let mut failures = Vec::new();
+    if used != census {
+        failures.push(format!(
+            "census: the ledger reports {used} bytes, but the scratch root holds {bytes} logical \
+             bytes in {entries} entries, {census} bytes by §3"
+        ));
+    }
 
     let mut exact = HarnessV1::new();
     exact.budgets.max_scratch_bytes = used;
-    let sealed = exact.run_sealed();
-    assert_eq!(sealed.evidence.scratch_bytes_used, used);
+    let result = exact.run();
+    let footprint = census_use(&exact.scratch);
+    if !matches!(result, Ok(CustodyExportOutcomeV1::Sealed(_))) || footprint > used {
+        failures.push(format!(
+            "exact-U arm (budget {used}): {}; census footprint {footprint}",
+            describe_run(&result)
+        ));
+    }
 
     let mut short = HarnessV1::new();
-    short.budgets.max_scratch_bytes = used - 1;
-    let error = short.refuse();
+    short.budgets.max_scratch_bytes = census - 1;
+    let result = short.run();
+    if !matches!(result, Err(CustodyExportErrorV1::ScratchLedger(_))) || short.seal_present() {
+        failures.push(format!(
+            "U - 1 arm (budget {}, one byte under the census): {}",
+            census - 1,
+            describe_run(&result)
+        ));
+    }
     assert!(
-        matches!(error, CustodyExportErrorV1::ScratchLedger(_)),
-        "expected a ledger refusal at U - 1, observed {error:?}"
+        failures.is_empty(),
+        "the ledger does not match the scratch census:\n{}",
+        failures.join("\n")
     );
+}
+
+/// Control 11: a git directory is held to its logical-byte bound, not to its entry allowances.
+/// After the source `git init` exits, its `config` grows by 8 KiB of comment lines: past the 4 KiB
+/// logical bound for `HEAD` and `config`, but far inside the nine 64 KiB entry allowances. The
+/// post-exit re-measure refuses it, so an allowance can never absorb file bytes the ledger did not
+/// charge.
+#[test]
+fn control_11_a_git_directory_is_held_to_its_logical_bound_not_its_entry_allowances() {
+    // Fixture validity: 8 KiB lies between the logical bound and the entry allowances.
+    const {
+        assert!(INIT_BARE_LOGICAL_BYTES_V1 < 8 * 1024);
+        assert!(8 * 1024 < INIT_BARE_ENTRIES_V1 * ENTRY_ALLOWANCE_BYTES_V1);
+    }
+    let harness = HarnessV1::new();
+    let _hook = install_export_hook_for_test(
+        ExportHookPointV1::PostExitCallback,
+        on_nth_call(1, |work| {
+            let mut config = std::fs::OpenOptions::new()
+                .append(true)
+                .open(work.join(SOURCE_GIT_DIR_NAME).join("config"))
+                .expect("the synthesized source config");
+            let mut line = vec![b'#'; 63];
+            line.push(b'\n');
+            for _ in 0..128 {
+                config.write_all(&line).expect("an 8 KiB config comment");
+            }
+        }),
+    );
+
+    let error = match harness.run() {
+        Err(error) => error,
+        wrong => panic!("{}", describe_run(&wrong)),
+    };
+    assert!(
+        matches!(&error, CustodyExportErrorV1::ScratchLedger(detail) if detail.contains(SOURCE_GIT_DIR_NAME)),
+        "expected a logical-bound refusal for {SOURCE_GIT_DIR_NAME}, observed {error:?}"
+    );
+    assert!(!harness.seal_present());
 }
 
 /// Control 11: the derived layout's artifact count is admitted at the budget and refused one
@@ -2415,6 +2677,12 @@ enum OverlapV1 {
     ScratchIsAlternateStore,
     ScratchInsideAlternateStore,
     AlternateStoreInsideScratch,
+    /// A normal non-bare clone, with the scratch root a sibling of `.git` inside the worktree.
+    ScratchInsideSourceWorktree,
+    /// A `--separate-git-dir` clone, whose worktree holds no git directory to trip over.
+    ScratchIsSourceWorktree,
+    /// The same layout, with the scratch root containing the worktree but not the git directory.
+    SourceWorktreeInsideScratch,
 }
 
 impl OverlapV1 {
@@ -2430,16 +2698,27 @@ impl OverlapV1 {
             Self::AlternateStoreInsideScratch => HarnessV1::with_source(|root| {
                 SourceFixtureV1::build_with_alternate_under(root, &root.join("outer"))
             }),
+            Self::ScratchInsideSourceWorktree => HarnessV1::with_source(|root| {
+                SourceFixtureV1::build_non_bare(&root.join("repo"), &root.join("repo/.git"))
+            }),
+            Self::ScratchIsSourceWorktree => HarnessV1::with_source(|root| {
+                SourceFixtureV1::build_non_bare(&root.join("wt"), &root.join("wt.git"))
+            }),
+            Self::SourceWorktreeInsideScratch => HarnessV1::with_source(|root| {
+                SourceFixtureV1::build_non_bare(&root.join("outer/wt"), &root.join("wt.git"))
+            }),
         };
         let alternate = harness.source.alternate.clone();
         harness.scratch = match self {
             Self::ScratchIsSourceGitDir => harness.source.git_dir.clone(),
             Self::ScratchInsideSourceGitDir => harness.source.git_dir.join("inner"),
-            Self::SourceGitDirInsideScratch | Self::AlternateStoreInsideScratch => {
-                harness.root.join("outer")
-            }
+            Self::SourceGitDirInsideScratch
+            | Self::AlternateStoreInsideScratch
+            | Self::SourceWorktreeInsideScratch => harness.root.join("outer"),
             Self::ScratchIsAlternateStore => alternate.expect("an alternate"),
             Self::ScratchInsideAlternateStore => alternate.expect("an alternate").join("inner"),
+            Self::ScratchInsideSourceWorktree => harness.source.repository.join("custody"),
+            Self::ScratchIsSourceWorktree => harness.source.repository.clone(),
         };
         if !harness.scratch.exists() {
             std::fs::create_dir(&harness.scratch).expect("the overlapping scratch root");
@@ -2449,12 +2728,16 @@ impl OverlapV1 {
     }
 }
 
-/// Control 21: the scratch root equals, lies inside, or contains the source git directory or a
-/// pinned alternate store. The emptiness and owner checks are bypassed so the disjointness
-/// preflight is the only guard: each row is refused before any write, and neither the scratch
-/// root nor any store changes.
+/// Control 21: the scratch root equals, lies inside, or contains the source git directory, a
+/// pinned alternate store, or a non-bare source's worktree. The disjointness preflight is the only
+/// guard: each row is refused before any write, and neither the scratch root nor any watched
+/// source path changes. The emptiness and owner checks are bypassed only where the overlapping
+/// scratch root already holds source bytes; a row whose scratch root is a fresh, empty,
+/// owner-private directory, such as `repo/custody` beside `repo/.git`, runs the production
+/// preflight unaided. Every row is evaluated, and every failing row is reported.
 #[test]
 fn control_21_disjointness_preflight_refuses_every_overlap_before_any_write() {
+    let mut failures = Vec::new();
     for overlap in [
         OverlapV1::ScratchIsSourceGitDir,
         OverlapV1::ScratchInsideSourceGitDir,
@@ -2462,33 +2745,43 @@ fn control_21_disjointness_preflight_refuses_every_overlap_before_any_write() {
         OverlapV1::ScratchIsAlternateStore,
         OverlapV1::ScratchInsideAlternateStore,
         OverlapV1::AlternateStoreInsideScratch,
+        OverlapV1::ScratchInsideSourceWorktree,
+        OverlapV1::ScratchIsSourceWorktree,
+        OverlapV1::SourceWorktreeInsideScratch,
     ] {
         let harness = overlap.harness();
-        let _bypass = set_export_bypass_for_test(ExportBypassV1 {
-            scratch_emptiness: true,
-            ..ExportBypassV1::default()
+        let _bypass = (!harness.scratch_is_empty()).then(|| {
+            set_export_bypass_for_test(ExportBypassV1 {
+                scratch_emptiness: true,
+                ..ExportBypassV1::default()
+            })
         });
         let stores = harness.source.snapshot();
         let scratch = snapshot_tree(&harness.scratch);
 
-        let error = harness
-            .run()
-            .expect_err("an overlapping scratch root must refuse");
-        assert!(
-            matches!(error, CustodyExportErrorV1::ScratchPreflight(_)),
-            "{overlap:?}: observed {error:?}"
-        );
-        assert_eq!(
-            harness.source.snapshot(),
-            stores,
-            "{overlap:?}: a store changed"
-        );
-        assert_eq!(
-            snapshot_tree(&harness.scratch),
-            scratch,
-            "{overlap:?}: scratch changed"
-        );
+        let result = harness.run();
+        let after = harness.source.snapshot();
+        let created: Vec<&String> = after
+            .keys()
+            .filter(|key| !stores.contains_key(*key))
+            .collect();
+        let refused = matches!(result, Err(CustodyExportErrorV1::ScratchPreflight(_)));
+        if !refused || after != stores || snapshot_tree(&harness.scratch) != scratch {
+            failures.push(format!(
+                "{overlap:?}: {}; {} source paths created{}",
+                describe_run(&result),
+                created.len(),
+                created
+                    .first()
+                    .map_or(String::new(), |first| format!(", first {first}"))
+            ));
+        }
     }
+    assert!(
+        failures.is_empty(),
+        "overlapping scratch roots were not refused before any write:\n{}",
+        failures.join("\n")
+    );
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -2735,4 +3028,197 @@ fn control_35_the_pack_output_allowance_bounds_the_pack_stream() {
         .expect("the staged pack")
         .len();
     assert!(written < pack_length, "byte B + 1 was written: {written}");
+}
+
+// ---------------------------------------------------------------------------------------------
+// The `verify-pack -v` output bound (control 11)
+// ---------------------------------------------------------------------------------------------
+
+/// Roughly two thousand related blobs: enough that a SHA-256 pack's verbose `verify-pack` rows
+/// outgrow a 128-byte-per-object estimate, while the manifest stays far below 1 MiB.
+const DELTA_BLOBS_V1: usize = 2_000;
+
+/// The `verify-pack -v` bound for `objects` objects of hex width `hex_width`, computed here from
+/// Git's row formats rather than taken from the exporter: a widest delta row (`2·W + 83` bytes), a
+/// widest chain-length histogram line (56 bytes) per object, and the 16 KiB floor.
+fn independent_verify_pack_bound(objects: usize, hex_width: usize) -> usize {
+    objects * (2 * hex_width + 83 + 56) + 16 * 1024
+}
+
+/// Control 11: the `verify-pack -v` bound is format-aware and checked. Its row and histogram
+/// widths are the widths of Git's own formats at their widest values; a SHA-256 row is 48 bytes
+/// wider than a SHA-1 row; and an unrepresentable bound is refused, never saturated.
+#[test]
+fn control_11_verify_pack_bound_is_format_aware_and_checked() {
+    let name = "f".repeat(64);
+    let row = format!(
+        "{name} {:<6} {} {} {} {} {name}\n",
+        "commit",
+        u64::MAX,
+        u64::MAX,
+        u64::MAX,
+        u32::MAX
+    );
+    assert_eq!(row.len(), 2 * 64 + VERIFY_PACK_ROW_BYTES_V1);
+    let histogram = format!("chain length = {}: {} objects\n", i32::MAX, u64::MAX);
+    assert_eq!(histogram.len(), VERIFY_PACK_HISTOGRAM_BYTES_V1);
+
+    let sha1 = verify_pack_stdout_limit(DELTA_BLOBS_V1 + 6, GitObjectFormatV1::Sha1);
+    let sha256 = verify_pack_stdout_limit(DELTA_BLOBS_V1 + 6, GitObjectFormatV1::Sha256);
+    assert_eq!(
+        sha1.expect("SHA-1"),
+        independent_verify_pack_bound(2_006, 40)
+    );
+    assert_eq!(
+        sha256.expect("SHA-256"),
+        independent_verify_pack_bound(2_006, 64)
+    );
+    assert!(matches!(
+        verify_pack_stdout_limit(usize::MAX, GitObjectFormatV1::Sha1),
+        Err(CustodyExportErrorV1::Io(_))
+    ));
+}
+
+/// Export a delta-heavy source in `format`; it must seal. Returns the bytes `verify-pack -v`
+/// printed and the object count.
+fn seal_a_delta_heavy_pack(format: CustodyGitObjectFormatV1) -> (usize, usize) {
+    let mut harness = HarnessV1::with_source(|root| {
+        SourceFixtureV1::build_delta_heavy(root, format, DELTA_BLOBS_V1)
+    });
+    harness.budgets.max_chunk_bytes = MAX_CHUNK_BYTES_V1;
+    let sealed = harness.run_sealed();
+    let objects = harness.manifest.original_objects().len();
+    assert_eq!(sealed.evidence.object_format, format);
+
+    // Fixture validity: the verified pack really is delta-heavy.
+    let verify = harness.work().join(VERIFY_GIT_DIR_NAME);
+    let index = verify.join(format!(
+        "objects/pack/pack-{}.idx",
+        sealed.evidence.pack_hash
+    ));
+    let listing = fixture_git_ok(
+        &verify,
+        &[
+            "verify-pack",
+            "-v",
+            index.to_str().expect("utf-8 index path"),
+        ],
+        None,
+    );
+    let deltas = listing
+        .lines()
+        .filter(|line| line.split_whitespace().count() == 7)
+        .count();
+    assert!(
+        deltas * 10 >= objects * 9,
+        "only {deltas} of {objects} objects are deltas"
+    );
+
+    let printed = sealed
+        .evidence
+        .runs
+        .iter()
+        .find(|run| run.label == "verify-pack")
+        .expect("verify-pack ran")
+        .stdout
+        .length;
+    (printed, objects)
+}
+
+/// Positive: a delta-heavy SHA-1 pack seals, and its verbose `verify-pack` output fits the
+/// format-aware bound.
+#[test]
+fn a_delta_heavy_sha1_pack_seals_within_the_verify_pack_bound() {
+    let (printed, objects) = seal_a_delta_heavy_pack(CustodyGitObjectFormatV1::Sha1);
+    assert!(printed <= independent_verify_pack_bound(objects, 40));
+}
+
+/// Positive: a delta-heavy SHA-256 pack seals. Each delta row carries two 64-character object
+/// names, so the output outgrows the shared 128-byte-per-object estimate; the format-aware bound
+/// admits it.
+#[test]
+fn a_delta_heavy_sha256_pack_seals_within_the_verify_pack_bound() {
+    let (printed, objects) = seal_a_delta_heavy_pack(CustodyGitObjectFormatV1::Sha256);
+    assert!(
+        printed > objects * 128 + 16 * 1024,
+        "fixture validity: {printed} bytes must exceed the 128-byte-per-object estimate"
+    );
+    assert!(printed <= independent_verify_pack_bound(objects, 64));
+}
+
+/// A fixture Git route whose `verify-pack` prints exactly `length` bytes, ending with an
+/// integrity line, and which runs the lane Git for every other command.
+fn verify_pack_output_route(
+    root: &Path,
+    length: usize,
+) -> (GitRouteRequestV1, SealedRouteAnchorV1) {
+    let anchor = root.join("verify-pack-anchor");
+    std::fs::create_dir(&anchor).expect("the route anchor");
+    set_owner_private(&anchor);
+    let ok_line = b"verify.git/objects/pack/pack-edge.pack: ok\n";
+    let mut output = Vec::with_capacity(length);
+    while output.len() + ok_line.len() < length {
+        let width = (length - ok_line.len() - output.len()).min(128);
+        output.resize(output.len() + width - 1, b'x');
+        output.push(b'\n');
+    }
+    output.extend_from_slice(ok_line);
+    assert_eq!(
+        output.len(),
+        length,
+        "the prepared output has the exact length"
+    );
+    let printed = anchor.join("verify-pack.out");
+    std::fs::write(&printed, &output).expect("the prepared verify-pack output");
+    let script = anchor.join("git");
+    std::fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\ncase \"$*\" in *\" verify-pack \"*) exec /bin/cat '{}';; esac\n\
+             exec '{}' \"$@\"\n",
+            printed.display(),
+            lane_git_path().display()
+        ),
+    )
+    .expect("the route script");
+    let sealed = SealedRouteAnchorV1::seal(&script, &anchor);
+    let digest = ExpectedGitDigestV1::from_bytes(sha256_of_file(&script));
+    let route = GitRouteRequestV1::for_test_fixture(script, digest, anchor)
+        .expect("the fixture route is absolute");
+    (route, sealed)
+}
+
+/// Control 11: `verify-pack -v` output of exactly the format-aware bound is admitted and seals;
+/// one byte more is refused with `StdoutLimit` at exactly that bound. The bound is computed here,
+/// not taken from the exporter. Both arms are evaluated, and every failing arm is reported.
+#[test]
+fn control_11_verify_pack_output_admits_its_exact_bound_and_refuses_one_byte_more() {
+    let bound = independent_verify_pack_bound(6, 40);
+    let mut failures = Vec::new();
+    for (arm, length) in [("exact bound", bound), ("bound + 1", bound + 1)] {
+        let mut harness = HarnessV1::new();
+        assert_eq!(harness.manifest.original_objects().len(), 6);
+        let (route, _sealed) = verify_pack_output_route(&harness.root, length);
+        harness.git_route = route;
+        let result = harness.run();
+        let held = if length == bound {
+            matches!(&result, Ok(CustodyExportOutcomeV1::Sealed(sealed)) if sealed
+                .evidence
+                .runs
+                .iter()
+                .any(|run| run.label == "verify-pack" && run.stdout.length == bound))
+        } else {
+            matches!(&result, Err(CustodyExportErrorV1::Git(CustodyGitError::StdoutLimit { limit }))
+                if *limit == bound)
+                && !harness.seal_present()
+        };
+        if !held {
+            failures.push(format!("{arm} ({length} bytes): {}", describe_run(&result)));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "the verify-pack output bound is not exactly {bound} bytes:\n{}",
+        failures.join("\n")
+    );
 }

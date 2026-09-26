@@ -76,6 +76,14 @@ const INIT_BARE_FILES_V1: [&str; 2] = ["HEAD", "config"];
 /// `HEAD`, `config`, and the empty `objects/{info,pack}` and `refs/{heads,tags}` tree, plus the
 /// git directory itself: nine created entries at the per-entry allowance.
 const INIT_BARE_ENTRIES_V1: u64 = 9;
+/// The logical bytes reserved for `HEAD` and `config` before each `git init`, apart from the entry
+/// allowances. `HEAD` is one symbolic-ref line and `config` a handful of `core` and `extensions`
+/// keys: 89 bytes for SHA-1 and 125 for SHA-256 on the container lane. The bound is enforced, not
+/// assumed: the post-exit re-measure refuses any excess, then reconciles the reservation down to
+/// the measured bytes.
+const INIT_BARE_LOGICAL_BYTES_V1: u64 = 4 * 1024;
+/// `index-pack` creates the pack, its version-2 index, and its reverse index.
+const INDEX_PACK_ENTRIES_V1: u64 = 3;
 
 const GIT_STDERR_LIMIT_V1: usize = 64 * 1024;
 /// `cat-file --batch-check` and `cat-file --batch-all-objects` emit one bounded line per object,
@@ -344,6 +352,10 @@ pub(crate) struct CustodyCaptureCapabilityV1 {
     inventory: Vec<(CustodyGitObjectFormatV1, String, CustodyGitObjectKindV1)>,
     primary_store: PinnedObjectStoreV1,
     alternate_stores: Vec<PinnedObjectStoreV1>,
+    /// The source repository root: a non-bare source's worktree, or a bare source's git directory.
+    /// It is pinned apart from the git directory because a worktree holds source bytes outside
+    /// `.git`, and no exporter write may land among them.
+    source_repository: PinnedDirectoryV1,
     source_git_dir: PinnedDirectoryV1,
     shallow_or_grafted: bool,
     unresolved_promisor_boundary: bool,
@@ -412,12 +424,13 @@ impl CustodyCaptureCapabilityV1 {
     ///
     /// The production quiescence primitive does not exist yet, so this crate-private fixture
     /// constructor is the only mint. It still takes a decision value rather than a boolean, and
-    /// it still pins the recursive alternate chain, so the shape the production mint must supply
-    /// is fixed here rather than left to the wiring slice.
+    /// it still pins the recursive alternate chain and the source repository root, so the shape
+    /// the production mint must supply is fixed here rather than left to the wiring slice.
     #[cfg(test)]
     pub(crate) fn from_fixture_quiescence(
         decision: CustodyQuiescenceDecisionV1,
         manifest: &CustodyManifestV1,
+        source_repository: &Path,
         source_git_dir: &Path,
         primary_store: &Path,
         streams: Vec<CustodyCapturedStreamV1>,
@@ -448,6 +461,10 @@ impl CustodyCaptureCapabilityV1 {
                 .collect(),
             primary_store: primary,
             alternate_stores,
+            source_repository: PinnedDirectoryV1::open(
+                source_repository,
+                "custody export source repository",
+            )?,
             source_git_dir: PinnedDirectoryV1::open(source_git_dir, "custody export source")?,
             shallow_or_grafted: false,
             unresolved_promisor_boundary: false,
@@ -550,7 +567,8 @@ impl CustodyCaptureCapabilityV1 {
         for alternate in &self.alternate_stores {
             alternate.recheck()?;
         }
-        pinned_root_unchanged(&self.source_git_dir).map_err(CustodyExportErrorV1::IdentityDrift)
+        pinned_root_unchanged(&self.source_git_dir).map_err(CustodyExportErrorV1::IdentityDrift)?;
+        pinned_root_unchanged(&self.source_repository).map_err(CustodyExportErrorV1::IdentityDrift)
     }
 
     fn object_store_route(&self) -> Result<GitObjectStoreRouteV1, CustodyExportErrorV1> {
@@ -564,9 +582,11 @@ impl CustodyCaptureCapabilityV1 {
         .map_err(CustodyExportErrorV1::Git)
     }
 
-    /// The store paths no scratch root may be, contain, or lie inside.
+    /// The source paths no scratch root may be, contain, or lie inside: the repository root, its
+    /// git directory, the primary object store, and every pinned alternate store.
     fn protected_paths(&self) -> Vec<PathBuf> {
-        let mut paths = vec![self.source_git_dir.canonical_path().to_path_buf()];
+        let mut paths = vec![self.source_repository.canonical_path().to_path_buf()];
+        paths.push(self.source_git_dir.canonical_path().to_path_buf());
         paths.push(self.primary_store.path().to_path_buf());
         paths.extend(
             self.alternate_stores
@@ -1498,13 +1518,13 @@ pub(crate) fn export_capsule_v1(
     // §4.1: the synthesized source git directory is created by `InitBare`, which takes no
     // GIT_DIR, and the exporter writes nothing else into it (control 30). Each git directory
     // carries the budget its post-exit re-measure (§3) is checked against.
-    let source_budget = GitDirectoryBudgetV1::after_init(SOURCE_GIT_DIR_NAME);
-    let mut verify_budget = GitDirectoryBudgetV1::after_init(VERIFY_GIT_DIR_NAME);
+    let mut source_budget = GitDirectoryBudgetV1::for_init(SOURCE_GIT_DIR_NAME);
+    let mut verify_budget = GitDirectoryBudgetV1::for_init(VERIFY_GIT_DIR_NAME);
     init_bare_git_directory(
         &context,
         &ledger,
         &mut runs,
-        &source_budget,
+        &mut source_budget,
         object_format,
         deadline,
     )?;
@@ -1512,7 +1532,7 @@ pub(crate) fn export_capsule_v1(
         &context,
         &ledger,
         &mut runs,
-        &verify_budget,
+        &mut verify_budget,
         object_format,
         deadline,
     )?;
@@ -1526,7 +1546,8 @@ pub(crate) fn export_capsule_v1(
     prove_object_presence(
         &context,
         &source_names,
-        &source_budget,
+        &mut source_budget,
+        &ledger,
         &mut runs,
         &object_lines,
         deadline,
@@ -1536,7 +1557,7 @@ pub(crate) fn export_capsule_v1(
     let pack = produce_pack(
         &context,
         &source_names,
-        &source_budget,
+        &mut source_budget,
         &ledger,
         &mut runs,
         &object_lines,
@@ -1731,19 +1752,20 @@ fn preflight_scratch_root(
     Ok(pin)
 }
 
-/// §2 disjointness: no exporter write may land in a source store. The scratch root must not be,
-/// contain, or lie inside the source git directory, the primary object store, or any pinned
-/// alternate store. Canonical paths are compared in both directions, and so are directory
-/// identities: every ancestor of the scratch root (itself included) against each store, and every
-/// ancestor of each store (itself included) against the scratch root, so an alias that path
-/// comparison cannot see is still refused.
+/// §2 disjointness: no exporter write may land in the source. The scratch root must not be,
+/// contain, or lie inside the source repository root (a non-bare source's worktree), the source
+/// git directory, the primary object store, or any pinned alternate store. Canonical paths are
+/// compared in both directions, and so are directory identities: every ancestor of the scratch
+/// root (itself included) against each protected path, and every ancestor of each protected path
+/// (itself included) against the scratch root, so an alias that path comparison cannot see is
+/// still refused.
 fn refuse_source_overlap(
     canonical: &Path,
     capability: &CustodyCaptureCapabilityV1,
 ) -> Result<(), CustodyExportErrorV1> {
     let refuse = |relation: &str, store: &Path| {
         Err(CustodyExportErrorV1::ScratchPreflight(format!(
-            "the scratch root {} {relation} the source store {}",
+            "the scratch root {} {relation} the protected source path {}",
             canonical.display(),
             store.display()
         )))
@@ -1797,6 +1819,39 @@ fn stdout_limit_for_objects(count: usize) -> usize {
     count
         .saturating_mul(GIT_LINE_BYTES_V1)
         .saturating_add(GIT_MIN_STDOUT_LIMIT_V1)
+}
+
+/// A widest `verify-pack -v` delta row, less its two hex object names:
+/// `<oid> <type> <size> <size-in-pack> <offset> <depth> <base-oid>\n` holds the `%-6s` type, three
+/// `uintmax_t` decimals of at most 20 digits, a `%u` depth of at most 10, six separators, and a
+/// newline.
+const VERIFY_PACK_ROW_BYTES_V1: usize = 6 + 3 * 20 + 10 + 6 + 1;
+/// A widest chain-length histogram line, `chain length = %d: %lu objects\n`. There is at most one
+/// per object.
+const VERIFY_PACK_HISTOGRAM_BYTES_V1: usize = 15 + 10 + 2 + 20 + 9;
+
+/// The `verify-pack -v` stdout bound for `objects` objects. Unlike the other listings, a delta row
+/// carries TWO object names, so the bound depends on the object format: `2·W + 83` bytes for the
+/// widest row at hex width `W`, plus one histogram line, per object. The `non delta` and final
+/// `<pack>: ok` lines fit the fixed floor. The runner fixes `LC_ALL=C`, so these are Git's
+/// untranslated formats. Every step is checked.
+fn verify_pack_stdout_limit(
+    objects: usize,
+    object_format: GitObjectFormatV1,
+) -> Result<usize, CustodyExportErrorV1> {
+    let hex_width = match object_format {
+        GitObjectFormatV1::Sha1 => 40,
+        GitObjectFormatV1::Sha256 => 64,
+    };
+    let per_object = 2 * hex_width + VERIFY_PACK_ROW_BYTES_V1 + VERIFY_PACK_HISTOGRAM_BYTES_V1;
+    objects
+        .checked_mul(per_object)
+        .and_then(|bytes| bytes.checked_add(GIT_MIN_STDOUT_LIMIT_V1))
+        .ok_or_else(|| {
+            CustodyExportErrorV1::Io(
+                "the verify-pack output bound does not fit this platform".into(),
+            )
+        })
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -2008,11 +2063,14 @@ fn init_bare_git_directory(
     context: &ExportContextV1<'_>,
     ledger: &RefCell<ScratchLedgerV1>,
     runs: &mut Vec<GitRunRecordV1>,
-    budget: &GitDirectoryBudgetV1,
+    budget: &mut GitDirectoryBudgetV1,
     object_format: GitObjectFormatV1,
     deadline: Instant,
 ) -> Result<(), CustodyExportErrorV1> {
-    ledger.borrow_mut().reserve(INIT_BARE_RESERVATION_V1)?;
+    // The nine entry allowances and, apart from them, the logical-byte bound for `HEAD` and
+    // `config`; the post-exit re-measure reconciles the latter to the bytes Git wrote.
+    ledger.borrow_mut().reserve_entries(budget.entries)?;
+    ledger.borrow_mut().reserve(budget.logical_bytes)?;
 
     let names = git_root_names(budget.directory)?;
     let request = GitRunRequestV1::new(
@@ -2026,41 +2084,57 @@ fn init_bare_git_directory(
         deadline,
     );
     let result = run_git(context, &names, "init --bare", request, runs)?;
-    remeasure_git_directory(context, budget)?;
+    remeasure_git_directory(context, budget, ledger)?;
     require_success(&result, "init --bare")
 }
 
-/// What one git directory under `work/` may hold once a child exits: its enumerated files and
-/// the cumulative ledger reservation for everything any child wrote there. §3 requires the
-/// re-measure after EVERY child, including the read-only ones, whose reservation is zero.
+/// What one git directory under `work/` may hold once a child exits: its enumerated files, the
+/// logical bytes the ledger charges for them, and the entries it charges at the per-entry
+/// allowance. §3 requires the re-measure after EVERY child, including the read-only ones, which
+/// add nothing to either figure.
 #[derive(Debug)]
 struct GitDirectoryBudgetV1 {
     directory: &'static str,
     files: BTreeSet<String>,
-    reservation: u64,
+    /// The logical file bytes this directory may hold. Each writing child adds its proven bound
+    /// before it runs; each re-measure reconciles the figure, and the ledger, down to the bytes
+    /// measured.
+    logical_bytes: u64,
+    /// Created entries, charged at the per-entry allowance. They are kept apart from
+    /// `logical_bytes`, so an allowance can never absorb file bytes the ledger did not charge.
+    entries: u64,
 }
 
 impl GitDirectoryBudgetV1 {
-    fn after_init(directory: &'static str) -> Self {
+    fn for_init(directory: &'static str) -> Self {
         Self {
             directory,
             files: INIT_BARE_FILES_V1
                 .iter()
                 .map(|name| (*name).to_owned())
                 .collect(),
-            reservation: INIT_BARE_RESERVATION_V1,
+            logical_bytes: INIT_BARE_LOGICAL_BYTES_V1,
+            entries: INIT_BARE_ENTRIES_V1,
         }
     }
 
-    /// Admit the pack, index, and reverse index `index-pack` writes, at its proven bound.
+    /// Admit the pack, index, and reverse index `index-pack` writes, at its proven logical bound
+    /// plus their three entries.
     fn admit_index_pack(
         &mut self,
         pack_hash: &str,
-        reservation: u64,
+        logical_bytes: u64,
     ) -> Result<(), CustodyExportErrorV1> {
-        self.reservation = self.reservation.checked_add(reservation).ok_or_else(|| {
-            CustodyExportErrorV1::ScratchLedger("a git directory budget overflowed".into())
-        })?;
+        let overflow =
+            || CustodyExportErrorV1::ScratchLedger("a git directory budget overflowed".into());
+        self.logical_bytes = self
+            .logical_bytes
+            .checked_add(logical_bytes)
+            .ok_or_else(overflow)?;
+        self.entries = self
+            .entries
+            .checked_add(INDEX_PACK_ENTRIES_V1)
+            .ok_or_else(overflow)?;
         for extension in ["pack", "idx", "rev"] {
             self.files
                 .insert(format!("objects/pack/pack-{pack_hash}.{extension}"));
@@ -2069,17 +2143,13 @@ impl GitDirectoryBudgetV1 {
     }
 }
 
-/// `git init --bare --template=` writes `HEAD`, `config`, and the empty `objects/{info,pack}` and
-/// `refs/{heads,tags}` tree, plus the git directory itself, each at the per-entry allowance.
-const INIT_BARE_RESERVATION_V1: u64 = INIT_BARE_ENTRIES_V1 * ENTRY_ALLOWANCE_BYTES_V1;
-
-/// §3's proven upper bound for one `index-pack --stdin` into an empty verification database. The
-/// temporary and final pack count once at the staged pack length, because the temporary pack is
-/// renamed rather than copied. For `objects` objects and a raw hash width `hash_width`, the
-/// version-2 index is at most `1072 + N·(H + 8) + 8·N + 2·H` bytes and the reverse index at most
-/// `12 + 4·N + 2·H`; no bitmap or `.keep` file is requested. The three files are charged the
-/// per-entry allowance. Every step is checked.
-fn index_pack_reservation(
+/// §3's proven upper bound on the logical bytes of one `index-pack --stdin` into an empty
+/// verification database. The temporary and final pack count once at the staged pack length,
+/// because the temporary pack is renamed rather than copied. For `objects` objects and a raw hash
+/// width `hash_width`, the version-2 index is at most `1072 + N·(H + 8) + 8·N + 2·H` bytes and the
+/// reverse index at most `12 + 4·N + 2·H`; no bitmap or `.keep` file is requested. The three files'
+/// entries are charged separately, as `INDEX_PACK_ENTRIES_V1`. Every step is checked.
+fn index_pack_logical_bound(
     pack_length: u64,
     objects: u64,
     hash_width: u64,
@@ -2101,14 +2171,16 @@ fn index_pack_reservation(
     pack_length
         .checked_add(index)
         .and_then(|total| total.checked_add(reverse))
-        .and_then(|total| total.checked_add(3 * ENTRY_ALLOWANCE_BYTES_V1))
         .ok_or_else(overflow)
 }
 
-/// Re-measure one git directory after a child exits and hold it to its budget.
+/// Re-measure one git directory after a child exits, hold its logical bytes to their own bound,
+/// and reconcile that reservation, in the budget and in the ledger, down to the measured bytes.
+/// The ledger then charges exactly the logical bytes Git wrote there, as §3 requires.
 fn remeasure_git_directory(
     context: &ExportContextV1<'_>,
-    budget: &GitDirectoryBudgetV1,
+    budget: &mut GitDirectoryBudgetV1,
+    ledger: &RefCell<ScratchLedgerV1>,
 ) -> Result<(), CustodyExportErrorV1> {
     let git_dir = context.work.open_existing_child_directory(
         OsStr::new(budget.directory),
@@ -2118,9 +2190,13 @@ fn remeasure_git_directory(
     verify_git_writes(
         &measured,
         &budget.files,
-        budget.reservation,
+        budget.logical_bytes,
         budget.directory,
-    )
+    )?;
+    let unused = budget.logical_bytes.saturating_sub(measured.logical_bytes);
+    ledger.borrow_mut().release(unused);
+    budget.logical_bytes = measured.logical_bytes;
+    Ok(())
 }
 
 #[derive(Debug, Default)]
@@ -2208,7 +2284,8 @@ fn verify_git_writes(
 fn prove_object_presence(
     context: &ExportContextV1<'_>,
     names: &GitRootNamesV1,
-    budget: &GitDirectoryBudgetV1,
+    budget: &mut GitDirectoryBudgetV1,
+    ledger: &RefCell<ScratchLedgerV1>,
     runs: &mut Vec<GitRunRecordV1>,
     object_lines: &[u8],
     deadline: Instant,
@@ -2222,7 +2299,7 @@ fn prove_object_presence(
     );
     request.object_store = Some(context.capability.object_store_route()?);
     let result = run_git(context, names, "cat-file --batch-check", request, runs)?;
-    remeasure_git_directory(context, budget)?;
+    remeasure_git_directory(context, budget, ledger)?;
     require_success(&result, "cat-file --batch-check")?;
 
     let stdout = result
@@ -2295,7 +2372,7 @@ impl VerifiedPackV1 {
 fn produce_pack(
     context: &ExportContextV1<'_>,
     names: &GitRootNamesV1,
-    budget: &GitDirectoryBudgetV1,
+    budget: &mut GitDirectoryBudgetV1,
     ledger: &RefCell<ScratchLedgerV1>,
     runs: &mut Vec<GitRunRecordV1>,
     object_lines: &[u8],
@@ -2337,7 +2414,7 @@ fn produce_pack(
         .stream_stdout_to_new_child(context.work, PACK_FILE_NAME)
         .map_err(CustodyExportErrorV1::Git)?;
     let result = run_git(context, names, "pack-objects --stdout", request, runs)?;
-    remeasure_git_directory(context, budget)?;
+    remeasure_git_directory(context, budget, ledger)?;
     require_success(&result, "pack-objects --stdout")?;
 
     let GitStdoutV1::Streamed(evidence) = &result.stdout else {
@@ -2382,12 +2459,13 @@ fn prove_isolated_closure(
     object_format: GitObjectFormatV1,
     deadline: Instant,
 ) -> Result<String, CustodyExportErrorV1> {
-    let reservation = index_pack_reservation(
+    let logical_bound = index_pack_logical_bound(
         pack.length,
         context.capability.inventory.len() as u64,
         context.capability.raw_hash_width(),
     )?;
-    ledger.borrow_mut().reserve(reservation)?;
+    ledger.borrow_mut().reserve_entries(INDEX_PACK_ENTRIES_V1)?;
+    ledger.borrow_mut().reserve(logical_bound)?;
 
     #[cfg(test)]
     run_hook(
@@ -2406,13 +2484,15 @@ fn prove_isolated_closure(
         context.work.canonical_path(),
     );
 
-    budget.admit_index_pack(&pack_hash, reservation)?;
-    remeasure_git_directory(context, budget)?;
+    budget.admit_index_pack(&pack_hash, logical_bound)?;
+    remeasure_git_directory(context, budget, ledger)?;
 
     fault(
         ExportFaultPointV1::VerifyPack,
         ExportFaultPositionV1::Before,
     )?;
+    let verify_pack_limit =
+        verify_pack_stdout_limit(context.capability.inventory.len(), object_format)?;
     let request = GitRunRequestV1::new(
         GitCommandV1::VerifyPack {
             git_dir: VERIFY_GIT_DIR_NAME.to_owned(),
@@ -2420,12 +2500,12 @@ fn prove_isolated_closure(
             object_format,
         },
         Vec::new(),
-        stdout_limit_for_objects(context.capability.inventory.len()),
+        verify_pack_limit,
         GIT_STDERR_LIMIT_V1,
         deadline,
     );
     let result = run_git(context, names, "verify-pack", request, runs)?;
-    remeasure_git_directory(context, budget)?;
+    remeasure_git_directory(context, budget, ledger)?;
     require_success(&result, "verify-pack")?;
     let stdout = result
         .captured_stdout()
@@ -2459,7 +2539,7 @@ fn prove_isolated_closure(
         request,
         runs,
     )?;
-    remeasure_git_directory(context, budget)?;
+    remeasure_git_directory(context, budget, ledger)?;
     require_success(&result, "cat-file --batch-all-objects")?;
     let stdout = result.captured_stdout().ok_or_else(|| {
         CustodyExportErrorV1::GitOutput("cat-file --batch-all-objects stdout was streamed".into())
@@ -2484,7 +2564,7 @@ fn prove_isolated_closure(
         deadline,
     );
     let result = run_git(context, names, "rev-list --missing=print", request, runs)?;
-    remeasure_git_directory(context, budget)?;
+    remeasure_git_directory(context, budget, ledger)?;
     require_success(&result, "rev-list --missing=print")?;
     let stdout = result
         .captured_stdout()
@@ -2511,7 +2591,7 @@ fn prove_isolated_closure(
         deadline,
     );
     let result = run_git(context, names, "fsck --strict", request, runs)?;
-    remeasure_git_directory(context, budget)?;
+    remeasure_git_directory(context, budget, ledger)?;
     // Step 4's own output check runs BEFORE the generic exit-status check. `fsck --strict` reports
     // a strict-object rejection on stderr and exits non-zero, so letting `require_success` answer
     // first would demote it to a generic child failure. Keeping step 4's classifier here and step
