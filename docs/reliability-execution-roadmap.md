@@ -13,17 +13,21 @@
   `6338bc1628fed52b772026b604a1bbdd710efa8c`; the final Sol/xhigh rereview recorded 0 WRONG and 3 SMELL,
   with full verification at 4,408 passed / 0 failed / 13 ignored / 726 filtered. The candidate remains
   production-unwired; its historical handoff's pre-publication stop is superseded by the recorded PR #102 merge.
-- **Active slice:** **ADR-0041 Slice 2B2 exporter spec review.** Slice 2B2a (descriptor seam and hardened Git
-  runner) **merged in PR #106 at `67f414e7`** on 2026-09-25. All CI jobs were green. The native-ext4 lane is proven
-  by `live_ext4_lane_probe_records_admission`, which asserts `Admitted` under `GITHUB_ACTIONS`.
-  - **2B2a history:** terra implementation, Opus 5.5 repairs, then controller macOS-lane fixes (`EROFS`/`EPERM` write
-    denial, and `killpg` `EPERM` during exit).
-  - **2B2a review:** the Sol implementation review ran rounds 1–2 plus a narrow extension; MATERIAL blockers
-    4 → 1 → 0.
-  - **2B2 spec:** revision 11 **APPROVED** after rounds 1–2 plus one extension (MATERIAL blockers 6 → 2 → 0).
-    Implementation by the Opus 5.5 containerized implementor is next, with the review loop and merge on green CI.
-    The serial order is 2B2a (merged) → 2B2 → 2B2b → 2B3.
-  - **Effects:** no 2B2 effect has started. The 2B2a deferrals are in the ledger below.
+- **Active slice:** **ADR-0041 Slice 2B2b (non-Git framing) — spec drafting is next.** Slice 2B2 (isolated local
+  export and Git-object closure) **merged in PR #111 at `90d3a208`** on 2026-09-26, with all CI jobs green,
+  including native ext4 and Windows. Slice 2B2a merged earlier in PR #106 at `67f414e7`.
+  - **2B2 history:**
+    - **Build:** Opus 5.5 implemented it through the bridge in three edit turns plus two repair turns, after the
+      2026-09-25 provider refresh that made the bridge's `opus` serve Opus 5.5.
+    - **Controller fixes:** the macOS lane sealed two test fixtures to `0500` (test-only), and six exporter-only
+      accessors were gated to `#[cfg(unix)]` for the Windows job.
+    - **Mutation matrix:** 75 rows are defined. 66/66 flipped across the full runs, and the targeted repair-round
+      rows flipped 24/24 and 13/13.
+  - **2B2 review:** the Sol implementation review ran rounds 1–2 plus one narrow extension; MATERIAL blockers went
+    3 → 1 → 0, with round 3 `APPROVE` at `4ce69caa`. The handoff is
+    `docs/superpowers/reviews/2026-09-25-adr0041-slice2b2-implementation-handoff.md`.
+  - **Effects:** the exporter is crate-private and production-unwired; the wiring slice supplies the production mint.
+    The serial order is 2B2a → 2B2 (merged) → 2B2b → 2B3. The 2B2a and 2B2 deferrals are in the ledger below.
   - **Earlier history:** Slice 1A defines canonical lossless records without I/O; Slice 1B adds an
   explicitly capped 8+8 metadata collector and synthetic historical reconciliation, with every missing row still
   unverified. The Opus 5/high spec review reported 4 WRONG and 9 SMELL; Sol/high folded all four WRONG and the
@@ -1015,6 +1019,27 @@ Each item was accepted as deferred by the 2B2a implementation review, and none b
   token, such as a non-interactive shell when the token is exported only from `~/.zshrc`. Still open: export the
   token from a file every shell reads, or make the FAIL message name the bypass variables. The file check cannot
   inspect the Keychain.
+
+### ADR-0041 2B2 deferred follow-ups (ledger, 2026-09-26)
+
+Accepted as deferred by the 2B2 implementation review (round 3 `APPROVE`; the raw results are summarized in PR
+#111). None blocks 2B2b. Detail is in `docs/superpowers/reviews/2026-09-25-adr0041-slice2b2-implementation-handoff.md`.
+
+- **Controls 5b/9b do not create drift *during* the Git child (SMELL).** The drift is installed at pre-spawn with that
+  check bypassed, so it proves the post-exit recheck sees final state, not a change that starts after spawn.
+  **Fix:** a test-only runner seam fired after child start and before exit, which touches the 2B2a seam.
+- **Reverse overlap direction stays path-based (honest limit).** The forward check (scratch ancestors against pinned
+  sources) uses retained descriptor identities. The reverse check (a pinned source inside scratch) compares paths,
+  because `fs_custody.rs` cannot walk upward from a descriptor. The pre-write recheck and the empty-scratch
+  requirement mean no write can pass.
+- **Test flakes seen during 2B2 verification (pre-existing, not changed by 2B2):**
+  - **2B2a fixture `ETXTBSY`:** a Git script written and executed immediately. It failed about 1 in 20 runs on the
+    unmodified base; see handoff §11.4.
+  - **`a2a-bridge` `compatibility_resolution::…process_executor_kills_descendants_when_execution_is_cancelled`:**
+    failed once under full-suite load on macOS, then passed 10/10 in isolation.
+  - **Container proxy environment:** with `HTTP_PROXY`/`HTTPS_PROXY` set, 8 `a2a-bridge` tests fail and the
+    `bridge-api` lib tests hang, because local HTTP mocks go through `reqwest`'s proxy. This reproduces on base
+    `742e0a60`. Run the workspace suite with the proxy variables unset, or set `NO_PROXY` for loopback.
 
 ### Provider refresh 2026-09-25 deferred follow-ups (ledger)
 
