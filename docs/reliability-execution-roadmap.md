@@ -1015,9 +1015,15 @@ Each item was accepted as deferred by the 2B2a implementation review, and none b
   token, such as a non-interactive shell when the token is exported only from `~/.zshrc`. Still open: export the
   token from a file every shell reads, or make the FAIL message name the bypass variables. The file check cannot
   inspect the Keychain.
-- **Reader pin guard is substring-based (provider refresh 2026-09-25, review round 2, open-class).**
-  `reader_dependency_pins.rs` now rejects additive explicit-version selectors, duplicate provenance labels, and
-  duplicate Kiro build arguments. It cannot model npm semantics, though, so a later layer with a bare
+
+### Provider refresh 2026-09-25 deferred follow-ups (ledger)
+
+These were accepted as deferred by the Sol review of the Opus 5.5 provider refresh (branch
+`chore/claude-acp-opus55-20260925`; review round 3 judged the disposition adequate). The evidence is in the
+2026-09-25 section of `docs/compatibility.md`.
+
+- **Reader pin guard is substring-based (open-class).** `reader_dependency_pins.rs` now rejects additive
+  explicit-version selectors, duplicate provenance labels, and duplicate Kiro build arguments. It cannot model npm semantics, though, so a later layer with a bare
   `@openai/codex` operand or `npm update` still passes it. Each review round found a new spelling. **Fix:** assert
   on the built image rather than on the Containerfile text. Read installed `package.json` versions after the final
   layer and compare them with the provenance labels. This belongs in the runbook's Stage 4 image inspection or a

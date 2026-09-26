@@ -131,8 +131,8 @@ skips the file check in these cases:
 - the entry configures an explicit `auth_method`, or is `pre_authenticated`;
 - an explicit auth variable (`ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `CLAUDE_CODE_OAUTH_TOKEN`) is
   non-empty in the smoke's own environment;
-- an external-provider selector (`CLAUDE_CODE_USE_BEDROCK`, `_VERTEX`, `_FOUNDRY`, `_ANTHROPIC_AWS`,
-  `_MANTLE`) is truthy.
+- an external-provider selector (`CLAUDE_CODE_USE_BEDROCK`, `CLAUDE_CODE_USE_VERTEX`,
+  `CLAUDE_CODE_USE_FOUNDRY`, `CLAUDE_CODE_USE_ANTHROPIC_AWS`, or `CLAUDE_CODE_USE_MANTLE`) is truthy.
 
 Without any of these, on a macOS host where Claude Code keeps its login only in the Keychain, there is no
 `~/.claude/.credentials.json`, and a host Claude `smoke` refuses before spawning anything.
