@@ -125,6 +125,29 @@ Run these gates against the private tree before touching production:
 An expired or absent Claude OAuth token blocks live verification even when `initialize` and `models` pass.
 Refresh the host login, sync the isolated reader credential copy when applicable, and rerun doctor.
 
+The host Claude credential-file preflight applies only to automatic first-party authentication.
+`claude_credential_source` in `bin/a2a-bridge/src/doctor.rs` is the authoritative list of exceptions. It
+skips the file check in these cases:
+- the entry configures an explicit `auth_method`, or is `pre_authenticated`;
+- an explicit auth variable (`ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `CLAUDE_CODE_OAUTH_TOKEN`) is
+  non-empty in the smoke's own environment;
+- an external-provider selector (`CLAUDE_CODE_USE_BEDROCK`, `CLAUDE_CODE_USE_VERTEX`,
+  `CLAUDE_CODE_USE_FOUNDRY`, `CLAUDE_CODE_USE_ANTHROPIC_AWS`, or `CLAUDE_CODE_USE_MANTLE`) is truthy.
+
+Without any of these, on a macOS host where Claude Code keeps its login only in the Keychain, there is no
+`~/.claude/.credentials.json`, and a host Claude `smoke` refuses before spawning anything.
+
+A token exported only from an interactive shell rc file is absent from non-interactive shells. Either export it
+into the smoke's environment, or point `CLAUDE_CONFIG_DIR` at a new owner-only directory holding a copy of
+the synced token credential (`~/.config/a2a-creds/claude/.credentials.json`) and delete that copy afterwards.
+
+Token authentication changes the advertised catalog to `default|sonnet|opus|haiku`, with no `opus[1m]`. Run
+`models` under the same environment and pass a model from that catalog.
+
+Neither catalog names the concrete model behind an alias. To prove which one served a lane, read the
+`"model"` field in the Claude session transcript under that config directory's `projects/`; for a reader,
+mount a scratch directory at `/root/.claude/projects`.
+
 ## 4. Repository candidate and image gates
 
 Change the pin regression first and execute an exact RED against the old Containerfile. Then update:
