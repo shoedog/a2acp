@@ -1,8 +1,9 @@
 # Bridge reliability execution and handoff roadmap
 
 - **Program status:** active P0
-- **Current main lineage:** `origin/main` is `5e431f4f2dd6f77c66d64fa28dc48054f396edf9`, the merge of ADR-0041
-  Slice 2B1 in PR #105. Its ancestry includes PR #104 at `27a885f6d4af6a517c2a8899aa5bfe36605b8fb7`, which merged
+- **Current main lineage:** `origin/main` is `f16ca4749b8ac2cbf8c6b059270d446c881bff6d`, which merged docs
+  PR #112 after ADR-0041 Slice 2B2 merged in PR #111 at `90d3a208`. Its ancestry includes the provider refresh
+  (PR #110), Slice 2B2a (PR #106 at `67f414e7`), and Slice 2B1 (PR #105 at `5e431f4f`), plus PR #104 at `27a885f6d4af6a517c2a8899aa5bfe36605b8fb7`, which merged
   Slices 1A, 1B, and 2A with reviewed/published head `65a572df40f07316124a70b7ec353a2d38dd334d`, plus
   ADR-0041 custody-lifecycle documentation PR #103, R2f1b 5B PR #102
   (`edcda181ad94daad6ddaf9d3c9d4dd63fd2dce00`), 5A PR #101, 4J PR #100, 4I PR #99,
@@ -13,7 +14,7 @@
   `6338bc1628fed52b772026b604a1bbdd710efa8c`; the final Sol/xhigh rereview recorded 0 WRONG and 3 SMELL,
   with full verification at 4,408 passed / 0 failed / 13 ignored / 726 filtered. The candidate remains
   production-unwired; its historical handoff's pre-publication stop is superseded by the recorded PR #102 merge.
-- **Active slice:** **ADR-0041 Slice 2B2b (non-Git framing) — spec drafting is next.** Slice 2B2 (isolated local
+- **Active slice:** **ADR-0041 Slice 2B2b1 (pure coverage-payload frame) — spec review.** The owner split 2B2b into 2B2b1 (frame) and 2B2b2 (walker, class selection, and exporter streaming) on 2026-09-26; the 2B2b1 task is `docs/superpowers/plans/2026-09-26-adr0041-slice2b2b1-coverage-frame-task.md`. Slice 2B2 (isolated local
   export and Git-object closure) **merged in PR #111 at `90d3a208`** on 2026-09-26, with all CI jobs green,
   including native ext4 and Windows. Slice 2B2a merged earlier in PR #106 at `67f414e7`.
   - **2B2 history:**
@@ -27,7 +28,7 @@
     3 → 1 → 0, with round 3 `APPROVE` at `4ce69caa`. The handoff is
     `docs/superpowers/reviews/2026-09-25-adr0041-slice2b2-implementation-handoff.md`.
   - **Effects:** the exporter is crate-private and production-unwired; the wiring slice supplies the production mint.
-    The serial order is 2B2a → 2B2 (merged) → 2B2b → 2B3. The 2B2a and 2B2 deferrals are in the ledger below.
+    The serial order is 2B2a → 2B2 (merged) → 2B2b1 → 2B2b2 → 2B3. The 2B2a and 2B2 deferrals are in the ledger below.
   - **Earlier history:** Slice 1A defines canonical lossless records without I/O; Slice 1B adds an
   explicitly capped 8+8 metadata collector and synthetic historical reconciliation, with every missing row still
   unverified. The Opus 5/high spec review reported 4 WRONG and 9 SMELL; Sol/high folded all four WRONG and the

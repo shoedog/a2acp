@@ -55,8 +55,18 @@ serial child, **2B2b**, sequenced after 2B2 and before 2B3, so 2B2 exports opaqu
 carries only restore. 2B2b receives its own reviewed task. See
 `docs/superpowers/plans/2026-09-23-adr0041-slice2b2-isolated-export-task.md` §3.
 
+**Amendment (owner-approved 2026-09-26):** 2B2b is delivered as two serial children:
+- **2B2b1:** the pure, effect-free coverage-payload frame (byte grammar, canonical order, bounds, path and mode
+  policy, and a validating streaming encoder and decoder);
+- **2B2b2:** the descriptor-relative no-follow walker, per-class entry selection, and streaming frame producers
+  for the exporter. It consumes 2B2b1 unchanged.
+
+The serial order is 2B1 → 2B2a → 2B2 → 2B2b1 → 2B2b2 → 2B3. 2B2b1's task is
+`docs/superpowers/plans/2026-09-26-adr0041-slice2b2b1-coverage-frame-task.md`.
+
 **Amendment (owner-approved 2026-09-24):** the descriptor seam and hardened Git runner are split out of 2B2 into child
-**2B2a**, sequenced before 2B2. The serial order is 2B1 → 2B2a → 2B2 → 2B2b → 2B3. 2B2a's task is
+**2B2a**, sequenced before 2B2. The serial order then became 2B1 → 2B2a → 2B2 → 2B2b → 2B3; the 2026-09-26
+amendment above supersedes it with 2B2b1 and 2B2b2. 2B2a's task is
 `docs/superpowers/plans/2026-09-24-adr0041-slice2b2a-git-runner-seam-task.md`; 2B2 builds on its API unchanged.
 
 No child may begin on a merely plausible predecessor. Each binds the exact approved predecessor commit and reruns
