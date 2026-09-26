@@ -3,7 +3,7 @@ task-type: implement
 ---
 # Implement ADR-0041 Slice 2B2b1: the pure coverage-payload frame
 
-**Revision:** 2 (folds spec review round 1; see §12)
+**Revision:** 3 (approved at spec review round 2, with its two DEFERs folded; see §12)
 **Predecessor (merged code base):** `f16ca474` (`main`, after PR #111 / 2B2 at `90d3a208` and docs PR #112)
 **Parent plan:** `docs/superpowers/plans/2026-09-20-adr0041-slice2b-local-capsule-plan.md`, as amended below
 
@@ -256,9 +256,10 @@ unix-only.
      included, and that the trailer digest covers magic through `total`.
 3. **Every refusal in §4 has a dedicated test** that triggers exactly that variant.
    - **Class codes:** a table-driven test covers all 13 accepted class/code pairs, encoding and decoding each. Codes
-     0, 2, and 15, plus `object_database`, are refused.
-   - **Field boundaries:** min, max, and max+1 are covered for the generation length (1/1024/1025), path length
-     (1/4096/4097), component length (1/255/256), symlink target length (1/4095/4096), and mode (`0o777` accepted;
+     0, 2, 15, 16, and 255, plus `object_database`, are refused.
+   - **Field boundaries:** zero, min, max, and max+1 are covered, on both the raw decoder and the constructor, for
+     the generation length (0/1/1024/1025), path length (0/1/4096/4097), component length (0/1/255/256), symlink
+     target length (0/1/4095/4096), and mode (`0o777` accepted;
      each of `0o1000`, `0o2000`, and `0o4000` refused by the encoder; a value above `0o777` refused by the decoder).
 4. **Truncation sweep.** For a small valid frame containing every entry type, decoding every proper prefix, at every
    byte offset, refuses with `Truncated`. None panics, and none returns `Ok(None)`.
@@ -374,9 +375,8 @@ feat(bridge-core): ADR-0041 Slice 2B2b1 coverage-payload frame
 
 ## 12. Review history
 
-**Spec review round 1** (Sol/xhigh, read-only, on revision 1 at `86b51cc6`): REJECT. It reported WRONG 3 MATERIAL
-(blockers), WRONG 1 IMMATERIAL, SMELL 3 MATERIAL, and SMELL 1 IMMATERIAL, all DEFER. Revision 2 folds all of them,
-because each fix is small:
+**Spec review round 1** (Sol/xhigh, read-only, on revision 1 at `86b51cc6`): REJECT. Dispositions: W1–W3 were
+BLOCKERs; W4 and S1–S4 were DEFER. Revision 2 folds all eight, because each fix is small:
 
 - **W1:** the Windows job never runs `bridge-core` tests. §4 now claims Windows compilation only, and names Linux and
   macOS as the test lanes.
@@ -388,3 +388,12 @@ because each fix is small:
 - **S2:** a table covers all 13 class codes, plus min/max/max+1 field matrices.
 - **S3:** the caller supplies `st_mode & 0o7777`, so special bits are refused rather than masked away.
 - **S4:** the parent plan marks the older serial order as superseded.
+
+**Spec review round 2** (final admitted round, on revision 2 at `6c6e4c63`): **APPROVE**. All eight round-1 items
+were RESOLVED.
+
+It left two DEFERs, both folded in revision 3 without another review, because they are additive test cases and a
+wording fix:
+- **a WRONG IMMATERIAL finding:** the history sentence above mixed dispositions and is now corrected;
+- **a SMELL MATERIAL finding:** the boundary matrix lacked class codes 16/255 and the zero-length edges, which §5.3
+  now includes.
