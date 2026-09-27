@@ -3,7 +3,7 @@ task-type: implement
 ---
 # Implement ADR-0041 Slice 2B2b2b1: the coverage plan (class tables, evidence detection, gitlink probe, policy records)
 
-**Revision:** 4 (folds the extension round, see §12). Revision 1 was the combined 2B2b2b task (`47d89436`). Sol spec review round 1 rejected it with 9
+**Revision:** 5 (approved at the second extension round, with its two DEFERs folded; see §12). Revision 1 was the combined 2B2b2b task (`47d89436`). Sol spec review round 1 rejected it with 9
 closed blockers, and the owner approved splitting it into 2B2b2b1 (this plan) and 2B2b2b2 (binding and export) on
 2026-09-27. See §12.
 **Implementation base:** current `main`; bind the exact SHA at dispatch. The predecessor is 2B2b2a, PR #117 at
@@ -268,6 +268,7 @@ outcome maps to exactly one result:
 | pre-write barrier | identity or alternates digest change | `SourceRootDrift` (plan refused) |
 | any stage | ledger reservation over budget, or remeasure over reservation | `PlanningScratchBudget` (plan refused) |
 | any runner call | `InvalidRoute`, `InvalidCommand`, `InvalidObjectStoreRoute`, `ObjectStoreRouteRefused`, `RouteRefusal`, `RouteIdentityChanged`, `DigestMismatch`, `BinaryDrift`, `UnsupportedVersion`, `Spawn`, `Fs`, `StdinNotRegular`, `StdinLimit`, `Stdin` | `ProbeInfrastructure` (plan refused) |
+| runner admission (`GitRunnerV1::admit`, whose internal `Version` run happens before any table stage) | `Timeout`, `Stream`, `StdoutLimit`, `StderrLimit`, or any variant in the row above | `ProbeInfrastructure` (plan refused) |
 | `InitBare` | nonzero exit, `Timeout`, `Stream`, `StdoutLimit`, `StderrLimit` | `ProbeInfrastructure` (plan refused) |
 | index copy | an open or read failure of the source `index` or `sharedindex.*` through the pin | `index` becomes `unresolved` with `ContentUnresolved` |
 | `LsFilesStageZ` | nonzero exit, `Timeout`, `Stream`, `StdoutLimit`, `StderrLimit` | `index` becomes `unresolved` with `ContentUnresolved` |
@@ -295,8 +296,17 @@ A test covers each error variant, and one class-local case per reason code.
      census of the planning scratch, and removing any charge flips the test.
    - A scratch root that is an empty descendant of an alternate store, and one that is an identity alias of an
      alternate store, each refuse `InvalidScratch` with no entry created.
-   - After request construction, rewriting the primary alternates file to name a store that contains the scratch root
-     refuses `SourceRootDrift` before any scratch entry appears. An unchanged chain succeeds.
+   - A **table-driven** barrier regression runs after request construction. Each row makes one change and must
+     refuse `SourceRootDrift` before any scratch entry appears:
+     - replace the source repository;
+     - replace the git directory;
+     - replace the primary object store;
+     - replace a pinned alternate store (each an identity change);
+     - rewrite the primary alternates file;
+     - rewrite a **non-primary** alternate's alternates file to name a store that contains the scratch root.
+
+     An unchanged chain succeeds. One mutation per recheck member removes only that check and turns only its row
+     red.
 3. **Class table.** Every §3.1 row routes as specified, and every special row (`commondir`, `shallow`, grafts,
    locks, the unknown name) gives its state and reason. Real rerere (`MERGE_RR`), notes-merge, and bisect states are
    captured in `in_progress_git_operations`.
@@ -437,3 +447,10 @@ because a pre-write alternate-chain drift barrier was missing. Revision 4 folds 
 
 Findings went 9 → 3 → 1, so the loop is still converging. Revision 4 gets one further narrow extension round,
 disclosed.
+
+**Second extension round** (on revision 4 at `f7ebdd07`): **APPROVE**, with 0 WRONG findings. The barrier and the
+shared init reservations are RESOLVED. Revision 5 folds its two MATERIAL SMELL DEFERs without re-review, because they
+are additive table rows and tests:
+- the runner-admission stage is mapped (§4.5);
+- the drift regression is table-driven over the whole protected set, including a non-primary alternates rewrite,
+  with one mutation per member (§5.2).
