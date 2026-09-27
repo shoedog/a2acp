@@ -55,6 +55,15 @@ serial child, **2B2b**, sequenced after 2B2 and before 2B3, so 2B2 exports opaqu
 carries only restore. 2B2b receives its own reviewed task. See
 `docs/superpowers/plans/2026-09-23-adr0041-slice2b2-isolated-export-task.md` §3.
 
+**Amendment (owner-approved 2026-09-26, later the same day):** 2B2b2 is split again, into:
+- **2B2b2a:** the descriptor-relative no-follow walker. Its task is
+  `docs/superpowers/plans/2026-09-26-adr0041-slice2b2b2a-walker-task.md`.
+- **2B2b2b:** class tables, the coverage plan and manifest binding, and exporter staged frames. Its design notes are
+  `docs/superpowers/plans/2026-09-26-adr0041-slice2b2b2b-coverage-design-notes.md`.
+
+2B2b2b also includes a small, reviewed amendment of 2B2a's closed Git command set: one read-only `ls-files --stage`,
+so gitlinks are detected exactly. The serial order is 2B2b1 → 2B2b2a → 2B2b2b → 2B3.
+
 **Amendment (owner-approved 2026-09-26):** 2B2b is delivered as two serial children:
 - **2B2b1:** the pure, effect-free coverage-payload frame (byte grammar, canonical order, bounds, path and mode
   policy, and a validating streaming encoder and decoder);
