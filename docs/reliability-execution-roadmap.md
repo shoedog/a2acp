@@ -1,8 +1,8 @@
 # Bridge reliability execution and handoff roadmap
 
 - **Program status:** active P0
-- **Current main lineage:** `origin/main` is `b8d2686d1cf15a41600099efbfbc50b63787d6c1`, which merged ADR-0041 Slice
-  2B2b1 in PR #114, after the 2B2b1 spec (PR #113 at `f3a4c0a8`), docs PR #112 (`f16ca474`), and Slice 2B2 (PR
+- **Current main lineage:** `origin/main` is `f42c81fcb7e02f9c0c7529b0981dc53b592508da`, which merged ADR-0041 Slice
+  2B2b2a in PR #117 (after its spec, PR #116 at `980eb52a`), and before that Slice 2B2b1 in PR #114, after the 2B2b1 spec (PR #113 at `f3a4c0a8`), docs PR #112 (`f16ca474`), and Slice 2B2 (PR
   #111 at `90d3a208`). Its ancestry includes the provider refresh
   (PR #110), Slice 2B2a (PR #106 at `67f414e7`), and Slice 2B1 (PR #105 at `5e431f4f`), plus PR #104 at `27a885f6d4af6a517c2a8899aa5bfe36605b8fb7`, which merged
   Slices 1A, 1B, and 2A with reviewed/published head `65a572df40f07316124a70b7ec353a2d38dd334d`, plus
@@ -15,12 +15,18 @@
   `6338bc1628fed52b772026b604a1bbdd710efa8c`; the final Sol/xhigh rereview recorded 0 WRONG and 3 SMELL,
   with full verification at 4,408 passed / 0 failed / 13 ignored / 726 filtered. The candidate remains
   production-unwired; its historical handoff's pre-publication stop is superseded by the recorded PR #102 merge.
-- **Active slice:** **ADR-0041 Slice 2B2b2 (walker, class selection, and exporter streaming) — spec drafting is next.**
-  Slice 2B2b1 (the pure coverage-payload frame) **merged in PR #114 at `b8d2686d`** on 2026-09-26: Opus 5.5 over one
-  implementation turn plus a finalizing continuation, 68/68 mutation rows flipped, and the Sol implementation review
-  approved at round 1. The spec was merged in PR #113. The owner split 2B2b into 2B2b1 and 2B2b2 on 2026-09-26.
-  export and Git-object closure) **merged in PR #111 at `90d3a208`** on 2026-09-26, with all CI jobs green,
-  including native ext4 and Windows. Slice 2B2a merged earlier in PR #106 at `67f414e7`.
+- **Active slice:** **ADR-0041 Slice 2B2b2b (class tables, coverage plan, manifest binding, and exporter staged
+  frames) — spec drafting is next.** It will be drafted against the merged walker API. Its design notes are
+  `docs/superpowers/plans/2026-09-26-adr0041-slice2b2b2b-coverage-design-notes.md`.
+  - **Merged on 2026-09-26/27:**
+    - Slice 2B2b1 (the pure coverage-payload frame) in PR #114 at `b8d2686d`, with its spec in PR #113;
+    - Slice 2B2b2a (the descriptor-relative no-follow walker) in PR #117 at `f42c81fc`, with its spec in PR #116.
+      Opus 5.5 built it via `a2a-bridge implement` (the attempt-2 fix loop repaired a stale A14 count and a
+      symlink-target identity gap). The 36-row matrix flipped every row, and the Sol implementation review approved
+      at round 1.
+  - **Owner decisions of 2026-09-26:** split 2B2b into 2B2b1 and 2B2b2, then split 2B2b2 into 2B2b2a and 2B2b2b;
+    the common-clone class set; capture the whole worktree except `cargo-target-v1`; and exact gitlink detection
+    through an `ls-files --stage` runner amendment.
   - **2B2 history:**
     - **Build:** Opus 5.5 implemented it through the bridge in three edit turns plus two repair turns, after the
       2026-09-25 provider refresh that made the bridge's `opus` serve Opus 5.5.
@@ -1056,6 +1062,13 @@ Accepted as deferred by the 2B2 implementation review (round 3 `APPROVE`; the ra
   race: another test thread forks while a freshly written fixture script is still open for writing. **Fix
   (test-only):** a bounded retry on `ExecutableFileBusy` in the fixture admission paths of `custody_git_tests.rs` and
   `custody_export_tests.rs`.
+
+### ADR-0041 2B2b2a deferred follow-ups (ledger, 2026-09-27)
+
+- **Shared-pin concurrent enumeration (SMELL, MATERIAL, DEFER to 2B2b2b).** `list_child_names` works through a `dup`
+  that shares the pin's directory offset. Two concurrent walks over one `PinnedDirectoryV1` could interleave
+  `readdir`. 2B2b2b must not walk concurrently over a shared pin; each walk must pin its own root. This was found in
+  the Sol implementation review of PR #117 and recorded in the 2B2b2b design notes.
 
 ### Provider refresh 2026-09-25 deferred follow-ups (ledger)
 

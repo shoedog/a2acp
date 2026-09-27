@@ -19,7 +19,7 @@
 2. Read ADR-0041 §§4, 8, 9, 11, 14, and 17; the Slice 2A handoff §4; and the complete plan in §6.
 3. Bind both 2B1 review records, the final approved closure, and the Slice 2B2 review candidate in §6.
 4. Preserve reviewed candidate `88013eb4`, merge `5e431f4f`, and the historical planning branch.
-5. **2B2a, 2B2, and 2B2b1 are merged**: 2B2a in PR #106 at `67f414e7`, 2B2 in PR #111 at `90d3a208`, and 2B2b1 (the pure coverage-payload frame) in PR #114 at `b8d2686d`, with its spec in PR #113. **Next:** draft the 2B2b2 task spec (walker, per-class selection, and exporter streaming), review it under a new two-round cap, then implement with Opus 5.5 and merge when CI is green.
+5. **2B2a, 2B2, 2B2b1, and 2B2b2a are merged**: 2B2a in PR #106 at `67f414e7`, 2B2 in PR #111 at `90d3a208`, 2B2b1 (the frame) in PR #114 at `b8d2686d`, and 2B2b2a (the walker) in PR #117 at `f42c81fc`. **Next:** the 2B2b2b task spec (class tables, coverage plan, manifest binding, the `ls-files --stage` runner amendment, and exporter staged frames), from its design notes.
 
 **STOP conditions:** Do not start 2B2/2B3 effects, use a bare path as a quiescence/capture capability, add remote/provider/destructive authority, publish the docs branch, or mutate the running operator. An open-class review population or exhausted nonconverging cap parks the plan.
 
@@ -34,7 +34,7 @@
 | Durable-state reconciliation | done | `[MEASURED]` roadmap plus Slice 1B/2A handoffs now record PR #104 merged and preserve adoption/effects as separate gates. |
 | Documentation gates | done | `[MEASURED]` `git diff --check` exits 0; locked/offline repository hygiene reports 41 tracked artifacts / 9 validated example configs. No code changed, so no implementation/full-suite claim is made. |
 | Independent spec review | approved | `[MEASURED]` Opus 5/high round 2 returned `APPROVE`: all 4 inherited WRONG RESOLVED, 0 new WRONG, 6 non-blocking SMELL. The converging two-round cap is exhausted; residuals were folded without extension. |
-| Implementation/effects | 2B1, 2B2a, 2B2, and 2B2b1 merged; 2B2b2 next | `[MEASURED]` PR #105 merged candidate `88013eb4` at `5e431f4f`. The 2B2 review candidate binds isolated export/object-closure scope and carries the four dropped public negatives forward. No 2B2/2B3 capsule/restore effect started. |
+| Implementation/effects | 2B1, 2B2a, 2B2, 2B2b1, and 2B2b2a merged; 2B2b2b next | `[MEASURED]` PR #105 merged candidate `88013eb4` at `5e431f4f`. The 2B2 review candidate binds isolated export/object-closure scope and carries the four dropped public negatives forward. No 2B2/2B3 capsule/restore effect started. |
 
 ## 3. Corrections to standing documents and memory
 

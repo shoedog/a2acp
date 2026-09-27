@@ -60,3 +60,6 @@ merges, against its API.
 - Staged-frame export (`work/payload-<code>.frame`, a ledger reservation, a pre-seal receipt comparison, and sealing
   from the retained descriptor), carried from combined revision 1 §5.
 - Lock files and `gc.pid` park with `WriterUncontrolled`, and `shallow` parks, as in combined revision 1.
+- **Walker concurrency contract** (2B2b2a implementation review, deferred). Class walks must not run concurrently
+  over one shared `PinnedDirectoryV1`, because `list_child_names` duplicates the pin's descriptor and shares its
+  directory offset. Either walk classes sequentially, or pin each class root separately.
