@@ -23,9 +23,11 @@ merges, against its API.
 
 ## Round-1 findings owned by 2B2b2b, and the intended resolution
 
-1. **Bind the plan to the manifest (#1).** The capability stores the plan's canonical coverage rows **and** its
-   exclusion and dependency records. Before any scratch write, it requires exact equality with `manifest.coverage()`
-   and with the manifest's exclusions. Receipts bind one-to-one to the captured non-object classes. RED: a
+1. **Bind the plan to the manifest (#1, and walker-lineage round 2 #4).** The capability stores the plan's canonical
+   coverage rows **and** its exclusion and dependency records. Before any scratch write, it requires exact equality
+   of **all three collections** (coverage, exclusions, dependencies) with the manifest's. This adds read-only
+   canonical `exclusions()` and `dependencies()` accessors to `CustodyManifestV1`. RED: change only one dependency
+   digest, and the export refuses before any write. Receipts bind one-to-one to the captured non-object classes. RED: a
    captured-plan row against an empty-manifest row, and the reverse, both refuse before any write.
 2. **Whole-subtree ownership (#2).** Each class owns whole subtrees; no subtree is split between classes.
    - `refs/`, **including** `refs/stash`, belongs to `refs_and_head`. The stash is a ref.
@@ -33,7 +35,10 @@ merges, against its API.
    - `info/`, **including** `sparse-checkout`, belongs to `git_configuration_and_hooks`.
 
    This satisfies ADR-0041's coverage table, because the table requires capture, not a particular class boundary.
-   A cross-class **multiset** control asserts that every source entry appears exactly once across all frames.
+   A cross-class **multiset** control asserts that every source entry appears exactly once across all frames. Its keys
+   are `(RootDomain, lossless_path)`, where `RootDomain` is `RepositoryRoot` or `GitDirectoryRoot` (walker-lineage
+   round 2 #5). A worktree `HEAD` and a git-directory `HEAD` are then distinct, and an external or separate git
+   directory is handled. Tests cover such a collision and a `--separate-git-dir` repository.
 3. **The root `.git` connector (#3).** The worktree frame emits the root `.git` entry itself: a directory as
    `IncludeEntryOnly` (a directory entry with its mode and no children), or a gitfile as ordinary regular-file bytes.
    The git-directory classes own its contents, relative to the git directory. The multiset control counts `.git`

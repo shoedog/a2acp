@@ -3,7 +3,7 @@ task-type: implement
 ---
 # Implement ADR-0041 Slice 2B2b2a: the descriptor-relative no-follow walker
 
-**Revision:** 2. Revision 1 was the combined 2B2b2 task (Parts A and B). Sol spec review round 1 rejected it and
+**Revision:** 3 (folds lineage round 2, see §11). Revision 1 was the combined 2B2b2 task (Parts A and B). Sol spec review round 1 rejected it and
 recommended splitting; the owner approved the split on 2026-09-26. This revision is Part A alone, with the
 walker-side findings folded (§11).
 **Implementation base:** current `main`; bind the exact SHA at dispatch. The predecessor is 2B2b1, PR #114 at
@@ -23,7 +23,13 @@ and never follows a symlink, and it applies a caller-supplied selection. Every e
 - skipped, because the selection says so;
 - or it refuses the walk with a typed error that 2B2b2b maps to a park reason.
 
-A concurrent change to the tree is detected as drift, never silently absorbed. The walker never crosses a device
+A concurrent change to the tree is detected as drift, never silently absorbed.
+
+**Guarantee boundary.** This is detection, not prevention. A change is detected if it is visible in any emitted
+entry's `(kind, dev, ino, mode, size, mtime, ctime)`, or in any directory's child-name set, at any point between the
+entry's first observation and the walk's final verification pass (§4.6). Coherence of the capture rests on the
+capability's quiescence decision (ADR-0041 §8: a coherent snapshot, or exclusive managed-writer quiescence). A writer
+that forges timestamps to hide a change is a hostile same-user racer, which the owner has ruled out of scope. The walker never crosses a device
 boundary. It never writes except into the caller's frame encoder.
 
 ### 1.2 Non-scope
@@ -51,6 +57,9 @@ These are `pub(crate)` and `#[cfg(unix)]`, inside `fs_custody`'s existing author
    `Special(type)`, and `mode` is the full `st_mode & 0o7777`.
 3. **`read_child_symlink(name, max_bytes, label) -> Vec<u8>`.** Uses `readlinkat` into a buffer of `max_bytes + 1`,
    and refuses if the target does not fit. It never truncates.
+4. **`current_metadata(label) -> ChildStatV1`.** `fstat` of the pinned directory's own retained descriptor. It
+   returns the same fields as `child_metadata_no_follow`, and is used for directory drift checks (fold of lineage
+   round 2 #3).
 
 Existing, unchanged, reused:
 - **`open_existing_child_directory`** opens subdirectories no-follow.
@@ -69,7 +78,7 @@ count and files.
 walk_tree_v1(root: &PinnedDirectoryV1,
              selection: &dyn WalkSelectionV1,
              entry_budget: u64,
-             encoder: &mut CustodyFrameEncoderV1<W>) -> Result<WalkReceiptV1, CustodyWalkErrorV1>
+             encoder: CustodyFrameEncoderV1<W>) -> Result<WalkReceiptV1, CustodyWalkErrorV1>
 
 trait WalkSelectionV1 {
     fn decide(&self, path: &CustodyFramePathV1, stat: &ChildStatV1) -> WalkDecisionV1;
@@ -89,8 +98,13 @@ enum WalkDecisionV1 {
   the caller can prove its accounting.
 - **`IncludeEntryOnly`.** This lets 2B2b2b emit a connector entry, such as the worktree's root `.git` directory,
   without descending into it.
-- **Receipt.** `WalkReceiptV1` holds the 2B2b1 frame summary (entries, content bytes, frame bytes, frame SHA-256)
-  plus `skipped_entries`.
+- **Encoder ownership (fold of lineage round 2 #2).** The walker takes the encoder **by value**, calls `finish()` after
+  the final verification pass succeeds, and returns its summary. Callers keep ownership of the sink by passing a
+  borrowed writer as `W` (for example `&mut File`).
+- **Receipt.** `WalkReceiptV1` holds the 2B2b1 frame summary returned by `finish()` (entries, content bytes, frame
+  bytes, frame SHA-256), plus `skipped_entries` and the §4.6 inventory digest.
+- **Selector purity.** `decide` must be a pure function of `(path, stat)`. The walker evaluates it only after sorting,
+  so decisions and the first reported `Park` are independent of `readdir` order.
 - **Errors.** `CustodyWalkErrorV1` is typed:
   - `Frame(CustodyFrameErrorV1)`, which wraps path-length, budget, and mode refusals;
   - `EntryLimit`;
@@ -107,10 +121,9 @@ enum WalkDecisionV1 {
 
 1. **Order.** For each directory:
    - list its children with `list_child_names`, charging the global budget;
-   - get each child's `child_metadata_no_follow`;
-   - apply `decide`;
-   - sort the kept names by byte order;
-   - process them in that order, recursing into an `Include` directory before its next sibling.
+   - **sort all names by byte order**;
+   - then, in that order, get each child's `child_metadata_no_follow` and apply `decide`;
+   - process the kept names in order, recursing into an `Include` directory before its next sibling.
 
    This depth-first pre-order is exactly 2B2b1's component-wise order. At most one name list per depth level is live
    at a time, and all of them share the one global budget.
@@ -137,9 +150,23 @@ enum WalkDecisionV1 {
 
    The re-listing charges a **separate** verification counter that is capped at the same budget, and it does not
    draw on the global emit budget.
-5. **Descent identity.** After opening a child directory, its descriptor's `(dev, ino)` must equal the listing's
-   `fstatat`. Otherwise it is `SourceDrift` (a directory replaced between listing and descent).
-6. **Root.** The walker takes an already pinned `PinnedDirectoryV1`. `PinnedDirectoryV1::open` canonicalizes before
+5. **Descent identity.** After opening a child directory, its descriptor's `current_metadata()` must equal the
+   listing's `fstatat` in `(dev, ino, mode, mtime, ctime)`. Otherwise it is `SourceDrift`: a directory replaced, or
+   `chmod`ed, between listing and descent. The emitted mode is the opened descriptor's mode.
+6. **Final verification pass (fold of lineage round 2 #1).**
+   - **During the walk,** every emitted entry's `(frame path, kind, dev, ino, mode, size, mtime, ctime)` is folded
+     into a running SHA-256, the **inventory digest**. Skipped entries are folded in the same way, with a skip marker.
+   - **After the last entry,** and before `finish()`, the walker re-walks the tree **stat-only**: the same
+     descriptor-relative traversal and the same selection, but with no content reads and no encoding. It recomputes
+     the inventory digest and requires equality.
+   - **Effect.** A change to any entry after it was first observed, such as an earlier sibling edited while a later
+     file is being read, is detected as `SourceDrift`. Memory stays O(depth), because only the running digest and the
+     current path stack are held.
+   - **Budget.** The verification re-walk re-lists each directory through a fresh duplicate, under the same global
+     budget ceiling as a separate counter. The peak live name memory is therefore at most **two budgets' worth**: one
+     list per depth level from each pass, or from the §4.4 re-listing. It is stated and tested at that bound (fold of
+     SMELL-2).
+7. **Root.** The walker takes an already pinned `PinnedDirectoryV1`. `PinnedDirectoryV1::open` canonicalizes before
    pinning, so a symlinked root path resolves to its target. Whether a root may be reached through a symlink at all
    is the pinning caller's policy (2B2b2b), not a walker claim (fold of #9). The walker only checks that the root's
    `(dev, ino)` is unchanged at the start and the end of the walk.
@@ -168,6 +195,9 @@ Each item has a dedicated control over real temp-directory trees, unless a seam 
    subdirectory, on a regular file, and on a symlink each refuses with `MountBoundary`. A regular file whose opened
    `dev` differs from its listing refuses too.
 6. **Drift.** Each of the following refuses with `SourceDrift`, using hook seams between steps:
+   - an **earlier sibling's content edited after its post-read check**, while a later file is still being read, which
+     the §4.6 final pass catches (the lineage round 2 #1 regression);
+   - a directory `chmod`ed between listing and descent (§4.5);
    - a file created after its directory's first listing (the review's #5 regression, with the inode unchanged);
    - a file deleted after listing;
    - a directory replaced between listing and descent;
@@ -175,13 +205,17 @@ Each item has a dedicated control over real temp-directory trees, unless a seam 
    - a file replaced between `fstatat` and open.
 7. **Budget.**
    - The global entry budget at max succeeds and max+1 refuses with `EntryLimit`.
+   - A counting seam proves the peak live name count never exceeds two budgets.
    - A wide parent plus a wide child, with a small budget, refuses without the second list reaching full size. A
      counting seam on name allocations proves this.
    - Frame budget refusals propagate as `Frame(ByteBudget)`.
 8. **Non-UTF-8 names.** On Linux only (`cfg(target_os = "linux")`), a non-UTF-8 name round-trips. macOS APFS refuses
    such names, which is a named exclusion.
 9. **Case-insensitive filesystem (macOS).** The walker emits the on-disk spelling and never folds case.
-10. **Determinism.** Two walks of an unchanged tree produce identical receipts.
+10. **Determinism.** Two walks of an unchanged tree produce identical receipts. A seam that reverses `readdir` order
+    produces the same receipt and the same first `Park`.
+11. **Receipt.** For an empty tree and for a non-empty tree, the returned summary equals the summary obtained by
+    decoding the finished sink with the 2B2b1 decoder.
 
 ## 6. RED-first and mutation evidence
 
@@ -197,7 +231,10 @@ Each item has a dedicated control over real temp-directory trees, unless a seam 
   - the descent identity check off;
   - the global budget off (a per-list budget instead);
   - the `IncludeEntryOnly` handling descending anyway;
-  - the `Skip` counter off.
+  - the `Skip` counter off;
+  - the final verification pass off;
+  - the descent mode comparison off;
+  - the decision made before sorting.
 - Byte-exact restores with a fresh mtime, and a snapshot proof after the matrix.
 
 ## 7. Verification
@@ -217,7 +254,7 @@ In the implementation container, unset `HTTP_PROXY` and `HTTPS_PROXY` for worksp
 
 ## 8. Files
 
-- `crates/bridge-core/src/fs_custody.rs`: only the three §2 methods and their unsafe inventory;
+- `crates/bridge-core/src/fs_custody.rs`: only the four §2 methods and their unsafe inventory;
 - `crates/bridge-core/src/custody_walk.rs` (new) and `custody_walk_tests.rs` (new);
 - `crates/bridge-core/src/lib.rs`: the `#[cfg(unix)] #[allow(dead_code)] mod custody_walk;` declaration only;
 - `docs/superpowers/reviews/<date>-adr0041-slice2b2b2a-implementation-handoff.md`.
@@ -258,3 +295,16 @@ Items #1, #2, #3, #4, #6, and #7 belong to 2B2b2b and are carried in its design 
 ```text
 feat(bridge-core): ADR-0041 Slice 2B2b2a descriptor-relative no-follow walker
 ```
+
+**Lineage round 2** (the first review of this split child, on revision 2 at `b2ebc4a1`): REJECT.
+- **Resolved from round 1:** #5, #8, #9, SMELL-1, and SMELL-2.
+- **New walker blockers,** folded in revision 3:
+  - #1: late mutation of an already-visited entry. Closed as a class by the §4.6 final stat-only verification pass
+    and inventory digest, with the guarantee boundary stated in §1.1.
+  - #2: encoder ownership. The walker now takes the encoder by value and finishes it.
+  - #3: the missing descriptor metadata primitive, added as `current_metadata`.
+- **SMELLs folded:** decisions are made after sorting and the selector is pure; the two-budget peak is stated and
+  tested; the parent plan's stale order line is corrected.
+- **Carried to the 2B2b2b design notes:** #4 (dependency equality) and #5 (the cross-root namespace).
+
+Revision 3 is reviewed in one disclosed extension round, under the owner's authorization while converging.

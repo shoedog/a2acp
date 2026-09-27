@@ -70,7 +70,7 @@ so gitlinks are detected exactly. The serial order is 2B2b1 → 2B2b2a → 2B2b2
 - **2B2b2:** the descriptor-relative no-follow walker, per-class entry selection, and streaming frame producers
   for the exporter. It consumes 2B2b1 unchanged.
 
-The serial order is 2B1 → 2B2a → 2B2 → 2B2b1 → 2B2b2 → 2B3. 2B2b1's task is
+The serial order was then 2B1 → 2B2a → 2B2 → 2B2b1 → 2B2b2 → 2B3; the later amendment above supersedes it, splitting 2B2b2 into 2B2b2a and 2B2b2b. 2B2b1's task is
 `docs/superpowers/plans/2026-09-26-adr0041-slice2b2b1-coverage-frame-task.md`.
 
 **Amendment (owner-approved 2026-09-24):** the descriptor seam and hardened Git runner are split out of 2B2 into child
