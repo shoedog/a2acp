@@ -3,7 +3,7 @@ task-type: implement
 ---
 # Implement ADR-0041 Slice 2B2b2a: the descriptor-relative no-follow walker
 
-**Revision:** 3 (folds lineage round 2, see §11). Revision 1 was the combined 2B2b2 task (Parts A and B). Sol spec review round 1 rejected it and
+**Revision:** 4 (approved at the extension round; see §11). Revision 1 was the combined 2B2b2 task (Parts A and B). Sol spec review round 1 rejected it and
 recommended splitting; the owner approved the split on 2026-09-26. This revision is Part A alone, with the
 walker-side findings folded (§11).
 **Implementation base:** current `main`; bind the exact SHA at dispatch. The predecessor is 2B2b1, PR #114 at
@@ -156,6 +156,16 @@ enum WalkDecisionV1 {
 6. **Final verification pass (fold of lineage round 2 #1).**
    - **During the walk,** every emitted entry's `(frame path, kind, dev, ino, mode, size, mtime, ctime)` is folded
      into a running SHA-256, the **inventory digest**. Skipped entries are folded in the same way, with a skip marker.
+   - **Encoding.** The digest input starts with the domain prefix `a2a-walk-inventory-v1` followed by one NUL byte.
+     Each entry then appends, with every integer little-endian and fixed width:
+     - a `u8` record tag: 1 directory, 2 regular file, 3 symlink, 4 skipped;
+     - a `u16` path length, then the path bytes;
+     - `u64 dev`, `u64 ino`, and `u32 mode` (the full `st_mode & 0o7777`);
+     - `u64 size`;
+     - `i64 mtime_sec`, `u32 mtime_nsec`, `i64 ctime_sec`, and `u32 ctime_nsec`.
+
+     The encoding is injective: every field is fixed width or length-prefixed. A unit test pins the digest of a
+     small tree as a hex literal.
    - **After the last entry,** and before `finish()`, the walker re-walks the tree **stat-only**: the same
      descriptor-relative traversal and the same selection, but with no content reads and no encoding. It recomputes
      the inventory digest and requires equality.
@@ -284,17 +294,11 @@ walker-side items:
 - **#5:** same-inode directory additions. Fixed by post-subtree re-listing and a name-set comparison (§4.4).
 - **#8:** bind-mounted regular files. Fixed by checking `dev` on every entry and on the opened descriptor (§4.3).
 - **#9:** the symlink-root claim was impossible under canonicalizing pins. The claim is removed; admission policy
-  belongs to the caller (§4.6).
+  belongs to the caller (§4.7).
 - **SMELL-1:** enumeration memory. Fixed by one global entry budget (§2.1, §4.1).
 - **SMELL-2:** the split itself, now owner-approved.
 
 Items #1, #2, #3, #4, #6, and #7 belong to 2B2b2b and are carried in its design notes.
-
-## 12. Commit message
-
-```text
-feat(bridge-core): ADR-0041 Slice 2B2b2a descriptor-relative no-follow walker
-```
 
 **Lineage round 2** (the first review of this split child, on revision 2 at `b2ebc4a1`): REJECT.
 - **Resolved from round 1:** #5, #8, #9, SMELL-1, and SMELL-2.
@@ -308,3 +312,15 @@ feat(bridge-core): ADR-0041 Slice 2B2b2a descriptor-relative no-follow walker
 - **Carried to the 2B2b2b design notes:** #4 (dependency equality) and #5 (the cross-root namespace).
 
 Revision 3 is reviewed in one disclosed extension round, under the owner's authorization while converging.
+
+**Extension round** (on revision 3 at `1d9d53d8`): **APPROVE**. Every lineage round-2 item was RESOLVED under the
+quiescence model. Revision 4 folds its two DEFERs without re-review, because they are specification precision:
+- **SMELL, MATERIAL:** the inventory digest now has an exact byte encoding (§4.6).
+- **WRONG, IMMATERIAL:** this history block had been placed under §12, and a Root reference was stale; both are
+  corrected.
+
+## 12. Commit message
+
+```text
+feat(bridge-core): ADR-0041 Slice 2B2b2a descriptor-relative no-follow walker
+```
