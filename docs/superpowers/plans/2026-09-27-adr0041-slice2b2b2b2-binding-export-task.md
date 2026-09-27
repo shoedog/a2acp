@@ -3,7 +3,7 @@ task-type: implement
 ---
 # Implement ADR-0041 Slice 2B2b2b2: plan-to-manifest binding, mount census, and bounded staged-frame export
 
-**Revision:** 2 (folds spec round 1, see §12)
+**Revision:** 3 (folds spec round 2, see §12)
 **Implementation base:** current `main`; bind the exact SHA at dispatch. The predecessor is 2B2b2b1, PR #119 at
 `e5de184b`.
 **Parent plan:** `docs/superpowers/plans/2026-09-20-adr0041-slice2b-local-capsule-plan.md`. The serial order is
@@ -51,7 +51,10 @@ This child does not include production quiescence or minting (the fixture mint r
   (every walked class `empty`) still binds its generation.
 - **Source operations (fix of S1).** Add narrow crate-private methods on `CustodyCoverageSourcesV1`:
   - `recheck()`, covering the whole protected set: identities and alternates digests;
-  - `protected_canonical_paths()`;
+  - `protected_pins() -> Vec<&PinnedDirectoryV1>`, the **retained** pins of the whole protected set, exactly as the
+    existing private `protected()` returns them. The existing retained-identity overlap predicate
+    (`refuse_source_overlap`) and the census consume the pins, so identity aliases of the scratch root are still
+    refused. A canonical-path-only list is **not** sufficient (fix of spec round 2 W1);
   - the object-store route accessors the exporter needs.
 
   They expose neither fields nor re-pinning. The plan-backed capability uses only these methods.
@@ -145,6 +148,9 @@ Staged frames are **retained** under `work/` as evidence, exactly like the stage
    - The injected mount list parks the unit (no entry created) for a mount point at the repository's `target`, and
      for one inside the git directory and one inside an alternate store.
    - A mount point that is a prefix sibling (`/repository` versus `/repo`) does not park.
+   - **Retention:** after a successful export, every staged `work/payload-<code>.frame` still exists, its bytes equal
+     the receipt's frame, and no `work/` entry was deleted. A mutation that removes a staged frame after sealing
+     turns this red (fold of spec round 2 SMELL).
    - The Linux mountinfo parser returns exact output bytes for fixtures containing `0xff`, every supported escape, and
      a literal escaped backslash. It refuses malformed escapes, malformed lines, and oversize input. A `0xff` mount
      point inside the repository parks the unit. A mutation that parses through UTF-8 conversion turns these
@@ -224,3 +230,11 @@ feat(bridge-core): ADR-0041 Slice 2B2b2b2 plan binding, mount census, and bounde
 - **S1, MATERIAL:** the source operations. Fixed with narrow `CustodyCoverageSourcesV1` methods (§2).
 - **S2, MATERIAL:** a byte-exact mountinfo parser, with `0xff` fixtures (§4.1, §6).
 - **S3, IMMATERIAL:** staged frames are retained, not removed (§5).
+
+**Spec round 2** (final admitted, on revision 2 at `5ced38c1`): REJECT. W1 (generation), S2, and S3 were RESOLVED.
+S1 was UNRESOLVED as a WRONG MATERIAL blocker: the specified `protected_canonical_paths()` lost the retained
+identities that the overlap predicate needs to reject aliased scratch roots.
+
+Revision 3 folds it by exposing the retained pins through `protected_pins()` (§2), and adds an explicit retention
+control, from the IMMATERIAL SMELL (§6). Findings went from 4 to 1, in the same area, so the loop is converging.
+Revision 3 gets one narrow disclosed extension round.
