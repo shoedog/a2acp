@@ -3,7 +3,7 @@ task-type: implement
 ---
 # Implement ADR-0041 Slice 2B2b2b2: plan-to-manifest binding, mount census, and bounded staged-frame export
 
-**Revision:** 3 (folds spec round 2, see §12)
+**Revision:** 4 (approved at the extension round, with its DEFER folded; see §12)
 **Implementation base:** current `main`; bind the exact SHA at dispatch. The predecessor is 2B2b2b1, PR #119 at
 `e5de184b`.
 **Parent plan:** `docs/superpowers/plans/2026-09-20-adr0041-slice2b-local-capsule-plan.md`. The serial order is
@@ -143,7 +143,11 @@ Staged frames are **retained** under `work/` as evidence, exactly like the stage
    - a coverage row flipped in each direction;
    - an extra exclusion, and a missing one;
    - one dependency digest changed;
-   - a receipt missing, and an extra receipt.
+   - a receipt missing, and an extra receipt;
+   - **through the plan-backed capability path:** an export scratch root that is an identity alias of a protected
+     pin (the source repository, the git directory, the primary store, or an alternate store) is refused by
+     `refuse_source_overlap` over `protected_pins()`, with no entry created. A mutation that switches the check to
+     canonical paths only turns it red.
 2. **Census.**
    - The injected mount list parks the unit (no entry created) for a mount point at the repository's `target`, and
      for one inside the git directory and one inside an alternate store.
@@ -238,3 +242,6 @@ identities that the overlap predicate needs to reject aliased scratch roots.
 Revision 3 folds it by exposing the retained pins through `protected_pins()` (§2), and adds an explicit retention
 control, from the IMMATERIAL SMELL (§6). Findings went from 4 to 1, in the same area, so the loop is converging.
 Revision 3 gets one narrow disclosed extension round.
+
+**Extension round** (on revision 3 at `80a4c9f5`): **APPROVE**. S1 and the retention SMELL were RESOLVED. Revision 4
+folds its one MATERIAL SMELL DEFER, a plan-backed alias regression (§6.1), without re-review, because it adds a test.
