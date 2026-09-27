@@ -22,6 +22,60 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
 
+/// The attempt cap and pause of [`retry_on_text_file_busy`]: about half a second in all.
+const TEXT_FILE_BUSY_ATTEMPTS: u32 = 50;
+const TEXT_FILE_BUSY_PAUSE: Duration = Duration::from_millis(10);
+
+/// An error that may be the `ETXTBSY` fork/exec race on a just-written fixture script.
+pub(crate) trait TextFileBusy {
+    fn is_text_file_busy(&self) -> bool;
+}
+
+impl TextFileBusy for std::io::Error {
+    fn is_text_file_busy(&self) -> bool {
+        self.kind() == std::io::ErrorKind::ExecutableFileBusy
+            || self.raw_os_error() == Some(libc::ETXTBSY)
+    }
+}
+
+impl TextFileBusy for CustodyGitError {
+    fn is_text_file_busy(&self) -> bool {
+        matches!(self, CustodyGitError::Spawn(error) if error.is_text_file_busy())
+    }
+}
+
+/// Run a test fixture's admission or spawn, retrying while it fails with `ETXTBSY`.
+///
+/// A test that writes a fixture script and then executes it races every other test thread's
+/// fork: a child forked while the script's write descriptor is open keeps a writable duplicate
+/// until its own exec closes it (`O_CLOEXEC`), and the kernel refuses to exec the script
+/// meanwhile. That window closes by itself, so a bounded retry suffices. Any other outcome, or the
+/// last `ETXTBSY` once the attempts are spent, is returned unchanged. Test-only: production never
+/// retries a refused spawn.
+pub(crate) fn retry_on_text_file_busy<T, E: TextFileBusy>(
+    operation: impl FnMut() -> Result<T, E>,
+) -> Result<T, E> {
+    retry_on_text_file_busy_bounded(TEXT_FILE_BUSY_ATTEMPTS, TEXT_FILE_BUSY_PAUSE, operation)
+}
+
+fn retry_on_text_file_busy_bounded<T, E: TextFileBusy>(
+    attempts: u32,
+    pause: Duration,
+    mut operation: impl FnMut() -> Result<T, E>,
+) -> Result<T, E> {
+    assert!(attempts > 0, "at least one attempt");
+    let mut attempt = 1;
+    loop {
+        match operation() {
+            Err(error) if error.is_text_file_busy() && attempt < attempts => {
+                attempt += 1;
+                std::thread::sleep(pause);
+            }
+            outcome => return outcome,
+        }
+    }
+}
+
 fn git_digest(path: &Path) -> ExpectedGitDigestV1 {
     ExpectedGitDigestV1::from_bytes(
         digest::digest(
@@ -99,18 +153,21 @@ impl FixtureRoute {
         Self { directory, path }
     }
 
+    /// Admit this route under its own digest, retrying the version spawn's `ETXTBSY` race.
     fn admit(&self, root: &PinnedDirectoryV1) -> GitRunnerV1 {
-        GitRunnerV1::admit(
-            GitRouteRequestV1::for_test_fixture(
-                self.path.clone(),
-                git_digest(&self.path),
-                self.directory.path().to_path_buf(),
+        retry_on_text_file_busy(|| {
+            GitRunnerV1::admit(
+                GitRouteRequestV1::for_test_fixture(
+                    self.path.clone(),
+                    git_digest(&self.path),
+                    self.directory.path().to_path_buf(),
+                )
+                .expect("fixture route"),
+                root,
+                &names(),
+                Instant::now() + Duration::from_secs(5),
             )
-            .expect("fixture route"),
-            root,
-            &names(),
-            Instant::now() + Duration::from_secs(5),
-        )
+        })
         .expect("admit fixture")
     }
 
@@ -760,13 +817,15 @@ fn a5_route_binding_rechecks_and_digest_refusals_carry_descriptor_facts() {
 #[test]
 fn a5c_a5e_and_a5e_r_recheck_after_spawn_bind_and_audit_ancestors() {
     let (_root_temp, root) = root_fixture();
-    let fixture = FixtureRoute::new(
-        "#!/bin/sh\ncase \"$*\" in *version*) echo 'git version 2.54.0';; *) exit 0;; esac\n",
-    );
-    let runner = fixture.admit(&root);
-    let route = fixture.path.clone();
-    let anchor = fixture.directory.path().to_path_buf();
-    assert!(matches!(
+    // The pre-spawn rewrite reopens the `ETXTBSY` window, and a retried run would refuse the
+    // already-rewritten route before spawning, so each attempt starts from a fresh fixture.
+    let drift = retry_on_text_file_busy(|| {
+        let fixture = FixtureRoute::new(
+            "#!/bin/sh\ncase \"$*\" in *version*) echo 'git version 2.54.0';; *) exit 0;; esac\n",
+        );
+        let runner = fixture.admit(&root);
+        let route = fixture.path.clone();
+        let anchor = fixture.directory.path().to_path_buf();
         runner.run(
             &root,
             &names(),
@@ -779,10 +838,13 @@ fn a5c_a5e_and_a5e_r_recheck_after_spawn_bind_and_audit_ancestors() {
                 fs::set_permissions(&anchor, fs::Permissions::from_mode(0o500)).unwrap();
                 Ok(())
             },
-            || Ok(())
-        ),
-        Err(CustodyGitError::BinaryDrift(_))
-    ));
+            || Ok(()),
+        )
+    });
+    assert!(
+        matches!(drift, Err(CustodyGitError::BinaryDrift(_))),
+        "{drift:?}"
+    );
 
     // A5e: a byte-identical replacement with a new inode, installed between the route audit and the
     // identity binding, whose owner and mode still pass the route rule. Neither the route rule nor
@@ -979,12 +1041,12 @@ fn a5_route_rule_table_and_final_symlink_guard_are_discriminating() {
         Err(CustodyGitError::RouteRefusal(_))
     ));
     let _mutation = bypass_final_symlink_refusal_for_test();
-    assert!(GitRunnerV1::admit(
+    assert!(retry_on_text_file_busy(|| GitRunnerV1::admit(
         request(),
         &root,
         &names(),
         Instant::now() + Duration::from_secs(1)
-    )
+    ))
     .is_ok());
 }
 
@@ -1651,22 +1713,24 @@ fn a5g_post_exit_rehash_a13_version_table_and_a17_profiles_are_enforced() {
         ("not a Git version", false),
     ] {
         let fixture = FixtureRoute::new(&format!("#!/bin/sh\necho '{output}'\n"));
-        let result = GitRunnerV1::admit(
-            GitRouteRequestV1::for_test_fixture(
-                fixture.path.clone(),
-                git_digest(&fixture.path),
-                fixture.directory.path().to_path_buf(),
+        let result = retry_on_text_file_busy(|| {
+            GitRunnerV1::admit(
+                GitRouteRequestV1::for_test_fixture(
+                    fixture.path.clone(),
+                    git_digest(&fixture.path),
+                    fixture.directory.path().to_path_buf(),
+                )
+                .unwrap(),
+                &root,
+                &names(),
+                Instant::now() + Duration::from_secs(1),
             )
-            .unwrap(),
-            &root,
-            &names(),
-            Instant::now() + Duration::from_secs(1),
-        );
+        });
         assert_eq!(result.is_ok(), accepted, "{output}");
     }
     let nonzero = FixtureRoute::new("#!/bin/sh\nexit 7\n");
     assert!(matches!(
-        GitRunnerV1::admit(
+        retry_on_text_file_busy(|| GitRunnerV1::admit(
             GitRouteRequestV1::for_test_fixture(
                 nonzero.path.clone(),
                 git_digest(&nonzero.path),
@@ -1676,7 +1740,7 @@ fn a5g_post_exit_rehash_a13_version_table_and_a17_profiles_are_enforced() {
             &root,
             &names(),
             Instant::now() + Duration::from_secs(1),
-        ),
+        )),
         Err(CustodyGitError::UnsupportedVersion(_))
     ));
 
@@ -2348,33 +2412,38 @@ fn a5a_wrong_digest_prevents_fixture_effect_and_own_digest_allows_it() {
 #[test]
 fn w1_post_exit_caller_check_runs_even_when_the_binary_drifted() {
     let (_root_temp, root) = root_fixture();
-    let fixture = FixtureRoute::new(
-        "#!/bin/sh\ncase \"$*\" in *version*) echo 'git version 2.54.0';; *) exit 0;; esac\n",
-    );
-    let runner = fixture.admit(&root);
-    let route = fixture.path.clone();
-    let anchor = fixture.directory.path().to_path_buf();
     let after_exit_ran = Arc::new(AtomicBool::new(false));
-    let flag = after_exit_ran.clone();
-    let outcome = runner.run(
-        &root,
-        &names(),
-        request(GitCommandV1::FsckStrict, vec![]),
-        move || {
-            // Replace the admitted route after its pre-spawn recheck, so the post-exit recheck
-            // reports drift for a child that has already run.
-            fs::set_permissions(&anchor, fs::Permissions::from_mode(0o700)).unwrap();
-            fs::set_permissions(&route, fs::Permissions::from_mode(0o700)).unwrap();
-            fs::write(&route, "#!/bin/sh\nexit 0\n").unwrap();
-            fs::set_permissions(&route, fs::Permissions::from_mode(0o500)).unwrap();
-            fs::set_permissions(&anchor, fs::Permissions::from_mode(0o500)).unwrap();
-            Ok(())
-        },
-        move || {
-            flag.store(true, Ordering::SeqCst);
-            Ok(())
-        },
-    );
+    // The pre-spawn rewrite reopens the `ETXTBSY` window, and a retried run would refuse the
+    // already-rewritten route before spawning, so each attempt starts from a fresh fixture. A
+    // refused spawn never reaches the post-exit check, so only the final attempt can set the flag.
+    let outcome = retry_on_text_file_busy(|| {
+        let fixture = FixtureRoute::new(
+            "#!/bin/sh\ncase \"$*\" in *version*) echo 'git version 2.54.0';; *) exit 0;; esac\n",
+        );
+        let runner = fixture.admit(&root);
+        let route = fixture.path.clone();
+        let anchor = fixture.directory.path().to_path_buf();
+        let flag = after_exit_ran.clone();
+        runner.run(
+            &root,
+            &names(),
+            request(GitCommandV1::FsckStrict, vec![]),
+            move || {
+                // Replace the admitted route after its pre-spawn recheck, so the post-exit
+                // recheck reports drift for a child that has already run.
+                fs::set_permissions(&anchor, fs::Permissions::from_mode(0o700)).unwrap();
+                fs::set_permissions(&route, fs::Permissions::from_mode(0o700)).unwrap();
+                fs::write(&route, "#!/bin/sh\nexit 0\n").unwrap();
+                fs::set_permissions(&route, fs::Permissions::from_mode(0o500)).unwrap();
+                fs::set_permissions(&anchor, fs::Permissions::from_mode(0o500)).unwrap();
+                Ok(())
+            },
+            move || {
+                flag.store(true, Ordering::SeqCst);
+                Ok(())
+            },
+        )
+    });
     assert!(
         matches!(outcome, Err(CustodyGitError::BinaryDrift(_))),
         "drift must dominate the child outcome"
@@ -2777,4 +2846,112 @@ fn terminating_a_group_whose_leader_already_exited_returns_its_status() {
     std::thread::sleep(Duration::from_millis(200));
     let status = terminate_process_group(&mut child).expect("terminate zombie-only group");
     assert_eq!(status.code(), Some(7));
+}
+
+#[test]
+fn retry_on_text_file_busy_retries_only_etxtbsy_and_only_up_to_its_cap() {
+    use std::io::{Error, ErrorKind};
+    let busy = || Error::from_raw_os_error(libc::ETXTBSY);
+
+    // Both spellings of the race are recognized, directly and inside a spawn refusal, and nothing
+    // else is: another errno, another spawn failure, and a non-spawn Git error.
+    assert!(busy().is_text_file_busy());
+    assert!(Error::from(ErrorKind::ExecutableFileBusy).is_text_file_busy());
+    assert!(CustodyGitError::Spawn(busy()).is_text_file_busy());
+    assert!(!Error::from_raw_os_error(libc::EACCES).is_text_file_busy());
+    assert!(!CustodyGitError::Spawn(Error::from_raw_os_error(libc::ENOENT)).is_text_file_busy());
+    assert!(!CustodyGitError::Timeout.is_text_file_busy());
+
+    // N busy failures, then success: every failure is retried and the success is returned.
+    let mut calls = 0;
+    let outcome = retry_on_text_file_busy(|| {
+        calls += 1;
+        if calls <= 3 {
+            Err(CustodyGitError::Spawn(busy()))
+        } else {
+            Ok(calls)
+        }
+    });
+    assert_eq!(outcome.unwrap(), 4);
+    assert_eq!(calls, 4);
+
+    // Always busy: the helper gives up after exactly its cap and returns the last busy error.
+    let mut calls = 0;
+    let outcome: Result<(), Error> = retry_on_text_file_busy(|| {
+        calls += 1;
+        Err(busy())
+    });
+    assert!(outcome.unwrap_err().is_text_file_busy());
+    assert_eq!(calls, TEXT_FILE_BUSY_ATTEMPTS);
+
+    // A smaller cap is honored too, and a single attempt never retries.
+    for attempts in [1, 2, 7] {
+        let mut calls = 0;
+        let outcome: Result<(), Error> =
+            retry_on_text_file_busy_bounded(attempts, Duration::ZERO, || {
+                calls += 1;
+                Err(busy())
+            });
+        assert!(outcome.is_err());
+        assert_eq!(calls, attempts);
+    }
+
+    // Any other failure is returned at once, unretried.
+    let mut calls = 0;
+    let outcome: Result<(), CustodyGitError> = retry_on_text_file_busy(|| {
+        calls += 1;
+        Err(CustodyGitError::Spawn(Error::from_raw_os_error(
+            libc::EACCES,
+        )))
+    });
+    assert!(
+        matches!(&outcome, Err(CustodyGitError::Spawn(error)) if error.raw_os_error() == Some(libc::EACCES)),
+        "{outcome:?}"
+    );
+    assert_eq!(calls, 1);
+    let mut calls = 0;
+    let outcome: Result<(), Error> = retry_on_text_file_busy(|| {
+        calls += 1;
+        Err(Error::from(ErrorKind::PermissionDenied))
+    });
+    assert_eq!(outcome.unwrap_err().kind(), ErrorKind::PermissionDenied);
+    assert_eq!(calls, 1);
+}
+
+/// The race itself, made deterministic: a held write descriptor stands in for the one a
+/// concurrently forked child inherits. Exec of the script is refused while it is held, the
+/// refusal is what the helper classifies as busy, and the retried exec succeeds once it closes.
+/// Linux only: macOS executes a `#!` script even while a writer is held (observed on this lane).
+#[cfg(target_os = "linux")]
+#[test]
+fn retry_on_text_file_busy_absorbs_a_real_writer_on_the_executed_script() {
+    let directory = TempDir::new().expect("script directory");
+    let path = directory.path().join("script");
+    fs::write(&path, "#!/bin/sh\nexit 0\n").expect("write script");
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).expect("chmod script");
+    let writer = fs::OpenOptions::new()
+        .write(true)
+        .open(&path)
+        .expect("hold a writer");
+    let refused = Command::new(&path)
+        .output()
+        .expect_err("exec must be refused while a writer is held");
+    assert!(refused.is_text_file_busy(), "{refused:?}");
+
+    let release = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(50));
+        drop(writer);
+    });
+    let mut calls = 0;
+    let output = retry_on_text_file_busy(|| {
+        calls += 1;
+        Command::new(&path).output()
+    })
+    .expect("exec succeeds once the writer closes");
+    release.join().unwrap();
+    assert!(output.status.success());
+    assert!(
+        calls > 1,
+        "the first exec raced the held writer and was retried"
+    );
 }

@@ -5,6 +5,8 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+mod text_file_busy;
+
 #[test]
 fn top_level_help_discovers_the_read_only_schedule_status_surface() {
     let output = Command::new(env!("CARGO_BIN_EXE_a2a-bridge"))
@@ -80,6 +82,10 @@ fn schedule_tick_is_recognized_but_refuses_before_provider_capable_spawn() {
     let trap = directory.path().join("codex");
     fs::write(&trap, format!("#!/bin/sh\n: > {:?}\nexit 99\n", marker)).unwrap();
     fs::set_permissions(&trap, fs::Permissions::from_mode(0o700)).unwrap();
+    // Without the warm-up an `ETXTBSY` exec refusal would leave the marker absent even if the
+    // trap were spawned, a false green.
+    text_file_busy::warm_up_script(&trap);
+    fs::remove_file(&marker).expect("the warm-up marker");
 
     let output = Command::new(env!("CARGO_BIN_EXE_a2a-bridge"))
         .arg("compatibility")
@@ -105,6 +111,10 @@ fn schedule_tick_rejects_all_source_arguments_without_inspecting_them() {
     let trap = directory.path().join("codex");
     fs::write(&trap, format!("#!/bin/sh\n: > {:?}\nexit 99\n", marker)).unwrap();
     fs::set_permissions(&trap, fs::Permissions::from_mode(0o700)).unwrap();
+    // Without the warm-up an `ETXTBSY` exec refusal would leave the marker absent even if the
+    // trap were spawned, a false green.
+    text_file_busy::warm_up_script(&trap);
+    fs::remove_file(&marker).expect("the warm-up marker");
     let untrusted_source = directory.path().join("must-not-be-read-or-reported");
 
     let output = Command::new(env!("CARGO_BIN_EXE_a2a-bridge"))
@@ -1047,6 +1057,8 @@ fn compatibility_child_closes_staged_capabilities_before_provider_spawn() {
     let mut permissions = fs::metadata(&adapter).unwrap().permissions();
     permissions.set_mode(0o755);
     fs::set_permissions(&adapter, permissions).unwrap();
+    text_file_busy::warm_up_script(&adapter);
+    fs::remove_file(&report).expect("the warm-up descriptor report");
 
     let config = dir.path().join("a2a-bridge.toml");
     fs::write(

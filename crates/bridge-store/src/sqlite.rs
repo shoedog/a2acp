@@ -30190,6 +30190,29 @@ mod r2f0a_history_tests {
             let helper = directory.path().join("bridge-store-readonly-helper");
             std::fs::copy(&current_exe, &helper).unwrap();
             set_mode(&helper, 0o755);
+            // The copy's write descriptor races every other test thread's fork: a child forked
+            // while it is open keeps a writable duplicate until its own exec, and exec of the copy
+            // is refused meanwhile (`ETXTBSY`). One exec that is not refused, here running no
+            // test, proves no writer remains; the copy is never opened for writing again.
+            let mut attempt = 1;
+            loop {
+                match std::process::Command::new(&helper)
+                    .args(["__text_file_busy_warm_up__", "--exact"])
+                    .output()
+                {
+                    Err(error)
+                        if error.kind() == std::io::ErrorKind::ExecutableFileBusy
+                            && attempt < 50 =>
+                    {
+                        attempt += 1;
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                    outcome => {
+                        outcome.expect("warm-up exec of the copied test binary");
+                        break;
+                    }
+                }
+            }
             helper
         } else {
             current_exe

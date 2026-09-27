@@ -24,6 +24,7 @@ use crate::custody_frame::{
     CustodyFrameHeaderV1,
 };
 use crate::custody_git::{ExpectedGitDigestV1, GitGuardBypassV1};
+use crate::custody_git_tests::retry_on_text_file_busy;
 use crate::custody_inventory::CustodyStateClassV1;
 use crate::custody_mounts::seam as mount_seam;
 use crate::custody_seal::{
@@ -932,6 +933,13 @@ fn set_owner_private(path: &Path) {
 /// `0500`, so the audited components deny effective write access even to a non-root owner (the
 /// macOS host lane); root sees no group or other write bit. Drop reopens the anchor so the
 /// harness's temporary directory can be removed.
+///
+/// Sealing also executes the script once as `<script> --version`, which every route here passes
+/// to the lane Git. A fork in another test thread while the script's write descriptor was open
+/// leaves a writable duplicate in that child until it execs, and exec refuses the script
+/// meanwhile (`ETXTBSY`). The export cannot be retried in place, so the warm-up absorbs the race:
+/// one exec that is not refused proves no writer remains, and none can appear later because the
+/// sealed script is never opened for writing again.
 struct SealedRouteAnchorV1 {
     anchor: PathBuf,
 }
@@ -943,9 +951,12 @@ impl SealedRouteAnchorV1 {
             .expect("seal the fixture route script");
         std::fs::set_permissions(anchor, std::fs::Permissions::from_mode(0o500))
             .expect("seal the fixture route anchor");
-        Self {
+        let sealed = Self {
             anchor: anchor.to_path_buf(),
-        }
+        };
+        retry_on_text_file_busy(|| Command::new(script).arg("--version").output())
+            .expect("the fixture route warm-up exec");
+        sealed
     }
 }
 
@@ -3064,6 +3075,8 @@ fn marker_route(
     )
     .expect("the route script");
     let sealed = SealedRouteAnchorV1::seal(&script, &anchor);
+    // The seal's warm-up exec recorded one invocation; only the export's own may remain.
+    std::fs::remove_file(&marker).expect("the warm-up marker");
     let digest = pin.unwrap_or_else(|| sha256_of_file(&script));
     let route = GitRouteRequestV1::for_test_fixture(
         script,

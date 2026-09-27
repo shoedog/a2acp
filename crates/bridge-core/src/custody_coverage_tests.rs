@@ -12,6 +12,7 @@ use super::seam::{self, PlanPointV1, PlanSeamsV1, ProbeRunV1, WalkEventV1};
 use super::*;
 use crate::custody_frame::{CustodyFrameDecoderV1, CustodyFrameEntryV1};
 use crate::custody_git::{ExpectedGitDigestV1, GitDigestMismatchV1, RouteFactsV1};
+use crate::custody_git_tests::retry_on_text_file_busy;
 use crate::custody_seal::{CustodyGitObjectKindV1, CustodyManifestV1};
 use crate::custody_walk::seam as walk_seam;
 use crate::custody_walk::{ObservationV1, PassV1};
@@ -96,14 +97,8 @@ impl FixtureRouteV1 {
         // writable duplicate in that child until it execs, and exec refuses the script meanwhile
         // (`ETXTBSY`, 2B2a's known fixture race). One exec that is not refused proves no writer
         // remains, and none can appear later: the script is never opened for writing again.
-        for _ in 0..400 {
-            match Command::new(&path).arg("warm-up").output() {
-                Err(error) if error.kind() == std::io::ErrorKind::ExecutableFileBusy => {
-                    std::thread::sleep(Duration::from_millis(5));
-                }
-                _ => break,
-            }
-        }
+        retry_on_text_file_busy(|| Command::new(&path).arg("warm-up").output())
+            .expect("fixture route warm-up exec");
         Self { directory, path }
     }
 
