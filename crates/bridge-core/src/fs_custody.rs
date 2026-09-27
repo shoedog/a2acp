@@ -1287,6 +1287,271 @@ impl PinnedDirectoryV1 {
     }
 }
 
+// ---------------------------------------------------------------------------------------------
+// ADR-0041 slice 2B2b2a: the walker's descriptor-relative, no-follow primitives
+// ---------------------------------------------------------------------------------------------
+
+/// One child name exactly as `readdir` returned it. Every byte is kept, non-UTF-8 sequences
+/// included. `Ord` is lexicographic byte order.
+#[cfg(unix)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) struct ChildBytesV1(Vec<u8>);
+
+#[cfg(unix)]
+impl ChildBytesV1 {
+    pub(crate) fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+
+    pub(crate) fn as_os_str(&self) -> &OsStr {
+        OsStr::from_bytes(&self.0)
+    }
+}
+
+/// The kind of one directory entry, observed without following a symlink.
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ChildKindV1 {
+    Directory,
+    Regular,
+    Symlink,
+    /// A FIFO, socket, or block or character device, carrying its `S_IFMT` bits.
+    Special(u32),
+}
+
+/// One metadata observation of a directory entry. Two observations of one unchanged object are
+/// equal; `atime` is deliberately absent, because reading content changes it.
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ChildStatV1 {
+    pub(crate) kind: ChildKindV1,
+    /// The full `st_mode & 0o7777`: the permission bits plus setuid, setgid, and sticky.
+    pub(crate) mode: u32,
+    pub(crate) size: u64,
+    pub(crate) dev: u64,
+    pub(crate) ino: u64,
+    /// Nanoseconds since the Unix epoch.
+    pub(crate) mtime_ns: i128,
+    pub(crate) ctime_ns: i128,
+}
+
+#[cfg(unix)]
+impl ChildStatV1 {
+    /// The POSIX file-type mask and type values are literals: `libc`'s `mode_t` constants are
+    /// `u16` on macOS and `u32` on Linux.
+    fn from_fields(
+        st_mode: u32,
+        size: u64,
+        dev: u64,
+        ino: u64,
+        mtime: (i64, i64),
+        ctime: (i64, i64),
+    ) -> Self {
+        let file_type = st_mode & 0o170_000;
+        let kind = match file_type {
+            0o040_000 => ChildKindV1::Directory,
+            0o100_000 => ChildKindV1::Regular,
+            0o120_000 => ChildKindV1::Symlink,
+            other => ChildKindV1::Special(other),
+        };
+        let nanoseconds = |(seconds, nanoseconds): (i64, i64)| {
+            i128::from(seconds) * 1_000_000_000 + i128::from(nanoseconds)
+        };
+        Self {
+            kind,
+            mode: st_mode & 0o7777,
+            size,
+            dev,
+            ino,
+            mtime_ns: nanoseconds(mtime),
+            ctime_ns: nanoseconds(ctime),
+        }
+    }
+
+    /// `dev_t`, `ino_t`, `mode_t`, and `time_t` differ in width across the unix targets, so each
+    /// field is widened with a cast that is a no-op on some of them.
+    #[allow(clippy::unnecessary_cast)]
+    fn from_raw(stat: &libc::stat, label: &str) -> Result<Self, FsCustodyError> {
+        let size = u64::try_from(stat.st_size).map_err(|_| {
+            FsCustodyError::Io(
+                label.to_owned(),
+                std::io::Error::from(std::io::ErrorKind::InvalidData),
+            )
+        })?;
+        Ok(Self::from_fields(
+            stat.st_mode as u32,
+            size,
+            stat.st_dev as u64,
+            stat.st_ino as u64,
+            (stat.st_mtime as i64, stat.st_mtime_nsec as i64),
+            (stat.st_ctime as i64, stat.st_ctime_nsec as i64),
+        ))
+    }
+
+    /// The same observation from an open descriptor's metadata (`fstat`).
+    pub(crate) fn from_metadata(metadata: &std::fs::Metadata) -> Self {
+        use std::os::unix::fs::MetadataExt as _;
+        Self::from_fields(
+            metadata.mode(),
+            metadata.size(),
+            metadata.dev(),
+            metadata.ino(),
+            (metadata.mtime(), metadata.mtime_nsec()),
+            (metadata.ctime(), metadata.ctime_nsec()),
+        )
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only count of every name [`PinnedDirectoryV1::list_child_names`] has stored on this
+    /// thread: the walker's name-allocation seam.
+    static LISTED_CHILD_NAMES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn listed_child_names_for_test() -> u64 {
+    LISTED_CHILD_NAMES.with(std::cell::Cell::get)
+}
+
+#[cfg(unix)]
+impl PinnedDirectoryV1 {
+    /// Lists the child names through a duplicate of the retained descriptor (`dup`, then
+    /// `fdopendir`, `rewinddir`, `readdir` to the end, and `closedir`), skipping `.` and `..`.
+    ///
+    /// `remaining` is the caller's entry budget, shared by every listing it charges. Each name is
+    /// charged before it is stored; a name read with the budget at zero refuses
+    /// [`FsCustodyError::EnumerationLimitExceeded`] before it is stored, so every live list the
+    /// caller holds is bounded by that one budget.
+    ///
+    /// The duplicate shares the retained descriptor's directory offset, so the listing rewinds it
+    /// first. Two listings of one pin must therefore not run concurrently.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    pub(crate) fn list_child_names(
+        &self,
+        remaining: &mut u64,
+        label: &str,
+    ) -> Result<Vec<ChildBytesV1>, FsCustodyError> {
+        use std::os::fd::{AsRawFd as _, IntoRawFd as _};
+
+        let io = |error| FsCustodyError::Io(label.to_owned(), error);
+        let duplicate = self.file.try_clone().map_err(io)?;
+        // SAFETY: `duplicate` is a live, owned directory descriptor. On success the stream owns
+        // it; on failure `duplicate` still owns it and closes it when dropped.
+        let stream = unsafe { libc::fdopendir(duplicate.as_raw_fd()) };
+        if stream.is_null() {
+            return Err(io(std::io::Error::last_os_error()));
+        }
+        let _owned_by_stream = duplicate.into_raw_fd();
+        let stream = DirectoryStreamV1(stream);
+        // SAFETY: `stream` is a live directory stream owned by this call.
+        unsafe { libc::rewinddir(stream.0) };
+        let mut names = Vec::new();
+        loop {
+            // SAFETY: errno is thread-local, and clearing it is what lets a null return tell the
+            // end of the stream from an error. `stream` is live.
+            let entry = unsafe {
+                *errno_location() = 0;
+                libc::readdir(stream.0)
+            };
+            if entry.is_null() {
+                let error = std::io::Error::last_os_error();
+                if error.raw_os_error() == Some(0) {
+                    break;
+                }
+                return Err(io(error));
+            }
+            // SAFETY: a non-null entry stays valid until the next `readdir` or `closedir` on this
+            // stream, and `d_name` is NUL-terminated.
+            let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) }.to_bytes();
+            if name == b"." || name == b".." {
+                continue;
+            }
+            if *remaining == 0 {
+                return Err(FsCustodyError::EnumerationLimitExceeded {
+                    label: label.to_owned(),
+                    limit: names.len(),
+                });
+            }
+            *remaining -= 1;
+            names.push(ChildBytesV1(name.to_vec()));
+            #[cfg(test)]
+            LISTED_CHILD_NAMES.with(|listed| listed.set(listed.get() + 1));
+        }
+        Ok(names)
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    pub(crate) fn list_child_names(
+        &self,
+        _remaining: &mut u64,
+        label: &str,
+    ) -> Result<Vec<ChildBytesV1>, FsCustodyError> {
+        Err(FsCustodyError::Unsupported(label.to_owned()))
+    }
+
+    /// `fstatat(AT_SYMLINK_NOFOLLOW)` of one child through the retained descriptor: the entry
+    /// itself, never a symlink's target. `Ok(None)` means the name is absent.
+    pub(crate) fn child_metadata_no_follow(
+        &self,
+        name: &OsStr,
+        label: &str,
+    ) -> Result<Option<ChildStatV1>, FsCustodyError> {
+        let name = child_name_cstring(name, label)?;
+        stat_child_no_follow(&self.file, &name)
+            .map_err(|error| FsCustodyError::Io(label.to_owned(), error))?
+            .map(|stat| ChildStatV1::from_raw(&stat, label))
+            .transpose()
+    }
+
+    /// `readlinkat` of one child through the retained descriptor, into a buffer of
+    /// `max_bytes + 1`. The target is never followed or opened. A target that does not fit in
+    /// `max_bytes` refuses [`FsCustodyError::Unsupported`]; it is never truncated.
+    pub(crate) fn read_child_symlink(
+        &self,
+        name: &OsStr,
+        max_bytes: usize,
+        label: &str,
+    ) -> Result<Vec<u8>, FsCustodyError> {
+        use std::os::fd::AsRawFd as _;
+
+        let name = child_name_cstring(name, label)?;
+        let too_long = || {
+            FsCustodyError::Unsupported(format!(
+                "{label}: symlink target is longer than {max_bytes} bytes"
+            ))
+        };
+        let capacity = max_bytes.checked_add(1).ok_or_else(too_long)?;
+        let mut buffer = vec![0_u8; capacity];
+        // SAFETY: the retained descriptor and the validated name are live, and `buffer` is
+        // writable for `capacity` bytes. `readlinkat` writes no terminating NUL.
+        let read = unsafe {
+            libc::readlinkat(
+                self.file.as_raw_fd(),
+                name.as_ptr(),
+                buffer.as_mut_ptr().cast(),
+                capacity,
+            )
+        };
+        let read = usize::try_from(read)
+            .map_err(|_| FsCustodyError::Io(label.to_owned(), std::io::Error::last_os_error()))?;
+        if read > max_bytes {
+            return Err(too_long());
+        }
+        buffer.truncate(read);
+        Ok(buffer)
+    }
+
+    /// `fstat` of this pin's own retained descriptor, as the same observation
+    /// [`Self::child_metadata_no_follow`] makes of a child.
+    pub(crate) fn current_metadata(&self, label: &str) -> Result<ChildStatV1, FsCustodyError> {
+        self.file
+            .metadata()
+            .map(|metadata| ChildStatV1::from_metadata(&metadata))
+            .map_err(|error| FsCustodyError::Io(label.to_owned(), error))
+    }
+}
+
 pub type ObjectIdentityV2 = RequiredObjectIdentityV2;
 
 #[derive(Clone, Debug)]

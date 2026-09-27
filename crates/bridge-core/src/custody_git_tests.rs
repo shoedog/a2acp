@@ -2223,6 +2223,10 @@ fn a14_ast_inventory_keeps_new_unsafe_boundaries_exact() {
     let owned: BTreeMap<String, usize> = BTreeMap::from([
         ("create_new_child_directory".into(), 2),
         ("root_command".into(), 1),
+        // ADR-0041 2B2b2a: the walker's listing and `readlinkat` primitives, pinned by
+        // `custody_walk::tests::unsafe_inventory_pins_the_new_2b2b2a_sites_and_their_files`.
+        ("list_child_names".into(), 4),
+        ("read_child_symlink".into(), 1),
     ]);
     for (function, count) in &owned {
         assert_eq!(fs_inventory.remove(function), Some(*count), "{function}");
