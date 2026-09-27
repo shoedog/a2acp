@@ -631,6 +631,21 @@ impl CustodyManifestV1 {
     pub(crate) fn generation_id(&self) -> &str {
         &self.generation_id
     }
+
+    /// Read-only canonical exclusion records, for the exporter's plan binding (2B2b2b2 §3.2):
+    /// a coverage plan's exclusions must equal these exactly. No validation or wire change.
+    #[cfg(unix)] // Read only by the unix-only exporter.
+    #[must_use]
+    pub(crate) fn exclusions(&self) -> &[CustodyExclusionV1] {
+        &self.exclusions
+    }
+
+    /// Read-only canonical dependency records. See [`Self::exclusions`].
+    #[cfg(unix)] // Read only by the unix-only exporter.
+    #[must_use]
+    pub(crate) fn dependencies(&self) -> &[CustodyDependencyV1] {
+        &self.dependencies
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

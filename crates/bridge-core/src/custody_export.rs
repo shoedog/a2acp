@@ -11,6 +11,13 @@
 //! Every filesystem effect goes through the descriptor-relative primitives in
 //! [`crate::fs_custody`], and every Git child goes through the closed runner in
 //! [`crate::custody_git`]. This module neither reimplements nor extends either seam.
+//!
+//! **Plan-backed capabilities (slice 2B2b2b2).** A capability minted from a 2B2b2b1 coverage plan
+//! binds that plan exactly to the manifest and takes a mount-point census before any scratch write
+//! (§3, §4). Each of its coverage payloads is then restaged from the source through the plan's own
+//! walk recipe into a bounded `work/payload-<class-code>.frame`, compared with the plan's receipt,
+//! and sealed from that retained descriptor (§5). Each walked class the plan holds `empty` has no
+//! payload, but it is replayed and compared with its zero-entry baseline before the seal.
 
 use crate::custody_capsule::{
     sealed, CustodyCapsuleArtifactRoleV1, CustodyCapsuleBindingV1, CustodyCapsuleErrorV1,
@@ -20,15 +27,19 @@ use crate::custody_capsule::{
     CustodyEnvelopeSealerV1, CustodyEnvelopeSinkValidatorV1, CustodyEnvelopeSourceDescriptorV1,
     CustodyEnvelopeSourceValidatorV1, CustodyEnvelopeStreamLimitsV1, CustodyRestorePolicyV1,
 };
+use crate::custody_coverage::{
+    restage_class_v1, CustodyClassReceiptV1, CustodyCoveragePlanV1, CustodyCoverageSourcesV1,
+};
 use crate::custody_git::{
     CustodyGitError, GitCommandV1, GitObjectFormatV1, GitObjectStoreRouteV1, GitRootNamesV1,
     GitRouteRequestV1, GitRunRequestV1, GitRunResultV1, GitRunnerV1, GitStdoutV1,
     GitStreamEvidenceV1,
 };
-use crate::custody_inventory::LosslessPathV1;
+use crate::custody_inventory::{CustodyStateClassV1, LosslessPathV1};
+use crate::custody_mounts::{mount_point_within, mount_points_v1, CustodyMountErrorV1};
 use crate::custody_seal::{
-    CustodyCoverageClassV1, CustodyGitObjectFormatV1, CustodyGitObjectKindV1, CustodyManifestV1,
-    CustodySealV1, CustodySealedArtifactV1,
+    CustodyCoverageClassV1, CustodyCoverageEntryV1, CustodyGitObjectFormatV1,
+    CustodyGitObjectKindV1, CustodyManifestV1, CustodySealV1, CustodySealedArtifactV1,
 };
 use crate::execution_policy::Sha256HexV1;
 use crate::fs_custody::{
@@ -40,7 +51,7 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{OsStr, OsString};
 use std::fs::File;
-use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
+use std::io::{self, Read as _, Seek as _, SeekFrom, Write};
 use std::path::Path;
 use std::time::Instant;
 
@@ -356,6 +367,25 @@ pub(crate) struct CustodyCaptureCapabilityV1 {
     generation_id: String,
     object_format: CustodyGitObjectFormatV1,
     inventory: Vec<(CustodyGitObjectFormatV1, String, CustodyGitObjectKindV1)>,
+    source: CaptureSourceV1,
+    shallow_or_grafted: bool,
+    unresolved_promisor_boundary: bool,
+    replacement_refs: Vec<String>,
+    streams: Vec<CustodyCapturedStreamV1>,
+}
+
+/// The pinned source a capability owns.
+#[derive(Debug)]
+enum CaptureSourceV1 {
+    /// The fixture mint's own pins. Its coverage payloads are fixture streams.
+    Fixture(Box<FixtureSourceV1>),
+    /// A coverage plan and the sources it was planned from (2B2b2b2 §3.1). Its coverage payloads
+    /// are the plan's walked streams, restaged at export.
+    Planned(Box<PlannedSourceV1>),
+}
+
+#[derive(Debug)]
+struct FixtureSourceV1 {
     primary_store: PinnedObjectStoreV1,
     alternate_stores: Vec<PinnedObjectStoreV1>,
     /// The source repository root: a non-bare source's worktree, or a bare source's git directory.
@@ -363,10 +393,40 @@ pub(crate) struct CustodyCaptureCapabilityV1 {
     /// `.git`, and no exporter write may land among them.
     source_repository: PinnedDirectoryV1,
     source_git_dir: PinnedDirectoryV1,
-    shallow_or_grafted: bool,
-    unresolved_promisor_boundary: bool,
-    replacement_refs: Vec<String>,
-    streams: Vec<CustodyCapturedStreamV1>,
+}
+
+impl FixtureSourceV1 {
+    fn recheck(&self) -> Result<(), CustodyExportErrorV1> {
+        self.primary_store.recheck()?;
+        for alternate in &self.alternate_stores {
+            alternate.recheck()?;
+        }
+        pinned_root_unchanged(&self.source_git_dir).map_err(CustodyExportErrorV1::IdentityDrift)?;
+        pinned_root_unchanged(&self.source_repository).map_err(CustodyExportErrorV1::IdentityDrift)
+    }
+}
+
+/// A plan-backed capability's source. It reaches the pins only through the narrow
+/// `CustodyCoverageSourcesV1` methods: the recheck, the retained protected pins, and the
+/// object-store route paths.
+#[derive(Debug)]
+struct PlannedSourceV1 {
+    plan: CustodyCoveragePlanV1,
+    sources: CustodyCoverageSourcesV1,
+    /// One walked stream per plan receipt, in the receipts' class order.
+    walked: Vec<CustodyWalkedStreamV1>,
+}
+
+/// One plan-backed coverage stream (2B2b2b2 §3.1): a plan receipt bound to exactly one coverage
+/// class, the plan's generation, the frame's length, and its SHA-256. It holds no bytes: the
+/// exporter restages them from the source at export and seals them only if they reproduce the
+/// receipt.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CustodyWalkedStreamV1 {
+    class: CustodyCoverageClassV1,
+    generation_id: String,
+    length: u64,
+    sha256: [u8; 32],
 }
 
 /// Follow a primary object store's `objects/info/alternates` chain to a fixed point, pinning
@@ -443,11 +503,63 @@ impl CustodyCaptureCapabilityV1 {
     ) -> Result<Self, CustodyExportErrorV1> {
         let primary = PinnedObjectStoreV1::open(primary_store)?;
         let alternate_stores = pin_alternate_chain(&primary)?;
+        let source = CaptureSourceV1::Fixture(Box::new(FixtureSourceV1 {
+            primary_store: primary,
+            alternate_stores,
+            source_repository: PinnedDirectoryV1::open(
+                source_repository,
+                "custody export source repository",
+            )?,
+            source_git_dir: PinnedDirectoryV1::open(source_git_dir, "custody export source")?,
+        }));
+        Ok(Self::minted(decision, manifest, source, streams))
+    }
+
+    /// Mint a capability from a fixture quiescence decision and a 2B2b2b1 coverage plan, with the
+    /// sources the plan was made from (2B2b2b2 §3.1). Like [`Self::from_fixture_quiescence`], it is
+    /// the only mint of its kind until the production quiescence primitive exists.
+    ///
+    /// The capability keeps the plan and its sources, and each plan receipt becomes one walked
+    /// stream. It pins nothing itself: every pin is the plan's own, so the protected set the
+    /// exporter checks is exactly the one the plan was made under.
+    #[cfg(test)]
+    pub(crate) fn from_fixture_quiescence_with_plan(
+        decision: CustodyQuiescenceDecisionV1,
+        manifest: &CustodyManifestV1,
+        sources: CustodyCoverageSourcesV1,
+        plan: CustodyCoveragePlanV1,
+    ) -> Self {
+        let walked = plan
+            .receipts()
+            .iter()
+            .map(|receipt| CustodyWalkedStreamV1 {
+                class: receipt.class,
+                generation_id: plan.generation_id().to_owned(),
+                length: receipt.frame_length,
+                sha256: receipt.frame_sha256,
+            })
+            .collect();
+        let source = CaptureSourceV1::Planned(Box::new(PlannedSourceV1 {
+            plan,
+            sources,
+            walked,
+        }));
+        Self::minted(decision, manifest, source, Vec::new())
+    }
+
+    /// The manifest-bound identity and inventory every mint records.
+    #[cfg(test)]
+    fn minted(
+        decision: CustodyQuiescenceDecisionV1,
+        manifest: &CustodyManifestV1,
+        source: CaptureSourceV1,
+        streams: Vec<CustodyCapturedStreamV1>,
+    ) -> Self {
         let object_format = manifest
             .original_objects()
             .first()
             .map_or(CustodyGitObjectFormatV1::Sha1, |object| object.format());
-        Ok(Self {
+        Self {
             decision,
             unit_id: manifest.unit_id().to_owned(),
             run_id: manifest.run_id().to_owned(),
@@ -465,18 +577,12 @@ impl CustodyCaptureCapabilityV1 {
                     )
                 })
                 .collect(),
-            primary_store: primary,
-            alternate_stores,
-            source_repository: PinnedDirectoryV1::open(
-                source_repository,
-                "custody export source repository",
-            )?,
-            source_git_dir: PinnedDirectoryV1::open(source_git_dir, "custody export source")?,
+            source,
             shallow_or_grafted: false,
             unresolved_promisor_boundary: false,
             replacement_refs: Vec::new(),
             streams,
-        })
+        }
     }
 
     #[cfg(test)]
@@ -505,7 +611,8 @@ impl CustodyCaptureCapabilityV1 {
 
     #[cfg(test)]
     pub(crate) fn source_git_dir_path_for_test(&self) -> &Path {
-        self.source_git_dir.canonical_path()
+        // The protected set lists the repository root, then the git directory.
+        self.protected_directories()[1].canonical_path()
     }
 
     #[cfg(test)]
@@ -551,7 +658,10 @@ impl CustodyCaptureCapabilityV1 {
         if self.inventory != manifest_inventory {
             return Err(CustodyExportErrorV1::CapabilityBinding("object inventory"));
         }
-        Ok(())
+        match &self.source {
+            CaptureSourceV1::Fixture(_) => Ok(()),
+            CaptureSourceV1::Planned(planned) => planned.bind(&self.generation_id, manifest),
+        }
     }
 
     fn refuse_unsupported_source_state(&self) -> Result<(), CustodyExportErrorV1> {
@@ -569,34 +679,81 @@ impl CustodyCaptureCapabilityV1 {
     }
 
     fn recheck(&self) -> Result<(), CustodyExportErrorV1> {
-        self.primary_store.recheck()?;
-        for alternate in &self.alternate_stores {
-            alternate.recheck()?;
+        match &self.source {
+            CaptureSourceV1::Fixture(source) => source.recheck(),
+            CaptureSourceV1::Planned(planned) => planned.sources.recheck(),
         }
-        pinned_root_unchanged(&self.source_git_dir).map_err(CustodyExportErrorV1::IdentityDrift)?;
-        pinned_root_unchanged(&self.source_repository).map_err(CustodyExportErrorV1::IdentityDrift)
+    }
+
+    /// The mount census over the protected set (2B2b2b2 §4.2). Only a plan-backed capability
+    /// exports walked source bytes, so a fixture capability takes no census.
+    fn recheck_mounts(&self) -> Result<(), CustodyExportErrorV1> {
+        match &self.source {
+            CaptureSourceV1::Fixture(_) => Ok(()),
+            CaptureSourceV1::Planned(planned) => {
+                refuse_mounts_within(&planned.sources.protected_pins())
+            }
+        }
     }
 
     fn object_store_route(&self) -> Result<GitObjectStoreRouteV1, CustodyExportErrorV1> {
+        let (primary, alternates) = match &self.source {
+            CaptureSourceV1::Fixture(source) => (
+                source.primary_store.path(),
+                source
+                    .alternate_stores
+                    .iter()
+                    .map(PinnedObjectStoreV1::path)
+                    .collect(),
+            ),
+            CaptureSourceV1::Planned(planned) => (
+                planned.sources.primary_store_path(),
+                planned.sources.alternate_store_paths(),
+            ),
+        };
         GitObjectStoreRouteV1::new(
-            self.primary_store.path().to_path_buf(),
-            self.alternate_stores
-                .iter()
-                .map(|store| store.path().to_path_buf())
-                .collect(),
+            primary.to_path_buf(),
+            alternates.into_iter().map(Path::to_path_buf).collect(),
         )
         .map_err(CustodyExportErrorV1::Git)
     }
 
     /// The pinned source directories no scratch root may be, contain, or lie inside. See
-    /// [`protected_directories`].
+    /// [`protected_directories`]. A plan-backed capability's set is its sources' retained pins.
     fn protected_directories(&self) -> Vec<&PinnedDirectoryV1> {
-        protected_directories(
-            &self.source_repository,
-            &self.source_git_dir,
-            &self.primary_store,
-            &self.alternate_stores,
-        )
+        match &self.source {
+            CaptureSourceV1::Fixture(source) => protected_directories(
+                &source.source_repository,
+                &source.source_git_dir,
+                &source.primary_store,
+                &source.alternate_stores,
+            ),
+            CaptureSourceV1::Planned(planned) => planned.sources.protected_pins(),
+        }
+    }
+
+    /// The walked stream bound to exactly this coverage class and generation, for a plan-backed
+    /// capability; `None` for a fixture capability, whose payloads are fixture streams.
+    fn walked_stream_for(
+        &self,
+        class: CustodyCoverageClassV1,
+    ) -> Result<Option<&CustodyWalkedStreamV1>, CustodyExportErrorV1> {
+        let CaptureSourceV1::Planned(planned) = &self.source else {
+            return Ok(None);
+        };
+        let stream = planned
+            .walked
+            .iter()
+            .find(|stream| stream.class == class)
+            .ok_or(CustodyExportErrorV1::CapabilityBinding(
+                "no walked stream for a coverage class",
+            ))?;
+        if stream.generation_id != self.generation_id {
+            return Err(CustodyExportErrorV1::CapabilityBinding(
+                "a walked stream names another generation",
+            ));
+        }
+        Ok(Some(stream))
     }
 
     /// The captured stream bound to exactly this coverage class, generation, declared length,
@@ -643,6 +800,102 @@ impl CustodyCaptureCapabilityV1 {
             CustodyGitObjectFormatV1::Sha256 => 32,
         }
     }
+}
+
+impl PlannedSourceV1 {
+    /// 2B2b2b2 §3.2: binds the plan exactly to the manifest, in order, before any scratch write.
+    /// Each refusal is a typed `CapabilityBinding`, except the census's `MountBoundary`.
+    fn bind(
+        &self,
+        generation_id: &str,
+        manifest: &CustodyManifestV1,
+    ) -> Result<(), CustodyExportErrorV1> {
+        let plan = &self.plan;
+        let refuse = |detail| Err(CustodyExportErrorV1::CapabilityBinding(detail));
+        // Step 1: an unresolved row is unsealable; 2B1's layout would refuse it too.
+        if plan
+            .coverage()
+            .iter()
+            .any(|row| row.state() == CustodyStateClassV1::Unresolved)
+        {
+            return refuse("the coverage plan has an unresolved row");
+        }
+        // Step 2: the plan's own generation, before any receipt is read, so a plan with no
+        // receipts still binds its generation.
+        if plan.generation_id() != generation_id || plan.generation_id() != manifest.generation_id()
+        {
+            return refuse("the coverage plan names another generation");
+        }
+        // Step 3: each collection exactly, canonical order included.
+        if plan.coverage() != manifest.coverage() {
+            return refuse("the coverage plan's rows are not the manifest's");
+        }
+        if plan.exclusions() != manifest.exclusions() {
+            return refuse("the coverage plan's exclusions are not the manifest's");
+        }
+        if plan.dependencies() != manifest.dependencies() {
+            return refuse("the coverage plan's dependencies are not the manifest's");
+        }
+        // Step 4: one receipt per captured class, the object database aside; both are in class
+        // order.
+        let captured = manifest
+            .coverage()
+            .iter()
+            .filter(|row| {
+                row.state() == CustodyStateClassV1::Captured
+                    && row.class() != CustodyCoverageClassV1::ObjectDatabase
+            })
+            .map(CustodyCoverageEntryV1::class);
+        if !plan
+            .receipts()
+            .iter()
+            .map(|receipt| receipt.class)
+            .eq(captured)
+        {
+            return refuse("the coverage plan's receipts are not the manifest's captured classes");
+        }
+        // Step 5: the mount census.
+        refuse_mounts_within(&self.sources.protected_pins())
+    }
+}
+
+/// 2B2b2b2 §4.2: refuses `MountBoundary` if any mount point lies strictly inside a protected root
+/// (the repository, the git directory, the primary store, or an alternate store), on component
+/// boundaries. The mount containing a root is at or above it, so it never counts. A census that
+/// cannot list the mount points fails closed.
+fn refuse_mounts_within(protected: &[&PinnedDirectoryV1]) -> Result<(), CustodyExportErrorV1> {
+    use std::os::unix::ffi::OsStrExt as _;
+    let mount_points = mount_points_v1().map_err(census_refusal)?;
+    for root in protected {
+        let root = root.canonical_path();
+        if let Some(mount_point) = mount_points
+            .iter()
+            .find(|mount_point| mount_point_within(mount_point, root.as_os_str().as_bytes()))
+        {
+            return Err(CustodyExportErrorV1::MountBoundary(format!(
+                "the mount point {} lies inside the protected source path {}",
+                String::from_utf8_lossy(mount_point),
+                root.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// A census failure is a binding refusal: the exporter cannot prove no mount hides in the source.
+fn census_refusal(error: CustodyMountErrorV1) -> CustodyExportErrorV1 {
+    CustodyExportErrorV1::CapabilityBinding(match error {
+        CustodyMountErrorV1::CensusUnsupported => {
+            "the mount census is unsupported on this platform"
+        }
+        CustodyMountErrorV1::Oversize => "the mount census exceeds its bound",
+        CustodyMountErrorV1::MalformedLine { .. } | CustodyMountErrorV1::MalformedEscape { .. } => {
+            "the mount census is malformed"
+        }
+        CustodyMountErrorV1::Empty => "the mount census listed no mount point",
+        CustodyMountErrorV1::Unstable => "the mount census count changed twice",
+        CustodyMountErrorV1::Io(_) => "the mount census could not be read",
+    })
 }
 
 /// The protected set: the repository root, its git directory, the primary object store, and every
@@ -901,6 +1154,31 @@ thread_local! {
         const { RefCell::new(None) };
     static LAST_PACK_ALLOWANCE: std::cell::Cell<(u64, u64)> = const { std::cell::Cell::new((0, 0)) };
     static HOOKS: RefCell<ExportHookTableV1> = RefCell::new(BTreeMap::new());
+    static FRAME_RESERVATIONS: RefCell<Vec<FrameReservationV1>> = const { RefCell::new(Vec::new()) };
+    static FRAME_OVERFLOWS: RefCell<Vec<(CustodyCoverageClassV1, u64)>> =
+        const { RefCell::new(Vec::new()) };
+}
+
+/// One walked class's §5 step 1 reservation: the ledger's use before it, and the bytes reserved.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct FrameReservationV1 {
+    pub(crate) class: CustodyCoverageClassV1,
+    pub(crate) used_before: u64,
+    pub(crate) reserved: u64,
+}
+
+/// §6.3: every walked class's staged-frame reservation, in staging order.
+#[cfg(test)]
+pub(crate) fn frame_reservations_for_test() -> Vec<FrameReservationV1> {
+    FRAME_RESERVATIONS.with(|slot| slot.borrow().clone())
+}
+
+/// §6.3: every write the bounded frame writer refused, as `(class, offset)`: the refused byte's
+/// 0-based offset in the frame, which is always the receipt's frame length.
+#[cfg(test)]
+pub(crate) fn frame_overflows_for_test() -> Vec<(CustodyCoverageClassV1, u64)> {
+    FRAME_OVERFLOWS.with(|slot| slot.borrow().clone())
 }
 
 #[cfg(test)]
@@ -1026,6 +1304,12 @@ pub(crate) enum ExportHookPointV1 {
     BeforeArtifactRename,
     /// Control 33: overwrite a published artifact in place before the seal barrier.
     AfterArtifactPublish,
+    /// 2B2b2b2 §5: a walked class's staged frame was just created (step 2); its recheck and
+    /// census (step 3) and its restage (step 4) have not run. The path is the staged frame's.
+    AfterFrameCreate,
+    /// 2B2b2b2 §5: a staged frame matched its receipt (step 5) and is not yet sealed (step 6).
+    /// A control replaces the file at its name here. The path is the staged frame's.
+    AfterFrameStaged,
 }
 
 #[cfg(test)]
@@ -1058,6 +1342,8 @@ thread_local! {
 pub(crate) fn reset_export_counters_for_test() {
     DERIVE_CALLS.with(|slot| slot.set(0));
     PACK_OBJECTS_SPAWNS.with(|slot| slot.set(0));
+    FRAME_RESERVATIONS.with(|slot| slot.borrow_mut().clear());
+    FRAME_OVERFLOWS.with(|slot| slot.borrow_mut().clear());
 }
 
 #[cfg(test)]
@@ -1101,6 +1387,13 @@ pub(crate) enum CustodyExportErrorV1 {
     ScratchPreflight(String),
     #[error("custody identity drifted: {0}")]
     IdentityDrift(String),
+    /// A walked class did not restage to its plan receipt: the source changed since it was
+    /// planned (2B2b2b2 §5).
+    #[error("the source changed since it was planned: {0}")]
+    SourceDrift(String),
+    /// A mount point lies strictly inside the protected source (2B2b2b2 §4.2).
+    #[error("a mount point lies inside the protected source: {0}")]
+    MountBoundary(String),
     #[error(transparent)]
     Git(CustodyGitError),
     #[error("Git child {command} exited {status:?}: {detail}")]
@@ -1508,6 +1801,8 @@ pub(crate) fn export_capsule_v1(
     // identity immediately before the first scratch write, so a stale capability refuses before
     // the exporter creates anything.
     capability.recheck()?;
+    // 2B2b2b2 §4.2: the mount census again, with the recheck, immediately before that write.
+    capability.recheck_mounts()?;
     let ledger = RefCell::new(ScratchLedgerV1::new(budgets.max_scratch_bytes));
 
     ledger.borrow_mut().reserve_entries(2)?;
@@ -1620,6 +1915,16 @@ pub(crate) fn export_capsule_v1(
     let mut directories: BTreeMap<Vec<u8>, PinnedDirectoryV1> = BTreeMap::new();
 
     for (ordinal, artifact) in plan.into_iter().enumerate() {
+        // 2B2b2b2 §5: a walked payload is staged, in layout order, just before its seal.
+        let artifact = match artifact.plaintext {
+            PlannedPlaintextV1::Walked(class) => ArtifactPlanV1 {
+                plaintext: PlannedPlaintextV1::Staged(stage_walked_frame(
+                    &context, &ledger, class,
+                )?),
+                ..artifact
+            },
+            _ => artifact,
+        };
         let sealed = seal_one_artifact(SealOneArtifactV1 {
             capsule: &capsule,
             directories: &mut directories,
@@ -1636,6 +1941,8 @@ pub(crate) fn export_capsule_v1(
         receipts.push(sealed.receipt.clone());
         published.push(sealed);
     }
+    // 2B2b2b2 §5, repair round 1: before the seal, every walked class planned `empty` replays.
+    prove_empty_walks(&capability)?;
 
     let seal_proof = CustodyCapsuleSealProofV1::from_receipts(receipts)
         .map_err(CustodyExportErrorV1::Capsule)?;
@@ -2897,6 +3204,10 @@ fn sha256_hex(bytes: [u8; 32]) -> Sha256HexV1 {
 enum PlannedPlaintextV1 {
     Bytes(Vec<u8>),
     Pack,
+    /// A walked coverage payload, not yet staged (2B2b2b2 §5).
+    Walked(CustodyCoverageClassV1),
+    /// A walked coverage payload's staged frame: its retained descriptor, rewound.
+    Staged(File),
 }
 
 struct ArtifactPlanV1 {
@@ -2937,12 +3248,22 @@ fn build_artifact_plan(
                 sha256_hex(pack.sha256),
             ),
             CustodyCapsuleArtifactRoleV1::CoveragePayload(class) => {
-                let stream = capability.stream_for(*class)?;
-                (
-                    PlannedPlaintextV1::Bytes(stream.bytes.clone()),
-                    stream.length,
-                    stream.sha256.clone(),
-                )
+                match capability.walked_stream_for(*class)? {
+                    // Its bytes are restaged when its turn to seal comes (2B2b2b2 §5).
+                    Some(walked) => (
+                        PlannedPlaintextV1::Walked(*class),
+                        walked.length,
+                        sha256_hex(walked.sha256),
+                    ),
+                    None => {
+                        let stream = capability.stream_for(*class)?;
+                        (
+                            PlannedPlaintextV1::Bytes(stream.bytes.clone()),
+                            stream.length,
+                            stream.sha256.clone(),
+                        )
+                    }
+                }
             }
         };
         check_plaintext_budget(length, budgets)?;
@@ -2984,6 +3305,8 @@ fn substituted_plaintext(
                 .map_err(|error| CustodyExportErrorV1::Io(format!("control 16: {error}")))?;
             bytes
         }
+        // Control 16 arms fixture payloads and the pack; a walked payload has no bytes yet.
+        PlannedPlaintextV1::Walked(_) | PlannedPlaintextV1::Staged(_) => return Ok(plaintext),
     };
     for byte in &mut bytes {
         *byte = !*byte;
@@ -3016,6 +3339,215 @@ fn bytes_plan(bytes: &[u8]) -> (PlannedPlaintextV1, u64, Sha256HexV1) {
         bytes.len() as u64,
         Sha256HexV1::digest(bytes),
     )
+}
+
+// ---------------------------------------------------------------------------------------------
+// Staged-frame export (2B2b2b2 §5)
+// ---------------------------------------------------------------------------------------------
+
+/// `payload-<class-code>.frame`: the code is the 2B2b1 frame's class code, the class's 1-based
+/// position in `CustodyCoverageClassV1::ALL`.
+fn staged_frame_name(class: CustodyCoverageClassV1) -> String {
+    let code = CustodyCoverageClassV1::ALL
+        .iter()
+        .position(|candidate| *candidate == class)
+        .map_or(0, |index| index + 1);
+    format!("payload-{code}.frame")
+}
+
+/// §5 steps 1–5 for one walked class. It returns the staged frame's retained descriptor, rewound,
+/// for step 6's seal. The frame is created once and never reopened by name, and it stays in
+/// `work/` as evidence, as the staged pack does.
+fn stage_walked_frame(
+    context: &ExportContextV1<'_>,
+    ledger: &RefCell<ScratchLedgerV1>,
+    class: CustodyCoverageClassV1,
+) -> Result<File, CustodyExportErrorV1> {
+    let CaptureSourceV1::Planned(planned) = &context.capability.source else {
+        return Err(CustodyExportErrorV1::CapabilityBinding(
+            "a walked payload needs a coverage plan",
+        ));
+    };
+    let receipt: CustodyClassReceiptV1 = planned
+        .plan
+        .receipts()
+        .iter()
+        .find(|receipt| receipt.class == class)
+        .copied()
+        .ok_or(CustodyExportErrorV1::CapabilityBinding(
+            "no plan receipt for a walked payload",
+        ))?;
+
+    // Step 1: the receipt's frame length and one entry allowance, before anything is created.
+    #[cfg(test)]
+    let used_before = ledger.borrow().used();
+    ledger.borrow_mut().reserve(receipt.frame_length)?;
+    ledger.borrow_mut().reserve_entries(1)?;
+    #[cfg(test)]
+    FRAME_RESERVATIONS.with(|slot| {
+        slot.borrow_mut().push(FrameReservationV1 {
+            class,
+            used_before,
+            reserved: ledger.borrow().used() - used_before,
+        });
+    });
+
+    // Step 2: create-new through the retained `work/` descriptor.
+    let name = staged_frame_name(class);
+    let mut file = context
+        .work
+        .create_new_regular_child(OsStr::new(&name), "custody export staged frame")?;
+    #[cfg(test)]
+    run_hook(
+        ExportHookPointV1::AfterFrameCreate,
+        &context.work.canonical_path().join(&name),
+    );
+
+    // Step 3: the capability recheck and the mount census.
+    context.capability.recheck()?;
+    context.capability.recheck_mounts()?;
+
+    // Step 4: exactly the plan's recipe, into a writer capped at the receipt's frame length.
+    let mut writer = BoundedFrameWriterV1 {
+        file: &mut file,
+        class,
+        cap: receipt.frame_length,
+        written: 0,
+        overflowed: false,
+        write_failure: None,
+    };
+    let restaged = restage_class_v1(&planned.plan, &planned.sources, class, &mut writer);
+    let restaged = match (restaged, writer.overflowed, writer.write_failure) {
+        (Ok(restaged), _, _) => restaged,
+        (Err(_), true, _) => {
+            return Err(CustodyExportErrorV1::SourceDrift(format!(
+                "{class:?} restaged past its receipt's {} frame bytes",
+                receipt.frame_length
+            )))
+        }
+        (Err(_), false, Some(kind)) => {
+            return Err(CustodyExportErrorV1::Io(format!(
+                "staged frame write: {kind}"
+            )))
+        }
+        // The plan walked this class under the same recipe, so any other refusal is the source's.
+        (Err(error), false, None) => {
+            return Err(CustodyExportErrorV1::SourceDrift(format!(
+                "{class:?} did not restage: {error}"
+            )))
+        }
+    };
+
+    // Step 5: the restaged frame must be the receipt's, byte for byte and entry for entry.
+    if restaged.summary().frame_bytes() != receipt.frame_length
+        || restaged.summary().frame_sha256() != receipt.frame_sha256
+        || restaged.inventory_sha256() != receipt.inventory_digest
+    {
+        return Err(CustodyExportErrorV1::SourceDrift(format!(
+            "{class:?} restaged to another frame than its plan receipt"
+        )));
+    }
+    #[cfg(test)]
+    run_hook(
+        ExportHookPointV1::AfterFrameStaged,
+        &context.work.canonical_path().join(&name),
+    );
+
+    // Step 6's input: the same descriptor, synced and rewound.
+    file.sync_all()
+        .map_err(|error| CustodyExportErrorV1::Io(format!("staged frame sync: {error}")))?;
+    file.seek(SeekFrom::Start(0))
+        .map_err(|error| CustodyExportErrorV1::Io(format!("staged frame rewind: {error}")))?;
+    Ok(file)
+}
+
+/// Repair round 1 of §5: a walked class the plan holds `empty` has no receipt, payload, or staged
+/// frame, yet the source may have gained its first entry since planning. So before the seal, each
+/// empty walk replays its own recipe from a fresh pin into a sink that keeps nothing, and must
+/// reproduce the plan's zero-entry baseline. Anything else is drift, and nothing is sealed.
+fn prove_empty_walks(capability: &CustodyCaptureCapabilityV1) -> Result<(), CustodyExportErrorV1> {
+    let CaptureSourceV1::Planned(planned) = &capability.source else {
+        return Ok(());
+    };
+    for baseline in planned.plan.empty_walks() {
+        let class = baseline.class;
+        let replayed =
+            match restage_class_v1(&planned.plan, &planned.sources, class, &mut io::sink()) {
+                Ok(replayed) => replayed,
+                // The plan walked this recipe successfully, so a refusal now is the source's.
+                Err(error) => {
+                    return Err(CustodyExportErrorV1::SourceDrift(format!(
+                        "{class:?} was planned empty and did not replay: {error}"
+                    )))
+                }
+            };
+        let observed = (
+            replayed.summary().frame_bytes(),
+            replayed.summary().frame_sha256(),
+            replayed.inventory_sha256(),
+        );
+        if observed
+            != (
+                baseline.frame_length,
+                baseline.frame_sha256,
+                baseline.inventory_digest,
+            )
+        {
+            return Err(CustodyExportErrorV1::SourceDrift(format!(
+                "{class:?} was planned empty and replayed to another walk"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// §5 step 4's writer: capped at exactly the receipt's frame length. A write that crosses the cap
+/// writes only up to it, and the next write, the one that would write byte `cap + 1`, is refused
+/// without writing it. The staged bytes therefore never exceed their reservation.
+struct BoundedFrameWriterV1<'f> {
+    file: &'f mut File,
+    class: CustodyCoverageClassV1,
+    cap: u64,
+    written: u64,
+    /// A write past the cap was refused: the source grew since it was planned.
+    overflowed: bool,
+    /// The staged file itself refused a write.
+    write_failure: Option<io::ErrorKind>,
+}
+
+impl Write for BoundedFrameWriterV1<'_> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        if bytes.is_empty() {
+            return Ok(0);
+        }
+        let room = self.cap - self.written;
+        if room == 0 {
+            self.overflowed = true;
+            #[cfg(test)]
+            FRAME_OVERFLOWS.with(|slot| slot.borrow_mut().push((self.class, self.written)));
+            return Err(io::Error::other(format!(
+                "the restaged {:?} frame exceeds its receipt",
+                self.class
+            )));
+        }
+        let admitted = usize::try_from(room).map_or(bytes.len(), |room| room.min(bytes.len()));
+        match self.file.write(&bytes[..admitted]) {
+            Ok(written) => {
+                self.written += written as u64;
+                Ok(written)
+            }
+            Err(error) => {
+                if error.kind() != io::ErrorKind::Interrupted {
+                    self.write_failure = Some(error.kind());
+                }
+                Err(error)
+            }
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.file.flush()
+    }
 }
 
 struct PublishedArtifactV1 {
@@ -3097,6 +3629,13 @@ fn seal_one_artifact(
         // The pack is sealed from the retained descriptor §5 verified, never re-opened by name.
         PlannedPlaintextV1::Pack => {
             PlaintextReaderV1::File(pack.rewound("custody export pack plaintext")?)
+        }
+        // So is a staged frame: the descriptor it was restaged through (2B2b2b2 §5 step 6).
+        PlannedPlaintextV1::Staged(file) => PlaintextReaderV1::File(file),
+        PlannedPlaintextV1::Walked(_) => {
+            return Err(CustodyExportErrorV1::Io(
+                "a walked payload reached its seal unstaged".into(),
+            ))
         }
     };
 
