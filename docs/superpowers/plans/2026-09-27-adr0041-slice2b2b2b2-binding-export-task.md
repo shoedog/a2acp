@@ -3,7 +3,7 @@ task-type: implement
 ---
 # Implement ADR-0041 Slice 2B2b2b2: plan-to-manifest binding, mount census, and bounded staged-frame export
 
-**Revision:** 1 (draft for spec review)
+**Revision:** 2 (folds spec round 1, see §12)
 **Implementation base:** current `main`; bind the exact SHA at dispatch. The predecessor is 2B2b2b1, PR #119 at
 `e5de184b`.
 **Parent plan:** `docs/superpowers/plans/2026-09-20-adr0041-slice2b-local-capsule-plan.md`. The serial order is
@@ -46,6 +46,15 @@ This child does not include production quiescence or minting (the fixture mint r
   CustodyWalkErrorV1>`. It re-runs **exactly** the recipe's walk with a fresh pin of the recipe's root into `sink`.
   The planner remains the only owner of selection logic, and the exporter never reconstructs a selection.
 - **Sequencing.** Restaging runs sequentially; it never shares a pin concurrently (the 2B2b2a contract).
+- **Plan generation (fix of W1).** `CustodyCoveragePlanV1` gains a `generation_id` field, populated from the request,
+  and a crate-private accessor. Binding no longer depends on receipts for generation. A plan with zero receipts
+  (every walked class `empty`) still binds its generation.
+- **Source operations (fix of S1).** Add narrow crate-private methods on `CustodyCoverageSourcesV1`:
+  - `recheck()`, covering the whole protected set: identities and alternates digests;
+  - `protected_canonical_paths()`;
+  - the object-store route accessors the exporter needs.
+
+  They expose neither fields nor re-pinning. The plan-backed capability uses only these methods.
 
 ## 3. Capability binding (`custody_export.rs`, `custody_seal.rs`)
 
@@ -61,7 +70,8 @@ These run in order, **before any scratch write**. Each failure is a typed `Capab
 no scratch entry.
 
 1. **Unresolved rows.** Any `unresolved` row in the plan refuses. 2B1 layout would also refuse it.
-2. **Generation.** The plan's generation must equal the capability's and the manifest's.
+2. **Generation.** The plan's own `generation_id` must equal the capability's and the manifest's. This is checked
+   **before** any receipt processing.
 3. **Coverage, exclusions, dependencies.** Each of the three collections must equal the manifest's exactly,
    canonical order included. This adds read-only `exclusions()` and `dependencies()` accessors to
    `CustodyManifestV1`, with no validation change.
@@ -74,8 +84,10 @@ no scratch entry.
 
 `mount_points_v1() -> Result<Vec<Vec<u8>>, CustodyMountErrorV1>` returns canonical mount-point paths as raw bytes.
 
-- **Linux:** read `/proc/self/mountinfo` through a bounded read (at most 4 MiB). Take field 5, the mount point, and
-  decode its octal escapes (`\040`, `\011`, `\012`, `\134`) strictly. A malformed line or an oversize file refuses.
+- **Linux:** read `/proc/self/mountinfo` through a bounded read (at most 4 MiB). Parse it as **bytes, never as a
+  UTF-8 string** (fix of S2). Take field 5, the mount point, and decode its octal escapes (`\040`, `\011`, `\012`,
+  `\134`) strictly. Any other byte, including non-UTF-8 bytes such as `0xff`, passes through verbatim. A malformed
+  escape, a malformed line, or an oversize file refuses.
 - **macOS:** `getfsstat(NULL, 0, MNT_NOWAIT)` for the count, then a second call into an exactly sized buffer, taking
   each `f_mntonname`. If the count changes between the two calls, retry once; a second change refuses. This adds an
   authorized unsafe boundary, recorded in a new-unsafe inventory control in the style of 2B2a's A14.
@@ -116,13 +128,15 @@ For each `Walked` class, in layout order:
 6. **Seal.** Rewind the retained descriptor and seal through the existing `PlaintextReaderV1::File` path. The file is
    never reopened by name.
 
-Staged frames are removed with `work/`.
+Staged frames are **retained** under `work/` as evidence, exactly like the staged pack. The exporter never deletes
+`work/` contents (the 2B2 contract, fix of S3).
 
 ## 6. Acceptance criteria
 
 1. **Binding.** Each §3.2 step has refusal controls, each proved by a scratch snapshot showing no entry created:
    - a plan with an unresolved row;
-   - a generation mismatch;
+   - a generation mismatch, both for a **zero-receipt** plan (an empty source planned under A, against a B manifest)
+     and for a plan with receipts;
    - a coverage row flipped in each direction;
    - an extra exclusion, and a missing one;
    - one dependency digest changed;
@@ -131,7 +145,10 @@ Staged frames are removed with `work/`.
    - The injected mount list parks the unit (no entry created) for a mount point at the repository's `target`, and
      for one inside the git directory and one inside an alternate store.
    - A mount point that is a prefix sibling (`/repository` versus `/repo`) does not park.
-   - The Linux mountinfo parser handles escapes, and refuses malformed lines and oversize input.
+   - The Linux mountinfo parser returns exact output bytes for fixtures containing `0xff`, every supported escape, and
+     a literal escaped backslash. It refuses malformed escapes, malformed lines, and oversize input. A `0xff` mount
+     point inside the repository parks the unit. A mutation that parses through UTF-8 conversion turns these
+     controls red.
    - macOS `getfsstat` returns a list containing `/` on the host lane.
    - A census error fails closed.
    - **Real bind mount:** on a mount-capable Linux lane, bind-mount a directory containing the git directory at
@@ -155,7 +172,8 @@ Staged frames are removed with `work/`.
 
 ## 7. Owned paths
 
-- `crates/bridge-core/src/custody_coverage.rs` and its tests: walk recipes and `restage_class_v1` only;
+- `crates/bridge-core/src/custody_coverage.rs` and its tests: walk recipes, `restage_class_v1`, the plan's
+  `generation_id` field and accessor, and the §2 `CustodyCoverageSourcesV1` methods only;
 - `crates/bridge-core/src/custody_export.rs` and its tests: §3, §5, and the census call sites;
 - `crates/bridge-core/src/custody_seal.rs`: two read-only accessors;
 - `crates/bridge-core/src/custody_mounts.rs` (new) and its tests;
@@ -167,7 +185,7 @@ Staged frames are removed with `work/`.
 
 As in earlier children:
 - a structural RED, a behavioral RED per control, and a persisted foreground mutation matrix. At minimum, it has one
-  row for each binding step, each census rule (including the prefix-boundary check and fail-closed), the second
+  row for each binding step (including the plan-generation comparison removed), each census rule (including the prefix-boundary check and fail-closed), the second
   census call, the bounded-writer cap, the receipt comparison, restaging through a reconstructed selection instead of
   the recipe, and reopening by name;
 - byte-exact restores and a snapshot proof;
@@ -197,3 +215,12 @@ tagged WRONG or SMELL and MATERIAL or IMMATERIAL to §1.1. Implementation and re
 ## 11. Commit Message
 
 feat(bridge-core): ADR-0041 Slice 2B2b2b2 plan binding, mount census, and bounded staged-frame export
+
+## 12. Review history
+
+**Spec round 1** (on revision 1 at `be6aff53`): REJECT. Revision 2 folds all of its findings:
+- **W1, a MATERIAL blocker:** a zero-receipt plan lost its generation. Fixed by adding the generation to the plan and
+  comparing it first (§2, §3.2).
+- **S1, MATERIAL:** the source operations. Fixed with narrow `CustodyCoverageSourcesV1` methods (§2).
+- **S2, MATERIAL:** a byte-exact mountinfo parser, with `0xff` fixtures (§4.1, §6).
+- **S3, IMMATERIAL:** staged frames are retained, not removed (§5).
