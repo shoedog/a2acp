@@ -16,7 +16,8 @@
 //! binds that plan exactly to the manifest and takes a mount-point census before any scratch write
 //! (§3, §4). Each of its coverage payloads is then restaged from the source through the plan's own
 //! walk recipe into a bounded `work/payload-<class-code>.frame`, compared with the plan's receipt,
-//! and sealed from that retained descriptor (§5).
+//! and sealed from that retained descriptor (§5). Each walked class the plan holds `empty` has no
+//! payload, but it is replayed and compared with its zero-entry baseline before the seal.
 
 use crate::custody_capsule::{
     sealed, CustodyCapsuleArtifactRoleV1, CustodyCapsuleBindingV1, CustodyCapsuleErrorV1,
@@ -1940,6 +1941,8 @@ pub(crate) fn export_capsule_v1(
         receipts.push(sealed.receipt.clone());
         published.push(sealed);
     }
+    // 2B2b2b2 §5, repair round 1: before the seal, every walked class planned `empty` replays.
+    prove_empty_walks(&capability)?;
 
     let seal_proof = CustodyCapsuleSealProofV1::from_receipts(receipts)
         .map_err(CustodyExportErrorV1::Capsule)?;
@@ -3456,6 +3459,46 @@ fn stage_walked_frame(
     file.seek(SeekFrom::Start(0))
         .map_err(|error| CustodyExportErrorV1::Io(format!("staged frame rewind: {error}")))?;
     Ok(file)
+}
+
+/// Repair round 1 of §5: a walked class the plan holds `empty` has no receipt, payload, or staged
+/// frame, yet the source may have gained its first entry since planning. So before the seal, each
+/// empty walk replays its own recipe from a fresh pin into a sink that keeps nothing, and must
+/// reproduce the plan's zero-entry baseline. Anything else is drift, and nothing is sealed.
+fn prove_empty_walks(capability: &CustodyCaptureCapabilityV1) -> Result<(), CustodyExportErrorV1> {
+    let CaptureSourceV1::Planned(planned) = &capability.source else {
+        return Ok(());
+    };
+    for baseline in planned.plan.empty_walks() {
+        let class = baseline.class;
+        let replayed =
+            match restage_class_v1(&planned.plan, &planned.sources, class, &mut io::sink()) {
+                Ok(replayed) => replayed,
+                // The plan walked this recipe successfully, so a refusal now is the source's.
+                Err(error) => {
+                    return Err(CustodyExportErrorV1::SourceDrift(format!(
+                        "{class:?} was planned empty and did not replay: {error}"
+                    )))
+                }
+            };
+        let observed = (
+            replayed.summary().frame_bytes(),
+            replayed.summary().frame_sha256(),
+            replayed.inventory_sha256(),
+        );
+        if observed
+            != (
+                baseline.frame_length,
+                baseline.frame_sha256,
+                baseline.inventory_digest,
+            )
+        {
+            return Err(CustodyExportErrorV1::SourceDrift(format!(
+                "{class:?} was planned empty and replayed to another walk"
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// §5 step 4's writer: capped at exactly the receipt's frame length. A write that crosses the cap

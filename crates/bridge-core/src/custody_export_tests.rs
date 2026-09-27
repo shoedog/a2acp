@@ -3522,6 +3522,53 @@ impl PlanFixtureV1 {
         })
     }
 
+    /// A worktree and a git directory apart from it, so neither root domain's walk observes the
+    /// other. With `populated_git_dir`, a bare-initialized git directory beside an empty worktree;
+    /// without it, a git directory holding only an empty `objects/` beside a worktree `README`.
+    fn separate_git_dir(populated_git_dir: bool) -> Self {
+        Self::with(|area| {
+            let worktree = area.join("worktree");
+            let git_dir = area.join("repo.git");
+            std::fs::create_dir(&worktree).expect("the worktree");
+            if populated_git_dir {
+                fixture_init_bare(&git_dir);
+            } else {
+                std::fs::create_dir_all(git_dir.join("objects")).expect("the empty store");
+                std::fs::write(
+                    worktree.join("README"),
+                    b"a worktree apart from its git dir\n",
+                )
+                .expect("the worktree README");
+            }
+            (worktree, git_dir)
+        })
+    }
+
+    /// Writes one loose blob into the source's store, copied from a donor bare repository beside
+    /// it, and returns it as a manifest object.
+    fn add_loose_blob(&self) -> CustodyOriginalObjectV1 {
+        let donor = self.area.join("donor.git");
+        fixture_init_bare(&donor);
+        let object_id = fixture_git_ok(
+            &donor,
+            &["hash-object", "-w", "--stdin"],
+            Some(b"a planned loose blob\n"),
+        );
+        let (fan_out, rest) = object_id.split_at(2);
+        std::fs::create_dir_all(self.objects().join(fan_out)).expect("the fan-out directory");
+        std::fs::copy(
+            donor.join("objects").join(fan_out).join(rest),
+            self.objects().join(fan_out).join(rest),
+        )
+        .expect("the loose blob");
+        CustodyOriginalObjectV1::new(
+            CustodyGitObjectFormatV1::Sha1,
+            object_id,
+            CustodyGitObjectKindV1::Blob,
+        )
+        .expect("a blob id")
+    }
+
     fn write(&self, relative: &str, content: &[u8]) {
         let path = self.worktree.join(relative);
         std::fs::create_dir_all(path.parent().expect("a worktree parent"))
@@ -4866,4 +4913,169 @@ fn planned_e2e_01_a_rich_clone_exports_a_sealed_capsule_of_its_walked_classes() 
         sealed.evidence.scratch_bytes_used,
         census_use(&fixture.scratch)
     );
+}
+
+// ---------------------------------------------------------------------------------------------
+// Repair round 1: a walked class planned `empty` has no receipt or payload, but it is replayed
+// before the seal, so a source that gained its first entry since planning is drift.
+// ---------------------------------------------------------------------------------------------
+
+/// An unchanged source whose plan has no receipts seals, with and without a planned loose blob:
+/// every empty walk replays to its baseline, and nothing is staged. Every row is evaluated, and
+/// every failing row is reported.
+#[test]
+fn planned_empty_01_an_unchanged_source_with_no_receipts_seals() {
+    let mut failures = Vec::new();
+    for with_blob in [false, true] {
+        let fixture = PlanFixtureV1::empty_source();
+        let inventory: Vec<_> = if with_blob {
+            vec![fixture.add_loose_blob()]
+        } else {
+            Vec::new()
+        };
+        let (plan, sources) = fixture.plan(GENERATION_V1, &inventory);
+        assert!(plan.receipts().is_empty());
+        let manifest = manifest_from_plan(&plan, GENERATION_V1, inventory);
+        assert_eq!(manifest.sealability(), CustodySealabilityV1::Sealable);
+        let result = fixture.export(&manifest, planned_capability(&manifest, plan, sources));
+        let staged: Vec<String> = fixture
+            .scratch_entries()
+            .into_iter()
+            .filter(|name| name.contains("payload-"))
+            .collect();
+        if !matches!(result, Ok(CustodyExportOutcomeV1::Sealed(_)))
+            || !fixture.seal_present()
+            || !staged.is_empty()
+        {
+            failures.push(format!(
+                "with a blob {with_blob}: {}; staged {staged:?}",
+                describe_run(&result)
+            ));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "an unchanged zero-receipt source did not seal:\n{}",
+        failures.join("\n")
+    );
+}
+
+/// The reviewer's state: a zero-receipt plan of a source holding only its store and a planned
+/// loose blob, then `HEAD` created after the capability is minted. The manifest claims
+/// `refs_and_head` empty, and the pins, binding, and census all still pass; the replay of that
+/// empty walk refuses the export as drift, and no seal is published.
+#[test]
+fn planned_empty_02_head_created_after_planning_is_drift_and_never_sealed() {
+    let fixture = PlanFixtureV1::empty_source();
+    let inventory = vec![fixture.add_loose_blob()];
+    let (plan, sources) = fixture.plan(GENERATION_V1, &inventory);
+    assert!(plan.receipts().is_empty());
+    let manifest = manifest_from_plan(&plan, GENERATION_V1, inventory);
+    assert!(manifest.coverage().iter().any(|row| {
+        row.class() == CustodyCoverageClassV1::RefsAndHead
+            && row.state() == CustodyStateClassV1::Empty
+    }));
+    let capability = planned_capability(&manifest, plan, sources);
+    std::fs::write(fixture.git_dir.join("HEAD"), b"ref: refs/heads/main\n")
+        .expect("HEAD created after planning");
+    let result = fixture.export(&manifest, capability);
+    assert!(
+        matches!(&result, Err(CustodyExportErrorV1::SourceDrift(detail))
+            if detail.contains("RefsAndHead was planned empty and replayed to another walk")),
+        "{}",
+        describe_run(&result)
+    );
+    assert!(!fixture.seal_present());
+}
+
+/// Only one root domain lacks captured receipts. The worktree and the git directory are apart,
+/// so the other domain's restages never observe the empty one. Each row seals unchanged, is
+/// planned again, is changed in its empty domain after minting, and must then refuse as drift
+/// with no seal. Every row is evaluated, and every failing row is reported.
+#[test]
+fn planned_empty_03_a_root_domain_without_captured_receipts_is_still_replayed() {
+    type ChangeV1 = fn(&PlanFixtureV1);
+    let rows: [(&str, bool, CustodyCoverageClassV1, ChangeV1); 2] = [
+        (
+            "a git directory of only `objects/` beside a captured worktree, then HEAD",
+            false,
+            CustodyCoverageClassV1::RefsAndHead,
+            |fixture| {
+                std::fs::write(fixture.git_dir.join("HEAD"), b"ref: refs/heads/main\n")
+                    .expect("HEAD created after planning");
+            },
+        ),
+        (
+            "an empty worktree beside a captured git directory, then a worktree file",
+            true,
+            CustodyCoverageClassV1::Worktree,
+            |fixture| fixture.write("new.txt", b"created after planning\n"),
+        ),
+    ];
+    let mut failures = Vec::new();
+    for (label, populated_git_dir, empty_class, change) in rows {
+        let fixture = PlanFixtureV1::separate_git_dir(populated_git_dir);
+        let (plan, sources) = fixture.plan(GENERATION_V1, &[]);
+        let captured: Vec<_> = plan
+            .receipts()
+            .iter()
+            .map(|receipt| receipt.class)
+            .collect();
+        let empty_row = plan
+            .coverage()
+            .iter()
+            .any(|row| row.class() == empty_class && row.state() == CustodyStateClassV1::Empty);
+        assert!(
+            !captured.is_empty() && !captured.contains(&empty_class) && empty_row,
+            "{label}: {captured:?}"
+        );
+        let manifest = manifest_from_plan(&plan, GENERATION_V1, Vec::new());
+        let unchanged = fixture.export(&manifest, planned_capability(&manifest, plan, sources));
+        if !matches!(unchanged, Ok(CustodyExportOutcomeV1::Sealed(_))) {
+            failures.push(format!("{label}, unchanged: {}", describe_run(&unchanged)));
+            continue;
+        }
+
+        let (plan, sources) = fixture.plan(GENERATION_V1, &[]);
+        let capability = planned_capability(&manifest, plan, sources);
+        change(&fixture);
+        let scratch = fixture.area.join("scratch-after-change");
+        std::fs::create_dir(&scratch).expect("a second scratch");
+        set_owner_private(&scratch);
+        let result = fixture.export_to(&scratch, fixture.budgets, &manifest, capability);
+        let expected = format!("{empty_class:?} was planned empty and replayed to another walk");
+        let sealed = std::fs::symlink_metadata(scratch.join(CAPSULE_DIR_NAME).join(SEAL_NAME));
+        if !matches!(&result, Err(CustodyExportErrorV1::SourceDrift(detail))
+            if detail.contains(&expected))
+            || sealed.is_ok()
+        {
+            failures.push(format!("{label}, changed: {}", describe_run(&result)));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "a change in the root domain without captured receipts was sealed:\n{}",
+        failures.join("\n")
+    );
+}
+
+/// An empty walk whose replay refuses is drift too: `HEAD.lock` created after planning parks the
+/// `refs_and_head` replay as an uncontrolled writer, and the export refuses with no seal.
+#[test]
+fn planned_empty_04_an_empty_walk_that_no_longer_replays_is_drift() {
+    let fixture = PlanFixtureV1::empty_source();
+    let (plan, sources) = fixture.plan(GENERATION_V1, &[]);
+    assert!(plan.receipts().is_empty());
+    let manifest = manifest_from_plan(&plan, GENERATION_V1, Vec::new());
+    let capability = planned_capability(&manifest, plan, sources);
+    std::fs::write(fixture.git_dir.join("HEAD.lock"), b"ref: refs/heads/main\n")
+        .expect("HEAD.lock created after planning");
+    let result = fixture.export(&manifest, capability);
+    assert!(
+        matches!(&result, Err(CustodyExportErrorV1::SourceDrift(detail))
+            if detail.contains("RefsAndHead was planned empty and did not replay")),
+        "{}",
+        describe_run(&result)
+    );
+    assert!(!fixture.seal_present());
 }

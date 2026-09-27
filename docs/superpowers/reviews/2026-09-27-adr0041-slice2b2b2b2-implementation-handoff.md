@@ -19,6 +19,7 @@
   - Each suite had 0 failures, and each total is its predecessor's plus exactly the 37 new controls.
 - **Excluded here:** `cargo deny` (not installed), the real bind-mount control (this lane refuses `mount`), the native
   ext4 lane, and the macOS lane (§7).
+- **Repair round 1** (§11) fixes the Sol review's one blocker: zero-entry walks are now replayed before the seal.
 
 This handoff records evidence only; it claims no review approval.
 
@@ -615,3 +616,237 @@ docs/superpowers/reviews/2026-09-27-adr0041-slice2b2b2b2-implementation-handoff.
 4. CI: native ext4, the Windows compile, `cargo deny`, and coverage.
 5. 2B3 (restore), which consumes this capsule.
 6. The parent plan, the roadmap, and the planning handoff, which the controller alone updates.
+
+## 11. Repair round 1
+
+**Scope.** The Sol implementation review, round 1, gave REJECT with one blocker, which the controller verified. This
+round fixes only that finding, inside the §7 owned paths, RED first. The base is the committed slice, `f2399ab0`.
+
+### 11.1 The finding
+
+**WRONG · MATERIAL · BLOCKER: zero-entry walks cannot detect post-plan source additions.**
+- **The defect.** `assemble` kept a receipt and a recipe only for a walk that emitted at least one entry. So
+  `restage_class_v1` could not replay an `empty` class, and the exporter restaged only the classes that had receipts.
+- **The reviewer's state.** An objects-only source, the supported fixture of `restage_03`, planned under the matching
+  generation, with or without a planned loose object. The capability is minted, then `HEAD` is created.
+  - Pins, alternates, the manifest collections, receipt cardinality, and the census all still pass.
+  - With no receipts, no walk is replayed, and the capsule seals `refs_and_head: empty` while `HEAD` exists.
+- **Why it blocks.** It violates §1.1: "a source change between planning and export is refused, never sealed".
+
+### 11.2 RED on the committed code
+
+The production sources were still the committed bytes: `custody_coverage.rs` `b0906475…` and `custody_export.rs`
+`4cbe9a9f…`, equal to the implementation turn's snapshot.
+
+**Behavioral RED.** Four new exporter controls, and `restage_03`'s corrected assertion, use only the existing API. Run:
+
+```text
+cargo test --locked --offline -p bridge-core --lib --no-fail-fast -- custody_export::tests::planned_empty_ custody_coverage::tests::restage_03
+```
+
+The result was `FAILED. 1 passed; 4 failed`. Raw output: `.git/a2a-bridge/repair-1/red-behavioral.txt`.
+
+| Control | On the committed code |
+|---|---|
+| `planned_empty_01` (unchanged zero-receipt source, with and without a loose blob) | **ok**: it seals. This is the no-over-refusal control, green before and after |
+| `planned_empty_02` (`HEAD` created after minting) | FAILED: `wrong success: a capsule sealed` |
+| `planned_empty_03` (only one root domain without captured receipts) | FAILED, in both rows: `…then HEAD, changed: wrong success: a capsule sealed` and `…then a worktree file, changed: wrong success: a capsule sealed` |
+| `planned_empty_04` (`HEAD.lock` created after minting) | FAILED: `wrong success: a capsule sealed` |
+| `restage_03` (a zero-receipt plan's walk keeps its recipe) | FAILED: `an empty walk keeps its recipe: Io(NotFound)` |
+
+**Structural RED.** `restage_05` names the new `CustodyCoveragePlanV1::empty_walks()`. Run:
+
+```text
+cargo test --locked --offline -p bridge-core --lib --no-fail-fast -- custody_coverage::tests::restage_05
+```
+
+It failed to compile. Raw output: `.git/a2a-bridge/repair-1/red-structural.txt`.
+
+```text
+error[E0599]: no method named `empty_walks` found for reference `&custody_coverage::CustodyCoveragePlanV1` in the current scope
+error[E0599]: no method named `empty_walks` found for struct `custody_coverage::CustodyCoveragePlanV1` in the current scope   (×3)
+error: could not compile `bridge-core` (lib test) due to 4 previous errors
+```
+
+**`restage_03`'s old assertion was the defect itself.** It required `Io(NotFound)` for a zero-receipt plan's
+`refs_and_head`. The corrected assertion requires that walk to replay to zero entries. This is a correction of an
+assertion that pinned the wrong behavior, not a relaxation. Its generation assertions are unchanged.
+
+### 11.3 The fix
+
+No manifest field, capsule wire format, reason code, dependency, or selection outside `custody_coverage.rs` was added.
+`custody_frame.rs`, `custody_walk.rs`, `fs_custody.rs`, and `custody_git.rs` are unchanged.
+
+**Planner (`custody_coverage.rs`).**
+- `assemble` handles every successful class walk the same way. It keeps the walk's recipe, and it projects the walk's
+  `WalkReceiptV1` to `CustodyClassReceiptV1 { class, frame_length, frame_sha256, inventory_digest }`.
+  - A walk with entries pushes that receipt to `receipts`, and its row is `Captured`, exactly as before.
+  - A zero-entry walk pushes it to a new private `empty_walks`, and its row is `Empty`, exactly as before.
+- **New accessor:** `CustodyCoveragePlanV1::empty_walks() -> &[CustodyClassReceiptV1]`, one baseline per walked class
+  planned `empty`, in class order. It is never a manifest receipt or payload. So binding step 4, the walked streams, the
+  layout, and the payloads are unchanged: they are still the `Captured` classes only.
+- `restage_class_v1` is unchanged in code. It now finds a recipe for an empty class too.
+- **What has no baseline:** a class whose walk refused (its row is `unresolved`), a class never walked, and a bare
+  source's `worktree`. A bare source walks no worktree, so that class has no root domain to change.
+
+**Exporter (`custody_export.rs`).**
+- **New function:** `prove_empty_walks(capability)`. For a plan-backed capability, it takes each baseline in
+  `plan.empty_walks()`, in class order, and replays it with `restage_class_v1(plan, sources, class, &mut io::sink())`.
+  That is the plan's own recipe, from a fresh pin proved to be the retained pin.
+  - A replay that refuses is `SourceDrift("<Class> was planned empty and did not replay: …")`.
+  - A replay whose `(frame_bytes, frame_sha256, inventory_sha256)` differs from the baseline is
+    `SourceDrift("<Class> was planned empty and replayed to another walk")`.
+  - A fixture capability has no plan, and returns `Ok`.
+- **The call site** is in `export_capsule_v1`, after the last artifact is sealed and before
+  `CustodyCapsuleSealProofV1::from_receipts`, so no seal is published after a refusal. A refusal is the 2B2 typed
+  incomplete outcome: the scratch holds the published artifacts, and no `capsule-seal`.
+
+### 11.4 Controls
+
+| Control | What it proves |
+|---|---|
+| `planned_empty_01` | An objects-only source with no receipts seals: with no objects, and with one loose blob, where the capsule then holds the pack. No `payload-*.frame` is staged |
+| `planned_empty_02` | The reviewer's state. An objects-only source with a planned loose blob has `refs_and_head` `empty` in the manifest. `HEAD` is created after minting. The export refuses `SourceDrift("RefsAndHead was planned empty and replayed to another walk")`, and no seal exists |
+| `planned_empty_03` | The one-root-domain edge, two rows. Each seals unchanged first, then is planned again and changed after minting, and is refused with no seal: (a) a git directory holding only `objects/` beside a captured worktree, then `HEAD` (drift on `RefsAndHead`); (b) an empty worktree beside a captured bare-initialized git directory, then `new.txt` (drift on `Worktree`) |
+| `planned_empty_04` | A replay refusal is drift: `HEAD.lock` created after minting parks the `refs_and_head` replay, and the export refuses `SourceDrift("RefsAndHead was planned empty and did not replay: …")` with no seal |
+| `restage_03` (corrected) | A zero-receipt plan's `refs_and_head` replays, unchanged, to a zero-entry frame |
+| `restage_05` | A clone's walked classes split exactly into receipts and baselines: `in_progress_git_operations` and `bridge_evidence` are empty, and together they are the seven walked classes. An objects-only plan's baselines are exactly the six git-directory classes. Every baseline's row is `empty`, and it replays to exactly its baseline. `HEAD` created after planning replays `refs_and_head` to one entry, with another frame digest and inventory digest |
+
+**Why `planned_empty_03`'s fixtures keep the git directory apart from the worktree.**
+- With `.git` inside the worktree, the worktree walk emits it as a connector, `IncludeEntryOnly`, and folds its full stat
+  into the inventory digest. So in that layout the worktree is always captured.
+- A new top-level git-directory entry moves `.git`'s mtime and ctime, so the worktree restage already catches it,
+  indirectly, and only through the timestamps.
+- With the domains apart, neither restage can observe the other. That is the state in which the committed code sealed
+  both rows.
+
+**GREEN.** Every control passes on the fix. Run over the whole slice filter:
+
+```text
+cargo test --locked --offline -p bridge-core --lib --no-fail-fast -- custody_export::tests:: custody_coverage::tests:: custody_mounts::tests::
+```
+
+The result was `ok. 178 passed; 0 failed`. Raw output: `.git/a2a-bridge/repair-1/green.txt`.
+
+**One correction before GREEN, stated plainly.** `restage_05`'s first draft planned `&readme_clone()` as a temporary.
+Its `TempDir` was dropped before the replay, so the replay refused `RootIdentity`, correctly. The clone is now bound to a
+variable. No assertion changed.
+
+### 11.5 Mutation matrix
+
+**The harness** is the same persisted `.git/a2a-bridge/mutation/matrix.py`, with the same rules as §6. It changed in
+two ways:
+- **Four new rows**, one per new guard:
+
+  | Row | Guard |
+  |---|---|
+  | `M-empty-walk-kept` | the `empty_walks.push` in `assemble` |
+  | `M-empty-proof-called` | the `prove_empty_walks` call |
+  | `M-empty-compare` | the baseline comparison, made `if false` |
+  | `M-empty-replay-error` | the replay refusal, made `continue` |
+
+- **`M-recipe-kept` was updated.** Its guard now covers every successful walk, so `restage_03` moved from its greens to
+  its reds, and `restage_05` and `planned_empty_01` joined its reds.
+
+**The run.** `matrix.py snapshot` was taken on the final bytes: snapshot `a9275492d214415b`, at 19:55:59Z.
+- `matrix.py check` reported **49 rows, 0 problems**.
+- Then **one foreground run** (`timeout 590 python3 matrix.py run …`, 19:56:03Z–19:59:20Z, 197 s) ran 10 rows:
+  - the 4 new rows;
+  - the 6 rows whose targets sit in the changed functions:
+    - `assemble`: `M-recipe-kept` and `M-plan-generation-field`;
+    - `restage_class_v1`: `M-restage-reconstructed` and `M-restage-domain`;
+    - `export_capsule_v1`: `M-census-prewrite` and `M-frame-removed-after-seal`.
+- The result: **10 FLIPPED, 0 NOT-FLIPPED, 0 INADMISSIBLE.**
+
+| ID | Named red | Verdict | Every failing control |
+|---|---|---|---|
+| M-empty-walk-kept | restage_05, planned_empty_02, _03, _04 | FLIPPED | planned_empty_02, _03, _04, restage_05 |
+| M-empty-proof-called | planned_empty_02, _03, _04 | FLIPPED | planned_empty_02, _03, _04 |
+| M-empty-compare | planned_empty_02, _03 | FLIPPED | planned_empty_02, _03 |
+| M-empty-replay-error | planned_empty_04 | FLIPPED | planned_empty_04 |
+| M-recipe-kept | restage_01, _03, _05, planned_empty_01, planned_e2e_01 | FLIPPED | planned_census_02, planned_e2e_01, planned_empty_01, _02, _03, planned_retention_01, planned_stage_01, _02, _04, restage_01–05 |
+| M-plan-generation-field | restage_03, planned_e2e_01 | FLIPPED | 23 `planned_*` controls (every `planned_empty_*` included), and restage_03 |
+| M-restage-reconstructed | restage_01, restage_02, planned_e2e_01 | FLIPPED | planned_census_02, planned_e2e_01, restage_01, restage_02 |
+| M-restage-domain | restage_01, planned_e2e_01 | FLIPPED | planned_census_02, planned_e2e_01, planned_empty_03, planned_retention_01, planned_stage_01, _02, _04, restage_01, _02, _04 |
+| M-census-prewrite | planned_census_05 | FLIPPED | planned_census_05 |
+| M-frame-removed-after-seal | planned_retention_01, planned_e2e_01 | FLIPPED | planned_e2e_01, planned_retention_01 |
+
+Each row's greens passed:
+- `M-empty-walk-kept` kept `planned_empty_01`, `restage_01`, and `restage_03` green.
+- `M-empty-proof-called` kept `planned_empty_01` and `restage_05` green.
+- `M-empty-compare` kept `planned_empty_01` and `planned_empty_04` green.
+- `M-empty-replay-error` kept `planned_empty_01` and `planned_empty_02` green.
+
+The last two show that the comparison and the refusal mapping are each discriminated alone. Under
+`M-empty-replay-error`, `planned_empty_04` fails because the next class, `Index`, reports the skipped `HEAD.lock` as
+drift instead. The control requires the refusal on `RefsAndHead` itself.
+
+**Source equals the snapshot:** yes.
+- **Harness:** the run ended with `VERIFY OK: 8 files equal their snapshot; no pending marker` at 19:59:20Z.
+  `matrix.log` now holds 74 `APPLIED` and 74 `RESTORED` lines, the 64 of §6 plus these 10.
+- **Independent check:** outside the harness, each live file's SHA-256 equals both its snapshot copy and
+  `manifest.json`, and each file's mtime was refreshed to 19:59:20:
+  - `custody_coverage.rs` `3ab6eee4`, and `custody_coverage_tests.rs` `61028c24`;
+  - `custody_export.rs` `ad081caf`, and `custody_export_tests.rs` `69b36365`;
+  - `custody_mounts.rs` `053e3c56`, and `custody_mounts_tests.rs` `0271e5a1`;
+  - `custody_seal.rs` `6538f8ad`, and `lib.rs` `eaa953fe`.
+- These are the same hashes recorded before the snapshot, on which the gates ran. No `pending.json` exists, and no
+  background job ran at any point in this round.
+- **After the matrix:** no source file was edited. Only this section, the harness's rendered `table.md`, and the staging
+  were done.
+
+### 11.6 Gates on the final bytes
+
+Raw output is in `.git/a2a-bridge/repair-1/`. Every cargo command ran with `CARGO_HOME=/cargo CARGO_NET_OFFLINE=true
+CARGO_TARGET_DIR=/tmp/target`. Every test run unset `HTTP_PROXY`, `HTTPS_PROXY`, `http_proxy`, and `https_proxy`.
+
+| Gate | Exit | Totals |
+|---|---|---|
+| `cargo fmt --all -- --check` | 0 | no diff |
+| `cargo clippy --locked --offline --workspace --all-targets -- -D warnings` | 0 | no warning or error |
+| `cargo test --locked --offline -p bridge-core --lib --no-fail-fast` | 0 | **1,031 passed**, 0 failed: §5's 1,026 plus the 5 new controls |
+| `cargo test --locked --offline --workspace --all-targets --no-fail-fast` | 0 | 90 test binaries: **4,766 passed**, 0 failed, 13 ignored, in 257 s: §5's 4,761 plus 5 |
+| `cargo test --locked --offline --workspace --no-fail-fast` | 0 | 106 `test result` lines, with 16 doctest runs: **4,776 passed**, 0 failed, 13 ignored: §5's 4,771 plus 5 |
+| `cargo run --locked --offline -p a2a-bridge -- validate --repo-hygiene` | 0 | `repository hygiene validated`; `tracked_artifacts: 41`, `validated_example_configs: 9` |
+| `git diff --cached --check`, over the five staged paths | 0 | no output |
+
+**One flake, disclosed.** The first `bridge-core` lib run returned 1,030 passed and 1 failed.
+- **The failure:** 2B2a's `custody_git_tests::a5g_post_exit_rehash_a13_version_table_and_a17_profiles_are_enforced`
+  panicked at `admit fixture: Spawn(Os { code: 26, kind: ExecutableFileBusy, message: "Text file busy" })`.
+- **Why it is unrelated:** it is the `ETXTBSY` exec race on a freshly written fixture script, which §6 already watches
+  for, in a file this round did not touch.
+- **The re-run:** the next lib run was clean, as recorded above, and so were both workspace runs.
+- Raw output: `bridge-core-lib-run1-etxtbsy.txt`.
+
+The §7 exclusions are unchanged: `cargo deny` is not installed, the lane is not mount-capable, and the ext4 and macOS
+lanes are elsewhere.
+
+### 11.7 Interpretations the reviewer should check
+
+1. **Placement.** The empty-walk proofs run after the last artifact seal and before the seal proof and publication. So
+   they are the last source observation before the seal. A refusal leaves published artifacts without a `capsule-seal`,
+   the same incomplete outcome as a `SourceDrift` at a later class's restage.
+2. **No recheck or census precedes the empty replays.** Each replay's fresh pin is proved to be the retained pin, as
+   every restage's is. The capability's full recheck and the census last ran before the first scratch write, or before
+   the last captured restage. §5 step 3 governs staged frames, and an empty walk stages nothing.
+3. **The replay sink is `io::sink()`, not a bounded writer.** An empty walk writes no scratch bytes, so there is no
+   reservation to exceed. Its cost is bounded by the recipe's frame and entry budgets, exactly as the planner's own walk
+   was.
+4. **What counts as drift.** The baseline is the same triple the captured comparison uses. The inventory digest folds
+   every skipped entry's stat. So a changed or added entry that another class owns, at the top of the same root, is
+   drift too. The captured restages already had the same property.
+5. **Superseded statements.** Two earlier statements are superseded by this round:
+   - §3.1's "A class with no recipe is `Io(NotFound)`" now applies only to a class that was never successfully walked;
+   - §4's `restage_03` row, "no recipe to restage", no longer holds.
+
+### 11.8 Staged paths
+
+```text
+crates/bridge-core/src/custody_coverage.rs        (empty_walks field and accessor; assemble keeps every walk's recipe and receipt)
+crates/bridge-core/src/custody_coverage_tests.rs  (objects_only_source helper; restage_03 corrected; restage_05)
+crates/bridge-core/src/custody_export.rs          (prove_empty_walks, and its call before the seal proof)
+crates/bridge-core/src/custody_export_tests.rs    (separate_git_dir and add_loose_blob fixtures; planned_empty_01–04)
+docs/superpowers/reviews/2026-09-27-adr0041-slice2b2b2b2-implementation-handoff.md (this section, and the status pointer)
+```
+
+Nothing is committed, and `.git/A2A_COMMIT_MSG` is not written in this round.

@@ -3143,18 +3143,22 @@ fn restage_02_a_recipe_changed_through_the_seam_restages_another_receipt() {
     }
 }
 
-#[test]
-fn restage_03_a_plan_with_no_receipts_still_binds_its_generation() {
-    // A bare git directory holding only an empty `objects/`: every walked class is empty.
+/// A bare git directory holding only an empty `objects/`: every walked class is empty.
+fn objects_only_source() -> SourceV1 {
     let area = TempDir::new().unwrap();
     let git_dir = area.path().canonicalize().unwrap().join("empty.git");
     fs::create_dir_all(git_dir.join("objects")).unwrap();
-    let source = SourceV1 {
+    SourceV1 {
         worktree: git_dir.clone(),
         git_dir,
         area: area.path().canonicalize().unwrap(),
         _area: area,
-    };
+    }
+}
+
+#[test]
+fn restage_03_a_plan_with_no_receipts_still_binds_its_generation() {
+    let source = objects_only_source();
     let scratch = new_scratch();
     let mut request = default_request(&source, scratch.path());
     request.generation_id = "generation-a".to_owned();
@@ -3165,11 +3169,13 @@ fn restage_03_a_plan_with_no_receipts_still_binds_its_generation() {
         .iter()
         .all(|row| row.state() == CustodyStateClassV1::Empty));
     assert_eq!(plan.generation_id(), "generation-a");
-    // With no receipt there is no recipe to restage.
-    assert_eq!(
-        restage(&plan, &request.sources, Class::RefsAndHead).map(|_| ()),
-        Err(CustodyWalkErrorV1::Io(io::ErrorKind::NotFound))
-    );
+    // With no receipt, each walked class still keeps its recipe (repair round 1), so the
+    // exporter can replay it: an unchanged source replays to a zero-entry walk.
+    let (frame, replayed) = restage(&plan, &request.sources, Class::RefsAndHead)
+        .expect("an empty walk keeps its recipe");
+    assert_eq!(replayed.summary().entries(), 0);
+    let header = CustodyFrameHeaderV1::new(Class::RefsAndHead, "generation-a").unwrap();
+    assert!(decode(&frame, &header).is_empty());
     // The generation is the request's, receipts or not.
     let (plan, _) = plan_and_sources(&readme_clone());
     assert!(!plan.receipts().is_empty());
@@ -3195,6 +3201,76 @@ fn restage_04_a_root_replaced_since_planning_is_drift() {
     let expected = receipt(&plan, Class::RefsAndHead);
     let (_, restaged) = restage(&plan, &sources, Class::RefsAndHead).expect("restage refs");
     assert_eq!(restaged.summary().frame_sha256(), expected.frame_sha256);
+}
+
+/// Repair round 1: every successful class walk keeps its recipe and its receipt. A captured
+/// walk's is a plan receipt; a zero-entry walk's is an empty-walk baseline, never a receipt. An
+/// unchanged source replays each baseline exactly, and `HEAD` created after planning replays
+/// `refs_and_head` to another walk.
+#[test]
+fn restage_05_every_empty_walk_keeps_its_recipe_and_its_baseline() {
+    let classes = |receipts: &[CustodyClassReceiptV1]| -> Vec<CustodyCoverageClassV1> {
+        receipts.iter().map(|receipt| receipt.class).collect()
+    };
+    let replays_its_baseline = |plan: &CustodyCoveragePlanV1,
+                                sources: &CustodyCoverageSourcesV1| {
+        for baseline in plan.empty_walks() {
+            let class = baseline.class;
+            assert_eq!(row(plan, class), empty(class));
+            let (frame, replayed) = restage(plan, sources, class).expect("replay the walk");
+            assert_eq!(replayed.summary().entries(), 0, "{class:?}");
+            assert_eq!(
+                (
+                    frame.len() as u64,
+                    sha256(&frame),
+                    replayed.inventory_sha256()
+                ),
+                (
+                    baseline.frame_length,
+                    baseline.frame_sha256,
+                    baseline.inventory_digest
+                ),
+                "{class:?}"
+            );
+        }
+    };
+
+    // A clone: its walked classes are partly captured and partly empty, never both.
+    let source = readme_clone();
+    let (plan, sources) = plan_and_sources(&source);
+    let empty_walks = classes(plan.empty_walks());
+    assert_eq!(
+        empty_walks,
+        [Class::InProgressGitOperations, Class::BridgeEvidence]
+    );
+    let mut walked = classes(plan.receipts());
+    walked.extend(&empty_walks);
+    walked.sort();
+    let mut expected = GIT_DIR_CLASSES_V1.to_vec();
+    expected.push(Class::Worktree);
+    expected.sort();
+    assert_eq!(walked, expected);
+    replays_its_baseline(&plan, &sources);
+
+    // No receipts: every git-directory class is an empty walk, and a bare source walks no
+    // worktree.
+    let source = objects_only_source();
+    let (plan, sources) = plan_and_sources(&source);
+    assert!(plan.receipts().is_empty());
+    assert_eq!(classes(plan.empty_walks()), GIT_DIR_CLASSES_V1);
+    replays_its_baseline(&plan, &sources);
+    fs::write(source.git_at("HEAD"), b"ref: refs/heads/main\n").unwrap();
+    let baseline = plan.empty_walks()[0];
+    assert_eq!(baseline.class, Class::RefsAndHead);
+    let (_, replayed) = restage(&plan, &sources, Class::RefsAndHead).expect("replay refs");
+    assert_eq!(replayed.summary().entries(), 1);
+    assert_ne!(
+        (
+            replayed.summary().frame_sha256(),
+            replayed.inventory_sha256()
+        ),
+        (baseline.frame_sha256, baseline.inventory_digest)
+    );
 }
 
 /// Pins `chain`'s source as the exporter's plan-backed capability holds it.
