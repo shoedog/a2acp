@@ -60,6 +60,9 @@ merges, against its API.
 - Staged-frame export (`work/payload-<code>.frame`, a ledger reservation, a pre-seal receipt comparison, and sealing
   from the retained descriptor), carried from combined revision 1 §5.
 - Lock files and `gc.pid` park with `WriterUncontrolled`, and `shallow` parks, as in combined revision 1.
+- **Walker concurrency contract** (2B2b2a implementation review, deferred). Class walks must not run concurrently
+  over one shared `PinnedDirectoryV1`, because `list_child_names` duplicates the pin's descriptor and shares its
+  directory offset. Either walk classes sequentially, or pin each class root separately.
 
 ## 2B2b2b split (owner-approved 2026-09-27)
 
@@ -79,3 +82,9 @@ merges, against its API.
 - **Staged-frame export:** reserve, create `work/payload-<code>.frame`, `recheck()`, re-walk sequentially with a
   fresh pin, compare `(frame_length, frame_sha256, inventory_digest)` with the receipt, then seal from the retained
   descriptor. Its controls cover binding refusals, drift, round trip, and regressions.
+- **Mandatory mount-point census** (owner ruling 2026-09-27, from the 2B2b2b1 implementation review round 2).
+  Before any plan is exported, enumerate the host's mount points (Linux `/proc/self/mountinfo`, macOS `getfsstat`).
+  Park the unit with `MountBoundary` if any mount point lies inside the source repository or the git directory. A
+  same-device bind mount is invisible to `st_dev` checks, and can alias the git directory beneath `target/` (a false
+  `cargo-target-v1` exclusion). RED: a Linux same-device bind-alias fixture on a mount-capable lane, plus a
+  deterministic census seam.

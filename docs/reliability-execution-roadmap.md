@@ -1,8 +1,9 @@
 # Bridge reliability execution and handoff roadmap
 
 - **Program status:** active P0
-- **Current main lineage:** `origin/main` is `f16ca4749b8ac2cbf8c6b059270d446c881bff6d`, which merged docs
-  PR #112 after ADR-0041 Slice 2B2 merged in PR #111 at `90d3a208`. Its ancestry includes the provider refresh
+- **Current main lineage:** `origin/main` is `3a9d8fb30595c9aa381db6c15b835a872fd34d5c`, which merged ADR-0041 Slice
+  2B2b2b2 in PR #121 (spec PR #120), and before that Slice 2B2b2b1 in PR #119 (spec PR #118 at `3e12ff53`), and before that Slice 2B2b2a in PR #117 (after its spec, PR #116 at `980eb52a`), and before that Slice 2B2b1 in PR #114, after the 2B2b1 spec (PR #113 at `f3a4c0a8`), docs PR #112 (`f16ca474`), and Slice 2B2 (PR
+  #111 at `90d3a208`). Its ancestry includes the provider refresh
   (PR #110), Slice 2B2a (PR #106 at `67f414e7`), and Slice 2B1 (PR #105 at `5e431f4f`), plus PR #104 at `27a885f6d4af6a517c2a8899aa5bfe36605b8fb7`, which merged
   Slices 1A, 1B, and 2A with reviewed/published head `65a572df40f07316124a70b7ec353a2d38dd334d`, plus
   ADR-0041 custody-lifecycle documentation PR #103, R2f1b 5B PR #102
@@ -14,9 +15,27 @@
   `6338bc1628fed52b772026b604a1bbdd710efa8c`; the final Sol/xhigh rereview recorded 0 WRONG and 3 SMELL,
   with full verification at 4,408 passed / 0 failed / 13 ignored / 726 filtered. The candidate remains
   production-unwired; its historical handoff's pre-publication stop is superseded by the recorded PR #102 merge.
-- **Active slice:** **ADR-0041 Slice 2B2b1 (pure coverage-payload frame) — spec review.** The owner split 2B2b into 2B2b1 (frame) and 2B2b2 (walker, class selection, and exporter streaming) on 2026-09-26; the 2B2b1 task is `docs/superpowers/plans/2026-09-26-adr0041-slice2b2b1-coverage-frame-task.md`. Slice 2B2 (isolated local
-  export and Git-object closure) **merged in PR #111 at `90d3a208`** on 2026-09-26, with all CI jobs green,
-  including native ext4 and Windows. Slice 2B2a merged earlier in PR #106 at `67f414e7`.
+- **Active slice:** **ADR-0041 Slice 2B3 (inert new-root restore and hidden-state proof) — spec drafting is next.**
+  **2B2b is complete:** all its children are merged. The parent Slice 2B completion gate (plan §8) still requires 2B3,
+  the aggregate fixture without the source or its alternates, and one bounded review of the combined diff.
+  - **Merged on 2026-09-26/27:**
+    - Slice 2B2b1 (the pure coverage-payload frame) in PR #114 at `b8d2686d`, with its spec in PR #113;
+    - Slice 2B2b2a (the descriptor-relative no-follow walker) in PR #117 at `f42c81fc`, with its spec in PR #116.
+    - Slice 2B2b2b1 (the coverage plan, evidence detection, and gitlink probe) in PR #119 at `e5de184b`, with its spec
+      in PR #118. Opus 5.5 built it via `implement` (3 loop attempts) plus one repair turn. The Sol implementation
+      review ran round 1 REJECT, then round 2 REJECT on a same-device bind-mount residual, which the **owner deferred
+      on 2026-09-27** to 2B2b2b2 as a mandatory mount-point census.
+    - Slice 2B2b2b2 (plan binding, the mandatory mount-point census, and bounded staged-frame export) in PR #121 at
+      `3a9d8fb3`, with its spec in PR #120. Opus 5.5 built it via `implement` (1 attempt) plus one repair turn, which
+      replays empty-class proofs. The Sol implementation review ran round 1 REJECT, then round 2 APPROVE. The real
+      bind-mount control is a named exclusion, because the container lacks `CAP_SYS_ADMIN`; an injected-census seam
+      stands in for it.
+      Opus 5.5 built it via `a2a-bridge implement` (the attempt-2 fix loop repaired a stale A14 count and a
+      symlink-target identity gap). The 36-row matrix flipped every row, and the Sol implementation review approved
+      at round 1.
+  - **Owner decisions of 2026-09-26:** split 2B2b into 2B2b1 and 2B2b2, then split 2B2b2 into 2B2b2a and 2B2b2b;
+    the common-clone class set; capture the whole worktree except `cargo-target-v1`; and exact gitlink detection
+    through an `ls-files --stage` runner amendment.
   - **2B2 history:**
     - **Build:** Opus 5.5 implemented it through the bridge in three edit turns plus two repair turns, after the
       2026-09-25 provider refresh that made the bridge's `opus` serve Opus 5.5.
@@ -1041,6 +1060,33 @@ Accepted as deferred by the 2B2 implementation review (round 3 `APPROVE`; the ra
   - **Container proxy environment:** with `HTTP_PROXY`/`HTTPS_PROXY` set, 8 `a2a-bridge` tests fail and the
     `bridge-api` lib tests hang, because local HTTP mocks go through `reqwest`'s proxy. This reproduces on base
     `742e0a60`. Run the workspace suite with the proxy variables unset, or set `NO_PROXY` for loopback.
+
+### ADR-0041 2B2b1 deferred follow-ups (ledger, 2026-09-26)
+
+- **`M-io-read` probe-boundary coverage (SMELL, MATERIAL, DEFER).** No control builds a reader that fails exactly at
+  the final one-byte length probe. The implementor self-reported it, and the Sol implementation review deferred it.
+  Detail is in `docs/superpowers/reviews/2026-09-26-adr0041-slice2b2b1-implementation-handoff.md`.
+- **The 2B2a `ETXTBSY` fixture flake now costs CI cycles (recommended small fix).** It failed the coverage job of the
+  first PR #114 run (`custody_git_tests::a8_…`, `Text file busy`); the rerun passed. The mechanism is a fork/exec
+  race: another test thread forks while a freshly written fixture script is still open for writing. **Fix
+  (test-only):** a bounded retry on `ExecutableFileBusy` in the fixture admission paths of `custody_git_tests.rs` and
+  `custody_export_tests.rs`.
+
+### ADR-0041 2B2b2b1 deferred follow-ups (ledger, 2026-09-27)
+
+- **Same-device bind-mount alias (WRONG, MATERIAL; owner-deferred to 2B2b2b2, mandatory).** `cargo-target-v1`'s
+  canonical-path containment misses a git directory reachable beneath `target/` through a same-device bind mount, so
+  the directory would be falsely excluded as reproducible output. **Fix in 2B2b2b2:** before any plan is exported, a
+  mount-point census (Linux `/proc/self/mountinfo`, macOS `getfsstat`) parks the unit with `MountBoundary` if any
+  mount point lies inside the source repository. This closes bind-mount aliasing for every class. It was found in
+  Sol implementation review round 2 of PR #119.
+
+### ADR-0041 2B2b2a deferred follow-ups (ledger, 2026-09-27)
+
+- **Shared-pin concurrent enumeration (SMELL, MATERIAL, DEFER to 2B2b2b).** `list_child_names` works through a `dup`
+  that shares the pin's directory offset. Two concurrent walks over one `PinnedDirectoryV1` could interleave
+  `readdir`. 2B2b2b must not walk concurrently over a shared pin; each walk must pin its own root. This was found in
+  the Sol implementation review of PR #117 and recorded in the 2B2b2b design notes.
 
 ### Provider refresh 2026-09-25 deferred follow-ups (ledger)
 
