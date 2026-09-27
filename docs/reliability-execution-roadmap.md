@@ -1,8 +1,8 @@
 # Bridge reliability execution and handoff roadmap
 
 - **Program status:** active P0
-- **Current main lineage:** `origin/main` is `e5de184b6f0fc8b968e9c08d695fa209ab841add`, which merged ADR-0041 Slice
-  2B2b2b1 in PR #119 (spec PR #118 at `3e12ff53`), and before that Slice 2B2b2a in PR #117 (after its spec, PR #116 at `980eb52a`), and before that Slice 2B2b1 in PR #114, after the 2B2b1 spec (PR #113 at `f3a4c0a8`), docs PR #112 (`f16ca474`), and Slice 2B2 (PR
+- **Current main lineage:** `origin/main` is `3a9d8fb30595c9aa381db6c15b835a872fd34d5c`, which merged ADR-0041 Slice
+  2B2b2b2 in PR #121 (spec PR #120), and before that Slice 2B2b2b1 in PR #119 (spec PR #118 at `3e12ff53`), and before that Slice 2B2b2a in PR #117 (after its spec, PR #116 at `980eb52a`), and before that Slice 2B2b1 in PR #114, after the 2B2b1 spec (PR #113 at `f3a4c0a8`), docs PR #112 (`f16ca474`), and Slice 2B2 (PR
   #111 at `90d3a208`). Its ancestry includes the provider refresh
   (PR #110), Slice 2B2a (PR #106 at `67f414e7`), and Slice 2B1 (PR #105 at `5e431f4f`), plus PR #104 at `27a885f6d4af6a517c2a8899aa5bfe36605b8fb7`, which merged
   Slices 1A, 1B, and 2A with reviewed/published head `65a572df40f07316124a70b7ec353a2d38dd334d`, plus
@@ -15,9 +15,9 @@
   `6338bc1628fed52b772026b604a1bbdd710efa8c`; the final Sol/xhigh rereview recorded 0 WRONG and 3 SMELL,
   with full verification at 4,408 passed / 0 failed / 13 ignored / 726 filtered. The candidate remains
   production-unwired; its historical handoff's pre-publication stop is superseded by the recorded PR #102 merge.
-- **Active slice:** **ADR-0041 Slice 2B2b2b2 (capability binding, bounded staged-frame export, and the mandatory
-  mount-point census) — spec drafting is next.** It will be written against the merged 2B2b2b1 plan type. Its scope
-  is in `docs/superpowers/plans/2026-09-26-adr0041-slice2b2b2b-coverage-design-notes.md`.
+- **Active slice:** **ADR-0041 Slice 2B3 (inert new-root restore and hidden-state proof) — spec drafting is next.**
+  **2B2b is complete:** all its children are merged. The parent Slice 2B completion gate (plan §8) still requires 2B3,
+  the aggregate fixture without the source or its alternates, and one bounded review of the combined diff.
   - **Merged on 2026-09-26/27:**
     - Slice 2B2b1 (the pure coverage-payload frame) in PR #114 at `b8d2686d`, with its spec in PR #113;
     - Slice 2B2b2a (the descriptor-relative no-follow walker) in PR #117 at `f42c81fc`, with its spec in PR #116.
@@ -25,6 +25,11 @@
       in PR #118. Opus 5.5 built it via `implement` (3 loop attempts) plus one repair turn. The Sol implementation
       review ran round 1 REJECT, then round 2 REJECT on a same-device bind-mount residual, which the **owner deferred
       on 2026-09-27** to 2B2b2b2 as a mandatory mount-point census.
+    - Slice 2B2b2b2 (plan binding, the mandatory mount-point census, and bounded staged-frame export) in PR #121 at
+      `3a9d8fb3`, with its spec in PR #120. Opus 5.5 built it via `implement` (1 attempt) plus one repair turn, which
+      replays empty-class proofs. The Sol implementation review ran round 1 REJECT, then round 2 APPROVE. The real
+      bind-mount control is a named exclusion, because the container lacks `CAP_SYS_ADMIN`; an injected-census seam
+      stands in for it.
       Opus 5.5 built it via `a2a-bridge implement` (the attempt-2 fix loop repaired a stale A14 count and a
       symlink-target identity gap). The 36-row matrix flipped every row, and the Sol implementation review approved
       at round 1.
