@@ -55,6 +55,13 @@ serial child, **2B2b**, sequenced after 2B2 and before 2B3, so 2B2 exports opaqu
 carries only restore. 2B2b receives its own reviewed task. See
 `docs/superpowers/plans/2026-09-23-adr0041-slice2b2-isolated-export-task.md` §3.
 
+**Amendment (owner-approved 2026-09-27):** 2B2b2b is split into:
+- **2B2b2b1:** the coverage plan, meaning the tables, detectors, the `ls-files --stage -z` probe, and the policy
+  records. Its task is `docs/superpowers/plans/2026-09-27-adr0041-slice2b2b2b1-coverage-plan-task.md`.
+- **2B2b2b2:** capability binding and staged-frame export.
+
+The serial order is 2B2b2a → 2B2b2b1 → 2B2b2b2 → 2B3.
+
 **Amendment (owner-approved 2026-09-26, later the same day):** 2B2b2 is split again, into:
 - **2B2b2a:** the descriptor-relative no-follow walker. Its task is
   `docs/superpowers/plans/2026-09-26-adr0041-slice2b2b2a-walker-task.md`.

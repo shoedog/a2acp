@@ -5,6 +5,10 @@ pub mod attestation;
 pub mod brief_lint;
 pub mod catalog;
 pub mod custody_capsule;
+// 2B2b2b1's coverage planner is production-unwired until 2B2b2b2 binds its plan to the export.
+#[cfg(unix)]
+#[allow(dead_code)]
+mod custody_coverage;
 // The exporter's entry point is crate-private and, by design, production-unreachable: the capture
 // capability has only a crate-private fixture constructor and the only sealer is the in-crate
 // fixture. The wiring slice supplies the production mint and the Git route pin.

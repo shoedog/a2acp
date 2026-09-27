@@ -63,3 +63,28 @@ merges, against its API.
 - **Walker concurrency contract** (2B2b2a implementation review, deferred). Class walks must not run concurrently
   over one shared `PinnedDirectoryV1`, because `list_child_names` duplicates the pin's descriptor and shares its
   directory offset. Either walk classes sequentially, or pin each class root separately.
+
+## 2B2b2b split (owner-approved 2026-09-27)
+
+2B2b2b is delivered as:
+- **2B2b2b1:** the coverage plan. Its task is `docs/superpowers/plans/2026-09-27-adr0041-slice2b2b2b1-coverage-plan-task.md`.
+- **2B2b2b2:** capability binding and staged-frame export. It is specified after 2B2b2b1 merges, against its real
+  plan type.
+
+2B2b2b2 must include:
+- **Three-collection binding (#1).** The capability stores the plan's coverage, exclusions, dependencies, and
+  receipts. Before any scratch write, all three collections must equal the manifest's exactly, which requires
+  read-only `exclusions()` and `dependencies()` accessors on `CustodyManifestV1`. Receipts must map one-to-one onto
+  captured, walked classes, and the plan's generation must equal the capability's.
+- **Bounded staged writes (2B2b2b round 1 #4).** The staged frame is written through an exact-length bounded writer
+  capped at the receipt's frame length. Any attempted extra byte is `SourceDrift`, so actual staged bytes never
+  exceed the ledger reservation. RED: grow a planned file past its receipt with no ledger headroom.
+- **Staged-frame export:** reserve, create `work/payload-<code>.frame`, `recheck()`, re-walk sequentially with a
+  fresh pin, compare `(frame_length, frame_sha256, inventory_digest)` with the receipt, then seal from the retained
+  descriptor. Its controls cover binding refusals, drift, round trip, and regressions.
+- **Mandatory mount-point census** (owner ruling 2026-09-27, from the 2B2b2b1 implementation review round 2).
+  Before any plan is exported, enumerate the host's mount points (Linux `/proc/self/mountinfo`, macOS `getfsstat`).
+  Park the unit with `MountBoundary` if any mount point lies inside the source repository or the git directory. A
+  same-device bind mount is invisible to `st_dev` checks, and can alias the git directory beneath `target/` (a false
+  `cargo-target-v1` exclusion). RED: a Linux same-device bind-alias fixture on a mount-capable lane, plus a
+  deterministic census seam.

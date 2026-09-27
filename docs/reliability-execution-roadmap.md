@@ -1,8 +1,8 @@
 # Bridge reliability execution and handoff roadmap
 
 - **Program status:** active P0
-- **Current main lineage:** `origin/main` is `f42c81fcb7e02f9c0c7529b0981dc53b592508da`, which merged ADR-0041 Slice
-  2B2b2a in PR #117 (after its spec, PR #116 at `980eb52a`), and before that Slice 2B2b1 in PR #114, after the 2B2b1 spec (PR #113 at `f3a4c0a8`), docs PR #112 (`f16ca474`), and Slice 2B2 (PR
+- **Current main lineage:** `origin/main` is `e5de184b6f0fc8b968e9c08d695fa209ab841add`, which merged ADR-0041 Slice
+  2B2b2b1 in PR #119 (spec PR #118 at `3e12ff53`), and before that Slice 2B2b2a in PR #117 (after its spec, PR #116 at `980eb52a`), and before that Slice 2B2b1 in PR #114, after the 2B2b1 spec (PR #113 at `f3a4c0a8`), docs PR #112 (`f16ca474`), and Slice 2B2 (PR
   #111 at `90d3a208`). Its ancestry includes the provider refresh
   (PR #110), Slice 2B2a (PR #106 at `67f414e7`), and Slice 2B1 (PR #105 at `5e431f4f`), plus PR #104 at `27a885f6d4af6a517c2a8899aa5bfe36605b8fb7`, which merged
   Slices 1A, 1B, and 2A with reviewed/published head `65a572df40f07316124a70b7ec353a2d38dd334d`, plus
@@ -15,12 +15,16 @@
   `6338bc1628fed52b772026b604a1bbdd710efa8c`; the final Sol/xhigh rereview recorded 0 WRONG and 3 SMELL,
   with full verification at 4,408 passed / 0 failed / 13 ignored / 726 filtered. The candidate remains
   production-unwired; its historical handoff's pre-publication stop is superseded by the recorded PR #102 merge.
-- **Active slice:** **ADR-0041 Slice 2B2b2b (class tables, coverage plan, manifest binding, and exporter staged
-  frames) — spec drafting is next.** It will be drafted against the merged walker API. Its design notes are
-  `docs/superpowers/plans/2026-09-26-adr0041-slice2b2b2b-coverage-design-notes.md`.
+- **Active slice:** **ADR-0041 Slice 2B2b2b2 (capability binding, bounded staged-frame export, and the mandatory
+  mount-point census) — spec drafting is next.** It will be written against the merged 2B2b2b1 plan type. Its scope
+  is in `docs/superpowers/plans/2026-09-26-adr0041-slice2b2b2b-coverage-design-notes.md`.
   - **Merged on 2026-09-26/27:**
     - Slice 2B2b1 (the pure coverage-payload frame) in PR #114 at `b8d2686d`, with its spec in PR #113;
     - Slice 2B2b2a (the descriptor-relative no-follow walker) in PR #117 at `f42c81fc`, with its spec in PR #116.
+    - Slice 2B2b2b1 (the coverage plan, evidence detection, and gitlink probe) in PR #119 at `e5de184b`, with its spec
+      in PR #118. Opus 5.5 built it via `implement` (3 loop attempts) plus one repair turn. The Sol implementation
+      review ran round 1 REJECT, then round 2 REJECT on a same-device bind-mount residual, which the **owner deferred
+      on 2026-09-27** to 2B2b2b2 as a mandatory mount-point census.
       Opus 5.5 built it via `a2a-bridge implement` (the attempt-2 fix loop repaired a stale A14 count and a
       symlink-target identity gap). The 36-row matrix flipped every row, and the Sol implementation review approved
       at round 1.
@@ -1062,6 +1066,15 @@ Accepted as deferred by the 2B2 implementation review (round 3 `APPROVE`; the ra
   race: another test thread forks while a freshly written fixture script is still open for writing. **Fix
   (test-only):** a bounded retry on `ExecutableFileBusy` in the fixture admission paths of `custody_git_tests.rs` and
   `custody_export_tests.rs`.
+
+### ADR-0041 2B2b2b1 deferred follow-ups (ledger, 2026-09-27)
+
+- **Same-device bind-mount alias (WRONG, MATERIAL; owner-deferred to 2B2b2b2, mandatory).** `cargo-target-v1`'s
+  canonical-path containment misses a git directory reachable beneath `target/` through a same-device bind mount, so
+  the directory would be falsely excluded as reproducible output. **Fix in 2B2b2b2:** before any plan is exported, a
+  mount-point census (Linux `/proc/self/mountinfo`, macOS `getfsstat`) parks the unit with `MountBoundary` if any
+  mount point lies inside the source repository. This closes bind-mount aliasing for every class. It was found in
+  Sol implementation review round 2 of PR #119.
 
 ### ADR-0041 2B2b2a deferred follow-ups (ledger, 2026-09-27)
 
