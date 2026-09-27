@@ -3,7 +3,7 @@ task-type: implement
 ---
 # Implement ADR-0041 Slice 2B2b2b1: the coverage plan (class tables, evidence detection, gitlink probe, policy records)
 
-**Revision:** 2. Revision 1 was the combined 2B2b2b task (`47d89436`). Sol spec review round 1 rejected it with 9
+**Revision:** 3 (folds spec round 2, see §12). Revision 1 was the combined 2B2b2b task (`47d89436`). Sol spec review round 1 rejected it with 9
 closed blockers, and the owner approved splitting it into 2B2b2b1 (this plan) and 2B2b2b2 (binding and export) on
 2026-09-27. See §12.
 **Implementation base:** current `main`; bind the exact SHA at dispatch. The predecessor is 2B2b2a, PR #117 at
@@ -54,15 +54,23 @@ Add `GitCommandV1::LsFilesStageZ`, with the exact argv `ls-files --stage -z`, to
 ### 2.2 Planning scratch and probe (fixes #1 and #8)
 
 - **Scratch.** The planner receives a caller-supplied **planning scratch root**: preflighted, owner-private, and
-  empty, with the same source-overlap preflight as the 2B2 export scratch, and a caller budget
-  `CustodyPlanningBudgetV1 { max_scratch_bytes }`.
+  empty, and a caller budget `CustodyPlanningBudgetV1 { max_scratch_bytes }`.
+- **Overlap preflight (fix of round 2 #2).** Before any scratch write, the planner refuses a scratch root that
+  overlaps the **full protected-directory set**:
+  - the source repository;
+  - the source git directory;
+  - the primary object store;
+  - every store of the pinned, recursive alternate chain.
+
+  It reuses the 2B2 exporter's retained-identity overlap predicate (`refuse_source_overlap` over
+  `protected_directories`) and its `pin_alternate_chain`. A refusal is `InvalidScratch`, with no entry created.
 - **Layout.** It creates `work/`, `work/home/`, and `work/xdg/`, and roots the runner at `work/` exactly as 2B2 does.
 - **Probe repository.** It creates the probe with `InitBare { dir: "index-probe.git", object_format: <the source
   object format> }`, a single-component operand. `GIT_DIR` is `index-probe.git`.
 - **Copy.** It copies the source `index`, and every `sharedindex.*`, read through the pinned `source_git_dir` with
   `open_regular_file`, into the probe with `create_new_regular_child`.
-- **Ledger.** One planning ledger, reusing 2B2's ledger type and its init reservation (nine entry allowances plus a
-  logical `HEAD` and `config` bound), charges:
+- **Ledger (fix of round 2 #1).** One planning ledger, reusing 2B2's `ScratchLedgerV1` and its init reservation
+  (nine entry allowances plus a logical `HEAD` and `config` bound), charges:
   - `work/`, `home/`, and `xdg/` (entries);
   - the probe initialization (reserved before the spawn, then remeasured and reconciled);
   - every copied file (its bytes plus an entry allowance, reserved before the copy).
@@ -164,8 +172,10 @@ When the policy applies, the plan returns:
   captured, reasons: [] }` for each dependency file.
 
 Details:
-- `content_class` is the exact string that `CustodyManifestV1` validation requires; the implementor confirms it in
-  `custody_seal.rs`.
+- `content_class` is exactly `"reproducible_outputs"`, the snake-case wire name of
+  `CustodyCoverageClassV1::ReproducibleOutputs` (fix of round 2 #3). Manifest validation requires only a non-empty
+  string, so the spec fixes the value. A test asserts the planner's exact emitted record, and a mutation of that one
+  value fails it.
 - The dependency ids are `cargo-toml` and `cargo-lock`, plus `rust-toolchain` when a root regular file
   `rust-toolchain.toml` exists. The files are also captured in the worktree frame.
 
@@ -178,7 +188,8 @@ plan_coverage_v1(request) -> Result<CustodyCoveragePlanV1, CustodyCoverageErrorV
 ```
 
 The request contains:
-- the pinned source repository and git directory;
+- the pinned source repository and git directory, the primary object store, and the pinned alternate chain, which
+  together are the full protected set (§2.2);
 - the generation id;
 - the frame and entry budgets;
 - `CustodyPlanningBudgetV1`;
@@ -238,6 +249,17 @@ Everything class-local becomes an `unresolved` row, never an error:
 - a probe timeout or nonzero exit;
 - walker refusals.
 
+**Runner failure mapping (round 2 SMELL, folded):**
+
+| Failure | Outcome |
+|---|---|
+| route admission refused, rooted-spawn setup failure, runner invariant violated | `CustodyCoverageErrorV1::ProbeInfrastructure`, which refuses the plan |
+| `InitBare` failure, or a probe remeasure over the reservation | `PlanningScratchBudget` or `ProbeInfrastructure`, which refuses the plan |
+| `ls-files` nonzero exit, timeout, `StdoutLimit`, a malformed or trailing record, an overlong path | `index` becomes `unresolved` with `ContentUnresolved` |
+| a missing source `index` | no probe, and `NoIndex` evidence |
+
+One negative control per row.
+
 A test covers each error variant, and one class-local case per reason code.
 
 ## 5. Acceptance criteria
@@ -250,8 +272,11 @@ A test covers each error variant, and one class-local case per reason code.
    - Stdout max and max+1 give success and unresolved.
    - Each malformed parser shape is refused.
    - The source `index` bytes and mtime are unchanged.
-2. **Planning ledger.** Exact max and max+1 are tested, including the init overhead and copied bytes. The ledger
-   equals an independent census of the planning scratch.
+2. **Planning ledger and overlap.**
+   - Exact max and max+1 are tested, including the init overhead and copied bytes. The ledger equals an independent
+     census of the planning scratch, and removing any charge flips the test.
+   - A scratch root that is an empty descendant of an alternate store, and one that is an identity alias of an
+     alternate store, each refuse `InvalidScratch` with no entry created.
 3. **Class table.** Every §3.1 row routes as specified, and every special row (`commondir`, `shallow`, grafts,
    locks, the unknown name) gives its state and reason. Real rerere (`MERGE_RR`), notes-merge, and bisect states are
    captured in `in_progress_git_operations`.
@@ -315,20 +340,21 @@ The parent plan §8 gates, run with `--no-fail-fast`. Platform lanes:
 - `crates/bridge-core/src/custody_git.rs` and `custody_git_tests.rs`: the §2.1 command, and its controls only;
 - `crates/bridge-core/src/custody_coverage.rs` and `custody_coverage_tests.rs` (new; `#[cfg(unix)]`);
 - `crates/bridge-core/src/lib.rs`: the module declaration only;
+- `crates/bridge-core/src/custody_export.rs`: **visibility only**. `pub(crate)` on `ScratchLedgerV1` and the ledger
+  methods the planner needs, and on `pin_alternate_chain`, `refuse_source_overlap`, and the protected-set helper, or
+  a move of those items into a neutral shared module. No behavior change; every 2B2 control still passes.
 - `docs/superpowers/reviews/<date>-adr0041-slice2b2b2b1-implementation-handoff.md`.
 
 ## 9. Stop conditions
 
 Stop and report if any of the following is needed:
-- a change to `custody_frame.rs`, `custody_walk.rs`, `fs_custody.rs`, `custody_export.rs`, or `custody_seal.rs`;
+- a change to `custody_frame.rs`, `custody_walk.rs`, `fs_custody.rs`, or `custody_seal.rs`, or any behavioral change
+  to `custody_export.rs` (visibility per §8 is allowed);
 - a new manifest field or reason code;
 - following a symlink;
 - a path-addressed source read;
 - any Git command other than `ls-files --stage -z` and the existing `InitBare`;
 - a new dependency.
-
-If 2B2's ledger type is not reachable from `custody_coverage.rs` without changing `custody_export.rs`, stop and
-report the smallest visibility change needed, rather than duplicating the ledger.
 
 Also stop on an open-class review population, or a review cap exhausted without convergence.
 
@@ -367,3 +393,13 @@ MATERIAL blockers and 4 SMELLs. The owner approved the plan/export split.
 | Design notes #2, #3, #6, #7, and the multiset | RESOLVED here | §3, §4, §5.4 |
 | Design note #4 (policy records) | RESOLVED | §3.4 |
 | The 2B2b2a shared-pin deferral | RESOLVED | §4.2 |
+
+**Round 2** (final admitted, on revision 2 at `5ae95a90`): REJECT. Every round-1 item was RESOLVED, or correctly
+MOVED to 2B2b2b2. It raised three new closed blockers, all folded in revision 3:
+- **#1 (ledger reachability):** an owned, visibility-only change to `custody_export.rs` (§8).
+- **#2 (alternate stores missing from the overlap preflight):** the full protected set, and the reused 2B2
+  predicate (§2.2).
+- **#3 (`content_class`):** the literal `"reproducible_outputs"`, with an exact-record test (§3.4).
+
+Its SMELL (runner-failure mapping) is folded as the §4.5 table. Findings went from 9 to 3, none repeating, so
+revision 3 is reviewed in one disclosed extension round under the owner's authorization while converging.
