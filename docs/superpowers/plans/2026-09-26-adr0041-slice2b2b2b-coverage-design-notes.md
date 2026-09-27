@@ -60,3 +60,22 @@ merges, against its API.
 - Staged-frame export (`work/payload-<code>.frame`, a ledger reservation, a pre-seal receipt comparison, and sealing
   from the retained descriptor), carried from combined revision 1 §5.
 - Lock files and `gc.pid` park with `WriterUncontrolled`, and `shallow` parks, as in combined revision 1.
+
+## 2B2b2b split (owner-approved 2026-09-27)
+
+2B2b2b is delivered as:
+- **2B2b2b1:** the coverage plan. Its task is `docs/superpowers/plans/2026-09-27-adr0041-slice2b2b2b1-coverage-plan-task.md`.
+- **2B2b2b2:** capability binding and staged-frame export. It is specified after 2B2b2b1 merges, against its real
+  plan type.
+
+2B2b2b2 must include:
+- **Three-collection binding (#1).** The capability stores the plan's coverage, exclusions, dependencies, and
+  receipts. Before any scratch write, all three collections must equal the manifest's exactly, which requires
+  read-only `exclusions()` and `dependencies()` accessors on `CustodyManifestV1`. Receipts must map one-to-one onto
+  captured, walked classes, and the plan's generation must equal the capability's.
+- **Bounded staged writes (2B2b2b round 1 #4).** The staged frame is written through an exact-length bounded writer
+  capped at the receipt's frame length. Any attempted extra byte is `SourceDrift`, so actual staged bytes never
+  exceed the ledger reservation. RED: grow a planned file past its receipt with no ledger headroom.
+- **Staged-frame export:** reserve, create `work/payload-<code>.frame`, `recheck()`, re-walk sequentially with a
+  fresh pin, compare `(frame_length, frame_sha256, inventory_digest)` with the receipt, then seal from the retained
+  descriptor. Its controls cover binding refusals, drift, round trip, and regressions.
