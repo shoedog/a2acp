@@ -20,9 +20,13 @@ mod custody_frame;
 mod custody_git;
 #[cfg(all(test, unix))]
 mod custody_git_tests;
+// 2B2b2a's descriptor-relative walker is production-unwired until 2B2b2b's class producers.
 pub mod custody_inventory;
 pub mod custody_inventory_collector;
 pub mod custody_seal;
+#[cfg(unix)]
+#[allow(dead_code)]
+mod custody_walk;
 pub mod diagnostics;
 pub mod domain;
 pub mod error;
