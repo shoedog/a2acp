@@ -3026,3 +3026,351 @@ fn walks_01_run_one_at_a_time_each_with_its_own_fresh_pin() {
         ]
     );
 }
+
+// ---------------------------------------------------------------------------------------------
+// 2B2b2b2 §6.5 Restaging, and the §2 plan and source additions
+// ---------------------------------------------------------------------------------------------
+
+/// Plans `source` with the default request, keeping the pinned sources for restaging.
+fn plan_and_sources(source: &SourceV1) -> (CustodyCoveragePlanV1, CustodyCoverageSourcesV1) {
+    let scratch = new_scratch();
+    let request = default_request(source, scratch.path());
+    let plan = plan_coverage_v1(&request).expect("plan the source");
+    (plan, request.sources)
+}
+
+/// Restages `class` into memory: the frame bytes and their receipt.
+fn restage(
+    plan: &CustodyCoveragePlanV1,
+    sources: &CustodyCoverageSourcesV1,
+    class: CustodyCoverageClassV1,
+) -> Result<(Vec<u8>, WalkReceiptV1), CustodyWalkErrorV1> {
+    let mut frame = Vec::new();
+    let receipt = restage_class_v1(plan, sources, class, &mut frame)?;
+    Ok((frame, receipt))
+}
+
+#[test]
+fn restage_01_an_unchanged_source_reproduces_every_receipt_byte_for_byte() {
+    for (source, cargo_target_excluded) in [(rich_clone(), false), (cargo_source(), true)] {
+        let (plan, sources) = plan_and_sources(&source);
+        assert!(plan.receipts().len() >= 4, "{:?}", plan.receipts());
+        let installed = seam::install(PlanSeamsV1::default());
+        for expected in plan.receipts() {
+            let class = expected.class;
+            let (frame, restaged) = restage(&plan, &sources, class).expect("restage the class");
+            assert_eq!(frame.len() as u64, expected.frame_length, "{class:?}");
+            assert_eq!(sha256(&frame), expected.frame_sha256, "{class:?}");
+            assert_eq!(restaged.summary().frame_bytes(), expected.frame_length);
+            assert_eq!(restaged.summary().frame_sha256(), expected.frame_sha256);
+            assert_eq!(restaged.inventory_sha256(), expected.inventory_digest);
+            // The restaged entries are an independent re-walk's, which also matches the receipt.
+            let rewalked = if class == Class::Worktree {
+                rewalk_worktree(&source, cargo_target_excluded, Some(expected))
+            } else {
+                rewalk_git_dir(&source, class, Some(expected))
+            };
+            let header = CustodyFrameHeaderV1::new(class, GENERATION).unwrap();
+            assert_eq!(decode(&frame, &header), rewalked, "{class:?}");
+        }
+        // Each restage walked alone, on its own fresh pin, apart from every plan pin.
+        let walks = installed.record().walks;
+        assert_eq!(walks.len(), 2 * plan.receipts().len(), "{walks:?}");
+        let mut pins = BTreeSet::new();
+        for (pair, expected) in walks.chunks(2).zip(plan.receipts()) {
+            let [WalkEventV1::Begin { walk, pin }, WalkEventV1::End {
+                walk: ended,
+                pin: ended_pin,
+            }] = pair
+            else {
+                panic!("restages overlap: {walks:?}");
+            };
+            assert_eq!((walk, pin), (ended, ended_pin), "{walks:?}");
+            assert_eq!(*walk, WalkKindV1::Class(expected.class));
+            assert!(*pin >= 1 << 63 && pins.insert(*pin), "{walks:?}");
+        }
+    }
+}
+
+#[test]
+fn restage_02_a_recipe_changed_through_the_seam_restages_another_receipt() {
+    type Change = fn(&mut CustodyWalkRecipeV1);
+    let rows: [(&str, CustodyCoverageClassV1, Change); 4] = [
+        ("the worktree policy flag", Class::Worktree, |recipe| {
+            let CustodyRecipeSelectionV1::Worktree(selection) = &mut recipe.selection else {
+                panic!("the worktree recipe holds the worktree selection");
+            };
+            selection.cargo_target_excluded = !selection.cargo_target_excluded;
+        }),
+        (
+            "the git-directory selection's class",
+            Class::Index,
+            |recipe| {
+                recipe.selection = CustodyRecipeSelectionV1::GitDirectory(GitDirClassSelectionV1 {
+                    class: Class::RefsAndHead,
+                });
+            },
+        ),
+        (
+            "the frame header's generation",
+            Class::RefsAndHead,
+            |recipe| {
+                recipe.header =
+                    CustodyFrameHeaderV1::new(Class::RefsAndHead, "generation-2").unwrap();
+            },
+        ),
+        ("the root domain", Class::Worktree, |recipe| {
+            recipe.domain = CustodyRootDomainV1::GitDirectoryRoot;
+        }),
+    ];
+    for (label, class, change) in rows {
+        let source = cargo_source();
+        let (mut plan, sources) = plan_and_sources(&source);
+        let expected = receipt(&plan, class);
+        let (_, unchanged) = restage(&plan, &sources, class).expect("restage unchanged");
+        assert_eq!(unchanged.summary().frame_sha256(), expected.frame_sha256);
+        change(
+            plan.recipe_mut_for_test(class)
+                .expect("a captured class has a recipe"),
+        );
+        let (frame, changed) = restage(&plan, &sources, class).expect("restage the changed recipe");
+        assert_ne!(
+            (changed.summary().frame_sha256(), changed.inventory_sha256()),
+            (expected.frame_sha256, expected.inventory_digest),
+            "{label}"
+        );
+        assert_ne!(sha256(&frame), expected.frame_sha256, "{label}");
+    }
+}
+
+/// A bare git directory holding only an empty `objects/`: every walked class is empty.
+fn objects_only_source() -> SourceV1 {
+    let area = TempDir::new().unwrap();
+    let git_dir = area.path().canonicalize().unwrap().join("empty.git");
+    fs::create_dir_all(git_dir.join("objects")).unwrap();
+    SourceV1 {
+        worktree: git_dir.clone(),
+        git_dir,
+        area: area.path().canonicalize().unwrap(),
+        _area: area,
+    }
+}
+
+#[test]
+fn restage_03_a_plan_with_no_receipts_still_binds_its_generation() {
+    let source = objects_only_source();
+    let scratch = new_scratch();
+    let mut request = default_request(&source, scratch.path());
+    request.generation_id = "generation-a".to_owned();
+    let plan = plan_coverage_v1(&request).expect("plan the empty source");
+    assert!(plan.receipts().is_empty());
+    assert!(plan
+        .coverage()
+        .iter()
+        .all(|row| row.state() == CustodyStateClassV1::Empty));
+    assert_eq!(plan.generation_id(), "generation-a");
+    // With no receipt, each walked class still keeps its recipe (repair round 1), so the
+    // exporter can replay it: an unchanged source replays to a zero-entry walk.
+    let (frame, replayed) = restage(&plan, &request.sources, Class::RefsAndHead)
+        .expect("an empty walk keeps its recipe");
+    assert_eq!(replayed.summary().entries(), 0);
+    let header = CustodyFrameHeaderV1::new(Class::RefsAndHead, "generation-a").unwrap();
+    assert!(decode(&frame, &header).is_empty());
+    // The generation is the request's, receipts or not.
+    let (plan, _) = plan_and_sources(&readme_clone());
+    assert!(!plan.receipts().is_empty());
+    assert_eq!(plan.generation_id(), GENERATION);
+}
+
+#[test]
+fn restage_04_a_root_replaced_since_planning_is_drift() {
+    let source = readme_clone();
+    let (plan, sources) = plan_and_sources(&source);
+    let old = source.worktree.with_file_name("clone-old");
+    fs::rename(&source.worktree, &old).unwrap();
+    fs::create_dir(&source.worktree).unwrap();
+    fs::rename(old.join(".git"), source.worktree.join(".git")).unwrap();
+    assert_eq!(
+        restage(&plan, &sources, Class::Worktree).map(|_| ()),
+        Err(CustodyWalkErrorV1::SourceDrift {
+            path: None,
+            detail: WalkDriftV1::RootIdentity,
+        })
+    );
+    // The git directory kept its identity, so its classes still restage to their receipts.
+    let expected = receipt(&plan, Class::RefsAndHead);
+    let (_, restaged) = restage(&plan, &sources, Class::RefsAndHead).expect("restage refs");
+    assert_eq!(restaged.summary().frame_sha256(), expected.frame_sha256);
+}
+
+/// Repair round 1: every successful class walk keeps its recipe and its receipt. A captured
+/// walk's is a plan receipt; a zero-entry walk's is an empty-walk baseline, never a receipt. An
+/// unchanged source replays each baseline exactly, and `HEAD` created after planning replays
+/// `refs_and_head` to another walk.
+#[test]
+fn restage_05_every_empty_walk_keeps_its_recipe_and_its_baseline() {
+    let classes = |receipts: &[CustodyClassReceiptV1]| -> Vec<CustodyCoverageClassV1> {
+        receipts.iter().map(|receipt| receipt.class).collect()
+    };
+    let replays_its_baseline = |plan: &CustodyCoveragePlanV1,
+                                sources: &CustodyCoverageSourcesV1| {
+        for baseline in plan.empty_walks() {
+            let class = baseline.class;
+            assert_eq!(row(plan, class), empty(class));
+            let (frame, replayed) = restage(plan, sources, class).expect("replay the walk");
+            assert_eq!(replayed.summary().entries(), 0, "{class:?}");
+            assert_eq!(
+                (
+                    frame.len() as u64,
+                    sha256(&frame),
+                    replayed.inventory_sha256()
+                ),
+                (
+                    baseline.frame_length,
+                    baseline.frame_sha256,
+                    baseline.inventory_digest
+                ),
+                "{class:?}"
+            );
+        }
+    };
+
+    // A clone: its walked classes are partly captured and partly empty, never both.
+    let source = readme_clone();
+    let (plan, sources) = plan_and_sources(&source);
+    let empty_walks = classes(plan.empty_walks());
+    assert_eq!(
+        empty_walks,
+        [Class::InProgressGitOperations, Class::BridgeEvidence]
+    );
+    let mut walked = classes(plan.receipts());
+    walked.extend(&empty_walks);
+    walked.sort();
+    let mut expected = GIT_DIR_CLASSES_V1.to_vec();
+    expected.push(Class::Worktree);
+    expected.sort();
+    assert_eq!(walked, expected);
+    replays_its_baseline(&plan, &sources);
+
+    // No receipts: every git-directory class is an empty walk, and a bare source walks no
+    // worktree.
+    let source = objects_only_source();
+    let (plan, sources) = plan_and_sources(&source);
+    assert!(plan.receipts().is_empty());
+    assert_eq!(classes(plan.empty_walks()), GIT_DIR_CLASSES_V1);
+    replays_its_baseline(&plan, &sources);
+    fs::write(source.git_at("HEAD"), b"ref: refs/heads/main\n").unwrap();
+    let baseline = plan.empty_walks()[0];
+    assert_eq!(baseline.class, Class::RefsAndHead);
+    let (_, replayed) = restage(&plan, &sources, Class::RefsAndHead).expect("replay refs");
+    assert_eq!(replayed.summary().entries(), 1);
+    assert_ne!(
+        (
+            replayed.summary().frame_sha256(),
+            replayed.inventory_sha256()
+        ),
+        (baseline.frame_sha256, baseline.inventory_digest)
+    );
+}
+
+/// Pins `chain`'s source as the exporter's plan-backed capability holds it.
+fn chain_sources(chain: &ChainV1) -> CustodyCoverageSourcesV1 {
+    CustodyCoverageSourcesV1::pin(
+        &chain.source.worktree,
+        &chain.source.git_dir,
+        &chain.source.objects(),
+    )
+    .unwrap()
+}
+
+/// §2's narrow source methods: the retained pins exactly, and the object-store route paths.
+#[test]
+fn sources_01_the_source_methods_cover_the_whole_protected_set() {
+    let chain = chain_fixture();
+    let sources = chain_sources(&chain);
+    let pins: Vec<*const PinnedDirectoryV1> = sources
+        .protected_pins()
+        .into_iter()
+        .map(std::ptr::from_ref)
+        .collect();
+    let retained: Vec<*const PinnedDirectoryV1> = sources
+        .protected()
+        .into_iter()
+        .map(std::ptr::from_ref)
+        .collect();
+    assert_eq!(
+        pins, retained,
+        "the retained pins themselves, not re-pinned"
+    );
+    assert_eq!(pins.len(), 4);
+    assert_eq!(sources.primary_store_path(), chain.source.objects());
+    assert_eq!(
+        sources.alternate_store_paths(),
+        vec![chain.alternate.as_path()]
+    );
+    assert!(sources.recheck().is_ok());
+}
+
+/// §2's recheck, one row per member. Each row replaces one pinned directory at its path, or
+/// rewrites a pinned store's alternates file, keeping every other member's identity, and the
+/// recheck must refuse it as identity drift. Every row is evaluated, and every failing row is
+/// reported.
+#[test]
+fn sources_02_the_recheck_refuses_a_change_to_any_member() {
+    type ChangeV1 = fn(&ChainV1);
+    let rows: [(&str, ChangeV1); 5] = [
+        ("the source repository", |chain| {
+            let worktree = &chain.source.worktree;
+            let old = worktree.with_file_name("repo-old");
+            fs::rename(worktree, &old).unwrap();
+            fs::create_dir(worktree).unwrap();
+            fs::rename(old.join(".git"), worktree.join(".git")).unwrap();
+        }),
+        ("the git directory", |chain| {
+            let git_dir = &chain.source.git_dir;
+            let old = git_dir.with_file_name(".git-old");
+            fs::rename(git_dir, &old).unwrap();
+            fs::create_dir(git_dir).unwrap();
+            fs::rename(old.join("objects"), git_dir.join("objects")).unwrap();
+        }),
+        ("the primary store", |chain| {
+            let objects = chain.source.objects();
+            fs::rename(&objects, objects.with_file_name("objects-old")).unwrap();
+            fs::create_dir_all(objects.join("info")).unwrap();
+            fs::write(
+                objects.join("info/alternates"),
+                format!("{}\n", chain.alternate.display()),
+            )
+            .unwrap();
+        }),
+        ("a pinned alternate store", |chain| {
+            fs::rename(
+                &chain.alternate,
+                chain.alternate.with_file_name("objects-old"),
+            )
+            .unwrap();
+            fs::create_dir(&chain.alternate).unwrap();
+        }),
+        ("the primary store's alternates file", |chain| {
+            let alternates = chain.source.git_at("objects/info/alternates");
+            let mut content = fs::read(&alternates).unwrap();
+            content.extend_from_slice(b"# rewritten\n");
+            fs::write(&alternates, content).unwrap();
+        }),
+    ];
+    let mut failures = Vec::new();
+    for (label, change) in rows {
+        let chain = chain_fixture();
+        let sources = chain_sources(&chain);
+        change(&chain);
+        let outcome = sources.recheck();
+        if !matches!(outcome, Err(CustodyExportErrorV1::IdentityDrift(_))) {
+            failures.push(format!("{label}: {outcome:?}"));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "the recheck missed a changed member:\n{}",
+        failures.join("\n")
+    );
+}

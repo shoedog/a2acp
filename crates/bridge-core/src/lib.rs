@@ -27,6 +27,11 @@ mod custody_git_tests;
 // 2B2b2a's descriptor-relative walker is production-unwired until 2B2b2b's class producers.
 pub mod custody_inventory;
 pub mod custody_inventory_collector;
+// 2B2b2b2's mount-point census is production-unwired until the wiring slice mints a plan-backed
+// capability.
+#[cfg(unix)]
+#[allow(dead_code)]
+mod custody_mounts;
 pub mod custody_seal;
 #[cfg(unix)]
 #[allow(dead_code)]

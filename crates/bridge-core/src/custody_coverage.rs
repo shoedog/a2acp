@@ -25,6 +25,12 @@
 //! **Failure semantics (§4.5).** A [`CustodyCoverageErrorV1`] means no plan is trustworthy.
 //! Everything class-local, such as an unreadable entry, a probe failure, or a walker refusal,
 //! becomes an `unresolved` row instead.
+//!
+//! **Restaging (slice 2B2b2b2 §2).** Every successful class walk keeps the private walk recipe it
+//! was walked with, and [`restage_class_v1`] re-runs exactly that recipe for the exporter, so the
+//! planner stays the only owner of selection logic. A captured walk's receipt is a plan receipt.
+//! A zero-entry walk's is a private empty-walk baseline (repair round 1), which the exporter
+//! replays before sealing, so a class that gained its first entry since planning is drift.
 
 use crate::custody_export::{
     pin_alternate_chain, preflight_scratch_root, protected_directories, remeasure_git_directory_in,
@@ -44,7 +50,8 @@ use crate::custody_seal::{
     CustodyGitObjectFormatV1, CustodyOriginalObjectV1,
 };
 use crate::custody_walk::{
-    walk_tree_v1, CustodyWalkErrorV1, WalkDecisionV1, WalkParkV1, WalkReceiptV1, WalkSelectionV1,
+    walk_tree_v1, CustodyWalkErrorV1, WalkDecisionV1, WalkDriftV1, WalkParkV1, WalkReceiptV1,
+    WalkSelectionV1,
 };
 use crate::execution_policy::Sha256HexV1;
 use crate::fs_custody::{
@@ -58,6 +65,7 @@ use std::fs::File;
 use std::io::{self, Read, Write};
 use std::os::unix::ffi::OsStrExt as _;
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 const LABEL: &str = "custody coverage plan";
@@ -227,6 +235,39 @@ impl CustodyCoverageSourcesV1 {
             &self.alternate_stores,
         )
     }
+
+    /// The retained pins of the whole protected set, exactly as [`Self::protected`] returns them
+    /// (2B2b2b2 §2). The exporter's overlap preflight and mount census consume the pins
+    /// themselves, so a scratch root that is an identity alias of one is still refused.
+    pub(crate) fn protected_pins(&self) -> Vec<&PinnedDirectoryV1> {
+        self.protected()
+    }
+
+    /// 2B2's `capability.recheck()` over the whole protected set (2B2b2b2 §2): the repository and
+    /// git-directory identities, and every pinned store's identity and alternates digest.
+    pub(crate) fn recheck(&self) -> Result<(), CustodyExportErrorV1> {
+        pinned_root_unchanged(&self.source_repository)
+            .map_err(CustodyExportErrorV1::IdentityDrift)?;
+        pinned_root_unchanged(&self.source_git_dir).map_err(CustodyExportErrorV1::IdentityDrift)?;
+        self.primary_store.recheck()?;
+        for store in &self.alternate_stores {
+            store.recheck()?;
+        }
+        Ok(())
+    }
+
+    /// The primary object store's pinned path, for the exporter's object-store route.
+    pub(crate) fn primary_store_path(&self) -> &Path {
+        self.primary_store.path()
+    }
+
+    /// Every pinned alternate store's path, in chain order, for the exporter's object-store route.
+    pub(crate) fn alternate_store_paths(&self) -> Vec<&Path> {
+        self.alternate_stores
+            .iter()
+            .map(PinnedObjectStoreV1::path)
+            .collect()
+    }
 }
 
 /// One planning request (§4.1).
@@ -272,18 +313,84 @@ pub(crate) enum CustodyGitlinkEvidenceV1 {
     Unresolved,
 }
 
+/// Which pinned root a class walk starts from (2B2b2b2 §2).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CustodyRootDomainV1 {
+    RepositoryRoot,
+    GitDirectoryRoot,
+}
+
+/// The exact selection a class walk used, with the parameters the planner fixed for it.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum CustodyRecipeSelectionV1 {
+    /// A git-directory class walk, for its one class.
+    GitDirectory(GitDirClassSelectionV1),
+    /// The worktree walk: the pinned git directory's identity and `cargo_target_excluded`.
+    Worktree(WorktreeSelectionV1),
+}
+
+impl CustodyRecipeSelectionV1 {
+    fn selection(&self) -> &dyn WalkSelectionV1 {
+        match self {
+            Self::GitDirectory(selection) => selection,
+            Self::Worktree(selection) => selection,
+        }
+    }
+}
+
+/// One class walk's private walk recipe (2B2b2b2 §2): the root domain, the exact selection the
+/// planner walked with, the frame header, the frame budget, and the entry budget. The planner
+/// walks every class through its recipe, and [`restage_class_v1`] re-runs the same recipe.
+#[derive(Clone, Debug)]
+pub(crate) struct CustodyWalkRecipeV1 {
+    domain: CustodyRootDomainV1,
+    selection: CustodyRecipeSelectionV1,
+    header: CustodyFrameHeaderV1,
+    frame_budget: CustodyFrameBudgetV1,
+    entry_budget: u64,
+}
+
+impl CustodyWalkRecipeV1 {
+    /// Walks `root`, a fresh pin of this recipe's root domain, into `sink`.
+    fn walk<W: Write>(
+        &self,
+        root: &FreshPinV1,
+        sink: W,
+    ) -> Result<WalkReceiptV1, CustodyWalkErrorV1> {
+        let encoder = CustodyFrameEncoderV1::new(sink, &self.header, self.frame_budget)?;
+        walk_one(
+            WalkKindV1::Class(self.header.class()),
+            root,
+            self.selection.selection(),
+            self.entry_budget,
+            encoder,
+        )
+    }
+}
+
 /// The coverage plan (§4.1).
 #[derive(Debug)]
 pub(crate) struct CustodyCoveragePlanV1 {
+    generation_id: String,
     coverage: Vec<CustodyCoverageEntryV1>,
     exclusions: Vec<CustodyExclusionV1>,
     dependencies: Vec<CustodyDependencyV1>,
     receipts: Vec<CustodyClassReceiptV1>,
+    /// One baseline per zero-entry class walk, in class order. It is never a plan receipt.
+    empty_walks: Vec<CustodyClassReceiptV1>,
+    /// Exactly one recipe per receipt and per empty walk, keyed by its class.
+    recipes: BTreeMap<CustodyCoverageClassV1, CustodyWalkRecipeV1>,
     gitlinks: CustodyGitlinkEvidenceV1,
     scratch_bytes_used: u64,
 }
 
 impl CustodyCoveragePlanV1 {
+    /// The generation the plan was made for, from its request (2B2b2b2 §2). Binding compares it
+    /// before any receipt, so a plan with no receipts still binds its generation.
+    pub(crate) fn generation_id(&self) -> &str {
+        &self.generation_id
+    }
+
     /// Canonical rows, one per class, in class order.
     pub(crate) fn coverage(&self) -> &[CustodyCoverageEntryV1] {
         &self.coverage
@@ -303,6 +410,13 @@ impl CustodyCoveragePlanV1 {
         &self.receipts
     }
 
+    /// One baseline per walked class planned `empty`, in class order: the zero-entry walk's
+    /// receipt (repair round 1). It is never a manifest receipt or payload; the exporter replays
+    /// it before sealing.
+    pub(crate) fn empty_walks(&self) -> &[CustodyClassReceiptV1] {
+        &self.empty_walks
+    }
+
     pub(crate) fn gitlinks(&self) -> CustodyGitlinkEvidenceV1 {
         self.gitlinks
     }
@@ -310,6 +424,27 @@ impl CustodyCoveragePlanV1 {
     /// The planning-scratch ledger's final charge.
     pub(crate) fn scratch_bytes_used(&self) -> u64 {
         self.scratch_bytes_used
+    }
+}
+
+/// Test seams for the exporter's binding controls (2B2b2b2 §6.1) and the recipe control (§6.5).
+/// A planned plan is always self-consistent, so a plan that disagrees with itself or with its
+/// manifest in these ways is only reachable through them.
+#[cfg(test)]
+impl CustodyCoveragePlanV1 {
+    pub(crate) fn receipts_mut_for_test(&mut self) -> &mut Vec<CustodyClassReceiptV1> {
+        &mut self.receipts
+    }
+
+    pub(crate) fn exclusions_mut_for_test(&mut self) -> &mut Vec<CustodyExclusionV1> {
+        &mut self.exclusions
+    }
+
+    pub(crate) fn recipe_mut_for_test(
+        &mut self,
+        class: CustodyCoverageClassV1,
+    ) -> Option<&mut CustodyWalkRecipeV1> {
+        self.recipes.get_mut(&class)
     }
 }
 
@@ -980,7 +1115,7 @@ struct PlannerV1<'r> {
     scratch: PinnedDirectoryV1,
     ledger: RefCell<ScratchLedgerV1>,
     reasons: BTreeMap<CustodyCoverageClassV1, BTreeSet<CustodyReasonCodeV1>>,
-    walked: BTreeMap<CustodyCoverageClassV1, WalkReceiptV1>,
+    walked: BTreeMap<CustodyCoverageClassV1, (WalkReceiptV1, CustodyWalkRecipeV1)>,
     next_serial: u64,
 }
 
@@ -1450,11 +1585,17 @@ impl PlannerV1<'_> {
     fn walk_git_dir_classes(&mut self, census: &GitDirCensusV1) -> PlanResult<()> {
         for class in GIT_DIR_CLASSES_V1 {
             let root = self.fresh_pin(&self.request.sources.source_git_dir)?;
-            let selection = GitDirClassSelectionV1 { class };
-            match self.class_walk(class, &root, &selection) {
-                Ok(receipt) => {
+            let selection =
+                CustodyRecipeSelectionV1::GitDirectory(GitDirClassSelectionV1 { class });
+            match self.class_walk(
+                class,
+                CustodyRootDomainV1::GitDirectoryRoot,
+                &root,
+                selection,
+            ) {
+                Ok((receipt, recipe)) => {
                     require_class_skips(class, census.owned_by_others(class), &receipt)?;
-                    self.walked.insert(class, receipt);
+                    self.walked.insert(class, (receipt, recipe));
                 }
                 Err(error) => self.mark(class, walk_refusal_reason(&error)),
             }
@@ -1465,16 +1606,16 @@ impl PlannerV1<'_> {
     fn walk_worktree(&mut self, worktree: &WorktreePlanV1) -> PlanResult<()> {
         let class = CustodyCoverageClassV1::Worktree;
         let root = self.fresh_pin(&self.request.sources.source_repository)?;
-        let selection = WorktreeSelectionV1 {
+        let selection = CustodyRecipeSelectionV1::Worktree(WorktreeSelectionV1 {
             git_dir: worktree.git_dir,
             cargo_target_excluded: worktree.cargo_target_excluded,
-        };
-        match self.class_walk(class, &root, &selection) {
-            Ok(receipt) => {
+        });
+        match self.class_walk(class, CustodyRootDomainV1::RepositoryRoot, &root, selection) {
+            Ok((receipt, recipe)) => {
                 // No other class owns a worktree entry; only the excluded `target` is skipped.
                 let expected = u64::from(worktree.cargo_target_excluded);
                 require_class_skips(class, expected, &receipt)?;
-                self.walked.insert(class, receipt);
+                self.walked.insert(class, (receipt, recipe));
             }
             Err(error) => {
                 if let CustodyWalkErrorV1::Park(park) = &error {
@@ -1488,22 +1629,24 @@ impl PlannerV1<'_> {
         Ok(())
     }
 
-    /// A class walk into a counting, hashing encoder over a sink that stores nothing.
+    /// A class walk into a counting, hashing encoder over a sink that stores nothing. The walk
+    /// runs through the recipe it returns, which is the one a receipt keeps.
     fn class_walk(
         &self,
         class: CustodyCoverageClassV1,
+        domain: CustodyRootDomainV1,
         root: &FreshPinV1,
-        selection: &dyn WalkSelectionV1,
-    ) -> Result<WalkReceiptV1, CustodyWalkErrorV1> {
-        let header = CustodyFrameHeaderV1::new(class, &self.request.generation_id)?;
-        let encoder = CustodyFrameEncoderV1::new(io::sink(), &header, self.request.frame_budget)?;
-        walk_one(
-            WalkKindV1::Class(class),
-            root,
+        selection: CustodyRecipeSelectionV1,
+    ) -> Result<(WalkReceiptV1, CustodyWalkRecipeV1), CustodyWalkErrorV1> {
+        let recipe = CustodyWalkRecipeV1 {
+            domain,
             selection,
-            self.request.entry_budget,
-            encoder,
-        )
+            header: CustodyFrameHeaderV1::new(class, &self.request.generation_id)?,
+            frame_budget: self.request.frame_budget,
+            entry_budget: self.request.entry_budget,
+        };
+        let receipt = recipe.walk(root, io::sink())?;
+        Ok((receipt, recipe))
     }
 
     /// Each dependency file must still have the stat it was hashed under after the worktree walk
@@ -1659,6 +1802,8 @@ impl PlannerV1<'_> {
             && worktree.is_some_and(|worktree| worktree.cargo_target_excluded);
         let mut coverage = Vec::with_capacity(CustodyCoverageClassV1::ALL.len());
         let mut receipts = Vec::new();
+        let mut empty_walks = Vec::new();
+        let mut recipes = BTreeMap::new();
         for class in CustodyCoverageClassV1::ALL {
             let row = if let Some(reasons) = self.reasons.get(&class) {
                 CustodyCoverageEntryV1::new(
@@ -1681,18 +1826,24 @@ impl PlannerV1<'_> {
                     CustodyStateClassV1::Captured
                 };
                 CustodyCoverageEntryV1::new(class, state, Vec::new(), None)
-            } else if let Some(receipt) = self
-                .walked
-                .get(&class)
-                .filter(|receipt| receipt.summary().entries() != 0)
-            {
-                receipts.push(CustodyClassReceiptV1 {
+            } else if let Some((receipt, recipe)) = self.walked.get(&class) {
+                // Every successful walk keeps its recipe and its receipt: a captured one as a plan
+                // receipt, and a zero-entry one as the baseline the exporter replays.
+                let walked = CustodyClassReceiptV1 {
                     class,
                     frame_length: receipt.summary().frame_bytes(),
                     frame_sha256: receipt.summary().frame_sha256(),
                     inventory_digest: receipt.inventory_sha256(),
-                });
-                CustodyCoverageEntryV1::new(class, CustodyStateClassV1::Captured, Vec::new(), None)
+                };
+                recipes.insert(class, recipe.clone());
+                let state = if receipt.summary().entries() == 0 {
+                    empty_walks.push(walked);
+                    CustodyStateClassV1::Empty
+                } else {
+                    receipts.push(walked);
+                    CustodyStateClassV1::Captured
+                };
+                CustodyCoverageEntryV1::new(class, state, Vec::new(), None)
             } else {
                 CustodyCoverageEntryV1::new(class, CustodyStateClassV1::Empty, Vec::new(), None)
             };
@@ -1704,14 +1855,72 @@ impl PlannerV1<'_> {
             _ => (Vec::new(), Vec::new()),
         };
         CustodyCoveragePlanV1 {
+            generation_id: self.request.generation_id.clone(),
             coverage,
             exclusions,
             dependencies,
             receipts,
+            empty_walks,
+            recipes,
             gitlinks,
             scratch_bytes_used: self.ledger.borrow().used(),
         }
     }
+}
+
+/// Restage pins are numbered apart from every plan's walk pins, for the seam's walk record.
+static NEXT_RESTAGE_SERIAL: AtomicU64 = AtomicU64::new(1 << 63);
+
+/// Re-runs exactly the walk `plan` recorded for `class` into `sink`, from a fresh pin of the
+/// recipe's root (2B2b2b2 §2). The recipe is the planner's own: the root domain, the selection
+/// with its parameters, the frame header, and both budgets. Nothing here builds a selection, so
+/// the exporter never reconstructs one; it compares the returned receipt with the plan's.
+///
+/// Each call opens its own pin and releases it before returning, so sequential calls never share
+/// a pin (the 2B2b2a contract). A root that no longer resolves to its retained pin is drift.
+pub(crate) fn restage_class_v1(
+    plan: &CustodyCoveragePlanV1,
+    sources: &CustodyCoverageSourcesV1,
+    class: CustodyCoverageClassV1,
+    sink: &mut dyn Write,
+) -> Result<WalkReceiptV1, CustodyWalkErrorV1> {
+    // Only a walked class, captured or empty, has a recipe.
+    let recipe = plan
+        .recipes
+        .get(&class)
+        .ok_or(CustodyWalkErrorV1::Io(io::ErrorKind::NotFound))?;
+    let retained = match recipe.domain {
+        CustodyRootDomainV1::RepositoryRoot => &sources.source_repository,
+        CustodyRootDomainV1::GitDirectoryRoot => &sources.source_git_dir,
+    };
+    let root = restage_pin(retained)?;
+    recipe.walk(&root, sink)
+}
+
+/// Opens `retained`'s directory afresh for one restage and proves it is the pinned directory, as
+/// the planner's own fresh pins do.
+fn restage_pin(retained: &PinnedDirectoryV1) -> Result<FreshPinV1, CustodyWalkErrorV1> {
+    let drift = CustodyWalkErrorV1::SourceDrift {
+        path: None,
+        detail: WalkDriftV1::RootIdentity,
+    };
+    let pin = match PinnedDirectoryV1::open(retained.canonical_path(), LABEL) {
+        Ok(pin) => pin,
+        Err(error) => {
+            return Err(match (pinned_root_unchanged(retained), error) {
+                (Err(_), _) => drift,
+                (Ok(()), FsCustodyError::Io(_, error)) => CustodyWalkErrorV1::Io(error.kind()),
+                (Ok(()), _) => CustodyWalkErrorV1::Io(io::ErrorKind::Other),
+            })
+        }
+    };
+    if !pin.identity().matches(retained.identity()) {
+        return Err(drift);
+    }
+    Ok(FreshPinV1 {
+        pin,
+        serial: NEXT_RESTAGE_SERIAL.fetch_add(1, Ordering::Relaxed),
+    })
 }
 
 /// §4.3's class-skip equation for one capture walk.
