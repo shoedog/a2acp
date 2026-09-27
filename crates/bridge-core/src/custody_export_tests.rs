@@ -12,13 +12,31 @@
 //! success.
 
 use super::*;
+use crate::custody_capsule::CustodyCapsuleIndexV1;
+use crate::custody_coverage::seam::{self as plan_seam, PlanSeamsV1, WalkEventV1};
+use crate::custody_coverage::{
+    plan_coverage_v1, CustodyCoverageRequestV1, CustodyPlanningBudgetV1,
+    ExternalEvidenceUnresolvedV1, GitDirClassSelectionV1, NoExternalEvidenceRecordedV1, WalkKindV1,
+    WorktreeSelectionV1,
+};
+use crate::custody_frame::{
+    CustodyFrameBudgetV1, CustodyFrameDecoderV1, CustodyFrameEncoderV1, CustodyFrameEntryV1,
+    CustodyFrameHeaderV1,
+};
 use crate::custody_git::{ExpectedGitDigestV1, GitGuardBypassV1};
 use crate::custody_inventory::CustodyStateClassV1;
-use crate::custody_seal::{CustodyCoverageEntryV1, CustodyOriginalObjectV1};
+use crate::custody_mounts::seam as mount_seam;
+use crate::custody_seal::{
+    CustodyCoverageEntryV1, CustodyDependencyV1, CustodyExclusionV1, CustodyOriginalObjectV1,
+    CustodySealabilityV1,
+};
+use crate::custody_walk::{walk_tree_v1, WalkSelectionV1};
 use crate::fs_custody::PublicationRenameFaultV1;
 use std::cell::Cell;
+use std::os::unix::ffi::OsStrExt as _;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
+use std::rc::Rc;
 use std::time::Duration;
 
 // ---------------------------------------------------------------------------------------------
@@ -3333,5 +3351,1519 @@ fn control_11_verify_pack_output_admits_its_exact_bound_and_refuses_one_byte_mor
         failures.is_empty(),
         "the verify-pack output bound is not exactly {bound} bytes:\n{}",
         failures.join("\n")
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// 2B2b2b2: plan-backed capabilities. `planned_binding_*` are §6.1, `planned_census_*` §6.2,
+// `planned_stage_*` and `planned_retention_*` §6.3, and `planned_e2e_*` §6.4. Every source is a
+// real clone, planned by 2B2b2b1 with the lane Git and exported through the capability minted
+// from that plan.
+// ---------------------------------------------------------------------------------------------
+
+/// Bytes only `target/` holds, so a payload that carried any of them is visible.
+const TARGET_MARKER_V1: &[u8] = b"cargo build output that no coverage payload may carry";
+/// The walk budgets the plan-backed fixtures plan with.
+const PLAN_ENTRY_BUDGET_V1: u64 = 10_000;
+
+fn plan_frame_budget() -> CustodyFrameBudgetV1 {
+    CustodyFrameBudgetV1::new(1 << 20, 1 << 30).expect("the fixture frame budget")
+}
+
+/// A Git command in `directory`, isolated from the host's configuration, for the plan-backed
+/// fixtures' worktree operations (clone, commit, stash, merge), which `fixture_git`'s `GIT_DIR`
+/// form does not drive.
+fn worktree_git_output(directory: &Path, args: &[&str]) -> std::process::Output {
+    Command::new(lane_git_path())
+        .current_dir(directory)
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("HOME", directory)
+        .env("LC_ALL", "C")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .args([
+            "-c",
+            "user.name=custody",
+            "-c",
+            "user.email=custody@example.invalid",
+            "-c",
+            "init.defaultBranch=main",
+            "-c",
+            "commit.gpgsign=false",
+        ])
+        .args(args)
+        .output()
+        .expect("the fixture Git child runs")
+}
+
+fn worktree_git(directory: &Path, args: &[&str]) {
+    let output = worktree_git_output(directory, args);
+    assert!(
+        output.status.success(),
+        "fixture git {args:?} failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// A real source, planned by 2B2b2b1, with an owner-private export scratch beside it.
+struct PlanFixtureV1 {
+    _temp: tempfile::TempDir,
+    area: PathBuf,
+    /// The repository root: the worktree, or a bare source's git directory.
+    worktree: PathBuf,
+    git_dir: PathBuf,
+    scratch: PathBuf,
+    budgets: CustodyExportBudgetsV1,
+    git_route: GitRouteRequestV1,
+}
+
+impl PlanFixtureV1 {
+    /// `build` makes the source beneath the canonical area and returns `(worktree, git_dir)`.
+    fn with(build: impl FnOnce(&Path) -> (PathBuf, PathBuf)) -> Self {
+        let temp = tempfile::TempDir::new().expect("a fixture temp root");
+        let area = temp
+            .path()
+            .canonicalize()
+            .expect("a canonical fixture root");
+        let (worktree, git_dir) = build(&area);
+        let scratch = area.join("scratch");
+        std::fs::create_dir(&scratch).expect("the export scratch root");
+        set_owner_private(&scratch);
+        Self {
+            _temp: temp,
+            area,
+            worktree,
+            git_dir,
+            scratch,
+            budgets: CustodyExportBudgetsV1::v1_ceilings(),
+            git_route: lane_git_route(),
+        }
+    }
+
+    /// A clone of a one-commit repository: a `README`, refs, reflogs, a config, and an index.
+    fn readme_clone() -> Self {
+        Self::with(readme_clone_in)
+    }
+
+    /// [`Self::readme_clone`] under the `cargo-target-v1` precondition, with a populated root
+    /// `target/`.
+    fn cargo_clone() -> Self {
+        let fixture = Self::readme_clone();
+        fixture.write_cargo();
+        fixture
+    }
+
+    /// §6.4's rich non-bare clone: a dirty worktree, untracked and ignored files, a stash,
+    /// reflogs, an in-progress merge with rerere, a hook, bridge evidence, and a Cargo `target/`.
+    fn rich_clone() -> Self {
+        let fixture = Self::with(|area| {
+            let origin = area.join("origin");
+            std::fs::create_dir(&origin).expect("the origin worktree");
+            let write = |name: &str, content: &[u8]| {
+                std::fs::write(origin.join(name), content).expect("an origin file");
+            };
+            worktree_git(&origin, &["init", "-q"]);
+            write("README", b"coverage fixture\n");
+            worktree_git(&origin, &["add", "README"]);
+            worktree_git(&origin, &["commit", "-q", "-m", "init"]);
+            write("f", b"a\nb\nc\n");
+            worktree_git(&origin, &["add", "f"]);
+            worktree_git(&origin, &["commit", "-q", "-m", "f"]);
+            worktree_git(&origin, &["checkout", "-q", "-b", "side"]);
+            write("f", b"a\nSIDE\nc\n");
+            worktree_git(&origin, &["commit", "-q", "-am", "side"]);
+            worktree_git(&origin, &["checkout", "-q", "main"]);
+            write("f", b"a\nMAIN\nc\n");
+            worktree_git(&origin, &["commit", "-q", "-am", "main"]);
+            worktree_git(area, &["clone", "-q", "origin", "clone"]);
+            (area.join("clone"), area.join("clone/.git"))
+        });
+        let git = |args: &[&str]| worktree_git(&fixture.worktree, args);
+        git(&["config", "rerere.enabled", "true"]);
+        // A stash, then a local branch for the merge.
+        fixture.write("README", b"coverage fixture\nstashed\n");
+        git(&["stash", "-q"]);
+        git(&["branch", "-q", "side", "origin/side"]);
+        // Untracked and ignored files, and a worktree file named `HEAD`.
+        fixture.write("untracked.txt", b"untracked\n");
+        fixture.write(".gitignore", b"*.log\n");
+        fixture.write("build.log", b"ignored\n");
+        fixture.write("HEAD", b"a worktree file named HEAD\n");
+        // An in-progress merge with rerere, then a dirty worktree.
+        let _ = worktree_git_output(&fixture.worktree, &["merge", "side"]);
+        assert!(fixture.git_dir.join("MERGE_RR").is_file());
+        assert!(fixture.git_dir.join("rr-cache").is_dir());
+        fixture.write("README", b"coverage fixture\ndirty\n");
+        // A hook and bridge evidence.
+        let hook = fixture.git_dir.join("hooks/pre-commit");
+        std::fs::create_dir_all(hook.parent().expect("hooks/")).expect("hooks/");
+        std::fs::write(&hook, b"#!/bin/sh\nexit 0\n").expect("the hook");
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755))
+                .expect("the hook is executable");
+        }
+        std::fs::create_dir_all(fixture.git_dir.join("a2a-bridge")).expect("a2a-bridge/");
+        std::fs::write(fixture.git_dir.join("a2a-bridge/evidence.json"), b"{}\n")
+            .expect("bridge evidence");
+        std::fs::write(fixture.git_dir.join("A2A_TASK.md"), b"# task\n").expect("a task file");
+        fixture.write_cargo();
+        fixture
+    }
+
+    /// A bare source whose git directory holds only an empty `objects/`: every walked class is
+    /// `empty`, so its plan has no receipts.
+    fn empty_source() -> Self {
+        Self::with(|area| {
+            let git_dir = area.join("empty.git");
+            std::fs::create_dir_all(git_dir.join("objects")).expect("the empty store");
+            (git_dir.clone(), git_dir)
+        })
+    }
+
+    fn write(&self, relative: &str, content: &[u8]) {
+        let path = self.worktree.join(relative);
+        std::fs::create_dir_all(path.parent().expect("a worktree parent"))
+            .expect("a worktree directory");
+        std::fs::write(path, content).expect("a worktree file");
+    }
+
+    fn write_cargo(&self) {
+        self.write("Cargo.toml", b"[package]\nname = \"fixture\"\n");
+        self.write("Cargo.lock", b"version = 4\n");
+        self.write("target/debug/build.bin", TARGET_MARKER_V1);
+    }
+
+    fn objects(&self) -> PathBuf {
+        self.git_dir.join("objects")
+    }
+
+    fn work(&self) -> PathBuf {
+        self.scratch.join(WORK_DIR_NAME)
+    }
+
+    fn capsule(&self) -> PathBuf {
+        self.scratch.join(CAPSULE_DIR_NAME)
+    }
+
+    /// Every object the source's store holds, as the manifest's object inventory.
+    fn inventory(&self) -> Vec<CustodyOriginalObjectV1> {
+        fixture_git_ok(
+            &self.git_dir,
+            &[
+                "cat-file",
+                "--batch-all-objects",
+                "--batch-check=%(objectname) %(objecttype)",
+            ],
+            None,
+        )
+        .lines()
+        .map(|line| {
+            let (object_id, kind) = line.split_once(' ').expect("an `id type` row");
+            let kind = match kind {
+                "commit" => CustodyGitObjectKindV1::Commit,
+                "tree" => CustodyGitObjectKindV1::Tree,
+                "blob" => CustodyGitObjectKindV1::Blob,
+                "tag" => CustodyGitObjectKindV1::Tag,
+                other => panic!("an unexpected object type {other}"),
+            };
+            CustodyOriginalObjectV1::new(CustodyGitObjectFormatV1::Sha1, object_id, kind)
+                .expect("a listed object id")
+        })
+        .collect()
+    }
+
+    /// Plans the source for `generation`, with `inventory` as the object inventory, into a fresh
+    /// planning scratch beside it, and keeps the pinned sources for the capability.
+    fn plan_with(
+        &self,
+        generation: &str,
+        inventory: &[CustodyOriginalObjectV1],
+        adjust: impl FnOnce(&mut CustodyCoverageRequestV1),
+    ) -> (CustodyCoveragePlanV1, CustodyCoverageSourcesV1) {
+        let planning = tempfile::TempDir::new_in(&self.area).expect("a planning scratch");
+        set_owner_private(planning.path());
+        let mut request = CustodyCoverageRequestV1 {
+            sources: CustodyCoverageSourcesV1::pin(&self.worktree, &self.git_dir, &self.objects())
+                .expect("pin the source"),
+            generation_id: generation.to_owned(),
+            frame_budget: plan_frame_budget(),
+            entry_budget: PLAN_ENTRY_BUDGET_V1,
+            planning_budget: CustodyPlanningBudgetV1 {
+                max_scratch_bytes: 64 * 1024 * 1024,
+            },
+            scratch_root: planning.path().to_path_buf(),
+            external_evidence: NoExternalEvidenceRecordedV1::declare().into(),
+            object_format: CustodyGitObjectFormatV1::Sha1,
+            object_inventory: inventory.to_vec(),
+            git_route: self.git_route.clone(),
+            deadline: Instant::now() + Duration::from_secs(120),
+        };
+        adjust(&mut request);
+        let plan = plan_coverage_v1(&request).expect("plan the source");
+        (plan, request.sources)
+    }
+
+    fn plan(
+        &self,
+        generation: &str,
+        inventory: &[CustodyOriginalObjectV1],
+    ) -> (CustodyCoveragePlanV1, CustodyCoverageSourcesV1) {
+        self.plan_with(generation, inventory, |_| {})
+    }
+
+    /// The ordinary path: every object planned for [`GENERATION_V1`], the manifest built from
+    /// the plan's three collections, and the capability minted from both.
+    fn planned(
+        &self,
+    ) -> (
+        CustodyManifestV1,
+        CustodyCaptureCapabilityV1,
+        Vec<CustodyClassReceiptV1>,
+    ) {
+        let inventory = self.inventory();
+        let (plan, sources) = self.plan(GENERATION_V1, &inventory);
+        let manifest = manifest_from_plan(&plan, GENERATION_V1, inventory);
+        let receipts = plan.receipts().to_vec();
+        let capability = planned_capability(&manifest, plan, sources);
+        (manifest, capability, receipts)
+    }
+
+    fn export(
+        &self,
+        manifest: &CustodyManifestV1,
+        capability: CustodyCaptureCapabilityV1,
+    ) -> Result<CustodyExportOutcomeV1, CustodyExportErrorV1> {
+        self.export_to(&self.scratch, self.budgets, manifest, capability)
+    }
+
+    fn export_to(
+        &self,
+        scratch: &Path,
+        budgets: CustodyExportBudgetsV1,
+        manifest: &CustodyManifestV1,
+        capability: CustodyCaptureCapabilityV1,
+    ) -> Result<CustodyExportOutcomeV1, CustodyExportErrorV1> {
+        reset_export_counters_for_test();
+        export_capsule_v1(CustodyExportRequestV1 {
+            manifest,
+            envelope_format: &envelope_format(),
+            recipients: &recipients(),
+            budgets,
+            sealer: &FixtureSealerV1::honest(),
+            capability,
+            git_route: self.git_route.clone(),
+            scratch_root: scratch,
+            deadline: Instant::now() + Duration::from_secs(120),
+        })
+    }
+
+    fn scratch_entries(&self) -> Vec<String> {
+        snapshot_entries(&self.scratch).into_keys().collect()
+    }
+
+    fn seal_present(&self) -> bool {
+        std::fs::symlink_metadata(self.capsule().join(SEAL_NAME)).is_ok()
+    }
+}
+
+/// [`PlanFixtureV1::readme_clone`]'s source, built in `base`: `(worktree, git_dir)`.
+fn readme_clone_in(base: &Path) -> (PathBuf, PathBuf) {
+    let origin = base.join("origin");
+    std::fs::create_dir(&origin).expect("the origin worktree");
+    worktree_git(&origin, &["init", "-q"]);
+    std::fs::write(origin.join("README"), b"plan-backed export fixture\n")
+        .expect("the origin README");
+    worktree_git(&origin, &["add", "README"]);
+    worktree_git(&origin, &["commit", "-q", "-m", "init"]);
+    worktree_git(base, &["clone", "-q", "origin", "clone"]);
+    (base.join("clone"), base.join("clone/.git"))
+}
+
+/// The manifest §6.4 builds from a plan: its coverage rows, exclusions, and dependencies.
+fn manifest_from_plan(
+    plan: &CustodyCoveragePlanV1,
+    generation: &str,
+    objects: Vec<CustodyOriginalObjectV1>,
+) -> CustodyManifestV1 {
+    manifest_with_rows(plan, generation, objects, plan.coverage().to_vec())
+}
+
+fn manifest_with_rows(
+    plan: &CustodyCoveragePlanV1,
+    generation: &str,
+    objects: Vec<CustodyOriginalObjectV1>,
+    coverage: Vec<CustodyCoverageEntryV1>,
+) -> CustodyManifestV1 {
+    let [unit, run, materialization, _] = IDENTITY_V1;
+    CustodyManifestV1::new(
+        unit,
+        run,
+        materialization,
+        generation,
+        coverage,
+        vec![],
+        objects,
+        plan.dependencies().to_vec(),
+        plan.exclusions().to_vec(),
+    )
+    .expect("a manifest from the plan's collections is valid")
+}
+
+/// `rows` with `class` set to `state`.
+fn with_state(
+    rows: &[CustodyCoverageEntryV1],
+    class: CustodyCoverageClassV1,
+    state: CustodyStateClassV1,
+) -> Vec<CustodyCoverageEntryV1> {
+    rows.iter()
+        .map(|row| {
+            if row.class() == class {
+                CustodyCoverageEntryV1::new(class, state, vec![], None).expect("a valid row")
+            } else {
+                row.clone()
+            }
+        })
+        .collect()
+}
+
+fn planned_capability(
+    manifest: &CustodyManifestV1,
+    plan: CustodyCoveragePlanV1,
+    sources: CustodyCoverageSourcesV1,
+) -> CustodyCaptureCapabilityV1 {
+    CustodyCaptureCapabilityV1::from_fixture_quiescence_with_plan(
+        CustodyQuiescenceDecisionV1::CoherentSnapshot,
+        manifest,
+        sources,
+        plan,
+    )
+}
+
+fn path_bytes(path: &Path) -> Vec<u8> {
+    path.as_os_str().as_bytes().to_vec()
+}
+
+fn receipt_of(
+    receipts: &[CustodyClassReceiptV1],
+    class: CustodyCoverageClassV1,
+) -> CustodyClassReceiptV1 {
+    *receipts
+        .iter()
+        .find(|receipt| receipt.class == class)
+        .expect("a captured class has a receipt")
+}
+
+/// §6.1: the export refuses `CapabilityBinding(detail)`, and the scratch root gained no entry.
+fn assert_binding_refused(
+    fixture: &PlanFixtureV1,
+    manifest: &CustodyManifestV1,
+    capability: CustodyCaptureCapabilityV1,
+    detail: &str,
+) {
+    let result = fixture.export(manifest, capability);
+    assert!(
+        matches!(&result, Err(CustodyExportErrorV1::CapabilityBinding(observed)) if *observed == detail),
+        "expected CapabilityBinding({detail:?}), observed {}",
+        describe_run(&result)
+    );
+    assert_eq!(
+        fixture.scratch_entries(),
+        Vec::<String>::new(),
+        "a binding refusal created a scratch entry"
+    );
+}
+
+#[test]
+fn planned_binding_01_a_plan_with_an_unresolved_row_refuses() {
+    let fixture = PlanFixtureV1::readme_clone();
+    let inventory = fixture.inventory();
+    let (clean, _) = fixture.plan(GENERATION_V1, &inventory);
+    let manifest = manifest_from_plan(&clean, GENERATION_V1, inventory.clone());
+    assert_eq!(manifest.sealability(), CustodySealabilityV1::Sealable);
+    let (plan, sources) = fixture.plan_with(GENERATION_V1, &inventory, |request| {
+        request.external_evidence = ExternalEvidenceUnresolvedV1::declare().into();
+    });
+    assert!(plan
+        .coverage()
+        .iter()
+        .any(|row| row.state() == CustodyStateClassV1::Unresolved));
+    assert_binding_refused(
+        &fixture,
+        &manifest,
+        planned_capability(&manifest, plan, sources),
+        "the coverage plan has an unresolved row",
+    );
+}
+
+#[test]
+fn planned_binding_02_a_generation_mismatch_refuses_with_or_without_receipts() {
+    // No receipts: an empty source planned under A, against a B manifest.
+    let fixture = PlanFixtureV1::empty_source();
+    let (plan, sources) = fixture.plan("generation-a", &[]);
+    assert!(plan.receipts().is_empty());
+    assert_eq!(plan.generation_id(), "generation-a");
+    let manifest = manifest_from_plan(&plan, "generation-b", Vec::new());
+    assert_eq!(manifest.sealability(), CustodySealabilityV1::Sealable);
+    assert_binding_refused(
+        &fixture,
+        &manifest,
+        planned_capability(&manifest, plan, sources),
+        "the coverage plan names another generation",
+    );
+
+    // Receipts: a clone planned under A, against a B manifest.
+    let fixture = PlanFixtureV1::readme_clone();
+    let inventory = fixture.inventory();
+    let (plan, sources) = fixture.plan("generation-a", &inventory);
+    assert!(!plan.receipts().is_empty());
+    let manifest = manifest_from_plan(&plan, "generation-b", inventory);
+    assert_binding_refused(
+        &fixture,
+        &manifest,
+        planned_capability(&manifest, plan, sources),
+        "the coverage plan names another generation",
+    );
+}
+
+#[test]
+fn planned_binding_03_a_coverage_row_flipped_either_way_refuses() {
+    let fixture = PlanFixtureV1::readme_clone();
+    let inventory = fixture.inventory();
+    let detail = "the coverage plan's rows are not the manifest's";
+    // The object database is outside the receipts, so only the row comparison sees these.
+    // Captured in the plan, empty in the manifest.
+    let (plan, sources) = fixture.plan(GENERATION_V1, &inventory);
+    let rows = with_state(
+        plan.coverage(),
+        CustodyCoverageClassV1::ObjectDatabase,
+        CustodyStateClassV1::Empty,
+    );
+    let manifest = manifest_with_rows(&plan, GENERATION_V1, Vec::new(), rows);
+    assert_binding_refused(
+        &fixture,
+        &manifest,
+        planned_capability(&manifest, plan, sources),
+        detail,
+    );
+    // Empty in the plan, captured in the manifest.
+    let (plan, sources) = fixture.plan(GENERATION_V1, &[]);
+    let rows = with_state(
+        plan.coverage(),
+        CustodyCoverageClassV1::ObjectDatabase,
+        CustodyStateClassV1::Captured,
+    );
+    let manifest = manifest_with_rows(&plan, GENERATION_V1, inventory, rows);
+    assert_binding_refused(
+        &fixture,
+        &manifest,
+        planned_capability(&manifest, plan, sources),
+        detail,
+    );
+}
+
+#[test]
+fn planned_binding_04_an_extra_or_a_missing_exclusion_refuses() {
+    let fixture = PlanFixtureV1::cargo_clone();
+    let inventory = fixture.inventory();
+    let detail = "the coverage plan's exclusions are not the manifest's";
+    // A manifest cannot hold an exclusion no row references, so the plan side differs.
+    let (mut plan, sources) = fixture.plan(GENERATION_V1, &inventory);
+    assert_eq!(plan.exclusions().len(), 1);
+    let manifest = manifest_from_plan(&plan, GENERATION_V1, inventory.clone());
+    plan.exclusions_mut_for_test().push(
+        CustodyExclusionV1::new(
+            "extra-v1",
+            "reproducible_outputs",
+            "extra-v1",
+            vec!["cargo-lock".to_owned()],
+        )
+        .expect("a valid exclusion"),
+    );
+    assert_binding_refused(
+        &fixture,
+        &manifest,
+        planned_capability(&manifest, plan, sources),
+        detail,
+    );
+    let (mut plan, sources) = fixture.plan(GENERATION_V1, &inventory);
+    let manifest = manifest_from_plan(&plan, GENERATION_V1, inventory);
+    plan.exclusions_mut_for_test().clear();
+    assert_binding_refused(
+        &fixture,
+        &manifest,
+        planned_capability(&manifest, plan, sources),
+        detail,
+    );
+}
+
+#[test]
+fn planned_binding_05_one_changed_dependency_digest_refuses() {
+    let fixture = PlanFixtureV1::cargo_clone();
+    let inventory = fixture.inventory();
+    let (plan, sources) = fixture.plan(GENERATION_V1, &inventory);
+    let mut dependencies = plan.dependencies().to_vec();
+    assert_eq!(dependencies.len(), 2);
+    dependencies[0] = CustodyDependencyV1::new(
+        "cargo-lock",
+        "worktree-file",
+        Sha256HexV1::digest(b"another lock file"),
+        CustodyStateClassV1::Captured,
+        vec![],
+    )
+    .expect("a valid dependency");
+    let [unit, run, materialization, _] = IDENTITY_V1;
+    let manifest = CustodyManifestV1::new(
+        unit,
+        run,
+        materialization,
+        GENERATION_V1,
+        plan.coverage().to_vec(),
+        vec![],
+        inventory,
+        dependencies,
+        plan.exclusions().to_vec(),
+    )
+    .expect("a valid manifest");
+    assert_binding_refused(
+        &fixture,
+        &manifest,
+        planned_capability(&manifest, plan, sources),
+        "the coverage plan's dependencies are not the manifest's",
+    );
+}
+
+#[test]
+fn planned_binding_06_a_missing_or_an_extra_receipt_refuses() {
+    let fixture = PlanFixtureV1::readme_clone();
+    let inventory = fixture.inventory();
+    let detail = "the coverage plan's receipts are not the manifest's captured classes";
+    let (mut plan, sources) = fixture.plan(GENERATION_V1, &inventory);
+    let manifest = manifest_from_plan(&plan, GENERATION_V1, inventory.clone());
+    plan.receipts_mut_for_test()
+        .retain(|receipt| receipt.class != CustodyCoverageClassV1::Worktree);
+    assert_binding_refused(
+        &fixture,
+        &manifest,
+        planned_capability(&manifest, plan, sources),
+        detail,
+    );
+    // An extra receipt, in class order, for a class the manifest has empty.
+    let (mut plan, sources) = fixture.plan(GENERATION_V1, &inventory);
+    let manifest = manifest_from_plan(&plan, GENERATION_V1, inventory);
+    let mut extra = receipt_of(plan.receipts(), CustodyCoverageClassV1::Worktree);
+    extra.class = CustodyCoverageClassV1::LinkedWorktrees;
+    plan.receipts_mut_for_test().push(extra);
+    plan.receipts_mut_for_test()
+        .sort_by_key(|receipt| receipt.class);
+    assert_binding_refused(
+        &fixture,
+        &manifest,
+        planned_capability(&manifest, plan, sources),
+        detail,
+    );
+}
+
+/// §6.1's alias row, through the plan-backed path. Each row renames one pinned directory after
+/// the capability is minted, then exports into a new, empty, owner-private directory beneath the
+/// renamed one: no path shows the overlap, and only the retained pin's identity does. Every row
+/// is evaluated, and every failing row is reported.
+#[test]
+fn planned_binding_07_a_scratch_root_aliasing_a_protected_pin_refuses() {
+    type PinnedPathV1 = fn(&PlanFixtureV1) -> PathBuf;
+    let rows: [(&str, PinnedPathV1); 3] = [
+        ("the source repository", |fixture| fixture.worktree.clone()),
+        ("the git directory", |fixture| fixture.git_dir.clone()),
+        ("the primary store", PlanFixtureV1::objects),
+    ];
+    let mut failures = Vec::new();
+    for (label, pinned) in rows {
+        let fixture = PlanFixtureV1::readme_clone();
+        let (manifest, capability, _) = fixture.planned();
+        let alias = fixture.area.join("alias");
+        std::fs::rename(pinned(&fixture), &alias).expect("rename the pinned directory");
+        let scratch = alias.join("export-scratch");
+        std::fs::create_dir(&scratch).expect("a scratch beneath the alias");
+        set_owner_private(&scratch);
+        let result = fixture.export_to(&scratch, fixture.budgets, &manifest, capability);
+        let written: Vec<String> = snapshot_entries(&scratch).into_keys().collect();
+        let refused = matches!(&result, Err(CustodyExportErrorV1::ScratchPreflight(detail))
+            if detail.contains("is or lies inside"));
+        if !refused || !written.is_empty() {
+            failures.push(format!(
+                "{label}: {}; scratch entries: {written:?}",
+                describe_run(&result)
+            ));
+        }
+    }
+
+    // An alternate store. The plan of a source with one leaves its alternates row unresolved, so
+    // the export refuses at binding step 1. Its capability's protected set still meets the
+    // exporter's own preflight, which refuses the alias the same way.
+    let fixture = PlanFixtureV1::readme_clone();
+    let alternate = fixture.area.join("alternate.git");
+    worktree_git(
+        &fixture.area,
+        &["init", "-q", "--bare", alternate.to_str().expect("utf-8")],
+    );
+    let alternate_store = alternate.join("objects");
+    std::fs::create_dir_all(fixture.objects().join("info")).expect("objects/info");
+    std::fs::write(
+        fixture.objects().join("info/alternates"),
+        format!("{}\n", alternate_store.display()),
+    )
+    .expect("the alternates file");
+    let inventory = fixture.inventory();
+    let (plan, sources) = fixture.plan(GENERATION_V1, &inventory);
+    let manifest = manifest_from_plan(&plan, GENERATION_V1, inventory);
+    let capability = planned_capability(&manifest, plan, sources);
+    let alias = fixture.area.join("alternate-alias");
+    std::fs::rename(&alternate_store, &alias).expect("rename the alternate store");
+    let scratch = alias.join("export-scratch");
+    std::fs::create_dir(&scratch).expect("a scratch beneath the alias");
+    set_owner_private(&scratch);
+    let preflight = preflight_scratch_root(&scratch, &capability.protected_directories());
+    if !matches!(&preflight, Err(CustodyExportErrorV1::ScratchPreflight(detail))
+        if detail.contains("is or lies inside"))
+        || !snapshot_entries(&scratch).is_empty()
+    {
+        failures.push(format!("an alternate store: {:?}", preflight.map(|_| ())));
+    }
+    let result = fixture.export_to(&scratch, fixture.budgets, &manifest, capability);
+    if !matches!(&result, Err(CustodyExportErrorV1::CapabilityBinding(detail))
+        if *detail == "the coverage plan has an unresolved row")
+        || !snapshot_entries(&scratch).is_empty()
+    {
+        failures.push(format!(
+            "an alternate store's export: {}",
+            describe_run(&result)
+        ));
+    }
+    assert!(
+        failures.is_empty(),
+        "an identity alias of a protected pin was not refused:\n{}",
+        failures.join("\n")
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// §6.2 The mount census
+// ---------------------------------------------------------------------------------------------
+
+/// A mount point at the repository's `target`, one inside the git directory, and a non-UTF-8
+/// one inside the repository each park the unit before any scratch write. Every row is
+/// evaluated, and every failing row is reported.
+#[test]
+fn planned_census_01_a_mount_inside_the_repository_or_git_directory_parks_the_unit() {
+    type MountPointV1 = fn(&PlanFixtureV1) -> Vec<u8>;
+    let rows: [(&str, MountPointV1); 3] = [
+        ("the repository's target", |fixture| {
+            path_bytes(&fixture.worktree.join("target"))
+        }),
+        ("inside the git directory", |fixture| {
+            path_bytes(&fixture.git_dir.join("refs/heads"))
+        }),
+        ("a 0xff name inside the repository", |fixture| {
+            let mut mount_point = path_bytes(&fixture.worktree);
+            mount_point.extend_from_slice(b"/\xff\xfe");
+            mount_point
+        }),
+    ];
+    let mut failures = Vec::new();
+    for (label, inside) in rows {
+        let fixture = PlanFixtureV1::cargo_clone();
+        let (manifest, capability, _) = fixture.planned();
+        let _census = mount_seam::install_list(vec![b"/".to_vec(), inside(&fixture)]);
+        let result = fixture.export(&manifest, capability);
+        let written = fixture.scratch_entries();
+        if !matches!(result, Err(CustodyExportErrorV1::MountBoundary(_))) || !written.is_empty() {
+            failures.push(format!(
+                "{label}: {}; scratch entries: {written:?}",
+                describe_run(&result)
+            ));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "a mount inside the protected set did not park the unit:\n{}",
+        failures.join("\n")
+    );
+}
+
+/// The mount containing the repository, the repository's own mount, and a prefix sibling
+/// (`/repository` beside `/repo`) are none of them strictly inside it: the unit seals. A `.gitx`
+/// beside `.git` is a sibling of the git directory but lies inside the repository, and parks.
+#[test]
+fn planned_census_02_a_prefix_sibling_and_the_containing_mount_do_not_park() {
+    let fixture = PlanFixtureV1::cargo_clone();
+    let (manifest, capability, _) = fixture.planned();
+    let mut sibling = path_bytes(&fixture.worktree);
+    sibling.extend_from_slice(b"sibling");
+    let census = mount_seam::install_list(vec![
+        b"/".to_vec(),
+        path_bytes(&fixture.area),
+        path_bytes(&fixture.worktree),
+        sibling,
+    ]);
+    let _ = expect_sealed(
+        fixture
+            .export(&manifest, capability)
+            .expect("the export seals"),
+    );
+    assert!(census.calls() >= 1, "{} census calls", census.calls());
+    drop(census);
+
+    let fixture = PlanFixtureV1::cargo_clone();
+    let (manifest, capability, _) = fixture.planned();
+    let mut git_sibling = path_bytes(&fixture.git_dir);
+    git_sibling.extend_from_slice(b"x");
+    let _census = mount_seam::install_list(vec![b"/".to_vec(), git_sibling]);
+    let result = fixture.export(&manifest, capability);
+    assert!(
+        matches!(result, Err(CustodyExportErrorV1::MountBoundary(_))),
+        "{}",
+        describe_run(&result)
+    );
+}
+
+/// A mount inside an alternate store. A plan-backed export of such a source refuses at binding
+/// step 1 (its alternates row is unresolved), so the census the export runs is called on that
+/// capability directly.
+#[test]
+fn planned_census_03_a_mount_inside_an_alternate_store_parks_the_unit() {
+    let fixture = PlanFixtureV1::readme_clone();
+    let alternate = fixture.area.join("alternate.git");
+    worktree_git(
+        &fixture.area,
+        &["init", "-q", "--bare", alternate.to_str().expect("utf-8")],
+    );
+    std::fs::create_dir_all(fixture.objects().join("info")).expect("objects/info");
+    std::fs::write(
+        fixture.objects().join("info/alternates"),
+        format!("{}\n", alternate.join("objects").display()),
+    )
+    .expect("the alternates file");
+    let inventory = fixture.inventory();
+    let (plan, sources) = fixture.plan(GENERATION_V1, &inventory);
+    let manifest = manifest_from_plan(&plan, GENERATION_V1, inventory);
+    let capability = planned_capability(&manifest, plan, sources);
+    let _census = mount_seam::install_list(vec![
+        b"/".to_vec(),
+        path_bytes(&alternate.join("objects/pack")),
+    ]);
+    assert!(matches!(
+        capability.recheck_mounts(),
+        Err(CustodyExportErrorV1::MountBoundary(detail)) if detail.contains("objects/pack")
+    ));
+}
+
+/// Every census failure fails closed, before any scratch write.
+#[test]
+fn planned_census_04_a_census_error_fails_closed() {
+    let mut failures = Vec::new();
+    for error in [
+        CustodyMountErrorV1::Io(std::io::ErrorKind::PermissionDenied),
+        CustodyMountErrorV1::MalformedLine { line: 3 },
+        CustodyMountErrorV1::MalformedEscape { line: 1 },
+        CustodyMountErrorV1::Oversize,
+        CustodyMountErrorV1::CensusUnsupported,
+        CustodyMountErrorV1::Empty,
+        CustodyMountErrorV1::Unstable,
+    ] {
+        let fixture = PlanFixtureV1::readme_clone();
+        let (manifest, capability, _) = fixture.planned();
+        let _census = mount_seam::install(Box::new(move |_| Err(error)));
+        let result = fixture.export(&manifest, capability);
+        let written = fixture.scratch_entries();
+        if !matches!(&result, Err(CustodyExportErrorV1::CapabilityBinding(detail))
+            if detail.contains("mount census"))
+            || !written.is_empty()
+        {
+            failures.push(format!(
+                "{error:?}: {}; scratch entries: {written:?}",
+                describe_run(&result)
+            ));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "a census failure did not fail closed:\n{}",
+        failures.join("\n")
+    );
+}
+
+/// The census runs again immediately before the first scratch write: a mount that appears once
+/// binding is over (the layout has been derived) is refused with the scratch root still empty.
+/// The census call is chosen by the export's phase, not by its number, so no other call's
+/// presence or absence moves it.
+#[test]
+fn planned_census_05_the_census_runs_again_before_the_first_scratch_write() {
+    let fixture = PlanFixtureV1::readme_clone();
+    let (manifest, capability, _) = fixture.planned();
+    let inside = path_bytes(&fixture.worktree.join("target"));
+    let _census = mount_seam::install(Box::new(move |_| {
+        let mut mount_points = vec![b"/".to_vec()];
+        if derive_calls_for_test() >= 1 {
+            mount_points.push(inside.clone());
+        }
+        Ok(mount_points)
+    }));
+    let result = fixture.export(&manifest, capability);
+    assert!(
+        matches!(result, Err(CustodyExportErrorV1::MountBoundary(_))),
+        "{}",
+        describe_run(&result)
+    );
+    assert_eq!(fixture.scratch_entries(), Vec::<String>::new());
+}
+
+/// The census runs again before each restage (§5 step 3): a mount that appears once `work/`
+/// exists is refused before the first walked class restages, and no seal exists.
+#[test]
+fn planned_census_06_the_census_runs_again_before_each_restage() {
+    let fixture = PlanFixtureV1::readme_clone();
+    let (manifest, capability, _) = fixture.planned();
+    let inside = path_bytes(&fixture.git_dir.join("hooks"));
+    let work = fixture.work();
+    let _census = mount_seam::install(Box::new(move |_| {
+        let mut mount_points = vec![b"/".to_vec()];
+        if work.exists() {
+            mount_points.push(inside.clone());
+        }
+        Ok(mount_points)
+    }));
+    let result = fixture.export(&manifest, capability);
+    assert!(
+        matches!(result, Err(CustodyExportErrorV1::MountBoundary(_))),
+        "{}",
+        describe_run(&result)
+    );
+    assert!(!fixture.seal_present());
+    // The first walked class's frame was created, and nothing was restaged into it.
+    let frames: Vec<_> = std::fs::read_dir(fixture.work())
+        .expect("work/")
+        .map(|entry| entry.expect("an entry").path())
+        .filter(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "frame")
+        })
+        .collect();
+    assert_eq!(frames.len(), 1, "{frames:?}");
+    assert_eq!(std::fs::metadata(&frames[0]).expect("the frame").len(), 0);
+}
+
+/// Unmounts a real bind mount when dropped.
+#[cfg(target_os = "linux")]
+struct BindMountV1(PathBuf);
+
+#[cfg(target_os = "linux")]
+impl Drop for BindMountV1 {
+    fn drop(&mut self) {
+        let _ = Command::new("umount").arg(&self.0).status();
+    }
+}
+
+/// The real bind mount of §6.2: a directory containing the git directory, bind-mounted at
+/// `repo/target`, is refused. It needs a mount-capable Linux lane. Elsewhere `mount` is refused,
+/// the control reports the named exclusion, and the injected-census controls stand in for it.
+#[cfg(target_os = "linux")]
+#[test]
+fn planned_census_07_a_real_bind_mount_at_repo_target_refuses_where_mounting_is_permitted() {
+    let fixture = PlanFixtureV1::readme_clone();
+    let (manifest, capability, _) = fixture.planned();
+    let target = fixture.worktree.join("target");
+    std::fs::create_dir(&target).expect("the mount point");
+    let mounted = Command::new("mount")
+        .arg("--bind")
+        .arg(&fixture.worktree)
+        .arg(&target)
+        .output();
+    match mounted {
+        Ok(output) if output.status.success() => {}
+        other => {
+            eprintln!(
+                "named exclusion (task §6.2): this lane cannot bind-mount ({other:?}); the \
+                 injected-census controls stand in for the real bind mount"
+            );
+            return;
+        }
+    }
+    let _mount = BindMountV1(target.clone());
+    assert!(
+        target.join(".git").is_dir(),
+        "the bind mount shows the repository"
+    );
+    let result = fixture.export(&manifest, capability);
+    assert!(
+        matches!(&result, Err(CustodyExportErrorV1::MountBoundary(detail))
+            if detail.contains(&*target.to_string_lossy())),
+        "{}",
+        describe_run(&result)
+    );
+    assert_eq!(fixture.scratch_entries(), Vec::<String>::new());
+}
+
+/// Binding's own census (§3.2 step 5) refuses a mount that only it sees: the mount is gone once
+/// binding is over (the layout has been derived), so nothing but step 5 stands between it and a
+/// sealed capsule.
+#[test]
+fn planned_census_08_the_binding_census_refuses_before_any_later_call() {
+    let fixture = PlanFixtureV1::readme_clone();
+    let (manifest, capability, _) = fixture.planned();
+    let inside = path_bytes(&fixture.worktree.join("target"));
+    let census = mount_seam::install(Box::new(move |_| {
+        let mut mount_points = vec![b"/".to_vec()];
+        if derive_calls_for_test() == 0 {
+            mount_points.push(inside.clone());
+        }
+        Ok(mount_points)
+    }));
+    let result = fixture.export(&manifest, capability);
+    assert!(
+        matches!(result, Err(CustodyExportErrorV1::MountBoundary(_))),
+        "{}",
+        describe_run(&result)
+    );
+    assert_eq!(census.calls(), 1);
+    assert_eq!(fixture.scratch_entries(), Vec::<String>::new());
+}
+
+/// A mount at `target` of a repository whose own path holds the non-UTF-8 bytes `0xff 0xfe`, as
+/// the kernel writes it in `mountinfo`, parks the unit. The census parses the bytes verbatim, so
+/// the mount point is a byte prefix match of the repository's canonical path; a census that went
+/// through a UTF-8 conversion would miss it. Linux only: APFS refuses a non-UTF-8 name.
+#[cfg(target_os = "linux")]
+#[test]
+fn planned_census_09_a_mountinfo_0xff_path_inside_the_repository_parks_the_unit() {
+    let fixture = PlanFixtureV1::with(|area| {
+        let base = area.join(OsStr::from_bytes(b"\xff\xfe-base"));
+        std::fs::create_dir(&base).expect("a non-UTF-8 base directory");
+        readme_clone_in(&base)
+    });
+    let (manifest, capability, _) = fixture.planned();
+    let mut text = b"1 0 0:1 / / rw - overlay overlay rw\n2 1 0:1 / ".to_vec();
+    text.extend_from_slice(&path_bytes(&fixture.worktree.join("target")));
+    text.extend_from_slice(b" rw,relatime - overlay overlay rw\n");
+    assert!(text.contains(&0xff));
+    let _census = mount_seam::install_mountinfo(text);
+    let result = fixture.export(&manifest, capability);
+    assert!(
+        matches!(result, Err(CustodyExportErrorV1::MountBoundary(_))),
+        "{}",
+        describe_run(&result)
+    );
+    assert_eq!(fixture.scratch_entries(), Vec::<String>::new());
+}
+
+// ---------------------------------------------------------------------------------------------
+// §6.3 Bounded staging, and the retention of staged frames
+// ---------------------------------------------------------------------------------------------
+
+/// A planned file grown past its receipt, with no ledger headroom beyond the frame's
+/// reservation: the export refuses `SourceDrift`, the staged frame is no longer than its
+/// reservation, and the bounded writer's record shows it refused byte `frame_length + 1`.
+#[test]
+fn planned_stage_01_a_file_grown_past_its_receipt_refuses_within_its_reservation() {
+    let fixture = PlanFixtureV1::readme_clone();
+    let inventory = fixture.inventory();
+    let worktree = CustodyCoverageClassV1::Worktree;
+
+    // The exact budget: an unchanged export records the worktree frame's reservation and the
+    // ledger's use before it.
+    let (plan, sources) = fixture.plan(GENERATION_V1, &inventory);
+    let manifest = manifest_from_plan(&plan, GENERATION_V1, inventory.clone());
+    let receipt = receipt_of(plan.receipts(), worktree);
+    let _ = expect_sealed(
+        fixture
+            .export(&manifest, planned_capability(&manifest, plan, sources))
+            .expect("the unchanged export seals"),
+    );
+    let probe = frame_reservations_for_test()
+        .into_iter()
+        .find(|reservation| reservation.class == worktree)
+        .expect("the worktree frame was reserved");
+    assert_eq!(
+        probe.reserved,
+        receipt.frame_length + ENTRY_ALLOWANCE_BYTES_V1
+    );
+
+    // The same source planned again, then grown.
+    let (plan, sources) = fixture.plan(GENERATION_V1, &inventory);
+    assert_eq!(receipt_of(plan.receipts(), worktree), receipt);
+    let capability = planned_capability(&manifest, plan, sources);
+    let mut readme = std::fs::OpenOptions::new()
+        .append(true)
+        .open(fixture.worktree.join("README"))
+        .expect("the planned README");
+    readme
+        .write_all(&[b'+'; 4096])
+        .expect("the README grows after planning");
+    drop(readme);
+
+    let scratch = fixture.area.join("scratch-without-headroom");
+    std::fs::create_dir(&scratch).expect("a second scratch");
+    set_owner_private(&scratch);
+    let budgets = CustodyExportBudgetsV1 {
+        max_scratch_bytes: probe.used_before + probe.reserved,
+        ..fixture.budgets
+    };
+    let result = fixture.export_to(&scratch, budgets, &manifest, capability);
+    assert!(
+        matches!(&result, Err(CustodyExportErrorV1::SourceDrift(detail)) if detail.contains("past its receipt")),
+        "{}",
+        describe_run(&result)
+    );
+    let staged = frame_reservations_for_test()
+        .into_iter()
+        .find(|reservation| reservation.class == worktree)
+        .expect("the grown frame was reserved");
+    assert_eq!(
+        staged.used_before + staged.reserved,
+        budgets.max_scratch_bytes,
+        "the frame's reservation left the ledger no headroom"
+    );
+    let frame = scratch
+        .join(WORK_DIR_NAME)
+        .join(staged_frame_name(worktree));
+    let length = std::fs::metadata(&frame).expect("the staged frame").len();
+    assert!(
+        length <= staged.reserved - ENTRY_ALLOWANCE_BYTES_V1,
+        "{length} staged bytes exceed the {} byte reservation",
+        staged.reserved - ENTRY_ALLOWANCE_BYTES_V1
+    );
+    assert_eq!(
+        frame_overflows_for_test(),
+        vec![(worktree, receipt.frame_length)],
+        "the bounded writer refused byte frame_length + 1"
+    );
+    assert!(std::fs::symlink_metadata(scratch.join(CAPSULE_DIR_NAME).join(SEAL_NAME)).is_err());
+}
+
+/// A planned file changed at the same length restages to a frame of the receipt's length, and
+/// the digest comparison refuses it.
+#[test]
+fn planned_stage_02_a_file_changed_at_the_same_length_refuses_by_its_digest() {
+    let fixture = PlanFixtureV1::readme_clone();
+    let (manifest, capability, receipts) = fixture.planned();
+    let readme = fixture.worktree.join("README");
+    let before = std::fs::read(&readme).expect("the planned README");
+    let after: Vec<u8> = before
+        .iter()
+        .map(|byte| byte.to_ascii_uppercase())
+        .collect();
+    assert_eq!((before.len(), before != after), (after.len(), true));
+    std::fs::write(&readme, &after).expect("the same-length rewrite");
+    let result = fixture.export(&manifest, capability);
+    assert!(
+        matches!(&result, Err(CustodyExportErrorV1::SourceDrift(detail))
+            if detail.contains("another frame than its plan receipt")),
+        "{}",
+        describe_run(&result)
+    );
+    assert!(frame_overflows_for_test().is_empty());
+    let receipt = receipt_of(&receipts, CustodyCoverageClassV1::Worktree);
+    let staged = std::fs::read(
+        fixture
+            .work()
+            .join(staged_frame_name(CustodyCoverageClassV1::Worktree)),
+    )
+    .expect("the staged frame");
+    assert_eq!(staged.len() as u64, receipt.frame_length);
+    assert_ne!(sha256_bytes(&staged), receipt.frame_sha256);
+    assert!(!fixture.seal_present());
+}
+
+/// The capability recheck runs before each restage (§5 step 3). The worktree root is swapped for
+/// a copy after the first walked frame is created, after every Git child's recheck has passed.
+#[test]
+fn planned_stage_03_the_recheck_runs_before_each_restage() {
+    let fixture = PlanFixtureV1::readme_clone();
+    let (manifest, capability, _) = fixture.planned();
+    let worktree = fixture.worktree.clone();
+    let _hook = install_export_hook_for_test(
+        ExportHookPointV1::AfterFrameCreate,
+        on_nth_call(1, move |_| swap_worktree_keeping_its_git_dir(&worktree)),
+    );
+    let result = fixture.export(&manifest, capability);
+    assert!(
+        matches!(result, Err(CustodyExportErrorV1::IdentityDrift(_))),
+        "{}",
+        describe_run(&result)
+    );
+    assert!(!fixture.seal_present());
+}
+
+/// The published payload body of `class`: its fixture envelope less the magic.
+fn payload_body(
+    fixture: &PlanFixtureV1,
+    manifest: &CustodyManifestV1,
+    class: CustodyCoverageClassV1,
+) -> Vec<u8> {
+    let layout = CustodyCapsuleLayoutV1::derive(manifest).expect("the layout");
+    let row = layout
+        .index()
+        .artifacts()
+        .iter()
+        .find(|row| *row.role() == CustodyCapsuleArtifactRoleV1::CoveragePayload(class))
+        .expect("a captured class has a payload");
+    let envelope = std::fs::read(
+        fixture
+            .capsule()
+            .join(OsStr::from_bytes(row.name().as_bytes())),
+    )
+    .expect("the published payload");
+    assert_eq!(&envelope[..8], FIXTURE_ENVELOPE_MAGIC_V1);
+    envelope[8..].to_vec()
+}
+
+/// Step 6 seals the staged frame's retained descriptor and never reopens it by name. After the
+/// first staged frame matched its receipt, its name is given to a same-length file of inverted
+/// bytes; the sealed payload is still exactly the receipt's frame.
+#[test]
+fn planned_stage_04_the_seal_reads_the_retained_descriptor_not_the_name() {
+    let fixture = PlanFixtureV1::readme_clone();
+    let (manifest, capability, receipts) = fixture.planned();
+    let replaced: Rc<RefCell<Option<PathBuf>>> = Rc::default();
+    let record = Rc::clone(&replaced);
+    let _hook = install_export_hook_for_test(
+        ExportHookPointV1::AfterFrameStaged,
+        on_nth_call(1, move |path| {
+            let staged = std::fs::read(path).expect("the staged frame");
+            std::fs::rename(path, path.with_extension("frame-moved")).expect("move it aside");
+            let inverted: Vec<u8> = staged.iter().map(|byte| !byte).collect();
+            std::fs::write(path, inverted).expect("a same-length decoy at its name");
+            *record.borrow_mut() = Some(path.to_path_buf());
+        }),
+    );
+    let result = fixture.export(&manifest, capability);
+    assert!(
+        matches!(result, Ok(CustodyExportOutcomeV1::Sealed(_))),
+        "{}",
+        describe_run(&result)
+    );
+    let replaced = replaced
+        .borrow()
+        .clone()
+        .expect("the hook replaced a staged frame");
+    let receipt = receipts
+        .iter()
+        .find(|receipt| replaced.file_name() == Some(OsStr::new(&staged_frame_name(receipt.class))))
+        .expect("the replaced frame is a walked class's");
+    let payload = payload_body(&fixture, &manifest, receipt.class);
+    assert_eq!(payload.len() as u64, receipt.frame_length);
+    assert_eq!(sha256_bytes(&payload), receipt.frame_sha256);
+}
+
+/// After a successful export every staged frame is still in `work/`, holding exactly its
+/// receipt's frame, and no `work/` entry observed during publication was deleted.
+#[test]
+fn planned_retention_01_every_staged_frame_is_kept_as_evidence() {
+    let fixture = PlanFixtureV1::readme_clone();
+    let (manifest, capability, receipts) = fixture.planned();
+    let observed: Rc<RefCell<BTreeSet<String>>> = Rc::default();
+    let seen = Rc::clone(&observed);
+    let work = fixture.work();
+    let _hook = install_export_hook_for_test(ExportHookPointV1::AfterArtifactPublish, move |_| {
+        seen.borrow_mut()
+            .extend(snapshot_entries(&work).into_keys());
+    });
+    let _ = expect_sealed(
+        fixture
+            .export(&manifest, capability)
+            .expect("the export seals"),
+    );
+
+    let after: BTreeSet<String> = snapshot_entries(&fixture.work()).into_keys().collect();
+    let deleted: Vec<_> = observed.borrow().difference(&after).cloned().collect();
+    assert!(
+        deleted.is_empty(),
+        "work/ entries were deleted: {deleted:?}"
+    );
+    for receipt in &receipts {
+        let name = staged_frame_name(receipt.class);
+        assert!(observed.borrow().contains(&name), "{name}");
+        let frame = std::fs::read(fixture.work().join(&name)).expect("a retained frame");
+        assert_eq!(frame.len() as u64, receipt.frame_length, "{name}");
+        assert_eq!(sha256_bytes(&frame), receipt.frame_sha256, "{name}");
+    }
+    let top: BTreeSet<String> = std::fs::read_dir(fixture.work())
+        .expect("work/")
+        .map(|entry| {
+            entry
+                .expect("an entry")
+                .file_name()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect();
+    let mut expected: BTreeSet<String> = [
+        HOME_DIR_NAME,
+        XDG_DIR_NAME,
+        SOURCE_GIT_DIR_NAME,
+        VERIFY_GIT_DIR_NAME,
+        PACK_FILE_NAME,
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect();
+    expected.extend(
+        receipts
+            .iter()
+            .map(|receipt| staged_frame_name(receipt.class)),
+    );
+    assert_eq!(top, expected);
+}
+
+// ---------------------------------------------------------------------------------------------
+// §6.4 End to end
+// ---------------------------------------------------------------------------------------------
+
+/// A frame's entries: `(path, kind, content)`, content empty for a directory or symlink.
+fn frame_entries(frame: &[u8], header: &CustodyFrameHeaderV1) -> Vec<(Vec<u8>, char, Vec<u8>)> {
+    let mut decoder =
+        CustodyFrameDecoderV1::new(frame, header, plan_frame_budget()).expect("a frame header");
+    let mut entries = Vec::new();
+    while let Some(entry) = decoder.next_entry().expect("a well-formed frame") {
+        entries.push(match entry {
+            CustodyFrameEntryV1::Directory { path, .. } => (path.as_bytes().to_vec(), 'd', vec![]),
+            CustodyFrameEntryV1::Symlink { path, target } => {
+                (path.as_bytes().to_vec(), 'l', target)
+            }
+            CustodyFrameEntryV1::Regular {
+                path, mut content, ..
+            } => {
+                let mut bytes = Vec::new();
+                content.read_to_end(&mut bytes).expect("verified content");
+                (path.as_bytes().to_vec(), 'f', bytes)
+            }
+        });
+    }
+    entries
+}
+
+#[test]
+fn planned_e2e_01_a_rich_clone_exports_a_sealed_capsule_of_its_walked_classes() {
+    use CustodyCoverageClassV1 as Class;
+    let fixture = PlanFixtureV1::rich_clone();
+    let inventory = fixture.inventory();
+    assert!(inventory.len() > 10, "{} objects", inventory.len());
+    let (plan, sources) = fixture.plan(GENERATION_V1, &inventory);
+    let receipts = plan.receipts().to_vec();
+    assert_eq!(
+        receipts
+            .iter()
+            .map(|receipt| receipt.class)
+            .collect::<Vec<_>>(),
+        [
+            Class::RefsAndHead,
+            Class::Index,
+            Class::Worktree,
+            Class::StashAndReflogs,
+            Class::InProgressGitOperations,
+            Class::GitConfigurationAndHooks,
+            Class::BridgeEvidence,
+        ]
+    );
+    assert_eq!(plan.exclusions().len(), 1);
+    assert_eq!(plan.dependencies().len(), 2);
+    let manifest = manifest_from_plan(&plan, GENERATION_V1, inventory);
+    assert_eq!(manifest.sealability(), CustodySealabilityV1::Sealable);
+    let capability = planned_capability(&manifest, plan, sources);
+
+    let before = snapshot_tree(&fixture.worktree);
+    let installed = plan_seam::install(PlanSeamsV1::default());
+    let sealed = expect_sealed(
+        fixture
+            .export(&manifest, capability)
+            .expect("the export seals"),
+    );
+    let walks = installed.record().walks;
+    drop(installed);
+    assert_eq!(
+        snapshot_tree(&fixture.worktree),
+        before,
+        "the source changed"
+    );
+
+    // 2B1's binding over the published capsule: the seal, the index, the manifest, and every
+    // artifact's recorded length and digest.
+    let layout = CustodyCapsuleLayoutV1::derive(&manifest).expect("the layout");
+    let seal = CustodySealV1::decode_canonical(
+        &std::fs::read(fixture.capsule().join(SEAL_NAME)).expect("the published seal"),
+    )
+    .expect("the published seal decodes");
+    assert_eq!(seal, sealed.seal);
+    CustodyCapsuleSealProofV1::preflight_generic_seal_for_capsule_v1(&seal)
+        .expect("a capsule seal");
+    assert_eq!(
+        &seal.content_digest().unwrap(),
+        sealed.binding.seal_digest()
+    );
+    assert_eq!(
+        &manifest.content_digest().unwrap(),
+        sealed.binding.manifest_digest()
+    );
+    assert_eq!(
+        &layout.index().content_digest().unwrap(),
+        sealed.binding.index_digest()
+    );
+    let names: Vec<&[u8]> = layout
+        .index()
+        .artifacts()
+        .iter()
+        .map(|row| row.name().as_bytes())
+        .collect();
+    assert_eq!(
+        sealed
+            .binding
+            .artifact_names()
+            .iter()
+            .map(LosslessPathV1::as_bytes)
+            .collect::<Vec<_>>(),
+        names
+    );
+    for artifact in seal.artifacts() {
+        let bytes = std::fs::read(
+            fixture
+                .capsule()
+                .join(OsStr::from_bytes(artifact.name().as_bytes())),
+        )
+        .expect("a sealed artifact");
+        assert_eq!(bytes.len() as u64, artifact.byte_length());
+        assert_eq!(&Sha256HexV1::digest(&bytes), artifact.sha256());
+    }
+    let body = |name: &[u8]| {
+        let envelope = std::fs::read(fixture.capsule().join(OsStr::from_bytes(name)))
+            .expect("a published artifact");
+        assert_eq!(&envelope[..8], FIXTURE_ENVELOPE_MAGIC_V1);
+        envelope[8..].to_vec()
+    };
+    assert_eq!(
+        CustodyManifestV1::decode_canonical(&body(MANIFEST_ARTIFACT_V1.as_bytes())).unwrap(),
+        manifest
+    );
+    assert_eq!(
+        &CustodyCapsuleIndexV1::decode_canonical(&body(b"control/capsule-index.json.enc")).unwrap(),
+        layout.index()
+    );
+
+    // The capsule holds the verified Git pack.
+    let pack = body(PACK_ARTIFACT_V1.as_bytes());
+    assert!(!pack.is_empty());
+    assert_eq!(
+        pack,
+        std::fs::read(fixture.work().join(PACK_FILE_NAME)).unwrap()
+    );
+    assert_eq!(sha256_bytes(&pack), sealed.evidence.verified_pack_sha256);
+
+    // Every coverage payload is its receipt's frame, byte for byte an independent re-walk with
+    // the class's selection, and decodes to exactly that class's walked entries.
+    let git_dir_identity = {
+        use std::os::unix::fs::MetadataExt as _;
+        let metadata = std::fs::metadata(&fixture.git_dir).unwrap();
+        (metadata.dev(), metadata.ino())
+    };
+    let mut payload_classes = Vec::new();
+    for row in layout.index().artifacts() {
+        let CustodyCapsuleArtifactRoleV1::CoveragePayload(class) = row.role() else {
+            continue;
+        };
+        let class = *class;
+        payload_classes.push(class);
+        let receipt = receipt_of(&receipts, class);
+        let payload = body(row.name().as_bytes());
+        assert_eq!(payload.len() as u64, receipt.frame_length, "{class:?}");
+        assert_eq!(sha256_bytes(&payload), receipt.frame_sha256, "{class:?}");
+        assert_eq!(
+            std::fs::read(fixture.work().join(staged_frame_name(class))).unwrap(),
+            payload,
+            "{class:?}: the retained staged frame"
+        );
+        let header = CustodyFrameHeaderV1::new(class, GENERATION_V1).unwrap();
+        let worktree_selection = WorktreeSelectionV1 {
+            git_dir: git_dir_identity,
+            cargo_target_excluded: true,
+        };
+        let git_dir_selection = GitDirClassSelectionV1 { class };
+        let (root, selection): (&Path, &dyn WalkSelectionV1) = if class == Class::Worktree {
+            (&fixture.worktree, &worktree_selection)
+        } else {
+            (&fixture.git_dir, &git_dir_selection)
+        };
+        let pin = PinnedDirectoryV1::open(root, "the e2e re-walk").unwrap();
+        let mut rewalked = Vec::new();
+        let encoder =
+            CustodyFrameEncoderV1::new(&mut rewalked, &header, plan_frame_budget()).unwrap();
+        walk_tree_v1(&pin, selection, PLAN_ENTRY_BUDGET_V1, encoder).expect("the re-walk");
+        assert_eq!(payload, rewalked, "{class:?}");
+        let entries = frame_entries(&payload, &header);
+        assert!(!entries.is_empty(), "{class:?}");
+        assert!(
+            !payload
+                .windows(TARGET_MARKER_V1.len())
+                .any(|window| window == TARGET_MARKER_V1),
+            "{class:?} carries target/ bytes"
+        );
+        if class == Class::Worktree {
+            let paths: BTreeSet<Vec<u8>> = entries.iter().map(|(path, ..)| path.clone()).collect();
+            assert!(!paths
+                .iter()
+                .any(|path| path == b"target" || path.starts_with(b"target/")));
+            for name in [
+                &b"Cargo.toml"[..],
+                b"Cargo.lock",
+                b"README",
+                b"untracked.txt",
+                b"build.log",
+                b"HEAD",
+                b".git",
+            ] {
+                assert!(paths.contains(name), "{}", String::from_utf8_lossy(name));
+            }
+            let readme = entries
+                .iter()
+                .find(|(path, ..)| path == b"README")
+                .map(|(_, _, content)| content.clone());
+            assert_eq!(readme.as_deref(), Some(&b"coverage fixture\ndirty\n"[..]));
+        }
+    }
+    let mut sorted = payload_classes.clone();
+    sorted.sort();
+    assert_eq!(
+        sorted,
+        receipts
+            .iter()
+            .map(|receipt| receipt.class)
+            .collect::<Vec<_>>()
+    );
+
+    // The restages ran one at a time, in layout order, each on its own fresh pin.
+    let mut pins = BTreeSet::new();
+    let mut restaged = Vec::new();
+    for pair in walks.chunks(2) {
+        let [WalkEventV1::Begin { walk, pin }, WalkEventV1::End {
+            walk: ended,
+            pin: ended_pin,
+        }] = pair
+        else {
+            panic!("restages overlap: {walks:?}");
+        };
+        assert_eq!((walk, pin), (ended, ended_pin), "{walks:?}");
+        assert!(pins.insert(*pin), "{walks:?}");
+        restaged.push(*walk);
+    }
+    assert_eq!(
+        restaged,
+        payload_classes
+            .iter()
+            .map(|class| WalkKindV1::Class(*class))
+            .collect::<Vec<_>>()
+    );
+
+    // The ledger charged exactly what the scratch root holds.
+    assert_eq!(
+        sealed.evidence.scratch_bytes_used,
+        census_use(&fixture.scratch)
     );
 }
