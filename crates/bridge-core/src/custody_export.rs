@@ -72,16 +72,19 @@ const SEAL_NAME: &str = "custody-seal.v1";
 
 /// The exact file set `git init --bare --template=` leaves behind, enumerated so a post-exit
 /// re-measure can refuse an unexpected Git-written file rather than merely totalling bytes.
-const INIT_BARE_FILES_V1: [&str; 2] = ["HEAD", "config"];
+///
+/// The init-reservation items are crate-visible so the 2B2b2b1 coverage planner charges its
+/// index-probe initialization with the same figures rather than a copy of them.
+pub(crate) const INIT_BARE_FILES_V1: [&str; 2] = ["HEAD", "config"];
 /// `HEAD`, `config`, and the empty `objects/{info,pack}` and `refs/{heads,tags}` tree, plus the
 /// git directory itself: nine created entries at the per-entry allowance.
-const INIT_BARE_ENTRIES_V1: u64 = 9;
+pub(crate) const INIT_BARE_ENTRIES_V1: u64 = 9;
 /// The logical bytes reserved for `HEAD` and `config` before each `git init`, apart from the entry
 /// allowances. `HEAD` is one symbolic-ref line and `config` a handful of `core` and `extensions`
 /// keys: 89 bytes for SHA-1 and 125 for SHA-256 on the container lane. The bound is enforced, not
 /// assumed: the post-exit re-measure refuses any excess, then reconciles the reservation down to
 /// the measured bytes.
-const INIT_BARE_LOGICAL_BYTES_V1: u64 = 4 * 1024;
+pub(crate) const INIT_BARE_LOGICAL_BYTES_V1: u64 = 4 * 1024;
 /// `index-pack` creates the pack, its version-2 index, and its reverse index.
 const INDEX_PACK_ENTRIES_V1: u64 = 3;
 
@@ -174,18 +177,21 @@ impl CustodyExportBudgetsV1 {
 /// staging names, the seal, the plaintext Git-pack staging file, and the verification database's
 /// pack, index, and reverse index. Logical file bytes are counted with checked arithmetic, plus
 /// a fixed per-entry allocation allowance for each created file or directory.
+///
+/// Crate-visible so the 2B2b2b1 coverage planner charges its planning scratch through this one
+/// ledger rather than a second implementation of it.
 #[derive(Debug)]
-struct ScratchLedgerV1 {
+pub(crate) struct ScratchLedgerV1 {
     limit: u64,
     used: u64,
 }
 
 impl ScratchLedgerV1 {
-    const fn new(limit: u64) -> Self {
+    pub(crate) const fn new(limit: u64) -> Self {
         Self { limit, used: 0 }
     }
 
-    fn reserve(&mut self, bytes: u64) -> Result<(), CustodyExportErrorV1> {
+    pub(crate) fn reserve(&mut self, bytes: u64) -> Result<(), CustodyExportErrorV1> {
         let next = self
             .used
             .checked_add(bytes)
@@ -200,7 +206,7 @@ impl ScratchLedgerV1 {
         Ok(())
     }
 
-    fn reserve_entries(&mut self, entries: u64) -> Result<(), CustodyExportErrorV1> {
+    pub(crate) fn reserve_entries(&mut self, entries: u64) -> Result<(), CustodyExportErrorV1> {
         let bytes = entries
             .checked_mul(ENTRY_ALLOWANCE_BYTES_V1)
             .ok_or_else(|| CustodyExportErrorV1::ScratchLedger("allowance overflowed".into()))?;
@@ -208,11 +214,11 @@ impl ScratchLedgerV1 {
     }
 
     /// Reconcile a whole-stream reservation down to the length that was actually streamed.
-    fn release(&mut self, bytes: u64) {
+    pub(crate) fn release(&mut self, bytes: u64) {
         self.used = self.used.saturating_sub(bytes);
     }
 
-    const fn used(&self) -> u64 {
+    pub(crate) const fn used(&self) -> u64 {
         self.used
     }
 }
@@ -276,7 +282,7 @@ pub(crate) struct PinnedObjectStoreV1 {
 }
 
 impl PinnedObjectStoreV1 {
-    fn open(path: &Path) -> Result<Self, CustodyExportErrorV1> {
+    pub(crate) fn open(path: &Path) -> Result<Self, CustodyExportErrorV1> {
         let pin = PinnedDirectoryV1::open(path, "custody export object store")?;
         let alternates_sha256 = read_alternates_digest(&pin)?.map(|(digest, _)| digest);
         Ok(Self {
@@ -285,7 +291,7 @@ impl PinnedObjectStoreV1 {
         })
     }
 
-    fn recheck(&self) -> Result<(), CustodyExportErrorV1> {
+    pub(crate) fn recheck(&self) -> Result<(), CustodyExportErrorV1> {
         pinned_root_unchanged(&self.pin).map_err(CustodyExportErrorV1::IdentityDrift)?;
         let observed = read_alternates_digest(&self.pin)?.map(|(digest, _)| digest);
         if observed != self.alternates_sha256 {
@@ -297,7 +303,7 @@ impl PinnedObjectStoreV1 {
         Ok(())
     }
 
-    fn path(&self) -> &Path {
+    pub(crate) fn path(&self) -> &Path {
         self.pin.canonical_path()
     }
 }
@@ -365,7 +371,7 @@ pub(crate) struct CustodyCaptureCapabilityV1 {
 
 /// Follow a primary object store's `objects/info/alternates` chain to a fixed point, pinning
 /// every store by identity and by its alternates file's content.
-fn pin_alternate_chain(
+pub(crate) fn pin_alternate_chain(
     primary: &PinnedObjectStoreV1,
 ) -> Result<Vec<PinnedObjectStoreV1>, CustodyExportErrorV1> {
     let mut pinned: Vec<PinnedObjectStoreV1> = Vec::new();
@@ -582,16 +588,15 @@ impl CustodyCaptureCapabilityV1 {
         .map_err(CustodyExportErrorV1::Git)
     }
 
-    /// The pinned source directories no scratch root may be, contain, or lie inside: the
-    /// repository root, its git directory, the primary object store, and every pinned alternate
-    /// store. Each is the retained descriptor, whose identity is the directory pinned at mint even
-    /// after its path has been renamed away.
+    /// The pinned source directories no scratch root may be, contain, or lie inside. See
+    /// [`protected_directories`].
     fn protected_directories(&self) -> Vec<&PinnedDirectoryV1> {
-        let mut directories = vec![&self.source_repository];
-        directories.push(&self.source_git_dir);
-        directories.push(&self.primary_store.pin);
-        directories.extend(self.alternate_stores.iter().map(|store| &store.pin));
-        directories
+        protected_directories(
+            &self.source_repository,
+            &self.source_git_dir,
+            &self.primary_store,
+            &self.alternate_stores,
+        )
     }
 
     /// The captured stream bound to exactly this coverage class, generation, declared length,
@@ -638,6 +643,23 @@ impl CustodyCaptureCapabilityV1 {
             CustodyGitObjectFormatV1::Sha256 => 32,
         }
     }
+}
+
+/// The protected set: the repository root, its git directory, the primary object store, and every
+/// pinned alternate store. Each is the retained descriptor, whose identity is the directory pinned
+/// at mint even after its path has been renamed away. Shared with the 2B2b2b1 coverage planner,
+/// whose planning scratch must avoid exactly the same set.
+pub(crate) fn protected_directories<'a>(
+    source_repository: &'a PinnedDirectoryV1,
+    source_git_dir: &'a PinnedDirectoryV1,
+    primary_store: &'a PinnedObjectStoreV1,
+    alternate_stores: &'a [PinnedObjectStoreV1],
+) -> Vec<&'a PinnedDirectoryV1> {
+    let mut directories = vec![source_repository];
+    directories.push(source_git_dir);
+    directories.push(&primary_store.pin);
+    directories.extend(alternate_stores.iter().map(|store| &store.pin));
+    directories
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1481,7 +1503,7 @@ pub(crate) fn export_capsule_v1(
         return Err(CustodyExportErrorV1::BudgetCeiling("artifact count"));
     }
 
-    let scratch = preflight_scratch_root(scratch_root, &capability)?;
+    let scratch = preflight_scratch_root(scratch_root, &capability.protected_directories())?;
     // A pinned source path may have been renamed or retargeted since mint. Recheck every pinned
     // identity immediately before the first scratch write, so a stale capability refuses before
     // the exporter creates anything.
@@ -1708,10 +1730,10 @@ fn preflight_canonical_manifest(
 /// §2 preflight: the scratch root must be owner-private and empty, and must not be, contain, or
 /// lie inside the source repository, its git directory, or any pinned alternate store. The
 /// comparison runs in both directions over canonical paths, and over the directory identity of
-/// every ancestor captured here.
-fn preflight_scratch_root(
+/// every ancestor captured here. `protected` is the [`protected_directories`] set.
+pub(crate) fn preflight_scratch_root(
     scratch_root: &Path,
-    capability: &CustodyCaptureCapabilityV1,
+    protected: &[&PinnedDirectoryV1],
 ) -> Result<PinnedDirectoryV1, CustodyExportErrorV1> {
     let canonical = scratch_root.canonicalize().map_err(|error| {
         CustodyExportErrorV1::ScratchPreflight(format!(
@@ -1719,7 +1741,7 @@ fn preflight_scratch_root(
         ))
     })?;
 
-    refuse_source_overlap(&canonical, capability)?;
+    refuse_source_overlap(&canonical, protected)?;
 
     let pin = PinnedDirectoryV1::open(&canonical, "custody export scratch root")?;
 
@@ -1767,9 +1789,9 @@ fn preflight_scratch_root(
 /// ancestor may still be the pinned directory itself. The second walks a pinned path. The
 /// capability recheck before the first scratch write refuses a path that no longer resolves to
 /// its descriptor, and the empty scratch root can contain no pinned directory.
-fn refuse_source_overlap(
+pub(crate) fn refuse_source_overlap(
     canonical: &Path,
-    capability: &CustodyCaptureCapabilityV1,
+    protected: &[&PinnedDirectoryV1],
 ) -> Result<(), CustodyExportErrorV1> {
     let refuse = |relation: &str, store: &Path| {
         Err(CustodyExportErrorV1::ScratchPreflight(format!(
@@ -1789,7 +1811,7 @@ fn refuse_source_overlap(
         ))),
     };
     let scratch_identity = identity(canonical)?;
-    for protected in capability.protected_directories() {
+    for protected in protected.iter().copied() {
         let path = protected.canonical_path();
         if canonical == path || canonical.starts_with(path) || path.starts_with(canonical) {
             return refuse("is, contains, or lies inside", path);
@@ -2105,21 +2127,24 @@ fn init_bare_git_directory(
 /// logical bytes the ledger charges for them, and the entries it charges at the per-entry
 /// allowance. §3 requires the re-measure after EVERY child, including the read-only ones, which
 /// add nothing to either figure.
+///
+/// Crate-visible, with its [`Self::for_init`] reservation and [`remeasure_git_directory_in`], so
+/// the 2B2b2b1 coverage planner reserves and reconciles its index probe exactly as 2B2 does.
 #[derive(Debug)]
-struct GitDirectoryBudgetV1 {
-    directory: &'static str,
-    files: BTreeSet<String>,
+pub(crate) struct GitDirectoryBudgetV1 {
+    pub(crate) directory: &'static str,
+    pub(crate) files: BTreeSet<String>,
     /// The logical file bytes this directory may hold. Each writing child adds its proven bound
     /// before it runs; each re-measure reconciles the figure, and the ledger, down to the bytes
     /// measured.
-    logical_bytes: u64,
+    pub(crate) logical_bytes: u64,
     /// Created entries, charged at the per-entry allowance. They are kept apart from
     /// `logical_bytes`, so an allowance can never absorb file bytes the ledger did not charge.
-    entries: u64,
+    pub(crate) entries: u64,
 }
 
 impl GitDirectoryBudgetV1 {
-    fn for_init(directory: &'static str) -> Self {
+    pub(crate) fn for_init(directory: &'static str) -> Self {
         Self {
             directory,
             files: INIT_BARE_FILES_V1
@@ -2195,7 +2220,16 @@ fn remeasure_git_directory(
     budget: &mut GitDirectoryBudgetV1,
     ledger: &RefCell<ScratchLedgerV1>,
 ) -> Result<(), CustodyExportErrorV1> {
-    let git_dir = context.work.open_existing_child_directory(
+    remeasure_git_directory_in(context.work, budget, ledger)
+}
+
+/// [`remeasure_git_directory`] for the git directory named by `budget` beneath `work`.
+pub(crate) fn remeasure_git_directory_in(
+    work: &PinnedDirectoryV1,
+    budget: &mut GitDirectoryBudgetV1,
+    ledger: &RefCell<ScratchLedgerV1>,
+) -> Result<(), CustodyExportErrorV1> {
+    let git_dir = work.open_existing_child_directory(
         OsStr::new(budget.directory),
         "custody export git directory",
     )?;

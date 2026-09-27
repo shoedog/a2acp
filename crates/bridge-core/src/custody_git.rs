@@ -89,6 +89,9 @@ pub(crate) enum GitCommandV1 {
     CatFileAllObjects,
     RevListMissingPrint,
     FsckStrict,
+    /// ADR-0041 2B2b2b1: the coverage planner's read-only index probe. It lists a copied index in
+    /// a template-less bare probe repository, so gitlinks are detected exactly.
+    LsFilesStageZ,
 }
 
 impl GitCommandV1 {
@@ -151,6 +154,7 @@ impl GitCommandV1 {
                 "--no-dangling".into(),
                 "--no-progress".into(),
             ],
+            Self::LsFilesStageZ => vec!["ls-files".into(), "--stage".into(), "-z".into()],
         };
         Ok((arguments, !matches!(self, Self::InitBare { .. })))
     }
@@ -161,6 +165,7 @@ impl GitCommandV1 {
     /// a location outside the caller's pinned root. A mutating subcommand handed such a route would
     /// write repository, pack, or index data there — `index-pack --stdin` writes its pack and index
     /// straight into `GIT_OBJECT_DIRECTORY` — which would defeat the root-confined effect boundary.
+    /// The index probe reads only its own copied index, so it never needs a caller store either.
     fn permits_object_store_route(&self) -> bool {
         match self {
             Self::CatFileBatchCheck
@@ -169,7 +174,10 @@ impl GitCommandV1 {
             | Self::CatFileAllObjects
             | Self::RevListMissingPrint
             | Self::FsckStrict => true,
-            Self::Version | Self::InitBare { .. } | Self::IndexPackStrictStdin => false,
+            Self::Version
+            | Self::InitBare { .. }
+            | Self::IndexPackStrictStdin
+            | Self::LsFilesStageZ => false,
         }
     }
 
@@ -184,6 +192,7 @@ impl GitCommandV1 {
             Self::CatFileAllObjects => "cat-file --batch-all-objects",
             Self::RevListMissingPrint => "rev-list --missing=print",
             Self::FsckStrict => "fsck --strict",
+            Self::LsFilesStageZ => "ls-files --stage -z",
         }
     }
 }

@@ -1181,6 +1181,10 @@ fn a6_a7_and_a11d_use_exact_environment_argv_and_init_shape() {
                 "--no-progress",
             ],
         ),
+        (
+            GitCommandV1::LsFilesStageZ,
+            vec!["ls-files", "--stage", "-z"],
+        ),
     ];
     for (command, tail) in variants {
         let result = runner
@@ -2553,6 +2557,7 @@ fn w2_mutating_commands_refuse_a_caller_object_store_route() {
             false,
         ),
         (GitCommandV1::IndexPackStrictStdin, false),
+        (GitCommandV1::LsFilesStageZ, false),
         (GitCommandV1::CatFileBatchCheck, true),
         (GitCommandV1::PackObjectsStdout, true),
         (GitCommandV1::CatFileAllObjects, true),
@@ -2619,6 +2624,114 @@ fn w3_option_shaped_path_operands_are_refused_before_any_effect() {
     );
     assert!(!root.canonical_path().join("objects").exists());
     assert_eq!(sorted_entry_names(root.canonical_path()), entries_before);
+}
+
+/// ADR-0041 2B2b2b1 §2.1 and probe P1. `ls-files --stage -z` lists a copied index in a
+/// template-less bare probe, rooted at the pinned root with `GIT_DIR` set to the probe, under the
+/// unchanged closed environment. It reports a gitlink as mode `160000`, exits 0, and writes
+/// nothing, for both object formats.
+#[test]
+fn ls_files_stage_z_lists_a_copied_index_in_a_bare_probe_and_writes_nothing() {
+    for (format, format_name, hex_length) in [
+        (GitObjectFormatV1::Sha1, "sha1", 40),
+        (GitObjectFormatV1::Sha256, "sha256", 64),
+    ] {
+        let source = TempDir::new().unwrap();
+        let repo = source.path().join("repo");
+        let git = |arguments: &[&str]| {
+            let output = Command::new(system_git_route())
+                .arg("-C")
+                .arg(&repo)
+                .args(arguments)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{arguments:?}: {:?}",
+                output.stderr
+            );
+            String::from_utf8(output.stdout).unwrap()
+        };
+        fs::create_dir(&repo).unwrap();
+        git(&["init", "-q", &format!("--object-format={format_name}")]);
+        fs::write(repo.join("README"), b"probe\n").unwrap();
+        git(&["add", "README"]);
+        let blob = git(&["rev-parse", ":README"]).trim().to_owned();
+        git(&[
+            "update-index",
+            "--add",
+            "--cacheinfo",
+            &format!("160000,{blob},sub"),
+        ]);
+
+        let (_root_temp, root) = root_fixture();
+        let runner = system_runner(&root);
+        let names = GitRootNamesV1::new("home", "xdg", "index-probe.git").unwrap();
+        runner
+            .run(
+                &root,
+                &names,
+                request(
+                    GitCommandV1::InitBare {
+                        dir: "index-probe.git".into(),
+                        object_format: format,
+                    },
+                    vec![],
+                ),
+                || Ok(()),
+                || Ok(()),
+            )
+            .unwrap();
+        fs::copy(
+            repo.join(".git/index"),
+            root.canonical_path().join("index-probe.git/index"),
+        )
+        .unwrap();
+        let before = fixture_tree_digest(root.canonical_path());
+
+        let result = runner
+            .run(
+                &root,
+                &names,
+                request(GitCommandV1::LsFilesStageZ, vec![]),
+                || Ok(()),
+                || Ok(()),
+            )
+            .unwrap();
+        assert!(result.status.success());
+        assert_eq!(
+            result.evidence.environment.get("GIT_DIR"),
+            Some(&"index-probe.git".into())
+        );
+        assert!(!result
+            .evidence
+            .environment
+            .contains_key("GIT_OBJECT_DIRECTORY"));
+        assert_eq!(
+            result.evidence.argv[result.evidence.argv.len() - 3..],
+            ["ls-files", "--stage", "-z"]
+        );
+        let stdout = result.captured_stdout().unwrap();
+        let records = stdout
+            .split(|byte| *byte == 0)
+            .filter(|record| !record.is_empty())
+            .map(|record| String::from_utf8(record.to_vec()).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(stdout.last(), Some(&0));
+        assert_eq!(
+            records,
+            [
+                format!("100644 {blob} 0\tREADME"),
+                format!("160000 {blob} 0\tsub"),
+            ]
+        );
+        assert_eq!(blob.len(), hex_length);
+        assert_eq!(
+            fixture_tree_digest(root.canonical_path()),
+            before,
+            "the probe must write nothing"
+        );
+    }
 }
 
 fn sorted_entry_names(path: &Path) -> Vec<String> {
