@@ -1,7 +1,7 @@
 # ADR-0041 Slice 2B2b2b1 implementation handoff — the coverage plan
 
-**Status:** implemented in the container lane over three bridge turns. **This revision is the second repair turn's**
-(§0).
+**Status:** implemented in the container lane over four bridge turns. **This revision is repair round 1's** (§0.3),
+after the Sol implementation review's round 1.
 - **First turn.** It implemented the slice.
 - **Verify and review then rejected it:**
   - the workspace suite failed one `a2a-bridge` CLI control;
@@ -17,14 +17,23 @@
     §8 paths.
   - It **confirmed both failing CLI controls as inherited**, on the base commit's own binary. The timing control's
     exact failure reproduces deterministically there.
+- **The Sol implementation review, round 1, rejected the committed slice** (`92bc4a9f`):
+  - one WRONG MATERIAL blocker: `cargo-target-v1` excluded a root `target/` that is, or holds, the pinned git
+    directory;
+  - one MATERIAL SMELL, deferred and folded here: no control discriminated the object sentinel's entry budget.
+- **Repair round 1 (§0.3)** fixes the blocker with one precondition conjunct. It adds three controls and three matrix
+  rows.
 - **Now:**
-  - every §5 criterion has a control, and the **71** planner controls and the **26** runner controls pass;
-  - every guard's mutation turned its control red: the matrix defines **103** rows and ran all 103 on the final bytes
-    (snapshot `690f6c618bf6c58d`), **103 FLIPPED, 0 NOT-FLIPPED, 0 INADMISSIBLE**, and the source was then proved equal
-    to that snapshot.
-- Every planner control is red in at least one matrix row (§2).
-- **Every workspace gate is green on the final bytes** (§5). The two CLI flakes are inherited and outside this slice
-  (§0.1).
+  - every §5 criterion has a control, and the **74** planner controls and the **26** runner controls pass;
+  - the matrix defines **106** rows, and all of them still apply to the final bytes (`matrix.py check`: 0 problems);
+  - repair round 1 ran its **3 new rows and 17 related rows** in one foreground run on the final bytes (snapshot
+    `5a447c9bd94ad07f`): **20 FLIPPED, 0 NOT-FLIPPED, 0 INADMISSIBLE**. The source was then proved equal to that
+    snapshot;
+  - the other 86 rows last ran on the second repair turn's bytes (snapshot `690f6c618bf6c58d`, 103 FLIPPED). Those
+    bytes differ from the final ones only by this round's two edits.
+- Every planner control is red in at least one matrix row (§2, §0.3).
+- **The gates repair round 1 ran are green on the final bytes** (§0.3): fmt, clippy, the `bridge-core` lib suite, and
+  the workspace suite. The two CLI flakes are inherited and outside this slice (§0.1).
 - **Left to CI and the controller:** `cargo deny`, the native ext4 lane, and the macOS lane (§7).
 
 This handoff records evidence only; it claims no review approval.
@@ -133,6 +142,179 @@ proves both with `git rev-parse --absolute-git-dir`.
 **RED.** `M-gitfile-leading-dotdot` restores the first turn's behavior, refusing a leading `..` as every `..` was
 refused. It turns `separate_04` and `separate_05` red. `M-gitfile-inner-dotdot` admits an inner `..`, which accepts the
 decoy, and `M-gitfile-past-root` drops the climb-past-`/` refusal. All three FLIPPED.
+
+### 0.3 Repair round 1: the Sol implementation review, round 1
+
+The review rejected the committed slice (`92bc4a9f`) with one WRONG MATERIAL blocker and one MATERIAL SMELL marked
+DEFER. The controller verified both. This round fixes both; the SMELL is folded because it is a cheap, test-only
+change. Raw output for the round is in `.git/a2a-bridge/repair-1/`.
+
+#### Finding 1 (WRONG, MATERIAL, blocker): `cargo-target-v1` against a git directory at or beneath the root `target`
+
+**The finding.** The policy precondition checked for regular `Cargo.toml` and `Cargo.lock` files and a directory named
+`target`. It did not check where the pinned git directory is, and Git's supported `--separate-git-dir` can place it
+there:
+- **`--separate-git-dir=repo/target/.gd`:** the worktree walk skipped the whole root `target` before reaching `.gd`.
+  The plan labeled `target` reproducible though it holds the git directory, and it had no connector entry.
+- **`--separate-git-dir=repo/target`:** connector precedence emitted `target` as `IncludeEntryOnly`, but the skip
+  equation still expected one excluded entry. The valid clone was refused with `AccountingMismatch`.
+
+**RED.** Both controls were added first and run against HEAD's unchanged `custody_coverage.rs` (`red.txt`):
+- `cargo_05_a_separate_git_dir_that_is_the_root_target_is_its_connector` panicked with
+  `plan the source: AccountingMismatch { class: Worktree, expected: 1, observed: 0 }`.
+- `cargo_06_a_separate_git_dir_beneath_the_root_target_is_its_connector` planned, but its rows differ in exactly one
+  class. The plan has `ReproducibleOutputs { state: ExcludedReproducible, exclusion_id: Some("cargo-target-v1") }`,
+  and the control expects `Empty` with no exclusion id.
+
+**The fix: `git_dir_within_target`.** `observe_worktree` gains one precondition conjunct: the policy applies only if
+the pinned git directory is neither the root `target` nor beneath it.
+- **The test.** The git directory's canonical path must not start with the repository's canonical path joined with
+  `target`, compared component by component, so equality counts.
+- **Why a canonical prefix is containment.** Both paths are canonical, so neither holds a symlink, and a component
+  prefix is physical containment. The git directory's canonical path is the one its identity was recorded under. The
+  pre-write barrier, and every later fresh pin, prove it still resolves to the pinned `(dev, ino)` (§8, item 3).
+- **Reads and symlinks.** Nothing is stated or read by path, and no symlink is followed.
+- **The effect.** With the policy off, `target` is an ordinary directory, captured whole:
+  - the worktree walk emits the identity-keyed connector wherever the git directory is (`target` itself, or
+    `target/.gd`);
+  - the LFS detector descends `target` and prunes the connector by identity;
+  - the skip equation expects no skip;
+  - `reproducible_outputs` is `empty`, with no exclusion or dependency record.
+- **The only production change.** Every consumer reads the one `cargo_target_excluded` flag, so this conjunct is the
+  whole fix.
+
+**Controls.** Both use real fixtures from Git 2.54's `init --separate-git-dir`, with a root `Cargo.toml`, `Cargo.lock`,
+and `README` committed. Each requires:
+- a successful plan with the ordinary rows, `reproducible_outputs` `empty`, and no exclusion or dependency;
+- in the worktree frame, re-walked against its receipt, exactly one entry at the git directory's path, a directory,
+  with nothing beneath it;
+- the §5.4 multiset: every git-directory entry is owned exactly once, and only by a git-directory class.
+
+`cargo_05` also asserts that `target` has the git directory's identity. `cargo_06` also writes build output to
+`target/debug/` and requires it captured.
+
+Two fixture facts:
+- Git does not create a missing parent for `--separate-git-dir`, so the `target/.gd` fixture creates `target/` first,
+  as a Cargo build would.
+- Git lists its own separate directory as untracked content, so the fixture adds its files by name.
+
+**Interpretations to check.**
+- Containment is decided by canonical path, not by identity. A bind mount could make the root `target` the git
+  directory under another canonical path. The policy would then stay on, and the identity-keyed connector would fail
+  the skip equation: the plan is refused (`AccountingMismatch`), never falsely excluded.
+- A git directory reachable beneath `target` only through a symlink is not physically inside it. Excluding `target` is
+  then correct, and the worktree walk never follows the symlink.
+
+#### Finding 2 (SMELL, MATERIAL, DEFER, folded): the sentinel's entry budget had no discriminating control
+
+**The finding.** The object lock sentinel passes the caller's entry budget, and its `EntryLimit` maps to
+`object_database` `unresolved` (`ContentUnresolved`). The only low-budget control, `error_04`, is refused earlier by
+the census. So an unlimited sentinel budget left every control green.
+
+**The control: `detector_07_the_object_sentinel_walks_under_the_entry_budget`.**
+- **The fixture.** A README clone gains 64 loose objects, hashed by Git from files outside the worktree, so `objects/`
+  is wider than the census and every other walk.
+- **The count.** The sentinel includes every directory beneath `objects/`. So its emitting pass lists exactly the
+  entries an independent recursive `std::fs` listing counts; call that N.
+- **The bound.** At an entry budget of N, the plan has the ordinary rows. At N − 1, it has the ordinary rows except
+  `object_database`, which is `unresolved` (`ContentUnresolved`). The second plan also proves the census and every
+  other walk still fit.
+
+**RED.** The control passes on the unchanged code, as the review expected: the mapping was right by inspection, and
+there is no production fix. Its RED is the brief's own mutation, which replaces the sentinel's budget with `u64::MAX`.
+It ran before the blocker fix, on snapshot `396fc69d02f3173d` (`red-sentinel-budget.txt`). The N − 1 plan's
+`object_database` is then `Empty` where `Unresolved [ContentUnresolved]` is expected. (`cargo_05` and `cargo_06` also
+failed in that run, because the blocker was not yet fixed.)
+
+#### GREEN
+
+On the final bytes, the three controls pass, and so do the planner suite (**74/74**) and the runner suite (**26/26**)
+(`green.txt`).
+
+#### Mutations
+
+Three rows were added to `.git/a2a-bridge/mutation/matrix.py`. "Pure" means `probe_06_every…` and `runner_00`.
+
+| ID | § | Guard mutated | Named red | Named green | Verdict | Every failing control |
+|---|---|---|---|---|---|---|
+| M-target-git-dir | 3.2 | the conjunct becomes `&& true` | cargo_05, cargo_06 | pure | FLIPPED | cargo_05, cargo_06 |
+| M-target-git-dir-beneath | 3.2 | `starts_with(target)` narrows to `eq(&target)` | cargo_06 | cargo_05, pure | FLIPPED | cargo_06 |
+| M-sentinel-budget | 3.3 | the sentinel's `self.request.entry_budget` becomes `u64::MAX` | detector_07 | pure | FLIPPED | detector_07 |
+
+`M-target-git-dir-beneath` proves that the predicate's "beneath" half is discriminated on its own: an equality-only
+guard leaves `cargo_06` red and `cargo_05` green.
+
+**The final run.** One foreground `matrix.py run` of 20 rows, inside `timeout 590`, ran on snapshot
+`5a447c9bd94ad07f` (the final bytes) from 09:59:13Z to 10:04:07Z. All 20 FLIPPED. The rows:
+- **the 3 new rows** (above);
+- **the 4 rows whose targets lie in the changed `observe_worktree`:** `M-gitfile-check`, `M-target-policy`,
+  `M-cargo-rust-toolchain`, and `M-bare-distinct`;
+- **13 rows guarding the same policy flag's consumers, the connector, the skip equation, and the sentinel and
+  budget:** `M-target-kind`, `M-target-root-only`, `M-lfs-prune-target`, `M-lfs-prune-connector`,
+  `M-connector-descends`, `M-connector-by-path`, `M-cargo-content-class`, `M-cargo-digest`, `M-dependency-recheck`,
+  `M-equation-off`, `M-sentinel`, `M-sentinel-walk`, and `M-census-budget`.
+
+| ID (re-run) | Verdict | Every failing control |
+|---|---|---|
+| M-gitfile-check | FLIPPED | separate_02, separate_04 |
+| M-target-policy | FLIPPED | cargo_04 |
+| M-cargo-rust-toolchain | FLIPPED | cargo_01 |
+| M-bare-distinct | FLIPPED | bare_01 |
+| M-target-kind | FLIPPED | cargo_02 |
+| M-target-root-only | FLIPPED | cargo_03 |
+| M-lfs-prune-target | FLIPPED | detector_01 |
+| M-lfs-prune-connector | FLIPPED | detector_05 |
+| M-connector-descends | FLIPPED | cargo_01, cargo_02, cargo_03, **cargo_05**, **cargo_06**, class_local_01, completeness_01, **detector_07**, separate_01, skip_01 |
+| M-connector-by-path | FLIPPED | **cargo_05**, **cargo_06**, separate_01, separate_03 |
+| M-cargo-content-class | FLIPPED | cargo_01 |
+| M-cargo-digest | FLIPPED | cargo_01 |
+| M-dependency-recheck | FLIPPED | class_local_06 |
+| M-equation-off | FLIPPED | skip_01, skip_02, and the stray below |
+| M-sentinel | FLIPPED | detector_03 |
+| M-sentinel-walk | FLIPPED | bare_01, detector_03, **detector_07**, walks_01 |
+| M-census-budget | FLIPPED | error_04 |
+
+The bold controls are this round's; they also discriminate the connector rows and the sentinel-walk row.
+
+**Stray.** `M-equation-off` also failed the 2B2a runner control `a8_a8b_a9_a10_bound_streams…`, with
+`admit fixture: Spawn(Os { code: 26, kind: ExecutableFileBusy, message: "Text file busy" })`. That is the known
+`ETXTBSY` fixture race (§7, item 4), outside the row's guard.
+
+A trial run of `M-target-git-dir` and `M-target-git-dir-beneath` on the same snapshot, at 09:53Z, gave the same
+verdicts before the gates ran.
+
+**Source equals the snapshot:** yes.
+- **Harness:** the run ended with `VERIFY OK: 6 files equal their snapshot; no pending marker` (10:04:07Z).
+  - `matrix.log` has 531 `APPLIED` lines: the prior 508, one pre-fix RED run, two trial rows, and the 20 final rows.
+  - It has 535 `RESTORED` lines: 512 + 23.
+- **Independent check:** outside the harness, each live file's bytes equal its snapshot copy, and each SHA-256 prefix
+  equals the manifest:
+  - `custody_coverage.rs` `cff02247`, and `custody_coverage_tests.rs` `30106685`;
+  - `custody_git.rs` `71557e65`, and `custody_git_tests.rs` `0aae9351`;
+  - `custody_export.rs` `65d99c8e`, and `lib.rs` `3a15b090`.
+
+  `custody_coverage.rs` carries the restore's fresh mtime (10:04:07Z). No `pending.json` exists, and a `/proc` scan
+  found no cargo, rustc, test, or harness process left running.
+- **After the matrix:** no source file was edited. Only this handoff was written, together with the harness's rendered
+  `table.md`.
+
+#### Gates on the final bytes
+
+All gates below ran on snapshot `5a447c9bd94ad07f` before the final matrix run. The matrix restored those bytes
+exactly.
+
+| Gate | Exit | Totals |
+|---|---|---|
+| `cargo fmt --all -- --check` | 0 | no diff |
+| `cargo clippy --locked --offline --workspace --all-targets -- -D warnings` | 0 | no warning or error |
+| `cargo test --locked --offline -p bridge-core --lib --no-fail-fast` | 0 | **989 passed**, 0 failed, 0 ignored (986 at `92bc4a9f`, plus 3) |
+| `cargo test --locked --offline --workspace --no-fail-fast`, proxies unset | 0 | **4,734 passed**, 0 failed, 13 ignored, over the same 106 `test result` lines as §5 (4,731 plus 3) |
+
+- The `bridge-core` lib output also holds one `test result` line from a pre-existing `fs_custody` control, which
+  re-executes the test binary filtered to one test. The total above is the binary's own line.
+- The §5 workspace total counted that child line too, so both totals use the same method.
+- `cargo deny` stays excluded (§7, item 2).
+- The `--all-targets` workspace run and the hygiene check were not re-run this round.
 
 ## 1. Structural RED on the predecessor
 
@@ -356,10 +538,12 @@ controls in §3.1.
 | 6 | `detector_03` | `objects/info/commit-graph.lock` parks `object_database` (`WriterUncontrolled`) |
 | 6 | `detector_04`, `detector_05` | the detector prunes a nested `.git` (its `filter=lfs` is never read) and the in-worktree `.gd` by identity |
 | 6 | `detector_06` | a 1 MiB + 1 byte `.gitattributes` exceeds the sink, so the worktree is `unresolved`; 512 KiB does not |
+| 6 | `detector_07` (repair round 1) | with 64 extra loose objects, an entry budget of exactly the sentinel's independently counted N plans the ordinary rows; N − 1 leaves only `object_database` `unresolved` (`ContentUnresolved`) (§0.3) |
 | 7 | `skip_01` | an ordinary clone with a `README` and no attributes plans, with a complete multiset. As a negative control, the LFS detector's own receipt skips 2 and fails `require_class_skips(Worktree, 0, …)` |
 | 7 | `skip_02` | an `ORIG_HEAD` created after the census (seam) refuses `AccountingMismatch { class: Index }` |
 | 8 | `cargo_01` | the row, the exact `CustodyExclusionV1("cargo-target-v1", "reproducible_outputs", "cargo-target-v1", […])`, and the three `worktree-file` dependencies by SHA-256. `"reproducible_outputs"` is asserted equal to the serde wire name. The records assemble into a `CustodyManifestV1` that validates. The dependency files are in the worktree frame and `target` is not. Changing `Cargo.lock` changes only its digest |
 | 8 | `cargo_02`, `cargo_03`, `cargo_04` | a regular-file root `target` and a symlink root `target` are captured, with no records; a nested `target` is captured; with only `Cargo.toml`, the root `target` is ordinary content |
+| 8 | `cargo_05`, `cargo_06` (repair round 1) | a real `--separate-git-dir` at `repo/target`, and at `repo/target/.gd`, each plan with no `cargo-target-v1` record, one childless connector in the worktree frame, and the git directory's contents owned only by git-directory classes (§0.3) |
 | 9 | `objects_01` | an empty initialized repository is `empty`, and a one-object repository with that object in the inventory is `captured`. No receipt and no class walk ever names `object_database` |
 | 10 | `error_01`–`error_04` | `InvalidScratch` (non-empty, mode 0755, missing); `SourceRootDrift` (the worktree replaced after the barrier, caught by the fresh pin); `Io` (the census listing fails); a census over the entry budget leaves the ten census classes `unresolved` with no scratch write. `PlanningScratchBudget` is `ledger_02` and `ledger_03`; `AccountingMismatch` is `skip_02` |
 | 10 | `runner_00`–`runner_07` | the runner-failure table: every stage × every one of the 18 variants as a pure mapping (`runner_00`), then one control per distinct cell through the shared seam and real fixtures. The cells: the 14 infrastructure variants at each stage; admission's four child outcomes; `init`'s four and its nonzero exit; an `index` that is a symlink (copy open failure); the listing's four and a real timeout; and no index (no run, no write) |
@@ -368,6 +552,9 @@ controls in §3.1.
 | — | `bare_01` | a bare clone plans its git directory only, with no worktree or LFS walk |
 
 ## 5. Verification totals
+
+**Repair round 1's gates, on its final bytes, are in §0.3.** The table below is the second repair turn's run, kept as
+the baseline its totals are compared against.
 
 All gates ran on the second repair turn's final bytes (snapshot `690f6c618bf6c58d`, with `bin/` identical to the
 base), before its final matrix round, and no source byte changed afterwards. Raw output is in `.git/a2a-bridge/gates/`. Totals count every `test result` line.
@@ -398,8 +585,8 @@ The 13 ignored tests are the pre-existing live and e2e tests outside `bridge-cor
 - the full table in `table.md`, and the compact one below in `compact-table.md`.
 
 **Rules** (2B2b2a style):
-- A row applies only if each of its targets occurs exactly once in the snapshot. `matrix.py check` reports 103 rows,
-  93 composable, and 0 problems.
+- A row applies only if each of its targets occurs exactly once in the snapshot. On the final bytes, `matrix.py check`
+  reports 106 rows, 96 composable, 0 problems, and 100 controls (round 5: 103 rows, 93 composable).
 - A `pending.json` marker is written and `fsync`ed before a mutation is applied. It is removed only after:
   1. the source is rewritten from the snapshot and `fsync`ed;
   2. its mtime is refreshed with `os.utime` (now);
@@ -437,8 +624,12 @@ Anything else is `INADMISSIBLE` or `NOT-FLIPPED`.
 5. **Round 5, second repair turn, final** (snapshot `690f6c618bf6c58d`, 103 rows). The bytes are round 4's
    `bridge-core` bytes; only `main.rs` left the diff. **103 FLIPPED, 0 NOT-FLIPPED, 0 INADMISSIBLE, 0 not run**, then
    `red-all`: 93 composable rows applied, and 69 of 97 controls fail.
+6. **Round 6, repair round 1, final** (snapshot `5a447c9bd94ad07f`, 106 rows). It adds `M-target-git-dir`,
+   `M-target-git-dir-beneath`, and `M-sentinel-budget`, and re-runs the 17 related rows: **20 FLIPPED, 0 NOT-FLIPPED,
+   0 INADMISSIBLE**. The other 86 rows keep their round 5 verdicts. No `red-all` was run. The rows, the restore proof,
+   and the stray are in §0.3.
 
-**Source equals snapshot after the matrix:** yes.
+**Source equals snapshot after the matrix** (round 5; round 6's proof is in §0.3): yes.
 - **Harness:** the last call ended with `VERIFY OK: 6 files equal their snapshot; no pending marker` (09:13:24Z).
   `matrix.log` has 508 `APPLIED` lines (round 1: 97 rows, 1 rerun, and `red-all`; rounds 2–5: 100, 101, 104, and 104)
   and 512 `RESTORED` lines, because each `red-all` restores two files.
@@ -456,9 +647,10 @@ Anything else is `INADMISSIBLE` or `NOT-FLIPPED`.
 - `160000` ignored: `M-160000` and `M-gitlink-mark`;
 - the connector descending, or keyed by path: `M-connector-descends` and `M-connector-by-path`, with the gitfile rows
   `M-gitfile-check`, `M-gitfile-leading-dotdot`, `M-gitfile-inner-dotdot`, and `M-gitfile-past-root`;
-- the target kind check: `M-target-kind`;
+- the target kind check: `M-target-kind`, and the git-directory containment check, `M-target-git-dir` and
+  `M-target-git-dir-beneath` (repair round 1);
 - each detector's pruning: `M-lfs-prune-connector`, `-nested`, and `-target`;
-- the object sentinel: `M-sentinel` and `M-sentinel-walk`;
+- the object sentinel: `M-sentinel`, `M-sentinel-walk`, and its entry budget, `M-sentinel-budget` (repair round 1);
 - the class-skip equation off, or applied to detectors: `M-equation-off` and `M-equation-detectors`;
 - the error-versus-row mapping swapped: `M-error-row-walk`, `M-cell-parse`, and the six `M-cell-*` rows (one per
   §4.5 cell);
@@ -586,6 +778,9 @@ control; every one whose output survives was the same `ETXTBSY`.
 | M-dependency-recheck | 3.4 | a dependency changed after its capture is IdentityChanged | class_local_06 | FLIPPED | 1 |
 | M-git-lsfiles-route | 2.1 | ls-files --stage -z refuses a caller object-store route | w2_mutating | FLIPPED | 1 |
 | M-git-lsfiles-argv | 2.1 | the exact argv is ls-files --stage -z | a6_a7, ls_files_stage_z, probe_01 | FLIPPED | 34 |
+| M-target-git-dir (round 6) | 3.2 | cargo-target-v1 is off when the pinned git directory is, or is beneath, the root target | cargo_05, cargo_06 | FLIPPED | 2 |
+| M-target-git-dir-beneath (round 6) | 3.2 | a git directory strictly beneath the root target also turns the policy off | cargo_06 | FLIPPED | 1 |
+| M-sentinel-budget (round 6) | 3.3 | the object sentinel walks under the plan's entry budget | detector_07 | FLIPPED | 1 |
 
 ## 7. Exclusions and their mechanisms
 
@@ -653,10 +848,14 @@ control; every one whose output survives was the same `ETXTBSY`.
    `(dev, ino)` before any write and at every git-directory walk. No path is stated and no symlink is followed.
    - A gitfile path that reaches the git directory only through a symlink fails closed. Git would follow it, but
      following it is a §9 stop condition.
-4. **When `cargo-target-v1` applies.** It applies only when the root has regular `Cargo.toml` and `Cargo.lock` *and*
-   the root `target` is a directory, all observed at plan start. Otherwise `reproducible_outputs` is `empty`, with no
-   exclusion or dependency record, and a file or symlink `target` is captured.
-   - An exclusion of nothing would be a false claim.
+4. **When `cargo-target-v1` applies.** It applies only when all of these hold, observed at plan start:
+   - the root has regular `Cargo.toml` and `Cargo.lock` files;
+   - the root `target` is a directory;
+   - the pinned git directory is neither the root `target` nor beneath it, by canonical path (repair round 1, §0.3).
+
+   Otherwise `reproducible_outputs` is `empty`, with no exclusion or dependency record. A file or symlink `target`, or
+   a `target` that holds the git directory, is captured.
+   - An exclusion of nothing would be a false claim. So would an exclusion of the git directory's own metadata.
    - The same `is_excludable_target` is used at plan start and in both selections, so `M-target-kind` removes one guard.
 5. **A worktree park unresolves two rows:** the worktree (its walk stopped) and the class the park evidences.
    - `.gitmodules` and a nested `.git` evidence nested repositories.
@@ -732,16 +931,26 @@ crates/bridge-core/src/lib.rs                       (modified: the module declar
 docs/superpowers/reviews/2026-09-27-adr0041-slice2b2b2b1-implementation-handoff.md (new)
 ```
 
-Immediately before staging, each source file's SHA-256 still equaled the snapshot manifest (§6), and no
-`pending.json` existed. `git diff --cached --check` exits 0. Against the current `HEAD`, which carries the first repair
-turn's edit, `git status --short` also lists `bin/a2a-bridge/src/main.rs`, staged as its restoration to the base bytes.
-Against the base, the staged tree differs in exactly the paths above. Nothing is committed; the bridge folds the repair
-into the first turn's commit and keeps its message.
+**Repair round 1** stages exactly three owned paths against `HEAD` (`92bc4a9f`, the committed slice, whose `bin/` is
+already identical to the base):
+
+```text
+crates/bridge-core/src/custody_coverage.rs          (the git_dir_within_target conjunct and function)
+crates/bridge-core/src/custody_coverage_tests.rs    (cargo_05, cargo_06, detector_07, and their fixture helpers)
+docs/superpowers/reviews/2026-09-27-adr0041-slice2b2b2b1-implementation-handoff.md (this section, §0.3, and updates)
+```
+
+Immediately before staging, each source file's SHA-256 still equaled round 6's snapshot manifest (§0.3), and no
+`pending.json` existed. `git diff --cached --check` exits 0. Against the base, the staged tree still differs in exactly
+the seven §8 paths above. Nothing is committed, and no `.git/A2A_COMMIT_MSG` is written for this round.
 
 ## 10. What remains for the controller
 
-1. The implementation review, under the §10 two-round cap. It should check that §0.2's resolver closes the gitfile
-   finding, and that §0.1's reversion and inheritance evidence close the scope and red-gate findings.
+1. The Sol implementation review's round 2, the last under the §10 two-round cap. It should check that §0.3 closes
+   round 1's findings:
+   - the `target` containment conjunct closes the `cargo-target-v1` blocker, including its canonical-path
+     interpretation;
+   - `detector_07` and `M-sentinel-budget` close the sentinel-budget SMELL.
 2. The inherited CLI flakes (§0.1, §7, item 4) belong to the `a2a-bridge` CLI's owner. A verify run can still hit them,
    as it can on the base commit.
 3. The controller's macOS lane: the §7 gates on macOS.

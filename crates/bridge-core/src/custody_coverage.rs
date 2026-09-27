@@ -1185,7 +1185,8 @@ impl PlannerV1<'_> {
             .collect::<PlanResult<Vec<_>>>()?
             .iter()
             .all(regular)
-            && stat("target")?.is_some_and(|stat| is_excludable_target(&stat));
+            && stat("target")?.is_some_and(|stat| is_excludable_target(&stat))
+            && !git_dir_within_target(sources);
 
         let mut dependencies = Vec::new();
         if cargo_target_excluded {
@@ -1782,6 +1783,22 @@ fn gitfile_names_pinned_git_dir(sources: &CustodyCoverageSourcesV1) -> bool {
         Path::new(OsStr::from_bytes(target)),
     )
     .is_some_and(|resolved| resolved == sources.source_git_dir.canonical_path())
+}
+
+/// Whether the pinned git directory is the root `target` or lies beneath it, as Git's
+/// `--separate-git-dir` can place it. `cargo-target-v1` then does not apply: skipping `target`
+/// would drop the identity-keyed connector and call git metadata reproducible output, so `target`
+/// is captured like any other directory (review round 1).
+///
+/// Both paths are canonical and so hold no symlink, which makes a component prefix physical
+/// containment. The git directory's is the path its identity was recorded under (see
+/// [`gitfile_names_pinned_git_dir`]).
+fn git_dir_within_target(sources: &CustodyCoverageSourcesV1) -> bool {
+    let target = sources
+        .source_repository
+        .canonical_path()
+        .join(OsStr::from_bytes(CARGO_TARGET_NAME_V1));
+    sources.source_git_dir.canonical_path().starts_with(target)
 }
 
 /// Resolves a gitfile's `gitdir:` target the way Git does (relative to the directory holding the

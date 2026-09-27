@@ -2104,6 +2104,45 @@ fn detector_06_the_lfs_detector_sink_is_bounded_at_one_mebibyte() {
     );
 }
 
+/// Review round 1: the object lock sentinel walks under the plan's entry budget. A loose object
+/// store wider than the census and every other walk plans at exactly the sentinel's own entry
+/// count, and one entry less leaves only `object_database` unresolved.
+#[test]
+fn detector_07_the_object_sentinel_walks_under_the_entry_budget() {
+    let source = readme_clone();
+    // Sixty-four loose objects, hashed from files outside the worktree.
+    let blobs = source.area.join("blobs");
+    fs::create_dir(&blobs).unwrap();
+    let files: Vec<String> = (0..64)
+        .map(|index| {
+            let path = blobs.join(format!("blob-{index}"));
+            fs::write(&path, format!("loose object {index}\n")).unwrap();
+            path.to_str().unwrap().to_owned()
+        })
+        .collect();
+    let mut arguments = vec!["hash-object", "-w"];
+    arguments.extend(files.iter().map(String::as_str));
+    source.git(&arguments);
+    // The sentinel descends every directory below `objects/`, so it lists every entry there.
+    let sentinel_entries = listing(&source.objects(), None).len() as u64;
+    assert!(sentinel_entries > 64, "{sentinel_entries}");
+    let plan_within = |entry_budget: u64| {
+        let scratch = new_scratch();
+        let mut request = default_request(&source, scratch.path());
+        request.entry_budget = entry_budget;
+        plan_coverage_v1(&request).expect("an entry budget is class-local")
+    };
+    assert_rows(&plan_within(sentinel_entries), &ordinary_rows());
+    // The census and every other walk still fit; only the sentinel is refused.
+    assert_rows(
+        &plan_within(sentinel_entries - 1),
+        &with_rows(&[unresolved(
+            Class::ObjectDatabase,
+            &[Reason::ContentUnresolved],
+        )]),
+    );
+}
+
 // ---------------------------------------------------------------------------------------------
 // §5.7 Class-skip accounting
 // ---------------------------------------------------------------------------------------------
@@ -2295,6 +2334,98 @@ fn cargo_04_without_both_cargo_files_a_root_target_is_ordinary_content() {
     assert!(plan.exclusions().is_empty());
     let frame = paths(&rewalk_worktree(&source, false, None));
     assert!(frame.contains(&"target/debug/out".to_owned()));
+}
+
+/// Review round 1: a Cargo worktree whose git directory Git's `--separate-git-dir` placed at
+/// `repo/<git_dir>`, the root `target` itself or a directory beneath it.
+fn cargo_separate_git_dir_source(git_dir: &str) -> SourceV1 {
+    let area = TempDir::new().unwrap();
+    let area_path = area.path().canonicalize().unwrap();
+    let worktree = area_path.join("repo");
+    let separate = worktree.join(git_dir);
+    // Git creates the separate directory, but not its parent.
+    fs::create_dir_all(separate.parent().unwrap()).unwrap();
+    git(
+        &area_path,
+        &[
+            "init",
+            "-q",
+            &format!("--separate-git-dir={}", separate.display()),
+            worktree.to_str().unwrap(),
+        ],
+    );
+    let source = SourceV1 {
+        worktree,
+        git_dir: separate,
+        area: area_path,
+        _area: area,
+    };
+    source.write("README", b"separate\n");
+    source.write("Cargo.toml", b"[package]\nname = \"fixture\"\n");
+    source.write("Cargo.lock", b"version = 4\n");
+    source.git(&["add", "README", "Cargo.toml", "Cargo.lock"]);
+    source.git(&["commit", "-q", "-m", "init"]);
+    assert!(source.at(".git").is_file() && source.at("target").is_dir());
+    source
+}
+
+/// The plan succeeds with no `cargo-target-v1` record, the pinned git directory at `git_dir` is
+/// the worktree frame's one childless connector, and every git-directory entry is owned by a
+/// git-directory class alone. Returns the worktree frame's paths.
+fn assert_target_git_dir_is_the_connector(source: &SourceV1, git_dir: &str) -> Vec<String> {
+    let plan = plan_source(source);
+    assert_rows(&plan, &source_rows(source, &[]));
+    assert!(plan.exclusions().is_empty() && plan.dependencies().is_empty());
+    let frame = rewalk_worktree(source, false, Some(&receipt(&plan, Class::Worktree)));
+    let connector: Vec<_> = frame
+        .iter()
+        .filter(|(path, _)| path.as_slice() == git_dir.as_bytes())
+        .collect();
+    assert_eq!(
+        connector,
+        [&(git_dir.as_bytes().to_vec(), 'd')],
+        "{frame:?}"
+    );
+    let beneath = format!("{git_dir}/");
+    assert!(
+        !frame
+            .iter()
+            .any(|(path, _)| path.starts_with(beneath.as_bytes())),
+        "{frame:?}"
+    );
+    assert_complete_multiset(source, &plan, false);
+    paths(&frame)
+}
+
+/// Review round 1: `--separate-git-dir=repo/target` makes the root `target` the pinned git
+/// directory. It is the worktree's connector, so `cargo-target-v1` does not apply, and the valid
+/// clone plans instead of failing the class-skip equation.
+#[test]
+fn cargo_05_a_separate_git_dir_that_is_the_root_target_is_its_connector() {
+    let source = cargo_separate_git_dir_source("target");
+    assert_eq!(identity(&source.at("target")), identity(&source.git_dir));
+    let frame = assert_target_git_dir_is_the_connector(&source, "target");
+    for name in ["Cargo.toml", "Cargo.lock", ".git"] {
+        assert!(frame.contains(&name.to_owned()), "{name}");
+    }
+}
+
+/// Review round 1: `--separate-git-dir=repo/target/.gd` puts the pinned git directory beneath the
+/// root `target`. Excluding `target` would drop the connector and call git metadata reproducible
+/// output, so `target` and its build output are captured and `.gd` is the connector.
+#[test]
+fn cargo_06_a_separate_git_dir_beneath_the_root_target_is_its_connector() {
+    let source = cargo_separate_git_dir_source("target/.gd");
+    source.write("target/debug/build.bin", b"reproducible");
+    let frame = assert_target_git_dir_is_the_connector(&source, "target/.gd");
+    for name in [
+        "Cargo.toml",
+        "Cargo.lock",
+        "target",
+        "target/debug/build.bin",
+    ] {
+        assert!(frame.contains(&name.to_owned()), "{name}");
+    }
 }
 
 /// A bare source's repository root is its git directory: there is no worktree walk, no LFS
