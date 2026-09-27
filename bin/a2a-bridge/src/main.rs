@@ -10318,7 +10318,7 @@ mod cli_tests {
     /// code under test executes it. One exec that is not refused proves no writer remains, and none
     /// can appear later: the script is never opened for writing again.
     #[cfg(unix)]
-    fn warm_up_script(path: &Path) {
+    pub(crate) fn warm_up_script(path: &Path) {
         retry_on_text_file_busy(50, std::time::Duration::from_millis(10), || {
             std::process::Command::new(path).output()
         })

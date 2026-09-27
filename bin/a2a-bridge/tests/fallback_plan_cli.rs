@@ -1284,6 +1284,10 @@ fn guarded_host_smoke_never_invokes_the_degraded_container_runtime() {
     let mut permissions = fs::metadata(&runtime).unwrap().permissions();
     permissions.set_mode(0o755);
     fs::set_permissions(&runtime, permissions).unwrap();
+    // Without the warm-up an `ETXTBSY` exec refusal would leave the marker absent even if the
+    // runtime were invoked, a false green.
+    text_file_busy::warm_up_script(&runtime);
+    fs::remove_file(&runtime_marker).expect("the warm-up marker");
     let config = dir.path().join("guarded-host.toml");
     fs::write(
         &config,

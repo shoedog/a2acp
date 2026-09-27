@@ -1252,6 +1252,33 @@ mod tests {
         .expect("warm-up exec of the fake runtime");
     }
 
+    /// Linux regression control for [`warm_up_runtime`]: hold a writable descriptor on a
+    /// just-written fake runtime, the way a concurrently forked child does, and release it from a
+    /// detached thread only after 100 ms. Nothing waits for that release except the warm-up's
+    /// bounded retry, so without the warm-up the production call that follows meets the held
+    /// writer and its spawn is refused. macOS executes a written `#!` script even while a writer
+    /// is held, so nothing is held there.
+    #[cfg(target_os = "linux")]
+    fn hold_writer_briefly(path: &std::path::Path) {
+        let writer = std::fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .expect("hold a writer on the fake runtime");
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            drop(writer);
+        });
+    }
+
+    /// Warm up a just-written fake runtime; on Linux, first hold a writer that only the warm-up's
+    /// bounded retry can outlast (see [`hold_writer_briefly`]).
+    #[cfg(unix)]
+    fn warm_up_runtime_through_a_held_writer(path: &std::path::Path) {
+        #[cfg(target_os = "linux")]
+        hold_writer_briefly(path);
+        warm_up_runtime(path);
+    }
+
     #[cfg(unix)]
     async fn production_runtime_fixture_permit() -> tokio::sync::SemaphorePermit<'static> {
         PRODUCTION_RUNTIME_FIXTURE_PERMIT
@@ -1564,17 +1591,24 @@ mod tests {
             ContainerStartState::Unknown
         );
 
+        // The no-argument branch is the side-effect-free warm-up. The probe's own invocation
+        // records that it started, then blocks until released, so only the timeout can end the
+        // probe. A refused spawn also returns `Unknown`, but never records a start.
         let hung_runtime = temp.path().join("hung-runtime");
         let marker = temp.path().join("late-side-effect");
+        let started = temp.path().join("late-side-effect.started");
+        let release = temp.path().join("late-side-effect.release");
         std::fs::write(
             &hung_runtime,
-            "#!/bin/sh\nsleep 0.25\nprintf reached > \"$5\"\nprintf running\n",
+            "#!/bin/sh\n[ \"$#\" -eq 0 ] && exit 0\n: > \"$5.started\"\nwhile [ ! -e \"$5.release\" ]; do sleep 0.01; done\nprintf reached > \"$5\"\nprintf running\n",
         )
         .unwrap();
         let mut permissions = std::fs::metadata(&hung_runtime).unwrap().permissions();
         permissions.set_mode(0o755);
         std::fs::set_permissions(&hung_runtime, permissions).unwrap();
-        let probe = production_start_probe(Duration::from_millis(20));
+        warm_up_runtime_through_a_held_writer(&hung_runtime);
+        // Long enough for the started child to record its start before the timeout kills it.
+        let probe = production_start_probe(Duration::from_secs(1));
         assert_eq!(
             probe(
                 hung_runtime.to_string_lossy().into_owned(),
@@ -1583,6 +1617,12 @@ mod tests {
             .await,
             ContainerStartState::Unknown
         );
+        assert!(
+            started.exists(),
+            "the timed-out probe must have started the runtime, not failed to spawn it"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        std::fs::write(release, b"release").unwrap();
         tokio::time::sleep(Duration::from_millis(350)).await;
         assert!(
             !marker.exists(),
@@ -1854,12 +1894,15 @@ mod tests {
         let release = temp.path().join("late-side-effect.release");
         std::fs::write(
             &runtime,
-            "#!/bin/sh\nwhile [ ! -e \"$5.release\" ]; do sleep 0.01; done\nprintf reached > \"$5\"\n",
+            "#!/bin/sh\n[ \"$#\" -eq 0 ] && exit 0\nwhile [ ! -e \"$5.release\" ]; do sleep 0.01; done\nprintf reached > \"$5\"\n",
         )
         .unwrap();
         let mut permissions = std::fs::metadata(&runtime).unwrap().permissions();
         permissions.set_mode(0o755);
         std::fs::set_permissions(&runtime, permissions).unwrap();
+        // The no-argument branch is the side-effect-free warm-up. A refused spawn would surface as
+        // `Spawn`, not the `Timeout` this control requires.
+        warm_up_runtime_through_a_held_writer(&runtime);
 
         let controller = ReapController::production_with_timeout(
             runtime.to_string_lossy(),

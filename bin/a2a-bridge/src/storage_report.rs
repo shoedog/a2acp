@@ -3059,6 +3059,10 @@ mod tests {
         {
             use std::os::unix::fs::PermissionsExt as _;
             std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+            // Without the warm-up an `ETXTBSY` exec refusal would leave the witness absent even
+            // if the audit did run the hook, a false green.
+            crate::cli_tests::warm_up_script(&hook);
+            std::fs::remove_file(&witness).expect("the warm-up witness");
         }
         git(
             &clone,

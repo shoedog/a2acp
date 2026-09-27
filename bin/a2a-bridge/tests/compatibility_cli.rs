@@ -5,8 +5,6 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-// Only the Linux-only descriptor-report control executes a script this file writes.
-#[cfg(target_os = "linux")]
 mod text_file_busy;
 
 #[test]
@@ -84,6 +82,10 @@ fn schedule_tick_is_recognized_but_refuses_before_provider_capable_spawn() {
     let trap = directory.path().join("codex");
     fs::write(&trap, format!("#!/bin/sh\n: > {:?}\nexit 99\n", marker)).unwrap();
     fs::set_permissions(&trap, fs::Permissions::from_mode(0o700)).unwrap();
+    // Without the warm-up an `ETXTBSY` exec refusal would leave the marker absent even if the
+    // trap were spawned, a false green.
+    text_file_busy::warm_up_script(&trap);
+    fs::remove_file(&marker).expect("the warm-up marker");
 
     let output = Command::new(env!("CARGO_BIN_EXE_a2a-bridge"))
         .arg("compatibility")
@@ -109,6 +111,10 @@ fn schedule_tick_rejects_all_source_arguments_without_inspecting_them() {
     let trap = directory.path().join("codex");
     fs::write(&trap, format!("#!/bin/sh\n: > {:?}\nexit 99\n", marker)).unwrap();
     fs::set_permissions(&trap, fs::Permissions::from_mode(0o700)).unwrap();
+    // Without the warm-up an `ETXTBSY` exec refusal would leave the marker absent even if the
+    // trap were spawned, a false green.
+    text_file_busy::warm_up_script(&trap);
+    fs::remove_file(&marker).expect("the warm-up marker");
     let untrusted_source = directory.path().join("must-not-be-read-or-reported");
 
     let output = Command::new(env!("CARGO_BIN_EXE_a2a-bridge"))
