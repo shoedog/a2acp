@@ -10289,6 +10289,72 @@ mod cli_tests {
     use crate::turn::TurnRunner;
     use bridge_core::ports::RichEventSinkFactory as _;
 
+    /// Retry `operation` while it fails with `ETXTBSY`, up to 50 attempts 10 ms apart; any other
+    /// outcome, or the last `ETXTBSY`, is returned unchanged. A test-only copy of `bridge-core`'s
+    /// helper: a test that writes a script races every other test thread's fork, because a child
+    /// forked while the write descriptor is open keeps a writable duplicate until its own exec, and
+    /// the kernel refuses to exec the script meanwhile. The window closes by itself.
+    fn retry_on_text_file_busy<T>(
+        attempts: u32,
+        pause: std::time::Duration,
+        mut operation: impl FnMut() -> std::io::Result<T>,
+    ) -> std::io::Result<T> {
+        let mut attempt = 1;
+        loop {
+            match operation() {
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::ExecutableFileBusy
+                        && attempt < attempts =>
+                {
+                    attempt += 1;
+                    std::thread::sleep(pause);
+                }
+                outcome => return outcome,
+            }
+        }
+    }
+
+    /// Execute a just-written script once with no arguments, retrying `ETXTBSY`, before production
+    /// code under test executes it. One exec that is not refused proves no writer remains, and none
+    /// can appear later: the script is never opened for writing again.
+    #[cfg(unix)]
+    fn warm_up_script(path: &Path) {
+        retry_on_text_file_busy(50, std::time::Duration::from_millis(10), || {
+            std::process::Command::new(path).output()
+        })
+        .expect("warm-up exec of the written script");
+    }
+
+    #[test]
+    fn text_file_busy_retry_is_bounded_and_retries_only_etxtbsy() {
+        use std::io::{Error, ErrorKind};
+        let zero = std::time::Duration::ZERO;
+        let mut calls = 0;
+        let outcome = retry_on_text_file_busy(50, zero, || {
+            calls += 1;
+            if calls <= 3 {
+                Err(Error::from(ErrorKind::ExecutableFileBusy))
+            } else {
+                Ok(calls)
+            }
+        });
+        assert_eq!(outcome.unwrap(), 4);
+        let mut calls = 0;
+        let outcome: std::io::Result<()> = retry_on_text_file_busy(7, zero, || {
+            calls += 1;
+            Err(Error::from(ErrorKind::ExecutableFileBusy))
+        });
+        assert_eq!(outcome.unwrap_err().kind(), ErrorKind::ExecutableFileBusy);
+        assert_eq!(calls, 7);
+        let mut calls = 0;
+        let outcome: std::io::Result<()> = retry_on_text_file_busy(50, zero, || {
+            calls += 1;
+            Err(Error::from(ErrorKind::PermissionDenied))
+        });
+        assert_eq!(outcome.unwrap_err().kind(), ErrorKind::PermissionDenied);
+        assert_eq!(calls, 1);
+    }
+
     #[test]
     fn implement_attempt_telemetry_forwards_its_factory_clock() {
         let telemetry = ImplementAttemptTelemetry::new("implement-clock-identity");
@@ -10521,6 +10587,7 @@ mod cli_tests {
         let mut permissions = std::fs::metadata(&runtime).unwrap().permissions();
         permissions.set_mode(0o755);
         std::fs::set_permissions(&runtime, permissions).unwrap();
+        warm_up_script(&runtime);
 
         let authority =
             operator_test_authority(runtime.to_string_lossy().into_owned(), "immutable-id");
@@ -10547,6 +10614,7 @@ mod cli_tests {
         let mut permissions = std::fs::metadata(&runtime).unwrap().permissions();
         permissions.set_mode(0o755);
         std::fs::set_permissions(&runtime, permissions).unwrap();
+        warm_up_script(&runtime);
 
         let authority = operator_test_authority(runtime.to_string_lossy().into_owned(), "old-id");
         assert!(!operator_remove_container(&authority));
@@ -10572,6 +10640,7 @@ mod cli_tests {
         let mut permissions = std::fs::metadata(&runtime).unwrap().permissions();
         permissions.set_mode(0o755);
         std::fs::set_permissions(&runtime, permissions).unwrap();
+        warm_up_script(&runtime);
 
         let authority =
             operator_test_authority(runtime.to_string_lossy().into_owned(), "immutable-id");
@@ -12360,6 +12429,8 @@ inputs = []
         let mut permissions = std::fs::metadata(&adapter).unwrap().permissions();
         permissions.set_mode(0o755);
         std::fs::set_permissions(&adapter, permissions).unwrap();
+        warm_up_script(&adapter);
+        std::fs::remove_file(&argv_log).expect("the warm-up argv log");
 
         let mut entry = acp_entry("guarded-codex");
         entry.cmd = Some(adapter.to_string_lossy().into_owned());

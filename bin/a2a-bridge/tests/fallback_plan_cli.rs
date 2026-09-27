@@ -3,6 +3,8 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+mod text_file_busy;
+
 fn fixture() -> (tempfile::TempDir, PathBuf, PathBuf, PathBuf) {
     let dir = tempfile::tempdir().unwrap();
     let marker = dir.path().join("spawned");
@@ -19,6 +21,9 @@ fn fixture() -> (tempfile::TempDir, PathBuf, PathBuf, PathBuf) {
     let mut permissions = fs::metadata(&adapter).unwrap().permissions();
     permissions.set_mode(0o755);
     fs::set_permissions(&adapter, permissions).unwrap();
+    text_file_busy::warm_up_script(&adapter);
+    fs::remove_file(&marker).expect("the warm-up marker");
+    fs::remove_file(&cwd_marker).expect("the warm-up cwd marker");
 
     let repo = dir.path().join("owned repo");
     fs::create_dir(&repo).unwrap();

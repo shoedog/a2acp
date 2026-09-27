@@ -5,6 +5,10 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+// Only the Linux-only descriptor-report control executes a script this file writes.
+#[cfg(target_os = "linux")]
+mod text_file_busy;
+
 #[test]
 fn top_level_help_discovers_the_read_only_schedule_status_surface() {
     let output = Command::new(env!("CARGO_BIN_EXE_a2a-bridge"))
@@ -1047,6 +1051,8 @@ fn compatibility_child_closes_staged_capabilities_before_provider_spawn() {
     let mut permissions = fs::metadata(&adapter).unwrap().permissions();
     permissions.set_mode(0o755);
     fs::set_permissions(&adapter, permissions).unwrap();
+    text_file_busy::warm_up_script(&adapter);
+    fs::remove_file(&report).expect("the warm-up descriptor report");
 
     let config = dir.path().join("a2a-bridge.toml");
     fs::write(

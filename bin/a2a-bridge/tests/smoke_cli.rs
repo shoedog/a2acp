@@ -4,6 +4,8 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+mod text_file_busy;
+
 fn marker_fixture() -> (tempfile::TempDir, PathBuf, PathBuf) {
     let dir = tempfile::tempdir().unwrap();
     let marker = dir.path().join("spawned");
@@ -16,6 +18,8 @@ fn marker_fixture() -> (tempfile::TempDir, PathBuf, PathBuf) {
     let mut permissions = fs::metadata(&adapter).unwrap().permissions();
     permissions.set_mode(0o755);
     fs::set_permissions(&adapter, permissions).unwrap();
+    text_file_busy::warm_up_script(&adapter);
+    fs::remove_file(&marker).expect("the warm-up marker");
 
     let config = dir.path().join("a2a-bridge.toml");
     fs::write(
@@ -56,6 +60,8 @@ fn claude_oauth_fixture(
     let mut permissions = fs::metadata(&adapter).unwrap().permissions();
     permissions.set_mode(0o755);
     fs::set_permissions(&adapter, permissions).unwrap();
+    text_file_busy::warm_up_script(&adapter);
+    fs::remove_file(&marker).expect("the warm-up marker");
 
     let home = dir.path().join("home");
     fs::create_dir_all(home.join(".claude")).unwrap();
@@ -110,7 +116,9 @@ fn delayed_recovery_fixture() -> (tempfile::TempDir, PathBuf, PathBuf, PathBuf) 
         let mut permissions = fs::metadata(executable).unwrap().permissions();
         permissions.set_mode(0o755);
         fs::set_permissions(executable, permissions).unwrap();
+        text_file_busy::warm_up_script(executable);
     }
+    fs::remove_file(&marker).expect("the warm-up marker");
 
     let config = dir.path().join("a2a-bridge.toml");
     fs::write(

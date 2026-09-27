@@ -8,6 +8,8 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
+mod text_file_busy;
+
 fn write_config(path: &Path, body: &str) {
     fs::write(path, body).expect("write models test config");
 }
@@ -36,6 +38,7 @@ fn executable(path: &Path, body: &str) {
     let mut permissions = fs::metadata(path).unwrap().permissions();
     permissions.set_mode(0o755);
     fs::set_permissions(path, permissions).unwrap();
+    text_file_busy::warm_up_script(path);
 }
 
 fn serve_one_response(

@@ -17,6 +17,8 @@ use std::path::PathBuf;
 use std::process::Command;
 use tempfile::tempdir;
 
+mod text_file_busy;
+
 // The parse helper and cmd are private to main.rs; we test through a re-exported
 // helper (or via the binary's public test surface — the bin crate exposes nothing
 // for test, so we inline equivalent logic here that mirrors what the subcommand does).
@@ -279,6 +281,7 @@ done
     let mut permissions = fs::metadata(&adapter).unwrap().permissions();
     permissions.set_mode(0o755);
     fs::set_permissions(&adapter, permissions).unwrap();
+    text_file_busy::warm_up_script(&adapter);
 
     let prompt = directory.path().join("prompt.md");
     fs::write(&prompt, "{{input}}").unwrap();

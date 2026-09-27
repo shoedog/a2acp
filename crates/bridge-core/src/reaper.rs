@@ -1241,6 +1241,17 @@ mod tests {
     static PRODUCTION_RUNTIME_FIXTURE_PERMIT: tokio::sync::Semaphore =
         tokio::sync::Semaphore::const_new(1);
 
+    /// Execute a just-written fake runtime once with no arguments, retrying the `ETXTBSY`
+    /// fork/exec race (see `custody_git_tests::retry_on_text_file_busy`), before the production
+    /// controller under test executes it. One exec that is not refused proves no writer remains.
+    #[cfg(unix)]
+    fn warm_up_runtime(path: &std::path::Path) {
+        crate::custody_git_tests::retry_on_text_file_busy(|| {
+            std::process::Command::new(path).output()
+        })
+        .expect("warm-up exec of the fake runtime");
+    }
+
     #[cfg(unix)]
     async fn production_runtime_fixture_permit() -> tokio::sync::SemaphorePermit<'static> {
         PRODUCTION_RUNTIME_FIXTURE_PERMIT
@@ -1530,6 +1541,7 @@ mod tests {
         let mut permissions = std::fs::metadata(&runtime).unwrap().permissions();
         permissions.set_mode(0o755);
         std::fs::set_permissions(&runtime, permissions).unwrap();
+        warm_up_runtime(&runtime);
         // Match the production bound for ordinary exact-status observations. The separate hung-runtime
         // control below keeps its deliberately short timeout and proves cancellation independently.
         let probe = production_start_probe(CONTAINER_START_PROBE_TIMEOUT);
@@ -1599,6 +1611,7 @@ mod tests {
         let mut permissions = std::fs::metadata(&runtime).unwrap().permissions();
         permissions.set_mode(0o755);
         std::fs::set_permissions(&runtime, permissions).unwrap();
+        warm_up_runtime(&runtime);
 
         let runtime = runtime.to_string_lossy().into_owned();
         let probe = production_start_probe(SUCCESSFUL_RUNTIME_TEST_TIMEOUT);
@@ -1629,6 +1642,7 @@ mod tests {
             let mut permissions = std::fs::metadata(&runtime).unwrap().permissions();
             permissions.set_mode(0o755);
             std::fs::set_permissions(&runtime, permissions).unwrap();
+            warm_up_runtime(&runtime);
 
             let controller = ReapController::production_with_timeout(
                 runtime.to_string_lossy(),
@@ -1659,6 +1673,7 @@ mod tests {
         let mut permissions = std::fs::metadata(&runtime).unwrap().permissions();
         permissions.set_mode(0o755);
         std::fs::set_permissions(&runtime, permissions).unwrap();
+        warm_up_runtime(&runtime);
 
         let controller = ReapController::production_with_timeout(
             runtime.to_string_lossy(),
@@ -1693,6 +1708,7 @@ mod tests {
         let mut permissions = std::fs::metadata(&runtime).unwrap().permissions();
         permissions.set_mode(0o755);
         std::fs::set_permissions(&runtime, permissions).unwrap();
+        warm_up_runtime(&runtime);
 
         let controller = ReapController::production_with_timeout(
             runtime.to_string_lossy(),
