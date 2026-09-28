@@ -16,6 +16,8 @@
   - Workspace `--all-targets`: **4,833** passed, 0 failed, 13 ignored.
   - Workspace default (with doctests): **4,844** passed, 0 failed, 13 ignored. The new visibility doctest passes.
 - **Excluded here:** `cargo deny` (not installed), the controller's macOS lane, and CI's native ext4 lane (§6).
+- **Repair round 1 (§10)** closes blocker B1 of the Sol implementation review, round 1. Its snapshot, matrix rows, and
+  totals supersede the ones above for the final bytes.
 
 This handoff records evidence only; it claims no review approval.
 
@@ -473,3 +475,165 @@ Immediately before staging, every source file's SHA-256 still equaled the final 
 4. 2B3b (the Git plane), which consumes `VerifiedCapsuleV1`: `IndexPackStrictStdin` on the staged pack and 2B2's
    closure proof.
 5. The parent plan, the roadmap, and the planning handoff, which the controller alone updates.
+
+## 10. Repair round 1 (Sol implementation review, round 1)
+
+The review's verdict was **REJECT**, with one blocker. This round fixes that blocker only, inside the task's Files
+paths. Every result below is on the final bytes, snapshot `3e60cf312cf06e7c`. Raw output is in
+`.git/a2a-bridge/red/repair1-*` and `.git/a2a-bridge/gates/repair1-*`.
+
+### 10.1 Finding B1 (WRONG MATERIAL): the final gate did not revalidate the destination's identity
+
+- The only check before `Ok(VerifiedCapsuleV1)` was `destination.recheck_containment()`, which is the mount census
+  alone.
+- `stage_one_v1` rechecks the staging chain before `BeforeLeafCreate`. It then creates the leaf through the retained
+  parent descriptor, and the frame is verified through retained descriptors.
+- **The failure case.** During the last indexed artifact's `BeforeLeafCreate`, a racer renames either the destination
+  root or that artifact's retained parent staging directory out of the destination, and puts an empty directory at the
+  name. The restore still returned `Ok`, although the named destination was incomplete.
+- The existing `shared_staging_directory_custody` swap is caught only because a later staging call rechecks. No check
+  follows the last one.
+- §7 item 9 described this gap as the intended design. §10.3 supersedes it.
+
+### 10.2 RED
+
+| Stage | Reader under test | Controls run | Result |
+|---|---|---|---|
+| A (`repair1-red-a.txt`) | exactly `7e63ed8d`'s `custody_restore.rs` (SHA-256 `4cebbe9b…`); only the tests changed | the root swap, the staging-parent swap, and the no-swap control | root swap FAILED and parent swap FAILED, each `observed Ok("VerifiedCapsuleV1")`; no-swap ok. 1 passed, 2 failed |
+| B (`repair1-red-b.txt`) | `7e63ed8d` plus only the `#[cfg(test)]` hook point `BeforeFinalGate` (`repair1-red-b-seam.diff`, 7 added lines) | adds the `.restore-work` swap | all three swap controls FAILED with `observed Ok("VerifiedCapsuleV1")`; no-swap ok. 1 passed, 3 failed |
+| Final tests (`repair1-red-final-tests.txt`) | the stage B reader (`c73dadb9…`), swapped in temporarily, then restored to the fixed reader (`320c9065…`) and checked by hash | the final test bytes | the same: 3 FAILED with `observed Ok("VerifiedCapsuleV1")`, no-swap ok |
+
+- **Why the final-tests row exists.** After stage B, each refusal assertion was tightened to name the check that must
+  fire. On the RED reader, each still observes `Ok`.
+- **Why the third control needed a new hook point.** The existing hook points (`AfterCiphertextVerification`,
+  `BeforeFirstCreate`, and `BeforeLeafCreate`) all run before the last frame verification.
+  - The census seam's second call does run later, but it is inside the gate. The brief's order runs it after the
+    identity checks, so a swap there would come after them.
+  - So one test-only hook point, `BeforeFinalGate`, was added. It runs after the frame loop and immediately before the
+    gate. It is compiled only under `#[cfg(test)]` and has no effect outside tests.
+
+### 10.3 Fix (`custody_restore.rs`, private)
+
+A new method, `RestoreDestinationV1::final_gate(&self)`, is called only from `verify_and_stage_v1`, in place of the
+bare `recheck_containment()` call. It runs three checks in order:
+1. **The root pin.** `pinned_root_unchanged(&self.root)` requires the destination's name to still resolve to its
+   pinned identity; otherwise `IdentityChanged`.
+2. **The staging chains.**
+   - First, `recheck_staging_chain(b"")` checks `.restore-work/` against the root's entry, and `plain/` against
+     `.restore-work/`'s entry.
+   - Then `recheck_staging_chain(key)` runs for every retained staging key. It checks each component against its
+     parent's no-follow entry: it must be a directory with the retained `dev` and `ino`, otherwise `IdentityChanged`.
+3. **The census.** `recheck_containment()` runs last, unchanged. So "`recheck_containment()` runs before
+   `VerifiedCapsuleV1` is returned" (task 6 step 4) still holds.
+
+Notes on the fix:
+- A swap during frame verification is closed by the same gate, because the gate runs only after every frame is
+  verified. The `.restore-work` control swaps at the latest point of that window.
+- No existing check changed, and no error variant was added.
+- **The empty-key call.** In every reachable state at least `control/` is retained, and every key's chain starts at
+  `.restore-work/` and `plain/`. So the empty-key call is redundant there. It guarantees that those two are rechecked
+  even if no staging directory were retained. The matrix row mutates the call and the loop as one unit.
+
+### 10.4 Controls (4 new, in `custody_restore::tests`)
+
+The helper `restore_with_last_leaf_swap` does the following:
+- It exports a fresh plan-backed capsule.
+- It takes the seal's last artifact (`payload/worktree.bin.enc`) as the last one staged. The seal and the index are in
+  canonical name order, and the controls stage first.
+- It counts every `BeforeLeafCreate`. It asserts that the swapped leaf is the last create, and that every artifact
+  reached its leaf create.
+
+`swap_out` renames an object out of the destination and puts an empty 0700 directory at its name.
+
+| Control | Swap | Asserts after the fix |
+|---|---|---|
+| `final_gate_refuses_a_destination_root_swapped_at_the_last_leaf` | at the last artifact's `BeforeLeafCreate`, `dest` is renamed to the sibling `dest-moved`, and `dest` is recreated empty | `IdentityChanged` from the root pin ("now resolves to a different directory"); the last leaf is in `dest-moved`; `dest` is empty |
+| `final_gate_refuses_a_staging_parent_swapped_at_the_last_leaf` | at the same point, `.restore-work/plain/payload/` is renamed to `parent-moved`, outside the destination, with an empty replacement | `IdentityChanged` naming `.restore-work/plain/payload`; the leaf is in `parent-moved`; the replacement is empty |
+| `final_gate_refuses_restore_work_swapped_after_the_last_frame` | at `BeforeFinalGate`, `.restore-work/` is renamed to `restore-work-moved`, with an empty replacement | `IdentityChanged` naming `.restore-work`; the moved tree holds `plain/payload/`; the replacement is empty |
+| `final_gate_admits_an_unswapped_restore` | both hooks are installed and change nothing | `Ok`; the leaf hook ran; the gate hook ran exactly once; every index row is staged; the last leaf is at its named path |
+
+### 10.5 Mutation rows
+
+**Harness changes (`matrix.py`):**
+- Two new rows: `M-final-root-identity` and `M-final-staging-chain`.
+- `M-census-final` is retargeted. Its target line, `destination.recheck_containment()?;`, moved into `final_gate` as
+  `self.recheck_containment()`. The mutation is the same in kind: the final census is removed.
+- `matrix.py check` reports **36 rows, 0 problems** on the snapshot.
+
+**The run.** One foreground run on the final bytes, snapshot `3e60cf312cf06e7c`, from 06:54:52Z to 06:58:11Z, under
+`timeout 590`. **8 of 8 FLIPPED**, with 0 NOT-FLIPPED and 0 INADMISSIBLE.
+
+| ID | Task | Guard mutated | Named red | Verdict | Every failing control |
+|---|---|---|---|---|---|
+| M-final-root-identity | R1/B1 | the final gate proves the destination root pin unchanged | final_gate_refuses_a_destination_root_swapped_at_the_last_leaf | FLIPPED | final_gate_refuses_a_destination_root_swapped_at_the_last_leaf |
+| M-final-staging-chain | R1/B1 | the final gate rechecks .restore-work/, plain/, and every retained staging chain | final_gate_refuses_a_staging_parent_swapped_at_the_last_leaf, final_gate_refuses_restore_work_swapped_after_the_last_frame | FLIPPED | final_gate_refuses_a_staging_parent_swapped_at_the_last_leaf, final_gate_refuses_restore_work_swapped_after_the_last_frame |
+| M-census-final | T6.4 | the mount census runs again before VerifiedCapsuleV1 is returned | mount_appearing_during_restore_refuses | FLIPPED | mount_appearing_during_restore_refuses |
+| M-staged-order-sort | T6.5 | staged plaintexts are in the index's canonical order | staged_order_equals_index_order, verifies_and_stages_a_plan_backed_capsule | FLIPPED | capsule_is_never_written, corrupt_frame_trailer_refuses, final_gate_admits_an_unswapped_restore, final_gate_refuses_a_destination_root_swapped_at_the_last_leaf, final_gate_refuses_a_staging_parent_swapped_at_the_last_leaf, final_gate_refuses_restore_work_swapped_after_the_last_frame, mount_appearing_during_restore_refuses, nothing_outside_restore_work, staged_order_equals_index_order, verifies_and_stages_a_fixture_stream_capsule, verifies_and_stages_a_plan_backed_capsule, wrong_class_frame_refuses, wrong_generation_frame_refuses |
+| M-payloads-before-binding | T6.0 | no pack or payload is staged before the controls bind | tampered_manifest_refuses_before_payload_staging, seal_manifest_digest_edit_refuses_at_binding, index_mapping_mismatch_refuses, non_inert_policy_refuses | FLIPPED | ciphertext_changed_after_verification_refuses, ciphertext_truncated_after_verification_refuses, final_gate_admits_an_unswapped_restore, final_gate_refuses_a_destination_root_swapped_at_the_last_leaf, final_gate_refuses_a_staging_parent_swapped_at_the_last_leaf, index_mapping_mismatch_refuses, non_inert_policy_refuses, opener_lying_receipt_refuses, opener_refusal_propagates, opener_stopping_early_refuses, oversize_control_plaintext_refuses, seal_manifest_digest_edit_refuses_at_binding, staging_collision_refuses, tampered_manifest_refuses_before_payload_staging |
+| M-staging-recheck | T5 | the retained staging chain is rechecked before each staged file's create | shared_staging_directory_custody | FLIPPED | shared_staging_directory_custody |
+| M-prewrite-recheck | T4 | the destination pin is rechecked before the first create | destination_swapped_before_first_write_refuses | FLIPPED | destination_swapped_before_first_write_refuses |
+| M-staging-reopen-by-name | T5 | a shared staging directory is reused by its retained pin, never re-opened by name | shared_staging_directory_custody | FLIPPED | shared_staging_directory_custody |
+
+- **Which rows were run.**
+  - The two new rows.
+  - The three whose targets are in the changed function `verify_and_stage_v1`, or were moved out of it:
+    `M-census-final`, `M-staged-order-sort`, and `M-payloads-before-binding`.
+  - The three that guard the pre-create identity checks and retained pins the gate re-walks: `M-staging-recheck`,
+    `M-prewrite-recheck`, and `M-staging-reopen-by-name`.
+- **The 28 rows not re-run** target functions this round did not change. Their FLIPPED verdicts (§5) are on snapshot
+  `412f94d481773a0b`. The five files this round did not touch are byte-identical in both snapshots.
+- **Each new row flips only its own controls.**
+  - Removing the root check leaves the root-swap control `Ok`: the chain recheck walks the retained descriptors inside
+    the renamed tree, and they all agree.
+  - Removing the chain recheck leaves the two directory-swap controls `Ok`: the root's name still resolves to its pin.
+- **The strays are expected.**
+  - `M-staged-order-sort` refuses every pipeline run at the order check, before the gate.
+  - Under `M-payloads-before-binding` the last leaf create is a control, so the helper's last-leaf assertion fails.
+    The `.restore-work` control does not use the helper, so it still refuses at the gate.
+
+**The source equals the snapshot.**
+- The harness logged `VERIFY OK: 7 files equal their snapshot 3e60cf312cf06e7c; no pending marker` at 06:58:11Z.
+- Outside the harness, each live file's SHA-256 prefix equals its snapshot copy's:
+
+  | File | SHA-256 prefix |
+  |---|---|
+  | `lib.rs` | `d11dd9db` |
+  | `custody_capsule.rs` | `3c43dedd` |
+  | `custody_envelope_fixture.rs` | `40030a73` |
+  | `custody_export.rs` | `cb9e7d3e` |
+  | `custody_export_tests.rs` | `b1c7bc0c` |
+  | `custody_restore.rs` | `320c9065` |
+  | `custody_restore_tests.rs` | `0786d21d` |
+
+- `cmp` finds the two changed files byte-identical to their snapshot copies. Each of the seven has the restore's
+  fresh mtime, 06:58:11Z. No `pending.json` exists.
+- `matrix.log` has 76 `APPLIED` and 76 `RESTORED` lines: 68 from round 0 and 8 here.
+- After this run, no source file was edited. The gates below then ran, and only this handoff was written.
+
+### 10.6 Gates, on the final bytes after the matrix run
+
+Every cargo command ran with `CARGO_HOME=/cargo CARGO_NET_OFFLINE=true CARGO_TARGET_DIR=/tmp/target
+CARGO_INCREMENTAL=0`, with `HTTP_PROXY`, `HTTPS_PROXY`, `http_proxy`, and `https_proxy` unset.
+
+| Gate | Exit | Totals |
+|---|---|---|
+| `cargo fmt --all -- --check` | 0 | no diff |
+| `cargo clippy --locked --offline --workspace --all-targets -- -D warnings` | 0 | no warning or error |
+| `cargo test --locked --offline -p bridge-core --lib --no-fail-fast` | 0 | **1,095 passed**, 0 failed (1,091 + the 4 new controls) |
+| `cargo test --locked --offline --workspace --all-targets --no-fail-fast` | 0 | 90 `test result` lines: **4,837 passed**, 0 failed, 13 ignored (4,833 + 4) |
+| `cargo test --locked --offline --workspace --no-fail-fast` | 0 | 106 lines, 16 doctest runs: **4,848 passed**, 0 failed, 13 ignored (4,844 + 4); the visibility doctest at line 541 passes |
+| `git diff --cached --check` after staging | 0 | no output |
+
+- **The lib count.** The `--lib` run also prints one nested child-process line (1 passed, the rest filtered out), as
+  round 0's did. 1,095 is the full lib line.
+- **Excluded:** as in §6.
+
+### 10.7 Staged paths
+
+```text
+crates/bridge-core/src/custody_restore.rs        (the final gate; one #[cfg(test)] hook point)
+crates/bridge-core/src/custody_restore_tests.rs  (4 controls and 2 helpers)
+docs/superpowers/reviews/2026-09-28-adr0041-slice2b3a-implementation-handoff.md (§10 and a status pointer)
+```
+
+Nothing is committed in this round, and `.git/A2A_COMMIT_MSG` is not written.

@@ -1794,3 +1794,162 @@ fn mount_appearing_during_restore_refuses() {
         "refused only at the end"
     );
 }
+
+// ---------------------------------------------------------------------------------------------
+// Repair round 1 (finding B1): the final gate re-proves the destination's identity
+// ---------------------------------------------------------------------------------------------
+
+/// A racer's swap: moves `path` to `to`, outside the destination, and puts an empty
+/// owner-private directory at its name.
+fn swap_out(path: &Path, to: &Path) {
+    std::fs::rename(path, to).expect("the swapped object moves out");
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(path)
+        .expect("an empty replacement at the original name");
+}
+
+/// Phase V over a new plan-backed capsule into `destination`, with `swap(leaf)` run at the
+/// `BeforeLeafCreate` of the last indexed artifact: after its last pre-create recheck, and before
+/// its leaf is created through the retained parent. Returns the result and that artifact's name.
+fn restore_with_last_leaf_swap(
+    destination: &DestinationV1,
+    swap: impl Fn(&Path) + 'static,
+) -> (Result<VerifiedCapsuleV1, CustodyRestoreErrorV1>, String) {
+    let exported = PlanBackedV1::export();
+    let capsule = exported.capsule();
+    let seal = read_seal(&capsule);
+    let total = seal.artifacts().len();
+    // The seal and the index are both in canonical name order, and the controls are staged
+    // first, so the seal's last artifact is the last one staged; the hook asserts it.
+    let last = lossy(seal.artifacts()[total - 1].name().as_bytes());
+    let target = destination.work().join("plain").join(&last);
+    let creates = Rc::new(std::cell::Cell::new(0_usize));
+    let seen = Rc::clone(&creates);
+    let _hook = install_restore_hook_for_test(RestoreHookPointV1::BeforeLeafCreate, move |leaf| {
+        seen.set(seen.get() + 1);
+        if leaf == target.as_path() {
+            assert_eq!(seen.get(), total, "the swapped leaf is the last one staged");
+            swap(leaf);
+        }
+    });
+    let result = restore(&capsule, &destination.path, &FixtureOpenerV1::honest());
+    assert_eq!(
+        creates.get(),
+        total,
+        "every artifact reached its leaf create"
+    );
+    (result, last)
+}
+
+/// Finding B1: at the last artifact's `BeforeLeafCreate`, the destination root is renamed to a
+/// sibling outside it, and an empty directory takes its name. The leaf is created, and its frame
+/// verified, through retained descriptors, so only the final gate's root identity check can see
+/// that the named destination holds nothing.
+#[test]
+fn final_gate_refuses_a_destination_root_swapped_at_the_last_leaf() {
+    let destination = DestinationV1::new();
+    let moved = destination.area.join("dest-moved");
+    let (root, moved_to) = (destination.path.clone(), moved.clone());
+    let (result, last) =
+        restore_with_last_leaf_swap(&destination, move |_| swap_out(&root, &moved_to));
+
+    assert!(
+        matches!(&result, Err(CustodyRestoreErrorV1::IdentityChanged(detail))
+            if detail.contains("now resolves to a different directory")),
+        "observed {:?}",
+        result.as_ref().map(|_| "VerifiedCapsuleV1")
+    );
+    assert!(
+        moved.join(".restore-work/plain").join(&last).is_file(),
+        "the last leaf was written into the renamed root"
+    );
+    assert_eq!(destination.entries(), Vec::<String>::new());
+}
+
+/// Finding B1: at the same point, the last artifact's retained parent staging directory is
+/// renamed out of the destination, and an empty directory takes its name. Only the final gate's
+/// staging-chain recheck can see it.
+#[test]
+fn final_gate_refuses_a_staging_parent_swapped_at_the_last_leaf() {
+    let destination = DestinationV1::new();
+    let moved = destination.area.join("parent-moved");
+    let moved_to = moved.clone();
+    let (result, last) = restore_with_last_leaf_swap(&destination, move |leaf| {
+        swap_out(leaf.parent().expect("a staged leaf's parent"), &moved_to);
+    });
+
+    let parent = Path::new(&last).parent().expect("a sealed parent");
+    let changed = format!(".restore-work/plain/{}: ", parent.display());
+    assert!(
+        matches!(&result, Err(CustodyRestoreErrorV1::IdentityChanged(detail))
+            if detail.starts_with(&changed)),
+        "observed {:?}",
+        result.as_ref().map(|_| "VerifiedCapsuleV1")
+    );
+    let leaf = destination.work().join("plain").join(&last);
+    assert!(
+        moved.join(leaf.file_name().expect("a leaf name")).is_file(),
+        "the last leaf was written into the renamed parent"
+    );
+    assert_eq!(
+        entries_beneath(leaf.parent().expect("a staged leaf's parent")),
+        Vec::<String>::new()
+    );
+}
+
+/// Finding B1: every frame is verified, and then `.restore-work/` is renamed out of the
+/// destination, and an empty directory takes its name, before the final gate. This is the end of
+/// the window a swap during frame verification also falls in. Only the final gate's recheck of
+/// `.restore-work/` against the root's entry can see it.
+#[test]
+fn final_gate_refuses_restore_work_swapped_after_the_last_frame() {
+    let exported = PlanBackedV1::export();
+    let destination = DestinationV1::new();
+    let moved = destination.area.join("restore-work-moved");
+    let moved_to = moved.clone();
+    let _hook = install_restore_hook_for_test(RestoreHookPointV1::BeforeFinalGate, move |root| {
+        swap_out(&root.join(".restore-work"), &moved_to);
+    });
+    let result = restore(
+        &exported.capsule(),
+        &destination.path,
+        &FixtureOpenerV1::honest(),
+    );
+
+    assert!(
+        matches!(&result, Err(CustodyRestoreErrorV1::IdentityChanged(detail))
+            if detail.starts_with(".restore-work: ")),
+        "observed {:?}",
+        result.as_ref().map(|_| "VerifiedCapsuleV1")
+    );
+    assert!(
+        moved.join("plain/payload").is_dir(),
+        "the hook ran after staging"
+    );
+    assert_eq!(entries_beneath(&destination.work()), Vec::<String>::new());
+}
+
+/// The final gate's positive control: the same hooks run at the last leaf and before the gate,
+/// and change nothing, so phase V passes, with the last leaf at its named path.
+#[test]
+fn final_gate_admits_an_unswapped_restore() {
+    let destination = DestinationV1::new();
+    let gate = Rc::new(std::cell::Cell::new(0_usize));
+    let gate_seen = Rc::clone(&gate);
+    let _gate = install_restore_hook_for_test(RestoreHookPointV1::BeforeFinalGate, move |_| {
+        gate_seen.set(gate_seen.get() + 1);
+    });
+    let ran = Rc::new(std::cell::Cell::new(false));
+    let seen = Rc::clone(&ran);
+    let (result, last) = restore_with_last_leaf_swap(&destination, move |_| seen.set(true));
+
+    let verified = result.expect("an unswapped restore passes the final gate");
+    assert!(ran.get(), "the last leaf's hook ran");
+    assert_eq!(gate.get(), 1, "the final gate's hook ran once");
+    assert_eq!(
+        verified.staged.len(),
+        verified.control.index.artifacts().len()
+    );
+    assert!(destination.work().join("plain").join(&last).is_file());
+}

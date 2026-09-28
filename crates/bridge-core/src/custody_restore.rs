@@ -209,6 +209,8 @@ pub(crate) enum RestoreHookPointV1 {
     BeforeFirstCreate,
     /// A staged file's parents exist and are rechecked, before its create-new (the file's path).
     BeforeLeafCreate,
+    /// Every frame is verified, before the final gate (the destination root).
+    BeforeFinalGate,
 }
 
 #[cfg(test)]
@@ -594,6 +596,25 @@ impl RestoreDestinationV1 {
     /// The mount census again: no mount point may lie strictly inside the destination.
     pub(crate) fn recheck_containment(&self) -> Result<(), CustodyRestoreErrorV1> {
         refuse_mounts_within(&self.root)
+    }
+
+    /// The final gate before [`VerifiedCapsuleV1`] is returned. Each leaf is created, and each
+    /// frame verified, through retained descriptors, so an object renamed out of the destination
+    /// after the last pre-create recheck would leave the named destination incomplete. The gate
+    /// requires, in order:
+    /// 1. the destination root's name to still resolve to its pin;
+    /// 2. `.restore-work/`, `plain/`, and every retained staging directory to still be the entry
+    ///    its parent holds;
+    /// 3. the mount census, again.
+    ///
+    /// A changed identity is `IdentityChanged`.
+    fn final_gate(&self) -> Result<(), CustodyRestoreErrorV1> {
+        pinned_root_unchanged(&self.root).map_err(CustodyRestoreErrorV1::IdentityChanged)?;
+        self.recheck_staging_chain(b"")?;
+        for key in self.staging.borrow().keys() {
+            self.recheck_staging_chain(key)?;
+        }
+        self.recheck_containment()
     }
 
     /// The retained pin of the staging directory at `key` (`plain/` itself for an empty key),
@@ -1175,7 +1196,8 @@ pub(crate) struct VerifiedCapsuleV1 {
 /// (task 4), and bind the controls (task 5). A T1 or T2 refusal therefore happens before
 /// `.restore-work/` exists, and a T3 refusal with only the control plaintexts staged. Only then is
 /// every remaining artifact staged, in index order, and every coverage frame fully decoded against
-/// its class and the manifest's generation. The Git pack is staged only; 2B3b indexes it.
+/// its class and the manifest's generation. The Git pack is staged only; 2B3b indexes it. The
+/// final gate then re-proves the destination's identity and its mount containment.
 pub(crate) fn verify_and_stage_v1(
     capsule_root: &Path,
     destination_root: &Path,
@@ -1226,7 +1248,12 @@ pub(crate) fn verify_and_stage_v1(
             verify_frame(&mut one.file, class, generation, frame_budget)?;
         }
     }
-    destination.recheck_containment()?;
+    #[cfg(test)]
+    run_hook(
+        RestoreHookPointV1::BeforeFinalGate,
+        destination.root.canonical_path(),
+    );
+    destination.final_gate()?;
     Ok(VerifiedCapsuleV1 {
         destination,
         control,
