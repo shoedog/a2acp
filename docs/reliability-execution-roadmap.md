@@ -1,8 +1,9 @@
 # Bridge reliability execution and handoff roadmap
 
 - **Program status:** active P0
-- **Current main lineage:** `origin/main` is `3a9d8fb30595c9aa381db6c15b835a872fd34d5c`, which merged ADR-0041 Slice
-  2B2b2b2 in PR #121 (spec PR #120), and before that Slice 2B2b2b1 in PR #119 (spec PR #118 at `3e12ff53`), and before that Slice 2B2b2a in PR #117 (after its spec, PR #116 at `980eb52a`), and before that Slice 2B2b1 in PR #114, after the 2B2b1 spec (PR #113 at `f3a4c0a8`), docs PR #112 (`f16ca474`), and Slice 2B2 (PR
+- **Current main lineage:** `origin/main` is `b7c85aee0440833380d9dab6804b406914644daa`, which merged ADR-0041 Slice
+  2B3a (the capsule reader) in PR #125, after its spec PR #124 (`b567d2d6`), the 2B3 design PR #123 (`abf74ad0`), and
+  the ETXTBSY fixture fix in PR #122 (`e232288c`). Before that, Slice 2B2b2b2 merged in PR #121 (spec PR #120), and before that Slice 2B2b2b1 in PR #119 (spec PR #118 at `3e12ff53`), and before that Slice 2B2b2a in PR #117 (after its spec, PR #116 at `980eb52a`), and before that Slice 2B2b1 in PR #114, after the 2B2b1 spec (PR #113 at `f3a4c0a8`), docs PR #112 (`f16ca474`), and Slice 2B2 (PR
   #111 at `90d3a208`). Its ancestry includes the provider refresh
   (PR #110), Slice 2B2a (PR #106 at `67f414e7`), and Slice 2B1 (PR #105 at `5e431f4f`), plus PR #104 at `27a885f6d4af6a517c2a8899aa5bfe36605b8fb7`, which merged
   Slices 1A, 1B, and 2A with reviewed/published head `65a572df40f07316124a70b7ec353a2d38dd334d`, plus
@@ -15,7 +16,17 @@
   `6338bc1628fed52b772026b604a1bbdd710efa8c`; the final Sol/xhigh rereview recorded 0 WRONG and 3 SMELL,
   with full verification at 4,408 passed / 0 failed / 13 ignored / 726 filtered. The candidate remains
   production-unwired; its historical handoff's pre-publication stop is superseded by the recorded PR #102 merge.
-- **Active slice:** **ADR-0041 Slice 2B3 (inert new-root restore and hidden-state proof) — spec drafting is next.**
+- **Active slice:** **ADR-0041 Slice 2B3 (inert new-root restore and hidden-state proof).** Its design is
+  `docs/superpowers/specs/2026-09-27-adr0041-slice2b3-restore-design.md` (PR #123). It has four serial children:
+  2B3a reader → 2B3b Git plane → 2B3c payload plane → 2B3d record and joint fixture.
+  - **2B3a is merged** in PR #125 at `b7c85aee`. It is the phase-V verify-and-stage reader, and it is crate-private
+    and production-unwired.
+    - The Sol spec review went REJECT, then APPROVE.
+    - The implementation review went REJECT (the final gate did not recheck identity), then REJECT (the final gate's
+      ordering), then **APPROVE** after one disclosed converging extension round.
+    - The declared residual boundary: a change after the final gate's last check is outside any gate, and consumers
+      act through the retained pins.
+  - **Next:** the 2B3b (Git plane) task spec.
   **2B2b is complete:** all its children are merged. The parent Slice 2B completion gate (plan §8) still requires 2B3,
   the aggregate fixture without the source or its alternates, and one bounded review of the combined diff.
   - **Merged on 2026-09-26/27:**
