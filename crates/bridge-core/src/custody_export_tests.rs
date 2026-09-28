@@ -19,6 +19,9 @@ use crate::custody_coverage::{
     ExternalEvidenceUnresolvedV1, GitDirClassSelectionV1, NoExternalEvidenceRecordedV1, WalkKindV1,
     WorktreeSelectionV1,
 };
+use crate::custody_envelope_fixture::{
+    fixture_envelope_format_v1, FixtureSealerV1, SealerFaultV1, FIXTURE_ENVELOPE_MAGIC_V1,
+};
 use crate::custody_frame::{
     CustodyFrameBudgetV1, CustodyFrameDecoderV1, CustodyFrameEncoderV1, CustodyFrameEntryV1,
     CustodyFrameHeaderV1,
@@ -598,7 +601,8 @@ fn object_lines(ids: &[String]) -> Vec<u8> {
 // ---------------------------------------------------------------------------------------------
 
 const GENERATION_V1: &str = "generation-2b2";
-const IDENTITY_V1: [&str; 4] = ["unit-2b2", "run-2b2", "materialization-2b2", GENERATION_V1];
+pub(crate) const IDENTITY_V1: [&str; 4] =
+    ["unit-2b2", "run-2b2", "materialization-2b2", GENERATION_V1];
 
 /// Three captured classes — the object database plus two non-Git payloads — so the derived layout
 /// has six artifacts across all three reserved capsule directories and control 19 has two
@@ -623,7 +627,10 @@ fn coverage_rows(captured: &[CustodyCoverageClassV1]) -> Vec<CustodyCoverageEntr
         .collect()
 }
 
-fn manifest_for(identity: [&str; 4], objects: Vec<CustodyOriginalObjectV1>) -> CustodyManifestV1 {
+pub(crate) fn manifest_for(
+    identity: [&str; 4],
+    objects: Vec<CustodyOriginalObjectV1>,
+) -> CustodyManifestV1 {
     let [unit, run, materialization, generation] = identity;
     CustodyManifestV1::new(
         unit,
@@ -651,7 +658,7 @@ fn captured_classes() -> Vec<CustodyCoverageClassV1> {
 
 /// Two payload streams of EQUAL length, so control 19's exchange cannot be caught by a length
 /// comparison alone.
-fn default_streams(generation: &str) -> Vec<CustodyCapturedStreamV1> {
+pub(crate) fn default_streams(generation: &str) -> Vec<CustodyCapturedStreamV1> {
     vec![
         CustodyCapturedStreamV1::for_test_fixture(
             CustodyCoverageClassV1::Index,
@@ -671,132 +678,18 @@ const MANIFEST_ARTIFACT_V1: &str = "control/manifest.json.enc";
 const WORKTREE_ARTIFACT_V1: &str = "payload/worktree.bin.enc";
 
 // ---------------------------------------------------------------------------------------------
-// The deterministic fixture sealer
-// ---------------------------------------------------------------------------------------------
-
-const FIXTURE_ENVELOPE_MAGIC_V1: &[u8; 8] = b"A2AFIX1\n";
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-struct SealerFaultV1 {
-    /// Read at most this many plaintext chunks before sealing anyway (control 16).
-    stop_after_chunks: Option<usize>,
-    /// Mint each receipt from the PREVIOUS call's context (control 15).
-    swap_receipt_contexts: bool,
-}
-
-/// The envelope is the fixed magic chunk followed by every plaintext chunk verbatim. It is a
-/// fixture: it makes no confidentiality claim.
-struct FixtureSealerV1 {
-    fault: SealerFaultV1,
-    /// Only artifacts whose name contains this marker are faulted; `None` faults every artifact.
-    target: Option<Vec<u8>>,
-    previous_context: RefCell<Option<CustodyEnvelopeContextV1>>,
-}
-
-impl FixtureSealerV1 {
-    fn honest() -> Self {
-        Self {
-            fault: SealerFaultV1::default(),
-            target: None,
-            previous_context: RefCell::new(None),
-        }
-    }
-
-    fn faulted(fault: SealerFaultV1, target: Option<&[u8]>) -> Self {
-        Self {
-            fault,
-            target: target.map(<[u8]>::to_vec),
-            previous_context: RefCell::new(None),
-        }
-    }
-
-    fn applies_to(&self, context: &CustodyEnvelopeContextV1) -> bool {
-        match &self.target {
-            None => true,
-            Some(marker) => context
-                .artifact_name()
-                .as_bytes()
-                .windows(marker.len())
-                .any(|window| window == marker.as_slice()),
-        }
-    }
-}
-
-impl sealed::Sealed for FixtureSealerV1 {}
-
-impl CustodyEnvelopeSealerV1 for FixtureSealerV1 {
-    fn seal(
-        &self,
-        context: &CustodyEnvelopeContextV1,
-        plaintext: &mut dyn CustodyEnvelopeChunkSourceV1,
-        _metadata: &CustodyEnvelopeMetadataV1,
-        ciphertext: &mut dyn CustodyEnvelopeChunkSinkV1,
-    ) -> Result<CustodyEnvelopeSealReceiptV1, CustodyCapsuleErrorV1> {
-        let faulted = self.applies_to(context);
-        let limit = if faulted {
-            self.fault.stop_after_chunks
-        } else {
-            None
-        };
-
-        let mut body: Vec<Vec<u8>> = Vec::new();
-        let mut read = 0_usize;
-        while limit.is_none_or(|limit| read < limit) {
-            let Some(chunk) = plaintext.next_chunk()? else {
-                break;
-            };
-            read += 1;
-            if !chunk.bytes().is_empty() {
-                body.push(chunk.bytes().to_vec());
-            }
-        }
-
-        let mut pieces = vec![FIXTURE_ENVELOPE_MAGIC_V1.to_vec()];
-        pieces.extend(body);
-
-        // The sealer keeps its own mirror of the destination's validator so it can mint a receipt
-        // without touching the exporter-owned sink validator.
-        let mut mirror = CustodyEnvelopeSinkValidatorV1::new(ciphertext.limits());
-        let count = pieces.len();
-        for (index, piece) in pieces.into_iter().enumerate() {
-            let ordinal = u32::try_from(index).map_err(|_| CustodyCapsuleErrorV1::InvalidInput)?;
-            let chunk = CustodyEnvelopeChunkV1::new(ordinal, piece, index + 1 == count)?;
-            mirror.accept_chunk(&chunk)?;
-            ciphertext.write_chunk(chunk)?;
-        }
-        let completion = mirror.finish()?;
-
-        let receipt_context = if faulted && self.fault.swap_receipt_contexts {
-            self.previous_context
-                .borrow()
-                .clone()
-                .unwrap_or_else(|| context.clone())
-        } else {
-            context.clone()
-        };
-        *self.previous_context.borrow_mut() = Some(context.clone());
-        CustodyEnvelopeSealReceiptV1::new(&receipt_context, completion)
-    }
-}
-
-// ---------------------------------------------------------------------------------------------
 // The export harness
 // ---------------------------------------------------------------------------------------------
 
-struct HarnessV1 {
+pub(crate) struct HarnessV1 {
     _temp: tempfile::TempDir,
     root: PathBuf,
     source: SourceFixtureV1,
     scratch: PathBuf,
-    manifest: CustodyManifestV1,
+    pub(crate) manifest: CustodyManifestV1,
     budgets: CustodyExportBudgetsV1,
-    streams: Vec<CustodyCapturedStreamV1>,
+    pub(crate) streams: Vec<CustodyCapturedStreamV1>,
     git_route: GitRouteRequestV1,
-}
-
-fn envelope_format() -> CustodyEnvelopeFormatV1 {
-    CustodyEnvelopeFormatV1::new("capsule-v1", "a2a-bridge-2b2-fixture", "0.1.0")
-        .expect("the fixture envelope format is valid")
 }
 
 fn recipients() -> Vec<String> {
@@ -804,7 +697,7 @@ fn recipients() -> Vec<String> {
 }
 
 impl HarnessV1 {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self::with_source(SourceFixtureV1::build)
     }
 
@@ -865,7 +758,7 @@ impl HarnessV1 {
         reset_export_counters_for_test();
         export_capsule_v1(CustodyExportRequestV1 {
             manifest: &self.manifest,
-            envelope_format: &envelope_format(),
+            envelope_format: &fixture_envelope_format_v1(),
             recipients: &recipients(),
             budgets: self.budgets,
             sealer,
@@ -882,7 +775,7 @@ impl HarnessV1 {
 
     /// Run an export that must seal, with the §7 no-mutation observation: the source's object,
     /// ref, config, and alternate bytes are identical before and after.
-    fn run_sealed(&self) -> Box<CustodyExportSealedV1> {
+    pub(crate) fn run_sealed(&self) -> Box<CustodyExportSealedV1> {
         let before = self.source.snapshot();
         let sealed = expect_sealed(self.run().expect("the fixture export seals"));
         assert_eq!(
@@ -905,6 +798,11 @@ impl HarnessV1 {
     }
 
     fn capsule(&self) -> PathBuf {
+        self.scratch.join(CAPSULE_DIR_NAME)
+    }
+
+    /// The published capsule directory, for the 2B3a capsule reader's controls.
+    pub(crate) fn capsule_dir(&self) -> PathBuf {
         self.scratch.join(CAPSULE_DIR_NAME)
     }
 
@@ -967,7 +865,7 @@ impl Drop for SealedRouteAnchorV1 {
     }
 }
 
-fn expect_sealed(outcome: CustodyExportOutcomeV1) -> Box<CustodyExportSealedV1> {
+pub(crate) fn expect_sealed(outcome: CustodyExportOutcomeV1) -> Box<CustodyExportSealedV1> {
     match outcome {
         CustodyExportOutcomeV1::Sealed(sealed) => sealed,
         other => panic!("expected a sealed capsule, observed {other:?}"),
@@ -2551,7 +2449,7 @@ fn control_15_every_receipt_field_is_compared() {
     let context = CustodyEnvelopeContextV1::new(
         LosslessPathV1::from_bytes(MANIFEST_ARTIFACT_V1.as_bytes().to_vec()),
         Sha256HexV1::digest(b"manifest"),
-        envelope_format(),
+        fixture_envelope_format_v1(),
         recipients(),
     )
     .expect("the receipt context");
@@ -3420,7 +3318,7 @@ fn worktree_git(directory: &Path, args: &[&str]) {
 }
 
 /// A real source, planned by 2B2b2b1, with an owner-private export scratch beside it.
-struct PlanFixtureV1 {
+pub(crate) struct PlanFixtureV1 {
     _temp: tempfile::TempDir,
     area: PathBuf,
     /// The repository root: the worktree, or a bare source's git directory.
@@ -3469,7 +3367,7 @@ impl PlanFixtureV1 {
 
     /// §6.4's rich non-bare clone: a dirty worktree, untracked and ignored files, a stash,
     /// reflogs, an in-progress merge with rerere, a hook, bridge evidence, and a Cargo `target/`.
-    fn rich_clone() -> Self {
+    pub(crate) fn rich_clone() -> Self {
         let fixture = Self::with(|area| {
             let origin = area.join("origin");
             std::fs::create_dir(&origin).expect("the origin worktree");
@@ -3607,8 +3505,13 @@ impl PlanFixtureV1 {
         self.scratch.join(CAPSULE_DIR_NAME)
     }
 
+    /// The published capsule directory, for the 2B3a capsule reader's controls.
+    pub(crate) fn capsule_dir(&self) -> PathBuf {
+        self.scratch.join(CAPSULE_DIR_NAME)
+    }
+
     /// Every object the source's store holds, as the manifest's object inventory.
-    fn inventory(&self) -> Vec<CustodyOriginalObjectV1> {
+    pub(crate) fn inventory(&self) -> Vec<CustodyOriginalObjectV1> {
         fixture_git_ok(
             &self.git_dir,
             &[
@@ -3665,7 +3568,7 @@ impl PlanFixtureV1 {
         (plan, request.sources)
     }
 
-    fn plan(
+    pub(crate) fn plan(
         &self,
         generation: &str,
         inventory: &[CustodyOriginalObjectV1],
@@ -3675,7 +3578,7 @@ impl PlanFixtureV1 {
 
     /// The ordinary path: every object planned for [`GENERATION_V1`], the manifest built from
     /// the plan's three collections, and the capability minted from both.
-    fn planned(
+    pub(crate) fn planned(
         &self,
     ) -> (
         CustodyManifestV1,
@@ -3690,7 +3593,7 @@ impl PlanFixtureV1 {
         (manifest, capability, receipts)
     }
 
-    fn export(
+    pub(crate) fn export(
         &self,
         manifest: &CustodyManifestV1,
         capability: CustodyCaptureCapabilityV1,
@@ -3708,7 +3611,7 @@ impl PlanFixtureV1 {
         reset_export_counters_for_test();
         export_capsule_v1(CustodyExportRequestV1 {
             manifest,
-            envelope_format: &envelope_format(),
+            envelope_format: &fixture_envelope_format_v1(),
             recipients: &recipients(),
             budgets,
             sealer: &FixtureSealerV1::honest(),
@@ -3742,7 +3645,7 @@ fn readme_clone_in(base: &Path) -> (PathBuf, PathBuf) {
 }
 
 /// The manifest §6.4 builds from a plan: its coverage rows, exclusions, and dependencies.
-fn manifest_from_plan(
+pub(crate) fn manifest_from_plan(
     plan: &CustodyCoveragePlanV1,
     generation: &str,
     objects: Vec<CustodyOriginalObjectV1>,
@@ -3788,7 +3691,7 @@ fn with_state(
         .collect()
 }
 
-fn planned_capability(
+pub(crate) fn planned_capability(
     manifest: &CustodyManifestV1,
     plan: CustodyCoveragePlanV1,
     sources: CustodyCoverageSourcesV1,
