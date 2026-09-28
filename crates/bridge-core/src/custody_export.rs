@@ -4059,4 +4059,4 @@ fn publish_seal(request: PublishSealV1<'_>) -> Result<SealPublicationV1, Custody
 
 #[cfg(test)]
 #[path = "custody_export_tests.rs"]
-mod tests;
+pub(crate) mod tests;

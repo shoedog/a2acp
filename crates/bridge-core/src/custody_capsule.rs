@@ -531,6 +531,32 @@ pub enum RestoreForbiddenV1 {
 /// .unwrap();
 /// let _ = CustodyEnvelopeOpenRequestV1::from_seal_artifact(&generic, name);
 /// ```
+///
+/// ADR-0041 slice 2B3a control `from_published_seal_is_crate_private`: only the crate-private
+/// capsule reader may turn a seal read back from a published capsule into this proof, so the
+/// receipt-derived boundary above is unchanged for every other caller. The doctest below builds
+/// an otherwise valid call whose only error is naming that constructor from outside the crate, so
+/// making `from_published_seal_v1` `pub` makes it compile and so turns the control red.
+///
+/// ```compile_fail
+/// use bridge_core::custody_capsule::CustodyCapsuleSealProofV1;
+/// use bridge_core::custody_inventory::LosslessPathV1;
+/// use bridge_core::custody_seal::{CustodySealV1, CustodySealedArtifactV1};
+/// use bridge_core::execution_policy::Sha256HexV1;
+///
+/// let digest = Sha256HexV1::digest(b"manifest");
+/// let name = LosslessPathV1::from_bytes(b"control/manifest.json.enc".to_vec());
+/// let seal = CustodySealV1::new(
+///     digest.clone(),
+///     vec![CustodySealedArtifactV1::new(name, 1, digest).unwrap()],
+///     vec!["recipient".to_owned()],
+///     "capsule-v1",
+///     "tool",
+///     "1",
+/// )
+/// .unwrap();
+/// let _ = CustodyCapsuleSealProofV1::from_published_seal_v1(seal);
+/// ```
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CustodyCapsuleSealProofV1 {
     seal: CustodySealV1,
@@ -599,6 +625,23 @@ impl CustodyCapsuleSealProofV1 {
     #[must_use]
     pub fn seal(&self) -> &CustodySealV1 {
         &self.seal
+    }
+
+    /// A seal read back from a published capsule, for the crate-private restore only. It is
+    /// validated as open requests validate a seal, and additionally every artifact as
+    /// `from_seal_artifact` validates one.
+    #[cfg_attr(not(unix), allow(dead_code))] // Its only caller, the 2B3a reader, is unix-only.
+    pub(crate) fn from_published_seal_v1(
+        seal: CustodySealV1,
+    ) -> Result<Self, CustodyCapsuleErrorV1> {
+        validate_capsule_seal_for_open_request(&seal)?;
+        for artifact in seal.artifacts() {
+            validate_selected_seal_artifact_limits(artifact)?;
+            if artifact.byte_length() == 0 {
+                return Err(CustodyCapsuleErrorV1::InvalidInput);
+            }
+        }
+        Ok(Self { seal })
     }
 }
 
@@ -2481,6 +2524,148 @@ mod tests {
             )
             .unwrap_err(),
             CustodyCapsuleErrorV1::MissingArtifact
+        );
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // ADR-0041 slice 2B3a task 2: a seal proof from a seal read back from a published capsule.
+    // -----------------------------------------------------------------------------------------
+
+    /// A canonical seal of `rows` (`(name, byte_length)`), with every other field at a valid
+    /// in-limit value unless overridden.
+    fn published_seal(
+        rows: &[(&str, u64)],
+        recipients: Vec<String>,
+        fields: [&str; 3],
+    ) -> CustodySealV1 {
+        let [format, tool, version] = fields;
+        CustodySealV1::new(
+            digest(1),
+            rows.iter()
+                .map(|(name, length)| {
+                    CustodySealedArtifactV1::new(
+                        LosslessPathV1::from_bytes(name.as_bytes().to_vec()),
+                        *length,
+                        digest(2),
+                    )
+                    .unwrap()
+                })
+                .collect(),
+            recipients,
+            format,
+            tool,
+            version,
+        )
+        .unwrap()
+    }
+
+    const IN_LIMIT_FIELDS_V1: [&str; 3] = ["capsule-v1", "tool", "1"];
+
+    #[test]
+    fn published_seal_round_trips_through_a_seal_proof() {
+        let manifest = full_manifest();
+        let layout = CustodyCapsuleLayoutV1::derive(&manifest).unwrap();
+        let proof = proof_for(layout.index(), manifest.content_digest().unwrap());
+        let published = proof.seal().encode_canonical().unwrap();
+        let decoded = CustodySealV1::decode_canonical(&published).unwrap();
+
+        let reread = CustodyCapsuleSealProofV1::from_published_seal_v1(decoded).unwrap();
+        assert_eq!(reread.seal(), proof.seal());
+        assert_eq!(reread, proof);
+    }
+
+    #[test]
+    fn published_seal_refuses_a_zero_length_artifact() {
+        let seal = published_seal(
+            &[
+                ("control/capsule-index.json.enc", 5),
+                ("control/manifest.json.enc", 0),
+            ],
+            vec!["recipient".to_owned()],
+            IN_LIMIT_FIELDS_V1,
+        );
+        let canonical = seal.encode_canonical().unwrap();
+        let seal = CustodySealV1::decode_canonical(&canonical).unwrap();
+        // The open-request seal validator alone admits it: only the per-artifact check refuses.
+        assert!(CustodyCapsuleSealProofV1::preflight_generic_seal_for_capsule_v1(&seal).is_ok());
+        assert_eq!(
+            CustodyCapsuleSealProofV1::from_published_seal_v1(seal).unwrap_err(),
+            CustodyCapsuleErrorV1::InvalidInput
+        );
+    }
+
+    #[test]
+    fn published_seal_refuses_an_over_limit_artifact() {
+        let over = MAX_ENVELOPE_TOTAL_BYTES_V1 + 1;
+        let seal = published_seal(
+            &[("control/manifest.json.enc", over)],
+            vec!["recipient".to_owned()],
+            IN_LIMIT_FIELDS_V1,
+        );
+        assert!(CustodyCapsuleSealProofV1::preflight_generic_seal_for_capsule_v1(&seal).is_ok());
+        assert_eq!(
+            CustodyCapsuleSealProofV1::from_published_seal_v1(seal).unwrap_err(),
+            CustodyCapsuleErrorV1::SealExceedsV1Limits
+        );
+
+        // Max, not max+1: the same seal at exactly the ceiling is admitted.
+        let at_ceiling = published_seal(
+            &[("control/manifest.json.enc", MAX_ENVELOPE_TOTAL_BYTES_V1)],
+            vec!["recipient".to_owned()],
+            IN_LIMIT_FIELDS_V1,
+        );
+        assert!(CustodyCapsuleSealProofV1::from_published_seal_v1(at_ceiling).is_ok());
+    }
+
+    #[test]
+    fn published_seal_refuses_what_open_requests_refuse() {
+        let field = "f".repeat(MAX_ENVELOPE_FIELD_BYTES_V1 + 1);
+        let rows = [("control/manifest.json.enc", 5)];
+        let one = || vec!["recipient".to_owned()];
+        let too_many: Vec<String> = (0..=MAX_ENVELOPE_RECIPIENTS_V1)
+            .map(|index| format!("recipient-{index:03}"))
+            .collect();
+        let too_long = vec!["r".repeat(MAX_ENVELOPE_FIELD_BYTES_V1 + 1)];
+        let refused = [
+            (
+                "recipient count",
+                published_seal(&rows, too_many, IN_LIMIT_FIELDS_V1),
+            ),
+            (
+                "recipient length",
+                published_seal(&rows, too_long, IN_LIMIT_FIELDS_V1),
+            ),
+            (
+                "capsule format",
+                published_seal(&rows, one(), [&field, "tool", "1"]),
+            ),
+            (
+                "sealing tool",
+                published_seal(&rows, one(), ["capsule-v1", &field, "1"]),
+            ),
+            (
+                "sealing tool version",
+                published_seal(&rows, one(), ["capsule-v1", "tool", &field]),
+            ),
+        ];
+        for (row, seal) in refused {
+            assert!(
+                CustodyCapsuleSealProofV1::preflight_generic_seal_for_capsule_v1(&seal).is_err(),
+                "{row}: the open-request validator admits it"
+            );
+            assert_eq!(
+                CustodyCapsuleSealProofV1::from_published_seal_v1(seal).unwrap_err(),
+                CustodyCapsuleErrorV1::SealExceedsV1Limits,
+                "{row}"
+            );
+        }
+        assert!(
+            CustodyCapsuleSealProofV1::from_published_seal_v1(published_seal(
+                &rows,
+                one(),
+                IN_LIMIT_FIELDS_V1
+            ))
+            .is_ok()
         );
     }
 }

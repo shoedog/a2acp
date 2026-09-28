@@ -9,6 +9,9 @@ pub mod custody_capsule;
 #[cfg(unix)]
 #[allow(dead_code)]
 mod custody_coverage;
+// 2B3a's shared fixture envelope: the test sealer and its mirror opener.
+#[cfg(test)]
+pub(crate) mod custody_envelope_fixture;
 // The exporter's entry point is crate-private and, by design, production-unreachable: the capture
 // capability has only a crate-private fixture constructor and the only sealer is the in-crate
 // fixture. The wiring slice supplies the production mint and the Git route pin.
@@ -32,6 +35,10 @@ pub mod custody_inventory_collector;
 #[cfg(unix)]
 #[allow(dead_code)]
 mod custody_mounts;
+// 2B3a's capsule reader (restore phase V) is production-unwired until 2B3b consumes it.
+#[cfg(unix)]
+#[allow(dead_code)]
+mod custody_restore;
 pub mod custody_seal;
 #[cfg(unix)]
 #[allow(dead_code)]
