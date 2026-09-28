@@ -30,7 +30,7 @@ the §5 row for 2B3a).
 
 **Implementation base:** current `main`; bind the exact SHA at dispatch.
 
-**Revision:** 2 (folds spec review round 1; see the Revision history at the end).
+**Revision:** 3 (approved in spec round 2, with its deferrals folded; see the Revision history at the end).
 
 ## Description
 
@@ -196,6 +196,9 @@ impl CustodyCapsuleSealProofV1 {
     `validate_capsule_seal_for_open_request` alone accepts it, so this test is RED against the one-line body.
   - `published_seal_refuses_an_over_limit_artifact`: an artifact whose length exceeds the selected-artifact limit
     gives `Err`.
+  - `from_published_seal_is_crate_private`: a `compile_fail` doctest on `CustodyCapsuleSealProofV1` calls
+    `bridge_core::custody_capsule::CustodyCapsuleSealProofV1::from_published_seal_v1(seal)` from outside the crate.
+    Making it `pub` turns this control red.
   - `published_seal_refuses_what_open_requests_refuse`: each seal the existing seal-wide negative fixtures refuse
     also gives `Err`.
   - The format check belongs to the opener (task 1), not the seal. The open-request validator accepts any bounded,
@@ -352,7 +355,7 @@ pub(crate) fn prepare_destination_v1(destination_root: &Path, capsule: &PinnedCa
   - `mount_inside_destination_refuses`: `custody_mounts::seam::install_list` with a mount point one level below the
     destination's canonical path gives `MountBoundary`, and no `.restore-work/` exists. A mount point equal to the
     destination, or above it, is accepted.
-  - `census_failure_refuses`: an installed census that returns `Err(Malformed)` gives `MountBoundary`.
+  - `census_failure_refuses`: an installed census that returns `Err(CustodyMountErrorV1::MalformedLine { line: 1 })` gives `MountBoundary`.
   - `created_directory_on_another_device_refuses`: a test seam in `custody_restore.rs`,
     `override_created_dev_for_test`, reports a different `dev` for the created `.restore-work/`. The result is
     `DeviceCrossing{".restore-work"}`.
@@ -406,6 +409,11 @@ fn bind_control_v1(dest: &RestoreDestinationV1, capsule: &PinnedCapsuleV1, opene
 - Every staged directory and file is created with `create_new_child_directory` / `create_new_regular_child`,
   which refuse an existing entry or a planted symlink.
 - A collision is `StagingCollision{name}`, and the pre-existing object is left untouched.
+- **Shared staging directories** (for example `plain/control/`, used by all three controls):
+  - `RestoreDestinationV1` retains the pin of every staging directory it created, keyed by relative path.
+  - A later artifact reuses only that retained pin, and never re-opens the directory by name.
+  - Before each child create, it rechecks the pin's identity and `dev` against the parent entry.
+  - A pre-existing, planted, or replaced intermediate directory is `StagingCollision{name}` or `IdentityChanged`.
 
 - [ ] **Step 1: failing tests.** Build capsules with the fixture sealer.
   - `binds_an_exported_capsule`: `Ok`, with only the 3 control plaintexts staged.
@@ -432,6 +440,12 @@ fn bind_control_v1(dest: &RestoreDestinationV1, capsule: &PinnedCapsuleV1, opene
     same-length, internally valid fixture envelope of different plaintext. The result is `CiphertextChanged{name}`.
   - `opener_stopping_early_refuses`: an opener fault `stop_after_chunks: Some(1)`, added to `OpenerFaultV1`, gives
     `CiphertextChanged{name}`.
+  - `shared_staging_directory_custody`: three variants, each giving `StagingCollision` or `IdentityChanged` with no
+    leaf created beneath the planted object:
+    - plant a real `plain/control/` directory before the first control is staged;
+    - plant it as a symlink to an outside directory;
+    - after the first control is staged, rename the created `plain/control/` away and put a fresh directory in its
+      place.
   - `staging_collision_refuses`: a hook plants a regular file at the first staged leaf, then separately a symlink to
     a file outside the destination. Each gives `StagingCollision`, the planted object's bytes and target are
     unchanged, and the outside file is unchanged.
@@ -515,7 +529,9 @@ pub(crate) fn verify_and_stage_v1(capsule_root: &Path, destination_root: &Path, 
   - the budget ceiling check off;
   - create-new replaced by create-or-truncate;
   - the bounded reader replaced by `read_to_end`;
-  - the staged-order sort off.
+  - the staged-order sort off;
+  - `from_published_seal_v1` visibility changed to `pub` (the compile-fail doctest);
+  - a shared staging directory re-opened by name instead of by its retained pin.
 
   Each row must turn its own control red. Restore byte-exactly, and prove the source equals its snapshot.
 - [ ] **Step 2: gates.**
@@ -586,6 +602,13 @@ findings. All are folded in revision 2:
 | S2 | Bounded-read tests don't prove bounded reading | `read_bounded_v1` over `Read`, with a counting and failing reader test |
 | S3 | Create-new and capsule read-only claims lack controls | Collision and planted-symlink tests; capsule snapshot on success and failure; matrix row |
 | S4 | Staged index order not asserted | `staged_order_equals_index_order` |
+
+**Revision 2** (`173eb88e`), spec review round 2 (final admitted round): **APPROVE**, with W1–W9 and S1, S2, S4
+RESOLVED and 0 blockers. Its three DEFER items are folded into revision 3 as text-only fixes, and no further review
+round was run:
+- the census error variant's name (`MalformedLine`);
+- shared staging-directory custody with retained pins, and its test (round-1 S3, which round 2 marked UNRESOLVED);
+- a compile-fail doctest plus a mutation row for the constructor's visibility.
 
 ## Commit Message
 
