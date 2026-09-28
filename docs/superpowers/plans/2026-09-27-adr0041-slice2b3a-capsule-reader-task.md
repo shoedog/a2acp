@@ -30,21 +30,30 @@ the §5 row for 2B3a).
 
 **Implementation base:** current `main`; bind the exact SHA at dispatch.
 
+**Revision:** 2 (folds spec review round 1; see the Revision history at the end).
+
 ## Description
 
 2B3a is the first of four serial children (2B3a reader → 2B3b Git plane → 2B3c payload plane → 2B3d record and
 proofs). It implements design §3.1 **phase V only**. It writes only under `<dest>/.restore-work/`, never under
 `repository/` or `evidence/`. It runs no Git command and decodes nothing into the destination tree.
 
-**Design refinement (stated for review):** design §5 says tampering "refuses before any plaintext is staged". That
-holds literally for seal-level and ciphertext-level tampering. The manifest, index, and restore policy are themselves
-encrypted artifacts, though, so they must be opened before they can be checked. This plan therefore:
-1. verifies every ciphertext against the seal;
-2. stages **only the three control artifacts**;
-3. binds them through 2B1;
-4. only then stages the pack and the coverage payloads.
+**Design refinement (stated for review):** design §5 says tampering "refuses before any plaintext is staged". The
+manifest, index, and restore policy are themselves encrypted artifacts, and the seal has no independently supplied
+expected digest in 2B, so a canonical seal that merely disagrees with the controls can only be detected after the
+controls are opened. The plan therefore fixes a three-tier timing contract. Each tier has named tests.
 
-Control-artifact tampering therefore refuses before **any pack or payload plaintext** is staged.
+| Tamper class | Example | Refuses | Staged when refused |
+|---|---|---|---|
+| **T1: malformed or out-of-bounds seal** | non-canonical or invalid JSON, oversize, zero-length artifact | task 3, `SealUnreadable` / `SealInvalid` | nothing; no `.restore-work/` exists |
+| **T2: seal/ciphertext disagreement** | a ciphertext byte, length, or a canonical edit of a seal artifact digest | task 3, `CiphertextLength` / `CiphertextDigest` | nothing; no `.restore-work/` exists |
+| **T3: seal/control semantic disagreement** | a canonical edit of the seal's `manifest_digest`; a swapped manifest; an index mapping or policy change | task 5, `Binding` / `ControlDecode` | only the three control plaintexts; **no pack or payload plaintext** |
+
+The order is:
+1. verify every ciphertext against the seal;
+2. stage **only the three control artifacts**;
+3. bind them through 2B1;
+4. only then stage the pack and the coverage payloads.
 
 ## Global Constraints
 
@@ -52,7 +61,8 @@ Control-artifact tampering therefore refuses before **any pack or payload plaint
 - **Where code goes:**
   - `custody_restore.rs` is `#[cfg(unix)]` and crate-private, with `#[allow(dead_code)]` until 2B3b uses it. It is
     declared in `lib.rs` next to `custody_export`.
-  - The new constructor in `custody_capsule.rs` is **additive**; no existing validation is weakened.
+  - The new constructor in `custody_capsule.rs` is **additive** and **`pub(crate)`**, so the receipt-derived proof
+    boundary of the public API is unchanged. No existing validation is weakened.
   - The shared envelope fixture is `#[cfg(test)]` only.
   - No change to `custody_frame.rs`, `custody_walk.rs`, `custody_coverage.rs`, `custody_git.rs`, or `custody_mounts.rs`.
 - **Filesystem access:**
@@ -60,8 +70,13 @@ Control-artifact tampering therefore refuses before **any pack or payload plaint
     `open_existing_child_directory`, `open_regular_file`).
   - Every write is create-new beneath the retained destination descriptor.
   - Never overwrite, never follow a symlink, never delete, not even on failure.
-- **Budget:** one restore-wide `ScratchLedgerV1` reserves every staged byte and entry before writing it. The ceiling
-  is 10 GiB, the same as 2B2 §3.
+- **Budget:** one restore-wide `ScratchLedgerV1` reserves every staged byte and entry before writing it.
+  - The ceiling is 10 GiB (`RESTORE_BYTES_CEILING_V1 = 10 * 1024 * 1024 * 1024`), the same as 2B2 §3.
+  - It is enforced by a validating constructor, not by a comment.
+- **Device containment (design §4):**
+  - Every directory the restore creates must have the destination root's `dev`.
+  - A mount census (`custody_mounts::mount_points_v1` / `mount_point_within`, consumed unchanged) must show no mount
+    point strictly within the destination. It runs at preflight and again before `VerifiedCapsuleV1` is returned.
 - **Bounded control reads:** the seal file and each control plaintext are read through a bounded read (1 MiB, the
   2B1 canonical metadata ceiling); oversize refuses.
 - **Capsule exterior:** exactly the seal's artifact files plus `custody-seal.v1`. Any other entry refuses (review
@@ -83,6 +98,10 @@ These are inputs the design implies but does not spell out. Each has a test in t
    size (task 3: `oversize_seal_refuses`; task 5: `oversize_control_plaintext_refuses`).
 5. **Destination replaced between preflight and the first staged write.** Refuse, with no write outside the
    original destination (task 4: `destination_swapped_before_first_write_refuses`).
+6. **A retained ciphertext modified in place after verification.** The bytes the opener consumes are re-verified
+   against the seal (task 5: `ciphertext_changed_after_verification_refuses`).
+7. **A capsule whose file chunking differs from the sealer's.** The fixture opener parses the magic across arbitrary
+   chunk boundaries (task 1: `fixture_opener_accepts_split_magic`, `fixture_opener_accepts_coalesced_magic`).
 
 ---
 
@@ -93,35 +112,50 @@ These are inputs the design implies but does not spell out. Each has a test in t
   `#[cfg(test)] pub(crate) mod custody_envelope_fixture;`).
 - Modify: `crates/bridge-core/src/custody_export_tests.rs`. **Move** `FixtureSealerV1`, `SealerFaultV1`, and
   `FIXTURE_ENVELOPE_MAGIC_V1` out, and import them. Their behavior is byte-identical.
+  - `SealerFaultV1`'s two existing fields (`stop_after_chunks`, `swap_receipt_contexts`) become `pub(crate)`, so the
+    existing field-literal constructions in export controls 15 and 16 compile unchanged.
+  - The existing `envelope_format()` helper moves too, as `pub(crate) fn fixture_envelope_format_v1()`.
 
 **Interfaces:**
 - Produces:
 
 ```rust
 pub(crate) const FIXTURE_ENVELOPE_MAGIC_V1: &[u8; 8] = b"A2AFIX1\n";
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct SealerFaultV1 { pub(crate) stop_after_chunks: Option<usize>, pub(crate) swap_receipt_contexts: bool }
+pub(crate) fn fixture_envelope_format_v1() -> CustodyEnvelopeFormatV1; // ("capsule-v1", "a2a-bridge-2b2-fixture", "0.1.0")
 pub(crate) struct FixtureSealerV1 { /* unchanged */ }
 impl FixtureSealerV1 { pub(crate) fn honest() -> Self; pub(crate) fn faulted(fault: SealerFaultV1, target: Option<&[u8]>) -> Self; }
-pub(crate) struct FixtureOpenerV1 { fault: OpenerFaultV1 }
+pub(crate) struct FixtureOpenerV1 { fault: OpenerFaultV1, calls: Cell<usize> }
 #[derive(Default, Clone, Copy)]
-pub(crate) struct OpenerFaultV1 { pub(crate) lie_about_receipt_length: bool, pub(crate) refuse: bool }
-impl FixtureOpenerV1 { pub(crate) fn honest() -> Self; pub(crate) fn faulted(fault: OpenerFaultV1) -> Self; }
+pub(crate) struct OpenerFaultV1 { pub(crate) lie_about_receipt_length: bool, pub(crate) refuse: bool, pub(crate) stop_after_chunks: Option<usize> }
+impl FixtureOpenerV1 { pub(crate) fn honest() -> Self; pub(crate) fn faulted(fault: OpenerFaultV1) -> Self; pub(crate) fn calls(&self) -> usize; }
 impl sealed::Sealed for FixtureOpenerV1 {}
-impl CustodyEnvelopeOpenerV1 for FixtureOpenerV1 { /* first chunk must equal the magic; every later chunk is written verbatim; the receipt carries the plaintext length and SHA-256 */ }
+impl CustodyEnvelopeOpenerV1 for FixtureOpenerV1 { /* see Step 3 */ }
 ```
 
 - [ ] **Step 1: write the failing tests.** Add `#[cfg(test)] mod tests` in the new module:
   - `fixture_opener_round_trips_the_fixture_sealer`: seal a 3-chunk plaintext with `FixtureSealerV1::honest()` into
     an in-memory ciphertext sink, then open it with `FixtureOpenerV1::honest()` into an in-memory plaintext sink.
     The bytes, the receipt length, and the SHA-256 are all equal.
-  - `fixture_opener_refuses_a_wrong_magic`: the first ciphertext chunk `b"NOTMAGIC"` gives `Err(InvalidInput)`.
-  - `fixture_opener_refuses_an_empty_envelope`: no chunks gives `Err`.
+  - `fixture_opener_accepts_split_magic`: the same envelope re-chunked as `b"A2A"`, `b"FIX1\n" ‖ body[..3]`, and then
+    the rest. The plaintext is byte-equal.
+  - `fixture_opener_accepts_coalesced_magic`: the whole envelope as one chunk. The plaintext is byte-equal.
+  - `fixture_opener_refuses_a_wrong_magic`: `b"NOTMAGIC"` followed by a body gives `Err(InvalidInput)`, with nothing
+    written to the sink.
+  - `fixture_opener_refuses_a_short_envelope`: no chunks, or only `b"A2AFIX"`, gives `Err(InvalidInput)`.
+  - `fixture_opener_refuses_an_unsupported_format`: an open request whose context format differs from
+    `fixture_envelope_format_v1()` gives `Err(InvalidInput)` before any chunk is read.
 - [ ] **Step 2: run and verify RED.** Run `cargo test -p bridge-core --lib custody_envelope_fixture`. Expected: a
   compile error (the module does not exist yet).
 - [ ] **Step 3: implement.** Move the sealer verbatim, and implement `FixtureOpenerV1::open`:
-  - read `ciphertext.next_chunk()` until `None`;
-  - require the first chunk's bytes to equal `FIXTURE_ENVELOPE_MAGIC_V1`;
-  - write every later chunk to `plaintext` with ordinals renumbered from 0, and the last-chunk flag set on the final
-    one (an empty plaintext is one empty last chunk);
+  - refuse unless `request.context().format() == &fixture_envelope_format_v1()`;
+  - read `ciphertext.next_chunk()` until `None`, treating the source as one byte stream: the chunk boundaries are
+    transport, not framing;
+  - accumulate the first 8 bytes across as many chunks as needed, and require them to equal
+    `FIXTURE_ENVELOPE_MAGIC_V1`. Nothing is written to the sink before the magic is proven;
+  - forward the remainder of the chunk that completes the magic, and every later chunk, to `plaintext`. Ordinals are
+    renumbered from 0, and the last-chunk flag is set on the final one (an empty plaintext is one empty last chunk);
   - hash while writing, and return `CustodyEnvelopeOpenReceiptV1::new(len, sha)`;
   - `refuse` returns `Err(InvalidInput)`, and `lie_about_receipt_length` returns `len + 1`.
 - [ ] **Step 4: run and verify GREEN.** Run the new tests plus `cargo test -p bridge-core --lib custody_export`.
@@ -139,9 +173,16 @@ impl CustodyEnvelopeOpenerV1 for FixtureOpenerV1 { /* first chunk must equal the
 
 ```rust
 impl CustodyCapsuleSealProofV1 {
-    /// A seal read back from a published capsule. Validated exactly as open requests validate a seal.
-    pub fn from_published_seal_v1(seal: CustodySealV1) -> Result<Self, CustodyCapsuleErrorV1> {
+    /// A seal read back from a published capsule, for the crate-private restore only. It is validated as
+    /// open requests validate a seal, and additionally every artifact as `from_seal_artifact` validates one.
+    pub(crate) fn from_published_seal_v1(seal: CustodySealV1) -> Result<Self, CustodyCapsuleErrorV1> {
         validate_capsule_seal_for_open_request(&seal)?;
+        for artifact in seal.artifacts() {
+            validate_selected_seal_artifact_limits(artifact)?;
+            if artifact.byte_length() == 0 {
+                return Err(CustodyCapsuleErrorV1::InvalidInput);
+            }
+        }
         Ok(Self { seal })
     }
 }
@@ -151,9 +192,14 @@ impl CustodyCapsuleSealProofV1 {
   - `published_seal_round_trips_through_a_seal_proof`: build a proof with `from_receipts` (the existing test helper),
     encode `proof.seal()` canonically, decode it with `CustodySealV1::decode_canonical`, and pass it to
     `from_published_seal_v1`. It returns `Ok`, and `seal()` is equal.
-  - `published_seal_refuses_what_open_requests_refuse`: for each seal that
-    `preflight_generic_seal_for_capsule_v1` refuses (the existing negative fixtures: a zero-length artifact, a wrong
-    format), `from_published_seal_v1` also returns `Err`.
+  - `published_seal_refuses_a_zero_length_artifact`: a canonical seal with one zero-length artifact gives `Err`.
+    `validate_capsule_seal_for_open_request` alone accepts it, so this test is RED against the one-line body.
+  - `published_seal_refuses_an_over_limit_artifact`: an artifact whose length exceeds the selected-artifact limit
+    gives `Err`.
+  - `published_seal_refuses_what_open_requests_refuse`: each seal the existing seal-wide negative fixtures refuse
+    also gives `Err`.
+  - The format check belongs to the opener (task 1), not the seal. The open-request validator accepts any bounded,
+    non-empty format.
 - [ ] **Step 2: RED.** It does not compile, because the function is missing.
 - [ ] **Step 3: implement.** Add exactly the constructor above.
 - [ ] **Step 4: GREEN.** Run the `custody_capsule` tests.
@@ -178,11 +224,25 @@ pub(crate) struct PinnedCapsuleV1 { root: PinnedDirectoryV1, seal: CustodyCapsul
 pub(crate) struct VerifiedCiphertextV1 { pub(crate) name: LosslessPathV1, pub(crate) file: File /* retained, no-follow, rewound */, pub(crate) length: u64 }
 pub(crate) fn pin_and_verify_capsule_v1(capsule_root: &Path) -> Result<PinnedCapsuleV1, CustodyRestoreErrorV1>;
 #[derive(Debug, thiserror::Error)]
-pub(crate) enum CustodyRestoreErrorV1 { /* SealUnreadable, SealInvalid, CapsuleEntryUnexpected, CapsuleEntryMissing, CiphertextLength{name}, CiphertextDigest{name}, SymlinkRefused{name}, Io(String), … later tasks add variants */ }
+pub(crate) enum CustodyRestoreErrorV1 {
+    // task 3
+    SealUnreadable(String), SealInvalid(String), CapsuleEntryUnexpected { name: String }, CapsuleEntryMissing { name: String },
+    CiphertextLength { name: String }, CiphertextDigest { name: String }, SymlinkRefused { name: String },
+    // task 4
+    DestinationInvalid(String), IdentityChanged(String), Budget(String), DeviceCrossing { name: String }, MountBoundary(String),
+    // task 5
+    Open(CustodyCapsuleErrorV1), OpenerReceiptMismatch { name: String }, CiphertextChanged { name: String },
+    StagingCollision { name: String }, ControlOversize { name: String }, ControlDecode { name: String }, Binding(CustodyCapsuleErrorV1),
+    // task 6
+    FrameInvalid { class: CustodyCoverageClassV1 },
+    Io(String),
+}
 ```
 
 **Behavior:**
-1. `PinnedDirectoryV1::open(capsule_root)`.
+1. `PinnedDirectoryV1::open(capsule_root, "custody restore capsule root")`. Every listing uses
+   `list_child_names(&mut remaining, label)`, with one shared entry budget per capsule
+   (`remaining = RESTORE_CAPSULE_ENTRY_BUDGET_V1 = 4096`).
 2. Open `custody-seal.v1` with `open_regular_file`. A bounded read (at most `RESTORE_CONTROL_READ_BOUND_V1`, with the
    `+1` probe) refuses oversize input. Then `CustodySealV1::decode_canonical`, then `from_published_seal_v1`.
 3. List the capsule exterior. It must equal exactly `{"custody-seal.v1"} ∪ {first components of every seal artifact
@@ -201,8 +261,7 @@ pub(crate) enum CustodyRestoreErrorV1 { /* SealUnreadable, SealInvalid, CapsuleE
 
     ```rust
     /// Copies `capsule` to `out` (owner-private, new), replacing the plaintext of each named artifact. The fixture
-    /// envelope is `A2AFIX1
-` followed by the plaintext, so plaintext = ciphertext[8..]. Every ciphertext is
+    /// envelope is `A2AFIX1\n` followed by the plaintext, so plaintext = ciphertext[8..]. Every ciphertext is
     /// re-wrapped, and the seal is rebuilt with `CustodySealV1::new` from the original seal's recipients, format,
     /// tool, and version, with fresh `CustodySealedArtifactV1::new(name, len, sha256)` rows. The seal's manifest
     /// digest is `manifest_digest.unwrap_or(original)`, and the seal is written via `encode_canonical`.
@@ -215,7 +274,14 @@ pub(crate) enum CustodyRestoreErrorV1 { /* SealUnreadable, SealInvalid, CapsuleE
   - `pins_and_verifies_an_exported_capsule`: `Ok`, the ciphertext count equals the seal's artifact count, and every
     length equals the seal's.
   - `oversize_seal_refuses`: replace the seal with 1 MiB + 1 bytes, giving `SealUnreadable`.
-  - `tampered_seal_refuses`: flip one byte of the seal JSON, giving `SealInvalid`.
+  - `malformed_seal_refuses` (T1): three variants each give `SealInvalid`, and no `.restore-work/` exists:
+    - a seal that is not valid JSON;
+    - valid JSON that is not canonical (an added space);
+    - a canonical seal with a zero-length artifact.
+  - `seal_artifact_digest_edit_refuses_before_staging` (T2): a canonical re-encoding of the seal with one
+    artifact's `sha256` changed gives `CiphertextDigest`, and no `.restore-work/` exists.
+  - `seal_manifest_digest_edit_passes_task_3` (T3 boundary): a canonical re-encoding with one hex character of
+    `manifest_digest` changed passes `pin_and_verify_capsule_v1`. Task 5 owns its refusal.
   - `ciphertext_length_mismatch_refuses`: append one byte to an artifact, giving `CiphertextLength`.
   - `ciphertext_digest_mismatch_refuses`: flip one byte of an artifact at the same length, giving `CiphertextDigest`.
   - `missing_artifact_refuses`: remove one artifact, giving `CapsuleEntryMissing`.
@@ -241,7 +307,14 @@ pub(crate) enum CustodyRestoreErrorV1 { /* SealUnreadable, SealInvalid, CapsuleE
 - Produces:
 
 ```rust
-pub(crate) struct CustodyRestoreBudgetV1 { pub(crate) max_restore_bytes: u64 /* ≤ 10 GiB */ }
+pub(crate) const RESTORE_BYTES_CEILING_V1: u64 = 10 * 1024 * 1024 * 1024;
+pub(crate) struct CustodyRestoreBudgetV1 { max_restore_bytes: u64 }
+impl CustodyRestoreBudgetV1 {
+    /// Refuses 0 and anything above RESTORE_BYTES_CEILING_V1.
+    pub(crate) fn new(max_restore_bytes: u64) -> Result<Self, CustodyRestoreErrorV1>;
+    pub(crate) const fn ceiling() -> Self; // exactly RESTORE_BYTES_CEILING_V1
+    pub(crate) const fn max_restore_bytes(&self) -> u64;
+}
 pub(crate) struct RestoreDestinationV1 { root: PinnedDirectoryV1, work: PinnedDirectoryV1, plain: PinnedDirectoryV1, ledger: RefCell<ScratchLedgerV1> }
 pub(crate) fn prepare_destination_v1(destination_root: &Path, capsule: &PinnedCapsuleV1, budget: CustodyRestoreBudgetV1) -> Result<RestoreDestinationV1, CustodyRestoreErrorV1>;
 ```
@@ -252,6 +325,15 @@ pub(crate) fn prepare_destination_v1(destination_root: &Path, capsule: &PinnedCa
   pin]`). The reverse check, a destination inside the capsule, also goes through the same predicate.
 - Create `.restore-work/` and `.restore-work/plain/` create-new, charging the ledger.
 - Recheck the destination pin before the first create.
+- **Device containment:**
+  - Record the destination root's `dev` at preflight.
+  - After each create-new directory, compare the created directory's `dev`, from its retained descriptor, with the
+    root's. A mismatch is `DeviceCrossing{name}`.
+  - Take the mount census over the destination's canonical path at preflight. Any mount point
+    `mount_point_within(mount_point, dest)` gives `MountBoundary`.
+  - A census error (unsupported, oversize, malformed, or empty) also refuses, as `MountBoundary`.
+  - `RestoreDestinationV1::recheck_containment(&self)` re-runs the census and is called again by task 6 before
+    returning.
 - Map the ledger's and preflight's `CustodyExportErrorV1` into `CustodyRestoreErrorV1::Budget(String)` and
   `DestinationInvalid(String)` respectively. Both constructors are already `pub(crate)`:
   `ScratchLedgerV1::new(limit)`, `reserve`, `reserve_entries`, and `preflight_scratch_root`.
@@ -265,6 +347,15 @@ pub(crate) fn prepare_destination_v1(destination_root: &Path, capsule: &PinnedCa
     either directory (review focus 5).
   - `ledger_max_and_max_plus_one`: with `max_restore_bytes` exactly equal to the bytes this task charges, it
     succeeds; with one byte less, it gives `Budget`.
+  - `budget_ceiling_and_ceiling_plus_one`: `CustodyRestoreBudgetV1::new(RESTORE_BYTES_CEILING_V1)` is `Ok`;
+    `new(RESTORE_BYTES_CEILING_V1 + 1)` and `new(0)` give `Budget`.
+  - `mount_inside_destination_refuses`: `custody_mounts::seam::install_list` with a mount point one level below the
+    destination's canonical path gives `MountBoundary`, and no `.restore-work/` exists. A mount point equal to the
+    destination, or above it, is accepted.
+  - `census_failure_refuses`: an installed census that returns `Err(Malformed)` gives `MountBoundary`.
+  - `created_directory_on_another_device_refuses`: a test seam in `custody_restore.rs`,
+    `override_created_dev_for_test`, reports a different `dev` for the created `.restore-work/`. The result is
+    `DeviceCrossing{".restore-work"}`.
 - [ ] **Step 2: RED**, then **Step 3: implement**, then **Step 4: GREEN.**
 - [ ] **Step 5: commit.** Commit with the message `feat(bridge-core): restore destination preflight and ledger (2B3a task 4)`.
 
@@ -288,12 +379,33 @@ fn bind_control_v1(dest: &RestoreDestinationV1, capsule: &PinnedCapsuleV1, opene
 **Behavior of `stage_one_v1`:**
 - The staged file mirrors the logical name under `plain/`, creating component directories new and charging the
   ledger.
-- The ciphertext chunk source reads the retained ciphertext descriptor in `max_chunk_bytes` chunks.
+- **Verified ciphertext source (the consumed bytes are bound to the seal):**
+  - The ciphertext chunk source, `VerifiedCiphertextSourceV1`, reads the retained ciphertext descriptor from offset 0
+    in `max_chunk_bytes` chunks.
+  - It feeds every chunk to a `CustodyEnvelopeSourceValidatorV1`, built from
+    `CustodyEnvelopeSourceDescriptorV1::new(request.ciphertext_length(), limits)`.
+  - After the opener returns, the stager calls the validator's `finish()`, which requires full consumption to the
+    declared total. It then requires `receipt.total_bytes() == request.ciphertext_length()` and
+    `receipt.sha256() == request.ciphertext_sha256()`.
+  - A mismatch, or an opener that stops early, gives `CiphertextChanged{name}`. The staged file stays, and nothing is
+    deleted.
+  - This is the exporter's `ExactTotalPlaintextSourceV1` pattern (`custody_export.rs`) applied to the ciphertext.
 - The plaintext sink writes create-new, reserving each chunk in the ledger before writing it, and **measures its own
   length and SHA-256**. If the opener's receipt disagrees, it refuses with `OpenerReceiptMismatch` (review focus 3).
 
 **Behavior of `bind_control_v1`:** stages exactly the three control names, reads each back through a bounded read
 (1 MiB), decodes them, and calls `CustodyCapsuleBindingV1::new`.
+
+**The bounded reader** is one function over any reader, used for both the seal (task 3) and the controls:
+`fn read_bounded_v1(reader: &mut dyn Read, bound: u64) -> Result<Vec<u8>, BoundedReadErrorV1>`.
+- It never requests more than `bound + 1` bytes in total.
+- It allocates at most `bound + 1`.
+- Reading `bound + 1` bytes is `Oversize`.
+
+**Create-new staging:**
+- Every staged directory and file is created with `create_new_child_directory` / `create_new_regular_child`,
+  which refuse an existing entry or a planted symlink.
+- A collision is `StagingCollision{name}`, and the pre-existing object is left untouched.
 
 - [ ] **Step 1: failing tests.** Build capsules with the fixture sealer.
   - `binds_an_exported_capsule`: `Ok`, with only the 3 control plaintexts staged.
@@ -309,7 +421,20 @@ fn bind_control_v1(dest: &RestoreDestinationV1, capsule: &PinnedCapsuleV1, opene
     `OpenerReceiptMismatch`.
   - `opener_refusal_propagates`: `refuse` gives `Open(..)`.
   - `oversize_control_plaintext_refuses`: a sealed manifest artifact of 1 MiB + 1 plaintext bytes gives
-    `ControlOversize`, without reading past the bound.
+    `ControlOversize`.
+  - `bounded_reader_never_requests_past_the_probe`: a counting reader over 4 MiB with `bound = 1 MiB` gives
+    `Oversize`, with at most `bound + 1` bytes requested. A reader that fails any read past `bound + 1` also gives
+    `Oversize`, not an I/O error. A `read_to_end` implementation turns this red.
+  - `seal_manifest_digest_edit_refuses_at_binding` (T3): the task 3 canonical `manifest_digest` edit gives
+    `Binding(..)`. Only the three control plaintexts exist under `plain/`; `plain/payload/` and `plain/git/` do not.
+  - `ciphertext_changed_after_verification_refuses` (review focus 6): a test seam
+    `after_ciphertext_verification_for_test` rewrites one control ciphertext in place, through the same inode, with a
+    same-length, internally valid fixture envelope of different plaintext. The result is `CiphertextChanged{name}`.
+  - `opener_stopping_early_refuses`: an opener fault `stop_after_chunks: Some(1)`, added to `OpenerFaultV1`, gives
+    `CiphertextChanged{name}`.
+  - `staging_collision_refuses`: a hook plants a regular file at the first staged leaf, then separately a symlink to
+    a file outside the destination. Each gives `StagingCollision`, the planted object's bytes and target are
+    unchanged, and the outside file is unchanged.
 - [ ] **Step 2: RED**, then **Step 3: implement**, then **Step 4: GREEN.**
 - [ ] **Step 5: commit.** Commit with the message `feat(bridge-core): stage and bind capsule control artifacts (2B3a task 5)`.
 
@@ -328,11 +453,16 @@ pub(crate) fn verify_and_stage_v1(capsule_root: &Path, destination_root: &Path, 
 ```
 
 **Behavior:**
+0. The order is: `pin_and_verify_capsule_v1` (task 3), then `prepare_destination_v1` (task 4), then
+   `bind_control_v1` (task 5). A T1 or T2 refusal therefore happens before `.restore-work/` exists.
 1. After `bind_control_v1`, stage every remaining index row in index order.
 2. For each `CoveragePayload(class)`, decode the staged plaintext with the expected header `(class,
    manifest.generation_id())` and the frame budget. Drain every entry's content, and require `Ok(None)`, so the
    trailer digest, count, and total are verified. Rewind afterwards.
 3. The pack is staged only; 2B3b verifies it with `index-pack`.
+4. Call `destination.recheck_containment()` before returning.
+5. `staged` is in exactly `control.index`'s artifact order, the index's canonical sorted order, including the three
+   controls. Consumers select descriptors by name, and the order is a checked invariant.
 
 - [ ] **Step 1: failing tests.**
   - `verifies_and_stages_a_fixture_stream_capsule`: the 2B2 harness capsule, whose fixture streams are **not**
@@ -349,6 +479,14 @@ pub(crate) fn verify_and_stage_v1(capsule_root: &Path, destination_root: &Path, 
 
     Each gives `FrameInvalid{class}`.
   - `nothing_outside_restore_work`: after success, the destination contains exactly `.restore-work/**`.
+  - `staged_order_equals_index_order`: the staged names equal the index's artifact names, in order.
+  - `every_ciphertext_verified_before_the_first_open`: in a plan-backed capsule, corrupt the lexically **last**
+    artifact's ciphertext. A counting opener (`FixtureOpenerV1::calls()`) records 0 calls, the result is
+    `CiphertextDigest`, and no `.restore-work/` exists.
+  - `capsule_is_never_written`: snapshot every capsule file (bytes, mode, and mtime) and its directory listings
+    before `verify_and_stage_v1`, on success and on each of three failure paths (T1, T2, T3). They are equal after.
+  - `mount_appearing_during_restore_refuses`: an installed census whose second call lists a mount point inside the
+    destination gives `MountBoundary` from the final recheck.
 - [ ] **Step 2: RED**, then **Step 3: implement**, then **Step 4: GREEN.**
 - [ ] **Step 5: commit.** Commit with the message `feat(bridge-core): stage payloads and decode-verify frames (2B3a task 6)`.
 
@@ -368,7 +506,16 @@ pub(crate) fn verify_and_stage_v1(capsule_root: &Path, destination_root: &Path, 
   - receipt versus measurement off;
   - staging the payloads before binding;
   - the frame drain skipped;
-  - the class or generation expectation dropped.
+  - the class or generation expectation dropped;
+  - the fixture opener requiring the magic in the first chunk (the revision 1 bug);
+  - the per-artifact zero-length check in `from_published_seal_v1` off;
+  - the consumed-ciphertext validator off;
+  - the device comparison off;
+  - the preflight census off, and the final census recheck off;
+  - the budget ceiling check off;
+  - create-new replaced by create-or-truncate;
+  - the bounded reader replaced by `read_to_end`;
+  - the staged-order sort off.
 
   Each row must turn its own control red. Restore byte-exactly, and prove the source equals its snapshot.
 - [ ] **Step 2: gates.**
@@ -418,6 +565,27 @@ Stop and report if any of the following is needed:
 - a new dependency.
 
 Also stop on an open-class review population, or a review cap exhausted without convergence.
+
+## Revision history
+
+**Revision 1** (`e230efd3`), spec review round 1: REJECT, with 8 WRONG MATERIAL, 1 WRONG IMMATERIAL, and 4 SMELL
+findings. All are folded in revision 2:
+
+| # | Finding | Fold |
+|---|---|---|
+| W1 | Public constructor weakens the receipt-derived proof boundary | `pub(crate)` (Global Constraints, task 2) |
+| W2 | One-line constructor accepts a zero-length artifact | Per-artifact limit and nonzero checks, a RED test for each; the format check moved to the opener |
+| W3 | "Before any plaintext" is false for canonical seal/control disagreement | The T1/T2/T3 timing contract, a named test per tier |
+| W4 | Opener treats a chunk boundary as envelope framing | Stream parse of the magic; split and coalesced tests |
+| W5 | Consumed ciphertext not bound to the seal | `VerifiedCiphertextSourceV1` with the envelope source validator; in-place rewrite and early-stop tests |
+| W6 | Destination device-crossing invariant omitted | Per-directory `dev` check plus the census at preflight and before return; seam tests |
+| W7 | 10 GiB ceiling only a comment | Validating `CustodyRestoreBudgetV1::new`; ceiling and ceiling+1 tests |
+| W8 | Moved `SealerFaultV1` fields private | `pub(crate)` fields; the export controls compile unchanged |
+| W9 | `PinnedDirectoryV1::open` / `list_child_names` signatures | Corrected, with a label and a shared entry budget |
+| S1 | No proof all ciphertexts are verified before the first open | `every_ciphertext_verified_before_the_first_open` with a counting opener |
+| S2 | Bounded-read tests don't prove bounded reading | `read_bounded_v1` over `Read`, with a counting and failing reader test |
+| S3 | Create-new and capsule read-only claims lack controls | Collision and planted-symlink tests; capsule snapshot on success and failure; matrix row |
+| S4 | Staged index order not asserted | `staged_order_equals_index_order` |
 
 ## Commit Message
 
