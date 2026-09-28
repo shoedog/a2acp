@@ -584,6 +584,8 @@ Also stop on an open-class review population, or a review cap exhausted without 
 
 ## Revision history
 
+The reviewed SHAs `e230efd3` (revision 1) and `173eb88e` (revision 2) were rebased onto `main` after #123 merged, as `24d2bda1` and `6c155852`. Their document bytes are unchanged.
+
 **Revision 1** (`e230efd3`), spec review round 1: REJECT, with 8 WRONG MATERIAL, 1 WRONG IMMATERIAL, and 4 SMELL
 findings. All are folded in revision 2:
 
