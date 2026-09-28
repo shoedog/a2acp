@@ -18,6 +18,9 @@
 - **Excluded here:** `cargo deny` (not installed), the controller's macOS lane, and CI's native ext4 lane (§6).
 - **Repair round 1 (§10)** closes blocker B1 of the Sol implementation review, round 1. Its snapshot, matrix rows, and
   totals supersede the ones above for the final bytes.
+- **Repair round 2 (§11)** closes B1 as the Sol implementation review, round 2, re-raised it: the final gate's order.
+  It also declares the final gate's guarantee boundary (§11.6). Its snapshot, matrix rows, and totals supersede §10's
+  for the final bytes.
 
 This handoff records evidence only; it claims no review approval.
 
@@ -634,6 +637,162 @@ CARGO_INCREMENTAL=0`, with `HTTP_PROXY`, `HTTPS_PROXY`, `http_proxy`, and `https
 crates/bridge-core/src/custody_restore.rs        (the final gate; one #[cfg(test)] hook point)
 crates/bridge-core/src/custody_restore_tests.rs  (4 controls and 2 helpers)
 docs/superpowers/reviews/2026-09-28-adr0041-slice2b3a-implementation-handoff.md (§10 and a status pointer)
+```
+
+Nothing is committed in this round, and `.git/A2A_COMMIT_MSG` is not written.
+
+## 11. Repair round 2 (Sol implementation review, round 2)
+
+The review's verdict was **REJECT**, with one blocker: B1, still unresolved. This round fixes that blocker only, inside
+the task's Files paths. Every result below is on the final bytes, snapshot `ab2972aa675e4e3f`. Raw output is in
+`.git/a2a-bridge/red/repair2-*` and `.git/a2a-bridge/gates/repair2-*`.
+
+### 11.1 Finding B1, round 2 (WRONG MATERIAL): the final gate checked identity before the census
+
+- Round 1's `final_gate` ran the root pin first, then the staging-chain sweep, and the mount census last. The census
+  may be slow. `verify_and_stage_v1` then returned `Ok` with no further identity check.
+- **The failure case.** Census call 1 (preflight) returns the ordinary list. During census call 2 (the final gate), a
+  racer renames `dest` to `dest-moved`, creates an empty `dest`, and the census returns only `/`. Every identity check
+  had already passed, so the restore returned `Ok(VerifiedCapsuleV1)` while the named destination was empty.
+- §10.2 noted that a swap inside the census would come after the identity checks, but took that as the brief's order.
+  §11.3 supersedes §10.3's order.
+
+### 11.2 RED
+
+| Stage | Reader under test | Controls run | Result |
+|---|---|---|---|
+| RED (`repair2-red.txt`) | exactly `59b252c7`'s `custody_restore.rs` (SHA-256 `320c9065…`, equal to `git show HEAD:`); only the new control was added to the tests | the new control, the four round-1 controls, and `mount_appearing_during_restore_refuses` | the new control FAILED at `custody_restore_tests.rs:1981` with `observed Ok("VerifiedCapsuleV1")`; the other five ok. 5 passed, 1 failed |
+| GREEN (`repair2-green.txt`) | the fixed reader (`1b5dd96d…`), with the same test bytes (`4efae0bb…`) | the same six | 6 passed, 0 failed |
+
+- The test bytes did not change between RED and GREEN, or afterwards.
+- No new hook point was needed. The census seam's second call is the final gate's census.
+
+### 11.3 Fix (`custody_restore.rs`, `final_gate` only)
+
+The gate's three checks are unchanged. Only their order changed:
+1. **The census.** `recheck_containment()` runs first, because it is the check that may be slow.
+2. **The staging chains.** `recheck_staging_chain(b"")` runs, then the check for every retained key, as in §10.3.
+3. **The root pin.** `pinned_root_unchanged(&self.root)` runs last. It is the last fallible check before
+   `Ok(VerifiedCapsuleV1)`.
+
+- **Why the root pin is last.**
+  - The chain sweep reads each entry through retained descriptors. A root rename carries those descriptors along
+    intact, so the sweep still agrees after a root swap (§10.5). Only the root pin sees a root swap.
+  - Because it runs last, the root pin sees a root swap made during the census or during the sweep.
+- **What else changed.**
+  - The doc comment now states the new order and the boundary in §11.6.
+  - No other code changed. No error variant or hook point was added, and `verify_and_stage_v1` is byte-identical.
+- **The root pin's form.** The root pin is written as `…?;` followed by `Ok(())`, not as a tail expression. So the
+  persisted `M-final-root-identity` target applies unchanged.
+
+### 11.4 Control (1 new, in `custody_restore::tests`)
+
+| Control | Swap | Asserts after the fix |
+|---|---|---|
+| `final_gate_refuses_destination_root_swapped_during_final_census` | The census seam returns `["/"]` on call 1 (preflight). On call 2 (the final gate), it renames `dest` to the sibling `dest-moved`, recreates `dest` empty with mode 0700, and returns `["/"]` | `IdentityChanged` from the root pin ("now resolves to a different directory"); exactly 2 census calls; `dest` is empty; every sealed artifact is a file under `dest-moved/.restore-work/plain/` |
+
+The four round-1 controls and `mount_appearing_during_restore_refuses` pass unchanged: see the GREEN row in §11.2 and
+the gates in §11.7.
+
+### 11.5 Mutation rows
+
+**Harness changes (`matrix.py`):**
+- **A new row, `M-final-census-first`.** It replaces the fixed gate body with round 1's body, which moves the census
+  back after the identity sweep. Before the run, the mutated `final_gate` was checked to be byte-identical to
+  `59b252c7`'s `final_gate`, from its signature to its closing brace.
+- **`M-census-final` is retargeted.** Its round-1 target, the tail `self.recheck_containment()`, is now the first line,
+  `self.recheck_containment()?;`. The mutation is the same in kind: the final census is removed.
+- **Unchanged rows.** `M-final-root-identity` and `M-final-staging-chain` are unchanged, because their target bytes
+  are unchanged.
+- `matrix.py check` reports **37 rows, 0 problems** on the snapshot.
+
+**The run.** There was one foreground run on the final bytes, snapshot `ab2972aa675e4e3f`, from 07:19:58Z to
+07:21:37Z, under `timeout 590`. **4 of 4 FLIPPED**, with 0 NOT-FLIPPED and 0 INADMISSIBLE.
+
+| ID | Task | Guard mutated | Named red | Verdict | Every failing control |
+|---|---|---|---|---|---|
+| M-final-census-first | R2/B1 | the final gate censuses first and ends with the root pin (mutated: the census moved back after the identity sweep) | final_gate_refuses_destination_root_swapped_during_final_census | FLIPPED | final_gate_refuses_destination_root_swapped_during_final_census |
+| M-final-root-identity | R1/B1 | the final gate proves the destination root pin unchanged | final_gate_refuses_a_destination_root_swapped_at_the_last_leaf | FLIPPED | final_gate_refuses_a_destination_root_swapped_at_the_last_leaf, final_gate_refuses_destination_root_swapped_during_final_census |
+| M-final-staging-chain | R1/B1 | the final gate rechecks .restore-work/, plain/, and every retained staging chain | final_gate_refuses_a_staging_parent_swapped_at_the_last_leaf, final_gate_refuses_restore_work_swapped_after_the_last_frame | FLIPPED | final_gate_refuses_a_staging_parent_swapped_at_the_last_leaf, final_gate_refuses_restore_work_swapped_after_the_last_frame |
+| M-census-final | T6.4 | the mount census runs again before VerifiedCapsuleV1 is returned | mount_appearing_during_restore_refuses | FLIPPED | final_gate_refuses_destination_root_swapped_during_final_census, mount_appearing_during_restore_refuses |
+
+- **Which rows were run.** The new row ran, and so did the three rows whose targets are in `final_gate`, the only
+  changed function.
+- **The 33 rows not re-run** target functions this round did not change.
+  - 28 have FLIPPED verdicts on snapshot `412f94d481773a0b` (§5), and 5 on snapshot `3e60cf312cf06e7c` (§10.5).
+  - The five files this round did not touch are byte-identical across all three snapshots.
+  - `table.md` lists those 33 rows as "not run", because it counts only rows run on the current snapshot.
+- **`M-final-census-first` flips only the new control.** The round-1 controls swap before the gate, so the gate catches
+  them in either order.
+- **The strays are expected.**
+  - Under `M-final-root-identity`, the new control also fails. Without the root pin, nothing sees a root swap.
+  - Under `M-census-final`, the new control also fails. With no second census the swap never happens, the result is
+    `Ok`, and the seam counts one call.
+
+**The source equals the snapshot.**
+- The harness logged `VERIFY OK: 7 files equal their snapshot ab2972aa675e4e3f; no pending marker` at 07:21:37Z.
+- Outside the harness, each live file's SHA-256 prefix equals its snapshot copy's, and all seven equal the manifest:
+
+  | File | SHA-256 prefix |
+  |---|---|
+  | `lib.rs` | `d11dd9db` |
+  | `custody_capsule.rs` | `3c43dedd` |
+  | `custody_envelope_fixture.rs` | `40030a73` |
+  | `custody_export.rs` | `cb9e7d3e` |
+  | `custody_export_tests.rs` | `b1c7bc0c` |
+  | `custody_restore.rs` | `1b5dd96d` |
+  | `custody_restore_tests.rs` | `4efae0bb` |
+
+- `cmp` finds all seven byte-identical to their snapshot copies. Each has the restore's fresh mtime, 07:21:37Z. No
+  `pending.json` exists.
+- `matrix.log` has 80 `APPLIED` and 80 `RESTORED` lines: 76 from earlier rounds and 4 here.
+- A `/proc` scan after the run found no cargo, rustc, or matrix process running.
+- **After this run, no snapshot file was edited.** `table.md` was rendered, and the gates below ran on those bytes.
+  Then only this handoff was written; it is outside the snapshot.
+
+### 11.6 The declared guarantee boundary of the final gate
+
+- **What the gate proves.** At its last check, the gate proves three things:
+  - the final census saw no mount point inside the destination;
+  - `.restore-work/`, `plain/`, and every retained staging directory are still the entries their parents hold;
+  - the destination's name still resolves to the root pin.
+- **The residual.** No gate can detect a change made after the last check instruction. There is always a last
+  instruction. This round documents that residual and does not try to fix it.
+- **Why it is out of scope.** Under the owner ruling, a hostile same-user racer is out of scope. The restore detects
+  changes and refuses at its gate points. It does not claim atomicity against a concurrent writer that runs as the
+  same user.
+- **What consumers rely on.** 2B3b and later consumers operate through the retained pins in `VerifiedCapsuleV1`, not by
+  path:
+  - the destination's root, `.restore-work/`, `plain/`, and staging-directory descriptors;
+  - each staged plaintext's open descriptor.
+
+  So a rename after the gate cannot redirect what they read. It can only mean that the named path no longer shows the
+  staged tree.
+
+### 11.7 Gates, on the final bytes after the matrix run
+
+Every cargo command ran with `CARGO_HOME=/cargo CARGO_NET_OFFLINE=true CARGO_TARGET_DIR=/tmp/target
+CARGO_INCREMENTAL=0`, with `HTTP_PROXY`, `HTTPS_PROXY`, `http_proxy`, and `https_proxy` unset.
+
+| Gate | Exit | Totals |
+|---|---|---|
+| `cargo fmt --all -- --check` | 0 | no diff |
+| `cargo clippy --locked --offline --workspace --all-targets -- -D warnings` | 0 | no warning or error |
+| `cargo test --locked --offline -p bridge-core --lib --no-fail-fast` | 0 | **1,096 passed**, 0 failed (1,095 + the 1 new control) |
+| `cargo test --locked --offline --workspace --all-targets --no-fail-fast` | 0 | 90 `test result` lines: **4,838 passed**, 0 failed, 13 ignored (4,837 + 1) |
+| `cargo test --locked --offline --workspace --no-fail-fast` | 0 | 106 lines, 16 doctest runs: **4,849 passed**, 0 failed, 13 ignored (4,848 + 1); the visibility doctest at line 541 passes |
+| `git diff --cached --check` after staging | 0 | no output |
+
+- **The lib count.** As in §10.6, the `--lib` run also prints one nested child-process line (1 passed). 1,096 is the
+  full lib line.
+- **Excluded:** as in §6.
+
+### 11.8 Staged paths
+
+```text
+crates/bridge-core/src/custody_restore.rs        (final_gate's order and its doc comment)
+crates/bridge-core/src/custody_restore_tests.rs  (1 control)
+docs/superpowers/reviews/2026-09-28-adr0041-slice2b3a-implementation-handoff.md (§11 and a status pointer)
 ```
 
 Nothing is committed in this round, and `.git/A2A_COMMIT_MSG` is not written.

@@ -1953,3 +1953,44 @@ fn final_gate_admits_an_unswapped_restore() {
     );
     assert!(destination.work().join("plain").join(&last).is_file());
 }
+
+// ---------------------------------------------------------------------------------------------
+// Repair round 2 (finding B1): the final gate's order
+// ---------------------------------------------------------------------------------------------
+
+/// Finding B1, round 2: during the final gate's census (the seam's second call), the destination
+/// root is renamed to a sibling outside it, an empty directory takes its name, and the census
+/// lists only `/`. Only a root identity check after the census can see that the named destination
+/// holds nothing.
+#[test]
+fn final_gate_refuses_destination_root_swapped_during_final_census() {
+    let exported = PlanBackedV1::export();
+    let capsule = exported.capsule();
+    let seal = read_seal(&capsule);
+    let destination = DestinationV1::new();
+    let moved = destination.area.join("dest-moved");
+    let (root, moved_to) = (destination.path.clone(), moved.clone());
+    let census = crate::custody_mounts::seam::install(Box::new(move |call| {
+        if call == 2 {
+            swap_out(&root, &moved_to);
+        }
+        Ok(vec![b"/".to_vec()])
+    }));
+
+    let result = restore(&capsule, &destination.path, &FixtureOpenerV1::honest());
+    assert!(
+        matches!(&result, Err(CustodyRestoreErrorV1::IdentityChanged(detail))
+            if detail.contains("now resolves to a different directory")),
+        "observed {:?}",
+        result.as_ref().map(|_| "VerifiedCapsuleV1")
+    );
+    assert_eq!(census.calls(), 2);
+    assert_eq!(destination.entries(), Vec::<String>::new());
+    for artifact in seal.artifacts() {
+        let name = lossy(artifact.name().as_bytes());
+        assert!(
+            moved.join(".restore-work/plain").join(&name).is_file(),
+            "{name} is staged under dest-moved"
+        );
+    }
+}

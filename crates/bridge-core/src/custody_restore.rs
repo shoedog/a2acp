@@ -602,19 +602,22 @@ impl RestoreDestinationV1 {
     /// frame verified, through retained descriptors, so an object renamed out of the destination
     /// after the last pre-create recheck would leave the named destination incomplete. The gate
     /// requires, in order:
-    /// 1. the destination root's name to still resolve to its pin;
+    /// 1. the mount census, again;
     /// 2. `.restore-work/`, `plain/`, and every retained staging directory to still be the entry
     ///    its parent holds;
-    /// 3. the mount census, again.
+    /// 3. the destination root's name to still resolve to its pin.
     ///
-    /// A changed identity is `IdentityChanged`.
+    /// The census may be slow, so it runs first, and the root pin is the last fallible check. A
+    /// change after that check is outside what any gate can see; consumers act through the
+    /// retained pins, not by path. A changed identity is `IdentityChanged`.
     fn final_gate(&self) -> Result<(), CustodyRestoreErrorV1> {
-        pinned_root_unchanged(&self.root).map_err(CustodyRestoreErrorV1::IdentityChanged)?;
+        self.recheck_containment()?;
         self.recheck_staging_chain(b"")?;
         for key in self.staging.borrow().keys() {
             self.recheck_staging_chain(key)?;
         }
-        self.recheck_containment()
+        pinned_root_unchanged(&self.root).map_err(CustodyRestoreErrorV1::IdentityChanged)?;
+        Ok(())
     }
 
     /// The retained pin of the staging directory at `key` (`plain/` itself for an empty key),
