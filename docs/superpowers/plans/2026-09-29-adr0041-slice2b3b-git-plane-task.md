@@ -3,7 +3,8 @@ task-type: implement
 ---
 # ADR-0041 Slice 2B3b — Git plane Implementation Plan
 
-**Revision:** 2; repairs the four Sol round-1 findings; pending round 2 of a two-round cap.
+**Revision:** 2, with nonblocking round-2 clarifications folded. Sol/xhigh APPROVE at `a25ddb01`:
+zero WRONG, two SMELL, zero blockers, round 2/2. Raw receipts and disposition live in `../reviews/`.
 **Implementation base:** bind the exact committed spec revision at dispatch. Drafting base is
 `5d2a82c457e626b2a108063e1de6b13b94e97f92` (PR #126). Reader 2B3a merged in PR #125 at `b7c85aee`.
 **Implementor:** Sonnet 5.5 through `a2a-bridge implement`, overriding the design's earlier Opus 5.5 direction
@@ -102,6 +103,11 @@ Implement phase G alongside the reader in `custody_restore.rs`, with tests in a 
   actual coverage classes. Reject symlinks and behavior-affecting/unsupported entries (config, hooks,
   shallow, objects, alternates and operation markers). A valid frame with a refs symlink must refuse with
   `active_materialization_began=false` and no `repository/`. Reverify/decode at use; later drift stays fatal.
+  The exact portable component rule for this Git-only slice is printable ASCII bytes `0x21..=0x7e`, no
+  backslash, and no trailing dot; reject all non-ASCII/non-UTF-8 components rather than normalize them.
+  The comparison key lowercases ASCII `A..Z`, preserving all other admitted bytes and component boundaries.
+  Reject distinct spellings sharing that key. Table tests cover A/a collision, distinct a/b, NFC/NFD and
+  non-UTF-8 refusal, backslash refusal and trailing-dot/space refusal. Ref grammar is an additional check.
 - [ ] Add accessor preservation tests: exact fields returned, canonical bytes/digests unchanged.
 - [ ] Record structural RED and behavioral RED against missing/disabled admission guards, then GREEN.
 
@@ -111,7 +117,10 @@ Implement phase G alongside the reader in `custody_restore.rs`, with tests in a 
   missing reachable object, invalid strict object syntax, malformed/truncated Git output, child failure,
   timeout, and an exhausted ledger refusing before a writing child starts.
 - [ ] Create pinned empty HOME and XDG children beneath `.restore-work/`, charging their entries, and
-  execute template-less `InitBare { dir: "git-bootstrap", object_format }` rooted at the retained work pin.
+  reserve, create-new and pin `git-bootstrap` BEFORE any Git child; its entry is included in the existing
+  nine-entry `for_init` reservation, not double-charged. Test preplanted empty directory, regular file and
+  symlink at that slot: refuse before Git starts and leave each untouched; retain the unplanted control.
+  Execute template-less `InitBare { dir: "git-bootstrap", object_format }` rooted at the retained work pin.
   Reuse the pure reservations in `GitDirectoryBudgetV1::for_init`; do NOT use the exporter's path-based
   `remeasure_git_directory_in`. Add a restore-specific bounded descriptor-relative census, retaining each
   child directory pin and opening regular files no-follow. Refuse links, special files, identity/device

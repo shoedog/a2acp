@@ -22,4 +22,9 @@ Verdict REJECT, WRONG=4, SMELL=0, blockers=4. Revision 2 repairs the existing ar
 4. Frame symlink ordering: complete active path/type/class/conflict prevalidation now belongs to admission,
    before the first repository write. A valid refs symlink refuses with no repository and false active flag.
 
-Independent round 2 must assess each correction and the complete revised task. No static approval yet.
+Independent Sol round 2 assessed all four corrections and the complete revised task at `a25ddb01`,
+then returned APPROVE, WRONG=0, SMELL=2, blockers=0, round=2/2. The two nonblocking recommendations are
+folded as clarifications: an exact printable-ASCII/casefold namespace with explicit refusal table, and
+create-new/pin bootstrap before InitBare with collision tests and no double charging. The raw APPROVE is
+bound to a25ddb01, not represented as an independent review of these later wording clarifications.
+Implementation review must bind the final committed task bytes. No implementation approval is claimed.
