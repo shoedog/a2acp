@@ -1,7 +1,7 @@
 # ADR-0041 Slice 2B3 — inert new-root restore and hidden-state proof (design)
 
-**Status:** design approved in conversation with the owner on 2026-09-27; the written spec awaits the owner's
-review.
+**Status:** design merged in PR #123. The owner approved the isolated-bootstrap refinement to phase G on
+2026-09-29 and selected Sonnet 5.5 for 2B3b implementation.
 **Parent plan:** `docs/superpowers/plans/2026-09-20-adr0041-slice2b-local-capsule-plan.md` §6 (restore boundary,
 two-plane reconstruction, required fixture) and §8 (gates).
 **Predecessors:** all of 2B1, 2B2a, 2B2, and 2B2b, merged (last: PR #121 at `3a9d8fb3`; flake fix PR #122 at
@@ -75,11 +75,14 @@ The output is a `VerifiedCapsuleV1` holding retained descriptors of every staged
 
 ### 3.2 Phase G — the Git plane (2B3b)
 
-1. Create `repository/`, then `.git` with the existing runner command `InitBare { dir: ".git" }`, rooted at
-   `repository/`.
+1. Initialize `.restore-work/git-bootstrap` with the existing runner command `InitBare`, rooted at the retained
+   `.restore-work/` descriptor. Its generated HEAD/config remain there: copying them into the final `.git` would
+   conflict with create-new restoration. This placement refinement was approved by the owner on 2026-09-29.
 2. Run `IndexPackStrictStdin` on the staged pack, then **2B2's closure proof**: `CatFileAllObjects` must equal the
    manifest inventory exactly, `RevListMissingPrint` must report nothing missing, and `FsckStrict` must pass.
-3. Write refs, `HEAD`, `ORIG_HEAD`/`FETCH_HEAD` when present, `packed-refs`, and `logs/**` from their verified frames,
+3. Create `repository/.git/` descriptor-relatively, and copy only verified object-store files from the bootstrap,
+   charging both copies to the original restore ledger. Write refs, `HEAD`, `ORIG_HEAD`/`FETCH_HEAD` when present,
+   `packed-refs`, and `logs/**` from their verified frames,
    descriptor-relative and create-new.
 4. **Cross-check** that every manifest original ref appears among the restored refs with the same target.
 5. Write the **synthesized** config:
@@ -87,7 +90,8 @@ The output is a `VerifiedCapsuleV1` holding retained descriptors of every staged
    - `core.bare=false`, `core.filemode=true`, `core.logallrefupdates=true`, `core.fsmonitor=false`;
    - **no** remotes, includes, filters, `core.hooksPath`, or credential helpers.
 
-   `InitBare --template=` creates no `hooks/` directory.
+   `InitBare --template=` creates no `hooks/` directory. Re-prove inventory, closure and strict fsck on the final
+   database once HEAD/config exist, before phase G succeeds. Preserve the bootstrap on success or refusal.
 
 No runner amendment is needed; every command already exists in 2B2a.
 
@@ -160,7 +164,8 @@ Local approval authorizes no push beyond the per-child PRs, and no custody, clea
 As for 2B2b:
 - a task spec derived from this design;
 - a Sol/xhigh spec review with a two-round cap;
-- implementation by **Opus 5.5** through `a2a-bridge implement`;
+- implementation through `a2a-bridge implement`: **Sonnet 5.5 for 2B3b**, per the owner's 2026-09-29 direction
+  (superseding the earlier Opus 5.5 selection for that child);
 - the controller's macOS lane plus CI (including native ext4);
 - a Sol implementation review with a two-round cap, and extensions only while converging;
 - merge on approval and green CI, followed by post-merge cleanup and a docs reconciliation.
