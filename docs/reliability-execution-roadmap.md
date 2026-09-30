@@ -1,7 +1,8 @@
 # Bridge reliability execution and handoff roadmap
 
 - **Program status:** active P0
-- **Current main lineage:** `origin/main` is `b7c85aee0440833380d9dab6804b406914644daa`, which merged ADR-0041 Slice
+- **Current main lineage:** PR #126 merged the post-2B3a roadmap at `5d2a82c457e626b2a108063e1de6b13b94e97f92`.
+  Its preceding code merge is `b7c85aee0440833380d9dab6804b406914644daa`, ADR-0041 Slice
   2B3a (the capsule reader) in PR #125, after its spec PR #124 (`b567d2d6`), the 2B3 design PR #123 (`abf74ad0`), and
   the ETXTBSY fixture fix in PR #122 (`e232288c`). Before that, Slice 2B2b2b2 merged in PR #121 (spec PR #120), and before that Slice 2B2b2b1 in PR #119 (spec PR #118 at `3e12ff53`), and before that Slice 2B2b2a in PR #117 (after its spec, PR #116 at `980eb52a`), and before that Slice 2B2b1 in PR #114, after the 2B2b1 spec (PR #113 at `f3a4c0a8`), docs PR #112 (`f16ca474`), and Slice 2B2 (PR
   #111 at `90d3a208`). Its ancestry includes the provider refresh
@@ -26,7 +27,14 @@
       ordering), then **APPROVE** after one disclosed converging extension round.
     - The declared residual boundary: a change after the final gate's last check is outside any gate, and consumers
       act through the retained pins.
-  - **Next:** the 2B3b (Git plane) task spec.
+  - **2B3b:** the draft task is `docs/superpowers/plans/2026-09-29-adr0041-slice2b3b-git-plane-task.md`.
+    Sol/xhigh spec round 1 rejected four bounded findings; revision 2 received **APPROVE** in round 2/2
+    (zero WRONG, two nonblocking SMELLs). Both clarity/regression recommendations are folded. Next is
+    Sonnet 5.5 implementation through the bridge per the
+    owner's 2026-09-29 direction. The owner approved isolated Git bootstrap under `.restore-work/` to preserve
+    create-new HEAD/config restoration, and explicit caller-selected format provenance for empty objects.
+    A container smoke returned Sonnet 5.5's PONG but failed cleanup; the owner requires repair and independent
+    review of that cleanup race before implementation. The controller handoff records dispatch and evidence state.
   **2B2b is complete:** all its children are merged. The parent Slice 2B completion gate (plan §8) still requires 2B3,
   the aggregate fixture without the source or its alternates, and one bounded review of the combined diff.
   - **Merged on 2026-09-26/27:**
