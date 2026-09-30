@@ -30,11 +30,15 @@
   - **2B3b:** the draft task is `docs/superpowers/plans/2026-09-29-adr0041-slice2b3b-git-plane-task.md`.
     Sol/xhigh spec round 1 rejected four bounded findings; revision 2 received **APPROVE** in round 2/2
     (zero WRONG, two nonblocking SMELLs). Both clarity/regression recommendations are folded. Next is
-    Sonnet 5.5 implementation through the bridge per the
+    two serial bounded Sonnet 5.5 passes through the bridge: isolated object bootstrap, then final Git
+    metadata/closure and the combined phase-G proof. Both retain the approved full task contract; 2B3b
+    remains incomplete until both pass and the combined change is reviewed. This follows the
     owner's 2026-09-29 direction. The owner approved isolated Git bootstrap under `.restore-work/` to preserve
     create-new HEAD/config restoration, and explicit caller-selected format provenance for empty objects.
     A container smoke returned Sonnet 5.5's PONG but failed cleanup; the owner requires repair and independent
-    review of that cleanup race before implementation. The controller handoff records dispatch and evidence state.
+    review of that cleanup race before implementation. Cleanup reviews reduced three blockers to one parser
+    defect at cap 2; the controller disclosed one converging extension to round 3 on the same artifact.
+    The controller handoff records dispatch and evidence state.
   **2B2b is complete:** all its children are merged. The parent Slice 2B completion gate (plan §8) still requires 2B3,
   the aggregate fixture without the source or its alternates, and one bounded review of the combined diff.
   - **Merged on 2026-09-26/27:**

@@ -17,7 +17,7 @@ committed at `a25ddb01`. Scratch evidence is `/private/tmp/adr0041-2b3b-20260929
 **(c) In flight / irreversible** — `[MEASURED]` original cleanup implement session 5067 terminated Rejected
 at frozen cap 2/2, final `07d5b32125ff92804d5c320176ab7424c9ed18b1`; original container removed. The
 controller disclosed one converging extension (3 blockers -> 1), then started targeted Sonnet workflow
-session 50931 in the SAME quarantine, `cleanup-round3-edit.log`. No Git-plane dispatch — OPEN.
+session 75650 in the SAME quarantine, `cleanup-round3-cache-edit.log`. No Git-plane dispatch — OPEN.
 **(d) Authorization granted but not exercised** — owner: "Merge 2B3a and proceed to orchestrate spec and
 implementation of 2B3b." Later: "use sonnet5-5 for implementation. You may need ti update the acp for the
 bridge. update for claude, codex if so". Owner selected isolated bootstrap, allowed explicit format for
@@ -25,8 +25,8 @@ empty objects with unauthenticated provenance, and selected "Repair and review c
 
 ## 1. Resume order
 
-1. Inspect `/private/tmp/adr0041-2b3b-20260929/cleanup-round3-edit.log`; join session 50931 if active.
-   The workflow uses the same quarantine, without optional LSP. Do not replay an accepted turn.
+1. Inspect `/private/tmp/adr0041-2b3b-20260929/cleanup-round3-cache-edit.log`; join session 75650 if active.
+   The workflow uses the same quarantine, without optional LSP, with RO `a2a-impl-lsp-cache-8ac4ca8ed1db0dde:/cargo`. Do not replay an accepted turn.
 2. When complete, snapshot `.git/a2a-evidence/cleanup-round3` in the quarantine, inspect/stage/commit only
    reaper.rs and its existing implementation handoff, with an accurate final commit message.
 3. Run independent Sol round 3/3 on the FULL `a25ddb01..final` cleanup range; original frozen checkpoint
@@ -85,6 +85,10 @@ unproven Sonnet 5.5 identity; open-class findings at cap; failing gate without s
 - The automatic implement checkpoint is terminal/frozen; extension uses container_rw run-workflow on the
   SAME quarantine, not a fresh implement/restart or forged checkpoint. Optional LSP was removed because
   standalone frozen admission lacks the MCP environment provider-effect key; no guard was bypassed.
+- Standalone writer initially lacked /cargo and STOPPED UNCHANGED. Its parser harness is only harness
+  evidence. A network-none provider-free cache control then resolved all locked metadata successfully;
+  doctor was all OK. Continuation uses the existing RO warmed cache and no network/fetch exception.
+  Empty NAMES is allowed with nonempty ID; malformed nonempty name lists still refuse.
 - run-workflow has no --lang; its pre-dispatch unknown-flag refusal sent no prompt.
 - Initial private config validation used unsupported timeout fields and omitted server; those probes were
   inadmissible schema errors and were corrected before any successful model/turn evidence.
