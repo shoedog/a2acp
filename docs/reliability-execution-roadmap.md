@@ -28,9 +28,12 @@
     - The declared residual boundary: a change after the final gate's last check is outside any gate, and consumers
       act through the retained pins.
   - **2B3b:** the draft task is `docs/superpowers/plans/2026-09-29-adr0041-slice2b3b-git-plane-task.md`.
-    Sol/xhigh spec review is next (two-round cap), then Sonnet 5.5 implementation through the bridge per the
+    Sol/xhigh spec round 1 rejected four bounded findings; revision 2 repairs them for round 2 (two-round cap),
+    then Sonnet 5.5 implementation through the bridge per the
     owner's 2026-09-29 direction. The owner approved isolated Git bootstrap under `.restore-work/` to preserve
-    create-new HEAD/config restoration. The controller handoff records dispatch and evidence state.
+    create-new HEAD/config restoration, and explicit caller-selected format provenance for empty objects.
+    A container smoke returned Sonnet 5.5's PONG but failed cleanup; the owner requires repair and independent
+    review of that cleanup race before implementation. The controller handoff records dispatch and evidence state.
   **2B2b is complete:** all its children are merged. The parent Slice 2B completion gate (plan §8) still requires 2B3,
   the aggregate fixture without the source or its alternates, and one bounded review of the combined diff.
   - **Merged on 2026-09-26/27:**

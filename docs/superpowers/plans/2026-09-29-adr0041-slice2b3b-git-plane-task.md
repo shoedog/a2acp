@@ -3,7 +3,7 @@ task-type: implement
 ---
 # ADR-0041 Slice 2B3b — Git plane Implementation Plan
 
-**Revision:** 1; draft for Sol/xhigh review, round 1 of a two-round cap.
+**Revision:** 2; repairs the four Sol round-1 findings; pending round 2 of a two-round cap.
 **Implementation base:** bind the exact committed spec revision at dispatch. Drafting base is
 `5d2a82c457e626b2a108063e1de6b13b94e97f92` (PR #126). Reader 2B3a merged in PR #125 at `b7c85aee`.
 **Implementor:** Sonnet 5.5 through `a2a-bridge implement`, overriding the design's earlier Opus 5.5 direction
@@ -64,8 +64,13 @@ Implement phase G alongside the reader in `custody_restore.rs`, with tests in a 
 - `restore_git_plane_v1(verified, runner, object_format, frame_budget, deadline)` consumes the verified
   value and returns a `RestoredGitPlaneV1` or typed `GitPlaneRestoreFailureV1`.
 - `object_format` is the closed SHA-1/SHA-256 enum, never a string. Every manifest object must match it.
-  With an empty inventory, strict indexing plus verification of the pack's format binds this explicit
-  caller choice; do not infer an empty repository's format from absent objects or archived config.
+  A nonempty object database requires exactly one pack and its strict format/inventory proof. A valid
+  Empty object-database coverage row has an empty inventory and NO pack: initialize the explicit caller
+  format, skip indexing/VerifyPack, and prove an empty bootstrap and final inventory plus strict fsck.
+  The owner approved this bounded exception on 2026-09-29. Return typed format provenance distinguishing
+  `CapsuleObjectsAndPack` from `CallerSelectedEmpty`; the latter makes NO claim that the sealed capsule
+  authenticated the original format. Both caller formats are accepted for the same valid empty capsule.
+  A pack present for Empty, or absent/multiple packs for Captured, refuses. Never consult archived config.
 - The success value retains `VerifiedCapsuleV1`, pins for `repository/`, `.git/`, object directories and
   materialized metadata directories, and typed closure evidence. Fields needed by 2B3c are crate-private.
 - Failure carries the typed cause, last completed phase/step and whether active materialization began.
@@ -83,13 +88,20 @@ Implement phase G alongside the reader in `custody_restore.rs`, with tests in a 
 
 - [ ] Read the exact base and the APIs above; record any mismatch before editing.
 - [ ] Write tests first: a real phase-V value enters G; changed staged descriptor bytes/length refuse before
-  new writes; renamed staged files are still read from their retained descriptors; wrong object format
-  refuses; absent/multiple pack roles refuse; an empty inventory with the correct supplied format works.
+  new writes; renamed staged files are still read from their retained descriptors; a wrong nonempty object
+  format refuses; absent/multiple Captured packs refuse; Empty with no pack works for both explicit formats
+  and reports `CallerSelectedEmpty`; a pack for Empty or nonempty inventory for Empty refuses.
 - [ ] Admit phase G only after rechecking all phase-V chains and root; hash staged inputs with bounded
   streaming reads against `StagedPlaintextV1.length/sha256`. No full pack/frame buffering.
-- [ ] Identify exactly one pack and the active `RefsAndHead` and `StashAndReflogs` payloads
+- [ ] Identify the coverage-dependent pack shape and the active `RefsAndHead` and `StashAndReflogs` payloads
   using their bound roles/coverage rows. Captured requires its payload; Empty needs no frame. Refuse
   impossible/unsupported states, never downgrade them to Empty. `packed-refs` belongs to `RefsAndHead`.
+- [ ] Completely prevalidate every active frame into a bounded null sink before ANY `repository/` write:
+  paths, entry types, ownership/class, file/parent conflicts and portable-equivalent spelling collisions.
+  Admit only HEAD, ORIG_HEAD, FETCH_HEAD, packed-refs, refs and descendants, logs and descendants in their
+  actual coverage classes. Reject symlinks and behavior-affecting/unsupported entries (config, hooks,
+  shallow, objects, alternates and operation markers). A valid frame with a refs symlink must refuse with
+  `active_materialization_began=false` and no `repository/`. Reverify/decode at use; later drift stays fatal.
 - [ ] Add accessor preservation tests: exact fields returned, canonical bytes/digests unchanged.
 - [ ] Record structural RED and behavioral RED against missing/disabled admission guards, then GREEN.
 
@@ -100,16 +112,25 @@ Implement phase G alongside the reader in `custody_restore.rs`, with tests in a 
   timeout, and an exhausted ledger refusing before a writing child starts.
 - [ ] Create pinned empty HOME and XDG children beneath `.restore-work/`, charging their entries, and
   execute template-less `InitBare { dir: "git-bootstrap", object_format }` rooted at the retained work pin.
-  Reuse `GitDirectoryBudgetV1::for_init` and `remeasure_git_directory_in`, including after failed children.
-- [ ] Strictly index the staged pack via `GitRunRequestV1::from_file` with a cloned retained descriptor.
+  Reuse the pure reservations in `GitDirectoryBudgetV1::for_init`; do NOT use the exporter's path-based
+  `remeasure_git_directory_in`. Add a restore-specific bounded descriptor-relative census, retaining each
+  child directory pin and opening regular files no-follow. Refuse links, special files, identity/device
+  drift, unexpected names/types and missing required files. Bound depth, names, entries and measured bytes.
+  Census before pin sweeps; root identity last. Reconcile reservations after successful AND failed children.
+  The existing exporter helper remains unchanged. Test a replaced HEAD link and a renamed/symlinked parent
+  during enumeration: no external file may be opened and no next writing child may start.
+- [ ] For Captured objects, strictly index the staged pack via `GitRunRequestV1::from_file` with a cloned retained descriptor.
   Reserve the checked pack/index/reverse-index logical bound and entry allowances first, using 2B2's
   formulas. Check stdout's exact pack hash width/lowercase syntax; admit only the expected `.pack/.idx/.rev`
   files into the budget. Reconcile the measured tree after every child; an unexpected entry refuses.
-- [ ] `VerifyPack` must prove the generated pack/index pair; `CatFileAllObjects` must yield exactly the
+- [ ] For Captured objects, `VerifyPack` must prove the generated pack/index pair. For both coverage shapes,
+  `CatFileAllObjects` must yield exactly the
   manifest's `(format, oid, kind)` set, with duplicate, absent, extra, wrong-kind and malformed rows fatal.
 - [ ] Feed EVERY manifest inventory oid to `RevListMissingPrint`, including blobs, trees, annotated tags
   and unreachable objects. Reject missing-marker rows, malformed output and unexpected closure objects.
   Apply 2B2's complete strict-output classification to `FsckStrict`, then require successful terminal status.
+  For Empty, issue no empty rev-list request; retain explicit vacuous closure evidence and run fsck with
+  its documented empty/unborn diagnostics classified. Tests must prove no indexing/VerifyPack child ran.
 - [ ] Never set `GitObjectStoreRouteV1`; restoration uses only the isolated bootstrap object database.
   Test with source/alternates/HOME config made unavailable and ambient GIT_* variables planted.
 - [ ] Retain command/evidence results and checked closure result. Exit status alone proves no inventory.
@@ -125,8 +146,14 @@ Implement phase G alongside the reader in `custody_restore.rs`, with tests in a 
 - [ ] Copy only regular files admitted by the bootstrap budget beneath objects/pack. Determine their
   exact length through retained descriptors, charge the second copy before its write, stream the bytes,
   sync and compare hashes/lengths. The second object store is not free just because the first is charged.
-- [ ] Recheck bootstrap and output chains around copying. Create pinned empty HOME/XDG children under
-  the retained repository pin and reserve their entries. Final Git commands wait until HEAD and config
+- [ ] Recheck bootstrap and output chains around copying. Final commands use
+  `GitRootNamesV1::new(".git", ".git", ".git")` rooted at the retained repository pin: HOME and XDG alias
+  the already retained `.git` directory; create NO additional worktree entries. The runner clears the
+  environment, sets `GIT_CONFIG_GLOBAL=/dev/null` and `GIT_CONFIG_NOSYSTEM=1`, so those aliases do not
+  activate global configuration. Archived `.gitconfig` and `git/config` are forbidden by the active allowlist.
+  Preserve tests for an empty worktree and source names equal to the originally proposed HOME/XDG names:
+  the phase-G repository's only child is `.git`, so later payload restoration has no foreign collision.
+  Final Git commands wait until HEAD and config
   exist in task 4, so Git recognizes the repository. The final database, not only its bootstrap sibling,
   must have closure evidence before success.
 - [ ] Preserve bootstrap bytes on success/failure; no cleanup belongs to this task.
@@ -137,11 +164,9 @@ Implement phase G alongside the reader in `custody_restore.rs`, with tests in a 
   ORIG_HEAD, FETCH_HEAD, stash refs and reflogs; packed-only refs and loose-over-packed precedence;
   symbolic chains/cycles, mismatched direct/symbolic target, absent original ref, malformed oid/ref row,
   unexpected active path, symlink, collision and a bad trailer after provisional regular content.
-- [ ] Prevalidate active frame paths/types before creating active metadata. Admit only HEAD, ORIG_HEAD,
-  FETCH_HEAD, packed-refs, refs and their descendants, logs and their descendants in their actual coverage
-  classes. Reject behavior-affecting or unsupported entries (config, hooks, shallow, objects, alternates,
-  in-progress operation markers), wrong ownership/class, file/parent conflicts and portable-equivalent
-  spelling collisions. The frame codec's generic path validity does not authorize arbitrary `.git` writes.
+- [ ] Use Task 1's completed active-frame prevalidation; it must precede Task 3's first active write.
+  Reverify retained frame descriptors immediately before the second decode/materialization pass. The
+  frame codec's generic path validity does not authorize arbitrary `.git` writes.
 - [ ] Materialize directories and regular files descriptor-relative and create-new, streaming content and
   charging entries/bytes before writes. Reuse only pinned parents created by this invocation. Drain each
   full decoder through its verified trailer. Original bytes stay exact; do not normalize or rewrite them.

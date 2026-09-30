@@ -78,8 +78,12 @@ The output is a `VerifiedCapsuleV1` holding retained descriptors of every staged
 1. Initialize `.restore-work/git-bootstrap` with the existing runner command `InitBare`, rooted at the retained
    `.restore-work/` descriptor. Its generated HEAD/config remain there: copying them into the final `.git` would
    conflict with create-new restoration. This placement refinement was approved by the owner on 2026-09-29.
-2. Run `IndexPackStrictStdin` on the staged pack, then **2B2's closure proof**: `CatFileAllObjects` must equal the
+2. For Captured objects, run `IndexPackStrictStdin` on the staged pack, then **2B2's closure proof**: `CatFileAllObjects` must equal the
    manifest inventory exactly, `RevListMissingPrint` must report nothing missing, and `FsckStrict` must pass.
+   Empty object databases have no pack or authenticated object format in capsule-v1. Under the owner's
+   explicit approval, use the caller's SHA-1/SHA-256 choice, record `CallerSelectedEmpty` provenance, skip
+   indexing/pack verification and prove empty inventory plus strict fsck. This does not authenticate the
+   original repository's format. Prevalidate all active metadata paths/types before any `repository/` write.
 3. Create `repository/.git/` descriptor-relatively, and copy only verified object-store files from the bootstrap,
    charging both copies to the original restore ledger. Write refs, `HEAD`, `ORIG_HEAD`/`FETCH_HEAD` when present,
    `packed-refs`, and `logs/**` from their verified frames,
@@ -92,6 +96,9 @@ The output is a `VerifiedCapsuleV1` holding retained descriptors of every staged
 
    `InitBare --template=` creates no `hooks/` directory. Re-prove inventory, closure and strict fsck on the final
    database once HEAD/config exist, before phase G succeeds. Preserve the bootstrap on success or refusal.
+   Final commands root at `repository/` with HOME/XDG/GIT_DIR all addressing the retained `.git` child.
+   The closed runner disables global/system configuration; no HOME/XDG siblings enter the worktree.
+   Git-tree accounting is bounded and descriptor-relative; the exporter's path walker is not reused.
 
 No runner amendment is needed; every command already exists in 2B2a.
 
