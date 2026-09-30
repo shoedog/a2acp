@@ -1,9 +1,9 @@
 # Handoff — ADR-0041 Slice 2B3b spec and Sonnet 5.5 orchestration
 
-**Written:** 2026-09-30T03:34:00Z · **By:** Codex controller · **Provider:** codex
+**Written:** 2026-09-30T05:14:00Z · **By:** Codex controller · **Provider:** codex
 **Workspace:** `/Users/wesleyjinks/code/a2a-bridge` · `work/container-auto-removal-20260929` ·
-**Measured state:** `[MEASURED]` HEAD `8bd0f83b15c96c828b4a44051c65f34d3d5eb6d1` · Tree DIRTY (docs only) ·
-Probe `git status --short --branch` · Output: branch above; new cleanup review receipts and handoff refresh only.
+**Measured state:** `[MEASURED]` HEAD `f32f0ded5819acbf42c2f4667cd3ade7b63e8538` · Tree CLEAN before this handoff refresh ·
+Probe `git status --short`, `git rev-parse HEAD` · Output: no dirty paths; exact HEAD above.
 **Predecessor:** Claude handoff supplied by owner: PR #126 open; next 2B3b spec, Sol review, Opus implementation.
 **Truth ordering:** measured live state > explicit owner/contract authority within its scope > this handoff for current operational state > earlier handoffs and non-authoritative summaries. A conflict between tiers stays OPEN in §0 — never resolved by document class alone.
 **Provenance:** written live by the controller. `[MEASURED]` claims were probed by this writer; `[INHERITED]` claims were not.
@@ -68,8 +68,8 @@ unproven Sonnet 5.5 identity; open-class findings at cap; failing gate without s
 | # | Work | State | Exact next action | Blocked by | Identifiers |
 |---:|---|---|---|---|---|
 | 1 | Spec custody | done | PR #127 merged | none | `8bd0f83b` |
-| 2 | Cleanup repair/review | pending | inspect targeted edit then independent round3 | active Sonnet session50931 | frozen run remains Rejected |
-| 3 | Git-plane implementation | blocked | approved task + repaired candidate | cleanup approval/gates | two-attempt cap |
+| 2 | Cleanup repair/review | pending | inspect targeted edit then independent round3 | active Sonnet session75650 | frozen run remains Rejected |
+| 3 | Git-plane implementation | blocked | approved task + repaired candidate; serial bootstrap then final G passes | cleanup approval/gates | two-round cap per pass |
 
 ## 5. Invariants and traps — do not do these
 
@@ -89,6 +89,13 @@ unproven Sonnet 5.5 identity; open-class findings at cap; failing gate without s
   evidence. A network-none provider-free cache control then resolved all locked metadata successfully;
   doctor was all OK. Continuation uses the existing RO warmed cache and no network/fetch exception.
   Empty NAMES is allowed with nonempty ID; malformed nonempty name lists still refuse.
+- Round3 Linux receipts are provisional until the writer closes and source is committed. Candidate
+  default/doctests: 4877 passed/0 failed/13 ignored. All-target runs: 4864/2/13, then 4865/1/13;
+  unchanged base control: 4838/0/13 in the same container/cwd. A newly added hung-inventory test
+  assumes its child starts before the shared deadline, which can fail under load; diagnosis remains open.
+  Diagnostic and control loops are sequential source overlays, restored afterward. An accidentally
+  overlapping worker diagnostic/control attempt was quarantined as INADMISSIBLE, not used as evidence.
+  Do not begin host gates or independent review while these overlays are active.
 - run-workflow has no --lang; its pre-dispatch unknown-flag refusal sent no prompt.
 - Initial private config validation used unsupported timeout fields and omitted server; those probes were
   inadmissible schema errors and were corrected before any successful model/turn evidence.
