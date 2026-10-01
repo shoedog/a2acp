@@ -1,8 +1,8 @@
 # Handoff — ADR-0041 Slice 2B3b orchestration
 
-**Written:** 2026-10-01T03:13:38Z · **By:** Codex controller · **Provider:** codex
+**Written:** 2026-10-01T04:09:50Z · **By:** Codex controller · **Provider:** codex
 **Workspace:** `/Users/wesleyjinks/code/a2a-bridge` · `work/adr0041-2b3b-bootstrap-20261001` ·
-**Measured state:** `[MEASURED]` HEAD `feb03a2535c292f321f984a41af81833407d029a` · Tree CLEAN before this active-run refresh ·
+**Measured state:** `[MEASURED]` HEAD `93af49fa5854fe98b1c3e17476f6717b09220a72` · Tree CLEAN before this active-run refresh ·
 Probe `git status --short`, `shasum -a 256 crates/bridge-core/src/reaper.rs` · Output: production hash
 `30860ae070746c5de9b9a85469f8e07dfd67e94f9da7183c5469c98f281aab2d`, exactly the independently approved source.
 **Predecessor:** Claude handoff supplied by owner: merge PR126, then 2B3b spec/review/implementation.
@@ -119,6 +119,8 @@ scope/contract disagreement; unproven concrete Sonnet5.5 model; a failing gate w
 | Master task SHA256 | e9c8d9e1289bcff53991b5fa49ad011727f0db3a0336cf69a2b15d3eaa69d48a |
 | Model receipt | scratch/cleanup-round3-model-provenance.json; transcript 54a56deb-49d2-4129-8295-023593788e97 |
 | Current bridge | target/release/a2a-bridge from 251289fe; SHA256 25fe68e184df1e4a06b16846e07b5a963493785c8bfd5c626cf26db5050ca370 |
+| Active G passA | impl-25228-mwz25w5c; controller PID25228; session24335; transcript3447a689-f6f9-44ee-8a62-e003010961f0 |
+| Pre-matrix backup | scratch/2b3b-pass-a-inflight-snapshot; frozen-matrix-binding.json proves all four saved file hashes equal worker pre-matrix hashes; not a final verdict |
 
 ## 7. Refutation verdict and owner questions
 
