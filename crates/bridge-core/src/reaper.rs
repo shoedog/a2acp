@@ -31,6 +31,11 @@ pub const CONTAINER_INVENTORY_FORMAT: &str = "{{.ID}}{{\"\\t\"}}{{.Names}}";
 const CONTAINER_START_PROBE_TIMEOUT: Duration = Duration::from_secs(1);
 const CONTAINER_START_STATUS_MAX_BYTES: u64 = 64;
 const CONTAINER_IDENTITY_MAX_BYTES: u64 = 64 * 1024;
+/// How long after the exact-ID removal command exits the container may still be observed as
+/// present before the removal is reported failed. It bounds every inventory child too, and is
+/// always further bounded by the removal's original deadline.
+const CONTAINER_REMOVAL_OBSERVATION_WINDOW: Duration = Duration::from_secs(2);
+const CONTAINER_REMOVAL_OBSERVATION_INTERVAL: Duration = Duration::from_millis(50);
 
 /// `(runtime, name) -> fire-and-forget reap`. Injectable so tests don't spawn Docker.
 pub type ReapFn = Arc<dyn Fn(String, String) + Send + Sync>;
@@ -877,27 +882,42 @@ pub fn parse_container_identity(bytes: &[u8]) -> Result<ContainerRuntimeIdentity
 }
 
 /// Parse a no-trunc runtime inventory and report exact selector presence.
+///
+/// Every non-empty row must be exactly two tab-separated fields, `ID<TAB>NAMES`. The ID is
+/// non-empty. NAMES is either empty (a runtime can release an object's names before the object
+/// leaves the inventory, so only the ID can match) or a comma-separated list with no empty or
+/// bare-slash element. The whole inventory is validated before any answer, so a matching row never
+/// hides a malformed one and a malformed row never lets the selector be reported absent.
 pub fn parse_container_inventory_contains(
     bytes: &[u8],
     selector: &str,
 ) -> Result<bool, ReapFailure> {
     let text = std::str::from_utf8(bytes).map_err(|_| ReapFailure::IdentityUnavailable)?;
     let normalized_selector = selector.strip_prefix("sha256:").unwrap_or(selector);
+    let mut present = false;
     for line in text.lines().filter(|line| !line.is_empty()) {
-        let (container_id, names) = line
-            .split_once('\t')
-            .ok_or(ReapFailure::IdentityUnavailable)?;
+        let mut fields = line.split('\t');
+        let (Some(container_id), Some(names), None) = (fields.next(), fields.next(), fields.next())
+        else {
+            return Err(ReapFailure::IdentityUnavailable);
+        };
         let normalized_id = container_id.strip_prefix("sha256:").unwrap_or(container_id);
-        if normalized_id == normalized_selector
-            || names
-                .split(',')
-                .map(|name| name.strip_prefix('/').unwrap_or(name))
-                .any(|name| name == selector)
-        {
-            return Ok(true);
+        if normalized_id.is_empty() {
+            return Err(ReapFailure::IdentityUnavailable);
+        }
+        present |= normalized_id == normalized_selector;
+        if names.is_empty() {
+            continue;
+        }
+        for name in names.split(',') {
+            let name = name.strip_prefix('/').unwrap_or(name);
+            if name.is_empty() {
+                return Err(ReapFailure::IdentityUnavailable);
+            }
+            present |= name == selector;
         }
     }
-    Ok(false)
+    Ok(present)
 }
 
 async fn observe_container_identity(
@@ -951,6 +971,19 @@ async fn runtime_inventory_contains(
     selector: &str,
     timeout: Duration,
 ) -> Result<bool, ReapFailure> {
+    let bound = tokio::time::Instant::now()
+        .checked_add(timeout)
+        .ok_or(ReapFailure::Timeout)?;
+    runtime_inventory_contains_until(runtime, selector, bound).await
+}
+
+/// [`runtime_inventory_contains`] against an absolute `bound`, so the child's spawn, its output,
+/// and its exit all share one caller-owned deadline.
+async fn runtime_inventory_contains_until(
+    runtime: &str,
+    selector: &str,
+    bound: tokio::time::Instant,
+) -> Result<bool, ReapFailure> {
     let mut command = tokio::process::Command::new(runtime);
     command
         .args([
@@ -982,7 +1015,7 @@ async fn runtime_inventory_contains(
         }
         parse_container_inventory_contains(&bytes, selector)
     };
-    tokio::time::timeout(timeout, observation)
+    tokio::time::timeout_at(bound, observation)
         .await
         .map_err(|_| ReapFailure::Timeout)?
 }
@@ -992,18 +1025,73 @@ async fn remove_container_id(
     immutable_container_id: &str,
     timeout: Duration,
 ) -> Result<(), ReapFailure> {
+    // One absolute deadline bounds the removal child and every observation after it.
+    let deadline = tokio::time::Instant::now()
+        .checked_add(timeout)
+        .ok_or(ReapFailure::Timeout)?;
     let (program, argv) = crate::sandbox::reap_argv(runtime, immutable_container_id);
     let mut command = tokio::process::Command::new(&program);
     command.args(&argv).kill_on_drop(true);
     let child = command.spawn().map_err(|_| ReapFailure::Spawn)?;
-    let output = tokio::time::timeout(timeout, child.wait_with_output())
+    // Neither exit status is evidence: `run --rm` can win the race behind a nonzero exit, and a
+    // runtime wrapper can exit zero without removing anything. Only the inventory decides.
+    tokio::time::timeout_at(deadline, child.wait_with_output())
         .await
         .map_err(|_| ReapFailure::Timeout)?
         .map_err(|_| ReapFailure::Spawn)?;
-    if output.status.success() {
-        Ok(())
-    } else {
-        Err(ReapFailure::NonZeroExit)
+    confirm_exact_id_absent_after_removal(runtime, immutable_container_id, deadline).await
+}
+
+/// Decide whether the one exact-ID `rm -f` achieved absence. Docker's `run --rm` can already be
+/// removing the container, so the runtime refuses the loser of that race even though the captured
+/// object is going away. The ID being absent from a complete, in-bounds runtime inventory is the
+/// only evidence that settles cleanup as success, whatever the exit status was. There is never a
+/// second removal: a present object is only re-observed, briefly, in case the removal in progress
+/// finishes.
+///
+/// Every inventory child is bounded by one absolute `observe_until`, the earlier of the removal's
+/// original `deadline` and the observation window, and an absence first seen after that bound is
+/// refused. Reaching the bound without accepted absence is `NonZeroExit` if the object was ever
+/// seen present (the removal did not achieve absence) and `Timeout` if it never was. An unusable
+/// inventory fails closed without a retry and keeps its own typed cause (`Spawn` or
+/// `IdentityUnavailable`), because durable recovery classifies on it.
+async fn confirm_exact_id_absent_after_removal(
+    runtime: &str,
+    immutable_container_id: &str,
+    deadline: tokio::time::Instant,
+) -> Result<(), ReapFailure> {
+    let observe_until = tokio::time::Instant::now()
+        .checked_add(CONTAINER_REMOVAL_OBSERVATION_WINDOW)
+        .map_or(deadline, |end| end.min(deadline));
+    let mut observed_present = false;
+    loop {
+        let unsettled = if observed_present {
+            ReapFailure::NonZeroExit
+        } else {
+            ReapFailure::Timeout
+        };
+        if tokio::time::Instant::now() >= observe_until {
+            return Err(unsettled);
+        }
+        let contained =
+            match runtime_inventory_contains_until(runtime, immutable_container_id, observe_until)
+                .await
+            {
+                Ok(contained) => contained,
+                Err(ReapFailure::Timeout) => return Err(unsettled),
+                Err(error) => return Err(error),
+            };
+        match contained {
+            // `timeout_at` polls its inner future first, so a stale answer can arrive after the
+            // bound; absence is only accepted if it is still inside it.
+            false if tokio::time::Instant::now() < observe_until => return Ok(()),
+            false => return Err(unsettled),
+            true => observed_present = true,
+        }
+        if tokio::time::Instant::now() + CONTAINER_REMOVAL_OBSERVATION_INTERVAL >= observe_until {
+            return Err(ReapFailure::NonZeroExit);
+        }
+        tokio::time::sleep(CONTAINER_REMOVAL_OBSERVATION_INTERVAL).await;
     }
 }
 
@@ -1492,6 +1580,137 @@ mod tests {
         );
     }
 
+    /// One `ID<TAB>NAMES` inventory row per way a row can be malformed (each is a single line, no
+    /// newline). No runtime prints any of them, so none may be read as "this object is absent" or
+    /// hidden behind a row that matches the selector.
+    const MALFORMED_INVENTORY_ROWS: &[(&str, &str)] = &[
+        ("missing tab", "other"),
+        ("extra field", "other\tname\textra"),
+        ("trailing tab after names", "other\tname\t"),
+        ("empty middle field", "other\t\tname"),
+        ("many fields", "other\ta\tb\tc"),
+        ("empty names and a trailing tab", "other\t\t"),
+        ("empty id", "\tname"),
+        ("empty id and names", "\t"),
+        ("bare sha256 id", "sha256:\tname"),
+        ("empty name in the list", "other\ta,,b"),
+        ("leading empty name", "other\t,a"),
+        ("trailing empty name", "other\ta,"),
+        ("only a comma", "other\t,"),
+        ("bare slash name", "other\t/"),
+        ("bare slash after a name", "other\ta,/"),
+    ];
+
+    #[test]
+    fn runtime_inventory_parser_refuses_every_malformed_row_wherever_it_appears() {
+        let id = "sha256:aaaa";
+        let matching = format!("{id}\tstable-name\n");
+        let mut accepted = Vec::new();
+        for (label, row) in MALFORMED_INVENTORY_ROWS {
+            for (position, inventory, selector) in [
+                ("alone", format!("{row}\n"), id),
+                ("after an unrelated row", format!("x\ty\n{row}\n"), id),
+                ("before the ID match", format!("{row}\n{matching}"), id),
+                ("after the ID match", format!("{matching}{row}\n"), id),
+                (
+                    "after the name match",
+                    format!("{matching}{row}\n"),
+                    "stable-name",
+                ),
+                (
+                    "last, with no final newline",
+                    format!("{matching}{row}"),
+                    id,
+                ),
+            ] {
+                let result = parse_container_inventory_contains(inventory.as_bytes(), selector);
+                if result != Err(ReapFailure::IdentityUnavailable) {
+                    accepted.push(format!("{label}, {position}: {result:?}"));
+                }
+            }
+        }
+        assert!(
+            accepted.is_empty(),
+            "malformed rows must refuse the whole inventory:\n{}",
+            accepted.join("\n")
+        );
+    }
+
+    #[test]
+    fn runtime_inventory_parser_refuses_invalid_utf8_anywhere() {
+        for inventory in [
+            b"\xff\n".as_slice(),
+            b"sha256:one\talpha\n\xff\n",
+            b"\xffsha256:one\talpha\n",
+            b"sha256:one\talp\xffha\n",
+        ] {
+            for selector in ["sha256:one", "alpha", "absent"] {
+                assert_eq!(
+                    parse_container_inventory_contains(inventory, selector),
+                    Err(ReapFailure::IdentityUnavailable),
+                    "{inventory:?} / {selector}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn runtime_inventory_parser_keeps_valid_presence_and_absence() {
+        // Blank lines are not rows; CRLF and a leading slash on each name are runtime spellings.
+        let inventory = b"\nsha256:one\t/alpha,/beta\n\ntwo\t/stable-name\r\nthree\tgamma\n";
+        for (selector, expected) in [
+            ("sha256:one", true),
+            ("one", true),
+            ("alpha", true),
+            ("beta", true),
+            ("two", true),
+            ("stable-name", true),
+            ("gamma", true),
+            ("three", true),
+            ("stable", false),
+            ("sha256:four", false),
+            ("onee", false),
+        ] {
+            assert_eq!(
+                parse_container_inventory_contains(inventory, selector),
+                Ok(expected),
+                "{selector}"
+            );
+        }
+        for empty in [b"".as_slice(), b"\n", b"\n\n"] {
+            assert_eq!(
+                parse_container_inventory_contains(empty, "sha256:one"),
+                Ok(false)
+            );
+        }
+    }
+
+    #[test]
+    fn runtime_inventory_parser_allows_an_empty_names_field_that_only_the_id_can_match() {
+        // A runtime can release an object's names before the object leaves the inventory. The ID
+        // still identifies it, and no name alias exists to match.
+        let inventory = b"sha256:three\t\nother\t/kept\n";
+        for (selector, expected) in [
+            ("sha256:three", true),
+            ("three", true),
+            ("kept", true),
+            ("absent", false),
+            // With no names, not even an empty selector has an alias to match.
+            ("", false),
+        ] {
+            assert_eq!(
+                parse_container_inventory_contains(inventory, selector),
+                Ok(expected),
+                "{selector:?}"
+            );
+        }
+        assert_eq!(
+            parse_container_inventory_contains(b"three\t\n", "other"),
+            Ok(false),
+            "an empty names field is a complete row that names nothing else"
+        );
+    }
+
     #[test]
     fn container_start_status_classification_is_closed() {
         for status in [b"created".as_slice(), b"configured", b"initialized"] {
@@ -1728,6 +1947,53 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn a_malformed_inventory_keeps_missing_selector_classification_unknown() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _fixture_permit = production_runtime_fixture_permit().await;
+        let mut wrong = Vec::new();
+        for (label, row) in MALFORMED_INVENTORY_ROWS {
+            let temp = tempfile::tempdir().unwrap();
+            let runtime = temp.path().join("runtime");
+            let dir = temp.path().display();
+            std::fs::write(
+                &runtime,
+                format!(
+                    "#!/bin/sh\nif [ \"$1\" = container ] && [ \"$2\" = inspect ]; then printf x >> '{dir}/inspect.log'; exit 1; fi\nif [ \"$1\" = container ] && [ \"$2\" = ps ]; then printf x >> '{dir}/ps.log'; printf '%s\\n' '{row}'; exit 0; fi\nif [ \"$1\" = rm ]; then printf called > '{dir}/removed'; exit 0; fi\nexit 2\n"
+                ),
+            )
+            .unwrap();
+            let mut permissions = std::fs::metadata(&runtime).unwrap().permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(&runtime, permissions).unwrap();
+            warm_up_runtime(&runtime);
+
+            let controller = ReapController::production_with_timeout(
+                runtime.to_string_lossy(),
+                "unresolved-name",
+                SUCCESSFUL_RUNTIME_TEST_TIMEOUT,
+            );
+            let result = controller.reap_observed().await;
+
+            assert!(
+                temp.path().join("inspect.log").exists() && temp.path().join("ps.log").exists(),
+                "{label}: the identity probe must fall through to the inventory"
+            );
+            if result != Err(ReapFailure::IdentityUnavailable)
+                || temp.path().join("removed").exists()
+            {
+                wrong.push(format!("{label}: {result:?}"));
+            }
+        }
+        assert!(
+            wrong.is_empty(),
+            "a malformed inventory must never classify a selector as already gone:\n{}",
+            wrong.join("\n")
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn ro_production_controller_spares_a_recycled_name() {
         use std::os::unix::fs::PermissionsExt;
 
@@ -1764,6 +2030,843 @@ mod tests {
         assert!(
             !removed.exists(),
             "a recycled selector must never reach exact-ID removal"
+        );
+    }
+
+    /// The container ID every removal-race fixture captures and removes.
+    #[cfg(unix)]
+    const RACE_CONTAINER_ID: &str =
+        "3f5a0c9e7b1d4a62c8e0f9137d5b2a4c6e8f01a3b5d7c9e2f4a6b8c0d1e3f5a7";
+
+    /// A fake runtime for the Docker `run --rm` versus `rm -f` removal race. `inspect` reports
+    /// [`RACE_CONTAINER_ID`]; each `rm` and `container ps` call is recorded so a test can prove the
+    /// production call started and how many times each command ran. `rm_body` and `ps_body` are the
+    /// shell bodies of those two branches; `$dir`, `$id`, and (in `ps_body`) `$n`, the 1-based `ps`
+    /// call number, are in scope.
+    #[cfg(unix)]
+    struct RemovalRaceRuntime {
+        temp: tempfile::TempDir,
+        runtime: std::path::PathBuf,
+    }
+
+    #[cfg(unix)]
+    impl RemovalRaceRuntime {
+        fn new(rm_body: &str, ps_body: &str) -> Self {
+            use std::os::unix::fs::PermissionsExt;
+
+            let temp = tempfile::tempdir().unwrap();
+            let runtime = temp.path().join("runtime");
+            std::fs::write(
+                &runtime,
+                format!(
+                    "#!/bin/sh\ndir='{dir}'\nid='{id}'\n\
+                     if [ \"$1\" = container ] && [ \"$2\" = inspect ]; then\n\
+                     printf '%s\\t{{\"a2a.owner\":\"owner\"}}\\n' \"$id\"\nexit 0\nfi\n\
+                     if [ \"$1\" = rm ]; then\nprintf '%s\\n' \"$*\" >> \"$dir/rm.log\"\n{rm_body}\nfi\n\
+                     if [ \"$1\" = container ] && [ \"$2\" = ps ]; then\n\
+                     printf x >> \"$dir/ps.log\"\nn=$(wc -c < \"$dir/ps.log\" | tr -d ' ')\n{ps_body}\nfi\n\
+                     exit 2\n",
+                    dir = temp.path().display(),
+                    id = RACE_CONTAINER_ID,
+                ),
+            )
+            .unwrap();
+            let mut permissions = std::fs::metadata(&runtime).unwrap().permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(&runtime, permissions).unwrap();
+            warm_up_runtime(&runtime);
+            Self { temp, runtime }
+        }
+
+        fn runtime(&self) -> String {
+            self.runtime.to_string_lossy().into_owned()
+        }
+
+        /// The recorded `rm` argument vectors, one line each.
+        fn rm_calls(&self) -> Vec<String> {
+            std::fs::read_to_string(self.temp.path().join("rm.log"))
+                .unwrap_or_default()
+                .lines()
+                .map(str::to_owned)
+                .collect()
+        }
+
+        /// The number of `container ps` inventory calls.
+        fn ps_calls(&self) -> usize {
+            std::fs::read(self.temp.path().join("ps.log")).map_or(0, |bytes| bytes.len())
+        }
+
+        /// A production controller with the identity captured, ready to run the exact-ID removal.
+        async fn controller(&self, timeout: Duration) -> ReapController {
+            let controller =
+                ReapController::production_with_timeout(self.runtime(), "stable-name", timeout);
+            assert_eq!(controller.capture_production_identity().await, Ok(()));
+            controller
+        }
+    }
+
+    /// Docker's answer when `run --rm` is already removing the container: nonzero, nothing else
+    /// the bridge may rely on.
+    #[cfg(unix)]
+    const RM_ALREADY_IN_PROGRESS: &str = "exit 1";
+
+    /// A runtime whose `rm -f` reports success; the tests never treat that as proof of absence.
+    #[cfg(unix)]
+    const RM_SUCCEEDS: &str = "exit 0";
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn nonzero_rm_with_the_exact_id_absent_settles_cleanup_successfully() {
+        let _fixture_permit = production_runtime_fixture_permit().await;
+        let fixture = RemovalRaceRuntime::new(RM_ALREADY_IN_PROGRESS, "exit 0");
+
+        let controller = fixture.controller(SUCCESSFUL_RUNTIME_TEST_TIMEOUT).await;
+        let result = controller.reap_observed().await;
+
+        assert_eq!(
+            fixture.rm_calls(),
+            [format!("rm -f {RACE_CONTAINER_ID}")],
+            "the production removal must start and run exactly once, on the captured ID"
+        );
+        assert_eq!(result, Ok(()));
+        assert_eq!(fixture.ps_calls(), 1, "absence is proven by one inventory");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn nonzero_rm_with_delayed_absence_settles_within_the_observation_window() {
+        let _fixture_permit = production_runtime_fixture_permit().await;
+        // The removal stays in progress for the first two inventories, then completes.
+        let fixture = RemovalRaceRuntime::new(
+            RM_ALREADY_IN_PROGRESS,
+            "if [ \"$n\" -le 2 ]; then printf '%s\\tstable-name\\n' \"$id\"; fi\nexit 0",
+        );
+
+        let controller = fixture.controller(SUCCESSFUL_RUNTIME_TEST_TIMEOUT).await;
+        let result = controller.reap_observed().await;
+
+        assert_eq!(
+            fixture.rm_calls(),
+            [format!("rm -f {RACE_CONTAINER_ID}")],
+            "observation polling must never dispatch another removal"
+        );
+        assert_eq!(result, Ok(()));
+        assert_eq!(fixture.ps_calls(), 3);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn nonzero_rm_ignores_unrelated_and_recycled_names_when_proving_absence() {
+        let _fixture_permit = production_runtime_fixture_permit().await;
+        // A successor reuses the selector's name under a new ID next to an unrelated container.
+        let fixture = RemovalRaceRuntime::new(
+            RM_ALREADY_IN_PROGRESS,
+            "printf 'unrelated-id\\tother-container\\nsuccessor-id\\tstable-name\\n'\nexit 0",
+        );
+
+        let controller = fixture.controller(SUCCESSFUL_RUNTIME_TEST_TIMEOUT).await;
+        let result = controller.reap_observed().await;
+
+        assert_eq!(
+            fixture.rm_calls(),
+            [format!("rm -f {RACE_CONTAINER_ID}")],
+            "only the captured ID may ever be removed, never the recycled name"
+        );
+        assert_eq!(result, Ok(()));
+        assert_eq!(fixture.ps_calls(), 1);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn nonzero_rm_with_a_still_present_object_never_greens_after_the_window() {
+        let _fixture_permit = production_runtime_fixture_permit().await;
+        let fixture = RemovalRaceRuntime::new(
+            RM_ALREADY_IN_PROGRESS,
+            "printf '%s\\tstable-name\\n' \"$id\"\nexit 0",
+        );
+
+        let controller = fixture.controller(SUCCESSFUL_RUNTIME_TEST_TIMEOUT).await;
+        let started = std::time::Instant::now();
+        let result = controller.reap_observed().await;
+
+        assert_eq!(fixture.rm_calls().len(), 1, "the removal must start once");
+        assert_eq!(result, Err(ReapFailure::NonZeroExit));
+        assert!(
+            fixture.ps_calls() >= 2,
+            "a present object must be observed repeatedly within the window, saw {}",
+            fixture.ps_calls()
+        );
+        // The 2 s observation window, not the 5 s removal deadline, ends this observation.
+        assert!(
+            started.elapsed() < Duration::from_secs(4),
+            "observation must stop at its window, took {:?}",
+            started.elapsed()
+        );
+        assert_eq!(
+            fixture.rm_calls().len(),
+            1,
+            "observation polling must never dispatch another removal"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn nonzero_rm_with_a_present_object_at_the_deadline_never_greens() {
+        let _fixture_permit = production_runtime_fixture_permit().await;
+        let fixture = RemovalRaceRuntime::new(
+            RM_ALREADY_IN_PROGRESS,
+            "printf '%s\\tstable-name\\n' \"$id\"\nexit 0",
+        );
+
+        // The deadline, not the observation window, ends this observation.
+        let started = std::time::Instant::now();
+        let result = remove_container_id(
+            &fixture.runtime(),
+            RACE_CONTAINER_ID,
+            Duration::from_millis(400),
+        )
+        .await;
+
+        assert_eq!(fixture.rm_calls().len(), 1, "the removal must start once");
+        assert_eq!(result, Err(ReapFailure::NonZeroExit));
+        assert!(
+            fixture.ps_calls() >= 1,
+            "the object must have been observed"
+        );
+        assert!(
+            started.elapsed() < Duration::from_millis(1500),
+            "observation must stop at the shared deadline, took {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_unusable_inventory_never_greens_and_keeps_its_typed_cause() {
+        let _fixture_permit = production_runtime_fixture_permit().await;
+        // Neither exit status of `rm` is proof of absence, and an ambiguous observation must not be
+        // collapsed into the removal's own failure code.
+        for (label, rm_body, ps_body) in [
+            ("failing inventory", RM_ALREADY_IN_PROGRESS, "exit 2"),
+            (
+                "malformed inventory",
+                RM_ALREADY_IN_PROGRESS,
+                "printf 'no-tab-separator\\n'\nexit 0",
+            ),
+            (
+                "oversized inventory of valid rows",
+                RM_ALREADY_IN_PROGRESS,
+                // 3,500 whole 20-byte rows (70,000 bytes) that never name the captured ID, so only
+                // the output limit refuses them. The bounded read stops 17 bytes into row 3,277,
+                // after its tab, so the parser alone would call that truncated tail a valid absence.
+                "yes \"$(printf 'other-id\\tother-name')\" | head -n 3500\nexit 0",
+            ),
+            ("failing inventory after a zero exit", RM_SUCCEEDS, "exit 2"),
+        ] {
+            let fixture = RemovalRaceRuntime::new(rm_body, ps_body);
+
+            let result = remove_container_id(
+                &fixture.runtime(),
+                RACE_CONTAINER_ID,
+                SUCCESSFUL_RUNTIME_TEST_TIMEOUT,
+            )
+            .await;
+
+            assert_eq!(
+                fixture.rm_calls().len(),
+                1,
+                "{label}: the removal must start once"
+            );
+            assert_eq!(result, Err(ReapFailure::IdentityUnavailable), "{label}");
+            assert_eq!(
+                fixture.ps_calls(),
+                1,
+                "{label}: an ambiguous observation fails closed without retrying"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_unspawnable_inventory_never_greens_and_keeps_its_typed_cause() {
+        let _fixture_permit = production_runtime_fixture_permit().await;
+        // The runtime removes itself, so the confirming inventory cannot even spawn.
+        for (label, rm_body) in [
+            ("nonzero exit", "rm -f \"$0\"\nexit 1"),
+            ("zero exit", "rm -f \"$0\"\nexit 0"),
+        ] {
+            let fixture = RemovalRaceRuntime::new(rm_body, "exit 0");
+
+            let result = remove_container_id(
+                &fixture.runtime(),
+                RACE_CONTAINER_ID,
+                SUCCESSFUL_RUNTIME_TEST_TIMEOUT,
+            )
+            .await;
+
+            assert_eq!(
+                fixture.rm_calls().len(),
+                1,
+                "{label}: the removal must start once"
+            );
+            assert_eq!(result, Err(ReapFailure::Spawn), "{label}");
+            assert_eq!(fixture.ps_calls(), 0, "{label}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn nonzero_rm_with_a_hung_inventory_times_out_at_the_shared_deadline() {
+        let _fixture_permit = production_runtime_fixture_permit().await;
+        // `rm` consumes 1 s of the 1.5 s deadline; a fresh deadline for the inventory would end
+        // near 2.5 s, so finishing well before that proves one shared absolute deadline.
+        let fixture = RemovalRaceRuntime::new(
+            "sleep 1\nexit 1",
+            "while [ ! -e \"$dir/ps.release\" ]; do sleep 0.01; done\nexit 0",
+        );
+
+        let started = std::time::Instant::now();
+        let result = remove_container_id(
+            &fixture.runtime(),
+            RACE_CONTAINER_ID,
+            Duration::from_millis(1500),
+        )
+        .await;
+        let elapsed = started.elapsed();
+
+        assert_eq!(fixture.rm_calls().len(), 1, "the removal must start once");
+        assert_eq!(fixture.ps_calls(), 1, "the inventory must have started");
+        assert_eq!(result, Err(ReapFailure::Timeout));
+        assert!(
+            elapsed < Duration::from_millis(2200),
+            "inventory work must share the original deadline, took {elapsed:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn hung_rm_times_out_without_observing_the_inventory() {
+        let _fixture_permit = production_runtime_fixture_permit().await;
+        let fixture = RemovalRaceRuntime::new(
+            "while [ ! -e \"$dir/rm.release\" ]; do sleep 0.01; done\nexit 1",
+            "exit 0",
+        );
+
+        let result = remove_container_id(
+            &fixture.runtime(),
+            RACE_CONTAINER_ID,
+            Duration::from_millis(300),
+        )
+        .await;
+
+        assert_eq!(fixture.rm_calls().len(), 1, "the removal must start once");
+        assert_eq!(result, Err(ReapFailure::Timeout));
+        assert_eq!(
+            fixture.ps_calls(),
+            0,
+            "a timed-out removal is never observed"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn exhausted_deadline_never_starts_an_absence_observation() {
+        let _fixture_permit = production_runtime_fixture_permit().await;
+        // Even an inventory that would prove absence must not run once no deadline remains.
+        let fixture = RemovalRaceRuntime::new(RM_ALREADY_IN_PROGRESS, "exit 0");
+
+        let result = confirm_exact_id_absent_after_removal(
+            &fixture.runtime(),
+            RACE_CONTAINER_ID,
+            tokio::time::Instant::now(),
+        )
+        .await;
+
+        assert_eq!(result, Err(ReapFailure::Timeout));
+        assert_eq!(
+            fixture.ps_calls(),
+            0,
+            "no work may start after the deadline"
+        );
+        assert!(fixture.rm_calls().is_empty(), "observation never removes");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn successful_rm_completes_only_after_the_exact_id_is_confirmed_absent() {
+        let _fixture_permit = production_runtime_fixture_permit().await;
+        let fixture = RemovalRaceRuntime::new(RM_SUCCEEDS, "exit 0");
+
+        let controller = fixture.controller(SUCCESSFUL_RUNTIME_TEST_TIMEOUT).await;
+        let result = controller.reap_observed().await;
+
+        assert_eq!(fixture.rm_calls(), [format!("rm -f {RACE_CONTAINER_ID}")]);
+        assert_eq!(result, Ok(()));
+        assert_eq!(
+            fixture.ps_calls(),
+            1,
+            "a zero exit is confirmed by one inventory, never trusted as proof of absence"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn successful_rm_with_a_still_present_object_never_greens() {
+        let _fixture_permit = production_runtime_fixture_permit().await;
+        // A runtime wrapper that exits zero while leaving the captured ID present.
+        let fixture =
+            RemovalRaceRuntime::new(RM_SUCCEEDS, "printf '%s\\tstable-name\\n' \"$id\"\nexit 0");
+
+        let started = std::time::Instant::now();
+        let controller = fixture.controller(SUCCESSFUL_RUNTIME_TEST_TIMEOUT).await;
+        let result = controller.reap_observed().await;
+
+        assert_eq!(fixture.rm_calls().len(), 1, "the removal must start once");
+        assert_eq!(result, Err(ReapFailure::NonZeroExit));
+        assert!(
+            fixture.ps_calls() >= 2,
+            "the present object must be observed within the window, saw {}",
+            fixture.ps_calls()
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(4),
+            "observation must stop at its window, took {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_inventory_that_reports_absence_after_the_window_never_greens() {
+        let _fixture_permit = production_runtime_fixture_permit().await;
+        // The removal deadline is 5 s but the observation window is 2 s: an inventory that only
+        // answers (absent) at 3 s is outside the window and must not settle cleanup.
+        let fixture = RemovalRaceRuntime::new(RM_ALREADY_IN_PROGRESS, "sleep 3\nexit 0");
+
+        let started = std::time::Instant::now();
+        let result = remove_container_id(
+            &fixture.runtime(),
+            RACE_CONTAINER_ID,
+            Duration::from_secs(5),
+        )
+        .await;
+
+        assert_eq!(fixture.rm_calls().len(), 1, "the removal must start once");
+        assert_eq!(fixture.ps_calls(), 1, "the inventory must have started");
+        assert_eq!(result, Err(ReapFailure::Timeout));
+        assert!(
+            started.elapsed() < Duration::from_millis(2800),
+            "the inventory child must be bounded by the window, took {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_present_sighting_followed_by_an_interrupted_inventory_never_greens() {
+        let _fixture_permit = production_runtime_fixture_permit().await;
+        // The first inventory sees the object; the second hangs until the 600 ms deadline cuts it
+        // off. The object was never seen absent, so the removal did not achieve absence.
+        let fixture = RemovalRaceRuntime::new(
+            RM_ALREADY_IN_PROGRESS,
+            "if [ \"$n\" -le 1 ]; then printf '%s\\tstable-name\\n' \"$id\"; exit 0; fi\nsleep 5\nexit 0",
+        );
+
+        let result = remove_container_id(
+            &fixture.runtime(),
+            RACE_CONTAINER_ID,
+            Duration::from_millis(600),
+        )
+        .await;
+
+        assert_eq!(fixture.rm_calls().len(), 1, "the removal must start once");
+        assert_eq!(
+            fixture.ps_calls(),
+            2,
+            "one sighting, then the interrupted inventory"
+        );
+        assert_eq!(result, Err(ReapFailure::NonZeroExit));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn absence_first_observed_after_the_bound_is_never_accepted() {
+        let _fixture_permit = production_runtime_fixture_permit().await;
+        let fixture = RemovalRaceRuntime::new(RM_ALREADY_IN_PROGRESS, "exit 0");
+        let runtime = fixture.runtime();
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(300);
+
+        // The inventory child answers (absent) long before the bound, but the only runtime thread
+        // is then held past it, so the answer is first polled after the bound. `timeout_at` polls
+        // its inner future first and would hand that stale answer back as success.
+        let (result, ()) = tokio::join!(
+            confirm_exact_id_absent_after_removal(&runtime, RACE_CONTAINER_ID, deadline),
+            async { std::thread::sleep(Duration::from_millis(700)) },
+        );
+
+        assert_eq!(fixture.ps_calls(), 1, "the inventory must have run");
+        assert_eq!(result, Err(ReapFailure::Timeout));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_malformed_inventory_never_settles_absence_after_either_exit_status() {
+        let _fixture_permit = production_runtime_fixture_permit().await;
+        let mut wrong = Vec::new();
+        for (exit, rm_body) in [("nonzero", RM_ALREADY_IN_PROGRESS), ("zero", RM_SUCCEEDS)] {
+            for (label, row) in MALFORMED_INVENTORY_ROWS {
+                let fixture =
+                    RemovalRaceRuntime::new(rm_body, &format!("printf '%s\\n' '{row}'\nexit 0"));
+
+                let result = remove_container_id(
+                    &fixture.runtime(),
+                    RACE_CONTAINER_ID,
+                    SUCCESSFUL_RUNTIME_TEST_TIMEOUT,
+                )
+                .await;
+
+                assert_eq!(
+                    fixture.rm_calls().len(),
+                    1,
+                    "{label} after a {exit} exit: the removal must start once"
+                );
+                if result != Err(ReapFailure::IdentityUnavailable) || fixture.ps_calls() != 1 {
+                    wrong.push(format!(
+                        "{label} after a {exit} exit: {result:?} after {} inventories",
+                        fixture.ps_calls()
+                    ));
+                }
+            }
+        }
+        assert!(
+            wrong.is_empty(),
+            "a malformed inventory must fail closed after one observation:\n{}",
+            wrong.join("\n")
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_matching_row_cannot_hide_a_malformed_row_from_the_removal() {
+        let _fixture_permit = production_runtime_fixture_permit().await;
+        let mut wrong = Vec::new();
+        for (label, ps_body) in [
+            (
+                "malformed row after the captured ID",
+                "printf '%s\\tstable-name\\n' \"$id\"\nprintf 'other\\tname\\textra\\n'\nexit 0",
+            ),
+            (
+                "malformed row before the captured ID",
+                "printf 'other\\tname\\textra\\n'\nprintf '%s\\tstable-name\\n' \"$id\"\nexit 0",
+            ),
+            (
+                "malformed row after the captured ID with no names",
+                "printf '%s\\t\\n' \"$id\"\nprintf '\\tname\\n'\nexit 0",
+            ),
+        ] {
+            let fixture = RemovalRaceRuntime::new(RM_ALREADY_IN_PROGRESS, ps_body);
+
+            let result = remove_container_id(
+                &fixture.runtime(),
+                RACE_CONTAINER_ID,
+                SUCCESSFUL_RUNTIME_TEST_TIMEOUT,
+            )
+            .await;
+
+            assert_eq!(
+                fixture.rm_calls().len(),
+                1,
+                "{label}: the removal must start once"
+            );
+            if result != Err(ReapFailure::IdentityUnavailable) || fixture.ps_calls() != 1 {
+                wrong.push(format!(
+                    "{label}: {result:?} after {} inventories",
+                    fixture.ps_calls()
+                ));
+            }
+        }
+        assert!(
+            wrong.is_empty(),
+            "an inventory with any malformed row is unusable, whatever else it lists:\n{}",
+            wrong.join("\n")
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_present_sighting_followed_by_a_malformed_inventory_never_greens() {
+        let _fixture_permit = production_runtime_fixture_permit().await;
+        // The first inventory sees the object; the second is malformed in the way that used to read
+        // as "absent". A prior sighting must not turn that unusable answer into a completed removal.
+        let fixture = RemovalRaceRuntime::new(
+            RM_ALREADY_IN_PROGRESS,
+            "if [ \"$n\" -le 1 ]; then printf '%s\\tstable-name\\n' \"$id\"; exit 0; fi\nprintf 'other\\tname\\textra\\n'\nexit 0",
+        );
+
+        let result = remove_container_id(
+            &fixture.runtime(),
+            RACE_CONTAINER_ID,
+            SUCCESSFUL_RUNTIME_TEST_TIMEOUT,
+        )
+        .await;
+
+        assert_eq!(fixture.rm_calls().len(), 1, "the removal must start once");
+        assert_eq!(
+            fixture.ps_calls(),
+            2,
+            "one sighting, then the malformed inventory"
+        );
+        assert_eq!(result, Err(ReapFailure::IdentityUnavailable));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_empty_names_field_still_observes_the_exact_id_as_present() {
+        let _fixture_permit = production_runtime_fixture_permit().await;
+        // Mid-removal a runtime can list the captured ID with its names already released. That row
+        // is well formed and the ID alone keeps the object present until it leaves the inventory.
+        let fixture = RemovalRaceRuntime::new(
+            RM_ALREADY_IN_PROGRESS,
+            "if [ \"$n\" -le 2 ]; then printf '%s\\t\\n' \"$id\"; fi\nprintf 'other-id\\t\\n'\nexit 0",
+        );
+
+        let result = remove_container_id(
+            &fixture.runtime(),
+            RACE_CONTAINER_ID,
+            SUCCESSFUL_RUNTIME_TEST_TIMEOUT,
+        )
+        .await;
+
+        assert_eq!(
+            fixture.rm_calls(),
+            [format!("rm -f {RACE_CONTAINER_ID}")],
+            "observation polling must never dispatch another removal"
+        );
+        assert_eq!(result, Ok(()));
+        assert_eq!(
+            fixture.ps_calls(),
+            3,
+            "two sightings by ID alone, then absence"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_empty_names_field_with_the_id_present_never_greens() {
+        let _fixture_permit = production_runtime_fixture_permit().await;
+        let fixture =
+            RemovalRaceRuntime::new(RM_ALREADY_IN_PROGRESS, "printf '%s\\t\\n' \"$id\"\nexit 0");
+
+        let result = remove_container_id(
+            &fixture.runtime(),
+            RACE_CONTAINER_ID,
+            SUCCESSFUL_RUNTIME_TEST_TIMEOUT,
+        )
+        .await;
+
+        assert_eq!(fixture.rm_calls().len(), 1, "the removal must start once");
+        assert_eq!(result, Err(ReapFailure::NonZeroExit));
+        assert!(
+            fixture.ps_calls() >= 2,
+            "the present object must be observed within the window, saw {}",
+            fixture.ps_calls()
+        );
+    }
+
+    /// A production-attempt managed controller over a [`RemovalRaceRuntime`], with the journal
+    /// exposed so a test can read the typed failure code that durable recovery would see.
+    #[cfg(unix)]
+    fn journaled_production_removal(
+        fixture: &RemovalRaceRuntime,
+    ) -> (
+        ReapController,
+        Arc<InMemoryResourceFlightJournal>,
+        ResourceFlightIdV1,
+    ) {
+        let ownership = managed_ownership();
+        let identity = ResourceIdentityV1::ManagedContainer {
+            generation: format!("container-id:{RACE_CONTAINER_ID}"),
+            runtime: fixture.runtime(),
+            immutable_container_id: RACE_CONTAINER_ID.into(),
+            ownership_labels_digest: ownership.digest().clone(),
+        };
+        let probe: ContainerIdentityProbeFn = {
+            let labels = ownership.ordered().to_vec();
+            Arc::new(move |_runtime, _selector| {
+                let labels = labels.clone();
+                Box::pin(async move {
+                    Ok(ContainerRuntimeIdentityV1 {
+                        immutable_container_id: RACE_CONTAINER_ID.into(),
+                        ownership_labels: labels,
+                    })
+                })
+            })
+        };
+        let subordinate: ContainerSubordinateCleanupFn = Arc::new(|| Box::pin(async { Ok(()) }));
+        let journal = Arc::new(InMemoryResourceFlightJournal::new(512));
+        let journal_port: Arc<dyn ResourceFlightJournal> = journal.clone();
+        let (durable, flight_id) = durable_container_for_test(&identity, journal_port);
+        let controller = ReapController::managed_durable_v3(
+            identity,
+            "stable-name",
+            ownership,
+            production_remove_attempt(SUCCESSFUL_RUNTIME_TEST_TIMEOUT),
+            probe,
+            subordinate,
+            durable,
+        )
+        .unwrap();
+        (controller, journal, flight_id)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_managed_flight_journals_the_typed_cause_of_an_unconfirmable_removal() {
+        let _fixture_permit = production_runtime_fixture_permit().await;
+        for (label, rm_body, ps_body, expected) in [
+            (
+                "failing inventory",
+                RM_ALREADY_IN_PROGRESS,
+                "exit 2",
+                ReapFailure::IdentityUnavailable,
+            ),
+            (
+                "unspawnable inventory",
+                "rm -f \"$0\"\nexit 1",
+                "exit 0",
+                ReapFailure::Spawn,
+            ),
+        ] {
+            let fixture = RemovalRaceRuntime::new(rm_body, ps_body);
+            let (controller, journal, flight_id) = journaled_production_removal(&fixture);
+
+            let result = controller.reap_observed().await;
+
+            assert_eq!(fixture.rm_calls().len(), 1, "{label}: one removal only");
+            assert_eq!(result, Err(expected), "{label}");
+            let rows = journal.records(&flight_id).unwrap();
+            assert!(
+                rows.iter().any(|row| matches!(
+                    &row.event,
+                    ResourceFlightJournalEventV1::ContainerRemovalObserved { observation }
+                        if !observation.removed
+                            && observation.failure_code.as_deref() == Some(expected.code())
+                )),
+                "{label}: the journaled removal must carry {}",
+                expected.code()
+            );
+            assert!(
+                rows.iter().any(|row| matches!(
+                    &row.event,
+                    ResourceFlightJournalEventV1::Settled { result }
+                        if result.disposition == ResourceActionDispositionV1::Failed
+                )),
+                "{label}: the flight must settle failed"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_managed_flight_journals_a_confirmed_absent_removal_as_complete() {
+        let _fixture_permit = production_runtime_fixture_permit().await;
+        let fixture = RemovalRaceRuntime::new(RM_ALREADY_IN_PROGRESS, "exit 0");
+        let (controller, journal, flight_id) = journaled_production_removal(&fixture);
+
+        let result = controller.reap_observed().await;
+
+        assert_eq!(fixture.rm_calls().len(), 1, "one removal only");
+        assert_eq!(result, Ok(()));
+        let rows = journal.records(&flight_id).unwrap();
+        assert!(rows.iter().any(|row| matches!(
+            &row.event,
+            ResourceFlightJournalEventV1::ContainerRemovalObserved { observation }
+                if observation.removed && observation.failure_code.is_none()
+        )));
+        assert!(rows.iter().any(|row| matches!(
+            &row.event,
+            ResourceFlightJournalEventV1::Settled { result }
+                if result.disposition == ResourceActionDispositionV1::Complete
+        )));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_managed_flight_journals_a_malformed_inventory_as_unavailable_never_complete() {
+        let _fixture_permit = production_runtime_fixture_permit().await;
+        let mut wrong = Vec::new();
+        for (label, rm_body, ps_body) in [
+            (
+                "extra-field inventory after a nonzero exit",
+                RM_ALREADY_IN_PROGRESS,
+                "printf 'other\\tname\\textra\\n'\nexit 0",
+            ),
+            (
+                "extra-field inventory after a zero exit",
+                RM_SUCCEEDS,
+                "printf 'other\\tname\\textra\\n'\nexit 0",
+            ),
+            (
+                "malformed row after the captured ID",
+                RM_ALREADY_IN_PROGRESS,
+                "printf '%s\\tstable-name\\n' \"$id\"\nprintf 'other\\tname\\textra\\n'\nexit 0",
+            ),
+            (
+                "empty identity",
+                RM_ALREADY_IN_PROGRESS,
+                "printf '\\tname\\n'\nexit 0",
+            ),
+        ] {
+            let fixture = RemovalRaceRuntime::new(rm_body, ps_body);
+            let (controller, journal, flight_id) = journaled_production_removal(&fixture);
+
+            let result = controller.reap_observed().await;
+
+            assert_eq!(fixture.rm_calls().len(), 1, "{label}: one removal only");
+            let rows = journal.records(&flight_id).unwrap();
+            let journaled_unavailable = rows.iter().any(|row| {
+                matches!(
+                    &row.event,
+                    ResourceFlightJournalEventV1::ContainerRemovalObserved { observation }
+                        if !observation.removed
+                            && observation.failure_code.as_deref()
+                                == Some(ReapFailure::IdentityUnavailable.code())
+                )
+            });
+            let journaled_removed = rows.iter().any(|row| {
+                matches!(
+                    &row.event,
+                    ResourceFlightJournalEventV1::ContainerRemovalObserved { observation }
+                        if observation.removed
+                )
+            });
+            let settled = |disposition| {
+                rows.iter().any(|row| {
+                    matches!(
+                        &row.event,
+                        ResourceFlightJournalEventV1::Settled { result }
+                            if result.disposition == disposition
+                    )
+                })
+            };
+            if result != Err(ReapFailure::IdentityUnavailable)
+                || !journaled_unavailable
+                || journaled_removed
+                || !settled(ResourceActionDispositionV1::Failed)
+                || settled(ResourceActionDispositionV1::Complete)
+            {
+                wrong.push(format!(
+                    "{label}: returned {result:?}, journaled unavailable {journaled_unavailable}, \
+                     journaled removed {journaled_removed}, settled failed {}, settled complete {}",
+                    settled(ResourceActionDispositionV1::Failed),
+                    settled(ResourceActionDispositionV1::Complete)
+                ));
+            }
+        }
+        assert!(
+            wrong.is_empty(),
+            "a malformed inventory must be returned and journaled as identity_unavailable:\n{}",
+            wrong.join("\n")
         );
     }
 
