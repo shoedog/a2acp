@@ -65,7 +65,9 @@
     source review3/3 were disclosed on the same retained artifact. The accepted Sonnet5.5 repair reached
     its two-hour policy cutoff, with source/evidence retained and no provider replay. Controller normal Cargo
     gates pass4952 all-target/4963 default-doctests,0failed/13ignored each, no exclusions and matching hashes.
-    Provider-free completion of the unfinished final-source mutations is active. No restart or passB dispatch.
+    All37 final-source mutations now build/select86/flip with restored hashes (A17/A19 structural-only).
+    Clean cab8661f, parent251289fe, is in cumulative Sol source review3/3; the rejected commit/checkpoint
+    and all prior evidence remain retained. No restart, provider repair replay or passB dispatch.
     No Git-plane code has landed; independent Sol approval, serial passB,
     native-ext4 CI, macOS verification and combined review remain outstanding.
     The controller handoff records the bound serial tasks and active run.

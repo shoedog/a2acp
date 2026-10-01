@@ -1,8 +1,8 @@
 # Handoff — ADR-0041 Slice 2B3b orchestration
 
-**Written:** 2026-10-01T14:21:33.683477+00:00 · **By:** Codex controller · **Provider:** codex
+**Written:** 2026-10-01T14:46:37.455236+00:00 · **By:** Codex controller · **Provider:** codex
 **Workspace:** `/Users/wesleyjinks/code/a2a-bridge` · `work/adr0041-2b3b-bootstrap-20261001` ·
-**Measured state:** `[MEASURED]` HEAD `39028617aa9edf28923aeef943d7613070351e6d` · Tree CLEAN before this active-run refresh ·
+**Measured state:** `[MEASURED]` HEAD `d4e4a5fba506ec7f05e17ecf60dbc6fb3894d1f1` · Tree CLEAN before this active-run refresh ·
 Probe `git status --short`, `shasum -a 256 crates/bridge-core/src/reaper.rs` · Output: production hash
 `30860ae070746c5de9b9a85469f8e07dfd67e94f9da7183c5469c98f281aab2d`, exactly the independently approved source.
 **Predecessor:** Claude handoff supplied by owner: merge PR126, then 2B3b spec/review/implementation.
@@ -14,7 +14,7 @@ Probe `git status --short`, `shasum -a 256 crates/bridge-core/src/reaper.rs` · 
 **(a) Lane ownership** — `[MEASURED]` controller owns this lane; Sonnet edit and Sol review both emitted
 completed terminal records for cleanup. Git-plane passA stopped at its two-round cap in impl-25228-mwz25w5c;
 retained assistant transcript model is exactly claude-sonnet-5-5. Implementation is parked; the read-only
-design audit completed and corrective Sol spec review APPROVED; targeted Sonnet repair ended at policy cutoff; controller verification is active — RESOLVED.
+design audit completed and corrective Sol spec review APPROVED; targeted Sonnet repair ended at policy cutoff; controller verification is complete; cumulative source review3/3 active — RESOLVED.
 **(b) Custody exposure** — `[MEASURED]` cleanup code committed in quarantine at 434905a2; exact delta imported
 here. Round3 evidence has a second copy in scratch. Integration and receipts committed/pushed at 25e63468;
 PR128 merged at 251289fe after all five checks passed — RESOLVED.
@@ -28,9 +28,12 @@ canceled_policy/cleanup complete; exact container0c7b59466e97 is absent. The tra
 Sonnet5.5 work despite the terminal prompt-acceptance field being false; no provider replay. Source25876aba/
 tests95dc80d7 and all receipts are preserved. Controller normal Cargo fmt/clippy/build/full suites/hygiene
 pass:4952 all-target,4963 default/doctests,0failed/13ignored each, no exclusions,86 Git tests. All source
-hashes match before/after/live. Provider-free completion of17 unfinished final-source mutations is active
-(session1464);20 worker rows retained,14 controller rows complete,3 remain. No import/passB/source
-review3 has started; old checkpoints remain frozen — RESOLVED for writer/custody, verification OPEN.
+hashes match before/after/live. All37 final-source mutation rows build/select86/FLIP with restored hashes;
+20 worker receipts and17 provider-free controller completions, A17/A19 structural-only. All verification
+processes ended successfully. Rejected3888ef5c is retained under retained/2b3b-pass-a-rejected-3888ef5c;
+controller committed clean cab8661f, parent251289fe. Sol cumulative source review3/3 session70445 active:
+exec-77178bc8a1cdb65f8c446265ec7f17c7, attempt-59cb1fbdbd7803e756312c755018c42b. No import/passB;
+old checkpoints remain frozen — RESOLVED for writer/custody/verification, source approval OPEN.
 **(d) Authorization granted but not exercised** — owner: "Merge 2B3a and proceed to orchestrate spec and
 implementation of 2B3b." Later: "use sonnet5-5 for implementation. You may need ti update the acp for the
 bridge. update for claude, codex if so". Owner approved isolated bootstrap, explicit caller format for Empty
@@ -47,14 +50,12 @@ is now236 GiB, mostly already visible before this deletion; cause unproven. See 
 
 ## 1. Resume order
 
-1. Monitor provider-free verification session1464 on the same quarantine; Sonnet session23587 ended. Approved task42ea4dc6 and
-   audit7114b718 are mounted byte-for-byte with a hash receipt. Execution exec-0a8d8b6a495cc721f7e9f7094e0eca7f,
-   attempt-c79cdda623932b893d249683220b40d9; node canceled_policy, cleanup complete. No source adoption.
-2. Sol corrective spec round1/2 APPROVED wrong0/smell0/blockers0. The disclosed extension is one repair
-   turn and cumulative source review3/3, preserving original cap2/source. At completion verify actual model,
-   behavioral RED on3888ef5c, final-byte mutation/gate receipts and the full source; then commit through the
-   controller and run hard-read-only Sol round3/3. Remaining open class parks for owner escalation.
-   Never resume/reset/forge the exhausted checkpoint or import its rejected patch.
+1. Monitor cumulative hard-read-only Sol source review3/3 session70445 on clean cab8661f, full251289fe..HEAD.
+   Execution exec-77178bc8a1cdb65f8c446265ec7f17c7; attempt-59cb1fbdbd7803e756312c755018c42b.
+   All normal Cargo gates and37 final-source mutations pass; exact causal limits are in final evidence notes.
+2. At review3/3 classify before acting: remaining open class parks for owner escalation. No silent fourth
+   round, provider repair replay, discarded artifact or passB dispatch. If approved, preserve exact receipt
+   and source before manual operator integration; original automatic Rejected checkpoint remains unchanged.
 3. Authorized build cleanup is complete. Do not delete checkouts, branches or evidence. After passA stopped,
    private implement.toml was restored to floor50 and validated. The exact executed floor20 config is retained
    as implement-pass-a-executed-floor20.toml; never silently substitute the changed config in historical claims.
@@ -82,7 +83,7 @@ scope/contract disagreement; unproven concrete Sonnet5.5 model; a failing gate w
 | Candidate release | done | `[MEASURED]` locked/offline release from exact 251289fe; build log and binary SHA25fe68e1 in scratch; validate/doctor/catalog green |
 | Git-plane implementation | PARKED at cap2 | `[MEASURED]` 3888ef5c, LoopStopped; review2 REJECT wrong2/smell0/blockers2: actual child entries unmeasured/uncharged; verify-pack/fsck accept truncated output. Both recur in earlier accounting/parser classes, so OPEN CLASS despite counts3→2. Source/transcript/gates preserved; green4927/4938 worker totals and bridge PASS do not establish correctness |
 | Design escalation | complete, cap1/1 | `[MEASURED]` node completed/cleanup complete, source3888ef5c still clean; raw payload7114b718 and tracked receipt2026-10-01-adr0041-slice2b3b-pass-a-design-audit.md. `[INHERITED]` census5 WRONG/2 SMELL, CLOSED POPULATION; no master contradiction/owner choice. Source is not approved |
-| Corrective task spec | APPROVED round1/2 | `[MEASURED]` task42ea4dc6 references full audit; session89683, execution exec-8de85e358ad01b90c4d250d86a9421a5, node completed, zero findings. Tracked corrective spec receipt; exact task/audit hashes unchanged. Separate Sonnet repair session23587 active |
+| Corrective task spec | APPROVED round1/2 | `[MEASURED]` task42ea4dc6 references full audit; session89683, execution exec-8de85e358ad01b90c4d250d86a9421a5, node completed, zero findings. Tracked corrective spec receipt; exact task/audit hashes unchanged. Sonnet repair ended at policy cutoff; normal Cargo verification complete, source review3/3 active |
 
 ## 3. Corrections to standing documents and memory
 
@@ -102,7 +103,7 @@ scope/contract disagreement; unproven concrete Sonnet5.5 model; a failing gate w
 | # | Work | State | Exact next action | Blocked by | Identifiers |
 |---:|---|---|---|---|---|
 | 1 | Storage admission / cleanup | resolved / cleared | preserve checkouts/evidence; private floor50 restored/validated, executed floor20 copy retained | none | scratch/cleanup-approved-result-rechecked.json |
-| 2 | Git bootstrap | provider-free verification active | inspect final evidence, controller commit, cumulative Sol source review3/3 | terminal repair + valid gates | impl-25228-mwz25w5c; rejected3888ef5c; repair session23587 |
+| 2 | Git bootstrap | source review3/3 active | inspect verdict/classification; preserve exact source receipt | Sol terminal | impl-25228-mwz25w5c; clean cab8661f; session70445 |
 | 3 | Complete G | blocked | serial passB and combined review | approved passA | scratch 2b3b-pass-b-draft.md |
 
 ## 5. Invariants and traps — do not do these
@@ -161,7 +162,7 @@ scope/contract disagreement; unproven concrete Sonnet5.5 model; a failing gate w
 bounded fully validated exact-ID absence, preserving typed failures · source 434905a2 · Sol round3 APPROVE,
 wrong0/smell0/blockers0. Controller executed full macOS gates separately; Linux gates are worker receipts.
 Spec round2 APPROVE remains authoritative with explicitly folded clarifications. Git-plane passA is rejected
-at cap2; design audit closed the population and the corrective spec is approved. Same-artifact repair reached policy cutoff; provider-free verification is active.
+at cap2; design audit closed the population and the corrective spec is approved. Same-artifact repair reached policy cutoff; provider-free verification is complete and cumulative source review3/3 is active.
 There is no completion claim until source approval, both passes, full gates
 and the combined review finish.
 
