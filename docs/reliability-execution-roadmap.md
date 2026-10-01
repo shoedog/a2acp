@@ -46,7 +46,7 @@
     The [cleanup audit](superpowers/reviews/2026-09-30-a2a-bridge-cleanup-audit.md) initially identified 15.8 GiB
     in old builds plus about4 GiB in root incremental. Owner-approved cleanup removed three remaining targets
     totaling 4.236 GiB; root incremental was already absent. Free space is now236 GiB, mostly observed before
-    this controller's deletion and not attributed to it. Worktrees, branches and evidence remain. PassA is active
+    this controller's deletion and not attributed to it. Worktrees, branches and evidence remain. PassA ran
     in `impl-25228-mwz25w5c`, with Sonnet5.5 proven by its retained transcript. Its first committed candidate was
     `b1b78d426f1e662128133f08f5e64940370d42d3`. Worker Linux receipts report 4922 all-target and4933
     default/doctest passes, zero failures and13 ignored in each; the bridge's five verification commands
@@ -55,7 +55,12 @@
     artifact; refreshed worker evidence has110 mutation rows,107 flipped and3 bounded equivalence notes,
     with receipt limits recorded in the controller handoff. The repair is committed at `3888ef5c`; worker
     full suites report 4927 all-target and4938 default/doctest passes, zero failures and13 ignored each,
-    with61 new Git tests and matching final hashes. Bridge verification passed and Sol review2/2 is active.
+    with61 new Git tests and matching final hashes. Bridge verification passed, but Sol review2/2 rejected
+    two recurring-class blockers: uncharged actual child entries and permissive verify-pack/fsck output.
+    At cap2 the controller classified OPEN CLASS and parked implementation on the retained artifact;
+    read-only Sol design audit cap1 is active to enumerate the full population and produce a concrete
+    corrective task for separate spec review before any further implementation. No silent third round,
+    restart or passB dispatch is authorized by the audit.
     No Git-plane code has landed; independent Sol approval, serial passB,
     native-ext4 CI, macOS verification and combined review remain outstanding.
     The controller handoff records the bound serial tasks and active run.
