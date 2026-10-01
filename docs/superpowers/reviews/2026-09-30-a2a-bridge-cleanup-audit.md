@@ -41,4 +41,4 @@ The bridge storage report counted 106 direct a2a-bridge standalone clones totali
 
 lsof exited 0; Docker inventory exited 0; 0 inspect failures. No selected old worktree had an observed open file or container mount. Current root and running bridge are active. Snapshot absence does not prove future absence; recheck before removal.
 
-Raw inventories: cleanup-audit.json, cleanup-liveness.json, storage-report-before-git.json, storage-build-targets-dry-run.json in this directory.
+Raw inventories: cleanup-audit.json, cleanup-liveness.json, storage-report-before-git.json, storage-build-targets-dry-run.json under `/private/tmp/adr0041-2b3b-20260929`; a second snapshot is retained under the controller checkout's `.git/a2a-evidence/cleanup-audit-20260930`.
