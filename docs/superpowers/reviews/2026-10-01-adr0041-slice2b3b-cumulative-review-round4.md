@@ -35,6 +35,8 @@ required before full unexcluded final-byte gates and a new independent cumulativ
 Owner decision is required because the declared final cap has been exhausted without convergence,
 not because ordinary reversible implementation needs permission. PassB remains gated on approval.
 
+**Subsequent owner decision:** "approved" — one targeted repair and cumulative review5/5 on the same artifact. This explicitly supersedes the parked state above; original verdict/cap and master contract remain unchanged.
+
 The following is raw reviewer output (execution evidence is supplied receipts, not reviewer-local runs).
 
 ---

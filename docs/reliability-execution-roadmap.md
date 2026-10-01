@@ -77,11 +77,13 @@
     post-child deadline escape, and mixed fsck output misclassification. The
     [round4 receipt](superpowers/reviews/2026-10-01-adr0041-slice2b3b-cumulative-review-round4.md)
     records the exact three-item repair. Counts3→2→1→3 no longer converge; the declared final cap is
-    exhausted. Implementation is PARKED pending owner authorization of a targeted same-artifact repair
-    and new review cap. All rejected source/checkpoints/evidence remain; no import, restart or passB.
+    exhausted, and implementation was parked. The owner explicitly approved one targeted same-artifact
+    Sonnet5.5 repair plus cumulative Sol review5/5. That repair is active on e6d866fa, with exact mounted
+    inputs and normal Cargo cache transport; no master deadline exception. All original cap records,
+    rejected source/checkpoints/evidence remain; no import, restart or passB.
     No Git-plane code has landed; independent Sol approval, serial passB,
     native-ext4 CI, macOS verification and combined review remain outstanding.
-    The controller handoff records the bound serial tasks and parked cap decision.
+    The controller handoff records the bound serial tasks and owner-approved round5 dispatch.
   **2B2b is complete:** all its children are merged. The parent Slice 2B completion gate (plan §8) still requires 2B3,
   the aggregate fixture without the source or its alternates, and one bounded review of the combined diff.
   - **Merged on 2026-09-26/27:**
