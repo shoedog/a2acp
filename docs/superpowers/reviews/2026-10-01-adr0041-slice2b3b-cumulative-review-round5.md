@@ -14,10 +14,12 @@ and return VerifiedGitBootstrapV1. Worker disclosed that limitation; controller 
 **Controller cap classification:** CLOSED, localized residual of the original deadline invariant;
 counts3→1 converge for this owner-approved repair. Owner authorized ONE repair plus source review5/5,
 not unlimited rounds. That cap is exhausted, so source remains UNAPPROVED and implementation PARKED
-for owner decision. No review6, restart, source import or passB occurred. Same clean artifact,
+for owner decision at that stable point. Owner subsequently replied "another repair is authorized";
+one targeted same-artifact Sonnet5.5 repair is now dispatched, followed by cumulative source review6/6.
+No review6 verdict, restart, source import or passB occurred. Same preserved artifact,
 all rejected refs/checkpoints and complete execution evidence remain preserved.
 
-**Concrete bounded repair proposed, not dispatched:**
+**Concrete bounded repair, subsequently authorized and dispatched:**
 - Carry the same original Instant through the post-child success sweep and closing gate, including
   bounded census/chain loops, staged rewinds where needed and admitted pack/idx/rev streaming rehash.
 - Check deadline after potentially slow reads and during loops, then immediately BEFORE the final
@@ -28,7 +30,12 @@ all rejected refs/checkpoints and complete execution evidence remain preserved.
   source-bound guard-removal mutations for late-expiry paths. Keep all100 existing Git tests.
 - Sonnet5.5 edits ONLY the same Git module/tests/implementation handoff. Same-environment admissible
   base RED and negative controls precede localized corrections; full unexcluded final-byte suites,
-  source/hash custody and one new cumulative Sol source review6/6 follow, if owner authorizes.
+  source/hash custody and one new cumulative Sol source review6/6 follow under the owner's authorization.
+
+Round6 task SHA256 `ef45bb94fe02e0d77674079b63e3b29eb5320334f11b033945692e99ddccc966`;
+fresh doctor27 checks and Sonnet catalog pass. Mounted inputs bind clean b3aa6afd and all five hashes.
+Session56776, execution exec-57b25cef7aa29dd8bb2a2025f8a16dda,
+attempt-9e2643c80d4b23ced3b5e20361021e89. Cap6/6 declared before dispatch; no silent seventh round.
 
 Full worker suites remain4966 all-target/4977 defaultdoctests,0failed/13ignored each/no exclusions,
 fmt/clippy/build/hygiene PASS and13/13 mutations. These are source-bound execution RECEIPTS, not
@@ -67,4 +74,3 @@ This verdict covers source-only pass A. Pass B, final Git-plane output, native f
 VERDICT: REJECT  
 SUMMARY: wrong=1 smell=0 blockers=1 round=5/5  
 CAP CLASSIFICATION: CLOSED POPULATION
-
