@@ -60,9 +60,10 @@
     At cap2 the controller classified OPEN CLASS and parked implementation on the retained artifact;
     read-only Sol design audit cap1/1 completed with a CLOSED POPULATION of5 WRONG/2 nonblocking SMELL,
     recorded in the [design audit receipt](superpowers/reviews/2026-10-01-adr0041-slice2b3b-pass-a-design-audit.md).
-    The master is sufficient; a concrete full-population corrective task is now in separate Sol spec
-    review1/2 before any further implementation. Only after approval is one disclosed cumulative
-    source-review extension3/3 proposed on this same artifact. No restart or passB dispatch.
+    The master is sufficient; the [corrective specification](superpowers/reviews/2026-10-01-adr0041-slice2b3b-corrective-spec-review.md)
+    was approved by Sol in round1/2 with zero findings. One targeted Sonnet5.5 repair and cumulative
+    source review3/3 were disclosed on the same retained artifact. Repair session23587 is active;
+    a pre-provider MCP-key refusal was preserved before the corrected launch. No restart or passB dispatch.
     No Git-plane code has landed; independent Sol approval, serial passB,
     native-ext4 CI, macOS verification and combined review remain outstanding.
     The controller handoff records the bound serial tasks and active run.
