@@ -69,8 +69,12 @@
     Sol cumulative source review3/3 of clean cab8661f REJECTED one bounded WRONG (read-only same-inode/
     same-length metadata/content effects evade baseline) and one nonblockingSMELL (unsafe FIFO fixture),
     CLOSED POPULATION. Earlier source findings are closed; controller disclosed a targeted Sonnet repair
-    and final cumulative source review4/4 on the same artifact. Round4 repair is active; the rejected
-    commits/checkpoint and all evidence remain retained. No restart or passB dispatch.
+    and final cumulative source review4/4 on the same artifact. Round4 repair completed at clean e6d866fa;
+    worker full suites pass4959 all-target/4970 default-doctests,0failed/13ignored each, no exclusions,
+    with93 Git tests and11/11 new mutations. Three seam-dependent tests lack base RED; post-child digest
+    has no deadline, an exception not approved by the controller. Final Sol review4/4 is active and carries
+    both limitations explicitly. Rejected commits/checkpoint and all evidence remain retained; no source
+    adoption, restart or passB dispatch.
     No Git-plane code has landed; independent Sol approval, serial passB,
     native-ext4 CI, macOS verification and combined review remain outstanding.
     The controller handoff records the bound serial tasks and active run.
