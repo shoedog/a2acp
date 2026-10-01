@@ -658,6 +658,8 @@ Receipts: `cleanup-host-candidate-approved/summary.json`, `cleanup-host-fresh-ba
 invalidation notes under `cleanup-host-final` / `cleanup-host-base-approved`, all beneath the scratch root.
 
 The controller imported the exact reviewed two-file delta and published PR128 at `25e63468`, with the
-exact production hash above. CI and landing remain pending; 2B3b Git-plane work has not started. Named parallel Linux timing failures remain
+exact production hash above. All five checks passed on final head `3317c398`; PR128 merged at
+`251289fe3fada54a740be4879fa48e7adeb9f3cb`. The rebuilt release is ready. 2B3b Git-plane work has not
+started because its first dispatch hit the storage floor before any agent started. Named parallel Linux timing failures remain
 unattributed receipts; serial host success does not prove their cause. Inventory/filter expansion and
 the out-of-scope stale sandbox comment remain deferred.
