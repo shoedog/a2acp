@@ -78,12 +78,15 @@
     [round4 receipt](superpowers/reviews/2026-10-01-adr0041-slice2b3b-cumulative-review-round4.md)
     records the exact three-item repair. Counts3→2→1→3 no longer converge; the declared final cap is
     exhausted, and implementation was parked. The owner explicitly approved one targeted same-artifact
-    Sonnet5.5 repair plus cumulative Sol review5/5. That repair is active on e6d866fa, with exact mounted
+    Sonnet5.5 repair plus cumulative Sol review5/5. That repair completed on e6d866fa, with exact mounted
     inputs and normal Cargo cache transport; no master deadline exception. Worker Git-module GREEN
     passes100/100, with all93 inherited test names preserved; valid base RED and separately labeled
     seam-only evidence retained. Frozen source80f88e89 and completed receipts have second copies;
-    all13 mutation rows build/flip/restore, unmutated13-test control passes. fmt/clippy/lockedbuild pass;
-    full final-byte suites/hygiene and review5 remain pending. All original cap records,
+    all13 mutation rows build/flip/restore, unmutated13-test control passes. Full final-byte suites pass
+    4966alltargets/4977defaultdoctests,0failed/13ignored each/no exclusions; fmt/clippy/build/hygiene pass.
+    Clean candidate b3aa6afd is under cumulative Sol source review5/5. Worker flags no deadline check
+    after the last digest read or during closing rehash; controller has not approved that exception,
+    and review input states it explicitly. All original cap records,
     rejected source/checkpoints/evidence remain; no import, restart or passB.
     No Git-plane code has landed; independent Sol approval, serial passB,
     native-ext4 CI, macOS verification and combined review remain outstanding.
