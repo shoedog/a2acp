@@ -81,8 +81,9 @@
     Sonnet5.5 repair plus cumulative Sol review5/5. That repair is active on e6d866fa, with exact mounted
     inputs and normal Cargo cache transport; no master deadline exception. Worker Git-module GREEN
     passes100/100, with all93 inherited test names preserved; valid base RED and separately labeled
-    seam-only evidence retained. Frozen source80f88e89 has a second copy; mutations/full gates/review5
-    remain pending. All original cap records,
+    seam-only evidence retained. Frozen source80f88e89 and completed receipts have second copies;
+    all13 mutation rows build/flip/restore, unmutated13-test control passes. fmt/clippy/lockedbuild pass;
+    full final-byte suites/hygiene and review5 remain pending. All original cap records,
     rejected source/checkpoints/evidence remain; no import, restart or passB.
     No Git-plane code has landed; independent Sol approval, serial passB,
     native-ext4 CI, macOS verification and combined review remain outstanding.

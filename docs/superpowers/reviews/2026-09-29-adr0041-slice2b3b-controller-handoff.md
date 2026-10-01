@@ -63,8 +63,11 @@ Registry cache transport explicitly provided; normal Cargo required. No source i
 rows succeeded incorrectly on base. Early invalid-HEAD probe corrections are not admissible evidence.
 StageB hook-dependent tests have seam-only S1 evidence, NOT base RED. Final Git-module GREEN100/100;
 [MEASURED] test-name sets93→100, removedNONE. Source80f88e89/tests264fc5df match frozen manifest;
-second copy at scratch/2b3b-pass-a-round5-frozen-source/receipt.json. Mutation campaign active on scratch
-copies; full final-byte gates and independent cumulative review5/5 still pending, source UNAPPROVED.
+second copy at scratch/2b3b-pass-a-round5-frozen-source/receipt.json. [MEASURED] all13 mutation records
+build/identifiedFLIP/hold/restore/livehash match; unmutated13-test control passes. Completed RED/GREEN/
+mutation receipts duplicated beside the snapshot; controller-mutation-check.json records limits.
+Final-byte gates active: fmt/clippy/lockedbuild pass, full alltargets running; defaultdoctests/hygiene
+and independent cumulative review5/5 still pending, source UNAPPROVED.
 **(d) Authorization granted but not exercised** — owner: "Merge 2B3a and proceed to orchestrate spec and
 implementation of 2B3b." Later: "use sonnet5-5 for implementation. You may need ti update the acp for the
 bridge. update for claude, codex if so". Owner approved isolated bootstrap, explicit caller format for Empty
