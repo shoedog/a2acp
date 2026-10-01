@@ -43,8 +43,10 @@
     Cleanup PR #128 is merged at `251289fe` after all five CI checks passed. The rebuilt release and private
     ACP/model preflights are ready. Git passA was refused before provider startup by D-4 storage admission
     (29.2 GiB free versus 50 GiB); the owner then approved a 20 GiB floor only for this isolated lane.
-    The [cleanup audit](superpowers/reviews/2026-09-30-a2a-bridge-cleanup-audit.md) identifies 15.8 GiB in old
-    build directories plus about4 GiB in root incremental artifacts; nothing was deleted. PassA is now active
+    The [cleanup audit](superpowers/reviews/2026-09-30-a2a-bridge-cleanup-audit.md) initially identified 15.8 GiB
+    in old builds plus about4 GiB in root incremental. Owner-approved cleanup removed three remaining targets
+    totaling 4.236 GiB; root incremental was already absent. Free space is now236 GiB, mostly observed before
+    this controller's deletion and not attributed to it. Worktrees, branches and evidence remain. PassA is active
     in `impl-25228-mwz25w5c`, with Sonnet5.5 proven by its retained transcript. No Git-plane code has landed;
     full verification, independent Sol approval, serial passB and combined review remain outstanding.
     The controller handoff records the bound serial tasks and active run.

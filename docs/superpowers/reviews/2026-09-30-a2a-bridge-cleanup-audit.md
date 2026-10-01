@@ -2,7 +2,7 @@
 
 Snapshot: 2026-10-01T03:03:28Z; ancestry bound to origin/main `251289fe3fada54a740be4879fa48e7adeb9f3cb`.
 
-Read-only audit; no worktree, branch, build, image, volume, source, or evidence deletion performed. Disk counts are allocated bytes from du; APFS actual reclaimed space can differ.
+Initial read-only audit snapshot; deletion had not yet been authorized or performed. The owner subsequently approved the four-directory build cleanup, completed below. Disk counts are allocated bytes from du; APFS actual reclaimed space can differ.
 
 ## Useful build candidates
 
@@ -46,3 +46,11 @@ Raw inventories: cleanup-audit.json, cleanup-liveness.json, storage-report-befor
 ## Concrete optional cleanup
 
 Limit removal to the three target directories in the table and root `/Users/wesleyjinks/code/a2a-bridge/target/debug/incremental`, about19.8 GiB allocated in total. Keep every worktree, branch, source file, evidence directory, root dependency cache and current release. Two old top-level release binaries were copied and SHA-256 verified into `/private/tmp/adr0041-2b3b-20260929/cleanup-retained-binaries`; receipt.json binds original and retained paths. Recheck directory identities, clean/merged state and active use immediately before removal. No deletion is authorized by this audit alone.
+
+## Authorized cleanup result
+
+The owner explicitly approved clearing the four listed directories. A first preflight at 03:50:33Z refused because root incremental was already absent; it deleted nothing. The PR104 target had also shrunk to 0.278 GiB, and free space was already about230 GiB before this controller deleted anything. The cause of those changes is unproven; do not attribute them to this cleanup.
+
+At 03:52:50Z the corrected preflight verified retained binary hashes, retained no-follow directory identities, clean/merged source, ignored build paths, host open files, and all container mounts. The three remaining target directories were removed and their absence confirmed; their freshly measured allocated bytes totaled **4.236 GiB**. Root incremental was recorded as already absent. Free space was **236.252 GiB** afterward, an observed increase of 4.340 GiB during this run; concurrent filesystem activity means that delta is not an exact reclaim attribution. Worktrees, branches, source and custody evidence were not removed. The current release hash remains `25fe68e184df1e4a06b16846e07b5a963493785c8bfd5c626cf26db5050ca370`.
+
+Receipts: `cleanup-approved-result.json` (no-deletion refusal) and `cleanup-approved-result-rechecked.json` (completed deletion), retained with the raw inventories in scratch and the controller Git evidence snapshot. No test suite was needed for cache removal; verification checked the actual directory absence, source state, retained binary hashes and running candidate hash. The Git-plane implementation remains active in its separate quarantine.

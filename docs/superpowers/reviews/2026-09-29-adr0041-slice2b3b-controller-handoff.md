@@ -28,10 +28,12 @@ objects with unauthenticated provenance, and "Repair and review cleanup before i
 
 **(e) Storage admission** — `[MEASURED]` passA refused at 29.2 GiB free, below the default 50 GiB D-4 floor.
 The safe build-target dry run plans only 765952 bytes across tiny fixture targets, insufficient to help.
-No deletion performed. Owner approved 20 GiB only in this private lane config; guard remains enabled.
-The owner also requested an audit of old a2a-bridge worktrees/builds/branches. Audit completed with no deletion:
-three old target dirs total 15.846 GiB, root incremental about4 GiB; ten clean merged worktrees and97 merged
-unused branches. See [cleanup audit](2026-09-30-a2a-bridge-cleanup-audit.md); recheck custody/liveness before deletion — RESOLVED.
+Owner approved 20 GiB only in this private lane config; guard remains enabled. The cleanup audit initially
+found three old targets totaling 15.846 GiB plus root incremental about4 GiB, ten clean merged worktrees and97
+merged unused branches. Owner then explicitly approved clearing only those four build directories. Root
+incremental was already absent at preflight and PR104 had shrunk; the remaining three targets were cleared
+(4.236 GiB freshly measured), retaining old release binaries, all worktrees/branches/source/evidence. Free space
+is now236 GiB, mostly already visible before this deletion; cause unproven. See [cleanup audit](2026-09-30-a2a-bridge-cleanup-audit.md) — RESOLVED.
 
 ## 1. Resume order
 
@@ -40,7 +42,8 @@ unused branches. See [cleanup audit](2026-09-30-a2a-bridge-cleanup-audit.md); re
 2. Inspect the passA terminal result and source-bound full gates; preserve any rejection for targeted fixes.
    Explicit base is `251289fe3fada54a740be4879fa48e7adeb9f3cb`, review cap2. PassA only retains an
    isolated verified object bootstrap, no repository/ output or G result.
-3. Cleanup audit is complete; no deletion authorized or performed. Recheck custody/liveness before removal.
+3. Authorized build cleanup is complete. Do not delete checkouts, branches or evidence. After passA settles,
+   restore the private config's default50 GiB admission floor before passB; free space now comfortably exceeds it.
 4. Independently approved passA then feeds serial passB (`2b3b-pass-b-draft.md`), cap2. Full unexcluded suites,
    native-ext4 CI, macOS checks and combined pre-passA..final review are required before 2B3b completion.
 
@@ -80,7 +83,7 @@ scope/contract disagreement; unproven concrete Sonnet5.5 model; a failing gate w
 
 | # | Work | State | Exact next action | Blocked by | Identifiers |
 |---:|---|---|---|---|---|
-| 1 | Storage admission / cleanup audit | resolved / audit complete | no deletion; recheck before any later cleanup | deletion authorization | scratch/cleanup-audit.json, cleanup-liveness.json |
+| 1 | Storage admission / cleanup | resolved / cleared | preserve checkouts/evidence; restore private floor50 after passA | active run config must remain stable | scratch/cleanup-approved-result-rechecked.json |
 | 2 | Git bootstrap | active | monitor preserved transcript/evidence and terminal gates | none | impl-25228-mwz25w5c; session24335; cap2 |
 | 3 | Complete G | blocked | serial passB and combined review | approved passA | scratch 2b3b-pass-b-draft.md |
 
