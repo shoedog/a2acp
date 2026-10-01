@@ -47,8 +47,11 @@
     in old builds plus about4 GiB in root incremental. Owner-approved cleanup removed three remaining targets
     totaling 4.236 GiB; root incremental was already absent. Free space is now236 GiB, mostly observed before
     this controller's deletion and not attributed to it. Worktrees, branches and evidence remain. PassA is active
-    in `impl-25228-mwz25w5c`, with Sonnet5.5 proven by its retained transcript. No Git-plane code has landed;
-    full verification, independent Sol approval, serial passB and combined review remain outstanding.
+    in `impl-25228-mwz25w5c`, with Sonnet5.5 proven by its retained transcript. Its committed candidate is
+    `b1b78d426f1e662128133f08f5e64940370d42d3`. Worker Linux receipts report 4922 all-target and4933
+    default/doctest passes, zero failures and13 ignored in each; the bridge's five verification commands
+    passed and Sol round1/2 is active. No Git-plane code has landed; independent Sol approval, serial passB,
+    native-ext4 CI, macOS verification and combined review remain outstanding.
     The controller handoff records the bound serial tasks and active run.
   **2B2b is complete:** all its children are merged. The parent Slice 2B completion gate (plan §8) still requires 2B3,
   the aggregate fixture without the source or its alternates, and one bounded review of the combined diff.
