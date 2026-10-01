@@ -46,8 +46,9 @@ is now236 GiB, mostly already visible before this deletion; cause unproven. See 
    both rounds. Complete the design audit's full population census and a concrete bounded corrective task;
    send that task through a separate Sol spec review before any implementation. Do not silently dispatch
    a third implementation review or transfer standalone equivalence claims to new callers.
-3. Authorized build cleanup is complete. Do not delete checkouts, branches or evidence. After passA settles,
-   restore the private config's default50 GiB admission floor before passB; free space now comfortably exceeds it.
+3. Authorized build cleanup is complete. Do not delete checkouts, branches or evidence. After passA stopped,
+   private implement.toml was restored to floor50 and validated. The exact executed floor20 config is retained
+   as implement-pass-a-executed-floor20.toml; never silently substitute the changed config in historical claims.
 4. Independently approved passA then feeds serial passB (`2b3b-pass-b-draft.md`), cap2. The separate private
    `implement-pass-b.toml` validates with floor50 and review timeout3600; executed passA config is retained.
    Refresh doctor/catalog and bind the task to the actual approved/imported base before dispatch. Full unexcluded suites,
@@ -90,7 +91,7 @@ scope/contract disagreement; unproven concrete Sonnet5.5 model; a failing gate w
 
 | # | Work | State | Exact next action | Blocked by | Identifiers |
 |---:|---|---|---|---|---|
-| 1 | Storage admission / cleanup | resolved / cleared | preserve checkouts/evidence; restore private floor50 after passA | active run config must remain stable | scratch/cleanup-approved-result-rechecked.json |
+| 1 | Storage admission / cleanup | resolved / cleared | preserve checkouts/evidence; private floor50 restored/validated, executed floor20 copy retained | none | scratch/cleanup-approved-result-rechecked.json |
 | 2 | Git bootstrap | PARKED / design audit | enumerate full accounting/parser population, concrete corrective task, separate spec review | approved corrective design/task before implementation | impl-25228-mwz25w5c; rejected3888ef5c; audit session19204 cap1 |
 | 3 | Complete G | blocked | serial passB and combined review | approved passA | scratch 2b3b-pass-b-draft.md |
 
