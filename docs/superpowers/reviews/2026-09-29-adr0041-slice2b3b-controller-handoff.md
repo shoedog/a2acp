@@ -1,8 +1,8 @@
 # Handoff — ADR-0041 Slice 2B3b orchestration
 
-**Written:** 2026-10-01T06:49:30Z · **By:** Codex controller · **Provider:** codex
+**Written:** 2026-10-01T07:14:34Z · **By:** Codex controller · **Provider:** codex
 **Workspace:** `/Users/wesleyjinks/code/a2a-bridge` · `work/adr0041-2b3b-bootstrap-20261001` ·
-**Measured state:** `[MEASURED]` HEAD `b4042ed1f8aef3e9b8476c8cd5529f99a2eac7cc` · Tree CLEAN before this active-run refresh ·
+**Measured state:** `[MEASURED]` HEAD `258e71486b18dc3816b2789ec94aaa86318e3ad0` · Tree CLEAN before this active-run refresh ·
 Probe `git status --short`, `shasum -a 256 crates/bridge-core/src/reaper.rs` · Output: production hash
 `30860ae070746c5de9b9a85469f8e07dfd67e94f9da7183c5469c98f281aab2d`, exactly the independently approved source.
 **Predecessor:** Claude handoff supplied by owner: merge PR126, then 2B3b spec/review/implementation.
@@ -66,7 +66,7 @@ scope/contract disagreement; unproven concrete Sonnet5.5 model; a failing gate w
 | Private ACP/model setup | done | `[INHERITED]` Claude ACP0.84.0/SDK0.3.284/CLI2.1.284; Codex ACP2.0.1/Codex0.159.1; `[MEASURED]` continuation transcript model set exactly claude-sonnet-5-5 |
 | Cleanup publication/CI/landing | done | `[MEASURED]` exact 3317c398 all five checks SUCCESS; PR128 merged 251289fe |
 | Candidate release | done | `[MEASURED]` locked/offline release from exact 251289fe; build log and binary SHA25fe68e1 in scratch; validate/doctor/catalog green |
-| Git-plane implementation | passA repaired-source gates | `[MEASURED]` Sol round1/2 REJECT at b1b78d42, wrong3/smell1/blockers3; same Sonnet5.5 transcript shows targeted repairs. Worker table110 rows:107 FLIPPED,3 bounded equivalents,0invalid/unresolved; static receipt caveats below. Frozen four-file source backed up against manifest. Fmt/clippy/hygiene pass, full suites active; bridge verification/review2 still pending. Earlier4922/4933 totals belong only to rejected b1b78d42 |
+| Git-plane implementation | passA review2/2 | `[MEASURED]` committed repair3888ef5c, clean five-path delta; bridge verification passed, Sol review active. All four source hashes match worker final manifest and frozen backup; final transcript model set exactly claude-sonnet-5-5. `[INHERITED]` worker gates4927/4938 passes,0failed,13ignored each,61 Git tests; matrix110 rows107 FLIPPED/3 bounded equivalents with caveats below. Earlier4922/4933 totals belong only to rejected b1b78d42 |
 
 ## 3. Corrections to standing documents and memory
 
@@ -86,7 +86,7 @@ scope/contract disagreement; unproven concrete Sonnet5.5 model; a failing gate w
 | # | Work | State | Exact next action | Blocked by | Identifiers |
 |---:|---|---|---|---|---|
 | 1 | Storage admission / cleanup | resolved / cleared | preserve checkouts/evidence; restore private floor50 after passA | active run config must remain stable | scratch/cleanup-approved-result-rechecked.json |
-| 2 | Git bootstrap | targeted repair | inspect refreshed source-bound evidence, full gates and review2/2 | none | impl-25228-mwz25w5c; rejected b1b78d42 preserved; session24335; cap2 |
+| 2 | Git bootstrap | review2/2 | inspect Sol verdict; classify remaining findings at cap before action | none | impl-25228-mwz25w5c; repair3888ef5c; session24335; cap2 |
 | 3 | Complete G | blocked | serial passB and combined review | approved passA | scratch 2b3b-pass-b-draft.md |
 
 ## 5. Invariants and traps — do not do these
@@ -122,7 +122,10 @@ scope/contract disagreement; unproven concrete Sonnet5.5 model; a failing gate w
 | Model receipt | scratch/cleanup-round3-model-provenance.json; transcript 54a56deb-49d2-4129-8295-023593788e97 |
 | Current bridge | target/release/a2a-bridge from 251289fe; SHA256 25fe68e184df1e4a06b16846e07b5a963493785c8bfd5c626cf26db5050ca370 |
 | Active G passA | impl-25228-mwz25w5c; controller PID25228; session24335; transcript3447a689-f6f9-44ee-8a62-e003010961f0 |
-| PassA candidate | b1b78d426f1e662128133f08f5e64940370d42d3; owned five-path delta; no root adoption yet |
+| Rejected PassA candidate | b1b78d426f1e662128133f08f5e64940370d42d3; retained separately |
+| Current repair candidate | 3888ef5c549cda2ab2044145c843e234712fec75; clean five-path delta; no root adoption yet |
+| Repair custody | scratch/2b3b-pass-a-committed-r2-snapshot: committed five paths, worker evidence including round0 archive, final transcript and provenance receipt |
+| Prepared import patch | scratch/2b3b-pass-a-3888ef5c.patch; SHA256 853642b00b62b2b100f884415210d57c34eb86a6d662d62603d9c46d91a5e08a; git apply --check passed; NOT APPLIED, requires approval first |
 | PassA raw evidence | quarantine .git/a2a-evidence/2b3b-pass-a; full gate logs, final source hashes and mutation matrix retained |
 | Rejected A custody | scratch/2b3b-pass-a-committed-r1-snapshot: five committed paths, full provider transcript, hashes and concrete Sonnet5.5 model; no approval claim |
 | Rejected A raw gates | scratch/2b3b-pass-a-rejected-r1-evidence:115 worker receipt files retained separately |
@@ -138,4 +141,4 @@ wrong0/smell0/blockers0. Controller executed full macOS gates separately; Linux 
 Spec round2 APPROVE remains authoritative with explicitly folded clarifications. Git-plane passA is active;
 there is no completion claim until both passes, full gates and the combined review finish.
 
-**Questions the owner owes an answer to:** None; private 20 GiB floor explicitly approved. Cleanup audit requested.
+**Questions the owner owes an answer to:** None; private 20 GiB floor explicitly approved. Audit and approved build cleanup completed.
