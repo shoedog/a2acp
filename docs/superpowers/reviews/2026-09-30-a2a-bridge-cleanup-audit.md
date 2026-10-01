@@ -42,3 +42,7 @@ The bridge storage report counted 106 direct a2a-bridge standalone clones totali
 lsof exited 0; Docker inventory exited 0; 0 inspect failures. No selected old worktree had an observed open file or container mount. Current root and running bridge are active. Snapshot absence does not prove future absence; recheck before removal.
 
 Raw inventories: cleanup-audit.json, cleanup-liveness.json, storage-report-before-git.json, storage-build-targets-dry-run.json under `/private/tmp/adr0041-2b3b-20260929`; a second snapshot is retained under the controller checkout's `.git/a2a-evidence/cleanup-audit-20260930`.
+
+## Concrete optional cleanup
+
+Limit removal to the three target directories in the table and root `/Users/wesleyjinks/code/a2a-bridge/target/debug/incremental`, about19.8 GiB allocated in total. Keep every worktree, branch, source file, evidence directory, root dependency cache and current release. Two old top-level release binaries were copied and SHA-256 verified into `/private/tmp/adr0041-2b3b-20260929/cleanup-retained-binaries`; receipt.json binds original and retained paths. Recheck directory identities, clean/merged state and active use immediately before removal. No deletion is authorized by this audit alone.
