@@ -1,8 +1,8 @@
 # Handoff — ADR-0041 Slice 2B3b orchestration
 
-**Written:** 2026-10-01T05:21:32Z · **By:** Codex controller · **Provider:** codex
+**Written:** 2026-10-01T05:45:58Z · **By:** Codex controller · **Provider:** codex
 **Workspace:** `/Users/wesleyjinks/code/a2a-bridge` · `work/adr0041-2b3b-bootstrap-20261001` ·
-**Measured state:** `[MEASURED]` HEAD `d1b7da02a1fe02c7ecdff0afb0f6858b38e76e99` · Tree CLEAN before this active-run refresh ·
+**Measured state:** `[MEASURED]` HEAD `cddde683` · Tree CLEAN before this active-run refresh ·
 Probe `git status --short`, `shasum -a 256 crates/bridge-core/src/reaper.rs` · Output: production hash
 `30860ae070746c5de9b9a85469f8e07dfd67e94f9da7183c5469c98f281aab2d`, exactly the independently approved source.
 **Predecessor:** Claude handoff supplied by owner: merge PR126, then 2B3b spec/review/implementation.
@@ -64,7 +64,7 @@ scope/contract disagreement; unproven concrete Sonnet5.5 model; a failing gate w
 | Private ACP/model setup | done | `[INHERITED]` Claude ACP0.84.0/SDK0.3.284/CLI2.1.284; Codex ACP2.0.1/Codex0.159.1; `[MEASURED]` continuation transcript model set exactly claude-sonnet-5-5 |
 | Cleanup publication/CI/landing | done | `[MEASURED]` exact 3317c398 all five checks SUCCESS; PR128 merged 251289fe |
 | Candidate release | done | `[MEASURED]` locked/offline release from exact 251289fe; build log and binary SHA25fe68e1 in scratch; validate/doctor/catalog green |
-| Git-plane implementation | passA review1/2 | `[MEASURED]` impl-25228-mwz25w5c, base251289fe, candidate b1b78d42; transcript proves Sonnet5.5; bridge five-command verification passed, Sol review active. `[INHERITED]` worker Linux receipts: 4922 all-target /4933 default-doctest passes, zero failures,13 ignored each;56 new tests;96/98 mutations flipped,2 documented equivalents, with causal limits stated in worker handoff |
+| Git-plane implementation | passA targeted repair | `[MEASURED]` Sol round1/2 REJECT at b1b78d42, wrong3/smell1/blockers3: final stale object digests; dropped failed-child budget/custody reconciliation; permissive index-pack output. Same Sonnet5.5 transcript shows targeted fixes and refreshed matrix underway. Earlier bridge five-command verification passed; `[INHERITED]` earlier worker Linux totals4922/4933,0failed,13ignored and96/98 mutations apply only to rejected b1b78d42, not new bytes |
 
 ## 3. Corrections to standing documents and memory
 
@@ -84,7 +84,7 @@ scope/contract disagreement; unproven concrete Sonnet5.5 model; a failing gate w
 | # | Work | State | Exact next action | Blocked by | Identifiers |
 |---:|---|---|---|---|---|
 | 1 | Storage admission / cleanup | resolved / cleared | preserve checkouts/evidence; restore private floor50 after passA | active run config must remain stable | scratch/cleanup-approved-result-rechecked.json |
-| 2 | Git bootstrap | review1/2 | inspect Sol verdict, preserve and target any rejection | none | impl-25228-mwz25w5c; b1b78d42; session24335; cap2 |
+| 2 | Git bootstrap | targeted repair | inspect refreshed source-bound evidence, full gates and review2/2 | none | impl-25228-mwz25w5c; rejected b1b78d42 preserved; session24335; cap2 |
 | 3 | Complete G | blocked | serial passB and combined review | approved passA | scratch 2b3b-pass-b-draft.md |
 
 ## 5. Invariants and traps — do not do these
@@ -122,6 +122,7 @@ scope/contract disagreement; unproven concrete Sonnet5.5 model; a failing gate w
 | Active G passA | impl-25228-mwz25w5c; controller PID25228; session24335; transcript3447a689-f6f9-44ee-8a62-e003010961f0 |
 | PassA candidate | b1b78d426f1e662128133f08f5e64940370d42d3; owned five-path delta; no root adoption yet |
 | PassA raw evidence | quarantine .git/a2a-evidence/2b3b-pass-a; full gate logs, final source hashes and mutation matrix retained |
+| Rejected A custody | scratch/2b3b-pass-a-committed-r1-snapshot: five committed paths, full provider transcript, hashes and concrete Sonnet5.5 model; no approval claim |
 | Pre-matrix backup | scratch/2b3b-pass-a-inflight-snapshot; frozen-matrix-binding.json proves all four saved file hashes equal worker pre-matrix hashes; not a final verdict |
 
 ## 7. Refutation verdict and owner questions
