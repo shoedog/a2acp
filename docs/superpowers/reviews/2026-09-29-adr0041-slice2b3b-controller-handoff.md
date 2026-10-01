@@ -1,8 +1,8 @@
 # Handoff — ADR-0041 Slice 2B3b orchestration
 
-**Written:** 2026-10-01T02:51:15Z · **By:** Codex controller · **Provider:** codex
+**Written:** 2026-10-01T03:13:38Z · **By:** Codex controller · **Provider:** codex
 **Workspace:** `/Users/wesleyjinks/code/a2a-bridge` · `work/adr0041-2b3b-bootstrap-20261001` ·
-**Measured state:** `[MEASURED]` HEAD `251289fe3fada54a740be4879fa48e7adeb9f3cb` · Tree CLEAN before this startup refresh ·
+**Measured state:** `[MEASURED]` HEAD `feb03a2535c292f321f984a41af81833407d029a` · Tree CLEAN before this active-run refresh ·
 Probe `git status --short`, `shasum -a 256 crates/bridge-core/src/reaper.rs` · Output: production hash
 `30860ae070746c5de9b9a85469f8e07dfd67e94f9da7183c5469c98f281aab2d`, exactly the independently approved source.
 **Predecessor:** Claude handoff supplied by owner: merge PR126, then 2B3b spec/review/implementation.
@@ -12,13 +12,15 @@ Probe `git status --short`, `shasum -a 256 crates/bridge-core/src/reaper.rs` · 
 ## 0. Gating facts — settle these before starting anything below
 
 **(a) Lane ownership** — `[MEASURED]` controller owns this lane; Sonnet edit and Sol review both emitted
-completed terminal records. No Git-plane agent has been dispatched — RESOLVED.
+completed terminal records for cleanup. Git-plane passA now runs in impl-25228-mwz25w5c;
+retained assistant transcript model is exactly claude-sonnet-5-5 — RESOLVED.
 **(b) Custody exposure** — `[MEASURED]` cleanup code committed in quarantine at 434905a2; exact delta imported
 here. Round3 evidence has a second copy in scratch. Integration and receipts committed/pushed at 25e63468;
 PR128 merged at 251289fe after all five checks passed — RESOLVED.
 **(c) In flight / irreversible** — `[MEASURED]` host sessions 95926 and 97919 completed; base rebuilt from a real
 clone. Original implement checkpoint remains Rejected. Separate round3 receipt approves source; no replay.
-Git passA was refused by storage admission before clone/provider startup; no accepted turn — RESOLVED.
+First Git passA dispatch was refused by storage admission before clone/provider startup; no accepted turn.
+Corrected dispatch passed admission and is active in session 24335, controller PID25228 — RESOLVED.
 **(d) Authorization granted but not exercised** — owner: "Merge 2B3a and proceed to orchestrate spec and
 implementation of 2B3b." Later: "use sonnet5-5 for implementation. You may need ti update the acp for the
 bridge. update for claude, codex if so". Owner approved isolated bootstrap, explicit caller format for Empty
@@ -27,17 +29,18 @@ objects with unauthenticated provenance, and "Repair and review cleanup before i
 **(e) Storage admission** — `[MEASURED]` passA refused at 29.2 GiB free, below the default 50 GiB D-4 floor.
 The safe build-target dry run plans only 765952 bytes across tiny fixture targets, insufficient to help.
 No deletion performed. Owner approved 20 GiB only in this private lane config; guard remains enabled.
-The owner also requested an audit of old a2a-bridge worktrees/builds/branches for cleanup candidates — RESOLVED.
+The owner also requested an audit of old a2a-bridge worktrees/builds/branches. Audit completed with no deletion:
+three old target dirs total 15.846 GiB, root incremental about4 GiB; ten clean merged worktrees and97 merged
+unused branches. See [cleanup audit](2026-09-30-a2a-bridge-cleanup-audit.md); recheck custody/liveness before deletion — RESOLVED.
 
 ## 1. Resume order
 
-1. Validate the owner-approved private 20 GiB floor in §0e; audit old bridge worktrees/builds/branches.
-   Do not delete unrelated checkouts. Dry-run/report are in scratch; retain custody before cleanup.
-2. Revalidate/doctor/catalog `scratch/implement.toml` with the rebuilt release. All were green at last probe;
-   both requested raw aliases advertised. No additional PONG smoke is authorized.
-3. Dispatch `scratch/2b3b-pass-a-task.md` with explicit base `251289fe3fada54a740be4879fa48e7adeb9f3cb`,
-   `--lang rust --depth standard`, cap2. Its first attempt only hit storage preflight, so no turn is replayed.
-   PassA only retains an isolated verified object bootstrap, no repository/ output or G result.
+1. Monitor active session24335 / PID25228 / impl-25228-mwz25w5c; do not dispatch a duplicate or reset it.
+   Agent transcript and .git/a2a-evidence advance even when the controller launch log is quiet.
+2. Inspect the passA terminal result and source-bound full gates; preserve any rejection for targeted fixes.
+   Explicit base is `251289fe3fada54a740be4879fa48e7adeb9f3cb`, review cap2. PassA only retains an
+   isolated verified object bootstrap, no repository/ output or G result.
+3. Cleanup audit is complete; no deletion authorized or performed. Recheck custody/liveness before removal.
 4. Independently approved passA then feeds serial passB (`2b3b-pass-b-draft.md`), cap2. Full unexcluded suites,
    native-ext4 CI, macOS checks and combined pre-passA..final review are required before 2B3b completion.
 
@@ -58,7 +61,7 @@ scope/contract disagreement; unproven concrete Sonnet5.5 model; a failing gate w
 | Private ACP/model setup | done | `[INHERITED]` Claude ACP0.84.0/SDK0.3.284/CLI2.1.284; Codex ACP2.0.1/Codex0.159.1; `[MEASURED]` continuation transcript model set exactly claude-sonnet-5-5 |
 | Cleanup publication/CI/landing | done | `[MEASURED]` exact 3317c398 all five checks SUCCESS; PR128 merged 251289fe |
 | Candidate release | done | `[MEASURED]` locked/offline release from exact 251289fe; build log and binary SHA25fe68e1 in scratch; validate/doctor/catalog green |
-| Git-plane implementation | ready | `[MEASURED]` first storage preflight refused before agent startup; no G code; owner-approved private integer 20 GiB floor now validates |
+| Git-plane implementation | active passA | `[MEASURED]` impl-25228-mwz25w5c at base251289fe; Sonnet5.5 transcript confirmed; baseline crate compile green, structural RED/editing in progress; full gates and Sol pending |
 
 ## 3. Corrections to standing documents and memory
 
@@ -70,15 +73,15 @@ scope/contract disagreement; unproven concrete Sonnet5.5 model; a failing gate w
 | Host sandbox suites | 251 failures establish a source regression | `[MEASURED]` rejected as environment-refusal evidence; approved host suites pass |
 | First base control | source hash/clean tree suffice to bind compiled tests | `[MEASURED]` candidate-only test names proved reused artifact; excluded; fresh clone control recompiles and verifies old population |
 | Sol progress statement | later clean macOS totals were supplied at review time | `[MEASURED]` unsupported; receipt header excludes that sentence; independent controller gates now supply actual totals |
-| Roadmap/worker closure | round3/landing pending | `[MEASURED]` source approval, full-suite receipts and PR128 merge recorded; private 20 GiB floor approved and validated; dispatch next |
+| Roadmap/worker closure | round3/landing pending | `[MEASURED]` source approval, full-suite receipts and PR128 merge recorded; private 20 GiB floor approved/validated; passA now active |
 | Memory | older 2B3a findings | `[INHERITED]` used to locate/rebind contract; no memory update requested |
 
 ## 4. Open work
 
 | # | Work | State | Exact next action | Blocked by | Identifiers |
 |---:|---|---|---|---|---|
-| 1 | Storage admission / cleanup audit | approved / auditing | retain guard at private 20 GiB; inventory old worktrees/builds/branches | none | scratch/storage-build-targets-dry-run.json |
-| 2 | Git bootstrap | ready | dispatch exact-base bound serial passA task | fresh preflight | scratch/2b3b-pass-a-task.md |
+| 1 | Storage admission / cleanup audit | resolved / audit complete | no deletion; recheck before any later cleanup | deletion authorization | scratch/cleanup-audit.json, cleanup-liveness.json |
+| 2 | Git bootstrap | active | monitor preserved transcript/evidence and terminal gates | none | impl-25228-mwz25w5c; session24335; cap2 |
 | 3 | Complete G | blocked | serial passB and combined review | approved passA | scratch 2b3b-pass-b-draft.md |
 
 ## 5. Invariants and traps — do not do these
@@ -119,6 +122,7 @@ scope/contract disagreement; unproven concrete Sonnet5.5 model; a failing gate w
 **§2c verdict:** CONFIRMED — pass: INDEPENDENT · evidence tier: STATIC-ONLY · claim: cleanup settles only on
 bounded fully validated exact-ID absence, preserving typed failures · source 434905a2 · Sol round3 APPROVE,
 wrong0/smell0/blockers0. Controller executed full macOS gates separately; Linux gates are worker receipts.
-Spec round2 APPROVE remains authoritative with explicitly folded clarifications. Git-plane code is not implemented.
+Spec round2 APPROVE remains authoritative with explicitly folded clarifications. Git-plane passA is active;
+there is no completion claim until both passes, full gates and the combined review finish.
 
 **Questions the owner owes an answer to:** None; private 20 GiB floor explicitly approved. Cleanup audit requested.
