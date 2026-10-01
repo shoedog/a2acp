@@ -51,8 +51,10 @@
     `b1b78d426f1e662128133f08f5e64940370d42d3`. Worker Linux receipts report 4922 all-target and4933
     default/doctest passes, zero failures and13 ignored in each; the bridge's five verification commands
     passed; Sol round1/2 rejected three bounded WRONGs (stale final object digests, failed-child accounting,
-    and permissive index-pack output) plus one nonblocking descriptor-offset SMELL. Sonnet is repairing the
-    same artifact and refreshing source-bound tests/evidence before review2/2. No Git-plane code has landed; independent Sol approval, serial passB,
+    and permissive index-pack output) plus one nonblocking descriptor-offset SMELL. Sonnet repaired the same
+    artifact; refreshed worker evidence has110 mutation rows,107 flipped and3 bounded equivalence notes,
+    with receipt limits recorded in the controller handoff. Frozen source is backed up; fmt/clippy/hygiene
+    pass and full suites are running before review2/2. No Git-plane code has landed; independent Sol approval, serial passB,
     native-ext4 CI, macOS verification and combined review remain outstanding.
     The controller handoff records the bound serial tasks and active run.
   **2B2b is complete:** all its children are merged. The parent Slice 2B completion gate (plan §8) still requires 2B3,

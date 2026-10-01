@@ -1,8 +1,8 @@
 # Handoff — ADR-0041 Slice 2B3b orchestration
 
-**Written:** 2026-10-01T05:45:58Z · **By:** Codex controller · **Provider:** codex
+**Written:** 2026-10-01T06:49:30Z · **By:** Codex controller · **Provider:** codex
 **Workspace:** `/Users/wesleyjinks/code/a2a-bridge` · `work/adr0041-2b3b-bootstrap-20261001` ·
-**Measured state:** `[MEASURED]` HEAD `cddde683` · Tree CLEAN before this active-run refresh ·
+**Measured state:** `[MEASURED]` HEAD `b4042ed1f8aef3e9b8476c8cd5529f99a2eac7cc` · Tree CLEAN before this active-run refresh ·
 Probe `git status --short`, `shasum -a 256 crates/bridge-core/src/reaper.rs` · Output: production hash
 `30860ae070746c5de9b9a85469f8e07dfd67e94f9da7183c5469c98f281aab2d`, exactly the independently approved source.
 **Predecessor:** Claude handoff supplied by owner: merge PR126, then 2B3b spec/review/implementation.
@@ -44,7 +44,9 @@ is now236 GiB, mostly already visible before this deletion; cause unproven. See 
    isolated verified object bootstrap, no repository/ output or G result.
 3. Authorized build cleanup is complete. Do not delete checkouts, branches or evidence. After passA settles,
    restore the private config's default50 GiB admission floor before passB; free space now comfortably exceeds it.
-4. Independently approved passA then feeds serial passB (`2b3b-pass-b-draft.md`), cap2. Full unexcluded suites,
+4. Independently approved passA then feeds serial passB (`2b3b-pass-b-draft.md`), cap2. The separate private
+   `implement-pass-b.toml` validates with floor50 and review timeout3600; active passA config remains unchanged.
+   Refresh doctor/catalog and bind the task to the actual approved/imported base before dispatch. Full unexcluded suites,
    native-ext4 CI, macOS checks and combined pre-passA..final review are required before 2B3b completion.
 
 **STOP conditions:** possibly accepted provider failure (no silent replay); open-class findings at cap;
@@ -64,7 +66,7 @@ scope/contract disagreement; unproven concrete Sonnet5.5 model; a failing gate w
 | Private ACP/model setup | done | `[INHERITED]` Claude ACP0.84.0/SDK0.3.284/CLI2.1.284; Codex ACP2.0.1/Codex0.159.1; `[MEASURED]` continuation transcript model set exactly claude-sonnet-5-5 |
 | Cleanup publication/CI/landing | done | `[MEASURED]` exact 3317c398 all five checks SUCCESS; PR128 merged 251289fe |
 | Candidate release | done | `[MEASURED]` locked/offline release from exact 251289fe; build log and binary SHA25fe68e1 in scratch; validate/doctor/catalog green |
-| Git-plane implementation | passA targeted repair | `[MEASURED]` Sol round1/2 REJECT at b1b78d42, wrong3/smell1/blockers3: final stale object digests; dropped failed-child budget/custody reconciliation; permissive index-pack output. Same Sonnet5.5 transcript shows targeted fixes and refreshed matrix underway. Earlier bridge five-command verification passed; `[INHERITED]` earlier worker Linux totals4922/4933,0failed,13ignored and96/98 mutations apply only to rejected b1b78d42, not new bytes |
+| Git-plane implementation | passA repaired-source gates | `[MEASURED]` Sol round1/2 REJECT at b1b78d42, wrong3/smell1/blockers3; same Sonnet5.5 transcript shows targeted repairs. Worker table110 rows:107 FLIPPED,3 bounded equivalents,0invalid/unresolved; static receipt caveats below. Frozen four-file source backed up against manifest. Fmt/clippy/hygiene pass, full suites active; bridge verification/review2 still pending. Earlier4922/4933 totals belong only to rejected b1b78d42 |
 
 ## 3. Corrections to standing documents and memory
 
@@ -123,6 +125,9 @@ scope/contract disagreement; unproven concrete Sonnet5.5 model; a failing gate w
 | PassA candidate | b1b78d426f1e662128133f08f5e64940370d42d3; owned five-path delta; no root adoption yet |
 | PassA raw evidence | quarantine .git/a2a-evidence/2b3b-pass-a; full gate logs, final source hashes and mutation matrix retained |
 | Rejected A custody | scratch/2b3b-pass-a-committed-r1-snapshot: five committed paths, full provider transcript, hashes and concrete Sonnet5.5 model; no approval claim |
+| Rejected A raw gates | scratch/2b3b-pass-a-rejected-r1-evidence:115 worker receipt files retained separately |
+| Frozen repair source | scratch/2b3b-pass-a-r2-frozen-source-snapshot: all four files match worker pre-matrix manifest; production Git module SHA5932d62f, tests SHAab856701; not yet final gates/review |
+| Repair evidence caveats | scratch/2b3b-pass-a-round2-controller-evidence-notes.md: C3c is refusal/progress redundancy with differing typed errors, not full equivalence; C6 equivalence is bounded to consuming passA flow; source-only E2 is structural evidence |
 | Pre-matrix backup | scratch/2b3b-pass-a-inflight-snapshot; frozen-matrix-binding.json proves all four saved file hashes equal worker pre-matrix hashes; not a final verdict |
 
 ## 7. Refutation verdict and owner questions
