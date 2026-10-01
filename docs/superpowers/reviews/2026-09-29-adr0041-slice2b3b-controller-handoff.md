@@ -1,8 +1,8 @@
 # Handoff — ADR-0041 Slice 2B3b orchestration
 
-**Written:** 2026-10-01T08:48:00Z · **By:** Codex controller · **Provider:** codex
+**Written:** 2026-10-01T10:42:00Z · **By:** Codex controller · **Provider:** codex
 **Workspace:** `/Users/wesleyjinks/code/a2a-bridge` · `work/adr0041-2b3b-bootstrap-20261001` ·
-**Measured state:** `[MEASURED]` HEAD `98d81fe13fb774ddec4e41f27506c4352e303aef` · Tree CLEAN before this active-run refresh ·
+**Measured state:** `[MEASURED]` HEAD `e8c96478` · Tree CLEAN before this active-run refresh ·
 Probe `git status --short`, `shasum -a 256 crates/bridge-core/src/reaper.rs` · Output: production hash
 `30860ae070746c5de9b9a85469f8e07dfd67e94f9da7183c5469c98f281aab2d`, exactly the independently approved source.
 **Predecessor:** Claude handoff supplied by owner: merge PR126, then 2B3b spec/review/implementation.
@@ -24,7 +24,12 @@ First Git passA dispatch was refused by storage admission before clone/provider 
 Corrected dispatch passed admission; session24335 has now ended with LoopStopped at3888ef5c and review2
 REJECT. Design audit session19204 completed, CLOSED POPULATION; corrective spec review session89683
 completed APPROVE with zero findings. Repair session23587 is active after a pre-provider MCP-key refusal
-was corrected. No import, passB or third source review has started; old checkpoints are retained — RESOLVED.
+was corrected. Transcript b4fe3dd1 confirms claude-sonnet-5-5. Controller restored the retained registry
+into this existing container, both explicit/default offline metadata pass; no provider replay. Sonnet used
+rustc substitutes while diagnosing the absent warm mount, so normal Cargo full gates remain required.
+First complete mutation run was superseded by the worker’s verify-pack guard restructuring; refreshed
+source SHA25876aba/tests95dc80d7 is snapshotted, GREEN86/86, refreshed campaign12/37 rows so far.
+No import, passB or third source review has started; old checkpoints are retained — RESOLVED.
 **(d) Authorization granted but not exercised** — owner: "Merge 2B3a and proceed to orchestrate spec and
 implementation of 2B3b." Later: "use sonnet5-5 for implementation. You may need ti update the acp for the
 bridge. update for claude, codex if so". Owner approved isolated bootstrap, explicit caller format for Empty
