@@ -2,7 +2,7 @@
 
 **Written:** 2026-10-01T00:06:27+00:00 · **By:** Codex controller · **Provider:** codex
 **Workspace:** `/Users/wesleyjinks/code/a2a-bridge` · `work/container-auto-removal-20260929` ·
-**Measured state:** `[MEASURED]` HEAD `9c41bac3a93150731ee9c948cdfabf7800ef16ba` + approved cleanup delta and evidence docs · Tree DIRTY ·
+**Measured state:** `[MEASURED]` HEAD `25e634683665d12270dc014b7bc8e64f1aff9747` · Tree CLEAN before this publication refresh ·
 Probe `git status --short`, `shasum -a 256 crates/bridge-core/src/reaper.rs` · Output: production hash
 `30860ae070746c5de9b9a85469f8e07dfd67e94f9da7183c5469c98f281aab2d`, exactly the independently approved source.
 **Predecessor:** Claude handoff supplied by owner: merge PR126, then 2B3b spec/review/implementation.
@@ -14,7 +14,8 @@ Probe `git status --short`, `shasum -a 256 crates/bridge-core/src/reaper.rs` · 
 **(a) Lane ownership** — `[MEASURED]` controller owns this lane; Sonnet edit and Sol review both emitted
 completed terminal records. No Git-plane agent has been dispatched — RESOLVED.
 **(b) Custody exposure** — `[MEASURED]` cleanup code committed in quarantine at 434905a2; exact delta imported
-here. Round3 evidence has a second copy in scratch. Root integration/docs need scoped commit and push — OPEN.
+here. Round3 evidence has a second copy in scratch. Integration and receipts committed/pushed at 25e63468;
+PR128 is open — RESOLVED.
 **(c) In flight / irreversible** — `[MEASURED]` host sessions 95926 and 97919 completed; base rebuilt from a real
 clone. Original implement checkpoint remains Rejected. Separate round3 receipt approves source; no replay — RESOLVED.
 **(d) Authorization granted but not exercised** — owner: "Merge 2B3a and proceed to orchestrate spec and
@@ -24,7 +25,7 @@ objects with unauthenticated provenance, and "Repair and review cleanup before i
 
 ## 1. Resume order
 
-1. Commit/push this scoped cleanup branch, create PR, require all five CI checks including native-ext4.
+1. Inspect `gh pr view 128 --json headRefOid,statusCheckRollup`; require all five checks including native-ext4.
    Source delta is exactly a25ddb01..434905a2 for reaper.rs; remaining changes are custody/review docs.
 2. Merge the cleanup PR preserving ancestry; build candidate release from its landed exact source.
    Do not replay the failed container PONG. Validate, doctor and catalog the private config before Git dispatch.
@@ -48,7 +49,8 @@ scope/contract disagreement; unproven concrete Sonnet5.5 model; a failing gate w
 | macOS gates | done | `[MEASURED]` `cleanup-host-candidate-approved`: all-targets 4860/0/13 (90 groups); default/doctests 4871/0/13 (106 groups); fmt/clippy/hygiene; clean exact source before/after |
 | Fresh macOS base control | done | `[MEASURED]` `cleanup-host-fresh-base`: exact a25ddb01, 4832/0/13; observed recompilation, 28 old reaper tests, no candidate-only names |
 | Private ACP/model setup | done | `[INHERITED]` Claude ACP0.84.0/SDK0.3.284/CLI2.1.284; Codex ACP2.0.1/Codex0.159.1; `[MEASURED]` continuation transcript model set exactly claude-sonnet-5-5 |
-| Cleanup publication/CI/landing | next | source/host gates approved; PR not yet created |
+| Cleanup publication | done | `[MEASURED]` PR128 open at 25e63468; GitHub head bound; CI running |
+| Cleanup CI/landing | pending | require all five checks, exact head, then merge/build |
 | Git-plane implementation | blocked | no dispatch before cleanup landing/build; two serial bounded passes |
 
 ## 3. Corrections to standing documents and memory
@@ -61,14 +63,14 @@ scope/contract disagreement; unproven concrete Sonnet5.5 model; a failing gate w
 | Host sandbox suites | 251 failures establish a source regression | `[MEASURED]` rejected as environment-refusal evidence; approved host suites pass |
 | First base control | source hash/clean tree suffice to bind compiled tests | `[MEASURED]` candidate-only test names proved reused artifact; excluded; fresh clone control recompiles and verifies old population |
 | Sol progress statement | later clean macOS totals were supplied at review time | `[MEASURED]` unsupported; receipt header excludes that sentence; independent controller gates now supply actual totals |
-| Roadmap/worker closure | round3 pending | `[MEASURED]` now records source approval and exact full-suite receipts; publication still pending |
+| Roadmap/worker closure | round3/publication pending | `[MEASURED]` source approval, full-suite receipts and PR128 publication recorded; CI/landing pending |
 | Memory | older 2B3a findings | `[INHERITED]` used to locate/rebind contract; no memory update requested |
 
 ## 4. Open work
 
 | # | Work | State | Exact next action | Blocked by | Identifiers |
 |---:|---|---|---|---|---|
-| 1 | Cleanup landing | next | scoped commit, push, PR, all CI, merge/build | CI not started | branch work/container-auto-removal-20260929 |
+| 1 | Cleanup landing | pending | PR128 all CI, exact-head merge/build | CI running | branch work/container-auto-removal-20260929 |
 | 2 | Git bootstrap | blocked | bind base/task, dispatch serial passA | cleanup landing | scratch 2b3b-pass-a-draft.md |
 | 3 | Complete G | blocked | serial passB and combined review | approved passA | scratch 2b3b-pass-b-draft.md |
 

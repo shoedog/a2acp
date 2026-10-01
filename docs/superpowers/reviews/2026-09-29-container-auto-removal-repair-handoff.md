@@ -657,7 +657,7 @@ rebuilt bridge-core and passed **4832/0/13**, with the original 28 reaper tests 
 Receipts: `cleanup-host-candidate-approved/summary.json`, `cleanup-host-fresh-base/summary.json`, and
 invalidation notes under `cleanup-host-final` / `cleanup-host-base-approved`, all beneath the scratch root.
 
-The controller imported the exact reviewed two-file delta onto its cleanup branch. CI/publication and
-landing remain pending; 2B3b Git-plane work has not started. Named parallel Linux timing failures remain
+The controller imported the exact reviewed two-file delta and published PR128 at `25e63468`, with the
+exact production hash above. CI and landing remain pending; 2B3b Git-plane work has not started. Named parallel Linux timing failures remain
 unattributed receipts; serial host success does not prove their cause. Inventory/filter expansion and
 the out-of-scope stale sandbox comment remain deferred.

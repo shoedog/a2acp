@@ -40,7 +40,7 @@
     defect at cap 2; one disclosed extension on the same artifact received **APPROVE** in round 3/3 at
     `434905a2`, zero WRONG/SMELL/blockers. Full Linux and macOS suites pass on the final source; the cached
     base control and sandbox-refused host probes are excluded from evidence, and a fresh base control passes.
-    Cleanup publication/CI/landing precedes Git-plane dispatch. The controller handoff records exact state.
+    Cleanup is published in PR #128; CI/landing precedes Git-plane dispatch. The controller handoff records exact state.
   **2B2b is complete:** all its children are merged. The parent Slice 2B completion gate (plan §8) still requires 2B3,
   the aggregate fixture without the source or its alternates, and one bounded review of the combined diff.
   - **Merged on 2026-09-26/27:**
