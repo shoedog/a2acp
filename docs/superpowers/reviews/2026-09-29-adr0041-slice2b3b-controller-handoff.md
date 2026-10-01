@@ -1,8 +1,8 @@
 # Handoff — ADR-0041 Slice 2B3b orchestration
 
-**Written:** 2026-10-01T20:32:15.847445+00:00 · **By:** Codex controller · **Provider:** codex
+**Written:** 2026-10-01T20:43:39.325550+00:00 · **By:** Codex controller · **Provider:** codex
 **Workspace:** `/Users/wesleyjinks/code/a2a-bridge` · `work/adr0041-2b3b-bootstrap-20261001` ·
-**Measured state:** `[MEASURED]` HEAD `4c0f59b08369f46a9ee862795cb81d3ea89ea465` · Tree CLEAN before this authorized-dispatch refresh ·
+**Measured state:** `[MEASURED]` HEAD `d73aa04657f6e50413a648e31276ed4462442d18` · Tree CLEAN before this authorized-dispatch refresh ·
 Probe `git status --short`, `shasum -a 256 crates/bridge-core/src/reaper.rs` · Output: production hash
 `30860ae070746c5de9b9a85469f8e07dfd67e94f9da7183c5469c98f281aab2d`, exactly the independently approved source.
 **Predecessor:** Claude handoff supplied by owner: merge PR126, then 2B3b spec/review/implementation.
@@ -73,9 +73,15 @@ parent251289fe; rejected e6d866fa retained under retained/2b3b-pass-a-rejected-e
 all round5 evidence and Sonnet transcript duplicated at scratch/2b3b-pass-a-round5-final-custody/.
 Exact Sonnet container29d1fd653ee3d3e9c7bc29d147d72656ae5e8085100150ab090971383f0ffe0d absent.
 Worker flags NO deadline check after last digest read or during closing gate/rehash; controller has
-NOT accepted an exception and review input emphasizes it. [MEASURED] Sol cumulative review5/5 active,
-session50065, exec-9ffe056038119b926842bcbd816a15ee, attempt-287fe43320ec5cce2c97c228595e4a7e.
-No source adoption/passB; source approval OPEN.
+NOT accepted an exception and review input emphasizes it. [MEASURED] Sol cumulative review5/5
+completed/cleanup complete, session50065 ended0, exec-9ffe056038119b926842bcbd816a15ee,
+attempt-287fe43320ec5cce2c97c228595e4a7e: REJECT wrong1/smell0/blockers1, CLOSED POPULATION.
+Raw86190843, tracked2026-10-01-adr0041-slice2b3b-cumulative-review-round5.md; full output/transcript
+second copies in final-custody. Only residual: success/closing census, rehash and chain sweeps can
+cross the original deadline and still return VerifiedGitBootstrapV1. Other inherited source findings closed.
+Counts3→1 converge, but owner authorized ONE repair/review5/5; cap exhausted. Implementation PARKED
+pending owner authorization of exact late-validation deadline fix plus source review6/6. No source
+adoption, review6, restart or passB; source approval OPEN.
 **(d) Authorization granted but not exercised** — owner: "Merge 2B3a and proceed to orchestrate spec and
 implementation of 2B3b." Later: "use sonnet5-5 for implementation. You may need ti update the acp for the
 bridge. update for claude, codex if so". Owner approved isolated bootstrap, explicit caller format for Empty
@@ -92,11 +98,13 @@ is now236 GiB, mostly already visible before this deletion; cause unproven. See 
 
 ## 1. Resume order
 
-1. Monitor Sol cumulative source review5/5 session50065; inspect
-   scratch/2b3b-pass-a-cumulative-review-r5-run.log and terminal -r5.md. Clean frozen b3aa6afd,
-   full251289fe..HEAD delta and all hashes bound. No source writer/build/mutation remains.
-2. Preserve verdict/cap classification and reconcile all receipts. Owner-approved final5/5;
-   remaining blockers go to owner, no silent sixth turn/restart. No adoption/passB before source approval.
+1. Await owner decision on the concrete late-validation deadline repair in
+   docs/superpowers/reviews/2026-10-01-adr0041-slice2b3b-cumulative-review-round5.md.
+   No agent/build/mutation is running; clean b3aa6afd remains UNAPPROVED in the preserved quarantine.
+2. If owner extends to6/6: refresh private doctor/catalog and dispatch one Sonnet5.5 same-artifact repair,
+   deadline-bound success/closing sweeps and rehash, deadline check immediately before rootLAST,
+   real late-expiry RED/control/mutations/full final-byte gates, then cumulative hardRO Sol source6/6.
+   Keep all original caps/refs/checkpoint/evidence; no restart or passB before source approval.
 3. Authorized build cleanup is complete. Do not delete checkouts, branches or evidence. After passA stopped,
    private implement.toml was restored to floor50 and validated. The exact executed floor20 config is retained
    as implement-pass-a-executed-floor20.toml; never silently substitute the changed config in historical claims.
@@ -124,7 +132,7 @@ scope/contract disagreement; unproven concrete Sonnet5.5 model; a failing gate w
 | Candidate release | done | `[MEASURED]` locked/offline release from exact 251289fe; build log and binary SHA25fe68e1 in scratch; validate/doctor/catalog green |
 | Git-plane implementation | PARKED at cap2 | `[MEASURED]` 3888ef5c, LoopStopped; review2 REJECT wrong2/smell0/blockers2: actual child entries unmeasured/uncharged; verify-pack/fsck accept truncated output. Both recur in earlier accounting/parser classes, so OPEN CLASS despite counts3→2. Source/transcript/gates preserved; green4927/4938 worker totals and bridge PASS do not establish correctness |
 | Design escalation | complete, cap1/1 | `[MEASURED]` node completed/cleanup complete, source3888ef5c still clean; raw payload7114b718 and tracked receipt2026-10-01-adr0041-slice2b3b-pass-a-design-audit.md. `[INHERITED]` census5 WRONG/2 SMELL, CLOSED POPULATION; no master contradiction/owner choice. Source is not approved |
-| Corrective task spec | APPROVED round1/2 | `[MEASURED]` task42ea4dc6 references full audit; session89683, execution exec-8de85e358ad01b90c4d250d86a9421a5, node completed, zero findings. Tracked corrective spec receipt; exact task/audit hashes unchanged. Sonnet repair ended at policy cutoff; normal Cargo verification complete; source review3/3 rejected; round4 repair complete; source review4/4 rejected3 blockers; owner approved targeted repair/review5/5, repair/gates complete and source review5 active |
+| Corrective task spec | APPROVED round1/2 | `[MEASURED]` task42ea4dc6 references full audit; session89683, execution exec-8de85e358ad01b90c4d250d86a9421a5, node completed, zero findings. Tracked corrective spec receipt; exact task/audit hashes unchanged. Sonnet repair ended at policy cutoff; normal Cargo verification complete; source review3/3 rejected; round4 repair complete; source review4/4 rejected3 blockers; owner approved targeted repair/review5/5, repair/gates complete and source review5 REJECT1blocker; parked at exhausted owner-approved cap |
 
 ## 3. Corrections to standing documents and memory
 
@@ -144,7 +152,7 @@ scope/contract disagreement; unproven concrete Sonnet5.5 model; a failing gate w
 | # | Work | State | Exact next action | Blocked by | Identifiers |
 |---:|---|---|---|---|---|
 | 1 | Storage admission / cleanup | resolved / cleared | preserve checkouts/evidence; private floor50 restored/validated, executed floor20 copy retained | none | scratch/cleanup-approved-result-rechecked.json |
-| 2 | Git bootstrap | cumulative source review5/5 active | inspect terminal verdict/cap classification | source approval | same impl-25228-mwz25w5c; candidate b3aa6afd; session50065 |
+| 2 | Git bootstrap | parked at exhausted cap5 | await owner decision on exact late-deadline repair/review6/6 | cap extension | same impl-25228-mwz25w5c; rejected b3aa6afd; completed session50065 |
 | 3 | Complete G | blocked | serial passB and combined review | approved passA | scratch 2b3b-pass-b-draft.md |
 
 ## 5. Invariants and traps — do not do these
@@ -188,7 +196,7 @@ scope/contract disagreement; unproven concrete Sonnet5.5 model; a failing gate w
 | Audit admission refusal | scratch/2b3b-pass-a-design-audit-refused-watchdog.log and .brief-lint.json; no provider start; legacy-watchdog/frozen-deadline conflict, not source behavior |
 | Rejected PassA candidate | b1b78d426f1e662128133f08f5e64940370d42d3; retained separately |
 | Current repair candidate | b3aa6afd58bbeb51d786e15bc14f94c5be789b99; clean five-path delta; no root adoption yet |
-| Round5 source review | session50065; exec-9ffe056038119b926842bcbd816a15ee; attempt-287fe43320ec5cce2c97c228595e4a7e; scratch/2b3b-pass-a-cumulative-review-input-r5.md and -r5-run.log; cap5/5 |
+| Round5 source review | session50065; exec-9ffe056038119b926842bcbd816a15ee; attempt-287fe43320ec5cce2c97c228595e4a7e; scratch/2b3b-pass-a-cumulative-review-input-r5.md and -r5-run.log; completed REJECT1/0/1 cap5/5 |
 | Round5 repair | session76824; exec-19830107b4bbf7e821b12a628c3e9807; attempt-02db2b6cb4d18052258c06c8e419a189; scratch/2b3b-pass-a-round5-task.md/.toml/-dispatch.md and -repair-run.log; completed/cleanup complete; owner-approved cap5/5 |
 | Round4 review | session28489; exec-d7bed171a9179a107c32cd6992f98bf6; attempt-5ddd1f362c0a8468d1c3041e7f92a10c; scratch/2b3b-pass-a-cumulative-review-input-r4.md and -r4-run.log; completed REJECT3/0/3 cap4/4 |
 | Repair custody | scratch/2b3b-pass-a-committed-r2-snapshot: committed five paths, worker evidence including round0 archive, final transcript and provenance receipt |
@@ -206,8 +214,8 @@ scope/contract disagreement; unproven concrete Sonnet5.5 model; a failing gate w
 bounded fully validated exact-ID absence, preserving typed failures · source 434905a2 · Sol round3 APPROVE,
 wrong0/smell0/blockers0. Controller executed full macOS gates separately; Linux gates are worker receipts.
 Spec round2 APPROVE remains authoritative with explicitly folded clarifications. Git-plane passA is rejected
-at cap2; design audit closed the population and the corrective spec is approved. Same-artifact repair reached policy cutoff; provider-free verification is complete and round3 source review rejected one localized WRONG/one nonblockingSMELL, CLOSED POPULATION. Targeted round4 repair completed; review4/4 REJECT wrong3/smell0/blockers3 CLOSED POPULATION. The post-child deadline exception remains unapproved. Counts3→2→1→3 are non-converging; final cap4 exhausted and implementation was parked. Owner explicitly approved one targeted repair plus cumulative review5/5; same-artifact Sonnet repair and all gates complete; clean b3aa6afd under cumulative source review5/5. Closing deadline limitation remains explicitly unapproved.
+at cap2; design audit closed the population and the corrective spec is approved. Same-artifact repair reached policy cutoff; provider-free verification is complete and round3 source review rejected one localized WRONG/one nonblockingSMELL, CLOSED POPULATION. Targeted round4 repair completed; review4/4 REJECT wrong3/smell0/blockers3 CLOSED POPULATION. The post-child deadline exception remains unapproved. Counts3→2→1→3 are non-converging; final cap4 exhausted and implementation was parked. Owner explicitly approved one targeted repair plus cumulative review5/5; same-artifact Sonnet repair and all gates complete; clean b3aa6afd source review5/5 REJECT1WRONG0SMELL/1blocker CLOSED POPULATION. Direct descriptor/parser/digest repairs closed; closing deadline invariant still fails. Owner-approved5/5 exhausted; source remains unapproved and implementation parked pending precise deadline repair/review6/6 authorization.
 There is no completion claim until source approval, both passes, full gates
 and the combined review finish.
 
-**Questions the owner owes an answer to:** None. Owner replied "approved" to the three-item same-artifact Sonnet repair and cumulative Sol review5/5. No master exception/restart/source adoption authorized. Private storage exception and build cleanup resolved.
+**Questions the owner owes an answer to:** Authorize one targeted same-artifact Sonnet5.5 repair of the late-validation deadline blocker and cumulative Sol source review6/6, or retain parked state. Prior "approved" authorized only one repair/review5/5, now completed. No master exception/restart/source adoption requested. Private storage exception and build cleanup resolved.

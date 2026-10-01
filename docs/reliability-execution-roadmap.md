@@ -84,13 +84,17 @@
     seam-only evidence retained. Frozen source80f88e89 and completed receipts have second copies;
     all13 mutation rows build/flip/restore, unmutated13-test control passes. Full final-byte suites pass
     4966alltargets/4977defaultdoctests,0failed/13ignored each/no exclusions; fmt/clippy/build/hygiene pass.
-    Clean candidate b3aa6afd is under cumulative Sol source review5/5. Worker flags no deadline check
-    after the last digest read or during closing rehash; controller has not approved that exception,
-    and review input states it explicitly. All original cap records,
+    Clean candidate b3aa6afd received cumulative Sol source review5/5 **REJECT**, WRONG1/SMELL0/blockers1,
+    CLOSED POPULATION. Descriptor/parser/direct-digest repairs are closed, but final census/rehash/chain
+    sweeps can still cross the original deadline and return success. The
+    [round5 report](superpowers/reviews/2026-10-01-adr0041-slice2b3b-cumulative-review-round5.md)
+    records the exact bounded repair; no deadline exception approved. Counts3→1 converge, but the
+    owner-approved5/5 cap is exhausted. Implementation is PARKED pending authorization of a targeted
+    late-validation deadline repair and source review6/6. All original cap records,
     rejected source/checkpoints/evidence remain; no import, restart or passB.
     No Git-plane code has landed; independent Sol approval, serial passB,
     native-ext4 CI, macOS verification and combined review remain outstanding.
-    The controller handoff records the bound serial tasks and owner-approved round5 dispatch.
+    The controller handoff records the bound serial tasks and parked cap5 decision.
   **2B2b is complete:** all its children are merged. The parent Slice 2B completion gate (plan §8) still requires 2B3,
   the aggregate fixture without the source or its alternates, and one bounded review of the combined diff.
   - **Merged on 2026-09-26/27:**
