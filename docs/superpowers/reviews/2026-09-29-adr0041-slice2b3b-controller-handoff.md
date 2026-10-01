@@ -58,6 +58,13 @@ Mounted .git/a2a-evidence/2b3b-pass-a-round5/controller-input/receipt.json binds
 exact task/rejection/repair plan and owner approval. Session76824 active, node sonnet-round5 started:
 exec-19830107b4bbf7e821b12a628c3e9807, attempt-02db2b6cb4d18052258c06c8e419a189.
 Registry cache transport explicitly provided; normal Cargo required. No source import/passB.
+[MEASURED] provider transcript f17d773f-b4ef-4e02-ad13-ddb67543e1bb contains actual claude-sonnet-5-5.
+[INHERITED] normal Cargo StageA RED on exact e6d866fa:4failed/2controls passed;16/16 substitution
+rows succeeded incorrectly on base. Early invalid-HEAD probe corrections are not admissible evidence.
+StageB hook-dependent tests have seam-only S1 evidence, NOT base RED. Final Git-module GREEN100/100;
+[MEASURED] test-name sets93→100, removedNONE. Source80f88e89/tests264fc5df match frozen manifest;
+second copy at scratch/2b3b-pass-a-round5-frozen-source/receipt.json. Mutation campaign active on scratch
+copies; full final-byte gates and independent cumulative review5/5 still pending, source UNAPPROVED.
 **(d) Authorization granted but not exercised** — owner: "Merge 2B3a and proceed to orchestrate spec and
 implementation of 2B3b." Later: "use sonnet5-5 for implementation. You may need ti update the acp for the
 bridge. update for claude, codex if so". Owner approved isolated bootstrap, explicit caller format for Empty
