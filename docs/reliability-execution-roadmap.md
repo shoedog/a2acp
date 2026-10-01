@@ -37,8 +37,10 @@
     create-new HEAD/config restoration, and explicit caller-selected format provenance for empty objects.
     A container smoke returned Sonnet 5.5's PONG but failed cleanup; the owner requires repair and independent
     review of that cleanup race before implementation. Cleanup reviews reduced three blockers to one parser
-    defect at cap 2; the controller disclosed one converging extension to round 3 on the same artifact.
-    The controller handoff records dispatch and evidence state.
+    defect at cap 2; one disclosed extension on the same artifact received **APPROVE** in round 3/3 at
+    `434905a2`, zero WRONG/SMELL/blockers. Full Linux and macOS suites pass on the final source; the cached
+    base control and sandbox-refused host probes are excluded from evidence, and a fresh base control passes.
+    Cleanup publication/CI/landing precedes Git-plane dispatch. The controller handoff records exact state.
   **2B2b is complete:** all its children are merged. The parent Slice 2B completion gate (plan §8) still requires 2B3,
   the aggregate fixture without the source or its alternates, and one bounded review of the combined diff.
   - **Merged on 2026-09-26/27:**
