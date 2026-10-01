@@ -66,8 +66,11 @@
     its two-hour policy cutoff, with source/evidence retained and no provider replay. Controller normal Cargo
     gates pass4952 all-target/4963 default-doctests,0failed/13ignored each, no exclusions and matching hashes.
     All37 final-source mutations now build/select86/flip with restored hashes (A17/A19 structural-only).
-    Clean cab8661f, parent251289fe, is in cumulative Sol source review3/3; the rejected commit/checkpoint
-    and all prior evidence remain retained. No restart, provider repair replay or passB dispatch.
+    Sol cumulative source review3/3 of clean cab8661f REJECTED one bounded WRONG (read-only same-inode/
+    same-length metadata/content effects evade baseline) and one nonblockingSMELL (unsafe FIFO fixture),
+    CLOSED POPULATION. Earlier source findings are closed; controller disclosed a targeted Sonnet repair
+    and final cumulative source review4/4 on the same artifact. Round4 repair is active; the rejected
+    commits/checkpoint and all evidence remain retained. No restart or passB dispatch.
     No Git-plane code has landed; independent Sol approval, serial passB,
     native-ext4 CI, macOS verification and combined review remain outstanding.
     The controller handoff records the bound serial tasks and active run.
