@@ -141,20 +141,20 @@
     poisoning mechanism, not behavioral RED. Trailing CAP/memory metadata caused automatic Inconclusive;
     original LoopStopped checkpoint remains unchanged. Exact reviewed files were operator-adopted
     at d49a30af after predecessor-file equality proofs; no forced merge, forged approval or review replay.
-    B1b dispatched through `implement --lang rust` from cleanff0d873c, taskb432db9f, private config711f0d58,
-    sourcecap2/floor50, into impl-45181-n4rk5zrn (session7746). Actual provider is claude-sonnet-5-5.
-    Same-environment untouched-base control147/0/0 preserves143Git+4seal names/core recompile. Trial133
-    raw receipts have second copies. Final matrix133/133 is complete:126/126 predicted behavioral flips,5 disclosed no-flip variants awaiting mechanism review,
-    two green no-edit controls, actual core rebuilds for every variant. Controller parsed every raw log
-    and recomputed each mutated/restored digest against final source;21 source files/raw matrix have
-    second copies in b1b-final-matrix-completed-custody/.
-    Six bridge gates retain full logs/source identity in private cache custody; no duplicate worker full
-    suites. Initial handoff stays provisional until bridge full suites and source review complete.
-    Focused final GREEN197/0/0 (191Git+6seal), core rebuilt;21 runtime hashes before==after==matrix==live.
-    Clean candidate4238382968c59a58dabcf12383e557b3778b2b43 has committed-source second copies. Bridge
-    fmt/clippy/build passed with unchanged source; both full suites/hygiene/Sol and adoption pending.
-    Serial B1b/B2a/B2b/B2c,
-    native-ext4 CI, macOS verification and combined review remain outstanding.
+    B1b completed from cleanff0d873c through Sonnet5.5 in impl-45181-n4rk5zrn. Sol1/2 rejected
+    one WRONG (shadowed packed refs wrongly required stale inventory targets). Same-artifact repair
+    at9a9f97ba received [Sol2/2 APPROVE0WRONG/1SMELL/0blockers](superpowers/reviews/2026-10-02-adr0041-slice2b3b-b1b-source-round2.md),
+    CLOSED POPULATION, and automatic bridge Approved. Exact four reviewed files were adopted0b4e28ab.
+    Final full alltargets5060/0/13 (90groups) and default/doctests5071/0/13 (106groups/16docgroups),
+    all192Git tests; fmt/clippy/build/hygiene pass, source before==after==live. Controller parsed
+    complete final raw receipts after review; Sol saw final bridge PASS but detailed host logs only
+    for round1. Focused198/0/0; untouchedbase147/0/0. Matrix132variants+2controls:127 behavioral
+    failures,5 disclosed no-flips; F04 stale prediction and corrected same-source rerun both retained.
+    All changed variants rebuilt/restored; first control cached, last rebuilt, both55/0/0. Source,
+    transcripts, checkpoints, old/new raw matrices and gate bundles have second copies.
+    Remaining provenance SMELL: stale source comment reserved for Sonnet B2a; operator adoption
+    corrects old commit counts/tests-first wording. Seal structural RED reconstructed after accessors.
+    B2a create-new object store is next, followed by B2b/B2c, native-ext4 CI, macOS and combined review.
     The controller handoff records approved A and the bound serial tasks.
   **2B2b is complete:** all its children are merged. The parent Slice 2B completion gate (plan §8) still requires 2B3,
   the aggregate fixture without the source or its alternates, and one bounded review of the combined diff.
