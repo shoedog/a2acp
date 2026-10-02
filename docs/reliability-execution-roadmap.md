@@ -131,7 +131,12 @@
     of56variants, with only M19 still needing qualification; M27/M38c now flip. Both unmodified controls
     recompiled and passed34/0/0. Controller independently checked all58 raw receipts; source hashes
     before==after==live D5/E5 at the completed-matrix observation. No blanket all-variants-flip claim.
-    TaskSHA99edc69b binds inherited tests; full workspace gates and B1a source approval still pending.
+    TaskSHA99edc69b binds inherited tests. Worker full workspace gates completed06:00:42UTC:
+    alltargets5009/0/13 in90groups (core recompiled) and default/doctests5020/0/13 in106groups
+    (core cached); both retain143Git/112inherited tests. No exclusions beyond13ignored. Formatting,
+    workspace clippy all-targets/all-features, locked build and hygiene pass, with four runtime hashes
+    before==after==live. Controller parsed and snapshotted complete raw gates. B1a source approval
+    and the bridge's own mandatory verification/terminal result are still pending.
     Serial B1b/B2a/B2b/B2c,
     native-ext4 CI, macOS verification and combined review remain outstanding.
     The controller handoff records approved A and the bound serial tasks.
