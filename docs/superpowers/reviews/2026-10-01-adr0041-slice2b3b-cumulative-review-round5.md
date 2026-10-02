@@ -15,7 +15,9 @@ and return VerifiedGitBootstrapV1. Worker disclosed that limitation; controller 
 counts3→1 converge for this owner-approved repair. Owner authorized ONE repair plus source review5/5,
 not unlimited rounds. That cap is exhausted, so source remains UNAPPROVED and implementation PARKED
 for owner decision at that stable point. Owner subsequently replied "another repair is authorized";
-one targeted same-artifact Sonnet5.5 repair is now dispatched, followed by cumulative source review6/6.
+one targeted same-artifact Sonnet5.5 repair was dispatched, followed by cumulative source review6/6.
+That turn ended at its fixed policy limit during full testing; exact container absent, source/evidence
+snapshotted. Provider-free controller verification is running before source6/6; no provider replay.
 No review6 verdict, restart, source import or passB occurred. Same preserved artifact,
 all rejected refs/checkpoints and complete execution evidence remain preserved.
 

@@ -16,7 +16,8 @@ completed terminal records for cleanup. Git-plane passA stopped at its two-round
 retained assistant transcript model is exactly claude-sonnet-5-5. The design audit/corrective spec and
 source reviews3/4/5 completed; source5 REJECT1WRONG0SMELL/blockers1, CLOSED POPULATION. Owner's
 "another repair is authorized" permits one targeted repair and cumulative review6/6. Sonnet session56776
-is running in the same artifact; transcript4d194aec records actual claude-sonnet-5-5. Authorization
+ended at two-hour policy cutoff with cleanup complete; exact container absent. Provider-free gates
+session64373 are running on frozen source; transcript4d194aec records actual claude-sonnet-5-5. Authorization
 RESOLVED; source approval OPEN. All prior caps and rejected artifacts remain preserved.
 **(b) Custody exposure** — `[MEASURED]` cleanup code committed in quarantine at 434905a2; exact delta imported
 here. Round3 evidence has a second copy in scratch. Integration and receipts committed/pushed at 25e63468;
@@ -97,7 +98,21 @@ at scratch/2b3b-pass-a-round6-frozen-source/. Main mutation campaign completed; 
 recompiled/restored exact SHA, live production equals frozen (controller checked; second copy retained).
 R6-M1's original all-flip prediction is false: overlapping downstream guards
 still refuse some paths. Additional flips need classification; no blanket20/20 assertion or source approval.
-Full final-byte gates and cumulative Sol6/6 remain pending; no concurrent controller build/source mutation.
+[MEASURED] supplementary5 mutations build/flip intended tests/restore exact SHA, CONTROL19/19 recompiled.
+Combined-removal R6-M1b flips all9 predicted deadline rows and holds controls; R6-M5 rerun has no collateral
+flip. The main CONTROL18/18 did NOT recompile (cached artifact), contrary to the controller's initial
+assumption; raw test names/outcomes match all25 mutation records. Checker scratch/check-round6-mutations.py
+and -controller-mutation-check.json, second copies retained. Hook-dependent StageB has NO pristine-base RED;
+structural assertions remain STRUCTURAL. No blanket original20/20 assertion.
+[MEASURED] Sonnet ended canceled_policy at00:47UTC, cleanup complete, exact b689aaa3 container absent.
+Worker fmt/clippy/build PASS; full alltargets interrupted, default/hygiene never completed. No provider replay.
+Source/evidence/public transcript snapshotted at scratch/2b3b-pass-a-round6-policy-ended-custody/ before
+controller refreshed implementation handoff. Provider-free full gates session64373 now running on the
+exact frozen source using existing offline cache a2a-verify-cache-8ac4ca8ed1db0dde, immutable imagefe3,
+network none/no credentials. Fresh cache inventory found no active user. Unsuffixed a2a-verify-cache
+was an empty volume created by the diagnostic mount, excluded from verification; left retained, no cleanup.
+Host free22.06GiB at continuation (original isolated20GiB authorization); cache filesystem15.86GiB free.
+No extra source edits or concurrent build/provider; source approval and cumulative Sol6/6 OPEN.
 **(d) Authorization granted but not exercised** — owner: "Merge 2B3a and proceed to orchestrate spec and
 implementation of 2B3b." Later: "use sonnet5-5 for implementation. You may need ti update the acp for the
 bridge. update for claude, codex if so". Owner approved isolated bootstrap, explicit caller format for Empty
@@ -110,13 +125,15 @@ found three old targets totaling 15.846 GiB plus root incremental about4 GiB, te
 merged unused branches. Owner then explicitly approved clearing only those four build directories. Root
 incremental was already absent at preflight and PR104 had shrunk; the remaining three targets were cleared
 (4.236 GiB freshly measured), retaining old release binaries, all worktrees/branches/source/evidence. Free space
-is now236 GiB, mostly already visible before this deletion; cause unproven. See [cleanup audit](2026-09-30-a2a-bridge-cleanup-audit.md) — RESOLVED.
+was236 GiB then, mostly already visible before this deletion; cause unproven. Current continuation is
+about22GiB; no attribution of the decrease made. See [cleanup audit](2026-09-30-a2a-bridge-cleanup-audit.md) — RESOLVED.
 
 ## 1. Resume order
 
-1. Monitor the authorized late-validation deadline repair in
+1. Monitor provider-free full verification session64373; logs are in the quarantine's
+   .git/a2a-evidence/2b3b-pass-a-round6/controller-full-gates/. The bound repair is in
    docs/superpowers/reviews/2026-10-01-adr0041-slice2b3b-cumulative-review-round5.md.
-   Sonnet session56776 is running; b3aa6afd remains UNAPPROVED in the preserved quarantine.
+   Sonnet session56776 ended at policy cutoff; b3aa6afd plus frozen repair remains UNAPPROVED.
 2. Owner extended to6/6; private doctor/catalog refreshed and one Sonnet5.5 same-artifact repair dispatched:
    deadline-bound success/closing sweeps and rehash, deadline check immediately before rootLAST,
    real late-expiry RED/control/mutations/full final-byte gates, then cumulative hardRO Sol source6/6.
@@ -172,7 +189,7 @@ scope/contract disagreement; unproven concrete Sonnet5.5 model; a failing gate w
 | # | Work | State | Exact next action | Blocked by | Identifiers |
 |---:|---|---|---|---|---|
 | 1 | Storage admission / cleanup | resolved / cleared | preserve checkouts/evidence; private floor50 restored/validated, executed floor20 copy retained | none | scratch/cleanup-approved-result-rechecked.json |
-| 2 | Git bootstrap | authorized repair active, cap6/6 | monitor Sonnet, verify final-byte gates and then cumulative Sol6/6 | source approval | same impl-25228-mwz25w5c; rejected b3aa6afd; session56776 |
+| 2 | Git bootstrap | provider-free verification active, cap6/6 | finish final-byte gates then cumulative Sol6/6 | source approval | same impl-25228-mwz25w5c; rejected b3aa6afd; session64373 |
 | 3 | Complete G | blocked | serial B1/B2, native macOS/ext4 and combined review | approved passA | scratch 2b3b-pass-b1-draft.md and -b2-draft.md; neither dispatched |
 
 ## 5. Invariants and traps — do not do these
@@ -234,8 +251,8 @@ scope/contract disagreement; unproven concrete Sonnet5.5 model; a failing gate w
 bounded fully validated exact-ID absence, preserving typed failures · source 434905a2 · Sol round3 APPROVE,
 wrong0/smell0/blockers0. Controller executed full macOS gates separately; Linux gates are worker receipts.
 Spec round2 APPROVE remains authoritative with explicitly folded clarifications. Git-plane passA is rejected
-at cap2; design audit closed the population and the corrective spec is approved. Same-artifact repair reached policy cutoff; provider-free verification is complete and round3 source review rejected one localized WRONG/one nonblockingSMELL, CLOSED POPULATION. Targeted round4 repair completed; review4/4 REJECT wrong3/smell0/blockers3 CLOSED POPULATION. The post-child deadline exception remains unapproved. Counts3→2→1→3 are non-converging; final cap4 exhausted and implementation was parked. Owner explicitly approved one targeted repair plus cumulative review5/5; same-artifact Sonnet repair and all gates complete; clean b3aa6afd source review5/5 REJECT1WRONG0SMELL/1blocker CLOSED POPULATION. Direct descriptor/parser/digest repairs closed; closing deadline invariant still fails on b3aa6afd. Owner-approved5/5 exhausted; source remains unapproved. Owner subsequently authorized the precise deadline repair/review6/6; Sonnet session56776 is active.
+at cap2; design audit closed the population and the corrective spec is approved. Same-artifact repair reached policy cutoff; provider-free verification is complete and round3 source review rejected one localized WRONG/one nonblockingSMELL, CLOSED POPULATION. Targeted round4 repair completed; review4/4 REJECT wrong3/smell0/blockers3 CLOSED POPULATION. The post-child deadline exception remains unapproved. Counts3→2→1→3 are non-converging; final cap4 exhausted and implementation was parked. Owner explicitly approved one targeted repair plus cumulative review5/5; same-artifact Sonnet repair and all gates complete; clean b3aa6afd source review5/5 REJECT1WRONG0SMELL/1blocker CLOSED POPULATION. Direct descriptor/parser/digest repairs closed; closing deadline invariant still fails on b3aa6afd. Owner-approved5/5 exhausted; source remains unapproved. Owner subsequently authorized the precise deadline repair/review6/6; Sonnet session56776 ended at policy cutoff; frozen repair source awaits cumulative6/6 after provider-free gates session64373.
 There is no completion claim until source approval, both passes, full gates
 and the combined review finish.
 
-**Questions the owner owes an answer to:** None pending. "Another repair is authorized" resolved the precise late-validation deadline repair and cumulative review6/6 request; one Sonnet repair is running. No master exception/restart/source adoption requested. At6/6 classify remaining findings before any extension. Private storage exception and build cleanup resolved.
+**Questions the owner owes an answer to:** None pending. "Another repair is authorized" resolved the precise late-validation deadline repair and cumulative review6/6 request; Sonnet ended at policy cutoff and controller provider-free verification is running. No master exception/restart/source adoption requested. At6/6 classify remaining findings before any extension. Private storage exception and build cleanup resolved.

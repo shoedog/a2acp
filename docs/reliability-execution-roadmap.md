@@ -90,8 +90,13 @@
     [round5 report](superpowers/reviews/2026-10-01-adr0041-slice2b3b-cumulative-review-round5.md)
     records the exact bounded repair; no deadline exception approved. Counts3→1 converge, but the
     owner-approved5/5 cap is exhausted. Owner then explicitly authorized another targeted repair and
-    cumulative source review6/6. Sonnet5.5 is running that repair in the SAME quarantine, taskef45bb94,
-    session56776, execution exec-57b25cef7aa29dd8bb2a2025f8a16dda. No deadline exception. All original cap records,
+    cumulative source review6/6. Sonnet5.5 repaired the SAME quarantine, taskef45bb94,
+    session56776, execution exec-57b25cef7aa29dd8bb2a2025f8a16dda; the two-hour policy ended its
+    full-test run, with cleanup complete and exact container absent. Pristine-base RED5 failures/1 control,
+    main20 plus supplementary5 mutation builds/restores have bound raw receipts; main-control18/18 cached,
+    supplementary19/19 recompiled. R6-M1's overbroad prediction is qualified by overlapping guards;
+    combined-removal variant flips all9 predicted rows. Controller provider-free full gates session64373
+    are running, frozen sourcec2fc2f2f preserved; source6/6 pending. No deadline exception. All original cap records,
     rejected source/checkpoints/evidence remain; no import, restart or passB.
     No Git-plane code has landed; independent Sol approval, serial passB,
     native-ext4 CI, macOS verification and combined review remain outstanding.
