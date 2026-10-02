@@ -93,8 +93,9 @@ adoption, review6 verdict, restart or passB; source approval OPEN.
 one headroom control pass; production byte-identical to b3aa6afd and core recompiled. Covers final digest
 read, BeforeFinalGate, closing mount/tree census and success-gate mount census; all-six-child markers retained.
 Initial corrected module106/106 (100 inherited+6 StageA). Frozen sourcec2fc2f2f and RED have second copies
-at scratch/2b3b-pass-a-round6-frozen-source/. Mutation campaign ongoing; CONTROL18/18, first13 records
-recompiled/restored exact SHA. R6-M1's original all-flip prediction is false: overlapping downstream guards
+at scratch/2b3b-pass-a-round6-frozen-source/. Main mutation campaign completed; CONTROL18/18, all20 records
+recompiled/restored exact SHA, live production equals frozen (controller checked; second copy retained).
+R6-M1's original all-flip prediction is false: overlapping downstream guards
 still refuse some paths. Additional flips need classification; no blanket20/20 assertion or source approval.
 Full final-byte gates and cumulative Sol6/6 remain pending; no concurrent controller build/source mutation.
 **(d) Authorization granted but not exercised** — owner: "Merge 2B3a and proceed to orchestrate spec and
@@ -123,7 +124,11 @@ is now236 GiB, mostly already visible before this deletion; cause unproven. See 
 3. Authorized build cleanup is complete. Do not delete checkouts, branches or evidence. After passA stopped,
    private implement.toml was restored to floor50 and validated. The exact executed floor20 config is retained
    as implement-pass-a-executed-floor20.toml; never silently substitute the changed config in historical claims.
-4. Independently approved passA then feeds serial passB (`2b3b-pass-b-draft.md`), cap2. The separate private
+4. Independently approved passA then feeds bounded serial B1/B2 drafts (`2b3b-pass-b1-draft.md` and
+   `2b3b-pass-b2-draft.md`), cap2 each. B1 is active preflight/pure ref agreement/config; B2 is active
+   materialization/final closure/retained result. Original aggregate B draft is retained but not dispatchable.
+   No semantic change to the approved master spec; bind approved A and then approved B1 before each dispatch.
+   The separate private
    `implement-pass-b.toml` validates with floor50 and review timeout3600; executed passA config is retained.
    Refresh doctor/catalog and bind the task to the actual approved/imported base before dispatch. Full unexcluded suites,
    native-ext4 CI, macOS checks and combined pre-passA..final review are required before 2B3b completion.
@@ -168,11 +173,11 @@ scope/contract disagreement; unproven concrete Sonnet5.5 model; a failing gate w
 |---:|---|---|---|---|---|
 | 1 | Storage admission / cleanup | resolved / cleared | preserve checkouts/evidence; private floor50 restored/validated, executed floor20 copy retained | none | scratch/cleanup-approved-result-rechecked.json |
 | 2 | Git bootstrap | authorized repair active, cap6/6 | monitor Sonnet, verify final-byte gates and then cumulative Sol6/6 | source approval | same impl-25228-mwz25w5c; rejected b3aa6afd; session56776 |
-| 3 | Complete G | blocked | serial passB and combined review | approved passA | scratch 2b3b-pass-b-draft.md |
+| 3 | Complete G | blocked | serial B1/B2, native macOS/ext4 and combined review | approved passA | scratch 2b3b-pass-b1-draft.md and -b2-draft.md; neither dispatched |
 
 ## 5. Invariants and traps — do not do these
 
-- Never forge the original frozen Rejected checkpoint; the round3 approval is a separate source-bound receipt.
+- Never forge the original frozen Rejected checkpoint; later source reviews are separate source-bound receipts.
 - Never restart a rejected artifact; the extension preserved the same quarantine and all prior context.
 - Never overlap source mutations and host builds. A writer-side accidental overlap was marked INADMISSIBLE.
 - Never infer compiled base provenance from Git/hash alone when sharing target dirs; verify old test population
