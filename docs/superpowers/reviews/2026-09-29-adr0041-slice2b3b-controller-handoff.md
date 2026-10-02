@@ -113,6 +113,9 @@ network none/no credentials. Fresh cache inventory found no active user. Unsuffi
 was an empty volume created by the diagnostic mount, excluded from verification; left retained, no cleanup.
 Host free22.06GiB at continuation (original isolated20GiB authorization); cache filesystem15.86GiB free.
 No extra source edits or concurrent build/provider; source approval and cumulative Sol6/6 OPEN.
+[MEASURED] provider-free fmt/clippy/build PASS; full alltargets4978/0/13 in90groups,112 Git tests,
+core recompiled. All100 inherited Git names preserved+12 new. Default/doctests now running;
+final source-after/hygiene/full custody/commit and cumulative6/6 remain pending.
 **(d) Authorization granted but not exercised** — owner: "Merge 2B3a and proceed to orchestrate spec and
 implementation of 2B3b." Later: "use sonnet5-5 for implementation. You may need ti update the acp for the
 bridge. update for claude, codex if so". Owner approved isolated bootstrap, explicit caller format for Empty

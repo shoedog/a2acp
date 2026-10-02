@@ -96,7 +96,8 @@
     main20 plus supplementary5 mutation builds/restores have bound raw receipts; main-control18/18 cached,
     supplementary19/19 recompiled. R6-M1's overbroad prediction is qualified by overlapping guards;
     combined-removal variant flips all9 predicted rows. Controller provider-free full gates session64373
-    are running, frozen sourcec2fc2f2f preserved; source6/6 pending. No deadline exception. All original cap records,
+    pass fmt/clippy/build and full alltargets4978/0/13 in90groups,112 Git tests/core recompiled;
+    default/doctests running, frozen sourcec2fc2f2f preserved; source6/6 pending. No deadline exception. All original cap records,
     rejected source/checkpoints/evidence remain; no import, restart or passB.
     No Git-plane code has landed; independent Sol approval, serial passB,
     native-ext4 CI, macOS verification and combined review remain outstanding.
