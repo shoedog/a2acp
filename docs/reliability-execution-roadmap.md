@@ -144,7 +144,10 @@
     B1b dispatched through `implement --lang rust` from cleanff0d873c, taskb432db9f, private config711f0d58,
     sourcecap2/floor50, into impl-45181-n4rk5zrn (session7746). Actual provider is claude-sonnet-5-5.
     Same-environment untouched-base control147/0/0 preserves143Git+4seal names/core recompile. Trial133
-    raw receipts have second copies; final matrix is active after targeted same-artifact corrections.
+    raw receipts have second copies. Final matrix133/133 is complete:131/131 predicted behavioral flips,
+    two green no-edit controls, actual core rebuilds for every variant. Controller parsed every raw log
+    and recomputed each mutated/restored digest against final source;21 source files/raw matrix have
+    second copies in b1b-final-matrix-completed-custody/.
     Six bridge gates retain full logs/source identity in private cache custody; no duplicate worker full
     suites. Initial handoff stays provisional until bridge full suites and source review complete.
     Final-byte source/gates/Sol approval and B1b adoption remain pending.
