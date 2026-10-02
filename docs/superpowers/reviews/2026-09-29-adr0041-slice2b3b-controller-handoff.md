@@ -89,6 +89,14 @@ same-artifact Sonnet5.5 repair plus cumulative source review6/6; no deadline exc
 Taskef45bb94; session56776, exec-57b25cef7aa29dd8bb2a2025f8a16dda,
 attempt-9e2643c80d4b23ced3b5e20361021e89; sonnet-round6 started. No source
 adoption, review6 verdict, restart or passB; source approval OPEN.
+[MEASURED] Round6 pristine-base normal Cargo RED:6 selected,5 behavioral failures after expired deadline,
+one headroom control pass; production byte-identical to b3aa6afd and core recompiled. Covers final digest
+read, BeforeFinalGate, closing mount/tree census and success-gate mount census; all-six-child markers retained.
+Initial corrected module106/106 (100 inherited+6 StageA). Frozen sourcec2fc2f2f and RED have second copies
+at scratch/2b3b-pass-a-round6-frozen-source/. Mutation campaign ongoing; CONTROL18/18, first13 records
+recompiled/restored exact SHA. R6-M1's original all-flip prediction is false: overlapping downstream guards
+still refuse some paths. Additional flips need classification; no blanket20/20 assertion or source approval.
+Full final-byte gates and cumulative Sol6/6 remain pending; no concurrent controller build/source mutation.
 **(d) Authorization granted but not exercised** — owner: "Merge 2B3a and proceed to orchestrate spec and
 implementation of 2B3b." Later: "use sonnet5-5 for implementation. You may need ti update the acp for the
 bridge. update for claude, codex if so". Owner approved isolated bootstrap, explicit caller format for Empty
