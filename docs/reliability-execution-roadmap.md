@@ -150,7 +150,9 @@
     second copies in b1b-final-matrix-completed-custody/.
     Six bridge gates retain full logs/source identity in private cache custody; no duplicate worker full
     suites. Initial handoff stays provisional until bridge full suites and source review complete.
-    Final-byte source/gates/Sol approval and B1b adoption remain pending.
+    Focused final GREEN197/0/0 (191Git+6seal), core rebuilt;21 runtime hashes before==after==matrix==live.
+    Clean candidate4238382968c59a58dabcf12383e557b3778b2b43 has committed-source second copies. Bridge
+    fmt/clippy/build passed with unchanged source; both full suites/hygiene/Sol and adoption pending.
     Serial B1b/B2a/B2b/B2c,
     native-ext4 CI, macOS verification and combined review remain outstanding.
     The controller handoff records approved A and the bound serial tasks.
