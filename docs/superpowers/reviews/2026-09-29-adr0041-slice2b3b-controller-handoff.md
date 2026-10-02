@@ -1,22 +1,22 @@
-# Handoff — ADR-0041 2B3b B1b approved; B2a next
+# Handoff — ADR-0041 2B3b B1b approved; B2a active
 
 **Written:** 2026-10-02T15:48:35.938533+00:00 · **By:** Codex controller · **Provider:** codex
-**Workspace:** /Users/wesleyjinks/code/a2a-bridge · work/adr0041-2b3b-bootstrap-20261001 · **Measured state:** `[MEASURED]` approved runtime at0b4e28abd1bc45179e5d719b55a39551bb5d8c27; controller-doc reconciliation dirty, to commit before B2a binding. Probe git status/log and final receipt audits in scratch.
+**Workspace:** /Users/wesleyjinks/code/a2a-bridge · work/adr0041-2b3b-bootstrap-20261001 · **Measured state:** `[MEASURED]` approved runtime at0b4e28abd1bc45179e5d719b55a39551bb5d8c27; controller reconciliation committedbbf4a2bf; B2a launched from immutablebbf4a2bf. Progress docs to commit separately. Probe git status/log and final receipt audits in scratch.
 **Predecessor:** B1b Sonnet5.5 run7746 complete; clean9a9f97ba automatic Approved; Sol2/2 APPROVE0W1S0block.
 **Truth ordering:** measured live state > explicit owner/contract authority within its scope > this handoff for current operational state > earlier handoffs and non-authoritative summaries. A conflict between tiers stays OPEN in §0 — never resolved by document class alone.
 **Provenance:** folded by controller from measured Git/checkpoint/raw logs and actual source finals. Prior merged A/ACP/cleanup history is `[INHERITED]` from preceding committed handoffs; not rerun here. No memory write authorized.
 
 ## 0. Gating facts — settle these before starting anything below
 
-**(a) Lane ownership** — `[MEASURED]` B1b ended0; exact workerc49e2c3c95d0b45fc0109b2d45699cb8553c59932597a4ed87ef10352cab623a absent. No live writer. B2a not yet dispatched — RESOLVED.
-**(b) Custody exposure** — `[MEASURED]` approved A/B1a/B1b adopted in local branch; not published. Complete B1b source/checkpoint/reviews/matrices/receipts second copies retained; 449files in b1b-round2-completed-custody/. Reconciliation docs commit pending — OPEN until commit.
-**(c) In flight / irreversible** — `[MEASURED]` no provider active. Mirror62813 ended0 after round1; final provider-free copier7895 ended0 with six9a9f97ba gate bundles. No possibly accepted replay — RESOLVED.
+**(a) Lane ownership** — `[MEASURED]` B1b ended0; exact workerc49e2c3c95d0b45fc0109b2d45699cb8553c59932597a4ed87ef10352cab623a absent. No live writer. B2a Sonnet5.5 session88111 owns ONLY impl-9452-ybd5v28a, exactworker408e7ad225acb3902ff33cd2d1cab4ab9b9ec541c5ea74b9dbbbbf22243a85b0/namea2a-rw-83911703b8b063f0-9452-zbd5v28a-0; actualclaude-sonnet-5-5 confirmed — RESOLVED.
+**(b) Custody exposure** — `[MEASURED]` approved A/B1a/B1b adopted in local branch; not published. Complete B1b source/checkpoint/reviews/matrices/receipts second copies retained; 449files in b1b-round2-completed-custody/. Reconciliation committedbbf4a2bf; new B2a dispatch/task/config/preflight copies retained in b2a-predispatch-custody/. — RESOLVED.
+**(c) In flight / irreversible** — `[MEASURED]` B2a provider88111 active, untouched-base control198 pending; no controller writer/build in its clone. B1b mirror/copy sessions ended0. B2a mirror not started yet; start before its final verification so Sol has full raw receipts. No provider replay — RESOLVED.
 **(d) Authorization granted but not exercised** — owner: "Merge 2B3a and proceed to orchestrate spec and implementation of 2B3b." "use sonnet5-5 for implementation." Latest Empty refs decision: "Refuse before creating repository/ (Recommended): complete Git restore requires captured refs/HEAD with exactly one valid HEAD; preserve Pass A’s acceptance of empty coverage." Continue B2a/B2b/B2c, native/combined and publication/landing under original scope; no question pending.
 
 ## 1. Resume order
 
-1. Commit the controller-doc reconciliation; bind approved B2a task to that clean base and exact runtime hashes/test192Git+6seal names. DraftSHA9fc04426330b3884f8d620fbf206bce5513edee0d3c4a6385c511531756ae125. Include retained-gate split and canonical template as in B1b. Reserve source-comment SMELL correction (tests.rs11091) for Sonnet, no runtime widening. Review cap TWO declared before dispatch.
-2. Validate/doctor/models private config711f0d58, floor50/imagefe3/Sonnet5.5; native disk free check; stage complete predispatch evidence. Dispatch implement --lang rust from immutable clean base, no --merge. Start cache mirror before verify; for a repair revision use exact-revision copier, not replaying old mirror against existing targets.
+1. Poll88111 and scratch/poll-b2a.py (public text/tool metadata only). Exactcloneimpl-9452-ybd5v28a, basebbf4a2bf8386d6be18bc6e68959c1fce7e7e4cd6. Actual modelclaude-sonnet-5-5. Do NOT redispatch/resume/build/edit clone. Baseline should198=192Git+6seal; actual names/normalcompile proof pending.
+2. Bound taskcd3cabf5/config7774d187 retains six full gates/cap2/privatefloor20 from owner authorization. Predispatchdoctor27/27OK, modelvaluesadvertised, diskfree33.77GiB, no cleanup. When writer's final matrix/green approaches completion, start provider-free mirror forcloneimpl-9452-ybd5v28a/actualverifycache8ac4RO, hostcustodyRW, networknone/nocreds/sourceunmounted. Observer7200s may expire if started too early; complete receipts can also be copied with exact-revision copier (one HEAD). Never rerun old mirror into existing paths. Source-comment-only B1b correction is explicitly in owned B2a brief.
 3. Audit actual raw/source final evidence. Adopt only approved predecessor, then B2b and B2c serially. Original one capsule/pins/ledger/absolute Instant throughout runtime helpers.
 4. Complete G native macOS/native-ext4 filesystem-proven CI, aggregate full suites and combined Sol base251..final (cap2), publish/inspect exactCI/land. Do not claim complete2B3b at B1b.
 
@@ -53,7 +53,7 @@
 
 | # | Work | State | Exact next action | Blocked by | Identifiers |
 |---:|---|---|---|---|---|
-|1|B2a|next|bind clean adoptedB1b/config/task/hashes/198names and dispatch Sonnet5.5|reconciliationcommit/preflight|approvedplan9fc04426; cap2|
+|1|B2a|pending,active|monitor88111/publicpoll; baseline/raw/source/bridge6gates/Sol|none|impl-9452-ybd5v28a;cap2|
 |2|B2b/B2c|pending|bind exactapprovedpredecessor serially|B2a|approvedtasks396a1730/bf7a0bee|
 |3|Native/combined|pending|Mac+ext4provenCI/fullbase251..finalreview|completeG|preparedhostscript/CIplan/combinedconfig|
 |4|Publication/landing|pending|PR/exactCI/merge|allgates|originalauthority|
@@ -79,7 +79,7 @@
 |Scratch|/private/tmp/adr0041-2b3b-20260929|
 |B1bsource2raw/session|dade922c865a3fbf44e19fd0ad429e647e09a35799a42f996ec5de63d3eb6b89 /01a0fce1-d04a-7770-92d5-6a0c857a4ad9|
 |B1bsource1raw/session|37eafc270d056cd7e4776ffe98477d478e324e9bda14f3ee7f8525e01d626ada /01a0fc90-f7c5-7e73-906c-90ae919b6149|
-|Config/prompt|implement-pass-b-retained-gates.toml SHA711f0d5806c4dd1bc24772a4e62435ca76a164aaef3287bfb1d1d18f2458b57c / compatibleprompt7c3f2475|
+|Config/prompt|B2a implement-pass-b-retained-gates-20gib.toml SHA7774d187e9cbeb4cfa2166d0d96c4f4260adccf823479abf1c50a04b9097a23f / compatibleprompt7c3f2475. B1b original711f0d58 retained.|
 |Immutableimage|sha256:fe3a644f07b68e5ad8d513b64dfa5eb4e454e1e67f49964f23388b4c370a6ef5|
 |Orchestrator|target/release/a2a-bridge from251 SHA25fe68e184df1e4a06b16846e07b5a963493785c8bfd5c626cf26db5050ca370; servedoperatorPID87677Library07aee unchanged|
 |Caches|a2a-verify-cache-8ac4ca8ed1db0dde /a2a-impl-lsp-cache-8ac4ca8ed1db0dde; retainunsuffixedemptydiagnosticcache|
@@ -89,3 +89,5 @@
 **§2c verdict:** SURVIVED · claim: "B1b preserves approved A/B1a and supplies the bounded pure refs/config foundation" · pass: INDEPENDENT · evidence tier: TEST-BACKED (source-bound supplied receipts, not reviewer test execution) · record: tracked b1b-source-round2.md, rawdade922c; APPROVE0W1S0block2/2. InitialpackedshadowWRONG repaired on sameartifact; provenanceSMELL has bounded owned followup. This is not whole2B3b completion.
 
 **Questions the owner owes an answer to:** None. Continue original authorized scope.
+
+[MEASURED] B2a transcript scratch/container-projects/-Users-wesleyjinks-code--a2a-implement-impl-9452-ybd5v28a/18dcb638-17ab-411a-86a9-1d2f8c1de969.jsonl; poll-b2a.py. Dispatch taskSHAcd3cabf5f5603b601ae19b750efe6ae7f9a209ecf22cb43b385d395f4aafe1f0 and bindingJSON/source198names snapshotted. Private floor20 only, using owner prior approval; no other config/model/gate changes.

@@ -154,7 +154,10 @@
     transcripts, checkpoints, old/new raw matrices and gate bundles have second copies.
     Remaining provenance SMELL: stale source comment reserved for Sonnet B2a; operator adoption
     corrects old commit counts/tests-first wording. Seal structural RED reconstructed after accessors.
-    B2a create-new object store is next, followed by B2b/B2c, native-ext4 CI, macOS and combined review.
+    B2a create-new object store dispatched from cleanbbf4a2bf into impl-9452-ybd5v28a/session88111,
+    actualclaude-sonnet-5-5; taskcd3cabf5/config7774d187/sourcecap2. Privatefloor20GiB uses prior
+    owner isolated-lane authorization;27/27doctor green, free33.77GiB. Untouchedbase198 control
+    pending; no B2a approval yet. B2b/B2c, native-ext4 CI, macOS and combined review follow.
     The controller handoff records approved A and the bound serial tasks.
   **2B2b is complete:** all its children are merged. The parent Slice 2B completion gate (plan §8) still requires 2B3,
   the aggregate fixture without the source or its alternates, and one bounded review of the combined diff.
