@@ -1,8 +1,8 @@
 # Handoff — ADR-0041 2B3b approved bootstrap and remaining five increments
 
-**Written:** 2026-10-02T02:47:58.339896+00:00 · **By:** Codex controller · **Provider:** codex
+**Written:** 2026-10-02T03:51:59.243178+00:00 · **By:** Codex controller · **Provider:** codex
 **Workspace:** /Users/wesleyjinks/code/a2a-bridge · work/adr0041-2b3b-bootstrap-20261001
-**Measured state:** `[MEASURED]` HEAD 53373e68ce4c32034ad735e9e58196be979e0c9a, controller-doc dispatch handoff only; B1a edits are isolated in its clone; approved runtime hashes unchanged. Probe git status/diff and draft manifest at scratch/remaining-increments-draft-manifest.json.
+**Measured state:** `[MEASURED]` HEAD d1634f8d7f18e3429e44016b86fd3689f2062910, controller-doc progress changes only; root runtime remains exact approved A. B1a writes ONLY its separate clone from immutable base53373e68. Probe git status/diff; raw audits/snapshots in scratch folders below.
 **Predecessor:** committed approved A adoption2d8a8fb4 and completed remaining spec2/2 APPROVE0/0/0.
 **Truth ordering:** measured live state > explicit owner/contract authority within its scope > this handoff for current operational state > earlier handoffs and non-authoritative summaries. A conflict between tiers stays OPEN in §0 — never resolved by document class alone.
 **Provenance:** written live by controller, folded from current read-only state and retained named receipts. `[MEASURED]` rechecked here; `[INHERITED]` prior verification evidence, not rerun.
@@ -11,7 +11,7 @@
 
 **(a) Lane ownership** — `[MEASURED]` remaining spec session27319 ENDED0 completed/cleanup complete. Sonnet B1a implement session63748 owns ONLY impl-94034-sqrswpnj; actual provider model claude-sonnet-5-5. No controller source writer/build — RESOLVED ownership.
 **(b) Custody exposure** — `[MEASURED]` approved A runtime is committed locally, not pushed/main-merged. Original reviews, Rejected checkpoint, all source/evidence/transcript snapshots retained. Spec1 raw and five pending task drafts are snapshotted under scratch/remaining-spec-r1-completed-custody/ and controller commits these new docs before spec2 dispatch — RESOLVED local custody; publication pending.
-**(c) In flight / irreversible** — `[MEASURED]` B1a session63748 running, warm dependencies complete, source/fixture reading underway; container98bdf6fe running. Remaining task spec2/2 APPROVED0/0/0. Preserve live worker source, no replay or controller edits in that clone.
+**(c) In flight / irreversible** — `[MEASURED]` B1a session63748 running in container98bdf6fe. Fresh Git restore suite142/0/0 complete; 51-variant mutation matrix active. Never compare/copy live source during intentional variants. Source/gates/Sol approval remain pending. Remaining spec2/2 APPROVED0/0/0. No replay or controller source edits in that clone.
 **(d) Authorization granted but not exercised** — owner: "Merge 2B3a and proceed to orchestrate spec and implementation of 2B3b." "use sonnet5-5 for implementation." "another repair is authorized" (A6 now complete). On Empty HEAD owner chose: "Refuse before creating repository/ (Recommended): complete Git restore requires captured refs/HEAD with exactly one valid HEAD; preserve Pass A’s acceptance of empty coverage." This semantic decision RESOLVED; revised spec2/2 gate RESOLVED by independent APPROVE0/0/0.
 
 ## 1. Resume order
@@ -38,7 +38,9 @@
 |A Sonnet/verification end|done|`[INHERITED]` session56776 policy-ended2h, exact b689aaa3 absent, no replay; controller providerfree64373 ENDED0 with full gates; source49293 ENDED0 approved6/6|
 |Remaining spec1/2|done rejected|`[MEASURED]` session43775 exec-fffd851e8bc3155755d1a37bced0d873 attempt-52c3d095d91dcc5342352ae2ce4561cd; REJECT1W2S1block CLOSED; rawecc96d7aa8bcf72f22fe8b2b9369d2d7f0978cf456c39859168f4a24f4764c1c; owner Empty-HEAD decision resolved|
 |Remaining spec2/2|done approved|`[MEASURED]` session27319, rawf9dee13be68d908d66a2dd79812c93a656bbe3a8860132472b4ad56cc4b8055b; APPROVE0/0/0 NO FINDINGS,5 task/master hashes match|
-|B1a implementation|in flight|`[MEASURED]` session63748, clone impl-94034-sqrswpnj base53373e68, actual assistant models only claude-sonnet-5-5; initial read underway, no completed source/gates/review|
+|B1a implementation|in flight|`[MEASURED]` session63748, clone impl-94034-sqrswpnj base53373e68, actual assistant models only claude-sonnet-5-5. Worker baseline140/0/0 (112restore+28runner), fresh focused142/0/0 (112inherited+30new). Full workspace/source review still pending|
+|B1a mutation evidence|partial, independently checked|`[MEASURED]` first26 raw rows checked against edits/digests/test names/totals/compilation/restoration.23usable; M03/M04/M05 bad Cargo filter syntax selected0tests, INADMISSIBLE, not guard misses. Corrected driver now puts filters after --; require valid reruns. Worker compiled flag is only buildability, not recompile. No unmet admissible prediction in checked population|
+|B1a evidence custody|done for intermediate artifacts|`[MEASURED]` scratch b1a-base-control-custody/, b1a-first-completed-git-suite-custody/, b1a-invalid-mutation-invocations-custody/, b1a-main-first26-checked-custody/; every copied rawSHA matched parsed report. Earlier partial suite retained as superseded, not GREEN. Live supplement b1a-live-controller-handoff.md|
 |Later implementation/native/combined|pending|B1b/B2a/B2b/B2c after exact approved predecessors; no completion claim|
 |Exact approved build cleanup|done|`[INHERITED]` three remaining literal target paths deleted4.236GiB freshly measured, fourth root incremental already absent. No19.8GiB actual reclaim claim. Releases/source/branches/worktrees/evidence/operator retained; cleanup-approved-result-rechecked.json|
 

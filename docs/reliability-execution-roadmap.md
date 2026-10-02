@@ -117,8 +117,12 @@
     WRONG0/SMELL0/blockers0, NO FINDINGS, at4083da5e. Original two-pass drafts remain historical, not dispatchable.
     B1a dispatched through `implement --lang rust` from clean53373e68 into
     `impl-94034-sqrswpnj`, tool session63748, declared source cap2. Actual provider transcript
-    confirms `claude-sonnet-5-5`; Rust warm dependencies complete, initial source reading underway.
-    TaskSHA99edc69b binds all112 inherited Git tests; no B1a gate/source approval yet.
+    confirms `claude-sonnet-5-5`. Worker same-environment base control140/0/0 includes112restore+28runner;
+    fresh focused restore suite142/0/0 preserves all112 inherited tests and adds30. The51-variant
+    behavioral mutation run is active. Controller independently checked first26 raw rows:23usable and
+    three invalid Cargo invocations (M03/M04/M05, zero tests), preserved separately for valid reruns.
+    No unmet admissible prediction in that checked population; source restoration verified per raw receipt.
+    TaskSHA99edc69b binds inherited tests; full workspace gates and B1a source approval still pending.
     Serial B1b/B2a/B2b/B2c,
     native-ext4 CI, macOS verification and combined review remain outstanding.
     The controller handoff records approved A and the bound serial tasks.
