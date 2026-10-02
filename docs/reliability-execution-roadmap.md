@@ -97,7 +97,11 @@
     supplementary19/19 recompiled. R6-M1's overbroad prediction is qualified by overlapping guards;
     combined-removal variant flips all9 predicted rows. Controller provider-free full gates session64373
     pass fmt/clippy/build and full alltargets4978/0/13 in90groups,112 Git tests/core recompiled;
-    default/doctests running, frozen sourcec2fc2f2f preserved; source6/6 pending. No deadline exception. All original cap records,
+    default/doctests4989/0/13 in106groups,112 Git tests; all runtime hashes before==after==live.
+    Final-handoff hygiene PASS; clean candidate e4e6dac7 retains cumulative parent251 and rejectedb3 ref.
+    Complete source/evidence/transcript/checkpoint have second copies. Cumulative hardRO Sol6/6
+    session49293 is running, exec-b5fd123a664fd41f8934399eb63443de; no source approval yet.
+    Frozen sourcec2fc2f2f preserved. No deadline exception. All original cap records,
     rejected source/checkpoints/evidence remain; no import, restart or passB.
     No Git-plane code has landed; independent Sol approval, serial passB,
     native-ext4 CI, macOS verification and combined review remain outstanding.

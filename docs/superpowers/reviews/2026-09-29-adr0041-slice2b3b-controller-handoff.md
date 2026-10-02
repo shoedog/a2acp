@@ -107,15 +107,22 @@ structural assertions remain STRUCTURAL. No blanket original20/20 assertion.
 [MEASURED] Sonnet ended canceled_policy at00:47UTC, cleanup complete, exact b689aaa3 container absent.
 Worker fmt/clippy/build PASS; full alltargets interrupted, default/hygiene never completed. No provider replay.
 Source/evidence/public transcript snapshotted at scratch/2b3b-pass-a-round6-policy-ended-custody/ before
-controller refreshed implementation handoff. Provider-free full gates session64373 now running on the
+controller refreshed implementation handoff. Provider-free full gates session64373 completed on the
 exact frozen source using existing offline cache a2a-verify-cache-8ac4ca8ed1db0dde, immutable imagefe3,
 network none/no credentials. Fresh cache inventory found no active user. Unsuffixed a2a-verify-cache
 was an empty volume created by the diagnostic mount, excluded from verification; left retained, no cleanup.
 Host free22.06GiB at continuation (original isolated20GiB authorization); cache filesystem15.86GiB free.
 No extra source edits or concurrent build/provider; source approval and cumulative Sol6/6 OPEN.
 [MEASURED] provider-free fmt/clippy/build PASS; full alltargets4978/0/13 in90groups,112 Git tests,
-core recompiled. All100 inherited Git names preserved+12 new. Default/doctests now running;
-final source-after/hygiene/full custody/commit and cumulative6/6 remain pending.
+core recompiled. All100 inherited Git names preserved+12 new. Default/doctests4989/0/13 in106groups,
+112 Git tests; no exclusions. Runtime hashes before==after==live; final-handoff hygiene PASS.
+[MEASURED] clean candidate e4e6dac7540ab488711de5db8a53a8e0bcd535b2, parent251, retainedb3 ref;
+frozen runtime hashes unchanged. Full source/evidence/transcript/original checkpoint copied to
+scratch/2b3b-pass-a-round6-final-custody/. Fresh Sol doctor/catalog PASS. Cumulative hardRO source6/6
+session49293 running, exec-b5fd123a664fd41f8934399eb63443de,
+attempt-47b8107d7af4cac2edf1e250ba735a4c. Actual turn_context modelgpt-5.6-sol/xhigh.
+Transcript /Users/wesleyjinks/.codex/sessions/2026/10/01/rollout-2026-10-01T19-31-13-01a0fa3c-a5b2-79f0-82a4-dd4b74fd11c0.jsonl.
+No source/build/mutation writer remains; source approval OPEN, no import/B1/B2 yet.
 **(d) Authorization granted but not exercised** — owner: "Merge 2B3a and proceed to orchestrate spec and
 implementation of 2B3b." Later: "use sonnet5-5 for implementation. You may need ti update the acp for the
 bridge. update for claude, codex if so". Owner approved isolated bootstrap, explicit caller format for Empty
@@ -133,10 +140,10 @@ about22GiB; no attribution of the decrease made. See [cleanup audit](2026-09-30-
 
 ## 1. Resume order
 
-1. Monitor provider-free full verification session64373; logs are in the quarantine's
+1. Monitor cumulative hardRO Sol source6/6 session49293 on clean e4e6dac7; completed gate logs are in the quarantine's
    .git/a2a-evidence/2b3b-pass-a-round6/controller-full-gates/. The bound repair is in
    docs/superpowers/reviews/2026-10-01-adr0041-slice2b3b-cumulative-review-round5.md.
-   Sonnet session56776 ended at policy cutoff; b3aa6afd plus frozen repair remains UNAPPROVED.
+   Sonnet session56776 ended at policy cutoff; source e4e6dac7 remains UNAPPROVED pending6/6.
 2. Owner extended to6/6; private doctor/catalog refreshed and one Sonnet5.5 same-artifact repair dispatched:
    deadline-bound success/closing sweeps and rehash, deadline check immediately before rootLAST,
    real late-expiry RED/control/mutations/full final-byte gates, then cumulative hardRO Sol source6/6.
@@ -192,7 +199,7 @@ scope/contract disagreement; unproven concrete Sonnet5.5 model; a failing gate w
 | # | Work | State | Exact next action | Blocked by | Identifiers |
 |---:|---|---|---|---|---|
 | 1 | Storage admission / cleanup | resolved / cleared | preserve checkouts/evidence; private floor50 restored/validated, executed floor20 copy retained | none | scratch/cleanup-approved-result-rechecked.json |
-| 2 | Git bootstrap | provider-free verification active, cap6/6 | finish final-byte gates then cumulative Sol6/6 | source approval | same impl-25228-mwz25w5c; rejected b3aa6afd; session64373 |
+| 2 | Git bootstrap | cumulative source review active, cap6/6 | inspect final Sol verdict and classify at cap | source approval | same impl-25228-mwz25w5c; clean e4e6dac7; session49293 |
 | 3 | Complete G | blocked | serial B1/B2, native macOS/ext4 and combined review | approved passA | scratch 2b3b-pass-b1-draft.md and -b2-draft.md; neither dispatched |
 
 ## 5. Invariants and traps — do not do these
@@ -254,8 +261,8 @@ scope/contract disagreement; unproven concrete Sonnet5.5 model; a failing gate w
 bounded fully validated exact-ID absence, preserving typed failures · source 434905a2 · Sol round3 APPROVE,
 wrong0/smell0/blockers0. Controller executed full macOS gates separately; Linux gates are worker receipts.
 Spec round2 APPROVE remains authoritative with explicitly folded clarifications. Git-plane passA is rejected
-at cap2; design audit closed the population and the corrective spec is approved. Same-artifact repair reached policy cutoff; provider-free verification is complete and round3 source review rejected one localized WRONG/one nonblockingSMELL, CLOSED POPULATION. Targeted round4 repair completed; review4/4 REJECT wrong3/smell0/blockers3 CLOSED POPULATION. The post-child deadline exception remains unapproved. Counts3→2→1→3 are non-converging; final cap4 exhausted and implementation was parked. Owner explicitly approved one targeted repair plus cumulative review5/5; same-artifact Sonnet repair and all gates complete; clean b3aa6afd source review5/5 REJECT1WRONG0SMELL/1blocker CLOSED POPULATION. Direct descriptor/parser/digest repairs closed; closing deadline invariant still fails on b3aa6afd. Owner-approved5/5 exhausted; source remains unapproved. Owner subsequently authorized the precise deadline repair/review6/6; Sonnet session56776 ended at policy cutoff; frozen repair source awaits cumulative6/6 after provider-free gates session64373.
+at cap2; design audit closed the population and the corrective spec is approved. Same-artifact repair reached policy cutoff; provider-free verification is complete and round3 source review rejected one localized WRONG/one nonblockingSMELL, CLOSED POPULATION. Targeted round4 repair completed; review4/4 REJECT wrong3/smell0/blockers3 CLOSED POPULATION. The post-child deadline exception remains unapproved. Counts3→2→1→3 are non-converging; final cap4 exhausted and implementation was parked. Owner explicitly approved one targeted repair plus cumulative review5/5; same-artifact Sonnet repair and all gates complete; clean b3aa6afd source review5/5 REJECT1WRONG0SMELL/1blocker CLOSED POPULATION. Direct descriptor/parser/digest repairs closed; closing deadline invariant still fails on b3aa6afd. Owner-approved5/5 exhausted; source remains unapproved. Owner subsequently authorized the precise deadline repair/review6/6; Sonnet session56776 ended at policy cutoff; provider-free gates complete4978/4989, clean e4e6dac7 cumulative source6/6 session49293 running.
 There is no completion claim until source approval, both passes, full gates
 and the combined review finish.
 
-**Questions the owner owes an answer to:** None pending. "Another repair is authorized" resolved the precise late-validation deadline repair and cumulative review6/6 request; Sonnet ended at policy cutoff and controller provider-free verification is running. No master exception/restart/source adoption requested. At6/6 classify remaining findings before any extension. Private storage exception and build cleanup resolved.
+**Questions the owner owes an answer to:** None pending. "Another repair is authorized" resolved the precise late-validation deadline repair and cumulative review6/6 request; full gates complete, clean e4e6dac7 cumulative source6/6 running. No master exception/restart/source adoption requested. At6/6 classify remaining findings before any extension. Private storage exception and build cleanup resolved.
