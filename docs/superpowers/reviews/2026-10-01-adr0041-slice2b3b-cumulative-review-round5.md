@@ -17,8 +17,9 @@ not unlimited rounds. That cap is exhausted, so source remains UNAPPROVED and im
 for owner decision at that stable point. Owner subsequently replied "another repair is authorized";
 one targeted same-artifact Sonnet5.5 repair was dispatched, followed by cumulative source review6/6.
 That turn ended at its fixed policy limit during full testing; exact container absent, source/evidence
-snapshotted. Provider-free controller verification is running before source6/6; no provider replay.
-No review6 verdict, restart, source import or passB occurred. Same preserved artifact,
+snapshotted. Provider-free controller verification subsequently completed4978/4989, and cumulative
+source6/6 APPROVED0/0/0 at e4e6dac7; see [round6 report](2026-10-02-adr0041-slice2b3b-cumulative-review-round6.md).
+Exact approved five paths adopted locally; no provider replay, restart or B1/B2 dispatch yet. Same preserved artifact,
 all rejected refs/checkpoints and complete execution evidence remain preserved.
 
 **Concrete bounded repair, subsequently authorized and dispatched:**
