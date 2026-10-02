@@ -35,7 +35,7 @@
     final closure/result, each capped at two source-review rounds. Remaining-task spec1/2 rejected one
     missing Empty-HEAD rule and two nonblocking scope/structural-test concerns. The owner chose typed
     pre-repository refusal for Empty refs; complete G requires captured refs with exactly one valid HEAD.
-    Pass A remains unchanged. These refinements await remaining-task spec2/2. 2B3b
+    Pass A remains unchanged. These refinements received independent remaining-task spec2/2 APPROVE0/0/0. 2B3b
     remains incomplete until all increments and native/combined gates pass. This follows the
     owner's 2026-09-29 direction. The owner approved isolated Git bootstrap under `.restore-work/` to preserve
     create-new HEAD/config restoration, and explicit caller-selected format provenance for empty objects.
@@ -113,7 +113,8 @@
     Git bootstrap is locally adopted at2d8a8fb4 with independent source approval.
     [Remaining spec1/2](superpowers/reviews/2026-10-02-adr0041-slice2b3b-remaining-spec-round1.md)
     is REJECT1WRONG/2SMELL/1blocker, CLOSED POPULATION. Owner refinement and five task drafts
-    are prepared for final spec2/2; original two-pass drafts remain historical, not dispatchable.
+    received [final spec2/2 approval](superpowers/reviews/2026-10-02-adr0041-slice2b3b-remaining-spec-round2.md),
+    WRONG0/SMELL0/blockers0, NO FINDINGS, at4083da5e. Original two-pass drafts remain historical, not dispatchable.
     Serial B1a/B1b/B2a/B2b/B2c,
     native-ext4 CI, macOS verification and combined review remain outstanding.
     The controller handoff records approved A and the bound serial tasks.

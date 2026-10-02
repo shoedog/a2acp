@@ -2,22 +2,22 @@
 
 **Written:** 2026-10-02T02:07:09.523516+00:00 · **By:** Codex controller · **Provider:** codex
 **Workspace:** /Users/wesleyjinks/code/a2a-bridge · work/adr0041-2b3b-bootstrap-20261001
-**Measured state:** `[MEASURED]` HEAD 2d8a8fb4441f7a4d5b5377d84d5104e6d03ddccb, controller-doc changes only after completed spec1/2; approved runtime hashes unchanged. Probe git status/diff and draft manifest at scratch/remaining-increments-draft-manifest.json.
-**Predecessor:** committed approved A adoption2d8a8fb4 and completed remaining spec1/2.
+**Measured state:** `[MEASURED]` HEAD 4083da5e5f5381c42e454227027afe24f0fd3c18, controller-doc changes only after completed spec2/2; approved runtime hashes unchanged. Probe git status/diff and draft manifest at scratch/remaining-increments-draft-manifest.json.
+**Predecessor:** committed approved A adoption2d8a8fb4 and completed remaining spec2/2 APPROVE0/0/0.
 **Truth ordering:** measured live state > explicit owner/contract authority within its scope > this handoff for current operational state > earlier handoffs and non-authoritative summaries. A conflict between tiers stays OPEN in §0 — never resolved by document class alone.
 **Provenance:** written live by controller, folded from current read-only state and retained named receipts. `[MEASURED]` rechecked here; `[INHERITED]` prior verification evidence, not rerun.
 
 ## 0. Gating facts — settle these before starting anything below
 
-**(a) Lane ownership** — `[MEASURED]` remaining spec session43775 ENDED0 completed/cleanup complete; no Sonnet/build/mutation active — RESOLVED.
+**(a) Lane ownership** — `[MEASURED]` remaining spec session27319 ENDED0 completed/cleanup complete; no Sonnet/build/mutation active — RESOLVED.
 **(b) Custody exposure** — `[MEASURED]` approved A runtime is committed locally, not pushed/main-merged. Original reviews, Rejected checkpoint, all source/evidence/transcript snapshots retained. Spec1 raw and five pending task drafts are snapshotted under scratch/remaining-spec-r1-completed-custody/ and controller commits these new docs before spec2 dispatch — RESOLVED local custody; publication pending.
-**(c) In flight / irreversible** — `[MEASURED]` none. Remaining task spec2/2 approval OPEN; no B implementation dispatched.
-**(d) Authorization granted but not exercised** — owner: "Merge 2B3a and proceed to orchestrate spec and implementation of 2B3b." "use sonnet5-5 for implementation." "another repair is authorized" (A6 now complete). On Empty HEAD owner chose: "Refuse before creating repository/ (Recommended): complete Git restore requires captured refs/HEAD with exactly one valid HEAD; preserve Pass A’s acceptance of empty coverage." This semantic decision RESOLVED; revised spec gate OPEN.
+**(c) In flight / irreversible** — `[MEASURED]` none. Remaining task spec2/2 APPROVED0/0/0; no B implementation dispatched yet.
+**(d) Authorization granted but not exercised** — owner: "Merge 2B3a and proceed to orchestrate spec and implementation of 2B3b." "use sonnet5-5 for implementation." "another repair is authorized" (A6 now complete). On Empty HEAD owner chose: "Refuse before creating repository/ (Recommended): complete Git restore requires captured refs/HEAD with exactly one valid HEAD; preserve Pass A’s acceptance of empty coverage." This semantic decision RESOLVED; revised spec2/2 gate RESOLVED by independent APPROVE0/0/0.
 
 ## 1. Resume order
 
-1. Commit controller-doc refinement/custody, confirm clean exact root and unchanged A runtime hashes; prepare remaining-spec2/2 input with new master/five task hashes, original spec1 raw and owner decision. Refresh Sol validate/doctor/models, then run existing git-plane-remaining-spec-review with hardRO Sol5.6/xhigh, new prompt round2/2. Preserve root while running.
-2. If APPROVED, bind B1a to that clean approved predecessor, master/refinement/spec receipt and ALL112 inherited Git test names. Refresh Sonnet5.5 doctor/catalog/storage; use scratch/implement-pass-b.toml, floor50GiB, implement --lang rust --base-ref exactSHA, no --merge. Review cap2 for this bounded new increment, not another A review or checkpoint reset.
+1. Commit spec2 approval/custody docs; confirm clean exact root and unchanged A runtime hashes. Bind B1a task to that clean commit, approved master SHAe3edf7fb and spec2 raw SHAf9dee13be68d908d66a2dd79812c93a656bbe3a8860132472b4ad56cc4b8055b, all112 inherited Git tests and exact source SHA. Sol2/2 is completed APPROVE0/0/0; do not rerun spec.
+2. Bind B1a to that clean approved predecessor, master/refinement/spec receipt and ALL112 inherited Git test names. Refresh Sonnet5.5 doctor/catalog/storage; use scratch/implement-pass-b.toml, floor50GiB, implement --lang rust --base-ref exactSHA, no --merge. Review cap2 for this bounded new increment, not another A review or checkpoint reset.
 3. Integrate independently approved B1a, then similarly B1b/B2a/B2b/B2c in dependency order. Runtime remains one original capsule/pins/ledger/absolute Instant, no separate restore retries. Each task source-review cap2; preserve deliberately deferred obligations and preceding source provenance.
 4. After complete G, execute native macOS and native-ext4 CI, full aggregate suites and combined Sol review base251..final. Publish PR, inspect exact CI and land under original task authority. No whole2B3b claim until gates pass.
 
@@ -37,7 +37,7 @@
 |A causal receipts|done with limits|`[INHERITED]` pristine b3 stageA6selected5behaviorFAIL/1controlPASS; final112Git; StageB hook tests NOBASE-RED; main20 mutation failed M1 all-flip prediction, preserve honest partial flips; supplementary5 verify overlap/earlier guards; 25 records independently checked. MainCONTROL18 cached/no compile; supplementCONTROL19 recompiled. No blanket20/20 or hook-only causal claim|
 |A Sonnet/verification end|done|`[INHERITED]` session56776 policy-ended2h, exact b689aaa3 absent, no replay; controller providerfree64373 ENDED0 with full gates; source49293 ENDED0 approved6/6|
 |Remaining spec1/2|done rejected|`[MEASURED]` session43775 exec-fffd851e8bc3155755d1a37bced0d873 attempt-52c3d095d91dcc5342352ae2ce4561cd; REJECT1W2S1block CLOSED; rawecc96d7aa8bcf72f22fe8b2b9369d2d7f0978cf456c39859168f4a24f4764c1c; owner Empty-HEAD decision resolved|
-|Remaining spec2/2|next|five serial tasks/master later refinement prepared, no dispatch yet|
+|Remaining spec2/2|done approved|`[MEASURED]` session27319, rawf9dee13be68d908d66a2dd79812c93a656bbe3a8860132472b4ad56cc4b8055b; APPROVE0/0/0 NO FINDINGS,5 task/master hashes match|
 |Remaining implementation/native/combined|pending|approved remaining spec then B1a/B1b/B2a/B2b/B2c; no completion claim|
 |Exact approved build cleanup|done|`[INHERITED]` three remaining literal target paths deleted4.236GiB freshly measured, fourth root incremental already absent. No19.8GiB actual reclaim claim. Releases/source/branches/worktrees/evidence/operator retained; cleanup-approved-result-rechecked.json|
 
@@ -45,20 +45,20 @@
 
 | Location | Stale or false assertion | Correction |
 |---|---|---|
-|Old master approval|later Empty HEAD rule attested by original review|new explicit owner refinement is pending remaining-spec2/2; original approval preserved historically|
+|Old master approval|later Empty HEAD rule attested by original review|new explicit owner refinement independently APPROVED0/0/0 in remaining-spec2/2; original approval preserved historically|
 |Old B1/B2 drafts|dispatchable next tasks|historical only; completed spec1 recommends five bounded increments, created before implementation|
 |Older handoff identifiers|b3aa6afd current/unadopted|superseded e4e6dac7 approved, root2d8a8fb4 exact adoption; b3 ref preserved|
 |Deadline preliminary concern|Pass A requires new Instant field|Sol source mechanism closes: eventual wrapper keeps SAME caller stack Instant through helpers; no A API change required|
 |Whole-module structural guard|all future Git helpers forbidden repository literals|narrow only to bootstrap function when needed; retain direct-bootstrap no-repository behavior|
-|Storage|earlier22GiB snapshot current|`[INHERITED]` latest01:37UTC about71GiB; no additional controller cleanup or attribution, future private floor50 unchanged|
+|Storage|earlier22/71GiB snapshots current|`[MEASURED]` df latest141809836KiB free (~135GiB); no additional controller cleanup or attribution, future private floor50 unchanged|
 |Memory|update needed|no update requested/authorized; no write|
 
 ## 4. Open work
 
 | # | Work | State | Exact next action | Blocked by | Identifiers |
 |---:|---|---|---|---|---|
-|1|Remaining spec|next|commit docs, bind hashes, dispatch2/2|none|five2026-10-02 task files, existing spec-review.toml|
-|2|B1a frame preflight|pending|Sonnet implement --lang rust exact approved base|spec2 approval|implement-pass-b.toml floor50 max2|
+|1|Remaining spec|done|preserve exact approval/custody|none|remaining-spec-round2.md|
+|2|B1a frame preflight|next|Sonnet implement --lang rust exact approved base|none|implement-pass-b.toml floor50 max2|
 |3|B1b/B2a/B2b/B2c|pending|serial approved predecessor bindings|B1a|same lane, source caps2 each|
 |4|Native/aggregate/combined|pending|Mac/native-ext4 explicit filesystem proof plus full base251..final review|complete G|combined-review.toml prepared|
 |5|Publication/landing|pending|exact CI/PR then main integration|all gates|no PR for A-only claim|
@@ -87,6 +87,7 @@
 |Scratch|/private/tmp/adr0041-2b3b-20260929|
 |A evidence|quarantine .git/a2a-evidence/2b3b-pass-a-round6/; scratch2b3b-pass-a-round6-final-custody/; approved-adoption-receipt.json|
 |Source6 execution|session49293; exec-b5fd123a664fd41f8934399eb63443de; attempt-47b8107d7af4cac2edf1e250ba735a4c|
+|Remaining spec2 execution|session27319; exec-bfc24975a9a3823ea02f5d714818508a; attempt-505d277c6862d5ed9e93c54d47e69506|
 |Remaining spec1 execution|session43775; exec-fffd851e8bc3155755d1a37bced0d873; attempt-52c3d095d91dcc5342352ae2ce4561cd|
 |Remaining tasks|docs/superpowers/plans/2026-10-02-adr0041-slice2b3b-pass-b1a-task.md and b1b/b2a/b2b/b2c; scratch remaining-increments-draft-manifest.json|
 |New master SHA|e3edf7fbcc51ecd89ba8dc6c3cbef77253f0d7d85b6f44a43639c6baa890c441|
@@ -98,6 +99,6 @@
 
 ## 7. Refutation verdict and owner questions
 
-**§2c verdict:** REFUTED — corrected in place · claim: "two remaining drafts implement every master requirement without undefined semantics" · pass: INDEPENDENT · evidence tier: STATIC-ONLY · record: remaining spec1/2 REJECT1WRONG2SMELL1block CLOSED. Owner decided Empty refs refusal; five bounded consecutive task increments and bootstrap guard transition prepared. Spec2 approval still OPEN. A6 independent source APPROVE0/0/0 and source-bound executed4978/4989 gates remain valid within A scope.
+**§2c verdict:** SURVIVED — repaired contract independently reviewed · claim: "two remaining drafts implement every master requirement without undefined semantics" · pass: INDEPENDENT · evidence tier: STATIC-ONLY · record: remaining spec1/2 REJECT1WRONG2SMELL1block CLOSED. Owner decided Empty refs refusal; five bounded consecutive task increments and bootstrap guard transition prepared. Spec2 independently APPROVED0/0/0 at4083da5e; remaining-plan population closed on mechanism, not silence. A6 independent source APPROVE0/0/0 and source-bound executed4978/4989 gates remain valid within A scope.
 
 **Questions the owner owes an answer to:** None pending. Original orchestration authority and explicit Empty HEAD refusal decision apply. No master exception beyond that decision, no restart, no additional cleanup.
