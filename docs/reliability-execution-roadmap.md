@@ -118,10 +118,14 @@
     B1a dispatched through `implement --lang rust` from clean53373e68 into
     `impl-94034-sqrswpnj`, tool session63748, declared source cap2. Actual provider transcript
     confirms `claude-sonnet-5-5`. Worker same-environment base control140/0/0 includes112restore+28runner;
-    fresh focused restore suite142/0/0 preserves all112 inherited tests and adds30. The51-variant
-    behavioral mutation run is active. Controller independently checked first26 raw rows:23usable and
-    three invalid Cargo invocations (M03/M04/M05, zero tests), preserved separately for valid reruns.
-    No unmet admissible prediction in that checked population; source restoration verified per raw receipt.
+    fresh focused restore suite143/0/0 preserves all112 inherited tests and adds31; the earlier142-test
+    source and raw run remain preserved separately. The first51-variant matrix completed:48 admissible,
+    46 predicted flips, two valid misses (M19/M27) and three invalid Cargo invocations (M03/M04/M05,
+    zero tests). Corrected M03/M04/M05 each recompiled and selected31 tests with exactly two expected
+    failures; the restored unmodified control recompiled and passed31/0/0. Controller independently
+    parsed all named raw receipts and saved second copies. Thus49 of51 usable variants triggered their
+    predictions; the two misses still require classification. Sonnet is now running a new matrix epoch
+    against the143-test source. No live-source binding is claimed during deliberate variants.
     TaskSHA99edc69b binds inherited tests; full workspace gates and B1a source approval still pending.
     Serial B1b/B2a/B2b/B2c,
     native-ext4 CI, macOS verification and combined review remain outstanding.
