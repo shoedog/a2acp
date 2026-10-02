@@ -158,7 +158,9 @@
     actualclaude-sonnet-5-5; taskcd3cabf5/config7774d187/sourcecap2. Privatefloor20GiB uses prior
     owner isolated-lane authorization;27/27doctor green, free33.77GiB. Untouchedbase198 control
     passed198/0/0 with exact192Git+6seal names/source hashes and actual normal core rebuild. Raw
-    baseline second copies retained; no B2a approval yet. B2b/B2c, native-ext4 CI, macOS and combined review follow.
+    baseline second copies retained. Structural RED and first23/3/0 behavioral run preserved; broader
+    focused run active, no final GREEN/approval. Two-revision provider-free mirror83952 started before
+    final bridge verification, actual B1b12bundle control passed. B2b/B2c/native/combined remain pending.
     The controller handoff records approved A and the bound serial tasks.
   **2B2b is complete:** all its children are merged. The parent Slice 2B completion gate (plan §8) still requires 2B3,
   the aggregate fixture without the source or its alternates, and one bounded review of the combined diff.
