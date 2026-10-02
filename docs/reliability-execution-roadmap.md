@@ -166,12 +166,19 @@
     Six bridge gates pass; alltargets5090/0/13,90groups/core rebuilt; default5101/0/13,
     106groups/16docgroups/core cached. Solsource1/2REJECT2WRONG1SMELL2block CLOSED:
     partial write underreports progress; slow nonfinal gate/read/sync permits post-deadline effects.
-    Sonnet repairs the same artifact within declaredcap2. Raw source review is retained in
+    Sonnet repaired the same artifact within declaredcap2; clean candidate110681c0 now awaits
+    full bridge suites and source2/2. Finalfocused232/0/0 retains198inheritednames; matching
+    launch/before/after source c860bb3b/32ab0f8c, core cached. Final101variant+2control matrix:
+    94behavioral flips,2structural-onlyOSsync flips,5disclosednonflips; no missedpredictions/invalidruns.
+    All101mutated digests and rawpopulations independently checked; restoredlive/launch hashes agree.
+    First repair trial's F12miss retained; tightened test now yields realbehavioral failure. Raw source review is retained in
     `2026-10-02-adr0041-slice2b3b-b2a-source-round1.md`; no B2a adoption/approval.
     Later source snapshot caught intentional E03 mutation; retained as a variant, not frozen GREEN bytes.
     First provider-free mirror83952 expired before any gate completed; Sol saw bridgePASS but no
     detailed host receipts. Continuation mirror22710 copied all six exact58e165a7 bundles, now audited
-    after review, and awaits repair receipts. No provider replay. B2b/B2c/native/combined remain pending.
+    after review;22710 ended0 at7200s with only that completedrevision. Continuation33595 now awaits
+    repaired110681c0 receipts; fmt/workspaceclippyalltargetsallfeatures/build PASS copied and audited,
+    both full suites/hygiene pending. No provider replay. B2b/B2c/native/combined remain pending.
     The controller handoff records approved A and the bound serial tasks.
   **2B2b is complete:** all its children are merged. The parent Slice 2B completion gate (plan §8) still requires 2B3,
   the aggregate fixture without the source or its alternates, and one bounded review of the combined diff.
