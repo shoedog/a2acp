@@ -9888,3 +9888,4083 @@ fn b1a_the_prevalidation_region_is_read_only_and_the_scan_split_is_unique() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------------------------
+// Pass B1b: pure refs agreement and inert config
+//
+// The grammar, agreement, and limit rows drive `RefsBuilderV1` over byte slices and readers: the same
+// code that later runs over retained final descriptors, fed here by the test. Objects are named by one
+// fill character (`a`..`e`) so a row reads as the refs it describes. The production rows below them run
+// the real entry point over REAL retained phase-V values and frames. Nothing here writes a byte, runs
+// Git on the code under test, or charges the ledger.
+//
+// Pass A's and B1a's controls above are unchanged. The mutation matrix in
+// `.git/a2a-evidence/2b3b-pass-b1b/` maps each guard to the rows that turn red without it.
+// ---------------------------------------------------------------------------------------------
+
+use crate::custody_seal::{CustodyOriginalRefV1, CustodyRefTargetV1};
+
+type KindV1 = CustodyGitObjectKindV1;
+
+/// The pure rows' object pool: `a` and `b` are commits, `c` an annotated tag, `d` a tree, `e` a blob,
+/// and `f` an object of unknown kind.
+const POOL_V1: [(char, KindV1); 6] = [
+    ('a', KindV1::Commit),
+    ('b', KindV1::Commit),
+    ('c', KindV1::Tag),
+    ('d', KindV1::Tree),
+    ('e', KindV1::Blob),
+    ('f', KindV1::Unknown),
+];
+const BOTH_FORMATS_V1: [GitObjectFormatV1; 2] =
+    [GitObjectFormatV1::Sha1, GitObjectFormatV1::Sha256];
+
+fn oid_len(format: GitObjectFormatV1) -> usize {
+    match format {
+        GitObjectFormatV1::Sha1 => 40,
+        GitObjectFormatV1::Sha256 => 64,
+    }
+}
+
+fn oid_of(fill: char, format: GitObjectFormatV1) -> String {
+    fill.to_string().repeat(oid_len(format))
+}
+
+fn manifest_format_of(format: GitObjectFormatV1) -> CustodyGitObjectFormatV1 {
+    match format {
+        GitObjectFormatV1::Sha1 => CustodyGitObjectFormatV1::Sha1,
+        GitObjectFormatV1::Sha256 => CustodyGitObjectFormatV1::Sha256,
+    }
+}
+
+fn pool_object(fill: char, format: GitObjectFormatV1) -> CustodyOriginalObjectV1 {
+    let kind = POOL_V1
+        .iter()
+        .find(|(found, _)| *found == fill)
+        .expect("a pooled object")
+        .1;
+    CustodyOriginalObjectV1::new(manifest_format_of(format), oid_of(fill, format), kind)
+        .expect("a pooled object")
+}
+
+/// What a manifest ref says its target is.
+#[derive(Clone, Copy)]
+enum WantV1 {
+    Direct(char),
+    Symbolic(&'static str),
+    Unborn,
+}
+
+fn want_ref(format: GitObjectFormatV1, name: &str, want: WantV1) -> CustodyOriginalRefV1 {
+    let target = match want {
+        WantV1::Direct(fill) => CustodyRefTargetV1::Direct(pool_object(fill, format)),
+        WantV1::Symbolic(target) => {
+            CustodyRefTargetV1::Symbolic(LosslessPathV1::from_bytes(target.as_bytes().to_vec()))
+        }
+        WantV1::Unborn => CustodyRefTargetV1::Unborn,
+    };
+    CustodyOriginalRefV1::new(LosslessPathV1::from_bytes(name.as_bytes().to_vec()), target)
+        .expect("a manifest ref")
+}
+
+/// A manifest over the pool (or over no objects) and `refs`.
+fn pool_manifest(
+    format: GitObjectFormatV1,
+    pooled: bool,
+    refs: &[(&str, WantV1)],
+) -> CustodyManifestV1 {
+    let objects = if pooled {
+        POOL_V1
+            .iter()
+            .map(|(fill, _)| pool_object(*fill, format))
+            .collect()
+    } else {
+        vec![]
+    };
+    let state = if pooled {
+        CustodyStateClassV1::Captured
+    } else {
+        CustodyStateClassV1::Empty
+    };
+    CustodyManifestV1::new(
+        "unit-b1b",
+        "run-b1b",
+        "materialization-b1b",
+        GENERATION_V1,
+        coverage_rows(state),
+        refs.iter()
+            .map(|(name, want)| want_ref(format, name, *want))
+            .collect(),
+        objects,
+        vec![],
+        vec![],
+    )
+    .expect("a pooled manifest")
+}
+
+type FileV1 = (&'static str, Vec<u8>);
+type ManifestRefsV1 = Vec<(&'static str, WantV1)>;
+
+fn direct_file(fill: char, format: GitObjectFormatV1) -> Vec<u8> {
+    format!("{}\n", oid_of(fill, format)).into_bytes()
+}
+
+fn symbolic_file(target: &str) -> Vec<u8> {
+    format!("ref: {target}\n").into_bytes()
+}
+
+fn file_of(path: &'static str, content: Vec<u8>) -> FileV1 {
+    (path, content)
+}
+
+/// An attached `HEAD` on `refs/heads/main`, which is commit `a`.
+fn base_files(format: GitObjectFormatV1) -> Vec<FileV1> {
+    vec![
+        file_of("HEAD", symbolic_file("refs/heads/main")),
+        file_of("refs/heads/main", direct_file('a', format)),
+    ]
+}
+
+/// `files` into a builder, then the agreement with a manifest of `refs`.
+fn pure_run(
+    format: GitObjectFormatV1,
+    pooled: bool,
+    files: &[FileV1],
+    refs: &[(&str, WantV1)],
+    limits: RefsLimitsV1,
+) -> Result<RefsAgreementV1, GitBootstrapErrorV1> {
+    let mut builder = RefsBuilderV1::new(format, limits, far_deadline());
+    for (path, content) in files {
+        let mut reader: &[u8] = content;
+        builder.admit_file(path.as_bytes(), &mut reader)?;
+    }
+    builder.finish(&pool_manifest(format, pooled, refs))
+}
+
+fn pure(
+    format: GitObjectFormatV1,
+    files: &[FileV1],
+    refs: &[(&str, WantV1)],
+) -> Result<RefsAgreementV1, GitBootstrapErrorV1> {
+    pure_run(format, true, files, refs, RefsLimitsV1::v1())
+}
+
+fn refs_fault(error: GitBootstrapErrorV1) -> RefsFaultV1 {
+    match error {
+        GitBootstrapErrorV1::Refs(fault) => fault,
+        other => panic!("a refs fault, not {other:?}"),
+    }
+}
+
+fn fault_of(result: Result<RefsAgreementV1, GitBootstrapErrorV1>, row: &str) -> RefsFaultV1 {
+    refs_fault(result.expect_err(row))
+}
+
+fn row_fault(path: &str, why: RowFaultV1) -> RefsFaultV1 {
+    RefsFaultV1::Row {
+        path: path.to_owned(),
+        why,
+    }
+}
+
+fn name_fault(path: &str, why: RefNameFaultV1) -> RefsFaultV1 {
+    RefsFaultV1::RefName {
+        path: path.to_owned(),
+        why,
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Ref names
+// ---------------------------------------------------------------------------------------------
+
+/// The ref-name rule: every name is under `refs/`, has no empty component, follows the portable ASCII
+/// spelling rule, and Git's check-ref-format rules (no leading dot, no `.lock` suffix, no `..`, none of
+/// `~ ^ : ? * [`, no `@{`). Each refusal is its own typed reason, and a valid neighbour passes.
+#[test]
+fn b1b_ref_names_follow_the_git_rules_and_the_portable_rule() {
+    for valid in [
+        "refs/heads/main",
+        "refs/tags/v1.0",
+        "refs/remotes/origin/HEAD",
+        "refs/stash",
+        "refs/heads/feature/deep/er",
+        "refs/heads/a-b_c",
+        "refs/heads/a.b",
+        "refs/heads/@x",
+        "refs/heads/lock",
+        "refs/notes/commits",
+        "refs/heads/x.locked",
+    ] {
+        assert_eq!(check_ref_name_v1(valid.as_bytes()), Ok(()), "{valid}");
+    }
+    let table: &[(&[u8], RefNameFaultV1)] = &[
+        (b"refs", RefNameFaultV1::NotUnderRefs),
+        (b"heads/main", RefNameFaultV1::NotUnderRefs),
+        (b"HEAD", RefNameFaultV1::NotUnderRefs),
+        (b"", RefNameFaultV1::NotUnderRefs),
+        (b"refs/", RefNameFaultV1::EmptyComponent),
+        (b"refs//x", RefNameFaultV1::EmptyComponent),
+        (b"refs/heads/", RefNameFaultV1::EmptyComponent),
+        (b"refs/heads/.hidden", RefNameFaultV1::LeadingDot),
+        (b"refs/.x/y", RefNameFaultV1::LeadingDot),
+        (b"refs/heads/x.lock", RefNameFaultV1::LockSuffix),
+        (b"refs/x.lock/y", RefNameFaultV1::LockSuffix),
+        (b"refs/heads/a..b", RefNameFaultV1::DoubleDot),
+        (b"refs/heads/a~1", RefNameFaultV1::ForbiddenByte),
+        (b"refs/heads/a^", RefNameFaultV1::ForbiddenByte),
+        (b"refs/heads/a:b", RefNameFaultV1::ForbiddenByte),
+        (b"refs/heads/a?", RefNameFaultV1::ForbiddenByte),
+        (b"refs/heads/a*", RefNameFaultV1::ForbiddenByte),
+        (b"refs/heads/a[", RefNameFaultV1::ForbiddenByte),
+        (b"refs/heads/a@{b", RefNameFaultV1::AtBrace),
+        (
+            b"refs/heads/a.",
+            RefNameFaultV1::Portable(PortableFaultV1::TrailingDot),
+        ),
+        (
+            b"refs/heads/a b",
+            RefNameFaultV1::Portable(PortableFaultV1::Unprintable),
+        ),
+        (
+            b"refs/heads/a\tb",
+            RefNameFaultV1::Portable(PortableFaultV1::Unprintable),
+        ),
+        (
+            b"refs/heads/a\x7f",
+            RefNameFaultV1::Portable(PortableFaultV1::Unprintable),
+        ),
+        (
+            b"refs/heads/a\\b",
+            RefNameFaultV1::Portable(PortableFaultV1::Backslash),
+        ),
+        (
+            "refs/heads/h\u{e9}".as_bytes(),
+            RefNameFaultV1::Portable(PortableFaultV1::NonAscii),
+        ),
+        (
+            b"refs/heads/\xff",
+            RefNameFaultV1::Portable(PortableFaultV1::NonAscii),
+        ),
+    ];
+    for (name, why) in table {
+        assert_eq!(
+            check_ref_name_v1(name),
+            Err(why.clone()),
+            "{}",
+            String::from_utf8_lossy(name)
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Loose refs, HEAD, and ORIG_HEAD
+// ---------------------------------------------------------------------------------------------
+
+/// HEAD, ORIG_HEAD, and a loose ref parse in both formats: a direct ref is exactly the format's
+/// lowercase hex and one LF, a symbolic ref exactly `ref: ` and a full ref name and one LF.
+#[test]
+fn b1b_exact_loose_refs_parse_in_both_formats() {
+    for format in BOTH_FORMATS_V1 {
+        let agreement = pure(
+            format,
+            &[
+                file_of("HEAD", symbolic_file("refs/heads/main")),
+                file_of("ORIG_HEAD", direct_file('b', format)),
+                file_of("refs/heads/main", direct_file('a', format)),
+                file_of("refs/heads/alias", symbolic_file("refs/heads/main")),
+                file_of("refs/tags/v1", direct_file('c', format)),
+                file_of("refs/heads/deep/er", direct_file('b', format)),
+            ],
+            &[],
+        )
+        .unwrap_or_else(|error| panic!("{format:?}: {error:?}"));
+        assert_eq!(
+            agreement.head,
+            HeadStateV1::Symbolic {
+                target: "refs/heads/main".into(),
+                resolved: Some(oid_of('a', format)),
+            }
+        );
+        assert_eq!(agreement.loose_refs, 4, "{format:?}");
+        assert_eq!(agreement.symbolic_refs, 1, "{format:?}");
+        assert_eq!(agreement.effective_refs, 4, "{format:?}");
+        assert_eq!(agreement.orig_head, Some(oid_of('b', format)));
+        assert_eq!((agreement.packed_refs, agreement.peeled_rows), (0, 0));
+        // A detached HEAD is the same grammar.
+        let detached = pure(format, &[file_of("HEAD", direct_file('a', format))], &[])
+            .unwrap_or_else(|error| panic!("{format:?}: {error:?}"));
+        assert_eq!(
+            detached.head,
+            HeadStateV1::Detached {
+                oid: oid_of('a', format)
+            }
+        );
+    }
+}
+
+/// Every malformed loose ref refuses with its own typed reason, for HEAD and for a loose ref alike:
+/// nothing is trimmed, lowercased, or defaulted.
+#[test]
+fn b1b_malformed_loose_refs_refuse_with_typed_reasons() {
+    for format in BOTH_FORMATS_V1 {
+        let good = oid_of('a', format);
+        let other_width = oid_of(
+            'a',
+            if oid_len(format) == 40 {
+                GitObjectFormatV1::Sha256
+            } else {
+                GitObjectFormatV1::Sha1
+            },
+        );
+        let upper = good.to_uppercase();
+        let rows: Vec<(&str, Vec<u8>, RowFaultV1)> = vec![
+            ("empty", b"".to_vec(), RowFaultV1::EmptyFile),
+            (
+                "no newline",
+                good.clone().into_bytes(),
+                RowFaultV1::PartialLine,
+            ),
+            (
+                "no newline, symbolic",
+                b"ref: refs/heads/main".to_vec(),
+                RowFaultV1::PartialLine,
+            ),
+            ("lone newline", b"\n".to_vec(), RowFaultV1::ObjectId),
+            (
+                "crlf",
+                format!("{good}\r\n").into_bytes(),
+                RowFaultV1::ObjectId,
+            ),
+            (
+                "trailing space",
+                format!("{good} \n").into_bytes(),
+                RowFaultV1::ObjectId,
+            ),
+            (
+                "leading space",
+                format!(" {good}\n").into_bytes(),
+                RowFaultV1::ObjectId,
+            ),
+            (
+                "uppercase",
+                format!("{upper}\n").into_bytes(),
+                RowFaultV1::ObjectId,
+            ),
+            (
+                "the other format's width",
+                format!("{other_width}\n").into_bytes(),
+                RowFaultV1::ObjectId,
+            ),
+            (
+                "one hex digit short",
+                format!("{}\n", &good[1..]).into_bytes(),
+                RowFaultV1::ObjectId,
+            ),
+            (
+                "a non-hex digit",
+                format!("g{}\n", &good[1..]).into_bytes(),
+                RowFaultV1::ObjectId,
+            ),
+            (
+                "a NUL",
+                format!("{}\0\n", &good[1..]).into_bytes(),
+                RowFaultV1::ObjectId,
+            ),
+            (
+                "a second line",
+                format!("{good}\n{good}\n").into_bytes(),
+                RowFaultV1::ExtraLine,
+            ),
+            (
+                "a trailing blank line",
+                format!("{good}\n\n").into_bytes(),
+                RowFaultV1::ExtraLine,
+            ),
+            (
+                "a second, partial line",
+                format!("{good}\nx").into_bytes(),
+                RowFaultV1::ExtraLine,
+            ),
+            (
+                "ref: without its space",
+                b"ref:refs/heads/main\n".to_vec(),
+                RowFaultV1::ObjectId,
+            ),
+            (
+                "a symbolic ref with two spaces",
+                b"ref:  refs/heads/main\n".to_vec(),
+                RowFaultV1::SymbolicTarget(RefNameFaultV1::NotUnderRefs),
+            ),
+            (
+                "a symbolic target with a trailing space",
+                b"ref: refs/heads/main \n".to_vec(),
+                RowFaultV1::SymbolicTarget(RefNameFaultV1::Portable(PortableFaultV1::Unprintable)),
+            ),
+            (
+                "a symbolic target with a CR",
+                b"ref: refs/heads/main\r\n".to_vec(),
+                RowFaultV1::SymbolicTarget(RefNameFaultV1::Portable(PortableFaultV1::Unprintable)),
+            ),
+            (
+                "a symbolic target outside refs/",
+                b"ref: HEAD\n".to_vec(),
+                RowFaultV1::SymbolicTarget(RefNameFaultV1::NotUnderRefs),
+            ),
+            (
+                "an empty symbolic target",
+                b"ref: \n".to_vec(),
+                RowFaultV1::SymbolicTarget(RefNameFaultV1::NotUnderRefs),
+            ),
+            (
+                "a symbolic target with ..",
+                b"ref: refs/heads/a..b\n".to_vec(),
+                RowFaultV1::SymbolicTarget(RefNameFaultV1::DoubleDot),
+            ),
+            (
+                "a symbolic target ending .lock",
+                b"ref: refs/heads/x.lock\n".to_vec(),
+                RowFaultV1::SymbolicTarget(RefNameFaultV1::LockSuffix),
+            ),
+        ];
+        for path in ["HEAD", "refs/heads/x"] {
+            for (row, content, why) in &rows {
+                let result = pure(format, &[file_of(path, content.clone())], &[]);
+                assert_eq!(
+                    fault_of(result, row),
+                    row_fault(path, why.clone()),
+                    "{format:?} {path}: {row}"
+                );
+            }
+        }
+    }
+}
+
+/// ORIG_HEAD is only ever a direct object id: a symbolic ORIG_HEAD refuses, and so does every malformed
+/// spelling.
+#[test]
+fn b1b_orig_head_is_a_direct_object_id_only() {
+    for format in BOTH_FORMATS_V1 {
+        let mut files = base_files(format);
+        files.push(file_of("ORIG_HEAD", symbolic_file("refs/heads/main")));
+        assert_eq!(
+            fault_of(pure(format, &files, &[]), "symbolic ORIG_HEAD"),
+            row_fault("ORIG_HEAD", RowFaultV1::ObjectId)
+        );
+        for (row, content, why) in [
+            ("empty", b"".to_vec(), RowFaultV1::EmptyFile),
+            (
+                "no newline",
+                oid_of('a', format).into_bytes(),
+                RowFaultV1::PartialLine,
+            ),
+            (
+                "two lines",
+                format!("{0}\n{0}\n", oid_of('a', format)).into_bytes(),
+                RowFaultV1::ExtraLine,
+            ),
+        ] {
+            let mut files = base_files(format);
+            files.push(file_of("ORIG_HEAD", content));
+            assert_eq!(
+                fault_of(pure(format, &files, &[]), row),
+                row_fault("ORIG_HEAD", why),
+                "{row}"
+            );
+        }
+    }
+}
+
+/// Which paths are refs files: the allowlist routes only HEAD, ORIG_HEAD, FETCH_HEAD, packed-refs,
+/// refs/**, and logs/HEAD or logs/refs/**. Any other file is refused, whatever it holds, and a ref
+/// file under a forbidden name is refused by its name. A path may be admitted once.
+#[test]
+fn b1b_only_refs_files_are_admitted_and_each_once() {
+    let format = GitObjectFormatV1::Sha1;
+    for path in [
+        "config",
+        "index",
+        "shallow",
+        "MERGE_HEAD",
+        "hooks/pre-commit",
+        "objects/pack/x",
+        "info/refs",
+        "refs",
+        "logs",
+        "logs/foo",
+        "logs/refs",
+        "refs.lock",
+        "head",
+        "HEAD/x",
+        "packed-refs/x",
+        "",
+    ] {
+        let mut builder = RefsBuilderV1::new(format, RefsLimitsV1::v1(), far_deadline());
+        let mut reader: &[u8] = b"anything\n";
+        let error = builder
+            .admit_file(path.as_bytes(), &mut reader)
+            .expect_err(path);
+        assert_eq!(
+            refs_fault(error),
+            RefsFaultV1::UnexpectedFile { path: path.into() },
+            "{path}"
+        );
+    }
+    for (path, why) in [
+        ("refs/heads/x.lock", RefNameFaultV1::LockSuffix),
+        ("refs/heads/.x", RefNameFaultV1::LeadingDot),
+        ("refs/heads/a..b", RefNameFaultV1::DoubleDot),
+        (
+            "refs/heads/a b",
+            RefNameFaultV1::Portable(PortableFaultV1::Unprintable),
+        ),
+    ] {
+        let mut files = base_files(format);
+        files.push(file_of(path, direct_file('a', format)));
+        assert_eq!(
+            fault_of(pure(format, &files, &[]), path),
+            name_fault(path, why),
+            "{path}"
+        );
+    }
+    for path in [
+        "HEAD",
+        "ORIG_HEAD",
+        "FETCH_HEAD",
+        "packed-refs",
+        "refs/heads/main",
+        "logs/HEAD",
+        "logs/refs/heads/main",
+    ] {
+        let mut builder = RefsBuilderV1::new(format, RefsLimitsV1::v1(), far_deadline());
+        let content: &[u8] = match path {
+            "HEAD" => b"ref: refs/heads/main\n",
+            "packed-refs" | "FETCH_HEAD" | "logs/HEAD" | "logs/refs/heads/main" => b"",
+            _ => b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n",
+        };
+        let mut reader: &[u8] = content;
+        builder
+            .admit_file(path.as_bytes(), &mut reader)
+            .expect("the first admission");
+        let mut again: &[u8] = content;
+        let error = builder
+            .admit_file(path.as_bytes(), &mut again)
+            .expect_err(path);
+        assert_eq!(
+            refs_fault(error),
+            RefsFaultV1::Duplicate { path: path.into() },
+            "{path}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// packed-refs
+// ---------------------------------------------------------------------------------------------
+
+const PACKED_HEADER_V1: &str = "# pack-refs with: peeled fully-peeled sorted \n";
+
+fn packed(format: GitObjectFormatV1, header: &str, rows: &[(&str, char, Option<char>)]) -> Vec<u8> {
+    let mut text = header.to_owned();
+    for (name, fill, peeled) in rows {
+        text.push_str(&format!("{} {name}\n", oid_of(*fill, format)));
+        if let Some(peeled) = peeled {
+            text.push_str(&format!("^{}\n", oid_of(*peeled, format)));
+        }
+    }
+    text.into_bytes()
+}
+
+/// A real-shaped packed-refs file parses in both formats: the header line, sorted rows, a peeled row
+/// under its annotated tag, a packed-only ref, and a ref that a loose one also names (the loose one wins).
+#[test]
+fn b1b_packed_refs_parse_with_peeled_rows_and_loose_precedence() {
+    for format in BOTH_FORMATS_V1 {
+        let mut files = vec![file_of("HEAD", symbolic_file("refs/heads/main"))];
+        files.push(file_of(
+            "packed-refs",
+            packed(
+                format,
+                PACKED_HEADER_V1,
+                &[
+                    ("refs/heads/main", 'a', None),
+                    ("refs/heads/other", 'b', None),
+                    ("refs/tags/v1", 'c', Some('a')),
+                    ("refs/tags/v2", 'a', None),
+                ],
+            ),
+        ));
+        // A loose ref hides the packed one of the same name.
+        files.push(file_of("refs/heads/other", direct_file('a', format)));
+        let agreement = pure(
+            format,
+            &files,
+            &[
+                ("HEAD", WantV1::Symbolic("refs/heads/main")),
+                ("refs/heads/main", WantV1::Direct('a')),
+                ("refs/heads/other", WantV1::Direct('a')),
+                ("refs/tags/v1", WantV1::Direct('c')),
+            ],
+        )
+        .unwrap_or_else(|error| panic!("{format:?}: {error:?}"));
+        assert_eq!(agreement.packed_refs, 4, "{format:?}");
+        assert_eq!(agreement.peeled_rows, 1, "{format:?}");
+        assert_eq!(agreement.loose_refs, 1, "{format:?}");
+        assert_eq!(agreement.effective_refs, 4, "{format:?}");
+        assert_eq!(agreement.manifest_refs, 4, "{format:?}");
+        assert_eq!(
+            agreement.head,
+            HeadStateV1::Symbolic {
+                target: "refs/heads/main".into(),
+                resolved: Some(oid_of('a', format)),
+            }
+        );
+    }
+}
+
+/// Packed-refs headers: the exact Git header, any subset of its three traits, or none at all, and an
+/// empty file or header-only file is a valid packed-refs with no rows.
+#[test]
+fn b1b_packed_refs_headers_and_empty_files() {
+    let format = GitObjectFormatV1::Sha1;
+    let rows = [("refs/heads/main", 'a', None)];
+    for header in [
+        PACKED_HEADER_V1,
+        "# pack-refs with: peeled fully-peeled sorted\n",
+        "# pack-refs with: peeled\n",
+        "# pack-refs with: sorted\n",
+        "# pack-refs with:\n",
+        "# pack-refs with: \n",
+        "",
+    ] {
+        let mut files = vec![file_of("HEAD", symbolic_file("refs/heads/main"))];
+        files.push(file_of("packed-refs", packed(format, header, &rows)));
+        pure(format, &files, &[])
+            .unwrap_or_else(|error| panic!("header {header:?} must parse: {error:?}"));
+    }
+    for content in [&b""[..], b"# pack-refs with: peeled fully-peeled sorted \n"] {
+        let mut files = vec![file_of("HEAD", symbolic_file("refs/heads/main"))];
+        files.push(file_of("packed-refs", content.to_vec()));
+        let agreement = pure(format, &files, &[]).expect("a packed-refs with no rows");
+        assert_eq!(agreement.packed_refs, 0);
+        assert_eq!(agreement.effective_refs, 0);
+    }
+}
+
+/// Every malformed packed-refs refuses with its own typed reason.
+#[test]
+fn b1b_malformed_packed_refs_refuse_with_typed_reasons() {
+    for format in BOTH_FORMATS_V1 {
+        let a = oid_of('a', format);
+        let c = oid_of('c', format);
+        let b = oid_of('b', format);
+        let header = PACKED_HEADER_V1;
+        let rows: Vec<(&str, String, RefsFaultV1)> = vec![
+            (
+                "an unknown trait",
+                "# pack-refs with: peeled bogus \n".into(),
+                row_fault("packed-refs", RowFaultV1::PackedHeader),
+            ),
+            (
+                "a repeated trait",
+                "# pack-refs with: sorted sorted \n".into(),
+                row_fault("packed-refs", RowFaultV1::PackedHeader),
+            ),
+            (
+                "a header without the colon",
+                "# pack-refs with peeled\n".into(),
+                row_fault("packed-refs", RowFaultV1::PackedHeader),
+            ),
+            (
+                "a header glued to its traits",
+                "# pack-refs with:peeled\n".into(),
+                row_fault("packed-refs", RowFaultV1::PackedHeader),
+            ),
+            (
+                "a comment that is not the header",
+                format!("# comment\n{a} refs/heads/main\n"),
+                row_fault("packed-refs", RowFaultV1::PackedHeader),
+            ),
+            (
+                "a second header",
+                format!("{header}{a} refs/heads/main\n{header}"),
+                row_fault("packed-refs", RowFaultV1::PackedHeader),
+            ),
+            (
+                "a header after a row",
+                format!("{a} refs/heads/main\n{header}"),
+                row_fault("packed-refs", RowFaultV1::PackedHeader),
+            ),
+            (
+                "a row without a name",
+                format!("{header}{a}\n"),
+                row_fault("packed-refs", RowFaultV1::PackedRow),
+            ),
+            (
+                "a row with two spaces",
+                format!("{header}{a}  refs/heads/main\n"),
+                name_fault(" refs/heads/main", RefNameFaultV1::NotUnderRefs),
+            ),
+            (
+                "a row with a bad object id",
+                format!("{header}{} refs/heads/main\n", a.to_uppercase()),
+                row_fault("packed-refs", RowFaultV1::ObjectId),
+            ),
+            (
+                "a row with a short object id",
+                format!("{header}{} refs/heads/main\n", &a[1..]),
+                row_fault("packed-refs", RowFaultV1::ObjectId),
+            ),
+            (
+                "a row with a bad name",
+                format!("{header}{a} refs/heads/x.lock\n"),
+                name_fault("refs/heads/x.lock", RefNameFaultV1::LockSuffix),
+            ),
+            (
+                "a row outside refs/",
+                format!("{header}{a} HEAD\n"),
+                name_fault("HEAD", RefNameFaultV1::NotUnderRefs),
+            ),
+            (
+                "a row with a CR",
+                format!("{header}{a} refs/heads/main\r\n"),
+                name_fault(
+                    "refs/heads/main\r",
+                    RefNameFaultV1::Portable(PortableFaultV1::Unprintable),
+                ),
+            ),
+            (
+                "a missing final newline",
+                format!("{header}{a} refs/heads/main"),
+                row_fault("packed-refs", RowFaultV1::PartialLine),
+            ),
+            (
+                "a blank line",
+                format!("{header}\n{a} refs/heads/main\n"),
+                row_fault("packed-refs", RowFaultV1::PackedRow),
+            ),
+            (
+                "a peeled row first",
+                format!("{header}^{a}\n{a} refs/heads/main\n"),
+                row_fault("packed-refs", RowFaultV1::PeeledOrphan),
+            ),
+            (
+                "two peeled rows",
+                format!("{header}{c} refs/tags/v1\n^{a}\n^{b}\n"),
+                row_fault("packed-refs", RowFaultV1::PeeledOrphan),
+            ),
+            (
+                "a peeled row with a bad object id",
+                format!("{header}{c} refs/tags/v1\n^{}\n", a.to_uppercase()),
+                row_fault("packed-refs", RowFaultV1::ObjectId),
+            ),
+            (
+                "an empty peeled row",
+                format!("{header}{c} refs/tags/v1\n^\n"),
+                row_fault("packed-refs", RowFaultV1::ObjectId),
+            ),
+            (
+                "rows out of order under the sorted trait",
+                format!("{header}{a} refs/heads/b\n{a} refs/heads/a\n"),
+                row_fault("packed-refs", RowFaultV1::PackedOrder),
+            ),
+            (
+                "a repeated name under the sorted trait",
+                format!("{header}{a} refs/heads/a\n{a} refs/heads/a\n"),
+                row_fault("packed-refs", RowFaultV1::PackedOrder),
+            ),
+            (
+                "a repeated name without the sorted trait",
+                format!("# pack-refs with: peeled \n{a} refs/heads/a\n{b} refs/heads/a\n"),
+                row_fault("packed-refs", RowFaultV1::PackedDuplicate),
+            ),
+        ];
+        for (row, content, expected) in rows {
+            let files = vec![
+                file_of("HEAD", symbolic_file("refs/heads/main")),
+                file_of("packed-refs", content.into_bytes()),
+            ];
+            assert_eq!(
+                fault_of(pure(format, &files, &[]), row),
+                expected,
+                "{format:?}: {row}"
+            );
+        }
+        // Out of order without the sorted trait is fine: only the header promises an order.
+        let files = vec![
+            file_of("HEAD", symbolic_file("refs/heads/main")),
+            file_of(
+                "packed-refs",
+                format!("# pack-refs with: peeled \n{a} refs/heads/b\n{a} refs/heads/a\n")
+                    .into_bytes(),
+            ),
+        ];
+        pure(format, &files, &[]).expect("unsorted rows without the sorted trait");
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// FETCH_HEAD and reflogs
+// ---------------------------------------------------------------------------------------------
+
+fn fetch_head(format: GitObjectFormatV1, rows: &[(char, &str, &str)]) -> Vec<u8> {
+    rows.iter()
+        .map(|(fill, flag, note)| format!("{}\t{flag}\t{note}\n", oid_of(*fill, format)))
+        .collect::<String>()
+        .into_bytes()
+}
+
+/// FETCH_HEAD rows are `<oid> TAB (empty | not-for-merge) TAB <note> LF`; the first row's object is the
+/// ref's value, and every row's object must be in the inventory. Empty is a valid FETCH_HEAD.
+#[test]
+fn b1b_fetch_head_rows_parse_and_the_first_row_is_the_value() {
+    for format in BOTH_FORMATS_V1 {
+        let mut files = base_files(format);
+        files.push(file_of(
+            "FETCH_HEAD",
+            fetch_head(
+                format,
+                &[
+                    ('b', "", "branch 'main' of https://example.invalid/r"),
+                    (
+                        'a',
+                        "not-for-merge",
+                        "branch 'side' of https://example.invalid/r",
+                    ),
+                    (
+                        'c',
+                        "not-for-merge",
+                        "tag 'v1' of https://example.invalid/r",
+                    ),
+                    ('d', "", ""),
+                ],
+            ),
+        ));
+        let agreement = pure(format, &files, &[("FETCH_HEAD", WantV1::Direct('b'))])
+            .unwrap_or_else(|error| panic!("{format:?}: {error:?}"));
+        assert_eq!(agreement.fetch_head_rows, 4);
+        assert_eq!(agreement.manifest_refs, 1);
+        // The second row's object is not the ref's value.
+        assert_eq!(
+            fault_of(
+                pure(format, &files, &[("FETCH_HEAD", WantV1::Direct('a'))]),
+                "the second row"
+            ),
+            RefsFaultV1::OriginalMismatch {
+                name: "FETCH_HEAD".into(),
+                expected: format!("direct {}", oid_of('a', format)),
+                found: format!("direct {}", oid_of('b', format)),
+            }
+        );
+        let mut empty_files = base_files(format);
+        empty_files.push(file_of("FETCH_HEAD", Vec::new()));
+        let agreement = pure(format, &empty_files, &[]).expect("an empty FETCH_HEAD");
+        assert_eq!(agreement.fetch_head_rows, 0);
+        // An empty FETCH_HEAD has no value for the manifest's FETCH_HEAD.
+        assert_eq!(
+            fault_of(
+                pure(format, &empty_files, &[("FETCH_HEAD", WantV1::Direct('a'))]),
+                "no first row"
+            ),
+            RefsFaultV1::MissingOriginal {
+                name: "FETCH_HEAD".into()
+            }
+        );
+    }
+}
+
+#[test]
+fn b1b_malformed_fetch_head_refuses_with_typed_reasons() {
+    for format in BOTH_FORMATS_V1 {
+        let a = oid_of('a', format);
+        let rows: Vec<(&str, String, RowFaultV1)> = vec![
+            (
+                "a bad flag",
+                format!("{a}\tmerge\tnote\n"),
+                RowFaultV1::FetchHeadRow,
+            ),
+            (
+                "no tabs",
+                format!("{a} not-for-merge note\n"),
+                RowFaultV1::FetchHeadRow,
+            ),
+            ("one tab", format!("{a}\t\n"), RowFaultV1::FetchHeadRow),
+            ("a bare oid", format!("{a}\n"), RowFaultV1::FetchHeadRow),
+            (
+                "an upper-case oid",
+                format!("{}\t\tnote\n", a.to_uppercase()),
+                RowFaultV1::ObjectId,
+            ),
+            (
+                "a short oid",
+                format!("{}\t\tnote\n", &a[1..]),
+                RowFaultV1::ObjectId,
+            ),
+            (
+                "no final newline",
+                format!("{a}\t\tnote"),
+                RowFaultV1::PartialLine,
+            ),
+            (
+                "a blank row",
+                format!("{a}\t\tnote\n\n"),
+                RowFaultV1::FetchHeadRow,
+            ),
+            (
+                "a NUL in the note",
+                format!("{a}\t\tno\0te\n"),
+                RowFaultV1::FetchHeadRow,
+            ),
+        ];
+        for (row, content, why) in rows {
+            let mut files = base_files(format);
+            files.push(file_of("FETCH_HEAD", content.into_bytes()));
+            assert_eq!(
+                fault_of(pure(format, &files, &[]), row),
+                row_fault("FETCH_HEAD", why),
+                "{format:?}: {row}"
+            );
+        }
+    }
+}
+
+fn log_row(format: GitObjectFormatV1, old: char, new: char, tail: &str) -> String {
+    format!("{} {} {tail}\n", oid_of(old, format), oid_of(new, format))
+}
+
+const IDENT_V1: &str = "A U Thor <author@example.invalid> 1700000000 +0000";
+
+/// Reflogs are `logs/HEAD` and `logs/refs/<ref name>`: each row is two object ids, an identity ending in
+/// `>`, a timestamp, a zone, and an optional TAB message; the object ids need not be in the inventory (a
+/// reflog may name an object that is gone), but they are the format's width. An empty log is valid.
+#[test]
+fn b1b_reflogs_parse_streaming_and_count_their_rows() {
+    for format in BOTH_FORMATS_V1 {
+        let mut files = base_files(format);
+        let head_log = [
+            log_row(
+                format,
+                '0',
+                'a',
+                &format!("{IDENT_V1}\tcommit (initial): one"),
+            ),
+            log_row(format, 'a', 'b', &format!("{IDENT_V1}\tcheckout: moving")),
+            log_row(format, 'b', 'a', IDENT_V1),
+            log_row(
+                format,
+                '0',
+                '9',
+                "N <n@e> 0 -1200\tmessage with <angle> brackets and a\u{e9}",
+            ),
+        ]
+        .concat();
+        files.push(file_of("logs/HEAD", head_log.into_bytes()));
+        files.push(file_of(
+            "logs/refs/heads/main",
+            log_row(format, '0', 'a', IDENT_V1).into_bytes(),
+        ));
+        files.push(file_of("logs/refs/stash", Vec::new()));
+        let agreement =
+            pure(format, &files, &[]).unwrap_or_else(|error| panic!("{format:?}: {error:?}"));
+        assert_eq!(agreement.reflog_files, 3, "{format:?}");
+        assert_eq!(agreement.reflog_rows, 5, "{format:?}");
+    }
+}
+
+#[test]
+fn b1b_malformed_reflogs_refuse_with_typed_reasons() {
+    for format in BOTH_FORMATS_V1 {
+        let (a, b) = (oid_of('a', format), oid_of('b', format));
+        let rows: Vec<(&str, String, RowFaultV1)> = vec![
+            (
+                "one object id",
+                format!("{a} {IDENT_V1}\n"),
+                RowFaultV1::LogRow,
+            ),
+            (
+                "an upper-case old id",
+                format!("{} {b} {IDENT_V1}\n", a.to_uppercase()),
+                RowFaultV1::LogRow,
+            ),
+            (
+                "a short new id",
+                format!("{a} {} {IDENT_V1}\n", &b[1..]),
+                RowFaultV1::LogRow,
+            ),
+            (
+                "two spaces after the old id",
+                format!("{a}  {b} {IDENT_V1}\n"),
+                RowFaultV1::LogRow,
+            ),
+            (
+                "an identity without an address",
+                format!("{a} {b} A U Thor 1700000000 +0000\n"),
+                RowFaultV1::LogRow,
+            ),
+            (
+                "an address that never opens",
+                format!("{a} {b} A U Thor> 1700000000 +0000\n"),
+                RowFaultV1::LogRow,
+            ),
+            (
+                "an address that never closes",
+                format!("{a} {b} A U Thor <author@example.invalid 1700000000 +0000\n"),
+                RowFaultV1::LogRow,
+            ),
+            (
+                "no identity",
+                format!("{a} {b} 1700000000 +0000\n"),
+                RowFaultV1::LogRow,
+            ),
+            (
+                "a timestamp that is not digits",
+                format!("{a} {b} A <a@e> 17x0000000 +0000\n"),
+                RowFaultV1::LogRow,
+            ),
+            (
+                "a missing timestamp",
+                format!("{a} {b} A <a@e> +0000\n"),
+                RowFaultV1::LogRow,
+            ),
+            (
+                "a zone without a sign",
+                format!("{a} {b} A <a@e> 1700000000 0000\n"),
+                RowFaultV1::LogRow,
+            ),
+            (
+                "a short zone",
+                format!("{a} {b} A <a@e> 1700000000 +000\n"),
+                RowFaultV1::LogRow,
+            ),
+            (
+                "a zone with letters",
+                format!("{a} {b} A <a@e> 1700000000 +00x0\n"),
+                RowFaultV1::LogRow,
+            ),
+            (
+                "a blank row",
+                format!("{a} {b} {IDENT_V1}\n\n"),
+                RowFaultV1::LogRow,
+            ),
+            (
+                "a NUL in the message",
+                format!("{a} {b} {IDENT_V1}\tme\0ssage\n"),
+                RowFaultV1::LogRow,
+            ),
+            (
+                "no final newline",
+                format!("{a} {b} {IDENT_V1}"),
+                RowFaultV1::PartialLine,
+            ),
+        ];
+        for (row, content, why) in rows {
+            let mut files = base_files(format);
+            files.push(file_of("logs/HEAD", content.into_bytes()));
+            assert_eq!(
+                fault_of(pure(format, &files, &[]), row),
+                row_fault("logs/HEAD", why),
+                "{format:?}: {row}"
+            );
+        }
+    }
+}
+
+/// A reflog's path is judged as a ref name: `logs/refs/heads/x.lock` and `logs/refs/a..b` refuse, and
+/// only `logs/HEAD` and `logs/refs/**` are reflogs.
+#[test]
+fn b1b_reflog_paths_are_ref_names() {
+    let format = GitObjectFormatV1::Sha1;
+    for (path, name, why) in [
+        (
+            "logs/refs/heads/x.lock",
+            "refs/heads/x.lock",
+            RefNameFaultV1::LockSuffix,
+        ),
+        ("logs/refs/a..b", "refs/a..b", RefNameFaultV1::DoubleDot),
+        (
+            "logs/refs/heads/a b",
+            "refs/heads/a b",
+            RefNameFaultV1::Portable(PortableFaultV1::Unprintable),
+        ),
+    ] {
+        let mut files = base_files(format);
+        files.push(file_of(path, Vec::new()));
+        assert_eq!(
+            fault_of(pure(format, &files, &[]), path),
+            name_fault(name, why),
+            "{path}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Agreement: HEAD states, precedence, resolution, kinds, targets, and the manifest
+// ---------------------------------------------------------------------------------------------
+
+/// Attached, detached, and unborn HEAD agree with the manifest in both formats; an unborn HEAD needs no
+/// object at all (an Empty database), and `Unborn` and `Symbolic` both describe it.
+#[test]
+fn b1b_attached_detached_and_unborn_heads_agree_with_the_manifest() {
+    for format in BOTH_FORMATS_V1 {
+        let attached = pure(
+            format,
+            &base_files(format),
+            &[
+                ("HEAD", WantV1::Symbolic("refs/heads/main")),
+                ("refs/heads/main", WantV1::Direct('a')),
+            ],
+        )
+        .unwrap_or_else(|error| panic!("{format:?}: {error:?}"));
+        assert_eq!(
+            attached.head,
+            HeadStateV1::Symbolic {
+                target: "refs/heads/main".into(),
+                resolved: Some(oid_of('a', format)),
+            }
+        );
+        assert_eq!((attached.manifest_refs, attached.direct_targets), (2, 1));
+
+        let detached = pure(
+            format,
+            &[file_of("HEAD", direct_file('a', format))],
+            &[("HEAD", WantV1::Direct('a'))],
+        )
+        .unwrap_or_else(|error| panic!("{format:?}: {error:?}"));
+        assert_eq!(
+            detached.head,
+            HeadStateV1::Detached {
+                oid: oid_of('a', format)
+            }
+        );
+        assert_eq!((detached.manifest_refs, detached.direct_targets), (1, 1));
+
+        // Unborn: an Empty database, a HEAD naming a branch that does not exist.
+        let unborn_files = [file_of("HEAD", symbolic_file("refs/heads/main"))];
+        for refs in [
+            &[][..],
+            &[("HEAD", WantV1::Symbolic("refs/heads/main"))][..],
+            &[("HEAD", WantV1::Unborn)][..],
+        ] {
+            let unborn = pure_run(format, false, &unborn_files, refs, RefsLimitsV1::v1())
+                .unwrap_or_else(|error| panic!("{format:?} {}: {error:?}", refs.len()));
+            assert_eq!(
+                unborn.head,
+                HeadStateV1::Symbolic {
+                    target: "refs/heads/main".into(),
+                    resolved: None,
+                }
+            );
+            assert_eq!((unborn.direct_targets, unborn.effective_refs), (0, 0));
+        }
+        // Detached HEAD in an Empty database has no object to name: absent, not unborn.
+        assert_eq!(
+            fault_of(
+                pure_run(
+                    format,
+                    false,
+                    &[file_of("HEAD", direct_file('a', format))],
+                    &[],
+                    RefsLimitsV1::v1()
+                ),
+                "an empty inventory"
+            ),
+            RefsFaultV1::TargetAbsent {
+                name: "HEAD".into(),
+                oid: oid_of('a', format)
+            }
+        );
+        // No HEAD at all is not an unborn HEAD: exactly one valid HEAD is required.
+        assert_eq!(
+            fault_of(
+                pure(
+                    format,
+                    &[file_of("refs/heads/main", direct_file('a', format))],
+                    &[]
+                ),
+                "no HEAD"
+            ),
+            RefsFaultV1::MissingHead
+        );
+    }
+}
+
+/// A loose ref hides a packed ref of the same name (direct or symbolic); a packed-only ref is a ref and
+/// can be HEAD's target. A packed row that a loose ref hides still names an object that must exist.
+#[test]
+fn b1b_loose_refs_win_over_packed_refs_and_packed_only_refs_count() {
+    let format = GitObjectFormatV1::Sha1;
+    let header = PACKED_HEADER_V1;
+    let rows = |extra: &[(&str, char, Option<char>)]| packed(format, header, extra);
+    let head = file_of("HEAD", symbolic_file("refs/heads/main"));
+
+    let mut files = vec![
+        head.clone(),
+        file_of("packed-refs", rows(&[("refs/heads/main", 'a', None)])),
+        file_of("refs/heads/main", direct_file('b', format)),
+    ];
+    pure(format, &files, &[("refs/heads/main", WantV1::Direct('b'))]).expect("the loose value");
+    assert_eq!(
+        fault_of(
+            pure(format, &files, &[("refs/heads/main", WantV1::Direct('a'))]),
+            "the packed value is hidden"
+        ),
+        RefsFaultV1::OriginalMismatch {
+            name: "refs/heads/main".into(),
+            expected: format!("direct {}", oid_of('a', format)),
+            found: format!("direct {}", oid_of('b', format)),
+        }
+    );
+    // HEAD resolves through the loose value, not the packed one.
+    let agreement = pure(format, &files, &[]).expect("loose over packed");
+    assert_eq!(
+        agreement.head,
+        HeadStateV1::Symbolic {
+            target: "refs/heads/main".into(),
+            resolved: Some(oid_of('b', format)),
+        }
+    );
+
+    // Packed only: HEAD resolves through the packed row.
+    files = vec![
+        head.clone(),
+        file_of("packed-refs", rows(&[("refs/heads/main", 'a', None)])),
+    ];
+    let agreement = pure(format, &files, &[("refs/heads/main", WantV1::Direct('a'))])
+        .expect("a packed-only ref");
+    assert_eq!(
+        agreement.head,
+        HeadStateV1::Symbolic {
+            target: "refs/heads/main".into(),
+            resolved: Some(oid_of('a', format)),
+        }
+    );
+    assert_eq!(agreement.loose_refs, 0);
+
+    // A loose symbolic ref hides a packed direct one.
+    files = vec![
+        head.clone(),
+        file_of(
+            "packed-refs",
+            rows(&[
+                ("refs/heads/alias", 'a', None),
+                ("refs/heads/main", 'a', None),
+            ]),
+        ),
+        file_of("refs/heads/alias", symbolic_file("refs/heads/main")),
+    ];
+    pure(
+        format,
+        &files,
+        &[("refs/heads/alias", WantV1::Symbolic("refs/heads/main"))],
+    )
+    .expect("the loose symbolic ref wins");
+    assert_eq!(
+        fault_of(
+            pure(format, &files, &[("refs/heads/alias", WantV1::Direct('a'))]),
+            "the packed direct value is hidden"
+        ),
+        RefsFaultV1::OriginalMismatch {
+            name: "refs/heads/alias".into(),
+            expected: format!("direct {}", oid_of('a', format)),
+            found: "symbolic refs/heads/main".into(),
+        }
+    );
+
+    // A packed row that a loose ref hides is not an active target: its stale object (here absent from the
+    // inventory, as after `pack-refs`, a branch advance, and a prune) is not required.
+    files = vec![
+        head,
+        file_of("packed-refs", rows(&[("refs/heads/hidden", '7', None)])),
+        file_of("refs/heads/hidden", direct_file('a', format)),
+    ];
+    let agreement = pure(
+        format,
+        &files,
+        &[("refs/heads/hidden", WantV1::Direct('a'))],
+    )
+    .expect("a shadowed stale packed row");
+    assert_eq!((agreement.packed_refs, agreement.effective_refs), (1, 1));
+    assert_eq!(
+        agreement.direct_targets, 1,
+        "only the loose value is active"
+    );
+}
+
+/// A shadowed packed row is judged structurally and nothing more: its object, its kind, and its peeled
+/// value (absent, of the wrong kind, a tag without a peel under `fully-peeled`) are never consulted, while
+/// every grammar rule, order, and name rule still applies to it, a row nothing shadows is still held to
+/// all of them, and a different name shadows nothing.
+#[test]
+fn b1b_a_shadowed_packed_row_is_not_an_active_target() {
+    for format in BOTH_FORMATS_V1 {
+        let missing = '7';
+        let head = file_of("HEAD", symbolic_file("refs/heads/main"));
+        let header = PACKED_HEADER_V1;
+        let loose = |path: &'static str, fill: char| file_of(path, direct_file(fill, format));
+        let rows = |list: &[(&str, char, Option<char>)]| {
+            file_of("packed-refs", packed(format, header, list))
+        };
+        // Stale objects the inventory lacks, a wrong kind under a branch, a tag with no peeled row, a peeled
+        // value that is absent and one that is itself a tag: all behind loose refs of the same names.
+        let stale = rows(&[
+            ("refs/heads/absent", missing, None),
+            ("refs/heads/blob", 'e', None),
+            ("refs/tags/bare", 'c', None),
+            ("refs/tags/gone", 'c', Some(missing)),
+            ("refs/tags/nontag", 'a', Some('b')),
+            ("refs/tags/tagged", 'c', Some('c')),
+        ]);
+        let shadows = vec![
+            head.clone(),
+            stale.clone(),
+            loose("refs/heads/absent", 'a'),
+            loose("refs/heads/blob", 'b'),
+            loose("refs/tags/bare", 'c'),
+            loose("refs/tags/gone", 'c'),
+            loose("refs/tags/tagged", 'c'),
+            // A loose SYMBOLIC ref hides a packed one too.
+            file_of("refs/tags/nontag", symbolic_file("refs/heads/absent")),
+        ];
+        let agreement = pure(format, &shadows, &[])
+            .unwrap_or_else(|error| panic!("{format:?}: the stale rows are shadowed: {error:?}"));
+        assert_eq!(agreement.packed_refs, 6, "{format:?}");
+        assert_eq!(agreement.peeled_rows, 3, "{format:?}");
+        assert_eq!(agreement.effective_refs, 6, "{format:?}");
+        // The active direct objects are only the loose ones: a, b, and c.
+        assert_eq!(agreement.direct_targets, 3, "{format:?}");
+
+        // Nothing shadows a row of another name, and an unshadowed row is held to every closure rule.
+        let kind_fault = |name: &str, oid: char, found: &'static str| RefsFaultV1::TargetKind {
+            name: name.into(),
+            oid: oid_of(oid, format),
+            found,
+            expected: "commit",
+        };
+        let rejected: Vec<(&str, Vec<FileV1>, RefsFaultV1)> = vec![
+            (
+                "an absent object, shadowed by another name",
+                vec![
+                    head.clone(),
+                    rows(&[("refs/heads/absent", missing, None)]),
+                    loose("refs/heads/absent-not", 'a'),
+                ],
+                RefsFaultV1::TargetAbsent {
+                    name: "refs/heads/absent".into(),
+                    oid: oid_of(missing, format),
+                },
+            ),
+            (
+                "an absent object, shadowed only by its prefix",
+                vec![
+                    head.clone(),
+                    rows(&[("refs/heads/absent", missing, None)]),
+                    loose("refs/heads", 'a'),
+                ],
+                // `refs/heads` as a ref conflicts with the packed name under it: structure is judged first.
+                RefsFaultV1::Conflict {
+                    name: "refs/heads/absent".into(),
+                    with: "refs/heads".into(),
+                },
+            ),
+            (
+                "a branch on a blob",
+                vec![head.clone(), rows(&[("refs/heads/blob", 'e', None)])],
+                kind_fault("refs/heads/blob", 'e', "blob"),
+            ),
+            (
+                "a tag with no peeled row under fully-peeled",
+                vec![head.clone(), rows(&[("refs/tags/bare", 'c', None)])],
+                RefsFaultV1::PeelMissing {
+                    name: "refs/tags/bare".into(),
+                },
+            ),
+            (
+                "an absent peeled value",
+                vec![
+                    head.clone(),
+                    rows(&[("refs/tags/gone", 'c', Some(missing))]),
+                ],
+                RefsFaultV1::TargetAbsent {
+                    name: "refs/tags/gone".into(),
+                    oid: oid_of(missing, format),
+                },
+            ),
+            (
+                "a peeled value that is a tag",
+                vec![head.clone(), rows(&[("refs/tags/tagged", 'c', Some('c'))])],
+                RefsFaultV1::PeeledIsTag {
+                    name: "refs/tags/tagged".into(),
+                },
+            ),
+            (
+                "a peeled row under a commit",
+                vec![head.clone(), rows(&[("refs/tags/nontag", 'a', Some('b'))])],
+                RefsFaultV1::PeeledNotTag {
+                    name: "refs/tags/nontag".into(),
+                },
+            ),
+        ];
+        for (row, files, expected) in rejected {
+            assert_eq!(
+                fault_of(pure(format, &files, &[]), row),
+                expected,
+                "{format:?}: {row}"
+            );
+        }
+
+        // The grammar of a shadowed row is still judged: a malformed row, a bad name, a repeated name, and
+        // rows out of order under `sorted` refuse even when a loose ref shadows every one of them.
+        let a = oid_of('a', format);
+        let bad: Vec<(&str, String, RefsFaultV1)> = vec![
+            (
+                "a bad object id",
+                format!("{header}{} refs/heads/main\n", a.to_uppercase()),
+                row_fault("packed-refs", RowFaultV1::ObjectId),
+            ),
+            (
+                "a bad name",
+                format!("{header}{a} refs/heads/main.lock\n"),
+                name_fault("refs/heads/main.lock", RefNameFaultV1::LockSuffix),
+            ),
+            (
+                "rows out of order",
+                format!("{header}{a} refs/heads/main\n{a} refs/heads/a\n"),
+                row_fault("packed-refs", RowFaultV1::PackedOrder),
+            ),
+            (
+                "an orphan peeled row",
+                format!("{header}^{a}\n{a} refs/heads/main\n"),
+                row_fault("packed-refs", RowFaultV1::PeeledOrphan),
+            ),
+        ];
+        for (row, content, expected) in bad {
+            let files = vec![
+                head.clone(),
+                file_of("packed-refs", content.into_bytes()),
+                loose("refs/heads/main", 'a'),
+                loose("refs/heads/a", 'a'),
+            ];
+            assert_eq!(
+                fault_of(pure(format, &files, &[]), row),
+                expected,
+                "{format:?}: {row}"
+            );
+        }
+
+        // Case collisions and conflicts are still judged across shadowed names.
+        let files = vec![
+            head.clone(),
+            rows(&[("refs/heads/Main", missing, None)]),
+            loose("refs/heads/main", 'a'),
+        ];
+        assert_eq!(
+            fault_of(pure(format, &files, &[]), "a shadowed collision"),
+            RefsFaultV1::Collision {
+                name: "refs/heads/main".into(),
+                with: "refs/heads/Main".into(),
+            },
+            "{format:?}"
+        );
+    }
+}
+
+/// `n` symbolic refs starting at HEAD, each naming the next, the last naming `last`.
+fn chain_files(n: usize, last: &'static str, format: GitObjectFormatV1) -> Vec<FileV1> {
+    let names: Vec<&'static str> = (1..n)
+        .map(|index| &*Box::leak(format!("refs/heads/s{index}").into_boxed_str()))
+        .collect();
+    let mut files = Vec::new();
+    for index in 0..n {
+        let target = names.get(index).copied().unwrap_or(last);
+        let path = if index == 0 { "HEAD" } else { names[index - 1] };
+        files.push(file_of(path, symbolic_file(target)));
+    }
+    files.push(file_of("refs/heads/main", direct_file('a', format)));
+    files
+}
+
+/// A chain may follow at most five symbolic refs (Git's own bound): five, ending in a value or in an
+/// unborn branch, resolve; six refuse. Ending in an absent ref is unborn only for HEAD or a manifest
+/// `Unborn`, so the unborn chain declares each hop `Unborn`.
+#[test]
+fn b1b_symbolic_chains_are_bounded_at_five() {
+    for format in BOTH_FORMATS_V1 {
+        let agreement = pure(format, &chain_files(5, "refs/heads/main", format), &[])
+            .unwrap_or_else(|error| panic!("{format:?}: {error:?}"));
+        assert_eq!(
+            agreement.head,
+            HeadStateV1::Symbolic {
+                target: "refs/heads/s1".into(),
+                resolved: Some(oid_of('a', format)),
+            }
+        );
+        assert_eq!(agreement.symbolic_refs, 4);
+        assert_eq!(
+            fault_of(
+                pure(format, &chain_files(6, "refs/heads/main", format), &[]),
+                "six symbolic refs"
+            ),
+            RefsFaultV1::TooDeep {
+                name: "HEAD".into()
+            }
+        );
+        // The same bound for an unborn tail.
+        let unborn = |n: usize| {
+            let mut files = chain_files(n, "refs/heads/gone", format);
+            files.pop();
+            let refs: Vec<(&str, WantV1)> = std::iter::once(("HEAD", WantV1::Unborn))
+                .chain((1..n).map(|index| {
+                    (
+                        &*Box::leak(format!("refs/heads/s{index}").into_boxed_str()),
+                        WantV1::Unborn,
+                    )
+                }))
+                .collect();
+            pure(format, &files, &refs)
+        };
+        let agreement = unborn(5).unwrap_or_else(|error| panic!("{format:?}: {error:?}"));
+        assert!(matches!(
+            agreement.head,
+            HeadStateV1::Symbolic { resolved: None, .. }
+        ));
+        assert_eq!(
+            fault_of(unborn(6), "six symbolic refs ending unborn"),
+            RefsFaultV1::TooDeep {
+                name: "HEAD".into()
+            }
+        );
+    }
+}
+
+/// Cycles fail closed, whatever their shape: HEAD in a loop, a self loop, a loop that HEAD is not in, a
+/// ring short enough to close within the bound (a cycle) and one too long to (too deep).
+#[test]
+fn b1b_symbolic_cycles_fail_closed() {
+    let format = GitObjectFormatV1::Sha1;
+    let main = file_of("refs/heads/main", direct_file('a', format));
+    let cycle = |name: &str| RefsFaultV1::Cycle { name: name.into() };
+
+    let files = vec![
+        file_of("HEAD", symbolic_file("refs/heads/a")),
+        file_of("refs/heads/a", symbolic_file("refs/heads/b")),
+        file_of("refs/heads/b", symbolic_file("refs/heads/a")),
+    ];
+    assert_eq!(
+        fault_of(pure(format, &files, &[]), "HEAD in a loop"),
+        cycle("HEAD")
+    );
+
+    let files = vec![
+        file_of("HEAD", symbolic_file("refs/heads/main")),
+        main.clone(),
+        file_of("refs/heads/self", symbolic_file("refs/heads/self")),
+    ];
+    assert_eq!(
+        fault_of(pure(format, &files, &[]), "a self loop"),
+        cycle("refs/heads/self")
+    );
+
+    let files = vec![
+        file_of("HEAD", symbolic_file("refs/heads/main")),
+        main.clone(),
+        file_of("refs/heads/a", symbolic_file("refs/heads/b")),
+        file_of("refs/heads/b", symbolic_file("refs/heads/a")),
+    ];
+    assert_eq!(
+        fault_of(pure(format, &files, &[]), "a loop beside HEAD"),
+        cycle("refs/heads/a")
+    );
+
+    // A loop through a packed ref cannot exist (packed refs are direct), so a symbolic loop in loose refs
+    // is the only kind; rings of six and seven close at, and past, the bound.
+    for (ring, expected) in [
+        (6, cycle("refs/heads/r1")),
+        (
+            7,
+            RefsFaultV1::TooDeep {
+                name: "refs/heads/r1".into(),
+            },
+        ),
+    ] {
+        let name = |index: usize| -> &'static str {
+            Box::leak(format!("refs/heads/r{index}").into_boxed_str())
+        };
+        let mut files = vec![
+            file_of("HEAD", symbolic_file("refs/heads/main")),
+            main.clone(),
+        ];
+        for index in 1..=ring {
+            let next = if index == ring { 1 } else { index + 1 };
+            files.push(file_of(name(index), symbolic_file(name(next))));
+        }
+        assert_eq!(
+            fault_of(pure(format, &files, &[]), &format!("a ring of {ring}")),
+            expected,
+            "a ring of {ring}"
+        );
+    }
+}
+
+/// Only HEAD may be unborn on its own; any other symbolic ref whose chain ends in a missing ref is
+/// refused as dangling unless the manifest says it is `Unborn`.
+#[test]
+fn b1b_dangling_symbolic_refs_refuse_unless_head_or_declared_unborn() {
+    for format in BOTH_FORMATS_V1 {
+        let mut files = base_files(format);
+        files.push(file_of(
+            "refs/remotes/origin/HEAD",
+            symbolic_file("refs/remotes/origin/main"),
+        ));
+        assert_eq!(
+            fault_of(pure(format, &files, &[]), "a dangling remote HEAD"),
+            RefsFaultV1::Dangling {
+                name: "refs/remotes/origin/HEAD".into(),
+                target: "refs/remotes/origin/main".into(),
+            }
+        );
+        // A manifest that says it is unborn makes it so; a manifest that merely says it is symbolic does
+        // not, because the target is still absent.
+        pure(
+            format,
+            &files,
+            &[("refs/remotes/origin/HEAD", WantV1::Unborn)],
+        )
+        .expect("declared unborn");
+        assert_eq!(
+            fault_of(
+                pure(
+                    format,
+                    &files,
+                    &[(
+                        "refs/remotes/origin/HEAD",
+                        WantV1::Symbolic("refs/remotes/origin/main")
+                    )],
+                ),
+                "declared symbolic only"
+            ),
+            RefsFaultV1::Dangling {
+                name: "refs/remotes/origin/HEAD".into(),
+                target: "refs/remotes/origin/main".into(),
+            }
+        );
+        // The target may be absent after more than one hop: the last name is the absent one.
+        let files = vec![
+            file_of("HEAD", symbolic_file("refs/heads/main")),
+            file_of("refs/heads/main", direct_file('a', format)),
+            file_of("refs/heads/x", symbolic_file("refs/heads/y")),
+            file_of("refs/heads/y", symbolic_file("refs/heads/z")),
+        ];
+        assert_eq!(
+            fault_of(pure(format, &files, &[]), "two hops to nothing"),
+            RefsFaultV1::Dangling {
+                name: "refs/heads/x".into(),
+                target: "refs/heads/z".into(),
+            }
+        );
+    }
+}
+
+/// Kind rules: `refs/heads/**`, a detached or resolved HEAD, and ORIG_HEAD must name a commit; other refs
+/// may name any known kind; an object of unknown kind is refused wherever it is named.
+#[test]
+fn b1b_object_kinds_are_validated() {
+    for format in BOTH_FORMATS_V1 {
+        let kind_fault = |name: &str, fill: char, found: &'static str| RefsFaultV1::TargetKind {
+            name: name.into(),
+            oid: oid_of(fill, format),
+            found,
+            expected: "commit",
+        };
+        for (fill, found) in [('c', "tag"), ('d', "tree"), ('e', "blob")] {
+            let mut files = base_files(format);
+            files.push(file_of("refs/heads/x", direct_file(fill, format)));
+            assert_eq!(
+                fault_of(pure(format, &files, &[]), "a head"),
+                kind_fault("refs/heads/x", fill, found)
+            );
+            assert_eq!(
+                fault_of(
+                    pure(format, &[file_of("HEAD", direct_file(fill, format))], &[]),
+                    "a detached HEAD"
+                ),
+                kind_fault("HEAD", fill, found)
+            );
+            let mut files = base_files(format);
+            files.push(file_of("ORIG_HEAD", direct_file(fill, format)));
+            assert_eq!(
+                fault_of(pure(format, &files, &[]), "ORIG_HEAD"),
+                kind_fault("ORIG_HEAD", fill, found)
+            );
+            // A symbolic HEAD or head resolves to a non-commit through a tag ref.
+            let files = vec![
+                file_of("HEAD", symbolic_file("refs/tags/t")),
+                file_of("refs/tags/t", direct_file(fill, format)),
+            ];
+            assert_eq!(
+                fault_of(pure(format, &files, &[]), "HEAD resolving to a non-commit"),
+                kind_fault("HEAD", fill, found)
+            );
+            let mut files = base_files(format);
+            files.push(file_of("refs/tags/t", direct_file(fill, format)));
+            files.push(file_of("refs/heads/alias", symbolic_file("refs/tags/t")));
+            assert_eq!(
+                fault_of(
+                    pure(format, &files, &[]),
+                    "an alias resolving to a non-commit"
+                ),
+                kind_fault("refs/heads/alias", fill, found)
+            );
+        }
+        // Any known kind is a fine tag, note, or custom ref target.
+        let mut files = base_files(format);
+        for (path, fill) in [
+            ("refs/tags/a", 'a'),
+            ("refs/tags/c", 'c'),
+            ("refs/tags/d", 'd'),
+            ("refs/tags/e", 'e'),
+            ("refs/notes/commits", 'a'),
+            ("refs/custom/x", 'e'),
+        ] {
+            files.push(file_of(path, direct_file(fill, format)));
+        }
+        pure(format, &files, &[]).expect("known kinds under non-branch refs");
+        // An unknown kind is refused wherever it is named.
+        let mut files = base_files(format);
+        files.push(file_of("refs/tags/u", direct_file('f', format)));
+        assert_eq!(
+            fault_of(pure(format, &files, &[]), "an unknown kind"),
+            RefsFaultV1::TargetKind {
+                name: "refs/tags/u".into(),
+                oid: oid_of('f', format),
+                found: "unknown",
+                expected: "a known kind",
+            }
+        );
+    }
+}
+
+/// Every active direct target, from every place one can come from, must be in the inventory, even when
+/// the manifest lists none of the refs. The same ref is accepted once its object is in the inventory.
+#[test]
+fn b1b_every_extra_direct_target_must_be_in_the_inventory() {
+    for format in BOTH_FORMATS_V1 {
+        let missing = oid_of('7', format);
+        let absent = |name: &str| RefsFaultV1::TargetAbsent {
+            name: name.into(),
+            oid: missing.clone(),
+        };
+        let header = PACKED_HEADER_V1;
+        let loose = |path: &'static str, fill: char| file_of(path, direct_file(fill, format));
+        let cases: Vec<(&str, Vec<FileV1>, &str)> = vec![
+            (
+                "a loose ref",
+                vec![loose("refs/heads/x", '7')],
+                "refs/heads/x",
+            ),
+            (
+                "a loose tag",
+                vec![loose("refs/tags/t", '7')],
+                "refs/tags/t",
+            ),
+            (
+                "a packed row",
+                vec![file_of(
+                    "packed-refs",
+                    packed(format, header, &[("refs/heads/p", '7', None)]),
+                )],
+                "refs/heads/p",
+            ),
+            (
+                "a peeled row",
+                vec![file_of(
+                    "packed-refs",
+                    packed(format, header, &[("refs/tags/v1", 'c', Some('7'))]),
+                )],
+                "refs/tags/v1",
+            ),
+            ("ORIG_HEAD", vec![loose("ORIG_HEAD", '7')], "ORIG_HEAD"),
+            (
+                "a FETCH_HEAD row",
+                vec![file_of(
+                    "FETCH_HEAD",
+                    fetch_head(
+                        format,
+                        &[('a', "", "first"), ('7', "not-for-merge", "second")],
+                    ),
+                )],
+                "FETCH_HEAD",
+            ),
+        ];
+        for (row, extra, name) in cases {
+            let mut files = base_files(format);
+            files.extend(extra);
+            assert_eq!(
+                fault_of(pure(format, &files, &[]), row),
+                absent(name),
+                "{format:?}: {row}"
+            );
+        }
+        // With an empty inventory, any direct ref is absent.
+        assert_eq!(
+            fault_of(
+                pure_run(
+                    format,
+                    false,
+                    &[
+                        file_of("HEAD", symbolic_file("refs/heads/main")),
+                        loose("refs/heads/main", 'a')
+                    ],
+                    &[],
+                    RefsLimitsV1::v1()
+                ),
+                "an empty inventory"
+            ),
+            RefsFaultV1::TargetAbsent {
+                name: "refs/heads/main".into(),
+                oid: oid_of('a', format)
+            }
+        );
+        // And the same refs pass when their objects are present.
+        let mut files = base_files(format);
+        files.extend([
+            loose("refs/heads/x", 'b'),
+            loose("refs/tags/t", 'c'),
+            loose("ORIG_HEAD", 'a'),
+            file_of(
+                "packed-refs",
+                packed(format, header, &[("refs/tags/v1", 'c', Some('a'))]),
+            ),
+            file_of(
+                "FETCH_HEAD",
+                fetch_head(format, &[('a', "", "n"), ('e', "", "n")]),
+            ),
+        ]);
+        let agreement = pure(format, &files, &[]).expect("every target present");
+        // a (main/ORIG_HEAD/peeled/FETCH_HEAD), b, c, e.
+        assert_eq!(agreement.direct_targets, 4, "{format:?}");
+        assert_eq!(agreement.manifest_refs, 0);
+    }
+}
+
+/// Peeled rows are checked against object kinds: only a tag has a peeled value, which is never a tag
+/// itself; under the `fully-peeled` trait every tag row needs one, and under `peeled` alone it does not.
+#[test]
+fn b1b_peeled_rows_are_checked_against_object_kinds() {
+    let format = GitObjectFormatV1::Sha1;
+    let run = |header: &str, rows: &[(&str, char, Option<char>)]| {
+        let files = vec![
+            file_of("HEAD", symbolic_file("refs/heads/main")),
+            file_of("packed-refs", packed(format, header, rows)),
+        ];
+        pure(format, &files, &[])
+    };
+    run(PACKED_HEADER_V1, &[("refs/tags/v1", 'c', Some('a'))]).expect("a tag and its peeled value");
+    run(PACKED_HEADER_V1, &[("refs/tags/v1", 'c', Some('d'))]).expect("a tag of a tree");
+    assert_eq!(
+        fault_of(
+            run(PACKED_HEADER_V1, &[("refs/heads/x", 'a', Some('b'))]),
+            "a peeled value under a commit"
+        ),
+        RefsFaultV1::PeeledNotTag {
+            name: "refs/heads/x".into()
+        }
+    );
+    assert_eq!(
+        fault_of(
+            run(PACKED_HEADER_V1, &[("refs/tags/v1", 'c', Some('c'))]),
+            "a tag peeled to a tag"
+        ),
+        RefsFaultV1::PeeledIsTag {
+            name: "refs/tags/v1".into()
+        }
+    );
+    assert_eq!(
+        fault_of(
+            run(PACKED_HEADER_V1, &[("refs/tags/v1", 'c', None)]),
+            "fully-peeled without a peeled row"
+        ),
+        RefsFaultV1::PeelMissing {
+            name: "refs/tags/v1".into()
+        }
+    );
+    run(
+        "# pack-refs with: peeled sorted \n",
+        &[("refs/tags/v1", 'c', None)],
+    )
+    .expect("peeled alone does not require a row");
+    run("", &[("refs/tags/v1", 'c', None)]).expect("no header, no promise");
+    // A non-tag row without a peeled row is the ordinary case.
+    run(PACKED_HEADER_V1, &[("refs/heads/x", 'a', None)]).expect("a commit with no peeled row");
+}
+
+/// Every manifest ref is cross-checked by name and by target kind; the refs the manifest does not list
+/// are still checked, and `Unborn` means a symbolic ref whose chain ends in a missing ref.
+#[test]
+fn b1b_every_manifest_ref_is_cross_checked_by_name_and_target() {
+    for format in BOTH_FORMATS_V1 {
+        let mut files = base_files(format);
+        files.extend([
+            file_of("refs/heads/side", direct_file('b', format)),
+            file_of("refs/tags/v1", direct_file('c', format)),
+            file_of("refs/heads/alias", symbolic_file("refs/heads/main")),
+            file_of("ORIG_HEAD", direct_file('b', format)),
+        ]);
+        let all: Vec<(&str, WantV1)> = vec![
+            ("HEAD", WantV1::Symbolic("refs/heads/main")),
+            ("ORIG_HEAD", WantV1::Direct('b')),
+            ("refs/heads/alias", WantV1::Symbolic("refs/heads/main")),
+            ("refs/heads/main", WantV1::Direct('a')),
+            ("refs/heads/side", WantV1::Direct('b')),
+            ("refs/tags/v1", WantV1::Direct('c')),
+        ];
+        let agreement =
+            pure(format, &files, &all).unwrap_or_else(|error| panic!("{format:?}: {error:?}"));
+        assert_eq!(agreement.manifest_refs, 6);
+        // A subset: the unlisted refs are still restored and still valid.
+        let subset = pure(format, &files, &all[..1]).expect("a subset");
+        assert_eq!(subset.manifest_refs, 1);
+        assert_eq!(subset.effective_refs, 4);
+
+        let with = |name: &'static str, want: WantV1| -> Vec<(&'static str, WantV1)> {
+            let mut refs: Vec<_> = all.iter().filter(|(n, _)| *n != name).cloned().collect();
+            refs.push((name, want));
+            refs
+        };
+        let mismatch =
+            |name: &str, expected: String, found: String| RefsFaultV1::OriginalMismatch {
+                name: name.into(),
+                expected,
+                found,
+            };
+        let (a, b) = (oid_of('a', format), oid_of('b', format));
+        let table: Vec<(&str, ManifestRefsV1, RefsFaultV1)> = vec![
+            (
+                "a missing original ref",
+                with("refs/heads/ghost", WantV1::Direct('a')),
+                RefsFaultV1::MissingOriginal {
+                    name: "refs/heads/ghost".into(),
+                },
+            ),
+            (
+                "a missing pseudoref",
+                with("FETCH_HEAD", WantV1::Direct('a')),
+                RefsFaultV1::MissingOriginal {
+                    name: "FETCH_HEAD".into(),
+                },
+            ),
+            (
+                "a different object",
+                with("refs/heads/side", WantV1::Direct('a')),
+                mismatch(
+                    "refs/heads/side",
+                    format!("direct {a}"),
+                    format!("direct {b}"),
+                ),
+            ),
+            (
+                "a different ORIG_HEAD",
+                with("ORIG_HEAD", WantV1::Direct('a')),
+                mismatch("ORIG_HEAD", format!("direct {a}"), format!("direct {b}")),
+            ),
+            (
+                "direct, but symbolic",
+                with("refs/heads/alias", WantV1::Direct('a')),
+                mismatch(
+                    "refs/heads/alias",
+                    format!("direct {a}"),
+                    "symbolic refs/heads/main".into(),
+                ),
+            ),
+            (
+                "symbolic, but direct",
+                with("refs/heads/side", WantV1::Symbolic("refs/heads/main")),
+                mismatch(
+                    "refs/heads/side",
+                    "symbolic refs/heads/main".into(),
+                    format!("direct {b}"),
+                ),
+            ),
+            (
+                "another symbolic target",
+                with("HEAD", WantV1::Symbolic("refs/heads/side")),
+                mismatch(
+                    "HEAD",
+                    "symbolic refs/heads/side".into(),
+                    "symbolic refs/heads/main".into(),
+                ),
+            ),
+            (
+                "an attached HEAD that the manifest calls detached",
+                with("HEAD", WantV1::Direct('a')),
+                mismatch(
+                    "HEAD",
+                    format!("direct {a}"),
+                    "symbolic refs/heads/main".into(),
+                ),
+            ),
+            (
+                "unborn, but direct",
+                with("refs/heads/main", WantV1::Unborn),
+                mismatch("refs/heads/main", "unborn".into(), format!("direct {a}")),
+            ),
+            (
+                "unborn, but the chain resolves",
+                with("HEAD", WantV1::Unborn),
+                mismatch("HEAD", "unborn".into(), "symbolic refs/heads/main".into()),
+            ),
+        ];
+        for (row, refs, expected) in table {
+            assert_eq!(
+                fault_of(pure(format, &files, &refs), row),
+                expected,
+                "{format:?}: {row}"
+            );
+        }
+        // A detached HEAD that the manifest calls attached.
+        assert_eq!(
+            fault_of(
+                pure(
+                    format,
+                    &[file_of("HEAD", direct_file('a', format))],
+                    &[("HEAD", WantV1::Symbolic("refs/heads/main"))]
+                ),
+                "a detached HEAD called attached"
+            ),
+            mismatch(
+                "HEAD",
+                "symbolic refs/heads/main".into(),
+                format!("direct {a}")
+            )
+        );
+    }
+}
+
+/// A manifest ref with a name or a symbolic target that is not a valid ref name is refused by name, and
+/// the three pseudorefs are the only names that need not be under `refs/`.
+#[test]
+fn b1b_manifest_ref_names_and_targets_are_validated() {
+    let format = GitObjectFormatV1::Sha1;
+    let files = base_files(format);
+    for (name, why) in [
+        ("refs/heads/x.lock", RefNameFaultV1::LockSuffix),
+        ("heads/main", RefNameFaultV1::NotUnderRefs),
+        ("head", RefNameFaultV1::NotUnderRefs),
+        ("MERGE_HEAD", RefNameFaultV1::NotUnderRefs),
+        ("refs/heads/a..b", RefNameFaultV1::DoubleDot),
+    ] {
+        assert_eq!(
+            fault_of(pure(format, &files, &[(name, WantV1::Direct('a'))]), name),
+            RefsFaultV1::ManifestName {
+                name: name.into(),
+                why
+            },
+            "{name}"
+        );
+    }
+    for (target, why) in [
+        ("main", RefNameFaultV1::NotUnderRefs),
+        ("HEAD", RefNameFaultV1::NotUnderRefs),
+        ("refs/heads/x.lock", RefNameFaultV1::LockSuffix),
+    ] {
+        assert_eq!(
+            fault_of(
+                pure(format, &files, &[("HEAD", WantV1::Symbolic(target))]),
+                target
+            ),
+            RefsFaultV1::ManifestTarget {
+                name: "HEAD".into(),
+                target: target.into(),
+                why
+            },
+            "{target}"
+        );
+    }
+    // A manifest object in another format than the caller's is the inventory's format refusal.
+    let mut builder = RefsBuilderV1::new(format, RefsLimitsV1::v1(), far_deadline());
+    for (path, content) in &files {
+        let mut reader: &[u8] = content;
+        builder
+            .admit_file(path.as_bytes(), &mut reader)
+            .expect("a file");
+    }
+    let error = builder
+        .finish(&pool_manifest(GitObjectFormatV1::Sha256, true, &[]))
+        .expect_err("a SHA-256 manifest for a SHA-1 caller");
+    assert!(
+        matches!(error, GitBootstrapErrorV1::FormatMismatch(_)),
+        "{error:?}"
+    );
+}
+
+/// Structure: a ref and a ref under it (in any mix of loose and packed) conflict, spellings that differ
+/// only by ASCII case collide, and the same name loose and packed is one ref, not a collision.
+#[test]
+fn b1b_ref_names_that_conflict_or_collide_refuse() {
+    let format = GitObjectFormatV1::Sha1;
+    let header = PACKED_HEADER_V1;
+    let head = file_of("HEAD", symbolic_file("refs/heads/main"));
+    let loose = |path: &'static str| file_of(path, direct_file('a', format));
+    let rows =
+        |list: &[(&str, char, Option<char>)]| file_of("packed-refs", packed(format, header, list));
+    let conflict = |name: &str, with: &str| RefsFaultV1::Conflict {
+        name: name.into(),
+        with: with.into(),
+    };
+    let collision = |name: &str, with: &str| RefsFaultV1::Collision {
+        name: name.into(),
+        with: with.into(),
+    };
+    assert_eq!(
+        fault_of(
+            pure(
+                format,
+                &[
+                    head.clone(),
+                    loose("refs/heads/a"),
+                    rows(&[("refs/heads/a/b", 'a', None)])
+                ],
+                &[]
+            ),
+            "loose over packed"
+        ),
+        conflict("refs/heads/a/b", "refs/heads/a")
+    );
+    assert_eq!(
+        fault_of(
+            pure(
+                format,
+                &[
+                    head.clone(),
+                    loose("refs/heads/a/b"),
+                    rows(&[("refs/heads/a", 'a', None)])
+                ],
+                &[]
+            ),
+            "packed over loose"
+        ),
+        conflict("refs/heads/a/b", "refs/heads/a")
+    );
+    assert_eq!(
+        fault_of(
+            pure(
+                format,
+                &[
+                    head.clone(),
+                    rows(&[("refs/heads/a", 'a', None), ("refs/heads/a/b", 'a', None)])
+                ],
+                &[]
+            ),
+            "within packed"
+        ),
+        conflict("refs/heads/a/b", "refs/heads/a")
+    );
+    assert_eq!(
+        fault_of(
+            pure(
+                format,
+                &[
+                    head.clone(),
+                    loose("refs/heads/Main"),
+                    rows(&[("refs/heads/main", 'a', None)])
+                ],
+                &[]
+            ),
+            "case, loose and packed"
+        ),
+        collision("refs/heads/main", "refs/heads/Main")
+    );
+    assert_eq!(
+        fault_of(
+            pure(
+                format,
+                &[head.clone(), loose("refs/heads/A"), loose("refs/heads/a")],
+                &[]
+            ),
+            "case, both loose"
+        ),
+        collision("refs/heads/a", "refs/heads/A")
+    );
+    assert_eq!(
+        fault_of(
+            pure(
+                format,
+                &[
+                    head.clone(),
+                    rows(&[("refs/heads/A", 'a', None), ("refs/heads/a", 'a', None)])
+                ],
+                &[]
+            ),
+            "case, both packed"
+        ),
+        collision("refs/heads/a", "refs/heads/A")
+    );
+    // The same name in both is one ref, and a prefix that is not a path component is no conflict.
+    pure(
+        format,
+        &[
+            head.clone(),
+            loose("refs/heads/a"),
+            rows(&[("refs/heads/a", 'a', None), ("refs/heads/ab", 'a', None)]),
+        ],
+        &[],
+    )
+    .expect("the same name loose and packed, and a sibling that shares a prefix");
+}
+
+// ---------------------------------------------------------------------------------------------
+// Limits and the one deadline, on the pure builder
+// ---------------------------------------------------------------------------------------------
+
+fn limits_with(edit: impl FnOnce(&mut RefsLimitsV1)) -> RefsLimitsV1 {
+    let mut limits = RefsLimitsV1::v1();
+    edit(&mut limits);
+    limits
+}
+
+fn limit_fault(what: RefsLimitKindV1, bound: u64) -> RefsFaultV1 {
+    RefsFaultV1::Limit { what, bound }
+}
+
+/// Runs `pure_run` under `limits` over `files` with an attached-HEAD manifest-free state.
+fn limited(
+    format: GitObjectFormatV1,
+    files: &[FileV1],
+    limits: RefsLimitsV1,
+) -> Result<RefsAgreementV1, GitBootstrapErrorV1> {
+    pure_run(format, true, files, &[], limits)
+}
+
+/// The documented v1 limits, and the retained-cost formula the accounting rows rely on.
+#[test]
+fn b1b_the_v1_limits_and_the_cost_formula_are_the_documented_ones() {
+    let limits = RefsLimitsV1::v1();
+    assert_eq!(limits.line_bytes, 8 * 1024);
+    assert_eq!(limits.loose_file_bytes, 16 * 1024);
+    assert_eq!(limits.packed_file_bytes, 64 * 1024 * 1024);
+    assert_eq!(limits.fetch_head_bytes, 1024 * 1024);
+    assert_eq!(limits.log_file_bytes, 64 * 1024 * 1024);
+    assert_eq!(limits.entries, 262_144);
+    assert_eq!(limits.retained_bytes, 64 * 1024 * 1024);
+    // Two copies of the name (the map key and its case key), the value, and a fixed allowance.
+    assert_eq!(refs_entry_cost_v1(0, 0), 64);
+    assert_eq!(refs_entry_cost_v1(15, 40), 64 + 2 * 15 + 40);
+    assert!(limits.line_bytes < limits.loose_file_bytes);
+}
+
+/// Each per-file byte cap is exact: a file of exactly the cap parses, one byte more is refused with the
+/// typed limit and the cap, for every kind of file and in both formats.
+#[test]
+fn b1b_each_file_byte_cap_is_exact() {
+    for format in BOTH_FORMATS_V1 {
+        let direct = direct_file('a', format);
+        let symbolic = symbolic_file("refs/heads/main");
+        let packed_bytes = packed(
+            format,
+            PACKED_HEADER_V1,
+            &[
+                ("refs/heads/main", 'a', None),
+                ("refs/tags/v1", 'c', Some('a')),
+            ],
+        );
+        let fetch = fetch_head(format, &[('a', "", "note"), ('b', "not-for-merge", "n")]);
+        let log = [
+            log_row(format, '0', 'a', IDENT_V1),
+            log_row(format, 'a', 'b', &format!("{IDENT_V1}\tmessage")),
+        ]
+        .concat()
+        .into_bytes();
+        type Edit = fn(&mut RefsLimitsV1, u64);
+        let rows: Vec<(&str, FileV1, RefsLimitKindV1, Edit)> = vec![
+            (
+                "HEAD",
+                file_of("HEAD", symbolic.clone()),
+                RefsLimitKindV1::LooseFile,
+                |limits, bound| limits.loose_file_bytes = bound,
+            ),
+            (
+                "a detached HEAD",
+                file_of("HEAD", direct.clone()),
+                RefsLimitKindV1::LooseFile,
+                |limits, bound| limits.loose_file_bytes = bound,
+            ),
+            (
+                "ORIG_HEAD",
+                file_of("ORIG_HEAD", direct.clone()),
+                RefsLimitKindV1::LooseFile,
+                |limits, bound| limits.loose_file_bytes = bound,
+            ),
+            (
+                "a loose ref",
+                file_of("refs/heads/x", direct.clone()),
+                RefsLimitKindV1::LooseFile,
+                |limits, bound| limits.loose_file_bytes = bound,
+            ),
+            (
+                "packed-refs",
+                file_of("packed-refs", packed_bytes),
+                RefsLimitKindV1::PackedFile,
+                |limits, bound| limits.packed_file_bytes = bound,
+            ),
+            (
+                "FETCH_HEAD",
+                file_of("FETCH_HEAD", fetch),
+                RefsLimitKindV1::FetchHeadFile,
+                |limits, bound| limits.fetch_head_bytes = bound,
+            ),
+            (
+                "a reflog",
+                file_of("logs/HEAD", log),
+                RefsLimitKindV1::LogFile,
+                |limits, bound| limits.log_file_bytes = bound,
+            ),
+        ];
+        for (row, file, what, edit) in rows {
+            let length = file.1.len() as u64;
+            let others = if file.0 == "HEAD" {
+                vec![]
+            } else {
+                vec![file_of("HEAD", symbolic.clone())]
+            };
+            let run = |bound: u64| {
+                let mut files = others.clone();
+                files.push(file.clone());
+                limited(format, &files, limits_with(|limits| edit(limits, bound)))
+            };
+            // The HEAD file itself must also be valid for the manifest-free finish.
+            run(length).unwrap_or_else(|error| panic!("{format:?} {row}: at the cap: {error:?}"));
+            assert_eq!(
+                fault_of(run(length - 1), row),
+                limit_fault(what, length - 1),
+                "{format:?} {row}: one byte over"
+            );
+        }
+    }
+}
+
+/// The line cap is exact too, for every line-structured file: a line of exactly the cap (without its
+/// LF) parses, one byte longer is refused.
+#[test]
+fn b1b_the_line_cap_is_exact() {
+    for format in BOTH_FORMATS_V1 {
+        let width = oid_len(format) as u64;
+        let head = file_of("HEAD", symbolic_file("refs/heads/main"));
+        let head_line = "ref: refs/heads/main".len() as u64;
+        // Each row: the files, and the length of the one line the cap is lowered onto.
+        let rows: Vec<(&str, Vec<FileV1>, u64)> = vec![
+            (
+                "a direct loose ref",
+                vec![
+                    head.clone(),
+                    file_of("refs/heads/x", direct_file('a', format)),
+                ],
+                width,
+            ),
+            ("a symbolic HEAD", vec![head.clone()], head_line),
+            (
+                "a packed row",
+                vec![
+                    head.clone(),
+                    file_of(
+                        "packed-refs",
+                        packed(format, "", &[("refs/heads/x", 'a', None)]),
+                    ),
+                ],
+                width + 1 + "refs/heads/x".len() as u64,
+            ),
+            (
+                "a FETCH_HEAD row",
+                vec![
+                    head.clone(),
+                    file_of("FETCH_HEAD", fetch_head(format, &[('a', "", "note")])),
+                ],
+                width + 2 + "note".len() as u64,
+            ),
+            (
+                "a reflog row",
+                vec![
+                    head.clone(),
+                    file_of(
+                        "logs/HEAD",
+                        log_row(format, '0', 'a', IDENT_V1).into_bytes(),
+                    ),
+                ],
+                2 * width + 2 + IDENT_V1.len() as u64,
+            ),
+        ];
+        for (row, files, cap) in rows {
+            let run = |bound: u64| {
+                limited(
+                    format,
+                    &files,
+                    limits_with(|limits| {
+                        limits.line_bytes = bound;
+                    }),
+                )
+            };
+            run(cap).unwrap_or_else(|error| panic!("{format:?} {row}: at the cap: {error:?}"));
+            assert_eq!(
+                fault_of(run(cap - 1), row),
+                limit_fault(RefsLimitKindV1::Line, cap - 1),
+                "{format:?} {row}"
+            );
+        }
+    }
+}
+
+/// The record cap counts every admitted record: each loose file (HEAD and ORIG_HEAD included), each
+/// packed row and peeled row, each FETCH_HEAD row, and each reflog file.
+#[test]
+fn b1b_the_entry_cap_counts_every_admitted_record() {
+    for format in BOTH_FORMATS_V1 {
+        let files = vec![
+            file_of("HEAD", symbolic_file("refs/heads/main")), // 1
+            file_of("ORIG_HEAD", direct_file('a', format)),    // 2
+            file_of("refs/heads/main", direct_file('a', format)), // 3
+            file_of(
+                "packed-refs",
+                packed(
+                    format,
+                    PACKED_HEADER_V1,
+                    &[
+                        ("refs/heads/p", 'a', None),
+                        ("refs/tags/v1", 'c', Some('a')),
+                    ],
+                ),
+            ), // 4, 5, and the peeled row 6
+            file_of(
+                "FETCH_HEAD",
+                fetch_head(format, &[('a', "", "n"), ('b', "", "n")]),
+            ), // 7, 8
+            file_of("logs/HEAD", Vec::new()),                  // 9
+            file_of("logs/refs/heads/main", Vec::new()),       // 10
+        ];
+        let run =
+            |bound: u64| limited(format, &files, limits_with(|limits| limits.entries = bound));
+        let agreement = run(10).unwrap_or_else(|error| panic!("{format:?}: {error:?}"));
+        assert_eq!(agreement.reflog_files, 2);
+        assert_eq!(
+            fault_of(run(9), "one record over"),
+            limit_fault(RefsLimitKindV1::Entries, 9),
+            "{format:?}"
+        );
+        assert_eq!(
+            fault_of(run(0), "no records"),
+            limit_fault(RefsLimitKindV1::Entries, 0),
+            "{format:?}"
+        );
+    }
+}
+
+/// The retained-bytes cap is exact: the sum of every retained record's cost parses, one byte less is
+/// refused. A reflog retains only its name (its rows stream by and are never kept).
+#[test]
+fn b1b_the_retained_cap_is_exact_and_reflogs_retain_only_their_names() {
+    for format in BOTH_FORMATS_V1 {
+        let width = oid_len(format);
+        let files = vec![
+            file_of("HEAD", symbolic_file("refs/heads/main")),
+            file_of("refs/heads/main", direct_file('a', format)),
+            file_of("refs/heads/alias", symbolic_file("refs/heads/main")),
+            file_of("ORIG_HEAD", direct_file('b', format)),
+            file_of(
+                "packed-refs",
+                packed(
+                    format,
+                    PACKED_HEADER_V1,
+                    &[
+                        ("refs/heads/p", 'a', None),
+                        ("refs/tags/v1", 'c', Some('a')),
+                    ],
+                ),
+            ),
+            file_of(
+                "FETCH_HEAD",
+                fetch_head(format, &[('a', "", "n"), ('b', "", "n")]),
+            ),
+            file_of(
+                "logs/HEAD",
+                log_row(format, '0', 'a', IDENT_V1).into_bytes(),
+            ),
+        ];
+        let expected = refs_entry_cost_v1("HEAD".len(), "refs/heads/main".len())
+            + refs_entry_cost_v1("refs/heads/main".len(), width)
+            + refs_entry_cost_v1("refs/heads/alias".len(), "refs/heads/main".len())
+            + refs_entry_cost_v1("ORIG_HEAD".len(), width)
+            + refs_entry_cost_v1("refs/heads/p".len(), width)
+            + refs_entry_cost_v1("refs/tags/v1".len(), 2 * width)
+            + 2 * refs_entry_cost_v1(0, width)
+            + refs_entry_cost_v1("logs/HEAD".len(), 0);
+        let run = |bound: u64| {
+            limited(
+                format,
+                &files,
+                limits_with(|limits| limits.retained_bytes = bound),
+            )
+        };
+        run(expected).unwrap_or_else(|error| panic!("{format:?}: at the sum: {error:?}"));
+        assert_eq!(
+            fault_of(run(expected - 1), "one byte less"),
+            limit_fault(RefsLimitKindV1::Retained, expected - 1),
+            "{format:?}"
+        );
+    }
+}
+
+/// A reader that serves `data` forever (or until `data` is `None`'s generator ends) and counts what it
+/// served: bounded admission means a hostile stream stops at the cap, never at the end of the stream.
+struct EndlessV1<F: FnMut(&mut [u8]) -> usize> {
+    fill: F,
+    served: std::rc::Rc<std::cell::Cell<u64>>,
+}
+
+impl<F: FnMut(&mut [u8]) -> usize> std::io::Read for EndlessV1<F> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        let count = (self.fill)(buffer);
+        self.served.set(self.served.get() + count as u64);
+        Ok(count)
+    }
+}
+
+/// Never-ending inputs stop at their cap with a typed refusal after reading at most the cap plus one
+/// byte, never buffering the stream: a line with no LF, an endless list of valid packed rows, FETCH_HEAD
+/// rows, and reflog rows.
+#[test]
+fn b1b_endless_inputs_stop_at_their_caps() {
+    for format in BOTH_FORMATS_V1 {
+        let served = std::rc::Rc::new(std::cell::Cell::new(0_u64));
+        let builder = |limits: RefsLimitsV1| {
+            served.set(0);
+            RefsBuilderV1::new(format, limits, far_deadline())
+        };
+        // No LF, ever: the line cap stops it before the loose-file cap.
+        let mut x = EndlessV1 {
+            fill: |buffer: &mut [u8]| {
+                buffer.fill(b'x');
+                buffer.len()
+            },
+            served: served.clone(),
+        };
+        let limits = RefsLimitsV1::v1();
+        let error = builder(limits)
+            .admit_file(b"refs/heads/x", &mut x)
+            .expect_err("an endless line");
+        assert_eq!(
+            refs_fault(error),
+            limit_fault(RefsLimitKindV1::Line, limits.line_bytes)
+        );
+        assert!(
+            served.get() <= limits.loose_file_bytes + 1,
+            "{}",
+            served.get()
+        );
+        // With the line cap out of the way, the loose-file cap itself stops it.
+        served.set(0);
+        let limits = limits_with(|limits| {
+            limits.line_bytes = 1 << 30;
+            limits.loose_file_bytes = 100;
+        });
+        let error = builder(limits)
+            .admit_file(b"HEAD", &mut x)
+            .expect_err("an endless loose file");
+        assert_eq!(
+            refs_fault(error),
+            limit_fault(RefsLimitKindV1::LooseFile, 100)
+        );
+        assert!(served.get() <= 101, "{}", served.get());
+
+        // Endless valid rows, one family at a time, each stopped by its file cap.
+        type RowFn = Box<dyn Fn(u64) -> String>;
+        let families: Vec<(&str, &[u8], RowFn, RefsLimitKindV1)> = vec![
+            (
+                "packed rows",
+                &b"packed-refs"[..],
+                Box::new(move |index| format!("{} refs/heads/n{index}\n", oid_of('a', format))),
+                RefsLimitKindV1::PackedFile,
+            ),
+            (
+                "FETCH_HEAD rows",
+                &b"FETCH_HEAD"[..],
+                Box::new(move |_| format!("{}\t\tnote\n", oid_of('a', format))),
+                RefsLimitKindV1::FetchHeadFile,
+            ),
+            (
+                "reflog rows",
+                &b"logs/HEAD"[..],
+                Box::new(move |_| log_row(format, '0', 'a', IDENT_V1)),
+                RefsLimitKindV1::LogFile,
+            ),
+        ];
+        for (family, path, row, what) in families {
+            let cap = 64 * 1024_u64;
+            let limits = limits_with(|limits| {
+                limits.packed_file_bytes = cap;
+                limits.fetch_head_bytes = cap;
+                limits.log_file_bytes = cap;
+            });
+            let mut index = 0_u64;
+            let mut pending: Vec<u8> = Vec::new();
+            let mut stream = EndlessV1 {
+                fill: |buffer: &mut [u8]| {
+                    while pending.len() < buffer.len() {
+                        pending.extend_from_slice(row(index).as_bytes());
+                        index += 1;
+                    }
+                    let count = buffer.len();
+                    buffer.copy_from_slice(&pending[..count]);
+                    pending.drain(..count);
+                    count
+                },
+                served: served.clone(),
+            };
+            let error = builder(limits)
+                .admit_file(path, &mut stream)
+                .expect_err(family);
+            assert_eq!(refs_fault(error), limit_fault(what, cap), "{family}");
+            assert!(served.get() <= cap + 1, "{family}: served {}", served.get());
+        }
+    }
+}
+
+/// A read error from the source is an `Unreadable` refusal naming the file, never a partial success.
+#[test]
+fn b1b_a_failing_source_is_unreadable_not_partial() {
+    struct FailingV1;
+    impl std::io::Read for FailingV1 {
+        fn read(&mut self, _buffer: &mut [u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::other("a failing source"))
+        }
+    }
+    for path in [
+        "HEAD",
+        "refs/heads/x",
+        "ORIG_HEAD",
+        "FETCH_HEAD",
+        "packed-refs",
+        "logs/HEAD",
+    ] {
+        let mut builder =
+            RefsBuilderV1::new(GitObjectFormatV1::Sha1, RefsLimitsV1::v1(), far_deadline());
+        let error = builder
+            .admit_file(path.as_bytes(), &mut FailingV1)
+            .expect_err(path);
+        assert_eq!(
+            refs_fault(error),
+            RefsFaultV1::Unreadable { path: path.into() },
+            "{path}"
+        );
+    }
+}
+
+/// A source that hands out `data` in small reads and counts them; `on_read` runs before each one.
+struct SlowV1<'a> {
+    data: &'a [u8],
+    reads: std::rc::Rc<std::cell::Cell<usize>>,
+    on_read: Box<dyn Fn(usize) + 'a>,
+}
+
+impl std::io::Read for SlowV1<'_> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        (self.on_read)(self.reads.get());
+        self.reads.set(self.reads.get() + 1);
+        let count = buffer.len().min(16).min(self.data.len());
+        buffer[..count].copy_from_slice(&self.data[..count]);
+        self.data = &self.data[count..];
+        Ok(count)
+    }
+}
+
+/// The one deadline is checked before every read of every file kind: a deadline already spent refuses
+/// before the first read, and a deadline that passes during one read stops the next. No byte is
+/// requested from a source after the deadline.
+#[test]
+fn b1b_no_source_read_follows_the_deadline() {
+    let format = GitObjectFormatV1::Sha1;
+    let rows = packed(
+        format,
+        PACKED_HEADER_V1,
+        &[
+            ("refs/heads/a", 'a', None),
+            ("refs/heads/b", 'a', None),
+            ("refs/heads/c", 'a', None),
+        ],
+    );
+    let log = [
+        log_row(format, '0', 'a', IDENT_V1),
+        log_row(format, 'a', 'b', IDENT_V1),
+        log_row(format, 'b', 'a', IDENT_V1),
+    ]
+    .concat()
+    .into_bytes();
+    let fetch = fetch_head(
+        format,
+        &[('a', "", "one"), ('b', "", "two"), ('a', "", "three")],
+    );
+    let files: Vec<(&[u8], Vec<u8>)> = vec![
+        (&b"HEAD"[..], symbolic_file("refs/heads/main")),
+        (&b"refs/heads/x"[..], direct_file('a', format)),
+        (&b"packed-refs"[..], rows),
+        (&b"FETCH_HEAD"[..], fetch),
+        (&b"logs/HEAD"[..], log),
+    ];
+    for (path, data) in &files {
+        let label = String::from_utf8_lossy(path).into_owned();
+        // Already spent: refused before the first read.
+        let reads = std::rc::Rc::new(std::cell::Cell::new(0_usize));
+        let spent = Instant::now();
+        std::thread::sleep(Duration::from_millis(5));
+        let mut source = SlowV1 {
+            data,
+            reads: reads.clone(),
+            on_read: Box::new(|_| {}),
+        };
+        let mut builder = RefsBuilderV1::new(format, RefsLimitsV1::v1(), spent);
+        let error = builder.admit_file(path, &mut source).expect_err(&label);
+        assert!(
+            matches!(error, GitBootstrapErrorV1::Git(CustodyGitError::Timeout)),
+            "{label}: {error:?}"
+        );
+        assert_eq!(reads.get(), 0, "{label}: a read after a spent deadline");
+
+        // Passes during the first read: the second is never requested.
+        let reads = std::rc::Rc::new(std::cell::Cell::new(0_usize));
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let mut source = SlowV1 {
+            data,
+            reads: reads.clone(),
+            on_read: Box::new(move |index| {
+                if index == 0 {
+                    pass_the_deadline(deadline);
+                }
+            }),
+        };
+        let mut builder = RefsBuilderV1::new(format, RefsLimitsV1::v1(), deadline);
+        let error = builder.admit_file(path, &mut source).expect_err(&label);
+        assert!(
+            matches!(error, GitBootstrapErrorV1::Git(CustodyGitError::Timeout)),
+            "{label}: {error:?}"
+        );
+        assert_eq!(reads.get(), 1, "{label}: a read after the deadline");
+    }
+}
+
+/// A spent deadline refuses ahead of everything else the builder does with a file, including routing it:
+/// a path that is no refs file at all is a timeout, not an unexpected file, and nothing is read.
+#[test]
+fn b1b_a_spent_deadline_refuses_before_a_file_is_routed() {
+    let spent = Instant::now();
+    std::thread::sleep(Duration::from_millis(5));
+    for path in ["config", "HEAD", "refs/heads/x", "logs/HEAD"] {
+        let reads = std::rc::Rc::new(std::cell::Cell::new(0_usize));
+        let mut source = SlowV1 {
+            data: b"x\n",
+            reads: reads.clone(),
+            on_read: Box::new(|_| {}),
+        };
+        let mut builder = RefsBuilderV1::new(GitObjectFormatV1::Sha1, RefsLimitsV1::v1(), spent);
+        let error = builder
+            .admit_file(path.as_bytes(), &mut source)
+            .expect_err(path);
+        assert!(
+            matches!(error, GitBootstrapErrorV1::Git(CustodyGitError::Timeout)),
+            "{path}: {error:?}"
+        );
+        assert_eq!(reads.get(), 0, "{path}");
+    }
+}
+
+/// The agreement's own phases each observe the deadline: a clean run reads the clock at exactly the
+/// documented guards, in order; each guard halts the run alone, AT that guard; and brief delays at every
+/// guard, with headroom, still succeed.
+#[test]
+fn b1b_the_agreement_phases_each_observe_the_deadline() {
+    const GUARDS: [&str; 4] = [
+        "refs-structure",
+        "refs-targets",
+        "refs-resolved",
+        "refs-manifest",
+    ];
+    let format = GitObjectFormatV1::Sha1;
+    let files = base_files(format);
+    let refs = [
+        ("HEAD", WantV1::Symbolic("refs/heads/main")),
+        ("refs/heads/main", WantV1::Direct('a')),
+    ];
+    let run = |deadline: Instant| {
+        let mut builder = RefsBuilderV1::new(format, RefsLimitsV1::v1(), deadline);
+        for (path, content) in &files {
+            let mut reader: &[u8] = content;
+            builder.admit_file(path.as_bytes(), &mut reader)?;
+        }
+        builder.finish(&pool_manifest(format, true, &refs))
+    };
+    let (labels, hook) = record_guards();
+    run(far_deadline()).expect("a clean run");
+    drop(hook);
+    assert_eq!(*labels.borrow(), GUARDS);
+
+    for target in GUARDS {
+        let deadline = Instant::now() + B1A_DEADLINE_V1;
+        let labels = std::rc::Rc::new(std::cell::RefCell::new(Vec::<&'static str>::new()));
+        let fired = std::rc::Rc::new(std::cell::Cell::new(false));
+        let (seen, slow) = (labels.clone(), fired.clone());
+        let _hook = install_git_hook_for_test(GitHookPointV1::DeadlineObserved, move |event| {
+            seen.borrow_mut().push(event.label);
+            if event.label == target && !slow.replace(true) {
+                pass_the_deadline(deadline);
+            }
+        });
+        let error = run(deadline).expect_err(target);
+        assert!(
+            matches!(error, GitBootstrapErrorV1::Git(CustodyGitError::Timeout)),
+            "{target}: {error:?}"
+        );
+        assert!(fired.get(), "{target}: the slow step never ran");
+        assert_eq!(
+            labels.borrow().last().copied(),
+            Some(target),
+            "{target}: the run halted AT its guard: {:?}",
+            labels.borrow()
+        );
+    }
+    let _hook = install_git_hook_for_test(GitHookPointV1::DeadlineObserved, |_| {
+        std::thread::sleep(Duration::from_millis(40));
+    });
+    run(Instant::now() + B1A_DEADLINE_V1).expect("brief delays leave most of the deadline");
+}
+
+// ---------------------------------------------------------------------------------------------
+// The inert config encoder
+// ---------------------------------------------------------------------------------------------
+
+const CONFIG_SHA1_V1: &[u8] = b"[core]\n\trepositoryformatversion = 0\n\tbare = false\n\tfilemode = true\n\tlogallrefupdates = true\n\tfsmonitor = false\n";
+const CONFIG_SHA256_V1: &[u8] = b"[core]\n\trepositoryformatversion = 1\n\tbare = false\n\tfilemode = true\n\tlogallrefupdates = true\n\tfsmonitor = false\n[extensions]\n\tobjectformat = sha256\n";
+
+/// The encoder's bytes are exactly the master's ordered keys, in both formats: `[core]`
+/// repositoryformatversion (0 or 1), bare, filemode, logallrefupdates, fsmonitor; SHA-256 additionally
+/// `[extensions]` objectformat. LF line ends, tab indentation, `key = value`, one trailing LF.
+#[test]
+fn b1b_the_inert_config_is_the_golden_bytes_in_both_formats() {
+    assert_eq!(
+        encode_inert_config_v1(GitObjectFormatV1::Sha1),
+        CONFIG_SHA1_V1,
+        "{}",
+        String::from_utf8_lossy(&encode_inert_config_v1(GitObjectFormatV1::Sha1))
+    );
+    assert_eq!(
+        encode_inert_config_v1(GitObjectFormatV1::Sha256),
+        CONFIG_SHA256_V1,
+        "{}",
+        String::from_utf8_lossy(&encode_inert_config_v1(GitObjectFormatV1::Sha256))
+    );
+    // Deterministic: the same bytes every time, and the two formats differ.
+    for format in BOTH_FORMATS_V1 {
+        assert_eq!(
+            encode_inert_config_v1(format),
+            encode_inert_config_v1(format)
+        );
+    }
+    assert_ne!(
+        encode_inert_config_v1(GitObjectFormatV1::Sha1),
+        encode_inert_config_v1(GitObjectFormatV1::Sha256)
+    );
+}
+
+/// The shape rules hold byte for byte, and nothing behavior-affecting is in either encoding: no include,
+/// remote, filter, hooks path, credential helper, alias, or any key beyond the documented ones.
+#[test]
+fn b1b_the_inert_config_has_only_the_documented_shape_and_no_behavior_keys() {
+    for format in BOTH_FORMATS_V1 {
+        let bytes = encode_inert_config_v1(format);
+        let text = std::str::from_utf8(&bytes).expect("UTF-8");
+        assert!(
+            text.ends_with('\n') && !text.ends_with("\n\n"),
+            "one trailing LF"
+        );
+        assert!(!bytes.contains(&b'\r'), "LF line ends only");
+        let mut keys = Vec::new();
+        for line in text.lines() {
+            if line.starts_with('[') {
+                assert!(line.ends_with(']'));
+            } else {
+                let rest = line.strip_prefix('\t').expect("a tab-indented key");
+                assert!(!rest.starts_with(' ') && !rest.starts_with('\t'));
+                let (key, value) = rest.split_once(" = ").expect("`key = value`");
+                assert!(!key.is_empty() && !value.is_empty());
+                assert!(!value.contains(' ') && !value.contains('\t'));
+                keys.push(key.to_owned());
+            }
+        }
+        let expected: &[&str] = match format {
+            GitObjectFormatV1::Sha1 => &[
+                "repositoryformatversion",
+                "bare",
+                "filemode",
+                "logallrefupdates",
+                "fsmonitor",
+            ],
+            GitObjectFormatV1::Sha256 => &[
+                "repositoryformatversion",
+                "bare",
+                "filemode",
+                "logallrefupdates",
+                "fsmonitor",
+                "objectformat",
+            ],
+        };
+        assert_eq!(keys, expected, "{format:?}");
+        let lowered = text.to_ascii_lowercase();
+        for forbidden in [
+            "include",
+            "remote",
+            "filter",
+            "hookspath",
+            "credential",
+            "alias",
+            "url",
+            "pager",
+            "editor",
+            "sshcommand",
+            "gpg",
+            "diff",
+            "merge",
+            "worktree",
+            "alternate",
+            "core.fsmonitor = true",
+        ] {
+            assert!(
+                !lowered.contains(forbidden),
+                "{format:?} mentions {forbidden}"
+            );
+        }
+    }
+}
+
+/// The golden bytes mean what they say to real Git: `git config --list` reads back exactly the
+/// documented keys, and a repository whose config is replaced by them reports the right object format,
+/// is not bare, and has its git directory where it was put. (Fixture plumbing, not the restore's effect
+/// seam; the repository here is a scratch one.)
+#[test]
+fn b1b_real_git_reads_the_inert_config_back() {
+    let git = |dir: &Path, args: &[&str]| -> String {
+        let output = Command::new(lane_git_path())
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("LC_ALL", "C")
+            .env("HOME", "/nonexistent")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .current_dir(dir)
+            .args(args)
+            .output()
+            .expect("the fixture Git child runs");
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout)
+            .expect("UTF-8")
+            .trim_end()
+            .to_owned()
+    };
+    for (format, flag, listed, name) in [
+        (
+            GitObjectFormatV1::Sha1,
+            "--object-format=sha1",
+            "core.repositoryformatversion=0\ncore.bare=false\ncore.filemode=true\ncore.logallrefupdates=true\ncore.fsmonitor=false",
+            "sha1",
+        ),
+        (
+            GitObjectFormatV1::Sha256,
+            "--object-format=sha256",
+            "core.repositoryformatversion=1\ncore.bare=false\ncore.filemode=true\ncore.logallrefupdates=true\ncore.fsmonitor=false\nextensions.objectformat=sha256",
+            "sha256",
+        ),
+    ] {
+        let area = tempfile::TempDir::new().expect("a scratch area");
+        let area_path = area.path().canonicalize().expect("a canonical area");
+        let repository = area_path.join("repository");
+        std::fs::create_dir(&repository).expect("the repository");
+        git(&area_path, &["init", "--bare", "-q", "--template=", flag, "repository/.git"]);
+        let config = repository.join(".git/config");
+        std::fs::write(&config, encode_inert_config_v1(format)).expect("the encoded config");
+        assert_eq!(git(&repository, &["config", "--file", ".git/config", "--list"]), listed);
+        assert_eq!(git(&repository, &["rev-parse", "--show-object-format"]), name);
+        assert_eq!(git(&repository, &["rev-parse", "--is-bare-repository"]), "false");
+        assert_eq!(git(&repository, &["rev-parse", "--git-dir"]), ".git");
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// The retained entry point: real phase-V values, real frames, the one capsule, ledger, and deadline
+// ---------------------------------------------------------------------------------------------
+
+/// The failure shape of the retained agreement is B1a's: no materialization began, the caller's
+/// completed step and the one ledger's charge are carried.
+fn agree_with(
+    verified: &mut VerifiedCapsuleV1,
+    plan: &ActiveFramePlanV1,
+    format: GitObjectFormatV1,
+    deadline: Instant,
+    limits: RefsLimitsV1,
+) -> Result<RefsAgreementV1, GitBootstrapErrorV1> {
+    let ledger = ledger_used(verified);
+    agree_active_refs_bounded_v1(
+        verified,
+        plan,
+        format,
+        frame_budget(),
+        deadline,
+        B1A_COMPLETED_V1,
+        limits,
+    )
+    .map_err(|failure| require_failure_shape(failure, B1A_COMPLETED_V1, ledger))
+}
+
+fn agree(
+    verified: &mut VerifiedCapsuleV1,
+    plan: &ActiveFramePlanV1,
+    format: GitObjectFormatV1,
+) -> Result<RefsAgreementV1, GitBootstrapErrorV1> {
+    agree_with(verified, plan, format, far_deadline(), RefsLimitsV1::v1())
+}
+
+/// The refs the manifest of `verified` lists, replaced on the retained value (as the frames are staged).
+fn set_refs(verified: &mut VerifiedCapsuleV1, refs: Vec<CustodyOriginalRefV1>) {
+    let base = &verified.control.manifest;
+    verified.control.manifest = CustodyManifestV1::new(
+        base.unit_id(),
+        base.run_id(),
+        base.materialization_id(),
+        base.generation_id(),
+        base.coverage().to_vec(),
+        refs,
+        base.original_objects().to_vec(),
+        base.dependencies().to_vec(),
+        base.exclusions().to_vec(),
+    )
+    .expect("a manifest with refs");
+}
+
+fn real_object(capsule: &CustomCapsuleV1, kind: KindV1) -> CustodyOriginalObjectV1 {
+    capsule
+        .source
+        .objects
+        .iter()
+        .find(|object| object.kind() == kind)
+        .expect("a real object of that kind")
+        .clone()
+}
+
+fn direct_ref(name: &str, object: &CustodyOriginalObjectV1) -> CustodyOriginalRefV1 {
+    CustodyOriginalRefV1::new(
+        LosslessPathV1::from_bytes(name.as_bytes().to_vec()),
+        CustodyRefTargetV1::Direct(object.clone()),
+    )
+    .expect("a manifest ref")
+}
+
+fn symbolic_ref(name: &str, target: &str) -> CustodyOriginalRefV1 {
+    CustodyOriginalRefV1::new(
+        LosslessPathV1::from_bytes(name.as_bytes().to_vec()),
+        CustodyRefTargetV1::Symbolic(LosslessPathV1::from_bytes(target.as_bytes().to_vec())),
+    )
+    .expect("a manifest ref")
+}
+
+fn fb<'a>(path: &'static str, content: &'a [u8]) -> (&'a [u8], EntryV1<'a>) {
+    (path.as_bytes(), EntryV1::File(content))
+}
+
+fn db(path: &'static str) -> (&'static [u8], EntryV1<'static>) {
+    (path.as_bytes(), EntryV1::Dir)
+}
+
+/// The real state of a Captured capsule: an attached `HEAD` on a loose `refs/heads/main` (the real commit),
+/// `ORIG_HEAD`, a packed `refs/heads/side` and `refs/tags/v1` (the real annotated tag, peeled to the
+/// real commit), and a `logs/HEAD` and `logs/refs/heads/main` reflog.
+struct RealStateV1 {
+    refs_frame: Vec<u8>,
+    logs_frame: Vec<u8>,
+    manifest_refs: Vec<CustodyOriginalRefV1>,
+}
+
+fn real_state(capsule: &CustomCapsuleV1, format: GitObjectFormatV1) -> RealStateV1 {
+    let generation = CaseV1::generation(capsule);
+    let commit = real_object(capsule, KindV1::Commit);
+    let tag = real_object(capsule, KindV1::Tag);
+    let (commit_id, tag_id) = (commit.object_id().to_owned(), tag.object_id().to_owned());
+    let loose = format!("{commit_id}\n");
+    let packed_text = format!(
+        "{PACKED_HEADER_V1}{commit_id} refs/heads/side\n{tag_id} refs/tags/v1\n^{commit_id}\n"
+    );
+    let zero = "0".repeat(oid_len(format));
+    let log = format!("{zero} {commit_id} {IDENT_V1}\tbranch: Created from main\n");
+    let refs_frame = encode_frame(
+        REFS_V1,
+        &generation,
+        &[
+            fb("HEAD", b"ref: refs/heads/main\n"),
+            fb("ORIG_HEAD", loose.as_bytes()),
+            fb("packed-refs", packed_text.as_bytes()),
+            db("refs"),
+            db("refs/heads"),
+            fb("refs/heads/main", loose.as_bytes()),
+            db("refs/tags"),
+        ],
+    );
+    let logs_frame = encode_frame(
+        LOGS_V1,
+        &generation,
+        &[
+            db("logs"),
+            fb("logs/HEAD", log.as_bytes()),
+            db("logs/refs"),
+            db("logs/refs/heads"),
+            fb("logs/refs/heads/main", log.as_bytes()),
+        ],
+    );
+    let manifest_refs = vec![
+        symbolic_ref("HEAD", "refs/heads/main"),
+        direct_ref("ORIG_HEAD", &commit),
+        direct_ref("refs/heads/main", &commit),
+        direct_ref("refs/heads/side", &commit),
+        direct_ref("refs/tags/v1", &tag),
+    ];
+    RealStateV1 {
+        refs_frame,
+        logs_frame,
+        manifest_refs,
+    }
+}
+
+fn real_case(capsule: &CustomCapsuleV1, format: GitObjectFormatV1) -> CaseV1 {
+    let state = real_state(capsule, format);
+    let mut case = CaseV1::with_bytes(
+        capsule,
+        &[(REFS_V1, state.refs_frame), (LOGS_V1, state.logs_frame)],
+    );
+    set_refs(&mut case.verified, state.manifest_refs);
+    case
+}
+
+/// Real SHA-1 and SHA-256 capsules (real Git objects, a real pack, a real phase-V value) carry the
+/// real-shaped refs through the WHOLE chain: pass A's bootstrap proves the objects with real Git, B1a
+/// prevalidates the frames and returns its plan, and B1b's agreement over those same retained
+/// descriptors, the one ledger, and the one deadline accepts every manifest ref. B1b writes, charges, and
+/// reserves nothing.
+#[test]
+fn b1b_real_objects_and_frames_agree_through_the_whole_chain_in_both_formats() {
+    for cformat in [
+        CustodyGitObjectFormatV1::Sha1,
+        CustodyGitObjectFormatV1::Sha256,
+    ] {
+        let format = core_format(cformat);
+        let capsule = captured(cformat);
+        let CaseV1 { dest, verified } = real_case(&capsule, format);
+        let mut boot = must_bootstrap(verified, format);
+        assert_eq!(
+            boot.provenance,
+            GitFormatProvenanceV1::CapsuleObjectsAndPack
+        );
+        let plan = prevalidate(&mut boot.verified, far_deadline()).expect("B1a admits the frames");
+        let ledger = ledger_used(&boot.verified);
+        let tree = snapshot(&dest.path);
+
+        let agreement = agree(&mut boot.verified, &plan, format)
+            .unwrap_or_else(|error| panic!("{cformat:?}: {error:?}"));
+        let commit = real_object(&capsule, KindV1::Commit).object_id().to_owned();
+        assert_eq!(
+            agreement.head,
+            HeadStateV1::Symbolic {
+                target: "refs/heads/main".into(),
+                resolved: Some(commit.clone()),
+            }
+        );
+        assert_eq!(agreement.orig_head, Some(commit));
+        assert_eq!(
+            (
+                agreement.loose_refs,
+                agreement.packed_refs,
+                agreement.peeled_rows,
+                agreement.effective_refs,
+                agreement.manifest_refs,
+                agreement.reflog_files,
+                agreement.reflog_rows,
+                agreement.direct_targets,
+            ),
+            (1, 2, 1, 3, 5, 2, 2, 2),
+            "{cformat:?}"
+        );
+        // Nothing was written, charged, or left mid-read.
+        assert_eq!(ledger_used(&boot.verified), ledger, "{cformat:?}");
+        assert_eq!(snapshot(&dest.path), tree, "{cformat:?}");
+        assert_eq!(dest.entries(), [".restore-work"], "{cformat:?}");
+        assert!(boot
+            .verified
+            .staged
+            .iter()
+            .filter(|one| matches!(one.role, CustodyCapsuleArtifactRoleV1::CoveragePayload(_)))
+            .all(|one| position(one) == 0));
+        // The same retained value agrees again, to the same result.
+        assert_eq!(
+            agree(&mut boot.verified, &plan, format).expect("a second agreement"),
+            agreement
+        );
+    }
+}
+
+/// The success control: Empty objects (no pack, an empty inventory) with a Captured, valid, UNBORN HEAD
+/// agree for BOTH caller formats, and the bootstrap reports caller-selected provenance.
+#[test]
+fn b1b_empty_objects_with_a_captured_unborn_head_agree_for_both_caller_formats() {
+    for cformat in [
+        CustodyGitObjectFormatV1::Sha1,
+        CustodyGitObjectFormatV1::Sha256,
+    ] {
+        let format = core_format(cformat);
+        let capsule = empty(cformat);
+        let case = CaseV1::refs_only(&capsule, &[db("refs"), db("refs/heads"), db("refs/tags")]);
+        let CaseV1 { dest, verified } = case;
+        let mut boot = must_bootstrap(verified, format);
+        assert_eq!(boot.provenance, GitFormatProvenanceV1::CallerSelectedEmpty);
+        assert!(matches!(boot.objects, BootstrapObjectsV1::Empty));
+        assert_eq!(boot.closure.inventory_objects, 0);
+        let plan = prevalidate(&mut boot.verified, far_deadline()).expect("B1a admits the frame");
+        let tree = snapshot(&dest.path);
+        let agreement = agree(&mut boot.verified, &plan, format)
+            .unwrap_or_else(|error| panic!("{cformat:?}: {error:?}"));
+        assert_eq!(
+            agreement.head,
+            HeadStateV1::Symbolic {
+                target: "refs/heads/main".into(),
+                resolved: None,
+            }
+        );
+        assert_eq!(
+            (
+                agreement.effective_refs,
+                agreement.direct_targets,
+                agreement.manifest_refs
+            ),
+            (0, 0, 0)
+        );
+        assert_eq!(snapshot(&dest.path), tree);
+        // With a manifest that lists the unborn HEAD, either way, it still agrees.
+        for head in [
+            symbolic_ref("HEAD", "refs/heads/main"),
+            CustodyOriginalRefV1::new(
+                LosslessPathV1::from_bytes(b"HEAD".to_vec()),
+                CustodyRefTargetV1::Unborn,
+            )
+            .expect("an unborn ref"),
+        ] {
+            set_refs(&mut boot.verified, vec![head]);
+            let agreement = agree(&mut boot.verified, &plan, format).expect("a listed unborn HEAD");
+            assert_eq!(agreement.manifest_refs, 1);
+        }
+    }
+}
+
+/// An all-Empty capsule has no HEAD, so there is nothing to agree: an empty plan (what B1a would have
+/// refused to produce) is the same typed refusal, and no HEAD is synthesized. A refs frame with a missing
+/// plan entry, or only a reflog frame, is the same refusal.
+#[test]
+fn b1b_empty_refs_are_refused_and_no_head_is_synthesized() {
+    let capsule = frames_capsule();
+    let mut case = CaseV1::with_bytes(&capsule, &[]);
+    let error =
+        prevalidate(&mut case.verified, far_deadline()).expect_err("B1a refuses Empty refs");
+    assert!(
+        matches!(error, GitBootstrapErrorV1::EmptyRefsAndHead),
+        "{error:?}"
+    );
+    let empty_plan = ActiveFramePlanV1 { frames: vec![] };
+    let error =
+        agree(&mut case.verified, &empty_plan, GitObjectFormatV1::Sha1).expect_err("no refs frame");
+    assert!(
+        matches!(error, GitBootstrapErrorV1::EmptyRefsAndHead),
+        "{error:?}"
+    );
+    assert_eq!(case.dest.entries(), [".restore-work"]);
+
+    // Reflogs alone: still no HEAD.
+    let generation = CaseV1::generation(&capsule);
+    let logs = encode_frame(LOGS_V1, &generation, &[db("logs")]);
+    let mut case = CaseV1::with_bytes(&capsule, &[(LOGS_V1, logs)]);
+    let error = prevalidate(&mut case.verified, far_deadline()).expect_err("B1a refuses");
+    assert!(
+        matches!(error, GitBootstrapErrorV1::EmptyRefsAndHead),
+        "{error:?}"
+    );
+    let error =
+        agree(&mut case.verified, &empty_plan, GitObjectFormatV1::Sha1).expect_err("no refs");
+    assert!(
+        matches!(error, GitBootstrapErrorV1::EmptyRefsAndHead),
+        "{error:?}"
+    );
+}
+
+/// The rich plan-backed capsule's REAL frames, as real Git wrote them (a clone with packed refs, a
+/// symbolic `origin/HEAD`, a stash, `ORIG_HEAD` from an interrupted merge, and every reflog), agree. The
+/// expected facts come from real Git against the real source repository: its ref list (name, object,
+/// symbolic target) becomes the manifest's refs, and its HEAD must be the agreement's HEAD.
+#[test]
+fn b1b_the_rich_clones_real_frames_agree_with_real_git() {
+    let fixture = PlanFixtureV1::rich_clone();
+    let (manifest, capability, _receipts) = fixture.planned();
+    let _ = expect_sealed(
+        fixture
+            .export(&manifest, capability)
+            .expect("the rich export seals"),
+    );
+    // The fixture's source clone, beside its export scratch: `<area>/scratch/capsule`.
+    let git_dir = fixture
+        .capsule_dir()
+        .parent()
+        .and_then(Path::parent)
+        .expect("the fixture area")
+        .join("clone/.git");
+    assert!(
+        git_dir.join("HEAD").is_file(),
+        "the source clone's git directory"
+    );
+    let (dest, mut verified) = phase_v(&fixture.capsule_dir());
+    let plan = prevalidate(&mut verified, far_deadline()).expect("B1a admits the real frames");
+    let format = GitObjectFormatV1::Sha1;
+
+    // Without a manifest ref, every active target of the real repository is still checked.
+    let bare = agree(&mut verified, &plan, format).expect("the real refs agree");
+    assert!(
+        verified
+            .staged
+            .iter()
+            .filter(|one| matches!(one.role, CustodyCapsuleArtifactRoleV1::CoveragePayload(_)))
+            .all(|one| position(one) == 0),
+        "every active frame's descriptor is back at offset 0"
+    );
+    // Real Git's own view.
+    let listing = plumb(
+        &git_dir,
+        &[
+            "for-each-ref",
+            "--format=%(refname)\t%(objectname)\t%(symref)",
+        ],
+        None,
+    );
+    let head_target = plumb(&git_dir, &["symbolic-ref", "HEAD"], None);
+    let head_oid = plumb(&git_dir, &["rev-parse", "HEAD"], None);
+    let refs: Vec<(String, String, String)> = listing
+        .lines()
+        .map(|line| {
+            let mut fields = line.split('\t');
+            (
+                fields.next().expect("a name").to_owned(),
+                fields.next().expect("an object").to_owned(),
+                fields.next().unwrap_or("").to_owned(),
+            )
+        })
+        .collect();
+    assert!(
+        refs.len() >= 5,
+        "a clone with branches, remotes, and a stash: {refs:?}"
+    );
+    assert!(refs
+        .iter()
+        .any(|(name, _, symref)| name == "refs/stash" && symref.is_empty()));
+    assert!(refs
+        .iter()
+        .any(|(name, _, symref)| name == "refs/remotes/origin/HEAD" && !symref.is_empty()));
+    assert_eq!(bare.effective_refs, refs.len() as u64, "the real ref count");
+    assert_eq!(
+        bare.head,
+        HeadStateV1::Symbolic {
+            target: head_target.clone(),
+            resolved: Some(head_oid.clone()),
+        }
+    );
+    assert!(
+        bare.orig_head.is_some(),
+        "the interrupted merge left ORIG_HEAD"
+    );
+    assert!(bare.reflog_files >= 3, "{}", bare.reflog_files);
+    assert!(bare.packed_refs > 0, "a clone packs its remote refs");
+
+    // With the manifest listing EVERY real ref and HEAD, each is cross-checked by name and target.
+    let objects = verified.control.manifest.original_objects().to_vec();
+    let mut listed = vec![symbolic_ref("HEAD", &head_target)];
+    for (name, oid, symref) in &refs {
+        if symref.is_empty() {
+            let object = objects
+                .iter()
+                .find(|object| object.object_id() == oid)
+                .unwrap_or_else(|| panic!("{name} names {oid}, which the manifest lists"));
+            listed.push(direct_ref(name, object));
+        } else {
+            listed.push(symbolic_ref(name, symref));
+        }
+    }
+    set_refs(&mut verified, listed.clone());
+    let full = agree(&mut verified, &plan, format).expect("every real ref agrees");
+    assert_eq!(full.manifest_refs, listed.len() as u64);
+    assert_eq!(full.head, bare.head);
+
+    // A manifest that disagrees with real Git on ONE ref is refused by name.
+    let (name, oid, _) = refs
+        .iter()
+        .find(|(name, _, symref)| name == "refs/heads/main" && symref.is_empty())
+        .expect("the real main branch");
+    let other = objects
+        .iter()
+        .find(|object| object.object_id() != oid && object.kind() == KindV1::Commit)
+        .expect("another real commit");
+    let mut wrong = listed.clone();
+    wrong.retain(|record| record.name().as_bytes() != name.as_bytes());
+    wrong.push(direct_ref(name, other));
+    set_refs(&mut verified, wrong);
+    assert_eq!(
+        refs_fault(agree(&mut verified, &plan, format).expect_err("a wrong object")),
+        RefsFaultV1::OriginalMismatch {
+            name: name.clone(),
+            expected: format!("direct {}", other.object_id()),
+            found: format!("direct {oid}"),
+        }
+    );
+    // And one that lists a ref the real repository never had.
+    let mut ghost = listed;
+    ghost.push(direct_ref("refs/heads/never-existed", other));
+    set_refs(&mut verified, ghost);
+    assert_eq!(
+        refs_fault(agree(&mut verified, &plan, format).expect_err("a ghost ref")),
+        RefsFaultV1::MissingOriginal {
+            name: "refs/heads/never-existed".into()
+        }
+    );
+    assert_eq!(dest.entries(), [".restore-work"]);
+
+    // Retained descriptors are the only input: every staged leaf renamed away, then unlinked, still agrees.
+    set_refs(&mut verified, Vec::new());
+    let plain = dest.work().join("plain");
+    for (relative, bytes) in snapshot(&plain) {
+        if bytes.is_some() {
+            let from = plain.join(&relative);
+            let to = from.with_file_name(format!("moved-{}", relative.replace('/', "-")));
+            std::fs::rename(&from, &to).expect("a staged leaf is renamed");
+        }
+    }
+    assert_eq!(
+        agree(&mut verified, &plan, format).expect("renamed leaves"),
+        bare
+    );
+    for (relative, bytes) in snapshot(&plain) {
+        if bytes.is_some() {
+            std::fs::remove_file(plain.join(&relative)).expect("a staged leaf is unlinked");
+        }
+    }
+    assert_eq!(
+        agree(&mut verified, &plan, format).expect("unlinked leaves"),
+        bare
+    );
+}
+
+/// Prevalidates a case's frames, then returns its plan.
+fn planned(case: &mut CaseV1) -> ActiveFramePlanV1 {
+    prevalidate(&mut case.verified, far_deadline()).expect("B1a admits the frames")
+}
+
+/// A refusal in the retained agreement leaves no trace (the ledger, the whole destination tree, and the
+/// directory listing are exactly what they were) and is in B1a's failure shape; a refused run still
+/// reports the typed fault. One row per class of fault, each from a real frame beside real objects.
+#[test]
+fn b1b_retained_refusals_leave_no_trace_and_keep_the_failure_shape() {
+    let capsule = captured(CustodyGitObjectFormatV1::Sha1);
+    let format = GitObjectFormatV1::Sha1;
+    let commit = real_object(&capsule, KindV1::Commit);
+    let blob = real_object(&capsule, KindV1::Blob);
+    let missing = "7".repeat(40);
+    let generation = CaseV1::generation(&capsule);
+    let bad_head = encode_frame(REFS_V1, &generation, &[fb("HEAD", b"not a ref\n")]);
+    let blob_branch = format!("{}\n", blob.object_id());
+    let kind_frame = encode_frame(
+        REFS_V1,
+        &generation,
+        &[
+            fb("HEAD", b"ref: refs/heads/main\n"),
+            db("refs"),
+            db("refs/heads"),
+            fb("refs/heads/main", blob_branch.as_bytes()),
+        ],
+    );
+    let absent = format!("{missing}\n");
+    let absent_frame = encode_frame(
+        REFS_V1,
+        &generation,
+        &[
+            fb("HEAD", b"ref: refs/heads/main\n"),
+            db("refs"),
+            db("refs/heads"),
+            fb("refs/heads/main", absent.as_bytes()),
+        ],
+    );
+    let good = encode_frame(
+        REFS_V1,
+        &generation,
+        &[
+            fb("HEAD", b"ref: refs/heads/main\n"),
+            db("refs"),
+            db("refs/heads"),
+        ],
+    );
+    let rows: Vec<(&str, Vec<u8>, Vec<CustodyOriginalRefV1>)> = vec![
+        ("a malformed HEAD", bad_head, vec![]),
+        ("a branch on a blob", kind_frame, vec![]),
+        ("a target outside the inventory", absent_frame, vec![]),
+        (
+            "a manifest ref the frame lacks",
+            good.clone(),
+            vec![direct_ref("refs/heads/main", &commit)],
+        ),
+    ];
+    for (row, frame, refs) in rows {
+        let mut case = CaseV1::with_bytes(&capsule, &[(REFS_V1, frame)]);
+        set_refs(&mut case.verified, refs);
+        let plan = planned(&mut case);
+        let ledger = ledger_used(&case.verified);
+        let tree = snapshot(&case.dest.path);
+        let error = agree(&mut case.verified, &plan, format).expect_err(row);
+        assert!(
+            matches!(error, GitBootstrapErrorV1::Refs(_)),
+            "{row}: {error:?}"
+        );
+        assert_eq!(ledger_used(&case.verified), ledger, "{row}: the ledger");
+        assert_eq!(snapshot(&case.dest.path), tree, "{row}: a byte was written");
+        assert_eq!(case.dest.entries(), [".restore-work"], "{row}");
+    }
+}
+
+fn two_real_frames(capsule: &CustomCapsuleV1) -> CaseV1 {
+    real_case(capsule, GitObjectFormatV1::Sha1)
+}
+
+/// The agreement reads exactly the frames B1a admitted: a plan that is not this capsule's is refused
+/// before a frame is decoded, whatever is wrong with it: an entry digest, a count, a length, a digest, a
+/// staged index, a class, the frame order, or a missing or extra frame.
+#[test]
+fn b1b_the_plan_binds_the_frames_the_agreement_reads() {
+    let capsule = captured(CustodyGitObjectFormatV1::Sha1);
+    let format = GitObjectFormatV1::Sha1;
+    let mut case = two_real_frames(&capsule);
+    let plan = planned(&mut case);
+    assert_eq!(plan.frames.len(), 2);
+    agree(&mut case.verified, &plan, format).expect("the untampered plan");
+
+    type Edit = fn(&mut ActiveFramePlanV1);
+    let edits: [(&str, Edit); 12] = [
+        ("an entry digest", |plan| {
+            plan.frames[0].entries_sha256[0] ^= 1
+        }),
+        ("the second frame's entry digest", |plan| {
+            plan.frames[1].entries_sha256[31] ^= 1
+        }),
+        ("an entry count", |plan| plan.frames[0].entries += 1),
+        ("a directory count", |plan| plan.frames[1].directories += 1),
+        ("a file count", |plan| plan.frames[0].regular_files += 1),
+        ("a content byte count", |plan| {
+            plan.frames[0].content_bytes += 1
+        }),
+        ("a length", |plan| plan.frames[0].length += 1),
+        ("a staged digest", |plan| plan.frames[1].sha256[0] ^= 1),
+        ("a staged index", |plan| {
+            plan.frames[0].staged = plan.frames[1].staged
+        }),
+        ("a swapped frame order", |plan| plan.frames.reverse()),
+        ("a missing frame", |plan| {
+            plan.frames.pop();
+        }),
+        ("an extra frame", |plan| {
+            let extra = plan.frames[0].clone();
+            plan.frames.push(extra);
+        }),
+    ];
+    for (row, edit) in edits {
+        let mut tampered = plan.clone();
+        edit(&mut tampered);
+        let ledger = ledger_used(&case.verified);
+        let error = agree(&mut case.verified, &tampered, format).expect_err(row);
+        assert!(
+            matches!(error, GitBootstrapErrorV1::ActivePlanMismatch(_)),
+            "{row}: {error:?}"
+        );
+        assert_eq!(ledger_used(&case.verified), ledger, "{row}");
+    }
+    // A plan whose class says something else than the staged role it points at.
+    let mut tampered = plan.clone();
+    tampered.frames[0].class = LOGS_V1;
+    let error = agree(&mut case.verified, &tampered, format).expect_err("a wrong class");
+    assert!(
+        matches!(error, GitBootstrapErrorV1::ActivePlanMismatch(_)),
+        "{error:?}"
+    );
+}
+
+/// A staged frame that no longer is the verified plaintext is refused as THAT, ahead of whatever it says:
+/// bytes changed or length changed after B1a (caught by the rehash), and a frame swapped for a well-formed
+/// frame carrying a bad HEAD between the rehash and the decode (caught by binding the decoded bytes to the
+/// verified digest: the content fault is held, and integrity outranks it).
+#[test]
+fn b1b_integrity_outranks_content_and_drift_is_refused() {
+    use std::os::unix::fs::FileExt as _;
+    let capsule = captured(CustodyGitObjectFormatV1::Sha1);
+    let format = GitObjectFormatV1::Sha1;
+    for (row, edit) in [
+        (
+            "a byte changed",
+            (|file: &std::fs::File| file.write_all_at(&[0xff], 12).expect("change"))
+                as fn(&std::fs::File),
+        ),
+        ("truncated", |file| {
+            let length = file.metadata().expect("metadata").len();
+            file.set_len(length - 1).expect("truncate");
+        }),
+        ("a byte appended", |file| {
+            let length = file.metadata().expect("metadata").len();
+            file.write_all_at(b"x", length).expect("append");
+        }),
+    ] {
+        let mut case = two_real_frames(&capsule);
+        let plan = planned(&mut case);
+        let index = staged_index(&case.verified, REFS_V1);
+        edit(&case.verified.staged[index].file);
+        let name = lossy(case.verified.staged[index].name.as_bytes());
+        let error = agree(&mut case.verified, &plan, format).expect_err(row);
+        assert!(
+            matches!(&error, GitBootstrapErrorV1::StagedInputChanged { name: found } if *found == name),
+            "{row}: {error:?}"
+        );
+    }
+
+    let generation = CaseV1::generation(&capsule);
+    let good = encode_frame(
+        REFS_V1,
+        &generation,
+        &[
+            fb("HEAD", b"ref: refs/heads/main\n"),
+            db("refs"),
+            db("refs/heads"),
+            db("refs/tags"),
+        ],
+    );
+    let evil = encode_frame(REFS_V1, &generation, &[fb("HEAD", b"not a ref at all\n")]);
+    assert!(evil.len() < good.len());
+    let mut case = CaseV1::with_bytes(&capsule, &[(REFS_V1, good)]);
+    let plan = planned(&mut case);
+    let handle = case.verified.staged[staged_index(&case.verified, REFS_V1)]
+        .file
+        .try_clone()
+        .expect("a duplicate descriptor");
+    let swapped = std::cell::Cell::new(false);
+    let _hook = install_git_hook_for_test(GitHookPointV1::DeadlineObserved, move |event| {
+        if event.label == "frame-rewind" && !swapped.replace(true) {
+            handle.set_len(0).expect("empty the frame");
+            handle.write_all_at(&evil, 0).expect("another frame");
+        }
+    });
+    let error = agree(&mut case.verified, &plan, format).expect_err("a swapped frame");
+    assert!(
+        matches!(error, GitBootstrapErrorV1::StagedInputChanged { .. }),
+        "the swapped frame's bad HEAD must not outrank its integrity: {error:?}"
+    );
+
+    // A frame swapped for one whose HEAD content is corrupt (its per-file digest no longer holds) fails
+    // inside the content read: that is an invalid frame, never a refs fault and never a success.
+    let generation = CaseV1::generation(&capsule);
+    let good = encode_frame(
+        REFS_V1,
+        &generation,
+        &[fb("HEAD", b"ref: refs/heads/main\n"), db("refs")],
+    );
+    let mut corrupt = good.clone();
+    let at = corrupt
+        .windows(5)
+        .position(|window| window == b"ref: ")
+        .expect("the HEAD content");
+    corrupt[at + 6] ^= 0x01;
+    assert_eq!(corrupt.len(), good.len());
+    let mut case = CaseV1::with_bytes(&capsule, &[(REFS_V1, good)]);
+    let plan = planned(&mut case);
+    let handle = case.verified.staged[staged_index(&case.verified, REFS_V1)]
+        .file
+        .try_clone()
+        .expect("a duplicate descriptor");
+    let swapped = std::cell::Cell::new(false);
+    let _hook = install_git_hook_for_test(GitHookPointV1::DeadlineObserved, move |event| {
+        if event.label == "frame-rewind" && !swapped.replace(true) {
+            handle.write_all_at(&corrupt, 0).expect("a corrupt frame");
+        }
+    });
+    let error = agree(&mut case.verified, &plan, format).expect_err("a corrupt frame");
+    assert!(
+        matches!(
+            error,
+            GitBootstrapErrorV1::Restore(CustodyRestoreErrorV1::FrameInvalid { class: REFS_V1 })
+        ),
+        "{error:?}"
+    );
+}
+
+/// The retained agreement's guards: a clean two-frame run reads the clock at exactly the documented
+/// guards in order (the shared rehash guards, then its own); each halts the run alone AT that guard with
+/// nothing written; brief delays at every guard, with headroom, still succeed; a deadline already spent
+/// refuses at the entry guard; and the deadline is observed before every decoded entry.
+#[test]
+fn b1b_the_retained_agreement_observes_the_one_deadline() {
+    const CLEAN: [&str; 14] = [
+        "refs-entry",
+        "frame-rehash",
+        "frame-rewind",
+        "refs-decoded",
+        "refs-rewound",
+        "frame-rehash",
+        "frame-rewind",
+        "refs-decoded",
+        "refs-rewound",
+        "refs-structure",
+        "refs-targets",
+        "refs-resolved",
+        "refs-manifest",
+        "refs-final",
+    ];
+    let capsule = captured(CustodyGitObjectFormatV1::Sha1);
+    let format = GitObjectFormatV1::Sha1;
+    let fresh = || {
+        let mut case = two_real_frames(&capsule);
+        let plan = planned(&mut case);
+        (case, plan)
+    };
+    let (mut case, plan) = fresh();
+    let (labels, hook) = record_guards();
+    agree(&mut case.verified, &plan, format).expect("a clean run");
+    drop(hook);
+    assert_eq!(*labels.borrow(), CLEAN);
+
+    let mut distinct: Vec<&'static str> = Vec::new();
+    for label in CLEAN {
+        if !distinct.contains(&label) {
+            distinct.push(label);
+        }
+    }
+    for target in distinct {
+        let (mut case, plan) = fresh();
+        let deadline = Instant::now() + B1A_DEADLINE_V1;
+        let labels = std::rc::Rc::new(std::cell::RefCell::new(Vec::<&'static str>::new()));
+        let fired = std::rc::Rc::new(std::cell::Cell::new(false));
+        let (seen, slow) = (labels.clone(), fired.clone());
+        let _hook = install_git_hook_for_test(GitHookPointV1::DeadlineObserved, move |event| {
+            seen.borrow_mut().push(event.label);
+            if event.label == target && !slow.replace(true) {
+                pass_the_deadline(deadline);
+            }
+        });
+        let ledger = ledger_used(&case.verified);
+        let tree = snapshot(&case.dest.path);
+        let error = agree_with(
+            &mut case.verified,
+            &plan,
+            format,
+            deadline,
+            RefsLimitsV1::v1(),
+        )
+        .expect_err(target);
+        assert!(
+            matches!(error, GitBootstrapErrorV1::Git(CustodyGitError::Timeout)),
+            "{target}: {error:?}"
+        );
+        assert!(fired.get(), "{target}: the slow step never ran");
+        assert_eq!(
+            labels.borrow().last().copied(),
+            Some(target),
+            "{target}: the run halted AT its guard: {:?}",
+            labels.borrow()
+        );
+        assert_eq!(ledger_used(&case.verified), ledger, "{target}");
+        assert_eq!(snapshot(&case.dest.path), tree, "{target}");
+    }
+
+    let (mut case, plan) = fresh();
+    {
+        let _hook = install_git_hook_for_test(GitHookPointV1::DeadlineObserved, |_| {
+            std::thread::sleep(Duration::from_millis(40));
+        });
+        agree_with(
+            &mut case.verified,
+            &plan,
+            format,
+            Instant::now() + B1A_DEADLINE_V1,
+            RefsLimitsV1::v1(),
+        )
+        .expect("fourteen brief delays leave most of the deadline");
+    }
+
+    // Spent: refused at the entry guard, no descriptor moved.
+    let (mut case, plan) = fresh();
+    for one in &case.verified.staged {
+        use std::io::Seek as _;
+        (&one.file)
+            .seek(SeekFrom::Start(3))
+            .expect("park the descriptor");
+    }
+    let spent = Instant::now();
+    std::thread::sleep(Duration::from_millis(5));
+    let (labels, hook) = record_guards();
+    let error = agree_with(&mut case.verified, &plan, format, spent, RefsLimitsV1::v1())
+        .expect_err("a spent deadline");
+    drop(hook);
+    assert!(
+        matches!(error, GitBootstrapErrorV1::Git(CustodyGitError::Timeout)),
+        "{error:?}"
+    );
+    assert_eq!(*labels.borrow(), ["refs-entry"]);
+    assert!(case.verified.staged.iter().all(|one| position(one) == 3));
+}
+
+/// A deadline that passes while one entry is being read stops AT that entry (no later entry is decoded),
+/// and a large reflog whose entry spends the deadline is not read past the one buffer the decoder had
+/// already taken.
+#[test]
+fn b1b_the_retained_agreement_decodes_nothing_after_the_deadline() {
+    let capsule = captured(CustodyGitObjectFormatV1::Sha1);
+    let format = GitObjectFormatV1::Sha1;
+    let generation = CaseV1::generation(&capsule);
+    let commit = real_object(&capsule, KindV1::Commit);
+    let branch = format!("{}\n", commit.object_id());
+    let refs = encode_frame(
+        REFS_V1,
+        &generation,
+        &[
+            fb("HEAD", b"ref: refs/heads/a\n"),
+            db("refs"),
+            db("refs/heads"),
+            fb("refs/heads/a", branch.as_bytes()),
+            fb("refs/heads/b", branch.as_bytes()),
+            fb("refs/heads/c", branch.as_bytes()),
+        ],
+    );
+    // The deadline passes while a DIRECTORY entry is judged, where nothing is read from it: the loop's own
+    // guard stops the decode at the next entry. Then while a regular file's entry is judged: the file's
+    // admission refuses before its first read. Either way no later entry is decoded.
+    for (spender, expected) in [
+        ("refs/heads", &["HEAD", "refs", "refs/heads"][..]),
+        (
+            "refs/heads/a",
+            &["HEAD", "refs", "refs/heads", "refs/heads/a"][..],
+        ),
+    ] {
+        let mut case = CaseV1::with_bytes(&capsule, &[(REFS_V1, refs.clone())]);
+        let plan = planned(&mut case);
+        let deadline = Instant::now() + B1A_DEADLINE_V1;
+        let entries = std::rc::Rc::new(std::cell::RefCell::new(Vec::<String>::new()));
+        let seen = entries.clone();
+        let hook = install_git_hook_for_test(GitHookPointV1::FrameEntry, move |event| {
+            seen.borrow_mut()
+                .push(event.path.to_string_lossy().into_owned());
+            if event.path == Path::new(spender) {
+                pass_the_deadline(deadline);
+            }
+        });
+        let error = agree_with(
+            &mut case.verified,
+            &plan,
+            format,
+            deadline,
+            RefsLimitsV1::v1(),
+        )
+        .expect_err("the deadline passed while judging an entry");
+        assert!(
+            matches!(error, GitBootstrapErrorV1::Git(CustodyGitError::Timeout)),
+            "{spender}: {error:?}"
+        );
+        assert_eq!(
+            *entries.borrow(),
+            expected,
+            "{spender}: no entry after the one that spent the deadline was decoded"
+        );
+        drop(hook);
+    }
+
+    // Reads are paced: a 300 KiB reflog whose entry spends the deadline is not read further.
+    let zero = "0".repeat(40);
+    let row = format!("{zero} {} {IDENT_V1}\tmessage\n", commit.object_id());
+    let log = row.repeat(300 * 1024 / row.len() + 1);
+    let logs = encode_frame(
+        LOGS_V1,
+        &generation,
+        &[db("logs"), fb("logs/HEAD", log.as_bytes())],
+    );
+    let head_frame = encode_frame(
+        REFS_V1,
+        &generation,
+        &[fb("HEAD", b"ref: refs/heads/main\n"), db("refs")],
+    );
+    let mut case = CaseV1::with_bytes(&capsule, &[(REFS_V1, head_frame), (LOGS_V1, logs)]);
+    let plan = planned(&mut case);
+    let deadline = Instant::now() + B1A_DEADLINE_V1;
+    let _hook = install_git_hook_for_test(GitHookPointV1::FrameEntry, move |event| {
+        if event.path == Path::new("logs/HEAD") {
+            pass_the_deadline(deadline);
+        }
+    });
+    let error = agree_with(
+        &mut case.verified,
+        &plan,
+        format,
+        deadline,
+        RefsLimitsV1::v1(),
+    )
+    .expect_err("the deadline passed before the log was read");
+    assert!(
+        matches!(error, GitBootstrapErrorV1::Git(CustodyGitError::Timeout)),
+        "{error:?}"
+    );
+    let one = &case.verified.staged[staged_index(&case.verified, LOGS_V1)];
+    assert!(one.length > 2 * HASH_BUFFER_BYTES_V1 as u64);
+    assert!(
+        position(one) <= HASH_BUFFER_BYTES_V1 as u64,
+        "the decode read {} bytes of {}: past the deadline",
+        position(one),
+        one.length
+    );
+}
+
+/// The limits apply through the retained entry point, with the failure shape and no trace: a FETCH_HEAD
+/// larger than its cap, and every per-class cap lowered by one from what the real frames need.
+#[test]
+fn b1b_limits_apply_through_the_retained_entry_point() {
+    let capsule = captured(CustodyGitObjectFormatV1::Sha1);
+    let format = GitObjectFormatV1::Sha1;
+    let generation = CaseV1::generation(&capsule);
+    let commit = real_object(&capsule, KindV1::Commit);
+    let row = format!(
+        "{}\t\tbranch 'main' of https://example.invalid/repository\n",
+        commit.object_id()
+    );
+    let limits = RefsLimitsV1::v1();
+    let big = row.repeat((limits.fetch_head_bytes as usize / row.len()) + 2);
+    assert!(big.len() as u64 > limits.fetch_head_bytes);
+    let frame = encode_frame(
+        REFS_V1,
+        &generation,
+        &[
+            fb("HEAD", b"ref: refs/heads/main\n"),
+            fb("FETCH_HEAD", big.as_bytes()),
+        ],
+    );
+    let mut case = CaseV1::with_bytes(&capsule, &[(REFS_V1, frame)]);
+    let plan = planned(&mut case);
+    let ledger = ledger_used(&case.verified);
+    let tree = snapshot(&case.dest.path);
+    let error = agree(&mut case.verified, &plan, format).expect_err("a FETCH_HEAD past its cap");
+    assert_eq!(
+        refs_fault(error),
+        limit_fault(RefsLimitKindV1::FetchHeadFile, limits.fetch_head_bytes)
+    );
+    assert_eq!(ledger_used(&case.verified), ledger);
+    assert_eq!(snapshot(&case.dest.path), tree);
+
+    // The real two-frame state needs these records; one fewer is refused through the same entry point.
+    let mut case = two_real_frames(&capsule);
+    let plan = planned(&mut case);
+    let needed = 1 + 1 + 1 + 2 + 1 + 2; // HEAD, ORIG_HEAD, loose main, two packed rows, a peeled row, two reflogs
+    for (bound, ok) in [(needed, true), (needed - 1, false)] {
+        let outcome = agree_with(
+            &mut case.verified,
+            &plan,
+            format,
+            far_deadline(),
+            limits_with(|limits| limits.entries = bound),
+        );
+        match (ok, outcome) {
+            (true, Ok(_)) => {}
+            (false, Err(error)) => assert_eq!(
+                refs_fault(error),
+                limit_fault(RefsLimitKindV1::Entries, bound)
+            ),
+            (ok, other) => panic!("{bound}: {ok}: {other:?}"),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Structure: the agreement region is pure
+// ---------------------------------------------------------------------------------------------
+
+const B1B_MARKER_V1: &str = "// Pass B1b: pure refs agreement and inert config";
+
+/// STRUCTURAL ONLY. B1b's region (the production source from its marker on) is pure: it opens no path,
+/// walks nothing, writes nothing, charges and reserves nothing, runs no Git child and no process, routes
+/// no object store, and has no unsafe. The marker is unique, follows B1a's region, and its region holds
+/// the entry points; B1a's own read-only scan covers it too (it runs to the end of the file). The
+/// behavior is proven by the retained rows above, which leave the ledger and the destination unchanged.
+#[test]
+fn b1b_the_agreement_region_is_pure_and_the_split_is_unique() {
+    let source = include_str!("custody_restore_git.rs");
+    assert_eq!(source.matches(B1B_MARKER_V1).count(), 1, "one marker");
+    assert_eq!(source.matches(B1A_MARKER_V1).count(), 1, "one B1a marker");
+    let (before, region) = source.split_once(B1B_MARKER_V1).expect("the marker");
+    assert!(before.contains(B1A_MARKER_V1), "B1b follows B1a");
+    assert!(before.contains("pub(crate) fn prevalidate_active_frames_v1("));
+    assert!(region.contains("pub(crate) fn agree_active_refs_v1("));
+    assert!(region.contains("pub(crate) fn encode_inert_config_v1("));
+    assert!(
+        !before.contains("agree_active_refs_v1(") && !before.contains("encode_inert_config_v1("),
+        "the earlier passes do not call B1b"
+    );
+    let code: String = region
+        .lines()
+        .filter(|line| !line.trim_start().starts_with("//"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    // The one ledger is not touched here at all: B1b's failure reads its figure through B1a's helper.
+    assert_eq!(
+        code.matches(".ledger").count(),
+        0,
+        "no access to the ledger"
+    );
+    for forbidden in [
+        "std::fs",
+        "File::open(",
+        "OpenOptions",
+        "read_dir(",
+        "create_new",
+        "create_staging_directory",
+        "write_all",
+        "GitRunnerV1",
+        "GitRunRequestV1",
+        "GitCommandV1",
+        "GitObjectStoreRouteV1",
+        "object_store",
+        "borrow_mut",
+        "ReservedPairV1",
+        "OwnedChargeV1",
+        "ScratchLedgerV1",
+        ".reserve(",
+        ".release(",
+        "roll_back",
+        "unsafe",
+        "\"repository\"",
+        "remeasure_git_directory",
+        "measure_git_directory",
+        "walk",
+        "Command",
+        "spawn",
+        "std::process",
+        "mkdir",
+        "rename",
+        "remove_file",
+        "set_len",
+    ] {
+        assert!(
+            !code.contains(forbidden),
+            "the pure region mentions `{forbidden}`"
+        );
+    }
+}

@@ -60,6 +60,16 @@
 //! It returns bounded metadata, [`ActiveFramePlanV1`], for a later second decode; the caller keeps the
 //! one capsule, ledger, pins, and deadline. The pass A invariant above is function-scoped: direct
 //! [`bootstrap_git_objects_v1`] never creates anything outside `.restore-work/`.
+//!
+//! **Pass B1b.** [`RefsBuilderV1`] is the pure refs foundation: it parses the exact HEAD, loose refs,
+//! packed refs (with peeled rows), `ORIG_HEAD`, `FETCH_HEAD`, and reflogs from readers, under explicit
+//! byte, line, entry, and retained-memory limits and the one deadline, never invoking Git and never
+//! reading archived configuration; then [`RefsBuilderV1::finish`] resolves symbolic chains with bounded
+//! work, applies loose-over-packed precedence, and agrees the result with the manifest's original refs
+//! and the verified inventory. [`agree_active_refs_v1`] feeds it from the retained, B1a-prevalidated
+//! frames (a second decode bound to [`ActiveFramePlanV1`]); a later pass feeds the same builder from
+//! the retained final descriptors. [`encode_inert_config_v1`] is the deterministic active config. It
+//! restores nothing: no repository entry, no Git child, no ledger access.
 
 use super::{
     create_staging_directory, hash_prefix, joined, lossy, recheck_entry, refuse_mounts_within,
@@ -84,6 +94,7 @@ use crate::custody_git::{
 use crate::custody_inventory::CustodyStateClassV1;
 use crate::custody_seal::{
     CustodyCoverageClassV1, CustodyGitObjectFormatV1, CustodyGitObjectKindV1, CustodyManifestV1,
+    CustodyRefTargetV1,
 };
 use crate::fs_custody::{
     pinned_root_unchanged, ChildKindV1, ChildStatV1, FsCustodyError, PinnedDirectoryV1,
@@ -211,6 +222,11 @@ pub(crate) enum GitBootstrapErrorV1 {
         class: CustodyCoverageClassV1,
         fault: ActiveFrameFaultV1,
     },
+    // Refs agreement (pass B1b).
+    #[error("the refs agreement refuses: {0}")]
+    Refs(RefsFaultV1),
+    #[error("the active-frame plan is not this capsule's: {0}")]
+    ActivePlanMismatch(String),
     /// A child failed, and reconciling what it left behind failed too. Neither is dropped: the
     /// reconciliation failure is a budget or custody refusal in its own right.
     #[error("{primary}; reconciling the failed child's effects also failed: {reconcile}")]
@@ -3230,14 +3246,24 @@ pub(crate) fn prevalidate_active_frames_bounded_v1(
     completed: Option<GitPlaneStepV1>,
     table_bound: u64,
 ) -> Result<ActiveFramePlanV1, GitBootstrapFailureV1> {
-    prevalidate_frames(verified, frame_budget, deadline, table_bound).map_err(|cause| {
-        GitBootstrapFailureV1 {
-            cause,
-            last_completed: completed,
-            active_materialization_began: false,
-            ledger_used: verified.destination.ledger.borrow().used(),
-        }
-    })
+    prevalidate_frames(verified, frame_budget, deadline, table_bound)
+        .map_err(|cause| pre_materialization_failure(verified, cause, completed))
+}
+
+/// A refusal in pass A's failure shape for a pass that writes nothing: it never began active
+/// materialization, it carries `completed`, the last step the caller's flow completed whole, and the one
+/// ledger's charge, read and never changed. Pass B1a and pass B1b share it.
+fn pre_materialization_failure(
+    verified: &VerifiedCapsuleV1,
+    cause: GitBootstrapErrorV1,
+    completed: Option<GitPlaneStepV1>,
+) -> GitBootstrapFailureV1 {
+    GitBootstrapFailureV1 {
+        cause,
+        last_completed: completed,
+        active_materialization_began: false,
+        ledger_used: verified.destination.ledger.borrow().used(),
+    }
 }
 
 fn prevalidate_frames(
@@ -3281,4 +3307,1443 @@ fn prevalidate_frames(
     // The last statement ahead of the infallible result.
     observe_deadline(deadline, "frames-final")?;
     Ok(ActiveFramePlanV1 { frames })
+}
+
+// ---------------------------------------------------------------------------------------------
+// Pass B1b: pure refs agreement and inert config
+// ---------------------------------------------------------------------------------------------
+
+/// Git's own bound on the symbolic refs one lookup may follow (`SYMREF_MAXDEPTH`): a chain of five
+/// symbolic refs ending in a value (or in a missing ref) resolves, a sixth refuses.
+const REFS_SYMREF_HOPS_V1: usize = 5;
+const REFS_BUFFER_BYTES_V1: usize = 8 * 1024;
+
+/// The bounds of one refs agreement. Every input is read through them: no line, file, record count, or
+/// retained byte count can exceed its cap, so no input is buffered whole without admission.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct RefsLimitsV1 {
+    /// The longest one line may be, without its LF.
+    pub(crate) line_bytes: u64,
+    /// `HEAD`, `ORIG_HEAD`, and each loose ref file.
+    pub(crate) loose_file_bytes: u64,
+    pub(crate) packed_file_bytes: u64,
+    pub(crate) fetch_head_bytes: u64,
+    /// One reflog file; a reflog is read a row at a time and never retained.
+    pub(crate) log_file_bytes: u64,
+    /// Admitted records: loose files (`HEAD` and `ORIG_HEAD` included), packed rows, peeled rows,
+    /// `FETCH_HEAD` rows, and reflog files.
+    pub(crate) entries: u64,
+    /// What the retained refs may cost in all, by [`refs_entry_cost_v1`].
+    pub(crate) retained_bytes: u64,
+}
+
+impl RefsLimitsV1 {
+    pub(crate) const fn v1() -> Self {
+        Self {
+            line_bytes: 8 * 1024,
+            loose_file_bytes: 16 * 1024,
+            packed_file_bytes: 64 * 1024 * 1024,
+            fetch_head_bytes: 1024 * 1024,
+            log_file_bytes: 64 * 1024 * 1024,
+            entries: 262_144,
+            retained_bytes: 64 * 1024 * 1024,
+        }
+    }
+}
+
+/// What one retained record costs: two copies of its name (its map key and its case key), its value, and
+/// a fixed allowance for the map's bookkeeping.
+pub(crate) fn refs_entry_cost_v1(name_len: usize, value_len: usize) -> u64 {
+    ACTIVE_ENTRY_OVERHEAD_BYTES_V1
+        .saturating_add(2 * name_len as u64)
+        .saturating_add(value_len as u64)
+}
+
+/// Which cap a refusal names.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RefsLimitKindV1 {
+    Line,
+    LooseFile,
+    PackedFile,
+    FetchHeadFile,
+    LogFile,
+    Entries,
+    Retained,
+}
+
+/// Why a name is not a ref name: it is under `refs/`, has no empty component, follows the portable ASCII
+/// spelling rule, and follows Git's check-ref-format rules.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+pub(crate) enum RefNameFaultV1 {
+    #[error("not under refs/")]
+    NotUnderRefs,
+    #[error("an empty component")]
+    EmptyComponent,
+    #[error("a component starts with a dot")]
+    LeadingDot,
+    #[error("a component ends in .lock")]
+    LockSuffix,
+    #[error("contains ..")]
+    DoubleDot,
+    #[error("contains a byte Git forbids in a ref name")]
+    ForbiddenByte,
+    #[error("contains @{{")]
+    AtBrace,
+    #[error("not a portable spelling ({0})")]
+    Portable(PortableFaultV1),
+}
+
+/// Why one file's text is not the grammar of its kind.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+pub(crate) enum RowFaultV1 {
+    #[error("the file is empty")]
+    EmptyFile,
+    #[error("a line is not terminated by LF")]
+    PartialLine,
+    #[error("a one-line file has more")]
+    ExtraLine,
+    #[error("not a lowercase object id of the format's width")]
+    ObjectId,
+    #[error("the symbolic target is not a ref name ({0})")]
+    SymbolicTarget(RefNameFaultV1),
+    #[error("a malformed packed-refs header")]
+    PackedHeader,
+    #[error("a packed row is not `<oid> <name>`")]
+    PackedRow,
+    #[error("rows are not in order under the `sorted` trait")]
+    PackedOrder,
+    #[error("a name is packed twice")]
+    PackedDuplicate,
+    #[error("a peeled row does not follow a ref row")]
+    PeeledOrphan,
+    #[error("a malformed FETCH_HEAD row")]
+    FetchHeadRow,
+    #[error("a malformed reflog row")]
+    LogRow,
+}
+
+/// Why the refs are refused. Paths and names are rendered lossily, for the message only.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+pub(crate) enum RefsFaultV1 {
+    #[error("{path}: not a refs file of the active subset")]
+    UnexpectedFile { path: String },
+    #[error("{path}: admitted twice")]
+    Duplicate { path: String },
+    #[error("{path}: not a valid ref name ({why})")]
+    RefName { path: String, why: RefNameFaultV1 },
+    #[error("{path}: {why}")]
+    Row { path: String, why: RowFaultV1 },
+    #[error("a {what:?} limit of {bound} was exceeded")]
+    Limit { what: RefsLimitKindV1, bound: u64 },
+    #[error("{path}: the source could not be read")]
+    Unreadable { path: String },
+    #[error("no valid HEAD was captured")]
+    MissingHead,
+    #[error("{name}: conflicts with the ref {with} above it")]
+    Conflict { name: String, with: String },
+    #[error("{name}: collides with {with} on a portable filesystem")]
+    Collision { name: String, with: String },
+    #[error("{name}: its symbolic chain is a cycle")]
+    Cycle { name: String },
+    #[error("{name}: its symbolic chain is longer than {REFS_SYMREF_HOPS_V1} refs")]
+    TooDeep { name: String },
+    #[error("{name}: names {target}, which does not exist")]
+    Dangling { name: String, target: String },
+    #[error("{name}: names the object {oid}, which is not in the verified inventory")]
+    TargetAbsent { name: String, oid: String },
+    #[error("{name}: the object {oid} is a {found}, not {expected}")]
+    TargetKind {
+        name: String,
+        oid: String,
+        found: &'static str,
+        expected: &'static str,
+    },
+    #[error("{name}: a peeled row follows an object that is not a tag")]
+    PeeledNotTag { name: String },
+    #[error("{name}: a tag has no peeled row under the fully-peeled trait")]
+    PeelMissing { name: String },
+    #[error("{name}: the peeled object is itself a tag")]
+    PeeledIsTag { name: String },
+    #[error("the manifest's ref {name} is not a valid name ({why})")]
+    ManifestName { name: String, why: RefNameFaultV1 },
+    #[error("the manifest's ref {name} names an invalid symbolic target {target} ({why})")]
+    ManifestTarget {
+        name: String,
+        target: String,
+        why: RefNameFaultV1,
+    },
+    #[error("the manifest's ref {name} was not restored")]
+    MissingOriginal { name: String },
+    #[error("the manifest's ref {name} is {expected}, and the restored one is {found}")]
+    OriginalMismatch {
+        name: String,
+        expected: String,
+        found: String,
+    },
+}
+
+fn refs_fault(fault: RefsFaultV1) -> GitBootstrapErrorV1 {
+    GitBootstrapErrorV1::Refs(fault)
+}
+
+fn row_fault(path: &str, why: RowFaultV1) -> GitBootstrapErrorV1 {
+    refs_fault(RefsFaultV1::Row {
+        path: path.to_owned(),
+        why,
+    })
+}
+
+fn limit_fault(what: RefsLimitKindV1, bound: u64) -> GitBootstrapErrorV1 {
+    refs_fault(RefsFaultV1::Limit { what, bound })
+}
+
+/// The ref-name rule for every name under `refs/`: at least one component after `refs/`, no empty
+/// component, the portable spelling rule of this slice, and Git's check-ref-format rules: no component
+/// that starts with a dot or ends in `.lock`, no `..`, none of `~ ^ : ? * [`, and no `@{`.
+pub(crate) fn check_ref_name_v1(name: &[u8]) -> Result<(), RefNameFaultV1> {
+    if !name.starts_with(b"refs/") {
+        return Err(RefNameFaultV1::NotUnderRefs);
+    }
+    if name.split(|byte| *byte == b'/').any(<[u8]>::is_empty) {
+        return Err(RefNameFaultV1::EmptyComponent);
+    }
+    portable_path(name).map_err(RefNameFaultV1::Portable)?;
+    for component in name.split(|byte| *byte == b'/') {
+        if component.starts_with(b".") {
+            return Err(RefNameFaultV1::LeadingDot);
+        }
+        if component.ends_with(b".lock") {
+            return Err(RefNameFaultV1::LockSuffix);
+        }
+    }
+    if name.windows(2).any(|pair| pair == b"..") {
+        return Err(RefNameFaultV1::DoubleDot);
+    }
+    if name.iter().any(|byte| b"~^:?*[".contains(byte)) {
+        return Err(RefNameFaultV1::ForbiddenByte);
+    }
+    if name.windows(2).any(|pair| pair == b"@{") {
+        return Err(RefNameFaultV1::AtBrace);
+    }
+    Ok(())
+}
+
+/// A deadline-paced, byte-capped source: every read observes the ONE deadline first, and at most `cap + 1`
+/// bytes are ever requested from the source underneath.
+struct PacedSourceV1<'a> {
+    inner: io::Take<&'a mut dyn io::Read>,
+    deadline: Instant,
+    expired: &'a Cell<bool>,
+}
+
+impl io::Read for PacedSourceV1<'_> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        if before_deadline(self.deadline).is_err() {
+            self.expired.set(true);
+            return Err(io::Error::new(
+                ErrorKind::TimedOut,
+                "the phase-G deadline passed",
+            ));
+        }
+        self.inner.read(buffer)
+    }
+}
+
+/// One file read a line at a time. A line is at most `line_cap` bytes without its LF and the file at most
+/// `file_cap` bytes; a source error, a deadline, a partial final line, and either cap are each refused
+/// with their own type, and nothing is read once any of them is.
+struct LinesV1<'a> {
+    reader: BufReader<PacedSourceV1<'a>>,
+    expired: &'a Cell<bool>,
+    path: &'a str,
+    file_cap: u64,
+    file_kind: RefsLimitKindV1,
+    line_cap: u64,
+    consumed: u64,
+}
+
+impl<'a> LinesV1<'a> {
+    fn new(
+        source: &'a mut dyn io::Read,
+        expired: &'a Cell<bool>,
+        deadline: Instant,
+        path: &'a str,
+        file_cap: u64,
+        file_kind: RefsLimitKindV1,
+        line_cap: u64,
+    ) -> Self {
+        let paced = PacedSourceV1 {
+            inner: source.take(file_cap.saturating_add(1)),
+            deadline,
+            expired,
+        };
+        Self {
+            reader: BufReader::with_capacity(REFS_BUFFER_BYTES_V1, paced),
+            expired,
+            path,
+            file_cap,
+            file_kind,
+            line_cap,
+            consumed: 0,
+        }
+    }
+
+    fn read_error(&self) -> GitBootstrapErrorV1 {
+        if self.expired.get() {
+            GitBootstrapErrorV1::Git(CustodyGitError::Timeout)
+        } else {
+            refs_fault(RefsFaultV1::Unreadable {
+                path: self.path.to_owned(),
+            })
+        }
+    }
+
+    /// The next line without its LF, or `None` at the end of the file.
+    fn next_line(&mut self) -> Result<Option<Vec<u8>>, GitBootstrapErrorV1> {
+        let room = self.line_cap.saturating_add(2);
+        let mut line = Vec::new();
+        let read = io::BufRead::read_until(&mut (&mut self.reader).take(room), b'\n', &mut line)
+            .map_err(|_| self.read_error())? as u64;
+        if read == 0 {
+            return Ok(None);
+        }
+        self.consumed = self.consumed.saturating_add(read);
+        if self.consumed > self.file_cap {
+            return Err(limit_fault(self.file_kind, self.file_cap));
+        }
+        if line.last() == Some(&b'\n') {
+            line.pop();
+            if line.len() as u64 > self.line_cap {
+                return Err(limit_fault(RefsLimitKindV1::Line, self.line_cap));
+            }
+            return Ok(Some(line));
+        }
+        if read >= room {
+            return Err(limit_fault(RefsLimitKindV1::Line, self.line_cap));
+        }
+        Err(row_fault(self.path, RowFaultV1::PartialLine))
+    }
+
+    /// Whether any byte remains in the file.
+    fn has_more(&mut self) -> Result<bool, GitBootstrapErrorV1> {
+        io::BufRead::fill_buf(&mut self.reader)
+            .map(|buffer| !buffer.is_empty())
+            .map_err(|_| self.read_error())
+    }
+}
+
+/// A restored ref's own value: a direct object id, or the name of the ref it points to.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum RefValueV1 {
+    Direct(String),
+    Symbolic(Vec<u8>),
+}
+
+impl RefValueV1 {
+    fn len(&self) -> usize {
+        match self {
+            Self::Direct(oid) => oid.len(),
+            Self::Symbolic(target) => target.len(),
+        }
+    }
+
+    fn found(&self) -> FoundV1<'_> {
+        match self {
+            Self::Direct(oid) => FoundV1::Direct(oid),
+            Self::Symbolic(target) => FoundV1::Symbolic(target),
+        }
+    }
+}
+
+/// A ref's value, borrowed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FoundV1<'a> {
+    Direct(&'a str),
+    Symbolic(&'a [u8]),
+}
+
+impl FoundV1<'_> {
+    fn describe(&self) -> String {
+        match self {
+            Self::Direct(oid) => format!("direct {oid}"),
+            Self::Symbolic(target) => format!("symbolic {}", lossy(target)),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct PackedHeaderV1 {
+    peeled: bool,
+    fully_peeled: bool,
+    sorted: bool,
+}
+
+#[derive(Debug)]
+struct PackedRowV1 {
+    oid: String,
+    peeled: Option<String>,
+}
+
+#[derive(Debug, Default)]
+struct PackedRefsV1 {
+    header: PackedHeaderV1,
+    rows: BTreeMap<Vec<u8>, PackedRowV1>,
+}
+
+/// `# pack-refs with:` and then any of the three traits, each at most once, each preceded by a space;
+/// Git writes a trailing space after the last.
+fn parse_packed_header(line: &[u8]) -> Option<PackedHeaderV1> {
+    let rest = line.strip_prefix(b"# pack-refs with:")?;
+    if rest.first().is_some_and(|byte| *byte != b' ') {
+        return None;
+    }
+    let mut header = PackedHeaderV1::default();
+    for token in rest
+        .split(|byte| *byte == b' ')
+        .filter(|token| !token.is_empty())
+    {
+        let flag = match token {
+            b"peeled" => &mut header.peeled,
+            b"fully-peeled" => &mut header.fully_peeled,
+            b"sorted" => &mut header.sorted,
+            _ => return None,
+        };
+        if std::mem::replace(flag, true) {
+            return None;
+        }
+    }
+    Some(header)
+}
+
+/// One reflog row: `<old> <new> <identity> <timestamp> <zone>` and optionally a TAB and a message, with
+/// both object ids at the format's width, an identity that ends in `>` after a `<`, digits for the
+/// timestamp, and a signed four-digit zone. The message is free text without a NUL.
+fn is_log_row(line: &[u8], format: GitObjectFormatV1) -> bool {
+    let width = hex_width(format);
+    let header = line
+        .iter()
+        .position(|byte| *byte == b'\t')
+        .map_or(line, |tab| &line[..tab]);
+    if line.contains(&0) || header.len() < 2 * width + 2 {
+        return false;
+    }
+    let hex = |text: &[u8]| std::str::from_utf8(text).is_ok_and(|text| is_object_id(text, format));
+    if !hex(&header[..width])
+        || header[width] != b' '
+        || !hex(&header[width + 1..2 * width + 1])
+        || header[2 * width + 1] != b' '
+    {
+        return false;
+    }
+    let rest = &header[2 * width + 2..];
+    let Some(zone_at) = rest.iter().rposition(|byte| *byte == b' ') else {
+        return false;
+    };
+    let (rest, zone) = (&rest[..zone_at], &rest[zone_at + 1..]);
+    let Some(stamp_at) = rest.iter().rposition(|byte| *byte == b' ') else {
+        return false;
+    };
+    let (identity, stamp) = (&rest[..stamp_at], &rest[stamp_at + 1..]);
+    let zone_ok = zone.len() == 5
+        && (zone[0] == b'+' || zone[0] == b'-')
+        && zone[1..].iter().all(u8::is_ascii_digit);
+    let stamp_ok = !stamp.is_empty() && stamp.len() <= 20 && stamp.iter().all(u8::is_ascii_digit);
+    zone_ok && stamp_ok && identity.last() == Some(&b'>') && identity.contains(&b'<')
+}
+
+/// What a name means to the pure builder: which file of the active subset it is.
+enum RouteV1<'a> {
+    Head,
+    OrigHead,
+    FetchHead,
+    Packed,
+    /// A loose ref, by its full name under `refs/`.
+    Loose(&'a [u8]),
+    /// A reflog, by the name of the ref it logs (`HEAD`, or a name under `refs/`).
+    Log(&'a [u8]),
+}
+
+fn route_refs_file(path: &[u8]) -> Option<RouteV1<'_>> {
+    match path {
+        b"HEAD" => Some(RouteV1::Head),
+        b"ORIG_HEAD" => Some(RouteV1::OrigHead),
+        b"FETCH_HEAD" => Some(RouteV1::FetchHead),
+        b"packed-refs" => Some(RouteV1::Packed),
+        b"logs/HEAD" => Some(RouteV1::Log(b"HEAD")),
+        _ if path.starts_with(b"refs/") => Some(RouteV1::Loose(path)),
+        _ => path
+            .strip_prefix(b"logs/")
+            .filter(|name| name.starts_with(b"refs/"))
+            .map(RouteV1::Log),
+    }
+}
+
+/// The object kinds the refs rules require: a branch, a detached or resolved HEAD, and `ORIG_HEAD` name a
+/// commit.
+fn required_kind(name: &[u8]) -> Option<&'static str> {
+    (name == b"HEAD" || name == b"ORIG_HEAD" || name.starts_with(b"refs/heads/"))
+        .then_some("commit")
+}
+
+/// What resolving the symbolic refs found: the commit HEAD resolved to (none when unborn), and the names
+/// whose chains end at a ref that does not exist.
+#[derive(Debug, Default)]
+struct ResolutionV1 {
+    head: Option<String>,
+    unborn: BTreeSet<Vec<u8>>,
+}
+
+/// The pure refs foundation. Files of the active subset are admitted one at a time, each read through its
+/// caps and the one deadline and parsed in a single streaming pass; [`Self::finish`] then judges the
+/// whole. It runs no Git, reads no configuration, opens no path, and holds only bounded, accounted state.
+#[derive(Debug)]
+pub(crate) struct RefsBuilderV1 {
+    format: GitObjectFormatV1,
+    limits: RefsLimitsV1,
+    deadline: Instant,
+    entries: u64,
+    retained: u64,
+    head: Option<RefValueV1>,
+    orig_head: Option<String>,
+    fetch_head: Option<Vec<String>>,
+    packed: Option<PackedRefsV1>,
+    loose: BTreeMap<Vec<u8>, RefValueV1>,
+    logs: BTreeSet<Vec<u8>>,
+    log_rows: u64,
+    peeled_rows: u64,
+}
+
+impl RefsBuilderV1 {
+    pub(crate) fn new(format: GitObjectFormatV1, limits: RefsLimitsV1, deadline: Instant) -> Self {
+        Self {
+            format,
+            limits,
+            deadline,
+            entries: 0,
+            retained: 0,
+            head: None,
+            orig_head: None,
+            fetch_head: None,
+            packed: None,
+            loose: BTreeMap::new(),
+            logs: BTreeSet::new(),
+            log_rows: 0,
+            peeled_rows: 0,
+        }
+    }
+
+    fn count_entry(&mut self) -> Result<(), GitBootstrapErrorV1> {
+        if self.entries >= self.limits.entries {
+            return Err(limit_fault(RefsLimitKindV1::Entries, self.limits.entries));
+        }
+        self.entries += 1;
+        Ok(())
+    }
+
+    fn charge(&mut self, bytes: u64) -> Result<(), GitBootstrapErrorV1> {
+        let total = self.retained.saturating_add(bytes);
+        if total > self.limits.retained_bytes {
+            return Err(limit_fault(
+                RefsLimitKindV1::Retained,
+                self.limits.retained_bytes,
+            ));
+        }
+        self.retained = total;
+        Ok(())
+    }
+
+    fn object_id(&self, text: &[u8]) -> Option<String> {
+        std::str::from_utf8(text)
+            .ok()
+            .filter(|text| is_object_id(text, self.format))
+            .map(str::to_owned)
+    }
+
+    /// Admit one regular file of the active subset, read from `reader`. The deadline is observed before
+    /// the first read and before every read after it, and no more than the file's cap is ever requested.
+    pub(crate) fn admit_file(
+        &mut self,
+        path: &[u8],
+        reader: &mut dyn io::Read,
+    ) -> Result<(), GitBootstrapErrorV1> {
+        before_deadline(self.deadline)?;
+        let display = lossy(path);
+        let Some(route) = route_refs_file(path) else {
+            return Err(refs_fault(RefsFaultV1::UnexpectedFile { path: display }));
+        };
+        let duplicate = || refs_fault(RefsFaultV1::Duplicate { path: lossy(path) });
+        let (cap, kind) = match route {
+            RouteV1::Packed => (self.limits.packed_file_bytes, RefsLimitKindV1::PackedFile),
+            RouteV1::FetchHead => (self.limits.fetch_head_bytes, RefsLimitKindV1::FetchHeadFile),
+            RouteV1::Log(_) => (self.limits.log_file_bytes, RefsLimitKindV1::LogFile),
+            _ => (self.limits.loose_file_bytes, RefsLimitKindV1::LooseFile),
+        };
+        match &route {
+            RouteV1::Head if self.head.is_some() => return Err(duplicate()),
+            RouteV1::OrigHead if self.orig_head.is_some() => return Err(duplicate()),
+            RouteV1::FetchHead if self.fetch_head.is_some() => return Err(duplicate()),
+            RouteV1::Packed if self.packed.is_some() => return Err(duplicate()),
+            RouteV1::Loose(name) if self.loose.contains_key(*name) => return Err(duplicate()),
+            RouteV1::Log(_) if self.logs.contains(path) => return Err(duplicate()),
+            RouteV1::Loose(name) => {
+                check_ref_name_v1(name).map_err(|why| {
+                    refs_fault(RefsFaultV1::RefName {
+                        path: display.clone(),
+                        why,
+                    })
+                })?;
+            }
+            RouteV1::Log(name) if *name != b"HEAD" => {
+                check_ref_name_v1(name).map_err(|why| {
+                    refs_fault(RefsFaultV1::RefName {
+                        path: lossy(name),
+                        why,
+                    })
+                })?;
+            }
+            _ => {}
+        }
+        // A file is one record, except packed-refs and FETCH_HEAD, whose rows are the records.
+        if !matches!(route, RouteV1::Packed | RouteV1::FetchHead) {
+            self.count_entry()?;
+        }
+        let expired = Cell::new(false);
+        let mut lines = LinesV1::new(
+            reader,
+            &expired,
+            self.deadline,
+            &display,
+            cap,
+            kind,
+            self.limits.line_bytes,
+        );
+        match route {
+            RouteV1::Head => {
+                let value = self.parse_loose(&mut lines, true)?;
+                self.charge(refs_entry_cost_v1(path.len(), value.len()))?;
+                self.head = Some(value);
+            }
+            RouteV1::OrigHead => {
+                let RefValueV1::Direct(oid) = self.parse_loose(&mut lines, false)? else {
+                    return Err(row_fault(&display, RowFaultV1::ObjectId));
+                };
+                self.charge(refs_entry_cost_v1(path.len(), oid.len()))?;
+                self.orig_head = Some(oid);
+            }
+            RouteV1::Loose(name) => {
+                let value = self.parse_loose(&mut lines, true)?;
+                self.charge(refs_entry_cost_v1(name.len(), value.len()))?;
+                self.loose.insert(name.to_vec(), value);
+            }
+            RouteV1::Packed => {
+                let packed = self.parse_packed(&mut lines)?;
+                self.packed = Some(packed);
+            }
+            RouteV1::FetchHead => {
+                let rows = self.parse_fetch_head(&mut lines)?;
+                self.fetch_head = Some(rows);
+            }
+            RouteV1::Log(_) => {
+                self.charge(refs_entry_cost_v1(path.len(), 0))?;
+                self.parse_log(&mut lines)?;
+                self.logs.insert(path.to_vec());
+            }
+        }
+        Ok(())
+    }
+
+    /// One line: a direct object id, or (when `symbolic` is allowed) `ref: ` and a full ref name.
+    fn parse_loose(
+        &self,
+        lines: &mut LinesV1<'_>,
+        symbolic: bool,
+    ) -> Result<RefValueV1, GitBootstrapErrorV1> {
+        let path = lines.path;
+        let Some(line) = lines.next_line()? else {
+            return Err(row_fault(path, RowFaultV1::EmptyFile));
+        };
+        let value = match line.strip_prefix(b"ref: ").filter(|_| symbolic) {
+            Some(target) => {
+                check_ref_name_v1(target)
+                    .map_err(|why| row_fault(path, RowFaultV1::SymbolicTarget(why)))?;
+                RefValueV1::Symbolic(target.to_vec())
+            }
+            None => RefValueV1::Direct(
+                self.object_id(&line)
+                    .ok_or_else(|| row_fault(path, RowFaultV1::ObjectId))?,
+            ),
+        };
+        if lines.has_more()? {
+            return Err(row_fault(path, RowFaultV1::ExtraLine));
+        }
+        Ok(value)
+    }
+
+    fn parse_packed(
+        &mut self,
+        lines: &mut LinesV1<'_>,
+    ) -> Result<PackedRefsV1, GitBootstrapErrorV1> {
+        let path = lines.path;
+        let width = hex_width(self.format);
+        let mut packed = PackedRefsV1::default();
+        let mut first = true;
+        let mut peelable: Option<Vec<u8>> = None;
+        let mut previous: Option<Vec<u8>> = None;
+        while let Some(line) = lines.next_line()? {
+            let at_start = std::mem::replace(&mut first, false);
+            if at_start && line.starts_with(b"# pack-refs with:") {
+                packed.header = parse_packed_header(&line)
+                    .ok_or_else(|| row_fault(path, RowFaultV1::PackedHeader))?;
+                continue;
+            }
+            if line.first() == Some(&b'#') {
+                return Err(row_fault(path, RowFaultV1::PackedHeader));
+            }
+            self.count_entry()?;
+            if let Some(oid) = line.strip_prefix(b"^") {
+                let Some(name) = peelable.take() else {
+                    return Err(row_fault(path, RowFaultV1::PeeledOrphan));
+                };
+                let oid = self
+                    .object_id(oid)
+                    .ok_or_else(|| row_fault(path, RowFaultV1::ObjectId))?;
+                self.charge(width as u64)?;
+                self.peeled_rows += 1;
+                if let Some(row) = packed.rows.get_mut(&name) {
+                    row.peeled = Some(oid);
+                }
+                continue;
+            }
+            let split = line
+                .iter()
+                .position(|byte| *byte == b' ')
+                .ok_or_else(|| row_fault(path, RowFaultV1::PackedRow))?;
+            let (oid, name) = (&line[..split], &line[split + 1..]);
+            let oid = self
+                .object_id(oid)
+                .ok_or_else(|| row_fault(path, RowFaultV1::ObjectId))?;
+            check_ref_name_v1(name).map_err(|why| {
+                refs_fault(RefsFaultV1::RefName {
+                    path: lossy(name),
+                    why,
+                })
+            })?;
+            if packed.header.sorted {
+                if previous.as_deref().is_some_and(|before| name <= before) {
+                    return Err(row_fault(path, RowFaultV1::PackedOrder));
+                }
+            } else if packed.rows.contains_key(name) {
+                return Err(row_fault(path, RowFaultV1::PackedDuplicate));
+            }
+            self.charge(refs_entry_cost_v1(name.len(), width))?;
+            packed
+                .rows
+                .insert(name.to_vec(), PackedRowV1 { oid, peeled: None });
+            previous = Some(name.to_vec());
+            peelable = Some(name.to_vec());
+        }
+        Ok(packed)
+    }
+
+    /// `<oid> TAB (empty | not-for-merge) TAB <note>` per row; the note is free text without a NUL.
+    fn parse_fetch_head(
+        &mut self,
+        lines: &mut LinesV1<'_>,
+    ) -> Result<Vec<String>, GitBootstrapErrorV1> {
+        let path = lines.path;
+        let width = hex_width(self.format);
+        let mut rows = Vec::new();
+        while let Some(line) = lines.next_line()? {
+            self.count_entry()?;
+            let malformed = || row_fault(path, RowFaultV1::FetchHeadRow);
+            if line.contains(&0) {
+                return Err(malformed());
+            }
+            let first = line
+                .iter()
+                .position(|byte| *byte == b'\t')
+                .ok_or_else(malformed)?;
+            let rest = &line[first + 1..];
+            let second = rest
+                .iter()
+                .position(|byte| *byte == b'\t')
+                .ok_or_else(malformed)?;
+            let oid = self
+                .object_id(&line[..first])
+                .ok_or_else(|| row_fault(path, RowFaultV1::ObjectId))?;
+            if !matches!(&rest[..second], b"" | b"not-for-merge") {
+                return Err(malformed());
+            }
+            self.charge(refs_entry_cost_v1(0, width))?;
+            rows.push(oid);
+        }
+        Ok(rows)
+    }
+
+    /// Reflog rows are validated as they stream by and never retained.
+    fn parse_log(&mut self, lines: &mut LinesV1<'_>) -> Result<(), GitBootstrapErrorV1> {
+        let path = lines.path;
+        while let Some(line) = lines.next_line()? {
+            if !is_log_row(&line, self.format) {
+                return Err(row_fault(path, RowFaultV1::LogRow));
+            }
+            self.log_rows += 1;
+        }
+        Ok(())
+    }
+
+    /// A ref's own value by name: a loose ref wins over a packed one of the same name.
+    fn effective(&self, name: &[u8]) -> Option<FoundV1<'_>> {
+        match self.loose.get(name) {
+            Some(value) => Some(value.found()),
+            None => self
+                .packed
+                .as_ref()
+                .and_then(|packed| packed.rows.get(name))
+                .map(|row| FoundV1::Direct(&row.oid)),
+        }
+    }
+
+    /// The value of a manifest ref's name, where the three pseudorefs have their own files.
+    fn found(&self, name: &[u8]) -> Option<FoundV1<'_>> {
+        match name {
+            b"HEAD" => self.head.as_ref().map(RefValueV1::found),
+            b"ORIG_HEAD" => self.orig_head.as_deref().map(FoundV1::Direct),
+            b"FETCH_HEAD" => self
+                .fetch_head
+                .as_ref()
+                .and_then(|rows| rows.first())
+                .map(|oid| FoundV1::Direct(oid)),
+            _ => self.effective(name),
+        }
+    }
+
+    /// Every name a ref has, loose or packed, once.
+    fn names(&self) -> BTreeSet<&[u8]> {
+        self.loose
+            .keys()
+            .map(Vec::as_slice)
+            .chain(
+                self.packed
+                    .iter()
+                    .flat_map(|packed| packed.rows.keys().map(Vec::as_slice)),
+            )
+            .collect()
+    }
+
+    /// A ref and a ref under it conflict, and spellings that differ only by ASCII case collide.
+    fn check_structure(&self) -> Result<(), GitBootstrapErrorV1> {
+        let names = self.names();
+        let mut keys: BTreeMap<Vec<u8>, &[u8]> = BTreeMap::new();
+        for name in &names {
+            for (at, byte) in name.iter().enumerate() {
+                if *byte == b'/' && names.contains(&name[..at]) {
+                    return Err(refs_fault(RefsFaultV1::Conflict {
+                        name: lossy(name),
+                        with: lossy(&name[..at]),
+                    }));
+                }
+            }
+            if let Some(earlier) = keys.insert(name.to_ascii_lowercase(), name) {
+                return Err(refs_fault(RefsFaultV1::Collision {
+                    name: lossy(name),
+                    with: lossy(earlier),
+                }));
+            }
+        }
+        Ok(())
+    }
+
+    /// One direct target: in the inventory, of a known kind, and of the kind its name requires.
+    fn check_target<'i>(
+        &self,
+        name: &[u8],
+        oid: &str,
+        inventory: &'i BTreeMap<String, &'static str>,
+    ) -> Result<&'i str, GitBootstrapErrorV1> {
+        let found = inventory.get(oid).copied().ok_or_else(|| {
+            refs_fault(RefsFaultV1::TargetAbsent {
+                name: lossy(name),
+                oid: oid.to_owned(),
+            })
+        })?;
+        let wrong = |expected: &'static str| {
+            refs_fault(RefsFaultV1::TargetKind {
+                name: lossy(name),
+                oid: oid.to_owned(),
+                found,
+                expected,
+            })
+        };
+        if found == "unknown" {
+            return Err(wrong("a known kind"));
+        }
+        match required_kind(name) {
+            Some(expected) if expected != found => Err(wrong(expected)),
+            _ => Ok(found),
+        }
+    }
+
+    /// Every ACTIVE direct target the restored refs carry, wherever it comes from, against the inventory:
+    /// everything Git can resolve (so not a packed row that a loose ref shadows).
+    fn check_targets(
+        &self,
+        inventory: &BTreeMap<String, &'static str>,
+    ) -> Result<u64, GitBootstrapErrorV1> {
+        let mut checked: BTreeSet<&str> = BTreeSet::new();
+        if let Some(RefValueV1::Direct(oid)) = &self.head {
+            self.check_target(b"HEAD", oid, inventory)?;
+            checked.insert(oid);
+        }
+        if let Some(oid) = &self.orig_head {
+            self.check_target(b"ORIG_HEAD", oid, inventory)?;
+            checked.insert(oid);
+        }
+        for oid in self.fetch_head.iter().flatten() {
+            self.check_target(b"FETCH_HEAD", oid, inventory)?;
+            checked.insert(oid);
+        }
+        for (name, value) in &self.loose {
+            if let RefValueV1::Direct(oid) = value {
+                self.check_target(name, oid, inventory)?;
+                checked.insert(oid);
+            }
+        }
+        if let Some(packed) = &self.packed {
+            for (name, row) in &packed.rows {
+                // A loose ref of the same name hides this row: Git never resolves it, so it is not an
+                // active target. Its grammar was judged as it streamed in; its object, kind, and peeled
+                // value are judged only when nothing shadows it (a pruned stale object is routine).
+                if self.loose.contains_key(name) {
+                    continue;
+                }
+                let kind = self.check_target(name, &row.oid, inventory)?;
+                checked.insert(&row.oid);
+                let tag = || refs_fault(RefsFaultV1::PeeledNotTag { name: lossy(name) });
+                match &row.peeled {
+                    Some(peeled) => {
+                        if kind != "tag" {
+                            return Err(tag());
+                        }
+                        if self.check_target(name, peeled, inventory)? == "tag" {
+                            return Err(refs_fault(RefsFaultV1::PeeledIsTag { name: lossy(name) }));
+                        }
+                        checked.insert(peeled);
+                    }
+                    None if packed.header.fully_peeled && kind == "tag" => {
+                        return Err(refs_fault(RefsFaultV1::PeelMissing { name: lossy(name) }));
+                    }
+                    None => {}
+                }
+            }
+        }
+        Ok(checked.len() as u64)
+    }
+
+    /// Follow one symbolic ref: at most [`REFS_SYMREF_HOPS_V1`] refs, a cycle refused as a cycle. The result
+    /// is the object it resolves to, or the name of the missing ref its chain ends at.
+    fn resolve<'s>(
+        &'s self,
+        start: &'s [u8],
+        first: FoundV1<'s>,
+    ) -> Result<Result<&'s str, &'s [u8]>, GitBootstrapErrorV1> {
+        let mut seen: Vec<&[u8]> = vec![start];
+        let mut value = first;
+        let mut hops = 0;
+        loop {
+            match value {
+                FoundV1::Direct(oid) => return Ok(Ok(oid)),
+                FoundV1::Symbolic(target) => {
+                    if seen.contains(&target) {
+                        return Err(refs_fault(RefsFaultV1::Cycle { name: lossy(start) }));
+                    }
+                    if hops == REFS_SYMREF_HOPS_V1 {
+                        return Err(refs_fault(RefsFaultV1::TooDeep { name: lossy(start) }));
+                    }
+                    hops += 1;
+                    seen.push(target);
+                    match self.effective(target) {
+                        Some(next) => value = next,
+                        None => return Ok(Err(target)),
+                    }
+                }
+            }
+        }
+    }
+
+    /// Resolve HEAD and every loose symbolic ref. A resolved ref must name an object of the kind its name
+    /// requires; a chain that ends at a missing ref is unborn, which only HEAD, or a ref the manifest
+    /// calls `Unborn`, may be.
+    fn check_resolution(
+        &self,
+        manifest: &CustodyManifestV1,
+        inventory: &BTreeMap<String, &'static str>,
+    ) -> Result<ResolutionV1, GitBootstrapErrorV1> {
+        let declared: BTreeSet<&[u8]> = manifest
+            .original_refs()
+            .iter()
+            .filter(|record| matches!(record.target(), CustodyRefTargetV1::Unborn))
+            .map(|record| record.name().as_bytes())
+            .collect();
+        let mut resolution = ResolutionV1::default();
+        let starts = self
+            .head
+            .iter()
+            .map(|head| (&b"HEAD"[..], head.found()))
+            .chain(
+                self.loose
+                    .iter()
+                    .map(|(name, value)| (name.as_slice(), value.found())),
+            )
+            .filter(|(_, value)| matches!(value, FoundV1::Symbolic(_)));
+        for (name, value) in starts {
+            match self.resolve(name, value)? {
+                Ok(oid) => {
+                    let found = inventory.get(oid).copied().unwrap_or("unknown");
+                    if let Some(expected) = required_kind(name).filter(|kind| *kind != found) {
+                        return Err(refs_fault(RefsFaultV1::TargetKind {
+                            name: lossy(name),
+                            oid: oid.to_owned(),
+                            found,
+                            expected,
+                        }));
+                    }
+                    if name == b"HEAD" {
+                        resolution.head = Some(oid.to_owned());
+                    }
+                }
+                Err(missing) => {
+                    if name != b"HEAD" && !declared.contains(name) {
+                        return Err(refs_fault(RefsFaultV1::Dangling {
+                            name: lossy(name),
+                            target: lossy(missing),
+                        }));
+                    }
+                    resolution.unborn.insert(name.to_vec());
+                }
+            }
+        }
+        Ok(resolution)
+    }
+
+    /// Every manifest ref, by name and by target: present, valid, and the very value the manifest records.
+    fn check_manifest(
+        &self,
+        manifest: &CustodyManifestV1,
+        unborn: &BTreeSet<Vec<u8>>,
+    ) -> Result<u64, GitBootstrapErrorV1> {
+        for record in manifest.original_refs() {
+            let name = record.name().as_bytes();
+            if !matches!(name, b"HEAD" | b"ORIG_HEAD" | b"FETCH_HEAD") {
+                check_ref_name_v1(name).map_err(|why| {
+                    refs_fault(RefsFaultV1::ManifestName {
+                        name: lossy(name),
+                        why,
+                    })
+                })?;
+            }
+            if let CustodyRefTargetV1::Symbolic(target) = record.target() {
+                check_ref_name_v1(target.as_bytes()).map_err(|why| {
+                    refs_fault(RefsFaultV1::ManifestTarget {
+                        name: lossy(name),
+                        target: lossy(target.as_bytes()),
+                        why,
+                    })
+                })?;
+            }
+            let found = self
+                .found(name)
+                .ok_or_else(|| refs_fault(RefsFaultV1::MissingOriginal { name: lossy(name) }))?;
+            let (expected, agrees) = match record.target() {
+                CustodyRefTargetV1::Direct(object) => (
+                    format!("direct {}", object.object_id()),
+                    found == FoundV1::Direct(object.object_id()),
+                ),
+                CustodyRefTargetV1::Symbolic(target) => (
+                    format!("symbolic {}", lossy(target.as_bytes())),
+                    found == FoundV1::Symbolic(target.as_bytes()),
+                ),
+                CustodyRefTargetV1::Unborn => (
+                    "unborn".to_owned(),
+                    matches!(found, FoundV1::Symbolic(_)) && unborn.contains(name),
+                ),
+            };
+            if !agrees {
+                return Err(refs_fault(RefsFaultV1::OriginalMismatch {
+                    name: lossy(name),
+                    expected,
+                    found: found.describe(),
+                }));
+            }
+        }
+        Ok(manifest.original_refs().len() as u64)
+    }
+
+    /// Judge everything admitted against `manifest` and its object inventory: exactly one valid HEAD;
+    /// refs that neither conflict nor collide; every active direct target in the inventory, of a valid
+    /// kind, with consistent peeled rows; every symbolic chain bounded and resolved (or unborn where that
+    /// is allowed); and every manifest ref present with exactly its recorded target. The deadline is
+    /// observed between phases.
+    ///
+    /// Where the manifest's closed vocabulary is silent, these are the readings (each refused, never
+    /// guessed, when the restored refs disagree): a manifest `Direct` ref is a ref whose OWN value is that
+    /// object (a symbolic ref that merely resolves to it disagrees); `Symbolic(name)` is a ref whose own
+    /// value names exactly `name`, resolvable or not; `Unborn` is a symbolic ref whose chain ends at a ref
+    /// that does not exist; the value of `FETCH_HEAD` is its first row's object (as Git resolves it) and
+    /// of `ORIG_HEAD` its one object; a branch under `refs/heads/`, HEAD (detached or resolved), and
+    /// `ORIG_HEAD` name commits; a packed peeled row follows a tag and names a non-tag; and ref names that
+    /// differ only by ASCII case collide. A refusal leaves the builder unusable: its caller stops.
+    pub(crate) fn finish(
+        &self,
+        manifest: &CustodyManifestV1,
+    ) -> Result<RefsAgreementV1, GitBootstrapErrorV1> {
+        let inventory = manifest_inventory(manifest, self.format)?;
+        let head = self
+            .head
+            .as_ref()
+            .ok_or_else(|| refs_fault(RefsFaultV1::MissingHead))?;
+        self.check_structure()?;
+        observe_deadline(self.deadline, "refs-structure")?;
+        let direct_targets = self.check_targets(&inventory)?;
+        observe_deadline(self.deadline, "refs-targets")?;
+        let resolution = self.check_resolution(manifest, &inventory)?;
+        observe_deadline(self.deadline, "refs-resolved")?;
+        let manifest_refs = self.check_manifest(manifest, &resolution.unborn)?;
+        observe_deadline(self.deadline, "refs-manifest")?;
+        let packed = self.packed.as_ref();
+        Ok(RefsAgreementV1 {
+            head: match head {
+                RefValueV1::Direct(oid) => HeadStateV1::Detached { oid: oid.clone() },
+                RefValueV1::Symbolic(target) => HeadStateV1::Symbolic {
+                    target: lossy(target),
+                    resolved: resolution.head,
+                },
+            },
+            loose_refs: self.loose.len() as u64,
+            packed_refs: packed.map_or(0, |packed| packed.rows.len() as u64),
+            peeled_rows: self.peeled_rows,
+            effective_refs: self.names().len() as u64,
+            symbolic_refs: self
+                .loose
+                .values()
+                .filter(|value| matches!(value, RefValueV1::Symbolic(_)))
+                .count() as u64,
+            orig_head: self.orig_head.clone(),
+            fetch_head_rows: self.fetch_head.as_ref().map_or(0, |rows| rows.len() as u64),
+            reflog_files: self.logs.len() as u64,
+            reflog_rows: self.log_rows,
+            direct_targets,
+            manifest_refs,
+        })
+    }
+}
+
+/// What HEAD is in the restored refs.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum HeadStateV1 {
+    /// HEAD holds an object id of the inventory's commits.
+    Detached { oid: String },
+    /// HEAD names a branch; `resolved` is the commit its chain ends at, or `None` when the chain ends
+    /// at a ref that does not exist (an unborn HEAD).
+    Symbolic {
+        target: String,
+        resolved: Option<String>,
+    },
+}
+
+/// What the agreement proved, in counts; the refs themselves are not retained.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RefsAgreementV1 {
+    pub(crate) head: HeadStateV1,
+    /// Loose files under `refs/`.
+    pub(crate) loose_refs: u64,
+    pub(crate) packed_refs: u64,
+    pub(crate) peeled_rows: u64,
+    /// Distinct ref names under `refs/`, loose or packed.
+    pub(crate) effective_refs: u64,
+    /// Loose symbolic refs under `refs/`.
+    pub(crate) symbolic_refs: u64,
+    pub(crate) orig_head: Option<String>,
+    pub(crate) fetch_head_rows: u64,
+    pub(crate) reflog_files: u64,
+    pub(crate) reflog_rows: u64,
+    /// Distinct direct targets found in the verified inventory.
+    pub(crate) direct_targets: u64,
+    /// The manifest's original refs, each cross-checked.
+    pub(crate) manifest_refs: u64,
+}
+
+/// The retained frames' agreement with the manifest and its inventory: the production input of the refs
+/// foundation. It re-reads exactly the frames pass B1a admitted (`plan` must be that plan, for this
+/// capsule), each rehashed from its retained descriptor and decoded again, completely, through its
+/// verified trailer, with every regular file of the active subset fed to a [`RefsBuilderV1`]; then
+/// [`RefsBuilderV1::finish`] judges the whole. A frame that is not the verified bytes is refused as that
+/// ahead of anything it says. An Empty `RefsAndHead` class is [`GitBootstrapErrorV1::EmptyRefsAndHead`];
+/// no HEAD is ever synthesized.
+///
+/// Nothing is written, charged, or reserved: the one ledger, the pins, and the destination are exactly as
+/// they were, whatever the outcome, and the caller keeps the one verified capsule. The ONE absolute
+/// `deadline` is observed at every step. On success each staged descriptor is at offset 0. A refusal is in
+/// pass A's failure shape: it never began active materialization, it carries `completed`, and the one
+/// ledger's charge.
+pub(crate) fn agree_active_refs_v1(
+    verified: &mut VerifiedCapsuleV1,
+    plan: &ActiveFramePlanV1,
+    object_format: GitObjectFormatV1,
+    frame_budget: CustodyFrameBudgetV1,
+    deadline: Instant,
+    completed: Option<GitPlaneStepV1>,
+) -> Result<RefsAgreementV1, GitBootstrapFailureV1> {
+    agree_active_refs_bounded_v1(
+        verified,
+        plan,
+        object_format,
+        frame_budget,
+        deadline,
+        completed,
+        RefsLimitsV1::v1(),
+    )
+}
+
+/// [`agree_active_refs_v1`] with the limits as a parameter, so each cap is exercised at a small size.
+pub(crate) fn agree_active_refs_bounded_v1(
+    verified: &mut VerifiedCapsuleV1,
+    plan: &ActiveFramePlanV1,
+    object_format: GitObjectFormatV1,
+    frame_budget: CustodyFrameBudgetV1,
+    deadline: Instant,
+    completed: Option<GitPlaneStepV1>,
+    limits: RefsLimitsV1,
+) -> Result<RefsAgreementV1, GitBootstrapFailureV1> {
+    agree_frames(
+        verified,
+        plan,
+        object_format,
+        frame_budget,
+        deadline,
+        limits,
+    )
+    .map_err(|cause| pre_materialization_failure(verified, cause, completed))
+}
+
+fn plan_mismatch(what: &str) -> GitBootstrapErrorV1 {
+    GitBootstrapErrorV1::ActivePlanMismatch(what.to_owned())
+}
+
+fn agree_frames(
+    verified: &mut VerifiedCapsuleV1,
+    plan: &ActiveFramePlanV1,
+    format: GitObjectFormatV1,
+    frame_budget: CustodyFrameBudgetV1,
+    deadline: Instant,
+    limits: RefsLimitsV1,
+) -> Result<RefsAgreementV1, GitBootstrapErrorV1> {
+    observe_deadline(deadline, "refs-entry")?;
+    let active = classify_active_frames(verified)?;
+    if !active
+        .iter()
+        .any(|frame| frame.class == CustodyCoverageClassV1::RefsAndHead)
+    {
+        return Err(GitBootstrapErrorV1::EmptyRefsAndHead);
+    }
+    // The plan is this capsule's: the same frames, in the same order, at the same staged payloads, with
+    // the length and SHA-256 the verified capsule recorded for each.
+    let planned: Vec<(CustodyCoverageClassV1, usize)> = plan
+        .frames
+        .iter()
+        .map(|frame| (frame.class, frame.staged))
+        .collect();
+    let expected: Vec<(CustodyCoverageClassV1, usize)> = active
+        .iter()
+        .map(|frame| (frame.class, frame.staged))
+        .collect();
+    if planned != expected {
+        return Err(plan_mismatch(
+            "the frames are not the capsule's active frames",
+        ));
+    }
+    for summary in &plan.frames {
+        let recorded = verified
+            .staged
+            .get(summary.staged)
+            .ok_or_else(|| plan_mismatch("a frame names no staged payload"))?;
+        if recorded.length != summary.length || recorded.sha256 != summary.sha256 {
+            return Err(plan_mismatch("a frame is not the verified plaintext"));
+        }
+    }
+    let generation = verified.control.manifest.generation_id().to_owned();
+    let mut builder = RefsBuilderV1::new(format, limits, deadline);
+    for summary in &plan.frames {
+        let one = verified
+            .staged
+            .get_mut(summary.staged)
+            .ok_or_else(|| plan_mismatch("a frame names no staged payload"))?;
+        feed_frame(
+            one,
+            summary,
+            &generation,
+            frame_budget,
+            deadline,
+            &mut builder,
+        )?;
+    }
+    let agreement = builder.finish(&verified.control.manifest)?;
+    // The last statement ahead of the infallible result.
+    observe_deadline(deadline, "refs-final")?;
+    Ok(agreement)
+}
+
+/// Decode one retained frame again, completely, and feed its regular files to `builder`. The first refusal
+/// of the refs themselves is HELD until the whole frame has decoded and its decoded bytes are bound to
+/// the verified plaintext, so a frame that is not whole or not the verified bytes is refused as THAT, and
+/// nothing it says is trusted. The frame must also be the one the plan describes. The descriptor ends at
+/// offset 0.
+fn feed_frame(
+    one: &mut StagedPlaintextV1,
+    summary: &ActiveFrameSummaryV1,
+    generation: &str,
+    budget: CustodyFrameBudgetV1,
+    deadline: Instant,
+    builder: &mut RefsBuilderV1,
+) -> Result<(), GitBootstrapErrorV1> {
+    let class = summary.class;
+    reverify_staged_v1(one, deadline)?;
+    let header = CustodyFrameHeaderV1::new(class, generation).map_err(|_| frame_invalid(class))?;
+    let expired = Cell::new(false);
+    let refuse = || {
+        if expired.get() {
+            GitBootstrapErrorV1::Git(CustodyGitError::Timeout)
+        } else {
+            frame_invalid(class)
+        }
+    };
+    let mut counts = FrameCountsV1::default();
+    let mut entry_digest = ActiveEntryDigestV1::new(class);
+    let mut fault: Option<GitBootstrapErrorV1> = None;
+    let mut paced = PacedFrameReaderV1 {
+        inner: (&one.file).take(one.length.saturating_add(1)),
+        deadline,
+        expired: &expired,
+        context: digest::Context::new(&digest::SHA256),
+        count: 0,
+    };
+    {
+        let reader = BufReader::with_capacity(HASH_BUFFER_BYTES_V1, &mut paced);
+        let mut decoder =
+            CustodyFrameDecoderV1::new(reader, &header, budget).map_err(|_| refuse())?;
+        loop {
+            before_deadline(deadline)?;
+            let Some(entry) = decoder.next_entry().map_err(|_| refuse())? else {
+                break;
+            };
+            let (path, kind, length, content) = match entry {
+                CustodyFrameEntryV1::Directory { path, .. } => {
+                    (path, ActiveEntryKindV1::Directory, 0, None)
+                }
+                CustodyFrameEntryV1::Symlink { path, .. } => {
+                    (path, ActiveEntryKindV1::Symlink, 0, None)
+                }
+                CustodyFrameEntryV1::Regular {
+                    path,
+                    length,
+                    content,
+                    ..
+                } => (path, ActiveEntryKindV1::Regular, length, Some(content)),
+            };
+            #[cfg(test)]
+            run_git_hook(
+                GitHookPointV1::FrameEntry,
+                "",
+                Path::new(OsStr::from_bytes(path.as_bytes())),
+            );
+            counts.entries = counts.entries.saturating_add(1);
+            match kind {
+                ActiveEntryKindV1::Directory => {
+                    counts.directories = counts.directories.saturating_add(1);
+                }
+                _ => {
+                    counts.regular_files = counts.regular_files.saturating_add(1);
+                    counts.content_bytes = counts.content_bytes.saturating_add(length);
+                }
+            }
+            entry_digest.record(kind, path.as_bytes(), length);
+            if let Some(mut content) = content {
+                if fault.is_none() {
+                    match builder.admit_file(path.as_bytes(), &mut content) {
+                        Ok(()) => {}
+                        Err(timeout @ GitBootstrapErrorV1::Git(CustodyGitError::Timeout)) => {
+                            return Err(timeout);
+                        }
+                        Err(GitBootstrapErrorV1::Refs(RefsFaultV1::Unreadable { .. })) => {
+                            return Err(refuse());
+                        }
+                        Err(found) => fault = Some(found),
+                    }
+                }
+                io::copy(&mut content, &mut io::sink()).map_err(|_| refuse())?;
+            } else if kind == ActiveEntryKindV1::Symlink && fault.is_none() {
+                fault = Some(refs_fault(RefsFaultV1::UnexpectedFile {
+                    path: lossy(path.as_bytes()),
+                }));
+            }
+        }
+    }
+    // The decoder met the verified trailer and the end of the stream. The bytes it consumed must be
+    // exactly the verified plaintext: a frame replaced after its rehash is refused here.
+    let (count, context) = (paced.count, paced.context);
+    let mut decoded_sha256 = [0_u8; 32];
+    decoded_sha256.copy_from_slice(context.finish().as_ref());
+    if count != one.length || decoded_sha256 != one.sha256 {
+        return Err(GitBootstrapErrorV1::StagedInputChanged {
+            name: lossy(one.name.as_bytes()),
+        });
+    }
+    if (
+        summary.entries,
+        summary.directories,
+        summary.regular_files,
+        summary.content_bytes,
+        summary.entries_sha256,
+    ) != (
+        counts.entries,
+        counts.directories,
+        counts.regular_files,
+        counts.content_bytes,
+        entry_digest.finish(),
+    ) {
+        return Err(plan_mismatch(
+            "a frame's entries are not the ones B1a admitted",
+        ));
+    }
+    if let Some(fault) = fault {
+        return Err(fault);
+    }
+    observe_deadline(deadline, "refs-decoded")?;
+    observe_deadline(deadline, "refs-rewound")?;
+    one.file.seek(SeekFrom::Start(0)).map_err(|error| {
+        GitBootstrapErrorV1::Restore(CustodyRestoreErrorV1::Io(format!(
+            "{}: {error}",
+            lossy(one.name.as_bytes())
+        )))
+    })?;
+    Ok(())
+}
+
+/// The active repository config, byte for byte: `[core]` with `repositoryformatversion` 0 (SHA-1) or 1
+/// (SHA-256), `bare = false`, `filemode = true`, `logallrefupdates = true`, `fsmonitor = false`, and for
+/// SHA-256 an `[extensions]` section with `objectformat = sha256`. LF line ends, tab-indented
+/// `key = value` lines, one trailing LF. It names no remote, include, filter, hooks path, or credential
+/// helper, and it is a function of the format alone: archived configuration is never consulted.
+pub(crate) fn encode_inert_config_v1(format: GitObjectFormatV1) -> Vec<u8> {
+    let version = match format {
+        GitObjectFormatV1::Sha1 => 0,
+        GitObjectFormatV1::Sha256 => 1,
+    };
+    let mut text = format!(
+        "[core]\n\trepositoryformatversion = {version}\n\tbare = false\n\tfilemode = true\n\tlogallrefupdates = true\n\tfsmonitor = false\n"
+    );
+    if format == GitObjectFormatV1::Sha256 {
+        text.push_str("[extensions]\n\tobjectformat = sha256\n");
+    }
+    text.into_bytes()
 }
