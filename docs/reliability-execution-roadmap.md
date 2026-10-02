@@ -29,10 +29,14 @@
       act through the retained pins.
   - **2B3b:** the draft task is `docs/superpowers/plans/2026-09-29-adr0041-slice2b3b-git-plane-task.md`.
     Sol/xhigh spec round 1 rejected four bounded findings; revision 2 received **APPROVE** in round 2/2
-    (zero WRONG, two nonblocking SMELLs). Both clarity/regression recommendations are folded. Next is
-    two serial bounded Sonnet 5.5 passes through the bridge: isolated object bootstrap, then final Git
-    metadata/closure and the combined phase-G proof. Both retain the approved full task contract; 2B3b
-    remains incomplete until both pass and the combined change is reviewed. This follows the
+    (zero WRONG, two nonblocking SMELLs). Both clarity/regression recommendations are folded.
+    Isolated object bootstrap now has independent source approval. Remaining work is split before
+    dispatch into B1a frame prevalidation, B1b pure refs/config, B2a object copies, B2b metadata, and B2c
+    final closure/result, each capped at two source-review rounds. Remaining-task spec1/2 rejected one
+    missing Empty-HEAD rule and two nonblocking scope/structural-test concerns. The owner chose typed
+    pre-repository refusal for Empty refs; complete G requires captured refs with exactly one valid HEAD.
+    Pass A remains unchanged. These refinements await remaining-task spec2/2. 2B3b
+    remains incomplete until all increments and native/combined gates pass. This follows the
     owner's 2026-09-29 direction. The owner approved isolated Git bootstrap under `.restore-work/` to preserve
     create-new HEAD/config restoration, and explicit caller-selected format provenance for empty objects.
     A container smoke returned Sonnet 5.5's PONG but failed cleanup; the owner requires repair and independent
@@ -105,8 +109,12 @@
     binds sole-success deadline closure and every earlier contract. Exact five reviewed paths adopted
     onto the controller branch; original Rejected checkpoint remains unchanged.
     Frozen sourcec2fc2f2f preserved. No deadline exception. All original cap records,
-    rejected source/checkpoints/evidence remain; no restart or B1/B2 dispatch yet.
-    Git bootstrap is locally adopted with independent source approval. Serial B1/B2,
+    rejected source/checkpoints/evidence remain; no restart or remaining implementation dispatch yet.
+    Git bootstrap is locally adopted at2d8a8fb4 with independent source approval.
+    [Remaining spec1/2](superpowers/reviews/2026-10-02-adr0041-slice2b3b-remaining-spec-round1.md)
+    is REJECT1WRONG/2SMELL/1blocker, CLOSED POPULATION. Owner refinement and five task drafts
+    are prepared for final spec2/2; original two-pass drafts remain historical, not dispatchable.
+    Serial B1a/B1b/B2a/B2b/B2c,
     native-ext4 CI, macOS verification and combined review remain outstanding.
     The controller handoff records approved A and the bound serial tasks.
   **2B2b is complete:** all its children are merged. The parent Slice 2B completion gate (plan §8) still requires 2B3,
