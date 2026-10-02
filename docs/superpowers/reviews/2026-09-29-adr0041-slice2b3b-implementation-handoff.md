@@ -1,26 +1,26 @@
 # Handoff — ADR-0041 2B3b pass B1A, retained active-frame prevalidation
 
-**Written:** 2026-10-02T06:10Z · **By:** Sonnet 5.5 implementor (`claude-sonnet-5-5`) under the bridge `implement` contract · **Provider:** claude
-**Workspace:** /Users/wesleyjinks/code/.a2a-implement/impl-94034-sqrswpnj · implement/impl-94034-sqrswpnj
-**Measured state:** `[MEASURED]` HEAD 53373e68ce4c32034ad735e9e58196be979e0c9a (clean at start); this agent modified exactly the three owned paths and staged them; it did not commit, push, merge, branch, reset, or checkout. Probe `git status --short` and the source hashes in §6.
+**Written:** 2026-10-02T07:02:32.568542+00:00 · **By:** Codex controller reconciliation of Sonnet 5.5 handoff · **Provider:** codex
+**Workspace:** /Users/wesleyjinks/code/a2a-bridge · work/adr0041-2b3b-bootstrap-20261001; reviewed quarantine impl-94034-sqrswpnj retained.
+**Measured state:** `[MEASURED]` B1a exact reviewed source3dc5533ab54488cfdbd34970810cc6494a29d13c adopted at controller d49a30aff9822a41ad7257fc3a5cf5dbafc9e0de. Original review handoff is preserved in that commit and in the unchanged quarantine. This reconciliation changes documentation only.
 **Predecessor:** pass A approved source e4e6dac7 (adopted at 2d8a8fb4), remaining-task spec 2/2 APPROVE (4083da5e; final approval recorded at 53373e68). The previous contents of this file (the pass A round-6 handoff) are retained in git history at 53373e68.
 **Truth ordering:** measured live state > explicit owner/contract authority within its scope > this handoff for current operational state > earlier handoffs and non-authoritative summaries. A conflict between tiers stays OPEN in §0 — never resolved by document class alone.
 **Provenance:** `[MEASURED]` claims were probed by this writer in this session; `[INHERITED]` claims were read from the task, the master plan, or retained review records and were not re-proven here.
-**Template:** `/Users/wesleyjinks/.claude/handoff-template.md` is NOT present in this environment (the sandbox has no `/Users/wesleyjinks/.claude/`). The eight sections below (§0–§7) follow the predecessor handoff's layout; that is an inference, not a verified copy of the template.
+**Template:** the original implementor could not access the host template in its container and disclosed that limit. Controller uses the installed /Users/wesleyjinks/.claude/handoff-template.md eight-section format; later private dispatches will include a canonical snapshot.
 
 ## 0. Gating facts — settle these before starting anything below
 
-**(a) Lane ownership** — `[MEASURED]` this session is the only writer of the three owned paths; no unknown writer was observed; no background process of this lane remains (the last gate run ended; the mutation driver restored the source byte-identically). Controller owns commit, source review, and every later increment — OPEN until the controller acts.
-**(b) Custody exposure** — `[MEASURED]` all raw receipts are under `.git/a2a-evidence/2b3b-pass-b1a/` in this clone (untracked, inside `.git`). Build output is in `/tmp/b1a-target` (disposable). **No second copy exists**; the controller must copy the evidence directory before this clone is cleaned. The model transcript is `/root/.claude/projects/-Users-wesleyjinks-code--a2a-implement-impl-94034-sqrswpnj/b97eecae-a065-4e65-bbeb-ee95352c7857.jsonl` (host mirror via the virtiofs `projects` mount); every assistant record carries `"model":"claude-sonnet-5-5"` (145 at the time first probed; re-probe for the final count).
-**(c) In flight / irreversible** — `[MEASURED]` nothing. Source is staged, not committed. No registry, image, container, billable turn, or live smoke was used.
+**(a) Lane ownership** — `[MEASURED]` Sonnet edit and Sol source review ended; exact worker container absent. Sol round1/2 APPROVE0/0/0; no second review or provider replay. Controller exact-reviewed-file adoption committed d49a30af. B1b next; no live B1a writer.
+**(b) Custody exposure** — `[MEASURED]` complete raw worker gates/mutations/source snapshots, first and terminal checkpoints, and source-review transcript/final have second copies under /private/tmp/adr0041-2b3b-20260929/. The original .git/a2a-evidence/2b3b-pass-b1a/ and unchanged reviewed quarantine remain. Runtime hashes D5/E5 are preserved. Sonnet transcript model is claude-sonnet-5-5; review transcript model gpt-5.6-sol/xhigh.
+**(c) In flight / irreversible** — `[MEASURED]` no B1a run remains active. Bridge committed3dc5533a, passed all five verification gates, then recorded LoopStopped/Inconclusive because trailing CAP/memory metadata violates its tail grammar. That checkpoint remains unchanged. Actual Sol source approval is explicit and source-bound; controller adoption is separate from automatic bridge approval. Original orchestration used container/provider turns; no extra live smoke or provider replay was used.
 **(d) Authorization granted but not exercised** — `[INHERITED]` source review cap TWO rounds for this increment, declared before dispatch; no extension is requested here. Native macOS and native-ext4 runs, the aggregate gates, and the full base251..final Sol review remain required before whole-2B3b completion and are NOT claimed. This run is Linux aarch64 (OrbStack) with the checkout on a virtiofs bind mount from macOS and test temp directories under `/tmp` on the container overlay: it is not native-ext4 evidence and not macOS evidence.
 
 **Environment facts that changed how gates ran** — `[MEASURED]` The default `CARGO_HOME` (`/usr/local/cargo`) has an incomplete registry for `--offline` (it lacks `arc-swap`); the populated registry is `/cargo`, so every Cargo command used `CARGO_HOME=/cargo CARGO_TARGET_DIR=/tmp/b1a-target CARGO_INCREMENTAL=0 CARGO_NET_OFFLINE=true` with all proxy variables unset (`.git/a2a-evidence/2b3b-pass-b1a/env.sh`). `rustc 1.94.0`, lane `git 2.54.0`.
 
 ## 1. Resume order
 
-1. Controller: verify `git status --short` shows only the three owned paths, verify the source hashes in §6 (before == after == live), copy `.git/a2a-evidence/2b3b-pass-b1a/`, and commit ONLY the three owned paths with the prepared `.git/A2A_COMMIT_MSG`.
-2. Controller: one independent Sol/xhigh hard-read-only SOURCE review of this increment (cap TWO rounds). Give it the base..candidate diff of the three paths, the master plan, the two B1A task lines about Empty refs, this handoff, and the mutation matrix; ask it to attack the §7 design choices first.
+1. B1a source review and operator adoption are complete; retain the source receipt and unchanged inconclusive checkpoint. Do not rerun B1a verification or reviewer without new source or a concrete unresolved concern.
+2. Bind B1b to the clean controller predecessor, all143 inherited Git names, the approved master and B1a source-review receipt; Sonnet5.5 implementation and source cap2. Preserve every A/B1a guard.
 3. Only after B1A approval: B1B (ref/HEAD grammar and agreement helpers, config encoder foundations), then B2A (charged second object store), B2B (metadata and final-descriptor agreement), B2C (the single wrapper, final proof, and result) — consecutive changes in the same lane, never five restore attempts.
 4. Whole-2B3b still needs native macOS and native-ext4 runs, the aggregate gates, and the full base251..final Sol review.
 
@@ -37,7 +37,7 @@
 | Final-byte gates | done | `[MEASURED]` `gates/summary.txt`: fmt, workspace clippy `--all-targets --all-features -- -D warnings`, locked build, repository hygiene all EXIT 0. Full workspace `--all-targets --no-fail-fast`: 90 groups, 5009 passed / 0 failed / 13 ignored. Default targets + doctests `--no-fail-fast`: 106 groups (16 doctest groups), 5020 passed / 0 failed / 13 ignored. 143 Git tests in each. No exclusions. All with `--test-threads=1`, locked, offline, `CARGO_INCREMENTAL=0`, proxies unset |
 | Runtime source before == after == live | done | `[MEASURED]` §6; `gates/source-before-gates.sha256`, `gates/source-after-gates.sha256`, and a live probe after the gates are identical |
 | Final-handoff hygiene | done | `[MEASURED]` re-run after this document's final bytes: `gates/hygiene-final-handoff.log` |
-| Source review of B1A | pending | `[INHERITED]` cap TWO source rounds, declared before dispatch; none run |
+| Source review of B1A | done | `[MEASURED]` Sol gpt-5.6-sol/xhigh hardRO APPROVE0/0/0 round1/2, NO FINDINGS, reviewed3dc5533a; raw SHA4316f2e8. Exact-reviewed-file adoption d49a30af, original bridge Inconclusive checkpoint unchanged |
 | B1B, B2A, B2B, B2C | not started | outstanding by design; see §4 |
 | Native macOS / native ext4 / aggregate / combined base251..final review | not run | required before whole-2B3b |
 
@@ -66,7 +66,7 @@
 
 | # | Work | State | Exact next action | Blocked by | Identifiers |
 |---:|---|---|---|---|---|
-|1|B1A source review|pending|commit the three owned paths, then one Sol/xhigh hard-RO review, cap two rounds|commit|task cap|
+|1|B1A source review/adoption|done|retain exact source/receipt/checkpoint|none|source1/2 APPROVE0/0/0; d49a30af|
 |2|B1B|not started|ref/HEAD grammar, agreement with the manifest, symbolic/detached/unborn semantics, `.lock` and ref-name rules, config encoder foundations, `custody_seal.rs` read-only accessors|B1A approval|master Tasks 1, 4|
 |3|B2A|not started|create `repository/.git/objects` and copy the verified pack/idx/rev, charged to the one ledger|B1B|master Task 3|
 |4|B2B|not started|materialize active metadata create-new through retained pins, second decode bound to `ActiveFramePlanV1`, final-descriptor agreement|B2A|master Task 4|
@@ -106,7 +106,7 @@
 
 ## 7. Refutation verdict and owner questions
 
-**§2c verdict:** NOT RUN — B1A source review pending · claim: "prevalidation admits only whole, trailer-verified, verified-bytes active frames in the exact allowlist, and writes, charges, and reserves nothing" · pass: INDEPENDENT (to be run by the controller) · evidence tier: TEST-BACKED, with the structural scans and the defense-in-depth limits in §5 stated plainly · record: planned source review after commit.
+**§2c verdict:** SURVIVED — independent B1a source review · claim: "prevalidation admits only whole, trailer-verified, verified-bytes active frames in the exact allowlist, and writes, charges, and reserves nothing" · pass: INDEPENDENT · evidence tier: STATIC SOURCE REVIEW plus supplied source-bound executed receipts · record: Sol1/2 APPROVE0/0/0 at3dc5533a; source-round1.md, raw4316f2e8. M19 mechanism independently confirmed; no behavioral RED claimed for redundant guard.
 
 **Behavioral evidence (guard removed, unchanged tests, rebuild, restored hashes), 56 mutations, 55 flipped as predicted:**
 
@@ -189,4 +189,4 @@
 | Remaining-task spec | rounds 1-2: APPROVE wrong0/smell0/blockers0 at round 2/2 (4083da5e, raw SHA256 f9dee13b…), `docs/superpowers/reviews/2026-10-02-adr0041-slice2b3b-remaining-spec-round2.md` |
 | Pass A source | rounds 1-5 rejected (the original Rejected automatic checkpoint is retained and unmodified); round 6/6 APPROVE wrong0/smell0/blockers0 at e4e6dac7, `docs/superpowers/reviews/2026-10-02-adr0041-slice2b3b-cumulative-review-round6.md`; pass A runtime adopted at 2d8a8fb4 |
 | Pass A Linux gates (prior receipts) | alltargets 4978/0/13 (90 groups), default+doctests 4989/0/13 (106 groups), 112 Git tests each |
-| B1A source | not yet reviewed; cap TWO rounds declared before dispatch |
+| B1A source | Sol round1/2 APPROVE0/0/0 at3dc5533a; exact operator adoption d49a30af; original automatic LoopStopped/Inconclusive checkpoint preserved |

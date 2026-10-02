@@ -135,8 +135,13 @@
     alltargets5009/0/13 in90groups (core recompiled) and default/doctests5020/0/13 in106groups
     (core cached); both retain143Git/112inherited tests. No exclusions beyond13ignored. Formatting,
     workspace clippy all-targets/all-features, locked build and hygiene pass, with four runtime hashes
-    before==after==live. Controller parsed and snapshotted complete raw gates. B1a source approval
-    and the bridge's own mandatory verification/terminal result are still pending.
+    before==after==live. Controller parsed and snapshotted complete raw gates. The bridge also passed
+    its five mandatory verification gates. [B1a source review1/2](superpowers/reviews/2026-10-02-adr0041-slice2b3b-b1a-source-round1.md)
+    completed APPROVE0WRONG/0SMELL/0blockers, NO FINDINGS, on clean3dc5533a. M19 is closed by decoder
+    poisoning mechanism, not behavioral RED. Trailing CAP/memory metadata caused automatic Inconclusive;
+    original LoopStopped checkpoint remains unchanged. Exact reviewed files were operator-adopted
+    at d49a30af after predecessor-file equality proofs; no forced merge, forged approval or review replay.
+    B1b is next, with source cap2 and exact approved predecessor binding.
     Serial B1b/B2a/B2b/B2c,
     native-ext4 CI, macOS verification and combined review remain outstanding.
     The controller handoff records approved A and the bound serial tasks.
