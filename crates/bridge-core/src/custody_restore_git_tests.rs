@@ -18,6 +18,7 @@ use crate::custody_export::{
     GitDirectoryBudgetV1, ENTRY_ALLOWANCE_BYTES_V1, INDEX_PACK_ENTRIES_V1, INIT_BARE_ENTRIES_V1,
     INIT_BARE_LOGICAL_BYTES_V1,
 };
+use crate::custody_frame::{CustodyFrameEncoderV1, CustodyFramePathV1};
 use crate::custody_git::{
     CustodyGitError, ExpectedGitDigestV1, GitCommandV1, GitObjectFormatV1, GitRootNamesV1,
     GitRouteRequestV1, GitRunRequestV1, GitRunnerV1,
@@ -3102,16 +3103,24 @@ fn the_exposed_budget_helpers_keep_their_exporter_formulas() {
 
 /// The bootstrap measures through retained descriptors only. It must not call the exporter's
 /// path-reopening walker, open any path with `std::fs`, route a caller object store, or write a
-/// repository entry: pass A creates nothing under `repository/`.
+/// repository entry: pass A creates nothing under `repository/`. That invariant is function-scoped
+/// (direct `bootstrap_git_objects_v1` never creates `repository/`), so the scan covers the bootstrap
+/// implementation: the production source up to the pass B1a marker, where later passes' code begins. The
+/// narrowing is guarded by `b1a_the_prevalidation_region_is_read_only_and_the_scan_split_is_unique`, and
+/// the filesystem behavior by `b1a_the_direct_bootstrap_creates_no_repository_and_prevalidation_adds_none`.
 #[test]
 fn the_seam_never_uses_the_path_walker_a_path_open_an_object_store_route_or_repository() {
     let source = include_str!("custody_restore_git.rs");
-    let production = source
+    let bootstrap_implementation = source
+        .split("// Pass B1a: retained active-frame prevalidation")
+        .next()
+        .expect("the bootstrap implementation");
+    let production = bootstrap_implementation
         .split("// Test seams")
         .next()
         .expect("the production half")
         .to_owned()
-        + source
+        + bootstrap_implementation
             .split("// Pure helpers")
             .nth(1)
             .expect("the helpers and steps");
@@ -7722,4 +7731,2160 @@ fn round6_the_late_validation_order_is_fixed_in_the_source() {
         !construct.contains('?'),
         "the success value is built infallibly"
     );
+}
+
+// ---------------------------------------------------------------------------------------------
+// Pass B1a: retained active-frame prevalidation
+//
+// Every row drives `prevalidate_active_frames_v1` over a REAL retained phase-V value: the rich
+// capsule's two plan-produced frames, or hand-encoded frames (built with the real frame encoder) that
+// stand where a sealed capsule's staged payloads would, beside a real phase-V capsule and its real
+// ledger, pins, and destination. Prevalidation takes no runner, so no Git child can run; every refusal
+// row also proves that the destination tree and the one ledger are exactly what they were.
+//
+// Pass A's controls above are unchanged. The mutation matrix in `.git/a2a-evidence/2b3b-pass-b1a/` maps
+// each guard to the rows that turn red without it.
+// ---------------------------------------------------------------------------------------------
+
+type ClassV1 = CustodyCoverageClassV1;
+const REFS_V1: ClassV1 = CustodyCoverageClassV1::RefsAndHead;
+const LOGS_V1: ClassV1 = CustodyCoverageClassV1::StashAndReflogs;
+const HEAD_BYTES_V1: &[u8] = b"ref: refs/heads/main\n";
+const DIGEST_BYTES_V1: usize = 32;
+
+/// One entry of a hand-built frame.
+#[derive(Clone, Copy)]
+enum EntryV1<'a> {
+    Dir,
+    File(&'a [u8]),
+    Link(&'a [u8]),
+}
+
+type EntriesV1<'a> = [(&'a [u8], EntryV1<'a>)];
+
+fn dir(path: &'static str) -> (&'static [u8], EntryV1<'static>) {
+    (path.as_bytes(), EntryV1::Dir)
+}
+
+fn file(path: &'static str, content: &'static [u8]) -> (&'static [u8], EntryV1<'static>) {
+    (path.as_bytes(), EntryV1::File(content))
+}
+
+fn link(path: &'static str, target: &'static [u8]) -> (&'static [u8], EntryV1<'static>) {
+    (path.as_bytes(), EntryV1::Link(target))
+}
+
+/// A frame's bytes, from the real encoder, with the entries in canonical order whatever order they are
+/// given in. A `/` or NUL cannot be in a component, but every other byte can: that is the codec's own
+/// rule, so every spelling below is encodable.
+fn encode_frame(class: ClassV1, generation: &str, entries: &EntriesV1<'_>) -> Vec<u8> {
+    let mut ordered: Vec<(CustodyFramePathV1, EntryV1<'_>)> = entries
+        .iter()
+        .map(|(path, entry)| {
+            (
+                CustodyFramePathV1::from_bytes(path).expect("a frame path"),
+                *entry,
+            )
+        })
+        .collect();
+    ordered.sort_by(|left, right| left.0.cmp(&right.0));
+    let header = CustodyFrameHeaderV1::new(class, generation).expect("a frame header");
+    let mut bytes = Vec::new();
+    let mut encoder =
+        CustodyFrameEncoderV1::new(&mut bytes, &header, frame_budget()).expect("an encoder");
+    for (path, entry) in ordered {
+        match entry {
+            EntryV1::Dir => encoder.directory(&path, 0o755).expect("a directory"),
+            EntryV1::File(content) => {
+                let mut reader: &[u8] = content;
+                encoder
+                    .regular_file(&path, 0o644, content.len() as u64, &mut reader)
+                    .expect("a regular file");
+            }
+            EntryV1::Link(target) => encoder.symlink(&path, target).expect("a symlink"),
+        }
+    }
+    encoder.finish().expect("the trailer");
+    bytes
+}
+
+/// `entries` plus a regular `HEAD`, unless they already name one.
+fn with_head<'a>(entries: &EntriesV1<'a>) -> Vec<(&'a [u8], EntryV1<'a>)> {
+    let mut all = entries.to_vec();
+    if !all.iter().any(|(path, _)| *path == b"HEAD") {
+        all.push((b"HEAD", EntryV1::File(HEAD_BYTES_V1)));
+    }
+    all
+}
+
+fn sha256_bytes(bytes: &[u8]) -> [u8; 32] {
+    let mut sha256 = [0_u8; 32];
+    sha256.copy_from_slice(digest::digest(&digest::SHA256, bytes).as_ref());
+    sha256
+}
+
+/// Stage `bytes` as the one Captured payload of `class`, through a fresh unlinked descriptor, and set
+/// the manifest's row for it: exactly what phase V would hold for a capsule carrying those bytes.
+fn stage_frame(verified: &mut VerifiedCapsuleV1, class: ClassV1, bytes: &[u8]) {
+    use std::io::{Seek as _, Write as _};
+    verified.control.manifest = manifest_with_row(class, CustodyStateClassV1::Captured, verified);
+    verified
+        .staged
+        .retain(|one| one.role != CustodyCapsuleArtifactRoleV1::CoveragePayload(class));
+    let mut file = tempfile::tempfile().expect("an unlinked staging descriptor");
+    file.write_all(bytes).expect("the frame bytes");
+    file.seek(SeekFrom::Start(0)).expect("rewind");
+    verified.staged.push(StagedPlaintextV1 {
+        name: LosslessPathV1::from_bytes(format!("test/{class:?}.frame").into_bytes()),
+        role: CustodyCapsuleArtifactRoleV1::CoveragePayload(class),
+        file,
+        length: bytes.len() as u64,
+        sha256: sha256_bytes(bytes),
+    });
+}
+
+fn staged_index(verified: &VerifiedCapsuleV1, class: ClassV1) -> usize {
+    verified
+        .staged
+        .iter()
+        .position(|one| one.role == CustodyCapsuleArtifactRoleV1::CoveragePayload(class))
+        .expect("the staged payload")
+}
+
+/// One real phase-V value with its destination.
+struct CaseV1 {
+    dest: DestV1,
+    verified: VerifiedCapsuleV1,
+}
+
+impl CaseV1 {
+    /// A real all-Empty phase-V capsule whose manifest and staged payloads name `frames` (class, bytes).
+    fn with_bytes(capsule: &CustomCapsuleV1, frames: &[(ClassV1, Vec<u8>)]) -> Self {
+        let (dest, mut verified) = phase_v(&capsule.capsule);
+        for (class, bytes) in frames {
+            stage_frame(&mut verified, *class, bytes);
+        }
+        Self { dest, verified }
+    }
+
+    fn generation(capsule: &CustomCapsuleV1) -> String {
+        let (_dest, verified) = phase_v(&capsule.capsule);
+        verified.control.manifest.generation_id().to_owned()
+    }
+
+    /// A refs frame (with `HEAD` added) and, if given, a logs frame, both well formed for the generation.
+    fn with_entries(
+        capsule: &CustomCapsuleV1,
+        refs: &EntriesV1<'_>,
+        logs: Option<&EntriesV1<'_>>,
+    ) -> Self {
+        let generation = Self::generation(capsule);
+        let mut frames = vec![(
+            REFS_V1,
+            encode_frame(REFS_V1, &generation, &with_head(refs)),
+        )];
+        if let Some(logs) = logs {
+            frames.push((LOGS_V1, encode_frame(LOGS_V1, &generation, logs)));
+        }
+        Self::with_bytes(capsule, &frames)
+    }
+
+    fn refs_only(capsule: &CustomCapsuleV1, refs: &EntriesV1<'_>) -> Self {
+        Self::with_entries(capsule, refs, None)
+    }
+
+    fn run(&mut self) -> Result<ActiveFramePlanV1, GitBootstrapErrorV1> {
+        prevalidate(&mut self.verified, far_deadline())
+    }
+
+    /// Runs, and requires the refusal to leave no trace: not on the ledger, not in the destination tree,
+    /// and no `repository/` entry.
+    fn refusal(&mut self, row: &str) -> GitBootstrapErrorV1 {
+        let ledger = ledger_used(&self.verified);
+        let tree = snapshot(&self.dest.path);
+        let error = self.run().expect_err(row);
+        assert_eq!(ledger_used(&self.verified), ledger, "{row}: the ledger");
+        assert_eq!(snapshot(&self.dest.path), tree, "{row}: a byte was written");
+        assert_eq!(
+            self.dest.entries(),
+            [".restore-work"],
+            "{row}: no repository exists"
+        );
+        error
+    }
+
+    fn fault(&mut self, row: &str, class: ClassV1, fault: ActiveFrameFaultV1) {
+        match self.refusal(row) {
+            GitBootstrapErrorV1::ActiveFrame {
+                class: found_class,
+                fault: found,
+            } => assert_eq!((found_class, found), (class, fault), "{row}"),
+            other => panic!("{row}: {other:?}"),
+        }
+    }
+
+    fn accepted(&mut self, row: &str) -> ActiveFramePlanV1 {
+        let ledger = ledger_used(&self.verified);
+        let tree = snapshot(&self.dest.path);
+        let plan = self
+            .run()
+            .unwrap_or_else(|error| panic!("{row}: must prevalidate: {error:?}"));
+        assert_eq!(ledger_used(&self.verified), ledger, "{row}: the ledger");
+        assert_eq!(snapshot(&self.dest.path), tree, "{row}: a byte was written");
+        assert_eq!(self.dest.entries(), [".restore-work"], "{row}");
+        assert!(
+            self.verified.staged.iter().all(|one| position(one) == 0),
+            "{row}: every staged descriptor is back at offset 0"
+        );
+        plan
+    }
+}
+
+fn frames_capsule() -> CustomCapsuleV1 {
+    empty(CustodyGitObjectFormatV1::Sha1)
+}
+
+fn path_string(bytes: &[u8]) -> String {
+    lossy(bytes)
+}
+
+/// The test's own decode of one retained frame: `(entries, directories, regular files, content bytes)`.
+/// It does not use the seam, and leaves the descriptor at offset 0.
+fn independent_summary(
+    file: &std::fs::File,
+    class: ClassV1,
+    generation: &str,
+) -> (u64, u64, u64, u64) {
+    use std::io::Seek as _;
+    let mut handle = file.try_clone().expect("a duplicate descriptor");
+    handle.seek(SeekFrom::Start(0)).expect("rewind");
+    let header = CustodyFrameHeaderV1::new(class, generation).expect("a header");
+    let (mut entries, mut directories, mut files, mut content_bytes) = (0, 0, 0, 0);
+    {
+        let reader = BufReader::new(&handle);
+        let mut decoder =
+            CustodyFrameDecoderV1::new(reader, &header, frame_budget()).expect("a decoder");
+        while let Some(entry) = decoder.next_entry().expect("a whole frame") {
+            entries += 1;
+            match entry {
+                CustodyFrameEntryV1::Directory { .. } => directories += 1,
+                CustodyFrameEntryV1::Regular {
+                    length,
+                    mut content,
+                    ..
+                } => {
+                    files += 1;
+                    content_bytes += length;
+                    std::io::copy(&mut content, &mut std::io::sink()).expect("its content");
+                }
+                CustodyFrameEntryV1::Symlink { .. } => {}
+            }
+        }
+    }
+    handle.seek(SeekFrom::Start(0)).expect("rewind");
+    (entries, directories, files, content_bytes)
+}
+
+fn position(one: &StagedPlaintextV1) -> u64 {
+    use std::io::Seek as _;
+    (&one.file).stream_position().expect("a position")
+}
+
+/// The last step a flow that ran pass A has completed: B1a is called after it.
+const B1A_COMPLETED_V1: Option<GitPlaneStepV1> = Some(GitPlaneStepV1::BootstrapGate);
+
+/// Holds a refusal to pass A's failure shape: no active materialization began, the caller's last completed
+/// step is carried unchanged, and the ledger figure is the one ledger's, exactly as it was before the call.
+fn require_failure_shape(
+    failure: GitBootstrapFailureV1,
+    completed: Option<GitPlaneStepV1>,
+    ledger: u64,
+) -> GitBootstrapErrorV1 {
+    assert!(
+        !failure.active_materialization_began,
+        "prevalidation writes nothing, so no materialization began: {:?}",
+        failure.cause
+    );
+    assert_eq!(failure.last_completed, completed, "{:?}", failure.cause);
+    assert_eq!(failure.ledger_used, ledger, "{:?}", failure.cause);
+    failure.cause
+}
+
+/// The real entry point after pass A, with the refusal's cause returned and its shape checked.
+fn prevalidate(
+    verified: &mut VerifiedCapsuleV1,
+    deadline: Instant,
+) -> Result<ActiveFramePlanV1, GitBootstrapErrorV1> {
+    let ledger = ledger_used(verified);
+    prevalidate_active_frames_v1(verified, frame_budget(), deadline, B1A_COMPLETED_V1)
+        .map_err(|failure| require_failure_shape(failure, B1A_COMPLETED_V1, ledger))
+}
+
+// ---------------------------------------------------------------------------------------------
+// Successful controls: the real frames, and the whole master allowlist
+// ---------------------------------------------------------------------------------------------
+
+/// The rich capsule's two real frames prevalidate. The plan names each by class and staged index with the
+/// staged length and digest, and its counts equal the test's own decode. Nothing is written, no ledger
+/// entry is charged, every staged descriptor is back at offset 0, and a second run returns the same plan.
+#[test]
+fn b1a_the_rich_capsules_real_frames_prevalidate_and_change_nothing() {
+    let fixture = PlanFixtureV1::rich_clone();
+    let (manifest, capability, _receipts) = fixture.planned();
+    let _ = expect_sealed(
+        fixture
+            .export(&manifest, capability)
+            .expect("the rich export seals"),
+    );
+    let (dest, mut verified) = phase_v(&fixture.capsule_dir());
+    let ledger = ledger_used(&verified);
+    let tree = snapshot(&dest.path);
+
+    let plan = prevalidate(&mut verified, far_deadline()).expect("the real frames prevalidate");
+    // Checked before the test's own decode, which shares (and rewinds) each descriptor's offset.
+    assert!(
+        verified.staged.iter().all(|one| position(one) == 0),
+        "every staged descriptor is back at offset 0"
+    );
+    let generation = verified.control.manifest.generation_id().to_owned();
+    assert_eq!(
+        plan.frames
+            .iter()
+            .map(|frame| frame.class)
+            .collect::<Vec<_>>(),
+        [REFS_V1, LOGS_V1]
+    );
+    for frame in &plan.frames {
+        let staged = &verified.staged[frame.staged];
+        assert_eq!(
+            staged.role,
+            CustodyCapsuleArtifactRoleV1::CoveragePayload(frame.class)
+        );
+        assert_eq!((frame.length, frame.sha256), (staged.length, staged.sha256));
+        let (entries, directories, files, content_bytes) =
+            independent_summary(&staged.file, frame.class, &generation);
+        assert_eq!(
+            (
+                frame.entries,
+                frame.directories,
+                frame.regular_files,
+                frame.content_bytes
+            ),
+            (entries, directories, files, content_bytes),
+            "{:?}",
+            frame.class
+        );
+        assert!(frame.entries > 1 && frame.regular_files > 0);
+        assert_eq!(frame.entries, frame.directories + frame.regular_files);
+    }
+    assert_eq!(ledger_used(&verified), ledger);
+    assert_eq!(snapshot(&dest.path), tree);
+    assert_eq!(dest.entries(), [".restore-work"]);
+
+    let again = prevalidate(&mut verified, far_deadline()).expect("a second run");
+    assert_eq!(again, plan, "the same frames give the same plan");
+}
+
+/// Every exactly-allowed name in its actual class is admitted, in both frames, with the counts the test
+/// knows, and the plan's retained facts bind the frames.
+#[test]
+fn b1a_the_master_allowlist_is_admitted_in_its_actual_classes() {
+    let capsule = frames_capsule();
+    let refs: &[(&[u8], EntryV1<'_>)] = &[
+        (b"HEAD", EntryV1::File(HEAD_BYTES_V1)),
+        (
+            b"ORIG_HEAD",
+            EntryV1::File(b"0123456789012345678901234567890123456789\n"),
+        ),
+        (b"FETCH_HEAD", EntryV1::File(b"fetched\n")),
+        (b"packed-refs", EntryV1::File(b"# pack-refs with: peeled\n")),
+        (b"refs", EntryV1::Dir),
+        (b"refs/heads", EntryV1::Dir),
+        (b"refs/heads/feature", EntryV1::Dir),
+        (b"refs/heads/feature/x", EntryV1::File(b"oid\n")),
+        (b"refs/heads/main", EntryV1::File(b"oid\n")),
+        (b"refs/tags", EntryV1::Dir),
+        (b"refs/tags/v1.0", EntryV1::File(b"oid\n")),
+        (b"refs/stash", EntryV1::File(b"oid\n")),
+    ];
+    let logs: &[(&[u8], EntryV1<'_>)] = &[
+        (b"logs", EntryV1::Dir),
+        (b"logs/HEAD", EntryV1::File(b"log\n")),
+        (b"logs/refs", EntryV1::Dir),
+        (b"logs/refs/heads", EntryV1::Dir),
+        (b"logs/refs/heads/main", EntryV1::File(b"log\n")),
+        (b"logs/refs/stash", EntryV1::File(b"log\n")),
+    ];
+    let mut case = CaseV1::with_entries(&capsule, refs, Some(logs));
+    let plan = case.accepted("the whole allowlist");
+    assert_eq!(plan.frames.len(), 2);
+    let refs_frame = &plan.frames[0];
+    assert_eq!(
+        (
+            refs_frame.class,
+            refs_frame.entries,
+            refs_frame.directories,
+            refs_frame.regular_files
+        ),
+        (REFS_V1, 12, 4, 8)
+    );
+    assert_eq!(
+        refs_frame.content_bytes,
+        (HEAD_BYTES_V1.len() + 41 + 8 + 25 + 4 * 4) as u64
+    );
+    let logs_frame = &plan.frames[1];
+    assert_eq!(
+        (
+            logs_frame.class,
+            logs_frame.entries,
+            logs_frame.directories,
+            logs_frame.regular_files,
+            logs_frame.content_bytes
+        ),
+        (LOGS_V1, 6, 3, 3, 4 * 3)
+    );
+    for frame in &plan.frames {
+        let staged = &case.verified.staged[frame.staged];
+        assert_eq!((frame.length, frame.sha256), (staged.length, staged.sha256));
+    }
+
+    // A refs frame that is only a `HEAD` (an unborn repository) is whole; B1b owns its grammar.
+    let mut only_head = CaseV1::refs_only(&capsule, &[]);
+    let plan = only_head.accepted("HEAD alone");
+    assert_eq!(
+        (
+            plan.frames.len(),
+            plan.frames[0].entries,
+            plan.frames[0].regular_files
+        ),
+        (1, 1, 1)
+    );
+}
+
+/// Pass A still accepts the existing all-Empty capsule for both caller formats and reports no active
+/// frame; complete G's first rule then refuses it with the typed Empty-refs refusal. The refusal leaves the
+/// original ledger, every pin, and the destination exactly as Pass A left them, and creates no repository.
+#[test]
+fn b1a_an_all_empty_capsule_is_accepted_by_pass_a_and_refused_by_the_complete_g_rule() {
+    for format in [
+        CustodyGitObjectFormatV1::Sha1,
+        CustodyGitObjectFormatV1::Sha256,
+    ] {
+        let capsule = empty(format);
+        let (dest, verified) = phase_v(&capsule.capsule);
+        let mut accepted = must_bootstrap(verified, core_format(format));
+        assert!(accepted.active_frames.is_empty(), "{format:?}");
+        assert_eq!(
+            accepted.provenance,
+            GitFormatProvenanceV1::CallerSelectedEmpty
+        );
+
+        let ledger = ledger_used(&accepted.verified);
+        let tree = snapshot(&dest.path);
+        let pins: Vec<String> = accepted.directories.keys().cloned().collect();
+        let error = prevalidate(&mut accepted.verified, far_deadline())
+            .expect_err("complete G refuses Empty refs");
+        assert!(
+            matches!(error, GitBootstrapErrorV1::EmptyRefsAndHead),
+            "{format:?}: {error:?}"
+        );
+        assert_eq!(ledger_used(&accepted.verified), ledger, "{format:?}");
+        assert_eq!(snapshot(&dest.path), tree, "{format:?}: a byte was written");
+        assert_eq!(
+            dest.entries(),
+            [".restore-work"],
+            "{format:?}: no repository"
+        );
+        assert_eq!(
+            accepted.directories.keys().cloned().collect::<Vec<_>>(),
+            pins,
+            "{format:?}: the pins are retained"
+        );
+
+        // The rule is independent of Pass A: the same refusal on a fresh phase-V value.
+        let (dest, mut verified) = phase_v(&capsule.capsule);
+        let ledger = ledger_used(&verified);
+        let error = prevalidate(&mut verified, far_deadline())
+            .expect_err("Empty refs refuse without Pass A");
+        assert!(
+            matches!(error, GitBootstrapErrorV1::EmptyRefsAndHead),
+            "{error:?}"
+        );
+        assert_eq!(ledger_used(&verified), ledger);
+        assert_eq!(dest.entries(), [".restore-work"]);
+        assert_eq!(dest.work_entries(), ["plain"]);
+    }
+}
+
+/// Empty refs refuse even beside a Captured reflog frame, and before ANY frame is read.
+#[test]
+fn b1a_empty_refs_refuse_before_any_frame_is_read() {
+    let capsule = frames_capsule();
+    let generation = CaseV1::generation(&capsule);
+    let logs = encode_frame(LOGS_V1, &generation, &[(b"logs", EntryV1::Dir)]);
+    let mut case = CaseV1::with_bytes(&capsule, &[(LOGS_V1, logs)]);
+    let labels = std::rc::Rc::new(std::cell::RefCell::new(Vec::<&'static str>::new()));
+    let seen = labels.clone();
+    let _hook = install_git_hook_for_test(GitHookPointV1::DeadlineObserved, move |event| {
+        seen.borrow_mut().push(event.label);
+    });
+    let error = case.refusal("Empty refs beside a Captured reflog frame");
+    assert!(
+        matches!(error, GitBootstrapErrorV1::EmptyRefsAndHead),
+        "{error:?}"
+    );
+    assert!(
+        !labels
+            .borrow()
+            .iter()
+            .any(|label| label.starts_with("frame-")),
+        "no frame was rehashed or decoded: {:?}",
+        labels.borrow()
+    );
+}
+
+/// Impossible and unsupported coverage states refuse through the B1a entry as they do through Pass A,
+/// for both active classes, and are never downgraded to Empty.
+#[test]
+fn b1a_active_coverage_states_that_cannot_be_restored_refuse() {
+    let capsule = frames_capsule();
+    let generation = CaseV1::generation(&capsule);
+    for class in [REFS_V1, LOGS_V1] {
+        let frame = || encode_frame(class, &generation, &with_head(&[]));
+        // Captured with no staged payload.
+        let (dest, mut verified) = phase_v(&capsule.capsule);
+        verified.control.manifest =
+            manifest_with_row(class, CustodyStateClassV1::Captured, &verified);
+        let error = prevalidate(&mut verified, far_deadline())
+            .expect_err("a Captured class without its payload");
+        assert!(
+            matches!(&error, GitBootstrapErrorV1::UnsupportedCoverage { class: found, detail }
+                if *found == class && detail.contains("exactly one")),
+            "{class:?}: {error:?}"
+        );
+        assert_eq!(dest.entries(), [".restore-work"]);
+
+        // Captured with two staged payloads.
+        let mut case = CaseV1::with_bytes(&capsule, &[(class, frame())]);
+        let twin = StagedPlaintextV1 {
+            name: LosslessPathV1::from_bytes(b"test/twin".to_vec()),
+            role: CustodyCapsuleArtifactRoleV1::CoveragePayload(class),
+            file: case.verified.staged[staged_index(&case.verified, class)]
+                .file
+                .try_clone()
+                .expect("a duplicate descriptor"),
+            length: 1,
+            sha256: [0; 32],
+        };
+        case.verified.staged.push(twin);
+        let error = case.refusal("two payloads");
+        assert!(
+            matches!(&error, GitBootstrapErrorV1::UnsupportedCoverage { class: found, detail }
+                if *found == class && detail.contains("exactly one")),
+            "{class:?}: {error:?}"
+        );
+
+        // Empty with a staged payload (the refs class is Captured so only this class is wrong).
+        let mut case = CaseV1::with_bytes(&capsule, &[(REFS_V1, with_head_frame(&generation))]);
+        if class == LOGS_V1 {
+            stage_frame(&mut case.verified, LOGS_V1, &frame());
+            case.verified.control.manifest =
+                manifest_with_row(LOGS_V1, CustodyStateClassV1::Empty, &case.verified);
+        } else {
+            case.verified.control.manifest =
+                manifest_with_row(REFS_V1, CustodyStateClassV1::Empty, &case.verified);
+        }
+        let error = case.refusal("Empty with a payload");
+        assert!(
+            matches!(&error, GitBootstrapErrorV1::UnsupportedCoverage { class: found, detail }
+                if *found == class && detail.contains("Empty active class")),
+            "{class:?}: {error:?}"
+        );
+
+        // Neither Captured nor Empty.
+        let mut case = CaseV1::with_bytes(&capsule, &[(REFS_V1, with_head_frame(&generation))]);
+        case.verified.control.manifest =
+            manifest_with_row(class, CustodyStateClassV1::Unresolved, &case.verified);
+        let error = case.refusal("Unresolved");
+        assert!(
+            matches!(&error, GitBootstrapErrorV1::UnsupportedCoverage { class: found, .. }
+                if *found == class),
+            "{class:?}: {error:?}"
+        );
+    }
+}
+
+fn with_head_frame(generation: &str) -> Vec<u8> {
+    encode_frame(REFS_V1, generation, &with_head(&[]))
+}
+
+// ---------------------------------------------------------------------------------------------
+// Exactly one HEAD, the exact allowlist, class ownership, types, symlinks
+// ---------------------------------------------------------------------------------------------
+
+/// A Captured refs class holds exactly one `HEAD` regular file. Absent, a directory, or a symlink
+/// refuses, with no repository and no byte written, and nothing is synthesized or copied from the
+/// bootstrap.
+#[test]
+fn b1a_captured_refs_need_exactly_one_head_regular_file() {
+    let capsule = frames_capsule();
+    let generation = CaseV1::generation(&capsule);
+    let refs_frame = |entries: &EntriesV1<'_>| encode_frame(REFS_V1, &generation, entries);
+
+    let none_at_all = refs_frame(&[]);
+    let no_head = refs_frame(&[(b"refs", EntryV1::Dir), (b"refs/heads", EntryV1::Dir)]);
+    let only_orig = refs_frame(&[(b"ORIG_HEAD", EntryV1::File(b"x\n"))]);
+    for (row, bytes) in [
+        ("an empty frame", none_at_all),
+        ("refs without a HEAD", no_head),
+        ("ORIG_HEAD is not HEAD", only_orig),
+    ] {
+        let mut case = CaseV1::with_bytes(&capsule, &[(REFS_V1, bytes)]);
+        case.fault(row, REFS_V1, ActiveFrameFaultV1::MissingHead);
+    }
+
+    let mut case = CaseV1::with_bytes(
+        &capsule,
+        &[(REFS_V1, refs_frame(&[(b"HEAD", EntryV1::Dir)]))],
+    );
+    case.fault(
+        "HEAD as a directory",
+        REFS_V1,
+        ActiveFrameFaultV1::WrongType {
+            path: "HEAD".into(),
+            expected: ActiveEntryKindV1::Regular,
+        },
+    );
+
+    let mut case = CaseV1::with_bytes(
+        &capsule,
+        &[(
+            REFS_V1,
+            refs_frame(&[(b"HEAD", EntryV1::Link(b"refs/heads/main"))]),
+        )],
+    );
+    case.fault(
+        "HEAD as a symlink",
+        REFS_V1,
+        ActiveFrameFaultV1::Symlink {
+            path: "HEAD".into(),
+        },
+    );
+
+    // The control: a HEAD regular file is exactly what is needed, whatever it says.
+    let mut case = CaseV1::with_bytes(
+        &capsule,
+        &[(REFS_V1, refs_frame(&[(b"HEAD", EntryV1::File(b""))]))],
+    );
+    case.accepted("an empty HEAD regular file is a B1b grammar question, not B1a's");
+}
+
+/// The exact master allowlist and nothing else: a name another class owns, an unsupported name, a lock
+/// name, or an unknown name refuses. Each row is a frame whose `HEAD` is fine, so only the named entry
+/// can be the cause.
+#[test]
+fn b1a_only_the_exact_allowlist_is_admitted_per_class() {
+    let capsule = frames_capsule();
+    let foreign = |path: &str, owner: ClassV1| ActiveFrameFaultV1::ForeignClass {
+        path: path.into(),
+        owner,
+    };
+    let unsupported = |path: &str| ActiveFrameFaultV1::Unsupported { path: path.into() };
+    let config = ClassV1::GitConfigurationAndHooks;
+    let operation = ClassV1::InProgressGitOperations;
+    type RowV1 = (
+        &'static str,
+        Vec<(&'static [u8], EntryV1<'static>)>,
+        ActiveFrameFaultV1,
+    );
+    let refs_rows: Vec<RowV1> = vec![
+        (
+            "config",
+            vec![file("config", b"[core]\n")],
+            foreign("config", config),
+        ),
+        (
+            "hooks",
+            vec![dir("hooks"), file("hooks/pre-commit", b"#!\n")],
+            foreign("hooks", config),
+        ),
+        ("info", vec![dir("info")], foreign("info", config)),
+        (
+            "objects",
+            vec![dir("objects")],
+            foreign("objects", ClassV1::ObjectDatabase),
+        ),
+        (
+            "an alternates file",
+            vec![
+                dir("objects"),
+                dir("objects/info"),
+                file("objects/info/alternates", b"/elsewhere\n"),
+            ],
+            foreign("objects", ClassV1::ObjectDatabase),
+        ),
+        (
+            "MERGE_HEAD",
+            vec![file("MERGE_HEAD", b"x\n")],
+            foreign("MERGE_HEAD", operation),
+        ),
+        (
+            "rebase-merge",
+            vec![dir("rebase-merge")],
+            foreign("rebase-merge", operation),
+        ),
+        (
+            "CHERRY_PICK_HEAD",
+            vec![file("CHERRY_PICK_HEAD", b"x\n")],
+            foreign("CHERRY_PICK_HEAD", operation),
+        ),
+        (
+            "BISECT_LOG",
+            vec![file("BISECT_LOG", b"x\n")],
+            foreign("BISECT_LOG", operation),
+        ),
+        (
+            "index",
+            vec![file("index", b"x")],
+            foreign("index", ClassV1::Index),
+        ),
+        (
+            "bridge evidence",
+            vec![dir("a2a-bridge")],
+            foreign("a2a-bridge", ClassV1::BridgeEvidence),
+        ),
+        (
+            "logs inside the refs frame",
+            vec![dir("logs")],
+            foreign("logs", LOGS_V1),
+        ),
+        (
+            "shallow",
+            vec![file("shallow", b"x\n")],
+            unsupported("shallow"),
+        ),
+        (
+            "a lock file",
+            vec![file("HEAD.lock", b"")],
+            unsupported("HEAD.lock"),
+        ),
+        (
+            "an unknown name",
+            vec![file("surprise", b"")],
+            unsupported("surprise"),
+        ),
+        (
+            "linked worktrees",
+            vec![dir("worktrees")],
+            foreign("worktrees", ClassV1::LinkedWorktrees),
+        ),
+    ];
+    for (row, entries, fault) in refs_rows {
+        let mut case = CaseV1::refs_only(&capsule, &entries);
+        case.fault(row, REFS_V1, fault);
+    }
+
+    let logs_rows: Vec<RowV1> = vec![
+        (
+            "HEAD inside the logs frame",
+            vec![file("HEAD", b"x\n")],
+            foreign("HEAD", REFS_V1),
+        ),
+        (
+            "refs inside the logs frame",
+            vec![dir("refs")],
+            foreign("refs", REFS_V1),
+        ),
+        (
+            "packed-refs inside the logs frame",
+            vec![file("packed-refs", b"")],
+            foreign("packed-refs", REFS_V1),
+        ),
+        (
+            "config inside the logs frame",
+            vec![file("config", b"")],
+            foreign("config", config),
+        ),
+        (
+            "shallow inside the logs frame",
+            vec![file("shallow", b"")],
+            unsupported("shallow"),
+        ),
+        (
+            "an unknown name inside the logs frame",
+            vec![dir("surprise")],
+            unsupported("surprise"),
+        ),
+    ];
+    for (row, entries, fault) in logs_rows {
+        let mut case = CaseV1::with_entries(&capsule, &[], Some(&entries));
+        case.fault(row, LOGS_V1, fault);
+    }
+}
+
+/// Each top-level allowlisted name has its own entry type: files are regular, `refs` and `logs` are
+/// directories.
+#[test]
+fn b1a_top_level_names_must_have_their_class_type() {
+    let capsule = frames_capsule();
+    let wrong = |path: &str, expected| ActiveFrameFaultV1::WrongType {
+        path: path.into(),
+        expected,
+    };
+    for name in ["ORIG_HEAD", "FETCH_HEAD", "packed-refs"] {
+        let mut case = CaseV1::refs_only(&capsule, &[(name.as_bytes(), EntryV1::Dir)]);
+        case.fault(name, REFS_V1, wrong(name, ActiveEntryKindV1::Regular));
+    }
+    let mut case = CaseV1::refs_only(&capsule, &[(b"refs", EntryV1::File(b"x"))]);
+    case.fault(
+        "refs as a regular file",
+        REFS_V1,
+        wrong("refs", ActiveEntryKindV1::Directory),
+    );
+    let mut case = CaseV1::with_entries(&capsule, &[], Some(&[(b"logs", EntryV1::File(b"x"))]));
+    case.fault(
+        "logs as a regular file",
+        LOGS_V1,
+        wrong("logs", ActiveEntryKindV1::Directory),
+    );
+}
+
+/// A symlink is refused wherever the frame carries one: at a top-level name, under `refs/`, and under
+/// `logs/`. A valid frame (its trailer verifies) holding a `refs` symlink refuses before any write.
+#[test]
+fn b1a_symlinks_are_refused_wherever_the_frame_carries_them() {
+    let capsule = frames_capsule();
+    let link = |path: &str| ActiveFrameFaultV1::Symlink { path: path.into() };
+    let mut case = CaseV1::refs_only(&capsule, &[(b"refs", EntryV1::Link(b"/elsewhere"))]);
+    case.fault("a refs symlink", REFS_V1, link("refs"));
+    let mut case = CaseV1::refs_only(
+        &capsule,
+        &[
+            (b"refs", EntryV1::Dir),
+            (b"refs/heads", EntryV1::Dir),
+            (b"refs/heads/main", EntryV1::Link(b"../../elsewhere")),
+        ],
+    );
+    case.fault("a link beneath refs", REFS_V1, link("refs/heads/main"));
+    let mut case = CaseV1::refs_only(&capsule, &[(b"packed-refs", EntryV1::Link(b"x"))]);
+    case.fault("a packed-refs symlink", REFS_V1, link("packed-refs"));
+    let mut case = CaseV1::with_entries(
+        &capsule,
+        &[],
+        Some(&[
+            (b"logs", EntryV1::Dir),
+            (b"logs/HEAD", EntryV1::Link(b"/etc/passwd")),
+        ]),
+    );
+    case.fault("a link beneath logs", LOGS_V1, link("logs/HEAD"));
+    // A symlink under a name no class owns is still a symlink first.
+    let mut case = CaseV1::refs_only(&capsule, &[(b"config", EntryV1::Link(b"x"))]);
+    case.fault("a config symlink", REFS_V1, link("config"));
+}
+
+// ---------------------------------------------------------------------------------------------
+// Portable spelling and collisions
+// ---------------------------------------------------------------------------------------------
+
+/// The portable component rule: printable ASCII `0x21..=0x7e`, no backslash, no trailing dot. Every
+/// other spelling refuses with its own reason, never normalized: NFC and NFD, a lone invalid byte,
+/// a backslash, a trailing dot or space, a control byte, an interior space, DEL.
+#[test]
+fn b1a_the_portable_spelling_rule_refuses_every_other_component() {
+    let capsule = frames_capsule();
+    let nfc: &[u8] = "caf\u{e9}".as_bytes();
+    let nfd: &[u8] = "cafe\u{301}".as_bytes();
+    assert_ne!(nfc, nfd);
+    let refused: Vec<(&str, &[u8], PortableFaultV1)> = vec![
+        ("NFC", nfc, PortableFaultV1::NonAscii),
+        ("NFD", nfd, PortableFaultV1::NonAscii),
+        ("a lone 0xff", b"a\xff", PortableFaultV1::NonAscii),
+        ("a truncated sequence", b"a\xc3", PortableFaultV1::NonAscii),
+        ("a backslash", b"a\\b", PortableFaultV1::Backslash),
+        ("a leading backslash", b"\\a", PortableFaultV1::Backslash),
+        ("a trailing dot", b"a.", PortableFaultV1::TrailingDot),
+        ("two trailing dots", b"a..", PortableFaultV1::TrailingDot),
+        ("a trailing space", b"a ", PortableFaultV1::Unprintable),
+        ("an interior space", b"a b", PortableFaultV1::Unprintable),
+        ("a tab", b"a\tb", PortableFaultV1::Unprintable),
+        ("a control byte", b"a\x01b", PortableFaultV1::Unprintable),
+        ("DEL", b"a\x7fb", PortableFaultV1::Unprintable),
+    ];
+    for (row, name, reason) in refused {
+        let mut path = b"refs/heads/".to_vec();
+        path.extend_from_slice(name);
+        let mut case = CaseV1::refs_only(
+            &capsule,
+            &[
+                (b"refs", EntryV1::Dir),
+                (b"refs/heads", EntryV1::Dir),
+                (&path, EntryV1::File(b"oid\n")),
+            ],
+        );
+        case.fault(
+            row,
+            REFS_V1,
+            ActiveFrameFaultV1::NonPortable {
+                path: path_string(&path),
+                reason,
+            },
+        );
+    }
+    // The same rule governs the logs class and every component, not only the last.
+    let mut case = CaseV1::with_entries(
+        &capsule,
+        &[],
+        Some(&[(b"logs", EntryV1::Dir), (b"logs/a ", EntryV1::Dir)]),
+    );
+    case.fault(
+        "a logs component",
+        LOGS_V1,
+        ActiveFrameFaultV1::NonPortable {
+            path: "logs/a ".into(),
+            reason: PortableFaultV1::Unprintable,
+        },
+    );
+    let mut case = CaseV1::refs_only(
+        &capsule,
+        &[
+            (b"refs", EntryV1::Dir),
+            (b"refs/d.", EntryV1::Dir),
+            (b"refs/d./x", EntryV1::File(b"oid\n")),
+        ],
+    );
+    case.fault(
+        "a directory component",
+        REFS_V1,
+        ActiveFrameFaultV1::NonPortable {
+            path: "refs/d.".into(),
+            reason: PortableFaultV1::TrailingDot,
+        },
+    );
+
+    // Controls: every other admitted byte, including punctuation and an interior or leading dot.
+    for name in [
+        "a.b", ".hidden", "a-b_c", "x~1", "A", "0", "a@b", "a{b}", "~",
+    ] {
+        let mut path = b"refs/heads/".to_vec();
+        path.extend_from_slice(name.as_bytes());
+        let mut case = CaseV1::refs_only(
+            &capsule,
+            &[
+                (b"refs", EntryV1::Dir),
+                (b"refs/heads", EntryV1::Dir),
+                (&path, EntryV1::File(b"oid\n")),
+            ],
+        );
+        let _ = case.accepted(name);
+    }
+}
+
+/// Two distinct spellings that share the ASCII-lowercased key refuse, in either order and at any depth,
+/// in either class. The key lowercases only `A..Z`: `@` and the backtick, which differ by 0x20 outside
+/// the letters, stay distinct, and so do `a/b` and `ab`.
+#[test]
+fn b1a_ascii_case_collisions_refuse_and_distinct_spellings_do_not() {
+    let capsule = frames_capsule();
+    let collision = |path: &str, with: &str| ActiveFrameFaultV1::Collision {
+        path: path.into(),
+        with: with.into(),
+    };
+    let mut case = CaseV1::refs_only(
+        &capsule,
+        &[
+            (b"refs", EntryV1::Dir),
+            (b"refs/heads", EntryV1::Dir),
+            (b"refs/heads/A", EntryV1::File(b"1\n")),
+            (b"refs/heads/a", EntryV1::File(b"2\n")),
+        ],
+    );
+    // Canonical order puts `A` (0x41) before `a` (0x61).
+    case.fault(
+        "A/a files",
+        REFS_V1,
+        collision("refs/heads/a", "refs/heads/A"),
+    );
+    let mut case = CaseV1::refs_only(
+        &capsule,
+        &[
+            (b"refs", EntryV1::Dir),
+            (b"refs/Heads", EntryV1::Dir),
+            (b"refs/Heads/x", EntryV1::File(b"1\n")),
+            (b"refs/heads", EntryV1::Dir),
+            (b"refs/heads/x", EntryV1::File(b"2\n")),
+        ],
+    );
+    case.fault(
+        "case-differing directories",
+        REFS_V1,
+        collision("refs/heads", "refs/Heads"),
+    );
+    let mut case = CaseV1::refs_only(
+        &capsule,
+        &[
+            (b"refs", EntryV1::Dir),
+            (b"refs/tags", EntryV1::Dir),
+            (b"refs/tags/V1", EntryV1::File(b"1\n")),
+            (b"refs/tags/v1", EntryV1::File(b"2\n")),
+        ],
+    );
+    case.fault("V1/v1", REFS_V1, collision("refs/tags/v1", "refs/tags/V1"));
+    let mut case = CaseV1::with_entries(
+        &capsule,
+        &[],
+        Some(&[
+            (b"logs", EntryV1::Dir),
+            (b"logs/refs", EntryV1::Dir),
+            (b"logs/refs/Main", EntryV1::File(b"1\n")),
+            (b"logs/refs/main", EntryV1::File(b"2\n")),
+        ]),
+    );
+    case.fault(
+        "reflog names",
+        LOGS_V1,
+        collision("logs/refs/main", "logs/refs/Main"),
+    );
+    let mut case = CaseV1::refs_only(
+        &capsule,
+        &[
+            (b"refs", EntryV1::Dir),
+            (b"refs/heads", EntryV1::Dir),
+            (b"refs/heads/MiXeD", EntryV1::File(b"1\n")),
+            (b"refs/heads/mixed", EntryV1::File(b"2\n")),
+        ],
+    );
+    case.fault(
+        "mixed case",
+        REFS_V1,
+        collision("refs/heads/mixed", "refs/heads/MiXeD"),
+    );
+
+    // Distinct spellings, and bytes that differ by 0x20 outside the letters, are different keys.
+    let mut case = CaseV1::refs_only(
+        &capsule,
+        &[
+            (b"refs", EntryV1::Dir),
+            (b"refs/heads", EntryV1::Dir),
+            (b"refs/heads/a", EntryV1::File(b"1\n")),
+            (b"refs/heads/b", EntryV1::File(b"2\n")),
+            (b"refs/heads/@", EntryV1::File(b"3\n")),
+            (b"refs/heads/`", EntryV1::File(b"4\n")),
+            (b"refs/heads/[", EntryV1::File(b"5\n")),
+            (b"refs/heads/{", EntryV1::File(b"6\n")),
+            (b"refs/heads/ab", EntryV1::File(b"7\n")),
+            (b"refs/heads/a.b", EntryV1::File(b"8\n")),
+            (b"refs/heads/a_b", EntryV1::File(b"9\n")),
+            (b"refs/heads/a-b", EntryV1::File(b"0\n")),
+        ],
+    );
+    let plan = case.accepted("distinct spellings");
+    assert_eq!(
+        plan.frames[0].regular_files,
+        10 + 1,
+        "ten branches and HEAD"
+    );
+    let mut case = CaseV1::refs_only(
+        &capsule,
+        &[
+            (b"refs", EntryV1::Dir),
+            (b"refs/a", EntryV1::Dir),
+            (b"refs/a/b", EntryV1::File(b"1\n")),
+            (b"refs/ab", EntryV1::File(b"2\n")),
+        ],
+    );
+    let _ = case.accepted("component boundaries are part of the key");
+}
+
+// ---------------------------------------------------------------------------------------------
+// The aggregate table, driven directly (the one table every frame of a restore feeds)
+// ---------------------------------------------------------------------------------------------
+
+/// The aggregate path table refuses what only the aggregate can see: the same path twice, a spelling
+/// collision across entries that did not come from one frame, a parent that is absent, a regular file, or
+/// spelled differently, an inactive class, and an overrun of its own bound; and its `finish` requires a
+/// regular `HEAD`.
+#[test]
+fn b1a_the_aggregate_table_refuses_what_only_the_aggregate_sees() {
+    use ActiveEntryKindV1::{Directory, Regular, Symlink};
+    let bound = 1 << 20;
+    let admit = |table: &mut ActivePathTableV1, class, path: &str, kind| {
+        table.admit(class, path.as_bytes(), kind)
+    };
+
+    let mut table = ActivePathTableV1::new(bound);
+    admit(&mut table, REFS_V1, "refs", Directory).expect("refs");
+    assert_eq!(
+        admit(&mut table, REFS_V1, "refs", Directory),
+        Err(ActiveFrameFaultV1::Duplicate {
+            path: "refs".into()
+        }),
+        "the same path from a second frame"
+    );
+    admit(&mut table, REFS_V1, "refs/heads", Directory).expect("refs/heads");
+    admit(&mut table, REFS_V1, "refs/heads/A", Regular).expect("refs/heads/A");
+    assert_eq!(
+        admit(&mut table, REFS_V1, "refs/heads/a", Regular),
+        Err(ActiveFrameFaultV1::Collision {
+            path: "refs/heads/a".into(),
+            with: "refs/heads/A".into()
+        }),
+        "a collision with an entry of an earlier frame"
+    );
+    assert_eq!(
+        admit(&mut table, REFS_V1, "refs/tags/x", Regular),
+        Err(ActiveFrameFaultV1::Conflict {
+            path: "refs/tags/x".into()
+        }),
+        "an absent parent"
+    );
+    admit(&mut table, REFS_V1, "packed-refs", Regular).expect("packed-refs");
+    assert_eq!(
+        admit(&mut table, REFS_V1, "packed-refs/x", Regular),
+        Err(ActiveFrameFaultV1::Conflict {
+            path: "packed-refs/x".into()
+        }),
+        "a regular file is not a parent"
+    );
+    assert_eq!(
+        admit(&mut table, REFS_V1, "refs/Heads/x", Regular),
+        Err(ActiveFrameFaultV1::Conflict {
+            path: "refs/Heads/x".into()
+        }),
+        "a parent spelled differently is not the parent"
+    );
+    assert_eq!(
+        admit(&mut table, REFS_V1, "refs/heads/s", Symlink),
+        Err(ActiveFrameFaultV1::Symlink {
+            path: "refs/heads/s".into()
+        })
+    );
+    assert_eq!(
+        admit(&mut table, ClassV1::ObjectDatabase, "objects", Directory),
+        Err(ActiveFrameFaultV1::InactiveClass {
+            class: ClassV1::ObjectDatabase
+        })
+    );
+    // The refusals admitted nothing: the earlier entries are the whole table, and there is no HEAD.
+    assert_eq!(table.entries(), 4);
+    assert_eq!(table.finish(), Err(ActiveFrameFaultV1::MissingHead));
+    admit(&mut table, REFS_V1, "HEAD", Regular).expect("HEAD");
+    assert_eq!(table.finish(), Ok(()));
+
+    // A HEAD from the wrong class is not the refs class's HEAD.
+    let mut table = ActivePathTableV1::new(bound);
+    assert_eq!(
+        admit(&mut table, LOGS_V1, "HEAD", Regular),
+        Err(ActiveFrameFaultV1::ForeignClass {
+            path: "HEAD".into(),
+            owner: REFS_V1
+        })
+    );
+    assert_eq!(table.finish(), Err(ActiveFrameFaultV1::MissingHead));
+
+    // Its own bound: 4 entries' keys and spellings do not fit in a handful of bytes.
+    let mut table = ActivePathTableV1::new(64);
+    let mut refused = None;
+    for path in ["HEAD", "ORIG_HEAD", "FETCH_HEAD", "packed-refs"] {
+        if let Err(fault) = admit(&mut table, REFS_V1, path, Regular) {
+            refused = Some(fault);
+            break;
+        }
+    }
+    assert_eq!(
+        refused,
+        Some(ActiveFrameFaultV1::PathTableBound { bound: 64 })
+    );
+}
+
+/// The bound is a parameter of the entry point, so its refusal is exercised at a small size through the
+/// whole decode: a frame whose paths do not fit refuses with the table bound, after the frame verified.
+#[test]
+fn b1a_the_path_table_bound_refuses_through_the_whole_decode() {
+    let capsule = frames_capsule();
+    let mut entries: Vec<(Vec<u8>, EntryV1<'static>)> = vec![
+        (b"refs".to_vec(), EntryV1::Dir),
+        (b"refs/heads".to_vec(), EntryV1::Dir),
+    ];
+    for index in 0..64 {
+        entries.push((
+            format!("refs/heads/branch-{index:03}").into_bytes(),
+            EntryV1::File(b"oid\n"),
+        ));
+    }
+    let borrowed: Vec<(&[u8], EntryV1<'_>)> = entries
+        .iter()
+        .map(|(path, entry)| (path.as_slice(), *entry))
+        .collect();
+    let mut case = CaseV1::refs_only(&capsule, &borrowed);
+    // The default bound holds the frame.
+    let _ = case.accepted("the default bound");
+    let ledger = ledger_used(&case.verified);
+    let failure = prevalidate_active_frames_bounded_v1(
+        &mut case.verified,
+        frame_budget(),
+        far_deadline(),
+        B1A_COMPLETED_V1,
+        1024,
+    )
+    .expect_err("a small bound refuses");
+    let error = require_failure_shape(failure, B1A_COMPLETED_V1, ledger);
+    assert!(
+        matches!(
+            error,
+            GitBootstrapErrorV1::ActiveFrame {
+                class: REFS_V1,
+                fault: ActiveFrameFaultV1::PathTableBound { bound: 1024 }
+            }
+        ),
+        "{error:?}"
+    );
+    assert_eq!(ledger_used(&case.verified), ledger);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Complete decode: the trailer, the header, and the staged bytes
+// ---------------------------------------------------------------------------------------------
+
+fn flip(bytes: &mut [u8], index: usize) {
+    bytes[index] ^= 0xff;
+}
+
+/// A whole frame is decoded through its verified trailer before anything is judged final. Every damaged
+/// trailer, content digest, header binding, or trailing byte refuses with `FrameInvalid`, even though the
+/// provisional entries before the damage were fine, and even when an entry fault came first: the frame's
+/// integrity outranks what it says. Controls: the same frames undamaged succeed.
+#[test]
+fn b1a_a_failed_trailer_after_provisional_entries_refuses_the_whole_frame() {
+    let capsule = frames_capsule();
+    let generation = CaseV1::generation(&capsule);
+    let good_entries: &[(&[u8], EntryV1<'_>)] = &[
+        (b"refs", EntryV1::Dir),
+        (b"refs/heads", EntryV1::Dir),
+        (b"refs/heads/main", EntryV1::File(b"oid\n")),
+    ];
+    let good = encode_frame(REFS_V1, &generation, &with_head(good_entries));
+    let invalid = |class| {
+        move |error: &GitBootstrapErrorV1| {
+            matches!(
+                error,
+                GitBootstrapErrorV1::Restore(CustodyRestoreErrorV1::FrameInvalid { class: found })
+                    if *found == class
+            )
+        }
+    };
+
+    let mut damaged: Vec<(&str, Vec<u8>)> = Vec::new();
+    let mut flipped_digest = good.clone();
+    flip(&mut flipped_digest, good.len() - 1);
+    damaged.push(("the frame digest's last byte", flipped_digest));
+    let mut flipped_count = good.clone();
+    flip(&mut flipped_count, good.len() - (DIGEST_BYTES_V1 + 8 + 8));
+    damaged.push(("the trailer's entry count", flipped_count));
+    let mut flipped_total = good.clone();
+    flip(&mut flipped_total, good.len() - (DIGEST_BYTES_V1 + 8));
+    damaged.push(("the trailer's content total", flipped_total));
+    let mut flipped_tag = good.clone();
+    flip(&mut flipped_tag, good.len() - (DIGEST_BYTES_V1 + 8 + 8 + 1));
+    damaged.push(("the trailer's tag", flipped_tag));
+    damaged.push(("a truncated trailer", good[..good.len() - 8].to_vec()));
+    damaged.push(("no trailer at all", good[..good.len() - 49].to_vec()));
+    let mut trailing = good.clone();
+    trailing.push(0);
+    damaged.push(("a byte after the trailer", trailing));
+    let content_at = good
+        .windows(HEAD_BYTES_V1.len())
+        .position(|window| window == HEAD_BYTES_V1)
+        .expect("the HEAD content");
+    let mut flipped_content = good.clone();
+    flip(&mut flipped_content, content_at);
+    damaged.push(("a HEAD content byte", flipped_content));
+    damaged.push((
+        "another generation's header",
+        encode_frame(REFS_V1, "another-generation", &with_head(good_entries)),
+    ));
+    damaged.push((
+        "another class's header",
+        encode_frame(LOGS_V1, &generation, &with_head(good_entries)),
+    ));
+    let mut with_link = encode_frame(
+        REFS_V1,
+        &generation,
+        &with_head(&[(b"refs", EntryV1::Dir), (b"refs/l", EntryV1::Link(b"x"))]),
+    );
+    let last = with_link.len() - 1;
+    flip(&mut with_link, last);
+    damaged.push(("an entry fault and then a bad trailer", with_link));
+    for (row, bytes) in damaged {
+        let mut case = CaseV1::with_bytes(&capsule, &[(REFS_V1, bytes)]);
+        let error = case.refusal(row);
+        assert!(invalid(REFS_V1)(&error), "{row}: {error:?}");
+    }
+
+    // The logs class is whole-decoded too.
+    let logs_good = encode_frame(
+        LOGS_V1,
+        &generation,
+        &[
+            (b"logs", EntryV1::Dir),
+            (b"logs/HEAD", EntryV1::File(b"log\n")),
+        ],
+    );
+    let mut bad_logs = logs_good.clone();
+    flip(&mut bad_logs, logs_good.len() - 1);
+    let refs_ok = encode_frame(REFS_V1, &generation, &with_head(&[]));
+    let mut case = CaseV1::with_bytes(&capsule, &[(REFS_V1, refs_ok.clone()), (LOGS_V1, bad_logs)]);
+    let error = case.refusal("a bad logs trailer");
+    assert!(invalid(LOGS_V1)(&error), "{error:?}");
+
+    // Controls: the undamaged frames.
+    let mut case = CaseV1::with_bytes(&capsule, &[(REFS_V1, good.clone()), (LOGS_V1, logs_good)]);
+    let plan = case.accepted("undamaged frames");
+    assert_eq!(plan.frames.len(), 2);
+}
+
+/// Staged bytes or length that differ from the verified plaintext refuse before decoding, and name the
+/// staged frame: a changed byte, an appended byte, a truncation, an emptied file. Either class.
+#[test]
+fn b1a_staged_frame_byte_or_length_drift_refuses() {
+    use std::os::unix::fs::FileExt as _;
+    let capsule = frames_capsule();
+    let generation = CaseV1::generation(&capsule);
+    let refs = encode_frame(REFS_V1, &generation, &with_head(&[]));
+    let logs = encode_frame(LOGS_V1, &generation, &[(b"logs", EntryV1::Dir)]);
+    type Edit = fn(&std::fs::File);
+    let edits: [(&str, Edit); 4] = [
+        ("a byte changed", |file| {
+            file.write_all_at(&[0xff], 12).expect("change a byte");
+        }),
+        ("a byte appended", |file| {
+            let length = file.metadata().expect("metadata").len();
+            file.write_all_at(b"x", length).expect("append");
+        }),
+        ("truncated", |file| {
+            let length = file.metadata().expect("metadata").len();
+            file.set_len(length - 1).expect("truncate");
+        }),
+        ("emptied", |file| file.set_len(0).expect("empty")),
+    ];
+    for class in [REFS_V1, LOGS_V1] {
+        for (row, edit) in edits {
+            let mut case = CaseV1::with_bytes(
+                &capsule,
+                &[(REFS_V1, refs.clone()), (LOGS_V1, logs.clone())],
+            );
+            let index = staged_index(&case.verified, class);
+            edit(&case.verified.staged[index].file);
+            let name = lossy(case.verified.staged[index].name.as_bytes());
+            let error = case.refusal(&format!("{class:?}: {row}"));
+            assert!(
+                matches!(&error, GitBootstrapErrorV1::StagedInputChanged { name: found }
+                    if *found == name),
+                "{class:?}: {row}: {error:?}"
+            );
+        }
+    }
+}
+
+/// A frame replaced between its rehash and its decode (with another well-formed frame, so only the
+/// verified staged digest can tell) is refused: the decoded bytes are bound to the verified plaintext.
+#[test]
+fn b1a_a_frame_changed_between_the_rehash_and_the_decode_is_refused() {
+    use std::os::unix::fs::FileExt as _;
+    let capsule = frames_capsule();
+    let generation = CaseV1::generation(&capsule);
+    // The replacement is shorter: the decode reads it whole, so only the verified digest can tell.
+    let refs = encode_frame(
+        REFS_V1,
+        &generation,
+        &with_head(&[(b"refs", EntryV1::Dir), (b"refs/heads", EntryV1::Dir)]),
+    );
+    let other = encode_frame(REFS_V1, &generation, &with_head(&[]));
+    assert!(other.len() < refs.len());
+    let mut case = CaseV1::with_bytes(&capsule, &[(REFS_V1, refs)]);
+    let handle = case.verified.staged[staged_index(&case.verified, REFS_V1)]
+        .file
+        .try_clone()
+        .expect("a duplicate descriptor");
+    let swapped = std::cell::Cell::new(false);
+    let _hook = install_git_hook_for_test(GitHookPointV1::DeadlineObserved, move |event| {
+        if event.label == "frame-rewind" && !swapped.replace(true) {
+            handle.set_len(0).expect("empty the frame");
+            handle.write_all_at(&other, 0).expect("another frame");
+        }
+    });
+    let error = case.refusal("a frame swapped after its rehash");
+    assert!(
+        matches!(error, GitBootstrapErrorV1::StagedInputChanged { .. }),
+        "{error:?}"
+    );
+}
+
+/// A frame assembled byte by byte, with a correct trailer and digest, for structures the encoder will
+/// not emit: each record is already encoded.
+fn raw_frame(
+    class_code: u8,
+    generation: &str,
+    records: &[Vec<u8>],
+    entries: u64,
+    total: u64,
+) -> Vec<u8> {
+    let mut bytes = b"a2a-cfr1".to_vec();
+    bytes.push(1);
+    bytes.push(class_code);
+    bytes.extend_from_slice(&(generation.len() as u16).to_le_bytes());
+    bytes.extend_from_slice(generation.as_bytes());
+    for record in records {
+        bytes.extend_from_slice(record);
+    }
+    bytes.push(0xff);
+    bytes.extend_from_slice(&entries.to_le_bytes());
+    bytes.extend_from_slice(&total.to_le_bytes());
+    let frame_digest = sha256_bytes(&bytes);
+    bytes.extend_from_slice(&frame_digest);
+    bytes
+}
+
+fn raw_record(tag: u8, path: &[u8], tail: &[u8]) -> Vec<u8> {
+    let mut record = vec![tag];
+    record.extend_from_slice(&(path.len() as u16).to_le_bytes());
+    record.extend_from_slice(path);
+    record.extend_from_slice(tail);
+    record
+}
+
+fn raw_file(path: &[u8], content: &[u8]) -> Vec<u8> {
+    let mut tail = 0o644_u16.to_le_bytes().to_vec();
+    tail.extend_from_slice(&(content.len() as u64).to_le_bytes());
+    tail.extend_from_slice(content);
+    tail.extend_from_slice(&sha256_bytes(content));
+    raw_record(2, path, &tail)
+}
+
+/// A regular file is never a parent: a hand-built frame with a correct trailer whose entry sits under a
+/// regular file is refused whole (by the codec's own structure rule, before the aggregate table sees it),
+/// and so is one whose parent directory is simply absent. The aggregate table's own parent rule is
+/// exercised directly above.
+#[test]
+fn b1a_a_hand_built_frame_with_a_file_parent_or_a_missing_parent_is_refused() {
+    let capsule = frames_capsule();
+    let generation = CaseV1::generation(&capsule);
+    let whole = |records: &[Vec<u8>], total: u64| {
+        raw_frame(1, &generation, records, records.len() as u64, total)
+    };
+
+    // Control: the same builder, with entries that are in order and under a directory, is whole.
+    let control = whole(
+        &[
+            raw_file(b"HEAD", b"ref: refs/heads/main\n"),
+            raw_record(1, b"refs", &0o755_u16.to_le_bytes()),
+            raw_file(b"refs/x", b"1"),
+        ],
+        21 + 1,
+    );
+    let mut case = CaseV1::with_bytes(&capsule, &[(REFS_V1, control)]);
+    let plan = case.accepted("the hand-built control");
+    assert_eq!(plan.frames[0].entries, 3);
+
+    let under_a_file = whole(&[raw_file(b"HEAD", b"x"), raw_file(b"HEAD/x", b"y")], 2);
+    let mut case = CaseV1::with_bytes(&capsule, &[(REFS_V1, under_a_file)]);
+    let error = case.refusal("an entry under a regular file");
+    assert!(
+        matches!(
+            error,
+            GitBootstrapErrorV1::Restore(CustodyRestoreErrorV1::FrameInvalid { class: REFS_V1 })
+        ),
+        "{error:?}"
+    );
+
+    let orphan = whole(
+        &[raw_file(b"HEAD", b"x"), raw_file(b"refs/heads/main", b"y")],
+        2,
+    );
+    let mut case = CaseV1::with_bytes(&capsule, &[(REFS_V1, orphan)]);
+    let error = case.refusal("an entry whose parents are absent");
+    assert!(
+        matches!(
+            error,
+            GitBootstrapErrorV1::Restore(CustodyRestoreErrorV1::FrameInvalid { class: REFS_V1 })
+        ),
+        "{error:?}"
+    );
+}
+
+/// Every refusal of the real entry point is in pass A's failure shape: no active materialization began,
+/// the caller's `completed` step is carried unchanged (whatever it is), and the ledger figure is the one
+/// ledger's. The causes span every refusal family: Empty refs, an entry fault, a bad trailer, drift, and
+/// a spent deadline. Nothing exists under `repository/`.
+#[test]
+fn b1a_every_refusal_is_in_the_failure_shape_that_began_no_materialization() {
+    let capsule = frames_capsule();
+    let generation = CaseV1::generation(&capsule);
+    let bad_trailer = {
+        let mut bytes = encode_frame(REFS_V1, &generation, &with_head(&[]));
+        let last = bytes.len() - 1;
+        flip(&mut bytes, last);
+        bytes
+    };
+    let linked = encode_frame(
+        REFS_V1,
+        &generation,
+        &with_head(&[(b"refs", EntryV1::Link(b"x"))]),
+    );
+    for completed in [
+        None,
+        Some(GitPlaneStepV1::Admission),
+        Some(GitPlaneStepV1::BootstrapGate),
+    ] {
+        let mut rows: Vec<(&str, CaseV1, Instant)> = vec![
+            (
+                "empty refs",
+                CaseV1::with_bytes(&capsule, &[]),
+                far_deadline(),
+            ),
+            (
+                "an entry fault",
+                CaseV1::with_bytes(&capsule, &[(REFS_V1, linked.clone())]),
+                far_deadline(),
+            ),
+            (
+                "a bad trailer",
+                CaseV1::with_bytes(&capsule, &[(REFS_V1, bad_trailer.clone())]),
+                far_deadline(),
+            ),
+        ];
+        let spent = Instant::now();
+        std::thread::sleep(Duration::from_millis(5));
+        rows.push((
+            "a spent deadline",
+            CaseV1::with_entries(&capsule, &[], None),
+            spent,
+        ));
+        for (row, mut case, deadline) in rows {
+            let ledger = ledger_used(&case.verified);
+            let failure = prevalidate_active_frames_v1(
+                &mut case.verified,
+                frame_budget(),
+                deadline,
+                completed,
+            )
+            .expect_err(row);
+            let _ = require_failure_shape(failure, completed, ledger);
+            assert_eq!(
+                case.dest.entries(),
+                [".restore-work"],
+                "{row}: no repository"
+            );
+        }
+    }
+    // The control: success carries no failure at all.
+    let mut case = CaseV1::with_entries(&capsule, &[], None);
+    prevalidate_active_frames_v1(&mut case.verified, frame_budget(), far_deadline(), None)
+        .expect("a whole refs frame");
+}
+
+/// A frame that grows after its rehash is read only one byte past its verified length, never whole: the
+/// decoder's source is bounded, so a frame that is not the verified plaintext is refused having consumed
+/// at most that one extra byte.
+#[test]
+fn b1a_a_frame_that_grows_after_its_rehash_is_never_read_past_one_extra_byte() {
+    use std::os::unix::fs::FileExt as _;
+    let capsule = frames_capsule();
+    let generation = CaseV1::generation(&capsule);
+    let bytes = encode_frame(REFS_V1, &generation, &with_head(&[]));
+    let mut case = CaseV1::with_bytes(&capsule, &[(REFS_V1, bytes)]);
+    let index = staged_index(&case.verified, REFS_V1);
+    let handle = case.verified.staged[index]
+        .file
+        .try_clone()
+        .expect("a duplicate descriptor");
+    let length = case.verified.staged[index].length;
+    let grown = std::cell::Cell::new(false);
+    let _hook = install_git_hook_for_test(GitHookPointV1::DeadlineObserved, move |event| {
+        if event.label == "frame-rewind" && !grown.replace(true) {
+            handle
+                .write_all_at(&vec![0_u8; 1024 * 1024], length)
+                .expect("grow the frame");
+        }
+    });
+    let error = case.refusal("a frame grown after its rehash");
+    assert!(
+        matches!(
+            error,
+            GitBootstrapErrorV1::StagedInputChanged { .. }
+                | GitBootstrapErrorV1::Restore(CustodyRestoreErrorV1::FrameInvalid {
+                    class: REFS_V1
+                })
+        ),
+        "{error:?}"
+    );
+    assert_eq!(
+        position(&case.verified.staged[index]),
+        length + 1,
+        "one byte past the verified length, and no more"
+    );
+}
+
+/// The caller's frame budget bounds the null-sink decode: a frame with more entries than the budget
+/// allows, or more bytes, is refused whole, and the same frame under a sufficient budget is whole.
+#[test]
+fn b1a_the_callers_frame_budget_bounds_the_decode() {
+    let capsule = frames_capsule();
+    let generation = CaseV1::generation(&capsule);
+    let bytes = encode_frame(
+        REFS_V1,
+        &generation,
+        &with_head(&[
+            dir("refs"),
+            dir("refs/heads"),
+            file("refs/heads/a", b"1\n"),
+            file("refs/heads/b", b"2\n"),
+            file("refs/heads/c", b"3\n"),
+        ]),
+    );
+    let length = bytes.len() as u64;
+    let run = |budget: CustodyFrameBudgetV1| {
+        let mut case = CaseV1::with_bytes(&capsule, &[(REFS_V1, bytes.clone())]);
+        let ledger = ledger_used(&case.verified);
+        let outcome = prevalidate_active_frames_bounded_v1(
+            &mut case.verified,
+            budget,
+            far_deadline(),
+            B1A_COMPLETED_V1,
+            1 << 20,
+        );
+        assert_eq!(ledger_used(&case.verified), ledger);
+        outcome.map_err(|failure| failure.cause)
+    };
+    let sufficient = CustodyFrameBudgetV1::new(6, length).expect("a budget");
+    assert!(run(sufficient).is_ok(), "exactly enough entries and bytes");
+    for (row, budget) in [
+        (
+            "one entry short",
+            CustodyFrameBudgetV1::new(5, length).expect("a budget"),
+        ),
+        (
+            "one byte short",
+            CustodyFrameBudgetV1::new(6, length - 1).expect("a budget"),
+        ),
+    ] {
+        let error = run(budget).expect_err(row);
+        assert!(
+            matches!(
+                error,
+                GitBootstrapErrorV1::Restore(CustodyRestoreErrorV1::FrameInvalid {
+                    class: REFS_V1
+                })
+            ),
+            "{row}: {error:?}"
+        );
+    }
+}
+
+/// The paced rehash, directly: it rewinds before and after, checks length and digest, never reads a
+/// grown file whole, and an expired deadline refuses before a byte is read or a descriptor is moved.
+#[test]
+fn b1a_the_paced_rehash_checks_rewinds_and_reads_a_bounded_prefix() {
+    use std::io::{Seek as _, Write as _};
+    use std::os::unix::fs::FileExt as _;
+    let capsule = frames_capsule();
+    let generation = CaseV1::generation(&capsule);
+    let bytes = encode_frame(REFS_V1, &generation, &with_head(&[]));
+    let fresh = || {
+        let mut case = CaseV1::with_bytes(&capsule, &[(REFS_V1, bytes.clone())]);
+        let index = staged_index(&case.verified, REFS_V1);
+        (case.verified.staged.swap_remove(index), case)
+    };
+
+    // A descriptor left mid-file is rewound first; it ends at offset 0.
+    let (mut one, _case) = fresh();
+    one.file.seek(SeekFrom::Start(7)).expect("seek");
+    reverify_staged_v1(&mut one, far_deadline()).expect("an unchanged frame");
+    assert_eq!(position(&one), 0);
+
+    // A same-length change and a truncation refuse by digest and length.
+    let (mut one, _case) = fresh();
+    one.file.write_all_at(&[0xff], 12).expect("change");
+    assert!(matches!(
+        reverify_staged_v1(&mut one, far_deadline()),
+        Err(GitBootstrapErrorV1::StagedInputChanged { .. })
+    ));
+    let (mut one, _case) = fresh();
+    one.file.set_len(one.length - 1).expect("truncate");
+    assert!(matches!(
+        reverify_staged_v1(&mut one, far_deadline()),
+        Err(GitBootstrapErrorV1::StagedInputChanged { .. })
+    ));
+
+    // A grown file is read only one byte past its recorded length, never whole.
+    let (mut one, _case) = fresh();
+    one.file.seek(SeekFrom::End(0)).expect("seek");
+    one.file
+        .write_all(&vec![0_u8; 4 * 1024 * 1024])
+        .expect("grow it");
+    assert!(matches!(
+        reverify_staged_v1(&mut one, far_deadline()),
+        Err(GitBootstrapErrorV1::StagedInputChanged { .. })
+    ));
+    assert_eq!(position(&one), one.length + 1, "one byte past the length");
+
+    // An expired deadline refuses before any read or rewind.
+    let (mut one, _case) = fresh();
+    one.file.seek(SeekFrom::Start(5)).expect("seek");
+    let spent = Instant::now();
+    std::thread::sleep(Duration::from_millis(5));
+    assert!(matches!(
+        reverify_staged_v1(&mut one, spent),
+        Err(GitBootstrapErrorV1::Git(CustodyGitError::Timeout))
+    ));
+    assert_eq!(position(&one), 5, "no read and no rewind happened");
+}
+
+/// Retained descriptors are the only input: every staged leaf renamed away, and then unlinked, is still
+/// read from its descriptor.
+#[test]
+fn b1a_renamed_and_unlinked_staged_frames_are_still_read_from_their_descriptors() {
+    let fixture = PlanFixtureV1::rich_clone();
+    let (manifest, capability, _receipts) = fixture.planned();
+    let _ = expect_sealed(
+        fixture
+            .export(&manifest, capability)
+            .expect("the rich export seals"),
+    );
+    let (dest, mut verified) = phase_v(&fixture.capsule_dir());
+    let whole = prevalidate(&mut verified, far_deadline()).expect("the unmoved frames");
+
+    let plain = dest.work().join("plain");
+    let mut renamed = 0_usize;
+    for (relative, bytes) in snapshot(&plain) {
+        if bytes.is_some() {
+            let from = plain.join(&relative);
+            let to = from.with_file_name(format!("renamed-{renamed}"));
+            std::fs::rename(&from, &to).expect("a staged leaf is renamed");
+            renamed += 1;
+        }
+    }
+    assert_eq!(renamed, verified.staged.len());
+    let moved = prevalidate(&mut verified, far_deadline())
+        .expect("renamed frames are read from their descriptors");
+    assert_eq!(moved, whole);
+
+    for (relative, bytes) in snapshot(&plain) {
+        if bytes.is_some() {
+            std::fs::remove_file(plain.join(&relative)).expect("a staged leaf is unlinked");
+        }
+    }
+    let unlinked = prevalidate(&mut verified, far_deadline())
+        .expect("unlinked frames are read from their descriptors");
+    assert_eq!(unlinked, whole);
+}
+
+// ---------------------------------------------------------------------------------------------
+// The one deadline paces every step: reads, entries, rewinds, and the success
+// ---------------------------------------------------------------------------------------------
+
+/// The one deadline of the pacing rows. A clean prevalidation of these small frames takes milliseconds.
+const B1A_DEADLINE_V1: Duration = Duration::from_secs(3);
+
+fn two_frame_case(capsule: &CustomCapsuleV1) -> CaseV1 {
+    CaseV1::with_entries(
+        capsule,
+        &[
+            (b"refs", EntryV1::Dir),
+            (b"refs/heads", EntryV1::Dir),
+            (b"refs/heads/main", EntryV1::File(b"oid\n")),
+        ],
+        Some(&[
+            (b"logs", EntryV1::Dir),
+            (b"logs/HEAD", EntryV1::File(b"log\n")),
+        ]),
+    )
+}
+
+/// The guards of a clean two-frame run, in order, by label.
+const CLEAN_GUARDS_V1: [&str; 10] = [
+    "frames-entry",
+    "frame-rehash",
+    "frame-rewind",
+    "frame-decoded",
+    "frame-rewound",
+    "frame-rehash",
+    "frame-rewind",
+    "frame-decoded",
+    "frame-rewound",
+    "frames-final",
+];
+
+fn record_guards() -> (
+    std::rc::Rc<std::cell::RefCell<Vec<&'static str>>>,
+    GitSeamGuardV1,
+) {
+    let labels = std::rc::Rc::new(std::cell::RefCell::new(Vec::<&'static str>::new()));
+    let seen = labels.clone();
+    let hook = install_git_hook_for_test(GitHookPointV1::DeadlineObserved, move |event| {
+        seen.borrow_mut().push(event.label);
+    });
+    (labels, hook)
+}
+
+/// A clean run reads the clock at exactly the documented guards, in order, so no step is unobserved.
+#[test]
+fn b1a_the_guards_of_a_clean_run_are_the_documented_ones_in_order() {
+    let capsule = frames_capsule();
+    let mut case = two_frame_case(&capsule);
+    let (labels, _hook) = record_guards();
+    let _ = case.accepted("a clean two-frame run");
+    assert_eq!(*labels.borrow(), CLEAN_GUARDS_V1);
+}
+
+/// Each guard halts the run alone: its step made slow past the deadline is refused with a typed timeout,
+/// the run stops AT that guard (no later guard ever ran), nothing is written, and the ledger is as it
+/// was. A brief delay at every guard, with headroom, still succeeds.
+#[test]
+fn b1a_each_guard_halts_the_run_alone_and_headroom_succeeds() {
+    let capsule = frames_capsule();
+    let mut distinct: Vec<&'static str> = Vec::new();
+    for label in CLEAN_GUARDS_V1 {
+        if !distinct.contains(&label) {
+            distinct.push(label);
+        }
+    }
+    for target in distinct {
+        let mut case = two_frame_case(&capsule);
+        let deadline = Instant::now() + B1A_DEADLINE_V1;
+        let labels = std::rc::Rc::new(std::cell::RefCell::new(Vec::<&'static str>::new()));
+        let fired = std::rc::Rc::new(std::cell::Cell::new(false));
+        let (seen, slow) = (labels.clone(), fired.clone());
+        let _hook = install_git_hook_for_test(GitHookPointV1::DeadlineObserved, move |event| {
+            seen.borrow_mut().push(event.label);
+            if event.label == target && !slow.replace(true) {
+                pass_the_deadline(deadline);
+            }
+        });
+        let ledger = ledger_used(&case.verified);
+        let tree = snapshot(&case.dest.path);
+        let error = prevalidate(&mut case.verified, deadline).expect_err(target);
+        assert!(
+            matches!(error, GitBootstrapErrorV1::Git(CustodyGitError::Timeout)),
+            "{target}: {error:?}"
+        );
+        assert!(fired.get(), "{target}: the slow step never ran");
+        assert_eq!(
+            labels.borrow().last().copied(),
+            Some(target),
+            "{target}: the run halted AT its guard: {:?}",
+            labels.borrow()
+        );
+        assert_eq!(ledger_used(&case.verified), ledger, "{target}");
+        assert_eq!(snapshot(&case.dest.path), tree, "{target}");
+        assert_eq!(case.dest.entries(), [".restore-work"], "{target}");
+    }
+
+    let mut case = two_frame_case(&capsule);
+    let deadline = Instant::now() + B1A_DEADLINE_V1;
+    let _hook = install_git_hook_for_test(GitHookPointV1::DeadlineObserved, |_| {
+        std::thread::sleep(Duration::from_millis(40));
+    });
+    prevalidate(&mut case.verified, deadline).expect("ten brief delays leave most of the deadline");
+}
+
+/// A deadline already spent refuses before the first read: no label past the entry guard, and every
+/// staged descriptor is exactly where it was left.
+#[test]
+fn b1a_a_spent_deadline_refuses_before_any_frame_is_touched() {
+    let capsule = frames_capsule();
+    let mut case = two_frame_case(&capsule);
+    for one in &case.verified.staged {
+        use std::io::Seek as _;
+        (&one.file)
+            .seek(SeekFrom::Start(3))
+            .expect("park the descriptor");
+    }
+    let spent = Instant::now();
+    std::thread::sleep(Duration::from_millis(5));
+    let (labels, _hook) = record_guards();
+    let error = prevalidate(&mut case.verified, spent).expect_err("a spent deadline");
+    assert!(
+        matches!(error, GitBootstrapErrorV1::Git(CustodyGitError::Timeout)),
+        "{error:?}"
+    );
+    assert_eq!(*labels.borrow(), ["frames-entry"]);
+    assert!(case.verified.staged.iter().all(|one| position(one) == 3));
+}
+
+/// A frame of several entries whose deadline passes while one entry is being judged stops AT that entry:
+/// the per-entry guard keeps the later entries from being decoded.
+#[test]
+fn b1a_the_deadline_is_observed_before_every_decoded_entry() {
+    let capsule = frames_capsule();
+    let mut case = CaseV1::refs_only(
+        &capsule,
+        &[
+            (b"refs", EntryV1::Dir),
+            (b"refs/heads", EntryV1::Dir),
+            (b"refs/heads/a", EntryV1::File(b"1\n")),
+            (b"refs/heads/b", EntryV1::File(b"2\n")),
+            (b"refs/heads/c", EntryV1::File(b"3\n")),
+            (b"refs/heads/d", EntryV1::File(b"4\n")),
+        ],
+    );
+    let deadline = Instant::now() + B1A_DEADLINE_V1;
+    let entries = std::rc::Rc::new(std::cell::RefCell::new(Vec::<String>::new()));
+    let seen = entries.clone();
+    let _hook = install_git_hook_for_test(GitHookPointV1::FrameEntry, move |event| {
+        seen.borrow_mut()
+            .push(event.path.to_string_lossy().into_owned());
+        if event.path == Path::new("refs/heads/a") {
+            pass_the_deadline(deadline);
+        }
+    });
+    let error = prevalidate(&mut case.verified, deadline)
+        .expect_err("the deadline passed while judging an entry");
+    assert!(
+        matches!(error, GitBootstrapErrorV1::Git(CustodyGitError::Timeout)),
+        "{error:?}"
+    );
+    assert_eq!(
+        *entries.borrow(),
+        ["HEAD", "refs", "refs/heads", "refs/heads/a"],
+        "no entry after the one that spent the deadline was decoded"
+    );
+}
+
+/// Reads are paced too: a large regular file whose entry spends the deadline is not read past the one
+/// buffer the decoder had already taken. The descriptor stops within one buffer of where it was.
+#[test]
+fn b1a_no_frame_byte_is_read_after_the_deadline() {
+    let capsule = frames_capsule();
+    let big = vec![b'x'; 300 * 1024];
+    let mut case = CaseV1::refs_only(
+        &capsule,
+        &[
+            (b"refs", EntryV1::Dir),
+            (b"refs/heads", EntryV1::Dir),
+            (b"refs/heads/big", EntryV1::File(&big)),
+        ],
+    );
+    let deadline = Instant::now() + B1A_DEADLINE_V1;
+    // The rehash reads the whole frame once; the decode must then stop after its first buffer. The
+    // hook marks the decode: it runs at an entry, which only the decode reaches.
+    let _hook = install_git_hook_for_test(GitHookPointV1::FrameEntry, move |event| {
+        if event.path == Path::new("refs/heads/big") {
+            pass_the_deadline(deadline);
+        }
+    });
+    let error = prevalidate(&mut case.verified, deadline)
+        .expect_err("the deadline passed before the content was read");
+    assert!(
+        matches!(error, GitBootstrapErrorV1::Git(CustodyGitError::Timeout)),
+        "{error:?}"
+    );
+    let one = &case.verified.staged[staged_index(&case.verified, REFS_V1)];
+    assert!(one.length > 2 * HASH_BUFFER_BYTES_V1 as u64);
+    assert!(
+        position(one) <= HASH_BUFFER_BYTES_V1 as u64,
+        "the decode read {} bytes of {}: past the deadline",
+        position(one),
+        one.length
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// Bounded private metadata for the later second decode
+// ---------------------------------------------------------------------------------------------
+
+/// The entry digest binds class, kind, path, and length, in order: any one difference changes it, and
+/// the same entries give the same digest.
+#[test]
+fn b1a_the_entry_digest_binds_class_kind_path_length_and_order() {
+    use ActiveEntryKindV1::{Directory, Regular};
+    let digest_of = |class, entries: &[(ActiveEntryKindV1, &str, u64)]| {
+        let mut digest = ActiveEntryDigestV1::new(class);
+        for (kind, path, length) in entries {
+            digest.record(*kind, path.as_bytes(), *length);
+        }
+        digest.finish()
+    };
+    let base = [(Directory, "refs", 0), (Regular, "refs/x", 3)];
+    let reference = digest_of(REFS_V1, &base);
+    assert_eq!(reference, digest_of(REFS_V1, &base), "deterministic");
+    let variants: [(&str, [u8; 32]); 6] = [
+        ("class", digest_of(LOGS_V1, &base)),
+        (
+            "kind",
+            digest_of(REFS_V1, &[(Directory, "refs", 0), (Directory, "refs/x", 3)]),
+        ),
+        (
+            "path",
+            digest_of(REFS_V1, &[(Directory, "refs", 0), (Regular, "refs/y", 3)]),
+        ),
+        (
+            "length",
+            digest_of(REFS_V1, &[(Directory, "refs", 0), (Regular, "refs/x", 4)]),
+        ),
+        (
+            "order",
+            digest_of(REFS_V1, &[(Regular, "refs/x", 3), (Directory, "refs", 0)]),
+        ),
+        ("count", digest_of(REFS_V1, &base[..1])),
+    ];
+    for (what, other) in variants {
+        assert_ne!(other, reference, "{what}");
+    }
+    // A path boundary is part of the record: `ab` + `c` is not `a` + `bc`.
+    assert_ne!(
+        digest_of(REFS_V1, &[(Regular, "ab", 0), (Regular, "c", 0)]),
+        digest_of(REFS_V1, &[(Regular, "a", 0), (Regular, "bc", 0)]),
+    );
+    // And the path is length-prefixed: one path that embeds the bytes of the next record (its content
+    // length and the following kind, as the digest lays them out) is not those two records. Without the
+    // prefix the two lists would hash the same bytes.
+    let embedded = "a\0\0\0\0\0\0\0\0\u{2}b";
+    assert_ne!(
+        digest_of(REFS_V1, &[(Regular, "a", 0), (Regular, "b", 0)]),
+        digest_of(REFS_V1, &[(Regular, embedded, 0)]),
+    );
+}
+
+/// The plan's facts for a second decode are those of the frames: different frames give different
+/// entry digests, and the same frame staged again gives the same.
+#[test]
+fn b1a_the_plan_is_reproducible_and_distinguishes_frames() {
+    let capsule = frames_capsule();
+    let one = |entries: &EntriesV1<'_>| {
+        CaseV1::refs_only(&capsule, entries)
+            .accepted("a frame")
+            .frames[0]
+            .clone()
+    };
+    let a = one(&[dir("refs"), file("refs/x", b"1\n")]);
+    let again = one(&[dir("refs"), file("refs/x", b"1\n")]);
+    let content = one(&[dir("refs"), file("refs/x", b"2\n")]);
+    let name = one(&[dir("refs"), file("refs/y", b"1\n")]);
+    assert_eq!(a, again);
+    // Content is bound by the staged digest, the names and shapes by the entry digest.
+    assert_ne!(a.sha256, content.sha256);
+    assert_eq!(a.entries_sha256, content.entries_sha256);
+    assert_ne!(a.entries_sha256, name.entries_sha256);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Pass A's no-repository invariant is function-scoped, and B1a's seam writes nothing
+// ---------------------------------------------------------------------------------------------
+
+/// Direct `bootstrap_git_objects_v1` never creates `repository/`, for every capsule shape: it leaves only
+/// `.restore-work/` in the destination, and nothing named `repository` anywhere beneath it. B1a's
+/// prevalidation run afterwards on the same retained value adds no entry either.
+#[test]
+fn b1a_the_direct_bootstrap_creates_no_repository_and_prevalidation_adds_none() {
+    let fixture = PlanFixtureV1::rich_clone();
+    let (manifest, capability, _receipts) = fixture.planned();
+    let _ = expect_sealed(
+        fixture
+            .export(&manifest, capability)
+            .expect("the rich export seals"),
+    );
+    let rich = fixture.capsule_dir();
+    let captured_capsule = captured(CustodyGitObjectFormatV1::Sha1);
+    let empty_sha256 = empty(CustodyGitObjectFormatV1::Sha256);
+    // Only the rich capsule carries active frames; the other two have Empty refs.
+    for (row, capsule, format, frames) in [
+        ("rich", rich, GitObjectFormatV1::Sha1, true),
+        (
+            "captured",
+            captured_capsule.capsule.clone(),
+            GitObjectFormatV1::Sha1,
+            false,
+        ),
+        (
+            "empty",
+            empty_sha256.capsule.clone(),
+            GitObjectFormatV1::Sha256,
+            false,
+        ),
+    ] {
+        let (dest, verified) = phase_v(&capsule);
+        let mut bootstrap = must_bootstrap(verified, format);
+        assert_eq!(dest.entries(), [".restore-work"], "{row}");
+        let after_bootstrap = snapshot(&dest.path);
+        assert!(
+            after_bootstrap
+                .keys()
+                .all(|name| !name.contains("repository")),
+            "{row}: {:?}",
+            after_bootstrap.keys().collect::<Vec<_>>()
+        );
+        let ledger = ledger_used(&bootstrap.verified);
+        let outcome = prevalidate(&mut bootstrap.verified, far_deadline());
+        match (frames, outcome) {
+            (true, Ok(plan)) => assert_eq!(plan.frames.len(), 2, "{row}"),
+            (false, Err(GitBootstrapErrorV1::EmptyRefsAndHead)) => {}
+            (_, other) => panic!("{row}: {other:?}"),
+        }
+        assert_eq!(ledger_used(&bootstrap.verified), ledger, "{row}");
+        assert_eq!(snapshot(&dest.path), after_bootstrap, "{row}");
+        assert_eq!(dest.entries(), [".restore-work"], "{row}");
+    }
+}
+
+const B1A_MARKER_V1: &str = "// Pass B1a: retained active-frame prevalidation";
+
+/// STRUCTURAL ONLY. Pass A's whole-module forbidden-name scan is narrowed to the bootstrap
+/// implementation (its production source up to the B1a marker), because later passes create the
+/// repository in this file; the marker is unique and the narrowing leaves a nonempty region before and
+/// after it. B1a's own region is then held to a read-only vocabulary: no path open, no walker, no
+/// repository or create-new write, no ledger charge, no Git runner, no object-store route, no unsafe.
+#[test]
+fn b1a_the_prevalidation_region_is_read_only_and_the_scan_split_is_unique() {
+    let source = include_str!("custody_restore_git.rs");
+    assert_eq!(source.matches(B1A_MARKER_V1).count(), 1, "one marker");
+    let (before, region) = source.split_once(B1A_MARKER_V1).expect("the marker");
+    assert!(before.contains("pub(crate) fn bootstrap_git_objects_v1("));
+    assert!(region.contains("pub(crate) fn prevalidate_active_frames_v1("));
+    assert!(
+        !before.contains("prevalidate_active_frames_v1("),
+        "Pass A's region does not call the prevalidation"
+    );
+    let code: String = region
+        .lines()
+        .filter(|line| !line.trim_start().starts_with("//"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    // The one ledger is only READ, once, for the failure's figure: it is never charged or released.
+    assert_eq!(
+        code.matches(".ledger").count(),
+        1,
+        "one access to the ledger"
+    );
+    assert!(code.contains(".ledger.borrow().used()"));
+    for forbidden in [
+        "std::fs",
+        "File::open(",
+        "OpenOptions",
+        "read_dir(",
+        "create_new",
+        "create_staging_directory",
+        "write_all",
+        "GitRunnerV1",
+        "GitRunRequestV1",
+        "GitObjectStoreRouteV1",
+        "object_store",
+        "borrow_mut",
+        "ReservedPairV1",
+        "OwnedChargeV1",
+        "ScratchLedgerV1",
+        ".reserve(",
+        ".release(",
+        "roll_back",
+        "unsafe",
+        "\"repository\"",
+        "remeasure_git_directory",
+        "measure_git_directory",
+        "walk",
+        "Command",
+    ] {
+        assert!(
+            !code.contains(forbidden),
+            "the prevalidation region mentions `{forbidden}`"
+        );
+    }
 }

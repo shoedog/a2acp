@@ -48,6 +48,18 @@
 //! held to the deadline (a failed child's effect and ledger are still reported beside its failure).
 //! A create-new that provably created nothing gives its reservation back.
 //! Nothing here touches a byte on disk: reconciliation changes only the ledger and the typed refusal.
+//!
+//! **Pass B1a.** After the bootstrap, [`prevalidate_active_frames_v1`] admits the retained active
+//! frames (`RefsAndHead`, `StashAndReflogs`) for the later restore, and writes nothing. It identifies
+//! the active roles from the authenticated coverage, refuses an Empty `RefsAndHead` class with a typed
+//! refusal before any entry is created (complete phase G needs a captured `HEAD`; none is synthesized),
+//! rehashes each retained descriptor under the one deadline, and decodes every active frame completely,
+//! through its verified trailer, into a null sink. Each decoded entry feeds one aggregate path table
+//! that enforces the exact active allowlist in its actual classes, entry types, parent/child
+//! agreement, and the portable-spelling rule. Only a whole, trailer-verified frame is judged final.
+//! It returns bounded metadata, [`ActiveFramePlanV1`], for a later second decode; the caller keeps the
+//! one capsule, ledger, pins, and deadline. The pass A invariant above is function-scoped: direct
+//! [`bootstrap_git_objects_v1`] never creates anything outside `.restore-work/`.
 
 use super::{
     create_staging_directory, hash_prefix, joined, lossy, recheck_entry, refuse_mounts_within,
@@ -55,11 +67,15 @@ use super::{
     HASH_BUFFER_BYTES_V1, RESTORE_WORK_DIR_NAME_V1,
 };
 use crate::custody_capsule::CustodyCapsuleArtifactRoleV1;
+use crate::custody_coverage::route_git_dir_entry;
 use crate::custody_export::{
     bounded, index_pack_logical_bound, stdout_limit_for_objects, strict_object_message_id,
     verify_pack_stdout_limit, CustodyExportErrorV1, GitDirectoryBudgetV1, GitRunRecordV1,
     ScratchLedgerV1, ENTRY_ALLOWANCE_BYTES_V1, FSCK_ALLOWED_NOTICE_V1, GIT_DIR_MAX_DEPTH_V1,
     GIT_DIR_MAX_ENTRIES_V1, GIT_MIN_STDOUT_LIMIT_V1, GIT_STDERR_LIMIT_V1, INDEX_PACK_ENTRIES_V1,
+};
+use crate::custody_frame::{
+    CustodyFrameBudgetV1, CustodyFrameDecoderV1, CustodyFrameEntryV1, CustodyFrameHeaderV1,
 };
 use crate::custody_git::{
     CustodyGitError, GitCommandV1, GitObjectFormatV1, GitRootNamesV1, GitRunRequestV1,
@@ -73,11 +89,11 @@ use crate::fs_custody::{
     pinned_root_unchanged, ChildKindV1, ChildStatV1, FsCustodyError, PinnedDirectoryV1,
 };
 use ring::digest;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
 use std::fs::File;
-use std::io::{ErrorKind, Read as _, Seek as _, SeekFrom};
+use std::io::{self, BufReader, ErrorKind, Read as _, Seek as _, SeekFrom};
 use std::os::unix::ffi::OsStrExt as _;
 use std::path::Path;
 use std::time::Instant;
@@ -185,6 +201,16 @@ pub(crate) enum GitBootstrapErrorV1 {
     InventoryMismatch(String),
     #[error("the manifest's objects are not closed in the bootstrap: {0}")]
     ClosureIncomplete(String),
+    // Active-frame prevalidation (pass B1a).
+    #[error(
+        "complete phase G refuses an Empty RefsAndHead class: it has no HEAD, and none is synthesized"
+    )]
+    EmptyRefsAndHead,
+    #[error("the {class:?} frame is refused: {fault}")]
+    ActiveFrame {
+        class: CustodyCoverageClassV1,
+        fault: ActiveFrameFaultV1,
+    },
     /// A child failed, and reconciling what it left behind failed too. Neither is dropped: the
     /// reconciliation failure is a budget or custody refusal in its own right.
     #[error("{primary}; reconciling the failed child's effects also failed: {reconcile}")]
@@ -318,6 +344,9 @@ pub(crate) enum GitHookPointV1 {
     /// A late-validation step has returned and the one deadline is about to be read: the event's
     /// label names the step (no path). A hook that sleeps here is that step having been slow.
     DeadlineObserved,
+    /// A decoded active-frame entry is about to be judged: the path is the entry's frame path (pass
+    /// B1a).
+    FrameEntry,
 }
 
 #[cfg(test)]
@@ -884,6 +913,17 @@ fn classify_shape(
         }
     };
 
+    let active = classify_active_frames(verified)?;
+    Ok((shape, provenance, active))
+}
+
+/// The active payloads, from the manifest's coverage rows and the staged roles: `RefsAndHead` and
+/// `StashAndReflogs`, each Captured (exactly one staged payload) or Empty (none). Every other state
+/// refuses and is never downgraded to Empty. Pure: no filesystem effect. Pass A and pass B1a share it.
+fn classify_active_frames(
+    verified: &VerifiedCapsuleV1,
+) -> Result<Vec<ActiveFrameV1>, GitBootstrapErrorV1> {
+    let manifest = &verified.control.manifest;
     let mut active = Vec::new();
     for class in [
         CustodyCoverageClassV1::RefsAndHead,
@@ -922,7 +962,7 @@ fn classify_shape(
             }
         }
     }
-    Ok((shape, provenance, active))
+    Ok(active)
 }
 
 /// Re-measure one staged plaintext from its retained descriptor against its recorded length and
@@ -2657,4 +2697,588 @@ fn run_steps(
         closure,
         fsck_strict: true,
     })
+}
+
+// ---------------------------------------------------------------------------------------------
+// Pass B1a: retained active-frame prevalidation
+// ---------------------------------------------------------------------------------------------
+
+/// The most bytes the aggregate path table may retain: two copies of each admitted path (its lowercased
+/// key and its spelling) and a fixed allowance for the map's own bookkeeping per entry. The frame
+/// codec bounds one frame's entries and bytes; this bounds what prevalidation keeps of all of them.
+const ACTIVE_PATH_TABLE_BYTES_V1: u64 = 64 * 1024 * 1024;
+const ACTIVE_ENTRY_OVERHEAD_BYTES_V1: u64 = 64;
+
+/// What a decoded frame entry is, as far as the active subset is concerned.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ActiveEntryKindV1 {
+    Directory,
+    Regular,
+    /// Never admitted: the active subset is directories and regular files only.
+    Symlink,
+}
+
+/// Why a path component is not portable: the Git-only rule is printable ASCII `0x21..=0x7e`, no
+/// backslash, and no trailing dot. Nothing is normalized; every other spelling is refused.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+pub(crate) enum PortableFaultV1 {
+    #[error("a non-ASCII byte")]
+    NonAscii,
+    #[error("a backslash")]
+    Backslash,
+    #[error("a space or control byte")]
+    Unprintable,
+    #[error("a trailing dot")]
+    TrailingDot,
+}
+
+/// Why one active-frame entry is refused. Paths are rendered lossily, for the message only.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+pub(crate) enum ActiveFrameFaultV1 {
+    #[error("{path}: a symlink is not restored by this slice")]
+    Symlink { path: String },
+    #[error("{path}: not a portable spelling ({reason})")]
+    NonPortable {
+        path: String,
+        reason: PortableFaultV1,
+    },
+    #[error("{path}: a name that {owner:?} owns, not this class")]
+    ForeignClass {
+        path: String,
+        owner: CustodyCoverageClassV1,
+    },
+    #[error("{path}: an unsupported or unknown Git-directory name")]
+    Unsupported { path: String },
+    #[error("{path}: not on the active allowlist")]
+    NotAllowlisted { path: String },
+    #[error("{path}: expected a {expected:?}")]
+    WrongType {
+        path: String,
+        expected: ActiveEntryKindV1,
+    },
+    #[error("{path}: listed twice")]
+    Duplicate { path: String },
+    #[error("{path}: collides with {with} on a portable filesystem")]
+    Collision { path: String, with: String },
+    #[error("{path}: its parent is not an admitted directory of that exact spelling")]
+    Conflict { path: String },
+    #[error("{class:?} is not an active Git class")]
+    InactiveClass { class: CustodyCoverageClassV1 },
+    #[error("a Captured RefsAndHead class holds no HEAD regular file")]
+    MissingHead,
+    #[error("the active path table exceeds its {bound}-byte bound")]
+    PathTableBound { bound: u64 },
+}
+
+fn portable_component(component: &[u8]) -> Result<(), PortableFaultV1> {
+    for byte in component {
+        if !byte.is_ascii() {
+            return Err(PortableFaultV1::NonAscii);
+        }
+        if *byte == b'\\' {
+            return Err(PortableFaultV1::Backslash);
+        }
+        if !(0x21..=0x7e).contains(byte) {
+            return Err(PortableFaultV1::Unprintable);
+        }
+    }
+    if component.last() == Some(&b'.') {
+        return Err(PortableFaultV1::TrailingDot);
+    }
+    Ok(())
+}
+
+fn portable_path(path: &[u8]) -> Result<(), PortableFaultV1> {
+    path.split(|byte| *byte == b'/')
+        .try_for_each(portable_component)
+}
+
+/// The entry type an allowlisted top-level name must have in `class`, or why the name is refused: the
+/// exact allowlist is `HEAD`, `ORIG_HEAD`, `FETCH_HEAD`, `packed-refs`, and `refs` (with its
+/// descendants) for `RefsAndHead`, and `logs` (with its descendants) for `StashAndReflogs`.
+fn top_level_kind(
+    class: CustodyCoverageClassV1,
+    top: &[u8],
+    path: &[u8],
+) -> Result<ActiveEntryKindV1, ActiveFrameFaultV1> {
+    match (class, top) {
+        (
+            CustodyCoverageClassV1::RefsAndHead,
+            b"HEAD" | b"ORIG_HEAD" | b"FETCH_HEAD" | b"packed-refs",
+        ) => Ok(ActiveEntryKindV1::Regular),
+        (CustodyCoverageClassV1::RefsAndHead, b"refs")
+        | (CustodyCoverageClassV1::StashAndReflogs, b"logs") => Ok(ActiveEntryKindV1::Directory),
+        _ => {
+            let route = route_git_dir_entry(top);
+            let path = lossy(path);
+            Err(if top == b"shallow" || route.unresolved.is_some() {
+                ActiveFrameFaultV1::Unsupported { path }
+            } else if route.class != class {
+                ActiveFrameFaultV1::ForeignClass {
+                    path,
+                    owner: route.class,
+                }
+            } else {
+                ActiveFrameFaultV1::NotAllowlisted { path }
+            })
+        }
+    }
+}
+
+#[derive(Debug)]
+struct TableEntryV1 {
+    spelling: Vec<u8>,
+    kind: ActiveEntryKindV1,
+}
+
+/// The one aggregate table every active frame of a restore feeds, in order. Each entry is judged
+/// against the exact allowlist and its class, its type, the portable-spelling rule, every earlier entry
+/// of every frame (the same path twice, or a different spelling with the same ASCII-lowercased key),
+/// and its parent (an admitted directory, spelled exactly as the entry says). An entry that is refused is
+/// not admitted. Its retained bytes are bounded.
+#[derive(Debug)]
+pub(crate) struct ActivePathTableV1 {
+    entries: BTreeMap<Vec<u8>, TableEntryV1>,
+    retained: u64,
+    bound: u64,
+    head: bool,
+}
+
+impl ActivePathTableV1 {
+    pub(crate) fn new(bound: u64) -> Self {
+        Self {
+            entries: BTreeMap::new(),
+            retained: 0,
+            bound,
+            head: false,
+        }
+    }
+
+    pub(crate) fn entries(&self) -> u64 {
+        self.entries.len() as u64
+    }
+
+    /// Judge one entry of `class`'s frame, and admit it if it passes every rule.
+    pub(crate) fn admit(
+        &mut self,
+        class: CustodyCoverageClassV1,
+        path: &[u8],
+        kind: ActiveEntryKindV1,
+    ) -> Result<(), ActiveFrameFaultV1> {
+        if !matches!(
+            class,
+            CustodyCoverageClassV1::RefsAndHead | CustodyCoverageClassV1::StashAndReflogs
+        ) {
+            return Err(ActiveFrameFaultV1::InactiveClass { class });
+        }
+        if kind == ActiveEntryKindV1::Symlink {
+            return Err(ActiveFrameFaultV1::Symlink { path: lossy(path) });
+        }
+        portable_path(path).map_err(|reason| ActiveFrameFaultV1::NonPortable {
+            path: lossy(path),
+            reason,
+        })?;
+        let top = path.split(|byte| *byte == b'/').next().unwrap_or(path);
+        let expected = top_level_kind(class, top, path)?;
+        let parent = path
+            .iter()
+            .rposition(|byte| *byte == b'/')
+            .map(|at| &path[..at]);
+        if parent.is_none() && kind != expected {
+            return Err(ActiveFrameFaultV1::WrongType {
+                path: lossy(path),
+                expected,
+            });
+        }
+        let key = path.to_ascii_lowercase();
+        if let Some(found) = self.entries.get(&key) {
+            return Err(if found.spelling == path {
+                ActiveFrameFaultV1::Duplicate { path: lossy(path) }
+            } else {
+                ActiveFrameFaultV1::Collision {
+                    path: lossy(path),
+                    with: lossy(&found.spelling),
+                }
+            });
+        }
+        if let Some(parent) = parent {
+            match self.entries.get(&parent.to_ascii_lowercase()) {
+                Some(found)
+                    if found.kind == ActiveEntryKindV1::Directory && found.spelling == parent => {}
+                _ => return Err(ActiveFrameFaultV1::Conflict { path: lossy(path) }),
+            }
+        }
+        let retained = self
+            .retained
+            .saturating_add(2 * path.len() as u64)
+            .saturating_add(ACTIVE_ENTRY_OVERHEAD_BYTES_V1);
+        if retained > self.bound {
+            return Err(ActiveFrameFaultV1::PathTableBound { bound: self.bound });
+        }
+        self.retained = retained;
+        if class == CustodyCoverageClassV1::RefsAndHead && path == b"HEAD" {
+            // The top-level rule made this a regular file.
+            self.head = true;
+        }
+        self.entries.insert(
+            key,
+            TableEntryV1 {
+                spelling: path.to_vec(),
+                kind,
+            },
+        );
+        Ok(())
+    }
+
+    /// A Captured refs class holds exactly one `HEAD` regular file: the table's paths are unique, so
+    /// "one" is whether the regular `HEAD` entry was admitted.
+    pub(crate) fn finish(&self) -> Result<(), ActiveFrameFaultV1> {
+        if self.head {
+            Ok(())
+        } else {
+            Err(ActiveFrameFaultV1::MissingHead)
+        }
+    }
+}
+
+fn class_tag(class: CustodyCoverageClassV1) -> u8 {
+    match class {
+        CustodyCoverageClassV1::RefsAndHead => 1,
+        CustodyCoverageClassV1::StashAndReflogs => 2,
+        _ => 0,
+    }
+}
+
+fn kind_tag(kind: ActiveEntryKindV1) -> u8 {
+    match kind {
+        ActiveEntryKindV1::Directory => 1,
+        ActiveEntryKindV1::Regular => 2,
+        ActiveEntryKindV1::Symlink => 3,
+    }
+}
+
+/// An order-sensitive SHA-256 over a frame's admitted entries: class, then for each entry its kind, its
+/// path (length-prefixed), and its content length. A second decode that reproduces it has met the same
+/// paths, types, and sizes in the same order; the content itself is bound by the staged digest.
+pub(crate) struct ActiveEntryDigestV1 {
+    context: digest::Context,
+}
+
+impl ActiveEntryDigestV1 {
+    pub(crate) fn new(class: CustodyCoverageClassV1) -> Self {
+        let mut context = digest::Context::new(&digest::SHA256);
+        context.update(b"a2a-active-frame-entries-v1\0");
+        context.update(&[class_tag(class)]);
+        Self { context }
+    }
+
+    pub(crate) fn record(&mut self, kind: ActiveEntryKindV1, path: &[u8], length: u64) {
+        self.context.update(&[kind_tag(kind)]);
+        self.context.update(&(path.len() as u64).to_le_bytes());
+        self.context.update(path);
+        self.context.update(&length.to_le_bytes());
+    }
+
+    pub(crate) fn finish(self) -> [u8; 32] {
+        let mut sha256 = [0_u8; 32];
+        sha256.copy_from_slice(self.context.finish().as_ref());
+        sha256
+    }
+}
+
+/// What prevalidation retains of one whole, trailer-verified active frame: which staged payload it is,
+/// the staged length and SHA-256 it was verified against, and its entry counts and entry digest.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ActiveFrameSummaryV1 {
+    pub(crate) class: CustodyCoverageClassV1,
+    /// Index into the verified capsule's staged plaintexts.
+    pub(crate) staged: usize,
+    pub(crate) length: u64,
+    pub(crate) sha256: [u8; 32],
+    pub(crate) entries: u64,
+    pub(crate) directories: u64,
+    pub(crate) regular_files: u64,
+    pub(crate) content_bytes: u64,
+    pub(crate) entries_sha256: [u8; 32],
+}
+
+/// Bounded private metadata for the later second decode: one summary per active frame, in class order.
+/// It holds no path and no descriptor; the caller still owns the one verified capsule.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ActiveFramePlanV1 {
+    pub(crate) frames: Vec<ActiveFrameSummaryV1>,
+}
+
+fn frame_invalid(class: CustodyCoverageClassV1) -> GitBootstrapErrorV1 {
+    GitBootstrapErrorV1::Restore(CustodyRestoreErrorV1::FrameInvalid { class })
+}
+
+/// Re-measure one retained staged plaintext from its descriptor against its recorded length and
+/// SHA-256, and leave it at offset 0. The descriptor is rewound explicitly before the read and after it;
+/// the read is bounded to one byte past the recorded length and keeps the ONE absolute deadline before
+/// every read; and a guard follows the rehash and precedes the closing rewind.
+pub(crate) fn reverify_staged_v1(
+    one: &mut StagedPlaintextV1,
+    deadline: Instant,
+) -> Result<(), GitBootstrapErrorV1> {
+    observe_deadline(deadline, "frame-rehash")?;
+    let name = lossy(one.name.as_bytes());
+    let io_refusal = |error: io::Error| {
+        GitBootstrapErrorV1::Restore(CustodyRestoreErrorV1::Io(format!("{name}: {error}")))
+    };
+    one.file.seek(SeekFrom::Start(0)).map_err(io_refusal)?;
+    let (length, sha256) = stream_digest(&mut one.file, one.length, deadline, &name)?;
+    if length != one.length || sha256 != one.sha256 {
+        return Err(GitBootstrapErrorV1::StagedInputChanged { name: name.clone() });
+    }
+    observe_deadline(deadline, "frame-rewind")?;
+    one.file.seek(SeekFrom::Start(0)).map_err(io_refusal)?;
+    Ok(())
+}
+
+/// The decoder's source: at most `recorded length + 1` bytes of the retained descriptor, one bounded
+/// read at a time, each preceded by the ONE absolute deadline, and every byte read is hashed and counted
+/// so the decoded bytes can be bound to the verified plaintext.
+struct PacedFrameReaderV1<'a> {
+    inner: io::Take<&'a File>,
+    deadline: Instant,
+    expired: &'a Cell<bool>,
+    context: digest::Context,
+    count: u64,
+}
+
+impl io::Read for PacedFrameReaderV1<'_> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        if before_deadline(self.deadline).is_err() {
+            self.expired.set(true);
+            return Err(io::Error::new(
+                ErrorKind::TimedOut,
+                "the phase-G deadline passed",
+            ));
+        }
+        let read = self.inner.read(buffer)?;
+        self.context.update(&buffer[..read]);
+        self.count = self.count.saturating_add(read as u64);
+        Ok(read)
+    }
+}
+
+#[derive(Default)]
+struct FrameCountsV1 {
+    entries: u64,
+    directories: u64,
+    regular_files: u64,
+    content_bytes: u64,
+}
+
+/// Prevalidate one retained active frame: rehash it, then decode it completely, through its verified
+/// trailer, into a null sink, feeding every entry to the aggregate `table`. The first entry refusal is
+/// held until the whole frame has decoded and its decoded bytes are bound to the verified plaintext, so a
+/// frame that is not whole or not the verified bytes is refused as THAT, and nothing it says is trusted.
+/// The descriptor ends at offset 0.
+fn prevalidate_frame(
+    one: &mut StagedPlaintextV1,
+    frame: &ActiveFrameV1,
+    generation: &str,
+    budget: CustodyFrameBudgetV1,
+    deadline: Instant,
+    table: &mut ActivePathTableV1,
+) -> Result<ActiveFrameSummaryV1, GitBootstrapErrorV1> {
+    let class = frame.class;
+    reverify_staged_v1(one, deadline)?;
+    let header = CustodyFrameHeaderV1::new(class, generation).map_err(|_| frame_invalid(class))?;
+    let expired = Cell::new(false);
+    let refuse = || {
+        if expired.get() {
+            GitBootstrapErrorV1::Git(CustodyGitError::Timeout)
+        } else {
+            frame_invalid(class)
+        }
+    };
+    let mut counts = FrameCountsV1::default();
+    let mut entry_digest = ActiveEntryDigestV1::new(class);
+    let mut fault: Option<ActiveFrameFaultV1> = None;
+    let mut paced = PacedFrameReaderV1 {
+        inner: (&one.file).take(one.length.saturating_add(1)),
+        deadline,
+        expired: &expired,
+        context: digest::Context::new(&digest::SHA256),
+        count: 0,
+    };
+    {
+        let reader = BufReader::with_capacity(HASH_BUFFER_BYTES_V1, &mut paced);
+        let mut decoder =
+            CustodyFrameDecoderV1::new(reader, &header, budget).map_err(|_| refuse())?;
+        loop {
+            before_deadline(deadline)?;
+            let Some(entry) = decoder.next_entry().map_err(|_| refuse())? else {
+                break;
+            };
+            let (path, kind, length, content) = match entry {
+                CustodyFrameEntryV1::Directory { path, .. } => {
+                    (path, ActiveEntryKindV1::Directory, 0, None)
+                }
+                CustodyFrameEntryV1::Symlink { path, .. } => {
+                    (path, ActiveEntryKindV1::Symlink, 0, None)
+                }
+                CustodyFrameEntryV1::Regular {
+                    path,
+                    length,
+                    content,
+                    ..
+                } => (path, ActiveEntryKindV1::Regular, length, Some(content)),
+            };
+            #[cfg(test)]
+            run_git_hook(
+                GitHookPointV1::FrameEntry,
+                "",
+                Path::new(OsStr::from_bytes(path.as_bytes())),
+            );
+            if fault.is_none() {
+                match table.admit(class, path.as_bytes(), kind) {
+                    Ok(()) => {
+                        counts.entries = counts.entries.saturating_add(1);
+                        match kind {
+                            ActiveEntryKindV1::Directory => {
+                                counts.directories = counts.directories.saturating_add(1);
+                            }
+                            _ => {
+                                counts.regular_files = counts.regular_files.saturating_add(1);
+                                counts.content_bytes = counts.content_bytes.saturating_add(length);
+                            }
+                        }
+                        entry_digest.record(kind, path.as_bytes(), length);
+                    }
+                    Err(found) => fault = Some(found),
+                }
+            }
+            if let Some(mut content) = content {
+                io::copy(&mut content, &mut io::sink()).map_err(|_| refuse())?;
+            }
+        }
+    }
+    // The decoder met the verified trailer and the end of the stream. The bytes it consumed must be
+    // exactly the verified plaintext: a frame replaced after its rehash is refused here.
+    let (count, context) = (paced.count, paced.context);
+    let mut decoded_sha256 = [0_u8; 32];
+    decoded_sha256.copy_from_slice(context.finish().as_ref());
+    if count != one.length || decoded_sha256 != one.sha256 {
+        return Err(GitBootstrapErrorV1::StagedInputChanged {
+            name: lossy(one.name.as_bytes()),
+        });
+    }
+    if let Some(fault) = fault {
+        return Err(GitBootstrapErrorV1::ActiveFrame { class, fault });
+    }
+    observe_deadline(deadline, "frame-decoded")?;
+    observe_deadline(deadline, "frame-rewound")?;
+    one.file.seek(SeekFrom::Start(0)).map_err(|error| {
+        GitBootstrapErrorV1::Restore(CustodyRestoreErrorV1::Io(format!(
+            "{}: {error}",
+            lossy(one.name.as_bytes())
+        )))
+    })?;
+    Ok(ActiveFrameSummaryV1 {
+        class,
+        staged: frame.staged,
+        length: one.length,
+        sha256: one.sha256,
+        entries: counts.entries,
+        directories: counts.directories,
+        regular_files: counts.regular_files,
+        content_bytes: counts.content_bytes,
+        entries_sha256: entry_digest.finish(),
+    })
+}
+
+/// Prevalidate the retained active frames of `verified`, before anything is written for the restored Git
+/// plane: identify the `RefsAndHead` and `StashAndReflogs` payloads from the authenticated coverage and
+/// the staged roles (a Captured class needs its one frame, an Empty one none, every other state
+/// refuses); refuse an Empty `RefsAndHead` class with [`GitBootstrapErrorV1::EmptyRefsAndHead`], because
+/// complete phase G needs a captured `HEAD` and synthesizes none; then, for every active frame, rehash
+/// the retained descriptor, decode it completely through its verified trailer into a null sink, and
+/// judge every entry (see [`ActivePathTableV1`]). A Captured refs class must hold exactly one `HEAD`
+/// regular file. Ref grammar and agreement with the manifest belong to a later pass.
+///
+/// Nothing is written and nothing is charged: the one ledger, the pins, and the destination are exactly
+/// as they were, whatever the outcome, and the caller keeps the one verified capsule. Every step keeps
+/// the ONE absolute `deadline` the caller passes through the whole of phase G. On success each staged
+/// descriptor is at offset 0. A refusal is in pass A's failure shape: it never began active
+/// materialization, it carries `completed`, the last step the caller's flow completed whole (this pass
+/// completes none), and the one ledger's charge.
+pub(crate) fn prevalidate_active_frames_v1(
+    verified: &mut VerifiedCapsuleV1,
+    frame_budget: CustodyFrameBudgetV1,
+    deadline: Instant,
+    completed: Option<GitPlaneStepV1>,
+) -> Result<ActiveFramePlanV1, GitBootstrapFailureV1> {
+    prevalidate_active_frames_bounded_v1(
+        verified,
+        frame_budget,
+        deadline,
+        completed,
+        ACTIVE_PATH_TABLE_BYTES_V1,
+    )
+}
+
+/// [`prevalidate_active_frames_v1`] with the aggregate path table's byte bound as a parameter, so its
+/// refusal is exercised at a small size.
+pub(crate) fn prevalidate_active_frames_bounded_v1(
+    verified: &mut VerifiedCapsuleV1,
+    frame_budget: CustodyFrameBudgetV1,
+    deadline: Instant,
+    completed: Option<GitPlaneStepV1>,
+    table_bound: u64,
+) -> Result<ActiveFramePlanV1, GitBootstrapFailureV1> {
+    prevalidate_frames(verified, frame_budget, deadline, table_bound).map_err(|cause| {
+        GitBootstrapFailureV1 {
+            cause,
+            last_completed: completed,
+            active_materialization_began: false,
+            ledger_used: verified.destination.ledger.borrow().used(),
+        }
+    })
+}
+
+fn prevalidate_frames(
+    verified: &mut VerifiedCapsuleV1,
+    frame_budget: CustodyFrameBudgetV1,
+    deadline: Instant,
+    table_bound: u64,
+) -> Result<ActiveFramePlanV1, GitBootstrapErrorV1> {
+    observe_deadline(deadline, "frames-entry")?;
+    let active = classify_active_frames(verified)?;
+    if !active
+        .iter()
+        .any(|frame| frame.class == CustodyCoverageClassV1::RefsAndHead)
+    {
+        return Err(GitBootstrapErrorV1::EmptyRefsAndHead);
+    }
+    let generation = verified.control.manifest.generation_id().to_owned();
+    let mut table = ActivePathTableV1::new(table_bound);
+    let mut frames = Vec::with_capacity(active.len());
+    for frame in &active {
+        let one = verified.staged.get_mut(frame.staged).ok_or_else(|| {
+            GitBootstrapErrorV1::Restore(CustodyRestoreErrorV1::Io(
+                "an active frame names no staged payload".into(),
+            ))
+        })?;
+        frames.push(prevalidate_frame(
+            one,
+            frame,
+            &generation,
+            frame_budget,
+            deadline,
+            &mut table,
+        )?);
+    }
+    table
+        .finish()
+        .map_err(|fault| GitBootstrapErrorV1::ActiveFrame {
+            class: CustodyCoverageClassV1::RefsAndHead,
+            fault,
+        })?;
+    // The last statement ahead of the infallible result.
+    observe_deadline(deadline, "frames-final")?;
+    Ok(ActiveFramePlanV1 { frames })
 }
