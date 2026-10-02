@@ -109,13 +109,17 @@
     binds sole-success deadline closure and every earlier contract. Exact five reviewed paths adopted
     onto the controller branch; original Rejected checkpoint remains unchanged.
     Frozen sourcec2fc2f2f preserved. No deadline exception. All original cap records,
-    rejected source/checkpoints/evidence remain; no restart or remaining implementation dispatch yet.
+    rejected source/checkpoints/evidence remain; no restart.
     Git bootstrap is locally adopted at2d8a8fb4 with independent source approval.
     [Remaining spec1/2](superpowers/reviews/2026-10-02-adr0041-slice2b3b-remaining-spec-round1.md)
     is REJECT1WRONG/2SMELL/1blocker, CLOSED POPULATION. Owner refinement and five task drafts
     received [final spec2/2 approval](superpowers/reviews/2026-10-02-adr0041-slice2b3b-remaining-spec-round2.md),
     WRONG0/SMELL0/blockers0, NO FINDINGS, at4083da5e. Original two-pass drafts remain historical, not dispatchable.
-    Serial B1a/B1b/B2a/B2b/B2c,
+    B1a dispatched through `implement --lang rust` from clean53373e68 into
+    `impl-94034-sqrswpnj`, tool session63748, declared source cap2. Actual provider transcript
+    confirms `claude-sonnet-5-5`; Rust warm dependencies complete, initial source reading underway.
+    TaskSHA99edc69b binds all112 inherited Git tests; no B1a gate/source approval yet.
+    Serial B1b/B2a/B2b/B2c,
     native-ext4 CI, macOS verification and combined review remain outstanding.
     The controller handoff records approved A and the bound serial tasks.
   **2B2b is complete:** all its children are merged. The parent Slice 2B completion gate (plan §8) still requires 2B3,
