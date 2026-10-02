@@ -159,8 +159,19 @@
     owner isolated-lane authorization;27/27doctor green, free33.77GiB. Untouchedbase198 control
     passed198/0/0 with exact192Git+6seal names/source hashes and actual normal core rebuild. Raw
     baseline second copies retained. Structural RED and first23/3/0 behavioral run preserved; broader
-    focused run active, no final GREEN/approval. Two-revision provider-free mirror83952 started before
-    final bridge verification, actual B1b12bundle control passed. B2b/B2c/native/combined remain pending.
+    focused run passed228/0/0 (222Git+6seal), retaining all198 baseline names; matching before/after
+    source hashes, core cached. Rejected candidate58e165a7 retains final228/0/0 and a restored
+    90variant+2control matrix:82 behavioral flips,2 structural-only sync flips,6 disclosed non-flips;
+    raw population and all90 mutated digests independently checked against immutable candidate bytes.
+    Six bridge gates pass; alltargets5090/0/13,90groups/core rebuilt; default5101/0/13,
+    106groups/16docgroups/core cached. Solsource1/2REJECT2WRONG1SMELL2block CLOSED:
+    partial write underreports progress; slow nonfinal gate/read/sync permits post-deadline effects.
+    Sonnet repairs the same artifact within declaredcap2. Raw source review is retained in
+    `2026-10-02-adr0041-slice2b3b-b2a-source-round1.md`; no B2a adoption/approval.
+    Later source snapshot caught intentional E03 mutation; retained as a variant, not frozen GREEN bytes.
+    First provider-free mirror83952 expired before any gate completed; Sol saw bridgePASS but no
+    detailed host receipts. Continuation mirror22710 copied all six exact58e165a7 bundles, now audited
+    after review, and awaits repair receipts. No provider replay. B2b/B2c/native/combined remain pending.
     The controller handoff records approved A and the bound serial tasks.
   **2B2b is complete:** all its children are merged. The parent Slice 2B completion gate (plan §8) still requires 2B3,
   the aggregate fixture without the source or its alternates, and one bounded review of the combined diff.
