@@ -141,7 +141,13 @@
     poisoning mechanism, not behavioral RED. Trailing CAP/memory metadata caused automatic Inconclusive;
     original LoopStopped checkpoint remains unchanged. Exact reviewed files were operator-adopted
     at d49a30af after predecessor-file equality proofs; no forced merge, forged approval or review replay.
-    B1b is next, with source cap2 and exact approved predecessor binding.
+    B1b dispatched through `implement --lang rust` from cleanff0d873c, taskb432db9f, private config711f0d58,
+    sourcecap2/floor50, into impl-45181-n4rk5zrn (session7746). Actual provider is claude-sonnet-5-5.
+    Same-environment untouched-base control147/0/0 preserves143Git+4seal names/core recompile. Trial133
+    raw receipts have second copies; final matrix is active after targeted same-artifact corrections.
+    Six bridge gates retain full logs/source identity in private cache custody; no duplicate worker full
+    suites. Initial handoff stays provisional until bridge full suites and source review complete.
+    Final-byte source/gates/Sol approval and B1b adoption remain pending.
     Serial B1b/B2a/B2b/B2c,
     native-ext4 CI, macOS verification and combined review remain outstanding.
     The controller handoff records approved A and the bound serial tasks.
