@@ -124,8 +124,13 @@
     zero tests). Corrected M03/M04/M05 each recompiled and selected31 tests with exactly two expected
     failures; the restored unmodified control recompiled and passed31/0/0. Controller independently
     parsed all named raw receipts and saved second copies. Thus49 of51 usable variants triggered their
-    predictions; the two misses still require classification. Sonnet is now running a new matrix epoch
-    against the143-test source. No live-source binding is claimed during deliberate variants.
+    predictions. The next58-entry epoch (56variants/two controls) produced54predicted flips and two misses,
+    M19/M38c; those raw receipts remain preserved. Sonnet strengthened the digest length-prefix test,
+    retaining production D5 unchanged. Final test source E5 passed fresh143/0/0 with112 inherited names,
+    observed compilation, fmt and bridge-core clippy. Its final58-entry matrix completed55predicted flips
+    of56variants, with only M19 still needing qualification; M27/M38c now flip. Both unmodified controls
+    recompiled and passed34/0/0. Controller independently checked all58 raw receipts; source hashes
+    before==after==live D5/E5 at the completed-matrix observation. No blanket all-variants-flip claim.
     TaskSHA99edc69b binds inherited tests; full workspace gates and B1a source approval still pending.
     Serial B1b/B2a/B2b/B2c,
     native-ext4 CI, macOS verification and combined review remain outstanding.
