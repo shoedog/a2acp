@@ -179,8 +179,9 @@
     controls40/0/0; all15mutateddigests/five-source restoration independentlychecked.
     Finalfocused238/0/0/corecompiled retainsall198baseline and232predecessor names;
     five-source hashes match before/after/live/matrixlaunch. ControllerLinux6gates session43190
-    active on88acb02e: fmt/workspaceclippyalltargetsallfeatures/buildPASS; bothfullsuites/hygiene
-    and independentSolsource3/3 stillpending. No B2aadoption. Transientlowspace
+    complete on88acb02e: alltargets5100/0/13/core rebuilt; default5111/0/13/16docgroups/core cached;
+    fmt/workspaceclippyalltargetsallfeatures/build/hygienePASS, independently audited. Verifier absent.
+    Independent hard-read-only Solsource3/3 active/session85270; actual verdict pending. No B2aadoption. Transientlowspace
     recovered externally to84.8GiB beforedispatch; auditonly/no additionaldeletion. Finalfocused232/0/0 retains198inheritednames; matching
     launch/before/after source c860bb3b/32ab0f8c, core cached. Final101variant+2control matrix:
     94behavioral flips,2structural-onlyOSsync flips,5disclosednonflips; no missedpredictions/invalidruns.
