@@ -1,12 +1,14 @@
 # Handoff — ADR-0041 2B3b B2b approved and adopted; B2c active
 
-**Written:** 2026-10-03T19:17:02.730682+00:00 · **By:** Codex controller · **Provider:** codex
+**Written:** 2026-10-03T19:39:00.283963+00:00 · **By:** Codex controller · **Provider:** codex
 **Workspace:** /Users/wesleyjinks/code/a2a-bridge · work/adr0041-2b3b-bootstrap-20261001 · **Measured state:** `[MEASURED]` approved A/B1a/B1b/B2a/B2b runtime adopted through18ff5beac8d6435966810baf7d04e5715a662714; B2c4136310d isolated and verifying, not adopted. Probe git status/log and scratch receipt audits.
 **Predecessor:** B2b Sonnet5.5 run2436 complete; clean0dadd17e automatic Approved; actual Sol2/2 APPROVE0W2S0block.
 **Truth ordering:** measured live state > explicit owner/contract authority within its scope > this handoff for current operational state > earlier handoffs and non-authoritative summaries. A conflict between tiers stays OPEN in §0 — never resolved by document class alone.
 **Provenance:** folded by controller from measured Git/checkpoint/raw logs and actual source finals. Prior merged A/ACP/cleanup history is `[INHERITED]` from preceding committed handoffs; not rerun here. No memory write authorized.
 
 ## 0. Gating facts — settle these before starting anything below
+
+**Reconstructed repair RED:** `[MEASURED]` Independent read-only audit retained 29PASS/6FAIL/0ignored, real core compilation and exact scratch tests SHA cb5ccf50. Immutable rejected413 production plus test hooks only (seam-only SHA9a340823), full delta independently read; five behavioral failed functions cover all3WRONGs and2SMELLs, one structural guard-order failure. Twelve-file hashed second custody: scratch/b2c-repair-red-completed-custody/. This is reconstructed RED, not literal tests-FIRST; later-added rows need their own binding. Sonnet now extends directory-effect coverage and bounded failure reconciliation, freezes spec3 before new matrix; original caps/source rejection retained.
 
 **Current repair chronology:** `[MEASURED]` SameSonnet5.5 repair ACTIVE on6053. Production edits preceded new regression construction; record in scratch/b2c-repair-tests-first-sequence-deviation.json and twofile transcriptcustody/b2c-repair-chronology-custody/. Do not claim literal tests-FIRST repair. New regressions must fail against immutable rejected413 or explicitly seam-only413 with full saved source/raw; reconstructed RED is distinct from launch chronology. Existing33 filteredtrial firstreported2guard-position failures; duplicatedfinal-entry label corrected,2sequence rows reportedPASS. New regression/final-byte focused+matrix+sixgates/source2/2 remain pending; original source1 rejection/cap retained.
 
