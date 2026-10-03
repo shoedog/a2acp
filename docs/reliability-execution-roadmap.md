@@ -193,7 +193,9 @@
     Reviewer receipt SMELL now reconciled; production-first process SMELL disclosed, enforce testsFIRST B2c.
     SameSonnet5.5/Solxhigh/config7774d187/private20GiB; B2c dispatched fromdc0b45ba
     intoimpl-70428-q52t65ks/session6053, warmdepscomplete, capTWO. Doctor27/27OK/free169.37GiB;
-    explicit untouched287 control/tests-only RED before production edits. Provider-free receipt observer22954
+    explicit untouched287 control/tests-only RED before production edits: control287/0/0/corecompiled,
+    all names independently matched and clone remained clean/five immutable-base hashes at15:15UTC,
+    source/raw/transcript secondcustody retained; tests-only RED stillpending. Provider-free receipt observer22954
     bounded24h/cacheRO/networknone copies completed gate logs as they appear; no duplicate suites.
     Native and whole-G gates remain pending. Transientlowspace
     recovered externally to84.8GiB beforedispatch; auditonly/no additionaldeletion. Finalfocused232/0/0 retains198inheritednames; matching
