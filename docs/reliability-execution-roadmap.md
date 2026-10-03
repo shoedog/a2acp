@@ -197,8 +197,11 @@
     all names independently matched and clone remained clean/five immutable-base hashes at15:15UTC,
     source/raw/transcript secondcustody retained. TestsFIRST corrected structuralRED54errors on
     unchangedproductionf0d8e9f8/testfd1ffb81 retained; initial draft duplicate-helper corrected, initialraw
-    overwritten but transcriptchronology preserved. Production added AFTER correctedRED; test build active,
-    no behavioralGREEN yet. Provider-free receipt observer22954
+    overwritten but transcriptchronology preserved. Production added AFTER correctedRED. Initialfiltered
+    25test trial19/6 and subsequenttestfixture/scan corrections retained with evidence limits; current111variant
+    trial matrix active in three scratch copies, first controls33/0/0 reported. No fullfocused/finalgates/approval.
+    Firstsetup rsync absence invalid beforemutations; corrected driver/spec/frozen source secondcopies retained.
+    Provider-free receipt observer22954
     bounded24h/cacheRO/networknone copies completed gate logs as they appear; no duplicate suites.
     Native and whole-G gates remain pending. Transientlowspace
     recovered externally to84.8GiB beforedispatch; auditonly/no additionaldeletion. Finalfocused232/0/0 retains198inheritednames; matching
