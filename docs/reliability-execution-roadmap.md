@@ -220,8 +220,11 @@
     audited againstimmutable4136310d: fmt/workspaceclippyalltargetsallfeatures/build/hygienePASS;
     alltargets5182/0/13/90groups/corecompiled, default5193/0/13/106groups/16docs/corecached.
     Both suites retain314Git tests; full raw/commands/source-before-after/manifest hashes checked.
-    ActualSolsource1/2ACTIVE, gpt-5.6-sol/xhigh/read-only/session01a1031c-fd16-7a10-a44b-e5f883ff26ca;
-    ninefile dispatch custody retained. No verdict/adoption/native/whole-G claim.
+    ActualSolsource1/2REJECT3WRONG2SMELL3blockers/CLOSED, gpt-5.6-sol/xhigh/read-only/
+    session01a1031c-fd16-7a10-a44b-e5f883ff26ca; raw2c706157 retained. Bounded defects: directory
+    non-atime metadata omitted fromzero-effect facts; expired failure digest misses same-length byteeffects;
+    pre-operation-only deadline guards permit continuationI/O after slowreturns. Same-artifact Sonnetrepair
+    andsource2/2 next; no reset/restart/adoption/native/whole-G claim. Tenfile rejected-source custody retained.
     Worker "132single-statement" wording overstates granularity; actual definitions include coupled
     pairs/whole-step slices/test-only log hooks. Preserve exact variants, not132single-production-guard claim.
     Earlier pre-checks used filtered output; complete final six-gate raw receipts now retained/audited.
