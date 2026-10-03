@@ -228,7 +228,10 @@
     SameSonnet5.5 repair ACTIVE. Production edits preceded new regression construction; actual chronology
     retained, no tests-FIRST repair claim. Require source-bound rejected413/seam-only413 behavioralRED,
     keep reconstruction distinct. Initial existing33 trial had2guard-position failures; duplicate newlabel
-    fixed and2sequence rows reportedPASS. Newregressions/final-byte matrix/focused/fullgates pending.
+    fixed and2sequence rows reportedPASS. Reconstructed seam-only413 RED29/6 compiled/fullraw audited;
+    expanded36-test RED29/7 supplied summary has overlapping log writers/interleaved rows, not fullproof.
+    Repair spec3 frozen190variants; first19+3controls independently audited, no misses/invalid runs.
+    Final-byte matrix/focused/fullgates/source2 pending.
     Worker "132single-statement" wording overstates granularity; actual definitions include coupled
     pairs/whole-step slices/test-only log hooks. Preserve exact variants, not132single-production-guard claim.
     Earlier pre-checks used filtered output; complete final six-gate raw receipts now retained/audited.
