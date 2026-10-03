@@ -216,13 +216,15 @@
     five-source before/after/launch/live match; other3runtime files matchimmutablebase. Elevenfile custody retained.
     Sonnet argues Q01redundant with the next effect-preceding deadline guard; Sol must verify that claim.
     First candidate4136310d committed clean atopdc0b45ba; exactly Git source/tests+handoff changed.
-    Complete319file source/worker/transcript custody retained. Automatic six gates ACTIVE: fmt,
-    workspaceclippyalltargetsallfeatures andbuild reportedPASS/mirrored. Alltargets complete5182/0/13,
-    90groups/corecompiled; raw475664bytes/ae9c900e counted independently. Default/doctestsACTIVE;
-    finalhygiene/Sol1/2 pending. Mirrored wrapper records unchangedsource; fullsix immutable auditpending.
+    Complete319file source/worker/transcript custody retained. Allsix gates COMPLETE and independently
+    audited againstimmutable4136310d: fmt/workspaceclippyalltargetsallfeatures/build/hygienePASS;
+    alltargets5182/0/13/90groups/corecompiled, default5193/0/13/106groups/16docs/corecached.
+    Both suites retain314Git tests; full raw/commands/source-before-after/manifest hashes checked.
+    ActualSolsource1/2ACTIVE, gpt-5.6-sol/xhigh/read-only/session01a1031c-fd16-7a10-a44b-e5f883ff26ca;
+    ninefile dispatch custody retained. No verdict/adoption/native/whole-G claim.
     Worker "132single-statement" wording overstates granularity; actual definitions include coupled
     pairs/whole-step slices/test-only log hooks. Preserve exact variants, not132single-production-guard claim.
-    Pre-check fmt/clippy/B2c pass reported with filtered output; final full raw six gates still pending.
+    Earlier pre-checks used filtered output; complete final six-gate raw receipts now retained/audited.
     Provider-free receipt observer22954
     bounded24h/cacheRO/networknone copies completed gate logs as they appear; no duplicate suites.
     Native and whole-G gates remain pending. Transientlowspace
