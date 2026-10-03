@@ -195,7 +195,10 @@
     intoimpl-70428-q52t65ks/session6053, warmdepscomplete, capTWO. Doctor27/27OK/free169.37GiB;
     explicit untouched287 control/tests-only RED before production edits: control287/0/0/corecompiled,
     all names independently matched and clone remained clean/five immutable-base hashes at15:15UTC,
-    source/raw/transcript secondcustody retained; tests-only RED stillpending. Provider-free receipt observer22954
+    source/raw/transcript secondcustody retained. TestsFIRST corrected structuralRED54errors on
+    unchangedproductionf0d8e9f8/testfd1ffb81 retained; initial draft duplicate-helper corrected, initialraw
+    overwritten but transcriptchronology preserved. Production added AFTER correctedRED; test build active,
+    no behavioralGREEN yet. Provider-free receipt observer22954
     bounded24h/cacheRO/networknone copies completed gate logs as they appear; no duplicate suites.
     Native and whole-G gates remain pending. Transientlowspace
     recovered externally to84.8GiB beforedispatch; auditonly/no additionaldeletion. Finalfocused232/0/0 retains198inheritednames; matching
