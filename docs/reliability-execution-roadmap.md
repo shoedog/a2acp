@@ -199,12 +199,13 @@
     unchangedproductionf0d8e9f8/testfd1ffb81 retained; initial draft duplicate-helper corrected, initialraw
     overwritten but transcriptchronology preserved. Production added AFTER correctedRED. Initialfiltered
     25test trial19/6 and subsequenttestfixture/scan corrections retained with evidence limits; current111variant
-    trial matrix active in three scratch copies, first controls33/0/0 reported. No fullfocused/finalgates/approval.
+    trial matrix complete111variants+6controls, eachcontrol33/0/0. No fullfocused/finalgates/approval.
     Firstsetup rsync absence invalid beforemutations; corrected driver/spec/frozen source secondcopies retained.
-    Partial controller audit retained45/111mutants and3controls: no compile/time/population invalidity,
-    missed predictions and two structural-only flips preserved. Four rows contain captured failing child
-    test output; auditor separates primary33-test outcomes from embedded child outcomes and retains
-    the driver's mixed fields. No implementation defect or complete-matrix claim follows from this audit.
+    Complete controller audit:97behavioral-failure variants,3structural-only,11nonflips,
+    25missed-prediction variants, no compile/time/population invalidity. All111mutated source digests
+    independently reconstructed. Nine rows contain captured failing child test output; auditor separates
+    primary33-test outcomes from embedded child outcomes and preserves the driver's mixed fields.
+    Full131file secondcustody retained; classification and final-byte gates remain pending.
     Provider-free receipt observer22954
     bounded24h/cacheRO/networknone copies completed gate logs as they appear; no duplicate suites.
     Native and whole-G gates remain pending. Transientlowspace
