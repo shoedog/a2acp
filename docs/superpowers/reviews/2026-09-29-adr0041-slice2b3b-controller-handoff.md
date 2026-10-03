@@ -1,12 +1,14 @@
 # Handoff — ADR-0041 2B3b B2b approved and adopted; B2c active
 
-**Written:** 2026-10-03T13:39:12.049141+00:00 · **By:** Codex controller · **Provider:** codex
-**Workspace:** /Users/wesleyjinks/code/a2a-bridge · work/adr0041-2b3b-bootstrap-20261001 · **Measured state:** `[MEASURED]` approved A/B1a/B1b/B2a/B2b runtime adopted through18ff5beac8d6435966810baf7d04e5715a662714; docs reconciliation to commit separately. Probe git status/log and scratch receipt audits.
+**Written:** 2026-10-03T18:13:20.116520+00:00 · **By:** Codex controller · **Provider:** codex
+**Workspace:** /Users/wesleyjinks/code/a2a-bridge · work/adr0041-2b3b-bootstrap-20261001 · **Measured state:** `[MEASURED]` approved A/B1a/B1b/B2a/B2b runtime adopted through18ff5beac8d6435966810baf7d04e5715a662714; B2c4136310d isolated and verifying, not adopted. Probe git status/log and scratch receipt audits.
 **Predecessor:** B2b Sonnet5.5 run2436 complete; clean0dadd17e automatic Approved; actual Sol2/2 APPROVE0W2S0block.
 **Truth ordering:** measured live state > explicit owner/contract authority within its scope > this handoff for current operational state > earlier handoffs and non-authoritative summaries. A conflict between tiers stays OPEN in §0 — never resolved by document class alone.
 **Provenance:** folded by controller from measured Git/checkpoint/raw logs and actual source finals. Prior merged A/ACP/cleanup history is `[INHERITED]` from preceding committed handoffs; not rerun here. No memory write authorized.
 
 ## 0. Gating facts — settle these before starting anything below
+
+**Current orchestration:** `[MEASURED]` Sonnet5.5 implementation turn completed; first candidate4136310dcb1b373240b4f2d3609b27dfda417aa2 clean atopdc0b45ba, exactly Git source/tests+implementationhandoff changed. Complete319file source/worker/transcript custody: scratch/b2c-first-candidate-custody/. Bridge6053 ACTIVE on six final-byte gates; fmt/workspaceclippyalltargetsallfeatures/build reportedPASS and mirrored by22954, bothworkspace suites andSol1/2 pending. Native host Git2.54.0 verified, native gates not executed. Worker "132single-statement" wording is overbroad: definitions include tightly coupled pairs/whole-step slices/test-only log hooks; retain actual granularity, not132single-production-guard claim. Root contains only approved predecessors. Earlier stage snapshots below are historical.
 
 **Latest focused result:** `[MEASURED]` COMPLETE320/0/0/corecompiled1; all287inherited+33new names independently audited. Five-source before/after/launch/live hashes agree, unchanged Restore/Export/Seal matchimmutablebase. Elevenfile custody: scratch/b2c-final-focused-completed-custody/. Sonnet's Q01redundancy argument is retained in its handoff and remains for independent Sol verification. Pre-check fmt/clippy/hygiene passed; automatic full six final-byte gates/source review remain pending. Approved spec already determines Empty refusal before repository (bootstrap permitted), final inventory/reachability/fsck, completed Config until FinalGate success, and primary+reconciliation preservation; the handoff's optional questions do not require new owner permission.
 
@@ -65,7 +67,7 @@
 | # | Work | State | Exact next action | Blocked by | Identifiers |
 |---:|---|---|---|---|---|
 |1|B2a|approved,adopted|retain actual review and all source-bound receipts|none|88acb02e→c8eb2910; originalcap2/disclosed3/3|
-|2|B2c|pending|bind clean approvedB2b predecessor, preflight, testsFIRST|none|0dadd17e→18ff5bea; taskbf7a0bee|
+|2|B2c|verifying|finish/audit six gates, inspectactualSolsource1/2|fullgatecompletion|4136310d;6053/22954; capTWO|
 |3|Native/combined|pending|Mac+ext4provenCI/fullbase251..finalreview|completeG|preparedhostscript/CIplan/combinedconfig|
 |4|Publication/landing|pending|PR/exactCI/merge|allgates|originalauthority|
 
