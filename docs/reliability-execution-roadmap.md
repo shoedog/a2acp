@@ -235,6 +235,8 @@
     Six predictionmisses C06/C07/M19SCAN,Q01/Q23/Q24HALT retained; D04/S03unexpectedflips.
     Sonnet strengthens captured-onlyHALT/scan tests; spec4explicitreasons before newmutants.
     Earliertrialnottransferred; oldepochcontrollerwatcher retired, provider/reviewcap2unchanged.
+    Spec4matrix ACTIVE190variants; frozenGit0224d33a/tests95481b09/spec4bb20fb16/driver187860f4
+    independently bound; first3controls36/0/0. Newepoch explicitreasons, oldtrial retained.
     Final-byte matrix/focused/fullgates/source2 pending.
     Worker "132single-statement" wording overstates granularity; actual definitions include coupled
     pairs/whole-step slices/test-only log hooks. Preserve exact variants, not132single-production-guard claim.
