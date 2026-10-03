@@ -52,6 +52,10 @@ pub struct ServerConfig {
     pub addr: String,
     #[serde(default = "default_warm_idle_ttl_secs")]
     pub warm_idle_ttl_secs: u64,
+    /// Retire an agent's shared adapter process (and every agent-side session/MCP child it holds)
+    /// once no registry lease has used it for this long; the next request respawns it. 0 = never.
+    #[serde(default = "default_adapter_idle_ttl_secs")]
+    pub adapter_idle_ttl_secs: u64,
     /// Advisory pre-task warn when carried context usage >= this window fraction in (0,1]. None = off. [Slice 2]
     #[serde(default)]
     pub warm_usage_warn_fraction: Option<f64>,
@@ -377,6 +381,10 @@ fn default_addr() -> String {
 
 fn default_warm_idle_ttl_secs() -> u64 {
     1800
+}
+
+fn default_adapter_idle_ttl_secs() -> u64 {
+    300
 }
 
 fn default_timeout_secs() -> u64 {
@@ -5192,16 +5200,22 @@ addr = "127.0.0.1:8080"
 "#;
         let cfg: RegistryConfig = RegistryConfig::parse(base).unwrap();
         assert_eq!(cfg.server.warm_idle_ttl_secs, 1800);
+        assert_eq!(cfg.server.adapter_idle_ttl_secs, 300);
         assert_eq!(cfg.server.warm_usage_warn_fraction, None);
         assert_eq!(cfg.server.compact_summarize_timeout_secs, None);
 
         let cfg2: RegistryConfig = RegistryConfig::parse(&format!(
-            "{base}warm_idle_ttl_secs = 5\nwarm_usage_warn_fraction = 0.8\ncompact_summarize_timeout_secs = 7\n"
+            "{base}warm_idle_ttl_secs = 5\nadapter_idle_ttl_secs = 0\nwarm_usage_warn_fraction = 0.8\ncompact_summarize_timeout_secs = 7\n"
         ))
         .unwrap();
         assert_eq!(cfg2.server.warm_idle_ttl_secs, 5);
+        assert_eq!(cfg2.server.adapter_idle_ttl_secs, 0);
         assert_eq!(cfg2.server.warm_usage_warn_fraction, Some(0.8));
         assert_eq!(cfg2.server.compact_summarize_timeout_secs, Some(7));
+
+        let cfg3: RegistryConfig =
+            RegistryConfig::parse(&format!("{base}adapter_idle_ttl_secs = 45\n")).unwrap();
+        assert_eq!(cfg3.server.adapter_idle_ttl_secs, 45);
     }
 
     #[test]

@@ -536,6 +536,8 @@ async fn resolve_configure_bind(
         if let Some(binding) = bindings.get(&routed.task) {
             let backend = binding.backend.clone();
             let eff = binding.eff.clone();
+            // Co-hold the lease: the first producer may evict the binding while we still drive it.
+            let lease = binding.lease.clone();
             drop(bindings);
             backend
                 .configure_session(
@@ -553,6 +555,7 @@ async fn resolve_configure_bind(
                 injects: Vec::new(),
                 turn_meta: None,
                 guard: None,
+                lease: Some(lease),
                 warm_guard: None,
                 // Cold-bind: no warm handle to race a force-reset → a fresh, never-cancelled token.
                 abort: tokio_util::sync::CancellationToken::new(),
@@ -583,12 +586,13 @@ async fn resolve_configure_bind(
         )
         .await?;
     let backend = resolved.backend.clone();
+    let lease: Arc<dyn Lease> = Arc::from(resolved.lease);
     srv.bindings().lock().await.insert(
         routed.task.clone(),
         TaskBinding {
             backend: backend.clone(),
             eff,
-            lease: resolved.lease,
+            lease: lease.clone(),
         },
     );
     let guard = BindingGuard {
@@ -604,6 +608,7 @@ async fn resolve_configure_bind(
         injects: Vec::new(),
         turn_meta: None,
         guard: Some(guard),
+        lease: Some(lease),
         warm_guard: None,
         obs_ctx: obs_ctx_for_dispatch(
             routed,
@@ -770,6 +775,7 @@ where
                     prefix_attestation_request: prefix_attestation_request.clone(),
                 }),
                 guard: None,
+                lease: None,
                 warm_guard: Some(warm_guard),
                 // Warm: the handle's per-turn abort token — a force-reset cancels it (cancel-tokens F2).
                 abort: turn.abort,
@@ -953,17 +959,23 @@ async fn resolve_for_fanout(
 /// // specific instance that drove each source (e.g. via the held backend from
 /// // `resolve_for_fanout`, or a per-source binding), NOT the registry default —
 /// // otherwise it cancels the wrong backend for any non-default fan-out leg.
+///
+/// Returns the backend WITH a registry lease the caller must hold until its `cancel` completes:
+/// the binding's lease (co-held, so a concurrent producer-exit eviction cannot drop the last
+/// one) or the fallback resolution's own lease. Without it the slot could reach zero leases —
+/// and be idle-retired — while the cancel is still driving the backend.
 async fn cancel_backend_for(
     srv: &InboundServer,
     task: &TaskId,
-) -> Result<Arc<dyn AgentBackend>, BridgeError> {
+) -> Result<(Arc<dyn AgentBackend>, Arc<dyn Lease>), BridgeError> {
     if let Some(binding) = srv.bindings().lock().await.get(task) {
-        return Ok(binding.backend.clone());
+        return Ok((binding.backend.clone(), binding.lease.clone()));
     }
     // Fallback: no binding exists — resolve the registry default agent.
     // See function doc for the two legitimate no-binding cases this covers.
     let default = srv.registry().default_id();
-    Ok(srv.registry().resolve(&default).await?.backend)
+    let resolved = srv.registry().resolve(&default).await?;
+    Ok((resolved.backend, Arc::from(resolved.lease)))
 }
 
 // ---- axum handlers ----
@@ -2647,6 +2659,7 @@ fn spawn_local_producer(
     );
     // Moved into the task: its Drop evicts the binding/lease/stash on ANY exit.
     let guard = dispatch.guard;
+    let lease = dispatch.lease;
     let warm = dispatch.warm_guard;
     let obs_ctx = dispatch.obs_ctx.clone();
     // cancel-tokens F2: the per-turn abort token (a force-reset cancels it).
@@ -2655,6 +2668,8 @@ fn spawn_local_producer(
     tokio::spawn(async move {
         // Hold the guard for the whole producer; dropped on every return path below.
         let _guard = guard;
+        // Keep the bound backend leased for this turn even if another producer evicts the binding.
+        let _lease = lease;
         let mut warm = warm;
         let started = std::time::Instant::now();
         let mut ttft = None;
@@ -3841,6 +3856,7 @@ async fn unary_message(
             // Held until this arm returns; its Drop evicts the binding/lease/stash
             // after the synchronous collect completes.
             let _guard = dispatch.guard;
+            let _lease = dispatch.lease;
             let mut warm = dispatch.warm_guard;
             let turn_meta = dispatch.turn_meta.clone();
             if let Some(meta) = turn_meta.clone() {
@@ -4594,7 +4610,7 @@ async fn cancel_task(
             // Prefer the task's bound instance; fall back to the default agent if no
             // binding exists yet (binding-or-fallback; T11 makes this binding-only).
             match cancel_backend_for(&srv, &task).await {
-                Ok(backend) => {
+                Ok((backend, _lease)) => {
                     if let Err(e) = backend.cancel(&session).await {
                         first_err.get_or_insert(e);
                     }
@@ -4639,8 +4655,9 @@ async fn cancel_task(
                     _ => SessionId::parse(format!("session-{}", task.as_str()))
                         .unwrap_or_else(|_| SessionId::parse("session-default").unwrap()),
                 };
-                let backend = match cancel_backend_for(&srv, &task).await {
-                    Ok(b) => b,
+                // `_lease` keeps the backend leased until its cancel completes.
+                let (backend, _lease) = match cancel_backend_for(&srv, &task).await {
+                    Ok(target) => target,
                     Err(e) => return bridge_err_to_jsonrpc(id, &e),
                 };
                 if let Err(e) = backend.cancel(&session).await {
@@ -13049,6 +13066,7 @@ mod tests {
             injects: Vec::new(),
             turn_meta: None,
             guard: None,
+            lease: None,
             warm_guard: None,
             obs_ctx: bridge_core::ports::TurnContext {
                 turn_id: bridge_core::ids::TurnId::parse("turn-ready-usage-disconnect").unwrap(),
@@ -13188,6 +13206,7 @@ mod tests {
             injects: Vec::new(),
             turn_meta: None,
             guard: None,
+            lease: None,
             warm_guard: None,
             obs_ctx: bridge_core::ports::TurnContext {
                 turn_id: bridge_core::ids::TurnId::parse("turn-pre-cancel").unwrap(),
@@ -13251,6 +13270,7 @@ mod tests {
             injects: Vec::new(),
             turn_meta: None,
             guard: None,
+            lease: None,
             warm_guard: None,
             obs_ctx: bridge_core::ports::TurnContext {
                 turn_id: bridge_core::ids::TurnId::parse("turn-streaming-disconnect").unwrap(),
@@ -13342,6 +13362,7 @@ mod tests {
             injects: Vec::new(),
             turn_meta: None,
             guard: None,
+            lease: None,
             warm_guard: None,
             obs_ctx: bridge_core::ports::TurnContext {
                 turn_id: bridge_core::ids::TurnId::parse("turn-streaming-no-usage-disconnect")
@@ -13476,6 +13497,7 @@ mod tests {
             injects: Vec::new(),
             turn_meta: None,
             guard: None,
+            lease: None,
             warm_guard: None,
             obs_ctx,
             abort,
@@ -15317,6 +15339,204 @@ mod tests {
             0,
             "the RAII guard must release the lease on early disconnect"
         );
+    }
+
+    // ---- Idle adapter retirement: served operations keep their backend leased ----
+    //
+    // The REAL registry with `[server] adapter_idle_ttl_secs` on retires a backend once its slot
+    // has had zero leases for the TTL, so every served use of a backend must co-hold a lease.
+    // Paused clock: each `sleep` lets the idle watcher run to (or past) its deadline.
+
+    const ADAPTER_IDLE_TTL: std::time::Duration = std::time::Duration::from_millis(50);
+
+    /// Prompt emits one frame then idles (keeping its producer alive); `cancel` announces itself on
+    /// `cancel_entered` and parks until `cancel_gate`; `retire()` calls are counted.
+    #[derive(Default)]
+    struct GatedCancelBackend {
+        prompts: AtomicUsize,
+        cancel_entered: tokio::sync::Notify,
+        cancel_gate: tokio::sync::Notify,
+        retired: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl AgentBackend for GatedCancelBackend {
+        async fn prompt(
+            &self,
+            _s: &SessionId,
+            _p: Vec<Part>,
+        ) -> Result<BackendStream, BridgeError> {
+            self.prompts.fetch_add(1, Ordering::SeqCst);
+            Ok(Box::pin(async_stream::stream! {
+                yield Ok(Update::Text("busy".into()));
+                futures::future::pending::<()>().await;
+            }))
+        }
+        async fn cancel(&self, _s: &SessionId) -> Result<(), BridgeError> {
+            self.cancel_entered.notify_one();
+            self.cancel_gate.notified().await;
+            Ok(())
+        }
+        fn resource_flight_v1(&self) -> Result<BackendResourceFlightV1, BridgeError> {
+            Ok(BackendResourceFlightV1::LegacyV2)
+        }
+        async fn retire(&self) -> Result<(), BridgeError> {
+            self.retired.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    fn idle_retiring_server(backend: Arc<GatedCancelBackend>) -> Arc<InboundServer> {
+        let snapshot = RegistrySnapshot {
+            default: AgentId::parse("a").unwrap(),
+            entries: vec![bare_entry("a")],
+            allowed_cmds: vec!["fake".into()],
+        };
+        let spawn: bridge_registry::registry::SpawnFn = Arc::new(move |_entry| {
+            let backend = backend.clone();
+            Box::pin(async move { Ok(backend as Arc<dyn AgentBackend>) })
+        });
+        let registry = bridge_registry::registry::Registry::new(snapshot, spawn)
+            .unwrap()
+            .with_idle_ttl(ADAPTER_IDLE_TTL);
+        build_registry_store(Arc::new(registry), Arc::new(FakeStore::default()), "a")
+    }
+
+    async fn await_binding(srv: &InboundServer, task: &str, present: bool) {
+        let task = TaskId::parse(task).unwrap();
+        for _ in 0..200 {
+            if srv.bindings().lock().await.contains_key(&task) == present {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        panic!(
+            "binding for {} never became present={present}",
+            task.as_str()
+        );
+    }
+
+    async fn await_prompts(backend: &GatedCancelBackend, want: usize) {
+        for _ in 0..200 {
+            if backend.prompts.load(Ordering::SeqCst) >= want {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        panic!("backend never reached {want} prompts");
+    }
+
+    fn spawn_cancel(
+        srv: &Arc<InboundServer>,
+        task: &str,
+    ) -> tokio::task::JoinHandle<Result<Response, std::convert::Infallible>> {
+        tokio::spawn(router(srv.clone()).oneshot(post_request(
+            methods::CANCEL_TASK,
+            json!({ "taskId": task }),
+            "1.0",
+        )))
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancel_without_binding_keeps_its_backend_leased_until_cancel_returns() {
+        let backend = Arc::new(GatedCancelBackend::default());
+        let srv = idle_retiring_server(backend.clone());
+
+        // No binding: the fallback resolves (and spawns) the default agent for the cancel.
+        let cancel = spawn_cancel(&srv, "t-nb");
+        backend.cancel_entered.notified().await;
+        tokio::time::sleep(ADAPTER_IDLE_TTL * 4).await;
+        assert_eq!(
+            backend.retired.load(Ordering::SeqCst),
+            0,
+            "an in-flight cancel must keep its backend leased past the idle TTL"
+        );
+
+        backend.cancel_gate.notify_one();
+        assert_eq!(cancel.await.unwrap().unwrap().status(), StatusCode::OK);
+        tokio::time::sleep(ADAPTER_IDLE_TTL * 2).await;
+        assert_eq!(
+            backend.retired.load(Ordering::SeqCst),
+            1,
+            "once the cancel's lease drops, the idle adapter retires"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancel_keeps_bound_backend_leased_across_binding_eviction() {
+        let backend = Arc::new(GatedCancelBackend::default());
+        let srv = idle_retiring_server(backend.clone());
+
+        // First message binds "t-ce"; its idle prompt keeps the producer (and binding) alive.
+        let stream = router(srv.clone())
+            .oneshot(post_request(
+                methods::SEND_STREAMING_MESSAGE,
+                json!({ "taskId": "t-ce", "message": { "text": "go" } }),
+                "1.0",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(stream.status(), StatusCode::OK);
+        await_binding(&srv, "t-ce", true).await;
+
+        let cancel = spawn_cancel(&srv, "t-ce");
+        backend.cancel_entered.notified().await;
+        // The producer exits (client disconnect) and evicts the binding — dropping the binding's
+        // lease — while the cancel is still driving the bound backend.
+        drop(stream);
+        await_binding(&srv, "t-ce", false).await;
+        tokio::time::sleep(ADAPTER_IDLE_TTL * 4).await;
+        assert_eq!(
+            backend.retired.load(Ordering::SeqCst),
+            0,
+            "the cancel co-holds the bound lease past the binding's eviction"
+        );
+
+        backend.cancel_gate.notify_one();
+        assert_eq!(cancel.await.unwrap().unwrap().status(), StatusCode::OK);
+        tokio::time::sleep(ADAPTER_IDLE_TTL * 2).await;
+        assert_eq!(backend.retired.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn follow_up_turn_keeps_bound_backend_leased_after_first_producer_evicts() {
+        let backend = Arc::new(GatedCancelBackend::default());
+        let srv = idle_retiring_server(backend.clone());
+
+        let first = router(srv.clone())
+            .oneshot(post_request(
+                methods::SEND_STREAMING_MESSAGE,
+                json!({ "taskId": "t-fl", "message": { "text": "go" } }),
+                "1.0",
+            ))
+            .await
+            .unwrap();
+        await_binding(&srv, "t-fl", true).await;
+        // The follow-up reuses the binding; its own idle prompt keeps its producer alive.
+        let follow_up = router(srv.clone())
+            .oneshot(post_request(
+                methods::SEND_STREAMING_MESSAGE,
+                json!({ "taskId": "t-fl", "message": { "text": "again" } }),
+                "1.0",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(follow_up.status(), StatusCode::OK);
+        await_prompts(&backend, 2).await;
+
+        // The first producer exits and evicts the binding while the follow-up still runs.
+        drop(first);
+        await_binding(&srv, "t-fl", false).await;
+        tokio::time::sleep(ADAPTER_IDLE_TTL * 4).await;
+        assert_eq!(
+            backend.retired.load(Ordering::SeqCst),
+            0,
+            "the follow-up turn co-holds the bound lease"
+        );
+
+        drop(follow_up);
+        tokio::time::sleep(ADAPTER_IDLE_TTL * 2).await;
+        assert_eq!(backend.retired.load(Ordering::SeqCst), 1);
     }
 
     // ---- Task 5 (session_cwd increment): parse + validate a2a-bridge.cwd ----

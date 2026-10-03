@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering::SeqCst};
-use std::sync::{Arc, Mutex as SyncMutex};
+use std::sync::{Arc, Mutex as SyncMutex, OnceLock, Weak};
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
@@ -120,6 +120,15 @@ pub(crate) struct Slot {
     /// Notified on every lease drop so the detached retirement task wakes the
     /// instant `leases` reaches zero (no sleep-polling).
     pub lease_notify: Arc<Notify>,
+    /// Monotonic count of lease acquisitions, bumped AFTER `leases`. The idle watcher compares it
+    /// across its whole window, so an acquire-and-drop round trip can never go unnoticed.
+    pub lease_acquisitions: Arc<AtomicU64>,
+    /// The idle watcher's claim (see [`Slot::claim_idle`]); a resolve/bind that takes its lease
+    /// and then observes it backs off instead of using the slot.
+    pub idle_retiring: AtomicBool,
+    /// This slot instance's idle-retirement watcher, started at most once (after the first
+    /// backend spawn) when the registry has a non-zero idle TTL.
+    pub idle_watch: OnceLock<tokio::task::JoinHandle<()>>,
 }
 
 impl Slot {
@@ -131,7 +140,62 @@ impl Slot {
             retired: Arc::new(AtomicBool::new(false)),
             leases: Arc::new(AtomicUsize::new(0)),
             lease_notify: Arc::new(Notify::new()),
+            lease_acquisitions: Arc::new(AtomicU64::new(0)),
+            idle_retiring: AtomicBool::new(false),
+            idle_watch: OnceLock::new(),
         })
+    }
+
+    /// Idle-retirement claim, made under `write_lock`. Sets `idle_retiring`, THEN re-reads the
+    /// lease count and acquisition epoch; a lease taker bumps both, THEN reads the claim. Under
+    /// SeqCst at least one side sees the other: either this withdraws the claim and returns `false`
+    /// (a lease is held, or one was taken since `epoch` was read, so the clock restarts), or every
+    /// later taker observes the claim and backs off.
+    fn claim_idle(&self, epoch: u64) -> bool {
+        self.idle_retiring.store(true, SeqCst);
+        if self.leases.load(SeqCst) == 0 && self.lease_acquisitions.load(SeqCst) == epoch {
+            return true;
+        }
+        self.idle_retiring.store(false, SeqCst);
+        false
+    }
+}
+
+/// Pause points inside the idle-retirement critical section (under `write_lock`). Tests park the
+/// watcher here to drive resolvers through each interleaving in a known order; a no-op otherwise.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum IdleSeam {
+    BeforeClaim,
+    AfterClaim,
+}
+
+#[cfg(test)]
+type IdleSeamHook = Arc<dyn Fn(IdleSeam) -> BoxFuture<'static, ()> + Send + Sync>;
+
+/// What a detached idle watcher needs to retire its slot. The slot and registry handles are weak,
+/// so a dropped registry (or slot) ends the watcher instead of being kept alive by it.
+struct IdleWatch {
+    slot: Weak<Slot>,
+    leases: Arc<AtomicUsize>,
+    lease_notify: Arc<Notify>,
+    lease_acquisitions: Arc<AtomicU64>,
+    retired: Arc<AtomicBool>,
+    state: Weak<ArcSwap<State>>,
+    write_lock: Weak<Mutex<()>>,
+    ttl: Duration,
+    grace: Duration,
+    #[cfg(test)]
+    seam_hook: Option<IdleSeamHook>,
+}
+
+impl IdleWatch {
+    async fn pause_at(&self, seam: IdleSeam) {
+        #[cfg(test)]
+        if let Some(hook) = &self.seam_hook {
+            hook(seam).await;
+        }
+        #[cfg(not(test))]
+        let _ = seam;
     }
 }
 
@@ -150,12 +214,14 @@ struct LeaseGuard {
     retired: Arc<AtomicBool>,
 }
 impl LeaseGuard {
-    fn new(count: Arc<AtomicUsize>, notify: Arc<Notify>, retired: Arc<AtomicBool>) -> Self {
-        count.fetch_add(1, SeqCst);
+    /// Count the lease, THEN bump the acquisition epoch (the order [`Slot::claim_idle`] relies on).
+    fn acquire(slot: &Slot) -> Self {
+        slot.leases.fetch_add(1, SeqCst);
+        slot.lease_acquisitions.fetch_add(1, SeqCst);
         Self {
-            count,
-            notify,
-            retired,
+            count: slot.leases.clone(),
+            notify: slot.lease_notify.clone(),
+            retired: slot.retired.clone(),
         }
     }
 }
@@ -174,16 +240,22 @@ impl Lease for LeaseGuard {
 
 /// Runtime-mutable agent registry: lazy-spawns backends and hands out leases.
 pub struct Registry {
-    state: ArcSwap<State>,
+    /// Shared (weakly) with idle watchers so they can swap their slot out under `write_lock`.
+    state: Arc<ArcSwap<State>>,
     spawn: BoundObservedSpawnFn,
     bound_aware_spawn: bool,
-    write_lock: Mutex<()>,
+    write_lock: Arc<Mutex<()>>,
     /// Grace deadline for the lease-draining retirement task: if a retired slot's
     /// leases don't reach zero within this window, the backend is force-retired.
     grace: Duration,
+    /// How long a spawned slot's leases must stay at zero before its backend process(es) are
+    /// retired and the slot is replaced by a cold one. `Duration::ZERO` disables idle retirement.
+    idle_ttl: Duration,
     /// Process-local discriminator for opaque bound-use tokens. This is not durable identity;
     /// it only makes diagnostics and accidental token substitution easier to distinguish.
     next_bound_use: AtomicU64,
+    #[cfg(test)]
+    idle_seam_hook: Option<IdleSeamHook>,
 }
 
 /// Shared snapshot validation: rejects duplicate ids, disallowed cmds, and a
@@ -395,16 +467,29 @@ impl Registry {
             .map(|e| (e.id.clone(), Slot::new(e)))
             .collect();
         Ok(Self {
-            state: ArcSwap::from_pointee(State {
+            state: Arc::new(ArcSwap::from_pointee(State {
                 slots,
                 default: snap.default,
-            }),
+            })),
             spawn,
             bound_aware_spawn,
-            write_lock: Mutex::new(()),
+            write_lock: Arc::new(Mutex::new(())),
             grace,
+            idle_ttl: Duration::ZERO,
             next_bound_use: AtomicU64::new(1),
+            #[cfg(test)]
+            idle_seam_hook: None,
         })
+    }
+
+    /// Retire a slot's lazily-spawned backend process(es) once its leases have stayed at zero for
+    /// `ttl`, replacing it with a cold slot for the same entry (the next resolve respawns). Long-lived
+    /// `serve` wires `[server] adapter_idle_ttl_secs` here; every constructor defaults to
+    /// `Duration::ZERO`, which disables idle retirement.
+    #[must_use]
+    pub fn with_idle_ttl(mut self, ttl: Duration) -> Self {
+        self.idle_ttl = ttl;
+        self
     }
 
     async fn observe_resolve(
@@ -480,16 +565,24 @@ impl Registry {
             // CRUX: take the lease (fetch_add) BEFORE checking `retired`. This closes
             // the window where a concurrent retirement could observe leases==0 between
             // our retired-check and our increment, and drain the backend out from under us.
-            let lease = LeaseGuard::new(
-                slot.leases.clone(),
-                slot.lease_notify.clone(),
-                slot.retired.clone(),
-            );
+            let lease = LeaseGuard::acquire(&slot);
+            if slot.idle_retiring.load(SeqCst) {
+                // The idle watcher claimed this slot after we loaded it. Its verdict is final once
+                // the writer lock is free: swapped out (retired) or claim dropped (still live).
+                drop(lease);
+                drop(self.write_lock.lock().await);
+                if slot.retired.load(SeqCst) && initialized_here.load(SeqCst) {
+                    // Our spawn may have landed after the idle drain inspected the cell.
+                    let _ = Self::retire_join_or_refuse(id, &backend).await;
+                }
+                continue;
+            }
             if slot.retired.load(SeqCst) {
                 drop(lease);
                 let _ = Self::retire_join_or_refuse(id, &backend).await;
                 continue;
             }
+            self.start_idle_watch(&slot);
 
             let code = (!initialized_here.load(SeqCst)).then_some("backend.reused");
             Self::observe_resolve(&observer, PhaseStatus::Completed, code).await?;
@@ -536,6 +629,8 @@ impl Registry {
     /// MUST treat repeat/concurrent `retire()` as idempotent.
     fn spawn_retirement(slot: Arc<Slot>, grace: Duration) {
         let agent = slot.entry.load().id.clone();
+        // Wake this slot's idle watcher (if parked) so it observes `retired` and exits now.
+        slot.lease_notify.notify_waiters();
         tokio::spawn(async move {
             Self::wait_for_slot_drain(&slot, grace).await;
             if let Some(b) = slot.backend.get() {
@@ -587,6 +682,109 @@ impl Registry {
             }
         });
     }
+
+    /// Start `slot`'s idle watcher unless idle retirement is disabled, the slot is already retired,
+    /// or this slot instance already has one. Called after every successful backend acquisition.
+    fn start_idle_watch(&self, slot: &Arc<Slot>) {
+        if self.idle_ttl.is_zero() || slot.idle_watch.get().is_some() || slot.retired.load(SeqCst) {
+            return;
+        }
+        slot.idle_watch.get_or_init(|| {
+            tokio::spawn(Self::watch_idle(IdleWatch {
+                slot: Arc::downgrade(slot),
+                leases: slot.leases.clone(),
+                lease_notify: slot.lease_notify.clone(),
+                lease_acquisitions: slot.lease_acquisitions.clone(),
+                retired: slot.retired.clone(),
+                state: Arc::downgrade(&self.state),
+                write_lock: Arc::downgrade(&self.write_lock),
+                ttl: self.idle_ttl,
+                grace: self.grace,
+                #[cfg(test)]
+                seam_hook: self.idle_seam_hook.clone(),
+            }))
+        });
+    }
+
+    /// Detached idle watcher for one slot instance. Parks on `lease_notify` (notified by every
+    /// lease drop and every retirement) and fires only once `leases` has stayed at zero for a whole
+    /// `ttl`: a lease drop inside the window restarts the clock, and the acquisition epoch read
+    /// when the clock started catches any round trip the wakeup misses. Ends once the slot is
+    /// retired by any path or the registry is gone.
+    async fn watch_idle(watch: IdleWatch) {
+        loop {
+            // Register before checking so a lease drop between the check and the await is kept.
+            let notified = watch.lease_notify.notified();
+            tokio::pin!(notified);
+            if watch.retired.load(SeqCst) {
+                return;
+            }
+            // Read the epoch BEFORE the idle check: any lease the count misses bumps it later.
+            let epoch = watch.lease_acquisitions.load(SeqCst);
+            if watch.leases.load(SeqCst) > 0 {
+                notified.await;
+                continue;
+            }
+            tokio::select! {
+                _ = &mut notified => continue,
+                _ = tokio::time::sleep(watch.ttl) => {}
+            }
+            // Used inside the window (still held, or dropped before its wakeup): restart.
+            if watch.leases.load(SeqCst) > 0 || watch.lease_acquisitions.load(SeqCst) != epoch {
+                continue;
+            }
+            if Self::retire_idle_slot(&watch, epoch).await {
+                return;
+            }
+        }
+    }
+
+    /// `invalidate`'s swap for an idle slot, under the writer lock and only if this exact instance
+    /// is still mapped and unretired and [`Slot::claim_idle`] proves no lease has been taken since
+    /// the idle clock started at `epoch`. Returns `false` when a lease intervened and the watcher
+    /// should keep watching; `true` once the slot is retired (here or by another path) or the
+    /// registry is gone.
+    async fn retire_idle_slot(watch: &IdleWatch, epoch: u64) -> bool {
+        let (Some(slot), Some(state), Some(write_lock)) = (
+            watch.slot.upgrade(),
+            watch.state.upgrade(),
+            watch.write_lock.upgrade(),
+        ) else {
+            return true;
+        };
+        let _g = write_lock.lock().await;
+        let cur = state.load_full();
+        let entry = slot.entry.load_full();
+        let mapped = cur
+            .slots
+            .get(&entry.id)
+            .is_some_and(|live| Arc::ptr_eq(live, &slot));
+        if !mapped || slot.retired.load(SeqCst) {
+            return true;
+        }
+        let mut next = cur.slots.clone();
+        next.insert(entry.id.clone(), Slot::new((*entry).clone()));
+
+        watch.pause_at(IdleSeam::BeforeClaim).await;
+        // A lease taken at ANY point since `epoch` (including while we waited for the lock or just
+        // now) fails the claim; every lease taken after the claim sees it and backs off.
+        if !slot.claim_idle(epoch) {
+            return false;
+        }
+        watch.pause_at(IdleSeam::AfterClaim).await;
+        state.store(Arc::new(State {
+            slots: next,
+            default: cur.default.clone(),
+        }));
+        slot.retired.store(true, SeqCst);
+        tracing::info!(
+            agent = entry.id.as_str(),
+            idle_secs = watch.ttl.as_secs(),
+            "registry retiring idle backend"
+        );
+        Self::spawn_retirement(slot, watch.grace);
+        true
+    }
 }
 
 #[async_trait::async_trait]
@@ -613,12 +811,10 @@ impl AgentRegistry for Registry {
                 let state = self.state.load();
                 state.slots.get(id).cloned()
             }?;
-            let lease = LeaseGuard::new(
-                slot.leases.clone(),
-                slot.lease_notify.clone(),
-                slot.retired.clone(),
-            );
-            if slot.retired.load(SeqCst) {
+            let lease = LeaseGuard::acquire(&slot);
+            // An idle-retirement claim is held only for a few synchronous steps under the writer
+            // lock before it is either dropped or followed by the swap, so retrying is bounded.
+            if slot.idle_retiring.load(SeqCst) || slot.retired.load(SeqCst) {
                 drop(lease);
                 continue;
             }
@@ -725,6 +921,7 @@ impl AgentRegistry for Registry {
         // The lease captured by `bind_entry_use` keeps this exact slot alive. Do not reject a
         // later retirement here: a reload after binding must not redirect or abort the already
         // admitted provider effect.
+        self.start_idle_watch(&slot);
         let code = (!initialized_here.load(SeqCst)).then_some("backend.reused");
         Self::observe_resolve(&observer, PhaseStatus::Completed, code).await?;
         Ok(backend)
@@ -2314,11 +2511,7 @@ mod tests {
         let registry = Arc::new(Registry::new(snapshot(&["a"]), spawn).unwrap());
         let id = AgentId::parse("a").unwrap();
         let old_slot = registry.slot_arc(&id).unwrap();
-        let drain_hold = LeaseGuard::new(
-            old_slot.leases.clone(),
-            old_slot.lease_notify.clone(),
-            old_slot.retired.clone(),
-        );
+        let drain_hold = LeaseGuard::acquire(&old_slot);
         let resolving = {
             let registry = registry.clone();
             let id = id.clone();
@@ -2422,6 +2615,465 @@ mod tests {
 
         reg.apply(snapshot(&["b"])).await.unwrap(); // removes "a"
         await_retired(&retired, 1).await;
+    }
+
+    // --- Idle adapter retirement ([server] adapter_idle_ttl_secs) -------------
+    //
+    // Paused-clock tests: `sleep` auto-advances only once every runnable task (watcher, drain) has
+    // parked, so each assertion observes a settled registry without wall-clock slack.
+
+    const IDLE_TTL: Duration = Duration::from_millis(50);
+
+    fn idle_registry(
+        ids: &[&str],
+        ttl: Duration,
+        count: &Arc<AtomicUsize>,
+        retired: &Arc<AtomicUsize>,
+    ) -> Registry {
+        Registry::new(
+            snapshot(ids),
+            counting_spawn_recording(count.clone(), 0, retired.clone()),
+        )
+        .unwrap()
+        .with_idle_ttl(ttl)
+    }
+
+    /// Yield until `slot`'s idle watcher has exited. Bounded by iterations, not time, so it also
+    /// proves the exit did not wait for a (paused) idle deadline.
+    async fn assert_idle_watch_exits(slot: &Slot) {
+        for _ in 0..1000 {
+            if slot.idle_watch.get().is_some_and(|w| w.is_finished()) {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("idle watcher outlived its retired slot");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn idle_retirement_retires_backend_after_last_lease_drops() {
+        let count = Arc::new(AtomicUsize::new(0));
+        let retired = Arc::new(AtomicUsize::new(0));
+        let reg = idle_registry(&["a"], IDLE_TTL, &count, &retired);
+        let a = AgentId::parse("a").unwrap();
+
+        let first = reg.resolve(&a).await.unwrap();
+        assert_eq!(count.load(SeqCst), 1);
+        let idle_slot = reg.slot_arc(&a).unwrap();
+        drop(first);
+
+        tokio::time::sleep(IDLE_TTL * 2).await;
+        assert_eq!(retired.load(SeqCst), 1, "the idle backend is retired once");
+        assert!(idle_slot.retired.load(SeqCst));
+        assert!(
+            !Arc::ptr_eq(&idle_slot, &reg.slot_arc(&a).unwrap()),
+            "a cold slot replaced the idle one"
+        );
+        assert_idle_watch_exits(&idle_slot).await;
+
+        let fresh = reg.resolve(&a).await.unwrap();
+        assert_eq!(
+            count.load(SeqCst),
+            2,
+            "the next resolve spawns a fresh backend"
+        );
+        assert!(!fresh.lease.is_retired());
+        assert_eq!(retired.load(SeqCst), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn idle_retirement_does_not_fire_while_a_lease_is_held() {
+        let count = Arc::new(AtomicUsize::new(0));
+        let retired = Arc::new(AtomicUsize::new(0));
+        let reg = idle_registry(&["a"], IDLE_TTL, &count, &retired);
+        let a = AgentId::parse("a").unwrap();
+
+        let held = reg.resolve(&a).await.unwrap();
+        tokio::time::sleep(IDLE_TTL * 4).await;
+        assert_eq!(
+            retired.load(SeqCst),
+            0,
+            "retire() must never fire while a lease is held"
+        );
+        assert_eq!(count.load(SeqCst), 1);
+        assert!(!held.lease.is_retired());
+
+        // The watcher was parked, not gone: the idle clock starts at the drop.
+        drop(held);
+        tokio::time::sleep(IDLE_TTL * 2).await;
+        assert_eq!(retired.load(SeqCst), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn lease_reacquired_inside_idle_window_resets_the_clock() {
+        let count = Arc::new(AtomicUsize::new(0));
+        let retired = Arc::new(AtomicUsize::new(0));
+        let reg = idle_registry(&["a"], IDLE_TTL, &count, &retired);
+        let a = AgentId::parse("a").unwrap();
+        let ms = Duration::from_millis;
+
+        drop(reg.resolve(&a).await.unwrap()); // t=0: clock starts, deadline t=50
+        tokio::time::sleep(ms(30)).await;
+        drop(reg.resolve(&a).await.unwrap()); // t=30: used and released, deadline t=80
+        tokio::time::sleep(ms(30)).await;
+        assert_eq!(
+            retired.load(SeqCst),
+            0,
+            "t=60 is past the original deadline"
+        );
+
+        let again = reg.resolve(&a).await.unwrap(); // t=60: held across t=80
+        tokio::time::sleep(ms(40)).await;
+        assert_eq!(retired.load(SeqCst), 0, "t=100 with a lease held");
+        assert_eq!(count.load(SeqCst), 1);
+
+        drop(again); // t=100: clock restarts, deadline t=150
+        tokio::time::sleep(ms(30)).await;
+        assert_eq!(
+            retired.load(SeqCst),
+            0,
+            "t=130 is inside the restarted window"
+        );
+        tokio::time::sleep(ms(30)).await;
+        assert_eq!(
+            retired.load(SeqCst),
+            1,
+            "t=160: one full idle TTL after the last drop"
+        );
+        assert_eq!(count.load(SeqCst), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn idle_ttl_zero_disables_idle_retirement() {
+        let count = Arc::new(AtomicUsize::new(0));
+        let retired = Arc::new(AtomicUsize::new(0));
+        let reg = idle_registry(&["a"], Duration::ZERO, &count, &retired);
+        let a = AgentId::parse("a").unwrap();
+
+        let first = reg.resolve(&a).await.unwrap();
+        let first_backend = first.backend.clone();
+        drop(first);
+        tokio::time::sleep(Duration::from_secs(3600)).await;
+
+        assert_eq!(retired.load(SeqCst), 0);
+        assert!(
+            reg.slot_arc(&a).unwrap().idle_watch.get().is_none(),
+            "no watcher is started when idle retirement is disabled"
+        );
+        let again = reg.resolve(&a).await.unwrap();
+        assert_eq!(count.load(SeqCst), 1);
+        assert!(Arc::ptr_eq(&first_backend, &again.backend));
+    }
+
+    /// An idle registry whose watcher parks at `at` on its FIRST arrival there, holding the writer
+    /// lock: `arrived` fires when it gets there and it resumes on `release`.
+    fn seam_gated_idle_registry(
+        at: IdleSeam,
+        count: &Arc<AtomicUsize>,
+        retired: &Arc<AtomicUsize>,
+    ) -> (Arc<Registry>, Arc<Notify>, Arc<Notify>) {
+        let arrived = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let hook: IdleSeamHook = {
+            let (arrived, release) = (arrived.clone(), release.clone());
+            let armed = AtomicBool::new(true);
+            Arc::new(move |seam| -> BoxFuture<'static, ()> {
+                if seam != at || !armed.swap(false, SeqCst) {
+                    return Box::pin(async {});
+                }
+                arrived.notify_one();
+                let release = release.clone();
+                Box::pin(async move { release.notified().await })
+            })
+        };
+        let mut reg = idle_registry(&["a"], IDLE_TTL, count, retired);
+        reg.idle_seam_hook = Some(hook);
+        (Arc::new(reg), arrived, release)
+    }
+
+    async fn yield_until(label: &str, done: impl Fn() -> bool) {
+        for _ in 0..1000 {
+            if done() {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("never reached: {label}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn concurrent_resolve_during_idle_retirement_never_returns_a_retired_lease() {
+        let a = AgentId::parse("a").unwrap();
+
+        // Order 1: the watcher has claimed the idle slot but not yet swapped it out. A resolve that
+        // loads the still-mapped slot and leases it must see the claim, wait for the verdict, and
+        // return a live lease on the replacement.
+        let count = Arc::new(AtomicUsize::new(0));
+        let retired = Arc::new(AtomicUsize::new(0));
+        let (reg, arrived, release) =
+            seam_gated_idle_registry(IdleSeam::AfterClaim, &count, &retired);
+        drop(reg.resolve(&a).await.unwrap());
+        let idle_slot = reg.slot_arc(&a).unwrap();
+        let idle_backend = idle_slot.backend.get().unwrap().clone();
+        arrived.notified().await;
+        assert!(idle_slot.idle_retiring.load(SeqCst));
+        assert!(
+            Arc::ptr_eq(&idle_slot, &reg.slot_arc(&a).unwrap()),
+            "the swap is still pending"
+        );
+
+        let leased_before = idle_slot.lease_acquisitions.load(SeqCst);
+        let racer = {
+            let (reg, a) = (reg.clone(), a.clone());
+            tokio::spawn(async move { reg.resolve(&a).await })
+        };
+        yield_until("racer leased the claimed slot and backed off", || {
+            idle_slot.lease_acquisitions.load(SeqCst) > leased_before
+                && idle_slot.leases.load(SeqCst) == 0
+        })
+        .await;
+        release.notify_one();
+
+        let resolved = racer.await.unwrap().unwrap();
+        assert!(
+            !resolved.lease.is_retired(),
+            "order 1: resolve returned a retired lease"
+        );
+        let mapped = reg.slot_arc(&a).unwrap();
+        assert!(!Arc::ptr_eq(&mapped, &idle_slot));
+        assert!(
+            Arc::ptr_eq(mapped.backend.get().unwrap(), &resolved.backend),
+            "order 1: the returned backend is the mapped one"
+        );
+        assert!(!Arc::ptr_eq(&idle_backend, &resolved.backend));
+        assert_eq!(count.load(SeqCst), 2);
+        await_retired(&retired, 1).await;
+        assert_eq!(retired.load(SeqCst), 1, "only the idle backend retires");
+        drop(resolved);
+
+        // Order 2: the TTL has expired and the watcher holds the writer lock but has not claimed
+        // yet. A resolve that leases the slot now must make the claim fail: no retirement, and the
+        // lease stays live on the still-mapped slot.
+        let count = Arc::new(AtomicUsize::new(0));
+        let retired = Arc::new(AtomicUsize::new(0));
+        let (reg, arrived, release) =
+            seam_gated_idle_registry(IdleSeam::BeforeClaim, &count, &retired);
+        drop(reg.resolve(&a).await.unwrap());
+        let idle_slot = reg.slot_arc(&a).unwrap();
+        arrived.notified().await;
+        let held = reg.resolve(&a).await.unwrap();
+        release.notify_one();
+        tokio::time::sleep(IDLE_TTL * 4).await;
+
+        assert!(
+            !held.lease.is_retired(),
+            "order 2: resolve returned a retired lease"
+        );
+        assert!(
+            !idle_slot.idle_retiring.load(SeqCst),
+            "the claim was withdrawn"
+        );
+        let mapped = reg.slot_arc(&a).unwrap();
+        assert!(Arc::ptr_eq(&mapped, &idle_slot));
+        assert!(
+            Arc::ptr_eq(mapped.backend.get().unwrap(), &held.backend),
+            "order 2: the returned backend is the mapped one"
+        );
+        assert_eq!(retired.load(SeqCst), 0);
+        assert_eq!(count.load(SeqCst), 1);
+
+        drop(held);
+        tokio::time::sleep(IDLE_TTL * 2).await;
+        assert_eq!(
+            retired.load(SeqCst),
+            1,
+            "the watcher kept watching and retires once idle"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn lease_round_trip_at_the_claim_seam_restarts_the_idle_clock() {
+        let count = Arc::new(AtomicUsize::new(0));
+        let retired = Arc::new(AtomicUsize::new(0));
+        let (reg, arrived, release) =
+            seam_gated_idle_registry(IdleSeam::BeforeClaim, &count, &retired);
+        let a = AgentId::parse("a").unwrap();
+        let ms = Duration::from_millis;
+
+        drop(reg.resolve(&a).await.unwrap());
+        let idle_slot = reg.slot_arc(&a).unwrap();
+        // The TTL has expired; the watcher holds the writer lock right before its claim.
+        arrived.notified().await;
+        // A complete acquire-and-drop round trip at that seam leaves `leases == 0`.
+        drop(reg.resolve(&a).await.unwrap());
+        let dropped_at = tokio::time::Instant::now();
+        release.notify_one();
+
+        tokio::time::sleep_until(dropped_at + IDLE_TTL - ms(1)).await;
+        assert_eq!(
+            retired.load(SeqCst),
+            0,
+            "the round trip restarted the clock"
+        );
+        assert!(
+            Arc::ptr_eq(&idle_slot, &reg.slot_arc(&a).unwrap()),
+            "the used slot stays mapped for a full TTL after the drop"
+        );
+        tokio::time::sleep_until(dropped_at + IDLE_TTL + ms(1)).await;
+        assert_eq!(retired.load(SeqCst), 1);
+        assert_eq!(count.load(SeqCst), 1);
+    }
+
+    /// Real parallelism on top of the deterministic orderings above: every returned lease stays
+    /// live and mapped, and every spawned backend is retired exactly once at quiescence.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn parallel_resolves_against_a_tiny_idle_ttl_keep_every_lease_live() {
+        let count = Arc::new(AtomicUsize::new(0));
+        let retired = Arc::new(AtomicUsize::new(0));
+        let reg = Arc::new(idle_registry(
+            &["a"],
+            Duration::from_millis(1),
+            &count,
+            &retired,
+        ));
+        let a = AgentId::parse("a").unwrap();
+
+        let workers: Vec<_> = (0..4u64)
+            .map(|worker| {
+                let reg = reg.clone();
+                let a = a.clone();
+                tokio::spawn(async move {
+                    for i in 0..150u64 {
+                        let resolved = reg.resolve(&a).await.unwrap();
+                        assert!(
+                            !resolved.lease.is_retired(),
+                            "worker {worker} iteration {i}: resolve returned a retired lease"
+                        );
+                        let mapped = reg.slot_arc(&a).unwrap();
+                        let mapped_backend = mapped
+                            .backend
+                            .get()
+                            .expect("the leased slot is still mapped and spawned");
+                        assert!(
+                            Arc::ptr_eq(mapped_backend, &resolved.backend),
+                            "worker {worker} iteration {i}: backend is not the mapped one"
+                        );
+                        drop(resolved);
+                        // Stagger so the slot regularly idles past the TTL while peers resolve.
+                        tokio::time::sleep(Duration::from_micros((worker + i) % 4 * 700)).await;
+                    }
+                })
+            })
+            .collect();
+        for worker in workers {
+            worker.await.unwrap();
+        }
+
+        // Quiescent: the last spawned backend idles out too, and none is retired twice.
+        let spawned = count.load(SeqCst);
+        await_counter("idle retirement", &retired, spawned).await;
+        assert_eq!(retired.load(SeqCst), spawned);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn apply_or_invalidate_during_idle_window_retires_exactly_once() {
+        for via_apply in [false, true] {
+            let count = Arc::new(AtomicUsize::new(0));
+            let retired = Arc::new(AtomicUsize::new(0));
+            let reg = idle_registry(&["a"], IDLE_TTL, &count, &retired);
+            let a = AgentId::parse("a").unwrap();
+
+            drop(reg.resolve(&a).await.unwrap());
+            let old_slot = reg.slot_arc(&a).unwrap();
+            tokio::time::sleep(IDLE_TTL / 2).await;
+            assert!(
+                old_slot.idle_watch.get().is_some_and(|w| !w.is_finished()),
+                "via_apply={via_apply}: watcher is inside its idle window"
+            );
+
+            if via_apply {
+                let mut desired = snapshot(&["a"]);
+                desired.entries[0].cmd = Some("other-cmd".into());
+                desired.allowed_cmds.push("other-cmd".into());
+                reg.apply(desired).await.unwrap();
+            } else {
+                reg.invalidate(&a).await;
+            }
+            assert_idle_watch_exits(&old_slot).await;
+
+            tokio::time::sleep(IDLE_TTL * 4).await;
+            assert_eq!(
+                retired.load(SeqCst),
+                1,
+                "via_apply={via_apply}: the replaced backend is retired exactly once"
+            );
+            assert!(
+                reg.slot_arc(&a).unwrap().idle_watch.get().is_none(),
+                "via_apply={via_apply}: the cold replacement has no watcher until it spawns"
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn idle_retirement_covers_effect_keyed_bound_backends() {
+        use bridge_core::diagnostics::NoopDiagnosticObserver;
+        use bridge_core::execution_policy::{
+            freeze_direct_checkout_v1, freeze_provider_attempt_v1, FrozenProviderLogicalSessionV1,
+            PolicyNodeRefV1, ProviderFreezeInputV1,
+        };
+
+        let count = Arc::new(AtomicUsize::new(0));
+        let retired = Arc::new(AtomicUsize::new(0));
+        let spawn: BoundObservedSpawnFn = {
+            let count = count.clone();
+            let retired = retired.clone();
+            Arc::new(move |_entry, _effect, _observer| {
+                count.fetch_add(1, SeqCst);
+                let retired = retired.clone();
+                Box::pin(
+                    async move { Ok(Arc::new(FakeBackend { retired }) as Arc<dyn AgentBackend>) },
+                )
+            })
+        };
+        let mut initial = snapshot(&["a"]);
+        initial.entries[0].mcp_delivery = McpDelivery::CodexNative;
+        let registry = Registry::new_bound_observed(initial, spawn)
+            .unwrap()
+            .with_idle_ttl(IDLE_TTL);
+        let id = AgentId::parse("a").unwrap();
+
+        for cwd in ["/repo-a", "/repo-b"] {
+            let bound = registry.bind_entry_use(&id).unwrap();
+            let bundle = freeze_provider_attempt_v1(&ProviderFreezeInputV1 {
+                entry: &bound.entry,
+                overrides: None,
+                node: PolicyNodeRefV1::from_node_id(0, "node"),
+                logical_session: FrozenProviderLogicalSessionV1::Execute {
+                    candidate_ordinal: 0,
+                },
+                checkout: freeze_direct_checkout_v1(bridge_core::SessionCwd::parse(cwd).unwrap()),
+                provider_effect_key: None,
+            })
+            .unwrap();
+            registry
+                .resolve_bound(
+                    &bound,
+                    &bundle.bound,
+                    Arc::new(NoopDiagnosticObserver::default()),
+                )
+                .await
+                .unwrap();
+        }
+        assert_eq!(count.load(SeqCst), 2, "one process per frozen effect");
+
+        tokio::time::sleep(IDLE_TTL * 2).await;
+        assert_eq!(
+            retired.load(SeqCst),
+            2,
+            "both effect-keyed processes retire with the idle slot"
+        );
+        let fresh = registry.bind_entry_use(&id).unwrap();
+        assert!(!fresh.lease.is_retired());
     }
 
     #[tokio::test]
