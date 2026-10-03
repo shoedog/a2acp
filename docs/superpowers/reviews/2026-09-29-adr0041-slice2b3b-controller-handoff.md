@@ -9,14 +9,14 @@
 ## 0. Gating facts — settle these before starting anything below
 
 **(a) Lane ownership** — `[MEASURED]` Sonnet round3 session79469 ended0/completed; exactworkerac6bfcb0153cb7ed584f85d2390d080d2bd2cb8261a1ff9eccd8c80e548b5bd5 confirmedabsent. Actualclaude-sonnet-5-5 only. Original88111/Rejected and33595/tworevisioncustody ended. — RESOLVED.
-**(b) Custody exposure** — `[MEASURED]` approved A/B1a/B1b locallyadopted only; new clean provisional B2acandidate88acb02eb01d9ebf37ec287089c57e459b4bf866 parent110681c0 committed exact3stagedownedpaths, NOTadopted/reviewapproved.97file completeworker/transcript/source/checkpoint/result secondcustody plus238focused/17matrix custody. OriginalRejectedcheckpoint byteunchanged. — RESOLVED.
-**(c) In flight / irreversible** — `[MEASURED]` verifier43190 completed all six gates; exact containerbbecb222 confirmed absent. Committed88acb02e/source unchanged: alltargets5100/0/13 (90 groups, core rebuilt), default5111/0/13 (106 groups, 16 doctest groups, core cached); fmt/workspaceclippyalltargetsallfeatures/build/hygienePASS. Independent receipt audit complete. Hard-read-only Sol source3/3 session85270 ACTIVE, executionexec-8b2935cd301d0e7d0659f7d0a3594c17/attempt-70a43ef659ed3667f9661570243e593b, bound input and config6f2f2a5e. Original2/2/LoopStoppedRejected preserved; noreset/restart/forcedapproval. — RESOLVED.
+**(b) Custody exposure** — `[MEASURED]` approved A/B1a/B1b/B2a locally adopted. B2a exact three files from88acb02eb01d9ebf37ec287089c57e459b4bf866 adopted atc8eb29103681df74a35c814203823de8ebb40e56 after SolAPPROVE0W0S0block3/3.97file worker custody,238focused/17matrix custody, all six gates and complete review transcript/raw retained. OriginalRejectedcheckpoint byteunchanged. — RESOLVED.
+**(c) In flight / irreversible** — `[MEASURED]` verifier43190 and Sol85270 completed; no active provider. B2a alltargets5100/0/13/core rebuilt; default5111/0/13/16docs/core cached; fmt/workspaceclippyalltargetsallfeatures/build/hygienePASS. Actual Solgpt-5.6-sol/xhigh/read-only session01a0fffb-f4db-75c1-8292-a87a65b9bc48 approved0/0/0 round3/3, raw82c532acf7bbf1fd30febdf1b5e0722f0771810c4aa98e2af3b484be1395acbb; cap NO FINDINGS. Original2/2/LoopStoppedRejected preserved. B2b dispatch binding/preflight next. — RESOLVED.
 **(d) Authorization granted but not exercised** — owner: "Merge 2B3a and proceed to orchestrate spec and implementation of 2B3b." "use sonnet5-5 for implementation." Latest Empty refs decision: "Refuse before creating repository/ (Recommended): complete Git restore requires captured refs/HEAD with exactly one valid HEAD; preserve Pass A’s acceptance of empty coverage." Continue B2a/B2b/B2c, native/combined and publication/landing under original scope; no question pending.
 
 ## 1. Resume order
 
-1. Poll85270; cleanexactcandidate88acb02eb01d9ebf37ec287089c57e459b4bf866 in impl-9452-ybd5v28a. No source edits/builds during independent review. All six controller Linux receipts are complete and independently audited against immutable88acb02e.
-2. Extract actual Sol final with VERDICT/SUMMARY round3/3, including channel-less ACP assistant finals; retain transcript, scope and metadata. Cap3/3disclosed/manualactualsource; rawactualverdict controlsadoption. No resetoriginalcheckpoint; no B2b before actualAPPROVE. Use prepare-b2b-after-round3-dispatch.py only after approved exact adoption and clean root.
+1. Bind B2b from clean controller root using prepare-b2b-after-round3-dispatch.py <rootHEAD> 88acb02e <rawSol3> <finalfocusedlog>. Exact approved adoptionc8eb2910; all six B2a receipts/source hashes audited. B2b source cap TWO unchanged.
+2. Fresh validate/doctor/models/storage/custody checks then authorized Sonnet5.5 quarantine implement, immutable base, config7774d187/private20GiB. Preserve B2a original cap2/disclosed3/3 and rejected checkpoint; no restart/reset or automatic merge.
 3. Audit actual raw/source final evidence. Adopt only approved predecessor, then B2b and B2c serially. Original one capsule/pins/ledger/absolute Instant throughout runtime helpers.
 4. Complete G native macOS/native-ext4 filesystem-proven CI, aggregate full suites and combined Sol base251..final (cap2), publish/inspect exactCI/land. Do not claim complete2B3b at B1b.
 
@@ -53,7 +53,7 @@
 
 | # | Work | State | Exact next action | Blocked by | Identifiers |
 |---:|---|---|---|---|---|
-|1|B2a|pending,active|monitor85270; actual Sol3/3 verdict→classify/adopt if approved|none|impl-9452-ybd5v28a; originalcap2/disclosed3/3|
+|1|B2a|approved,adopted|retain actual review and all source-bound receipts|none|88acb02e→c8eb2910; originalcap2/disclosed3/3|
 |2|B2b/B2c|pending|bind exactapprovedpredecessor serially|B2a|approvedtasks396a1730/bf7a0bee|
 |3|Native/combined|pending|Mac+ext4provenCI/fullbase251..finalreview|completeG|preparedhostscript/CIplan/combinedconfig|
 |4|Publication/landing|pending|PR/exactCI/merge|allgates|originalauthority|

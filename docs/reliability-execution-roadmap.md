@@ -172,7 +172,7 @@
     source3/3 disclosed; SAME artifact, original LoopStopped/Rejected checkpoint retained.
     TargetedSonnet5.5 repair finished session79469/completed, actualclaude-sonnet-5-5 only.
     Exact3stagedfiles committed as cleancandidate88acb02e(parent110); originalRejectedcheckpoint
-    bytepreserved. No adoption.97filecompleteworker secondcustody retained.
+    bytepreserved. Exact three files subsequently adopted atc8eb2910 after actual Sol3/3 approval.97filecompleteworker secondcustody retained.
     New28/28doctor/modelchecks pass; private20GiBfloor unchanged.
     Corrected seam-onlyRED36/4/0 and repaired40/0/0(corecompiled) retained. Round3matrix
     complete17rows:15actualbehavioralflips(12production+2testseams+1wholedefectivecontrol),
@@ -181,7 +181,9 @@
     five-source hashes match before/after/live/matrixlaunch. ControllerLinux6gates session43190
     complete on88acb02e: alltargets5100/0/13/core rebuilt; default5111/0/13/16docgroups/core cached;
     fmt/workspaceclippyalltargetsallfeatures/build/hygienePASS, independently audited. Verifier absent.
-    Independent hard-read-only Solsource3/3 active/session85270; actual verdict pending. No B2aadoption. Transientlowspace
+    Independent hard-read-only Solsource3/3 completed/session85270: APPROVE0WRONG0SMELL0blockers,
+    cap NO FINDINGS, raw82c532acf7bbf1fd30febdf1b5e0722f0771810c4aa98e2af3b484be1395acbb.
+    B2a adopted; B2b binding/dispatch next. Native and whole-G gates remain pending. Transientlowspace
     recovered externally to84.8GiB beforedispatch; auditonly/no additionaldeletion. Finalfocused232/0/0 retains198inheritednames; matching
     launch/before/after source c860bb3b/32ab0f8c, core cached. Final101variant+2control matrix:
     94behavioral flips,2structural-onlyOSsync flips,5disclosednonflips; no missedpredictions/invalidruns.
