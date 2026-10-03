@@ -225,6 +225,10 @@
     non-atime metadata omitted fromzero-effect facts; expired failure digest misses same-length byteeffects;
     pre-operation-only deadline guards permit continuationI/O after slowreturns. Same-artifact Sonnetrepair
     andsource2/2 next; no reset/restart/adoption/native/whole-G claim. Tenfile rejected-source custody retained.
+    SameSonnet5.5 repair ACTIVE. Production edits preceded new regression construction; actual chronology
+    retained, no tests-FIRST repair claim. Require source-bound rejected413/seam-only413 behavioralRED,
+    keep reconstruction distinct. Initial existing33 trial had2guard-position failures; duplicate newlabel
+    fixed and2sequence rows reportedPASS. Newregressions/final-byte matrix/focused/fullgates pending.
     Worker "132single-statement" wording overstates granularity; actual definitions include coupled
     pairs/whole-step slices/test-only log hooks. Preserve exact variants, not132single-production-guard claim.
     Earlier pre-checks used filtered output; complete final six-gate raw receipts now retained/audited.
