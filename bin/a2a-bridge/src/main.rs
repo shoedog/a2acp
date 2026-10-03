@@ -6825,6 +6825,10 @@ fn build_init_config(
     ));
     out.push_str("[store]\npath = \".a2a-bridge/tasks.sqlite\"\nresume_attempt_cap = 3\n\n");
     out.push_str("[server]\naddr = \"127.0.0.1:8080\"\n");
+    out.push_str(
+        "# Retire an agent's idle shared adapter process (and its MCP children) after N s; 0 = never.\n\
+         # adapter_idle_ttl_secs = 300\n",
+    );
     for a in selected {
         out.push_str(agent_fragment(a));
     }
@@ -8239,7 +8243,11 @@ async fn mcp_cmd(args: &[String]) -> Result<(), BoxError> {
         )
         .await;
     }
-    let registry = Arc::new(Registry::new_bound_observed(snapshot, spawn)?);
+    // Long-lived: retire a shared adapter process (and its agent-side children) once it idles.
+    let registry = Arc::new(
+        Registry::new_bound_observed(snapshot, spawn)?
+            .with_idle_ttl(Duration::from_secs(cfg.server.adapter_idle_ttl_secs)),
+    );
 
     let base = config_path
         .parent()
@@ -9945,7 +9953,12 @@ async fn main() -> Result<(), BoxError> {
         .map(|e| (e.id.as_str().to_string(), e.clone()))
         .collect();
     // Registry::new VALIDATES the snapshot → boot fails loud on bad config (spec §7).
-    let registry = Arc::new(Registry::new_bound_observed(snapshot, spawn)?);
+    // Warm-session expiry only drops a lease; idle retirement frees the shared adapter process
+    // (and its agent-side session/MCP children) once no lease has used it for the TTL.
+    let registry = Arc::new(
+        Registry::new_bound_observed(snapshot, spawn)?
+            .with_idle_ttl(Duration::from_secs(cfg.server.adapter_idle_ttl_secs)),
+    );
 
     // 6. Reconcile loop — consume `watch()` and `apply()` each new snapshot so
     //    on-disk edits hot-reload the live registry. The watch stream is held for
@@ -13317,6 +13330,16 @@ inputs = []
         .unwrap();
         let raw = std::fs::read_to_string(dir.join("a2a-bridge.toml")).unwrap();
         let cfg = config::RegistryConfig::parse(&raw).unwrap();
+        // The scaffold documents the idle-adapter knob under [server]; uncommented, it parses.
+        let enabled = raw.replace("# adapter_idle_ttl_secs", "adapter_idle_ttl_secs");
+        assert_ne!(enabled, raw, "scaffold documents adapter_idle_ttl_secs");
+        assert_eq!(
+            config::RegistryConfig::parse(&enabled)
+                .unwrap()
+                .server
+                .adapter_idle_ttl_secs,
+            300
+        );
         let wf = cfg.load_workflows(&dir).unwrap();
         assert_eq!(
             wf.len(),
