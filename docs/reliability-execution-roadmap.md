@@ -171,7 +171,11 @@
     retry/continuation loops lack original-deadline guards. Converging targeted extension
     source3/3 disclosed; SAME artifact, original LoopStopped/Rejected checkpoint retained.
     TargetedSonnet5.5 repair now active session79469, actualclaude-sonnet-5-5 confirmed.
-    New28/28doctor/modelchecks pass; private20GiBfloor unchanged. Transientlowspace
+    New28/28doctor/modelchecks pass; private20GiBfloor unchanged.
+    Corrected seam-onlyRED36/4/0 and repaired40/0/0(corecompiled) retained. Round3matrix
+    complete17rows:15actualbehavioralflips(12production+2testseams+1wholedefectivecontrol),
+    controls40/0/0; all15mutateddigests/five-source restoration independentlychecked.
+    Finalfocused stillactive; newfull6gates/source3/3 pending. No B2aadoption. Transientlowspace
     recovered externally to84.8GiB beforedispatch; auditonly/no additionaldeletion. Finalfocused232/0/0 retains198inheritednames; matching
     launch/before/after source c860bb3b/32ab0f8c, core cached. Final101variant+2control matrix:
     94behavioral flips,2structural-onlyOSsync flips,5disclosednonflips; no missedpredictions/invalidruns.

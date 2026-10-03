@@ -1,6 +1,6 @@
 # Handoff — ADR-0041 2B3b B1b approved; B2a active
 
-**Written:** 2026-10-02T15:48:35.938533+00:00 · **By:** Codex controller · **Provider:** codex
+**Written:** 2026-10-03T03:18:23.340863+00:00 · **By:** Codex controller · **Provider:** codex
 **Workspace:** /Users/wesleyjinks/code/a2a-bridge · work/adr0041-2b3b-bootstrap-20261001 · **Measured state:** `[MEASURED]` approved runtime at0b4e28abd1bc45179e5d719b55a39551bb5d8c27; controller reconciliation committedbbf4a2bf; B2a launched from immutablebbf4a2bf. Progress docs to commit separately. Probe git status/log and final receipt audits in scratch.
 **Predecessor:** B1b Sonnet5.5 run7746 complete; clean9a9f97ba automatic Approved; Sol2/2 APPROVE0W1S0block.
 **Truth ordering:** measured live state > explicit owner/contract authority within its scope > this handoff for current operational state > earlier handoffs and non-authoritative summaries. A conflict between tiers stays OPEN in §0 — never resolved by document class alone.
@@ -53,7 +53,7 @@
 
 | # | Work | State | Exact next action | Blocked by | Identifiers |
 |---:|---|---|---|---|---|
-|1|B2a|pending,active|monitor88111/publicpoll; baseline/raw/source/bridge6gates/Sol|none|impl-9452-ybd5v28a;cap2|
+|1|B2a|pending,active|monitor79469/poll-b2a-round3.py; focused completion→writerexit→exactcommit→manual6gates→Sol3/3|none|impl-9452-ybd5v28a; originalcap2/disclosed3/3|
 |2|B2b/B2c|pending|bind exactapprovedpredecessor serially|B2a|approvedtasks396a1730/bf7a0bee|
 |3|Native/combined|pending|Mac+ext4provenCI/fullbase251..finalreview|completeG|preparedhostscript/CIplan/combinedconfig|
 |4|Publication/landing|pending|PR/exactCI/merge|allgates|originalauthority|
@@ -103,3 +103,5 @@
 [MEASURED] SUPERSEDES110pendingstate:88111 ended0/LoopStopped REJECT2/2, rawe2462d58/session01a0ff11-e419-77b3-a135-ab283387ca10. All6exact110gatesPASS, reviewerinspectedfullreceipts:5094/0/13alltargets90groups226Git/corecompiled;5105/0/13default106groups16docs/corecached. DeadlinecontinuationWRONG98 on3loops; previousfixessurvive. CLOSED/converging2block→1boundedblock, one disclosedsource3/3extension SAMEartifact. Logread failed because observer finished/removed during approvallatency, inadmissiblestatusprobe. Rawextract initially assumedfinalchannel; ACPemittedchannellessfinal, corrected exactVERDICT/SUMMARY extraction. Hostpython lacks tomllib; preparationprobe refused beforewrites, no config/sourceevidence; use bridgevalidate. No memorywrite.
 
 [MEASURED] Round3 preflight28/28doctorOK/requestedmodelsadvertised/privatefloor20 unchanged. Free storage transient7.84→40.25→84.805GiB with NO deletion; attribution unknown, auditonly13.218GiB reusablebuildcandidates recorded, no newcleanup authorization/execution. Firstrunworkflow schema refused beforeprovider; input corrected tofreeform/frontmatter/falsificationlicense, rawrefusal kept. Admittedexecutionexec-6aefbce72f025b0c8c8e63fb328fcabc/attempt-06bd12e7de6bdf7109aca283dbae823c/session79469; actualclaude-sonnet-5-5 confirmed. Typedinput2b3b-pass-b2a-round3-dispatch-v2.md; config2b3b-pass-b2a-round3-repair.toml mounts existingwarmcargoRO; languagewarming skippedambiguity but depsmount explicit. Counter3/3 manualsource—notcheckpointrewrite. Predispatchsecondcustody b2a-round3-predispatch-custody/, update manifest forcorrectedinput/refusal files.
+
+[MEASURED] Round3 intermediate receipts: untouched110 control34/0/0/corecompiled; before6paths vsafter2Gitpaths semanticallymatch and bindimmutable110 (firstwhole-file-equality controllerprobe invalid because population differs). Corrected seam-onlyRED36/4/0 with actualtested source snapshots retained; earlierINVALID-T4-targetpath trial separate. Repaired40/0/0/corecompiled; all5snapshot hashes match frozenmatrixlaunch5535241c/a5bc2aae. Matrix17rowscomplete:15actualbehavioralflips(12productionstatement variants+2testseams+1wholedefectivecontrol), controls40/0/0, noinvalid/missedprediction/populationmismatch, all15mutateddigests recomputed/recordedbeforeafter/live5restoreequal; secondcustody b2a-round3-completed-matrix-custody/. Finalfocused active (no totalsclaim), full6gates/source3pending. Prepared providerfree run-b2a-round3-six-gates.py uses exactunchanged6commandJSON6811ef04; syntaxcheckedonly. Preparedreviewconfig6f2f2a5e validated, hardreadonlySol3/3, no dispatchbeforecomplete6receipts. prepare-b2b-after-round3-dispatch.py requires actualAPPROVE3/3 and exactadoption/cleanbase; unexecuted. No native/wholeG/adoptionclaim.
