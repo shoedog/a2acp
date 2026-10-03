@@ -230,9 +230,11 @@
     keep reconstruction distinct. Initial existing33 trial had2guard-position failures; duplicate newlabel
     fixed and2sequence rows reportedPASS. Reconstructed seam-only413 RED29/6 compiled/fullraw audited;
     expanded36-test RED29/7 supplied summary has overlapping log writers/interleaved rows, not fullproof.
-    Repair spec3 frozen190variants; sealed95+3controls independently audited/secondcopies retained:
-    86behavioral flips,4structural-only,5declarednonflips; C06/C07/M19 SCAN predictions missed
-    but all three fail behavioral tests. No invalid runs; original predictions retained.
+    Repair trialspec3 COMPLETE190+6controls36/0/0 independently audited/secondcopies retained:
+    176runtime/instrumented-sequence flips,4source-structural,10nonflips, zero invalid runs.
+    Six predictionmisses C06/C07/M19SCAN,Q01/Q23/Q24HALT retained; D04/S03unexpectedflips.
+    Sonnet strengthens captured-onlyHALT/scan tests; spec4explicitreasons before newmutants.
+    Earliertrialnottransferred; oldepochcontrollerwatcher retired, provider/reviewcap2unchanged.
     Final-byte matrix/focused/fullgates/source2 pending.
     Worker "132single-statement" wording overstates granularity; actual definitions include coupled
     pairs/whole-step slices/test-only log hooks. Preserve exact variants, not132single-production-guard claim.
