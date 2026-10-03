@@ -1,12 +1,14 @@
 # Handoff — ADR-0041 2B3b B2b approved and adopted; B2c active
 
-**Written:** 2026-10-03T22:13:29.597905+00:00 · **By:** Codex controller · **Provider:** codex
+**Written:** 2026-10-03T22:30:22.648906+00:00 · **By:** Codex controller · **Provider:** codex
 **Workspace:** /Users/wesleyjinks/code/a2a-bridge · work/adr0041-2b3b-bootstrap-20261001 · **Measured state:** `[MEASURED]` approved A/B1a/B1b/B2a/B2b runtime adopted through18ff5beac8d6435966810baf7d04e5715a662714; B2c4136310d isolated and verifying, not adopted. Probe git status/log and scratch receipt audits.
 **Predecessor:** B2b Sonnet5.5 run2436 complete; clean0dadd17e automatic Approved; actual Sol2/2 APPROVE0W2S0block.
 **Truth ordering:** measured live state > explicit owner/contract authority within its scope > this handoff for current operational state > earlier handoffs and non-authoritative summaries. A conflict between tiers stays OPEN in §0 — never resolved by document class alone.
 **Provenance:** folded by controller from measured Git/checkpoint/raw logs and actual source finals. Prior merged A/ACP/cleanup history is `[INHERITED]` from preceding committed handoffs; not rerun here. No memory write authorized.
 
 ## 0. Gating facts — settle these before starting anything below
+
+**Spec4 partial25 checkpoint:** `[MEASURED]` 25/190variants+3controls independently audited:21runtime/instrumented-sequence flips,4source-structural, no misses/nonflips/invalid runs yet. Full28rawlogs/audit/manifest retained in scratch/b2c-spec4-partial25-audited-custody/. New controller-only receiptwatcher28614 bound4h saves halfway/full spec4 snapshots; uses own report separate from interactive audit. Sonnet6053/Dockerobserver22954 active. Worker plans freshfocused/sixgates/source-boundRED aftermatrix; finalsource2/2/adoption/native/whole-G remain pending. Earliertrial retained, reviewcap2 unchanged.
 
 **Strengthened spec4 matrix ACTIVE:** `[MEASURED]` Five-source/spec4/driver/base-spec hashes independently matched in scratch/b2c-repair-spec4-launch-custody/. Git0224d33a/tests95481b09/spec4bb20fb16/driver187860f4; first3controls36/0/0. New190variants on strengthened Captured-onlyHALT/scan tests; literal-only AST audit includes explicit spec4reasons and reads loader expressions as data, never executing worker code. Preserve full trialspec3 predictions/results; no transfer or artifact/source-round restart. Currentbridge6053/Sonnet5.5 andDockerobserver22954 active, oldcontrollerwatcher76490 retired. Finalmatrix/focused/sixgates/actualSolsource2/2 remain required before B2c adoption.
 
