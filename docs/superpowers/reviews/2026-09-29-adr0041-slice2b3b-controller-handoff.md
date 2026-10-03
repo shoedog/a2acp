@@ -1,4 +1,4 @@
-# Handoff — ADR-0041 2B3b B2b approved and adopted; B2c next
+# Handoff — ADR-0041 2B3b B2b approved and adopted; B2c active
 
 **Written:** 2026-10-03T13:39:12.049141+00:00 · **By:** Codex controller · **Provider:** codex
 **Workspace:** /Users/wesleyjinks/code/a2a-bridge · work/adr0041-2b3b-bootstrap-20261001 · **Measured state:** `[MEASURED]` approved A/B1a/B1b/B2a/B2b runtime adopted through18ff5beac8d6435966810baf7d04e5715a662714; docs reconciliation to commit separately. Probe git status/log and scratch receipt audits.
@@ -7,6 +7,8 @@
 **Provenance:** folded by controller from measured Git/checkpoint/raw logs and actual source finals. Prior merged A/ACP/cleanup history is `[INHERITED]` from preceding committed handoffs; not rerun here. No memory write authorized.
 
 ## 0. Gating facts — settle these before starting anything below
+
+**Latest receipt audit:** `[MEASURED]` Partial B2c trial45/111 variants plus3controls independently checked against frozen source/spec/full raw logs. No compile/time/population invalidity; missed predictions and two structural-only flips retained. P03/W15/W21/W23 embed captured failing one-test child output. Controller auditor's one-summary assumption was inadmissible; corrected parser separates primary33-test outcomes from embedded child outcomes and preserves mixed worker fields. Second copies and hypothesis/result log: scratch/b2c-partial45-matrix-audited-custody/. Still no final source approval or whole-G completion.
 
 **(a) Lane ownership** — `[MEASURED]` B2c6053 ACTIVE, quarantineimpl-70428-q52t65ks/basedc0b45bafd3538c93fe15254bd9f975ad34f4c71. Actualclaude-sonnet-5-5/transcript33085e37-e00a-46db-8999-43c19c01cee7; writer387d362c82e2e7f8201beb2c80183c2238ab4ec65f4078d17be23f7b9c4e6119; observera1dcb69cd1bc2768efa6e5bc9a37b41953c943cc0477380c0411f051e9efa41b. Untouched287/0/0/corecompiled; testsFIRST corrected structuralRED54errors retained. Initial filtered25test trial19/6 and fixture/scan corrections retained with limited-output/observed-source labels. Current111variant trial matrix RUNNING in three scratch copies, first controls33/0/0 reported; no full focused/final gates/source approval yet. Setup rsync absence invalid before mutations; corrected shutil driver/spec/frozen sources secondcustody retained. — RESOLVED.
 **(b) Custody exposure** — `[MEASURED]` B2b exact three owned files adopted at18ff5bea from0dadd17e after actual SolAPPROVE0W2S0block2/2. Complete808file source/worker/transcripts/raw reviews/checkpoint custody and both six-gate populations retained. Original bridge message preserved/reconciled by operator message. ARejected/B1aInconclusive/B2aRejected histories untouched. — RESOLVED.

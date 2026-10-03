@@ -201,6 +201,10 @@
     25test trial19/6 and subsequenttestfixture/scan corrections retained with evidence limits; current111variant
     trial matrix active in three scratch copies, first controls33/0/0 reported. No fullfocused/finalgates/approval.
     Firstsetup rsync absence invalid beforemutations; corrected driver/spec/frozen source secondcopies retained.
+    Partial controller audit retained45/111mutants and3controls: no compile/time/population invalidity,
+    missed predictions and two structural-only flips preserved. Four rows contain captured failing child
+    test output; auditor separates primary33-test outcomes from embedded child outcomes and retains
+    the driver's mixed fields. No implementation defect or complete-matrix claim follows from this audit.
     Provider-free receipt observer22954
     bounded24h/cacheRO/networknone copies completed gate logs as they appear; no duplicate suites.
     Native and whole-G gates remain pending. Transientlowspace
