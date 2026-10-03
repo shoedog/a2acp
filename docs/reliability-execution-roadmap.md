@@ -209,6 +209,8 @@
     Sonnet strengthened tests and wrote explicit prediction overrides; final132-variant matrix RUNNING.
     Launch Gitde910e03/testsdb671562/spec2dc47b7c4/driver37405ee1 hashes independently checked;
     all3startingcontrols33/0/0. Separate12file launch custody and literal-only final auditor retained.
+    Halfway audit66/132:60behavioral-failure variants,4structural-only,2declarednonflips,
+    no missed predictions or invalid runs. Partial75file secondcustody retained.
     Pre-check fmt/clippy/B2c pass reported with filtered output; final full raw six gates still pending.
     Provider-free receipt observer22954
     bounded24h/cacheRO/networknone copies completed gate logs as they appear; no duplicate suites.
