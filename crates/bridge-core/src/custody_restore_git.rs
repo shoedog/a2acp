@@ -70,6 +70,20 @@
 //! frames (a second decode bound to [`ActiveFramePlanV1`]); a later pass feeds the same builder from
 //! the retained final descriptors. [`encode_inert_config_v1`] is the deterministic active config. It
 //! restores nothing: no repository entry, no Git child, no ledger access.
+//!
+//! **Pass B2a.** The helper whose result is [`FinalObjectStoreV1`] is the first that creates anything
+//! under `repository/`. Only after the retained, prevalidated active frames ([`ActiveFramePlanV1`], which must be
+//! this capsule's) and the proven bootstrap agree does it create `repository/.git/objects/{pack,info}`
+//! through retained pins, create-new, charging every entry before it exists, and copy ONLY the bootstrap's
+//! three admitted regular files (`.pack`, `.idx`, `.rev`) from their retained descriptors: each chunk is
+//! charged before it is written, the bytes are compared with the admitted length and SHA-256 as they stream
+//! and again when read back from the new file, and the file and its directory are synced. The second copy
+//! is charged like the first. Every chain, device, and mount is rechecked around the writes under the one
+//! deadline, which is read again after every recheck, source read, and file sync, before the next create,
+//! charge, write, or sync. Nothing is renamed, overwritten, deleted, or cleaned up, the bootstrap's own HEAD, config, and
+//! hooks are never copied, and no Git child runs. A refusal keeps every created byte and reports it as typed
+//! partial effects. The result is a helper value for the later passes, not phase G's result, and the pass A
+//! invariant above stays function-scoped: direct [`bootstrap_git_objects_v1`] still creates nothing there.
 
 use super::{
     create_staging_directory, hash_prefix, joined, lossy, recheck_entry, refuse_mounts_within,
@@ -227,6 +241,11 @@ pub(crate) enum GitBootstrapErrorV1 {
     Refs(RefsFaultV1),
     #[error("the active-frame plan is not this capsule's: {0}")]
     ActivePlanMismatch(String),
+    // The final object store (pass B2a).
+    #[error("the verified bootstrap is not a proven object store: {0}")]
+    ObjectStoreInput(String),
+    #[error("the copy of {relative} is not the admitted bytes: {detail}")]
+    ObjectCopy { relative: String, detail: String },
     /// A child failed, and reconciling what it left behind failed too. Neither is dropped: the
     /// reconciliation failure is a budget or custody refusal in its own right.
     #[error("{primary}; reconciling the failed child's effects also failed: {reconcile}")]
@@ -363,6 +382,22 @@ pub(crate) enum GitHookPointV1 {
     /// A decoded active-frame entry is about to be judged: the path is the entry's frame path (pass
     /// B1a).
     FrameEntry,
+    /// An object-store entry is about to be created, after its pre-create recheck: the label is
+    /// `directory` or `file`, and the path is the entry (pass B2a).
+    BeforeObjectCreate,
+    /// One chunk of an object file is about to be read, charged, and written: the path is the new file
+    /// (pass B2a).
+    BeforeObjectChunk,
+    /// A created file or its directory was just synced: the label is `file` or `directory`, and the path
+    /// is that file or that directory (pass B2a).
+    ObjectSynced,
+    /// All object-store entries are made, before the final gate: the path is the destination root (pass
+    /// B2a).
+    BeforeObjectsFinalGate,
+    /// One blocking call of the object-store copy has just returned, before its result is examined: the
+    /// label is `read` (a chunk read), `write`, or `probe` (the length probe), and the path is the new
+    /// file (pass B2a). A hook that sleeps here is that call having been slow.
+    ObjectIo,
 }
 
 #[cfg(test)]
@@ -383,6 +418,47 @@ thread_local! {
     /// Which of a census fact's timestamps are reported as never having advanced.
     static CENSUS_CLOCKS: std::cell::Cell<StalledClocksV1> =
         const { std::cell::Cell::new(StalledClocksV1 { mtime: false, ctime: false }) };
+    /// A smaller chunk for the object-store copy, so small files span several chunks.
+    static COPY_CHUNK: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+    /// A fault the object-store copy raises in place of one filesystem effect.
+    static OBJECT_FAULT: std::cell::Cell<Option<ObjectFaultV1>> =
+        const { std::cell::Cell::new(None) };
+    /// How many more calls of each kind (read, write, probe) return as interrupted, having done nothing.
+    static OBJECT_INTERRUPTS: std::cell::Cell<[u32; 3]> = const { std::cell::Cell::new([0; 3]) };
+}
+
+/// A blocking call of the object-store copy on a descriptor: the three that can return after the deadline
+/// and be followed by a retry or a continuation (pass B2a).
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ObjectCallV1 {
+    /// A chunk read of the retained source.
+    Read,
+    /// A write of the rest of a chunk to the new file.
+    Write,
+    /// The one-byte read that proves the source holds no more than its admitted length.
+    Probe,
+}
+
+/// A fault a test makes the object-store copy raise in place of one filesystem effect, so a failure whose
+/// real trigger is a full disk, an I/O error, or a permission refusal is exercised (pass B2a).
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ObjectFaultV1 {
+    /// Every file's writes stop after this many bytes of that file: the write that would pass the limit
+    /// writes only up to it, and the next write fails.
+    WriteAfter(u64),
+    /// The same limit, but the next write reports that it wrote nothing.
+    WriteZeroAfter(u64),
+    /// The file's `fsync` fails.
+    SyncFile,
+    /// The pack directory's `fsync` fails.
+    SyncDirectory,
+    /// Creating the file fails with an error that is not a collision.
+    CreateFile,
+    /// Every write accepts at most this many bytes of what it is given, as signals, quotas, and some
+    /// filesystems make it: the rest of the chunk is left to the next call.
+    ShortWrites(usize),
 }
 
 /// The timestamps a test makes the census see as never having moved: a filesystem whose clock is too
@@ -401,6 +477,9 @@ pub(crate) enum GitSeamGuardV1 {
     Hook(GitHookPointV1),
     CensusDev(String),
     CensusClocks,
+    CopyChunk,
+    ObjectFault,
+    ObjectInterrupts(ObjectCallV1),
 }
 
 #[cfg(test)]
@@ -416,6 +495,13 @@ impl Drop for GitSeamGuardV1 {
             Self::CensusClocks => {
                 CENSUS_CLOCKS.with(|clocks| clocks.set(StalledClocksV1::default()))
             }
+            Self::CopyChunk => COPY_CHUNK.with(|chunk| chunk.set(None)),
+            Self::ObjectFault => OBJECT_FAULT.with(|fault| fault.set(None)),
+            Self::ObjectInterrupts(call) => OBJECT_INTERRUPTS.with(|left| {
+                let mut counts = left.get();
+                counts[*call as usize] = 0;
+                left.set(counts);
+            }),
         }
     }
 }
@@ -441,6 +527,48 @@ pub(crate) fn override_census_dev_for_test(relative: &str, dev: u64) -> GitSeamG
 pub(crate) fn stall_census_clocks_for_test(stalled: StalledClocksV1) -> GitSeamGuardV1 {
     CENSUS_CLOCKS.with(|clocks| clocks.set(stalled));
     GitSeamGuardV1::CensusClocks
+}
+
+/// Makes the object-store copy raise `fault` in place of one filesystem effect.
+#[cfg(test)]
+pub(crate) fn override_object_fault_for_test(fault: ObjectFaultV1) -> GitSeamGuardV1 {
+    OBJECT_FAULT.with(|slot| slot.set(Some(fault)));
+    GitSeamGuardV1::ObjectFault
+}
+
+/// Makes the first `count` calls of `call` return as interrupted (`EINTR`), having done nothing; later calls
+/// are real. A regular file does not produce an interruption on demand, and a retried one is exactly the
+/// call that must still observe the one deadline.
+#[cfg(test)]
+pub(crate) fn interrupt_object_calls_for_test(call: ObjectCallV1, count: u32) -> GitSeamGuardV1 {
+    OBJECT_INTERRUPTS.with(|left| {
+        let mut counts = left.get();
+        counts[call as usize] = count;
+        left.set(counts);
+    });
+    GitSeamGuardV1::ObjectInterrupts(call)
+}
+
+/// The interruption the next `call` is to return, if a test asked for one: consumed once.
+#[cfg(test)]
+fn injected_interrupt(call: ObjectCallV1) -> Option<io::Error> {
+    OBJECT_INTERRUPTS.with(|left| {
+        let mut counts = left.get();
+        let slot = &mut counts[call as usize];
+        if *slot == 0 {
+            return None;
+        }
+        *slot -= 1;
+        left.set(counts);
+        Some(io::Error::from(ErrorKind::Interrupted))
+    })
+}
+
+/// Makes the object-store copy read, charge, and write `bytes` at a time instead of one hash buffer.
+#[cfg(test)]
+pub(crate) fn override_object_copy_chunk_for_test(bytes: usize) -> GitSeamGuardV1 {
+    COPY_CHUNK.with(|chunk| chunk.set(Some(bytes.max(1))));
+    GitSeamGuardV1::CopyChunk
 }
 
 #[cfg(test)]
@@ -4746,4 +4874,1091 @@ pub(crate) fn encode_inert_config_v1(format: GitObjectFormatV1) -> Vec<u8> {
         text.push_str("[extensions]\n\tobjectformat = sha256\n");
     }
     text.into_bytes()
+}
+
+// ---------------------------------------------------------------------------------------------
+// Pass B2a: charged second object store
+// ---------------------------------------------------------------------------------------------
+
+/// One directory of the final object store, in creation order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ObjectDirV1 {
+    Repository,
+    Git,
+    Objects,
+    Pack,
+    Info,
+}
+
+impl ObjectDirV1 {
+    const ALL: [Self; 5] = [
+        Self::Repository,
+        Self::Git,
+        Self::Objects,
+        Self::Pack,
+        Self::Info,
+    ];
+
+    const fn index(self) -> usize {
+        match self {
+            Self::Repository => 0,
+            Self::Git => 1,
+            Self::Objects => 2,
+            Self::Pack => 3,
+            Self::Info => 4,
+        }
+    }
+
+    /// The name beneath its parent.
+    const fn leaf(self) -> &'static str {
+        match self {
+            Self::Repository => "repository",
+            Self::Git => ".git",
+            Self::Objects => "objects",
+            Self::Pack => "pack",
+            Self::Info => "info",
+        }
+    }
+
+    /// The destination-relative name: what the ledger's collision refusal, the device seam, and every
+    /// custody refusal call it.
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Repository => "repository",
+            Self::Git => "repository/.git",
+            Self::Objects => "repository/.git/objects",
+            Self::Pack => "repository/.git/objects/pack",
+            Self::Info => "repository/.git/objects/info",
+        }
+    }
+
+    /// The directory it is created beneath: `None` is the destination root.
+    const fn parent(self) -> Option<Self> {
+        match self {
+            Self::Repository => None,
+            Self::Git => Some(Self::Repository),
+            Self::Objects => Some(Self::Git),
+            Self::Pack | Self::Info => Some(Self::Objects),
+        }
+    }
+}
+
+/// The directory pins the helper has created so far. A refusal reports them as they stand; a success
+/// freezes them as a [`FinalObjectPinsV1`].
+#[derive(Debug, Default)]
+pub(crate) struct PartialObjectPinsV1 {
+    pub(crate) repository: Option<PinnedDirectoryV1>,
+    pub(crate) git: Option<PinnedDirectoryV1>,
+    pub(crate) objects: Option<PinnedDirectoryV1>,
+    pub(crate) pack: Option<PinnedDirectoryV1>,
+    pub(crate) info: Option<PinnedDirectoryV1>,
+}
+
+impl PartialObjectPinsV1 {
+    fn set(&mut self, dir: ObjectDirV1, pin: PinnedDirectoryV1) {
+        let slot = match dir {
+            ObjectDirV1::Repository => &mut self.repository,
+            ObjectDirV1::Git => &mut self.git,
+            ObjectDirV1::Objects => &mut self.objects,
+            ObjectDirV1::Pack => &mut self.pack,
+            ObjectDirV1::Info => &mut self.info,
+        };
+        *slot = Some(pin);
+    }
+
+    /// All five pins, or the pins back as they were.
+    fn freeze(self) -> Result<FinalObjectPinsV1, Box<Self>> {
+        match self {
+            Self {
+                repository: Some(repository),
+                git: Some(git),
+                objects: Some(objects),
+                pack: Some(pack),
+                info: Some(info),
+            } => Ok(FinalObjectPinsV1 {
+                repository,
+                git,
+                objects,
+                pack,
+                info,
+            }),
+            other => Err(Box::new(other)),
+        }
+    }
+}
+
+/// The five retained pins of the final object store: `repository/`, its `.git/`, `objects/`, and
+/// `objects/pack` and `objects/info`.
+#[derive(Debug)]
+pub(crate) struct FinalObjectPinsV1 {
+    pub(crate) repository: PinnedDirectoryV1,
+    pub(crate) git: PinnedDirectoryV1,
+    pub(crate) objects: PinnedDirectoryV1,
+    pub(crate) pack: PinnedDirectoryV1,
+    pub(crate) info: PinnedDirectoryV1,
+}
+
+impl FinalObjectPinsV1 {
+    fn thaw(self) -> PartialObjectPinsV1 {
+        PartialObjectPinsV1 {
+            repository: Some(self.repository),
+            git: Some(self.git),
+            objects: Some(self.objects),
+            pack: Some(self.pack),
+            info: Some(self.info),
+        }
+    }
+}
+
+/// The pins a recheck looks at, borrowed from either a partial or a frozen set.
+#[derive(Clone, Copy)]
+struct PinViewV1<'p> {
+    pins: [Option<&'p PinnedDirectoryV1>; 5],
+}
+
+impl<'p> PinViewV1<'p> {
+    fn of_partial(pins: &'p PartialObjectPinsV1) -> Self {
+        Self {
+            pins: [
+                pins.repository.as_ref(),
+                pins.git.as_ref(),
+                pins.objects.as_ref(),
+                pins.pack.as_ref(),
+                pins.info.as_ref(),
+            ],
+        }
+    }
+
+    fn of_final(pins: &'p FinalObjectPinsV1) -> Self {
+        Self {
+            pins: [
+                Some(&pins.repository),
+                Some(&pins.git),
+                Some(&pins.objects),
+                Some(&pins.pack),
+                Some(&pins.info),
+            ],
+        }
+    }
+
+    fn get(&self, dir: ObjectDirV1) -> Option<&'p PinnedDirectoryV1> {
+        self.pins[dir.index()]
+    }
+}
+
+/// What the helper charged to the one ledger and has not given back: entry allowances and logical bytes.
+/// The ledger moved by exactly `entries * ENTRY_ALLOWANCE_BYTES_V1 + bytes`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ObjectStoreChargeV1 {
+    pub(crate) entries: u64,
+    pub(crate) bytes: u64,
+}
+
+/// One object file copied whole and verified: its retained descriptor (read-write, at offset 0), and its
+/// length, SHA-256, device, and inode, measured from it.
+#[derive(Debug)]
+pub(crate) struct MaterializedObjectFileV1 {
+    /// Relative to `.git`, and to the bootstrap alike: `objects/pack/pack-<hash>.pack`.
+    pub(crate) relative: String,
+    pub(crate) file: File,
+    pub(crate) length: u64,
+    pub(crate) sha256: [u8; 32],
+    pub(crate) dev: u64,
+    pub(crate) ino: u64,
+}
+
+/// The one object file that was being created or written when a refusal came: the bytes written so far
+/// are on disk and stay there.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct InFlightObjectFileV1 {
+    pub(crate) relative: String,
+    pub(crate) expected_length: u64,
+    /// Exactly the bytes that reached the file: it advances with every successful write, including the
+    /// prefix of a chunk whose write then failed, and the ledger keeps exactly these bytes charged.
+    pub(crate) written: u64,
+}
+
+/// The second object store, created and verified. This is a helper's value for the later passes, not
+/// phase G's result: no HEAD, config, refs, or Git child belongs to it.
+#[derive(Debug)]
+pub(crate) struct FinalObjectStoreV1 {
+    /// The phase-G step this completes.
+    pub(crate) step: GitPlaneStepV1,
+    pub(crate) pins: FinalObjectPinsV1,
+    /// The copied files, in copy order (`.pack`, `.idx`, `.rev`); empty for an Empty object database.
+    pub(crate) files: Vec<MaterializedObjectFileV1>,
+    pub(crate) charged: ObjectStoreChargeV1,
+}
+
+/// What a refused invocation left: the pins that exist, the files that are whole, the file that was in
+/// flight, and what it still has charged. Nothing here is ever removed.
+#[derive(Debug, Default)]
+pub(crate) struct ObjectStorePartialV1 {
+    pub(crate) pins: PartialObjectPinsV1,
+    pub(crate) files: Vec<MaterializedObjectFileV1>,
+    pub(crate) in_flight: Option<InFlightObjectFileV1>,
+    pub(crate) charged: ObjectStoreChargeV1,
+}
+
+/// A refused or failed second object store, with how far it got. `last_completed` is the caller's own
+/// last completed step, carried unchanged (this helper completes [`GitPlaneStepV1::Objects`] only whole).
+#[derive(Debug)]
+pub(crate) struct ObjectStoreFailureV1 {
+    pub(crate) cause: GitBootstrapErrorV1,
+    pub(crate) last_completed: Option<GitPlaneStepV1>,
+    /// Whether this invocation may have created an entry: false for every refusal before the first
+    /// create, and for a collision at the very first entry.
+    pub(crate) active_materialization_began: bool,
+    /// The one ledger's charge when the failure was returned.
+    pub(crate) ledger_used: u64,
+    pub(crate) partial: ObjectStorePartialV1,
+}
+
+/// The reads and writes of the copy go through a buffer of this size, unless a test makes it smaller.
+fn copy_chunk_bytes() -> usize {
+    #[cfg(test)]
+    if let Some(bytes) = COPY_CHUNK.with(std::cell::Cell::get) {
+        return bytes;
+    }
+    HASH_BUFFER_BYTES_V1
+}
+
+/// Create the output file beneath the pack pin, create-new and no-follow.
+fn create_output_file(pack: &PinnedDirectoryV1, leaf: &str) -> Result<File, FsCustodyError> {
+    #[cfg(test)]
+    if OBJECT_FAULT.with(std::cell::Cell::get) == Some(ObjectFaultV1::CreateFile) {
+        return Err(FsCustodyError::Io(
+            "custody restore object store file".to_owned(),
+            io::Error::from(ErrorKind::PermissionDenied),
+        ));
+    }
+    pack.create_new_regular_child(OsStr::new(leaf), "custody restore object store file")
+}
+
+/// One chunk read of the retained source descriptor.
+fn read_chunk_step(source: &File, buffer: &mut [u8]) -> io::Result<usize> {
+    #[cfg(test)]
+    if let Some(interrupted) = injected_interrupt(ObjectCallV1::Read) {
+        return Err(interrupted);
+    }
+    let mut reader = source;
+    reader.read(buffer)
+}
+
+/// One read of the length probe on the retained source descriptor.
+fn read_probe_step(source: &File, buffer: &mut [u8]) -> io::Result<usize> {
+    #[cfg(test)]
+    if let Some(interrupted) = injected_interrupt(ObjectCallV1::Probe) {
+        return Err(interrupted);
+    }
+    let mut reader = source;
+    reader.read(buffer)
+}
+
+/// One write of `bytes` to the output file, which already holds `written` bytes.
+fn write_step(output: &mut File, bytes: &[u8], written: u64) -> io::Result<usize> {
+    use std::io::Write as _;
+
+    #[cfg(not(test))]
+    let _ = written;
+    #[cfg(test)]
+    if let Some(interrupted) = injected_interrupt(ObjectCallV1::Write) {
+        return Err(interrupted);
+    }
+    #[cfg(test)]
+    match OBJECT_FAULT.with(std::cell::Cell::get) {
+        Some(ObjectFaultV1::ShortWrites(most)) => {
+            let take = bytes.len().min(most.max(1));
+            return output.write(&bytes[..take]);
+        }
+        Some(ObjectFaultV1::WriteAfter(limit)) | Some(ObjectFaultV1::WriteZeroAfter(limit)) => {
+            let room = limit.saturating_sub(written);
+            if room == 0 {
+                return if OBJECT_FAULT.with(std::cell::Cell::get)
+                    == Some(ObjectFaultV1::WriteZeroAfter(limit))
+                {
+                    Ok(0)
+                } else {
+                    Err(io::Error::other("an injected write fault"))
+                };
+            }
+            let take = usize::try_from(room).map_or(bytes.len(), |room| room.min(bytes.len()));
+            return output.write(&bytes[..take]);
+        }
+        _ => {}
+    }
+    output.write(bytes)
+}
+
+/// Give back `bytes` of a chunk that was reserved on the ledger and provably never written (a failed or
+/// zero-length write reports that none of them reached the file): the ledger and the facts both drop them.
+fn give_back_unwritten(
+    dest: &super::RestoreDestinationV1,
+    charged: &mut ObjectStoreChargeV1,
+    bytes: usize,
+) {
+    let bytes = bytes as u64;
+    dest.ledger.borrow_mut().release(bytes);
+    charged.bytes = charged.bytes.saturating_sub(bytes);
+}
+
+/// Flush the output file's contents to stable storage.
+fn sync_output_file(output: &File, relative: &str) -> Result<(), GitBootstrapErrorV1> {
+    #[cfg(test)]
+    if OBJECT_FAULT.with(std::cell::Cell::get) == Some(ObjectFaultV1::SyncFile) {
+        return Err(io_refusal(
+            relative,
+            &io::Error::other("an injected file sync fault"),
+        ));
+    }
+    output
+        .sync_all()
+        .map_err(|error| io_refusal(relative, &error))
+}
+
+/// Flush the pack directory's new entry to stable storage.
+fn sync_pack_directory(pack: &PinnedDirectoryV1) -> Result<(), GitBootstrapErrorV1> {
+    #[cfg(test)]
+    if OBJECT_FAULT.with(std::cell::Cell::get) == Some(ObjectFaultV1::SyncDirectory) {
+        return Err(GitBootstrapErrorV1::Restore(CustodyRestoreErrorV1::Io(
+            "an injected directory sync fault".to_owned(),
+        )));
+    }
+    pack.sync("custody restore object store directory")
+        .map_err(fs_error)
+}
+
+fn leaf_of(relative: &str) -> &str {
+    relative.rsplit('/').next().unwrap_or(relative)
+}
+
+fn io_refusal(relative: &str, error: &io::Error) -> GitBootstrapErrorV1 {
+    GitBootstrapErrorV1::Restore(CustodyRestoreErrorV1::Io(format!("{relative}: {error}")))
+}
+
+fn object_input(why: impl Into<String>) -> GitBootstrapErrorV1 {
+    GitBootstrapErrorV1::ObjectStoreInput(why.into())
+}
+
+fn copy_refusal(relative: &str, detail: impl Into<String>) -> GitBootstrapErrorV1 {
+    GitBootstrapErrorV1::ObjectCopy {
+        relative: relative.to_owned(),
+        detail: detail.into(),
+    }
+}
+
+/// The plan is this capsule's complete active prevalidation: the capsule's active classes include a
+/// Captured `RefsAndHead` (an Empty one is [`GitBootstrapErrorV1::EmptyRefsAndHead`], and no HEAD is ever
+/// synthesized), and the plan names exactly the capsule's active frames, in order, at the same staged
+/// payloads, with the length and SHA-256 the verified capsule recorded for each. Pure.
+fn require_prevalidated(
+    boot: &VerifiedGitBootstrapV1,
+    plan: &ActiveFramePlanV1,
+) -> Result<(), GitBootstrapErrorV1> {
+    let active = classify_active_frames(&boot.verified)?;
+    if !active
+        .iter()
+        .any(|frame| frame.class == CustodyCoverageClassV1::RefsAndHead)
+    {
+        return Err(GitBootstrapErrorV1::EmptyRefsAndHead);
+    }
+    let planned: Vec<(CustodyCoverageClassV1, usize)> = plan
+        .frames
+        .iter()
+        .map(|frame| (frame.class, frame.staged))
+        .collect();
+    let expected: Vec<(CustodyCoverageClassV1, usize)> = active
+        .iter()
+        .map(|frame| (frame.class, frame.staged))
+        .collect();
+    if planned != expected {
+        return Err(plan_mismatch(
+            "the frames are not the capsule's active frames",
+        ));
+    }
+    for summary in &plan.frames {
+        let recorded = boot
+            .verified
+            .staged
+            .get(summary.staged)
+            .ok_or_else(|| plan_mismatch("a frame names no staged payload"))?;
+        if recorded.length != summary.length || recorded.sha256 != summary.sha256 {
+            return Err(plan_mismatch("a frame is not the verified plaintext"));
+        }
+    }
+    if boot.active_frames != active {
+        return Err(object_input(
+            "the bootstrap's active frames are not the capsule's",
+        ));
+    }
+    Ok(())
+}
+
+/// The bootstrap is a proven object store: strict fsck ran, the closure evidence agrees with the
+/// manifest's inventory and coverage, the provenance and the objects agree, and a Captured pack is the
+/// hash-named `.pack`, `.idx`, and `.rev` of the bootstrap's retained pack directory, in that order. The
+/// pack name is a lower-case object-id-width hexadecimal string, never a path. Pure.
+fn require_proven_bootstrap(boot: &VerifiedGitBootstrapV1) -> Result<(), GitBootstrapErrorV1> {
+    let manifest = &boot.verified.control.manifest;
+    let inventory = manifest.original_objects().len();
+    if !boot.closure.fsck_strict {
+        return Err(object_input("strict fsck was not proven"));
+    }
+    if boot.closure.inventory_objects != inventory {
+        return Err(object_input(format!(
+            "the closure evidence covers {} objects, and the manifest lists {inventory}",
+            boot.closure.inventory_objects
+        )));
+    }
+    let database = coverage_state(manifest, CustodyCoverageClassV1::ObjectDatabase);
+    match (
+        &boot.objects,
+        boot.provenance,
+        boot.closure.closure,
+        database,
+    ) {
+        (
+            BootstrapObjectsV1::Captured { pack_hash, files },
+            GitFormatProvenanceV1::CapsuleObjectsAndPack,
+            GitClosureProofV1::Reachable { objects },
+            Some(CustodyStateClassV1::Captured),
+        ) => {
+            if inventory == 0 || objects != inventory {
+                return Err(object_input(
+                    "the reachable closure is not the manifest's inventory",
+                ));
+            }
+            if !is_object_id(pack_hash, boot.object_format) {
+                return Err(object_input(
+                    "the pack name is not an object id of the caller's format",
+                ));
+            }
+            if files.len() != 3 {
+                return Err(object_input(format!(
+                    "a Captured bootstrap admits three files, not {}",
+                    files.len()
+                )));
+            }
+            for (file, extension) in files.iter().zip(["pack", "idx", "rev"]) {
+                if file.relative != format!("{PACK_DIRECTORY_V1}/pack-{pack_hash}.{extension}") {
+                    return Err(object_input(format!(
+                        "{} is not the admitted .{extension}",
+                        file.relative
+                    )));
+                }
+            }
+            if !boot.directories.contains_key(PACK_DIRECTORY_V1) {
+                return Err(object_input(
+                    "the bootstrap's pack directory is not retained",
+                ));
+            }
+        }
+        (
+            BootstrapObjectsV1::Empty,
+            GitFormatProvenanceV1::CallerSelectedEmpty,
+            GitClosureProofV1::Vacuous,
+            Some(CustodyStateClassV1::Empty),
+        ) => {
+            if inventory != 0 {
+                return Err(object_input("an Empty object database lists objects"));
+            }
+        }
+        _ => {
+            return Err(object_input(
+                "the objects, provenance, closure, and manifest coverage disagree",
+            ))
+        }
+    }
+    Ok(())
+}
+
+/// The admitted bootstrap files, in copy order; none for Empty.
+fn admitted_files(boot: &VerifiedGitBootstrapV1) -> &[AdmittedObjectFileV1] {
+    match &boot.objects {
+        BootstrapObjectsV1::Captured { files, .. } => files,
+        BootstrapObjectsV1::Empty => &[],
+    }
+}
+
+/// Every admitted bootstrap file is still the entry its retained pack directory holds, and its retained
+/// descriptor is still that regular file at the admitted length. A link, a directory, a special file,
+/// another inode, or another length refuses; the replacement is never opened. Each file is preceded by the
+/// one deadline's guard.
+fn source_files_unchanged(
+    boot: &VerifiedGitBootstrapV1,
+    pace: PaceV1<'_>,
+) -> Result<(), GitBootstrapErrorV1> {
+    for admitted in admitted_files(boot) {
+        pace("objects-source")?;
+        let pack = boot
+            .directories
+            .get(PACK_DIRECTORY_V1)
+            .ok_or_else(|| object_input("the bootstrap's pack directory is not retained"))?;
+        let stat = pack
+            .child_metadata_no_follow(
+                OsStr::new(leaf_of(&admitted.relative)),
+                "custody restore admitted object file",
+            )
+            .map_err(fs_error)?
+            .ok_or_else(|| {
+                digest_identity(&admitted.relative, "no longer the admitted object file")
+            })?;
+        match stat.kind {
+            ChildKindV1::Symlink => {
+                return Err(GitBootstrapErrorV1::Restore(
+                    CustodyRestoreErrorV1::SymlinkRefused {
+                        name: admitted.relative.clone(),
+                    },
+                ))
+            }
+            ChildKindV1::Regular => {}
+            ChildKindV1::Directory | ChildKindV1::Special(_) => {
+                return Err(digest_identity(
+                    &admitted.relative,
+                    "no longer the admitted object file",
+                ))
+            }
+        }
+        if (stat.dev, stat.ino, stat.size) != (admitted.dev, admitted.ino, admitted.length) {
+            return Err(digest_identity(
+                &admitted.relative,
+                "no longer the admitted object file",
+            ));
+        }
+        let held = admitted
+            .file
+            .metadata()
+            .map_err(|error| io_refusal(&admitted.relative, &error))?;
+        let held = ChildStatV1::from_metadata(&held);
+        if (held.kind, held.dev, held.ino, held.size)
+            != (
+                ChildKindV1::Regular,
+                admitted.dev,
+                admitted.ino,
+                admitted.length,
+            )
+        {
+            return Err(digest_identity(
+                &admitted.relative,
+                "the retained descriptor is no longer the admitted object file",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Every output directory that exists is still the entry its parent holds, parents first, and every file
+/// already copied is still the regular file its retained pin lists, of the length and identity it was
+/// measured with. A link or another object refuses; nothing is followed.
+fn output_chains(
+    dest: &super::RestoreDestinationV1,
+    pins: PinViewV1<'_>,
+    files: &[MaterializedObjectFileV1],
+    pace: PaceV1<'_>,
+) -> Result<(), GitBootstrapErrorV1> {
+    for dir in ObjectDirV1::ALL {
+        let Some(pin) = pins.get(dir) else { continue };
+        pace("objects-chain")?;
+        let parent = match dir.parent() {
+            None => &dest.root,
+            Some(parent) => pins.get(parent).ok_or_else(|| {
+                CustodyRestoreErrorV1::IdentityChanged(format!(
+                    "{}: its parent is not retained",
+                    dir.name()
+                ))
+            })?,
+        };
+        recheck_entry(parent, dir.leaf().as_bytes(), pin, dir.name().as_bytes())?;
+    }
+    for file in files {
+        pace("objects-chain")?;
+        let pack = pins.get(ObjectDirV1::Pack).ok_or_else(|| {
+            CustodyRestoreErrorV1::IdentityChanged(format!(
+                "{}: the pack directory is not retained",
+                file.relative
+            ))
+        })?;
+        let stat = pack
+            .child_metadata_no_follow(
+                OsStr::new(leaf_of(&file.relative)),
+                "custody restore object store file",
+            )
+            .map_err(fs_error)?
+            .ok_or_else(|| digest_identity(&file.relative, "the copied file's entry is gone"))?;
+        match stat.kind {
+            ChildKindV1::Symlink => {
+                return Err(GitBootstrapErrorV1::Restore(
+                    CustodyRestoreErrorV1::SymlinkRefused {
+                        name: file.relative.clone(),
+                    },
+                ))
+            }
+            ChildKindV1::Regular => {}
+            ChildKindV1::Directory | ChildKindV1::Special(_) => {
+                return Err(digest_identity(
+                    &file.relative,
+                    "the entry is no longer the copied file",
+                ))
+            }
+        }
+        if (stat.dev, stat.ino, stat.size) != (file.dev, file.ino, file.length) {
+            return Err(digest_identity(
+                &file.relative,
+                "the entry is no longer the copied file",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// One run of the helper: the retained bootstrap it reads, and what it has created and charged so far.
+struct StoreRunV1<'a> {
+    boot: &'a VerifiedGitBootstrapV1,
+    deadline: Instant,
+    pins: PartialObjectPinsV1,
+    files: Vec<MaterializedObjectFileV1>,
+    in_flight: Option<InFlightObjectFileV1>,
+    charged: ObjectStoreChargeV1,
+    began: bool,
+}
+
+impl<'a> StoreRunV1<'a> {
+    fn dest(&self) -> &'a super::RestoreDestinationV1 {
+        &self.boot.verified.destination
+    }
+
+    /// The recheck between writes: every output directory and file, then every admitted source file, then
+    /// the staging, HOME, XDG, and bootstrap chains, and the destination root's identity LAST. Each step
+    /// is held to the one deadline.
+    fn chains(
+        &self,
+        pins: PinViewV1<'_>,
+        files: &[MaterializedObjectFileV1],
+        pace: PaceV1<'_>,
+    ) -> Result<(), GitBootstrapErrorV1> {
+        output_chains(self.dest(), pins, files, pace)?;
+        source_files_unchanged(self.boot, pace)?;
+        sweep_chains(
+            self.dest(),
+            Some(&self.boot.home),
+            Some(&self.boot.xdg),
+            &self.boot.directories,
+            pace,
+        )
+    }
+
+    /// [`Self::chains`] over what exists now, then the clock: the recheck ends in the destination root's
+    /// identity, which can block, so nothing the caller does next (a create, a charge, a write) may follow
+    /// an expired deadline. Only the final gate, which has nothing fallible after it, omits this guard.
+    fn recheck(&self) -> Result<(), GitBootstrapErrorV1> {
+        let deadline = self.deadline;
+        let pace = |step: &'static str| observe_deadline(deadline, step);
+        self.chains(PinViewV1::of_partial(&self.pins), &self.files, &pace)?;
+        observe_deadline(deadline, "objects-checked")
+    }
+
+    /// The full gate: the mount census first, then [`Self::chains`], then the clock (see
+    /// [`Self::recheck`]).
+    fn gate(&self) -> Result<(), GitBootstrapErrorV1> {
+        let deadline = self.deadline;
+        let pace = |step: &'static str| observe_deadline(deadline, step);
+        pace("objects-gate")?;
+        refuse_mounts_within(&self.dest().root)?;
+        self.chains(PinViewV1::of_partial(&self.pins), &self.files, &pace)?;
+        observe_deadline(deadline, "objects-checked")
+    }
+
+    /// The final gate over the frozen pins: the mount census, the output and source chains, every other
+    /// retained chain, and the destination root's identity LAST, the guard immediately before it being
+    /// the last statement ahead of it.
+    fn final_gate(&self, frozen: &FinalObjectPinsV1) -> Result<(), GitBootstrapErrorV1> {
+        #[cfg(test)]
+        run_git_hook(
+            GitHookPointV1::BeforeObjectsFinalGate,
+            "",
+            self.dest().root.canonical_path(),
+        );
+        let deadline = self.deadline;
+        let pace = |step: &'static str| observe_deadline(deadline, step);
+        pace("objects-final")?;
+        refuse_mounts_within(&self.dest().root)?;
+        self.chains(PinViewV1::of_final(frozen), &self.files, &pace)
+    }
+
+    /// Create one directory of the hierarchy: the clock, a recheck of everything retained, then the
+    /// create-new beneath its retained parent (its entry reserved first, given back only when the create
+    /// provably made nothing), and a recheck that includes the new pin.
+    fn create_directory(&mut self, dir: ObjectDirV1) -> Result<(), GitBootstrapErrorV1> {
+        observe_deadline(self.deadline, "objects-directory")?;
+        self.recheck()?;
+        let dest = self.dest();
+        let parent = match dir.parent() {
+            None => &dest.root,
+            Some(parent) => PinViewV1::of_partial(&self.pins)
+                .get(parent)
+                .ok_or_else(|| {
+                    object_input(format!("{}: its parent is not retained", dir.name()))
+                })?,
+        };
+        #[cfg(test)]
+        run_git_hook(
+            GitHookPointV1::BeforeObjectCreate,
+            "directory",
+            &parent.canonical_path().join(dir.leaf()),
+        );
+        let created = create_staging_directory(
+            parent,
+            &dest.ledger,
+            dest.dev,
+            dir.leaf().as_bytes(),
+            dir.name().as_bytes(),
+        );
+        match created {
+            Ok(pin) => {
+                self.began = true;
+                self.charged.entries += 1;
+                self.pins.set(dir, pin);
+            }
+            Err(error) => {
+                // A collision and a refused reservation made nothing and charge nothing. Any other error
+                // may follow a successful create, so its entry stays charged.
+                if !matches!(
+                    error,
+                    CustodyRestoreErrorV1::StagingCollision { .. }
+                        | CustodyRestoreErrorV1::Budget(_)
+                ) {
+                    self.began = true;
+                    self.charged.entries += 1;
+                }
+                return Err(error.into());
+            }
+        }
+        self.recheck()
+    }
+
+    /// Copy the admitted file `admitted` into the new pack directory: the full gate, the clock, the entry
+    /// reserved, the create-new, the device, a recheck; then the stream, one bounded chunk at a time, each
+    /// chunk charged before it is written, ending in the exact length and SHA-256; the file and its
+    /// directory synced; the written file read back against the admitted digest; and a recheck.
+    ///
+    /// A blocking call cannot be preempted, so the deadline can pass inside one. Whatever it returns, no
+    /// further call on the descriptor follows without the one deadline being read first: the retry of an
+    /// interrupted read, write, or probe, the rest of a chunk after a short write, and the first probe
+    /// after the last write. A write that stops there keeps the bytes the file accepted charged and gives
+    /// back the rest of its reservation.
+    fn copy_file(&mut self, admitted: &AdmittedObjectFileV1) -> Result<(), GitBootstrapErrorV1> {
+        // Every file follows all five directories, so materialization began when the first was created.
+        let deadline = self.deadline;
+        let relative = admitted.relative.as_str();
+        let leaf = leaf_of(relative);
+        observe_deadline(deadline, "objects-file")?;
+        self.gate()?;
+        let dest = self.dest();
+        let name = joined(ObjectDirV1::Pack.name().as_bytes(), leaf.as_bytes());
+        let pack = self
+            .pins
+            .pack
+            .as_ref()
+            .ok_or_else(|| object_input("the pack directory is not retained"))?;
+        // The retained source descriptor is read from its start.
+        (&admitted.file)
+            .seek(SeekFrom::Start(0))
+            .map_err(|error| io_refusal(relative, &error))?;
+
+        dest.ledger
+            .borrow_mut()
+            .reserve_entries(1)
+            .map_err(ledger_error)?;
+        self.charged.entries += 1;
+        #[cfg(test)]
+        run_git_hook(
+            GitHookPointV1::BeforeObjectCreate,
+            "file",
+            &pack.canonical_path().join(leaf),
+        );
+        let mut output = match create_output_file(pack, leaf) {
+            Ok(output) => output,
+            Err(error) => {
+                // A create that met an existing entry made nothing, so its allowance goes back;
+                // any other error may follow a successful create and keeps the charge.
+                if matches!(error, FsCustodyError::TargetExists(_)) {
+                    dest.ledger.borrow_mut().release(ENTRY_ALLOWANCE_BYTES_V1);
+                    self.charged.entries = self.charged.entries.saturating_sub(1);
+                }
+                return Err(staging_refusal(error, &name).into());
+            }
+        };
+        let length = admitted.length;
+        self.in_flight = Some(InFlightObjectFileV1 {
+            relative: relative.to_owned(),
+            expected_length: length,
+            written: 0,
+        });
+        let created = ChildStatV1::from_metadata(
+            &output
+                .metadata()
+                .map_err(|error| io_refusal(relative, &error))?,
+        );
+        let observed = created.dev;
+        #[cfg(test)]
+        let observed = super::CREATED_DEV
+            .with(|devices| devices.borrow().get(name.as_slice()).copied())
+            .unwrap_or(observed);
+        if observed != dest.dev {
+            return Err(CustodyRestoreErrorV1::DeviceCrossing { name: lossy(&name) }.into());
+        }
+        self.recheck()?;
+
+        // The stream: at most one chunk in memory, the clock before every chunk, each chunk charged
+        // before it is written, and never more than the admitted length.
+        let chunk = copy_chunk_bytes();
+        let mut buffer = vec![0_u8; chunk];
+        let mut context = digest::Context::new(&digest::SHA256);
+        let source = &admitted.file;
+        let mut written = 0_u64;
+        #[cfg(test)]
+        let output_path = pack.canonical_path().join(leaf);
+        while written < length {
+            #[cfg(test)]
+            run_git_hook(
+                GitHookPointV1::BeforeObjectChunk,
+                "",
+                &pack.canonical_path().join(leaf),
+            );
+            before_deadline(deadline)?;
+            let want = usize::try_from(length - written).map_or(chunk, |left| left.min(chunk));
+            let read = loop {
+                let step = read_chunk_step(source, &mut buffer[..want]);
+                #[cfg(test)]
+                run_git_hook(GitHookPointV1::ObjectIo, "read", &output_path);
+                match step {
+                    Ok(read) => break read,
+                    // An interrupted read did nothing, and the call can have blocked past the deadline: its
+                    // retry is held to the one deadline like every other call.
+                    Err(error) if error.kind() == ErrorKind::Interrupted => {
+                        before_deadline(deadline)?
+                    }
+                    Err(error) => return Err(io_refusal(relative, &error)),
+                }
+            };
+            if read == 0 {
+                return Err(copy_refusal(
+                    relative,
+                    format!("the source ended after {written} of {length} bytes"),
+                ));
+            }
+            // The read can block: the clock is read again before the chunk is charged and written.
+            observe_deadline(deadline, "objects-read")?;
+            dest.ledger
+                .borrow_mut()
+                .reserve(read as u64)
+                .map_err(ledger_error)?;
+            self.charged.bytes += read as u64;
+            // Explicit writes, so a failure partway keeps the bytes that did reach the file: the fact in
+            // flight advances with each successful write, and the part of the chunk that was reserved and
+            // never written is given back, so the charge is exactly what is on disk. A write that returned
+            // (a prefix, or an interruption that wrote nothing) is followed by another call only while the
+            // one deadline is still ahead; once it has passed, the accepted prefix stays charged and the
+            // rest of the chunk goes back like a failed write's.
+            let mut offset = 0_usize;
+            let mut stopped: Option<GitBootstrapErrorV1> = None;
+            while offset < read {
+                let step = write_step(&mut output, &buffer[offset..read], written);
+                #[cfg(test)]
+                run_git_hook(GitHookPointV1::ObjectIo, "write", &output_path);
+                match step {
+                    Ok(0) => {
+                        stopped =
+                            Some(io_refusal(relative, &io::Error::from(ErrorKind::WriteZero)));
+                    }
+                    Ok(wrote) => {
+                        offset += wrote;
+                        written += wrote as u64;
+                        if let Some(flight) = self.in_flight.as_mut() {
+                            flight.written = written;
+                        }
+                        if offset < read {
+                            stopped = before_deadline(deadline).err();
+                        }
+                    }
+                    Err(error) if error.kind() == ErrorKind::Interrupted => {
+                        stopped = before_deadline(deadline).err();
+                    }
+                    Err(error) => {
+                        stopped = Some(io_refusal(relative, &error));
+                    }
+                }
+                if stopped.is_some() {
+                    break;
+                }
+            }
+            if let Some(error) = stopped {
+                give_back_unwritten(dest, &mut self.charged, read - offset);
+                return Err(error);
+            }
+            context.update(&buffer[..read]);
+        }
+        // The source holds exactly the admitted length, and the bytes streamed are the admitted digest. The
+        // last write can have blocked past the deadline, so the first probe call is held to it, and so is
+        // every retry of an interrupted one.
+        before_deadline(deadline)?;
+        let mut probe = [0_u8; 1];
+        let extra = loop {
+            let step = read_probe_step(source, &mut probe);
+            #[cfg(test)]
+            run_git_hook(GitHookPointV1::ObjectIo, "probe", &output_path);
+            match step {
+                Ok(read) => break read,
+                Err(error) if error.kind() == ErrorKind::Interrupted => before_deadline(deadline)?,
+                Err(error) => return Err(io_refusal(relative, &error)),
+            }
+        };
+        if extra != 0 {
+            return Err(copy_refusal(
+                relative,
+                format!("the source is longer than the admitted {length} bytes"),
+            ));
+        }
+        let mut streamed = [0_u8; 32];
+        streamed.copy_from_slice(context.finish().as_ref());
+        if streamed != admitted.sha256 {
+            return Err(copy_refusal(
+                relative,
+                "the bytes read are not the admitted SHA-256",
+            ));
+        }
+
+        observe_deadline(deadline, "objects-sync")?;
+        sync_output_file(&output, relative)?;
+        #[cfg(test)]
+        run_git_hook(
+            GitHookPointV1::ObjectSynced,
+            "file",
+            &pack.canonical_path().join(leaf),
+        );
+        // The file's sync can block: the clock is read again before the directory's.
+        observe_deadline(deadline, "objects-sync-directory")?;
+        sync_pack_directory(pack)?;
+        #[cfg(test)]
+        run_git_hook(
+            GitHookPointV1::ObjectSynced,
+            "directory",
+            pack.canonical_path(),
+        );
+
+        // The written file, read back from its own descriptor, is the admitted bytes.
+        observe_deadline(deadline, "objects-verify")?;
+        output
+            .seek(SeekFrom::Start(0))
+            .map_err(|error| io_refusal(relative, &error))?;
+        let (read_back, back_sha256) = stream_digest(&mut output, length, deadline, relative)?;
+        if read_back != length || back_sha256 != admitted.sha256 {
+            return Err(copy_refusal(
+                relative,
+                "the written file is not the admitted bytes",
+            ));
+        }
+        output
+            .seek(SeekFrom::Start(0))
+            .map_err(|error| io_refusal(relative, &error))?;
+        let held = ChildStatV1::from_metadata(
+            &output
+                .metadata()
+                .map_err(|error| io_refusal(relative, &error))?,
+        );
+        if (held.kind, held.size, held.dev) != (ChildKindV1::Regular, length, dest.dev) {
+            return Err(copy_refusal(
+                relative,
+                "the written file is not a regular file of the admitted length on the root's device",
+            ));
+        }
+        self.in_flight = None;
+        self.files.push(MaterializedObjectFileV1 {
+            relative: relative.to_owned(),
+            file: output,
+            length,
+            sha256: admitted.sha256,
+            dev: held.dev,
+            ino: held.ino,
+        });
+        self.recheck()
+    }
+
+    fn run(&mut self, plan: &ActiveFramePlanV1) -> Result<FinalObjectStoreV1, GitBootstrapErrorV1> {
+        observe_deadline(self.deadline, "objects-entry")?;
+        let boot = self.boot;
+        require_prevalidated(boot, plan)?;
+        require_proven_bootstrap(boot)?;
+        self.gate()?;
+        for dir in ObjectDirV1::ALL {
+            self.create_directory(dir)?;
+        }
+        for admitted in admitted_files(boot) {
+            self.copy_file(admitted)?;
+        }
+        let frozen = std::mem::take(&mut self.pins).freeze().map_err(|pins| {
+            self.pins = *pins;
+            object_input("the object-store hierarchy is incomplete")
+        })?;
+        match self.final_gate(&frozen) {
+            Ok(()) => Ok(FinalObjectStoreV1 {
+                step: GitPlaneStepV1::Objects,
+                pins: frozen,
+                files: std::mem::take(&mut self.files),
+                charged: self.charged,
+            }),
+            Err(error) => {
+                self.pins = frozen.thaw();
+                Err(error)
+            }
+        }
+    }
+}
+
+/// Create the second object store: `repository/.git/objects/{pack,info}`, and, for a Captured object
+/// database, the bootstrap's three admitted files copied into `objects/pack`.
+///
+/// Nothing is created unless `plan` is this capsule's complete active prevalidation (an Empty
+/// `RefsAndHead` is [`GitBootstrapErrorV1::EmptyRefsAndHead`]) and `bootstrap` is a proven object store.
+/// Every directory and file is create-new beneath a retained pin and its entry is charged to the one
+/// ledger first; each copied chunk is charged before it is written, so the second copy is charged as the
+/// first was. Only the three admitted regular files are streamed, from their retained descriptors; the
+/// bootstrap's HEAD, config, and hooks are never copied. Nothing is renamed, overwritten, deleted, or
+/// cleaned up, and no Git child runs: the final HEAD and config are deliberately absent. Every step keeps
+/// the ONE absolute `deadline`; the destination root's identity is the last fallible check and only
+/// infallible construction follows it.
+///
+/// A refusal keeps every created byte and is in [`ObjectStoreFailureV1`]'s shape: the caller's `completed`
+/// step, whether materialization began, the one ledger's charge, and typed partial effects. A second
+/// invocation over the same destination refuses at `repository` as a collision, touching nothing.
+pub(crate) fn materialize_object_store_v1(
+    bootstrap: &VerifiedGitBootstrapV1,
+    plan: &ActiveFramePlanV1,
+    deadline: Instant,
+    completed: Option<GitPlaneStepV1>,
+) -> Result<FinalObjectStoreV1, Box<ObjectStoreFailureV1>> {
+    let mut run = StoreRunV1 {
+        boot: bootstrap,
+        deadline,
+        pins: PartialObjectPinsV1::default(),
+        files: Vec::new(),
+        in_flight: None,
+        charged: ObjectStoreChargeV1::default(),
+        began: false,
+    };
+    match run.run(plan) {
+        Ok(done) => Ok(done),
+        Err(cause) => Err(Box::new(ObjectStoreFailureV1 {
+            cause,
+            last_completed: completed,
+            active_materialization_began: run.began,
+            ledger_used: bootstrap.verified.destination.ledger.borrow().used(),
+            partial: ObjectStorePartialV1 {
+                pins: run.pins,
+                files: run.files,
+                in_flight: run.in_flight,
+                charged: run.charged,
+            },
+        })),
+    }
 }

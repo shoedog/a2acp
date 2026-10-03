@@ -9831,13 +9831,18 @@ const B1A_MARKER_V1: &str = "// Pass B1a: retained active-frame prevalidation";
 /// STRUCTURAL ONLY. Pass A's whole-module forbidden-name scan is narrowed to the bootstrap
 /// implementation (its production source up to the B1a marker), because later passes create the
 /// repository in this file; the marker is unique and the narrowing leaves a nonempty region before and
-/// after it. B1a's own region is then held to a read-only vocabulary: no path open, no walker, no
-/// repository or create-new write, no ledger charge, no Git runner, no object-store route, no unsafe.
+/// after it. B1a's own region (through B1b's, up to B2a's marker, where creating and charging begin) is
+/// then held to a read-only vocabulary: no path open, no walker, no repository or create-new write, no
+/// ledger charge, no Git runner, no object-store route, no unsafe.
 #[test]
 fn b1a_the_prevalidation_region_is_read_only_and_the_scan_split_is_unique() {
     let source = include_str!("custody_restore_git.rs");
     assert_eq!(source.matches(B1A_MARKER_V1).count(), 1, "one marker");
     let (before, region) = source.split_once(B1A_MARKER_V1).expect("the marker");
+    // B2a's region, which creates and charges, is outside this read-only scan; its own scan covers it.
+    let (region, _later) = region
+        .split_once(B2A_MARKER_V1)
+        .expect("the B2a marker follows B1a's region");
     assert!(before.contains("pub(crate) fn bootstrap_git_objects_v1("));
     assert!(region.contains("pub(crate) fn prevalidate_active_frames_v1("));
     assert!(
@@ -11089,7 +11094,9 @@ fn b1b_attached_detached_and_unborn_heads_agree_with_the_manifest() {
 }
 
 /// A loose ref hides a packed ref of the same name (direct or symbolic); a packed-only ref is a ref and
-/// can be HEAD's target. A packed row that a loose ref hides still names an object that must exist.
+/// can be HEAD's target. A packed row that a loose ref of exactly that name hides is not an active
+/// target: its object need not be in the inventory, and no kind or peeled closure applies to it, while
+/// every structural rule (grammar, order, name, collisions) still does.
 #[test]
 fn b1b_loose_refs_win_over_packed_refs_and_packed_only_refs_count() {
     let format = GitObjectFormatV1::Sha1;
@@ -13899,10 +13906,10 @@ fn b1b_limits_apply_through_the_retained_entry_point() {
 
 const B1B_MARKER_V1: &str = "// Pass B1b: pure refs agreement and inert config";
 
-/// STRUCTURAL ONLY. B1b's region (the production source from its marker on) is pure: it opens no path,
-/// walks nothing, writes nothing, charges and reserves nothing, runs no Git child and no process, routes
-/// no object store, and has no unsafe. The marker is unique, follows B1a's region, and its region holds
-/// the entry points; B1a's own read-only scan covers it too (it runs to the end of the file). The
+/// STRUCTURAL ONLY. B1b's region (the production source from its marker to B2a's marker) is pure: it opens
+/// no path, walks nothing, writes nothing, charges and reserves nothing, runs no Git child and no process,
+/// routes no object store, and has no unsafe. The marker is unique, follows B1a's region, and its region
+/// holds the entry points; B1a's own read-only scan covers it too (it runs to B2a's marker). The
 /// behavior is proven by the retained rows above, which leave the ledger and the destination unchanged.
 #[test]
 fn b1b_the_agreement_region_is_pure_and_the_split_is_unique() {
@@ -13910,6 +13917,10 @@ fn b1b_the_agreement_region_is_pure_and_the_split_is_unique() {
     assert_eq!(source.matches(B1B_MARKER_V1).count(), 1, "one marker");
     assert_eq!(source.matches(B1A_MARKER_V1).count(), 1, "one B1a marker");
     let (before, region) = source.split_once(B1B_MARKER_V1).expect("the marker");
+    // B2a's region, which creates and charges, is outside this pure scan; its own scan covers it.
+    let (region, _later) = region
+        .split_once(B2A_MARKER_V1)
+        .expect("the B2a marker follows B1b's region");
     assert!(before.contains(B1A_MARKER_V1), "B1b follows B1a");
     assert!(before.contains("pub(crate) fn prevalidate_active_frames_v1("));
     assert!(region.contains("pub(crate) fn agree_active_refs_v1("));
@@ -13965,6 +13976,3503 @@ fn b1b_the_agreement_region_is_pure_and_the_split_is_unique() {
         assert!(
             !code.contains(forbidden),
             "the pure region mentions `{forbidden}`"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Pass B2a: the create-new second object store
+//
+// Every row drives `materialize_object_store_v1` over a REAL retained value: a real phase-V capsule (real
+// Git objects and a real pack with real active frames, or an Empty object database with a captured unborn
+// HEAD), carried through pass A's real bootstrap (the first object store, proven by real Git) and B1a's real
+// prevalidation. The helper takes no runner, so no Git child can run in it. Every row also proves the one
+// ledger's conservation: what the helper reports charged is exactly what the ledger moved, on every outcome.
+//
+// Pass A's, B1a's, and B1b's controls above are unchanged, except the two structural scans' region ends
+// (see `B2A_MARKER_V1`). The mutation matrix in `.git/a2a-evidence/2b3b-pass-b2a/` maps each guard to the
+// rows that turn red without it.
+// ---------------------------------------------------------------------------------------------
+
+/// The step a flow that ran pass A has completed: B2a is called after it.
+const B2A_COMPLETED_V1: Option<GitPlaneStepV1> = Some(GitPlaneStepV1::BootstrapGate);
+
+const B2A_MARKER_V1: &str = "// Pass B2a: charged second object store";
+
+/// The final hierarchy's directories, in creation order, by destination-relative name.
+const SLOTS_V1: [&str; 5] = [
+    "repository",
+    "repository/.git",
+    "repository/.git/objects",
+    "repository/.git/objects/pack",
+    "repository/.git/objects/info",
+];
+
+/// The three admitted files, in copy order.
+const EXTENSIONS_V1: [&str; 3] = ["pack", "idx", "rev"];
+
+/// A real phase-V value carried through pass A (the first object store, proven) and B1a (the active frames,
+/// prevalidated): exactly what a later flow holds when it calls the second-store helper.
+struct StoreCaseV1 {
+    dest: DestV1,
+    boot: VerifiedGitBootstrapV1,
+    plan: ActiveFramePlanV1,
+    format: GitObjectFormatV1,
+    /// The one ledger's charge when phase V returned: before any bootstrap entry.
+    phase_v_used: u64,
+}
+
+fn charge_of(charged: ObjectStoreChargeV1) -> u64 {
+    charged.entries * ENTRY_V1 + charged.bytes
+}
+
+fn none_charged() -> ObjectStoreChargeV1 {
+    ObjectStoreChargeV1::default()
+}
+
+impl StoreCaseV1 {
+    fn of(capsule: &CustomCapsuleV1, cformat: CustodyGitObjectFormatV1) -> Self {
+        let format = core_format(cformat);
+        let CaseV1 { dest, verified } = if capsule.source.objects.is_empty() {
+            CaseV1::refs_only(capsule, &[db("refs"), db("refs/heads"), db("refs/tags")])
+        } else {
+            real_case(capsule, format)
+        };
+        let phase_v_used = ledger_used(&verified);
+        let mut boot = must_bootstrap(verified, format);
+        let plan = prevalidate(&mut boot.verified, far_deadline()).expect("B1a admits the frames");
+        Self {
+            dest,
+            boot,
+            plan,
+            format,
+            phase_v_used,
+        }
+    }
+
+    fn ledger(&self) -> u64 {
+        ledger_used(&self.boot.verified)
+    }
+
+    /// The real entry point under `deadline`, with EVERY outcome held to the helper's contract: a success
+    /// reports the completed step; a refusal carries the caller's completed step and the one ledger's
+    /// charge; and the ledger moved by exactly what the helper reports it charged.
+    fn attempt_by(
+        &mut self,
+        deadline: Instant,
+    ) -> Result<FinalObjectStoreV1, Box<ObjectStoreFailureV1>> {
+        let before = self.ledger();
+        let result =
+            materialize_object_store_v1(&self.boot, &self.plan, deadline, B2A_COMPLETED_V1);
+        let moved = self.ledger() - before;
+        match &result {
+            Ok(done) => {
+                assert_eq!(done.step, GitPlaneStepV1::Objects);
+                assert_eq!(
+                    moved,
+                    charge_of(done.charged),
+                    "the ledger moved as reported"
+                );
+            }
+            Err(failure) => {
+                assert_eq!(failure.last_completed, B2A_COMPLETED_V1);
+                assert_eq!(failure.ledger_used, self.ledger(), "the failure's figure");
+                assert_eq!(
+                    moved,
+                    charge_of(failure.partial.charged),
+                    "{:?}: the ledger moved as reported",
+                    failure.cause
+                );
+            }
+        }
+        result
+    }
+
+    fn attempt(&mut self) -> Result<FinalObjectStoreV1, Box<ObjectStoreFailureV1>> {
+        self.attempt_by(far_deadline())
+    }
+
+    fn done(&mut self, row: &str) -> FinalObjectStoreV1 {
+        match self.attempt() {
+            Ok(done) => done,
+            Err(failure) => panic!("{row}: must succeed: {:?}", failure.cause),
+        }
+    }
+
+    fn refused(&mut self, row: &str) -> Box<ObjectStoreFailureV1> {
+        match self.attempt() {
+            Ok(_) => panic!("{row}: must refuse"),
+            Err(failure) => failure,
+        }
+    }
+
+    /// A refusal before any write: no active materialization began, nothing was created, pinned, or
+    /// charged, and the destination tree and the one ledger are exactly what they were.
+    fn refused_before_any_write(&mut self, row: &str) -> GitBootstrapErrorV1 {
+        let tree = snapshot(&self.dest.path);
+        let ledger = self.ledger();
+        let failure = self.refused(row);
+        assert!(
+            !failure.active_materialization_began,
+            "{row}: {:?}",
+            failure.cause
+        );
+        assert_eq!(failure.partial.charged, none_charged(), "{row}");
+        assert!(failure.partial.files.is_empty(), "{row}");
+        assert!(failure.partial.in_flight.is_none(), "{row}");
+        assert_eq!(pins_present(&failure.partial.pins), [false; 5], "{row}");
+        assert_eq!(self.ledger(), ledger, "{row}: the ledger");
+        assert_eq!(snapshot(&self.dest.path), tree, "{row}: a byte was written");
+        assert_eq!(self.dest.entries(), [".restore-work"], "{row}");
+        failure.cause
+    }
+
+    fn pack_hash(&self) -> String {
+        match &self.boot.objects {
+            BootstrapObjectsV1::Captured { pack_hash, .. } => pack_hash.clone(),
+            BootstrapObjectsV1::Empty => panic!("an Empty capsule has no pack"),
+        }
+    }
+
+    /// The three admitted files' lengths, in copy order, as the test's own measurement of the bootstrap.
+    fn lengths(&self) -> [u64; 3] {
+        let files = bootstrap_object_files(&self.dest);
+        let mut lengths = [0_u64; 3];
+        for (length, extension) in lengths.iter_mut().zip(EXTENSIONS_V1) {
+            let suffix = format!(".{extension}");
+            let found: Vec<&(String, Vec<u8>)> = files
+                .iter()
+                .filter(|(name, _)| name.ends_with(&suffix))
+                .collect();
+            assert_eq!(found.len(), 1, "exactly one .{extension}");
+            *length = found[0].1.len() as u64;
+        }
+        lengths
+    }
+
+    /// Every created entry's destination-relative name, in the order the helper creates them.
+    fn entry_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = SLOTS_V1.iter().map(|slot| (*slot).to_owned()).collect();
+        if let BootstrapObjectsV1::Captured { pack_hash, .. } = &self.boot.objects {
+            for extension in EXTENSIONS_V1 {
+                names.push(format!(
+                    "repository/.git/objects/pack/pack-{pack_hash}.{extension}"
+                ));
+            }
+        }
+        names
+    }
+}
+
+fn pins_present(pins: &PartialObjectPinsV1) -> [bool; 5] {
+    [
+        pins.repository.is_some(),
+        pins.git.is_some(),
+        pins.objects.is_some(),
+        pins.pack.is_some(),
+        pins.info.is_some(),
+    ]
+}
+
+/// The bootstrap's `objects/pack` files, by name, with their bytes, as the test reads them from disk.
+fn bootstrap_object_files(dest: &DestV1) -> Vec<(String, Vec<u8>)> {
+    files_in(&dest.bootstrap().join("objects/pack"))
+}
+
+fn files_in(directory: &Path) -> Vec<(String, Vec<u8>)> {
+    let mut files: Vec<(String, Vec<u8>)> = std::fs::read_dir(directory)
+        .expect("a listable directory")
+        .map(|entry| {
+            let path = entry.expect("an entry").path();
+            (
+                path.file_name()
+                    .expect("a name")
+                    .to_string_lossy()
+                    .into_owned(),
+                std::fs::read(&path).expect("a readable file"),
+            )
+        })
+        .collect();
+    files.sort();
+    files
+}
+
+fn listing(directory: &Path) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(directory)
+        .expect("a listable directory")
+        .map(|entry| {
+            entry
+                .expect("an entry")
+                .file_name()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect();
+    names.sort();
+    names
+}
+
+fn exists(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok()
+}
+
+fn stored(dest: &DestV1, relative: &str) -> PathBuf {
+    dest.path.join(relative)
+}
+
+fn pack_directory(dest: &DestV1) -> PathBuf {
+    stored(dest, "repository/.git/objects/pack")
+}
+
+/// A pin is exactly the directory the path names: its canonical path, device, and inode.
+fn assert_pin_is(pin: &PinnedDirectoryV1, path: &Path) {
+    use std::os::unix::fs::MetadataExt as _;
+    let metadata = std::fs::metadata(path).expect("the pinned directory");
+    assert_eq!(pin.canonical_path(), path);
+    assert_eq!(pin.identity().dev, Some(metadata.dev()), "{path:?}");
+    assert_eq!(pin.identity().ino, Some(metadata.ino()), "{path:?}");
+}
+
+/// What the helper's partial facts say exists must be what is on disk: each slot's pin is present exactly
+/// when its directory is there (and a pinned one always is), and the files on disk are the completed copies
+/// and the one in flight, plus `unlisted` entries the facts cannot carry (an entry created and then refused
+/// before its pin existed). Only for rows where nothing is planted at a slot.
+fn assert_partial_is_the_disk(case: &StoreCaseV1, failure: &ObjectStoreFailureV1, unlisted: usize) {
+    let present = pins_present(&failure.partial.pins);
+    let mut on_disk = 0;
+    for (slot, pinned) in SLOTS_V1.iter().zip(present) {
+        let found = exists(&stored(&case.dest, slot));
+        assert!(
+            !pinned || found,
+            "{slot}: a pin for a directory that is not there"
+        );
+        on_disk += usize::from(found);
+    }
+    let mut listed = present.iter().filter(|pinned| **pinned).count() + unlisted;
+    let pack = pack_directory(&case.dest);
+    if pack.is_dir() {
+        let names = listing(&pack);
+        on_disk += names.len();
+        let relatives = failure
+            .partial
+            .files
+            .iter()
+            .map(|file| file.relative.as_str())
+            .chain(
+                failure
+                    .partial
+                    .in_flight
+                    .iter()
+                    .map(|flight| flight.relative.as_str()),
+            );
+        for relative in relatives {
+            listed += 1;
+            let leaf = relative.rsplit('/').next().expect("a leaf");
+            assert!(
+                names.iter().any(|name| name == leaf),
+                "{relative}: listed but absent"
+            );
+        }
+    }
+    assert_eq!(on_disk, listed, "{:?}", failure.cause);
+}
+
+fn plant_one(case: &StoreCaseV1, slot: &str, kind: PlantV1, outside: &Path) -> GitSeamGuardV1 {
+    let target = stored(&case.dest, slot);
+    let outside = outside.to_path_buf();
+    let planted = std::rc::Rc::new(std::cell::Cell::new(false));
+    install_git_hook_for_test(GitHookPointV1::BeforeObjectCreate, move |event| {
+        if event.path == target && !planted.replace(true) {
+            plant(&target, kind, &outside);
+        }
+    })
+}
+
+/// Leaves exactly `headroom` bytes on the one ledger, by reserving the rest.
+fn leave_headroom(verified: &VerifiedCapsuleV1, headroom: u64) {
+    let used = ledger_used(verified);
+    let filler = RESTORE_BYTES_CEILING_V1
+        .checked_sub(used + headroom)
+        .expect("room for the filler");
+    verified
+        .destination
+        .ledger
+        .borrow_mut()
+        .reserve(filler)
+        .expect("the filler fits");
+}
+
+fn captured_case(cformat: CustodyGitObjectFormatV1) -> (CustomCapsuleV1, StoreCaseV1) {
+    let capsule = captured(cformat);
+    let case = StoreCaseV1::of(&capsule, cformat);
+    (capsule, case)
+}
+
+const BOTH_CAPSULE_FORMATS_V1: [CustodyGitObjectFormatV1; 2] = [
+    CustodyGitObjectFormatV1::Sha1,
+    CustodyGitObjectFormatV1::Sha256,
+];
+
+// ---------------------------------------------------------------------------------------------
+// The exact second object store, and both stores' charges
+// ---------------------------------------------------------------------------------------------
+
+/// A Captured capsule in each caller format: the helper creates `repository/.git/objects/{pack,info}` and
+/// copies exactly the three admitted files, byte for byte. The facts it retains are the created objects, and
+/// the one ledger is charged for the second copy as well as the first.
+#[test]
+fn b2a_both_formats_copy_the_exact_pack_idx_and_rev_and_charge_both_stores() {
+    use std::io::Seek as _;
+    use std::os::unix::fs::MetadataExt as _;
+    for cformat in BOTH_CAPSULE_FORMATS_V1 {
+        let row = format!("{cformat:?}");
+        let (_capsule, mut case) = captured_case(cformat);
+        assert_eq!(
+            case.boot.provenance,
+            GitFormatProvenanceV1::CapsuleObjectsAndPack
+        );
+        let work_before = snapshot(&case.dest.work());
+        let first_store_bytes = tree_bytes(&case.dest.bootstrap());
+        let ledger_after_bootstrap = case.ledger();
+        let expected = bootstrap_object_files(&case.dest);
+        assert_eq!(expected.len(), 3, "{row}");
+        let lengths = case.lengths();
+        let children = case.boot.runs.len();
+        let hash = case.pack_hash();
+
+        let done = case.done(&row);
+
+        // The hierarchy: the repository's only child is `.git`, which holds only `objects`.
+        assert_eq!(
+            case.dest.entries(),
+            [".restore-work", "repository"],
+            "{row}"
+        );
+        let repository = stored(&case.dest, "repository");
+        assert_eq!(listing(&repository), [".git"], "{row}");
+        assert_eq!(listing(&repository.join(".git")), ["objects"], "{row}");
+        assert_eq!(
+            listing(&repository.join(".git/objects")),
+            ["info", "pack"],
+            "{row}"
+        );
+        assert!(listing(&repository.join(".git/objects/info")).is_empty());
+        // Exactly the three admitted files, byte for byte.
+        assert_eq!(files_in(&pack_directory(&case.dest)), expected, "{row}");
+
+        // The retained facts: the files in copy order, each the created object.
+        let relatives: Vec<&str> = done
+            .files
+            .iter()
+            .map(|file| file.relative.as_str())
+            .collect();
+        assert_eq!(
+            relatives,
+            [
+                format!("objects/pack/pack-{hash}.pack"),
+                format!("objects/pack/pack-{hash}.idx"),
+                format!("objects/pack/pack-{hash}.rev"),
+            ],
+            "{row}"
+        );
+        for (file, length) in done.files.iter().zip(lengths) {
+            let name = file.relative.rsplit('/').next().expect("a leaf");
+            let bytes = &expected
+                .iter()
+                .find(|(found, _)| found == name)
+                .expect("an admitted file")
+                .1;
+            assert_eq!(file.length, length, "{row}: {name}");
+            assert_eq!(file.sha256, sha256_bytes(bytes), "{row}: {name}");
+            let metadata =
+                std::fs::metadata(pack_directory(&case.dest).join(name)).expect("a copied file");
+            assert_eq!(
+                (file.dev, file.ino),
+                (metadata.dev(), metadata.ino()),
+                "{row}"
+            );
+            assert_eq!((&file.file).stream_position().expect("a position"), 0);
+            let mut read = Vec::new();
+            (&file.file)
+                .read_to_end(&mut read)
+                .expect("the retained descriptor reads");
+            assert_eq!(&read, bytes, "{row}: {name}: the retained descriptor");
+        }
+        assert_pin_is(&done.pins.repository, &repository);
+        assert_pin_is(&done.pins.git, &repository.join(".git"));
+        assert_pin_is(&done.pins.objects, &repository.join(".git/objects"));
+        assert_pin_is(&done.pins.pack, &repository.join(".git/objects/pack"));
+        assert_pin_is(&done.pins.info, &repository.join(".git/objects/info"));
+
+        // Both stores are charged: eight entries (five directories and three files) and the second copy's
+        // bytes, on top of the bootstrap's own, which the helper never changes.
+        let second_store_bytes = tree_bytes(&pack_directory(&case.dest));
+        assert_eq!(second_store_bytes, lengths.iter().sum::<u64>(), "{row}");
+        assert_eq!(
+            done.charged,
+            ObjectStoreChargeV1 {
+                entries: 8,
+                bytes: second_store_bytes
+            },
+            "{row}"
+        );
+        assert_eq!(
+            case.ledger() - ledger_after_bootstrap,
+            8 * ENTRY_V1 + second_store_bytes,
+            "{row}"
+        );
+        assert_eq!(
+            case.ledger() - case.phase_v_used,
+            (2 + INIT_BARE_ENTRIES_V1 + INDEX_PACK_ENTRIES_V1 + 8) * ENTRY_V1
+                + first_store_bytes
+                + second_store_bytes,
+            "{row}: HOME, XDG, the bootstrap, and the final store are all on the one ledger"
+        );
+
+        // The first store, the staging tree, and the staged descriptors are untouched, and no Git child ran.
+        assert_eq!(snapshot(&case.dest.work()), work_before, "{row}");
+        assert_eq!(case.boot.runs.len(), children, "{row}: no child ran");
+        assert!(case
+            .boot
+            .verified
+            .staged
+            .iter()
+            .all(|one| position(one) == 0));
+    }
+}
+
+/// An Empty object database still creates the whole required hierarchy and copies no pack: five entries are
+/// charged, the pack directory is empty, and the format is the caller's, for both caller formats.
+#[test]
+fn b2a_empty_objects_create_the_hierarchy_and_copy_no_pack_for_both_formats() {
+    for cformat in BOTH_CAPSULE_FORMATS_V1 {
+        let row = format!("{cformat:?}");
+        let capsule = empty(cformat);
+        let mut case = StoreCaseV1::of(&capsule, cformat);
+        assert_eq!(
+            case.boot.provenance,
+            GitFormatProvenanceV1::CallerSelectedEmpty
+        );
+        assert!(matches!(case.boot.objects, BootstrapObjectsV1::Empty));
+        let work_before = snapshot(&case.dest.work());
+        let ledger_after_bootstrap = case.ledger();
+        let done = case.done(&row);
+
+        assert!(done.files.is_empty(), "{row}");
+        assert_eq!(
+            done.charged,
+            ObjectStoreChargeV1 {
+                entries: 5,
+                bytes: 0
+            },
+            "{row}"
+        );
+        assert_eq!(
+            case.ledger() - ledger_after_bootstrap,
+            5 * ENTRY_V1,
+            "{row}"
+        );
+        let repository = stored(&case.dest, "repository");
+        assert_eq!(listing(&repository), [".git"], "{row}");
+        assert_eq!(listing(&repository.join(".git")), ["objects"], "{row}");
+        assert_eq!(
+            listing(&repository.join(".git/objects")),
+            ["info", "pack"],
+            "{row}"
+        );
+        assert!(listing(&pack_directory(&case.dest)).is_empty(), "{row}");
+        assert!(listing(&repository.join(".git/objects/info")).is_empty());
+        assert_pin_is(&done.pins.repository, &repository);
+        assert_pin_is(&done.pins.git, &repository.join(".git"));
+        assert_pin_is(&done.pins.objects, &repository.join(".git/objects"));
+        assert_pin_is(&done.pins.pack, &repository.join(".git/objects/pack"));
+        assert_pin_is(&done.pins.info, &repository.join(".git/objects/info"));
+        assert_eq!(snapshot(&case.dest.work()), work_before, "{row}");
+        assert_eq!(
+            case.boot
+                .runs
+                .iter()
+                .map(|run| run.label)
+                .collect::<Vec<_>>(),
+            [
+                "init --bare",
+                "cat-file --batch-all-objects",
+                "fsck --strict"
+            ],
+            "{row}: no index, verify-pack, rev-list, or further child"
+        );
+    }
+}
+
+/// Only the three admitted regular files are streamed. Entries added to the bootstrap afterwards (a hook, a
+/// `.keep`, an alternates file, a description) are never copied, the bootstrap's own HEAD and config never
+/// reach the new store, and the bootstrap is byte-identical afterwards, planted entries included.
+#[test]
+fn b2a_no_bootstrap_head_config_hook_or_stray_file_is_copied() {
+    let (_capsule, mut case) = captured_case(CustodyGitObjectFormatV1::Sha1);
+    let bootstrap = case.dest.bootstrap();
+    let hash = case.pack_hash();
+    std::fs::create_dir(bootstrap.join("hooks")).expect("a planted hooks directory");
+    std::fs::write(bootstrap.join("hooks/pre-commit"), b"#!/bin/sh\nexit 1\n")
+        .expect("a planted hook");
+    std::fs::write(
+        bootstrap.join(format!("objects/pack/pack-{hash}.keep")),
+        b"keep",
+    )
+    .expect("a planted keep file");
+    std::fs::write(bootstrap.join("objects/info/alternates"), b"/elsewhere\n")
+        .expect("a planted alternates file");
+    std::fs::write(bootstrap.join("description"), b"planted").expect("a planted description");
+    let work_before = snapshot(&case.dest.work());
+
+    let _ = case.done("stray entries");
+
+    assert_eq!(snapshot(&case.dest.work()), work_before, "the bootstrap");
+    let git = stored(&case.dest, "repository/.git");
+    assert_eq!(listing(&git), ["objects"]);
+    for forbidden in ["HEAD", "config", "hooks", "refs", "description", "info"] {
+        assert!(!exists(&git.join(forbidden)), "{forbidden}");
+    }
+    assert!(
+        listing(&git.join("objects/info")).is_empty(),
+        "no alternates"
+    );
+    let names: Vec<String> = listing(&pack_directory(&case.dest));
+    assert_eq!(names.len(), 3, "{names:?}");
+    assert!(
+        names.iter().all(|name| !name.ends_with(".keep")),
+        "{names:?}"
+    );
+}
+
+/// Pass A's no-repository invariant is function-scoped: direct bootstrap creates only `.restore-work/` (for
+/// every capsule shape), and only this helper creates `repository/`.
+#[test]
+fn b2a_only_this_helper_creates_the_repository_and_direct_bootstrap_still_never_does() {
+    for populated in [true, false] {
+        let cformat = CustodyGitObjectFormatV1::Sha1;
+        let capsule = if populated {
+            captured(cformat)
+        } else {
+            empty(cformat)
+        };
+        let case = StoreCaseV1::of(&capsule, cformat);
+        // Pass A and B1a have both run on this value, and nothing is under `repository/`.
+        assert_eq!(case.dest.entries(), [".restore-work"], "{populated}");
+        assert!(snapshot(&case.dest.path)
+            .keys()
+            .all(|name| !name.contains("repository")));
+        let mut case = case;
+        let _ = case.done("the helper");
+        assert_eq!(
+            case.dest.entries(),
+            [".restore-work", "repository"],
+            "{populated}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Complete active prevalidation and a proven bootstrap come first
+// ---------------------------------------------------------------------------------------------
+
+/// Complete G needs a captured HEAD: an Empty `RefsAndHead` class is the typed pre-repository refusal, for
+/// both caller formats and both object shapes, with a reflog-only capsule the same. Pass A accepts all of
+/// them; the helper refuses before it creates, pins, or charges anything.
+#[test]
+fn b2a_empty_refs_refuse_before_the_repository_is_created_for_every_shape_and_format() {
+    for cformat in BOTH_CAPSULE_FORMATS_V1 {
+        for populated in [true, false] {
+            let row = format!("{cformat:?} populated={populated}");
+            let capsule = if populated {
+                captured(cformat)
+            } else {
+                empty(cformat)
+            };
+            let format = core_format(cformat);
+            // No active frame at all, and a reflog frame alone: neither carries a HEAD.
+            let generation = CaseV1::generation(&capsule);
+            let logs = encode_frame(LOGS_V1, &generation, &[db("logs")]);
+            for (shape, frames) in [
+                ("no frame", vec![]),
+                ("reflogs only", vec![(LOGS_V1, logs)]),
+            ] {
+                let CaseV1 { dest, verified } = CaseV1::with_bytes(&capsule, &frames);
+                let boot = must_bootstrap(verified, format);
+                // B1a would refuse to produce a plan; the hand-built plan stands where one would be.
+                let plan = ActiveFramePlanV1 {
+                    frames: boot
+                        .verified
+                        .staged
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, one)| {
+                            one.role == CustodyCapsuleArtifactRoleV1::CoveragePayload(LOGS_V1)
+                        })
+                        .map(|(staged, one)| ActiveFrameSummaryV1 {
+                            class: LOGS_V1,
+                            staged,
+                            length: one.length,
+                            sha256: one.sha256,
+                            entries: 1,
+                            directories: 1,
+                            regular_files: 0,
+                            content_bytes: 0,
+                            entries_sha256: [0; 32],
+                        })
+                        .collect(),
+                };
+                let tree = snapshot(&dest.path);
+                let ledger = ledger_used(&boot.verified);
+                let failure =
+                    materialize_object_store_v1(&boot, &plan, far_deadline(), B2A_COMPLETED_V1)
+                        .expect_err(&format!("{row} {shape}"));
+                assert!(
+                    matches!(failure.cause, GitBootstrapErrorV1::EmptyRefsAndHead),
+                    "{row} {shape}: {:?}",
+                    failure.cause
+                );
+                assert!(!failure.active_materialization_began, "{row} {shape}");
+                assert_eq!(failure.last_completed, B2A_COMPLETED_V1, "{row} {shape}");
+                assert_eq!(failure.ledger_used, ledger, "{row} {shape}");
+                assert_eq!(failure.partial.charged, none_charged(), "{row} {shape}");
+                assert_eq!(pins_present(&failure.partial.pins), [false; 5]);
+                assert!(failure.partial.files.is_empty());
+                assert_eq!(ledger_used(&boot.verified), ledger, "{row} {shape}");
+                assert_eq!(snapshot(&dest.path), tree, "{row} {shape}");
+                assert_eq!(dest.entries(), [".restore-work"], "{row} {shape}");
+            }
+        }
+    }
+}
+
+/// A plan that is not this capsule's active frames is refused before any write: reordered, short, extra,
+/// pointing at another payload or class, or carrying another length or digest than the verified one. The
+/// control with the real plan then succeeds on the same untouched value.
+#[test]
+fn b2a_a_plan_that_is_not_this_capsules_refuses_before_any_write() {
+    let (_capsule, mut case) = captured_case(CustodyGitObjectFormatV1::Sha1);
+    type EditV1 = fn(&mut ActiveFramePlanV1);
+    let rows: [(&str, EditV1); 8] = [
+        ("reversed", |plan| plan.frames.reverse()),
+        ("without the logs frame", |plan| {
+            plan.frames.pop();
+        }),
+        ("without the refs frame", |plan| {
+            plan.frames.remove(0);
+        }),
+        ("an extra frame", |plan| {
+            let again = plan.frames[0].clone();
+            plan.frames.push(again);
+        }),
+        ("another staged payload", |plan| plan.frames[0].staged += 1),
+        ("another class", |plan| plan.frames[0].class = LOGS_V1),
+        ("another length", |plan| plan.frames[1].length += 1),
+        ("another digest", |plan| plan.frames[0].sha256[0] ^= 1),
+    ];
+    for (row, edit) in rows {
+        let original = case.plan.clone();
+        edit(&mut case.plan);
+        let cause = case.refused_before_any_write(row);
+        assert!(
+            matches!(cause, GitBootstrapErrorV1::ActivePlanMismatch(_)),
+            "{row}: {cause:?}"
+        );
+        case.plan = original;
+    }
+    let _ = case.done("the real plan");
+}
+
+fn refused_while_tampered(
+    case: &mut StoreCaseV1,
+    row: &str,
+    tamper: impl FnOnce(&mut VerifiedGitBootstrapV1) -> Box<dyn FnOnce(&mut VerifiedGitBootstrapV1)>,
+) -> GitBootstrapErrorV1 {
+    let undo = tamper(&mut case.boot);
+    let cause = case.refused_before_any_write(row);
+    undo(&mut case.boot);
+    cause
+}
+
+fn pack_hash_mut(boot: &mut VerifiedGitBootstrapV1) -> &mut String {
+    match &mut boot.objects {
+        BootstrapObjectsV1::Captured { pack_hash, .. } => pack_hash,
+        BootstrapObjectsV1::Empty => panic!("a Captured bootstrap"),
+    }
+}
+
+fn admitted_mut(boot: &mut VerifiedGitBootstrapV1) -> &mut Vec<AdmittedObjectFileV1> {
+    match &mut boot.objects {
+        BootstrapObjectsV1::Captured { files, .. } => files,
+        BootstrapObjectsV1::Empty => panic!("a Captured bootstrap"),
+    }
+}
+
+/// Only a proven bootstrap is copied: closure evidence that is incomplete or contradicts the manifest, the
+/// objects, or the provenance; a pack name that is not the admitted hash (a path, the wrong width, upper
+/// case); files that are not the three admitted ones in order; a retained descriptor that is not the admitted
+/// file; or a bootstrap whose pack directory is not retained. Each refuses before any write, and the
+/// untampered control then succeeds on the same value.
+#[test]
+fn b2a_an_unproven_bootstrap_refuses_before_any_write() {
+    let (_capsule, mut case) = captured_case(CustodyGitObjectFormatV1::Sha1);
+    let input = |cause: GitBootstrapErrorV1, row: &str| {
+        assert!(
+            matches!(cause, GitBootstrapErrorV1::ObjectStoreInput(_)),
+            "{row}: {cause:?}"
+        );
+    };
+
+    let cause = refused_while_tampered(&mut case, "no strict fsck", |boot| {
+        let saved = boot.closure;
+        boot.closure.fsck_strict = false;
+        Box::new(move |boot| boot.closure = saved)
+    });
+    input(cause, "no strict fsck");
+
+    let cause = refused_while_tampered(&mut case, "another inventory size", |boot| {
+        let saved = boot.closure;
+        boot.closure.inventory_objects += 1;
+        Box::new(move |boot| boot.closure = saved)
+    });
+    input(cause, "another inventory size");
+
+    let cause = refused_while_tampered(&mut case, "a vacuous closure for a pack", |boot| {
+        let saved = boot.closure;
+        boot.closure.closure = GitClosureProofV1::Vacuous;
+        Box::new(move |boot| boot.closure = saved)
+    });
+    input(cause, "a vacuous closure for a pack");
+
+    let cause = refused_while_tampered(&mut case, "another reachable count", |boot| {
+        let saved = boot.closure;
+        boot.closure.closure = GitClosureProofV1::Reachable { objects: 5 };
+        Box::new(move |boot| boot.closure = saved)
+    });
+    input(cause, "another reachable count");
+
+    let cause =
+        refused_while_tampered(&mut case, "caller-selected provenance for a pack", |boot| {
+            let saved = boot.provenance;
+            boot.provenance = GitFormatProvenanceV1::CallerSelectedEmpty;
+            Box::new(move |boot| boot.provenance = saved)
+        });
+    input(cause, "caller-selected provenance for a pack");
+
+    let cause =
+        refused_while_tampered(&mut case, "Empty objects for a Captured manifest", |boot| {
+            let saved = std::mem::replace(&mut boot.objects, BootstrapObjectsV1::Empty);
+            Box::new(move |boot| boot.objects = saved)
+        });
+    input(cause, "Empty objects for a Captured manifest");
+
+    for (row, replacement) in [
+        ("a path in the pack name", "../escape".to_owned()),
+        ("a pack name of the wrong width", "ab".repeat(32)),
+        ("an upper-case pack name", "AB".repeat(20)),
+        ("an empty pack name", String::new()),
+    ] {
+        let cause = refused_while_tampered(&mut case, row, |boot| {
+            let saved = std::mem::replace(pack_hash_mut(boot), replacement);
+            Box::new(move |boot| *pack_hash_mut(boot) = saved)
+        });
+        input(cause, row);
+    }
+
+    // A pack name that is a path or upper case, with the three files' names changed to match: only the
+    // object-id rule refuses it.
+    for (row, replacement) in [
+        (
+            "a path in the pack name and the file names",
+            "../escape".to_owned(),
+        ),
+        ("an upper-case pack name and file names", "AB".repeat(20)),
+    ] {
+        let cause = refused_while_tampered(&mut case, row, |boot| {
+            let saved = std::mem::replace(pack_hash_mut(boot), replacement.clone());
+            let originals: Vec<String> = admitted_mut(boot)
+                .iter()
+                .map(|file| file.relative.clone())
+                .collect();
+            for (file, extension) in admitted_mut(boot).iter_mut().zip(EXTENSIONS_V1) {
+                file.relative = format!("objects/pack/pack-{replacement}.{extension}");
+            }
+            Box::new(move |boot| {
+                *pack_hash_mut(boot) = saved;
+                for (file, original) in admitted_mut(boot).iter_mut().zip(originals) {
+                    file.relative = original;
+                }
+            })
+        });
+        input(cause, row);
+    }
+
+    // A Captured bootstrap over a manifest whose object database row is Empty: the coverage must agree.
+    let cause = refused_while_tampered(
+        &mut case,
+        "a Captured bootstrap over an Empty row",
+        |boot| {
+            let emptied = manifest_with_row(
+                CustodyCoverageClassV1::ObjectDatabase,
+                CustodyStateClassV1::Empty,
+                &boot.verified,
+            );
+            let saved = std::mem::replace(&mut boot.verified.control.manifest, emptied);
+            Box::new(move |boot| boot.verified.control.manifest = saved)
+        },
+    );
+    input(cause, "a Captured bootstrap over an Empty row");
+
+    // The Empty arm: Empty objects, caller-selected provenance, a vacuous closure, and an Empty coverage
+    // row, over a manifest that nevertheless lists objects.
+    let cause = refused_while_tampered(&mut case, "an Empty database that lists objects", |boot| {
+        let emptied = manifest_with_row(
+            CustodyCoverageClassV1::ObjectDatabase,
+            CustodyStateClassV1::Empty,
+            &boot.verified,
+        );
+        let saved_manifest = std::mem::replace(&mut boot.verified.control.manifest, emptied);
+        let saved_objects = std::mem::replace(&mut boot.objects, BootstrapObjectsV1::Empty);
+        let saved_provenance = boot.provenance;
+        let saved_closure = boot.closure;
+        boot.provenance = GitFormatProvenanceV1::CallerSelectedEmpty;
+        boot.closure.closure = GitClosureProofV1::Vacuous;
+        Box::new(move |boot| {
+            boot.verified.control.manifest = saved_manifest;
+            boot.objects = saved_objects;
+            boot.provenance = saved_provenance;
+            boot.closure = saved_closure;
+        })
+    });
+    input(cause, "an Empty database that lists objects");
+
+    let cause = refused_while_tampered(&mut case, "files out of order", |boot| {
+        admitted_mut(boot).swap(0, 1);
+        Box::new(|boot| admitted_mut(boot).swap(0, 1))
+    });
+    input(cause, "files out of order");
+
+    let cause = refused_while_tampered(&mut case, "a missing file", |boot| {
+        let last = admitted_mut(boot).pop().expect("three files");
+        Box::new(move |boot| admitted_mut(boot).push(last))
+    });
+    input(cause, "a missing file");
+
+    let cause = refused_while_tampered(&mut case, "a renamed file", |boot| {
+        let saved = std::mem::replace(
+            &mut admitted_mut(boot)[0].relative,
+            "objects/pack/other.pack".to_owned(),
+        );
+        Box::new(move |boot| admitted_mut(boot)[0].relative = saved)
+    });
+    input(cause, "a renamed file");
+
+    let cause = refused_while_tampered(&mut case, "the other object format", |boot| {
+        let saved = boot.object_format;
+        boot.object_format = GitObjectFormatV1::Sha256;
+        Box::new(move |boot| boot.object_format = saved)
+    });
+    input(cause, "the other object format");
+
+    let cause = refused_while_tampered(&mut case, "no retained active frames", |boot| {
+        let saved = std::mem::take(&mut boot.active_frames);
+        Box::new(move |boot| boot.active_frames = saved)
+    });
+    input(cause, "no retained active frames");
+
+    let cause = refused_while_tampered(&mut case, "no retained pack directory", |boot| {
+        let saved = boot
+            .directories
+            .remove("objects/pack")
+            .expect("the pack directory");
+        Box::new(move |boot| {
+            boot.directories.insert("objects/pack".to_owned(), saved);
+        })
+    });
+    input(cause, "no retained pack directory");
+
+    // A retained descriptor that is not the admitted file: another length.
+    let cause = refused_while_tampered(&mut case, "another descriptor", |boot| {
+        let mut other = tempfile::tempfile().expect("another file");
+        use std::io::Write as _;
+        other.write_all(b"not the admitted bytes").expect("bytes");
+        let saved = std::mem::replace(&mut admitted_mut(boot)[0].file, other);
+        Box::new(move |boot| admitted_mut(boot)[0].file = saved)
+    });
+    assert!(
+        matches!(
+            cause,
+            GitBootstrapErrorV1::Restore(CustodyRestoreErrorV1::IdentityChanged(_))
+        ),
+        "another descriptor: {cause:?}"
+    );
+
+    let _ = case.done("the untampered value");
+}
+
+// ---------------------------------------------------------------------------------------------
+// Preexisting entries are collisions, and the ledger is released once and only for what was never created
+// ---------------------------------------------------------------------------------------------
+
+/// A preplanted file, empty directory, or symlink at each of the eight entries the helper creates (the five
+/// directories and the three object files) is a collision: the planted entry is left exactly as it was and
+/// nothing is written through it, the entry that was never created is given back to the ledger and nothing
+/// else is, and the facts name exactly what this invocation did create before it.
+#[test]
+fn b2a_preexisting_slots_are_collisions_and_stay_unchanged() {
+    let capsule = captured(CustodyGitObjectFormatV1::Sha1);
+    let names = StoreCaseV1::of(&capsule, CustodyGitObjectFormatV1::Sha1).entry_names();
+    assert_eq!(names.len(), 8);
+    for (index, slot) in names.iter().enumerate() {
+        for kind in [
+            PlantV1::RegularFile,
+            PlantV1::EmptyDirectory,
+            PlantV1::Symlink,
+        ] {
+            let row = format!("{slot} {kind:?}");
+            let mut case = StoreCaseV1::of(&capsule, CustodyGitObjectFormatV1::Sha1);
+            assert_eq!(
+                &case.entry_names(),
+                &names,
+                "the same names for the same capsule"
+            );
+            let lengths = case.lengths();
+            let (_outside_area, outside) = external_dir_with(&["decoy"]);
+            let outside_before = snapshot(&outside);
+            let _hook = plant_one(&case, slot, kind, &outside);
+
+            let failure = case.refused(&row);
+            assert!(
+                matches!(&failure.cause,
+                    GitBootstrapErrorV1::Restore(CustodyRestoreErrorV1::StagingCollision { name })
+                        if name == slot),
+                "{row}: {:?}",
+                failure.cause
+            );
+            // Active materialization began exactly when an earlier entry had been created.
+            assert_eq!(failure.active_materialization_began, index > 0, "{row}");
+            // The facts: the earlier directories are pinned, the earlier files complete, nothing in flight.
+            let expected_pins: Vec<bool> = (0..5).map(|slot_index| slot_index < index).collect();
+            assert_eq!(
+                pins_present(&failure.partial.pins).to_vec(),
+                expected_pins,
+                "{row}"
+            );
+            let complete = index.saturating_sub(5);
+            assert_eq!(failure.partial.files.len(), complete, "{row}");
+            assert!(failure.partial.in_flight.is_none(), "{row}");
+            // The refused entry's allowance went back; everything created before it stays charged.
+            assert_eq!(
+                failure.partial.charged,
+                ObjectStoreChargeV1 {
+                    entries: index as u64,
+                    bytes: lengths[..complete].iter().sum(),
+                },
+                "{row}"
+            );
+            // Earlier entries exist; later ones do not; the planted entry is untouched.
+            let target = stored(&case.dest, slot);
+            for (later, name) in names.iter().enumerate() {
+                let path = stored(&case.dest, name);
+                if later < index {
+                    assert!(
+                        exists(&path),
+                        "{row}: {name} was created before the collision"
+                    );
+                } else if later > index {
+                    assert!(
+                        !exists(&path),
+                        "{row}: {name} was created after the collision"
+                    );
+                }
+            }
+            match kind {
+                PlantV1::RegularFile => {
+                    assert_eq!(
+                        std::fs::read(&target).expect("planted"),
+                        b"planted",
+                        "{row}"
+                    );
+                }
+                PlantV1::EmptyDirectory => {
+                    assert!(
+                        listing(&target).is_empty(),
+                        "{row}: something was written inside"
+                    );
+                }
+                PlantV1::Symlink => {
+                    assert_eq!(
+                        std::fs::read_link(&target).expect("a link"),
+                        outside,
+                        "{row}"
+                    );
+                    assert_eq!(snapshot(&outside), outside_before, "{row}: written through");
+                }
+            }
+        }
+    }
+}
+
+/// A refused invocation leaves every created byte, and a second invocation over the same retained value
+/// (after a success, and after a partial failure) refuses at `repository` as a collision: it overwrites
+/// nothing, and its own reservation is given back.
+#[test]
+fn b2a_a_second_invocation_refuses_and_cannot_overwrite_the_first_partial_state() {
+    let capsule = captured(CustodyGitObjectFormatV1::Sha1);
+
+    // After a success.
+    let mut case = StoreCaseV1::of(&capsule, CustodyGitObjectFormatV1::Sha1);
+    let _ = case.done("the first invocation");
+    let after_first = snapshot(&case.dest.path);
+    let ledger = case.ledger();
+    let failure = case.refused("the second invocation");
+    assert!(
+        matches!(&failure.cause,
+            GitBootstrapErrorV1::Restore(CustodyRestoreErrorV1::StagingCollision { name })
+                if name == "repository"),
+        "{:?}",
+        failure.cause
+    );
+    assert!(!failure.active_materialization_began, "it created nothing");
+    assert_eq!(failure.partial.charged, none_charged());
+    assert_eq!(case.ledger(), ledger, "the second reservation was released");
+    assert_eq!(snapshot(&case.dest.path), after_first, "byte-identical");
+
+    // After a partial failure: the `.idx` copy was refused after its file was created.
+    let mut case = StoreCaseV1::of(&capsule, CustodyGitObjectFormatV1::Sha1);
+    let idx = case.entry_names()[6].clone();
+    let _device = override_created_dev_for_test(&idx, device_of(&case.dest.path) + 1);
+    let first = case.refused("the first invocation");
+    assert!(
+        matches!(
+            first.cause,
+            GitBootstrapErrorV1::Restore(CustodyRestoreErrorV1::DeviceCrossing { .. })
+        ),
+        "{:?}",
+        first.cause
+    );
+    assert!(first.active_materialization_began);
+    let after_first = snapshot(&case.dest.path);
+    let ledger = case.ledger();
+    let second = case.refused("the second invocation");
+    assert!(
+        matches!(&second.cause,
+            GitBootstrapErrorV1::Restore(CustodyRestoreErrorV1::StagingCollision { name })
+                if name == "repository"),
+        "{:?}",
+        second.cause
+    );
+    assert!(!second.active_materialization_began);
+    assert_eq!(case.ledger(), ledger);
+    assert_eq!(
+        snapshot(&case.dest.path),
+        after_first,
+        "the partial state is byte-identical"
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// Entry and byte exhaustion are exact
+// ---------------------------------------------------------------------------------------------
+
+/// The bound is exact at every entry and every byte: with one byte less than an entry needs, the entry is
+/// refused and not created; the headroom of exactly the whole charge succeeds. Everything created before the
+/// refusal stays, charged, and the facts say so.
+#[test]
+fn b2a_entry_and_byte_exhaustion_is_exact_and_leaves_typed_partial_effects() {
+    let capsule = captured(CustodyGitObjectFormatV1::Sha1);
+    let lengths = StoreCaseV1::of(&capsule, CustodyGitObjectFormatV1::Sha1).lengths();
+    let total_bytes: u64 = lengths.iter().sum();
+
+    // The exact fit succeeds.
+    let mut case = StoreCaseV1::of(&capsule, CustodyGitObjectFormatV1::Sha1);
+    leave_headroom(&case.boot.verified, 8 * ENTRY_V1 + total_bytes);
+    let done = case.done("the exact fit");
+    assert_eq!(
+        case.ledger(),
+        RESTORE_BYTES_CEILING_V1,
+        "the ledger is exactly full"
+    );
+    assert_eq!(charge_of(done.charged), 8 * ENTRY_V1 + total_bytes);
+
+    // One byte short of an ENTRY, at each of the eight entries.
+    for index in 0..8_usize {
+        let row = format!("entry {index}");
+        let mut case = StoreCaseV1::of(&capsule, CustodyGitObjectFormatV1::Sha1);
+        let complete = index.saturating_sub(5);
+        let bytes_before: u64 = lengths[..complete].iter().sum();
+        leave_headroom(
+            &case.boot.verified,
+            index as u64 * ENTRY_V1 + bytes_before + (ENTRY_V1 - 1),
+        );
+        let failure = case.refused(&row);
+        assert!(
+            matches!(
+                failure.cause,
+                GitBootstrapErrorV1::Restore(CustodyRestoreErrorV1::Budget(_))
+            ),
+            "{row}: {:?}",
+            failure.cause
+        );
+        assert_eq!(failure.active_materialization_began, index > 0, "{row}");
+        assert_eq!(
+            failure.partial.charged,
+            ObjectStoreChargeV1 {
+                entries: index as u64,
+                bytes: bytes_before
+            },
+            "{row}"
+        );
+        assert_eq!(failure.partial.files.len(), complete, "{row}");
+        assert!(failure.partial.in_flight.is_none(), "{row}");
+        assert_partial_is_the_disk(&case, &failure, 0);
+        // The entry that was refused was not created.
+        let names = case.entry_names();
+        assert!(!exists(&stored(&case.dest, &names[index])), "{row}");
+    }
+
+    // One byte short of a FILE's bytes: its entry exists, empty or partly written, and stays charged.
+    for chunk in [None, Some(16_usize)] {
+        for file in 0..3_usize {
+            let row = format!("bytes of file {file} chunk {chunk:?}");
+            let _chunk = chunk.map(override_object_copy_chunk_for_test);
+            let mut case = StoreCaseV1::of(&capsule, CustodyGitObjectFormatV1::Sha1);
+            let bytes_before: u64 = lengths[..file].iter().sum();
+            let length = lengths[file];
+            leave_headroom(
+                &case.boot.verified,
+                (6 + file as u64) * ENTRY_V1 + bytes_before + length - 1,
+            );
+            let failure = case.refused(&row);
+            assert!(
+                matches!(
+                    failure.cause,
+                    GitBootstrapErrorV1::Restore(CustodyRestoreErrorV1::Budget(_))
+                ),
+                "{row}: {:?}",
+                failure.cause
+            );
+            assert!(failure.active_materialization_began, "{row}");
+            // The refused chunk is the last one: it is never written.
+            let last = chunk.map_or(length, |size| ((length - 1) % size as u64) + 1);
+            let written = length - last;
+            let flight = failure
+                .partial
+                .in_flight
+                .as_ref()
+                .expect("the file in flight");
+            assert_eq!(
+                (flight.expected_length, flight.written),
+                (length, written),
+                "{row}"
+            );
+            assert_eq!(
+                failure.partial.charged,
+                ObjectStoreChargeV1 {
+                    entries: 6 + file as u64,
+                    bytes: bytes_before + written
+                },
+                "{row}"
+            );
+            assert_eq!(failure.partial.files.len(), file, "{row}");
+            // The partial bytes are on disk, exactly what was charged, and are a prefix of the original.
+            let leaf = flight.relative.rsplit('/').next().expect("a leaf");
+            let copied = std::fs::read(pack_directory(&case.dest).join(leaf)).expect("the file");
+            let original = std::fs::read(case.dest.bootstrap().join(&flight.relative))
+                .expect("the bootstrap file");
+            assert_eq!(copied.len() as u64, written, "{row}");
+            assert_eq!(&original[..copied.len()], &copied[..], "{row}");
+            assert_partial_is_the_disk(&case, &failure, 0);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// The retained bootstrap files are what is copied
+// ---------------------------------------------------------------------------------------------
+
+/// An admitted bootstrap file that is replaced, swapped for a link, or changed before the copy is refused
+/// before any write, and the replacement is never followed or read: a symlink to a copy of the bytes, a new
+/// inode holding the same bytes, and an appended byte (the retained descriptor's own length no longer the
+/// admitted one).
+#[test]
+fn b2a_a_replaced_or_changed_bootstrap_object_file_refuses_before_any_write() {
+    let capsule = captured(CustodyGitObjectFormatV1::Sha1);
+    for extension in EXTENSIONS_V1 {
+        for action in ["symlink", "a new inode", "an appended byte"] {
+            let row = format!("{extension}: {action}");
+            let mut case = StoreCaseV1::of(&capsule, CustodyGitObjectFormatV1::Sha1);
+            let path = admitted_path(&case.dest.bootstrap(), extension);
+            let original = std::fs::read(&path).expect("the admitted file");
+            let (_outside_area, outside) = external_dir_with(&["decoy"]);
+            let outside_before = snapshot(&outside);
+            match action {
+                "symlink" => {
+                    let copy = outside.join("copy");
+                    std::fs::write(&copy, &original).expect("a copy elsewhere");
+                    std::fs::remove_file(&path).expect("the file goes");
+                    std::os::unix::fs::symlink(&copy, &path).expect("a link in its place");
+                }
+                "a new inode" => {
+                    std::fs::rename(&path, path.with_extension("moved")).expect("moved away");
+                    std::fs::write(&path, &original).expect("the same bytes, a new inode");
+                }
+                _ => {
+                    use std::io::Write as _;
+                    std::fs::OpenOptions::new()
+                        .append(true)
+                        .open(&path)
+                        .and_then(|mut file| file.write_all(b"x"))
+                        .expect("an appended byte");
+                }
+            }
+            let outside_planted = snapshot(&outside);
+            let cause = case.refused_before_any_write(&row);
+            let accepted = match action {
+                "symlink" => matches!(
+                    cause,
+                    GitBootstrapErrorV1::Restore(CustodyRestoreErrorV1::SymlinkRefused { .. })
+                ),
+                _ => matches!(
+                    cause,
+                    GitBootstrapErrorV1::Restore(CustodyRestoreErrorV1::IdentityChanged(_))
+                ),
+            };
+            assert!(accepted, "{row}: {cause:?}");
+            assert_eq!(
+                snapshot(&outside),
+                outside_planted,
+                "{row}: the outside changed"
+            );
+            assert_ne!(outside_before, BTreeMap::new());
+        }
+    }
+}
+
+/// A bootstrap file that changes DURING the copy is never taken for the admitted bytes. The copy streams
+/// from the retained descriptor, one bounded chunk at a time, and the result is checked against the length
+/// and SHA-256 admitted: a same-length change in place, an appended byte, and a truncation each refuse with
+/// a typed copy refusal, and the bytes written so far are preserved with the facts that describe them.
+#[test]
+fn b2a_a_bootstrap_file_that_changes_during_the_copy_is_refused_with_the_partial_bytes_kept() {
+    // A chunk no admitted file's length is a multiple of, so the last chunk is short and the read bound
+    // (never past the admitted length) is what keeps a grown source from being copied.
+    let _chunk = override_object_copy_chunk_for_test(13);
+    let capsule = captured(CustodyGitObjectFormatV1::Sha1);
+    for (extension, action) in [
+        ("pack", "changed in place"),
+        ("idx", "an appended byte"),
+        ("rev", "truncated"),
+    ] {
+        let row = format!("{extension}: {action}");
+        let mut case = StoreCaseV1::of(&capsule, CustodyGitObjectFormatV1::Sha1);
+        let source = admitted_path(&case.dest.bootstrap(), extension);
+        let original = std::fs::read(&source).expect("the admitted file");
+        let output_leaf = source.file_name().expect("a name").to_owned();
+        let output = pack_directory(&case.dest).join(&output_leaf);
+        let chunks = std::rc::Rc::new(std::cell::Cell::new(0_usize));
+        let seen = chunks.clone();
+        let acting = (source.clone(), output.clone(), action);
+        let _hook = install_git_hook_for_test(GitHookPointV1::BeforeObjectChunk, move |event| {
+            if event.path != acting.1 {
+                return;
+            }
+            seen.set(seen.get() + 1);
+            // A change in place must precede the first read to be seen at all; the others act between
+            // the first chunk and the second.
+            if seen.get() != if acting.2 == "changed in place" { 1 } else { 2 } {
+                return;
+            }
+            match acting.2 {
+                "changed in place" => change_in_place(&acting.0),
+                "an appended byte" => {
+                    use std::io::Write as _;
+                    std::fs::OpenOptions::new()
+                        .append(true)
+                        .open(&acting.0)
+                        .and_then(|mut file| file.write_all(b"x"))
+                        .expect("an appended byte");
+                }
+                _ => std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(&acting.0)
+                    .and_then(|file| file.set_len(20))
+                    .expect("a truncation"),
+            }
+        });
+        let failure = case.refused(&row);
+        // Each refusal is its own guard's: the digest of the bytes streamed, the probe past the admitted
+        // length, and the end of the source before it.
+        let wanted = match action {
+            "changed in place" => "admitted SHA-256",
+            "an appended byte" => "longer than the admitted",
+            _ => "the source ended after",
+        };
+        match &failure.cause {
+            GitBootstrapErrorV1::ObjectCopy { relative, detail } => {
+                assert!(relative.ends_with(extension), "{row}: {relative}");
+                assert!(detail.contains(wanted), "{row}: {detail}");
+            }
+            other => panic!("{row}: {other:?}"),
+        }
+        assert!(failure.active_materialization_began, "{row}");
+        let flight = failure
+            .partial
+            .in_flight
+            .as_ref()
+            .expect("the file in flight");
+        assert_eq!(flight.expected_length, original.len() as u64, "{row}");
+        // What is on disk is exactly what the facts say was written, and is kept.
+        let copied = std::fs::read(&output).expect("the partial copy");
+        assert_eq!(copied.len() as u64, flight.written, "{row}");
+        match action {
+            "changed in place" => {
+                assert_eq!(
+                    flight.written,
+                    original.len() as u64,
+                    "{row}: every byte was read"
+                );
+                assert_ne!(
+                    copied, original,
+                    "{row}: the changed byte was copied, and refused"
+                );
+            }
+            "an appended byte" => {
+                assert_eq!(
+                    copied,
+                    original,
+                    "{row}: the first {} bytes",
+                    original.len()
+                );
+            }
+            _ => {
+                assert!(flight.written < original.len() as u64, "{row}");
+                assert!(copied.len() >= 13, "{row}: the first chunk was copied");
+            }
+        }
+        // Files before it are complete, files after it were never created.
+        let position = EXTENSIONS_V1
+            .iter()
+            .position(|found| *found == extension)
+            .expect("ext");
+        assert_eq!(failure.partial.files.len(), position, "{row}");
+        assert_eq!(
+            listing(&pack_directory(&case.dest)).len(),
+            position + 1,
+            "{row}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Late swaps: every retained chain is rechecked around the writes
+// ---------------------------------------------------------------------------------------------
+
+/// Runs `act` once, just before the helper creates the entry at `target` (after its pre-create recheck).
+fn act_before_creating(target: PathBuf, act: impl Fn() + 'static) -> GitSeamGuardV1 {
+    let fired = std::rc::Rc::new(std::cell::Cell::new(false));
+    install_git_hook_for_test(GitHookPointV1::BeforeObjectCreate, move |event| {
+        if event.path == target && !fired.replace(true) {
+            act();
+        }
+    })
+}
+
+/// Runs `act` once, at the `nth` time the helper reads the clock for the guard `label`.
+fn act_at_guard(label: &'static str, nth: usize, act: impl Fn() + 'static) -> GitSeamGuardV1 {
+    let seen = std::rc::Rc::new(std::cell::Cell::new(0_usize));
+    install_git_hook_for_test(GitHookPointV1::DeadlineObserved, move |event| {
+        if event.label == label {
+            seen.set(seen.get() + 1);
+            if seen.get() == nth {
+                act();
+            }
+        }
+    })
+}
+
+fn identity_changed(error: &GitBootstrapErrorV1) -> bool {
+    matches!(
+        error,
+        GitBootstrapErrorV1::Restore(CustodyRestoreErrorV1::IdentityChanged(_))
+    )
+}
+
+fn move_away(path: &Path, to: &str) {
+    std::fs::rename(path, path.with_file_name(to)).expect("moved away");
+}
+
+/// The guards the helper reads after a swap happened: a refusal that comes from the swapped step's OWN
+/// recheck never reaches the guard of any later step (a later directory, file, gate, sync, or read-back).
+struct AfterSwapV1 {
+    swapped: std::rc::Rc<std::cell::Cell<bool>>,
+    labels: std::rc::Rc<std::cell::RefCell<Vec<&'static str>>>,
+}
+
+impl AfterSwapV1 {
+    fn new() -> Self {
+        Self {
+            swapped: std::rc::Rc::new(std::cell::Cell::new(false)),
+            labels: std::rc::Rc::new(std::cell::RefCell::new(Vec::new())),
+        }
+    }
+
+    fn flag(&self) -> std::rc::Rc<std::cell::Cell<bool>> {
+        self.swapped.clone()
+    }
+
+    fn record(&self) -> GitSeamGuardV1 {
+        let (swapped, labels) = (self.swapped.clone(), self.labels.clone());
+        install_git_hook_for_test(GitHookPointV1::DeadlineObserved, move |event| {
+            if swapped.get() {
+                labels.borrow_mut().push(event.label);
+            }
+        })
+    }
+
+    fn assert_refused_within_the_step(&self, row: &str) {
+        let labels = self.labels.borrow();
+        assert!(!labels.is_empty(), "{row}: the swap was never reached");
+        for later in [
+            "objects-directory",
+            "objects-file",
+            "objects-gate",
+            "objects-sync",
+            "objects-verify",
+            "objects-final",
+        ] {
+            assert!(
+                !labels.contains(&later),
+                "{row}: the run went on to `{later}` after the swap: {labels:?}"
+            );
+        }
+    }
+}
+
+/// One swap between two writes: the entry it happens before, the swap itself (given the destination's
+/// paths and an outside directory a link may name), and how many entries the helper had created when the
+/// next recheck refused.
+struct SwapV1 {
+    row: &'static str,
+    before: usize,
+    swap: fn(&PathsV1, &Path),
+    entries: u64,
+    /// Entries under `repository*` that the swap itself plants (a replacement directory or link).
+    planted: usize,
+}
+
+/// A directory the helper created and pinned that is renamed away and replaced by a new directory, or by a
+/// link, between two writes is caught at the next recheck: the entry that raced went through the retained
+/// pin into the moved directory (never through the new name), no later entry is created, and every byte is
+/// preserved. A bootstrap, staging, work, or HOME/XDG chain swapped between two writes is caught the same
+/// way, and a replacement bootstrap file is never read: the copy comes from the retained descriptor.
+#[test]
+fn b2a_late_parent_link_and_staging_swaps_refuse_through_retained_pins() {
+    let capsule = captured(CustodyGitObjectFormatV1::Sha1);
+    let rows = [
+        SwapV1 {
+            row: "an output parent replaced by a directory",
+            before: 2,
+            swap: |paths, _| {
+                let git = paths.root.join("repository/.git");
+                move_away(&git, ".git-away");
+                std::fs::create_dir(&git).expect("a new directory takes the name");
+            },
+            entries: 3,
+            planted: 1,
+        },
+        SwapV1 {
+            row: "an output parent replaced by a link",
+            before: 3,
+            swap: |paths, outside| {
+                let objects = paths.root.join("repository/.git/objects");
+                move_away(&objects, "objects-away");
+                std::os::unix::fs::symlink(outside, &objects).expect("a link takes the name");
+            },
+            entries: 4,
+            planted: 1,
+        },
+        SwapV1 {
+            row: "an earlier output directory replaced by a link",
+            before: 4,
+            swap: |paths, outside| {
+                let pack = paths.root.join("repository/.git/objects/pack");
+                move_away(&pack, "pack-away");
+                std::os::unix::fs::symlink(outside, &pack).expect("a link takes the name");
+            },
+            entries: 5,
+            planted: 1,
+        },
+        SwapV1 {
+            row: "the repository replaced by a link",
+            before: 1,
+            swap: |paths, outside| {
+                let repository = paths.root.join("repository");
+                move_away(&repository, "repository-away");
+                std::os::unix::fs::symlink(outside, &repository).expect("a link takes the name");
+            },
+            entries: 2,
+            planted: 1,
+        },
+        SwapV1 {
+            row: "the bootstrap pack directory replaced",
+            before: 6,
+            swap: |paths, _| {
+                let pack = paths.bootstrap.join("objects/pack");
+                move_away(&pack, "pack-away");
+                std::fs::create_dir(&pack).expect("a new directory takes the name");
+                // Same-named files with other bytes: they must never be read.
+                for entry in std::fs::read_dir(pack.with_file_name("pack-away")).expect("the old") {
+                    let name = entry.expect("an entry").file_name();
+                    std::fs::write(pack.join(name), b"poison").expect("a poisoned file");
+                }
+            },
+            entries: 7,
+            planted: 0,
+        },
+        SwapV1 {
+            row: "the staging directory replaced",
+            before: 5,
+            swap: |paths, _| {
+                let plain = paths.work.join("plain");
+                move_away(&plain, "plain-away");
+                std::fs::create_dir(&plain).expect("a new directory takes the name");
+            },
+            entries: 6,
+            planted: 0,
+        },
+        SwapV1 {
+            row: "the work directory replaced",
+            before: 7,
+            swap: |paths, _| {
+                move_away(&paths.work, ".restore-work-away");
+                std::fs::create_dir(&paths.work).expect("a new directory takes the name");
+            },
+            entries: 8,
+            planted: 0,
+        },
+        SwapV1 {
+            row: "the XDG directory replaced by a link",
+            before: 0,
+            swap: |paths, outside| {
+                let xdg = paths.work.join("xdg");
+                move_away(&xdg, "xdg-away");
+                std::os::unix::fs::symlink(outside, &xdg).expect("a link takes the name");
+            },
+            entries: 1,
+            planted: 0,
+        },
+        SwapV1 {
+            row: "an unrelated bootstrap directory replaced",
+            before: 4,
+            swap: |paths, _| {
+                let info = paths.bootstrap.join("objects/info");
+                move_away(&info, "info-away");
+                std::fs::create_dir(&info).expect("a new directory takes the name");
+            },
+            entries: 5,
+            planted: 0,
+        },
+    ];
+    for SwapV1 {
+        row,
+        before,
+        swap,
+        entries,
+        planted,
+    } in rows
+    {
+        let mut case = StoreCaseV1::of(&capsule, CustodyGitObjectFormatV1::Sha1);
+        let lengths = case.lengths();
+        let (_outside_area, outside) = external_dir_with(&["decoy"]);
+        let outside_before = snapshot(&outside);
+        let originals = bootstrap_object_files(&case.dest);
+        let paths = PathsV1::of(&case.dest);
+        let names = case.entry_names();
+        let swapping = outside.clone();
+        let after = AfterSwapV1::new();
+        let swapped = after.flag();
+        let _hook = act_before_creating(stored(&case.dest, &names[before]), move || {
+            swap(&paths, &swapping);
+            swapped.set(true);
+        });
+        let _guards = after.record();
+        let failure = case.refused(row);
+        assert!(
+            identity_changed(&failure.cause),
+            "{row}: {:?}",
+            failure.cause
+        );
+        assert!(failure.active_materialization_began, "{row}");
+        after.assert_refused_within_the_step(row);
+        assert_eq!(
+            snapshot(&outside),
+            outside_before,
+            "{row}: written through a link"
+        );
+        // The entry that raced is created (it went through the retained pin) and refused at once; nothing
+        // after it exists, anywhere.
+        let complete = before.saturating_sub(5).min(3);
+        assert_eq!(failure.partial.charged.entries, entries, "{row}");
+        assert_eq!(
+            failure.partial.charged.bytes,
+            lengths[..complete].iter().sum::<u64>(),
+            "{row}: no byte of the raced file was streamed"
+        );
+        assert_eq!(failure.partial.files.len(), complete, "{row}");
+        assert_eq!(failure.partial.in_flight.is_some(), before >= 5, "{row}");
+        if let Some(flight) = &failure.partial.in_flight {
+            assert_eq!(flight.written, 0, "{row}");
+        }
+        assert_eq!(
+            repository_keys(&case.dest),
+            entries as usize + planted,
+            "{row}: exactly the entries reported exist under the repository, and the swap's own"
+        );
+        // Whatever was copied is the original bytes; a replacement file was never read.
+        let moved_pack = pack_directory(&case.dest);
+        let linked = std::fs::symlink_metadata(&moved_pack)
+            .map(|metadata| metadata.file_type().is_symlink())
+            .unwrap_or(true);
+        if !linked && moved_pack.is_dir() {
+            for (name, bytes) in files_in(&moved_pack) {
+                let original = originals.iter().find(|(found, _)| *found == name);
+                assert!(
+                    original.is_some_and(|(_, original)| *original == bytes || bytes.is_empty()),
+                    "{row}: {name}"
+                );
+            }
+        }
+    }
+}
+
+/// The pre-write recheck is its own guard: a chain swapped at the helper's own entry to a step (the clock
+/// guard before it) refuses BEFORE the entry is created, where the post-write recheck would have let the
+/// entry race into the moved directory first.
+#[test]
+fn b2a_a_chain_swapped_before_a_step_refuses_before_that_entry_is_created() {
+    let capsule = captured(CustodyGitObjectFormatV1::Sha1);
+    type PreV1 = (&'static str, &'static str, usize, fn(&PathsV1), u64, usize);
+    let rows: [PreV1; 4] = [
+        (
+            "an output parent, before the objects directory",
+            "objects-directory",
+            3,
+            |paths| {
+                let git = paths.root.join("repository/.git");
+                move_away(&git, ".git-away");
+                std::fs::create_dir(&git).expect("a new directory takes the name");
+            },
+            2,
+            1,
+        ),
+        (
+            "the repository, before the `.git` directory",
+            "objects-directory",
+            2,
+            |paths| {
+                let repository = paths.root.join("repository");
+                move_away(&repository, "repository-away");
+                std::fs::create_dir(&repository).expect("a new directory takes the name");
+            },
+            1,
+            1,
+        ),
+        (
+            "a bootstrap directory, before the first file",
+            "objects-file",
+            1,
+            |paths| {
+                let pack = paths.bootstrap.join("objects/pack");
+                move_away(&pack, "pack-away");
+                std::fs::create_dir(&pack).expect("a new directory takes the name");
+            },
+            5,
+            0,
+        ),
+        (
+            "the staging directory, before the second file",
+            "objects-file",
+            2,
+            |paths| {
+                let plain = paths.work.join("plain");
+                move_away(&plain, "plain-away");
+                std::fs::create_dir(&plain).expect("a new directory takes the name");
+            },
+            6,
+            0,
+        ),
+    ];
+    for (row, label, nth, swap, entries, planted) in rows {
+        let mut case = StoreCaseV1::of(&capsule, CustodyGitObjectFormatV1::Sha1);
+        let paths = PathsV1::of(&case.dest);
+        let _hook = act_at_guard(label, nth, move || swap(&paths));
+        let failure = case.refused(row);
+        assert!(
+            identity_changed(&failure.cause),
+            "{row}: {:?}",
+            failure.cause
+        );
+        assert!(failure.active_materialization_began, "{row}");
+        assert_eq!(failure.partial.charged.entries, entries, "{row}");
+        assert!(
+            failure.partial.in_flight.is_none(),
+            "{row}: no entry was in flight"
+        );
+        assert_eq!(
+            repository_keys(&case.dest),
+            entries as usize + planted,
+            "{row}: the step's entry was never created, in the moved tree or anywhere"
+        );
+    }
+}
+
+/// How many entries (files, directories, links) the snapshot holds under a name starting with `repository`:
+/// the helper's created entries, wherever a swap moved them, plus whatever a swap planted.
+fn repository_keys(dest: &DestV1) -> usize {
+    snapshot(&dest.path)
+        .keys()
+        .filter(|name| name.starts_with("repository"))
+        .count()
+}
+
+// ---------------------------------------------------------------------------------------------
+// The final gate: the root is checked LAST, and a late link or root swap refuses with every byte kept
+// ---------------------------------------------------------------------------------------------
+
+/// The destination root swapped just before the final gate refuses with every file already complete: the
+/// retained facts name all eight entries, they are all in the moved root, and the replacement stays empty.
+#[test]
+fn b2a_a_root_swapped_before_the_final_gate_refuses_with_every_effect_preserved() {
+    let (_capsule, mut case) = captured_case(CustodyGitObjectFormatV1::Sha1);
+    let lengths = case.lengths();
+    let root = case.dest.path.clone();
+    let away = root.with_file_name("dest-away");
+    let (swap_root, swap_away) = (root.clone(), away.clone());
+    let _hook = install_git_hook_for_test(GitHookPointV1::BeforeObjectsFinalGate, move |_| {
+        std::fs::rename(&swap_root, &swap_away).expect("the root moves away");
+        std::fs::create_dir(&swap_root).expect("an empty root takes its name");
+    });
+    let failure = case.refused("the final gate");
+    assert!(identity_changed(&failure.cause), "{:?}", failure.cause);
+    assert!(failure.active_materialization_began);
+    assert_eq!(
+        failure.partial.charged,
+        ObjectStoreChargeV1 {
+            entries: 8,
+            bytes: lengths.iter().sum()
+        }
+    );
+    assert_eq!(failure.partial.files.len(), 3, "every copy was complete");
+    assert!(failure.partial.in_flight.is_none());
+    assert_eq!(pins_present(&failure.partial.pins), [true; 5]);
+    assert_eq!(
+        case.dest.entries(),
+        Vec::<String>::new(),
+        "the replacement root stays empty"
+    );
+    assert_eq!(listing(&away.join("repository/.git/objects/pack")).len(), 3);
+}
+
+/// An output file replaced by a link between its copy and the final gate is refused, never followed: the
+/// gate looks every created file up by name through its retained pin. The outside file is untouched.
+#[test]
+fn b2a_an_output_file_replaced_by_a_link_before_the_final_gate_refuses() {
+    let (_capsule, mut case) = captured_case(CustodyGitObjectFormatV1::Sha1);
+    let rev = case.entry_names()[7].clone();
+    let rev_path = stored(&case.dest, &rev);
+    let (_outside_area, outside) = external_dir_with(&["decoy"]);
+    let outside_before = snapshot(&outside);
+    let link_target = outside.join("decoy");
+    let swapped = rev_path.clone();
+    let _hook = install_git_hook_for_test(GitHookPointV1::BeforeObjectsFinalGate, move |_| {
+        move_away(&swapped, "moved.rev");
+        std::os::unix::fs::symlink(&link_target, &swapped).expect("a link takes the name");
+    });
+    let failure = case.refused("a linked output file");
+    assert!(
+        matches!(
+            failure.cause,
+            GitBootstrapErrorV1::Restore(CustodyRestoreErrorV1::SymlinkRefused { .. })
+        ),
+        "{:?}",
+        failure.cause
+    );
+    assert_eq!(
+        snapshot(&outside),
+        outside_before,
+        "written through the link"
+    );
+    assert_eq!(failure.partial.files.len(), 3);
+    assert!(
+        rev_path.with_file_name("moved.rev").is_file(),
+        "the bytes are kept"
+    );
+}
+
+/// A copied file that is no longer the one the helper measured (another inode holding the same bytes, a
+/// longer file, or a directory) is refused at the final gate: the gate looks every created file up by name
+/// through its retained pin and holds it to the device, inode, and length it was measured with.
+#[test]
+fn b2a_an_output_file_that_is_no_longer_the_copy_refuses_before_the_final_gate() {
+    let capsule = captured(CustodyGitObjectFormatV1::Sha1);
+    for action in ["a new inode", "an appended byte", "a directory"] {
+        let mut case = StoreCaseV1::of(&capsule, CustodyGitObjectFormatV1::Sha1);
+        let idx = case.entry_names()[6].clone();
+        let path = stored(&case.dest, &idx);
+        let acting = path.clone();
+        let _hook =
+            install_git_hook_for_test(
+                GitHookPointV1::BeforeObjectsFinalGate,
+                move |_| match action {
+                    "a new inode" => {
+                        let bytes = std::fs::read(&acting).expect("the copy");
+                        move_away(&acting, "moved.idx");
+                        std::fs::write(&acting, bytes).expect("the same bytes, a new inode");
+                    }
+                    "an appended byte" => {
+                        use std::io::Write as _;
+                        std::fs::OpenOptions::new()
+                            .append(true)
+                            .open(&acting)
+                            .and_then(|mut file| file.write_all(b"x"))
+                            .expect("an appended byte");
+                    }
+                    _ => {
+                        move_away(&acting, "moved.idx");
+                        std::fs::create_dir(&acting).expect("a directory takes the name");
+                    }
+                },
+            );
+        let failure = case.refused(action);
+        assert!(
+            identity_changed(&failure.cause),
+            "{action}: {:?}",
+            failure.cause
+        );
+        assert!(failure.active_materialization_began, "{action}");
+        assert_eq!(
+            failure.partial.files.len(),
+            3,
+            "{action}: every copy was complete"
+        );
+    }
+}
+
+/// The caller's last completed step is carried unchanged on every refusal, before the first write and
+/// after writes began; the helper never claims a step of its own on a failure.
+#[test]
+fn b2a_the_callers_completed_step_is_carried_unchanged_on_every_refusal() {
+    let capsule = captured(CustodyGitObjectFormatV1::Sha1);
+    let case = StoreCaseV1::of(&capsule, CustodyGitObjectFormatV1::Sha1);
+    let mut wrong = case.plan.clone();
+    wrong.frames.reverse();
+    let steps = [
+        None,
+        Some(GitPlaneStepV1::Admission),
+        Some(GitPlaneStepV1::BootstrapGate),
+    ];
+    for completed in steps {
+        let failure = materialize_object_store_v1(&case.boot, &wrong, far_deadline(), completed)
+            .expect_err("a wrong plan");
+        assert_eq!(failure.last_completed, completed);
+        assert!(!failure.active_materialization_began);
+    }
+    for completed in steps {
+        let case = StoreCaseV1::of(&capsule, CustodyGitObjectFormatV1::Sha1);
+        let pack = case.entry_names()[5].clone();
+        let _device = override_created_dev_for_test(&pack, device_of(&case.dest.path) + 1);
+        let failure =
+            materialize_object_store_v1(&case.boot, &case.plan, far_deadline(), completed)
+                .expect_err("a device refusal after writes began");
+        assert_eq!(failure.last_completed, completed);
+        assert!(failure.active_materialization_began);
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Devices and mounts
+// ---------------------------------------------------------------------------------------------
+
+/// A created entry on another device refuses for every one of the eight entries, and its charge stays: the
+/// entry exists (it was created before the device was read), it is named in the facts when it is a file, no
+/// later entry is created, and the ledger moved by exactly what the facts report.
+#[test]
+fn b2a_a_device_mismatch_refuses_for_every_entry_and_keeps_the_charge() {
+    let capsule = captured(CustodyGitObjectFormatV1::Sha1);
+    let names = StoreCaseV1::of(&capsule, CustodyGitObjectFormatV1::Sha1).entry_names();
+    for (index, slot) in names.iter().enumerate() {
+        let mut case = StoreCaseV1::of(&capsule, CustodyGitObjectFormatV1::Sha1);
+        let lengths = case.lengths();
+        let other = device_of(&case.dest.path) + 1;
+        let _device = override_created_dev_for_test(slot, other);
+        let failure = case.refused(slot);
+        assert!(
+            matches!(&failure.cause,
+                GitBootstrapErrorV1::Restore(CustodyRestoreErrorV1::DeviceCrossing { name })
+                    if name == slot),
+            "{slot}: {:?}",
+            failure.cause
+        );
+        assert!(failure.active_materialization_began, "{slot}");
+        let complete = index.saturating_sub(5);
+        assert_eq!(
+            failure.partial.charged,
+            ObjectStoreChargeV1 {
+                entries: index as u64 + 1,
+                bytes: lengths[..complete].iter().sum()
+            },
+            "{slot}: the created entry stays charged"
+        );
+        assert!(exists(&stored(&case.dest, slot)), "{slot}: it was created");
+        for later in &names[index + 1..] {
+            assert!(
+                !exists(&stored(&case.dest, later)),
+                "{slot}: {later} was created after"
+            );
+        }
+        // A directory refused on its device has no pin; a file is named in flight with nothing written.
+        let unlisted = usize::from(index < 5);
+        assert_eq!(failure.partial.in_flight.is_some(), index >= 5, "{slot}");
+        assert_partial_is_the_disk(&case, &failure, unlisted);
+    }
+}
+
+/// The mount census runs before the first entry, before each file's write, and at the final gate: a mount
+/// that appears for any ONE census call refuses at that call, with only the entries made before it, and a
+/// census that cannot list the mount points fails closed before anything is created.
+#[test]
+fn b2a_a_mount_appearing_at_any_census_refuses_and_a_failing_census_fails_closed() {
+    for (populated, expected_entries) in [(true, vec![0_u64, 5, 6, 7, 8]), (false, vec![0, 5])] {
+        let cformat = CustodyGitObjectFormatV1::Sha1;
+        let capsule = if populated {
+            captured(cformat)
+        } else {
+            empty(cformat)
+        };
+        // Learn the number of census calls in a clean run.
+        let mut case = StoreCaseV1::of(&capsule, cformat);
+        let census = crate::custody_mounts::seam::install_list(vec![b"/".to_vec()]);
+        let _ = case.done("a clean run");
+        let total = census.calls();
+        drop(census);
+        assert_eq!(
+            total,
+            expected_entries.len(),
+            "populated={populated}: {total} census calls"
+        );
+
+        for call in 1..=total {
+            let row = format!("populated={populated} call {call}");
+            let mut case = StoreCaseV1::of(&capsule, cformat);
+            let inside = case
+                .dest
+                .path
+                .join(".restore-work/home")
+                .as_os_str()
+                .as_bytes()
+                .to_vec();
+            let _census = crate::custody_mounts::seam::install(Box::new(move |number| {
+                if number == call {
+                    Ok(vec![b"/".to_vec(), inside.clone()])
+                } else {
+                    Ok(vec![b"/".to_vec()])
+                }
+            }));
+            let failure = case.refused(&row);
+            assert!(
+                matches!(
+                    failure.cause,
+                    GitBootstrapErrorV1::Restore(CustodyRestoreErrorV1::MountBoundary(_))
+                ),
+                "{row}: {:?}",
+                failure.cause
+            );
+            assert_eq!(
+                failure.partial.charged.entries,
+                expected_entries[call - 1],
+                "{row}: the census precedes the entries it guards"
+            );
+            assert_eq!(failure.active_materialization_began, call > 1, "{row}");
+            assert_partial_is_the_disk(&case, &failure, 0);
+        }
+    }
+
+    let capsule = captured(CustodyGitObjectFormatV1::Sha1);
+    let mut case = StoreCaseV1::of(&capsule, CustodyGitObjectFormatV1::Sha1);
+    let _census = crate::custody_mounts::seam::install(Box::new(|_| {
+        Err(crate::custody_mounts::CustodyMountErrorV1::MalformedLine { line: 1 })
+    }));
+    let cause = case.refused_before_any_write("a failing census");
+    assert!(
+        matches!(
+            cause,
+            GitBootstrapErrorV1::Restore(CustodyRestoreErrorV1::MountBoundary(_))
+        ),
+        "{cause:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// The one deadline paces every step
+// ---------------------------------------------------------------------------------------------
+
+/// The one deadline of the pacing rows. A clean run of these small files takes milliseconds.
+const B2A_DEADLINE_V1: Duration = Duration::from_secs(2);
+
+/// Every label the helper's clean Captured run reads the clock at: each step of the success path is paced.
+const B2A_GUARDS_V1: [&str; 14] = [
+    "chain",
+    "objects-chain",
+    "objects-checked",
+    "objects-directory",
+    "objects-entry",
+    "objects-file",
+    "objects-final",
+    "objects-gate",
+    "objects-read",
+    "objects-source",
+    "objects-sync",
+    "objects-sync-directory",
+    "objects-verify",
+    "root",
+];
+
+/// A deadline already spent refuses before the first entry: the clock is read once, and nothing is created,
+/// charged, or pinned.
+#[test]
+fn b2a_a_spent_deadline_refuses_before_any_write() {
+    let (_capsule, mut case) = captured_case(CustodyGitObjectFormatV1::Sha1);
+    let spent = Instant::now();
+    std::thread::sleep(Duration::from_millis(5));
+    let (labels, _hook) = record_guards();
+    let tree = snapshot(&case.dest.path);
+    let ledger = case.ledger();
+    let failure = match case.attempt_by(spent) {
+        Ok(_) => panic!("a spent deadline must refuse"),
+        Err(failure) => failure,
+    };
+    assert!(
+        matches!(
+            failure.cause,
+            GitBootstrapErrorV1::Git(CustodyGitError::Timeout)
+        ),
+        "{:?}",
+        failure.cause
+    );
+    assert!(!failure.active_materialization_began);
+    assert_eq!(*labels.borrow(), ["objects-entry"]);
+    assert_eq!(case.ledger(), ledger);
+    assert_eq!(snapshot(&case.dest.path), tree);
+}
+
+/// The clock is read at exactly the documented guards, so no step is unobserved: the first guard is the
+/// entry, the last is the one immediately before the destination root's identity check (the final gate's),
+/// the distinct labels are exactly the documented ones, and each is read exactly as often as the design
+/// says. The recheck runs 21 times for a Captured run (the first gate, two around each of the five
+/// directories, three around each of the three files, and the final gate) and 12 for an Empty one, and
+/// every recheck covers every retained chain, output directory and file, and admitted source file.
+#[test]
+fn b2a_the_guards_of_a_clean_run_are_the_documented_ones() {
+    for populated in [true, false] {
+        let cformat = CustodyGitObjectFormatV1::Sha1;
+        let capsule = if populated {
+            captured(cformat)
+        } else {
+            empty(cformat)
+        };
+        let mut case = StoreCaseV1::of(&capsule, cformat);
+        let staging = case.boot.verified.destination.staging.borrow().len();
+        let bootstrap_directories = case.boot.directories.len();
+        let (labels, _hook) = record_guards();
+        let _ = case.done("a clean run");
+        let labels = labels.borrow();
+        assert_eq!(labels.first().copied(), Some("objects-entry"));
+        assert_eq!(labels.last().copied(), Some("root"));
+        let count = |wanted: &str| labels.iter().filter(|label| **label == wanted).count();
+        let sweeps = if populated { 21 } else { 12 };
+        let expected: Vec<(&str, usize)> = vec![
+            ("objects-entry", 1),
+            ("objects-gate", if populated { 4 } else { 1 }),
+            // The guard right after every NON-final recheck (the full gates and the rechecks between
+            // writes): the recheck ends in the root's identity, which can block.
+            ("objects-checked", if populated { 20 } else { 11 }),
+            ("objects-read", if populated { 3 } else { 0 }),
+            ("objects-sync-directory", if populated { 3 } else { 0 }),
+            ("objects-directory", 5),
+            ("objects-file", if populated { 3 } else { 0 }),
+            ("objects-sync", if populated { 3 } else { 0 }),
+            ("objects-verify", if populated { 3 } else { 0 }),
+            ("objects-final", 1),
+            ("root", sweeps),
+            ("chain", sweeps * (1 + staging + 2 + bootstrap_directories)),
+            ("objects-source", if populated { 3 * sweeps } else { 0 }),
+            ("objects-chain", if populated { 90 } else { 30 }),
+        ];
+        for (label, times) in &expected {
+            assert_eq!(count(label), *times, "populated={populated}: {label}");
+        }
+        assert_eq!(
+            labels.len(),
+            expected.iter().map(|(_, times)| times).sum::<usize>(),
+            "populated={populated}: no other label"
+        );
+        let mut distinct: Vec<&str> = labels.clone();
+        distinct.sort_unstable();
+        distinct.dedup();
+        let documented: Vec<&str> = B2A_GUARDS_V1
+            .into_iter()
+            .filter(|label| populated || !matches!(*label, "objects-source"))
+            .filter(|label| {
+                populated
+                    || !matches!(
+                        *label,
+                        "objects-file"
+                            | "objects-read"
+                            | "objects-sync"
+                            | "objects-sync-directory"
+                            | "objects-verify"
+                    )
+            })
+            .collect();
+        assert_eq!(distinct, documented, "populated={populated}");
+    }
+}
+
+/// Each distinct guard halts the run alone: its step made slow past the deadline is refused with a typed
+/// timeout, the run stops AT that guard (no later guard ever ran), every byte created so far is kept and
+/// reported, and a brief delay at every guard, with headroom, still succeeds.
+#[test]
+fn b2a_each_guard_halts_the_run_alone_and_headroom_succeeds() {
+    let capsule = captured(CustodyGitObjectFormatV1::Sha1);
+    for target in B2A_GUARDS_V1 {
+        let mut case = StoreCaseV1::of(&capsule, CustodyGitObjectFormatV1::Sha1);
+        let deadline = Instant::now() + B2A_DEADLINE_V1;
+        let labels = std::rc::Rc::new(std::cell::RefCell::new(Vec::<&'static str>::new()));
+        let fired = std::rc::Rc::new(std::cell::Cell::new(false));
+        let (seen, slow) = (labels.clone(), fired.clone());
+        let _hook = install_git_hook_for_test(GitHookPointV1::DeadlineObserved, move |event| {
+            seen.borrow_mut().push(event.label);
+            if event.label == target && !slow.replace(true) {
+                pass_the_deadline(deadline);
+            }
+        });
+        let failure = match case.attempt_by(deadline) {
+            Ok(_) => panic!("{target}: a spent deadline must refuse"),
+            Err(failure) => failure,
+        };
+        assert!(
+            matches!(
+                failure.cause,
+                GitBootstrapErrorV1::Git(CustodyGitError::Timeout)
+            ),
+            "{target}: {:?}",
+            failure.cause
+        );
+        assert!(fired.get(), "{target}: the slow step never ran");
+        assert_eq!(
+            labels.borrow().last().copied(),
+            Some(target),
+            "{target}: the run halted AT its guard"
+        );
+    }
+
+    let mut case = StoreCaseV1::of(&capsule, CustodyGitObjectFormatV1::Sha1);
+    // Some five hundred guards, each delayed a millisecond, still leave most of a generous deadline.
+    let _hook = install_git_hook_for_test(GitHookPointV1::DeadlineObserved, |_| {
+        std::thread::sleep(Duration::from_millis(1));
+    });
+    case.attempt_by(Instant::now() + 10 * B2A_DEADLINE_V1)
+        .unwrap_or_else(|failure| panic!("brief delays leave headroom: {:?}", failure.cause));
+}
+
+/// No success past the deadline: when the clock passes at any guard of the FINAL gate (its entry, the guard
+/// right after its mount census, and the last guard right before the root's identity), the run still
+/// refuses, with every file complete and reported. The identity check is therefore the last fallible call,
+/// and the final gate's own chain recheck is what makes it so (the post-write rechecks before it have their
+/// own guards, which this row does not count).
+#[test]
+fn b2a_a_deadline_spent_in_the_final_gate_cannot_succeed() {
+    let capsule = captured(CustodyGitObjectFormatV1::Sha1);
+    for (row, label) in [
+        ("the final gate's entry", "objects-final"),
+        ("the guard after the final census", "objects-chain"),
+        ("the last guard before the root's identity", "root"),
+    ] {
+        let mut case = StoreCaseV1::of(&capsule, CustodyGitObjectFormatV1::Sha1);
+        let lengths = case.lengths();
+        let deadline = Instant::now() + B2A_DEADLINE_V1;
+        let in_final = std::rc::Rc::new(std::cell::Cell::new(false));
+        let fired = std::rc::Rc::new(std::cell::Cell::new(false));
+        let started = in_final.clone();
+        let _gate = install_git_hook_for_test(GitHookPointV1::BeforeObjectsFinalGate, move |_| {
+            started.set(true);
+        });
+        let (inside, once) = (in_final.clone(), fired.clone());
+        let _hook = install_git_hook_for_test(GitHookPointV1::DeadlineObserved, move |event| {
+            if inside.get() && event.label == label && !once.replace(true) {
+                pass_the_deadline(deadline);
+            }
+        });
+        let failure = match case.attempt_by(deadline) {
+            Ok(_) => panic!("{row}: no success after the deadline"),
+            Err(failure) => failure,
+        };
+        assert!(fired.get(), "{row}: the final gate never read that guard");
+        assert!(
+            matches!(
+                failure.cause,
+                GitBootstrapErrorV1::Git(CustodyGitError::Timeout)
+            ),
+            "{row}: {:?}",
+            failure.cause
+        );
+        assert_eq!(
+            failure.partial.charged,
+            ObjectStoreChargeV1 {
+                entries: 8,
+                bytes: lengths.iter().sum()
+            },
+            "{row}: every entry was already made"
+        );
+        assert_eq!(failure.partial.files.len(), 3, "{row}");
+    }
+}
+
+/// Reads and writes are paced too: with chunks of 16 bytes, a deadline that passes before the second chunk of
+/// the `.pack` stops the copy there. Exactly one chunk was read, charged, and written, nothing after it, and
+/// the retained source descriptor itself has not moved past that one chunk (no later chunk was even read).
+#[test]
+fn b2a_no_chunk_is_read_after_the_deadline() {
+    let _chunk = override_object_copy_chunk_for_test(16);
+    let (_capsule, mut case) = captured_case(CustodyGitObjectFormatV1::Sha1);
+    let names = case.entry_names();
+    let output = stored(&case.dest, &names[5]);
+    let deadline = Instant::now() + B2A_DEADLINE_V1;
+    let chunks = std::rc::Rc::new(std::cell::Cell::new(0_usize));
+    let seen = chunks.clone();
+    let _hook = install_git_hook_for_test(GitHookPointV1::BeforeObjectChunk, move |event| {
+        if event.path == output {
+            seen.set(seen.get() + 1);
+            if seen.get() == 2 {
+                pass_the_deadline(deadline);
+            }
+        }
+    });
+    let failure = match case.attempt_by(deadline) {
+        Ok(_) => panic!("the deadline passed mid-copy"),
+        Err(failure) => failure,
+    };
+    assert!(
+        matches!(
+            failure.cause,
+            GitBootstrapErrorV1::Git(CustodyGitError::Timeout)
+        ),
+        "{:?}",
+        failure.cause
+    );
+    assert_eq!(chunks.get(), 2, "no third chunk was started");
+    let flight = failure
+        .partial
+        .in_flight
+        .as_ref()
+        .expect("the pack in flight");
+    assert_eq!(flight.written, 16);
+    assert_eq!(
+        failure.partial.charged,
+        ObjectStoreChargeV1 {
+            entries: 6,
+            bytes: 16
+        }
+    );
+    let written = std::fs::read(stored(&case.dest, &names[5])).expect("the partial pack");
+    assert_eq!(written.len(), 16);
+    assert_eq!(
+        listing(&pack_directory(&case.dest)).len(),
+        1,
+        "no later file was created"
+    );
+    let BootstrapObjectsV1::Captured { files, .. } = &case.boot.objects else {
+        panic!("a Captured bootstrap");
+    };
+    assert_eq!(
+        (&files[0].file).stream_position().expect("a position"),
+        16,
+        "the source was read one chunk, not two"
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// Streaming: bounded chunks, charged ahead of each write, synced after the last byte
+// ---------------------------------------------------------------------------------------------
+
+/// The copy is a stream of bounded chunks: with 16-byte chunks every file is read, charged, and written one
+/// chunk at a time (the disk holds exactly the chunks before the one about to be read), and with the default
+/// chunk each small file is one chunk. Each file and then its directory are synced after its LAST chunk and
+/// before the next file begins.
+#[test]
+fn b2a_the_copy_is_chunked_and_synced_after_the_last_byte() {
+    for chunk in [Some(16_usize), None] {
+        let _seam = chunk.map(override_object_copy_chunk_for_test);
+        let (_capsule, mut case) = captured_case(CustodyGitObjectFormatV1::Sha1);
+        let lengths = case.lengths();
+        let names = case.entry_names();
+        let outputs: Vec<PathBuf> = names[5..]
+            .iter()
+            .map(|name| stored(&case.dest, name))
+            .collect();
+        let log = std::rc::Rc::new(std::cell::RefCell::new(Vec::<String>::new()));
+        let mut guards = Vec::new();
+        {
+            let (log, outputs) = (log.clone(), outputs.clone());
+            guards.push(install_git_hook_for_test(
+                GitHookPointV1::BeforeObjectChunk,
+                move |event| {
+                    let index = outputs
+                        .iter()
+                        .position(|path| path == event.path)
+                        .expect("an output");
+                    let on_disk = std::fs::metadata(event.path).expect("the output").len();
+                    log.borrow_mut()
+                        .push(format!("chunk {index} disk {on_disk}"));
+                },
+            ));
+        }
+        {
+            let (log, outputs, pack) = (log.clone(), outputs.clone(), pack_directory(&case.dest));
+            guards.push(install_git_hook_for_test(
+                GitHookPointV1::ObjectSynced,
+                move |event| {
+                    if event.label == "directory" {
+                        assert_eq!(event.path, pack);
+                        log.borrow_mut().push("sync directory".to_owned());
+                    } else {
+                        let index = outputs
+                            .iter()
+                            .position(|path| path == event.path)
+                            .expect("an output");
+                        log.borrow_mut().push(format!("sync file {index}"));
+                    }
+                },
+            ));
+        }
+        let _ = case.done("a streamed copy");
+        drop(guards);
+
+        let mut expected = Vec::new();
+        for (index, length) in lengths.iter().enumerate() {
+            let size = chunk.map_or(u64::MAX, |size| size as u64);
+            let chunks = length.div_ceil(size.min(*length).max(1));
+            for number in 0..chunks {
+                expected.push(format!(
+                    "chunk {index} disk {}",
+                    (number * size).min(*length)
+                ));
+            }
+            expected.push(format!("sync file {index}"));
+            expected.push("sync directory".to_owned());
+        }
+        assert_eq!(*log.borrow(), expected, "chunk {chunk:?}");
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Retained descriptors are read from their start, and the written copy is read back
+// ---------------------------------------------------------------------------------------------
+
+/// The retained source descriptors are sought to their start explicitly: parked elsewhere by an earlier
+/// reader (as the runner leaves a shared duplicate), each is still copied whole, and the bytes are exact.
+#[test]
+fn b2a_the_source_descriptors_are_read_from_their_start() {
+    use std::io::Seek as _;
+    let (_capsule, mut case) = captured_case(CustodyGitObjectFormatV1::Sha1);
+    let expected = bootstrap_object_files(&case.dest);
+    let BootstrapObjectsV1::Captured { files, .. } = &case.boot.objects else {
+        panic!("a Captured bootstrap");
+    };
+    for admitted in files {
+        (&admitted.file)
+            .seek(SeekFrom::Start(9))
+            .expect("park the descriptor");
+    }
+    let _ = case.done("parked descriptors");
+    assert_eq!(files_in(&pack_directory(&case.dest)), expected);
+}
+
+/// The written file is read back from its own descriptor and held to the admitted digest: a copy that
+/// changes after it was written and synced (same inode, same length) is refused at the read-back, with
+/// every byte kept and the file named in flight.
+#[test]
+fn b2a_a_copy_changed_after_its_write_is_refused_at_the_read_back() {
+    let (_capsule, mut case) = captured_case(CustodyGitObjectFormatV1::Sha1);
+    let names = case.entry_names();
+    let output = stored(&case.dest, &names[6]);
+    let pack = pack_directory(&case.dest);
+    let acting = output.clone();
+    let _hook = install_git_hook_for_test(GitHookPointV1::ObjectSynced, move |event| {
+        if event.label == "directory" && event.path == pack && acting.exists() {
+            change_in_place(&acting);
+        }
+    });
+    let failure = case.refused("a copy changed after its write");
+    match &failure.cause {
+        GitBootstrapErrorV1::ObjectCopy { relative, detail } => {
+            assert!(relative.ends_with(".idx"), "{relative}");
+            assert!(detail.contains("written file"), "{detail}");
+        }
+        other => panic!("{other:?}"),
+    }
+    let flight = failure
+        .partial
+        .in_flight
+        .as_ref()
+        .expect("the idx in flight");
+    assert_eq!(
+        flight.written, flight.expected_length,
+        "every byte was written"
+    );
+    assert_eq!(failure.partial.files.len(), 1, "the pack is whole");
+    assert_ne!(
+        std::fs::read(&output).expect("the changed copy"),
+        std::fs::read(admitted_path(&case.dest.bootstrap(), "idx")).expect("the admitted idx"),
+        "the changed bytes are kept"
+    );
+}
+
+/// A chain swapped while a file is being streamed is caught by the recheck that follows that file's
+/// write, before the final gate: the last file is complete and reported, and the run never reaches the
+/// final gate's guard.
+#[test]
+fn b2a_a_chain_swapped_during_the_last_copy_refuses_before_the_final_gate() {
+    let (_capsule, mut case) = captured_case(CustodyGitObjectFormatV1::Sha1);
+    let names = case.entry_names();
+    let output = stored(&case.dest, &names[7]);
+    let paths = PathsV1::of(&case.dest);
+    let after = AfterSwapV1::new();
+    let swapped = after.flag();
+    let _hook = install_git_hook_for_test(GitHookPointV1::BeforeObjectChunk, move |event| {
+        if event.path == output && !swapped.replace(true) {
+            let plain = paths.work.join("plain");
+            move_away(&plain, "plain-away");
+            std::fs::create_dir(&plain).expect("a new directory takes the name");
+        }
+    });
+    let _guards = after.record();
+    let failure = case.refused("a swap during the last copy");
+    assert!(identity_changed(&failure.cause), "{:?}", failure.cause);
+    assert_eq!(failure.partial.files.len(), 3, "the last copy is whole");
+    assert!(failure.partial.in_flight.is_none());
+    let labels = after.labels.borrow();
+    assert!(labels.contains(&"objects-sync") && labels.contains(&"objects-verify"));
+    assert!(
+        !labels.contains(&"objects-final"),
+        "the file's own recheck refused before the final gate: {labels:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// Failure paths whose real trigger is the storage itself: a partial write, a failed sync, a refused create
+//
+// Each row raises one fault in place of one filesystem effect (`ObjectFaultV1`), so what a full disk, an
+// I/O error, or a permission refusal leaves behind is exercised, and the typed facts are held to the disk.
+// ---------------------------------------------------------------------------------------------
+
+/// A write that reaches the file only in part (a full disk, a quota, an I/O error after a prefix) leaves
+/// exactly that prefix, and the typed facts say so: the file in flight reports the bytes that reached it,
+/// the ledger keeps exactly those bytes charged (the part of the chunk that was reserved and never written
+/// is given back), and nothing after the failed file is created. A write that reports it wrote nothing is
+/// the same refusal, never a loop.
+#[test]
+fn b2a_a_partial_write_failure_records_exactly_the_bytes_that_reached_the_file() {
+    let _chunk = override_object_copy_chunk_for_test(16);
+    let capsule = captured(CustodyGitObjectFormatV1::Sha1);
+    for (row, fault) in [
+        ("a prefix of the first chunk", ObjectFaultV1::WriteAfter(5)),
+        (
+            "the first chunk whole, then nothing",
+            ObjectFaultV1::WriteAfter(16),
+        ),
+        (
+            "a prefix of the second chunk",
+            ObjectFaultV1::WriteAfter(20),
+        ),
+        (
+            "a zero-byte write inside the first chunk",
+            ObjectFaultV1::WriteZeroAfter(7),
+        ),
+        (
+            "a zero-byte write after two chunks",
+            ObjectFaultV1::WriteZeroAfter(32),
+        ),
+    ] {
+        let limit = match fault {
+            ObjectFaultV1::WriteAfter(limit) | ObjectFaultV1::WriteZeroAfter(limit) => limit,
+            other => panic!("not a write fault: {other:?}"),
+        };
+        let mut case = StoreCaseV1::of(&capsule, CustodyGitObjectFormatV1::Sha1);
+        let names = case.entry_names();
+        let original = std::fs::read(admitted_path(&case.dest.bootstrap(), "pack"))
+            .expect("the admitted pack");
+        let _fault = override_object_fault_for_test(fault);
+        let failure = case.refused(row);
+        match &failure.cause {
+            GitBootstrapErrorV1::Restore(CustodyRestoreErrorV1::Io(detail)) => {
+                assert!(detail.contains(".pack"), "{row}: {detail}");
+            }
+            other => panic!("{row}: {other:?}"),
+        }
+        assert!(failure.active_materialization_began, "{row}");
+        let flight = failure
+            .partial
+            .in_flight
+            .as_ref()
+            .expect("the pack in flight");
+        assert_eq!(flight.written, limit, "{row}: the retained fact");
+        let on_disk = std::fs::read(stored(&case.dest, &names[5])).expect("the partial pack");
+        assert_eq!(on_disk.len() as u64, limit, "{row}: the file on disk");
+        assert_eq!(&original[..on_disk.len()], &on_disk[..], "{row}: a prefix");
+        assert_eq!(
+            failure.partial.charged,
+            ObjectStoreChargeV1 {
+                entries: 6,
+                bytes: limit
+            },
+            "{row}: exactly the bytes that reached the file stay charged"
+        );
+        assert!(failure.partial.files.is_empty(), "{row}");
+        assert_eq!(
+            listing(&pack_directory(&case.dest)).len(),
+            1,
+            "{row}: nothing after the failed file"
+        );
+    }
+}
+
+/// A failed `fsync` of the file, or of its directory, is a refusal and never a success: the file is
+/// whole on disk and still named in flight (it is not yet a completed copy), nothing after it is created,
+/// and the directory sync is not attempted when the file's own failed.
+#[test]
+fn b2a_a_sync_failure_refuses_and_keeps_the_whole_file() {
+    let capsule = captured(CustodyGitObjectFormatV1::Sha1);
+    for (row, fault, synced) in [
+        (
+            "the file's sync",
+            ObjectFaultV1::SyncFile,
+            Vec::<&str>::new(),
+        ),
+        (
+            "the directory's sync",
+            ObjectFaultV1::SyncDirectory,
+            vec!["file"],
+        ),
+    ] {
+        let mut case = StoreCaseV1::of(&capsule, CustodyGitObjectFormatV1::Sha1);
+        let lengths = case.lengths();
+        let names = case.entry_names();
+        let original = std::fs::read(admitted_path(&case.dest.bootstrap(), "pack"))
+            .expect("the admitted pack");
+        let events = std::rc::Rc::new(std::cell::RefCell::new(Vec::<String>::new()));
+        let seen = events.clone();
+        let _hook = install_git_hook_for_test(GitHookPointV1::ObjectSynced, move |event| {
+            seen.borrow_mut().push(event.label.to_owned());
+        });
+        let _fault = override_object_fault_for_test(fault);
+        let failure = case.refused(row);
+        match &failure.cause {
+            GitBootstrapErrorV1::Restore(CustodyRestoreErrorV1::Io(detail)) => {
+                assert!(detail.contains("injected"), "{row}: {detail}");
+            }
+            other => panic!("{row}: {other:?}"),
+        }
+        let flight = failure
+            .partial
+            .in_flight
+            .as_ref()
+            .expect("the pack in flight");
+        assert_eq!(
+            (flight.written, flight.expected_length),
+            (lengths[0], lengths[0])
+        );
+        assert!(
+            failure.partial.files.is_empty(),
+            "{row}: not a completed copy"
+        );
+        assert_eq!(
+            failure.partial.charged,
+            ObjectStoreChargeV1 {
+                entries: 6,
+                bytes: lengths[0]
+            },
+            "{row}"
+        );
+        assert_eq!(
+            std::fs::read(stored(&case.dest, &names[5])).expect("the pack"),
+            original,
+            "{row}: the whole file is kept"
+        );
+        assert_eq!(listing(&pack_directory(&case.dest)).len(), 1, "{row}");
+        assert_eq!(*events.borrow(), synced, "{row}: the syncs that ran");
+    }
+}
+
+/// A create that fails for any reason but a collision keeps its entry charged (the primitive cannot say
+/// whether anything was created) and creates nothing after it, for each of the three files: the entry's
+/// allowance is not given back, unlike a collision's.
+#[test]
+fn b2a_a_file_create_failure_other_than_a_collision_keeps_its_charge() {
+    let capsule = captured(CustodyGitObjectFormatV1::Sha1);
+    let mut case = StoreCaseV1::of(&capsule, CustodyGitObjectFormatV1::Sha1);
+    let _fault = override_object_fault_for_test(ObjectFaultV1::CreateFile);
+    let failure = case.refused("a refused create");
+    assert!(
+        matches!(
+            failure.cause,
+            GitBootstrapErrorV1::Restore(CustodyRestoreErrorV1::Io(_))
+        ),
+        "{:?}",
+        failure.cause
+    );
+    assert!(
+        failure.active_materialization_began,
+        "the directories exist"
+    );
+    assert_eq!(
+        failure.partial.charged,
+        ObjectStoreChargeV1 {
+            entries: 6,
+            bytes: 0
+        },
+        "five directories and the refused file's entry"
+    );
+    assert!(failure.partial.in_flight.is_none(), "no file was created");
+    assert!(failure.partial.files.is_empty());
+    assert_eq!(pins_present(&failure.partial.pins), [true; 5]);
+    assert!(listing(&pack_directory(&case.dest)).is_empty());
+}
+
+/// The deadline observed after the recheck, the read, and the file sync is never followed by an effect.
+const B2A_SPENT_DEADLINE_V1: Duration = Duration::from_millis(1200);
+
+/// No effect follows a guard that finds the deadline spent. The guard right after every non-final recheck
+/// (whose last call is the root's identity, which can block), after each source read (before its chunk is
+/// charged and written), and after each file's sync (before the directory's) is made slow past the
+/// deadline, at every occurrence in a clean Captured run: the run refuses with a timeout and no create,
+/// chunk, sync, or final-gate event follows it, and the facts say exactly what had been done.
+#[test]
+fn b2a_no_effect_follows_a_guard_that_finds_the_deadline_spent() {
+    let capsule = captured(CustodyGitObjectFormatV1::Sha1);
+    let mut learn = StoreCaseV1::of(&capsule, CustodyGitObjectFormatV1::Sha1);
+    let (labels, hook) = record_guards();
+    let _ = learn.done("a clean run");
+    let rows: Vec<(&str, usize)> = ["objects-checked", "objects-read", "objects-sync-directory"]
+        .into_iter()
+        .map(|wanted| {
+            (
+                wanted,
+                labels
+                    .borrow()
+                    .iter()
+                    .filter(|label| **label == wanted)
+                    .count(),
+            )
+        })
+        .collect();
+    drop(hook);
+    assert_eq!(
+        rows,
+        [
+            ("objects-checked", 20),
+            ("objects-read", 3),
+            ("objects-sync-directory", 3)
+        ]
+    );
+
+    for (target, total) in rows {
+        for nth in 1..=total {
+            let row = format!("{target} #{nth}");
+            let mut case = StoreCaseV1::of(&capsule, CustodyGitObjectFormatV1::Sha1);
+            let lengths = case.lengths();
+            let deadline = Instant::now() + B2A_SPENT_DEADLINE_V1;
+            let spent = std::rc::Rc::new(std::cell::Cell::new(false));
+            let seen = std::rc::Rc::new(std::cell::Cell::new(0_usize));
+            let effects = std::rc::Rc::new(std::cell::RefCell::new(Vec::<String>::new()));
+            let (flag, counter) = (spent.clone(), seen.clone());
+            let _clock =
+                install_git_hook_for_test(GitHookPointV1::DeadlineObserved, move |event| {
+                    if event.label == target {
+                        counter.set(counter.get() + 1);
+                        if counter.get() == nth {
+                            flag.set(true);
+                            pass_the_deadline(deadline);
+                        }
+                    }
+                });
+            let mut effect_hooks = Vec::new();
+            for point in [
+                GitHookPointV1::BeforeObjectCreate,
+                GitHookPointV1::BeforeObjectChunk,
+                GitHookPointV1::ObjectSynced,
+                GitHookPointV1::BeforeObjectsFinalGate,
+            ] {
+                let (flag, log) = (spent.clone(), effects.clone());
+                effect_hooks.push(install_git_hook_for_test(point, move |event| {
+                    if flag.get() {
+                        log.borrow_mut()
+                            .push(format!("{point:?} {} {:?}", event.label, event.path));
+                    }
+                }));
+            }
+            let failure = match case.attempt_by(deadline) {
+                Ok(_) => panic!("{row}: no success after the deadline"),
+                Err(failure) => failure,
+            };
+            drop(effect_hooks);
+            assert!(spent.get(), "{row}: the guard never ran");
+            assert!(
+                matches!(
+                    failure.cause,
+                    GitBootstrapErrorV1::Git(CustodyGitError::Timeout)
+                ),
+                "{row}: {:?}",
+                failure.cause
+            );
+            assert!(
+                effects.borrow().is_empty(),
+                "{row}: effects after the spent guard: {:?}",
+                effects.borrow()
+            );
+            match target {
+                "objects-read" => {
+                    // The chunk that was read is neither charged nor written.
+                    let before: u64 = lengths[..nth - 1].iter().sum();
+                    let flight = failure.partial.in_flight.as_ref().expect("in flight");
+                    assert_eq!(flight.written, 0, "{row}");
+                    assert_eq!(failure.partial.charged.bytes, before, "{row}");
+                    assert_eq!(failure.partial.files.len(), nth - 1, "{row}");
+                }
+                "objects-sync-directory" => {
+                    // The file is whole, synced to its own descriptor, and not yet a completed copy.
+                    let flight = failure.partial.in_flight.as_ref().expect("in flight");
+                    assert_eq!(flight.written, lengths[nth - 1], "{row}");
+                    assert_eq!(failure.partial.files.len(), nth - 1, "{row}");
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// The copy's own retries and continuations observe the one deadline
+//
+// A blocking call cannot be preempted, so the deadline can pass INSIDE a read, a write, or the length probe.
+// Whatever such a call returns (a prefix, an interruption, the last byte), no further call on the same
+// descriptor may follow it: every retry and every continuation reads the same absolute clock first, and a
+// write that stops there keeps exactly the bytes the file accepted charged, giving back the rest of the
+// chunk it had reserved.
+//
+// A returned call is made slow through the `ObjectIo` hook, which runs after the call returns and before
+// its result is examined: a hook that sleeps IS that call having been slow, and every call that returns
+// after it is logged. The two results a real regular file does not produce on demand, an interruption and
+// a short write, are injected by the test-only seams `interrupt_object_calls_for_test` and
+// `ObjectFaultV1::ShortWrites`.
+// ---------------------------------------------------------------------------------------------
+
+/// The deadline of a row that makes one call slow: long enough for the run to reach the call, short enough
+/// that the row ends soon after it.
+const B2A_SLOW_CALL_DEADLINE_V1: Duration = B2A_SPENT_DEADLINE_V1;
+
+/// Every returned read, write, and probe of the copy, in order, and what followed the one made slow.
+struct CallClockV1 {
+    calls: std::rc::Rc<std::cell::RefCell<Vec<(&'static str, PathBuf)>>>,
+    after_slow: std::rc::Rc<std::cell::RefCell<Vec<String>>>,
+    slowed: std::rc::Rc<std::cell::Cell<bool>>,
+    _hook: GitSeamGuardV1,
+}
+
+impl CallClockV1 {
+    /// Records every call. The `nth` (counting from one) call labelled `label` on `file` spends `deadline`
+    /// before its result is examined, if one is named; every call that returns after it is logged. Every
+    /// call also pauses for `pause`, which a row with headroom uses to prove brief delays are harmless.
+    fn watch(
+        deadline: Instant,
+        slow: Option<(&'static str, usize, &Path)>,
+        pause: Duration,
+    ) -> Self {
+        let calls = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let after_slow = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let slowed = std::rc::Rc::new(std::cell::Cell::new(false));
+        let target = slow.map(|(label, nth, file)| (label, nth, file.to_path_buf()));
+        let counted = std::cell::Cell::new(0_usize);
+        let (log, later, flag) = (calls.clone(), after_slow.clone(), slowed.clone());
+        let hook = install_git_hook_for_test(GitHookPointV1::ObjectIo, move |event| {
+            log.borrow_mut()
+                .push((event.label, event.path.to_path_buf()));
+            if flag.get() {
+                later
+                    .borrow_mut()
+                    .push(format!("{} {:?}", event.label, event.path));
+                return;
+            }
+            if !pause.is_zero() {
+                std::thread::sleep(pause);
+            }
+            if let Some((label, nth, file)) = &target {
+                if event.label == *label && event.path == file.as_path() {
+                    counted.set(counted.get() + 1);
+                    if counted.get() == *nth {
+                        flag.set(true);
+                        pass_the_deadline(deadline);
+                    }
+                }
+            }
+        });
+        Self {
+            calls,
+            after_slow,
+            slowed,
+            _hook: hook,
+        }
+    }
+
+    fn fired(&self) -> bool {
+        self.slowed.get()
+    }
+
+    /// The calls with this label, on any file.
+    fn count(&self, label: &str) -> usize {
+        self.calls
+            .borrow()
+            .iter()
+            .filter(|(seen, _)| *seen == label)
+            .count()
+    }
+
+    /// The labels of the calls on `file`, in order.
+    fn labels_on(&self, file: &Path) -> Vec<&'static str> {
+        self.calls
+            .borrow()
+            .iter()
+            .filter(|(_, path)| path == file)
+            .map(|(label, _)| *label)
+            .collect()
+    }
+
+    /// Every call that returned after the slow one: there must be none.
+    fn after_the_slow_call(&self) -> Vec<String> {
+        self.after_slow.borrow().clone()
+    }
+}
+
+/// The refusal a spent deadline must give: a typed timeout.
+fn timed_out(
+    row: &str,
+    result: Result<FinalObjectStoreV1, Box<ObjectStoreFailureV1>>,
+) -> Box<ObjectStoreFailureV1> {
+    match result {
+        Ok(_) => panic!("{row}: no success after the deadline"),
+        Err(failure) => {
+            assert!(
+                matches!(
+                    failure.cause,
+                    GitBootstrapErrorV1::Git(CustodyGitError::Timeout)
+                ),
+                "{row}: {:?}",
+                failure.cause
+            );
+            failure
+        }
+    }
+}
+
+/// The charge is exactly the disk: every byte in the pack directory is charged and reported, nothing
+/// reserved and never written stays charged, and each file's entry is accounted for. The completed files are
+/// whole, and the file in flight is on disk at exactly its `written` count.
+fn assert_charge_is_the_disk(row: &str, case: &StoreCaseV1, failure: &ObjectStoreFailureV1) {
+    let on_disk = files_in(&pack_directory(&case.dest));
+    let total: u64 = on_disk.iter().map(|(_, bytes)| bytes.len() as u64).sum();
+    assert_eq!(
+        failure.partial.charged.bytes, total,
+        "{row}: the charge is the bytes on disk"
+    );
+    let whole: u64 = failure.partial.files.iter().map(|file| file.length).sum();
+    let flying = failure.partial.in_flight.as_ref().map(|flight| {
+        let leaf = flight.relative.rsplit('/').next().expect("a leaf");
+        let found = on_disk
+            .iter()
+            .find(|(name, _)| name == leaf)
+            .unwrap_or_else(|| panic!("{row}: the file in flight is on disk"));
+        assert_eq!(
+            found.1.len() as u64,
+            flight.written,
+            "{row}: the file in flight is on disk at its written count"
+        );
+        flight.written
+    });
+    assert_eq!(whole + flying.unwrap_or(0), total, "{row}: the facts");
+    let entries = 5 + failure.partial.files.len() as u64 + u64::from(flying.is_some());
+    assert_eq!(failure.partial.charged.entries, entries, "{row}: entries");
+}
+
+/// A short write: each write call accepts at most five bytes, as signals, quotas, and some filesystems make
+/// it. A 16-byte chunk is written five, five, five, and one.
+fn short_writes_of_five() -> GitSeamGuardV1 {
+    override_object_fault_for_test(ObjectFaultV1::ShortWrites(5))
+}
+
+/// Short writes, an interruption of each kind of call, and 16-byte chunks: the run a signal-prone or
+/// network filesystem gives. The first calls of the first file are interrupted (two of each kind).
+fn retry_script() -> Vec<GitSeamGuardV1> {
+    vec![
+        override_object_copy_chunk_for_test(16),
+        short_writes_of_five(),
+        interrupt_object_calls_for_test(ObjectCallV1::Read, 2),
+        interrupt_object_calls_for_test(ObjectCallV1::Write, 2),
+        interrupt_object_calls_for_test(ObjectCallV1::Probe, 2),
+    ]
+}
+
+/// A write that accepts only a prefix of a chunk and then returns AFTER the deadline is followed by no second
+/// write: the file keeps exactly the accepted prefix, the ledger and the facts keep exactly those bytes
+/// charged (the rest of the 16-byte chunk, reserved and never written, is given back), and nothing after the
+/// file is created. The write that completes the chunk leaves nothing to give back.
+#[test]
+fn b2a_a_slow_short_write_keeps_exactly_the_accepted_prefix_and_makes_no_second_write() {
+    let _chunk = override_object_copy_chunk_for_test(16);
+    let capsule = captured(CustodyGitObjectFormatV1::Sha1);
+    for (row, slow_write, accepted) in [
+        ("the first write took five of sixteen", 1_usize, 5_u64),
+        ("the second write took five more", 2, 10),
+        ("the third write took five more", 3, 15),
+        ("the fourth write completed the chunk", 4, 16),
+    ] {
+        let mut case = StoreCaseV1::of(&capsule, CustodyGitObjectFormatV1::Sha1);
+        let names = case.entry_names();
+        let output = stored(&case.dest, &names[5]);
+        let original = std::fs::read(admitted_path(&case.dest.bootstrap(), "pack"))
+            .expect("the admitted pack");
+        let _fault = short_writes_of_five();
+        let deadline = Instant::now() + B2A_SLOW_CALL_DEADLINE_V1;
+        let clock = CallClockV1::watch(
+            deadline,
+            Some(("write", slow_write, &output)),
+            Duration::ZERO,
+        );
+        let failure = timed_out(row, case.attempt_by(deadline));
+        assert!(clock.fired(), "{row}: the slow write never ran");
+        assert_eq!(
+            clock.after_the_slow_call(),
+            Vec::<String>::new(),
+            "{row}: a call followed the write that returned after the deadline"
+        );
+        assert_eq!(clock.count("write"), slow_write, "{row}: no second write");
+        let flight = failure
+            .partial
+            .in_flight
+            .as_ref()
+            .expect("the pack in flight");
+        assert_eq!(flight.written, accepted, "{row}: the retained fact");
+        let on_disk = std::fs::read(&output).expect("the partial pack");
+        assert_eq!(on_disk.len() as u64, accepted, "{row}: the file on disk");
+        assert_eq!(&original[..on_disk.len()], &on_disk[..], "{row}: a prefix");
+        assert_eq!(
+            failure.partial.charged,
+            ObjectStoreChargeV1 {
+                entries: 6,
+                bytes: accepted
+            },
+            "{row}: exactly the accepted bytes stay charged"
+        );
+        assert!(failure.partial.files.is_empty(), "{row}");
+        assert_eq!(listing(&pack_directory(&case.dest)).len(), 1, "{row}");
+        assert_charge_is_the_disk(row, &case, &failure);
+    }
+}
+
+/// An interrupted read or write returns without having done anything, and it is retried only while the
+/// deadline is still ahead: an interruption that returns after it is followed by no further call on that
+/// descriptor. A write interrupted that way gives back all of its chunk's reservation; one that follows an
+/// accepted prefix keeps exactly that prefix.
+#[test]
+fn b2a_an_interrupted_read_or_write_is_never_retried_after_the_deadline() {
+    let _chunk = override_object_copy_chunk_for_test(16);
+    let capsule = captured(CustodyGitObjectFormatV1::Sha1);
+    struct SlowCallRowV1 {
+        row: &'static str,
+        /// The kind of call interrupted, and how many of its first calls are.
+        interrupted: (ObjectCallV1, u32),
+        /// Whether the writes are also short (five bytes at most).
+        short: bool,
+        /// The call made slow: its label and its number among the pack's calls of that label.
+        slow: (&'static str, usize),
+        /// The calls that ran, and the bytes the file accepted.
+        reads: usize,
+        writes: usize,
+        accepted: u64,
+    }
+    let rows = [
+        SlowCallRowV1 {
+            row: "the first read was interrupted and slow",
+            interrupted: (ObjectCallV1::Read, 3),
+            short: false,
+            slow: ("read", 1),
+            reads: 1,
+            writes: 0,
+            accepted: 0,
+        },
+        SlowCallRowV1 {
+            row: "the third read was interrupted and slow, after two prompt retries",
+            interrupted: (ObjectCallV1::Read, 3),
+            short: false,
+            slow: ("read", 3),
+            reads: 3,
+            writes: 0,
+            accepted: 0,
+        },
+        SlowCallRowV1 {
+            row: "the first write was interrupted and slow",
+            interrupted: (ObjectCallV1::Write, 3),
+            short: false,
+            slow: ("write", 1),
+            reads: 1,
+            writes: 1,
+            accepted: 0,
+        },
+        SlowCallRowV1 {
+            row: "the third write was interrupted and slow, after two prompt retries",
+            interrupted: (ObjectCallV1::Write, 3),
+            short: false,
+            slow: ("write", 3),
+            reads: 1,
+            writes: 3,
+            accepted: 0,
+        },
+        SlowCallRowV1 {
+            row: "an interrupted write, then five of sixteen accepted slowly",
+            interrupted: (ObjectCallV1::Write, 1),
+            short: true,
+            slow: ("write", 2),
+            reads: 1,
+            writes: 2,
+            accepted: 5,
+        },
+    ];
+    for SlowCallRowV1 {
+        row,
+        interrupted: (call, interruptions),
+        short,
+        slow: (label, nth),
+        reads,
+        writes,
+        accepted,
+    } in rows
+    {
+        let mut case = StoreCaseV1::of(&capsule, CustodyGitObjectFormatV1::Sha1);
+        let names = case.entry_names();
+        let output = stored(&case.dest, &names[5]);
+        let _interrupts = interrupt_object_calls_for_test(call, interruptions);
+        let _short = short.then(short_writes_of_five);
+        let deadline = Instant::now() + B2A_SLOW_CALL_DEADLINE_V1;
+        let clock = CallClockV1::watch(deadline, Some((label, nth, &output)), Duration::ZERO);
+        let failure = timed_out(row, case.attempt_by(deadline));
+        assert!(clock.fired(), "{row}: the slow call never ran");
+        assert_eq!(
+            clock.after_the_slow_call(),
+            Vec::<String>::new(),
+            "{row}: a call followed the interruption that returned after the deadline"
+        );
+        assert_eq!(clock.count("read"), reads, "{row}: reads");
+        assert_eq!(clock.count("write"), writes, "{row}: writes");
+        assert_eq!(clock.count("probe"), 0, "{row}: probes");
+        let flight = failure
+            .partial
+            .in_flight
+            .as_ref()
+            .expect("the pack in flight");
+        assert_eq!(flight.written, accepted, "{row}: the retained fact");
+        assert_eq!(
+            failure.partial.charged,
+            ObjectStoreChargeV1 {
+                entries: 6,
+                bytes: accepted
+            },
+            "{row}: nothing reserved and never written stays charged"
+        );
+        assert_eq!(
+            std::fs::metadata(&output).expect("the pack").len(),
+            accepted,
+            "{row}: the file on disk"
+        );
+        let BootstrapObjectsV1::Captured { files, .. } = &case.boot.objects else {
+            panic!("a Captured bootstrap");
+        };
+        let read_so_far = (&files[0].file).stream_position().expect("a position");
+        assert_eq!(
+            read_so_far,
+            if call == ObjectCallV1::Read { 0 } else { 16 },
+            "{row}: the source was read once, or not at all"
+        );
+        assert_charge_is_the_disk(row, &case, &failure);
+    }
+}
+
+/// The length probe is held to the deadline before EVERY call, the first included: a last write that
+/// returns after the deadline is followed by no probe, and an interrupted probe that returns after it is
+/// not retried. The file is whole on disk and fully charged, and it is not a completed copy.
+#[test]
+fn b2a_the_length_probe_is_never_called_after_the_deadline() {
+    let capsule = captured(CustodyGitObjectFormatV1::Sha1);
+    // (row, interruptions of the probe, the slow call's label and number, probes that ran)
+    for (row, interruptions, (label, nth), probes) in [
+        (
+            "the last write returned after the deadline",
+            0_u32,
+            ("write", 1_usize),
+            0_usize,
+        ),
+        (
+            "the first probe was interrupted and slow",
+            2,
+            ("probe", 1),
+            1,
+        ),
+        (
+            "the second probe was interrupted and slow",
+            2,
+            ("probe", 2),
+            2,
+        ),
+    ] {
+        let mut case = StoreCaseV1::of(&capsule, CustodyGitObjectFormatV1::Sha1);
+        let lengths = case.lengths();
+        assert!(
+            lengths[0] as usize <= HASH_BUFFER_BYTES_V1,
+            "the pack is one chunk, so its first write is its last"
+        );
+        let names = case.entry_names();
+        let output = stored(&case.dest, &names[5]);
+        let _interrupts = interrupt_object_calls_for_test(ObjectCallV1::Probe, interruptions);
+        let deadline = Instant::now() + B2A_SLOW_CALL_DEADLINE_V1;
+        let clock = CallClockV1::watch(deadline, Some((label, nth, &output)), Duration::ZERO);
+        let failure = timed_out(row, case.attempt_by(deadline));
+        assert!(clock.fired(), "{row}: the slow call never ran");
+        assert_eq!(
+            clock.after_the_slow_call(),
+            Vec::<String>::new(),
+            "{row}: a call followed the call that returned after the deadline"
+        );
+        assert_eq!(clock.count("read"), 1, "{row}");
+        assert_eq!(clock.count("write"), 1, "{row}");
+        assert_eq!(clock.count("probe"), probes, "{row}: probes");
+        let flight = failure
+            .partial
+            .in_flight
+            .as_ref()
+            .expect("the pack in flight");
+        assert_eq!(
+            (flight.written, flight.expected_length),
+            (lengths[0], lengths[0]),
+            "{row}: the file is whole"
+        );
+        assert!(
+            failure.partial.files.is_empty(),
+            "{row}: not a completed copy"
+        );
+        assert_eq!(
+            failure.partial.charged,
+            ObjectStoreChargeV1 {
+                entries: 6,
+                bytes: lengths[0]
+            },
+            "{row}"
+        );
+        assert_charge_is_the_disk(row, &case, &failure);
+    }
+}
+
+/// Every call of a run full of interruptions and short writes, made slow in turn, is the last call: the
+/// calls of the first chunk (where every interruption falls), of the last chunk, and of the probe, and the
+/// first call of the next file. Whichever returns after the deadline, the run refuses with a timeout, no call
+/// follows it, and the charge is exactly the bytes on disk.
+#[test]
+fn b2a_no_read_write_or_probe_follows_a_call_that_returned_after_the_deadline() {
+    let capsule = captured(CustodyGitObjectFormatV1::Sha1);
+    let mut learn = StoreCaseV1::of(&capsule, CustodyGitObjectFormatV1::Sha1);
+    let names = learn.entry_names();
+    let pack = stored(&learn.dest, &names[5]);
+    let idx = stored(&learn.dest, &names[6]);
+    let (pack_calls, idx_calls) = {
+        let _script = retry_script();
+        let clock = CallClockV1::watch(far_deadline(), None, Duration::ZERO);
+        let _ = learn.done("a clean scripted run");
+        (clock.labels_on(&pack), clock.labels_on(&idx))
+    };
+    let total = pack_calls.len();
+    assert!(total > 24, "the pack spans many chunks: {total} calls");
+    assert_eq!(
+        pack_calls.iter().filter(|label| **label == "probe").count(),
+        3,
+        "two interrupted probes and the real one"
+    );
+    assert!(!idx_calls.is_empty());
+    let mut chosen: Vec<usize> = (1..=9).chain(total - 7..=total).collect();
+    chosen.dedup();
+    for nth in chosen {
+        let row = format!("call {nth} of {total}: {}", pack_calls[nth - 1]);
+        let mut case = StoreCaseV1::of(&capsule, CustodyGitObjectFormatV1::Sha1);
+        // This run's own pack: every case has a destination of its own.
+        let target = stored(&case.dest, &case.entry_names()[5]);
+        let _script = retry_script();
+        let deadline = Instant::now() + B2A_SLOW_CALL_DEADLINE_V1;
+        // Counts every call on the pack, whatever its kind: the slow one is the `nth` of them.
+        let counted = std::rc::Rc::new(std::cell::Cell::new(0_usize));
+        let calls = std::rc::Rc::new(std::cell::RefCell::new(Vec::<String>::new()));
+        let slowed = std::rc::Rc::new(std::cell::Cell::new(false));
+        let (seen, log, flag) = (counted.clone(), calls.clone(), slowed.clone());
+        let _hook = install_git_hook_for_test(GitHookPointV1::ObjectIo, move |event| {
+            if flag.get() {
+                log.borrow_mut()
+                    .push(format!("{} {:?}", event.label, event.path));
+                return;
+            }
+            if event.path == target {
+                seen.set(seen.get() + 1);
+                if seen.get() == nth {
+                    flag.set(true);
+                    pass_the_deadline(deadline);
+                }
+            }
+        });
+        let failure = timed_out(&row, case.attempt_by(deadline));
+        assert!(slowed.get(), "{row}: the slow call never ran");
+        assert_eq!(
+            *calls.borrow(),
+            Vec::<String>::new(),
+            "{row}: a call followed it"
+        );
+        assert_eq!(counted.get(), nth, "{row}");
+        assert!(
+            failure.partial.files.is_empty(),
+            "{row}: the pack is in flight"
+        );
+        assert_charge_is_the_disk(&row, &case, &failure);
+    }
+}
+
+/// With headroom, the same run of interruptions and short writes completes: every interrupted call is
+/// retried, every short write is continued to the whole chunk, the files are the admitted bytes, and both
+/// copies' charge is exactly what is on disk, with the brief delays of a slow filesystem at every call.
+#[test]
+fn b2a_interrupted_and_short_calls_with_headroom_copy_exactly_and_conserve_the_ledger() {
+    let capsule = captured(CustodyGitObjectFormatV1::Sha1);
+    for (row, pause) in [
+        ("no delay", Duration::ZERO),
+        ("a millisecond at every call", Duration::from_millis(1)),
+    ] {
+        let mut case = StoreCaseV1::of(&capsule, CustodyGitObjectFormatV1::Sha1);
+        let lengths = case.lengths();
+        let expected = bootstrap_object_files(&case.dest);
+        let _script = retry_script();
+        let deadline = Instant::now() + 10 * B2A_DEADLINE_V1;
+        let clock = CallClockV1::watch(deadline, None, pause);
+        let done = case
+            .attempt_by(deadline)
+            .unwrap_or_else(|failure| panic!("{row}: headroom must succeed: {:?}", failure.cause));
+        assert_eq!(
+            files_in(&pack_directory(&case.dest)),
+            expected,
+            "{row}: the exact bytes"
+        );
+        assert_eq!(
+            done.charged,
+            ObjectStoreChargeV1 {
+                entries: 8,
+                bytes: lengths.iter().sum()
+            },
+            "{row}"
+        );
+        // The calls a 16-byte chunk and five-byte writes take, plus the injected interruptions (two of each
+        // kind, all on the first file), and one probe per file.
+        let chunks: Vec<u64> = lengths.iter().map(|length| length.div_ceil(16)).collect();
+        let writes: u64 = lengths
+            .iter()
+            .map(|length| {
+                (0..length.div_ceil(16))
+                    .map(|chunk| (length - chunk * 16).min(16).div_ceil(5))
+                    .sum::<u64>()
+            })
+            .sum();
+        assert_eq!(
+            clock.count("read") as u64,
+            chunks.iter().sum::<u64>() + 2,
+            "{row}: reads"
+        );
+        assert_eq!(clock.count("write") as u64, writes + 2, "{row}: writes");
+        assert_eq!(clock.count("probe"), 3 + 2, "{row}: probes");
+    }
+}
+
+/// A write that FAILS after interruptions or short writes still conserves the ledger exactly: the bytes the
+/// file accepted stay charged and reported (a failure and a zero-length write are the same refusal as
+/// before, never a loop, and never a timeout while the deadline is ahead), and the rest of the chunk is given
+/// back. The interruptions before it are retried.
+#[test]
+fn b2a_a_write_failure_after_retries_and_short_writes_conserves_the_ledger() {
+    let _chunk = override_object_copy_chunk_for_test(16);
+    let capsule = captured(CustodyGitObjectFormatV1::Sha1);
+    // (row, the interrupted kind and count, the failure, the bytes the file accepted, reads, writes)
+    for (row, interruptions, fault, accepted, reads, writes) in [
+        (
+            "two interrupted writes, then five bytes, then an I/O error",
+            (ObjectCallV1::Write, 2_u32),
+            ObjectFaultV1::WriteAfter(5),
+            5_u64,
+            1_usize,
+            4_usize,
+        ),
+        (
+            "an interrupted write, then seven bytes, then a zero-length write",
+            (ObjectCallV1::Write, 1),
+            ObjectFaultV1::WriteZeroAfter(7),
+            7,
+            1,
+            3,
+        ),
+        (
+            "interrupted reads, a whole chunk, then four bytes and an I/O error",
+            (ObjectCallV1::Read, 2),
+            ObjectFaultV1::WriteAfter(20),
+            20,
+            4,
+            3,
+        ),
+    ] {
+        let mut case = StoreCaseV1::of(&capsule, CustodyGitObjectFormatV1::Sha1);
+        let names = case.entry_names();
+        let original = std::fs::read(admitted_path(&case.dest.bootstrap(), "pack"))
+            .expect("the admitted pack");
+        let _interrupts = interrupt_object_calls_for_test(interruptions.0, interruptions.1);
+        let _fault = override_object_fault_for_test(fault);
+        let clock = CallClockV1::watch(far_deadline(), None, Duration::ZERO);
+        let failure = case.refused(row);
+        match &failure.cause {
+            GitBootstrapErrorV1::Restore(CustodyRestoreErrorV1::Io(detail)) => {
+                assert!(detail.contains(".pack"), "{row}: {detail}");
+            }
+            other => panic!("{row}: {other:?}"),
+        }
+        assert_eq!(
+            (
+                clock.count("read"),
+                clock.count("write"),
+                clock.count("probe")
+            ),
+            (reads, writes, 0),
+            "{row}: the interrupted calls were retried, and nothing else ran"
+        );
+        let flight = failure
+            .partial
+            .in_flight
+            .as_ref()
+            .expect("the pack in flight");
+        assert_eq!(flight.written, accepted, "{row}: the retained fact");
+        let on_disk = std::fs::read(stored(&case.dest, &names[5])).expect("the partial pack");
+        assert_eq!(&original[..on_disk.len()], &on_disk[..], "{row}: a prefix");
+        assert_eq!(
+            failure.partial.charged,
+            ObjectStoreChargeV1 {
+                entries: 6,
+                bytes: accepted
+            },
+            "{row}: exactly the bytes that reached the file stay charged"
+        );
+        assert_charge_is_the_disk(row, &case, &failure);
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Structure: B2a's region creates and charges, and only that
+
+/// STRUCTURAL ONLY. B2a's region (the production source from its marker on, up to the end of the file) is
+/// held to its own vocabulary, because B1a's read-only scan and B1b's pure scan now end at this marker: it
+/// opens no path, walks nothing, runs no Git child or process, routes no object store, renames, removes,
+/// truncates, links, or re-permissions nothing, has no unsafe, and names no bootstrap HEAD, config, or hook.
+/// Everything it creates is create-new beneath a retained pin. The marker is unique, follows B1b's region,
+/// and the region holds the entry point. The behavior is proven by the rows above, which run the code.
+#[test]
+fn b2a_the_object_store_region_is_create_new_only_and_the_split_is_unique() {
+    let source = include_str!("custody_restore_git.rs");
+    assert_eq!(source.matches(B2A_MARKER_V1).count(), 1, "one marker");
+    assert_eq!(source.matches(B1B_MARKER_V1).count(), 1, "one B1b marker");
+    let (before, region) = source.split_once(B2A_MARKER_V1).expect("the marker");
+    assert!(before.contains(B1B_MARKER_V1), "B2a follows B1b");
+    assert!(before.contains("pub(crate) fn encode_inert_config_v1("));
+    assert!(region.contains("pub(crate) fn materialize_object_store_v1("));
+    assert!(
+        !before.contains("materialize_object_store_v1("),
+        "the earlier passes do not call B2a"
+    );
+    let code: String = region
+        .lines()
+        .filter(|line| !line.trim_start().starts_with("//"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    for forbidden in [
+        "std::fs",
+        "File::open(",
+        "OpenOptions",
+        "read_dir(",
+        "GitRunnerV1",
+        "GitRunRequestV1",
+        "GitCommandV1",
+        "GitObjectStoreRouteV1",
+        "remeasure_git_directory",
+        "measure_git_directory",
+        "walk",
+        "Command",
+        "spawn",
+        "std::process",
+        "mkdir",
+        "rename",
+        "remove_file",
+        "remove_dir",
+        "unlink",
+        "set_len",
+        "truncate",
+        "hard_link",
+        "symlink(",
+        "set_permissions",
+        "unsafe",
+        "WorkV1",
+        "OwnedChargeV1",
+        "settle_to",
+        "\"HEAD\"",
+        "\"config\"",
+        "\"hooks\"",
+        "\"refs\"",
+    ] {
+        assert!(
+            !code.contains(forbidden),
+            "the object-store region mentions `{forbidden}`"
+        );
+    }
+    // What it does use: create-new beneath retained pins, the one deadline, and the one ledger.
+    for required in [
+        "create_staging_directory(",
+        "create_new_regular_child(",
+        "observe_deadline(",
+        "before_deadline(",
+        "stream_digest(",
+        "sync_all(",
+        "pack.sync(",
+        "reserve_entries(",
+        ".reserve(",
+        "sweep_chains(",
+        "refuse_mounts_within(",
+    ] {
+        assert!(
+            code.contains(required),
+            "the object-store region lacks `{required}`"
         );
     }
 }
