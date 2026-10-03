@@ -17405,6 +17405,11 @@ fn b2a_the_object_store_region_is_create_new_only_and_the_split_is_unique() {
     assert_eq!(source.matches(B2A_MARKER_V1).count(), 1, "one marker");
     assert_eq!(source.matches(B1B_MARKER_V1).count(), 1, "one B1b marker");
     let (before, region) = source.split_once(B2A_MARKER_V1).expect("the marker");
+    // B2b's region, which restores and names the metadata, is outside this object-store scan; its own scan
+    // covers it.
+    let (region, _later) = region
+        .split_once(B2B_MARKER_V1)
+        .expect("the B2b marker follows B2a's region");
     assert!(before.contains(B1B_MARKER_V1), "B2a follows B1b");
     assert!(before.contains("pub(crate) fn encode_inert_config_v1("));
     assert!(region.contains("pub(crate) fn materialize_object_store_v1("));
@@ -17475,4 +17480,5350 @@ fn b2a_the_object_store_region_is_create_new_only_and_the_split_is_unique() {
             "the object-store region lacks `{required}`"
         );
     }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Pass B2b: the exact active metadata and the final ref agreement
+//
+// Every row drives `materialize_active_metadata_v1` over a REAL retained value: a real phase-V capsule (real
+// Git objects and a real pack with real active frames, or an Empty object database with a captured unborn
+// HEAD), carried through pass A's real bootstrap, B1a's real prevalidation, and B2a's real second object
+// store. The step takes no runner, so no Git child can run in it. Every row also proves the one ledger's
+// conservation: what the step reports charged is exactly what the ledger moved, on every outcome, and every
+// failure's partial facts are held to the disk.
+//
+// Pass A's, B1a's, B1b's, and B2a's controls above are unchanged, except the B2a structural scan's region end
+// (see `B2B_MARKER_V1`). The mutation matrix in `.git/a2a-evidence/2b3b-pass-b2b/` maps each guard to the
+// rows that turn red without it.
+// ---------------------------------------------------------------------------------------------
+
+const B2B_MARKER_V1: &str = "// Pass B2b: exact active metadata and final ref agreement";
+
+/// The aggregate path table's default byte bound (the production default, restated: it is private there), and
+/// the fixed allowance per entry it adds to each path's two copies.
+const B2B_TABLE_BOUND_V1: u64 = 64 * 1024 * 1024;
+const B2B_ENTRY_OVERHEAD_V1: u64 = 64;
+
+/// The step a flow that ran the object copy has completed: B2b is called after it.
+const B2B_COMPLETED_V1: Option<GitPlaneStepV1> = Some(GitPlaneStepV1::Objects);
+
+/// One entry of a frame spec.
+#[derive(Clone)]
+enum SpecKindV1 {
+    Dir,
+    File(Vec<u8>),
+    Link(Vec<u8>),
+}
+
+/// One frame's entries, in the order given.
+#[derive(Clone, Default)]
+struct FrameSpecV1 {
+    entries: Vec<(String, SpecKindV1)>,
+}
+
+impl FrameSpecV1 {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    fn dir(mut self, path: &str) -> Self {
+        self.entries.push((path.to_owned(), SpecKindV1::Dir));
+        self
+    }
+
+    fn file(mut self, path: &str, bytes: impl AsRef<[u8]>) -> Self {
+        self.entries
+            .push((path.to_owned(), SpecKindV1::File(bytes.as_ref().to_vec())));
+        self
+    }
+
+    fn link(mut self, path: &str, target: &str) -> Self {
+        self.entries.push((
+            path.to_owned(),
+            SpecKindV1::Link(target.as_bytes().to_vec()),
+        ));
+        self
+    }
+
+    /// Without the entry at `path`.
+    fn without(mut self, path: &str) -> Self {
+        self.entries.retain(|(found, _)| found != path);
+        self
+    }
+
+    fn encode(&self, class: ClassV1, generation: &str) -> Vec<u8> {
+        let borrowed: Vec<(&[u8], EntryV1<'_>)> = self
+            .entries
+            .iter()
+            .map(|(path, kind)| {
+                (
+                    path.as_bytes(),
+                    match kind {
+                        SpecKindV1::Dir => EntryV1::Dir,
+                        SpecKindV1::File(bytes) => EntryV1::File(bytes),
+                        SpecKindV1::Link(target) => EntryV1::Link(target),
+                    },
+                )
+            })
+            .collect();
+        encode_frame(class, generation, &borrowed)
+    }
+}
+
+/// The test's own decode of one retained frame, through the real codec on a duplicate descriptor: every
+/// entry in order, a directory as `None` and a regular file with its bytes. It is the oracle for what the
+/// restored tree must hold, and leaves the shared descriptor at offset 0.
+fn decoded_entries(
+    file: &std::fs::File,
+    class: ClassV1,
+    generation: &str,
+) -> Vec<(String, Option<Vec<u8>>)> {
+    use std::io::Seek as _;
+    let mut handle = file.try_clone().expect("a duplicate descriptor");
+    handle.seek(SeekFrom::Start(0)).expect("rewind");
+    let header = CustodyFrameHeaderV1::new(class, generation).expect("a header");
+    let mut entries = Vec::new();
+    {
+        let reader = BufReader::new(&handle);
+        let mut decoder =
+            CustodyFrameDecoderV1::new(reader, &header, frame_budget()).expect("a decoder");
+        while let Some(entry) = decoder.next_entry().expect("a whole frame") {
+            match entry {
+                CustodyFrameEntryV1::Directory { path, .. } => {
+                    entries.push((path_string(path.as_bytes()), None));
+                }
+                CustodyFrameEntryV1::Regular {
+                    path, mut content, ..
+                } => {
+                    let mut bytes = Vec::new();
+                    std::io::Read::read_to_end(&mut content, &mut bytes).expect("its content");
+                    entries.push((path_string(path.as_bytes()), Some(bytes)));
+                }
+                CustodyFrameEntryV1::Symlink { .. } => panic!("a symlink in an active frame"),
+            }
+        }
+    }
+    handle.seek(SeekFrom::Start(0)).expect("rewind");
+    entries
+}
+
+/// The golden config bytes of the caller's format, written out independently of the encoder.
+fn golden_config(format: GitObjectFormatV1) -> &'static [u8] {
+    match format {
+        GitObjectFormatV1::Sha1 => CONFIG_SHA1_V1,
+        GitObjectFormatV1::Sha256 => CONFIG_SHA256_V1,
+    }
+}
+
+impl StoreCaseV1 {
+    /// A case whose active frames are `refs` (and `logs`), and whose manifest lists `manifest_refs`: carried
+    /// through pass A, B1a, and a real phase-V value exactly as [`StoreCaseV1::of`] does.
+    fn with_frames(
+        capsule: &CustomCapsuleV1,
+        cformat: CustodyGitObjectFormatV1,
+        refs: &FrameSpecV1,
+        logs: Option<&FrameSpecV1>,
+        manifest_refs: Vec<CustodyOriginalRefV1>,
+    ) -> Self {
+        let format = core_format(cformat);
+        let generation = CaseV1::generation(capsule);
+        let mut frames = vec![(REFS_V1, refs.encode(REFS_V1, &generation))];
+        if let Some(logs) = logs {
+            frames.push((LOGS_V1, logs.encode(LOGS_V1, &generation)));
+        }
+        let CaseV1 { dest, mut verified } = CaseV1::with_bytes(capsule, &frames);
+        set_refs(&mut verified, manifest_refs);
+        let phase_v_used = ledger_used(&verified);
+        let mut boot = must_bootstrap(verified, format);
+        let plan = prevalidate(&mut boot.verified, far_deadline()).expect("B1a admits the frames");
+        Self {
+            dest,
+            boot,
+            plan,
+            format,
+            phase_v_used,
+        }
+    }
+}
+
+/// A real phase-V value carried through pass A, B1a, and B2a: exactly what a later flow holds when it calls
+/// the metadata step.
+struct MetaCaseV1 {
+    store: StoreCaseV1,
+    objects: FinalObjectStoreV1,
+    format: GitObjectFormatV1,
+    /// The frame budget the step is given.
+    budget: CustodyFrameBudgetV1,
+}
+
+fn meta_charge(charged: MetadataChargeV1) -> u64 {
+    charged.entries * ENTRY_V1 + charged.bytes
+}
+
+impl MetaCaseV1 {
+    fn from_store(mut store: StoreCaseV1) -> Self {
+        let objects = store.done("the object copy");
+        let format = store.format;
+        Self {
+            store,
+            objects,
+            format,
+            budget: frame_budget(),
+        }
+    }
+
+    /// The rich real frames of a Captured capsule, or the refs-only frames of an Empty one.
+    fn of(capsule: &CustomCapsuleV1, cformat: CustodyGitObjectFormatV1) -> Self {
+        Self::from_store(StoreCaseV1::of(capsule, cformat))
+    }
+
+    fn with_frames(
+        capsule: &CustomCapsuleV1,
+        cformat: CustodyGitObjectFormatV1,
+        refs: &FrameSpecV1,
+        logs: Option<&FrameSpecV1>,
+        manifest_refs: Vec<CustodyOriginalRefV1>,
+    ) -> Self {
+        Self::from_store(StoreCaseV1::with_frames(
+            capsule,
+            cformat,
+            refs,
+            logs,
+            manifest_refs,
+        ))
+    }
+
+    fn ledger(&self) -> u64 {
+        self.store.ledger()
+    }
+
+    fn dest(&self) -> &DestV1 {
+        &self.store.dest
+    }
+
+    fn git(&self) -> PathBuf {
+        stored(&self.store.dest, "repository/.git")
+    }
+
+    fn meta(&self, relative: &str) -> PathBuf {
+        self.git().join(relative)
+    }
+
+    /// The real entry point under `deadline`, with EVERY outcome held to the step's contract: a success
+    /// reports the config step; a refusal carries the one ledger's charge; and the ledger moved by exactly
+    /// what the step reports it charged.
+    fn attempt_with(
+        &mut self,
+        deadline: Instant,
+        completed: Option<GitPlaneStepV1>,
+        table_bound: u64,
+        limits: RefsLimitsV1,
+    ) -> Result<FinalMetadataV1, Box<MetadataFailureV1>> {
+        let before = self.ledger();
+        let result = materialize_active_metadata_bounded_v1(
+            &self.store.boot,
+            &self.objects,
+            &self.store.plan,
+            self.budget,
+            deadline,
+            completed,
+            table_bound,
+            limits,
+        );
+        let moved = self.ledger() - before;
+        match &result {
+            Ok(done) => {
+                assert_eq!(done.step, GitPlaneStepV1::Config);
+                assert_eq!(
+                    moved,
+                    meta_charge(done.charged),
+                    "the ledger moved as reported"
+                );
+            }
+            Err(failure) => {
+                assert_eq!(failure.ledger_used, self.ledger(), "the failure's figure");
+                assert_eq!(
+                    moved,
+                    meta_charge(failure.partial.charged),
+                    "{:?}: the ledger moved as reported",
+                    failure.cause
+                );
+            }
+        }
+        result
+    }
+
+    fn attempt_by(&mut self, deadline: Instant) -> Result<FinalMetadataV1, Box<MetadataFailureV1>> {
+        self.attempt_with(
+            deadline,
+            B2B_COMPLETED_V1,
+            B2B_TABLE_BOUND_V1,
+            RefsLimitsV1::v1(),
+        )
+    }
+
+    fn attempt(&mut self) -> Result<FinalMetadataV1, Box<MetadataFailureV1>> {
+        self.attempt_by(far_deadline())
+    }
+
+    fn done(&mut self, row: &str) -> FinalMetadataV1 {
+        match self.attempt() {
+            Ok(done) => done,
+            Err(failure) => panic!("{row}: must succeed: {:?}", failure.cause),
+        }
+    }
+
+    fn refused(&mut self, row: &str) -> Box<MetadataFailureV1> {
+        match self.attempt() {
+            Ok(_) => panic!("{row}: must refuse"),
+            Err(failure) => failure,
+        }
+    }
+
+    /// The restored tree the retained frames must produce, by the test's own decode: every entry of every
+    /// active frame, by its path beneath `.git`.
+    fn expected_frames(&self) -> BTreeMap<String, Option<Vec<u8>>> {
+        let generation = self.store.boot.verified.control.manifest.generation_id();
+        let mut tree = BTreeMap::new();
+        for frame in &self.store.boot.active_frames {
+            let one = &self.store.boot.verified.staged[frame.staged];
+            for (path, content) in decoded_entries(&one.file, frame.class, generation) {
+                tree.insert(path, content);
+            }
+        }
+        tree
+    }
+
+    /// What is on disk beneath `.git` except the object store the earlier pass made.
+    fn metadata_on_disk(&self) -> BTreeMap<String, Option<Vec<u8>>> {
+        let mut tree = snapshot(&self.git());
+        tree.retain(|name, _| name != "objects" && !name.starts_with("objects/"));
+        tree
+    }
+
+    fn entry_count(&self) -> usize {
+        self.metadata_on_disk().len()
+    }
+
+    /// A refusal that began nothing: no entry was created, pinned, or charged by the step, and the destination
+    /// tree and the one ledger are exactly what they were.
+    fn refused_before_any_write(&mut self, row: &str) -> GitBootstrapErrorV1 {
+        let tree = snapshot(&self.dest().path);
+        let ledger = self.ledger();
+        let failure = self.refused(row);
+        assert!(
+            !failure.active_materialization_began,
+            "{row}: {:?}",
+            failure.cause
+        );
+        assert_eq!(failure.partial.charged, none_charged(), "{row}");
+        assert!(failure.partial.files.is_empty(), "{row}");
+        assert!(failure.partial.in_flight.is_none(), "{row}");
+        assert!(failure.partial.directories.is_empty(), "{row}");
+        assert_eq!(self.ledger(), ledger, "{row}: the ledger");
+        assert_eq!(
+            snapshot(&self.dest().path),
+            tree,
+            "{row}: a byte was written"
+        );
+        failure.cause
+    }
+}
+
+/// A refusal's partial facts are the disk: every pinned directory and every whole file is on disk, the file
+/// in flight is on disk at exactly its `written` count, nothing else exists beneath `.git` but the object
+/// store, and the charge is exactly the entries and bytes on disk (plus `unlisted` entries the facts cannot
+/// carry: an entry created and then refused before its pin existed). Only for rows where nothing is planted.
+fn assert_metadata_partial_is_the_disk(
+    row: &str,
+    case: &MetaCaseV1,
+    failure: &MetadataFailureV1,
+    unlisted: u64,
+) {
+    let on_disk = case.metadata_on_disk();
+    let mut listed = 0_u64;
+    let mut bytes = 0_u64;
+    for relative in failure.partial.directories.keys() {
+        assert_eq!(
+            on_disk.get(relative),
+            Some(&None),
+            "{row}: directory {relative}"
+        );
+        listed += 1;
+    }
+    for file in &failure.partial.files {
+        use std::io::Seek as _;
+        if failure.last_completed <= Some(GitPlaneStepV1::Objects) {
+            assert_eq!(
+                (&file.file).stream_position().expect("a position"),
+                0,
+                "{row}: {}: a whole file is retained at offset 0",
+                file.relative
+            );
+        }
+        let found = on_disk
+            .get(&file.relative)
+            .unwrap_or_else(|| panic!("{row}: {} is not on disk", file.relative));
+        assert_eq!(
+            found.as_ref().map(|found| found.len() as u64),
+            Some(file.length),
+            "{row}: {}",
+            file.relative
+        );
+        listed += 1;
+        bytes += file.length;
+    }
+    if let Some(flight) = &failure.partial.in_flight {
+        let found = on_disk
+            .get(&flight.relative)
+            .unwrap_or_else(|| panic!("{row}: the file in flight is not on disk"));
+        assert_eq!(
+            found.as_ref().map(|found| found.len() as u64),
+            Some(flight.written),
+            "{row}: the file in flight is on disk at its written count"
+        );
+        assert!(flight.written <= flight.expected_length, "{row}");
+        listed += 1;
+        bytes += flight.written;
+    }
+    assert_eq!(
+        on_disk.len() as u64,
+        listed + unlisted,
+        "{row}: {:?}: every entry on disk is in the facts",
+        failure.cause
+    );
+    assert_eq!(
+        failure.partial.charged,
+        MetadataChargeV1 {
+            entries: listed + unlisted,
+            bytes
+        },
+        "{row}: the charge is the disk"
+    );
+}
+
+/// The real-shaped refs of a Captured capsule as specs (the same content as `real_state`), and its manifest
+/// refs: an attached `HEAD` on a loose `refs/heads/main`, `ORIG_HEAD`, a packed `refs/heads/side` and
+/// `refs/tags/v1` (the real annotated tag, peeled to the real commit), and reflogs.
+struct RealSpecsV1 {
+    commit: String,
+    tag: String,
+    refs: FrameSpecV1,
+    logs: FrameSpecV1,
+    manifest_refs: Vec<CustodyOriginalRefV1>,
+}
+
+fn real_specs(capsule: &CustomCapsuleV1, format: GitObjectFormatV1) -> RealSpecsV1 {
+    let commit = real_object(capsule, KindV1::Commit);
+    let tag = real_object(capsule, KindV1::Tag);
+    let (commit_id, tag_id) = (commit.object_id().to_owned(), tag.object_id().to_owned());
+    let loose = format!("{commit_id}\n");
+    let packed_text = format!(
+        "{PACKED_HEADER_V1}{commit_id} refs/heads/side\n{tag_id} refs/tags/v1\n^{commit_id}\n"
+    );
+    let zero = "0".repeat(oid_len(format));
+    let log = format!("{zero} {commit_id} {IDENT_V1}\tbranch: Created from main\n");
+    RealSpecsV1 {
+        commit: commit_id,
+        tag: tag_id,
+        refs: FrameSpecV1::new()
+            .file("HEAD", "ref: refs/heads/main\n")
+            .file("ORIG_HEAD", &loose)
+            .file("packed-refs", &packed_text)
+            .dir("refs")
+            .dir("refs/heads")
+            .file("refs/heads/main", &loose)
+            .dir("refs/tags"),
+        logs: FrameSpecV1::new()
+            .dir("logs")
+            .file("logs/HEAD", &log)
+            .dir("logs/refs")
+            .dir("logs/refs/heads")
+            .file("logs/refs/heads/main", &log),
+        manifest_refs: vec![
+            symbolic_ref("HEAD", "refs/heads/main"),
+            direct_ref("ORIG_HEAD", &commit),
+            direct_ref("refs/heads/main", &commit),
+            direct_ref("refs/heads/side", &commit),
+            direct_ref("refs/tags/v1", &tag),
+        ],
+    }
+}
+
+/// The destination-relative names of the files a case's frames carry, in the order a restore creates them,
+/// and its directories: from the test's own decode.
+fn expected_names(case: &MetaCaseV1) -> (Vec<String>, Vec<String>) {
+    let (mut files, mut directories) = (Vec::new(), Vec::new());
+    let generation = case.store.boot.verified.control.manifest.generation_id();
+    for frame in &case.store.boot.active_frames {
+        let one = &case.store.boot.verified.staged[frame.staged];
+        for (path, content) in decoded_entries(&one.file, frame.class, generation) {
+            if content.is_some() {
+                files.push(path);
+            } else {
+                directories.push(path);
+            }
+        }
+    }
+    (files, directories)
+}
+
+// ---------------------------------------------------------------------------------------------
+// The exact restored metadata, both formats, both object shapes
+// ---------------------------------------------------------------------------------------------
+
+/// Real SHA-1 and SHA-256 capsules (real Git objects, a real pack, real frames) restore their active metadata
+/// byte for byte beneath the retained `.git`: every directory and regular file of both frames, HEAD,
+/// ORIG_HEAD, packed-refs, the loose ref, and both reflogs, then the golden config of the caller's format.
+/// The refs agree with all five manifest refs, read from the retained final descriptors. The repository's
+/// only child stays `.git`, the object copy and the bootstrap are untouched, no Git child ran, and the facts
+/// are exact: each pin is the directory, each file's descriptor is at offset 0 and reads the bytes, and the
+/// one ledger moved by exactly the entries and bytes created.
+#[test]
+fn b2b_the_real_frames_restore_byte_exact_in_both_formats_with_the_exact_facts() {
+    use std::io::Seek as _;
+    use std::os::unix::fs::MetadataExt as _;
+    for cformat in BOTH_CAPSULE_FORMATS_V1 {
+        let row = format!("{cformat:?}");
+        let capsule = captured(cformat);
+        let mut case = MetaCaseV1::of(&capsule, cformat);
+        assert_eq!(
+            case.store.boot.provenance,
+            GitFormatProvenanceV1::CapsuleObjectsAndPack
+        );
+        let format = case.format;
+        let expected = case.expected_frames();
+        assert_eq!(expected.len(), 12, "{row}: six directories and six files");
+        let work_before = snapshot(&case.dest().work());
+        let objects_before: BTreeMap<_, _> = snapshot(&case.git())
+            .into_iter()
+            .filter(|(name, _)| name == "objects" || name.starts_with("objects/"))
+            .collect();
+        let ledger_before = case.ledger();
+        let children = case.store.boot.runs.len();
+        let (file_names, directory_names) = expected_names(&case);
+
+        let done = case.done(&row);
+
+        // The exact tree: the frames' entries byte for byte, and the golden config; nothing else.
+        let mut want = expected.clone();
+        want.insert("config".to_owned(), Some(golden_config(format).to_vec()));
+        assert_eq!(case.metadata_on_disk(), want, "{row}");
+        assert_eq!(
+            listing(&case.git()),
+            [
+                "HEAD",
+                "ORIG_HEAD",
+                "config",
+                "logs",
+                "objects",
+                "packed-refs",
+                "refs"
+            ],
+            "{row}"
+        );
+        assert_eq!(
+            listing(&stored(case.dest(), "repository")),
+            [".git"],
+            "{row}: the repository's only child is .git"
+        );
+        assert_eq!(
+            case.dest().entries(),
+            [".restore-work", "repository"],
+            "{row}"
+        );
+        assert_eq!(
+            std::fs::read(case.meta("HEAD")).expect("HEAD"),
+            b"ref: refs/heads/main\n",
+            "{row}"
+        );
+
+        // The facts: the frames' files in order, then the config; every directory pinned.
+        assert_eq!(done.step, GitPlaneStepV1::Config);
+        let mut relatives: Vec<&str> = done
+            .files
+            .iter()
+            .map(|file| file.relative.as_str())
+            .collect();
+        assert_eq!(relatives.pop(), Some("config"), "{row}: the config is last");
+        assert_eq!(relatives, file_names, "{row}: creation order");
+        assert_eq!(
+            done.directories.keys().cloned().collect::<Vec<_>>(),
+            {
+                let mut sorted = directory_names.clone();
+                sorted.sort();
+                sorted
+            },
+            "{row}"
+        );
+        for (relative, pin) in &done.directories {
+            assert_pin_is(pin, &case.meta(relative));
+        }
+        for file in &done.files {
+            let path = case.meta(&file.relative);
+            let bytes = std::fs::read(&path).expect("a restored file");
+            let metadata = std::fs::metadata(&path).expect("metadata");
+            assert_eq!(file.length, bytes.len() as u64, "{row}: {}", file.relative);
+            assert_eq!(
+                file.sha256,
+                sha256_bytes(&bytes),
+                "{row}: {}",
+                file.relative
+            );
+            assert_eq!(
+                (file.dev, file.ino),
+                (metadata.dev(), metadata.ino()),
+                "{row}: {}",
+                file.relative
+            );
+            assert_eq!((&file.file).stream_position().expect("a position"), 0);
+            let mut read = Vec::new();
+            (&file.file)
+                .read_to_end(&mut read)
+                .expect("the retained descriptor reads");
+            assert_eq!(
+                read, bytes,
+                "{row}: {}: the retained descriptor",
+                file.relative
+            );
+        }
+        assert_eq!(
+            done.config().map(|file| file.relative.as_str()),
+            Some("config")
+        );
+
+        // The refs agree with every manifest ref, from the final descriptors.
+        assert_eq!(
+            done.agreement.head,
+            HeadStateV1::Symbolic {
+                target: "refs/heads/main".into(),
+                resolved: Some(real_object(&capsule, KindV1::Commit).object_id().to_owned()),
+            },
+            "{row}"
+        );
+        assert_eq!(
+            (
+                done.agreement.loose_refs,
+                done.agreement.packed_refs,
+                done.agreement.peeled_rows,
+                done.agreement.effective_refs,
+                done.agreement.manifest_refs,
+                done.agreement.reflog_files,
+                done.agreement.reflog_rows,
+                done.agreement.direct_targets,
+            ),
+            (1, 2, 1, 3, 5, 2, 2, 2),
+            "{row}"
+        );
+
+        // The charge: the 12 frame entries plus the config, and every byte of them; the ledger moved by it.
+        let bytes: u64 = done.files.iter().map(|file| file.length).sum();
+        assert_eq!(
+            done.charged,
+            MetadataChargeV1 { entries: 13, bytes },
+            "{row}"
+        );
+        assert_eq!(
+            case.ledger() - ledger_before,
+            13 * ENTRY_V1 + bytes,
+            "{row}"
+        );
+
+        // Everything earlier is untouched: the bootstrap, the object copy, and the staged descriptors.
+        assert_eq!(
+            snapshot(&case.dest().work()),
+            work_before,
+            "{row}: the bootstrap"
+        );
+        let objects_after: BTreeMap<_, _> = snapshot(&case.git())
+            .into_iter()
+            .filter(|(name, _)| name == "objects" || name.starts_with("objects/"))
+            .collect();
+        assert_eq!(objects_after, objects_before, "{row}: the object copy");
+        assert_eq!(
+            case.store.boot.runs.len(),
+            children,
+            "{row}: no Git child ran"
+        );
+        assert!(case
+            .store
+            .boot
+            .verified
+            .staged
+            .iter()
+            .all(|one| position(one) == 0));
+        for forbidden in ["hooks", "info", "description", "shallow", "index"] {
+            assert!(!exists(&case.meta(forbidden)), "{row}: {forbidden}");
+        }
+    }
+}
+
+/// Empty objects (no pack, an empty inventory) with a captured, valid, UNBORN HEAD restore for BOTH caller
+/// formats: the refs frame's directories and HEAD byte for byte, and the golden config of the caller's
+/// format (the bootstrap reports caller-selected provenance, and nothing in the capsule chose the format).
+#[test]
+fn b2b_empty_objects_with_a_captured_unborn_head_restore_for_both_caller_formats() {
+    for cformat in BOTH_CAPSULE_FORMATS_V1 {
+        let row = format!("{cformat:?}");
+        let capsule = empty(cformat);
+        let mut case = MetaCaseV1::of(&capsule, cformat);
+        assert_eq!(
+            case.store.boot.provenance,
+            GitFormatProvenanceV1::CallerSelectedEmpty
+        );
+        let format = case.format;
+        let ledger_before = case.ledger();
+        let done = case.done(&row);
+
+        let mut want = BTreeMap::new();
+        want.insert("HEAD".to_owned(), Some(HEAD_BYTES_V1.to_vec()));
+        for directory in ["refs", "refs/heads", "refs/tags"] {
+            want.insert(directory.to_owned(), None);
+        }
+        want.insert("config".to_owned(), Some(golden_config(format).to_vec()));
+        assert_eq!(case.metadata_on_disk(), want, "{row}");
+        assert_eq!(
+            done.agreement.head,
+            HeadStateV1::Symbolic {
+                target: "refs/heads/main".into(),
+                resolved: None
+            },
+            "{row}: an unborn HEAD"
+        );
+        assert_eq!(
+            (done.agreement.effective_refs, done.agreement.direct_targets),
+            (0, 0),
+            "{row}"
+        );
+        assert_eq!(
+            done.charged,
+            MetadataChargeV1 {
+                entries: 5,
+                bytes: HEAD_BYTES_V1.len() as u64 + golden_config(format).len() as u64
+            },
+            "{row}"
+        );
+        assert_eq!(
+            case.ledger() - ledger_before,
+            meta_charge(done.charged),
+            "{row}"
+        );
+        assert_eq!(
+            listing(&case.git()),
+            ["HEAD", "config", "objects", "refs"],
+            "{row}"
+        );
+        assert!(listing(&pack_directory(case.dest())).is_empty(), "{row}");
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Every head state and ref family is restored byte for byte, and agrees
+// ---------------------------------------------------------------------------------------------
+
+/// The ways the real specs vary, each with what its agreement must report.
+struct FamilyV1 {
+    row: &'static str,
+    edit: fn(&CustomCapsuleV1, &mut RealSpecsV1),
+    head: fn(&RealSpecsV1) -> HeadStateV1,
+    /// loose refs, packed refs, peeled rows, effective refs, manifest refs, reflog files, FETCH_HEAD rows,
+    /// direct targets.
+    counts: (u64, u64, u64, u64, u64, u64, u64, u64),
+}
+
+fn edit_none(_: &CustomCapsuleV1, _: &mut RealSpecsV1) {}
+
+/// A detached HEAD: the commit itself, listed by the manifest as a direct ref.
+fn edit_detached(capsule: &CustomCapsuleV1, specs: &mut RealSpecsV1) {
+    let commit = real_object(capsule, KindV1::Commit);
+    specs.refs = specs
+        .refs
+        .clone()
+        .without("HEAD")
+        .file("HEAD", format!("{}\n", specs.commit));
+    specs.manifest_refs[0] = direct_ref("HEAD", &commit);
+}
+
+/// An unborn branch in a Captured capsule: HEAD names `refs/heads/main`, which does not exist, and the
+/// manifest says so with `Unborn`.
+fn edit_unborn(_: &CustomCapsuleV1, specs: &mut RealSpecsV1) {
+    specs.refs = specs.refs.clone().without("refs/heads/main");
+    specs.logs = specs.logs.clone().without("logs/refs/heads/main");
+    specs
+        .manifest_refs
+        .retain(|record| record.name().as_bytes() != b"refs/heads/main");
+    specs.manifest_refs[0] = CustodyOriginalRefV1::new(
+        LosslessPathV1::from_bytes(b"HEAD".to_vec()),
+        CustodyRefTargetV1::Unborn,
+    )
+    .expect("an unborn ref");
+}
+
+/// A loose ref that shadows a packed row of the same name: the loose lightweight tag wins over the packed
+/// annotated one, and the manifest lists the loose value.
+fn edit_loose_over_packed(capsule: &CustomCapsuleV1, specs: &mut RealSpecsV1) {
+    let commit = real_object(capsule, KindV1::Commit);
+    specs.refs = specs
+        .refs
+        .clone()
+        .file("refs/tags/v1", format!("{}\n", specs.commit));
+    for record in &mut specs.manifest_refs {
+        if record.name().as_bytes() == b"refs/tags/v1" {
+            *record = direct_ref("refs/tags/v1", &commit);
+        }
+    }
+}
+
+/// FETCH_HEAD, a stash ref, and its reflog beside ORIG_HEAD and the rest.
+fn edit_pseudorefs_and_stash(capsule: &CustomCapsuleV1, specs: &mut RealSpecsV1) {
+    let commit = real_object(capsule, KindV1::Commit);
+    let zero = "0".repeat(specs.commit.len());
+    let log = format!("{zero} {} {IDENT_V1}\tWIP on main\n", specs.commit);
+    specs.refs = specs
+        .refs
+        .clone()
+        .file(
+            "FETCH_HEAD",
+            format!("{}\t\tbranch 'main' of origin\n", specs.commit),
+        )
+        .file("refs/stash", format!("{}\n", specs.commit));
+    specs.logs = specs.logs.clone().file("logs/refs/stash", log);
+    specs.manifest_refs.push(direct_ref("FETCH_HEAD", &commit));
+    specs.manifest_refs.push(direct_ref("refs/stash", &commit));
+}
+
+fn family_head(specs: &RealSpecsV1) -> HeadStateV1 {
+    HeadStateV1::Symbolic {
+        target: "refs/heads/main".into(),
+        resolved: Some(specs.commit.clone()),
+    }
+}
+
+/// Detached, unborn, loose-over-packed, packed-only, ORIG_HEAD, FETCH_HEAD, stash, and reflogs each restore
+/// byte for byte (the tree equals the test's own decode of the frames, plus the golden config) and agree with
+/// the manifest from the retained final descriptors, in both formats.
+#[test]
+fn b2b_every_head_state_and_ref_family_restores_exactly_and_agrees() {
+    let families = [
+        FamilyV1 {
+            row: "an attached HEAD, packed-only refs, ORIG_HEAD",
+            edit: edit_none,
+            head: family_head,
+            counts: (1, 2, 1, 3, 5, 2, 0, 2),
+        },
+        FamilyV1 {
+            row: "a detached HEAD",
+            edit: edit_detached,
+            head: |specs| HeadStateV1::Detached {
+                oid: specs.commit.clone(),
+            },
+            counts: (1, 2, 1, 3, 5, 2, 0, 2),
+        },
+        FamilyV1 {
+            row: "an unborn branch",
+            edit: edit_unborn,
+            head: |_| HeadStateV1::Symbolic {
+                target: "refs/heads/main".into(),
+                resolved: None,
+            },
+            counts: (0, 2, 1, 2, 4, 1, 0, 2),
+        },
+        FamilyV1 {
+            row: "a loose ref over a packed one",
+            edit: edit_loose_over_packed,
+            head: family_head,
+            // The packed annotated tag is shadowed by the loose ref, so it is not an active target.
+            counts: (2, 2, 1, 3, 5, 2, 0, 1),
+        },
+        FamilyV1 {
+            row: "FETCH_HEAD, a stash ref, and its reflog",
+            edit: edit_pseudorefs_and_stash,
+            head: family_head,
+            counts: (2, 2, 1, 4, 7, 3, 1, 2),
+        },
+    ];
+    for cformat in BOTH_CAPSULE_FORMATS_V1 {
+        let capsule = captured(cformat);
+        let format = core_format(cformat);
+        for family in &families {
+            let row = format!("{cformat:?}: {}", family.row);
+            let mut specs = real_specs(&capsule, format);
+            (family.edit)(&capsule, &mut specs);
+            let mut case = MetaCaseV1::with_frames(
+                &capsule,
+                cformat,
+                &specs.refs,
+                Some(&specs.logs),
+                specs.manifest_refs.clone(),
+            );
+            let mut want = case.expected_frames();
+            let done = case.done(&row);
+            want.insert("config".to_owned(), Some(golden_config(format).to_vec()));
+            assert_eq!(case.metadata_on_disk(), want, "{row}");
+            assert_eq!(done.agreement.head, (family.head)(&specs), "{row}");
+            let a = &done.agreement;
+            assert_eq!(
+                (
+                    a.loose_refs,
+                    a.packed_refs,
+                    a.peeled_rows,
+                    a.effective_refs,
+                    a.manifest_refs,
+                    a.reflog_files,
+                    a.fetch_head_rows,
+                    a.direct_targets,
+                ),
+                family.counts,
+                "{row}"
+            );
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// The config is created once, last, and only after every ref is agreed
+// ---------------------------------------------------------------------------------------------
+
+/// Every entry of the metadata is created before the refs are read back, the agreement completes before the
+/// config exists, and the config is created exactly once and last (nothing is created after it): the order
+/// of the create events and the clock's labels shows it. The bootstrap's config is never copied: the
+/// restored config is the golden bytes, whatever the bootstrap holds.
+#[test]
+fn b2b_the_config_is_created_once_last_and_only_after_the_refs_agree() {
+    for cformat in BOTH_CAPSULE_FORMATS_V1 {
+        let row = format!("{cformat:?}");
+        let capsule = captured(cformat);
+        let mut case = MetaCaseV1::of(&capsule, cformat);
+        // A hostile bootstrap config that must never reach the final repository.
+        let bootstrap_config = case.dest().bootstrap().join("config");
+        assert!(
+            exists(&bootstrap_config),
+            "{row}: the bootstrap has a config"
+        );
+        let planted =
+            b"[core]\n\tfsmonitor = /tmp/b2b-marker\n[include]\n\tpath = /tmp/elsewhere\n";
+        std::fs::write(&bootstrap_config, planted).expect("a hostile bootstrap config");
+        let events = std::rc::Rc::new(std::cell::RefCell::new(Vec::<String>::new()));
+        let mut hooks = Vec::new();
+        {
+            let log = events.clone();
+            hooks.push(install_git_hook_for_test(
+                GitHookPointV1::BeforeObjectCreate,
+                move |event| {
+                    log.borrow_mut()
+                        .push(format!("create {}", event.path.display()))
+                },
+            ));
+        }
+        {
+            let log = events.clone();
+            hooks.push(install_git_hook_for_test(
+                GitHookPointV1::DeadlineObserved,
+                move |event| {
+                    if matches!(
+                        event.label,
+                        "metadata-refs" | "metadata-agreed" | "metadata-config"
+                    ) {
+                        log.borrow_mut().push(event.label.to_owned());
+                    }
+                },
+            ));
+        }
+        let git = case.git();
+        let _ = case.done(&row);
+        drop(hooks);
+        let events = events.borrow();
+        let create_of = |name: &str| format!("create {}", git.join(name).display());
+        let position_of = |wanted: &str| {
+            events
+                .iter()
+                .position(|event| event == wanted)
+                .unwrap_or_else(|| panic!("{row}: no `{wanted}` in {events:?}"))
+        };
+        let agreed = position_of("metadata-agreed");
+        let started = position_of("metadata-refs");
+        let config = position_of(&create_of("config"));
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| **event == create_of("config"))
+                .count(),
+            1,
+            "{row}: the config is created once"
+        );
+        assert!(started < agreed && agreed < config, "{row}: {events:?}");
+        assert_eq!(
+            events.iter().position(|event| event == "metadata-config"),
+            Some(agreed + 1),
+            "{row}: the config step begins right after the agreement"
+        );
+        assert_eq!(
+            config,
+            events.len() - 1,
+            "{row}: nothing is created after the config"
+        );
+        // Every other entry was created before the refs were read back.
+        assert!(
+            events[..started]
+                .iter()
+                .all(|event| event.starts_with("create ")),
+            "{row}"
+        );
+        assert_eq!(started, events.len() - 4, "{row}: {events:?}");
+        assert_eq!(
+            std::fs::read(case.meta("config")).expect("the config"),
+            golden_config(case.format),
+            "{row}: the golden bytes, never the bootstrap's"
+        );
+        assert_eq!(
+            std::fs::read(&bootstrap_config).expect("the bootstrap config"),
+            planted,
+            "{row}: the bootstrap is untouched"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// The second pass applies pass B1a's rules again, before anything is created
+// ---------------------------------------------------------------------------------------------
+
+/// What B1a's plan says of `bytes`, by the test's own decode: the same counts and the same entry digest,
+/// computed independently of any later pass's flow. A frame that does not decode whole is described by
+/// zeros: it can never reach the comparison.
+fn summary_of(
+    bytes: &[u8],
+    class: ClassV1,
+    generation: &str,
+    staged: usize,
+) -> ActiveFrameSummaryV1 {
+    let header = CustodyFrameHeaderV1::new(class, generation).expect("a header");
+    let mut digest = ActiveEntryDigestV1::new(class);
+    let (mut entries, mut directories, mut files, mut content_bytes) = (0_u64, 0_u64, 0_u64, 0_u64);
+    let mut whole = true;
+    match CustodyFrameDecoderV1::new(bytes, &header, frame_budget()) {
+        Err(_) => whole = false,
+        Ok(mut decoder) => loop {
+            match decoder.next_entry() {
+                Err(_) => {
+                    whole = false;
+                    break;
+                }
+                Ok(None) => break,
+                Ok(Some(entry)) => {
+                    entries += 1;
+                    match entry {
+                        CustodyFrameEntryV1::Directory { path, .. } => {
+                            directories += 1;
+                            digest.record(ActiveEntryKindV1::Directory, path.as_bytes(), 0);
+                        }
+                        CustodyFrameEntryV1::Symlink { path, .. } => {
+                            files += 1;
+                            digest.record(ActiveEntryKindV1::Symlink, path.as_bytes(), 0);
+                        }
+                        CustodyFrameEntryV1::Regular {
+                            path,
+                            length,
+                            mut content,
+                            ..
+                        } => {
+                            files += 1;
+                            content_bytes += length;
+                            digest.record(ActiveEntryKindV1::Regular, path.as_bytes(), length);
+                            let _ = std::io::copy(&mut content, &mut std::io::sink());
+                        }
+                    }
+                }
+            }
+        },
+    }
+    let zeros = !whole;
+    ActiveFrameSummaryV1 {
+        class,
+        staged,
+        length: bytes.len() as u64,
+        sha256: sha256_bytes(bytes),
+        entries: if zeros { 0 } else { entries },
+        directories: if zeros { 0 } else { directories },
+        regular_files: if zeros { 0 } else { files },
+        content_bytes: if zeros { 0 } else { content_bytes },
+        entries_sha256: if zeros { [0; 32] } else { digest.finish() },
+    }
+}
+
+/// Replace the staged payload of `class` IN PLACE (the same slot, so every retained classification and
+/// index stays valid) with `bytes`, and make the plan describe exactly those bytes: what a hand-built plan
+/// would say, so only the step's own guards can tell the frame from a prevalidated one.
+fn swap_frame(case: &mut MetaCaseV1, class: ClassV1, bytes: &[u8]) {
+    use std::io::{Seek as _, Write as _};
+    let generation = case
+        .store
+        .boot
+        .verified
+        .control
+        .manifest
+        .generation_id()
+        .to_owned();
+    let index = staged_index(&case.store.boot.verified, class);
+    let mut file = tempfile::tempfile().expect("an unlinked staging descriptor");
+    file.write_all(bytes).expect("the frame bytes");
+    file.seek(SeekFrom::Start(0)).expect("rewind");
+    let one = &mut case.store.boot.verified.staged[index];
+    one.file = file;
+    one.length = bytes.len() as u64;
+    one.sha256 = sha256_bytes(bytes);
+    let summary = summary_of(bytes, class, &generation, index);
+    *case
+        .store
+        .plan
+        .frames
+        .iter_mut()
+        .find(|frame| frame.class == class)
+        .expect("a planned frame") = summary;
+}
+
+fn generation_of(case: &MetaCaseV1) -> String {
+    case.store
+        .boot
+        .verified
+        .control
+        .manifest
+        .generation_id()
+        .to_owned()
+}
+
+/// The cause the pass B1a prevalidation gives a frame set, on a fresh capsule.
+fn b1a_cause_of(capsule: &CustomCapsuleV1, frames: &[(ClassV1, Vec<u8>)]) -> String {
+    let mut case = CaseV1::with_bytes(capsule, frames);
+    let cause = prevalidate(&mut case.verified, far_deadline())
+        .expect_err("pass B1a refuses the frame set");
+    format!("{cause:?}")
+}
+
+/// The refs frame every second-pass row starts from: a HEAD and the empty branch and tag directories.
+fn base_refs() -> FrameSpecV1 {
+    FrameSpecV1::new()
+        .file("HEAD", HEAD_BYTES_V1)
+        .dir("refs")
+        .dir("refs/heads")
+        .dir("refs/tags")
+}
+
+/// An entry the active subset never carries, or carries in the wrong place, or spells wrongly, in a frame
+/// that an earlier pass would never have admitted (the plan here is hand-built to describe it): the second
+/// pass refuses it with the very cause pass B1a gives, before creating it, keeps what it had already created,
+/// and leaves the bytes of everything behavior-affecting unwritten.
+#[test]
+fn b2b_the_second_pass_refuses_what_pass_b1a_refuses_before_creating_it() {
+    let capsule = empty(CustodyGitObjectFormatV1::Sha1);
+    let long = |name: &str| format!("refs/heads/{name}");
+    // (row, the frame's class, its entries, the paths that must not exist afterwards)
+    let rows: Vec<(&str, ClassV1, FrameSpecV1, Vec<String>)> = vec![
+        (
+            "a symlink in refs",
+            REFS_V1,
+            base_refs().link("refs/heads/l", "main"),
+            vec![long("l")],
+        ),
+        (
+            "a config file",
+            REFS_V1,
+            base_refs().file("config", "[core]\n\tfsmonitor = /tmp/b2b-marker\n"),
+            vec!["config".into()],
+        ),
+        (
+            "a hooks directory and a hook",
+            REFS_V1,
+            base_refs()
+                .dir("hooks")
+                .file("hooks/pre-commit", "#!/bin/sh\ntouch /tmp/b2b-marker\n"),
+            vec!["hooks".into(), "hooks/pre-commit".into()],
+        ),
+        (
+            "an include-bearing info file",
+            REFS_V1,
+            base_refs()
+                .dir("info")
+                .file("info/attributes", "* filter=x\n"),
+            vec!["info".into(), "info/attributes".into()],
+        ),
+        (
+            "shallow",
+            REFS_V1,
+            base_refs().file("shallow", "x\n"),
+            vec!["shallow".into()],
+        ),
+        (
+            "an objects entry",
+            REFS_V1,
+            base_refs().dir("objects").file("objects/stray", "x"),
+            vec!["objects/stray".into()],
+        ),
+        (
+            "an index",
+            REFS_V1,
+            base_refs().file("index", "DIRC"),
+            vec!["index".into()],
+        ),
+        (
+            "modules and worktrees",
+            REFS_V1,
+            base_refs().dir("modules").dir("worktrees"),
+            vec!["modules".into(), "worktrees".into()],
+        ),
+        (
+            "a logs entry in the refs class",
+            REFS_V1,
+            base_refs().dir("logs").file("logs/HEAD", "x\n"),
+            vec!["logs".into()],
+        ),
+        (
+            "a non-ASCII spelling",
+            REFS_V1,
+            base_refs().file(&long("caf\u{e9}"), "x\n"),
+            vec![long("caf\u{e9}")],
+        ),
+        (
+            "a backslash",
+            REFS_V1,
+            base_refs().file(&long("a\\b"), "x\n"),
+            vec![long("a\\b")],
+        ),
+        (
+            "a trailing dot",
+            REFS_V1,
+            base_refs().file(&long("a."), "x\n"),
+            vec![long("a.")],
+        ),
+        (
+            "a space",
+            REFS_V1,
+            base_refs().file(&long("a b"), "x\n"),
+            vec![long("a b")],
+        ),
+        (
+            "refs as a regular file",
+            REFS_V1,
+            FrameSpecV1::new()
+                .file("HEAD", HEAD_BYTES_V1)
+                .file("refs", "x"),
+            vec![],
+        ),
+        (
+            "HEAD as a directory",
+            REFS_V1,
+            FrameSpecV1::new().dir("HEAD").dir("refs"),
+            vec![],
+        ),
+        (
+            "two spellings that differ only by ASCII case",
+            REFS_V1,
+            base_refs().file(&long("A"), "x\n").file(&long("a"), "x\n"),
+            vec![long("a")],
+        ),
+        (
+            "no HEAD at all",
+            REFS_V1,
+            FrameSpecV1::new().dir("refs").dir("refs/heads"),
+            vec![],
+        ),
+    ];
+    for (row, class, spec, absent) in rows {
+        let mut case = MetaCaseV1::of(&capsule, CustodyGitObjectFormatV1::Sha1);
+        let generation = generation_of(&case);
+        let evil = spec.encode(class, &generation);
+        let expected = b1a_cause_of(&capsule, &[(class, evil.clone())]);
+        swap_frame(&mut case, class, &evil);
+        let failure = case.refused(row);
+        assert_eq!(
+            format!("{:?}", failure.cause),
+            expected,
+            "{row}: the second pass gives pass B1a's cause"
+        );
+        assert_eq!(failure.last_completed, B2B_COMPLETED_V1, "{row}");
+        assert_eq!(
+            failure.active_materialization_began,
+            failure.partial.charged.entries > 0,
+            "{row}"
+        );
+        for path in &absent {
+            assert!(!exists(&case.meta(path)), "{row}: `{path}` was created");
+        }
+        for forbidden in [
+            "hooks",
+            "config",
+            "info",
+            "shallow",
+            "index",
+            "modules",
+            "worktrees",
+        ] {
+            assert!(!exists(&case.meta(forbidden)), "{row}: {forbidden}");
+        }
+        assert_metadata_partial_is_the_disk(row, &case, &failure, 0);
+    }
+
+    // The same holds for the logs class, after a whole refs frame was restored.
+    let logs_rows: Vec<(&str, FrameSpecV1, &str)> = vec![
+        (
+            "a symlink in logs",
+            FrameSpecV1::new().dir("logs").link("logs/l", "HEAD"),
+            "logs/l",
+        ),
+        (
+            "a refs entry in the logs class",
+            FrameSpecV1::new().dir("logs").dir("refs"),
+            "refs/heads/x",
+        ),
+        (
+            "logs as a regular file",
+            FrameSpecV1::new().file("logs", "x"),
+            "logs",
+        ),
+    ];
+    for (row, spec, absent) in logs_rows {
+        // A case with a logs frame: the plan names both classes.
+        let mut case = MetaCaseV1::with_frames(
+            &capsule,
+            CustodyGitObjectFormatV1::Sha1,
+            &base_refs(),
+            Some(&FrameSpecV1::new().dir("logs")),
+            vec![symbolic_ref("HEAD", "refs/heads/main")],
+        );
+        let generation = generation_of(&case);
+        let refs = base_refs().encode(REFS_V1, &generation);
+        let evil = spec.encode(LOGS_V1, &generation);
+        let expected = b1a_cause_of(&capsule, &[(REFS_V1, refs), (LOGS_V1, evil.clone())]);
+        swap_frame(&mut case, LOGS_V1, &evil);
+        let failure = case.refused(row);
+        assert_eq!(format!("{:?}", failure.cause), expected, "{row}");
+        assert!(
+            failure.active_materialization_began,
+            "{row}: refs was restored"
+        );
+        assert!(!exists(&case.meta(absent)), "{row}: `{absent}`");
+        assert!(
+            exists(&case.meta("HEAD")),
+            "{row}: the refs frame was whole"
+        );
+        assert_metadata_partial_is_the_disk(row, &case, &failure, 0);
+    }
+}
+
+/// The aggregate path table's byte bound applies in the second pass: a bound the first pass cleared (the
+/// default) is refused when it is smaller, with the same typed fault, before the entry that passes it is
+/// created.
+#[test]
+fn b2b_the_path_table_bound_applies_in_the_second_pass() {
+    let capsule = empty(CustodyGitObjectFormatV1::Sha1);
+    let mut case = MetaCaseV1::of(&capsule, CustodyGitObjectFormatV1::Sha1);
+    let failure = match case.attempt_with(
+        far_deadline(),
+        B2B_COMPLETED_V1,
+        B2B_ENTRY_OVERHEAD_V1 * 2,
+        RefsLimitsV1::v1(),
+    ) {
+        Ok(_) => panic!("a tiny table bound must refuse"),
+        Err(failure) => failure,
+    };
+    assert!(
+        matches!(
+            &failure.cause,
+            GitBootstrapErrorV1::ActiveFrame {
+                fault: ActiveFrameFaultV1::PathTableBound { .. },
+                ..
+            }
+        ),
+        "{:?}",
+        failure.cause
+    );
+    assert_eq!(failure.last_completed, B2B_COMPLETED_V1);
+    assert_metadata_partial_is_the_disk("a tiny table bound", &case, &failure, 0);
+    assert!(
+        failure.partial.charged.entries < 3,
+        "the entry that passed the bound was never created: {:?}",
+        failure.partial.charged
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// Each retained frame is reverified immediately before its own second decode
+// ---------------------------------------------------------------------------------------------
+
+/// A staged frame whose bytes or length drifted after its plan (a changed byte, an appended byte, a
+/// truncation, an emptied file) is refused by the reverify BEFORE its decode begins, and named: for the refs
+/// frame nothing at all was created, and for the logs frame the refs frame had been restored whole and not
+/// one logs entry exists. Each frame is reverified at its own turn, not all up front.
+#[test]
+fn b2b_a_frame_changed_after_its_plan_is_refused_by_the_reverify_before_its_decode() {
+    use std::os::unix::fs::FileExt as _;
+    type Edit = fn(&std::fs::File);
+    let edits: [(&str, Edit); 4] = [
+        ("a byte changed", |file| {
+            file.write_all_at(&[0xff], 12).expect("change a byte");
+        }),
+        ("a byte appended", |file| {
+            let length = file.metadata().expect("metadata").len();
+            file.write_all_at(b"x", length).expect("append");
+        }),
+        ("truncated", |file| {
+            let length = file.metadata().expect("metadata").len();
+            file.set_len(length - 1).expect("truncate");
+        }),
+        ("emptied", |file| file.set_len(0).expect("empty")),
+    ];
+    let capsule = captured(CustodyGitObjectFormatV1::Sha1);
+    for class in [REFS_V1, LOGS_V1] {
+        for (row, edit) in edits {
+            let row = format!("{class:?}: {row}");
+            let mut case = MetaCaseV1::of(&capsule, CustodyGitObjectFormatV1::Sha1);
+            let index = staged_index(&case.store.boot.verified, class);
+            edit(&case.store.boot.verified.staged[index].file);
+            let name = lossy(case.store.boot.verified.staged[index].name.as_bytes());
+            let failure = case.refused(&row);
+            assert!(
+                matches!(&failure.cause, GitBootstrapErrorV1::StagedInputChanged { name: found }
+                    if *found == name),
+                "{row}: {:?}",
+                failure.cause
+            );
+            assert_eq!(failure.last_completed, B2B_COMPLETED_V1, "{row}");
+            assert_metadata_partial_is_the_disk(&row, &case, &failure, 0);
+            if class == REFS_V1 {
+                assert!(!failure.active_materialization_began, "{row}");
+                assert_eq!(failure.partial.charged, none_charged(), "{row}");
+                assert_eq!(case.entry_count(), 0, "{row}: nothing was created");
+            } else {
+                assert!(failure.active_materialization_began, "{row}");
+                assert_eq!(
+                    failure.partial.files.len(),
+                    4,
+                    "{row}: the refs frame was whole"
+                );
+                assert!(exists(&case.meta("refs/heads/main")), "{row}");
+                assert!(!exists(&case.meta("logs")), "{row}: no logs entry");
+            }
+        }
+    }
+}
+
+/// A frame replaced between its rehash and its decode (with another well-formed frame, so only the verified
+/// staged digest can tell) is refused as that, AFTER the replacement's entries were created (a frame is not
+/// final until its trailer and its bytes are verified), and every byte created stays: a shorter replacement
+/// (the byte count differs) and one of exactly the same length (only the digest differs).
+#[test]
+fn b2b_a_frame_changed_between_the_rehash_and_the_decode_is_refused_with_the_partial_state() {
+    use std::os::unix::fs::FileExt as _;
+    let capsule = empty(CustodyGitObjectFormatV1::Sha1);
+    for (row, replacement, entries, head) in [
+        (
+            "a shorter well-formed frame",
+            FrameSpecV1::new().file("HEAD", HEAD_BYTES_V1),
+            1_usize,
+            HEAD_BYTES_V1.to_vec(),
+        ),
+        (
+            "a well-formed frame of the same length",
+            base_refs()
+                .without("HEAD")
+                .file("HEAD", "ref: refs/heads/mine\n"),
+            4,
+            b"ref: refs/heads/mine\n".to_vec(),
+        ),
+    ] {
+        let mut case = MetaCaseV1::of(&capsule, CustodyGitObjectFormatV1::Sha1);
+        let generation = generation_of(&case);
+        let other = replacement.encode(REFS_V1, &generation);
+        let index = staged_index(&case.store.boot.verified, REFS_V1);
+        let staged_length = case.store.boot.verified.staged[index].length as usize;
+        assert_eq!(other.len() < staged_length, entries == 1, "{row}");
+        assert_eq!(other.len() == staged_length, entries == 4, "{row}");
+        let handle = case.store.boot.verified.staged[index]
+            .file
+            .try_clone()
+            .expect("a duplicate descriptor");
+        let swapped = std::cell::Cell::new(false);
+        let _hook = install_git_hook_for_test(GitHookPointV1::DeadlineObserved, move |event| {
+            if event.label == "frame-rewind" && !swapped.replace(true) {
+                handle.set_len(0).expect("empty the frame");
+                handle.write_all_at(&other, 0).expect("another frame");
+            }
+        });
+        let failure = case.refused(row);
+        assert!(
+            matches!(
+                failure.cause,
+                GitBootstrapErrorV1::StagedInputChanged { .. }
+            ),
+            "{row}: {:?}",
+            failure.cause
+        );
+        assert_eq!(failure.last_completed, B2B_COMPLETED_V1, "{row}");
+        assert!(failure.active_materialization_began, "{row}");
+        // The replacement's entries were created, and refused only when the bytes were bound.
+        assert_eq!(case.entry_count(), entries, "{row}");
+        assert_eq!(
+            std::fs::read(case.meta("HEAD")).expect("HEAD"),
+            head,
+            "{row}"
+        );
+        assert_metadata_partial_is_the_disk(row, &case, &failure, 0);
+    }
+}
+
+/// A plan that does not describe the frame it names (one more entry, directory, regular file, or content byte,
+/// or another entry digest) is refused once the frame has decoded whole and its bytes are bound to the
+/// verified plaintext: the frame is the verified bytes, so every byte of it was restored, and nothing after it
+/// is. The refs frame and the logs frame each.
+#[test]
+fn b2b_a_plan_that_does_not_describe_the_frame_is_refused_after_its_decode() {
+    type BreakV1 = fn(&mut ActiveFrameSummaryV1);
+    let breaks: [(&str, BreakV1); 5] = [
+        ("one more entry", |summary| summary.entries += 1),
+        ("one more directory", |summary| summary.directories += 1),
+        ("one more regular file", |summary| {
+            summary.regular_files += 1
+        }),
+        ("one more content byte", |summary| {
+            summary.content_bytes += 1
+        }),
+        ("another entry digest", |summary| {
+            summary.entries_sha256[0] ^= 1
+        }),
+    ];
+    let capsule = captured(CustodyGitObjectFormatV1::Sha1);
+    for (class_index, restored_before) in [(0_usize, 0_usize), (1, 7)] {
+        for (row, breakage) in breaks {
+            let row = format!("frame {class_index}: {row}");
+            let mut case = MetaCaseV1::of(&capsule, CustodyGitObjectFormatV1::Sha1);
+            breakage(&mut case.store.plan.frames[class_index]);
+            let failure = case.refused(&row);
+            assert!(
+                matches!(&failure.cause, GitBootstrapErrorV1::ActivePlanMismatch(detail)
+                    if detail.contains("admitted")),
+                "{row}: {:?}",
+                failure.cause
+            );
+            assert_eq!(failure.last_completed, B2B_COMPLETED_V1, "{row}");
+            assert!(failure.active_materialization_began, "{row}");
+            // The frame itself was whole and restored; the next frame never began.
+            let frame_entries = if class_index == 0 { 7 } else { 5 };
+            assert_eq!(case.entry_count(), restored_before + frame_entries, "{row}");
+            assert!(!exists(&case.meta("config")), "{row}");
+            assert_metadata_partial_is_the_disk(&row, &case, &failure, 0);
+        }
+    }
+}
+
+/// The retained descriptors are the only input: every staged file is renamed away or unlinked after phase V,
+/// and the step still restores the exact frames, and reads nothing by name.
+#[test]
+fn b2b_renamed_and_unlinked_staged_frames_are_still_read_from_their_descriptors() {
+    let capsule = captured(CustodyGitObjectFormatV1::Sha1);
+    let mut case = MetaCaseV1::of(&capsule, CustodyGitObjectFormatV1::Sha1);
+    let expected = case.expected_frames();
+    let plain = case.dest().work().join("plain");
+    let mut moved = 0;
+    let mut removed = 0;
+    for (number, entry) in walk_files(&plain).into_iter().enumerate() {
+        if number % 2 == 0 {
+            std::fs::rename(&entry, entry.with_extension("renamed")).expect("renamed away");
+            moved += 1;
+        } else {
+            std::fs::remove_file(&entry).expect("unlinked");
+            removed += 1;
+        }
+    }
+    assert!(moved > 0 && removed > 0, "both kinds of drift were made");
+    let _ = case.done("staged names gone");
+    let mut want = expected;
+    want.insert(
+        "config".to_owned(),
+        Some(golden_config(case.format).to_vec()),
+    );
+    assert_eq!(case.metadata_on_disk(), want);
+}
+
+/// Every regular file beneath `root`, by path.
+fn walk_files(root: &Path) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    let mut frontier = vec![root.to_path_buf()];
+    while let Some(directory) = frontier.pop() {
+        for entry in std::fs::read_dir(&directory).expect("a directory") {
+            let path = entry.expect("an entry").path();
+            if std::fs::symlink_metadata(&path).expect("metadata").is_dir() {
+                frontier.push(path);
+            } else {
+                files.push(path);
+            }
+        }
+    }
+    files.sort();
+    files
+}
+
+/// Each frame is reverified at its own turn, immediately before its decode: the events show one rehash
+/// before the refs frame's first entry and a second one after the refs frame's last entry and before the
+/// logs frame's first, never both up front.
+#[test]
+fn b2b_each_frame_is_rehashed_immediately_before_its_own_decode() {
+    let capsule = captured(CustodyGitObjectFormatV1::Sha1);
+    let mut case = MetaCaseV1::of(&capsule, CustodyGitObjectFormatV1::Sha1);
+    let events = std::rc::Rc::new(std::cell::RefCell::new(Vec::<String>::new()));
+    let mut hooks = Vec::new();
+    {
+        let log = events.clone();
+        hooks.push(install_git_hook_for_test(
+            GitHookPointV1::DeadlineObserved,
+            move |event| {
+                if event.label == "frame-rehash" {
+                    log.borrow_mut().push("rehash".to_owned());
+                }
+            },
+        ));
+    }
+    {
+        let log = events.clone();
+        let git = case.git();
+        hooks.push(install_git_hook_for_test(
+            GitHookPointV1::BeforeObjectCreate,
+            move |event| {
+                let relative = event.path.strip_prefix(&git).expect("beneath .git");
+                log.borrow_mut().push(relative.display().to_string());
+            },
+        ));
+    }
+    let _ = case.done("two frames");
+    drop(hooks);
+    let events = events.borrow();
+    let at = |wanted: &str| {
+        events
+            .iter()
+            .position(|event| event == wanted)
+            .unwrap_or_else(|| panic!("no `{wanted}` in {events:?}"))
+    };
+    let rehashes: Vec<usize> = events
+        .iter()
+        .enumerate()
+        .filter(|(_, event)| *event == "rehash")
+        .map(|(index, _)| index)
+        .collect();
+    assert_eq!(rehashes.len(), 2, "{events:?}");
+    assert!(
+        rehashes[0] < at("HEAD"),
+        "the refs frame is rehashed before its first entry"
+    );
+    assert!(
+        at("refs/heads/main") < rehashes[1] && rehashes[1] < at("logs"),
+        "the logs frame is rehashed after the refs frame is restored and before its own first entry: {events:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// A frame that is not whole stays fatal, and every partial byte stays
+// ---------------------------------------------------------------------------------------------
+
+/// A frame that does not decode whole is fatal at the point of damage, in the second pass too, even though
+/// every earlier entry was fine and was already created: damage to a trailer, a content digest, a header
+/// binding, or a trailing byte is `FrameInvalid` for its class, with every provisional byte kept and the
+/// facts naming exactly what exists. Controls: the undamaged frame restores.
+#[test]
+fn b2b_a_bad_trailer_or_damage_after_provisional_content_keeps_every_partial_byte() {
+    let capsule = empty(CustodyGitObjectFormatV1::Sha1);
+    let generation = CaseV1::generation(&capsule);
+    let spec = FrameSpecV1::new()
+        .file("HEAD", HEAD_BYTES_V1)
+        .file("packed-refs", PACKED_HEADER_V1)
+        .dir("refs")
+        .dir("refs/heads");
+    let good = spec.encode(REFS_V1, &generation);
+    let mut damaged: Vec<(&str, Vec<u8>, usize)> = Vec::new();
+    // (row, bytes, the entries that exist beforehand)
+    let entries = 4;
+    let mut flipped_digest = good.clone();
+    flip(&mut flipped_digest, good.len() - 1);
+    damaged.push(("the frame digest's last byte", flipped_digest, entries));
+    let mut flipped_count = good.clone();
+    flip(&mut flipped_count, good.len() - (DIGEST_BYTES_V1 + 8 + 8));
+    damaged.push(("the trailer's entry count", flipped_count, entries));
+    let mut flipped_total = good.clone();
+    flip(&mut flipped_total, good.len() - (DIGEST_BYTES_V1 + 8));
+    damaged.push(("the trailer's content total", flipped_total, entries));
+    damaged.push((
+        "a truncated trailer",
+        good[..good.len() - 8].to_vec(),
+        entries,
+    ));
+    damaged.push((
+        "no trailer at all",
+        good[..good.len() - 49].to_vec(),
+        entries,
+    ));
+    let mut trailing = good.clone();
+    trailing.push(0);
+    damaged.push(("a byte after the trailer", trailing, entries));
+    let note_at = good
+        .windows(9)
+        .position(|window| window == b"pack-refs")
+        .expect("the packed-refs content");
+    let mut flipped_content = good.clone();
+    flip(&mut flipped_content, note_at);
+    // The file's content digest fails at the read that exhausts it: its last chunk is never written, and
+    // the entries after it were never reached.
+    damaged.push(("a content byte of the second file", flipped_content, 2));
+    damaged.push((
+        "another generation's header",
+        spec.encode(REFS_V1, "another-generation"),
+        0,
+    ));
+    damaged.push((
+        "another class's header",
+        spec.encode(LOGS_V1, &generation),
+        0,
+    ));
+    let whole = |records: &[Vec<u8>], total: u64| {
+        raw_frame(1, &generation, records, records.len() as u64, total)
+    };
+    damaged.push((
+        "an entry under a regular file",
+        whole(&[raw_file(b"HEAD", b"x"), raw_file(b"HEAD/x", b"y")], 2),
+        1,
+    ));
+    damaged.push((
+        "an entry whose parents are absent",
+        whole(
+            &[raw_file(b"HEAD", b"x"), raw_file(b"refs/heads/main", b"y")],
+            2,
+        ),
+        1,
+    ));
+    for (row, bytes, created) in damaged {
+        let mut case = MetaCaseV1::of(&capsule, CustodyGitObjectFormatV1::Sha1);
+        swap_frame(&mut case, REFS_V1, &bytes);
+        let failure = case.refused(row);
+        assert!(
+            matches!(
+                failure.cause,
+                GitBootstrapErrorV1::Restore(CustodyRestoreErrorV1::FrameInvalid {
+                    class: REFS_V1
+                })
+            ),
+            "{row}: {:?}",
+            failure.cause
+        );
+        assert_eq!(failure.last_completed, B2B_COMPLETED_V1, "{row}");
+        assert_eq!(failure.active_materialization_began, created > 0, "{row}");
+        assert_eq!(
+            case.entry_count(),
+            created,
+            "{row}: exactly the provisional entries before the damage exist"
+        );
+        assert!(!exists(&case.meta("config")), "{row}: no config");
+        assert_metadata_partial_is_the_disk(row, &case, &failure, 0);
+    }
+
+    // The content flip leaves a partial file: some bytes of it were written, never all.
+    let mut case = MetaCaseV1::of(&capsule, CustodyGitObjectFormatV1::Sha1);
+    let mut bytes = good.clone();
+    flip(&mut bytes, note_at);
+    swap_frame(&mut case, REFS_V1, &bytes);
+    let _chunk = override_object_copy_chunk_for_test(16);
+    let failure = case.refused("the content flip in chunks");
+    let flight = failure
+        .partial
+        .in_flight
+        .as_ref()
+        .expect("packed-refs in flight");
+    assert_eq!(flight.relative, "packed-refs");
+    assert_eq!(
+        flight.written, 32,
+        "two whole chunks were written; the third failed its digest"
+    );
+    assert!(flight.written < flight.expected_length);
+    assert_metadata_partial_is_the_disk("the content flip in chunks", &case, &failure, 0);
+
+    // The control: the undamaged frame restores.
+    let mut case = MetaCaseV1::of(&capsule, CustodyGitObjectFormatV1::Sha1);
+    swap_frame(&mut case, REFS_V1, &good);
+    let _ = case.done("the undamaged frame");
+    assert_eq!(
+        std::fs::read(case.meta("packed-refs")).expect("packed-refs"),
+        PACKED_HEADER_V1.as_bytes()
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// A file that changes while it is written, and the caller's frame budget
+// ---------------------------------------------------------------------------------------------
+
+/// A file that changes during its own write, after the last chunk returned, is never taken for what was
+/// written: an appended byte and a truncation are refused by the check of the file's own descriptor, a name
+/// swapped for a link or another inode by the check of its entry through the retained parent, each before the
+/// file is kept (it stays in flight, with every byte), and a config changed in place after its write is
+/// refused by its read-back.
+#[test]
+fn b2b_a_file_that_changes_during_its_own_write_is_refused_with_the_partial_state() {
+    let capsule = empty(CustodyGitObjectFormatV1::Sha1);
+    let head_length = HEAD_BYTES_V1.len() as u64;
+    type ChangeV1 = fn(&Path, &Path);
+    let rows: [(&str, ChangeV1, &str); 4] = [
+        (
+            "an appended byte",
+            |path, _| {
+                use std::io::Write as _;
+                std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(path)
+                    .and_then(|mut file| file.write_all(b"x"))
+                    .expect("an appended byte");
+            },
+            "regular file of the frame's length",
+        ),
+        (
+            "a truncation",
+            |path, _| {
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(path)
+                    .and_then(|file| file.set_len(5))
+                    .expect("a truncation");
+            },
+            "regular file of the frame's length",
+        ),
+        (
+            "a link in its place",
+            |path, outside| {
+                move_away(path, "HEAD.moved");
+                std::os::unix::fs::symlink(outside.join("decoy"), path).expect("a link");
+            },
+            "",
+        ),
+        (
+            "another inode in its place",
+            |path, _| {
+                let bytes = std::fs::read(path).expect("HEAD");
+                move_away(path, "HEAD.moved");
+                std::fs::write(path, bytes).expect("the same bytes, a new inode");
+            },
+            "",
+        ),
+    ];
+    for (row, change, detail) in rows {
+        let mut case = MetaCaseV1::of(&capsule, CustodyGitObjectFormatV1::Sha1);
+        let target = case.meta("HEAD");
+        let (_outside_area, outside) = external_dir_with(&["decoy"]);
+        let outside_before = snapshot(&outside);
+        let (acting, away) = (target.clone(), outside.clone());
+        let acted = std::cell::Cell::new(false);
+        let _hook = install_git_hook_for_test(GitHookPointV1::ObjectIo, move |event| {
+            if event.label == "write" && event.path == acting && !acted.replace(true) {
+                change(&acting, &away);
+            }
+        });
+        let failure = case.refused(row);
+        match (&failure.cause, detail.is_empty()) {
+            (
+                GitBootstrapErrorV1::MetadataCopy {
+                    relative,
+                    detail: found,
+                },
+                false,
+            ) => {
+                assert_eq!(relative, "HEAD", "{row}");
+                assert!(found.contains(detail), "{row}: {found}");
+            }
+            (GitBootstrapErrorV1::Restore(CustodyRestoreErrorV1::SymlinkRefused { .. }), true)
+                if row == "a link in its place" => {}
+            (cause, true) if row != "a link in its place" => {
+                assert!(identity_changed(cause), "{row}: {cause:?}");
+            }
+            (cause, _) => panic!("{row}: {cause:?}"),
+        }
+        assert_eq!(
+            snapshot(&outside),
+            outside_before,
+            "{row}: written through a link"
+        );
+        assert!(failure.active_materialization_began, "{row}");
+        assert_eq!(failure.last_completed, B2B_COMPLETED_V1, "{row}");
+        let flight = failure
+            .partial
+            .in_flight
+            .as_ref()
+            .expect("HEAD stays in flight");
+        assert_eq!(
+            (flight.relative.as_str(), flight.written),
+            ("HEAD", head_length),
+            "{row}"
+        );
+        assert!(
+            failure.partial.files.is_empty(),
+            "{row}: the file was never kept"
+        );
+        assert_eq!(
+            failure.partial.charged,
+            MetadataChargeV1 {
+                entries: 1,
+                bytes: head_length
+            },
+            "{row}"
+        );
+    }
+
+    // The config, changed in place (same inode, same length) after its write and before its read-back.
+    let mut case = MetaCaseV1::of(&capsule, CustodyGitObjectFormatV1::Sha1);
+    let config = case.meta("config");
+    // The seventeenth recheck of a clean run of this capsule is the one that ends the config's own write.
+    let _hook = act_at_guard("metadata-checked", 17, move || {
+        use std::os::unix::fs::FileExt as _;
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&config)
+            .expect("the config opens for the racer");
+        file.write_all_at(b"X", 0).expect("a byte changed in place");
+    });
+    let failure = case.refused("a config changed in place");
+    assert!(
+        matches!(&failure.cause, GitBootstrapErrorV1::MetadataCopy { relative, .. }
+            if relative == "config"),
+        "{:?}",
+        failure.cause
+    );
+    assert_eq!(failure.last_completed, Some(GitPlaneStepV1::Refs));
+    assert_eq!(
+        failure.partial.files.len(),
+        2,
+        "HEAD and the config were kept"
+    );
+}
+
+/// The caller's frame budget bounds the second decode: a budget below the frame's entry count stops the decode
+/// at the first entry past it (the entries before it were already restored, and kept), and one too small for
+/// any frame stops it before the first entry.
+#[test]
+fn b2b_the_callers_frame_budget_bounds_the_second_decode() {
+    let capsule = empty(CustodyGitObjectFormatV1::Sha1);
+    for (row, budget, created) in [
+        (
+            "two entries",
+            CustodyFrameBudgetV1::new(2, 1 << 30).expect("a budget"),
+            2_usize,
+        ),
+        (
+            "bytes too few for any frame",
+            CustodyFrameBudgetV1::new(1 << 20, 80).expect("a budget"),
+            0,
+        ),
+    ] {
+        let mut case = MetaCaseV1::of(&capsule, CustodyGitObjectFormatV1::Sha1);
+        case.budget = budget;
+        let failure = case.refused(row);
+        assert!(
+            matches!(
+                failure.cause,
+                GitBootstrapErrorV1::Restore(CustodyRestoreErrorV1::FrameInvalid {
+                    class: REFS_V1
+                })
+            ),
+            "{row}: {:?}",
+            failure.cause
+        );
+        assert_eq!(case.entry_count(), created, "{row}");
+        assert_eq!(failure.last_completed, B2B_COMPLETED_V1, "{row}");
+        assert_metadata_partial_is_the_disk(row, &case, &failure, 0);
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// A held fault never pre-empts the frame's own integrity (source round 1 repair)
+//
+// The first refusal of what was DONE with a decoded entry (an admission fault, or a failed create or write) is
+// held: nothing more is judged or created, but the decoder is drained through its trailer and the decoded bytes
+// are bound to the verified plaintext and the plan, and only then is the held fault reported. A frame that is
+// not whole, or not the verified bytes, is refused as THAT, whatever its first entry said, and every byte
+// created before the fault stays.
+// ---------------------------------------------------------------------------------------------
+
+/// A well-formed refs frame of EXACTLY `length` bytes: `spec` builds the entries from a padding string that it
+/// puts in HEAD's content, and the padding is sized so the encoded frame is `length` bytes long.
+fn frame_of_length(generation: &str, length: usize, spec: impl Fn(&str) -> FrameSpecV1) -> Vec<u8> {
+    let bare = spec("").encode(REFS_V1, generation);
+    assert!(bare.len() <= length, "{} > {length}", bare.len());
+    let padded = spec(&"x".repeat(length - bare.len())).encode(REFS_V1, generation);
+    assert_eq!(padded.len(), length);
+    padded
+}
+
+/// A frame whose entry after HEAD is an admission fault (`hooks` is never active), with entries after it that
+/// must never be created.
+fn faulted_frame_spec(padding: &str) -> FrameSpecV1 {
+    FrameSpecV1::new()
+        .file("HEAD", format!("ref: refs/heads/main\n{padding}"))
+        .dir("hooks")
+        .dir("refs")
+        .dir("refs/heads")
+}
+
+/// Replace the staged refs frame IN PLACE with `bytes` at the one moment between its rehash and its decode (the
+/// reverify's own last guard), through a duplicate of the retained descriptor.
+fn replace_frame_after_rehash(case: &MetaCaseV1, bytes: Vec<u8>) -> GitSeamGuardV1 {
+    use std::os::unix::fs::FileExt as _;
+    let index = staged_index(&case.store.boot.verified, REFS_V1);
+    let handle = case.store.boot.verified.staged[index]
+        .file
+        .try_clone()
+        .expect("a duplicate descriptor");
+    let swapped = std::cell::Cell::new(false);
+    install_git_hook_for_test(GitHookPointV1::DeadlineObserved, move |event| {
+        if event.label == "frame-rewind" && !swapped.replace(true) {
+            handle.set_len(0).expect("empty the frame");
+            handle.write_all_at(&bytes, 0).expect("another frame");
+        }
+    })
+}
+
+/// An entry fault followed by anything that makes the frame not whole or not the verified bytes is refused as
+/// that, never as the entry fault: a malformed trailer (a flipped digest, a flipped count, a truncated trailer,
+/// a byte after it) after an ADMISSION fault and after a COLLISION; a frame replaced between its rehash and its
+/// decode by a shorter one and by one of exactly the same length (only the digest differs), after an admission
+/// fault and after a collision; and a plan that does not describe the frame, which outranks the held fault too.
+/// Everything created before the fault stays, nothing after it is created, and the control (a whole, verified
+/// frame) reports the held fault itself.
+#[test]
+fn b2b_a_held_entry_fault_never_pre_empts_the_trailer_the_digest_or_the_plan() {
+    let capsule = empty(CustodyGitObjectFormatV1::Sha1);
+    let invalid = |cause: &GitBootstrapErrorV1| {
+        matches!(
+            cause,
+            GitBootstrapErrorV1::Restore(CustodyRestoreErrorV1::FrameInvalid { class: REFS_V1 })
+        )
+    };
+    let changed = |cause: &GitBootstrapErrorV1| {
+        matches!(cause, GitBootstrapErrorV1::StagedInputChanged { .. })
+    };
+
+    // The control: a whole, verified frame reports the admission fault itself, after creating only HEAD.
+    let mut case = MetaCaseV1::of(&capsule, CustodyGitObjectFormatV1::Sha1);
+    let generation = generation_of(&case);
+    let faulted = faulted_frame_spec("").encode(REFS_V1, &generation);
+    let expected = b1a_cause_of(&capsule, &[(REFS_V1, faulted.clone())]);
+    swap_frame(&mut case, REFS_V1, &faulted);
+    let failure = case.refused("the control");
+    assert_eq!(format!("{:?}", failure.cause), expected);
+    assert_eq!(
+        case.metadata_on_disk().keys().collect::<Vec<_>>(),
+        ["HEAD"],
+        "only the entry before the fault exists: nothing after a held fault is created"
+    );
+    assert_metadata_partial_is_the_disk("the control", &case, &failure, 0);
+
+    // A malformed trailer after an admission fault.
+    type MalformV1 = fn(&mut Vec<u8>);
+    let malformed: [(&str, MalformV1); 4] = [
+        ("a flipped frame digest", |bytes| {
+            let last = bytes.len() - 1;
+            flip(bytes, last);
+        }),
+        ("a flipped trailer entry count", |bytes| {
+            let at = bytes.len() - (DIGEST_BYTES_V1 + 8 + 8);
+            flip(bytes, at);
+        }),
+        ("a truncated trailer", |bytes| {
+            bytes.truncate(bytes.len() - 8)
+        }),
+        ("a byte after the trailer", |bytes| bytes.push(0)),
+    ];
+    for (row, damage) in malformed {
+        let row = format!("an admission fault, then {row}");
+        let mut case = MetaCaseV1::of(&capsule, CustodyGitObjectFormatV1::Sha1);
+        let mut bytes = faulted_frame_spec("").encode(REFS_V1, &generation_of(&case));
+        damage(&mut bytes);
+        swap_frame(&mut case, REFS_V1, &bytes);
+        let failure = case.refused(&row);
+        assert!(invalid(&failure.cause), "{row}: {:?}", failure.cause);
+        assert_eq!(failure.last_completed, B2B_COMPLETED_V1, "{row}");
+        assert_eq!(
+            case.metadata_on_disk().keys().collect::<Vec<_>>(),
+            ["HEAD"],
+            "{row}"
+        );
+        assert_metadata_partial_is_the_disk(&row, &case, &failure, 0);
+    }
+
+    // A collision (the first entry's name is planted) then a malformed trailer, and then a changed frame.
+    for row in [
+        "a collision, then a flipped digest",
+        "a collision, then a shorter frame",
+    ] {
+        let mut case = MetaCaseV1::of(&capsule, CustodyGitObjectFormatV1::Sha1);
+        let head = case.meta("HEAD");
+        let (_outside_area, outside) = external_dir_with(&["decoy"]);
+        let _plant = act_before_creating(head.clone(), {
+            let at = head.clone();
+            move || plant(&at, PlantV1::RegularFile, &outside)
+        });
+        let good = base_refs().encode(REFS_V1, &generation_of(&case));
+        let _swap = if row.ends_with("a flipped digest") {
+            let mut bad = good.clone();
+            let last = bad.len() - 1;
+            flip(&mut bad, last);
+            swap_frame(&mut case, REFS_V1, &bad);
+            None
+        } else {
+            let shorter = FrameSpecV1::new()
+                .file("HEAD", HEAD_BYTES_V1)
+                .encode(REFS_V1, &generation_of(&case));
+            Some(replace_frame_after_rehash(&case, shorter))
+        };
+        let failure = case.refused(row);
+        let accepted = if row.ends_with("a flipped digest") {
+            invalid(&failure.cause)
+        } else {
+            changed(&failure.cause)
+        };
+        assert!(accepted, "{row}: {:?}", failure.cause);
+        assert_eq!(
+            std::fs::read(&head).expect("the planted file"),
+            b"planted",
+            "{row}"
+        );
+        assert_eq!(
+            case.entry_count(),
+            1,
+            "{row}: nothing but the planted entry"
+        );
+        assert_eq!(
+            failure.partial.charged,
+            none_charged(),
+            "{row}: the refused entry was given back"
+        );
+    }
+
+    // A frame replaced between its rehash and its decode, after an admission fault: a shorter one, and one of
+    // exactly the original's length (the staged digest alone tells them apart).
+    let original_length = {
+        let case = MetaCaseV1::of(&capsule, CustodyGitObjectFormatV1::Sha1);
+        let index = staged_index(&case.store.boot.verified, REFS_V1);
+        case.store.boot.verified.staged[index].length as usize
+    };
+    for (row, same_length) in [
+        ("a shorter frame", false),
+        ("a frame of the same length", true),
+    ] {
+        let row = format!("an admission fault, then {row}");
+        let mut case = MetaCaseV1::of(&capsule, CustodyGitObjectFormatV1::Sha1);
+        let generation = generation_of(&case);
+        let replacement = if same_length {
+            frame_of_length(&generation, original_length, faulted_frame_spec)
+        } else {
+            faulted_frame_spec("").encode(REFS_V1, &generation)
+        };
+        assert_eq!(replacement.len() == original_length, same_length, "{row}");
+        let _hook = replace_frame_after_rehash(&case, replacement);
+        let failure = case.refused(&row);
+        assert!(changed(&failure.cause), "{row}: {:?}", failure.cause);
+        assert_eq!(
+            case.metadata_on_disk().keys().collect::<Vec<_>>(),
+            ["HEAD"],
+            "{row}: the entry before the fault exists, nothing after it"
+        );
+        assert_metadata_partial_is_the_disk(&row, &case, &failure, 0);
+    }
+
+    // A plan that does not describe the frame outranks the held fault (the decode is whole and verified).
+    let mut case = MetaCaseV1::of(&capsule, CustodyGitObjectFormatV1::Sha1);
+    swap_frame(&mut case, REFS_V1, &faulted);
+    case.store.plan.frames[0].entries += 1;
+    let failure = case.refused("a stale plan summary");
+    assert!(
+        matches!(&failure.cause, GitBootstrapErrorV1::ActivePlanMismatch(detail)
+            if detail.contains("admitted")),
+        "{:?}",
+        failure.cause
+    );
+    assert_metadata_partial_is_the_disk("a stale plan summary", &case, &failure, 0);
+}
+
+// ---------------------------------------------------------------------------------------------
+// The refs agreement hashes exactly the stream the parsers consume (source round 1 repair)
+// ---------------------------------------------------------------------------------------------
+
+/// A valid reflog of `rows` rows of one fixed length, each ending in a four-digit message number, and that
+/// length: far past one 8 KiB parser buffer for the sizes the rows below use.
+fn big_reflog(commit: &str, format: GitObjectFormatV1, rows: usize) -> (String, usize) {
+    let zero = "0".repeat(oid_len(format));
+    let mut text = String::new();
+    let mut row_length = 0;
+    for number in 0..rows {
+        let row = format!("{zero} {commit} {IDENT_V1}\tmessage {number:04}\n");
+        row_length = row.len();
+        text.push_str(&row);
+    }
+    (text, row_length)
+}
+
+/// A restored file that changes WHILE the parsers read it (after their first read returned, in a part they have
+/// not read yet, with the same inode and the same length) is refused as changed, never accepted for what it now
+/// says: an equivalent change (one message digit) that the parsers would accept, and a malformed one (a NUL byte
+/// in a row) that they would refuse, which must still be reported as the integrity failure, because the digest
+/// is taken over the very bytes the parsers consume and a parser fault is held until the file is drained and
+/// verified. The control reads the same reflog unchanged and succeeds, so the rows differ only by the change.
+#[test]
+fn b2b_a_ref_file_that_changes_while_it_is_parsed_is_refused_as_changed() {
+    use std::os::unix::fs::FileExt as _;
+    for cformat in BOTH_CAPSULE_FORMATS_V1 {
+        let capsule = captured(cformat);
+        let format = core_format(cformat);
+        let specs = real_specs(&capsule, format);
+        let (log, row_length) = big_reflog(&specs.commit, format, 400);
+        assert!(
+            log.len() > 3 * 8192,
+            "the reflog spans several parser buffers"
+        );
+        // A byte of a message number deep in the unread part: the tens digit of row 340.
+        let at = (340 * row_length + row_length - 3) as u64;
+        let logs = specs
+            .logs
+            .clone()
+            .without("logs/HEAD")
+            .file("logs/HEAD", &log);
+
+        let build = || {
+            MetaCaseV1::with_frames(
+                &capsule,
+                cformat,
+                &specs.refs,
+                Some(&logs),
+                specs.manifest_refs.clone(),
+            )
+        };
+        let mut control = build();
+        let _ = control.done(&format!("{cformat:?}: the unchanged reflog"));
+
+        type ChangeV1 = fn(&std::fs::File, u64);
+        let changes: [(&str, ChangeV1); 3] = [
+            ("an equivalent digit", |file, at| {
+                let mut byte = [0_u8; 1];
+                file.read_exact_at(&mut byte, at).expect("the digit");
+                assert!(byte[0].is_ascii_digit());
+                file.write_all_at(&[byte[0] ^ 1], at)
+                    .expect("a digit changed");
+            }),
+            ("a NUL byte", |file, at| {
+                file.write_all_at(&[0], at).expect("a NUL written");
+            }),
+            ("an appended byte", |file, _| {
+                let end = file.metadata().expect("metadata").len();
+                file.write_all_at(b"x", end).expect("a byte appended");
+            }),
+        ];
+        for (change_row, change) in changes {
+            let row = format!("{cformat:?}: {change_row} in the unread part of a reflog");
+            let mut case = build();
+            let target = case.meta("logs/HEAD");
+            let reads = std::rc::Rc::new(std::cell::Cell::new(0_usize));
+            let seen = reads.clone();
+            let acting = target.clone();
+            let _hook = install_git_hook_for_test(GitHookPointV1::AfterRefsRead, move |event| {
+                if event.path == acting {
+                    seen.set(seen.get() + 1);
+                    // After the FIRST read of the file, before anything past it has been read.
+                    if seen.get() == 1 {
+                        let file = std::fs::OpenOptions::new()
+                            .write(true)
+                            .read(true)
+                            .open(&acting)
+                            .expect("the racer opens the reflog");
+                        change(&file, at);
+                    }
+                }
+            });
+            let failure = case.refused(&row);
+            assert!(
+                matches!(&failure.cause, GitBootstrapErrorV1::MetadataCopy { relative, .. }
+                    if relative == "logs/HEAD"),
+                "{row}: {:?}",
+                failure.cause
+            );
+            assert!(reads.get() > 1, "{row}: the file was read in several calls");
+            assert_eq!(
+                failure.last_completed,
+                Some(GitPlaneStepV1::Metadata),
+                "{row}"
+            );
+            assert!(!exists(&case.meta("config")), "{row}: no config");
+            assert_eq!(
+                failure.partial.charged.entries, 12,
+                "{row}: every frame entry was restored, and no config"
+            );
+        }
+    }
+}
+
+/// The drain that follows a held ref fault reads the one absolute deadline before EVERY read: a malformed row early
+/// in a large reflog stops the parsers after the first buffer, the rest of the file is drained for its digest, and
+/// a read of the drain that returns after the deadline is followed by no further read of that file.
+#[test]
+fn b2b_the_drain_after_a_held_ref_fault_never_reads_past_the_deadline() {
+    use std::os::unix::fs::FileExt as _;
+    let cformat = CustodyGitObjectFormatV1::Sha1;
+    let capsule = captured(cformat);
+    let format = core_format(cformat);
+    let specs = real_specs(&capsule, format);
+    let (log, _row_length) = big_reflog(&specs.commit, format, 400);
+    // A NUL in the second buffer: the parsers refuse inside it, with most of the file unread.
+    let logs = specs
+        .logs
+        .clone()
+        .without("logs/HEAD")
+        .file("logs/HEAD", &log);
+    let mut case = MetaCaseV1::with_frames(
+        &capsule,
+        cformat,
+        &specs.refs,
+        Some(&logs),
+        specs.manifest_refs.clone(),
+    );
+    let target = case.meta("logs/HEAD");
+    let deadline = Instant::now() + B2B_SPENT_DEADLINE_V1;
+    let reads = std::rc::Rc::new(std::cell::Cell::new(0_usize));
+    let seen = reads.clone();
+    let acting = target.clone();
+    let _hook = install_git_hook_for_test(GitHookPointV1::AfterRefsRead, move |event| {
+        if event.path != acting {
+            return;
+        }
+        seen.set(seen.get() + 1);
+        match seen.get() {
+            // After the first read: a row in the part not yet read is changed in place to a malformed one.
+            1 => {
+                let file = std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(&acting)
+                    .expect("the racer opens the reflog");
+                file.write_all_at(&[0], 10_000).expect("a NUL written");
+            }
+            // The parsers refused inside the second read's buffer, so the third read is the drain's first: it
+            // returns after the deadline.
+            3 => pass_the_deadline(deadline),
+            _ => {}
+        }
+    });
+    let failure = timed_out_metadata("a drain read past the deadline", case.attempt_by(deadline));
+    assert_eq!(
+        reads.get(),
+        3,
+        "no read of the file follows the one that returned after the deadline"
+    );
+    assert_eq!(failure.last_completed, Some(GitPlaneStepV1::Metadata));
+    assert!(!exists(&case.meta("config")));
+}
+
+// ---------------------------------------------------------------------------------------------
+// Preexisting names are collisions, never reused, and the ledger is released only for what was never created
+// ---------------------------------------------------------------------------------------------
+
+/// The destination-relative creates of a clean run in order: `(path beneath .git, is a file)`.
+fn creation_order(
+    capsule: &CustomCapsuleV1,
+    cformat: CustodyGitObjectFormatV1,
+) -> Vec<(String, bool)> {
+    let mut case = MetaCaseV1::of(capsule, cformat);
+    let git = case.git();
+    let events = std::rc::Rc::new(std::cell::RefCell::new(Vec::<(String, bool)>::new()));
+    let log = events.clone();
+    let _hook = install_git_hook_for_test(GitHookPointV1::BeforeObjectCreate, move |event| {
+        let relative = event.path.strip_prefix(&git).expect("beneath .git");
+        log.borrow_mut()
+            .push((relative.display().to_string(), event.label == "file"));
+    });
+    let _ = case.done("a clean run");
+    let order = events.borrow().clone();
+    order
+}
+
+/// A preplanted file, empty directory, or symlink at each entry the step creates (every directory and file
+/// of both frames, and the config) is a collision: the planted entry is left exactly as it was and nothing
+/// is written through it or beneath it, the entry that was never created is given back to the ledger and
+/// nothing else is, the facts name exactly what this invocation created before it, and a planted entry is
+/// never reused as a directory.
+#[test]
+fn b2b_preexisting_names_are_collisions_and_stay_unchanged() {
+    let capsule = captured(CustodyGitObjectFormatV1::Sha1);
+    let order = creation_order(&capsule, CustodyGitObjectFormatV1::Sha1);
+    assert_eq!(
+        order.len(),
+        13,
+        "twelve frame entries and the config: {order:?}"
+    );
+    assert_eq!(order.last(), Some(&("config".to_owned(), true)));
+    for (index, (slot, _)) in order.iter().enumerate() {
+        for kind in [
+            PlantV1::RegularFile,
+            PlantV1::EmptyDirectory,
+            PlantV1::Symlink,
+        ] {
+            let row = format!("{slot} {kind:?}");
+            let mut case = MetaCaseV1::of(&capsule, CustodyGitObjectFormatV1::Sha1);
+            let (_outside_area, outside) = external_dir_with(&["decoy"]);
+            let outside_before = snapshot(&outside);
+            let target = case.meta(slot);
+            let planted = std::rc::Rc::new(std::cell::Cell::new(false));
+            let (hooked, at, away) = (planted.clone(), target.clone(), outside.clone());
+            let _hook =
+                install_git_hook_for_test(GitHookPointV1::BeforeObjectCreate, move |event| {
+                    if event.path == at && !hooked.replace(true) {
+                        plant(&at, kind, &away);
+                    }
+                });
+            let failure = case.refused(&row);
+            assert!(planted.get(), "{row}: the plant never ran");
+            let full = format!("repository/.git/{slot}");
+            assert!(
+                matches!(&failure.cause,
+                    GitBootstrapErrorV1::Restore(CustodyRestoreErrorV1::StagingCollision { name })
+                        if *name == full),
+                "{row}: {:?}",
+                failure.cause
+            );
+            // What came before it was created and charged; it and everything after it was not.
+            let before = &order[..index];
+            let files_before = before.iter().filter(|(_, file)| *file).count();
+            assert_eq!(failure.active_materialization_began, index > 0, "{row}");
+            assert_eq!(
+                failure.partial.directories.len(),
+                before.len() - files_before,
+                "{row}"
+            );
+            assert_eq!(failure.partial.files.len(), files_before, "{row}");
+            assert!(failure.partial.in_flight.is_none(), "{row}");
+            assert_eq!(failure.partial.charged.entries, index as u64, "{row}");
+            let want_bytes: u64 = failure.partial.files.iter().map(|file| file.length).sum();
+            assert_eq!(failure.partial.charged.bytes, want_bytes, "{row}");
+            // The completed step is the caller's, or Refs when only the config collided.
+            let want_step = if slot == "config" {
+                Some(GitPlaneStepV1::Refs)
+            } else {
+                B2B_COMPLETED_V1
+            };
+            assert_eq!(failure.last_completed, want_step, "{row}");
+            for (earlier, _) in before {
+                assert!(
+                    exists(&case.meta(earlier)),
+                    "{row}: {earlier} was created before"
+                );
+            }
+            for (later, _) in &order[index + 1..] {
+                assert!(
+                    !exists(&case.meta(later)),
+                    "{row}: {later} was created after"
+                );
+            }
+            let on_disk = case.metadata_on_disk();
+            assert_eq!(
+                on_disk.len(),
+                index + 1,
+                "{row}: the earlier entries and the planted one"
+            );
+            match kind {
+                PlantV1::RegularFile => {
+                    assert_eq!(
+                        std::fs::read(&target).expect("planted"),
+                        b"planted",
+                        "{row}"
+                    );
+                }
+                PlantV1::EmptyDirectory => {
+                    assert!(
+                        listing(&target).is_empty(),
+                        "{row}: something was written inside"
+                    );
+                }
+                PlantV1::Symlink => {
+                    assert_eq!(
+                        std::fs::read_link(&target).expect("a link"),
+                        outside,
+                        "{row}"
+                    );
+                    assert_eq!(snapshot(&outside), outside_before, "{row}: written through");
+                }
+            }
+        }
+    }
+}
+
+/// A refused invocation leaves every created byte, and a second invocation over the same retained value
+/// (after a success, and after a partial failure) refuses at its FIRST entry as a collision: it overwrites
+/// nothing, begins nothing, and its own reservation is given back.
+#[test]
+fn b2b_a_second_invocation_refuses_and_cannot_overwrite_the_first_partial_state() {
+    let capsule = captured(CustodyGitObjectFormatV1::Sha1);
+    let order = creation_order(&capsule, CustodyGitObjectFormatV1::Sha1);
+    let first_name = format!("repository/.git/{}", order[0].0);
+
+    // After a success.
+    let mut case = MetaCaseV1::of(&capsule, CustodyGitObjectFormatV1::Sha1);
+    let _ = case.done("the first invocation");
+    let after_first = snapshot(&case.dest().path);
+    let ledger = case.ledger();
+    let failure = case.refused("the second invocation");
+    assert!(
+        matches!(&failure.cause,
+            GitBootstrapErrorV1::Restore(CustodyRestoreErrorV1::StagingCollision { name })
+                if *name == first_name),
+        "{:?}",
+        failure.cause
+    );
+    assert!(!failure.active_materialization_began, "it created nothing");
+    assert_eq!(failure.partial.charged, none_charged());
+    assert_eq!(case.ledger(), ledger, "the second reservation was released");
+    assert_eq!(snapshot(&case.dest().path), after_first, "byte-identical");
+
+    // After a partial failure: the third entry was refused on its device after it was created.
+    let mut case = MetaCaseV1::of(&capsule, CustodyGitObjectFormatV1::Sha1);
+    let third = format!("repository/.git/{}", order[2].0);
+    let _device = override_created_dev_for_test(&third, device_of(&case.dest().path) + 1);
+    let first = case.refused("the first invocation");
+    assert!(
+        matches!(
+            first.cause,
+            GitBootstrapErrorV1::Restore(CustodyRestoreErrorV1::DeviceCrossing { .. })
+        ),
+        "{:?}",
+        first.cause
+    );
+    assert!(first.active_materialization_began);
+    let after_first = snapshot(&case.dest().path);
+    let ledger = case.ledger();
+    let second = case.refused("the second invocation");
+    assert!(
+        matches!(&second.cause,
+            GitBootstrapErrorV1::Restore(CustodyRestoreErrorV1::StagingCollision { name })
+                if *name == first_name),
+        "{:?}",
+        second.cause
+    );
+    assert!(!second.active_materialization_began);
+    assert_eq!(case.ledger(), ledger);
+    assert_eq!(
+        snapshot(&case.dest().path),
+        after_first,
+        "the partial state is byte-identical"
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// Every original ref is cross-checked over the retained FINAL descriptors, before any config exists
+// ---------------------------------------------------------------------------------------------
+
+type RefsCheckV1 = fn(&RefsFaultV1) -> bool;
+type RefsEditV1 = fn(&CustomCapsuleV1, &mut RealSpecsV1);
+type RefsRowV1 = (&'static str, RefsEditV1, RefsCheckV1);
+
+/// A refusal of the ref agreement leaves the whole metadata restored and no config: every frame entry exists
+/// byte for byte, the last completed step is `Metadata`, and the facts are the disk.
+fn assert_refs_refusal(row: &str, case: &MetaCaseV1, failure: &MetadataFailureV1) {
+    assert_eq!(
+        failure.last_completed,
+        Some(GitPlaneStepV1::Metadata),
+        "{row}"
+    );
+    assert!(failure.active_materialization_began, "{row}");
+    assert!(!exists(&case.meta("config")), "{row}: no config");
+    assert_eq!(
+        case.metadata_on_disk(),
+        case.expected_frames(),
+        "{row}: every frame entry is restored and nothing else"
+    );
+    assert!(failure.partial.in_flight.is_none(), "{row}");
+    assert_metadata_partial_is_the_disk(row, case, failure, 0);
+}
+
+fn refs_fault_of(row: &str, failure: &MetadataFailureV1) -> RefsFaultV1 {
+    match &failure.cause {
+        GitBootstrapErrorV1::Refs(fault) => fault.clone(),
+        other => panic!("{row}: {other:?}"),
+    }
+}
+
+fn absent_like(oid: &str) -> String {
+    "f".repeat(oid.len())
+}
+
+/// Frames whose files are well formed bytes but whose refs are wrong (so pass B1a, which judges names and
+/// types only, admitted them) are refused by the agreement over the restored files, in both formats: an
+/// object absent from the inventory, a wrong kind, every malformed loose row, a dangling or cyclic or too
+/// deep symbolic chain, every malformed packed row, reflog, and FETCH_HEAD row, a bad ref name, and a
+/// packed ref that conflicts with a loose one. Each leaves every frame entry restored, no config, and the
+/// step `Metadata` completed.
+#[test]
+fn b2b_the_restored_files_are_agreed_with_the_manifest_and_a_bad_ref_stops_before_the_config() {
+    let rows: Vec<RefsRowV1> = vec![
+        (
+            "a ref naming an object absent from the inventory",
+            |_, specs| {
+                specs.refs = specs.refs.clone().file(
+                    "refs/heads/ghost",
+                    format!("{}\n", absent_like(&specs.commit)),
+                );
+            },
+            |fault| matches!(fault, RefsFaultV1::TargetAbsent { name, .. } if name == "refs/heads/ghost"),
+        ),
+        (
+            "a branch naming a tree",
+            |capsule, specs| {
+                let tree = real_object(capsule, KindV1::Tree);
+                specs.refs = specs
+                    .refs
+                    .clone()
+                    .file("refs/heads/tree", format!("{}\n", tree.object_id()));
+            },
+            |fault| matches!(fault, RefsFaultV1::TargetKind { name, expected: "commit", found: "tree", .. } if name == "refs/heads/tree"),
+        ),
+        (
+            "a malformed loose row",
+            |_, specs| specs.refs = specs.refs.clone().file("refs/heads/bad", "garbage\n"),
+            |fault| matches!(fault, RefsFaultV1::Row { why: RowFaultV1::ObjectId, path } if path == "refs/heads/bad"),
+        ),
+        (
+            "an empty loose file",
+            |_, specs| specs.refs = specs.refs.clone().file("refs/heads/empty", ""),
+            |fault| {
+                matches!(
+                    fault,
+                    RefsFaultV1::Row {
+                        why: RowFaultV1::EmptyFile,
+                        ..
+                    }
+                )
+            },
+        ),
+        (
+            "a CRLF loose row",
+            |_, specs| {
+                specs.refs = specs
+                    .refs
+                    .clone()
+                    .file("refs/heads/crlf", format!("{}\r\n", specs.commit));
+            },
+            |fault| {
+                matches!(
+                    fault,
+                    RefsFaultV1::Row {
+                        why: RowFaultV1::ObjectId,
+                        ..
+                    }
+                )
+            },
+        ),
+        (
+            "two lines in a loose file",
+            |_, specs| {
+                specs.refs = specs
+                    .refs
+                    .clone()
+                    .file("refs/heads/two", format!("{0}\n{0}\n", specs.commit));
+            },
+            |fault| {
+                matches!(
+                    fault,
+                    RefsFaultV1::Row {
+                        why: RowFaultV1::ExtraLine,
+                        ..
+                    }
+                )
+            },
+        ),
+        (
+            "a loose file without its final line feed",
+            |_, specs| {
+                specs.refs = specs
+                    .refs
+                    .clone()
+                    .file("refs/heads/open", specs.commit.clone());
+            },
+            |fault| {
+                matches!(
+                    fault,
+                    RefsFaultV1::Row {
+                        why: RowFaultV1::PartialLine,
+                        ..
+                    }
+                )
+            },
+        ),
+        (
+            "a dangling symbolic ref",
+            |_, specs| {
+                specs.refs = specs
+                    .refs
+                    .clone()
+                    .file("refs/heads/dang", "ref: refs/heads/nowhere\n");
+            },
+            |fault| matches!(fault, RefsFaultV1::Dangling { name, target } if name == "refs/heads/dang" && target == "refs/heads/nowhere"),
+        ),
+        (
+            "a symbolic cycle",
+            |_, specs| {
+                specs.refs = specs
+                    .refs
+                    .clone()
+                    .file("refs/heads/a", "ref: refs/heads/b\n")
+                    .file("refs/heads/b", "ref: refs/heads/a\n");
+            },
+            |fault| matches!(fault, RefsFaultV1::Cycle { .. }),
+        ),
+        (
+            "a symbolic chain of six refs from HEAD",
+            |_, specs| {
+                let mut refs = specs
+                    .refs
+                    .clone()
+                    .without("HEAD")
+                    .file("HEAD", "ref: refs/heads/s1\n");
+                for index in 1..6 {
+                    let target = if index == 5 {
+                        "refs/heads/main".to_owned()
+                    } else {
+                        format!("refs/heads/s{}", index + 1)
+                    };
+                    refs = refs.file(&format!("refs/heads/s{index}"), format!("ref: {target}\n"));
+                }
+                specs.refs = refs;
+            },
+            |fault| matches!(fault, RefsFaultV1::TooDeep { name } if name == "HEAD"),
+        ),
+        (
+            "HEAD naming something that is not a ref",
+            |_, specs| {
+                specs.refs = specs
+                    .refs
+                    .clone()
+                    .without("HEAD")
+                    .file("HEAD", "ref: elsewhere/x\n");
+            },
+            |fault| matches!(fault, RefsFaultV1::Row { why: RowFaultV1::SymbolicTarget(_), path } if path == "HEAD"),
+        ),
+        (
+            "ORIG_HEAD naming a branch symbolically",
+            |_, specs| {
+                specs.refs = specs
+                    .refs
+                    .clone()
+                    .without("ORIG_HEAD")
+                    .file("ORIG_HEAD", "ref: refs/heads/main\n");
+            },
+            |fault| matches!(fault, RefsFaultV1::Row { why: RowFaultV1::ObjectId, path } if path == "ORIG_HEAD"),
+        ),
+        (
+            "a loose ref named like a lock file",
+            |_, specs| {
+                specs.refs = specs
+                    .refs
+                    .clone()
+                    .file("refs/heads/main.lock", format!("{}\n", specs.commit));
+            },
+            |fault| {
+                matches!(
+                    fault,
+                    RefsFaultV1::RefName {
+                        why: RefNameFaultV1::LockSuffix,
+                        ..
+                    }
+                )
+            },
+        ),
+        (
+            "a packed row with a peeled row but no ref before it",
+            |_, specs| {
+                specs.refs = specs.refs.clone().without("packed-refs").file(
+                    "packed-refs",
+                    format!("{PACKED_HEADER_V1}^{}\n", specs.commit),
+                );
+            },
+            |fault| {
+                matches!(
+                    fault,
+                    RefsFaultV1::Row {
+                        why: RowFaultV1::PeeledOrphan,
+                        ..
+                    }
+                )
+            },
+        ),
+        (
+            "a malformed packed-refs header",
+            |_, specs| {
+                specs.refs = specs
+                    .refs
+                    .clone()
+                    .without("packed-refs")
+                    .file("packed-refs", "# pack-refs with: unknown \n");
+            },
+            |fault| {
+                matches!(
+                    fault,
+                    RefsFaultV1::Row {
+                        why: RowFaultV1::PackedHeader,
+                        ..
+                    }
+                )
+            },
+        ),
+        (
+            "packed rows out of order under the sorted trait",
+            |_, specs| {
+                specs.refs = specs.refs.clone().without("packed-refs").file(
+                    "packed-refs",
+                    format!(
+                        "{PACKED_HEADER_V1}{0} refs/heads/z\n{0} refs/heads/a\n",
+                        specs.commit
+                    ),
+                );
+            },
+            |fault| {
+                matches!(
+                    fault,
+                    RefsFaultV1::Row {
+                        why: RowFaultV1::PackedOrder,
+                        ..
+                    }
+                )
+            },
+        ),
+        (
+            "a peeled row after a commit",
+            |_, specs| {
+                specs.refs = specs.refs.clone().without("packed-refs").file(
+                    "packed-refs",
+                    format!("{PACKED_HEADER_V1}{0} refs/heads/a\n^{0}\n", specs.commit),
+                );
+            },
+            |fault| matches!(fault, RefsFaultV1::PeeledNotTag { name } if name == "refs/heads/a"),
+        ),
+        (
+            "a tag with no peeled row under the fully-peeled trait",
+            |_, specs| {
+                specs.refs = specs.refs.clone().without("packed-refs").file(
+                    "packed-refs",
+                    format!("{PACKED_HEADER_V1}{} refs/tags/v1\n", specs.tag),
+                );
+            },
+            |fault| matches!(fault, RefsFaultV1::PeelMissing { name } if name == "refs/tags/v1"),
+        ),
+        (
+            "a packed ref under a loose one",
+            |_, specs| {
+                specs.refs = specs
+                    .refs
+                    .clone()
+                    .without("packed-refs")
+                    .file(
+                        "packed-refs",
+                        format!("{PACKED_HEADER_V1}{} refs/tags/x/y\n", specs.commit),
+                    )
+                    .file("refs/tags/x", format!("{}\n", specs.commit));
+            },
+            |fault| matches!(fault, RefsFaultV1::Conflict { .. }),
+        ),
+        (
+            "a malformed reflog row",
+            |_, specs| {
+                specs.logs = specs
+                    .logs
+                    .clone()
+                    .without("logs/HEAD")
+                    .file("logs/HEAD", "not a reflog row\n");
+            },
+            |fault| matches!(fault, RefsFaultV1::Row { why: RowFaultV1::LogRow, path } if path == "logs/HEAD"),
+        ),
+        (
+            "a malformed FETCH_HEAD row",
+            |_, specs| specs.refs = specs.refs.clone().file("FETCH_HEAD", "not a row\n"),
+            |fault| {
+                matches!(
+                    fault,
+                    RefsFaultV1::Row {
+                        why: RowFaultV1::FetchHeadRow,
+                        ..
+                    }
+                )
+            },
+        ),
+        (
+            "a file under logs that is no reflog",
+            |_, specs| specs.logs = specs.logs.clone().file("logs/stray", "x\n"),
+            |fault| matches!(fault, RefsFaultV1::UnexpectedFile { path } if path == "logs/stray"),
+        ),
+    ];
+    for cformat in BOTH_CAPSULE_FORMATS_V1 {
+        let capsule = captured(cformat);
+        let format = core_format(cformat);
+        for (row, edit, check) in &rows {
+            let row = format!("{cformat:?}: {row}");
+            let mut specs = real_specs(&capsule, format);
+            edit(&capsule, &mut specs);
+            let mut case = MetaCaseV1::with_frames(
+                &capsule,
+                cformat,
+                &specs.refs,
+                Some(&specs.logs),
+                specs.manifest_refs.clone(),
+            );
+            let failure = case.refused(&row);
+            let fault = refs_fault_of(&row, &failure);
+            assert!(check(&fault), "{row}: {fault:?}");
+            assert_refs_refusal(&row, &case, &failure);
+        }
+    }
+}
+
+/// The agreement also checks every ORIGINAL ref against the restored state: with the frames themselves fine,
+/// a manifest that lists a ref that was not restored, a different target, a different symbolic target, an
+/// unborn ref that exists, or a name that is no ref name is refused after the metadata is restored and before
+/// any config exists.
+#[test]
+fn b2b_every_original_ref_is_cross_checked_by_name_and_target() {
+    type EditV1 = fn(&CustomCapsuleV1, &RealSpecsV1) -> Vec<CustodyOriginalRefV1>;
+    let rows: Vec<(&str, EditV1, RefsCheckV1)> = vec![
+        (
+            "an original ref that was not restored",
+            |capsule, specs| {
+                let mut refs = specs.manifest_refs.clone();
+                refs.push(direct_ref(
+                    "refs/heads/ghost",
+                    &real_object(capsule, KindV1::Commit),
+                ));
+                refs
+            },
+            |fault| matches!(fault, RefsFaultV1::MissingOriginal { name } if name == "refs/heads/ghost"),
+        ),
+        (
+            "an original ref with another direct target",
+            |capsule, specs| {
+                let mut refs = specs.manifest_refs.clone();
+                refs.retain(|record| record.name().as_bytes() != b"refs/heads/main");
+                refs.push(direct_ref(
+                    "refs/heads/main",
+                    &real_object(capsule, KindV1::Tree),
+                ));
+                refs
+            },
+            |fault| matches!(fault, RefsFaultV1::OriginalMismatch { name, .. } if name == "refs/heads/main"),
+        ),
+        (
+            "an original HEAD with another symbolic target",
+            |_, specs| {
+                let mut refs = specs.manifest_refs.clone();
+                refs[0] = symbolic_ref("HEAD", "refs/heads/other");
+                refs
+            },
+            |fault| matches!(fault, RefsFaultV1::OriginalMismatch { name, .. } if name == "HEAD"),
+        ),
+        (
+            "an original unborn ref that exists",
+            |_, specs| {
+                let mut refs = specs.manifest_refs.clone();
+                refs.retain(|record| record.name().as_bytes() != b"refs/heads/main");
+                refs.push(
+                    CustodyOriginalRefV1::new(
+                        LosslessPathV1::from_bytes(b"refs/heads/main".to_vec()),
+                        CustodyRefTargetV1::Unborn,
+                    )
+                    .expect("an unborn ref"),
+                );
+                refs
+            },
+            |fault| matches!(fault, RefsFaultV1::OriginalMismatch { name, .. } if name == "refs/heads/main"),
+        ),
+        (
+            "an original ref that is not a ref name",
+            |capsule, specs| {
+                let mut refs = specs.manifest_refs.clone();
+                refs.push(direct_ref(
+                    "refs/heads/a..b",
+                    &real_object(capsule, KindV1::Commit),
+                ));
+                refs
+            },
+            |fault| {
+                matches!(
+                    fault,
+                    RefsFaultV1::ManifestName {
+                        why: RefNameFaultV1::DoubleDot,
+                        ..
+                    }
+                )
+            },
+        ),
+        (
+            "an original symbolic ref with an invalid target",
+            |_, specs| {
+                let mut refs = specs.manifest_refs.clone();
+                refs.push(symbolic_ref("refs/heads/link", "not-under-refs"));
+                refs
+            },
+            |fault| matches!(fault, RefsFaultV1::ManifestTarget { .. }),
+        ),
+        (
+            "an original ORIG_HEAD that is not the restored one",
+            |capsule, specs| {
+                let mut refs = specs.manifest_refs.clone();
+                refs.retain(|record| record.name().as_bytes() != b"ORIG_HEAD");
+                refs.push(direct_ref("ORIG_HEAD", &real_object(capsule, KindV1::Tree)));
+                refs
+            },
+            |fault| matches!(fault, RefsFaultV1::OriginalMismatch { name, .. } if name == "ORIG_HEAD"),
+        ),
+    ];
+    for cformat in BOTH_CAPSULE_FORMATS_V1 {
+        let capsule = captured(cformat);
+        let format = core_format(cformat);
+        for (row, edit, check) in &rows {
+            let row = format!("{cformat:?}: {row}");
+            let specs = real_specs(&capsule, format);
+            let mut case = MetaCaseV1::with_frames(
+                &capsule,
+                cformat,
+                &specs.refs,
+                Some(&specs.logs),
+                specs.manifest_refs.clone(),
+            );
+            // The frames were prevalidated and copied; the manifest the agreement judges is changed after.
+            let refs = edit(&capsule, &specs);
+            set_refs(&mut case.store.boot.verified, refs);
+            let failure = case.refused(&row);
+            let fault = refs_fault_of(&row, &failure);
+            assert!(check(&fault), "{row}: {fault:?}");
+            assert_refs_refusal(&row, &case, &failure);
+        }
+    }
+}
+
+/// The limits of the refs agreement apply to the retained final descriptors, not only to byte slices: a
+/// loose-file cap, an entry cap, and a line cap each refuse through the real descriptors, after the metadata
+/// is restored and before any config.
+#[test]
+fn b2b_the_ref_limits_apply_through_the_retained_final_descriptors() {
+    let capsule = captured(CustodyGitObjectFormatV1::Sha1);
+    let rows: Vec<(&str, RefsLimitsV1, RefsCheckV1)> = vec![
+        (
+            "a loose file cap below HEAD's length",
+            RefsLimitsV1 {
+                loose_file_bytes: 10,
+                ..RefsLimitsV1::v1()
+            },
+            |fault| {
+                matches!(
+                    fault,
+                    RefsFaultV1::Limit {
+                        what: RefsLimitKindV1::LooseFile,
+                        bound: 10
+                    }
+                )
+            },
+        ),
+        (
+            "a line cap below the packed rows",
+            RefsLimitsV1 {
+                line_bytes: 20,
+                ..RefsLimitsV1::v1()
+            },
+            |fault| {
+                matches!(
+                    fault,
+                    RefsFaultV1::Limit {
+                        what: RefsLimitKindV1::Line,
+                        bound: 20
+                    }
+                )
+            },
+        ),
+        (
+            "an entry cap below the restored refs",
+            RefsLimitsV1 {
+                entries: 2,
+                ..RefsLimitsV1::v1()
+            },
+            |fault| {
+                matches!(
+                    fault,
+                    RefsFaultV1::Limit {
+                        what: RefsLimitKindV1::Entries,
+                        bound: 2
+                    }
+                )
+            },
+        ),
+        (
+            "a retained-bytes cap below the restored refs",
+            RefsLimitsV1 {
+                retained_bytes: 100,
+                ..RefsLimitsV1::v1()
+            },
+            |fault| {
+                matches!(
+                    fault,
+                    RefsFaultV1::Limit {
+                        what: RefsLimitKindV1::Retained,
+                        bound: 100
+                    }
+                )
+            },
+        ),
+    ];
+    for (row, limits, check) in rows {
+        let mut case = MetaCaseV1::of(&capsule, CustodyGitObjectFormatV1::Sha1);
+        let failure =
+            match case.attempt_with(far_deadline(), B2B_COMPLETED_V1, B2B_TABLE_BOUND_V1, limits) {
+                Ok(_) => panic!("{row}: must refuse"),
+                Err(failure) => failure,
+            };
+        let fault = refs_fault_of(row, &failure);
+        assert!(check(&fault), "{row}: {fault:?}");
+        assert_refs_refusal(row, &case, &failure);
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// The agreement reads the retained descriptors: integrity outranks content, and a swapped name is never read
+// ---------------------------------------------------------------------------------------------
+
+/// The one clock label the agreement begins with: the swaps below happen right after it, before the recheck
+/// that precedes the first read.
+const REFS_BEGIN_V1: &str = "metadata-refs";
+
+/// A restored file changed in place between its write and the agreement (the same inode and the same length)
+/// is refused as THAT, whatever it now says: a valid but different object id that would otherwise be an
+/// ordinary ref refusal, and bytes that are no ref at all. The retained descriptor's digest is the
+/// integrity guard, and it outranks the parsers.
+#[test]
+fn b2b_a_file_changed_in_place_is_refused_as_changed_before_anything_it_says() {
+    use std::os::unix::fs::FileExt as _;
+    let capsule = captured(CustodyGitObjectFormatV1::Sha1);
+    let tree = real_object(&capsule, KindV1::Tree).object_id().to_owned();
+    for (row, change) in [
+        (
+            "a valid object id of another kind",
+            Box::new(move |path: &Path, length: usize| {
+                let file = std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(path)
+                    .expect("open");
+                file.write_all_at(format!("{tree}\n").as_bytes(), 0)
+                    .expect("rewrite");
+                assert_eq!(length, 41);
+            }) as Box<dyn Fn(&Path, usize)>,
+        ),
+        (
+            "bytes that are no ref",
+            Box::new(|path: &Path, _length: usize| {
+                let file = std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(path)
+                    .expect("open");
+                file.write_all_at(b"zzzzzzzz", 0).expect("rewrite");
+            }),
+        ),
+    ] {
+        let mut case = MetaCaseV1::of(&capsule, CustodyGitObjectFormatV1::Sha1);
+        let target = case.meta("ORIG_HEAD");
+        // The frames' own bytes, by the test's decode: nothing is restored yet.
+        let length = case.expected_frames()["ORIG_HEAD"]
+            .as_ref()
+            .expect("ORIG_HEAD is a file")
+            .len();
+        let changing = target.clone();
+        let acted = std::cell::Cell::new(false);
+        let _hook = install_git_hook_for_test(GitHookPointV1::DeadlineObserved, move |event| {
+            if event.label == REFS_BEGIN_V1 && !acted.replace(true) {
+                change(&changing, length);
+            }
+        });
+        let failure = case.refused(row);
+        assert!(
+            matches!(&failure.cause, GitBootstrapErrorV1::MetadataCopy { relative, .. }
+                if relative == "ORIG_HEAD"),
+            "{row}: {:?}",
+            failure.cause
+        );
+        assert_eq!(
+            failure.last_completed,
+            Some(GitPlaneStepV1::Metadata),
+            "{row}"
+        );
+        assert!(!exists(&case.meta("config")), "{row}");
+    }
+}
+
+/// A restored file whose NAME is swapped (for a link to a copy of the very same bytes, for another inode
+/// holding them, or for nothing) is refused by the recheck that precedes the agreement's first read: the
+/// replacement is never opened or read, and nothing outside is touched. Every refusal leaves the
+/// metadata restored, no config, and the step `Metadata` completed.
+#[test]
+fn b2b_a_restored_file_swapped_before_the_agreement_is_never_read_by_name() {
+    let capsule = captured(CustodyGitObjectFormatV1::Sha1);
+    for action in ["a link to a copy of the bytes", "a new inode", "moved away"] {
+        let mut case = MetaCaseV1::of(&capsule, CustodyGitObjectFormatV1::Sha1);
+        let target = case.meta("refs/heads/main");
+        let original = case.expected_frames()["refs/heads/main"]
+            .clone()
+            .expect("the loose ref is a file");
+        let (_outside_area, outside) = external_dir_with(&["decoy"]);
+        let outside_before = snapshot(&outside);
+        let copy = outside.join("copy");
+        let acting = target.clone();
+        let acted = std::cell::Cell::new(false);
+        let _hook = install_git_hook_for_test(GitHookPointV1::DeadlineObserved, move |event| {
+            if event.label != REFS_BEGIN_V1 || acted.replace(true) {
+                return;
+            }
+            match action {
+                "a link to a copy of the bytes" => {
+                    std::fs::write(&copy, &original).expect("a copy elsewhere");
+                    move_away(&acting, "main.moved");
+                    std::os::unix::fs::symlink(&copy, &acting).expect("a link in its place");
+                }
+                "a new inode" => {
+                    move_away(&acting, "main.moved");
+                    std::fs::write(&acting, &original).expect("the same bytes, a new inode");
+                }
+                _ => move_away(&acting, "main.moved"),
+            }
+        });
+        let failure = case.refused(action);
+        let accepted = match action {
+            "a link to a copy of the bytes" => matches!(
+                failure.cause,
+                GitBootstrapErrorV1::Restore(CustodyRestoreErrorV1::SymlinkRefused { .. })
+            ),
+            _ => identity_changed(&failure.cause),
+        };
+        assert!(accepted, "{action}: {:?}", failure.cause);
+        assert_eq!(
+            failure.last_completed,
+            Some(GitPlaneStepV1::Metadata),
+            "{action}"
+        );
+        assert!(!exists(&case.meta("config")), "{action}");
+        let outside_after = snapshot(&outside);
+        assert_eq!(
+            outside_after.keys().collect::<Vec<_>>(),
+            if action == "a link to a copy of the bytes" {
+                vec!["copy", "decoy"]
+            } else {
+                vec!["decoy"]
+            },
+            "{action}: nothing was created outside"
+        );
+        assert_eq!(
+            outside_after.get("decoy"),
+            outside_before.get("decoy"),
+            "{action}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Late swaps: every retained chain is rechecked around each entry
+// ---------------------------------------------------------------------------------------------
+
+/// The destination's interesting paths for a swap row, owned so a `'static` hook can carry them.
+#[derive(Clone)]
+struct MetaPathsV1 {
+    root: PathBuf,
+    git: PathBuf,
+    work: PathBuf,
+    bootstrap: PathBuf,
+}
+
+impl MetaPathsV1 {
+    fn of(case: &MetaCaseV1) -> Self {
+        Self {
+            root: case.dest().path.clone(),
+            git: case.git(),
+            work: case.dest().work(),
+            bootstrap: case.dest().bootstrap(),
+        }
+    }
+}
+
+/// One swap, by what it does to the destination's paths and an outside directory a link may name.
+struct MetaSwapV1 {
+    row: &'static str,
+    swap: fn(&MetaPathsV1, &Path),
+    /// Entries under `repository*` that the swap itself plants (a replacement directory or link).
+    planted: usize,
+    /// The swap is on the chain of only the slots beneath this metadata directory, if one is named.
+    under: Option<&'static str>,
+}
+
+fn swap_rows() -> Vec<MetaSwapV1> {
+    vec![
+        MetaSwapV1 {
+            row: "`.git` replaced by a directory",
+            swap: |paths, _| {
+                move_away(&paths.git, ".git-away");
+                std::fs::create_dir(&paths.git).expect("a new directory takes the name");
+            },
+            planted: 1,
+            under: None,
+        },
+        MetaSwapV1 {
+            row: "`.git` replaced by a link",
+            swap: |paths, outside| {
+                move_away(&paths.git, ".git-away");
+                std::os::unix::fs::symlink(outside, &paths.git).expect("a link takes the name");
+            },
+            planted: 1,
+            under: None,
+        },
+        MetaSwapV1 {
+            row: "the repository replaced by a link",
+            swap: |paths, outside| {
+                let repository = paths.git.parent().expect("the repository").to_path_buf();
+                move_away(&repository, "repository-away");
+                std::os::unix::fs::symlink(outside, &repository).expect("a link takes the name");
+            },
+            planted: 1,
+            under: None,
+        },
+        MetaSwapV1 {
+            row: "the object copy's `objects` replaced by a link",
+            swap: |paths, outside| {
+                let objects = paths.git.join("objects");
+                move_away(&objects, "objects-away");
+                std::os::unix::fs::symlink(outside, &objects).expect("a link takes the name");
+            },
+            planted: 1,
+            under: None,
+        },
+        MetaSwapV1 {
+            row: "the object copy's pack directory replaced by a directory",
+            swap: |paths, _| {
+                let pack = paths.git.join("objects/pack");
+                move_away(&pack, "pack-away");
+                std::fs::create_dir(&pack).expect("a new directory takes the name");
+            },
+            planted: 1,
+            under: None,
+        },
+        MetaSwapV1 {
+            row: "the metadata directory `refs` replaced by a link",
+            swap: |paths, outside| {
+                let refs = paths.git.join("refs");
+                move_away(&refs, "refs-away");
+                std::os::unix::fs::symlink(outside, &refs).expect("a link takes the name");
+            },
+            planted: 1,
+            under: Some("refs"),
+        },
+        MetaSwapV1 {
+            row: "the bootstrap pack directory replaced",
+            swap: |paths, _| {
+                let pack = paths.bootstrap.join("objects/pack");
+                move_away(&pack, "pack-away");
+                std::fs::create_dir(&pack).expect("a new directory takes the name");
+                for entry in std::fs::read_dir(pack.with_file_name("pack-away")).expect("the old") {
+                    let name = entry.expect("an entry").file_name();
+                    std::fs::write(pack.join(name), b"poison").expect("a poisoned file");
+                }
+            },
+            planted: 0,
+            under: None,
+        },
+        MetaSwapV1 {
+            row: "the staging directory replaced",
+            swap: |paths, _| {
+                let plain = paths.work.join("plain");
+                move_away(&plain, "plain-away");
+                std::fs::create_dir(&plain).expect("a new directory takes the name");
+            },
+            planted: 0,
+            under: None,
+        },
+        MetaSwapV1 {
+            row: "the work directory replaced",
+            swap: |paths, _| {
+                move_away(&paths.work, ".restore-work-away");
+                std::fs::create_dir(&paths.work).expect("a new directory takes the name");
+            },
+            planted: 0,
+            under: None,
+        },
+        MetaSwapV1 {
+            row: "an admitted bootstrap object file replaced by a link",
+            swap: |paths, outside| {
+                let pack = admitted_path_in(&paths.bootstrap.join("objects/pack"), "pack");
+                move_away(&pack, "admitted.moved");
+                std::os::unix::fs::symlink(outside.join("decoy"), &pack).expect("a link");
+            },
+            planted: 0,
+            under: None,
+        },
+        MetaSwapV1 {
+            row: "an admitted bootstrap object file replaced by another inode",
+            swap: |paths, _| {
+                let pack = admitted_path_in(&paths.bootstrap.join("objects/pack"), "pack");
+                let bytes = std::fs::read(&pack).expect("the admitted pack");
+                move_away(&pack, "admitted.moved");
+                std::fs::write(&pack, bytes).expect("the same bytes, a new inode");
+            },
+            planted: 0,
+            under: None,
+        },
+        MetaSwapV1 {
+            row: "an admitted bootstrap object file grown",
+            swap: |paths, _| {
+                use std::io::Write as _;
+                let pack = admitted_path_in(&paths.bootstrap.join("objects/pack"), "pack");
+                std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(&pack)
+                    .and_then(|mut file| file.write_all(b"x"))
+                    .expect("an appended byte");
+            },
+            planted: 0,
+            under: None,
+        },
+        MetaSwapV1 {
+            row: "the XDG directory replaced by a link",
+            swap: |paths, outside| {
+                let xdg = paths.work.join("xdg");
+                move_away(&xdg, "xdg-away");
+                std::os::unix::fs::symlink(outside, &xdg).expect("a link takes the name");
+            },
+            planted: 0,
+            under: None,
+        },
+    ]
+}
+
+/// [`act_at_guard`] that also records every guard read after the action ran (the hook point holds one hook, so
+/// the two cannot be installed apart).
+fn act_at_guard_recording(
+    label: &'static str,
+    nth: usize,
+    act: impl Fn() + 'static,
+    after: &AfterSwapV1,
+) -> GitSeamGuardV1 {
+    let seen = std::cell::Cell::new(0_usize);
+    let (swapped, labels) = (after.swapped.clone(), after.labels.clone());
+    install_git_hook_for_test(GitHookPointV1::DeadlineObserved, move |event| {
+        if swapped.get() {
+            labels.borrow_mut().push(event.label);
+        }
+        if event.label == label {
+            seen.set(seen.get() + 1);
+            if seen.get() == nth {
+                act();
+            }
+        }
+    })
+}
+
+/// A swap's refusal: a retained directory or file that is no longer the entry its parent holds, or a link
+/// where one was.
+fn swap_refusal(cause: &GitBootstrapErrorV1) -> bool {
+    identity_changed(cause)
+        || matches!(
+            cause,
+            GitBootstrapErrorV1::Restore(CustodyRestoreErrorV1::SymlinkRefused { .. })
+        )
+}
+
+/// The guards the step reads after a swap happened: a refusal that comes from the swapped step's OWN recheck
+/// never reaches the guard of any later step (a later entry's decode, a frame, a gate, the agreement, the
+/// config, the final gate). `in_config_gate` excuses the gate's own first guard, which is where a swap made at
+/// the config step's start is refused.
+fn assert_refused_within_the_b2b_step(after: &AfterSwapV1, in_config_gate: bool, row: &str) {
+    let labels = after.labels.borrow();
+    assert!(!labels.is_empty(), "{row}: the swap was never reached");
+    for later in [
+        "metadata-item",
+        "metadata-frame",
+        "metadata-decoded",
+        "metadata-gate",
+        "metadata-read",
+        "metadata-refs",
+        "metadata-agreed",
+        "metadata-config",
+        "metadata-final",
+    ] {
+        if in_config_gate && matches!(later, "metadata-gate" | "metadata-config") {
+            continue;
+        }
+        assert!(
+            !labels.contains(&later),
+            "{row}: the run went on to `{later}` after the swap: {labels:?}"
+        );
+    }
+}
+
+/// A directory this step created, or one of the chains beneath it, swapped between two entries is caught by
+/// the recheck around the next entry, for each of thirteen swaps and for one entry of every shape (a file in the
+/// first frame, a directory, a file under a metadata directory, a file in the second frame, and the config):
+///
+/// - a swap AFTER the pre-create recheck and before the create: the entry that raced went through the
+///   retained pin into the moved directory (never through the new name) and is refused by ITS OWN post-create
+///   recheck (no later guard of any later step is read), with nothing after it created;
+/// - a swap BEFORE the pre-create recheck: refused BEFORE the entry is created at all.
+///
+/// Nothing is ever written through a link, and every byte created is kept.
+#[test]
+fn b2b_late_swaps_refuse_through_retained_pins_before_and_after_each_entry() {
+    let capsule = captured(CustodyGitObjectFormatV1::Sha1);
+    let order = creation_order(&capsule, CustodyGitObjectFormatV1::Sha1);
+    let slots = [
+        "HEAD",
+        "refs",
+        "refs/heads/main",
+        "logs/refs/heads/main",
+        "config",
+    ];
+    assert!(swap_rows().iter().any(|row| row.under == Some("refs")));
+    let objects_entries = 8_usize;
+    for slot in slots {
+        let index = order
+            .iter()
+            .position(|(name, _)| name == slot)
+            .expect("a slot of the run");
+        let is_file = order[index].1;
+        for swap_row in swap_rows() {
+            // A swap of a metadata directory is on the chain of the slots beneath it only.
+            if let Some(under) = swap_row.under {
+                if !slot.starts_with(&format!("{under}/")) {
+                    continue;
+                }
+            }
+            for after_pre_recheck in [true, false] {
+                let row = format!(
+                    "{slot}: {} ({})",
+                    swap_row.row,
+                    if after_pre_recheck {
+                        "after the pre-create recheck"
+                    } else {
+                        "before it"
+                    }
+                );
+                let mut case = MetaCaseV1::of(&capsule, CustodyGitObjectFormatV1::Sha1);
+                let (_outside_area, outside) = external_dir_with(&["decoy"]);
+                let outside_before = snapshot(&outside);
+                let paths = MetaPathsV1::of(&case);
+                let swapping = outside.clone();
+                let swap = swap_row.swap;
+                let after = AfterSwapV1::new();
+                let swapped = after.flag();
+                let flag = swapped.clone();
+                let act = move || {
+                    swap(&paths, &swapping);
+                    flag.set(true);
+                };
+                // One hook per point: the swap made at a guard records the guards after it itself.
+                let (_hook, _guards) = if after_pre_recheck {
+                    (
+                        act_before_creating(case.meta(slot), act),
+                        Some(after.record()),
+                    )
+                } else if slot == "config" {
+                    (
+                        act_at_guard_recording("metadata-config", 1, act, &after),
+                        None,
+                    )
+                } else {
+                    (
+                        act_at_guard_recording("metadata-item", index + 1, act, &after),
+                        None,
+                    )
+                };
+                let failure = case.refused(&row);
+                assert!(swapped.get(), "{row}: the swap never ran");
+                assert!(swap_refusal(&failure.cause), "{row}: {:?}", failure.cause);
+                assert_refused_within_the_b2b_step(&after, slot == "config", &row);
+                assert_eq!(
+                    snapshot(&outside),
+                    outside_before,
+                    "{row}: written through a link"
+                );
+                let made = if after_pre_recheck { index + 1 } else { index };
+                assert_eq!(failure.active_materialization_began, made > 0, "{row}");
+                assert_eq!(failure.partial.charged.entries, made as u64, "{row}");
+                // Where the refusal is the swapped slot's own post-create recheck, the file it created is
+                // in flight with nothing written; a directory is pinned.
+                assert_eq!(
+                    failure.partial.in_flight.is_some(),
+                    after_pre_recheck && is_file,
+                    "{row}"
+                );
+                if let Some(flight) = &failure.partial.in_flight {
+                    assert_eq!(flight.written, 0, "{row}");
+                }
+                assert_eq!(
+                    repository_keys(case.dest()),
+                    objects_entries + made + swap_row.planted,
+                    "{row}: exactly the entries made exist under the repository, and the swap's own"
+                );
+                // The completed step is the caller's, or Refs once the config step began.
+                let want = if slot == "config" {
+                    Some(GitPlaneStepV1::Refs)
+                } else {
+                    B2B_COMPLETED_V1
+                };
+                assert_eq!(failure.last_completed, want, "{row}");
+            }
+        }
+    }
+}
+
+/// A COMPLETED file or directory swapped while a later entry is being restored is caught at the next FULL
+/// recheck: at the start of the next frame (before any entry of it is created) when the swap is made between
+/// the frames, and at the gate after the last frame (before the refs are agreed and before any config) when it
+/// is made inside the last frame. The between-entries recheck is bounded to the new entry's own chain, so a
+/// completed sibling is not looked at until then; nothing is written through anything swapped, and every byte
+/// is kept.
+#[test]
+fn b2b_a_completed_entry_swapped_is_caught_at_the_next_full_recheck() {
+    let capsule = captured(CustodyGitObjectFormatV1::Sha1);
+    type SwapFnV1 = Box<dyn Fn(&MetaPathsV1, &Path)>;
+    let swaps: Vec<(&str, SwapFnV1)> = vec![
+        (
+            "a completed file replaced by a link",
+            Box::new(|paths, outside| {
+                let head = paths.git.join("HEAD");
+                move_away(&head, "HEAD.moved");
+                std::os::unix::fs::symlink(outside.join("decoy"), &head).expect("a link");
+            }),
+        ),
+        (
+            "a completed file replaced by another inode",
+            Box::new(|paths, _| {
+                let head = paths.git.join("HEAD");
+                let bytes = std::fs::read(&head).expect("HEAD");
+                move_away(&head, "HEAD.moved");
+                std::fs::write(&head, bytes).expect("the same bytes, a new inode");
+            }),
+        ),
+        (
+            "a completed file grown",
+            Box::new(|paths, _| {
+                use std::io::Write as _;
+                std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(paths.git.join("HEAD"))
+                    .and_then(|mut file| file.write_all(b"x"))
+                    .expect("an appended byte");
+            }),
+        ),
+        (
+            "a completed directory replaced",
+            Box::new(|paths, _| {
+                let tags = paths.git.join("refs/tags");
+                move_away(&tags, "tags-away");
+                std::fs::create_dir(&tags).expect("a new directory takes the name");
+            }),
+        ),
+    ];
+    for (row, swap) in swaps {
+        let swap = std::rc::Rc::new(swap);
+        // Between the frames: the second frame's own guard runs before its recheck of everything made.
+        let mut case = MetaCaseV1::of(&capsule, CustodyGitObjectFormatV1::Sha1);
+        let (_outside_area, outside) = external_dir_with(&["decoy"]);
+        let outside_before = snapshot(&outside);
+        let (paths, away, acting) = (MetaPathsV1::of(&case), outside.clone(), swap.clone());
+        let _hook = act_at_guard("metadata-frame", 2, move || acting(&paths, &away));
+        let failure = case.refused(row);
+        assert!(
+            identity_changed(&failure.cause)
+                || matches!(
+                    failure.cause,
+                    GitBootstrapErrorV1::Restore(CustodyRestoreErrorV1::SymlinkRefused { .. })
+                ),
+            "{row}: {:?}",
+            failure.cause
+        );
+        assert_eq!(snapshot(&outside), outside_before, "{row}");
+        assert_eq!(failure.last_completed, B2B_COMPLETED_V1, "{row}");
+        assert!(!exists(&case.meta("logs")), "{row}: the next frame began");
+        assert_eq!(
+            failure.partial.charged.entries, 7,
+            "{row}: the refs frame, whole"
+        );
+        drop(_hook);
+
+        // Inside the last frame: the gate after the frames refuses it, before any step completes.
+        let mut case = MetaCaseV1::of(&capsule, CustodyGitObjectFormatV1::Sha1);
+        let (paths, away, acting) = (MetaPathsV1::of(&case), outside.clone(), swap.clone());
+        let _hook = act_before_creating(case.meta("logs"), move || acting(&paths, &away));
+        let failure = case.refused(row);
+        assert!(
+            identity_changed(&failure.cause)
+                || matches!(
+                    failure.cause,
+                    GitBootstrapErrorV1::Restore(CustodyRestoreErrorV1::SymlinkRefused { .. })
+                ),
+            "{row}: {:?}",
+            failure.cause
+        );
+        assert_eq!(snapshot(&outside), outside_before, "{row}");
+        assert_eq!(
+            failure.last_completed, B2B_COMPLETED_V1,
+            "{row}: Metadata is not complete"
+        );
+        assert_eq!(
+            failure.partial.charged.entries, 12,
+            "{row}: both frames were whole"
+        );
+        assert!(exists(&case.meta("logs/refs/heads/main")), "{row}");
+        assert!(!exists(&case.meta("config")), "{row}");
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// The final gate: the root is checked LAST, and a late link or root swap refuses with every byte kept
+// ---------------------------------------------------------------------------------------------
+
+/// The destination root swapped just before the final gate refuses with every entry already made: the facts
+/// name all of them, they are all in the moved root, the replacement stays empty, and the last completed step
+/// is `Refs` (the config step completes only in a success).
+#[test]
+fn b2b_a_root_swapped_before_the_final_gate_refuses_with_every_effect_preserved() {
+    let capsule = captured(CustodyGitObjectFormatV1::Sha1);
+    let mut case = MetaCaseV1::of(&capsule, CustodyGitObjectFormatV1::Sha1);
+    let root = case.dest().path.clone();
+    let away = root.with_file_name("dest-away");
+    let (swap_root, swap_away) = (root.clone(), away.clone());
+    let _hook = install_git_hook_for_test(GitHookPointV1::BeforeMetadataFinalGate, move |_| {
+        std::fs::rename(&swap_root, &swap_away).expect("the root moves away");
+        std::fs::create_dir(&swap_root).expect("an empty root takes its name");
+    });
+    let failure = case.refused("the final gate");
+    assert!(identity_changed(&failure.cause), "{:?}", failure.cause);
+    assert!(failure.active_materialization_began);
+    assert_eq!(failure.last_completed, Some(GitPlaneStepV1::Refs));
+    assert_eq!(failure.partial.directories.len(), 6);
+    assert_eq!(
+        failure.partial.files.len(),
+        7,
+        "six frame files and the config"
+    );
+    assert!(failure.partial.in_flight.is_none());
+    assert_eq!(failure.partial.charged.entries, 13);
+    assert_eq!(
+        case.dest().entries(),
+        Vec::<String>::new(),
+        "the replacement root stays empty"
+    );
+    assert_eq!(
+        std::fs::read(away.join("repository/.git/config")).expect("the config in the moved root"),
+        golden_config(case.format)
+    );
+}
+
+/// A file or directory of the metadata (or the config) swapped between its creation and the final gate is
+/// refused there, never followed: a link, another inode holding the same bytes, a longer file, or a
+/// directory in its place, a replaced metadata directory, and a replaced object copy file. Each leaves every
+/// byte, and the step `Refs`.
+#[test]
+fn b2b_a_late_swap_before_the_final_gate_refuses_whatever_it_replaced() {
+    let capsule = captured(CustodyGitObjectFormatV1::Sha1);
+    type FinalSwapV1 = (&'static str, &'static str, fn(&Path, &Path));
+    let rows: [FinalSwapV1; 8] = [
+        (
+            "a ref file replaced by a link",
+            "refs/heads/main",
+            |path, outside| {
+                move_away(path, "moved");
+                std::os::unix::fs::symlink(outside.join("decoy"), path).expect("a link");
+            },
+        ),
+        (
+            "the config replaced by a link",
+            "config",
+            |path, outside| {
+                move_away(path, "moved");
+                std::os::unix::fs::symlink(outside.join("decoy"), path).expect("a link");
+            },
+        ),
+        (
+            "a reflog replaced by another inode",
+            "logs/HEAD",
+            |path, _| {
+                let bytes = std::fs::read(path).expect("the reflog");
+                move_away(path, "moved");
+                std::fs::write(path, bytes).expect("the same bytes, a new inode");
+            },
+        ),
+        ("the config grown", "config", |path, _| {
+            use std::io::Write as _;
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(path)
+                .and_then(|mut file| file.write_all(b"x"))
+                .expect("an appended byte");
+        }),
+        (
+            "a ref file replaced by a directory",
+            "ORIG_HEAD",
+            |path, _| {
+                move_away(path, "moved");
+                std::fs::create_dir(path).expect("a directory takes the name");
+            },
+        ),
+        ("a metadata directory replaced", "logs/refs", |path, _| {
+            move_away(path, "moved");
+            std::fs::create_dir(path).expect("a new directory takes the name");
+        }),
+        (
+            "a metadata directory replaced by a link",
+            "refs/heads",
+            |path, outside| {
+                move_away(path, "moved");
+                std::os::unix::fs::symlink(outside, path).expect("a link");
+            },
+        ),
+        (
+            "an object copy file replaced by another inode",
+            "objects/pack/PACK",
+            |path, _| {
+                let bytes = std::fs::read(path).expect("the pack");
+                move_away(path, "moved");
+                std::fs::write(path, bytes).expect("the same bytes, a new inode");
+            },
+        ),
+    ];
+    for (row, slot, swap) in rows {
+        let mut case = MetaCaseV1::of(&capsule, CustodyGitObjectFormatV1::Sha1);
+        let target = if slot.ends_with("PACK") {
+            admitted_path_in(&pack_directory(case.dest()), "pack")
+        } else {
+            case.meta(slot)
+        };
+        let (_outside_area, outside) = external_dir_with(&["decoy"]);
+        let outside_before = snapshot(&outside);
+        let (acting, away) = (target.clone(), outside.clone());
+        let _hook = install_git_hook_for_test(GitHookPointV1::BeforeMetadataFinalGate, move |_| {
+            swap(&acting, &away);
+        });
+        let failure = case.refused(row);
+        assert!(
+            identity_changed(&failure.cause)
+                || matches!(
+                    failure.cause,
+                    GitBootstrapErrorV1::Restore(CustodyRestoreErrorV1::SymlinkRefused { .. })
+                ),
+            "{row}: {:?}",
+            failure.cause
+        );
+        assert_eq!(
+            snapshot(&outside),
+            outside_before,
+            "{row}: written through a link"
+        );
+        assert_eq!(failure.last_completed, Some(GitPlaneStepV1::Refs), "{row}");
+        assert_eq!(
+            failure.partial.charged.entries, 13,
+            "{row}: every entry was already made"
+        );
+        if row != "the config grown" {
+            assert!(
+                exists(&target.with_file_name("moved")),
+                "{row}: the original bytes are kept beside the swap"
+            );
+        }
+    }
+}
+
+/// The `.pack` file in `directory`.
+fn admitted_path_in(directory: &Path, extension: &str) -> PathBuf {
+    std::fs::read_dir(directory)
+        .expect("a pack directory")
+        .map(|entry| entry.expect("an entry").path())
+        .find(|path| path.extension().is_some_and(|found| found == extension))
+        .expect("a pack file")
+}
+
+// ---------------------------------------------------------------------------------------------
+// Devices and mounts
+// ---------------------------------------------------------------------------------------------
+
+/// A created entry on another device refuses for every one of the thirteen entries, and its charge stays: the
+/// entry exists (it was created before the device was read), it is named in the facts when it is a file, no
+/// later entry is created, and the ledger moved by exactly what the facts report.
+#[test]
+fn b2b_a_device_mismatch_refuses_for_every_entry_and_keeps_the_charge() {
+    let capsule = captured(CustodyGitObjectFormatV1::Sha1);
+    let order = creation_order(&capsule, CustodyGitObjectFormatV1::Sha1);
+    for (index, (slot, is_file)) in order.iter().enumerate() {
+        let mut case = MetaCaseV1::of(&capsule, CustodyGitObjectFormatV1::Sha1);
+        let name = format!("repository/.git/{slot}");
+        let other = device_of(&case.dest().path) + 1;
+        let _device = override_created_dev_for_test(&name, other);
+        let failure = case.refused(slot);
+        assert!(
+            matches!(&failure.cause,
+                GitBootstrapErrorV1::Restore(CustodyRestoreErrorV1::DeviceCrossing { name: found })
+                    if *found == name),
+            "{slot}: {:?}",
+            failure.cause
+        );
+        assert!(failure.active_materialization_began, "{slot}");
+        assert_eq!(
+            failure.partial.charged.entries,
+            index as u64 + 1,
+            "{slot}: the entry stays charged"
+        );
+        assert!(exists(&case.meta(slot)), "{slot}: it was created");
+        for (later, _) in &order[index + 1..] {
+            assert!(
+                !exists(&case.meta(later)),
+                "{slot}: {later} was created after"
+            );
+        }
+        // A directory refused on its device has no pin; a file is named in flight with nothing written.
+        assert_eq!(failure.partial.in_flight.is_some(), *is_file, "{slot}");
+        assert_metadata_partial_is_the_disk(slot, &case, &failure, u64::from(!*is_file));
+        let want = if slot == "config" {
+            Some(GitPlaneStepV1::Refs)
+        } else {
+            B2B_COMPLETED_V1
+        };
+        assert_eq!(failure.last_completed, want, "{slot}");
+    }
+}
+
+/// The mount census runs at the step's entry, after the frames, before the config, and at the final gate: a
+/// mount that appears for any ONE census call refuses at that call, with only the entries made before it and
+/// the step reported exactly as far as it got, and a census that cannot list the mount points fails closed
+/// before anything is created.
+#[test]
+fn b2b_a_mount_appearing_at_any_census_refuses_and_a_failing_census_fails_closed() {
+    let capsule = captured(CustodyGitObjectFormatV1::Sha1);
+    // The census calls of a clean run, and what each guards: the entries made and the last completed step.
+    let expected = [
+        (0_u64, B2B_COMPLETED_V1),
+        (12, B2B_COMPLETED_V1),
+        (12, Some(GitPlaneStepV1::Refs)),
+        (13, Some(GitPlaneStepV1::Refs)),
+    ];
+    let mut case = MetaCaseV1::of(&capsule, CustodyGitObjectFormatV1::Sha1);
+    let census = crate::custody_mounts::seam::install_list(vec![b"/".to_vec()]);
+    let _ = case.done("a clean run");
+    assert_eq!(
+        census.calls(),
+        expected.len(),
+        "the census calls of a clean run"
+    );
+    drop(census);
+
+    for call in 1..=expected.len() {
+        let row = format!("call {call}");
+        let mut case = MetaCaseV1::of(&capsule, CustodyGitObjectFormatV1::Sha1);
+        let inside = case
+            .dest()
+            .path
+            .join(".restore-work/home")
+            .as_os_str()
+            .as_bytes()
+            .to_vec();
+        // The object copy's own census calls came earlier; this census counts only the step's.
+        let _census = crate::custody_mounts::seam::install(Box::new(move |number| {
+            if number == call {
+                Ok(vec![b"/".to_vec(), inside.clone()])
+            } else {
+                Ok(vec![b"/".to_vec()])
+            }
+        }));
+        let failure = case.refused(&row);
+        assert!(
+            matches!(
+                failure.cause,
+                GitBootstrapErrorV1::Restore(CustodyRestoreErrorV1::MountBoundary(_))
+            ),
+            "{row}: {:?}",
+            failure.cause
+        );
+        assert_eq!(
+            failure.partial.charged.entries,
+            expected[call - 1].0,
+            "{row}"
+        );
+        assert_eq!(failure.last_completed, expected[call - 1].1, "{row}");
+        assert_eq!(failure.active_materialization_began, call > 1, "{row}");
+        assert_metadata_partial_is_the_disk(&row, &case, &failure, 0);
+    }
+
+    let mut case = MetaCaseV1::of(&capsule, CustodyGitObjectFormatV1::Sha1);
+    let _census = crate::custody_mounts::seam::install(Box::new(|_| {
+        Err(crate::custody_mounts::CustodyMountErrorV1::MalformedLine { line: 1 })
+    }));
+    let cause = case.refused_before_any_write("a failing census");
+    assert!(
+        matches!(
+            cause,
+            GitBootstrapErrorV1::Restore(CustodyRestoreErrorV1::MountBoundary(_))
+        ),
+        "{cause:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// Entry and byte exhaustion are exact
+// ---------------------------------------------------------------------------------------------
+
+/// The bound is exact at every entry and every byte: with one byte less than an entry needs, the entry is
+/// refused and not created; with one byte less than a file's bytes, the file's entry exists and its refused
+/// chunk is never written; the headroom of exactly the whole charge succeeds. Everything created before the
+/// refusal stays, charged, and the facts say so.
+#[test]
+fn b2b_entry_and_byte_exhaustion_is_exact_and_leaves_typed_partial_effects() {
+    let capsule = captured(CustodyGitObjectFormatV1::Sha1);
+    let order = creation_order(&capsule, CustodyGitObjectFormatV1::Sha1);
+    // The lengths of the files, by name, from a clean run (the config included).
+    let mut learn = MetaCaseV1::of(&capsule, CustodyGitObjectFormatV1::Sha1);
+    let done = learn.done("a clean run");
+    let lengths: BTreeMap<String, u64> = done
+        .files
+        .iter()
+        .map(|file| (file.relative.clone(), file.length))
+        .collect();
+    let total_bytes: u64 = lengths.values().sum();
+    let bytes_before = |index: usize| -> u64 {
+        order[..index]
+            .iter()
+            .filter(|(_, is_file)| *is_file)
+            .map(|(name, _)| lengths[name])
+            .sum()
+    };
+
+    // The exact fit succeeds.
+    let mut case = MetaCaseV1::of(&capsule, CustodyGitObjectFormatV1::Sha1);
+    leave_headroom(&case.store.boot.verified, 13 * ENTRY_V1 + total_bytes);
+    let done = case.done("the exact fit");
+    assert_eq!(
+        case.ledger(),
+        RESTORE_BYTES_CEILING_V1,
+        "the ledger is exactly full"
+    );
+    assert_eq!(meta_charge(done.charged), 13 * ENTRY_V1 + total_bytes);
+
+    // One byte short of an ENTRY, at each of the thirteen entries.
+    for (index, (slot, _)) in order.iter().enumerate() {
+        let row = format!("entry {index} ({slot})");
+        let mut case = MetaCaseV1::of(&capsule, CustodyGitObjectFormatV1::Sha1);
+        leave_headroom(
+            &case.store.boot.verified,
+            index as u64 * ENTRY_V1 + bytes_before(index) + (ENTRY_V1 - 1),
+        );
+        let failure = case.refused(&row);
+        assert!(
+            matches!(
+                failure.cause,
+                GitBootstrapErrorV1::Restore(CustodyRestoreErrorV1::Budget(_))
+            ),
+            "{row}: {:?}",
+            failure.cause
+        );
+        assert_eq!(failure.active_materialization_began, index > 0, "{row}");
+        assert_eq!(
+            failure.partial.charged,
+            MetadataChargeV1 {
+                entries: index as u64,
+                bytes: bytes_before(index)
+            },
+            "{row}"
+        );
+        assert!(failure.partial.in_flight.is_none(), "{row}");
+        assert!(
+            !exists(&case.meta(slot)),
+            "{row}: the refused entry was not created"
+        );
+        assert_metadata_partial_is_the_disk(&row, &case, &failure, 0);
+    }
+
+    // One byte short of a FILE's bytes: its entry exists, empty or partly written, and stays charged.
+    for chunk in [None, Some(4_usize)] {
+        for (index, (slot, is_file)) in order.iter().enumerate() {
+            if !is_file {
+                continue;
+            }
+            let row = format!("bytes of {slot}, chunk {chunk:?}");
+            let _chunk = chunk.map(override_object_copy_chunk_for_test);
+            let mut case = MetaCaseV1::of(&capsule, CustodyGitObjectFormatV1::Sha1);
+            let length = lengths[slot];
+            leave_headroom(
+                &case.store.boot.verified,
+                (index as u64 + 1) * ENTRY_V1 + bytes_before(index) + length - 1,
+            );
+            let failure = case.refused(&row);
+            assert!(
+                matches!(
+                    failure.cause,
+                    GitBootstrapErrorV1::Restore(CustodyRestoreErrorV1::Budget(_))
+                ),
+                "{row}: {:?}",
+                failure.cause
+            );
+            // The refused chunk is the last one: it is never written.
+            let last = chunk.map_or(length, |size| ((length - 1) % size as u64) + 1);
+            let written = length - last;
+            let flight = failure
+                .partial
+                .in_flight
+                .as_ref()
+                .expect("the file in flight");
+            assert_eq!(
+                (
+                    flight.relative.as_str(),
+                    flight.expected_length,
+                    flight.written
+                ),
+                (slot.as_str(), length, written),
+                "{row}"
+            );
+            assert_eq!(
+                failure.partial.charged,
+                MetadataChargeV1 {
+                    entries: index as u64 + 1,
+                    bytes: bytes_before(index) + written
+                },
+                "{row}"
+            );
+            assert_metadata_partial_is_the_disk(&row, &case, &failure, 0);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Failure paths whose real trigger is the storage itself: a partial write and a refused create
+// ---------------------------------------------------------------------------------------------
+
+/// What a Captured or Empty run creates first: the first file in canonical order, its length, and how many
+/// directories precede it (each charged an entry).
+fn first_file_of(case: &MetaCaseV1) -> (String, u64, u64) {
+    let generation = generation_of(case);
+    let mut directories = 0_u64;
+    for frame in &case.store.boot.active_frames {
+        let one = &case.store.boot.verified.staged[frame.staged];
+        for (path, content) in decoded_entries(&one.file, frame.class, &generation) {
+            match content {
+                Some(bytes) => return (path, bytes.len() as u64, directories),
+                None => directories += 1,
+            }
+        }
+    }
+    panic!("a frame holds a file");
+}
+
+/// A write that reaches the file only in part (a full disk, a quota, an I/O error after a prefix) leaves
+/// exactly that prefix, and the typed facts say so: the file in flight reports the bytes that reached it, the
+/// ledger keeps exactly those bytes charged (the part of the chunk that was reserved and never written is
+/// given back), and nothing after the failed file is created. A write that reports it wrote nothing is the
+/// same refusal, never a loop.
+#[test]
+fn b2b_a_partial_write_failure_records_exactly_the_bytes_that_reached_the_file() {
+    let _chunk = override_object_copy_chunk_for_test(16);
+    let capsule = empty(CustodyGitObjectFormatV1::Sha1);
+    for (row, fault) in [
+        ("a prefix of the first chunk", ObjectFaultV1::WriteAfter(5)),
+        (
+            "the first chunk whole, then nothing",
+            ObjectFaultV1::WriteAfter(16),
+        ),
+        (
+            "a prefix of the second chunk",
+            ObjectFaultV1::WriteAfter(20),
+        ),
+        (
+            "a zero-byte write inside the first chunk",
+            ObjectFaultV1::WriteZeroAfter(7),
+        ),
+    ] {
+        let limit = match fault {
+            ObjectFaultV1::WriteAfter(limit) | ObjectFaultV1::WriteZeroAfter(limit) => limit,
+            other => panic!("not a write fault: {other:?}"),
+        };
+        let mut case = MetaCaseV1::of(&capsule, CustodyGitObjectFormatV1::Sha1);
+        let (first, length, before) = first_file_of(&case);
+        assert!(
+            length > limit,
+            "{row}: the first file is longer than the limit"
+        );
+        let _fault = override_object_fault_for_test(fault);
+        let failure = case.refused(row);
+        match &failure.cause {
+            GitBootstrapErrorV1::Restore(CustodyRestoreErrorV1::Io(detail)) => {
+                assert!(detail.contains(&first), "{row}: {detail}");
+            }
+            other => panic!("{row}: {other:?}"),
+        }
+        assert!(failure.active_materialization_began, "{row}");
+        let flight = failure
+            .partial
+            .in_flight
+            .as_ref()
+            .expect("the first file in flight");
+        assert_eq!(flight.written, limit, "{row}: the retained fact");
+        let on_disk = std::fs::read(case.meta(&first)).expect("the partial file");
+        assert_eq!(on_disk.len() as u64, limit, "{row}: the file on disk");
+        let whole = case.expected_frames()[&first].clone().expect("a file");
+        assert_eq!(&whole[..on_disk.len()], &on_disk[..], "{row}: a prefix");
+        assert_eq!(
+            failure.partial.charged,
+            MetadataChargeV1 {
+                entries: before + 1,
+                bytes: limit
+            },
+            "{row}: exactly the bytes that reached the file stay charged"
+        );
+        assert!(failure.partial.files.is_empty(), "{row}");
+        assert_eq!(failure.last_completed, B2B_COMPLETED_V1, "{row}");
+        assert_metadata_partial_is_the_disk(row, &case, &failure, 0);
+    }
+}
+
+/// A create that fails for any reason but a collision keeps its entry charged (the primitive cannot say
+/// whether anything was created) and creates nothing after it, and materialization is reported begun even when
+/// the refused create was the FIRST entry of the step: the allowance is not given back, unlike a collision's.
+#[test]
+fn b2b_a_file_create_failure_other_than_a_collision_keeps_its_charge_and_reports_begun() {
+    let capsule = empty(CustodyGitObjectFormatV1::Sha1);
+    let mut case = MetaCaseV1::of(&capsule, CustodyGitObjectFormatV1::Sha1);
+    let (first, _, before) = first_file_of(&case);
+    assert_eq!(before, 0, "the first entry of the step is a file");
+    let _fault = override_object_fault_for_test(ObjectFaultV1::CreateFile);
+    let failure = case.refused("a refused create");
+    assert!(
+        matches!(
+            failure.cause,
+            GitBootstrapErrorV1::Restore(CustodyRestoreErrorV1::Io(_))
+        ),
+        "{:?}",
+        failure.cause
+    );
+    assert!(
+        failure.active_materialization_began,
+        "the create may have made the file"
+    );
+    assert_eq!(
+        failure.partial.charged,
+        MetadataChargeV1 {
+            entries: 1,
+            bytes: 0
+        },
+        "the refused file's entry stays charged"
+    );
+    assert!(failure.partial.in_flight.is_none(), "no file was created");
+    assert!(failure.partial.files.is_empty());
+    assert_eq!(case.entry_count(), 0, "{first}: nothing is on disk");
+    assert_eq!(failure.last_completed, B2B_COMPLETED_V1);
+}
+
+// ---------------------------------------------------------------------------------------------
+// The one deadline paces every step
+// ---------------------------------------------------------------------------------------------
+
+/// The one deadline of the pacing rows. A clean run of these small files takes milliseconds.
+const B2B_DEADLINE_V1: Duration = Duration::from_secs(2);
+
+/// Every label a clean run reads the clock at: each step of the success path is paced (the frame rehash's and
+/// the refs agreement's own guards included).
+const B2B_GUARDS_V1: [&str; 22] = [
+    "chain",
+    "frame-rehash",
+    "frame-rewind",
+    "metadata-agreed",
+    "metadata-chain",
+    "metadata-checked",
+    "metadata-config",
+    "metadata-decoded",
+    "metadata-entry",
+    "metadata-final",
+    "metadata-frame",
+    "metadata-gate",
+    "metadata-item",
+    "metadata-read",
+    "metadata-refs",
+    "objects-chain",
+    "objects-source",
+    "refs-manifest",
+    "refs-resolved",
+    "refs-structure",
+    "refs-targets",
+    "root",
+];
+
+fn timed_out_metadata(
+    row: &str,
+    result: Result<FinalMetadataV1, Box<MetadataFailureV1>>,
+) -> Box<MetadataFailureV1> {
+    match result {
+        Ok(_) => panic!("{row}: no success after the deadline"),
+        Err(failure) => {
+            assert!(
+                matches!(
+                    failure.cause,
+                    GitBootstrapErrorV1::Git(CustodyGitError::Timeout)
+                ),
+                "{row}: {:?}",
+                failure.cause
+            );
+            failure
+        }
+    }
+}
+
+/// A deadline already spent refuses before the first entry: the clock is read once, and nothing is created,
+/// charged, or pinned.
+#[test]
+fn b2b_a_spent_deadline_refuses_before_any_write() {
+    let capsule = captured(CustodyGitObjectFormatV1::Sha1);
+    let mut case = MetaCaseV1::of(&capsule, CustodyGitObjectFormatV1::Sha1);
+    let spent = Instant::now();
+    std::thread::sleep(Duration::from_millis(5));
+    let (labels, _hook) = record_guards();
+    let tree = snapshot(&case.dest().path);
+    let ledger = case.ledger();
+    let failure = timed_out_metadata("a spent deadline", case.attempt_by(spent));
+    assert!(!failure.active_materialization_began);
+    assert_eq!(*labels.borrow(), ["metadata-entry"]);
+    assert_eq!(case.ledger(), ledger);
+    assert_eq!(snapshot(&case.dest().path), tree);
+    assert_eq!(failure.last_completed, B2B_COMPLETED_V1);
+}
+
+/// The clock is read at exactly the documented guards, so no step is unobserved: the first guard is the
+/// entry, the last is the one immediately before the destination root's identity check (the final gate's),
+/// the distinct labels are exactly the documented ones, and each is read exactly as often as the design says.
+/// The recheck runs `5 + frames + 2 dirs + 3 (files + config)` times before the final gate, and every one is
+/// followed by the clock.
+#[test]
+fn b2b_the_guards_of_a_clean_run_are_the_documented_ones() {
+    for populated in [true, false] {
+        let cformat = CustodyGitObjectFormatV1::Sha1;
+        let capsule = if populated {
+            captured(cformat)
+        } else {
+            empty(cformat)
+        };
+        let mut case = MetaCaseV1::of(&capsule, cformat);
+        let staging = case.store.boot.verified.destination.staging.borrow().len();
+        let bootstrap_directories = case.store.boot.directories.len();
+        let (frames, files, directories) = {
+            let (names, dirs) = expected_names(&case);
+            (case.store.plan.frames.len(), names.len(), dirs.len())
+        };
+        let (labels, _hook) = record_guards();
+        let _ = case.done("a clean run");
+        let labels = labels.borrow();
+        assert_eq!(labels.first().copied(), Some("metadata-entry"));
+        assert_eq!(labels.last().copied(), Some("root"));
+        let count = |wanted: &str| labels.iter().filter(|label| **label == wanted).count();
+        // Gates: the entry, after the frames, before the config; rechecks: one per frame, two per directory,
+        // three per file and the config, one before the refs, one after the config.
+        let checked = 5 + frames + 2 * directories + 3 * (files + 1);
+        let sweeps = checked + 1;
+        let objects_files = if populated { 3 } else { 0 };
+        let expected: Vec<(&str, usize)> = vec![
+            ("metadata-entry", 1),
+            ("metadata-gate", 3),
+            ("metadata-checked", checked),
+            ("metadata-frame", frames),
+            ("metadata-item", directories + files),
+            ("metadata-read", files + 1),
+            ("metadata-decoded", frames),
+            ("metadata-refs", 1),
+            ("metadata-agreed", 1),
+            ("metadata-config", 1),
+            ("metadata-final", 1),
+            ("frame-rehash", frames),
+            ("frame-rewind", frames),
+            ("refs-structure", 1),
+            ("refs-targets", 1),
+            ("refs-resolved", 1),
+            ("refs-manifest", 1),
+            ("root", sweeps),
+            ("chain", sweeps * (1 + staging + 2 + bootstrap_directories)),
+            ("objects-source", sweeps * objects_files),
+            ("objects-chain", sweeps * (5 + objects_files)),
+        ];
+        for (label, times) in &expected {
+            assert_eq!(count(label), *times, "populated={populated}: {label}");
+        }
+        assert!(
+            count("metadata-chain") > 0,
+            "populated={populated}: the metadata chains are paced"
+        );
+        assert_eq!(
+            labels.len(),
+            expected.iter().map(|(_, times)| times).sum::<usize>() + count("metadata-chain"),
+            "populated={populated}: no other label"
+        );
+        let mut distinct: Vec<&str> = labels.clone();
+        distinct.sort_unstable();
+        distinct.dedup();
+        let documented: Vec<&str> = B2B_GUARDS_V1
+            .into_iter()
+            .filter(|label| populated || *label != "objects-source")
+            .collect();
+        assert_eq!(distinct, documented, "populated={populated}");
+    }
+}
+
+/// Each distinct guard halts the run alone: its step made slow past the deadline is refused with a typed
+/// timeout, the run stops AT that guard (no later guard ever ran), every byte created so far is kept and
+/// reported, and a brief delay at every guard, with headroom, still succeeds.
+#[test]
+fn b2b_each_guard_halts_the_run_alone_and_headroom_succeeds() {
+    let capsule = captured(CustodyGitObjectFormatV1::Sha1);
+    for target in B2B_GUARDS_V1 {
+        let mut case = MetaCaseV1::of(&capsule, CustodyGitObjectFormatV1::Sha1);
+        let deadline = Instant::now() + B2B_DEADLINE_V1;
+        let labels = std::rc::Rc::new(std::cell::RefCell::new(Vec::<&'static str>::new()));
+        let fired = std::rc::Rc::new(std::cell::Cell::new(false));
+        let (seen, slow) = (labels.clone(), fired.clone());
+        let _hook = install_git_hook_for_test(GitHookPointV1::DeadlineObserved, move |event| {
+            seen.borrow_mut().push(event.label);
+            if event.label == target && !slow.replace(true) {
+                pass_the_deadline(deadline);
+            }
+        });
+        let failure = timed_out_metadata(target, case.attempt_by(deadline));
+        assert!(fired.get(), "{target}: the slow step never ran");
+        assert_eq!(
+            labels.borrow().last().copied(),
+            Some(target),
+            "{target}: the run halted AT its guard"
+        );
+        assert_metadata_partial_is_the_disk(target, &case, &failure, 0);
+    }
+
+    let mut case = MetaCaseV1::of(&capsule, CustodyGitObjectFormatV1::Sha1);
+    // Some two thousand guards, each delayed a millisecond, still leave most of a generous deadline.
+    let _hook = install_git_hook_for_test(GitHookPointV1::DeadlineObserved, |_| {
+        std::thread::sleep(Duration::from_millis(1));
+    });
+    case.attempt_by(Instant::now() + 20 * B2B_DEADLINE_V1)
+        .unwrap_or_else(|failure| panic!("brief delays leave headroom: {:?}", failure.cause));
+}
+
+/// No success past the deadline: when the clock passes at any guard of the FINAL gate (its entry, the guard
+/// right after its mount census, and the last guard right before the root's identity), the run still
+/// refuses, with every entry made and reported. The identity check is therefore the last fallible call.
+#[test]
+fn b2b_a_deadline_spent_in_the_final_gate_cannot_succeed() {
+    let capsule = captured(CustodyGitObjectFormatV1::Sha1);
+    for (row, label) in [
+        ("the final gate's entry", "metadata-final"),
+        ("the guard after the final census", "objects-chain"),
+        ("the last guard before the root's identity", "root"),
+    ] {
+        let mut case = MetaCaseV1::of(&capsule, CustodyGitObjectFormatV1::Sha1);
+        let deadline = Instant::now() + B2B_DEADLINE_V1;
+        let in_final = std::rc::Rc::new(std::cell::Cell::new(false));
+        let fired = std::rc::Rc::new(std::cell::Cell::new(false));
+        let started = in_final.clone();
+        let _gate = install_git_hook_for_test(GitHookPointV1::BeforeMetadataFinalGate, move |_| {
+            started.set(true);
+        });
+        let (inside, once) = (in_final.clone(), fired.clone());
+        let _hook = install_git_hook_for_test(GitHookPointV1::DeadlineObserved, move |event| {
+            if inside.get() && event.label == label && !once.replace(true) {
+                pass_the_deadline(deadline);
+            }
+        });
+        let failure = timed_out_metadata(row, case.attempt_by(deadline));
+        assert!(fired.get(), "{row}: the final gate never read that guard");
+        assert_eq!(
+            failure.partial.charged.entries, 13,
+            "{row}: every entry was already made"
+        );
+        assert_eq!(failure.partial.files.len(), 7, "{row}");
+        assert_eq!(failure.last_completed, Some(GitPlaneStepV1::Refs), "{row}");
+    }
+}
+
+/// The deadline observed after the recheck, the decode, the read, the agreement, and the config step's start
+/// is never followed by an effect.
+const B2B_SPENT_DEADLINE_V1: Duration = Duration::from_millis(1200);
+
+/// No effect follows a guard that finds the deadline spent. Each guard that stands between a blocking step
+/// and the next effect (after every non-final recheck and gate, each frame's start, each decoded entry, each
+/// content read, each frame's decode, the agreement, and the config step's start) is made slow past the
+/// deadline at every occurrence in a clean run: the run refuses with a timeout and no create, chunk, read,
+/// write, or final-gate event follows it, and the facts say exactly what had been done.
+#[test]
+fn b2b_no_effect_follows_a_guard_that_finds_the_deadline_spent() {
+    let capsule = empty(CustodyGitObjectFormatV1::Sha1);
+    let targets = [
+        "metadata-checked",
+        "metadata-frame",
+        "metadata-item",
+        "metadata-read",
+        "metadata-decoded",
+        "metadata-agreed",
+        "metadata-config",
+    ];
+    let mut learn = MetaCaseV1::of(&capsule, CustodyGitObjectFormatV1::Sha1);
+    let (labels, hook) = record_guards();
+    let _ = learn.done("a clean run");
+    let rows: Vec<(&str, usize)> = targets
+        .into_iter()
+        .map(|wanted| {
+            (
+                wanted,
+                labels
+                    .borrow()
+                    .iter()
+                    .filter(|label| **label == wanted)
+                    .count(),
+            )
+        })
+        .collect();
+    drop(hook);
+    // One refs frame of HEAD, three directories, and the config: eighteen rechecks, two reads.
+    assert_eq!(
+        rows,
+        [
+            ("metadata-checked", 18),
+            ("metadata-frame", 1),
+            ("metadata-item", 4),
+            ("metadata-read", 2),
+            ("metadata-decoded", 1),
+            ("metadata-agreed", 1),
+            ("metadata-config", 1),
+        ]
+    );
+    for (target, total) in rows {
+        for nth in 1..=total {
+            let row = format!("{target} #{nth}");
+            let mut case = MetaCaseV1::of(&capsule, CustodyGitObjectFormatV1::Sha1);
+            let deadline = Instant::now() + B2B_SPENT_DEADLINE_V1;
+            let spent = std::rc::Rc::new(std::cell::Cell::new(false));
+            let seen = std::rc::Rc::new(std::cell::Cell::new(0_usize));
+            let effects = std::rc::Rc::new(std::cell::RefCell::new(Vec::<String>::new()));
+            let (flag, counter) = (spent.clone(), seen.clone());
+            let _clock =
+                install_git_hook_for_test(GitHookPointV1::DeadlineObserved, move |event| {
+                    if event.label == target {
+                        counter.set(counter.get() + 1);
+                        if counter.get() == nth {
+                            flag.set(true);
+                            pass_the_deadline(deadline);
+                        }
+                    }
+                });
+            let mut effect_hooks = Vec::new();
+            for point in [
+                GitHookPointV1::BeforeObjectCreate,
+                GitHookPointV1::BeforeObjectChunk,
+                GitHookPointV1::ObjectIo,
+                GitHookPointV1::BeforeMetadataFinalGate,
+            ] {
+                let (flag, log) = (spent.clone(), effects.clone());
+                effect_hooks.push(install_git_hook_for_test(point, move |event| {
+                    if flag.get() {
+                        log.borrow_mut()
+                            .push(format!("{point:?} {} {:?}", event.label, event.path));
+                    }
+                }));
+            }
+            let failure = timed_out_metadata(&row, case.attempt_by(deadline));
+            drop(effect_hooks);
+            assert!(spent.get(), "{row}: the guard never ran");
+            assert!(
+                effects.borrow().is_empty(),
+                "{row}: effects after the spent guard: {:?}",
+                effects.borrow()
+            );
+            match target {
+                // The chunk that was read is neither charged nor written: the file exists, empty.
+                "metadata-read" => {
+                    let flight = failure.partial.in_flight.as_ref().expect("in flight");
+                    assert_eq!(flight.written, 0, "{row}");
+                    assert_eq!(
+                        failure.partial.charged.bytes,
+                        if nth == 1 {
+                            0
+                        } else {
+                            HEAD_BYTES_V1.len() as u64
+                        },
+                        "{row}"
+                    );
+                }
+                // A judged entry that was never created is neither charged nor on disk.
+                "metadata-item" => {
+                    assert_eq!(failure.partial.charged.entries, nth as u64 - 1, "{row}");
+                }
+                "metadata-agreed" => {
+                    assert_eq!(
+                        failure.last_completed,
+                        Some(GitPlaneStepV1::Metadata),
+                        "{row}"
+                    );
+                    assert!(!exists(&case.meta("config")), "{row}");
+                }
+                "metadata-config" => {
+                    assert_eq!(failure.last_completed, Some(GitPlaneStepV1::Refs), "{row}");
+                    assert!(!exists(&case.meta("config")), "{row}");
+                }
+                _ => {}
+            }
+            assert_metadata_partial_is_the_disk(&row, &case, &failure, 0);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// The step's own writes observe the one deadline
+//
+// A blocking call cannot be preempted, so the deadline can pass INSIDE a read or a write. Whatever such a
+// call returns (a prefix, an interruption, the last byte), no further call follows it: every continuation of
+// a short write reads the same absolute clock first, and a write that stops there keeps exactly the bytes the
+// file accepted charged, giving back the rest of the chunk it had reserved. The returned call is made slow
+// through the `ObjectIo` hook, and the two results a regular file does not produce on demand, an interruption
+// and a short write, are injected by the test-only seams.
+// ---------------------------------------------------------------------------------------------
+
+/// Short writes (five bytes at most), an interruption of two writes, and 16-byte chunks: the run a signal-prone
+/// or network filesystem gives. The first writes of the first file are interrupted.
+fn retry_script_b2b() -> Vec<GitSeamGuardV1> {
+    vec![
+        override_object_copy_chunk_for_test(16),
+        short_writes_of_five(),
+        interrupt_object_calls_for_test(ObjectCallV1::Write, 2),
+    ]
+}
+
+/// A write that accepts only a prefix of a chunk and then returns AFTER the deadline is followed by no second
+/// write: the file keeps exactly the accepted prefix, the ledger and the facts keep exactly those bytes
+/// charged (the rest of the 16-byte chunk, reserved and never written, is given back), and nothing after the
+/// file is created. The write that completes the chunk leaves nothing to give back, and no later chunk is read.
+#[test]
+fn b2b_a_slow_short_write_keeps_exactly_the_accepted_prefix_and_makes_no_second_write() {
+    let _chunk = override_object_copy_chunk_for_test(16);
+    let capsule = empty(CustodyGitObjectFormatV1::Sha1);
+    for (row, slow_write, accepted) in [
+        ("the first write took five of sixteen", 1_usize, 5_u64),
+        ("the second write took five more", 2, 10),
+        ("the third write took five more", 3, 15),
+        ("the fourth write completed the chunk", 4, 16),
+    ] {
+        let mut case = MetaCaseV1::of(&capsule, CustodyGitObjectFormatV1::Sha1);
+        let (first, _, before) = first_file_of(&case);
+        let output = case.meta(&first);
+        let original = case.expected_frames()[&first].clone().expect("a file");
+        let _fault = short_writes_of_five();
+        let deadline = Instant::now() + B2A_SLOW_CALL_DEADLINE_V1;
+        let clock = CallClockV1::watch(
+            deadline,
+            Some(("write", slow_write, &output)),
+            Duration::ZERO,
+        );
+        let failure = timed_out_metadata(row, case.attempt_by(deadline));
+        assert!(clock.fired(), "{row}: the slow write never ran");
+        assert_eq!(
+            clock.after_the_slow_call(),
+            Vec::<String>::new(),
+            "{row}: a call followed the write that returned after the deadline"
+        );
+        assert_eq!(clock.count("write"), slow_write, "{row}: no second write");
+        assert_eq!(clock.count("read"), 1, "{row}: no later chunk was read");
+        let flight = failure
+            .partial
+            .in_flight
+            .as_ref()
+            .expect("the first file in flight");
+        assert_eq!(flight.written, accepted, "{row}: the retained fact");
+        let on_disk = std::fs::read(&output).expect("the partial file");
+        assert_eq!(on_disk.len() as u64, accepted, "{row}: the file on disk");
+        assert_eq!(&original[..on_disk.len()], &on_disk[..], "{row}: a prefix");
+        assert_eq!(
+            failure.partial.charged,
+            MetadataChargeV1 {
+                entries: before + 1,
+                bytes: accepted
+            },
+            "{row}: exactly the accepted bytes stay charged"
+        );
+        assert_metadata_partial_is_the_disk(row, &case, &failure, 0);
+    }
+}
+
+/// An interrupted write returns without having done anything, and it is retried only while the deadline is
+/// still ahead: an interruption that returns after it is followed by no further call on that descriptor. A
+/// write interrupted that way gives back all of its chunk's reservation; one that follows an accepted prefix
+/// keeps exactly that prefix.
+#[test]
+fn b2b_an_interrupted_write_is_never_retried_after_the_deadline() {
+    let _chunk = override_object_copy_chunk_for_test(16);
+    let capsule = empty(CustodyGitObjectFormatV1::Sha1);
+    // (row, interruptions, short writes, the slow write's number, writes that ran, bytes the file accepted)
+    for (row, interruptions, short, slow_write, writes, accepted) in [
+        (
+            "the first write was interrupted and slow",
+            3_u32,
+            false,
+            1_usize,
+            1_usize,
+            0_u64,
+        ),
+        (
+            "the third write was interrupted and slow, after two prompt retries",
+            3,
+            false,
+            3,
+            3,
+            0,
+        ),
+        (
+            "an interrupted write, then five of sixteen accepted slowly",
+            1,
+            true,
+            2,
+            2,
+            5,
+        ),
+    ] {
+        let mut case = MetaCaseV1::of(&capsule, CustodyGitObjectFormatV1::Sha1);
+        let (first, _, before) = first_file_of(&case);
+        let output = case.meta(&first);
+        let _interrupts = interrupt_object_calls_for_test(ObjectCallV1::Write, interruptions);
+        let _short = short.then(short_writes_of_five);
+        let deadline = Instant::now() + B2A_SLOW_CALL_DEADLINE_V1;
+        let clock = CallClockV1::watch(
+            deadline,
+            Some(("write", slow_write, &output)),
+            Duration::ZERO,
+        );
+        let failure = timed_out_metadata(row, case.attempt_by(deadline));
+        assert!(clock.fired(), "{row}: the slow call never ran");
+        assert_eq!(
+            clock.after_the_slow_call(),
+            Vec::<String>::new(),
+            "{row}: a call followed the interruption that returned after the deadline"
+        );
+        assert_eq!(clock.count("write"), writes, "{row}: writes");
+        assert_eq!(clock.count("read"), 1, "{row}: reads");
+        let flight = failure
+            .partial
+            .in_flight
+            .as_ref()
+            .expect("the first file in flight");
+        assert_eq!(flight.written, accepted, "{row}: the retained fact");
+        assert_eq!(
+            failure.partial.charged,
+            MetadataChargeV1 {
+                entries: before + 1,
+                bytes: accepted
+            },
+            "{row}: nothing reserved and never written stays charged"
+        );
+        assert_eq!(
+            std::fs::metadata(&output).expect("the file").len(),
+            accepted,
+            "{row}"
+        );
+        assert_metadata_partial_is_the_disk(row, &case, &failure, 0);
+    }
+}
+
+/// No chunk is read after the deadline: with chunks of 16 bytes, a deadline that passes before the second
+/// chunk of the first file stops the copy there. Exactly one chunk was read, charged, and written, and
+/// nothing after it.
+#[test]
+fn b2b_no_chunk_is_read_after_the_deadline() {
+    let _chunk = override_object_copy_chunk_for_test(16);
+    let capsule = empty(CustodyGitObjectFormatV1::Sha1);
+    let mut case = MetaCaseV1::of(&capsule, CustodyGitObjectFormatV1::Sha1);
+    let (first, length, before) = first_file_of(&case);
+    assert!(length > 16 && length <= 32);
+    let output = case.meta(&first);
+    let deadline = Instant::now() + B2B_DEADLINE_V1;
+    let chunks = std::rc::Rc::new(std::cell::Cell::new(0_usize));
+    let seen = chunks.clone();
+    let target = output.clone();
+    let _hook = install_git_hook_for_test(GitHookPointV1::BeforeObjectChunk, move |event| {
+        if event.path == target {
+            seen.set(seen.get() + 1);
+            if seen.get() == 2 {
+                pass_the_deadline(deadline);
+            }
+        }
+    });
+    let clock = CallClockV1::watch(deadline, None, Duration::ZERO);
+    let failure = timed_out_metadata(
+        "a deadline before the second chunk",
+        case.attempt_by(deadline),
+    );
+    assert_eq!(chunks.get(), 2, "no third chunk was started");
+    assert_eq!(clock.count("read"), 1, "the second chunk was never read");
+    let flight = failure
+        .partial
+        .in_flight
+        .as_ref()
+        .expect("the file in flight");
+    assert_eq!(flight.written, 16);
+    assert_eq!(
+        failure.partial.charged,
+        MetadataChargeV1 {
+            entries: before + 1,
+            bytes: 16
+        }
+    );
+    assert_eq!(std::fs::read(&output).expect("the partial file").len(), 16);
+    assert_metadata_partial_is_the_disk("a deadline before the second chunk", &case, &failure, 0);
+}
+
+/// Every call of the first file in a run full of interruptions and short writes, made slow in turn, is the
+/// last call: whichever returns after the deadline, the run refuses with a timeout, no call follows it, and
+/// the charge is exactly the bytes on disk.
+#[test]
+fn b2b_no_read_or_write_follows_a_call_that_returned_after_the_deadline() {
+    let capsule = empty(CustodyGitObjectFormatV1::Sha1);
+    let mut learn = MetaCaseV1::of(&capsule, CustodyGitObjectFormatV1::Sha1);
+    let (first, _, _) = first_file_of(&learn);
+    let output = learn.meta(&first);
+    let calls = {
+        let _script = retry_script_b2b();
+        let clock = CallClockV1::watch(far_deadline(), None, Duration::ZERO);
+        let _ = learn.done("a clean scripted run");
+        clock.labels_on(&output)
+    };
+    let total = calls.len();
+    assert!(
+        total >= 8,
+        "the first file spans several chunks and writes: {calls:?}"
+    );
+    for nth in 1..=total {
+        let row = format!("call {nth} of {total}: {}", calls[nth - 1]);
+        let mut case = MetaCaseV1::of(&capsule, CustodyGitObjectFormatV1::Sha1);
+        // This run's own file: every case has a destination of its own.
+        let target = case.meta(&first);
+        let _script = retry_script_b2b();
+        let deadline = Instant::now() + B2A_SLOW_CALL_DEADLINE_V1;
+        let counted = std::rc::Rc::new(std::cell::Cell::new(0_usize));
+        let after = std::rc::Rc::new(std::cell::RefCell::new(Vec::<String>::new()));
+        let slowed = std::rc::Rc::new(std::cell::Cell::new(false));
+        let (seen, log, flag) = (counted.clone(), after.clone(), slowed.clone());
+        let _hook = install_git_hook_for_test(GitHookPointV1::ObjectIo, move |event| {
+            if flag.get() {
+                log.borrow_mut()
+                    .push(format!("{} {:?}", event.label, event.path));
+                return;
+            }
+            if event.path == target {
+                seen.set(seen.get() + 1);
+                if seen.get() == nth {
+                    flag.set(true);
+                    pass_the_deadline(deadline);
+                }
+            }
+        });
+        let failure = timed_out_metadata(&row, case.attempt_by(deadline));
+        assert!(slowed.get(), "{row}: the slow call never ran");
+        assert_eq!(
+            *after.borrow(),
+            Vec::<String>::new(),
+            "{row}: a call followed it"
+        );
+        assert_eq!(counted.get(), nth, "{row}");
+        assert!(
+            failure.partial.files.is_empty(),
+            "{row}: the first file is in flight"
+        );
+        assert_metadata_partial_is_the_disk(&row, &case, &failure, 0);
+    }
+}
+
+/// With headroom, the same run of interruptions and short writes completes: every interrupted write is
+/// retried, every short write is continued to the whole chunk, the files are the frame's exact bytes and the
+/// golden config, and the charge is exactly what is on disk, with the brief delays of a slow filesystem at
+/// every call.
+#[test]
+fn b2b_interrupted_and_short_writes_with_headroom_restore_exactly_and_conserve_the_ledger() {
+    let capsule = captured(CustodyGitObjectFormatV1::Sha1);
+    for (row, pause) in [
+        ("no delay", Duration::ZERO),
+        ("a millisecond at every call", Duration::from_millis(1)),
+    ] {
+        let mut case = MetaCaseV1::of(&capsule, CustodyGitObjectFormatV1::Sha1);
+        let mut expected = case.expected_frames();
+        expected.insert(
+            "config".to_owned(),
+            Some(golden_config(case.format).to_vec()),
+        );
+        let _script = retry_script_b2b();
+        let deadline = Instant::now() + 10 * B2B_DEADLINE_V1;
+        let clock = CallClockV1::watch(deadline, None, pause);
+        let done = case
+            .attempt_by(deadline)
+            .unwrap_or_else(|failure| panic!("{row}: headroom must succeed: {:?}", failure.cause));
+        assert_eq!(case.metadata_on_disk(), expected, "{row}: the exact bytes");
+        let lengths: Vec<u64> = expected
+            .values()
+            .filter_map(|content| content.as_ref().map(|bytes| bytes.len() as u64))
+            .collect();
+        assert_eq!(
+            done.charged,
+            MetadataChargeV1 {
+                entries: 13,
+                bytes: lengths.iter().sum()
+            },
+            "{row}"
+        );
+        // 16-byte chunks, five-byte writes, and the two interrupted writes of the first file.
+        let reads: u64 = lengths.iter().map(|length| length.div_ceil(16)).sum();
+        let writes: u64 = lengths
+            .iter()
+            .map(|length| {
+                (0..length.div_ceil(16))
+                    .map(|chunk| (length - chunk * 16).min(16).div_ceil(5))
+                    .sum::<u64>()
+            })
+            .sum();
+        assert_eq!(clock.count("read") as u64, reads, "{row}: reads");
+        assert_eq!(clock.count("write") as u64, writes + 2, "{row}: writes");
+        assert_eq!(clock.count("probe"), 0, "{row}: the step probes nothing");
+    }
+}
+
+/// A write that FAILS after interruptions or short writes still conserves the ledger exactly: the bytes the
+/// file accepted stay charged and reported (a failure and a zero-length write are the same refusal as before,
+/// never a loop, and never a timeout while the deadline is ahead), and the rest of the chunk is given back.
+/// The interruptions before it are retried.
+#[test]
+fn b2b_a_write_failure_after_retries_conserves_the_ledger() {
+    let _chunk = override_object_copy_chunk_for_test(16);
+    let capsule = empty(CustodyGitObjectFormatV1::Sha1);
+    // (row, interrupted writes, the failure, the bytes the file accepted, writes that ran)
+    for (row, interruptions, fault, accepted, writes) in [
+        (
+            "two interrupted writes, then five bytes, then an I/O error",
+            2_u32,
+            ObjectFaultV1::WriteAfter(5),
+            5_u64,
+            4_usize,
+        ),
+        (
+            "an interrupted write, then seven bytes, then a zero-length write",
+            1,
+            ObjectFaultV1::WriteZeroAfter(7),
+            7,
+            3,
+        ),
+    ] {
+        let mut case = MetaCaseV1::of(&capsule, CustodyGitObjectFormatV1::Sha1);
+        let (first, _, before) = first_file_of(&case);
+        let _interrupts = interrupt_object_calls_for_test(ObjectCallV1::Write, interruptions);
+        let _fault = override_object_fault_for_test(fault);
+        let clock = CallClockV1::watch(far_deadline(), None, Duration::ZERO);
+        let failure = case.refused(row);
+        match &failure.cause {
+            GitBootstrapErrorV1::Restore(CustodyRestoreErrorV1::Io(detail)) => {
+                assert!(detail.contains(&first), "{row}: {detail}");
+            }
+            other => panic!("{row}: {other:?}"),
+        }
+        assert_eq!(
+            (clock.count("read"), clock.count("write")),
+            (1, writes),
+            "{row}: the interrupted writes were retried, and nothing else ran"
+        );
+        let flight = failure
+            .partial
+            .in_flight
+            .as_ref()
+            .expect("the first file in flight");
+        assert_eq!(flight.written, accepted, "{row}: the retained fact");
+        assert_eq!(
+            failure.partial.charged,
+            MetadataChargeV1 {
+                entries: before + 1,
+                bytes: accepted
+            },
+            "{row}: exactly the bytes that reached the file stay charged"
+        );
+        assert_metadata_partial_is_the_disk(row, &case, &failure, 0);
+    }
+}
+
+/// The recheck between two entries is bounded to the new entry's own chain, so the work of a restore grows with
+/// its entries and not with their square: eighty sibling directories cost a few chain checks each, where a
+/// full recheck per entry would cost on the order of the entries made so far (thousands more).
+#[test]
+fn b2b_the_recheck_between_entries_does_not_grow_with_the_entries_made() {
+    let capsule = empty(CustodyGitObjectFormatV1::Sha1);
+    let mut refs = base_refs();
+    for number in 0..80 {
+        refs = refs.dir(&format!("refs/tags/t{number:02}"));
+    }
+    let mut case = MetaCaseV1::with_frames(
+        &capsule,
+        CustodyGitObjectFormatV1::Sha1,
+        &refs,
+        None,
+        vec![symbolic_ref("HEAD", "refs/heads/main")],
+    );
+    let (labels, _hook) = record_guards();
+    let done = case.done("eighty directories");
+    assert_eq!(done.directories.len(), 83);
+    let chains = labels
+        .borrow()
+        .iter()
+        .filter(|label| **label == "metadata-chain")
+        .count();
+    // The exact count: each directory costs its parent's chain before its create and its own after, each
+    // file three times its parent's chain (the config sits in `.git`, which is no metadata directory), and a
+    // full recheck costs one step per directory and file made so far: none at the entry and at the first
+    // frame's start, then the frame's 84 entries at the gate after it, before the refs are read, and at the
+    // config gate, and those and the config at the final gate. A per-entry recheck of everything made would
+    // cost thousands more, and one that skipped the chain fewer.
+    let depth = |path: &str| path.matches('/').count() + 1;
+    let parent_depth = |path: &str| path.rsplit_once('/').map_or(0, |(parent, _)| depth(parent));
+    let mut expected = 0;
+    for relative in done.directories.keys() {
+        expected += parent_depth(relative) + depth(relative);
+    }
+    let frame_files: Vec<&str> = done
+        .files
+        .iter()
+        .map(|file| file.relative.as_str())
+        .filter(|relative| *relative != "config")
+        .collect();
+    for relative in &frame_files {
+        expected += 3 * parent_depth(relative);
+    }
+    let made = done.directories.len() + frame_files.len();
+    expected += 4 * made + 1;
+    assert_eq!(chains, expected, "metadata chain checks for {made} entries");
+    assert!(chains < 1500, "{chains}: linear in the entries made");
+}
+
+// ---------------------------------------------------------------------------------------------
+// The step's inputs, and its typed progress
+// ---------------------------------------------------------------------------------------------
+
+/// The step builds on exactly one restore's earlier passes: a plan that is not this capsule's, a bootstrap
+/// that is not a proven object store, and an object copy that is not the copy of this bootstrap's admitted
+/// files (not completed, a file missing, another digest, another name) each refuse before the first entry,
+/// carrying the caller's step and beginning nothing.
+#[test]
+fn b2b_the_inputs_must_be_one_restores_and_refuse_before_any_write() {
+    type TamperV1 = fn(&mut MetaCaseV1);
+    type ExpectedV1 = fn(&GitBootstrapErrorV1) -> bool;
+    let rows: Vec<(&str, TamperV1, ExpectedV1)> = vec![
+        (
+            "a plan that is not this capsule's",
+            |case| case.store.plan.frames.reverse(),
+            |cause| matches!(cause, GitBootstrapErrorV1::ActivePlanMismatch(_)),
+        ),
+        (
+            "a bootstrap whose strict fsck was not proven",
+            |case| case.store.boot.closure.fsck_strict = false,
+            |cause| matches!(cause, GitBootstrapErrorV1::ObjectStoreInput(_)),
+        ),
+        (
+            "an object copy that has not completed its step",
+            |case| case.objects.step = GitPlaneStepV1::Admission,
+            |cause| matches!(cause, GitBootstrapErrorV1::MetadataInput(_)),
+        ),
+        (
+            "an object copy with a file missing",
+            |case| {
+                case.objects.files.pop();
+            },
+            |cause| matches!(cause, GitBootstrapErrorV1::MetadataInput(_)),
+        ),
+        (
+            "an object copy file with another digest",
+            |case| case.objects.files[0].sha256[0] ^= 1,
+            |cause| matches!(cause, GitBootstrapErrorV1::MetadataInput(_)),
+        ),
+        (
+            "an object copy file with another length",
+            |case| case.objects.files[1].length += 1,
+            |cause| matches!(cause, GitBootstrapErrorV1::MetadataInput(_)),
+        ),
+        (
+            "an object copy file with another name",
+            |case| case.objects.files[2].relative.push('x'),
+            |cause| matches!(cause, GitBootstrapErrorV1::MetadataInput(_)),
+        ),
+    ];
+    let capsule = captured(CustodyGitObjectFormatV1::Sha1);
+    for (row, tamper, expected) in rows {
+        for completed in [None, Some(GitPlaneStepV1::Admission), B2B_COMPLETED_V1] {
+            let mut case = MetaCaseV1::of(&capsule, CustodyGitObjectFormatV1::Sha1);
+            tamper(&mut case);
+            let tree = snapshot(&case.dest().path);
+            let ledger = case.ledger();
+            let failure = match case.attempt_with(
+                far_deadline(),
+                completed,
+                B2B_TABLE_BOUND_V1,
+                RefsLimitsV1::v1(),
+            ) {
+                Ok(_) => panic!("{row}: must refuse"),
+                Err(failure) => failure,
+            };
+            assert!(expected(&failure.cause), "{row}: {:?}", failure.cause);
+            assert_eq!(
+                failure.last_completed, completed,
+                "{row}: the caller's step is carried"
+            );
+            assert!(!failure.active_materialization_began, "{row}");
+            assert_eq!(failure.partial.charged, none_charged(), "{row}");
+            assert_eq!(case.ledger(), ledger, "{row}: the ledger");
+            assert_eq!(
+                snapshot(&case.dest().path),
+                tree,
+                "{row}: a byte was written"
+            );
+        }
+    }
+}
+
+/// Complete G needs a captured HEAD: a bootstrap whose capsule has an Empty `RefsAndHead` class is the typed
+/// pre-write refusal, for both caller formats, before the object copy is even compared: no HEAD is
+/// synthesized, nothing is created, and the caller's step is carried.
+#[test]
+fn b2b_empty_refs_refuse_before_any_write_and_no_head_is_synthesized() {
+    for cformat in BOTH_CAPSULE_FORMATS_V1 {
+        let sibling = MetaCaseV1::of(&empty(cformat), cformat);
+        let capsule = empty(cformat);
+        let CaseV1 { dest, verified } = CaseV1::with_bytes(&capsule, &[]);
+        let boot = must_bootstrap(verified, core_format(cformat));
+        let tree = snapshot(&dest.path);
+        let ledger = ledger_used(&boot.verified);
+        let failure = materialize_active_metadata_v1(
+            &boot,
+            &sibling.objects,
+            &ActiveFramePlanV1 { frames: vec![] },
+            frame_budget(),
+            far_deadline(),
+            B2B_COMPLETED_V1,
+        )
+        .expect_err("an Empty RefsAndHead");
+        assert!(
+            matches!(failure.cause, GitBootstrapErrorV1::EmptyRefsAndHead),
+            "{cformat:?}: {:?}",
+            failure.cause
+        );
+        assert_eq!(failure.last_completed, B2B_COMPLETED_V1);
+        assert!(!failure.active_materialization_began);
+        assert_eq!(failure.partial.charged, none_charged());
+        assert_eq!(failure.ledger_used, ledger);
+        assert_eq!(snapshot(&dest.path), tree);
+        assert_eq!(
+            dest.entries(),
+            [".restore-work"],
+            "{cformat:?}: no repository exists"
+        );
+    }
+}
+
+/// Typed progress: the last completed step is the caller's until the frames are all restored and the gate
+/// after them passes (`Metadata`), then until the refs agree (`Refs`); the config step completes only in a
+/// success (`Config`). The caller's own step is carried unchanged on every refusal before the metadata step
+/// completes, whatever it is.
+#[test]
+fn b2b_the_last_completed_step_is_typed_at_each_step() {
+    let capsule = captured(CustodyGitObjectFormatV1::Sha1);
+    for completed in [None, Some(GitPlaneStepV1::Admission), B2B_COMPLETED_V1] {
+        // A refusal after writes began but before the metadata step completes: the caller's own.
+        let mut case = MetaCaseV1::of(&capsule, CustodyGitObjectFormatV1::Sha1);
+        let name = format!(
+            "repository/.git/{}",
+            creation_order(&capsule, CustodyGitObjectFormatV1::Sha1)[3].0
+        );
+        let _device = override_created_dev_for_test(&name, device_of(&case.dest().path) + 1);
+        let failure = match case.attempt_with(
+            far_deadline(),
+            completed,
+            B2B_TABLE_BOUND_V1,
+            RefsLimitsV1::v1(),
+        ) {
+            Ok(_) => panic!("a device refusal"),
+            Err(failure) => failure,
+        };
+        assert_eq!(failure.last_completed, completed);
+        assert!(failure.active_materialization_began);
+        drop(_device);
+
+        // The metadata step is whole and the agreement refuses: `Metadata`, whatever the caller's step was.
+        let mut case = MetaCaseV1::of(&capsule, CustodyGitObjectFormatV1::Sha1);
+        let specs = real_specs(&capsule, case.format);
+        let mut refs = specs.manifest_refs.clone();
+        refs.push(symbolic_ref("refs/heads/link", "refs/heads/main"));
+        set_refs(&mut case.store.boot.verified, refs);
+        let failure = match case.attempt_with(
+            far_deadline(),
+            completed,
+            B2B_TABLE_BOUND_V1,
+            RefsLimitsV1::v1(),
+        ) {
+            Ok(_) => panic!("an agreement refusal"),
+            Err(failure) => failure,
+        };
+        assert_eq!(failure.last_completed, Some(GitPlaneStepV1::Metadata));
+
+        // The refs agree and the config collides: `Refs`.
+        let mut case = MetaCaseV1::of(&capsule, CustodyGitObjectFormatV1::Sha1);
+        let config = case.meta("config");
+        let planted = std::rc::Rc::new(std::cell::Cell::new(false));
+        let (flag, at) = (planted.clone(), config.clone());
+        let _hook = install_git_hook_for_test(GitHookPointV1::BeforeObjectCreate, move |event| {
+            if event.path == at && !flag.replace(true) {
+                std::fs::write(&at, b"planted").expect("a planted config");
+            }
+        });
+        let failure = match case.attempt_with(
+            far_deadline(),
+            completed,
+            B2B_TABLE_BOUND_V1,
+            RefsLimitsV1::v1(),
+        ) {
+            Ok(_) => panic!("a config collision"),
+            Err(failure) => failure,
+        };
+        assert_eq!(failure.last_completed, Some(GitPlaneStepV1::Refs));
+        assert_eq!(
+            std::fs::read(&config).expect("the planted config"),
+            b"planted"
+        );
+        drop(_hook);
+
+        // A success: the config step.
+        let mut case = MetaCaseV1::of(&capsule, CustodyGitObjectFormatV1::Sha1);
+        let done = case
+            .attempt_with(
+                far_deadline(),
+                completed,
+                B2B_TABLE_BOUND_V1,
+                RefsLimitsV1::v1(),
+            )
+            .unwrap_or_else(|failure| panic!("a clean run: {:?}", failure.cause));
+        assert_eq!(done.step, GitPlaneStepV1::Config);
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Structure: B2b's region creates and charges, and only that
+// ---------------------------------------------------------------------------------------------
+
+/// STRUCTURAL ONLY. B2b's region (the production source from its marker on, up to the end of the file) is held
+/// to its own vocabulary, because B2a's create-new scan now ends at this marker: it opens no path, walks
+/// nothing, runs no Git child or process, routes no object store, renames, removes, truncates, links, or
+/// re-permissions nothing, has no unsafe, names the `config` leaf exactly once, and names no hook, alternate,
+/// info, shallow, index, module, or worktree entry, nor any ref or HEAD path. Everything it creates is
+/// create-new beneath a retained pin. The marker is unique, follows B2a's region, and the region holds the
+/// entry point. The behavior is proven by the rows above, which run the code.
+#[test]
+fn b2b_the_metadata_region_is_create_new_only_and_the_split_is_unique() {
+    let source = include_str!("custody_restore_git.rs");
+    assert_eq!(source.matches(B2B_MARKER_V1).count(), 1, "one marker");
+    assert_eq!(source.matches(B2A_MARKER_V1).count(), 1, "one B2a marker");
+    let (before, region) = source.split_once(B2B_MARKER_V1).expect("the marker");
+    assert!(before.contains(B2A_MARKER_V1), "B2b follows B2a");
+    assert!(before.contains("pub(crate) fn materialize_object_store_v1("));
+    assert!(region.contains("pub(crate) fn materialize_active_metadata_v1("));
+    assert!(
+        !before.contains("materialize_active_metadata_v1("),
+        "the earlier passes do not call B2b"
+    );
+    let code: String = region
+        .lines()
+        .filter(|line| !line.trim_start().starts_with("//"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    for forbidden in [
+        "std::fs",
+        "File::open(",
+        "OpenOptions",
+        "read_dir(",
+        "GitRunnerV1",
+        "GitRunRequestV1",
+        "GitCommandV1",
+        "GitObjectStoreRouteV1",
+        "remeasure_git_directory",
+        "measure_git_directory",
+        "walk",
+        "Command",
+        "spawn",
+        "std::process",
+        "mkdir",
+        "rename",
+        "remove_file",
+        "remove_dir",
+        "unlink",
+        "set_len",
+        "truncate",
+        "hard_link",
+        "symlink(",
+        "set_permissions",
+        "unsafe",
+        "WorkV1",
+        "OwnedChargeV1",
+        "settle_to",
+        "\"HEAD\"",
+        "\"refs\"",
+        "\"logs\"",
+        "\"hooks\"",
+        "\"alternates\"",
+        "\"info\"",
+        "\"shallow\"",
+        "\"index\"",
+        "\"modules\"",
+        "\"worktrees\"",
+        "ORIG_HEAD",
+        "FETCH_HEAD",
+        "packed-refs",
+    ] {
+        assert!(
+            !code.contains(forbidden),
+            "the metadata region mentions `{forbidden}`"
+        );
+    }
+    assert_eq!(
+        code.matches("\"config\"").count(),
+        1,
+        "the config leaf is named exactly once"
+    );
+    // What it does use: create-new beneath retained pins, the one deadline, the one ledger, the retained
+    // descriptors, the pass B1a rules again, and the pass B1b parsers.
+    for required in [
+        "create_staging_directory(",
+        "create_output_file(",
+        "observe_deadline(",
+        "before_deadline(",
+        "stream_digest(",
+        "write_step(",
+        "give_back_unwritten(",
+        "reserve_entries(",
+        ".reserve(",
+        "sweep_chains(",
+        "output_chains(",
+        "source_files_unchanged(",
+        "refuse_mounts_within(",
+        "reverify_staged_v1(",
+        "ActivePathTableV1::new(",
+        ".admit(",
+        "CustodyFrameDecoderV1::new(",
+        "RefsBuilderV1::new(",
+        ".admit_file(",
+        ".finish(",
+        "encode_inert_config_v1(",
+        "try_clone(",
+    ] {
+        assert!(
+            code.contains(required),
+            "the metadata region lacks `{required}`"
+        );
+    }
+    // No retry or continuation loop on a descriptor beyond the guarded write loop and the guarded drain loop
+    // (each reads the one clock before every call, a retry included).
+    assert_eq!(
+        code.matches("Interrupted").count(),
+        2,
+        "the interrupted-write arm and the drain loop's guarded retry"
+    );
 }

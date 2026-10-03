@@ -84,6 +84,19 @@
 //! hooks are never copied, and no Git child runs. A refusal keeps every created byte and reports it as typed
 //! partial effects. The result is a helper value for the later passes, not phase G's result, and the pass A
 //! invariant above stays function-scoped: direct [`bootstrap_git_objects_v1`] still creates nothing there.
+//!
+//! **Pass B2b.** [`materialize_active_metadata_v1`] restores the active metadata beneath the retained
+//! `repository/.git` pin, after the object copy and before any final Git command. It reverifies each retained
+//! active frame from its descriptor immediately before a second complete decode, applies the pass B1a admission
+//! rules to every decoded entry again, and only then creates the entry: directories and regular files, each
+//! create-new beneath a retained pin this invocation made, charged to the one ledger (the entry, then every
+//! chunk) before it exists, the bytes exactly as the frame carries them. Each decoder is drained through its
+//! trailer; a later malformed byte is fatal and every partial byte stays. Before any config exists, every
+//! restored file is read back from its retained descriptor and agreed with the manifest's original refs and
+//! the verified inventory through the pass B1b parsers, and only then is the inert config created, once. The
+//! repository keeps one child, `.git`; no hook, include, filter, remote, or archived config is ever restored.
+//! Typed progress names the last step completed whole, and every pin and file is retained for the final
+//! passes. It runs no Git child and never reopens a staged name.
 
 use super::{
     create_staging_directory, hash_prefix, joined, lossy, recheck_entry, refuse_mounts_within,
@@ -99,7 +112,8 @@ use crate::custody_export::{
     GIT_DIR_MAX_ENTRIES_V1, GIT_MIN_STDOUT_LIMIT_V1, GIT_STDERR_LIMIT_V1, INDEX_PACK_ENTRIES_V1,
 };
 use crate::custody_frame::{
-    CustodyFrameBudgetV1, CustodyFrameDecoderV1, CustodyFrameEntryV1, CustodyFrameHeaderV1,
+    CustodyFrameBudgetV1, CustodyFrameContentReaderV1, CustodyFrameDecoderV1, CustodyFrameEntryV1,
+    CustodyFrameHeaderV1,
 };
 use crate::custody_git::{
     CustodyGitError, GitCommandV1, GitObjectFormatV1, GitRootNamesV1, GitRunRequestV1,
@@ -246,6 +260,11 @@ pub(crate) enum GitBootstrapErrorV1 {
     ObjectStoreInput(String),
     #[error("the copy of {relative} is not the admitted bytes: {detail}")]
     ObjectCopy { relative: String, detail: String },
+    // The active metadata and the final ref agreement (pass B2b).
+    #[error("the inputs of the metadata step are not one restore's: {0}")]
+    MetadataInput(String),
+    #[error("the metadata file {relative} is not the bytes that were written: {detail}")]
+    MetadataCopy { relative: String, detail: String },
     /// A child failed, and reconciling what it left behind failed too. Neither is dropped: the
     /// reconciliation failure is a budget or custody refusal in its own right.
     #[error("{primary}; reconciling the failed child's effects also failed: {reconcile}")]
@@ -398,6 +417,12 @@ pub(crate) enum GitHookPointV1 {
     /// label is `read` (a chunk read), `write`, or `probe` (the length probe), and the path is the new
     /// file (pass B2a). A hook that sleeps here is that call having been slow.
     ObjectIo,
+    /// All active metadata and the config exist, before the final gate: the path is the destination root
+    /// (pass B2b).
+    BeforeMetadataFinalGate,
+    /// One read of a restored file by the refs agreement has just returned, before its result is examined: the
+    /// path is that file (pass B2b). A hook that changes the file here changes what the parsers read next.
+    AfterRefsRead,
 }
 
 #[cfg(test)]
@@ -5955,6 +5980,1039 @@ pub(crate) fn materialize_object_store_v1(
             ledger_used: bootstrap.verified.destination.ledger.borrow().used(),
             partial: ObjectStorePartialV1 {
                 pins: run.pins,
+                files: run.files,
+                in_flight: run.in_flight,
+                charged: run.charged,
+            },
+        })),
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Pass B2b: exact active metadata and final ref agreement
+// ---------------------------------------------------------------------------------------------
+
+/// The one file the active `.git` receives that no frame carries: the inert config.
+const CONFIG_LEAF_V1: &str = "config";
+
+/// A metadata file copied whole is the same fact as an object file copied whole: its retained read-write
+/// descriptor at offset 0, and the length, SHA-256, device, and inode measured from it. Its `relative` name
+/// is beneath `.git` (`HEAD`, `refs/heads/main`, `config`).
+pub(crate) type MaterializedMetadataFileV1 = MaterializedObjectFileV1;
+/// The metadata file that was being created or written when a refusal came.
+pub(crate) type InFlightMetadataFileV1 = InFlightObjectFileV1;
+/// What the step charged to the one ledger and has not given back.
+pub(crate) type MetadataChargeV1 = ObjectStoreChargeV1;
+
+/// The active metadata, restored and agreed with the manifest, and the config created. This is a helper's
+/// value for the final passes, not phase G's result: no Git child has run on it, and no final proof of the
+/// restored repository belongs to it.
+#[derive(Debug)]
+pub(crate) struct FinalMetadataV1 {
+    /// The phase-G step this completes: [`GitPlaneStepV1::Config`].
+    pub(crate) step: GitPlaneStepV1,
+    /// Every metadata directory this step created and pinned, by its path beneath `.git` (`refs`,
+    /// `refs/heads`, `logs`, ...). Each is on the root's device.
+    pub(crate) directories: BTreeMap<String, PinnedDirectoryV1>,
+    /// Every metadata file, in creation order (the frames' regular files, then `config`), each retained
+    /// read-write at offset 0.
+    pub(crate) files: Vec<MaterializedMetadataFileV1>,
+    /// What the restored refs proved, read from the retained final descriptors.
+    pub(crate) agreement: RefsAgreementV1,
+    pub(crate) charged: MetadataChargeV1,
+}
+
+impl FinalMetadataV1 {
+    /// The config, the last file created.
+    pub(crate) fn config(&self) -> Option<&MaterializedMetadataFileV1> {
+        self.files
+            .last()
+            .filter(|file| file.relative == CONFIG_LEAF_V1)
+    }
+}
+
+/// What a refused invocation left: the directories that exist and are pinned, the files that are whole, the
+/// file in flight, and what it still has charged. Nothing here is ever removed.
+#[derive(Debug, Default)]
+pub(crate) struct MetadataPartialV1 {
+    pub(crate) directories: BTreeMap<String, PinnedDirectoryV1>,
+    pub(crate) files: Vec<MaterializedMetadataFileV1>,
+    pub(crate) in_flight: Option<InFlightMetadataFileV1>,
+    pub(crate) charged: MetadataChargeV1,
+}
+
+/// A refused or failed metadata step, with how far it got. `last_completed` is the last step that completed
+/// whole: the caller's own at entry, then [`GitPlaneStepV1::Metadata`] once every frame is restored, then
+/// [`GitPlaneStepV1::Refs`] once the refs agree; the config step completes only in a success.
+#[derive(Debug)]
+pub(crate) struct MetadataFailureV1 {
+    pub(crate) cause: GitBootstrapErrorV1,
+    pub(crate) last_completed: Option<GitPlaneStepV1>,
+    /// Whether THIS invocation may have created an entry. The object copy before it already began active
+    /// materialization, so the caller's own flag is the stronger one.
+    pub(crate) active_materialization_began: bool,
+    /// The one ledger's charge when the failure was returned.
+    pub(crate) ledger_used: u64,
+    pub(crate) partial: MetadataPartialV1,
+}
+
+fn metadata_input(why: impl Into<String>) -> GitBootstrapErrorV1 {
+    GitBootstrapErrorV1::MetadataInput(why.into())
+}
+
+fn metadata_copy(relative: &str, detail: impl Into<String>) -> GitBootstrapErrorV1 {
+    GitBootstrapErrorV1::MetadataCopy {
+        relative: relative.to_owned(),
+        detail: detail.into(),
+    }
+}
+
+/// `relative` split into the directory it is created in (`None` is `.git` itself) and its leaf.
+fn split_relative(relative: &str) -> (Option<&str>, &str) {
+    match relative.rsplit_once('/') {
+        Some((parent, leaf)) => (Some(parent), leaf),
+        None => (None, relative),
+    }
+}
+
+/// The destination-relative name of an entry beneath `.git`.
+fn metadata_name(relative: &str) -> String {
+    format!("{}/{relative}", ObjectDirV1::Git.name())
+}
+
+/// The retained pin of `parent` (`None` is `.git`), which must be one this invocation created and pinned.
+fn pin_beneath<'p>(
+    git: &'p PinnedDirectoryV1,
+    directories: &'p BTreeMap<String, PinnedDirectoryV1>,
+    parent: Option<&str>,
+) -> Result<&'p PinnedDirectoryV1, GitBootstrapErrorV1> {
+    match parent {
+        None => Ok(git),
+        Some(parent) => directories.get(parent).ok_or_else(|| {
+            metadata_input(format!(
+                "{}: its parent is not a retained directory of this restore",
+                metadata_name(parent)
+            ))
+        }),
+    }
+}
+
+/// `parent`'s entry `leaf` must still be the regular file measured as `(dev, ino, length)`. A link or any
+/// other object refuses, and nothing is followed.
+fn recheck_regular_entry(
+    parent: &PinnedDirectoryV1,
+    relative: &str,
+    measured: (u64, u64, u64),
+) -> Result<(), GitBootstrapErrorV1> {
+    let name = metadata_name(relative);
+    let stat = parent
+        .child_metadata_no_follow(
+            OsStr::new(split_relative(relative).1),
+            "custody restore metadata file",
+        )
+        .map_err(fs_error)?
+        .ok_or_else(|| digest_identity(&name, "the metadata file's entry is gone"))?;
+    match stat.kind {
+        ChildKindV1::Symlink => {
+            return Err(GitBootstrapErrorV1::Restore(
+                CustodyRestoreErrorV1::SymlinkRefused { name },
+            ))
+        }
+        ChildKindV1::Regular => {}
+        ChildKindV1::Directory | ChildKindV1::Special(_) => {
+            return Err(digest_identity(
+                &name,
+                "the entry is no longer the restored file",
+            ))
+        }
+    }
+    if (stat.dev, stat.ino, stat.size) != measured {
+        return Err(digest_identity(
+            &name,
+            "the entry is no longer the restored file",
+        ));
+    }
+    Ok(())
+}
+
+/// One decoded frame entry, as the step judges it.
+struct FrameEntryV1<'e> {
+    class: CustodyCoverageClassV1,
+    path: &'e [u8],
+    kind: ActiveEntryKindV1,
+    length: u64,
+}
+
+/// A refusal that ends a decode at once instead of being held until the stream is verified: the deadline
+/// (nothing more is read after it), and the decoder's own failure (it is poisoned and cannot be drained). Every
+/// other fault comes from what was DONE with a decoded entry, and is held.
+fn ends_the_decode(error: &GitBootstrapErrorV1) -> bool {
+    matches!(
+        error,
+        GitBootstrapErrorV1::Git(CustodyGitError::Timeout)
+            | GitBootstrapErrorV1::Restore(CustodyRestoreErrorV1::FrameInvalid { .. })
+    )
+}
+
+/// A refusal that ends a parse of a retained file at once instead of being held until the file is read to its
+/// end: the deadline, and a read the descriptor itself failed. Every other fault is about what the bytes say.
+fn ends_the_parse(error: &GitBootstrapErrorV1) -> bool {
+    matches!(
+        error,
+        GitBootstrapErrorV1::Git(CustodyGitError::Timeout)
+            | GitBootstrapErrorV1::Refs(RefsFaultV1::Unreadable { .. })
+    )
+}
+
+/// The retained descriptor of a restored file, bounded to one byte past its recorded length, as the parsers
+/// read it: every byte that passes is hashed and counted.
+struct DigestedReaderV1<'a> {
+    inner: io::Take<&'a File>,
+    context: digest::Context,
+    count: u64,
+    /// The file's path, for the test hook.
+    #[cfg(test)]
+    hook_path: std::path::PathBuf,
+}
+
+impl io::Read for DigestedReaderV1<'_> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        let read = self.inner.read(buffer);
+        #[cfg(test)]
+        run_git_hook(GitHookPointV1::AfterRefsRead, "", &self.hook_path);
+        let read = read?;
+        self.context.update(&buffer[..read]);
+        self.count = self.count.saturating_add(read as u64);
+        Ok(read)
+    }
+}
+
+/// Read `reader` to its end, discarding the bytes: the one absolute deadline is read before every read, so a
+/// retry of an interrupted read is held to it as well.
+fn drain_stream(
+    reader: &mut dyn io::Read,
+    deadline: Instant,
+    relative: &str,
+) -> Result<(), GitBootstrapErrorV1> {
+    let mut buffer = vec![0_u8; HASH_BUFFER_BYTES_V1];
+    loop {
+        before_deadline(deadline)?;
+        match reader.read(&mut buffer) {
+            Ok(0) => return Ok(()),
+            Ok(_) => {}
+            Err(error) if error.kind() == ErrorKind::Interrupted => {}
+            Err(error) => return Err(io_refusal(relative, &error)),
+        }
+    }
+}
+
+/// What a recheck covers of the metadata this step made.
+#[derive(Clone, Copy)]
+enum MetaScopeV1<'s> {
+    /// Every directory and file made so far.
+    All,
+    /// Only the chain of directories down to this one (`None` is `.git` itself): the bounded recheck
+    /// between two entries, whose cost does not grow with the number of entries made.
+    Chain(Option<&'s str>),
+}
+
+/// Where one file's bytes go: the destination, the one deadline, and the file's own names.
+struct SinkV1<'s> {
+    dest: &'s super::RestoreDestinationV1,
+    deadline: Instant,
+    relative: &'s str,
+    /// The file's path, for the test hooks.
+    hook_path: &'s Path,
+    length: u64,
+}
+
+/// Stream exactly `sink.length` bytes of `source` into `output`, at most one chunk in memory: the clock
+/// before every chunk and again after its read, each chunk charged to the one ledger BEFORE it is written,
+/// and each write an explicit call, so the fact in flight advances with every successful write and a
+/// failed or zero-length write stops the copy with the part of the chunk that was reserved and never
+/// written given back. A write that returned (a prefix, or an interruption that wrote nothing) is followed
+/// by another call only while the one deadline is still ahead. Returns the SHA-256 of the bytes written.
+fn stream_into(
+    sink: &SinkV1<'_>,
+    charged: &mut MetadataChargeV1,
+    in_flight: &mut Option<InFlightMetadataFileV1>,
+    output: &mut File,
+    source: &mut dyn io::Read,
+    source_fault: &dyn Fn() -> GitBootstrapErrorV1,
+) -> Result<[u8; 32], GitBootstrapErrorV1> {
+    let (dest, deadline, relative, length) = (sink.dest, sink.deadline, sink.relative, sink.length);
+    #[cfg(not(test))]
+    let _ = sink.hook_path;
+    let chunk = copy_chunk_bytes();
+    let mut buffer = vec![0_u8; chunk];
+    let mut context = digest::Context::new(&digest::SHA256);
+    let mut written = 0_u64;
+    while written < length {
+        #[cfg(test)]
+        run_git_hook(GitHookPointV1::BeforeObjectChunk, "", sink.hook_path);
+        before_deadline(deadline)?;
+        let want = usize::try_from(length - written).map_or(chunk, |left| left.min(chunk));
+        let step = source.read(&mut buffer[..want]);
+        #[cfg(test)]
+        run_git_hook(GitHookPointV1::ObjectIo, "read", sink.hook_path);
+        let read = step.map_err(|_| source_fault())?;
+        if read == 0 {
+            return Err(metadata_copy(
+                relative,
+                format!("the frame's content ended after {written} of {length} bytes"),
+            ));
+        }
+        // The read can block: the clock is read again before the chunk is charged and written.
+        observe_deadline(deadline, "metadata-read")?;
+        dest.ledger
+            .borrow_mut()
+            .reserve(read as u64)
+            .map_err(ledger_error)?;
+        charged.bytes += read as u64;
+        let mut offset = 0_usize;
+        let mut stopped: Option<GitBootstrapErrorV1> = None;
+        while offset < read {
+            let step = write_step(output, &buffer[offset..read], written);
+            #[cfg(test)]
+            run_git_hook(GitHookPointV1::ObjectIo, "write", sink.hook_path);
+            match step {
+                Ok(0) => {
+                    stopped = Some(io_refusal(relative, &io::Error::from(ErrorKind::WriteZero)));
+                }
+                Ok(wrote) => {
+                    offset += wrote;
+                    written += wrote as u64;
+                    if let Some(flight) = in_flight.as_mut() {
+                        flight.written = written;
+                    }
+                    if offset < read {
+                        stopped = before_deadline(deadline).err();
+                    }
+                }
+                Err(error) if error.kind() == ErrorKind::Interrupted => {
+                    stopped = before_deadline(deadline).err();
+                }
+                Err(error) => {
+                    stopped = Some(io_refusal(relative, &error));
+                }
+            }
+            if stopped.is_some() {
+                break;
+            }
+        }
+        if let Some(error) = stopped {
+            give_back_unwritten(dest, charged, read - offset);
+            return Err(error);
+        }
+        context.update(&buffer[..read]);
+    }
+    // The last write can have blocked past the deadline: nothing follows it on the descriptor without the
+    // clock.
+    before_deadline(deadline)?;
+    let mut sha256 = [0_u8; 32];
+    sha256.copy_from_slice(context.finish().as_ref());
+    Ok(sha256)
+}
+
+/// The retained metadata outputs are the objects the earlier passes made: the object copy completed its
+/// step, and its files are exactly the bootstrap's admitted files, in order, with the admitted length and
+/// SHA-256. Pure.
+fn require_final_objects(
+    boot: &VerifiedGitBootstrapV1,
+    objects: &FinalObjectStoreV1,
+) -> Result<(), GitBootstrapErrorV1> {
+    if objects.step != GitPlaneStepV1::Objects {
+        return Err(metadata_input("the object copy has not completed its step"));
+    }
+    let admitted = admitted_files(boot);
+    if objects.files.len() != admitted.len() {
+        return Err(metadata_input(format!(
+            "the object copy holds {} files, and the bootstrap admitted {}",
+            objects.files.len(),
+            admitted.len()
+        )));
+    }
+    for (made, admitted) in objects.files.iter().zip(admitted) {
+        if (&made.relative, made.length, made.sha256)
+            != (&admitted.relative, admitted.length, admitted.sha256)
+        {
+            return Err(metadata_input(format!(
+                "{} is not the copy of the admitted file",
+                made.relative
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// One run of the metadata step: the retained bootstrap and object copy it builds on, and what it has
+/// created, charged, and completed so far.
+struct MetaRunV1<'a> {
+    boot: &'a VerifiedGitBootstrapV1,
+    objects: &'a FinalObjectStoreV1,
+    deadline: Instant,
+    frame_budget: CustodyFrameBudgetV1,
+    table_bound: u64,
+    limits: RefsLimitsV1,
+    directories: BTreeMap<String, PinnedDirectoryV1>,
+    files: Vec<MaterializedMetadataFileV1>,
+    in_flight: Option<InFlightMetadataFileV1>,
+    charged: MetadataChargeV1,
+    began: bool,
+    completed: Option<GitPlaneStepV1>,
+}
+
+impl<'a> MetaRunV1<'a> {
+    fn dest(&self) -> &'a super::RestoreDestinationV1 {
+        &self.boot.verified.destination
+    }
+
+    /// Every directory this step made is still the entry its parent holds, and (for [`MetaScopeV1::All`])
+    /// every file is still the regular file its parent lists, of the identity and length it was measured
+    /// with. Each step is held to the one deadline.
+    fn metadata_chains(
+        &self,
+        scope: MetaScopeV1<'_>,
+        pace: PaceV1<'_>,
+    ) -> Result<(), GitBootstrapErrorV1> {
+        let git = &self.objects.pins.git;
+        let directory = |relative: &str| -> Result<(), GitBootstrapErrorV1> {
+            let (parent, leaf) = split_relative(relative);
+            let pin = pin_beneath(git, &self.directories, Some(relative))?;
+            let above = pin_beneath(git, &self.directories, parent)?;
+            recheck_entry(
+                above,
+                leaf.as_bytes(),
+                pin,
+                metadata_name(relative).as_bytes(),
+            )?;
+            Ok(())
+        };
+        match scope {
+            MetaScopeV1::All => {
+                for relative in self.directories.keys() {
+                    pace("metadata-chain")?;
+                    directory(relative)?;
+                }
+                for file in &self.files {
+                    pace("metadata-chain")?;
+                    let parent =
+                        pin_beneath(git, &self.directories, split_relative(&file.relative).0)?;
+                    recheck_regular_entry(
+                        parent,
+                        &file.relative,
+                        (file.dev, file.ino, file.length),
+                    )?;
+                }
+            }
+            MetaScopeV1::Chain(Some(tail)) => {
+                for (at, _) in tail.match_indices('/').chain([(tail.len(), "")]) {
+                    pace("metadata-chain")?;
+                    directory(&tail[..at])?;
+                }
+            }
+            MetaScopeV1::Chain(None) => {}
+        }
+        Ok(())
+    }
+
+    /// The recheck: the object copy's chains, then the metadata chains in `scope`, then every admitted
+    /// bootstrap file, then the staging, HOME, XDG, and bootstrap chains and the destination root's
+    /// identity LAST.
+    fn chains(&self, scope: MetaScopeV1<'_>, pace: PaceV1<'_>) -> Result<(), GitBootstrapErrorV1> {
+        output_chains(
+            self.dest(),
+            PinViewV1::of_final(&self.objects.pins),
+            &self.objects.files,
+            pace,
+        )?;
+        self.metadata_chains(scope, pace)?;
+        source_files_unchanged(self.boot, pace)?;
+        sweep_chains(
+            self.dest(),
+            Some(&self.boot.home),
+            Some(&self.boot.xdg),
+            &self.boot.directories,
+            pace,
+        )
+    }
+
+    /// [`Self::chains`] over `scope`, then the clock: the recheck ends in the destination root's identity,
+    /// which can block, so nothing the caller does next (a create, a charge, a write) may follow an expired
+    /// deadline. Only the final gate, which has nothing fallible after it, omits this guard.
+    fn recheck(&self, scope: MetaScopeV1<'_>) -> Result<(), GitBootstrapErrorV1> {
+        let deadline = self.deadline;
+        let pace = |step: &'static str| observe_deadline(deadline, step);
+        self.chains(scope, &pace)?;
+        observe_deadline(deadline, "metadata-checked")
+    }
+
+    /// The full gate: the mount census first, then every chain, then the clock (see [`Self::recheck`]).
+    fn gate(&self) -> Result<(), GitBootstrapErrorV1> {
+        let deadline = self.deadline;
+        let pace = |step: &'static str| observe_deadline(deadline, step);
+        pace("metadata-gate")?;
+        refuse_mounts_within(&self.dest().root)?;
+        self.chains(MetaScopeV1::All, &pace)?;
+        observe_deadline(deadline, "metadata-checked")
+    }
+
+    /// The final gate: the mount census, every chain, and the destination root's identity LAST, the guard
+    /// immediately before it being the last statement ahead of it.
+    fn final_gate(&self) -> Result<(), GitBootstrapErrorV1> {
+        #[cfg(test)]
+        run_git_hook(
+            GitHookPointV1::BeforeMetadataFinalGate,
+            "",
+            self.dest().root.canonical_path(),
+        );
+        let deadline = self.deadline;
+        let pace = |step: &'static str| observe_deadline(deadline, step);
+        pace("metadata-final")?;
+        refuse_mounts_within(&self.dest().root)?;
+        self.chains(MetaScopeV1::All, &pace)
+    }
+
+    /// Create one directory: a bounded recheck, then the create-new beneath its retained parent (its entry
+    /// reserved first, given back only when the create provably made nothing), and a recheck that includes
+    /// the new pin.
+    fn make_directory(&mut self, relative: &str) -> Result<(), GitBootstrapErrorV1> {
+        let (parent_relative, leaf) = split_relative(relative);
+        self.recheck(MetaScopeV1::Chain(parent_relative))?;
+        let dest = self.dest();
+        let parent = pin_beneath(&self.objects.pins.git, &self.directories, parent_relative)?;
+        #[cfg(test)]
+        run_git_hook(
+            GitHookPointV1::BeforeObjectCreate,
+            "directory",
+            &parent.canonical_path().join(leaf),
+        );
+        let created = create_staging_directory(
+            parent,
+            &dest.ledger,
+            dest.dev,
+            leaf.as_bytes(),
+            metadata_name(relative).as_bytes(),
+        );
+        match created {
+            Ok(pin) => {
+                self.began = true;
+                self.charged.entries += 1;
+                self.directories.insert(relative.to_owned(), pin);
+            }
+            Err(error) => {
+                // A collision and a refused reservation made nothing and charge nothing. Any other error
+                // may follow a successful create, so its entry stays charged.
+                if !matches!(
+                    error,
+                    CustodyRestoreErrorV1::StagingCollision { .. }
+                        | CustodyRestoreErrorV1::Budget(_)
+                ) {
+                    self.began = true;
+                    self.charged.entries += 1;
+                }
+                return Err(error.into());
+            }
+        }
+        self.recheck(MetaScopeV1::Chain(Some(relative)))
+    }
+
+    /// Create one regular file beneath its retained parent and stream `length` bytes of `source` into it:
+    /// a bounded recheck, the entry reserved, the create-new, the device, a recheck, the stream, and the
+    /// file's own entry checked by name before it is kept. A collision is never reused: the preexisting
+    /// entry is left exactly as it was.
+    fn make_file(
+        &mut self,
+        relative: &str,
+        length: u64,
+        source: &mut dyn io::Read,
+        source_fault: &dyn Fn() -> GitBootstrapErrorV1,
+    ) -> Result<(), GitBootstrapErrorV1> {
+        let deadline = self.deadline;
+        let (parent_relative, leaf) = split_relative(relative);
+        self.recheck(MetaScopeV1::Chain(parent_relative))?;
+        let dest = self.dest();
+        let name = metadata_name(relative);
+        let parent = pin_beneath(&self.objects.pins.git, &self.directories, parent_relative)?;
+        dest.ledger
+            .borrow_mut()
+            .reserve_entries(1)
+            .map_err(ledger_error)?;
+        self.charged.entries += 1;
+        let hook_path = parent.canonical_path().join(leaf);
+        #[cfg(test)]
+        run_git_hook(GitHookPointV1::BeforeObjectCreate, "file", &hook_path);
+        let mut output = match create_output_file(parent, leaf) {
+            Ok(output) => output,
+            Err(error) => {
+                // A create that met an existing entry made nothing, so its allowance goes back; any other
+                // error may follow a successful create and keeps the charge.
+                if matches!(error, FsCustodyError::TargetExists(_)) {
+                    dest.ledger.borrow_mut().release(ENTRY_ALLOWANCE_BYTES_V1);
+                    self.charged.entries = self.charged.entries.saturating_sub(1);
+                } else {
+                    self.began = true;
+                }
+                return Err(staging_refusal(error, name.as_bytes()).into());
+            }
+        };
+        self.began = true;
+        self.in_flight = Some(InFlightMetadataFileV1 {
+            relative: relative.to_owned(),
+            expected_length: length,
+            written: 0,
+        });
+        let created = ChildStatV1::from_metadata(
+            &output
+                .metadata()
+                .map_err(|error| io_refusal(&name, &error))?,
+        );
+        let observed = created.dev;
+        #[cfg(test)]
+        let observed = super::CREATED_DEV
+            .with(|devices| devices.borrow().get(name.as_bytes()).copied())
+            .unwrap_or(observed);
+        if observed != dest.dev {
+            return Err(CustodyRestoreErrorV1::DeviceCrossing { name }.into());
+        }
+        self.recheck(MetaScopeV1::Chain(parent_relative))?;
+
+        let sink = SinkV1 {
+            dest,
+            deadline,
+            relative,
+            hook_path: &hook_path,
+            length,
+        };
+        let sha256 = stream_into(
+            &sink,
+            &mut self.charged,
+            &mut self.in_flight,
+            &mut output,
+            source,
+            source_fault,
+        )?;
+        let held = ChildStatV1::from_metadata(
+            &output
+                .metadata()
+                .map_err(|error| io_refusal(&name, &error))?,
+        );
+        if (held.kind, held.size, held.dev) != (ChildKindV1::Regular, length, dest.dev) {
+            return Err(metadata_copy(
+                relative,
+                "the written file is not a regular file of the frame's length on the root's device",
+            ));
+        }
+        output
+            .seek(SeekFrom::Start(0))
+            .map_err(|error| io_refusal(&name, &error))?;
+        recheck_regular_entry(parent, relative, (held.dev, held.ino, length))?;
+        self.in_flight = None;
+        self.files.push(MaterializedMetadataFileV1 {
+            relative: relative.to_owned(),
+            file: output,
+            length,
+            sha256,
+            dev: held.dev,
+            ino: held.ino,
+        });
+        self.recheck(MetaScopeV1::Chain(parent_relative))
+    }
+
+    /// Judge one decoded entry by the pass B1a rules again and create it: the admission BEFORE anything is
+    /// created (the exact allowlist in its actual class, the entry type, the portable spelling, the
+    /// collisions, the parent, and no symlink), the clock again (the decode can block), and then the
+    /// directory or the file, streamed from `content`.
+    fn restore_entry(
+        &mut self,
+        table: &mut ActivePathTableV1,
+        entry: &FrameEntryV1<'_>,
+        content: Option<CustodyFrameContentReaderV1<'_>>,
+        source_fault: &dyn Fn() -> GitBootstrapErrorV1,
+    ) -> Result<(), GitBootstrapErrorV1> {
+        table
+            .admit(entry.class, entry.path, entry.kind)
+            .map_err(|fault| GitBootstrapErrorV1::ActiveFrame {
+                class: entry.class,
+                fault,
+            })?;
+        observe_deadline(self.deadline, "metadata-item")?;
+        let relative = std::str::from_utf8(entry.path)
+            .map_err(|_| metadata_input("an admitted frame path is not UTF-8"))?;
+        match (entry.kind, content) {
+            (ActiveEntryKindV1::Directory, _) => self.make_directory(relative),
+            (ActiveEntryKindV1::Regular, Some(mut content)) => {
+                self.make_file(relative, entry.length, &mut content, source_fault)
+            }
+            _ => Err(GitBootstrapErrorV1::ActiveFrame {
+                class: entry.class,
+                fault: ActiveFrameFaultV1::Symlink {
+                    path: lossy(entry.path),
+                },
+            }),
+        }
+    }
+
+    /// One retained active frame, restored: the clock, a recheck of everything made, the descriptor
+    /// reverified against its recorded length and SHA-256 immediately before a second COMPLETE decode, and
+    /// then every decoded entry judged by the pass B1a rules again and created. The decoder is drained
+    /// through its verified trailer, the bytes it consumed are bound to the verified plaintext, and its
+    /// entries to the ones prevalidation admitted. The first refusal of what was done with an entry is HELD
+    /// (nothing after it is judged or created) until all of that has been verified, and then reported;
+    /// the deadline and the decoder's own failure end the decode at once. Every byte already created stays.
+    fn materialize_frame(
+        &mut self,
+        summary: &ActiveFrameSummaryV1,
+        generation: &str,
+        table: &mut ActivePathTableV1,
+    ) -> Result<(), GitBootstrapErrorV1> {
+        let class = summary.class;
+        let deadline = self.deadline;
+        observe_deadline(deadline, "metadata-frame")?;
+        self.recheck(MetaScopeV1::All)?;
+        let recorded = self
+            .boot
+            .verified
+            .staged
+            .get(summary.staged)
+            .ok_or_else(|| plan_mismatch("a frame names no staged payload"))?;
+        // The retained descriptor is read through a duplicate of itself, which shares its open file
+        // description: no staged name is ever opened again.
+        let mut one = StagedPlaintextV1 {
+            name: recorded.name.clone(),
+            role: recorded.role.clone(),
+            file: recorded
+                .file
+                .try_clone()
+                .map_err(|error| io_refusal(&lossy(recorded.name.as_bytes()), &error))?,
+            length: recorded.length,
+            sha256: recorded.sha256,
+        };
+        reverify_staged_v1(&mut one, deadline)?;
+        let header =
+            CustodyFrameHeaderV1::new(class, generation).map_err(|_| frame_invalid(class))?;
+        let expired = Cell::new(false);
+        let refuse = || {
+            if expired.get() {
+                GitBootstrapErrorV1::Git(CustodyGitError::Timeout)
+            } else {
+                frame_invalid(class)
+            }
+        };
+        let mut counts = FrameCountsV1::default();
+        let mut entry_digest = ActiveEntryDigestV1::new(class);
+        // The first refusal of the entries themselves (an admission fault, or a failed create or write) is
+        // HELD until the whole frame has decoded and its bytes are bound to the verified plaintext, so a
+        // frame that is not whole or not the verified bytes is refused as THAT, whatever it said first.
+        let mut held: Option<GitBootstrapErrorV1> = None;
+        let mut paced = PacedFrameReaderV1 {
+            inner: (&one.file).take(one.length.saturating_add(1)),
+            deadline,
+            expired: &expired,
+            context: digest::Context::new(&digest::SHA256),
+            count: 0,
+        };
+        {
+            let reader = BufReader::with_capacity(HASH_BUFFER_BYTES_V1, &mut paced);
+            let mut decoder = CustodyFrameDecoderV1::new(reader, &header, self.frame_budget)
+                .map_err(|_| refuse())?;
+            loop {
+                before_deadline(deadline)?;
+                let Some(entry) = decoder.next_entry().map_err(|_| refuse())? else {
+                    break;
+                };
+                let (path, kind, length, content) = match entry {
+                    CustodyFrameEntryV1::Directory { path, .. } => {
+                        (path, ActiveEntryKindV1::Directory, 0, None)
+                    }
+                    CustodyFrameEntryV1::Symlink { path, .. } => {
+                        (path, ActiveEntryKindV1::Symlink, 0, None)
+                    }
+                    CustodyFrameEntryV1::Regular {
+                        path,
+                        length,
+                        content,
+                        ..
+                    } => (path, ActiveEntryKindV1::Regular, length, Some(content)),
+                };
+                #[cfg(test)]
+                run_git_hook(
+                    GitHookPointV1::FrameEntry,
+                    "",
+                    Path::new(OsStr::from_bytes(path.as_bytes())),
+                );
+                counts.entries = counts.entries.saturating_add(1);
+                match kind {
+                    ActiveEntryKindV1::Directory => {
+                        counts.directories = counts.directories.saturating_add(1);
+                    }
+                    _ => {
+                        counts.regular_files = counts.regular_files.saturating_add(1);
+                        counts.content_bytes = counts.content_bytes.saturating_add(length);
+                    }
+                }
+                entry_digest.record(kind, path.as_bytes(), length);
+                // Once a fault is held nothing more is judged or created: the rest of the frame is only
+                // decoded, so its trailer and its bytes are still verified (an unread remainder of the
+                // current content is drained and verified by the decoder's next call).
+                if held.is_some() {
+                    continue;
+                }
+                let entry = FrameEntryV1 {
+                    class,
+                    path: path.as_bytes(),
+                    kind,
+                    length,
+                };
+                match self.restore_entry(table, &entry, content, &refuse) {
+                    Ok(()) => {}
+                    Err(error) if ends_the_decode(&error) => return Err(error),
+                    Err(error) => held = Some(error),
+                }
+            }
+        }
+        // The decoder met the verified trailer and the end of the stream. The bytes it consumed must be
+        // exactly the verified plaintext: a frame replaced after its rehash is refused here.
+        let (count, context) = (paced.count, paced.context);
+        let mut decoded_sha256 = [0_u8; 32];
+        decoded_sha256.copy_from_slice(context.finish().as_ref());
+        if count != one.length || decoded_sha256 != one.sha256 {
+            return Err(GitBootstrapErrorV1::StagedInputChanged {
+                name: lossy(one.name.as_bytes()),
+            });
+        }
+        if (
+            summary.entries,
+            summary.directories,
+            summary.regular_files,
+            summary.content_bytes,
+            summary.entries_sha256,
+        ) != (
+            counts.entries,
+            counts.directories,
+            counts.regular_files,
+            counts.content_bytes,
+            entry_digest.finish(),
+        ) {
+            return Err(plan_mismatch(
+                "a frame's entries are not the ones B1a admitted",
+            ));
+        }
+        if let Some(error) = held {
+            return Err(error);
+        }
+        observe_deadline(deadline, "metadata-decoded")?;
+        one.file
+            .seek(SeekFrom::Start(0))
+            .map_err(|error| io_refusal(&lossy(one.name.as_bytes()), &error))?;
+        Ok(())
+    }
+
+    /// Cross-check EVERY restored ref against the manifest and the verified inventory, reading only the
+    /// retained FINAL descriptors: the clock, a recheck of everything made, and then each file read ONCE,
+    /// through a reader that hashes and counts exactly the bytes the pass B1b parsers consume, which then
+    /// judge the whole. The first refusal of the refs themselves is HELD until the file has been read to its
+    /// end and its digest and length are compared with the ones it was written with, so a changed file is
+    /// refused as that ahead of anything it says, and no byte the parser saw escapes the digest.
+    fn check_refs(&mut self) -> Result<RefsAgreementV1, GitBootstrapErrorV1> {
+        let deadline = self.deadline;
+        observe_deadline(deadline, "metadata-refs")?;
+        self.recheck(MetaScopeV1::All)?;
+        let mut builder = RefsBuilderV1::new(self.boot.object_format, self.limits, deadline);
+        for file in &mut self.files {
+            file.file
+                .seek(SeekFrom::Start(0))
+                .map_err(|error| io_refusal(&file.relative, &error))?;
+            let mut reader = DigestedReaderV1 {
+                inner: (&file.file).take(file.length.saturating_add(1)),
+                context: digest::Context::new(&digest::SHA256),
+                count: 0,
+                #[cfg(test)]
+                hook_path: self.objects.pins.git.canonical_path().join(&file.relative),
+            };
+            let held = match builder.admit_file(file.relative.as_bytes(), &mut reader) {
+                Ok(()) => None,
+                Err(error) if ends_the_parse(&error) => return Err(error),
+                Err(error) => Some(error),
+            };
+            // Whatever the parsers left unread is read now, so the digest covers the whole file.
+            drain_stream(&mut reader, deadline, &file.relative)?;
+            let (count, context) = (reader.count, reader.context);
+            let mut sha256 = [0_u8; 32];
+            sha256.copy_from_slice(context.finish().as_ref());
+            if count != file.length || sha256 != file.sha256 {
+                return Err(metadata_copy(
+                    &file.relative,
+                    "the retained descriptor is not the bytes that were written",
+                ));
+            }
+            if let Some(error) = held {
+                return Err(error);
+            }
+            file.file
+                .seek(SeekFrom::Start(0))
+                .map_err(|error| io_refusal(&file.relative, &error))?;
+        }
+        let agreement = builder.finish(&self.boot.verified.control.manifest)?;
+        observe_deadline(deadline, "metadata-agreed")?;
+        Ok(agreement)
+    }
+
+    /// The inert config, created ONCE, only after the refs agree: the gate, then the one create-new of
+    /// `config` beneath `.git` carrying exactly the golden bytes of the caller's format, read back from its
+    /// own descriptor. The bootstrap's config, and any archived one, is never consulted.
+    fn create_config(&mut self) -> Result<(), GitBootstrapErrorV1> {
+        let deadline = self.deadline;
+        observe_deadline(deadline, "metadata-config")?;
+        self.gate()?;
+        let bytes = encode_inert_config_v1(self.boot.object_format);
+        let mut sha256 = [0_u8; 32];
+        sha256.copy_from_slice(digest::digest(&digest::SHA256, &bytes).as_ref());
+        let mut source: &[u8] = &bytes;
+        self.make_file(CONFIG_LEAF_V1, bytes.len() as u64, &mut source, &|| {
+            metadata_input("the config source failed")
+        })?;
+        let file = self
+            .files
+            .last_mut()
+            .filter(|file| file.relative == CONFIG_LEAF_V1)
+            .ok_or_else(|| metadata_input("the config was not kept"))?;
+        file.file
+            .seek(SeekFrom::Start(0))
+            .map_err(|error| io_refusal(&file.relative, &error))?;
+        let (length, read_back) =
+            stream_digest(&mut file.file, file.length, deadline, &file.relative)?;
+        if length != file.length || read_back != sha256 || file.sha256 != sha256 {
+            return Err(metadata_copy(
+                &file.relative,
+                "the written config is not the golden bytes",
+            ));
+        }
+        file.file
+            .seek(SeekFrom::Start(0))
+            .map_err(|error| io_refusal(&file.relative, &error))?;
+        self.recheck(MetaScopeV1::Chain(None))
+    }
+
+    fn run(&mut self, plan: &ActiveFramePlanV1) -> Result<FinalMetadataV1, GitBootstrapErrorV1> {
+        let deadline = self.deadline;
+        observe_deadline(deadline, "metadata-entry")?;
+        let boot = self.boot;
+        require_prevalidated(boot, plan)?;
+        require_proven_bootstrap(boot)?;
+        require_final_objects(boot, self.objects)?;
+        self.gate()?;
+        let generation = boot.verified.control.manifest.generation_id().to_owned();
+        let mut table = ActivePathTableV1::new(self.table_bound);
+        for summary in &plan.frames {
+            self.materialize_frame(summary, &generation, &mut table)?;
+        }
+        table
+            .finish()
+            .map_err(|fault| GitBootstrapErrorV1::ActiveFrame {
+                class: CustodyCoverageClassV1::RefsAndHead,
+                fault,
+            })?;
+        self.gate()?;
+        self.completed = Some(GitPlaneStepV1::Metadata);
+
+        let agreement = self.check_refs()?;
+        self.completed = Some(GitPlaneStepV1::Refs);
+
+        self.create_config()?;
+        self.final_gate()?;
+        Ok(FinalMetadataV1 {
+            step: GitPlaneStepV1::Config,
+            directories: std::mem::take(&mut self.directories),
+            files: std::mem::take(&mut self.files),
+            agreement,
+            charged: self.charged,
+        })
+    }
+}
+
+/// Restore the active metadata beneath the retained `.git` of `objects`, agree it with the manifest's
+/// original refs, and create the inert config.
+///
+/// Nothing is created unless `plan` is this capsule's complete active prevalidation (an Empty `RefsAndHead`
+/// is [`GitBootstrapErrorV1::EmptyRefsAndHead`]), `bootstrap` is a proven object store, and `objects` is
+/// the copy of it that [`materialize_object_store_v1`] made. Each retained active frame is rehashed from
+/// its descriptor immediately before it is decoded a second time, every entry is judged by the pass B1a
+/// rules again before it is created, and every directory and file is create-new beneath a retained pin that
+/// this invocation created (the entry, and then each chunk, charged to the one ledger first). The bytes are
+/// the frame's, exactly: no symlink, no normalization, no archived or bootstrap config, hook, or other
+/// behavior-affecting entry ever exists. After every frame is restored, every file is read back from its
+/// retained descriptor and fed to the pass B1b parsers, which agree the whole with the manifest's original
+/// refs and the verified inventory; only then is the config created, once, with the golden bytes of the
+/// caller's format. No Git child runs, the repository's only child stays `.git`, and the bootstrap is never
+/// touched. Nothing is renamed, overwritten, deleted, or cleaned up.
+///
+/// Files are created with the create-new primitive's owner-private mode and directories with its `0700`; the
+/// frames' recorded modes are not applied, and no file or directory is individually synced here (the sync of
+/// the new directory entry that each directory create performs is the primitive's own). Nothing in this slice
+/// depends on either.
+///
+/// Every step keeps the ONE absolute `deadline`; the destination root's identity is the last fallible check
+/// and only infallible construction follows it. A refusal keeps every created byte and is in
+/// [`MetadataFailureV1`]'s shape: the last step completed whole, whether this invocation began creating,
+/// the one ledger's charge, and typed partial effects. A second invocation over the same `.git` refuses at
+/// its first entry as a collision, touching nothing.
+pub(crate) fn materialize_active_metadata_v1(
+    bootstrap: &VerifiedGitBootstrapV1,
+    objects: &FinalObjectStoreV1,
+    plan: &ActiveFramePlanV1,
+    frame_budget: CustodyFrameBudgetV1,
+    deadline: Instant,
+    completed: Option<GitPlaneStepV1>,
+) -> Result<FinalMetadataV1, Box<MetadataFailureV1>> {
+    materialize_active_metadata_bounded_v1(
+        bootstrap,
+        objects,
+        plan,
+        frame_budget,
+        deadline,
+        completed,
+        ACTIVE_PATH_TABLE_BYTES_V1,
+        RefsLimitsV1::v1(),
+    )
+}
+
+/// [`materialize_active_metadata_v1`] with the aggregate path table's byte bound and the refs limits as
+/// parameters, so each is exercised at a small size.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn materialize_active_metadata_bounded_v1(
+    bootstrap: &VerifiedGitBootstrapV1,
+    objects: &FinalObjectStoreV1,
+    plan: &ActiveFramePlanV1,
+    frame_budget: CustodyFrameBudgetV1,
+    deadline: Instant,
+    completed: Option<GitPlaneStepV1>,
+    table_bound: u64,
+    limits: RefsLimitsV1,
+) -> Result<FinalMetadataV1, Box<MetadataFailureV1>> {
+    let mut run = MetaRunV1 {
+        boot: bootstrap,
+        objects,
+        deadline,
+        frame_budget,
+        table_bound,
+        limits,
+        directories: BTreeMap::new(),
+        files: Vec::new(),
+        in_flight: None,
+        charged: MetadataChargeV1::default(),
+        began: false,
+        completed,
+    };
+    match run.run(plan) {
+        Ok(done) => Ok(done),
+        Err(cause) => Err(Box::new(MetadataFailureV1 {
+            cause,
+            last_completed: run.completed,
+            active_materialization_began: run.began,
+            ledger_used: bootstrap.verified.destination.ledger.borrow().used(),
+            partial: MetadataPartialV1 {
+                directories: run.directories,
                 files: run.files,
                 in_flight: run.in_flight,
                 charged: run.charged,
