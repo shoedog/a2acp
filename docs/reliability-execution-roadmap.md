@@ -217,7 +217,9 @@
     Sonnet argues Q01redundant with the next effect-preceding deadline guard; Sol must verify that claim.
     First candidate4136310d committed clean atopdc0b45ba; exactly Git source/tests+handoff changed.
     Complete319file source/worker/transcript custody retained. Automatic six gates ACTIVE: fmt,
-    workspaceclippyalltargetsallfeatures andbuild reportedPASS/mirrored; bothfullsuites/reviewpending.
+    workspaceclippyalltargetsallfeatures andbuild reportedPASS/mirrored. Alltargets complete5182/0/13,
+    90groups/corecompiled; raw475664bytes/ae9c900e counted independently. Default/doctestsACTIVE;
+    finalhygiene/Sol1/2 pending. Mirrored wrapper records unchangedsource; fullsix immutable auditpending.
     Worker "132single-statement" wording overstates granularity; actual definitions include coupled
     pairs/whole-step slices/test-only log hooks. Preserve exact variants, not132single-production-guard claim.
     Pre-check fmt/clippy/B2c pass reported with filtered output; final full raw six gates still pending.
