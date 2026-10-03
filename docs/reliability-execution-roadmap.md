@@ -236,7 +236,11 @@
     Sonnet strengthens captured-onlyHALT/scan tests; spec4explicitreasons before newmutants.
     Earliertrialnottransferred; oldepochcontrollerwatcher retired, provider/reviewcap2unchanged.
     Spec4matrix ACTIVE190variants; frozenGit0224d33a/tests95481b09/spec4bb20fb16/driver187860f4
-    independently bound; first3controls36/0/0. Newepoch explicitreasons, oldtrial retained.
+    independently bound; halfway95+3controls36/0/0:86runtime flips,4structural-only,5declared
+    nonflips, zero misses/invalid runs. Full101-file halfway custody hash-checked.
+    Newepoch explicitreasons, oldtrial retained. Owner scopes expensive deep audits to changes
+    affecting this area or its test evidence; skip unchanged-area slices and routine CI/CD.
+    Ordinary CI/tests/review remain; no recurring mutation matrix or receipt-audit CI job.
     Final-byte matrix/focused/fullgates/source2 pending.
     Worker "132single-statement" wording overstates granularity; actual definitions include coupled
     pairs/whole-step slices/test-only log hooks. Preserve exact variants, not132single-production-guard claim.
