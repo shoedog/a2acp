@@ -230,7 +230,9 @@
     keep reconstruction distinct. Initial existing33 trial had2guard-position failures; duplicate newlabel
     fixed and2sequence rows reportedPASS. Reconstructed seam-only413 RED29/6 compiled/fullraw audited;
     expanded36-test RED29/7 supplied summary has overlapping log writers/interleaved rows, not fullproof.
-    Repair spec3 frozen190variants; first19+3controls independently audited, no misses/invalid runs.
+    Repair spec3 frozen190variants; sealed95+3controls independently audited/secondcopies retained:
+    86behavioral flips,4structural-only,5declarednonflips; C06/C07/M19 SCAN predictions missed
+    but all three fail behavioral tests. No invalid runs; original predictions retained.
     Final-byte matrix/focused/fullgates/source2 pending.
     Worker "132single-statement" wording overstates granularity; actual definitions include coupled
     pairs/whole-step slices/test-only log hooks. Preserve exact variants, not132single-production-guard claim.
