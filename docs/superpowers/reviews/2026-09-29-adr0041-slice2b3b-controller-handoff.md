@@ -1,12 +1,14 @@
 # Handoff — ADR-0041 2B3b B2b approved and adopted; B2c active
 
-**Written:** 2026-10-03T20:57:22.443516+00:00 · **By:** Codex controller · **Provider:** codex
+**Written:** 2026-10-03T21:36:21.335310+00:00 · **By:** Codex controller · **Provider:** codex
 **Workspace:** /Users/wesleyjinks/code/a2a-bridge · work/adr0041-2b3b-bootstrap-20261001 · **Measured state:** `[MEASURED]` approved A/B1a/B1b/B2a/B2b runtime adopted through18ff5beac8d6435966810baf7d04e5715a662714; B2c4136310d isolated and verifying, not adopted. Probe git status/log and scratch receipt audits.
 **Predecessor:** B2b Sonnet5.5 run2436 complete; clean0dadd17e automatic Approved; actual Sol2/2 APPROVE0W2S0block.
 **Truth ordering:** measured live state > explicit owner/contract authority within its scope > this handoff for current operational state > earlier handoffs and non-authoritative summaries. A conflict between tiers stays OPEN in §0 — never resolved by document class alone.
 **Provenance:** folded by controller from measured Git/checkpoint/raw logs and actual source finals. Prior merged A/ACP/cleanup history is `[INHERITED]` from preceding committed handoffs; not rerun here. No memory write authorized.
 
 ## 0. Gating facts — settle these before starting anything below
+
+**Repair partial151 checkpoint:** `[MEASURED]` 151/190variants+3controls audited:137behavioral flips,4structural-only,10actualnonflips (9declared; Q01unexpected). C06/C07/M19 SCAN predictions missed but behavioral tests fail; Q01HALT miss repeats original132 matrix. All original predictions retained, zero invalid runs. New directory-fact N01–N07 allbehavioral flips; timed-out-byte/boundedread rows likewise flip where predicted. Source2 must independently assess nonflip redundancy, not transfer worker arguments. Full154rawlogs/audit/manifest retained in scratch/b2c-repair-partial151-audited-custody/. Same Sonnet repair ACTIVE; finalmatrix/focused/fullgates/source2 pending, cap2 intact.
 
 **Repair halfway checkpoint:** `[MEASURED]` Automatic read-only watcher76490 sealed95/190variants+3controls: 86behavioral flips,4structural-only,5declarednonflips; C06/C07/M19 carried-over SCAN predictions missed but all three fail behavioral tests. No invalid runs, predictions unchanged. Full98rawlogs/audit/manifest independently hash-checked in scratch/b2c-repair-matrix-halfway-automatic-custody/. Watcher bound4h remains ACTIVE for complete checkpoint, no tests/providers/source writes. Interactive audit subsequently96. Finalmatrix/focused/sixgates/source2/2 pending, cap2 intact.
 
