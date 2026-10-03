@@ -183,9 +183,15 @@
     fmt/workspaceclippyalltargetsallfeatures/build/hygienePASS, independently audited. Verifier absent.
     Independent hard-read-only Solsource3/3 completed/session85270: APPROVE0WRONG0SMELL0blockers,
     cap NO FINDINGS, raw82c532acf7bbf1fd30febdf1b5e0722f0771810c4aa98e2af3b484be1395acbb.
-    B2a adopted; B2b dispatched from cleanbase1e6674ec intoimpl-68504-mnvnlojn/session2436,
-    warm-deps phase. CapTWO; sameSonnet5.5/Solxhigh/config7774d187/sixgates/private20GiB.
-    Doctor27/27OK, free149.99GiB, exact238inheritednames and five hashes bound/custody retained.
+    B2a adopted; B2b source0dadd17e inimpl-68504-mnvnlojn/session2436 completed/Approved2/2,
+    actualSol0WRONG2SMELL0blockers, raw377e56c9; exact three files adopted18ff5bea. Initial7d4dc87d
+    source1/2REJECT2W1S2block repaired same artifact: complete decoder drain and one hashed parse stream.
+    Final gates5149/0/13alltargets;5160/0/13default/16docs;fmt/clippyalltargetsallfeatures/build/hygienePASS,
+    full raw/source receipts independently audited after review. Focused287/0/0 retains238names,49newGit.
+    Matrix123variants+6controls:118behavioral failures,115allpredictionsmet,5nonflips; D03/C03/C12
+    wrongpredictions preserved. All123actual mutationdiffs independently reconstructed;808file secondcustody.
+    Reviewer receipt SMELL now reconciled; production-first process SMELL disclosed, enforce testsFIRST B2c.
+    SameSonnet5.5/Solxhigh/config7774d187/private20GiB; B2c binding next, capTWO.
     Native and whole-G gates remain pending. Transientlowspace
     recovered externally to84.8GiB beforedispatch; auditonly/no additionaldeletion. Finalfocused232/0/0 retains198inheritednames; matching
     launch/before/after source c860bb3b/32ab0f8c, core cached. Final101variant+2control matrix:

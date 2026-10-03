@@ -1,22 +1,22 @@
-# Handoff — ADR-0041 2B3b B1b approved; B2a active
+# Handoff — ADR-0041 2B3b B2b approved and adopted; B2c next
 
-**Written:** 2026-10-03T03:18:23.340863+00:00 · **By:** Codex controller · **Provider:** codex
-**Workspace:** /Users/wesleyjinks/code/a2a-bridge · work/adr0041-2b3b-bootstrap-20261001 · **Measured state:** `[MEASURED]` approved runtime at0b4e28abd1bc45179e5d719b55a39551bb5d8c27; controller reconciliation committedbbf4a2bf; B2a launched from immutablebbf4a2bf. Progress docs to commit separately. Probe git status/log and final receipt audits in scratch.
-**Predecessor:** B1b Sonnet5.5 run7746 complete; clean9a9f97ba automatic Approved; Sol2/2 APPROVE0W1S0block.
+**Written:** 2026-10-03T13:39:12.049141+00:00 · **By:** Codex controller · **Provider:** codex
+**Workspace:** /Users/wesleyjinks/code/a2a-bridge · work/adr0041-2b3b-bootstrap-20261001 · **Measured state:** `[MEASURED]` approved A/B1a/B1b/B2a/B2b runtime adopted through18ff5beac8d6435966810baf7d04e5715a662714; docs reconciliation to commit separately. Probe git status/log and scratch receipt audits.
+**Predecessor:** B2b Sonnet5.5 run2436 complete; clean0dadd17e automatic Approved; actual Sol2/2 APPROVE0W2S0block.
 **Truth ordering:** measured live state > explicit owner/contract authority within its scope > this handoff for current operational state > earlier handoffs and non-authoritative summaries. A conflict between tiers stays OPEN in §0 — never resolved by document class alone.
 **Provenance:** folded by controller from measured Git/checkpoint/raw logs and actual source finals. Prior merged A/ACP/cleanup history is `[INHERITED]` from preceding committed handoffs; not rerun here. No memory write authorized.
 
 ## 0. Gating facts — settle these before starting anything below
 
-**(a) Lane ownership** — `[MEASURED]` B2b implement session2436 ACTIVE in quarantineimpl-68504-mnvnlojn from exact cleanbase1e6674ec0763168869b0c2a6832d0d3642f8cf8d. Actualclaude-sonnet-5-5 in transcript8a9336a9-6864-4973-841f-6fe30a8e9992; exact workerb16111aac6957def13e4657242e947453c1c9b97de925db1799ddeb4b038f78a/namea2a-rw-83911703b8b063f0-68504-nnvnlojn-0. Warm dependencies complete; reading approved task/source, no duplicate writer/reviewer. — RESOLVED.
-**(b) Custody exposure** — `[MEASURED]` approved A/B1a/B1b/B2a locally adopted. B2a exact three files from88acb02eb01d9ebf37ec287089c57e459b4bf866 adopted atc8eb29103681df74a35c814203823de8ebb40e56 after SolAPPROVE0W0S0block3/3.97file worker custody,238focused/17matrix custody, all six gates and complete review transcript/raw retained. OriginalRejectedcheckpoint byteunchanged. — RESOLVED.
-**(c) In flight / irreversible** — `[MEASURED]` B2b session2436 accepted Sonnet turn, immutablebase1e6674ec, no automatic merge. TaskSHAb4f6890c52491d9117e503be4b3cebf383c5e1f8bbafd800b9cdbc917ac3adbd bound all238inherited names/five hashes/actual B2a approval. Freshdoctor27/27OK, free149.99GiB/privatefloor20; inputs/live transcript/worker binding second custody retained. B2a verifier43190/Sol85270 completed; rawAPPROVE82c532ac/source88acb02e adoptedc8eb2910. Original2/2/LoopStoppedRejected preserved. — RESOLVED.
+**(a) Lane ownership** — `[MEASURED]` B2b session2436 ended0/Approved after TWO source rounds. Actualclaude-sonnet-5-5 only; workerb16111aa absent after cleanup. Clean approved quarantineimpl-68504-mnvnlojn/0dadd17e over1e6674ec. No active writer/reviewer. — RESOLVED.
+**(b) Custody exposure** — `[MEASURED]` B2b exact three owned files adopted at18ff5bea from0dadd17e after actual SolAPPROVE0W2S0block2/2. Complete808file source/worker/transcripts/raw reviews/checkpoint custody and both six-gate populations retained. Original bridge message preserved/reconciled by operator message. ARejected/B1aInconclusive/B2aRejected histories untouched. — RESOLVED.
+**(c) In flight / irreversible** — `[MEASURED]` none. B2b final six gates independently audited after review: alltargets5149/0/13/core rebuilt; default5160/0/13/16docs/core cached; fmt/workspaceclippyalltargetsallfeatures/build/hygienePASS. Sol2/2 raw377e56c9/session01a1016a-e204-7bf1-889b-be64284869b1. Receipt SMELL reconciled after review; production-first chronology remains disclosed. B2c binder prepared, not dispatched. — RESOLVED.
 **(d) Authorization granted but not exercised** — owner: "Merge 2B3a and proceed to orchestrate spec and implementation of 2B3b." "use sonnet5-5 for implementation." Latest Empty refs decision: "Refuse before creating repository/ (Recommended): complete Git restore requires captured refs/HEAD with exactly one valid HEAD; preserve Pass A’s acceptance of empty coverage." Continue B2a/B2b/B2c, native/combined and publication/landing under original scope; no question pending.
 
 ## 1. Resume order
 
-1. Poll2436; monitor exact B2b quarantineimpl-68504-mnvnlojn, bind worker ID and actualSonnet5.5 transcript once spawned. B2b source cap TWO declared before dispatch; retain untouched238control and structural/behavioral proof distinctions.
-2. Preserve complete source-bound six-gate raw receipts for both possible revisions using two-revision custody mirror. Audit actual source review and classify at cap; no replay/restart/reset or automatic merge. Initial B2b binder wrongfocusedlogpath refused before writes/providers, corrected retainedrootlog supplied.
+1. Bind B2c on clean root via prepare-b2c-dispatch.py <rootHEAD> 0dadd17e <rawB2b2/2> <round1/finalfocusedlog>. Exact source adoption18ff5bea; retain287inherited names and five runtime hashes. B2c cap TWO; enforce untouched control completion and tests-only RED before any production edit.
+2. Fresh validate/doctor/models/storage/custody then Sonnet5.5 quarantine implementation. Mirror both final-byte gate populations without duplicate suites; no replay/restart/reset or automatic merge. B2b123mutationdiffs independently reconstructed,129raw rows checked,5nonflips andD03/C03/C12 wrongpredictions disclosed. Source approval is scoped; no review3.
 3. Audit actual raw/source final evidence. Adopt only approved predecessor, then B2b and B2c serially. Original one capsule/pins/ledger/absolute Instant throughout runtime helpers.
 4. Complete G native macOS/native-ext4 filesystem-proven CI, aggregate full suites and combined Sol base251..final (cap2), publish/inspect exactCI/land. Do not claim complete2B3b at B1b.
 
@@ -34,8 +34,9 @@
 |B1b|done|`[MEASURED]` clean9a9f97ba baseff0; automaticApproved/cap2. Source1/2REJECT1W; exactshadow fix;2/2APPROVE0W1S0block. Four exactfiles adopted0b4e28ab after base-file equality proof.|
 |B1b final gates|done|`[MEASURED]` alltargets5060/0/13,90groups/core rebuilt; default5071/0/13,106groups/16docgroups/core cached;192Git+6seal. fmt/clippyalltargetsallfeatures/build/hygienePASS. Raw/source before-after/livechecked. Sol final saw bridgePASS but fullrawhost onlyround1; controller copied/audited final afterward.|
 |B1b evidence|done|`[MEASURED]` base147/0/0;focused198/0/0;matrix132variants+2controls/127actualfail/5disclosednonflip, everychangedvariantcompile/restored. F04one staleprediction kept with corrected same-source row. Controls55/0/0 firstcached/lastcompiled. SealREDreconstructedstructural, not literaltestsfirst.|
-|B1b provenanceSMELL|next|`[MEASURED]` operator adoption message corrects counts/chronology; source test comment must-exist stale, bounded correction in B2a. No behavioral change or review3.|
-|B2a/B2b/B2c/native/combined/publication|pending|Approved serial task plans, runtime success still deferred.|
+|B1b provenanceSMELL|done|`[MEASURED]` source comment corrected in approved B2a; operator adoption messages correct counts/chronology.|
+|B2a/B2b|done|`[MEASURED]` approved sources88acb02e/0dadd17e adoptedc8eb2910/18ff5bea; exact gates/raw reviews retained.|
+|B2c/native/combined/publication|pending|Approved B2c task; complete runtime success and whole-G gates still deferred.|
 |Exactfour-buildcleanup|done|`[INHERITED]` three literal dirs deleted4.236GiB; fourth rootincremental alreadyabsent. Releases/source/worktrees/branches/caches/evidence/operator retained. No19.8GiBreclaimclaim.|
 
 ## 3. Corrections to standing documents and memory
@@ -54,7 +55,7 @@
 | # | Work | State | Exact next action | Blocked by | Identifiers |
 |---:|---|---|---|---|---|
 |1|B2a|approved,adopted|retain actual review and all source-bound receipts|none|88acb02e→c8eb2910; originalcap2/disclosed3/3|
-|2|B2b/B2c|pending|bind exactapprovedpredecessor serially|B2a|approvedtasks396a1730/bf7a0bee|
+|2|B2c|pending|bind clean approvedB2b predecessor, preflight, testsFIRST|none|0dadd17e→18ff5bea; taskbf7a0bee|
 |3|Native/combined|pending|Mac+ext4provenCI/fullbase251..finalreview|completeG|preparedhostscript/CIplan/combinedconfig|
 |4|Publication/landing|pending|PR/exactCI/merge|allgates|originalauthority|
 
