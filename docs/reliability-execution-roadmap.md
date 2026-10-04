@@ -273,7 +273,9 @@
     counts3→1→2 are not monotonic, no cap reset/restart. Changed-path mutation cap8; no132/190/16 replay.
     Initial source4 refused container.mount.preflight before prompt acceptance, source unchanged.
     Missing private Claude settings restored exactly; missing host ACP restored from retained lock into
-    fresh private directory. Fresh preflight/binding and one correction retry1/1 pending; no writer live.
+    fresh private directory. Recovered config7ad15132 valid/doctor29OK/catalog ready; correction retry1/1
+    admitted session79104/execec2414/attemptb8df30. Actual transcript ec2110cb confirms Sonnet5.5;
+    live container7acbf292 imagefe3a644f/network/mount/labels retained. SAME artifact; writer active.
     Repair tests FIRST, then focused327+new, six final-byte gates once and Sol4/4. No adoption yet.
     Prior sessions6053/22954/28614 complete. No adoption/native/whole-G claim. D07 actualSLOW+source-scan
     failure means original structural-only annotation was wrong; R3 handoff corrects it, original raw retained.
