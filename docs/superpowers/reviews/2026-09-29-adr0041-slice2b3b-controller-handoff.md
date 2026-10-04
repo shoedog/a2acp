@@ -1,6 +1,6 @@
 # Handoff — ADR-0041 2B3b B2b approved and adopted; B2c active
 
-**Written:** 2026-10-03T23:25:00+00:00 · **By:** Codex controller · **Provider:** codex
+**Written:** 2026-10-04T00:29:37+00:00 · **By:** Codex controller · **Provider:** codex
 **Workspace:** /Users/wesleyjinks/code/a2a-bridge · work/adr0041-2b3b-bootstrap-20261001 · **Measured state:** `[MEASURED]` approved A/B1a/B1b/B2a/B2b runtime adopted through18ff5beac8d6435966810baf7d04e5715a662714; B2c4136310d isolated and verifying, not adopted. Probe git status/log and scratch receipt audits.
 **Predecessor:** B2b Sonnet5.5 run2436 complete; clean0dadd17e automatic Approved; actual Sol2/2 APPROVE0W2S0block.
 **Truth ordering:** measured live state > explicit owner/contract authority within its scope > this handoff for current operational state > earlier handoffs and non-authoritative summaries. A conflict between tiers stays OPEN in §0 — never resolved by document class alone.
@@ -9,6 +9,8 @@
 ## 0. Gating facts — settle these before starting anything below
 
 **Owner audit scope:** Owner directs that the expensive deep audit stay out of routine CI/CD and be skipped for slices/increments that do not change this area. Retain ordinary CI and required implementation tests/review; scope mutation/evidence auditing to changes affecting these custody guards or their test evidence. Current B2c repair changes those guards, so finish its running audit. No recurring full mutation matrix or controller receipt-audit job is authorized for CI/CD. Carry this constraint into any native-ext4 integration dispatch.
+
+**Spec4 matrix complete:** `[MEASURED]` 190 variants plus six controls36/0/0 independently audited:176 runtime/instrumented-sequence flips,4 source-structural-only,10 nonflips (9 declared plus Q01). Q01 misses HALT with no test failure; Q21 misses HALT but fails the slow-call regression. Q23 now fails HALT; Q24 fails HALT and SLOW. Zero invalid runs; original predictions and earlier trial retained. Complete199-file raw/audit/manifest custody independently hash-checked in scratch/b2c-repair-spec4-matrix-complete-automatic-custody/. Controller watcher28614 finished normally. Sonnet6053 and gate observer22954 continue; source-bound final RED/focused/six gates/actual Solsource2/2 remain pending. No repeat matrix merely for prediction calibration; cap TWO unchanged. Native-ext4 draft now reuses existing CI lint/build/hygiene rather than duplicating them, no mutation or recurring controller audit; draft remains unbound/unexecuted.
 
 **Spec4 halfway checkpoint:** `[MEASURED]` 95/190 variants plus 3 controls independently audited: 86 runtime/instrumented-sequence flips, 4 source-structural-only, 5 predeclared nonflips; zero missed predictions or invalid runs. All 101 retained files independently hash-checked in scratch/b2c-repair-spec4-matrix-halfway-automatic-custody/. Earlier trial misses remain retained in their original epoch. Sonnet6053 and bounded receipt watchers continue; final focused/six gates/source-bound RED/source2/2/adoption/native/whole-G remain pending. Source review cap TWO unchanged.
 

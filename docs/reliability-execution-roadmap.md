@@ -235,13 +235,14 @@
     Six predictionmisses C06/C07/M19SCAN,Q01/Q23/Q24HALT retained; D04/S03unexpectedflips.
     Sonnet strengthens captured-onlyHALT/scan tests; spec4explicitreasons before newmutants.
     Earliertrialnottransferred; oldepochcontrollerwatcher retired, provider/reviewcap2unchanged.
-    Spec4matrix ACTIVE190variants; frozenGit0224d33a/tests95481b09/spec4bb20fb16/driver187860f4
-    independently bound; halfway95+3controls36/0/0:86runtime flips,4structural-only,5declared
-    nonflips, zero misses/invalid runs. Full101-file halfway custody hash-checked.
+    Spec4matrix COMPLETE190variants+6controls36/0/0; frozenGit0224d33a/tests95481b09/
+    spec4bb20fb16/driver187860f4 independently bound. 176runtime/instrumented-sequence flips,
+    4structural-only,10nonflips (9declared+Q01); Q01HALT miss/nonflip andQ21HALT miss/SLOW failure
+    retained. Q23HALT andQ24HALT/SLOW now fail; zero invalid runs. Full199-file custody hash-checked.
     Newepoch explicitreasons, oldtrial retained. Owner scopes expensive deep audits to changes
     affecting this area or its test evidence; skip unchanged-area slices and routine CI/CD.
     Ordinary CI/tests/review remain; no recurring mutation matrix or receipt-audit CI job.
-    Final-byte matrix/focused/fullgates/source2 pending.
+    No repeat matrix merely for prediction calibration. Final RED/focused/fullgates/source2 pending.
     Worker "132single-statement" wording overstates granularity; actual definitions include coupled
     pairs/whole-step slices/test-only log hooks. Preserve exact variants, not132single-production-guard claim.
     Earlier pre-checks used filtered output; complete final six-gate raw receipts now retained/audited.
