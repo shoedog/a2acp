@@ -242,7 +242,17 @@
     Newepoch explicitreasons, oldtrial retained. Owner scopes expensive deep audits to changes
     affecting this area or its test evidence; skip unchanged-area slices and routine CI/CD.
     Ordinary CI/tests/review remain; no recurring mutation matrix or receipt-audit CI job.
-    No repeat matrix merely for prediction calibration. Final RED/focused/fullgates/source2 pending.
+    No repeat matrix merely for prediction calibration. Final reconstructed36-test RED25/11 compiled,
+    non-hook runtime tokens equalimmutable413; focused323/0/0. Candidate90130ed9 alltargets5185/0/13,
+    fmt/clippy/build/hygienePASS; default5195/1/13 on inheritedPassA clock fixture. Actual Solsource2/2
+    REJECT1WRONG2SMELL2blockers/CLOSED at90130ed9, raw236d6070/session01a10493. Unpaced
+    baseline/runner callbacks/success settlement remain; failing fixture uses an earlier asserted clock
+    than production, so no regression attribution without same-environment base control.
+    Disclosed converging extension3/3 on SAME artifact, no reset/restart. Prepared Sonnet task first
+    basecontrol/tests-FIRST, actual-Instant fixture, at most24 changed-guard variants, then focused/
+    controller sixgates/Sol3. Configvalid/doctor29OK/sonnet advertised; not dispatched yet. Prior
+    sessions6053/22954/28614 complete. No adoption/native/whole-G claim. D07 actualSLOW+source-scan
+    failure means worker structural-only annotation needs correction; original raw retained.
     Worker "132single-statement" wording overstates granularity; actual definitions include coupled
     pairs/whole-step slices/test-only log hooks. Preserve exact variants, not132single-production-guard claim.
     Earlier pre-checks used filtered output; complete final six-gate raw receipts now retained/audited.
