@@ -279,8 +279,14 @@
     Tests-first RED on exact c4 production retained:13selected10/3,5selected2/3,8selected4/4;
     corrected filter/test-row defects preserved. Completed raw/snapshots/transcript custody67files.
     Changed-path variants predeclared:7causal+1neutral,11selectedtests, cap8; not yet complete.
-    Final focused327+new running on unreviewed repaire30842e5. Six final-byte gates once and Sol4/4
-    follow writer exit; no adoption/native/whole-G claim.
+    Final focused330/0/0 preserves327names+3new; real rebuild/binary/source hashes independently checked.
+    Matrix8variants (7causal+1neutral),4controls11/0/0 complete; all seven actual runtime/instrumented
+    failures,0missed/0unexpected/0invalid, changed/restored hashes checked. Matrix freezes2 owned Rust
+    files; others from git archive c4. Complete worker/source/transcript/evidence custody retained.
+    Sonnet79104 completed/cleanup596ms; exact3paths committed clean4b941d4b032cbd652accd5fb18a59e0cb12d258a.
+    Controller sixgatesLIVE51759 ONCE, verifierabe594b4 imagefe3/networknone/sourceRO/no credentials;
+    fmt/clippyPASS, latergates pending. Initial shortSHA guard refusal ran no command, corrected fullSHA.
+    Sol4/4 configvalid/doctor10OK/catalogready; dispatch only after allsixpass. No adoption/native/whole-G claim.
     Prior sessions6053/22954/28614 complete. No adoption/native/whole-G claim. D07 actualSLOW+source-scan
     failure means original structural-only annotation was wrong; R3 handoff corrects it, original raw retained.
     Worker "132single-statement" wording overstates granularity; actual definitions include coupled
