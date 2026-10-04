@@ -257,7 +257,12 @@
     prior names. Five source hashes before/after match: Git05197a2b/tests f263b118. RED assertions
     include runtime, fixture/order and structural failures; not six independent runtime defects.
     Raw/source second copies in scratch/b2c-round3-red-focused-custody/. Sixteen targeted variants
-    now starting, below cap24; transcript chronology/mutation results/final sixgates/Sol3 pending.
+    COMPLETE below cap24:13 production runtime/instrumented failures,2 test-clock failures,1neutralpass;
+    six controls42/0/0, zero invalid/source-only variants. M13 structural prediction miss and M08/M09/M12
+    unexpected failures retained; no rerun. Tests-FIRST chronology verified; full worker secondcopy sealed.
+    Sonnet89293 completed/cleanup520ms; EXACT3paths committed clean c4c60a60, parent90130ed9.
+    Controller sixgates LIVE98230 on sourceRO/networknone/no credentials; observed imagefe3a644f,
+    containerb47d8da4362d. Fmt/workspace all-feature clippyPASS; remaining gates and Sol3 pending.
     Prior sessions6053/22954/28614 complete. No adoption/native/whole-G claim. D07 actualSLOW+source-scan
     failure means worker structural-only annotation needs correction; original raw retained.
     Worker "132single-statement" wording overstates granularity; actual definitions include coupled
