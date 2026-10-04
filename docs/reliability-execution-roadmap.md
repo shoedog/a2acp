@@ -285,7 +285,8 @@
     files; others from git archive c4. Complete worker/source/transcript/evidence custody retained.
     Sonnet79104 completed/cleanup596ms; exact3paths committed clean4b941d4b032cbd652accd5fb18a59e0cb12d258a.
     Controller sixgatesLIVE51759 ONCE, verifierabe594b4 imagefe3/networknone/sourceRO/no credentials;
-    fmt/clippyPASS, latergates pending. Initial shortSHA guard refusal ran no command, corrected fullSHA.
+    fmt/workspace all-feature clippy/buildPASS; alltargets5192/0/13,90groups/corecompiledPASS.
+    Default/doctests and hygiene pending. Initial shortSHA guard refusal ran no command, corrected fullSHA.
     Sol4/4 configvalid/doctor10OK/catalogready; dispatch only after allsixpass. No adoption/native/whole-G claim.
     Prior sessions6053/22954/28614 complete. No adoption/native/whole-G claim. D07 actualSLOW+source-scan
     failure means original structural-only annotation was wrong; R3 handoff corrects it, original raw retained.
