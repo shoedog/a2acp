@@ -275,23 +275,31 @@
     Missing private Claude settings restored exactly; missing host ACP restored from retained lock into
     fresh private directory. Recovered config7ad15132 valid/doctor29OK/catalog ready; correction retry1/1
     admitted session79104/execec2414/attemptb8df30. Actual transcript ec2110cb confirms Sonnet5.5;
-    live container7acbf292 imagefe3a644f/network/mount/labels retained. SAME artifact; writer active.
+    live container7acbf292 imagefe3a644f/network/mount/labels retained. SAME artifact; writer subsequently completed.
     Tests-first RED on exact c4 production retained:13selected10/3,5selected2/3,8selected4/4;
     corrected filter/test-row defects preserved. Completed raw/snapshots/transcript custody67files.
-    Changed-path variants predeclared:7causal+1neutral,11selectedtests, cap8; not yet complete.
+    Changed-path variants predeclared:7causal+1neutral,11selectedtests, cap8; completed below.
     Final focused330/0/0 preserves327names+3new; real rebuild/binary/source hashes independently checked.
     Matrix8variants (7causal+1neutral),4controls11/0/0 complete; all seven actual runtime/instrumented
     failures,0missed/0unexpected/0invalid, changed/restored hashes checked. Matrix freezes2 owned Rust
     files; others from git archive c4. Complete worker/source/transcript/evidence custody retained.
     Sonnet79104 completed/cleanup596ms; exact3paths committed clean4b941d4b032cbd652accd5fb18a59e0cb12d258a.
-    Controller sixgatesLIVE51759 ONCE, verifierabe594b4 imagefe3/networknone/sourceRO/no credentials;
+    Controller sixgatesCOMPLETE51759 ONCE, verifierabe594b4 imagefe3/networknone/sourceRO/no credentials;
     fmt/workspace all-feature clippy/buildPASS; alltargets5192/0/13,90groups/corecompiledPASS.
     Default/doctests5203/0/13,106groups/16docgroups/corecached and hygienePASS; ALLSIX complete,
     raw/commands/source hashes independently parsed, source unchanged. Verifier51759 completed.
     Initial shortSHA guard refusal ran no command, corrected fullSHA; no runtime-gate replay.
-    Sol4/4 LIVE79300/execexecb12ded/attemptcc4b708 after allsixPASS. Actual transcript01a10918 confirms
-    gpt5.6sol/xhigh/read-only with on-request policy (not never), no verdict yet.
-    No adoption/native/whole-G claim.
+    Sol4/4 COMPLETE79300/execexecb12ded/attemptcc4b708 after allsixPASS. Actual transcript01a10918 confirms
+    gpt5.6sol/xhigh/read-only with on-request policy (not never). Actual final REJECT3WRONG1SMELL3blockers,
+    round4/4; OPEN CLASS at exhausted cap. Source3 WRONGs closed, but three new combinations hide owed
+    digest observations, dominant BinaryDrift, or later chain checks. B2c PARKED FOR SPEC/DESIGN under
+    owner convergence rule; no fifth round, restart, provider dispatch or adoption admitted.
+    [Exact source4 review](superpowers/reviews/2026-10-04-adr0041-slice2b3b-b2c-source-round4.md),
+    rawSHAae5964ee and immutable source/full transcript custody retained in b2c-source4-rejected-custody/.
+    [Prepared design escalation](superpowers/plans/2026-10-04-adr0041-b2c-reconciliation-design-escalation.md)
+    names all three constructs and the stage/completion/error-composition deliverables for owner decision.
+    All current lane sessions complete. Native/aggregate/whole-G remain pending behind B2c approval.
+    Expensive deep audits stay out of routine CI/CD and skip unchanged-area slices; ordinary tests/review remain.
     Prior sessions6053/22954/28614 complete. No adoption/native/whole-G claim. D07 actualSLOW+source-scan
     failure means original structural-only annotation was wrong; R3 handoff corrects it, original raw retained.
     Worker "132single-statement" wording overstates granularity; actual definitions include coupled
