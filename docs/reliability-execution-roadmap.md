@@ -262,9 +262,10 @@
     unexpected failures retained; no rerun. Tests-FIRST chronology verified; full worker secondcopy sealed.
     Sonnet89293 completed/cleanup520ms; EXACT3paths committed clean c4c60a60, parent90130ed9.
     Controller sixgates LIVE98230 on sourceRO/networknone/no credentials; observed imagefe3a644f,
-    containerb47d8da4362d. Fmt/workspace all-feature clippyPASS; remaining gates and Sol3 pending.
+    containerb47d8da4362d. Fmt/workspace all-feature clippy/buildPASS; full alltargets5189/0/13,
+    90groups/321Git/corecompiled, raw/source independently checked. Default/doctests ACTIVE; hygiene/Sol3 pending.
     Prior sessions6053/22954/28614 complete. No adoption/native/whole-G claim. D07 actualSLOW+source-scan
-    failure means worker structural-only annotation needs correction; original raw retained.
+    failure means original structural-only annotation was wrong; R3 handoff corrects it, original raw retained.
     Worker "132single-statement" wording overstates granularity; actual definitions include coupled
     pairs/whole-step slices/test-only log hooks. Preserve exact variants, not132single-production-guard claim.
     Earlier pre-checks used filtered output; complete final six-gate raw receipts now retained/audited.
