@@ -264,8 +264,17 @@
     Controller sixgates COMPLETE/PASS98230 on sourceRO/networknone/no credentials, observed imagefe3a644f.
     Alltargets5189/0/13,90groups/321Git/corecompiled; default5200/0/13,106groups/16docgroups/corecached;
     fmt/workspace all-feature clippy/build/hygienePASS. All raw/source independently checked unchanged.
-    Solsource3/3 LIVE46566/execexec894343/attemptae021fbc on c4c60a60, transcript01a10568 confirms
-    gpt-5.6-sol/xhigh/read-only with on-request policy (not never). Final verdict pending.
+    Solsource3/3 COMPLETE/REJECT2WRONG1SMELL2blockers on c4c60a60; actual transcript01a10568
+    confirms gpt-5.6-sol/xhigh/read-only with on-request policy (not never). CLOSED POPULATION:
+    known timeout skips retained-chain/mount reconciliation; settlement-discovered timeout skips child
+    effect reconciliation. Shared bounded failure-only repair; historical chronology SMELL nonblocking.
+    [Exact source3 review](superpowers/reviews/2026-10-04-adr0041-slice2b3b-b2c-source-round3.md)
+    and rawSHA2df0e36f retained. Authorized targeted SAME-artifact source4/4 extension declared;
+    counts3→1→2 are not monotonic, no cap reset/restart. Changed-path mutation cap8; no132/190/16 replay.
+    Initial source4 refused container.mount.preflight before prompt acceptance, source unchanged.
+    Missing private Claude settings restored exactly; missing host ACP restored from retained lock into
+    fresh private directory. Fresh preflight/binding and one correction retry1/1 pending; no writer live.
+    Repair tests FIRST, then focused327+new, six final-byte gates once and Sol4/4. No adoption yet.
     Prior sessions6053/22954/28614 complete. No adoption/native/whole-G claim. D07 actualSLOW+source-scan
     failure means original structural-only annotation was wrong; R3 handoff corrects it, original raw retained.
     Worker "132single-statement" wording overstates granularity; actual definitions include coupled
