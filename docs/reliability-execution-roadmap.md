@@ -276,7 +276,11 @@
     fresh private directory. Recovered config7ad15132 valid/doctor29OK/catalog ready; correction retry1/1
     admitted session79104/execec2414/attemptb8df30. Actual transcript ec2110cb confirms Sonnet5.5;
     live container7acbf292 imagefe3a644f/network/mount/labels retained. SAME artifact; writer active.
-    Repair tests FIRST, then focused327+new, six final-byte gates once and Sol4/4. No adoption yet.
+    Tests-first RED on exact c4 production retained:13selected10/3,5selected2/3,8selected4/4;
+    corrected filter/test-row defects preserved. Completed raw/snapshots/transcript custody67files.
+    Changed-path variants predeclared:7causal+1neutral,11selectedtests, cap8; not yet complete.
+    Final focused327+new running on unreviewed repaire30842e5. Six final-byte gates once and Sol4/4
+    follow writer exit; no adoption/native/whole-G claim.
     Prior sessions6053/22954/28614 complete. No adoption/native/whole-G claim. D07 actualSLOW+source-scan
     failure means original structural-only annotation was wrong; R3 handoff corrects it, original raw retained.
     Worker "132single-statement" wording overstates granularity; actual definitions include coupled
