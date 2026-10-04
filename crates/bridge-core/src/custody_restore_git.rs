@@ -7721,16 +7721,13 @@ impl<'a> ProofRunV1<'a> {
         )
     }
 
-    /// The gate of a runner callback: the mount census, then every retained chain. Not held to the deadline:
-    /// a refusal here serves a child that is about to start or has already run.
-    fn proof_gate(&self) -> Result<(), GitBootstrapErrorV1> {
-        refuse_mounts_within(&self.dest().root)?;
-        self.proof_chains(&unpaced)
-    }
-
-    /// [`Self::proof_gate`] for a result that is about to become a success, held to the ONE absolute
-    /// deadline: observed before the census, right after it (the first step), before every chain, and
-    /// immediately before the root's identity, which stays the LAST fallible call.
+    /// The ONE gate of the final children: the mount census, then every retained chain, held to the ONE
+    /// absolute deadline: observed before the census, right after it (the first step of the chains), before
+    /// every chain, and immediately before the root's identity, which stays the LAST fallible call. Both runner
+    /// callbacks run it, because neither knows the child's outcome (the post-exit one of a child that is about
+    /// to succeed precedes a success), and so does a result that is about to become a success. A refusal here
+    /// makes the child's failure known, and a known failure is reconciled without the clock
+    /// ([`Self::proof_settle`]); no gate is ever left out of the deadline.
     fn proof_deadline_gate(&self) -> Result<(), GitBootstrapErrorV1> {
         let deadline = self.deadline;
         observe_deadline(deadline, "final-gate")?;
@@ -8000,8 +7997,10 @@ impl<'a> ProofRunV1<'a> {
     /// Run one read-only child rooted at the retained repository, and settle what it left, on EVERY outcome.
     /// A read-only child owns a zero-effect allowance: before it, the tree is censused and every file's
     /// SHA-256 is held to the restore's (a replaced entry stops the child); both runner callbacks run the
-    /// phase gate; and `classify` judges a returned result (status, then output). Nothing is reserved, so
-    /// nothing is released: the one ledger is never touched.
+    /// deadline gate; and `classify` judges a returned result (status, then output). Nothing is reserved, so
+    /// nothing is released: the one ledger is never touched. The baseline is held to the ONE absolute deadline
+    /// at every call (a guard after each, and one before the runner, a filesystem call of its own, is called):
+    /// a baseline that returns after it never lets a child start.
     fn proof_child<T>(
         &mut self,
         runner: &GitRunnerV1,
@@ -8016,8 +8015,11 @@ impl<'a> ProofRunV1<'a> {
             label,
             self.made.repository.canonical_path(),
         );
-        let baseline = self.proof_measure(&unpaced)?;
-        self.proof_digests(&baseline, &unpaced, DigestBoundV1::Deadline)?;
+        let deadline = self.deadline;
+        let pace = |step: &'static str| observe_deadline(deadline, step);
+        let baseline = self.proof_measure(&pace)?;
+        self.proof_digests(&baseline, &pace, DigestBoundV1::Deadline)?;
+        observe_deadline(deadline, "final-baselined")?;
         let callback_error: RefCell<Option<GitBootstrapErrorV1>> = RefCell::new(None);
         let outcome = {
             let this = &*self;
@@ -8034,7 +8036,7 @@ impl<'a> ProofRunV1<'a> {
                 );
                 #[cfg(not(test))]
                 let _ = (point_label, after);
-                match this.proof_gate() {
+                match this.proof_deadline_gate() {
                     Ok(()) => Ok(()),
                     Err(error) => {
                         *callback_error.borrow_mut() = Some(error);
@@ -8080,24 +8082,31 @@ impl<'a> ProofRunV1<'a> {
     /// Settle a read-only child, once, on any outcome: the tree must be EXACTLY what the pre-child census
     /// found, so an added, removed, replaced, or resized entry, a file whose mode or timestamps moved, and a
     /// file whose bytes changed in place (which only its digest can show) are each a reconciliation failure.
-    /// A returned result, a runner error, a nonzero status, and a parser refusal all keep their own failure
-    /// beside it. A result that is about to become a success passes the success gate held to the ONE
-    /// absolute deadline; a failed child's census and effect comparison are never cut short by it, so its
-    /// effect is still named beside its failure.
+    /// A returned result, a runner error, a nonzero status, a callback refusal (the typed timeout of a
+    /// callback that found the deadline spent among them), and a parser refusal all keep their own failure
+    /// beside it. A result that is about to become a success is settled on the ONE absolute deadline at every
+    /// call (a guard after each census and digest call, so nothing is made after a slow one without the
+    /// clock) and ends in the success gate held to it too; the typed timeout of a settlement the deadline cut
+    /// short is that settlement's own failure. Only a child whose failure is ALREADY known is measured
+    /// without the clock (bounded by the measured lengths instead), so its effect is still named beside its
+    /// failure and no success can come of it.
     fn proof_settle<T>(
         &self,
         baseline: &ProofFactsV1,
         label: &'static str,
         verdict: Result<T, GitBootstrapErrorV1>,
     ) -> Result<T, GitBootstrapErrorV1> {
-        // A child that has already failed is reconciled without the clock (its timeout is the usual reason the
+        let deadline = self.deadline;
+        let paced = |step: &'static str| observe_deadline(deadline, step);
+        // The pace and the digest bound go together: a verdict that is still a success keeps the clock, and a
+        // child that has already failed is reconciled without it (its timeout is the usual reason the
         // deadline has passed): its effect is measured, and the failure stays a failure.
-        let bound = if verdict.is_ok() {
-            DigestBoundV1::Deadline
+        let (pace, bound): (PaceV1<'_>, DigestBoundV1) = if verdict.is_ok() {
+            (&paced, DigestBoundV1::Deadline)
         } else {
-            DigestBoundV1::Reconciling
+            (&unpaced, DigestBoundV1::Reconciling)
         };
-        let effect = self.proof_measure(&unpaced).and_then(|measured| {
+        let effect = self.proof_measure(pace).and_then(|measured| {
             if &measured != baseline {
                 let changed = match measured
                     .files
@@ -8126,7 +8135,7 @@ impl<'a> ProofRunV1<'a> {
             }
             // Every fact is equal, so this reads the very files, at the very lengths, that the baseline
             // read, under the SAME absolute deadline: there is no exception after a child.
-            self.proof_digests(&measured, &unpaced, bound)
+            self.proof_digests(&measured, pace, bound)
         });
         match (verdict, effect) {
             (Ok(value), Ok(())) => {

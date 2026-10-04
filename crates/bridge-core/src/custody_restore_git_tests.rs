@@ -3932,13 +3932,20 @@ struct RanV1 {
 
 type OutcomeV1 = Result<VerifiedGitBootstrapV1, GitBootstrapFailureV1>;
 
-/// One Captured SHA-1 bootstrap through a tampering route. `setup` may install seams over the
-/// destination; its guards live until the attempt ends.
-fn run_with(
+/// The ONE absolute deadline an attempt hands to production, as the attempt itself made it: empty until the
+/// attempt makes it (after phase V, the setup, and the route), set to the very `Instant` the bootstrap is
+/// called with. A hook reads it when it runs, so a clock a row builds from it is the clock production keeps;
+/// a clock anchored at any earlier instant is not, by exactly the preparation in between.
+type ActualDeadlineV1 = std::rc::Rc<std::cell::Cell<Option<Instant>>>;
+
+/// [`run_with`] that also tells `setup`'s hooks the ACTUAL deadline (see [`ActualDeadlineV1`]) and returns it.
+/// The deadline is made at the same point as ever: after `setup` and the route, so the preparation does not
+/// spend the attempt's headroom.
+fn run_with_the_actual_deadline(
     rules: &[(&str, &str)],
     timeout: Duration,
-    setup: impl FnOnce(&DestV1) -> Vec<GitSeamGuardV1>,
-) -> (RanV1, OutcomeV1) {
+    setup: impl FnOnce(&DestV1, ActualDeadlineV1) -> Vec<GitSeamGuardV1>,
+) -> (RanV1, OutcomeV1, Instant) {
     let capsule = captured(CustodyGitObjectFormatV1::Sha1);
     let (dest, verified) = phase_v(&capsule.capsule);
     let (phase_v_used, base) = pin_charge(&verified);
@@ -3948,15 +3955,13 @@ fn run_with(
         .find(|one| one.role == CustodyCapsuleArtifactRoleV1::GitObjectPack)
         .map(|one| one.length)
         .expect("the staged pack");
-    let _guards = setup(&dest);
+    let actual = ActualDeadlineV1::default();
+    let _guards = setup(&dest, actual.clone());
     let route = RouteV1::new(rules);
     let (_area, runner) = route.runner();
-    let outcome = bootstrap_git_objects_v1(
-        verified,
-        &runner,
-        GitObjectFormatV1::Sha1,
-        Instant::now() + timeout,
-    );
+    let deadline = Instant::now() + timeout;
+    actual.set(Some(deadline));
+    let outcome = bootstrap_git_objects_v1(verified, &runner, GitObjectFormatV1::Sha1, deadline);
     (
         RanV1 {
             dest,
@@ -3966,7 +3971,19 @@ fn run_with(
             pack_length,
         },
         outcome,
+        deadline,
     )
+}
+
+/// One Captured SHA-1 bootstrap through a tampering route. `setup` may install seams over the
+/// destination; its guards live until the attempt ends.
+fn run_with(
+    rules: &[(&str, &str)],
+    timeout: Duration,
+    setup: impl FnOnce(&DestV1) -> Vec<GitSeamGuardV1>,
+) -> (RanV1, OutcomeV1) {
+    let (ran, outcome, _) = run_with_the_actual_deadline(rules, timeout, |dest, _| setup(dest));
+    (ran, outcome)
 }
 
 fn run(rules: &[(&str, &str)]) -> (RanV1, OutcomeV1) {
@@ -6355,21 +6372,32 @@ fn round5_the_measured_inode_renamed_away_and_back_is_not_a_substitution() {
 const NEAR_EXPIRY_V1: Duration = Duration::from_secs(10);
 
 /// One Captured SHA-1 bootstrap in which the final `fsck` EXITS WITHIN the deadline, and the clock
-/// then reaches `until` (measured from the attempt's start) in the child's post-exit callback, before
-/// the child's settlement runs: the digest pass of that settlement is what meets the deadline.
-fn run_with_the_final_fsck_settling_at(until: Duration) -> (RanV1, OutcomeV1, Instant) {
-    let begun = Instant::now();
-    let (ran, outcome) = run_with(&[], NEAR_EXPIRY_V1, move |_dest| {
+/// then reaches `until` in the child's post-exit callback, before the child's settlement runs: the digest
+/// pass of that settlement is what meets the deadline. `until` is measured from the start of the deadline
+/// the bootstrap is ACTUALLY given (that deadline less [`NEAR_EXPIRY_V1`]), never from an instant read
+/// before the attempt prepared itself: production makes its deadline after phase V and the setup, so a
+/// clock anchored earlier is early by the whole preparation, and under load that moves the row's
+/// "crossing" to before the real deadline. `preparation` is spent after phase V and BEFORE the deadline is
+/// made (it models that load, deterministically), and the returned instant is the deadline production got.
+fn run_with_the_final_fsck_settling_at(
+    until: Duration,
+    preparation: Duration,
+) -> (RanV1, OutcomeV1, Instant) {
+    run_with_the_actual_deadline(&[], NEAR_EXPIRY_V1, move |_dest, actual| {
+        std::thread::sleep(preparation);
         vec![install_git_hook_for_test(
             GitHookPointV1::AfterChild,
             move |event| {
                 if event.label == "fsck --strict" {
+                    let deadline = actual
+                        .get()
+                        .expect("a child runs after the deadline is made");
+                    let begun = deadline - NEAR_EXPIRY_V1;
                     std::thread::sleep((begun + until).saturating_duration_since(Instant::now()));
                 }
             },
         )]
-    });
-    (ran, outcome, begun + NEAR_EXPIRY_V1)
+    })
 }
 
 /// A final `fsck` that finishes before the deadline can never make the bootstrap succeed AFTER it:
@@ -6381,8 +6409,10 @@ fn run_with_the_final_fsck_settling_at(until: Duration) -> (RanV1, OutcomeV1, In
 fn round5_a_final_fsck_that_finishes_before_the_deadline_cannot_succeed_after_it() {
     let clean = clean_charge();
     let (_needle, _command, started, completed) = READ_ONLY_V1[3];
-    let (ran, outcome, deadline) =
-        run_with_the_final_fsck_settling_at(NEAR_EXPIRY_V1 + Duration::from_secs(1));
+    let (ran, outcome, deadline) = run_with_the_final_fsck_settling_at(
+        NEAR_EXPIRY_V1 + Duration::from_secs(1),
+        Duration::ZERO,
+    );
     let after = Instant::now().saturating_duration_since(deadline);
     println!(
         "DEADLINE-MARKER the final fsck crossing: returned {}ms after the deadline",
@@ -6410,7 +6440,8 @@ fn round5_a_final_fsck_that_finishes_before_the_deadline_cannot_succeed_after_it
 /// deadline, succeeds with every child started, and returns before the deadline.
 #[test]
 fn round5_a_final_fsck_settling_with_headroom_succeeds_before_the_deadline() {
-    let (ran, outcome, deadline) = run_with_the_final_fsck_settling_at(Duration::from_millis(500));
+    let (ran, outcome, deadline) =
+        run_with_the_final_fsck_settling_at(Duration::from_millis(500), Duration::ZERO);
     let observed = ran.route.children();
     println!(
         "CHILD-START-MARKER the headroom control: observed={observed:?} returned_before_the_deadline={}",
@@ -6425,6 +6456,76 @@ fn round5_a_final_fsck_settling_with_headroom_succeeds_before_the_deadline() {
         Instant::now() < deadline,
         "the control must finish inside its deadline"
     );
+}
+
+/// The near-expiry rows are timed from the deadline the bootstrap is ACTUALLY given. Production makes its
+/// deadline after phase V and the attempt's setup, so a row that anchors its crossing at an instant read
+/// before them is early by the whole preparation: under load (a preparation of more than the crossing's
+/// one-second margin) the inherited crossing row then reported a bootstrap that succeeded BEFORE its own
+/// deadline as one that succeeded after it. Here the preparation is explicit and longer than that margin
+/// (1.5 s, spent before the deadline is made), and: the crossing (the final `fsck` settling one second past
+/// the deadline) is still a refusal with the typed timeout, the headroom control (settling inside it) still
+/// succeeds before it, and the deadline each returns is later than the row's start by the preparation and the
+/// whole timeout, so it is the one the bootstrap was handed. A crossing measured from the row's start instead
+/// lands before that deadline: the bootstrap succeeds and the crossing row reports it.
+#[test]
+fn b2c_the_near_expiry_rows_are_timed_from_the_deadline_the_bootstrap_receives() {
+    const PREPARATION_V1: Duration = Duration::from_millis(1500);
+    let (_needle, _command, started, completed) = READ_ONLY_V1[3];
+    let crossing = || -> Vec<String> {
+        let begun = Instant::now();
+        let (ran, outcome, deadline) = run_with_the_final_fsck_settling_at(
+            NEAR_EXPIRY_V1 + Duration::from_secs(1),
+            PREPARATION_V1,
+        );
+        let mut problems = judge(
+            "a crossing after a slow preparation",
+            &ran,
+            &outcome,
+            started,
+            Some(completed),
+            ChargeV1::Exactly(ran.phase_v + clean_charge()),
+            is_timeout,
+        );
+        if deadline < begun + PREPARATION_V1 + NEAR_EXPIRY_V1 {
+            problems.push("the crossing row's deadline was made before its preparation".to_owned());
+        }
+        if outcome.is_ok() {
+            problems.push(format!(
+                "success was returned {}ms after the deadline",
+                Instant::now()
+                    .saturating_duration_since(deadline)
+                    .as_millis()
+            ));
+        }
+        problems
+    };
+    let headroom = || -> Vec<String> {
+        let begun = Instant::now();
+        let (ran, outcome, deadline) =
+            run_with_the_final_fsck_settling_at(Duration::from_millis(500), PREPARATION_V1);
+        let mut problems = Vec::new();
+        if ran.route.children().len() != 6 {
+            problems.push(format!("children {:?}", ran.route.children()));
+        }
+        if outcome.is_err() {
+            problems.push("the headroom control was refused".to_owned());
+        }
+        if Instant::now() >= deadline {
+            problems.push("the headroom control finished after its deadline".to_owned());
+        }
+        if deadline < begun + PREPARATION_V1 + NEAR_EXPIRY_V1 {
+            problems.push("the headroom row's deadline was made before its preparation".to_owned());
+        }
+        problems
+    };
+    let problems: Vec<String> = std::thread::scope(|scope| {
+        let (crossing, headroom) = (scope.spawn(crossing), scope.spawn(headroom));
+        let mut all = crossing.join().expect("the crossing row's thread");
+        all.extend(headroom.join().expect("the headroom row's thread"));
+        all
+    });
+    assert_no_problems(problems);
 }
 
 /// `fsck` stderr rows, each a real final child with its marker: a recognized strict-object row never
@@ -23979,6 +24080,52 @@ fn b2c_the_one_deadline_reaches_every_helper_and_none_resets_it() {
 // The final stage's guards: derived from the filesystem, and each halts the run alone
 // ---------------------------------------------------------------------------------------------
 
+/// The parts of ONE final child's bracket that a success is made of, in the order they run. A slow call in any
+/// of them returns after the one deadline with a child possibly still to run or still to be accepted, so each is
+/// held to that deadline: none may be followed by a call before the clock is read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BracketV1 {
+    /// The zero-effect baseline: the census of the exact tree and the digest of every restored file, before the
+    /// runner is called.
+    Baseline,
+    /// The runner's pre-spawn callback: the mount census and every retained chain.
+    BeforeCallback,
+    /// The runner's post-exit callback, which cannot know whether the child succeeded.
+    AfterCallback,
+    /// The settlement of a result that is about to be a success: the census, the digests, and the success gate.
+    Settlement,
+}
+
+/// Where a guard of the final stage stands.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StageV1 {
+    /// The stage's entry guard.
+    Entry,
+    /// A part of the bracket of final child `n` (1-based).
+    Child(usize, BracketV1),
+    /// The rewinds of the staged descriptors.
+    Rewind,
+    /// The closing gate.
+    Closing,
+}
+
+impl StageV1 {
+    /// How many final children had started, and how many proofs the failure records, when a refusal ends the
+    /// run in this stage of a run with `total` final children: a refusal in a callback of a child makes the
+    /// runner return an error, so the child that ran is not recorded.
+    fn children_after(self, total: usize) -> (usize, usize) {
+        match self {
+            Self::Entry => (0, 0),
+            Self::Child(child, BracketV1::Baseline | BracketV1::BeforeCallback) => {
+                (child - 1, child - 1)
+            }
+            Self::Child(child, BracketV1::AfterCallback) => (child, child - 1),
+            Self::Child(child, BracketV1::Settlement) => (child, child),
+            Self::Rewind | Self::Closing => (total, total),
+        }
+    }
+}
+
 /// One clean run's final stage, with the facts its guard sequence is derived from (the test's OWN
 /// measurement of the disk and of the retained value, never the production code under test).
 struct FinalShapeV1 {
@@ -24056,24 +24203,78 @@ impl FinalShapeV1 {
         }
     }
 
-    /// The whole final stage a clean run must log, derived from the facts above.
-    fn expected(&self) -> Vec<&'static str> {
-        let mut events = vec!["final-entry"];
-        for _ in 0..self.final_children {
-            events.push("final-gate");
-            self.sweep(&mut events);
-        }
-        events.push("final-rewind");
-        events.extend(std::iter::repeat_n("final-rewound", self.staged));
-        events.extend(["final-closing", "final-mounts"]);
-        self.census(&mut events);
-        events.push("final-tree");
+    /// The guards of the digest of every restored file: before each file, after its open, and after its read.
+    fn digests(&self, events: &mut Vec<&'static str>) {
         for _ in 0..self.object_files + self.metadata_files {
             events.extend(["final-digest", "final-digest-opened", "final-digest-read"]);
         }
+    }
+
+    /// The guards of one gate of a final child (a runner callback's, or the settlement's success gate): its
+    /// entry guard, which stands before the mount census and so also right after the call before the gate, then
+    /// the sweep of everything retained (whose first guard stands right after the mount census).
+    fn gate(&self, events: &mut Vec<&'static str>) {
+        events.push("final-gate");
+        self.sweep(events);
+    }
+
+    /// The whole final stage a clean run must log, derived from the facts above, each guard with where it
+    /// stands. Every success-eligible bracket of a final child is held to the one deadline, so each child logs:
+    /// its zero-effect baseline (the census of the exact tree and the digest of every restored file, then a
+    /// guard before the runner is called); the gate of the pre-spawn callback; the gate of the post-exit
+    /// callback; and the settlement of a result that is about to be a success (the census, the digests, and
+    /// the success gate). The rewinds and the closing gate follow the last child.
+    fn expected_staged(&self) -> Vec<(&'static str, StageV1)> {
+        let mut staged: Vec<(&'static str, StageV1)> = vec![("final-entry", StageV1::Entry)];
+        let mut part = |stage: StageV1, events: Vec<&'static str>| {
+            staged.extend(events.into_iter().map(|label| (label, stage)));
+        };
+        for child in 1..=self.final_children {
+            let mut events = Vec::new();
+            self.census(&mut events);
+            self.digests(&mut events);
+            events.push("final-baselined");
+            part(StageV1::Child(child, BracketV1::Baseline), events);
+            for bracket in [BracketV1::BeforeCallback, BracketV1::AfterCallback] {
+                let mut events = Vec::new();
+                self.gate(&mut events);
+                part(StageV1::Child(child, bracket), events);
+            }
+            let mut events = Vec::new();
+            self.census(&mut events);
+            self.digests(&mut events);
+            self.gate(&mut events);
+            part(StageV1::Child(child, BracketV1::Settlement), events);
+        }
+        let mut events = vec!["final-rewind"];
+        events.extend(std::iter::repeat_n("final-rewound", self.staged));
+        part(StageV1::Rewind, events);
+        let mut events = vec!["final-closing", "final-mounts"];
+        self.census(&mut events);
+        events.push("final-tree");
+        self.digests(&mut events);
         events.push("final-digested");
         self.sweep(&mut events);
-        events
+        part(StageV1::Closing, events);
+        staged
+    }
+
+    /// [`Self::expected_staged`]'s guards alone.
+    fn expected(&self) -> Vec<&'static str> {
+        self.expected_staged()
+            .into_iter()
+            .map(|(label, _)| label)
+            .collect()
+    }
+
+    /// The index, in the whole run's guards, of the first guard labelled `label` in `stage`.
+    fn index_in(&self, stage: StageV1, label: &str) -> usize {
+        self.entry
+            + self
+                .expected_staged()
+                .iter()
+                .position(|found| *found == (label, stage))
+                .unwrap_or_else(|| panic!("no `{label}` guard in {stage:?}"))
     }
 
     /// The index of the first guard labelled `label` at or after `from`.
@@ -24174,12 +24375,15 @@ fn clean_final_shape(
 }
 
 /// The guards of the final stage are EXACTLY the ones derived from the filesystem, in order, for an Empty
-/// database (no object file) and a Captured one: the clock is read at the stage's entry, at each child's
-/// success gate and over every retained chain in it, before the first staged rewind and after each, and through
-/// the closing gate (the mount census, the census of the exact tree after every call that is followed by
-/// another, the digest of each restored file after each of its calls, and every chain, one guard per call), and
-/// the LAST guard is the one immediately before the destination root's identity, with nothing read after it.
-/// Every guard site has a halting row below; this pins that none is missing, doubled, or moved.
+/// database (no object file) and a Captured one: the clock is read at the stage's entry; in every part of
+/// each final child's bracket (its baseline census and digests and the guard before the runner is called, the
+/// gate of its pre-spawn callback and the gate of its post-exit callback, and its settlement census, digests,
+/// and success gate, each gate being its entry guard and then every retained chain); before the first staged
+/// rewind and after each; and through the closing gate (the mount census, the census of the exact tree after
+/// every call that is followed by another, the digest of each restored file after each of its calls, and every
+/// chain, one guard per call). The LAST guard is the one immediately before the destination root's identity,
+/// with nothing read after it. Every guard site has a halting row below; this pins that none is missing,
+/// doubled, or moved.
 #[test]
 fn b2c_the_final_guards_run_in_the_documented_order() {
     for (row, shape) in [
@@ -24213,28 +24417,48 @@ fn b2c_the_final_guards_run_in_the_documented_order() {
     }
 }
 
-/// The index and label of the guards a halting row slows: the first and the last guard of every run of equal
-/// labels in the final stage, skipping every child's success gate after the first (the same code).
-fn halting_rows(shape: &FinalShapeV1) -> Vec<(usize, &'static str)> {
-    let tail = &shape.events[shape.entry..];
+/// The index, label, and stage of the guards a halting row slows. In the stage's entry, the rewinds, and the
+/// closing gate: the first and the last guard of every run of equal labels. In each part of the FIRST final
+/// child's bracket (the other children run the same code, so their brackets add nothing): the first and the
+/// last guard of the part, and the first guard of every distinct label in it, so every guard of every part
+/// has a row, whether it is the plumbing of the deadline into that part or a site the closing gate's rows
+/// already cover one by one.
+fn halting_rows(shape: &FinalShapeV1) -> Vec<(usize, &'static str, StageV1)> {
+    let staged = shape.expected_staged();
     let mut rows = Vec::new();
-    let (mut gates, mut skipping, mut at) = (0_usize, false, 0_usize);
-    while at < tail.len() {
-        let label = tail[at];
+    let mut at = 0_usize;
+    while at < staged.len() {
+        let stage = staged[at].1;
         let mut end = at;
-        while end < tail.len() && tail[end] == label {
+        while end < staged.len() && staged[end].1 == stage {
             end += 1;
         }
-        if label == "final-gate" {
-            gates += 1;
-            skipping = gates > 1;
-        } else if label == "final-rewind" || label == "final-closing" {
-            skipping = false;
-        }
-        if !skipping {
-            rows.push((shape.entry + at, label));
-            if end - 1 != at {
-                rows.push((shape.entry + end - 1, label));
+        match stage {
+            StageV1::Child(child, _) if child > 1 => {}
+            StageV1::Child(..) => {
+                let part = &staged[at..end];
+                let mut seen = std::collections::BTreeSet::new();
+                for (offset, (label, _)) in part.iter().enumerate() {
+                    let first_of_its_label = seen.insert(*label);
+                    if first_of_its_label || offset == 0 || offset == part.len() - 1 {
+                        rows.push((shape.entry + at + offset, *label, stage));
+                    }
+                }
+            }
+            StageV1::Entry | StageV1::Rewind | StageV1::Closing => {
+                let mut run = at;
+                while run < end {
+                    let (label, _) = staged[run];
+                    let mut last = run;
+                    while last < end && staged[last].0 == label {
+                        last += 1;
+                    }
+                    rows.push((shape.entry + run, label, stage));
+                    if last - 1 != run {
+                        rows.push((shape.entry + last - 1, label, stage));
+                    }
+                    run = last;
+                }
             }
         }
         at = end;
@@ -24242,17 +24466,18 @@ fn halting_rows(shape: &FinalShapeV1) -> Vec<(usize, &'static str)> {
     rows
 }
 
-/// One halting row: the run in which the step before guard `index` (labelled `label`) is made slow past the
-/// one deadline, and every problem found with how it ended. `rich` runs a Captured database (the bootstrap ran
-/// six Git children) and not an Empty one with an unborn HEAD (three).
+/// One halting row: the run in which the step before guard `index` (labelled `label`, standing in `stage`) is
+/// made slow past the one deadline, and every problem found with how it ended. `rich` runs a Captured database
+/// (the bootstrap ran six Git children) and not an Empty one with an unborn HEAD (three).
 fn halting_row(
     capsule: &CustomCapsuleV1,
     shape: &FinalShapeV1,
     index: usize,
     label: &'static str,
+    stage: StageV1,
     rich: bool,
 ) -> Vec<String> {
-    let name = format!("guard #{index} `{label}`");
+    let name = format!("guard #{index} `{label}` ({stage:?})");
     let input = if rich {
         PlaneInV1::rich(capsule, CustodyGitObjectFormatV1::Sha1)
     } else {
@@ -24276,10 +24501,7 @@ fn halting_row(
     let Err(failure) = &ran.outcome else {
         return vec![format!("{name}: a success followed the expiry")];
     };
-    let ran_children = shape.events[shape.entry..=index]
-        .iter()
-        .filter(|event| **event == "final-gate")
-        .count();
+    let (started, recorded) = stage.children_after(shape.final_children);
     let mut judged = Vec::new();
     if !is_timeout(&failure.cause) {
         judged.push(format!("cause {:?}", failure.cause));
@@ -24296,14 +24518,14 @@ fn halting_row(
             events.borrow().len().saturating_sub(index + 1)
         ));
     }
-    if failure.partial.final_runs.len() != ran_children {
+    if failure.partial.final_runs.len() != recorded {
         judged.push(format!(
-            "{} final children recorded, {ran_children} had run",
+            "{} final children recorded, {recorded} had returned",
             failure.partial.final_runs.len()
         ));
     }
     let bootstrap_children = if rich { 6 } else { 3 };
-    if route.children().len() != bootstrap_children + ran_children {
+    if route.children().len() != bootstrap_children + started {
         judged.push(format!("children {:?}", route.children()));
     }
     if failure.ledger_used != shape.ledger {
@@ -24319,51 +24541,71 @@ fn halting_row(
     }
 }
 
-/// Every guard of the final stage halts the run ALONE: the step before it is made slow past the one deadline,
-/// and the run ends with the typed timeout AT that guard: the children that had run, `Config` as the last
-/// completed step, the ledger exactly as a clean run leaves it, a failure and never a success, and NO later
-/// guard read (so nothing further was done toward a result, and the root's identity was never reached). The
-/// rows are independent runs that mostly wait for their deadline, so they run on a few threads at once. The rows
-/// are derived from an Empty database's run; the guards that exist only for a Captured database (those of its
-/// admitted bootstrap files) are derived from a Captured run, and every one of them has its rows too.
+/// Every guard of the final stage halts the run alone: the step before it is made slow past the one deadline,
+/// and the run ends with the typed timeout AT that guard: the children that had started and the proofs that had
+/// returned (a refusal in a runner callback makes the runner return an error, so that child's proof is not
+/// recorded), `Config` as the last completed step, the ledger exactly as a clean run leaves it, a failure and
+/// never a success, and NO later guard read (so nothing further was done toward a result, and the root's
+/// identity was never reached). The rows are independent runs that mostly wait for their deadline, so they run
+/// on a few threads at once. The rows are derived from an Empty database's run; the guards that exist only for a
+/// Captured database (those of its admitted bootstrap files) are derived from a Captured run, and every one of
+/// them has its rows too.
 #[test]
 fn b2c_every_final_guard_halts_the_run_alone_and_no_success_follows_expiry() {
     let capsule = empty(CustodyGitObjectFormatV1::Sha1);
     let shape = clean_final_shape(&capsule, CustodyGitObjectFormatV1::Sha1, false);
     let captured_capsule = captured(CustodyGitObjectFormatV1::Sha1);
     let captured_shape = clean_final_shape(&captured_capsule, CustodyGitObjectFormatV1::Sha1, true);
-    let mut rows: Vec<(bool, usize, &'static str)> = halting_rows(&shape)
+    let mut rows: Vec<(bool, usize, &'static str, StageV1)> = halting_rows(&shape)
         .into_iter()
-        .map(|(index, label)| (false, index, label))
+        .map(|(index, label, stage)| (false, index, label, stage))
         .collect();
-    assert!(rows.len() >= 20, "{rows:?}");
-    let empty_labels: std::collections::BTreeSet<&str> =
-        shape.events[shape.entry..].iter().copied().collect();
-    let only_captured: Vec<(bool, usize, &'static str)> = halting_rows(&captured_shape)
+    assert!(rows.len() >= 60, "{}", rows.len());
+    for bracket in [
+        BracketV1::Baseline,
+        BracketV1::BeforeCallback,
+        BracketV1::AfterCallback,
+        BracketV1::Settlement,
+    ] {
+        assert!(
+            rows.iter().any(|row| row.3 == StageV1::Child(1, bracket)),
+            "{bracket:?} has rows"
+        );
+    }
+    // The labels of the Empty database's documented sequence (the order row holds it equal to what a run logs).
+    let empty_labels: std::collections::BTreeSet<&str> = shape.expected().into_iter().collect();
+    let only_captured: Vec<(bool, usize, &'static str, StageV1)> = halting_rows(&captured_shape)
         .into_iter()
-        .filter(|(_, label)| !empty_labels.contains(label))
-        .map(|(index, label)| (true, index, label))
+        .filter(|(_, label, _)| !empty_labels.contains(label))
+        .map(|(index, label, stage)| (true, index, label, stage))
         .collect();
-    let labels: std::collections::BTreeSet<&str> =
-        only_captured.iter().map(|&(_, _, label)| label).collect();
+    let labels: std::collections::BTreeSet<&str> = only_captured
+        .iter()
+        .map(|&(_, _, label, _)| label)
+        .collect();
     assert_eq!(
         labels,
         std::collections::BTreeSet::from(["final-source", "final-source-statted"]),
         "the guards only a Captured database has"
     );
+    println!(
+        "HALTING-ROWS: {} for an Empty database, {} more for the guards only a Captured one has",
+        rows.len(),
+        only_captured.len()
+    );
     rows.extend(only_captured);
     let problems: Vec<String> = std::thread::scope(|scope| {
         let mut all = Vec::new();
-        for chunk in rows.chunks(7) {
+        for chunk in rows.chunks(8) {
             let handles: Vec<_> = chunk
                 .iter()
-                .map(|&(rich, index, label)| {
+                .map(|&(rich, index, label, stage)| {
                     let (capsule, shape) = if rich {
                         (&captured_capsule, &captured_shape)
                     } else {
                         (&capsule, &shape)
                     };
-                    scope.spawn(move || halting_row(capsule, shape, index, label, rich))
+                    scope.spawn(move || halting_row(capsule, shape, index, label, stage, rich))
                 })
                 .collect();
             for handle in handles {
@@ -24751,8 +24993,7 @@ fn b2c_a_retained_chain_swapped_in_the_final_gates_or_the_root_swapped_last_is_r
     }
     let capsule = captured(CustodyGitObjectFormatV1::Sha1);
     let shape = clean_final_shape(&capsule, CustodyGitObjectFormatV1::Sha1, true);
-    let first_gate = shape.first_after(shape.entry, "final-gate");
-    let closing = shape.first_after(first_gate, "final-closing");
+    let closing = shape.first_after(shape.entry, "final-closing");
     let sweep = shape.first_after(closing, "objects-chain");
     let first_chain = shape.first_after(sweep, "chain");
     let metadata_chain = shape.first_after(sweep, "final-chain");
@@ -24891,8 +25132,24 @@ fn b2c_a_retained_chain_swapped_in_the_final_gates_or_the_root_swapped_last_is_r
             recorded: 3,
         },
         RowV1 {
+            name: "the destination root at a child's pre-spawn callback",
+            index: shape.index_in(StageV1::Child(1, BracketV1::BeforeCallback), "root"),
+            label: "root",
+            swap: |root, outside| swap_directory(root, outside),
+            check: is_identity_changed,
+            recorded: 0,
+        },
+        RowV1 {
+            name: "the destination root at a child's post-exit callback",
+            index: shape.index_in(StageV1::Child(1, BracketV1::AfterCallback), "root"),
+            label: "root",
+            swap: |root, outside| swap_directory(root, outside),
+            check: is_identity_changed,
+            recorded: 0,
+        },
+        RowV1 {
             name: "the destination root at a child's success gate",
-            index: shape.first_after(first_gate, "root"),
+            index: shape.index_in(StageV1::Child(1, BracketV1::Settlement), "root"),
             label: "root",
             swap: |root, outside| swap_directory(root, outside),
             check: is_identity_changed,
@@ -26508,10 +26765,14 @@ fn b2c_the_final_region_names_only_the_final_vocabulary_and_the_split_is_unique(
 /// gate is the clock, the mount census, the census of the exact tree, the digest of every restored file, and
 /// then the sweep of every retained chain as its TAIL expression, whose own last statements are the guard and
 /// the root's identity (the last fallible call, with only a tail expression after it); the retained chains
-/// are the output chains, the metadata chains, the admitted source files, and the sweep, in that order; the
-/// success arm of a child uses the deadline gate and the runner's callbacks stay unobserved; nothing
-/// fallible follows the closing gate but infallible construction; and the wrapper builds its success value
-/// infallibly.
+/// are the output chains, the metadata chains, the admitted source files, and the sweep, in that order; every
+/// success-eligible bracket of a final child is held to the one deadline (the baseline's census and digests
+/// then a guard before the runner, both runner callbacks and a child's success arm through the one deadline
+/// gate, the settlement's census and digests on the pace its verdict chose), and the ONLY clock-free pace in
+/// the final region is the reconciliation of a child whose failure is already known; nothing fallible follows
+/// the closing gate but infallible construction; and the wrapper builds its success value infallibly. (Before
+/// source round 3 this row asserted the opposite of the callbacks: "the runner callbacks' gate is not held to
+/// the deadline". That was the defect, restated as a scan.)
 #[test]
 fn b2c_the_final_gate_order_is_fixed_in_the_source() {
     let source = include_str!("custody_restore_git.rs");
@@ -26547,17 +26808,69 @@ fn b2c_the_final_gate_order_is_fixed_in_the_source() {
         "the sweep, whose last statement before the root's identity is its guard, is the tail expression"
     );
 
+    // ONE gate, always held to the deadline: its entry guard, then the mount census, then every chain on the same
+    // pace. A child's success arm and BOTH runner callbacks run it, and there is no gate that is not held to the
+    // deadline.
+    let gate = body_of(source, "fn proof_deadline_gate(");
+    let order = [
+        at(gate, "observe_deadline("),
+        at(gate, "refuse_mounts_within("),
+        at(gate, "self.proof_chains("),
+    ];
+    assert!(order.windows(2).all(|pair| pair[0] < pair[1]), "{order:?}");
+    assert!(
+        !source.contains("fn proof_gate(") && !source.contains("self.proof_gate()"),
+        "no gate escapes the deadline"
+    );
+    let child = body_of(source, "fn proof_child<");
+    assert!(
+        child.contains("match this.proof_deadline_gate()"),
+        "both runner callbacks run the deadline gate"
+    );
+    // The baseline is held to the same deadline: its census and digests on the one pace, and a guard before the
+    // runner (a filesystem call of its own) is called.
+    let order = [
+        at(child, "self.proof_measure(&pace)"),
+        at(
+            child,
+            "self.proof_digests(&baseline, &pace, DigestBoundV1::Deadline)",
+        ),
+        at(child, "\"final-baselined\""),
+        at(child, "runner.run("),
+    ];
+    assert!(order.windows(2).all(|pair| pair[0] < pair[1]), "{order:?}");
+    assert!(
+        !child.contains("unpaced"),
+        "no step of a child's bracket leaves the clock out"
+    );
+    // The settlement of a result that is about to be a success is paced and bound to the deadline; ONLY a child
+    // whose failure is already known is reconciled without the clock, and the success arm still ends in the gate.
     let settle = body_of(source, "fn proof_settle<");
     assert!(
-        settle.contains("self.proof_deadline_gate()?") && !settle.contains("self.proof_gate()?"),
+        settle.contains("self.proof_deadline_gate()?"),
         "a child's success arm is held to the deadline"
     );
-    let gate = body_of(source, "fn proof_gate(");
+    assert_eq!(settle.matches("unpaced").count(), 1, "one clock-free arm");
     assert!(
-        gate.contains("refuse_mounts_within(") && !gate.contains("observe_deadline("),
-        "the runner callbacks' gate is not held to the deadline"
+        at(settle, "DigestBoundV1::Deadline") < at(settle, "&unpaced")
+            && at(settle, "&unpaced") < at(settle, "DigestBoundV1::Reconciling"),
+        "the success arm is paced and the failure arm is the clock-free one"
     );
-    assert!(source.contains("match this.proof_gate()"));
+    assert!(
+        settle.contains("self.proof_measure(pace)")
+            && settle.contains("self.proof_digests(&measured, pace, bound)"),
+        "the settlement's census and digests take the pace its verdict chose"
+    );
+    let region = source.split_once(B2C_MARKER_V1).expect("the B2c marker").1;
+    assert_eq!(
+        region
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .map(|line| line.matches("&unpaced").count())
+            .sum::<usize>(),
+        1,
+        "the only unpaced pace in the final region is the failed child's reconciliation"
+    );
 
     let prove = body_of(source, "fn proof_run(");
     let tail =
@@ -27081,6 +27394,550 @@ fn b2c_a_slow_call_that_returns_after_the_deadline_is_followed_by_no_further_cal
             .flat_map(|handle| handle.join().expect("a slow-return row's thread"))
             .collect()
     });
+    assert!(problems.is_empty(), "{}", problems.join("\n"));
+}
+
+// ---------------------------------------------------------------------------------------------
+// A deadline spent in a runner callback is still reconciled beside what the child left (source round 3)
+// ---------------------------------------------------------------------------------------------
+
+/// The runner's callbacks are held to the one deadline, so a callback that finds it spent refuses with the typed
+/// timeout. That refusal makes the child's failure KNOWN, and a known failure is reconciled WITHOUT the clock
+/// (bounded by the measured lengths): what the child left is measured after the deadline and named beside the
+/// timeout, never lost to it. In a post-exit callback (the child ran; the runner returns an error, so its proof
+/// is not recorded) the child left an entry, or rewrote HEAD in place with every clock stalled (only the digest
+/// sees it); the typed timeout is the primary and the effect the reconciliation. In a pre-spawn callback an
+/// entry appeared before the child would start: the child never starts, and the same two failures are kept
+/// (the control: it did so before the callbacks were paced too). Every byte stays, the ledger is the clean
+/// run's, and the second final child's proof is the last recorded.
+#[test]
+fn b2c_a_deadline_spent_in_a_runner_callback_is_reconciled_beside_what_the_child_left() {
+    type CheckV1 = fn(&GitBootstrapErrorV1) -> bool;
+    struct RowV1 {
+        name: &'static str,
+        point: GitHookPointV1,
+        shell: Option<&'static str>,
+        /// Whether the hook itself plants the entry (a child that never starts cannot).
+        plant: bool,
+        stalled: bool,
+        children: usize,
+        check: CheckV1,
+    }
+    let capsule = captured(CustodyGitObjectFormatV1::Sha1);
+    let clean = clean_final_shape(&capsule, CustodyGitObjectFormatV1::Sha1, true);
+    let rows = [
+        RowV1 {
+            name: "a post-exit callback, the child left an entry",
+            point: GitHookPointV1::AfterFinalChild,
+            shell: Some("\"$REAL\" \"$@\"; : > .git/stray"),
+            plant: false,
+            stalled: false,
+            children: 9,
+            check: |error| {
+                combined_with(error, is_timeout, |r| {
+                    tree_fault(r, FinalTreeFaultV1::Unexpected)
+                })
+            },
+        },
+        RowV1 {
+            name: "a post-exit callback, the child rewrote HEAD in place with every clock stalled",
+            point: GitHookPointV1::AfterFinalChild,
+            shell: Some(
+                "\"$REAL\" \"$@\"; printf X | dd of=.git/HEAD bs=1 seek=10 conv=notrunc 2>/dev/null",
+            ),
+            plant: false,
+            stalled: true,
+            children: 9,
+            check: |error| {
+                combined_with(error, is_timeout, |r| tree_fault(r, FinalTreeFaultV1::Bytes))
+            },
+        },
+        RowV1 {
+            name: "a pre-spawn callback, an entry appeared before the child would start",
+            point: GitHookPointV1::BeforeFinalChild,
+            shell: None,
+            plant: true,
+            stalled: false,
+            children: 8,
+            check: |error| {
+                combined_with(error, is_timeout, |r| {
+                    tree_fault(r, FinalTreeFaultV1::Unexpected)
+                })
+            },
+        },
+    ];
+    let mut problems = Vec::new();
+    for row in rows {
+        let input = PlaneInV1::rich(&capsule, CustodyGitObjectFormatV1::Sha1);
+        let root = input.dest.path.clone();
+        let stray = root.join("repository/.git/stray");
+        let deadline = Instant::now() + B2C_DEADLINE_V1;
+        let at_the_hook: SnapshotSlotV1 = SnapshotSlotV1::default();
+        let (slot, planted, hooked_root) = (at_the_hook.clone(), row.plant, root.clone());
+        let _hook = install_git_hook_for_test(row.point, move |event| {
+            if event.label == "fsck --strict" {
+                if planted {
+                    std::fs::write(&stray, b"").expect("a planted entry");
+                }
+                *slot.borrow_mut() = Some(snapshot(&hooked_root));
+                pass_the_deadline(deadline);
+            }
+        });
+        let _clocks = row
+            .stalled
+            .then(|| stall_census_clocks_for_test(BOTH_CLOCKS_V1));
+        let route = match row.shell {
+            Some(shell) => RouteV1::new(&[("fsck --strict", &final_only(shell))]),
+            None => RouteV1::recorder(),
+        };
+        let ran = run_plane(input, &route, deadline);
+        let Err(failure) = &ran.outcome else {
+            problems.push(format!("{}: a success", row.name));
+            continue;
+        };
+        let mut judged = Vec::new();
+        if !(row.check)(&failure.cause) {
+            judged.push(format!("cause {:?}", failure.cause));
+        }
+        if route.children().len() != row.children {
+            judged.push(format!("children {:?}", route.children()));
+        }
+        if failure.partial.final_runs.len() != 2 {
+            judged.push(format!("{} proofs", failure.partial.final_runs.len()));
+        }
+        if failure.last_completed != Some(GitPlaneStepV1::Config)
+            || !failure.active_materialization_began
+        {
+            judged.push(format!("completed {:?}", failure.last_completed));
+        }
+        if failure.ledger_used != clean.ledger {
+            judged.push(format!(
+                "ledger {} not {}",
+                failure.ledger_used, clean.ledger
+            ));
+        }
+        if Some(snapshot(&ran.dest.path)) != at_the_hook.borrow().clone() {
+            judged.push("a byte changed after the hook".to_owned());
+        }
+        if !judged.is_empty() {
+            problems.push(format!("{}: {}", row.name, judged.join("; ")));
+        }
+    }
+    assert!(problems.is_empty(), "{}", problems.join("\n"));
+}
+
+// ---------------------------------------------------------------------------------------------
+// A slow call inside a final child's bracket is followed by no further call (source round 3)
+//
+// The rows above slow the closing gate. Every final child is bracketed by four more success-eligible parts, and
+// each is held to the same one deadline: the zero-effect baseline (census and digests), the pre-spawn callback,
+// the post-exit callback, and the settlement of a result that is about to be a success. These rows make ONE call
+// of one part slow past the deadline (or, as the control, slow but with headroom), and record every event that
+// follows it: the clock's guards, the hooks that stand right after later calls, and each mount census. A
+// failure that is already KNOWN (a callback that found the deadline spent) is still reconciled without the
+// clock, so the census and digest hooks of that reconciliation are allowed after it; the callback's gate
+// (a mount census, an admitted file's or a staging entry's recheck, a second guard) is not.
+// ---------------------------------------------------------------------------------------------
+
+/// Where in a bracket the slow call is made.
+#[derive(Clone, Copy, Debug)]
+enum SiteV1 {
+    /// The bracket's first moment: the hook that stands before anything of the bracket is done.
+    Entry,
+    /// The mount census (a runner callback's first call, and the success gate's).
+    Mount,
+    /// The call behind this hook point (`true`: only a regular file's, for the points that stand behind a
+    /// per-entry call).
+    Call(GitHookPointV1, bool),
+}
+
+/// How slow the call is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HowSlowV1 {
+    /// Past the one deadline: it returns after it.
+    PastTheDeadline,
+    /// Slow, but returning well inside the deadline: the control that nothing refuses a live deadline.
+    WithHeadroom,
+}
+
+/// How long a slow call with headroom takes.
+const HEADROOM_SLOW_V1: Duration = Duration::from_millis(300);
+
+/// What a bracket row records after the arming guard, in order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SeenV1 {
+    /// The clock was read for this step.
+    Guard(&'static str),
+    /// A hook that stands right after a call ran.
+    Hook(GitHookPointV1),
+    /// The mount census ran.
+    Mount,
+}
+
+/// The hook points that stand behind a call of the census, the digests, or the retained chains.
+const CALL_POINTS_V1: [GitHookPointV1; 9] = [
+    GitHookPointV1::FinalCensusStatted,
+    GitHookPointV1::FinalCensusListed,
+    GitHookPointV1::BeforeFinalCensusOpen,
+    GitHookPointV1::FinalFileOpened,
+    GitHookPointV1::FinalDigestFileOpened,
+    GitHookPointV1::FinalDigestOpened,
+    GitHookPointV1::FinalDigestHashed,
+    GitHookPointV1::FinalSourceStatted,
+    GitHookPointV1::FinalStagingChecked,
+];
+
+/// The calls of a census, of the digests, and of the retained chains, by the site that slows each.
+const CENSUS_SITES_V1: [SiteV1; 4] = [
+    SiteV1::Call(GitHookPointV1::FinalCensusStatted, false),
+    SiteV1::Call(GitHookPointV1::FinalCensusListed, false),
+    SiteV1::Call(GitHookPointV1::BeforeFinalCensusOpen, true),
+    SiteV1::Call(GitHookPointV1::FinalFileOpened, true),
+];
+const DIGEST_SITES_V1: [SiteV1; 3] = [
+    SiteV1::Call(GitHookPointV1::FinalDigestFileOpened, true),
+    SiteV1::Call(GitHookPointV1::FinalDigestOpened, true),
+    SiteV1::Call(GitHookPointV1::FinalDigestHashed, true),
+];
+const GATE_SITES_V1: [SiteV1; 3] = [
+    SiteV1::Mount,
+    SiteV1::Call(GitHookPointV1::FinalSourceStatted, false),
+    SiteV1::Call(GitHookPointV1::FinalStagingChecked, false),
+];
+
+/// Every bracket row: all of the FIRST final child's sites, and a representative set for the other two (the
+/// bracket is one function for every child, so what differs is only which child's hooks are reached).
+fn bracket_rows() -> Vec<(usize, BracketV1, SiteV1)> {
+    let mut rows = vec![(1, BracketV1::Baseline, SiteV1::Entry)];
+    for site in CENSUS_SITES_V1.into_iter().chain(DIGEST_SITES_V1) {
+        rows.push((1, BracketV1::Baseline, site));
+    }
+    for bracket in [BracketV1::BeforeCallback, BracketV1::AfterCallback] {
+        rows.push((1, bracket, SiteV1::Entry));
+        for site in GATE_SITES_V1 {
+            rows.push((1, bracket, site));
+        }
+    }
+    for site in CENSUS_SITES_V1
+        .into_iter()
+        .chain(DIGEST_SITES_V1)
+        .chain(GATE_SITES_V1)
+    {
+        rows.push((1, BracketV1::Settlement, site));
+    }
+    for child in [2, 3] {
+        rows.push((child, BracketV1::Baseline, SiteV1::Entry));
+        rows.push((
+            child,
+            BracketV1::Baseline,
+            SiteV1::Call(GitHookPointV1::FinalDigestHashed, true),
+        ));
+        rows.push((child, BracketV1::BeforeCallback, SiteV1::Mount));
+        rows.push((child, BracketV1::AfterCallback, SiteV1::Mount));
+        rows.push((
+            child,
+            BracketV1::Settlement,
+            SiteV1::Call(GitHookPointV1::FinalCensusStatted, false),
+        ));
+        rows.push((
+            child,
+            BracketV1::Settlement,
+            SiteV1::Call(GitHookPointV1::FinalDigestHashed, true),
+        ));
+        rows.push((child, BracketV1::Settlement, SiteV1::Mount));
+    }
+    rows
+}
+
+/// One bracket row: final child `child` (1-based), the call at `site` in its `bracket` (the first such call,
+/// on a regular file for the points that stand behind a per-entry call) made `slow`, over a Captured database
+/// (the only one with every site), with everything that follows recorded. Returns every problem found.
+fn bracket_row(
+    capsule: &CustomCapsuleV1,
+    clean: &FinalShapeV1,
+    child: usize,
+    bracket: BracketV1,
+    site: SiteV1,
+    slow: HowSlowV1,
+) -> Vec<String> {
+    type WindowV1 = std::rc::Rc<std::cell::Cell<Option<(&'static str, BracketV1)>>>;
+    let label = FINAL_LABELS_CAPTURED_V1[child - 1];
+    let name = format!("child {child} (`{label}`), {bracket:?}, {site:?}, {slow:?}");
+    let input = PlaneInV1::rich(capsule, CustodyGitObjectFormatV1::Sha1);
+    let root = input.dest.path.clone();
+    let deadline = Instant::now() + B2C_DEADLINE_V1;
+    let log: std::rc::Rc<std::cell::RefCell<Vec<SeenV1>>> = std::rc::Rc::default();
+    let armed = std::rc::Rc::new(std::cell::Cell::new(false));
+    let window: WindowV1 = WindowV1::default();
+    let slowed_at: std::rc::Rc<std::cell::Cell<Option<usize>>> = std::rc::Rc::default();
+    let at_the_slow_call: SnapshotSlotV1 = SnapshotSlotV1::default();
+    // The ONE place an event is recorded: nothing before the final stage's entry guard is.
+    let record: std::rc::Rc<dyn Fn(SeenV1) -> Option<usize>> = {
+        let (log, armed) = (log.clone(), armed.clone());
+        std::rc::Rc::new(move |seen: SeenV1| {
+            if !armed.get() {
+                return None;
+            }
+            let mut log = log.borrow_mut();
+            log.push(seen);
+            Some(log.len() - 1)
+        })
+    };
+    // The ONE slow call: noted, the tree snapshotted as it stands, and then made slow.
+    let slow_now: std::rc::Rc<dyn Fn(usize)> = {
+        let (slowed_at, at_the_slow_call) = (slowed_at.clone(), at_the_slow_call.clone());
+        std::rc::Rc::new(move |index: usize| {
+            slowed_at.set(Some(index));
+            *at_the_slow_call.borrow_mut() = Some(snapshot(&root));
+            match slow {
+                HowSlowV1::PastTheDeadline => pass_the_deadline(deadline),
+                HowSlowV1::WithHeadroom => std::thread::sleep(HEADROOM_SLOW_V1),
+            }
+        })
+    };
+    let mut hooks = Vec::new();
+    // The three hooks that open a bracket for the child they name.
+    for (point, part) in [
+        (GitHookPointV1::BeforeFinalChildCensus, BracketV1::Baseline),
+        (GitHookPointV1::BeforeFinalChild, BracketV1::BeforeCallback),
+        (GitHookPointV1::AfterFinalChild, BracketV1::AfterCallback),
+    ] {
+        let (window, record, slow_now, slowed_at) = (
+            window.clone(),
+            record.clone(),
+            slow_now.clone(),
+            slowed_at.clone(),
+        );
+        hooks.push(install_git_hook_for_test(point, move |event| {
+            window.set(Some((event.label, part)));
+            let Some(index) = record(SeenV1::Hook(point)) else {
+                return;
+            };
+            if matches!(site, SiteV1::Entry)
+                && part == bracket
+                && event.label == label
+                && slowed_at.get().is_none()
+            {
+                slow_now(index);
+            }
+        }));
+    }
+    // The hooks behind a call. The first census call after a post-exit callback opens the settlement.
+    for point in CALL_POINTS_V1 {
+        let (window, record, slow_now, slowed_at) = (
+            window.clone(),
+            record.clone(),
+            slow_now.clone(),
+            slowed_at.clone(),
+        );
+        hooks.push(install_git_hook_for_test(point, move |event| {
+            if point == GitHookPointV1::FinalCensusStatted
+                && window.get() == Some((label, BracketV1::AfterCallback))
+            {
+                window.set(Some((label, BracketV1::Settlement)));
+            }
+            let Some(index) = record(SeenV1::Hook(point)) else {
+                return;
+            };
+            if let SiteV1::Call(wanted, regular_only) = site {
+                if wanted == point
+                    && window.get() == Some((label, bracket))
+                    && (!regular_only || event.path.is_file())
+                    && slowed_at.get().is_none()
+                {
+                    slow_now(index);
+                }
+            }
+        }));
+    }
+    // The clock's own guards arm the recording at the stage's entry and close the brackets at the rewinds.
+    {
+        let (window, armed, record) = (window.clone(), armed.clone(), record.clone());
+        hooks.push(install_git_hook_for_test(
+            GitHookPointV1::DeadlineObserved,
+            move |event| {
+                if event.label == "final-entry" {
+                    armed.set(true);
+                }
+                if event.label == "final-rewind" {
+                    window.set(None);
+                }
+                record(SeenV1::Guard(event.label));
+            },
+        ));
+    }
+    let census = {
+        let (window, record, slow_now, slowed_at) = (
+            window.clone(),
+            record.clone(),
+            slow_now.clone(),
+            slowed_at.clone(),
+        );
+        crate::custody_mounts::seam::install(Box::new(move |_| {
+            if let Some(index) = record(SeenV1::Mount) {
+                if matches!(site, SiteV1::Mount)
+                    && window.get() == Some((label, bracket))
+                    && slowed_at.get().is_none()
+                {
+                    slow_now(index);
+                }
+            }
+            Ok(vec![b"/".to_vec()])
+        }))
+    };
+    let route = RouteV1::recorder();
+    let ran = run_plane(input, &route, deadline);
+    drop(hooks);
+    drop(census);
+    let Some(at) = slowed_at.get() else {
+        return vec![format!("{name}: the call was never reached")];
+    };
+    let log = log.borrow();
+    let after = &log[at + 1..];
+    let (started, recorded) = StageV1::Child(child, bracket).children_after(clean.final_children);
+    let mut judged = Vec::new();
+    match slow {
+        HowSlowV1::PastTheDeadline => {
+            let Err(failure) = &ran.outcome else {
+                return vec![format!("{name}: a success followed the expiry")];
+            };
+            if !is_timeout(&failure.cause) {
+                judged.push(format!("cause {:?}", failure.cause));
+            }
+            if failure.last_completed != Some(GitPlaneStepV1::Config) {
+                judged.push(format!("completed {:?}", failure.last_completed));
+            }
+            if !failure.active_materialization_began {
+                judged.push("began nothing".to_owned());
+            }
+            if failure.partial.final_runs.len() != recorded {
+                judged.push(format!(
+                    "{} proofs recorded, {recorded} had returned",
+                    failure.partial.final_runs.len()
+                ));
+            }
+            if route.children().len() != 6 + started {
+                judged.push(format!("children {:?}", route.children()));
+            }
+            if failure.ledger_used != clean.ledger {
+                judged.push(format!(
+                    "ledger {} not {}",
+                    failure.ledger_used, clean.ledger
+                ));
+            }
+            if Some(snapshot(&ran.dest.path)) != at_the_slow_call.borrow().clone() {
+                judged.push("a byte changed after the slow call".to_owned());
+            }
+            match bracket {
+                // A failure that is not yet known when the call returns: the clock is the ONLY thing that may
+                // follow it (at most one guard), and not a hook, a census, or a second call.
+                BracketV1::Baseline | BracketV1::Settlement => {
+                    if after.len() > 1
+                        || after
+                            .iter()
+                            .any(|seen| matches!(seen, SeenV1::Hook(_) | SeenV1::Mount))
+                    {
+                        judged.push(format!("{} events followed it: {after:?}", after.len()));
+                    }
+                }
+                // A callback's refusal makes the failure known, and a known failure is still reconciled without
+                // the clock (a census and the digests, whose hooks may follow): but nothing of the callback's
+                // own gate may, and the guard that found the deadline spent must be the very next event.
+                BracketV1::BeforeCallback | BracketV1::AfterCallback => {
+                    let gate: Vec<&SeenV1> = after
+                        .iter()
+                        .filter(|seen| {
+                            matches!(
+                                seen,
+                                SeenV1::Guard(_)
+                                    | SeenV1::Mount
+                                    | SeenV1::Hook(GitHookPointV1::FinalSourceStatted)
+                                    | SeenV1::Hook(GitHookPointV1::FinalStagingChecked)
+                            )
+                        })
+                        .collect();
+                    if gate.len() > 1
+                        || (gate.len() == 1 && !matches!(after.first(), Some(SeenV1::Guard(_))))
+                    {
+                        judged.push(format!("the gate went on after it: {after:?}"));
+                    }
+                }
+            }
+        }
+        HowSlowV1::WithHeadroom => {
+            match &ran.outcome {
+                Ok(plane) => {
+                    if plane.closure.runs.len() != clean.final_children {
+                        judged.push(format!("{} proofs", plane.closure.runs.len()));
+                    }
+                }
+                Err(failure) => judged.push(format!("refused: {:?}", failure.cause)),
+            }
+            if route.children() != CAPTURED_CHILDREN_V1 {
+                judged.push(format!("children {:?}", route.children()));
+            }
+            if Instant::now() >= deadline {
+                judged.push("finished after its deadline".to_owned());
+            }
+            if after.is_empty() {
+                judged.push("nothing followed the slow call".to_owned());
+            }
+        }
+    }
+    if judged.is_empty() {
+        Vec::new()
+    } else {
+        vec![format!("{name}: {}", judged.join("; "))]
+    }
+}
+
+/// Runs every bracket row with `slow` on a few threads at once, and returns every problem.
+fn bracket_problems(slow: HowSlowV1) -> Vec<String> {
+    let capsule = captured(CustodyGitObjectFormatV1::Sha1);
+    let clean = clean_final_shape(&capsule, CustodyGitObjectFormatV1::Sha1, true);
+    assert_eq!(
+        clean.final_children, 3,
+        "a Captured database has three final children"
+    );
+    let rows = bracket_rows();
+    std::thread::scope(|scope| {
+        let mut all = Vec::new();
+        for chunk in rows.chunks(8) {
+            let handles: Vec<_> = chunk
+                .iter()
+                .map(|&(child, bracket, site)| {
+                    let (capsule, clean) = (&capsule, &clean);
+                    scope.spawn(move || bracket_row(capsule, clean, child, bracket, site, slow))
+                })
+                .collect();
+            for handle in handles {
+                all.extend(handle.join().expect("a bracket row's thread"));
+            }
+        }
+        all
+    })
+}
+
+/// Every success-eligible bracket of every final child is held to the ONE deadline at every slow call: the
+/// baseline's census (a directory's `fstat`, its listing, an entry's `fstat`, a file's open) and digest (an open,
+/// its binding `fstat`, a read), the mount census and the retained chains of BOTH runner callbacks, the
+/// settlement's census, digests, and success gate, and each bracket's own first moment (a deadline already
+/// spent when the bracket begins). Each is made slow past the deadline in turn, and the run ends with the typed
+/// timeout and NOTHING further done: a baseline or a settlement is followed by at most the guard that reads the
+/// clock (no hook, no census), and a callback by that guard and then only the clock-free reconciliation of the
+/// failure it made known (its gate does not go on); the child that had not started never starts, the proofs are
+/// exactly the ones that returned, and every byte is as it stood when the slow call returned.
+#[test]
+fn b2c_a_slow_call_inside_a_childs_bracket_is_followed_by_no_further_call() {
+    let problems = bracket_problems(HowSlowV1::PastTheDeadline);
+    assert!(problems.is_empty(), "{}", problems.join("\n"));
+}
+
+/// The control of the rows above: the very same calls, slow but returning WITH headroom, change nothing: the
+/// run goes on past each one and succeeds with all three final children, before its deadline.
+#[test]
+fn b2c_a_slow_call_with_headroom_inside_a_childs_bracket_changes_nothing() {
+    let problems = bracket_problems(HowSlowV1::WithHeadroom);
     assert!(problems.is_empty(), "{}", problems.join("\n"));
 }
 
