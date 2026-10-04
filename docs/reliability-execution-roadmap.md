@@ -286,8 +286,12 @@
     Sonnet79104 completed/cleanup596ms; exact3paths committed clean4b941d4b032cbd652accd5fb18a59e0cb12d258a.
     Controller sixgatesLIVE51759 ONCE, verifierabe594b4 imagefe3/networknone/sourceRO/no credentials;
     fmt/workspace all-feature clippy/buildPASS; alltargets5192/0/13,90groups/corecompiledPASS.
-    Default/doctests and hygiene pending. Initial shortSHA guard refusal ran no command, corrected fullSHA.
-    Sol4/4 configvalid/doctor10OK/catalogready; dispatch only after allsixpass. No adoption/native/whole-G claim.
+    Default/doctests5203/0/13,106groups/16docgroups/corecached and hygienePASS; ALLSIX complete,
+    raw/commands/source hashes independently parsed, source unchanged. Verifier51759 completed.
+    Initial shortSHA guard refusal ran no command, corrected fullSHA; no runtime-gate replay.
+    Sol4/4 LIVE79300/execexecb12ded/attemptcc4b708 after allsixPASS. Actual transcript01a10918 confirms
+    gpt5.6sol/xhigh/read-only with on-request policy (not never), no verdict yet.
+    No adoption/native/whole-G claim.
     Prior sessions6053/22954/28614 complete. No adoption/native/whole-G claim. D07 actualSLOW+source-scan
     failure means original structural-only annotation was wrong; R3 handoff corrects it, original raw retained.
     Worker "132single-statement" wording overstates granularity; actual definitions include coupled
