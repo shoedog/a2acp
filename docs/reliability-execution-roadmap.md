@@ -261,9 +261,11 @@
     six controls42/0/0, zero invalid/source-only variants. M13 structural prediction miss and M08/M09/M12
     unexpected failures retained; no rerun. Tests-FIRST chronology verified; full worker secondcopy sealed.
     Sonnet89293 completed/cleanup520ms; EXACT3paths committed clean c4c60a60, parent90130ed9.
-    Controller sixgates LIVE98230 on sourceRO/networknone/no credentials; observed imagefe3a644f,
-    containerb47d8da4362d. Fmt/workspace all-feature clippy/buildPASS; full alltargets5189/0/13,
-    90groups/321Git/corecompiled, raw/source independently checked. Default/doctests ACTIVE; hygiene/Sol3 pending.
+    Controller sixgates COMPLETE/PASS98230 on sourceRO/networknone/no credentials, observed imagefe3a644f.
+    Alltargets5189/0/13,90groups/321Git/corecompiled; default5200/0/13,106groups/16docgroups/corecached;
+    fmt/workspace all-feature clippy/build/hygienePASS. All raw/source independently checked unchanged.
+    Solsource3/3 LIVE46566/execexec894343/attemptae021fbc on c4c60a60, transcript01a10568 confirms
+    gpt-5.6-sol/xhigh/read-only with on-request policy (not never). Final verdict pending.
     Prior sessions6053/22954/28614 complete. No adoption/native/whole-G claim. D07 actualSLOW+source-scan
     failure means original structural-only annotation was wrong; R3 handoff corrects it, original raw retained.
     Worker "132single-statement" wording overstates granularity; actual definitions include coupled
