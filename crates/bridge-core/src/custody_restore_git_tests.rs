@@ -25731,24 +25731,34 @@ fn b2c_a_final_child_that_leaves_an_effect_is_refused_beside_its_own_outcome_on_
 /// the clock: a file that grew after that census and after its descriptor was bound to it (so only the read can
 /// show it) is read one byte past the measured length and no further, for a child that failed and for one that
 /// timed out (whose deadline has already passed), and the refusal names that count beside the child's own
-/// failure.
+/// failure. (A timed-out child's grown file is also refused by the retained chains, which the one failure-only
+/// reconciliation of a child that may have run now sweeps, so that row keeps both refusals.)
 #[test]
 fn b2c_a_failed_childs_reconciliation_digest_reads_one_byte_past_the_census_and_no_further() {
     type PrimaryV1 = fn(&GitBootstrapErrorV1) -> bool;
     let capsule = captured(CustodyGitObjectFormatV1::Sha1);
-    let rows: [(&str, &str, Option<Duration>, PrimaryV1); 2] = [
-        ("a failed child", "\"$REAL\" \"$@\"; exit 1", None, |e| {
-            is_git_child(e, "fsck --strict", 1)
-        }),
+    // Source round 4: a timed-out child's post-exit gate never ran, so the one failure-only reconciliation also
+    // sweeps the retained chains, and the grown HEAD is refused there too (its retained length changed): the
+    // digest's refusal, exactly as before, is the first of the two kept beside the timeout. The failed child's
+    // post-exit gate ran before the file grew (it grows during the settlement), so only the tree is owed.
+    let rows: [(&str, &str, Option<Duration>, PrimaryV1, bool); 2] = [
+        (
+            "a failed child",
+            "\"$REAL\" \"$@\"; exit 1",
+            None,
+            |e| is_git_child(e, "fsck --strict", 1),
+            false,
+        ),
         (
             "a timed-out child",
             "sleep 30",
             Some(B2C_DEADLINE_V1),
             is_timeout,
+            true,
         ),
     ];
     let mut problems = Vec::new();
-    for (row, shell, limit, primary) in rows {
+    for (row, shell, limit, primary, chains_too) in rows {
         let input = PlaneInV1::rich(&capsule, CustodyGitObjectFormatV1::Sha1);
         let started = std::rc::Rc::new(std::cell::Cell::new(false));
         let measured: std::rc::Rc<std::cell::Cell<Option<u64>>> = std::rc::Rc::default();
@@ -25788,7 +25798,14 @@ fn b2c_a_failed_childs_reconciliation_digest_reads_one_byte_past_the_census_and_
             matches!(r, GitBootstrapErrorV1::Restore(CustodyRestoreErrorV1::IdentityChanged(detail))
                 if detail.contains(&want))
         };
-        if !combined_with(&failure.cause, primary, reconcile) {
+        let judged = if chains_too {
+            combined_with(&failure.cause, primary, |r| {
+                combined_with(r, reconcile, is_identity_changed)
+            })
+        } else {
+            combined_with(&failure.cause, primary, reconcile)
+        };
+        if !judged {
             problems.push(format!("{row}: {:?}", failure.cause));
         }
     }
@@ -26843,23 +26860,71 @@ fn b2c_the_final_gate_order_is_fixed_in_the_source() {
         !child.contains("unpaced"),
         "no step of a child's bracket leaves the clock out"
     );
-    // The settlement of a result that is about to be a success is paced and bound to the deadline; ONLY a child
-    // whose failure is already known is reconciled without the clock, and the success arm still ends in the gate.
+    // The settlement of a result that is about to be a success is paced and bound to the deadline and ends in
+    // the success gate; it never leaves the clock out. A failure that is ALREADY known (the verdict) and the
+    // typed timeout that cuts the settlement short are each handed, once, to ONE failure-only helper, and the
+    // verdict's value is returned only after the paced settlement and the gate succeeded. (Source round 4:
+    // before it, the clock-free arm lived inside this function and the timeout of a settlement was returned
+    // bare.)
     let settle = body_of(source, "fn proof_settle<");
-    assert!(
-        settle.contains("self.proof_deadline_gate()?"),
-        "a child's success arm is held to the deadline"
+    assert_eq!(
+        settle.matches("unpaced").count(),
+        0,
+        "the settlement itself never leaves the clock out"
     );
-    assert_eq!(settle.matches("unpaced").count(), 1, "one clock-free arm");
+    assert_eq!(
+        settle.matches("self.proof_reconcile(").count(),
+        2,
+        "a known failure and a settlement the deadline cut short each enter the one helper"
+    );
+    let order = [
+        at(settle, "self.proof_reconcile("),
+        at(settle, ".proof_measure(&paced)"),
+        at(
+            settle,
+            ".proof_digests(&measured, &paced, DigestBoundV1::Deadline)",
+        ),
+        at(settle, ".proof_deadline_gate()"),
+        settle.rfind("Ok(value)").expect("the success arm"),
+    ];
+    assert!(order.windows(2).all(|pair| pair[0] < pair[1]), "{order:?}");
+    // The ONE failure-only helper: the mount census, then the exact tree and its bounded digests, then every
+    // retained chain (the destination root's identity LAST), all on the one clock-free pace, with no gate, no
+    // runner, and no classifier in it, and a return type that is a FAILURE: it cannot return a verified value.
+    let reconcile = body_of(source, "fn proof_reconcile(");
+    assert_eq!(
+        reconcile.matches("&unpaced").count(),
+        1,
+        "one clock-free pace"
+    );
+    let order = [
+        at(reconcile, "refuse_mounts_within("),
+        at(reconcile, "self.proof_measure(pace)"),
+        at(reconcile, "DigestBoundV1::Reconciling"),
+        at(reconcile, "self.proof_chains(pace)"),
+    ];
+    assert!(order.windows(2).all(|pair| pair[0] < pair[1]), "{order:?}");
+    for forbidden in [
+        "proof_deadline_gate",
+        "runner",
+        "classify",
+        "observe_deadline",
+        "Ok(value)",
+    ] {
+        assert!(
+            !reconcile.contains(forbidden),
+            "the failure-only helper mentions `{forbidden}`"
+        );
+    }
+    let signature = &source[at(source, "fn proof_reconcile(")..];
+    let signature = &signature[..at(signature, "{\n")];
     assert!(
-        at(settle, "DigestBoundV1::Deadline") < at(settle, "&unpaced")
-            && at(settle, "&unpaced") < at(settle, "DigestBoundV1::Reconciling"),
-        "the success arm is paced and the failure arm is the clock-free one"
+        signature.contains("-> GitBootstrapErrorV1"),
+        "the helper's result is a failure: {signature}"
     );
     assert!(
-        settle.contains("self.proof_measure(pace)")
-            && settle.contains("self.proof_digests(&measured, pace, bound)"),
-        "the settlement's census and digests take the pace its verdict chose"
+        child.contains("self.proof_settle(&baseline, label, verdict, gates_owed)"),
+        "the child's bracket hands the settlement what its callbacks saw"
     );
     let region = source.split_once(B2C_MARKER_V1).expect("the B2c marker").1;
     assert_eq!(
@@ -26869,7 +26934,7 @@ fn b2c_the_final_gate_order_is_fixed_in_the_source() {
             .map(|line| line.matches("&unpaced").count())
             .sum::<usize>(),
         1,
-        "the only unpaced pace in the final region is the failed child's reconciliation"
+        "the only unpaced pace in the final region is the known failure's reconciliation"
     );
 
     let prove = body_of(source, "fn proof_run(");
@@ -27535,8 +27600,15 @@ fn b2c_a_deadline_spent_in_a_runner_callback_is_reconciled_beside_what_the_child
 // of one part slow past the deadline (or, as the control, slow but with headroom), and record every event that
 // follows it: the clock's guards, the hooks that stand right after later calls, and each mount census. A
 // failure that is already KNOWN (a callback that found the deadline spent) is still reconciled without the
-// clock, so the census and digest hooks of that reconciliation are allowed after it; the callback's gate
-// (a mount census, an admitted file's or a staging entry's recheck, a second guard) is not.
+// clock, so the census and digest hooks of that reconciliation are allowed after it; the pre-spawn callback's
+// gate (a mount census, an admitted file's or a staging entry's recheck, a second guard) is not.
+//
+// Source round 4 changes what follows a slow call in the post-exit callback and in the settlement: the clock cut
+// a part of a child that may have run short, so the typed timeout is a KNOWN failure there, and exactly one
+// failure-only reconciliation (the mount census, the exact tree, every retained chain, no clock) is now
+// REQUIRED after the guard, where before nothing but a tree reconciliation (a callback) or nothing at all (a
+// settlement) followed. What stays prohibited is every success-eligible continuation: a second guard, a child,
+// a second census, a success.
 // ---------------------------------------------------------------------------------------------
 
 /// Where in a bracket the slow call is made.
@@ -27829,9 +27901,10 @@ fn bracket_row(
                 judged.push("a byte changed after the slow call".to_owned());
             }
             match bracket {
-                // A failure that is not yet known when the call returns: the clock is the ONLY thing that may
-                // follow it (at most one guard), and not a hook, a census, or a second call.
-                BracketV1::Baseline | BracketV1::Settlement => {
+                // A failure that is not yet known when the call returns, and that no child is owed: the clock is
+                // the ONLY thing that may follow it (at most one guard), and not a hook, a census, or a second
+                // call. A baseline that runs late refuses before the runner is called: nothing started.
+                BracketV1::Baseline => {
                     if after.len() > 1
                         || after
                             .iter()
@@ -27840,10 +27913,24 @@ fn bracket_row(
                         judged.push(format!("{} events followed it: {after:?}", after.len()));
                     }
                 }
-                // A callback's refusal makes the failure known, and a known failure is still reconciled without
-                // the clock (a census and the digests, whose hooks may follow): but nothing of the callback's
-                // own gate may, and the guard that found the deadline spent must be the very next event.
-                BracketV1::BeforeCallback | BracketV1::AfterCallback => {
+                // Source round 4. The clock cut a success-eligible part of a child that may have run short (the
+                // post-exit callback, or the settlement of a result that was about to be a success): that
+                // typed timeout is now a KNOWN failure, and exactly ONE failure-only reconciliation follows the
+                // guard that found it, without reading the clock again: the mount census, the exact tree, and
+                // every retained chain (see `failure_only_reconciliation`). No child began or resumed, and no
+                // success-eligible step went on.
+                BracketV1::AfterCallback | BracketV1::Settlement => {
+                    judged.extend(failure_only_reconciliation(
+                        after,
+                        clean,
+                        FailureOnlyV1::complete(),
+                    ));
+                }
+                // A pre-spawn callback's refusal makes a failure known before the child starts, and a known
+                // failure is still reconciled without the clock (a census and the digests, whose hooks may
+                // follow): but nothing of the callback's own gate may, and the guard that found the deadline
+                // spent must be the very next event.
+                BracketV1::BeforeCallback => {
                     let gate: Vec<&SeenV1> = after
                         .iter()
                         .filter(|seen| {
@@ -27923,10 +28010,13 @@ fn bracket_problems(slow: HowSlowV1) -> Vec<String> {
 /// its binding `fstat`, a read), the mount census and the retained chains of BOTH runner callbacks, the
 /// settlement's census, digests, and success gate, and each bracket's own first moment (a deadline already
 /// spent when the bracket begins). Each is made slow past the deadline in turn, and the run ends with the typed
-/// timeout and NOTHING further done: a baseline or a settlement is followed by at most the guard that reads the
-/// clock (no hook, no census), and a callback by that guard and then only the clock-free reconciliation of the
-/// failure it made known (its gate does not go on); the child that had not started never starts, the proofs are
-/// exactly the ones that returned, and every byte is as it stood when the slow call returned.
+/// timeout and NO SUCCESS-ELIGIBLE step further done: a baseline is followed by at most the guard that reads the
+/// clock (no hook, no census: its child never started); a pre-spawn callback by that guard and then only the
+/// clock-free reconciliation of the final tree (its gate does not go on); and the post-exit callback and the
+/// settlement (source round 4) by that guard and then exactly ONE clock-free failure-only reconciliation (the
+/// mount census once, the exact tree once, every retained chain once, no clock, no child, no success); the child
+/// that had not started never starts, the proofs are exactly the ones that returned, and every byte is as it
+/// stood when the slow call returned.
 #[test]
 fn b2c_a_slow_call_inside_a_childs_bracket_is_followed_by_no_further_call() {
     let problems = bracket_problems(HowSlowV1::PastTheDeadline);
@@ -27938,6 +28028,696 @@ fn b2c_a_slow_call_inside_a_childs_bracket_is_followed_by_no_further_call() {
 #[test]
 fn b2c_a_slow_call_with_headroom_inside_a_childs_bracket_changes_nothing() {
     let problems = bracket_problems(HowSlowV1::WithHeadroom);
+    assert!(problems.is_empty(), "{}", problems.join("\n"));
+}
+
+// ---------------------------------------------------------------------------------------------
+// A KNOWN failure is reconciled once, through one bounded failure-only helper (source round 4)
+//
+// Source round 3/3 found two finite transitions in which a final child's failure was known, or became known, and
+// what the child left behind was still never examined: (1) a child the runner TIMES OUT meets a post-exit
+// callback whose gate stops at its entry guard, so the mount census and every retained chain went unexamined;
+// (2) a success-eligible settlement whose slow call returns after the deadline returned the bare typed timeout,
+// so the entries and bytes of a child that had succeeded went unmeasured. These rows drive the REAL wrapper over
+// REAL Git with a routed final `fsck` child and the real runner, with only the hooks and the mount-census seam
+// that already existed, and judge the outcome (the typed primary beside the typed reconciliation failure), the
+// filesystem (no byte after the failure was known), the ledger, the proofs, the children that started, and the
+// FOOTPRINT of the reconciliation (the events that followed the failure becoming known).
+// ---------------------------------------------------------------------------------------------
+
+/// What a failure-only reconciliation owes and may stop early for, judged from the events that followed.
+#[derive(Clone, Copy, Debug)]
+struct FailureOnlyV1 {
+    /// The mount census and every retained chain are owed (the child may have run and no completed gate saw it).
+    gates: bool,
+    /// The census of the exact tree ran to its end (no fault of its own stopped it early).
+    census_complete: bool,
+    /// The digest of every restored file ran to its end.
+    digests_complete: bool,
+    /// The retained chains ran to their end (no chain fault of its own stopped the sweep early).
+    chains_complete: bool,
+}
+
+impl FailureOnlyV1 {
+    /// Nothing stops any class early: a clean tree and clean chains.
+    fn complete() -> Self {
+        Self {
+            gates: true,
+            census_complete: true,
+            digests_complete: true,
+            chains_complete: true,
+        }
+    }
+}
+
+/// Judges what followed a slow call that returned after the deadline (`after` starts right after it). The ONLY
+/// event allowed before the reconciliation is the guard that read the clock (a bounded digest read reads it
+/// itself, unlogged); the reconciliation itself reads no
+/// clock, begins and resumes no child, runs the mount census exactly once, the exact tree at most once, and each
+/// retained chain at most once, and (for a clean tree and clean chains) runs each class to its end. Returns every
+/// problem found.
+fn failure_only_reconciliation(
+    after: &[SeenV1],
+    clean: &FinalShapeV1,
+    scope: FailureOnlyV1,
+) -> Vec<String> {
+    let reconcile = match after.split_first() {
+        Some((SeenV1::Guard(_), reconcile)) => reconcile,
+        // A bounded digest read keeps its own clock and reads it with no logged guard: the reconciliation's first
+        // event (the mount census, which is owed whenever this scope applies) then follows the slow call itself,
+        // and a read that went on would have announced itself through its own hook first.
+        Some((SeenV1::Mount, _)) if scope.gates => after,
+        None => {
+            return vec![
+                "nothing followed the slow call: no failure-only reconciliation ran".to_owned(),
+            ];
+        }
+        Some(_) => {
+            return vec![format!(
+                "a call followed the slow one before the clock was read: {after:?}"
+            )];
+        }
+    };
+    let count =
+        |wanted: &dyn Fn(&SeenV1) -> bool| reconcile.iter().filter(|seen| wanted(seen)).count();
+    let mut judged = Vec::new();
+    if reconcile
+        .iter()
+        .any(|seen| matches!(seen, SeenV1::Guard(_)))
+    {
+        judged.push(format!(
+            "the clock was read again, so a step went on past the guard: {reconcile:?}"
+        ));
+    }
+    if reconcile.iter().any(|seen| {
+        matches!(
+            seen,
+            SeenV1::Hook(
+                GitHookPointV1::BeforeFinalChildCensus
+                    | GitHookPointV1::BeforeFinalChild
+                    | GitHookPointV1::AfterFinalChild
+            )
+        )
+    }) {
+        judged.push(format!("a child began or resumed: {reconcile:?}"));
+    }
+    let mounts = count(&|seen| matches!(seen, SeenV1::Mount));
+    let want_mounts = usize::from(scope.gates);
+    if mounts != want_mounts {
+        judged.push(format!("{mounts} mount censuses, {want_mounts} owed"));
+    }
+    let one_census = 1 + clean.tree_dirs;
+    let stats = count(&|seen| matches!(seen, SeenV1::Hook(GitHookPointV1::FinalCensusStatted)));
+    if scope.census_complete {
+        if stats != one_census {
+            judged.push(format!(
+                "{stats} directory censuses, exactly {one_census} owed"
+            ));
+        }
+    } else if stats == 0 || stats > one_census {
+        judged.push(format!("{stats} directory censuses, one at most owed"));
+    }
+    let files = clean.object_files + clean.metadata_files;
+    let digests =
+        count(&|seen| matches!(seen, SeenV1::Hook(GitHookPointV1::FinalDigestFileOpened)));
+    if scope.digests_complete {
+        if digests != files {
+            judged.push(format!("{digests} digests, exactly {files} owed"));
+        }
+    } else if digests > files {
+        judged.push(format!("{digests} digests, {files} at most owed"));
+    }
+    let sources = count(&|seen| matches!(seen, SeenV1::Hook(GitHookPointV1::FinalSourceStatted)));
+    let staging = count(&|seen| matches!(seen, SeenV1::Hook(GitHookPointV1::FinalStagingChecked)));
+    if !scope.gates {
+        if sources != 0 || staging != 0 {
+            judged.push(format!(
+                "{sources} source and {staging} staging rechecks, none owed"
+            ));
+        }
+    } else if scope.chains_complete {
+        if sources != clean.object_files || staging == 0 {
+            judged.push(format!(
+                "{sources} source rechecks (exactly {} owed) and {staging} staging rechecks (some owed)",
+                clean.object_files
+            ));
+        }
+    } else if sources > clean.object_files {
+        judged.push(format!(
+            "{sources} source rechecks, {} at most owed",
+            clean.object_files
+        ));
+    }
+    judged
+}
+
+/// When the failure of a row's final `fsck` child becomes known.
+#[derive(Clone, Copy, Debug)]
+enum KnownWhenV1 {
+    /// At the child's post-exit callback (the child timed out, exited, or was refused by its gate).
+    AfterChild,
+    /// At a call of the child's settlement that returns late (or, as the control, slow with headroom).
+    SlowSettlement(GitHookPointV1, HowSlowV1),
+}
+
+/// What a row expects of the reconciliation that follows the failure.
+#[derive(Clone, Copy, Debug)]
+enum ReconciledV1 {
+    /// Source round 4: ONE failure-only reconciliation after the guard that found the deadline spent.
+    Once(FailureOnlyV1),
+    /// The post-exit gate itself ran to a verdict (a pass, or a custody refusal that is the finding): only the
+    /// tree is owed beside the primary, and the gate's own single mount census and single chain sweep are the
+    /// only ones that follow the child.
+    TreeAfterTheGate,
+    /// No failure was known, so nothing but the settlement's own paced calls followed the slow call.
+    NotAtAll,
+}
+
+/// One row: the final `fsck` child runs `shell` (or delegates), the failure becomes known `when`, and the run
+/// must end with the typed cause `cause`.
+struct KnownRowV1 {
+    name: &'static str,
+    shell: Option<&'static str>,
+    when: KnownWhenV1,
+    /// The child overruns the one deadline (it sleeps), so the runner times it out.
+    timed_out: bool,
+    /// Every census clock is reported as never having advanced (only a digest can see an in-place write).
+    stalled: bool,
+    /// A mount appears inside the destination as soon as the child has exited.
+    mount_after_exit: bool,
+    cause: fn(&GitBootstrapErrorV1) -> bool,
+    reconciled: ReconciledV1,
+    /// The final proofs recorded when the run ends (a refused callback makes the runner return an error).
+    recorded: usize,
+}
+
+/// A bootstrap-relative mount point of the destination, as the census would list it.
+fn mount_inside(root: &Path) -> Vec<u8> {
+    root.join(".restore-work/home")
+        .as_os_str()
+        .as_bytes()
+        .to_vec()
+}
+
+/// Runs one row and returns every problem found (and prints its verdict, so a green row is as visible as a red
+/// one).
+fn known_row(capsule: &CustomCapsuleV1, clean: &FinalShapeV1, row: &KnownRowV1) -> Vec<String> {
+    type LogV1 = std::rc::Rc<std::cell::RefCell<Vec<SeenV1>>>;
+    let name = row.name;
+    let input = PlaneInV1::rich(capsule, CustodyGitObjectFormatV1::Sha1);
+    let root = input.dest.path.clone();
+    let spends_the_deadline = row.timed_out
+        || matches!(
+            row.when,
+            KnownWhenV1::SlowSettlement(_, HowSlowV1::PastTheDeadline)
+        );
+    let deadline = if spends_the_deadline {
+        Instant::now() + B2C_DEADLINE_V1
+    } else {
+        far_deadline()
+    };
+    let log: LogV1 = LogV1::default();
+    let armed = std::rc::Rc::new(std::cell::Cell::new(false));
+    let after_exit = std::rc::Rc::new(std::cell::Cell::new(false));
+    let appeared = std::rc::Rc::new(std::cell::Cell::new(false));
+    let known_at: std::rc::Rc<std::cell::Cell<Option<usize>>> = std::rc::Rc::default();
+    let at_known: SnapshotSlotV1 = SnapshotSlotV1::default();
+    // The ONE place an event is recorded: nothing before the final stage's entry guard is.
+    let record: std::rc::Rc<dyn Fn(SeenV1) -> Option<usize>> = {
+        let (log, armed) = (log.clone(), armed.clone());
+        std::rc::Rc::new(move |seen: SeenV1| {
+            if !armed.get() {
+                return None;
+            }
+            let mut log = log.borrow_mut();
+            log.push(seen);
+            Some(log.len() - 1)
+        })
+    };
+    let mut hooks = Vec::new();
+    // The three hooks that open a part of a final child's bracket: the post-exit one is the moment a child that
+    // exited (or timed out) is judged, and where a row that waits for it notes that its failure is known.
+    for point in [
+        GitHookPointV1::BeforeFinalChildCensus,
+        GitHookPointV1::BeforeFinalChild,
+        GitHookPointV1::AfterFinalChild,
+    ] {
+        let (record, after_exit, appeared, known_at, at_known, root) = (
+            record.clone(),
+            after_exit.clone(),
+            appeared.clone(),
+            known_at.clone(),
+            at_known.clone(),
+            root.clone(),
+        );
+        let (when, mount_after_exit) = (row.when, row.mount_after_exit);
+        hooks.push(install_git_hook_for_test(point, move |event| {
+            let index = record(SeenV1::Hook(point));
+            if point == GitHookPointV1::AfterFinalChild && event.label == "fsck --strict" {
+                after_exit.set(true);
+                if mount_after_exit {
+                    appeared.set(true);
+                }
+                if let (Some(index), KnownWhenV1::AfterChild) = (index, when) {
+                    known_at.set(Some(index));
+                    *at_known.borrow_mut() = Some(snapshot(&root));
+                }
+            }
+        }));
+    }
+    // The hooks behind a call: the settlement of the `fsck` child is the first such call after its post-exit
+    // callback (the callback's gate has no census and no digest), and the row's slow call is made there.
+    for point in CALL_POINTS_V1 {
+        let (record, after_exit, known_at, at_known, root) = (
+            record.clone(),
+            after_exit.clone(),
+            known_at.clone(),
+            at_known.clone(),
+            root.clone(),
+        );
+        let when = row.when;
+        hooks.push(install_git_hook_for_test(point, move |_| {
+            let Some(index) = record(SeenV1::Hook(point)) else {
+                return;
+            };
+            if let KnownWhenV1::SlowSettlement(wanted, slow) = when {
+                if wanted == point && after_exit.get() && known_at.get().is_none() {
+                    known_at.set(Some(index));
+                    *at_known.borrow_mut() = Some(snapshot(&root));
+                    match slow {
+                        HowSlowV1::PastTheDeadline => pass_the_deadline(deadline),
+                        HowSlowV1::WithHeadroom => std::thread::sleep(HEADROOM_SLOW_V1),
+                    }
+                }
+            }
+        }));
+    }
+    {
+        let (armed, record) = (armed.clone(), record.clone());
+        hooks.push(install_git_hook_for_test(
+            GitHookPointV1::DeadlineObserved,
+            move |event| {
+                if event.label == "final-entry" {
+                    armed.set(true);
+                }
+                record(SeenV1::Guard(event.label));
+            },
+        ));
+    }
+    let census = {
+        let (record, appeared) = (record.clone(), appeared.clone());
+        let inside = mount_inside(&root);
+        crate::custody_mounts::seam::install(Box::new(move |_| {
+            record(SeenV1::Mount);
+            if appeared.get() {
+                Ok(vec![b"/".to_vec(), inside.clone()])
+            } else {
+                Ok(vec![b"/".to_vec()])
+            }
+        }))
+    };
+    let _clocks = row
+        .stalled
+        .then(|| stall_census_clocks_for_test(BOTH_CLOCKS_V1));
+    let body = row.shell.map(final_only);
+    let route = match &body {
+        Some(body) => RouteV1::new(&[("fsck --strict", body.as_str())]),
+        None => RouteV1::recorder(),
+    };
+    let ran = run_plane(input, &route, deadline);
+    drop(hooks);
+    drop(census);
+    let Some(known) = known_at.get() else {
+        let seen = format!("{name}: the failure never became known (the fixture did not reach it)");
+        println!("KNOWN-ROW {seen}");
+        return vec![seen];
+    };
+    let Err(failure) = &ran.outcome else {
+        let seen = format!("{name}: a success followed the failure");
+        println!("KNOWN-ROW {seen}");
+        return vec![seen];
+    };
+    let log = log.borrow();
+    let after = &log[known + 1..];
+    let mut judged = Vec::new();
+    if !(row.cause)(&failure.cause) {
+        judged.push(format!("cause {:?}", failure.cause));
+    }
+    if failure.last_completed != Some(GitPlaneStepV1::Config)
+        || !failure.active_materialization_began
+    {
+        judged.push(format!("completed {:?}", failure.last_completed));
+    }
+    if route.children().len() != 9 {
+        judged.push(format!("children {:?}", route.children()));
+    }
+    if failure.partial.final_runs.len() != row.recorded {
+        judged.push(format!(
+            "{} proofs, {} had returned",
+            failure.partial.final_runs.len(),
+            row.recorded
+        ));
+    }
+    if failure.ledger_used != clean.ledger {
+        judged.push(format!(
+            "ledger {} not {}",
+            failure.ledger_used, clean.ledger
+        ));
+    }
+    if Some(snapshot(&ran.dest.path)) != *at_known.borrow() {
+        judged.push("a byte changed after the failure was known".to_owned());
+    }
+    match row.reconciled {
+        ReconciledV1::Once(scope) => {
+            judged.extend(failure_only_reconciliation(after, clean, scope));
+        }
+        ReconciledV1::TreeAfterTheGate => {
+            let count =
+                |wanted: &dyn Fn(&SeenV1) -> bool| after.iter().filter(|seen| wanted(seen)).count();
+            let mounts = count(&|seen| matches!(seen, SeenV1::Mount));
+            if mounts != 1 {
+                judged.push(format!("{mounts} mount censuses, the gate's own one owed"));
+            }
+            let sources =
+                count(&|seen| matches!(seen, SeenV1::Hook(GitHookPointV1::FinalSourceStatted)));
+            if sources != clean.object_files {
+                judged.push(format!(
+                    "{sources} source rechecks, the gate's own {} owed",
+                    clean.object_files
+                ));
+            }
+            let stats =
+                count(&|seen| matches!(seen, SeenV1::Hook(GitHookPointV1::FinalCensusStatted)));
+            if stats != 1 + clean.tree_dirs {
+                judged.push(format!(
+                    "{stats} directory censuses, exactly {} owed",
+                    1 + clean.tree_dirs
+                ));
+            }
+        }
+        ReconciledV1::NotAtAll => {
+            let ran_a_reconciliation = after.iter().any(|seen| {
+                matches!(
+                    seen,
+                    SeenV1::Mount
+                        | SeenV1::Hook(
+                            GitHookPointV1::FinalDigestFileOpened
+                                | GitHookPointV1::FinalSourceStatted
+                                | GitHookPointV1::FinalStagingChecked
+                        )
+                )
+            });
+            if ran_a_reconciliation {
+                judged.push(format!(
+                    "a reconciliation ran without a known failure: {after:?}"
+                ));
+            }
+        }
+    }
+    println!(
+        "KNOWN-ROW {name}: {}",
+        if judged.is_empty() {
+            "ok".to_owned()
+        } else {
+            judged.join("; ")
+        }
+    );
+    if judged.is_empty() {
+        Vec::new()
+    } else {
+        vec![format!("{name}: {}", judged.join("; "))]
+    }
+}
+
+/// Runs the rows of one test, a few threads at a time (each row installs its own hooks and census seam in its own
+/// thread), and returns every problem.
+fn known_problems(rows: Vec<KnownRowV1>) -> Vec<String> {
+    let capsule = captured(CustodyGitObjectFormatV1::Sha1);
+    let clean = clean_final_shape(&capsule, CustodyGitObjectFormatV1::Sha1, true);
+    std::thread::scope(|scope| {
+        let mut all = Vec::new();
+        for chunk in rows.chunks(8) {
+            let handles: Vec<_> = chunk
+                .iter()
+                .map(|row| {
+                    let (capsule, clean) = (&capsule, &clean);
+                    scope.spawn(move || known_row(capsule, clean, row))
+                })
+                .collect();
+            for handle in handles {
+                all.extend(handle.join().expect("a known-failure row's thread"));
+            }
+        }
+        all
+    })
+}
+
+/// A child the runner TIMES OUT has run, and the post-exit callback cannot gate it (its entry guard finds the
+/// deadline spent). The failure is known: the typed timeout is the primary, and ONE failure-only reconciliation
+/// follows it, WITHOUT the clock, and examines everything the child may have left: the mount census, the exact
+/// tree, and every retained chain. A retained bootstrap directory, staging directory, admitted bootstrap object
+/// file, and the output chain's repository entry are each swapped by the child while the final repository stays
+/// byte-identical, and a mount appears just after it exits: each is named beside the timeout. Both a tree effect
+/// and a chain swap are kept (neither class hides the other). The reconciliation stays finite for a child that
+/// left hundreds of names, and one that put a link where a restored file was is refused by the tree AND by the
+/// chains (never followed); a child that left nothing is the bare timeout. Every
+/// row: the same children, the proofs that had returned, `Config`, the one ledger unchanged, no byte after the
+/// failure was known, one mount census, no clock, no child resumed, no success.
+#[test]
+fn b2c_a_timed_out_final_child_is_reconciled_once_beside_every_retained_chain_and_mount_it_left_owed(
+) {
+    let chain_fails = FailureOnlyV1 {
+        chains_complete: false,
+        ..FailureOnlyV1::complete()
+    };
+    let tree_fails = FailureOnlyV1 {
+        census_complete: false,
+        digests_complete: false,
+        ..FailureOnlyV1::complete()
+    };
+    let timed_out =
+        |name, shell, cause: fn(&GitBootstrapErrorV1) -> bool, scope: FailureOnlyV1| KnownRowV1 {
+            name,
+            shell: Some(shell),
+            when: KnownWhenV1::AfterChild,
+            timed_out: true,
+            stalled: false,
+            mount_after_exit: false,
+            cause,
+            reconciled: ReconciledV1::Once(scope),
+            recorded: 2,
+        };
+    let rows = vec![
+        timed_out(
+            "a timed-out child swapped a retained bootstrap directory, the repository unchanged",
+            "mv ../.restore-work/git-bootstrap/objects ../.restore-work/git-bootstrap/objects.away; mkdir ../.restore-work/git-bootstrap/objects; sleep 30",
+            |e| combined_with(e, is_timeout, is_identity_changed),
+            chain_fails,
+        ),
+        timed_out(
+            "a timed-out child swapped a retained staging directory, the repository unchanged",
+            "mv ../.restore-work/plain/control ../.restore-work/plain/control.away; mkdir ../.restore-work/plain/control; sleep 30",
+            |e| combined_with(e, is_timeout, is_identity_changed),
+            chain_fails,
+        ),
+        timed_out(
+            "a timed-out child replaced an admitted bootstrap object file with another inode",
+            "for f in ../.restore-work/git-bootstrap/objects/pack/*.pack; do cp \"$f\" \"$f.new\"; mv \"$f.new\" \"$f\"; done; sleep 30",
+            |e| combined_with(e, is_timeout, is_identity_changed),
+            chain_fails,
+        ),
+        // A rename moves the pinned directory's own ctime, which the census of the tree would see by itself: the
+        // clocks are stalled so only the chain (the root's entry for `repository`) can.
+        KnownRowV1 {
+            stalled: true,
+            ..timed_out(
+                "a timed-out child swapped the repository directory itself (the output chain), every clock stalled",
+                "mv ../repository ../repository.away; mkdir ../repository; sleep 30",
+                |e| combined_with(e, is_timeout, is_identity_changed),
+                chain_fails,
+            )
+        },
+        KnownRowV1 {
+            mount_after_exit: true,
+            ..timed_out(
+                "a mount appeared inside the destination as a timed-out child exited",
+                "sleep 30",
+                |e| {
+                    combined_with(e, is_timeout, |r| {
+                        matches!(
+                            r,
+                            GitBootstrapErrorV1::Restore(CustodyRestoreErrorV1::MountBoundary(_))
+                        )
+                    })
+                },
+                FailureOnlyV1::complete(),
+            )
+        },
+        timed_out(
+            "a timed-out child that left an entry AND swapped a retained bootstrap directory",
+            ": > .git/stray; mv ../.restore-work/git-bootstrap/objects ../.restore-work/git-bootstrap/objects.away; mkdir ../.restore-work/git-bootstrap/objects; sleep 30",
+            |e| {
+                matches!(e, GitBootstrapErrorV1::ChildAndReconcile { primary, reconcile }
+                    if is_timeout(primary)
+                        && combined_with(
+                            reconcile,
+                            |p| tree_fault(p, FinalTreeFaultV1::Unexpected),
+                            is_identity_changed,
+                        ))
+            },
+            FailureOnlyV1 {
+                census_complete: false,
+                digests_complete: false,
+                chains_complete: false,
+                ..FailureOnlyV1::complete()
+            },
+        ),
+        timed_out(
+            "a timed-out child that left nothing is the bare timeout",
+            "sleep 30",
+            is_timeout,
+            FailureOnlyV1::complete(),
+        ),
+        timed_out(
+            "a timed-out child that left hundreds of names stops at the census bound",
+            "i=0; while [ $i -lt 500 ]; do : > .git/n$i; i=$((i+1)); done; sleep 30",
+            |e| combined_with(e, is_timeout, |r| tree_fault(r, FinalTreeFaultV1::Bound)),
+            tree_fails,
+        ),
+        // A restored metadata file is in two classes: the census of the tree and the retained chains each refuse the
+        // link (neither follows it), and neither hides the other.
+        timed_out(
+            "a timed-out child that put a link where a file was is refused by both the tree and the chains, never followed",
+            "rm .git/ORIG_HEAD; ln -s /etc/hostname .git/ORIG_HEAD; sleep 30",
+            |e| {
+                matches!(e, GitBootstrapErrorV1::ChildAndReconcile { primary, reconcile }
+                    if is_timeout(primary) && combined_with(reconcile, symlink_refused, symlink_refused))
+            },
+            FailureOnlyV1 {
+                census_complete: false,
+                digests_complete: false,
+                chains_complete: false,
+                ..FailureOnlyV1::complete()
+            },
+        ),
+    ];
+    let problems = known_problems(rows);
+    assert!(problems.is_empty(), "{}", problems.join("\n"));
+}
+
+/// A child that SUCCEEDED (its runner result and both callbacks are clean) enters the settlement on the one
+/// deadline; a call of that settlement that returns after the deadline makes the typed timeout the PRIMARY
+/// failure, now known, and ONE failure-only reconciliation follows the guard that found it, without the clock:
+/// the effect the child left is named beside the timeout, never lost to it. A child that added `.git/stray`
+/// (the post-exit gate does not enumerate names) whose settlement's first `fstat` returns late; a child that
+/// rewrote HEAD in place with every clock stalled whose settlement's first digest open returns late (only the
+/// digest sees the bytes); and, as the control, a child that left nothing is the bare timeout. The same
+/// exactly-once, no-clock, no-resumed-child, no-success, unchanged-ledger, no-byte-after judgements hold.
+#[test]
+fn b2c_a_successful_final_child_whose_settlement_returns_late_is_reconciled_once_beside_what_it_left(
+) {
+    let late =
+        |name, shell, point, stalled, cause: fn(&GitBootstrapErrorV1) -> bool, scope| KnownRowV1 {
+            name,
+            shell,
+            when: KnownWhenV1::SlowSettlement(point, HowSlowV1::PastTheDeadline),
+            timed_out: false,
+            stalled,
+            mount_after_exit: false,
+            cause,
+            reconciled: ReconciledV1::Once(scope),
+            recorded: 3,
+        };
+    let rows = vec![
+        late(
+            "a successful child added an entry and its settlement's first fstat returned late",
+            Some("\"$REAL\" \"$@\"; : > .git/stray"),
+            GitHookPointV1::FinalCensusStatted,
+            false,
+            |e| {
+                combined_with(e, is_timeout, |r| {
+                    tree_fault(r, FinalTreeFaultV1::Unexpected)
+                })
+            },
+            FailureOnlyV1 {
+                census_complete: false,
+                digests_complete: false,
+                ..FailureOnlyV1::complete()
+            },
+        ),
+        late(
+            "a successful child rewrote HEAD in place, every clock stalled, and its first digest open returned late",
+            Some("\"$REAL\" \"$@\"; printf X | dd of=.git/HEAD bs=1 seek=10 conv=notrunc 2>/dev/null"),
+            GitHookPointV1::FinalDigestFileOpened,
+            true,
+            |e| combined_with(e, is_timeout, |r| tree_fault(r, FinalTreeFaultV1::Bytes)),
+            FailureOnlyV1 {
+                digests_complete: false,
+                ..FailureOnlyV1::complete()
+            },
+        ),
+        late(
+            "a successful child that left nothing is the bare timeout when its settlement returns late",
+            None,
+            GitHookPointV1::FinalCensusStatted,
+            false,
+            is_timeout,
+            FailureOnlyV1::complete(),
+        ),
+    ];
+    let problems = known_problems(rows);
+    assert!(problems.is_empty(), "{}", problems.join("\n"));
+}
+
+/// The negative controls of the two rows above, against the same fixture: a failure whose gate class was already
+/// examined is reconciled for the TREE only (the post-exit gate that ran to a verdict is the finding, and re-running
+/// it would only repeat it): a child that failed with a nonzero status and left nothing, and a child that swapped a
+/// retained bootstrap directory and exited normally (its own post-exit gate refuses with the identity change) each
+/// show the gate's own single mount census and single chain sweep and the tree once, nothing more; and the SAME
+/// slow settlement call, slow but returning WITH headroom, is no timeout and no known failure at all: the paced
+/// settlement measures the added entry itself and refuses it ALONE, and no reconciliation of any class runs.
+#[test]
+fn b2c_a_known_failure_whose_gate_already_ran_is_reconciled_for_the_tree_only_and_a_headroom_call_for_none(
+) {
+    let rows = vec![
+        KnownRowV1 {
+            name: "a child failed with a nonzero status and left nothing (its post-exit gate passed)",
+            shell: Some("\"$REAL\" \"$@\"; exit 1"),
+            when: KnownWhenV1::AfterChild,
+            timed_out: false,
+            stalled: false,
+            mount_after_exit: false,
+            cause: |e| is_git_child(e, "fsck --strict", 1),
+            reconciled: ReconciledV1::TreeAfterTheGate,
+            recorded: 3,
+        },
+        KnownRowV1 {
+            name: "a child swapped a retained bootstrap directory and exited (its post-exit gate refuses)",
+            shell: Some("\"$REAL\" \"$@\"; mv ../.restore-work/git-bootstrap/objects ../.restore-work/git-bootstrap/objects.away; mkdir ../.restore-work/git-bootstrap/objects"),
+            when: KnownWhenV1::AfterChild,
+            timed_out: false,
+            stalled: false,
+            mount_after_exit: false,
+            cause: is_identity_changed,
+            reconciled: ReconciledV1::TreeAfterTheGate,
+            recorded: 2,
+        },
+        KnownRowV1 {
+            name: "the same slow settlement call with headroom: the paced settlement refuses the entry alone",
+            shell: Some("\"$REAL\" \"$@\"; : > .git/stray"),
+            when: KnownWhenV1::SlowSettlement(
+                GitHookPointV1::FinalCensusStatted,
+                HowSlowV1::WithHeadroom,
+            ),
+            timed_out: false,
+            stalled: false,
+            mount_after_exit: false,
+            cause: |e| tree_fault(e, FinalTreeFaultV1::Unexpected),
+            reconciled: ReconciledV1::NotAtAll,
+            recorded: 3,
+        },
+    ];
+    let problems = known_problems(rows);
     assert!(problems.is_empty(), "{}", problems.join("\n"));
 }
 
