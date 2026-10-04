@@ -250,7 +250,9 @@
     than production, so no regression attribution without same-environment base control.
     Disclosed converging extension3/3 on SAME artifact, no reset/restart. Prepared Sonnet task first
     basecontrol/tests-FIRST, actual-Instant fixture, at most24 changed-guard variants, then focused/
-    controller sixgates/Sol3. Configvalid/doctor29OK/sonnet advertised; not dispatched yet. Prior
+    controller sixgates/Sol3. Configvalid/doctor29OK; dispatched ONCE on SAME90130ed9, bridge89293/
+    execfe077842/attempt6d1cccf6; actualclaude-sonnet-5-5 transcript00e25b0d verified. Worker first
+    matches failed gate environment before basecontrol; no production repair/RED claim yet. Prior
     sessions6053/22954/28614 complete. No adoption/native/whole-G claim. D07 actualSLOW+source-scan
     failure means worker structural-only annotation needs correction; original raw retained.
     Worker "132single-statement" wording overstates granularity; actual definitions include coupled
