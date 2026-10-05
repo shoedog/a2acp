@@ -111,10 +111,15 @@
 //! tree is the restore's exactly (names, identities, lengths, every restored file's mode, timestamps, and
 //! SHA-256, and every directory's mode and timestamps) before and after it, on every outcome, and an effect is
 //! refused beside the child's own failure: a failure that is already known (a runner or callback failure, a
-//! status or parser refusal, and the typed timeout that cuts a success-eligible step short) is reconciled ONCE,
-//! without the clock and bounded by the measured lengths, through one helper that measures the exact tree and
-//! its digests and, where the child may have run and no completed gate saw it, the mount census and every
-//! retained chain, beside the failure and never as a success. The closing gate is the mount census, the
+//! status or parser refusal) or becomes known inside the paced settlement (the typed timeout, or a custody
+//! finding) is COMPLETED once, at one site, without the clock, through one helper that makes every
+//! observation still owed, each independently of the others and each unit once: the mount census; the census of
+//! the exact tree and its comparison with the baseline; the digest of every restored file by the descriptor the
+//! restore RETAINED (positioned reads, bounded to its length plus one byte, an interruption refused and never
+//! retried); and every retained chain edge, with the destination root's identity last. A unit an earlier phase
+//! already ran to a verdict is not observed again, a unit that fails never hides the next, and the findings
+//! are kept beside the primary in a fixed order (a callback's refusal first), a drifted binary staying the
+//! primary: beside the failure, and never as a success. The closing gate is the mount census, the
 //! exact tree and digest, every retained chain, and the destination root's identity LAST, each step held to
 //! the one deadline with a guard read after every filesystem call returns and before the next is made; only
 //! infallible construction of [`RestoredGitPlaneV1`] follows it. A failure is a [`GitPlaneRestoreFailureV1`]: the last step
@@ -157,6 +162,7 @@ use std::ffi::OsStr;
 use std::fs::File;
 use std::io::{self, BufReader, ErrorKind, Read as _, Seek as _, SeekFrom};
 use std::os::unix::ffi::OsStrExt as _;
+use std::os::unix::fs::FileExt as _;
 use std::path::Path;
 use std::time::Instant;
 
@@ -473,10 +479,12 @@ pub(crate) enum GitHookPointV1 {
     /// The census opened a final file no-follow, before its descriptor is `fstat`ed (that file).
     FinalFileOpened,
     /// A digest has just opened a final file through its retained directory pin, before its descriptor is
-    /// `fstat`ed (that file).
+    /// `fstat`ed (that file). The failure-only digest opens nothing: it fires this as it takes up the file's
+    /// retained descriptor, before that descriptor is `fstat`ed.
     FinalDigestFileOpened,
     /// A digest opened a final file through its retained directory pin and the descriptor matched its census
-    /// fact; nothing has been read from it yet (that file).
+    /// fact; nothing has been read from it yet (that file). The failure-only digest fires it when the retained
+    /// descriptor is still the file the restore made, before its first read.
     FinalDigestOpened,
     /// A digest read a final file to its end; its closing `fstat` check has not run yet (that file).
     FinalDigestHashed,
@@ -516,6 +524,19 @@ thread_local! {
         const { std::cell::Cell::new(None) };
     /// How many more calls of each kind (read, write, probe) return as interrupted, having done nothing.
     static OBJECT_INTERRUPTS: std::cell::Cell<[u32; 3]> = const { std::cell::Cell::new([0; 3]) };
+    /// The reads of the failure-only digest of a final child: every read call made, by file, and one file whose
+    /// first reads return as interrupted, having done nothing.
+    static RECONCILE_READS: RefCell<Option<ReconcileReadsV1>> = const { RefCell::new(None) };
+}
+
+/// What a test observes of, and injects into, the reads of the failure-only digest (pass B2c).
+#[cfg(test)]
+#[derive(Debug, Default)]
+struct ReconcileReadsV1 {
+    /// The file (relative to `.git`) whose next `count` reads return as interrupted.
+    interrupt: Option<(String, u32)>,
+    /// Every read call made, by file.
+    calls: BTreeMap<String, u32>,
 }
 
 /// A blocking call of the object-store copy on a descriptor: the three that can return after the deadline
@@ -571,6 +592,7 @@ pub(crate) enum GitSeamGuardV1 {
     CopyChunk,
     ObjectFault,
     ObjectInterrupts(ObjectCallV1),
+    ReconcileReads,
 }
 
 #[cfg(test)]
@@ -593,6 +615,7 @@ impl Drop for GitSeamGuardV1 {
                 counts[*call as usize] = 0;
                 left.set(counts);
             }),
+            Self::ReconcileReads => RECONCILE_READS.with(|reads| *reads.borrow_mut() = None),
         }
     }
 }
@@ -652,6 +675,51 @@ fn injected_interrupt(call: ObjectCallV1) -> Option<io::Error> {
         *slot -= 1;
         left.set(counts);
         Some(io::Error::from(ErrorKind::Interrupted))
+    })
+}
+
+/// Starts counting every read call of the failure-only digest of a final child, by file (relative to `.git`),
+/// and, when `interrupt` names a file and a count, makes that file's first `count` reads return as interrupted
+/// (`EINTR`), having done nothing; later reads are real. A regular file does not produce an interruption on
+/// demand, and a retried one is exactly the call a failure that is already known must never wait for.
+#[cfg(test)]
+pub(crate) fn watch_reconcile_reads_for_test(interrupt: Option<(&str, u32)>) -> GitSeamGuardV1 {
+    RECONCILE_READS.with(|reads| {
+        *reads.borrow_mut() = Some(ReconcileReadsV1 {
+            interrupt: interrupt.map(|(file, count)| (file.to_owned(), count)),
+            calls: BTreeMap::new(),
+        });
+    });
+    GitSeamGuardV1::ReconcileReads
+}
+
+/// Every read call the failure-only digest has made since [`watch_reconcile_reads_for_test`], by file.
+#[cfg(test)]
+pub(crate) fn reconcile_read_calls_for_test() -> BTreeMap<String, u32> {
+    RECONCILE_READS.with(|reads| {
+        reads
+            .borrow()
+            .as_ref()
+            .map(|watched| watched.calls.clone())
+            .unwrap_or_default()
+    })
+}
+
+/// One read call of the failure-only digest of `relative` is about to be made: it is counted, and a test may
+/// have it return as interrupted instead (consumed once).
+#[cfg(test)]
+fn reconcile_read_call(relative: &str) -> Option<io::Error> {
+    RECONCILE_READS.with(|reads| {
+        let mut reads = reads.borrow_mut();
+        let watched = reads.as_mut()?;
+        *watched.calls.entry(relative.to_owned()).or_default() += 1;
+        match &mut watched.interrupt {
+            Some((file, left)) if file == relative && *left > 0 => {
+                *left -= 1;
+                Some(io::Error::from(ErrorKind::Interrupted))
+            }
+            _ => None,
+        }
     })
 }
 
@@ -7236,13 +7304,16 @@ fn is_deadline_timeout(error: &GitBootstrapErrorV1) -> bool {
     matches!(error, GitBootstrapErrorV1::Git(CustodyGitError::Timeout))
 }
 
-/// One regular file the restore made, as it was measured when it was made.
+/// One regular file the restore made, as it was measured when it was made, and the descriptor the restore
+/// retained of it (the very file object, read-write, that its store owns): the one thing a failure that is
+/// already known may read the file's bytes from, because a name may be another inode by then.
 #[derive(Clone, Copy)]
-struct MadeFileV1 {
+struct MadeFileV1<'a> {
     dev: u64,
     ino: u64,
     length: u64,
     sha256: [u8; 32],
+    file: &'a File,
 }
 
 /// Everything the restore made beneath the repository, by its path beneath the Git directory (`""` is the
@@ -7252,7 +7323,7 @@ struct MadeTreeV1<'a> {
     repository: &'a PinnedDirectoryV1,
     git: &'a PinnedDirectoryV1,
     directories: BTreeMap<String, &'a PinnedDirectoryV1>,
-    files: BTreeMap<String, MadeFileV1>,
+    files: BTreeMap<String, MadeFileV1<'a>>,
 }
 
 impl<'a> MadeTreeV1<'a> {
@@ -7281,6 +7352,7 @@ impl<'a> MadeTreeV1<'a> {
                 ino: file.ino,
                 length: file.length,
                 sha256: file.sha256,
+                file: &file.file,
             };
             if files.insert(file.relative.clone(), made).is_some() {
                 return Err(final_input(format!(
@@ -7439,43 +7511,40 @@ fn require_final_directory(
     Ok(())
 }
 
-/// Which deadline discipline a digest pass keeps.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum DigestBoundV1 {
-    /// A pass that serves a success: every read keeps the ONE absolute deadline.
-    Deadline,
-    /// A pass that serves a child that has ALREADY failed: its byte effect is still measured after the
-    /// deadline has passed (the child's own timeout is the usual reason), bounded by the measured length
-    /// instead of the clock, and its result can only ever refuse, never verify.
-    Reconciling,
+/// The descriptor the restore retained of a file it made must still be that file, regular, of the length it was
+/// made with: its own `fstat`, never a name. A descriptor that cannot be `fstat`ed is the typed refusal of its
+/// file; one that is not the file the restore made, or of another length, is that file's own finding.
+fn require_made_file(
+    file: &File,
+    made: &MadeFileV1<'_>,
+    relative: &str,
+) -> Result<(), GitBootstrapErrorV1> {
+    let held = file
+        .metadata()
+        .map_err(|error| io_refusal(relative, &error))?;
+    let held = ChildStatV1::from_metadata(&held);
+    if held.kind != ChildKindV1::Regular || (held.dev, held.ino) != (made.dev, made.ino) {
+        return Err(digest_identity(
+            relative,
+            "the retained descriptor is no longer the file the restore made",
+        ));
+    }
+    if held.size != made.length {
+        return Err(final_tree(relative.to_owned(), FinalTreeFaultV1::Bytes));
+    }
+    Ok(())
 }
 
-/// The SHA-256 of `file` from its start, one bounded buffer at a time, and how many bytes it read. It reads
-/// at most `expected + 1` bytes (a file that grew is never read whole), and it reads no clock: it is the
-/// [`DigestBoundV1::Reconciling`] digest, so the effect of a child that timed out can be measured.
-fn reconciling_digest(
-    file: &mut File,
-    expected: u64,
-    relative: &str,
-) -> Result<(u64, [u8; 32]), GitBootstrapErrorV1> {
-    let mut limited = file.by_ref().take(expected.saturating_add(1));
-    let mut context = digest::Context::new(&digest::SHA256);
-    let mut buffer = vec![0_u8; HASH_BUFFER_BYTES_V1];
-    let mut count = 0_u64;
-    loop {
-        match limited.read(&mut buffer) {
-            Ok(0) => break,
-            Ok(read) => {
-                count = count.saturating_add(read as u64);
-                context.update(&buffer[..read]);
-            }
-            Err(error) if error.kind() == ErrorKind::Interrupted => {}
-            Err(error) => return Err(io_refusal(relative, &error)),
-        }
-    }
-    let mut sha256 = [0_u8; 32];
-    sha256.copy_from_slice(context.finish().as_ref());
-    Ok((count, sha256))
+/// The same fault of the same file, named by two independent classes of observation (the census of the tree and
+/// the descriptor of the file), is one finding.
+fn same_final_tree_fault(left: &GitBootstrapErrorV1, right: &GitBootstrapErrorV1) -> bool {
+    matches!(
+        (left, right),
+        (
+            GitBootstrapErrorV1::FinalTree { name: a, fault: x },
+            GitBootstrapErrorV1::FinalTree { name: b, fault: y },
+        ) if a == b && x == y
+    )
 }
 
 /// A proof stream's SHAPE outranks its exit status: output that is not UTF-8, ends in a partial line, or holds a
@@ -7497,74 +7566,150 @@ fn shape_then_status<T>(
     }
 }
 
+/// [`output_chains`] for the final gates: the same directories and files in the same order and with the same
+/// refusals, every one its own unit of `pass`, with the same clock before each.
+fn final_output_chains(
+    dest: &super::RestoreDestinationV1,
+    pins: PinViewV1<'_>,
+    files: &[MaterializedObjectFileV1],
+    pace: PaceV1<'_>,
+    pass: &ChainPassV1,
+) -> Result<(), GitBootstrapErrorV1> {
+    for dir in ObjectDirV1::ALL {
+        let Some(pin) = pins.get(dir) else { continue };
+        pass.unit(|| {
+            pace("objects-chain")?;
+            let parent = match dir.parent() {
+                None => &dest.root,
+                Some(parent) => pins.get(parent).ok_or_else(|| {
+                    CustodyRestoreErrorV1::IdentityChanged(format!(
+                        "{}: its parent is not retained",
+                        dir.name()
+                    ))
+                })?,
+            };
+            recheck_entry(parent, dir.leaf().as_bytes(), pin, dir.name().as_bytes())?;
+            Ok(())
+        })?;
+    }
+    for file in files {
+        pass.unit(|| {
+            pace("objects-chain")?;
+            let pack = pins.get(ObjectDirV1::Pack).ok_or_else(|| {
+                CustodyRestoreErrorV1::IdentityChanged(format!(
+                    "{}: the pack directory is not retained",
+                    file.relative
+                ))
+            })?;
+            let stat = pack
+                .child_metadata_no_follow(
+                    OsStr::new(leaf_of(&file.relative)),
+                    "custody restore object store file",
+                )
+                .map_err(fs_error)?
+                .ok_or_else(|| {
+                    digest_identity(&file.relative, "the copied file's entry is gone")
+                })?;
+            match stat.kind {
+                ChildKindV1::Symlink => {
+                    return Err(GitBootstrapErrorV1::Restore(
+                        CustodyRestoreErrorV1::SymlinkRefused {
+                            name: file.relative.clone(),
+                        },
+                    ))
+                }
+                ChildKindV1::Regular => {}
+                ChildKindV1::Directory | ChildKindV1::Special(_) => {
+                    return Err(digest_identity(
+                        &file.relative,
+                        "the entry is no longer the copied file",
+                    ))
+                }
+            }
+            if (stat.dev, stat.ino, stat.size) != (file.dev, file.ino, file.length) {
+                return Err(digest_identity(
+                    &file.relative,
+                    "the entry is no longer the copied file",
+                ));
+            }
+            Ok(())
+        })?;
+    }
+    Ok(())
+}
+
 /// [`source_files_unchanged`] for the final gates, the same two reads of each admitted bootstrap file in the
 /// same order and with the same refusals, with a clock after EACH read: `pace` runs before the entry's
 /// `fstat` by name and again between it and the `fstat` of the file's retained descriptor, so no call is
-/// made after a slow one without the clock.
+/// made after a slow one without the clock. Every admitted file is its own unit of `pass`.
 fn final_source_files_unchanged(
     boot: &VerifiedGitBootstrapV1,
     pace: PaceV1<'_>,
+    pass: &ChainPassV1,
 ) -> Result<(), GitBootstrapErrorV1> {
     for admitted in admitted_files(boot) {
-        pace("final-source")?;
-        let pack = boot
-            .directories
-            .get(PACK_DIRECTORY_V1)
-            .ok_or_else(|| object_input("the bootstrap's pack directory is not retained"))?;
-        let leaf = OsStr::new(leaf_of(&admitted.relative));
-        let stat = pack
-            .child_metadata_no_follow(leaf, "custody restore admitted object file")
-            .map_err(fs_error)?;
-        #[cfg(test)]
-        run_git_hook(
-            GitHookPointV1::FinalSourceStatted,
-            "",
-            &pack.canonical_path().join(leaf),
-        );
-        let stat = stat.ok_or_else(|| {
-            digest_identity(&admitted.relative, "no longer the admitted object file")
-        })?;
-        match stat.kind {
-            ChildKindV1::Symlink => {
-                return Err(GitBootstrapErrorV1::Restore(
-                    CustodyRestoreErrorV1::SymlinkRefused {
-                        name: admitted.relative.clone(),
-                    },
-                ))
+        pass.unit(|| {
+            pace("final-source")?;
+            let pack = boot
+                .directories
+                .get(PACK_DIRECTORY_V1)
+                .ok_or_else(|| object_input("the bootstrap's pack directory is not retained"))?;
+            let leaf = OsStr::new(leaf_of(&admitted.relative));
+            let stat = pack
+                .child_metadata_no_follow(leaf, "custody restore admitted object file")
+                .map_err(fs_error)?;
+            #[cfg(test)]
+            run_git_hook(
+                GitHookPointV1::FinalSourceStatted,
+                "",
+                &pack.canonical_path().join(leaf),
+            );
+            let stat = stat.ok_or_else(|| {
+                digest_identity(&admitted.relative, "no longer the admitted object file")
+            })?;
+            match stat.kind {
+                ChildKindV1::Symlink => {
+                    return Err(GitBootstrapErrorV1::Restore(
+                        CustodyRestoreErrorV1::SymlinkRefused {
+                            name: admitted.relative.clone(),
+                        },
+                    ))
+                }
+                ChildKindV1::Regular => {}
+                ChildKindV1::Directory | ChildKindV1::Special(_) => {
+                    return Err(digest_identity(
+                        &admitted.relative,
+                        "no longer the admitted object file",
+                    ))
+                }
             }
-            ChildKindV1::Regular => {}
-            ChildKindV1::Directory | ChildKindV1::Special(_) => {
+            if (stat.dev, stat.ino, stat.size) != (admitted.dev, admitted.ino, admitted.length) {
                 return Err(digest_identity(
                     &admitted.relative,
                     "no longer the admitted object file",
-                ))
+                ));
             }
-        }
-        if (stat.dev, stat.ino, stat.size) != (admitted.dev, admitted.ino, admitted.length) {
-            return Err(digest_identity(
-                &admitted.relative,
-                "no longer the admitted object file",
-            ));
-        }
-        pace("final-source-statted")?;
-        let held = admitted
-            .file
-            .metadata()
-            .map_err(|error| io_refusal(&admitted.relative, &error))?;
-        let held = ChildStatV1::from_metadata(&held);
-        if (held.kind, held.dev, held.ino, held.size)
-            != (
-                ChildKindV1::Regular,
-                admitted.dev,
-                admitted.ino,
-                admitted.length,
-            )
-        {
-            return Err(digest_identity(
-                &admitted.relative,
-                "the retained descriptor is no longer the admitted object file",
-            ));
-        }
+            pace("final-source-statted")?;
+            let held = admitted
+                .file
+                .metadata()
+                .map_err(|error| io_refusal(&admitted.relative, &error))?;
+            let held = ChildStatV1::from_metadata(&held);
+            if (held.kind, held.dev, held.ino, held.size)
+                != (
+                    ChildKindV1::Regular,
+                    admitted.dev,
+                    admitted.ino,
+                    admitted.length,
+                )
+            {
+                return Err(digest_identity(
+                    &admitted.relative,
+                    "the retained descriptor is no longer the admitted object file",
+                ));
+            }
+            Ok(())
+        })?;
     }
     Ok(())
 }
@@ -7627,61 +7772,227 @@ fn final_staging_chain(
 
 /// [`sweep_chains`] for the final gates: the same chains in the same order, the destination root's identity
 /// LAST, with the staging chains taken one entry per clock ([`final_staging_chain`]). The other chains are one
-/// `fstatat` each, so the clock before each is the clock after the one before it.
+/// `fstatat` each, so the clock before each is the clock after the one before it. Every chain, and the root, is its
+/// own unit of `pass`: a completion goes on past a refusal, and the root is always the last unit.
 fn final_sweep_chains(
     dest: &super::RestoreDestinationV1,
     home: Option<&PinnedDirectoryV1>,
     xdg: Option<&PinnedDirectoryV1>,
     dirs: &BTreeMap<String, PinnedDirectoryV1>,
     pace: PaceV1<'_>,
+    pass: &ChainPassV1,
 ) -> Result<(), GitBootstrapErrorV1> {
-    pace("chain")?;
-    final_staging_chain(dest, b"", pace)?;
-    for key in dest.staging.borrow().keys() {
+    pass.unit(|| {
         pace("chain")?;
-        final_staging_chain(dest, key, pace)?;
+        final_staging_chain(dest, b"", pace)
+    })?;
+    for key in dest.staging.borrow().keys() {
+        pass.unit(|| {
+            pace("chain")?;
+            final_staging_chain(dest, key, pace)
+        })?;
     }
     let work_name = RESTORE_WORK_DIR_NAME_V1.as_bytes();
     for (name, pin) in [(HOME_NAME_V1, home), (XDG_NAME_V1, xdg)] {
         if let Some(pin) = pin {
-            pace("chain")?;
-            recheck_entry(
-                &dest.work,
-                name.as_bytes(),
-                pin,
-                &joined(work_name, name.as_bytes()),
-            )?;
+            pass.unit(|| {
+                pace("chain")?;
+                recheck_entry(
+                    &dest.work,
+                    name.as_bytes(),
+                    pin,
+                    &joined(work_name, name.as_bytes()),
+                )?;
+                Ok(())
+            })?;
         }
     }
     let bootstrap_name = joined(work_name, BOOTSTRAP_NAME_V1.as_bytes());
     for (relative, pin) in dirs {
-        pace("chain")?;
-        if relative.is_empty() {
+        pass.unit(|| {
+            pace("chain")?;
+            if relative.is_empty() {
+                recheck_entry(
+                    &dest.work,
+                    BOOTSTRAP_NAME_V1.as_bytes(),
+                    pin,
+                    &bootstrap_name,
+                )?;
+                return Ok(());
+            }
+            let (parent_relative, component) =
+                relative.rsplit_once('/').unwrap_or(("", relative.as_str()));
+            let parent = dirs.get(parent_relative).ok_or_else(|| {
+                CustodyRestoreErrorV1::IdentityChanged(format!(
+                    "{relative}: its bootstrap parent is not retained"
+                ))
+            })?;
             recheck_entry(
-                &dest.work,
-                BOOTSTRAP_NAME_V1.as_bytes(),
+                parent,
+                component.as_bytes(),
                 pin,
-                &bootstrap_name,
+                &joined(&bootstrap_name, relative.as_bytes()),
             )?;
-            continue;
-        }
-        let (parent_relative, component) =
-            relative.rsplit_once('/').unwrap_or(("", relative.as_str()));
-        let parent = dirs.get(parent_relative).ok_or_else(|| {
-            CustodyRestoreErrorV1::IdentityChanged(format!(
-                "{relative}: its bootstrap parent is not retained"
-            ))
+            Ok(())
         })?;
-        recheck_entry(
-            parent,
-            component.as_bytes(),
-            pin,
-            &joined(&bootstrap_name, relative.as_bytes()),
-        )?;
     }
-    pace("root")?;
-    pinned_root_unchanged(&dest.root)
-        .map_err(|detail| CustodyRestoreErrorV1::IdentityChanged(detail).into())
+    pass.unit(|| {
+        pace("root")?;
+        pinned_root_unchanged(&dest.root)
+            .map_err(|detail| CustodyRestoreErrorV1::IdentityChanged(detail).into())
+    })
+}
+
+// ---------------------------------------------------------------------------------------------
+// Observation progress: units, phases, and the completion of a known failure
+// ---------------------------------------------------------------------------------------------
+
+/// The text of the route refusal the runner callbacks of a final child are returned as when their gate refuses. The
+/// runner returns a callback's own error as it is when the binary did not drift, so this text, and only this,
+/// identifies a refusal THIS file made, as against any other error of the runner.
+const FINAL_GATE_REFUSED_V1: &str = "the final repository gate refused";
+
+/// Whether `error` is the route refusal a callback's refusal was returned as (see [`FINAL_GATE_REFUSED_V1`]).
+fn is_final_gate_refusal(error: &CustodyGitError) -> bool {
+    matches!(error, CustodyGitError::RouteRefusal(text) if text == FINAL_GATE_REFUSED_V1)
+}
+
+/// One pass over the retained chains, in custody order. Every retained edge (and the destination root's identity,
+/// which is the last) is ONE unit ([`Self::unit`]), and a unit is SETTLED when it ran to a verdict, a pass or a
+/// custody refusal, and not when a deadline guard stopped it first. A gate's pass is held to the one deadline and
+/// ends at its first refusal, which is the child's failure; a completion's pass goes on past every refusal and keeps
+/// each, so no failing edge hides another and the root is always observed, last. A completion resumes after the
+/// leading units an earlier observation of the same phase settled: a unit is never observed twice after a child.
+struct ChainPassV1 {
+    /// How many leading units to skip.
+    resume: usize,
+    /// Whether a refusal is kept and the pass goes on (a completion), or ends it (a gate).
+    exhaustive: bool,
+    /// The index of the next unit.
+    next: Cell<usize>,
+    /// How many leading units ran to a verdict.
+    settled: Cell<usize>,
+    /// The refusals a completion kept, in custody order.
+    found: RefCell<Vec<GitBootstrapErrorV1>>,
+}
+
+impl ChainPassV1 {
+    /// A gate's pass: from the first unit, ending at the first refusal.
+    fn gate() -> Self {
+        Self::of(0, false)
+    }
+
+    /// A completion's pass: resuming after `resume` settled units, keeping every refusal.
+    fn completing(resume: usize) -> Self {
+        Self::of(resume, true)
+    }
+
+    fn of(resume: usize, exhaustive: bool) -> Self {
+        Self {
+            resume,
+            exhaustive,
+            next: Cell::new(0),
+            settled: Cell::new(0),
+            found: RefCell::new(Vec::new()),
+        }
+    }
+
+    /// Runs one unit, unless an earlier observation already settled it.
+    fn unit(
+        &self,
+        run: impl FnOnce() -> Result<(), GitBootstrapErrorV1>,
+    ) -> Result<(), GitBootstrapErrorV1> {
+        let index = self.next.get();
+        self.next.set(index + 1);
+        if index < self.resume {
+            self.settled.set(index + 1);
+            return Ok(());
+        }
+        match run() {
+            Ok(()) => {
+                self.settled.set(index + 1);
+                Ok(())
+            }
+            // A guard the deadline tripped stopped the unit before it ran to a verdict: it is NOT settled.
+            Err(error) if is_deadline_timeout(&error) => Err(error),
+            Err(error) => {
+                self.settled.set(index + 1);
+                if self.exhaustive {
+                    self.found.borrow_mut().push(error);
+                    Ok(())
+                } else {
+                    Err(error)
+                }
+            }
+        }
+    }
+}
+
+/// What one gate of a final child (a runner callback's, or the settlement's terminal one) ran to a verdict.
+struct GateSeenV1 {
+    /// The mount census ran to a verdict (a refusal is its verdict).
+    mounts: Cell<bool>,
+    /// The retained chains.
+    chains: ChainPassV1,
+}
+
+impl GateSeenV1 {
+    fn new() -> Self {
+        Self {
+            mounts: Cell::new(false),
+            chains: ChainPassV1::gate(),
+        }
+    }
+}
+
+/// What the observations made AFTER a final child's exit ran to a verdict, by stage and unit. A completion makes
+/// only the rest of them.
+#[derive(Clone, Copy, Debug, Default)]
+struct SettledV1 {
+    /// The mount census.
+    mounts: bool,
+    /// The census of the exact tree and its comparison with the baseline.
+    tree: bool,
+    /// How many restored files, in path order, had their digest run to a verdict.
+    digests: usize,
+    /// How many retained-chain units, in custody order, ran to a verdict (the root's identity is the last).
+    chains: usize,
+}
+
+/// How a final child ended, for its completion: whether it may have run (its pre-spawn gate passed, so the runner
+/// went on), and what the observations made since it exited already settled.
+#[derive(Clone, Copy, Debug)]
+struct ChildExitV1 {
+    may_have_run: bool,
+    settled: SettledV1,
+}
+
+/// What the paced settlement of a returned, classified-ok result ran to a verdict, in its own phase: its census and
+/// comparison, its digests, and its terminal gate. The after-exit gate of the same child does NOT stand for any of
+/// it: the settlement did further I/O after that gate returned.
+struct SettlementSeenV1 {
+    tree: Cell<bool>,
+    digests: Cell<usize>,
+    gate: GateSeenV1,
+}
+
+impl SettlementSeenV1 {
+    fn new() -> Self {
+        Self {
+            tree: Cell::new(false),
+            digests: Cell::new(0),
+            gate: GateSeenV1::new(),
+        }
+    }
+
+    fn settled(&self) -> SettledV1 {
+        SettledV1 {
+            mounts: self.gate.mounts.get(),
+            tree: self.tree.get(),
+            digests: self.digests.get(),
+            chains: self.gate.chains.settled.get(),
+        }
+    }
 }
 
 /// One run of the final proof: the retained values it reads, the account of what the restore made, the ONE
@@ -7723,46 +8034,59 @@ impl<'a> ProofRunV1<'a> {
         self.runs
     }
 
-    /// Every retained chain: the output directories and the files copied, the metadata directories and
-    /// files, every admitted bootstrap file, then the staging, HOME, XDG, and bootstrap chains with the
-    /// destination root's identity LAST. `pace` runs before every filesystem call a step makes, so no call is
-    /// made after a slow one without the clock: a step of one call has one guard, and the two that make
-    /// more ([`final_source_files_unchanged`], [`final_staging_chain`]) have one between their calls.
-    fn proof_chains(&self, pace: PaceV1<'_>) -> Result<(), GitBootstrapErrorV1> {
-        output_chains(
+    /// Every retained chain, one UNIT per retained edge, in custody order: the output directories and the files
+    /// copied, the metadata directories and files, every admitted bootstrap file, then the staging, HOME, XDG, and
+    /// bootstrap chains with the destination root's identity LAST. `pace` runs before every filesystem call a step
+    /// makes, so no call is made after a slow one without the clock: a step of one call has one guard, and the two
+    /// that make more ([`final_source_files_unchanged`], [`final_staging_chain`]) have one between their calls.
+    /// `pass` says what a refusal does ([`ChainPassV1`]): a gate's pass ends at the first one, a completion's keeps
+    /// every one and goes on to the next edge and, last, the root.
+    fn proof_chains(
+        &self,
+        pace: PaceV1<'_>,
+        pass: &ChainPassV1,
+    ) -> Result<(), GitBootstrapErrorV1> {
+        final_output_chains(
             self.dest(),
             PinViewV1::of_final(&self.objects.pins),
             &self.objects.files,
             pace,
+            pass,
         )?;
         let git = &self.objects.pins.git;
         for (relative, pin) in &self.metadata.directories {
-            pace("final-chain")?;
-            let (parent, leaf) = split_relative(relative);
-            let above = pin_beneath(git, &self.metadata.directories, parent)?;
-            recheck_entry(
-                above,
-                leaf.as_bytes(),
-                pin,
-                metadata_name(relative).as_bytes(),
-            )?;
+            pass.unit(|| {
+                pace("final-chain")?;
+                let (parent, leaf) = split_relative(relative);
+                let above = pin_beneath(git, &self.metadata.directories, parent)?;
+                recheck_entry(
+                    above,
+                    leaf.as_bytes(),
+                    pin,
+                    metadata_name(relative).as_bytes(),
+                )?;
+                Ok(())
+            })?;
         }
         for file in &self.metadata.files {
-            pace("final-chain")?;
-            let parent = pin_beneath(
-                git,
-                &self.metadata.directories,
-                split_relative(&file.relative).0,
-            )?;
-            recheck_regular_entry(parent, &file.relative, (file.dev, file.ino, file.length))?;
+            pass.unit(|| {
+                pace("final-chain")?;
+                let parent = pin_beneath(
+                    git,
+                    &self.metadata.directories,
+                    split_relative(&file.relative).0,
+                )?;
+                recheck_regular_entry(parent, &file.relative, (file.dev, file.ino, file.length))
+            })?;
         }
-        final_source_files_unchanged(self.boot, pace)?;
+        final_source_files_unchanged(self.boot, pace, pass)?;
         final_sweep_chains(
             self.dest(),
             Some(&self.boot.home),
             Some(&self.boot.xdg),
             &self.boot.directories,
             pace,
+            pass,
         )
     }
 
@@ -7771,13 +8095,17 @@ impl<'a> ProofRunV1<'a> {
     /// every chain, and immediately before the root's identity, which stays the LAST fallible call. Both runner
     /// callbacks run it, because neither knows the child's outcome (the post-exit one of a child that is about
     /// to succeed precedes a success), and so does a result that is about to become a success. A refusal here
-    /// makes the child's failure known, and a known failure is reconciled without the clock
-    /// ([`Self::proof_settle`]); no gate is ever left out of the deadline.
-    fn proof_deadline_gate(&self) -> Result<(), GitBootstrapErrorV1> {
+    /// makes the child's failure known, and a known failure is completed without the clock
+    /// ([`Self::proof_settle`]); no gate is ever left out of the deadline. `seen` records what the gate ran to a
+    /// verdict, so that completion makes only the observations this one did not: the mount census once it has run
+    /// (its refusal is its verdict), and each chain unit it reached (the one that refused included).
+    fn proof_deadline_gate(&self, seen: &GateSeenV1) -> Result<(), GitBootstrapErrorV1> {
         let deadline = self.deadline;
         observe_deadline(deadline, "final-gate")?;
-        refuse_mounts_within(&self.dest().root)?;
-        self.proof_chains(&|step| observe_deadline(deadline, step))
+        let mounts = refuse_mounts_within(&self.dest().root);
+        seen.mounts.set(true);
+        mounts?;
+        self.proof_chains(&|step| observe_deadline(deadline, step), &seen.chains)
     }
 
     /// The census of the exact tree, through retained pins only. The repository holds exactly the Git
@@ -7964,77 +8292,102 @@ impl<'a> ProofRunV1<'a> {
     /// through the RETAINED pin of its directory and bound to the census (its own `fstat`, before the first
     /// read and after the last, must equal the file's measured non-atime facts, and exactly the measured byte
     /// count must be read), and each compared with the digest the file was restored with. Every read keeps
-    /// the ONE absolute deadline (see [`DigestBoundV1`] for the one pass that does not); `pace` runs before
-    /// every file, after its open, and after its read has returned.
+    /// the ONE absolute deadline; `pace` runs before every file, after its open, and after its read has returned.
+    /// This is the pass that serves a success, so it ends at its first refusal.
     fn proof_digests(
         &self,
         facts: &ProofFactsV1,
         pace: PaceV1<'_>,
-        bound: DigestBoundV1,
     ) -> Result<(), GitBootstrapErrorV1> {
-        for (relative, fact) in &facts.files {
-            pace("final-digest")?;
-            let (parent, leaf) = split_relative(relative);
-            let directory = self
-                .made
-                .directories
-                .get(parent.unwrap_or(""))
-                .ok_or_else(|| final_input(format!("{relative}: its directory is not retained")))?;
-            let made =
-                self.made.files.get(relative).ok_or_else(|| {
-                    final_input(format!("{relative}: not a file the restore made"))
-                })?;
-            let mut file = directory
-                .open_regular_file(OsStr::new(leaf), "custody restore final file digest")
-                .map_err(|error| {
-                    if refused_link(&error) {
-                        GitBootstrapErrorV1::Restore(CustodyRestoreErrorV1::SymlinkRefused {
-                            name: relative.clone(),
-                        })
-                    } else {
-                        fs_error(error)
+        self.proof_digests_counted(facts, pace, &Cell::new(0))
+    }
+
+    /// [`Self::proof_digests`], recording in `settled` how many leading files ran to a verdict: a file whose
+    /// digest ended in a custody refusal is settled (its refusal is the finding), one a deadline guard stopped is not.
+    fn proof_digests_counted(
+        &self,
+        facts: &ProofFactsV1,
+        pace: PaceV1<'_>,
+        settled: &Cell<usize>,
+    ) -> Result<(), GitBootstrapErrorV1> {
+        for (index, (relative, fact)) in facts.files.iter().enumerate() {
+            match self.proof_digest_file(relative, fact, pace) {
+                Ok(()) => settled.set(index + 1),
+                Err(error) => {
+                    if !is_deadline_timeout(&error) {
+                        settled.set(index + 1);
                     }
-                })?;
-            #[cfg(test)]
-            run_git_hook(
-                GitHookPointV1::FinalDigestFileOpened,
-                "",
-                &directory.canonical_path().join(leaf),
-            );
-            pace("final-digest-opened")?;
-            require_measured_file(&file, fact, relative, "before it was read")?;
-            #[cfg(test)]
-            run_git_hook(
-                GitHookPointV1::FinalDigestOpened,
-                "",
-                &directory.canonical_path().join(leaf),
-            );
-            let (read, sha256) = match bound {
-                DigestBoundV1::Deadline => {
-                    stream_digest(&mut file, fact.length, self.deadline, relative)?
+                    return Err(error);
                 }
-                DigestBoundV1::Reconciling => reconciling_digest(&mut file, fact.length, relative)?,
-            };
-            #[cfg(test)]
-            run_git_hook(
-                GitHookPointV1::FinalDigestHashed,
-                "",
-                &directory.canonical_path().join(leaf),
-            );
-            pace("final-digest-read")?;
-            if read != fact.length {
-                return Err(digest_identity(
-                    relative,
-                    &format!(
-                        "{read} bytes were read, and the census measured {}",
-                        fact.length
-                    ),
-                ));
             }
-            require_measured_file(&file, fact, relative, "after it was read")?;
-            if sha256 != made.sha256 {
-                return Err(final_tree(relative.clone(), FinalTreeFaultV1::Bytes));
-            }
+        }
+        Ok(())
+    }
+
+    /// The digest of ONE file of the census, held to the one deadline ([`Self::proof_digests`]).
+    fn proof_digest_file(
+        &self,
+        relative: &str,
+        fact: &FileFactV1,
+        pace: PaceV1<'_>,
+    ) -> Result<(), GitBootstrapErrorV1> {
+        pace("final-digest")?;
+        let (parent, leaf) = split_relative(relative);
+        let directory = self
+            .made
+            .directories
+            .get(parent.unwrap_or(""))
+            .ok_or_else(|| final_input(format!("{relative}: its directory is not retained")))?;
+        let made = self
+            .made
+            .files
+            .get(relative)
+            .ok_or_else(|| final_input(format!("{relative}: not a file the restore made")))?;
+        let mut file = directory
+            .open_regular_file(OsStr::new(leaf), "custody restore final file digest")
+            .map_err(|error| {
+                if refused_link(&error) {
+                    GitBootstrapErrorV1::Restore(CustodyRestoreErrorV1::SymlinkRefused {
+                        name: relative.to_owned(),
+                    })
+                } else {
+                    fs_error(error)
+                }
+            })?;
+        #[cfg(test)]
+        run_git_hook(
+            GitHookPointV1::FinalDigestFileOpened,
+            "",
+            &directory.canonical_path().join(leaf),
+        );
+        pace("final-digest-opened")?;
+        require_measured_file(&file, fact, relative, "before it was read")?;
+        #[cfg(test)]
+        run_git_hook(
+            GitHookPointV1::FinalDigestOpened,
+            "",
+            &directory.canonical_path().join(leaf),
+        );
+        let (read, sha256) = stream_digest(&mut file, fact.length, self.deadline, relative)?;
+        #[cfg(test)]
+        run_git_hook(
+            GitHookPointV1::FinalDigestHashed,
+            "",
+            &directory.canonical_path().join(leaf),
+        );
+        pace("final-digest-read")?;
+        if read != fact.length {
+            return Err(digest_identity(
+                relative,
+                &format!(
+                    "{read} bytes were read, and the census measured {}",
+                    fact.length
+                ),
+            ));
+        }
+        require_measured_file(&file, fact, relative, "after it was read")?;
+        if sha256 != made.sha256 {
+            return Err(final_tree(relative.to_owned(), FinalTreeFaultV1::Bytes));
         }
         Ok(())
     }
@@ -8045,9 +8398,12 @@ impl<'a> ProofRunV1<'a> {
     /// deadline gate; and `classify` judges a returned result (status, then output). Nothing is reserved, so
     /// nothing is released: the one ledger is never touched. The baseline is held to the ONE absolute deadline
     /// at every call (a guard after each, and one before the runner, a filesystem call of its own, is called):
-    /// a baseline that returns after it never lets a child start. The two callbacks record whether their gate
-    /// passed, so a failure that is known afterwards is reconciled for what no completed gate saw
-    /// ([`Self::proof_reconcile`]).
+    /// a baseline that returns after it never lets a child start. The two callbacks record what their gates ran
+    /// to a verdict, per phase, so a failure that is known afterwards is completed for exactly what no gate saw
+    /// ([`Self::proof_reconcile`]). The runner evaluates the binary's drift and the post-exit callback
+    /// independently and lets the drift dominate, so a callback's refusal replaces only the route refusal this file
+    /// made for it: any other runner error stays the primary and the callback's refusal is the first finding
+    /// beside it.
     fn proof_child<T>(
         &mut self,
         runner: &GitRunnerV1,
@@ -8065,20 +8421,19 @@ impl<'a> ProofRunV1<'a> {
         let deadline = self.deadline;
         let pace = |step: &'static str| observe_deadline(deadline, step);
         let baseline = self.proof_measure(&pace)?;
-        self.proof_digests(&baseline, &pace, DigestBoundV1::Deadline)?;
+        self.proof_digests(&baseline, &pace)?;
         observe_deadline(deadline, "final-baselined")?;
-        let callback_error: RefCell<Option<GitBootstrapErrorV1>> = RefCell::new(None);
-        // What the two callbacks saw, for the reconciliation of a failure that becomes known: whether the
-        // pre-spawn gate passed (the child may then have run) and whether the post-exit gate passed (what a
-        // child that exited left was then gated after it exited).
-        let gated_before = Cell::new(false);
-        let gated_after = Cell::new(false);
+        let refusal: RefCell<Option<GitBootstrapErrorV1>> = RefCell::new(None);
+        // What the two callbacks saw. The pre-spawn gate only says the child may now run (it is no evidence of what
+        // the child leaves); the post-exit gate's progress is what the child left that a gate has already seen.
+        let before_passed = Cell::new(false);
+        let after = GateSeenV1::new();
         let outcome = {
             let this = &*self;
-            let check = |point_label: &'static str, after: bool| {
+            let check = |point_label: &'static str, is_after: bool| {
                 #[cfg(test)]
                 run_git_hook(
-                    if after {
+                    if is_after {
                         GitHookPointV1::AfterFinalChild
                     } else {
                         GitHookPointV1::BeforeFinalChild
@@ -8087,21 +8442,19 @@ impl<'a> ProofRunV1<'a> {
                     this.made.repository.canonical_path(),
                 );
                 #[cfg(not(test))]
-                let _ = (point_label, after);
-                match this.proof_deadline_gate() {
+                let _ = point_label;
+                let before = GateSeenV1::new();
+                let seen = if is_after { &after } else { &before };
+                match this.proof_deadline_gate(seen) {
                     Ok(()) => {
-                        if after {
-                            gated_after.set(true);
-                        } else {
-                            gated_before.set(true);
+                        if !is_after {
+                            before_passed.set(true);
                         }
                         Ok(())
                     }
                     Err(error) => {
-                        *callback_error.borrow_mut() = Some(error);
-                        Err(CustodyGitError::RouteRefusal(
-                            "the final repository gate refused".into(),
-                        ))
+                        *refusal.borrow_mut() = Some(error);
+                        Err(CustodyGitError::RouteRefusal(FINAL_GATE_REFUSED_V1.into()))
                     }
                 }
             };
@@ -8113,18 +8466,18 @@ impl<'a> ProofRunV1<'a> {
                 || check(label, true),
             )
         };
-        let callback_error = callback_error.into_inner();
-        // The mount census and the retained chains are owed to a known failure when the child may have run and
-        // no gate that completed saw what it left: the pre-spawn gate passed, the post-exit gate did not, and
-        // no gate refused with a custody finding of its own (a gate that refused IS the finding of the class
-        // that found it; a gate the deadline cut short is not).
-        let refused_by_a_gate = callback_error
-            .as_ref()
-            .is_some_and(|error| !is_deadline_timeout(error));
-        let gates_owed = gated_before.get() && !gated_after.get() && !refused_by_a_gate;
-        // Every runner error is one outcome of a child that may have run: a callback refusal, a timeout, a
-        // cap, binary drift, a failed stream, and a refusal before the spawn alike.
-        let verdict = match outcome {
+        let refusal = refusal.into_inner();
+        let exit = ChildExitV1 {
+            may_have_run: before_passed.get(),
+            settled: SettledV1 {
+                mounts: after.mounts.get(),
+                chains: after.chains.settled.get(),
+                ..SettledV1::default()
+            },
+        };
+        // Every runner error is one outcome of a child that may have run: a callback refusal, a timeout, a cap,
+        // binary drift, a failed stream, and a refusal before the spawn alike.
+        let (verdict, beside) = match outcome {
             Ok(result) => {
                 self.runs.push(GitRunRecordV1 {
                     label,
@@ -8136,97 +8489,139 @@ impl<'a> ProofRunV1<'a> {
                     stdout: result.evidence.stdout.clone(),
                     stderr: result.evidence.stderr.clone(),
                 });
-                match callback_error {
-                    None => classify(&result),
-                    Some(error) => Err(error),
+                match refusal {
+                    None => (classify(&result), None),
+                    Some(error) => (Err(error), None),
                 }
             }
-            Err(error) => Err(callback_error.unwrap_or(error.into())),
+            Err(error) => match refusal {
+                None => (Err(error.into()), None),
+                Some(callback) if is_final_gate_refusal(&error) => (Err(callback), None),
+                Some(callback) => (Err(error.into()), Some(callback)),
+            },
         };
-        self.proof_settle(&baseline, label, verdict, gates_owed)
+        self.proof_settle(&baseline, label, verdict, beside, exit)
     }
 
     /// Settle a read-only child, once, on any outcome: the tree must be EXACTLY what the pre-child census
     /// found, so an added, removed, replaced, or resized entry, a file whose mode or timestamps moved, and a
     /// file whose bytes changed in place (which only its digest can show) are each a reconciliation failure.
-    /// A result that is about to be a success is settled on the ONE absolute deadline at every call (a guard
-    /// after each census and digest call, so nothing is made after a slow one without the clock) and ends in
-    /// the success gate held to it too; it can only become a success there. A failure that is ALREADY known (a
-    /// runner error, a callback refusal, a nonzero status, a parser refusal), and the typed timeout that cuts
-    /// the settlement short (now a known failure too), are each handed ONCE to [`Self::proof_reconcile`],
-    /// which keeps the failure beside whatever it finds and can never return a value. A measured effect or a
-    /// custody refusal found by the paced settlement is the finding of the class that found it, and is
-    /// returned as it is. `gates` says whether the mount census and the retained chains are owed.
+    /// A result that is about to be a success is settled on the ONE absolute deadline at every call
+    /// ([`Self::proof_settle_paced`]) and can only become a success there. EVERY failure of the child, whether
+    /// already known (a runner error, a callback refusal, a nonzero status, a parser refusal) or made known by
+    /// the paced settlement (the typed timeout, or a custody finding), enters [`Self::proof_reconcile`] at this
+    /// ONE site, once, with what had already run to a verdict; that helper keeps the failure beside whatever else
+    /// it finds and can never return a value. `beside` is a callback's refusal that the runner's own error
+    /// outranked, `exit` how the child ended.
     fn proof_settle<T>(
         &self,
         baseline: &ProofFactsV1,
         label: &'static str,
         verdict: Result<T, GitBootstrapErrorV1>,
-        gates: bool,
+        beside: Option<GitBootstrapErrorV1>,
+        exit: ChildExitV1,
     ) -> Result<T, GitBootstrapErrorV1> {
-        let value = match verdict {
-            Ok(value) => value,
-            Err(primary) => return Err(self.proof_reconcile(baseline, label, primary, gates)),
-        };
-        let deadline = self.deadline;
-        let paced = |step: &'static str| observe_deadline(deadline, step);
-        let settled = self
-            .proof_measure(&paced)
-            .and_then(|measured| {
-                final_unchanged(baseline, &measured, label)?;
-                // Every fact is equal, so this reads the very files, at the very lengths, that the baseline
-                // read, under the SAME absolute deadline: there is no exception after a child.
-                self.proof_digests(&measured, &paced, DigestBoundV1::Deadline)
-            })
-            .and_then(|()| self.proof_deadline_gate());
-        match settled {
-            Ok(()) => Ok(value),
-            Err(timeout) if is_deadline_timeout(&timeout) => {
-                Err(self.proof_reconcile(baseline, label, timeout, true))
+        let (primary, exit) = match verdict {
+            Err(primary) => (primary, exit),
+            Ok(value) => {
+                let seen = SettlementSeenV1::new();
+                match self.proof_settle_paced(baseline, label, &seen) {
+                    Ok(()) => return Ok(value),
+                    Err(error) => (
+                        error,
+                        ChildExitV1 {
+                            may_have_run: true,
+                            settled: seen.settled(),
+                        },
+                    ),
+                }
             }
-            Err(finding) => Err(finding),
-        }
+        };
+        Err(self.proof_reconcile(baseline, label, primary, beside, exit))
     }
 
-    /// The ONE failure-only reconciliation of a final child: `primary` is a failure that is already known, and
-    /// what it left behind is measured WITHOUT the clock (a spent deadline cannot stop it), in the master's
-    /// gate order: the mount census; the exact tree, its comparison with the baseline, and the digest of every
-    /// restored file, each read bounded by its measured length plus one byte; then every retained chain, the
-    /// destination root's identity LAST. The census, the digests, and the chains are the very ones the gates
-    /// run, so each is finite: a bounded mount table, at most the entries the restore made plus one, one read
-    /// per file, one call per retained entry. Nothing is written, reserved, released, or retried.
+    /// The settlement of a result that is about to be a success, held to the ONE absolute deadline at every call
+    /// (a guard after each census and digest call, so nothing is made after a slow one without the clock): the
+    /// census, its comparison with the baseline, the digests, and the success gate, in that order, ending at the
+    /// first failure. `seen` records what ran to a verdict in this phase, so a completion never repeats it: the
+    /// census whose finding is the failure, or whose guard the deadline tripped, is told apart.
+    fn proof_settle_paced(
+        &self,
+        baseline: &ProofFactsV1,
+        label: &'static str,
+        seen: &SettlementSeenV1,
+    ) -> Result<(), GitBootstrapErrorV1> {
+        let deadline = self.deadline;
+        let paced = |step: &'static str| observe_deadline(deadline, step);
+        let measured = match self.proof_measure(&paced) {
+            Ok(measured) => measured,
+            Err(error) => {
+                // A census a custody finding ended ran to its verdict (the finding is the failure, and no complete
+                // comparison exists); one the deadline stopped did not.
+                seen.tree.set(!is_deadline_timeout(&error));
+                return Err(error);
+            }
+        };
+        let unchanged = final_unchanged(baseline, &measured, label);
+        seen.tree.set(true);
+        unchanged?;
+        // Every fact is equal, so this reads the very files, at the very lengths, that the baseline
+        // read, under the SAME absolute deadline: there is no exception after a child.
+        self.proof_digests_counted(&measured, &paced, &seen.digests)?;
+        self.proof_deadline_gate(&seen.gate)
+    }
+
+    /// The ONE failure-only completion of a final child: `primary` is a failure that is already known, and
+    /// every observation of what the child may have left that no earlier phase ran to a verdict is made WITHOUT
+    /// the clock (a spent deadline cannot stop it), each independently of the others, in the master's gate order:
+    /// the mount census; the census of the exact tree and its comparison with the baseline (the comparison needs
+    /// a complete census); the digest of every restored file, in path order, by its RETAINED descriptor (it needs
+    /// neither the census nor a name); then every retained chain edge, the destination root's identity LAST. Each
+    /// is finite: a bounded mount table, at most the entries the restore made plus one, one bounded read per
+    /// file, one call per retained edge. Nothing is written, reserved, released, retried, or started.
     ///
-    /// `gates` says whether the mount census and the chains are owed (the child may have run and no completed
-    /// gate saw it, or a success-eligible check the deadline cut short would have); the tree always is. Every
-    /// class runs, so none hides another: a class that fails is kept beside the primary, the first failing
-    /// class in the order above first (nested [`GitBootstrapErrorV1::ChildAndReconcile`] values), and the
-    /// result is ALWAYS a failure: its type cannot be a verified value, and the primary is never dropped.
+    /// `exit` says what ran to a verdict since the child exited (a unit that refused did; a unit a deadline guard
+    /// stopped did not) and whether the child may have run at all (when it did not, only the tree is owed). A
+    /// finding that fails is kept, in the order above, beside the primary (a callback's refusal first, via
+    /// `beside`), nested in the existing [`GitBootstrapErrorV1::ChildAndReconcile`] with the first finding
+    /// outermost, and the result is ALWAYS a failure: its type cannot be a verified value, and the primary is
+    /// never dropped.
     fn proof_reconcile(
         &self,
         baseline: &ProofFactsV1,
         label: &'static str,
         primary: GitBootstrapErrorV1,
-        gates: bool,
+        beside: Option<GitBootstrapErrorV1>,
+        exit: ChildExitV1,
     ) -> GitBootstrapErrorV1 {
         // The ONE clock-free pace of the final region, used only after a failure is known.
         let pace: PaceV1<'_> = &unpaced;
-        let mut found: Vec<GitBootstrapErrorV1> = Vec::new();
-        if gates {
+        let settled = exit.settled;
+        let mut found: Vec<GitBootstrapErrorV1> = beside.into_iter().collect();
+        if exit.may_have_run && !settled.mounts {
             if let Err(error) = refuse_mounts_within(&self.dest().root) {
                 found.push(error.into());
             }
         }
-        let tree = self.proof_measure(pace).and_then(|measured| {
-            final_unchanged(baseline, &measured, label)?;
-            self.proof_digests(&measured, pace, DigestBoundV1::Reconciling)
-        });
-        if let Err(error) = tree {
-            found.push(error);
+        if !settled.tree {
+            match self.proof_measure(pace) {
+                Ok(measured) => {
+                    if let Err(error) = final_unchanged(baseline, &measured, label) {
+                        found.push(error);
+                    }
+                }
+                Err(error) => found.push(error),
+            }
         }
-        if gates {
-            if let Err(error) = self.proof_chains(pace) {
+        self.proof_retained_digests(settled.digests, &mut found);
+        if exit.may_have_run {
+            let pass = ChainPassV1::completing(settled.chains);
+            // Every call is inside a unit and a completion keeps each refusal, so this returns nothing; a refusal
+            // that were returned is kept all the same.
+            if let Err(error) = self.proof_chains(pace, &pass) {
                 found.push(error);
             }
+            found.extend(pass.found.take());
         }
         let reconcile = found.into_iter().rev().reduce(|later, earlier| {
             GitBootstrapErrorV1::ChildAndReconcile {
@@ -8241,6 +8636,103 @@ impl<'a> ProofRunV1<'a> {
                 reconcile: Box::new(reconcile),
             },
         }
+    }
+
+    /// The path of the restored file `relative` beneath its retained directory, for a test hook.
+    #[cfg(test)]
+    fn final_file_path(&self, relative: &str) -> Option<std::path::PathBuf> {
+        let (parent, leaf) = split_relative(relative);
+        self.made
+            .directories
+            .get(parent.unwrap_or(""))
+            .map(|directory| directory.canonical_path().join(leaf))
+    }
+
+    /// The digest of every restored file after the first `from` (in path order, which is the order the paced digests
+    /// settle in), each by its retained descriptor ([`Self::proof_retained_digest`]), each independent of the
+    /// others: a file whose digest refuses is kept, and the next file is observed. A fault the census of the tree
+    /// already named for the same file (a resized file is both) is reported once.
+    fn proof_retained_digests(&self, from: usize, found: &mut Vec<GitBootstrapErrorV1>) {
+        for (relative, made) in self.made.files.iter().skip(from) {
+            #[cfg(test)]
+            if let Some(at) = self.final_file_path(relative) {
+                run_git_hook(GitHookPointV1::FinalDigestFileOpened, "", &at);
+            }
+            if let Err(error) = self.proof_retained_digest(relative, made) {
+                if !found.iter().any(|seen| same_final_tree_fault(seen, &error)) {
+                    found.push(error);
+                }
+            }
+        }
+    }
+
+    /// The SHA-256 of the file the restore made at `relative`, read from the descriptor the restore RETAINED, at
+    /// explicit offsets: it moves no shared cursor, reopens no name (a name may be another inode, a link, or a FIFO
+    /// by now), and reads no clock, because it serves a failure that is already known. It reads at most the length the
+    /// restore made plus one byte, so a file that grew is never read whole, in a finite number of calls, and a
+    /// read that fails for any reason, a signal's interruption included, is one typed refusal of that file and is
+    /// never repeated. It can only refuse: a descriptor that is no longer the file the restore made, a length or
+    /// bytes that changed, and a read that failed are each that file's own finding, and the other files are
+    /// observed regardless.
+    fn proof_retained_digest(
+        &self,
+        relative: &str,
+        made: &MadeFileV1<'_>,
+    ) -> Result<(), GitBootstrapErrorV1> {
+        let file = made.file;
+        require_made_file(file, made, relative)?;
+        #[cfg(test)]
+        let at = self.final_file_path(relative);
+        #[cfg(test)]
+        if let Some(at) = &at {
+            run_git_hook(GitHookPointV1::FinalDigestOpened, "", at);
+        }
+        let limit = made.length.saturating_add(1);
+        let mut context = digest::Context::new(&digest::SHA256);
+        let mut buffer = vec![0_u8; HASH_BUFFER_BYTES_V1];
+        let mut count = 0_u64;
+        while count < limit {
+            let want =
+                usize::try_from(limit - count).map_or(buffer.len(), |left| left.min(buffer.len()));
+            #[cfg(test)]
+            let read = match reconcile_read_call(relative) {
+                Some(error) => Err(error),
+                None => file.read_at(&mut buffer[..want], count),
+            };
+            #[cfg(not(test))]
+            let read = file.read_at(&mut buffer[..want], count);
+            match read {
+                Ok(0) => break,
+                Ok(read) => {
+                    count = count.saturating_add(read as u64);
+                    context.update(&buffer[..read]);
+                }
+                Err(error) => return Err(io_refusal(relative, &error)),
+            }
+        }
+        #[cfg(test)]
+        if let Some(at) = &at {
+            run_git_hook(GitHookPointV1::FinalDigestHashed, "", at);
+        }
+        if count > made.length {
+            return Err(digest_identity(
+                relative,
+                &format!(
+                    "{count} bytes were read, and the census measured {}",
+                    made.length
+                ),
+            ));
+        }
+        if count < made.length {
+            return Err(final_tree(relative.to_owned(), FinalTreeFaultV1::Bytes));
+        }
+        require_made_file(file, made, relative)?;
+        let mut sha256 = [0_u8; 32];
+        sha256.copy_from_slice(context.finish().as_ref());
+        if sha256 != made.sha256 {
+            return Err(final_tree(relative.to_owned(), FinalTreeFaultV1::Bytes));
+        }
+        Ok(())
     }
 
     /// `cat-file --batch-all-objects`: exactly the manifest's `(oid, kind)` set, in the FINAL database.
@@ -8364,9 +8856,9 @@ impl<'a> ProofRunV1<'a> {
         observe_deadline(deadline, "final-mounts")?;
         let facts = self.proof_measure(&pace)?;
         observe_deadline(deadline, "final-tree")?;
-        self.proof_digests(&facts, &pace, DigestBoundV1::Deadline)?;
+        self.proof_digests(&facts, &pace)?;
         observe_deadline(deadline, "final-digested")?;
-        self.proof_chains(&pace)
+        self.proof_chains(&pace, &ChainPassV1::gate())
     }
 
     /// The final proof: the inventory, the reachability of every inventory object (vacuous for an Empty

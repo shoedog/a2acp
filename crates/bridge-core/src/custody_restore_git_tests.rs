@@ -25527,11 +25527,20 @@ fn b2c_a_final_child_that_leaves_an_effect_is_refused_beside_its_own_outcome_on_
             true,
             None,
         ),
+        // Design follow-on 1: the comparison refuses the moved timestamps FIRST (the paced settlement's finding is the
+        // primary), and the bytes, which only the file's own retained descriptor can show, are still observed and
+        // named beside it: before, this row required the comparison's finding ALONE, which hid them.
         (
             "a child that rewrote HEAD in place, the clocks running",
             "\"$REAL\" \"$@\"; sleep 1; printf X | dd of=.git/HEAD bs=1 seek=10 conv=notrunc 2>/dev/null"
                 .into(),
-            |e| is_budget(e, "read-only"),
+            |e| {
+                combined_with(
+                    e,
+                    |p| is_budget(p, "read-only"),
+                    |r| tree_fault(r, FinalTreeFaultV1::Bytes),
+                )
+            },
             3,
             false,
             None,
@@ -26841,17 +26850,14 @@ fn b2c_the_final_gate_order_is_fixed_in_the_source() {
     );
     let child = body_of(source, "fn proof_child<");
     assert!(
-        child.contains("match this.proof_deadline_gate()"),
+        child.contains("match this.proof_deadline_gate("),
         "both runner callbacks run the deadline gate"
     );
     // The baseline is held to the same deadline: its census and digests on the one pace, and a guard before the
     // runner (a filesystem call of its own) is called.
     let order = [
         at(child, "self.proof_measure(&pace)"),
-        at(
-            child,
-            "self.proof_digests(&baseline, &pace, DigestBoundV1::Deadline)",
-        ),
+        at(child, "self.proof_digests(&baseline, &pace)"),
         at(child, "\"final-baselined\""),
         at(child, "runner.run("),
     ];
@@ -26861,11 +26867,12 @@ fn b2c_the_final_gate_order_is_fixed_in_the_source() {
         "no step of a child's bracket leaves the clock out"
     );
     // The settlement of a result that is about to be a success is paced and bound to the deadline and ends in
-    // the success gate; it never leaves the clock out. A failure that is ALREADY known (the verdict) and the
-    // typed timeout that cuts the settlement short are each handed, once, to ONE failure-only helper, and the
-    // verdict's value is returned only after the paced settlement and the gate succeeded. (Source round 4:
-    // before it, the clock-free arm lived inside this function and the timeout of a settlement was returned
-    // bare.)
+    // the success gate; it never leaves the clock out. EVERY failure of a final child (one that is already known:
+    // a runner error, a callback refusal, a nonzero status, a parser refusal; and one that becomes known inside
+    // the paced settlement, the typed timeout or a custody finding) enters ONE failure-only completion, at ONE
+    // call site, after the paced settlement or a known verdict, and the verdict's value is returned only after
+    // the paced settlement and its gate succeeded. (Design follow-on 1: before it, a non-timeout paced finding
+    // was returned alone, and the timeout was one of two call sites.)
     let settle = body_of(source, "fn proof_settle<");
     assert_eq!(
         settle.matches("unpaced").count(),
@@ -26874,23 +26881,35 @@ fn b2c_the_final_gate_order_is_fixed_in_the_source() {
     );
     assert_eq!(
         settle.matches("self.proof_reconcile(").count(),
-        2,
-        "a known failure and a settlement the deadline cut short each enter the one helper"
+        1,
+        "every failure of a final child enters the one completion at ONE site"
     );
     let order = [
+        at(settle, "self.proof_settle_paced("),
+        at(settle, "return Ok(value)"),
         at(settle, "self.proof_reconcile("),
-        at(settle, ".proof_measure(&paced)"),
-        at(
-            settle,
-            ".proof_digests(&measured, &paced, DigestBoundV1::Deadline)",
-        ),
-        at(settle, ".proof_deadline_gate()"),
-        settle.rfind("Ok(value)").expect("the success arm"),
     ];
     assert!(order.windows(2).all(|pair| pair[0] < pair[1]), "{order:?}");
-    // The ONE failure-only helper: the mount census, then the exact tree and its bounded digests, then every
-    // retained chain (the destination root's identity LAST), all on the one clock-free pace, with no gate, no
-    // runner, and no classifier in it, and a return type that is a FAILURE: it cannot return a verified value.
+    let paced = body_of(source, "fn proof_settle_paced(");
+    assert!(
+        !paced.contains("unpaced") && !paced.contains("proof_reconcile"),
+        "the paced settlement is held to the deadline and never completes"
+    );
+    let order = [
+        at(paced, ".proof_measure(&paced)"),
+        at(paced, "final_unchanged("),
+        at(paced, ".proof_digests_counted(&measured, &paced"),
+        at(paced, ".proof_deadline_gate("),
+    ];
+    assert!(order.windows(2).all(|pair| pair[0] < pair[1]), "{order:?}");
+    assert!(
+        !paced[order[3]..].contains(';'),
+        "the success gate is the paced settlement's tail expression"
+    );
+    // The ONE failure-only completion: the mount census, then the exact tree and its comparison, then the digest
+    // of every restored file by its RETAINED descriptor, then every retained chain (the destination root's
+    // identity LAST), all on the one clock-free pace, with no gate, no runner, and no classifier in it, and a
+    // return type that is a FAILURE: it cannot return a verified value.
     let reconcile = body_of(source, "fn proof_reconcile(");
     assert_eq!(
         reconcile.matches("&unpaced").count(),
@@ -26900,8 +26919,8 @@ fn b2c_the_final_gate_order_is_fixed_in_the_source() {
     let order = [
         at(reconcile, "refuse_mounts_within("),
         at(reconcile, "self.proof_measure(pace)"),
-        at(reconcile, "DigestBoundV1::Reconciling"),
-        at(reconcile, "self.proof_chains(pace)"),
+        at(reconcile, "self.proof_retained_digests("),
+        at(reconcile, "self.proof_chains(pace"),
     ];
     assert!(order.windows(2).all(|pair| pair[0] < pair[1]), "{order:?}");
     for forbidden in [
@@ -26910,6 +26929,8 @@ fn b2c_the_final_gate_order_is_fixed_in_the_source() {
         "classify",
         "observe_deadline",
         "Ok(value)",
+        "self.proof_digests(",
+        "proof_digests_counted",
     ] {
         assert!(
             !reconcile.contains(forbidden),
@@ -26922,9 +26943,45 @@ fn b2c_the_final_gate_order_is_fixed_in_the_source() {
         signature.contains("-> GitBootstrapErrorV1"),
         "the helper's result is a failure: {signature}"
     );
+    // The digest of a restored file after a failure is known reads ONLY the descriptor the restore retained, at
+    // explicit offsets (no seek of a shared cursor, no reopened name, no clone), bounded to its length plus one
+    // byte, and never retries an interruption: it is an observation of one file's own descriptor and nothing else.
+    let retained = body_of(source, "fn proof_retained_digest(");
+    assert!(retained.contains("read_at("), "positioned reads");
+    for forbidden in [
+        "open_regular_file",
+        "seek(",
+        "Seek",
+        "try_clone",
+        "by_ref",
+        "Interrupted",
+        "continue",
+        "observe_deadline",
+        "Instant",
+    ] {
+        assert!(
+            !retained.contains(forbidden),
+            "the retained digest mentions `{forbidden}`"
+        );
+    }
     assert!(
-        child.contains("self.proof_settle(&baseline, label, verdict, gates_owed)"),
+        !source.contains("fn reconciling_digest(") && !source.contains("DigestBoundV1"),
+        "no failure-only digest reopens a name or retries an interruption"
+    );
+    assert!(
+        child.contains("self.proof_settle(&baseline, label, verdict, beside, exit)"),
         "the child's bracket hands the settlement what its callbacks saw"
+    );
+    assert!(
+        child.contains("is_final_gate_refusal("),
+        "a callback's refusal replaces ONLY the route refusal this file made"
+    );
+    // The completion is the one site every failure enters; the observations are each a UNIT, a refusal of one
+    // never ends the others (a completion's chains keep every refusal and the root is the last unit).
+    let pass = body_of(source, "fn unit(");
+    assert!(
+        pass.contains("self.exhaustive"),
+        "a completion's unit keeps its refusal and goes on"
     );
     let region = source.split_once(B2C_MARKER_V1).expect("the B2c marker").1;
     assert_eq!(
@@ -27919,11 +27976,15 @@ fn bracket_row(
                 // guard that found it, without reading the clock again: the mount census, the exact tree, and
                 // every retained chain (see `failure_only_reconciliation`). No child began or resumed, and no
                 // success-eligible step went on.
+                //
+                // Design follow-on 1: what is owed is by UNIT, from the part's own progress: a slow call returns,
+                // the next guard of the SAME unit finds the deadline spent, so that unit and every unit after it
+                // are owed, and every unit before it is not observed again (`owed_after_the_slow_call`).
                 BracketV1::AfterCallback | BracketV1::Settlement => {
                     judged.extend(failure_only_reconciliation(
                         after,
                         clean,
-                        FailureOnlyV1::complete(),
+                        owed_after_the_slow_call(bracket, site),
                     ));
                 }
                 // A pre-spawn callback's refusal makes a failure known before the child starts, and a known
@@ -28016,7 +28077,10 @@ fn bracket_problems(slow: HowSlowV1) -> Vec<String> {
 /// settlement (source round 4) by that guard and then exactly ONE clock-free failure-only reconciliation (the
 /// mount census once, the exact tree once, every retained chain once, no clock, no child, no success); the child
 /// that had not started never starts, the proofs are exactly the ones that returned, and every byte is as it
-/// stood when the slow call returned.
+/// stood when the slow call returned. (Design follow-on 1: what the completion owes is by UNIT, from the part's own
+/// progress: the slow call returns, the next guard of the SAME unit finds the deadline spent, so that unit and
+/// every unit after it are observed once, and every unit before it, which ran to a verdict, is not observed
+/// again; `owed_after_the_slow_call` states it for each site.)
 #[test]
 fn b2c_a_slow_call_inside_a_childs_bracket_is_followed_by_no_further_call() {
     let problems = bracket_problems(HowSlowV1::PastTheDeadline);
@@ -28045,37 +28109,125 @@ fn b2c_a_slow_call_with_headroom_inside_a_childs_bracket_changes_nothing() {
 // FOOTPRINT of the reconciliation (the events that followed the failure becoming known).
 // ---------------------------------------------------------------------------------------------
 
-/// What a failure-only reconciliation owes and may stop early for, judged from the events that followed.
+/// How often a failure-only reconciliation owes one class of observation, by unit and not by boolean (design
+/// follow-on 1): a class whose units a completed phase already ran to a verdict is owed NOTHING again, a class no
+/// phase ran is owed ONCE, in full, and a class can stop early only for a fault of its own (the census of the
+/// tree stops at its first fault; no other class does, because its units are independent).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OwedV1 {
+    /// Every unit of the class, exactly once.
+    Once,
+    /// Nothing: an earlier phase ran every unit of the class to a verdict.
+    Never,
+    /// The class's own fault stops it: at least its first step, at most the whole of it.
+    Early,
+}
+
+/// What a failure-only reconciliation owes, judged from the events that followed it.
 #[derive(Clone, Copy, Debug)]
 struct FailureOnlyV1 {
-    /// The mount census and every retained chain are owed (the child may have run and no completed gate saw it).
-    gates: bool,
-    /// The census of the exact tree ran to its end (no fault of its own stopped it early).
-    census_complete: bool,
-    /// The digest of every restored file ran to its end.
-    digests_complete: bool,
-    /// The retained chains ran to their end (no chain fault of its own stopped the sweep early).
-    chains_complete: bool,
+    /// The mount census is owed once (no verdict of it followed the child), or not at all.
+    mounts: bool,
+    /// The census of the exact tree.
+    census: OwedV1,
+    /// The digest of every restored file, by its retained descriptor.
+    digests: OwedV1,
+    /// The recheck of every admitted bootstrap file.
+    sources: OwedV1,
+    /// The recheck of the staging chains.
+    staging: OwedV1,
 }
 
 impl FailureOnlyV1 {
-    /// Nothing stops any class early: a clean tree and clean chains.
+    /// Nothing was observed after the child: every class owed once, a clean tree and clean chains.
     fn complete() -> Self {
         Self {
-            gates: true,
-            census_complete: true,
-            digests_complete: true,
-            chains_complete: true,
+            mounts: true,
+            census: OwedV1::Once,
+            digests: OwedV1::Once,
+            sources: OwedV1::Once,
+            staging: OwedV1::Once,
         }
+    }
+}
+
+/// What a slow call at `site` of `bracket` leaves owed (design follow-on 1: the units the part had already run to
+/// a verdict are NOT observed again, and the unit the guard stopped is). A post-exit callback's gate is its
+/// entry guard, the mount census, then every retained chain in custody order (the admitted bootstrap files
+/// before the staging chains); a settlement is the census (whose comparison follows it), the digests, and then
+/// the same gate. A slow call returns, then the NEXT guard of its own unit finds the deadline spent: the unit it
+/// was in is unsettled, and every unit before it is settled.
+fn owed_after_the_slow_call(bracket: BracketV1, site: SiteV1) -> FailureOnlyV1 {
+    let all = FailureOnlyV1::complete();
+    let census_point = |point| {
+        matches!(
+            point,
+            GitHookPointV1::FinalCensusStatted
+                | GitHookPointV1::FinalCensusListed
+                | GitHookPointV1::BeforeFinalCensusOpen
+                | GitHookPointV1::FinalFileOpened
+        )
+    };
+    match (bracket, site) {
+        (BracketV1::AfterCallback, SiteV1::Entry) => all,
+        (BracketV1::AfterCallback, SiteV1::Mount) => FailureOnlyV1 {
+            mounts: false,
+            ..all
+        },
+        (BracketV1::AfterCallback, SiteV1::Call(GitHookPointV1::FinalSourceStatted, _)) => {
+            FailureOnlyV1 {
+                mounts: false,
+                ..all
+            }
+        }
+        (BracketV1::AfterCallback, SiteV1::Call(GitHookPointV1::FinalStagingChecked, _)) => {
+            FailureOnlyV1 {
+                mounts: false,
+                sources: OwedV1::Never,
+                ..all
+            }
+        }
+        (BracketV1::Settlement, SiteV1::Call(point, _)) if census_point(point) => all,
+        (
+            BracketV1::Settlement,
+            SiteV1::Call(
+                GitHookPointV1::FinalDigestFileOpened
+                | GitHookPointV1::FinalDigestOpened
+                | GitHookPointV1::FinalDigestHashed,
+                _,
+            ),
+        ) => FailureOnlyV1 {
+            census: OwedV1::Never,
+            ..all
+        },
+        (
+            BracketV1::Settlement,
+            SiteV1::Mount | SiteV1::Call(GitHookPointV1::FinalSourceStatted, _),
+        ) => FailureOnlyV1 {
+            mounts: false,
+            census: OwedV1::Never,
+            digests: OwedV1::Never,
+            ..all
+        },
+        (BracketV1::Settlement, SiteV1::Call(GitHookPointV1::FinalStagingChecked, _)) => {
+            FailureOnlyV1 {
+                mounts: false,
+                census: OwedV1::Never,
+                digests: OwedV1::Never,
+                sources: OwedV1::Never,
+                ..all
+            }
+        }
+        other => panic!("no reconciliation is owed after a slow call at {other:?}"),
     }
 }
 
 /// Judges what followed a slow call that returned after the deadline (`after` starts right after it). The ONLY
 /// event allowed before the reconciliation is the guard that read the clock (a bounded digest read reads it
-/// itself, unlogged); the reconciliation itself reads no
-/// clock, begins and resumes no child, runs the mount census exactly once, the exact tree at most once, and each
-/// retained chain at most once, and (for a clean tree and clean chains) runs each class to its end. Returns every
-/// problem found.
+/// itself, unlogged); the reconciliation itself reads no clock and begins and resumes no child. Each class of
+/// observation is owed exactly as `scope` says, by unit (see [`OwedV1`]): the mount census once or not at all,
+/// the census of the tree once, early (its own fault), or not at all, the digest of every restored file, the
+/// admitted bootstrap files, and the staging chains likewise. Returns every problem found.
 fn failure_only_reconciliation(
     after: &[SeenV1],
     clean: &FinalShapeV1,
@@ -28086,7 +28238,7 @@ fn failure_only_reconciliation(
         // A bounded digest read keeps its own clock and reads it with no logged guard: the reconciliation's first
         // event (the mount census, which is owed whenever this scope applies) then follows the slow call itself,
         // and a read that went on would have announced itself through its own hook first.
-        Some((SeenV1::Mount, _)) if scope.gates => after,
+        Some((SeenV1::Mount, _)) if scope.mounts => after,
         None => {
             return vec![
                 "nothing followed the slow call: no failure-only reconciliation ran".to_owned(),
@@ -28122,50 +28274,46 @@ fn failure_only_reconciliation(
         judged.push(format!("a child began or resumed: {reconcile:?}"));
     }
     let mounts = count(&|seen| matches!(seen, SeenV1::Mount));
-    let want_mounts = usize::from(scope.gates);
+    let want_mounts = usize::from(scope.mounts);
     if mounts != want_mounts {
         judged.push(format!("{mounts} mount censuses, {want_mounts} owed"));
     }
     let one_census = 1 + clean.tree_dirs;
     let stats = count(&|seen| matches!(seen, SeenV1::Hook(GitHookPointV1::FinalCensusStatted)));
-    if scope.census_complete {
-        if stats != one_census {
-            judged.push(format!(
-                "{stats} directory censuses, exactly {one_census} owed"
-            ));
-        }
-    } else if stats == 0 || stats > one_census {
-        judged.push(format!("{stats} directory censuses, one at most owed"));
-    }
     let files = clean.object_files + clean.metadata_files;
     let digests =
         count(&|seen| matches!(seen, SeenV1::Hook(GitHookPointV1::FinalDigestFileOpened)));
-    if scope.digests_complete {
-        if digests != files {
-            judged.push(format!("{digests} digests, exactly {files} owed"));
-        }
-    } else if digests > files {
-        judged.push(format!("{digests} digests, {files} at most owed"));
-    }
     let sources = count(&|seen| matches!(seen, SeenV1::Hook(GitHookPointV1::FinalSourceStatted)));
     let staging = count(&|seen| matches!(seen, SeenV1::Hook(GitHookPointV1::FinalStagingChecked)));
-    if !scope.gates {
-        if sources != 0 || staging != 0 {
-            judged.push(format!(
-                "{sources} source and {staging} staging rechecks, none owed"
-            ));
+    // (class, found, exactly-once count)
+    for (class, found, whole, owed) in [
+        ("directory censuses", stats, one_census, scope.census),
+        ("digests", digests, files, scope.digests),
+        (
+            "admitted-file rechecks",
+            sources,
+            clean.object_files,
+            scope.sources,
+        ),
+    ] {
+        let wrong = match owed {
+            OwedV1::Once => found != whole,
+            OwedV1::Never => found != 0,
+            OwedV1::Early => found == 0 || found > whole,
+        };
+        if wrong {
+            judged.push(format!("{found} {class}, {owed:?} of {whole} owed"));
         }
-    } else if scope.chains_complete {
-        if sources != clean.object_files || staging == 0 {
-            judged.push(format!(
-                "{sources} source rechecks (exactly {} owed) and {staging} staging rechecks (some owed)",
-                clean.object_files
-            ));
-        }
-    } else if sources > clean.object_files {
+    }
+    let wrong = match scope.staging {
+        OwedV1::Once => staging == 0,
+        OwedV1::Never => staging != 0,
+        OwedV1::Early => false,
+    };
+    if wrong {
         judged.push(format!(
-            "{sources} source rechecks, {} at most owed",
-            clean.object_files
+            "{staging} staging rechecks, {:?} owed",
+            scope.staging
         ));
     }
     judged
@@ -28189,8 +28337,13 @@ enum ReconciledV1 {
     /// tree is owed beside the primary, and the gate's own single mount census and single chain sweep are the
     /// only ones that follow the child.
     TreeAfterTheGate,
-    /// No failure was known, so nothing but the settlement's own paced calls followed the slow call.
-    NotAtAll,
+    /// A settlement that had headroom found a custody finding of its own (the first paced finding is the
+    /// primary), which makes the failure known: its census had already run to that verdict, so it is not
+    /// observed again, and every other observation still owed (the mount census, the digest of every restored
+    /// file by its retained descriptor, and every retained chain) is made exactly once, as the paced settlement
+    /// itself never reached them (design follow-on 1; the control that used to require no reconciliation here
+    /// asserted the defect).
+    AfterPacedFinding,
 }
 
 /// One row: the final `fsck` child runs `shell` (or delegates), the failure becomes known `when`, and the run
@@ -28415,22 +28568,44 @@ fn known_row(capsule: &CustomCapsuleV1, clean: &FinalShapeV1, row: &KnownRowV1) 
                 ));
             }
         }
-        ReconciledV1::NotAtAll => {
-            let ran_a_reconciliation = after.iter().any(|seen| {
+        ReconciledV1::AfterPacedFinding => {
+            let count =
+                |wanted: &dyn Fn(&SeenV1) -> bool| after.iter().filter(|seen| wanted(seen)).count();
+            let mounts = count(&|seen| matches!(seen, SeenV1::Mount));
+            if mounts != 1 {
+                judged.push(format!(
+                    "{mounts} mount censuses, the one completion's owed (the paced settlement never reached its gate)"
+                ));
+            }
+            let digests =
+                count(&|seen| matches!(seen, SeenV1::Hook(GitHookPointV1::FinalDigestFileOpened)));
+            let files = clean.object_files + clean.metadata_files;
+            if digests != files {
+                judged.push(format!(
+                    "{digests} digests, exactly {files} owed (the paced settlement never reached its digests)"
+                ));
+            }
+            let sources =
+                count(&|seen| matches!(seen, SeenV1::Hook(GitHookPointV1::FinalSourceStatted)));
+            let staging =
+                count(&|seen| matches!(seen, SeenV1::Hook(GitHookPointV1::FinalStagingChecked)));
+            if sources != clean.object_files || staging == 0 {
+                judged.push(format!(
+                    "{sources} source rechecks (exactly {} owed) and {staging} staging rechecks (some owed)",
+                    clean.object_files
+                ));
+            }
+            if after.iter().any(|seen| {
                 matches!(
                     seen,
-                    SeenV1::Mount
-                        | SeenV1::Hook(
-                            GitHookPointV1::FinalDigestFileOpened
-                                | GitHookPointV1::FinalSourceStatted
-                                | GitHookPointV1::FinalStagingChecked
-                        )
+                    SeenV1::Hook(
+                        GitHookPointV1::AfterFinalChild
+                            | GitHookPointV1::BeforeFinalChild
+                            | GitHookPointV1::BeforeFinalChildCensus
+                    )
                 )
-            });
-            if ran_a_reconciliation {
-                judged.push(format!(
-                    "a reconciliation ran without a known failure: {after:?}"
-                ));
+            }) {
+                judged.push(format!("a child began or resumed: {after:?}"));
             }
         }
     }
@@ -28486,13 +28661,12 @@ fn known_problems(rows: Vec<KnownRowV1>) -> Vec<String> {
 #[test]
 fn b2c_a_timed_out_final_child_is_reconciled_once_beside_every_retained_chain_and_mount_it_left_owed(
 ) {
-    let chain_fails = FailureOnlyV1 {
-        chains_complete: false,
-        ..FailureOnlyV1::complete()
-    };
+    // Design follow-on 1: the units of one class are independent, so a failing chain edge never stops the next
+    // edge, and the census of the tree stopping at its own first fault never stops the digests (they read the
+    // retained descriptors) or the chains: only the census itself can stop early.
+    let chain_fails = FailureOnlyV1::complete();
     let tree_fails = FailureOnlyV1 {
-        census_complete: false,
-        digests_complete: false,
+        census: OwedV1::Early,
         ..FailureOnlyV1::complete()
     };
     let timed_out =
@@ -28565,12 +28739,8 @@ fn b2c_a_timed_out_final_child_is_reconciled_once_beside_every_retained_chain_an
                             is_identity_changed,
                         ))
             },
-            FailureOnlyV1 {
-                census_complete: false,
-                digests_complete: false,
-                chains_complete: false,
-                ..FailureOnlyV1::complete()
-            },
+            // The census stops at the stray; the digests and every chain edge are still owed in full.
+            tree_fails,
         ),
         timed_out(
             "a timed-out child that left nothing is the bare timeout",
@@ -28593,12 +28763,7 @@ fn b2c_a_timed_out_final_child_is_reconciled_once_beside_every_retained_chain_an
                 matches!(e, GitBootstrapErrorV1::ChildAndReconcile { primary, reconcile }
                     if is_timeout(primary) && combined_with(reconcile, symlink_refused, symlink_refused))
             },
-            FailureOnlyV1 {
-                census_complete: false,
-                digests_complete: false,
-                chains_complete: false,
-                ..FailureOnlyV1::complete()
-            },
+            tree_fails,
         ),
     ];
     let problems = known_problems(rows);
@@ -28639,9 +28804,9 @@ fn b2c_a_successful_final_child_whose_settlement_returns_late_is_reconciled_once
                     tree_fault(r, FinalTreeFaultV1::Unexpected)
                 })
             },
+            // The late call is in the census, which stops at the entry; every other class is owed in full.
             FailureOnlyV1 {
-                census_complete: false,
-                digests_complete: false,
+                census: OwedV1::Early,
                 ..FailureOnlyV1::complete()
             },
         ),
@@ -28651,8 +28816,11 @@ fn b2c_a_successful_final_child_whose_settlement_returns_late_is_reconciled_once
             GitHookPointV1::FinalDigestFileOpened,
             true,
             |e| combined_with(e, is_timeout, |r| tree_fault(r, FinalTreeFaultV1::Bytes)),
+            // The late call is the first digest's: the settlement's census and its comparison had already run to
+            // their verdict (clean), so they are not observed again; every digest is owed, by its retained
+            // descriptor, and so are the mount census and every chain.
             FailureOnlyV1 {
-                digests_complete: false,
+                census: OwedV1::Never,
                 ..FailureOnlyV1::complete()
             },
         ),
@@ -28669,13 +28837,17 @@ fn b2c_a_successful_final_child_whose_settlement_returns_late_is_reconciled_once
     assert!(problems.is_empty(), "{}", problems.join("\n"));
 }
 
-/// The negative controls of the two rows above, against the same fixture: a failure whose gate class was already
-/// examined is reconciled for the TREE only (the post-exit gate that ran to a verdict is the finding, and re-running
-/// it would only repeat it): a child that failed with a nonzero status and left nothing, and a child that swapped a
-/// retained bootstrap directory and exited normally (its own post-exit gate refuses with the identity change) each
-/// show the gate's own single mount census and single chain sweep and the tree once, nothing more; and the SAME
-/// slow settlement call, slow but returning WITH headroom, is no timeout and no known failure at all: the paced
-/// settlement measures the added entry itself and refuses it ALONE, and no reconciliation of any class runs.
+/// The controls of the two rows above, against the same fixture. A failure whose post-exit gate ran to its end is
+/// reconciled for the TREE only, and a gate that refused part way is never observed again for the units it ran:
+/// a child that failed with a nonzero status and left nothing, and a child that swapped a retained bootstrap
+/// directory and exited normally (its own post-exit gate refuses at that directory, after the mount census and
+/// every admitted file and staging chain it had already run to a verdict, and only the units after the refusing one
+/// are owed, of which none finds anything) each show the gate's own single mount census and single sweep of the
+/// admitted files and the tree once, nothing more. And the SAME slow settlement call, slow but returning WITH
+/// headroom, is no timeout: the paced settlement measures the added entry itself and that custody finding is the
+/// primary (design follow-on 1: it used to be returned ALONE, which hid every observation still owed), and the
+/// observations it never reached (the mount census, the digest of every restored file, and every retained chain)
+/// are made exactly once, finding nothing more here, so the entry is reported alone, with no clock and no child.
 #[test]
 fn b2c_a_known_failure_whose_gate_already_ran_is_reconciled_for_the_tree_only_and_a_headroom_call_for_none(
 ) {
@@ -28703,7 +28875,7 @@ fn b2c_a_known_failure_whose_gate_already_ran_is_reconciled_for_the_tree_only_an
             recorded: 2,
         },
         KnownRowV1 {
-            name: "the same slow settlement call with headroom: the paced settlement refuses the entry alone",
+            name: "the same slow settlement call with headroom: the paced settlement's own finding is the primary and everything still owed is observed once",
             shell: Some("\"$REAL\" \"$@\"; : > .git/stray"),
             when: KnownWhenV1::SlowSettlement(
                 GitHookPointV1::FinalCensusStatted,
@@ -28712,13 +28884,938 @@ fn b2c_a_known_failure_whose_gate_already_ran_is_reconciled_for_the_tree_only_an
             timed_out: false,
             stalled: false,
             mount_after_exit: false,
+            // Nothing else was left behind, so the observations that are still owed find nothing: the entry is
+            // reported alone, but they ran (see `ReconciledV1::AfterPacedFinding`).
             cause: |e| tree_fault(e, FinalTreeFaultV1::Unexpected),
-            reconciled: ReconciledV1::NotAtAll,
+            reconciled: ReconciledV1::AfterPacedFinding,
             recorded: 3,
         },
     ];
     let problems = known_problems(rows);
     assert!(problems.is_empty(), "{}", problems.join("\n"));
+}
+
+// ---------------------------------------------------------------------------------------------
+// Design follow-on 1: every owed observation of a known failure is made, independently, once
+//
+// The design pass (1/1, SHA-256 e932e69c…) found that a failure that is already known (or becomes known inside the
+// paced settlement) still let ONE failing observation suppress the independent evidence of another: a census fault
+// hid the bytes of a rewritten file, a callback refusal erased a drifted binary, a refused mount census was
+// treated as a completed gate, a non-timeout paced finding was returned alone, a first bad file or chain edge
+// stopped the rest, and the failure-only digest retried `Interrupted` without bound. These rows drive the REAL
+// wrapper over REAL Git with a routed final `fsck` child and the real runner (and, for a detached helper's effect
+// during the settlement, the hooks that already stand behind each call), with the typed failures a row expects
+// listed IN ORDER: the primary, then the callback's refusal, the mount census, the census of the tree, the digest
+// of each restored file by path, each retained chain in custody order, and the destination root LAST.
+// ---------------------------------------------------------------------------------------------
+
+/// One typed failure a row expects, by what it is (never by its text alone).
+#[derive(Clone, Debug)]
+enum ExpectedFailureV1 {
+    Timeout,
+    Drift,
+    Child(&'static str, i32),
+    Tree(FinalTreeFaultV1, &'static str),
+    /// An identity refusal whose detail names this (a path, or the root).
+    Identity(&'static str),
+    Mount,
+    /// An I/O refusal whose detail names this file.
+    Io(&'static str),
+}
+
+impl ExpectedFailureV1 {
+    fn is(&self, error: &GitBootstrapErrorV1) -> bool {
+        match self {
+            Self::Timeout => is_timeout(error),
+            Self::Drift => is_binary_drift(error),
+            Self::Child(command, status) => is_git_child(error, command, *status),
+            Self::Tree(fault, name) => matches!(
+                error,
+                GitBootstrapErrorV1::FinalTree { fault: found, name: named }
+                    if found == fault && named.as_str() == *name
+            ),
+            Self::Identity(needle) => matches!(
+                error,
+                GitBootstrapErrorV1::Restore(CustodyRestoreErrorV1::IdentityChanged(detail))
+                    if detail.contains(needle)
+            ),
+            Self::Mount => matches!(
+                error,
+                GitBootstrapErrorV1::Restore(CustodyRestoreErrorV1::MountBoundary(_))
+            ),
+            Self::Io(needle) => matches!(
+                error,
+                GitBootstrapErrorV1::Restore(CustodyRestoreErrorV1::Io(detail))
+                    if detail.contains(needle)
+            ),
+        }
+    }
+}
+
+/// Every typed failure a (possibly nested) `ChildAndReconcile` holds, the primary first, in order.
+fn leaves(error: &GitBootstrapErrorV1) -> Vec<&GitBootstrapErrorV1> {
+    match error {
+        GitBootstrapErrorV1::ChildAndReconcile { primary, reconcile } => {
+            let mut all = leaves(primary);
+            all.extend(leaves(reconcile));
+            all
+        }
+        other => vec![other],
+    }
+}
+
+/// How the mount census answers once the final child has exited.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MountsAfterV1 {
+    Quiet,
+    /// A mount appears inside the destination.
+    Appears,
+    /// The census cannot list the mount points (it fails closed).
+    Fails,
+}
+
+/// What was observed from a moment on, by kind.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct CountsV1 {
+    mounts: usize,
+    sources: usize,
+    stats: usize,
+    digests: usize,
+}
+
+/// The counts a row holds exactly (`None`: not judged).
+#[derive(Clone, Copy, Debug, Default)]
+struct CountsExpectedFailureV1 {
+    mounts: Option<usize>,
+    sources: Option<usize>,
+    stats: Option<usize>,
+    digests: Option<usize>,
+}
+
+/// A change made to the destination, given the destination root and an outside directory.
+type ActV1 = fn(&Path, &Path);
+/// The shell the final `fsck --strict` child runs, given the destination root and an outside directory.
+type ShellV1 = fn(&Path, &Path) -> String;
+
+struct OwedRowV1 {
+    name: &'static str,
+    /// The final child's shell (`None`: the recorder runs the real child, which succeeds).
+    shell: Option<ShellV1>,
+    /// The child overruns the one deadline (it sleeps), so the runner times it out.
+    timed_out: bool,
+    /// Every census clock is reported as never having advanced (only a digest can see an in-place write).
+    stalled: bool,
+    mounts: MountsAfterV1,
+    /// A change made as the child's pre-spawn callback begins.
+    pre_spawn: Option<ActV1>,
+    /// A detached helper's effect, made at the first call of the census after the child exited.
+    helper: Option<ActV1>,
+    /// Count from the pre-spawn callback of the final child (`true`) or from its post-exit callback.
+    count_from_pre_spawn: bool,
+    /// The typed failures, in order, the primary first.
+    want: Vec<ExpectedFailureV1>,
+    /// Every child that had started (`6` of pass A, then the final ones).
+    children: usize,
+    /// The final proofs that had returned.
+    recorded: usize,
+    counts: CountsExpectedFailureV1,
+}
+
+impl OwedRowV1 {
+    fn new(name: &'static str, want: Vec<ExpectedFailureV1>) -> Self {
+        Self {
+            name,
+            shell: None,
+            timed_out: false,
+            stalled: false,
+            mounts: MountsAfterV1::Quiet,
+            pre_spawn: None,
+            helper: None,
+            count_from_pre_spawn: false,
+            want,
+            children: 9,
+            recorded: 3,
+            counts: CountsExpectedFailureV1::default(),
+        }
+    }
+}
+
+/// The final `fsck --strict` child's `shell`, with the destination and an outside directory.
+fn fsck_shell(shell: fn(&Path, &Path) -> String) -> Option<fn(&Path, &Path) -> String> {
+    Some(shell)
+}
+
+/// Runs one row and returns every problem found (and prints its verdict, so a green row is as visible as a red
+/// one).
+fn owed_row(capsule: &CustomCapsuleV1, clean: &FinalShapeV1, row: &OwedRowV1) -> Vec<String> {
+    use std::cell::Cell;
+    use std::rc::Rc;
+    let name = row.name;
+    let input = PlaneInV1::rich(capsule, CustodyGitObjectFormatV1::Sha1);
+    let root = input.dest.path.clone();
+    let (_area, outside) = external_dir_with(&["decoy"]);
+    let deadline = if row.timed_out {
+        Instant::now() + B2C_DEADLINE_V1
+    } else {
+        far_deadline()
+    };
+    let counting = Rc::new(Cell::new(false));
+    let exited = Rc::new(Cell::new(false));
+    let helped = Rc::new(Cell::new(false));
+    let counts = Rc::new(Cell::new(CountsV1::default()));
+    let mut hooks = Vec::new();
+    {
+        let (counting, root, outside) = (counting.clone(), root.clone(), outside.clone());
+        let (pre_spawn, from_pre_spawn) = (row.pre_spawn, row.count_from_pre_spawn);
+        hooks.push(install_git_hook_for_test(
+            GitHookPointV1::BeforeFinalChild,
+            move |event| {
+                if event.label != "fsck --strict" {
+                    return;
+                }
+                if from_pre_spawn {
+                    counting.set(true);
+                }
+                if let Some(act) = pre_spawn {
+                    act(&root, &outside);
+                }
+            },
+        ));
+    }
+    {
+        let (counting, exited) = (counting.clone(), exited.clone());
+        let from_pre_spawn = row.count_from_pre_spawn;
+        hooks.push(install_git_hook_for_test(
+            GitHookPointV1::AfterFinalChild,
+            move |event| {
+                if event.label == "fsck --strict" {
+                    exited.set(true);
+                    if !from_pre_spawn {
+                        counting.set(true);
+                    }
+                }
+            },
+        ));
+    }
+    for point in [
+        GitHookPointV1::FinalCensusStatted,
+        GitHookPointV1::FinalSourceStatted,
+        GitHookPointV1::FinalDigestFileOpened,
+    ] {
+        let (counting, counts, exited, helped) = (
+            counting.clone(),
+            counts.clone(),
+            exited.clone(),
+            helped.clone(),
+        );
+        let (root, outside, helper) = (root.clone(), outside.clone(), row.helper);
+        hooks.push(install_git_hook_for_test(point, move |_| {
+            if !counting.get() {
+                return;
+            }
+            let mut seen = counts.get();
+            match point {
+                GitHookPointV1::FinalCensusStatted => {
+                    seen.stats += 1;
+                    if exited.get() && !helped.get() {
+                        helped.set(true);
+                        if let Some(act) = helper {
+                            act(&root, &outside);
+                        }
+                    }
+                }
+                GitHookPointV1::FinalSourceStatted => seen.sources += 1,
+                _ => seen.digests += 1,
+            }
+            counts.set(seen);
+        }));
+    }
+    let census = {
+        let (counting, counts, exited) = (counting.clone(), counts.clone(), exited.clone());
+        let (mode, inside) = (row.mounts, mount_inside(&root));
+        crate::custody_mounts::seam::install(Box::new(move |_| {
+            if counting.get() {
+                let mut seen = counts.get();
+                seen.mounts += 1;
+                counts.set(seen);
+            }
+            match (mode, exited.get()) {
+                (MountsAfterV1::Appears, true) => Ok(vec![b"/".to_vec(), inside.clone()]),
+                (MountsAfterV1::Fails, true) => {
+                    Err(crate::custody_mounts::CustodyMountErrorV1::MalformedLine { line: 1 })
+                }
+                _ => Ok(vec![b"/".to_vec()]),
+            }
+        }))
+    };
+    let _clocks = row
+        .stalled
+        .then(|| stall_census_clocks_for_test(BOTH_CLOCKS_V1));
+    let body = row.shell.map(|shell| final_only(&shell(&root, &outside)));
+    let route = match &body {
+        Some(body) => RouteV1::new(&[("fsck --strict", body.as_str())]),
+        None => RouteV1::recorder(),
+    };
+    let ran = run_plane(input, &route, deadline);
+    drop(hooks);
+    drop(census);
+    let Err(failure) = &ran.outcome else {
+        let seen = format!("{name}: a success");
+        println!("OWED-ROW {seen}");
+        return vec![seen];
+    };
+    let held = leaves(&failure.cause);
+    let mut judged = Vec::new();
+    if held.len() != row.want.len()
+        || !held
+            .iter()
+            .zip(&row.want)
+            .all(|(error, want)| want.is(error))
+    {
+        judged.push(format!(
+            "the typed failures were {held:?}, wanted {:?}",
+            row.want
+        ));
+    }
+    if route.children().len() != row.children {
+        judged.push(format!("children {:?}", route.children()));
+    }
+    if failure.partial.final_runs.len() != row.recorded {
+        judged.push(format!(
+            "{} proofs, {} had returned",
+            failure.partial.final_runs.len(),
+            row.recorded
+        ));
+    }
+    if failure.last_completed != Some(GitPlaneStepV1::Config)
+        || !failure.active_materialization_began
+    {
+        judged.push(format!("completed {:?}", failure.last_completed));
+    }
+    if failure.ledger_used != clean.ledger {
+        judged.push(format!(
+            "ledger {} not {}",
+            failure.ledger_used, clean.ledger
+        ));
+    }
+    let seen = counts.get();
+    for (what, got, want) in [
+        ("mount censuses", seen.mounts, row.counts.mounts),
+        ("admitted-file rechecks", seen.sources, row.counts.sources),
+        ("directory censuses", seen.stats, row.counts.stats),
+        ("digests", seen.digests, row.counts.digests),
+    ] {
+        if let Some(want) = want {
+            if got != want {
+                judged.push(format!("{got} {what}, exactly {want} owed"));
+            }
+        }
+    }
+    println!(
+        "OWED-ROW {name}: {}",
+        if judged.is_empty() {
+            "ok".to_owned()
+        } else {
+            judged.join("; ")
+        }
+    );
+    if judged.is_empty() {
+        Vec::new()
+    } else {
+        vec![format!("{name}: {}", judged.join("; "))]
+    }
+}
+
+/// Runs the rows of one test, a few threads at a time (each row installs its own hooks and census seam in its own
+/// thread), and returns every problem.
+fn owed_problems(rows: Vec<OwedRowV1>) -> Vec<String> {
+    let capsule = captured(CustodyGitObjectFormatV1::Sha1);
+    let clean = clean_final_shape(&capsule, CustodyGitObjectFormatV1::Sha1, true);
+    std::thread::scope(|scope| {
+        let mut all = Vec::new();
+        for chunk in rows.chunks(8) {
+            let handles: Vec<_> = chunk
+                .iter()
+                .map(|row| {
+                    let (capsule, clean) = (&capsule, &clean);
+                    scope.spawn(move || owed_row(capsule, clean, row))
+                })
+                .collect();
+            for handle in handles {
+                all.extend(handle.join().expect("an owed-observation row's thread"));
+            }
+        }
+        all
+    })
+}
+
+/// What the Git directory's HEAD and ORIG_HEAD look like to an in-place, same-length rewrite.
+const REWRITE_HEAD_V1: &str = "printf X | dd of=.git/HEAD bs=1 seek=10 conv=notrunc 2>/dev/null";
+const REWRITE_ORIG_HEAD_V1: &str =
+    "printf X | dd of=.git/ORIG_HEAD bs=1 seek=10 conv=notrunc 2>/dev/null";
+
+/// REGRESSION 1 (design finding 1). A final `fsck` adds `.git/0stray`, rewrites HEAD in place at the same
+/// length, and fails. The census refuses the stray, but that must not hide the bytes: the rewritten file's own
+/// retained descriptor still shows them, so the run names the child's failure, the unexpected entry, and the
+/// changed bytes, in that order, and nothing else (the post-exit gate that ran to its end is not repeated).
+#[test]
+fn b2c_a_failed_final_child_that_added_an_entry_and_rewrote_head_reports_both_the_entry_and_the_bytes(
+) {
+    let capsule = captured(CustodyGitObjectFormatV1::Sha1);
+    let clean = clean_final_shape(&capsule, CustodyGitObjectFormatV1::Sha1, true);
+    let files = clean.object_files + clean.metadata_files;
+    let row = OwedRowV1 {
+        shell: fsck_shell(|_, _| {
+            format!("\"$REAL\" \"$@\"; : > .git/0stray; {REWRITE_HEAD_V1}; exit 1")
+        }),
+        counts: CountsExpectedFailureV1 {
+            mounts: Some(1),
+            sources: Some(clean.object_files),
+            digests: Some(files),
+            ..CountsExpectedFailureV1::default()
+        },
+        ..OwedRowV1::new(
+            "a failed child added an entry and rewrote HEAD in place",
+            vec![
+                ExpectedFailureV1::Child("fsck --strict", 1),
+                ExpectedFailureV1::Tree(FinalTreeFaultV1::Unexpected, "0stray"),
+                ExpectedFailureV1::Tree(FinalTreeFaultV1::Bytes, "HEAD"),
+            ],
+        )
+    };
+    let problems = owed_problems(vec![row]);
+    assert!(problems.is_empty(), "{}", problems.join("\n"));
+}
+
+/// REGRESSION 2 (design finding 1, with the runner's timeout). The same effects, and the child overruns the one
+/// deadline: the typed timeout is the primary, and BOTH observations follow it (the mount census and every
+/// retained chain, owed because no gate saw this child, find nothing).
+#[test]
+fn b2c_a_timed_out_final_child_that_added_an_entry_and_rewrote_head_reports_the_timeout_beside_both(
+) {
+    let capsule = captured(CustodyGitObjectFormatV1::Sha1);
+    let clean = clean_final_shape(&capsule, CustodyGitObjectFormatV1::Sha1, true);
+    let files = clean.object_files + clean.metadata_files;
+    let row = OwedRowV1 {
+        shell: fsck_shell(|_, _| format!(": > .git/0stray; {REWRITE_HEAD_V1}; sleep 30")),
+        timed_out: true,
+        recorded: 2,
+        counts: CountsExpectedFailureV1 {
+            mounts: Some(1),
+            sources: Some(clean.object_files),
+            digests: Some(files),
+            ..CountsExpectedFailureV1::default()
+        },
+        ..OwedRowV1::new(
+            "a timed-out child added an entry and rewrote HEAD in place",
+            vec![
+                ExpectedFailureV1::Timeout,
+                ExpectedFailureV1::Tree(FinalTreeFaultV1::Unexpected, "0stray"),
+                ExpectedFailureV1::Tree(FinalTreeFaultV1::Bytes, "HEAD"),
+            ],
+        )
+    };
+    let problems = owed_problems(vec![row]);
+    assert!(problems.is_empty(), "{}", problems.join("\n"));
+}
+
+/// REGRESSION 3 (design finding 2). A final child that mutates `$0` (the Git route) and swaps a retained
+/// bootstrap directory: the runner evaluates BOTH the drift and the post-exit callback, and drift dominates, so
+/// the primary is `BinaryDrift` and the callback's identity refusal is named beside it (it used to REPLACE it).
+/// The same drift beside a callback that found the deadline spent keeps both too, and a drift whose callback
+/// passed stays bare (the control).
+#[test]
+fn b2c_a_drifted_binary_stays_the_primary_beside_the_callback_refusal_and_what_the_child_left() {
+    let capsule = captured(CustodyGitObjectFormatV1::Sha1);
+    let clean = clean_final_shape(&capsule, CustodyGitObjectFormatV1::Sha1, true);
+    let files = clean.object_files + clean.metadata_files;
+    let rows = vec![
+        OwedRowV1 {
+            shell: fsck_shell(|_, outside| {
+                format!(
+                    "\"$REAL\" \"$@\"; chmod u+w \"$0\"; echo '# drift' >> \"$0\"; mv ../.restore-work/git-bootstrap/objects {o}/objects-away; mkdir ../.restore-work/git-bootstrap/objects",
+                    o = outside.display()
+                )
+            }),
+            recorded: 2,
+            counts: CountsExpectedFailureV1 {
+                // The gate's own census and its admitted-file rechecks (before the refusing directory), once.
+                mounts: Some(1),
+                sources: Some(clean.object_files),
+                digests: Some(files),
+                ..CountsExpectedFailureV1::default()
+            },
+            ..OwedRowV1::new(
+                "a drifted binary beside a swapped retained bootstrap directory",
+                vec![
+                    ExpectedFailureV1::Drift,
+                    ExpectedFailureV1::Identity("git-bootstrap/objects"),
+                ],
+            )
+        },
+        OwedRowV1 {
+            shell: fsck_shell(|_, _| {
+                "chmod u+w \"$0\"; echo '# drift' >> \"$0\"; sleep 30".to_owned()
+            }),
+            timed_out: true,
+            recorded: 2,
+            counts: CountsExpectedFailureV1 {
+                mounts: Some(1),
+                sources: Some(clean.object_files),
+                digests: Some(files),
+                ..CountsExpectedFailureV1::default()
+            },
+            ..OwedRowV1::new(
+                "a drifted binary beside a callback that found the deadline spent",
+                vec![ExpectedFailureV1::Drift, ExpectedFailureV1::Timeout],
+            )
+        },
+        // Control: the drift alone, its post-exit callback passed.
+        OwedRowV1 {
+            shell: fsck_shell(|_, _| format!("\"$REAL\" \"$@\"; {DRIFT_V1}")),
+            recorded: 2,
+            counts: CountsExpectedFailureV1 {
+                mounts: Some(1),
+                sources: Some(clean.object_files),
+                stats: Some(1 + clean.tree_dirs),
+                digests: Some(files),
+            },
+            ..OwedRowV1::new("a drifted binary alone", vec![ExpectedFailureV1::Drift])
+        },
+    ];
+    let problems = owed_problems(rows);
+    assert!(problems.is_empty(), "{}", problems.join("\n"));
+}
+
+/// REGRESSION 4 (design finding 3). The post-exit gate is a fail-fast list, and a refused mount census is the
+/// first thing in it: it must not be treated as a completed gate. The child swaps a retained bootstrap directory
+/// while the census refuses (a mount appears, or the census cannot list the mount points), so BOTH typed
+/// failures are named: the census's refusal as the primary (the callback's), then the later chain's identity
+/// change, and the mount census is made exactly once (the gate's own; it is not owed again).
+#[test]
+fn b2c_a_refused_mount_census_in_a_callback_does_not_hide_a_later_retained_chain_failure() {
+    let capsule = captured(CustodyGitObjectFormatV1::Sha1);
+    let clean = clean_final_shape(&capsule, CustodyGitObjectFormatV1::Sha1, true);
+    let files = clean.object_files + clean.metadata_files;
+    let swapped = |_: &Path, outside: &Path| {
+        format!(
+            "\"$REAL\" \"$@\"; mv ../.restore-work/git-bootstrap/objects {o}/objects-away; mkdir ../.restore-work/git-bootstrap/objects",
+            o = outside.display()
+        )
+    };
+    let rows: Vec<OwedRowV1> = [
+        (
+            "a mount appeared as the child exited, beside a swapped bootstrap directory",
+            MountsAfterV1::Appears,
+        ),
+        (
+            "the mount census could not list the mount points, beside a swapped bootstrap directory",
+            MountsAfterV1::Fails,
+        ),
+    ]
+    .into_iter()
+    .map(|(name, mounts)| OwedRowV1 {
+        shell: fsck_shell(swapped),
+        mounts,
+        recorded: 2,
+        counts: CountsExpectedFailureV1 {
+            mounts: Some(1),
+            sources: Some(clean.object_files),
+            digests: Some(files),
+            ..CountsExpectedFailureV1::default()
+        },
+        ..OwedRowV1::new(
+            name,
+            vec![ExpectedFailureV1::Mount, ExpectedFailureV1::Identity("git-bootstrap/objects")],
+        )
+    })
+    .collect();
+    let problems = owed_problems(rows);
+    assert!(problems.is_empty(), "{}", problems.join("\n"));
+}
+
+/// REGRESSION 5 (design finding 4). A final child SUCCEEDS (its result and both callbacks are clean) and a
+/// detached helper changes the destination while the settlement runs: it adds `.git/0stray`, rewrites HEAD in
+/// place, and swaps a retained bootstrap directory. The paced settlement's census meets the stray first, and
+/// that custody finding is the primary; it must not be returned alone: the bytes, the swapped chain, and the
+/// mount census the paced settlement never reached are each observed once, in order, and the census that
+/// produced the primary is not observed again.
+#[test]
+fn b2c_a_successful_final_childs_settlement_finding_is_reported_beside_every_other_owed_observation(
+) {
+    let capsule = captured(CustodyGitObjectFormatV1::Sha1);
+    let clean = clean_final_shape(&capsule, CustodyGitObjectFormatV1::Sha1, true);
+    let files = clean.object_files + clean.metadata_files;
+    let row = OwedRowV1 {
+        helper: Some(|root, outside| {
+            std::fs::write(root.join("repository/.git/0stray"), b"").expect("a stray");
+            change_in_place(&root.join("repository/.git/HEAD"));
+            swap_directory(&root.join(".restore-work/git-bootstrap/objects"), outside);
+        }),
+        counts: CountsExpectedFailureV1 {
+            // The post-exit gate's own census and admitted-file rechecks, then the completion's (the settlement
+            // never reached its gate), and the digest of every file once.
+            mounts: Some(2),
+            sources: Some(2 * clean.object_files),
+            digests: Some(files),
+            ..CountsExpectedFailureV1::default()
+        },
+        ..OwedRowV1::new(
+            "a successful child's settlement meets an entry, changed bytes, and a swapped chain",
+            vec![
+                ExpectedFailureV1::Tree(FinalTreeFaultV1::Unexpected, "0stray"),
+                ExpectedFailureV1::Tree(FinalTreeFaultV1::Bytes, "HEAD"),
+                ExpectedFailureV1::Identity("git-bootstrap/objects"),
+            ],
+        )
+    };
+    let problems = owed_problems(vec![row]);
+    assert!(problems.is_empty(), "{}", problems.join("\n"));
+}
+
+/// REGRESSION 6 (design finding 5, digests). Two restored files are rewritten in place at the same length with
+/// every census clock stalled (so only a digest can see either), by a child that fails. BOTH are named, in
+/// relative-path order, and the evidence that every retained descriptor was attempted is that the digest ran
+/// once for every restored file (the first bad file used to stop the rest).
+#[test]
+fn b2c_two_restored_files_rewritten_in_place_are_both_reported_and_every_retained_descriptor_is_attempted(
+) {
+    let capsule = captured(CustodyGitObjectFormatV1::Sha1);
+    let clean = clean_final_shape(&capsule, CustodyGitObjectFormatV1::Sha1, true);
+    let files = clean.object_files + clean.metadata_files;
+    let row = OwedRowV1 {
+        shell: fsck_shell(|_, _| {
+            format!("\"$REAL\" \"$@\"; {REWRITE_HEAD_V1}; {REWRITE_ORIG_HEAD_V1}; exit 1")
+        }),
+        stalled: true,
+        counts: CountsExpectedFailureV1 {
+            mounts: Some(1),
+            sources: Some(clean.object_files),
+            stats: Some(1 + clean.tree_dirs),
+            digests: Some(files),
+        },
+        ..OwedRowV1::new(
+            "a failed child rewrote two restored files in place, every clock stalled",
+            vec![
+                ExpectedFailureV1::Child("fsck --strict", 1),
+                ExpectedFailureV1::Tree(FinalTreeFaultV1::Bytes, "HEAD"),
+                ExpectedFailureV1::Tree(FinalTreeFaultV1::Bytes, "ORIG_HEAD"),
+            ],
+        )
+    };
+    let problems = owed_problems(vec![row]);
+    assert!(problems.is_empty(), "{}", problems.join("\n"));
+}
+
+/// REGRESSION 7 (design finding 5, chains). Two retained chain entries (a staging directory and a bootstrap
+/// directory) and then the destination root are swapped. Every edge is its own unit: all three identity
+/// failures are named in custody order and the root is LAST, for a child the runner timed out (its gate never
+/// ran) and for a child whose post-exit gate refused at the first of them (the units it had run are not
+/// repeated, and the ones after it are still observed).
+#[test]
+fn b2c_two_swapped_retained_chain_entries_and_a_swapped_root_are_all_reported_with_the_root_last() {
+    let capsule = captured(CustodyGitObjectFormatV1::Sha1);
+    let clean = clean_final_shape(&capsule, CustodyGitObjectFormatV1::Sha1, true);
+    let files = clean.object_files + clean.metadata_files;
+    let identities = || {
+        vec![
+            ExpectedFailureV1::Identity("plain/control"),
+            ExpectedFailureV1::Identity("git-bootstrap/objects"),
+            ExpectedFailureV1::Identity("pinned scan root"),
+        ]
+    };
+    let rows = vec![
+        OwedRowV1 {
+            shell: fsck_shell(|root, outside| format!("{}; sleep 30", swaps_of(root, outside))),
+            timed_out: true,
+            recorded: 2,
+            counts: CountsExpectedFailureV1 {
+                mounts: Some(1),
+                sources: Some(clean.object_files),
+                digests: Some(files),
+                ..CountsExpectedFailureV1::default()
+            },
+            ..OwedRowV1::new(
+                "a timed-out child swapped two chain entries and the root",
+                [vec![ExpectedFailureV1::Timeout], identities()].concat(),
+            )
+        },
+        OwedRowV1 {
+            shell: fsck_shell(|root, outside| {
+                format!("\"$REAL\" \"$@\"; {}", swaps_of(root, outside))
+            }),
+            recorded: 2,
+            counts: CountsExpectedFailureV1 {
+                // The post-exit gate ran the census and the admitted-file rechecks before the first swapped
+                // entry (the staging chains come after the admitted files), and the units after it are the
+                // completion's: no census and no admitted-file recheck is repeated.
+                mounts: Some(1),
+                sources: Some(clean.object_files),
+                digests: Some(files),
+                ..CountsExpectedFailureV1::default()
+            },
+            ..OwedRowV1::new(
+                "a child exited after swapping two chain entries and the root",
+                identities(),
+            )
+        },
+    ];
+    let problems = owed_problems(rows);
+    assert!(problems.is_empty(), "{}", problems.join("\n"));
+}
+
+/// The destination root's and two retained entries' swaps, as one shell fragment.
+fn swaps_of(root: &Path, outside: &Path) -> String {
+    let o = outside.display();
+    format!(
+        "mv ../.restore-work/plain/control {o}/control-away; mkdir ../.restore-work/plain/control; mv ../.restore-work/git-bootstrap/objects {o}/objects-away; mkdir ../.restore-work/git-bootstrap/objects; mv {r} {o}/root-away; mkdir {r}",
+        r = root.display()
+    )
+}
+
+/// REGRESSION 8 (design finding 6). The failure-only digest of a child that already failed has no clock, so an
+/// `Interrupted` read must never be retried: it is ONE typed I/O refusal for that file, the later files are
+/// still observed, and the number of read calls is finite (the interrupted file is read once; every other file
+/// at most `length / buffer + 2` times). The injection is finite (64 interruptions), so the unrepaired retry
+/// ends and the test cannot hang.
+#[test]
+fn b2c_an_interrupted_failure_only_digest_read_is_one_typed_refusal_with_no_retry_and_a_finite_read_count(
+) {
+    let capsule = captured(CustodyGitObjectFormatV1::Sha1);
+    let input = PlaneInV1::rich(&capsule, CustodyGitObjectFormatV1::Sha1);
+    let watch = watch_reconcile_reads_for_test(Some(("HEAD", 64)));
+    let route = RouteV1::new(&[("fsck --strict", &final_only("\"$REAL\" \"$@\"; exit 1"))]);
+    let ran = run_plane(input, &route, far_deadline());
+    let calls = reconcile_read_calls_for_test();
+    drop(watch);
+    let failure = ran.failure("a failed child whose HEAD digest read is interrupted");
+    let held = leaves(&failure.cause);
+    let want = [
+        ExpectedFailureV1::Child("fsck --strict", 1),
+        ExpectedFailureV1::Io("HEAD"),
+    ];
+    let mut problems = Vec::new();
+    if held.len() != want.len() || !held.iter().zip(&want).all(|(error, want)| want.is(error)) {
+        problems.push(format!("the typed failures were {held:?}, wanted {want:?}"));
+    }
+    let git = stored(&ran.dest, "repository/.git");
+    let lengths: BTreeMap<String, u64> = snapshot(&git)
+        .into_iter()
+        .filter_map(|(name, bytes)| bytes.map(|bytes| (name, bytes.len() as u64)))
+        .collect();
+    if calls.keys().collect::<Vec<_>>() != lengths.keys().collect::<Vec<_>>() {
+        problems.push(format!("not every restored file was attempted: {calls:?}"));
+    }
+    if calls.get("HEAD") != Some(&1) {
+        problems.push(format!(
+            "the interrupted read was made {:?} times, never to be retried: {calls:?}",
+            calls.get("HEAD")
+        ));
+    }
+    for (file, length) in &lengths {
+        let bound = length / HASH_BUFFER_BYTES_V1 as u64 + 2;
+        let made = calls.get(file).copied().unwrap_or(0);
+        if made == 0 || u64::from(made) > bound {
+            problems.push(format!("{file}: {made} read calls, between 1 and {bound}"));
+        }
+    }
+    assert!(problems.is_empty(), "{}", problems.join("\n"));
+}
+
+/// CONTROLS of the eight rows above. (a) A pre-spawn callback refusal: the child never starts, no gate work is
+/// replayed (the one mount census and one sweep of the admitted files are the gate's own), and the tree is
+/// observed once. (b) A failed child whose post-exit gate ran to its end owes only the tree: the gate's own one
+/// mount census and one sweep are not repeated. (c) A clean timeout stays the bare timeout. (d) A name replaced by
+/// another inode holding DIFFERENT bytes of the same length is refused as a replacement and the replacement's
+/// bytes are never read: the original inode's retained descriptor is clean, so there is no byte finding.
+#[test]
+fn b2c_controls_a_refused_pre_spawn_gate_is_not_replayed_and_a_completed_post_exit_gate_is_not_repeated(
+) {
+    let capsule = captured(CustodyGitObjectFormatV1::Sha1);
+    let clean = clean_final_shape(&capsule, CustodyGitObjectFormatV1::Sha1, true);
+    let files = clean.object_files + clean.metadata_files;
+    let one_census = 1 + clean.tree_dirs;
+    let rows = vec![
+        OwedRowV1 {
+            pre_spawn: Some(|root, outside| {
+                swap_directory(&root.join(".restore-work/git-bootstrap/objects"), outside);
+            }),
+            count_from_pre_spawn: true,
+            children: 8,
+            recorded: 2,
+            counts: CountsExpectedFailureV1 {
+                mounts: Some(1),
+                sources: Some(clean.object_files),
+                stats: Some(one_census),
+                digests: Some(files),
+            },
+            ..OwedRowV1::new(
+                "(a) a pre-spawn callback refused a swapped bootstrap directory",
+                vec![ExpectedFailureV1::Identity("git-bootstrap/objects")],
+            )
+        },
+        OwedRowV1 {
+            shell: fsck_shell(|_, _| "\"$REAL\" \"$@\"; exit 1".to_owned()),
+            counts: CountsExpectedFailureV1 {
+                mounts: Some(1),
+                sources: Some(clean.object_files),
+                stats: Some(one_census),
+                digests: Some(files),
+            },
+            ..OwedRowV1::new(
+                "(b) a failed child that left nothing, its post-exit gate completed",
+                vec![ExpectedFailureV1::Child("fsck --strict", 1)],
+            )
+        },
+        OwedRowV1 {
+            shell: fsck_shell(|_, _| "sleep 30".to_owned()),
+            timed_out: true,
+            recorded: 2,
+            counts: CountsExpectedFailureV1 {
+                mounts: Some(1),
+                sources: Some(clean.object_files),
+                stats: Some(one_census),
+                digests: Some(files),
+            },
+            ..OwedRowV1::new(
+                "(c) a timed-out child that left nothing",
+                vec![ExpectedFailureV1::Timeout],
+            )
+        },
+        OwedRowV1 {
+            shell: fsck_shell(|_, _| {
+                "\"$REAL\" \"$@\"; cp .git/HEAD .git/HEAD.new; printf Y | dd of=.git/HEAD.new bs=1 seek=10 conv=notrunc 2>/dev/null; mv .git/HEAD.new .git/HEAD".to_owned()
+            }),
+            recorded: 2,
+            ..OwedRowV1::new(
+                "(d) HEAD replaced by another inode with different bytes of the same length",
+                vec![
+                    ExpectedFailureV1::Identity(".git/HEAD"),
+                    ExpectedFailureV1::Tree(FinalTreeFaultV1::Replaced, "HEAD"),
+                ],
+            )
+        },
+    ];
+    let problems = owed_problems(rows);
+    assert!(problems.is_empty(), "{}", problems.join("\n"));
+}
+
+/// EDGE CONTROLS of the failure-only digest, which observes one retained descriptor per file and never a name.
+/// (1) A retained file the child TRUNCATED is resized: the descriptor's own `fstat` says so, so it is one byte
+/// finding (the census names the same fault of the same file, reported once), its content is never read, and
+/// every other restored file is still observed. (2) A file that SHRINKS between the digest's binding and its read
+/// reads short and is the file's own typed byte finding; the digests of the other files still run.
+#[test]
+fn b2c_edge_a_resized_or_shrunk_retained_file_is_its_own_byte_finding_and_never_hides_the_others() {
+    let capsule = captured(CustodyGitObjectFormatV1::Sha1);
+    let clean = clean_final_shape(&capsule, CustodyGitObjectFormatV1::Sha1, true);
+    let files = clean.object_files + clean.metadata_files;
+    let mut problems = Vec::new();
+
+    // (1) The truncated HEAD, with the read calls counted.
+    let input = PlaneInV1::rich(&capsule, CustodyGitObjectFormatV1::Sha1);
+    let watch = watch_reconcile_reads_for_test(None);
+    let route = RouteV1::new(&[(
+        "fsck --strict",
+        &final_only("\"$REAL\" \"$@\"; : > .git/HEAD; exit 1"),
+    )]);
+    let ran = run_plane(input, &route, far_deadline());
+    let calls = reconcile_read_calls_for_test();
+    drop(watch);
+    let failure = ran.failure("a child truncated HEAD");
+    let held = leaves(&failure.cause);
+    let want = [
+        ExpectedFailureV1::Identity(".git/HEAD"),
+        ExpectedFailureV1::Tree(FinalTreeFaultV1::Bytes, "HEAD"),
+    ];
+    if held.len() != want.len() || !held.iter().zip(&want).all(|(error, want)| want.is(error)) {
+        problems.push(format!(
+            "(1) the typed failures were {held:?}, wanted {want:?}"
+        ));
+    }
+    if calls.contains_key("HEAD") {
+        problems.push(format!(
+            "(1) the truncated file's content was read: {calls:?}"
+        ));
+    }
+    if calls.len() != files - 1 {
+        problems.push(format!(
+            "(1) {} of the {} other restored files were observed: {calls:?}",
+            calls.len(),
+            files - 1
+        ));
+    }
+
+    // (2) HEAD shrinks after the digest bound its descriptor and before it read.
+    let input = PlaneInV1::rich(&capsule, CustodyGitObjectFormatV1::Sha1);
+    let started = std::rc::Rc::new(std::cell::Cell::new(false));
+    let digests = std::rc::Rc::new(std::cell::Cell::new(0_usize));
+    let shrunk = std::rc::Rc::new(std::cell::Cell::new(false));
+    let before = started.clone();
+    let _before = install_git_hook_for_test(GitHookPointV1::BeforeFinalChild, move |event| {
+        if event.label == "fsck --strict" {
+            before.set(true);
+        }
+    });
+    let (counting, counted) = (started.clone(), digests.clone());
+    let _opened = install_git_hook_for_test(GitHookPointV1::FinalDigestFileOpened, move |_| {
+        if counting.get() {
+            counted.set(counted.get() + 1);
+        }
+    });
+    let (armed, done) = (started.clone(), shrunk.clone());
+    let _shrink = install_git_hook_for_test(GitHookPointV1::FinalDigestOpened, move |event| {
+        if armed.get() && !done.get() {
+            done.set(true);
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(event.path)
+                .and_then(|file| file.set_len(5))
+                .expect("the digested file shrinks");
+        }
+    });
+    let route = RouteV1::new(&[("fsck --strict", &final_only("\"$REAL\" \"$@\"; exit 1"))]);
+    let ran = run_plane(input, &route, far_deadline());
+    let failure = ran.failure("a file shrank under its digest");
+    let held = leaves(&failure.cause);
+    let want = [
+        ExpectedFailureV1::Child("fsck --strict", 1),
+        ExpectedFailureV1::Tree(FinalTreeFaultV1::Bytes, "HEAD"),
+    ];
+    if !shrunk.get() {
+        problems.push("(2) the file never shrank".to_owned());
+    }
+    if held.len() != want.len() || !held.iter().zip(&want).all(|(error, want)| want.is(error)) {
+        problems.push(format!(
+            "(2) the typed failures were {held:?}, wanted {want:?}"
+        ));
+    }
+    if digests.get() != files {
+        problems.push(format!(
+            "(2) {} digests, every one of the {files} restored files owed one",
+            digests.get()
+        ));
+    }
+    assert!(problems.is_empty(), "{}", problems.join("\n"));
+}
+
+/// CONTROL: a clean, successful run never reads through the failure-only digest (it is entered only after a
+/// failure is known), and a failure whose digests all pass reads every restored file through it a finite,
+/// small number of times, with no interruption injected.
+#[test]
+fn b2c_controls_a_successful_run_never_uses_the_failure_only_digest() {
+    let capsule = captured(CustodyGitObjectFormatV1::Sha1);
+    let input = PlaneInV1::rich(&capsule, CustodyGitObjectFormatV1::Sha1);
+    let watch = watch_reconcile_reads_for_test(None);
+    let route = RouteV1::recorder();
+    let ran = run_plane(input, &route, far_deadline());
+    let calls = reconcile_read_calls_for_test();
+    drop(watch);
+    let _ = ran.success("a clean run");
+    assert!(
+        calls.is_empty(),
+        "a success read through the failure-only digest: {calls:?}"
+    );
 }
 
 /// The final database's refusals name the final database: a missing object in the final inventory is
