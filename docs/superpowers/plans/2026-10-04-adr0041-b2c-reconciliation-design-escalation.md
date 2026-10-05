@@ -1,10 +1,10 @@
 # ADR-0041 B2c reconciliation design escalation
 
-Status: owner APPROVED the bounded design review. One pass cap1/1 dispatched through Sol/xhigh in read-only mode; no implementation authorization inferred. Preserve the existing artifact. This is a design-review brief, not an adopted replacement contract.
+Status: owner-approved design pass1/1 COMPLETE, actual Sol/xhigh/read-only result READY. See [complete design and controller qualification](2026-10-05-adr0041-b2c-reconciliation-design-result.md). Implementation remains parked pending expanded repair-scope/cap approval. Preserve the existing artifact; the result is not source approval.
 
 Candidate `4b941d4b032cbd652accd5fb18a59e0cb12d258a`, parent `c4c60a60dfcbf1e04d0f4fe532d77233363aa82f`, whole-B2c base `dc0b45bafd3538c93fe15254bd9f975ad34f4c71`, remains isolated in `impl-70428-q52t65ks`. [Source review 4/4](../reviews/2026-10-04-adr0041-slice2b3b-b2c-source-round4.md) rejected three WRONGs and one nonblocking historical SMELL. Its classification is OPEN CLASS at the exhausted cap: successive repairs still reveal combinations in the same reconciliation family. The existing artifact is retained; no restart or fifth source round is admitted.
 
-The owner-supplied convergence instruction, also in `/Users/wesleyjinks/.codex/AGENTS.md:13`, says: “if findings are open-class (each round surfaces new instances of the same kind), park and escalate to spec or design.” Implementation is parked under that rule. The next proposed activity is a bounded contract/design review of reconciliation and error composition, followed by an explicit decision on repair scope and a new declared cap.
+The owner-supplied convergence instruction, also in `/Users/wesleyjinks/.codex/AGENTS.md:13`, says: “if findings are open-class (each round surfaces new instances of the same kind), park and escalate to spec or design.” Implementation is parked under that rule. The authorized bounded contract/design review is complete. The next decision is its expanded repair scope and a newly declared two-round follow-on source-review cap.
 
 ## Concrete population exposed by the final review
 
