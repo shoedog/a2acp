@@ -350,7 +350,7 @@
     Complete raw/source/script/list/compile/transcript secondcustody sealed; first missing test import compile
     INVALID then corrected core rebuild; declaration16/9 wording preserved versus actual15=7new+8changed.
     Pre-edit complete C/D/R enumeration/baseline retained, reviewer decisions flagged; finalfocused
-    now350/0/0 as below; tinycheck complete; writer94528 exited; sixgates67015/source2/2 pending.
+    now350/0/0 as below; tinycheck complete; writer94528 exited; sixgates complete/PASS; actual Sol2/2 LIVE9970.
     Repair2 corrected RED2 COMPLETE0/2/0 on unchangedde4164; late census table0/1/0 on exact old
     production in scratch is reconstructed RED, added after production. First GREEN trial15/2/0 failed
     two structural checks (retained); corrected before final350/0/0. Full
@@ -362,9 +362,13 @@
     neutral/2controls9/0/0. All6core rebuilt/mutated-restored/fullraw checked,0missed0unexpected0invalid;
     declarations unchanged,28file secondcustody retained. No historical deep audit replay;
     exact3 committed cleanfa9c80b849295cdaf6b2c6cd4df6b10a3761969d atopde4164. Complete worker custody
-    1425files, actual286model records allSonnet5.5; cleanup368ms. Six final-byte gates ONCE LIVE67015
-    verifier ef4d4751/imagefe3/networknone/sourceRO/no creds/cache8ac4 freshly bound; fmt/clippyPASS,
-    build/BOTHfullsuites/hygiene pending. Actual Sol2/2 UNEXECUTED until6PASS. CapTWO/no adoption.
+    1425files, actual286model records allSonnet5.5; cleanup368ms. Six final-byte gates ONCE COMPLETE/PASS
+    verifier ef4d4751/imagefe3/networknone/sourceRO/no creds/cache8ac4 freshly bound. All6PASS: alltargets5212/0/13/90groups/corecompiled;
+    defaultdocs5223/0/13/106groups/16docs/corecached. Full raw/immutable source/before-after independently
+    parsed, complete/no missing; daemon interruption then recovered receipts, no gate rerun. Actual final
+    Solfollow-on2/2 LIVE9970/execa02ac2bc/attempt9dc2839f after6PASS; transcript01a10e62 confirms
+    gpt5.6sol/xhigh/read-only/exactq/on-request (not never). Fresh configb343 validated/doctor10OK/catalog;
+    input9faca854 and full context/source/evidence secondcustody retained. CapTWO; no verdict/adoption.
     Native/aggregate/whole-G remain pending behind B2c approval.
     Expensive deep audits stay out of routine CI/CD and skip unchanged-area slices; ordinary tests/review remain.
     Prior sessions6053/22954/28614 complete. No adoption/native/whole-G claim. D07 actualSLOW+source-scan
