@@ -308,7 +308,7 @@
     eight tests-first regressions; proposed follow-on sourcecapTWO and mutation budget5causal+1neutral.
     Root-LAST scoped to each gate/final closing region; separate observation phases retain original ordering.
     Owner APPROVED expanded six-mechanism Sonnet5.5 same-artifact repair and new TWO-round source cap.
-    Repair1 LIVE59090/execa8955348/attempt2f14611f from clean4b941d4b; actual transcriptc54dfe24 only
+    Repair1 COMPLETE59090/cleanup384ms/execa8955348/attempt2f14611f from clean4b941d4b; actual transcriptc54dfe24 only
     claude-sonnet-5-5. Fresh live writerba44a7be imagefe3/network/mount custody retained; configdf84a5ef
     valid/doctor29OK/catalog ready, storage142GiB. Input/source/model/container secondcopies preserved.
     TestsFIRST before non-cfg(test) production, focused330+new/real rebuild; targeted5causal+1neutral
@@ -325,8 +325,10 @@
     each causal has behavioral failures, every row core rebuilt. Original predictions unchanged:0missed,
     1unexpected/nonflip V4/T8 (first-error digest break omits later Interrupted-control descriptors).
     Last restored controls green; raw/spec/frozen hashes/independent check secondcustody28files retained.
-    Source-frozen2ownedfiles, other files gitarchive4b. Sonnet59090 finishing handoff; six final-byte
-    gates and Sol follow-on1/2 pending. Sourcecap2 unchanged.
+    Source-frozen2ownedfiles, other files gitarchive4b. Controller verified/staged exact3files and committed
+    clean de4164dffdc786080083a8bc55dc3e6620aab474 atop4b; completed worker custody79files retained.
+    Six final-byte gatesLIVE91943 once; verifiere9061371 imagefe3/networknone/sourceRO/no credentials.
+    fmt/clippy/buildPASS; all-targets/default-doctests/hygiene pending before actual Sol1/2. Sourcecap2 unchanged.
     Native/aggregate/whole-G remain pending behind B2c approval.
     Expensive deep audits stay out of routine CI/CD and skip unchanged-area slices; ordinary tests/review remain.
     Prior sessions6053/22954/28614 complete. No adoption/native/whole-G claim. D07 actualSLOW+source-scan
