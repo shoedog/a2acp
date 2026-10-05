@@ -2,11 +2,15 @@
 
 Controller record: actual `gpt-5.6-sol` / `xhigh` / read-only transcript `01a10994-bdb0-76b2-9bdd-435e5927fbfe`; actual approval policy on-request, not never. Workflow54246 completed with cleanup complete0ms. Exact final SHA-256 `e932e69c92baa03482b0e80d94095018dcf30785c2f4b03671769ec97a8f4f7f`; full raw, bridge terminal stream, transcript, input/config/context and immutable owned candidate files retained in private `b2c-design-completed-custody/`. Reviewer memory footer omitted from this tracked copy. This is a design result, not implementation/source approval.
 
+## Owner adoption and implementation admission
+
+Owner approved this expanded six-mechanism design, actual Sonnet5.5 implementation on the preserved artifact, and a new TWO-round follow-on Sol source-review cap. The old exhausted source1–4 cap and all rejections remain preserved. Repair1 was admitted once on clean4b941d4b; actual Sonnet5.5 and live pinned container bindings are recorded in the controller handoff. The historical approval requests in the raw design below are satisfied by this explicit owner decision. Source approval, adoption and whole-2B3b completion remain pending.
+
 ## Controller qualification before any repair dispatch
 
 The root-last statement below applies to the end of each custody/closing gate, especially the final successful closing gate. The table itself permits repository census/digests after a completed post-exit callback gate. Therefore “no filesystem or clock call follows Z” must be scoped to the corresponding gate/completion region; it cannot prohibit the ordinary subsequent settlement/next child. Keep separate progress for pre-spawn, post-exit and settlement observation phases: a completed earlier phase never proves observations complete for a later phase after further I/O. Preserve the existing final successful root identity as the last fallible observation before infallible result construction.
 
-The expanded repair remains a proposal pending owner scope/cap approval. Require the typed-error regressions to establish each claimed behavior; the design pass performed no tests. Keep all prior rejected candidates, six source4 green gates and historical RED debt intact. No cap reset, source adoption, runner/API/codec/dependency/Pass A change or implementation dispatch occurred.
+The expanded repair scope/cap is now owner-approved; implementation has been dispatched on the preserved artifact. Require the typed-error regressions to establish each claimed behavior; the design pass performed no tests. Keep all prior rejected candidates, six source4 green gates and historical RED debt intact. No cap reset, source adoption, runner/API/codec/dependency/Pass A change or implementation dispatch occurred.
 
 ## Actual Sol final
 

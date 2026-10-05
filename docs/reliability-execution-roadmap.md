@@ -307,8 +307,13 @@
     to the original three combinations. Same3ownedfiles, retained-descriptor positioned reads,
     eight tests-first regressions; proposed follow-on sourcecapTWO and mutation budget5causal+1neutral.
     Root-LAST scoped to each gate/final closing region; separate observation phases retain original ordering.
-    Implementation stays PARKED pending owner expanded-scope/repair/cap decision. This is not source5,
-    oldcap reset, adoption or new repair dispatch. All sessions complete; no suites or matrices replayed.
+    Owner APPROVED expanded six-mechanism Sonnet5.5 same-artifact repair and new TWO-round source cap.
+    Repair1 LIVE59090/execa8955348/attempt2f14611f from clean4b941d4b; actual transcriptc54dfe24 only
+    claude-sonnet-5-5. Fresh live writerba44a7be imagefe3/network/mount custody retained; configdf84a5ef
+    valid/doctor29OK/catalog ready, storage142GiB. Input/source/model/container secondcopies preserved.
+    TestsFIRST before non-cfg(test) production, focused330+new/real rebuild; targeted5causal+1neutral
+    maximum. Controller commits exact3files after exit, runs six final-byte gates once, then Sol1/2.
+    No oldcap reset/source5/restart/adoption/suite or historical-matrix replay.
     Native/aggregate/whole-G remain pending behind B2c approval.
     Expensive deep audits stay out of routine CI/CD and skip unchanged-area slices; ordinary tests/review remain.
     Prior sessions6053/22954/28614 complete. No adoption/native/whole-G claim. D07 actualSLOW+source-scan
