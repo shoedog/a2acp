@@ -116,10 +116,15 @@
 //! observation still owed, each independently of the others and each unit once: the mount census; the census of
 //! the exact tree and its comparison with the baseline; the digest of every restored file by the descriptor the
 //! restore RETAINED (positioned reads, bounded to its length plus one byte, an interruption refused and never
-//! retried); and every retained chain edge, with the destination root's identity last. A unit an earlier phase
-//! already ran to a verdict is not observed again, a unit that fails never hides the next, and the findings
-//! are kept beside the primary in a fixed order (a callback's refusal first), a drifted binary staying the
-//! primary: beside the failure, and never as a success. The closing gate is the mount census, the
+//! retried); and every retained chain edge, with the destination root's identity last. Progress is kept CALL by
+//! call: a call that returned is attempted whether a refusal or a guard that found the deadline spent followed it,
+//! its fact is carried (a census call's `fstat`, listing, or descriptor; the bytes a paced digest read), and it is
+//! never made again, while every call that did not run is made once. A refusal of one unit settles no other: a
+//! census continues past a replaced or unexpected entry without descending it, a refused NAME says nothing about
+//! the retained descriptor's digest, and every retained edge (the work and plain directories, each retained
+//! staging directory once, and each admitted file's entry and descriptor) is its own unit. The findings are kept
+//! beside the primary in a fixed order (a callback's refusal first), a drifted binary staying the primary:
+//! beside the failure, and never as a success. The closing gate is the mount census, the
 //! exact tree and digest, every retained chain, and the destination root's identity LAST, each step held to
 //! the one deadline with a guard read after every filesystem call returns and before the next is made; only
 //! infallible construction of [`RestoredGitPlaneV1`] follows it. A failure is a [`GitPlaneRestoreFailureV1`]: the last step
@@ -7421,53 +7426,6 @@ struct ProofFactsV1 {
     directories: BTreeMap<String, FileFactV1>,
 }
 
-/// Open the regular file `component` beneath `directory` no-follow, `fstat` the descriptor, and require it
-/// to be the entry `stat` listed, on the root's device.
-fn open_final_file(
-    directory: &PinnedDirectoryV1,
-    component: &OsStr,
-    child: &str,
-    stat: &ChildStatV1,
-    dev: u64,
-    pace: PaceV1<'_>,
-) -> Result<ChildStatV1, GitBootstrapErrorV1> {
-    let file = directory
-        .open_regular_file(component, "custody restore final file")
-        .map_err(|error| {
-            if refused_link(&error) {
-                GitBootstrapErrorV1::Restore(CustodyRestoreErrorV1::SymlinkRefused {
-                    name: child.to_owned(),
-                })
-            } else {
-                fs_error(error)
-            }
-        })?;
-    #[cfg(test)]
-    run_git_hook(
-        GitHookPointV1::FinalFileOpened,
-        "",
-        &directory.canonical_path().join(component),
-    );
-    pace("final-opened")?;
-    let opened = file.metadata().map_err(|error| io_refusal(child, &error))?;
-    let fact = observed_stat(ChildStatV1::from_metadata(&opened));
-    if fact.kind != ChildKindV1::Regular || fact.dev != stat.dev || fact.ino != stat.ino {
-        return Err(GitBootstrapErrorV1::Restore(
-            CustodyRestoreErrorV1::IdentityChanged(format!(
-                "{child}: the opened file is not the listed entry"
-            )),
-        ));
-    }
-    if observed_dev(&final_name(child), fact.dev) != dev {
-        return Err(GitBootstrapErrorV1::Restore(
-            CustodyRestoreErrorV1::DeviceCrossing {
-                name: final_name(child),
-            },
-        ));
-    }
-    Ok(fact)
-}
-
 /// The listed entry `stat` must be the retained directory `pin`, on the root's device. A link is refused and
 /// never followed, a special file is refused, and a regular file or another directory is a replacement.
 /// `child` names the entry in a refusal, and `seam` is its destination-relative name for the device seam.
@@ -7639,9 +7597,11 @@ fn final_output_chains(
 }
 
 /// [`source_files_unchanged`] for the final gates, the same two reads of each admitted bootstrap file in the
-/// same order and with the same refusals, with a clock after EACH read: `pace` runs before the entry's
-/// `fstat` by name and again between it and the `fstat` of the file's retained descriptor, so no call is
-/// made after a slow one without the clock. Every admitted file is its own unit of `pass`.
+/// same order and with the same refusals, each its OWN unit of `pass` behind its own clock (one call per unit):
+/// the entry by name (`pace` runs before its `fstatat`), then the file's retained descriptor (`pace` runs between
+/// the two, so no call is made after a slow one without the clock). A deadline that stops the second leaves the
+/// first attempted, and a completion makes only the second; the two are independent, so a refusal of one never
+/// hides the other.
 fn final_source_files_unchanged(
     boot: &VerifiedGitBootstrapV1,
     pace: PaceV1<'_>,
@@ -7689,6 +7649,9 @@ fn final_source_files_unchanged(
                     "no longer the admitted object file",
                 ));
             }
+            Ok(())
+        })?;
+        pass.unit(|| {
             pace("final-source-statted")?;
             let held = admitted
                 .file
@@ -7714,66 +7677,14 @@ fn final_source_files_unchanged(
     Ok(())
 }
 
-/// The retained staging chain of `key` (the work and plain directories when `key` is empty), each entry
-/// rechecked against its parent exactly as the destination's own chain recheck does, with a clock BEFORE every
-/// entry after the first: the entries are separate `fstatat` calls, and none follows a slow one without it.
-fn final_staging_chain(
-    dest: &super::RestoreDestinationV1,
-    key: &[u8],
-    pace: PaceV1<'_>,
-) -> Result<(), GitBootstrapErrorV1> {
-    let work = RESTORE_WORK_DIR_NAME_V1.as_bytes();
-    recheck_entry(&dest.root, work, &dest.work, work)?;
-    #[cfg(test)]
-    run_git_hook(
-        GitHookPointV1::FinalStagingChecked,
-        "",
-        dest.root.canonical_path(),
-    );
-    pace("chain-step")?;
-    recheck_entry(
-        &dest.work,
-        RESTORE_PLAIN_DIR_NAME_V1.as_bytes(),
-        &dest.plain,
-        &plain_relative(b""),
-    )?;
-    #[cfg(test)]
-    run_git_hook(
-        GitHookPointV1::FinalStagingChecked,
-        "",
-        dest.work.canonical_path(),
-    );
-    if key.is_empty() {
-        return Ok(());
-    }
-    let staging = dest.staging.borrow();
-    let mut parent: &PinnedDirectoryV1 = &dest.plain;
-    let mut prefix = Vec::new();
-    for component in key.split(|byte| *byte == b'/') {
-        pace("chain-step")?;
-        prefix = joined(&prefix, component);
-        let pin = staging.get(&prefix).ok_or_else(|| {
-            CustodyRestoreErrorV1::IdentityChanged(format!(
-                "{}: a staging directory is not retained",
-                lossy(&plain_relative(&prefix))
-            ))
-        })?;
-        recheck_entry(parent, component, pin, &plain_relative(&prefix))?;
-        #[cfg(test)]
-        run_git_hook(
-            GitHookPointV1::FinalStagingChecked,
-            "",
-            parent.canonical_path(),
-        );
-        parent = pin;
-    }
-    Ok(())
-}
-
 /// [`sweep_chains`] for the final gates: the same chains in the same order, the destination root's identity
-/// LAST, with the staging chains taken one entry per clock ([`final_staging_chain`]). The other chains are one
-/// `fstatat` each, so the clock before each is the clock after the one before it. Every chain, and the root, is its
-/// own unit of `pass`: a completion goes on past a refusal, and the root is always the last unit.
+/// LAST. Every retained EDGE is its own unit of `pass`, ONE guard and ONE call each, attempted once: the work
+/// directory's entry beneath the root, the plain directory's beneath the work directory, and each retained staging
+/// directory's beneath its retained parent (the plain directory, or the retained pin of its key's parent: the keys
+/// are in byte order, so a parent comes before its child), then HOME, XDG, each bootstrap directory, and the root.
+/// No edge is checked again for another's sake (the work and plain entries, and every prefix of a key, used to be
+/// replayed for each staging key, so one refusal both hid the next edge and was repeated for each key). A completion
+/// goes on past a refusal, and the root is always the last unit.
 fn final_sweep_chains(
     dest: &super::RestoreDestinationV1,
     home: Option<&PinnedDirectoryV1>,
@@ -7782,14 +7693,59 @@ fn final_sweep_chains(
     pace: PaceV1<'_>,
     pass: &ChainPassV1,
 ) -> Result<(), GitBootstrapErrorV1> {
+    let work = RESTORE_WORK_DIR_NAME_V1.as_bytes();
     pass.unit(|| {
         pace("chain")?;
-        final_staging_chain(dest, b"", pace)
+        recheck_entry(&dest.root, work, &dest.work, work)?;
+        #[cfg(test)]
+        run_git_hook(
+            GitHookPointV1::FinalStagingChecked,
+            "",
+            dest.root.canonical_path(),
+        );
+        Ok(())
     })?;
-    for key in dest.staging.borrow().keys() {
+    pass.unit(|| {
+        pace("chain-step")?;
+        recheck_entry(
+            &dest.work,
+            RESTORE_PLAIN_DIR_NAME_V1.as_bytes(),
+            &dest.plain,
+            &plain_relative(b""),
+        )?;
+        #[cfg(test)]
+        run_git_hook(
+            GitHookPointV1::FinalStagingChecked,
+            "",
+            dest.work.canonical_path(),
+        );
+        Ok(())
+    })?;
+    let staging = dest.staging.borrow();
+    for (key, pin) in staging.iter() {
         pass.unit(|| {
-            pace("chain")?;
-            final_staging_chain(dest, key, pace)
+            pace("chain-step")?;
+            let (parent, component): (&PinnedDirectoryV1, &[u8]) =
+                match key.iter().rposition(|byte| *byte == b'/') {
+                    Some(at) => {
+                        let above = staging.get(&key[..at]).ok_or_else(|| {
+                            CustodyRestoreErrorV1::IdentityChanged(format!(
+                                "{}: a staging directory is not retained",
+                                lossy(&plain_relative(&key[..at]))
+                            ))
+                        })?;
+                        (&**above, &key[at + 1..])
+                    }
+                    None => (&dest.plain, key.as_slice()),
+                };
+            recheck_entry(parent, component, pin, &plain_relative(key))?;
+            #[cfg(test)]
+            run_git_hook(
+                GitHookPointV1::FinalStagingChecked,
+                "",
+                parent.canonical_path(),
+            );
+            Ok(())
         })?;
     }
     let work_name = RESTORE_WORK_DIR_NAME_V1.as_bytes();
@@ -7945,23 +7901,109 @@ impl GateSeenV1 {
     }
 }
 
+/// The repository's own key among the directories of a census: no relative path can hold a NUL, so it cannot be
+/// one of the made directories' (`""` is the Git directory).
+const CENSUS_REPOSITORY_V1: &str = "\0repository";
+
+/// What the census of the exact tree has run to a verdict, CALL by call, and the facts those calls returned. A call
+/// is ATTEMPTED when it ran, whether a custody refusal followed it or a later guard found the deadline spent: its
+/// fact is kept here and the call is never made again, while every call that has not run is still owed, one at a
+/// time, in the census's own order. A custody finding of one unit settles no other: a gate's pass ends at the first
+/// one (it is the child's failure), and a completion ([`ProofRunV1::proof_census`] with `collect`) keeps each in
+/// `findings` and goes on to the next unit, never descending an unexpected or replaced entry (a directory is only
+/// ever listed through its RETAINED pin). The comparison with the baseline needs a COMPLETE census that found
+/// nothing: after any finding it is unavailable, and so it is when the listing bound, which every listing shares,
+/// is spent (`ended`: nothing more can be listed within it).
+#[derive(Debug, Default)]
+struct CensusV1 {
+    /// What the calls that returned reported: every directory's and every regular file's facts.
+    facts: ProofFactsV1,
+    /// Every name a listing returned, by its path beneath the Git directory (the Git directory itself is `""`).
+    seen: BTreeSet<String>,
+    /// The listing budget every directory's listing draws on, once the first listing is about to be made.
+    remaining: Option<u64>,
+    /// The directories (by key) whose `fstat` call ran, and what the ones that returned reported.
+    stat_ran: BTreeSet<String>,
+    stats: BTreeMap<String, ChildStatV1>,
+    /// The directories (by key) whose listing call ran, and the names, in byte order, the ones that returned held.
+    list_ran: BTreeSet<String>,
+    listed: BTreeMap<String, Vec<Vec<u8>>>,
+    /// The `fstatat` of each listed entry (by path) that returned, awaiting its verdict.
+    entry_stats: BTreeMap<String, ChildStatV1>,
+    /// The descriptor of each expected regular file whose `open` returned, awaiting its own `fstat`.
+    opened: BTreeMap<String, File>,
+    /// The entries whose verdict was reached (a pass or a finding).
+    done: BTreeSet<String>,
+    /// The findings a completion kept, in the census's order.
+    findings: Vec<GitBootstrapErrorV1>,
+    /// Whether any unit ended in a finding (in any phase).
+    faulted: bool,
+    /// Whether the shared listing bound was spent: the census can go no further.
+    ended: bool,
+    missing_git_checked: bool,
+    missing_checked: bool,
+    /// Whether every unit ran to the end.
+    finished: bool,
+    /// Whether the comparison with the baseline was made.
+    compared: bool,
+}
+
+impl CensusV1 {
+    /// A finding of one unit: a gate's pass ends at it, and a completion keeps it and goes on.
+    fn fault(
+        &mut self,
+        error: GitBootstrapErrorV1,
+        collect: bool,
+    ) -> Result<(), GitBootstrapErrorV1> {
+        self.faulted = true;
+        if collect {
+            self.findings.push(error);
+            Ok(())
+        } else {
+            Err(error)
+        }
+    }
+}
+
+/// What the paced digest of a settlement ran to a verdict, file by file in path order (the pass ends at its first
+/// refusal, so at most one file is partial): `settled` leading files had their digest reach a verdict ABOUT THE
+/// ORIGINAL BYTES (a pass, or a finding derived from the bytes read through a descriptor bound to the measured file),
+/// and `read` holds the count and SHA-256 of the next file's bytes when its read RETURNED and a guard then found the
+/// deadline spent: those bytes were read, so a completion carries their verdict and never reads them again. A NAME
+/// refusal (the open, or the binding `fstat` of the descriptor the name opened) is no observation of the retained
+/// file, a guard that stops the read leaves no complete hash, and neither settles the file: the retained descriptor
+/// is still owed its own digest.
+#[derive(Debug, Default)]
+struct DigestSeenV1 {
+    settled: Cell<usize>,
+    read: Cell<Option<(u64, [u8; 32])>>,
+}
+
+impl DigestSeenV1 {
+    /// The file whose digest was being made reached its verdict: it is settled and its carried bytes are spent.
+    fn settle(&self) {
+        self.settled.set(self.settled.get() + 1);
+        self.read.set(None);
+    }
+}
+
 /// What the observations made AFTER a final child's exit ran to a verdict, by stage and unit. A completion makes
 /// only the rest of them.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Debug, Default)]
 struct SettledV1 {
     /// The mount census.
     mounts: bool,
-    /// The census of the exact tree and its comparison with the baseline.
-    tree: bool,
-    /// How many restored files, in path order, had their digest run to a verdict.
-    digests: usize,
+    /// The census of the exact tree, call by call, and whether its comparison with the baseline was made.
+    census: CensusV1,
+    /// How many restored files, in path order, had their digest run to a verdict, and the bytes the next returned.
+    digests: DigestSeenV1,
     /// How many retained-chain units, in custody order, ran to a verdict (the root's identity is the last).
     chains: usize,
 }
 
 /// How a final child ended, for its completion: whether it may have run (its pre-spawn gate passed, so the runner
 /// went on), and what the observations made since it exited already settled.
-#[derive(Clone, Copy, Debug)]
+#[derive(Debug)]
 struct ChildExitV1 {
     may_have_run: bool,
     settled: SettledV1,
@@ -7971,25 +8013,25 @@ struct ChildExitV1 {
 /// comparison, its digests, and its terminal gate. The after-exit gate of the same child does NOT stand for any of
 /// it: the settlement did further I/O after that gate returned.
 struct SettlementSeenV1 {
-    tree: Cell<bool>,
-    digests: Cell<usize>,
+    census: RefCell<CensusV1>,
+    digests: DigestSeenV1,
     gate: GateSeenV1,
 }
 
 impl SettlementSeenV1 {
     fn new() -> Self {
         Self {
-            tree: Cell::new(false),
-            digests: Cell::new(0),
+            census: RefCell::new(CensusV1::default()),
+            digests: DigestSeenV1::default(),
             gate: GateSeenV1::new(),
         }
     }
 
-    fn settled(&self) -> SettledV1 {
+    fn into_settled(self) -> SettledV1 {
         SettledV1 {
             mounts: self.gate.mounts.get(),
-            tree: self.tree.get(),
-            digests: self.digests.get(),
+            census: self.census.into_inner(),
+            digests: self.digests,
             chains: self.gate.chains.settled.get(),
         }
     }
@@ -8038,7 +8080,7 @@ impl<'a> ProofRunV1<'a> {
     /// copied, the metadata directories and files, every admitted bootstrap file, then the staging, HOME, XDG, and
     /// bootstrap chains with the destination root's identity LAST. `pace` runs before every filesystem call a step
     /// makes, so no call is made after a slow one without the clock: a step of one call has one guard, and the two
-    /// that make more ([`final_source_files_unchanged`], [`final_staging_chain`]) have one between their calls.
+    /// that make more ([`final_source_files_unchanged`] is two units) have one guard each.
     /// `pass` says what a refusal does ([`ChainPassV1`]): a gate's pass ends at the first one, a completion's keeps
     /// every one and goes on to the next edge and, last, the root.
     fn proof_chains(
@@ -8108,184 +8150,448 @@ impl<'a> ProofRunV1<'a> {
         self.proof_chains(&|step| observe_deadline(deadline, step), &seen.chains)
     }
 
-    /// The census of the exact tree, through retained pins only. The repository holds exactly the Git
-    /// directory; every directory is the retained pin its parent lists; every regular file is opened
-    /// no-follow, `fstat`ed, and required to be the inode and length the restore made; anything else (an
-    /// entry the restore did not make, a missing one, a link, a special file, another device, or more
-    /// entries than the restore made) refuses. `pace` runs before every directory and every entry.
+    /// The census of the exact tree as one gate's pass: the facts of one complete census, or its first finding or its
+    /// first guard that finds the deadline spent ([`Self::proof_census`] with a fresh [`CensusV1`]).
     fn proof_measure(&self, pace: PaceV1<'_>) -> Result<ProofFactsV1, GitBootstrapErrorV1> {
+        let mut census = CensusV1::default();
+        self.proof_census(pace, &mut census, false)?;
+        Ok(census.facts)
+    }
+
+    /// The census of the exact tree, through retained pins only, resumable call by call ([`CensusV1`]). The
+    /// repository holds exactly the Git directory; every directory is the retained pin its parent lists; every
+    /// regular file is opened no-follow, `fstat`ed, and required to be the inode and length the restore made;
+    /// anything else (an entry the restore did not make, a missing one, a link, a special file, another device, or
+    /// more entries than the restore made) is a finding. Every unit is ONE call behind ITS OWN guard: `pace` runs
+    /// before the repository's and each directory's `fstat`, before each listing, before each entry's `fstatat`,
+    /// before an expected file's `open`, and before the `fstat` of the descriptor it opened, so no call is made after a
+    /// slow one without the clock. A unit whose call already ran is not made again; its returned fact is used.
+    ///
+    /// `collect` false is a gate's pass: it returns at its first finding or guard. `collect` true is a completion:
+    /// each finding is kept in the census and the next unit runs (a listing bound spent ends the census). A unit never
+    /// descends an unexpected, replaced, linked, or special entry.
+    fn proof_census(
+        &self,
+        pace: PaceV1<'_>,
+        c: &mut CensusV1,
+        collect: bool,
+    ) -> Result<(), GitBootstrapErrorV1> {
+        if c.ended || c.finished {
+            return Ok(());
+        }
         let dev = self.dest().dev;
         // One entry for the Git directory beneath the repository, every other directory, and every file:
         // one more than the restore made is named, and anything past that is a census bound.
-        let mut remaining = (self.made.directories.len() + self.made.files.len()) as u64 + 1;
-        let mut facts = ProofFactsV1::default();
-        let mut seen: BTreeSet<String> = BTreeSet::new();
+        c.remaining
+            .get_or_insert((self.made.directories.len() + self.made.files.len()) as u64 + 1);
 
-        // Every slow call is followed by a clock before the next one is made: the repository's `fstat`, its
-        // listing, and each entry's `fstat` are separated by a guard.
-        pace("final-census")?;
-        let stat = observed_stat(
-            self.made
-                .repository
-                .current_metadata("custody restore final repository")
-                .map_err(fs_error)?,
-        );
-        #[cfg(test)]
-        run_git_hook(
-            GitHookPointV1::FinalCensusStatted,
-            "",
-            self.made.repository.canonical_path(),
-        );
-        pace("final-statted")?;
-        facts.directories.insert(
-            ObjectDirV1::Repository.name().to_owned(),
-            FileFactV1::of(&stat),
-        );
-        if observed_dev(ObjectDirV1::Repository.name(), stat.dev) != dev {
-            return Err(GitBootstrapErrorV1::Restore(
-                CustodyRestoreErrorV1::DeviceCrossing {
-                    name: ObjectDirV1::Repository.name().to_owned(),
-                },
-            ));
+        let repository = self.made.repository;
+        let repository_name = ObjectDirV1::Repository.name().to_owned();
+        self.census_stat(
+            pace,
+            c,
+            CENSUS_REPOSITORY_V1,
+            repository,
+            "custody restore final repository",
+            &repository_name,
+            collect,
+        )?;
+        self.census_list(
+            pace,
+            c,
+            CENSUS_REPOSITORY_V1,
+            repository,
+            "custody restore final repository listing",
+            &repository_name,
+            dev,
+            collect,
+        )?;
+        if c.ended {
+            return Ok(());
         }
-        let listed = self
-            .made
-            .repository
-            .list_child_names(&mut remaining, "custody restore final repository listing")
-            .map_err(|error| {
-                final_listing_error(error, ObjectDirV1::Repository.name().to_owned())
-            })?;
-        #[cfg(test)]
-        run_git_hook(
-            GitHookPointV1::FinalCensusListed,
-            "",
-            self.made.repository.canonical_path(),
-        );
-        for name in &listed {
-            pace("final-census")?;
-            if name.as_bytes() != b".git" {
-                return Err(final_tree(
-                    lossy(name.as_bytes()),
-                    FinalTreeFaultV1::Unexpected,
-                ));
+        if let Some(names) = c.listed.get(CENSUS_REPOSITORY_V1).cloned() {
+            for name in &names {
+                self.census_repository_entry(pace, c, name, dev, collect)?;
             }
-            let stat = self
-                .made
-                .repository
-                .child_metadata_no_follow(OsStr::new(".git"), "custody restore final entry")
-                .map_err(fs_error)?
-                .ok_or_else(|| final_tree(final_name(""), FinalTreeFaultV1::Missing))?;
-            require_final_directory(&stat, ".git", &final_name(""), self.made.git, dev)?;
-            seen.insert(String::new());
         }
-        if !seen.contains("") {
-            return Err(final_tree(final_name(""), FinalTreeFaultV1::Missing));
+        if !c.missing_git_checked {
+            c.missing_git_checked = true;
+            if c.listed.contains_key(CENSUS_REPOSITORY_V1) && !c.seen.contains("") {
+                c.fault(
+                    final_tree(final_name(""), FinalTreeFaultV1::Missing),
+                    collect,
+                )?;
+            }
         }
 
         for (relative, directory) in &self.made.directories {
-            pace("final-census")?;
-            let stat = observed_stat(
-                directory
-                    .current_metadata("custody restore final directory")
-                    .map_err(fs_error)?,
-            );
-            #[cfg(test)]
-            run_git_hook(
-                GitHookPointV1::FinalCensusStatted,
-                "",
-                directory.canonical_path(),
-            );
-            pace("final-statted")?;
-            facts
-                .directories
-                .insert(final_name(relative), FileFactV1::of(&stat));
-            if observed_dev(&final_name(relative), stat.dev) != dev {
-                return Err(GitBootstrapErrorV1::Restore(
-                    CustodyRestoreErrorV1::DeviceCrossing {
-                        name: final_name(relative),
-                    },
-                ));
+            let seam = final_name(relative);
+            self.census_stat(
+                pace,
+                c,
+                relative,
+                directory,
+                "custody restore final directory",
+                &seam,
+                collect,
+            )?;
+            self.census_list(
+                pace,
+                c,
+                relative,
+                directory,
+                "custody restore final listing",
+                &seam,
+                dev,
+                collect,
+            )?;
+            if c.ended {
+                return Ok(());
             }
-            let names = directory
-                .list_child_names(&mut remaining, "custody restore final listing")
-                .map_err(|error| final_listing_error(error, final_name(relative)))?;
-            #[cfg(test)]
-            run_git_hook(
-                GitHookPointV1::FinalCensusListed,
-                "",
-                directory.canonical_path(),
-            );
-            for name in &names {
-                pace("final-census")?;
-                let child = bootstrap_relative(relative, name.as_bytes());
-                let component = OsStr::from_bytes(name.as_bytes());
-                let stat = directory
-                    .child_metadata_no_follow(component, "custody restore final entry")
-                    .map_err(fs_error)?
-                    .ok_or_else(|| final_tree(child.clone(), FinalTreeFaultV1::Missing))?;
+            if let Some(names) = c.listed.get(relative.as_str()).cloned() {
+                for name in &names {
+                    self.census_entry(pace, c, relative, directory, name, dev, collect)?;
+                }
+            }
+        }
+        // A name the restore made that no returned listing held (a name under a directory whose listing never
+        // returned is not judged: nothing says it is missing). Each missing name is its own unit.
+        if !c.missing_checked {
+            for name in self
+                .made
+                .directories
+                .keys()
+                .filter(|name| !name.is_empty())
+                .chain(self.made.files.keys())
+            {
+                let parent = split_relative(name).0.unwrap_or("");
+                let unit = format!("\u{1}{name}");
+                if c.listed.contains_key(parent) && !c.seen.contains(name) && c.done.insert(unit) {
+                    c.fault(final_tree(name.clone(), FinalTreeFaultV1::Missing), collect)?;
+                }
+            }
+            c.missing_checked = true;
+        }
+        c.finished = true;
+        Ok(())
+    }
+
+    /// The `fstat` of the retained directory `pin` (the repository, or a made directory), one unit: its guard, its
+    /// call, and the fact it returned (kept the moment it returns). `seam` names it for the device seam and the facts.
+    #[allow(clippy::too_many_arguments)]
+    fn census_stat(
+        &self,
+        pace: PaceV1<'_>,
+        c: &mut CensusV1,
+        key: &str,
+        pin: &PinnedDirectoryV1,
+        label: &str,
+        seam: &str,
+        collect: bool,
+    ) -> Result<(), GitBootstrapErrorV1> {
+        if c.stat_ran.contains(key) {
+            return Ok(());
+        }
+        pace("final-census")?;
+        c.stat_ran.insert(key.to_owned());
+        match pin.current_metadata(label) {
+            Ok(stat) => {
+                let stat = observed_stat(stat);
+                c.facts
+                    .directories
+                    .insert(seam.to_owned(), FileFactV1::of(&stat));
+                c.stats.insert(key.to_owned(), stat);
                 #[cfg(test)]
-                run_git_hook(
-                    GitHookPointV1::BeforeFinalCensusOpen,
-                    "",
-                    &directory.canonical_path().join(component),
+                run_git_hook(GitHookPointV1::FinalCensusStatted, "", pin.canonical_path());
+                Ok(())
+            }
+            Err(error) => c.fault(fs_error(error), collect),
+        }
+    }
+
+    /// The listing of the retained directory `pin`, one unit: its guard (which also stands before the device check
+    /// of the `fstat` that returned), its call, and the names it returned, in byte order, so the findings a
+    /// completion collects come in one order. It draws on the one listing budget; a listing that ran past it is a
+    /// `Bound` finding and ends the census.
+    #[allow(clippy::too_many_arguments)]
+    fn census_list(
+        &self,
+        pace: PaceV1<'_>,
+        c: &mut CensusV1,
+        key: &str,
+        pin: &PinnedDirectoryV1,
+        label: &str,
+        seam: &str,
+        dev: u64,
+        collect: bool,
+    ) -> Result<(), GitBootstrapErrorV1> {
+        if c.list_ran.contains(key) {
+            return Ok(());
+        }
+        pace("final-statted")?;
+        c.list_ran.insert(key.to_owned());
+        if let Some(stat) = c.stats.get(key) {
+            if observed_dev(seam, stat.dev) != dev {
+                return c.fault(
+                    GitBootstrapErrorV1::Restore(CustodyRestoreErrorV1::DeviceCrossing {
+                        name: seam.to_owned(),
+                    }),
+                    collect,
                 );
-                match stat.kind {
-                    ChildKindV1::Symlink => {
-                        return Err(GitBootstrapErrorV1::Restore(
-                            CustodyRestoreErrorV1::SymlinkRefused { name: child },
-                        ))
-                    }
-                    ChildKindV1::Special(_) => {
-                        return Err(final_tree(child, FinalTreeFaultV1::Special))
-                    }
-                    ChildKindV1::Directory => {
-                        // A name the restore made as a file is a replacement; any other name is unexpected.
-                        let pin = self.made.directories.get(&child).ok_or_else(|| {
-                            let fault = if self.made.files.contains_key(&child) {
-                                FinalTreeFaultV1::Replaced
-                            } else {
-                                FinalTreeFaultV1::Unexpected
-                            };
-                            final_tree(child.clone(), fault)
-                        })?;
-                        require_final_directory(&stat, &child, &final_name(&child), pin, dev)?;
-                    }
-                    ChildKindV1::Regular => {
-                        // A name the restore made as a directory is a replacement; any other is unexpected.
-                        let made = self.made.files.get(&child).ok_or_else(|| {
-                            let fault = if self.made.directories.contains_key(&child) {
-                                FinalTreeFaultV1::Replaced
-                            } else {
-                                FinalTreeFaultV1::Unexpected
-                            };
-                            final_tree(child.clone(), fault)
-                        })?;
-                        // The entry's `fstat` has returned: a clock before the descriptor is opened.
-                        pace("final-entry-statted")?;
-                        let fact = open_final_file(directory, component, &child, &stat, dev, pace)?;
-                        if (fact.dev, fact.ino) != (made.dev, made.ino) {
-                            return Err(final_tree(child, FinalTreeFaultV1::Replaced));
+            }
+        }
+        let mut left = c.remaining.unwrap_or(0);
+        let listed = pin.list_child_names(&mut left, label);
+        c.remaining = Some(left);
+        match listed {
+            Ok(mut names) => {
+                names.sort();
+                #[cfg(test)]
+                run_git_hook(GitHookPointV1::FinalCensusListed, "", pin.canonical_path());
+                let names: Vec<Vec<u8>> =
+                    names.iter().map(|name| name.as_bytes().to_vec()).collect();
+                for name in &names {
+                    if key == CENSUS_REPOSITORY_V1 {
+                        if name.as_slice() == b".git" {
+                            c.seen.insert(String::new());
                         }
-                        if fact.size != made.length {
-                            return Err(final_tree(child, FinalTreeFaultV1::Bytes));
-                        }
-                        facts.files.insert(child.clone(), FileFactV1::of(&fact));
+                    } else {
+                        c.seen.insert(bootstrap_relative(key, name));
                     }
                 }
-                seen.insert(child);
+                c.listed.insert(key.to_owned(), names);
+                Ok(())
+            }
+            Err(error) => {
+                let error = final_listing_error(error, seam.to_owned());
+                if matches!(
+                    error,
+                    GitBootstrapErrorV1::FinalTree {
+                        fault: FinalTreeFaultV1::Bound,
+                        ..
+                    }
+                ) {
+                    c.ended = true;
+                }
+                c.fault(error, collect)
             }
         }
-        if let Some(name) = self
-            .made
-            .directories
-            .keys()
-            .filter(|name| !name.is_empty())
-            .chain(self.made.files.keys())
-            .find(|name| !seen.contains(*name))
-        {
-            return Err(final_tree(name.clone(), FinalTreeFaultV1::Missing));
+    }
+
+    /// One name the repository lists: it must be the Git directory, which is checked through the retained pin of
+    /// its parent (one `fstatat`), and any other name is an unexpected entry (no call, and never descended).
+    fn census_repository_entry(
+        &self,
+        pace: PaceV1<'_>,
+        c: &mut CensusV1,
+        name: &[u8],
+        dev: u64,
+        collect: bool,
+    ) -> Result<(), GitBootstrapErrorV1> {
+        let key = format!("\0{}", lossy(name));
+        if c.done.contains(&key) {
+            return Ok(());
         }
-        Ok(facts)
+        pace("final-census")?;
+        c.done.insert(key);
+        if name != b".git" {
+            return c.fault(
+                final_tree(lossy(name), FinalTreeFaultV1::Unexpected),
+                collect,
+            );
+        }
+        let stat = match self
+            .made
+            .repository
+            .child_metadata_no_follow(OsStr::new(".git"), "custody restore final entry")
+        {
+            Err(error) => return c.fault(fs_error(error), collect),
+            Ok(None) => {
+                return c.fault(
+                    final_tree(final_name(""), FinalTreeFaultV1::Missing),
+                    collect,
+                )
+            }
+            Ok(Some(stat)) => stat,
+        };
+        match require_final_directory(&stat, ".git", &final_name(""), self.made.git, dev) {
+            Ok(()) => Ok(()),
+            Err(error) => c.fault(error, collect),
+        }
+    }
+
+    /// One name a made directory lists: its `fstatat` (one unit, whose returned fact is kept and whose hook stands
+    /// right after it), then its kind. A link, a special file, an unexpected or replaced entry, and a directory that
+    /// is not the retained pin its name has are each a finding of THAT name only; none is descended or opened (a
+    /// directory is listed through its retained pin when the census reaches it). An expected regular file goes on to
+    /// [`Self::census_file`].
+    #[allow(clippy::too_many_arguments)]
+    fn census_entry(
+        &self,
+        pace: PaceV1<'_>,
+        c: &mut CensusV1,
+        key: &str,
+        directory: &PinnedDirectoryV1,
+        name: &[u8],
+        dev: u64,
+        collect: bool,
+    ) -> Result<(), GitBootstrapErrorV1> {
+        let child = bootstrap_relative(key, name);
+        if c.done.contains(&child) {
+            return Ok(());
+        }
+        let component = OsStr::from_bytes(name);
+        let stat = match c.entry_stats.get(&child).copied() {
+            Some(stat) => stat,
+            None => {
+                pace("final-census")?;
+                match directory.child_metadata_no_follow(component, "custody restore final entry") {
+                    Err(error) => {
+                        c.done.insert(child);
+                        return c.fault(fs_error(error), collect);
+                    }
+                    Ok(None) => {
+                        c.done.insert(child.clone());
+                        return c.fault(final_tree(child, FinalTreeFaultV1::Missing), collect);
+                    }
+                    Ok(Some(stat)) => {
+                        c.entry_stats.insert(child.clone(), stat);
+                        #[cfg(test)]
+                        run_git_hook(
+                            GitHookPointV1::BeforeFinalCensusOpen,
+                            "",
+                            &directory.canonical_path().join(component),
+                        );
+                        stat
+                    }
+                }
+            }
+        };
+        if stat.kind == ChildKindV1::Regular {
+            return self.census_file(pace, c, directory, component, &child, &stat, dev, collect);
+        }
+        c.done.insert(child.clone());
+        let verdict = match stat.kind {
+            ChildKindV1::Symlink => Err(GitBootstrapErrorV1::Restore(
+                CustodyRestoreErrorV1::SymlinkRefused { name: child },
+            )),
+            ChildKindV1::Special(_) => Err(final_tree(child, FinalTreeFaultV1::Special)),
+            ChildKindV1::Directory | ChildKindV1::Regular => {
+                // A name the restore made as a file is a replacement; any other name is unexpected.
+                match self.made.directories.get(&child) {
+                    Some(pin) => {
+                        require_final_directory(&stat, &child, &final_name(&child), pin, dev)
+                    }
+                    None => {
+                        let fault = if self.made.files.contains_key(&child) {
+                            FinalTreeFaultV1::Replaced
+                        } else {
+                            FinalTreeFaultV1::Unexpected
+                        };
+                        Err(final_tree(child, fault))
+                    }
+                }
+            }
+        };
+        match verdict {
+            Ok(()) => Ok(()),
+            Err(error) => c.fault(error, collect),
+        }
+    }
+
+    /// An expected regular file's two calls, each its own unit: the `open` of the name no-follow through its retained
+    /// directory (its hook right after it; the descriptor is kept the moment it returns), and the `fstat` of THAT
+    /// descriptor, which must be the entry the listing named, on the root's device, the very inode the restore made,
+    /// at the length it made. A name the restore made as a directory is a replacement; any other is unexpected.
+    #[allow(clippy::too_many_arguments)]
+    fn census_file(
+        &self,
+        pace: PaceV1<'_>,
+        c: &mut CensusV1,
+        directory: &PinnedDirectoryV1,
+        component: &OsStr,
+        child: &str,
+        stat: &ChildStatV1,
+        dev: u64,
+        collect: bool,
+    ) -> Result<(), GitBootstrapErrorV1> {
+        let Some(made) = self.made.files.get(child) else {
+            c.done.insert(child.to_owned());
+            let fault = if self.made.directories.contains_key(child) {
+                FinalTreeFaultV1::Replaced
+            } else {
+                FinalTreeFaultV1::Unexpected
+            };
+            return c.fault(final_tree(child.to_owned(), fault), collect);
+        };
+        if !c.opened.contains_key(child) {
+            // The entry's `fstatat` has returned: a clock before the descriptor is opened.
+            pace("final-entry-statted")?;
+            match directory.open_regular_file(component, "custody restore final file") {
+                Err(error) => {
+                    c.done.insert(child.to_owned());
+                    let error = if refused_link(&error) {
+                        GitBootstrapErrorV1::Restore(CustodyRestoreErrorV1::SymlinkRefused {
+                            name: child.to_owned(),
+                        })
+                    } else {
+                        fs_error(error)
+                    };
+                    return c.fault(error, collect);
+                }
+                Ok(file) => {
+                    c.opened.insert(child.to_owned(), file);
+                    #[cfg(test)]
+                    run_git_hook(
+                        GitHookPointV1::FinalFileOpened,
+                        "",
+                        &directory.canonical_path().join(component),
+                    );
+                }
+            }
+        }
+        pace("final-opened")?;
+        let Some(file) = c.opened.remove(child) else {
+            return Ok(());
+        };
+        c.done.insert(child.to_owned());
+        let opened = match file.metadata() {
+            Ok(opened) => opened,
+            Err(error) => return c.fault(io_refusal(child, &error), collect),
+        };
+        let fact = observed_stat(ChildStatV1::from_metadata(&opened));
+        if fact.kind != ChildKindV1::Regular || fact.dev != stat.dev || fact.ino != stat.ino {
+            return c.fault(
+                GitBootstrapErrorV1::Restore(CustodyRestoreErrorV1::IdentityChanged(format!(
+                    "{child}: the opened file is not the listed entry"
+                ))),
+                collect,
+            );
+        }
+        if observed_dev(&final_name(child), fact.dev) != dev {
+            return c.fault(
+                GitBootstrapErrorV1::Restore(CustodyRestoreErrorV1::DeviceCrossing {
+                    name: final_name(child),
+                }),
+                collect,
+            );
+        }
+        if (fact.dev, fact.ino) != (made.dev, made.ino) {
+            return c.fault(
+                final_tree(child.to_owned(), FinalTreeFaultV1::Replaced),
+                collect,
+            );
+        }
+        if fact.size != made.length {
+            return c.fault(
+                final_tree(child.to_owned(), FinalTreeFaultV1::Bytes),
+                collect,
+            );
+        }
+        c.facts
+            .files
+            .insert(child.to_owned(), FileFactV1::of(&fact));
+        Ok(())
     }
 
     /// The SHA-256 of every file `facts` holds, each streamed from a fresh no-follow descriptor opened
@@ -8299,37 +8605,35 @@ impl<'a> ProofRunV1<'a> {
         facts: &ProofFactsV1,
         pace: PaceV1<'_>,
     ) -> Result<(), GitBootstrapErrorV1> {
-        self.proof_digests_counted(facts, pace, &Cell::new(0))
+        self.proof_digests_counted(facts, pace, &DigestSeenV1::default())
     }
 
-    /// [`Self::proof_digests`], recording in `settled` how many leading files ran to a verdict: a file whose
-    /// digest ended in a custody refusal is settled (its refusal is the finding), one a deadline guard stopped is not.
+    /// [`Self::proof_digests`], recording in `seen` how far each file's digest got ([`DigestSeenV1`]).
     fn proof_digests_counted(
         &self,
         facts: &ProofFactsV1,
         pace: PaceV1<'_>,
-        settled: &Cell<usize>,
+        seen: &DigestSeenV1,
     ) -> Result<(), GitBootstrapErrorV1> {
-        for (index, (relative, fact)) in facts.files.iter().enumerate() {
-            match self.proof_digest_file(relative, fact, pace) {
-                Ok(()) => settled.set(index + 1),
-                Err(error) => {
-                    if !is_deadline_timeout(&error) {
-                        settled.set(index + 1);
-                    }
-                    return Err(error);
-                }
-            }
+        for (relative, fact) in &facts.files {
+            self.proof_digest_file(relative, fact, pace, seen)?;
         }
         Ok(())
     }
 
-    /// The digest of ONE file of the census, held to the one deadline ([`Self::proof_digests`]).
+    /// The digest of ONE file of the census, held to the one deadline ([`Self::proof_digests`]). It reaches a
+    /// VERDICT about the original bytes only once its read has returned through a descriptor bound to the measured
+    /// file: the bytes read (count and SHA-256) are recorded in `seen` the moment the read returns, before the guard
+    /// that follows it, and the file is settled when its verdict is reached (a pass, or a finding about the bytes or
+    /// the descriptor that read them). A refusal of the NAME (the open, or the binding `fstat`), a guard that stops
+    /// the read, and a read that fails each leave the file unsettled and unrecorded: they say nothing about the
+    /// retained descriptor.
     fn proof_digest_file(
         &self,
         relative: &str,
         fact: &FileFactV1,
         pace: PaceV1<'_>,
+        seen: &DigestSeenV1,
     ) -> Result<(), GitBootstrapErrorV1> {
         pace("final-digest")?;
         let (parent, leaf) = split_relative(relative);
@@ -8369,6 +8673,7 @@ impl<'a> ProofRunV1<'a> {
             &directory.canonical_path().join(leaf),
         );
         let (read, sha256) = stream_digest(&mut file, fact.length, self.deadline, relative)?;
+        seen.read.set(Some((read, sha256)));
         #[cfg(test)]
         run_git_hook(
             GitHookPointV1::FinalDigestHashed,
@@ -8377,6 +8682,7 @@ impl<'a> ProofRunV1<'a> {
         );
         pace("final-digest-read")?;
         if read != fact.length {
+            seen.settle();
             return Err(digest_identity(
                 relative,
                 &format!(
@@ -8385,7 +8691,11 @@ impl<'a> ProofRunV1<'a> {
                 ),
             ));
         }
-        require_measured_file(&file, fact, relative, "after it was read")?;
+        if let Err(error) = require_measured_file(&file, fact, relative, "after it was read") {
+            seen.settle();
+            return Err(error);
+        }
+        seen.settle();
         if sha256 != made.sha256 {
             return Err(final_tree(relative.to_owned(), FinalTreeFaultV1::Bytes));
         }
@@ -8531,7 +8841,7 @@ impl<'a> ProofRunV1<'a> {
                         error,
                         ChildExitV1 {
                             may_have_run: true,
-                            settled: seen.settled(),
+                            settled: seen.into_settled(),
                         },
                     ),
                 }
@@ -8541,10 +8851,11 @@ impl<'a> ProofRunV1<'a> {
     }
 
     /// The settlement of a result that is about to be a success, held to the ONE absolute deadline at every call
-    /// (a guard after each census and digest call, so nothing is made after a slow one without the clock): the
-    /// census, its comparison with the baseline, the digests, and the success gate, in that order, ending at the
-    /// first failure. `seen` records what ran to a verdict in this phase, so a completion never repeats it: the
-    /// census whose finding is the failure, or whose guard the deadline tripped, is told apart.
+    /// (a guard before each call of the census and of the digests, so nothing is made after a slow one without the
+    /// clock): the census, its comparison with the baseline, the digests, and the success gate, in that order,
+    /// ending at the first failure. `seen` records what ran to a verdict in this phase, CALL by call (the census's
+    /// returned facts, each digest's returned bytes, the gate's units), so a completion never repeats a call that
+    /// ran and still makes every call that did not.
     fn proof_settle_paced(
         &self,
         baseline: &ProofFactsV1,
@@ -8553,39 +8864,35 @@ impl<'a> ProofRunV1<'a> {
     ) -> Result<(), GitBootstrapErrorV1> {
         let deadline = self.deadline;
         let paced = |step: &'static str| observe_deadline(deadline, step);
-        let measured = match self.proof_measure(&paced) {
-            Ok(measured) => measured,
-            Err(error) => {
-                // A census a custody finding ended ran to its verdict (the finding is the failure, and no complete
-                // comparison exists); one the deadline stopped did not.
-                seen.tree.set(!is_deadline_timeout(&error));
-                return Err(error);
-            }
-        };
-        let unchanged = final_unchanged(baseline, &measured, label);
-        seen.tree.set(true);
-        unchanged?;
+        self.proof_census(&paced, &mut seen.census.borrow_mut(), false)?;
+        {
+            let mut census = seen.census.borrow_mut();
+            census.compared = true;
+            final_unchanged(baseline, &census.facts, label)?;
+        }
         // Every fact is equal, so this reads the very files, at the very lengths, that the baseline
         // read, under the SAME absolute deadline: there is no exception after a child.
-        self.proof_digests_counted(&measured, &paced, &seen.digests)?;
+        self.proof_digests_counted(&seen.census.borrow().facts, &paced, &seen.digests)?;
         self.proof_deadline_gate(&seen.gate)
     }
 
     /// The ONE failure-only completion of a final child: `primary` is a failure that is already known, and
     /// every observation of what the child may have left that no earlier phase ran to a verdict is made WITHOUT
     /// the clock (a spent deadline cannot stop it), each independently of the others, in the master's gate order:
-    /// the mount census; the census of the exact tree and its comparison with the baseline (the comparison needs
-    /// a complete census); the digest of every restored file, in path order, by its RETAINED descriptor (it needs
-    /// neither the census nor a name); then every retained chain edge, the destination root's identity LAST. Each
-    /// is finite: a bounded mount table, at most the entries the restore made plus one, one bounded read per
+    /// the mount census; the census of the exact tree, resumed after the calls that already returned (each unit one
+    /// call, each finding kept, an unexpected or replaced entry never descended), and its comparison with the
+    /// baseline (which needs a complete census that found nothing); the digest of every restored file, in path
+    /// order, by its RETAINED descriptor (it needs neither the census nor a name, and it carries the bytes a paced
+    /// read already returned); then every retained chain edge, one unit each, the destination root's identity LAST.
+    /// Each is finite: a bounded mount table, at most the entries the restore made plus one, one bounded read per
     /// file, one call per retained edge. Nothing is written, reserved, released, retried, or started.
     ///
-    /// `exit` says what ran to a verdict since the child exited (a unit that refused did; a unit a deadline guard
-    /// stopped did not) and whether the child may have run at all (when it did not, only the tree is owed). A
-    /// finding that fails is kept, in the order above, beside the primary (a callback's refusal first, via
-    /// `beside`), nested in the existing [`GitBootstrapErrorV1::ChildAndReconcile`] with the first finding
-    /// outermost, and the result is ALWAYS a failure: its type cannot be a verified value, and the primary is
-    /// never dropped.
+    /// `exit` says what ran to a verdict since the child exited, call by call (a unit whose call ran is attempted
+    /// whether a refusal or a guard followed it; a unit a deadline guard stopped before its call is not) and whether
+    /// the child may have run at all (when it did not, only the tree and the digests are owed). A finding that fails
+    /// is kept, in the order above, beside the primary (a callback's refusal first, via `beside`), nested in the
+    /// existing [`GitBootstrapErrorV1::ChildAndReconcile`] with the first finding outermost, and the result is
+    /// ALWAYS a failure: its type cannot be a verified value, and the primary is never dropped.
     fn proof_reconcile(
         &self,
         baseline: &ProofFactsV1,
@@ -8596,24 +8903,25 @@ impl<'a> ProofRunV1<'a> {
     ) -> GitBootstrapErrorV1 {
         // The ONE clock-free pace of the final region, used only after a failure is known.
         let pace: PaceV1<'_> = &unpaced;
-        let settled = exit.settled;
+        let mut settled = exit.settled;
         let mut found: Vec<GitBootstrapErrorV1> = beside.into_iter().collect();
         if exit.may_have_run && !settled.mounts {
             if let Err(error) = refuse_mounts_within(&self.dest().root) {
                 found.push(error.into());
             }
         }
-        if !settled.tree {
-            match self.proof_measure(pace) {
-                Ok(measured) => {
-                    if let Err(error) = final_unchanged(baseline, &measured, label) {
-                        found.push(error);
-                    }
-                }
-                Err(error) => found.push(error),
+        // A completion collects each finding and cannot fail on a clock; a refusal it returned all the same is kept.
+        if let Err(error) = self.proof_census(pace, &mut settled.census, true) {
+            found.push(error);
+        }
+        found.append(&mut settled.census.findings);
+        if settled.census.finished && !settled.census.faulted && !settled.census.compared {
+            settled.census.compared = true;
+            if let Err(error) = final_unchanged(baseline, &settled.census.facts, label) {
+                found.push(error);
             }
         }
-        self.proof_retained_digests(settled.digests, &mut found);
+        self.proof_retained_digests(&settled.digests, &mut found);
         if exit.may_have_run {
             let pass = ChainPassV1::completing(settled.chains);
             // Every call is inside a unit and a completion keeps each refusal, so this returns nothing; a refusal
@@ -8648,17 +8956,24 @@ impl<'a> ProofRunV1<'a> {
             .map(|directory| directory.canonical_path().join(leaf))
     }
 
-    /// The digest of every restored file after the first `from` (in path order, which is the order the paced digests
-    /// settle in), each by its retained descriptor ([`Self::proof_retained_digest`]), each independent of the
-    /// others: a file whose digest refuses is kept, and the next file is observed. A fault the census of the tree
-    /// already named for the same file (a resized file is both) is reported once.
-    fn proof_retained_digests(&self, from: usize, found: &mut Vec<GitBootstrapErrorV1>) {
-        for (relative, made) in self.made.files.iter().skip(from) {
+    /// The digest of every restored file after the ones the paced digests settled (in path order, which is the order
+    /// they settle in), each by its retained descriptor ([`Self::proof_retained_digest`]), each independent of the
+    /// others: a file whose digest refuses is kept, and the next file is observed. The first file owed carries the
+    /// bytes its paced read returned, if one did. A fault the census of the tree already named for the same file (a
+    /// resized file is both) is reported once.
+    fn proof_retained_digests(&self, seen: &DigestSeenV1, found: &mut Vec<GitBootstrapErrorV1>) {
+        let from = seen.settled.get();
+        for (position, (relative, made)) in self.made.files.iter().enumerate().skip(from) {
             #[cfg(test)]
             if let Some(at) = self.final_file_path(relative) {
                 run_git_hook(GitHookPointV1::FinalDigestFileOpened, "", &at);
             }
-            if let Err(error) = self.proof_retained_digest(relative, made) {
+            let carried = if position == from {
+                seen.read.get()
+            } else {
+                None
+            };
+            if let Err(error) = self.proof_retained_digest(relative, made, carried) {
                 if !found.iter().any(|seen| same_final_tree_fault(seen, &error)) {
                     found.push(error);
                 }
@@ -8674,46 +8989,60 @@ impl<'a> ProofRunV1<'a> {
     /// never repeated. It can only refuse: a descriptor that is no longer the file the restore made, a length or
     /// bytes that changed, and a read that failed are each that file's own finding, and the other files are
     /// observed regardless.
+    ///
+    /// `carried` is the count and SHA-256 of bytes a paced digest already READ from this file through a descriptor
+    /// bound to the measured file, before a guard found the deadline spent: they are an observation of the original
+    /// bytes, so they are judged here and never read again (a second read could only see a later state, and the
+    /// descriptor's own `fstat` is made as the one call that is still owed).
     fn proof_retained_digest(
         &self,
         relative: &str,
         made: &MadeFileV1<'_>,
+        carried: Option<(u64, [u8; 32])>,
     ) -> Result<(), GitBootstrapErrorV1> {
         let file = made.file;
-        require_made_file(file, made, relative)?;
-        #[cfg(test)]
-        let at = self.final_file_path(relative);
-        #[cfg(test)]
-        if let Some(at) = &at {
-            run_git_hook(GitHookPointV1::FinalDigestOpened, "", at);
-        }
-        let limit = made.length.saturating_add(1);
-        let mut context = digest::Context::new(&digest::SHA256);
-        let mut buffer = vec![0_u8; HASH_BUFFER_BYTES_V1];
-        let mut count = 0_u64;
-        while count < limit {
-            let want =
-                usize::try_from(limit - count).map_or(buffer.len(), |left| left.min(buffer.len()));
-            #[cfg(test)]
-            let read = match reconcile_read_call(relative) {
-                Some(error) => Err(error),
-                None => file.read_at(&mut buffer[..want], count),
-            };
-            #[cfg(not(test))]
-            let read = file.read_at(&mut buffer[..want], count);
-            match read {
-                Ok(0) => break,
-                Ok(read) => {
-                    count = count.saturating_add(read as u64);
-                    context.update(&buffer[..read]);
+        let (count, sha256) = match carried {
+            Some(read) => read,
+            None => {
+                require_made_file(file, made, relative)?;
+                #[cfg(test)]
+                let at = self.final_file_path(relative);
+                #[cfg(test)]
+                if let Some(at) = &at {
+                    run_git_hook(GitHookPointV1::FinalDigestOpened, "", at);
                 }
-                Err(error) => return Err(io_refusal(relative, &error)),
+                let limit = made.length.saturating_add(1);
+                let mut context = digest::Context::new(&digest::SHA256);
+                let mut buffer = vec![0_u8; HASH_BUFFER_BYTES_V1];
+                let mut count = 0_u64;
+                while count < limit {
+                    let want = usize::try_from(limit - count)
+                        .map_or(buffer.len(), |left| left.min(buffer.len()));
+                    #[cfg(test)]
+                    let read = match reconcile_read_call(relative) {
+                        Some(error) => Err(error),
+                        None => file.read_at(&mut buffer[..want], count),
+                    };
+                    #[cfg(not(test))]
+                    let read = file.read_at(&mut buffer[..want], count);
+                    match read {
+                        Ok(0) => break,
+                        Ok(read) => {
+                            count = count.saturating_add(read as u64);
+                            context.update(&buffer[..read]);
+                        }
+                        Err(error) => return Err(io_refusal(relative, &error)),
+                    }
+                }
+                #[cfg(test)]
+                if let Some(at) = &at {
+                    run_git_hook(GitHookPointV1::FinalDigestHashed, "", at);
+                }
+                let mut sha256 = [0_u8; 32];
+                sha256.copy_from_slice(context.finish().as_ref());
+                (count, sha256)
             }
-        }
-        #[cfg(test)]
-        if let Some(at) = &at {
-            run_git_hook(GitHookPointV1::FinalDigestHashed, "", at);
-        }
+        };
         if count > made.length {
             return Err(digest_identity(
                 relative,
@@ -8727,8 +9056,6 @@ impl<'a> ProofRunV1<'a> {
             return Err(final_tree(relative.to_owned(), FinalTreeFaultV1::Bytes));
         }
         require_made_file(file, made, relative)?;
-        let mut sha256 = [0_u8; 32];
-        sha256.copy_from_slice(context.finish().as_ref());
         if sha256 != made.sha256 {
             return Err(final_tree(relative.to_owned(), FinalTreeFaultV1::Bytes));
         }

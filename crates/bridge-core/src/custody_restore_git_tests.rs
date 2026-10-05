@@ -24156,15 +24156,13 @@ struct FinalShapeV1 {
 }
 
 impl FinalShapeV1 {
-    /// The guards of the sweep's staging chains: the work and plain chain (a guard, one between its two
-    /// entries) and each staging directory's (a guard, then one before each entry after the first: the work
-    /// and plain entries and one per component of its key, so one between every two).
+    /// The guards of the sweep's staging chains, ONE UNIT PER RETAINED EDGE, each behind its own guard and each
+    /// attempted once (follow-on 1 targeted repair; before it the work and plain entries were replayed for every
+    /// staging key and every key's prefixes were replayed): the work directory's entry (`chain`), the plain
+    /// directory's, and each retained staging directory's, once, in key order (`chain-step`).
     fn staging_chain_events(&self) -> Vec<&'static str> {
         let mut events = vec!["chain", "chain-step"];
-        for depth in &self.staging_depths {
-            events.push("chain");
-            events.extend(std::iter::repeat_n("chain-step", 1 + depth));
-        }
+        events.extend(std::iter::repeat_n("chain-step", self.staging_depths.len()));
         events
     }
 
@@ -25081,7 +25079,9 @@ fn b2c_a_retained_chain_swapped_in_the_final_gates_or_the_root_swapped_last_is_r
         },
         RowV1 {
             name: "a staging directory, after the work and plain entries were checked",
-            index: first_chain + 4,
+            // One unit per retained edge: the work entry's guard, the plain entry's, then the first staging
+            // directory's (follow-on 1 targeted repair: it used to be the fifth, behind a replay of work and plain).
+            index: first_chain + 2,
             label: "chain-step",
             swap: |root, outside| {
                 swap_directory(&root.join(".restore-work/plain/control"), outside)
@@ -26739,12 +26739,19 @@ fn b2c_the_final_region_names_only_the_final_vocabulary_and_the_split_is_unique(
     for (name, at_least) in [
         ("final_sweep_chains(", 2),
         ("final_source_files_unchanged(", 2),
-        ("final_staging_chain(", 3),
-        ("observed_stat(", 3),
+        ("observed_stat(", 2),
     ] {
         assert!(
             code.matches(name).count() >= at_least,
             "the final region uses `{name}` at least {at_least} times"
+        );
+    }
+    // The census's two recording units (a directory's `fstat`, the repository's included, and a file's descriptor)
+    // each read what they record through the stalled-clock seam.
+    for unit in ["fn census_stat(", "fn census_file("] {
+        assert!(
+            body_of(source, unit).contains("observed_stat("),
+            "`{unit}` records a fact without the stalled-clock seam"
         );
     }
     // The wrapper calls each earlier helper exactly once, in the documented order, with the one deadline.
@@ -26896,9 +26903,9 @@ fn b2c_the_final_gate_order_is_fixed_in_the_source() {
         "the paced settlement is held to the deadline and never completes"
     );
     let order = [
-        at(paced, ".proof_measure(&paced)"),
+        at(paced, ".proof_census(&paced"),
         at(paced, "final_unchanged("),
-        at(paced, ".proof_digests_counted(&measured, &paced"),
+        at(paced, ".proof_digests_counted("),
         at(paced, ".proof_deadline_gate("),
     ];
     assert!(order.windows(2).all(|pair| pair[0] < pair[1]), "{order:?}");
@@ -26918,7 +26925,8 @@ fn b2c_the_final_gate_order_is_fixed_in_the_source() {
     );
     let order = [
         at(reconcile, "refuse_mounts_within("),
-        at(reconcile, "self.proof_measure(pace)"),
+        at(reconcile, "self.proof_census(pace"),
+        at(reconcile, "final_unchanged("),
         at(reconcile, "self.proof_retained_digests("),
         at(reconcile, "self.proof_chains(pace"),
     ];
@@ -26967,6 +26975,36 @@ fn b2c_the_final_gate_order_is_fixed_in_the_source() {
     assert!(
         !source.contains("fn reconciling_digest(") && !source.contains("DigestBoundV1"),
         "no failure-only digest reopens a name or retries an interruption"
+    );
+    // Progress is kept CALL by call and never as one boolean for a class (follow-on 1 targeted repair): the
+    // settlement's census is a resumable value the completion continues, the digest cursor carries the bytes a paced
+    // read returned, a name refusal settles no digest (only a verdict about the original bytes does), and the
+    // comparison with the baseline is unavailable after a finding.
+    assert!(
+        !source.contains("tree: Cell<bool>") && !source.contains("settled.tree"),
+        "no stage-wide boolean stands for the whole census"
+    );
+    let census = body_of(source, "fn proof_census(");
+    assert!(
+        census.contains("if c.ended || c.finished") && census.contains("collect"),
+        "the census is resumable and a completion collects each finding"
+    );
+    let digest = body_of(source, "fn proof_digest_file(");
+    let read = at(digest, "seen.read.set(Some((read, sha256)))");
+    assert!(
+        at(digest, "stream_digest(") < read && read < at(digest, "pace(\"final-digest-read\")"),
+        "the bytes a paced read returned are recorded before the guard that follows the read"
+    );
+    assert!(
+        digest[..at(digest, "stream_digest(")]
+            .matches("seen.settle()")
+            .count()
+            == 0,
+        "a refusal of the name (the open, the binding fstat) settles no digest"
+    );
+    assert!(
+        reconcile.contains("!settled.census.faulted"),
+        "the comparison needs a complete census that found nothing"
     );
     assert!(
         child.contains("self.proof_settle(&baseline, label, verdict, beside, exit)"),
@@ -27985,6 +28023,7 @@ fn bracket_row(
                         after,
                         clean,
                         owed_after_the_slow_call(bracket, site),
+                        attempted_in_phase(&log[..=at], bracket == BracketV1::Settlement),
                     ));
                 }
                 // A pre-spawn callback's refusal makes a failure known before the child starts, and a known
@@ -28222,6 +28261,50 @@ fn owed_after_the_slow_call(bracket: BracketV1, site: SiteV1) -> FailureOnlyV1 {
     }
 }
 
+/// The units of the census and of the admitted-file chain that the PACED part of a final child's bracket had
+/// already made a call for when a slow call returned (the slow call included), counted from the hooks that stand
+/// right after each call: a completion never makes such a call again (follow-on 1 targeted repair), so it is owed
+/// only the rest.
+#[derive(Clone, Copy, Debug, Default)]
+struct AttemptedV2 {
+    stats: usize,
+    listed: usize,
+    entries: usize,
+    opened: usize,
+    sources: usize,
+}
+
+/// [`AttemptedV2`] from the events up to and including the slow call. A post-exit callback's own part starts at its
+/// callback (its gate has no census, only admitted-file rechecks); a settlement's starts at its first census call
+/// after that callback, which is also where its terminal gate's admitted-file rechecks belong.
+fn attempted_in_phase(prefix: &[SeenV1], settlement: bool) -> AttemptedV2 {
+    let exit = prefix
+        .iter()
+        .rposition(|seen| matches!(seen, SeenV1::Hook(GitHookPointV1::AfterFinalChild)))
+        .unwrap_or(0);
+    let start = if settlement {
+        prefix[exit..]
+            .iter()
+            .position(|seen| matches!(seen, SeenV1::Hook(GitHookPointV1::FinalCensusStatted)))
+            .map_or(prefix.len(), |at| exit + at)
+    } else {
+        exit
+    };
+    let count = |point| {
+        prefix[start..]
+            .iter()
+            .filter(|seen| matches!(seen, SeenV1::Hook(found) if *found == point))
+            .count()
+    };
+    AttemptedV2 {
+        stats: count(GitHookPointV1::FinalCensusStatted),
+        listed: count(GitHookPointV1::FinalCensusListed),
+        entries: count(GitHookPointV1::BeforeFinalCensusOpen),
+        opened: count(GitHookPointV1::FinalFileOpened),
+        sources: count(GitHookPointV1::FinalSourceStatted),
+    }
+}
+
 /// Judges what followed a slow call that returned after the deadline (`after` starts right after it). The ONLY
 /// event allowed before the reconciliation is the guard that read the clock (a bounded digest read reads it
 /// itself, unlogged); the reconciliation itself reads no clock and begins and resumes no child. Each class of
@@ -28232,6 +28315,7 @@ fn failure_only_reconciliation(
     after: &[SeenV1],
     clean: &FinalShapeV1,
     scope: FailureOnlyV1,
+    attempted: AttemptedV2,
 ) -> Vec<String> {
     let reconcile = match after.split_first() {
         Some((SeenV1::Guard(_), reconcile)) => reconcile,
@@ -28279,30 +28363,63 @@ fn failure_only_reconciliation(
         judged.push(format!("{mounts} mount censuses, {want_mounts} owed"));
     }
     let one_census = 1 + clean.tree_dirs;
-    let stats = count(&|seen| matches!(seen, SeenV1::Hook(GitHookPointV1::FinalCensusStatted)));
+    let hooks = |point| count(&|seen| matches!(seen, SeenV1::Hook(found) if *found == point));
+    let stats = hooks(GitHookPointV1::FinalCensusStatted);
+    let listed = hooks(GitHookPointV1::FinalCensusListed);
+    let entries = hooks(GitHookPointV1::BeforeFinalCensusOpen);
+    let opened = hooks(GitHookPointV1::FinalFileOpened);
     let files = clean.object_files + clean.metadata_files;
-    let digests =
-        count(&|seen| matches!(seen, SeenV1::Hook(GitHookPointV1::FinalDigestFileOpened)));
-    let sources = count(&|seen| matches!(seen, SeenV1::Hook(GitHookPointV1::FinalSourceStatted)));
-    let staging = count(&|seen| matches!(seen, SeenV1::Hook(GitHookPointV1::FinalStagingChecked)));
-    // (class, found, exactly-once count)
-    for (class, found, whole, owed) in [
-        ("directory censuses", stats, one_census, scope.census),
-        ("digests", digests, files, scope.digests),
+    let digests = hooks(GitHookPointV1::FinalDigestFileOpened);
+    let sources = hooks(GitHookPointV1::FinalSourceStatted);
+    let staging = hooks(GitHookPointV1::FinalStagingChecked);
+    // (class, found, whole, already attempted by the paced part before the completion, owed). A unit whose call
+    // RETURNED before the guard found the deadline spent is attempted: the completion carries its fact and never
+    // makes the call again (follow-on 1 targeted repair), so a class owed `Once` is owed exactly the units of it
+    // that no call had returned for.
+    for (class, found, whole, done, owed) in [
+        (
+            "directory censuses",
+            stats,
+            one_census,
+            attempted.stats,
+            scope.census,
+        ),
+        (
+            "directory listings",
+            listed,
+            one_census,
+            attempted.listed,
+            scope.census,
+        ),
+        (
+            "entry censuses",
+            entries,
+            clean.tree_entries,
+            attempted.entries,
+            scope.census,
+        ),
+        ("file opens", opened, files, attempted.opened, scope.census),
+        ("digests", digests, files, 0, scope.digests),
         (
             "admitted-file rechecks",
             sources,
             clean.object_files,
+            attempted.sources,
             scope.sources,
         ),
     ] {
         let wrong = match owed {
-            OwedV1::Once => found != whole,
+            OwedV1::Once => found + done != whole,
             OwedV1::Never => found != 0,
-            OwedV1::Early => found == 0 || found > whole,
+            // An early stop is bounded by what the class holds, and an entry the child added is one more name.
+            OwedV1::Early => {
+                found + done > whole + 1 || (class == "directory censuses" && found + done == 0)
+            }
         };
         if wrong {
-            judged.push(format!("{found} {class}, {owed:?} of {whole} owed"));
+            judged.push(format!(
+                "{found} {class} (and {done} already attempted), {owed:?} of {whole} owed"
+            ));
         }
     }
     let wrong = match scope.staging {
@@ -28542,7 +28659,11 @@ fn known_row(capsule: &CustomCapsuleV1, clean: &FinalShapeV1, row: &KnownRowV1) 
     }
     match row.reconciled {
         ReconciledV1::Once(scope) => {
-            judged.extend(failure_only_reconciliation(after, clean, scope));
+            let attempted = match row.when {
+                KnownWhenV1::AfterChild => AttemptedV2::default(),
+                KnownWhenV1::SlowSettlement(..) => attempted_in_phase(&log[..=known], true),
+            };
+            judged.extend(failure_only_reconciliation(after, clean, scope, attempted));
         }
         ReconciledV1::TreeAfterTheGate => {
             let count =
@@ -28921,11 +29042,25 @@ enum ExpectedFailureV1 {
     Mount,
     /// An I/O refusal whose detail names this file.
     Io(&'static str),
+    /// A link refused, never followed, by exactly this name.
+    Symlink(&'static str),
+    /// The comparison with the pre-child baseline refused (a read-only child changed the final repository).
+    Changed,
 }
 
 impl ExpectedFailureV1 {
     fn is(&self, error: &GitBootstrapErrorV1) -> bool {
         match self {
+            Self::Symlink(needle) => matches!(
+                error,
+                GitBootstrapErrorV1::Restore(CustodyRestoreErrorV1::SymlinkRefused { name })
+                    if name == needle
+            ),
+            Self::Changed => matches!(
+                error,
+                GitBootstrapErrorV1::Restore(CustodyRestoreErrorV1::Budget(detail))
+                    if detail.contains("a read-only child changed the final repository")
+            ),
             Self::Timeout => is_timeout(error),
             Self::Drift => is_binary_drift(error),
             Self::Child(command, status) => is_git_child(error, command, *status),
@@ -29880,4 +30015,1136 @@ fn b2c_the_diagnostics_name_the_database_that_was_read() {
         failure.cause
     );
     assert_eq!(failure.last_completed, Some(GitPlaneStepV1::Indexing));
+}
+
+// ---------------------------------------------------------------------------------------------
+// Follow-on 1 targeted repair (before follow-on 2/2): the three closed C/D/R progress classes
+//
+// Source follow-on 1/2 found that the progress model collapsed what had RUN into one boolean or one compound unit:
+// (1) the census of the exact tree was one fail-fast unit, so a second replaced sibling went unreported and a call
+// that had returned before its guard found the deadline spent was made again; (2) a paced digest's NAME refusal
+// settled the retained descriptor's digest, and bytes already read were read again after the following guard;
+// (3) a staging chain was one unit that replayed the work and plain entries for every key, so one refusal hid the
+// next retained edge and was repeated. These rows drive the REAL wrapper over REAL Git with a routed final `fsck`
+// child and the real runner, and use only hooks, the stalled-clock seam, the mount-census seam and the failure-only
+// read counter that already existed at de4164. A unit is ATTEMPTED when its call returned; a returned fact is
+// carried, never re-observed; every other unit still runs exactly once; a refusal of one unit settles no other.
+// ---------------------------------------------------------------------------------------------
+
+/// One event of a watched run, recorded from the final stage's entry guard on.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum EvV2 {
+    /// A hook that stands right after a call, with the path it was made on.
+    Hook(GitHookPointV1, PathBuf),
+    /// One of the three hooks that open a part of a final child's bracket, with the child's label.
+    Child(GitHookPointV1, &'static str),
+    /// The clock was read for this step.
+    Guard(&'static str),
+    /// The mount census ran.
+    Mount,
+}
+
+/// What a watched run calls after each recorded event, with the log so far.
+type ActV2 = std::rc::Rc<dyn Fn(&[EvV2])>;
+
+/// A watched run: the outcome, every recorded event, and every read call the failure-only digest made.
+struct WatchedV2 {
+    ran: PlaneRunV1,
+    log: Vec<EvV2>,
+    reads: BTreeMap<String, u32>,
+}
+
+/// The real wrapper under `deadline` with every hook, guard, and mount census recorded from the final stage's entry
+/// guard on, and `act` called after each recorded event with the log so far (its last element is the new event).
+/// The act may change the filesystem or make a call slow; it must not re-enter the wrapper.
+fn run_watched_v2(
+    input: PlaneInV1,
+    route: &RouteV1,
+    deadline: Instant,
+    stalled: bool,
+    act: impl Fn(&[EvV2]) + 'static,
+) -> WatchedV2 {
+    let log: std::rc::Rc<std::cell::RefCell<Vec<EvV2>>> = std::rc::Rc::default();
+    let armed = std::rc::Rc::new(std::cell::Cell::new(false));
+    let act: ActV2 = std::rc::Rc::new(act);
+    let record: std::rc::Rc<dyn Fn(EvV2)> = {
+        let (log, armed) = (log.clone(), armed.clone());
+        std::rc::Rc::new(move |event: EvV2| {
+            if !armed.get() {
+                return;
+            }
+            log.borrow_mut().push(event);
+            act(&log.borrow());
+        })
+    };
+    let mut hooks = Vec::new();
+    for point in CALL_POINTS_V1 {
+        let record = record.clone();
+        hooks.push(install_git_hook_for_test(point, move |event| {
+            record(EvV2::Hook(point, event.path.to_path_buf()));
+        }));
+    }
+    for point in [
+        GitHookPointV1::BeforeFinalChildCensus,
+        GitHookPointV1::BeforeFinalChild,
+        GitHookPointV1::AfterFinalChild,
+    ] {
+        let record = record.clone();
+        hooks.push(install_git_hook_for_test(point, move |event| {
+            record(EvV2::Child(point, event.label));
+        }));
+    }
+    {
+        let (armed, record) = (armed.clone(), record.clone());
+        hooks.push(install_git_hook_for_test(
+            GitHookPointV1::DeadlineObserved,
+            move |event| {
+                if event.label == "final-entry" {
+                    armed.set(true);
+                }
+                record(EvV2::Guard(event.label));
+            },
+        ));
+    }
+    let census = {
+        let record = record.clone();
+        crate::custody_mounts::seam::install(Box::new(move |_| {
+            record(EvV2::Mount);
+            Ok(vec![b"/".to_vec()])
+        }))
+    };
+    let _clocks = stalled.then(|| stall_census_clocks_for_test(BOTH_CLOCKS_V1));
+    let watch = watch_reconcile_reads_for_test(None);
+    let ran = run_plane(input, route, deadline);
+    let reads = reconcile_read_calls_for_test();
+    drop(watch);
+    drop(hooks);
+    drop(census);
+    let log = log.borrow().clone();
+    WatchedV2 { ran, log, reads }
+}
+
+/// Whether the final `fsck` child's post-exit callback has begun.
+fn exited_v2(log: &[EvV2]) -> bool {
+    log.iter().any(|event| {
+        matches!(
+            event,
+            EvV2::Child(GitHookPointV1::AfterFinalChild, "fsck --strict")
+        )
+    })
+}
+
+/// The events from the final `fsck` child's post-exit callback to the staged rewinds (or the end of the run).
+fn settlement_window_v2(log: &[EvV2]) -> &[EvV2] {
+    let from = log
+        .iter()
+        .position(|event| {
+            matches!(
+                event,
+                EvV2::Child(GitHookPointV1::AfterFinalChild, "fsck --strict")
+            )
+        })
+        .map_or(log.len(), |at| at + 1);
+    let to = log
+        .iter()
+        .position(|event| *event == EvV2::Guard("final-rewind"))
+        .unwrap_or(log.len())
+        .max(from);
+    &log[from..to]
+}
+
+fn hooks_v2(window: &[EvV2], point: GitHookPointV1) -> usize {
+    window
+        .iter()
+        .filter(|event| matches!(event, EvV2::Hook(found, _) if *found == point))
+        .count()
+}
+
+/// The typed failures of `error`, in order, against `want`, or what they were.
+fn judge_leaves_v2(error: &GitBootstrapErrorV1, want: &[ExpectedFailureV1]) -> Option<String> {
+    let held = leaves(error);
+    (held.len() != want.len() || !held.iter().zip(want).all(|(error, want)| want.is(error)))
+        .then(|| format!("the typed failures were {held:?}, wanted {want:?}"))
+}
+
+/// What every failing row of the repair keeps: the typed last step, the one ledger, every child that started,
+/// the proofs that had returned, and the materialization that began.
+fn judge_failure_v2(
+    failure: &GitPlaneRestoreFailureV1,
+    route: &RouteV1,
+    clean: &FinalShapeV1,
+    recorded: usize,
+) -> Vec<String> {
+    let mut judged = Vec::new();
+    if failure.last_completed != Some(GitPlaneStepV1::Config)
+        || !failure.active_materialization_began
+    {
+        judged.push(format!("completed {:?}", failure.last_completed));
+    }
+    if route.children().len() != 9 {
+        judged.push(format!("children {:?}", route.children()));
+    }
+    if failure.partial.final_runs.len() != recorded {
+        judged.push(format!(
+            "{} proofs, {recorded} had returned",
+            failure.partial.final_runs.len()
+        ));
+    }
+    if failure.ledger_used != clean.ledger {
+        judged.push(format!(
+            "ledger {} not {}",
+            failure.ledger_used, clean.ledger
+        ));
+    }
+    judged
+}
+
+/// The restored files' relative names, in path order, as the failure retains them.
+fn restored_files_v2(failure: &GitPlaneRestoreFailureV1) -> Vec<String> {
+    let mut names = std::collections::BTreeSet::new();
+    if let PlaneObjectsV1::Whole(objects) = &failure.partial.objects {
+        names.extend(objects.files.iter().map(|file| file.relative.clone()));
+    }
+    if let PlaneMetadataV1::Whole(metadata) = &failure.partial.metadata {
+        names.extend(metadata.files.iter().map(|file| file.relative.clone()));
+    }
+    names.into_iter().collect()
+}
+
+type RcCellV2<T> = std::rc::Rc<std::cell::Cell<T>>;
+
+/// FINDING 1 (census siblings). A successful final child, then a detached helper replaces expected restored files
+/// by other inodes after the post-exit gate and before the settlement's census. Every replaced sibling is its own
+/// typed finding: the census meets the first and the completion goes on to the next without descending either
+/// (the census used to return at the first and mark itself complete), and the chain of each is refused too. A lone
+/// replacement is the control: exactly one finding of its own, never duplicated.
+#[test]
+fn b2c_two_replaced_census_siblings_are_both_typed_findings_and_a_lone_one_is_reported_once() {
+    let capsule = captured(CustodyGitObjectFormatV1::Sha1);
+    let clean = clean_final_shape(&capsule, CustodyGitObjectFormatV1::Sha1, true);
+    let mut problems = Vec::new();
+    for (name, replaced) in [
+        ("two replaced siblings", vec!["HEAD", "ORIG_HEAD"]),
+        ("one replaced sibling (the control)", vec!["HEAD"]),
+    ] {
+        let input = PlaneInV1::rich(&capsule, CustodyGitObjectFormatV1::Sha1);
+        let git = input.dest.path.join("repository/.git");
+        let (_area, outside) = external_dir_with(&["decoy"]);
+        let acted: RcCellV2<bool> = RcCellV2::default();
+        let (done, files) = (acted.clone(), replaced.clone());
+        let act = move |log: &[EvV2]| {
+            if !done.get()
+                && exited_v2(log)
+                && matches!(
+                    log.last(),
+                    Some(EvV2::Hook(GitHookPointV1::FinalCensusStatted, _))
+                )
+            {
+                done.set(true);
+                for file in &files {
+                    replace_with_other_bytes(&git.join(file), &outside);
+                }
+            }
+        };
+        let route = RouteV1::recorder();
+        let watched = run_watched_v2(input, &route, far_deadline(), false, act);
+        if !acted.get() {
+            problems.push(format!("{name}: the replacement was never made"));
+            continue;
+        }
+        let Err(failure) = &watched.ran.outcome else {
+            problems.push(format!("{name}: a success followed the replacement"));
+            continue;
+        };
+        let held = leaves(&failure.cause);
+        let mut judged = judge_failure_v2(failure, &route, &clean, 3);
+        let n = replaced.len();
+        let census: Vec<ExpectedFailureV1> = replaced
+            .iter()
+            .map(|file| ExpectedFailureV1::Tree(FinalTreeFaultV1::Replaced, file))
+            .collect();
+        let chains: Vec<ExpectedFailureV1> = replaced
+            .iter()
+            .map(|file| match *file {
+                "HEAD" => ExpectedFailureV1::Identity(".git/HEAD"),
+                _ => ExpectedFailureV1::Identity(".git/ORIG_HEAD"),
+            })
+            .collect();
+        let ordered = held.len() == 2 * n
+            && held[..n]
+                .iter()
+                .zip(&census)
+                .all(|(error, want)| want.is(error));
+        // The two chains are in the restore's file order: each named exactly once, after the census's findings.
+        let chained = held.len() == 2 * n
+            && chains
+                .iter()
+                .all(|want| held[n..].iter().filter(|error| want.is(error)).count() == 1);
+        if !(ordered && chained) {
+            judged.push(format!(
+                "the typed failures were {held:?}, wanted the census findings {census:?} then the chains {chains:?}"
+            ));
+        }
+        if !judged.is_empty() {
+            problems.push(format!("{name}: {}", judged.join("; ")));
+        }
+    }
+    assert!(problems.is_empty(), "{}", problems.join("\n"));
+}
+
+/// FINDING 1 (slow call). The settlement's census is made slow at one call (its repository `fstat`, a listing, an
+/// entry's `fstatat`, a file's `open`) so that the call RETURNS after the deadline and the next guard finds it
+/// spent. That call is attempted: its fact is carried and the completion never makes it again, and every unit that
+/// had no call yet runs exactly once, so each kind of call is made exactly as often as one clean census makes it
+/// (it used to be made again for every unit already attempted, from the repository on). The controls: no slow call
+/// (a success, the same totals), and, beside a slow `fstat`, an added entry (the census reports it, and the
+/// comparison with the baseline is unavailable after a faulted census: it reports nothing) and a touched file (a
+/// complete clean census, so the comparison runs and reports the change).
+#[test]
+fn b2c_a_returned_slow_census_call_is_counted_once_and_every_unattempted_unit_still_runs_once() {
+    #[derive(Clone, Copy)]
+    enum Make {
+        Nothing,
+        Slow,
+        SlowAndStray,
+        SlowAndTouch,
+    }
+    struct RowV2 {
+        name: &'static str,
+        point: GitHookPointV1,
+        regular_only: bool,
+        make: Make,
+        /// Whether the totals of every kind of call are held to one clean census's.
+        totals: bool,
+    }
+    let capsule = captured(CustodyGitObjectFormatV1::Sha1);
+    let clean = clean_final_shape(&capsule, CustodyGitObjectFormatV1::Sha1, true);
+    let files = clean.object_files + clean.metadata_files;
+    let one_census = 1 + clean.tree_dirs;
+    let rows = [
+        RowV2 {
+            name: "the repository's fstat returned late",
+            point: GitHookPointV1::FinalCensusStatted,
+            regular_only: false,
+            make: Make::Slow,
+            totals: true,
+        },
+        RowV2 {
+            name: "a listing returned late",
+            point: GitHookPointV1::FinalCensusListed,
+            regular_only: false,
+            make: Make::Slow,
+            totals: true,
+        },
+        RowV2 {
+            name: "a regular entry's fstatat returned late",
+            point: GitHookPointV1::BeforeFinalCensusOpen,
+            regular_only: true,
+            make: Make::Slow,
+            totals: true,
+        },
+        RowV2 {
+            name: "a regular file's open returned late",
+            point: GitHookPointV1::FinalFileOpened,
+            regular_only: true,
+            make: Make::Slow,
+            totals: true,
+        },
+        RowV2 {
+            name: "control: no slow call",
+            point: GitHookPointV1::FinalCensusStatted,
+            regular_only: false,
+            make: Make::Nothing,
+            totals: true,
+        },
+        RowV2 {
+            name: "control: a slow fstat beside an added entry (the comparison is unavailable)",
+            point: GitHookPointV1::FinalCensusStatted,
+            regular_only: false,
+            make: Make::SlowAndStray,
+            totals: false,
+        },
+        RowV2 {
+            name: "control: a slow fstat beside a touched file (a complete clean census: the comparison runs)",
+            point: GitHookPointV1::FinalCensusStatted,
+            regular_only: false,
+            make: Make::SlowAndTouch,
+            totals: false,
+        },
+    ];
+    let problems: Vec<String> = std::thread::scope(|scope| {
+        let handles: Vec<_> = rows
+            .iter()
+            .map(|row| {
+                let (capsule, clean) = (&capsule, &clean);
+                scope.spawn(move || {
+                    let input = PlaneInV1::rich(capsule, CustodyGitObjectFormatV1::Sha1);
+                    let git = input.dest.path.join("repository/.git");
+                    let deadline = Instant::now() + B2C_DEADLINE_V1;
+                    let acted: RcCellV2<bool> = RcCellV2::default();
+                    let done = acted.clone();
+                    let (point, regular_only, make) = (row.point, row.regular_only, row.make);
+                    let act = move |log: &[EvV2]| {
+                        let Some(EvV2::Hook(found, path)) = log.last() else {
+                            return;
+                        };
+                        if matches!(make, Make::Nothing)
+                            || done.get()
+                            || *found != point
+                            || !exited_v2(log)
+                            || (regular_only && !path.is_file())
+                        {
+                            return;
+                        }
+                        done.set(true);
+                        match make {
+                            Make::SlowAndStray => {
+                                std::fs::write(git.join("0stray"), b"").expect("a stray");
+                            }
+                            Make::SlowAndTouch => {
+                                std::fs::OpenOptions::new()
+                                    .write(true)
+                                    .open(git.join("HEAD"))
+                                    .and_then(|file| {
+                                        file.set_modified(
+                                            std::time::SystemTime::UNIX_EPOCH
+                                                + Duration::from_secs(1_000_000),
+                                        )
+                                    })
+                                    .expect("a touched file");
+                            }
+                            Make::Slow | Make::Nothing => {}
+                        }
+                        pass_the_deadline(deadline);
+                    };
+                    let route = RouteV1::recorder();
+                    let watched = run_watched_v2(input, &route, deadline, false, act);
+                    let mut judged = Vec::new();
+                    if !matches!(make, Make::Nothing) && !acted.get() {
+                        return vec![format!("{}: the slow call was never reached", row.name)];
+                    }
+                    match (&watched.ran.outcome, make) {
+                        (Ok(_), Make::Nothing) => {}
+                        (Ok(_), _) => judged.push("a success followed the expiry".to_owned()),
+                        (Err(failure), Make::Nothing) => {
+                            judged.push(format!("refused: {:?}", failure.cause));
+                        }
+                        (Err(failure), make) => {
+                            let want: Vec<ExpectedFailureV1> = match make {
+                                Make::SlowAndStray => vec![
+                                    ExpectedFailureV1::Timeout,
+                                    ExpectedFailureV1::Tree(FinalTreeFaultV1::Unexpected, "0stray"),
+                                ],
+                                Make::SlowAndTouch => {
+                                    vec![ExpectedFailureV1::Timeout, ExpectedFailureV1::Changed]
+                                }
+                                _ => vec![ExpectedFailureV1::Timeout],
+                            };
+                            judged.extend(judge_leaves_v2(&failure.cause, &want));
+                            judged.extend(judge_failure_v2(failure, &route, clean, 3));
+                        }
+                    }
+                    if row.totals {
+                        let window = settlement_window_v2(&watched.log);
+                        for (kind, point, whole) in [
+                            ("directory censuses", GitHookPointV1::FinalCensusStatted, one_census),
+                            ("directory listings", GitHookPointV1::FinalCensusListed, one_census),
+                            (
+                                "entry censuses",
+                                GitHookPointV1::BeforeFinalCensusOpen,
+                                clean.tree_entries,
+                            ),
+                            ("file opens", GitHookPointV1::FinalFileOpened, files),
+                        ] {
+                            let made = hooks_v2(window, point);
+                            if made != whole {
+                                judged.push(format!(
+                                    "{made} {kind} were made across the settlement and its completion, exactly {whole} (one clean census) owed"
+                                ));
+                            }
+                        }
+                    }
+                    if judged.is_empty() {
+                        Vec::new()
+                    } else {
+                        vec![format!("{}: {}", row.name, judged.join("; "))]
+                    }
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .flat_map(|handle| handle.join().expect("a slow-census row's thread"))
+            .collect()
+    });
+    assert!(problems.is_empty(), "{}", problems.join("\n"));
+}
+
+/// FINDING 2 (name versus retained descriptor). After a CLEAN census, at the barrier before the settlement's first
+/// digest open, a detached helper moves `ORIG_HEAD` away, rewrites the moved ORIGINAL inode in place at the same
+/// length (as a helper holding an inherited descriptor would), and puts a link at the name. The paced digest meets
+/// the link at the NAME and refuses; that settles nothing about the original inode: the completion still reads the
+/// RETAINED descriptor of `ORIG_HEAD` and reports its changed bytes, then reads every later file once. `HEAD`,
+/// whose paced digest ran to its verdict before the refusal, is not read again. The control leaves the original
+/// clean: no byte finding, but the retained descriptor of `ORIG_HEAD` and every later file is still observed.
+#[test]
+fn b2c_a_name_refusal_never_settles_the_retained_original_digest_and_the_later_descriptors_run_once(
+) {
+    let capsule = captured(CustodyGitObjectFormatV1::Sha1);
+    let clean = clean_final_shape(&capsule, CustodyGitObjectFormatV1::Sha1, true);
+    let mut problems = Vec::new();
+    for (name, rewrite) in [
+        ("the original inode rewritten in place", true),
+        ("control: the original inode left clean", false),
+    ] {
+        let input = PlaneInV1::rich(&capsule, CustodyGitObjectFormatV1::Sha1);
+        let git = input.dest.path.join("repository/.git");
+        let (_area, outside) = external_dir_with(&["decoy"]);
+        let acted: RcCellV2<bool> = RcCellV2::default();
+        let done = acted.clone();
+        let act = move |log: &[EvV2]| {
+            if !done.get() && exited_v2(log) && log.last() == Some(&EvV2::Guard("final-digest")) {
+                done.set(true);
+                let away = outside.join("ORIG_HEAD.away");
+                std::fs::rename(git.join("ORIG_HEAD"), &away).expect("the original moves away");
+                if rewrite {
+                    change_in_place(&away);
+                }
+                std::os::unix::fs::symlink(outside.join("decoy"), git.join("ORIG_HEAD"))
+                    .expect("a link takes the name");
+            }
+        };
+        let route = RouteV1::recorder();
+        let watched = run_watched_v2(input, &route, far_deadline(), false, act);
+        if !acted.get() {
+            problems.push(format!("{name}: the barrier was never reached"));
+            continue;
+        }
+        let Err(failure) = &watched.ran.outcome else {
+            problems.push(format!("{name}: a success followed the link"));
+            continue;
+        };
+        let mut want = vec![ExpectedFailureV1::Symlink("ORIG_HEAD")];
+        if rewrite {
+            want.push(ExpectedFailureV1::Tree(
+                FinalTreeFaultV1::Bytes,
+                "ORIG_HEAD",
+            ));
+        }
+        want.push(ExpectedFailureV1::Symlink("repository/.git/ORIG_HEAD"));
+        let mut judged: Vec<String> = judge_leaves_v2(&failure.cause, &want).into_iter().collect();
+        judged.extend(judge_failure_v2(failure, &route, &clean, 3));
+        let files = restored_files_v2(failure);
+        let observed: Vec<&String> = watched.reads.keys().collect();
+        let expected: Vec<&String> = files
+            .iter()
+            .filter(|file| file.as_str() >= "ORIG_HEAD")
+            .collect();
+        if files.first().map(String::as_str) != Some("HEAD") || observed != expected {
+            judged.push(format!(
+                "the retained descriptors observed were {observed:?}, wanted ORIG_HEAD and every later file {expected:?} (HEAD, before it, ran to its paced verdict; restored files {files:?})"
+            ));
+        }
+        for (file, calls) in &watched.reads {
+            if *calls == 0 || u64::from(*calls) > 64 {
+                judged.push(format!("{file}: {calls} read calls"));
+            }
+        }
+        if !judged.is_empty() {
+            problems.push(format!("{name}: {}", judged.join("; ")));
+        }
+    }
+    assert!(problems.is_empty(), "{}", problems.join("\n"));
+}
+
+/// FINDING 2 (bytes already read). A successful child rewrote `HEAD` in place with every clock stalled (only the
+/// digest sees it), and the settlement's paced digest of `HEAD` RETURNS its bytes; the call after it is made slow
+/// past the deadline, so the next guard finds it spent. Those bytes were read: the completion carries them, reports
+/// their verdict (here the changed bytes, though the helper has since put the original byte back, so a second read
+/// would see a clean file), and does not read `HEAD` again, while every later file is read once. The control makes
+/// the call BEFORE the read slow instead: no bytes had returned, so the retained descriptor of `HEAD` is read once.
+#[test]
+fn b2c_a_timeout_after_the_paced_digest_bytes_returned_does_not_reread_them() {
+    let capsule = captured(CustodyGitObjectFormatV1::Sha1);
+    let clean = clean_final_shape(&capsule, CustodyGitObjectFormatV1::Sha1, true);
+    let mut problems = Vec::new();
+    for (name, point, restore, carried) in [
+        (
+            "the digest's read returned, then the guard found the deadline spent",
+            GitHookPointV1::FinalDigestHashed,
+            true,
+            true,
+        ),
+        (
+            "control: the binding fstat returned (no byte read), then the read found the deadline spent",
+            GitHookPointV1::FinalDigestOpened,
+            false,
+            false,
+        ),
+    ] {
+        let input = PlaneInV1::rich(&capsule, CustodyGitObjectFormatV1::Sha1);
+        let head = input.dest.path.join("repository/.git/HEAD");
+        let deadline = Instant::now() + B2C_DEADLINE_V1;
+        let original: RcCellV2<Option<u8>> = RcCellV2::default();
+        let slowed: RcCellV2<bool> = RcCellV2::default();
+        let (remember, done) = (original.clone(), slowed.clone());
+        let act = move |log: &[EvV2]| {
+            match log.last() {
+                Some(EvV2::Child(GitHookPointV1::BeforeFinalChild, "fsck --strict")) => {
+                    remember.set(std::fs::read(&head).ok().and_then(|bytes| bytes.get(10).copied()));
+                }
+                Some(EvV2::Hook(found, path))
+                    if *found == point
+                        && !done.get()
+                        && exited_v2(log)
+                        && path.ends_with("repository/.git/HEAD") =>
+                {
+                    done.set(true);
+                    if restore {
+                        use std::os::unix::fs::FileExt as _;
+                        let byte = remember.get().expect("the original byte");
+                        std::fs::OpenOptions::new()
+                            .write(true)
+                            .open(path)
+                            .and_then(|file| file.write_all_at(&[byte], 10))
+                            .expect("the original byte is put back");
+                    }
+                    pass_the_deadline(deadline);
+                }
+                _ => {}
+            }
+        };
+        let route = RouteV1::new(&[("fsck --strict", &final_only(&format!("\"$REAL\" \"$@\"; {REWRITE_HEAD_V1}")))]);
+        let watched = run_watched_v2(input, &route, deadline, true, act);
+        if !slowed.get() {
+            problems.push(format!("{name}: the slow call was never reached"));
+            continue;
+        }
+        let Err(failure) = &watched.ran.outcome else {
+            problems.push(format!("{name}: a success followed the expiry"));
+            continue;
+        };
+        let want = [
+            ExpectedFailureV1::Timeout,
+            ExpectedFailureV1::Tree(FinalTreeFaultV1::Bytes, "HEAD"),
+        ];
+        let mut judged: Vec<String> = judge_leaves_v2(&failure.cause, &want).into_iter().collect();
+        judged.extend(judge_failure_v2(failure, &route, &clean, 3));
+        let files = restored_files_v2(failure);
+        let observed: Vec<&String> = watched.reads.keys().collect();
+        let expected: Vec<&String> = files
+            .iter()
+            .filter(|file| {
+                if carried {
+                    file.as_str() > "HEAD"
+                } else {
+                    file.as_str() >= "HEAD"
+                }
+            })
+            .collect();
+        if observed != expected {
+            judged.push(format!(
+                "the retained descriptors read were {observed:?}, wanted {expected:?} (HEAD's bytes {} returned)",
+                if carried { "had" } else { "had not" }
+            ));
+        }
+        if !judged.is_empty() {
+            problems.push(format!("{name}: {}", judged.join("; ")));
+        }
+    }
+    assert!(problems.is_empty(), "{}", problems.join("\n"));
+}
+
+/// A nested staging directory `parent/child`, created beneath the retained pin of the staging directory `parent` and
+/// retained as a staging key of its own, so that a staging chain has a prefix that is itself a retained edge (the
+/// fixture's staging directories are all one deep). Nothing is charged: it is an extra retained edge for the rows,
+/// not a restore step.
+fn add_nested_staging_v2(input: &PlaneInV1, parent: &[u8], child: &str) {
+    let destination = &input.verified.destination;
+    let nested = {
+        let staging = destination.staging.borrow();
+        let pin = staging.get(parent).unwrap_or_else(|| {
+            panic!(
+                "no staging directory {:?} among {:?}",
+                String::from_utf8_lossy(parent),
+                staging
+                    .keys()
+                    .map(|key| String::from_utf8_lossy(key).into_owned())
+                    .collect::<Vec<_>>()
+            )
+        });
+        pin.create_new_child_directory(std::ffi::OsStr::new(child), "a nested staging directory")
+            .expect("a nested staging directory")
+    };
+    let mut key = parent.to_vec();
+    key.push(b'/');
+    key.extend_from_slice(child.as_bytes());
+    destination
+        .staging
+        .borrow_mut()
+        .insert(key, std::rc::Rc::new(nested));
+}
+
+/// FINDING 3 (staging edges). The work directory and the plain directory beneath it are swapped TOGETHER (plain
+/// first, beneath the retained work directory, then the work directory beneath the retained root), so each retained
+/// edge is refused for its own reason: both identities are named, exactly once each, in custody order, and the
+/// root is the LAST unit when it is swapped too (a refusal of the work edge used to hide the plain edge and to
+/// repeat itself for every staging key). A bootstrap-directory swap alone is the control. A clean completion
+/// rechecks each retained staging edge exactly once: the work and plain entries and each staging directory, with no
+/// replay of a common prefix.
+#[test]
+fn b2c_work_and_plain_swapped_together_are_both_reported_once_each_with_unique_prefixes_and_the_root_last(
+) {
+    struct RowV2 {
+        name: &'static str,
+        shell: ShellV1,
+        timed_out: bool,
+        /// Whether a nested staging directory `control/nested` is retained as a staging key too.
+        nested: bool,
+        recorded: usize,
+        want: Vec<ExpectedFailureV1>,
+    }
+    let capsule = captured(CustodyGitObjectFormatV1::Sha1);
+    let clean = clean_final_shape(&capsule, CustodyGitObjectFormatV1::Sha1, true);
+    assert!(
+        !clean.staging_depths.is_empty(),
+        "the fixture holds a staging directory"
+    );
+    let work_name = || ExpectedFailureV1::Identity(".restore-work: ");
+    let plain_name = || ExpectedFailureV1::Identity(".restore-work/plain");
+    let rows = vec![
+        RowV2 {
+            name: "a child exited after swapping plain and then work",
+            shell: |_, outside| {
+                format!(
+                    "\"$REAL\" \"$@\"; mv ../.restore-work/plain ../.restore-work/plain.away; mkdir ../.restore-work/plain; mv ../.restore-work {o}/work-away; mkdir ../.restore-work",
+                    o = outside.display()
+                )
+            },
+            timed_out: false,
+            nested: false,
+            recorded: 2,
+            want: vec![work_name(), plain_name()],
+        },
+        RowV2 {
+            name: "a timed-out child swapped plain and then work",
+            shell: |_, outside| {
+                format!(
+                    "mv ../.restore-work/plain ../.restore-work/plain.away; mkdir ../.restore-work/plain; mv ../.restore-work {o}/work-away; mkdir ../.restore-work; sleep 30",
+                    o = outside.display()
+                )
+            },
+            timed_out: true,
+            nested: false,
+            recorded: 2,
+            want: vec![ExpectedFailureV1::Timeout, work_name(), plain_name()],
+        },
+        RowV2 {
+            name: "a timed-out child swapped plain, then work, then the root",
+            shell: |root, outside| {
+                format!(
+                    "mv ../.restore-work/plain ../.restore-work/plain.away; mkdir ../.restore-work/plain; mv ../.restore-work {o}/work-away; mkdir ../.restore-work; mv {r} {o}/root-away; mkdir {r}; sleep 30",
+                    o = outside.display(),
+                    r = root.display()
+                )
+            },
+            timed_out: true,
+            nested: false,
+            recorded: 2,
+            want: vec![
+                ExpectedFailureV1::Timeout,
+                work_name(),
+                plain_name(),
+                ExpectedFailureV1::Identity("pinned scan root"),
+            ],
+        },
+        RowV2 {
+            name: "control: a timed-out child swapped one bootstrap directory",
+            shell: |_, outside| {
+                format!(
+                    "mv ../.restore-work/git-bootstrap/objects {o}/objects-away; mkdir ../.restore-work/git-bootstrap/objects; sleep 30",
+                    o = outside.display()
+                )
+            },
+            timed_out: true,
+            nested: false,
+            recorded: 2,
+            want: vec![
+                ExpectedFailureV1::Timeout,
+                ExpectedFailureV1::Identity("git-bootstrap/objects"),
+            ],
+        },
+        RowV2 {
+            name:
+                "a timed-out child swapped a nested staging directory and then its retained parent",
+            shell: |_, outside| {
+                format!(
+                    "mv ../.restore-work/plain/control/nested {o}/nested-away; mkdir ../.restore-work/plain/control/nested; mv ../.restore-work/plain/control {o}/control-away; mkdir ../.restore-work/plain/control; sleep 30",
+                    o = outside.display()
+                )
+            },
+            timed_out: true,
+            nested: true,
+            recorded: 2,
+            want: vec![
+                ExpectedFailureV1::Timeout,
+                ExpectedFailureV1::Identity(".restore-work/plain/control: "),
+                ExpectedFailureV1::Identity(".restore-work/plain/control/nested"),
+            ],
+        },
+        RowV2 {
+            name: "control: a timed-out child that left nothing is the bare timeout",
+            shell: |_, _| "sleep 30".to_owned(),
+            timed_out: true,
+            nested: true,
+            recorded: 2,
+            want: vec![ExpectedFailureV1::Timeout],
+        },
+    ];
+    let mut problems = Vec::new();
+    for row in rows {
+        let input = PlaneInV1::rich(&capsule, CustodyGitObjectFormatV1::Sha1);
+        if row.nested {
+            add_nested_staging_v2(&input, b"control", "nested");
+        }
+        let retained_staging = input.verified.destination.staging.borrow().len();
+        let root = input.dest.path.clone();
+        let (_area, outside) = external_dir_with(&["decoy"]);
+        let deadline = if row.timed_out {
+            Instant::now() + B2C_DEADLINE_V1
+        } else {
+            far_deadline()
+        };
+        let body = final_only(&(row.shell)(&root, &outside));
+        let route = RouteV1::new(&[("fsck --strict", body.as_str())]);
+        let watched = run_watched_v2(input, &route, deadline, false, |_| {});
+        let Err(failure) = &watched.ran.outcome else {
+            problems.push(format!("{}: a success", row.name));
+            continue;
+        };
+        let mut judged: Vec<String> = judge_leaves_v2(&failure.cause, &row.want)
+            .into_iter()
+            .collect();
+        judged.extend(judge_failure_v2(failure, &route, &clean, row.recorded));
+        if row
+            .name
+            .starts_with("control: a timed-out child that left nothing")
+        {
+            // No gate saw a timed-out child, so the whole staging chain is the completion's: each retained edge
+            // (work, plain, and every staging directory) exactly once.
+            let staging = hooks_v2(
+                settlement_window_v2(&watched.log),
+                GitHookPointV1::FinalStagingChecked,
+            );
+            let whole = 2 + retained_staging;
+            if staging != whole {
+                judged.push(format!(
+                    "{staging} staging rechecks, exactly {whole} (work, plain, and {retained_staging} retained staging directories, each once) owed"
+                ));
+            }
+        }
+        if !judged.is_empty() {
+            problems.push(format!("{}: {}", row.name, judged.join("; ")));
+        }
+    }
+    assert!(problems.is_empty(), "{}", problems.join("\n"));
+}
+
+/// FINDING 3 (admitted source files). A retained admitted bootstrap file is two calls: its entry by name, and its
+/// retained descriptor. The post-exit gate's guard between them finds the deadline spent: the entry check had
+/// returned, so it is attempted and the completion does not make it again, while the descriptor check (no call
+/// yet) is made: each admitted file's entry is checked exactly once across the gate and its completion.
+#[test]
+fn b2c_a_gate_stopped_between_an_admitted_files_two_calls_does_not_repeat_the_first() {
+    let capsule = captured(CustodyGitObjectFormatV1::Sha1);
+    let clean = clean_final_shape(&capsule, CustodyGitObjectFormatV1::Sha1, true);
+    let input = PlaneInV1::rich(&capsule, CustodyGitObjectFormatV1::Sha1);
+    let deadline = Instant::now() + B2C_DEADLINE_V1;
+    let slowed: RcCellV2<bool> = RcCellV2::default();
+    let done = slowed.clone();
+    let act = move |log: &[EvV2]| {
+        if !done.get()
+            && exited_v2(log)
+            && matches!(
+                log.last(),
+                Some(EvV2::Hook(GitHookPointV1::FinalSourceStatted, _))
+            )
+        {
+            done.set(true);
+            pass_the_deadline(deadline);
+        }
+    };
+    let route = RouteV1::recorder();
+    let watched = run_watched_v2(input, &route, deadline, false, act);
+    assert!(slowed.get(), "the slow call was never reached");
+    let Err(failure) = &watched.ran.outcome else {
+        panic!("a success followed the expiry");
+    };
+    let mut judged: Vec<String> = judge_leaves_v2(&failure.cause, &[ExpectedFailureV1::Timeout])
+        .into_iter()
+        .collect();
+    judged.extend(judge_failure_v2(failure, &route, &clean, 2));
+    let window = settlement_window_v2(&watched.log);
+    let checked = hooks_v2(window, GitHookPointV1::FinalSourceStatted);
+    if checked != clean.object_files {
+        judged.push(format!(
+            "{checked} admitted-file entry checks across the gate and its completion, exactly {} (each file once) owed",
+            clean.object_files
+        ));
+    }
+    let mounts = window.iter().filter(|event| **event == EvV2::Mount).count();
+    if mounts != 1 {
+        judged.push(format!("{mounts} mount censuses, the gate's own one owed"));
+    }
+    assert!(judged.is_empty(), "{}", judged.join("\n"));
+}
+
+/// STRUCTURAL ONLY (it reads the production source, so it is evidence of shape, never of behavior; the behavioral
+/// evidence is every row above). Every unit of the retained chains is ONE guard and ONE call: the staging chain is
+/// not a function of its own that replays a prefix, the sweep's staging edges are single-call units, and an
+/// admitted bootstrap file's two calls are two units.
+#[test]
+fn b2c_every_retained_chain_unit_is_one_guard_and_one_call_in_the_source() {
+    let source = include_str!("custody_restore_git.rs");
+    assert!(
+        !source.contains("fn final_staging_chain("),
+        "no compound staging chain that replays work, plain, and every prefix per key"
+    );
+    for function in [
+        "fn final_sweep_chains(",
+        "fn final_source_files_unchanged(",
+        "fn final_output_chains(",
+    ] {
+        let body = body_of(source, function);
+        let code: String = body
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let units: Vec<&str> = code.split("pass.unit(").skip(1).collect();
+        assert!(!units.is_empty(), "{function} runs its steps as units");
+        for unit in units {
+            // A unit's closure ends at the next `pass.unit(`: ONE guard (its own, before its call), and, for the
+            // functions whose units have a single call site, ONE call.
+            let guards = unit.matches("pace(").count();
+            let calls = unit.matches("recheck_entry(").count()
+                + unit.matches("child_metadata_no_follow(").count()
+                + unit.matches(".metadata()").count()
+                + unit.matches("pinned_root_unchanged(").count();
+            assert!(
+                guards == 1 && (function == "fn final_sweep_chains(" || calls <= 1),
+                "{function}: a unit holds {guards} guards and {calls} calls: {unit}"
+            );
+        }
+    }
+}
+
+/// FINDING 1 (every kind of census finding). A successful child, then a detached helper makes TWO simultaneous
+/// changes of different kinds after the post-exit gate and before the settlement's census: two unexpected files, a
+/// link and a FIFO where restored files were, two restored files removed, an unexpected file beside a removed one,
+/// an unexpected entry beside the repository and beside a replaced file, an unexpected file beside a replaced one,
+/// and a replaced directory beside a replaced file; and two added names, which spend the census's one shared listing
+/// bound (a `Bound` finding that ends the census, as it always did). Each is its own typed finding of the census, in the census's own (byte) order, none hides
+/// another, and none is descended or opened (a link and a FIFO are only `fstatat`ed: the run does not hang on the
+/// FIFO). The settlement's census meets the first as the primary and the completion continues with the rest.
+#[test]
+fn b2c_every_kind_of_census_finding_is_kept_beside_its_siblings_and_none_is_descended() {
+    struct RowV2 {
+        name: &'static str,
+        act: fn(&Path, &Path),
+        /// The census's own findings, in order (the chains' and digests' are not judged here).
+        want: Vec<ExpectedFailureV1>,
+    }
+    let capsule = captured(CustodyGitObjectFormatV1::Sha1);
+    let clean = clean_final_shape(&capsule, CustodyGitObjectFormatV1::Sha1, true);
+    let rows = vec![
+        RowV2 {
+            // The census's listing budget is one name more than the restore made, shared by every listing: two added
+            // names spend it at the last listing, which is a `Bound` finding and the end of the census (the retained
+            // bound; nothing past it is listed).
+            name: "two unexpected files exhaust the one shared listing bound",
+            act: |root, _| {
+                for name in ["0a", "0b"] {
+                    std::fs::write(root.join("repository/.git").join(name), b"").expect("a stray");
+                }
+            },
+            want: vec![
+                ExpectedFailureV1::Tree(FinalTreeFaultV1::Unexpected, "0a"),
+                ExpectedFailureV1::Tree(FinalTreeFaultV1::Unexpected, "0b"),
+                ExpectedFailureV1::Tree(FinalTreeFaultV1::Bound, "repository/.git/refs/heads"),
+            ],
+        },
+        RowV2 {
+            name: "an unexpected file and a removed file",
+            act: |root, _| {
+                std::fs::write(root.join("repository/.git/0a"), b"").expect("a stray");
+                std::fs::remove_file(root.join("repository/.git/HEAD")).expect("a removed file");
+            },
+            want: vec![
+                ExpectedFailureV1::Tree(FinalTreeFaultV1::Unexpected, "0a"),
+                ExpectedFailureV1::Tree(FinalTreeFaultV1::Missing, "HEAD"),
+            ],
+        },
+        RowV2 {
+            name: "a link and a FIFO where restored files were",
+            act: |root, outside| {
+                replace_with_link(&root.join("repository/.git/HEAD"), outside);
+                replace_with_fifo(&root.join("repository/.git/ORIG_HEAD"), outside);
+            },
+            want: vec![
+                ExpectedFailureV1::Symlink("HEAD"),
+                ExpectedFailureV1::Tree(FinalTreeFaultV1::Special, "ORIG_HEAD"),
+            ],
+        },
+        RowV2 {
+            name: "two restored files removed",
+            act: |root, _| {
+                for name in ["HEAD", "ORIG_HEAD"] {
+                    std::fs::remove_file(root.join("repository/.git").join(name))
+                        .expect("a removed file");
+                }
+            },
+            want: vec![
+                ExpectedFailureV1::Tree(FinalTreeFaultV1::Missing, "HEAD"),
+                ExpectedFailureV1::Tree(FinalTreeFaultV1::Missing, "ORIG_HEAD"),
+            ],
+        },
+        RowV2 {
+            name: "an unexpected entry beside the repository and a replaced file",
+            act: |root, outside| {
+                std::fs::write(root.join("repository/0stray"), b"").expect("a stray");
+                replace_with_other_bytes(&root.join("repository/.git/HEAD"), outside);
+            },
+            want: vec![
+                ExpectedFailureV1::Tree(FinalTreeFaultV1::Unexpected, "0stray"),
+                ExpectedFailureV1::Tree(FinalTreeFaultV1::Replaced, "HEAD"),
+            ],
+        },
+        RowV2 {
+            name: "an unexpected file beside a replaced one",
+            act: |root, outside| {
+                std::fs::write(root.join("repository/.git/0stray"), b"").expect("a stray");
+                replace_with_other_bytes(&root.join("repository/.git/HEAD"), outside);
+            },
+            want: vec![
+                ExpectedFailureV1::Tree(FinalTreeFaultV1::Unexpected, "0stray"),
+                ExpectedFailureV1::Tree(FinalTreeFaultV1::Replaced, "HEAD"),
+            ],
+        },
+        RowV2 {
+            name: "a replaced directory beside a replaced file",
+            act: |root, outside| {
+                replace_with_other_bytes(&root.join("repository/.git/HEAD"), outside);
+                swap_directory(&root.join("repository/.git/objects/info"), outside);
+            },
+            want: vec![
+                ExpectedFailureV1::Tree(FinalTreeFaultV1::Replaced, "HEAD"),
+                ExpectedFailureV1::Identity(
+                    "objects/info: the entry is no longer the retained directory",
+                ),
+            ],
+        },
+    ];
+    let mut problems = Vec::new();
+    for row in rows {
+        let input = PlaneInV1::rich(&capsule, CustodyGitObjectFormatV1::Sha1);
+        let root = input.dest.path.clone();
+        let (_area, outside) = external_dir_with(&["decoy"]);
+        let acted: RcCellV2<bool> = RcCellV2::default();
+        let (done, act) = (acted.clone(), row.act);
+        let hook = move |log: &[EvV2]| {
+            if !done.get()
+                && exited_v2(log)
+                && matches!(
+                    log.last(),
+                    Some(EvV2::Hook(GitHookPointV1::FinalCensusStatted, _))
+                )
+            {
+                done.set(true);
+                act(&root, &outside);
+            }
+        };
+        let route = RouteV1::recorder();
+        let watched = run_watched_v2(input, &route, far_deadline(), false, hook);
+        if !acted.get() {
+            problems.push(format!("{}: the change was never made", row.name));
+            continue;
+        }
+        let Err(failure) = &watched.ran.outcome else {
+            problems.push(format!("{}: a success followed the change", row.name));
+            continue;
+        };
+        // The census's own findings: the tree faults and the links it met beneath a name of the Git directory
+        // (the chains' refusals name `repository/.git/...`, and no digest of a replaced original can fail here).
+        let held: Vec<&GitBootstrapErrorV1> = leaves(&failure.cause)
+            .into_iter()
+            .filter(|error| match error {
+                GitBootstrapErrorV1::FinalTree { .. } => true,
+                GitBootstrapErrorV1::Restore(CustodyRestoreErrorV1::SymlinkRefused { name })
+                | GitBootstrapErrorV1::Restore(CustodyRestoreErrorV1::IdentityChanged(name)) => {
+                    !name.starts_with("repository/")
+                }
+                _ => false,
+            })
+            .collect();
+        let mut judged = judge_failure_v2(failure, &route, &clean, 3);
+        if held.len() != row.want.len()
+            || !held
+                .iter()
+                .zip(&row.want)
+                .all(|(error, want)| want.is(error))
+        {
+            judged.push(format!(
+                "the census's findings were {held:?}, wanted {:?}",
+                row.want
+            ));
+        }
+        if !judged.is_empty() {
+            problems.push(format!("{}: {}", row.name, judged.join("; ")));
+        }
+    }
+    assert!(problems.is_empty(), "{}", problems.join("\n"));
+}
+
+/// FINDING 3 (independent units of one admitted file). An admitted bootstrap file is checked twice, by its entry
+/// NAME and by its RETAINED descriptor, and the two are independent units. A child that grows the original inode (an
+/// append through a hard link) and then puts another inode at the name makes BOTH refuse, for different reasons:
+/// the post-exit gate refuses the entry (the child's failure) and the completion still makes the descriptor's own
+/// check and names its length (the whole compound unit used to be settled by the first refusal). A control puts
+/// another inode with the same bytes at the name and leaves the original alone: only the entry refuses.
+#[test]
+fn b2c_an_admitted_files_entry_and_its_retained_descriptor_are_independent_units() {
+    let capsule = captured(CustodyGitObjectFormatV1::Sha1);
+    let clean = clean_final_shape(&capsule, CustodyGitObjectFormatV1::Sha1, true);
+    let mut problems = Vec::new();
+    for (name, shell, want) in [
+        (
+            "the original grown and another inode at the name",
+            "\"$REAL\" \"$@\"; for f in ../.restore-work/git-bootstrap/objects/pack/*.pack; do ln \"$f\" \"$f.keep\"; printf x >> \"$f.keep\"; cp \"$f.keep\" \"$f.new\"; mv \"$f.new\" \"$f\"; done",
+            vec![
+                ExpectedFailureV1::Identity("no longer the admitted object file"),
+                ExpectedFailureV1::Identity("the retained descriptor is no longer the admitted object file"),
+            ],
+        ),
+        (
+            "control: another inode with the same bytes at the name, the original untouched",
+            "\"$REAL\" \"$@\"; for f in ../.restore-work/git-bootstrap/objects/pack/*.pack; do cp \"$f\" \"$f.new\"; mv \"$f.new\" \"$f\"; done",
+            vec![ExpectedFailureV1::Identity("no longer the admitted object file")],
+        ),
+    ] {
+        let input = PlaneInV1::rich(&capsule, CustodyGitObjectFormatV1::Sha1);
+        let body = final_only(shell);
+        let route = RouteV1::new(&[("fsck --strict", body.as_str())]);
+        let watched = run_watched_v2(input, &route, far_deadline(), false, |_| {});
+        let Err(failure) = &watched.ran.outcome else {
+            problems.push(format!("{name}: a success"));
+            continue;
+        };
+        let mut judged: Vec<String> = judge_leaves_v2(&failure.cause, &want).into_iter().collect();
+        judged.extend(judge_failure_v2(failure, &route, &clean, 2));
+        if !judged.is_empty() {
+            problems.push(format!("{name}: {}", judged.join("; ")));
+        }
+    }
+    assert!(problems.is_empty(), "{}", problems.join("\n"));
 }
