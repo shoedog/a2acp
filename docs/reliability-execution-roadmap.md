@@ -338,7 +338,7 @@
     Original six scenarios repaired; these three finite C/D/R defects require SAME-artifact Sonnet5.5 targeted
     repair before admitted follow-on2/2. Same3paths and private scope, testsFIRST/current focused population,
     maximum3causal+neutral scoped check, six new final-byte gates then source2/2. No cap reset or adoption.
-    Targeted SAME-artifact repairLIVE94528/execea3fa9c5/attemptfd25931e atde4164; actual transcript08734021
+    Targeted SAME-artifact repair94528 COMPLETE/execea3fa9c5/attemptfd25931e fromde4164; actual transcript08734021
     only claude-sonnet-5-5. Fresh writer86cc1c35/imagefe3/exactqRW/lockednetwork/caches8ac4RO bound.
     Config54425b40 validated/doctor29OK/catalog; private settingsc900 unchanged/free124.87GiB, no deletion.
     Input56bd422b/prompt155dd8bd/source/model/container secondcustody retained. Pre-edit full C/D/R
@@ -350,7 +350,7 @@
     Complete raw/source/script/list/compile/transcript secondcustody sealed; first missing test import compile
     INVALID then corrected core rebuild; declaration16/9 wording preserved versus actual15=7new+8changed.
     Pre-edit complete C/D/R enumeration/baseline retained, reviewer decisions flagged; finalfocused
-    now350/0/0 as below; new3causal+neutral/sixgates/source2/2 pending on94528. No completed repair claim.
+    now350/0/0 as below; tinycheck complete; writer94528 exited; sixgates67015/source2/2 pending.
     Repair2 corrected RED2 COMPLETE0/2/0 on unchangedde4164; late census table0/1/0 on exact old
     production in scratch is reconstructed RED, added after production. First GREEN trial15/2/0 failed
     two structural checks (retained); corrected before final350/0/0. Full
@@ -361,7 +361,10 @@
     Tiny3causal+neutral/9tests/first-last controls COMPLETE; each causal8/1/0 exactly predicted,
     neutral/2controls9/0/0. All6core rebuilt/mutated-restored/fullraw checked,0missed0unexpected0invalid;
     declarations unchanged,28file secondcustody retained. No historical deep audit replay;
-    exact final commit/sixgates/actual Sol2/2 pending. Same94528/capTWO/3paths; no adoption.
+    exact3 committed cleanfa9c80b849295cdaf6b2c6cd4df6b10a3761969d atopde4164. Complete worker custody
+    1425files, actual286model records allSonnet5.5; cleanup368ms. Six final-byte gates ONCE LIVE67015
+    verifier ef4d4751/imagefe3/networknone/sourceRO/no creds/cache8ac4 freshly bound; fmt/clippyPASS,
+    build/BOTHfullsuites/hygiene pending. Actual Sol2/2 UNEXECUTED until6PASS. CapTWO/no adoption.
     Native/aggregate/whole-G remain pending behind B2c approval.
     Expensive deep audits stay out of routine CI/CD and skip unchanged-area slices; ordinary tests/review remain.
     Prior sessions6053/22954/28614 complete. No adoption/native/whole-G claim. D07 actualSLOW+source-scan
