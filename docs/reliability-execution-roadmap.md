@@ -327,8 +327,12 @@
     Last restored controls green; raw/spec/frozen hashes/independent check secondcustody28files retained.
     Source-frozen2ownedfiles, other files gitarchive4b. Controller verified/staged exact3files and committed
     clean de4164dffdc786080083a8bc55dc3e6620aab474 atop4b; completed worker custody79files retained.
-    Six final-byte gatesLIVE91943 once; verifiere9061371 imagefe3/networknone/sourceRO/no credentials.
-    fmt/clippy/buildPASS; all-targets/default-doctests/hygiene pending before actual Sol1/2. Sourcecap2 unchanged.
+    Six final-byte gatesCOMPLETE91943: all6PASS, all-targets5203/0/13 (90groups/core compiled),
+    default-doctests5214/0/13 (106groups/16docgroups/cached core); fmt/clippy/build/hygienePASS.
+    Provider-free verifiere9061371 imagefe3/sourceRO/networknone/no credentials; complete immutable-source
+    raw/before-after independently parsed, missingnone. Actual Solfollow-on1/2LIVE59909/execfb748674/
+    attemptc1799be6, transcript01a10c9e actualgpt5.6sol/xhigh/read-only/on-request. Fresh doctor10OK/catalog;
+    bound input/context/predispatch custody preserved. New sourcecapTWO unchanged; source verdict pending.
     Native/aggregate/whole-G remain pending behind B2c approval.
     Expensive deep audits stay out of routine CI/CD and skip unchanged-area slices; ordinary tests/review remain.
     Prior sessions6053/22954/28614 complete. No adoption/native/whole-G claim. D07 actualSLOW+source-scan
