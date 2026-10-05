@@ -298,7 +298,12 @@
     rawSHAae5964ee and immutable source/full transcript custody retained in b2c-source4-rejected-custody/.
     [Prepared design escalation](superpowers/plans/2026-10-04-adr0041-b2c-reconciliation-design-escalation.md)
     names all three constructs and the stage/completion/error-composition deliverables for owner decision.
-    All current lane sessions complete. Native/aggregate/whole-G remain pending behind B2c approval.
+    Source4-era sessions complete. Owner APPROVED bounded design escalation, one pass cap1/1.
+    Sol designLIVE54246/execa1ccce99/attemptd381b184 on unchanged4b941d4b; actual transcript01a10994
+    confirms5.6sol/xhigh/read-only/on-request (not never). Config43697cde valid/doctor10OK/catalog ready;
+    input/source/context secondcopies retained in b2c-design-dispatched-custody/. This is not source5,
+    a cap reset or repair dispatch. Preserve final design then present concrete repair-scope/cap decision.
+    No repeated suites/matrices. Native/aggregate/whole-G remain pending behind B2c approval.
     Expensive deep audits stay out of routine CI/CD and skip unchanged-area slices; ordinary tests/review remain.
     Prior sessions6053/22954/28614 complete. No adoption/native/whole-G claim. D07 actualSLOW+source-scan
     failure means original structural-only annotation was wrong; R3 handoff corrects it, original raw retained.
