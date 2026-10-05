@@ -1,0 +1,39 @@
+# ADR-0041 B2c actual design-follow-on source review 2/2
+
+Actual Sol5.6/xhigh/read-only transcript `01a10e62-b93a-77d0-b66f-09b82232c63e`; candidate `fa9c80b849295cdaf6b2c6cd4df6b10a3761969d`. Review completed once, cleanup0ms. Full raw final, bridge stream, transcript and immutable source/context retained separately; reviewer memory footer omitted from this tracked copy only. Candidate remains isolated/unadopted.
+
+Bound clean checkout at `fa9c80b849295cdaf6b2c6cd4df6b10a3761969d`, targeted parent `de4164dffdc786080083a8bc55dc3e6620aab474`, and whole-B2c base `dc0b45bafd3538c93fe15254bd9f975ad34f4c71`. Both diffs contain exactly the three owned paths and pass `git diff --check`.
+
+1. **WRONG — lossy census progress keys merge distinct raw filenames, so an independent C unit is never attempted. Blocker. Confidence 99/100.**
+
+   [`bootstrap_relative`](/Users/wesleyjinks/code/.a2a-implement/impl-70428-q52t65ks/crates/bridge-core/src/custody_restore_git.rs:2751) converts raw directory-entry bytes with `String::from_utf8_lossy`. `CensusV1` then uses those strings for `seen`, `entry_stats`, and `done` ([source](/Users/wesleyjinks/code/.a2a-implement/impl-70428-q52t65ks/crates/bridge-core/src/custody_restore_git.rs:7918)). [`census_entry`](/Users/wesleyjinks/code/.a2a-implement/impl-70428-q52t65ks/crates/bridge-core/src/custody_restore_git.rs:8439) returns immediately when the lossy key is already in `done`.
+
+   A routed final-child wrapper can remove `.git/HEAD` and `.git/ORIG_HEAD`, then create `.git/$(printf '\377')` and `.git/$(printf '\376')`. The total entry count remains unchanged, so the shared census bound does not preempt the case. Both raw names render as `�`; the first produces `Unexpected`, while the second collides in `done` and receives no `fstatat` or finding. The required result has two independent `Unexpected` findings followed by the missing and chain findings; this source returns only one. The repository already has a Linux regression proving two such names can coexist and must be counted independently ([existing reachability evidence](/Users/wesleyjinks/code/.a2a-implement/impl-70428-q52t65ks/crates/bridge-core/src/custody_restore_git_tests.rs:4344)).
+
+   Stock Git is unlikely to create this state, but one routed wrapper or detached helper can. Exposure is incomplete reconciliation evidence; it does not create a false success. The bounded repair is to key C progress and membership with lossless raw path bytes, retaining lossy strings only for diagnostics. A realistic Linux regression should create the two count-preserving aliases and require two identical-looking `Unexpected` leaves and one attempt per raw entry.
+
+   Confidence rises to 100 with that behavioral regression. It would fall if admission proved that every listed child name is valid UTF-8, which it does not. It collapses if progress is keyed by raw bytes or the contract explicitly equates distinct raw names, contrary to the independent-unit requirement.
+
+2. **WRONG — the owned handoff binds both RED test revisions to the production-file hash. Blocker. Confidence 100/100.**
+
+   The handoff reports `07ea98db…` as the test hash for RED runs 1 and 2 ([handoff](/Users/wesleyjinks/code/.a2a-implement/impl-70428-q52t65ks/docs/superpowers/reviews/2026-09-29-adr0041-slice2b3b-implementation-handoff.md:314)). Its cited manifests instead bind run 1 to `14b26cdd…` ([manifest](/Users/wesleyjinks/code/.a2a-implement/impl-70428-q52t65ks/.git/a2a-b2c-follow-on-r1-repair/red/sources-before-run1.sha256:2)) and run 2 to `43578c1b…` ([manifest](/Users/wesleyjinks/code/.a2a-implement/impl-70428-q52t65ks/.git/a2a-b2c-follow-on-r1-repair/red/sources-before-run2.sha256:2)). A successor following the authoritative identifiers row binds the RED logs to bytes that were never the tests, violating the task’s truthful exact-source handoff requirement ([task](/Users/wesleyjinks/code/.a2a-implement/impl-70428-q52t65ks/.git/A2A_TASK.md:39)).
+
+   This is reached whenever a reviewer or controller validates the RED from the handoff. Exposure is provenance rather than runtime behavior, but exact source binding is an acceptance gate. Repair is the two literal hashes; a small consistency check can compare the handoff row with the second line of each cited manifest. Direct contradictory retained bytes establish 100/100 confidence; it collapses only if the row ceases to claim test-file hashes.
+
+3. **SMELL — a test-only directory-device finding marks its listing completed before the listing call. Nonblocker. Confidence 97/100.**
+
+   [`census_list`](/Users/wesleyjinks/code/.a2a-implement/impl-70428-q52t65ks/crates/bridge-core/src/custody_restore_git.rs:8328) inserts `list_ran` before checking the directory-device verdict and before `list_child_names`. A test device override can therefore produce `DeviceCrossing`, after which completion skips that directory’s uncalled listing and children. This conflicts with the declared call-level model, but I found no release-mode trigger: production `observed_dev` returns the retained descriptor’s actual, stable device ([source](/Users/wesleyjinks/code/.a2a-implement/impl-70428-q52t65ks/crates/bridge-core/src/custody_restore_git.rs:747)). Without a demonstrated operator-reachable bad result this cannot block. Moving the progress mark to the listing call, or tracking the device verdict separately, is local.
+
+4. **SMELL — historical production-before-RED and tests-after-repair debt remains disclosed. Nonblocker. Confidence 100/100.**
+
+   The earlier retrospective RED remains evidence against defective bytes, not a chronological tests-first checkpoint ([handoff](/Users/wesleyjinks/code/.a2a-implement/impl-70428-q52t65ks/docs/superpowers/reviews/2026-09-29-adr0041-slice2b3b-implementation-handoff.md:257)). Current T3 is truthful tests-first evidence, while N8 and N9 were added after production and retrospectively failed on preserved `de4164` bytes ([handoff](/Users/wesleyjinks/code/.a2a-implement/impl-70428-q52t65ks/docs/superpowers/reviews/2026-09-29-adr0041-slice2b3b-implementation-handoff.md:34)). This demonstrates no runtime error and cannot be repaired retroactively; preserving the disclosure is the correct disposition.
+
+The three inherited follow-on 1 WRONGs are mechanism-closed: `CensusV1` carries returned per-call facts and resumes unattempted calls; `DigestSeenV1` separates name refusal from retained-descriptor observation and carries completed reads; and R is flattened into admitted-file and unique retained-edge units with root last. The original six-mechanism repair also retains `BinaryDrift` as primary, reconciles mount and every paced failure, continues independent D/R units, uses bounded retained-descriptor `read_at`, and refuses `Interrupted` without retry. The raw-name alias above is a new C-stage unit-identity member, not a failure to prove those specific parent fixes.
+
+Supplied revision-bound evidence reports focused **350/0/0**, all 341 preceding names plus nine new; three causal variants, one neutral variant, and two green controls with no missed predictions or unexpected flips; and final-byte gates with all-targets **5,212/0/13** and default/doctests **5,223/0/13**. I treated these as evidence and executed nothing. They do not cover lossless C-unit identity or validate the handoff’s RED hash table.
+
+Scope remains B2c final-child reconciliation. Runner/API/codec/dependencies, Pass A, capsule, ledger, pins, original deadline, closing gate, entry guard, staged rewinds, native macOS/ext4, aggregate and combined review, whole 2B3b, 2B3c/2B3d, adoption, and publication remain outside this verdict.
+
+CAP CLASSIFICATION: OPEN CLASS — final round 2/2 surfaced another C-stage independent-unit accounting instance after round 1’s C-stage progress defect; no third round, reset, or restart is authorized.
+VERDICT: REJECT
+SUMMARY: wrong=2 smell=2 blockers=2 round=2/2

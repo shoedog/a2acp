@@ -350,7 +350,7 @@
     Complete raw/source/script/list/compile/transcript secondcustody sealed; first missing test import compile
     INVALID then corrected core rebuild; declaration16/9 wording preserved versus actual15=7new+8changed.
     Pre-edit complete C/D/R enumeration/baseline retained, reviewer decisions flagged; finalfocused
-    now350/0/0 as below; tinycheck complete; writer94528 exited; sixgates complete/PASS; actual Sol2/2 LIVE9970.
+    now350/0/0 as below; tinycheck complete; writer94528 exited; sixgates complete/PASS; actual Sol2/2 COMPLETE REJECT/OPEN.
     Repair2 corrected RED2 COMPLETE0/2/0 on unchangedde4164; late census table0/1/0 on exact old
     production in scratch is reconstructed RED, added after production. First GREEN trial15/2/0 failed
     two structural checks (retained); corrected before final350/0/0. Full
@@ -366,9 +366,16 @@
     verifier ef4d4751/imagefe3/networknone/sourceRO/no creds/cache8ac4 freshly bound. All6PASS: alltargets5212/0/13/90groups/corecompiled;
     defaultdocs5223/0/13/106groups/16docs/corecached. Full raw/immutable source/before-after independently
     parsed, complete/no missing; daemon interruption then recovered receipts, no gate rerun. Actual final
-    Solfollow-on2/2 LIVE9970/execa02ac2bc/attempt9dc2839f after6PASS; transcript01a10e62 confirms
+    Solfollow-on2/2 COMPLETE9970/execa02ac2bc/attempt9dc2839f after6PASS; transcript01a10e62 confirms
     gpt5.6sol/xhigh/read-only/exactq/on-request (not never). Fresh configb343 validated/doctor10OK/catalog;
-    input9faca854 and full context/source/evidence secondcustody retained. CapTWO; no verdict/adoption.
+    input9faca854 and full context/source/evidence secondcustody retained. CapTWO exhausted: actual final REJECT2WRONG2SMELL2block/OPEN CLASS, raw877c999d;
+    cleanfa9c80b8 PARKED/unadopted. Full raw/transcript/immutable source secondcustody22files retained.
+    Raw-name aliases ff/fe collapse C-unit keys, losing an independent Unexpected; owned handoff
+    RED1/RED2 test hashes incorrectly repeat production07ea instead of14b26cdd/43578c1b. Parent three
+    WRONGs and six mechanisms closed; new C accounting instance makes classOPEN. Device anomaly and
+    process debt nonblocking. No third round/reset/restart; bounded lossless-key/custody design proposal
+    prepared but UNAUTHORIZED/UNEXECUTED, owner decision pending for proposed1designpass then
+    conditional same-artifact Sonnet5.5/exact3 repair/new sourcecap2 only if READY without widening.
     Native/aggregate/whole-G remain pending behind B2c approval.
     Expensive deep audits stay out of routine CI/CD and skip unchanged-area slices; ordinary tests/review remain.
     Prior sessions6053/22954/28614 complete. No adoption/native/whole-G claim. D07 actualSLOW+source-scan
