@@ -338,6 +338,12 @@
     Original six scenarios repaired; these three finite C/D/R defects require SAME-artifact Sonnet5.5 targeted
     repair before admitted follow-on2/2. Same3paths and private scope, testsFIRST/current focused population,
     maximum3causal+neutral scoped check, six new final-byte gates then source2/2. No cap reset or adoption.
+    Targeted SAME-artifact repairLIVE94528/execea3fa9c5/attemptfd25931e atde4164; actual transcript08734021
+    only claude-sonnet-5-5. Fresh writer86cc1c35/imagefe3/exactqRW/lockednetwork/caches8ac4RO bound.
+    Config54425b40 validated/doctor29OK/catalog; private settingsc900 unchanged/free124.87GiB, no deletion.
+    Input56bd422b/prompt155dd8bd/source/model/container secondcustody retained. Pre-edit full C/D/R
+    enumeration and testsFIRST required; final341+new focused and tiny3causal+neutral then controller
+    final6gates ONCE/actual Sol2/2. No source approval/native/whole-G or automatic merge.
     Native/aggregate/whole-G remain pending behind B2c approval.
     Expensive deep audits stay out of routine CI/CD and skip unchanged-area slices; ordinary tests/review remain.
     Prior sessions6053/22954/28614 complete. No adoption/native/whole-G claim. D07 actualSLOW+source-scan
