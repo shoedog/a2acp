@@ -358,7 +358,9 @@
     Repair2 finalfocusedCOMPLETE350/0/0,1551.19s; all341prior+9new, exact source before-after/live,
     fresh core build and actual binary4e15a02d independently bound. Full raw/source/rebuild/list
     secondcustody retained. Late N8/N9 each reconstructedRED0/1/0 after production, not testsFIRST.
-    Tiny3causal+neutral/9tests/first-last controls declared before runs, now private scratch running;
+    Tiny3causal+neutral/9tests/first-last controls COMPLETE; each causal8/1/0 exactly predicted,
+    neutral/2controls9/0/0. All6core rebuilt/mutated-restored/fullraw checked,0missed0unexpected0invalid;
+    declarations unchanged,28file secondcustody retained. No historical deep audit replay;
     exact final commit/sixgates/actual Sol2/2 pending. Same94528/capTWO/3paths; no adoption.
     Native/aggregate/whole-G remain pending behind B2c approval.
     Expensive deep audits stay out of routine CI/CD and skip unchanged-area slices; ordinary tests/review remain.
