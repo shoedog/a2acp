@@ -317,7 +317,13 @@
     TestsFIRST RED1 COMPLETE22selected8/14/0; all8new regressions failed, plus old strengthened oracles
     and source-order assertion (not14runtime-defect claim). Production0eb6f80f has cfg(test) read seam
     only; tests4a7f0c77. Exact raw/source/script/names/binary/transcript custody8files retained; pre-edit
-    enumeration/baseline and partialRED separate. Sonnet59090 continues repair; no finalGREEN/gates/review yet.
+    enumeration/baseline and partialRED separate. Earlier GREEN22trial21/1 failed source-order assertion;
+    kept, corrected before final focused. Post-production edge control’s old-production scratchRED separate.
+    Final focused341/0/0, all330oldnames+11new,1299.76s; fresh core rebuild observed. Raw/list/binarySHA
+    e66b4fa4/source-before-after-live-matrix07ea98db/abc7faa6 independently checked and secondcopied.
+    Small mutation6variants(5causal+neutral),23tests/row, two private workers ACTIVE; declarations retained
+    before runs, source-frozen2ownedfiles, other files gitarchive4b. Sonnet59090 live; no complete matrix,
+    six final-byte gates or Sol follow-on1/2 yet. Sourcecap2 unchanged.
     Native/aggregate/whole-G remain pending behind B2c approval.
     Expensive deep audits stay out of routine CI/CD and skip unchanged-area slices; ordinary tests/review remain.
     Prior sessions6053/22954/28614 complete. No adoption/native/whole-G claim. D07 actualSLOW+source-scan
