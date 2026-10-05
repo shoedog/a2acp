@@ -82,8 +82,8 @@
 
 ## 1. Resume order
 
-1. Observe actual Sonnet repair1 session59090 on SAME4b artifact. Preserve testsFIRST RED source/raw/transcript before production repair, focused330+new with real rebuild, small declared targeted matrix and final owned bytes; no old matrix/suite replay.
-2. On writer exit, preserve all evidence, stage equality and model/container provenance; commit only exact3owned paths, then run the ordinary six final-byte gates once and independent Sol follow-on1/2. Follow-on source capTWO declared before dispatch; classify at cap without silent extension. Keep old source4 rejection and design1/1 immutable.
+1. Observe actual Sol follow-on1/2 session59909 at clean de4164dffdc786080083a8bc55dc3e6620aab474. Sonnet59090 completed; exact3paths committed; focused341/0/0 and small six-variant/four-control matrix retained, all six final-byte gates PASS5203/0/13 and5214/0/13. Do not replay completed suites or historical matrices.
+2. On reviewer exit, preserve actual final/transcript/typed terminal and exact immutable source. APPROVE permits exact scoped adoption; REJECT closed enumerable findings permits targeted same-artifact Sonnet repair within admitted follow-on2/2. Classify at cap before action without silent extension. Keep old source4 rejection, owner-approved design1/1 and truthful test chronology immutable.
 3. After a separately admitted design/repair and actual independent approval, adopt only exact approved B2c source and handoff bytes. Preserve every rejected checkpoint, source-bound receipts and chronology. B2c approval alone is not whole-2B3b completion.
 4. Native macOS/ext4, aggregate suites, combined Sol base251..final (cap2), concrete PR and exact CI remain pending behind B2c approval. No automatic2B3b merge. No recurring deep audit or mutation CI job; skip unchanged-area slices and reuse existing CI lint/build/hygiene.
 
@@ -103,7 +103,7 @@
 |B1b evidence|done|`[MEASURED]` base147/0/0;focused198/0/0;matrix132variants+2controls/127actualfail/5disclosednonflip, everychangedvariantcompile/restored. F04one staleprediction kept with corrected same-source row. Controls55/0/0 firstcached/lastcompiled. SealREDreconstructedstructural, not literaltestsfirst.|
 |B1b provenanceSMELL|done|`[MEASURED]` source comment corrected in approved B2a; operator adoption messages correct counts/chronology.|
 |B2a/B2b|done|`[MEASURED]` approved sources88acb02e/0dadd17e adoptedc8eb2910/18ff5bea; exact gates/raw reviews retained.|
-|B2c/native/combined/publication|parked/pending|B2c source4/4 REJECT3W1S3block; OPEN CLASS cap exhausted. Design decision precedes any further repair; native/whole-G remain deferred.|
+|B2c/native/combined/publication|review1/2 active/pending|Old source4OPEN CLASS retained; separate owner-approved design/repair complete atde4164df, all6gatesPASS, actual Solfollow-on1/2LIVE59909. Native/combined/publication await scoped approval.|
 |Exactfour-buildcleanup|done|`[INHERITED]` three literal dirs deleted4.236GiB; fourth rootincremental alreadyabsent. Releases/source/worktrees/branches/caches/evidence/operator retained. No19.8GiBreclaimclaim.|
 
 ## 3. Corrections to standing documents and memory
