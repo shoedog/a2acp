@@ -314,6 +314,10 @@
     TestsFIRST before non-cfg(test) production, focused330+new/real rebuild; targeted5causal+1neutral
     maximum. Controller commits exact3files after exit, runs six final-byte gates once, then Sol1/2.
     No oldcap reset/source5/restart/adoption/suite or historical-matrix replay.
+    TestsFIRST RED1 COMPLETE22selected8/14/0; all8new regressions failed, plus old strengthened oracles
+    and source-order assertion (not14runtime-defect claim). Production0eb6f80f has cfg(test) read seam
+    only; tests4a7f0c77. Exact raw/source/script/names/binary/transcript custody8files retained; pre-edit
+    enumeration/baseline and partialRED separate. Sonnet59090 continues repair; no finalGREEN/gates/review yet.
     Native/aggregate/whole-G remain pending behind B2c approval.
     Expensive deep audits stay out of routine CI/CD and skip unchanged-area slices; ordinary tests/review remain.
     Prior sessions6053/22954/28614 complete. No adoption/native/whole-G claim. D07 actualSLOW+source-scan
