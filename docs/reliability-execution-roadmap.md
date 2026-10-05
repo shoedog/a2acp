@@ -321,9 +321,12 @@
     kept, corrected before final focused. Post-production edge control’s old-production scratchRED separate.
     Final focused341/0/0, all330oldnames+11new,1299.76s; fresh core rebuild observed. Raw/list/binarySHA
     e66b4fa4/source-before-after-live-matrix07ea98db/abc7faa6 independently checked and secondcopied.
-    Small mutation6variants(5causal+neutral),23tests/row, two private workers ACTIVE; declarations retained
-    before runs, source-frozen2ownedfiles, other files gitarchive4b. Sonnet59090 live; no complete matrix,
-    six final-byte gates or Sol follow-on1/2 yet. Sourcecap2 unchanged.
+    Small mutation6variants(5causal+neutral),23tests/row COMPLETE; all4controls/neutral23/0/0,
+    each causal has behavioral failures, every row core rebuilt. Original predictions unchanged:0missed,
+    1unexpected/nonflip V4/T8 (first-error digest break omits later Interrupted-control descriptors).
+    Last restored controls green; raw/spec/frozen hashes/independent check secondcustody28files retained.
+    Source-frozen2ownedfiles, other files gitarchive4b. Sonnet59090 finishing handoff; six final-byte
+    gates and Sol follow-on1/2 pending. Sourcecap2 unchanged.
     Native/aggregate/whole-G remain pending behind B2c approval.
     Expensive deep audits stay out of routine CI/CD and skip unchanged-area slices; ordinary tests/review remain.
     Prior sessions6053/22954/28614 complete. No adoption/native/whole-G claim. D07 actualSLOW+source-scan
