@@ -349,12 +349,17 @@
     Exact before-after production07ea98db unchangedde4164, tests14b26cdd; actual RED-start binary checked.
     Complete raw/source/script/list/compile/transcript secondcustody sealed; first missing test import compile
     INVALID then corrected core rebuild; declaration16/9 wording preserved versus actual15=7new+8changed.
-    Pre-edit complete C/D/R enumeration/baseline retained, reviewer decisions flagged; final repair GREEN,
-    focused341+new/new3causal+neutral/sixgates/source2/2 pending on same94528. No completed repair claim.
+    Pre-edit complete C/D/R enumeration/baseline retained, reviewer decisions flagged; finalfocused
+    now350/0/0 as below; new3causal+neutral/sixgates/source2/2 pending on94528. No completed repair claim.
     Repair2 corrected RED2 COMPLETE0/2/0 on unchangedde4164; late census table0/1/0 on exact old
     production in scratch is reconstructed RED, added after production. First GREEN trial15/2/0 failed
-    two structural checks (retained); writer reports corrected, fresh finalfocused now running. Full
+    two structural checks (retained); corrected before final350/0/0. Full
     RED2/late/GREEN/transcript secondcustody30files and read-only binding retained; no tests replay.
+    Repair2 finalfocusedCOMPLETE350/0/0,1551.19s; all341prior+9new, exact source before-after/live,
+    fresh core build and actual binary4e15a02d independently bound. Full raw/source/rebuild/list
+    secondcustody retained. Late N8/N9 each reconstructedRED0/1/0 after production, not testsFIRST.
+    Tiny3causal+neutral/9tests/first-last controls declared before runs, now private scratch running;
+    exact final commit/sixgates/actual Sol2/2 pending. Same94528/capTWO/3paths; no adoption.
     Native/aggregate/whole-G remain pending behind B2c approval.
     Expensive deep audits stay out of routine CI/CD and skip unchanged-area slices; ordinary tests/review remain.
     Prior sessions6053/22954/28614 complete. No adoption/native/whole-G claim. D07 actualSLOW+source-scan
