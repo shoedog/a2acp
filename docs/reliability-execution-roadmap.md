@@ -344,6 +344,13 @@
     Input56bd422b/prompt155dd8bd/source/model/container secondcustody retained. Pre-edit full C/D/R
     enumeration and testsFIRST required; final341+new focused and tiny3causal+neutral then controller
     final6gates ONCE/actual Sol2/2. No source approval/native/whole-G or automatic merge.
+    Repair2 testsFIRST RED1COMPLETE15selected3/12/0,191.47s; six new runtime failures discriminate
+    three C/D/R defects, plus one structural and five changed old oracles (not12runtimebugs).
+    Exact before-after production07ea98db unchangedde4164, tests14b26cdd; actual RED-start binary checked.
+    Complete raw/source/script/list/compile/transcript secondcustody sealed; first missing test import compile
+    INVALID then corrected core rebuild; declaration16/9 wording preserved versus actual15=7new+8changed.
+    Pre-edit complete C/D/R enumeration/baseline retained, reviewer decisions flagged; final repair GREEN,
+    focused341+new/new3causal+neutral/sixgates/source2/2 pending on same94528. No completed repair claim.
     Native/aggregate/whole-G remain pending behind B2c approval.
     Expensive deep audits stay out of routine CI/CD and skip unchanged-area slices; ordinary tests/review remain.
     Prior sessions6053/22954/28614 complete. No adoption/native/whole-G claim. D07 actualSLOW+source-scan
