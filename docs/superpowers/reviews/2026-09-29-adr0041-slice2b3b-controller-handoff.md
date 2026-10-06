@@ -1,6 +1,6 @@
-# Handoff — ADR-0041 2B3b B2b approved and adopted; B2c final follow-on2/2 REJECT; OPEN CLASS; owner-authorized lossless design follow-on
+# Handoff — ADR-0041 2B3b B2b approved and adopted; B2c final follow-on2/2 REJECT; OPEN CLASS; lossless design READY; repair stopped below storage floor
 
-**Written:** 2026-10-05T23:43:25.365690+00:00 · **By:** Codex controller · **Provider:** codex
+**Written:** 2026-10-06T22:54:27.900969+00:00 · **By:** Codex controller · **Provider:** codex
 **Workspace:** /Users/wesleyjinks/code/a2a-bridge · work/adr0041-2b3b-bootstrap-20261001 · **Measured state:** `[MEASURED]` approved A/B1a/B1b/B2a/B2b runtime adopted through18ff5beac8d6435966810baf7d04e5715a662714; B2c 4b941d4b rejected at source4/4, OPEN CLASS at exhausted cap; isolated, not adopted; owner-approved design-follow-on candidate de4164dffdc786080083a8bc55dc3e6620aab474 clean; six final-byte gates PASS; actual Solfollow-on1/2 COMPLETE REJECT3W1S3block/CLOSED; actual Sonnet5.5 targeted repair94528 COMPLETE; clean fa9c80b849295cdaf6b2c6cd4df6b10a3761969d atopde4164; all6 final gates PASS; actual Solfollow-on2/2 COMPLETE REJECT2W2S2block/OPEN CLASS at exhausted capTWO; candidate PARKED/unadopted. Probe git status/log and scratch receipt audits.
 **Predecessor:** B2b Sonnet5.5 run2436 complete; clean0dadd17e automatic Approved; actual Sol2/2 APPROVE0W2S0block.
 **Truth ordering:** measured live state > explicit owner/contract authority within its scope > this handoff for current operational state > earlier handoffs and non-authoritative summaries. A conflict between tiers stays OPEN in §0 — never resolved by document class alone.
@@ -9,6 +9,8 @@
 ## 0. Gating facts — settle these before starting anything below
 
 **Owner audit scope:** Owner directs that the expensive deep audit stay out of routine CI/CD and be skipped for slices/increments that do not change this area. Retain ordinary CI and required implementation tests/review; scope mutation/evidence auditing to changes affecting these custody guards or their test evidence. Current B2c design-follow-on repair changes those guards, so only its admitted small changed-helper audit runs. Old source4 audit/design escalation are complete; expanded repair is separately owner-approved. No recurring full mutation matrix or controller receipt-audit job is authorized for CI/CD. Carry this constraint into any native-ext4 integration dispatch.
+
+**Lossless repair STOPPED FOR STORAGE:** `[MEASURED]` ActualSonnet5.5 session34470/execution3ad78e02/attempt49892b4e launched despite failed controller20GiB assertion (separate-command sequencing error), then exactPID49134 gracefullySIGINT/process130. Writerc790c1722b3f absent; actual transcript4b6edb19 has65records allclaude-sonnet-5-5. No owned edit: cleanfa9c80b8/3hashes unchanged. Finite enumeration and baseline build30.06s/350listed/binary4e15a02d retained with complete worker/raw/source/transcript/binary secondcustody. No runtimeRED/GREEN/full new gates/source review; NEW cap0/2. [Storage stop and concrete cleanup proposal](2026-10-06-adr0041-b2c-lossless-storage-stop.md): latestfree12.19GiB below unchanged20floor; rootdebugdeps9.64GiB proposed ONLY, no open handles/builders observed, must freshcheck. No deletion/new accepted retry until owner decision. Old caps/rejections retained; designREADY/conditional scope intact; no adoption.
 
 **Lossless design COMPLETE/READY:** `[MEASURED]` Sol19019 completed0 once/cleanup0ms; exactfa9c80b8 remains clean. Actual finalSHAcf35c488/model5.6sol/xhigh/read-only/exactq/on-request, transcript01a112b6. [Full design result](../plans/2026-10-06-adr0041-b2c-lossless-census-design-result.md) enumerates complete private raw-key namespaces/progress/membership/facts/dedup, two hash corrections, three finite behavioral test families and controls;2WRONG2SMELL0design blockers. No primitive/contract/ownership widening; device/list bookkeeping SMELL explicitly deferred and chronology debt retained. Owner conditional approval therefore admits actualSonnet5.5 SAME artifact/exact3 repair and NEW independent sourcecapTWO, declared now before writer dispatch. No old audit replay/CI audit. Focused/6gates/source approval/native/combined still owed for new bytes; old caps/rejections preserved, no adoption.
 
@@ -105,7 +107,7 @@
 ## 1. Resume order
 
 1. Preserve actual final follow-on2/2 REJECT2W2S2block/OPEN at cleanfa9c80b8, full raw/source/transcript custody and exhausted capTWO. New owner-authorized lossless follow-on does not reset that cap; adoption remains gated. Original source4/4 OPEN/design and every parent checkpoint remain preserved.
-2. Exercise owner approval “approved to exceed cap”: one Soldesign1/1, then conditional Sonnet5.5 same-artifact repair only if READY within existing contract/primitives/3paths, and separately authorized NEW sourcecapTWO. Prepared config validates, but no design/implementation turn executed. No fresh clone, old cap reset, cleanup or audit replay.
+2. Lossless design1/1 is COMPLETE READY; Sonnet repair attempt cancelled below20GiB with source unchanged. Obtain exact rootdebugdeps cleanup/new accepted-turn retry decision; fresh storage>=20 and live-use checks before action. Conditional same-artifact/exact3 scope and NEW sourcecapTWO remain, currently0/2. No fresh clone, old cap reset, cleanup or audit replay.
 3. After a separately admitted design/repair and actual independent approval, adopt only exact approved B2c source and handoff bytes. Preserve every rejected checkpoint, source-bound receipts and chronology. B2c approval alone is not whole-2B3b completion.
 4. Native macOS/ext4, aggregate suites, combined Sol base251..final (cap2), concrete PR and exact CI remain pending behind B2c approval. No automatic2B3b merge. No recurring deep audit or mutation CI job; skip unchanged-area slices and reuse existing CI lint/build/hygiene.
 
@@ -144,7 +146,7 @@
 | # | Work | State | Exact next action | Blocked by | Identifiers |
 |---:|---|---|---|---|---|
 |1|B2a|approved,adopted|retain actual review and all source-bound receipts|none|88acb02e→c8eb2910; originalcap2/disclosed3/3|
-|2|B2c|cleanfa9c80b8 REJECT2W2S2block/OPEN final2/2; PARKED|fresh preflight then owner-authorized lossless design1/1|READY design gates conditional repair/new sourcecapTWO|actual raw877c999d; parentde4164df|
+|2|B2c|cleanfa9c80b8 REJECT2W2S2block/OPEN final2/2; PARKED|owner decision on exactrootdebugdepscleanup/new accepted retry|below20GiBfloor; interrupted acceptedSonnetturn|actual raw877c999d; parentde4164df|
 |3|Native/combined|pending|Mac+ext4provenCI/fullbase251..finalreview|completeG|preparedhostscript/CIplan/combinedconfig|
 |4|Publication/landing|pending|PR/exactCI/merge|allgates|originalauthority|
 

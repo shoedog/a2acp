@@ -374,8 +374,8 @@
     RED1/RED2 test hashes incorrectly repeat production07ea instead of14b26cdd/43578c1b. Parent three
     WRONGs and six mechanisms closed; new C accounting instance makes classOPEN. Device anomaly and
     process debt nonblocking. No third round/reset/restart; bounded lossless-key/custody design proposal
-    OWNER AUTHORIZED by “approved to exceed cap”; Sol design1/1 COMPLETE/READY session19019/actual transcript01a112b6 (5.6sol/xhigh/read-only), rawcf35c488; conditional
-    conditional same-artifact Sonnet5.5/exact3 repair/new sourcecap2 only if READY without widening.
+    OWNER AUTHORIZED by “approved to exceed cap”; Sol design1/1 COMPLETE/READY session19019/actual transcript01a112b6 (5.6sol/xhigh/read-only), rawcf35c488. ActualSonnet5.5 repair34470 CANCELLED below20GiB after controller sequencing error; no owned edits, enumeration/baseline retained; retry/cleanup owner decision pending.
+    Conditional same-artifact Sonnet5.5/exact3 repair/new sourcecap2 only if READY without widening.
     Native/aggregate/whole-G remain pending behind B2c approval.
     Expensive deep audits stay out of routine CI/CD and skip unchanged-area slices; ordinary tests/review remain.
     Prior sessions6053/22954/28614 complete. No adoption/native/whole-G claim. D07 actualSLOW+source-scan
