@@ -31148,3 +31148,778 @@ fn b2c_an_admitted_files_entry_and_its_retained_descriptor_are_independent_units
     }
     assert!(problems.is_empty(), "{}", problems.join("\n"));
 }
+
+// ---------------------------------------------------------------------------------------------
+// Lossless census (same-artifact repair after source round 4 and design follow-on 2/2). A census unit is
+// keyed by the object it OBSERVES: the exact bytes of one directory entry, read through
+// `OsStr::from_bytes`. Two different raw names are two units even when their lossy renderings are the same
+// string (`ff` and `fe` both render as U+FFFD, and so does the valid `ef bf bd`), a rendered name never
+// decides membership, a missing check, a returned fact, or a duplicate, and an unexpected, linked, or special
+// entry is never opened or descended. Every row below acts AFTER the final `fsck` child has exited and BEFORE
+// the settlement's first listing, exactly as the census rows above do, and keeps the shared listing bound's
+// total constant (each row removes as many expected entries as it adds, so the bound never ends the census).
+// A row records everything it observes (raw attempts from the hooks' paths as bytes, the typed findings, the
+// listing count) BEFORE any assertion, and a family judges all of its rows together. A CAUSAL row names a
+// collision the repair removes; a CONTROL names a separation that already held and must hold after.
+// ---------------------------------------------------------------------------------------------
+
+/// The kind of one raw entry a row adds.
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RawKindV3 {
+    Regular,
+    Link,
+    Fifo,
+}
+
+/// Where a row makes the one deadline pass.
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RawStopV3 {
+    /// Never: the paced settlement meets the first finding.
+    Never,
+    /// Right after the `.git` listing RETURNED: the paced pass stops at the first entry's guard (the typed
+    /// timeout) and the completion resumes from the cached list.
+    AfterGitListing,
+    /// Inside the first added entry's `fstatat`: the completion owes the rest and has no clock.
+    AtFirstStat,
+}
+
+/// One entry a row adds: its parent beneath the destination root, its EXACT bytes, and its kind.
+#[cfg(target_os = "linux")]
+struct RawAddV3 {
+    parent: &'static str,
+    name: &'static [u8],
+    kind: RawKindV3,
+}
+
+#[cfg(target_os = "linux")]
+struct RawRowV3 {
+    name: &'static str,
+    /// Whether the row's collision is the one the repair removes (a control separates what already held).
+    causal: bool,
+    adds: Vec<RawAddV3>,
+    /// Expected restored files removed from `.git` (named beneath it), so the listing total does not change.
+    removes: Vec<&'static str>,
+    stop: RawStopV3,
+    /// The census's own findings, in the census's order (rendered names are the public leaves').
+    want: Vec<ExpectedFailureV1>,
+}
+
+/// What one row observed and how it judged it: `invalid` is a construction problem (never evidence), and
+/// `collisions` is every way the observed run differs from the row's expectation.
+#[cfg(target_os = "linux")]
+struct RawOutcomeV3 {
+    name: &'static str,
+    causal: bool,
+    invalid: Vec<String>,
+    collisions: Vec<String>,
+    seen: String,
+}
+
+#[cfg(target_os = "linux")]
+fn hex_v3(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+/// A finding of the census itself (not a chain's or a digest's): a tree fault, or a link met beneath a name of
+/// the Git directory (the chains' refusals name `repository/.git/...`).
+#[cfg(target_os = "linux")]
+fn census_own_v3(error: &GitBootstrapErrorV1) -> bool {
+    match error {
+        GitBootstrapErrorV1::FinalTree { .. } => true,
+        GitBootstrapErrorV1::Restore(CustodyRestoreErrorV1::SymlinkRefused { name })
+        | GitBootstrapErrorV1::Restore(CustodyRestoreErrorV1::IdentityChanged(name)) => {
+            !name.starts_with("repository/")
+        }
+        _ => false,
+    }
+}
+
+/// The chain refusal of a restored metadata file whose entry is gone.
+#[cfg(target_os = "linux")]
+fn gone_chain_v3(error: &GitBootstrapErrorV1, file: &str) -> bool {
+    matches!(
+        error,
+        GitBootstrapErrorV1::Restore(CustodyRestoreErrorV1::IdentityChanged(detail))
+            if *detail == format!("repository/.git/{file}: the metadata file's entry is gone")
+    )
+}
+
+/// Run one row: the real wrapper over the rich capsule, the row's change made at the settlement's first
+/// directory `fstat`, every observation recorded, and the row judged against its own expectation.
+#[cfg(target_os = "linux")]
+fn run_raw_row_v3(row: &RawRowV3, capsule: &CustomCapsuleV1, clean: &FinalShapeV1) -> RawOutcomeV3 {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    #[derive(Default)]
+    struct StateV3 {
+        acted: std::cell::Cell<bool>,
+        slowed: std::cell::Cell<bool>,
+        invalid: std::cell::RefCell<Vec<String>>,
+    }
+    fn alias_of(add: &RawAddV3) -> PathBuf {
+        use std::os::unix::ffi::OsStrExt as _;
+        Path::new(add.parent).join(std::ffi::OsStr::from_bytes(add.name))
+    }
+    let input = PlaneInV1::rich(capsule, CustodyGitObjectFormatV1::Sha1);
+    let root = input.dest.path.clone();
+    let (_area, outside) = external_dir_with(&["decoy"]);
+    let deadline = match row.stop {
+        RawStopV3::Never => far_deadline(),
+        RawStopV3::AfterGitListing | RawStopV3::AtFirstStat => Instant::now() + B2C_DEADLINE_V1,
+    };
+    // The first added entry beneath a retained directory, in byte order: the one a first-stat stop slows.
+    let first_stat = row
+        .adds
+        .iter()
+        .filter(|add| add.parent != "repository")
+        .min_by_key(|add| add.name)
+        .map(alias_of);
+    let state: std::rc::Rc<StateV3> = std::rc::Rc::default();
+    let act = {
+        let state = state.clone();
+        let adds: Vec<(PathBuf, RawKindV3, &'static str, &'static [u8])> = row
+            .adds
+            .iter()
+            .map(|add| (alias_of(add), add.kind, add.parent, add.name))
+            .collect();
+        let removes = row.removes.clone();
+        let (root, stop) = (root.clone(), row.stop);
+        let first_stat = first_stat.clone();
+        move |log: &[EvV2]| {
+            let Some(EvV2::Hook(point, path)) = log.last() else {
+                return;
+            };
+            if !state.acted.get() {
+                if exited_v2(log) && *point == GitHookPointV1::FinalCensusStatted {
+                    state.acted.set(true);
+                    let mut invalid = state.invalid.borrow_mut();
+                    for (relative, kind, parent, name) in &adds {
+                        let at = root.join(relative);
+                        match kind {
+                            RawKindV3::Regular => std::fs::write(&at, b"").expect("a raw entry"),
+                            RawKindV3::Link => {
+                                std::os::unix::fs::symlink(outside.join("decoy"), &at)
+                                    .expect("a raw link");
+                            }
+                            RawKindV3::Fifo => mkfifo(&at),
+                        }
+                        // The fixture must really hold this EXACT name, of this kind (a filesystem that
+                        // refuses a raw name would otherwise make the row vacuous).
+                        let listed: Vec<Vec<u8>> = std::fs::read_dir(root.join(parent))
+                            .expect("the parent lists")
+                            .map(|entry| entry.expect("an entry").file_name().as_bytes().to_vec())
+                            .collect();
+                        if listed
+                            .iter()
+                            .filter(|held| held.as_slice() == *name)
+                            .count()
+                            != 1
+                        {
+                            invalid.push(format!("{} is not listed exactly once", hex_v3(name)));
+                        }
+                        let made = std::fs::symlink_metadata(&at).expect("the raw entry exists");
+                        let right = match kind {
+                            RawKindV3::Regular => made.file_type().is_file(),
+                            RawKindV3::Link => made.file_type().is_symlink(),
+                            RawKindV3::Fifo => {
+                                std::os::unix::fs::FileTypeExt::is_fifo(&made.file_type())
+                            }
+                        };
+                        if !right {
+                            invalid.push(format!("{} is not of its kind", hex_v3(name)));
+                        }
+                    }
+                    for name in &removes {
+                        let at = root.join("repository/.git").join(name);
+                        std::fs::remove_file(&at).expect("a removed file");
+                        if std::fs::symlink_metadata(&at).is_ok() {
+                            invalid.push(format!("{name} was not removed"));
+                        }
+                    }
+                }
+                return;
+            }
+            if state.slowed.get() {
+                return;
+            }
+            let slow = match stop {
+                RawStopV3::Never => false,
+                RawStopV3::AfterGitListing => {
+                    *point == GitHookPointV1::FinalCensusListed && path.ends_with("repository/.git")
+                }
+                RawStopV3::AtFirstStat => {
+                    *point == GitHookPointV1::BeforeFinalCensusOpen
+                        && first_stat
+                            .as_ref()
+                            .is_some_and(|first| path.ends_with(first))
+                }
+            };
+            if slow {
+                state.slowed.set(true);
+                pass_the_deadline(deadline);
+            }
+        }
+    };
+    let route = RouteV1::recorder();
+    let watched = run_watched_v2(input, &route, deadline, false, act);
+
+    let mut invalid = state.invalid.borrow().clone();
+    let mut collisions = Vec::new();
+    let mut seen = String::new();
+    if !state.acted.get() {
+        invalid.push("the change was never made".to_owned());
+    }
+    if row.stop != RawStopV3::Never && !state.slowed.get() {
+        invalid.push("the deadline was never made to pass".to_owned());
+    }
+    let window = settlement_window_v2(&watched.log);
+    match &watched.ran.outcome {
+        Ok(_) => collisions.push("a success followed the change".to_owned()),
+        Err(failure) => {
+            let held = leaves(&failure.cause);
+            let own: Vec<&GitBootstrapErrorV1> = held
+                .iter()
+                .copied()
+                .filter(|error| census_own_v3(error))
+                .collect();
+            seen.push_str(&format!("findings {own:?}"));
+            if own.len() != row.want.len()
+                || !own
+                    .iter()
+                    .zip(&row.want)
+                    .all(|(error, want)| want.is(error))
+            {
+                collisions.push(format!(
+                    "the census's findings were {} ({own:?}), wanted {} ({:?})",
+                    own.len(),
+                    row.want.len(),
+                    row.want
+                ));
+            }
+            // The chain aftermath: each removed restored file is refused once by its retained chain.
+            for file in &row.removes {
+                let made = held
+                    .iter()
+                    .filter(|error| gone_chain_v3(error, file))
+                    .count();
+                if made != 1 {
+                    collisions.push(format!(
+                        "{made} chain refusals of the removed {file}, wanted 1"
+                    ));
+                }
+            }
+            if held.iter().any(|error| {
+                matches!(
+                    error,
+                    GitBootstrapErrorV1::FinalTree {
+                        fault: FinalTreeFaultV1::Bound,
+                        ..
+                    }
+                )
+            }) {
+                collisions.push("a Bound finding ended the census".to_owned());
+            }
+            // A leaf a row expects is the census's own, a removed file's chain refusal, or the leading timeout.
+            let expected = |at: usize, error: &GitBootstrapErrorV1| {
+                census_own_v3(error)
+                    || row.removes.iter().any(|file| gone_chain_v3(error, file))
+                    || (at == 0 && is_timeout(error))
+            };
+            let stray: Vec<&&GitBootstrapErrorV1> = held
+                .iter()
+                .enumerate()
+                .filter(|(at, error)| !expected(*at, error))
+                .map(|(_, error)| error)
+                .collect();
+            if !stray.is_empty() {
+                collisions.push(format!("leaves no row expects: {stray:?}"));
+            }
+            if row.stop == RawStopV3::AfterGitListing
+                && !held.first().is_some_and(|error| is_timeout(error))
+            {
+                invalid.push(
+                    "the typed timeout was not the primary: the stop took no effect".to_owned(),
+                );
+            }
+            for message in judge_failure_v2(failure, &route, clean, 3) {
+                collisions.push(format!("failure state: {message}"));
+            }
+        }
+    }
+    // One no-follow stat per exact raw name beneath a retained directory, and none for a repository child
+    // (an unexpected repository entry makes no call at all); no event of any other kind at an added entry's
+    // path (never opened, never read, never listed, never descended).
+    for add in &row.adds {
+        let relative = alias_of(add);
+        let attempts = window
+            .iter()
+            .filter(|event| {
+                matches!(event, EvV2::Hook(GitHookPointV1::BeforeFinalCensusOpen, path)
+                    if path.ends_with(&relative))
+            })
+            .count();
+        let wanted = usize::from(add.parent != "repository");
+        seen.push_str(&format!(" | {} attempts {attempts}", hex_v3(add.name)));
+        if attempts != wanted {
+            collisions.push(format!(
+                "{} was attempted {attempts} times beneath {}, wanted {wanted}",
+                hex_v3(add.name),
+                add.parent
+            ));
+        }
+        let beyond = window
+            .iter()
+            .filter(|event| {
+                matches!(event, EvV2::Hook(point, path)
+                    if *point != GitHookPointV1::BeforeFinalCensusOpen
+                        && path.ends_with(&relative))
+            })
+            .count();
+        if beyond != 0 {
+            collisions.push(format!(
+                "{} was opened, read, listed, or descended ({beyond} events)",
+                hex_v3(add.name)
+            ));
+        }
+    }
+    let listings = hooks_v2(window, GitHookPointV1::FinalCensusListed);
+    seen.push_str(&format!(" | listings {listings}"));
+    if listings != 1 + clean.tree_dirs {
+        collisions.push(format!(
+            "{listings} directory listings across the settlement and its completion, wanted {}",
+            1 + clean.tree_dirs
+        ));
+    }
+    RawOutcomeV3 {
+        name: row.name,
+        causal: row.causal,
+        invalid,
+        collisions,
+        seen,
+    }
+}
+
+/// Run every row of a family (each on its own thread: the hooks are thread-local), print one line per row
+/// BEFORE any assertion, and assert once: no row is invalid, and every row matches its expectation.
+#[cfg(target_os = "linux")]
+fn judge_raw_rows_v3(family: &str, rows: Vec<RawRowV3>) {
+    let capsule = captured(CustodyGitObjectFormatV1::Sha1);
+    let clean = clean_final_shape(&capsule, CustodyGitObjectFormatV1::Sha1, true);
+    let outcomes: Vec<RawOutcomeV3> = std::thread::scope(|scope| {
+        let handles: Vec<_> = rows
+            .iter()
+            .map(|row| {
+                let (capsule, clean) = (&capsule, &clean);
+                scope.spawn(move || run_raw_row_v3(row, capsule, clean))
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|handle| handle.join().expect("a raw row's thread"))
+            .collect()
+    });
+    let mut problems = Vec::new();
+    for outcome in &outcomes {
+        let status = if !outcome.invalid.is_empty() {
+            "INVALID"
+        } else if outcome.collisions.is_empty() {
+            "MATCHES"
+        } else {
+            "COLLISION"
+        };
+        println!(
+            "RAW-ROW | {family} | {} | {} | {status} | {} | invalid {:?} | differs {:?}",
+            if outcome.causal { "causal" } else { "control" },
+            outcome.name,
+            outcome.seen,
+            outcome.invalid,
+            outcome.collisions
+        );
+        if !outcome.invalid.is_empty() {
+            problems.push(format!(
+                "INVALID (not behavioral evidence) {}: {}",
+                outcome.name,
+                outcome.invalid.join("; ")
+            ));
+        } else if !outcome.collisions.is_empty() {
+            problems.push(format!(
+                "{} row {}: {}",
+                if outcome.causal { "CAUSAL" } else { "CONTROL" },
+                outcome.name,
+                outcome.collisions.join("; ")
+            ));
+        }
+    }
+    assert!(problems.is_empty(), "{}", problems.join("\n"));
+}
+
+/// FAMILY 1 (raw aliases, exact attempts, resume). Two raw names of ONE parent whose lossy renderings are the
+/// same string (`ff` and `fe`; `ff` and the valid UTF-8 `ef bf bd`) are two independent census units: each is
+/// `fstatat`ed exactly once by its exact bytes and each is its own finding (the two public leaves may look
+/// identical), beside the findings of the removed expected files and their chain aftermath, and each directory is
+/// listed once. A deadline spent right after the `.git` listing RETURNED stops the paced pass at the first entry's
+/// guard, and the completion resumes from the cached list and attempts each raw name once. The controls are two
+/// distinct VALID names and one alias alone.
+#[cfg(target_os = "linux")]
+#[test]
+fn b2c_lossless_raw_name_aliases_are_independent_census_units_with_exact_attempts_and_resume() {
+    let ff_fe = || {
+        vec![
+            RawAddV3 {
+                parent: "repository/.git",
+                name: b"\xff",
+                kind: RawKindV3::Regular,
+            },
+            RawAddV3 {
+                parent: "repository/.git",
+                name: b"\xfe",
+                kind: RawKindV3::Regular,
+            },
+        ]
+    };
+    let ff_replacement = || {
+        vec![
+            RawAddV3 {
+                parent: "repository/.git",
+                name: b"\xff",
+                kind: RawKindV3::Regular,
+            },
+            RawAddV3 {
+                parent: "repository/.git",
+                name: b"\xef\xbf\xbd",
+                kind: RawKindV3::Regular,
+            },
+        ]
+    };
+    let unexpected = || ExpectedFailureV1::Tree(FinalTreeFaultV1::Unexpected, "\u{fffd}");
+    let missing = |name| ExpectedFailureV1::Tree(FinalTreeFaultV1::Missing, name);
+    let two = || {
+        vec![
+            unexpected(),
+            unexpected(),
+            missing("HEAD"),
+            missing("ORIG_HEAD"),
+        ]
+    };
+    let removed = || vec!["HEAD", "ORIG_HEAD"];
+    judge_raw_rows_v3(
+        "family 1",
+        vec![
+            RawRowV3 {
+                name: "two invalid raw names {ff, fe} beneath .git",
+                causal: true,
+                adds: ff_fe(),
+                removes: removed(),
+                stop: RawStopV3::Never,
+                want: two(),
+            },
+            RawRowV3 {
+                name: "an invalid raw name and the valid U+FFFD {ff, ef bf bd} beneath .git",
+                causal: true,
+                adds: ff_replacement(),
+                removes: removed(),
+                stop: RawStopV3::Never,
+                want: two(),
+            },
+            RawRowV3 {
+                name: "two invalid raw names {ff, fe} beneath the nested retained parent refs",
+                causal: true,
+                adds: vec![
+                    RawAddV3 { parent: "repository/.git/refs", name: b"\xff", kind: RawKindV3::Regular },
+                    RawAddV3 { parent: "repository/.git/refs", name: b"\xfe", kind: RawKindV3::Regular },
+                ],
+                removes: removed(),
+                stop: RawStopV3::Never,
+                want: vec![
+                    ExpectedFailureV1::Tree(FinalTreeFaultV1::Unexpected, "refs/\u{fffd}"),
+                    ExpectedFailureV1::Tree(FinalTreeFaultV1::Unexpected, "refs/\u{fffd}"),
+                    missing("HEAD"),
+                    missing("ORIG_HEAD"),
+                ],
+            },
+            RawRowV3 {
+                name: "{ff, fe} with the deadline spent right after the .git listing returned (resume from the cached list)",
+                causal: true,
+                adds: ff_fe(),
+                removes: removed(),
+                stop: RawStopV3::AfterGitListing,
+                want: two(),
+            },
+            RawRowV3 {
+                name: "{ff, ef bf bd} with the deadline spent right after the .git listing returned (resume from the cached list)",
+                causal: true,
+                adds: ff_replacement(),
+                removes: removed(),
+                stop: RawStopV3::AfterGitListing,
+                want: two(),
+            },
+            RawRowV3 {
+                name: "{ff, fe} with the deadline spent inside the first name's fstatat (a clock-free completion)",
+                causal: true,
+                adds: ff_fe(),
+                removes: removed(),
+                stop: RawStopV3::AtFirstStat,
+                want: two(),
+            },
+            RawRowV3 {
+                name: "control: two distinct valid names {0a, 0b}",
+                causal: false,
+                adds: vec![
+                    RawAddV3 { parent: "repository/.git", name: b"0a", kind: RawKindV3::Regular },
+                    RawAddV3 { parent: "repository/.git", name: b"0b", kind: RawKindV3::Regular },
+                ],
+                removes: removed(),
+                stop: RawStopV3::Never,
+                want: vec![
+                    ExpectedFailureV1::Tree(FinalTreeFaultV1::Unexpected, "0a"),
+                    ExpectedFailureV1::Tree(FinalTreeFaultV1::Unexpected, "0b"),
+                    missing("HEAD"),
+                    missing("ORIG_HEAD"),
+                ],
+            },
+            RawRowV3 {
+                name: "control: one invalid raw name {ff} alone",
+                causal: false,
+                adds: vec![RawAddV3 {
+                    parent: "repository/.git",
+                    name: b"\xff",
+                    kind: RawKindV3::Regular,
+                }],
+                removes: vec!["HEAD"],
+                stop: RawStopV3::Never,
+                want: vec![unexpected(), missing("HEAD")],
+            },
+        ],
+    );
+}
+
+/// FAMILY 2 (the repository's own children, the sentinel, and the namespaces that were already separate). Two raw
+/// names of the REPOSITORY directory (outside `.git`) are two units and two findings (an unexpected repository
+/// child makes no call at all), and a Git child whose raw name is `\x01HEAD` is its own entry that must not
+/// settle the missing check of `HEAD` (a missing unit used to be a prefixed string in the same set as the
+/// entries). The CONTROLS hold on every version: equal raw spelling in the repository and in the Git namespace,
+/// the same rendered name under two retained parents (equal and different raw bytes), and one repository child
+/// alone, each its own units.
+#[cfg(target_os = "linux")]
+#[test]
+fn b2c_lossless_repository_aliases_the_missing_namespace_and_the_separate_namespace_controls() {
+    let unexpected = |name| ExpectedFailureV1::Tree(FinalTreeFaultV1::Unexpected, name);
+    let missing = |name| ExpectedFailureV1::Tree(FinalTreeFaultV1::Missing, name);
+    let removed = || vec!["HEAD", "ORIG_HEAD"];
+    judge_raw_rows_v3(
+        "family 2",
+        vec![
+            RawRowV3 {
+                name: "two invalid raw names {ff, fe} beside the repository's .git",
+                causal: true,
+                adds: vec![
+                    RawAddV3 { parent: "repository", name: b"\xff", kind: RawKindV3::Regular },
+                    RawAddV3 { parent: "repository", name: b"\xfe", kind: RawKindV3::Regular },
+                ],
+                removes: removed(),
+                stop: RawStopV3::Never,
+                want: vec![
+                    unexpected("\u{fffd}"),
+                    unexpected("\u{fffd}"),
+                    missing("HEAD"),
+                    missing("ORIG_HEAD"),
+                ],
+            },
+            RawRowV3 {
+                name: "an invalid raw name and the valid U+FFFD {ff, ef bf bd} beside the repository's .git",
+                causal: true,
+                adds: vec![
+                    RawAddV3 { parent: "repository", name: b"\xff", kind: RawKindV3::Regular },
+                    RawAddV3 { parent: "repository", name: b"\xef\xbf\xbd", kind: RawKindV3::Regular },
+                ],
+                removes: removed(),
+                stop: RawStopV3::Never,
+                want: vec![
+                    unexpected("\u{fffd}"),
+                    unexpected("\u{fffd}"),
+                    missing("HEAD"),
+                    missing("ORIG_HEAD"),
+                ],
+            },
+            RawRowV3 {
+                name: "the Git child \\x01HEAD beside a removed HEAD (the missing unit is not an entry)",
+                causal: true,
+                adds: vec![RawAddV3 {
+                    parent: "repository/.git",
+                    name: b"\x01HEAD",
+                    kind: RawKindV3::Regular,
+                }],
+                removes: vec!["HEAD"],
+                stop: RawStopV3::Never,
+                want: vec![unexpected("\u{1}HEAD"), missing("HEAD")],
+            },
+            RawRowV3 {
+                name: "control: equal raw spelling {ff} in the repository and beneath .git",
+                causal: false,
+                adds: vec![
+                    RawAddV3 { parent: "repository", name: b"\xff", kind: RawKindV3::Regular },
+                    RawAddV3 { parent: "repository/.git", name: b"\xff", kind: RawKindV3::Regular },
+                ],
+                removes: removed(),
+                stop: RawStopV3::Never,
+                want: vec![
+                    unexpected("\u{fffd}"),
+                    unexpected("\u{fffd}"),
+                    missing("HEAD"),
+                    missing("ORIG_HEAD"),
+                ],
+            },
+            RawRowV3 {
+                name: "control: equal raw spelling {ff} beneath the two retained parents logs and refs",
+                causal: false,
+                adds: vec![
+                    RawAddV3 { parent: "repository/.git/logs", name: b"\xff", kind: RawKindV3::Regular },
+                    RawAddV3 { parent: "repository/.git/refs", name: b"\xff", kind: RawKindV3::Regular },
+                ],
+                removes: removed(),
+                stop: RawStopV3::Never,
+                want: vec![
+                    unexpected("logs/\u{fffd}"),
+                    unexpected("refs/\u{fffd}"),
+                    missing("HEAD"),
+                    missing("ORIG_HEAD"),
+                ],
+            },
+            RawRowV3 {
+                name: "control: different raw bytes {ff, fe} with one rendering beneath logs and refs",
+                causal: false,
+                adds: vec![
+                    RawAddV3 { parent: "repository/.git/logs", name: b"\xff", kind: RawKindV3::Regular },
+                    RawAddV3 { parent: "repository/.git/refs", name: b"\xfe", kind: RawKindV3::Regular },
+                ],
+                removes: removed(),
+                stop: RawStopV3::Never,
+                want: vec![
+                    unexpected("logs/\u{fffd}"),
+                    unexpected("refs/\u{fffd}"),
+                    missing("HEAD"),
+                    missing("ORIG_HEAD"),
+                ],
+            },
+            RawRowV3 {
+                name: "control: one invalid repository child {ff} alone",
+                causal: false,
+                adds: vec![RawAddV3 {
+                    parent: "repository",
+                    name: b"\xff",
+                    kind: RawKindV3::Regular,
+                }],
+                removes: vec!["HEAD"],
+                stop: RawStopV3::Never,
+                want: vec![unexpected("\u{fffd}"), missing("HEAD")],
+            },
+        ],
+    );
+}
+
+/// FAMILY 3 (regular, link, and special entries of distinct raw names). Byte-distinct invalid names that are a
+/// regular file, a symlink, and a FIFO (in either order) are each classified by their own `fstatat` and each is
+/// its own finding, in raw byte order, beside every removed file's missing check and chain; the link and the FIFO
+/// are never opened, read, or descended (an `open` of the FIFO would hang the run). One entry alone of each
+/// class is exactly one attempt and one finding, and three distinct VALID names classify the same way.
+#[cfg(target_os = "linux")]
+#[test]
+fn b2c_lossless_regular_link_and_special_aliases_are_classified_independently_and_never_opened() {
+    let unexpected = |name| ExpectedFailureV1::Tree(FinalTreeFaultV1::Unexpected, name);
+    let special = |name| ExpectedFailureV1::Tree(FinalTreeFaultV1::Special, name);
+    let missing = |name| ExpectedFailureV1::Tree(FinalTreeFaultV1::Missing, name);
+    let three = || vec!["HEAD", "ORIG_HEAD", "packed-refs"];
+    let in_git = |name: &'static [u8], kind| RawAddV3 {
+        parent: "repository/.git",
+        name,
+        kind,
+    };
+    judge_raw_rows_v3(
+        "family 3",
+        vec![
+            RawRowV3 {
+                name: "{fd regular, fe symlink, ff FIFO} replacing three restored files",
+                causal: true,
+                adds: vec![
+                    in_git(b"\xfd", RawKindV3::Regular),
+                    in_git(b"\xfe", RawKindV3::Link),
+                    in_git(b"\xff", RawKindV3::Fifo),
+                ],
+                removes: three(),
+                stop: RawStopV3::Never,
+                want: vec![
+                    unexpected("\u{fffd}"),
+                    ExpectedFailureV1::Symlink("\u{fffd}"),
+                    special("\u{fffd}"),
+                    missing("HEAD"),
+                    missing("ORIG_HEAD"),
+                    missing("packed-refs"),
+                ],
+            },
+            RawRowV3 {
+                name: "{fd FIFO, fe symlink, ff regular} replacing three restored files",
+                causal: true,
+                adds: vec![
+                    in_git(b"\xfd", RawKindV3::Fifo),
+                    in_git(b"\xfe", RawKindV3::Link),
+                    in_git(b"\xff", RawKindV3::Regular),
+                ],
+                removes: three(),
+                stop: RawStopV3::Never,
+                want: vec![
+                    special("\u{fffd}"),
+                    ExpectedFailureV1::Symlink("\u{fffd}"),
+                    unexpected("\u{fffd}"),
+                    missing("HEAD"),
+                    missing("ORIG_HEAD"),
+                    missing("packed-refs"),
+                ],
+            },
+            RawRowV3 {
+                name: "control: one regular raw name {ff} alone",
+                causal: false,
+                adds: vec![in_git(b"\xff", RawKindV3::Regular)],
+                removes: vec!["HEAD"],
+                stop: RawStopV3::Never,
+                want: vec![unexpected("\u{fffd}"), missing("HEAD")],
+            },
+            RawRowV3 {
+                name: "control: one symlink raw name {ff} alone",
+                causal: false,
+                adds: vec![in_git(b"\xff", RawKindV3::Link)],
+                removes: vec!["HEAD"],
+                stop: RawStopV3::Never,
+                want: vec![ExpectedFailureV1::Symlink("\u{fffd}"), missing("HEAD")],
+            },
+            RawRowV3 {
+                name: "control: one FIFO raw name {ff} alone",
+                causal: false,
+                adds: vec![in_git(b"\xff", RawKindV3::Fifo)],
+                removes: vec!["HEAD"],
+                stop: RawStopV3::Never,
+                want: vec![special("\u{fffd}"), missing("HEAD")],
+            },
+            RawRowV3 {
+                name: "control: three distinct valid names {0a regular, 0b symlink, 0c FIFO}",
+                causal: false,
+                adds: vec![
+                    in_git(b"0a", RawKindV3::Regular),
+                    in_git(b"0b", RawKindV3::Link),
+                    in_git(b"0c", RawKindV3::Fifo),
+                ],
+                removes: three(),
+                stop: RawStopV3::Never,
+                want: vec![
+                    unexpected("0a"),
+                    ExpectedFailureV1::Symlink("0b"),
+                    special("0c"),
+                    missing("HEAD"),
+                    missing("ORIG_HEAD"),
+                    missing("packed-refs"),
+                ],
+            },
+        ],
+    );
+}
