@@ -16,22 +16,23 @@ use std::time::{Duration, Instant};
 
 use agent_client_protocol::schema::v1::{
     AgentCapabilities, AuthMethod, AuthMethodId, AuthenticateRequest, CancelNotification,
-    CloseSessionRequest, ContentBlock, CreateTerminalRequest, CreateTerminalResponse, EnvVariable,
-    InitializeRequest, InitializeResponse, KillTerminalRequest, KillTerminalResponse, McpServer,
-    McpServerStdio, NewSessionRequest, PermissionOption, PermissionOptionKind, PlanEntryPriority,
-    PlanEntryStatus, PromptRequest, PromptResponse, ReadTextFileRequest, ReadTextFileResponse,
-    ReleaseTerminalRequest, ReleaseTerminalResponse, RequestPermissionOutcome,
-    RequestPermissionRequest, RequestPermissionResponse, SelectedPermissionOutcome,
-    SessionConfigId, SessionConfigOption, SessionConfigValueId, SessionId as AgentSessionId,
-    SessionModeState, SessionNotification, SessionUpdate, SetSessionConfigOptionRequest,
-    SetSessionModeRequest, StopReason, TerminalOutputRequest, TerminalOutputResponse, TextContent,
-    ToolCallContent, ToolCallLocation, ToolCallStatus, ToolKind, WaitForTerminalExitRequest,
-    WaitForTerminalExitResponse, WriteTextFileRequest, WriteTextFileResponse,
+    CloseSessionRequest, CloseSessionResponse, ContentBlock, CreateTerminalRequest,
+    CreateTerminalResponse, EnvVariable, InitializeRequest, InitializeResponse,
+    KillTerminalRequest, KillTerminalResponse, McpServer, McpServerStdio, NewSessionRequest,
+    PermissionOption, PermissionOptionKind, PlanEntryPriority, PlanEntryStatus, PromptRequest,
+    PromptResponse, ReadTextFileRequest, ReadTextFileResponse, ReleaseTerminalRequest,
+    ReleaseTerminalResponse, RequestPermissionOutcome, RequestPermissionRequest,
+    RequestPermissionResponse, SelectedPermissionOutcome, SessionConfigId, SessionConfigOption,
+    SessionConfigValueId, SessionId as AgentSessionId, SessionModeState, SessionNotification,
+    SessionUpdate, SetSessionConfigOptionRequest, SetSessionModeRequest, StopReason,
+    TerminalOutputRequest, TerminalOutputResponse, TextContent, ToolCallContent, ToolCallLocation,
+    ToolCallStatus, ToolKind, WaitForTerminalExitRequest, WaitForTerminalExitResponse,
+    WriteTextFileRequest, WriteTextFileResponse,
 };
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::{
     Agent, Client, ConnectTo, ConnectionTo, Error as AcpError, ErrorCode, JsonRpcMessage,
-    JsonRpcRequest, JsonRpcResponse, Lines, UntypedMessage,
+    JsonRpcRequest, JsonRpcResponse, Lines, SentRequest, UntypedMessage,
 };
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -864,8 +865,8 @@ enum AcpTraceEvent {
     },
     /// The agent acknowledged the `session/close` sent for one agent session
     /// of a released bridge session. Like the three outcomes below it is
-    /// emitted once per agent session and correlates through the bridge
-    /// session's owner fingerprint; neither session id is traced.
+    /// emitted per agent session and correlates through the bridge session's
+    /// owner fingerprint; neither session id is traced.
     SessionCloseAcknowledged {
         owner_key_fingerprint: i64,
     },
@@ -880,8 +881,12 @@ enum AcpTraceEvent {
         owner_key_fingerprint: i64,
     },
     /// The bridge gave up on `session/close`. Unsent: the connection was
-    /// already fenced, or the session's cancelled turn did not settle within
-    /// the cancel grace. Sent: the connection was fenced before any answer.
+    /// already fenced, or the cancel grace ran out while a mint was still in
+    /// flight, while the session's cancelled turn was still unwinding, or
+    /// before this request came up to be sent. Sent: the connection was
+    /// fenced before any answer. A release that gives up on a mint still in
+    /// flight emits this once for that mint; the mint closes what it minted
+    /// when it settles, and that close is traced as an outcome of its own.
     SessionCloseAbandoned {
         owner_key_fingerprint: i64,
         sent: bool,
@@ -1932,11 +1937,9 @@ struct AgentSession {
     /// The agent-minted session id, set exactly once by the `session/new` that
     /// `ensure_session` drives. `OnceCell` guarantees single init under races.
     agent_id: OnceCell<AgentSessionId>,
-    /// Ids a `session/new` returned for this bridge session that never became
-    /// `agent_id`: a mint whose mode/model/effort setup fails abandons its
-    /// agent-side session, and the retry mints another. Release drains this
-    /// list and offers each id, along with `agent_id`, to `session/close`.
-    abandoned_agent_ids: StdMutex<Vec<AgentSessionId>>,
+    /// What else `session/new` returned for this bridge session, and whether
+    /// release has unpublished it (see [`MintLedger`]).
+    minted: StdMutex<MintLedger>,
     /// Single-flight owner for initialization. The owner moves into a spawned
     /// task, so cancelling the caller that first requested a session cannot
     /// cancel an already-started `session/new`/configuration lifecycle and
@@ -1984,11 +1987,31 @@ struct AgentSession {
     turn_kill: Arc<StdMutex<Option<Arc<tokio::sync::Notify>>>>,
 }
 
+/// Which agent sessions one bridge session minted beyond its published
+/// `agent_id`, and who closes them. A single lock orders a mint publishing or
+/// abandoning its id against release collecting the entry's ids, so each
+/// minted id has exactly one closer.
+#[derive(Default)]
+struct MintLedger {
+    /// Set, together with the map removal, by the release that unpublishes
+    /// the entry. A released entry never gains an `agent_id` and starts no
+    /// further mint: whatever `session/new` returns for it is only closed.
+    released: bool,
+    /// Ids a `session/new` returned that never became `agent_id` and that
+    /// nobody has collected yet: a mint whose mode/model/effort setup fails
+    /// abandons its agent-side session, and the retry mints another.
+    abandoned: Vec<AgentSessionId>,
+    /// Left by release's close flight once it has collected the ids above.
+    /// An id abandoned after that, by a mint the flight did not or could not
+    /// wait for, is closed through this instead of being collected.
+    late_closer: Option<SessionCloser>,
+}
+
 impl AgentSession {
     fn new() -> Self {
         Self {
             agent_id: OnceCell::new(),
-            abandoned_agent_ids: StdMutex::new(Vec::new()),
+            minted: StdMutex::new(MintLedger::default()),
             init_lock: Arc::new(Mutex::new(())),
             minted_cwd: OnceCell::new(),
             active_mint_cwd: StdMutex::new(None),
@@ -1998,6 +2021,73 @@ impl AgentSession {
             cancel_requested: AtomicBool::new(false),
             turn_kill: Arc::new(StdMutex::new(None)),
         }
+    }
+
+    fn minted(&self) -> std::sync::MutexGuard<'_, MintLedger> {
+        self.minted
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Record that release has removed this entry from the session map.
+    fn mark_released(&self) {
+        self.minted().released = true;
+    }
+
+    /// Whether release has unpublished this entry. A caller still holding it
+    /// must neither mint for it nor reuse what was minted for it.
+    fn is_released(&self) -> bool {
+        self.minted().released
+    }
+
+    /// Publish the id a mint settled on, with the cwd it was minted for.
+    /// Refused once release has unpublished the entry: the id then stays with
+    /// the mint's [`AbandonedMintGuard`] and is closed, never used.
+    fn publish_minted(&self, agent_id: AgentSessionId, cwd: String) -> Result<(), BridgeError> {
+        // Held to the end, so publication and release cannot interleave.
+        let minted = self.minted();
+        if minted.released {
+            return Err(BridgeError::InvalidStateTransition);
+        }
+        // The cwd goes first, so whoever can see the id can see its cwd. `set`
+        // on a `OnceCell` can only fail if already set (impossible here since
+        // the mint owns the single-flight init guard); ignore the result.
+        let _ = self.minted_cwd.set(cwd);
+        self.agent_id
+            .set(agent_id)
+            .map_err(|_| BridgeError::InvalidStateTransition)
+    }
+
+    /// Take in an id that a mint received from `session/new` and did not
+    /// publish. Release's close flight collects it, unless that flight has
+    /// been and gone, in which case the id is closed from here.
+    fn abandon_minted(&self, agent_id: AgentSessionId) {
+        let mut minted = self.minted();
+        match minted.late_closer.clone() {
+            Some(closer) => {
+                drop(minted);
+                closer.close_late(agent_id);
+            }
+            None => minted.abandoned.push(agent_id),
+        }
+    }
+
+    /// The ids abandoned so far. They are settled and never carried a turn,
+    /// so release's close flight has nothing to wait for before closing them.
+    fn take_abandoned(&self) -> Vec<AgentSessionId> {
+        std::mem::take(&mut self.minted().abandoned)
+    }
+
+    /// Give release's close flight what is left for it to close: the ids
+    /// abandoned since [`Self::take_abandoned`], then the published one.
+    /// `closer` stays behind for whatever a mint abandons after this.
+    fn hand_over_minted(&self, closer: &SessionCloser) -> Vec<AgentSessionId> {
+        let mut minted = self.minted();
+        minted.late_closer = Some(closer.clone());
+        std::mem::take(&mut minted.abandoned)
+            .into_iter()
+            .chain(self.agent_id.get().cloned())
+            .collect()
     }
 }
 
@@ -2011,8 +2101,9 @@ impl Drop for ActiveMintCwdGuard {
     }
 }
 
-/// Records the id one mint attempt received from `session/new` as abandoned
-/// unless that attempt goes on to publish it, on every exit including abort.
+/// Hands the id one mint attempt received from `session/new` back to its
+/// entry as abandoned unless that attempt goes on to publish it, on every
+/// exit including abort.
 struct AbandonedMintGuard {
     entry: Arc<AgentSession>,
     agent_id: Option<AgentSessionId>,
@@ -2034,12 +2125,193 @@ impl AbandonedMintGuard {
 impl Drop for AbandonedMintGuard {
     fn drop(&mut self) {
         if let Some(agent_id) = self.agent_id.take() {
-            self.entry
-                .abandoned_agent_ids
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .push(agent_id);
+            self.entry.abandon_minted(agent_id);
         }
+    }
+}
+
+/// One `session/close` on the wire, or the typed reason it never got there.
+type PendingClose = Result<SentRequest<CloseSessionResponse>, AcpTraceEvent>;
+
+/// What sending `session/close` needs from the backend, cloned out of it so
+/// that a close can outlive the release call that asked for it.
+#[derive(Clone)]
+struct SessionCloser {
+    cx: ConnectionTo<Agent>,
+    dispatch_gate: Arc<StdMutex<()>>,
+    unavailable: Arc<AtomicBool>,
+    /// [`AcpConfig::cancel_grace`], which bounds a close that has no release
+    /// deadline to run under (see [`Self::close_late`]).
+    grace: Duration,
+    owner_key_fingerprint: i64,
+    /// Pause taken before each request, to walk dispatch into its deadline.
+    #[cfg(test)]
+    dispatch_delay: Option<Duration>,
+}
+
+impl SessionCloser {
+    fn unsent(&self) -> AcpTraceEvent {
+        AcpTraceEvent::SessionCloseAbandoned {
+            owner_key_fingerprint: self.owner_key_fingerprint,
+            sent: false,
+            connection_unavailable: self.unavailable.load(Ordering::SeqCst),
+        }
+    }
+
+    /// Release's close flight over an entry it has just unpublished. The one
+    /// `deadline` covers everything the flight waits for (a mint still in
+    /// flight, the turn the preceding cancel is unwinding, and the agent's
+    /// answers), so the flight ends by then whatever the agent does.
+    /// `dispatched` fires once every close is on the wire or has been given
+    /// up. Returns one typed outcome per agent session for the caller to
+    /// trace, counting a mint that outlived the deadline as one.
+    async fn close_released(
+        self,
+        entry: Arc<AgentSession>,
+        deadline: tokio::time::Instant,
+        dispatched: oneshot::Sender<()>,
+    ) -> Vec<AcpTraceEvent> {
+        // A fenced connection takes no close, so there is nothing to wait for.
+        let fenced = || self.unavailable.load(Ordering::SeqCst);
+        let mut seen = HashSet::new();
+        // What earlier mints abandoned is settled and never carried a turn,
+        // so it goes out at once instead of behind the two waits below.
+        let mut pending = self
+            .dispatch(entry.take_abandoned(), deadline, &mut seen)
+            .await;
+        // A mint holds `init_lock` until it has published its id or abandoned
+        // it, so the lock is how the flight learns of an id that `session/new`
+        // had yet to settle when release ran. Taking it once is enough: a
+        // released entry starts no further mint.
+        let mint_settled = fenced()
+            || tokio::time::timeout_at(deadline, entry.init_lock.lock())
+                .await
+                .is_ok();
+        let remaining = entry.hand_over_minted(&self);
+        if !mint_settled && remaining.is_empty() {
+            // The mint outlived the deadline. It cannot publish what it mints
+            // and closes it itself when it settles (`abandon_minted`).
+            pending.push(Err(self.unsent()));
+        }
+        // A turn the preceding cancel is still unwinding holds the turn lock
+        // until its prompt result is terminal. Closing underneath it could turn
+        // that clean cancel into an agent error, so close only once the lock
+        // is free, or give up at the deadline.
+        let turn = if fenced() {
+            None
+        } else {
+            tokio::time::timeout_at(deadline, entry.turn_lock.lock())
+                .await
+                .ok()
+        };
+        pending.extend(match turn {
+            Some(_turn) => self.dispatch(remaining, deadline, &mut seen).await,
+            None => remaining
+                .into_iter()
+                .filter(|agent_id| seen.insert(agent_id.clone()))
+                .map(|_| Err(self.unsent()))
+                .collect(),
+        });
+        // Nobody may still be listening; the flight finishes regardless.
+        let _ = dispatched.send(());
+        self.settle(pending, deadline).await
+    }
+
+    /// Close one id that a mint abandoned after its release's flight had
+    /// collected the entry, as a task of its own under a grace of its own.
+    fn close_late(self, agent_id: AgentSessionId) {
+        // Without a runtime the backend is going down, adapter and all.
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        runtime.spawn(async move {
+            let deadline = tokio::time::Instant::now() + self.grace;
+            let pending = self
+                .dispatch(vec![agent_id], deadline, &mut HashSet::new())
+                .await;
+            for outcome in self.settle(pending, deadline).await {
+                outcome.emit();
+            }
+        });
+    }
+
+    /// Put `session/close` on the wire for each id not yet `seen`, in order.
+    /// Every request is checked against `deadline` and the fence on its own,
+    /// so dispatch stops where either cuts in and the rest come back unsent.
+    async fn dispatch(
+        &self,
+        agent_ids: Vec<AgentSessionId>,
+        deadline: tokio::time::Instant,
+        seen: &mut HashSet<AgentSessionId>,
+    ) -> Vec<PendingClose> {
+        let mut pending = Vec::with_capacity(agent_ids.len());
+        for agent_id in agent_ids {
+            if !seen.insert(agent_id.clone()) {
+                continue;
+            }
+            #[cfg(test)]
+            if let Some(delay) = self.dispatch_delay {
+                tokio::time::sleep(delay).await;
+            }
+            pending.push(self.send(agent_id, deadline));
+        }
+        pending
+    }
+
+    fn send(&self, agent_id: AgentSessionId, deadline: tokio::time::Instant) -> PendingClose {
+        // Same short, non-awaiting gate as prompt installation: once
+        // escalation or retirement closes the fence, nothing more is sent.
+        let _dispatch = self
+            .dispatch_gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.unavailable.load(Ordering::SeqCst) || tokio::time::Instant::now() >= deadline {
+            return Err(self.unsent());
+        }
+        Ok(self.cx.send_request(CloseSessionRequest::new(agent_id)))
+    }
+
+    /// Wait until `deadline` for the answer to each close that was sent, and
+    /// type every outcome.
+    async fn settle(
+        &self,
+        pending: Vec<PendingClose>,
+        deadline: tokio::time::Instant,
+    ) -> Vec<AcpTraceEvent> {
+        let owner_key_fingerprint = self.owner_key_fingerprint;
+        let mut outcomes = Vec::with_capacity(pending.len());
+        for close in pending {
+            let answer = match close {
+                Ok(sent) => tokio::time::timeout_at(deadline, sent.block_task()).await,
+                Err(unsent) => {
+                    outcomes.push(unsent);
+                    continue;
+                }
+            };
+            outcomes.push(match answer {
+                Ok(Ok(_)) => AcpTraceEvent::SessionCloseAcknowledged {
+                    owner_key_fingerprint,
+                },
+                // Retirement or escalation fails or starves a request already
+                // on the wire. That is this bridge's own teardown, not the
+                // agent's verdict on the close.
+                _ if self.unavailable.load(Ordering::SeqCst) => {
+                    AcpTraceEvent::SessionCloseAbandoned {
+                        owner_key_fingerprint,
+                        sent: true,
+                        connection_unavailable: true,
+                    }
+                }
+                Ok(Err(error)) => AcpTraceEvent::SessionCloseRejected {
+                    owner_key_fingerprint,
+                    rpc_code: AcpBackend::error_code_i64(error.code),
+                },
+                Err(_) => AcpTraceEvent::SessionCloseUnanswered {
+                    owner_key_fingerprint,
+                },
+            });
+        }
+        outcomes
     }
 }
 
@@ -4891,6 +5163,12 @@ impl AcpBackend {
             (id.clone(), false)
         } else {
             let init_guard = Arc::clone(&entry.init_lock).lock_owned().await;
+            if entry.is_released() {
+                // Release unpublished the entry while this caller queued for
+                // it. Whatever was minted for it is being closed, and a mint
+                // started now could only be closed in turn.
+                return Err(BridgeError::InvalidStateTransition);
+            }
             if let Some(id) = entry.agent_id.get() {
                 drop(init_guard);
                 (id.clone(), false)
@@ -5177,16 +5455,13 @@ impl AcpBackend {
                             session_catalog.current_mode = Some(mode.clone());
                         }
 
-                        // (5) Record the cwd that was actually used to mint this session so
-                        // the immutability guard below can compare future requests against
-                        // what the agent was ACTUALLY given at session/new (ACP §11A).
-                        // `set` on a `OnceCell` can only fail if already set (impossible here
-                        // since we own the single-flight init guard); ignore the result.
-                        let _ = entry.minted_cwd.set(cwd_for_mint);
-                        entry
-                            .agent_id
-                            .set(id.clone())
-                            .map_err(|_| BridgeError::InvalidStateTransition)?;
+                        // (5) Publish the id, recording with it the cwd that was actually
+                        // used to mint this session so the immutability guard below can
+                        // compare future requests against what the agent was ACTUALLY given
+                        // at session/new (ACP §11A). A release that unpublished the entry
+                        // while this mint ran wins: the id stays with `abandoned_mint`,
+                        // which hands it over to be closed, and the caller gets the error.
+                        entry.publish_minted(id.clone(), cwd_for_mint)?;
                         abandoned_mint.published();
                         catalogs_for_mint
                             .lock()
@@ -5655,7 +5930,14 @@ impl AcpBackend {
                     stderr_ring.retain_metadata_only();
                 }
             }
-            sessions.remove(session)
+            let released = sessions.remove(session);
+            if let Some(entry) = released.as_ref() {
+                // Out of the map and marked in one step: from here on a mint
+                // still running for this entry can only be closed, never
+                // published, while the key is free for a fresh entry.
+                entry.mark_released();
+            }
+            released
         };
         let owner_detach_result = if released.is_some() {
             // Ordinary release changes owner membership only. Destructive
@@ -5701,43 +5983,16 @@ impl AcpBackend {
     /// initialize and an id was actually minted. Returns once every close is
     /// on the wire or has been given up, which takes at most one
     /// [`AcpConfig::cancel_grace`]; the answers are awaited by the flight
-    /// alone (see [`Self::close_agent_sessions`]).
+    /// alone (see [`SessionCloser::close_released`]).
     async fn close_released_agent_sessions(&self, session: &SessionId, entry: Arc<AgentSession>) {
-        if !self.capabilities().close {
-            return;
-        }
-        let Ok(cx) = self.cx() else {
+        // One absolute deadline for the whole flight, started before any id
+        // is collected or sent.
+        let deadline = tokio::time::Instant::now() + self.cancel_grace();
+        let Some(closer) = self.session_closer(session) else {
             return;
         };
-        // Everything minted and settled by now: the ids failed mints
-        // abandoned, then the published one. A mint still in flight is left
-        // alone, neither waited for nor closed underneath its own requests.
-        let abandoned = std::mem::take(
-            &mut *entry
-                .abandoned_agent_ids
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner),
-        );
-        let mut agent_ids: Vec<AgentSessionId> = Vec::with_capacity(abandoned.len() + 1);
-        for agent_id in abandoned.into_iter().chain(entry.agent_id.get().cloned()) {
-            if !agent_ids.contains(&agent_id) {
-                agent_ids.push(agent_id);
-            }
-        }
-        if agent_ids.is_empty() {
-            return;
-        }
         let (dispatched, dispatch_settled) = oneshot::channel();
-        let closing = Self::close_agent_sessions(
-            cx.clone(),
-            entry,
-            agent_ids,
-            Arc::clone(&self.dispatch_gate),
-            Arc::clone(&self.unavailable),
-            self.cancel_grace(),
-            AcpTraceEvent::owner_key_fingerprint(session.as_str()),
-            dispatched,
-        );
+        let closing = closer.close_released(entry, deadline, dispatched);
         // The flight runs, and traces its outcomes, as its own task: a release
         // caller that stops waiting cannot strand a close between the turn
         // settling and the send.
@@ -5751,84 +6006,22 @@ impl AcpBackend {
         let _ = dispatch_settled.await;
     }
 
-    /// One `session/close` flight. A single `grace` deadline covers both
-    /// waiting for the session's turn to settle and waiting for the answers,
-    /// so the flight ends within `grace` whatever the agent does. `dispatched`
-    /// fires once every close is on the wire or has been given up. Returns one
-    /// typed outcome per agent session for the caller to trace.
-    #[allow(clippy::too_many_arguments)]
-    async fn close_agent_sessions(
-        cx: ConnectionTo<Agent>,
-        entry: Arc<AgentSession>,
-        agent_ids: Vec<AgentSessionId>,
-        dispatch_gate: Arc<StdMutex<()>>,
-        unavailable: Arc<AtomicBool>,
-        grace: Duration,
-        owner_key_fingerprint: i64,
-        dispatched: oneshot::Sender<()>,
-    ) -> Vec<AcpTraceEvent> {
-        let deadline = tokio::time::Instant::now() + grace;
-        // A turn the preceding cancel is still unwinding holds the turn lock
-        // until its prompt result is terminal. Closing underneath it could turn
-        // that clean cancel into an agent error, so close only once the lock
-        // is free, or give up at the deadline.
-        let turn = if unavailable.load(Ordering::SeqCst) {
-            None
-        } else {
-            tokio::time::timeout_at(deadline, entry.turn_lock.lock())
-                .await
-                .ok()
-        };
-        let pending = turn.and_then(|_turn| {
-            // Same short, non-awaiting gate as prompt installation: once
-            // escalation or retirement closes the fence, nothing more is sent.
-            let _dispatch = dispatch_gate
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            (!unavailable.load(Ordering::SeqCst)).then(|| {
-                agent_ids
-                    .iter()
-                    .map(|agent_id| {
-                        cx.send_request(CloseSessionRequest::new(agent_id.clone()))
-                            .block_task()
-                    })
-                    .collect::<Vec<_>>()
-            })
-        });
-        // Nobody may still be listening; the flight finishes regardless.
-        let _ = dispatched.send(());
-        let Some(pending) = pending else {
-            let unsent = AcpTraceEvent::SessionCloseAbandoned {
-                owner_key_fingerprint,
-                sent: false,
-                connection_unavailable: unavailable.load(Ordering::SeqCst),
-            };
-            return vec![unsent; agent_ids.len()];
-        };
-        let mut outcomes = Vec::with_capacity(pending.len());
-        for response in pending {
-            outcomes.push(match tokio::time::timeout_at(deadline, response).await {
-                Ok(Ok(_)) => AcpTraceEvent::SessionCloseAcknowledged {
-                    owner_key_fingerprint,
-                },
-                // Retirement or escalation fails or starves a request already
-                // on the wire. That is this bridge's own teardown, not the
-                // agent's verdict on the close.
-                _ if unavailable.load(Ordering::SeqCst) => AcpTraceEvent::SessionCloseAbandoned {
-                    owner_key_fingerprint,
-                    sent: true,
-                    connection_unavailable: true,
-                },
-                Ok(Err(error)) => AcpTraceEvent::SessionCloseRejected {
-                    owner_key_fingerprint,
-                    rpc_code: Self::error_code_i64(error.code),
-                },
-                Err(_) => AcpTraceEvent::SessionCloseUnanswered {
-                    owner_key_fingerprint,
-                },
-            });
+    /// The means of closing `session`'s agent sessions, or `None` when there
+    /// is nothing to close them with: the agent did not advertise the close
+    /// capability at initialize, or there is no connection.
+    fn session_closer(&self, session: &SessionId) -> Option<SessionCloser> {
+        if !self.capabilities().close {
+            return None;
         }
-        outcomes
+        Some(SessionCloser {
+            cx: self.cx().ok()?.clone(),
+            dispatch_gate: Arc::clone(&self.dispatch_gate),
+            unavailable: Arc::clone(&self.unavailable),
+            grace: self.cancel_grace(),
+            owner_key_fingerprint: AcpTraceEvent::owner_key_fingerprint(session.as_str()),
+            #[cfg(test)]
+            dispatch_delay: None,
+        })
     }
 
     /// Last-resort escalation when a cancelled turn does not complete within the
@@ -17824,28 +18017,118 @@ mod tests {
         .expect("session/cancel must reach the agent");
     }
 
+    /// Wait until the agent has recorded `count` `session/close` frames, for a
+    /// close sent by a task the test cannot join.
+    async fn closes_recorded(rec: &Recorder, count: usize) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while rec.closes.lock().await.len() < count {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("session/close must reach the agent");
+    }
+
+    /// Wait until a release running elsewhere has taken `session` out of the
+    /// session map, which it does before it waits on anything to close.
+    async fn unpublished(backend: &AcpBackend, session: &SessionId) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while backend.sessions.lock().await.contains_key(session) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("release must unpublish the session");
+    }
+
+    type Mint = tokio::task::JoinHandle<Result<AgentSessionId, BridgeError>>;
+
+    /// Start a mint for `session` and park it in its mode configuration:
+    /// `session/new` has answered, so the agent-side session exists, but
+    /// nothing is published. Returns the mint with the id it is holding. The
+    /// agent's dispatch loop stays parked with it until [`open_mode_gate`].
+    async fn mint_parked_in_mode_setup(
+        backend: &Arc<AcpBackend>,
+        rec: &Recorder,
+        session: &SessionId,
+    ) -> (Mint, String) {
+        let configured = rec.set_modes.lock().await.len();
+        rec.gate_set_mode.store(true, Ordering::SeqCst);
+        let mint = {
+            let backend = Arc::clone(backend);
+            let session = session.clone();
+            tokio::spawn(async move { backend.ensure_session(&session).await })
+        };
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while rec.set_modes.lock().await.len() <= configured {
+                rec.set_mode_seen.notified().await;
+            }
+        })
+        .await
+        .expect("the mint must reach its mode configuration");
+        let minted = rec.new_session_calls.load(Ordering::SeqCst);
+        (mint, format!("{}-{minted}", rec.minted_id))
+    }
+
+    fn open_mode_gate(rec: &Recorder) {
+        rec.gate_set_mode.store(false, Ordering::SeqCst);
+        rec.set_mode_gate.notify_one();
+    }
+
+    /// A recording backend whose agent advertises close, mints unique ids,
+    /// and has a mode to configure, so that a mint can be parked mid-setup.
+    async fn connect_closing_with_mode(rec: &Recorder, cancel_grace: Duration) -> Arc<AcpBackend> {
+        rec.unique_minted_ids.store(true, Ordering::SeqCst);
+        Arc::new(
+            connect_recording_with(
+                rec.clone(),
+                AcpConfig {
+                    cancel_grace,
+                    ..test_config_with_mode("mode")
+                },
+            )
+            .await,
+        )
+    }
+
+    fn spawn_release(
+        backend: &Arc<AcpBackend>,
+        session: &SessionId,
+    ) -> tokio::task::JoinHandle<Result<BackendCleanupDispositionV1, BridgeError>> {
+        let backend = Arc::clone(backend);
+        let session = session.clone();
+        tokio::spawn(async move { backend.release_session_checked(&session).await })
+    }
+
     const CLOSE_FINGERPRINT: i64 = 7;
 
-    /// Run one close flight over `session`'s minted ids, the way release does
-    /// once it has unpublished the entry, and return its typed outcomes.
+    /// Unpublish `session` the way release does, then run its close flight
+    /// and return the typed outcomes. `dispatch_delay` is taken before each
+    /// request.
     async fn close_flight(
         backend: &AcpBackend,
         session: &SessionId,
         grace: Duration,
+        dispatch_delay: Option<Duration>,
         dispatched: oneshot::Sender<()>,
     ) -> Vec<AcpTraceEvent> {
-        let entry = backend.session_entry(session).await.unwrap();
-        let agent_ids = entry.agent_id.get().cloned().into_iter().collect();
-        let flight = AcpBackend::close_agent_sessions(
-            backend.cx().unwrap().clone(),
-            entry,
-            agent_ids,
-            Arc::clone(&backend.dispatch_gate),
-            Arc::clone(&backend.unavailable),
+        let entry = backend
+            .sessions
+            .lock()
+            .await
+            .remove(session)
+            .expect("the session has an entry to release");
+        entry.mark_released();
+        let closer = SessionCloser {
             grace,
-            CLOSE_FINGERPRINT,
-            dispatched,
-        );
+            owner_key_fingerprint: CLOSE_FINGERPRINT,
+            dispatch_delay,
+            ..backend
+                .session_closer(session)
+                .expect("the recording agent advertises close")
+        };
+        let deadline = tokio::time::Instant::now() + grace;
+        let flight = closer.close_released(entry, deadline, dispatched);
         tokio::time::timeout(grace + Duration::from_secs(5), flight)
             .await
             .expect("a close flight must end within its grace")
@@ -17858,7 +18141,7 @@ mod tests {
         grace: Duration,
     ) -> Vec<AcpTraceEvent> {
         let (dispatched, _dispatch_settled) = oneshot::channel();
-        close_flight(backend, session, grace, dispatched).await
+        close_flight(backend, session, grace, None, dispatched).await
     }
 
     #[tokio::test]
@@ -18071,42 +18354,218 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn release_leaves_a_mint_still_in_flight_alone() {
-        let rec = Recorder::advertising_close("agent-sess-CLOSE-MINTING");
-        rec.unique_minted_ids.store(true, Ordering::SeqCst);
-        let backend =
-            Arc::new(connect_recording_with(rec.clone(), test_config_with_mode("mode")).await);
-        let control_id = release_control_session(&backend, "bridge-CLOSE-MINTING-CONTROL").await;
+    async fn release_closes_a_session_whose_mint_settles_within_the_grace() {
+        // Whether the agent accepts or rejects the mode, the mint settles
+        // while release is waiting for it, and release closes what it minted.
+        for reject_mode in [false, true] {
+            let rec = Recorder::advertising_close("agent-sess-CLOSE-MINTING");
+            let backend = connect_closing_with_mode(&rec, DEFAULT_CANCEL_GRACE).await;
+            let control_id =
+                release_control_session(&backend, "bridge-CLOSE-MINTING-CONTROL").await;
+            let session = bkey("bridge-CLOSE-MINTING");
+            rec.reject_set_mode.store(reject_mode, Ordering::SeqCst);
+            let (mint, minting_id) = mint_parked_in_mode_setup(&backend, &rec, &session).await;
 
-        // `session/new` has answered and the mint is applying its mode: the
-        // agent-side session exists, but nothing is published yet.
-        rec.gate_set_mode.store(true, Ordering::SeqCst);
-        let session = bkey("bridge-CLOSE-MINTING");
-        let mint = {
+            let mut release = spawn_release(&backend, &session);
+            assert!(
+                tokio::time::timeout(Duration::from_millis(50), &mut release)
+                    .await
+                    .is_err(),
+                "release must wait for a mint that can still settle within the cancel grace"
+            );
+
+            open_mode_gate(&rec);
+            assert_eq!(
+                tokio::time::timeout(Duration::from_secs(2), release)
+                    .await
+                    .expect("release completes once the mint has settled")
+                    .unwrap(),
+                Ok(BackendCleanupDispositionV1::Complete)
+            );
+            mint.await
+                .unwrap()
+                .expect_err("a mint that release overtook must not hand out its session");
+            assert_bridge_state_released(&backend, &session).await;
+            settle_recording_agent(&backend).await;
+            assert_eq!(
+                *rec.closes.lock().await,
+                vec![control_id, minting_id],
+                "reject_mode={reject_mode}: the session minted during release is closed exactly once"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn repeated_release_closes_a_session_minted_during_release_once() {
+        let rec = Recorder::advertising_close("agent-sess-CLOSE-MINTING-ONCE");
+        let backend = connect_closing_with_mode(&rec, DEFAULT_CANCEL_GRACE).await;
+        let control_id =
+            release_control_session(&backend, "bridge-CLOSE-MINTING-ONCE-CONTROL").await;
+        let session = bkey("bridge-CLOSE-MINTING-ONCE");
+        let (mint, minting_id) = mint_parked_in_mode_setup(&backend, &rec, &session).await;
+
+        let first = spawn_release(&backend, &session);
+        unpublished(&backend, &session).await;
+        // The first release owns the mint and is waiting for it. A second one
+        // finds nothing of its own to close, and so nothing to wait for.
+        assert_eq!(
+            tokio::time::timeout(
+                Duration::from_secs(1),
+                backend.release_session_checked(&session)
+            )
+            .await
+            .expect("a repeated release must not wait for the first release's mint"),
+            Ok(BackendCleanupDispositionV1::Complete)
+        );
+        assert!(!first.is_finished());
+
+        open_mode_gate(&rec);
+        first.await.unwrap().unwrap();
+        mint.await.unwrap().unwrap_err();
+        backend.release_session_result(&session).await.unwrap();
+
+        settle_recording_agent(&backend).await;
+        assert_eq!(
+            *rec.closes.lock().await,
+            vec![control_id, minting_id],
+            "the session is closed once, by the release that unpublished its entry"
+        );
+    }
+
+    #[tokio::test]
+    async fn caller_queued_behind_a_released_mint_neither_mints_nor_reuses() {
+        let rec = Recorder::advertising_close("agent-sess-CLOSE-QUEUED");
+        let backend = connect_closing_with_mode(&rec, DEFAULT_CANCEL_GRACE).await;
+        let control_id = release_control_session(&backend, "bridge-CLOSE-QUEUED-CONTROL").await;
+        let session = bkey("bridge-CLOSE-QUEUED");
+        let (mint, minting_id) = mint_parked_in_mode_setup(&backend, &rec, &session).await;
+        // A second caller for the same entry, queued on the mint in flight.
+        let queued = {
             let backend = Arc::clone(&backend);
             let session = session.clone();
             tokio::spawn(async move { backend.ensure_session(&session).await })
         };
-        tokio::time::timeout(Duration::from_secs(2), async {
-            // The control's mode request, then this mint's.
-            while rec.set_modes.lock().await.len() < 2 {
-                rec.set_mode_seen.notified().await;
-            }
-        })
-        .await
-        .expect("the mint must reach its mode configuration");
+        tokio::task::yield_now().await;
+        assert!(!queued.is_finished());
 
-        backend.release_session_result(&session).await.unwrap();
-
-        rec.set_mode_gate.notify_one();
-        mint.await
+        let release = spawn_release(&backend, &session);
+        unpublished(&backend, &session).await;
+        open_mode_gate(&rec);
+        release.await.unwrap().unwrap();
+        mint.await.unwrap().unwrap_err();
+        queued
+            .await
             .unwrap()
-            .expect("release must not close a session underneath its own mint");
+            .expect_err("a caller queued for a released entry must not be handed a session");
+
+        settle_recording_agent(&backend).await;
+        assert_eq!(
+            rec.new_session_calls.load(Ordering::SeqCst),
+            2,
+            "the queued caller must not mint for the released entry"
+        );
+        assert_eq!(*rec.closes.lock().await, vec![control_id, minting_id]);
+        assert_bridge_state_released(&backend, &session).await;
+    }
+
+    #[tokio::test]
+    async fn fresh_mint_for_a_released_key_is_not_closed_by_the_old_release() {
+        let rec = Recorder::advertising_close("agent-sess-CLOSE-REMINT");
+        let backend = connect_closing_with_mode(&rec, DEFAULT_CANCEL_GRACE).await;
+        let control_id = release_control_session(&backend, "bridge-CLOSE-REMINT-CONTROL").await;
+        let session = bkey("bridge-CLOSE-REMINT");
+        let (old_mint, old_id) = mint_parked_in_mode_setup(&backend, &rec, &session).await;
+
+        // The key is free again as soon as release has unpublished the entry,
+        // while that release still waits on the old mint.
+        let release = spawn_release(&backend, &session);
+        unpublished(&backend, &session).await;
+        let fresh_mint = {
+            let backend = Arc::clone(&backend);
+            let session = session.clone();
+            tokio::spawn(async move { backend.ensure_session(&session).await })
+        };
+
+        open_mode_gate(&rec);
+        release.await.unwrap().unwrap();
+        old_mint.await.unwrap().unwrap_err();
+        let fresh_id = fresh_mint
+            .await
+            .unwrap()
+            .expect("a fresh mint for the released key must succeed");
+        assert_ne!(fresh_id.0.as_ref(), old_id);
+
         settle_recording_agent(&backend).await;
         assert_eq!(
             *rec.closes.lock().await,
-            vec![control_id],
-            "only settled agent sessions are closed"
+            vec![control_id.clone(), old_id.clone()],
+            "the old release closes the old mint and nothing else"
+        );
+        assert_eq!(
+            backend.ensure_session(&session).await.unwrap(),
+            fresh_id,
+            "the fresh session is the one the key resolves to"
+        );
+        assert!(backend.session_catalog(&session).is_some());
+
+        // Its own release is what closes the fresh session.
+        backend.release_session_result(&session).await.unwrap();
+        settle_recording_agent(&backend).await;
+        assert_eq!(
+            *rec.closes.lock().await,
+            vec![control_id, old_id, fresh_id.0.to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn release_gives_up_on_a_mint_that_outlives_the_grace() {
+        let grace = Duration::from_millis(200);
+        let rec = Recorder::advertising_close("agent-sess-CLOSE-LATE-MINT");
+        let backend = connect_closing_with_mode(&rec, grace).await;
+        let control_id = release_control_session(&backend, "bridge-CLOSE-LATE-MINT-CONTROL").await;
+        let session = bkey("bridge-CLOSE-LATE-MINT");
+        let (mint, minting_id) = mint_parked_in_mode_setup(&backend, &rec, &session).await;
+
+        // With the clock paused, time advances only once every task is idle:
+        // release waits on the parked mint until the grace is spent.
+        tokio::time::pause();
+        let started = tokio::time::Instant::now();
+        let result = tokio::time::timeout(grace * 10, backend.release_session_checked(&session))
+            .await
+            .expect("a mint that does not settle must not hang release");
+        let waited = started.elapsed();
+        tokio::time::resume();
+
+        assert_eq!(result, Ok(BackendCleanupDispositionV1::Complete));
+        assert!(
+            (grace..grace * 2).contains(&waited),
+            "release waited {waited:?} for the mint; it must wait out the \
+             {grace:?} cancel grace and no longer"
+        );
+        assert_bridge_state_released(&backend, &session).await;
+
+        // The mint settles after its release has gone. It must not become a
+        // session anyone can use, and what it minted must not be left open.
+        open_mode_gate(&rec);
+        mint.await
+            .unwrap()
+            .expect_err("a mint that outlived its release must not hand out its session");
+        closes_recorded(&rec, 2).await;
+        settle_recording_agent(&backend).await;
+        assert_eq!(
+            *rec.closes.lock().await,
+            vec![control_id, minting_id.clone()],
+            "the late mint closes what it minted, exactly once"
+        );
+        assert_bridge_state_released(&backend, &session).await;
+
+        let fresh_id = backend.ensure_session(&session).await.unwrap();
+        assert_ne!(fresh_id.0.as_ref(), minting_id);
+        settle_recording_agent(&backend).await;
+        assert_eq!(
+            rec.closes.lock().await.len(),
+            2,
+            "re-minting the released key must not close anything"
         );
     }
 
@@ -18363,7 +18822,7 @@ mod tests {
         backend.ensure_session(&fenced).await.unwrap();
         let (dispatched, dispatch_settled) = oneshot::channel();
         let (outcomes, ()) = tokio::join!(
-            close_flight(&backend, &retired, expires, dispatched),
+            close_flight(&backend, &retired, expires, None, dispatched),
             async {
                 dispatch_settled.await.expect("the flight dispatches");
                 backend.retire().await.unwrap();
@@ -18394,6 +18853,96 @@ mod tests {
             *rec.closes.lock().await,
             [acknowledged_id, rejected_id, unanswered_id, retired_id].map(|id| id.0.to_string()),
             "an unsent close never reaches the agent"
+        );
+    }
+
+    #[tokio::test]
+    async fn close_flight_gives_up_on_a_mint_that_outlives_the_deadline() {
+        let expires = Duration::from_millis(50);
+        let rec = Recorder::advertising_close("agent-sess-CLOSE-UNSETTLED-MINT");
+        let backend = connect_recording(rec.clone()).await;
+        let session = bkey("bridge-CLOSE-UNSETTLED-MINT");
+        let entry = backend.session_entry(&session).await.unwrap();
+        // A mint in flight: it owns the single-flight lock and has an id from
+        // `session/new` that it has neither published nor abandoned.
+        let minting = Arc::clone(&entry.init_lock).lock_owned().await;
+        let minted = AbandonedMintGuard::arm(
+            Arc::clone(&entry),
+            AgentSessionId::new("agent-sess-CLOSE-UNSETTLED-MINT"),
+        );
+
+        tokio::time::pause();
+        let outcomes = close_flight_outcomes(&backend, &session, expires).await;
+        tokio::time::resume();
+        assert_eq!(
+            outcomes,
+            [AcpTraceEvent::SessionCloseAbandoned {
+                owner_key_fingerprint: CLOSE_FINGERPRINT,
+                sent: false,
+                connection_unavailable: false,
+            }],
+            "the flight records that it gave up on the mint"
+        );
+
+        // The flight is gone. The mint can no longer publish, and it closes
+        // what it minted itself when it settles.
+        entry
+            .publish_minted(
+                AgentSessionId::new("agent-sess-CLOSE-UNSETTLED-MINT"),
+                "/tmp".to_string(),
+            )
+            .expect_err("a released entry never gains an agent session");
+        assert!(entry.agent_id.get().is_none());
+        assert!(entry.minted_cwd.get().is_none());
+        drop(minted);
+        drop(minting);
+        closes_recorded(&rec, 1).await;
+        settle_recording_agent(&backend).await;
+        assert_eq!(
+            *rec.closes.lock().await,
+            vec!["agent-sess-CLOSE-UNSETTLED-MINT"]
+        );
+    }
+
+    #[tokio::test]
+    async fn close_flight_stops_dispatching_at_its_deadline() {
+        let grace = Duration::from_millis(100);
+        let dispatch_delay = Duration::from_millis(40);
+        let rec = Recorder::advertising_close("agent-sess-CLOSE-DEADLINE");
+        let backend = connect_recording(rec.clone()).await;
+        let session = bkey("bridge-CLOSE-DEADLINE");
+        let entry = backend.session_entry(&session).await.unwrap();
+        // Four failed mints, one of them reported twice.
+        for abandoned in ["first", "first", "second", "third", "fourth"] {
+            entry.abandon_minted(AgentSessionId::new(abandoned));
+        }
+
+        // Each request is 40 ms after the last: two fit inside the grace.
+        tokio::time::pause();
+        let (dispatched, _dispatch_settled) = oneshot::channel();
+        let outcomes =
+            close_flight(&backend, &session, grace, Some(dispatch_delay), dispatched).await;
+        tokio::time::resume();
+
+        let owner_key_fingerprint = CLOSE_FINGERPRINT;
+        let acknowledged = AcpTraceEvent::SessionCloseAcknowledged {
+            owner_key_fingerprint,
+        };
+        let unsent = AcpTraceEvent::SessionCloseAbandoned {
+            owner_key_fingerprint,
+            sent: false,
+            connection_unavailable: false,
+        };
+        assert_eq!(
+            outcomes,
+            [acknowledged, acknowledged, unsent, unsent],
+            "one outcome per distinct agent session, abandoned once the deadline has passed"
+        );
+        settle_recording_agent(&backend).await;
+        assert_eq!(
+            *rec.closes.lock().await,
+            vec!["first", "second"],
+            "nothing is sent at or after the deadline, and no id is sent twice"
         );
     }
 
