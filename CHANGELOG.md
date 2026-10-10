@@ -11,14 +11,27 @@ release (see [`docs/adr/`](docs/adr/) for the full architectural record).
 
 - `serve` and `mcp` now retire an agent's shared adapter process once no registry lease has used it
   for `[server] adapter_idle_ttl_secs` (default `300`; `0` disables). Warm-session expiry
-  (`warm_idle_ttl_secs`) only cancels and releases the bridge-side handle, so the single adapter
+  (`warm_idle_ttl_secs`) only cancelled and released the bridge-side handle, so the single adapter
   process — and every agent-side thread/session child it created, such as codex's per-thread MCP
-  servers — previously lived until `serve` restarted, because the bridge never closes the agent-side
+  servers — previously lived until `serve` restarted, because the bridge never closed the agent-side
   session (codex releases a thread's MCP servers about 60 s after ACP `session/close`). The
   idle slot is swapped for a cold one and its backend retired through the existing lease-drain
   path, so the next request respawns the adapter. A lease taken inside the window restarts the
   clock, and no resolve is ever handed a lease on a slot being retired. Non-serve commands
   (`run-workflow`, `implement`, `smoke`, compatibility) keep retiring their runner at end of run.
+- Releasing a backend session (warm-session idle expiry, `session release`, `session clear`,
+  compact, reset, release-all) now also sends ACP `session/close` for every agent-side session the
+  bridge minted for it, when the agent advertised `sessionCapabilities.close` at initialize and the
+  adapter connection is still usable. Release used to stop at `session/cancel` plus dropping
+  bridge-side state, so agent-side sessions — and codex's per-thread MCP server processes — lived
+  until the shared adapter exited, which idle adapter retirement cannot bring about while
+  overlapping sessions keep the adapter leased. The close goes out after the cancel, and only once a
+  turn that cancel is still unwinding has settled. It is best-effort: release waits at most the
+  existing cancel grace for that turn and never for the agent's answer, which is collected in the
+  background within the same grace; a rejected, unanswered, or abandoned close is recorded only as a
+  typed trace event, and release's result is unchanged. Measured against codex-acp 1.13.1 and 2.1.1,
+  a session's MCP server exits about 60 s after its own `session/close` while other sessions on the
+  same adapter stay open.
 
 ## [0.3.1] - 2026-07-30
 
