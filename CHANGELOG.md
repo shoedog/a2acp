@@ -13,7 +13,8 @@ release (see [`docs/adr/`](docs/adr/) for the full architectural record).
   for `[server] adapter_idle_ttl_secs` (default `300`; `0` disables). Warm-session expiry
   (`warm_idle_ttl_secs`) only cancels and releases the bridge-side handle, so the single adapter
   process — and every agent-side thread/session child it created, such as codex's per-thread MCP
-  servers — previously lived until `serve` restarted; ACP `session/close` does not free them. The
+  servers — previously lived until `serve` restarted, because the bridge never closes the agent-side
+  session (codex releases a thread's MCP servers about 60 s after ACP `session/close`). The
   idle slot is swapped for a cold one and its backend retired through the existing lease-drain
   path, so the next request respawns the adapter. A lease taken inside the window restarts the
   clock, and no resolve is ever handed a lease on a slot being retired. Non-serve commands
