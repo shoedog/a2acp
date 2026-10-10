@@ -1990,12 +1990,15 @@ struct AgentSession {
 /// Which agent sessions one bridge session minted beyond its published
 /// `agent_id`, and who closes them. A single lock orders a mint publishing or
 /// abandoning its id against release collecting the entry's ids, so each
-/// minted id has exactly one closer.
+/// minted id has exactly one closer. The same lock orders a turn starting
+/// against release beginning (see [`AgentSession::admit_turn`]).
 #[derive(Default)]
 struct MintLedger {
-    /// Set, together with the map removal, by the release that unpublishes
-    /// the entry. A released entry never gains an `agent_id` and starts no
-    /// further mint: whatever `session/new` returns for it is only closed.
+    /// Set by the release that unpublishes the entry, under the same hold of
+    /// the session map as the removal and before that release's cancel goes
+    /// out. A released entry never gains an `agent_id`, starts no further
+    /// mint, and admits no further turn: whatever `session/new` returns for
+    /// it is only closed.
     released: bool,
     /// Ids a `session/new` returned that never became `agent_id` and that
     /// nobody has collected yet: a mint whose mode/model/effort setup fails
@@ -2029,7 +2032,7 @@ impl AgentSession {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// Record that release has removed this entry from the session map.
+    /// Record that release is taking this entry out of the session map.
     fn mark_released(&self) {
         self.minted().released = true;
     }
@@ -2038,6 +2041,16 @@ impl AgentSession {
     /// must neither mint for it nor reuse what was minted for it.
     fn is_released(&self) -> bool {
         self.minted().released
+    }
+
+    /// Run `start`, which puts a turn on the wire for this entry's agent
+    /// session, unless release has unpublished the entry. The ledger lock is
+    /// held throughout, so `start` and [`Self::mark_released`] cannot
+    /// interleave: a turn is either on the wire before the release that
+    /// cancels it begins, or it never starts.
+    fn admit_turn<T>(&self, start: impl FnOnce() -> T) -> Option<T> {
+        let minted = self.minted();
+        (!minted.released).then(start)
     }
 
     /// Publish the id a mint settled on, with the cwd it was minted for.
@@ -2215,6 +2228,32 @@ impl SessionCloser {
         // Nobody may still be listening; the flight finishes regardless.
         let _ = dispatched.send(());
         self.settle(pending, deadline).await
+    }
+
+    /// Run [`Self::close_released`] as a task of its own, which traces every
+    /// outcome, and wait for it to have dispatched, though never past
+    /// `deadline`. A release caller that stops waiting therefore cannot
+    /// strand a close between the turn settling and the send, and one that
+    /// waits is held neither by the agent's answers nor by a backlog of
+    /// abandoned ids the flight is still working through. Returns the flight,
+    /// which runs on whether or not it is joined.
+    async fn fly_released(
+        self,
+        entry: Arc<AgentSession>,
+        deadline: tokio::time::Instant,
+    ) -> tokio::task::JoinHandle<Vec<AcpTraceEvent>> {
+        let (dispatched, dispatch_settled) = oneshot::channel();
+        let closing = self.close_released(entry, deadline, dispatched);
+        let flight = tokio::spawn(async move {
+            let outcomes = closing.await;
+            for outcome in &outcomes {
+                outcome.emit();
+            }
+            outcomes
+        });
+        // An error from the signal only means the flight is gone.
+        let _ = tokio::time::timeout_at(deadline, dispatch_settled).await;
+        flight
     }
 
     /// Close one id that a mint abandoned after its release's flight had
@@ -5061,6 +5100,15 @@ impl AcpBackend {
     /// would PANIC if two tasks on different runtime threads raced here.)
     async fn session_entry(&self, key: &SessionId) -> Result<Arc<AgentSession>, BridgeError> {
         let mut map = self.sessions.lock().await;
+        self.session_entry_in(&mut map, key)
+    }
+
+    /// [`Self::session_entry`] for a caller that already holds the session map.
+    fn session_entry_in(
+        &self,
+        map: &mut HashMap<SessionId, Arc<AgentSession>>,
+        key: &SessionId,
+    ) -> Result<Arc<AgentSession>, BridgeError> {
         if let Some(s) = map.get(key) {
             return Ok(Arc::clone(s));
         }
@@ -5570,16 +5618,9 @@ impl AcpBackend {
         Ok(id)
     }
 
-    /// Record a cancel for bridge key `key`, honoring the create/cancel race.
-    ///
-    /// * If the agent session already exists, send `session/cancel` for it now.
-    /// * If `session/new` is still in flight (or hasn't started), set the latch
-    ///   so `ensure_session` flushes the cancel the instant the id is minted.
-    /// * If `key` was never seen (session ended / never started), it's a no-op
-    ///   on the wire but still latches a freshly-created entry defensively.
-    ///
-    /// Task 4 builds full `cancel()` completion semantics (waiting for the
-    /// prompt result with `stopReason:"cancelled"`) on top of this.
+    /// [`Self::request_cancel_for`] by bridge key, creating the entry if `key`
+    /// was never seen.
+    #[cfg(test)]
     async fn request_cancel(&self, key: &SessionId) -> Result<CancelDispatch, TeardownFailure> {
         let entry = self
             .session_entry(key)
@@ -5588,6 +5629,21 @@ impl AcpBackend {
                 error,
                 prompt_may_have_been_accepted: false,
             })?;
+        self.request_cancel_for(&entry)
+    }
+
+    /// Record a cancel for the bridge session `entry` belongs to, honoring the
+    /// create/cancel race.
+    ///
+    /// * If the agent session already exists, send `session/cancel` for it now.
+    /// * If `session/new` is still in flight (or hasn't started), set the latch
+    ///   so `ensure_session` flushes the cancel the instant the id is minted.
+    /// * If the key was never seen (session ended / never started), it's a no-op
+    ///   on the wire but still latches a freshly-created entry defensively.
+    ///
+    /// Task 4 builds full `cancel()` completion semantics (waiting for the
+    /// prompt result with `stopReason:"cancelled"`) on top of this.
+    fn request_cancel_for(&self, entry: &AgentSession) -> Result<CancelDispatch, TeardownFailure> {
         let cx = self.cx().map_err(|error| TeardownFailure {
             error,
             prompt_may_have_been_accepted: false,
@@ -5602,7 +5658,7 @@ impl AcpBackend {
                 Self::send_cancel_under_dispatch_fence(
                     &self.dispatch_gate,
                     &self.unavailable,
-                    || Self::turn_prompt_accepted_handle(&entry),
+                    || Self::turn_prompt_accepted_handle(entry),
                     || {
                         #[cfg(test)]
                         if self.fail_cancel_send.load(Ordering::SeqCst) {
@@ -5618,8 +5674,6 @@ impl AcpBackend {
     }
 
     async fn cancel_inner(&self, session: &SessionId) -> Result<CancelDispatch, TeardownFailure> {
-        let dispatch = self.request_cancel(session).await?;
-
         let entry = self
             .session_entry(session)
             .await
@@ -5627,6 +5681,14 @@ impl AcpBackend {
                 error,
                 prompt_may_have_been_accepted: false,
             })?;
+        self.cancel_entry(&entry)
+    }
+
+    /// [`Self::cancel_inner`] against an entry the caller already holds. It
+    /// awaits nothing, so release can run it under its hold of the session map.
+    fn cancel_entry(&self, entry: &AgentSession) -> Result<CancelDispatch, TeardownFailure> {
+        let dispatch = self.request_cancel_for(entry)?;
+
         let (turn_active, turn_meta) = if let Some(agent_id) = entry.agent_id.get() {
             self.updates()
                 .ok()
@@ -5912,9 +5974,26 @@ impl AcpBackend {
         // Cleanup is unconditional: even a transport error while sending cancel
         // must not retain stale per-session routing/config state. The error is
         // still returned to the observed owner instead of being discarded.
-        let cancel_result = self.cancel_inner(session).await;
-        let released = {
+        let (cancel_result, released) = {
+            // One hold of the session map covers marking the entry, cancelling
+            // it and removing it, so all three act on the same entry and it is
+            // never published while marked. The mark comes before the cancel:
+            // a turn admitted ahead of it is already on the wire for the
+            // cancel to find, and none is admitted after it (see
+            // `AgentSession::admit_turn`). Nor can a mint still running for
+            // this entry be published from here on, only closed, while the
+            // key is free for a fresh entry once the map is let go.
             let mut sessions = self.sessions.lock().await;
+            let cancel_result = self
+                .session_entry_in(&mut sessions, session)
+                .map_err(|error| TeardownFailure {
+                    error,
+                    prompt_may_have_been_accepted: false,
+                })
+                .and_then(|entry| {
+                    entry.mark_released();
+                    self.cancel_entry(&entry)
+                });
             if sessions.contains_key(session) {
                 // The agent learns the session is over only from the
                 // best-effort `session/close` below, which is sent after
@@ -5930,14 +6009,7 @@ impl AcpBackend {
                     stderr_ring.retain_metadata_only();
                 }
             }
-            let released = sessions.remove(session);
-            if let Some(entry) = released.as_ref() {
-                // Out of the map and marked in one step: from here on a mint
-                // still running for this entry can only be closed, never
-                // published, while the key is free for a fresh entry.
-                entry.mark_released();
-            }
-            released
+            (cancel_result, sessions.remove(session))
         };
         let owner_detach_result = if released.is_some() {
             // Ordinary release changes owner membership only. Destructive
@@ -5981,9 +6053,10 @@ impl AcpBackend {
     ///
     /// Nothing is sent unless the agent advertised the close capability at
     /// initialize and an id was actually minted. Returns once every close is
-    /// on the wire or has been given up, which takes at most one
-    /// [`AcpConfig::cancel_grace`]; the answers are awaited by the flight
-    /// alone (see [`SessionCloser::close_released`]).
+    /// on the wire or has been given up, or when one
+    /// [`AcpConfig::cancel_grace`] has passed, whichever comes first; the
+    /// answers are awaited by the flight alone (see
+    /// [`SessionCloser::fly_released`]).
     async fn close_released_agent_sessions(&self, session: &SessionId, entry: Arc<AgentSession>) {
         // One absolute deadline for the whole flight, started before any id
         // is collected or sent.
@@ -5991,19 +6064,8 @@ impl AcpBackend {
         let Some(closer) = self.session_closer(session) else {
             return;
         };
-        let (dispatched, dispatch_settled) = oneshot::channel();
-        let closing = closer.close_released(entry, deadline, dispatched);
-        // The flight runs, and traces its outcomes, as its own task: a release
-        // caller that stops waiting cannot strand a close between the turn
-        // settling and the send.
-        tokio::spawn(async move {
-            for outcome in closing.await {
-                outcome.emit();
-            }
-        });
-        // How long the agent takes to answer is the flight's concern, never
-        // the release caller's. An error only means the flight is gone.
-        let _ = dispatch_settled.await;
+        // Nothing joins the flight: it finishes, and traces, on its own.
+        closer.fly_released(entry, deadline).await;
     }
 
     /// The means of closing `session`'s agent sessions, or `None` when there
@@ -6816,43 +6878,69 @@ impl AcpBackend {
             Arc::clone(&entry.turn_accepted),
             Arc::clone(&prompt_accepted),
         );
-        {
-            let mut map = registry.lock().expect("update routing registry lock");
-            map.insert(
-                agent_id.clone(),
-                TurnRoute {
-                    tx,
-                    watch: watch.clone(),
-                    turn_meta,
-                    cancelled: Arc::new(AtomicBool::new(false)),
-                    active: Arc::clone(&turn_active),
-                    prefix_attestation: prefix_state.clone(),
-                    activity: Arc::clone(&progress),
-                    terminal_evidence: terminal_state.clone(),
-                },
-            );
-        }
+        let route = TurnRoute {
+            tx,
+            watch: watch.clone(),
+            turn_meta,
+            cancelled: Arc::new(AtomicBool::new(false)),
+            active: Arc::clone(&turn_active),
+            prefix_attestation: prefix_state.clone(),
+            activity: Arc::clone(&progress),
+            terminal_evidence: terminal_state.clone(),
+        };
         let req = EvidenceAwarePromptRequest::new(
             Self::prompt_request(agent_id.clone(), &parts),
             evidence_binding,
         );
-
-        // Install a FRESH per-turn kill switch on the session: the external cancel
-        // grace-watcher fires it to unblock a hung driver (see `cancel`). The
-        // driver `select!`s on it and clears the slot on exit.
         let kill = Arc::new(tokio::sync::Notify::new());
-        *entry.turn_kill.lock().expect("turn_kill lock") = Some(Arc::clone(&kill));
 
-        // This is the accepted-work barrier. The connection-wide gate makes
-        // the final availability sample and SDK request installation one
-        // atomic ordering point with escalation and retirement. All observer
-        // awaits are complete before this short synchronous critical section.
-        let prompt_fut = Self::install_prompt_request(
-            &self.dispatch_gate,
-            &self.unavailable,
-            &prompt_accepted,
-            || cx.send_request(req).block_task(),
-        );
+        // Admission. This entry and its agent session were selected before the
+        // turn lock was taken, and release can have begun for them at any
+        // await since. So the route, the kill switch and the request go in
+        // together under the entry's ledger lock, which release takes to mark
+        // the entry before it cancels: either this turn is on the wire for
+        // that cancel to find, or none of it happens and no turn starts on a
+        // session that is being closed.
+        let admitted = entry.admit_turn(|| {
+            registry
+                .lock()
+                .expect("update routing registry lock")
+                .insert(agent_id.clone(), route);
+
+            // Install a FRESH per-turn kill switch on the session: the external cancel
+            // grace-watcher fires it to unblock a hung driver (see `cancel`). The
+            // driver `select!`s on it and clears the slot on exit.
+            *entry.turn_kill.lock().expect("turn_kill lock") = Some(Arc::clone(&kill));
+
+            // This is the accepted-work barrier. The connection-wide gate makes
+            // the final availability sample and SDK request installation one
+            // atomic ordering point with escalation and retirement. All observer
+            // awaits are complete before this short synchronous critical section.
+            Self::install_prompt_request(
+                &self.dispatch_gate,
+                &self.unavailable,
+                &prompt_accepted,
+                || cx.send_request(req).block_task(),
+            )
+        });
+        let Some(prompt_fut) = admitted else {
+            // Release won. Nothing was installed, and the key now mints afresh.
+            return Err(lifecycle
+                .failure(
+                    DiagnosticPhase::PromptStart,
+                    Some(DiagnosticPhase::ConfigApply),
+                    DiagnosticFailureClass::Canceled,
+                    FailureDisposition::Fatal,
+                    "acp.prompt_start.session_released",
+                    "ACP session was released before prompt dispatch",
+                    None,
+                    false,
+                    None,
+                    None,
+                    None,
+                )
+                .await);
+        };
         let Some(prompt_fut) = prompt_fut else {
             turn_active.store(false, Ordering::SeqCst);
             if let Ok(mut map) = registry.lock() {
@@ -18102,16 +18190,14 @@ mod tests {
 
     const CLOSE_FINGERPRINT: i64 = 7;
 
-    /// Unpublish `session` the way release does, then run its close flight
-    /// and return the typed outcomes. `dispatch_delay` is taken before each
-    /// request.
-    async fn close_flight(
+    /// Unpublish `session` the way release does, and return its entry with
+    /// the means of closing it. `dispatch_delay` is taken before each request.
+    async fn unpublish_for_close(
         backend: &AcpBackend,
         session: &SessionId,
         grace: Duration,
         dispatch_delay: Option<Duration>,
-        dispatched: oneshot::Sender<()>,
-    ) -> Vec<AcpTraceEvent> {
+    ) -> (Arc<AgentSession>, SessionCloser) {
         let entry = backend
             .sessions
             .lock()
@@ -18127,6 +18213,18 @@ mod tests {
                 .session_closer(session)
                 .expect("the recording agent advertises close")
         };
+        (entry, closer)
+    }
+
+    /// [`unpublish_for_close`], then run the close flight and return its
+    /// typed outcomes.
+    async fn close_flight(
+        backend: &AcpBackend,
+        session: &SessionId,
+        grace: Duration,
+        dispatched: oneshot::Sender<()>,
+    ) -> Vec<AcpTraceEvent> {
+        let (entry, closer) = unpublish_for_close(backend, session, grace, None).await;
         let deadline = tokio::time::Instant::now() + grace;
         let flight = closer.close_released(entry, deadline, dispatched);
         tokio::time::timeout(grace + Duration::from_secs(5), flight)
@@ -18141,7 +18239,67 @@ mod tests {
         grace: Duration,
     ) -> Vec<AcpTraceEvent> {
         let (dispatched, _dispatch_settled) = oneshot::channel();
-        close_flight(backend, session, grace, None, dispatched).await
+        close_flight(backend, session, grace, dispatched).await
+    }
+
+    type Prompt = tokio::task::JoinHandle<Result<BackendStream, BridgeError>>;
+
+    /// Start a prompt for `session` and park it in its `block_at`-th
+    /// lifecycle record. On a session that is already minted, the fourth
+    /// record is the last of the reuse path, made once the prompt has
+    /// selected its agent session and before it queues for the turn lock; the
+    /// fifth is `PromptStart`, made under the turn lock and before anything
+    /// is installed for the turn. Returns the prompt with what resumes it.
+    async fn prompt_parked_at_record(
+        backend: &Arc<AcpBackend>,
+        session: &SessionId,
+        block_at: u64,
+    ) -> (Prompt, Arc<Notify>) {
+        let entered = Arc::new(Notify::new());
+        let resume = Arc::new(Notify::new());
+        let observer = Arc::new(BlockOnRecord {
+            count: AtomicU64::new(0),
+            block_at,
+            entered: Arc::clone(&entered),
+            release: Arc::clone(&resume),
+        });
+        let prompt = {
+            let backend = Arc::clone(backend);
+            let session = session.clone();
+            tokio::spawn(async move {
+                backend
+                    .prompt_with_observers(
+                        &session,
+                        vec![],
+                        BackendObservers::diagnostic_only(observer),
+                    )
+                    .await
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(2), entered.notified())
+            .await
+            .expect("the prompt must reach the record it parks in");
+        (prompt, resume)
+    }
+
+    /// The failure of a prompt that lost its agent session to a release.
+    async fn assert_refused_as_released(prompt: Prompt) {
+        let error = tokio::time::timeout(Duration::from_secs(2), prompt)
+            .await
+            .expect("a prompt that lost to release must settle")
+            .unwrap()
+            .err()
+            .expect("a prompt must not start on a session that is being released");
+        let diagnostic = assert_agent_failure(
+            &error,
+            DiagnosticPhase::PromptStart,
+            DiagnosticFailureClass::Canceled,
+            false,
+        );
+        assert_eq!(
+            diagnostic.code().as_str(),
+            "acp.prompt_start.session_released"
+        );
     }
 
     #[tokio::test]
@@ -18755,6 +18913,99 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn prompt_that_selected_a_session_does_not_start_after_its_release() {
+        let rec = Recorder::advertising_close("agent-sess-CLOSE-SELECTED");
+        rec.unique_minted_ids.store(true, Ordering::SeqCst);
+        let backend = Arc::new(connect_recording(rec.clone()).await);
+        let session = bkey("bridge-CLOSE-SELECTED");
+        let agent_id = backend.ensure_session(&session).await.unwrap();
+        let agent_id = agent_id.0.to_string();
+        // The prompt has picked the minted session to reuse and is not yet in
+        // line for the turn lock.
+        let (prompt, resume) = prompt_parked_at_record(&backend, &session, 4).await;
+
+        // Release runs to its end: cancel, removal, and the close.
+        assert_eq!(
+            backend.release_session_checked(&session).await,
+            Ok(BackendCleanupDispositionV1::Complete)
+        );
+        settle_recording_agent(&backend).await;
+        assert_eq!(
+            *rec.teardown_log.lock().await,
+            vec![format!("cancel:{agent_id}"), format!("close:{agent_id}")]
+        );
+
+        resume.notify_one();
+        assert_refused_as_released(prompt).await;
+        settle_recording_agent(&backend).await;
+        assert!(
+            rec.prompt_log.lock().await.is_empty(),
+            "no session/prompt may reach a session after its release began"
+        );
+        assert_eq!(
+            *rec.closes.lock().await,
+            vec![agent_id.clone()],
+            "the released session is closed exactly once"
+        );
+
+        // The next call for the key mints a fresh session and runs its turn there.
+        let mut stream = backend.prompt(&session, vec![]).await.unwrap();
+        while stream.next().await.is_some() {}
+        assert_eq!(rec.new_session_calls.load(Ordering::SeqCst), 2);
+        assert_ne!(
+            backend.ensure_session(&session).await.unwrap().0.as_ref(),
+            agent_id
+        );
+        assert_eq!(rec.prompt_log.lock().await.as_slice(), &["start", "end"]);
+        settle_recording_agent(&backend).await;
+        assert_eq!(*rec.closes.lock().await, vec![agent_id]);
+    }
+
+    #[tokio::test]
+    async fn prompt_holding_the_turn_lock_does_not_start_once_release_begins() {
+        let rec = Recorder::advertising_close("agent-sess-CLOSE-ADMITTING");
+        rec.unique_minted_ids.store(true, Ordering::SeqCst);
+        let backend = Arc::new(connect_recording(rec.clone()).await);
+        let session = bkey("bridge-CLOSE-ADMITTING");
+        let agent_id = backend.ensure_session(&session).await.unwrap();
+        let agent_id = agent_id.0.to_string();
+        // The prompt owns the turn lock and has installed nothing for its turn.
+        let (prompt, resume) = prompt_parked_at_record(&backend, &session, 5).await;
+
+        // Release's cancel finds no turn on the wire, and its close waits for
+        // the turn lock the prompt is holding.
+        let release = spawn_release(&backend, &session);
+        unpublished(&backend, &session).await;
+        cancels_recorded(&rec, 1).await;
+        settle_recording_agent(&backend).await;
+        assert!(rec.closes.lock().await.is_empty());
+        assert!(!release.is_finished());
+
+        resume.notify_one();
+        assert_refused_as_released(prompt).await;
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), release)
+                .await
+                .expect("release closes once the refused prompt lets go of the turn lock")
+                .unwrap(),
+            Ok(BackendCleanupDispositionV1::Complete)
+        );
+        settle_recording_agent(&backend).await;
+        assert!(
+            rec.prompt_log.lock().await.is_empty(),
+            "no session/prompt may reach a session after its release began"
+        );
+        assert_eq!(
+            *rec.teardown_log.lock().await,
+            vec![format!("cancel:{agent_id}"), format!("close:{agent_id}")]
+        );
+
+        let fresh_id = backend.ensure_session(&session).await.unwrap();
+        assert_ne!(fresh_id.0.as_ref(), agent_id);
+        assert_eq!(rec.new_session_calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
     async fn close_flight_reports_a_typed_outcome_per_agent_session() {
         // Long enough that an answer always arrives first; short where the
         // case under test is the deadline itself.
@@ -18822,7 +19073,7 @@ mod tests {
         backend.ensure_session(&fenced).await.unwrap();
         let (dispatched, dispatch_settled) = oneshot::channel();
         let (outcomes, ()) = tokio::join!(
-            close_flight(&backend, &retired, expires, None, dispatched),
+            close_flight(&backend, &retired, expires, dispatched),
             async {
                 dispatch_settled.await.expect("the flight dispatches");
                 backend.retire().await.unwrap();
@@ -18917,11 +19168,27 @@ mod tests {
             entry.abandon_minted(AgentSessionId::new(abandoned));
         }
 
-        // Each request is 40 ms after the last: two fit inside the grace.
+        // Each request is 40 ms after the last: two fit inside the grace, and
+        // getting through all four takes 160 ms.
         tokio::time::pause();
-        let (dispatched, _dispatch_settled) = oneshot::channel();
-        let outcomes =
-            close_flight(&backend, &session, grace, Some(dispatch_delay), dispatched).await;
+        let (entry, closer) =
+            unpublish_for_close(&backend, &session, grace, Some(dispatch_delay)).await;
+        let started = tokio::time::Instant::now();
+        let flight = closer.fly_released(entry, started + grace).await;
+        let waited = started.elapsed();
+        assert!(
+            (grace..grace + dispatch_delay / 2).contains(&waited),
+            "release waited {waited:?} on dispatch; the {grace:?} cancel grace \
+             bounds its wait however long the backlog is"
+        );
+        assert!(
+            !flight.is_finished(),
+            "the flight works through the rest of the backlog on its own"
+        );
+        let outcomes = tokio::time::timeout(Duration::from_secs(5), flight)
+            .await
+            .expect("a close flight must end once it is through its backlog")
+            .unwrap();
         tokio::time::resume();
 
         let owner_key_fingerprint = CLOSE_FINGERPRINT;
