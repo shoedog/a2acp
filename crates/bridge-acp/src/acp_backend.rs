@@ -876,17 +876,20 @@ enum AcpTraceEvent {
         owner_key_fingerprint: i64,
         rpc_code: i64,
     },
-    /// No answer to `session/close` arrived within the cancel grace.
+    /// No answer to `session/close` arrived within one cancel grace of that
+    /// close being sent.
     SessionCloseUnanswered {
         owner_key_fingerprint: i64,
     },
-    /// The bridge gave up on `session/close`. Unsent: the connection was
-    /// already fenced, or the cancel grace ran out while a mint was still in
-    /// flight, while the session's cancelled turn was still unwinding, or
-    /// before this request came up to be sent. Sent: the connection was
-    /// fenced before any answer. A release that gives up on a mint still in
-    /// flight emits this once for that mint; the mint closes what it minted
-    /// when it settles, and that close is traced as an outcome of its own.
+    /// The bridge's own teardown ended a `session/close`. With
+    /// `connection_unavailable`, the connection was fenced: before the close
+    /// could be sent (the adapter is being torn down and takes the session
+    /// with it), or, when `sent`, before any answer. Time alone never leaves
+    /// a known agent session unsent. Unsent on a usable connection is
+    /// therefore not a close at all: a release whose wait for a mint still in
+    /// flight ran out emits it once for that mint, whose id is not yet
+    /// known; the mint closes what it minted when it settles, and that close
+    /// is traced as an outcome of its own.
     SessionCloseAbandoned {
         owner_key_fingerprint: i64,
         sent: bool,
@@ -2092,15 +2095,19 @@ impl AgentSession {
     }
 
     /// Give release's close flight what is left for it to close: the ids
-    /// abandoned since [`Self::take_abandoned`], then the published one.
+    /// abandoned since [`Self::take_abandoned`], and the published one. They
+    /// come apart because only the published id can have carried a turn.
     /// `closer` stays behind for whatever a mint abandons after this.
-    fn hand_over_minted(&self, closer: &SessionCloser) -> Vec<AgentSessionId> {
+    fn hand_over_minted(
+        &self,
+        closer: &SessionCloser,
+    ) -> (Vec<AgentSessionId>, Option<AgentSessionId>) {
         let mut minted = self.minted();
         minted.late_closer = Some(closer.clone());
-        std::mem::take(&mut minted.abandoned)
-            .into_iter()
-            .chain(self.agent_id.get().cloned())
-            .collect()
+        (
+            std::mem::take(&mut minted.abandoned),
+            self.agent_id.get().cloned(),
+        )
     }
 }
 
@@ -2143,27 +2150,39 @@ impl Drop for AbandonedMintGuard {
     }
 }
 
-/// One `session/close` on the wire, or the typed reason it never got there.
-type PendingClose = Result<SentRequest<CloseSessionResponse>, AcpTraceEvent>;
+/// One `session/close` on the wire with the instant its answer is awaited
+/// until, or the typed reason it never got there.
+type PendingClose =
+    Result<(SentRequest<CloseSessionResponse>, tokio::time::Instant), AcpTraceEvent>;
 
 /// What sending `session/close` needs from the backend, cloned out of it so
 /// that a close can outlive the release call that asked for it.
+///
+/// Close ownership: from the moment release takes an entry out of the session
+/// map, every agent session id that `session/new` returned for it is owed one
+/// `session/close`. Two things end that: the close going on the wire, or the
+/// connection being fenced, when the adapter is being torn down and takes the
+/// session with it. Elapsed time never does.
 #[derive(Clone)]
 struct SessionCloser {
     cx: ConnectionTo<Agent>,
     dispatch_gate: Arc<StdMutex<()>>,
     unavailable: Arc<AtomicBool>,
-    /// [`AcpConfig::cancel_grace`], which bounds a close that has no release
-    /// deadline to run under (see [`Self::close_late`]).
+    /// [`AcpConfig::cancel_grace`]: how long the answer to a close is awaited,
+    /// counted from when that close was sent.
     grace: Duration,
     owner_key_fingerprint: i64,
-    /// Pause taken before each request, to walk dispatch into its deadline.
+    /// Pause taken before each request, to walk dispatch past the release
+    /// caller's deadline.
     #[cfg(test)]
     dispatch_delay: Option<Duration>,
 }
 
 impl SessionCloser {
-    fn unsent(&self) -> AcpTraceEvent {
+    /// The outcome a flight records for a mint that outlived its deadline. It
+    /// stands for an id that is not known yet, which makes it the only
+    /// outcome that can be unsent on a usable connection.
+    fn mint_outlived_deadline(&self) -> AcpTraceEvent {
         AcpTraceEvent::SessionCloseAbandoned {
             owner_key_fingerprint: self.owner_key_fingerprint,
             sent: false,
@@ -2171,13 +2190,21 @@ impl SessionCloser {
         }
     }
 
-    /// Release's close flight over an entry it has just unpublished. The one
-    /// `deadline` covers everything the flight waits for (a mint still in
-    /// flight, the turn the preceding cancel is unwinding, and the agent's
-    /// answers), so the flight ends by then whatever the agent does.
-    /// `dispatched` fires once every close is on the wire or has been given
-    /// up. Returns one typed outcome per agent session for the caller to
-    /// trace, counting a mint that outlived the deadline as one.
+    /// Release's close flight over an entry it has just unpublished.
+    ///
+    /// `deadline` is the release caller's. Of the flight's own waits it
+    /// bounds one, the wait for a mint still in flight: a mint that outlives
+    /// it cannot publish what it mints and closes it itself when it settles.
+    /// The wait for the turn lock has no bound. Whoever holds that lock is
+    /// still acting on the published session and nothing else would ever
+    /// close it, so its close stays pending until the lock is free or the
+    /// connection is fenced. The answer to each close is awaited for one
+    /// grace from when that close was sent.
+    ///
+    /// `dispatched` fires once every close the flight owns is on the wire or
+    /// has been refused by the fence. Traces one typed outcome per agent
+    /// session and returns them, counting a mint that outlived `deadline` as
+    /// one.
     async fn close_released(
         self,
         entry: Arc<AgentSession>,
@@ -2189,9 +2216,7 @@ impl SessionCloser {
         let mut seen = HashSet::new();
         // What earlier mints abandoned is settled and never carried a turn,
         // so it goes out at once instead of behind the two waits below.
-        let mut pending = self
-            .dispatch(entry.take_abandoned(), deadline, &mut seen)
-            .await;
+        let mut turnless = self.dispatch(entry.take_abandoned(), &mut seen).await;
         // A mint holds `init_lock` until it has published its id or abandoned
         // it, so the lock is how the flight learns of an id that `session/new`
         // had yet to settle when release ran. Taking it once is enough: a
@@ -2200,87 +2225,85 @@ impl SessionCloser {
             || tokio::time::timeout_at(deadline, entry.init_lock.lock())
                 .await
                 .is_ok();
-        let remaining = entry.hand_over_minted(&self);
-        if !mint_settled && remaining.is_empty() {
-            // The mint outlived the deadline. It cannot publish what it mints
-            // and closes it itself when it settles (`abandon_minted`).
-            pending.push(Err(self.unsent()));
+        let (abandoned, published) = entry.hand_over_minted(&self);
+        if !mint_settled && abandoned.is_empty() && published.is_none() {
+            // The mint outlived the deadline, so there is no id to close yet.
+            // It cannot publish what it mints and closes it itself when it
+            // settles (`abandon_minted`).
+            turnless.push(Err(self.mint_outlived_deadline()));
         }
-        // A turn the preceding cancel is still unwinding holds the turn lock
-        // until its prompt result is terminal. Closing underneath it could turn
-        // that clean cancel into an agent error, so close only once the lock
-        // is free, or give up at the deadline.
-        let turn = if fenced() {
-            None
-        } else {
-            tokio::time::timeout_at(deadline, entry.turn_lock.lock())
-                .await
-                .ok()
+        // What that mint abandoned in the meantime never carried a turn
+        // either, so it does not wait for the turn lock.
+        turnless.extend(self.dispatch(abandoned, &mut seen).await);
+        let after_turn = async {
+            let mut pending = Vec::new();
+            if let Some(agent_id) = published {
+                // Whoever holds the turn lock is still acting on the
+                // published session: a turn the preceding cancel is
+                // unwinding, a finished turn persisting its outcome, a prompt
+                // yet to be refused admission, a config reconcile. Closing
+                // underneath any of them could turn a clean cancel into an
+                // agent error, so the close goes out only once the lock is
+                // free, however long that takes: giving up would leave the
+                // session open with nobody left to close it.
+                let _turn = if fenced() {
+                    None
+                } else {
+                    Some(entry.turn_lock.lock().await)
+                };
+                pending = self.dispatch(vec![agent_id], &mut seen).await;
+            }
+            // Nobody may still be listening; the flight finishes regardless.
+            let _ = dispatched.send(());
+            self.settle(pending).await
         };
-        pending.extend(match turn {
-            Some(_turn) => self.dispatch(remaining, deadline, &mut seen).await,
-            None => remaining
-                .into_iter()
-                .filter(|agent_id| seen.insert(agent_id.clone()))
-                .map(|_| Err(self.unsent()))
-                .collect(),
-        });
-        // Nobody may still be listening; the flight finishes regardless.
-        let _ = dispatched.send(());
-        self.settle(pending, deadline).await
+        // The closes already sent are answered while the published id waits
+        // for the turn lock, so their outcomes are not held behind that wait.
+        let (mut outcomes, after_turn) = tokio::join!(self.settle(turnless), after_turn);
+        outcomes.extend(after_turn);
+        outcomes
     }
 
-    /// Run [`Self::close_released`] as a task of its own, which traces every
-    /// outcome, and wait for it to have dispatched, though never past
-    /// `deadline`. A release caller that stops waiting therefore cannot
-    /// strand a close between the turn settling and the send, and one that
-    /// waits is held neither by the agent's answers nor by a backlog of
-    /// abandoned ids the flight is still working through. Returns the flight,
-    /// which runs on whether or not it is joined.
+    /// Run [`Self::close_released`] as a task of its own and wait for it to
+    /// have dispatched, though never past `deadline`: the cancel grace bounds
+    /// the release caller, not the flight. The flight is spawned before the
+    /// first wait, so a release caller that stops waiting, or is itself
+    /// cancelled, cannot strand a close, and one that waits is held neither
+    /// by a turn lock that stays taken, nor by the agent's answers, nor by a
+    /// backlog of abandoned ids the flight is still working through. Returns
+    /// the flight, which runs on whether or not it is joined.
     async fn fly_released(
         self,
         entry: Arc<AgentSession>,
         deadline: tokio::time::Instant,
     ) -> tokio::task::JoinHandle<Vec<AcpTraceEvent>> {
         let (dispatched, dispatch_settled) = oneshot::channel();
-        let closing = self.close_released(entry, deadline, dispatched);
-        let flight = tokio::spawn(async move {
-            let outcomes = closing.await;
-            for outcome in &outcomes {
-                outcome.emit();
-            }
-            outcomes
-        });
+        let flight = tokio::spawn(self.close_released(entry, deadline, dispatched));
         // An error from the signal only means the flight is gone.
         let _ = tokio::time::timeout_at(deadline, dispatch_settled).await;
         flight
     }
 
     /// Close one id that a mint abandoned after its release's flight had
-    /// collected the entry, as a task of its own under a grace of its own.
+    /// collected the entry, as a task of its own. The id never carried a
+    /// turn, so it goes out at once unless the connection is fenced.
     fn close_late(self, agent_id: AgentSessionId) {
         // Without a runtime the backend is going down, adapter and all.
         let Ok(runtime) = tokio::runtime::Handle::try_current() else {
             return;
         };
         runtime.spawn(async move {
-            let deadline = tokio::time::Instant::now() + self.grace;
-            let pending = self
-                .dispatch(vec![agent_id], deadline, &mut HashSet::new())
-                .await;
-            for outcome in self.settle(pending, deadline).await {
-                outcome.emit();
-            }
+            let pending = self.dispatch(vec![agent_id], &mut HashSet::new()).await;
+            self.settle(pending).await;
         });
     }
 
     /// Put `session/close` on the wire for each id not yet `seen`, in order.
-    /// Every request is checked against `deadline` and the fence on its own,
-    /// so dispatch stops where either cuts in and the rest come back unsent.
+    /// Every request is checked against the fence on its own, so once the
+    /// fence closes the rest come back unsent. Nothing else holds one back.
     async fn dispatch(
         &self,
         agent_ids: Vec<AgentSessionId>,
-        deadline: tokio::time::Instant,
         seen: &mut HashSet<AgentSessionId>,
     ) -> Vec<PendingClose> {
         let mut pending = Vec::with_capacity(agent_ids.len());
@@ -2292,63 +2315,66 @@ impl SessionCloser {
             if let Some(delay) = self.dispatch_delay {
                 tokio::time::sleep(delay).await;
             }
-            pending.push(self.send(agent_id, deadline));
+            pending.push(self.send(agent_id));
         }
         pending
     }
 
-    fn send(&self, agent_id: AgentSessionId, deadline: tokio::time::Instant) -> PendingClose {
+    /// Send one `session/close`, unless the connection is fenced. The fence
+    /// is the only refusal: no deadline leaves a known id unsent.
+    fn send(&self, agent_id: AgentSessionId) -> PendingClose {
         // Same short, non-awaiting gate as prompt installation: once
         // escalation or retirement closes the fence, nothing more is sent.
         let _dispatch = self
             .dispatch_gate
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if self.unavailable.load(Ordering::SeqCst) || tokio::time::Instant::now() >= deadline {
-            return Err(self.unsent());
+        if self.unavailable.load(Ordering::SeqCst) {
+            return Err(AcpTraceEvent::SessionCloseAbandoned {
+                owner_key_fingerprint: self.owner_key_fingerprint,
+                sent: false,
+                connection_unavailable: true,
+            });
         }
-        Ok(self.cx.send_request(CloseSessionRequest::new(agent_id)))
+        let sent = self.cx.send_request(CloseSessionRequest::new(agent_id));
+        Ok((sent, tokio::time::Instant::now() + self.grace))
     }
 
-    /// Wait until `deadline` for the answer to each close that was sent, and
-    /// type every outcome.
-    async fn settle(
-        &self,
-        pending: Vec<PendingClose>,
-        deadline: tokio::time::Instant,
-    ) -> Vec<AcpTraceEvent> {
+    /// Wait for the answer to each close that was sent, until that close's
+    /// own deadline, then type and trace every outcome.
+    async fn settle(&self, pending: Vec<PendingClose>) -> Vec<AcpTraceEvent> {
         let owner_key_fingerprint = self.owner_key_fingerprint;
         let mut outcomes = Vec::with_capacity(pending.len());
         for close in pending {
-            let answer = match close {
-                Ok(sent) => tokio::time::timeout_at(deadline, sent.block_task()).await,
-                Err(unsent) => {
-                    outcomes.push(unsent);
-                    continue;
-                }
-            };
-            outcomes.push(match answer {
-                Ok(Ok(_)) => AcpTraceEvent::SessionCloseAcknowledged {
-                    owner_key_fingerprint,
-                },
-                // Retirement or escalation fails or starves a request already
-                // on the wire. That is this bridge's own teardown, not the
-                // agent's verdict on the close.
-                _ if self.unavailable.load(Ordering::SeqCst) => {
-                    AcpTraceEvent::SessionCloseAbandoned {
-                        owner_key_fingerprint,
-                        sent: true,
-                        connection_unavailable: true,
+            let outcome = match close {
+                Ok((sent, answer_by)) => {
+                    match tokio::time::timeout_at(answer_by, sent.block_task()).await {
+                        Ok(Ok(_)) => AcpTraceEvent::SessionCloseAcknowledged {
+                            owner_key_fingerprint,
+                        },
+                        // Retirement or escalation fails or starves a request
+                        // already on the wire. That is this bridge's own
+                        // teardown, not the agent's verdict on the close.
+                        _ if self.unavailable.load(Ordering::SeqCst) => {
+                            AcpTraceEvent::SessionCloseAbandoned {
+                                owner_key_fingerprint,
+                                sent: true,
+                                connection_unavailable: true,
+                            }
+                        }
+                        Ok(Err(error)) => AcpTraceEvent::SessionCloseRejected {
+                            owner_key_fingerprint,
+                            rpc_code: AcpBackend::error_code_i64(error.code),
+                        },
+                        Err(_) => AcpTraceEvent::SessionCloseUnanswered {
+                            owner_key_fingerprint,
+                        },
                     }
                 }
-                Ok(Err(error)) => AcpTraceEvent::SessionCloseRejected {
-                    owner_key_fingerprint,
-                    rpc_code: AcpBackend::error_code_i64(error.code),
-                },
-                Err(_) => AcpTraceEvent::SessionCloseUnanswered {
-                    owner_key_fingerprint,
-                },
-            });
+                Err(unsent) => unsent,
+            };
+            outcome.emit();
+            outcomes.push(outcome);
         }
         outcomes
     }
@@ -6070,14 +6096,17 @@ impl AcpBackend {
     /// session's resources while the shared process keeps serving the others.
     ///
     /// Nothing is sent unless the agent advertised the close capability at
-    /// initialize and an id was actually minted. Returns once every close is
-    /// on the wire or has been given up, or when one
-    /// [`AcpConfig::cancel_grace`] has passed, whichever comes first; the
+    /// initialize and an id was actually minted. The caller's wait is bounded
+    /// by one [`AcpConfig::cancel_grace`]: this returns once every close is on
+    /// the wire or refused by the fence, or when the grace has passed,
+    /// whichever comes first. The closes themselves are not bounded by it. A
+    /// close that cannot go out yet stays pending with the flight until the
+    /// session's turn lock is free or the adapter is torn down, and the
     /// answers are awaited by the flight alone (see
     /// [`SessionCloser::fly_released`]).
     async fn close_released_agent_sessions(&self, session: &SessionId, entry: Arc<AgentSession>) {
-        // One absolute deadline for the whole flight, started before any id
-        // is collected or sent.
+        // One absolute deadline for this caller's wait, and for the flight's
+        // wait for a mint, started before any id is collected or sent.
         let deadline = tokio::time::Instant::now() + self.cancel_grace();
         let Some(closer) = self.session_closer(session) else {
             return;
@@ -11666,6 +11695,12 @@ mod tests {
         set_config_options: Arc<Mutex<Vec<(String, String)>>>,
         /// Fires every time a `session/set_config_option` is recorded.
         set_config_seen: Arc<Notify>,
+        /// Whether `session/set_config_option` waits on `set_config_gate`
+        /// before replying. The wait is taken off the agent's dispatch loop,
+        /// so the agent goes on handling other frames meanwhile.
+        gate_set_config: Arc<AtomicBool>,
+        /// Released to let a gated `session/set_config_option` reply proceed.
+        set_config_gate: Arc<Notify>,
         /// When set, the `session/set_config_option` handler REJECTS with a JSON-RPC
         /// error (modeling an adapter without a structured effort knob). NON-FATAL.
         reject_set_config: Arc<AtomicBool>,
@@ -11757,6 +11792,8 @@ mod tests {
                 session_models: Arc::new(Mutex::new(None)),
                 set_config_options: Arc::new(Mutex::new(Vec::new())),
                 set_config_seen: Arc::new(Notify::new()),
+                gate_set_config: Arc::new(AtomicBool::new(false)),
+                set_config_gate: Arc::new(Notify::new()),
                 reject_set_config: Arc::new(AtomicBool::new(false)),
                 advertise_model_config: Arc::new(AtomicBool::new(true)),
                 model_config_id: Arc::new(Mutex::new("model".to_string())),
@@ -12345,7 +12382,7 @@ mod tests {
                           responder: agent_client_protocol::Responder<
                         SetSessionConfigOptionResponse,
                     >,
-                          _cx| {
+                          cx: ConnectionTo<Client>| {
                         let r = r_config.clone();
                         async move {
                             let call_number = {
@@ -12355,25 +12392,40 @@ mod tests {
                                 set_config_options.len()
                             };
                             r.set_config_seen.notify_one();
-                            let reject_call = *r.reject_set_config_call.lock().await;
-                            if r.reject_set_config.load(Ordering::SeqCst)
-                                || reject_call == Some(call_number)
-                            {
-                                let body = r.set_config_error_body.lock().await.clone();
-                                responder.respond_with_internal_error(body)?;
+                            let gated = r.gate_set_config.load(Ordering::SeqCst);
+                            let respond = async move {
+                                if gated {
+                                    r.set_config_gate.notified().await;
+                                }
+                                let reject_call = *r.reject_set_config_call.lock().await;
+                                if r.reject_set_config.load(Ordering::SeqCst)
+                                    || reject_call == Some(call_number)
+                                {
+                                    let body = r.set_config_error_body.lock().await.clone();
+                                    responder.respond_with_internal_error(body)?;
+                                } else {
+                                    r.refresh_config_current(&req.config_id.0, &req.value.0)
+                                        .await;
+                                    let config_options =
+                                        if r.empty_config_response_on_set.load(Ordering::SeqCst) {
+                                            Vec::new()
+                                        } else {
+                                            r.advertised_config_options().await
+                                        };
+                                    responder.respond(SetSessionConfigOptionResponse::new(
+                                        config_options,
+                                    ))?;
+                                }
+                                Ok(())
+                            };
+                            if gated {
+                                // Parking in the handler would park the
+                                // dispatch loop, and with it every later frame.
+                                cx.spawn(respond)?;
+                                Ok(())
                             } else {
-                                r.refresh_config_current(&req.config_id.0, &req.value.0)
-                                    .await;
-                                let config_options =
-                                    if r.empty_config_response_on_set.load(Ordering::SeqCst) {
-                                        Vec::new()
-                                    } else {
-                                        r.advertised_config_options().await
-                                    };
-                                responder
-                                    .respond(SetSessionConfigOptionResponse::new(config_options))?;
+                                respond.await
                             }
-                            Ok(())
                         }
                     },
                     agent_client_protocol::on_receive_request!(),
@@ -18275,7 +18327,7 @@ mod tests {
         let flight = closer.close_released(entry, deadline, dispatched);
         tokio::time::timeout(grace + Duration::from_secs(5), flight)
             .await
-            .expect("a close flight must end within its grace")
+            .expect("a close flight must end when nothing holds its closes back")
     }
 
     /// [`close_flight`] for a caller that does not watch the dispatch signal.
@@ -18295,7 +18347,10 @@ mod tests {
     /// record is the last of the reuse path, made once the prompt has
     /// selected its agent session and before it queues for the turn lock; the
     /// fifth is `PromptStart`, made under the turn lock and before anything
-    /// is installed for the turn. Returns the prompt with what resumes it.
+    /// is installed for the turn; the eighth is the completion of
+    /// `PromptStream`, made by the driver once the turn's result is terminal
+    /// and its route is gone, still under the turn lock. Returns the prompt
+    /// with what resumes it.
     async fn prompt_parked_at_record(
         backend: &Arc<AcpBackend>,
         session: &SessionId,
@@ -18825,7 +18880,7 @@ mod tests {
         );
         assert!(
             !release.is_finished(),
-            "release returns only once the close is on the wire or given up"
+            "release waits, within its grace, for the close to go out"
         );
 
         rec.prompt_gate.notify_one();
@@ -18920,7 +18975,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn release_gives_up_on_close_when_the_cancelled_turn_never_settles() {
+    async fn release_does_not_close_a_session_whose_stuck_turn_is_escalated() {
         let rec = Recorder::advertising_close("agent-sess-CLOSE-STUCK");
         rec.unique_minted_ids.store(true, Ordering::SeqCst);
         // The agent sees the cancel and then never ends the turn.
@@ -18949,12 +19004,19 @@ mod tests {
         .expect("an unsettled turn must not hold release past the cancel grace");
 
         assert_eq!(result, Ok(BackendCleanupDispositionV1::Complete));
+        // The turn ends only when the cancel watcher escalates. That fences
+        // the connection, which is what ends the close: the grace alone
+        // would leave it pending.
         while stream.next().await.is_some() {}
+        assert!(
+            backend.unavailable.load(Ordering::SeqCst),
+            "a turn that ignores its cancel is escalated, fencing the connection"
+        );
         settle_recording_agent(&backend).await;
         assert_eq!(
             *rec.closes.lock().await,
             vec![control_id],
-            "no session/close is sent under a turn that never settled"
+            "no session/close is sent once escalation has fenced the connection"
         );
     }
 
@@ -19049,6 +19111,206 @@ mod tests {
         let fresh_id = backend.ensure_session(&session).await.unwrap();
         assert_ne!(fresh_id.0.as_ref(), agent_id);
         assert_eq!(rec.new_session_calls.load(Ordering::SeqCst), 2);
+    }
+
+    /// A recording backend with a short cancel grace, holding a minted
+    /// `session` for a test to release and a minted `sibling` whose turns
+    /// show that the adapter is still serving its other sessions. Returns
+    /// the backend with `session`'s agent id.
+    async fn connect_closing_beside_a_sibling(
+        rec: &Recorder,
+        grace: Duration,
+        session: &SessionId,
+        sibling: &SessionId,
+    ) -> (Arc<AcpBackend>, String) {
+        rec.unique_minted_ids.store(true, Ordering::SeqCst);
+        let backend = Arc::new(
+            connect_recording_with(
+                rec.clone(),
+                AcpConfig {
+                    cancel_grace: grace,
+                    ..test_config()
+                },
+            )
+            .await,
+        );
+        backend.ensure_session(sibling).await.unwrap();
+        let agent_id = backend.ensure_session(session).await.unwrap();
+        (backend, agent_id.0.to_string())
+    }
+
+    /// Run one turn on `session` to its end.
+    async fn assert_serves_a_turn(backend: &AcpBackend, session: &SessionId) {
+        let mut stream = backend
+            .prompt(session, vec![])
+            .await
+            .expect("the adapter must still take a prompt for its other session");
+        let mut last = None;
+        while let Some(update) = stream.next().await {
+            last = Some(update);
+        }
+        assert!(
+            matches!(last, Some(Ok(Update::Done { .. }))),
+            "the other session's turn must complete, got {last:?}"
+        );
+    }
+
+    /// Release `session` while something that is not a turn on the wire
+    /// holds its turn lock and goes on holding it, and assert what the
+    /// release owes meanwhile: it returns at the cancel grace with the entry
+    /// gone and no `session/close` sent, and `sibling` is still served.
+    async fn release_while_the_turn_lock_stays_held(
+        backend: &AcpBackend,
+        rec: &Recorder,
+        session: &SessionId,
+        sibling: &SessionId,
+        grace: Duration,
+    ) {
+        // With the clock paused, time advances only once every task is idle:
+        // release waits on the pending close until the grace is spent.
+        tokio::time::pause();
+        let started = tokio::time::Instant::now();
+        let result = tokio::time::timeout(grace * 10, backend.release_session_checked(session))
+            .await
+            .expect("a turn lock that stays held must not hang release");
+        let waited = started.elapsed();
+        tokio::time::resume();
+
+        assert_eq!(result, Ok(BackendCleanupDispositionV1::Complete));
+        assert!(
+            (grace..grace * 2).contains(&waited),
+            "release waited {waited:?} on the pending close; it must wait out \
+             the {grace:?} cancel grace and no longer"
+        );
+        assert!(backend.sessions.lock().await.get(session).is_none());
+        settle_recording_agent(backend).await;
+        assert!(
+            rec.closes.lock().await.is_empty(),
+            "session/close must not be sent underneath a held turn lock"
+        );
+        assert_serves_a_turn(backend, sibling).await;
+    }
+
+    /// What must hold once the holder of a released session's turn lock has
+    /// let go, however long after the cancel grace that was: the session is
+    /// closed exactly once, after its cancel, and `sibling` is still served.
+    async fn assert_closed_once_the_turn_lock_is_free(
+        backend: &AcpBackend,
+        rec: &Recorder,
+        agent_id: &str,
+        sibling: &SessionId,
+    ) {
+        closes_recorded(rec, 1).await;
+        settle_recording_agent(backend).await;
+        assert_eq!(
+            *rec.teardown_log.lock().await,
+            vec![format!("cancel:{agent_id}"), format!("close:{agent_id}")],
+            "the close left pending at the grace goes out once, when the turn lock is free"
+        );
+        assert!(
+            !backend.unavailable.load(Ordering::SeqCst),
+            "closing one session must not fence the connection the others share"
+        );
+        assert_serves_a_turn(backend, sibling).await;
+    }
+
+    #[tokio::test]
+    async fn release_closes_a_session_whose_finished_turn_outlasts_the_grace() {
+        let grace = Duration::from_millis(200);
+        let rec = Recorder::advertising_close("agent-sess-CLOSE-FINISHING");
+        let session = bkey("bridge-CLOSE-FINISHING");
+        let sibling = bkey("bridge-CLOSE-FINISHING-SIBLING");
+        let (backend, agent_id) =
+            connect_closing_beside_a_sibling(&rec, grace, &session, &sibling).await;
+        // The turn's result is terminal and its route is gone, so release's
+        // cancel finds no turn to watch and nothing will ever escalate. The
+        // driver is still persisting the outcome, under the turn lock.
+        let (prompt, resume) = prompt_parked_at_record(&backend, &session, 8).await;
+        let entry = backend.session_entry(&session).await.unwrap();
+        assert!(!backend
+            .updates()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .contains_key(&AgentSessionId::new(agent_id.clone())));
+        assert!(entry.turn_lock.try_lock().is_err());
+
+        release_while_the_turn_lock_stays_held(&backend, &rec, &session, &sibling, grace).await;
+
+        resume.notify_one();
+        let mut stream = prompt
+            .await
+            .unwrap()
+            .expect("the turn was on the wire before its session was released");
+        while stream.next().await.is_some() {}
+        assert_closed_once_the_turn_lock_is_free(&backend, &rec, &agent_id, &sibling).await;
+    }
+
+    #[tokio::test]
+    async fn release_closes_a_session_whose_unadmitted_prompt_outlasts_the_grace() {
+        let grace = Duration::from_millis(200);
+        let rec = Recorder::advertising_close("agent-sess-CLOSE-UNADMITTED");
+        let session = bkey("bridge-CLOSE-UNADMITTED");
+        let sibling = bkey("bridge-CLOSE-UNADMITTED-SIBLING");
+        let (backend, agent_id) =
+            connect_closing_beside_a_sibling(&rec, grace, &session, &sibling).await;
+        // The prompt owns the turn lock and has installed nothing for its turn.
+        let (prompt, resume) = prompt_parked_at_record(&backend, &session, 5).await;
+
+        release_while_the_turn_lock_stays_held(&backend, &rec, &session, &sibling, grace).await;
+
+        resume.notify_one();
+        assert_refused_as_released(prompt).await;
+        assert_closed_once_the_turn_lock_is_free(&backend, &rec, &agent_id, &sibling).await;
+        assert_eq!(
+            rec.prompt_log.lock().await.as_slice(),
+            &["start", "end", "start", "end"],
+            "only the sibling's two turns reach the agent"
+        );
+    }
+
+    #[tokio::test]
+    async fn release_closes_a_session_whose_config_reconcile_outlasts_the_grace() {
+        let grace = Duration::from_millis(200);
+        let rec = Recorder::advertising_close("agent-sess-CLOSE-RECONCILING");
+        let session = bkey("bridge-CLOSE-RECONCILING");
+        let sibling = bkey("bridge-CLOSE-RECONCILING-SIBLING");
+        let (backend, agent_id) =
+            connect_closing_beside_a_sibling(&rec, grace, &session, &sibling).await;
+        // A warm reconcile holds the turn lock across a
+        // `session/set_config_option` that the agent is slow to answer.
+        rec.gate_set_config.store(true, Ordering::SeqCst);
+        let reconcile = {
+            let backend = Arc::clone(&backend);
+            let session = session.clone();
+            tokio::spawn(async move {
+                let spec = SessionSpec::from_config(EffectiveConfig {
+                    model: None,
+                    effort: Some(Effort::High),
+                    mode: None,
+                });
+                backend.reconcile_config(&session, &spec).await
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while rec.set_config_options.lock().await.is_empty() {
+                rec.set_config_seen.notified().await;
+            }
+        })
+        .await
+        .expect("the reconcile must reach the agent");
+
+        release_while_the_turn_lock_stays_held(&backend, &rec, &session, &sibling, grace).await;
+
+        rec.set_config_gate.notify_one();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), reconcile)
+                .await
+                .expect("the reconcile settles once the agent answers")
+                .unwrap(),
+            Ok(bridge_core::orch::ReconcileOutcome::Applied)
+        );
+        assert_closed_once_the_turn_lock_is_free(&backend, &rec, &agent_id, &sibling).await;
     }
 
     /// Start a prompt for `session` and park it where it has just resolved
@@ -19244,7 +19506,7 @@ mod tests {
     #[tokio::test]
     async fn close_flight_reports_a_typed_outcome_per_agent_session() {
         // Long enough that an answer always arrives first; short where the
-        // case under test is the deadline itself.
+        // case under test is an answer that never comes.
         let answered = Duration::from_secs(5);
         let expires = Duration::from_millis(50);
         let rec = Recorder::advertising_close("agent-sess-CLOSE-OUTCOME");
@@ -19284,22 +19546,6 @@ mod tests {
                 owner_key_fingerprint
             }]
         );
-
-        // A turn that outlives the deadline: nothing is sent underneath it.
-        let unsettled = bkey("bridge-CLOSE-OUTCOME-UNSETTLED");
-        backend.ensure_session(&unsettled).await.unwrap();
-        let turn = Arc::clone(&backend.session_entry(&unsettled).await.unwrap().turn_lock)
-            .lock_owned()
-            .await;
-        assert_eq!(
-            close_flight_outcomes(&backend, &unsettled, expires).await,
-            [AcpTraceEvent::SessionCloseAbandoned {
-                owner_key_fingerprint,
-                sent: false,
-                connection_unavailable: false,
-            }]
-        );
-        drop(turn);
 
         // On the wire, then the connection is retired before any answer:
         // the missing answer is the bridge's own teardown, not the agent's.
@@ -19392,12 +19638,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn close_flight_stops_dispatching_at_its_deadline() {
+    async fn close_flight_closes_its_whole_backlog_after_the_caller_has_returned() {
         let grace = Duration::from_millis(100);
         let dispatch_delay = Duration::from_millis(40);
-        let rec = Recorder::advertising_close("agent-sess-CLOSE-DEADLINE");
+        let rec = Recorder::advertising_close("agent-sess-CLOSE-BACKLOG");
         let backend = connect_recording(rec.clone()).await;
-        let session = bkey("bridge-CLOSE-DEADLINE");
+        let session = bkey("bridge-CLOSE-BACKLOG");
         let entry = backend.session_entry(&session).await.unwrap();
         // Four failed mints, one of them reported twice.
         for abandoned in ["first", "first", "second", "third", "fourth"] {
@@ -19421,31 +19667,271 @@ mod tests {
             !flight.is_finished(),
             "the flight works through the rest of the backlog on its own"
         );
+        settle_recording_agent(&backend).await;
+        assert_eq!(
+            *rec.closes.lock().await,
+            vec!["first", "second"],
+            "the caller returned at its deadline with half the backlog still to send"
+        );
         let outcomes = tokio::time::timeout(Duration::from_secs(5), flight)
             .await
             .expect("a close flight must end once it is through its backlog")
             .unwrap();
         tokio::time::resume();
 
-        let owner_key_fingerprint = CLOSE_FINGERPRINT;
         let acknowledged = AcpTraceEvent::SessionCloseAcknowledged {
-            owner_key_fingerprint,
-        };
-        let unsent = AcpTraceEvent::SessionCloseAbandoned {
-            owner_key_fingerprint,
-            sent: false,
-            connection_unavailable: false,
+            owner_key_fingerprint: CLOSE_FINGERPRINT,
         };
         assert_eq!(
-            outcomes,
-            [acknowledged, acknowledged, unsent, unsent],
-            "one outcome per distinct agent session, abandoned once the deadline has passed"
+            outcomes, [acknowledged; 4],
+            "one outcome per distinct agent session, closed and answered \
+             whichever side of the caller's deadline it was sent on"
         );
         settle_recording_agent(&backend).await;
         assert_eq!(
             *rec.closes.lock().await,
-            vec!["first", "second"],
-            "nothing is sent at or after the deadline, and no id is sent twice"
+            vec!["first", "second", "third", "fourth"],
+            "the deadline leaves no id unsent, and no id is sent twice"
+        );
+    }
+
+    #[tokio::test]
+    async fn close_flight_does_not_hold_abandoned_ids_behind_the_turn_lock() {
+        let rec = Recorder::advertising_close("agent-sess-CLOSE-TURNLESS");
+        let backend = connect_recording(rec.clone()).await;
+        let session = bkey("bridge-CLOSE-TURNLESS");
+        let published = backend.ensure_session(&session).await.unwrap();
+        let entry = backend.session_entry(&session).await.unwrap();
+        // Something is still acting on the published session, one id was
+        // abandoned before release, and a mint in flight holds another. The
+        // entry is put together by hand: the flight must keep the three apart
+        // whatever combination it is handed.
+        let turn = Arc::clone(&entry.turn_lock).lock_owned().await;
+        entry.abandon_minted(AgentSessionId::new("abandoned-before"));
+        let minting = Arc::clone(&entry.init_lock).lock_owned().await;
+        let minted =
+            AbandonedMintGuard::arm(Arc::clone(&entry), AgentSessionId::new("abandoned-during"));
+
+        let (entry, closer) =
+            unpublish_for_close(&backend, &session, DEFAULT_CANCEL_GRACE, None).await;
+        let (dispatched, mut dispatch_settled) = oneshot::channel();
+        let deadline = tokio::time::Instant::now() + DEFAULT_CANCEL_GRACE;
+        let flight = tokio::spawn(closer.close_released(entry, deadline, dispatched));
+        closes_recorded(&rec, 1).await;
+        // The mint settles while the flight is waiting for it.
+        drop(minted);
+        drop(minting);
+        closes_recorded(&rec, 2).await;
+        settle_recording_agent(&backend).await;
+        assert_eq!(
+            *rec.closes.lock().await,
+            vec!["abandoned-before", "abandoned-during"],
+            "ids that never carried a turn are closed while the turn lock is held"
+        );
+        assert!(
+            dispatch_settled.try_recv().is_err() && !flight.is_finished(),
+            "only the published id waits for the turn lock"
+        );
+
+        drop(turn);
+        let outcomes = tokio::time::timeout(Duration::from_secs(5), flight)
+            .await
+            .expect("the flight ends once the turn lock is free")
+            .unwrap();
+        let acknowledged = AcpTraceEvent::SessionCloseAcknowledged {
+            owner_key_fingerprint: CLOSE_FINGERPRINT,
+        };
+        assert_eq!(outcomes, [acknowledged; 3]);
+        settle_recording_agent(&backend).await;
+        assert_eq!(
+            *rec.closes.lock().await,
+            vec!["abandoned-before", "abandoned-during", published.0.as_ref()]
+        );
+    }
+
+    #[tokio::test]
+    async fn close_flight_settles_sent_closes_while_the_published_id_waits_for_the_turn_lock() {
+        let grace = Duration::from_millis(50);
+        let rec = Recorder::advertising_close("agent-sess-CLOSE-SETTLING");
+        rec.hang_close.store(true, Ordering::SeqCst);
+        let backend = connect_recording(rec.clone()).await;
+        let session = bkey("bridge-CLOSE-SETTLING");
+        backend.ensure_session(&session).await.unwrap();
+        let entry = backend.session_entry(&session).await.unwrap();
+        // One id that never carried a turn, whose close the agent will not
+        // answer, beside a published id whose turn lock stays held.
+        entry.abandon_minted(AgentSessionId::new("abandoned"));
+        let turn = Arc::clone(&entry.turn_lock).lock_owned().await;
+
+        // Deadlines are reached by the idle runtime advancing the clock.
+        tokio::time::pause();
+        let (entry, closer) = unpublish_for_close(&backend, &session, grace, None).await;
+        let (dispatched, _dispatch_settled) = oneshot::channel();
+        let deadline = tokio::time::Instant::now() + grace;
+        let flight = tokio::spawn(closer.close_released(entry, deadline, dispatched));
+        // The abandoned id's close runs out of grace while the flight is
+        // still waiting for the turn lock. Its outcome is settled then, so a
+        // fence that closes afterwards cannot pass it off as the bridge's own
+        // teardown.
+        tokio::time::sleep(grace * 4).await;
+        backend.retire().await.unwrap();
+        drop(turn);
+        let outcomes = tokio::time::timeout(Duration::from_secs(5), flight)
+            .await
+            .expect("the flight ends once the turn lock is free")
+            .unwrap();
+        tokio::time::resume();
+
+        let owner_key_fingerprint = CLOSE_FINGERPRINT;
+        assert_eq!(
+            outcomes,
+            [
+                AcpTraceEvent::SessionCloseUnanswered {
+                    owner_key_fingerprint
+                },
+                AcpTraceEvent::SessionCloseAbandoned {
+                    owner_key_fingerprint,
+                    sent: false,
+                    connection_unavailable: true,
+                },
+            ],
+            "a close already sent is answered or not within its own grace, \
+             whatever the published id is still waiting for"
+        );
+        settle_recording_agent(&backend).await;
+        assert_eq!(*rec.closes.lock().await, vec!["abandoned"]);
+    }
+
+    #[tokio::test]
+    async fn close_pending_behind_a_held_turn_lock_ends_when_the_connection_is_fenced() {
+        let grace = Duration::from_millis(50);
+        let rec = Recorder::advertising_close("agent-sess-CLOSE-PENDING-FENCED");
+        rec.unique_minted_ids.store(true, Ordering::SeqCst);
+        let backend = connect_recording(rec.clone()).await;
+        // While the connection is usable, release closes.
+        let control_id =
+            release_control_session(&backend, "bridge-CLOSE-PENDING-FENCED-CONTROL").await;
+        let session = bkey("bridge-CLOSE-PENDING-FENCED");
+        backend.ensure_session(&session).await.unwrap();
+        let turn = Arc::clone(&backend.session_entry(&session).await.unwrap().turn_lock)
+            .lock_owned()
+            .await;
+
+        // Deadlines are reached by the idle runtime advancing the clock.
+        tokio::time::pause();
+        let (entry, closer) = unpublish_for_close(&backend, &session, grace, None).await;
+        let started = tokio::time::Instant::now();
+        let flight = closer.fly_released(entry, started + grace).await;
+        let waited = started.elapsed();
+        assert!(
+            (grace..grace * 2).contains(&waited),
+            "release waited {waited:?} on the pending close; the {grace:?} \
+             cancel grace bounds its wait"
+        );
+        tokio::time::sleep(grace * 4).await;
+        assert!(
+            !flight.is_finished(),
+            "the close stays owed past the deadline while the turn lock is held"
+        );
+
+        // The fence is the one thing that ends a close still owed.
+        backend.retire().await.unwrap();
+        drop(turn);
+        let outcomes = tokio::time::timeout(Duration::from_secs(5), flight)
+            .await
+            .expect("the flight ends once the turn lock is free")
+            .unwrap();
+        tokio::time::resume();
+
+        assert_eq!(
+            outcomes,
+            [AcpTraceEvent::SessionCloseAbandoned {
+                owner_key_fingerprint: CLOSE_FINGERPRINT,
+                sent: false,
+                connection_unavailable: true,
+            }]
+        );
+        settle_recording_agent(&backend).await;
+        assert_eq!(
+            *rec.closes.lock().await,
+            vec![control_id],
+            "nothing is sent on a connection fenced while the close was pending"
+        );
+    }
+
+    #[tokio::test]
+    async fn close_sent_after_the_release_deadline_has_its_own_grace_to_be_answered() {
+        /// Run a close flight for `session` whose close can only go out well
+        /// after the flight's deadline. Returns its outcomes with how long it
+        /// took to settle them once the close was free to go.
+        async fn close_late_behind_the_turn_lock(
+            backend: &AcpBackend,
+            session: &SessionId,
+            grace: Duration,
+        ) -> (Vec<AcpTraceEvent>, Duration) {
+            let turn = Arc::clone(&backend.session_entry(session).await.unwrap().turn_lock)
+                .lock_owned()
+                .await;
+            let (entry, closer) = unpublish_for_close(backend, session, grace, None).await;
+            let deadline = tokio::time::Instant::now() + grace;
+            let flight = closer.fly_released(entry, deadline).await;
+            tokio::time::sleep(grace * 4).await;
+            drop(turn);
+            let freed = tokio::time::Instant::now();
+            let outcomes = tokio::time::timeout(Duration::from_secs(5), flight)
+                .await
+                .expect("the flight ends once its close is answered or its grace is spent")
+                .unwrap();
+            (outcomes, freed.elapsed())
+        }
+
+        let grace = Duration::from_millis(50);
+        let rec = Recorder::advertising_close("agent-sess-CLOSE-LATE-ANSWER");
+        rec.unique_minted_ids.store(true, Ordering::SeqCst);
+        let backend = connect_recording(rec.clone()).await;
+        let owner_key_fingerprint = CLOSE_FINGERPRINT;
+        let answered = bkey("bridge-CLOSE-LATE-ANSWERED");
+        let answered_id = backend.ensure_session(&answered).await.unwrap();
+        let unanswered = bkey("bridge-CLOSE-LATE-UNANSWERED");
+        let unanswered_id = backend.ensure_session(&unanswered).await.unwrap();
+        // Deadlines are reached by the idle runtime advancing the clock.
+        tokio::time::pause();
+
+        let (outcomes, settled_in) =
+            close_late_behind_the_turn_lock(&backend, &answered, grace).await;
+        assert_eq!(
+            outcomes,
+            [AcpTraceEvent::SessionCloseAcknowledged {
+                owner_key_fingerprint
+            }],
+            "an answer is awaited from when its close was sent, not from a \
+             release deadline that had already passed by then"
+        );
+        assert!(
+            settled_in < grace,
+            "an answered close settled only after {settled_in:?}"
+        );
+
+        rec.hang_close.store(true, Ordering::SeqCst);
+        let (outcomes, settled_in) =
+            close_late_behind_the_turn_lock(&backend, &unanswered, grace).await;
+        assert_eq!(
+            outcomes,
+            [AcpTraceEvent::SessionCloseUnanswered {
+                owner_key_fingerprint
+            }]
+        );
+        assert!(
+            (grace..grace * 2).contains(&settled_in),
+            "an unanswered close was waited on for {settled_in:?}; its answer \
+             is given one {grace:?} grace from when it was sent"
+        );
+
+        tokio::time::resume();
+        settle_recording_agent(&backend).await;
+        assert_eq!(
+            *rec.closes.lock().await,
+            [answered_id, unanswered_id].map(|id| id.0.to_string())
         );
     }
 

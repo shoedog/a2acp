@@ -25,18 +25,21 @@ release (see [`docs/adr/`](docs/adr/) for the full architectural record).
   adapter connection is still usable. Release used to stop at `session/cancel` plus dropping
   bridge-side state, so agent-side sessions — and codex's per-thread MCP server processes — lived
   until the shared adapter exited, which idle adapter retirement cannot bring about while
-  overlapping sessions keep the adapter leased. The close goes out after the cancel, and only once a
-  turn that cancel is still unwinding has settled. A prompt that had picked the session but not yet
-  put its turn on the wire when release began does not start one: it fails with
-  `acp.prompt_start.session_released`, and the next call mints a fresh session. A session whose
-  `session/new` or mode/model setup is still in flight when release runs is never published:
-  release waits for it and closes it, and one that outlives the wait is closed when its mint
-  settles. It is best-effort: release waits no longer than the existing cancel grace for that mint,
-  that turn, and the sending of the closes together, and never for the agent's answer, which is
-  collected in the background within the same grace; a rejected, unanswered, or abandoned close is
-  recorded only as a typed trace event, and release's result is unchanged. Measured against
-  codex-acp 1.13.1 and 2.1.1, a session's MCP server exits about 60 s after its own `session/close`
-  while other sessions on the same adapter stay open.
+  overlapping sessions keep the adapter leased. The close goes out after the cancel, and only once
+  nothing is still acting on the session under its turn lock, such as a turn that cancel is still
+  unwinding. A prompt that had picked the session but not yet put its turn on the wire when release
+  began does not start one: it fails with `acp.prompt_start.session_released`, and the next call
+  mints a fresh session. A session whose `session/new` or mode/model setup is still in flight when
+  release runs is never published: release waits for it and closes it, and one that outlives the
+  wait is closed when its mint settles. It is best-effort in that it never fails or holds up
+  release: the caller's wait is bounded by the existing cancel grace, whatever the closes are still
+  waiting for, and never includes the agent's answer. The grace does not give a close up, though: a
+  close that cannot go out yet stays pending in the background until the session's turn lock is
+  free or the adapter is torn down, and each close's answer is awaited there for one grace from
+  when it was sent. A rejected or unanswered close, or one ended by adapter teardown, is recorded
+  only as a typed trace event, and release's result is unchanged. Measured against codex-acp 1.13.1
+  and 2.1.1, a session's MCP server exits about 60 s after its own `session/close` while other
+  sessions on the same adapter stay open.
 
 ## [0.3.1] - 2026-07-30
 
