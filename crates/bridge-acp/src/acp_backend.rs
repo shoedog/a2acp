@@ -2522,7 +2522,7 @@ pub struct AcpBackend {
     /// Per-bridge-session spec stash (Increment 3b/session-cwd). Dispatch (T10)
     /// calls [`Self::configure_session`] to insert the `SessionSpec` (effective
     /// `model`/`effort`/`mode` + `cwd`) for a session BEFORE its first prompt;
-    /// [`Self::ensure_session`] reads THIS map (keyed by the bridge `SessionId`) at
+    /// [`Self::ensure_session_for`] reads THIS map (keyed by the bridge `SessionId`) at
     /// lazy mint and applies the values, so a live registry config edit affects new
     /// sessions with no respawn and per-request overrides stay isolated per session.
     /// Behind a plain `std::sync::Mutex` (only short, non-async insert/lookup/remove
@@ -2557,6 +2557,10 @@ pub struct AcpBackend {
     perm_timeout_ms: Arc<AtomicU64>,
     #[cfg(test)]
     prompt_snapshot_hook: StdMutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    /// Fires once `prompt_inner` has resolved its bridge key to an entry and
+    /// before it does anything with that entry.
+    #[cfg(test)]
+    prompt_entry_hook: StdMutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     #[cfg(test)]
     before_process_redactor_hook: StdMutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     #[cfg(test)]
@@ -4607,6 +4611,8 @@ impl AcpBackend {
             #[cfg(test)]
             prompt_snapshot_hook: StdMutex::new(None),
             #[cfg(test)]
+            prompt_entry_hook: StdMutex::new(None),
+            #[cfg(test)]
             before_process_redactor_hook: StdMutex::new(None),
             #[cfg(test)]
             fail_deferred_cancel_send: Arc::new(AtomicBool::new(false)),
@@ -5140,27 +5146,40 @@ impl AcpBackend {
     /// the same `swap` and exactly one sends.
     ///
     /// `prompt` calls this, then acquires `turn_lock` and sends `session/prompt`.
-    async fn ensure_session(&self, key: &SessionId) -> Result<AgentSessionId, BridgeError> {
-        self.ensure_session_observed(
+    ///
+    /// The mint acts on `entry`, which the caller resolved `key` to, and never
+    /// looks `key` up itself: `key` only names the config stash to read and
+    /// where the minted session's catalog is filed. So a caller mints for,
+    /// locks and admits a turn on one and the same entry, and if release
+    /// unpublished that entry in the meantime the call is refused instead of
+    /// being served from a replacement entry that no release would close.
+    async fn ensure_session_for(
+        &self,
+        key: &SessionId,
+        entry: &Arc<AgentSession>,
+    ) -> Result<AgentSessionId, BridgeError> {
+        let snapshot = self.session_config_snapshot(key)?;
+        self.ensure_session_observed_with_snapshot(
             key,
+            entry,
             Arc::new(bridge_core::diagnostics::NoopDiagnosticObserver::default()),
+            snapshot,
         )
         .await
     }
 
-    async fn ensure_session_observed(
-        &self,
-        key: &SessionId,
-        observer: Arc<dyn DiagnosticObserver>,
-    ) -> Result<AgentSessionId, BridgeError> {
-        let snapshot = self.session_config_snapshot(key)?;
-        self.ensure_session_observed_with_snapshot(key, observer, snapshot)
-            .await
+    /// [`Self::ensure_session_for`] by bridge key, creating the entry if `key`
+    /// was never seen. The one lookup happens here.
+    #[cfg(test)]
+    async fn ensure_session(&self, key: &SessionId) -> Result<AgentSessionId, BridgeError> {
+        let entry = self.session_entry(key).await?;
+        self.ensure_session_for(key, &entry).await
     }
 
     async fn ensure_session_observed_with_snapshot(
         &self,
         key: &SessionId,
+        entry: &Arc<AgentSession>,
         observer: Arc<dyn DiagnosticObserver>,
         snapshot: SessionConfigSnapshot,
     ) -> Result<AgentSessionId, BridgeError> {
@@ -5173,7 +5192,6 @@ impl AcpBackend {
             self.diagnostic_redactor_for_cwds(std::slice::from_ref(&snapshot.desired_cwd)),
             stderr,
         );
-        let entry = self.session_entry(key).await?;
         // One owned snapshot supplies both mint inputs and the lifecycle redactor.
         // A concurrent `configure_session` replacement affects the next snapshot,
         // never half of this attempt.
@@ -5228,7 +5246,7 @@ impl AcpBackend {
                 // caller is cancelled while waiting to install the process
                 // redactor, this local guard clears the attempt; once the
                 // initializer is spawned, ownership moves into that task.
-                let active_mint_cwd = ActiveMintCwdGuard(Arc::clone(&entry));
+                let active_mint_cwd = ActiveMintCwdGuard(Arc::clone(entry));
                 #[cfg(test)]
                 {
                     let hook = self
@@ -5241,7 +5259,7 @@ impl AcpBackend {
                     }
                 }
                 self.apply_process_redactor_for_live_sessions(None).await;
-                let entry_for_init = Arc::clone(&entry);
+                let entry_for_init = Arc::clone(entry);
                 let cx_for_init = self.cx()?.clone();
                 let lifecycle_for_init = lifecycle.clone();
                 let stderr_ring_for_init = self.stderr_ring.clone();
@@ -5798,7 +5816,7 @@ impl AcpBackend {
     /// Discovery seam: mint a THROWAWAY `session/new`, read the advertised model/effort/mode
     /// surfaces the agent returns, map them to [`AgentCaps`], and return — **no prompt is sent
     /// and nothing is configured**. This reads the SAME `config_options` the lazy mint
-    /// ([`Self::ensure_session`]) reads at its step (1), plus the SDK 1.x `modes` state, BEFORE
+    /// ([`Self::ensure_session_for`]) reads at its step (1), plus the SDK 1.x `modes` state, BEFORE
     /// any model/mode/effort resolution.
     ///
     /// `cwd` is any readable directory: `session/new` requires one (ACP §11A) but discovery reads
@@ -6755,9 +6773,31 @@ impl AcpBackend {
 
         // (1) Mint/get the agent session id. Done OUTSIDE the turn lock so a
         // first-prompt's `session/new` doesn't hold the lock while awaiting.
+        // This is the turn's only lookup of `session`: the mint, the turn lock
+        // and admission below all act on this one entry, so a release that
+        // unpublishes it before the turn is admitted leaves this prompt
+        // nothing to mint or start. Resolving the key again could instead mint
+        // into a replacement entry that the release never sees and this turn
+        // never uses.
         let entry = self.session_entry(session).await?;
+        #[cfg(test)]
+        {
+            let hook = self
+                .prompt_entry_hook
+                .lock()
+                .ok()
+                .and_then(|hook| hook.clone());
+            if let Some(hook) = hook {
+                hook();
+            }
+        }
         let agent_id = self
-            .ensure_session_observed_with_snapshot(session, diagnostic_observer, config_snapshot)
+            .ensure_session_observed_with_snapshot(
+                session,
+                &entry,
+                diagnostic_observer,
+                config_snapshot,
+            )
             .await?;
 
         // Acquire the turn lock as an OWNED guard so it can move into the driver
@@ -7673,7 +7713,7 @@ impl AgentBackend for AcpBackend {
     }
 
     /// Stash the per-session spec (Increment 3b/session-cwd). Dispatch (T10) calls
-    /// this BEFORE the first prompt for a session; [`Self::ensure_session`] reads
+    /// this BEFORE the first prompt for a session; [`Self::ensure_session_for`] reads
     /// the stash at lazy mint (keyed by the bridge `SessionId`) and applies
     /// `mode`/`model`/`effort` from `spec.config`. Insert-or-replace, so a
     /// re-`configure_session` with fresh spec (e.g. after a live registry edit) takes
@@ -7801,16 +7841,18 @@ impl AgentBackend for AcpBackend {
         session: &SessionId,
         spec: &SessionSpec,
     ) -> Result<ReconcileOutcome, BridgeError> {
+        // The only lookup of `session` here: both branches act on this entry.
         let entry = self.session_entry(session).await?;
         if entry.agent_id.get().is_none() {
             self.configure_session(session, spec).await?;
-            let _aid = self.ensure_session(session).await?;
+            let _aid = self.ensure_session_for(session, &entry).await?;
             return Ok(ReconcileOutcome::Applied);
         }
 
-        // Already minted (checked above): read the live id DIRECTLY from this entry — do NOT call
-        // `ensure_session` (it re-fetches the map by key, racing `release_session`, and re-runs the
-        // `minted_cwd` immutability guard). We only reconcile model/effort on the live session.
+        // Already minted (checked above): read the live id DIRECTLY from this entry. Do NOT resolve
+        // `session` again (a second lookup races `release_session` and can land on a replacement
+        // entry), and do NOT go through `ensure_session_for` (it re-runs the `minted_cwd`
+        // immutability guard). We only reconcile model/effort on the live session.
         let aid =
             entry.agent_id.get().cloned().ok_or_else(|| {
                 BridgeError::agent_crashed("warm reconcile: agent session vanished")
@@ -11397,6 +11439,7 @@ mod tests {
             permission_registry: Arc::new(StdMutex::new(None)),
             perm_timeout_ms: Arc::new(AtomicU64::new(120_000)),
             prompt_snapshot_hook: StdMutex::new(None),
+            prompt_entry_hook: StdMutex::new(None),
             before_process_redactor_hook: StdMutex::new(None),
             fail_deferred_cancel_send: Arc::new(AtomicBool::new(false)),
             fail_cancel_send: Arc::new(AtomicBool::new(false)),
@@ -13041,8 +13084,9 @@ mod tests {
             .unwrap();
 
         let observer = Arc::new(InMemoryDiagnosticObserver::new(8).unwrap());
+        let entry = backend.session_entry(&session).await.unwrap();
         let error = backend
-            .ensure_session_observed_with_snapshot(&session, observer, snapshot)
+            .ensure_session_observed_with_snapshot(&session, &entry, observer, snapshot)
             .await
             .expect_err("the fake agent rejects session/new");
         let diagnostic = assert_agent_failure(
@@ -14125,6 +14169,7 @@ mod tests {
             permission_registry: Arc::new(StdMutex::new(None)),
             perm_timeout_ms: Arc::new(AtomicU64::new(120_000)),
             prompt_snapshot_hook: StdMutex::new(None),
+            prompt_entry_hook: StdMutex::new(None),
             before_process_redactor_hook: StdMutex::new(None),
             fail_deferred_cancel_send: Arc::new(AtomicBool::new(false)),
             fail_cancel_send: Arc::new(AtomicBool::new(false)),
@@ -17308,6 +17353,7 @@ mod tests {
             permission_registry: Arc::new(StdMutex::new(None)),
             perm_timeout_ms: Arc::new(AtomicU64::new(120_000)),
             prompt_snapshot_hook: StdMutex::new(None),
+            prompt_entry_hook: StdMutex::new(None),
             before_process_redactor_hook: StdMutex::new(None),
             fail_deferred_cancel_send: Arc::new(AtomicBool::new(false)),
             fail_cancel_send: Arc::new(AtomicBool::new(false)),
@@ -19005,6 +19051,196 @@ mod tests {
         assert_eq!(rec.new_session_calls.load(Ordering::SeqCst), 2);
     }
 
+    /// Start a prompt for `session` and park it where it has just resolved
+    /// the key to its entry and has done nothing with that entry yet. Returns
+    /// the prompt with what resumes it. The hook blocks the worker it runs
+    /// on, so the caller needs a multi-threaded runtime.
+    fn prompt_parked_after_entry_lookup(
+        backend: &Arc<AcpBackend>,
+        session: &SessionId,
+    ) -> (Prompt, Arc<std::sync::Barrier>) {
+        let entered = Arc::new(std::sync::Barrier::new(2));
+        let resume = Arc::new(std::sync::Barrier::new(2));
+        *backend.prompt_entry_hook.lock().unwrap() = Some(Arc::new({
+            let entered = Arc::clone(&entered);
+            let resume = Arc::clone(&resume);
+            move || {
+                entered.wait();
+                resume.wait();
+            }
+        }));
+        let prompt = {
+            let backend = Arc::clone(backend);
+            let session = session.clone();
+            tokio::spawn(async move { backend.prompt(&session, vec![]).await })
+        };
+        entered.wait();
+        // Only this prompt parks; a later one in the same test runs through.
+        *backend.prompt_entry_hook.lock().unwrap() = None;
+        (prompt, resume)
+    }
+
+    /// Every agent session id the recording agent has minted, in mint order.
+    /// Needs `Recorder::unique_minted_ids`.
+    fn minted_ids(rec: &Recorder) -> Vec<String> {
+        (1..=rec.new_session_calls.load(Ordering::SeqCst))
+            .map(|sequence| format!("{}-{sequence}", rec.minted_id))
+            .collect()
+    }
+
+    /// What must hold once a caller that was parked on its entry while
+    /// `session` was released has settled, where the agent had minted
+    /// `minted` sessions by the time the caller parked.
+    async fn assert_parked_caller_left_nothing_behind(
+        backend: &AcpBackend,
+        rec: &Recorder,
+        session: &SessionId,
+        minted: usize,
+    ) {
+        settle_recording_agent(backend).await;
+        assert_eq!(
+            rec.new_session_calls.load(Ordering::SeqCst),
+            minted,
+            "a caller whose entry was released must not send session/new"
+        );
+        assert!(
+            rec.prompt_log.lock().await.is_empty(),
+            "a caller whose entry was released must not send session/prompt"
+        );
+        assert!(
+            backend.sessions.lock().await.get(session).is_none(),
+            "a caller whose entry was released must not put a replacement entry in the map"
+        );
+        assert_eq!(
+            *rec.closes.lock().await,
+            minted_ids(rec),
+            "no agent session may be left that a release did not close"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn prompt_parked_on_an_unminted_entry_does_not_mint_after_its_release() {
+        let rec = Recorder::advertising_close("agent-sess-CLOSE-PARKED-UNMINTED");
+        rec.unique_minted_ids.store(true, Ordering::SeqCst);
+        let backend = Arc::new(connect_recording(rec.clone()).await);
+        let control_id =
+            release_control_session(&backend, "bridge-CLOSE-PARKED-UNMINTED-CONTROL").await;
+        let session = bkey("bridge-CLOSE-PARKED-UNMINTED");
+        // The prompt holds a fresh entry for the key and has minted nothing.
+        let (prompt, resume) = prompt_parked_after_entry_lookup(&backend, &session);
+        assert!(backend.sessions.lock().await.contains_key(&session));
+
+        // Release runs to its end over that entry, which has nothing to close.
+        assert_eq!(
+            backend.release_session_checked(&session).await,
+            Ok(BackendCleanupDispositionV1::Complete)
+        );
+        settle_recording_agent(&backend).await;
+        assert_eq!(*rec.closes.lock().await, vec![control_id]);
+
+        resume.wait();
+        let error = tokio::time::timeout(Duration::from_secs(2), prompt)
+            .await
+            .expect("a prompt that lost its entry to release must settle")
+            .unwrap()
+            .err()
+            .expect("a prompt must not mint for an entry that was released under it");
+        assert_eq!(error, BridgeError::InvalidStateTransition);
+        assert_parked_caller_left_nothing_behind(&backend, &rec, &session, 1).await;
+
+        // The key is free: the next call mints a fresh session for it.
+        backend.ensure_session(&session).await.unwrap();
+        assert_eq!(rec.new_session_calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn prompt_parked_on_a_minted_entry_does_not_remint_after_its_release() {
+        let rec = Recorder::advertising_close("agent-sess-CLOSE-PARKED-MINTED");
+        rec.unique_minted_ids.store(true, Ordering::SeqCst);
+        let backend = Arc::new(connect_recording(rec.clone()).await);
+        let session = bkey("bridge-CLOSE-PARKED-MINTED");
+        let agent_id = backend.ensure_session(&session).await.unwrap();
+        let agent_id = agent_id.0.to_string();
+        // The prompt holds the minted entry and has not yet asked it for its
+        // agent session.
+        let (prompt, resume) = prompt_parked_after_entry_lookup(&backend, &session);
+
+        // Release runs to its end: cancel, removal, and the close.
+        assert_eq!(
+            backend.release_session_checked(&session).await,
+            Ok(BackendCleanupDispositionV1::Complete)
+        );
+        settle_recording_agent(&backend).await;
+        assert_eq!(
+            *rec.teardown_log.lock().await,
+            vec![format!("cancel:{agent_id}"), format!("close:{agent_id}")]
+        );
+
+        resume.wait();
+        assert_refused_as_released(prompt).await;
+        assert_parked_caller_left_nothing_behind(&backend, &rec, &session, 1).await;
+        assert_eq!(
+            *rec.closes.lock().await,
+            vec![agent_id],
+            "the released session is closed exactly once"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_parked_on_an_unminted_entry_does_not_mint_after_its_release() {
+        let rec = Recorder::advertising_close("agent-sess-CLOSE-PARKED-RECONCILE");
+        rec.unique_minted_ids.store(true, Ordering::SeqCst);
+        let backend = Arc::new(connect_recording(rec.clone()).await);
+        let control_id =
+            release_control_session(&backend, "bridge-CLOSE-PARKED-RECONCILE-CONTROL").await;
+        let session = bkey("bridge-CLOSE-PARKED-RECONCILE");
+        // An unminted entry whose single-flight lock the test owns, so that a
+        // reconcile minting through this entry parks before it decides to.
+        let entry = backend.session_entry(&session).await.unwrap();
+        let minting = Arc::clone(&entry.init_lock).lock_owned().await;
+
+        // Reconcile, then release, queue on the session map in that order. The
+        // map is granted first come, first served: reconcile resolves the key
+        // to the entry above, and release unpublishes that entry before
+        // reconcile could get back to the map.
+        let parked = backend.sessions.lock().await;
+        let reconcile = {
+            let backend = Arc::clone(&backend);
+            let session = session.clone();
+            tokio::spawn(async move {
+                backend
+                    .reconcile_config(&session, &SessionSpec::from_config(Default::default()))
+                    .await
+            })
+        };
+        tokio::task::yield_now().await;
+        let release = spawn_release(&backend, &session);
+        tokio::task::yield_now().await;
+        drop(parked);
+        unpublished(&backend, &session).await;
+        assert!(!reconcile.is_finished());
+
+        // Release is waiting for the mint the test poses as. Let both go on.
+        drop(minting);
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), release)
+                .await
+                .expect("release ends once the entry's single-flight lock is free")
+                .unwrap(),
+            Ok(BackendCleanupDispositionV1::Complete)
+        );
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), reconcile)
+                .await
+                .expect("a reconcile that lost its entry to release must settle")
+                .unwrap(),
+            Err(BridgeError::InvalidStateTransition),
+            "a reconcile must not mint for an entry that was released under it"
+        );
+        assert_parked_caller_left_nothing_behind(&backend, &rec, &session, 1).await;
+        assert_eq!(*rec.closes.lock().await, vec![control_id]);
+    }
+
     #[tokio::test]
     async fn close_flight_reports_a_typed_outcome_per_agent_session() {
         // Long enough that an answer always arrives first; short where the
@@ -19691,6 +19927,7 @@ mod tests {
             permission_registry: Arc::new(StdMutex::new(None)),
             perm_timeout_ms: Arc::new(AtomicU64::new(120_000)),
             prompt_snapshot_hook: StdMutex::new(None),
+            prompt_entry_hook: StdMutex::new(None),
             before_process_redactor_hook: StdMutex::new(None),
             fail_deferred_cancel_send: Arc::new(AtomicBool::new(false)),
             fail_cancel_send: Arc::new(AtomicBool::new(false)),
