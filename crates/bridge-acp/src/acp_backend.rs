@@ -2155,6 +2155,12 @@ impl Drop for AbandonedMintGuard {
 type PendingClose =
     Result<(SentRequest<CloseSessionResponse>, tokio::time::Instant), AcpTraceEvent>;
 
+/// How many closes a [`SessionCloser`] sends, or settles, before it yields to
+/// the runtime. An entry's backlog of abandoned ids has no bound of its own,
+/// and the release caller's deadline can only fire between polls of the
+/// flight.
+const CLOSE_BATCH: usize = 32;
+
 /// What sending `session/close` needs from the backend, cloned out of it so
 /// that a close can outlive the release call that asked for it.
 ///
@@ -2176,6 +2182,10 @@ struct SessionCloser {
     /// caller's deadline.
     #[cfg(test)]
     dispatch_delay: Option<Duration>,
+    /// How many closes this closer and its clones have put on the wire, for
+    /// a test to sample while a flight is still dispatching.
+    #[cfg(test)]
+    sent: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl SessionCloser {
@@ -2198,8 +2208,9 @@ impl SessionCloser {
     /// The wait for the turn lock has no bound. Whoever holds that lock is
     /// still acting on the published session and nothing else would ever
     /// close it, so its close stays pending until the lock is free or the
-    /// connection is fenced. The answer to each close is awaited for one
-    /// grace from when that close was sent.
+    /// connection is fenced. The flight takes the lock only to send that
+    /// close and lets it go before it waits on any answer. The answer to
+    /// each close is awaited for one grace from when that close was sent.
     ///
     /// `dispatched` fires once every close the flight owns is on the wire or
     /// has been refused by the fence. Traces one typed outcome per agent
@@ -2246,12 +2257,16 @@ impl SessionCloser {
                 // agent error, so the close goes out only once the lock is
                 // free, however long that takes: giving up would leave the
                 // session open with nobody left to close it.
-                let _turn = if fenced() {
+                let turn = if fenced() {
                     None
                 } else {
                     Some(entry.turn_lock.lock().await)
                 };
                 pending = self.dispatch(vec![agent_id], &mut seen).await;
+                // The lock orders the send alone. It is free again before
+                // the flight signals dispatch or waits on the answer, so a
+                // prompt queued behind it is refused now, not a grace later.
+                drop(turn);
             }
             // Nobody may still be listening; the flight finishes regardless.
             let _ = dispatched.send(());
@@ -2301,13 +2316,21 @@ impl SessionCloser {
     /// Put `session/close` on the wire for each id not yet `seen`, in order.
     /// Every request is checked against the fence on its own, so once the
     /// fence closes the rest come back unsent. Nothing else holds one back.
+    ///
+    /// The runtime gets a turn after every [`CLOSE_BATCH`] ids, so no backlog
+    /// is worked through in one poll and the release caller's deadline fires
+    /// on time on a single-threaded runtime too. Every id is still
+    /// dispatched: yielding delays the rest, it never drops them.
     async fn dispatch(
         &self,
         agent_ids: Vec<AgentSessionId>,
         seen: &mut HashSet<AgentSessionId>,
     ) -> Vec<PendingClose> {
         let mut pending = Vec::with_capacity(agent_ids.len());
-        for agent_id in agent_ids {
+        for (position, agent_id) in agent_ids.into_iter().enumerate() {
+            if position > 0 && position.is_multiple_of(CLOSE_BATCH) {
+                tokio::task::yield_now().await;
+            }
             if !seen.insert(agent_id.clone()) {
                 continue;
             }
@@ -2337,15 +2360,23 @@ impl SessionCloser {
             });
         }
         let sent = self.cx.send_request(CloseSessionRequest::new(agent_id));
+        #[cfg(test)]
+        self.sent.fetch_add(1, Ordering::SeqCst);
         Ok((sent, tokio::time::Instant::now() + self.grace))
     }
 
     /// Wait for the answer to each close that was sent, until that close's
-    /// own deadline, then type and trace every outcome.
+    /// own deadline, then type and trace every outcome. An answer that is
+    /// already in, or a close that was never sent, takes no wait at all, so
+    /// the runtime gets a turn after every [`CLOSE_BATCH`] outcomes here as
+    /// it does in [`Self::dispatch`].
     async fn settle(&self, pending: Vec<PendingClose>) -> Vec<AcpTraceEvent> {
         let owner_key_fingerprint = self.owner_key_fingerprint;
         let mut outcomes = Vec::with_capacity(pending.len());
-        for close in pending {
+        for (position, close) in pending.into_iter().enumerate() {
+            if position > 0 && position.is_multiple_of(CLOSE_BATCH) {
+                tokio::task::yield_now().await;
+            }
             let outcome = match close {
                 Ok((sent, answer_by)) => {
                     match tokio::time::timeout_at(answer_by, sent.block_task()).await {
@@ -6130,6 +6161,8 @@ impl AcpBackend {
             owner_key_fingerprint: AcpTraceEvent::owner_key_fingerprint(session.as_str()),
             #[cfg(test)]
             dispatch_delay: None,
+            #[cfg(test)]
+            sent: Arc::default(),
         })
     }
 
@@ -19070,6 +19103,68 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn prompt_queued_on_a_released_session_is_refused_while_its_close_is_unanswered() {
+        let grace = Duration::from_millis(200);
+        let rec = Recorder::advertising_close("agent-sess-CLOSE-UNANSWERED-QUEUED");
+        rec.unique_minted_ids.store(true, Ordering::SeqCst);
+        // The agent takes the close and keeps its answer back.
+        rec.hang_close.store(true, Ordering::SeqCst);
+        let backend = Arc::new(
+            connect_recording_with(
+                rec.clone(),
+                AcpConfig {
+                    cancel_grace: grace,
+                    ..test_config()
+                },
+            )
+            .await,
+        );
+        let session = bkey("bridge-CLOSE-UNANSWERED-QUEUED");
+        let agent_id = backend.ensure_session(&session).await.unwrap();
+        let agent_id = agent_id.0.to_string();
+        // The prompt has picked the minted session to reuse and is not yet in
+        // line for the turn lock.
+        let (prompt, resume) = prompt_parked_at_record(&backend, &session, 4).await;
+
+        // With the clock paused, time advances only once every task is idle:
+        // a prompt held behind the flight's wait for the answer would be seen
+        // to take the whole grace.
+        tokio::time::pause();
+        let started = tokio::time::Instant::now();
+        assert_eq!(
+            backend.release_session_checked(&session).await,
+            Ok(BackendCleanupDispositionV1::Complete)
+        );
+        settle_recording_agent(&backend).await;
+        assert_eq!(
+            *rec.closes.lock().await,
+            vec![agent_id.clone()],
+            "the close is with the agent, which has not answered it"
+        );
+        resume.notify_one();
+        assert_refused_as_released(prompt).await;
+        let waited = started.elapsed();
+        tokio::time::resume();
+
+        assert!(
+            waited < grace,
+            "the prompt was refused only after {waited:?}; the close flight \
+             holds the turn lock to send its close, not for the {grace:?} it \
+             then waits on the answer"
+        );
+        settle_recording_agent(&backend).await;
+        assert!(
+            rec.prompt_log.lock().await.is_empty(),
+            "no session/prompt may reach a session after its release began"
+        );
+        assert_eq!(
+            *rec.closes.lock().await,
+            vec![agent_id],
+            "the released session is closed exactly once"
+        );
+    }
+
+    #[tokio::test]
     async fn prompt_holding_the_turn_lock_does_not_start_once_release_begins() {
         let rec = Recorder::advertising_close("agent-sess-CLOSE-ADMITTING");
         rec.unique_minted_ids.store(true, Ordering::SeqCst);
@@ -19692,6 +19787,146 @@ mod tests {
             *rec.closes.lock().await,
             vec!["first", "second", "third", "fourth"],
             "the deadline leaves no id unsent, and no id is sent twice"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn close_flight_yields_to_the_runtime_between_batches_of_its_backlog() {
+        let grace = Duration::from_millis(100);
+        // Long enough that every answer arrives first.
+        let answered = Duration::from_secs(5);
+        let rec = Recorder::advertising_close("agent-sess-CLOSE-YIELDING");
+        let backend = connect_recording(rec.clone()).await;
+        let session = bkey("bridge-CLOSE-YIELDING");
+        let entry = backend.session_entry(&session).await.unwrap();
+        // Several batches of failed mints, the first of them reported twice.
+        let backlog: Vec<String> = (0..CLOSE_BATCH * 6)
+            .map(|mint| format!("abandoned-{mint}"))
+            .collect();
+        for abandoned in backlog.iter().chain(backlog.first()) {
+            entry.abandon_minted(AgentSessionId::new(abandoned.clone()));
+        }
+
+        // This runtime has one thread and nothing delays a request, so the
+        // flight's own yields are all that lets another task run before the
+        // backlog is through. The clock is paused: only the witness moves it.
+        tokio::time::pause();
+        let (entry, closer) = unpublish_for_close(&backend, &session, answered, None).await;
+        let sent = Arc::clone(&closer.sent);
+        // Another task on the flight's runtime. It reports how much of the
+        // backlog was on the wire when it first ran with the flight under
+        // way, and at that point takes the clock past the caller's deadline,
+        // by the millisecond that timers resolve to.
+        let witness = tokio::spawn({
+            let sent = Arc::clone(&sent);
+            async move {
+                loop {
+                    let sent = sent.load(Ordering::SeqCst);
+                    if sent > 0 {
+                        tokio::time::advance(grace + Duration::from_millis(1)).await;
+                        return sent;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            }
+        });
+        let started = tokio::time::Instant::now();
+        let flight = closer.fly_released(entry, started + grace).await;
+        let waited = started.elapsed();
+        let sent_on_return = sent.load(Ordering::SeqCst);
+        let flying_on_return = !flight.is_finished();
+
+        let witnessed = witness.await.unwrap();
+        assert!(
+            (1..backlog.len()).contains(&witnessed),
+            "another task first ran with {witnessed} of {} closes sent; the \
+             flight must yield to the runtime between batches of its backlog",
+            backlog.len()
+        );
+        assert!(
+            (grace..grace * 2).contains(&waited),
+            "release waited {waited:?} on dispatch; the {grace:?} cancel grace \
+             bounds its wait however long the backlog is"
+        );
+        assert!(
+            flying_on_return && sent_on_return < backlog.len(),
+            "the flight works through the rest of the backlog on its own; \
+             {sent_on_return} of {} closes were sent when release returned",
+            backlog.len()
+        );
+        let outcomes = tokio::time::timeout(Duration::from_secs(5), flight)
+            .await
+            .expect("a close flight must end once it is through its backlog")
+            .unwrap();
+        tokio::time::resume();
+
+        let acknowledged = AcpTraceEvent::SessionCloseAcknowledged {
+            owner_key_fingerprint: CLOSE_FINGERPRINT,
+        };
+        assert_eq!(
+            outcomes,
+            vec![acknowledged; backlog.len()],
+            "one outcome per distinct agent session"
+        );
+        settle_recording_agent(&backend).await;
+        assert_eq!(
+            *rec.closes.lock().await,
+            backlog,
+            "yielding leaves no id unsent, and no id is sent twice"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn close_flight_yields_to_the_runtime_between_batches_of_its_outcomes() {
+        let rec = Recorder::advertising_close("agent-sess-CLOSE-SETTLING-BACKLOG");
+        let backend = connect_recording(rec.clone()).await;
+        let session = bkey("bridge-CLOSE-SETTLING-BACKLOG");
+        let entry = backend.session_entry(&session).await.unwrap();
+        let backlog = CLOSE_BATCH * 6;
+        for mint in 0..backlog {
+            entry.abandon_minted(AgentSessionId::new(format!("abandoned-{mint}")));
+        }
+        // On a fenced connection every close comes back unsent. No outcome
+        // has an answer to wait for, so the flight's own yields are all that
+        // comes between one and the next.
+        backend.retire().await.unwrap();
+
+        let (entry, closer) =
+            unpublish_for_close(&backend, &session, DEFAULT_CANCEL_GRACE, None).await;
+        let (dispatched, mut dispatch_settled) = oneshot::channel();
+        let deadline = tokio::time::Instant::now() + DEFAULT_CANCEL_GRACE;
+        let flight = tokio::spawn(closer.close_released(entry, deadline, dispatched));
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while dispatch_settled.try_recv().is_err() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("a fenced flight has nothing to wait for before it signals dispatch");
+        assert!(
+            !flight.is_finished(),
+            "the flight must signal dispatch, which lets the release caller \
+             go, without first settling its whole backlog in one poll"
+        );
+
+        let outcomes = tokio::time::timeout(Duration::from_secs(5), flight)
+            .await
+            .expect("a close flight must end once it is through its backlog")
+            .unwrap();
+        let unsent = AcpTraceEvent::SessionCloseAbandoned {
+            owner_key_fingerprint: CLOSE_FINGERPRINT,
+            sent: false,
+            connection_unavailable: true,
+        };
+        assert_eq!(
+            outcomes,
+            vec![unsent; backlog],
+            "one outcome per distinct agent session"
+        );
+        settle_recording_agent(&backend).await;
+        assert!(
+            rec.closes.lock().await.is_empty(),
+            "nothing is sent on a fenced connection"
         );
     }
 
