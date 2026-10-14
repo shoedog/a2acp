@@ -184,6 +184,7 @@ mod tests {
             session_cwd: None,
             sandbox,
             watchdog: None,
+            liveness: None,
             auth_method: None,
             pre_authenticated: false,
             host_fallback_eligible: false,

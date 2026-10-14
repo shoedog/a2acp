@@ -1050,6 +1050,7 @@ impl AgentRegistry for Registry {
                     && c.session_cwd == e.session_cwd
                     && c.api_key_env == e.api_key_env
                     && c.watchdog == e.watchdog
+                    && c.liveness == e.liveness
                     && c.mcp == e.mcp
                     && c.mcp_delivery == e.mcp_delivery
                     && c.rename_new_sessions == e.rename_new_sessions
@@ -1227,6 +1228,7 @@ mod tests {
             session_cwd: None,
             sandbox: None,
             watchdog: None,
+            liveness: None,
             auth_method: None,
             pre_authenticated: false,
             host_fallback_eligible: false,
@@ -1322,6 +1324,7 @@ mod tests {
                 session_cwd: None,
                 sandbox: None,
                 watchdog: None,
+                liveness: None,
                 auth_method: None,
                 pre_authenticated: false,
                 host_fallback_eligible: false,
@@ -2217,6 +2220,14 @@ mod tests {
             hard_wall_clock: Duration::from_secs(300),
         });
         assert_spawn_frozen_edit_replaces_slot("watchdog", base.clone(), with_watchdog).await;
+
+        // `[agents.liveness]` is read into the backend's config at spawn, like the watchdog.
+        let mut with_liveness = base.clone();
+        with_liveness.liveness = Some(bridge_core::domain::AgentLivenessConfig {
+            silence_cutoff: Some(bridge_core::turn_liveness::LivenessOverrideV1::Off),
+            work_cutoff: None,
+        });
+        assert_spawn_frozen_edit_replaces_slot("liveness", base.clone(), with_liveness).await;
 
         let mcp = McpServerSpec {
             name: "repo-nav".into(),

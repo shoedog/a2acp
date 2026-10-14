@@ -37,6 +37,7 @@ pub fn single_agent_registry(id: &str, backend: Arc<dyn AgentBackend>) -> Arc<dy
         session_cwd: None,
         sandbox: None,
         watchdog: None,
+        liveness: None,
         auth_method: None,
         pre_authenticated: false,
         host_fallback_eligible: false,

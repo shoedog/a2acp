@@ -297,6 +297,7 @@ fn provider_entry() -> AgentEntry {
         session_cwd: None,
         sandbox: None,
         watchdog: None,
+        liveness: None,
         mcp: vec![McpServerSpec {
             name: "prism".into(),
             command: "/opt/prism".into(),
@@ -637,6 +638,102 @@ fn rename_new_sessions_joins_the_effect_digest_only_when_it_is_on() {
         assert_eq!(
             off.frozen.effect.mcp_delivery_digest,
             on.frozen.effect.mcp_delivery_digest
+        );
+    }
+}
+
+/// I1 test 13. `[agents.liveness]` bounds every turn the provider serves, so it is part of the
+/// frozen provider-effect identity, encoded only when the entry sets it: an entry without it
+/// keeps exactly the digest it had before the field existed. The literals are the same
+/// pre-field digests `rename_new_sessions_joins_the_effect_digest_only_when_it_is_on` pins.
+#[test]
+fn agent_liveness_joins_the_effect_digest_only_when_it_is_set() {
+    use bridge_core::domain::AgentLivenessConfig;
+    use bridge_core::turn_liveness::LivenessOverrideV1;
+
+    let mut keyed_entry = provider_entry();
+    keyed_entry.cmd = Some("codex-acp".into());
+    let mut plain_entry = keyed_entry.clone();
+    plain_entry.mcp.clear();
+    let key = ProviderEffectKeyV1::from_bytes([9_u8; 32]);
+    let worktree =
+        freeze_worktree_checkout_v1(&checkout_input(FrozenProviderLogicalSessionV1::Execute {
+            candidate_ordinal: 0,
+        }))
+        .unwrap();
+    let direct = freeze_direct_checkout_v1(SessionCwd::parse("/repo").unwrap());
+    let configs = [
+        AgentLivenessConfig::default(),
+        AgentLivenessConfig {
+            silence_cutoff: Some(LivenessOverrideV1::Off),
+            work_cutoff: None,
+        },
+        AgentLivenessConfig {
+            silence_cutoff: None,
+            work_cutoff: Some(LivenessOverrideV1::Off),
+        },
+        AgentLivenessConfig {
+            silence_cutoff: Some(LivenessOverrideV1::Ms(600_000)),
+            work_cutoff: None,
+        },
+        AgentLivenessConfig {
+            silence_cutoff: Some(LivenessOverrideV1::Ms(600_001)),
+            work_cutoff: None,
+        },
+        AgentLivenessConfig {
+            silence_cutoff: None,
+            work_cutoff: Some(LivenessOverrideV1::Ms(600_000)),
+        },
+    ];
+
+    for (entry, checkout, key, digest_before_the_field) in [
+        (
+            &plain_entry,
+            direct,
+            None,
+            "804620bd39ceb58b6f5d329a36ed91a8aab7a033055bc7c505ebb7ceada0529f",
+        ),
+        (
+            &keyed_entry,
+            worktree,
+            Some(&key),
+            "acb2872723823babf3e46163e184e750d141586e09678b4d1fef111ccfe77f2f",
+        ),
+    ] {
+        assert!(entry.liveness.is_none());
+        let unset =
+            freeze_provider_attempt_v1(&provider_freeze_input(entry, checkout.clone(), key))
+                .unwrap();
+        assert_eq!(
+            unset.frozen.effect.effect_digest.as_str(),
+            digest_before_the_field
+        );
+
+        let mut digests = vec![unset.frozen.effect.effect_digest.clone()];
+        for config in configs {
+            let mut configured = entry.clone();
+            configured.liveness = Some(config);
+            let set = freeze_provider_attempt_v1(&provider_freeze_input(
+                &configured,
+                checkout.clone(),
+                key,
+            ))
+            .unwrap();
+            // Nothing else of the identity moves with the table.
+            assert_eq!(unset.selection, set.selection);
+            assert_eq!(unset.frozen.checkout, set.frozen.checkout);
+            assert_eq!(
+                unset.frozen.effect.mcp_delivery_digest,
+                set.frozen.effect.mcp_delivery_digest
+            );
+            digests.push(set.frozen.effect.effect_digest);
+        }
+        let distinct: std::collections::BTreeSet<_> =
+            digests.iter().map(|digest| digest.as_str()).collect();
+        assert_eq!(
+            distinct.len(),
+            digests.len(),
+            "every set liveness value has its own digest"
         );
     }
 }

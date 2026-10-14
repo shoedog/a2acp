@@ -799,6 +799,7 @@ mod tests {
             requested_mode: bridge_core::attestation::HarvestSanitizationMode::Off,
             prefix_attestation_request:
                 bridge_core::attestation::PrefixAttestationRequest::Disabled,
+            liveness: bridge_core::turn_liveness::TurnLivenessRequestV1::default(),
         };
 
         assert!(

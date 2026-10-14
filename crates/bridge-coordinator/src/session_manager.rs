@@ -2767,6 +2767,7 @@ mod tests {
             session_cwd: None,
             sandbox: None,
             watchdog: None,
+            liveness: None,
             mcp: vec![],
             mcp_delivery: Default::default(),
             auth_method: None,

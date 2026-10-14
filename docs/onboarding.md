@@ -203,6 +203,40 @@ before selecting a concrete `:free` model. Local Ollama is configuration-defined
 available. Follow the [official OpenCode provider guide](https://opencode.ai/docs/providers/) for its required
 `provider.ollama` block and verify the exact ID with `opencode models ollama`.
 
+### Turn liveness: `[agents.liveness]`
+
+Every ACP turn outside a workflow runs under two bounds:
+
+- **Silence cutoff, default 30 minutes.** The turn ends with `acp.prompt.silence_cutoff` when the agent
+  shows no activity for that long while no tool call is open and no permission request is pending.
+  Activity is any `session/update` (message, thought chunk even with empty text, plan, tool call or
+  update, any other variant) except a usage update whose totals and cost repeat the previous one's,
+  plus the arrival or the resolution of a permission request. A tool call whose status is `pending` or
+  `in_progress`, or a pending permission request, pauses the clock until it closes, so a long
+  `cargo test` never trips it.
+- **Turn work cutoff, default 2 hours.** The turn ends with `acp.prompt.work_cutoff` after that long,
+  whatever is open: it is the backstop for a hung tool.
+
+```toml
+[[agents]]
+id = "codex"
+cmd = "codex-acp"
+
+[agents.liveness]
+silence_cutoff_secs = 2700   # 45 minutes
+work_cutoff_secs = 0         # off
+```
+
+Values are whole seconds, at most 2592000 (30 days); `0` turns that bound off and an absent field keeps
+the default. Both endings are fatal `Timeout` failures that are never retried: the bridge sends
+`session/cancel`, waits `cancel_grace`, then terminates the agent process, so the
+[watchdog's blast radius](containerized-agents.md#e9-watchdog-agentswatchdog--blast-radius-on-shared-backends)
+applies to a shared process-backed agent too. The table is part of the agent's frozen provider-effect
+identity, automatic workflow admission accepts it (unlike `[agents.watchdog]`), and `container_rw` agents
+apply it inside the container. Workflow node turns, preflight included, currently carry neither bound;
+the workflow's own deadlines remain their limit. `[agents.watchdog]` keeps working unchanged alongside;
+bounds due at the same instant are reported as watchdog, then work cutoff, then silence.
+
 ### Workflow preflight and fallback models
 
 `preflight = true` is optional and defaults off. When enabled on an agent entry, each workflow run sends one fixed smoke prompt before that agent's first real node turn: `Reply with exactly PONG and nothing else.` The bridge may try the next configured `fallback_models` entry only after resolution/configuration fails before prompt dispatch, or after prompt-open returns typed proof that the prompt was not accepted. Once prompt-open succeeds, an empty, non-`PONG`, cancelled, broken-stream, or cleanup-failed result is sticky for the run and is never replayed. The first model that replies exactly `PONG` is used for real workflow turns for that agent in the run; effort, mode, cwd, auth, sandbox, and MCP settings are otherwise unchanged.

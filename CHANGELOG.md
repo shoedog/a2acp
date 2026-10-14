@@ -9,6 +9,31 @@ release (see [`docs/adr/`](docs/adr/) for the full architectural record).
 
 ### Changed
 
+- ACP turns outside a workflow are now bounded by default (#47). Served unary turns (`message/send`,
+  and so `submit`), served session turns and `implement` turns end after 30 minutes without activity
+  while no tool call is open and no permission request is pending (`acp.prompt.silence_cutoff`), and
+  after 2 hours whatever is open (`acp.prompt.work_cutoff`). Before, a served turn whose agent went
+  silent had no bound at all. Activity is any ACP `session/update`, empty thought chunks included,
+  except a usage update that repeats the previous one's totals and cost, plus the arrival or the
+  resolution of a permission request. A tool call that is `pending` or `in_progress`, or a pending
+  permission request, pauses the silence clock, so a long `cargo test` never trips it; the clock
+  restarts when the last one closes. Both endings are fatal `Timeout` failures that may follow an
+  accepted prompt and are never retried; the bridge sends `session/cancel`. When the agent ignores
+  it past `cancel_grace`, the turn still fails and its connection takes no new prompt, but the
+  shared agent process is terminated only once no other session's turn is running on it, so one
+  hung session does not cut the others short (the `[agents.watchdog]` still terminates at once).
+  A diagnostic journal stalled on recording the start of the turn's stream does not hold a bounded
+  turn open either: once the turn's cancellation has settled, it waits at most 5 s more for those
+  records, then reports its failure and frees its session. The records, and the failure's own
+  record after them, are finished in the background for up to 5 minutes, and how that ends is
+  traced. A turn the agent had already finished then fails with `acp.prompt.start_records_pending`
+  (`Persistence`) rather than completing, as when those records fail. No client marks a turn as
+  watched yet, so every such turn gets the 2-hour work cutoff. Workflow
+  node turns, preflight included, are unchanged: they carry neither bound and keep the workflow's
+  own deadlines. The legacy `[agents.watchdog]` keeps its semantics and its
+  `acp.prompt.watchdog_timeout` code and runs alongside; when bounds fall due at the same instant
+  the watchdog is reported first, then the work cutoff, then silence.
+
 - Reader and toolchain images pin codex-acp 2.2.2 with Codex 0.162.1 (was 1.13.1 / 0.157.1) and
   claude-agent-acp 0.90.0 with Agent SDK 0.3.296 / Claude Code 2.1.296 (was 0.81.2 / 0.3.280 /
   2.1.280). codex-acp 2.2.2 advertises `gpt-6.1-sol`. Host and reader fixed-`PONG` lanes passed for
@@ -16,6 +41,13 @@ release (see [`docs/adr/`](docs/adr/) for the full architectural record).
 
 ### Added
 
+- `[agents.liveness]` sets an agent's turn bounds: `silence_cutoff_secs` and `work_cutoff_secs`, whole
+  seconds up to 30 days, `0` for off, an absent field keeping the built-in 30-minute and 2-hour
+  defaults. One parser checks every liveness duration, refusing anything over 30 days. The table is
+  part of the frozen provider-effect identity only when it is set, so entries without it keep the
+  identity they already had. Automatic workflow admission accepts it (it still refuses
+  `[agents.watchdog]`), and `container_rw` agents forward it to the inner backend that serves their
+  turns.
 - `[[agents]]` entries for `codex-acp` can set `rename_new_sessions = true` (default `false`) to stop
   the adapter's title-generation thread. After a new session's first turn the adapter starts a second
   codex thread, spends one model turn on it to generate a title, and never unsubscribes it; the bridge
@@ -83,6 +115,14 @@ release (see [`docs/adr/`](docs/adr/) for the full architectural record).
   only as a typed trace event, and release's result is unchanged. Measured against codex-acp 1.13.1
   and 2.1.1, a session's MCP server exits about 60 s after its own `session/close` while other
   sessions on the same adapter stay open.
+- A turn whose agent process the bridge terminates, because the agent ignored the `session/cancel`
+  of an `[agents.watchdog]` bound or a silence or work cutoff past `cancel_grace`, now ends with
+  that failure (`acp.prompt.watchdog_timeout`, `acp.prompt.silence_cutoff` or
+  `acp.prompt.work_cutoff`) and a terminal event. The turn's check of the agent process after the
+  termination panicked on the child the termination had already taken, so the client's stream
+  ended with neither, and the coordinator's check after the turn could panic the same way. Both now
+  record the process's liveness as `unknown`: they saw no exit status, and the termination may
+  still be reaping the child.
 - A served unary `message/send` turn now records turn metrics like a streaming one (#47): one
   turn-started event, then exactly one turn-finished (`success`, `failed`, or `canceled` for an
   abort or a caller that disconnects mid-turn) and one final-usage event with the turn's last usage

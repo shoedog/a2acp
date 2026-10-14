@@ -86,6 +86,7 @@ pub mod task_spec;
 pub mod task_store;
 pub mod terminal_evidence;
 pub mod translator;
+pub mod turn_liveness;
 pub mod workflow_history;
 
 pub use profile::{rust_profile, CacheBinding, CacheCtx, LanguageProfile};

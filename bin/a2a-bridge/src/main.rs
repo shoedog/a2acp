@@ -818,6 +818,7 @@ fn acp_spawn_inputs_with_cwd_binding(
         rename_new_sessions: entry.rename_new_sessions,
         container,
         watchdog: entry.watchdog.clone(),
+        liveness: entry.liveness,
         diagnostic_redactor,
         child_env_remove,
         prefix_attestation_transport: acp_prefix_attestation_transport(entry),
@@ -1161,6 +1162,7 @@ fn container_rw_cfg_from_entry(
         pre_authenticated: entry.pre_authenticated,
         rename_new_sessions: entry.rename_new_sessions,
         watchdog: entry.watchdog.clone(),
+        liveness: entry.liveness,
         handshake_timeout: bridge_acp::acp_backend::AcpConfig::default().handshake_timeout,
         cancel_grace: bridge_acp::acp_backend::AcpConfig::default().cancel_grace,
         resource_flight_attempt_v3: None,
@@ -2750,6 +2752,7 @@ impl ImplementAttemptTelemetry {
                 requested_mode: bridge_core::attestation::HarvestSanitizationMode::Off,
                 prefix_attestation_request:
                     bridge_core::attestation::PrefixAttestationRequest::Disabled,
+                liveness: bridge_core::turn_liveness::TurnLivenessRequestV1::default(),
             }),
         })
     }
@@ -12700,6 +12703,7 @@ inputs = []
             session_cwd: None,
             sandbox: None,
             watchdog: None,
+            liveness: None,
             mcp: vec![],
             mcp_delivery: Default::default(),
             auth_method: None,

@@ -669,6 +669,7 @@ mod slice4b_tests {
                 idle_timeout: std::time::Duration::from_secs(30),
                 hard_wall_clock: std::time::Duration::from_secs(60),
             }),
+            liveness: None,
             mcp: vec![],
             mcp_delivery: Default::default(),
             auth_method: None,

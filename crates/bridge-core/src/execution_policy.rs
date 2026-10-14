@@ -2492,6 +2492,20 @@ fn encode_checkout(target: &mut Vec<u8>, checkout: &FrozenCheckoutEffectV1) {
     }
 }
 
+fn encode_liveness_override(
+    target: &mut Vec<u8>,
+    value: Option<crate::turn_liveness::LivenessOverrideV1>,
+) {
+    match value {
+        None => target.push(0),
+        Some(crate::turn_liveness::LivenessOverrideV1::Off) => target.push(1),
+        Some(crate::turn_liveness::LivenessOverrideV1::Ms(ms)) => {
+            target.push(2);
+            target.extend_from_slice(&ms.to_be_bytes());
+        }
+    }
+}
+
 fn freeze_effect(
     entry: &AgentEntry,
     checkout: &FrozenCheckoutEffectV1,
@@ -2517,6 +2531,7 @@ fn freeze_effect(
         session_cwd,
         sandbox,
         watchdog,
+        liveness,
         mcp: _,
         mcp_delivery,
         auth_method,
@@ -2571,6 +2586,14 @@ fn freeze_effect(
     // already persisted stay valid.
     if *rename_new_sessions {
         push_bytes(&mut canonical, b"rename_new_sessions");
+    }
+    // `[agents.liveness]` bounds every turn the provider serves. Like `rename_new_sessions`, it is
+    // a trailing field encoded only when the entry sets it, so entries without it keep their
+    // digests.
+    if let Some(liveness) = liveness {
+        push_bytes(&mut canonical, b"liveness");
+        encode_liveness_override(&mut canonical, liveness.silence_cutoff);
+        encode_liveness_override(&mut canonical, liveness.work_cutoff);
     }
     let effect_digest = secret_silent_digest(
         key,
@@ -3256,6 +3279,7 @@ mod r2f1b_contract_tests {
             session_cwd: None,
             sandbox: None,
             watchdog: None,
+            liveness: None,
             mcp: vec![],
             mcp_delivery: crate::mcp::McpDelivery::Acp,
             auth_method: None,

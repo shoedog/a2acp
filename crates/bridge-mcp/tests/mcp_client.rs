@@ -347,6 +347,7 @@ fn agent_entry() -> AgentEntry {
         session_cwd: None,
         sandbox: None,
         watchdog: None,
+        liveness: None,
         mcp: Vec::new(),
         mcp_delivery: Default::default(),
         auth_method: None,
