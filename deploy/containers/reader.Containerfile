@@ -8,7 +8,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       git ripgrep ca-certificates curl unzip \
     && rm -rf /var/lib/apt/lists/*
 
-# Pin the ACP agent CLIs (portable Node packages; provider-free ACP compatibility verified 2026-09-03).
+# Pin the ACP agent CLIs (portable Node packages; candidate evidence for these pins: docs/compatibility.md,
+# provider refresh 2026-10-13).
 # claude-agent-acp pulls @anthropic-ai/claude-agent-sdk, whose optional dep is the platform `claude`
 # binary — the LINUX build resolves here, not the host's macOS one.
 RUN npm install -g \
