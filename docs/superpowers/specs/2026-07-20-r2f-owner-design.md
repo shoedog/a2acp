@@ -99,6 +99,9 @@ The design is constrained by these verified production seams:
 
 1. No workflow mode is unbounded. Queue admission, execution, node work, retry/backoff, cancellation, cleanup, and
    artifact finalization have explicit finite ownership.
+   **Amended 2026-10-14 (owner):** a *watched* run (an interactive CLI client printing the liveness heartbeat) has
+   no absolute work cutoff unless it opts in; its node work is bounded by the activity silence cutoff and by the
+   client. Unwatched runs keep the absolute cutoff. See `2026-10-14-activity-liveness-design.md` §3.
 2. Silence, elapsed time, process existence, CPU use, and file modification time are evidence, not proof of a
    wedge. A quiet live child may be healthy model reasoning or a silent test.
 3. Under `bounded_independent`, a failed fan-out leg does not shorten or reset a sibling's frozen clocks.
@@ -198,6 +201,9 @@ Crossing a stagnation threshold snapshots evidence. Before the absolute deadline
 permitted only for a mechanically proved orphan or another deterministic impossible-to-complete ownership state.
 `quiet_live_child` and `stagnant_suspected` remain visible and may be taken over manually, but are not killed merely
 for silence. The absolute deadline always bounds them eventually.
+**Amended 2026-10-14 (owner):** turns are now cancelled after 30 minutes without ACP activity while no tool call or
+permission is open, and the absolute deadline is opt-in for watched runs. See
+`2026-10-14-activity-liveness-design.md` §3.
 
 ### D3 — workflow budget construction
 
