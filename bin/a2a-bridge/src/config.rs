@@ -3833,6 +3833,56 @@ addr="127.0.0.1:8080"
     }
 
     #[test]
+    fn tracked_example_write_agents_keep_loopback_off_the_egress_proxy() {
+        // A `:rw` implementor runs the project's tests in its own container. Without NO_PROXY for
+        // loopback, tests that talk to a local mock server go through the egress proxy and fail.
+        for (name, raw) in [
+            (
+                "containerized",
+                include_str!("../../../examples/a2a-bridge.containerized.toml"),
+            ),
+            (
+                "containerized.podman",
+                include_str!("../../../examples/a2a-bridge.containerized.podman.toml"),
+            ),
+            (
+                "r2f1b-impl",
+                include_str!("../../../examples/a2a-bridge.r2f1b-impl.toml"),
+            ),
+            (
+                "slicing-implement",
+                include_str!("../../../examples/a2a-bridge.slicing-implement.toml"),
+            ),
+            (
+                "tiers",
+                include_str!("../../../examples/a2a-bridge.tiers.toml"),
+            ),
+        ] {
+            let config = RegistryConfig::parse(raw).unwrap();
+            let mut write_agents = 0;
+            for agent in &config.agents {
+                let Some(sandbox) = agent.sandbox.as_ref() else {
+                    continue;
+                };
+                if sandbox.access != "rw" || sandbox.egress != "locked" {
+                    continue;
+                }
+                write_agents += 1;
+                let no_proxy = sandbox.no_proxy.as_deref().unwrap_or_default();
+                let hosts: Vec<&str> = no_proxy.split(',').map(str::trim).collect();
+                for host in ["localhost", "127.0.0.1", "::1"] {
+                    assert!(
+                        hosts.contains(&host),
+                        "{name}: agent {:?} no_proxy {no_proxy:?} lacks {host}",
+                        agent.id
+                    );
+                }
+            }
+            assert!(write_agents > 0, "{name}: no locked `:rw` agent to check");
+        }
+    }
+
+    #[test]
     fn tracked_example_language_verify_commands_round_trip() {
         // Pin the FULL (name, cmd, gate) per config — not just names — so a changed test flag, a dropped
         // `--exclude`/`--skip`, or clippy re-added to slicing is caught (gpt-5.5 review MINOR).

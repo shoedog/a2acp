@@ -2,15 +2,15 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 const REQUIRED_READER_PINS: &[&str] = &[
-    "@agentclientprotocol/codex-acp@1.13.1",
-    "@openai/codex@0.157.1",
-    "@agentclientprotocol/claude-agent-acp@0.81.2",
-    "@anthropic-ai/claude-agent-sdk@0.3.280",
-    "claudeCodeVersion\")\" = \"2.1.280\"",
-    "io.a2a-bridge.provenance.codex.adapter=\"@agentclientprotocol/codex-acp=1.13.1\"",
-    "io.a2a-bridge.provenance.codex.agent-cli=\"@openai/codex=0.157.1\"",
-    "io.a2a-bridge.provenance.claude.adapter=\"@agentclientprotocol/claude-agent-acp=0.81.2\"",
-    "io.a2a-bridge.provenance.claude.agent-cli=\"@anthropic-ai/claude-agent-sdk=0.3.280\"",
+    "@agentclientprotocol/codex-acp@2.2.2",
+    "@openai/codex@0.162.1",
+    "@agentclientprotocol/claude-agent-acp@0.90.0",
+    "@anthropic-ai/claude-agent-sdk@0.3.296",
+    "claudeCodeVersion\")\" = \"2.1.296\"",
+    "io.a2a-bridge.provenance.codex.adapter=\"@agentclientprotocol/codex-acp=2.2.2\"",
+    "io.a2a-bridge.provenance.codex.agent-cli=\"@openai/codex=0.162.1\"",
+    "io.a2a-bridge.provenance.claude.adapter=\"@agentclientprotocol/claude-agent-acp=0.90.0\"",
+    "io.a2a-bridge.provenance.claude.agent-cli=\"@anthropic-ai/claude-agent-sdk=0.3.296\"",
     "io.a2a-bridge.provenance.kiro.agent-cli=\"kiro-cli=2.24.1\"",
     "ARG KIRO_CLI_VERSION=2.24.1",
     "ARG KIRO_CLI_AMD64_SHA256=0187d8f613b4ad6b63f7fe069a187c33c79664ee9874ec5848faa7dc8c001ef9",
@@ -115,10 +115,10 @@ fn reader_pin_guard_rejects_floating_or_mismatched_nested_versions() {
     let valid = REQUIRED_READER_PINS.join("\n");
     assert!(validate_reader_pins(&valid).is_ok());
 
-    let floating_codex = valid.replace("@openai/codex@0.157.1", "@openai/codex@latest");
+    let floating_codex = valid.replace("@openai/codex@0.162.1", "@openai/codex@latest");
     assert!(validate_reader_pins(&floating_codex).is_err());
 
-    let mismatched_claude = valid.replace("2.1.280", "2.1.283");
+    let mismatched_claude = valid.replace("2.1.296", "2.1.299");
     assert!(validate_reader_pins(&mismatched_claude).is_err());
 
     let mutable_kiro = format!("{valid}\nhttps://example.invalid/latest/kirocli.zip");

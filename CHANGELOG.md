@@ -7,6 +7,13 @@ release (see [`docs/adr/`](docs/adr/) for the full architectural record).
 
 ## [Unreleased]
 
+### Changed
+
+- Reader and toolchain images pin codex-acp 2.2.2 with Codex 0.162.1 (was 1.13.1 / 0.157.1) and
+  claude-agent-acp 0.90.0 with Agent SDK 0.3.296 / Claude Code 2.1.296 (was 0.81.2 / 0.3.280 /
+  2.1.280). codex-acp 2.2.2 advertises `gpt-6.1-sol`. Host and reader fixed-`PONG` lanes passed for
+  both adapters; see `docs/compatibility.md`.
+
 ### Added
 
 - `[[agents]]` entries for `codex-acp` can set `rename_new_sessions = true` (default `false`) to stop
@@ -33,6 +40,18 @@ release (see [`docs/adr/`](docs/adr/) for the full architectural record).
 
 ### Fixed
 
+- `serve` startup now re-probes, once, every agent whose model-catalog probe failed, after a fixed
+  3 s delay and with the same 20 s per-agent bound, still before the listener binds. An agent that
+  recovers is on the first Agent Card; one that fails again stays omitted until `SIGHUP`, as before.
+  Agents that succeeded are not probed again, a startup with no failures adds no delay, and nothing
+  runs in the background. Startup can take up to one retry delay plus one probe timeout longer when
+  an agent fails. Each failed probe now logs one WARN event naming the agent, probe strategy, phase,
+  failure category (for example `timeout` or `process_exit`), attempt, and the bounded, redacted
+  deepest cause; a recovery logs one INFO event. With `RUST_LOG` unset, `serve` now defaults to WARN
+  instead of ERROR so these events appear without configuration; an explicit `RUST_LOG` still wins,
+  and every other subcommand keeps its ERROR default. A `kiro-cli chat --list-models` probe child
+  that is still running when its probe times out is now killed instead of outliving the probe.
+  Previously a restart could leave kiro off the first card with no record of why.
 - `serve` and `mcp` now retire an agent's shared adapter process once no registry lease has used it
   for `[server] adapter_idle_ttl_secs` (default `300`; `0` disables). Warm-session expiry
   (`warm_idle_ttl_secs`) only cancelled and released the bridge-side handle, so the single adapter

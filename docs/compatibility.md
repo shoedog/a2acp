@@ -65,7 +65,47 @@ Accepted limits:
   the adapter is already misbehaving.
 
 This records adapter behaviour, not a bridge lane. The bridge side is covered by in-process tests against a
-fake adapter; no fixed-`PONG` smoke has been run with the option on, so that combination is **UNKNOWN**.
+fake adapter. With the option on, one served fixed-`PONG` turn passed on codex-acp 1.13.1 (2026-10-13, operator
+serve; one `prism-mcp` instead of two, freed about 60 s after release), and the codex host lane of the
+2026-10-13 provider refresh below passed on codex-acp 2.2.2 with the option on.
+
+## Provider refresh — 2026-10-13 (codex-acp 2.2.2, claude-agent-acp 0.90.0)
+
+Motive: codex-acp 1.13.1 does not advertise `gpt-6.1-sol` (2.2.2 does), and both adapters were several releases
+behind. The refresh followed [`provider-refresh-runbook.md`](provider-refresh-runbook.md) with a candidate release
+binary (`a2a-bridge` 0.3.1, SHA-256 `a7da5f492f18022cb9ba25e9d97e13b343989e96c126ea7f366b486e751d5733`, kept at
+`~/.a2a-dispatch/provider-refresh-20261013/a2a-bridge-candidate`) built with `cargo build --release --locked` from
+`main` `173ab62b503747517fe06202fe473001e13836bf` plus this change's then-uncommitted edits to
+`reader.Containerfile` and `tests/reader_dependency_pins.rs`, neither of which is compiled into the binary. The
+smoke artifacts record the package version, not a commit. Exact-version candidates were installed in a private host
+prefix, and reader image `sha256:85f2575d5f23a673f989af1fbcdf069e1be2cb4b34074745b214dbd5607cf498` (toolchain
+`sha256:082205eef63fa7af72423ff318502ed5414c5ca884b3f62c2043650a342ff35d`, built `FROM` that reader; the reader
+ID was unchanged after the toolchain build). Both images are linux/arm64.
+
+Candidate components, verified from the installed package manifests and the image labels:
+
+- Codex ACP 2.2.2, with nested `@openai/codex` pinned to 0.162.1 (the adapter declares `^0.160.1`);
+- Claude ACP 0.90.0, with its declared Agent SDK 0.3.296 (bundled Claude Code 2.1.296);
+- Kiro CLI 2.24.1 and OpenCode are unchanged.
+
+Provider-free gates: `validate` ok; host `doctor` 29 ok / 2 known warnings (Kiro and OpenCode provenance) / 0 fail;
+reader `doctor` 14/14 (codex) and 15/15 (Claude) ok; `models` lists 40 codex entries including `gpt-6.1-sol`
+and 11 Claude entries including `opus` and `claude-opus-5`.
+
+Every lane ran exactly one fixed `PONG` prompt (`--timeout-secs 120`, `--acknowledge-billable`, no
+`--include-redacted-stderr`, session cwd `/Users/wesleyjinks/code/a2a-bridge`), with no retry. Each artifact records
+`success: true`, terminal state `completed`, one prompt call, `exact_pong: true`, stop reason `end_turn` and
+`timed_out: false`:
+
+| Lane | Model / effort | Status | Evidence |
+|---|---|---|---|
+| Codex host (ACP 2.2.2 / Codex 0.162.1, `rename_new_sessions = true`) | `gpt-6.1-sol` / `xhigh` / `read-only` | **PASS** | `attempt-9d7b3198…`; 8.1 s; 35,965 tokens; auth `pre_authenticated`; effective request `gpt-6.1-sol`. |
+| Claude host (ACP 0.90.0) | `opus` / `low` | **PASS** | `attempt-374cfd64…`; 6.0 s; 47,456 tokens; USD 0.298; auth `automatic`. The host transcript records `claude-opus-5-5`. |
+| Codex reader (image `85f2575d…`) | `gpt-6.1-sol` / `xhigh` | **PASS** | `attempt-a171078a…`; 42.8 s including container start; 20,405 tokens; auth `pre_authenticated`. |
+| Claude reader (image `85f2575d…`) | `opus` / `low` | **PASS** | `attempt-f9747fb4…`; 29.7 s including container start; 26,504 tokens; USD 0.130; auth `pre_authenticated`. The container transcript was not retained, so the served model is the requested alias only. |
+
+All four cleanups completed (release and retire). Promotion to the host trees, the shared image tags and the
+operator is recorded in the operator service custody, not here.
 
 ## Provider refresh — 2026-09-25 (Opus 5.5)
 

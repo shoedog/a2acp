@@ -106,6 +106,28 @@ pub fn init() {
         .try_init();
 }
 
+/// [`init`] for the long-running `serve` subcommand: the same JSON-to-stdout subscriber, but filtered by
+/// [`serve_env_filter`], so operator-facing warnings appear without configuring `RUST_LOG`. Every other
+/// subcommand keeps [`init`] or [`init_stderr`]: they own their stdout. Idempotent-safe.
+pub fn init_serve() {
+    use tracing_subscriber::{fmt, EnvFilter};
+    let rust_log = std::env::var(EnvFilter::DEFAULT_ENV).ok();
+    let _ = fmt()
+        .json()
+        .with_env_filter(serve_env_filter(rust_log.as_deref()))
+        .try_init();
+}
+
+/// `serve`'s filter for a given `RUST_LOG` value. Parsed exactly like [`init`]'s
+/// `EnvFilter::from_default_env` (lossy; empty or only-invalid directives fall back to the default),
+/// except that the default level is WARN instead of ERROR. An explicit `RUST_LOG` always wins.
+pub fn serve_env_filter(rust_log: Option<&str>) -> tracing_subscriber::EnvFilter {
+    use tracing_subscriber::{filter::LevelFilter, EnvFilter};
+    EnvFilter::builder()
+        .with_default_directive(LevelFilter::WARN.into())
+        .parse_lossy(rust_log.unwrap_or_default())
+}
+
 /// Like [`init`] but writes the JSON trace stream to STDERR, leaving STDOUT clean for protocols that
 /// own it (the MCP stdio transport). Idempotent-safe.
 pub fn init_stderr() {
@@ -1731,6 +1753,74 @@ mod tests {
         // Calling init_stderr() twice must not panic.
         init_stderr();
         init_stderr();
+    }
+
+    /// Emit one event per level through `serve`'s filter for `rust_log`; return the captured JSON.
+    fn capture_serve_filtered(rust_log: Option<&str>) -> String {
+        let (writer, buf) = BufWriter::new();
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .with_writer(writer)
+            .with_env_filter(serve_env_filter(rust_log))
+            .finish();
+        with_default(subscriber, || {
+            tracing::error!("serve-filter-error-sentinel");
+            tracing::warn!("serve-filter-warn-sentinel");
+            tracing::info!("serve-filter-info-sentinel");
+        });
+        let captured = buf.lock().unwrap().clone();
+        String::from_utf8(captured).unwrap()
+    }
+
+    #[test]
+    fn serve_filter_defaults_to_warn_when_rust_log_is_unset() {
+        use tracing_subscriber::filter::LevelFilter;
+        assert_eq!(
+            serve_env_filter(None).max_level_hint(),
+            Some(LevelFilter::WARN)
+        );
+        let captured = capture_serve_filtered(None);
+        assert!(
+            captured.contains("serve-filter-error-sentinel"),
+            "{captured}"
+        );
+        assert!(
+            captured.contains("serve-filter-warn-sentinel"),
+            "{captured}"
+        );
+        assert!(
+            !captured.contains("serve-filter-info-sentinel"),
+            "{captured}"
+        );
+        // Like `init`'s from_default_env: an empty or wholly invalid value is not a filter.
+        for not_a_filter in ["", "a2a_bridge=not-a-level"] {
+            assert_eq!(
+                serve_env_filter(Some(not_a_filter)).max_level_hint(),
+                Some(LevelFilter::WARN),
+                "RUST_LOG={not_a_filter:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_rust_log_overrides_the_serve_default_in_both_directions() {
+        use tracing_subscriber::filter::LevelFilter;
+        assert_eq!(
+            serve_env_filter(Some("error")).max_level_hint(),
+            Some(LevelFilter::ERROR)
+        );
+        let quiet = capture_serve_filtered(Some("error"));
+        assert!(quiet.contains("serve-filter-error-sentinel"), "{quiet}");
+        assert!(!quiet.contains("serve-filter-warn-sentinel"), "{quiet}");
+
+        let verbose = capture_serve_filtered(Some("info"));
+        assert!(verbose.contains("serve-filter-info-sentinel"), "{verbose}");
+    }
+
+    #[test]
+    fn init_serve_is_idempotent() {
+        init_serve();
+        init_serve();
     }
 }
 

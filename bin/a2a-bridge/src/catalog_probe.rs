@@ -9,7 +9,8 @@
 //!
 //! Every probe is bounded by [`PROBE_TIMEOUT`]. Server-side [`probe_all`] still degrades per-agent to the
 //! success-only Agent Card catalog, while [`probe_all_report`] retains bounded, redacted failures for the
-//! operator-facing `models` CLI.
+//! operator-facing `models` CLI. Serve startup uses [`probe_all_at_startup`], which re-probes the failed
+//! agents once after [`STARTUP_RETRY_DELAY`]; every failed probe is logged at WARN.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -29,6 +30,12 @@ use serde::Serialize;
 /// single unresponsive adapter would block startup/CLI forever.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(20);
 const PROCESS_STDERR_LINE_BYTES: usize = 4 * 1024;
+/// Pause before serve startup's one re-probe of the agents whose first probe failed. Short and fixed:
+/// it only gives an adapter that lost a cold-start race a moment to settle before the listener binds.
+const STARTUP_RETRY_DELAY: Duration = Duration::from_secs(3);
+/// `attempt` values on the probe log events: every probe is attempt 1; only the startup retry is 2.
+const FIRST_ATTEMPT: u32 = 1;
+const STARTUP_RETRY_ATTEMPT: u32 = 2;
 
 /// Which discovery strategy an entry uses. Pure (kind/cmd only) so the dispatch decision is unit-tested
 /// without spawning a real adapter.
@@ -38,6 +45,16 @@ enum Strategy {
     Api,
     Kiro,
     Acp,
+}
+
+impl Strategy {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Api => "api",
+            Self::Kiro => "kiro",
+            Self::Acp => "acp",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -149,11 +166,16 @@ impl ProbeError {
         }
     }
 
+    #[cfg(test)]
     fn timeout() -> Self {
+        Self::timeout_after(PROBE_TIMEOUT)
+    }
+
+    fn timeout_after(limit: Duration) -> Self {
         Self {
             phase: CatalogProbePhase::Timeout,
             category: CatalogProbeCategory::Timeout,
-            reason: format!("probe timed out after {} seconds", PROBE_TIMEOUT.as_secs()),
+            reason: format!("probe timed out after {} seconds", limit.as_secs()),
             diagnostic: None,
         }
     }
@@ -250,10 +272,6 @@ impl CatalogProbeFailure {
             self.error
         )
     }
-
-    pub(super) fn error(&self) -> &str {
-        &self.error
-    }
 }
 
 /// The CLI-facing probe result. The success catalog retains the public Agent Card shape; failures are
@@ -284,8 +302,12 @@ fn probe_strategy(entry: &AgentEntry) -> Strategy {
     }
 }
 
-/// Probe ONE agent host-side (sandbox ignored). Timeout-bounded; the strategy is chosen by `(kind, cmd)`.
-async fn probe_agent(entry: &AgentEntry, cwd: &Path) -> Result<AgentCaps, CatalogProbeFailure> {
+/// Probe ONE agent host-side (sandbox ignored), bounded by `limit`; strategy chosen by `(kind, cmd)`.
+async fn probe_agent(
+    entry: &AgentEntry,
+    cwd: &Path,
+    limit: Duration,
+) -> Result<AgentCaps, CatalogProbeFailure> {
     let strategy = probe_strategy(entry);
     let fut = async {
         match strategy {
@@ -294,18 +316,49 @@ async fn probe_agent(entry: &AgentEntry, cwd: &Path) -> Result<AgentCaps, Catalo
             Strategy::Acp => probe_acp_host(entry, cwd).await,
         }
     };
-    let result = match tokio::time::timeout(PROBE_TIMEOUT, fut).await {
+    let result = match tokio::time::timeout(limit, fut).await {
         Ok(result) => result,
-        Err(_) => Err(ProbeError::timeout()),
+        Err(_) => Err(ProbeError::timeout_after(limit)),
     };
     result.map_err(|error| CatalogProbeFailure::build(entry, strategy, error))
+}
+
+/// One agent's bounded probe. A seam so the startup retry runs against scripted outcomes in tests
+/// (no adapters, no processes) while production always goes through [`HostProber`].
+#[async_trait::async_trait]
+trait AgentProber: Send + Sync {
+    async fn probe(&self, entry: &AgentEntry, cwd: &Path)
+        -> Result<AgentCaps, CatalogProbeFailure>;
+}
+
+/// The production prober: [`probe_agent`] under a per-agent bound ([`PROBE_TIMEOUT`] outside tests).
+struct HostProber {
+    limit: Duration,
+}
+
+const HOST_PROBER: HostProber = HostProber {
+    limit: PROBE_TIMEOUT,
+};
+
+#[async_trait::async_trait]
+impl AgentProber for HostProber {
+    async fn probe(
+        &self,
+        entry: &AgentEntry,
+        cwd: &Path,
+    ) -> Result<AgentCaps, CatalogProbeFailure> {
+        probe_agent(entry, cwd, self.limit).await
+    }
 }
 
 /// kiro native list: `kiro-cli chat --list-models` (host-side; requires current CLI login state).
 async fn probe_kiro(entry: &AgentEntry) -> Result<AgentCaps, ProbeError> {
     let cmd = entry.cmd.clone().unwrap_or_else(|| "kiro-cli".into());
+    // `kill_on_drop`: when the per-agent timeout cancels this future, dropping the child SIGKILLs it
+    // instead of leaving a stray `kiro-cli` running after its probe has already been reported failed.
     let out = tokio::process::Command::new(&cmd)
         .args(["chat", "--list-models"])
+        .kill_on_drop(true)
         .output()
         .await
         .map_err(|e| ProbeError::spawn(format!("spawn {cmd}: {e}")))?;
@@ -490,21 +543,87 @@ async fn probe_acp_host_with(
     caps
 }
 
+/// Probe the given entries concurrently, one bounded probe each.
+async fn probe_each<'a>(
+    entries: impl IntoIterator<Item = &'a (String, AgentEntry)>,
+    cwd: &Path,
+    prober: &dyn AgentProber,
+) -> Vec<(String, Result<AgentCaps, CatalogProbeFailure>)> {
+    let futs = entries
+        .into_iter()
+        .map(|(id, entry)| async move { (id.clone(), prober.probe(entry, cwd).await) });
+    futures::future::join_all(futs).await
+}
+
 /// Probe every entry concurrently and retain both successes and safe failure records for the CLI.
 pub(super) async fn probe_all_report(
     entries: &[(String, AgentEntry)],
     cwd: &Path,
 ) -> CatalogProbeReport {
-    let futs = entries
-        .iter()
-        .map(|(id, entry)| async move { (id.clone(), probe_agent(entry, cwd).await) });
-    let results = futures::future::join_all(futs).await;
-    collect_probe_report(results)
+    collect_probe_report(probe_each(entries, cwd, &HOST_PROBER).await)
 }
 
 /// Server/Card callers intentionally keep the legacy success-only catalog and per-agent degradation.
 pub async fn probe_all(entries: &[(String, AgentEntry)], cwd: &Path) -> ModelCatalog {
     probe_all_report(entries, cwd).await.catalog
+}
+
+/// Serve startup's catalog: [`probe_all`], then ONE re-probe of only the agents that failed, after
+/// [`STARTUP_RETRY_DELAY`]. Recovered agents join the catalog; agents that fail again stay omitted until
+/// a SIGHUP re-probe. Nothing runs in the background (owner decision: no catalog timer).
+pub async fn probe_all_at_startup(entries: &[(String, AgentEntry)], cwd: &Path) -> ModelCatalog {
+    probe_all_with_startup_retry(entries, cwd, &HOST_PROBER, STARTUP_RETRY_DELAY)
+        .await
+        .catalog
+}
+
+async fn probe_all_with_startup_retry(
+    entries: &[(String, AgentEntry)],
+    cwd: &Path,
+    prober: &dyn AgentProber,
+    retry_delay: Duration,
+) -> CatalogProbeReport {
+    let mut report = collect_probe_report(probe_each(entries, cwd, prober).await);
+    if report.failures.is_empty() {
+        return report;
+    }
+    tokio::time::sleep(retry_delay).await;
+    let failed = entries
+        .iter()
+        .filter(|(id, _)| report.failures.contains_key(id));
+    let retried = probe_each(failed, cwd, prober).await;
+    for (id, result) in retried {
+        match result {
+            Ok(caps) => {
+                tracing::info!(
+                    agent = %id,
+                    attempt = STARTUP_RETRY_ATTEMPT,
+                    "model probe succeeded on startup retry; agent added to the model catalog"
+                );
+                report.failures.remove(&id);
+                report.catalog.insert(id, sanitize_model_caps(caps));
+            }
+            Err(failure) => {
+                warn_probe_failure(&failure, STARTUP_RETRY_ATTEMPT);
+                report.failures.insert(id, failure);
+            }
+        }
+    }
+    report
+}
+
+/// The one operator-visible record of a failed probe: which agent, how it was probed, why it failed
+/// (category plus the bounded, redacted deepest cause), and which attempt this was.
+fn warn_probe_failure(failure: &CatalogProbeFailure, attempt: u32) {
+    tracing::warn!(
+        agent = %failure.agent,
+        strategy = failure.strategy.as_str(),
+        phase = failure.phase.as_str(),
+        category = failure.category.as_str(),
+        attempt,
+        error = %failure.error,
+        "model probe failed; agent omitted from the model catalog"
+    );
 }
 
 /// Fold per-agent probe results without erasing failures. Pure so both server degradation and CLI
@@ -520,7 +639,7 @@ fn collect_probe_report(
                 catalog.insert(id, sanitize_model_caps(caps));
             }
             Err(failure) => {
-                tracing::warn!(agent = %id, reason = %failure.error(), "model probe failed; omitting from server catalog");
+                warn_probe_failure(&failure, FIRST_ATTEMPT);
                 failures.insert(id, failure);
             }
         }
@@ -842,5 +961,365 @@ mod tests {
         assert!(deepest.starts_with("deepest-"));
         assert_eq!(deepest.len(), PROCESS_STDERR_LINE_BYTES);
         assert!(!deepest.contains("first"));
+    }
+
+    #[derive(Clone, Copy)]
+    enum Scripted {
+        Caps,
+        TimedOut,
+        Exited,
+    }
+
+    /// An [`AgentProber`] whose Nth probe of an agent returns that agent's Nth scripted outcome, and
+    /// which counts every call. No processes, no timers; probing past the script panics.
+    struct ScriptedProber {
+        script: BTreeMap<String, Vec<Scripted>>,
+        calls: std::sync::Mutex<BTreeMap<String, usize>>,
+    }
+
+    impl ScriptedProber {
+        fn new(script: &[(&str, &[Scripted])]) -> Self {
+            Self {
+                script: script
+                    .iter()
+                    .map(|(id, outcomes)| (id.to_string(), outcomes.to_vec()))
+                    .collect(),
+                calls: std::sync::Mutex::new(BTreeMap::new()),
+            }
+        }
+
+        fn calls(&self, id: &str) -> usize {
+            self.calls.lock().unwrap().get(id).copied().unwrap_or(0)
+        }
+
+        /// One entry per scripted agent; `kiro` gets the native-list strategy, the rest ACP.
+        fn entries(&self) -> Vec<(String, AgentEntry)> {
+            self.script
+                .keys()
+                .map(|id| {
+                    let cmd = if id == "kiro" {
+                        "kiro-cli"
+                    } else {
+                        "codex-acp"
+                    };
+                    (id.clone(), entry(id, Some(cmd), AgentKind::Acp))
+                })
+                .collect()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl AgentProber for ScriptedProber {
+        async fn probe(
+            &self,
+            entry: &AgentEntry,
+            _cwd: &Path,
+        ) -> Result<AgentCaps, CatalogProbeFailure> {
+            let id = entry.id.as_str();
+            let attempt = {
+                let mut calls = self.calls.lock().unwrap();
+                let count = calls.entry(id.to_string()).or_default();
+                *count += 1;
+                *count
+            };
+            let outcome = self.script[id]
+                .get(attempt - 1)
+                .copied()
+                .unwrap_or_else(|| panic!("{id} probed {attempt} times, beyond its script"));
+            let error = match outcome {
+                Scripted::Caps => {
+                    return Ok(AgentCaps {
+                        models: vec![format!("{id}-model-from-attempt-{attempt}")],
+                        ..AgentCaps::default()
+                    })
+                }
+                Scripted::TimedOut => ProbeError::timeout(),
+                Scripted::Exited => ProbeError::process_exit(format!(
+                    "fake exited with exit status: 1: deepest-cause-{id}-{attempt} authorization: top-secret"
+                )),
+            };
+            Err(CatalogProbeFailure::build(
+                entry,
+                probe_strategy(entry),
+                error,
+            ))
+        }
+    }
+
+    #[test]
+    fn startup_retry_delay_is_three_seconds() {
+        assert_eq!(STARTUP_RETRY_DELAY, Duration::from_secs(3));
+    }
+
+    #[tokio::test]
+    async fn startup_retry_adds_a_recovered_agent_and_probes_the_others_once() {
+        use Scripted::*;
+        let prober = ScriptedProber::new(&[
+            ("claude", &[Caps]),
+            ("codex", &[Caps]),
+            ("kiro", &[TimedOut, Caps]),
+        ]);
+        let entries = prober.entries();
+
+        let report =
+            probe_all_with_startup_retry(&entries, Path::new("/tmp"), &prober, Duration::ZERO)
+                .await;
+
+        assert_eq!(
+            report.catalog["kiro"].models,
+            vec!["kiro-model-from-attempt-2"]
+        );
+        assert!(
+            report.failures.is_empty(),
+            "the recovered failure is cleared"
+        );
+        assert_eq!(report.catalog.len(), 3);
+        assert_eq!(prober.calls("kiro"), 2);
+        assert_eq!(
+            prober.calls("claude"),
+            1,
+            "a first-time success is not re-probed"
+        );
+        assert_eq!(
+            prober.calls("codex"),
+            1,
+            "a first-time success is not re-probed"
+        );
+    }
+
+    #[tokio::test]
+    async fn startup_retry_omits_a_twice_failed_agent_and_leaves_the_others_untouched() {
+        use Scripted::*;
+        let prober = ScriptedProber::new(&[
+            ("claude", &[Caps]),
+            ("codex", &[Exited, Caps]),
+            ("kiro", &[TimedOut, Exited]),
+        ]);
+        let entries = prober.entries();
+
+        let report =
+            probe_all_with_startup_retry(&entries, Path::new("/tmp"), &prober, Duration::ZERO)
+                .await;
+
+        assert!(!report.catalog.contains_key("kiro"), "still omitted");
+        assert_eq!(prober.calls("kiro"), 2, "exactly one retry");
+        let failure = &report.failures["kiro"];
+        assert_eq!(failure.category, CatalogProbeCategory::ProcessExit);
+        assert!(
+            failure.error.contains("deepest-cause-kiro-2"),
+            "the retry's failure is the one retained: {}",
+            failure.error
+        );
+        assert_eq!(report.failures.len(), 1);
+        assert_eq!(
+            report.catalog["claude"].models,
+            vec!["claude-model-from-attempt-1"],
+            "a first-time success keeps its own entry"
+        );
+        assert_eq!(
+            report.catalog["codex"].models,
+            vec!["codex-model-from-attempt-2"],
+            "a sibling's recovery is unaffected"
+        );
+        assert_eq!(report.catalog.len(), 2);
+        assert_eq!(prober.calls("claude"), 1);
+    }
+
+    #[tokio::test]
+    async fn startup_without_failures_neither_retries_nor_waits() {
+        use Scripted::*;
+        // An hour-long delay: completing well inside the guard proves no delay was spent.
+        let hour = Duration::from_secs(3600);
+        let guard = Duration::from_secs(10);
+        let healthy = ScriptedProber::new(&[("claude", &[Caps]), ("kiro", &[Caps])]);
+        let entries = healthy.entries();
+        let report = tokio::time::timeout(
+            guard,
+            probe_all_with_startup_retry(&entries, Path::new("/tmp"), &healthy, hour),
+        )
+        .await
+        .expect("no failure, so no retry delay");
+        assert_eq!(report.catalog.len(), 2);
+        assert_eq!(healthy.calls("claude"), 1);
+        assert_eq!(healthy.calls("kiro"), 1);
+
+        // Control: the same delay IS spent once an agent fails, so the guard above is meaningful.
+        let failing = ScriptedProber::new(&[("kiro", &[Exited, Caps])]);
+        let entries = failing.entries();
+        let waited = tokio::time::timeout(
+            Duration::from_millis(50),
+            probe_all_with_startup_retry(&entries, Path::new("/tmp"), &failing, hour),
+        )
+        .await;
+        assert!(waited.is_err(), "a failure waits out the retry delay");
+        assert_eq!(failing.calls("kiro"), 1, "the retry follows the delay");
+    }
+
+    /// JSON lines written by a capturing subscriber.
+    #[derive(Clone)]
+    struct CapturedLog(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CapturedLog {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl CapturedLog {
+        fn events(&self) -> Vec<serde_json::Value> {
+            let bytes = self.0.lock().unwrap().clone();
+            String::from_utf8(bytes)
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect()
+        }
+    }
+
+    #[tokio::test]
+    async fn each_failed_probe_warns_with_its_cause_and_a_recovery_logs_info() {
+        use Scripted::*;
+        let log = CapturedLog(Arc::new(std::sync::Mutex::new(Vec::new())));
+        let writer = log.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .with_max_level(tracing::Level::TRACE)
+            .with_writer(move || writer.clone())
+            .finish();
+        // tracing-core caches each callsite's interest process-wide. While exactly one dispatcher is
+        // registered, a callsite's interest comes from whichever thread hits it first, so a parallel
+        // test without a subscriber could cache `never` for the shared probe-log callsites. A second
+        // live dispatcher makes every registration consult all live dispatchers, this one included.
+        let _second = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
+        let _default = tracing::subscriber::set_default(subscriber);
+
+        let prober = ScriptedProber::new(&[
+            ("claude", &[Caps]),
+            ("codex", &[Exited, Caps]),
+            ("kiro", &[TimedOut, Exited]),
+        ]);
+        let entries = prober.entries();
+        probe_all_with_startup_retry(&entries, Path::new("/tmp"), &prober, Duration::ZERO).await;
+
+        let events = log.events();
+        let at = |level: &str| -> Vec<&serde_json::Value> {
+            events
+                .iter()
+                .filter(|event| event["level"] == level)
+                .map(|event| &event["fields"])
+                .collect()
+        };
+        let warns = at("WARN");
+        let find = |agent: &str, attempt: u32| {
+            *warns
+                .iter()
+                .find(|fields| fields["agent"] == agent && fields["attempt"] == attempt)
+                .unwrap_or_else(|| panic!("no WARN for {agent} attempt {attempt}: {events:?}"))
+        };
+        assert_eq!(warns.len(), 3, "one WARN per failed probe: {events:?}");
+
+        let kiro_first = find("kiro", 1);
+        assert_eq!(kiro_first["strategy"], "kiro");
+        assert_eq!(kiro_first["category"], "timeout");
+        assert_eq!(
+            kiro_first["error"],
+            format!("probe timed out after {} seconds", PROBE_TIMEOUT.as_secs())
+        );
+
+        let kiro_retry = find("kiro", 2);
+        assert_eq!(kiro_retry["strategy"], "kiro");
+        assert_eq!(kiro_retry["category"], "process_exit");
+        let cause = kiro_retry["error"].as_str().unwrap();
+        assert!(cause.contains("deepest-cause-kiro-2"), "{cause}");
+        assert!(
+            !cause.contains("top-secret"),
+            "redacted before logging: {cause}"
+        );
+
+        let codex_first = find("codex", 1);
+        assert_eq!(codex_first["strategy"], "acp");
+        assert_eq!(codex_first["category"], "process_exit");
+        assert!(codex_first["error"]
+            .as_str()
+            .unwrap()
+            .contains("deepest-cause-codex-1"));
+
+        let infos = at("INFO");
+        assert_eq!(infos.len(), 1, "one INFO per recovered agent: {events:?}");
+        assert_eq!(infos[0]["agent"], "codex");
+        assert_eq!(infos[0]["attempt"], 2);
+    }
+
+    /// Whether `pid` is a live, non-zombie process. A SIGKILLed child stays a zombie until tokio's
+    /// orphan reaper collects it, but a zombie runs nothing.
+    #[cfg(unix)]
+    fn process_is_running(pid: libc::pid_t) -> bool {
+        // SAFETY: signal 0 only checks that the process exists.
+        if unsafe { libc::kill(pid, 0) } != 0 {
+            return false;
+        }
+        #[cfg(target_os = "linux")]
+        let state = std::fs::read_to_string(format!("/proc/{pid}/stat"))
+            .ok()
+            .and_then(|stat| {
+                let (_, after_comm) = stat.rsplit_once(')')?;
+                after_comm.trim_start().chars().next()
+            });
+        #[cfg(not(target_os = "linux"))]
+        let state = std::process::Command::new("ps")
+            .args(["-o", "stat=", "-p", &pid.to_string()])
+            .output()
+            .ok()
+            .and_then(|out| String::from_utf8_lossy(&out.stdout).trim().chars().next());
+        state.is_some_and(|state| state != 'Z')
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn timed_out_kiro_probe_leaves_no_child_running() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = dir.path().join("kiro.pid");
+        let kiro = dir.path().join("kiro-cli");
+        // Only the probe's `chat --list-models` hangs; the warm-up exec (no args) exits at once.
+        std::fs::write(
+            &kiro,
+            format!(
+                "#!/bin/sh\n[ \"$1\" = chat ] || exit 0\necho $$ > '{}'\nexec sleep 30\n",
+                pid_file.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&kiro, std::fs::Permissions::from_mode(0o755)).unwrap();
+        crate::cli_tests::warm_up_script(&kiro);
+
+        let short = HostProber {
+            limit: Duration::from_secs(1),
+        };
+        let kiro_entry = entry("kiro", Some(kiro.to_str().unwrap()), AgentKind::Acp);
+        let failure = short.probe(&kiro_entry, dir.path()).await.unwrap_err();
+        assert_eq!(failure.strategy, Strategy::Kiro);
+        assert_eq!(failure.category, CatalogProbeCategory::Timeout);
+
+        let pid: libc::pid_t = std::fs::read_to_string(&pid_file)
+            .expect("the fake kiro-cli started and recorded its pid")
+            .trim()
+            .parse()
+            .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while process_is_running(pid) {
+            if std::time::Instant::now() >= deadline {
+                // SAFETY: plain SIGKILL of the test's own leaked child.
+                unsafe { libc::kill(pid, libc::SIGKILL) };
+                panic!("timed-out kiro probe left its child {pid} running");
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
     }
 }
