@@ -41,6 +41,9 @@ resume_attempt_cap = 3
 
 [server]
 addr = "127.0.0.1:8080"
+# Retire an agent's shared adapter process (and every session/MCP child it holds) once no request
+# has used it for this many seconds; the next request respawns it. 0 = never.
+# adapter_idle_ttl_secs = 300
 
 # kiro: zero-auth local default (kiro-cli acp). ACP SDK 1.x can discover Kiro's
 # native model list, but cannot apply Kiro model pins unless the catalog marks

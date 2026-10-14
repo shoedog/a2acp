@@ -815,6 +815,7 @@ fn acp_spawn_inputs_with_cwd_binding(
         mode: entry.mode.clone(),
         auth_method: entry.auth_method.clone(),
         pre_authenticated: entry.pre_authenticated,
+        rename_new_sessions: entry.rename_new_sessions,
         container,
         watchdog: entry.watchdog.clone(),
         diagnostic_redactor,
@@ -1158,6 +1159,7 @@ fn container_rw_cfg_from_entry(
         mode: entry.mode.clone(),
         auth_method: entry.auth_method.clone(),
         pre_authenticated: entry.pre_authenticated,
+        rename_new_sessions: entry.rename_new_sessions,
         watchdog: entry.watchdog.clone(),
         handshake_timeout: bridge_acp::acp_backend::AcpConfig::default().handshake_timeout,
         cancel_grace: bridge_acp::acp_backend::AcpConfig::default().cancel_grace,
@@ -6825,6 +6827,10 @@ fn build_init_config(
     ));
     out.push_str("[store]\npath = \".a2a-bridge/tasks.sqlite\"\nresume_attempt_cap = 3\n\n");
     out.push_str("[server]\naddr = \"127.0.0.1:8080\"\n");
+    out.push_str(
+        "# Retire an agent's idle shared adapter process (and its MCP children) after N s; 0 = never.\n\
+         # adapter_idle_ttl_secs = 300\n",
+    );
     for a in selected {
         out.push_str(agent_fragment(a));
     }
@@ -8239,7 +8245,11 @@ async fn mcp_cmd(args: &[String]) -> Result<(), BoxError> {
         )
         .await;
     }
-    let registry = Arc::new(Registry::new_bound_observed(snapshot, spawn)?);
+    // Long-lived: retire a shared adapter process (and its agent-side children) once it idles.
+    let registry = Arc::new(
+        Registry::new_bound_observed(snapshot, spawn)?
+            .with_idle_ttl(Duration::from_secs(cfg.server.adapter_idle_ttl_secs)),
+    );
 
     let base = config_path
         .parent()
@@ -9945,7 +9955,12 @@ async fn main() -> Result<(), BoxError> {
         .map(|e| (e.id.as_str().to_string(), e.clone()))
         .collect();
     // Registry::new VALIDATES the snapshot → boot fails loud on bad config (spec §7).
-    let registry = Arc::new(Registry::new_bound_observed(snapshot, spawn)?);
+    // Warm-session expiry only drops a lease; idle retirement frees the shared adapter process
+    // (and its agent-side session/MCP children) once no lease has used it for the TTL.
+    let registry = Arc::new(
+        Registry::new_bound_observed(snapshot, spawn)?
+            .with_idle_ttl(Duration::from_secs(cfg.server.adapter_idle_ttl_secs)),
+    );
 
     // 6. Reconcile loop — consume `watch()` and `apply()` each new snapshot so
     //    on-disk edits hot-reload the live registry. The watch stream is held for
@@ -12302,6 +12317,50 @@ inputs = []
     }
 
     #[test]
+    fn serving_configs_carry_the_entrys_rename_new_sessions() {
+        use bridge_core::domain::{EgressPolicy, MountAccess, SandboxConfig};
+        let run = bridge_core::run_identity::RunHandle {
+            instance_id: "run0".into(),
+            host: "h".into(),
+            lease: "/l/run0.lock".into(),
+            start: "0".into(),
+        };
+        let mut writer = acp_entry("writer");
+        writer.cmd = Some("codex-acp".into());
+        writer.kind = bridge_core::domain::AgentKind::ContainerRw;
+        writer.sandbox = Some(SandboxConfig {
+            runtime: None,
+            image: "img".into(),
+            mount: "/work".into(),
+            access: MountAccess::Rw,
+            egress: EgressPolicy::Open,
+            volumes: vec![],
+        });
+
+        // Both ways a serving backend is configured from an entry: the ACP spawn inputs (host
+        // and `:ro` agents) and the `:rw` container config. Off unless the entry asks for it.
+        for rename_new_sessions in [false, true] {
+            let mut reader = acp_entry("reader");
+            // Absolute, so the test does not need `codex-acp` on PATH: a bare `codex-acp` goes
+            // through the packaged wrapper, which resolves the binary on PATH.
+            reader.cmd = Some("/opt/codex/bin/codex-acp".into());
+            reader.rename_new_sessions = rename_new_sessions;
+            let (_, _, acp) = acp_spawn_inputs(
+                &reader,
+                std::path::PathBuf::from("/tmp"),
+                std::path::Path::new("/cfg/a2a.toml"),
+                &run,
+            )
+            .unwrap();
+            assert_eq!(acp.rename_new_sessions, rename_new_sessions);
+
+            writer.rename_new_sessions = rename_new_sessions;
+            let ccfg = container_rw_cfg_from_entry(&writer, &run).unwrap();
+            assert_eq!(ccfg.rename_new_sessions, rename_new_sessions);
+        }
+    }
+
+    #[test]
     fn acp_spawn_inputs_threads_bridge_known_mcp_env_into_diagnostic_redactor() {
         const SECRET: &str = "bridge-known-mcp-secret";
         let mut entry = acp_entry("reader-redaction");
@@ -12643,6 +12702,7 @@ inputs = []
             auth_method: None,
             pre_authenticated: false,
             host_fallback_eligible: false,
+            rename_new_sessions: false,
             name: None,
             description: None,
             tags: vec![],
@@ -13317,6 +13377,16 @@ inputs = []
         .unwrap();
         let raw = std::fs::read_to_string(dir.join("a2a-bridge.toml")).unwrap();
         let cfg = config::RegistryConfig::parse(&raw).unwrap();
+        // The scaffold documents the idle-adapter knob under [server]; uncommented, it parses.
+        let enabled = raw.replace("# adapter_idle_ttl_secs", "adapter_idle_ttl_secs");
+        assert_ne!(enabled, raw, "scaffold documents adapter_idle_ttl_secs");
+        assert_eq!(
+            config::RegistryConfig::parse(&enabled)
+                .unwrap()
+                .server
+                .adapter_idle_ttl_secs,
+            300
+        );
         let wf = cfg.load_workflows(&dir).unwrap();
         assert_eq!(
             wf.len(),

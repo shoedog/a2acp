@@ -21,9 +21,11 @@ pub struct TaskBinding {
     /// follow-ups (they prompt the bound backend without recomputing config). Kept on
     /// the binding so the resolved config is available for the task's whole lifetime.
     pub eff: EffectiveConfig,
-    /// The registry lease keeping the slot alive for the task. Dropped (releasing the
-    /// slot's active-task count) when the binding is removed on producer exit.
-    pub lease: Box<dyn Lease>,
+    /// The registry lease keeping the slot alive for the task. The binding's reference is
+    /// dropped when the binding is removed on producer exit; anything else still driving the
+    /// bound backend (a follow-up turn, a cancel) co-holds a clone, so the slot's active-task
+    /// count only reaches zero once the backend is truly unused.
+    pub lease: Arc<dyn Lease>,
 }
 
 /// RAII eviction guard owned by a task's producer. While alive it represents the
@@ -81,6 +83,10 @@ pub struct LocalDispatch {
     /// Warm path only: bridge turn identity stashed into ACP before the next prompt.
     pub turn_meta: Option<TurnMeta>,
     pub guard: Option<BindingGuard>,
+    /// Binding path only: a clone of the task binding's lease, held by the producer for the
+    /// whole turn so the backend stays leased (never idle-retired) even if the binding is
+    /// evicted mid-turn. `None` on the warm path, whose handle holds its own lease.
+    pub lease: Option<Arc<dyn Lease>>,
     /// Warm path only: finishes the warm turn (→ Idle) on drop. Mutually exclusive with `guard`.
     pub warm_guard: Option<WarmTurnGuard>,
     /// Per-turn abort token (cancel-tokens F2). For a WARM turn it is the handle's `turn_abort`

@@ -7,6 +7,64 @@ release (see [`docs/adr/`](docs/adr/) for the full architectural record).
 
 ## [Unreleased]
 
+### Added
+
+- `[[agents]]` entries for `codex-acp` can set `rename_new_sessions = true` (default `false`) to stop
+  the adapter's title-generation thread. After a new session's first turn the adapter starts a second
+  codex thread, spends one model turn on it to generate a title, and never unsubscribes it; the bridge
+  has no id for that thread, so neither `session/close` on release nor anything short of adapter exit
+  ends the MCP server processes it started. With the option on, the bridge sends the adapter's own
+  slash command, `/rename <name>` as a `session/prompt`, once to each agent session it mints, after
+  mode, model and effort have settled and before the session can serve a turn. The adapter answers it
+  locally without a model turn and then skips title generation. The name is derived from the bridge
+  session key and is what the thread is listed under in codex's own session list. The rename is
+  best-effort: one attempt, bounded at 5 s, never retried, and it never fails the mint. Whatever
+  comes of it, the same session is published as it would be without the step, and a refused,
+  unanswered or cut-off rename is recorded only as a typed trace event. Updates the adapter sends
+  for the session before the rename exchange has ended reach no turn; output it sends late for a
+  rename it left unanswered past the bound can reach the session's first turn. Validation rejects
+  the option for any other `cmd`, where the text would reach the model as a prompt; a hot reload
+  that changes it respawns the agent's adapter; and model-catalog probes never rename. The option is
+  part of the frozen provider-effect identity, so a workflow run frozen under one value refuses an
+  entry reloaded with the other as a config mismatch; entries that leave it off keep the identity
+  they already had. The option relies on the adapter's `/rename` command as measured on codex-acp
+  1.13.1 and 2.2.2: see [`docs/compatibility.md`](docs/compatibility.md) before enabling it on
+  another version.
+
+### Fixed
+
+- `serve` and `mcp` now retire an agent's shared adapter process once no registry lease has used it
+  for `[server] adapter_idle_ttl_secs` (default `300`; `0` disables). Warm-session expiry
+  (`warm_idle_ttl_secs`) only cancelled and released the bridge-side handle, so the single adapter
+  process — and every agent-side thread/session child it created, such as codex's per-thread MCP
+  servers — previously lived until `serve` restarted, because the bridge never closed the agent-side
+  session (codex releases a thread's MCP servers about 60 s after ACP `session/close`). The
+  idle slot is swapped for a cold one and its backend retired through the existing lease-drain
+  path, so the next request respawns the adapter. A lease taken inside the window restarts the
+  clock, and no resolve is ever handed a lease on a slot being retired. Non-serve commands
+  (`run-workflow`, `implement`, `smoke`, compatibility) keep retiring their runner at end of run.
+- Releasing a backend session (warm-session idle expiry, `session release`, `session clear`,
+  compact, reset, release-all) now also sends ACP `session/close` for every agent-side session the
+  bridge minted for it, when the agent advertised `sessionCapabilities.close` at initialize and the
+  adapter connection is still usable. Release used to stop at `session/cancel` plus dropping
+  bridge-side state, so agent-side sessions — and codex's per-thread MCP server processes — lived
+  until the shared adapter exited, which idle adapter retirement cannot bring about while
+  overlapping sessions keep the adapter leased. The close goes out after the cancel, and only once
+  nothing is still acting on the session under its turn lock, such as a turn that cancel is still
+  unwinding. A prompt that had picked the session but not yet put its turn on the wire when release
+  began does not start one: it fails with `acp.prompt_start.session_released`, and the next call
+  mints a fresh session. A session whose `session/new` or mode/model setup is still in flight when
+  release runs is never published: release waits for it and closes it, and one that outlives the
+  wait is closed when its mint settles. It is best-effort in that it never fails or holds up
+  release: the caller's wait is bounded by the existing cancel grace, whatever the closes are still
+  waiting for, and never includes the agent's answer. The grace does not give a close up, though: a
+  close that cannot go out yet stays pending in the background until the session's turn lock is
+  free or the adapter is torn down, and each close's answer is awaited there for one grace from
+  when it was sent. A rejected or unanswered close, or one ended by adapter teardown, is recorded
+  only as a typed trace event, and release's result is unchanged. Measured against codex-acp 1.13.1
+  and 2.1.1, a session's MCP server exits about 60 s after its own `session/close` while other
+  sessions on the same adapter stay open.
+
 ## [0.3.1] - 2026-07-30
 
 ### Fixed

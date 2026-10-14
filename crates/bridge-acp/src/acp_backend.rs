@@ -16,22 +16,23 @@ use std::time::{Duration, Instant};
 
 use agent_client_protocol::schema::v1::{
     AgentCapabilities, AuthMethod, AuthMethodId, AuthenticateRequest, CancelNotification,
-    ContentBlock, CreateTerminalRequest, CreateTerminalResponse, EnvVariable, InitializeRequest,
-    InitializeResponse, KillTerminalRequest, KillTerminalResponse, McpServer, McpServerStdio,
-    NewSessionRequest, PermissionOption, PermissionOptionKind, PlanEntryPriority, PlanEntryStatus,
-    PromptRequest, PromptResponse, ReadTextFileRequest, ReadTextFileResponse,
-    ReleaseTerminalRequest, ReleaseTerminalResponse, RequestPermissionOutcome,
-    RequestPermissionRequest, RequestPermissionResponse, SelectedPermissionOutcome,
-    SessionConfigId, SessionConfigOption, SessionConfigValueId, SessionId as AgentSessionId,
-    SessionModeState, SessionNotification, SessionUpdate, SetSessionConfigOptionRequest,
-    SetSessionModeRequest, StopReason, TerminalOutputRequest, TerminalOutputResponse, TextContent,
-    ToolCallContent, ToolCallLocation, ToolCallStatus, ToolKind, WaitForTerminalExitRequest,
-    WaitForTerminalExitResponse, WriteTextFileRequest, WriteTextFileResponse,
+    CloseSessionRequest, CloseSessionResponse, ContentBlock, CreateTerminalRequest,
+    CreateTerminalResponse, EnvVariable, InitializeRequest, InitializeResponse,
+    KillTerminalRequest, KillTerminalResponse, McpServer, McpServerStdio, NewSessionRequest,
+    PermissionOption, PermissionOptionKind, PlanEntryPriority, PlanEntryStatus, PromptRequest,
+    PromptResponse, ReadTextFileRequest, ReadTextFileResponse, ReleaseTerminalRequest,
+    ReleaseTerminalResponse, RequestPermissionOutcome, RequestPermissionRequest,
+    RequestPermissionResponse, SelectedPermissionOutcome, SessionConfigId, SessionConfigOption,
+    SessionConfigValueId, SessionId as AgentSessionId, SessionModeState, SessionNotification,
+    SessionUpdate, SetSessionConfigOptionRequest, SetSessionModeRequest, StopReason,
+    TerminalOutputRequest, TerminalOutputResponse, TextContent, ToolCallContent, ToolCallLocation,
+    ToolCallStatus, ToolKind, WaitForTerminalExitRequest, WaitForTerminalExitResponse,
+    WriteTextFileRequest, WriteTextFileResponse,
 };
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::{
     Agent, Client, ConnectTo, ConnectionTo, Error as AcpError, ErrorCode, JsonRpcMessage,
-    JsonRpcRequest, JsonRpcResponse, Lines, UntypedMessage,
+    JsonRpcRequest, JsonRpcResponse, Lines, SentRequest, UntypedMessage,
 };
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -108,6 +109,18 @@ const DEFAULT_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from
 /// (see [`AcpBackend::escalate_terminate`]) so a hung in-flight turn cannot hold
 /// the per-session turn lock — and hang the caller's stream — forever.
 const DEFAULT_CANCEL_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Default bound on the `/rename` exchange that names a newly minted agent
+/// session (see [`AcpConfig::rename_new_sessions`]). The adapter answers the
+/// command locally in well under a second; on elapse the mint goes on to
+/// publish the session rather than wait for an adapter that is not answering.
+const DEFAULT_RENAME_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The longest name [`AcpBackend::rename_session_name`] derives.
+const RENAME_NAME_MAX_CHARS: usize = 96;
+
+/// The name given to an agent session whose bridge session key is empty.
+const RENAME_NAME_FALLBACK: &str = "a2a-session";
 
 /// Grace handed to `OwnedProcessTreeV1::terminate` between SIGTERM and the SIGKILL
 /// escalation when we nuke the agent process on a cancel/drop timeout.
@@ -810,7 +823,7 @@ impl AcpLifecycle {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum AcpTraceEvent {
     ModelOptionsMissing,
     EffortBelowMinimum {
@@ -861,6 +874,67 @@ enum AcpTraceEvent {
     ProcessFlightOwnerDetachFailed {
         owner_key_fingerprint: i64,
         supervised_lock_poisoned: bool,
+    },
+    /// The agent acknowledged the `session/close` sent for one agent session
+    /// of a released bridge session. Like the three outcomes below it is
+    /// emitted per agent session and correlates through the bridge session's
+    /// owner fingerprint; neither session id is traced.
+    SessionCloseAcknowledged {
+        owner_key_fingerprint: i64,
+    },
+    /// The agent answered `session/close` with a JSON-RPC error, or the
+    /// request failed on a connection that was still usable.
+    SessionCloseRejected {
+        owner_key_fingerprint: i64,
+        rpc_code: i64,
+    },
+    /// No answer to `session/close` arrived within one cancel grace of that
+    /// close being sent.
+    SessionCloseUnanswered {
+        owner_key_fingerprint: i64,
+    },
+    /// The bridge's own teardown ended a `session/close`. With
+    /// `connection_unavailable`, the connection was fenced: before the close
+    /// could be sent (the adapter is being torn down and takes the session
+    /// with it), or, when `sent`, before any answer. Time alone never leaves
+    /// a known agent session unsent. Unsent on a usable connection is
+    /// therefore not a close at all: a release whose wait for a mint still in
+    /// flight ran out emits it once for that mint, whose id is not yet
+    /// known; the mint closes what it minted when it settles, and that close
+    /// is traced as an outcome of its own.
+    SessionCloseAbandoned {
+        owner_key_fingerprint: i64,
+        sent: bool,
+        connection_unavailable: bool,
+    },
+    /// The adapter accepted the `/rename` that names a newly minted agent
+    /// session. Like the four outcomes below it is emitted once per mint and
+    /// correlates through the bridge session's owner fingerprint; neither the
+    /// session id nor the name is traced.
+    SessionRenameAcknowledged {
+        owner_key_fingerprint: i64,
+    },
+    /// The adapter answered the rename with a JSON-RPC error, or the request
+    /// failed on a connection nobody had fenced, as it does when the adapter
+    /// dies.
+    SessionRenameRejected {
+        owner_key_fingerprint: i64,
+        rpc_code: i64,
+    },
+    /// No answer to the rename arrived within its bound, on a connection that
+    /// was still usable. The mint published the session all the same, while
+    /// the adapter may still be handling the request.
+    SessionRenameUnanswered {
+        owner_key_fingerprint: i64,
+    },
+    /// The connection was fenced while the rename waited for its answer.
+    SessionRenameInterrupted {
+        owner_key_fingerprint: i64,
+    },
+    /// The connection was already fenced when the mint reached the rename,
+    /// so none was sent.
+    SessionRenameSkipped {
+        owner_key_fingerprint: i64,
     },
 }
 
@@ -997,6 +1071,77 @@ impl AcpTraceEvent {
                 supervised_lock_poisoned,
                 "ACP lifecycle metadata"
             ),
+            Self::SessionCloseAcknowledged {
+                owner_key_fingerprint,
+            } => tracing::debug!(
+                event = "acp.session_close_acknowledged",
+                owner_key_fingerprint,
+                "ACP lifecycle metadata"
+            ),
+            Self::SessionCloseRejected {
+                owner_key_fingerprint,
+                rpc_code,
+            } => tracing::warn!(
+                event = "acp.session_close_rejected",
+                owner_key_fingerprint,
+                rpc_code,
+                "ACP lifecycle metadata"
+            ),
+            Self::SessionCloseUnanswered {
+                owner_key_fingerprint,
+            } => tracing::warn!(
+                event = "acp.session_close_unanswered",
+                owner_key_fingerprint,
+                "ACP lifecycle metadata"
+            ),
+            Self::SessionCloseAbandoned {
+                owner_key_fingerprint,
+                sent,
+                connection_unavailable,
+            } => tracing::debug!(
+                event = "acp.session_close_abandoned",
+                owner_key_fingerprint,
+                sent,
+                connection_unavailable,
+                "ACP lifecycle metadata"
+            ),
+            Self::SessionRenameAcknowledged {
+                owner_key_fingerprint,
+            } => tracing::debug!(
+                event = "acp.session_rename_acknowledged",
+                owner_key_fingerprint,
+                "ACP lifecycle metadata"
+            ),
+            Self::SessionRenameRejected {
+                owner_key_fingerprint,
+                rpc_code,
+            } => tracing::warn!(
+                event = "acp.session_rename_rejected",
+                owner_key_fingerprint,
+                rpc_code,
+                "ACP lifecycle metadata"
+            ),
+            Self::SessionRenameUnanswered {
+                owner_key_fingerprint,
+            } => tracing::warn!(
+                event = "acp.session_rename_unanswered",
+                owner_key_fingerprint,
+                "ACP lifecycle metadata"
+            ),
+            Self::SessionRenameInterrupted {
+                owner_key_fingerprint,
+            } => tracing::warn!(
+                event = "acp.session_rename_interrupted",
+                owner_key_fingerprint,
+                "ACP lifecycle metadata"
+            ),
+            Self::SessionRenameSkipped {
+                owner_key_fingerprint,
+            } => tracing::debug!(
+                event = "acp.session_rename_skipped",
+                owner_key_fingerprint,
+                "ACP lifecycle metadata"
+            ),
         }
     }
 }
@@ -1073,6 +1218,29 @@ pub struct AcpConfig {
     /// [`DEFAULT_CANCEL_GRACE`]; tests override it to a short value to assert the
     /// hung-agent escalation deterministically without hanging the suite.
     pub cancel_grace: std::time::Duration,
+    /// Name each agent session the backend mints, by sending the adapter's
+    /// own slash command `/rename <name>` as a `session/prompt` once, as the
+    /// last setup step of the mint and before the session id is published.
+    /// `codex-acp` answers it locally, without a model turn, and then skips
+    /// the title-generation thread it otherwise starts after the session's
+    /// first turn: a thread the bridge has no id for and cannot close, whose
+    /// MCP server processes live until the adapter exits.
+    ///
+    /// Best effort and one attempt: a rename that is refused, unanswered or
+    /// cut off never fails the mint, and whatever comes of it the same
+    /// session is published as it would be without the step. The backend
+    /// keeps no state for the rename once the mint has moved on. Until the
+    /// exchange has ended, answered or at its bound, the id is unpublished
+    /// and has no update route, so what the adapter sends for the session
+    /// reaches no turn. Only what it sends late, for a rename it left
+    /// unanswered past the bound, can reach the session's first turn. Off by
+    /// default, and only for `codex-acp`: any other adapter would hand the
+    /// text to its model as a real prompt.
+    pub rename_new_sessions: bool,
+    /// Bound on the wait for that rename's answer. Defaults to
+    /// [`DEFAULT_RENAME_TIMEOUT`]; tests override it to a short value to
+    /// assert the unanswered case without waiting the default out.
+    pub rename_timeout: std::time::Duration,
     /// Reaper for a containerized agent's `docker run` container (`:ro` sandbox). `None` for local-process
     /// and in-process (test) backends — reaping is then a no-op.
     pub container: Option<ContainerReap>,
@@ -1168,6 +1336,8 @@ impl Default for AcpConfig {
             pre_authenticated: false,
             handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
             cancel_grace: DEFAULT_CANCEL_GRACE,
+            rename_new_sessions: false,
+            rename_timeout: DEFAULT_RENAME_TIMEOUT,
             container: None,
             mcp: Vec::new(),
             child_env_remove: Vec::new(),
@@ -1873,6 +2043,9 @@ struct AgentSession {
     /// The agent-minted session id, set exactly once by the `session/new` that
     /// `ensure_session` drives. `OnceCell` guarantees single init under races.
     agent_id: OnceCell<AgentSessionId>,
+    /// What else `session/new` returned for this bridge session, and whether
+    /// release has unpublished it (see [`MintLedger`]).
+    minted: StdMutex<MintLedger>,
     /// Single-flight owner for initialization. The owner moves into a spawned
     /// task, so cancelling the caller that first requested a session cannot
     /// cancel an already-started `session/new`/configuration lifecycle and
@@ -1920,10 +2093,34 @@ struct AgentSession {
     turn_kill: Arc<StdMutex<Option<Arc<tokio::sync::Notify>>>>,
 }
 
+/// Which agent sessions one bridge session minted beyond its published
+/// `agent_id`, and who closes them. A single lock orders a mint publishing or
+/// abandoning its id against release collecting the entry's ids, so each
+/// minted id has exactly one closer. The same lock orders a turn starting
+/// against release beginning (see [`AgentSession::admit_turn`]).
+#[derive(Default)]
+struct MintLedger {
+    /// Set by the release that unpublishes the entry, under the same hold of
+    /// the session map as the removal and before that release's cancel goes
+    /// out. A released entry never gains an `agent_id`, starts no further
+    /// mint, and admits no further turn: whatever `session/new` returns for
+    /// it is only closed.
+    released: bool,
+    /// Ids a `session/new` returned that never became `agent_id` and that
+    /// nobody has collected yet: a mint whose mode/model/effort setup fails
+    /// abandons its agent-side session, and the retry mints another.
+    abandoned: Vec<AgentSessionId>,
+    /// Left by release's close flight once it has collected the ids above.
+    /// An id abandoned after that, by a mint the flight did not or could not
+    /// wait for, is closed through this instead of being collected.
+    late_closer: Option<SessionCloser>,
+}
+
 impl AgentSession {
     fn new() -> Self {
         Self {
             agent_id: OnceCell::new(),
+            minted: StdMutex::new(MintLedger::default()),
             init_lock: Arc::new(Mutex::new(())),
             minted_cwd: OnceCell::new(),
             active_mint_cwd: StdMutex::new(None),
@@ -1934,6 +2131,87 @@ impl AgentSession {
             turn_kill: Arc::new(StdMutex::new(None)),
         }
     }
+
+    fn minted(&self) -> std::sync::MutexGuard<'_, MintLedger> {
+        self.minted
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Record that release is taking this entry out of the session map.
+    fn mark_released(&self) {
+        self.minted().released = true;
+    }
+
+    /// Whether release has unpublished this entry. A caller still holding it
+    /// must neither mint for it nor reuse what was minted for it.
+    fn is_released(&self) -> bool {
+        self.minted().released
+    }
+
+    /// Run `start`, which puts a turn on the wire for this entry's agent
+    /// session, unless release has unpublished the entry. The ledger lock is
+    /// held throughout, so `start` and [`Self::mark_released`] cannot
+    /// interleave: a turn is either on the wire before the release that
+    /// cancels it begins, or it never starts.
+    fn admit_turn<T>(&self, start: impl FnOnce() -> T) -> Option<T> {
+        let minted = self.minted();
+        (!minted.released).then(start)
+    }
+
+    /// Publish the id a mint settled on, with the cwd it was minted for.
+    /// Refused once release has unpublished the entry: the id then stays with
+    /// the mint's [`AbandonedMintGuard`] and is closed, never used.
+    fn publish_minted(&self, agent_id: AgentSessionId, cwd: String) -> Result<(), BridgeError> {
+        // Held to the end, so publication and release cannot interleave.
+        let minted = self.minted();
+        if minted.released {
+            return Err(BridgeError::InvalidStateTransition);
+        }
+        // The cwd goes first, so whoever can see the id can see its cwd. `set`
+        // on a `OnceCell` can only fail if already set (impossible here since
+        // the mint owns the single-flight init guard); ignore the result.
+        let _ = self.minted_cwd.set(cwd);
+        self.agent_id
+            .set(agent_id)
+            .map_err(|_| BridgeError::InvalidStateTransition)
+    }
+
+    /// Take in an id that a mint received from `session/new` and did not
+    /// publish. Release's close flight collects it, unless that flight has
+    /// been and gone, in which case the id is closed from here.
+    fn abandon_minted(&self, agent_id: AgentSessionId) {
+        let mut minted = self.minted();
+        match minted.late_closer.clone() {
+            Some(closer) => {
+                drop(minted);
+                closer.close_late(agent_id);
+            }
+            None => minted.abandoned.push(agent_id),
+        }
+    }
+
+    /// The ids abandoned so far. They are settled and never carried a turn,
+    /// so release's close flight has nothing to wait for before closing them.
+    fn take_abandoned(&self) -> Vec<AgentSessionId> {
+        std::mem::take(&mut self.minted().abandoned)
+    }
+
+    /// Give release's close flight what is left for it to close: the ids
+    /// abandoned since [`Self::take_abandoned`], and the published one. They
+    /// come apart because only the published id can have carried a turn.
+    /// `closer` stays behind for whatever a mint abandons after this.
+    fn hand_over_minted(
+        &self,
+        closer: &SessionCloser,
+    ) -> (Vec<AgentSessionId>, Option<AgentSessionId>) {
+        let mut minted = self.minted();
+        minted.late_closer = Some(closer.clone());
+        (
+            std::mem::take(&mut minted.abandoned),
+            self.agent_id.get().cloned(),
+        )
+    }
 }
 
 struct ActiveMintCwdGuard(Arc<AgentSession>);
@@ -1943,6 +2221,296 @@ impl Drop for ActiveMintCwdGuard {
         if let Ok(mut active_cwd) = self.0.active_mint_cwd.lock() {
             *active_cwd = None;
         }
+    }
+}
+
+/// Hands the id one mint attempt received from `session/new` back to its
+/// entry as abandoned unless that attempt goes on to publish it, on every
+/// exit including abort.
+struct AbandonedMintGuard {
+    entry: Arc<AgentSession>,
+    agent_id: Option<AgentSessionId>,
+}
+
+impl AbandonedMintGuard {
+    fn arm(entry: Arc<AgentSession>, agent_id: AgentSessionId) -> Self {
+        Self {
+            entry,
+            agent_id: Some(agent_id),
+        }
+    }
+
+    fn published(&mut self) {
+        self.agent_id = None;
+    }
+}
+
+impl Drop for AbandonedMintGuard {
+    fn drop(&mut self) {
+        if let Some(agent_id) = self.agent_id.take() {
+            self.entry.abandon_minted(agent_id);
+        }
+    }
+}
+
+/// One `session/close` on the wire with the instant its answer is awaited
+/// until, or the typed reason it never got there.
+type PendingClose =
+    Result<(SentRequest<CloseSessionResponse>, tokio::time::Instant), AcpTraceEvent>;
+
+/// How many closes a [`SessionCloser`] sends, or settles, before it yields to
+/// the runtime. An entry's backlog of abandoned ids has no bound of its own,
+/// and the release caller's deadline can only fire between polls of the
+/// flight.
+const CLOSE_BATCH: usize = 32;
+
+/// What sending `session/close` needs from the backend, cloned out of it so
+/// that a close can outlive the release call that asked for it.
+///
+/// Close ownership: from the moment release takes an entry out of the session
+/// map, every agent session id that `session/new` returned for it is owed one
+/// `session/close`. Two things end that: the close going on the wire, or the
+/// connection being fenced, when the adapter is being torn down and takes the
+/// session with it. Elapsed time never does.
+#[derive(Clone)]
+struct SessionCloser {
+    cx: ConnectionTo<Agent>,
+    dispatch_gate: Arc<StdMutex<()>>,
+    unavailable: Arc<AtomicBool>,
+    /// [`AcpConfig::cancel_grace`]: how long the answer to a close is awaited,
+    /// counted from when that close was sent.
+    grace: Duration,
+    owner_key_fingerprint: i64,
+    /// Pause taken before each request, to walk dispatch past the release
+    /// caller's deadline.
+    #[cfg(test)]
+    dispatch_delay: Option<Duration>,
+    /// How many closes this closer and its clones have put on the wire, for
+    /// a test to sample while a flight is still dispatching.
+    #[cfg(test)]
+    sent: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl SessionCloser {
+    /// The outcome a flight records for a mint that outlived its deadline. It
+    /// stands for an id that is not known yet, which makes it the only
+    /// outcome that can be unsent on a usable connection.
+    fn mint_outlived_deadline(&self) -> AcpTraceEvent {
+        AcpTraceEvent::SessionCloseAbandoned {
+            owner_key_fingerprint: self.owner_key_fingerprint,
+            sent: false,
+            connection_unavailable: self.unavailable.load(Ordering::SeqCst),
+        }
+    }
+
+    /// Release's close flight over an entry it has just unpublished.
+    ///
+    /// `deadline` is the release caller's. Of the flight's own waits it
+    /// bounds one, the wait for a mint still in flight: a mint that outlives
+    /// it cannot publish what it mints and closes it itself when it settles.
+    /// The wait for the turn lock has no bound. Whoever holds that lock is
+    /// still acting on the published session and nothing else would ever
+    /// close it, so its close stays pending until the lock is free or the
+    /// connection is fenced. The flight takes the lock only to send that
+    /// close and lets it go before it waits on any answer. The answer to
+    /// each close is awaited for one grace from when that close was sent.
+    ///
+    /// `dispatched` fires once every close the flight owns is on the wire or
+    /// has been refused by the fence. Traces one typed outcome per agent
+    /// session and returns them, counting a mint that outlived `deadline` as
+    /// one.
+    async fn close_released(
+        self,
+        entry: Arc<AgentSession>,
+        deadline: tokio::time::Instant,
+        dispatched: oneshot::Sender<()>,
+    ) -> Vec<AcpTraceEvent> {
+        // A fenced connection takes no close, so there is nothing to wait for.
+        let fenced = || self.unavailable.load(Ordering::SeqCst);
+        let mut seen = HashSet::new();
+        // What earlier mints abandoned is settled and never carried a turn,
+        // so it goes out at once instead of behind the two waits below.
+        let mut turnless = self.dispatch(entry.take_abandoned(), &mut seen).await;
+        // A mint holds `init_lock` until it has published its id or abandoned
+        // it, so the lock is how the flight learns of an id that `session/new`
+        // had yet to settle when release ran. Taking it once is enough: a
+        // released entry starts no further mint.
+        let mint_settled = fenced()
+            || tokio::time::timeout_at(deadline, entry.init_lock.lock())
+                .await
+                .is_ok();
+        let (abandoned, published) = entry.hand_over_minted(&self);
+        if !mint_settled && abandoned.is_empty() && published.is_none() {
+            // The mint outlived the deadline, so there is no id to close yet.
+            // It cannot publish what it mints and closes it itself when it
+            // settles (`abandon_minted`).
+            turnless.push(Err(self.mint_outlived_deadline()));
+        }
+        // What that mint abandoned in the meantime never carried a turn
+        // either, so it does not wait for the turn lock.
+        turnless.extend(self.dispatch(abandoned, &mut seen).await);
+        let after_turn = async {
+            let mut pending = Vec::new();
+            if let Some(agent_id) = published {
+                // Whoever holds the turn lock is still acting on the
+                // published session: a turn the preceding cancel is
+                // unwinding, a finished turn persisting its outcome, a prompt
+                // yet to be refused admission, a config reconcile. Closing
+                // underneath any of them could turn a clean cancel into an
+                // agent error, so the close goes out only once the lock is
+                // free, however long that takes: giving up would leave the
+                // session open with nobody left to close it.
+                let turn = if fenced() {
+                    None
+                } else {
+                    Some(entry.turn_lock.lock().await)
+                };
+                pending = self.dispatch(vec![agent_id], &mut seen).await;
+                // The lock orders the send alone. It is free again before
+                // the flight signals dispatch or waits on the answer, so a
+                // prompt queued behind it is refused now, not a grace later.
+                drop(turn);
+            }
+            // Nobody may still be listening; the flight finishes regardless.
+            let _ = dispatched.send(());
+            self.settle(pending).await
+        };
+        // The closes already sent are answered while the published id waits
+        // for the turn lock, so their outcomes are not held behind that wait.
+        let (mut outcomes, after_turn) = tokio::join!(self.settle(turnless), after_turn);
+        outcomes.extend(after_turn);
+        outcomes
+    }
+
+    /// Run [`Self::close_released`] as a task of its own and wait for it to
+    /// have dispatched, though never past `deadline`: the cancel grace bounds
+    /// the release caller, not the flight. The flight is spawned before the
+    /// first wait, so a release caller that stops waiting, or is itself
+    /// cancelled, cannot strand a close, and one that waits is held neither
+    /// by a turn lock that stays taken, nor by the agent's answers, nor by a
+    /// backlog of abandoned ids the flight is still working through. Returns
+    /// the flight, which runs on whether or not it is joined.
+    async fn fly_released(
+        self,
+        entry: Arc<AgentSession>,
+        deadline: tokio::time::Instant,
+    ) -> tokio::task::JoinHandle<Vec<AcpTraceEvent>> {
+        let (dispatched, dispatch_settled) = oneshot::channel();
+        let flight = tokio::spawn(self.close_released(entry, deadline, dispatched));
+        // An error from the signal only means the flight is gone.
+        let _ = tokio::time::timeout_at(deadline, dispatch_settled).await;
+        flight
+    }
+
+    /// Close one id that a mint abandoned after its release's flight had
+    /// collected the entry, as a task of its own. The id never carried a
+    /// turn, so it goes out at once unless the connection is fenced.
+    fn close_late(self, agent_id: AgentSessionId) {
+        // Without a runtime the backend is going down, adapter and all.
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        runtime.spawn(async move {
+            let pending = self.dispatch(vec![agent_id], &mut HashSet::new()).await;
+            self.settle(pending).await;
+        });
+    }
+
+    /// Put `session/close` on the wire for each id not yet `seen`, in order.
+    /// Every request is checked against the fence on its own, so once the
+    /// fence closes the rest come back unsent. Nothing else holds one back.
+    ///
+    /// The runtime gets a turn after every [`CLOSE_BATCH`] ids, so no backlog
+    /// is worked through in one poll and the release caller's deadline fires
+    /// on time on a single-threaded runtime too. Every id is still
+    /// dispatched: yielding delays the rest, it never drops them.
+    async fn dispatch(
+        &self,
+        agent_ids: Vec<AgentSessionId>,
+        seen: &mut HashSet<AgentSessionId>,
+    ) -> Vec<PendingClose> {
+        let mut pending = Vec::with_capacity(agent_ids.len());
+        for (position, agent_id) in agent_ids.into_iter().enumerate() {
+            if position > 0 && position.is_multiple_of(CLOSE_BATCH) {
+                tokio::task::yield_now().await;
+            }
+            if !seen.insert(agent_id.clone()) {
+                continue;
+            }
+            #[cfg(test)]
+            if let Some(delay) = self.dispatch_delay {
+                tokio::time::sleep(delay).await;
+            }
+            pending.push(self.send(agent_id));
+        }
+        pending
+    }
+
+    /// Send one `session/close`, unless the connection is fenced. The fence
+    /// is the only refusal: no deadline leaves a known id unsent.
+    fn send(&self, agent_id: AgentSessionId) -> PendingClose {
+        // Same short, non-awaiting gate as prompt installation: once
+        // escalation or retirement closes the fence, nothing more is sent.
+        let _dispatch = self
+            .dispatch_gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.unavailable.load(Ordering::SeqCst) {
+            return Err(AcpTraceEvent::SessionCloseAbandoned {
+                owner_key_fingerprint: self.owner_key_fingerprint,
+                sent: false,
+                connection_unavailable: true,
+            });
+        }
+        let sent = self.cx.send_request(CloseSessionRequest::new(agent_id));
+        #[cfg(test)]
+        self.sent.fetch_add(1, Ordering::SeqCst);
+        Ok((sent, tokio::time::Instant::now() + self.grace))
+    }
+
+    /// Wait for the answer to each close that was sent, until that close's
+    /// own deadline, then type and trace every outcome. An answer that is
+    /// already in, or a close that was never sent, takes no wait at all, so
+    /// the runtime gets a turn after every [`CLOSE_BATCH`] outcomes here as
+    /// it does in [`Self::dispatch`].
+    async fn settle(&self, pending: Vec<PendingClose>) -> Vec<AcpTraceEvent> {
+        let owner_key_fingerprint = self.owner_key_fingerprint;
+        let mut outcomes = Vec::with_capacity(pending.len());
+        for (position, close) in pending.into_iter().enumerate() {
+            if position > 0 && position.is_multiple_of(CLOSE_BATCH) {
+                tokio::task::yield_now().await;
+            }
+            let outcome = match close {
+                Ok((sent, answer_by)) => {
+                    match tokio::time::timeout_at(answer_by, sent.block_task()).await {
+                        Ok(Ok(_)) => AcpTraceEvent::SessionCloseAcknowledged {
+                            owner_key_fingerprint,
+                        },
+                        // Retirement or escalation fails or starves a request
+                        // already on the wire. That is this bridge's own
+                        // teardown, not the agent's verdict on the close.
+                        _ if self.unavailable.load(Ordering::SeqCst) => {
+                            AcpTraceEvent::SessionCloseAbandoned {
+                                owner_key_fingerprint,
+                                sent: true,
+                                connection_unavailable: true,
+                            }
+                        }
+                        Ok(Err(error)) => AcpTraceEvent::SessionCloseRejected {
+                            owner_key_fingerprint,
+                            rpc_code: AcpBackend::error_code_i64(error.code),
+                        },
+                        Err(_) => AcpTraceEvent::SessionCloseUnanswered {
+                            owner_key_fingerprint,
+                        },
+                    }
+                }
+                Err(unsent) => unsent,
+            };
+            outcome.emit();
+            outcomes.push(outcome);
+        }
+        outcomes
     }
 }
 
@@ -2114,7 +2682,7 @@ pub struct AcpBackend {
     /// Per-bridge-session spec stash (Increment 3b/session-cwd). Dispatch (T10)
     /// calls [`Self::configure_session`] to insert the `SessionSpec` (effective
     /// `model`/`effort`/`mode` + `cwd`) for a session BEFORE its first prompt;
-    /// [`Self::ensure_session`] reads THIS map (keyed by the bridge `SessionId`) at
+    /// [`Self::ensure_session_for`] reads THIS map (keyed by the bridge `SessionId`) at
     /// lazy mint and applies the values, so a live registry config edit affects new
     /// sessions with no respawn and per-request overrides stay isolated per session.
     /// Behind a plain `std::sync::Mutex` (only short, non-async insert/lookup/remove
@@ -2149,6 +2717,10 @@ pub struct AcpBackend {
     perm_timeout_ms: Arc<AtomicU64>,
     #[cfg(test)]
     prompt_snapshot_hook: StdMutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    /// Fires once `prompt_inner` has resolved its bridge key to an entry and
+    /// before it does anything with that entry.
+    #[cfg(test)]
+    prompt_entry_hook: StdMutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     #[cfg(test)]
     before_process_redactor_hook: StdMutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     #[cfg(test)]
@@ -2468,6 +3040,65 @@ impl AcpBackend {
         }
     }
 
+    /// Name the agent session a mint has just created, before that mint
+    /// publishes it (see [`AcpConfig::rename_new_sessions`]). The id is still
+    /// unpublished, so no turn, cancel or prompt can target the session and
+    /// no update route exists for it: whatever the adapter emits for the
+    /// session during the exchange is dropped by the notification handler,
+    /// never delivered to a turn.
+    ///
+    /// Best effort, sent once and never retried. The request goes out under
+    /// the dispatch gate, so none is sent on a connection that is already
+    /// fenced, and its answer is awaited for at most `bound`. Emits the one
+    /// typed outcome and keeps nothing: the caller publishes the session
+    /// whatever that outcome is, and an answer that comes after the bound is
+    /// dropped with the request.
+    async fn rename_minted_session(
+        cx: &ConnectionTo<Agent>,
+        dispatch_gate: &Arc<StdMutex<()>>,
+        unavailable: &Arc<AtomicBool>,
+        agent_id: AgentSessionId,
+        key: &SessionId,
+        bound: Duration,
+    ) {
+        let owner_key_fingerprint = AcpTraceEvent::owner_key_fingerprint(key.as_str());
+        let sent = {
+            // Same short, non-awaiting gate as prompt installation: once
+            // escalation or retirement closes the fence, no prompt is sent.
+            let _dispatch = dispatch_gate
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            (!unavailable.load(Ordering::SeqCst))
+                .then(|| cx.send_request(Self::rename_session_request(agent_id, key)))
+        };
+        let outcome = match sent {
+            None => AcpTraceEvent::SessionRenameSkipped {
+                owner_key_fingerprint,
+            },
+            Some(sent) => match tokio::time::timeout(bound, sent.block_task()).await {
+                Ok(Ok(_)) => AcpTraceEvent::SessionRenameAcknowledged {
+                    owner_key_fingerprint,
+                },
+                // Retirement or escalation fails or starves a request
+                // already on the wire. That is this bridge's own teardown,
+                // not the adapter's verdict on the rename.
+                _ if unavailable.load(Ordering::SeqCst) => {
+                    AcpTraceEvent::SessionRenameInterrupted {
+                        owner_key_fingerprint,
+                    }
+                }
+                Ok(Err(error)) => AcpTraceEvent::SessionRenameRejected {
+                    owner_key_fingerprint,
+                    rpc_code: Self::error_code_i64(error.code),
+                },
+                Err(_) => AcpTraceEvent::SessionRenameUnanswered {
+                    owner_key_fingerprint,
+                },
+            },
+        };
+        outcome.emit();
+    }
+
     #[cfg(test)]
     fn turn_prompt_accepted(entry: &AgentSession) -> bool {
         Self::turn_prompt_accepted_handle(entry)
@@ -2752,6 +3383,44 @@ impl AcpBackend {
             .map(|p| ContentBlock::Text(TextContent::new(p.text.clone())))
             .collect();
         PromptRequest::new(agent_id, blocks)
+    }
+
+    /// The name the bridge gives the agent session it mints for the bridge
+    /// session with key `key` (see [`AcpConfig::rename_new_sessions`]): the
+    /// key itself, reduced to what is safe as the one argument of a slash
+    /// command. Every character outside `[A-Za-z0-9._:@-]` becomes `_`, the
+    /// result is cut to [`RENAME_NAME_MAX_CHARS`] characters, and an empty
+    /// result becomes [`RENAME_NAME_FALLBACK`].
+    fn rename_session_name(key: &str) -> String {
+        let name: String = key
+            .chars()
+            .take(RENAME_NAME_MAX_CHARS)
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | ':' | '@' | '-') {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect();
+        if name.is_empty() {
+            RENAME_NAME_FALLBACK.to_owned()
+        } else {
+            name
+        }
+    }
+
+    /// Build the `session/prompt` request that names agent session `agent_id`
+    /// after the bridge session with key `key`: the adapter's slash command
+    /// `/rename <name>` as the prompt's single text block.
+    fn rename_session_request(agent_id: AgentSessionId, key: &SessionId) -> PromptRequest {
+        let name = Self::rename_session_name(key.as_str());
+        PromptRequest::new(
+            agent_id,
+            vec![ContentBlock::Text(TextContent::new(format!(
+                "/rename {name}"
+            )))],
+        )
     }
 
     /// Build the `session/cancel` NOTIFICATION this backend sends to cancel an
@@ -4199,6 +4868,8 @@ impl AcpBackend {
             #[cfg(test)]
             prompt_snapshot_hook: StdMutex::new(None),
             #[cfg(test)]
+            prompt_entry_hook: StdMutex::new(None),
+            #[cfg(test)]
             before_process_redactor_hook: StdMutex::new(None),
             #[cfg(test)]
             fail_deferred_cancel_send: Arc::new(AtomicBool::new(false)),
@@ -4692,6 +5363,15 @@ impl AcpBackend {
     /// would PANIC if two tasks on different runtime threads raced here.)
     async fn session_entry(&self, key: &SessionId) -> Result<Arc<AgentSession>, BridgeError> {
         let mut map = self.sessions.lock().await;
+        self.session_entry_in(&mut map, key)
+    }
+
+    /// [`Self::session_entry`] for a caller that already holds the session map.
+    fn session_entry_in(
+        &self,
+        map: &mut HashMap<SessionId, Arc<AgentSession>>,
+        key: &SessionId,
+    ) -> Result<Arc<AgentSession>, BridgeError> {
         if let Some(s) = map.get(key) {
             return Ok(Arc::clone(s));
         }
@@ -4723,27 +5403,40 @@ impl AcpBackend {
     /// the same `swap` and exactly one sends.
     ///
     /// `prompt` calls this, then acquires `turn_lock` and sends `session/prompt`.
-    async fn ensure_session(&self, key: &SessionId) -> Result<AgentSessionId, BridgeError> {
-        self.ensure_session_observed(
+    ///
+    /// The mint acts on `entry`, which the caller resolved `key` to, and never
+    /// looks `key` up itself: `key` only names the config stash to read and
+    /// where the minted session's catalog is filed. So a caller mints for,
+    /// locks and admits a turn on one and the same entry, and if release
+    /// unpublished that entry in the meantime the call is refused instead of
+    /// being served from a replacement entry that no release would close.
+    async fn ensure_session_for(
+        &self,
+        key: &SessionId,
+        entry: &Arc<AgentSession>,
+    ) -> Result<AgentSessionId, BridgeError> {
+        let snapshot = self.session_config_snapshot(key)?;
+        self.ensure_session_observed_with_snapshot(
             key,
+            entry,
             Arc::new(bridge_core::diagnostics::NoopDiagnosticObserver::default()),
+            snapshot,
         )
         .await
     }
 
-    async fn ensure_session_observed(
-        &self,
-        key: &SessionId,
-        observer: Arc<dyn DiagnosticObserver>,
-    ) -> Result<AgentSessionId, BridgeError> {
-        let snapshot = self.session_config_snapshot(key)?;
-        self.ensure_session_observed_with_snapshot(key, observer, snapshot)
-            .await
+    /// [`Self::ensure_session_for`] by bridge key, creating the entry if `key`
+    /// was never seen. The one lookup happens here.
+    #[cfg(test)]
+    async fn ensure_session(&self, key: &SessionId) -> Result<AgentSessionId, BridgeError> {
+        let entry = self.session_entry(key).await?;
+        self.ensure_session_for(key, &entry).await
     }
 
     async fn ensure_session_observed_with_snapshot(
         &self,
         key: &SessionId,
+        entry: &Arc<AgentSession>,
         observer: Arc<dyn DiagnosticObserver>,
         snapshot: SessionConfigSnapshot,
     ) -> Result<AgentSessionId, BridgeError> {
@@ -4756,7 +5449,6 @@ impl AcpBackend {
             self.diagnostic_redactor_for_cwds(std::slice::from_ref(&snapshot.desired_cwd)),
             stderr,
         );
-        let entry = self.session_entry(key).await?;
         // One owned snapshot supplies both mint inputs and the lifecycle redactor.
         // A concurrent `configure_session` replacement affects the next snapshot,
         // never half of this attempt.
@@ -4790,10 +5482,23 @@ impl AcpBackend {
             .or_else(|| self.config.as_ref().map(|config| config.mcp.clone()))
             .unwrap_or_default();
         let mcp_is_bound = bound_mcp.is_some();
+        // The bound on the rename of a newly minted session, when this
+        // agent's sessions are renamed at all.
+        let rename_bound_for_mint = self
+            .config
+            .as_ref()
+            .filter(|config| config.rename_new_sessions)
+            .map(|config| config.rename_timeout);
         let (id, newly_minted) = if let Some(id) = entry.agent_id.get() {
             (id.clone(), false)
         } else {
             let init_guard = Arc::clone(&entry.init_lock).lock_owned().await;
+            if entry.is_released() {
+                // Release unpublished the entry while this caller queued for
+                // it. Whatever was minted for it is being closed, and a mint
+                // started now could only be closed in turn.
+                return Err(BridgeError::InvalidStateTransition);
+            }
             if let Some(id) = entry.agent_id.get() {
                 drop(init_guard);
                 (id.clone(), false)
@@ -4805,7 +5510,7 @@ impl AcpBackend {
                 // caller is cancelled while waiting to install the process
                 // redactor, this local guard clears the attempt; once the
                 // initializer is spawned, ownership moves into that task.
-                let active_mint_cwd = ActiveMintCwdGuard(Arc::clone(&entry));
+                let active_mint_cwd = ActiveMintCwdGuard(Arc::clone(entry));
                 #[cfg(test)]
                 {
                     let hook = self
@@ -4818,10 +5523,12 @@ impl AcpBackend {
                     }
                 }
                 self.apply_process_redactor_for_live_sessions(None).await;
-                let entry_for_init = Arc::clone(&entry);
+                let entry_for_init = Arc::clone(entry);
                 let cx_for_init = self.cx()?.clone();
                 let lifecycle_for_init = lifecycle.clone();
                 let stderr_ring_for_init = self.stderr_ring.clone();
+                let dispatch_gate_for_init = Arc::clone(&self.dispatch_gate);
+                let unavailable_for_init = Arc::clone(&self.unavailable);
                 #[cfg(test)]
                 let fail_deferred_cancel_send = Arc::clone(&self.fail_deferred_cancel_send);
                 let task = tokio::spawn(async move {
@@ -4881,6 +5588,10 @@ impl AcpBackend {
                             }
                         };
                         let id = resp.session_id;
+                        // The agent-side session exists from here on, whether or
+                        // not the configuration below publishes it as `agent_id`.
+                        let mut abandoned_mint =
+                            AbandonedMintGuard::arm(Arc::clone(&entry), id.clone());
                         let opts0 = resp.config_options.unwrap_or_default();
                         let modes0 = resp.modes;
                         let models0 = resp.models;
@@ -5076,16 +5787,32 @@ impl AcpBackend {
                             session_catalog.current_mode = Some(mode.clone());
                         }
 
-                        // (5) Record the cwd that was actually used to mint this session so
-                        // the immutability guard below can compare future requests against
-                        // what the agent was ACTUALLY given at session/new (ACP §11A).
-                        // `set` on a `OnceCell` can only fail if already set (impossible here
-                        // since we own the single-flight init guard); ignore the result.
-                        let _ = entry.minted_cwd.set(cwd_for_mint);
-                        entry
-                            .agent_id
-                            .set(id.clone())
-                            .map_err(|_| BridgeError::InvalidStateTransition)?;
+                        // (5) Name the session, for an adapter that is opted in. Last of
+                        // the setup, on an id nobody else can see yet, and best effort:
+                        // one attempt, and whatever comes of it the mint goes on to
+                        // publish this same session. A release that overtakes the mint
+                        // here finds the id with `abandoned_mint`, as it would during
+                        // any earlier step.
+                        if let Some(bound) = rename_bound_for_mint {
+                            Self::rename_minted_session(
+                                &cx,
+                                &dispatch_gate_for_init,
+                                &unavailable_for_init,
+                                id.clone(),
+                                &key_for_mint,
+                                bound,
+                            )
+                            .await;
+                        }
+
+                        // (6) Publish the id, recording with it the cwd that was actually
+                        // used to mint this session so the immutability guard below can
+                        // compare future requests against what the agent was ACTUALLY given
+                        // at session/new (ACP §11A). A release that unpublished the entry
+                        // while this mint ran wins: the id stays with `abandoned_mint`,
+                        // which hands it over to be closed, and the caller gets the error.
+                        entry.publish_minted(id.clone(), cwd_for_mint)?;
+                        abandoned_mint.published();
                         catalogs_for_mint
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -5193,16 +5920,9 @@ impl AcpBackend {
         Ok(id)
     }
 
-    /// Record a cancel for bridge key `key`, honoring the create/cancel race.
-    ///
-    /// * If the agent session already exists, send `session/cancel` for it now.
-    /// * If `session/new` is still in flight (or hasn't started), set the latch
-    ///   so `ensure_session` flushes the cancel the instant the id is minted.
-    /// * If `key` was never seen (session ended / never started), it's a no-op
-    ///   on the wire but still latches a freshly-created entry defensively.
-    ///
-    /// Task 4 builds full `cancel()` completion semantics (waiting for the
-    /// prompt result with `stopReason:"cancelled"`) on top of this.
+    /// [`Self::request_cancel_for`] by bridge key, creating the entry if `key`
+    /// was never seen.
+    #[cfg(test)]
     async fn request_cancel(&self, key: &SessionId) -> Result<CancelDispatch, TeardownFailure> {
         let entry = self
             .session_entry(key)
@@ -5211,6 +5931,21 @@ impl AcpBackend {
                 error,
                 prompt_may_have_been_accepted: false,
             })?;
+        self.request_cancel_for(&entry)
+    }
+
+    /// Record a cancel for the bridge session `entry` belongs to, honoring the
+    /// create/cancel race.
+    ///
+    /// * If the agent session already exists, send `session/cancel` for it now.
+    /// * If `session/new` is still in flight (or hasn't started), set the latch
+    ///   so `ensure_session` flushes the cancel the instant the id is minted.
+    /// * If the key was never seen (session ended / never started), it's a no-op
+    ///   on the wire but still latches a freshly-created entry defensively.
+    ///
+    /// Task 4 builds full `cancel()` completion semantics (waiting for the
+    /// prompt result with `stopReason:"cancelled"`) on top of this.
+    fn request_cancel_for(&self, entry: &AgentSession) -> Result<CancelDispatch, TeardownFailure> {
         let cx = self.cx().map_err(|error| TeardownFailure {
             error,
             prompt_may_have_been_accepted: false,
@@ -5225,7 +5960,7 @@ impl AcpBackend {
                 Self::send_cancel_under_dispatch_fence(
                     &self.dispatch_gate,
                     &self.unavailable,
-                    || Self::turn_prompt_accepted_handle(&entry),
+                    || Self::turn_prompt_accepted_handle(entry),
                     || {
                         #[cfg(test)]
                         if self.fail_cancel_send.load(Ordering::SeqCst) {
@@ -5241,8 +5976,6 @@ impl AcpBackend {
     }
 
     async fn cancel_inner(&self, session: &SessionId) -> Result<CancelDispatch, TeardownFailure> {
-        let dispatch = self.request_cancel(session).await?;
-
         let entry = self
             .session_entry(session)
             .await
@@ -5250,6 +5983,14 @@ impl AcpBackend {
                 error,
                 prompt_may_have_been_accepted: false,
             })?;
+        self.cancel_entry(&entry)
+    }
+
+    /// [`Self::cancel_inner`] against an entry the caller already holds. It
+    /// awaits nothing, so release can run it under its hold of the session map.
+    fn cancel_entry(&self, entry: &AgentSession) -> Result<CancelDispatch, TeardownFailure> {
+        let dispatch = self.request_cancel_for(entry)?;
+
         let (turn_active, turn_meta) = if let Some(agent_id) = entry.agent_id.get() {
             self.updates()
                 .ok()
@@ -5359,7 +6100,7 @@ impl AcpBackend {
     /// Discovery seam: mint a THROWAWAY `session/new`, read the advertised model/effort/mode
     /// surfaces the agent returns, map them to [`AgentCaps`], and return — **no prompt is sent
     /// and nothing is configured**. This reads the SAME `config_options` the lazy mint
-    /// ([`Self::ensure_session`]) reads at its step (1), plus the SDK 1.x `modes` state, BEFORE
+    /// ([`Self::ensure_session_for`]) reads at its step (1), plus the SDK 1.x `modes` state, BEFORE
     /// any model/mode/effort resolution.
     ///
     /// `cwd` is any readable directory: `session/new` requires one (ACP §11A) but discovery reads
@@ -5535,23 +6276,44 @@ impl AcpBackend {
         // Cleanup is unconditional: even a transport error while sending cancel
         // must not retain stale per-session routing/config state. The error is
         // still returned to the observed owner instead of being discarded.
-        let cancel_result = self.cancel_inner(session).await;
-        let removed = {
+        let (cancel_result, released) = {
+            // One hold of the session map covers marking the entry, cancelling
+            // it and removing it, so all three act on the same entry and it is
+            // never published while marked. The mark comes before the cancel:
+            // a turn admitted ahead of it is already on the wire for the
+            // cancel to find, and none is admitted after it (see
+            // `AgentSession::admit_turn`). Nor can a mint still running for
+            // this entry be published from here on, only closed, while the
+            // key is free for a fresh entry once the map is let go.
             let mut sessions = self.sessions.lock().await;
+            let cancel_result = self
+                .session_entry_in(&mut sessions, session)
+                .map_err(|error| TeardownFailure {
+                    error,
+                    prompt_may_have_been_accepted: false,
+                })
+                .and_then(|entry| {
+                    entry.mark_released();
+                    self.cancel_entry(&entry)
+                });
             if sessions.contains_key(session) {
-                // ACP has no session-close acknowledgement here. Once bridge
-                // ownership is removed, the shared process can still emit late
-                // text derived from this session's MCP environment, while a
-                // future mint will replace the finite exact-value policy.
-                // Fail closed before removal so that replacement can retain
-                // counts but can never re-enable process stderr text.
+                // The agent learns the session is over only from the
+                // best-effort `session/close` below, which is sent after
+                // bridge ownership is removed, only to an agent that
+                // advertises it, and whose acknowledgement does not promise
+                // the session's children have already stopped. So the shared
+                // process can still emit late text derived from this
+                // session's MCP environment, while a future mint will replace
+                // the finite exact-value policy. Fail closed before removal so
+                // that replacement can retain counts but can never re-enable
+                // process stderr text.
                 if let Some(stderr_ring) = self.stderr_ring.as_ref() {
                     stderr_ring.retain_metadata_only();
                 }
             }
-            sessions.remove(session).is_some()
+            (cancel_result, sessions.remove(session))
         };
-        let owner_detach_result = if removed {
+        let owner_detach_result = if released.is_some() {
             // Ordinary release changes owner membership only. Destructive
             // retirement remains a separate, flight-joined adapter action.
             self.detach_process_flight_owner(session)
@@ -5569,6 +6331,14 @@ impl AcpBackend {
             .lock()
             .expect("pending_turn_meta lock")
             .remove(session);
+        // Bridge-side state is gone; only now tell the agent. Whichever release
+        // removed the entry owns its close, so a repeated or concurrent release
+        // of the same key finds nothing left to close. The outcome is traced,
+        // never returned: the cancel and owner-detach results below are the
+        // whole release contract.
+        if let Some(entry) = released {
+            self.close_released_agent_sessions(session, entry).await;
+        }
         match (cancel_result, owner_detach_result) {
             (Err(failure), _) => Err(failure),
             (Ok(_), Err(error)) => Err(TeardownFailure {
@@ -5577,6 +6347,50 @@ impl AcpBackend {
             }),
             (Ok(_), Ok(())) => Ok(()),
         }
+    }
+
+    /// Send ACP `session/close` for every agent-side session that was minted
+    /// for a just-released bridge session, so the agent can free that
+    /// session's resources while the shared process keeps serving the others.
+    ///
+    /// Nothing is sent unless the agent advertised the close capability at
+    /// initialize and an id was actually minted. The caller's wait is bounded
+    /// by one [`AcpConfig::cancel_grace`]: this returns once every close is on
+    /// the wire or refused by the fence, or when the grace has passed,
+    /// whichever comes first. The closes themselves are not bounded by it. A
+    /// close that cannot go out yet stays pending with the flight until the
+    /// session's turn lock is free or the adapter is torn down, and the
+    /// answers are awaited by the flight alone (see
+    /// [`SessionCloser::fly_released`]).
+    async fn close_released_agent_sessions(&self, session: &SessionId, entry: Arc<AgentSession>) {
+        // One absolute deadline for this caller's wait, and for the flight's
+        // wait for a mint, started before any id is collected or sent.
+        let deadline = tokio::time::Instant::now() + self.cancel_grace();
+        let Some(closer) = self.session_closer(session) else {
+            return;
+        };
+        // Nothing joins the flight: it finishes, and traces, on its own.
+        closer.fly_released(entry, deadline).await;
+    }
+
+    /// The means of closing `session`'s agent sessions, or `None` when there
+    /// is nothing to close them with: the agent did not advertise the close
+    /// capability at initialize, or there is no connection.
+    fn session_closer(&self, session: &SessionId) -> Option<SessionCloser> {
+        if !self.capabilities().close {
+            return None;
+        }
+        Some(SessionCloser {
+            cx: self.cx().ok()?.clone(),
+            dispatch_gate: Arc::clone(&self.dispatch_gate),
+            unavailable: Arc::clone(&self.unavailable),
+            grace: self.cancel_grace(),
+            owner_key_fingerprint: AcpTraceEvent::owner_key_fingerprint(session.as_str()),
+            #[cfg(test)]
+            dispatch_delay: None,
+            #[cfg(test)]
+            sent: Arc::default(),
+        })
     }
 
     /// Last-resort escalation when a cancelled turn does not complete within the
@@ -6248,9 +7062,31 @@ impl AcpBackend {
 
         // (1) Mint/get the agent session id. Done OUTSIDE the turn lock so a
         // first-prompt's `session/new` doesn't hold the lock while awaiting.
+        // This is the turn's only lookup of `session`: the mint, the turn lock
+        // and admission below all act on this one entry, so a release that
+        // unpublishes it before the turn is admitted leaves this prompt
+        // nothing to mint or start. Resolving the key again could instead mint
+        // into a replacement entry that the release never sees and this turn
+        // never uses.
         let entry = self.session_entry(session).await?;
+        #[cfg(test)]
+        {
+            let hook = self
+                .prompt_entry_hook
+                .lock()
+                .ok()
+                .and_then(|hook| hook.clone());
+            if let Some(hook) = hook {
+                hook();
+            }
+        }
         let agent_id = self
-            .ensure_session_observed_with_snapshot(session, diagnostic_observer, config_snapshot)
+            .ensure_session_observed_with_snapshot(
+                session,
+                &entry,
+                diagnostic_observer,
+                config_snapshot,
+            )
             .await?;
 
         // Acquire the turn lock as an OWNED guard so it can move into the driver
@@ -6371,43 +7207,69 @@ impl AcpBackend {
             Arc::clone(&entry.turn_accepted),
             Arc::clone(&prompt_accepted),
         );
-        {
-            let mut map = registry.lock().expect("update routing registry lock");
-            map.insert(
-                agent_id.clone(),
-                TurnRoute {
-                    tx,
-                    watch: watch.clone(),
-                    turn_meta,
-                    cancelled: Arc::new(AtomicBool::new(false)),
-                    active: Arc::clone(&turn_active),
-                    prefix_attestation: prefix_state.clone(),
-                    activity: Arc::clone(&progress),
-                    terminal_evidence: terminal_state.clone(),
-                },
-            );
-        }
+        let route = TurnRoute {
+            tx,
+            watch: watch.clone(),
+            turn_meta,
+            cancelled: Arc::new(AtomicBool::new(false)),
+            active: Arc::clone(&turn_active),
+            prefix_attestation: prefix_state.clone(),
+            activity: Arc::clone(&progress),
+            terminal_evidence: terminal_state.clone(),
+        };
         let req = EvidenceAwarePromptRequest::new(
             Self::prompt_request(agent_id.clone(), &parts),
             evidence_binding,
         );
-
-        // Install a FRESH per-turn kill switch on the session: the external cancel
-        // grace-watcher fires it to unblock a hung driver (see `cancel`). The
-        // driver `select!`s on it and clears the slot on exit.
         let kill = Arc::new(tokio::sync::Notify::new());
-        *entry.turn_kill.lock().expect("turn_kill lock") = Some(Arc::clone(&kill));
 
-        // This is the accepted-work barrier. The connection-wide gate makes
-        // the final availability sample and SDK request installation one
-        // atomic ordering point with escalation and retirement. All observer
-        // awaits are complete before this short synchronous critical section.
-        let prompt_fut = Self::install_prompt_request(
-            &self.dispatch_gate,
-            &self.unavailable,
-            &prompt_accepted,
-            || cx.send_request(req).block_task(),
-        );
+        // Admission. This entry and its agent session were selected before the
+        // turn lock was taken, and release can have begun for them at any
+        // await since. So the route, the kill switch and the request go in
+        // together under the entry's ledger lock, which release takes to mark
+        // the entry before it cancels: either this turn is on the wire for
+        // that cancel to find, or none of it happens and no turn starts on a
+        // session that is being closed.
+        let admitted = entry.admit_turn(|| {
+            registry
+                .lock()
+                .expect("update routing registry lock")
+                .insert(agent_id.clone(), route);
+
+            // Install a FRESH per-turn kill switch on the session: the external cancel
+            // grace-watcher fires it to unblock a hung driver (see `cancel`). The
+            // driver `select!`s on it and clears the slot on exit.
+            *entry.turn_kill.lock().expect("turn_kill lock") = Some(Arc::clone(&kill));
+
+            // This is the accepted-work barrier. The connection-wide gate makes
+            // the final availability sample and SDK request installation one
+            // atomic ordering point with escalation and retirement. All observer
+            // awaits are complete before this short synchronous critical section.
+            Self::install_prompt_request(
+                &self.dispatch_gate,
+                &self.unavailable,
+                &prompt_accepted,
+                || cx.send_request(req).block_task(),
+            )
+        });
+        let Some(prompt_fut) = admitted else {
+            // Release won. Nothing was installed, and the key now mints afresh.
+            return Err(lifecycle
+                .failure(
+                    DiagnosticPhase::PromptStart,
+                    Some(DiagnosticPhase::ConfigApply),
+                    DiagnosticFailureClass::Canceled,
+                    FailureDisposition::Fatal,
+                    "acp.prompt_start.session_released",
+                    "ACP session was released before prompt dispatch",
+                    None,
+                    false,
+                    None,
+                    None,
+                    None,
+                )
+                .await);
+        };
         let Some(prompt_fut) = prompt_fut else {
             turn_active.store(false, Ordering::SeqCst);
             if let Ok(mut map) = registry.lock() {
@@ -7140,7 +8002,7 @@ impl AgentBackend for AcpBackend {
     }
 
     /// Stash the per-session spec (Increment 3b/session-cwd). Dispatch (T10) calls
-    /// this BEFORE the first prompt for a session; [`Self::ensure_session`] reads
+    /// this BEFORE the first prompt for a session; [`Self::ensure_session_for`] reads
     /// the stash at lazy mint (keyed by the bridge `SessionId`) and applies
     /// `mode`/`model`/`effort` from `spec.config`. Insert-or-replace, so a
     /// re-`configure_session` with fresh spec (e.g. after a live registry edit) takes
@@ -7268,16 +8130,18 @@ impl AgentBackend for AcpBackend {
         session: &SessionId,
         spec: &SessionSpec,
     ) -> Result<ReconcileOutcome, BridgeError> {
+        // The only lookup of `session` here: both branches act on this entry.
         let entry = self.session_entry(session).await?;
         if entry.agent_id.get().is_none() {
             self.configure_session(session, spec).await?;
-            let _aid = self.ensure_session(session).await?;
+            let _aid = self.ensure_session_for(session, &entry).await?;
             return Ok(ReconcileOutcome::Applied);
         }
 
-        // Already minted (checked above): read the live id DIRECTLY from this entry — do NOT call
-        // `ensure_session` (it re-fetches the map by key, racing `release_session`, and re-runs the
-        // `minted_cwd` immutability guard). We only reconcile model/effort on the live session.
+        // Already minted (checked above): read the live id DIRECTLY from this entry. Do NOT resolve
+        // `session` again (a second lookup races `release_session` and can land on a replacement
+        // entry), and do NOT go through `ensure_session_for` (it re-runs the `minted_cwd`
+        // immutability guard). We only reconcile model/effort on the live session.
         let aid =
             entry.agent_id.get().cloned().ok_or_else(|| {
                 BridgeError::agent_crashed("warm reconcile: agent session vanished")
@@ -7348,9 +8212,10 @@ impl AgentBackend for AcpBackend {
     }
 
     /// Release a warm ACP session: best-effort cancel any in-flight turn, drop the
-    /// agent-side `AgentSession` (a later reuse re-mints a fresh `session/new`), and drop
-    /// the config stash. Does NOT `retire()` the shared process (warm for serve's lifetime,
-    /// shared across sessions). [Slice 0]
+    /// agent-side `AgentSession` (a later reuse re-mints a fresh `session/new`), drop
+    /// the config stash, and send a best-effort `session/close` for what was minted when
+    /// the agent advertises it. Does NOT `retire()` the shared process (warm for serve's
+    /// lifetime, shared across sessions). [Slice 0]
     async fn release_session(&self, session: &SessionId) {
         let _ = self.release_session_checked(session).await;
     }
@@ -7980,6 +8845,21 @@ mod tests {
                 AcpTraceEvent::PromptFailed,
                 AcpTraceEvent::WarmConfigNotAdvertised,
                 AcpTraceEvent::WarmConfigRejected,
+                AcpTraceEvent::SessionCloseAcknowledged {
+                    owner_key_fingerprint: AcpTraceEvent::owner_key_fingerprint(known_secret),
+                },
+                AcpTraceEvent::SessionCloseRejected {
+                    owner_key_fingerprint: AcpTraceEvent::owner_key_fingerprint(known_secret),
+                    rpc_code: -32603,
+                },
+                AcpTraceEvent::SessionCloseUnanswered {
+                    owner_key_fingerprint: AcpTraceEvent::owner_key_fingerprint(known_secret),
+                },
+                AcpTraceEvent::SessionCloseAbandoned {
+                    owner_key_fingerprint: AcpTraceEvent::owner_key_fingerprint(known_secret),
+                    sent: true,
+                    connection_unavailable: true,
+                },
             ] {
                 event.emit();
             }
@@ -10848,6 +11728,7 @@ mod tests {
             permission_registry: Arc::new(StdMutex::new(None)),
             perm_timeout_ms: Arc::new(AtomicU64::new(120_000)),
             prompt_snapshot_hook: StdMutex::new(None),
+            prompt_entry_hook: StdMutex::new(None),
             before_process_redactor_hook: StdMutex::new(None),
             fail_deferred_cancel_send: Arc::new(AtomicBool::new(false)),
             fail_cancel_send: Arc::new(AtomicBool::new(false)),
@@ -10895,13 +11776,13 @@ mod tests {
     // `CancelNotification`, `NewSessionRequest`, `AgentSessionId` are already in
     // scope via `super::*`; import only the agent-side response/prompt types.
     use agent_client_protocol::schema::v1::{
-        AuthenticateRequest, AuthenticateResponse, ContentChunk, NewSessionResponse,
-        PermissionOption, PermissionOptionId, PromptRequest, PromptResponse,
+        AuthenticateRequest, AuthenticateResponse, CloseSessionResponse, ContentChunk,
+        NewSessionResponse, PermissionOption, PermissionOptionId, PromptRequest, PromptResponse,
         RequestPermissionRequest, RequestPermissionResponse, SessionConfigKind,
-        SessionConfigOption, SessionConfigOptionCategory, SessionConfigSelectOption, SessionMode,
-        SessionModeState, SetSessionConfigOptionResponse, SetSessionModeRequest,
-        SetSessionModeResponse, StopReason, ToolCall, ToolCallId, ToolCallUpdate,
-        ToolCallUpdateFields, ToolKind, Usage,
+        SessionConfigOption, SessionConfigOptionCategory, SessionConfigSelectOption,
+        SessionInfoUpdate, SessionMode, SessionModeState, SetSessionConfigOptionResponse,
+        SetSessionModeRequest, SetSessionModeResponse, StopReason, ToolCall, ToolCallId,
+        ToolCallUpdate, ToolCallUpdateFields, ToolKind, Usage,
     };
     use bridge_core::domain::Effort;
     use std::sync::atomic::AtomicUsize;
@@ -11045,6 +11926,12 @@ mod tests {
         /// When set, the `session/set_mode` handler REJECTS the request with a
         /// JSON-RPC error (modeling an agent that does not know the mode id).
         reject_set_mode: Arc<AtomicBool>,
+        /// Whether `session/set_mode` waits on `set_mode_gate` before replying,
+        /// holding a mint in its configuration phase (and, because handlers run
+        /// on the agent's dispatch loop, every later frame behind it).
+        gate_set_mode: Arc<AtomicBool>,
+        /// Released to let a gated `session/set_mode` reply proceed.
+        set_mode_gate: Arc<Notify>,
         /// Model ids observed via `session/set_model` requests (in order).
         set_models: Arc<Mutex<Vec<String>>>,
         /// Fires every time a `session/set_model` is recorded.
@@ -11068,6 +11955,12 @@ mod tests {
         set_config_options: Arc<Mutex<Vec<(String, String)>>>,
         /// Fires every time a `session/set_config_option` is recorded.
         set_config_seen: Arc<Notify>,
+        /// Whether `session/set_config_option` waits on `set_config_gate`
+        /// before replying. The wait is taken off the agent's dispatch loop,
+        /// so the agent goes on handling other frames meanwhile.
+        gate_set_config: Arc<AtomicBool>,
+        /// Released to let a gated `session/set_config_option` reply proceed.
+        set_config_gate: Arc<Notify>,
         /// When set, the `session/set_config_option` handler REJECTS with a JSON-RPC
         /// error (modeling an adapter without a structured effort knob). NON-FATAL.
         reject_set_config: Arc<AtomicBool>,
@@ -11099,6 +11992,47 @@ mod tests {
         new_session_cwd: Arc<Mutex<Option<std::path::PathBuf>>>,
         /// Exact serialized `session/new` request for bound-delivery assertions.
         new_session_request: Arc<Mutex<Option<serde_json::Value>>>,
+
+        // ── session/close on release ──────────────────────────────────────────
+        /// Whether `initialize` advertises `sessionCapabilities.close`. Off by
+        /// default, so a release sends no `session/close` unless a test opts in.
+        advertise_close: Arc<AtomicBool>,
+        /// Agent session ids observed via `session/close` requests (in order).
+        closes: Arc<Mutex<Vec<String>>>,
+        /// `session/cancel` and `session/close` frames in arrival order, as
+        /// `cancel:<id>` / `close:<id>`, so a test can assert their ordering.
+        teardown_log: Arc<Mutex<Vec<String>>>,
+        /// When set, `session/close` is answered with a JSON-RPC error.
+        reject_close: Arc<AtomicBool>,
+        /// When set, `session/close` is recorded but never answered.
+        hang_close: Arc<AtomicBool>,
+
+        // ── /rename at mint ───────────────────────────────────────────────────
+        /// The method of every session request and `session/cancel`
+        /// received, in arrival order.
+        wire_log: Arc<Mutex<Vec<&'static str>>>,
+        /// Every `session/prompt` received, in arrival order: the agent
+        /// session id and the request's `prompt` array as it was sent.
+        prompts: Arc<Mutex<Vec<(String, serde_json::Value)>>>,
+        /// Fires every time a `/rename` prompt is recorded.
+        rename_seen: Arc<Notify>,
+        /// When set, a `/rename` prompt is answered with a JSON-RPC error.
+        reject_rename: Arc<AtomicBool>,
+        /// When set, a `/rename` prompt is recorded but never answered.
+        hang_rename: Arc<AtomicBool>,
+        /// Whether a `/rename` prompt waits on `rename_gate` before it is
+        /// answered. The wait is taken off the agent's dispatch loop, so the
+        /// agent goes on handling other frames meanwhile.
+        gate_rename: Arc<AtomicBool>,
+        /// Released to let a gated `/rename` proceed.
+        rename_gate: Arc<Notify>,
+        /// When set, the agent also emits an `agent_message_chunk` and a
+        /// `usage_update` for the session before it answers a `/rename`,
+        /// beside the `session_info_update` it always sends.
+        rename_chatter: Arc<AtomicBool>,
+        /// Fires once the agent is done with a `/rename`: its updates are
+        /// sent, and its answer too unless it is one that never comes.
+        rename_settled: Arc<Notify>,
     }
 
     impl Recorder {
@@ -11133,6 +12067,8 @@ mod tests {
                 set_modes: Arc::new(Mutex::new(Vec::new())),
                 set_mode_seen: Arc::new(Notify::new()),
                 reject_set_mode: Arc::new(AtomicBool::new(false)),
+                gate_set_mode: Arc::new(AtomicBool::new(false)),
+                set_mode_gate: Arc::new(Notify::new()),
                 set_models: Arc::new(Mutex::new(Vec::new())),
                 set_model_seen: Arc::new(Notify::new()),
                 reject_set_model: Arc::new(AtomicBool::new(false)),
@@ -11143,6 +12079,8 @@ mod tests {
                 session_models: Arc::new(Mutex::new(None)),
                 set_config_options: Arc::new(Mutex::new(Vec::new())),
                 set_config_seen: Arc::new(Notify::new()),
+                gate_set_config: Arc::new(AtomicBool::new(false)),
+                set_config_gate: Arc::new(Notify::new()),
                 reject_set_config: Arc::new(AtomicBool::new(false)),
                 advertise_model_config: Arc::new(AtomicBool::new(true)),
                 model_config_id: Arc::new(Mutex::new("model".to_string())),
@@ -11171,7 +12109,54 @@ mod tests {
                 set_config_error_body: Arc::new(Mutex::new("Invalid value for effort".to_string())),
                 new_session_cwd: Arc::new(Mutex::new(None)),
                 new_session_request: Arc::new(Mutex::new(None)),
+                advertise_close: Arc::new(AtomicBool::new(false)),
+                closes: Arc::new(Mutex::new(Vec::new())),
+                teardown_log: Arc::new(Mutex::new(Vec::new())),
+                reject_close: Arc::new(AtomicBool::new(false)),
+                hang_close: Arc::new(AtomicBool::new(false)),
+                wire_log: Arc::new(Mutex::new(Vec::new())),
+                prompts: Arc::new(Mutex::new(Vec::new())),
+                rename_seen: Arc::new(Notify::new()),
+                reject_rename: Arc::new(AtomicBool::new(false)),
+                hang_rename: Arc::new(AtomicBool::new(false)),
+                gate_rename: Arc::new(AtomicBool::new(false)),
+                rename_gate: Arc::new(Notify::new()),
+                rename_chatter: Arc::new(AtomicBool::new(false)),
+                rename_settled: Arc::new(Notify::new()),
             }
+        }
+
+        /// The text of a prompt that is one `/rename <name>` block, which the
+        /// agent answers as the codex adapter does: locally, with no turn.
+        fn rename_command(req: &PromptRequest) -> Option<&str> {
+            match req.prompt.as_slice() {
+                [ContentBlock::Text(block)] if block.text.starts_with("/rename ") => {
+                    Some(block.text.as_str())
+                }
+                _ => None,
+            }
+        }
+
+        /// The `/rename` prompts received so far, as `(agent session id,
+        /// prompt text)` in arrival order.
+        async fn renames(&self) -> Vec<(String, String)> {
+            self.prompts
+                .lock()
+                .await
+                .iter()
+                .filter_map(|(session, blocks)| {
+                    let text = blocks.get(0)?.get("text")?.as_str()?;
+                    text.starts_with("/rename ")
+                        .then(|| (session.clone(), text.to_owned()))
+                })
+                .collect()
+        }
+
+        /// A recorder whose agent advertises `sessionCapabilities.close`.
+        fn advertising_close(minted_id: &'static str) -> Self {
+            let rec = Self::new(minted_id);
+            rec.advertise_close.store(true, Ordering::SeqCst);
+            rec
         }
 
         fn select_options(values: Vec<String>) -> Vec<SessionConfigSelectOption> {
@@ -11600,6 +12585,7 @@ mod tests {
             let r_config = rec.clone();
             let r_prompt = rec.clone();
             let r_cancel = rec.clone();
+            let r_close = rec.clone();
             let _ = Agent
                 .builder()
                 .name("recording-agent")
@@ -11612,9 +12598,42 @@ mod tests {
                             // Advertise the configured auth methods (default: none)
                             // so the backend's `authenticate` step can be exercised.
                             let methods = r.auth_methods.lock().await.clone();
-                            responder.respond(
-                                InitializeResponse::new(ProtocolVersion::V1).auth_methods(methods),
-                            )?;
+                            let mut response =
+                                InitializeResponse::new(ProtocolVersion::V1).auth_methods(methods);
+                            if r.advertise_close.load(Ordering::SeqCst) {
+                                response = response.agent_capabilities(
+                                    AgentCapabilities::new().session_capabilities(
+                                        SessionCapabilities::new()
+                                            .close(SessionCloseCapabilities::new()),
+                                    ),
+                                );
+                            }
+                            responder.respond(response)?;
+                            Ok(())
+                        }
+                    },
+                    agent_client_protocol::on_receive_request!(),
+                )
+                // Registered whether or not the capability is advertised, so a
+                // `session/close` the backend should not have sent is still recorded.
+                .on_receive_request(
+                    move |req: CloseSessionRequest,
+                          responder: agent_client_protocol::Responder<CloseSessionResponse>,
+                          _cx| {
+                        let r = r_close.clone();
+                        async move {
+                            let id = req.session_id.0.to_string();
+                            r.teardown_log.lock().await.push(format!("close:{id}"));
+                            r.closes.lock().await.push(id);
+                            if r.hang_close.load(Ordering::SeqCst) {
+                                // Dropping the responder sends nothing: the
+                                // request stays unanswered for the connection's life.
+                                drop(responder);
+                            } else if r.reject_close.load(Ordering::SeqCst) {
+                                responder.respond_with_internal_error("close rejected")?;
+                            } else {
+                                responder.respond(CloseSessionResponse::new())?;
+                            }
                             Ok(())
                         }
                     },
@@ -11646,8 +12665,12 @@ mod tests {
                           _cx| {
                         let r = r_mode.clone();
                         async move {
+                            r.wire_log.lock().await.push("session/set_mode");
                             r.set_modes.lock().await.push(req.mode_id.0.to_string());
                             r.set_mode_seen.notify_one();
+                            if r.gate_set_mode.load(Ordering::SeqCst) {
+                                r.set_mode_gate.notified().await;
+                            }
                             if r.reject_set_mode.load(Ordering::SeqCst) {
                                 responder.respond_with_internal_error("unknown mode id")?;
                             } else {
@@ -11664,6 +12687,7 @@ mod tests {
                           _cx| {
                         let r = r_model.clone();
                         async move {
+                            r.wire_log.lock().await.push("session/set_model");
                             r.set_models.lock().await.push(req.model_id.clone());
                             r.set_model_seen.notify_one();
                             if r.reject_set_model.load(Ordering::SeqCst) {
@@ -11682,9 +12706,13 @@ mod tests {
                           responder: agent_client_protocol::Responder<
                         SetSessionConfigOptionResponse,
                     >,
-                          _cx| {
+                          cx: ConnectionTo<Client>| {
                         let r = r_config.clone();
                         async move {
+                            r.wire_log
+                                .lock()
+                                .await
+                                .push("session/set_config_option");
                             let call_number = {
                                 let mut set_config_options = r.set_config_options.lock().await;
                                 set_config_options
@@ -11692,25 +12720,40 @@ mod tests {
                                 set_config_options.len()
                             };
                             r.set_config_seen.notify_one();
-                            let reject_call = *r.reject_set_config_call.lock().await;
-                            if r.reject_set_config.load(Ordering::SeqCst)
-                                || reject_call == Some(call_number)
-                            {
-                                let body = r.set_config_error_body.lock().await.clone();
-                                responder.respond_with_internal_error(body)?;
+                            let gated = r.gate_set_config.load(Ordering::SeqCst);
+                            let respond = async move {
+                                if gated {
+                                    r.set_config_gate.notified().await;
+                                }
+                                let reject_call = *r.reject_set_config_call.lock().await;
+                                if r.reject_set_config.load(Ordering::SeqCst)
+                                    || reject_call == Some(call_number)
+                                {
+                                    let body = r.set_config_error_body.lock().await.clone();
+                                    responder.respond_with_internal_error(body)?;
+                                } else {
+                                    r.refresh_config_current(&req.config_id.0, &req.value.0)
+                                        .await;
+                                    let config_options =
+                                        if r.empty_config_response_on_set.load(Ordering::SeqCst) {
+                                            Vec::new()
+                                        } else {
+                                            r.advertised_config_options().await
+                                        };
+                                    responder.respond(SetSessionConfigOptionResponse::new(
+                                        config_options,
+                                    ))?;
+                                }
+                                Ok(())
+                            };
+                            if gated {
+                                // Parking in the handler would park the
+                                // dispatch loop, and with it every later frame.
+                                cx.spawn(respond)?;
+                                Ok(())
                             } else {
-                                r.refresh_config_current(&req.config_id.0, &req.value.0)
-                                    .await;
-                                let config_options =
-                                    if r.empty_config_response_on_set.load(Ordering::SeqCst) {
-                                        Vec::new()
-                                    } else {
-                                        r.advertised_config_options().await
-                                    };
-                                responder
-                                    .respond(SetSessionConfigOptionResponse::new(config_options))?;
+                                respond.await
                             }
-                            Ok(())
                         }
                     },
                     agent_client_protocol::on_receive_request!(),
@@ -11721,6 +12764,7 @@ mod tests {
                           _cx| {
                         let r = r_new.clone();
                         async move {
+                            r.wire_log.lock().await.push("session/new");
                             let mint_sequence =
                                 r.new_session_calls.fetch_add(1, Ordering::SeqCst) + 1;
                             *r.new_session_request.lock().await =
@@ -11760,6 +12804,59 @@ mod tests {
                           cx: ConnectionTo<Client>| {
                         let r = r_prompt.clone();
                         async move {
+                            r.wire_log.lock().await.push("session/prompt");
+                            r.prompts.lock().await.push((
+                                req.session_id.0.to_string(),
+                                serde_json::to_value(&req.prompt).expect("serialize prompt"),
+                            ));
+                            if let Some(command) = Recorder::rename_command(&req) {
+                                // The adapter's slash command, not a turn: it is
+                                // answered locally and leaves `prompt_log` alone.
+                                // Off the dispatch loop, so that a gated or
+                                // unanswered rename parks nothing else.
+                                let title = command["/rename ".len()..].to_owned();
+                                let sid = req.session_id.clone();
+                                let cx2 = cx.clone();
+                                r.rename_seen.notify_one();
+                                cx.spawn(async move {
+                                    if r.gate_rename.load(Ordering::SeqCst) {
+                                        r.rename_gate.notified().await;
+                                    }
+                                    let mut updates = vec![SessionUpdate::SessionInfoUpdate(
+                                        SessionInfoUpdate::new().title(title),
+                                    )];
+                                    if r.rename_chatter.load(Ordering::SeqCst) {
+                                        updates.push(SessionUpdate::AgentMessageChunk(
+                                            ContentChunk::new(ContentBlock::Text(
+                                                TextContent::new("rename chatter"),
+                                            )),
+                                        ));
+                                        updates.push(SessionUpdate::UsageUpdate(
+                                            agent_client_protocol::schema::v1::UsageUpdate::new(
+                                                7, 70,
+                                            ),
+                                        ));
+                                    }
+                                    for update in updates {
+                                        cx2.send_notification(SessionNotification::new(
+                                            sid.clone(),
+                                            update,
+                                        ))?;
+                                    }
+                                    if r.hang_rename.load(Ordering::SeqCst) {
+                                        // Dropping the responder sends nothing: the
+                                        // request stays unanswered for the connection's life.
+                                        drop(responder);
+                                    } else if r.reject_rename.load(Ordering::SeqCst) {
+                                        responder.respond_with_internal_error("rename rejected")?;
+                                    } else {
+                                        responder.respond(PromptResponse::new(StopReason::EndTurn))?;
+                                    }
+                                    r.rename_settled.notify_one();
+                                    Ok(())
+                                })?;
+                                return Ok(());
+                            }
                             r.prompt_log.lock().await.push("start");
                             r.prompt_started.notify_one();
 
@@ -11925,7 +13022,10 @@ mod tests {
                     move |notif: CancelNotification, _cx| {
                         let r = r_cancel.clone();
                         async move {
-                            r.cancels.lock().await.push(notif.session_id.0.to_string());
+                            let id = notif.session_id.0.to_string();
+                            r.wire_log.lock().await.push("session/cancel");
+                            r.teardown_log.lock().await.push(format!("cancel:{id}"));
+                            r.cancels.lock().await.push(id);
                             r.cancel_seen.notify_one();
                             r.cancel_arrived.notify_one();
                             Ok(())
@@ -12419,8 +13519,9 @@ mod tests {
             .unwrap();
 
         let observer = Arc::new(InMemoryDiagnosticObserver::new(8).unwrap());
+        let entry = backend.session_entry(&session).await.unwrap();
         let error = backend
-            .ensure_session_observed_with_snapshot(&session, observer, snapshot)
+            .ensure_session_observed_with_snapshot(&session, &entry, observer, snapshot)
             .await
             .expect_err("the fake agent rejects session/new");
         let diagnostic = assert_agent_failure(
@@ -13503,6 +14604,7 @@ mod tests {
             permission_registry: Arc::new(StdMutex::new(None)),
             perm_timeout_ms: Arc::new(AtomicU64::new(120_000)),
             prompt_snapshot_hook: StdMutex::new(None),
+            prompt_entry_hook: StdMutex::new(None),
             before_process_redactor_hook: StdMutex::new(None),
             fail_deferred_cancel_send: Arc::new(AtomicBool::new(false)),
             fail_cancel_send: Arc::new(AtomicBool::new(false)),
@@ -16686,6 +17788,7 @@ mod tests {
             permission_registry: Arc::new(StdMutex::new(None)),
             perm_timeout_ms: Arc::new(AtomicU64::new(120_000)),
             prompt_snapshot_hook: StdMutex::new(None),
+            prompt_entry_hook: StdMutex::new(None),
             before_process_redactor_hook: StdMutex::new(None),
             fail_deferred_cancel_send: Arc::new(AtomicBool::new(false)),
             fail_cancel_send: Arc::new(AtomicBool::new(false)),
@@ -17404,6 +18507,2019 @@ mod tests {
         );
     }
 
+    // ── session/close on release ──────────────────────────────────────────────
+
+    /// Round-trip one request through the recording agent. Its dispatch loop
+    /// handles frames in arrival order, so every frame the backend sent before
+    /// this call (in particular any `session/close`) is recorded on return.
+    async fn settle_recording_agent(backend: &AcpBackend) {
+        backend
+            .cx()
+            .expect("recording backend is connected")
+            .send_request(AuthenticateRequest::new(AuthMethodId::new("settle")))
+            .block_task()
+            .await
+            .expect("recording agent answers the settle round trip");
+    }
+
+    /// Stash config and turn metadata, then mint, so every map a release must
+    /// clear holds an entry for `session`.
+    async fn mint_with_bridge_state(backend: &AcpBackend, session: &SessionId) -> AgentSessionId {
+        backend
+            .configure_session(session, &SessionSpec::from_config(Default::default()))
+            .await
+            .unwrap();
+        backend
+            .configure_turn(session, turn_meta("ctx-close", 1, "op-close"))
+            .await;
+        let agent_id = backend.ensure_session(session).await.unwrap();
+        assert!(backend.sessions.lock().await.contains_key(session));
+        assert!(backend.session_cfg.lock().unwrap().contains_key(session));
+        assert!(backend.session_catalog(session).is_some());
+        assert!(backend
+            .pending_turn_meta
+            .lock()
+            .unwrap()
+            .contains_key(session));
+        agent_id
+    }
+
+    async fn assert_bridge_state_released(backend: &AcpBackend, session: &SessionId) {
+        assert!(
+            backend.sessions.lock().await.get(session).is_none(),
+            "agent session entry removed"
+        );
+        assert!(
+            backend.session_cfg.lock().unwrap().get(session).is_none(),
+            "cfg stash removed"
+        );
+        assert!(
+            backend.session_catalog(session).is_none(),
+            "session catalog removed"
+        );
+        assert!(
+            backend.take_pending_turn_meta(session).is_none(),
+            "pending turn metadata removed"
+        );
+    }
+
+    /// Mint and release one session, returning its agent id. The positive
+    /// control for a test whose subject must NOT be closed: it shows that a
+    /// release on this very connection does reach `Recorder::closes`.
+    async fn release_control_session(backend: &AcpBackend, key: &str) -> String {
+        let session = bkey(key);
+        let agent_id = backend.ensure_session(&session).await.unwrap();
+        backend.release_session_result(&session).await.unwrap();
+        agent_id.0.to_string()
+    }
+
+    /// Wait until the agent has recorded `count` `session/cancel` frames. A
+    /// count, because `Recorder::cancel_seen` keeps a permit for every cancel,
+    /// including the one an earlier control release sent.
+    async fn cancels_recorded(rec: &Recorder, count: usize) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while rec.cancels.lock().await.len() < count {
+                rec.cancel_seen.notified().await;
+            }
+        })
+        .await
+        .expect("session/cancel must reach the agent");
+    }
+
+    /// Wait until the agent has recorded `count` `session/close` frames, for a
+    /// close sent by a task the test cannot join.
+    async fn closes_recorded(rec: &Recorder, count: usize) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while rec.closes.lock().await.len() < count {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("session/close must reach the agent");
+    }
+
+    /// Wait until a release running elsewhere has taken `session` out of the
+    /// session map, which it does before it waits on anything to close.
+    async fn unpublished(backend: &AcpBackend, session: &SessionId) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while backend.sessions.lock().await.contains_key(session) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("release must unpublish the session");
+    }
+
+    type Mint = tokio::task::JoinHandle<Result<AgentSessionId, BridgeError>>;
+
+    /// Start a mint for `session` and park it in its mode configuration:
+    /// `session/new` has answered, so the agent-side session exists, but
+    /// nothing is published. Returns the mint with the id it is holding. The
+    /// agent's dispatch loop stays parked with it until [`open_mode_gate`].
+    async fn mint_parked_in_mode_setup(
+        backend: &Arc<AcpBackend>,
+        rec: &Recorder,
+        session: &SessionId,
+    ) -> (Mint, String) {
+        let configured = rec.set_modes.lock().await.len();
+        rec.gate_set_mode.store(true, Ordering::SeqCst);
+        let mint = {
+            let backend = Arc::clone(backend);
+            let session = session.clone();
+            tokio::spawn(async move { backend.ensure_session(&session).await })
+        };
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while rec.set_modes.lock().await.len() <= configured {
+                rec.set_mode_seen.notified().await;
+            }
+        })
+        .await
+        .expect("the mint must reach its mode configuration");
+        let minted = rec.new_session_calls.load(Ordering::SeqCst);
+        (mint, format!("{}-{minted}", rec.minted_id))
+    }
+
+    fn open_mode_gate(rec: &Recorder) {
+        rec.gate_set_mode.store(false, Ordering::SeqCst);
+        rec.set_mode_gate.notify_one();
+    }
+
+    /// A recording backend whose agent advertises close, mints unique ids,
+    /// and has a mode to configure, so that a mint can be parked mid-setup.
+    async fn connect_closing_with_mode(rec: &Recorder, cancel_grace: Duration) -> Arc<AcpBackend> {
+        rec.unique_minted_ids.store(true, Ordering::SeqCst);
+        Arc::new(
+            connect_recording_with(
+                rec.clone(),
+                AcpConfig {
+                    cancel_grace,
+                    ..test_config_with_mode("mode")
+                },
+            )
+            .await,
+        )
+    }
+
+    fn spawn_release(
+        backend: &Arc<AcpBackend>,
+        session: &SessionId,
+    ) -> tokio::task::JoinHandle<Result<BackendCleanupDispositionV1, BridgeError>> {
+        let backend = Arc::clone(backend);
+        let session = session.clone();
+        tokio::spawn(async move { backend.release_session_checked(&session).await })
+    }
+
+    const CLOSE_FINGERPRINT: i64 = 7;
+
+    /// Unpublish `session` the way release does, and return its entry with
+    /// the means of closing it. `dispatch_delay` is taken before each request.
+    async fn unpublish_for_close(
+        backend: &AcpBackend,
+        session: &SessionId,
+        grace: Duration,
+        dispatch_delay: Option<Duration>,
+    ) -> (Arc<AgentSession>, SessionCloser) {
+        let entry = backend
+            .sessions
+            .lock()
+            .await
+            .remove(session)
+            .expect("the session has an entry to release");
+        entry.mark_released();
+        let closer = SessionCloser {
+            grace,
+            owner_key_fingerprint: CLOSE_FINGERPRINT,
+            dispatch_delay,
+            ..backend
+                .session_closer(session)
+                .expect("the recording agent advertises close")
+        };
+        (entry, closer)
+    }
+
+    /// [`unpublish_for_close`], then run the close flight and return its
+    /// typed outcomes.
+    async fn close_flight(
+        backend: &AcpBackend,
+        session: &SessionId,
+        grace: Duration,
+        dispatched: oneshot::Sender<()>,
+    ) -> Vec<AcpTraceEvent> {
+        let (entry, closer) = unpublish_for_close(backend, session, grace, None).await;
+        let deadline = tokio::time::Instant::now() + grace;
+        let flight = closer.close_released(entry, deadline, dispatched);
+        tokio::time::timeout(grace + Duration::from_secs(5), flight)
+            .await
+            .expect("a close flight must end when nothing holds its closes back")
+    }
+
+    /// [`close_flight`] for a caller that does not watch the dispatch signal.
+    async fn close_flight_outcomes(
+        backend: &AcpBackend,
+        session: &SessionId,
+        grace: Duration,
+    ) -> Vec<AcpTraceEvent> {
+        let (dispatched, _dispatch_settled) = oneshot::channel();
+        close_flight(backend, session, grace, dispatched).await
+    }
+
+    type Prompt = tokio::task::JoinHandle<Result<BackendStream, BridgeError>>;
+
+    /// Start a prompt for `session` and park it in its `block_at`-th
+    /// lifecycle record. On a session that is already minted, the fourth
+    /// record is the last of the reuse path, made once the prompt has
+    /// selected its agent session and before it queues for the turn lock; the
+    /// fifth is `PromptStart`, made under the turn lock and before anything
+    /// is installed for the turn; the eighth is the completion of
+    /// `PromptStream`, made by the driver once the turn's result is terminal
+    /// and its route is gone, still under the turn lock. Returns the prompt
+    /// with what resumes it.
+    async fn prompt_parked_at_record(
+        backend: &Arc<AcpBackend>,
+        session: &SessionId,
+        block_at: u64,
+    ) -> (Prompt, Arc<Notify>) {
+        let entered = Arc::new(Notify::new());
+        let resume = Arc::new(Notify::new());
+        let observer = Arc::new(BlockOnRecord {
+            count: AtomicU64::new(0),
+            block_at,
+            entered: Arc::clone(&entered),
+            release: Arc::clone(&resume),
+        });
+        let prompt = {
+            let backend = Arc::clone(backend);
+            let session = session.clone();
+            tokio::spawn(async move {
+                backend
+                    .prompt_with_observers(
+                        &session,
+                        vec![],
+                        BackendObservers::diagnostic_only(observer),
+                    )
+                    .await
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(2), entered.notified())
+            .await
+            .expect("the prompt must reach the record it parks in");
+        (prompt, resume)
+    }
+
+    /// The failure of a prompt that lost its agent session to a release.
+    async fn assert_refused_as_released(prompt: Prompt) {
+        let error = tokio::time::timeout(Duration::from_secs(2), prompt)
+            .await
+            .expect("a prompt that lost to release must settle")
+            .unwrap()
+            .err()
+            .expect("a prompt must not start on a session that is being released");
+        let diagnostic = assert_agent_failure(
+            &error,
+            DiagnosticPhase::PromptStart,
+            DiagnosticFailureClass::Canceled,
+            false,
+        );
+        assert_eq!(
+            diagnostic.code().as_str(),
+            "acp.prompt_start.session_released"
+        );
+    }
+
+    #[tokio::test]
+    async fn release_sends_session_close_when_agent_advertises_close() {
+        let rec = Recorder::advertising_close("agent-sess-CLOSE");
+        let backend = connect_recording(rec.clone()).await;
+        let session = bkey("bridge-CLOSE");
+        let agent_id = backend.ensure_session(&session).await.unwrap();
+
+        backend.release_session_result(&session).await.unwrap();
+
+        settle_recording_agent(&backend).await;
+        assert_eq!(
+            *rec.closes.lock().await,
+            vec![agent_id.0.to_string()],
+            "release must close exactly the minted agent session"
+        );
+        assert_eq!(
+            *rec.teardown_log.lock().await,
+            vec!["cancel:agent-sess-CLOSE", "close:agent-sess-CLOSE"],
+            "session/close must follow session/cancel"
+        );
+
+        // The same bridge key mints a fresh agent session afterwards.
+        backend.ensure_session(&session).await.unwrap();
+        assert_eq!(rec.new_session_calls.load(Ordering::SeqCst), 2);
+        settle_recording_agent(&backend).await;
+        assert_eq!(
+            rec.closes.lock().await.len(),
+            1,
+            "re-minting the released key must not close anything"
+        );
+    }
+
+    #[tokio::test]
+    async fn release_does_not_send_session_close_when_capability_absent() {
+        async fn closes_after_release(advertise_close: bool) -> Vec<String> {
+            let rec = Recorder::new("agent-sess-CLOSE-CAP");
+            rec.advertise_close.store(advertise_close, Ordering::SeqCst);
+            let backend = connect_recording(rec.clone()).await;
+            let session = bkey("bridge-CLOSE-CAP");
+            backend.ensure_session(&session).await.unwrap();
+            backend.release_session_result(&session).await.unwrap();
+            settle_recording_agent(&backend).await;
+            let closes = rec.closes.lock().await.clone();
+            closes
+        }
+
+        assert_eq!(
+            closes_after_release(true).await,
+            ["agent-sess-CLOSE-CAP"],
+            "control: the same flow closes when the capability is advertised"
+        );
+        assert!(
+            closes_after_release(false).await.is_empty(),
+            "an agent that did not advertise close must never receive session/close"
+        );
+    }
+
+    #[tokio::test]
+    async fn release_without_minted_session_sends_no_close() {
+        let rec = Recorder::advertising_close("agent-sess-CLOSE-UNMINTED");
+        let backend = connect_recording(rec.clone()).await;
+        // One key the backend has never seen, one with an entry but no mint.
+        let unseen = bkey("bridge-CLOSE-UNSEEN");
+        let unminted = bkey("bridge-CLOSE-UNMINTED");
+        let _ = backend.session_entry(&unminted).await.unwrap();
+
+        backend.release_session_result(&unseen).await.unwrap();
+        backend.release_session_result(&unminted).await.unwrap();
+
+        settle_recording_agent(&backend).await;
+        assert!(
+            rec.closes.lock().await.is_empty(),
+            "there is no agent session to close before one is minted"
+        );
+        assert_eq!(
+            rec.new_session_calls.load(Ordering::SeqCst),
+            0,
+            "release must not mint an agent session just to close it"
+        );
+
+        let control_id = release_control_session(&backend, "bridge-CLOSE-MINTED").await;
+        settle_recording_agent(&backend).await;
+        assert_eq!(*rec.closes.lock().await, vec![control_id]);
+    }
+
+    #[tokio::test]
+    async fn release_returns_ok_when_session_close_errors() {
+        let rec = Recorder::advertising_close("agent-sess-CLOSE-ERR");
+        rec.reject_close.store(true, Ordering::SeqCst);
+        let backend = connect_recording(rec.clone()).await;
+        let session = bkey("bridge-CLOSE-ERR");
+        let agent_id = mint_with_bridge_state(&backend, &session).await;
+
+        assert_eq!(
+            backend.release_session_checked(&session).await,
+            Ok(BackendCleanupDispositionV1::Complete),
+            "a rejected session/close must not fail release"
+        );
+
+        settle_recording_agent(&backend).await;
+        assert_eq!(
+            *rec.closes.lock().await,
+            vec![agent_id.0.to_string()],
+            "the close was sent and it was the agent that rejected it"
+        );
+        assert_bridge_state_released(&backend, &session).await;
+    }
+
+    #[tokio::test]
+    async fn release_is_bounded_when_session_close_never_answers() {
+        let grace = Duration::from_millis(200);
+        let rec = Recorder::advertising_close("agent-sess-CLOSE-HANG");
+        rec.hang_close.store(true, Ordering::SeqCst);
+        let backend = connect_recording_with(
+            rec.clone(),
+            AcpConfig {
+                cancel_grace: grace,
+                ..test_config()
+            },
+        )
+        .await;
+        let session = bkey("bridge-CLOSE-HANG");
+        let agent_id = mint_with_bridge_state(&backend, &session).await;
+
+        // With the clock paused, time advances only once every task is idle,
+        // so a release that waited on the missing answer would be seen to
+        // take the whole cancel grace.
+        tokio::time::pause();
+        let started = tokio::time::Instant::now();
+        let result = tokio::time::timeout(grace * 10, backend.release_session_checked(&session))
+            .await
+            .expect("an unanswered session/close must not hang release");
+        let waited = started.elapsed();
+        tokio::time::resume();
+
+        assert_eq!(result, Ok(BackendCleanupDispositionV1::Complete));
+        assert!(
+            waited < grace,
+            "release waited {waited:?} on an answer that never comes; \
+             the {grace:?} cancel grace bounds the close flight, not the caller"
+        );
+        settle_recording_agent(&backend).await;
+        assert_eq!(*rec.closes.lock().await, vec![agent_id.0.to_string()]);
+        assert_bridge_state_released(&backend, &session).await;
+    }
+
+    #[tokio::test]
+    async fn repeated_release_sends_one_close() {
+        let rec = Recorder::advertising_close("agent-sess-CLOSE-ONCE");
+        rec.unique_minted_ids.store(true, Ordering::SeqCst);
+        let backend = Arc::new(connect_recording(rec.clone()).await);
+
+        // Sequential: the second release finds nothing left to close.
+        let sequential = bkey("bridge-CLOSE-ONCE-SEQUENTIAL");
+        let sequential_id = backend.ensure_session(&sequential).await.unwrap();
+        backend.release_session_result(&sequential).await.unwrap();
+        backend.release_session_result(&sequential).await.unwrap();
+
+        // Concurrent: both releases park on the session map before either has
+        // looked the entry up, so they contend for the same minted session.
+        let concurrent = bkey("bridge-CLOSE-ONCE-CONCURRENT");
+        let concurrent_id = backend.ensure_session(&concurrent).await.unwrap();
+        let parked = backend.sessions.lock().await;
+        let releases = [(); 2].map(|()| {
+            let backend = Arc::clone(&backend);
+            let session = concurrent.clone();
+            tokio::spawn(async move { backend.release_session_checked(&session).await })
+        });
+        tokio::task::yield_now().await;
+        drop(parked);
+        for release in releases {
+            release.await.unwrap().unwrap();
+        }
+
+        settle_recording_agent(&backend).await;
+        assert_eq!(
+            *rec.closes.lock().await,
+            vec![sequential_id.0.to_string(), concurrent_id.0.to_string()],
+            "each agent session is closed exactly once however often it is released"
+        );
+    }
+
+    #[tokio::test]
+    async fn release_closes_every_agent_session_for_the_bridge_session() {
+        // A rejected mode abandons the first minted id before it is published;
+        // the retry mints a second agent session for the same bridge session.
+        let rec = Recorder::advertising_close("agent-sess-CLOSE-EVERY");
+        rec.unique_minted_ids.store(true, Ordering::SeqCst);
+        rec.reject_set_mode.store(true, Ordering::SeqCst);
+        let backend = connect_recording_with(rec.clone(), test_config_with_mode("mode")).await;
+        let session = bkey("bridge-CLOSE-EVERY");
+        backend
+            .ensure_session(&session)
+            .await
+            .expect_err("the rejected mode fails the first mint");
+        rec.reject_set_mode.store(false, Ordering::SeqCst);
+        let published = backend.ensure_session(&session).await.unwrap();
+        assert_eq!(published.0.as_ref(), "agent-sess-CLOSE-EVERY-2");
+
+        backend.release_session_result(&session).await.unwrap();
+
+        settle_recording_agent(&backend).await;
+        assert_eq!(
+            *rec.closes.lock().await,
+            vec!["agent-sess-CLOSE-EVERY-1", "agent-sess-CLOSE-EVERY-2"],
+            "the abandoned agent session is closed along with the published one"
+        );
+    }
+
+    #[tokio::test]
+    async fn release_closes_a_session_whose_mint_settles_within_the_grace() {
+        // Whether the agent accepts or rejects the mode, the mint settles
+        // while release is waiting for it, and release closes what it minted.
+        for reject_mode in [false, true] {
+            let rec = Recorder::advertising_close("agent-sess-CLOSE-MINTING");
+            let backend = connect_closing_with_mode(&rec, DEFAULT_CANCEL_GRACE).await;
+            let control_id =
+                release_control_session(&backend, "bridge-CLOSE-MINTING-CONTROL").await;
+            let session = bkey("bridge-CLOSE-MINTING");
+            rec.reject_set_mode.store(reject_mode, Ordering::SeqCst);
+            let (mint, minting_id) = mint_parked_in_mode_setup(&backend, &rec, &session).await;
+
+            let mut release = spawn_release(&backend, &session);
+            assert!(
+                tokio::time::timeout(Duration::from_millis(50), &mut release)
+                    .await
+                    .is_err(),
+                "release must wait for a mint that can still settle within the cancel grace"
+            );
+
+            open_mode_gate(&rec);
+            assert_eq!(
+                tokio::time::timeout(Duration::from_secs(2), release)
+                    .await
+                    .expect("release completes once the mint has settled")
+                    .unwrap(),
+                Ok(BackendCleanupDispositionV1::Complete)
+            );
+            mint.await
+                .unwrap()
+                .expect_err("a mint that release overtook must not hand out its session");
+            assert_bridge_state_released(&backend, &session).await;
+            settle_recording_agent(&backend).await;
+            assert_eq!(
+                *rec.closes.lock().await,
+                vec![control_id, minting_id],
+                "reject_mode={reject_mode}: the session minted during release is closed exactly once"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn repeated_release_closes_a_session_minted_during_release_once() {
+        let rec = Recorder::advertising_close("agent-sess-CLOSE-MINTING-ONCE");
+        let backend = connect_closing_with_mode(&rec, DEFAULT_CANCEL_GRACE).await;
+        let control_id =
+            release_control_session(&backend, "bridge-CLOSE-MINTING-ONCE-CONTROL").await;
+        let session = bkey("bridge-CLOSE-MINTING-ONCE");
+        let (mint, minting_id) = mint_parked_in_mode_setup(&backend, &rec, &session).await;
+
+        let first = spawn_release(&backend, &session);
+        unpublished(&backend, &session).await;
+        // The first release owns the mint and is waiting for it. A second one
+        // finds nothing of its own to close, and so nothing to wait for.
+        assert_eq!(
+            tokio::time::timeout(
+                Duration::from_secs(1),
+                backend.release_session_checked(&session)
+            )
+            .await
+            .expect("a repeated release must not wait for the first release's mint"),
+            Ok(BackendCleanupDispositionV1::Complete)
+        );
+        assert!(!first.is_finished());
+
+        open_mode_gate(&rec);
+        first.await.unwrap().unwrap();
+        mint.await.unwrap().unwrap_err();
+        backend.release_session_result(&session).await.unwrap();
+
+        settle_recording_agent(&backend).await;
+        assert_eq!(
+            *rec.closes.lock().await,
+            vec![control_id, minting_id],
+            "the session is closed once, by the release that unpublished its entry"
+        );
+    }
+
+    #[tokio::test]
+    async fn caller_queued_behind_a_released_mint_neither_mints_nor_reuses() {
+        let rec = Recorder::advertising_close("agent-sess-CLOSE-QUEUED");
+        let backend = connect_closing_with_mode(&rec, DEFAULT_CANCEL_GRACE).await;
+        let control_id = release_control_session(&backend, "bridge-CLOSE-QUEUED-CONTROL").await;
+        let session = bkey("bridge-CLOSE-QUEUED");
+        let (mint, minting_id) = mint_parked_in_mode_setup(&backend, &rec, &session).await;
+        // A second caller for the same entry, queued on the mint in flight.
+        let queued = {
+            let backend = Arc::clone(&backend);
+            let session = session.clone();
+            tokio::spawn(async move { backend.ensure_session(&session).await })
+        };
+        tokio::task::yield_now().await;
+        assert!(!queued.is_finished());
+
+        let release = spawn_release(&backend, &session);
+        unpublished(&backend, &session).await;
+        open_mode_gate(&rec);
+        release.await.unwrap().unwrap();
+        mint.await.unwrap().unwrap_err();
+        queued
+            .await
+            .unwrap()
+            .expect_err("a caller queued for a released entry must not be handed a session");
+
+        settle_recording_agent(&backend).await;
+        assert_eq!(
+            rec.new_session_calls.load(Ordering::SeqCst),
+            2,
+            "the queued caller must not mint for the released entry"
+        );
+        assert_eq!(*rec.closes.lock().await, vec![control_id, minting_id]);
+        assert_bridge_state_released(&backend, &session).await;
+    }
+
+    #[tokio::test]
+    async fn fresh_mint_for_a_released_key_is_not_closed_by_the_old_release() {
+        let rec = Recorder::advertising_close("agent-sess-CLOSE-REMINT");
+        let backend = connect_closing_with_mode(&rec, DEFAULT_CANCEL_GRACE).await;
+        let control_id = release_control_session(&backend, "bridge-CLOSE-REMINT-CONTROL").await;
+        let session = bkey("bridge-CLOSE-REMINT");
+        let (old_mint, old_id) = mint_parked_in_mode_setup(&backend, &rec, &session).await;
+
+        // The key is free again as soon as release has unpublished the entry,
+        // while that release still waits on the old mint.
+        let release = spawn_release(&backend, &session);
+        unpublished(&backend, &session).await;
+        let fresh_mint = {
+            let backend = Arc::clone(&backend);
+            let session = session.clone();
+            tokio::spawn(async move { backend.ensure_session(&session).await })
+        };
+
+        open_mode_gate(&rec);
+        release.await.unwrap().unwrap();
+        old_mint.await.unwrap().unwrap_err();
+        let fresh_id = fresh_mint
+            .await
+            .unwrap()
+            .expect("a fresh mint for the released key must succeed");
+        assert_ne!(fresh_id.0.as_ref(), old_id);
+
+        settle_recording_agent(&backend).await;
+        assert_eq!(
+            *rec.closes.lock().await,
+            vec![control_id.clone(), old_id.clone()],
+            "the old release closes the old mint and nothing else"
+        );
+        assert_eq!(
+            backend.ensure_session(&session).await.unwrap(),
+            fresh_id,
+            "the fresh session is the one the key resolves to"
+        );
+        assert!(backend.session_catalog(&session).is_some());
+
+        // Its own release is what closes the fresh session.
+        backend.release_session_result(&session).await.unwrap();
+        settle_recording_agent(&backend).await;
+        assert_eq!(
+            *rec.closes.lock().await,
+            vec![control_id, old_id, fresh_id.0.to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn release_gives_up_on_a_mint_that_outlives_the_grace() {
+        let grace = Duration::from_millis(200);
+        let rec = Recorder::advertising_close("agent-sess-CLOSE-LATE-MINT");
+        let backend = connect_closing_with_mode(&rec, grace).await;
+        let control_id = release_control_session(&backend, "bridge-CLOSE-LATE-MINT-CONTROL").await;
+        let session = bkey("bridge-CLOSE-LATE-MINT");
+        let (mint, minting_id) = mint_parked_in_mode_setup(&backend, &rec, &session).await;
+
+        // With the clock paused, time advances only once every task is idle:
+        // release waits on the parked mint until the grace is spent.
+        tokio::time::pause();
+        let started = tokio::time::Instant::now();
+        let result = tokio::time::timeout(grace * 10, backend.release_session_checked(&session))
+            .await
+            .expect("a mint that does not settle must not hang release");
+        let waited = started.elapsed();
+        tokio::time::resume();
+
+        assert_eq!(result, Ok(BackendCleanupDispositionV1::Complete));
+        assert!(
+            (grace..grace * 2).contains(&waited),
+            "release waited {waited:?} for the mint; it must wait out the \
+             {grace:?} cancel grace and no longer"
+        );
+        assert_bridge_state_released(&backend, &session).await;
+
+        // The mint settles after its release has gone. It must not become a
+        // session anyone can use, and what it minted must not be left open.
+        open_mode_gate(&rec);
+        mint.await
+            .unwrap()
+            .expect_err("a mint that outlived its release must not hand out its session");
+        closes_recorded(&rec, 2).await;
+        settle_recording_agent(&backend).await;
+        assert_eq!(
+            *rec.closes.lock().await,
+            vec![control_id, minting_id.clone()],
+            "the late mint closes what it minted, exactly once"
+        );
+        assert_bridge_state_released(&backend, &session).await;
+
+        let fresh_id = backend.ensure_session(&session).await.unwrap();
+        assert_ne!(fresh_id.0.as_ref(), minting_id);
+        settle_recording_agent(&backend).await;
+        assert_eq!(
+            rec.closes.lock().await.len(),
+            2,
+            "re-minting the released key must not close anything"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_close_after_retire() {
+        let rec = Recorder::advertising_close("agent-sess-CLOSE-RETIRED");
+        rec.unique_minted_ids.store(true, Ordering::SeqCst);
+        let backend = connect_recording(rec.clone()).await;
+        let session = bkey("bridge-CLOSE-RETIRED");
+        mint_with_bridge_state(&backend, &session).await;
+        // While the connection is usable, release closes.
+        let control_id = release_control_session(&backend, "bridge-CLOSE-RETIRED-CONTROL").await;
+
+        backend.retire().await.unwrap();
+        assert_eq!(
+            backend.release_session_checked(&session).await,
+            Ok(BackendCleanupDispositionV1::Complete),
+            "a close skipped after retirement is not a release failure"
+        );
+
+        settle_recording_agent(&backend).await;
+        assert_eq!(
+            *rec.closes.lock().await,
+            vec![control_id],
+            "nothing is closed once the connection is retired"
+        );
+        assert_bridge_state_released(&backend, &session).await;
+    }
+
+    #[tokio::test]
+    async fn release_closes_only_after_the_cancelled_turn_settles() {
+        let rec = Recorder::advertising_close("agent-sess-CLOSE-TURN");
+        // The turn stays open until the test opens the gate, however early the
+        // agent sees the cancel.
+        rec.gate_prompt.store(true, Ordering::SeqCst);
+        let backend = Arc::new(connect_recording(rec.clone()).await);
+        let session = bkey("bridge-CLOSE-TURN");
+        let mut stream = backend.prompt(&session, vec![]).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), rec.prompt_started.notified())
+            .await
+            .expect("the turn must be in flight before release");
+
+        let release = {
+            let backend = Arc::clone(&backend);
+            let session = session.clone();
+            tokio::spawn(async move { backend.release_session_checked(&session).await })
+        };
+        cancels_recorded(&rec, 1).await;
+        settle_recording_agent(&backend).await;
+        assert!(
+            rec.closes.lock().await.is_empty(),
+            "session/close must not race a turn that is still unwinding"
+        );
+        assert!(
+            !release.is_finished(),
+            "release waits, within its grace, for the close to go out"
+        );
+
+        rec.prompt_gate.notify_one();
+        while stream.next().await.is_some() {}
+        tokio::time::timeout(Duration::from_secs(2), release)
+            .await
+            .expect("release completes once the turn has settled")
+            .unwrap()
+            .unwrap();
+        settle_recording_agent(&backend).await;
+        assert_eq!(
+            *rec.teardown_log.lock().await,
+            vec![
+                "cancel:agent-sess-CLOSE-TURN",
+                "close:agent-sess-CLOSE-TURN"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn release_after_retire_does_not_wait_for_an_open_turn() {
+        // Default five-second cancel grace: waiting for the turn would outlast
+        // the one-second bound below.
+        let rec = Recorder::advertising_close("agent-sess-CLOSE-RETIRED-TURN");
+        rec.unique_minted_ids.store(true, Ordering::SeqCst);
+        rec.gate_prompt.store(true, Ordering::SeqCst);
+        let backend = connect_recording(rec.clone()).await;
+        let control_id =
+            release_control_session(&backend, "bridge-CLOSE-RETIRED-TURN-CONTROL").await;
+        let session = bkey("bridge-CLOSE-RETIRED-TURN");
+        let mut stream = backend.prompt(&session, vec![]).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), rec.prompt_started.notified())
+            .await
+            .expect("the turn must be in flight before retirement");
+        // In-process there is no child for retirement to kill, so the turn and
+        // its lock outlive the fence.
+        backend.retire().await.unwrap();
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            backend.release_session_checked(&session),
+        )
+        .await
+        .expect("a retired connection has nothing to close, so nothing to wait for");
+
+        assert_eq!(result, Ok(BackendCleanupDispositionV1::Complete));
+        rec.prompt_gate.notify_one();
+        while stream.next().await.is_some() {}
+        settle_recording_agent(&backend).await;
+        assert_eq!(*rec.closes.lock().await, vec![control_id]);
+    }
+
+    #[tokio::test]
+    async fn release_does_not_close_when_retired_while_the_turn_settles() {
+        let rec = Recorder::advertising_close("agent-sess-CLOSE-RETIRING");
+        rec.unique_minted_ids.store(true, Ordering::SeqCst);
+        rec.gate_prompt.store(true, Ordering::SeqCst);
+        let backend = Arc::new(connect_recording(rec.clone()).await);
+        let control_id = release_control_session(&backend, "bridge-CLOSE-RETIRING-CONTROL").await;
+        let session = bkey("bridge-CLOSE-RETIRING");
+        let mut stream = backend.prompt(&session, vec![]).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), rec.prompt_started.notified())
+            .await
+            .expect("the turn must be in flight before release");
+
+        let release = {
+            let backend = Arc::clone(&backend);
+            let session = session.clone();
+            tokio::spawn(async move { backend.release_session_checked(&session).await })
+        };
+        // The control's cancel plus this one. The round trip then lets release
+        // reach its wait for the turn before the fence closes underneath it.
+        cancels_recorded(&rec, 2).await;
+        settle_recording_agent(&backend).await;
+        backend.retire().await.unwrap();
+        rec.prompt_gate.notify_one();
+        while stream.next().await.is_some() {}
+
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), release)
+                .await
+                .expect("release completes once the turn has settled")
+                .unwrap(),
+            Ok(BackendCleanupDispositionV1::Complete)
+        );
+        settle_recording_agent(&backend).await;
+        assert_eq!(
+            *rec.closes.lock().await,
+            vec![control_id],
+            "nothing is sent on a connection retired during the wait"
+        );
+    }
+
+    #[tokio::test]
+    async fn release_does_not_close_a_session_whose_stuck_turn_is_escalated() {
+        let rec = Recorder::advertising_close("agent-sess-CLOSE-STUCK");
+        rec.unique_minted_ids.store(true, Ordering::SeqCst);
+        // The agent sees the cancel and then never ends the turn.
+        rec.wait_cancel_before_respond.store(true, Ordering::SeqCst);
+        rec.hang_after_cancel.store(true, Ordering::SeqCst);
+        let backend = connect_recording_with(
+            rec.clone(),
+            AcpConfig {
+                cancel_grace: Duration::from_millis(100),
+                ..test_config()
+            },
+        )
+        .await;
+        let control_id = release_control_session(&backend, "bridge-CLOSE-STUCK-CONTROL").await;
+        let session = bkey("bridge-CLOSE-STUCK");
+        let mut stream = backend.prompt(&session, vec![]).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), rec.prompt_started.notified())
+            .await
+            .expect("the turn must be in flight before release");
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            backend.release_session_checked(&session),
+        )
+        .await
+        .expect("an unsettled turn must not hold release past the cancel grace");
+
+        assert_eq!(result, Ok(BackendCleanupDispositionV1::Complete));
+        // The turn ends only when the cancel watcher escalates. That fences
+        // the connection, which is what ends the close: the grace alone
+        // would leave it pending.
+        while stream.next().await.is_some() {}
+        assert!(
+            backend.unavailable.load(Ordering::SeqCst),
+            "a turn that ignores its cancel is escalated, fencing the connection"
+        );
+        settle_recording_agent(&backend).await;
+        assert_eq!(
+            *rec.closes.lock().await,
+            vec![control_id],
+            "no session/close is sent once escalation has fenced the connection"
+        );
+    }
+
+    #[tokio::test]
+    async fn prompt_that_selected_a_session_does_not_start_after_its_release() {
+        let rec = Recorder::advertising_close("agent-sess-CLOSE-SELECTED");
+        rec.unique_minted_ids.store(true, Ordering::SeqCst);
+        let backend = Arc::new(connect_recording(rec.clone()).await);
+        let session = bkey("bridge-CLOSE-SELECTED");
+        let agent_id = backend.ensure_session(&session).await.unwrap();
+        let agent_id = agent_id.0.to_string();
+        // The prompt has picked the minted session to reuse and is not yet in
+        // line for the turn lock.
+        let (prompt, resume) = prompt_parked_at_record(&backend, &session, 4).await;
+
+        // Release runs to its end: cancel, removal, and the close.
+        assert_eq!(
+            backend.release_session_checked(&session).await,
+            Ok(BackendCleanupDispositionV1::Complete)
+        );
+        settle_recording_agent(&backend).await;
+        assert_eq!(
+            *rec.teardown_log.lock().await,
+            vec![format!("cancel:{agent_id}"), format!("close:{agent_id}")]
+        );
+
+        resume.notify_one();
+        assert_refused_as_released(prompt).await;
+        settle_recording_agent(&backend).await;
+        assert!(
+            rec.prompt_log.lock().await.is_empty(),
+            "no session/prompt may reach a session after its release began"
+        );
+        assert_eq!(
+            *rec.closes.lock().await,
+            vec![agent_id.clone()],
+            "the released session is closed exactly once"
+        );
+
+        // The next call for the key mints a fresh session and runs its turn there.
+        let mut stream = backend.prompt(&session, vec![]).await.unwrap();
+        while stream.next().await.is_some() {}
+        assert_eq!(rec.new_session_calls.load(Ordering::SeqCst), 2);
+        assert_ne!(
+            backend.ensure_session(&session).await.unwrap().0.as_ref(),
+            agent_id
+        );
+        assert_eq!(rec.prompt_log.lock().await.as_slice(), &["start", "end"]);
+        settle_recording_agent(&backend).await;
+        assert_eq!(*rec.closes.lock().await, vec![agent_id]);
+    }
+
+    #[tokio::test]
+    async fn prompt_queued_on_a_released_session_is_refused_while_its_close_is_unanswered() {
+        let grace = Duration::from_millis(200);
+        let rec = Recorder::advertising_close("agent-sess-CLOSE-UNANSWERED-QUEUED");
+        rec.unique_minted_ids.store(true, Ordering::SeqCst);
+        // The agent takes the close and keeps its answer back.
+        rec.hang_close.store(true, Ordering::SeqCst);
+        let backend = Arc::new(
+            connect_recording_with(
+                rec.clone(),
+                AcpConfig {
+                    cancel_grace: grace,
+                    ..test_config()
+                },
+            )
+            .await,
+        );
+        let session = bkey("bridge-CLOSE-UNANSWERED-QUEUED");
+        let agent_id = backend.ensure_session(&session).await.unwrap();
+        let agent_id = agent_id.0.to_string();
+        // The prompt has picked the minted session to reuse and is not yet in
+        // line for the turn lock.
+        let (prompt, resume) = prompt_parked_at_record(&backend, &session, 4).await;
+
+        // With the clock paused, time advances only once every task is idle:
+        // a prompt held behind the flight's wait for the answer would be seen
+        // to take the whole grace.
+        tokio::time::pause();
+        let started = tokio::time::Instant::now();
+        assert_eq!(
+            backend.release_session_checked(&session).await,
+            Ok(BackendCleanupDispositionV1::Complete)
+        );
+        settle_recording_agent(&backend).await;
+        assert_eq!(
+            *rec.closes.lock().await,
+            vec![agent_id.clone()],
+            "the close is with the agent, which has not answered it"
+        );
+        resume.notify_one();
+        assert_refused_as_released(prompt).await;
+        let waited = started.elapsed();
+        tokio::time::resume();
+
+        assert!(
+            waited < grace,
+            "the prompt was refused only after {waited:?}; the close flight \
+             holds the turn lock to send its close, not for the {grace:?} it \
+             then waits on the answer"
+        );
+        settle_recording_agent(&backend).await;
+        assert!(
+            rec.prompt_log.lock().await.is_empty(),
+            "no session/prompt may reach a session after its release began"
+        );
+        assert_eq!(
+            *rec.closes.lock().await,
+            vec![agent_id],
+            "the released session is closed exactly once"
+        );
+    }
+
+    #[tokio::test]
+    async fn prompt_holding_the_turn_lock_does_not_start_once_release_begins() {
+        let rec = Recorder::advertising_close("agent-sess-CLOSE-ADMITTING");
+        rec.unique_minted_ids.store(true, Ordering::SeqCst);
+        let backend = Arc::new(connect_recording(rec.clone()).await);
+        let session = bkey("bridge-CLOSE-ADMITTING");
+        let agent_id = backend.ensure_session(&session).await.unwrap();
+        let agent_id = agent_id.0.to_string();
+        // The prompt owns the turn lock and has installed nothing for its turn.
+        let (prompt, resume) = prompt_parked_at_record(&backend, &session, 5).await;
+
+        // Release's cancel finds no turn on the wire, and its close waits for
+        // the turn lock the prompt is holding.
+        let release = spawn_release(&backend, &session);
+        unpublished(&backend, &session).await;
+        cancels_recorded(&rec, 1).await;
+        settle_recording_agent(&backend).await;
+        assert!(rec.closes.lock().await.is_empty());
+        assert!(!release.is_finished());
+
+        resume.notify_one();
+        assert_refused_as_released(prompt).await;
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), release)
+                .await
+                .expect("release closes once the refused prompt lets go of the turn lock")
+                .unwrap(),
+            Ok(BackendCleanupDispositionV1::Complete)
+        );
+        settle_recording_agent(&backend).await;
+        assert!(
+            rec.prompt_log.lock().await.is_empty(),
+            "no session/prompt may reach a session after its release began"
+        );
+        assert_eq!(
+            *rec.teardown_log.lock().await,
+            vec![format!("cancel:{agent_id}"), format!("close:{agent_id}")]
+        );
+
+        let fresh_id = backend.ensure_session(&session).await.unwrap();
+        assert_ne!(fresh_id.0.as_ref(), agent_id);
+        assert_eq!(rec.new_session_calls.load(Ordering::SeqCst), 2);
+    }
+
+    /// A recording backend with a short cancel grace, holding a minted
+    /// `session` for a test to release and a minted `sibling` whose turns
+    /// show that the adapter is still serving its other sessions. Returns
+    /// the backend with `session`'s agent id.
+    async fn connect_closing_beside_a_sibling(
+        rec: &Recorder,
+        grace: Duration,
+        session: &SessionId,
+        sibling: &SessionId,
+    ) -> (Arc<AcpBackend>, String) {
+        rec.unique_minted_ids.store(true, Ordering::SeqCst);
+        let backend = Arc::new(
+            connect_recording_with(
+                rec.clone(),
+                AcpConfig {
+                    cancel_grace: grace,
+                    ..test_config()
+                },
+            )
+            .await,
+        );
+        backend.ensure_session(sibling).await.unwrap();
+        let agent_id = backend.ensure_session(session).await.unwrap();
+        (backend, agent_id.0.to_string())
+    }
+
+    /// Run one turn on `session` to its end.
+    async fn assert_serves_a_turn(backend: &AcpBackend, session: &SessionId) {
+        let mut stream = backend
+            .prompt(session, vec![])
+            .await
+            .expect("the adapter must still take a prompt for its other session");
+        let mut last = None;
+        while let Some(update) = stream.next().await {
+            last = Some(update);
+        }
+        assert!(
+            matches!(last, Some(Ok(Update::Done { .. }))),
+            "the other session's turn must complete, got {last:?}"
+        );
+    }
+
+    /// Release `session` while something that is not a turn on the wire
+    /// holds its turn lock and goes on holding it, and assert what the
+    /// release owes meanwhile: it returns at the cancel grace with the entry
+    /// gone and no `session/close` sent, and `sibling` is still served.
+    async fn release_while_the_turn_lock_stays_held(
+        backend: &AcpBackend,
+        rec: &Recorder,
+        session: &SessionId,
+        sibling: &SessionId,
+        grace: Duration,
+    ) {
+        // With the clock paused, time advances only once every task is idle:
+        // release waits on the pending close until the grace is spent.
+        tokio::time::pause();
+        let started = tokio::time::Instant::now();
+        let result = tokio::time::timeout(grace * 10, backend.release_session_checked(session))
+            .await
+            .expect("a turn lock that stays held must not hang release");
+        let waited = started.elapsed();
+        tokio::time::resume();
+
+        assert_eq!(result, Ok(BackendCleanupDispositionV1::Complete));
+        assert!(
+            (grace..grace * 2).contains(&waited),
+            "release waited {waited:?} on the pending close; it must wait out \
+             the {grace:?} cancel grace and no longer"
+        );
+        assert!(backend.sessions.lock().await.get(session).is_none());
+        settle_recording_agent(backend).await;
+        assert!(
+            rec.closes.lock().await.is_empty(),
+            "session/close must not be sent underneath a held turn lock"
+        );
+        assert_serves_a_turn(backend, sibling).await;
+    }
+
+    /// What must hold once the holder of a released session's turn lock has
+    /// let go, however long after the cancel grace that was: the session is
+    /// closed exactly once, after its cancel, and `sibling` is still served.
+    async fn assert_closed_once_the_turn_lock_is_free(
+        backend: &AcpBackend,
+        rec: &Recorder,
+        agent_id: &str,
+        sibling: &SessionId,
+    ) {
+        closes_recorded(rec, 1).await;
+        settle_recording_agent(backend).await;
+        assert_eq!(
+            *rec.teardown_log.lock().await,
+            vec![format!("cancel:{agent_id}"), format!("close:{agent_id}")],
+            "the close left pending at the grace goes out once, when the turn lock is free"
+        );
+        assert!(
+            !backend.unavailable.load(Ordering::SeqCst),
+            "closing one session must not fence the connection the others share"
+        );
+        assert_serves_a_turn(backend, sibling).await;
+    }
+
+    #[tokio::test]
+    async fn release_closes_a_session_whose_finished_turn_outlasts_the_grace() {
+        let grace = Duration::from_millis(200);
+        let rec = Recorder::advertising_close("agent-sess-CLOSE-FINISHING");
+        let session = bkey("bridge-CLOSE-FINISHING");
+        let sibling = bkey("bridge-CLOSE-FINISHING-SIBLING");
+        let (backend, agent_id) =
+            connect_closing_beside_a_sibling(&rec, grace, &session, &sibling).await;
+        // The turn's result is terminal and its route is gone, so release's
+        // cancel finds no turn to watch and nothing will ever escalate. The
+        // driver is still persisting the outcome, under the turn lock.
+        let (prompt, resume) = prompt_parked_at_record(&backend, &session, 8).await;
+        let entry = backend.session_entry(&session).await.unwrap();
+        assert!(!backend
+            .updates()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .contains_key(&AgentSessionId::new(agent_id.clone())));
+        assert!(entry.turn_lock.try_lock().is_err());
+
+        release_while_the_turn_lock_stays_held(&backend, &rec, &session, &sibling, grace).await;
+
+        resume.notify_one();
+        let mut stream = prompt
+            .await
+            .unwrap()
+            .expect("the turn was on the wire before its session was released");
+        while stream.next().await.is_some() {}
+        assert_closed_once_the_turn_lock_is_free(&backend, &rec, &agent_id, &sibling).await;
+    }
+
+    #[tokio::test]
+    async fn release_closes_a_session_whose_unadmitted_prompt_outlasts_the_grace() {
+        let grace = Duration::from_millis(200);
+        let rec = Recorder::advertising_close("agent-sess-CLOSE-UNADMITTED");
+        let session = bkey("bridge-CLOSE-UNADMITTED");
+        let sibling = bkey("bridge-CLOSE-UNADMITTED-SIBLING");
+        let (backend, agent_id) =
+            connect_closing_beside_a_sibling(&rec, grace, &session, &sibling).await;
+        // The prompt owns the turn lock and has installed nothing for its turn.
+        let (prompt, resume) = prompt_parked_at_record(&backend, &session, 5).await;
+
+        release_while_the_turn_lock_stays_held(&backend, &rec, &session, &sibling, grace).await;
+
+        resume.notify_one();
+        assert_refused_as_released(prompt).await;
+        assert_closed_once_the_turn_lock_is_free(&backend, &rec, &agent_id, &sibling).await;
+        assert_eq!(
+            rec.prompt_log.lock().await.as_slice(),
+            &["start", "end", "start", "end"],
+            "only the sibling's two turns reach the agent"
+        );
+    }
+
+    #[tokio::test]
+    async fn release_closes_a_session_whose_config_reconcile_outlasts_the_grace() {
+        let grace = Duration::from_millis(200);
+        let rec = Recorder::advertising_close("agent-sess-CLOSE-RECONCILING");
+        let session = bkey("bridge-CLOSE-RECONCILING");
+        let sibling = bkey("bridge-CLOSE-RECONCILING-SIBLING");
+        let (backend, agent_id) =
+            connect_closing_beside_a_sibling(&rec, grace, &session, &sibling).await;
+        // A warm reconcile holds the turn lock across a
+        // `session/set_config_option` that the agent is slow to answer.
+        rec.gate_set_config.store(true, Ordering::SeqCst);
+        let reconcile = {
+            let backend = Arc::clone(&backend);
+            let session = session.clone();
+            tokio::spawn(async move {
+                let spec = SessionSpec::from_config(EffectiveConfig {
+                    model: None,
+                    effort: Some(Effort::High),
+                    mode: None,
+                });
+                backend.reconcile_config(&session, &spec).await
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while rec.set_config_options.lock().await.is_empty() {
+                rec.set_config_seen.notified().await;
+            }
+        })
+        .await
+        .expect("the reconcile must reach the agent");
+
+        release_while_the_turn_lock_stays_held(&backend, &rec, &session, &sibling, grace).await;
+
+        rec.set_config_gate.notify_one();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), reconcile)
+                .await
+                .expect("the reconcile settles once the agent answers")
+                .unwrap(),
+            Ok(bridge_core::orch::ReconcileOutcome::Applied)
+        );
+        assert_closed_once_the_turn_lock_is_free(&backend, &rec, &agent_id, &sibling).await;
+    }
+
+    /// Start a prompt for `session` and park it where it has just resolved
+    /// the key to its entry and has done nothing with that entry yet. Returns
+    /// the prompt with what resumes it. The hook blocks the worker it runs
+    /// on, so the caller needs a multi-threaded runtime.
+    fn prompt_parked_after_entry_lookup(
+        backend: &Arc<AcpBackend>,
+        session: &SessionId,
+    ) -> (Prompt, Arc<std::sync::Barrier>) {
+        let entered = Arc::new(std::sync::Barrier::new(2));
+        let resume = Arc::new(std::sync::Barrier::new(2));
+        *backend.prompt_entry_hook.lock().unwrap() = Some(Arc::new({
+            let entered = Arc::clone(&entered);
+            let resume = Arc::clone(&resume);
+            move || {
+                entered.wait();
+                resume.wait();
+            }
+        }));
+        let prompt = {
+            let backend = Arc::clone(backend);
+            let session = session.clone();
+            tokio::spawn(async move { backend.prompt(&session, vec![]).await })
+        };
+        entered.wait();
+        // Only this prompt parks; a later one in the same test runs through.
+        *backend.prompt_entry_hook.lock().unwrap() = None;
+        (prompt, resume)
+    }
+
+    /// Every agent session id the recording agent has minted, in mint order.
+    /// Needs `Recorder::unique_minted_ids`.
+    fn minted_ids(rec: &Recorder) -> Vec<String> {
+        (1..=rec.new_session_calls.load(Ordering::SeqCst))
+            .map(|sequence| format!("{}-{sequence}", rec.minted_id))
+            .collect()
+    }
+
+    /// What must hold once a caller that was parked on its entry while
+    /// `session` was released has settled, where the agent had minted
+    /// `minted` sessions by the time the caller parked.
+    async fn assert_parked_caller_left_nothing_behind(
+        backend: &AcpBackend,
+        rec: &Recorder,
+        session: &SessionId,
+        minted: usize,
+    ) {
+        settle_recording_agent(backend).await;
+        assert_eq!(
+            rec.new_session_calls.load(Ordering::SeqCst),
+            minted,
+            "a caller whose entry was released must not send session/new"
+        );
+        assert!(
+            rec.prompt_log.lock().await.is_empty(),
+            "a caller whose entry was released must not send session/prompt"
+        );
+        assert!(
+            backend.sessions.lock().await.get(session).is_none(),
+            "a caller whose entry was released must not put a replacement entry in the map"
+        );
+        assert_eq!(
+            *rec.closes.lock().await,
+            minted_ids(rec),
+            "no agent session may be left that a release did not close"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn prompt_parked_on_an_unminted_entry_does_not_mint_after_its_release() {
+        let rec = Recorder::advertising_close("agent-sess-CLOSE-PARKED-UNMINTED");
+        rec.unique_minted_ids.store(true, Ordering::SeqCst);
+        let backend = Arc::new(connect_recording(rec.clone()).await);
+        let control_id =
+            release_control_session(&backend, "bridge-CLOSE-PARKED-UNMINTED-CONTROL").await;
+        let session = bkey("bridge-CLOSE-PARKED-UNMINTED");
+        // The prompt holds a fresh entry for the key and has minted nothing.
+        let (prompt, resume) = prompt_parked_after_entry_lookup(&backend, &session);
+        assert!(backend.sessions.lock().await.contains_key(&session));
+
+        // Release runs to its end over that entry, which has nothing to close.
+        assert_eq!(
+            backend.release_session_checked(&session).await,
+            Ok(BackendCleanupDispositionV1::Complete)
+        );
+        settle_recording_agent(&backend).await;
+        assert_eq!(*rec.closes.lock().await, vec![control_id]);
+
+        resume.wait();
+        let error = tokio::time::timeout(Duration::from_secs(2), prompt)
+            .await
+            .expect("a prompt that lost its entry to release must settle")
+            .unwrap()
+            .err()
+            .expect("a prompt must not mint for an entry that was released under it");
+        assert_eq!(error, BridgeError::InvalidStateTransition);
+        assert_parked_caller_left_nothing_behind(&backend, &rec, &session, 1).await;
+
+        // The key is free: the next call mints a fresh session for it.
+        backend.ensure_session(&session).await.unwrap();
+        assert_eq!(rec.new_session_calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn prompt_parked_on_a_minted_entry_does_not_remint_after_its_release() {
+        let rec = Recorder::advertising_close("agent-sess-CLOSE-PARKED-MINTED");
+        rec.unique_minted_ids.store(true, Ordering::SeqCst);
+        let backend = Arc::new(connect_recording(rec.clone()).await);
+        let session = bkey("bridge-CLOSE-PARKED-MINTED");
+        let agent_id = backend.ensure_session(&session).await.unwrap();
+        let agent_id = agent_id.0.to_string();
+        // The prompt holds the minted entry and has not yet asked it for its
+        // agent session.
+        let (prompt, resume) = prompt_parked_after_entry_lookup(&backend, &session);
+
+        // Release runs to its end: cancel, removal, and the close.
+        assert_eq!(
+            backend.release_session_checked(&session).await,
+            Ok(BackendCleanupDispositionV1::Complete)
+        );
+        settle_recording_agent(&backend).await;
+        assert_eq!(
+            *rec.teardown_log.lock().await,
+            vec![format!("cancel:{agent_id}"), format!("close:{agent_id}")]
+        );
+
+        resume.wait();
+        assert_refused_as_released(prompt).await;
+        assert_parked_caller_left_nothing_behind(&backend, &rec, &session, 1).await;
+        assert_eq!(
+            *rec.closes.lock().await,
+            vec![agent_id],
+            "the released session is closed exactly once"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_parked_on_an_unminted_entry_does_not_mint_after_its_release() {
+        let rec = Recorder::advertising_close("agent-sess-CLOSE-PARKED-RECONCILE");
+        rec.unique_minted_ids.store(true, Ordering::SeqCst);
+        let backend = Arc::new(connect_recording(rec.clone()).await);
+        let control_id =
+            release_control_session(&backend, "bridge-CLOSE-PARKED-RECONCILE-CONTROL").await;
+        let session = bkey("bridge-CLOSE-PARKED-RECONCILE");
+        // An unminted entry whose single-flight lock the test owns, so that a
+        // reconcile minting through this entry parks before it decides to.
+        let entry = backend.session_entry(&session).await.unwrap();
+        let minting = Arc::clone(&entry.init_lock).lock_owned().await;
+
+        // Reconcile, then release, queue on the session map in that order. The
+        // map is granted first come, first served: reconcile resolves the key
+        // to the entry above, and release unpublishes that entry before
+        // reconcile could get back to the map.
+        let parked = backend.sessions.lock().await;
+        let reconcile = {
+            let backend = Arc::clone(&backend);
+            let session = session.clone();
+            tokio::spawn(async move {
+                backend
+                    .reconcile_config(&session, &SessionSpec::from_config(Default::default()))
+                    .await
+            })
+        };
+        tokio::task::yield_now().await;
+        let release = spawn_release(&backend, &session);
+        tokio::task::yield_now().await;
+        drop(parked);
+        unpublished(&backend, &session).await;
+        assert!(!reconcile.is_finished());
+
+        // Release is waiting for the mint the test poses as. Let both go on.
+        drop(minting);
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), release)
+                .await
+                .expect("release ends once the entry's single-flight lock is free")
+                .unwrap(),
+            Ok(BackendCleanupDispositionV1::Complete)
+        );
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), reconcile)
+                .await
+                .expect("a reconcile that lost its entry to release must settle")
+                .unwrap(),
+            Err(BridgeError::InvalidStateTransition),
+            "a reconcile must not mint for an entry that was released under it"
+        );
+        assert_parked_caller_left_nothing_behind(&backend, &rec, &session, 1).await;
+        assert_eq!(*rec.closes.lock().await, vec![control_id]);
+    }
+
+    #[tokio::test]
+    async fn close_flight_reports_a_typed_outcome_per_agent_session() {
+        // Long enough that an answer always arrives first; short where the
+        // case under test is an answer that never comes.
+        let answered = Duration::from_secs(5);
+        let expires = Duration::from_millis(50);
+        let rec = Recorder::advertising_close("agent-sess-CLOSE-OUTCOME");
+        rec.unique_minted_ids.store(true, Ordering::SeqCst);
+        let backend = connect_recording(rec.clone()).await;
+        let owner_key_fingerprint = CLOSE_FINGERPRINT;
+        // Deadlines are reached by the idle runtime advancing the clock.
+        tokio::time::pause();
+
+        let acknowledged = bkey("bridge-CLOSE-OUTCOME-ACKNOWLEDGED");
+        let acknowledged_id = backend.ensure_session(&acknowledged).await.unwrap();
+        assert_eq!(
+            close_flight_outcomes(&backend, &acknowledged, answered).await,
+            [AcpTraceEvent::SessionCloseAcknowledged {
+                owner_key_fingerprint
+            }]
+        );
+
+        let rejected = bkey("bridge-CLOSE-OUTCOME-REJECTED");
+        let rejected_id = backend.ensure_session(&rejected).await.unwrap();
+        rec.reject_close.store(true, Ordering::SeqCst);
+        assert_eq!(
+            close_flight_outcomes(&backend, &rejected, answered).await,
+            [AcpTraceEvent::SessionCloseRejected {
+                owner_key_fingerprint,
+                rpc_code: -32603,
+            }]
+        );
+        rec.reject_close.store(false, Ordering::SeqCst);
+
+        let unanswered = bkey("bridge-CLOSE-OUTCOME-UNANSWERED");
+        let unanswered_id = backend.ensure_session(&unanswered).await.unwrap();
+        rec.hang_close.store(true, Ordering::SeqCst);
+        assert_eq!(
+            close_flight_outcomes(&backend, &unanswered, expires).await,
+            [AcpTraceEvent::SessionCloseUnanswered {
+                owner_key_fingerprint
+            }]
+        );
+
+        // On the wire, then the connection is retired before any answer:
+        // the missing answer is the bridge's own teardown, not the agent's.
+        let retired = bkey("bridge-CLOSE-OUTCOME-RETIRED");
+        let retired_id = backend.ensure_session(&retired).await.unwrap();
+        let fenced = bkey("bridge-CLOSE-OUTCOME-FENCED");
+        backend.ensure_session(&fenced).await.unwrap();
+        let (dispatched, dispatch_settled) = oneshot::channel();
+        let (outcomes, ()) = tokio::join!(
+            close_flight(&backend, &retired, expires, dispatched),
+            async {
+                dispatch_settled.await.expect("the flight dispatches");
+                backend.retire().await.unwrap();
+            }
+        );
+        assert_eq!(
+            outcomes,
+            [AcpTraceEvent::SessionCloseAbandoned {
+                owner_key_fingerprint,
+                sent: true,
+                connection_unavailable: true,
+            }]
+        );
+
+        // Already fenced: nothing is sent at all.
+        assert_eq!(
+            close_flight_outcomes(&backend, &fenced, answered).await,
+            [AcpTraceEvent::SessionCloseAbandoned {
+                owner_key_fingerprint,
+                sent: false,
+                connection_unavailable: true,
+            }]
+        );
+
+        tokio::time::resume();
+        settle_recording_agent(&backend).await;
+        assert_eq!(
+            *rec.closes.lock().await,
+            [acknowledged_id, rejected_id, unanswered_id, retired_id].map(|id| id.0.to_string()),
+            "an unsent close never reaches the agent"
+        );
+    }
+
+    #[tokio::test]
+    async fn close_flight_gives_up_on_a_mint_that_outlives_the_deadline() {
+        let expires = Duration::from_millis(50);
+        let rec = Recorder::advertising_close("agent-sess-CLOSE-UNSETTLED-MINT");
+        let backend = connect_recording(rec.clone()).await;
+        let session = bkey("bridge-CLOSE-UNSETTLED-MINT");
+        let entry = backend.session_entry(&session).await.unwrap();
+        // A mint in flight: it owns the single-flight lock and has an id from
+        // `session/new` that it has neither published nor abandoned.
+        let minting = Arc::clone(&entry.init_lock).lock_owned().await;
+        let minted = AbandonedMintGuard::arm(
+            Arc::clone(&entry),
+            AgentSessionId::new("agent-sess-CLOSE-UNSETTLED-MINT"),
+        );
+
+        tokio::time::pause();
+        let outcomes = close_flight_outcomes(&backend, &session, expires).await;
+        tokio::time::resume();
+        assert_eq!(
+            outcomes,
+            [AcpTraceEvent::SessionCloseAbandoned {
+                owner_key_fingerprint: CLOSE_FINGERPRINT,
+                sent: false,
+                connection_unavailable: false,
+            }],
+            "the flight records that it gave up on the mint"
+        );
+
+        // The flight is gone. The mint can no longer publish, and it closes
+        // what it minted itself when it settles.
+        entry
+            .publish_minted(
+                AgentSessionId::new("agent-sess-CLOSE-UNSETTLED-MINT"),
+                "/tmp".to_string(),
+            )
+            .expect_err("a released entry never gains an agent session");
+        assert!(entry.agent_id.get().is_none());
+        assert!(entry.minted_cwd.get().is_none());
+        drop(minted);
+        drop(minting);
+        closes_recorded(&rec, 1).await;
+        settle_recording_agent(&backend).await;
+        assert_eq!(
+            *rec.closes.lock().await,
+            vec!["agent-sess-CLOSE-UNSETTLED-MINT"]
+        );
+    }
+
+    #[tokio::test]
+    async fn close_flight_closes_its_whole_backlog_after_the_caller_has_returned() {
+        let grace = Duration::from_millis(100);
+        let dispatch_delay = Duration::from_millis(40);
+        let rec = Recorder::advertising_close("agent-sess-CLOSE-BACKLOG");
+        let backend = connect_recording(rec.clone()).await;
+        let session = bkey("bridge-CLOSE-BACKLOG");
+        let entry = backend.session_entry(&session).await.unwrap();
+        // Four failed mints, one of them reported twice.
+        for abandoned in ["first", "first", "second", "third", "fourth"] {
+            entry.abandon_minted(AgentSessionId::new(abandoned));
+        }
+
+        // Each request is 40 ms after the last: two fit inside the grace, and
+        // getting through all four takes 160 ms.
+        tokio::time::pause();
+        let (entry, closer) =
+            unpublish_for_close(&backend, &session, grace, Some(dispatch_delay)).await;
+        let started = tokio::time::Instant::now();
+        let flight = closer.fly_released(entry, started + grace).await;
+        let waited = started.elapsed();
+        assert!(
+            (grace..grace + dispatch_delay / 2).contains(&waited),
+            "release waited {waited:?} on dispatch; the {grace:?} cancel grace \
+             bounds its wait however long the backlog is"
+        );
+        assert!(
+            !flight.is_finished(),
+            "the flight works through the rest of the backlog on its own"
+        );
+        settle_recording_agent(&backend).await;
+        assert_eq!(
+            *rec.closes.lock().await,
+            vec!["first", "second"],
+            "the caller returned at its deadline with half the backlog still to send"
+        );
+        let outcomes = tokio::time::timeout(Duration::from_secs(5), flight)
+            .await
+            .expect("a close flight must end once it is through its backlog")
+            .unwrap();
+        tokio::time::resume();
+
+        let acknowledged = AcpTraceEvent::SessionCloseAcknowledged {
+            owner_key_fingerprint: CLOSE_FINGERPRINT,
+        };
+        assert_eq!(
+            outcomes, [acknowledged; 4],
+            "one outcome per distinct agent session, closed and answered \
+             whichever side of the caller's deadline it was sent on"
+        );
+        settle_recording_agent(&backend).await;
+        assert_eq!(
+            *rec.closes.lock().await,
+            vec!["first", "second", "third", "fourth"],
+            "the deadline leaves no id unsent, and no id is sent twice"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn close_flight_yields_to_the_runtime_between_batches_of_its_backlog() {
+        let grace = Duration::from_millis(100);
+        // Long enough that every answer arrives first.
+        let answered = Duration::from_secs(5);
+        let rec = Recorder::advertising_close("agent-sess-CLOSE-YIELDING");
+        let backend = connect_recording(rec.clone()).await;
+        let session = bkey("bridge-CLOSE-YIELDING");
+        let entry = backend.session_entry(&session).await.unwrap();
+        // Several batches of failed mints, the first of them reported twice.
+        let backlog: Vec<String> = (0..CLOSE_BATCH * 6)
+            .map(|mint| format!("abandoned-{mint}"))
+            .collect();
+        for abandoned in backlog.iter().chain(backlog.first()) {
+            entry.abandon_minted(AgentSessionId::new(abandoned.clone()));
+        }
+
+        // This runtime has one thread and nothing delays a request, so the
+        // flight's own yields are all that lets another task run before the
+        // backlog is through. The clock is paused: only the witness moves it.
+        tokio::time::pause();
+        let (entry, closer) = unpublish_for_close(&backend, &session, answered, None).await;
+        let sent = Arc::clone(&closer.sent);
+        // Another task on the flight's runtime. It reports how much of the
+        // backlog was on the wire when it first ran with the flight under
+        // way, and at that point takes the clock past the caller's deadline,
+        // by the millisecond that timers resolve to.
+        let witness = tokio::spawn({
+            let sent = Arc::clone(&sent);
+            async move {
+                loop {
+                    let sent = sent.load(Ordering::SeqCst);
+                    if sent > 0 {
+                        tokio::time::advance(grace + Duration::from_millis(1)).await;
+                        return sent;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            }
+        });
+        let started = tokio::time::Instant::now();
+        let flight = closer.fly_released(entry, started + grace).await;
+        let waited = started.elapsed();
+        let sent_on_return = sent.load(Ordering::SeqCst);
+        let flying_on_return = !flight.is_finished();
+
+        let witnessed = witness.await.unwrap();
+        assert!(
+            (1..backlog.len()).contains(&witnessed),
+            "another task first ran with {witnessed} of {} closes sent; the \
+             flight must yield to the runtime between batches of its backlog",
+            backlog.len()
+        );
+        assert!(
+            (grace..grace * 2).contains(&waited),
+            "release waited {waited:?} on dispatch; the {grace:?} cancel grace \
+             bounds its wait however long the backlog is"
+        );
+        assert!(
+            flying_on_return && sent_on_return < backlog.len(),
+            "the flight works through the rest of the backlog on its own; \
+             {sent_on_return} of {} closes were sent when release returned",
+            backlog.len()
+        );
+        let outcomes = tokio::time::timeout(Duration::from_secs(5), flight)
+            .await
+            .expect("a close flight must end once it is through its backlog")
+            .unwrap();
+        tokio::time::resume();
+
+        let acknowledged = AcpTraceEvent::SessionCloseAcknowledged {
+            owner_key_fingerprint: CLOSE_FINGERPRINT,
+        };
+        assert_eq!(
+            outcomes,
+            vec![acknowledged; backlog.len()],
+            "one outcome per distinct agent session"
+        );
+        settle_recording_agent(&backend).await;
+        assert_eq!(
+            *rec.closes.lock().await,
+            backlog,
+            "yielding leaves no id unsent, and no id is sent twice"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn close_flight_yields_to_the_runtime_between_batches_of_its_outcomes() {
+        let rec = Recorder::advertising_close("agent-sess-CLOSE-SETTLING-BACKLOG");
+        let backend = connect_recording(rec.clone()).await;
+        let session = bkey("bridge-CLOSE-SETTLING-BACKLOG");
+        let entry = backend.session_entry(&session).await.unwrap();
+        let backlog = CLOSE_BATCH * 6;
+        for mint in 0..backlog {
+            entry.abandon_minted(AgentSessionId::new(format!("abandoned-{mint}")));
+        }
+        // On a fenced connection every close comes back unsent. No outcome
+        // has an answer to wait for, so the flight's own yields are all that
+        // comes between one and the next.
+        backend.retire().await.unwrap();
+
+        let (entry, closer) =
+            unpublish_for_close(&backend, &session, DEFAULT_CANCEL_GRACE, None).await;
+        let (dispatched, mut dispatch_settled) = oneshot::channel();
+        let deadline = tokio::time::Instant::now() + DEFAULT_CANCEL_GRACE;
+        let flight = tokio::spawn(closer.close_released(entry, deadline, dispatched));
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while dispatch_settled.try_recv().is_err() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("a fenced flight has nothing to wait for before it signals dispatch");
+        assert!(
+            !flight.is_finished(),
+            "the flight must signal dispatch, which lets the release caller \
+             go, without first settling its whole backlog in one poll"
+        );
+
+        let outcomes = tokio::time::timeout(Duration::from_secs(5), flight)
+            .await
+            .expect("a close flight must end once it is through its backlog")
+            .unwrap();
+        let unsent = AcpTraceEvent::SessionCloseAbandoned {
+            owner_key_fingerprint: CLOSE_FINGERPRINT,
+            sent: false,
+            connection_unavailable: true,
+        };
+        assert_eq!(
+            outcomes,
+            vec![unsent; backlog],
+            "one outcome per distinct agent session"
+        );
+        settle_recording_agent(&backend).await;
+        assert!(
+            rec.closes.lock().await.is_empty(),
+            "nothing is sent on a fenced connection"
+        );
+    }
+
+    #[tokio::test]
+    async fn close_flight_does_not_hold_abandoned_ids_behind_the_turn_lock() {
+        let rec = Recorder::advertising_close("agent-sess-CLOSE-TURNLESS");
+        let backend = connect_recording(rec.clone()).await;
+        let session = bkey("bridge-CLOSE-TURNLESS");
+        let published = backend.ensure_session(&session).await.unwrap();
+        let entry = backend.session_entry(&session).await.unwrap();
+        // Something is still acting on the published session, one id was
+        // abandoned before release, and a mint in flight holds another. The
+        // entry is put together by hand: the flight must keep the three apart
+        // whatever combination it is handed.
+        let turn = Arc::clone(&entry.turn_lock).lock_owned().await;
+        entry.abandon_minted(AgentSessionId::new("abandoned-before"));
+        let minting = Arc::clone(&entry.init_lock).lock_owned().await;
+        let minted =
+            AbandonedMintGuard::arm(Arc::clone(&entry), AgentSessionId::new("abandoned-during"));
+
+        let (entry, closer) =
+            unpublish_for_close(&backend, &session, DEFAULT_CANCEL_GRACE, None).await;
+        let (dispatched, mut dispatch_settled) = oneshot::channel();
+        let deadline = tokio::time::Instant::now() + DEFAULT_CANCEL_GRACE;
+        let flight = tokio::spawn(closer.close_released(entry, deadline, dispatched));
+        closes_recorded(&rec, 1).await;
+        // The mint settles while the flight is waiting for it.
+        drop(minted);
+        drop(minting);
+        closes_recorded(&rec, 2).await;
+        settle_recording_agent(&backend).await;
+        assert_eq!(
+            *rec.closes.lock().await,
+            vec!["abandoned-before", "abandoned-during"],
+            "ids that never carried a turn are closed while the turn lock is held"
+        );
+        assert!(
+            dispatch_settled.try_recv().is_err() && !flight.is_finished(),
+            "only the published id waits for the turn lock"
+        );
+
+        drop(turn);
+        let outcomes = tokio::time::timeout(Duration::from_secs(5), flight)
+            .await
+            .expect("the flight ends once the turn lock is free")
+            .unwrap();
+        let acknowledged = AcpTraceEvent::SessionCloseAcknowledged {
+            owner_key_fingerprint: CLOSE_FINGERPRINT,
+        };
+        assert_eq!(outcomes, [acknowledged; 3]);
+        settle_recording_agent(&backend).await;
+        assert_eq!(
+            *rec.closes.lock().await,
+            vec!["abandoned-before", "abandoned-during", published.0.as_ref()]
+        );
+    }
+
+    #[tokio::test]
+    async fn close_flight_settles_sent_closes_while_the_published_id_waits_for_the_turn_lock() {
+        let grace = Duration::from_millis(50);
+        let rec = Recorder::advertising_close("agent-sess-CLOSE-SETTLING");
+        rec.hang_close.store(true, Ordering::SeqCst);
+        let backend = connect_recording(rec.clone()).await;
+        let session = bkey("bridge-CLOSE-SETTLING");
+        backend.ensure_session(&session).await.unwrap();
+        let entry = backend.session_entry(&session).await.unwrap();
+        // One id that never carried a turn, whose close the agent will not
+        // answer, beside a published id whose turn lock stays held.
+        entry.abandon_minted(AgentSessionId::new("abandoned"));
+        let turn = Arc::clone(&entry.turn_lock).lock_owned().await;
+
+        // Deadlines are reached by the idle runtime advancing the clock.
+        tokio::time::pause();
+        let (entry, closer) = unpublish_for_close(&backend, &session, grace, None).await;
+        let (dispatched, _dispatch_settled) = oneshot::channel();
+        let deadline = tokio::time::Instant::now() + grace;
+        let flight = tokio::spawn(closer.close_released(entry, deadline, dispatched));
+        // The abandoned id's close runs out of grace while the flight is
+        // still waiting for the turn lock. Its outcome is settled then, so a
+        // fence that closes afterwards cannot pass it off as the bridge's own
+        // teardown.
+        tokio::time::sleep(grace * 4).await;
+        backend.retire().await.unwrap();
+        drop(turn);
+        let outcomes = tokio::time::timeout(Duration::from_secs(5), flight)
+            .await
+            .expect("the flight ends once the turn lock is free")
+            .unwrap();
+        tokio::time::resume();
+
+        let owner_key_fingerprint = CLOSE_FINGERPRINT;
+        assert_eq!(
+            outcomes,
+            [
+                AcpTraceEvent::SessionCloseUnanswered {
+                    owner_key_fingerprint
+                },
+                AcpTraceEvent::SessionCloseAbandoned {
+                    owner_key_fingerprint,
+                    sent: false,
+                    connection_unavailable: true,
+                },
+            ],
+            "a close already sent is answered or not within its own grace, \
+             whatever the published id is still waiting for"
+        );
+        settle_recording_agent(&backend).await;
+        assert_eq!(*rec.closes.lock().await, vec!["abandoned"]);
+    }
+
+    #[tokio::test]
+    async fn close_pending_behind_a_held_turn_lock_ends_when_the_connection_is_fenced() {
+        let grace = Duration::from_millis(50);
+        let rec = Recorder::advertising_close("agent-sess-CLOSE-PENDING-FENCED");
+        rec.unique_minted_ids.store(true, Ordering::SeqCst);
+        let backend = connect_recording(rec.clone()).await;
+        // While the connection is usable, release closes.
+        let control_id =
+            release_control_session(&backend, "bridge-CLOSE-PENDING-FENCED-CONTROL").await;
+        let session = bkey("bridge-CLOSE-PENDING-FENCED");
+        backend.ensure_session(&session).await.unwrap();
+        let turn = Arc::clone(&backend.session_entry(&session).await.unwrap().turn_lock)
+            .lock_owned()
+            .await;
+
+        // Deadlines are reached by the idle runtime advancing the clock.
+        tokio::time::pause();
+        let (entry, closer) = unpublish_for_close(&backend, &session, grace, None).await;
+        let started = tokio::time::Instant::now();
+        let flight = closer.fly_released(entry, started + grace).await;
+        let waited = started.elapsed();
+        assert!(
+            (grace..grace * 2).contains(&waited),
+            "release waited {waited:?} on the pending close; the {grace:?} \
+             cancel grace bounds its wait"
+        );
+        tokio::time::sleep(grace * 4).await;
+        assert!(
+            !flight.is_finished(),
+            "the close stays owed past the deadline while the turn lock is held"
+        );
+
+        // The fence is the one thing that ends a close still owed.
+        backend.retire().await.unwrap();
+        drop(turn);
+        let outcomes = tokio::time::timeout(Duration::from_secs(5), flight)
+            .await
+            .expect("the flight ends once the turn lock is free")
+            .unwrap();
+        tokio::time::resume();
+
+        assert_eq!(
+            outcomes,
+            [AcpTraceEvent::SessionCloseAbandoned {
+                owner_key_fingerprint: CLOSE_FINGERPRINT,
+                sent: false,
+                connection_unavailable: true,
+            }]
+        );
+        settle_recording_agent(&backend).await;
+        assert_eq!(
+            *rec.closes.lock().await,
+            vec![control_id],
+            "nothing is sent on a connection fenced while the close was pending"
+        );
+    }
+
+    #[tokio::test]
+    async fn close_sent_after_the_release_deadline_has_its_own_grace_to_be_answered() {
+        /// Run a close flight for `session` whose close can only go out well
+        /// after the flight's deadline. Returns its outcomes with how long it
+        /// took to settle them once the close was free to go.
+        async fn close_late_behind_the_turn_lock(
+            backend: &AcpBackend,
+            session: &SessionId,
+            grace: Duration,
+        ) -> (Vec<AcpTraceEvent>, Duration) {
+            let turn = Arc::clone(&backend.session_entry(session).await.unwrap().turn_lock)
+                .lock_owned()
+                .await;
+            let (entry, closer) = unpublish_for_close(backend, session, grace, None).await;
+            let deadline = tokio::time::Instant::now() + grace;
+            let flight = closer.fly_released(entry, deadline).await;
+            tokio::time::sleep(grace * 4).await;
+            drop(turn);
+            let freed = tokio::time::Instant::now();
+            let outcomes = tokio::time::timeout(Duration::from_secs(5), flight)
+                .await
+                .expect("the flight ends once its close is answered or its grace is spent")
+                .unwrap();
+            (outcomes, freed.elapsed())
+        }
+
+        let grace = Duration::from_millis(50);
+        let rec = Recorder::advertising_close("agent-sess-CLOSE-LATE-ANSWER");
+        rec.unique_minted_ids.store(true, Ordering::SeqCst);
+        let backend = connect_recording(rec.clone()).await;
+        let owner_key_fingerprint = CLOSE_FINGERPRINT;
+        let answered = bkey("bridge-CLOSE-LATE-ANSWERED");
+        let answered_id = backend.ensure_session(&answered).await.unwrap();
+        let unanswered = bkey("bridge-CLOSE-LATE-UNANSWERED");
+        let unanswered_id = backend.ensure_session(&unanswered).await.unwrap();
+        // Deadlines are reached by the idle runtime advancing the clock.
+        tokio::time::pause();
+
+        let (outcomes, settled_in) =
+            close_late_behind_the_turn_lock(&backend, &answered, grace).await;
+        assert_eq!(
+            outcomes,
+            [AcpTraceEvent::SessionCloseAcknowledged {
+                owner_key_fingerprint
+            }],
+            "an answer is awaited from when its close was sent, not from a \
+             release deadline that had already passed by then"
+        );
+        assert!(
+            settled_in < grace,
+            "an answered close settled only after {settled_in:?}"
+        );
+
+        rec.hang_close.store(true, Ordering::SeqCst);
+        let (outcomes, settled_in) =
+            close_late_behind_the_turn_lock(&backend, &unanswered, grace).await;
+        assert_eq!(
+            outcomes,
+            [AcpTraceEvent::SessionCloseUnanswered {
+                owner_key_fingerprint
+            }]
+        );
+        assert!(
+            (grace..grace * 2).contains(&settled_in),
+            "an unanswered close was waited on for {settled_in:?}; its answer \
+             is given one {grace:?} grace from when it was sent"
+        );
+
+        tokio::time::resume();
+        settle_recording_agent(&backend).await;
+        assert_eq!(
+            *rec.closes.lock().await,
+            [answered_id, unanswered_id].map(|id| id.0.to_string())
+        );
+    }
+
     #[tokio::test]
     async fn observed_release_records_teardown_and_removes_session_state() {
         let rec = Recorder::new("agent-sess-RELEASE-OBSERVED");
@@ -17882,6 +20998,7 @@ mod tests {
             permission_registry: Arc::new(StdMutex::new(None)),
             perm_timeout_ms: Arc::new(AtomicU64::new(120_000)),
             prompt_snapshot_hook: StdMutex::new(None),
+            prompt_entry_hook: StdMutex::new(None),
             before_process_redactor_hook: StdMutex::new(None),
             fail_deferred_cancel_send: Arc::new(AtomicBool::new(false)),
             fail_cancel_send: Arc::new(AtomicBool::new(false)),
@@ -18026,6 +21143,7 @@ mod tests {
             auth_method: None,
             pre_authenticated: false,
             host_fallback_eligible: false,
+            rename_new_sessions: false,
             name: None,
             description: None,
             tags: vec![],
@@ -18184,5 +21302,805 @@ mod tests {
             1,
             "no additional session/new must be sent on the immutability guard path"
         );
+    }
+
+    // ── /rename at mint (`AcpConfig::rename_new_sessions`) ─────────────────────
+
+    /// The rename outcomes traced on a test's thread for as long as this lives.
+    ///
+    /// Every test that turns renaming on holds one from before its backend
+    /// exists, whether or not it asserts on the trace: [`connect_renaming`] is
+    /// the only way to such a backend. `tracing` caches for each callsite,
+    /// process-wide, whether any subscriber wants its events, and while a
+    /// single subscriber is registered it settles that from whichever thread
+    /// reaches the callsite first. A renaming test with no subscriber of its
+    /// own could so switch a rename event off under the test capturing it.
+    struct RenameTrace {
+        bytes: Arc<StdMutex<Vec<u8>>>,
+        _capturing: tracing::dispatcher::DefaultGuard,
+    }
+
+    impl RenameTrace {
+        fn capture() -> Self {
+            let bytes = Arc::new(StdMutex::new(Vec::new()));
+            let capturing = tracing::dispatcher::set_default(&test_trace_dispatch(bytes.clone()));
+            Self {
+                bytes,
+                _capturing: capturing,
+            }
+        }
+
+        /// The captured trace lines that report a rename outcome.
+        fn lines(&self) -> Vec<String> {
+            String::from_utf8(self.bytes.lock().unwrap().clone())
+                .unwrap()
+                .lines()
+                .filter(|line| line.contains("acp.session_rename_"))
+                .map(str::to_owned)
+                .collect()
+        }
+
+        /// Exactly these rename outcomes were traced, in this order, each as
+        /// `(level, event)`.
+        fn assert_events(&self, expected: &[(&str, &str)]) {
+            let lines = self.lines();
+            assert_eq!(lines.len(), expected.len(), "{expected:?}, got {lines:?}");
+            for (line, (level, event)) in lines.iter().zip(expected) {
+                assert!(
+                    line.contains(level) && line.contains(event),
+                    "expected {expected:?}, got {lines:?}"
+                );
+            }
+        }
+
+        /// Exactly one rename outcome was traced: `event`, at `level`.
+        fn assert_one(&self, level: &str, event: &str) {
+            self.assert_events(&[(level, event)]);
+        }
+    }
+
+    /// A recording backend that renames the sessions it mints, whatever else
+    /// `config` says, with the trace of its renames.
+    async fn connect_renaming(rec: &Recorder, config: AcpConfig) -> (Arc<AcpBackend>, RenameTrace) {
+        let trace = RenameTrace::capture();
+        let backend = connect_recording_with(
+            rec.clone(),
+            AcpConfig {
+                rename_new_sessions: true,
+                ..config
+            },
+        )
+        .await;
+        (Arc::new(backend), trace)
+    }
+
+    /// The `prompt` array of a `session/prompt` whose only block is `text`.
+    fn one_text_block(text: &str) -> serde_json::Value {
+        serde_json::json!([{ "type": "text", "text": text }])
+    }
+
+    /// Run one turn for `session` to its end and return what its stream
+    /// yielded, none of which may be an error.
+    async fn run_turn(backend: &AcpBackend, session: &SessionId, text: &str) -> Vec<Update> {
+        let part = bridge_core::domain::Part {
+            text: text.to_owned(),
+        };
+        let mut stream = backend
+            .prompt(session, vec![part])
+            .await
+            .expect("the turn starts");
+        let mut items = Vec::new();
+        while let Some(item) = stream.next().await {
+            items.push(item.expect("the turn yields no error"));
+        }
+        items
+    }
+
+    /// Start a turn for `session` as a task of its own, for a test that has
+    /// to act while the turn is under way.
+    fn spawn_turn(backend: &Arc<AcpBackend>, session: &SessionId, text: &str) -> Prompt {
+        let backend = Arc::clone(backend);
+        let session = session.clone();
+        let part = bridge_core::domain::Part {
+            text: text.to_owned(),
+        };
+        tokio::spawn(async move { backend.prompt(&session, vec![part]).await })
+    }
+
+    /// See a turn that [`spawn_turn`] started through to its end and return
+    /// what its stream yielded, none of which may be an error.
+    async fn finish_turn(turn: Prompt) -> Vec<Update> {
+        let mut stream = turn.await.unwrap().expect("the turn starts");
+        let mut items = Vec::new();
+        while let Some(item) = stream.next().await {
+            items.push(item.expect("the turn yields no error"));
+        }
+        items
+    }
+
+    /// The turn `run_turn` returned streamed exactly `texts` and then ended
+    /// with `end_turn`: nothing else reached its stream.
+    fn assert_plain_turn(items: &[Update], texts: &[&str]) {
+        let (done, streamed) = items.split_last().expect("a turn ends with Done");
+        assert!(
+            matches!(done, Update::Done { stop_reason, .. } if stop_reason == "end_turn"),
+            "the turn must end normally, got {done:?}"
+        );
+        let streamed: Vec<&str> = streamed
+            .iter()
+            .map(|item| match item {
+                Update::Text(text) => text.as_str(),
+                other => panic!("only the turn's own text may reach its stream, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(streamed, texts);
+    }
+
+    /// Wait until the agent has recorded `count` `/rename` prompts.
+    async fn renames_recorded(rec: &Recorder, count: usize) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while rec.renames().await.len() < count {
+                rec.rename_seen.notified().await;
+            }
+        })
+        .await
+        .expect("the mint must reach its rename");
+    }
+
+    fn open_rename_gate(rec: &Recorder) {
+        rec.gate_rename.store(false, Ordering::SeqCst);
+        rec.rename_gate.notify_one();
+    }
+
+    #[test]
+    fn rename_session_name_keeps_only_what_is_safe_in_a_slash_command() {
+        // Everything in the allowed set passes through untouched.
+        let allowed = "ABCXYZabcxyz0189._:@-";
+        assert_eq!(AcpBackend::rename_session_name(allowed), allowed);
+        assert_eq!(
+            AcpBackend::rename_session_name("ctx-1:node.review@a_b"),
+            "ctx-1:node.review@a_b"
+        );
+
+        // Anything else becomes one `_` per character, not per byte.
+        assert_eq!(
+            AcpBackend::rename_session_name("a b/c\nd\té\u{1F600}!"),
+            "a_b_c_d____"
+        );
+        assert_eq!(AcpBackend::rename_session_name("/rename x"), "_rename_x");
+
+        // A long key is cut to 96 characters, counted after the mapping.
+        assert_eq!(
+            AcpBackend::rename_session_name(&"k".repeat(96)),
+            "k".repeat(96)
+        );
+        assert_eq!(
+            AcpBackend::rename_session_name(&"k".repeat(97)),
+            "k".repeat(96)
+        );
+        assert_eq!(
+            AcpBackend::rename_session_name(&"é".repeat(200)),
+            "_".repeat(96)
+        );
+
+        // Nothing to name the session after.
+        assert_eq!(AcpBackend::rename_session_name(""), "a2a-session");
+    }
+
+    #[test]
+    fn rename_request_is_one_text_block_holding_the_slash_command() {
+        let request = AcpBackend::rename_session_request(
+            AgentSessionId::new("agent-sess-RENAME-WIRE"),
+            &bkey("bridge RENAME/wire"),
+        );
+        assert_eq!(
+            serde_json::to_value(&request).unwrap(),
+            serde_json::json!({
+                "sessionId": "agent-sess-RENAME-WIRE",
+                "prompt": [{ "type": "text", "text": "/rename bridge_RENAME_wire" }],
+            })
+        );
+    }
+
+    #[test]
+    fn renaming_is_off_by_default_and_bounded_at_five_seconds() {
+        let config = AcpConfig::default();
+        assert!(!config.rename_new_sessions);
+        assert_eq!(config.rename_timeout, Duration::from_secs(5));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn minting_renames_the_session_once_after_setup_and_before_any_turn() {
+        let rec = Recorder::new("agent-sess-RENAME");
+        let (backend, trace) = connect_renaming(&rec, test_config_with_mode("mode")).await;
+        // A key the name has to be derived from, not copied.
+        let session = bkey("bridge RENAME/1");
+        backend
+            .configure_session(
+                &session,
+                &SessionSpec::from_config(EffectiveConfig {
+                    model: Some("m".into()),
+                    effort: Some(Effort::High),
+                    mode: Some("mode".into()),
+                }),
+            )
+            .await
+            .unwrap();
+
+        assert_plain_turn(&run_turn(&backend, &session, "first").await, &[]);
+        assert_plain_turn(&run_turn(&backend, &session, "second").await, &[]);
+
+        settle_recording_agent(&backend).await;
+        assert_eq!(
+            *rec.wire_log.lock().await,
+            [
+                "session/new",
+                "session/set_mode",
+                "session/set_config_option",
+                "session/set_config_option",
+                "session/prompt",
+                "session/prompt",
+                "session/prompt",
+            ],
+            "the rename follows every setup request of the mint and precedes the first turn"
+        );
+        let agent_id = "agent-sess-RENAME".to_string();
+        assert_eq!(
+            *rec.prompts.lock().await,
+            [
+                (agent_id.clone(), one_text_block("/rename bridge_RENAME_1")),
+                (agent_id.clone(), one_text_block("first")),
+                (agent_id, one_text_block("second")),
+            ],
+            "one rename, as the only block of the session's first prompt, and none on reuse"
+        );
+        assert_eq!(
+            *rec.prompt_log.lock().await,
+            ["start", "end", "start", "end"],
+            "the rename is not a turn"
+        );
+        trace.assert_one("DEBUG", "acp.session_rename_acknowledged");
+    }
+
+    #[tokio::test]
+    async fn sessions_are_not_renamed_unless_the_agent_opts_in() {
+        let rec = Recorder::new("agent-sess-RENAME-OFF");
+        let backend = connect_recording(rec.clone()).await;
+        let session = bkey("bridge-RENAME-OFF");
+
+        backend.ensure_session(&session).await.unwrap();
+        assert_plain_turn(&run_turn(&backend, &session, "first").await, &[]);
+        assert_plain_turn(&run_turn(&backend, &session, "second").await, &[]);
+
+        settle_recording_agent(&backend).await;
+        assert!(rec.renames().await.is_empty());
+        let agent_id = "agent-sess-RENAME-OFF".to_string();
+        assert_eq!(
+            *rec.prompts.lock().await,
+            [
+                (agent_id.clone(), one_text_block("first")),
+                (agent_id, one_text_block("second")),
+            ],
+            "with the option off the agent sees the turns and nothing else"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn rejected_rename_does_not_fail_the_mint() {
+        let rec = Recorder::new("agent-sess-RENAME-REJECT");
+        rec.reject_rename.store(true, Ordering::SeqCst);
+        rec.set_updates(vec![ScriptedUpdate::Text("real")]).await;
+        let (backend, trace) = connect_renaming(&rec, test_config()).await;
+        let session = bkey("bridge-RENAME-REJECT");
+
+        let agent_id = backend
+            .ensure_session(&session)
+            .await
+            .expect("a rejected rename must not fail the mint");
+        assert_eq!(agent_id.0.as_ref(), "agent-sess-RENAME-REJECT");
+        assert!(backend.session_catalog(&session).is_some());
+        assert_plain_turn(&run_turn(&backend, &session, "first").await, &["real"]);
+
+        settle_recording_agent(&backend).await;
+        assert_eq!(
+            rec.renames().await.len(),
+            1,
+            "a rejected rename is not retried, at the mint or at the first turn"
+        );
+        assert_eq!(rec.new_session_calls.load(Ordering::SeqCst), 1);
+        assert!(
+            rec.cancels.lock().await.is_empty(),
+            "a rejected rename is not followed up with a cancel"
+        );
+        trace.assert_one("WARN", "acp.session_rename_rejected");
+    }
+
+    /// `entry` holds the session it published as `agent_id` and nothing of a
+    /// mint or a turn in flight: both locks are free and every slot that one
+    /// of them fills is empty. The pattern names every field, so one added to
+    /// carry something from a mint over to a later turn has to be accounted
+    /// for here.
+    async fn assert_entry_holds_only_its_session(entry: &AgentSession, agent_id: &str) {
+        let AgentSession {
+            agent_id: published,
+            minted,
+            init_lock,
+            minted_cwd,
+            active_mint_cwd,
+            turn_lock,
+            turn_accepted,
+            config_surface,
+            cancel_requested,
+            turn_kill,
+        } = entry;
+        // A turn's driver lets go of the session just after its stream ends.
+        drop(
+            tokio::time::timeout(Duration::from_secs(2), turn_lock.lock())
+                .await
+                .expect("no turn may hold the session"),
+        );
+        assert!(init_lock.try_lock().is_ok(), "no mint may be in flight");
+        assert_eq!(published.get().map(|id| id.0.as_ref()), Some(agent_id));
+        assert!(minted_cwd.get().is_some());
+        assert!(config_surface.lock().unwrap().is_some());
+        assert!(active_mint_cwd.lock().unwrap().is_none());
+        let ledger = minted.lock().unwrap();
+        assert!(!ledger.released);
+        assert!(ledger.abandoned.is_empty());
+        assert!(ledger.late_closer.is_none());
+        assert!(turn_accepted.lock().unwrap().is_none());
+        assert!(turn_kill.lock().unwrap().is_none());
+        assert!(!cancel_requested.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn unanswered_rename_ends_at_its_bound_and_the_same_session_serves_the_first_turn() {
+        let bound = Duration::from_millis(200);
+        let rec = Recorder::advertising_close("agent-sess-RENAME-HANG");
+        rec.unique_minted_ids.store(true, Ordering::SeqCst);
+        rec.hang_rename.store(true, Ordering::SeqCst);
+        rec.set_updates(vec![ScriptedUpdate::Text("real")]).await;
+        let (backend, trace) = connect_renaming(
+            &rec,
+            AcpConfig {
+                rename_timeout: bound,
+                ..test_config()
+            },
+        )
+        .await;
+        let session = bkey("bridge-RENAME-HANG");
+        let minted_id = "agent-sess-RENAME-HANG-1".to_string();
+
+        // With the clock paused, time advances only once every task is idle,
+        // and then no further than the next timer: the mint waits on the
+        // missing answer until its bound is spent, and a turn that waits on
+        // no timer takes no time at all.
+        tokio::time::pause();
+        let started = tokio::time::Instant::now();
+        let mint: Mint = {
+            let backend = Arc::clone(&backend);
+            let session = session.clone();
+            tokio::spawn(async move { backend.ensure_session(&session).await })
+        };
+        renames_recorded(&rec, 1).await;
+        // From here on a second `session/new` would never be answered: the
+        // mint has to come through without one.
+        rec.gate_new_session.store(true, Ordering::SeqCst);
+        let minted = tokio::time::timeout(bound * 10, mint)
+            .await
+            .expect("an unanswered rename must not hang the mint")
+            .unwrap();
+        let waited = started.elapsed();
+
+        assert_eq!(
+            minted
+                .expect("an unanswered rename must not fail the mint")
+                .0
+                .as_ref(),
+            minted_id,
+            "the mint publishes the session that `session/new` returned"
+        );
+        // The timer fires on the first millisecond tick at or past the bound.
+        assert!(
+            (bound..=bound + Duration::from_millis(1)).contains(&waited),
+            "the mint waited {waited:?} on the rename; it must wait out the \
+             {bound:?} bound and no longer"
+        );
+        assert!(backend.session_catalog(&session).is_some());
+        let entry = backend.session_entry(&session).await.unwrap();
+        assert_entry_holds_only_its_session(&entry, &minted_id).await;
+        assert!(
+            backend.updates().unwrap().lock().unwrap().is_empty(),
+            "the rename must not leave an update route behind"
+        );
+
+        // The first turn goes straight out to the session that was minted.
+        let started = tokio::time::Instant::now();
+        let first = run_turn(&backend, &session, "first").await;
+        let turn_took = started.elapsed();
+        tokio::time::resume();
+
+        assert_plain_turn(&first, &["real"]);
+        assert_eq!(
+            turn_took,
+            Duration::ZERO,
+            "nothing may hold the first turn back after an unanswered rename"
+        );
+        settle_recording_agent(&backend).await;
+        assert_eq!(
+            *rec.wire_log.lock().await,
+            ["session/new", "session/prompt", "session/prompt"],
+            "one `session/new`, one rename, then the turn, and no `session/cancel`"
+        );
+        assert_eq!(rec.new_session_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            *rec.prompts.lock().await,
+            [
+                (
+                    minted_id.clone(),
+                    one_text_block("/rename bridge-RENAME-HANG")
+                ),
+                (minted_id.clone(), one_text_block("first")),
+            ],
+            "one rename, not retried, and the turn on the session that was minted"
+        );
+        assert!(rec.cancels.lock().await.is_empty());
+        assert_entry_holds_only_its_session(&entry, &minted_id).await;
+        trace.assert_one("WARN", "acp.session_rename_unanswered");
+
+        // The session is the bridge session's own, unanswered rename and
+        // all: its release closes it, once.
+        backend.release_session_result(&session).await.unwrap();
+        settle_recording_agent(&backend).await;
+        assert_eq!(*rec.closes.lock().await, vec![minted_id]);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn answer_that_comes_after_the_bound_does_not_disturb_the_first_turn() {
+        let rec = Recorder::new("agent-sess-RENAME-LATE");
+        rec.gate_rename.store(true, Ordering::SeqCst);
+        // The first turn stays open until it is let go, so the rename's
+        // answer arrives while that turn is under way.
+        rec.gate_prompt.store(true, Ordering::SeqCst);
+        rec.set_updates(vec![ScriptedUpdate::Text("real")]).await;
+        let (backend, trace) = connect_renaming(
+            &rec,
+            AcpConfig {
+                rename_timeout: Duration::from_millis(50),
+                ..test_config()
+            },
+        )
+        .await;
+        let session = bkey("bridge-RENAME-LATE");
+        let agent_id = "agent-sess-RENAME-LATE".to_string();
+
+        // With the clock paused, the bound is the only wait that runs out.
+        tokio::time::pause();
+        backend
+            .ensure_session(&session)
+            .await
+            .expect("an unanswered rename must not fail the mint");
+        let turn = spawn_turn(&backend, &session, "first");
+        tokio::time::timeout(Duration::from_secs(2), rec.prompt_started.notified())
+            .await
+            .expect("the first turn must reach the adapter");
+
+        // Now the adapter gets round to the rename: its `session_info_update`
+        // and then its answer, to a request the mint has given up on. The
+        // round trip after them shows the backend has taken both in.
+        open_rename_gate(&rec);
+        tokio::time::timeout(Duration::from_secs(2), rec.rename_settled.notified())
+            .await
+            .expect("the adapter must get round to the rename");
+        settle_recording_agent(&backend).await;
+
+        rec.prompt_gate.notify_one();
+        let first = finish_turn(turn).await;
+        rec.gate_prompt.store(false, Ordering::SeqCst);
+        let second = run_turn(&backend, &session, "second").await;
+        tokio::time::resume();
+
+        // The turn ends on its own answer, not on the rename's.
+        assert_plain_turn(&first, &["real"]);
+        assert_plain_turn(&second, &["real"]);
+        settle_recording_agent(&backend).await;
+        assert_eq!(
+            *rec.prompts.lock().await,
+            [
+                (
+                    agent_id.clone(),
+                    one_text_block("/rename bridge-RENAME-LATE")
+                ),
+                (agent_id.clone(), one_text_block("first")),
+                (agent_id, one_text_block("second")),
+            ],
+            "the rename is sent once, whenever it is answered"
+        );
+        assert_eq!(
+            *rec.prompt_log.lock().await,
+            ["start", "end", "start", "end"]
+        );
+        assert_eq!(rec.new_session_calls.load(Ordering::SeqCst), 1);
+        assert!(rec.cancels.lock().await.is_empty());
+        trace.assert_one("WARN", "acp.session_rename_unanswered");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn release_during_an_unanswered_rename_closes_the_minted_session_once() {
+        let bound = Duration::from_millis(200);
+        let rec = Recorder::advertising_close("agent-sess-RENAME-HANG-RELEASE");
+        rec.unique_minted_ids.store(true, Ordering::SeqCst);
+        rec.hang_rename.store(true, Ordering::SeqCst);
+        let (backend, trace) = connect_renaming(
+            &rec,
+            AcpConfig {
+                rename_timeout: bound,
+                ..test_config()
+            },
+        )
+        .await;
+        let session = bkey("bridge-RENAME-HANG-RELEASE");
+
+        // With the clock paused, time advances only once every task is idle,
+        // so the bound cannot run out before release has unpublished the
+        // entry of the mint that is waiting on it.
+        tokio::time::pause();
+        let mint: Mint = {
+            let backend = Arc::clone(&backend);
+            let session = session.clone();
+            tokio::spawn(async move { backend.ensure_session(&session).await })
+        };
+        renames_recorded(&rec, 1).await;
+        let release = spawn_release(&backend, &session);
+        unpublished(&backend, &session).await;
+
+        mint.await
+            .unwrap()
+            .expect_err("a mint that release overtook must not hand out its session");
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), release)
+                .await
+                .expect("release completes once the mint has settled")
+                .unwrap(),
+            Ok(BackendCleanupDispositionV1::Complete)
+        );
+        tokio::time::resume();
+
+        assert_bridge_state_released(&backend, &session).await;
+        settle_recording_agent(&backend).await;
+        assert_eq!(rec.new_session_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            *rec.closes.lock().await,
+            vec!["agent-sess-RENAME-HANG-RELEASE-1"],
+            "the session whose rename went unanswered is closed exactly once"
+        );
+        trace.assert_one("WARN", "acp.session_rename_unanswered");
+
+        // The key is free again: a fresh mint works, and is renamed once.
+        rec.hang_rename.store(false, Ordering::SeqCst);
+        let fresh_id = backend.ensure_session(&session).await.unwrap();
+        assert_eq!(fresh_id.0.as_ref(), "agent-sess-RENAME-HANG-RELEASE-2");
+        settle_recording_agent(&backend).await;
+        assert_eq!(rec.renames().await.len(), 2);
+        assert_eq!(rec.closes.lock().await.len(), 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn updates_sent_during_the_rename_reach_no_turn() {
+        // Control: the same updates sent during a turn do reach its stream,
+        // so their absence below is the rename's doing.
+        let control = Recorder::new("agent-sess-RENAME-CHATTER-CONTROL");
+        control
+            .set_updates(vec![
+                ScriptedUpdate::Text("rename chatter"),
+                ScriptedUpdate::Usage(7, 70),
+            ])
+            .await;
+        let backend = connect_recording(control.clone()).await;
+        let items = run_turn(&backend, &bkey("bridge-RENAME-CHATTER-CONTROL"), "first").await;
+        assert!(items
+            .iter()
+            .any(|item| matches!(item, Update::Text(text) if text == "rename chatter")));
+        assert!(items
+            .iter()
+            .any(|item| matches!(item, Update::Usage(usage) if usage.used == Some(7))));
+
+        let rec = Recorder::new("agent-sess-RENAME-CHATTER");
+        rec.rename_chatter.store(true, Ordering::SeqCst);
+        rec.set_updates(vec![ScriptedUpdate::Text("real")]).await;
+        let (backend, trace) = connect_renaming(&rec, test_config()).await;
+        let session = bkey("bridge-RENAME-CHATTER");
+
+        // The adapter's `session_info_update`, a stray message chunk and a
+        // usage snapshot all arrive ahead of the rename's answer, so the mint
+        // has seen them through by the time it returns.
+        backend
+            .ensure_session(&session)
+            .await
+            .expect("updates for a session being renamed must not fail its mint");
+        assert!(
+            backend.updates().unwrap().lock().unwrap().is_empty(),
+            "the rename must not install an update route"
+        );
+
+        assert_plain_turn(&run_turn(&backend, &session, "first").await, &["real"]);
+        assert_plain_turn(&run_turn(&backend, &session, "second").await, &["real"]);
+        settle_recording_agent(&backend).await;
+        assert_eq!(rec.renames().await.len(), 1);
+        trace.assert_one("DEBUG", "acp.session_rename_acknowledged");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn release_during_the_rename_closes_the_minted_session_once() {
+        let rec = Recorder::advertising_close("agent-sess-RENAME-RELEASE");
+        rec.unique_minted_ids.store(true, Ordering::SeqCst);
+        rec.gate_rename.store(true, Ordering::SeqCst);
+        let (backend, trace) = connect_renaming(&rec, test_config()).await;
+        let session = bkey("bridge-RENAME-RELEASE");
+        let rename = "/rename bridge-RENAME-RELEASE".to_string();
+
+        // Park the mint in its rename: `session/new` has answered, so the
+        // agent-side session exists, but nothing is published.
+        let mint: Mint = {
+            let backend = Arc::clone(&backend);
+            let session = session.clone();
+            tokio::spawn(async move { backend.ensure_session(&session).await })
+        };
+        renames_recorded(&rec, 1).await;
+        let parked = backend.session_entry(&session).await.unwrap();
+        assert!(parked.agent_id.get().is_none());
+
+        let mut release = spawn_release(&backend, &session);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut release)
+                .await
+                .is_err(),
+            "release must wait for a mint that can still settle within the cancel grace"
+        );
+
+        open_rename_gate(&rec);
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), release)
+                .await
+                .expect("release completes once the mint has settled")
+                .unwrap(),
+            Ok(BackendCleanupDispositionV1::Complete)
+        );
+        mint.await
+            .unwrap()
+            .expect_err("a mint that release overtook must not hand out its session");
+        assert!(
+            parked.agent_id.get().is_none(),
+            "the renamed session must never be published on the released entry"
+        );
+        assert_bridge_state_released(&backend, &session).await;
+        settle_recording_agent(&backend).await;
+        assert_eq!(
+            *rec.closes.lock().await,
+            vec!["agent-sess-RENAME-RELEASE-1"],
+            "the session minted during release is closed exactly once"
+        );
+        trace.assert_one("DEBUG", "acp.session_rename_acknowledged");
+
+        // The key is free again: a fresh mint works, and is renamed once.
+        let fresh_id = backend
+            .ensure_session(&session)
+            .await
+            .expect("a fresh mint for the released key must succeed");
+        assert_eq!(fresh_id.0.as_ref(), "agent-sess-RENAME-RELEASE-2");
+        assert_eq!(backend.ensure_session(&session).await.unwrap(), fresh_id);
+        settle_recording_agent(&backend).await;
+        assert_eq!(
+            rec.renames().await,
+            vec![
+                ("agent-sess-RENAME-RELEASE-1".to_string(), rename.clone()),
+                ("agent-sess-RENAME-RELEASE-2".to_string(), rename),
+            ],
+            "each minted session is renamed once"
+        );
+        assert_eq!(
+            rec.closes.lock().await.len(),
+            1,
+            "re-minting the released key must not close anything"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn rename_is_skipped_on_a_connection_that_is_already_fenced() {
+        let rec = Recorder::new("agent-sess-RENAME-FENCED");
+        rec.unique_minted_ids.store(true, Ordering::SeqCst);
+        let (backend, trace) = connect_renaming(&rec, test_config_with_mode("mode")).await;
+        let session = bkey("bridge-RENAME-FENCED");
+
+        // The fence closes while the mint is still configuring its mode, so
+        // it is already closed when the mint reaches its rename.
+        let (mint, minting_id) = mint_parked_in_mode_setup(&backend, &rec, &session).await;
+        AcpBackend::close_connection_fence(&backend.dispatch_gate, &backend.unavailable);
+        open_mode_gate(&rec);
+
+        let minted = mint
+            .await
+            .unwrap()
+            .expect("a skipped rename must not fail the mint");
+        assert_eq!(minted.0.as_ref(), minting_id);
+        settle_recording_agent(&backend).await;
+        assert!(
+            rec.prompts.lock().await.is_empty(),
+            "no prompt, the rename included, goes out on a fenced connection"
+        );
+        trace.assert_one("DEBUG", "acp.session_rename_skipped");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn rename_cut_off_by_the_fence_does_not_fail_the_mint() {
+        let rec = Recorder::new("agent-sess-RENAME-CUT");
+        rec.gate_rename.store(true, Ordering::SeqCst);
+        // What the adapter answers once the fence is closed is not its
+        // verdict on the rename, so it must not be traced as one.
+        rec.reject_rename.store(true, Ordering::SeqCst);
+        let (backend, trace) = connect_renaming(&rec, test_config()).await;
+        let session = bkey("bridge-RENAME-CUT");
+
+        let mint: Mint = {
+            let backend = Arc::clone(&backend);
+            let session = session.clone();
+            tokio::spawn(async move { backend.ensure_session(&session).await })
+        };
+        renames_recorded(&rec, 1).await;
+        AcpBackend::close_connection_fence(&backend.dispatch_gate, &backend.unavailable);
+        open_rename_gate(&rec);
+
+        let minted = mint
+            .await
+            .unwrap()
+            .expect("a rename cut off by the fence must not fail the mint");
+        assert_eq!(minted.0.as_ref(), "agent-sess-RENAME-CUT");
+        settle_recording_agent(&backend).await;
+        assert_eq!(rec.renames().await.len(), 1);
+        trace.assert_one("WARN", "acp.session_rename_interrupted");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn rename_starved_by_the_fence_does_not_fail_the_mint() {
+        let bound = Duration::from_millis(200);
+        let rec = Recorder::new("agent-sess-RENAME-STARVED");
+        rec.unique_minted_ids.store(true, Ordering::SeqCst);
+        rec.hang_rename.store(true, Ordering::SeqCst);
+        let (backend, trace) = connect_renaming(
+            &rec,
+            AcpConfig {
+                rename_timeout: bound,
+                ..test_config()
+            },
+        )
+        .await;
+        let session = bkey("bridge-RENAME-STARVED");
+
+        // With the clock paused, the bound cannot run out before the fence
+        // has closed on the mint that is waiting on it.
+        tokio::time::pause();
+        let mint: Mint = {
+            let backend = Arc::clone(&backend);
+            let session = session.clone();
+            tokio::spawn(async move { backend.ensure_session(&session).await })
+        };
+        renames_recorded(&rec, 1).await;
+        AcpBackend::close_connection_fence(&backend.dispatch_gate, &backend.unavailable);
+        let minted = mint
+            .await
+            .unwrap()
+            .expect("a rename starved by the fence must not fail the mint");
+        tokio::time::resume();
+
+        assert_eq!(minted.0.as_ref(), "agent-sess-RENAME-STARVED-1");
+        settle_recording_agent(&backend).await;
+        assert_eq!(rec.new_session_calls.load(Ordering::SeqCst), 1);
+        assert!(rec.cancels.lock().await.is_empty());
+        trace.assert_one("WARN", "acp.session_rename_interrupted");
+        backend
+            .prompt(&session, vec![])
+            .await
+            .err()
+            .expect("no turn starts on a fenced connection");
     }
 }

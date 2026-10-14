@@ -447,6 +447,7 @@ dependencies = [
  "bridge-coordinator",
  "bridge-core",
  "bridge-observ",
+ "bridge-registry",
  "bridge-workflow",
  "futures",
  "serde",
