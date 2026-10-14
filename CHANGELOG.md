@@ -7,6 +7,28 @@ release (see [`docs/adr/`](docs/adr/) for the full architectural record).
 
 ## [Unreleased]
 
+### Added
+
+- `[[agents]]` entries for `codex-acp` can set `rename_new_sessions = true` (default `false`) to stop
+  the adapter's title-generation thread. After a new session's first turn the adapter starts a second
+  codex thread, spends one model turn on it to generate a title, and never unsubscribes it; the bridge
+  has no id for that thread, so neither `session/close` on release nor anything short of adapter exit
+  ends the MCP server processes it started. With the option on, the bridge sends the adapter's own
+  slash command, `/rename <name>` as a `session/prompt`, once to each agent session it mints, after
+  mode, model and effort have settled and before the session can serve a turn. The adapter answers it
+  locally without a model turn and then skips title generation. The name is derived from the bridge
+  session key and is what the thread is listed under in codex's own session list. The rename is
+  best-effort: it is bounded at 5 s, never retried, and never fails the mint, and a refused,
+  unanswered or cut-off rename is recorded only as a typed trace event. A session whose rename is
+  still unanswered at the bound is published all the same, but its first turn does not start
+  alongside the rename, because the adapter may yet send output for it that nothing could tell apart
+  from the turn's own: the bridge sends `session/cancel` and waits for the rename to be answered,
+  for one cancel grace at most. Validation rejects the option for any other `cmd`, where the text
+  would reach the model as a prompt; a hot reload that changes it respawns the agent's adapter; and
+  model-catalog probes never rename. The option relies on the adapter's `/rename` command as
+  measured on codex-acp 1.13.1 and 2.2.2: see [`docs/compatibility.md`](docs/compatibility.md)
+  before enabling it on another version.
+
 ### Fixed
 
 - `serve` and `mcp` now retire an agent's shared adapter process once no registry lease has used it

@@ -1052,6 +1052,7 @@ impl AgentRegistry for Registry {
                     && c.watchdog == e.watchdog
                     && c.mcp == e.mcp
                     && c.mcp_delivery == e.mcp_delivery
+                    && c.rename_new_sessions == e.rename_new_sessions
             });
             match reuse {
                 // Config-only edit: keep the warm slot, swap only its entry config.
@@ -1229,6 +1230,7 @@ mod tests {
             auth_method: None,
             pre_authenticated: false,
             host_fallback_eligible: false,
+            rename_new_sessions: false,
             name: None,
             description: None,
             tags: vec![],
@@ -1323,6 +1325,7 @@ mod tests {
                 auth_method: None,
                 pre_authenticated: false,
                 host_fallback_eligible: false,
+                rename_new_sessions: false,
                 name: None,
                 description: None,
                 tags: vec![],
@@ -2230,6 +2233,18 @@ mod tests {
         let mut native_delivery = acp_delivery.clone();
         native_delivery.mcp_delivery = McpDelivery::CodexNative;
         assert_spawn_frozen_edit_replaces_slot("mcp_delivery", acp_delivery, native_delivery).await;
+    }
+
+    #[tokio::test]
+    async fn spawn_frozen_rename_new_sessions_edit_replaces_backend() {
+        // The backend reads the option once, at spawn, so turning it on or off must not leave
+        // the warm backend minting sessions under the old setting.
+        let off = entry("a");
+        let mut on = off.clone();
+        on.rename_new_sessions = true;
+        assert_spawn_frozen_edit_replaces_slot("rename_new_sessions on", off.clone(), on.clone())
+            .await;
+        assert_spawn_frozen_edit_replaces_slot("rename_new_sessions off", on, off).await;
     }
 
     #[tokio::test]

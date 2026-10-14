@@ -2522,6 +2522,9 @@ fn freeze_effect(
         auth_method,
         pre_authenticated,
         host_fallback_eligible: _,
+        // Best-effort session naming: it never fails a mint and changes nothing a turn runs
+        // with, so toggling it must not read as provider-effect drift on a frozen run.
+        rename_new_sessions: _,
         name: _,
         description: _,
         tags: _,
@@ -3253,6 +3256,7 @@ mod r2f1b_contract_tests {
             auth_method: None,
             pre_authenticated: true,
             host_fallback_eligible: false,
+            rename_new_sessions: false,
             name: None,
             description: None,
             tags: vec![],

@@ -51,6 +51,7 @@ fn entry() -> AgentEntry {
         auth_method: None,
         pre_authenticated: true,
         host_fallback_eligible: false,
+        rename_new_sessions: false,
         name: None,
         description: None,
         tags: vec![],

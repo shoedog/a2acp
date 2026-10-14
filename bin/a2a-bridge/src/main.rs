@@ -815,6 +815,7 @@ fn acp_spawn_inputs_with_cwd_binding(
         mode: entry.mode.clone(),
         auth_method: entry.auth_method.clone(),
         pre_authenticated: entry.pre_authenticated,
+        rename_new_sessions: entry.rename_new_sessions,
         container,
         watchdog: entry.watchdog.clone(),
         diagnostic_redactor,
@@ -1158,6 +1159,7 @@ fn container_rw_cfg_from_entry(
         mode: entry.mode.clone(),
         auth_method: entry.auth_method.clone(),
         pre_authenticated: entry.pre_authenticated,
+        rename_new_sessions: entry.rename_new_sessions,
         watchdog: entry.watchdog.clone(),
         handshake_timeout: bridge_acp::acp_backend::AcpConfig::default().handshake_timeout,
         cancel_grace: bridge_acp::acp_backend::AcpConfig::default().cancel_grace,
@@ -12315,6 +12317,48 @@ inputs = []
     }
 
     #[test]
+    fn serving_configs_carry_the_entrys_rename_new_sessions() {
+        use bridge_core::domain::{EgressPolicy, MountAccess, SandboxConfig};
+        let run = bridge_core::run_identity::RunHandle {
+            instance_id: "run0".into(),
+            host: "h".into(),
+            lease: "/l/run0.lock".into(),
+            start: "0".into(),
+        };
+        let mut writer = acp_entry("writer");
+        writer.cmd = Some("codex-acp".into());
+        writer.kind = bridge_core::domain::AgentKind::ContainerRw;
+        writer.sandbox = Some(SandboxConfig {
+            runtime: None,
+            image: "img".into(),
+            mount: "/work".into(),
+            access: MountAccess::Rw,
+            egress: EgressPolicy::Open,
+            volumes: vec![],
+        });
+
+        // Both ways a serving backend is configured from an entry: the ACP spawn inputs (host
+        // and `:ro` agents) and the `:rw` container config. Off unless the entry asks for it.
+        for rename_new_sessions in [false, true] {
+            let mut reader = acp_entry("reader");
+            reader.cmd = Some("codex-acp".into());
+            reader.rename_new_sessions = rename_new_sessions;
+            let (_, _, acp) = acp_spawn_inputs(
+                &reader,
+                std::path::PathBuf::from("/tmp"),
+                std::path::Path::new("/cfg/a2a.toml"),
+                &run,
+            )
+            .unwrap();
+            assert_eq!(acp.rename_new_sessions, rename_new_sessions);
+
+            writer.rename_new_sessions = rename_new_sessions;
+            let ccfg = container_rw_cfg_from_entry(&writer, &run).unwrap();
+            assert_eq!(ccfg.rename_new_sessions, rename_new_sessions);
+        }
+    }
+
+    #[test]
     fn acp_spawn_inputs_threads_bridge_known_mcp_env_into_diagnostic_redactor() {
         const SECRET: &str = "bridge-known-mcp-secret";
         let mut entry = acp_entry("reader-redaction");
@@ -12656,6 +12700,7 @@ inputs = []
             auth_method: None,
             pre_authenticated: false,
             host_fallback_eligible: false,
+            rename_new_sessions: false,
             name: None,
             description: None,
             tags: vec![],

@@ -72,6 +72,27 @@ Set `pre_authenticated = true` when an ACP process already has credentials from 
 mounted auth file. This prevents the bridge from invoking an advertised interactive login method during
 startup. Do not combine it with `auth_method`, which explicitly asks the bridge to authenticate.
 
+Set `rename_new_sessions = true` on a `cmd = "codex-acp"` entry (host, `:ro` reader or `container_rw`)
+to stop the codex adapter from starting its title-generation thread. Left alone, the adapter starts a
+second codex thread after a new session's first turn, spends one model turn on it to generate a title,
+and never lets it go; that thread starts every process-backed MCP server in codex's own config, and the
+bridge has no id to close it with, so those processes live until the adapter exits. With the option on,
+the bridge sends the adapter's own slash command `/rename <name>` once to each agent session it mints,
+before the session serves a turn. The adapter answers it locally, without a model turn, and then skips
+title generation. The name is the bridge session key with every character outside `[A-Za-z0-9._:@-]`
+replaced by `_`, cut to 96 characters; the thread appears under that name in codex's own session list.
+The rename is best-effort and bounded at 5 s: one that is refused, unanswered or cut off is traced
+(`acp.session_rename_*`) and the session is served as it is. A rename still unanswered at 5 s does not
+hold the mint up further, but the session's first turn does not start alongside it, because output the
+adapter still sent for the rename could not be told apart from the turn's own: the bridge sends
+`session/cancel` and gives the adapter one cancel grace (5 s) to answer before the turn starts
+regardless. The field defaults false and is rejected for
+any other `cmd`, including a wrapper script that launches `codex-acp` under another file name, because
+another adapter would hand the text to its model as a prompt. It is tied to the adapter versions it was
+measured on; read the
+[compatibility note](compatibility.md#codex-acp-title-generation-thread-and-rename_new_sessions--2026-10-13)
+before enabling it on a different version. Model-catalog probes never rename.
+
 Set `host_fallback_eligible = true` only on an unsandboxed `kind = "acp"` entry that may be selected by
 the local `fallback-plan` command for trusted own-repo read-only verification. The field defaults false,
 does not infer trust, and does not execute or authorize an in-process fallback. API, sandboxed ACP, and
