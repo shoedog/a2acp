@@ -17,16 +17,42 @@
   `6338bc1628fed52b772026b604a1bbdd710efa8c`; the final Sol/xhigh rereview recorded 0 WRONG and 3 SMELL,
   with full verification at 4,408 passed / 0 failed / 13 ignored / 726 filtered. The candidate remains
   production-unwired; its historical handoff's pre-publication stop is superseded by the recorded PR #102 merge.
+- **Side lane: activity liveness (#47/#24).** Owner-approved 2026-10-13/14. Design rev 3 is
+  `docs/superpowers/specs/2026-10-14-activity-liveness-design.md` (PR #141). Landed:
+  - L1, unary turn metrics and the fenced-rename trace class: PR #139.
+  - I1, the per-turn silence cutoff (30 min, paused while a tool or permission is open) and `[agents.liveness]`:
+    PR #144.
+  - I2a, the workflow silence cutoff (`[[workflows]] silence_cutoff`, `run-workflow --silence-cutoff`): PR #147.
+  - I3, the stderr heartbeat, the `TaskLiveness` RPC and per-request `a2a-bridge.silence_cutoff_secs` /
+    `work_cutoff_secs` / `client_watching` metadata (strings only): PR #149 at `e3600e8a`.
+
+  **I2b (making the workflow 2 h cap opt-in for watched runs) is PARKED as open-class.** Before I2b is reviewed
+  again, every consumer of the workflow work cutoff must be enumerated. Until then, workflows keep the always-on
+  2 h cap. Rollback limit (accepted by the owner): binaries older than `fbee12ae` cannot decode the new automatic
+  run-policy rows; this is documented in the operator's SERVICE.md. Known tooling issue: #146, where concurrent
+  implement verifies share a stale target; serialize them until it is fixed.
 - **Active slice:** **ADR-0041 Slice 2B3 (inert new-root restore and hidden-state proof).** Its design is
   `docs/superpowers/specs/2026-09-27-adr0041-slice2b3-restore-design.md` (PR #123). It has four serial children:
   2B3a reader → 2B3b Git plane → 2B3c payload plane → 2B3d record and joint fixture.
+  - **2B3c (payload plane) is in progress.** Spec rev 4 merged in PR #140 at `d56b1eed`:
+    `docs/superpowers/plans/2026-10-14-adr0041-slice2b3c-payload-plane-task.md`, with ledger
+    `docs/superpowers/reviews/2026-10-14-adr0041-slice2b3c-spec-review.md`. Spec review went 6 → 2 → 1 blockers, and
+    the last one was folded as specified. The spec splits the slice into four increments, each with a two-round
+    review cap and a native macOS non-root run:
+    - C1 primitives: merged, PR #142 at `c09e54d5`.
+    - C2a admission and plan: merged, PR #143 at `c86d392a`.
+    - C2b materialization: merged, PR #148 at `0235b1d3`. Review round 1 found 2 WRONG; round 2 approved.
+    - C3 (terminal gate, final modes, the complete result): in implementation.
+
+    Running record: `docs/superpowers/reviews/2026-10-14-adr0041-slice2b3c-implementation-handoff.md`. Carried
+    into 2B3d's design: each created directory keeps a descriptor (the macOS soft `RLIMIT_NOFILE` is 256).
+    **Next after C3: the 2B3d spec (record and joint fixture).**
   - **2B3b is merged** in PR #137 at `4fcda06d` (2026-10-14): the phase-G Git plane, crate-private and
     production-unwired. It landed after the owner accepted the B2c literal correction without a third source review,
     the first native macOS run surfaced 13 test-only portability failures (no production defect), the test-only
     repair `f3d0fac1` (codex `gpt-6.1-sol`) passed `bridge-core` on macOS 1,604/0 twice, one combined Sol review of
     the whole slice returned APPROVE with no findings, and Linux CI passed. Custody bundles and gate logs:
-    `~/.a2a-dispatch/adr0041-2b3b-custody/`. **Next: 2B3c (payload plane) spec.** The 2B3b history below is kept as
-    the lane record.
+    `~/.a2a-dispatch/adr0041-2b3b-custody/`. The 2B3b history below is kept as the lane record.
   - **2B3a is merged** in PR #125 at `b7c85aee`. It is the phase-V verify-and-stage reader, and it is crate-private
     and production-unwired.
     - The Sol spec review went REJECT, then APPROVE.
