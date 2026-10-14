@@ -9,6 +9,23 @@ release (see [`docs/adr/`](docs/adr/) for the full architectural record).
 
 ### Changed
 
+- ACP turns outside a workflow are now bounded by default (#47). Served unary turns (`message/send`,
+  and so `submit`), served session turns and `implement` turns end after 30 minutes without activity
+  while no tool call is open and no permission request is pending (`acp.prompt.silence_cutoff`), and
+  after 2 hours whatever is open (`acp.prompt.work_cutoff`). Before, a served turn whose agent went
+  silent had no bound at all. Activity is any ACP `session/update`, empty thought chunks included,
+  except a usage update that repeats the previous one's totals and cost, plus the arrival or the
+  resolution of a permission request. A tool call that is `pending` or `in_progress`, or a pending
+  permission request, pauses the silence clock, so a long `cargo test` never trips it; the clock
+  restarts when the last one closes. Both endings are fatal `Timeout` failures that may follow an
+  accepted prompt and are never retried; the bridge sends `session/cancel` and, past `cancel_grace`,
+  terminates the agent process, the same path (and the same blast radius on a shared process-backed
+  agent) as the `[agents.watchdog]`. No client marks a turn as watched yet, so every such turn gets
+  the 2-hour work cutoff. Workflow node turns, preflight included, are unchanged: they carry neither
+  bound and keep the workflow's own deadlines. The legacy `[agents.watchdog]` keeps its semantics and
+  its `acp.prompt.watchdog_timeout` code and runs alongside; when bounds fall due at the same instant
+  the watchdog is reported first, then the work cutoff, then silence.
+
 - Reader and toolchain images pin codex-acp 2.2.2 with Codex 0.162.1 (was 1.13.1 / 0.157.1) and
   claude-agent-acp 0.90.0 with Agent SDK 0.3.296 / Claude Code 2.1.296 (was 0.81.2 / 0.3.280 /
   2.1.280). codex-acp 2.2.2 advertises `gpt-6.1-sol`. Host and reader fixed-`PONG` lanes passed for
@@ -16,6 +33,13 @@ release (see [`docs/adr/`](docs/adr/) for the full architectural record).
 
 ### Added
 
+- `[agents.liveness]` sets an agent's turn bounds: `silence_cutoff_secs` and `work_cutoff_secs`, whole
+  seconds up to 30 days, `0` for off, an absent field keeping the built-in 30-minute and 2-hour
+  defaults. One parser checks every liveness duration, refusing anything over 30 days. The table is
+  part of the frozen provider-effect identity only when it is set, so entries without it keep the
+  identity they already had. Automatic workflow admission accepts it (it still refuses
+  `[agents.watchdog]`), and `container_rw` agents forward it to the inner backend that serves their
+  turns.
 - `[[agents]]` entries for `codex-acp` can set `rename_new_sessions = true` (default `false`) to stop
   the adapter's title-generation thread. After a new session's first turn the adapter starts a second
   codex thread, spends one model turn on it to generate a title, and never unsubscribes it; the bridge

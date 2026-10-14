@@ -773,6 +773,7 @@ where
                     // (§6): sanitization is permanently Off here.
                     requested_mode: HarvestSanitizationMode::Off,
                     prefix_attestation_request: prefix_attestation_request.clone(),
+                    liveness: bridge_core::turn_liveness::TurnLivenessRequestV1::default(),
                 }),
                 guard: None,
                 lease: None,
@@ -5683,6 +5684,7 @@ mod tests {
             session_cwd: None,
             sandbox: None,
             watchdog: None,
+            liveness: None,
             auth_method: None,
             pre_authenticated: false,
             host_fallback_eligible: false,

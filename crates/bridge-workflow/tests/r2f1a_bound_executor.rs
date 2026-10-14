@@ -276,6 +276,7 @@ fn entry() -> AgentEntry {
         session_cwd: None,
         sandbox: None,
         watchdog: None,
+        liveness: None,
         mcp: vec![McpServerSpec {
             name: "repo-reader".into(),
             command: "reader".into(),

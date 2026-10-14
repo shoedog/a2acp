@@ -1,6 +1,7 @@
 use crate::attestation::{HarvestSanitizationMode, PrefixAttestationRequest};
 use crate::domain::PermitDecision;
 use crate::ids::{ContextId, OperationId, TurnId};
+use crate::turn_liveness::TurnLivenessRequestV1;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -23,6 +24,9 @@ pub struct TurnMeta {
     /// backend cannot honor an enabled mode; consult `requested_mode` for the
     /// operator's intent.
     pub prefix_attestation_request: PrefixAttestationRequest,
+    /// The turn's liveness request (silence and work cutoffs). The default inherits the
+    /// agent's `[agents.liveness]`, else the built-in bounds.
+    pub liveness: TurnLivenessRequestV1,
 }
 
 /// Gen+op-keyed identity of one pending permission rendezvous.

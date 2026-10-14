@@ -59,6 +59,7 @@ fn entry() -> AgentEntry {
         session_cwd: None,
         sandbox: None,
         watchdog: None,
+        liveness: None,
         mcp: vec![],
         mcp_delivery: McpDelivery::Acp,
         auth_method: None,

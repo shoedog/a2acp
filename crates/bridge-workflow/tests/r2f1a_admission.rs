@@ -90,6 +90,7 @@ fn entry() -> AgentEntry {
         session_cwd: None,
         sandbox: None,
         watchdog: None,
+        liveness: None,
         auth_method: None,
         pre_authenticated: false,
         host_fallback_eligible: false,
@@ -201,6 +202,48 @@ async fn automatic_activation_refuses_legacy_watchdog_configuration() {
         reason.contains("automatic R2f1b deadline activation is incompatible"),
         "unexpected refusal: {reason}"
     );
+}
+
+/// I1 test 12: `[agents.liveness]` is not the legacy watchdog. Automatic activation admits it
+/// and freezes it into the provider-effect identity.
+#[tokio::test]
+async fn automatic_activation_accepts_agent_liveness_configuration() {
+    use bridge_core::domain::AgentLivenessConfig;
+    use bridge_core::turn_liveness::LivenessOverrideV1;
+
+    let without = admission(entry(), "/launch")
+        .freeze(request(
+            AttemptIdentity::initial().unwrap().attempt_id,
+            graph(),
+            None,
+        ))
+        .await
+        .expect("an entry without liveness is admitted");
+    let mut configured = entry();
+    configured.liveness = Some(AgentLivenessConfig {
+        silence_cutoff: Some(LivenessOverrideV1::Ms(20 * 60_000)),
+        work_cutoff: Some(LivenessOverrideV1::Off),
+    });
+    let admitted = admission(configured, "/launch")
+        .freeze(request(
+            AttemptIdentity::initial().unwrap().attempt_id,
+            graph(),
+            None,
+        ))
+        .await
+        .expect("automatic activation must accept [agents.liveness]");
+
+    assert_eq!(
+        admitted.run_spec.controls.deadline_activation,
+        DeadlineActivationV2::AutomaticR2f1b
+    );
+    let effect = |admitted: &bridge_workflow::admission::AdmittedWorkflowRunV1| {
+        admitted.run_spec.node_execution_identities[0].provider_attempts[0]
+            .effect
+            .effect_digest
+            .clone()
+    };
+    assert_ne!(effect(&without), effect(&admitted));
 }
 
 #[tokio::test]

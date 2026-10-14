@@ -5992,6 +5992,7 @@ mod tests {
             session_cwd: None,
             sandbox: None,
             watchdog: None,
+            liveness: None,
             mcp: vec![McpServerSpec {
                 name: "repo".into(),
                 command: "/bin/repo".into(),

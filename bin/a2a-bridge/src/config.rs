@@ -1048,6 +1048,10 @@ pub struct AgentEntryToml {
     /// Optional per-agent E9 watchdog. Absent means disabled.
     #[serde(default)]
     pub watchdog: Option<WatchdogToml>,
+    /// Optional per-agent turn liveness defaults. Absent keeps the built-in silence and work
+    /// cutoffs.
+    #[serde(default)]
+    pub liveness: Option<AgentLivenessToml>,
     #[serde(default)]
     pub auth_method: Option<String>,
     /// Credentials are supplied out of band (for example by a mounted auth file),
@@ -1319,6 +1323,39 @@ pub struct SandboxToml {
 pub struct WatchdogToml {
     pub idle_timeout_secs: u64,
     pub hard_wall_clock_secs: u64,
+}
+
+/// `[agents.liveness]` TOML mirror. Whole seconds, `0` = off, at most 30 days; converted to
+/// [`bridge_core::domain::AgentLivenessConfig`] in `into_snapshot` through the shared
+/// [`bridge_core::turn_liveness::parse_liveness_secs_v1`].
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentLivenessToml {
+    #[serde(default)]
+    pub silence_cutoff_secs: Option<u64>,
+    #[serde(default)]
+    pub work_cutoff_secs: Option<u64>,
+}
+
+impl AgentLivenessToml {
+    /// `Ok(None)` when the table sets neither field, so an empty table changes nothing.
+    fn to_config(
+        &self,
+        agent: &str,
+    ) -> Result<Option<bridge_core::domain::AgentLivenessConfig>, ConfigError> {
+        let parse = |field: &str, secs: Option<u64>| {
+            secs.map(bridge_core::turn_liveness::parse_liveness_secs_v1)
+                .transpose()
+                .map_err(|error| {
+                    ConfigError::Registry(format!("agent {agent:?}: liveness {field}: {error}"))
+                })
+        };
+        let config = bridge_core::domain::AgentLivenessConfig {
+            silence_cutoff: parse("silence_cutoff_secs", self.silence_cutoff_secs)?,
+            work_cutoff: parse("work_cutoff_secs", self.work_cutoff_secs)?,
+        };
+        Ok((config != bridge_core::domain::AgentLivenessConfig::default()).then_some(config))
+    }
 }
 
 fn default_gate() -> bool {
@@ -2207,6 +2244,10 @@ impl RegistryConfig {
                     })
                 }
             };
+            let liveness = match &a.liveness {
+                None => None,
+                Some(liveness) => liveness.to_config(id.as_str())?,
+            };
             entries.push(AgentEntry {
                 id,
                 cmd: a.cmd,
@@ -2224,6 +2265,7 @@ impl RegistryConfig {
                 session_cwd: a.session_cwd,
                 sandbox,
                 watchdog,
+                liveness,
                 mcp,
                 mcp_delivery,
                 auth_method: a.auth_method,
@@ -3532,6 +3574,99 @@ addr="127.0.0.1:8080"
                 .is_err(),
             "an absurd hard_wall_clock_secs must be rejected (overflow guard)"
         );
+    }
+
+    #[test]
+    fn agent_liveness_toml_parses_through_the_shared_parser() {
+        use bridge_core::domain::AgentLivenessConfig;
+        use bridge_core::turn_liveness::LivenessOverrideV1;
+
+        let toml = r#"
+            default = "c"
+            [server]
+            addr = "127.0.0.1:8080"
+            [[agents]]
+            id = "c"
+            cmd = "codex-acp"
+            [agents.liveness]
+            silence_cutoff_secs = 1200
+            work_cutoff_secs = 0
+            [[agents]]
+            id = "plain"
+            cmd = "codex-acp"
+        "#;
+        let liveness = |toml: &str, agent: &str| {
+            RegistryConfig::parse(toml)
+                .unwrap()
+                .into_snapshot()
+                .map(|snap| {
+                    snap.entries
+                        .iter()
+                        .find(|e| e.id.as_str() == agent)
+                        .unwrap()
+                        .liveness
+                })
+        };
+        assert_eq!(
+            liveness(toml, "c").unwrap(),
+            Some(AgentLivenessConfig {
+                silence_cutoff: Some(LivenessOverrideV1::Ms(1_200_000)),
+                work_cutoff: Some(LivenessOverrideV1::Off),
+            }),
+            "0 is off, N is whole seconds"
+        );
+        assert_eq!(
+            liveness(toml, "plain").unwrap(),
+            None,
+            "agents without [agents.liveness] inherit the built-in bounds"
+        );
+
+        let one_field = toml.replace("work_cutoff_secs = 0\n", "");
+        assert_eq!(
+            liveness(&one_field, "c").unwrap(),
+            Some(AgentLivenessConfig {
+                silence_cutoff: Some(LivenessOverrideV1::Ms(1_200_000)),
+                work_cutoff: None,
+            }),
+            "an absent field inherits"
+        );
+        let empty = one_field.replace("silence_cutoff_secs = 1200\n", "");
+        assert_eq!(
+            liveness(&empty, "c").unwrap(),
+            None,
+            "an empty table changes nothing, its provider-effect digest included"
+        );
+
+        // The 30-day maximum is the watchdog's; one second more is refused.
+        let thirty_days = toml.replace(
+            "silence_cutoff_secs = 1200",
+            "silence_cutoff_secs = 2592000",
+        );
+        assert_eq!(
+            liveness(&thirty_days, "c").unwrap().unwrap().silence_cutoff,
+            Some(LivenessOverrideV1::Ms(2_592_000_000))
+        );
+        // TOML integers stop at i64::MAX; the parser's own u64::MAX case is in bridge-core.
+        for too_long in ["2592001", "9223372036854775807"] {
+            let bad = toml.replace(
+                "work_cutoff_secs = 0",
+                &format!("work_cutoff_secs = {too_long}"),
+            );
+            let Err(error) = liveness(&bad, "c") else {
+                panic!("work_cutoff_secs = {too_long} must be refused");
+            };
+            assert!(
+                error.to_string().contains("liveness work_cutoff_secs"),
+                "{error}"
+            );
+        }
+        let typo = toml.replace("work_cutoff_secs", "work_cutoff");
+        assert!(
+            RegistryConfig::parse(&typo).is_err(),
+            "an unknown [agents.liveness] key must be rejected"
+        );
+        let negative = toml.replace("silence_cutoff_secs = 1200", "silence_cutoff_secs = -1");
+        assert!(RegistryConfig::parse(&negative).is_err());
     }
 
     #[test]

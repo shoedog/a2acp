@@ -214,6 +214,9 @@ pub struct ContainerRwConfig {
     /// Name each inner agent session at mint (`AcpConfig::rename_new_sessions`); `codex-acp` only.
     pub rename_new_sessions: bool,
     pub watchdog: Option<bridge_core::domain::WatchdogConfig>,
+    /// The agent's `[agents.liveness]` (`AcpConfig::liveness`): the inner backend enforces it on
+    /// every turn.
+    pub liveness: Option<bridge_core::domain::AgentLivenessConfig>,
     pub handshake_timeout: Duration,
     pub cancel_grace: Duration,
     /// Slice-4 admission supplies this attempt-owned route. `None` is the
@@ -854,6 +857,7 @@ impl ContainerRwBackend {
             rename_new_sessions: self.cfg.rename_new_sessions,
             rename_timeout: AcpConfig::default().rename_timeout,
             watchdog: self.cfg.watchdog.clone(),
+            liveness: self.cfg.liveness,
             process_flight_route_v3: self.cfg.resource_flight_attempt_v3.as_ref().map(|attempt| {
                 let owner = ResourceFlightOwnerV1::new(
                     NodeId::parse("container-inner-process").expect("static node id"),
@@ -2312,6 +2316,7 @@ mod tests {
         last_argv: Mutex<Vec<String>>,
         last_acp_mcp: Mutex<Vec<bridge_core::mcp::McpServerSpec>>,
         last_acp_rename_new_sessions: Mutex<Option<bool>>,
+        last_acp_liveness: Mutex<Option<Option<bridge_core::domain::AgentLivenessConfig>>>,
         last_diagnostic_redactor: Mutex<Option<bridge_core::diagnostics::DiagnosticRedactor>>,
         last_inner: Mutex<Option<Arc<StubInner>>>,
         spawn_gate: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
@@ -2425,6 +2430,7 @@ mod tests {
                 last_argv: Mutex::new(vec![]),
                 last_acp_mcp: Mutex::new(vec![]),
                 last_acp_rename_new_sessions: Mutex::new(None),
+                last_acp_liveness: Mutex::new(None),
                 last_diagnostic_redactor: Mutex::new(None),
                 last_inner: Mutex::new(None),
                 spawn_gate,
@@ -2448,6 +2454,7 @@ mod tests {
             *self.last_argv.lock().await = argv.to_vec();
             *self.last_acp_mcp.lock().await = cfg.mcp.clone();
             *self.last_acp_rename_new_sessions.lock().await = Some(cfg.rename_new_sessions);
+            *self.last_acp_liveness.lock().await = Some(cfg.liveness);
             *self.last_diagnostic_redactor.lock().await = Some(cfg.diagnostic_redactor.clone());
             if let Some((entered, release)) = &self.spawn_gate {
                 entered.notify_one();
@@ -2667,6 +2674,7 @@ mod tests {
             pre_authenticated: false,
             rename_new_sessions: false,
             watchdog: None,
+            liveness: None,
             handshake_timeout: Duration::from_secs(30),
             cancel_grace: Duration::from_secs(5),
             resource_flight_attempt_v3: None,
@@ -2789,6 +2797,7 @@ mod tests {
             requested_mode: bridge_core::attestation::HarvestSanitizationMode::Off,
             prefix_attestation_request:
                 bridge_core::attestation::PrefixAttestationRequest::Disabled,
+            liveness: Default::default(),
         }
     }
     /// `prompt` returns `Result<BackendStream, _>`; BackendStream isn't `Debug`, so we can't
@@ -3020,6 +3029,7 @@ mod tests {
             session_cwd: None,
             sandbox: Some(config.sandbox.clone()),
             watchdog: config.watchdog.clone(),
+            liveness: config.liveness,
             mcp: config.mcp.clone(),
             mcp_delivery: config.mcp_delivery,
             auth_method: config.auth_method.clone(),
@@ -3295,6 +3305,60 @@ mod tests {
                 Some(rename_new_sessions)
             );
             while stream.next().await.is_some() {}
+        }
+    }
+
+    /// I1 test 18: the inner `AcpBackend` enforces the turn's liveness, so a `container_rw`
+    /// agent's `[agents.liveness]` must reach the inner `AcpConfig`. With silence off there, a
+    /// default turn silent past 31 minutes stays active; a missing forward would leave the
+    /// inner backend on the built-in 30-minute cutoff.
+    #[tokio::test]
+    async fn agent_liveness_reaches_the_inner_backend_config() {
+        use bridge_core::domain::AgentLivenessConfig;
+        use bridge_core::turn_liveness::{
+            parse_liveness_secs_v1, resolve_turn_liveness_v1, TurnLivenessCauseV1,
+            TurnLivenessRequestV1, TurnLivenessTracker,
+        };
+        let silent_past_cutoff_ms = 31 * 60_000;
+        let silence_after_31_minutes = |inner: Option<AgentLivenessConfig>| {
+            TurnLivenessTracker::new(resolve_turn_liveness_v1(
+                &TurnLivenessRequestV1::default(),
+                inner.as_ref(),
+            ))
+            .due_cause(silent_past_cutoff_ms, false)
+        };
+
+        for (liveness, expected) in [
+            (
+                Some(AgentLivenessConfig {
+                    silence_cutoff: Some(parse_liveness_secs_v1(0).unwrap()),
+                    work_cutoff: None,
+                }),
+                None,
+            ),
+            (None, Some(TurnLivenessCauseV1::Silence)),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let root = tmp.path().to_str().unwrap();
+            let mut cfg = cfg_with_mount(root);
+            cfg.liveness = liveness;
+            let spawn = CountingSpawn::new(false);
+            let (reap, _) = counting_reap();
+            let be = ContainerRwBackend::new_with_hooks(cfg, spawn.clone(), "inst".into(), reap)
+                .await
+                .unwrap();
+            let s = SessionId::parse("s1").unwrap();
+            be.configure_session(&s, &spec_cwd(root)).await.unwrap();
+            let mut stream = be.prompt(&s, vec![]).await.unwrap();
+            while stream.next().await.is_some() {}
+
+            let inner = spawn
+                .last_acp_liveness
+                .lock()
+                .await
+                .expect("the turn spawned an inner backend");
+            assert_eq!(inner, liveness);
+            assert_eq!(silence_after_31_minutes(inner), expected);
         }
     }
 

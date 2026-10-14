@@ -85,6 +85,14 @@ pub struct WatchdogConfig {
     pub hard_wall_clock: std::time::Duration,
 }
 
+/// `[agents.liveness]`: this agent's per-turn liveness defaults. A `None` field inherits the
+/// built-in default (see [`crate::turn_liveness::resolve_turn_liveness_v1`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AgentLivenessConfig {
+    pub silence_cutoff: Option<crate::turn_liveness::LivenessOverrideV1>,
+    pub work_cutoff: Option<crate::turn_liveness::LivenessOverrideV1>,
+}
+
 /// The container runtime used when none is configured. The SINGLE source of this literal — the sandbox
 /// runtime resolver, the default-`allowed_cmds` union, and the `[verify]` runtime gate all read it, so the
 /// "validate vs spawn" pair can never drift on the default.
@@ -149,6 +157,9 @@ pub struct AgentEntry {
     pub sandbox: Option<SandboxConfig>,
     /// Optional per-agent E9 watchdog. `None` preserves the pre-watchdog turn behavior.
     pub watchdog: Option<WatchdogConfig>,
+    /// Optional `[agents.liveness]` defaults for this agent's turns. `None` uses the built-in
+    /// silence and work cutoffs.
+    pub liveness: Option<AgentLivenessConfig>,
     /// MCP servers to offer this agent (ADR-0028). Empty = none. Delivered via [`Self::mcp_delivery`].
     pub mcp: Vec<crate::mcp::McpServerSpec>,
     /// Which channel delivers `mcp` to this agent (resolved at config build from `cmd`). Irrelevant
@@ -438,6 +449,7 @@ mod tests {
             session_cwd: None,
             sandbox: None,
             watchdog: None,
+            liveness: None,
             auth_method: None,
             pre_authenticated: false,
             host_fallback_eligible: false,
@@ -474,6 +486,7 @@ mod tests {
             session_cwd: None,
             sandbox: None,
             watchdog: None,
+            liveness: None,
             auth_method: None,
             pre_authenticated: false,
             host_fallback_eligible: false,
@@ -508,6 +521,7 @@ mod tests {
             session_cwd: None,
             sandbox: None,
             watchdog: None,
+            liveness: None,
             auth_method: None,
             pre_authenticated: false,
             host_fallback_eligible: false,

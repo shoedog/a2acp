@@ -46,6 +46,7 @@ use bridge_core::ports::{
 };
 use bridge_core::resource_flight::BoundedRecoveryReasonV1;
 use bridge_core::retained_resource_flight::CleanupDeadlineTransferV1;
+use bridge_core::turn_liveness::{TurnLivenessRequestV1, TurnLivenessValueV1};
 use bridge_core::SessionCwd;
 use futures::stream::FuturesUnordered;
 use futures::{FutureExt, StreamExt};
@@ -1940,6 +1941,18 @@ pub enum WorkflowEvent {
 pub type WorkflowStream =
     std::pin::Pin<Box<dyn futures::Stream<Item = Result<WorkflowEvent, BridgeError>> + Send>>;
 
+/// The liveness request every workflow turn stages (preflight, warm and cold). Until the frozen
+/// workflow silence control is mapped here, a workflow turn carries neither a silence cutoff nor
+/// a turn work cutoff: the workflow's own deadlines stay its only bounds, as before the turn
+/// engine existed.
+fn workflow_turn_liveness_v1() -> TurnLivenessRequestV1 {
+    TurnLivenessRequestV1 {
+        silence: TurnLivenessValueV1::Off,
+        work_cutoff: TurnLivenessValueV1::Off,
+        ..TurnLivenessRequestV1::default()
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn node_turn_context(
     wf_id: &str,
@@ -2496,6 +2509,7 @@ impl WorkflowExecutor {
                         requested_mode: HarvestSanitizationMode::Off,
                         prefix_attestation_request:
                             bridge_core::attestation::PrefixAttestationRequest::Disabled,
+                        liveness: workflow_turn_liveness_v1(),
                     },
                 )
                 .await;
@@ -3090,6 +3104,7 @@ impl WorkflowExecutor {
                             turn_id: obs_ctx.turn_id.clone(),
                             requested_mode: node_harvest_mode,
                             prefix_attestation_request: prefix_attestation_request.clone(),
+                            liveness: workflow_turn_liveness_v1(),
                         },
                     )
                     .await;
@@ -4003,6 +4018,7 @@ impl WorkflowExecutor {
                                 turn_id: obs_ctx_ref.turn_id.clone(),
                                 requested_mode: node_harvest_mode,
                                 prefix_attestation_request: prefix_attestation_request.clone(),
+                                liveness: workflow_turn_liveness_v1(),
                             },
                         )
                         .await;
@@ -6663,6 +6679,7 @@ mod tests {
             session_cwd: None,
             sandbox: None,
             watchdog: None,
+            liveness: None,
             auth_method: None,
             pre_authenticated: false,
             host_fallback_eligible: false,
@@ -9256,6 +9273,159 @@ mod tests {
         entry.preflight = true;
         entry.fallback_models = fallbacks.iter().map(|model| model.to_string()).collect();
         entry
+    }
+
+    /// Records the liveness request of every turn it is configured for.
+    #[derive(Default)]
+    struct LivenessRecordingBackend {
+        turns: Mutex<Vec<bridge_core::turn_liveness::TurnLivenessRequestV1>>,
+    }
+
+    #[async_trait::async_trait]
+    impl AgentBackend for LivenessRecordingBackend {
+        async fn prompt(
+            &self,
+            _session: &SessionId,
+            _parts: Vec<Part>,
+        ) -> Result<BackendStream, BridgeError> {
+            Ok(Box::pin(tokio_stream::iter(text_done("PONG"))))
+        }
+
+        async fn cancel(&self, _session: &SessionId) -> Result<(), BridgeError> {
+            Ok(())
+        }
+
+        async fn configure_turn(&self, _session: &SessionId, meta: TurnMeta) {
+            self.turns.lock().unwrap().push(meta.liveness);
+        }
+    }
+
+    struct LivenessPreflightRegistry {
+        entry: AgentEntry,
+        backend: Arc<dyn AgentBackend>,
+    }
+
+    #[async_trait::async_trait]
+    impl AgentRegistry for LivenessPreflightRegistry {
+        async fn resolve(&self, _id: &AgentId) -> Result<Resolved, BridgeError> {
+            Ok(Resolved {
+                entry: Arc::new(self.entry.clone()),
+                backend: self.backend.clone(),
+                lease: Box::new(NoopLease),
+            })
+        }
+
+        fn default_id(&self) -> AgentId {
+            self.entry.id.clone()
+        }
+
+        async fn apply(&self, _: RegistrySnapshot) -> Result<(), BridgeError> {
+            Ok(())
+        }
+
+        fn entry_snapshot(&self, _id: &AgentId) -> Option<Arc<AgentEntry>> {
+            Some(Arc::new(self.entry.clone()))
+        }
+
+        fn list(&self) -> Vec<AgentId> {
+            vec![self.entry.id.clone()]
+        }
+    }
+
+    struct LivenessWarmDispatcher {
+        backend: Arc<dyn AgentBackend>,
+    }
+
+    #[async_trait::async_trait]
+    impl WorkflowNodeDispatcher for LivenessWarmDispatcher {
+        async fn checkout(
+            &self,
+            _wf_id: &str,
+            _node: &WorkflowNode,
+            _run_id: &str,
+            _ctx: &WorkflowRunContext,
+        ) -> Result<NodeTurn, BridgeError> {
+            Ok(NodeTurn {
+                backend: self.backend.clone(),
+                session: SessionId::parse("workflow-liveness-warm").unwrap(),
+                seed: None,
+                cleanup: Box::new(CompositePathCleanup),
+            })
+        }
+    }
+
+    /// I1 test 19 (workflow half): until I2 maps the frozen workflow controls, every workflow
+    /// turn (preflight, warm and cold) requests silence and work cutoff off, so a manual
+    /// workflow node silent past 31 minutes, or past two hours, is not cut by the turn engine.
+    /// The backend half (`a_turn_requesting_silence_and_work_off_runs_unbounded`) runs such a
+    /// turn through `AcpBackend`.
+    #[tokio::test]
+    async fn every_workflow_turn_site_requests_silence_and_work_cutoff_off() {
+        use bridge_core::turn_liveness::{
+            resolve_turn_liveness_v1, TurnLivenessRequestV1, TurnLivenessTracker,
+            TurnLivenessValueV1,
+        };
+        let interim = TurnLivenessRequestV1 {
+            silence: TurnLivenessValueV1::Off,
+            work_cutoff: TurnLivenessValueV1::Off,
+            client_watching: false,
+            observer_key: None,
+        };
+        let entry = preflight_entry("good", &[]);
+
+        let cold = Arc::new(LivenessRecordingBackend::default());
+        let events = WorkflowExecutor::new(Arc::new(LivenessPreflightRegistry {
+            entry: entry.clone(),
+            backend: cold.clone(),
+        }))
+        .run(
+            one_node_graph(),
+            "DIFF".into(),
+            "liveness-cold".into(),
+            CancellationToken::new(),
+        )
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .map(|event| event.expect("workflow event"))
+        .collect::<Vec<_>>();
+        assert!(*node_finished(&events).0, "the cold node completes");
+
+        let warm = Arc::new(LivenessRecordingBackend::default());
+        let events = WorkflowExecutor::new(Arc::new(LivenessPreflightRegistry {
+            entry: entry.clone(),
+            backend: warm.clone(),
+        }))
+        .run_with_context_and_dispatcher(
+            one_node_graph(),
+            "DIFF".into(),
+            "liveness-warm".into(),
+            CancellationToken::new(),
+            WorkflowRunContext::default(),
+            Arc::new(LivenessWarmDispatcher {
+                backend: warm.clone(),
+            }),
+        )
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .map(|event| event.expect("workflow event"))
+        .collect::<Vec<_>>();
+        assert!(*node_finished(&events).0, "the warm node completes");
+
+        // One preflight turn and one node turn on each path.
+        for turns in [&cold.turns, &warm.turns] {
+            let turns = turns.lock().unwrap().clone();
+            assert_eq!(turns, vec![interim.clone(), interim.clone()]);
+            for request in turns {
+                let tracker = TurnLivenessTracker::new(resolve_turn_liveness_v1(
+                    &request,
+                    entry.liveness.as_ref(),
+                ));
+                assert_eq!(tracker.due_cause(31 * 60_000, false), None);
+                assert_eq!(tracker.due_cause(3 * 60 * 60_000, false), None);
+            }
+        }
     }
 
     async fn exercise_preflight_fault(
@@ -15664,6 +15834,7 @@ mod observability_tests {
                     session_cwd: None,
                     sandbox: None,
                     watchdog: None,
+                    liveness: None,
                     auth_method: None,
                     pre_authenticated: false,
                     host_fallback_eligible: false,
@@ -16100,6 +16271,7 @@ mod observability_tests {
                     session_cwd: None,
                     sandbox: None,
                     watchdog: None,
+                    liveness: None,
                     auth_method: None,
                     pre_authenticated: false,
                     host_fallback_eligible: false,
@@ -16206,6 +16378,7 @@ mod observability_tests {
                     session_cwd: None,
                     sandbox: None,
                     watchdog: None,
+                    liveness: None,
                     auth_method: None,
                     pre_authenticated: false,
                     host_fallback_eligible: false,
@@ -16329,6 +16502,7 @@ mod observability_tests {
                     session_cwd: None,
                     sandbox: None,
                     watchdog: None,
+                    liveness: None,
                     auth_method: None,
                     pre_authenticated: false,
                     host_fallback_eligible: false,

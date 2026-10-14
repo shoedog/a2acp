@@ -1257,6 +1257,7 @@ impl Coordinator {
                     // sanitization is permanently Off here.
                     requested_mode: HarvestSanitizationMode::Off,
                     prefix_attestation_request: prefix_attestation_request.clone(),
+                    liveness: bridge_core::turn_liveness::TurnLivenessRequestV1::default(),
                 },
             )
             .await;
@@ -3745,6 +3746,7 @@ mod tests {
             session_cwd: None,
             sandbox: None,
             watchdog: None,
+            liveness: None,
             mcp: Vec::new(),
             mcp_delivery: Default::default(),
             auth_method: None,
@@ -5018,6 +5020,7 @@ mod tests {
                         session_cwd: None,
                         sandbox: None,
                         watchdog: None,
+                        liveness: None,
                         mcp: vec![],
                         mcp_delivery: Default::default(),
                         auth_method: None,
