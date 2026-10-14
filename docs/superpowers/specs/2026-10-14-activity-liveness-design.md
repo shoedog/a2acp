@@ -1,6 +1,7 @@
 # Activity liveness: silence cutoff, opt-in hard cap, client heartbeat (design)
 
-**Status:** draft for Sol/xhigh spec review (cap two rounds). Issues #47 and #24.
+**Status:** revision 2. Sol/xhigh round 1/2 REJECTED five WRONG and five SMELL; all folded here (ledger:
+`../reviews/2026-10-14-activity-liveness-spec-review.md`). Cap two rounds. Issues #47 and #24.
 **Base:** `origin/main` `5e3fec9367300bc12c37840f9d4ccaeebad2b04f`.
 **Owner decisions:** 2026-10-13 (items 1-4 below) and 2026-10-14 (the hard-cap default and the rollback
 limit). The two small sibling fixes (unary turn metrics, fenced-rename trace class) are a separate task and
@@ -27,7 +28,12 @@ waiting CLI client sees nothing until the turn ends.
    the client (item 4).
 3. **The 2-hour hard cap becomes an opt-in backstop for watched runs and stays on by default for unwatched
    runs** (owner, 2026-10-14). "Watched" means an interactive CLI client is waiting and printing the
-   heartbeat of item 4. Any run can explicitly turn the cap on or off.
+   heartbeat of item 4. Any run can explicitly turn the cap on or off. **Controller refinement (round 1):** a
+   run counts as watched only when its lifetime is bound to that client, so the client leaving ends the run:
+   local `run-workflow` (in-process) and served unary `message/send` whose dropped request cancels the turn
+   (§4.5). Served or detached workflows (`run-workflow --serve`, detached `submit`, batch, boot-resumed runs)
+   outlive their client, so they are always unwatched for the default; their client may still opt out
+   explicitly. This avoids a watcher-lease mechanism.
 4. **The client sees activity and decides:** `submit` and `run-workflow` (local and `--serve`) print a
    periodic stderr heartbeat. Served clients also have `task watch` and `task cancel`.
 5. **Rollback limit accepted** (owner, 2026-10-14): binaries older than this change cannot decode the run-policy
@@ -72,8 +78,9 @@ carried on `TurnMeta` (`crates/bridge-core/src/permission.rs` :11).
 (`acp_backend.rs` :4341-4344):
 - every variant counts, including `AgentThoughtChunk` with empty or non-text content (classify by variant,
   not by `thought_delta_len`) and unmodeled, terminal-evidence and prefix-control frames;
-- **except** a `UsageUpdate` whose totals tuple `(used, size, cost.amount.to_bits(), cost.currency)` equals
-  the previous usage update's tuple in the same turn. The first usage update counts. Compare with the previous
+- **except** a `UsageUpdate` whose totals key `(used, size, Option<(cost.amount.to_bits(), cost.currency)>)`
+  (cost is optional in the ACP mapping, `acp_backend.rs` :6902) equals the previous usage update's key in the
+  same turn: repeated `None` cost is unchanged; `None`→`Some` and a currency-only change are changes. The first usage update counts. Compare with the previous
   update, not a high-water mark, so a drop after compaction counts. `TurnProgress.usage` is unchanged. Final
   usage arrives with the prompt response, which ends the turn.
 - a permission request's arrival and its resolution both count.
@@ -88,7 +95,7 @@ carried on `TurnMeta` (`crates/bridge-core/src/permission.rs` :11).
   a trace event `acp.liveness_tool_set_overflow`. Overflow counts as paused (fails open: never a false kill).
 - `TurnProgress.tool_states` stays as it is.
 
-**Pending permissions:** a counter incremented on arrival (`acp_backend.rs` :4499) and decremented by an RAII
+**Pending permissions:** a counter (not a flag: two may be pending at once) incremented on arrival (`acp_backend.rs` :4499) and decremented by an RAII
 guard moved into the permission task around `resolve_permission_outcome`, so it runs on every path
 including drop.
 
@@ -118,8 +125,17 @@ client_watching: bool, observer_key: Option<String> }`, default `Inherit, Inheri
 - **Turn work cutoff:** request > agent `[agents.liveness] work_cutoff_secs` (0 = off) > the watched default:
   off when `client_watching`, 2 h (`DEFAULT_WORK_CUTOFF_MS`) when not.
 - **Workflow nodes** carry `work_cutoff: Off` on the turn: the workflow-wide cutoff (§4.4) is their backstop.
-  Their silence value comes from the frozen workflow controls (§4.4).
-- Both config values are validated ≤ 30 days (reuse the watchdog cap at `config.rs` :2196).
+  Their silence value comes from the frozen workflow controls (§4.4). **Until I2 lands, I1 writes
+  `silence: Off` and `work_cutoff: Off` at all three workflow turn sites**, so I1 alone changes no workflow
+  behaviour; I2 then maps the frozen controls.
+- Every duration from any source (agent config, request metadata, workflow config, invocation/CLI) goes
+  through ONE checked parser: whole seconds, ≤ 30 days (the watchdog cap at `config.rs` :2196), checked
+  seconds→milliseconds conversion; anything else is a typed refusal (`InvalidRequest` for requests, config
+  error for config). Tests: 30 days, 30 days + 1 s, and `u64::MAX`.
+- `container_rw` agents: the inner `AcpConfig` is built in `crates/bridge-container/src/lib.rs` (~:847), not at
+  `main.rs` :1163, which builds `ContainerRwConfig`. Add the resolved agent liveness config and the shared
+  board to `ContainerRwConfig` (~:201), populate them in `container_rw_cfg_from_entry`, and forward both to
+  the inner `AcpConfig`.
 - Per request (served): metadata `a2a-bridge.silence_cutoff_secs`, `a2a-bridge.work_cutoff_secs`
   (`"off"`, `"0"` or N) and `a2a-bridge.client_watching` (`"true"`), parsed in
   `crates/bridge-coordinator/src/params.rs` :265 into a separate field, **not** `AgentOverride` (which feeds
@@ -146,31 +162,43 @@ do not move (precedent: `graph.rs` :543). The executor maps `None` → Off, `Age
   re-encode byte-identically.
 - Manual activation leaves it `None` (bytes unchanged).
 - Automatic: `Armed` at 2 h unless the invocation is watched; watched → `Unarmed`, unless the run opted in.
-- Knobs: `[[workflows]] work_cutoff_ms` (add explicitly: `WorkflowToml` is `deny_unknown_fields`),
-  `ExecutionPolicyInvocationV1.work_cutoff_ms` and `.client_watching`, `run-workflow --work-cutoff <secs|off>`
-  (replacing `::default()` at `main.rs` :4624). Precedence: invocation > workflow > watched default.
-- A present `max_qualification` keeps its meaning and counts as opt-in at its value; setting both it and
-  `work_cutoff_ms` is a new `ExecutionPolicyError::ConflictingWorkCutoff`.
+  Only the local in-process `run-workflow` path may set the invocation's `client_watching`; the served and
+  detached paths never set it (§2 item 3 refinement).
+- Explicit overrides are tri-state everywhere: absent = inherit, `Off`, or a duration. Define
+  `LivenessOverrideV1 { Off, Ms(u64) }` and carry `Option<LivenessOverrideV1>` for **both** silence and work
+  cutoff in `[[workflows]]` TOML (`silence_cutoff = "off" | <secs>`, `work_cutoff = "off" | <secs>`; add the
+  fields explicitly: `WorkflowToml` is `deny_unknown_fields`), in `ExecutionPolicyInvocationV1`, and in
+  `run-workflow --silence-cutoff <secs|off>` / `--work-cutoff <secs|off>` (replacing `::default()` at
+  `main.rs` :4624). `off` never collapses into absence. Precedence: invocation > workflow > default (silence:
+  `AgentDefault`; work cutoff: the watched default). The resolved values are frozen into the controls
+  (`SilenceCutoffV1::None` for silence off, `Activity` for a duration; `Unarmed` / `Armed` for work cutoff).
+- A present `max_qualification` keeps its meaning and counts as opt-in at its value; setting both it and an
+  explicit work-cutoff override is a new `ExecutionPolicyError::ConflictingWorkCutoff`.
 - Accessors `armed_work_cutoff_ms() -> Option<u64>` and `armed_terminal_bound_ms()`; keep
   `effective_work_cutoff_ms()` nominal, because the retry budget (`run_spec.rs` :445), fixed grace ≤ cutoff
   (:1635) and `effective_terminal_bound_ms` depend on it.
-- Executor: the one behaviour change is `scheduler_work_cutoff_ms = armed_work_cutoff_ms().unwrap_or(u64::MAX)`
-  (`executor.rs` :5560). Confirm in tests that the cleanup deadline after cancellation, fixed grace and tie
-  facts saturate safely with `u64::MAX`.
+- Executor: carry the armed cutoff as `Option<u64>` through the scheduler (`executor.rs` ~:5560). When it is
+  `None`, the absolute-cutoff future, its arbitration fact and its tie timestamp do not exist (the branch at
+  ~:650/~:714 is never polled). **Never substitute `u64::MAX`**: `sleep(Duration::from_millis(u64::MAX))`
+  overflows `Instant` arithmetic and can panic. The nominal cutoff stays available separately for the
+  retry-budget and fixed-grace validators.
 - No `EXECUTION_POLICY_SCHEMA_V1` bump (a bump would make `run_spec.rs` :433/:439 refuse every persisted run;
   the additions are decode-compatible on new binaries). Old binaries cannot decode new automatic rows: the
   accepted rollback limit (§2 item 5).
 
 ### 4.5 Heartbeat
 
-A `TurnLivenessBoard` (`Arc`) is injected through a new `AcpConfig.liveness_board` (set at `main.rs`
-:820/:1163). The backend registers its tracker under `TurnMeta.liveness.observer_key` at turn start and
-removes it at turn end. `snapshot(key)` returns one entry per in-flight turn: agent, elapsed, last-activity
+A `TurnLivenessBoard` (`Arc`) is injected through a new `AcpConfig.liveness_board` (set at `main.rs` :820,
+and through `ContainerRwConfig` for `container_rw` agents, §4.3). The backend registers its tracker under
+`(observer_key, turn_id)` at turn start with an RAII registration that removes exactly that entry on every
+exit, including cancel and drop; several turns (workflow fan-out) can share one observer key. `snapshot(key)` returns one entry per in-flight turn: agent, elapsed, last-activity
 age, open tools (title, kind, age), permission pending, paused, silence cutoff, work cutoff.
 
-- Local `run-workflow`: `observer_key = execution_id`; the CLI reads the board in-process.
-- Served: the server sets `observer_key = routed.task` for unary turns; the executor uses the execution id
-  for served workflows. A new bridge-private read-only RPC `TaskLiveness {taskId}` beside `AttemptStatus`
+- Workflows: add a non-persisted `observer_key: Option<String>` to `WorkflowRunContext` (`executor.rs` ~:88).
+  Local `run-workflow` sets it to the execution id (distinct from the attempt id that `run_id`/`task_id`
+  carry, `main.rs` :4334/:4465); served workflows set it to the served task/execution id. The executor copies it
+  into all three workflow `TurnMeta` constructions. The local CLI reads the board in-process.
+- Served unary: the server sets `observer_key = routed.task`. A new bridge-private read-only RPC `TaskLiveness {taskId}` beside `AttemptStatus`
   (`server.rs` :1607), behind the same `authorize_headers`, returns `{turns: [...]}` or `TaskNotFound`.
 - `submit` keeps unary `SEND_MESSAGE` (no output-contract change) and races it against an interval task
   polling `TaskLiveness(execution_id)` (the task id is `execution_id`, `main.rs` :6194). "Method not found"
@@ -181,9 +209,13 @@ age, open tools (title, kind, age), permission pending, paused, silence cutoff, 
   or `[heartbeat] elapsed=14m00s liveness=unavailable`.
 - Control: `--heartbeat-secs N` (0 = off), `--no-heartbeat`, env `A2A_BRIDGE_HEARTBEAT_SECS`; a flag beats
   the env. On by default.
-- **Watched = heartbeat on.** When the CLI's heartbeat is on, it sends `client_watching=true` (metadata for
-  served, invocation field for local). `--no-heartbeat` or 0 makes the run unwatched, so a script that turns
-  the heartbeat off keeps the 2 h backstop.
+- **Watched = heartbeat on, and only where the run dies with its client** (§2 item 3). Local `run-workflow`
+  with the heartbeat on sets the invocation's `client_watching`. `submit` with the heartbeat on sends
+  `a2a-bridge.client_watching=true` for a unary `message/send`; the server honours it only on that unary path,
+  and only because dropping the unary request future cancels the ACP prompt: I3 must prove that with a test
+  (the stub agent observes `session/cancel` after the client disconnects), and if it does not hold today I3
+  adds the cancellation; honouring the flag without it is not allowed. The served workflow and detached paths
+  ignore the flag. `--no-heartbeat` or 0 makes the run unwatched, so a script keeps the 2 h backstop.
 
 ## 5. Increments
 
@@ -194,7 +226,9 @@ crates; the full workspace suite is CI's job and the merge gate.
 **I1 — turn liveness engine and agent config.** Files: new `crates/bridge-core/src/turn_liveness.rs`;
 `permission.rs` (TurnMeta field); `domain.rs` (`AgentLivenessConfig`, `AgentEntry.liveness`);
 `execution_policy.rs` (`freeze_effect` trailing encoding only); `acp_backend.rs`; `bin/a2a-bridge/src/config.rs`
-(`[agents.liveness]`); `main.rs` (AcpConfig forwarding); mechanical literal updates. Tests (each fails on
+(`[agents.liveness]`, the shared duration parser); `main.rs` (AcpConfig forwarding);
+`crates/bridge-container/src/lib.rs` (ContainerRwConfig liveness/board forwarding); `executor.rs` (only the
+interim `Off`/`Off` at the three workflow turn sites); mechanical literal updates. Tests (each fails on
 pre-change code; compile failure counts as structural only, so also show behavioural RED):
 1. default config, agent silent 31 min → `acp.prompt.silence_cutoff`;
 2. tool call `in_progress`, 40 min silence, then `completed` and end → completes;
@@ -207,26 +241,43 @@ pre-change code; compile failure counts as structural only, so also show behavio
     2 h; `client_watching` default runs past 2 h;
 11. legacy watchdog tests still return `acp.prompt.watchdog_timeout`;
 12. automatic workflow admission accepts `[agents.liveness]`;
-13. the provider-effect digest is unchanged without liveness config and changes with it.
+13. the provider-effect digest is unchanged without liveness config and changes with it;
+14. two raw tool ids whose capped forms collide are tracked separately (closing one keeps the other open);
+15. two pending permissions: resolving one keeps the clock paused, resolving both resumes it;
+16. a tool closes and the turn stays open: 31 min of silence after the close trips (the unpause notify works);
+17. usage keys: repeated `None` cost is unchanged, `None`→`Some` and a currency-only change count;
+18. a `container_rw` agent with silence off stays active past 31 min (its inner config received the value);
+19. a manual workflow turn stays active past 31 min (I1's interim `Off`);
+20. the shared parser: 30 days ok, 30 days + 1 s and `u64::MAX` refused.
 
 **I2 — workflow policy.** Files: `execution_policy.rs`; `executor.rs`; `config.rs` (WorkflowToml knobs);
-`main.rs` (`run-workflow --work-cutoff/--silence-cutoff`, `client_watching` into the invocation); affected
-tests and fixtures (`executor.rs` :15362 must opt in). Tests: default automatic + watched →
-`armed_work_cutoff_ms() == None` and `AgentDefault`; unwatched → armed at 2 h; an executor run that is watched
-passes 2 h + 1 ms with no cancel; an opt-in cutoff fires at its value; a legacy persisted automatic controls
+`main.rs` (`run-workflow --work-cutoff/--silence-cutoff`, `client_watching` into the local invocation);
+affected tests and fixtures (`executor.rs` :15362 must opt in). Stage the data carriers first so RED is
+behavioural, not an unknown-option or compile failure. Tests: default automatic + watched →
+`armed_work_cutoff_ms() == None` and `AgentDefault`; unwatched → armed at 2 h; a watched automatic workflow
+with a pending node survives its first scheduler poll (no `u64::MAX` panic), emits normal warnings, passes
+2 h + 1 ms under paused time and never observes `AbsoluteCutoff`; the served/detached path never yields
+`Unarmed` by default; tri-state overrides: unwatched explicit work-off, watched explicit duration,
+workflow-off overridden by an invocation duration, silence-off; an opt-in cutoff fires at its value; a legacy persisted automatic controls
 literal (no arming field) decodes, behaves armed at 2 h, and re-encodes byte-identically; a node silent
 31 min ends `TimedOut` with cause `acp.prompt.silence_cutoff` and no retry even with `node.retry`; workflow
-silence off never trips; `work_cutoff_ms` + `max_qualification` → `ConflictingWorkCutoff`; the three manual
-goldens pass unchanged.
+silence off never trips; an explicit work cutoff + `max_qualification` → `ConflictingWorkCutoff`; the three
+manual goldens pass unchanged.
 
 **I3 — client heartbeat and per-request knobs.** Files: `main.rs` (heartbeat task and formatter, `submit`
 flags, the local `run_workflow_cmd` loop, `run_workflow_serve_client`); `server.rs` (`TaskLiveness` RPC,
-board ownership, `observer_key` on TurnMeta at :767/:2680/:3865); `params.rs` (metadata parse). Tests: the
+board ownership, `observer_key` on TurnMeta at :767/:2680/:3865, the watched-unary cancellation proof);
+`params.rs` (metadata parse); `executor.rs` (`WorkflowRunContext.observer_key` into the three `TurnMeta`
+sites); `crates/bridge-container/src/lib.rs` if the board path needs it. Tests: the
 pure formatter (tool open, idle, unavailable); flag/env precedence and `--no-heartbeat` silence; a paused-time
 loop writes 2 lines for a 150 s wait into a captured writer and nothing to stdout; `TaskLiveness` returns an
 open tool for an in-flight stub turn, `TaskNotFound` when idle, and requires auth; an older server ("method
 not found") falls back to elapsed-only; metadata `"off"` → Off and `"abc"` → `InvalidRequest`;
-heartbeat on sends `client_watching=true`, off does not.
+heartbeat on sends `client_watching=true`, off does not; a local workflow with distinct execution and attempt
+ids registers under the execution id (the attempt-id snapshot is empty) and the CLI prints detailed lines; the
+board keeps two fan-out turns under one key, removes exactly the finished one, cleans up on cancel, and is
+empty after both; a watched unary turn is cancelled (stub observes `session/cancel`) when the client
+disconnects; `client_watching` on a served workflow request is ignored (cap armed).
 
 Docs with the increments: `CHANGELOG.md`, `docs/onboarding.md` or AGENTS.md wording for the new knobs, and the
 operator SERVICE.md rollback note (operator-side, by the controller).
@@ -234,7 +285,8 @@ operator SERVICE.md rollback note (operator-side, by the controller).
 ## 6. Accepted risks
 
 - A hung tool in a watched run runs until the client cancels (owner decision).
-- Detached/batch/served runs with no watching client keep the 2 h backstop, so a hung tool there still ends.
+- Detached/batch/served-workflow runs keep the 2 h backstop by default (they outlive their client), so a hung
+  tool there still ends unless the caller explicitly opted out.
 - New automatic run-policy rows are unreadable to older binaries (rollback limit, owner decision).
 - Every new automatic run's controls fingerprint changes (re-partitions automatic history/calibration);
   manual fingerprints do not move.
