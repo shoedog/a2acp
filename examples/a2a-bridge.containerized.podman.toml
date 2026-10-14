@@ -268,6 +268,7 @@ access  = "rw"
 egress  = "locked"
 network = "a2a-egress-internal"
 proxy   = "http://a2a-egress-proxy:8888"
+no_proxy = "localhost,127.0.0.1,::1"   # loopback stays off the proxy: the agent runs the tests
 volumes = ["/Users/wesleyjinks/.config/a2a-creds/codex/auth.json:/root/.codex/auth.json"]
 # lsp (L3 Slice B): in-container type-resolved nav for the implementor's edits. The Linux lsp-mcp + RA are
 # baked into a2a-toolchain (Tasks 2-3); CARGO_HOME=/cargo is the READ-ONLY warmed dep cache (Task 1), offline

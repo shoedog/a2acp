@@ -76,6 +76,7 @@ access  = "rw"
 egress  = "locked"
 network = "a2a-egress-internal"
 proxy   = "http://a2a-egress-proxy:8888"
+no_proxy = "localhost,127.0.0.1,::1"   # loopback stays off the proxy: the agent runs the tests
 
 [server]
 addr = "127.0.0.1:8080"
