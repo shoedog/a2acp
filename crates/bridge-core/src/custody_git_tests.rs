@@ -2298,6 +2298,9 @@ fn a14_ast_inventory_keeps_new_unsafe_boundaries_exact() {
         // `custody_walk::tests::unsafe_inventory_pins_the_new_2b2b2a_sites_and_their_files`.
         ("list_child_names".into(), 4),
         ("read_child_symlink".into(), 1),
+        // ADR-0041 2B3c C1: the symlink primitive's one `symlinkat` site, pinned by
+        // `fs_custody::payload_primitive_tests::unsafe_inventory_pins_the_2b3c_symlink_site`.
+        ("create_new_symlink_child".into(), 1),
     ]);
     for (function, count) in &owned {
         assert_eq!(fs_inventory.remove(function), Some(*count), "{function}");
