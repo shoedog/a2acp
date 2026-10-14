@@ -4637,6 +4637,14 @@ impl AgentBackend for WorktreeBackend {
         self.inner.configure_turn(session, meta).await;
     }
 
+    async fn configure_turn_liveness(
+        &self,
+        session: &SessionId,
+        liveness: bridge_core::turn_liveness::TurnLivenessRequestV1,
+    ) {
+        self.inner.configure_turn_liveness(session, liveness).await;
+    }
+
     async fn configure_bound_session(
         &self,
         session: &SessionId,
@@ -5379,6 +5387,9 @@ mod tests {
         /// inner backend receives. This is the §5.1 step 6 witness taken from the far side of the
         /// barrier: what the record said at the moment the signal actually landed.
         record_state_at_signal: Mutex<Vec<(String, Option<String>)>>,
+        /// Every `configure_turn_liveness` the inner backend receives.
+        configured_liveness:
+            Mutex<Vec<(SessionId, bridge_core::turn_liveness::TurnLivenessRequestV1)>>,
     }
 
     /// Read the custody record's state tag beside `worktree_path`, if there is a readable one.
@@ -5574,6 +5585,18 @@ mod tests {
                 .unwrap()
                 .push(spec.session.cwd.as_ref().map(|c| c.as_str().to_string()));
             Ok(())
+        }
+
+        async fn configure_turn_liveness(
+            &self,
+            session: &SessionId,
+            liveness: bridge_core::turn_liveness::TurnLivenessRequestV1,
+        ) {
+            self.rec
+                .configured_liveness
+                .lock()
+                .unwrap()
+                .push((session.clone(), liveness));
         }
 
         async fn forget_session(&self, _session: &SessionId) {
@@ -6112,6 +6135,29 @@ mod tests {
 
         assert_eq!(rec.flight_attach_count.load(Ordering::SeqCst), 1);
         assert_eq!(rec.retire_count.load(Ordering::SeqCst), 1);
+    }
+
+    /// I3: a liveness request staged without a `TurnMeta` (a cold served turn) reaches the
+    /// inner backend unchanged; the trait default would silently drop it.
+    #[tokio::test]
+    async fn configure_turn_liveness_forwards_to_the_inner_backend() {
+        let rec = Arc::new(Rec::default());
+        let backend = flight_only_backend(Arc::new(FakeInner { rec: rec.clone() }), rec.clone());
+        let session = SessionId::parse("liveness-forwarding").unwrap();
+        let request = bridge_core::turn_liveness::TurnLivenessRequestV1 {
+            client_watching: true,
+            observer_key: Some("task-1".into()),
+            ..Default::default()
+        };
+
+        backend
+            .configure_turn_liveness(&session, request.clone())
+            .await;
+
+        assert_eq!(
+            rec.configured_liveness.lock().unwrap().as_slice(),
+            [(session, request)]
+        );
     }
 
     #[tokio::test]

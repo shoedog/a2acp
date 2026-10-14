@@ -429,6 +429,16 @@ pub trait AgentBackend: Send + Sync {
     /// handler build a gen-stamped key). Default: no-op. The producer calls this immediately before `prompt`.
     async fn configure_turn(&self, _session: &SessionId, _meta: crate::permission::TurnMeta) {}
 
+    /// Stash the liveness request for the NEXT prompt on this session when the caller has no
+    /// [`crate::permission::TurnMeta`] to stage (a cold served unary turn). A staged `TurnMeta`'s
+    /// own `liveness` takes precedence. Default: no-op, so the turn inherits its defaults.
+    async fn configure_turn_liveness(
+        &self,
+        _session: &SessionId,
+        _liveness: crate::turn_liveness::TurnLivenessRequestV1,
+    ) {
+    }
+
     /// Stash the per-session spec (config + cwd); applied at lazy ACP mint. Default: no-op. [§4.4]
     async fn configure_session(
         &self,

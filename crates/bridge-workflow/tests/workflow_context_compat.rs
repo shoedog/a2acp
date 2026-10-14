@@ -11,5 +11,6 @@ fn downstream_exhaustive_workflow_context_literal_sets_harvest_store() {
         task_id: None,
         prompt_id: None,
         harvest_audit_store: std::sync::Arc::new(bridge_core::harvest::NoopHarvestAuditStore),
+        observer_key: None,
     };
 }

@@ -52,6 +52,7 @@ use bridge_core::ports::{
 };
 use bridge_core::task_store::BatchItem;
 use bridge_core::translator::{Event, EventKind, TaskOutcome, Translator};
+use bridge_core::turn_liveness::{TurnLivenessBoard, TurnLivenessRequestV1};
 use bridge_core::SessionCwd;
 #[cfg(test)]
 use bridge_workflow::executor::{
@@ -65,7 +66,9 @@ use bridge_coordinator::coordinator::StatusDto;
 use bridge_coordinator::dispatch::{
     BindingGuard, LocalDispatch, TaskBinding, WarmCompletionExit, WarmCompletionGuard,
 };
-use bridge_coordinator::params::{validate_cwd_str, InjectParams, PermitParams};
+use bridge_coordinator::params::{
+    validate_cwd_str, InjectParams, PermitParams, RequestLivenessParams,
+};
 use bridge_coordinator::turn_parts::assemble_turn_parts;
 use bridge_coordinator::{BatchDeps, BatchRuntime};
 
@@ -158,6 +161,9 @@ pub struct InboundServer {
     /// use. Every shared-state read routes through the forwarders below, which borrow
     /// the Coordinator's owned fields — so a mutation on any surface is visible to all.
     coordinator: Arc<bridge_coordinator::Coordinator>,
+    /// The process's heartbeat board, shared with every agent's backend (`AcpConfig`), which
+    /// registers its in-flight turns on it. Read by the bridge-private `TaskLiveness` RPC.
+    liveness_board: Arc<TurnLivenessBoard>,
 }
 
 impl InboundServer {
@@ -194,7 +200,21 @@ impl InboundServer {
             metrics_endpoint: None,
             trace_config: TraceHttpConfig::default(),
             coordinator,
+            liveness_board: Arc::new(TurnLivenessBoard::default()),
         }
+    }
+
+    /// Share the heartbeat board the agents' backends register their turns on. Without it the
+    /// server reads its own empty board, and `TaskLiveness` finds no turn.
+    #[must_use]
+    pub fn with_liveness_board(mut self, board: Arc<TurnLivenessBoard>) -> Self {
+        self.liveness_board = board;
+        self
+    }
+
+    /// The heartbeat board `TaskLiveness` reads.
+    pub fn liveness_board(&self) -> &Arc<TurnLivenessBoard> {
+        &self.liveness_board
     }
 
     /// Set the global root path that gates per-request session cwds (session_cwd increment).
@@ -415,6 +435,14 @@ impl InboundServer {
         //     must happen BEFORE task/session ids are derived so a malformed request
         //     is rejected before any state is created.
         let session_cwd = session_cwd_from_params(params, self.allowed_cwd_root.as_deref())?;
+        // 3c. Per-request turn liveness (`a2a-bridge.{silence,work}_cutoff_secs`,
+        //     `a2a-bridge.client_watching`): refused before any state is created when invalid.
+        let liveness = RequestLivenessParams::from_a2a_metadata(
+            params
+                .get("message")
+                .and_then(|m| m.get("metadata"))
+                .and_then(Value::as_object),
+        )?;
         let traceparent = headers
             .get("traceparent")
             .and_then(|v| v.to_str().ok())
@@ -444,6 +472,7 @@ impl InboundServer {
             prompt_id,
             context_id,
             session_cwd,
+            liveness,
         })
     }
 }
@@ -493,6 +522,44 @@ struct RoutedCall {
     /// dispatch (AgentOverride is dropped for workflows). `None` when absent.
     /// Applied by Tasks 6 (single-agent) and 7 (workflow).
     session_cwd: Option<SessionCwd>,
+    /// Per-request turn liveness from `a2a-bridge.*` metadata. Distinct from `AgentOverride`;
+    /// applied to local unary and streaming turns, and to a fan-out's local leg, by
+    /// [`served_turn_liveness`], never to a workflow.
+    liveness: RequestLivenessParams,
+}
+
+/// The liveness request of a served local turn: the request's cutoffs, registered on the
+/// heartbeat board under the task id. `client_watching` is honoured only where the caller
+/// says the turn dies with its client: unary `message/send`, whose dropped request future
+/// drops the turn's stream, which cancels the ACP prompt.
+fn served_turn_liveness(
+    routed: &RoutedCall,
+    honour_client_watching: bool,
+) -> TurnLivenessRequestV1 {
+    TurnLivenessRequestV1 {
+        silence: routed.liveness.silence,
+        work_cutoff: routed.liveness.work_cutoff,
+        client_watching: honour_client_watching && routed.liveness.client_watching,
+        observer_key: Some(routed.task.as_str().to_owned()),
+    }
+}
+
+/// Stage `liveness` for the next turn on `session`: on its `TurnMeta` when it has one, else on
+/// its own (a cold turn has no `TurnMeta`).
+async fn stage_served_turn(
+    backend: &dyn AgentBackend,
+    session: &SessionId,
+    meta: Option<TurnMeta>,
+    liveness: TurnLivenessRequestV1,
+) {
+    match meta {
+        Some(meta) => {
+            backend
+                .configure_turn(session, TurnMeta { liveness, ..meta })
+                .await
+        }
+        None => backend.configure_turn_liveness(session, liveness).await,
+    }
 }
 
 /// Extract the resolved `AgentId` from a `RouteTarget::Local`, falling back to the
@@ -773,7 +840,9 @@ where
                     // (§6): sanitization is permanently Off here.
                     requested_mode: HarvestSanitizationMode::Off,
                     prefix_attestation_request: prefix_attestation_request.clone(),
-                    liveness: bridge_core::turn_liveness::TurnLivenessRequestV1::default(),
+                    // Set where the turn is staged (`stage_served_turn`), which knows whether
+                    // the route honours `client_watching`.
+                    liveness: TurnLivenessRequestV1::default(),
                 }),
                 guard: None,
                 lease: None,
@@ -1606,6 +1675,7 @@ async fn jsonrpc(
         m if m == methods::GET_TASK => get_task(srv, headers, id, params).await,
         m if m == methods::LIST_TASKS => list_tasks(srv, headers, id, params).await,
         "AttemptStatus" => attempt_status_rpc(srv, headers, id, params).await,
+        "TaskLiveness" => task_liveness_rpc(srv, headers, id, params).await,
         "SessionStatus" => session_status(srv, headers, id, params).await,
         "SessionInject" => session_inject(srv, headers, id, params).await,
         "SessionPermit" => session_permit(srv, headers, id, params).await,
@@ -2643,6 +2713,9 @@ fn spawn_local_producer(
     let harvest_audit_store: Arc<dyn bridge_core::harvest::HarvestAuditStore> = Arc::new(
         bridge_core::task_store::TaskStoreHarvestAuditStore::new(srv.task_store().clone()),
     );
+    // Only unary `message/send` honours `client_watching`; a streaming turn keeps the
+    // unwatched default work cutoff.
+    let liveness = served_turn_liveness(&routed, false);
     let task = routed.task;
     let session = dispatch.session.clone();
     let mut parts = assemble_turn_parts(dispatch.seed.as_deref(), &dispatch.injects, routed.parts);
@@ -2677,9 +2750,7 @@ fn spawn_local_producer(
         let mut last_usage: Option<bridge_core::orch::UsageSnapshot> = None;
         observer.record(&bridge_core::ports::ObsEvent::TurnStarted { ctx: &obs_ctx });
 
-        if let Some(meta) = turn_meta {
-            backend.configure_turn(&session, meta).await;
-        }
+        stage_served_turn(backend.as_ref(), &session, turn_meta, liveness).await;
         let translator = Translator::new();
         let mut events = translator.run_observed(
             backend.as_ref(),
@@ -3019,6 +3090,8 @@ async fn poll_cancel_requested(store: &dyn SessionStore, local: &TaskId) {
 
 /// Build a `Source` for the local Kiro backend by running the Translator inside an
 /// `async_stream::stream!` that owns all the `Arc` clones it needs — no lifetime fight.
+/// `liveness` is staged for the leg's turn when the stream is first polled, immediately
+/// before translation, as the single-source paths stage theirs (`stage_served_turn`).
 #[allow(clippy::too_many_arguments)]
 fn local_kiro_source(
     label: String,
@@ -3032,6 +3105,7 @@ fn local_kiro_source(
     turn_id: Option<bridge_core::ids::TurnId>,
     activity: Arc<dyn bridge_core::attempt_activity::AttemptRecorder>,
     terminal_evidence: Arc<dyn bridge_core::terminal_evidence::TerminalEvidenceSink>,
+    liveness: TurnLivenessRequestV1,
 ) -> Source {
     let source_label = label.clone();
     // Build the stream by cloning Arc refs into a `'static + Send` stream.
@@ -3047,6 +3121,8 @@ fn local_kiro_source(
                 }
             },
         };
+        // A fan-out leg has no `TurnMeta` (`resolve_for_fanout` only configures the session).
+        stage_served_turn(backend.as_ref(), &session, None, liveness).await;
         let turn_context = bridge_core::ports::TurnContext {
             turn_id,
             session_id: ContextId::parse(session.as_str()).unwrap_or_else(|_| {
@@ -3105,6 +3181,8 @@ fn spawn_fanout_producer(
     let guard = srv.cancelled_peers.clone();
     let local_source_label = srv.local_source_label.clone();
     let agent_id = local_agent_id(&srv, &routed.target);
+    // Like every streaming turn, the local leg ignores `client_watching`.
+    let liveness = served_turn_liveness(&routed, false);
     let task = routed.task;
     let session = routed.session;
     let parts = routed.parts.clone();
@@ -3151,6 +3229,7 @@ fn spawn_fanout_producer(
                         None,
                         Arc::new(bridge_core::attempt_activity::NoopAttemptRecorder),
                         Arc::new(bridge_core::terminal_evidence::SharedTurnEvidence::unsupported()),
+                        liveness,
                     );
                     (src, Some(backend), Some(lease))
                 }
@@ -3944,12 +4023,16 @@ async fn unary_message(
             let _lease = dispatch.lease;
             let mut warm = dispatch.warm_guard;
             let turn_meta = dispatch.turn_meta.clone();
-            if let Some(meta) = turn_meta.clone() {
-                dispatch
-                    .backend
-                    .configure_turn(&dispatch.session, meta)
-                    .await;
-            }
+            // Unary `message/send` is the one path that honours `client_watching`: dropping
+            // this request future (the client disconnects) drops the turn's stream, and the
+            // ACP driver cancels the prompt when its stream is dropped.
+            stage_served_turn(
+                dispatch.backend.as_ref(),
+                &dispatch.session,
+                turn_meta.clone(),
+                served_turn_liveness(&routed, true),
+            )
+            .await;
             // cancel-tokens F2: the per-turn abort token (a force-reset cancels it).
             let abort = dispatch.abort;
             let mut parts =
@@ -4442,6 +4525,10 @@ async fn unary_fanout_message(
                 leg_turn,
                 leg_recorder,
                 leg_evidence,
+                // Unary fan-out honours `client_watching` as unary `message/send` does: dropping
+                // this request future drops `rx`, so `fanout::run` returns on `tx.closed()` and
+                // drops this leg's stream, and the ACP driver cancels a dropped prompt.
+                served_turn_liveness(&routed, true),
             );
             (src, Some(lease))
         }
@@ -4805,6 +4892,34 @@ async fn attempt_status_rpc(
         Ok(record) => jsonrpc_ok(id, json!({ "attempt": record })),
         Err(error) => bridge_err_to_jsonrpc(id, &error),
     }
+}
+
+/// Bridge-private, read-only: the in-flight turns registered under `taskId` (a served task id,
+/// or a served unary request's execution id), for a client heartbeat. `TaskNotFound` when no
+/// turn is in flight under it. Same authorization as `AttemptStatus`.
+async fn task_liveness_rpc(
+    srv: Arc<InboundServer>,
+    headers: HeaderMap,
+    id: Value,
+    params: Value,
+) -> Response {
+    if let Err(error) = authorize_headers(&srv, &headers) {
+        return bridge_err_to_jsonrpc(id, &error);
+    }
+    let task = match params
+        .get("taskId")
+        .and_then(Value::as_str)
+        .ok_or(BridgeError::InvalidRequest { field: "taskId" })
+        .and_then(TaskId::parse)
+    {
+        Ok(task) => task,
+        Err(error) => return bridge_err_to_jsonrpc(id, &error),
+    };
+    let turns = srv.liveness_board.snapshot(task.as_str());
+    if turns.is_empty() {
+        return bridge_err_to_jsonrpc(id, &BridgeError::TaskNotFound);
+    }
+    jsonrpc_ok(id, json!({ "turns": turns }))
 }
 
 async fn session_status(
@@ -11369,6 +11484,7 @@ mod tests {
             None,
             Arc::new(bridge_core::attempt_activity::NoopAttemptRecorder),
             Arc::new(bridge_core::terminal_evidence::SharedTurnEvidence::unsupported()),
+            TurnLivenessRequestV1::default(),
         );
 
         let out: Vec<Result<Event, BridgeError>> = source.stream.collect().await;
@@ -13059,6 +13175,7 @@ mod tests {
             prompt_id: None,
             context_id: Some(context.clone()),
             session_cwd: None,
+            liveness: Default::default(),
         };
         let diagnostic = direct_diagnostic_observer();
         let dispatch = warm_local_dispatch(
@@ -13101,6 +13218,7 @@ mod tests {
             prompt_id: None,
             context_id: Some(context.clone()),
             session_cwd: None,
+            liveness: Default::default(),
         };
 
         let result = warm_local_dispatch_with_turn_id_minter(
@@ -13213,6 +13331,7 @@ mod tests {
             prompt_id: None,
             context_id: Some(ContextId::parse("ready-usage-disconnect").unwrap()),
             session_cwd: None,
+            liveness: Default::default(),
         };
         let (tx, rx) = tokio::sync::mpsc::channel(1);
         drop(rx);
@@ -13353,6 +13472,7 @@ mod tests {
             prompt_id: None,
             context_id: Some(ContextId::parse("streaming-pre-cancel").unwrap()),
             session_cwd: None,
+            liveness: Default::default(),
         };
         let (tx, mut rx) = tokio::sync::mpsc::channel(64);
 
@@ -13417,6 +13537,7 @@ mod tests {
             prompt_id: None,
             context_id: Some(ContextId::parse("streaming-disconnect").unwrap()),
             session_cwd: None,
+            liveness: Default::default(),
         };
         let (tx, rx) = tokio::sync::mpsc::channel(64);
 
@@ -13510,6 +13631,7 @@ mod tests {
             prompt_id: None,
             context_id: Some(ContextId::parse("streaming-no-usage-disconnect").unwrap()),
             session_cwd: None,
+            liveness: Default::default(),
         };
         let (tx, rx) = tokio::sync::mpsc::channel(64);
 
@@ -13631,6 +13753,7 @@ mod tests {
             prompt_id: None,
             context_id: Some(ContextId::parse("send-err").unwrap()),
             session_cwd: None,
+            liveness: Default::default(),
         };
         // Capacity=1: first tx.send succeeds, second blocks → dropping rx makes it fail.
         let (tx, rx) = tokio::sync::mpsc::channel(1);
@@ -13955,6 +14078,719 @@ mod tests {
             single_unary_turn(&observer.snapshot()),
             (bridge_core::ports::TurnOutcome::Canceled, true, Some(123))
         );
+    }
+
+    // ---- Activity liveness I3: TaskLiveness and per-request knobs ----
+
+    /// Stands in for the ACP backend at the heartbeat seam. It registers each prompted turn on
+    /// the board under the liveness request staged for it (with one open tool, resolved through
+    /// the real tracker), then parks until released. Its stream dropping mid-turn is the moment
+    /// the ACP driver sends `session/cancel` to the agent: bridge-acp's
+    /// `a_watched_turn_has_no_default_work_cutoff_and_is_cancelled_when_its_consumer_leaves`
+    /// proves that half against its fake agent.
+    struct HeartbeatStubBackend {
+        board: Arc<TurnLivenessBoard>,
+        staged: Mutex<Option<TurnLivenessRequestV1>>,
+        requests: Mutex<Vec<TurnLivenessRequestV1>>,
+        started: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+        cancelled: Arc<tokio::sync::Notify>,
+    }
+
+    impl HeartbeatStubBackend {
+        fn new(board: Arc<TurnLivenessBoard>) -> Arc<Self> {
+            Arc::new(Self {
+                board,
+                staged: Mutex::new(None),
+                requests: Mutex::new(Vec::new()),
+                started: Arc::new(tokio::sync::Notify::new()),
+                release: Arc::new(tokio::sync::Notify::new()),
+                cancelled: Arc::new(tokio::sync::Notify::new()),
+            })
+        }
+
+        fn requests(&self) -> Vec<TurnLivenessRequestV1> {
+            self.requests.lock().unwrap().clone()
+        }
+    }
+
+    struct StubTurnProbe(bridge_core::turn_liveness::TurnLivenessTracker);
+
+    impl bridge_core::turn_liveness::TurnLivenessProbeV1 for StubTurnProbe {
+        fn snapshot(&self) -> bridge_core::turn_liveness::TurnLivenessSnapshotV1 {
+            self.0.snapshot(90_000, "kiro")
+        }
+    }
+
+    /// The stub's in-flight turn: dropped unfinished, it is cancelled.
+    struct StubTurn {
+        registration: Option<bridge_core::turn_liveness::TurnLivenessRegistrationV1>,
+        cancelled: Arc<tokio::sync::Notify>,
+        finished: bool,
+    }
+
+    impl Drop for StubTurn {
+        fn drop(&mut self) {
+            if !self.finished {
+                self.cancelled.notify_one();
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl AgentBackend for HeartbeatStubBackend {
+        async fn prompt(
+            &self,
+            _s: &SessionId,
+            _p: Vec<Part>,
+        ) -> Result<BackendStream, BridgeError> {
+            use bridge_core::turn_liveness::{
+                resolve_turn_liveness_v1, ToolCallPhaseV1, ToolObservationV1, TurnActivityV1,
+                TurnLivenessTracker,
+            };
+            let request = self.staged.lock().unwrap().take().unwrap_or_default();
+            self.requests.lock().unwrap().push(request.clone());
+            let mut tracker = TurnLivenessTracker::new(resolve_turn_liveness_v1(&request, None));
+            tracker.observe(
+                30_000,
+                TurnActivityV1::Tool(ToolObservationV1 {
+                    raw_id: "tool-1",
+                    status: Some(ToolCallPhaseV1::InProgress),
+                    title: Some("cargo test"),
+                    kind: Some("execute"),
+                }),
+            );
+            let registration = request.observer_key.clone().map(|key| {
+                self.board
+                    .register(key, "turn-stub", Arc::new(StubTurnProbe(tracker)))
+            });
+            let (started, release) = (self.started.clone(), self.release.clone());
+            let cancelled = self.cancelled.clone();
+            Ok(Box::pin(async_stream::stream! {
+                let mut turn = StubTurn { registration, cancelled, finished: false };
+                started.notify_one();
+                release.notified().await;
+                turn.finished = true;
+                drop(turn.registration.take());
+                yield Ok(Update::Text("done".into()));
+                yield Ok(Update::Done {
+                    stop_reason: "end_turn".into(),
+                    prefix_attestation: Default::default(),
+                });
+            }))
+        }
+
+        async fn cancel(&self, _s: &SessionId) -> Result<(), BridgeError> {
+            Ok(())
+        }
+
+        async fn configure_turn(&self, _s: &SessionId, meta: TurnMeta) {
+            *self.staged.lock().unwrap() = Some(meta.liveness);
+        }
+
+        async fn configure_turn_liveness(&self, _s: &SessionId, liveness: TurnLivenessRequestV1) {
+            *self.staged.lock().unwrap() = Some(liveness);
+        }
+    }
+
+    fn liveness_server(
+        backend: Arc<dyn AgentBackend>,
+        board: Arc<TurnLivenessBoard>,
+        auth: Arc<dyn AuthMiddleware>,
+    ) -> Arc<InboundServer> {
+        let coord = test_coordinator(
+            FakeRegistry::single("kiro", backend),
+            Arc::new(FakeStore::default()),
+            Arc::new(AutoApprove),
+        );
+        Arc::new(
+            InboundServer::from_coordinator(
+                coord,
+                Arc::new(AlwaysKiro),
+                auth,
+                "http://localhost:8080",
+                Arc::new(NoDelegation),
+                "kiro",
+            )
+            .with_liveness_board(board),
+        )
+    }
+
+    /// A unary `SendMessage` the way `a2a-bridge submit` sends it: task id = execution id.
+    fn liveness_unary_msg(identity: &bridge_core::ids::AttemptIdentity, extra: Value) -> Value {
+        let mut metadata = json!({
+            "a2a-bridge.execution_id": identity.execution_id.as_str(),
+            "a2a-bridge.attempt_id": identity.attempt_id.as_str(),
+        });
+        for (key, value) in extra.as_object().unwrap() {
+            metadata[key] = value.clone();
+        }
+        json!({ "message": {
+            "taskId": identity.execution_id.as_str(),
+            "text": "go",
+            "metadata": metadata,
+        } })
+    }
+
+    async fn task_liveness_response(srv: Arc<InboundServer>, task: &str) -> (StatusCode, Value) {
+        let response = router(srv)
+            .oneshot(post_request(
+                "TaskLiveness",
+                json!({ "taskId": task }),
+                "1.0",
+            ))
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = body_string(response).await;
+        (status, serde_json::from_str(&body).unwrap())
+    }
+
+    async fn notified_within(notify: &tokio::sync::Notify, what: &str) {
+        tokio::time::timeout(std::time::Duration::from_secs(10), notify.notified())
+            .await
+            .unwrap_or_else(|_| panic!("{what}"));
+    }
+
+    /// I3: `TaskLiveness` returns the open tool of an in-flight unary turn under its task id
+    /// (the execution id), `TaskNotFound` while no turn is in flight, and requires auth.
+    #[tokio::test]
+    async fn task_liveness_reports_an_in_flight_turn_and_task_not_found_when_idle() {
+        let board = Arc::new(TurnLivenessBoard::default());
+        let stub = HeartbeatStubBackend::new(board.clone());
+        let srv = liveness_server(stub.clone(), board.clone(), Arc::new(AlwaysGrant));
+        let identity = bridge_core::ids::AttemptIdentity::initial().unwrap();
+        let task = identity.execution_id.as_str().to_owned();
+
+        let (status, idle) = task_liveness_response(srv.clone(), &task).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(idle["error"]["message"], "task not found");
+
+        let request = tokio::spawn({
+            let srv = srv.clone();
+            let params = liveness_unary_msg(&identity, json!({}));
+            async move { send_unary(&srv, params).await }
+        });
+        notified_within(&stub.started, "the unary turn never started").await;
+
+        let (status, live) = task_liveness_response(srv.clone(), &task).await;
+        assert_eq!(status, StatusCode::OK, "{live}");
+        let turns: Vec<bridge_core::turn_liveness::TurnLivenessSnapshotV1> =
+            serde_json::from_value(live["result"]["turns"].clone()).unwrap();
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].turn_id, "turn-stub");
+        assert_eq!(turns[0].open_tool_count, 1);
+        assert_eq!(turns[0].open_tools[0].title, "cargo test");
+        assert_eq!(turns[0].open_tools[0].kind, "execute");
+        assert_eq!(turns[0].open_tools[0].age_ms, 60_000);
+        assert!(turns[0].paused);
+        assert!(
+            task_liveness_response(srv.clone(), identity.attempt_id.as_str())
+                .await
+                .1["error"]
+                .is_object(),
+            "the turn is keyed by the execution id, not the attempt id"
+        );
+
+        let refusing = liveness_server(stub.clone(), board.clone(), Arc::new(RejectAuth));
+        let (_, refused) = task_liveness_response(refusing, &task).await;
+        assert!(refused.get("result").is_none(), "{refused}");
+        assert!(refused["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("auth required"));
+
+        stub.release.notify_one();
+        let response = request.await.unwrap();
+        assert_eq!(response["result"]["task"]["state"], "TASK_STATE_COMPLETED");
+        let (_, after) = task_liveness_response(srv, &task).await;
+        assert_eq!(after["error"]["message"], "task not found");
+    }
+
+    /// I3: a unary turn sent with `client_watching=true` is staged watched (no default work
+    /// cutoff) and, when its client disconnects, the server drops the turn's stream, which is
+    /// what cancels the ACP prompt. Without the flag the turn stays unwatched (2 h cutoff).
+    #[tokio::test]
+    async fn a_watched_unary_turn_dies_with_its_client() {
+        let board = Arc::new(TurnLivenessBoard::default());
+        let stub = HeartbeatStubBackend::new(board.clone());
+        let srv = liveness_server(stub.clone(), board.clone(), Arc::new(AlwaysGrant));
+        let identity = bridge_core::ids::AttemptIdentity::initial().unwrap();
+        let task = identity.execution_id.as_str().to_owned();
+
+        let mut request = Box::pin(router(srv.clone()).oneshot(post_request(
+            methods::SEND_MESSAGE,
+            liveness_unary_msg(&identity, json!({ "a2a-bridge.client_watching": "true" })),
+            "1.0",
+        )));
+        tokio::select! {
+            _ = &mut request => panic!("a parked turn must not answer"),
+            _ = stub.started.notified() => {}
+        }
+        assert_eq!(
+            board.snapshot(&task)[0].work_cutoff_ms,
+            None,
+            "a watched turn has no default work cutoff"
+        );
+        // Client disconnect: the server drops the in-flight handler future.
+        drop(request);
+        notified_within(&stub.cancelled, "the disconnect did not end the turn").await;
+        assert!(board.snapshot(&task).is_empty());
+        assert_eq!(
+            stub.requests(),
+            vec![TurnLivenessRequestV1 {
+                client_watching: true,
+                observer_key: Some(task.clone()),
+                ..TurnLivenessRequestV1::default()
+            }]
+        );
+
+        let unwatched = bridge_core::ids::AttemptIdentity::initial().unwrap();
+        let request = tokio::spawn({
+            let srv = srv.clone();
+            let params = liveness_unary_msg(&unwatched, json!({}));
+            async move { send_unary(&srv, params).await }
+        });
+        notified_within(&stub.started, "the unwatched turn never started").await;
+        assert_eq!(
+            board.snapshot(unwatched.execution_id.as_str())[0].work_cutoff_ms,
+            Some(bridge_core::execution_policy::DEFAULT_WORK_CUTOFF_MS)
+        );
+        stub.release.notify_one();
+        request.await.unwrap();
+        assert!(!stub.requests()[1].client_watching);
+    }
+
+    /// I3: the same over a real socket. Closing the client's TCP connection mid-turn makes the
+    /// HTTP server drop the unary handler, and with it the watched turn's stream.
+    #[tokio::test]
+    async fn a_watched_unary_turn_ends_when_its_client_socket_closes() {
+        use tokio::io::AsyncWriteExt;
+        let board = Arc::new(TurnLivenessBoard::default());
+        let stub = HeartbeatStubBackend::new(board.clone());
+        let srv = liveness_server(stub.clone(), board.clone(), Arc::new(AlwaysGrant));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, srv.router()).await });
+
+        let identity = bridge_core::ids::AttemptIdentity::initial().unwrap();
+        let body = serde_json::to_vec(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": methods::SEND_MESSAGE,
+            "params": liveness_unary_msg(&identity, json!({ "a2a-bridge.client_watching": "true" })),
+        }))
+        .unwrap();
+        let mut socket = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let head = format!(
+            "POST / HTTP/1.1\r\nhost: {addr}\r\ncontent-type: application/json\r\n{SVC_PARAM_VERSION}: 1.0\r\ncontent-length: {}\r\n\r\n",
+            body.len()
+        );
+        socket.write_all(head.as_bytes()).await.unwrap();
+        socket.write_all(&body).await.unwrap();
+        notified_within(&stub.started, "the unary turn never started").await;
+        assert_eq!(board.snapshot(identity.execution_id.as_str()).len(), 1);
+
+        drop(socket);
+        notified_within(&stub.cancelled, "closing the socket did not end the turn").await;
+        assert!(board.snapshot(identity.execution_id.as_str()).is_empty());
+        assert!(stub.requests()[0].client_watching);
+    }
+
+    /// I3: the liveness metadata parses (`"off"` → Off, seconds → Ms) onto the staged turn, an
+    /// invalid value is `InvalidRequest` before any prompt, and a streaming turn ignores
+    /// `client_watching` (only unary `message/send` dies with its client).
+    #[tokio::test]
+    async fn liveness_metadata_reaches_the_turn_and_invalid_values_are_refused() {
+        use bridge_core::turn_liveness::TurnLivenessValueV1;
+        let board = Arc::new(TurnLivenessBoard::default());
+        let stub = HeartbeatStubBackend::new(board.clone());
+        let srv = liveness_server(stub.clone(), board.clone(), Arc::new(AlwaysGrant));
+
+        let refused = send_unary(
+            &srv,
+            liveness_unary_msg(
+                &bridge_core::ids::AttemptIdentity::initial().unwrap(),
+                json!({ "a2a-bridge.silence_cutoff_secs": "abc" }),
+            ),
+        )
+        .await;
+        assert_eq!(
+            refused["error"]["code"], JSONRPC_INVALID_REQUEST,
+            "{refused}"
+        );
+        assert!(refused["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("a2a-bridge.silence_cutoff_secs"));
+        assert!(stub.requests().is_empty(), "refused before any prompt");
+
+        let identity = bridge_core::ids::AttemptIdentity::initial().unwrap();
+        stub.release.notify_one();
+        let completed = send_unary(
+            &srv,
+            liveness_unary_msg(
+                &identity,
+                json!({
+                    "a2a-bridge.silence_cutoff_secs": "off",
+                    "a2a-bridge.work_cutoff_secs": "600",
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(completed["result"]["task"]["state"], "TASK_STATE_COMPLETED");
+        assert_eq!(
+            stub.requests().last().cloned().unwrap(),
+            TurnLivenessRequestV1 {
+                silence: TurnLivenessValueV1::Off,
+                work_cutoff: TurnLivenessValueV1::Ms(600_000),
+                client_watching: false,
+                observer_key: Some(identity.execution_id.as_str().to_owned()),
+            }
+        );
+
+        let streamed = bridge_core::ids::AttemptIdentity::initial().unwrap();
+        stub.release.notify_one();
+        let response = router(srv)
+            .oneshot(post_request(
+                methods::SEND_STREAMING_MESSAGE,
+                liveness_unary_msg(&streamed, json!({ "a2a-bridge.client_watching": "true" })),
+                "1.0",
+            ))
+            .await
+            .unwrap();
+        let _ = body_string(response).await;
+        let request = stub.requests().last().cloned().unwrap();
+        assert!(
+            !request.client_watching,
+            "streaming ignores client_watching"
+        );
+        assert_eq!(
+            request.observer_key.as_deref(),
+            Some(streamed.execution_id.as_str())
+        );
+    }
+
+    /// I3: a served workflow's node turns are found by `TaskLiveness` under the served task
+    /// id, and the request's `client_watching` and cutoff metadata are ignored: the node turns
+    /// run under the workflow's own policy, its run-wide cutoff remaining the backstop.
+    #[tokio::test]
+    async fn served_workflow_turns_are_found_under_the_task_id_and_ignore_client_watching() {
+        let board = Arc::new(TurnLivenessBoard::default());
+        let stub = HeartbeatStubBackend::new(board.clone());
+        let registry = FakeRegistry::single("kiro", stub.clone());
+        let executor = Arc::new(bridge_workflow::executor::WorkflowExecutor::new(
+            registry.clone() as Arc<dyn AgentRegistry>,
+        ));
+        let graph = Arc::new(bridge_workflow::graph::WorkflowGraph {
+            id: bridge_core::ids::WorkflowId::parse("code-review").unwrap(),
+            nodes: vec![WorkflowNode {
+                id: bridge_core::ids::NodeId::parse("only").unwrap(),
+                agent: AgentId::parse("kiro").unwrap(),
+                prompt_template: "review {{input}}".into(),
+                inputs: vec![],
+                retry: None,
+                harvest_sanitization: None,
+            }],
+            panel: None,
+            controls: None,
+        });
+        let srv = Arc::new(
+            InboundServer::from_coordinator(
+                test_coordinator_over_in_memory_history(
+                    registry as Arc<dyn AgentRegistry>,
+                    Arc::new(FakeStore::default()),
+                    Arc::new(AutoApprove),
+                    Some(executor),
+                    HashMap::from([(graph.id.clone(), graph)]),
+                    Arc::new(bridge_core::task_store::MemoryTaskStore::new()),
+                    None,
+                    None,
+                    None,
+                ),
+                Arc::new(WorkflowOnlyRoute),
+                Arc::new(AlwaysGrant),
+                "http://localhost:8080",
+                Arc::new(NoDelegation),
+                "kiro",
+            )
+            .with_liveness_board(board.clone()),
+        );
+        let identity = bridge_core::ids::AttemptIdentity::initial().unwrap();
+        let mut params = liveness_unary_msg(
+            &identity,
+            json!({
+                "a2a-bridge.skill": "code-review",
+                "a2a-bridge.client_watching": "true",
+                "a2a-bridge.silence_cutoff_secs": "600",
+                "a2a-bridge.work_cutoff_secs": "60",
+            }),
+        );
+        params["message"]["text"] = json!(typed_code_review_input());
+
+        let submitted = send_unary(&srv, params).await;
+        let task = submitted["result"]["locator"]["task_id"]
+            .as_str()
+            .unwrap_or_else(|| panic!("a detached workflow locator: {submitted}"))
+            .to_owned();
+        notified_within(&stub.started, "the workflow node never started").await;
+
+        let (status, live) = task_liveness_response(srv.clone(), &task).await;
+        assert_eq!(status, StatusCode::OK, "{live}");
+        assert_eq!(live["result"]["turns"].as_array().unwrap().len(), 1);
+        let staged = stub.requests();
+        assert_eq!(
+            staged,
+            vec![TurnLivenessRequestV1 {
+                silence: bridge_core::turn_liveness::TurnLivenessValueV1::Off,
+                work_cutoff: bridge_core::turn_liveness::TurnLivenessValueV1::Off,
+                client_watching: false,
+                observer_key: Some(task.clone()),
+            }],
+            "the node turn runs under the workflow's policy, never the request's knobs"
+        );
+
+        stub.release.notify_one();
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while !board.snapshot(&task).is_empty() {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the node turn leaves the board");
+    }
+
+    /// I3 review round 2: the wire contract is strings only. A native JSON number (zero
+    /// included) or boolean for any of the three keys is `InvalidRequest` on `message/send` and
+    /// `message/stream` alike, before any prompt.
+    #[tokio::test]
+    async fn non_string_liveness_metadata_is_refused_at_the_server_before_any_prompt() {
+        let board = Arc::new(TurnLivenessBoard::default());
+        let stub = HeartbeatStubBackend::new(board.clone());
+        let srv = liveness_server(stub.clone(), board, Arc::new(AlwaysGrant));
+        for (key, value) in [
+            ("a2a-bridge.work_cutoff_secs", json!(0)),
+            ("a2a-bridge.work_cutoff_secs", json!(600)),
+            ("a2a-bridge.silence_cutoff_secs", json!(0)),
+            ("a2a-bridge.silence_cutoff_secs", json!(600)),
+            ("a2a-bridge.client_watching", json!(true)),
+            ("a2a-bridge.client_watching", json!(false)),
+        ] {
+            for method in [methods::SEND_MESSAGE, methods::SEND_STREAMING_MESSAGE] {
+                // An accepted request reaches the stub, which parks: bounded, it fails instead.
+                let body = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                    let response = router(srv.clone())
+                        .oneshot(post_request(
+                            method,
+                            liveness_unary_msg(
+                                &bridge_core::ids::AttemptIdentity::initial().unwrap(),
+                                json!({ key: value }),
+                            ),
+                            "1.0",
+                        ))
+                        .await
+                        .unwrap();
+                    body_string(response).await
+                })
+                .await
+                .unwrap_or_else(|_| panic!("{method} {key}={value} was dispatched, not refused"));
+                let refused: Value = serde_json::from_str(&body)
+                    .unwrap_or_else(|e| panic!("{method} {key}={value}: {e}: {body}"));
+                assert_eq!(
+                    refused["error"]["code"], JSONRPC_INVALID_REQUEST,
+                    "{method} {key}={value}: {refused}"
+                );
+                assert!(
+                    refused["error"]["message"].as_str().unwrap().contains(key),
+                    "{method} {key}={value}: {refused}"
+                );
+            }
+        }
+        assert!(stub.requests().is_empty(), "refused before any prompt");
+    }
+
+    /// A fan-out server whose local leg is `backend`, sharing `board` with `TaskLiveness`.
+    fn liveness_fanout_server(
+        backend: Arc<dyn AgentBackend>,
+        board: Arc<TurnLivenessBoard>,
+    ) -> Arc<InboundServer> {
+        let coord = test_coordinator(
+            FakeRegistry::single("kiro", backend),
+            Arc::new(FakeStore::default()),
+            Arc::new(AutoApprove),
+        );
+        Arc::new(
+            InboundServer::from_coordinator(
+                coord,
+                Arc::new(FanoutSkillRoute),
+                Arc::new(AlwaysGrant),
+                "http://localhost:8080",
+                FakeDelegation::new(vec![Ok(Event::artifact("PA"))], Some("p1")),
+                "kiro",
+            )
+            .with_liveness_board(board),
+        )
+    }
+
+    fn liveness_fanout_msg(identity: &bridge_core::ids::AttemptIdentity, extra: Value) -> Value {
+        let mut params = liveness_unary_msg(identity, extra);
+        params["message"]["metadata"]["a2a-bridge.skill"] = json!("fan-out");
+        params
+    }
+
+    /// I3 review round 2: a unary fan-out's local leg runs under the request's cutoffs and is
+    /// registered under the served task id while it is held open, then leaves the board when it
+    /// completes. Before, the leg ran with the defaults and `TaskLiveness` found nothing.
+    #[tokio::test]
+    async fn a_unary_fanout_local_leg_carries_the_request_liveness_until_it_completes() {
+        use bridge_core::turn_liveness::TurnLivenessValueV1;
+        let board = Arc::new(TurnLivenessBoard::default());
+        let stub = HeartbeatStubBackend::new(board.clone());
+        let srv = liveness_fanout_server(stub.clone(), board.clone());
+        let identity = bridge_core::ids::AttemptIdentity::initial().unwrap();
+        let task = identity.execution_id.as_str().to_owned();
+
+        let request = tokio::spawn({
+            let srv = srv.clone();
+            let params = liveness_fanout_msg(
+                &identity,
+                json!({
+                    "a2a-bridge.silence_cutoff_secs": "off",
+                    "a2a-bridge.work_cutoff_secs": "60",
+                }),
+            );
+            async move { send_unary(&srv, params).await }
+        });
+        notified_within(&stub.started, "the fan-out local leg never started").await;
+
+        let (status, live) = task_liveness_response(srv.clone(), &task).await;
+        assert_eq!(status, StatusCode::OK, "{live}");
+        let turns: Vec<bridge_core::turn_liveness::TurnLivenessSnapshotV1> =
+            serde_json::from_value(live["result"]["turns"].clone()).unwrap();
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].work_cutoff_ms, Some(60_000));
+        assert_eq!(turns[0].silence_cutoff_ms, None);
+        assert_eq!(
+            stub.requests(),
+            vec![TurnLivenessRequestV1 {
+                silence: TurnLivenessValueV1::Off,
+                work_cutoff: TurnLivenessValueV1::Ms(60_000),
+                client_watching: false,
+                observer_key: Some(task.clone()),
+            }]
+        );
+
+        stub.release.notify_one();
+        let response = request.await.unwrap();
+        assert_eq!(
+            response["result"]["status"]["state"], "TASK_STATE_COMPLETED",
+            "{response}"
+        );
+        let (_, after) = task_liveness_response(srv, &task).await;
+        assert_eq!(after["error"]["message"], "task not found");
+    }
+
+    /// I3 review round 2: a unary fan-out sent with `client_watching=true` stages its local leg
+    /// watched (no default work cutoff), and dropping the request (the client disconnects)
+    /// drops that leg's stream, which is what cancels the ACP prompt (`session/cancel`); the leg
+    /// leaves the board.
+    #[tokio::test]
+    async fn a_watched_unary_fanout_local_leg_dies_with_its_client() {
+        let board = Arc::new(TurnLivenessBoard::default());
+        let stub = HeartbeatStubBackend::new(board.clone());
+        let srv = liveness_fanout_server(stub.clone(), board.clone());
+        let identity = bridge_core::ids::AttemptIdentity::initial().unwrap();
+        let task = identity.execution_id.as_str().to_owned();
+
+        let mut request = Box::pin(router(srv).oneshot(post_request(
+            methods::SEND_MESSAGE,
+            liveness_fanout_msg(&identity, json!({ "a2a-bridge.client_watching": "true" })),
+            "1.0",
+        )));
+        tokio::select! {
+            _ = &mut request => panic!("a parked fan-out leg must not answer"),
+            _ = stub.started.notified() => {}
+        }
+        let turns = board.snapshot(&task);
+        assert_eq!(turns.len(), 1, "the leg is registered under the task id");
+        assert_eq!(
+            turns[0].work_cutoff_ms, None,
+            "a watched leg has no default work cutoff"
+        );
+
+        drop(request);
+        notified_within(
+            &stub.cancelled,
+            "the disconnect did not end the fan-out leg",
+        )
+        .await;
+        assert!(board.snapshot(&task).is_empty());
+        assert_eq!(
+            stub.requests(),
+            vec![TurnLivenessRequestV1 {
+                client_watching: true,
+                observer_key: Some(task),
+                ..TurnLivenessRequestV1::default()
+            }]
+        );
+    }
+
+    /// I3 review round 2: a streaming fan-out's local leg takes the request's cutoffs and the
+    /// task id as its observer key but ignores `client_watching` (it keeps the default 2 h work
+    /// cutoff), and leaves the board when the caller disconnects.
+    #[tokio::test]
+    async fn a_streaming_fanout_local_leg_ignores_client_watching_and_leaves_on_disconnect() {
+        use bridge_core::turn_liveness::TurnLivenessValueV1;
+        let board = Arc::new(TurnLivenessBoard::default());
+        let stub = HeartbeatStubBackend::new(board.clone());
+        let srv = liveness_fanout_server(stub.clone(), board.clone());
+        let identity = bridge_core::ids::AttemptIdentity::initial().unwrap();
+        let task = identity.execution_id.as_str().to_owned();
+
+        let response = router(srv.clone())
+            .oneshot(post_request(
+                methods::SEND_STREAMING_MESSAGE,
+                liveness_fanout_msg(
+                    &identity,
+                    json!({
+                        "a2a-bridge.client_watching": "true",
+                        "a2a-bridge.silence_cutoff_secs": "600",
+                    }),
+                ),
+                "1.0",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        notified_within(&stub.started, "the fan-out local leg never started").await;
+
+        let (status, live) = task_liveness_response(srv, &task).await;
+        assert_eq!(status, StatusCode::OK, "{live}");
+        let turns: Vec<bridge_core::turn_liveness::TurnLivenessSnapshotV1> =
+            serde_json::from_value(live["result"]["turns"].clone()).unwrap();
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].silence_cutoff_ms, Some(600_000));
+        assert_eq!(
+            turns[0].work_cutoff_ms,
+            Some(bridge_core::execution_policy::DEFAULT_WORK_CUTOFF_MS),
+            "streaming ignores client_watching"
+        );
+        assert_eq!(
+            stub.requests(),
+            vec![TurnLivenessRequestV1 {
+                silence: TurnLivenessValueV1::Ms(600_000),
+                observer_key: Some(task.clone()),
+                ..TurnLivenessRequestV1::default()
+            }]
+        );
+
+        drop(response);
+        notified_within(
+            &stub.cancelled,
+            "the disconnect did not end the fan-out leg",
+        )
+        .await;
+        assert!(board.snapshot(&task).is_empty());
     }
 
     fn warm_msg(text: &str) -> serde_json::Value {

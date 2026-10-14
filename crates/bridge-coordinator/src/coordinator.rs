@@ -1793,6 +1793,8 @@ impl Coordinator {
             task_id: Some(task.clone()),
             make_rich_sink: None,
             observer: self.observer.clone(),
+            // A served workflow's heartbeat key is its task id (`TaskLiveness`).
+            observer_key: Some(task.as_str().to_owned()),
             ..WorkflowRunContext::default()
         };
         let runner = match admitted {

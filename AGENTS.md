@@ -66,6 +66,17 @@ a2a-bridge run-workflow <id> \
 - The **terminal** workflow node's output is what you get (stdout or `--out`). Runs offline.
 - `--session-cwd` is the per-request cwd (ADR-0014). Without it, agents run in the launch cwd, not your
   target repo — a common mistake.
+- While a run is in flight, `run-workflow` (local or `--serve`) and `submit` print a `[heartbeat] …` line
+  on **stderr** every 60 s (stdout is unchanged): elapsed time, each in-flight turn's agent, last
+  activity, oldest open tool and cutoffs, or `liveness=unavailable` when the server cannot say.
+  `--heartbeat-secs N` (`0` = off), `--no-heartbeat`, or env `A2A_BRIDGE_HEARTBEAT_SECS`; a flag beats
+  the env. `submit` with the heartbeat on sends `a2a-bridge.client_watching=true`, so its unary turn
+  dies with the client and has no default 2 h work cutoff; scripts wanting the backstop pass
+  `--no-heartbeat`. Served requests may also set `a2a-bridge.silence_cutoff_secs` /
+  `a2a-bridge.work_cutoff_secs` (JSON strings only: `"off"`, `"0"` or seconds) in `message.metadata`;
+  a fan-out applies all three keys to its local leg, workflows ignore them. Served turns are readable
+  through the bridge-private `TaskLiveness {taskId}` RPC. Details:
+  [`docs/onboarding.md`](docs/onboarding.md#watching-a-run-the-heartbeat-and-per-request-bounds).
 
 **Built-in workflow `<id>`s** (defined in `examples/a2a-bridge.containerized.toml` and
 `examples/a2a-bridge.multi-agent.toml`):
