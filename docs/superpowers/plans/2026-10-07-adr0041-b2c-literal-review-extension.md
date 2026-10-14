@@ -1,6 +1,6 @@
 # B2c exact-literal correction and proposed bounded source3/3
 
-Status: CORRECTION COMPLETE; additional review UNADMITTED, owner decision pending.
+Status: CORRECTION COMPLETE. **Owner decision 2026-10-13: accepted on the mechanical proof; the proposed source3/3 is NOT run.** The prepared source3 inputs under `/private/tmp` were lost with that scratch root.
 
 The approved [lossless follow-on](2026-10-05-adr0041-b2c-lossless-census-design-follow-on.md) declared a NEW TWO-round independent source cap. Actual [source1/2](../reviews/2026-10-06-adr0041-slice2b3b-b2c-lossless-source-round1.md) rejected one stale living-handoff finding; actual [source2/2](../reviews/2026-10-06-adr0041-slice2b3b-b2c-lossless-source-round2.md) closed that mechanism and rejected one newly introduced literal. Both verdicts are 1WRONG/2SMELL/1blocker, CLOSED POPULATION; the count1→1 is not a decreasing count or a reset. The complete remaining current-binding population was enumerated by Sol: only L10's incorrect test-source prefix. Old source4/4 and prior follow-on2/2 remain rejected/exhausted OPEN.
 
