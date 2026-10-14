@@ -1552,6 +1552,247 @@ impl PinnedDirectoryV1 {
     }
 }
 
+// ---------------------------------------------------------------------------------------------
+// ADR-0041 slice 2B3c C1: the payload plane's symlink and exact-mode primitives
+// ---------------------------------------------------------------------------------------------
+
+/// Why [`PinnedDirectoryV1::create_new_symlink_child`] did not create a verified symlink.
+#[cfg(unix)]
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum SymlinkChildRefusalV1 {
+    /// The destination file system cannot hold this symlink: `symlinkat` refused it with
+    /// `ENAMETOOLONG`, before creating anything. macOS, for example, holds at most 1023 target
+    /// bytes where the frame format admits 4095. The target is never truncated and the entry is
+    /// never skipped.
+    #[error(
+        "{label}: the destination file system cannot hold this symlink ({target_len}-byte \
+         target): {source}"
+    )]
+    DestinationUnsupported {
+        label: String,
+        target_len: usize,
+        source: std::io::Error,
+    },
+    /// Every other refusal, in the shared primitive vocabulary: an occupied name is
+    /// [`FsCustodyError::TargetExists`], and an entry that is not the verified symlink is
+    /// [`FsCustodyError::IdentityChanged`].
+    #[error(transparent)]
+    Custody(#[from] FsCustodyError),
+}
+
+/// The verifying observation of a just-created symlink: a symlink, owned by the effective user,
+/// on its parent's device, whose size (a symlink's target length) is the target's. A pure
+/// predicate, like [`created_child_owner_and_mode_is_valid`], so the owner and device arms, which
+/// an unprivileged control cannot provoke through a real directory, are discriminated with
+/// injected observations.
+#[cfg(unix)]
+fn created_symlink_is_valid(
+    observed: &ChildStatV1,
+    owner: u32,
+    effective_uid: u32,
+    parent_dev: Option<u64>,
+    target_len: usize,
+) -> bool {
+    observed.kind == ChildKindV1::Symlink
+        && owner == effective_uid
+        && parent_dev == Some(observed.dev)
+        && u64::try_from(target_len).is_ok_and(|length| length == observed.size)
+}
+
+/// A point inside a 2B3c primitive where a control may change the tree.
+#[cfg(all(test, unix))]
+enum PayloadPrimitivePointV1<'a> {
+    /// `symlinkat` created the entry at this path; the verifying `fstatat` has not run.
+    SymlinkCreated(&'a Path),
+    /// `readlinkat` returned the target; the closing `fstatat` has not run.
+    TargetRead(&'a Path),
+    /// `fchmod` returned on this descriptor; the confirming `fstat` has not run.
+    ModeSet(&'a File),
+}
+
+#[cfg(all(test, unix))]
+type PayloadPrimitiveHookV1 = Box<dyn Fn(PayloadPrimitivePointV1<'_>)>;
+
+#[cfg(all(test, unix))]
+thread_local! {
+    static PAYLOAD_PRIMITIVE_HOOK: RefCell<Option<PayloadPrimitiveHookV1>> =
+        const { RefCell::new(None) };
+}
+
+#[cfg(all(test, unix))]
+struct PayloadPrimitiveHookGuardV1 {
+    previous: Option<PayloadPrimitiveHookV1>,
+}
+
+#[cfg(all(test, unix))]
+impl Drop for PayloadPrimitiveHookGuardV1 {
+    fn drop(&mut self) {
+        PAYLOAD_PRIMITIVE_HOOK.with(|hook| *hook.borrow_mut() = self.previous.take());
+    }
+}
+
+/// Install `hook` on this thread until the returned guard drops.
+#[cfg(all(test, unix))]
+fn install_payload_primitive_hook_for_test(
+    hook: PayloadPrimitiveHookV1,
+) -> PayloadPrimitiveHookGuardV1 {
+    let previous = PAYLOAD_PRIMITIVE_HOOK.with(|installed| installed.borrow_mut().replace(hook));
+    PayloadPrimitiveHookGuardV1 { previous }
+}
+
+#[cfg(all(test, unix))]
+fn run_payload_primitive_hook(point: PayloadPrimitivePointV1<'_>) {
+    PAYLOAD_PRIMITIVE_HOOK.with(|hook| {
+        if let Some(hook) = hook.borrow().as_ref() {
+            hook(point);
+        }
+    });
+}
+
+#[cfg(unix)]
+impl PinnedDirectoryV1 {
+    /// Create one symlink holding exactly `target` beneath this retained descriptor, and return
+    /// the no-follow observation that verified it.
+    ///
+    /// `symlinkat` is relative to the retained descriptor and never follows, replaces, or reuses
+    /// an existing entry: an occupied name (a file, a directory, or any symlink) refuses
+    /// [`FsCustodyError::TargetExists`]. A symlink has no descriptor to pin, so the created entry
+    /// is verified by name and bracketed like the walker's symlink read: a no-follow `fstatat`
+    /// must show a symlink owned by the effective user, on this directory's device, whose size is
+    /// the target's length; `readlinkat` must return exactly `target`; and a closing no-follow
+    /// `fstatat` must equal the first. Anything else refuses [`FsCustodyError::IdentityChanged`].
+    /// Nothing here follows the link.
+    ///
+    /// A target must be non-empty and hold no NUL byte (what `symlinkat` expresses alike on every
+    /// unix target). The destination file system's own limit is
+    /// [`SymlinkChildRefusalV1::DestinationUnsupported`]. As with
+    /// [`Self::create_new_regular_child`], the parent is not synced: durability is the caller's.
+    #[allow(dead_code)] // 2B3c's phase P lands in C2b.
+    pub(crate) fn create_new_symlink_child(
+        &self,
+        name: &OsStr,
+        target: &[u8],
+        label: &str,
+    ) -> Result<ChildStatV1, SymlinkChildRefusalV1> {
+        use std::os::fd::AsRawFd as _;
+
+        let child_name = child_name_cstring(name, label)?;
+        let target_c = CString::new(target)
+            .ok()
+            .filter(|target| !target.as_bytes().is_empty())
+            .ok_or_else(|| {
+                FsCustodyError::Unsupported(format!(
+                    "{label}: a symlink target must be non-empty and hold no NUL byte"
+                ))
+            })?;
+        // SAFETY: `geteuid` has no preconditions and only reads this process's effective uid; it
+        // runs first, so the errno read below is `symlinkat`'s. `self.file` is a live retained
+        // directory descriptor, and `target_c` and `child_name` are NUL-terminated C strings live
+        // for the call. `symlinkat` only creates a new entry; it never follows or replaces one.
+        let (effective_uid, status) = unsafe {
+            let effective_uid = libc::geteuid();
+            let status = libc::symlinkat(
+                target_c.as_ptr(),
+                self.file.as_raw_fd(),
+                child_name.as_ptr(),
+            );
+            (effective_uid, status)
+        };
+        if status == -1 {
+            let error = std::io::Error::last_os_error();
+            return Err(match error.raw_os_error() {
+                Some(libc::EEXIST) => FsCustodyError::TargetExists(label.to_owned()).into(),
+                Some(libc::ENAMETOOLONG) => SymlinkChildRefusalV1::DestinationUnsupported {
+                    label: label.to_owned(),
+                    target_len: target.len(),
+                    source: error,
+                },
+                _ => FsCustodyError::Io(label.to_owned(), error).into(),
+            });
+        }
+        #[cfg(test)]
+        run_payload_primitive_hook(PayloadPrimitivePointV1::SymlinkCreated(
+            &self.canonical_path.join(name),
+        ));
+
+        let changed = || FsCustodyError::IdentityChanged(label.to_owned());
+        let observe = || -> Result<Option<(ChildStatV1, u32)>, FsCustodyError> {
+            stat_child_no_follow(&self.file, &child_name)
+                .map_err(|error| FsCustodyError::Io(label.to_owned(), error))?
+                .map(|stat| {
+                    ChildStatV1::from_raw(&stat, label).map(|observed| (observed, stat.st_uid))
+                })
+                .transpose()
+        };
+        let (created, owner) = observe()?.ok_or_else(changed)?;
+        if !created_symlink_is_valid(
+            &created,
+            owner,
+            effective_uid,
+            self.identity.dev,
+            target.len(),
+        ) {
+            return Err(changed().into());
+        }
+        let read = match self.read_child_symlink(name, target.len(), label) {
+            Ok(read) => read,
+            // A longer target is another link, never a truncated match.
+            Err(FsCustodyError::Unsupported(_)) => return Err(changed().into()),
+            Err(error) => return Err(error.into()),
+        };
+        #[cfg(test)]
+        run_payload_primitive_hook(PayloadPrimitivePointV1::TargetRead(
+            &self.canonical_path.join(name),
+        ));
+        let closing = observe()?.map(|(observed, _)| observed);
+        if read != target || closing != Some(created) {
+            return Err(changed().into());
+        }
+        Ok(created)
+    }
+
+    /// Set exactly `mode` on this pinned directory through its retained descriptor, then confirm
+    /// it, as [`set_exact_file_mode`] does for a file.
+    #[allow(dead_code)] // 2B3c's terminal gate lands in C3.
+    pub(crate) fn set_exact_mode(&self, mode: u32, label: &str) -> Result<(), FsCustodyError> {
+        set_exact_file_mode(&self.file, mode, label)
+    }
+}
+
+/// Set exactly `mode` on the object behind `file` with `fchmod` through that descriptor
+/// ([`File::set_permissions`]), then confirm it with `fstat` of the same descriptor. Never a
+/// path-based chmod, so a name re-pointed at a decoy cannot redirect it; and a mode change is not
+/// subject to the umask. `mode` is permission bits only: setuid, setgid, sticky, or any higher bit
+/// refuses [`FsCustodyError::Unsupported`] before anything changes. Any other mode observed after
+/// the `fchmod` refuses [`FsCustodyError::IdentityChanged`].
+#[cfg(unix)]
+#[allow(dead_code)] // 2B3c's terminal gate lands in C3.
+pub(crate) fn set_exact_file_mode(
+    file: &File,
+    mode: u32,
+    label: &str,
+) -> Result<(), FsCustodyError> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    if mode & !0o777 != 0 {
+        return Err(FsCustodyError::Unsupported(format!(
+            "{label}: mode {mode:#o} is not permission bits only"
+        )));
+    }
+    let io = |error| FsCustodyError::Io(label.to_owned(), error);
+    file.set_permissions(std::fs::Permissions::from_mode(mode))
+        .map_err(io)?;
+    #[cfg(test)]
+    run_payload_primitive_hook(PayloadPrimitivePointV1::ModeSet(file));
+    let observed = ChildStatV1::from_metadata(&file.metadata().map_err(io)?).mode;
+    if observed != mode {
+        return Err(FsCustodyError::IdentityChanged(format!(
+            "{label}: the mode reads {observed:04o} after {mode:04o} was set"
+        )));
+    }
+    Ok(())
+}
+
 pub type ObjectIdentityV2 = RequiredObjectIdentityV2;
 
 #[derive(Clone, Debug)]
@@ -8335,3 +8576,9 @@ mod tests {
         }
     }
 }
+
+// ADR-0041 slice 2B3c C1: the payload plane's symlink and exact-mode primitive controls, and the
+// 2B3c new-unsafe inventory.
+#[cfg(all(test, unix))]
+#[path = "fs_custody_payload_tests.rs"]
+mod payload_primitive_tests;

@@ -123,6 +123,14 @@ release (see [`docs/adr/`](docs/adr/) for the full architectural record).
   ended with neither, and the coordinator's check after the turn could panic the same way. Both now
   record the process's liveness as `unknown`: they saw no exit status, and the termination may
   still be reaping the child.
+- A served unary `message/send` turn now records turn metrics like a streaming one (#47): one
+  turn-started event, then exactly one turn-finished (`success`, `failed`, or `canceled` for an
+  abort or a caller that disconnects mid-turn) and one final-usage event with the turn's last usage
+  snapshot. It previously recorded none, so unary turns were missing from the turn log, latency,
+  outcome and usage metrics, and `bridge_turns_in_flight`. Separately, a `/rename` at session mint
+  that the adapter answers with success after the connection was fenced is now traced as
+  `acp.session_rename_interrupted` (WARN), like a late error or timeout, instead of
+  `acp.session_rename_acknowledged`.
 
 ## [0.3.1] - 2026-07-30
 

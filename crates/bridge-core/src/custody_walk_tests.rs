@@ -528,6 +528,9 @@ fn unsafe_inventory_pins_the_new_2b2b2a_sites_and_their_files() {
     for (function, count) in &added {
         assert_eq!(fs_inventory.remove(function), Some(*count), "{function}");
     }
+    // ADR-0041 2B3c C1 adds exactly one later site, the symlink primitive's `symlinkat`, pinned by
+    // `fs_custody::payload_primitive_tests::unsafe_inventory_pins_the_2b3c_symlink_site`.
+    assert_eq!(fs_inventory.remove("create_new_symlink_child"), Some(1));
     // Every other `fs_custody.rs` site is the one 2B2a's A14 control pins, unchanged.
     let predecessor = BTreeMap::from([
         (
