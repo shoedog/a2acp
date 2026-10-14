@@ -20,6 +20,13 @@
 - **Active slice:** **ADR-0041 Slice 2B3 (inert new-root restore and hidden-state proof).** Its design is
   `docs/superpowers/specs/2026-09-27-adr0041-slice2b3-restore-design.md` (PR #123). It has four serial children:
   2B3a reader → 2B3b Git plane → 2B3c payload plane → 2B3d record and joint fixture.
+  - **2B3b is merged** in PR #137 at `4fcda06d` (2026-10-14): the phase-G Git plane, crate-private and
+    production-unwired. It landed after the owner accepted the B2c literal correction without a third source review,
+    the first native macOS run surfaced 13 test-only portability failures (no production defect), the test-only
+    repair `f3d0fac1` (codex `gpt-6.1-sol`) passed `bridge-core` on macOS 1,604/0 twice, one combined Sol review of
+    the whole slice returned APPROVE with no findings, and Linux CI passed. Custody bundles and gate logs:
+    `~/.a2a-dispatch/adr0041-2b3b-custody/`. **Next: 2B3c (payload plane) spec.** The 2B3b history below is kept as
+    the lane record.
   - **2B3a is merged** in PR #125 at `b7c85aee`. It is the phase-V verify-and-stage reader, and it is crate-private
     and production-unwired.
     - The Sol spec review went REJECT, then APPROVE.
