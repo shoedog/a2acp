@@ -574,6 +574,73 @@ fn provider_identity_separates_selection_order_effect_changes_and_presentation_e
     assert_eq!(base.frozen, presentation.frozen);
 }
 
+/// `rename_new_sessions` changes what the provider is sent before a turn, so it is part of the
+/// frozen provider-effect identity. Only `true` is encoded: an entry that leaves it off keeps
+/// exactly the digest it had before the field existed, or every identity a running serve has
+/// already persisted would stop matching its own config across the upgrade.
+///
+/// The two literals were computed on the commit before the field was added (`1d7a5a68`), for
+/// these same inputs, and pasted here: one per commitment form, the plain digest of an entry
+/// with no MCP secret and the keyed one. A red on either means persisted provider-effect
+/// identities no longer validate, which needs an explicit compatibility ruling.
+#[test]
+fn rename_new_sessions_joins_the_effect_digest_only_when_it_is_on() {
+    let mut keyed_entry = provider_entry();
+    keyed_entry.cmd = Some("codex-acp".into());
+    let mut plain_entry = keyed_entry.clone();
+    plain_entry.mcp.clear();
+    let key = ProviderEffectKeyV1::from_bytes([9_u8; 32]);
+    let worktree =
+        freeze_worktree_checkout_v1(&checkout_input(FrozenProviderLogicalSessionV1::Execute {
+            candidate_ordinal: 0,
+        }))
+        .unwrap();
+    let direct = freeze_direct_checkout_v1(SessionCwd::parse("/repo").unwrap());
+
+    for (entry, checkout, key, digest_before_the_field) in [
+        (
+            &plain_entry,
+            direct,
+            None,
+            "804620bd39ceb58b6f5d329a36ed91a8aab7a033055bc7c505ebb7ceada0529f",
+        ),
+        (
+            &keyed_entry,
+            worktree,
+            Some(&key),
+            "acb2872723823babf3e46163e184e750d141586e09678b4d1fef111ccfe77f2f",
+        ),
+    ] {
+        assert!(!entry.rename_new_sessions);
+        let off = freeze_provider_attempt_v1(&provider_freeze_input(entry, checkout.clone(), key))
+            .unwrap();
+        assert_eq!(
+            off.frozen.effect.effect_digest.as_str(),
+            digest_before_the_field
+        );
+
+        let mut renaming_entry = entry.clone();
+        renaming_entry.rename_new_sessions = true;
+        let on = freeze_provider_attempt_v1(&provider_freeze_input(&renaming_entry, checkout, key))
+            .unwrap();
+        assert_ne!(
+            off.frozen.effect.effect_digest,
+            on.frozen.effect.effect_digest
+        );
+        assert_ne!(
+            off.frozen.attempt_fingerprint,
+            on.frozen.attempt_fingerprint
+        );
+        // Nothing else of the identity moves with the flag.
+        assert_eq!(off.selection, on.selection);
+        assert_eq!(off.frozen.checkout, on.frozen.checkout);
+        assert_eq!(
+            off.frozen.effect.mcp_delivery_digest,
+            on.frozen.effect.mcp_delivery_digest
+        );
+    }
+}
+
 struct LegacyBackend;
 
 #[async_trait::async_trait]

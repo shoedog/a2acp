@@ -81,15 +81,13 @@ the bridge sends the adapter's own slash command `/rename <name>` once to each a
 before the session serves a turn. The adapter answers it locally, without a model turn, and then skips
 title generation. The name is the bridge session key with every character outside `[A-Za-z0-9._:@-]`
 replaced by `_`, cut to 96 characters; the thread appears under that name in codex's own session list.
-The rename is best-effort and bounded at 5 s: one that is refused, unanswered or cut off is traced
-(`acp.session_rename_*`) and the session is served as it is. A rename still unanswered at 5 s does not
-hold the mint up further, but the session's first turn does not start alongside it, because output the
-adapter still sent for the rename could not be told apart from the turn's own: the bridge sends
-`session/cancel` and gives the adapter one cancel grace (5 s) to answer before the turn starts
-regardless. The field defaults false and is rejected for
-any other `cmd`, including a wrapper script that launches `codex-acp` under another file name, because
-another adapter would hand the text to its model as a prompt. It is tied to the adapter versions it was
-measured on; read the
+The rename is best-effort, a single attempt bounded at 5 s: one that is refused, unanswered or cut off
+is traced (`acp.session_rename_*`) and the same session is served as it is. A rename still unanswered
+at 5 s is not waited on or cancelled, so output the adapter sends late for it can reach the session's
+first turn; the tested adapter versions answer `/rename` in well under a second. The field defaults
+false and is rejected for any other `cmd`, including a wrapper script that launches `codex-acp` under
+another file name, because another adapter would hand the text to its model as a prompt. It is tied to
+the adapter versions it was measured on; read the
 [compatibility note](compatibility.md#codex-acp-title-generation-thread-and-rename_new_sessions--2026-10-13)
 before enabling it on a different version. Model-catalog probes never rename.
 

@@ -113,9 +113,7 @@ const DEFAULT_CANCEL_GRACE: std::time::Duration = std::time::Duration::from_secs
 /// Default bound on the `/rename` exchange that names a newly minted agent
 /// session (see [`AcpConfig::rename_new_sessions`]). The adapter answers the
 /// command locally in well under a second; on elapse the mint goes on to
-/// publish the session rather than wait for an adapter that is not answering,
-/// and leaves the unanswered rename for the session's first turn to see
-/// through (see [`AcpBackend::settle_unanswered_rename`]).
+/// publish the session rather than wait for an adapter that is not answering.
 const DEFAULT_RENAME_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// The longest name [`AcpBackend::rename_session_name`] derives.
@@ -929,13 +927,6 @@ enum AcpTraceEvent {
     SessionRenameUnanswered {
         owner_key_fingerprint: i64,
     },
-    /// A turn was about to start on a session whose rename was still
-    /// unanswered. The adapter was sent `session/cancel` and, one cancel
-    /// grace later, had still not answered the rename, so the turn stopped
-    /// waiting and started alongside it.
-    SessionRenameUnsettled {
-        owner_key_fingerprint: i64,
-    },
     /// The connection was fenced while the rename waited for its answer.
     SessionRenameInterrupted {
         owner_key_fingerprint: i64,
@@ -1137,13 +1128,6 @@ impl AcpTraceEvent {
                 owner_key_fingerprint,
                 "ACP lifecycle metadata"
             ),
-            Self::SessionRenameUnsettled {
-                owner_key_fingerprint,
-            } => tracing::warn!(
-                event = "acp.session_rename_unsettled",
-                owner_key_fingerprint,
-                "ACP lifecycle metadata"
-            ),
             Self::SessionRenameInterrupted {
                 owner_key_fingerprint,
             } => tracing::warn!(
@@ -1242,14 +1226,16 @@ pub struct AcpConfig {
     /// first turn: a thread the bridge has no id for and cannot close, whose
     /// MCP server processes live until the adapter exits.
     ///
-    /// Best effort: a rename that is refused, unanswered or cut off never
-    /// fails the mint, and one still unanswered when its bound runs out does
-    /// not hold it up either: the session is published as it is. Its first
-    /// turn then waits, for one [`Self::cancel_grace`] at most, until the
-    /// adapter is done with the rename, because an update the adapter sent
-    /// for the rename afterwards could not be told apart from the turn's
-    /// own. Off by default, and only for `codex-acp`: any other adapter
-    /// would hand the text to its model as a real prompt.
+    /// Best effort and one attempt: a rename that is refused, unanswered or
+    /// cut off never fails the mint, and whatever comes of it the same
+    /// session is published as it would be without the step. The backend
+    /// keeps no state for the rename once the mint has moved on. Until the
+    /// exchange has ended, answered or at its bound, the id is unpublished
+    /// and has no update route, so what the adapter sends for the session
+    /// reaches no turn. Only what it sends late, for a rename it left
+    /// unanswered past the bound, can reach the session's first turn. Off by
+    /// default, and only for `codex-acp`: any other adapter would hand the
+    /// text to its model as a real prompt.
     pub rename_new_sessions: bool,
     /// Bound on the wait for that rename's answer. Defaults to
     /// [`DEFAULT_RENAME_TIMEOUT`]; tests override it to a short value to
@@ -1492,11 +1478,6 @@ fn no_attestation_reason_from_wire(raw: &str) -> Option<NoAttestationReason> {
 // handler only does a `get` + non-blocking `send` under it, never awaits while
 // holding it, so a non-async lock is correct and avoids `.await` in the handler.
 type UpdateSender = mpsc::UnboundedSender<TurnEvent>;
-/// The answer to a rename that a mint stopped waiting for. It resolves once
-/// the adapter has answered the request, to `Err` with the JSON-RPC code when
-/// that answer is an error or the connection took the request down. Shared,
-/// so that each turn it holds back can wait on it in its own time.
-type RenameAnswer = futures::future::Shared<futures::future::BoxFuture<'static, Result<(), i64>>>;
 type UpdateRegistry = Arc<StdMutex<HashMap<AgentSessionId, TurnRoute>>>;
 type EvidenceTombstoneKey = (AgentSessionId, String);
 type EvidenceTombstones = Arc<StdMutex<HashMap<EvidenceTombstoneKey, EvidenceTombstone>>>;
@@ -2110,14 +2091,6 @@ struct AgentSession {
     /// actually killed; the kill switch is what makes the in-process transport —
     /// which has no process to kill — unblock deterministically too.)
     turn_kill: Arc<StdMutex<Option<Arc<tokio::sync::Notify>>>>,
-    /// The rename this session's mint stopped waiting for when its bound ran
-    /// out (see [`AcpConfig::rename_new_sessions`]), until a turn has seen it
-    /// through. While it is here the adapter may still send updates for the
-    /// rename, and an update names its session, not its request: a turn must
-    /// not install its route alongside it (see
-    /// [`AcpBackend::settle_unanswered_rename`]). Set before the id is
-    /// published, so whoever can see the id can see this.
-    unanswered_rename: StdMutex<Option<RenameAnswer>>,
 }
 
 /// Which agent sessions one bridge session minted beyond its published
@@ -2156,18 +2129,11 @@ impl AgentSession {
             config_surface: StdMutex::new(None),
             cancel_requested: AtomicBool::new(false),
             turn_kill: Arc::new(StdMutex::new(None)),
-            unanswered_rename: StdMutex::new(None),
         }
     }
 
     fn minted(&self) -> std::sync::MutexGuard<'_, MintLedger> {
         self.minted
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-    }
-
-    fn unanswered_rename(&self) -> std::sync::MutexGuard<'_, Option<RenameAnswer>> {
-        self.unanswered_rename
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
@@ -3084,13 +3050,9 @@ impl AcpBackend {
     /// Best effort, sent once and never retried. The request goes out under
     /// the dispatch gate, so none is sent on a connection that is already
     /// fenced, and its answer is awaited for at most `bound`. Emits the one
-    /// typed outcome; the caller publishes the session whatever that is.
-    ///
-    /// Returns the answer still to come when the bound ran out with the
-    /// rename unanswered on a usable connection, and `None` in every other
-    /// case: the rename was answered either way, none was sent, or the
-    /// connection is fenced and admits no turn again. The caller leaves an
-    /// answer still to come with the session, for its first turn to wait on.
+    /// typed outcome and keeps nothing: the caller publishes the session
+    /// whatever that outcome is, and an answer that comes after the bound is
+    /// dropped with the request.
     async fn rename_minted_session(
         cx: &ConnectionTo<Agent>,
         dispatch_gate: &Arc<StdMutex<()>>,
@@ -3098,9 +3060,7 @@ impl AcpBackend {
         agent_id: AgentSessionId,
         key: &SessionId,
         bound: Duration,
-    ) -> Option<RenameAnswer> {
-        use futures::FutureExt as _;
-
+    ) {
         let owner_key_fingerprint = AcpTraceEvent::owner_key_fingerprint(key.as_str());
         let sent = {
             // Same short, non-awaiting gate as prompt installation: once
@@ -3111,107 +3071,32 @@ impl AcpBackend {
             (!unavailable.load(Ordering::SeqCst))
                 .then(|| cx.send_request(Self::rename_session_request(agent_id, key)))
         };
-        let (outcome, unanswered) = match sent {
-            None => (
-                AcpTraceEvent::SessionRenameSkipped {
+        let outcome = match sent {
+            None => AcpTraceEvent::SessionRenameSkipped {
+                owner_key_fingerprint,
+            },
+            Some(sent) => match tokio::time::timeout(bound, sent.block_task()).await {
+                Ok(Ok(_)) => AcpTraceEvent::SessionRenameAcknowledged {
                     owner_key_fingerprint,
                 },
-                None,
-            ),
-            Some(sent) => {
-                let answer: RenameAnswer = sent
-                    .block_task()
-                    .map(|answer| match answer {
-                        Ok(_) => Ok(()),
-                        Err(error) => Err(Self::error_code_i64(error.code)),
-                    })
-                    .boxed()
-                    .shared();
-                match tokio::time::timeout(bound, answer.clone()).await {
-                    Ok(Ok(())) => (
-                        AcpTraceEvent::SessionRenameAcknowledged {
-                            owner_key_fingerprint,
-                        },
-                        None,
-                    ),
-                    // Retirement or escalation fails or starves a request
-                    // already on the wire. That is this bridge's own teardown,
-                    // not the adapter's verdict on the rename.
-                    _ if unavailable.load(Ordering::SeqCst) => (
-                        AcpTraceEvent::SessionRenameInterrupted {
-                            owner_key_fingerprint,
-                        },
-                        None,
-                    ),
-                    Ok(Err(rpc_code)) => (
-                        AcpTraceEvent::SessionRenameRejected {
-                            owner_key_fingerprint,
-                            rpc_code,
-                        },
-                        None,
-                    ),
-                    Err(_) => (
-                        AcpTraceEvent::SessionRenameUnanswered {
-                            owner_key_fingerprint,
-                        },
-                        Some(answer),
-                    ),
+                // Retirement or escalation fails or starves a request
+                // already on the wire. That is this bridge's own teardown,
+                // not the adapter's verdict on the rename.
+                _ if unavailable.load(Ordering::SeqCst) => {
+                    AcpTraceEvent::SessionRenameInterrupted {
+                        owner_key_fingerprint,
+                    }
                 }
-            }
+                Ok(Err(error)) => AcpTraceEvent::SessionRenameRejected {
+                    owner_key_fingerprint,
+                    rpc_code: Self::error_code_i64(error.code),
+                },
+                Err(_) => AcpTraceEvent::SessionRenameUnanswered {
+                    owner_key_fingerprint,
+                },
+            },
         };
         outcome.emit();
-        unanswered
-    }
-
-    /// Hold a turn back while the rename that its session's mint stopped
-    /// waiting for is still unanswered (see
-    /// [`AcpConfig::rename_new_sessions`]). Returns at once for every other
-    /// session.
-    ///
-    /// An update names its session, not its request. Once the turn has a
-    /// route, anything the adapter still sent for the rename would be taken
-    /// for the turn's own output and counted as its usage. So the turn
-    /// installs no route until the rename is over, and until then the
-    /// notification handler drops what arrives for the session, as it did
-    /// while the mint was waiting. The caller holds the turn lock, so every
-    /// later turn queues behind this wait.
-    ///
-    /// The wait has a bound, because a rename may never be answered and the
-    /// session still has to serve its turns. The adapter is told to end the
-    /// request with `session/cancel` and given one cancel grace to answer
-    /// it. An adapter that has by then neither answered the rename nor
-    /// honoured its cancel is not waited on any longer: the turn starts, and
-    /// the one typed outcome records that it started alongside an unanswered
-    /// rename. Only output that such an adapter sends for the rename after
-    /// that can still reach a turn.
-    async fn settle_unanswered_rename(
-        &self,
-        key: &SessionId,
-        entry: &AgentSession,
-        agent_id: &AgentSessionId,
-    ) {
-        use futures::FutureExt as _;
-
-        // Cloned out and left in place: a caller dropped in the middle of
-        // this wait must not let the next turn through without one.
-        let Some(answer) = entry.unanswered_rename().clone() else {
-            return;
-        };
-        if answer.clone().now_or_never().is_none() {
-            if let Ok(cx) = self.cx() {
-                let _ = cx.send_notification(CancelNotification::new(agent_id.clone()));
-            }
-            if tokio::time::timeout(self.cancel_grace(), answer)
-                .await
-                .is_err()
-            {
-                AcpTraceEvent::SessionRenameUnsettled {
-                    owner_key_fingerprint: AcpTraceEvent::owner_key_fingerprint(key.as_str()),
-                }
-                .emit();
-            }
-        }
-        *entry.unanswered_rename() = None;
     }
 
     #[cfg(test)]
@@ -5904,13 +5789,12 @@ impl AcpBackend {
 
                         // (5) Name the session, for an adapter that is opted in. Last of
                         // the setup, on an id nobody else can see yet, and best effort:
-                        // whatever comes of it, the mint goes on to publish. A release
-                        // that overtakes the mint here finds the id with `abandoned_mint`,
-                        // as it would during any earlier step. A rename still unanswered
-                        // at its bound goes with the session, where its first turn sees
-                        // it through before anything the adapter sends can reach a turn.
+                        // one attempt, and whatever comes of it the mint goes on to
+                        // publish this same session. A release that overtakes the mint
+                        // here finds the id with `abandoned_mint`, as it would during
+                        // any earlier step.
                         if let Some(bound) = rename_bound_for_mint {
-                            let unanswered = Self::rename_minted_session(
+                            Self::rename_minted_session(
                                 &cx,
                                 &dispatch_gate_for_init,
                                 &unavailable_for_init,
@@ -5919,7 +5803,6 @@ impl AcpBackend {
                                 bound,
                             )
                             .await;
-                            *entry.unanswered_rename() = unanswered;
                         }
 
                         // (6) Publish the id, recording with it the cwd that was actually
@@ -7213,11 +7096,6 @@ impl AcpBackend {
         // that escalates the shared connection. Revalidate after acquiring the
         // lock so that queued caller cannot dispatch onto a killed/fenced agent.
         self.require_prompt_connection(&lifecycle).await?;
-        // The mint may have stopped waiting for this session's rename. Under
-        // the turn lock and ahead of the route, the turn waits until the
-        // adapter is done with it.
-        self.settle_unanswered_rename(session, &entry, &agent_id)
-            .await;
         lifecycle
             .record(
                 DiagnosticPhase::PromptStart,
@@ -12155,13 +12033,6 @@ mod tests {
         /// Fires once the agent is done with a `/rename`: its updates are
         /// sent, and its answer too unless it is one that never comes.
         rename_settled: Arc<Notify>,
-        /// When set, a gated `/rename` also ends when a `session/cancel`
-        /// arrives, and is then answered as cancelled.
-        rename_honours_cancel: Arc<AtomicBool>,
-        /// Fires when a `session/cancel` is recorded, for a gated `/rename`
-        /// to await (separate from `cancel_seen` and `cancel_arrived`, so
-        /// that none consumes another's permit).
-        rename_cancel: Arc<Notify>,
     }
 
     impl Recorder {
@@ -12252,8 +12123,6 @@ mod tests {
                 rename_gate: Arc::new(Notify::new()),
                 rename_chatter: Arc::new(AtomicBool::new(false)),
                 rename_settled: Arc::new(Notify::new()),
-                rename_honours_cancel: Arc::new(AtomicBool::new(false)),
-                rename_cancel: Arc::new(Notify::new()),
             }
         }
 
@@ -12950,16 +12819,8 @@ mod tests {
                                 let cx2 = cx.clone();
                                 r.rename_seen.notify_one();
                                 cx.spawn(async move {
-                                    let mut cancelled = false;
                                     if r.gate_rename.load(Ordering::SeqCst) {
-                                        if r.rename_honours_cancel.load(Ordering::SeqCst) {
-                                            tokio::select! {
-                                                _ = r.rename_gate.notified() => {}
-                                                _ = r.rename_cancel.notified() => cancelled = true,
-                                            }
-                                        } else {
-                                            r.rename_gate.notified().await;
-                                        }
+                                        r.rename_gate.notified().await;
                                     }
                                     let mut updates = vec![SessionUpdate::SessionInfoUpdate(
                                         SessionInfoUpdate::new().title(title),
@@ -12982,10 +12843,7 @@ mod tests {
                                             update,
                                         ))?;
                                     }
-                                    if cancelled {
-                                        responder
-                                            .respond(PromptResponse::new(StopReason::Cancelled))?;
-                                    } else if r.hang_rename.load(Ordering::SeqCst) {
+                                    if r.hang_rename.load(Ordering::SeqCst) {
                                         // Dropping the responder sends nothing: the
                                         // request stays unanswered for the connection's life.
                                         drop(responder);
@@ -13170,7 +13028,6 @@ mod tests {
                             r.cancels.lock().await.push(id);
                             r.cancel_seen.notify_one();
                             r.cancel_arrived.notify_one();
-                            r.rename_cancel.notify_one();
                             Ok(())
                         }
                     },
@@ -21540,7 +21397,7 @@ mod tests {
     }
 
     /// Start a turn for `session` as a task of its own, for a test that has
-    /// to act while the turn is still held back from starting.
+    /// to act while the turn is under way.
     fn spawn_turn(backend: &Arc<AcpBackend>, session: &SessionId, text: &str) -> Prompt {
         let backend = Arc::clone(backend);
         let session = session.clone();
@@ -21753,17 +21610,56 @@ mod tests {
         assert_eq!(rec.new_session_calls.load(Ordering::SeqCst), 1);
         assert!(
             rec.cancels.lock().await.is_empty(),
-            "a rename that was answered leaves the first turn nothing to see through"
+            "a rejected rename is not followed up with a cancel"
         );
         trace.assert_one("WARN", "acp.session_rename_rejected");
     }
 
+    /// `entry` holds the session it published as `agent_id` and nothing of a
+    /// mint or a turn in flight: both locks are free and every slot that one
+    /// of them fills is empty. The pattern names every field, so one added to
+    /// carry something from a mint over to a later turn has to be accounted
+    /// for here.
+    async fn assert_entry_holds_only_its_session(entry: &AgentSession, agent_id: &str) {
+        let AgentSession {
+            agent_id: published,
+            minted,
+            init_lock,
+            minted_cwd,
+            active_mint_cwd,
+            turn_lock,
+            turn_accepted,
+            config_surface,
+            cancel_requested,
+            turn_kill,
+        } = entry;
+        // A turn's driver lets go of the session just after its stream ends.
+        drop(
+            tokio::time::timeout(Duration::from_secs(2), turn_lock.lock())
+                .await
+                .expect("no turn may hold the session"),
+        );
+        assert!(init_lock.try_lock().is_ok(), "no mint may be in flight");
+        assert_eq!(published.get().map(|id| id.0.as_ref()), Some(agent_id));
+        assert!(minted_cwd.get().is_some());
+        assert!(config_surface.lock().unwrap().is_some());
+        assert!(active_mint_cwd.lock().unwrap().is_none());
+        let ledger = minted.lock().unwrap();
+        assert!(!ledger.released);
+        assert!(ledger.abandoned.is_empty());
+        assert!(ledger.late_closer.is_none());
+        assert!(turn_accepted.lock().unwrap().is_none());
+        assert!(turn_kill.lock().unwrap().is_none());
+        assert!(!cancel_requested.load(Ordering::SeqCst));
+    }
+
     #[tokio::test(flavor = "current_thread")]
-    async fn unanswered_rename_delays_the_mint_by_its_bound_and_publishes_the_same_session() {
+    async fn unanswered_rename_ends_at_its_bound_and_the_same_session_serves_the_first_turn() {
         let bound = Duration::from_millis(200);
         let rec = Recorder::advertising_close("agent-sess-RENAME-HANG");
         rec.unique_minted_ids.store(true, Ordering::SeqCst);
         rec.hang_rename.store(true, Ordering::SeqCst);
+        rec.set_updates(vec![ScriptedUpdate::Text("real")]).await;
         let (backend, trace) = connect_renaming(
             &rec,
             AcpConfig {
@@ -21775,8 +21671,10 @@ mod tests {
         let session = bkey("bridge-RENAME-HANG");
         let minted_id = "agent-sess-RENAME-HANG-1".to_string();
 
-        // With the clock paused, time advances only once every task is idle:
-        // the mint waits on the missing answer until its bound is spent.
+        // With the clock paused, time advances only once every task is idle,
+        // and then no further than the next timer: the mint waits on the
+        // missing answer until its bound is spent, and a turn that waits on
+        // no timer takes no time at all.
         tokio::time::pause();
         let started = tokio::time::Instant::now();
         let mint: Mint = {
@@ -21793,7 +21691,6 @@ mod tests {
             .expect("an unanswered rename must not hang the mint")
             .unwrap();
         let waited = started.elapsed();
-        tokio::time::resume();
 
         assert_eq!(
             minted
@@ -21801,32 +21698,54 @@ mod tests {
                 .0
                 .as_ref(),
             minted_id,
-            "the mint publishes the session it created"
+            "the mint publishes the session that `session/new` returned"
         );
+        // The timer fires on the first millisecond tick at or past the bound.
         assert!(
-            (bound..bound * 2).contains(&waited),
+            (bound..=bound + Duration::from_millis(1)).contains(&waited),
             "the mint waited {waited:?} on the rename; it must wait out the \
              {bound:?} bound and no longer"
         );
         assert!(backend.session_catalog(&session).is_some());
+        let entry = backend.session_entry(&session).await.unwrap();
+        assert_entry_holds_only_its_session(&entry, &minted_id).await;
+        assert!(
+            backend.updates().unwrap().lock().unwrap().is_empty(),
+            "the rename must not leave an update route behind"
+        );
+
+        // The first turn goes straight out to the session that was minted.
+        let started = tokio::time::Instant::now();
+        let first = run_turn(&backend, &session, "first").await;
+        let turn_took = started.elapsed();
+        tokio::time::resume();
+
+        assert_plain_turn(&first, &["real"]);
         assert_eq!(
-            backend.ensure_session(&session).await.unwrap().0.as_ref(),
-            minted_id
+            turn_took,
+            Duration::ZERO,
+            "nothing may hold the first turn back after an unanswered rename"
         );
         settle_recording_agent(&backend).await;
+        assert_eq!(
+            *rec.wire_log.lock().await,
+            ["session/new", "session/prompt", "session/prompt"],
+            "one `session/new`, one rename, then the turn, and no `session/cancel`"
+        );
         assert_eq!(rec.new_session_calls.load(Ordering::SeqCst), 1);
         assert_eq!(
             *rec.prompts.lock().await,
-            [(
-                minted_id.clone(),
-                one_text_block("/rename bridge-RENAME-HANG")
-            )],
-            "one rename, not retried"
+            [
+                (
+                    minted_id.clone(),
+                    one_text_block("/rename bridge-RENAME-HANG")
+                ),
+                (minted_id.clone(), one_text_block("first")),
+            ],
+            "one rename, not retried, and the turn on the session that was minted"
         );
-        assert!(
-            rec.cancels.lock().await.is_empty(),
-            "the mint itself cancels nothing"
-        );
+        assert!(rec.cancels.lock().await.is_empty());
+        assert_entry_holds_only_its_session(&entry, &minted_id).await;
         trace.assert_one("WARN", "acp.session_rename_unanswered");
 
         // The session is the bridge session's own, unanswered rename and
@@ -21837,238 +21756,12 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn turn_after_a_never_answered_rename_waits_one_cancel_grace_and_then_starts() {
-        let bound = Duration::from_millis(100);
-        let grace = Duration::from_millis(300);
-        let rec = Recorder::new("agent-sess-RENAME-NEVER");
-        rec.hang_rename.store(true, Ordering::SeqCst);
-        rec.set_updates(vec![ScriptedUpdate::Text("real")]).await;
-        let (backend, trace) = connect_renaming(
-            &rec,
-            AcpConfig {
-                rename_timeout: bound,
-                cancel_grace: grace,
-                ..test_config()
-            },
-        )
-        .await;
-        let session = bkey("bridge-RENAME-NEVER");
-        let agent_id = "agent-sess-RENAME-NEVER".to_string();
-
-        // With the clock paused, time advances only once every task is idle,
-        // so each wait below is seen at exactly its length.
-        tokio::time::pause();
-        backend
-            .ensure_session(&session)
-            .await
-            .expect("an unanswered rename must not fail the mint");
-        let started = tokio::time::Instant::now();
-        let first = run_turn(&backend, &session, "first").await;
-        let held_back = started.elapsed();
-        let started = tokio::time::Instant::now();
-        let second = run_turn(&backend, &session, "second").await;
-        let not_held_back = started.elapsed();
-        tokio::time::resume();
-
-        assert_plain_turn(&first, &["real"]);
-        assert!(
-            (grace..grace * 2).contains(&held_back),
-            "the first turn was held back {held_back:?}; it must give the adapter \
-             the {grace:?} cancel grace to end the rename and no longer"
-        );
-        assert_plain_turn(&second, &["real"]);
-        assert!(
-            not_held_back < grace,
-            "a rename that was given up on must not hold a later turn back"
-        );
-
-        settle_recording_agent(&backend).await;
-        assert_eq!(
-            *rec.wire_log.lock().await,
-            [
-                "session/new",
-                "session/prompt",
-                "session/cancel",
-                "session/prompt",
-                "session/prompt",
-            ],
-            "the adapter is told once to end the rename, ahead of the first turn"
-        );
-        assert_eq!(*rec.cancels.lock().await, vec![agent_id.clone()]);
-        assert_eq!(
-            *rec.prompts.lock().await,
-            [
-                (
-                    agent_id.clone(),
-                    one_text_block("/rename bridge-RENAME-NEVER")
-                ),
-                (agent_id.clone(), one_text_block("first")),
-                (agent_id, one_text_block("second")),
-            ],
-            "the turns are served by the session that was minted, and nothing is retried"
-        );
-        trace.assert_events(&[
-            ("WARN", "acp.session_rename_unanswered"),
-            ("WARN", "acp.session_rename_unsettled"),
-        ]);
-    }
-
-    /// How an adapter that left a rename unanswered past its bound gets
-    /// round to it once a turn is waiting on it.
-    #[derive(Clone, Copy, Debug, PartialEq)]
-    enum LateRename {
-        /// It answers of its own accord.
-        Answers,
-        /// It answers because it is told to cancel.
-        AnswersToCancel,
-        /// It sends what it has for the rename and never answers.
-        NeverAnswers,
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn late_output_of_an_unanswered_rename_reaches_no_turn() {
-        // Whether the adapter answers the rename late, or never answers it
-        // and still has output for it.
-        for never_answers in [false, true] {
-            let rec = Recorder::new("agent-sess-RENAME-LATE");
-            rec.gate_rename.store(true, Ordering::SeqCst);
-            rec.hang_rename.store(never_answers, Ordering::SeqCst);
-            rec.rename_chatter.store(true, Ordering::SeqCst);
-            // A turn that did start alongside the rename would still be open
-            // when the rename's output arrives: it ends only when let go.
-            rec.gate_prompt.store(true, Ordering::SeqCst);
-            rec.set_updates(vec![ScriptedUpdate::Text("real")]).await;
-            let (backend, _trace) = connect_renaming(
-                &rec,
-                AcpConfig {
-                    rename_timeout: Duration::from_millis(50),
-                    ..test_config()
-                },
-            )
-            .await;
-            let session = bkey("bridge-RENAME-LATE");
-
-            // With the clock paused, no bound runs out on the turn below
-            // before the adapter has sent what it has.
-            tokio::time::pause();
-            backend
-                .ensure_session(&session)
-                .await
-                .expect("an unanswered rename must not fail the mint");
-
-            // The rename has outlived its bound, and the first turn is asked
-            // for. One way or the other the adapter hears of it.
-            let turn = spawn_turn(&backend, &session, "first");
-            tokio::time::timeout(Duration::from_secs(2), async {
-                tokio::select! {
-                    _ = rec.cancel_seen.notified() => {}
-                    _ = rec.prompt_started.notified() => {}
-                }
-            })
-            .await
-            .expect("the adapter must hear of the first turn");
-
-            // Now the rename's `session_info_update`, message chunk and usage
-            // snapshot arrive, with or without its answer behind them. The
-            // round trip after them shows the backend has taken them all in.
-            open_rename_gate(&rec);
-            tokio::time::timeout(Duration::from_secs(2), rec.rename_settled.notified())
-                .await
-                .expect("the adapter must get round to the rename");
-            settle_recording_agent(&backend).await;
-
-            rec.prompt_gate.notify_one();
-            let items = finish_turn(turn).await;
-            tokio::time::resume();
-            assert_plain_turn(&items, &["real"]);
-        }
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn turn_is_held_back_until_an_unanswered_rename_is_over() {
-        for late in [
-            LateRename::Answers,
-            LateRename::AnswersToCancel,
-            LateRename::NeverAnswers,
-        ] {
-            let rec = Recorder::new("agent-sess-RENAME-LATE");
-            rec.gate_rename.store(true, Ordering::SeqCst);
-            rec.rename_chatter.store(true, Ordering::SeqCst);
-            rec.rename_honours_cancel
-                .store(late == LateRename::AnswersToCancel, Ordering::SeqCst);
-            rec.hang_rename
-                .store(late == LateRename::NeverAnswers, Ordering::SeqCst);
-            rec.set_updates(vec![ScriptedUpdate::Text("real")]).await;
-            let (backend, trace) = connect_renaming(
-                &rec,
-                AcpConfig {
-                    rename_timeout: Duration::from_millis(50),
-                    ..test_config()
-                },
-            )
-            .await;
-            let session = bkey("bridge-RENAME-LATE");
-
-            // With the clock paused, the cancel grace cannot run out on the
-            // turn below before the adapter has sent what it has.
-            tokio::time::pause();
-            backend
-                .ensure_session(&session)
-                .await
-                .expect("an unanswered rename must not fail the mint");
-
-            // The rename has outlived its bound, and the first turn is asked
-            // for. The adapter hears a cancel for the session, not a prompt.
-            let turn = spawn_turn(&backend, &session, "first");
-            cancels_recorded(&rec, 1).await;
-            if late != LateRename::AnswersToCancel {
-                assert!(!turn.is_finished());
-                assert!(
-                    rec.prompt_log.lock().await.is_empty(),
-                    "{late:?}: no turn may start alongside the unanswered rename"
-                );
-                assert!(
-                    backend.updates().unwrap().lock().unwrap().is_empty(),
-                    "{late:?}: a turn held back has no update route"
-                );
-                open_rename_gate(&rec);
-            }
-            // Now the rename's `session_info_update`, message chunk and usage
-            // snapshot arrive, with or without its answer behind them. The
-            // round trip after them shows the backend has taken them all in.
-            tokio::time::timeout(Duration::from_secs(2), rec.rename_settled.notified())
-                .await
-                .expect("the adapter must get round to the rename");
-            settle_recording_agent(&backend).await;
-
-            let items = finish_turn(turn).await;
-            tokio::time::resume();
-
-            assert_plain_turn(&items, &["real"]);
-            settle_recording_agent(&backend).await;
-            assert_eq!(
-                *rec.wire_log.lock().await,
-                [
-                    "session/new",
-                    "session/prompt",
-                    "session/cancel",
-                    "session/prompt",
-                ],
-                "{late:?}: one rename, one cancel for it, then the turn"
-            );
-            let mut traced = vec![("WARN", "acp.session_rename_unanswered")];
-            if late == LateRename::NeverAnswers {
-                traced.push(("WARN", "acp.session_rename_unsettled"));
-            }
-            trace.assert_events(&traced);
-        }
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn turn_dropped_while_held_back_by_a_rename_leaves_the_next_turn_held_back() {
-        let rec = Recorder::new("agent-sess-RENAME-DROPPED");
+    async fn answer_that_comes_after_the_bound_does_not_disturb_the_first_turn() {
+        let rec = Recorder::new("agent-sess-RENAME-LATE");
         rec.gate_rename.store(true, Ordering::SeqCst);
-        rec.rename_chatter.store(true, Ordering::SeqCst);
+        // The first turn stays open until it is let go, so the rename's
+        // answer arrives while that turn is under way.
+        rec.gate_prompt.store(true, Ordering::SeqCst);
         rec.set_updates(vec![ScriptedUpdate::Text("real")]).await;
         let (backend, trace) = connect_renaming(
             &rec,
@@ -22078,53 +21771,57 @@ mod tests {
             },
         )
         .await;
-        let session = bkey("bridge-RENAME-DROPPED");
+        let session = bkey("bridge-RENAME-LATE");
+        let agent_id = "agent-sess-RENAME-LATE".to_string();
 
-        // With the clock paused, no cancel grace runs out while a turn is
-        // held back below.
+        // With the clock paused, the bound is the only wait that runs out.
         tokio::time::pause();
-        backend.ensure_session(&session).await.unwrap();
-
-        // The first turn's caller goes away while the turn is held back.
-        let dropped = spawn_turn(&backend, &session, "dropped");
-        cancels_recorded(&rec, 1).await;
-        dropped.abort();
-        assert!(matches!(dropped.await, Err(error) if error.is_cancelled()));
-
-        // The rename is no nearer its answer, so the next turn is held back
-        // in its turn.
+        backend
+            .ensure_session(&session)
+            .await
+            .expect("an unanswered rename must not fail the mint");
         let turn = spawn_turn(&backend, &session, "first");
-        cancels_recorded(&rec, 2).await;
-        assert!(!turn.is_finished());
-        assert!(
-            rec.prompt_log.lock().await.is_empty(),
-            "no turn may start alongside the unanswered rename"
-        );
+        tokio::time::timeout(Duration::from_secs(2), rec.prompt_started.notified())
+            .await
+            .expect("the first turn must reach the adapter");
 
+        // Now the adapter gets round to the rename: its `session_info_update`
+        // and then its answer, to a request the mint has given up on. The
+        // round trip after them shows the backend has taken both in.
         open_rename_gate(&rec);
         tokio::time::timeout(Duration::from_secs(2), rec.rename_settled.notified())
             .await
             .expect("the adapter must get round to the rename");
         settle_recording_agent(&backend).await;
-        let items = finish_turn(turn).await;
+
+        rec.prompt_gate.notify_one();
+        let first = finish_turn(turn).await;
+        rec.gate_prompt.store(false, Ordering::SeqCst);
+        let second = run_turn(&backend, &session, "second").await;
         tokio::time::resume();
 
-        assert_plain_turn(&items, &["real"]);
+        // The turn ends on its own answer, not on the rename's.
+        assert_plain_turn(&first, &["real"]);
+        assert_plain_turn(&second, &["real"]);
         settle_recording_agent(&backend).await;
         assert_eq!(
             *rec.prompts.lock().await,
             [
                 (
-                    "agent-sess-RENAME-DROPPED".to_string(),
-                    one_text_block("/rename bridge-RENAME-DROPPED")
+                    agent_id.clone(),
+                    one_text_block("/rename bridge-RENAME-LATE")
                 ),
-                (
-                    "agent-sess-RENAME-DROPPED".to_string(),
-                    one_text_block("first")
-                ),
+                (agent_id.clone(), one_text_block("first")),
+                (agent_id, one_text_block("second")),
             ],
-            "the dropped turn never reached the adapter"
+            "the rename is sent once, whenever it is answered"
         );
+        assert_eq!(
+            *rec.prompt_log.lock().await,
+            ["start", "end", "start", "end"]
+        );
+        assert_eq!(rec.new_session_calls.load(Ordering::SeqCst), 1);
+        assert!(rec.cancels.lock().await.is_empty());
         trace.assert_one("WARN", "acp.session_rename_unanswered");
     }
 
@@ -22395,11 +22092,7 @@ mod tests {
             .expect("a rename starved by the fence must not fail the mint");
         tokio::time::resume();
 
-        // A fenced connection admits no turn, so there is nothing for the
-        // rename's late output to reach and nothing for a turn to wait on.
         assert_eq!(minted.0.as_ref(), "agent-sess-RENAME-STARVED-1");
-        let entry = backend.session_entry(&session).await.unwrap();
-        assert!(entry.unanswered_rename().is_none());
         settle_recording_agent(&backend).await;
         assert_eq!(rec.new_session_calls.load(Ordering::SeqCst), 1);
         assert!(rec.cancels.lock().await.is_empty());

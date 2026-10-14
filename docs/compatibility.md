@@ -46,26 +46,23 @@ that 2.2.2 adds and 1.13.1 lacks.
 Accepted limits:
 
 - **Tied to the tested versions.** If a later adapter drops or changes `/rename`, the text reaches the model
-  as an ordinary prompt at session mint, outside any bridge turn: its output is dropped and its usage is not
-  recorded, and a reply still in progress when the session's first turn is asked for is cancelled. Repeat the
-  measurement above before enabling the option on any adapter version other than 1.13.1 and 2.2.2.
+  as an ordinary prompt at session mint, outside any bridge turn: until the exchange ends its output is
+  dropped and its usage is not recorded, and a reply still in progress at the 5 s bound falls under the last
+  limit below. Repeat the measurement above before enabling the option on any adapter version other than
+  1.13.1 and 2.2.2.
 - **Recognized by file name.** Validation accepts the option only when the entry's `cmd` has the file name
   `codex-acp`, on a host and in a container alike. A wrapper script that launches the adapter under another
   name cannot use it.
 - **Renamed whether or not it is used.** A session that is minted and then never prompted is still renamed,
   and so still appears in codex's session list. Model-catalog probes are exempt: they never rename.
-- **Best-effort, bounded at 5 s.** A rename that is refused, unanswered or cut off by adapter teardown never
-  fails the mint, never holds it up for more than 5 s and is never retried: it is traced
+- **Best-effort, one attempt, bounded at 5 s.** A rename that is refused, unanswered or cut off by adapter
+  teardown never fails the mint, never holds it up for more than 5 s and is never retried: it is traced
   (`acp.session_rename_rejected`, `acp.session_rename_unanswered` or `acp.session_rename_interrupted`) and
-  the session is served as it is, so the title thread returns for a session the adapter did not name.
-- **An unanswered rename can hold the first turn back.** After a timeout the bridge publishes the session
-  and proceeds while the adapter may still be handling the request. Nothing the adapter later sends for that
-  session could be told apart from a turn's own output, because a `session/update` names its session and not
-  its request, so a turn does not start alongside the rename: the bridge sends `session/cancel` and waits
-  until the rename is answered, for one cancel grace (5 s) at most. An adapter that has by then neither
-  answered the rename nor honoured the cancel is not waited on further. The turn starts,
-  `acp.session_rename_unsettled` is traced, and output that such an adapter still sends for the rename after
-  that is the one case in which it can reach a turn.
+  the same session is served as it is, so the title thread returns for a session the adapter did not name.
+- **Late output after a timeout.** A rename that is not answered within the bound is not waited on or
+  cancelled, so output the adapter emits late for it can reach the session's first turn. On the tested
+  adapter versions `/rename` is answered locally in well under a second, so the bound is only reached when
+  the adapter is already misbehaving.
 
 This records adapter behaviour, not a bridge lane. The bridge side is covered by in-process tests against a
 fake adapter; no fixed-`PONG` smoke has been run with the option on, so that combination is **UNKNOWN**.
