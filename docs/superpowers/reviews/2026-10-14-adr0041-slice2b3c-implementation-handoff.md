@@ -242,3 +242,271 @@ There are no dependency, `Cargo.lock`, public-API, wire or runner changes. The c
    calls `create_new_symlink_child` (mapping `TargetExists` to `DestinationCollision` and keeping the returned identity)
    and maps `DestinationUnsupported` into `PayloadPlaneRestoreFailureV1`. C3's terminal gate calls
    `set_exact_file_mode` and `PinnedDirectoryV1::set_exact_mode`.
+
+---
+
+# Increment C2a — phase-P admission, prevalidation and plan (no writes)
+
+**Written:** 2026-10-14 · **By:** Opus 5.5 (`claude-opus-5-5`) through `a2a-bridge implement` · **Base:**
+`c09e54d5` (C1 merged, PR #142) · **Scope:** C2a only; C2b (materialization) and C3 (terminal gate) are not started.
+**Source snapshot:** `50544e77a985850b` (the first 16 hex digits of the SHA-256 of the five changed `.rs` files
+concatenated in the C2a §7 order; per-file hashes are in the receipts).
+**Receipts:** `.git/a2a-evidence/2b3c-c2a/` (listed in C2a §3.5).
+
+## C2a 1. Context
+
+Increment C2a of the 2B3c payload plane (task spec revision 4, "C2a — admission, prevalidation and plan"; decisions
+D3, D5, D6, D7; the global input, consumed-byte, deadline and gate rules). It adds phase P's admission and its complete
+prevalidation of the worktree, index and evidence frames into one bounded, pure plan. **Nothing is created, charged or
+executed**: the only entry point returns the phase-G value unchanged beside the plan, or a typed failure that keeps it.
+
+Lane: the bridge's Linux container (OrbStack kernel `7.0.14`), running as root, with every C2a control also run as an
+unprivileged user (`setpriv --reuid=65534 --regid=65534 --clear-groups`, `TMPDIR` in a world-writable scratch
+directory). **The native non-root macOS run was not performed here**; the spec gives it to the controller (C2a §6).
+
+## C2a 2. What changed
+
+### 2.1 `crates/bridge-core/src/custody_restore_payload.rs` (new; mounted as `custody_restore::payload`)
+
+| Item | Contract |
+|---|---|
+| `plan_payload_plane_v1(plane, frame_budget, deadline)` and `plan_payload_plane_bounded_v1(…, table_bound)` | The only entry points. Consume a `RestoredGitPlaneV1`; return `PlannedPayloadPlaneV1 { step: Prevalidation, plane, plan }` or `Box<PayloadPlaneRestoreFailureV1>`. The bounded form is the small-bound test seam (phase G's `_bounded_v1` pattern); the production bound is 64 MiB. |
+| Admission | Entry guard, then D5: any Captured class outside {RefsAndHead, ObjectDatabase, StashAndReflogs, Worktree, Index, InProgressGitOperations, GitConfigurationAndHooks, BridgeEvidence} → `UnsupportedCapturedClass { class }`. Then each of the five phase-P classes must be Captured with exactly one staged payload (`Captured { staged }`) or Empty with none; every other state or shape → `UnsupportedCoverage { class, detail }`, never downgraded. Then `reverify_staged_v1` on each phase-P payload, then the first gate. |
+| Prevalidation | In step order (worktree, index, then the three evidence classes): a per-frame guard, `reverify_staged_v1` again, then a complete decode through the verified trailer into a null sink via phase G's `PacedFrameReaderV1` (deadline before every read, bounded to length + 1, every consumed byte counted and hashed), a per-entry `before_deadline`, and each entry fed to the table. The first entry refusal is **held**; after the trailer, count and SHA-256 must equal the staged length and digest (`StagedInputChanged`), and only then is a held refusal returned. Then a decoded-frame guard and the rewind. After every frame, the gate again. |
+| `PayloadPlanTableV1` | Pure. Keys are `(plane, exact path bytes)`. Rules, in order: D6 components (empty, `.`, `..` → `InvalidComponent`); D3 for the worktree root `.git` (childless directory → `SkipConnector`; regular file → `RootGitfileToEvidence`; symlink → `GitConnectorSymlink`; any path beneath `.git/` → `BeneathGitConnector`); index names (top-level `index` or `sharedindex.*` only → `IndexName`; regular files only → `IndexKind`); D6 duplicates (`Duplicate`, any kinds); D6 parent (a `Directory` entry of the same frame, else `ParentNotDirectory`); D7 (absolute, or lexically leaving the plane root from the link's parent → `external`); the D6 charge `2 × path + target + 64`, checked (`checked_mul`/`checked_add`), `≤ bound` else `PlanTableBound`. A refused entry is not admitted and charges nothing. Each frame's entries are moved out once it is whole, so the table never holds a third copy of a path. |
+| `PayloadPlanV1` | `classes` (the five, in step order, with their state), `frames: Vec<PlannedFrameV1>` (class, plane, staged index, staged length and SHA-256, every entry in frame order with exact path bytes, kind with frame mode / length / verbatim target / `external` / `childless`, and action), `root_git: RootGitDispositionV1` (`ConnectorDirectorySkipped`, `RootGitfileToEvidence`, `Absent`), `table_bytes`. Derived views: `childless_directories()` (worktree directories with no entry beneath them, connector excluded; no claim which was a Git directory) and `declared_external_references()` (`ExternalSymlinkV1 { plane, path, target }`). |
+| `PayloadPlaneStepV1` | All six steps listed; C2a reaches `Admission` and `Prevalidation`. |
+| `PayloadPlaneErrorV1` | `UnsupportedCapturedClass`, `UnsupportedCoverage`, `StagedInputChanged`, `PayloadFrameInvalid { class, fault: PayloadFrameFaultV1 }`, `Timeout`, `Restore(CustodyRestoreErrorV1)` (frame decode, identity, mount, I/O), `GitPlane(Box<GitBootstrapErrorV1>)` (a shared phase-G check's refusal no variant above names; unreachable for a consistent plane). `From<GitBootstrapErrorV1>` keeps the meaning of phase G's `StagedInputChanged`, `Git(Timeout)` and `Restore`. |
+| `PayloadPlaneRestoreFailureV1` | `{ cause, last_completed, payload_materialization_began (always false in C2a), ledger_used, partial: PayloadPlanePartialV1 { plane } }`. |
+| Gate (private) | `pace("payload-gate")` → `refuse_mounts_within` → phase G's `output_chains` (repository, `.git`, objects, pack, info and each copied object file) → phase G's metadata directories and files → phase G's `source_files_unchanged` (the bootstrap's admitted files) → `retained_sweep` (every staging chain, HOME, XDG, each bootstrap directory, then `pace("payload-root")` and the destination root's identity LAST). Run at the end of Admission and at the end of Prevalidation. |
+| Test seam (`#[cfg(test)]`) | `PayloadHookPointV1::{AdmissionEntry, PrevalidationRehashed, PrevalidationEntry, BeforePrevalidationGate}`, thread-local, guard-removed. `PrevalidationRehashed` is the prevalidation pass's own replacement hook (C2b will have its own). |
+
+### 2.2 `crates/bridge-core/src/custody_restore_git.rs` (visibility only)
+
+`pub(super)` on: `HOME_NAME_V1`, `XDG_NAME_V1`, `BOOTSTRAP_NAME_V1`, `before_deadline`, `observe_deadline`, `PaceV1`,
+`coverage_state`, `PacedFrameReaderV1` and its five fields, `PinViewV1` and `PinViewV1::of_final`,
+`source_files_unchanged`, `output_chains`, `split_relative`, `metadata_name`, `pin_beneath`, `recheck_regular_entry`.
+rustfmt rewrapped `observe_deadline`'s signature. No body changed; every 2B3b control is unchanged and green.
+
+`sweep_chains` was **not** widened: the 2B3b structural control `round6_the_late_validation_order_is_fixed_in_the_source`
+reads it with `body_of(source, "fn sweep_chains(")`, which derives the closing-brace indentation from the column of
+`fn`, so a `pub(super) ` prefix would break that unchanged test. Phase P's `retained_sweep` therefore restates the same
+edges in the same order (C2a §5.2).
+
+### 2.3 `crates/bridge-core/src/custody_restore.rs`
+
+The `#[path = "custody_restore_payload.rs"] mod payload;` mount beside phase G's, with a two-line comment.
+
+### 2.4 `crates/bridge-core/src/custody_restore_git_tests.rs` (one mount; outside the task's file list, C2a §5.1)
+
+Five appended lines mount `custody_restore_payload_tests.rs` as `git_tests::payload_tests`, so the C2a controls reuse
+the private 2B3b fixtures (`CustomCapsuleV1`, `phase_v`, `PlaneInV1`, `stage_frame`, `manifest_with_row`, `snapshot`,
+the lane route) without widening any of them. No 2B3b test is changed.
+
+### 2.5 `crates/bridge-core/src/custody_restore_payload_tests.rs` (new; 18 controls)
+
+Every behavioural row runs over a real phase-G value: a real 2B2 export → real phase V → the real `restore_git_plane_v1`
+with real Git, then phase P. Frames are either real (the rich clone; the planned separate-Git-directory source) or hand
+encoded with the real encoder and staged by `stage_frame` **before** phase G runs. `PCaseV1::run` snapshots the whole
+destination and the one ledger before phase P and requires both unchanged after (or equal to what a drifting hook left),
+`repository/` still holding only `.git`, and a refusal's `ledger_used`/`payload_materialization_began` shape.
+
+| Control | Proves |
+|---|---|
+| `c2a_the_rich_clones_real_frames_plan_whole_and_change_nothing` | The rich clone (all eight union classes Captured) plans; frames in step order with their exact planes; each frame bound to its staged payload and equal to the test's own decode (paths, kinds, modes, lengths, targets); content bytes; table charge = the test's own arithmetic; root `.git` = skipped connector; `target/` absent; hook mode `0755` kept; bridge evidence present; nothing external; offsets 0; a second plan is equal. |
+| `c2a_each_phase_p_class_is_captured_with_one_payload_or_empty_and_nothing_else` | For all five classes: Captured+payload plans; Empty plans nothing; ExcludedReproducible, Captured without a payload, Unresolved, Empty with a payload, and Captured with two payloads refuse `UnsupportedCoverage` with `last_completed = None`. All Empty → no frames, `Absent`, charge 0. |
+| `c2a_a_captured_class_outside_the_union_refuses_at_admission` | Each of the six non-union classes Captured (with and without its frame) refuses `UnsupportedCapturedClass`, ahead of a broken phase-P class beside it. |
+| `c2a_a_root_gitfile_goes_to_evidence_and_every_childless_directory_is_disclosed` | D3 opposite branch on a real planned capsule (`git init --separate-git-dir=repo/.gd` + `repo/empty`): `RootGitfileToEvidence`; childless = [`.gd`, `empty`], both `Create`; nothing beneath `.gd/`. |
+| `c2a_the_git_connector_is_skipped_or_sent_to_evidence_and_anything_else_refuses` | Childless `.git` → skipped; gitfile → evidence; none → `Absent`; childless `sub/.git` → ordinary empty directory; `.git` symlink, `.git/config`, `.git/hooks` refuse (held until the frame is whole). |
+| `c2a_external_symlink_targets_are_declared_with_their_exact_plane` | D7 in the worktree and in `GitConfigurationAndHooks`: `dir/link -> ../inside`, `..`, `./x/../x`, `../dir/inside` internal; absolute, `../outside`, `../../x`, leave-and-re-enter, non-UTF-8 absolute external; exact plane/class, path and target bytes, in plan order. |
+| `c2a_byte_distinct_names_that_render_alike_stay_distinct` | `n\xff`, `n\xfe`, `n\u{FFFD}` and two `d\xff/x`, `d\xfe/x` subtrees: seven exact entries, each child finding its own parent. |
+| `c2a_the_index_frame_holds_only_index_and_shared_index_files` | `index` + `sharedindex.0123abcd` plan with modes and lengths; `other`, `INDEX`, `sub/index`, a directory `index`, a symlink `sharedindex.x` refuse. |
+| `c2a_the_plan_table_refuses_every_path_rule_and_never_wraps` | Pure table: empty/`.`/`..` components, missing/regular/symlink parents, duplicates in every kind, `.git/x` without a connector, a nested index name; refused entries charge nothing; one path in two planes is two entries; checked arithmetic refuses near `u64::MAX`. |
+| `c2a_the_plan_table_bound_is_exact_for_paths_and_for_targets` | Path-dominated (8 × 203-byte names) and target-dominated (4000- and 3000-byte targets) frames: bound = charge plans with `table_bytes = charge`; bound = charge − 1 refuses `PlanTableBound`. |
+| `c2a_a_frame_replaced_during_the_prevalidation_pass_refuses_as_changed` | The `PrevalidationRehashed` hook writes a valid same-length frame in place → `StagedInputChanged` (`last_completed = Admission`); that frame alone plans; a frame grown after admission is refused by prevalidation's own rehash; a changed byte, an appended byte and a truncation after phase G are refused by admission's rehash (`None`). |
+| `c2a_a_held_entry_refusal_yields_to_the_byte_binding` | A same-length replacement whose entry would be refused (`indez`) is refused as `StagedInputChanged`, never `IndexName`. |
+| `c2a_a_frame_that_does_not_decode_whole_refuses` | Another generation, a truncated trailer, another class's header → `FrameInvalid { Worktree }`. |
+| `c2a_the_first_gate_refuses_a_changed_retained_chain` | At `AdmissionEntry`: metadata `refs`, `objects/info`, `HEAD` as another inode, a copied pack, an admitted bootstrap pack, `git-bootstrap/objects`, `plain`, `home`, the destination root → `IdentityChanged`, `None`. |
+| `c2a_a_mount_inside_the_destination_or_a_failing_census_refuses_at_its_gate` | Exactly two censuses per clean run; a mount at census 1 → `None`, at census 2 → `Admission`; a failing census fails closed. |
+| `c2a_prevalidations_gate_refuses_a_chain_changed_after_the_plan` | At `BeforePrevalidationGate`: metadata `refs` and the root → `IdentityChanged`, `Admission`. |
+| `c2a_the_one_deadline_is_kept_before_every_step_and_entry` | Spent at entry (only `payload-entry` observed, offsets unmoved); spent at entry `b` (no later entry decoded); the clean run's guard sequence equals one computed from the plane's own chains; nine guards each halt alone with `Timeout` and the right `last_completed` (scoped threads; each row asserts its hook fired before the deadline); brief delays at every guard succeed. |
+| `c2a_the_planner_holds_no_write_vocabulary_and_no_unsafe` | Structural only: the production half of `custody_restore_payload.rs` mentions no write/create/link/chmod/rename/ledger-charge/Git-runner/`unsafe` vocabulary; `syn` finds no `unsafe` site in either new file. |
+
+## C2a 3. Verification
+
+All runs were in the foreground with `CARGO_INCREMENTAL=0` and the proxies unset (one exception is disclosed in §3.3).
+
+### 3.1 Targeted controls (final bytes)
+
+- As root: `18 passed; 0 failed; 0 ignored; 1487 filtered out` (~19 s).
+- As `nobody`: `18 passed; 0 failed; 0 ignored; 1487 filtered out` (~27 s); the scratch `TMPDIR` was empty afterwards.
+
+### 3.2 Required local gates
+
+| Gate | Result |
+|---|---|
+| `cargo fmt --all -- --check` | clean |
+| `cargo clippy --workspace --all-targets --all-features -- -D warnings` | clean on final bytes. The first run flagged one `type_complexity` in a test (a local alias fixed it). |
+| `cargo test -p bridge-core` | **1644 passed, 0 failed, 0 ignored; nothing excluded**: lib 1505 (C1's 1487 + 18), trybuild 1, 13 integration binaries 128, doc-tests 10. Run as an exact partition (§3.3). |
+| `cargo run -p a2a-bridge -- validate --repo-hygiene` | `repository hygiene validated` (41 tracked artifacts, 9 example configs) |
+| `git diff --check` | clean (new files added intent-to-add for the check) |
+
+### 3.3 The full suite in this lane: load-sensitive deadline controls (outside scope; reported, not fixed)
+
+1. One monolithic `cargo test -p bridge-core` (9 m 17 s) gave lib `1504 passed; 1 failed`: the 2B3b control
+   `round6_each_late_validation_guard_halts_the_run_alone` ("guard #59 `rewind`: the fixture found None", with
+   `guards_run=0`: its 6 s deadline was spent before the bootstrap reached its first guard). Cargo stopped there. It
+   passed alone on the candidate (`05b`).
+2. **Base control, same environment**: the base commit `c09e54d5` exported with `git archive` (no checkout) to
+   `/tmp/c2a-base` and built with its own target dir. Its full lib suite under the same load showed three other 2B3b
+   deadline controls failing (`b2a_an_interrupted_read_or_write_is_never_retried_after_the_deadline`,
+   `b2a_a_slow_short_write_keeps_exactly_the_accepted_prefix_and_makes_no_second_write`,
+   `b2c_every_final_guard_halts_the_run_alone_and_no_success_follows_expiry`) and did not finish within 590 s (`05c`).
+   Each passed alone on the base (`05d`). The load average during these runs was ~13–14 on 15 cores.
+3. A filtered run of all 365 `custody_restore::git_tests` controls (default threads) exceeded the 600 s foreground limit
+   and **the harness moved it to the background**; I stopped it at once. It had already completed: `363 passed; 2 failed`
+   (the same two `b2a` controls as the base control). Its log is kept as `05e`.
+4. The receipt run: the lib binary run directly in eight filtered partitions at `--test-threads 6`, each under a 580 s
+   foreground timeout: `b2c` 66, `b2a` 40, `b2b` 49, `b1a` 31, `b1b` 49, `round` 26, `corrective` 25, the rest of
+   `git_tests` (with the 18 C2a controls) 79, and the rest of the lib 1140 = **1505, all passed**; also one 2B3b control,
+   `b2c_lossless_raw_name_aliases_…`, whose own fixture reported its row "INVALID (not behavioral evidence)" in a first
+   default-thread `b2c` partition, passed alone and in the 6-thread rerun. Then `cargo test -p bridge-core --test '*'`
+   (14 targets: trybuild 1 + 128) and `--doc` (10).
+
+Conclusion: the 2B3b deadline controls are load-sensitive in this container on the base commit too; nothing C2a changes
+is in their path (C2a touches phase G's file only by visibility). The full workspace suite and the macOS run are CI's and
+the controller's.
+
+### 3.4 Final-bytes run
+
+After the last edit (a test-only validity assertion in `halting_row`), on snapshot `50544e77a985850b`: fmt, clippy,
+repo hygiene and `git diff --check` clean; the 18 controls as root and as `nobody` (§3.1); the `git_tests` remainder
+partition again `79 passed`.
+
+### 3.5 Receipts (`.git/a2a-evidence/2b3c-c2a/`)
+
+| File | Content |
+|---|---|
+| `base-commit.txt` | `c09e54d5…` |
+| `01-red-missing-symbol.log` | Structural RED (§4.1). |
+| `04-clippy-workspace.log` | §3.2 |
+| `05-test-bridge-core-root-linux.log` | §3.3 item 1 |
+| `05b-round6-alone-candidate.log`, `05c-base-control-lib-root-linux.log`, `05d-base-flakes-alone.log`, `05e-test-lib-part1-git-tests.log` | §3.3 items 1–3 |
+| `05f-binary.txt`, `05f-part-*.log`, `05f-b2c-lossless-alone.log`, `05g-integration.log`, `05h-doc.log` | §3.3 item 4 |
+| `06-repo-hygiene.log` | §3.2 |
+| `07-run_mutations.py`, `07-mutation-matrix-{a..i}.json`, `07-summary.md` | §4.2 |
+| `08-final-*` | §3.4 |
+| `source-sha256.txt` | Per-file SHA-256 of the five changed `.rs` files. |
+
+## C2a 4. RED evidence
+
+### 4.1 Structural RED
+
+The production module was drafted before the controls, so structural RED was taken by compiling the finished controls
+with the `mod payload;` mount removed: `cargo test -p bridge-core --lib --no-run` failed with
+`E0432 unresolved import super::super::payload` (and its derived `E0282`s). The behavioural evidence is §4.2.
+
+### 4.2 Behavioural RED: the single-guard mutation matrix
+
+`07-run_mutations.py` applies each row as exact, unique string replacements to `custody_restore_payload.rs`, rebuilds,
+runs the 18 controls as root and as `nobody`, records the failing controls, restores the file and checks the tree hash.
+**56 rows: 54 turned controls red, every row identically as root and as `nobody`; 2 survived (below).** The full
+row → control table is `07-summary.md`; condensed:
+
+| Rows | Guard removed | Controls turned red |
+|---|---|---|
+| M01–M03 | D5 check removed; union widened (LinkedWorktrees); union narrowed (StashAndReflogs) | union control; rich clone / separate-Git-dir / first gate |
+| M04–M07 | Captured with ≥1 payload; Captured-without → Empty; Empty-with accepted; other states → Empty | class-state control |
+| M08, M10 | admission's / prevalidation's rehash removed | replacement control (+ deadline control) |
+| M09, M32 | admission's / prevalidation's gate removed | first-gate, mount, deadline / prevalidation-gate, mount, deadline |
+| M11, M13 | binding SHA-256 removed; held refusal returned before the binding | replacement + held-refusal / held-refusal |
+| M14, M18–M23 | per-entry guard; entry, frame, decoded-frame, pre-census, pre-root, first-chain guards | deadline control (exact guard sequence or halting rows) |
+| M15, M17 | decode error ends quietly; closing rewind removed | decode control; ten controls (offset 0) |
+| M24–M31 | census; object chains; metadata chains; admitted files; staging; HOME/XDG; bootstrap dirs; root identity | mount / first-gate / prevalidation-gate controls |
+| M33–M39 | D3 symlink, beneath-`.git`, connector created, gitfile created, disposition dropped, childless never cleared, connector listed | connector, rich clone, separate-Git-dir, lossless, table controls |
+| M40–M43 | D6 components; duplicates; parent rule; lossy keys | table control; lossless control |
+| M44–M46 | D7 absolute; root escape; base depth from the plane root | external-target control |
+| M47–M49 | index name rule; `sharedindex.*` refused; regular-file rule | index control (+ held-refusal, table) |
+| M50–M54 | 1 × path; target dropped; 63-byte allowance; saturating sum; `<` bound | bound control (+ rich clone); table control (overflow) |
+| M55, M56 | step order; every evidence class in one plane | rich clone |
+
+Survivors, both predicted before the run and kept deliberately (phase G has the same two):
+- **M12** (the consumed **count** comparison removed): any count difference also changes the consumed SHA-256, so the
+  digest comparison alone refuses every observable case; the count is defence in depth.
+- **M16** (the explicit content drain removed): the decoder's next `next_entry` drains and digest-verifies unread
+  content itself, through the same paced, hashed reader.
+
+Rows M01–M17, M22 and M24–M28 ran before the exact clean-run guard sequence was added to the deadline control;
+M18–M21 and M23 were re-run after it (M23 had survived its first run, which is why that assertion was added), and
+M29–M56 ran after it. Later edits only add assertions.
+
+## C2a 5. Open items: interpretations for the reviewer and controller
+
+1. **A file outside the task's list.** `custody_restore_git_tests.rs` gains the five-line `payload_tests` mount (§2.4).
+   The acceptance criteria require the 2B3b fixtures, which are private to that module; the alternatives were widening
+   about twenty fixtures there or copying them. No test there changed. If the controller prefers widening, it is
+   mechanical.
+2. **`retained_sweep` restates `sweep_chains`** (§2.2): same edges, same order, same refusals, with phase-P guard
+   labels. The other gate parts call phase G's own helpers.
+3. **Gate scope.** "Staging and `.git` chains" is read inclusively: phase G's object store and metadata, the bootstrap's
+   admitted files, and the staging, HOME, XDG and bootstrap directories, i.e. everything phase G's own gates recheck.
+   The gate runs at the end of Admission (the "first gate") and at the end of Prevalidation ("at the end of each step";
+   it is also the gate before C2b's first write), so a clean plan takes two censuses.
+4. **Admission rehashes only the five phase-P payloads**; phase G already rehashed and consumed the rest.
+5. **D3 is applied to the worktree root `.git` only**, as written. A childless `sub/.git` is planned as an ordinary empty
+   directory (coverage's connector is matched by identity, so a separate Git directory named `.git` below the root is a
+   real case). A nested `.git` *with content* is not refused by phase P; coverage parks it (Worktree becomes
+   Unresolved, which admission refuses), so it cannot arrive in a sealed capsule. If the reviewer wants defence in
+   depth here, it is one more table rule.
+6. **Index entries must be regular files** (`IndexKind`), as a consequence of "`index` and `sharedindex.*`, byte-exact"
+   and D4. The `sharedindex.` prefix rule is exactly coverage's routing predicate (so an empty suffix is admitted).
+7. **Error shape.** The table bound is a `PayloadFrameFaultV1::PlanTableBound` inside `PayloadFrameInvalid`, as phase G
+   nests `PathTableBound` inside `ActiveFrame`. Phase-G helper refusals are mapped by `From<GitBootstrapErrorV1>`.
+8. **API shape.** The entry point consumes the plane and returns it beside the plan, so C2b's
+   `restore_payload_plane_v1` can be `plan_payload_plane_v1` followed by materialization, and its failure partial can
+   grow pins and inventory rows on top of `PayloadPlanePartialV1 { plane }`.
+9. **Charge accounting.** Every admitted entry is charged, the skipped connector and the root gitfile included. Derived
+   lists (childless directories, external references) are computed on demand rather than stored, so they add no
+   uncharged copies.
+10. **D1's evidence directory names** are not needed until C2b and are not added here.
+11. **The recording Git route is not used by the C2a controls**: they run the same wrapper over the lane route (no child
+    is tampered with), because `RouteV1` leaks its sealed anchor under a non-root run (C2a §6).
+
+## C2a 6. Risks
+
+- **The macOS native non-root run has not happened.** Facts it decides: `git init --separate-git-dir` and the planner on
+  APFS (the separate-Git-directory control); the macOS mount census at both gates; the 3 s deadline rows on that host
+  (each starts only after its plane exists; a row whose deadline is spent before its guard reports itself INVALID rather
+  than as a behavioural failure). C2a writes nothing, so case folding and symlink limits are not exercised yet (C2b).
+- **Pre-existing, outside scope (reported, not fixed):**
+  - the 2B3b deadline controls are load-sensitive in this container, on the base commit too (§3.3);
+  - the 2B3b `RouteV1` fixture drops its `TempDir` before its `SealedAnchorV1` restores the anchor's `0700`, so every
+    phase-G control that uses it leaves its area behind in `TMPDIR` under a non-root run (measured: 2 directories for
+    one `b2c` control as `nobody`). This will show on the controller's macOS run as leftovers, not failures.
+- **The suite's wall time.** The C2a controls add ~10–20 s of wall time to `cargo test -p bridge-core` (the deadline
+  control runs its nine halting rows in parallel).
+- **D3 nested `.git` with content** (§5.5).
+
+## C2a 7. Files
+
+Changed and staged, and nothing else:
+- `crates/bridge-core/src/custody_restore.rs` — the `payload` mount (§2.3)
+- `crates/bridge-core/src/custody_restore_git.rs` — visibility only (§2.2)
+- `crates/bridge-core/src/custody_restore_git_tests.rs` — the `payload_tests` mount only (§2.4, §5.1)
+- `crates/bridge-core/src/custody_restore_payload.rs` — new (§2.1)
+- `crates/bridge-core/src/custody_restore_payload_tests.rs` — new (§2.5)
+- `docs/superpowers/reviews/2026-10-14-adr0041-slice2b3c-implementation-handoff.md` — this section
+
+There are no dependency, `Cargo.lock`, public-API, wire, runner, `fs_custody`, frame-codec or coverage changes, and no
+new `unsafe`. The commit message is in `.git/A2A_COMMIT_MSG`; the bridge commits. There is no push or merge.
+
+## C2a 8. Next
+
+1. The controller runs `cargo test -p bridge-core` natively on macOS as a non-root user on this candidate, before the
+   C2a source review (§6).
+2. C2a source review: Sol/xhigh, cap two rounds; §5 lists the interpretations to rule on, especially §5.1 (the test-file
+   mount), §5.3 (gate scope and the two gates) and §5.5 (nested `.git`).
+3. On approval, C2b on the approved commit: decode a third time against `PayloadPlanV1` (entry by entry, with the
+   materialization pass's own consumed-byte binding and replacement hook), create at `0600`/`0700` through
+   `create_new_regular_child` / `create_new_child_directory` / `create_new_symlink_child`, with the one ledger, the
+   deadline, the per-step gates and `PayloadPlaneRestoreFailureV1` partial progress.

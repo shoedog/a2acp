@@ -31944,3 +31944,8 @@ fn b2c_lossless_regular_link_and_special_aliases_are_classified_independently_an
         ],
     );
 }
+
+// 2B3c phase P's controls: a child module, so every row reuses the real phase-V-to-G fixtures above
+// without widening any of them.
+#[path = "custody_restore_payload_tests.rs"]
+mod payload_tests;

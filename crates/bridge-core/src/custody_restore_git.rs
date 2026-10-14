@@ -175,9 +175,9 @@ use std::time::Instant;
 // Names
 // ---------------------------------------------------------------------------------------------
 
-const HOME_NAME_V1: &str = "home";
-const XDG_NAME_V1: &str = "xdg";
-const BOOTSTRAP_NAME_V1: &str = "git-bootstrap";
+pub(super) const HOME_NAME_V1: &str = "home";
+pub(super) const XDG_NAME_V1: &str = "xdg";
+pub(super) const BOOTSTRAP_NAME_V1: &str = "git-bootstrap";
 /// The nested directories `git init --bare --template=` leaves in the bootstrap, parents first.
 const BOOTSTRAP_DIRECTORIES_V1: [&str; 6] = [
     "objects",
@@ -1110,7 +1110,7 @@ fn fs_error(error: FsCustodyError) -> GitBootstrapErrorV1 {
 /// The ONE absolute deadline, read: once it has passed, whatever is being validated is a Git timeout
 /// and never a success. The comparison is the runner's own (`now >= deadline`): the deadline instant
 /// itself is already spent.
-fn before_deadline(deadline: Instant) -> Result<(), GitBootstrapErrorV1> {
+pub(super) fn before_deadline(deadline: Instant) -> Result<(), GitBootstrapErrorV1> {
     if Instant::now() >= deadline {
         return Err(GitBootstrapErrorV1::Git(CustodyGitError::Timeout));
     }
@@ -1121,7 +1121,10 @@ fn before_deadline(deadline: Instant) -> Result<(), GitBootstrapErrorV1> {
 /// anything else is done toward a verified result. Every guard of the success path is this call; the
 /// test hook inside it is how a test makes exactly that step slow. Filesystem and platform calls cannot
 /// be preempted, so the deadline can only be observed when each returns.
-fn observe_deadline(deadline: Instant, step: &'static str) -> Result<(), GitBootstrapErrorV1> {
+pub(super) fn observe_deadline(
+    deadline: Instant,
+    step: &'static str,
+) -> Result<(), GitBootstrapErrorV1> {
     #[cfg(test)]
     run_git_hook(GitHookPointV1::DeadlineObserved, step, Path::new(""));
     #[cfg(not(test))]
@@ -1133,7 +1136,7 @@ fn observe_deadline(deadline: Instant, step: &'static str) -> Result<(), GitBoot
 /// [`unpaced`]. Only success-only code is paced: a gate or census that runs for a child that already
 /// failed, around admission, or inside a runner callback must still complete and report, so it is the
 /// caller's explicit, visible choice to leave it unpaced.
-type PaceV1<'a> = &'a dyn Fn(&'static str) -> Result<(), GitBootstrapErrorV1>;
+pub(super) type PaceV1<'a> = &'a dyn Fn(&'static str) -> Result<(), GitBootstrapErrorV1>;
 
 /// The pace of a sweep that is not held to the deadline (see [`PaceV1`]).
 fn unpaced(_step: &'static str) -> Result<(), GitBootstrapErrorV1> {
@@ -1153,7 +1156,7 @@ enum ObjectShapeV1 {
     Empty,
 }
 
-fn coverage_state(
+pub(super) fn coverage_state(
     manifest: &CustodyManifestV1,
     class: CustodyCoverageClassV1,
 ) -> Option<CustodyStateClassV1> {
@@ -3348,12 +3351,12 @@ pub(crate) fn reverify_staged_v1(
 /// The decoder's source: at most `recorded length + 1` bytes of the retained descriptor, one bounded
 /// read at a time, each preceded by the ONE absolute deadline, and every byte read is hashed and counted
 /// so the decoded bytes can be bound to the verified plaintext.
-struct PacedFrameReaderV1<'a> {
-    inner: io::Take<&'a File>,
-    deadline: Instant,
-    expired: &'a Cell<bool>,
-    context: digest::Context,
-    count: u64,
+pub(super) struct PacedFrameReaderV1<'a> {
+    pub(super) inner: io::Take<&'a File>,
+    pub(super) deadline: Instant,
+    pub(super) expired: &'a Cell<bool>,
+    pub(super) context: digest::Context,
+    pub(super) count: u64,
 }
 
 impl io::Read for PacedFrameReaderV1<'_> {
@@ -5177,7 +5180,7 @@ impl FinalObjectPinsV1 {
 
 /// The pins a recheck looks at, borrowed from either a partial or a frozen set.
 #[derive(Clone, Copy)]
-struct PinViewV1<'p> {
+pub(super) struct PinViewV1<'p> {
     pins: [Option<&'p PinnedDirectoryV1>; 5],
 }
 
@@ -5194,7 +5197,7 @@ impl<'p> PinViewV1<'p> {
         }
     }
 
-    fn of_final(pins: &'p FinalObjectPinsV1) -> Self {
+    pub(super) fn of_final(pins: &'p FinalObjectPinsV1) -> Self {
         Self {
             pins: [
                 Some(&pins.repository),
@@ -5549,7 +5552,7 @@ fn admitted_files(boot: &VerifiedGitBootstrapV1) -> &[AdmittedObjectFileV1] {
 /// descriptor is still that regular file at the admitted length. A link, a directory, a special file,
 /// another inode, or another length refuses; the replacement is never opened. Each file is preceded by the
 /// one deadline's guard.
-fn source_files_unchanged(
+pub(super) fn source_files_unchanged(
     boot: &VerifiedGitBootstrapV1,
     pace: PaceV1<'_>,
 ) -> Result<(), GitBootstrapErrorV1> {
@@ -5615,7 +5618,7 @@ fn source_files_unchanged(
 /// Every output directory that exists is still the entry its parent holds, parents first, and every file
 /// already copied is still the regular file its retained pin lists, of the length and identity it was
 /// measured with. A link or another object refuses; nothing is followed.
-fn output_chains(
+pub(super) fn output_chains(
     dest: &super::RestoreDestinationV1,
     pins: PinViewV1<'_>,
     files: &[MaterializedObjectFileV1],
@@ -6208,7 +6211,7 @@ fn metadata_copy(relative: &str, detail: impl Into<String>) -> GitBootstrapError
 }
 
 /// `relative` split into the directory it is created in (`None` is `.git` itself) and its leaf.
-fn split_relative(relative: &str) -> (Option<&str>, &str) {
+pub(super) fn split_relative(relative: &str) -> (Option<&str>, &str) {
     match relative.rsplit_once('/') {
         Some((parent, leaf)) => (Some(parent), leaf),
         None => (None, relative),
@@ -6216,12 +6219,12 @@ fn split_relative(relative: &str) -> (Option<&str>, &str) {
 }
 
 /// The destination-relative name of an entry beneath `.git`.
-fn metadata_name(relative: &str) -> String {
+pub(super) fn metadata_name(relative: &str) -> String {
     format!("{}/{relative}", ObjectDirV1::Git.name())
 }
 
 /// The retained pin of `parent` (`None` is `.git`), which must be one this invocation created and pinned.
-fn pin_beneath<'p>(
+pub(super) fn pin_beneath<'p>(
     git: &'p PinnedDirectoryV1,
     directories: &'p BTreeMap<String, PinnedDirectoryV1>,
     parent: Option<&str>,
@@ -6239,7 +6242,7 @@ fn pin_beneath<'p>(
 
 /// `parent`'s entry `leaf` must still be the regular file measured as `(dev, ino, length)`. A link or any
 /// other object refuses, and nothing is followed.
-fn recheck_regular_entry(
+pub(super) fn recheck_regular_entry(
     parent: &PinnedDirectoryV1,
     relative: &str,
     measured: (u64, u64, u64),

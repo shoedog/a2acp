@@ -1344,6 +1344,11 @@ fn sha256_hex(bytes: &[u8; 32]) -> Sha256HexV1 {
 #[path = "custody_restore_git.rs"]
 mod git;
 
+// 2B3c phase P: the payload plane. A child module like phase G, so it reaches the reader's private pins
+// and phase G's retained value without widening either beyond this module.
+#[path = "custody_restore_payload.rs"]
+mod payload;
+
 #[cfg(test)]
 #[path = "custody_restore_tests.rs"]
 mod tests;
