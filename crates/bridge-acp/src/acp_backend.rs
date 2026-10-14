@@ -9318,6 +9318,9 @@ mod tests {
         let bytes = Arc::new(StdMutex::new(Vec::new()));
         let dispatch = test_trace_dispatch(bytes.clone());
         let _trace = tracing::dispatcher::set_default(&dispatch);
+        // A callsite another test thread hit first, with no subscriber, can be cached as disabled
+        // process-wide; a thread-local default does not rebuild that cache, so rebuild it here.
+        tracing::callsite::rebuild_interest_cache();
         let failed: Result<ResourceActionResultV1, ()> =
             Ok(action_result(ResourceActionDispositionV1::Failed));
 
@@ -9334,6 +9337,9 @@ mod tests {
         let bytes = Arc::new(StdMutex::new(Vec::new()));
         let dispatch = test_trace_dispatch(bytes.clone());
         let _trace = tracing::dispatcher::set_default(&dispatch);
+        // A callsite another test thread hit first, with no subscriber, can be cached as disabled
+        // process-wide; a thread-local default does not rebuild that cache, so rebuild it here.
+        tracing::callsite::rebuild_interest_cache();
         let failed: Result<Option<ResourceActionResultV1>, ()> =
             Ok(Some(action_result(ResourceActionDispositionV1::Failed)));
 
@@ -13755,6 +13761,9 @@ mod tests {
         let bytes = Arc::new(StdMutex::new(Vec::new()));
         let dispatch = test_trace_dispatch(bytes.clone());
         let _trace = tracing::dispatcher::set_default(&dispatch);
+        // A callsite another test thread hit first, with no subscriber, can be cached as disabled
+        // process-wide; a thread-local default does not rebuild that cache, so rebuild it here.
+        tracing::callsite::rebuild_interest_cache();
         let first = bkey("bridge-owner-attach-a");
         let second = bkey("bridge-owner-attach-b");
         let first_fingerprint = AcpTraceEvent::owner_key_fingerprint(first.as_str());
@@ -13785,6 +13794,9 @@ mod tests {
         let bytes = Arc::new(StdMutex::new(Vec::new()));
         let dispatch = test_trace_dispatch(bytes.clone());
         let _trace = tracing::dispatcher::set_default(&dispatch);
+        // A callsite another test thread hit first, with no subscriber, can be cached as disabled
+        // process-wide; a thread-local default does not rebuild that cache, so rebuild it here.
+        tracing::callsite::rebuild_interest_cache();
 
         let result = backend.release_session_result(&session).await;
 
@@ -17303,6 +17315,9 @@ mod tests {
         let bytes = Arc::new(StdMutex::new(Vec::new()));
         let dispatch = test_trace_dispatch(bytes.clone());
         let _trace = tracing::dispatcher::set_default(&dispatch);
+        // A callsite another test thread hit first, with no subscriber, can be cached as disabled
+        // process-wide; a thread-local default does not rebuild that cache, so rebuild it here.
+        tracing::callsite::rebuild_interest_cache();
         let ids = tool_ids("wide", bridge_core::turn_liveness::MAX_OPEN_TOOL_CALLS + 1);
         let mut updates: Vec<_> = ids
             .iter()
@@ -17948,6 +17963,9 @@ mod tests {
         let bytes = Arc::new(StdMutex::new(Vec::new()));
         let dispatch = test_trace_dispatch(bytes.clone());
         let _trace = tracing::dispatcher::set_default(&dispatch);
+        // A callsite another test thread hit first, with no subscriber, can be cached as disabled
+        // process-wide; a thread-local default does not rebuild that cache, so rebuild it here.
+        tracing::callsite::rebuild_interest_cache();
         let traced = |event: &str| {
             String::from_utf8(bytes.lock().unwrap().clone())
                 .unwrap()
@@ -18005,6 +18023,9 @@ mod tests {
         let bytes = Arc::new(StdMutex::new(Vec::new()));
         let dispatch = test_trace_dispatch(bytes.clone());
         let _trace = tracing::dispatcher::set_default(&dispatch);
+        // A callsite another test thread hit first, with no subscriber, can be cached as disabled
+        // process-wide; a thread-local default does not rebuild that cache, so rebuild it here.
+        tracing::callsite::rebuild_interest_cache();
         let rec = silent_after("agent-sess-LV-LAGGING", vec![]).await;
         let backend = connect_recording_with(rec.clone(), liveness_config()).await;
         let (mut stream, observer) =
