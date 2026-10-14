@@ -65,7 +65,40 @@ Accepted limits:
   the adapter is already misbehaving.
 
 This records adapter behaviour, not a bridge lane. The bridge side is covered by in-process tests against a
-fake adapter; no fixed-`PONG` smoke has been run with the option on, so that combination is **UNKNOWN**.
+fake adapter. With the option on, one served fixed-`PONG` turn passed on codex-acp 1.13.1 (2026-10-13, operator
+serve; one `prism-mcp` instead of two, freed about 60 s after release), and the codex host lane of the
+2026-10-13 provider refresh below passed on codex-acp 2.2.2 with the option on.
+
+## Provider refresh — 2026-10-13 (codex-acp 2.2.2, claude-agent-acp 0.90.0)
+
+Motive: codex-acp 1.13.1 does not advertise `gpt-6.1-sol` (2.2.2 does), and both adapters were several releases
+behind. The refresh followed [`provider-refresh-runbook.md`](provider-refresh-runbook.md) with a candidate release
+binary built from this change (SHA-256 prefix `a7da5f492f18022c`), exact-version candidates in a private host
+prefix, and reader image `sha256:85f2575d5f23a673f989af1fbcdf069e1be2cb4b34074745b214dbd5607cf498` (toolchain
+`sha256:082205eef63fa7af72423ff318502ed5414c5ca884b3f62c2043650a342ff35d`, built `FROM` that reader; the reader
+ID was unchanged after the toolchain build). Both images are linux/arm64.
+
+Candidate components, verified from the installed package manifests and the image labels:
+
+- Codex ACP 2.2.2, with nested `@openai/codex` pinned to 0.162.1 (the adapter declares `^0.160.1`);
+- Claude ACP 0.90.0, with its declared Agent SDK 0.3.296 (bundled Claude Code 2.1.296);
+- Kiro CLI 2.24.1 and OpenCode are unchanged.
+
+Provider-free gates: `validate` ok; host `doctor` 29 ok / 2 known warnings (Kiro and OpenCode provenance) / 0 fail;
+reader `doctor` 14/14 (codex) and 15/15 (Claude) ok; `models` lists 40 codex entries including `gpt-6.1-sol`
+and 11 Claude entries including `opus` and `claude-opus-5`.
+
+Every lane ran exactly one fixed `PONG` prompt, with no retry:
+
+| Lane | Model / effort | Status | Evidence |
+|---|---|---|---|
+| Codex host (ACP 2.2.2 / Codex 0.162.1, `rename_new_sessions = true`) | `gpt-6.1-sol` / `xhigh` / `read-only` | **PASS** | exact `PONG`; 35,965 tokens; effective request `gpt-6.1-sol`. |
+| Claude host (ACP 0.90.0) | `opus` / `low` | **PASS** | exact `PONG`; 47,456 tokens; USD 0.298. The host transcript records `claude-opus-5-5`. |
+| Codex reader (image `85f2575d…`) | `gpt-6.1-sol` / `xhigh` | **PASS** | exact `PONG`; 20,405 tokens. |
+| Claude reader (image `85f2575d…`) | `opus` / `low` | **PASS** | exact `PONG`; 26,504 tokens; USD 0.130. The container transcript was not retained, so the served model is the requested alias only. |
+
+All four cleanups completed (release and retire). Promotion to the host trees, the shared image tags and the
+operator is recorded in the operator service custody, not here.
 
 ## Provider refresh — 2026-09-25 (Opus 5.5)
 
