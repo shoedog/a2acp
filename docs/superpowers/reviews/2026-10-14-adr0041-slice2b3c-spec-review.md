@@ -18,3 +18,18 @@ the wrong result and a bounded fix. Disposition (all folded in revision 2):
 | S1 | D5 allowed set ambiguous | Folded: exact eight-class union |
 | S2 | Prevalidation table unbounded | Folded: 64 MiB bound like phase G, test seam |
 | S3 | D3/D6/D7 lack opposite-branch tests | Folded: controls added to C2 |
+
+## Round 2/2 — artifact `dbf21d13` (revision 2) — REJECT
+
+Two WRONG·MATERIAL blockers, four SMELL·MATERIAL·DEFER. W1, W2, W4, W5, S1, S2 confirmed closed; W3 only partly.
+Classification at the cap: **converging** (6 → 2 blockers, smaller, closed population, bounded repairs; one is
+the remainder of W3). Controller discloses **one extension round (3/3)** on the same artifact.
+
+| # | Finding | Disposition (revision 3) |
+|---|---|---|
+| W1 | Restrictive modes applied before gates that must read or traverse the entries | Folded: everything written `0600`/`0700`; a single post-order closing gate (last step, after index and evidence) verifies and digests, then sets and confirms each final mode |
+| W2 | 4095-byte symlink success is impossible on macOS | Folded: typed `DestinationUnsupported` refusal, capability-aware tests |
+| S1 | Non-Captured/non-Empty states for the five classes undefined | Folded: exactly Captured-with-payload or Empty, else Admission refusal; table tests |
+| S2 | Consumed-byte binding not tested per pass | Folded: separate hooks and tests for each pass |
+| S3 | Raw-byte and evidence-symlink branches untested | Folded: byte-distinct names, NFC/NFD, non-UTF-8 targets, evidence symlinks |
+| S4 | C2 too broad for a two-round cap | Folded: split into C2a (admission/prevalidation/plan, no writes) and C2b (materialization); index and evidence move into C2b, closing gate and modes into C3 |
