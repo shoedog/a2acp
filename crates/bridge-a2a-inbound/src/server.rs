@@ -3711,6 +3711,90 @@ async fn durable_task_metadata(
     Ok((!metadata.is_empty()).then_some(metadata))
 }
 
+/// Turn telemetry for one served unary turn (#47), with the streaming producer's
+/// `ttft`/`last_usage` bookkeeping. [`Self::start`] records `TurnStarted`; exactly one
+/// `TurnFinished` + `UsageFinalized` pair follows, from [`Self::finish`] on every in-band
+/// exit or, when the unary request future is dropped mid-turn (client disconnect), from
+/// `Drop` as `Canceled` with the last usage seen, so the in-flight gauge never leaks.
+struct UnaryTurnMetrics {
+    observer: Arc<dyn bridge_core::ports::Observer>,
+    ctx: bridge_core::ports::TurnContext,
+    started: std::time::Instant,
+    ttft: Option<std::time::Duration>,
+    last_usage: Option<bridge_core::orch::UsageSnapshot>,
+    finished: bool,
+}
+
+impl UnaryTurnMetrics {
+    fn start(
+        observer: Arc<dyn bridge_core::ports::Observer>,
+        ctx: bridge_core::ports::TurnContext,
+    ) -> Self {
+        let started = std::time::Instant::now();
+        observer.record(&bridge_core::ports::ObsEvent::TurnStarted { ctx: &ctx });
+        Self {
+            observer,
+            ctx,
+            started,
+            ttft: None,
+            last_usage: None,
+            finished: false,
+        }
+    }
+
+    fn observe_usage(&mut self, snap: &bridge_core::orch::UsageSnapshot) {
+        self.last_usage = Some(snap.clone());
+    }
+
+    /// A non-usage event (content or error) reached the turn: the first one sets `ttft`.
+    fn observe_content(&mut self) {
+        if self.ttft.is_none() {
+            self.ttft = Some(self.started.elapsed());
+        }
+    }
+
+    /// The streaming producer's outcome mapping over a collected unary turn: a Canceled
+    /// terminal (translator-emitted or force-reset abort) wins, then any error.
+    fn outcome(collected: &[Result<Event, BridgeError>]) -> bridge_core::ports::TurnOutcome {
+        let canceled = collected.iter().any(|ev| {
+            matches!(ev, Ok(e) if e.kind() == &EventKind::Terminal
+                && e.outcome() == Some(TaskOutcome::Canceled))
+        });
+        if canceled {
+            bridge_core::ports::TurnOutcome::Canceled
+        } else if collected.iter().any(Result::is_err) {
+            bridge_core::ports::TurnOutcome::Failed(bridge_core::ports::FailureClass::Other)
+        } else {
+            bridge_core::ports::TurnOutcome::Success
+        }
+    }
+
+    fn finish(&mut self, outcome: &bridge_core::ports::TurnOutcome) {
+        if std::mem::replace(&mut self.finished, true) {
+            return;
+        }
+        self.observer
+            .record(&bridge_core::ports::ObsEvent::TurnFinished {
+                ctx: &self.ctx,
+                latency: self.started.elapsed(),
+                ttft: self.ttft,
+                outcome,
+            });
+        self.observer
+            .record(&bridge_core::ports::ObsEvent::UsageFinalized {
+                ctx: &self.ctx,
+                usage: self.last_usage.as_ref(),
+                fin: bridge_core::ports::UsageFinalization::TurnFinal,
+            });
+    }
+}
+
+impl Drop for UnaryTurnMetrics {
+    fn drop(&mut self) {
+        self.finish(&bridge_core::ports::TurnOutcome::Canceled);
+    }
+}
+
 /// Unary path: run the same pipeline but collect events into one JSON response.
 async fn unary_message(
     srv: Arc<InboundServer>,
@@ -3943,6 +4027,9 @@ async fn unary_message(
             // attempt telemetry port. Translated Status and Artifact events are delivery
             // projections and cannot independently prove provider progress.
             let mut prompt_polled = false;
+            // Dropped with this future on client disconnect → TurnFinished(Canceled).
+            let mut turn_metrics =
+                UnaryTurnMetrics::start(srv.coordinator().observer(), dispatch.obs_ctx.clone());
             loop {
                 let ev = tokio::select! {
                     biased;
@@ -3980,8 +4067,11 @@ async fn unary_message(
                 };
                 if let Ok(e) = &ev {
                     if e.kind() == &EventKind::Usage {
-                        if let (Some(snap), Some(w)) = (e.usage_snapshot(), warm.as_ref()) {
-                            w.record_usage(snap.clone()).await;
+                        if let Some(snap) = e.usage_snapshot() {
+                            turn_metrics.observe_usage(snap);
+                            if let Some(w) = warm.as_ref() {
+                                w.record_usage(snap.clone()).await;
+                            }
                         }
                         continue; // exclude usage from the unary output
                     }
@@ -3999,8 +4089,10 @@ async fn unary_message(
                         warm.observe_exit(WarmCompletionExit::Error(error));
                     }
                 }
+                turn_metrics.observe_content();
                 collected.push(ev);
             }
+            turn_metrics.finish(&UnaryTurnMetrics::outcome(&collected));
             drop(events);
             child_liveness = dispatch.backend.bridge_owned_acp_child_liveness();
             if let Some(mut warm) = warm.take() {
@@ -6479,6 +6571,25 @@ mod tests {
         policy: Arc<dyn PolicyEngine>,
         perm: Option<Arc<PermissionRegistry>>,
     ) -> Arc<bridge_coordinator::Coordinator> {
+        coordinator_with_sm_observed(
+            sm,
+            registry,
+            store,
+            policy,
+            perm,
+            Arc::new(bridge_observ::NoopObserver),
+        )
+    }
+
+    /// Test-support: [`coordinator_with_sm`] whose turn telemetry goes to `observer`.
+    fn coordinator_with_sm_observed(
+        sm: Arc<crate::session_manager::SessionManager>,
+        registry: Arc<dyn AgentRegistry>,
+        store: Arc<dyn SessionStore>,
+        policy: Arc<dyn PolicyEngine>,
+        perm: Option<Arc<PermissionRegistry>>,
+        observer: Arc<dyn bridge_core::ports::Observer>,
+    ) -> Arc<bridge_coordinator::Coordinator> {
         let coord = bridge_coordinator::Coordinator::new(
             sm,
             None,
@@ -6490,7 +6601,7 @@ mod tests {
             Arc::new(bridge_coordinator::clock::SystemClock),
             None,
             None,
-            Arc::new(bridge_observ::NoopObserver),
+            observer,
             3,
         );
         let coord = coord.with_workflow_history(Ok(Arc::new(
@@ -6636,6 +6747,8 @@ mod tests {
         UsageFinalized {
             ctx: bridge_core::ports::TurnContext,
             has_usage: bool,
+            /// The finalized snapshot's `used` tokens, telling which snapshot it was.
+            used: Option<u64>,
         },
     }
 
@@ -6665,6 +6778,7 @@ mod tests {
                     out.push(RecordedObsEvent::UsageFinalized {
                         ctx: (*ctx).clone(),
                         has_usage: usage.is_some(),
+                        used: usage.and_then(|usage| usage.used),
                     })
                 }
                 bridge_core::ports::ObsEvent::TaskStarted { .. }
@@ -13607,6 +13721,238 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
         let v: Value = serde_json::from_str(&body_string(resp).await).unwrap();
         assert_eq!(v["result"]["task"]["state"], "TASK_STATE_CANCELED");
+    }
+
+    // ---- #47: a served unary turn records TurnStarted / TurnFinished / UsageFinalized ----
+
+    /// A history-backed single-agent (`a`) server whose coordinator records turn
+    /// telemetry into the returned observer. `store` is built over the session manager,
+    /// so a test can force-reset the turn's context from inside dispatch.
+    fn unary_observed_server(
+        backend: Arc<dyn AgentBackend>,
+        store: impl FnOnce(Arc<crate::session_manager::SessionManager>) -> Arc<dyn SessionStore>,
+    ) -> (Arc<InboundServer>, Arc<RecordingObserver>) {
+        let registry = FakeRegistry::with_entries("a", vec![(bare_entry("a"), backend)]);
+        let sm = Arc::new(crate::session_manager::SessionManager::new(
+            registry.clone() as Arc<dyn AgentRegistry>,
+            std::time::Duration::from_secs(60),
+        ));
+        let observer = Arc::new(RecordingObserver::default());
+        let coord = coordinator_with_sm_observed(
+            sm.clone(),
+            registry as Arc<dyn AgentRegistry>,
+            store(sm),
+            Arc::new(AutoApprove),
+            None,
+            observer.clone() as Arc<dyn bridge_core::ports::Observer>,
+        );
+        let srv = Arc::new(InboundServer::from_coordinator(
+            coord,
+            Arc::new(RegistryRoute {
+                default: AgentId::parse("a").unwrap(),
+            }),
+            Arc::new(AlwaysGrant),
+            "http://localhost:8080",
+            Arc::new(NoDelegation),
+            "a",
+        ));
+        (srv, observer)
+    }
+
+    /// `SendMessage` params for `agent`; a `context` makes it a warm-session turn.
+    fn unary_agent_msg(agent: &str, context: Option<&str>) -> Value {
+        let mut message = json!({ "text": "go", "metadata": { "a2a-bridge.agent": agent } });
+        if let Some(context) = context {
+            message["contextId"] = json!(context);
+        }
+        json!({ "message": message })
+    }
+
+    async fn send_unary(srv: &Arc<InboundServer>, params: Value) -> Value {
+        let resp = router(srv.clone())
+            .oneshot(post_request(methods::SEND_MESSAGE, params, "1.0"))
+            .await
+            .unwrap();
+        serde_json::from_str(&body_string(resp).await).unwrap()
+    }
+
+    /// `events` hold exactly one turn's `[Start, Finish, UsageFinalized]`, in that order
+    /// and for the same turn. Returns its outcome and finalized `(has_usage, used)`.
+    fn single_unary_turn(
+        events: &[RecordedObsEvent],
+    ) -> (bridge_core::ports::TurnOutcome, bool, Option<u64>) {
+        match events {
+            [RecordedObsEvent::Start(start), RecordedObsEvent::Finish {
+                ctx: finished,
+                outcome,
+            }, RecordedObsEvent::UsageFinalized {
+                ctx: finalized,
+                has_usage,
+                used,
+            }] => {
+                assert_eq!(finished, start, "TurnFinished must be for the started turn");
+                assert_eq!(
+                    finalized, start,
+                    "UsageFinalized must be for the started turn"
+                );
+                (outcome.clone(), *has_usage, *used)
+            }
+            other => panic!("expected exactly [Start, Finish, UsageFinalized], got {other:?}"),
+        }
+    }
+
+    fn usage_update(used: u64) -> Result<Update, BridgeError> {
+        Ok(Update::Usage(UsageSnapshot {
+            used: Some(used),
+            size: Some(1000),
+            cost: None,
+            terminal: None,
+            at_ms: 0,
+        }))
+    }
+
+    /// Usage before and after the turn's text: the second snapshot is the turn's last.
+    struct TwoUsageBackend;
+
+    #[async_trait::async_trait]
+    impl AgentBackend for TwoUsageBackend {
+        async fn prompt(
+            &self,
+            _s: &SessionId,
+            _p: Vec<Part>,
+        ) -> Result<BackendStream, BridgeError> {
+            Ok(Box::pin(tokio_stream::iter(vec![
+                usage_update(100),
+                Ok(Update::Text("ok".into())),
+                usage_update(123),
+                Ok(Update::Done {
+                    stop_reason: "end_turn".into(),
+                    prefix_attestation: Default::default(),
+                }),
+            ])))
+        }
+
+        async fn cancel(&self, _s: &SessionId) -> Result<(), BridgeError> {
+            Ok(())
+        }
+    }
+
+    /// Reports usage, signals `parked` once the consumer has polled past it, then never
+    /// finishes: a unary request that is still mid-turn when its caller goes away.
+    struct UsageThenParkedBackend {
+        parked: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait::async_trait]
+    impl AgentBackend for UsageThenParkedBackend {
+        async fn prompt(
+            &self,
+            _s: &SessionId,
+            _p: Vec<Part>,
+        ) -> Result<BackendStream, BridgeError> {
+            let parked = self.parked.clone();
+            Ok(Box::pin(async_stream::stream! {
+                yield usage_update(123);
+                parked.notify_one();
+                futures::future::pending::<()>().await;
+            }))
+        }
+
+        async fn cancel(&self, _s: &SessionId) -> Result<(), BridgeError> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn unary_turn_records_start_finish_and_last_usage_once() {
+        let (srv, observer) =
+            unary_observed_server(
+                Arc::new(TwoUsageBackend),
+                |_| Arc::new(FakeStore::default()),
+            );
+
+        // Refused before dispatch (unknown agent): no turn started, nothing recorded.
+        let refused = send_unary(&srv, unary_agent_msg("ghost", None)).await;
+        assert!(refused["error"].is_object(), "{refused}");
+        assert_eq!(observer.snapshot(), Vec::new());
+
+        // A cold turn, then a warm-session turn: each records exactly one triple.
+        for context in [None, Some("unary-metrics-warm")] {
+            let v = send_unary(&srv, unary_agent_msg("a", context)).await;
+            assert_eq!(v["result"]["task"]["state"], "TASK_STATE_COMPLETED", "{v}");
+            assert_eq!(v["result"]["artifact"]["text"], "ok");
+            let events = observer.0.lock().unwrap().drain(..).collect::<Vec<_>>();
+            assert_eq!(
+                single_unary_turn(&events),
+                (bridge_core::ports::TurnOutcome::Success, true, Some(123)),
+                "context {context:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn unary_failed_turn_records_failed_once() {
+        let (srv, observer) = unary_observed_server(NoDoneBackend::new(vec!["partial"]), |_| {
+            Arc::new(FakeStore::default())
+        });
+
+        let v = send_unary(&srv, unary_agent_msg("a", None)).await;
+        assert!(
+            v["error"].is_object(),
+            "a missing terminal fails the turn: {v}"
+        );
+        assert_eq!(
+            single_unary_turn(&observer.snapshot()),
+            (
+                bridge_core::ports::TurnOutcome::Failed(bridge_core::ports::FailureClass::Other),
+                false,
+                None
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn unary_force_reset_abort_records_canceled_once() {
+        let ctx = ContextId::parse("unary-metrics-abort").unwrap();
+        let (srv, observer) = unary_observed_server(Arc::new(PanicBackend), |sm| {
+            Arc::new(ForceClearOnWarmPutStore::new(sm, ctx.clone()))
+        });
+
+        let v = send_unary(&srv, unary_agent_msg("a", Some(ctx.as_str()))).await;
+        assert_eq!(v["result"]["task"]["state"], "TASK_STATE_CANCELED", "{v}");
+        assert_eq!(
+            single_unary_turn(&observer.snapshot()),
+            (bridge_core::ports::TurnOutcome::Canceled, false, None)
+        );
+    }
+
+    #[tokio::test]
+    async fn unary_request_dropped_mid_turn_records_canceled_once() {
+        let parked = Arc::new(tokio::sync::Notify::new());
+        let (srv, observer) = unary_observed_server(
+            Arc::new(UsageThenParkedBackend {
+                parked: parked.clone(),
+            }),
+            |_| Arc::new(FakeStore::default()),
+        );
+
+        // Client disconnect: the server drops the in-flight handler future.
+        let request = router(srv).oneshot(post_request(
+            methods::SEND_MESSAGE,
+            unary_agent_msg("a", None),
+            "1.0",
+        ));
+        tokio::select! {
+            _ = request => panic!("a parked turn must not answer"),
+            _ = parked.notified() => {}
+        }
+
+        // Nothing settles later into a second record.
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert_eq!(
+            single_unary_turn(&observer.snapshot()),
+            (bridge_core::ports::TurnOutcome::Canceled, true, Some(123))
+        );
     }
 
     fn warm_msg(text: &str) -> serde_json::Value {

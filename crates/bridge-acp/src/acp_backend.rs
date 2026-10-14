@@ -908,7 +908,8 @@ enum AcpTraceEvent {
         connection_unavailable: bool,
     },
     /// The adapter accepted the `/rename` that names a newly minted agent
-    /// session. Like the four outcomes below it is emitted once per mint and
+    /// session, on a connection nobody had fenced by the time the answer
+    /// arrived. Like the four outcomes below it is emitted once per mint and
     /// correlates through the bridge session's owner fingerprint; neither the
     /// session id nor the name is traced.
     SessionRenameAcknowledged {
@@ -927,7 +928,8 @@ enum AcpTraceEvent {
     SessionRenameUnanswered {
         owner_key_fingerprint: i64,
     },
-    /// The connection was fenced while the rename waited for its answer.
+    /// The connection was fenced while the rename waited for its answer,
+    /// whether that answer then turned out to be success, an error or none.
     SessionRenameInterrupted {
         owner_key_fingerprint: i64,
     },
@@ -3076,17 +3078,18 @@ impl AcpBackend {
                 owner_key_fingerprint,
             },
             Some(sent) => match tokio::time::timeout(bound, sent.block_task()).await {
-                Ok(Ok(_)) => AcpTraceEvent::SessionRenameAcknowledged {
-                    owner_key_fingerprint,
-                },
-                // Retirement or escalation fails or starves a request
-                // already on the wire. That is this bridge's own teardown,
-                // not the adapter's verdict on the rename.
+                // Retirement or escalation fails, starves or overtakes a
+                // request already on the wire. That is this bridge's own
+                // teardown, so whatever the adapter answered after it is not
+                // the adapter's verdict on the rename.
                 _ if unavailable.load(Ordering::SeqCst) => {
                     AcpTraceEvent::SessionRenameInterrupted {
                         owner_key_fingerprint,
                     }
                 }
+                Ok(Ok(_)) => AcpTraceEvent::SessionRenameAcknowledged {
+                    owner_key_fingerprint,
+                },
                 Ok(Err(error)) => AcpTraceEvent::SessionRenameRejected {
                     owner_key_fingerprint,
                     rpc_code: Self::error_code_i64(error.code),
@@ -22055,6 +22058,34 @@ mod tests {
             .unwrap()
             .expect("a rename cut off by the fence must not fail the mint");
         assert_eq!(minted.0.as_ref(), "agent-sess-RENAME-CUT");
+        settle_recording_agent(&backend).await;
+        assert_eq!(rec.renames().await.len(), 1);
+        trace.assert_one("WARN", "acp.session_rename_interrupted");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn rename_acknowledged_after_the_fence_is_traced_as_interrupted() {
+        let rec = Recorder::new("agent-sess-RENAME-LATE-ACK");
+        rec.gate_rename.store(true, Ordering::SeqCst);
+        // The adapter accepts the rename, but only once the fence is closed:
+        // that success is no more its verdict than a late error would be.
+        let (backend, trace) = connect_renaming(&rec, test_config()).await;
+        let session = bkey("bridge-RENAME-LATE-ACK");
+
+        let mint: Mint = {
+            let backend = Arc::clone(&backend);
+            let session = session.clone();
+            tokio::spawn(async move { backend.ensure_session(&session).await })
+        };
+        renames_recorded(&rec, 1).await;
+        AcpBackend::close_connection_fence(&backend.dispatch_gate, &backend.unavailable);
+        open_rename_gate(&rec);
+
+        let minted = mint
+            .await
+            .unwrap()
+            .expect("a rename the fence overtook must not fail the mint");
+        assert_eq!(minted.0.as_ref(), "agent-sess-RENAME-LATE-ACK");
         settle_recording_agent(&backend).await;
         assert_eq!(rec.renames().await.len(), 1);
         trace.assert_one("WARN", "acp.session_rename_interrupted");
