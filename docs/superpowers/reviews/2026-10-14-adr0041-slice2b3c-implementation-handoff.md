@@ -510,3 +510,263 @@ new `unsafe`. The commit message is in `.git/A2A_COMMIT_MSG`; the bridge commits
    materialization pass's own consumed-byte binding and replacement hook), create at `0600`/`0700` through
    `create_new_regular_child` / `create_new_child_directory` / `create_new_symlink_child`, with the one ledger, the
    deadline, the per-step gates and `PayloadPlaneRestoreFailureV1` partial progress.
+
+---
+
+# Increment C2b — phase-P materialization (worktree, index, evidence)
+
+**Written:** 2026-10-14 · **By:** Opus 5.5 (`claude-opus-5-5`) through `a2a-bridge implement` · **Base:**
+`c86d392a` (C2a merged, PR #143) · **Scope:** C2b only; C3 (the terminal gate, final modes, the complete
+`RestoredPayloadPlaneV1`) is not started.
+**Source snapshot:** `e8a6f077fea26e39` after source-review round 1 (round 0 was `16ecb2344bdbfef0`); the first 16
+hex digits of the SHA-256 of the three changed `.rs` files concatenated in the C2b §7 order; per-file hashes are in the
+receipts.
+**Receipts:** `.git/a2a-evidence/2b3c-c2b/` (listed in C2b §3.5; round 0's are kept in its `round0/`).
+
+**Source review round 1/2 (Sol/xhigh): REJECT, two WRONG·BLOCKER findings, both folded here.**
+
+| # | Finding | Disposition (round 1 bytes) |
+|---|---|---|
+| W1 | A create could follow an expired deadline: one check before an entry, then `evidence/`, its slot and the entry created with no check between (a slow `evidence/` create in its directory sync, then two more creates). | Fixed. The one deadline is now read immediately after every create returns, once what it made is kept: after `evidence/` (its pin kept, charged), after a slot, after a directory or symlink entry is recorded, right after a file's create-new (in flight, before its first byte), and after a written file is verified and recorded (guards `payload-created`, `payload-verified`). A directory entry is now recorded from its pin, with no further filesystem call between its create and that reading. New control `c2b_a_create_returning_after_the_deadline_is_never_followed_by_another` (7 rows, the reviewer's `evidence/` row first: `Timeout`, `evidence/`'s pin and its one allowance in the partial, no slot and no file on disk); mutation rows M43–M46 (§4.2). |
+| W2 | The gates did not enforce the interim modes: a same-inode `chmod` of a created file or directory between its creation and a gate passed every gate, and the created file's mode was recorded but not required. | Fixed. A file's mode must be `0600` as its create returns, after its write (its own `fstat`), at its by-name recheck, and at every gate; every created directory (entries, `evidence/`, slots) must still be `0700` at every gate (`recheck_directory`, one no-follow `fstatat`: kind, the pin's device and inode, mode). New control `c2b_the_created_modes_are_required_at_creation_and_at_every_gate` (mode-only changes from `EntryCreated` and before each step gate → `IdentityChanged` with the prior step as `last_completed`; a file not `0600` as its create returns → refused at its create, in flight, nothing after); mutation rows M47–M50 (§4.2). §5.4 is replaced accordingly. |
+
+## C2b 1. Context
+
+Increment C2b of the 2B3c payload plane (task spec revision 4, "C2b — materialization"; D1–D4, D6, D7; the global
+input, consumed-byte, write, budget, deadline and gate rules). It consumes C2a's plan and writes the worktree, the
+index and the three evidence classes at `0600`/`0700`, each step ending in a gate, and returns a crate-private value
+carrying everything C3's terminal gate needs. No final mode is applied and no terminal gate is built.
+
+Lane: the bridge's Linux container (OrbStack kernel `7.0.14`), running as root, with every payload control (C2a's 18
+and C2b's 19) also run as an unprivileged user (`setpriv --reuid=65534 --regid=65534 --clear-groups`, `TMPDIR` in a
+world-writable scratch directory, empty afterwards). **The native non-root macOS run was not performed here**; the
+spec gives it to the controller (C2b §6).
+
+## C2b 2. What changed
+
+### 2.1 `crates/bridge-core/src/custody_restore_payload.rs`
+
+C2a's planner half is unchanged except the gate (below), the partial value, the new error variants and the test seams.
+All C2b code is in one new section after the entry point, headed
+`// Materialization (increment C2b): the worktree, the index, and the evidence`.
+
+| Item | Contract |
+|---|---|
+| `materialize_payload_plane_v1(plane, frame_budget, deadline)` and `materialize_payload_plane_bounded_v1(…, table_bound)` | Plan exactly as C2a (`plan_payload_plane_bounded_v1`: admission, prevalidation, their two gates; a refusal there keeps C2a's shape), then three steps on the ONE deadline and the one ledger: **Worktree** (the worktree frame; D3's root gitfile to `evidence/worktree_root_gitfile/gitfile`), **Index** (`index`, `sharedindex.*` beneath `repository/.git`), **Evidence** (`InProgressGitOperations`, `GitConfigurationAndHooks`, `BridgeEvidence`, in step order, beneath `evidence/<serde wire name>/`). Each step writes its Captured frames and then runs the gate; `last_completed` advances only after the gate. Returns `MaterializedPayloadPlaneV1` or `Box<PayloadPlaneRestoreFailureV1>` (§5.1 on the name). |
+| Third decode (`materialize_frame`) | Guard `payload-write-frame`; the plan must bind the staged payload it names (role, plane, length, SHA-256), else `PlanMismatch` before any create; a `try_clone` of the retained descriptor (no staged name reopened); `reverify_staged_v1`; the pass's own hook `MaterializationRehashed`; the decode through phase G's `PacedFrameReaderV1` (deadline before every read, bounded to length + 1, every consumed byte counted and hashed). Each decoded entry must equal the planned entry at its position (path bytes, kind, mode, length, target), else a `PlanMismatch` is **held** and nothing after it is created. A create's refusal is also held; the deadline and the decoder's own failure end the decode at once. After the verified trailer: count + SHA-256 = staged (`StagedInputChanged`), then decoded count = planned count (`PlanMismatch`), then the held refusal; guard `payload-write-decoded`; rewind. |
+| Entries | Before each create: guard `payload-write-item`. **Directory**: phase V's `create_staging_directory` (entry reserved first, `mkdirat 0700` + the primitive's owner/`0700`/identity verification, given back only on `EEXIST`, device check incl. the `CREATED_DEV` seam); `StagingCollision` → `DestinationCollision`; recorded from its pin, then guard `payload-created`. **File**: entry reserved, `create_new_regular_child` (`O_CREAT\|O_EXCL\|O_NOFOLLOW`, `0600`), `EEXIST` → given back + `DestinationCollision`; guard `payload-created` as the create returns (the file in flight); device and `0600` checked before the first byte; phase G's `stream_into` (each chunk reserved before it is written, only the unwritten part given back on a short/failed/zero write or the deadline; the deadline before every chunk); then the descriptor's `fstat` (regular, frame length, root's device, same inode, `0600`) and a by-name no-follow recheck (the same, `0600`); the descriptor is dropped; recorded, then guard `payload-verified`. **Symlink**: entry reserved, C1's `create_new_symlink_child`; `TargetExists` → `DestinationCollision` and `DestinationUnsupported` → typed refusal, both given back; any other refusal keeps the charge; device check; recorded, then guard `payload-created`. **Connector** (childless root `.git`): skipped. `evidence/` and each slot directory are created only when an entry needs them, each followed by guard `payload-created` once its pin is kept. So no create follows a create, write, or verification that returned after the deadline. |
+| Recorded identity | `CreatedEntryV1 { path, kind: Directory \| Regular { length, sha256 } \| Symlink { target }, frame_mode, created_mode, final_mode, dev, ino }`. `created_mode` is `0600` for a file (required at its creation, after its write, and at every gate) and `0700` for a directory (required by the primitive and at every gate) (§5.4). `final_mode` is planned, never applied: the frame's mode for the worktree (D4), `0600` for the index (D4), `0400`/`0500` for evidence (D2), none for a symlink. `CreatedTreeV1 { entries (creation order), directories (pin per created directory) }`; `CreatedEvidenceV1 { root, slots: [EvidenceDirectoryV1 { slot, pin, tree }] }` (`evidence/` and slots end `0500`, constant); `PayloadCreatedV1 { worktree, index, evidence, in_flight: Option<InFlightPayloadFileV1 { name, expected_length, written }>, charged }`. |
+| `MaterializedPayloadPlaneV1` | `{ step: Evidence, plane, plan, created }`: the phase-G value unchanged (descriptors at offset 0), the plan (classes, `root_git`, `childless_directories()`, `declared_external_references()`), and every created entry's identity, modes and directory pin. |
+| Errors | New `PayloadPlaneErrorV1::{DestinationCollision { name }, DestinationUnsupported { name, target_len }, PlanMismatch { class, detail }}`. Budget, device crossing, identity, I/O and mount refusals stay `Restore(…)`; phase G's helpers keep their `From` mapping. |
+| `PayloadPlanePartialV1` | Gains `plan: Option<PayloadPlanV1>` and `created: PayloadCreatedV1` (every created row and pin, the file in flight, the charge). Nothing is removed. |
+| Gate | C2a's `retained_sweep` is split: `retained_chains` (the same staging/HOME/XDG/bootstrap edges, same order), then `created_chains` (the worktree tree beneath `repository/`, the index beneath `.git`, `evidence/`, each slot and each slot's tree, parents first: a directory by no-follow `fstatat` against its pin's device and inode and `0700`, a file/link against its recorded kind/device/inode/length and, for a file, `0600`; guard `payload-output-chain` per row), then guard `payload-root` and the root's identity LAST. `gate(plane, created: Option<&PayloadCreatedV1>, deadline)`; planning passes `None`, so its guard sequence and census count are unchanged (the C2a controls are unchanged and green). |
+| Test seams | Hook points `MaterializationRehashed`, `MaterializationEntry`, `BeforeCreate`, `EntryCreated`, `BeforeStepGate`; the event gains `step`; `edit_plan_for_test` (a plan that does not describe its frames); the seam guard is now an enum. |
+
+### 2.2 `crates/bridge-core/src/custody_restore_git.rs` (visibility only)
+
+`pub(super)` on `stream_into`, `SinkV1` and its five fields. No body changed; every 2B3b control is unchanged and green.
+
+### 2.3 `crates/bridge-core/src/custody_restore_payload_tests.rs` (19 new controls; 2 C2a edits)
+
+C2a edits: the structural control `c2a_the_planner_holds_no_write_vocabulary_and_no_unsafe` now scans the planner half
+only (it cuts at the C2b header, which must occur exactly once); `expected_guards` is refactored into `gate_guards`
+plus the same sequence. The C2b runner (`PCaseV1::write_within`) holds on **every** outcome that the one ledger moved by
+exactly what phase P reports it charged, that a failure reports that ledger's figure, that every entry phase V/G made is
+unchanged (unless the row's own hook drifted the tree), and that every added entry lies in a phase-P plane (beneath
+`repository/` but outside `.git`, `repository/.git/{index,sharedindex.*}`, or `evidence/`).
+`assert_created_is_the_disk` holds that the recorded rows (identity, pin, bytes, SHA-256, target, modes, in-flight bytes)
+are exactly what was added, and that the disk's own charge equals the reported one.
+
+| Control | Proves |
+|---|---|
+| `c2b_the_rich_clone_restores_byte_exact_with_a_split_index` | The rich clone with a REAL split index (`git update-index --split-index`: `index` + one `sharedindex.<hash>`) and a worktree symlink, V→G→P: added = the test's own decode of every frame, byte-exact, nothing else; source bytes agree (shared index, README, hook, bridge evidence); `a2a-bridge/evidence.json` and `A2A_TASK.md` only beneath `evidence/bridge_evidence/`; no `target/`, no gitfile slot; slot names = serde wire names; frame/created/final modes (hook `0755`/`0600`/`0400`); descriptors at offset 0. |
+| `c2b_a_root_gitfile_lands_in_evidence_and_nothing_at_repository_git` | Real separate-Git-dir capsule: the gitfile's source bytes at `evidence/worktree_root_gitfile/gitfile`, `repository/.git` still phase G's inode, `.gd`/`empty` empty `0700`; on hand frames the gitfile exists before the worktree gate and its slot precedes a later class's. |
+| `c2b_symlinks_are_written_verbatim_and_never_followed` | Absolute, `..`, dangling, escaping, non-UTF-8 and to-directory targets in the worktree and an evidence class: verbatim; the outside file's bytes/inode/mode/times unchanged, the outside directory empty, no target created; no modes recorded; exactly the external links declared. |
+| `c2b_a_symlink_the_destination_cannot_hold_refuses_typed` | 4095-byte target, probed at run time: held byte-exact (this lane) or `DestinationUnsupported` with nothing at its name and its allowance given back (macOS). |
+| `c2b_the_ledger_exactly_fits_and_one_byte_over_refuses` | Content-dominated and entry-dominated frames: exactly-fits succeeds with the ledger full; one byte under refuses `Budget` at the last chunk (file in flight, 0 bytes) / the last entry (nothing at its name), figure = ceiling + 1 − last; no room refuses before anything exists (`began` false). |
+| `c2b_a_short_write_then_an_error_charges_exactly_the_accepted_bytes` | 4-byte chunks; `WriteAfter(6)` and `WriteZeroAfter(6)`: 6 bytes on disk, charged `(1 entry, 6 bytes)`, in flight `written = 6`; `ShortWrites(3)` alone writes and charges all 10. |
+| `c2b_the_deadline_expiring_mid_frame_or_mid_step_halts_with_the_partial_kept` | Six rows (an entry mid-frame, between two chunks, before the index frame's decode, before an evidence frame's decode, in the worktree and the evidence gates): `Timeout`, the right `last_completed`, exactly the entries created before; brief delays at every guard succeed. 10 s deadlines, started after the plane exists; each row asserts its hook fired before the deadline (INVALID otherwise). |
+| `c2b_every_materialization_guard_is_in_its_place_and_halts_the_run_alone` | The clean run's guard sequence equals one computed from the plane's chains and the frames (with `payload-created`/`payload-verified` after every create); eleven halting rows (each materialization guard label, `evidence/`'s create included) → `Timeout` with the right `last_completed`. |
+| `c2b_a_create_returning_after_the_deadline_is_never_followed_by_another` | (Review round 1, W1.) The guard after a create made slow: `evidence/` (pin and one allowance kept, no slot, no file), a slot (no entry), a directory (no child), a file's create (in flight, 0 bytes, nothing after; also the frame's last entry), a symlink, a written file's verification → `Timeout`, the right `last_completed`, exactly what was made before, recorded as on disk. |
+| `c2b_the_created_modes_are_required_at_creation_and_at_every_gate` | (Review round 1, W2.) Mode-only changes (same inode, kind, length): a file `0777` and a directory `0755` right after creation, a file `0400`, a directory `0750`, the index `0644`, an evidence file `0400`, `evidence/` `0755` and a slot `0711` before their step gates → `IdentityChanged` with the prior step as `last_completed`; a file made `0644` as its create returns → refused at its create, in flight with no byte, nothing after. |
+| `c2b_a_frame_replaced_during_the_materialization_pass_refuses_as_changed` | The pass's own hook writes a valid same-length frame: `StagedInputChanged` for the worktree/index/evidence with `last_completed` Prevalidation/Worktree/Index, the written bytes stay; prevalidation's hook fired once (its own pass); a change before this pass's rehash refuses before any create; a held collision yields to the binding; an unplanned name is never created. |
+| `c2b_a_plan_that_does_not_describe_its_frames_refuses` | Plan edits (digest, length, an entry the plan lacks, an entry the frame lacks) → `PlanMismatch`, with exactly the earlier entries kept. |
+| `c2b_an_entry_replaced_after_creation_refuses_at_its_step_gate` | Nine rows at the step gates (file/dir/link/file→link/removed, index file, evidence file, `evidence/`, a slot) → `IdentityChanged` with the right `last_completed`; replaced during its own write → refused at its create, nothing after; replaced right after creation → later entries created, the gate refuses. |
+| `c2b_a_device_crossing_refuses_and_keeps_the_charge` | Directory, file, link, index file, `evidence/`, a slot, an evidence file on another device → `DeviceCrossing` at its create, kept and charged, the right `last_completed`. |
+| `c2b_every_step_names_its_last_completed_step` | Collisions planted just before the create of a worktree file and link, the index, `evidence/`, a slot → `DestinationCollision`, planted entry untouched, allowance given back, right `last_completed`/`began`; a clean run takes five censuses; a mount at census 3/4/5 → Prevalidation/Worktree/Index. |
+| `c2b_case_and_normalization_variants_restore_or_collide_as_the_destination_decides` | `A`/`a` and NFD/NFC `é`: folding detected at run time; distinct on this lane (both restored), `DestinationCollision` on the second name with the first kept on a folding one. |
+| `c2b_an_empty_class_creates_nothing` | All Empty: nothing added; one evidence class: only `evidence/`, its slot, its entry; an index alone: `repository/` holds only `.git`; a Captured evidence frame with no entry: nothing at all. |
+| `c2b_a_second_invocation_refuses_and_changes_nothing` | Over a written destination: `DestinationCollision` at the first create (`repository/a`, or `evidence` after two empty steps), `began` false, the ledger and the tree unchanged. |
+| `c2b_the_materialization_section_is_create_new_only` | Structural only: no rename/remove/truncate/chmod/path-symlink/sync/Git/`unsafe` vocabulary and no Git metadata literal in the C2b section; it uses the create-new primitives, the ledger, the retained descriptors and the deadline. |
+
+## C2b 3. Verification
+
+All runs were in the foreground with `CARGO_INCREMENTAL=0` and the proxies unset.
+
+### 3.1 Targeted controls (final bytes)
+
+- As root: `37 passed; 0 failed; 0 ignored; 1487 filtered out` (~31 s).
+- As `nobody`: `37 passed; 0 failed; 0 ignored; 1487 filtered out` (~33 s); the scratch `TMPDIR` was empty afterwards.
+- Runtime probes on this lane: `PAYLOAD-LONG-SYMLINK target_len=4095 holds=true`, `PAYLOAD-FOLDING case folds=false`,
+  `PAYLOAD-FOLDING normalization folds=false`.
+
+### 3.2 Required local gates
+
+| Gate | Result |
+|---|---|
+| `cargo fmt --all -- --check` | clean |
+| `cargo clippy --workspace --all-targets --all-features -- -D warnings` | clean (0 warnings) on final bytes. Earlier runs flagged `bool_assert_comparison` in a test and `unused_assignments` on a test-only path variable; both fixed. |
+| `cargo test -p bridge-core` | **1663 passed, 0 failed, 0 ignored; nothing excluded**: lib 1524 (C2a's 1505 + 19), trybuild 1, 13 integration binaries 128, doc-tests 10. Run as an exact partition (§3.3). Round 0: 1661 (lib 1522). |
+| `cargo run -p a2a-bridge -- validate --repo-hygiene` | `repository hygiene validated` (41 tracked artifacts, 9 example configs) |
+| `git diff --check` | clean |
+
+### 3.3 The full suite in partitions
+
+C2a measured the monolithic `cargo test -p bridge-core` at over nine minutes in this container, beyond the 600 s
+foreground limit, so the lib binary was run directly in nine filtered partitions at `--test-threads 6`, each under its
+own foreground timeout: `b2c` 66 (143 s), `b2a` 40 (197 s), `b2b` 49, `b1a` 31, `b1b` 49, `round` 26 (137 s),
+`corrective` 25, the rest of `git_tests` with the 37 payload controls 98, and the rest of the lib 1140 = **1524, all
+passed** (round 1 bytes; round 0's 1522 are in `round0/`). Then `cargo test -p bridge-core --test '*'` (trybuild 1 + 128) and `--doc` (10). No failure occurred in any
+partition, so no base-control run was needed; C2a's load-sensitive 2B3b deadline controls did not fail this time. The
+rest-of-lib log also holds the known extra `1 passed` line of `path_identity_refuses_an_unreadable_ancestor`'s nested
+child (C1 §3.3), excluded from the totals.
+
+### 3.4 Final-bytes run
+
+After the last source edit of round 1 (formatting, before its mutation matrix), on snapshot `e8a6f077fea26e39`: fmt,
+workspace clippy, repo hygiene and `git diff --check` clean; the partitioned suite (§3.3); the 37 payload controls as
+root and as `nobody` (`08-*`). The matrix restored the source byte-exact after every row (checked by SHA-256 in the script), and
+`sha256sum -c source-sha256.txt` passed after the structural-RED build.
+
+### 3.5 Receipts (`.git/a2a-evidence/2b3c-c2b/`)
+
+| File | Content |
+|---|---|
+| `base-commit.txt` | `c86d392a…` |
+| `01-red-missing-symbol.log` | Structural RED (§4.1). |
+| `04-clippy-workspace.log` | §3.2 |
+| `05-binary.txt`, `05-part-{1..9}-*.log`, `05-totals.txt`, `05g-integration.log`, `05h-doc.log` | §3.3 |
+| `06-repo-hygiene.log` | §3.2 |
+| `07-run_mutations.py`, `07-mutation-matrix-{a..k}.json`, `07-summary.md` | §4.2 |
+| `08-final-targeted-{root,nonroot}-linux.log` | §3.1, §3.4 |
+| `source-sha256.txt` | Per-file SHA-256 of the three changed `.rs` files. |
+| `round0/` | Round 0's receipts (its 42-row matrix, partitions, structural RED, targeted runs, hashes). |
+
+## C2b 4. RED evidence
+
+### 4.1 Structural RED
+
+The production section was drafted before the controls, so structural RED was taken by compiling the finished
+controls with the C2b section (everything from its header) removed: `cargo test -p bridge-core --lib --no-run` failed
+with 62 errors on round 1 bytes (59 on round 0), all unresolved C2b symbols (`EvidenceSlotV1`, `TreeAtV1`, `CreatedKindV1`, `PayloadCreatedV1`,
+`CreatedTreeV1`, `InFlightPayloadFileV1`, `MaterializedPayloadPlaneV1`, `materialize_payload_plane_v1`, `split_path`,
+`EVIDENCE_NAME_V1`) and their derived `E0282`s. The source was then restored and its hash checked.
+
+### 4.2 Behavioural RED: the single-guard mutation matrix
+
+`07-run_mutations.py` applies each row as exact, unique replacements to `custody_restore_payload.rs`, rebuilds, runs
+all 37 payload controls as root and as `nobody`, records the failing controls, restores the file and checks its
+SHA-256. On round 1 bytes, **50 rows (round 0's 42, re-pointed where their code changed, and M43–M50 for the review
+fixes): 45 turned controls red, every row identically as root and as `nobody`; 5 survived (below).** The full row →
+control table is `07-summary.md`; condensed:
+
+| Rows | Guard removed | Controls turned red |
+|---|---|---|
+| M01, M02, M04, M05 | this pass's rehash; the SHA-256 binding; a create refusal or an unplanned entry returned before the binding | replacement control (+ guard, structural) |
+| M06–M08 | decoded entry ≠ plan; decoded count ≠ plan; the plan's staged binding | plan control (+ replacement) |
+| M09–M11, M19 | item, frame, decoded guards; the root's identity before the created chains | guard control (+ deadline, replacement) |
+| M12, M13, M35 | the step gate; the gate without the created rows; a step completed before its gate | step-gate, guard, step, deadline controls |
+| M14–M18, M38 | `evidence/`, slot, directory, file/link rechecks; inode/device dropped from the recheck; the by-name recheck after a write | step-gate control |
+| M20–M22, M42 | a file's/link's entry not reserved; a file/link collision keeps its charge | ledger, step, second-invocation and most byte-exact controls |
+| M24–M27 | a file's/link's device unchecked; `began` not set; the in-flight bytes not recorded | device, short-write, ledger, deadline controls |
+| M28–M33, M36, M39–M41 | final modes; `evidence/` for an Empty class; the connector created; the gitfile into the worktree; a non-wire slot name; no rewind; an untyped directory collision; `evidence/` or the index beneath `repository/` | rich-clone, gitfile, empty-class, step, second-invocation and most byte-exact controls |
+| M43–M46 | (W1) the reading after `evidence/`'s create, after a slot's, after a recorded entry, after a file's create-new | slow-create control, guard control (M46 also the mode control) |
+| M47, M49, M50 | (W2) a file's `0600` at its creation; at the gates; a directory's `0700` at the gates | mode control |
+
+Survivors, each predicted before its run and kept deliberately:
+- **M03** (the consumed **count** comparison removed): any count difference also changes the consumed SHA-256, so the
+  digest refuses every observable case (C2a's M12 and phase G have the same survivor).
+- **M23** (a link the destination cannot hold keeps its charge): this lane holds 4095-byte targets, so the refusal
+  branch never runs here; on macOS, `c2b_a_symlink_the_destination_cannot_hold_refuses_typed`'s charge check
+  (`assert_created_is_the_disk`) decides it. The controller's macOS run is the evidence for this row.
+- **M34** (the decode-ending refusals held instead): a held `Timeout` is re-raised by the loop's own `before_deadline`
+  at the next iteration, and a held `FrameInvalid` by the poisoned decoder's next call, so the outcome is the same;
+  `ends_the_decode` documents the intent (phase G keeps the same helper).
+- **M37** (the written file's own `fstat` comparison removed): the by-name recheck that follows compares the same
+  inode, device, frame length and mode, so every change the descriptor check can see is also refused there; it is
+  defence in depth, as in phase G's `make_file`.
+- **M48** (the `0600` dropped from that descriptor comparison only): the by-name recheck immediately after requires
+  `0600` too, for the same reason as M37.
+
+## C2b 5. Open items: interpretations for the reviewer and controller
+
+1. **Entry-point name.** The spec's `restore_payload_plane_v1 → RestoredPayloadPlaneV1` includes the terminal gate,
+   which is C3's. C2b's entry point is therefore `materialize_payload_plane_v1 → MaterializedPayloadPlaneV1` (step
+   `Evidence`), and C3 can add `restore_payload_plane_v1` as materialization followed by the terminal gate.
+2. **The root gitfile is written in the Worktree step.** Its bytes stream from the worktree frame, so writing it there
+   needs neither buffering nor a fourth decode. `evidence/` and `evidence/worktree_root_gitfile/` can therefore first
+   appear in the Worktree step; that step's gate covers them.
+3. **A symlink charges one entry allowance only.** A target is at most 4095 bytes, within the 64 KiB allowance; the
+   controls' disk measure counts a link as one entry.
+4. **Interim modes are enforced (round 1, W2).** A file must be `0600` as its create returns (its `fstat`), after its
+   write, at its by-name recheck, and at every gate; a directory is `0700` by its primitive and at every gate. A wrong
+   mode is `IdentityChanged`, like any other change to a created entry. The creation-time arm is provoked through the
+   guard that follows the create (a hook changes the mode there); the test process's umask is never changed. A
+   symlink's mode is not compared (nothing reads it, and Linux cannot change it).
+5. **Entries refused after their create.** A directory or link refused by a post-create guard (device, identity) stays
+   on disk and charged and is named by the failure, but it is not an inventory row, because its identity was refused;
+   a file stays as `in_flight`. This is phase G's B2b shape.
+6. **No per-entry chain recheck.** Unlike phase G's B2b (a bounded recheck before each create), phase P relies on
+   descriptor-relative creation, the by-name verification of each created entry, and the gates the spec places (before
+   the first write, i.e. prevalidation's gate, and at the end of each step). A parent renamed away keeps receiving its
+   entries through its retained descriptor, and the step gate then refuses (the "a swapped directory" row).
+7. **Every step runs its gate, even an Empty one**, and each gate rechecks everything created so far (five censuses
+   in a clean run; O(entries) per gate).
+8. **`stream_into` is phase G's, unchanged**, so its guard label (`metadata-read`) and its seams (`BeforeObjectChunk`,
+   `ObjectIo`, the object fault and chunk seams) apply to payload files too.
+9. **No per-file fsync**, as in phase G's B2b; each directory create syncs its parent inside the primitive.
+10. **The rich clone's split index.** `PlanFixtureV1`'s fields are private to another module, so the control derives the
+    source (`<area>/scratch/capsule` → `<area>/clone`) from `capsule_dir()` and asserts its layout first.
+11. **The plan-edit seam** (`edit_plan_for_test`) is the only way to exercise `PlanMismatch` after a verified binding;
+    with an unmodified plan it is unreachable (the same bytes decode to the same entries).
+
+## C2b 6. Risks
+
+- **The macOS native non-root run has not happened.** Facts it decides:
+  - the folding branch (APFS folds case by default, and normalization in both variants): expected
+    `DestinationCollision` on the second name in both rows of the folding control;
+  - the 4095-byte symlink refusal (expected `DestinationUnsupported`; it also decides survivor M23);
+  - `git update-index --split-index` with the lane Git, and the planner's capture of a worktree symlink, on APFS;
+  - the 10 s deadline rows (each starts after its plane exists and reports INVALID, never a false pass or fail, if a hook
+    is reached late).
+
+  If any of these fails, the right response is to report it, not to weaken the control.
+- **Descriptor use.** Each created directory keeps its pin's descriptor until the value is dropped, as the spec's
+  result requires. A worktree with more directories than the soft `RLIMIT_NOFILE` (256 by default on macOS) would fail at
+  a create with a typed I/O refusal and its partial kept; files keep no descriptor. C3 and 2B3d may need to bound this.
+- **Pre-existing, outside scope:** C2a §3.3's load-sensitive 2B3b deadline controls (not reproduced in this run) and
+  C2a §6's `RouteV1` non-root leftovers (no C2b control uses the recording route).
+
+## C2b 7. Files
+
+Changed and staged, and nothing else:
+- `crates/bridge-core/src/custody_restore_git.rs` — visibility only (§2.2)
+- `crates/bridge-core/src/custody_restore_payload.rs` — the C2b section, the gate split, the partial value, the error
+  variants and the seams (§2.1)
+- `crates/bridge-core/src/custody_restore_payload_tests.rs` — 19 controls and two C2a edits (§2.3)
+- `docs/superpowers/reviews/2026-10-14-adr0041-slice2b3c-implementation-handoff.md` — this section
+
+There are no dependency, `Cargo.lock`, public-API, wire, runner, `fs_custody`, frame-codec or coverage changes, and no
+new `unsafe`. The commit message is in `.git/A2A_COMMIT_MSG`; the bridge commits. There is no push or merge.
+
+## C2b 8. Next
+
+1. The controller runs `cargo test -p bridge-core` natively on macOS as a non-root user on this candidate, before the
+   C2b source review (§6 lists what it decides).
+2. C2b source review round 2/2: Sol/xhigh, on the round 1 bytes; the round 1 dispositions are at the head of this
+   section. §5 lists the interpretations still to rule on, especially §5.1 (the entry point's name) and §5.6 (no
+   per-entry chain recheck).
+3. On approval, C3 on the approved commit: the terminal gate over `MaterializedPayloadPlaneV1` (census; the post-order
+   walk of the worktree, index and evidence trees using `CreatedTreeV1`'s rows and pins, `set_exact_file_mode` /
+   `PinnedDirectoryV1::set_exact_mode` with each row's `final_mode`; the retained chains; the root's identity last) and
+   the complete `RestoredPayloadPlaneV1`.

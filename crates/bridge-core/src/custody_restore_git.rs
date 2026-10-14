@@ -6360,13 +6360,13 @@ enum MetaScopeV1<'s> {
 }
 
 /// Where one file's bytes go: the destination, the one deadline, and the file's own names.
-struct SinkV1<'s> {
-    dest: &'s super::RestoreDestinationV1,
-    deadline: Instant,
-    relative: &'s str,
+pub(super) struct SinkV1<'s> {
+    pub(super) dest: &'s super::RestoreDestinationV1,
+    pub(super) deadline: Instant,
+    pub(super) relative: &'s str,
     /// The file's path, for the test hooks.
-    hook_path: &'s Path,
-    length: u64,
+    pub(super) hook_path: &'s Path,
+    pub(super) length: u64,
 }
 
 /// Stream exactly `sink.length` bytes of `source` into `output`, at most one chunk in memory: the clock
@@ -6375,7 +6375,7 @@ struct SinkV1<'s> {
 /// failed or zero-length write stops the copy with the part of the chunk that was reserved and never
 /// written given back. A write that returned (a prefix, or an interruption that wrote nothing) is followed
 /// by another call only while the one deadline is still ahead. Returns the SHA-256 of the bytes written.
-fn stream_into(
+pub(super) fn stream_into(
     sink: &SinkV1<'_>,
     charged: &mut MetadataChargeV1,
     in_flight: &mut Option<InFlightMetadataFileV1>,
