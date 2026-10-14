@@ -238,3 +238,18 @@
   `~/.a2a-dispatch/adr0041-2b3b-custody/`.
 - Note: two worktrees sharing one `CARGO_TARGET_DIR` reused a stale test binary (wrong test count); controls must use
   their own target dir.
+
+## 2026-10-14 macOS repair and native gate
+
+- All 13 macOS failures classified as test assumptions (no production defect): 8 root-only racers, 1
+  case-insensitive `exists()` check, 2 deadlines started before fixture warm-up, 2 admission deadlines too tight
+  under load. Case-only ref collisions cannot overwrite: B1a refuses them (ASCII-folded table) before any create,
+  and creates are exclusive.
+- Owner directed the repair to `gpt-6.1-sol`; that needed codex-acp ≥2.x, delivered by the provider refresh
+  (PR #135). Repair `f3d0fac1` (codex `gpt-6.1-sol`/xhigh, implementor image `082205ee…`, cap 2): test-only,
+  container verify PASS, built-in review APPROVE in 1 attempt; implementor: lib 1,473/0, the 8 permission tests
+  pass as UID 65534, 4 guard mutations each turn a repaired test red.
+- Native macOS gate on `f3d0fac1`: `cargo test -p bridge-core` twice, 1,604 passed / 0 failed each.
+- Final branch `work/adr0041-2b3b-b2c-adopt-20261013` = B2c adoption + repair + this controller branch + main
+  `91ef9b2f`. Against main: 6 `bridge-core` files (+41.8k: ~9.6k production, ~32k tests) and 41 docs files.
+  One combined Sol review (cap 1) in flight, then the PR (Linux/ext4 = CI).
