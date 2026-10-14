@@ -22,7 +22,13 @@ release (see [`docs/adr/`](docs/adr/) for the full architectural record).
   it past `cancel_grace`, the turn still fails and its connection takes no new prompt, but the
   shared agent process is terminated only once no other session's turn is running on it, so one
   hung session does not cut the others short (the `[agents.watchdog]` still terminates at once).
-  No client marks a turn as watched yet, so every such turn gets the 2-hour work cutoff. Workflow
+  A diagnostic journal stalled on recording the start of the turn's stream does not hold a bounded
+  turn open either: once the turn's cancellation has settled, it waits at most 5 s more for those
+  records, then reports its failure and frees its session. The records, and the failure's own
+  record after them, are finished in the background for up to 5 minutes, and how that ends is
+  traced. A turn the agent had already finished then fails with `acp.prompt.start_records_pending`
+  (`Persistence`) rather than completing, as when those records fail. No client marks a turn as
+  watched yet, so every such turn gets the 2-hour work cutoff. Workflow
   node turns, preflight included, are unchanged: they carry neither bound and keep the workflow's
   own deadlines. The legacy `[agents.watchdog]` keeps its semantics and its
   `acp.prompt.watchdog_timeout` code and runs alongside; when bounds fall due at the same instant
