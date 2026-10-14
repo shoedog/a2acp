@@ -222,3 +222,19 @@
 [MEASURED] Round3 intermediate receipts: untouched110 control34/0/0/corecompiled; before6paths vsafter2Gitpaths semanticallymatch and bindimmutable110 (firstwhole-file-equality controllerprobe invalid because population differs). Corrected seam-onlyRED36/4/0 with actualtested source snapshots retained; earlierINVALID-T4-targetpath trial separate. Repaired40/0/0/corecompiled; all5snapshot hashes match frozenmatrixlaunch5535241c/a5bc2aae. Matrix17rowscomplete:15actualbehavioralflips(12productionstatement variants+2testseams+1wholedefectivecontrol), controls40/0/0, noinvalid/missedprediction/populationmismatch, all15mutateddigests recomputed/recordedbeforeafter/live5restoreequal; secondcustody b2a-round3-completed-matrix-custody/. Finalfocused active (no totalsclaim), full6gates/source3pending. Prepared providerfree run-b2a-round3-six-gates.py uses exactunchanged6commandJSON6811ef04; syntaxcheckedonly. Preparedreviewconfig6f2f2a5e validated, hardreadonlySol3/3, no dispatchbeforecomplete6receipts. prepare-b2b-after-round3-dispatch.py requires actualAPPROVE3/3 and exactadoption/cleanbase; unexecuted. No native/wholeG/adoptionclaim.
 
 [MEASURED] SUPERSEDES pendingfocused/writerstate: final238/0/0,232Git+6seal/corecompiled, all198baseline and232predecessornames preserved, sixnewnames independentlychecked. Fivefinalfocusbefore/after/live/matrixlaunch equal5535241c/a5bc2aae; secondcustody b2a-round3-final-focused-custody/. Bothmatrixcontrols actuallycorecompiled; all15predictionsexact(noextra),12production+2seams+1wholedefect. Workerfinished/absent, exact3stageblobschecked, finalcurrentcandidatehygieneprechecksuppliedPASS. Controllercandidatecommit88acb02e preservesparent110/checkpointRejected; operatorcorrectedmessage limits single-statement/literalprechangeRED claims, originalworkerbyteskept. ManualLinux6gates session43190active/fmtclippybuildPASS; source3pending. Preparedreviewgenerator eea1ef37 and controllerreceiptparser preserved. Completeworker97files in b2a-round3-worker-completed-custody/. No extra cleanup; externalsstoragegain notattributed.
+
+
+## 2026-10-13 native macOS gate (first run outside Linux-root containers)
+
+- B2c adopted onto `work/adr0041-2b3b-b2c-adopt-20261013` (cherry-picked `dc0b45ba..9e3d206b`, code byte-identical to
+  `9e3d206b`), then `origin/main` `1db1b50b` merged in cleanly (`bf313795`).
+- macOS (APFS, non-root, Apple Git 2.54.0): fmt OK, workspace clippy exit 0, `bridge-core` lib **1452 passed / 12
+  failed**. Same-environment control on the exact reviewed code `35fdeb0f` with an isolated target dir: also 1452/12,
+  11 in common (union 13). So the merge is not the cause; the reviewed code fails on native macOS.
+- Classes: 6 tests whose racer writes a read-only file (root-only assumption); 2 `custody_git_tests::a5*` that miss a
+  1 s admission deadline under full-suite load (pass alone, both orders); 1 case-collision ref test on case-insensitive
+  APFS; 1 pack-tamper refusal; 2 guard-sweep "fixture found None"; 1 typed-failure-set mismatch. The last five are
+  being classified (test assumption vs production defect) before any repair. Logs in
+  `~/.a2a-dispatch/adr0041-2b3b-custody/`.
+- Note: two worktrees sharing one `CARGO_TARGET_DIR` reused a stale test binary (wrong test count); controls must use
+  their own target dir.
