@@ -12,6 +12,7 @@ use crate::domain::{
 use crate::ids::{AgentId, AttemptId, AttemptIdentity};
 use crate::mcp::{render_codex_mcp_args, render_kiro_agent_config, McpDelivery, McpServerSpec};
 use crate::resource_flight::ResourceFlightIdV1;
+use crate::turn_liveness::LivenessOverrideV1;
 use crate::SessionCwd;
 use ring::rand::{SecureRandom, SystemRandom};
 use ring::{digest, hmac};
@@ -108,10 +109,17 @@ impl TaskClassV1 {
     }
 }
 
+/// The silence cutoff a workflow's node turns run under, frozen at admission.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SilenceCutoffV1 {
+    /// No silence cutoff: manual activation, an explicit `off`, and every run frozen before
+    /// workflow turns had one.
     None,
+    /// The node agent's `[agents.liveness] silence_cutoff_secs`, else the built-in 30 minutes.
+    AgentDefault,
+    /// An explicit workflow or invocation duration.
+    Activity { silence_ms: u64 },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1467,6 +1475,9 @@ pub struct WorkflowControlDefaultsV1 {
     pub max_work_cutoff_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_reason: Option<String>,
+    /// `[[workflows]] silence_cutoff`. Absent inherits; `Off` is kept distinct from absence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub silence_cutoff: Option<LivenessOverrideV1>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -1477,6 +1488,9 @@ pub struct ExecutionPolicyInvocationV1 {
     pub max_work_cutoff_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_reason: Option<String>,
+    /// `run-workflow --silence-cutoff`. Beats the workflow's value; `Off` beats a duration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub silence_cutoff: Option<LivenessOverrideV1>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -1497,6 +1511,8 @@ pub enum ExecutionPolicyError {
     FixedGraceInactive,
     #[error("fixed grace must fit inside the effective work cutoff")]
     InvalidFixedGrace,
+    #[error("silence cutoff must be whole seconds from 1 s to 30 days")]
+    InvalidSilenceCutoff,
     #[error("execution-policy arithmetic overflow")]
     ArithmeticOverflow,
     #[error("worktree owner must be a bounded portable identifier")]
@@ -1517,6 +1533,41 @@ pub enum ExecutionPolicyError {
     StructuredEvidenceOverBound,
     #[error("canonical structured evidence is invalid")]
     InvalidStructuredEvidence,
+}
+
+/// Refuses a silence override the shared checked parser could not have produced: whole seconds
+/// from 1 s to 30 days.
+fn checked_silence_override(
+    value: Option<LivenessOverrideV1>,
+) -> Result<Option<LivenessOverrideV1>, ExecutionPolicyError> {
+    match value {
+        Some(LivenessOverrideV1::Ms(ms))
+            if crate::turn_liveness::parse_liveness_secs_v1(ms / 1_000)
+                != Ok(LivenessOverrideV1::Ms(ms)) =>
+        {
+            Err(ExecutionPolicyError::InvalidSilenceCutoff)
+        }
+        value => Ok(value),
+    }
+}
+
+/// The frozen silence cutoff: invocation, then workflow, then the node agent's default. Only
+/// automatic activation arms it; manual activation keeps none.
+fn resolve_silence_cutoff(
+    workflow: Option<LivenessOverrideV1>,
+    invocation: Option<LivenessOverrideV1>,
+    activation: DeadlineActivationV2,
+) -> Result<SilenceCutoffV1, ExecutionPolicyError> {
+    let workflow = checked_silence_override(workflow)?;
+    let invocation = checked_silence_override(invocation)?;
+    Ok(match activation {
+        DeadlineActivationV2::ManualOnlyR2f1a => SilenceCutoffV1::None,
+        DeadlineActivationV2::AutomaticR2f1b => match invocation.or(workflow) {
+            None => SilenceCutoffV1::AgentDefault,
+            Some(LivenessOverrideV1::Off) => SilenceCutoffV1::None,
+            Some(LivenessOverrideV1::Ms(silence_ms)) => SilenceCutoffV1::Activity { silence_ms },
+        },
+    })
 }
 
 fn max_qualification(
@@ -1609,7 +1660,15 @@ pub fn resolve_execution_policy_with_readiness_v1(
             )
         };
 
-    let profile = liveness_profile_v1(profile_id);
+    let deadline_activation = deadline_activation_v2_for(readiness, activation);
+    let profile = LivenessProfileV1 {
+        silence_cutoff: resolve_silence_cutoff(
+            workflow.silence_cutoff,
+            invocation.silence_cutoff,
+            deadline_activation,
+        )?,
+        ..liveness_profile_v1(profile_id)
+    };
     let fan_out = workflow
         .fan_out
         .clone()
@@ -1622,7 +1681,7 @@ pub fn resolve_execution_policy_with_readiness_v1(
         max_qualification: qualification,
         fan_out,
         synthesis: workflow.synthesis.unwrap_or(SynthesisModeV1::Degraded),
-        deadline_activation: deadline_activation_v2_for(readiness, activation),
+        deadline_activation,
     };
 
     if let FanOutPolicyV1::FixedGrace { grace_ms } = controls.fan_out {

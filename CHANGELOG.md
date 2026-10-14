@@ -29,10 +29,23 @@ release (see [`docs/adr/`](docs/adr/) for the full architectural record).
   traced. A turn the agent had already finished then fails with `acp.prompt.start_records_pending`
   (`Persistence`) rather than completing, as when those records fail. No client marks a turn as
   watched yet, so every such turn gets the 2-hour work cutoff. Workflow
-  node turns, preflight included, are unchanged: they carry neither bound and keep the workflow's
-  own deadlines. The legacy `[agents.watchdog]` keeps its semantics and its
+  node turns, preflight included, carry no turn work cutoff and keep the workflow's own deadlines;
+  their silence cutoff is the next entry. The legacy `[agents.watchdog]` keeps its semantics and its
   `acp.prompt.watchdog_timeout` code and runs alongside; when bounds fall due at the same instant
   the watchdog is reported first, then the work cutoff, then silence.
+
+- Workflow node turns, preflight included, now end after a silence cutoff too. Admission
+  (local `run-workflow`, and served, detached and batch workflows) freezes it into the run's
+  controls: the node agent's `[agents.liveness] silence_cutoff_secs`, else 30 minutes, unless the
+  workflow or the invocation sets one. A node that trips it ends `TimedOut` with
+  `acp.prompt.silence_cutoff` and is never retried, even with `retry`. The workflow's 2-hour work
+  cutoff is unchanged and node turns still carry no turn work cutoff. Runs frozen before this
+  change keep no silence cutoff when resumed, as does the `implement` review-the-diff workflow,
+  which runs without frozen controls. The frozen value is a new spelling inside the unchanged
+  run-policy schema version, so a binary older than this one cannot decode the run-policy records
+  that new workflow runs with a silence cutoff write (accepted rollback limit), and every new
+  automatic run's controls fingerprint changes, re-partitioning automatic history; manual
+  fingerprints do not move.
 
 - Reader and toolchain images pin codex-acp 2.2.2 with Codex 0.162.1 (was 1.13.1 / 0.157.1) and
   claude-agent-acp 0.90.0 with Agent SDK 0.3.296 / Claude Code 2.1.296 (was 0.81.2 / 0.3.280 /
@@ -41,6 +54,11 @@ release (see [`docs/adr/`](docs/adr/) for the full architectural record).
 
 ### Added
 
+- `[[workflows]] silence_cutoff = "off" | <secs>` and `run-workflow --silence-cutoff <secs|off>` set
+  the silence cutoff of a workflow's node turns: whole seconds up to 30 days through the shared
+  liveness parser, `"off"` (or `0`) for none. The flag beats the workflow's value, which beats the
+  agent default; an explicit off at either level stays off. `--silence-cutoff` is refused with
+  `--serve`.
 - `[agents.liveness]` sets an agent's turn bounds: `silence_cutoff_secs` and `work_cutoff_secs`, whole
   seconds up to 30 days, `0` for off, an absent field keeping the built-in 30-minute and 2-hour
   defaults. One parser checks every liveness duration, refusing anything over 30 days. The table is

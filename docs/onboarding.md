@@ -233,9 +233,35 @@ the default. Both endings are fatal `Timeout` failures that are never retried: t
 [watchdog's blast radius](containerized-agents.md#e9-watchdog-agentswatchdog--blast-radius-on-shared-backends)
 applies to a shared process-backed agent too. The table is part of the agent's frozen provider-effect
 identity, automatic workflow admission accepts it (unlike `[agents.watchdog]`), and `container_rw` agents
-apply it inside the container. Workflow node turns, preflight included, currently carry neither bound;
-the workflow's own deadlines remain their limit. `[agents.watchdog]` keeps working unchanged alongside;
-bounds due at the same instant are reported as watchdog, then work cutoff, then silence.
+apply it inside the container. Workflow node turns follow the next section. `[agents.watchdog]` keeps
+working unchanged alongside; bounds due at the same instant are reported as watchdog, then work cutoff,
+then silence.
+
+### Workflow node turns: `[[workflows]] silence_cutoff`
+
+A workflow freezes its silence cutoff when the run is admitted (local `run-workflow`, and served,
+detached, batch and resumed workflows). Every node turn, preflight included, then runs under it: by
+default the node agent's `[agents.liveness] silence_cutoff_secs`, else 30 minutes. A node that trips it
+ends `TimedOut` with `acp.prompt.silence_cutoff` and is never retried, even with `retry`, since the
+agent may have accepted the prompt. Node turns carry no turn work cutoff: the workflow's own 2-hour
+work cutoff stays their backstop and is unchanged.
+
+```toml
+[[workflows]]
+id = "code-review"
+silence_cutoff = 2700     # 45 minutes; or "off"
+```
+
+```sh
+a2a-bridge run-workflow code-review --input task.md --silence-cutoff 900   # or: --silence-cutoff off
+```
+
+Values are whole seconds, at most 2592000 (30 days); `"off"` (or `0`) means no silence cutoff. The flag
+beats the workflow's value, which beats the agent default, and an explicit off at either level stays off
+rather than falling back to the default. `--silence-cutoff` is refused with `--serve`: a served workflow
+takes its value from the server's config. Runs admitted before this setting existed keep no silence
+cutoff when resumed, and the `implement` review-the-diff workflow, which runs without frozen controls,
+keeps none either.
 
 ### Workflow preflight and fallback models
 

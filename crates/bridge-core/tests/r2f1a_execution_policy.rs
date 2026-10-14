@@ -3,20 +3,22 @@ use bridge_core::domain::{AgentEntry, AgentKind, EffectiveConfig, Effort, Part};
 use bridge_core::error::BridgeError;
 use bridge_core::execution_policy::{
     deadline_activation_v2_for, freeze_direct_checkout_v1, freeze_node_execution_identity_v1,
-    freeze_provider_attempt_v1, freeze_worktree_checkout_v1, resolve_execution_policy_v1,
-    resolve_execution_policy_with_readiness_v1, BoundMcpDeliveryPayloadV1, BoundSessionSpecV1,
-    ControlEventIdV1, DeadlineActivationV2, ExecutionPolicyError, ExecutionPolicyInvocationV1,
-    FanOutPolicyNameV1, FanOutPolicyV1, FrozenCheckoutEffectV1, FrozenProviderLogicalSessionV1,
-    FrozenWorkflowControlsV1, LivenessProfileIdV1, NodeCauseV1, NodeCleanupDispositionV1,
-    NodeCleanupV1, NodePrimaryDispositionV1, NodeTerminalV1, PolicyActivationV1, PolicyNodeRefV1,
-    PolicyTriggerV1, ProfileSelectionSourceV1, ProviderEffectKeyV1, ProviderFreezeInputV1,
-    SchedulerActivationReadinessV1, SynthesisModeV1, TaskClassV1, WorkflowControlDefaultsV1,
-    WorktreeCheckoutInputV1, MAX_NODE_TERMINAL_JSON_BYTES, MAX_POLICY_TRIGGER_JSON_BYTES,
-    PROFILE_LEGACY_BOUNDED_V1, PROFILE_REVIEW_HIGH_XHIGH_V1,
+    freeze_provider_attempt_v1, freeze_worktree_checkout_v1, liveness_profile_v1,
+    resolve_execution_policy_v1, resolve_execution_policy_with_readiness_v1,
+    BoundMcpDeliveryPayloadV1, BoundSessionSpecV1, ControlEventIdV1, DeadlineActivationV2,
+    ExecutionPolicyError, ExecutionPolicyInvocationV1, FanOutPolicyNameV1, FanOutPolicyV1,
+    FrozenCheckoutEffectV1, FrozenProviderLogicalSessionV1, FrozenWorkflowControlsV1,
+    LivenessProfileIdV1, NodeCauseV1, NodeCleanupDispositionV1, NodeCleanupV1,
+    NodePrimaryDispositionV1, NodeTerminalV1, PolicyActivationV1, PolicyNodeRefV1, PolicyTriggerV1,
+    ProfileSelectionSourceV1, ProviderEffectKeyV1, ProviderFreezeInputV1,
+    SchedulerActivationReadinessV1, SilenceCutoffV1, SynthesisModeV1, TaskClassV1,
+    WorkflowControlDefaultsV1, WorktreeCheckoutInputV1, MAX_NODE_TERMINAL_JSON_BYTES,
+    MAX_POLICY_TRIGGER_JSON_BYTES, PROFILE_LEGACY_BOUNDED_V1, PROFILE_REVIEW_HIGH_XHIGH_V1,
 };
 use bridge_core::ids::{AgentId, AttemptId, SessionId};
 use bridge_core::mcp::{McpDelivery, McpEnvValueSourceV1, McpServerSpec, SecretString};
 use bridge_core::ports::{AgentBackend, BackendStream};
+use bridge_core::turn_liveness::LivenessOverrideV1;
 use bridge_core::SessionCwd;
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -70,6 +72,270 @@ fn manual_deadline_activation_controls_retain_literal_wire_bytes() {
         serde_json::to_vec(&decoded).expect("manual controls must encode"),
         LITERAL
     );
+}
+
+// ── Activity liveness I2a: the frozen workflow silence cutoff ────────────────────────────────
+
+fn resolve_silence(
+    workflow: Option<LivenessOverrideV1>,
+    invocation: Option<LivenessOverrideV1>,
+    readiness: SchedulerActivationReadinessV1,
+    activation: PolicyActivationV1,
+) -> Result<FrozenWorkflowControlsV1, ExecutionPolicyError> {
+    resolve_execution_policy_with_readiness_v1(
+        &WorkflowControlDefaultsV1 {
+            silence_cutoff: workflow,
+            ..WorkflowControlDefaultsV1::default()
+        },
+        &ExecutionPolicyInvocationV1 {
+            silence_cutoff: invocation,
+            ..ExecutionPolicyInvocationV1::default()
+        },
+        false,
+        readiness,
+        activation,
+    )
+}
+
+/// Automatic activation inherits each node agent's silence cutoff; manual activation keeps none,
+/// whatever the workflow or invocation asks for. The named profiles themselves are unchanged.
+#[test]
+fn automatic_resolve_freezes_agent_default_silence_and_manual_freezes_none() {
+    use LivenessOverrideV1::{Ms, Off};
+    use PolicyActivationV1::{ManualTest, Production};
+    use SchedulerActivationReadinessV1::{Armed, Disarmed};
+
+    for id in [
+        LivenessProfileIdV1::LegacyBoundedV1,
+        LivenessProfileIdV1::ReviewHighXhighV1,
+    ] {
+        assert_eq!(
+            liveness_profile_v1(id).silence_cutoff,
+            SilenceCutoffV1::None
+        );
+    }
+
+    let automatic = resolve_execution_policy_v1(
+        &WorkflowControlDefaultsV1::default(),
+        &ExecutionPolicyInvocationV1::default(),
+        false,
+        Production,
+    )
+    .unwrap();
+    assert_eq!(
+        automatic.deadline_activation,
+        DeadlineActivationV2::AutomaticR2f1b
+    );
+    assert_eq!(
+        automatic.profile.silence_cutoff,
+        SilenceCutoffV1::AgentDefault
+    );
+
+    for (readiness, activation) in [(Armed, ManualTest), (Disarmed, Production)] {
+        for (workflow, invocation) in [
+            (None, None),
+            (Some(Ms(900_000)), None),
+            (None, Some(Ms(900_000))),
+            (Some(Off), None),
+        ] {
+            let manual = resolve_silence(workflow, invocation, readiness, activation).unwrap();
+            assert_eq!(
+                manual.deadline_activation,
+                DeadlineActivationV2::ManualOnlyR2f1a
+            );
+            assert_eq!(
+                manual.profile.silence_cutoff,
+                SilenceCutoffV1::None,
+                "manual activation keeps no silence cutoff ({workflow:?}, {invocation:?})"
+            );
+        }
+    }
+}
+
+/// Invocation beats workflow beats the agent default; an explicit `off` at either level is kept
+/// as `off` and never collapses into inherit. The workflow-wide 2 h work cutoff and its terminal
+/// bound do not move whatever the silence value.
+#[test]
+fn silence_overrides_follow_invocation_then_workflow_and_keep_off_distinct() {
+    use LivenessOverrideV1::{Ms, Off};
+
+    let table = [
+        (None, None, SilenceCutoffV1::AgentDefault),
+        (Some(Off), None, SilenceCutoffV1::None),
+        (
+            Some(Ms(1_200_000)),
+            None,
+            SilenceCutoffV1::Activity {
+                silence_ms: 1_200_000,
+            },
+        ),
+        (None, Some(Off), SilenceCutoffV1::None),
+        (
+            None,
+            Some(Ms(900_000)),
+            SilenceCutoffV1::Activity {
+                silence_ms: 900_000,
+            },
+        ),
+        (
+            Some(Off),
+            Some(Ms(900_000)),
+            SilenceCutoffV1::Activity {
+                silence_ms: 900_000,
+            },
+        ),
+        (Some(Ms(1_200_000)), Some(Off), SilenceCutoffV1::None),
+        (
+            Some(Ms(1_200_000)),
+            Some(Ms(900_000)),
+            SilenceCutoffV1::Activity {
+                silence_ms: 900_000,
+            },
+        ),
+    ];
+    for (workflow, invocation, expected) in table {
+        let controls = resolve_silence(
+            workflow,
+            invocation,
+            SchedulerActivationReadinessV1::Armed,
+            PolicyActivationV1::Production,
+        )
+        .unwrap();
+        assert_eq!(
+            controls.profile.silence_cutoff, expected,
+            "workflow {workflow:?}, invocation {invocation:?}"
+        );
+        assert_eq!(controls.profile.work_cutoff_ms, 7_200_000);
+        assert_eq!(controls.effective_work_cutoff_ms(), 7_200_000);
+        assert_eq!(controls.effective_terminal_bound_ms().unwrap(), 7_270_000);
+    }
+}
+
+/// A frozen override holds only what the shared parser can produce: whole seconds from 1 s to
+/// 30 days. A carrier built by hand with anything else is refused, at either level.
+#[test]
+fn silence_override_values_outside_the_shared_parser_range_refuse() {
+    use bridge_core::turn_liveness::{parse_liveness_secs_v1, MAX_LIVENESS_SECS};
+    use LivenessOverrideV1::Ms;
+
+    let thirty_days = parse_liveness_secs_v1(MAX_LIVENESS_SECS).unwrap();
+    assert_eq!(thirty_days, Ms(2_592_000_000));
+    assert!(parse_liveness_secs_v1(MAX_LIVENESS_SECS + 1).is_err());
+    assert!(parse_liveness_secs_v1(u64::MAX).is_err());
+    for level in 0..2 {
+        let at = |value| {
+            let (workflow, invocation) = if level == 0 {
+                (Some(value), None)
+            } else {
+                (None, Some(value))
+            };
+            resolve_silence(
+                workflow,
+                invocation,
+                SchedulerActivationReadinessV1::Armed,
+                PolicyActivationV1::Production,
+            )
+        };
+        assert_eq!(
+            at(thirty_days).unwrap().profile.silence_cutoff,
+            SilenceCutoffV1::Activity {
+                silence_ms: 2_592_000_000
+            }
+        );
+        for refused in [Ms(0), Ms(1_500), Ms(2_592_001_000), Ms(u64::MAX)] {
+            assert_eq!(
+                at(refused),
+                Err(ExecutionPolicyError::InvalidSilenceCutoff),
+                "{refused:?} at level {level}"
+            );
+        }
+    }
+}
+
+/// A run frozen automatic before the workflow silence cutoff existed carries `"none"`. It still
+/// decodes to no silence cutoff and re-encodes to the same bytes; the new values encode as
+/// additive enum spellings inside the unchanged schema version.
+#[test]
+fn legacy_automatic_controls_literal_keeps_no_silence_cutoff_and_exact_bytes() {
+    const LEGACY: &[u8] = br#"{"schema_version":1,"task_class":"other","profile":{"schema_version":1,"id":"legacy_bounded_v1","queue_wait_ms":1800000,"control_observable_ms":31000,"no_progress_snapshot_ms":1800000,"silence_cutoff":"none","work_cutoff_ms":7200000,"cancel_observable_ms":6000,"cleanup_tail_ms":60000,"reporting_tail_ms":10000,"terminal_bound_ms":7270000},"profile_source":"compatibility_omission","fan_out":{"kind":"bounded_independent"},"synthesis":"degraded","deadline_activation":"automatic_r2f1b"}"#;
+
+    let legacy: FrozenWorkflowControlsV1 =
+        serde_json::from_slice(LEGACY).expect("persisted automatic controls must decode");
+    assert_eq!(
+        legacy.deadline_activation,
+        DeadlineActivationV2::AutomaticR2f1b
+    );
+    assert_eq!(legacy.profile.silence_cutoff, SilenceCutoffV1::None);
+    assert_eq!(legacy.encode_canonical().unwrap(), LEGACY);
+    assert_eq!(legacy.effective_work_cutoff_ms(), 7_200_000);
+
+    let resolved = resolve_execution_policy_v1(
+        &WorkflowControlDefaultsV1::default(),
+        &ExecutionPolicyInvocationV1::default(),
+        false,
+        PolicyActivationV1::Production,
+    )
+    .unwrap();
+    let as_frozen_now = String::from_utf8(LEGACY.to_vec()).unwrap().replace(
+        r#""silence_cutoff":"none""#,
+        r#""silence_cutoff":"agent_default""#,
+    );
+    assert_eq!(
+        String::from_utf8(resolved.encode_canonical().unwrap()).unwrap(),
+        as_frozen_now,
+        "a new automatic run differs from the legacy row only in its silence value"
+    );
+
+    let mut activity = legacy.clone();
+    activity.profile.silence_cutoff = SilenceCutoffV1::Activity {
+        silence_ms: 900_000,
+    };
+    let encoded = activity.encode_canonical().unwrap();
+    assert!(String::from_utf8(encoded.clone())
+        .unwrap()
+        .contains(r#""silence_cutoff":{"activity":{"silence_ms":900000}}"#));
+    let decoded: FrozenWorkflowControlsV1 = serde_json::from_slice(&encoded).unwrap();
+    assert_eq!(decoded, activity);
+    assert_eq!(decoded.encode_canonical().unwrap(), encoded);
+}
+
+/// The new override fields are absent from the encoding unless set, so persisted graphs and
+/// invocations re-encode byte-identically; a set `off` round-trips as `off`, not as absence.
+#[test]
+fn silence_override_carriers_encode_only_when_set() {
+    use LivenessOverrideV1::{Ms, Off};
+
+    assert_eq!(
+        serde_json::to_string(&WorkflowControlDefaultsV1::default()).unwrap(),
+        "{}"
+    );
+    assert_eq!(
+        serde_json::to_string(&ExecutionPolicyInvocationV1::default()).unwrap(),
+        "{}"
+    );
+    for (value, json) in [
+        (Off, r#"{"silence_cutoff":"off"}"#),
+        (Ms(900_000), r#"{"silence_cutoff":{"ms":900000}}"#),
+    ] {
+        let defaults = WorkflowControlDefaultsV1 {
+            silence_cutoff: Some(value),
+            ..WorkflowControlDefaultsV1::default()
+        };
+        assert_eq!(serde_json::to_string(&defaults).unwrap(), json);
+        assert_eq!(
+            serde_json::from_str::<WorkflowControlDefaultsV1>(json).unwrap(),
+            defaults
+        );
+        let invocation = ExecutionPolicyInvocationV1 {
+            silence_cutoff: Some(value),
+            ..ExecutionPolicyInvocationV1::default()
+        };
+        assert_eq!(serde_json::to_string(&invocation).unwrap(), json);
+        assert_eq!(
+            serde_json::from_str::<ExecutionPolicyInvocationV1>(json).unwrap(),
+            invocation
+        );
+    }
 }
 
 #[test]

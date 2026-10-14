@@ -9,16 +9,20 @@ use bridge_core::execution_policy::{
     freeze_direct_checkout_v1, freeze_node_execution_identity_v1, freeze_provider_attempt_v1,
     freeze_worktree_checkout_v1, resolve_execution_policy_v1, BoundMcpDeliveryPayloadV1,
     BoundSessionSpecV1, ExecutionPolicyInvocationV1, FanOutPolicyV1,
-    FrozenProviderLogicalSessionV1, HistoryAllocationKindV1, LedgerAdmissionV1,
-    NodeCleanupDispositionV1, NodePrimaryDispositionV1, NodeTerminalV1, PolicyActivationV1,
-    PolicyNodeRefV1, ProviderFreezeInputV1, SynthesisModeV1, WorkflowControlDefaultsV1,
-    WorktreeCheckoutInputV1,
+    FrozenProviderLogicalSessionV1, FrozenWorkflowControlsV1, HistoryAllocationKindV1,
+    LedgerAdmissionV1, NodeCleanupDispositionV1, NodePrimaryDispositionV1, NodeTerminalV1,
+    PolicyActivationV1, PolicyNodeRefV1, ProviderFreezeInputV1, SynthesisModeV1,
+    WorkflowControlDefaultsV1, WorktreeCheckoutInputV1,
 };
 use bridge_core::ids::{AgentId, AttemptId, NodeId, SessionId, WorkflowId};
 use bridge_core::mcp::{McpDelivery, McpServerSpec};
 use bridge_core::ports::{
     AgentBackend, AgentRegistry, BackendStream, BoundEntryUseV1, EntryUseTokenV1, Lease, Resolved,
     Update,
+};
+use bridge_core::turn_liveness::{
+    resolve_turn_liveness_v1, LivenessOverrideV1, ResolvedTurnLivenessV1, TurnLivenessCauseV1,
+    TurnLivenessRequestV1, TurnLivenessTracker, TurnLivenessValueV1,
 };
 use bridge_core::SessionCwd;
 use bridge_workflow::executor::{
@@ -300,6 +304,25 @@ fn frozen_worktree_run_with_retry(
     entry: &AgentEntry,
     retry: Option<RetryPolicy>,
 ) -> WorkflowRunSpecV1 {
+    let graph_controls = WorkflowControlDefaultsV1::default();
+    let controls = resolve_execution_policy_v1(
+        &graph_controls,
+        &ExecutionPolicyInvocationV1::default(),
+        false,
+        PolicyActivationV1::Production,
+    )
+    .unwrap();
+    frozen_worktree_run_with_controls(entry, retry, graph_controls, controls)
+}
+
+/// [`frozen_worktree_run_with_retry`] with the graph's declared controls and the controls frozen
+/// from them chosen by the caller.
+fn frozen_worktree_run_with_controls(
+    entry: &AgentEntry,
+    retry: Option<RetryPolicy>,
+    graph_controls: WorkflowControlDefaultsV1,
+    controls: FrozenWorkflowControlsV1,
+) -> WorkflowRunSpecV1 {
     let attempt_id = AttemptId::parse("attempt-22222222222222222222222222222222").unwrap();
     let source_cwd = SessionCwd::parse("/repo/source").unwrap();
     let node_ref = PolicyNodeRefV1::from_node_id(0, "review-node");
@@ -352,15 +375,8 @@ fn frozen_worktree_run_with_retry(
             harvest_sanitization: None,
         }],
         panel: None,
-        controls: Some(WorkflowControlDefaultsV1::default()),
+        controls: Some(graph_controls),
     };
-    let controls = resolve_execution_policy_v1(
-        graph.controls.as_ref().unwrap(),
-        &ExecutionPolicyInvocationV1::default(),
-        false,
-        PolicyActivationV1::Production,
-    )
-    .unwrap();
     WorkflowRunSpecV1::build(
         attempt_id,
         graph,
@@ -1197,6 +1213,485 @@ async fn v2_node_terminal_keeps_primary_diagnostic_when_cleanup_also_fails() {
     assert_eq!(cause.failure_class, DiagnosticFailureClass::Transport);
     assert_eq!(cause.code.as_str(), "test.node.prompt_open");
     assert_eq!(cause.deepest_cause.as_deref(), Some("deepest cause"));
+}
+
+// ---------------------------------------------------------------------------------------------
+// Activity liveness I2a — the frozen workflow silence cutoff reaches every node turn.
+//
+// These run on paused tokio time. `AcpBackend` enforcing a staged `TurnMeta.liveness` is proven
+// by the I1 tests in `crates/bridge-acp/src/acp_backend.rs`; the fake agent below reproduces that
+// contract with the same pure tracker, so what is under test here is the workflow half: which
+// request each turn stages, and what the node and the workflow do when the turn ends for silence.
+// ---------------------------------------------------------------------------------------------
+
+const PREFLIGHT_PROMPT: &str = "Reply with exactly PONG and nothing else.";
+
+fn minutes(n: u64) -> std::time::Duration {
+    std::time::Duration::from_secs(n * 60)
+}
+
+/// A fake agent honouring the liveness request staged on each turn as `AcpBackend` does. It
+/// answers the preflight smoke at once. On a node turn it says nothing for `silent_for` and then
+/// ends the turn, unless a bound of the staged request falls due first: that ends the turn with
+/// the bound's fatal `Timeout` failure, after a possibly accepted prompt.
+struct LivenessBackend {
+    silent_for: std::time::Duration,
+    staged: Mutex<Option<TurnLivenessRequestV1>>,
+    turns: Mutex<Vec<TurnLivenessRequestV1>>,
+    node_prompts: AtomicUsize,
+}
+
+impl LivenessBackend {
+    fn new(silent_for: std::time::Duration) -> Self {
+        Self {
+            silent_for,
+            staged: Mutex::new(None),
+            turns: Mutex::new(Vec::new()),
+            node_prompts: AtomicUsize::new(0),
+        }
+    }
+}
+
+fn liveness_cutoff_failure(
+    cause: TurnLivenessCauseV1,
+    resolved: ResolvedTurnLivenessV1,
+) -> BridgeError {
+    let (code, summary, detail) = match cause {
+        TurnLivenessCauseV1::Silence => (
+            "acp.prompt.silence_cutoff",
+            "ACP prompt exceeded its silence cutoff",
+            format!(
+                "ACP prompt had no activity for {}s with no tool call or permission open",
+                resolved.silence_ms.unwrap_or_default() / 1_000
+            ),
+        ),
+        TurnLivenessCauseV1::WorkCutoff => (
+            "acp.prompt.work_cutoff",
+            "ACP prompt exceeded its turn work cutoff",
+            format!(
+                "ACP prompt ran for {}s, its turn work cutoff",
+                resolved.work_cutoff_ms.unwrap_or_default() / 1_000
+            ),
+        ),
+        TurnLivenessCauseV1::LegacyWatchdog => unreachable!("the fake agent has no watchdog"),
+    };
+    BridgeError::agent_failure(
+        FailureDiagnostic::build_static_code(
+            FailureDiagnosticInput {
+                failed_phase: DiagnosticPhase::PromptStream,
+                last_completed_phase: Some(DiagnosticPhase::PromptStart),
+                class: DiagnosticFailureClass::Timeout,
+                disposition: FailureDisposition::Fatal,
+                code: String::new(),
+                summary: summary.into(),
+                causes: vec![detail],
+                stderr_observed: false,
+                stderr_line_count: 0,
+                stderr_scope: None,
+                stderr_tail: None,
+                stderr_redaction: None,
+                retry_after_ms: None,
+                reset_at_ms: None,
+                prompt_may_have_been_accepted: true,
+            },
+            code,
+            &DiagnosticRedactor::default(),
+        )
+        .unwrap(),
+    )
+}
+
+#[async_trait]
+impl AgentBackend for LivenessBackend {
+    async fn configure_turn(&self, _session: &SessionId, meta: bridge_core::permission::TurnMeta) {
+        self.turns.lock().unwrap().push(meta.liveness.clone());
+        *self.staged.lock().unwrap() = Some(meta.liveness);
+    }
+
+    async fn prompt(
+        &self,
+        _session: &SessionId,
+        parts: Vec<Part>,
+    ) -> Result<BackendStream, BridgeError> {
+        let request = self
+            .staged
+            .lock()
+            .unwrap()
+            .take()
+            .expect("every workflow turn stages its liveness request before the prompt");
+        if parts
+            .first()
+            .is_some_and(|part| part.text == PREFLIGHT_PROMPT)
+        {
+            return Ok(Box::pin(tokio_stream::iter(vec![
+                Ok(Update::Text("PONG".into())),
+                Ok(Update::done("end_turn")),
+            ])));
+        }
+        self.node_prompts.fetch_add(1, Ordering::SeqCst);
+        // `entry()` sets no `[agents.liveness]`, so inherit resolves to the built-in bounds.
+        let resolved = resolve_turn_liveness_v1(&request, None);
+        let tracker = TurnLivenessTracker::new(resolved);
+        let silent_for_ms = u64::try_from(self.silent_for.as_millis()).unwrap();
+        let cutoff = [tracker.work_due_ms(), tracker.silence_due_ms()]
+            .into_iter()
+            .flatten()
+            .min()
+            .filter(|due_ms| *due_ms <= silent_for_ms);
+        let silent_for = self.silent_for;
+        Ok(Box::pin(async_stream::stream! {
+            match cutoff {
+                Some(due_ms) => {
+                    tokio::time::sleep(std::time::Duration::from_millis(due_ms)).await;
+                    let cause = tracker
+                        .due_cause(due_ms, false)
+                        .expect("the earliest bound is due at its own instant");
+                    yield Err(liveness_cutoff_failure(cause, resolved));
+                }
+                None => {
+                    tokio::time::sleep(silent_for).await;
+                    yield Ok(Update::Text("DONE".into()));
+                    yield Ok(Update::done("end_turn"));
+                }
+            }
+        }))
+    }
+
+    async fn cancel(&self, _session: &SessionId) -> Result<(), BridgeError> {
+        Ok(())
+    }
+
+    async fn configure_bound_session(
+        &self,
+        _session: &SessionId,
+        _spec: &BoundSessionSpecV1,
+    ) -> Result<(), BridgeError> {
+        Ok(())
+    }
+}
+
+/// Puts the workflow scheduler on the paused tokio clock the fake agent sleeps on; otherwise the
+/// scheduler reads the system clock and its absolute cutoff never falls due in virtual time.
+struct PausedClockSinkFactory(tokio::time::Instant);
+
+struct PausedClock(tokio::time::Instant);
+
+struct NoopRichSink;
+
+impl bridge_core::attempt_activity::MonotonicClock for PausedClock {
+    fn elapsed_ms(&self) -> u64 {
+        u64::try_from(self.0.elapsed().as_millis()).unwrap_or(u64::MAX)
+    }
+}
+
+#[async_trait]
+impl bridge_core::ports::RichEventSink for NoopRichSink {
+    fn record(&self, _kind: bridge_core::orch::OrchEventKind) {}
+
+    async fn flush(&self) -> Result<(), BridgeError> {
+        Ok(())
+    }
+}
+
+impl bridge_core::ports::RichEventSinkFactory for PausedClockSinkFactory {
+    fn make(&self, _node: &NodeId) -> Arc<dyn bridge_core::ports::RichEventSink> {
+        Arc::new(NoopRichSink)
+    }
+
+    fn monotonic_clock(&self) -> Option<Arc<dyn bridge_core::attempt_activity::MonotonicClock>> {
+        Some(Arc::new(PausedClock(self.0)))
+    }
+}
+
+struct LivenessRun {
+    backend: Arc<LivenessBackend>,
+    terminal: NodeTerminalV1,
+    outcome: WorkflowOutcome,
+    elapsed: std::time::Duration,
+}
+
+impl LivenessRun {
+    fn node_turns(&self) -> Vec<TurnLivenessRequestV1> {
+        self.backend.turns.lock().unwrap().clone()
+    }
+}
+
+fn liveness_controls(
+    workflow: Option<LivenessOverrideV1>,
+    invocation: Option<LivenessOverrideV1>,
+) -> (WorkflowControlDefaultsV1, FrozenWorkflowControlsV1) {
+    let graph_controls = WorkflowControlDefaultsV1 {
+        silence_cutoff: workflow,
+        ..WorkflowControlDefaultsV1::default()
+    };
+    let controls = resolve_execution_policy_v1(
+        &graph_controls,
+        &ExecutionPolicyInvocationV1 {
+            silence_cutoff: invocation,
+            ..ExecutionPolicyInvocationV1::default()
+        },
+        false,
+        PolicyActivationV1::Production,
+    )
+    .unwrap();
+    assert_eq!(
+        controls.deadline_activation,
+        bridge_core::execution_policy::DeadlineActivationV2::AutomaticR2f1b
+    );
+    (graph_controls, controls)
+}
+
+async fn run_liveness_case(
+    entry: AgentEntry,
+    retry: Option<RetryPolicy>,
+    (graph_controls, controls): (WorkflowControlDefaultsV1, FrozenWorkflowControlsV1),
+    silent_for: std::time::Duration,
+) -> LivenessRun {
+    let entry = Arc::new(entry);
+    let run_spec = Arc::new(frozen_worktree_run_with_controls(
+        &entry,
+        retry,
+        graph_controls,
+        controls,
+    ));
+    let backend = Arc::new(LivenessBackend::new(silent_for));
+    let registry = Arc::new(BoundOnlyRegistry {
+        entry,
+        backend: backend.clone(),
+        slot: Arc::new(()),
+        calls: Arc::new(Calls::default()),
+        fail_preflight_ordinal: None,
+    });
+    let started = tokio::time::Instant::now();
+    let context = WorkflowDiagnosticContext::in_memory(WorkflowRunContext {
+        session_cwd: run_spec.requested_session_cwd.clone(),
+        make_rich_sink: Some(Arc::new(PausedClockSinkFactory(started))),
+        ..WorkflowRunContext::default()
+    })
+    .with_frozen_run_spec(run_spec.clone(), None)
+    .unwrap();
+    let events = WorkflowExecutor::new(registry)
+        .run_with_diagnostic_context(
+            Arc::new(run_spec.graph.clone()),
+            "review this".into(),
+            "liveness-i2a-run".into(),
+            CancellationToken::new(),
+            context,
+        )
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    let elapsed = started.elapsed();
+    let terminal = events
+        .iter()
+        .find_map(|event| match event {
+            WorkflowEvent::NodeFinished {
+                terminal_json: Some(terminal_json),
+                ..
+            } => Some(NodeTerminalV1::decode_canonical(terminal_json.as_bytes()).unwrap()),
+            _ => None,
+        })
+        .expect("the bound node publishes one canonical terminal");
+    let outcome = terminal_outcome(&events).expect("the workflow reaches a terminal");
+    LivenessRun {
+        backend,
+        terminal,
+        outcome,
+        elapsed,
+    }
+}
+
+fn node_turn(silence: TurnLivenessValueV1) -> TurnLivenessRequestV1 {
+    TurnLivenessRequestV1 {
+        silence,
+        work_cutoff: TurnLivenessValueV1::Off,
+        client_watching: false,
+        observer_key: None,
+    }
+}
+
+fn assert_ended_between(
+    elapsed: std::time::Duration,
+    from: std::time::Duration,
+    to: std::time::Duration,
+) {
+    assert!(
+        elapsed >= from && elapsed < to,
+        "the run ended at {elapsed:?}, expected [{from:?}, {to:?})"
+    );
+}
+
+fn assert_silence_timed_out(run: &LivenessRun, silence_secs: u64) {
+    assert_eq!(run.terminal.primary, NodePrimaryDispositionV1::TimedOut);
+    assert!(run.terminal.prompt_may_have_been_accepted);
+    let cause = run
+        .terminal
+        .cause
+        .as_ref()
+        .expect("a silence cutoff keeps its cause");
+    assert_eq!(cause.failure_class, DiagnosticFailureClass::Timeout);
+    assert_eq!(cause.code.as_str(), "acp.prompt.silence_cutoff");
+    assert_eq!(
+        cause.deepest_cause.as_deref(),
+        Some(
+            format!(
+                "ACP prompt had no activity for {silence_secs}s with no tool call or permission open"
+            )
+            .as_str()
+        )
+    );
+    assert_eq!(run.outcome, WorkflowOutcome::Failed);
+}
+
+/// I2a: an automatic workflow inherits the agent's silence cutoff (30 min by default). A node
+/// whose agent stays silent 31 min ends `TimedOut` with `acp.prompt.silence_cutoff` at 30 min and
+/// is not retried, even though the node has a retry policy: the prompt may have been accepted.
+#[tokio::test(start_paused = true)]
+async fn i2a_a_silent_node_ends_timed_out_at_the_inherited_cutoff_without_retry() {
+    let run = run_liveness_case(
+        entry(),
+        Some(RetryPolicy {
+            max_attempts: 3,
+            backoff_ms: 0,
+            backoff_cap_ms: None,
+        }),
+        liveness_controls(None, None),
+        minutes(31),
+    )
+    .await;
+
+    assert_silence_timed_out(&run, 1_800);
+    assert_eq!(
+        run.node_turns(),
+        vec![node_turn(TurnLivenessValueV1::Inherit)]
+    );
+    assert_eq!(
+        run.backend.node_prompts.load(Ordering::SeqCst),
+        1,
+        "a silence cutoff is never retried"
+    );
+    assert_ended_between(run.elapsed, minutes(30), minutes(31));
+}
+
+/// I2a: `[[workflows]] silence_cutoff = "off"` freezes no silence cutoff, so a node silent for
+/// 40 min is left to finish.
+#[tokio::test(start_paused = true)]
+async fn i2a_workflow_silence_off_never_trips() {
+    let run = run_liveness_case(
+        entry(),
+        None,
+        liveness_controls(Some(LivenessOverrideV1::Off), None),
+        minutes(40),
+    )
+    .await;
+
+    assert_eq!(run.node_turns(), vec![node_turn(TurnLivenessValueV1::Off)]);
+    assert_eq!(run.terminal.primary, NodePrimaryDispositionV1::Completed);
+    assert_eq!(run.outcome, WorkflowOutcome::Completed);
+    assert_ended_between(run.elapsed, minutes(40), minutes(41));
+}
+
+/// I2a: an invocation duration beats a workflow `off`.
+#[tokio::test(start_paused = true)]
+async fn i2a_an_invocation_duration_overrides_a_workflow_off() {
+    let run = run_liveness_case(
+        entry(),
+        None,
+        liveness_controls(
+            Some(LivenessOverrideV1::Off),
+            Some(LivenessOverrideV1::Ms(20 * 60_000)),
+        ),
+        minutes(31),
+    )
+    .await;
+
+    assert_silence_timed_out(&run, 1_200);
+    assert_eq!(
+        run.node_turns(),
+        vec![node_turn(TurnLivenessValueV1::Ms(1_200_000))]
+    );
+    assert_ended_between(run.elapsed, minutes(20), minutes(21));
+}
+
+/// I2a: an invocation `off` beats a workflow duration; it does not collapse into "inherit".
+#[tokio::test(start_paused = true)]
+async fn i2a_an_invocation_off_overrides_a_workflow_duration() {
+    let run = run_liveness_case(
+        entry(),
+        None,
+        liveness_controls(
+            Some(LivenessOverrideV1::Ms(20 * 60_000)),
+            Some(LivenessOverrideV1::Off),
+        ),
+        minutes(40),
+    )
+    .await;
+
+    assert_eq!(run.node_turns(), vec![node_turn(TurnLivenessValueV1::Off)]);
+    assert_eq!(run.terminal.primary, NodePrimaryDispositionV1::Completed);
+    assert_ended_between(run.elapsed, minutes(40), minutes(41));
+}
+
+/// I2a: the preflight smoke and the node turn both carry the frozen value.
+#[tokio::test(start_paused = true)]
+async fn i2a_preflight_and_node_turns_carry_the_frozen_silence() {
+    let mut preflight_entry = entry();
+    preflight_entry.preflight = true;
+    let run = run_liveness_case(
+        preflight_entry,
+        None,
+        liveness_controls(Some(LivenessOverrideV1::Ms(20 * 60_000)), None),
+        minutes(1),
+    )
+    .await;
+
+    assert_eq!(
+        run.node_turns(),
+        vec![
+            node_turn(TurnLivenessValueV1::Ms(1_200_000)),
+            node_turn(TurnLivenessValueV1::Ms(1_200_000)),
+        ],
+        "one preflight turn, then one node turn"
+    );
+    assert_eq!(run.terminal.primary, NodePrimaryDispositionV1::Completed);
+}
+
+/// I2a: a run frozen automatic before workflow turns had a silence cutoff carries `"none"`. On
+/// resume its node turns keep no silence cutoff.
+#[tokio::test(start_paused = true)]
+async fn i2a_legacy_frozen_automatic_controls_keep_no_silence_cutoff() {
+    const LEGACY: &[u8] = br#"{"schema_version":1,"task_class":"other","profile":{"schema_version":1,"id":"legacy_bounded_v1","queue_wait_ms":1800000,"control_observable_ms":31000,"no_progress_snapshot_ms":1800000,"silence_cutoff":"none","work_cutoff_ms":7200000,"cancel_observable_ms":6000,"cleanup_tail_ms":60000,"reporting_tail_ms":10000,"terminal_bound_ms":7270000},"profile_source":"compatibility_omission","fan_out":{"kind":"bounded_independent"},"synthesis":"degraded","deadline_activation":"automatic_r2f1b"}"#;
+    let legacy: FrozenWorkflowControlsV1 = serde_json::from_slice(LEGACY).unwrap();
+    let run = run_liveness_case(
+        entry(),
+        None,
+        (WorkflowControlDefaultsV1::default(), legacy),
+        minutes(40),
+    )
+    .await;
+
+    assert_eq!(run.node_turns(), vec![node_turn(TurnLivenessValueV1::Off)]);
+    assert_eq!(run.terminal.primary, NodePrimaryDispositionV1::Completed);
+    assert_ended_between(run.elapsed, minutes(40), minutes(41));
+}
+
+/// I2a leaves the workflow-wide work cutoff alone: with the silence cutoff off, a node whose
+/// agent works silently for 3 h is still cancelled by the automatic 2 h absolute cutoff.
+#[tokio::test(start_paused = true)]
+async fn i2a_the_automatic_two_hour_workflow_cutoff_still_bounds_a_silence_off_run() {
+    let controls = liveness_controls(Some(LivenessOverrideV1::Off), None);
+    assert_eq!(controls.1.effective_work_cutoff_ms(), 7_200_000);
+    let run = run_liveness_case(entry(), None, controls, minutes(180)).await;
+
+    assert_eq!(run.node_turns(), vec![node_turn(TurnLivenessValueV1::Off)]);
+    assert_eq!(
+        run.terminal.primary,
+        NodePrimaryDispositionV1::CanceledPolicy
+    );
+    assert_ne!(run.outcome, WorkflowOutcome::Completed);
+    assert_ended_between(run.elapsed, minutes(120), minutes(122));
 }
 
 #[derive(Default)]

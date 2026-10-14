@@ -249,6 +249,21 @@ fn run_offline_legacy_success(
     String,
     bridge_core::workflow_history::AttemptStructuredEvidenceV1,
 ) {
+    run_offline_workflow(advertise_v1, "", &[])
+}
+
+/// One provider-free offline `run-workflow` against a fake ACP adapter, with `workflow_keys`
+/// added to the `[[workflows]]` table and `extra_args` to the command line.
+fn run_offline_workflow(
+    advertise_v1: bool,
+    workflow_keys: &str,
+    extra_args: &[&str],
+) -> (
+    std::process::Output,
+    bridge_core::workflow_history::AttemptTerminal,
+    String,
+    bridge_core::workflow_history::AttemptStructuredEvidenceV1,
+) {
     let directory = tempdir().unwrap();
     let adapter = directory.path().join("missing-evidence-acp");
     let initialize = if advertise_v1 {
@@ -313,6 +328,7 @@ path = {store:?}
 
 [[workflows]]
 id = "offline-v1"
+{workflow_keys}
 
 [[workflows.nodes]]
 id = "only"
@@ -344,6 +360,7 @@ addr = "127.0.0.1:0"
             "--out",
             output_path.to_str().unwrap(),
         ])
+        .args(extra_args)
         .current_dir(directory.path())
         .output()
         .expect("run provider-free offline workflow");
@@ -474,4 +491,55 @@ fn offline_unsupported_legacy_success_remains_completed() {
         )
         .unwrap(),
     );
+}
+
+/// Activity liveness I2a, end to end through the real binary: the silence cutoff an offline run
+/// freezes (as reserved in its history ledger) follows `--silence-cutoff`, then
+/// `[[workflows]] silence_cutoff`, then the agent default; `off` at either level freezes no cutoff.
+#[test]
+fn offline_run_freezes_the_silence_cutoff_by_invocation_then_workflow() {
+    use bridge_core::execution_policy::{FrozenWorkflowControlsV1, SilenceCutoffV1};
+
+    let cases: [(&str, &[&str], SilenceCutoffV1); 5] = [
+        ("", &[], SilenceCutoffV1::AgentDefault),
+        ("silence_cutoff = \"off\"", &[], SilenceCutoffV1::None),
+        (
+            "silence_cutoff = 1200",
+            &[],
+            SilenceCutoffV1::Activity {
+                silence_ms: 1_200_000,
+            },
+        ),
+        (
+            "silence_cutoff = \"off\"",
+            &["--silence-cutoff", "900"],
+            SilenceCutoffV1::Activity {
+                silence_ms: 900_000,
+            },
+        ),
+        (
+            "silence_cutoff = 1200",
+            &["--silence-cutoff", "off"],
+            SilenceCutoffV1::None,
+        ),
+    ];
+    for (workflow_keys, args, expected) in cases {
+        let (output, terminal, output_text, structured) =
+            run_offline_workflow(false, workflow_keys, args);
+        assert!(
+            output.status.success(),
+            "{workflow_keys:?} {args:?}: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(terminal.outcome, "completed");
+        assert_eq!(output_text, "FINAL");
+        let controls: FrozenWorkflowControlsV1 =
+            serde_json::from_str(&structured.reservation.controls_json).unwrap();
+        assert_eq!(
+            controls.profile.silence_cutoff, expected,
+            "{workflow_keys:?} {args:?}"
+        );
+        assert_eq!(controls.effective_work_cutoff_ms(), 7_200_000);
+    }
 }

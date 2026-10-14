@@ -8,6 +8,7 @@
 
 use crate::domain::AgentLivenessConfig;
 use crate::execution_policy::DEFAULT_WORK_CUTOFF_MS;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt;
 
@@ -27,8 +28,10 @@ pub const TOOL_ID_PREVIEW_MAX_BYTES: usize = 64;
 /// Bytes of a tool call's title (and kind) kept for display.
 pub const TOOL_TITLE_MAX_BYTES: usize = 128;
 
-/// A configured liveness duration: explicitly off, or a bound in milliseconds.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// A configured liveness duration: explicitly off, or a bound in milliseconds. Carried as
+/// `Option<_>` wherever absence means inherit, so `Off` never collapses into absence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum LivenessOverrideV1 {
     Off,
     Ms(u64),
