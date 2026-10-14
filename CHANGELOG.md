@@ -27,8 +27,9 @@ release (see [`docs/adr/`](docs/adr/) for the full architectural record).
   records, then reports its failure and frees its session. The records, and the failure's own
   record after them, are finished in the background for up to 5 minutes, and how that ends is
   traced. A turn the agent had already finished then fails with `acp.prompt.start_records_pending`
-  (`Persistence`) rather than completing, as when those records fail. No client marks a turn as
-  watched yet, so every such turn gets the 2-hour work cutoff. Workflow
+  (`Persistence`) rather than completing, as when those records fail. A served unary turn sent with
+  `a2a-bridge.client_watching=true`, as `submit` does while its heartbeat is on, has no default work
+  cutoff (see Added); every other such turn gets the 2-hour one. Workflow
   node turns, preflight included, carry no turn work cutoff and keep the workflow's own deadlines;
   their silence cutoff is the next entry. The legacy `[agents.watchdog]` keeps its semantics and its
   `acp.prompt.watchdog_timeout` code and runs alongside; when bounds fall due at the same instant
@@ -54,6 +55,34 @@ release (see [`docs/adr/`](docs/adr/) for the full architectural record).
 
 ### Added
 
+- `submit` and `run-workflow` (local and `--serve`) print a heartbeat while the run is in flight: one
+  stderr line per beat, first after 60 s and then every 60 s, never anything on stdout, for example
+  `[heartbeat] elapsed=14m00s turns=1 agent=codex last_activity=2m10s open_tool="cargo test"
+  tool_kind=execute tool_age=9m02s silence=paused cutoff=30m`. Each in-flight turn of the run is
+  listed (its agent, the time since its last activity, its oldest open tool call, whether the
+  silence clock is paused, and its silence and work cutoffs); `turns=0` means none is in flight.
+  The tool title and kind come from the agent, so they are truncated on a UTF-8 boundary and then
+  escaped JSON-style (quotes, backslashes and every control character, ESC included): a beat is
+  always one line and cannot drive the terminal. `--heartbeat-secs <n>` sets the interval (`0` is
+  off), `--no-heartbeat` turns it off, and `A2A_BRIDGE_HEARTBEAT_SECS` sets it when neither flag is
+  given. A local `run-workflow` reads the turns in-process. `submit` and `run-workflow --serve` ask
+  the server with the new bridge-private, read-only `TaskLiveness {taskId}` JSON-RPC method (the
+  same authorization as `AttemptStatus`; `{turns: [...]}`, or `TaskNotFound` while no turn is in
+  flight); `--serve` also reports the age of the last SSE frame. Every poll has its own deadline,
+  `min(10 s, interval / 2)`: a poll that times out or fails, or a server older than this change
+  ("method not found"), gives that beat as `[heartbeat] elapsed=… liveness=unavailable`, and the
+  next beat polls again. `submit` keeps its single unary `SendMessage` and its output.
+- Per-request turn liveness for served `message/send` and `message/stream` turns, as
+  `message.metadata` strings: `a2a-bridge.silence_cutoff_secs` and `a2a-bridge.work_cutoff_secs`
+  (`"off"`, `"0"` or whole seconds up to 30 days, through the shared liveness parser) override the
+  agent's `[agents.liveness]` for that turn, and `a2a-bridge.client_watching` (`"true"`/`"false"`)
+  marks a unary turn as watched. A watched turn has no default work cutoff, because a unary turn
+  dies with its client: closing the connection drops the request, which cancels the ACP prompt
+  (`session/cancel`). Only unary `message/send` honours `client_watching`; streaming requests and
+  served workflows ignore it, and workflows ignore all three keys, keeping their own frozen policy
+  and 2-hour cutoff. An invalid value is refused as `InvalidRequest` before any work starts.
+  `submit` sends `client_watching=true` while its heartbeat is on, so `--no-heartbeat` (or
+  `--heartbeat-secs 0`) keeps a script's turn on the 2-hour backstop.
 - `[[workflows]] silence_cutoff = "off" | <secs>` and `run-workflow --silence-cutoff <secs|off>` set
   the silence cutoff of a workflow's node turns: whole seconds up to 30 days through the shared
   liveness parser, `"off"` (or `0`) for none. The flag beats the workflow's value, which beats the

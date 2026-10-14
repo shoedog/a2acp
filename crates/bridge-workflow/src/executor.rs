@@ -94,6 +94,10 @@ pub struct WorkflowRunContext {
     pub task_id: Option<bridge_core::ids::TaskId>,
     pub prompt_id: Option<String>,
     pub harvest_audit_store: Arc<dyn HarvestAuditStore>,
+    /// Heartbeat board key for every node turn of this run: the local `run-workflow`'s
+    /// execution id (not its attempt id), or the served task id. Never persisted; `None`
+    /// registers no turn.
+    pub observer_key: Option<String>,
     #[cfg(test)]
     post_recording_exit_fault: Option<PostRecordingExitFaultForTest>,
 }
@@ -108,6 +112,7 @@ impl Default for WorkflowRunContext {
             task_id: None,
             prompt_id: None,
             harvest_audit_store: Arc::new(NoopHarvestAuditStore),
+            observer_key: None,
             #[cfg(test)]
             post_recording_exit_fault: None,
         }
@@ -1968,6 +1973,18 @@ fn workflow_turn_liveness_v1(
     }
 }
 
+/// [`workflow_turn_liveness_v1`] for a turn of the run `ctx` describes: registered on the
+/// heartbeat board under the run's observer key.
+fn observed_workflow_turn_liveness_v1(
+    controls: Option<&ep::FrozenWorkflowControlsV1>,
+    ctx: &WorkflowRunContext,
+) -> TurnLivenessRequestV1 {
+    TurnLivenessRequestV1 {
+        observer_key: ctx.observer_key.clone(),
+        ..workflow_turn_liveness_v1(controls)
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn node_turn_context(
     wf_id: &str,
@@ -2524,7 +2541,7 @@ impl WorkflowExecutor {
                         requested_mode: HarvestSanitizationMode::Off,
                         prefix_attestation_request:
                             bridge_core::attestation::PrefixAttestationRequest::Disabled,
-                        liveness: workflow_turn_liveness_v1(source.frozen_controls()),
+                        liveness: observed_workflow_turn_liveness_v1(source.frozen_controls(), ctx),
                     },
                 )
                 .await;
@@ -3119,8 +3136,9 @@ impl WorkflowExecutor {
                             turn_id: obs_ctx.turn_id.clone(),
                             requested_mode: node_harvest_mode,
                             prefix_attestation_request: prefix_attestation_request.clone(),
-                            liveness: workflow_turn_liveness_v1(
+                            liveness: observed_workflow_turn_liveness_v1(
                                 frozen_authority.map(|authority| &authority.run_spec.controls),
+                                ctx,
                             ),
                         },
                     )
@@ -4035,8 +4053,9 @@ impl WorkflowExecutor {
                                 turn_id: obs_ctx_ref.turn_id.clone(),
                                 requested_mode: node_harvest_mode,
                                 prefix_attestation_request: prefix_attestation_request.clone(),
-                                liveness: workflow_turn_liveness_v1(
+                                liveness: observed_workflow_turn_liveness_v1(
                                     frozen_authority.map(|authority| &authority.run_spec.controls),
+                                    ctx,
                                 ),
                             },
                         )
@@ -9444,6 +9463,68 @@ mod tests {
                 ));
                 assert_eq!(tracker.due_cause(31 * 60_000, false), None);
                 assert_eq!(tracker.due_cause(3 * 60 * 60_000, false), None);
+            }
+        }
+    }
+
+    /// I3: every workflow turn site (preflight, cold and warm node) registers its turn under
+    /// the run's observer key, and a run without one registers nothing. The key never makes a
+    /// workflow turn watched.
+    #[tokio::test]
+    async fn every_workflow_turn_site_carries_the_run_observer_key() {
+        let entry = preflight_entry("good", &[]);
+        let observed = || WorkflowRunContext {
+            observer_key: Some("exec-observed".into()),
+            ..WorkflowRunContext::default()
+        };
+
+        let cold = Arc::new(LivenessRecordingBackend::default());
+        let events = WorkflowExecutor::new(Arc::new(LivenessPreflightRegistry {
+            entry: entry.clone(),
+            backend: cold.clone(),
+        }))
+        .run_with_context(
+            one_node_graph(),
+            "DIFF".into(),
+            "attempt-observed-cold".into(),
+            CancellationToken::new(),
+            observed(),
+        )
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .map(|event| event.expect("workflow event"))
+        .collect::<Vec<_>>();
+        assert!(*node_finished(&events).0, "the cold node completes");
+
+        let warm = Arc::new(LivenessRecordingBackend::default());
+        let events = WorkflowExecutor::new(Arc::new(LivenessPreflightRegistry {
+            entry: entry.clone(),
+            backend: warm.clone(),
+        }))
+        .run_with_context_and_dispatcher(
+            one_node_graph(),
+            "DIFF".into(),
+            "attempt-observed-warm".into(),
+            CancellationToken::new(),
+            observed(),
+            Arc::new(LivenessWarmDispatcher {
+                backend: warm.clone(),
+            }),
+        )
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .map(|event| event.expect("workflow event"))
+        .collect::<Vec<_>>();
+        assert!(*node_finished(&events).0, "the warm node completes");
+
+        for turns in [&cold.turns, &warm.turns] {
+            let turns = turns.lock().unwrap().clone();
+            assert_eq!(turns.len(), 2, "one preflight turn and one node turn");
+            for request in turns {
+                assert_eq!(request.observer_key.as_deref(), Some("exec-observed"));
+                assert!(!request.client_watching);
             }
         }
     }
@@ -15943,6 +16024,7 @@ mod observability_tests {
             task_id: None,
             prompt_id: Some("prompt/workflow".to_string()),
             harvest_audit_store: Arc::new(NoopHarvestAuditStore),
+            observer_key: None,
         };
         let graph = Arc::new(WorkflowGraph {
             id: bridge_core::ids::WorkflowId::parse("wf").unwrap(),
@@ -16118,6 +16200,7 @@ mod observability_tests {
             task_id: None,
             prompt_id: None,
             harvest_audit_store: Arc::new(NoopHarvestAuditStore),
+            observer_key: None,
         };
         let exec = WorkflowExecutor::new(Arc::new(UsageRegistry));
         let mut stream = exec.run_with_context_and_dispatcher(
@@ -16238,6 +16321,7 @@ mod observability_tests {
             task_id: None,
             prompt_id: None,
             harvest_audit_store: Arc::new(NoopHarvestAuditStore),
+            observer_key: None,
         };
         let dispatcher = Arc::new(EmptyThenTextDispatcher {
             recover_on_retry: true,
@@ -16377,6 +16461,7 @@ mod observability_tests {
             task_id: None,
             prompt_id: None,
             harvest_audit_store: Arc::new(NoopHarvestAuditStore),
+            observer_key: None,
         };
         let exec = WorkflowExecutor::new(Arc::new(TextRegistry));
         let mut stream = exec.run_with_context(
@@ -16484,6 +16569,7 @@ mod observability_tests {
             task_id: None,
             prompt_id: None,
             harvest_audit_store: Arc::new(NoopHarvestAuditStore),
+            observer_key: None,
         };
         // No retry → AgentTimedOut is fatal on the only attempt.
         let exec = WorkflowExecutor::new(Arc::new(TimedOutRegistry));
@@ -16611,6 +16697,7 @@ mod observability_tests {
             task_id: None,
             prompt_id: None,
             harvest_audit_store: Arc::new(NoopHarvestAuditStore),
+            observer_key: None,
         };
         let exec = WorkflowExecutor::new(Arc::new(FailOnceThenTextRegistry { calls }));
         // 2 attempts, 0ms backoff so the test doesn't sleep.
@@ -16786,6 +16873,7 @@ mod observability_tests {
             task_id: None,
             prompt_id: None,
             harvest_audit_store: Arc::new(NoopHarvestAuditStore),
+            observer_key: None,
         };
         let exec = WorkflowExecutor::new(Arc::new(TextRegistry));
         let mut stream = exec.run_with_context(
@@ -16813,6 +16901,7 @@ mod observability_tests {
             task_id: None,
             prompt_id: None,
             harvest_audit_store: Arc::new(NoopHarvestAuditStore),
+            observer_key: None,
         };
         let exec = WorkflowExecutor::new(Arc::new(TimedOutRegistry));
         let mut stream = exec.run_with_context(
@@ -16840,6 +16929,7 @@ mod observability_tests {
             task_id: None,
             prompt_id: None,
             harvest_audit_store: Arc::new(NoopHarvestAuditStore),
+            observer_key: None,
         };
         let token = CancellationToken::new();
         let exec = WorkflowExecutor::new(Arc::new(NoUsageIdleRegistry));
@@ -16878,6 +16968,7 @@ mod observability_tests {
             task_id: None,
             prompt_id: None,
             harvest_audit_store: Arc::new(NoopHarvestAuditStore),
+            observer_key: None,
         };
         let exec = WorkflowExecutor::new(Arc::new(UsageRegistry));
         let mut stream = exec.run_with_context(
@@ -16927,6 +17018,7 @@ mod observability_tests {
             task_id: None,
             prompt_id: None,
             harvest_audit_store: Arc::new(NoopHarvestAuditStore),
+            observer_key: None,
         };
         let exec = WorkflowExecutor::new(Arc::new(UsageRegistry));
         let mut stream = exec.run_with_context_and_dispatcher(
@@ -17055,6 +17147,7 @@ mod observability_tests {
             task_id: None,
             prompt_id: None,
             harvest_audit_store: Arc::new(NoopHarvestAuditStore),
+            observer_key: None,
         };
         let exec = WorkflowExecutor::new(Arc::new(UsageRegistry));
 
@@ -17128,6 +17221,7 @@ mod observability_tests {
             task_id: None,
             prompt_id: None,
             harvest_audit_store: Arc::new(NoopHarvestAuditStore),
+            observer_key: None,
         };
         let exec = WorkflowExecutor::new(Arc::new(UsageRegistry));
 

@@ -4051,6 +4051,8 @@ fn spawn_detached_workflow_inner(
         // stale value. This is the central safety boundary; caller-side fixes are defense in
         // depth. Must sit after sink construction and before any turn can be emitted.
         ctx.task_id = Some(task.clone());
+        // Kept in step with the task id: `TaskLiveness` finds this run's turns under it.
+        ctx.observer_key = Some(task.as_str().to_owned());
         let drain_cancel = token.clone();
         let diagnostic_context = WorkflowDiagnosticContext::new(ctx, diagnostic_factory);
         let diagnostic_context = match prompt_dispatch {
@@ -5677,6 +5679,8 @@ mod resume_tests {
     #[derive(Default)]
     struct PromptRec {
         prompts: StdMutex<Vec<String>>,
+        /// The heartbeat key of every turn staged on the backend.
+        observer_keys: StdMutex<Vec<Option<String>>>,
     }
 
     struct RecordingBackend {
@@ -5706,6 +5710,18 @@ mod resume_tests {
 
         async fn cancel(&self, _session: &SessionId) -> Result<(), BridgeError> {
             Ok(())
+        }
+
+        async fn configure_turn(
+            &self,
+            _session: &SessionId,
+            meta: bridge_core::permission::TurnMeta,
+        ) {
+            self.rec
+                .observer_keys
+                .lock()
+                .unwrap()
+                .push(meta.liveness.observer_key);
         }
     }
 
@@ -6934,6 +6950,60 @@ mod resume_tests {
                 "detached runner must persist authoritative task_id for {task_raw}: {rows:?}"
             );
         }
+    }
+
+    /// I3: the detached runner owns the heartbeat key as it owns the task id: every turn of a
+    /// served, batch or resumed workflow is found by `TaskLiveness` under the task id, whatever
+    /// key the caller supplied.
+    #[tokio::test]
+    async fn spawn_detached_workflow_keys_its_turns_by_the_task_id() {
+        let store: Arc<dyn TaskStore> = Arc::new(MemoryTaskStore::new());
+        let turnlog = turn_log_observer(store.clone());
+        let graph = single_retry_graph();
+        let synth = Arc::new(PromptRec::default());
+        let deps = DetachedDeps {
+            executor: Some(Arc::new(WorkflowExecutor::new(Arc::new(
+                RecordingRegistry {
+                    synth: synth.clone(),
+                },
+            )))),
+            ..detached_deps_with_observer(store.clone(), turnlog.clone(), graph.clone())
+        };
+        let task = TaskId::parse("t-observed-owner").unwrap();
+        store
+            .create(&make_task_record(task.as_str()))
+            .await
+            .unwrap();
+        let hub = Arc::new(TaskProgressHub::new());
+        deps.progress_hubs
+            .lock()
+            .await
+            .insert(task.clone(), hub.clone());
+
+        let handle = spawn_detached_workflow(
+            &deps,
+            task.clone(),
+            "DIFF".into(),
+            graph.clone(),
+            "attempt-observed".into(),
+            CancellationToken::new(),
+            HashMap::new(),
+            WorkflowRunContext {
+                observer_key: Some("stale-key".into()),
+                observer: turnlog.clone(),
+                ..WorkflowRunContext::default()
+            },
+            hub,
+        );
+        assert!(handle.await.unwrap());
+
+        let keys = synth.observer_keys.lock().unwrap().clone();
+        assert!(!keys.is_empty(), "the workflow staged its turns");
+        assert!(
+            keys.iter()
+                .all(|key| key.as_deref() == Some("t-observed-owner")),
+            "{keys:?}"
+        );
     }
 
     #[tokio::test]

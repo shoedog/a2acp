@@ -11,6 +11,8 @@ use crate::execution_policy::DEFAULT_WORK_CUTOFF_MS;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 
 /// Default silence cutoff: 30 minutes without activity while no tool call or permission is open.
 pub const DEFAULT_SILENCE_CUTOFF_MS: u64 = 1_800_000;
@@ -27,6 +29,9 @@ pub const TOOL_ID_PREVIEW_MAX_BYTES: usize = 64;
 
 /// Bytes of a tool call's title (and kind) kept for display.
 pub const TOOL_TITLE_MAX_BYTES: usize = 128;
+
+/// Open tool calls a snapshot lists, oldest first. Its count is always exact.
+pub const SNAPSHOT_OPEN_TOOLS_MAX: usize = 8;
 
 /// A configured liveness duration: explicitly off, or a bound in milliseconds. Carried as
 /// `Option<_>` wherever absence means inherit, so `Off` never collapses into absence.
@@ -89,7 +94,8 @@ pub struct TurnLivenessRequestV1 {
     pub work_cutoff: TurnLivenessValueV1,
     /// A client is waiting on this turn and dies with it, so the work cutoff defaults to off.
     pub client_watching: bool,
-    /// Heartbeat registration key. Carried for the client heartbeat; the engine ignores it.
+    /// Heartbeat key: the backend registers the turn on its [`TurnLivenessBoard`] under it for
+    /// as long as the turn runs. The bounds ignore it; `None` registers nothing.
     pub observer_key: Option<String>,
 }
 
@@ -409,6 +415,39 @@ impl TurnLivenessTracker {
     pub fn open_tools(&self) -> impl Iterator<Item = &OpenToolV1> {
         self.open.values()
     }
+
+    /// What the turn looks like at `now_ms`, for a heartbeat. Lists at most
+    /// [`SNAPSHOT_OPEN_TOOLS_MAX`] open tools, oldest first.
+    #[must_use]
+    pub fn snapshot(&self, now_ms: u64, agent: &str) -> TurnLivenessSnapshotV1 {
+        let mut open: Vec<&OpenToolV1> = self.open.values().collect();
+        open.sort_by(|a, b| {
+            a.opened_ms
+                .cmp(&b.opened_ms)
+                .then_with(|| a.id_preview.cmp(&b.id_preview))
+        });
+        TurnLivenessSnapshotV1 {
+            turn_id: String::new(),
+            agent: agent.to_owned(),
+            elapsed_ms: now_ms,
+            last_activity_age_ms: now_ms.saturating_sub(self.last_activity_ms),
+            open_tool_count: u64::try_from(self.open.len()).unwrap_or(u64::MAX),
+            open_tools: open
+                .into_iter()
+                .take(SNAPSHOT_OPEN_TOOLS_MAX)
+                .map(|tool| OpenToolSnapshotV1 {
+                    title: tool.title.clone(),
+                    kind: tool.kind.clone(),
+                    age_ms: now_ms.saturating_sub(tool.opened_ms),
+                })
+                .collect(),
+            open_overflowed: self.open_overflowed,
+            pending_permissions: self.pending_permissions,
+            paused: self.paused(),
+            silence_cutoff_ms: self.resolved.silence_ms,
+            work_cutoff_ms: self.resolved.work_cutoff_ms,
+        }
+    }
 }
 
 fn bounded(text: &str, max_bytes: usize) -> String {
@@ -417,6 +456,154 @@ fn bounded(text: &str, max_bytes: usize) -> String {
         end -= 1;
     }
     text[..end].to_owned()
+}
+
+/// One open tool call in a [`TurnLivenessSnapshotV1`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OpenToolSnapshotV1 {
+    pub title: String,
+    pub kind: String,
+    pub age_ms: u64,
+}
+
+/// One in-flight turn as a client heartbeat sees it. Served by the bridge-private
+/// `TaskLiveness` RPC; the titles and kinds are agent-controlled text.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TurnLivenessSnapshotV1 {
+    /// Filled by the [`TurnLivenessBoard`] from the turn's registration.
+    #[serde(default)]
+    pub turn_id: String,
+    pub agent: String,
+    pub elapsed_ms: u64,
+    pub last_activity_age_ms: u64,
+    pub open_tool_count: u64,
+    /// At most [`SNAPSHOT_OPEN_TOOLS_MAX`], oldest first.
+    #[serde(default)]
+    pub open_tools: Vec<OpenToolSnapshotV1>,
+    #[serde(default)]
+    pub open_overflowed: bool,
+    pub pending_permissions: u64,
+    pub paused: bool,
+    /// `None` is off.
+    pub silence_cutoff_ms: Option<u64>,
+    /// `None` is off.
+    pub work_cutoff_ms: Option<u64>,
+}
+
+/// A live turn's view of itself, read by a [`TurnLivenessBoard`] snapshot.
+pub trait TurnLivenessProbeV1: Send + Sync {
+    fn snapshot(&self) -> TurnLivenessSnapshotV1;
+}
+
+struct BoardEntry {
+    serial: u64,
+    turn_id: String,
+    probe: Arc<dyn TurnLivenessProbeV1>,
+}
+
+/// The in-flight turns of a process, by observer key (a local workflow's execution id, a served
+/// task id). Several turns can share a key (workflow fan-out). Each turn registers itself for as
+/// long as it runs and is removed when its [`TurnLivenessRegistrationV1`] drops.
+#[derive(Default)]
+pub struct TurnLivenessBoard {
+    next_serial: AtomicU64,
+    turns: Mutex<HashMap<String, Vec<BoardEntry>>>,
+}
+
+impl fmt::Debug for TurnLivenessBoard {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TurnLivenessBoard")
+            .field("turns", &self.turn_count())
+            .finish_non_exhaustive()
+    }
+}
+
+impl TurnLivenessBoard {
+    /// Register one turn under `(observer_key, turn_id)` until the returned registration drops.
+    pub fn register(
+        self: &Arc<Self>,
+        observer_key: impl Into<String>,
+        turn_id: impl Into<String>,
+        probe: Arc<dyn TurnLivenessProbeV1>,
+    ) -> TurnLivenessRegistrationV1 {
+        let observer_key = observer_key.into();
+        let serial = self.next_serial.fetch_add(1, Ordering::Relaxed);
+        self.lock()
+            .entry(observer_key.clone())
+            .or_default()
+            .push(BoardEntry {
+                serial,
+                turn_id: turn_id.into(),
+                probe,
+            });
+        TurnLivenessRegistrationV1 {
+            board: Arc::clone(self),
+            observer_key,
+            serial,
+        }
+    }
+
+    /// Every in-flight turn under `observer_key`, in registration order. Empty when none is.
+    #[must_use]
+    pub fn snapshot(&self, observer_key: &str) -> Vec<TurnLivenessSnapshotV1> {
+        // Probes take their own locks, so they are read after the board's is released.
+        let entries: Vec<(String, Arc<dyn TurnLivenessProbeV1>)> = self
+            .lock()
+            .get(observer_key)
+            .map(|entries| {
+                entries
+                    .iter()
+                    .map(|entry| (entry.turn_id.clone(), Arc::clone(&entry.probe)))
+                    .collect()
+            })
+            .unwrap_or_default();
+        entries
+            .into_iter()
+            .map(|(turn_id, probe)| TurnLivenessSnapshotV1 {
+                turn_id,
+                ..probe.snapshot()
+            })
+            .collect()
+    }
+
+    /// Registered turns under every key.
+    #[must_use]
+    pub fn turn_count(&self) -> usize {
+        self.lock().values().map(Vec::len).sum()
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, Vec<BoardEntry>>> {
+        self.turns.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+/// One turn's place on a [`TurnLivenessBoard`]. Dropping it removes exactly that turn, on every
+/// path the turn ends by.
+#[must_use = "the turn leaves the board when its registration drops"]
+pub struct TurnLivenessRegistrationV1 {
+    board: Arc<TurnLivenessBoard>,
+    observer_key: String,
+    serial: u64,
+}
+
+impl fmt::Debug for TurnLivenessRegistrationV1 {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TurnLivenessRegistrationV1")
+            .field("observer_key", &self.observer_key)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Drop for TurnLivenessRegistrationV1 {
+    fn drop(&mut self) {
+        let mut turns = self.board.lock();
+        if let Some(entries) = turns.get_mut(&self.observer_key) {
+            entries.retain(|entry| entry.serial != self.serial);
+            if entries.is_empty() {
+                turns.remove(&self.observer_key);
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -807,6 +994,121 @@ mod tests {
         assert_eq!(
             due(&tracker, 60 * MIN),
             Some(TurnLivenessCauseV1::WorkCutoff)
+        );
+    }
+
+    #[test]
+    fn snapshot_reports_ages_open_tools_oldest_first_and_the_bounds() {
+        let mut tracker = default_tracker();
+        tracker.observe(
+            2 * MIN,
+            TurnActivityV1::Tool(ToolObservationV1 {
+                raw_id: "newer",
+                status: Some(ToolCallPhaseV1::InProgress),
+                title: Some("cargo fmt"),
+                kind: Some("execute"),
+            }),
+        );
+        tracker.observe(
+            MIN,
+            TurnActivityV1::Tool(ToolObservationV1 {
+                raw_id: "older",
+                status: Some(ToolCallPhaseV1::InProgress),
+                title: Some("cargo test"),
+                kind: Some("execute"),
+            }),
+        );
+        tracker.permission_arrived(3 * MIN);
+
+        let snapshot = tracker.snapshot(10 * MIN, "codex");
+        assert_eq!(snapshot.agent, "codex");
+        assert_eq!(snapshot.elapsed_ms, 10 * MIN);
+        assert_eq!(snapshot.last_activity_age_ms, 7 * MIN);
+        assert_eq!(snapshot.open_tool_count, 2);
+        assert_eq!(
+            snapshot.open_tools,
+            vec![
+                OpenToolSnapshotV1 {
+                    title: "cargo test".into(),
+                    kind: "execute".into(),
+                    age_ms: 9 * MIN,
+                },
+                OpenToolSnapshotV1 {
+                    title: "cargo fmt".into(),
+                    kind: "execute".into(),
+                    age_ms: 8 * MIN,
+                },
+            ]
+        );
+        assert_eq!(snapshot.pending_permissions, 1);
+        assert!(snapshot.paused);
+        assert_eq!(snapshot.silence_cutoff_ms, Some(30 * MIN));
+        assert_eq!(snapshot.work_cutoff_ms, Some(120 * MIN));
+
+        let mut wide = default_tracker();
+        for index in 0..(SNAPSHOT_OPEN_TOOLS_MAX + 3) {
+            let id = index.to_string();
+            wide.observe(MIN, tool(&id, ToolCallPhaseV1::Pending));
+        }
+        let snapshot = wide.snapshot(MIN, "claude");
+        assert_eq!(snapshot.open_tools.len(), SNAPSHOT_OPEN_TOOLS_MAX);
+        assert_eq!(
+            snapshot.open_tool_count,
+            u64::try_from(SNAPSHOT_OPEN_TOOLS_MAX + 3).unwrap()
+        );
+    }
+
+    struct FixedProbe(TurnLivenessSnapshotV1);
+
+    impl TurnLivenessProbeV1 for FixedProbe {
+        fn snapshot(&self) -> TurnLivenessSnapshotV1 {
+            self.0.clone()
+        }
+    }
+
+    fn probe(agent: &str) -> Arc<dyn TurnLivenessProbeV1> {
+        Arc::new(FixedProbe(default_tracker().snapshot(MIN, agent)))
+    }
+
+    /// I3: two fan-out turns share one key; each registration removes exactly its own turn.
+    #[test]
+    fn board_keeps_fan_out_turns_under_one_key_and_removes_exactly_the_finished_one() {
+        let board = Arc::new(TurnLivenessBoard::default());
+        let first = board.register("exec-1", "turn-a", probe("codex"));
+        let second = board.register("exec-1", "turn-b", probe("claude"));
+        let other = board.register("exec-2", "turn-c", probe("kiro"));
+
+        let turns = board.snapshot("exec-1");
+        assert_eq!(
+            turns
+                .iter()
+                .map(|turn| (turn.turn_id.as_str(), turn.agent.as_str()))
+                .collect::<Vec<_>>(),
+            vec![("turn-a", "codex"), ("turn-b", "claude")]
+        );
+        assert!(board.snapshot("attempt-1").is_empty());
+
+        drop(first);
+        let turns = board.snapshot("exec-1");
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].turn_id, "turn-b");
+        assert_eq!(board.snapshot("exec-2").len(), 1);
+
+        drop(second);
+        assert!(board.snapshot("exec-1").is_empty());
+        drop(other);
+        assert_eq!(board.turn_count(), 0);
+        assert!(board.lock().is_empty(), "an emptied key is removed");
+    }
+
+    #[test]
+    fn snapshot_round_trips_through_json() {
+        let mut snapshot = default_tracker().snapshot(MIN, "codex");
+        snapshot.turn_id = "turn-1".into();
+        let encoded = serde_json::to_string(&snapshot).unwrap();
+        assert_eq!(
+            serde_json::from_str::<TurnLivenessSnapshotV1>(&encoded).unwrap(),
+            snapshot
         );
     }
 

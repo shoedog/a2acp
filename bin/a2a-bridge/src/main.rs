@@ -57,6 +57,7 @@ mod config;
 mod containers;
 mod doctor;
 mod fallback_plan;
+mod heartbeat;
 mod local_file;
 mod provider_refresh;
 mod route;
@@ -1163,6 +1164,7 @@ fn container_rw_cfg_from_entry(
         rename_new_sessions: entry.rename_new_sessions,
         watchdog: entry.watchdog.clone(),
         liveness: entry.liveness,
+        liveness_board: None,
         handshake_timeout: bridge_acp::acp_backend::AcpConfig::default().handshake_timeout,
         cancel_grace: bridge_acp::acp_backend::AcpConfig::default().cancel_grace,
         resource_flight_attempt_v3: None,
@@ -1457,6 +1459,31 @@ fn make_spawn_fn(
     worktree_cfg: Option<WorktreeRuntimeCfg>,
     host_process_cwd: Option<HostProcessCwd>,
 ) -> BoundObservedSpawnFn {
+    make_spawn_fn_with_liveness_board(
+        policy_for_spawn,
+        owner_config_path,
+        run,
+        permission_registry,
+        perm_timeout_ms,
+        worktree_cfg,
+        host_process_cwd,
+        None,
+    )
+}
+
+/// [`make_spawn_fn`] whose ACP backends (direct and `container_rw`) register their in-flight
+/// turns on `liveness_board`, for the client heartbeat.
+#[allow(clippy::too_many_arguments)]
+fn make_spawn_fn_with_liveness_board(
+    policy_for_spawn: Arc<dyn bridge_core::ports::PolicyEngine>,
+    owner_config_path: PathBuf,
+    run: bridge_core::run_identity::RunHandle,
+    permission_registry: Option<Arc<PermissionRegistry>>,
+    perm_timeout_ms: u64,
+    worktree_cfg: Option<WorktreeRuntimeCfg>,
+    host_process_cwd: Option<HostProcessCwd>,
+    liveness_board: Option<Arc<bridge_core::turn_liveness::TurnLivenessBoard>>,
+) -> BoundObservedSpawnFn {
     Arc::new(move |entry: Arc<AgentEntry>, bound_effect, observer| {
         let policy = Arc::clone(&policy_for_spawn);
         let owner_config_path = owner_config_path.clone();
@@ -1464,6 +1491,7 @@ fn make_spawn_fn(
         let permission_registry = permission_registry.clone();
         let worktree_cfg = worktree_cfg.clone();
         let host_process_cwd = host_process_cwd.clone();
+        let liveness_board = liveness_board.clone();
         Box::pin(async move {
             // Ordinary host children inherit the bridge cwd; AcpConfig.cwd is their ACP session cwd.
             // Guarded fallback instead composes every cwd-derived input from the pinned object's stable
@@ -1573,6 +1601,7 @@ fn make_spawn_fn(
                     if let Some(pinned) = host_process_cwd.as_ref() {
                         acp.cwd = pinned.acp_session_cwd.clone();
                     }
+                    acp.liveness_board = liveness_board;
                     let argv_ref: Vec<&str> = argv.iter().map(String::as_str).collect();
                     let controller = acp
                         .container
@@ -1645,7 +1674,8 @@ fn make_spawn_fn(
                         })?;
                         container_owner(&owner_config_path, &sb.mount, entry.id.as_str())
                     };
-                    let ccfg = container_rw_cfg_from_entry(&entry, &run)?;
+                    let mut ccfg = container_rw_cfg_from_entry(&entry, &run)?;
+                    ccfg.liveness_board = liveness_board;
                     let cspawn: Arc<dyn bridge_container::ContainerSpawn> =
                         Arc::new(AcpContainerSpawn {
                             policy: Arc::clone(&policy),
@@ -1675,8 +1705,8 @@ fn permission_timeout_ms(server: &ServerConfig) -> u64 {
 /// from a raw args iterator (skipping the binary name at position 0 and the
 /// subcommand name at position 1).
 const RUN_WORKFLOW_USAGE: &str = "\
-usage: a2a-bridge run-workflow <workflow-id> --input <file|-> [--session-cwd <repo>] [--config <path>] [--silence-cutoff <secs|off>] [--out <file>] [--strict-brief]
-       a2a-bridge run-workflow --serve [--url <url>] --context <context-id> <workflow-id> --input <file|-> [--session-cwd <repo>] [--out <file>] [--strict-brief]
+usage: a2a-bridge run-workflow <workflow-id> --input <file|-> [--session-cwd <repo>] [--config <path>] [--silence-cutoff <secs|off>] [--out <file>] [--strict-brief] [--heartbeat-secs <n> | --no-heartbeat]
+       a2a-bridge run-workflow --serve [--url <url>] --context <context-id> <workflow-id> --input <file|-> [--session-cwd <repo>] [--out <file>] [--strict-brief] [--heartbeat-secs <n> | --no-heartbeat]
   <workflow-id>   design | code-review | spec-review | plan-review | … (whatever your --config defines)
   --input <file|-> the typed task-spec markdown the workflow acts on (required; '-' reads stdin)
   --session-cwd   the repo the agents read/work in (per-request cwd; without it they use the launch cwd)
@@ -1687,7 +1717,10 @@ usage: a2a-bridge run-workflow <workflow-id> --input <file|-> [--session-cwd <re
   --url <url>     serve URL for --serve (default: http://127.0.0.1:8080)
   --context       warm workflow parent context id for --serve (required with --serve)
   --out <file>    write the terminal node's output here (default: stdout)
-  --strict-brief abort before spawning/contacting serve when brief lint reports a VIOLATION";
+  --strict-brief abort before spawning/contacting serve when brief lint reports a VIOLATION
+  --heartbeat-secs <n>  print a [heartbeat] line on stderr every n seconds while the run is in
+                  flight (default 60, or A2A_BRIDGE_HEARTBEAT_SECS; 0 disables)
+  --no-heartbeat  no heartbeat";
 
 #[allow(clippy::type_complexity)]
 fn parse_run_workflow_args(
@@ -4214,6 +4247,7 @@ fn message_text(message: &a2a::Message) -> String {
         .join("")
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_workflow_serve_client(
     workflow_id: &str,
     input: &str,
@@ -4222,6 +4256,7 @@ async fn run_workflow_serve_client(
     context: &str,
     session_cwd: Option<&str>,
     identity: &bridge_core::ids::AttemptIdentity,
+    heartbeat: Option<Duration>,
 ) -> Result<(), BoxError> {
     let mut metadata = serde_json::Map::new();
     metadata.insert("a2a-bridge.skill".to_string(), workflow_id.into());
@@ -4268,8 +4303,17 @@ async fn run_workflow_serve_client(
     use futures::StreamExt;
     let mut output = String::new();
     let mut terminal: Option<a2a::TaskState> = None;
+    // The served workflow's task id is its execution id; each beat also reports how long ago
+    // the last SSE frame arrived.
+    let frames = heartbeat::FrameClock::default();
+    let beat = heartbeat::spawn_heartbeat(
+        heartbeat,
+        heartbeat::rpc_poller(url.to_owned(), identity.execution_id.as_str().to_owned()),
+        Some(frames.clone()),
+    );
 
     while let Some(event) = stream.next().await {
+        frames.frame();
         let event = event.map_err(|e| format!("run-workflow --serve: stream error: {e}"))?;
         let response: a2a::StreamResponse = serde_json::from_str(&event.data)
             .map_err(|e| format!("run-workflow --serve: bad SSE data frame: {e}"))?;
@@ -4307,6 +4351,7 @@ async fn run_workflow_serve_client(
             }
         }
     }
+    drop(beat);
 
     if let Some(out) = out_path {
         std::fs::write(out, &output)
@@ -4325,6 +4370,12 @@ async fn run_workflow_serve_client(
         }
         None => Err("run-workflow --serve: stream ended without terminal status".into()),
     }
+}
+
+/// A local run's heartbeat key: its execution id, never the attempt id its `run_id` and
+/// `task_id` carry.
+fn local_workflow_observer_key(identity: &bridge_core::ids::AttemptIdentity) -> String {
+    identity.execution_id.as_str().to_owned()
 }
 
 struct RunWorkflowAttemptTiming {
@@ -4355,6 +4406,12 @@ async fn run_workflow_cmd(args: &[String]) -> Result<(), BoxError> {
         return Ok(());
     }
     bridge_observ::init();
+    let heartbeat = heartbeat::heartbeat_interval(
+        args,
+        std::env::var(heartbeat::HEARTBEAT_ENV).ok().as_deref(),
+    )
+    .map_err(|error| format!("run-workflow: {error}"))?;
+    let args = &heartbeat::strip_heartbeat_flags(args);
     let (
         workflow_id,
         input_path,
@@ -4421,6 +4478,7 @@ async fn run_workflow_cmd(args: &[String]) -> Result<(), BoxError> {
             &context,
             session_cwd.as_deref(),
             &identity,
+            heartbeat,
         )
         .await;
     }
@@ -4608,7 +4666,9 @@ async fn run_workflow_cmd(args: &[String]) -> Result<(), BoxError> {
     });
     let policy = Arc::new(bridge_policy::permission::AutoPolicy);
     let policy_for_spawn = Arc::clone(&policy) as Arc<dyn bridge_core::ports::PolicyEngine>;
-    let spawn = make_spawn_fn(
+    // The node turns register on this in-process board; the heartbeat reads it directly.
+    let liveness_board = Arc::new(bridge_core::turn_liveness::TurnLivenessBoard::default());
+    let spawn = make_spawn_fn_with_liveness_board(
         policy_for_spawn,
         owner_config_path.clone(),
         run,
@@ -4616,6 +4676,7 @@ async fn run_workflow_cmd(args: &[String]) -> Result<(), BoxError> {
         120_000,
         worktree_cfg.clone(),
         None,
+        Some(Arc::clone(&liveness_board)),
     );
     let registry = Arc::new(
         bridge_registry::registry::Registry::new_bound_observed(snapshot, spawn)
@@ -4795,6 +4856,8 @@ async fn run_workflow_cmd(args: &[String]) -> Result<(), BoxError> {
     };
     ctx.task_id = task_id;
     ctx.harvest_audit_store = harvest_audit_store;
+    let observer_key = local_workflow_observer_key(&identity);
+    ctx.observer_key = Some(observer_key.clone());
     let attempt_timing = RunWorkflowAttemptTiming::new(identity.attempt_id.as_str().to_string());
     let activity_recorder = attempt_timing.telemetry.recorder();
     let terminal_evidence = attempt_timing.telemetry.evidence();
@@ -4907,6 +4970,11 @@ async fn run_workflow_cmd(args: &[String]) -> Result<(), BoxError> {
         run_id,
         tokio_util::sync::CancellationToken::new(),
         diagnostic_ctx,
+    );
+    let beat = heartbeat::spawn_heartbeat(
+        heartbeat,
+        heartbeat::board_poller(liveness_board, observer_key),
+        None,
     );
     let mut output = String::new();
     let mut ok = true;
@@ -5055,6 +5123,7 @@ async fn run_workflow_cmd(args: &[String]) -> Result<(), BoxError> {
             }
         }
     }
+    drop(beat);
     let prefinal_ms = attempt_timing.elapsed_ms();
     let cleanup_ms = cleanup_ms.min(prefinal_ms);
     let work_ms = prefinal_ms.saturating_sub(cleanup_ms);
@@ -6151,6 +6220,7 @@ async fn batch_cmd(args: &[String]) -> Result<(), BoxError> {
 const SUBMIT_USAGE: &str = "\
 usage: a2a-bridge submit [skill] --input <file> [--url <url>] [--context <id>] [--agent <id>]
                          [--model <m>] [--effort <e>] [--mode <m>] [--cwd <dir>]
+                         [--heartbeat-secs <n> | --no-heartbeat]
 
 Send one unary message to a running a2a-bridge serve and print the response text.
   [skill]         optional skill/workflow name (the first non-flag argument)
@@ -6161,7 +6231,11 @@ Send one unary message to a running a2a-bridge serve and print the response text
   --model <m>     override the agent model for this message
   --effort <e>    override the reasoning effort for this message
   --mode <m>      override the agent mode for this message
-  --cwd <dir>     override the session cwd for this message";
+  --cwd <dir>     override the session cwd for this message
+  --heartbeat-secs <n>  print a [heartbeat] line on stderr every n seconds while waiting
+                  (default 60, or A2A_BRIDGE_HEARTBEAT_SECS; 0 disables). While it is on the
+                  turn is watched: it dies with this client and has no default 2 h work cutoff
+  --no-heartbeat  no heartbeat; the turn keeps the 2 h work cutoff (for scripts)";
 
 fn submit_failure_message(error: &serde_json::Value) -> &str {
     error
@@ -6177,6 +6251,12 @@ fn submit_failure_message(error: &serde_json::Value) -> &str {
 }
 
 async fn submit_cmd(args: &[String]) -> Result<(), BoxError> {
+    let heartbeat = heartbeat::heartbeat_interval(
+        args,
+        std::env::var(heartbeat::HEARTBEAT_ENV).ok().as_deref(),
+    )
+    .map_err(|error| format!("submit: {error}"))?;
+    let args = &heartbeat::strip_heartbeat_flags(args);
     let identity = bridge_core::ids::AttemptIdentity::initial()?;
     println!("execution_id={}", identity.execution_id.as_str());
     println!("attempt_id={}", identity.attempt_id.as_str());
@@ -6185,6 +6265,47 @@ async fn submit_cmd(args: &[String]) -> Result<(), BoxError> {
     let input_path = flag(args, "--input").ok_or("submit: --input <file> required")?;
     let url = flag(args, "--url").unwrap_or("http://127.0.0.1:8080");
     let text = std::fs::read_to_string(input_path)?;
+    let message = submit_message(args, &identity, text, heartbeat.is_some());
+    // Unary SEND_MESSAGE stays the one request whose answer is the output; the heartbeat
+    // races it on stderr, polling the turn's liveness under the task id (the execution id).
+    let beat = heartbeat::spawn_heartbeat(
+        heartbeat,
+        heartbeat::rpc_poller(url.to_owned(), identity.execution_id.as_str().to_owned()),
+        None,
+    );
+    let v = rpc_call(
+        url,
+        a2a::methods::SEND_MESSAGE,
+        serde_json::json!({ "message": message }),
+    )
+    .await;
+    drop(beat);
+    let v = v?;
+    if let Some(err) = v.get("error") {
+        return Err(format!("submit failed: {}", submit_failure_message(err)).into());
+    }
+    let out = v["result"]["artifact"]["text"]
+        .as_str()
+        .or_else(|| {
+            v["result"]["artifacts"]
+                .as_array()
+                .and_then(|artifacts| artifacts.iter().find_map(artifact_text))
+        })
+        .or_else(|| v["result"]["task"]["id"].as_str())
+        .unwrap_or("ok");
+    println!("{out}");
+    Ok(())
+}
+
+/// The `submit` message. Its metadata carries the attempt identity, the route and overrides,
+/// and, while the heartbeat is on, `a2a-bridge.client_watching=true`: this client waits on the
+/// unary turn and the turn dies with it, so the server drops its default 2 h work cutoff.
+fn submit_message(
+    args: &[String],
+    identity: &bridge_core::ids::AttemptIdentity,
+    text: String,
+    heartbeat_on: bool,
+) -> serde_json::Map<String, serde_json::Value> {
     let mut md = serde_json::Map::new();
     md.insert(
         "a2a-bridge.execution_id".into(),
@@ -6225,6 +6346,12 @@ async fn submit_cmd(args: &[String]) -> Result<(), BoxError> {
             md.insert(key.into(), v.into());
         }
     }
+    if heartbeat_on {
+        md.insert(
+            bridge_coordinator::params::CLIENT_WATCHING_KEY.into(),
+            "true".into(),
+        );
+    }
     let mut message = serde_json::Map::new();
     message.insert("text".into(), text.into());
     message.insert("metadata".into(), serde_json::Value::Object(md));
@@ -6232,26 +6359,7 @@ async fn submit_cmd(args: &[String]) -> Result<(), BoxError> {
     if let Some(c) = flag(args, "--context") {
         message.insert("contextId".into(), c.into());
     }
-    let v = rpc_call(
-        url,
-        a2a::methods::SEND_MESSAGE,
-        serde_json::json!({ "message": message }),
-    )
-    .await?;
-    if let Some(err) = v.get("error") {
-        return Err(format!("submit failed: {}", submit_failure_message(err)).into());
-    }
-    let out = v["result"]["artifact"]["text"]
-        .as_str()
-        .or_else(|| {
-            v["result"]["artifacts"]
-                .as_array()
-                .and_then(|artifacts| artifacts.iter().find_map(artifact_text))
-        })
-        .or_else(|| v["result"]["task"]["id"].as_str())
-        .unwrap_or("ok");
-    println!("{out}");
-    Ok(())
+    message
 }
 
 fn artifact_text(artifact: &serde_json::Value) -> Option<&str> {
@@ -9945,7 +10053,10 @@ async fn main() -> Result<(), BoxError> {
     //    for the backend's lifetime, and applies the configured mode/model after
     //    each `session/new`. `model`/`mode` here are the per-MINT FALLBACK; the
     //    per-session `configure_session` overrides them at dispatch (Task 6).
-    let spawn: BoundObservedSpawnFn = make_spawn_fn(
+    //    Every backend registers its in-flight turns on the ONE heartbeat board the
+    //    server's `TaskLiveness` RPC reads.
+    let liveness_board = Arc::new(bridge_core::turn_liveness::TurnLivenessBoard::default());
+    let spawn: BoundObservedSpawnFn = make_spawn_fn_with_liveness_board(
         Arc::clone(&policy) as Arc<dyn PolicyEngine>,
         config_path.clone(),
         run.clone(),
@@ -9953,6 +10064,7 @@ async fn main() -> Result<(), BoxError> {
         perm_timeout,
         worktree_cfg.clone(),
         None,
+        Some(Arc::clone(&liveness_board)),
     );
 
     // 5. Config source + registry. `load()` is the initial desired state; the
@@ -10258,6 +10370,7 @@ async fn main() -> Result<(), BoxError> {
         )
         .with_allowed_cwd_root(cfg.allowed_cwd_root.clone())
         .with_model_catalog(Arc::clone(&model_catalog))
+        .with_liveness_board(liveness_board)
         .with_trace_http_config(bridge_a2a_inbound::server::TraceHttpConfig {
             enabled: traces_cfg.enabled,
             journal_max_bytes: traces_cfg.journal_max_bytes,
@@ -14950,6 +15063,234 @@ The command prints schemas, templates, and validates input.
         assert!(result.is_err());
     }
 
+    // ── Activity liveness I3: the client heartbeat ───────────────────────────
+
+    /// I3: `submit` asks for a watched turn exactly while its heartbeat is on, and the
+    /// heartbeat flags never become the route.
+    #[test]
+    fn submit_sends_client_watching_only_while_the_heartbeat_is_on() {
+        let identity = bridge_core::ids::AttemptIdentity::initial().unwrap();
+        let raw: Vec<String> = ["--heartbeat-secs", "30", "review", "--input", "brief.md"]
+            .iter()
+            .map(|arg| arg.to_string())
+            .collect();
+        let args = heartbeat::strip_heartbeat_flags(&raw);
+
+        let on = super::submit_message(&args, &identity, "go".into(), true);
+        assert_eq!(on["metadata"]["a2a-bridge.client_watching"], "true");
+        assert_eq!(on["metadata"]["a2a-bridge.skill"], "review");
+        assert_eq!(on["taskId"], identity.execution_id.as_str());
+
+        let off = super::submit_message(&args, &identity, "go".into(), false);
+        assert!(off["metadata"].get("a2a-bridge.client_watching").is_none());
+        assert_eq!(
+            heartbeat::heartbeat_interval(&raw, None),
+            Ok(Some(Duration::from_secs(30)))
+        );
+    }
+
+    /// I3: `run-workflow` takes the heartbeat flags without its own parser refusing them.
+    #[test]
+    fn run_workflow_accepts_the_heartbeat_flags() {
+        let raw: Vec<String> = ["wf", "--input", "in.md", "--no-heartbeat"]
+            .iter()
+            .map(|arg| arg.to_string())
+            .collect();
+        assert!(super::parse_run_workflow_args(&raw).is_err());
+        let (workflow_id, ..) =
+            super::parse_run_workflow_args(&heartbeat::strip_heartbeat_flags(&raw)).unwrap();
+        assert_eq!(workflow_id, "wf");
+        assert_eq!(heartbeat::heartbeat_interval(&raw, None), Ok(None));
+    }
+
+    /// Stands in for the ACP backend at the board seam: a node turn registers on the board
+    /// under the key its `TurnMeta` names, with one open tool, and runs 90 virtual seconds.
+    struct BoardRegisteringBackend {
+        board: Arc<bridge_core::turn_liveness::TurnLivenessBoard>,
+        staged: std::sync::Mutex<Option<bridge_core::turn_liveness::TurnLivenessRequestV1>>,
+    }
+
+    struct NodeTurnProbe(bridge_core::turn_liveness::TurnLivenessTracker);
+
+    impl bridge_core::turn_liveness::TurnLivenessProbeV1 for NodeTurnProbe {
+        fn snapshot(&self) -> bridge_core::turn_liveness::TurnLivenessSnapshotV1 {
+            self.0.snapshot(60_000, "codex")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl bridge_core::ports::AgentBackend for BoardRegisteringBackend {
+        async fn prompt(
+            &self,
+            _session: &bridge_core::ids::SessionId,
+            _parts: Vec<bridge_core::domain::Part>,
+        ) -> Result<bridge_core::ports::BackendStream, BridgeError> {
+            use bridge_core::turn_liveness::{
+                resolve_turn_liveness_v1, ToolCallPhaseV1, ToolObservationV1, TurnActivityV1,
+                TurnLivenessTracker,
+            };
+            let request = self.staged.lock().unwrap().take().unwrap_or_default();
+            let mut tracker = TurnLivenessTracker::new(resolve_turn_liveness_v1(&request, None));
+            tracker.observe(
+                5_000,
+                TurnActivityV1::Tool(ToolObservationV1 {
+                    raw_id: "call-1",
+                    status: Some(ToolCallPhaseV1::InProgress),
+                    title: Some("cargo test"),
+                    kind: Some("execute"),
+                }),
+            );
+            let registration = request.observer_key.map(|key| {
+                self.board
+                    .register(key, "turn-node", Arc::new(NodeTurnProbe(tracker)))
+            });
+            let turn = futures::stream::once(async move {
+                let _registration = registration;
+                tokio::time::sleep(Duration::from_secs(90)).await;
+            });
+            Ok(Box::pin(futures::StreamExt::flat_map(turn, |()| {
+                futures::stream::iter(vec![
+                    Ok(bridge_core::ports::Update::Text("OK".into())),
+                    Ok(bridge_core::ports::Update::Done {
+                        stop_reason: "end_turn".into(),
+                        prefix_attestation: Default::default(),
+                    }),
+                ])
+            })))
+        }
+
+        async fn cancel(&self, _session: &bridge_core::ids::SessionId) -> Result<(), BridgeError> {
+            Ok(())
+        }
+
+        async fn configure_turn(
+            &self,
+            _session: &bridge_core::ids::SessionId,
+            meta: bridge_core::permission::TurnMeta,
+        ) {
+            *self.staged.lock().unwrap() = Some(meta.liveness);
+        }
+    }
+
+    struct BoardRegisteringRegistry {
+        backend: Arc<BoardRegisteringBackend>,
+    }
+
+    #[async_trait::async_trait]
+    impl bridge_core::ports::AgentRegistry for BoardRegisteringRegistry {
+        async fn resolve(
+            &self,
+            _id: &bridge_core::ids::AgentId,
+        ) -> Result<bridge_core::ports::Resolved, BridgeError> {
+            Ok(bridge_core::ports::Resolved {
+                entry: Arc::new(acp_entry("codex")),
+                backend: self.backend.clone(),
+                lease: Box::new(ReviewTelemetryLease),
+            })
+        }
+
+        fn default_id(&self) -> bridge_core::ids::AgentId {
+            bridge_core::ids::AgentId::parse("codex").unwrap()
+        }
+
+        async fn apply(
+            &self,
+            _snapshot: bridge_core::domain::RegistrySnapshot,
+        ) -> Result<(), BridgeError> {
+            Ok(())
+        }
+
+        fn list(&self) -> Vec<bridge_core::ids::AgentId> {
+            vec![self.default_id()]
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct CapturedStderr(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CapturedStderr {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// I3: a local workflow, whose execution and attempt ids differ, registers its node turns
+    /// under the execution id (nothing is under the attempt id), and the in-process heartbeat
+    /// prints the turn's details.
+    #[tokio::test(start_paused = true)]
+    async fn a_local_workflow_registers_under_its_execution_id_and_beats_in_detail() {
+        use futures::StreamExt;
+        let identity = bridge_core::ids::AttemptIdentity::initial().unwrap();
+        assert_ne!(identity.execution_id.as_str(), identity.attempt_id.as_str());
+        let board = Arc::new(bridge_core::turn_liveness::TurnLivenessBoard::default());
+        let executor =
+            bridge_workflow::executor::WorkflowExecutor::new(Arc::new(BoardRegisteringRegistry {
+                backend: Arc::new(BoardRegisteringBackend {
+                    board: board.clone(),
+                    staged: std::sync::Mutex::new(None),
+                }),
+            }));
+        let graph = Arc::new(bridge_workflow::graph::WorkflowGraph {
+            id: bridge_core::ids::WorkflowId::parse("review").unwrap(),
+            nodes: vec![bridge_workflow::graph::WorkflowNode {
+                id: bridge_core::ids::NodeId::parse("only").unwrap(),
+                agent: bridge_core::ids::AgentId::parse("codex").unwrap(),
+                prompt_template: "{{input}}".into(),
+                inputs: vec![],
+                retry: None,
+                harvest_sanitization: None,
+            }],
+            panel: None,
+            controls: None,
+        });
+        let observer_key = super::local_workflow_observer_key(&identity);
+        assert_eq!(observer_key, identity.execution_id.as_str());
+        let stream = executor.run_with_context(
+            graph,
+            "go".into(),
+            identity.run_id().to_string(),
+            tokio_util::sync::CancellationToken::new(),
+            bridge_workflow::executor::WorkflowRunContext {
+                observer_key: Some(observer_key.clone()),
+                ..bridge_workflow::executor::WorkflowRunContext::default()
+            },
+        );
+        let stderr = CapturedStderr::default();
+        let beat = heartbeat::run_heartbeat(
+            Duration::from_secs(60),
+            heartbeat::board_poller(board.clone(), observer_key.clone()),
+            None,
+            stderr.clone(),
+        );
+        let during = async {
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            (
+                board.snapshot(&observer_key).len(),
+                board.snapshot(identity.attempt_id.as_str()).len(),
+            )
+        };
+
+        let (events, during) = tokio::select! {
+            ran = async { tokio::join!(stream.collect::<Vec<_>>(), during) } => ran,
+            _ = beat => unreachable!("the heartbeat never ends on its own"),
+        };
+
+        assert!(events.iter().all(Result::is_ok), "{events:?}");
+        assert_eq!(during, (1, 0), "registered under the execution id only");
+        assert_eq!(board.turn_count(), 0, "the finished turn left the board");
+        let lines = String::from_utf8(stderr.0.lock().unwrap().clone()).unwrap();
+        assert_eq!(
+            lines,
+            "[heartbeat] elapsed=1m00s turns=1 agent=codex last_activity=55s \
+             open_tool=\"cargo test\" tool_kind=execute tool_age=55s silence=off\n"
+        );
+    }
+
     #[test]
     fn parse_run_workflow_args_session_cwd() {
         let args: Vec<String> = ["wf", "--input", "in.md", "--session-cwd", "/work/repo"]
@@ -15176,6 +15517,7 @@ The command prints schemas, templates, and validates input.
             context,
             session_cwd,
             &identity,
+            None,
         )
         .await
         .unwrap();

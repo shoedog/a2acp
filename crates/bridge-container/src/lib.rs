@@ -35,6 +35,7 @@ use bridge_core::sandbox::{
     a2a_name, check_rw_target, compose_container_rw, compose_container_rw_with_source,
 };
 use bridge_core::session_cwd::SessionCwd;
+use bridge_core::turn_liveness::{TurnLivenessBoard, TurnLivenessRequestV1};
 use futures::StreamExt;
 use tokio::sync::Mutex;
 
@@ -217,6 +218,9 @@ pub struct ContainerRwConfig {
     /// The agent's `[agents.liveness]` (`AcpConfig::liveness`): the inner backend enforces it on
     /// every turn.
     pub liveness: Option<bridge_core::domain::AgentLivenessConfig>,
+    /// The process's heartbeat board (`AcpConfig::liveness_board`), forwarded to every inner
+    /// backend, which registers its turns on it.
+    pub liveness_board: Option<Arc<TurnLivenessBoard>>,
     pub handshake_timeout: Duration,
     pub cancel_grace: Duration,
     /// Slice-4 admission supplies this attempt-owned route. `None` is the
@@ -545,6 +549,9 @@ pub struct ContainerRwBackend {
     owner: String,
     session_cfg: Mutex<HashMap<SessionId, ContainerSessionSpec>>,
     pending_turn_meta: Mutex<HashMap<SessionId, TurnMeta>>,
+    /// `configure_turn_liveness` for a turn with no `TurnMeta`; forwarded to the inner backend
+    /// at the same point as the meta.
+    pending_turn_liveness: Mutex<HashMap<SessionId, TurnLivenessRequestV1>>,
     inflight: Inflight,
     turn_seq: AtomicU64,
     /// Set under `inflight` before retirement drains ownership. Prompt
@@ -643,6 +650,7 @@ impl ContainerRwBackend {
             owner,
             session_cfg: Mutex::new(HashMap::new()),
             pending_turn_meta: Mutex::new(HashMap::new()),
+            pending_turn_liveness: Mutex::new(HashMap::new()),
             inflight: Arc::new(Mutex::new(HashMap::new())),
             turn_seq: AtomicU64::new(0),
             retired: AtomicBool::new(false),
@@ -858,6 +866,7 @@ impl ContainerRwBackend {
             rename_timeout: AcpConfig::default().rename_timeout,
             watchdog: self.cfg.watchdog.clone(),
             liveness: self.cfg.liveness,
+            liveness_board: self.cfg.liveness_board.clone(),
             process_flight_route_v3: self.cfg.resource_flight_attempt_v3.as_ref().map(|attempt| {
                 let owner = ResourceFlightOwnerV1::new(
                     NodeId::parse("container-inner-process").expect("static node id"),
@@ -1105,6 +1114,7 @@ impl ContainerRwBackend {
         observers: Option<BackendObservers>,
     ) -> Result<BackendStream, BridgeError> {
         let meta = { self.pending_turn_meta.lock().await.remove(session) };
+        let liveness = { self.pending_turn_liveness.lock().await.remove(session) };
         let spec = self.session_cfg.lock().await.get(session).cloned().ok_or(
             BridgeError::ConfigInvalid {
                 reason: "missing session cwd".into(),
@@ -1255,6 +1265,9 @@ impl ContainerRwBackend {
         };
         if let Some(meta) = meta {
             inner.configure_turn(session, meta).await;
+        }
+        if let Some(liveness) = liveness {
+            inner.configure_turn_liveness(session, liveness).await;
         }
         // This exact generation owns dispatch until the inner backend has
         // installed its prompt and returned the stream. Teardown that starts
@@ -1555,6 +1568,7 @@ impl ContainerRwBackend {
         }
 
         let meta = { self.pending_turn_meta.lock().await.remove(session) };
+        let liveness = { self.pending_turn_liveness.lock().await.remove(session) };
 
         // Strict-reject: a writer MUST name its :rw target (no fallback to the broad root). The early
         // presence check keeps reject-before-reserve; `open_inner` re-resolves the same cwd.
@@ -1619,6 +1633,9 @@ impl ContainerRwBackend {
 
         if let Some(meta) = meta {
             wi.inner.configure_turn(session, meta).await;
+        }
+        if let Some(liveness) = liveness {
+            wi.inner.configure_turn_liveness(session, liveness).await;
         }
         // Match the warm path's generation gate: prompt installation and
         // teardown have one exact linearization point instead of a check/call
@@ -1834,6 +1851,13 @@ impl AgentBackend for ContainerRwBackend {
             .insert(session.clone(), meta);
     }
 
+    async fn configure_turn_liveness(&self, session: &SessionId, liveness: TurnLivenessRequestV1) {
+        self.pending_turn_liveness
+            .lock()
+            .await
+            .insert(session.clone(), liveness);
+    }
+
     /// Legacy cleanup still joins the process-owned flight; it only discards
     /// the result after ownership has settled.
     async fn forget_session(&self, session: &SessionId) {
@@ -1851,6 +1875,7 @@ impl AgentBackend for ContainerRwBackend {
         };
         self.session_cfg.lock().await.remove(session);
         self.pending_turn_meta.lock().await.remove(session);
+        self.pending_turn_liveness.lock().await.remove(session);
         result.map_err(|failure| match build_reap_failure(failure) {
             Ok(diagnostic) => container_reap_failure_error(diagnostic),
             Err(error) => error,
@@ -1869,6 +1894,7 @@ impl AgentBackend for ContainerRwBackend {
         };
         self.session_cfg.lock().await.remove(session);
         self.pending_turn_meta.lock().await.remove(session);
+        self.pending_turn_liveness.lock().await.remove(session);
         result
     }
 
@@ -1887,6 +1913,7 @@ impl AgentBackend for ContainerRwBackend {
         };
         self.session_cfg.lock().await.remove(session);
         self.pending_turn_meta.lock().await.remove(session);
+        self.pending_turn_liveness.lock().await.remove(session);
         result.map_err(|failure| match build_reap_failure(failure) {
             Ok(diagnostic) => container_reap_failure_error(diagnostic),
             Err(error) => error,
@@ -1905,6 +1932,7 @@ impl AgentBackend for ContainerRwBackend {
         };
         self.session_cfg.lock().await.remove(session);
         self.pending_turn_meta.lock().await.remove(session);
+        self.pending_turn_liveness.lock().await.remove(session);
         result
     }
 
@@ -2220,6 +2248,7 @@ mod tests {
         fail_prompt: AtomicBool,
         configured_turns: Mutex<Vec<(SessionId, TurnMeta)>>,
         call_order: Mutex<Vec<&'static str>>,
+        configured_liveness: Mutex<Vec<(SessionId, TurnLivenessRequestV1)>>,
         terminal_evidence_v1: bool,
         prompt_gate: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
         turn_gate: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
@@ -2263,6 +2292,18 @@ mod tests {
                 .await
                 .push((session.clone(), meta));
             self.call_order.lock().await.push("configure_turn");
+        }
+
+        async fn configure_turn_liveness(
+            &self,
+            session: &SessionId,
+            liveness: TurnLivenessRequestV1,
+        ) {
+            self.configured_liveness
+                .lock()
+                .await
+                .push((session.clone(), liveness));
+            self.call_order.lock().await.push("configure_turn_liveness");
         }
 
         async fn configure_bound_session(
@@ -2317,6 +2358,7 @@ mod tests {
         last_acp_mcp: Mutex<Vec<bridge_core::mcp::McpServerSpec>>,
         last_acp_rename_new_sessions: Mutex<Option<bool>>,
         last_acp_liveness: Mutex<Option<Option<bridge_core::domain::AgentLivenessConfig>>>,
+        last_acp_liveness_board: Mutex<Option<Option<Arc<TurnLivenessBoard>>>>,
         last_diagnostic_redactor: Mutex<Option<bridge_core::diagnostics::DiagnosticRedactor>>,
         last_inner: Mutex<Option<Arc<StubInner>>>,
         spawn_gate: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
@@ -2431,6 +2473,7 @@ mod tests {
                 last_acp_mcp: Mutex::new(vec![]),
                 last_acp_rename_new_sessions: Mutex::new(None),
                 last_acp_liveness: Mutex::new(None),
+                last_acp_liveness_board: Mutex::new(None),
                 last_diagnostic_redactor: Mutex::new(None),
                 last_inner: Mutex::new(None),
                 spawn_gate,
@@ -2455,6 +2498,7 @@ mod tests {
             *self.last_acp_mcp.lock().await = cfg.mcp.clone();
             *self.last_acp_rename_new_sessions.lock().await = Some(cfg.rename_new_sessions);
             *self.last_acp_liveness.lock().await = Some(cfg.liveness);
+            *self.last_acp_liveness_board.lock().await = Some(cfg.liveness_board.clone());
             *self.last_diagnostic_redactor.lock().await = Some(cfg.diagnostic_redactor.clone());
             if let Some((entered, release)) = &self.spawn_gate {
                 entered.notify_one();
@@ -2475,6 +2519,7 @@ mod tests {
                 fail_prompt: AtomicBool::new(self.fail_prompt),
                 configured_turns: Mutex::new(Vec::new()),
                 call_order: Mutex::new(Vec::new()),
+                configured_liveness: Mutex::new(Vec::new()),
                 terminal_evidence_v1: self.terminal_evidence_v1.load(Ordering::SeqCst),
                 prompt_gate: self.prompt_gate.clone(),
                 turn_gate: self.turn_gate.clone(),
@@ -2675,6 +2720,7 @@ mod tests {
             rename_new_sessions: false,
             watchdog: None,
             liveness: None,
+            liveness_board: None,
             handshake_timeout: Duration::from_secs(30),
             cancel_grace: Duration::from_secs(5),
             resource_flight_attempt_v3: None,
@@ -3359,6 +3405,61 @@ mod tests {
                 .expect("the turn spawned an inner backend");
             assert_eq!(inner, liveness);
             assert_eq!(silence_after_31_minutes(inner), expected);
+        }
+    }
+
+    /// I3: the heartbeat board reaches the inner `AcpConfig`, and a liveness request staged
+    /// without a `TurnMeta` (a cold served unary turn) is forwarded to the inner backend before
+    /// its prompt, on the per-turn and the warm path alike.
+    #[tokio::test]
+    async fn the_board_and_a_staged_liveness_request_reach_the_inner_backend() {
+        for warm in [false, true] {
+            let tmp = tempfile::tempdir().unwrap();
+            let root = tmp.path().to_str().unwrap();
+            let board = Arc::new(TurnLivenessBoard::default());
+            let mut cfg = cfg_with_mount(root);
+            cfg.liveness_board = Some(Arc::clone(&board));
+            let spawn = CountingSpawn::new(false);
+            let (reap, _) = counting_reap();
+            let be = if warm {
+                ContainerRwBackend::new_warm_with_hooks(cfg, spawn.clone(), "inst".into(), reap)
+                    .await
+                    .unwrap()
+            } else {
+                ContainerRwBackend::new_with_hooks(cfg, spawn.clone(), "inst".into(), reap)
+                    .await
+                    .unwrap()
+            };
+            let s = SessionId::parse("s1").unwrap();
+            let request = TurnLivenessRequestV1 {
+                client_watching: true,
+                observer_key: Some("task-1".into()),
+                ..TurnLivenessRequestV1::default()
+            };
+            be.configure_session(&s, &spec_cwd(root)).await.unwrap();
+            be.configure_turn_liveness(&s, request.clone()).await;
+            let mut stream = be.prompt(&s, vec![]).await.unwrap();
+            while stream.next().await.is_some() {}
+
+            let forwarded = spawn
+                .last_acp_liveness_board
+                .lock()
+                .await
+                .clone()
+                .expect("the turn spawned an inner backend")
+                .expect("the inner config carries the board");
+            assert!(Arc::ptr_eq(&forwarded, &board), "warm={warm}");
+            let inner = spawn.last_inner.lock().await.clone().unwrap();
+            assert_eq!(
+                inner.configured_liveness.lock().await.as_slice(),
+                &[(s.clone(), request)],
+                "warm={warm}"
+            );
+            assert_eq!(
+                inner.call_order.lock().await.as_slice(),
+                ["configure_turn_liveness", "prompt"],
+                "warm={warm}"
+            );
         }
     }
 

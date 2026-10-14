@@ -4637,6 +4637,14 @@ impl AgentBackend for WorktreeBackend {
         self.inner.configure_turn(session, meta).await;
     }
 
+    async fn configure_turn_liveness(
+        &self,
+        session: &SessionId,
+        liveness: bridge_core::turn_liveness::TurnLivenessRequestV1,
+    ) {
+        self.inner.configure_turn_liveness(session, liveness).await;
+    }
+
     async fn configure_bound_session(
         &self,
         session: &SessionId,

@@ -86,6 +86,7 @@ pub mod task_spec;
 pub mod task_store;
 pub mod terminal_evidence;
 pub mod translator;
+// Per-turn activity liveness: the silence and work cutoffs, and the heartbeat board clients read.
 pub mod turn_liveness;
 pub mod workflow_history;
 

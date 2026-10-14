@@ -2,6 +2,7 @@ use bridge_core::domain::{AgentOverride, Effort, InjectMode, InjectRequest, Perm
 use bridge_core::error::BridgeError;
 use bridge_core::ids::{AgentId, ContextId, OperationId};
 use bridge_core::session_cwd::SessionCwd;
+use bridge_core::turn_liveness::{parse_liveness_secs_v1, LivenessOverrideV1, TurnLivenessValueV1};
 
 /// D1 typed operation params.
 ///
@@ -275,7 +276,76 @@ impl OpParams {
             mode: self.mode.clone(),
         }
     }
+}
 
+/// Metadata key: the turn's silence cutoff, `"off"`, `"0"` or whole seconds.
+pub const SILENCE_CUTOFF_SECS_KEY: &str = "a2a-bridge.silence_cutoff_secs";
+/// Metadata key: the turn's work cutoff, `"off"`, `"0"` or whole seconds.
+pub const WORK_CUTOFF_SECS_KEY: &str = "a2a-bridge.work_cutoff_secs";
+/// Metadata key: `"true"` when an interactive client waits on the turn and dies with it.
+pub const CLIENT_WATCHING_KEY: &str = "a2a-bridge.client_watching";
+
+/// Per-request turn liveness from A2A `message.metadata`. Its own field, never part of
+/// `AgentOverride`, so it reaches neither `effective_config` nor any identity. Which route
+/// honours which knob is the caller's decision (`client_watching` only on unary `message/send`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RequestLivenessParams {
+    pub silence: TurnLivenessValueV1,
+    pub work_cutoff: TurnLivenessValueV1,
+    pub client_watching: bool,
+}
+
+impl RequestLivenessParams {
+    /// Absent keys inherit; a present key that is not a valid value is `InvalidRequest`.
+    /// Durations are `"off"`, or whole seconds through the shared checked parser (`"0"` is
+    /// off, at most 30 days); `client_watching` is `"true"` or `"false"`.
+    pub fn from_a2a_metadata(
+        md: Option<&serde_json::Map<String, serde_json::Value>>,
+    ) -> Result<Self, BridgeError> {
+        let value = |key: &str| md.and_then(|md| md.get(key));
+        Ok(Self {
+            silence: parse_liveness_value(value(SILENCE_CUTOFF_SECS_KEY), SILENCE_CUTOFF_SECS_KEY)?,
+            work_cutoff: parse_liveness_value(value(WORK_CUTOFF_SECS_KEY), WORK_CUTOFF_SECS_KEY)?,
+            client_watching: match value(CLIENT_WATCHING_KEY) {
+                None => false,
+                Some(serde_json::Value::Bool(watching)) => *watching,
+                Some(serde_json::Value::String(raw)) if raw == "true" => true,
+                Some(serde_json::Value::String(raw)) if raw == "false" => false,
+                Some(_) => {
+                    return Err(BridgeError::InvalidRequest {
+                        field: CLIENT_WATCHING_KEY,
+                    })
+                }
+            },
+        })
+    }
+}
+
+fn parse_liveness_value(
+    value: Option<&serde_json::Value>,
+    field: &'static str,
+) -> Result<TurnLivenessValueV1, BridgeError> {
+    let secs = match value {
+        None => return Ok(TurnLivenessValueV1::Inherit),
+        Some(serde_json::Value::String(raw)) if raw == "off" => {
+            return Ok(TurnLivenessValueV1::Off)
+        }
+        Some(serde_json::Value::String(raw))
+            if !raw.is_empty() && raw.bytes().all(|byte| byte.is_ascii_digit()) =>
+        {
+            raw.parse::<u64>().ok()
+        }
+        Some(serde_json::Value::Number(number)) => number.as_u64(),
+        Some(_) => None,
+    }
+    .ok_or(BridgeError::InvalidRequest { field })?;
+    match parse_liveness_secs_v1(secs).map_err(|_| BridgeError::InvalidRequest { field })? {
+        LivenessOverrideV1::Off => Ok(TurnLivenessValueV1::Off),
+        LivenessOverrideV1::Ms(ms) => Ok(TurnLivenessValueV1::Ms(ms)),
+    }
+}
+
+impl OpParams {
     /// FIX-9/PFIX-N: shape-validate cwd and enforce the configured root.
     pub fn validate_cwd(
         &self,
@@ -468,6 +538,78 @@ mod tests {
         assert_eq!(p.agent.as_ref().map(|a| a.as_str()), Some("kiro"));
         assert!(matches!(p.effort, Some(Effort::Medium)));
         assert_eq!(p.cwd.as_deref(), Some("/work/repo"));
+    }
+
+    fn liveness(md: serde_json::Value) -> Result<RequestLivenessParams, BridgeError> {
+        RequestLivenessParams::from_a2a_metadata(md.as_object())
+    }
+
+    /// I3: per-request liveness metadata, through the shared checked parser.
+    #[test]
+    fn request_liveness_metadata_parses_off_zero_and_seconds_and_refuses_the_rest() {
+        assert_eq!(
+            liveness(serde_json::json!({})).unwrap(),
+            RequestLivenessParams::default()
+        );
+        assert_eq!(
+            RequestLivenessParams::from_a2a_metadata(None).unwrap(),
+            RequestLivenessParams::default()
+        );
+        let parsed = liveness(serde_json::json!({
+            "a2a-bridge.silence_cutoff_secs": "off",
+            "a2a-bridge.work_cutoff_secs": "600",
+            "a2a-bridge.client_watching": "true"
+        }))
+        .unwrap();
+        assert_eq!(parsed.silence, TurnLivenessValueV1::Off);
+        assert_eq!(parsed.work_cutoff, TurnLivenessValueV1::Ms(600_000));
+        assert!(parsed.client_watching);
+        assert_eq!(
+            liveness(serde_json::json!({"a2a-bridge.silence_cutoff_secs": "0"}))
+                .unwrap()
+                .silence,
+            TurnLivenessValueV1::Off
+        );
+        assert_eq!(
+            liveness(serde_json::json!({"a2a-bridge.work_cutoff_secs": 2_592_000}))
+                .unwrap()
+                .work_cutoff,
+            TurnLivenessValueV1::Ms(2_592_000_000)
+        );
+        assert!(
+            !liveness(serde_json::json!({"a2a-bridge.client_watching": "false"}))
+                .unwrap()
+                .client_watching
+        );
+
+        for (key, value) in [
+            ("a2a-bridge.silence_cutoff_secs", serde_json::json!("abc")),
+            ("a2a-bridge.silence_cutoff_secs", serde_json::json!("")),
+            ("a2a-bridge.silence_cutoff_secs", serde_json::json!("-5")),
+            ("a2a-bridge.silence_cutoff_secs", serde_json::json!("1.5")),
+            ("a2a-bridge.silence_cutoff_secs", serde_json::json!("+5")),
+            ("a2a-bridge.silence_cutoff_secs", serde_json::json!(" 5")),
+            ("a2a-bridge.silence_cutoff_secs", serde_json::json!("OFF")),
+            ("a2a-bridge.silence_cutoff_secs", serde_json::json!(true)),
+            ("a2a-bridge.work_cutoff_secs", serde_json::json!("2592001")),
+            (
+                "a2a-bridge.work_cutoff_secs",
+                serde_json::json!(u64::MAX.to_string()),
+            ),
+            ("a2a-bridge.work_cutoff_secs", serde_json::json!(-1)),
+            ("a2a-bridge.client_watching", serde_json::json!("yes")),
+            ("a2a-bridge.client_watching", serde_json::json!(1)),
+        ] {
+            let mut md = serde_json::Map::new();
+            md.insert(key.to_owned(), value.clone());
+            assert!(
+                matches!(
+                    RequestLivenessParams::from_a2a_metadata(Some(&md)),
+                    Err(BridgeError::InvalidRequest { field }) if field == key
+                ),
+                "{key} = {value} must be refused"
+            );
+        }
     }
 
     #[test]

@@ -215,7 +215,8 @@ Every ACP turn outside a workflow runs under two bounds:
   `in_progress`, or a pending permission request, pauses the clock until it closes, so a long
   `cargo test` never trips it.
 - **Turn work cutoff, default 2 hours.** The turn ends with `acp.prompt.work_cutoff` after that long,
-  whatever is open: it is the backstop for a hung tool.
+  whatever is open: it is the backstop for a hung tool. A watched unary turn (below) has none by
+  default: its client sees the heartbeat and can cancel.
 
 ```toml
 [[agents]]
@@ -262,6 +263,45 @@ rather than falling back to the default. `--silence-cutoff` is refused with `--s
 takes its value from the server's config. Runs admitted before this setting existed keep no silence
 cutoff when resumed, and the `implement` review-the-diff workflow, which runs without frozen controls,
 keeps none either.
+
+### Watching a run: the heartbeat and per-request bounds
+
+`submit` and `run-workflow` (local and `--serve`) print one stderr line per beat while the run is in
+flight, first after 60 s and then every 60 s; stdout carries only the usual output:
+
+```text
+[heartbeat] elapsed=14m00s turns=1 agent=codex last_activity=2m10s open_tool="cargo test" tool_kind=execute tool_age=9m02s silence=paused cutoff=30m
+[heartbeat] elapsed=15m00s liveness=unavailable
+```
+
+Each in-flight turn is listed with its agent, the time since its last activity, its oldest open tool
+call, whether its silence clock is paused, its silence `cutoff` and any `work_cutoff`; `turns=0` means
+none is in flight right now (for example between workflow nodes). `--serve` adds `last_frame=`, the age
+of the last SSE frame. Tool titles and kinds come from the agent and are escaped, so a beat is always one
+line. `liveness=unavailable` means the poll got no answer in time (`min(10 s, interval / 2)`) or the
+server predates the bridge-private `TaskLiveness` method; the next beat polls again.
+
+| Control | Effect |
+|---|---|
+| `--heartbeat-secs <n>` | beat every `n` seconds; `0` is off |
+| `--no-heartbeat` | no heartbeat |
+| `A2A_BRIDGE_HEARTBEAT_SECS=<n>` | the interval when neither flag is given; a flag beats it |
+
+While its heartbeat is on, `submit` marks its unary turn as watched
+(`a2a-bridge.client_watching=true`): the turn dies with the client (closing the connection cancels the
+ACP prompt) and has no default 2-hour work cutoff. Scripts that want the backstop pass `--no-heartbeat`.
+
+Any served `message/send` or `message/stream` request can set its turn's bounds in `message.metadata`;
+each value is a string and an invalid one is refused as `InvalidRequest`:
+
+| Key | Values |
+|---|---|
+| `a2a-bridge.silence_cutoff_secs` | `"off"`, `"0"` or whole seconds up to `"2592000"`; beats `[agents.liveness]` |
+| `a2a-bridge.work_cutoff_secs` | same; beats `[agents.liveness]` |
+| `a2a-bridge.client_watching` | `"true"` or `"false"`; honoured on unary `message/send` only |
+
+Served workflows ignore all three: their node turns follow the frozen workflow policy above and keep the
+workflow's 2-hour cutoff, whatever the client asked.
 
 ### Workflow preflight and fallback models
 

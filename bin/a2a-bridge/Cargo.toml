@@ -62,7 +62,7 @@ tar = "0.4"
 a2a.workspace = true
 
 [dev-dependencies]
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }
 tower = { workspace = true, features = ["util"] }
 futures = { workspace = true }
 serde_json = { workspace = true }

@@ -99,7 +99,8 @@ use bridge_core::terminal_evidence::{
 };
 use bridge_core::turn_liveness::{
     resolve_turn_liveness_v1, ResolvedTurnLivenessV1, ToolCallPhaseV1, ToolObservationV1,
-    TurnActivityV1, TurnLivenessCauseV1, TurnLivenessTracker, TurnLivenessTransitionV1,
+    TurnActivityV1, TurnLivenessBoard, TurnLivenessCauseV1, TurnLivenessProbeV1,
+    TurnLivenessRequestV1, TurnLivenessSnapshotV1, TurnLivenessTracker, TurnLivenessTransitionV1,
     UsageTotalsKeyV1,
 };
 
@@ -1365,6 +1366,9 @@ pub struct AcpConfig {
     /// turn work cutoff resolved from the turn's request, then this, then the built-in
     /// defaults; `None` here inherits the built-in defaults.
     pub liveness: Option<bridge_core::domain::AgentLivenessConfig>,
+    /// The process's heartbeat board. A turn whose liveness request names an observer key is
+    /// registered on it for as long as it runs; `None` registers nothing.
+    pub liveness_board: Option<Arc<TurnLivenessBoard>>,
     /// Attempt-owned protected process route. Slice 4 supplies this only after
     /// `AutomaticR2f1b` admission succeeds; `None` preserves V2 behavior.
     pub process_flight_route_v3: Option<AcpProcessFlightRouteV3>,
@@ -1454,6 +1458,7 @@ impl Default for AcpConfig {
             child_env_remove: Vec::new(),
             watchdog: None,
             liveness: None,
+            liveness_board: None,
             process_flight_route_v3: None,
             diagnostic_redactor: DiagnosticRedactor::default(),
             prefix_attestation_transport: PrefixAttestationTransport::Unsupported,
@@ -2250,6 +2255,19 @@ impl TurnWatch {
         let legacy_due =
             legacy_checked && watchdog.is_some_and(|watchdog| self.legacy_due(watchdog));
         tracker.due_cause(now_ms, legacy_due)
+    }
+}
+
+/// A turn's entry on the heartbeat board: its tracker, read at the snapshot's instant.
+struct TurnBoardProbe {
+    watch: Arc<TurnWatch>,
+    agent: String,
+}
+
+impl TurnLivenessProbeV1 for TurnBoardProbe {
+    fn snapshot(&self) -> TurnLivenessSnapshotV1 {
+        let tracker = self.watch.tracker();
+        tracker.snapshot(self.watch.elapsed_ms(), &self.agent)
     }
 }
 
@@ -3132,6 +3150,9 @@ pub struct AcpBackend {
     /// prompt. `prompt_inner` takes it at entry, before lazy session minting, so
     /// early setup errors cannot leave stale metadata for a later turn.
     pending_turn_meta: StdMutex<HashMap<SessionId, TurnMeta>>,
+    /// The liveness request a caller with no `TurnMeta` staged for the next prompt
+    /// (`configure_turn_liveness`). Taken at the same point as `pending_turn_meta`.
+    pending_turn_liveness: StdMutex<HashMap<SessionId, TurnLivenessRequestV1>>,
     prefix_attestation_capability: PrefixAttestationCapability,
     terminal_evidence_capability: EvidenceCapability,
     /// Policy engine that decides reverse `session/request_permission` requests.
@@ -5324,6 +5345,7 @@ impl AcpBackend {
             session_catalogs: Arc::new(StdMutex::new(HashMap::new())),
             session_cfg: Arc::new(StdMutex::new(HashMap::new())),
             pending_turn_meta: StdMutex::new(HashMap::new()),
+            pending_turn_liveness: StdMutex::new(HashMap::new()),
             prefix_attestation_capability,
             terminal_evidence_capability,
             policy,
@@ -5713,6 +5735,13 @@ impl AcpBackend {
         self.pending_turn_meta
             .lock()
             .expect("pending_turn_meta lock")
+            .remove(session)
+    }
+
+    fn take_pending_turn_liveness(&self, session: &SessionId) -> Option<TurnLivenessRequestV1> {
+        self.pending_turn_liveness
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(session)
     }
 
@@ -6795,6 +6824,7 @@ impl AcpBackend {
             .lock()
             .expect("pending_turn_meta lock")
             .remove(session);
+        self.take_pending_turn_liveness(session);
         // Bridge-side state is gone; only now tell the agent. Whichever release
         // removed the entry owns its close, so a repeated or concurrent release
         // of the same key finds nothing left to close. The outcome is traced,
@@ -7518,6 +7548,9 @@ impl AcpBackend {
         let stderr_cursor: Option<ProcessStderrCursor> =
             self.stderr_ring.as_ref().map(ProcessStderrRing::cursor);
         let turn_meta = self.take_pending_turn_meta(session);
+        // Taken unconditionally, so a request staged beside a `TurnMeta` never leaks into a
+        // later turn; the meta's own request wins.
+        let staged_liveness = self.take_pending_turn_liveness(session);
         let producer_id = self
             .config
             .as_ref()
@@ -7653,14 +7686,21 @@ impl AcpBackend {
         }
 
         // Every turn is bounded: the request's values, then the agent's `[agents.liveness]`, then
-        // the built-in defaults. A turn staged without metadata takes the defaults.
+        // the built-in defaults. A turn staged without metadata or a liveness request takes the
+        // defaults.
+        let liveness_request = turn_meta
+            .as_ref()
+            .map(|meta| meta.liveness.clone())
+            .or(staged_liveness)
+            .unwrap_or_default();
         let watch = Arc::new(TurnWatch::new(resolve_turn_liveness_v1(
-            &turn_meta
-                .as_ref()
-                .map(|meta| meta.liveness.clone())
-                .unwrap_or_default(),
+            &liveness_request,
             self.config.as_ref().and_then(|c| c.liveness.as_ref()),
         )));
+        let board_turn_id = turn_meta
+            .as_ref()
+            .map(|meta| meta.turn_id.as_str().to_owned())
+            .unwrap_or_else(|| agent_id.0.to_string());
         if registry.is_poisoned() {
             return Err(lifecycle
                 .failure(
@@ -7776,6 +7816,24 @@ impl AcpBackend {
                 )
                 .await);
         };
+        // The prompt is on the wire: a heartbeat can see this turn until its driver ends it.
+        // The driver drops the registration before it publishes the turn's terminal, and a
+        // dropped driver drops it with everything else it owns.
+        let board_registration = self
+            .config
+            .as_ref()
+            .and_then(|config| config.liveness_board.as_ref())
+            .zip(liveness_request.observer_key.clone())
+            .map(|(board, observer_key)| {
+                board.register(
+                    observer_key,
+                    board_turn_id,
+                    Arc::new(TurnBoardProbe {
+                        watch: Arc::clone(&watch),
+                        agent: producer_id.clone(),
+                    }),
+                )
+            });
 
         // (3) Driver: holds the turn lock for the whole streamed turn (it OWNS
         // `turn_guard`, releasing the lock only when it finishes) and awaits the
@@ -7908,6 +7966,7 @@ impl AcpBackend {
                 }
                 drop(liveness_done_tx);
                 drop(child_output_sampler_done_tx);
+                drop(board_registration);
                 let _ = done_sender.send(TurnEvent::Failed(error));
                 return;
             }
@@ -8056,6 +8115,8 @@ impl AcpBackend {
                     .record(AttemptPhase::Adapter, ActivityReason::PhaseTransition, 2);
             drop(liveness_done_tx);
             drop(child_output_sampler_done_tx);
+            // The turn is over: it leaves the heartbeat board before its terminal is published.
+            drop(board_registration);
             // Clear the kill switch slot now the turn is ending (next turn installs
             // its own); avoids a stale notify firing across turns.
             if let Ok(mut slot) = kill_slot.lock() {
@@ -8441,6 +8502,13 @@ impl AgentBackend for AcpBackend {
             .insert(session.clone(), meta);
     }
 
+    async fn configure_turn_liveness(&self, session: &SessionId, liveness: TurnLivenessRequestV1) {
+        self.pending_turn_liveness
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(session.clone(), liveness);
+    }
+
     /// Cancel the in-flight turn for the bridge session.
     ///
     /// Spec §5.3 / Codex finding 2: cancellation COMPLETION is the prompt RESULT
@@ -8651,6 +8719,7 @@ impl AgentBackend for AcpBackend {
             .lock()
             .expect("pending_turn_meta lock")
             .remove(session);
+        self.take_pending_turn_liveness(session);
     }
 
     async fn forget_session_checked(
@@ -12280,6 +12349,7 @@ mod tests {
             session_catalogs: Arc::new(StdMutex::new(HashMap::new())),
             session_cfg: Arc::new(StdMutex::new(HashMap::new())),
             pending_turn_meta: StdMutex::new(HashMap::new()),
+            pending_turn_liveness: StdMutex::new(HashMap::new()),
             prefix_attestation_capability: PrefixAttestationCapability::default(),
             terminal_evidence_capability: EvidenceCapability::Unsupported,
             policy: Arc::new(StdMutex::new(
@@ -15225,6 +15295,7 @@ mod tests {
             session_catalogs: Arc::new(StdMutex::new(HashMap::new())),
             session_cfg: Arc::new(StdMutex::new(HashMap::new())),
             pending_turn_meta: StdMutex::new(HashMap::new()),
+            pending_turn_liveness: StdMutex::new(HashMap::new()),
             prefix_attestation_capability: PrefixAttestationCapability::default(),
             terminal_evidence_capability: EvidenceCapability::Unsupported,
             policy: Arc::new(StdMutex::new(
@@ -18381,6 +18452,236 @@ mod tests {
         );
     }
 
+    // ── Activity liveness I3: the heartbeat board ───────────────────────────
+
+    fn board_config(board: &Arc<TurnLivenessBoard>, agent: &str) -> AcpConfig {
+        AcpConfig {
+            agent_id: agent.into(),
+            liveness_board: Some(Arc::clone(board)),
+            ..liveness_config()
+        }
+    }
+
+    fn observed_request(observer_key: &str, client_watching: bool) -> TurnLivenessRequestV1 {
+        TurnLivenessRequestV1 {
+            client_watching,
+            observer_key: Some(observer_key.into()),
+            ..TurnLivenessRequestV1::default()
+        }
+    }
+
+    /// Wait on the virtual clock until `key` holds `count` turns.
+    async fn board_settles(board: &TurnLivenessBoard, key: &str, count: usize) {
+        tokio::time::timeout(minutes(5), async {
+            while board.snapshot(key).len() != count {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("{key} never held {count} turns"));
+    }
+
+    async fn drain_to_done(stream: &mut BackendStream) {
+        loop {
+            match stream.next().await {
+                Some(Ok(Update::Done { .. })) => return,
+                Some(Ok(_)) => {}
+                other => panic!("the turn ended without Done: {other:?}"),
+            }
+        }
+    }
+
+    /// I3: two fan-out turns run under one observer key. The one that finishes leaves the
+    /// board exactly, the one whose consumer goes away is cancelled at the agent and leaves
+    /// too, and the board is empty after both.
+    #[tokio::test(start_paused = true)]
+    async fn board_tracks_fan_out_turns_and_drops_each_on_its_own_exit() {
+        let board = Arc::new(TurnLivenessBoard::default());
+        let finishing = ends_after(
+            "agent-sess-BOARD-A",
+            vec![
+                ScriptedUpdate::OpenTool("build".into(), ToolCallStatus::InProgress),
+                ScriptedUpdate::Delay(minutes(10)),
+                ScriptedUpdate::ToolStatus("build".into(), ToolCallStatus::Completed),
+            ],
+        )
+        .await;
+        let abandoned = silent_after(
+            "agent-sess-BOARD-B",
+            vec![ScriptedUpdate::OpenTool(
+                "lint".into(),
+                ToolCallStatus::InProgress,
+            )],
+        )
+        .await;
+        let first = connect_recording_with(finishing, board_config(&board, "codex")).await;
+        let second =
+            connect_recording_with(abandoned.clone(), board_config(&board, "claude")).await;
+        let meta_a = TurnMeta {
+            liveness: observed_request("exec-fanout", false),
+            ..turn_meta("ctx-board-a", 1, "op-board-a")
+        };
+        let meta_b = TurnMeta {
+            liveness: observed_request("exec-fanout", false),
+            ..turn_meta("ctx-board-b", 2, "op-board-b")
+        };
+        first
+            .configure_turn(&bkey("bridge-BOARD-A"), meta_a.clone())
+            .await;
+        second
+            .configure_turn(&bkey("bridge-BOARD-B"), meta_b.clone())
+            .await;
+
+        let mut finishing_stream = first.prompt(&bkey("bridge-BOARD-A"), vec![]).await.unwrap();
+        let abandoned_stream = second
+            .prompt(&bkey("bridge-BOARD-B"), vec![])
+            .await
+            .unwrap();
+        tokio::time::sleep(minutes(1)).await;
+
+        let turns = board.snapshot("exec-fanout");
+        assert_eq!(
+            turns
+                .iter()
+                .map(|turn| (turn.turn_id.as_str(), turn.agent.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                (meta_a.turn_id.as_str(), "codex"),
+                (meta_b.turn_id.as_str(), "claude")
+            ]
+        );
+        for turn in &turns {
+            assert_eq!(turn.open_tool_count, 1);
+            assert_eq!(turn.open_tools[0].title, "cargo test");
+            assert_eq!(turn.open_tools[0].kind, "execute");
+            assert!(turn.paused);
+        }
+        assert!(board.snapshot("attempt-fanout").is_empty());
+
+        drain_to_done(&mut finishing_stream).await;
+        let turns = board.snapshot("exec-fanout");
+        assert_eq!(turns.len(), 1, "exactly the finished turn left");
+        assert_eq!(turns[0].turn_id, meta_b.turn_id.as_str());
+
+        drop(abandoned_stream);
+        tokio::time::timeout(minutes(1), abandoned.cancel_seen.notified())
+            .await
+            .expect("the abandoned turn is cancelled at the agent");
+        assert_eq!(
+            abandoned.cancels.lock().await.as_slice(),
+            &["agent-sess-BOARD-B"]
+        );
+        board_settles(&board, "exec-fanout", 0).await;
+        assert_eq!(board.turn_count(), 0);
+    }
+
+    /// I3: a watched turn has no turn work cutoff by default while an unwatched one keeps 2 h,
+    /// and a watched turn whose consumer goes away is cancelled at the agent
+    /// (`session/cancel`). The served unary path drops its stream when its client disconnects
+    /// (`bridge-a2a-inbound`), so the watched turn dies with its client.
+    #[tokio::test(start_paused = true)]
+    async fn a_watched_turn_has_no_default_work_cutoff_and_is_cancelled_when_its_consumer_leaves() {
+        let board = Arc::new(TurnLivenessBoard::default());
+        let watched = silent_after(
+            "agent-sess-WATCHED",
+            vec![ScriptedUpdate::OpenTool(
+                "test".into(),
+                ToolCallStatus::InProgress,
+            )],
+        )
+        .await;
+        let backend = connect_recording_with(watched.clone(), board_config(&board, "codex")).await;
+        backend
+            .configure_turn_liveness(
+                &bkey("bridge-WATCHED"),
+                observed_request("task-watched", true),
+            )
+            .await;
+        let stream = backend
+            .prompt(&bkey("bridge-WATCHED"), vec![])
+            .await
+            .unwrap();
+        tokio::time::sleep(minutes(1)).await;
+
+        let turns = board.snapshot("task-watched");
+        assert_eq!(turns.len(), 1);
+        assert_eq!(
+            turns[0].work_cutoff_ms, None,
+            "a watched turn has no work cutoff"
+        );
+        assert_eq!(
+            turns[0].silence_cutoff_ms,
+            Some(bridge_core::turn_liveness::DEFAULT_SILENCE_CUTOFF_MS)
+        );
+        assert_eq!(turns[0].open_tools[0].title, "cargo test");
+
+        drop(stream);
+        tokio::time::timeout(minutes(1), watched.cancel_seen.notified())
+            .await
+            .expect("the watched turn is cancelled when its consumer leaves");
+        assert_eq!(
+            watched.cancels.lock().await.as_slice(),
+            &["agent-sess-WATCHED"]
+        );
+        board_settles(&board, "task-watched", 0).await;
+
+        let unwatched = silent_after("agent-sess-UNWATCHED", vec![]).await;
+        let backend = connect_recording_with(unwatched, board_config(&board, "codex")).await;
+        backend
+            .configure_turn_liveness(
+                &bkey("bridge-UNWATCHED"),
+                observed_request("task-unwatched", false),
+            )
+            .await;
+        let _stream = backend
+            .prompt(&bkey("bridge-UNWATCHED"), vec![])
+            .await
+            .unwrap();
+        tokio::time::sleep(minutes(1)).await;
+        assert_eq!(
+            board.snapshot("task-unwatched")[0].work_cutoff_ms,
+            Some(bridge_core::execution_policy::DEFAULT_WORK_CUTOFF_MS),
+            "an unwatched turn keeps the 2 h work cutoff"
+        );
+    }
+
+    /// I3: a staged `TurnMeta`'s request wins over a liveness-only request staged beside it,
+    /// which is consumed with it rather than leaking into a later turn; a turn with no
+    /// observer key registers nothing.
+    #[tokio::test(start_paused = true)]
+    async fn turn_meta_liveness_wins_and_a_staged_request_never_leaks() {
+        let board = Arc::new(TurnLivenessBoard::default());
+        let rec = ends_after("agent-sess-STAGED", vec![ScriptedUpdate::Delay(minutes(2))]).await;
+        let backend = connect_recording_with(rec, board_config(&board, "codex")).await;
+        let key = bkey("bridge-STAGED");
+
+        backend
+            .configure_turn_liveness(&key, observed_request("stale", true))
+            .await;
+        backend
+            .configure_turn(
+                &key,
+                TurnMeta {
+                    liveness: observed_request("fresh", false),
+                    ..turn_meta("ctx-staged", 1, "op-staged")
+                },
+            )
+            .await;
+        let mut stream = backend.prompt(&key, vec![]).await.unwrap();
+        tokio::time::sleep(minutes(1)).await;
+        assert!(board.snapshot("stale").is_empty());
+        assert_eq!(
+            board.snapshot("fresh")[0].work_cutoff_ms,
+            Some(bridge_core::execution_policy::DEFAULT_WORK_CUTOFF_MS)
+        );
+        drain_to_done(&mut stream).await;
+
+        let mut stream = backend.prompt(&key, vec![]).await.unwrap();
+        tokio::time::sleep(minutes(1)).await;
+        assert_eq!(board.turn_count(), 0, "an unstaged turn registers nothing");
+        drain_to_done(&mut stream).await;
+    }
+
     // ── Task 5: reverse session/request_permission handler ─────────────────────
 
     #[tokio::test]
@@ -19834,6 +20135,7 @@ mod tests {
             session_catalogs: Arc::new(StdMutex::new(HashMap::new())),
             session_cfg: Arc::new(StdMutex::new(HashMap::new())),
             pending_turn_meta: StdMutex::new(HashMap::new()),
+            pending_turn_liveness: StdMutex::new(HashMap::new()),
             prefix_attestation_capability: PrefixAttestationCapability::default(),
             terminal_evidence_capability: EvidenceCapability::Unsupported,
             policy: Arc::new(StdMutex::new(
@@ -23044,6 +23346,7 @@ mod tests {
             session_catalogs: Arc::new(StdMutex::new(HashMap::new())),
             session_cfg: Arc::new(StdMutex::new(HashMap::new())),
             pending_turn_meta: StdMutex::new(HashMap::new()),
+            pending_turn_liveness: StdMutex::new(HashMap::new()),
             prefix_attestation_capability: PrefixAttestationCapability::default(),
             terminal_evidence_capability: EvidenceCapability::Unsupported,
             policy: Arc::new(StdMutex::new(
