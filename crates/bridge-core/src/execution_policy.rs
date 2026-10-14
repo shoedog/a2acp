@@ -2522,6 +2522,7 @@ fn freeze_effect(
         auth_method,
         pre_authenticated,
         host_fallback_eligible: _,
+        rename_new_sessions,
         name: _,
         description: _,
         tags: _,
@@ -2564,6 +2565,13 @@ fn freeze_effect(
     );
     push_bytes(&mut canonical, source_digest.as_str().as_bytes());
     push_bytes(&mut canonical, delivery_digest.as_str().as_bytes());
+    // Naming a session at mint changes what the provider is sent before a turn, so it is part
+    // of the effect. Only `true` is encoded, as a trailing field no earlier encoding has: an
+    // entry that leaves it off keeps the digest it had before the field existed, and identities
+    // already persisted stay valid.
+    if *rename_new_sessions {
+        push_bytes(&mut canonical, b"rename_new_sessions");
+    }
     let effect_digest = secret_silent_digest(
         key,
         secret_bearing,
@@ -3253,6 +3261,7 @@ mod r2f1b_contract_tests {
             auth_method: None,
             pre_authenticated: true,
             host_fallback_eligible: false,
+            rename_new_sessions: false,
             name: None,
             description: None,
             tags: vec![],

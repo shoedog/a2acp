@@ -7,6 +7,30 @@ release (see [`docs/adr/`](docs/adr/) for the full architectural record).
 
 ## [Unreleased]
 
+### Added
+
+- `[[agents]]` entries for `codex-acp` can set `rename_new_sessions = true` (default `false`) to stop
+  the adapter's title-generation thread. After a new session's first turn the adapter starts a second
+  codex thread, spends one model turn on it to generate a title, and never unsubscribes it; the bridge
+  has no id for that thread, so neither `session/close` on release nor anything short of adapter exit
+  ends the MCP server processes it started. With the option on, the bridge sends the adapter's own
+  slash command, `/rename <name>` as a `session/prompt`, once to each agent session it mints, after
+  mode, model and effort have settled and before the session can serve a turn. The adapter answers it
+  locally without a model turn and then skips title generation. The name is derived from the bridge
+  session key and is what the thread is listed under in codex's own session list. The rename is
+  best-effort: one attempt, bounded at 5 s, never retried, and it never fails the mint. Whatever
+  comes of it, the same session is published as it would be without the step, and a refused,
+  unanswered or cut-off rename is recorded only as a typed trace event. Updates the adapter sends
+  for the session before the rename exchange has ended reach no turn; output it sends late for a
+  rename it left unanswered past the bound can reach the session's first turn. Validation rejects
+  the option for any other `cmd`, where the text would reach the model as a prompt; a hot reload
+  that changes it respawns the agent's adapter; and model-catalog probes never rename. The option is
+  part of the frozen provider-effect identity, so a workflow run frozen under one value refuses an
+  entry reloaded with the other as a config mismatch; entries that leave it off keep the identity
+  they already had. The option relies on the adapter's `/rename` command as measured on codex-acp
+  1.13.1 and 2.2.2: see [`docs/compatibility.md`](docs/compatibility.md) before enabling it on
+  another version.
+
 ### Fixed
 
 - `serve` and `mcp` now retire an agent's shared adapter process once no registry lease has used it

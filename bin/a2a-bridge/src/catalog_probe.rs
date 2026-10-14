@@ -451,6 +451,9 @@ async fn probe_acp_host_with(
         mode: None,
         auth_method: entry.auth_method.clone(),
         pre_authenticated: entry.pre_authenticated,
+        // Never the entry's value: a probe session runs no turn, so there is no title thread to
+        // head off, and a rename would only leave a named, empty entry in codex's session index.
+        rename_new_sessions: false,
         container: None,
         mcp: Vec::new(),
         ..AcpConfig::default()
@@ -551,6 +554,7 @@ mod tests {
             auth_method: None,
             pre_authenticated: false,
             host_fallback_eligible: false,
+            rename_new_sessions: false,
             name: None,
             description: None,
             tags: vec![],
@@ -665,6 +669,58 @@ mod tests {
             backend.retired.load(std::sync::atomic::Ordering::SeqCst),
             "production owner must retire the one-shot backend"
         );
+    }
+
+    #[tokio::test]
+    async fn acp_probe_never_renames_the_sessions_it_mints() {
+        struct ConfigCapturingSpawner {
+            configs: std::sync::Mutex<Vec<AcpConfig>>,
+            backend: Arc<RecordingProbeBackend>,
+        }
+
+        #[async_trait::async_trait]
+        impl CatalogAcpSpawner for ConfigCapturingSpawner {
+            async fn spawn_observed(
+                &self,
+                _cmd: &str,
+                _args: &[&str],
+                config: AcpConfig,
+                _observer: Arc<dyn DiagnosticObserver>,
+            ) -> Result<Arc<dyn CatalogAcpBackend>, bridge_core::error::BridgeError> {
+                self.configs.lock().unwrap().push(config);
+                Ok(self.backend.clone())
+            }
+        }
+
+        let spawner = ConfigCapturingSpawner {
+            configs: std::sync::Mutex::new(Vec::new()),
+            backend: Arc::new(RecordingProbeBackend {
+                described: std::sync::Mutex::new(Vec::new()),
+                retired: std::sync::atomic::AtomicBool::new(false),
+            }),
+        };
+        // Host and container kinds alike are probed host-side, from an entry that opted in.
+        for kind in [AgentKind::Acp, AgentKind::ContainerRw] {
+            let mut renaming = entry("codex", Some("codex-acp"), kind);
+            renaming.rename_new_sessions = true;
+            renaming.pre_authenticated = true;
+            probe_acp_host_with(&renaming, Path::new("/tmp"), &spawner)
+                .await
+                .unwrap();
+        }
+
+        let configs = spawner.configs.lock().unwrap();
+        assert_eq!(configs.len(), 2);
+        for config in configs.iter() {
+            assert!(
+                config.pre_authenticated,
+                "control: the probe config does carry the entry's other settings"
+            );
+            assert!(
+                !config.rename_new_sessions,
+                "a probe session never runs a turn, so it must not be renamed"
+            );
+        }
     }
 
     #[test]

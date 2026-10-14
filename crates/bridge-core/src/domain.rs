@@ -161,6 +161,10 @@ pub struct AgentEntry {
     /// Whether this unsandboxed ACP entry may be named as a target in a local R2d fallback plan.
     /// This capability never asserts trust and never authorizes or performs execution.
     pub host_fallback_eligible: bool,
+    /// Name each agent session this entry mints by sending the adapter's `/rename` slash command
+    /// before the session serves a turn, so `codex-acp` skips its title-generation thread. Only
+    /// valid for a `codex-acp` `cmd`: any other adapter would hand the text to its model.
+    pub rename_new_sessions: bool,
     pub name: Option<String>,
     pub description: Option<String>,
     pub tags: Vec<String>,
@@ -437,6 +441,7 @@ mod tests {
             auth_method: None,
             pre_authenticated: false,
             host_fallback_eligible: false,
+            rename_new_sessions: false,
             name: None,
             description: None,
             tags: vec![],
@@ -472,6 +477,7 @@ mod tests {
             auth_method: None,
             pre_authenticated: false,
             host_fallback_eligible: false,
+            rename_new_sessions: false,
             name: None,
             description: None,
             tags: vec![],
@@ -505,6 +511,7 @@ mod tests {
             auth_method: None,
             pre_authenticated: false,
             host_fallback_eligible: false,
+            rename_new_sessions: false,
             name: None,
             description: None,
             tags: vec![],

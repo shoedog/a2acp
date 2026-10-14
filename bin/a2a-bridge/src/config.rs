@@ -1058,6 +1058,11 @@ pub struct AgentEntryToml {
     /// authorize execution; absent/default false keeps existing entries ineligible.
     #[serde(default)]
     pub host_fallback_eligible: bool,
+    /// Send `/rename <name>` to each agent session this entry mints, so `codex-acp` finds an
+    /// explicit name after the first turn and skips its title-generation thread. Absent/default
+    /// false; only valid when `cmd` is `codex-acp`.
+    #[serde(default)]
+    pub rename_new_sessions: bool,
     #[serde(default)]
     pub name: Option<String>,
     #[serde(default)]
@@ -1243,6 +1248,19 @@ fn build_mcp_specs(
     Ok(out)
 }
 
+/// The file name of an agent's `cmd`, which is how the adapter behind an entry is told apart
+/// whether `cmd` is a bare program name or a full path.
+fn cmd_file_name(cmd: Option<&str>) -> Option<&str> {
+    cmd.and_then(|c| std::path::Path::new(c).file_name())
+        .and_then(|s| s.to_str())
+}
+
+/// Whether `cmd` launches the codex adapter under its own file name. A wrapper script with
+/// another name is not recognized, on a host and in a container alike.
+fn cmd_is_codex_acp(cmd: Option<&str>) -> bool {
+    cmd_file_name(cmd) == Some("codex-acp")
+}
+
 /// Resolve the MCP delivery channel: explicit `mcp_delivery` override wins; else auto-detect from the
 /// `cmd` basename. Only required when the agent actually has MCP servers (`has_mcp`).
 fn resolve_mcp_delivery(
@@ -1262,10 +1280,7 @@ fn resolve_mcp_delivery(
             ))),
         };
     }
-    let base = cmd
-        .and_then(|c| std::path::Path::new(c).file_name())
-        .and_then(|s| s.to_str());
-    match base {
+    match cmd_file_name(cmd) {
         Some("claude-agent-acp") => Ok(McpDelivery::Acp),
         Some("codex-acp") => Ok(McpDelivery::CodexNative),
         Some("kiro-cli") => Ok(McpDelivery::KiroNative),
@@ -2151,6 +2166,14 @@ impl RegistryConfig {
                     id.as_str()
                 )));
             }
+            // `/rename` is a slash command of the codex adapter alone. Any other adapter would
+            // hand the text to its model as the session's first prompt.
+            if a.rename_new_sessions && !cmd_is_codex_acp(a.cmd.as_deref()) {
+                return Err(ConfigError::Registry(format!(
+                    "agent {:?}: rename_new_sessions=true requires cmd \"codex-acp\"",
+                    id.as_str()
+                )));
+            }
             let watchdog = match &a.watchdog {
                 None => None,
                 Some(wd) => {
@@ -2206,6 +2229,7 @@ impl RegistryConfig {
                 auth_method: a.auth_method,
                 pre_authenticated: a.pre_authenticated,
                 host_fallback_eligible: a.host_fallback_eligible,
+                rename_new_sessions: a.rename_new_sessions,
                 name: a.name,
                 description: a.description,
                 tags: a.tags,
@@ -3050,6 +3074,189 @@ egress = "open"
                 error.to_string().contains("host_fallback_eligible"),
                 "{case} rejection should name the invalid capability: {error}"
             );
+        }
+    }
+
+    #[test]
+    fn rename_new_sessions_defaults_false_and_accepts_codex_acp_on_host_and_in_containers() {
+        let default_snapshot = RegistryConfig::parse(
+            r#"
+default = "codex"
+
+[[agents]]
+id = "codex"
+cmd = "codex-acp"
+
+[server]
+"#,
+        )
+        .unwrap()
+        .into_snapshot()
+        .unwrap();
+        assert!(!default_snapshot.entries[0].rename_new_sessions);
+
+        let accepted = [
+            (
+                "host, bare cmd",
+                r#"
+default = "codex"
+
+[[agents]]
+id = "codex"
+cmd = "codex-acp"
+rename_new_sessions = true
+
+[server]
+"#,
+            ),
+            (
+                "host, cmd given as a path",
+                r#"
+default = "codex"
+
+[[agents]]
+id = "codex"
+cmd = "/usr/local/bin/codex-acp"
+rename_new_sessions = true
+
+[server]
+"#,
+            ),
+            (
+                "read-only container",
+                r#"
+default = "codex"
+allowed_cwd_root = "/repo"
+
+[[agents]]
+id = "codex"
+cmd = "codex-acp"
+rename_new_sessions = true
+
+[agents.sandbox]
+image = "reader:latest"
+mount = "/repo"
+access = "ro"
+egress = "open"
+
+[server]
+"#,
+            ),
+            (
+                "container_rw",
+                r#"
+default = "codex"
+allowed_cwd_root = "/repo"
+
+[[agents]]
+id = "codex"
+kind = "container_rw"
+cmd = "codex-acp"
+rename_new_sessions = true
+
+[agents.sandbox]
+image = "writer:latest"
+mount = "/repo"
+access = "rw"
+egress = "open"
+
+[server]
+"#,
+            ),
+        ];
+        for (case, toml) in accepted {
+            let snapshot = RegistryConfig::parse(toml)
+                .unwrap()
+                .into_snapshot()
+                .unwrap_or_else(|error| panic!("{case} must be accepted: {error}"));
+            assert!(snapshot.entries[0].rename_new_sessions, "{case}");
+        }
+    }
+
+    #[test]
+    fn rename_new_sessions_rejects_every_cmd_but_codex_acp() {
+        let invalid = [
+            (
+                "another adapter",
+                r#"
+default = "target"
+
+[[agents]]
+id = "target"
+cmd = "claude-agent-acp"
+rename_new_sessions = true
+
+[server]
+"#,
+            ),
+            (
+                "a wrapper under another file name",
+                r#"
+default = "target"
+
+[[agents]]
+id = "target"
+cmd = "/opt/wrappers/codex-acp-wrapper"
+rename_new_sessions = true
+
+[server]
+"#,
+            ),
+            (
+                "another adapter in a container",
+                r#"
+default = "target"
+allowed_cwd_root = "/repo"
+
+[[agents]]
+id = "target"
+kind = "container_rw"
+cmd = "claude-agent-acp"
+rename_new_sessions = true
+
+[agents.sandbox]
+image = "writer:latest"
+mount = "/repo"
+access = "rw"
+egress = "open"
+
+[server]
+"#,
+            ),
+            (
+                "an api agent, which has no cmd",
+                r#"
+default = "target"
+
+[[agents]]
+id = "target"
+kind = "api"
+base_url = "http://localhost:11434/v1"
+rename_new_sessions = true
+
+[server]
+"#,
+            ),
+        ];
+
+        for (case, toml) in invalid {
+            let error = RegistryConfig::parse(toml)
+                .unwrap()
+                .into_snapshot()
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("\"target\"") && error.contains("rename_new_sessions"),
+                "{case} rejection should name the agent and the field: {error}"
+            );
+        }
+
+        // The same entries are valid once the option is left off.
+        for (case, toml) in invalid {
+            RegistryConfig::parse(&toml.replace("rename_new_sessions = true\n", ""))
+                .unwrap()
+                .into_snapshot()
+                .unwrap_or_else(|error| panic!("{case} without the option: {error}"));
         }
     }
 

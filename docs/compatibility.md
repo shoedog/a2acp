@@ -15,6 +15,58 @@ Status meanings:
 - **STALE** — it passed previously, but a relevant component has changed or the evidence is too old for
   a release decision.
 
+## Codex ACP title-generation thread and `rename_new_sessions` — 2026-10-13
+
+Measured on 2026-10-13 against `@agentclientprotocol/codex-acp` 1.13.1 and 2.2.2, with the same result on
+both.
+
+**What the adapter does.** After the first turn of a new session, the adapter starts a second, ephemeral
+codex thread, runs one `gpt-5.6-luna` turn on it to generate a session title, and never unsubscribes that
+thread. The bridge has no id for it, so `session/close` cannot reach it. The thread starts every
+process-backed MCP server in codex's own config (`~/.codex/config.toml` and the trusted project's
+`.codex/config.toml`), and those processes live until the adapter process exits. Close-on-release and idle
+adapter retirement free the session the bridge minted; they do not reach this thread.
+
+**What avoids it.** The adapter skips title generation when the thread already has an explicit name by the
+time its first turn completes. Its own slash command sets one: a `session/prompt` whose single text block is
+`/rename <name>`. On both versions that prompt was accepted on a session that had not had a turn, was
+answered locally in under a second with `{"stopReason":"end_turn","usage":null}`, started no model turn, and
+emitted one `session/update` of kind `session_info_update` for the session. A session treated this way left
+nothing behind after `session/close`; the control session in the same adapter process left one MCP server
+set behind.
+
+**The opt-in.** `rename_new_sessions = true` on a `cmd = "codex-acp"` entry makes the bridge send that
+prompt once for each agent session it mints, as the last step of session setup and before the session can
+serve a turn. The name is derived from the bridge session key (every character outside `[A-Za-z0-9._:@-]`
+becomes `_`, cut to 96 characters), and the thread appears under that name in codex's own session list. The
+option is off by default and relies entirely on the adapter's `/rename` command: the bridge does not detect
+the command from `available_commands_update`, and it does not use the `_session/rename` extension method
+that 2.2.2 adds and 1.13.1 lacks.
+
+Accepted limits:
+
+- **Tied to the tested versions.** If a later adapter drops or changes `/rename`, the text reaches the model
+  as an ordinary prompt at session mint, outside any bridge turn: until the exchange ends its output is
+  dropped and its usage is not recorded, and a reply still in progress at the 5 s bound falls under the last
+  limit below. Repeat the measurement above before enabling the option on any adapter version other than
+  1.13.1 and 2.2.2.
+- **Recognized by file name.** Validation accepts the option only when the entry's `cmd` has the file name
+  `codex-acp`, on a host and in a container alike. A wrapper script that launches the adapter under another
+  name cannot use it.
+- **Renamed whether or not it is used.** A session that is minted and then never prompted is still renamed,
+  and so still appears in codex's session list. Model-catalog probes are exempt: they never rename.
+- **Best-effort, one attempt, bounded at 5 s.** A rename that is refused, unanswered or cut off by adapter
+  teardown never fails the mint, never holds it up for more than 5 s and is never retried: it is traced
+  (`acp.session_rename_rejected`, `acp.session_rename_unanswered` or `acp.session_rename_interrupted`) and
+  the same session is served as it is, so the title thread returns for a session the adapter did not name.
+- **Late output after a timeout.** A rename that is not answered within the bound is not waited on or
+  cancelled, so output the adapter emits late for it can reach the session's first turn. On the tested
+  adapter versions `/rename` is answered locally in well under a second, so the bound is only reached when
+  the adapter is already misbehaving.
+
+This records adapter behaviour, not a bridge lane. The bridge side is covered by in-process tests against a
+fake adapter; no fixed-`PONG` smoke has been run with the option on, so that combination is **UNKNOWN**.
+
 ## Provider refresh — 2026-09-25 (Opus 5.5)
 
 Motive: the previous production Claude tree (ACP 0.73.0 / Agent SDK 0.3.257 / bundled Claude Code 2.1.257)

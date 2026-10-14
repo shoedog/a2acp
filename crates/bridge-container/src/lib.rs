@@ -211,6 +211,8 @@ pub struct ContainerRwConfig {
     pub mode: Option<String>,
     pub auth_method: Option<String>,
     pub pre_authenticated: bool,
+    /// Name each inner agent session at mint (`AcpConfig::rename_new_sessions`); `codex-acp` only.
+    pub rename_new_sessions: bool,
     pub watchdog: Option<bridge_core::domain::WatchdogConfig>,
     pub handshake_timeout: Duration,
     pub cancel_grace: Duration,
@@ -849,6 +851,8 @@ impl ContainerRwBackend {
             mode: self.cfg.mode.clone(),
             auth_method: self.cfg.auth_method.clone(),
             pre_authenticated: self.cfg.pre_authenticated,
+            rename_new_sessions: self.cfg.rename_new_sessions,
+            rename_timeout: AcpConfig::default().rename_timeout,
             watchdog: self.cfg.watchdog.clone(),
             process_flight_route_v3: self.cfg.resource_flight_attempt_v3.as_ref().map(|attempt| {
                 let owner = ResourceFlightOwnerV1::new(
@@ -2307,6 +2311,7 @@ mod tests {
         observed_count: AtomicUsize,
         last_argv: Mutex<Vec<String>>,
         last_acp_mcp: Mutex<Vec<bridge_core::mcp::McpServerSpec>>,
+        last_acp_rename_new_sessions: Mutex<Option<bool>>,
         last_diagnostic_redactor: Mutex<Option<bridge_core::diagnostics::DiagnosticRedactor>>,
         last_inner: Mutex<Option<Arc<StubInner>>>,
         spawn_gate: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
@@ -2419,6 +2424,7 @@ mod tests {
                 observed_count: AtomicUsize::new(0),
                 last_argv: Mutex::new(vec![]),
                 last_acp_mcp: Mutex::new(vec![]),
+                last_acp_rename_new_sessions: Mutex::new(None),
                 last_diagnostic_redactor: Mutex::new(None),
                 last_inner: Mutex::new(None),
                 spawn_gate,
@@ -2441,6 +2447,7 @@ mod tests {
             self.count.fetch_add(1, Ordering::SeqCst);
             *self.last_argv.lock().await = argv.to_vec();
             *self.last_acp_mcp.lock().await = cfg.mcp.clone();
+            *self.last_acp_rename_new_sessions.lock().await = Some(cfg.rename_new_sessions);
             *self.last_diagnostic_redactor.lock().await = Some(cfg.diagnostic_redactor.clone());
             if let Some((entered, release)) = &self.spawn_gate {
                 entered.notify_one();
@@ -2658,6 +2665,7 @@ mod tests {
             mode: None,
             auth_method: None,
             pre_authenticated: false,
+            rename_new_sessions: false,
             watchdog: None,
             handshake_timeout: Duration::from_secs(30),
             cancel_grace: Duration::from_secs(5),
@@ -3017,6 +3025,7 @@ mod tests {
             auth_method: config.auth_method.clone(),
             pre_authenticated: config.pre_authenticated,
             host_fallback_eligible: false,
+            rename_new_sessions: false,
             name: None,
             description: None,
             tags: vec![],
@@ -3261,6 +3270,32 @@ mod tests {
             "claude path must not append codex -c mcp args: {argv:?}"
         );
         while stream.next().await.is_some() {}
+    }
+
+    #[tokio::test]
+    async fn rename_new_sessions_reaches_the_inner_session_config() {
+        // The inner agent's sessions are the ones that serve the turns, so the option has to
+        // arrive on the inner AcpConfig, and stay off there unless the config asks for it.
+        for rename_new_sessions in [false, true] {
+            let tmp = tempfile::tempdir().unwrap();
+            let root = tmp.path().to_str().unwrap();
+            let mut cfg = cfg_with_mount(root);
+            cfg.cmd = "codex-acp".into();
+            cfg.rename_new_sessions = rename_new_sessions;
+            let spawn = CountingSpawn::new(false);
+            let (reap, _) = counting_reap();
+            let be = ContainerRwBackend::new_with_hooks(cfg, spawn.clone(), "inst".into(), reap)
+                .await
+                .unwrap();
+            let s = SessionId::parse("s1").unwrap();
+            be.configure_session(&s, &spec_cwd(root)).await.unwrap();
+            let mut stream = be.prompt(&s, vec![]).await.unwrap();
+            assert_eq!(
+                *spawn.last_acp_rename_new_sessions.lock().await,
+                Some(rename_new_sessions)
+            );
+            while stream.next().await.is_some() {}
+        }
     }
 
     #[tokio::test]

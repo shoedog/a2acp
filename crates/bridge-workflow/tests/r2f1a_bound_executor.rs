@@ -286,6 +286,7 @@ fn entry() -> AgentEntry {
         auth_method: None,
         pre_authenticated: true,
         host_fallback_eligible: false,
+        rename_new_sessions: false,
         name: None,
         description: None,
         tags: vec![],
@@ -748,6 +749,98 @@ async fn v2_refuses_legacy_dispatcher_before_any_unbound_read_or_checkout() {
     assert_eq!(calls.binds.load(Ordering::SeqCst), 0);
     assert_eq!(calls.bound_resolves.load(Ordering::SeqCst), 0);
     assert!(calls.bound_specs.lock().unwrap().is_empty());
+}
+
+/// Run the workflow frozen for `frozen` against a registry that serves `live` for the same agent,
+/// as it does once a reload has replaced the entry.
+async fn execute_frozen_against_live_entry(
+    frozen: &AgentEntry,
+    live: AgentEntry,
+) -> (Arc<Calls>, Vec<WorkflowEvent>) {
+    let run_spec = Arc::new(frozen_worktree_run(frozen));
+    run_spec.validate().unwrap();
+    let calls = Arc::new(Calls::default());
+    let backend: Arc<dyn AgentBackend> = Arc::new(RecordingBackend {
+        calls: calls.clone(),
+    });
+    let registry = Arc::new(BoundOnlyRegistry {
+        entry: Arc::new(live),
+        backend,
+        slot: Arc::new(()),
+        calls: calls.clone(),
+        fail_preflight_ordinal: None,
+    });
+    let context = WorkflowDiagnosticContext::in_memory(WorkflowRunContext {
+        session_cwd: run_spec.requested_session_cwd.clone(),
+        ..WorkflowRunContext::default()
+    })
+    .with_frozen_run_spec(run_spec.clone(), None)
+    .unwrap();
+    let mut stream = WorkflowExecutor::new(registry).run_with_diagnostic_context(
+        Arc::new(run_spec.graph.clone()),
+        "review this".into(),
+        "bound-reload-run".into(),
+        CancellationToken::new(),
+        context,
+    );
+    let mut events = Vec::new();
+    while let Some(event) = stream.next().await {
+        events.push(event.unwrap());
+    }
+    (calls, events)
+}
+
+fn terminal_outcome(events: &[WorkflowEvent]) -> Option<WorkflowOutcome> {
+    events.iter().find_map(|event| match event {
+        WorkflowEvent::Terminal { outcome, .. } => Some(outcome.clone()),
+        _ => None,
+    })
+}
+
+/// `rename_new_sessions` is part of the frozen provider effect: a run frozen under one value
+/// refuses an entry that was reloaded with the other, in either direction, with the same config
+/// mismatch as any other provider-effect drift and before a backend is resolved. Discriminates a
+/// digest that leaves the flag out, under which a resumed run would silently start (or stop)
+/// sending `/rename` to the provider.
+#[tokio::test]
+async fn v2_refuses_an_entry_reloaded_with_the_opposite_rename_new_sessions() {
+    for frozen_with in [false, true] {
+        let mut frozen = entry();
+        frozen.rename_new_sessions = frozen_with;
+
+        // Control: the entry the run was frozen for still binds and runs.
+        let (calls, events) = execute_frozen_against_live_entry(&frozen, frozen.clone()).await;
+        assert_eq!(
+            terminal_outcome(&events),
+            Some(WorkflowOutcome::Completed),
+            "frozen with {frozen_with}: {events:?}"
+        );
+        assert_eq!(calls.bound_resolves.load(Ordering::SeqCst), 1);
+
+        let mut reloaded = frozen.clone();
+        reloaded.rename_new_sessions = !frozen_with;
+        let (calls, events) = execute_frozen_against_live_entry(&frozen, reloaded).await;
+        assert_eq!(
+            terminal_outcome(&events),
+            Some(WorkflowOutcome::Failed),
+            "frozen with {frozen_with}: {events:?}"
+        );
+        let (_, terminal) = node_terminal(&events, "review-node");
+        assert_eq!(terminal.primary, NodePrimaryDispositionV1::Failed);
+        assert!(!terminal.prompt_may_have_been_accepted);
+        let cause = terminal.cause.expect("the refusal retains its cause");
+        assert_eq!(cause.failure_class, DiagnosticFailureClass::Config);
+        assert_eq!(cause.code.as_str(), "bridge.config_mismatch");
+        assert_eq!(
+            cause.deepest_cause.as_deref(),
+            Some("config mismatch: provider_effect")
+        );
+        assert_eq!(calls.binds.load(Ordering::SeqCst), 1);
+        assert_eq!(calls.bound_resolves.load(Ordering::SeqCst), 0);
+        assert_eq!(calls.unbound_resolves.load(Ordering::SeqCst), 0);
+        assert_eq!(calls.main_prompts.load(Ordering::SeqCst), 0);
+        assert!(calls.bound_specs.lock().unwrap().is_empty());
+    }
 }
 
 #[tokio::test]
