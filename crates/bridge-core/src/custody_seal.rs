@@ -280,6 +280,25 @@ impl CustodyOriginalRefV1 {
         }
         Ok(Self { name, target })
     }
+
+    /// Read-only ref name, for the crate-private restore's refs agreement.
+    ///
+    /// The restore compares every manifest ref with the refs it restored, record by record. Re-parsing
+    /// the canonical JSON to do that would make the comparison depend on the encoder rather than on the
+    /// record, so the two components are exposed here as accessors. Neither changes validation or the
+    /// wire format.
+    #[cfg(unix)] // Read only by the unix-only restore.
+    #[must_use]
+    pub(crate) fn name(&self) -> &LosslessPathV1 {
+        &self.name
+    }
+
+    /// Read-only ref target. See [`Self::name`].
+    #[cfg(unix)] // Read only by the unix-only restore.
+    #[must_use]
+    pub(crate) fn target(&self) -> &CustodyRefTargetV1 {
+        &self.target
+    }
 }
 
 #[derive(Deserialize)]
@@ -597,6 +616,14 @@ impl CustodyManifestV1 {
     #[must_use]
     pub fn original_objects(&self) -> &[CustodyOriginalObjectV1] {
         &self.original_objects
+    }
+
+    /// Read-only canonical original refs, in canonical (name) order, for the crate-private restore's
+    /// refs agreement. See [`CustodyOriginalRefV1::name`]. No validation or wire change.
+    #[cfg(unix)] // Read only by the unix-only restore.
+    #[must_use]
+    pub(crate) fn original_refs(&self) -> &[CustodyOriginalRefV1] {
+        &self.original_refs
     }
 
     /// Read-only manifest identity, for the crate-private exporter's capability binding.
@@ -1309,5 +1336,139 @@ mod tests {
             manifest.generation_id(),
         );
         assert_eq!(manifest.encode_canonical().unwrap(), before);
+    }
+
+    fn lossless(name: &[u8]) -> LosslessPathV1 {
+        LosslessPathV1::from_bytes(name.to_vec())
+    }
+
+    fn sha1_object(fill: char, kind: CustodyGitObjectKindV1) -> CustodyOriginalObjectV1 {
+        CustodyOriginalObjectV1::new(
+            CustodyGitObjectFormatV1::Sha1,
+            fill.to_string().repeat(40),
+            kind,
+        )
+        .unwrap()
+    }
+
+    /// Four refs, one of each target kind and one more direct ref, given in an order that is NOT the
+    /// canonical one, over a Captured coverage.
+    fn manifest_with_refs() -> CustodyManifestV1 {
+        let commit = sha1_object('a', CustodyGitObjectKindV1::Commit);
+        let tag = sha1_object('b', CustodyGitObjectKindV1::Tag);
+        let refs = vec![
+            CustodyOriginalRefV1::new(
+                lossless(b"refs/tags/v1"),
+                CustodyRefTargetV1::Direct(tag.clone()),
+            )
+            .unwrap(),
+            CustodyOriginalRefV1::new(
+                lossless(b"HEAD"),
+                CustodyRefTargetV1::Symbolic(lossless(b"refs/heads/main")),
+            )
+            .unwrap(),
+            CustodyOriginalRefV1::new(
+                lossless(b"refs/heads/main"),
+                CustodyRefTargetV1::Direct(commit.clone()),
+            )
+            .unwrap(),
+            CustodyOriginalRefV1::new(
+                lossless(b"refs/remotes/origin/HEAD"),
+                CustodyRefTargetV1::Unborn,
+            )
+            .unwrap(),
+        ];
+        CustodyManifestV1::new(
+            "unit-g",
+            "run-g",
+            "materialization-g",
+            "generation-g",
+            coverage_all(CustodyStateClassV1::Captured),
+            refs,
+            vec![tag, commit],
+            vec![],
+            vec![],
+        )
+        .unwrap()
+    }
+
+    /// The canonical encoding and digest of [`manifest_with_refs`], recorded from the code BEFORE the
+    /// ref accessors existed: the accessors must not move a byte of either.
+    const REFS_CANONICAL_V1: &str = r#"{"schema":"custody-manifest.v1","unit_id":"unit-g","run_id":"run-g","materialization_id":"materialization-g","generation_id":"generation-g","coverage":[{"class":"refs_and_head","state":"captured","reasons":[],"exclusion_id":null},{"class":"object_database","state":"captured","reasons":[],"exclusion_id":null},{"class":"index","state":"captured","reasons":[],"exclusion_id":null},{"class":"worktree","state":"captured","reasons":[],"exclusion_id":null},{"class":"stash_and_reflogs","state":"captured","reasons":[],"exclusion_id":null},{"class":"in_progress_git_operations","state":"captured","reasons":[],"exclusion_id":null},{"class":"linked_worktrees","state":"captured","reasons":[],"exclusion_id":null},{"class":"nested_repositories_and_submodules","state":"captured","reasons":[],"exclusion_id":null},{"class":"lfs_and_external_payloads","state":"captured","reasons":[],"exclusion_id":null},{"class":"alternates_and_shared_stores","state":"captured","reasons":[],"exclusion_id":null},{"class":"git_configuration_and_hooks","state":"captured","reasons":[],"exclusion_id":null},{"class":"bridge_evidence","state":"captured","reasons":[],"exclusion_id":null},{"class":"external_evidence","state":"captured","reasons":[],"exclusion_id":null},{"class":"reproducible_outputs","state":"captured","reasons":[],"exclusion_id":null}],"original_refs":[{"name":[72,69,65,68],"target":{"kind":"symbolic","value":[114,101,102,115,47,104,101,97,100,115,47,109,97,105,110]}},{"name":[114,101,102,115,47,104,101,97,100,115,47,109,97,105,110],"target":{"kind":"direct","value":{"format":"sha1","object_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","kind":"commit"}}},{"name":[114,101,102,115,47,114,101,109,111,116,101,115,47,111,114,105,103,105,110,47,72,69,65,68],"target":{"kind":"unborn"}},{"name":[114,101,102,115,47,116,97,103,115,47,118,49],"target":{"kind":"direct","value":{"format":"sha1","object_id":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","kind":"tag"}}}],"original_objects":[{"format":"sha1","object_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","kind":"commit"},{"format":"sha1","object_id":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","kind":"tag"}],"dependencies":[],"exclusions":[]}"#;
+    const REFS_DIGEST_V1: &str = "8fd90b306ac117f55d068638ace373126a74a6a2cc831e3877c96011b232e844";
+
+    /// `original_refs`, `name`, and `target` report the records' own values, in the manifest's canonical
+    /// (name) order whatever order the refs were given in, and each target kind comes back as itself.
+    #[test]
+    fn crate_private_original_ref_accessors_report_name_and_each_target_kind() {
+        let manifest = manifest_with_refs();
+        let refs = manifest.original_refs();
+        assert_eq!(refs.len(), 4);
+        let names: Vec<&[u8]> = refs.iter().map(|record| record.name().as_bytes()).collect();
+        assert_eq!(
+            names,
+            [
+                &b"HEAD"[..],
+                b"refs/heads/main",
+                b"refs/remotes/origin/HEAD",
+                b"refs/tags/v1"
+            ],
+            "canonical order, not the order given"
+        );
+        assert_eq!(
+            refs[0].target(),
+            &CustodyRefTargetV1::Symbolic(lossless(b"refs/heads/main"))
+        );
+        assert_eq!(
+            refs[1].target(),
+            &CustodyRefTargetV1::Direct(sha1_object('a', CustodyGitObjectKindV1::Commit))
+        );
+        assert_eq!(refs[2].target(), &CustodyRefTargetV1::Unborn);
+        match refs[3].target() {
+            CustodyRefTargetV1::Direct(object) => {
+                assert_eq!(object.format(), CustodyGitObjectFormatV1::Sha1);
+                assert_eq!(object.object_id(), "b".repeat(40));
+                assert_eq!(object.kind(), CustodyGitObjectKindV1::Tag);
+            }
+            other => panic!("a direct tag target, not {other:?}"),
+        }
+        // A manifest without refs reports none.
+        let bare = CustodyManifestV1::new(
+            "unit",
+            "run",
+            "materialization",
+            "generation",
+            coverage_all(CustodyStateClassV1::Empty),
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+        )
+        .unwrap();
+        assert!(bare.original_refs().is_empty());
+    }
+
+    /// The accessors are read-only: the canonical bytes and digest of a manifest with refs are exactly
+    /// the ones recorded before they existed, before and after every accessor is read, and decoding
+    /// those bytes gives the same records.
+    #[test]
+    fn crate_private_original_refs_accessors_preserve_canonical_bytes_and_digest() {
+        let manifest = manifest_with_refs();
+        assert_eq!(
+            String::from_utf8(manifest.encode_canonical().unwrap()).unwrap(),
+            REFS_CANONICAL_V1
+        );
+        assert_eq!(manifest.content_digest().unwrap().as_str(), REFS_DIGEST_V1);
+        for record in manifest.original_refs() {
+            let _ = (record.name(), record.target());
+        }
+        assert_eq!(
+            String::from_utf8(manifest.encode_canonical().unwrap()).unwrap(),
+            REFS_CANONICAL_V1
+        );
+        assert_eq!(manifest.content_digest().unwrap().as_str(), REFS_DIGEST_V1);
+        let decoded = CustodyManifestV1::decode_canonical(REFS_CANONICAL_V1.as_bytes()).unwrap();
+        assert_eq!(decoded.original_refs(), manifest.original_refs());
+        assert_eq!(decoded, manifest);
     }
 }

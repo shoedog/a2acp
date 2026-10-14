@@ -70,7 +70,7 @@ const MAX_CANONICAL_JSON_BYTES_V1: usize = 1024 * 1024;
 /// The fixed per-entry allocation allowance charged against the scratch-wide ledger for every
 /// file or directory the exporter (or a Git child it spawned) creates. The set of created
 /// entries is fixed and small, so allocated-block overhead stays bounded.
-const ENTRY_ALLOWANCE_BYTES_V1: u64 = 64 * 1024;
+pub(crate) const ENTRY_ALLOWANCE_BYTES_V1: u64 = 64 * 1024;
 
 const CAPSULE_DIR_NAME: &str = "capsule";
 const WORK_DIR_NAME: &str = "work";
@@ -97,17 +97,17 @@ pub(crate) const INIT_BARE_ENTRIES_V1: u64 = 9;
 /// the measured bytes.
 pub(crate) const INIT_BARE_LOGICAL_BYTES_V1: u64 = 4 * 1024;
 /// `index-pack` creates the pack, its version-2 index, and its reverse index.
-const INDEX_PACK_ENTRIES_V1: u64 = 3;
+pub(crate) const INDEX_PACK_ENTRIES_V1: u64 = 3;
 
-const GIT_STDERR_LIMIT_V1: usize = 64 * 1024;
+pub(crate) const GIT_STDERR_LIMIT_V1: usize = 64 * 1024;
 /// `cat-file --batch-check` and `cat-file --batch-all-objects` emit one bounded line per object,
 /// and `rev-list` one per reachable object plus one per missing object.
-const GIT_LINE_BYTES_V1: usize = 128;
-const GIT_MIN_STDOUT_LIMIT_V1: usize = 16 * 1024;
+pub(crate) const GIT_LINE_BYTES_V1: usize = 128;
+pub(crate) const GIT_MIN_STDOUT_LIMIT_V1: usize = 16 * 1024;
 
 /// Bounded walk limits for the post-exit git-directory re-measure.
-const GIT_DIR_MAX_DEPTH_V1: usize = 6;
-const GIT_DIR_MAX_ENTRIES_V1: usize = 256;
+pub(crate) const GIT_DIR_MAX_DEPTH_V1: usize = 6;
+pub(crate) const GIT_DIR_MAX_ENTRIES_V1: usize = 256;
 
 /// An `objects/info/alternates` file names a handful of store paths. It is read through a bound
 /// one byte past this ceiling, so an oversized file is refused without ever being buffered whole.
@@ -2157,7 +2157,7 @@ fn inventory_stdin(capability: &CustodyCaptureCapabilityV1) -> Vec<u8> {
     bytes
 }
 
-fn stdout_limit_for_objects(count: usize) -> usize {
+pub(crate) fn stdout_limit_for_objects(count: usize) -> usize {
     count
         .saturating_mul(GIT_LINE_BYTES_V1)
         .saturating_add(GIT_MIN_STDOUT_LIMIT_V1)
@@ -2177,7 +2177,7 @@ const VERIFY_PACK_HISTOGRAM_BYTES_V1: usize = 15 + 10 + 2 + 20 + 9;
 /// widest row at hex width `W`, plus one histogram line, per object. The `non delta` and final
 /// `<pack>: ok` lines fit the fixed floor. The runner fixes `LC_ALL=C`, so these are Git's
 /// untranslated formats. Every step is checked.
-fn verify_pack_stdout_limit(
+pub(crate) fn verify_pack_stdout_limit(
     objects: usize,
     object_format: GitObjectFormatV1,
 ) -> Result<usize, CustodyExportErrorV1> {
@@ -2360,7 +2360,7 @@ fn classify_index_pack(result: &GitRunResultV1) -> Result<(), CustodyExportError
     Err(CustodyExportErrorV1::StrictPack(bounded(&detail)))
 }
 
-fn bounded(text: &str) -> String {
+pub(crate) fn bounded(text: &str) -> String {
     text.chars().take(512).collect()
 }
 
@@ -2368,7 +2368,7 @@ fn bounded(text: &str) -> String {
 /// as `zeroPaddedFilemode`. Both `index-pack --strict` (§5 step 1) and `fsck --strict` (step 4)
 /// report one, and each is classified as a dedicated `StrictObjectCheck` refusal rather than a
 /// generic ambiguity.
-fn strict_object_message_id(text: &str) -> Option<String> {
+pub(crate) fn strict_object_message_id(text: &str) -> Option<String> {
     for line in text.lines().take(64) {
         // Scan every bounded line rather than only the first: `index-pack --strict` and
         // `fsck --strict` both interleave their object report with other output, and a
@@ -2465,7 +2465,7 @@ impl GitDirectoryBudgetV1 {
 
     /// Admit the pack, index, and reverse index `index-pack` writes, at its proven logical bound
     /// plus their three entries.
-    fn admit_index_pack(
+    pub(crate) fn admit_index_pack(
         &mut self,
         pack_hash: &str,
         logical_bytes: u64,
@@ -2494,7 +2494,7 @@ impl GitDirectoryBudgetV1 {
 /// width `hash_width`, the version-2 index is at most `1072 + N·(H + 8) + 8·N + 2·H` bytes and the
 /// reverse index at most `12 + 4·N + 2·H`; no bitmap or `.keep` file is requested. The three files'
 /// entries are charged separately, as `INDEX_PACK_ENTRIES_V1`. Every step is checked.
-fn index_pack_logical_bound(
+pub(crate) fn index_pack_logical_bound(
     pack_length: u64,
     objects: u64,
     hash_width: u64,
@@ -3137,7 +3137,7 @@ fn compare_closure(
 /// `fsck --strict --full --no-reflogs --no-dangling --no-progress` writes nothing to stdout for a
 /// clean database. On stderr it emits exactly one informational line for the refless verification
 /// database §5 mandates. Any other line refuses.
-const FSCK_ALLOWED_NOTICE_V1: &str = "notice: No default references";
+pub(crate) const FSCK_ALLOWED_NOTICE_V1: &str = "notice: No default references";
 
 fn check_fsck_output(result: &GitRunResultV1) -> Result<(), CustodyExportErrorV1> {
     let stdout = result

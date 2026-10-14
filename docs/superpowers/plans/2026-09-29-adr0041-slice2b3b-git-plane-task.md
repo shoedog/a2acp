@@ -5,6 +5,12 @@ task-type: implement
 
 **Revision:** 2, with nonblocking round-2 clarifications folded. Sol/xhigh APPROVE at `a25ddb01`:
 zero WRONG, two SMELL, zero blockers, round 2/2. Raw receipts and disposition live in `../reviews/`.
+**Later owner refinement (2026-10-02 UTC):** complete phase G requires `RefsAndHead=Captured`
+with exactly one valid `HEAD`. `RefsAndHead=Empty` receives a typed pre-repository refusal with
+`active_materialization_began=false`; no `repository/` is created. The approved Pass A bootstrap
+continues to accept Empty coverage. No HEAD is synthesized or copied from bootstrap. This later rule
+and the five consecutive remaining implementation increments require their own remaining-task spec
+review; the earlier revision-2 approval does not attest this refinement.
 **Implementation base:** bind the exact committed spec revision at dispatch. Drafting base is
 `5d2a82c457e626b2a108063e1de6b13b94e97f92` (PR #126). Reader 2B3a merged in PR #125 at `b7c85aee`.
 **Implementor:** Sonnet 5.5 through `a2a-bridge implement`, overriding the design's earlier Opus 5.5 direction
@@ -97,6 +103,12 @@ Implement phase G alongside the reader in `custody_restore.rs`, with tests in a 
 - [ ] Identify the coverage-dependent pack shape and the active `RefsAndHead` and `StashAndReflogs` payloads
   using their bound roles/coverage rows. Captured requires its payload; Empty needs no frame. Refuse
   impossible/unsupported states, never downgrade them to Empty. `packed-refs` belongs to `RefsAndHead`.
+  Empty still needs no frame for classification/bootstrap, but complete phase G refuses Empty
+  `RefsAndHead` before any repository write under the owner refinement above. Captured refs coverage
+  must contain exactly one valid HEAD. Test the existing all-Empty capsule for both caller object formats:
+  Pass A remains accepted; complete G returns the exact typed refusal, preserves the original ledger,
+  pins and deadline custody, and creates no repository. Final empty-object success controls instead use
+  captured valid unborn HEAD metadata, no pack and empty inventory; retain `CallerSelectedEmpty`.
 - [ ] Completely prevalidate every active frame into a bounded null sink before ANY `repository/` write:
   paths, entry types, ownership/class, file/parent conflicts and portable-equivalent spelling collisions.
   Admit only HEAD, ORIG_HEAD, FETCH_HEAD, packed-refs, refs and descendants, logs and descendants in their

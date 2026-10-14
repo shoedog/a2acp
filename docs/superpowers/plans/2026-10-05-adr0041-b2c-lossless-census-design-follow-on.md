@@ -1,0 +1,32 @@
+# ADR-0041 B2c lossless-unit identity and RED custody design follow-on proposal
+
+Status: lossless design1/1 READY/runtime repair complete/e32 focused353/SIXPASS5215+5226/13ignores each. NEW source1/2 and2/2REJECT1W2S1block/CLOSED, capTWO exhausted/counts1→1. Source1 stale directives mechanism-closed; source2 sole L10 prefix fixed by actualSonnet51389 COMPLETE15models, exact onebyte8→b, clean9e3d206b/all6Rustunchanged/hygiene/diffPASS/fullcustody. Concrete bounded source3/3 proposal prepared/validated but UNADMITTED/owner decision pending; no approval/adoption/native/whole-G. Immutable e32 receipts source-equal, no suite/audit replay; old rejected caps unchanged. Roadmap sole cursor.
+
+Candidate `fa9c80b849295cdaf6b2c6cd4df6b10a3761969d`, parent `de4164dffdc786080083a8bc55dc3e6620aab474`, whole-B2c base `dc0b45bafd3538c93fe15254bd9f975ad34f4c71`, quarantine `/Users/wesleyjinks/code/.a2a-implement/impl-70428-q52t65ks`. Read the [actual final review](../reviews/2026-10-05-adr0041-slice2b3b-b2c-design-follow-on-round2.md). The earlier six mechanisms and all three parent C/D/R WRONGs are mechanism-closed; preserve their tests and every rejected checkpoint.
+
+The owner convergence instruction at `/Users/wesleyjinks/.codex/AGENTS.md:13` says: “if findings are open-class (each round surfaces new instances of the same kind), park and escalate to spec or design.” Runtime work is parked. The old source4 cap and this two-round follow-on cap remain exhausted and unchanged.
+
+## Concrete new population
+
+| Input/state | Incorrect result | Bounded design direction |
+|---|---|---|
+| Final routed child removes HEAD and ORIG_HEAD, adds raw byte names `ff` and `fe`, and fails; total entries stay constant | Both names render as the same replacement character. C `done`/`entry_stats`/`seen` use that string, so the second raw entry is never attempted and only one Unexpected is retained | Lossless identity for every census unit and membership key; diagnostic rendering must never determine progress, cache membership or expected-entry matching |
+| The owned handoff's RED1/RED2 test hash cells both contain production hash `07ea98db…` | A successor binds test evidence to bytes that were never the tests | Correct RED1 to `14b26cdd02912f7303c6a48af6f97af09081f9702fd8f17ad2952815b1d4c0e4` and RED2 to `43578c1b73c87007489b2d1f5b114da3ed33c177724c1737f675b162ed6ce239`, using the cited path-bound manifests; preserve old inaccurate checkpoint bytes |
+
+Enumerate the complete finite identity population BEFORE another source edit: Git child keys, repository child keys, directory fstat/list keys, `seen`, `entry_stats`, `opened`, `done`, expected file/directory membership and missing-entry checks, facts used by comparison, namespace/sentinel separation, and conversion boundaries. Distinguish retained expected UTF-8 names from arbitrary names returned by the filesystem. Inspect both invalid/invalid aliases and invalid/valid UTF-8 aliases (including literal U+FFFD), raw names under different parents, repository siblings outside .git, and regular/link/special classifications. Do not fix just the single `done` lookup. Never descend unexpected entries.
+
+A suitable private representation may use raw relative byte paths with an explicit repository/Git namespace, or an equivalent injective typed key. The design pass must choose and justify it from actual source; lossy strings stay diagnostic only. Preserve byte-sorted observation order and existing refusal/composition behavior. The test-only device/listing bookkeeping SMELL has no release trigger and is nonblocking: explicitly defer it or specify a bounded same-scope treatment without manufacturing a production WRONG. Preserve historical tests-first debt; it cannot be repaired retroactively.
+
+## Proposed serial lane and caps
+
+Owner authorized ONE hard-read-only Sol/xhigh design pass (cap1/1) on the exact candidate. Its deliverables are a full identity/membership boundary table, safe namespace and conversion rules, finite failure/continuation semantics, and a tests-first implementation plan. No edits/builds/tests/network/providers/nested agents inside that design pass. READY is conditional on no runner/API/codec/dependency/PassA/capsule/ledger/pin/closing/entryguard/staged-rewind widening and no new filesystem primitive.
+
+The owner authorized the full conditional follow-on. If that design is READY without widening: actual `claude-sonnet-5-5` implements on the SAME retained Tier3 quarantine, owning ONLY `custody_restore_git.rs`, `custody_restore_git_tests.rs`, and the implementation handoff. Declare a NEW TWO-round independent Sol source cap before dispatch; it is a separately authorized design follow-on, not a reset of either exhausted cap. At its cap classify before acting; no silent extension or restart. A new contract/primitive/ownership requirement returns to the owner.
+
+Tests FIRST: capture real runtime RED against immutable fa9c80b8 for the count-preserving raw aliases, missing/chain aftermath, independent per-raw-name attempts, and negative controls. Add only the finite family the identity table establishes, preserving all350 previous focused names. Document late epochs honestly. For the handoff correction use a small one-time read-only consistency check against its two retained manifests; do not make CI depend on private .git evidence or add a recurring audit. The implementation's focused suite and ordinary six final-byte gates remain required before independent source review; no broad historical matrix replay.
+
+## Exclusions and retained evidence
+
+The expensive deep mutation/controller audit stays out of routine CI/CD and is skipped for unchanged-area increments. Scope any optional new causal check to changed lossless C keys and provenance only; do not replay132/190/16, the previous six variants or the completed four variants. No cleanup, operator/pin/ACP promotion, provider fallback, fresh artifact, source adoption, native execution, public PR or automatic merge is authorized by this proposal.
+
+Exact fa9c80b8 receipts remain valid evidence, not source approval: focused350/0/0; scoped3causal+neutral+2controls/9tests; all6gatesPASS, alltargets5212/0/13, default/doctests5223/0/13. They do not cover the new alias defect or incorrect hash row. All raw/context/transcript/immutable files are retained. Native macOS/ext4, aggregate, combined base251..final review and concrete PR remain behind eventual B2c approval.

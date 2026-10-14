@@ -30,7 +30,7 @@ use crate::custody_capsule::{
     CustodyEnvelopeSourceDescriptorV1, CustodyEnvelopeSourceValidatorV1,
     CustodyEnvelopeStreamLimitsV1, CustodyEnvelopeStreamReceiptV1, CustodyRestorePolicyV1,
 };
-use crate::custody_export::{preflight_scratch_root, ScratchLedgerV1};
+use crate::custody_export::{preflight_scratch_root, ScratchLedgerV1, ENTRY_ALLOWANCE_BYTES_V1};
 use crate::custody_frame::{
     CustodyFrameBudgetV1, CustodyFrameDecoderV1, CustodyFrameEntryV1, CustodyFrameHeaderV1,
 };
@@ -818,9 +818,21 @@ fn create_staging_directory(
         .borrow_mut()
         .reserve_entries(1)
         .map_err(|error| CustodyRestoreErrorV1::Budget(error.to_string()))?;
-    let created = parent
+    let created = match parent
         .create_new_child_directory(OsStr::from_bytes(leaf), "custody restore staging directory")
-        .map_err(|error| staging_refusal(error, name))?;
+    {
+        Ok(created) => created,
+        Err(error) => {
+            // `create_new_child_directory` returns `TargetExists` only where its own `mkdirat`
+            // answered `EEXIST`, before it created anything, so the one entry reserved above is
+            // released and nothing else is. Every other error may follow a successful `mkdirat`
+            // (a failed open, identity, or ownership guard), so it keeps its charge.
+            if matches!(error, FsCustodyError::TargetExists(_)) {
+                ledger.borrow_mut().release(ENTRY_ALLOWANCE_BYTES_V1);
+            }
+            return Err(staging_refusal(error, name));
+        }
+    };
     let observed = created
         .current_metadata("custody restore staging directory")
         .map_err(|error| CustodyRestoreErrorV1::Io(error.to_string()))?
@@ -1327,6 +1339,15 @@ fn sha256_hex(bytes: &[u8; 32]) -> Sha256HexV1 {
     Sha256HexV1::parse(value).expect("a SHA-256 digest renders as 64 lower-hex bytes")
 }
 
+// 2B3b pass A: the isolated Git object bootstrap. A child module, so it reaches the reader's
+// private pins and ledger without widening any of them.
+#[path = "custody_restore_git.rs"]
+mod git;
+
 #[cfg(test)]
 #[path = "custody_restore_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "custody_restore_git_tests.rs"]
+mod git_tests;

@@ -29,10 +29,14 @@
       act through the retained pins.
   - **2B3b:** the draft task is `docs/superpowers/plans/2026-09-29-adr0041-slice2b3b-git-plane-task.md`.
     Sol/xhigh spec round 1 rejected four bounded findings; revision 2 received **APPROVE** in round 2/2
-    (zero WRONG, two nonblocking SMELLs). Both clarity/regression recommendations are folded. Next is
-    two serial bounded Sonnet 5.5 passes through the bridge: isolated object bootstrap, then final Git
-    metadata/closure and the combined phase-G proof. Both retain the approved full task contract; 2B3b
-    remains incomplete until both pass and the combined change is reviewed. This follows the
+    (zero WRONG, two nonblocking SMELLs). Both clarity/regression recommendations are folded.
+    Isolated object bootstrap now has independent source approval. Remaining work is split before
+    dispatch into B1a frame prevalidation, B1b pure refs/config, B2a object copies, B2b metadata, and B2c
+    final closure/result, each capped at two source-review rounds. Remaining-task spec1/2 rejected one
+    missing Empty-HEAD rule and two nonblocking scope/structural-test concerns. The owner chose typed
+    pre-repository refusal for Empty refs; complete G requires captured refs with exactly one valid HEAD.
+    Pass A remains unchanged. These refinements received independent remaining-task spec2/2 APPROVE0/0/0. 2B3b
+    remains incomplete until all increments and native/combined gates pass. This follows the
     owner's 2026-09-29 direction. The owner approved isolated Git bootstrap under `.restore-work/` to preserve
     create-new HEAD/config restoration, and explicit caller-selected format provenance for empty objects.
     A container smoke returned Sonnet 5.5's PONG but failed cleanup; the owner requires repair and independent
@@ -40,7 +44,369 @@
     defect at cap 2; one disclosed extension on the same artifact received **APPROVE** in round 3/3 at
     `434905a2`, zero WRONG/SMELL/blockers. Full Linux and macOS suites pass on the final source; the cached
     base control and sandbox-refused host probes are excluded from evidence, and a fresh base control passes.
-    Cleanup is published in PR #128; CI/landing precedes Git-plane dispatch. The controller handoff records exact state.
+    Cleanup PR #128 is merged at `251289fe` after all five CI checks passed. The rebuilt release and private
+    ACP/model preflights are ready. Git passA was refused before provider startup by D-4 storage admission
+    (29.2 GiB free versus 50 GiB); the owner then approved a 20 GiB floor only for this isolated lane.
+    The [cleanup audit](superpowers/reviews/2026-09-30-a2a-bridge-cleanup-audit.md) initially identified 15.8 GiB
+    in old builds plus about4 GiB in root incremental. Owner-approved cleanup removed three remaining targets
+    totaling 4.236 GiB; root incremental was already absent. Free space is now236 GiB, mostly observed before
+    this controller's deletion and not attributed to it. Worktrees, branches and evidence remain. PassA ran
+    in `impl-25228-mwz25w5c`, with Sonnet5.5 proven by its retained transcript. Its first committed candidate was
+    `b1b78d426f1e662128133f08f5e64940370d42d3`. Worker Linux receipts report 4922 all-target and4933
+    default/doctest passes, zero failures and13 ignored in each; the bridge's five verification commands
+    passed; Sol round1/2 rejected three bounded WRONGs (stale final object digests, failed-child accounting,
+    and permissive index-pack output) plus one nonblocking descriptor-offset SMELL. Sonnet repaired the same
+    artifact; refreshed worker evidence has110 mutation rows,107 flipped and3 bounded equivalence notes,
+    with receipt limits recorded in the controller handoff. The repair is committed at `3888ef5c`; worker
+    full suites report 4927 all-target and4938 default/doctest passes, zero failures and13 ignored each,
+    with61 new Git tests and matching final hashes. Bridge verification passed, but Sol review2/2 rejected
+    two recurring-class blockers: uncharged actual child entries and permissive verify-pack/fsck output.
+    At cap2 the controller classified OPEN CLASS and parked implementation on the retained artifact;
+    read-only Sol design audit cap1/1 completed with a CLOSED POPULATION of5 WRONG/2 nonblocking SMELL,
+    recorded in the [design audit receipt](superpowers/reviews/2026-10-01-adr0041-slice2b3b-pass-a-design-audit.md).
+    The master is sufficient; the [corrective specification](superpowers/reviews/2026-10-01-adr0041-slice2b3b-corrective-spec-review.md)
+    was approved by Sol in round1/2 with zero findings. One targeted Sonnet5.5 repair and cumulative
+    source review3/3 were disclosed on the same retained artifact. The accepted Sonnet5.5 repair reached
+    its two-hour policy cutoff, with source/evidence retained and no provider replay. Controller normal Cargo
+    gates pass4952 all-target/4963 default-doctests,0failed/13ignored each, no exclusions and matching hashes.
+    All37 final-source mutations now build/select86/flip with restored hashes (A17/A19 structural-only).
+    Sol cumulative source review3/3 of clean cab8661f REJECTED one bounded WRONG (read-only same-inode/
+    same-length metadata/content effects evade baseline) and one nonblockingSMELL (unsafe FIFO fixture),
+    CLOSED POPULATION. Earlier source findings are closed; controller disclosed a targeted Sonnet repair
+    and final cumulative source review4/4 on the same artifact. Round4 repair completed at clean e6d866fa;
+    worker full suites pass4959 all-target/4970 default-doctests,0failed/13ignored each, no exclusions,
+    with93 Git tests and11/11 new mutations. Three seam-dependent tests lack base RED; post-child digest
+    has no deadline, an exception not approved by the controller. Final Sol review4/4 completed
+    **REJECT**, WRONG3/SMELL0/blockers3, CLOSED POPULATION: digest descriptor/census identity mismatch,
+    post-child deadline escape, and mixed fsck output misclassification. The
+    [round4 receipt](superpowers/reviews/2026-10-01-adr0041-slice2b3b-cumulative-review-round4.md)
+    records the exact three-item repair. Counts3→2→1→3 no longer converge; the declared final cap is
+    exhausted, and implementation was parked. The owner explicitly approved one targeted same-artifact
+    Sonnet5.5 repair plus cumulative Sol review5/5. That repair completed on e6d866fa, with exact mounted
+    inputs and normal Cargo cache transport; no master deadline exception. Worker Git-module GREEN
+    passes100/100, with all93 inherited test names preserved; valid base RED and separately labeled
+    seam-only evidence retained. Frozen source80f88e89 and completed receipts have second copies;
+    all13 mutation rows build/flip/restore, unmutated13-test control passes. Full final-byte suites pass
+    4966alltargets/4977defaultdoctests,0failed/13ignored each/no exclusions; fmt/clippy/build/hygiene pass.
+    Clean candidate b3aa6afd received cumulative Sol source review5/5 **REJECT**, WRONG1/SMELL0/blockers1,
+    CLOSED POPULATION. Descriptor/parser/direct-digest repairs are closed, but final census/rehash/chain
+    sweeps can still cross the original deadline and return success. The
+    [round5 report](superpowers/reviews/2026-10-01-adr0041-slice2b3b-cumulative-review-round5.md)
+    records the exact bounded repair; no deadline exception approved. Counts3→1 converge, but the
+    owner-approved5/5 cap is exhausted. Owner then explicitly authorized another targeted repair and
+    cumulative source review6/6. Sonnet5.5 repaired the SAME quarantine, taskef45bb94,
+    session56776, execution exec-57b25cef7aa29dd8bb2a2025f8a16dda; the two-hour policy ended its
+    full-test run, with cleanup complete and exact container absent. Pristine-base RED5 failures/1 control,
+    main20 plus supplementary5 mutation builds/restores have bound raw receipts; main-control18/18 cached,
+    supplementary19/19 recompiled. R6-M1's overbroad prediction is qualified by overlapping guards;
+    combined-removal variant flips all9 predicted rows. Controller provider-free full gates session64373
+    pass fmt/clippy/build and full alltargets4978/0/13 in90groups,112 Git tests/core recompiled;
+    default/doctests4989/0/13 in106groups,112 Git tests; all runtime hashes before==after==live.
+    Final-handoff hygiene PASS; clean candidate e4e6dac7 retains cumulative parent251 and rejectedb3 ref.
+    Complete source/evidence/transcript/checkpoint have second copies. Cumulative hardRO Sol6/6
+    session49293 completed, exec-b5fd123a664fd41f8934399eb63443de: **APPROVE**, WRONG0/SMELL0/blockers0,
+    round6/6, NO FINDINGS. The [round6 receipt](superpowers/reviews/2026-10-02-adr0041-slice2b3b-cumulative-review-round6.md)
+    binds sole-success deadline closure and every earlier contract. Exact five reviewed paths adopted
+    onto the controller branch; original Rejected checkpoint remains unchanged.
+    Frozen sourcec2fc2f2f preserved. No deadline exception. All original cap records,
+    rejected source/checkpoints/evidence remain; no restart.
+    Git bootstrap is locally adopted at2d8a8fb4 with independent source approval.
+    [Remaining spec1/2](superpowers/reviews/2026-10-02-adr0041-slice2b3b-remaining-spec-round1.md)
+    is REJECT1WRONG/2SMELL/1blocker, CLOSED POPULATION. Owner refinement and five task drafts
+    received [final spec2/2 approval](superpowers/reviews/2026-10-02-adr0041-slice2b3b-remaining-spec-round2.md),
+    WRONG0/SMELL0/blockers0, NO FINDINGS, at4083da5e. Original two-pass drafts remain historical, not dispatchable.
+    B1a dispatched through `implement --lang rust` from clean53373e68 into
+    `impl-94034-sqrswpnj`, tool session63748, declared source cap2. Actual provider transcript
+    confirms `claude-sonnet-5-5`. Worker same-environment base control140/0/0 includes112restore+28runner;
+    fresh focused restore suite143/0/0 preserves all112 inherited tests and adds31; the earlier142-test
+    source and raw run remain preserved separately. The first51-variant matrix completed:48 admissible,
+    46 predicted flips, two valid misses (M19/M27) and three invalid Cargo invocations (M03/M04/M05,
+    zero tests). Corrected M03/M04/M05 each recompiled and selected31 tests with exactly two expected
+    failures; the restored unmodified control recompiled and passed31/0/0. Controller independently
+    parsed all named raw receipts and saved second copies. Thus49 of51 usable variants triggered their
+    predictions. The next58-entry epoch (56variants/two controls) produced54predicted flips and two misses,
+    M19/M38c; those raw receipts remain preserved. Sonnet strengthened the digest length-prefix test,
+    retaining production D5 unchanged. Final test source E5 passed fresh143/0/0 with112 inherited names,
+    observed compilation, fmt and bridge-core clippy. Its final58-entry matrix completed55predicted flips
+    of56variants, with only M19 still needing qualification; M27/M38c now flip. Both unmodified controls
+    recompiled and passed34/0/0. Controller independently checked all58 raw receipts; source hashes
+    before==after==live D5/E5 at the completed-matrix observation. No blanket all-variants-flip claim.
+    TaskSHA99edc69b binds inherited tests. Worker full workspace gates completed06:00:42UTC:
+    alltargets5009/0/13 in90groups (core recompiled) and default/doctests5020/0/13 in106groups
+    (core cached); both retain143Git/112inherited tests. No exclusions beyond13ignored. Formatting,
+    workspace clippy all-targets/all-features, locked build and hygiene pass, with four runtime hashes
+    before==after==live. Controller parsed and snapshotted complete raw gates. The bridge also passed
+    its five mandatory verification gates. [B1a source review1/2](superpowers/reviews/2026-10-02-adr0041-slice2b3b-b1a-source-round1.md)
+    completed APPROVE0WRONG/0SMELL/0blockers, NO FINDINGS, on clean3dc5533a. M19 is closed by decoder
+    poisoning mechanism, not behavioral RED. Trailing CAP/memory metadata caused automatic Inconclusive;
+    original LoopStopped checkpoint remains unchanged. Exact reviewed files were operator-adopted
+    at d49a30af after predecessor-file equality proofs; no forced merge, forged approval or review replay.
+    B1b completed from cleanff0d873c through Sonnet5.5 in impl-45181-n4rk5zrn. Sol1/2 rejected
+    one WRONG (shadowed packed refs wrongly required stale inventory targets). Same-artifact repair
+    at9a9f97ba received [Sol2/2 APPROVE0WRONG/1SMELL/0blockers](superpowers/reviews/2026-10-02-adr0041-slice2b3b-b1b-source-round2.md),
+    CLOSED POPULATION, and automatic bridge Approved. Exact four reviewed files were adopted0b4e28ab.
+    Final full alltargets5060/0/13 (90groups) and default/doctests5071/0/13 (106groups/16docgroups),
+    all192Git tests; fmt/clippy/build/hygiene pass, source before==after==live. Controller parsed
+    complete final raw receipts after review; Sol saw final bridge PASS but detailed host logs only
+    for round1. Focused198/0/0; untouchedbase147/0/0. Matrix132variants+2controls:127 behavioral
+    failures,5 disclosed no-flips; F04 stale prediction and corrected same-source rerun both retained.
+    All changed variants rebuilt/restored; first control cached, last rebuilt, both55/0/0. Source,
+    transcripts, checkpoints, old/new raw matrices and gate bundles have second copies.
+    Remaining provenance SMELL: stale source comment reserved for Sonnet B2a; operator adoption
+    corrects old commit counts/tests-first wording. Seal structural RED reconstructed after accessors.
+    B2a create-new object store dispatched from cleanbbf4a2bf into impl-9452-ybd5v28a/session88111,
+    actualclaude-sonnet-5-5; taskcd3cabf5/config7774d187/sourcecap2. Privatefloor20GiB uses prior
+    owner isolated-lane authorization;27/27doctor green, free33.77GiB. Untouchedbase198 control
+    passed198/0/0 with exact192Git+6seal names/source hashes and actual normal core rebuild. Raw
+    baseline second copies retained. Structural RED and first23/3/0 behavioral run preserved; broader
+    focused run passed228/0/0 (222Git+6seal), retaining all198 baseline names; matching before/after
+    source hashes, core cached. Rejected candidate58e165a7 retains final228/0/0 and a restored
+    90variant+2control matrix:82 behavioral flips,2 structural-only sync flips,6 disclosed non-flips;
+    raw population and all90 mutated digests independently checked against immutable candidate bytes.
+    Six bridge gates pass; alltargets5090/0/13,90groups/core rebuilt; default5101/0/13,
+    106groups/16docgroups/core cached. Solsource1/2REJECT2WRONG1SMELL2block CLOSED:
+    partial write underreports progress; slow nonfinal gate/read/sync permits post-deadline effects.
+    Sonnet repaired the same artifact within declaredcap2; clean candidate110681c0 passed all six bridge gates: alltargets5094/0/13,
+    default5105/0/13. Solsource2/2REJECT1WRONG0SMELL1block CLOSED: three I/O
+    retry/continuation loops lack original-deadline guards. Converging targeted extension
+    source3/3 disclosed; SAME artifact, original LoopStopped/Rejected checkpoint retained.
+    TargetedSonnet5.5 repair finished session79469/completed, actualclaude-sonnet-5-5 only.
+    Exact3stagedfiles committed as cleancandidate88acb02e(parent110); originalRejectedcheckpoint
+    bytepreserved. Exact three files subsequently adopted atc8eb2910 after actual Sol3/3 approval.97filecompleteworker secondcustody retained.
+    New28/28doctor/modelchecks pass; private20GiBfloor unchanged.
+    Corrected seam-onlyRED36/4/0 and repaired40/0/0(corecompiled) retained. Round3matrix
+    complete17rows:15actualbehavioralflips(12production+2testseams+1wholedefectivecontrol),
+    controls40/0/0; all15mutateddigests/five-source restoration independentlychecked.
+    Finalfocused238/0/0/corecompiled retainsall198baseline and232predecessor names;
+    five-source hashes match before/after/live/matrixlaunch. ControllerLinux6gates session43190
+    complete on88acb02e: alltargets5100/0/13/core rebuilt; default5111/0/13/16docgroups/core cached;
+    fmt/workspaceclippyalltargetsallfeatures/build/hygienePASS, independently audited. Verifier absent.
+    Independent hard-read-only Solsource3/3 completed/session85270: APPROVE0WRONG0SMELL0blockers,
+    cap NO FINDINGS, raw82c532acf7bbf1fd30febdf1b5e0722f0771810c4aa98e2af3b484be1395acbb.
+    B2a adopted; B2b source0dadd17e inimpl-68504-mnvnlojn/session2436 completed/Approved2/2,
+    actualSol0WRONG2SMELL0blockers, raw377e56c9; exact three files adopted18ff5bea. Initial7d4dc87d
+    source1/2REJECT2W1S2block repaired same artifact: complete decoder drain and one hashed parse stream.
+    Final gates5149/0/13alltargets;5160/0/13default/16docs;fmt/clippyalltargetsallfeatures/build/hygienePASS,
+    full raw/source receipts independently audited after review. Focused287/0/0 retains238names,49newGit.
+    Matrix123variants+6controls:118behavioral failures,115allpredictionsmet,5nonflips; D03/C03/C12
+    wrongpredictions preserved. All123actual mutationdiffs independently reconstructed;808file secondcustody.
+    Reviewer receipt SMELL now reconciled; production-first process SMELL disclosed, enforce testsFIRST B2c.
+    SameSonnet5.5/Solxhigh/config7774d187/private20GiB; B2c dispatched fromdc0b45ba
+    intoimpl-70428-q52t65ks/session6053, warmdepscomplete, capTWO. Doctor27/27OK/free169.37GiB;
+    explicit untouched287 control/tests-only RED before production edits: control287/0/0/corecompiled,
+    all names independently matched and clone remained clean/five immutable-base hashes at15:15UTC,
+    source/raw/transcript secondcustody retained. TestsFIRST corrected structuralRED54errors on
+    unchangedproductionf0d8e9f8/testfd1ffb81 retained; initial draft duplicate-helper corrected, initialraw
+    overwritten but transcriptchronology preserved. Production added AFTER correctedRED. Initialfiltered
+    25test trial19/6 and subsequenttestfixture/scan corrections retained with evidence limits; current111variant
+    trial matrix complete111variants+6controls, eachcontrol33/0/0. No fullfocused/finalgates/approval.
+    Firstsetup rsync absence invalid beforemutations; corrected driver/spec/frozen source secondcopies retained.
+    Complete controller audit:97behavioral-failure variants,3structural-only,11nonflips,
+    25missed-prediction variants, no compile/time/population invalidity. All111mutated source digests
+    independently reconstructed. Nine rows contain captured failing child test output; auditor separates
+    primary33-test outcomes from embedded child outcomes and preserves the driver's mixed fields.
+    Full131file secondcustody retained; classification and final-byte gates remain pending.
+    Sonnet strengthened tests and wrote explicit prediction overrides; final132-variant matrix COMPLETE.
+    Launch Gitde910e03/testsdb671562/spec2dc47b7c4/driver37405ee1 hashes independently checked;
+    all6controls33/0/0. Separate12file launch custody and literal-only final auditor retained.
+    Complete audit132/132:117behavioral-failure variants,5structural-only,10nonflips,
+    Q01missed prediction retained, no invalid runs. All132mutated digests/fullraw independentlychecked;
+    five restored runtime sources match launch. Full285file completed custody; earlierhalfway snapshot preserved.
+    Final focused320/0/0/corecompiled completed and independently audited: all287inherited+33new names,
+    five-source before/after/launch/live match; other3runtime files matchimmutablebase. Elevenfile custody retained.
+    Sonnet argues Q01redundant with the next effect-preceding deadline guard; Sol must verify that claim.
+    First candidate4136310d committed clean atopdc0b45ba; exactly Git source/tests+handoff changed.
+    Complete319file source/worker/transcript custody retained. Allsix gates COMPLETE and independently
+    audited againstimmutable4136310d: fmt/workspaceclippyalltargetsallfeatures/build/hygienePASS;
+    alltargets5182/0/13/90groups/corecompiled, default5193/0/13/106groups/16docs/corecached.
+    Both suites retain314Git tests; full raw/commands/source-before-after/manifest hashes checked.
+    ActualSolsource1/2REJECT3WRONG2SMELL3blockers/CLOSED, gpt-5.6-sol/xhigh/read-only/
+    session01a1031c-fd16-7a10-a44b-e5f883ff26ca; raw2c706157 retained. Bounded defects: directory
+    non-atime metadata omitted fromzero-effect facts; expired failure digest misses same-length byteeffects;
+    pre-operation-only deadline guards permit continuationI/O after slowreturns. Same-artifact Sonnetrepair
+    andsource2/2 next; no reset/restart/adoption/native/whole-G claim. Tenfile rejected-source custody retained.
+    SameSonnet5.5 repair ACTIVE. Production edits preceded new regression construction; actual chronology
+    retained, no tests-FIRST repair claim. Require source-bound rejected413/seam-only413 behavioralRED,
+    keep reconstruction distinct. Initial existing33 trial had2guard-position failures; duplicate newlabel
+    fixed and2sequence rows reportedPASS. Reconstructed seam-only413 RED29/6 compiled/fullraw audited;
+    expanded36-test RED29/7 supplied summary has overlapping log writers/interleaved rows, not fullproof.
+    Repair trialspec3 COMPLETE190+6controls36/0/0 independently audited/secondcopies retained:
+    176runtime/instrumented-sequence flips,4source-structural,10nonflips, zero invalid runs.
+    Six predictionmisses C06/C07/M19SCAN,Q01/Q23/Q24HALT retained; D04/S03unexpectedflips.
+    Sonnet strengthens captured-onlyHALT/scan tests; spec4explicitreasons before newmutants.
+    Earliertrialnottransferred; oldepochcontrollerwatcher retired, provider/reviewcap2unchanged.
+    Spec4matrix COMPLETE190variants+6controls36/0/0; frozenGit0224d33a/tests95481b09/
+    spec4bb20fb16/driver187860f4 independently bound. 176runtime/instrumented-sequence flips,
+    4structural-only,10nonflips (9declared+Q01); Q01HALT miss/nonflip andQ21HALT miss/SLOW failure
+    retained. Q23HALT andQ24HALT/SLOW now fail; zero invalid runs. Full199-file custody hash-checked.
+    Newepoch explicitreasons, oldtrial retained. Owner scopes expensive deep audits to changes
+    affecting this area or its test evidence; skip unchanged-area slices and routine CI/CD.
+    Ordinary CI/tests/review remain; no recurring mutation matrix or receipt-audit CI job.
+    No repeat matrix merely for prediction calibration. Final reconstructed36-test RED25/11 compiled,
+    non-hook runtime tokens equalimmutable413; focused323/0/0. Candidate90130ed9 alltargets5185/0/13,
+    fmt/clippy/build/hygienePASS; default5195/1/13 on inheritedPassA clock fixture. Actual Solsource2/2
+    REJECT1WRONG2SMELL2blockers/CLOSED at90130ed9, raw236d6070/session01a10493. Unpaced
+    baseline/runner callbacks/success settlement remain; failing fixture uses an earlier asserted clock
+    than production, so no regression attribution without same-environment base control.
+    Disclosed converging extension3/3 on SAME artifact, no reset/restart. Prepared Sonnet task first
+    basecontrol/tests-FIRST, actual-Instant fixture, at most24 changed-guard variants, then focused/
+    controller sixgates/Sol3. Configvalid/doctor29OK; dispatched ONCE on SAME90130ed9, bridge89293/
+    execfe077842/attempt6d1cccf6; actualclaude-sonnet-5-5 transcript00e25b0d verified. Worker first
+    completed same-image basecontrol1/0/0 (private paths/load differ; no regression attribution),
+    tests-FIRST RED5/6 plus corrected haltingRED0/1, and repaired focused327/0/0 retaining all323
+    prior names. Five source hashes before/after match: Git05197a2b/tests f263b118. RED assertions
+    include runtime, fixture/order and structural failures; not six independent runtime defects.
+    Raw/source second copies in scratch/b2c-round3-red-focused-custody/. Sixteen targeted variants
+    COMPLETE below cap24:13 production runtime/instrumented failures,2 test-clock failures,1neutralpass;
+    six controls42/0/0, zero invalid/source-only variants. M13 structural prediction miss and M08/M09/M12
+    unexpected failures retained; no rerun. Tests-FIRST chronology verified; full worker secondcopy sealed.
+    Sonnet89293 completed/cleanup520ms; EXACT3paths committed clean c4c60a60, parent90130ed9.
+    Controller sixgates COMPLETE/PASS98230 on sourceRO/networknone/no credentials, observed imagefe3a644f.
+    Alltargets5189/0/13,90groups/321Git/corecompiled; default5200/0/13,106groups/16docgroups/corecached;
+    fmt/workspace all-feature clippy/build/hygienePASS. All raw/source independently checked unchanged.
+    Solsource3/3 COMPLETE/REJECT2WRONG1SMELL2blockers on c4c60a60; actual transcript01a10568
+    confirms gpt-5.6-sol/xhigh/read-only with on-request policy (not never). CLOSED POPULATION:
+    known timeout skips retained-chain/mount reconciliation; settlement-discovered timeout skips child
+    effect reconciliation. Shared bounded failure-only repair; historical chronology SMELL nonblocking.
+    [Exact source3 review](superpowers/reviews/2026-10-04-adr0041-slice2b3b-b2c-source-round3.md)
+    and rawSHA2df0e36f retained. Authorized targeted SAME-artifact source4/4 extension declared;
+    counts3→1→2 are not monotonic, no cap reset/restart. Changed-path mutation cap8; no132/190/16 replay.
+    Initial source4 refused container.mount.preflight before prompt acceptance, source unchanged.
+    Missing private Claude settings restored exactly; missing host ACP restored from retained lock into
+    fresh private directory. Recovered config7ad15132 valid/doctor29OK/catalog ready; correction retry1/1
+    admitted session79104/execec2414/attemptb8df30. Actual transcript ec2110cb confirms Sonnet5.5;
+    live container7acbf292 imagefe3a644f/network/mount/labels retained. SAME artifact; writer subsequently completed.
+    Tests-first RED on exact c4 production retained:13selected10/3,5selected2/3,8selected4/4;
+    corrected filter/test-row defects preserved. Completed raw/snapshots/transcript custody67files.
+    Changed-path variants predeclared:7causal+1neutral,11selectedtests, cap8; completed below.
+    Final focused330/0/0 preserves327names+3new; real rebuild/binary/source hashes independently checked.
+    Matrix8variants (7causal+1neutral),4controls11/0/0 complete; all seven actual runtime/instrumented
+    failures,0missed/0unexpected/0invalid, changed/restored hashes checked. Matrix freezes2 owned Rust
+    files; others from git archive c4. Complete worker/source/transcript/evidence custody retained.
+    Sonnet79104 completed/cleanup596ms; exact3paths committed clean4b941d4b032cbd652accd5fb18a59e0cb12d258a.
+    Controller sixgatesCOMPLETE51759 ONCE, verifierabe594b4 imagefe3/networknone/sourceRO/no credentials;
+    fmt/workspace all-feature clippy/buildPASS; alltargets5192/0/13,90groups/corecompiledPASS.
+    Default/doctests5203/0/13,106groups/16docgroups/corecached and hygienePASS; ALLSIX complete,
+    raw/commands/source hashes independently parsed, source unchanged. Verifier51759 completed.
+    Initial shortSHA guard refusal ran no command, corrected fullSHA; no runtime-gate replay.
+    Sol4/4 COMPLETE79300/execexecb12ded/attemptcc4b708 after allsixPASS. Actual transcript01a10918 confirms
+    gpt5.6sol/xhigh/read-only with on-request policy (not never). Actual final REJECT3WRONG1SMELL3blockers,
+    round4/4; OPEN CLASS at exhausted cap. Source3 WRONGs closed, but three new combinations hide owed
+    digest observations, dominant BinaryDrift, or later chain checks. B2c PARKED FOR SPEC/DESIGN under
+    owner convergence rule; no fifth round, restart, provider dispatch or adoption admitted.
+    [Exact source4 review](superpowers/reviews/2026-10-04-adr0041-slice2b3b-b2c-source-round4.md),
+    rawSHAae5964ee and immutable source/full transcript custody retained in b2c-source4-rejected-custody/.
+    [Prepared design escalation](superpowers/plans/2026-10-04-adr0041-b2c-reconciliation-design-escalation.md)
+    names all three constructs and the stage/completion/error-composition deliverables for owner decision.
+    Source4-era sessions complete. Owner APPROVED bounded design escalation, one pass cap1/1.
+    Sol designCOMPLETE54246/execa1ccce99/attemptd381b184, cleanup0ms, unchanged clean4b941d4b;
+    actual transcript01a10994 confirms5.6sol/xhigh/read-only/on-request (not never).
+    DESIGN READINESS: READY; finalSHAe932e69c and full immutable custody in b2c-design-completed-custody/.
+    [Complete design and controller qualification](superpowers/plans/2026-10-05-adr0041-b2c-reconciliation-design-result.md)
+    adds paced non-timeout settlement, per-entry exhaustive observation and finite Interrupted handling
+    to the original three combinations. Same3ownedfiles, retained-descriptor positioned reads,
+    eight tests-first regressions; proposed follow-on sourcecapTWO and mutation budget5causal+1neutral.
+    Root-LAST scoped to each gate/final closing region; separate observation phases retain original ordering.
+    Owner APPROVED expanded six-mechanism Sonnet5.5 same-artifact repair and new TWO-round source cap.
+    Repair1 COMPLETE59090/cleanup384ms/execa8955348/attempt2f14611f from clean4b941d4b; actual transcriptc54dfe24 only
+    claude-sonnet-5-5. Fresh live writerba44a7be imagefe3/network/mount custody retained; configdf84a5ef
+    valid/doctor29OK/catalog ready, storage142GiB. Input/source/model/container secondcopies preserved.
+    TestsFIRST before non-cfg(test) production, focused330+new/real rebuild; targeted5causal+1neutral
+    maximum. Controller commits exact3files after exit, runs six final-byte gates once, then Sol1/2.
+    No oldcap reset/source5/restart/adoption/suite or historical-matrix replay.
+    TestsFIRST RED1 COMPLETE22selected8/14/0; all8new regressions failed, plus old strengthened oracles
+    and source-order assertion (not14runtime-defect claim). Production0eb6f80f has cfg(test) read seam
+    only; tests4a7f0c77. Exact raw/source/script/names/binary/transcript custody8files retained; pre-edit
+    enumeration/baseline and partialRED separate. Earlier GREEN22trial21/1 failed source-order assertion;
+    kept, corrected before final focused. Post-production edge control’s old-production scratchRED separate.
+    Final focused341/0/0, all330oldnames+11new,1299.76s; fresh core rebuild observed. Raw/list/binarySHA
+    e66b4fa4/source-before-after-live-matrix07ea98db/abc7faa6 independently checked and secondcopied.
+    Small mutation6variants(5causal+neutral),23tests/row COMPLETE; all4controls/neutral23/0/0,
+    each causal has behavioral failures, every row core rebuilt. Original predictions unchanged:0missed,
+    1unexpected/nonflip V4/T8 (first-error digest break omits later Interrupted-control descriptors).
+    Last restored controls green; raw/spec/frozen hashes/independent check secondcustody28files retained.
+    Source-frozen2ownedfiles, other files gitarchive4b. Controller verified/staged exact3files and committed
+    clean de4164dffdc786080083a8bc55dc3e6620aab474 atop4b; completed worker custody79files retained.
+    Six final-byte gatesCOMPLETE91943: all6PASS, all-targets5203/0/13 (90groups/core compiled),
+    default-doctests5214/0/13 (106groups/16docgroups/cached core); fmt/clippy/build/hygienePASS.
+    Provider-free verifiere9061371 imagefe3/sourceRO/networknone/no credentials; complete immutable-source
+    raw/before-after independently parsed, missingnone. Actual Solfollow-on1/2COMPLETE59909/cleanup0/
+    execfb748674/attemptc1799be6, transcript01a10c9e actualgpt5.6sol/xhigh/read-only/on-request.
+    REJECT3WRONG1SMELL3block/CLOSED, finalSHAead11301; full22file raw/transcript/immutable source custody.
+    [Actual source review](superpowers/reviews/2026-10-05-adr0041-slice2b3b-b2c-design-follow-on-round1.md)
+    identifies partial Cboolean/replay, name-refusal settling retained D, compound staging R/duplicate prefixes.
+    Original six scenarios repaired; these three finite C/D/R defects require SAME-artifact Sonnet5.5 targeted
+    repair before admitted follow-on2/2. Same3paths and private scope, testsFIRST/current focused population,
+    maximum3causal+neutral scoped check, six new final-byte gates then source2/2. No cap reset or adoption.
+    Targeted SAME-artifact repair94528 COMPLETE/execea3fa9c5/attemptfd25931e fromde4164; actual transcript08734021
+    only claude-sonnet-5-5. Fresh writer86cc1c35/imagefe3/exactqRW/lockednetwork/caches8ac4RO bound.
+    Config54425b40 validated/doctor29OK/catalog; private settingsc900 unchanged/free124.87GiB, no deletion.
+    Input56bd422b/prompt155dd8bd/source/model/container secondcustody retained. Pre-edit full C/D/R
+    enumeration and testsFIRST required; final341+new focused and tiny3causal+neutral then controller
+    final6gates ONCE/actual Sol2/2. No source approval/native/whole-G or automatic merge.
+    Repair2 testsFIRST RED1COMPLETE15selected3/12/0,191.47s; six new runtime failures discriminate
+    three C/D/R defects, plus one structural and five changed old oracles (not12runtimebugs).
+    Exact before-after production07ea98db unchangedde4164, tests14b26cdd; actual RED-start binary checked.
+    Complete raw/source/script/list/compile/transcript secondcustody sealed; first missing test import compile
+    INVALID then corrected core rebuild; declaration16/9 wording preserved versus actual15=7new+8changed.
+    Pre-edit complete C/D/R enumeration/baseline retained, reviewer decisions flagged; finalfocused
+    now350/0/0 as below; tinycheck complete; writer94528 exited; sixgates complete/PASS; actual Sol2/2 COMPLETE REJECT/OPEN.
+    Repair2 corrected RED2 COMPLETE0/2/0 on unchangedde4164; late census table0/1/0 on exact old
+    production in scratch is reconstructed RED, added after production. First GREEN trial15/2/0 failed
+    two structural checks (retained); corrected before final350/0/0. Full
+    RED2/late/GREEN/transcript secondcustody30files and read-only binding retained; no tests replay.
+    Repair2 finalfocusedCOMPLETE350/0/0,1551.19s; all341prior+9new, exact source before-after/live,
+    fresh core build and actual binary4e15a02d independently bound. Full raw/source/rebuild/list
+    secondcustody retained. Late N8/N9 each reconstructedRED0/1/0 after production, not testsFIRST.
+    Tiny3causal+neutral/9tests/first-last controls COMPLETE; each causal8/1/0 exactly predicted,
+    neutral/2controls9/0/0. All6core rebuilt/mutated-restored/fullraw checked,0missed0unexpected0invalid;
+    declarations unchanged,28file secondcustody retained. No historical deep audit replay;
+    exact3 committed cleanfa9c80b849295cdaf6b2c6cd4df6b10a3761969d atopde4164. Complete worker custody
+    1425files, actual286model records allSonnet5.5; cleanup368ms. Six final-byte gates ONCE COMPLETE/PASS
+    verifier ef4d4751/imagefe3/networknone/sourceRO/no creds/cache8ac4 freshly bound. All6PASS: alltargets5212/0/13/90groups/corecompiled;
+    defaultdocs5223/0/13/106groups/16docs/corecached. Full raw/immutable source/before-after independently
+    parsed, complete/no missing; daemon interruption then recovered receipts, no gate rerun. Actual final
+    Solfollow-on2/2 COMPLETE9970/execa02ac2bc/attempt9dc2839f after6PASS; transcript01a10e62 confirms
+    gpt5.6sol/xhigh/read-only/exactq/on-request (not never). Fresh configb343 validated/doctor10OK/catalog;
+    input9faca854 and full context/source/evidence secondcustody retained. CapTWO exhausted: actual final REJECT2WRONG2SMELL2block/OPEN CLASS, raw877c999d;
+    cleanfa9c80b8 PARKED/unadopted. Full raw/transcript/immutable source secondcustody22files retained.
+    Raw-name aliases ff/fe collapse C-unit keys, losing an independent Unexpected; owned handoff
+    RED1/RED2 test hashes incorrectly repeat production07ea instead of14b26cdd/43578c1b. Parent three
+    WRONGs and six mechanisms closed; new C accounting instance makes classOPEN. Device anomaly and
+    process debt nonblocking. No third round/reset/restart; bounded lossless-key/custody design proposal
+    OWNER AUTHORIZED by “approved to exceed cap”; Sol design1/1 COMPLETE/READY session19019/actual transcript01a112b6 (5.6sol/xhigh/read-only), rawcf35c488. ActualSonnet5.5 repair34470 CANCELLED below20GiB after controller sequencing error; no owned edits, enumeration/baseline retained; owner now authorized broad repo builds/caches cleanup;13unusedbuilds removed, observedfree29.219GiB, served21200/07aee unchanged; guarded same-artifact Sonnet continuation20662 COMPLETE0/cleanup578ms,204actualSonnet5.5 records/transcript7f33b813; exact3 clean commit e32b7ca6e1d00c843170be5736faa994d1805344 atopfa9c80b8; NEW sourcecapTWO with1/2 admitted as below. ChronologicalRED3families0PASS3FAIL/21rows11causalcollisions+10greencontrols/0invalid on immutablefa18630569; actualcorebuild/binary9d024960/source/raw secondcustody, productionrepairbc834e38/firstGREEN3PASS21MATCHES; clippylint-only final-test retrospectiveRED recheck3FAIL11COLLISION+10controls/0invalid, exactepochsretained. Final353focusedPASS0FAIL0ignored/1876.45s/all350prior+3new/corebuilt/binary38b84120/raw53ca0f53; full131filewritercustody and22filefocusedcustody retained. SIXgatesONCE COMPLETE/PASS15017/ab273a0f/imagefe3/networknone/sourceRO/no creds/cache8ac4; fmt/clippy/build/hygienePASS, alltargets5215PASS0FAIL13ignored/90groups/corecompiled/rawdcba5815 and defaultdocs5226PASS0FAIL13ignored/106groups/16docs/corecached/rawaa523f85; allsource unchanged/fullraw independently parsed,347Git each. NEW actualSolsource1/2 COMPLETE0/cleanup0ms96087/exec-f5fa29bc/attempt754db2eb,5.6sol/xhigh/read-only/exactq/on-request: REJECT1WRONG2SMELL1blocker/CLOSED POPULATION; fullfinal96181a7f/fullcustody retained. Runtime alias defect mechanism-closed; sole stale living-handoff blocker gets same-artifact actualSonnet handoff-only correction COMPLETE0/cleanup288ms/143actualSonnet5.5 records, clean docs-only852e79afcf1fb26c4521eb0724edaa1fc94eebf7 atop e32/all6Rustunchanged/final one-time26PASS0FAIL. Checker v1 parser correction/retrospective v2 RED/partial-read qualifications retained. FINAL actualSol source2/2 COMPLETE0/cleanup0ms13280/exec-ccdd6cec/attempt06375f4f/transcript01a113ff (5.6sol/xhigh/read-only/exactq/on-request), REJECT1WRONG2SMELL1blocker/CLOSED POPULATION, fullactualfinal23dc0f0a/custody retained. Sole L10 testhashprefix74969e88 vs74969e8b newly introduced in handoff correction; prior stale directive mechanism-closed/other current bindings checked/runtime unchanged. NEW capTWO exhausted/counts1→1/no third source round admitted. SAME-artifact one-character correction actualSonnet51389 COMPLETE0/cleanup1407ms/15actualSonnet5.5 records, clean9e3d206bce0dc6b2131e7c81f2afd5559fd8aac4 atop852e79af. Verified exact onebyte8→b at40943/265827bytes, correctedhandoff4a75e47a/all6Rustunchanged/staged==working/hygiene/diffPASS/fullcustody. Concrete bounded source3/3 proposal/config/prompt/input prepared/validated but UNADMITTED/owner cap decision pending; no sourceapproval/adoption/native/whole-G. Preserve e32 source-equal receipts without repeat suites/audits. Writer context-read limitations and preliminary metadata corrections disclosed in controllerhandoff; baselineactualbinary retained in cancelled secondcopy. No auditreplay/adoption/native claim.
+    Conditional same-artifact Sonnet5.5/exact3 repair/new sourcecap2 only if READY without widening.
+    Native/aggregate/whole-G remain pending behind B2c approval.
+    **Owner decision 2026-10-13:** the one-byte L10 literal correction at clean `9e3d206b` is ACCEPTED on the
+    controller's mechanical proof (one byte changed, all Rust hashes unchanged); NO source3/3 review. B2c source
+    is approved for adoption on that basis. Next: adopt B2c onto this branch, native macOS + Linux/ext4 (CI) gates,
+    aggregate full gates, one combined `251..final` review, concrete PR. Custody note: the scratch root
+    `/private/tmp/adr0041-2b3b-20260929/` (raw receipts, transcripts, matrices, prepared source3 inputs) was found
+    deleted on 2026-10-13, probably by a reboot; the committed review receipts remain. `9e3d206b` is now held at
+    `refs/wip/adr0041-2b3b-b2c-candidate-9e3d206b` and, with this branch, in the bundle
+    `~/.a2a-dispatch/adr0041-2b3b-custody/adr0041-2b3b-20261013.bundle` (SHA-256 `9049b17d…dbeb7`).
+    Expensive deep audits stay out of routine CI/CD and skip unchanged-area slices; ordinary tests/review remain.
+    Prior sessions6053/22954/28614 complete. No adoption/native/whole-G claim. D07 actualSLOW+source-scan
+    failure means original structural-only annotation was wrong; R3 handoff corrects it, original raw retained.
+    Worker "132single-statement" wording overstates granularity; actual definitions include coupled
+    pairs/whole-step slices/test-only log hooks. Preserve exact variants, not132single-production-guard claim.
+    Earlier pre-checks used filtered output; complete final six-gate raw receipts now retained/audited.
+    Provider-free receipt observer22954
+    bounded24h/cacheRO/networknone copies completed gate logs as they appear; no duplicate suites.
+    Native and whole-G gates remain pending. Transientlowspace
+    recovered externally to84.8GiB beforedispatch; auditonly/no additionaldeletion. Finalfocused232/0/0 retains198inheritednames; matching
+    launch/before/after source c860bb3b/32ab0f8c, core cached. Final101variant+2control matrix:
+    94behavioral flips,2structural-onlyOSsync flips,5disclosednonflips; no missedpredictions/invalidruns.
+    All101mutated digests and rawpopulations independently checked; restoredlive/launch hashes agree.
+    First repair trial's F12miss retained; tightened test now yields realbehavioral failure. Raw source review is retained in
+    `2026-10-02-adr0041-slice2b3b-b2a-source-round1.md`; no B2a adoption/approval.
+    Later source snapshot caught intentional E03 mutation; retained as a variant, not frozen GREEN bytes.
+    First provider-free mirror83952 expired before any gate completed; Sol saw bridgePASS but no
+    detailed host receipts. Continuation mirror22710 copied all six exact58e165a7 bundles, now audited
+    after review;22710 ended0 at7200s with only that completedrevision. Continuation33595 ended0 after copying
+    both exactrevision6gatepopulations; all repaired110receipts independently audited.
+    Rawreview/source/checkpoint secondcopies in b2a-source-round2-rejected-custody/. No provider replay. B2b/B2c/native/combined remain pending.
+    The controller handoff records approved A and the bound serial tasks.
   **2B2b is complete:** all its children are merged. The parent Slice 2B completion gate (plan §8) still requires 2B3,
   the aggregate fixture without the source or its alternates, and one bounded review of the combined diff.
   - **Merged on 2026-09-26/27:**

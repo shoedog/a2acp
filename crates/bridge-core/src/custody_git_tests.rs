@@ -942,6 +942,7 @@ fn a5c_a5e_and_a5e_r_recheck_after_spawn_bind_and_audit_ancestors() {
 
 #[test]
 fn a5_route_rule_table_and_final_symlink_guard_are_discriminating() {
+    // Admission timing is not under test; leave headroom for route exec under suite load.
     let (_root_temp, root) = root_fixture();
     assert!(route_component_owner_is_trusted_for_test(42, 42));
     assert!(!route_component_owner_is_trusted_for_test(41, 42));
@@ -960,7 +961,7 @@ fn a5_route_rule_table_and_final_symlink_guard_are_discriminating() {
             .unwrap(),
             &root,
             &names(),
-            Instant::now() + Duration::from_secs(1),
+            Instant::now() + Duration::from_secs(30),
         ),
         Err(CustodyGitError::RouteRefusal(_))
     ));
@@ -1004,7 +1005,7 @@ fn a5_route_rule_table_and_final_symlink_guard_are_discriminating() {
                 .unwrap(),
                 &root,
                 &names(),
-                Instant::now() + Duration::from_secs(1),
+                Instant::now() + Duration::from_secs(30),
             ),
             Err(CustodyGitError::RouteRefusal(_))
         ));
@@ -1036,7 +1037,7 @@ fn a5_route_rule_table_and_final_symlink_guard_are_discriminating() {
             request(),
             &root,
             &names(),
-            Instant::now() + Duration::from_secs(1)
+            Instant::now() + Duration::from_secs(30)
         ),
         Err(CustodyGitError::RouteRefusal(_))
     ));
@@ -1045,7 +1046,7 @@ fn a5_route_rule_table_and_final_symlink_guard_are_discriminating() {
         request(),
         &root,
         &names(),
-        Instant::now() + Duration::from_secs(1)
+        Instant::now() + Duration::from_secs(30)
     ))
     .is_ok());
 }
@@ -1657,6 +1658,7 @@ fn a16_real_index_pack_then_verify_pack_uses_the_fixed_pack_namespace() {
 
 #[test]
 fn a5g_post_exit_rehash_a13_version_table_and_a17_profiles_are_enforced() {
+    // Admission timing is not under test; leave headroom for route exec under suite load.
     let (_root_temp, root) = root_fixture();
     let fixture = FixtureRoute::new(
         "#!/bin/sh\ncase \"$*\" in *version*) echo 'git version 2.54.0';; *) exec /bin/sh -c 'echo ready > ready; sleep .2';; esac\n",
@@ -1666,6 +1668,7 @@ fn a5g_post_exit_rehash_a13_version_table_and_a17_profiles_are_enforced() {
     let anchor = fixture.directory.path().to_path_buf();
     let ready = root.canonical_path().join("ready");
     let mutator = std::thread::spawn(move || {
+        // This only waits for the racer readiness marker, not an admission deadline.
         let limit = Instant::now() + Duration::from_secs(1);
         while !ready.exists() && Instant::now() < limit {
             std::thread::sleep(Duration::from_millis(2));
@@ -1723,7 +1726,7 @@ fn a5g_post_exit_rehash_a13_version_table_and_a17_profiles_are_enforced() {
                 .unwrap(),
                 &root,
                 &names(),
-                Instant::now() + Duration::from_secs(1),
+                Instant::now() + Duration::from_secs(30),
             )
         });
         assert_eq!(result.is_ok(), accepted, "{output}");
@@ -1739,7 +1742,7 @@ fn a5g_post_exit_rehash_a13_version_table_and_a17_profiles_are_enforced() {
             .unwrap(),
             &root,
             &names(),
-            Instant::now() + Duration::from_secs(1),
+            Instant::now() + Duration::from_secs(30),
         )),
         Err(CustodyGitError::UnsupportedVersion(_))
     ));
@@ -1752,7 +1755,7 @@ fn a5g_post_exit_rehash_a13_version_table_and_a17_profiles_are_enforced() {
         GitRouteRequestV1::production(fixture.path.clone(), git_digest(&fixture.path)).unwrap(),
         &root,
         &names(),
-        Instant::now() + Duration::from_secs(1),
+        Instant::now() + Duration::from_secs(30),
     ) {
         Err(CustodyGitError::RouteRefusal(message)) => assert!(
             !running_as_root_for_test() || message.contains("uid 0"),
@@ -1773,7 +1776,7 @@ fn a5g_post_exit_rehash_a13_version_table_and_a17_profiles_are_enforced() {
             .unwrap(),
             &root,
             &names(),
-            Instant::now() + Duration::from_secs(1),
+            Instant::now() + Duration::from_secs(30),
         ),
         Err(CustodyGitError::RouteRefusal(_))
     ));
