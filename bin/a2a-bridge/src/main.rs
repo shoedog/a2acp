@@ -9837,8 +9837,9 @@ async fn main() -> Result<(), BoxError> {
         }
     }
 
-    // 1. Observability — install tracing subscriber (idempotent).
-    bridge_observ::init();
+    // 1. Observability — install tracing subscriber (idempotent). serve-only default: WARN when
+    //    `RUST_LOG` is unset, so startup warnings (e.g. a failed model probe) reach the operator.
+    bridge_observ::init_serve();
 
     // 2. Configuration. `serve --config <path>` reads an EXPLICIT config (must already
     //    exist — an explicit path is a promise, so a missing one errors with an `init`
@@ -10116,12 +10117,14 @@ async fn main() -> Result<(), BoxError> {
         };
 
     // 7b. advertise-models: probe each agent's advertised model/effort/mode catalog HOST-SIDE before the
-    //     first card is served (bounded + degrade-per-agent; spec §5). Held behind an `ArcSwap` the card
-    //     reads lock-free; a `SIGHUP` handler (below) re-probes and atomically swaps it. The advertised
-    //     list is account/adapter-driven and sandbox-independent, so this never spins a container.
+    //     first card is served (bounded + degrade-per-agent; spec §5). Agents whose probe failed are
+    //     re-probed once after a short fixed delay, still before the listener binds. Held behind an
+    //     `ArcSwap` the card reads lock-free; a `SIGHUP` handler (below) re-probes and atomically swaps
+    //     it. The advertised list is account/adapter-driven and sandbox-independent, so this never spins
+    //     a container.
     let probe_cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/tmp"));
     let model_catalog = Arc::new(arc_swap::ArcSwap::from_pointee(
-        catalog_probe::probe_all(&probe_entries, &probe_cwd).await,
+        catalog_probe::probe_all_at_startup(&probe_entries, &probe_cwd).await,
     ));
 
     // Slice 0 warm sessions: share the live registry with the SessionManager and reap idle handles.
