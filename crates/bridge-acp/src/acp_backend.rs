@@ -36,7 +36,7 @@ use agent_client_protocol::{
 };
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use tokio::sync::{mpsc, oneshot, Mutex, Notify, OnceCell, OwnedMutexGuard};
+use tokio::sync::{mpsc, oneshot, watch, Mutex, Notify, OnceCell, OwnedMutexGuard};
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
 use crate::model_effort::{
@@ -1557,6 +1557,44 @@ struct TurnRoute {
     terminal_evidence: Option<Arc<dyn TerminalEvidenceSink>>,
 }
 
+/// The prompt turns live on one connection. A turn counts from before its route is admitted
+/// until its driver, once the turn has ended, has observed the agent process; a turn refused
+/// before its prompt is installed stops counting when it is refused. A liveness escalation
+/// that would cut other turns short waits on it before terminating the shared process.
+#[derive(Clone)]
+struct LiveTurns(Arc<watch::Sender<usize>>);
+
+impl Default for LiveTurns {
+    fn default() -> Self {
+        Self(Arc::new(watch::Sender::new(0)))
+    }
+}
+
+impl LiveTurns {
+    fn enter(&self) -> LiveTurn {
+        self.0.send_modify(|count| *count += 1);
+        LiveTurn(Arc::clone(&self.0))
+    }
+
+    fn count(&self) -> usize {
+        *self.0.borrow()
+    }
+
+    /// Resolves once no turn is live.
+    async fn drained(&self) {
+        let _ = self.0.subscribe().wait_for(|count| *count == 0).await;
+    }
+}
+
+/// One turn's count in [`LiveTurns`], released on drop.
+struct LiveTurn(Arc<watch::Sender<usize>>);
+
+impl Drop for LiveTurn {
+    fn drop(&mut self) {
+        self.0.send_modify(|count| *count -= 1);
+    }
+}
+
 struct TurnProgress {
     recorder: Arc<dyn AttemptRecorder>,
     message_advance: AtomicU64,
@@ -2103,14 +2141,20 @@ impl TurnWatch {
     }
 
     /// Re-check the bounds under the tracker lock; the cause by the fixed priority. The legacy
-    /// watchdog is checked only when `watchdog` is passed.
+    /// watchdog is checked when its own wake was reached (`legacy_woke`), and whenever the work
+    /// or silence cutoff is due: its wake was computed earlier, and a first activity since can
+    /// have brought its idle bound forward to this instant.
     fn due_cause(
         &self,
         watchdog: Option<&bridge_core::domain::WatchdogConfig>,
+        legacy_woke: bool,
     ) -> Option<TurnLivenessCauseV1> {
         let tracker = self.tracker();
-        let legacy_due = watchdog.is_some_and(|watchdog| self.legacy_due(watchdog));
-        tracker.due_cause(self.elapsed_ms(), legacy_due)
+        let now_ms = self.elapsed_ms();
+        let legacy_checked = legacy_woke || tracker.due_cause(now_ms, false).is_some();
+        let legacy_due =
+            legacy_checked && watchdog.is_some_and(|watchdog| self.legacy_due(watchdog));
+        tracker.due_cause(now_ms, legacy_due)
     }
 }
 
@@ -2135,8 +2179,9 @@ impl Drop for PendingPermissionGuard {
 /// Returns without firing once the driver drops `done`.
 ///
 /// The legacy watchdog keeps the wake schedule it had as its own task: its deadline is
-/// recomputed, and its bounds checked, only when that deadline is reached. A wake for the
-/// silence or work cutoff, or an unpause, never checks it early.
+/// recomputed only when that deadline is reached. An unpause, or a wake for the silence or work
+/// cutoff that is not yet due, never checks it early; a due cutoff checks it so that it keeps its
+/// priority at the same instant.
 fn spawn_turn_liveness_timer(
     watch: Arc<TurnWatch>,
     watchdog: Option<bridge_core::domain::WatchdogConfig>,
@@ -2164,12 +2209,11 @@ fn spawn_turn_liveness_timer(
             }
             let now = tokio::time::Instant::now();
             let legacy_woke = legacy_deadline.is_some_and(|deadline| now >= deadline);
-            let legacy = watchdog.as_ref().filter(|_| legacy_woke);
-            if let Some(cause) = watch.due_cause(legacy) {
+            if let Some(cause) = watch.due_cause(watchdog.as_ref(), legacy_woke) {
                 let _ = fired.send(cause);
                 return;
             }
-            if let Some(watchdog) = legacy {
+            if let Some(watchdog) = watchdog.as_ref().filter(|_| legacy_woke) {
                 legacy_deadline = Some(watch.legacy_deadline(watchdog));
             }
         }
@@ -2217,6 +2261,14 @@ enum PromptDriverFailure {
         cause: Option<String>,
     },
     DroppedStreamTimeout,
+}
+
+/// What ended a prompt driver's wait for the start of its stream to be recorded.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PromptDriverInterrupt {
+    Liveness(TurnLivenessCauseV1),
+    KillSwitch,
+    ConsumerClosed,
 }
 
 enum CancelSettle<T, E> {
@@ -2269,6 +2321,8 @@ struct AcpConn {
     /// BEFORE sending `session/prompt` and removes it once the turn ends.
     updates: UpdateRegistry,
     terminal_tombstones: EvidenceTombstones,
+    /// The prompt turns live on this connection.
+    live_turns: LiveTurns,
 }
 
 // ── Per-bridge-session agent state ───────────────────────────────────────────
@@ -3053,6 +3107,30 @@ async fn await_container_start(
         }
         tokio::time::sleep_until(std::cmp::min(deadline, now + CONTAINER_START_POLL_INTERVAL))
             .await;
+    }
+}
+
+/// Sample the bridge-owned ACP child without waiting. Once the bridge has terminated the process,
+/// the termination holds the child, and that reads `Unknown`, not `Exited`: the termination may
+/// still be in its grace or may have failed to reap the child, and this probe saw no exit status.
+/// The liveness is terminal evidence only and decides no outcome.
+fn owned_child_liveness(
+    supervised: &StdMutex<Option<OwnedProcessTreeV1>>,
+) -> bridge_core::terminal_evidence::AcpChildLiveness {
+    use bridge_core::terminal_evidence::AcpChildLiveness;
+    let Ok(mut supervised) = supervised.lock() else {
+        return AcpChildLiveness::Unknown;
+    };
+    let Some(mut child) = supervised
+        .as_mut()
+        .and_then(OwnedProcessTreeV1::try_child_mut)
+    else {
+        return AcpChildLiveness::Unknown;
+    };
+    match child.try_wait() {
+        Ok(None) => AcpChildLiveness::Live,
+        Ok(Some(_)) => AcpChildLiveness::Exited,
+        Err(_) => AcpChildLiveness::Unknown,
     }
 }
 
@@ -5099,6 +5177,7 @@ impl AcpBackend {
                 _shutdown: shutdown_tx,
                 updates,
                 terminal_tombstones,
+                live_turns: LiveTurns::default(),
             }),
             supervised: Arc::new(StdMutex::new(None)),
             stderr_ring: None,
@@ -6654,6 +6733,9 @@ impl AcpBackend {
     /// agent that ignores `session/cancel` — killing it closes the stdio pipes,
     /// which makes every in-flight `send_request` error out, so each driver
     /// surfaces `Err` and releases its turn lock (no caller hangs forever).
+    /// A silence or work cutoff therefore fences the connection and defers
+    /// the termination while another turn is live on it
+    /// ([`Self::fence_with_live_siblings`]).
     ///
     /// On the in-process `connect` test path `supervised` is `None`, so this is a
     /// no-op there (closing the duplex channel is the test's own concern).
@@ -6663,6 +6745,19 @@ impl AcpBackend {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         unavailable.store(true, Ordering::SeqCst);
+    }
+
+    /// Close the connection fence, then report whether a turn other than the caller's own is
+    /// still live. No prompt is installed once the fence is closed, so a turn counted here
+    /// either is already on the wire, and terminating the process would cut it short, or is
+    /// about to be refused.
+    fn fence_with_live_siblings(
+        dispatch_gate: &Arc<StdMutex<()>>,
+        unavailable: &Arc<AtomicBool>,
+        live_turns: &LiveTurns,
+    ) -> bool {
+        Self::close_connection_fence(dispatch_gate, unavailable);
+        live_turns.count() > 1
     }
 
     async fn escalate_terminate(
@@ -7364,11 +7459,12 @@ impl AcpBackend {
         // stream yields chunks then Done, in order).
         let (tx, rx) = mpsc::unbounded_channel::<TurnEvent>();
         let done_sender = tx.clone();
-        let (registry, cx, tombstones) = match self.conn.as_ref() {
+        let (registry, cx, tombstones, live_turns) = match self.conn.as_ref() {
             Some(conn) => (
                 Arc::clone(&conn.updates),
                 conn.cx.clone(),
                 Arc::clone(&conn.terminal_tombstones),
+                conn.live_turns.clone(),
             ),
             None => {
                 return Err(lifecycle
@@ -7464,6 +7560,9 @@ impl AcpBackend {
             activity: Arc::clone(&progress),
             terminal_evidence: terminal_state.clone(),
         };
+        // Counted before admission, so a liveness escalation that fences the connection sees
+        // this turn unless its prompt can no longer be installed (see `LiveTurns`).
+        let live_turn = live_turns.enter();
         let req = EvidenceAwarePromptRequest::new(
             Self::prompt_request(agent_id.clone(), &parts),
             evidence_binding,
@@ -7501,6 +7600,7 @@ impl AcpBackend {
         });
         let Some(prompt_fut) = admitted else {
             // Release won. Nothing was installed, and the key now mints afresh.
+            drop(live_turn);
             return Err(lifecycle
                 .failure(
                     DiagnosticPhase::PromptStart,
@@ -7525,6 +7625,7 @@ impl AcpBackend {
             if let Ok(mut slot) = entry.turn_kill.lock() {
                 *slot = None;
             }
+            drop(live_turn);
             return Err(lifecycle
                 .failure(
                     DiagnosticPhase::PromptStart,
@@ -7565,7 +7666,7 @@ impl AcpBackend {
         let turn_acceptance_for_driver = turn_acceptance;
         let grace = self.cancel_grace();
         let resolved_liveness = watch.resolved();
-        let (liveness_fired_tx, mut liveness_fired) = oneshot::channel::<TurnLivenessCauseV1>();
+        let (liveness_fired_tx, liveness_fired) = oneshot::channel::<TurnLivenessCauseV1>();
         let (liveness_done_tx, liveness_done_rx) = oneshot::channel::<()>();
         spawn_turn_liveness_timer(
             Arc::clone(&watch),
@@ -7594,17 +7695,17 @@ impl AcpBackend {
             // dispatch gate immediately before this task was spawned. Every
             // exit below is therefore post-barrier and fatal.
             tokio::pin!(prompt_fut);
-            let persistence_error = match lifecycle
-                .record(
-                    DiagnosticPhase::PromptStart,
-                    PhaseStatus::Completed,
-                    None,
-                    None,
-                    None,
-                )
-                .await
-            {
-                Ok(()) => lifecycle
+            let persistence = async {
+                lifecycle
+                    .record(
+                        DiagnosticPhase::PromptStart,
+                        PhaseStatus::Completed,
+                        None,
+                        None,
+                        None,
+                    )
+                    .await?;
+                lifecycle
                     .record(
                         DiagnosticPhase::PromptStream,
                         PhaseStatus::Started,
@@ -7613,8 +7714,26 @@ impl AcpBackend {
                         None,
                     )
                     .await
-                    .err(),
-                Err(error) => Some(error),
+            };
+            tokio::pin!(persistence);
+            let liveness = async {
+                match liveness_fired.await {
+                    Ok(cause) => cause,
+                    // The timer only drops its sender after the driver is past both selects.
+                    Err(_) => std::future::pending::<TurnLivenessCauseV1>().await,
+                }
+            };
+            tokio::pin!(liveness);
+            // Recording the start of the stream can wait on a durable observer, so a liveness
+            // bound, the kill switch or the consumer leaving also ends that wait, and the turn
+            // takes the path that signal owns below. The pending records are kept, not
+            // dropped, and finished before the terminal transition.
+            let (persistence_error, interrupt) = tokio::select! {
+                biased;
+                persisted = &mut persistence => (persisted.err(), None),
+                cause = &mut liveness => (None, Some(PromptDriverInterrupt::Liveness(cause))),
+                _ = kill.notified() => (None, Some(PromptDriverInterrupt::KillSwitch)),
+                _ = done_sender.closed() => (None, Some(PromptDriverInterrupt::ConsumerClosed)),
             };
             if let Some(error) = persistence_error {
                 // Work crossed the accepted-work barrier before persistence
@@ -7654,18 +7773,24 @@ impl AcpBackend {
                 let _ = done_sender.send(TurnEvent::Failed(error));
                 return;
             }
+            // Set when a silence or work cutoff fenced the connection but left terminating
+            // the shared process to this driver, once no other turn is live on it.
+            let mut escalation_deferred = false;
             let outcome: Result<_, PromptDriverFailure> = tokio::select! {
                 // BIASED: poll the arms in order so a `prompt_fut` that became ready in the SAME
                 // poll as a fired liveness bound ALWAYS wins (the natural completion is never
                 // relabeled a timeout). Without `biased`, tokio picks a ready arm at random.
                 biased;
                 outcome = &mut prompt_fut => outcome.map_err(PromptDriverFailure::Sdk),
-                _ = kill.notified() => Err(PromptDriverFailure::KillSwitch),
+                _ = async {
+                    if interrupt != Some(PromptDriverInterrupt::KillSwitch) {
+                        kill.notified().await;
+                    }
+                } => Err(PromptDriverFailure::KillSwitch),
                 fired = async {
-                    match (&mut liveness_fired).await {
-                        Ok(cause) => cause,
-                        // The timer only drops its sender after the driver is past this select.
-                        Err(_) => std::future::pending::<TurnLivenessCauseV1>().await,
+                    match interrupt {
+                        Some(PromptDriverInterrupt::Liveness(cause)) => cause,
+                        _ => (&mut liveness).await,
                     }
                 } => {
                     let _ = cx.send_notification(CancelNotification::new(
@@ -7682,15 +7807,30 @@ impl AcpBackend {
                             outcome.err().map(|error| error.to_string())
                         }
                         CancelSettle::KillSwitch => None,
+                        // The agent ignored the cancel. Terminating the shared process would
+                        // also end every other session's turn on it, so a silence or work
+                        // cutoff only fences the connection while another turn is live, and
+                        // terminates the process once the last one ends (below). The legacy
+                        // watchdog escalates at once, as it always has.
                         CancelSettle::GraceElapsed => {
-                            AcpBackend::escalate_terminate(
-                                &supervised_for_driver,
-                                &container_for_driver,
-                                &reaped_for_driver,
-                                &dispatch_gate_for_driver,
-                                &unavailable_for_driver,
-                            )
-                            .await;
+                            if fired != TurnLivenessCauseV1::LegacyWatchdog
+                                && AcpBackend::fence_with_live_siblings(
+                                    &dispatch_gate_for_driver,
+                                    &unavailable_for_driver,
+                                    &live_turns,
+                                )
+                            {
+                                escalation_deferred = true;
+                            } else {
+                                AcpBackend::escalate_terminate(
+                                    &supervised_for_driver,
+                                    &container_for_driver,
+                                    &reaped_for_driver,
+                                    &dispatch_gate_for_driver,
+                                    &unavailable_for_driver,
+                                )
+                                .await;
+                            }
                             None
                         }
                     };
@@ -7783,19 +7923,7 @@ impl AcpBackend {
             if let Ok(mut slot) = kill_slot.lock() {
                 *slot = None;
             }
-            let observed_child_liveness = supervised_for_driver
-                .lock()
-                .ok()
-                .and_then(|mut child| {
-                    child
-                        .as_mut()
-                        .map(|child| match child.child_mut().try_wait() {
-                            Ok(None) => bridge_core::terminal_evidence::AcpChildLiveness::Live,
-                            Ok(Some(_)) => bridge_core::terminal_evidence::AcpChildLiveness::Exited,
-                            Err(_) => bridge_core::terminal_evidence::AcpChildLiveness::Unknown,
-                        })
-                })
-                .unwrap_or(bridge_core::terminal_evidence::AcpChildLiveness::Unknown);
+            let observed_child_liveness = owned_child_liveness(&supervised_for_driver);
             if let Some(state) = terminal_state.as_ref() {
                 state.record_child_liveness(observed_child_liveness);
             }
@@ -7811,10 +7939,21 @@ impl AcpBackend {
                     advance,
                 );
             }
-            let event = match outcome {
+            // The turn stops counting as live only now: a deferred escalation must not
+            // terminate the process before this driver has observed it.
+            drop(live_turn);
+            // A turn that ended while the start of its stream was still being recorded
+            // finishes those records now, before its terminal transition. Their failure is
+            // the turn's terminal, as when they fail first.
+            let persistence_error = match interrupt {
+                Some(_) => persistence.as_mut().await.err(),
+                None => None,
+            };
+            let event = match (persistence_error, outcome) {
+                (Some(error), _) => TurnEvent::Failed(error),
                 // Turn COMPLETED (incl. a real StopReason::Cancelled, which maps
                 // to Done{"cancelled"} — NOT an error). Emit the mapped Done.
-                Ok(resp) => {
+                (None, Ok(resp)) => {
                     let _ = progress.recorder.record(
                         AttemptPhase::Adapter,
                         ActivityReason::ProducerTerminal,
@@ -7884,7 +8023,7 @@ impl AcpBackend {
                 // surface a terminal Err on the stream so downstream reports the
                 // inbound A2A caller `Failed` — never a silent Done{"unknown"}
                 // that reads as a clean `Completed`.
-                Err(failure) => {
+                (None, Err(failure)) => {
                     AcpTraceEvent::PromptFailed.emit();
                     let stderr = stderr_ring_for_driver.as_ref().and_then(|ring| {
                         stderr_cursor.map(|cursor| lifecycle.stderr_snapshot_since(ring, cursor))
@@ -8001,6 +8140,22 @@ impl AcpBackend {
             // If the consumer already dropped the stream this `send` is a no-op,
             // but the lock-release below is what matters there.
             let _ = done_sender.send(event);
+            if escalation_deferred {
+                // This turn is over and the fenced connection admits no new prompt, but
+                // other turns still run on the shared process. Release this turn, then
+                // terminate the process once the last of them has ended.
+                drop(_turn_acceptance);
+                drop(_turn);
+                live_turns.drained().await;
+                AcpBackend::escalate_terminate(
+                    &supervised_for_driver,
+                    &container_for_driver,
+                    &reaped_for_driver,
+                    &dispatch_gate_for_driver,
+                    &unavailable_for_driver,
+                )
+                .await;
+            }
             // `_turn` (the OwnedMutexGuard) drops here, releasing the turn lock.
         });
 
@@ -8105,18 +8260,7 @@ impl AgentBackend for AcpBackend {
     }
 
     fn bridge_owned_acp_child_liveness(&self) -> bridge_core::terminal_evidence::AcpChildLiveness {
-        let Ok(mut supervised) = self.supervised.lock() else {
-            return bridge_core::terminal_evidence::AcpChildLiveness::Unknown;
-        };
-        let Some(supervised) = supervised.as_mut() else {
-            return bridge_core::terminal_evidence::AcpChildLiveness::Unknown;
-        };
-        let liveness = match supervised.child_mut().try_wait() {
-            Ok(None) => bridge_core::terminal_evidence::AcpChildLiveness::Live,
-            Ok(Some(_)) => bridge_core::terminal_evidence::AcpChildLiveness::Exited,
-            Err(_) => bridge_core::terminal_evidence::AcpChildLiveness::Unknown,
-        };
-        liveness
+        owned_child_liveness(&self.supervised)
     }
 
     async fn configure_turn(&self, session: &SessionId, meta: TurnMeta) {
@@ -12061,6 +12205,8 @@ mod tests {
         OpenTool(String, ToolCallStatus),
         /// `session/update` with a `tool_call_update` for this raw id and status.
         ToolStatus(String, ToolCallStatus),
+        /// Park the turn for good, whatever arrives: an agent that ignores `session/cancel`.
+        Hang,
     }
 
     #[derive(Default)]
@@ -12128,6 +12274,10 @@ mod tests {
         /// Scripted `session/update`s the prompt handler emits (in order) BEFORE
         /// it returns the `PromptResponse`. Empty by default.
         prompt_updates: Arc<Mutex<Vec<ScriptedUpdate>>>,
+        /// Per agent session id, a script emitted instead of `prompt_updates`
+        /// for that session's turns, so sessions sharing one connection can
+        /// behave differently. Empty by default.
+        session_updates: Arc<Mutex<HashMap<String, Vec<ScriptedUpdate>>>>,
         /// The `StopReason` the prompt handler returns. `EndTurn` by default.
         stop_reason: Arc<Mutex<StopReason>>,
         /// Optional terminal `PromptResponse.usage` token totals.
@@ -12312,6 +12462,7 @@ mod tests {
                 fail_prompt: Arc::new(AtomicBool::new(false)),
                 prompt_error: Arc::new(Mutex::new(None)),
                 prompt_updates: Arc::new(Mutex::new(Vec::new())),
+                session_updates: Arc::new(Mutex::new(HashMap::new())),
                 stop_reason: Arc::new(Mutex::new(StopReason::EndTurn)),
                 terminal_usage: Arc::new(Mutex::new(None)),
                 wait_cancel_before_respond: Arc::new(AtomicBool::new(false)),
@@ -13138,7 +13289,12 @@ mod tests {
                                 // agent's connection to the client; a `SessionNotification`
                                 // is the wire `session/update`.
                                 let emit_updates = || async {
-                                    let updates = r2.prompt_updates.lock().await.clone();
+                                    let scripted =
+                                        r2.session_updates.lock().await.get(&*sid.0).cloned();
+                                    let updates = match scripted {
+                                        Some(updates) => updates,
+                                        None => r2.prompt_updates.lock().await.clone(),
+                                    };
                                     for u in updates {
                                         let update = match u {
                                             ScriptedUpdate::Text(t) => {
@@ -13196,6 +13352,7 @@ mod tests {
                                                     ToolCallUpdateFields::new().status(status),
                                                 ))
                                             }
+                                            ScriptedUpdate::Hang => std::future::pending().await,
                                         };
                                         cx2.send_notification(SessionNotification::new(
                                             sid.clone(),
@@ -17337,6 +17494,439 @@ mod tests {
         let (terminal, elapsed) = liveness_turn(&backend, "bridge-LV-TIE-WORK", None).await;
         assert_liveness_cutoff(&terminal, "acp.prompt.work_cutoff");
         assert_ended_at(elapsed, minutes(30));
+    }
+
+    /// I1 review round 1, finding 3: the timer cached the legacy wall clock as its legacy wake
+    /// before the first activity, which then brought the legacy idle bound forward to the same
+    /// instant as silence. The watchdog still comes first.
+    #[tokio::test(start_paused = true)]
+    async fn a_legacy_idle_bound_brought_forward_by_activity_keeps_its_priority() {
+        let rec = silent_after(
+            "agent-sess-LV-TIE-IDLE",
+            vec![
+                ScriptedUpdate::Delay(minutes(1)),
+                ScriptedUpdate::Text("started"),
+            ],
+        )
+        .await;
+        let backend = connect_recording_with(
+            rec,
+            AcpConfig {
+                watchdog: Some(bridge_core::domain::WatchdogConfig {
+                    idle_timeout: minutes(30),
+                    hard_wall_clock: minutes(120),
+                }),
+                ..liveness_config()
+            },
+        )
+        .await;
+
+        let (terminal, elapsed) = liveness_turn(&backend, "bridge-LV-TIE-IDLE", None).await;
+
+        assert_liveness_cutoff(&terminal, "acp.prompt.watchdog_timeout");
+        assert_ended_at(elapsed, minutes(31));
+    }
+
+    /// Holds the first record of one transition until released, and checks the transition
+    /// grammar of every record it lets through.
+    struct BlockOnTransition {
+        phase: DiagnosticPhase,
+        status: PhaseStatus,
+        blocked: AtomicBool,
+        entered: Notify,
+        release: Notify,
+        grammar: bridge_core::diagnostics::NoopDiagnosticObserver,
+    }
+
+    impl BlockOnTransition {
+        fn new(phase: DiagnosticPhase, status: PhaseStatus) -> Arc<Self> {
+            Arc::new(Self {
+                phase,
+                status,
+                blocked: AtomicBool::new(false),
+                entered: Notify::new(),
+                release: Notify::new(),
+                grammar: bridge_core::diagnostics::NoopDiagnosticObserver::default(),
+            })
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl DiagnosticObserver for BlockOnTransition {
+        async fn record(
+            &self,
+            event: bridge_core::diagnostics::DiagnosticEvent,
+        ) -> Result<(), BridgeError> {
+            let transition = event.transition();
+            if transition.phase() == self.phase
+                && transition.status() == self.status
+                && !self.blocked.swap(true, Ordering::SeqCst)
+            {
+                self.entered.notify_one();
+                self.release.notified().await;
+            }
+            self.grammar.record(event).await
+        }
+    }
+
+    /// The `Done` stop reason or the failure that ends `stream`.
+    async fn stream_terminal(stream: &mut BackendStream) -> Result<String, BridgeError> {
+        loop {
+            match stream.next().await {
+                Some(Ok(Update::Done { stop_reason, .. })) => break Ok(stop_reason),
+                Some(Ok(_)) => {}
+                Some(Err(error)) => break Err(error),
+                None => panic!("the turn ended without a terminal"),
+            }
+        }
+    }
+
+    /// I1 review round 1, finding 2: a cutoff that falls due while the start of the stream is
+    /// still being recorded cancels the turn at the cutoff. The held records are finished after
+    /// that, before the terminal transition.
+    #[tokio::test(start_paused = true)]
+    async fn a_cutoff_cancels_a_turn_whose_start_is_still_being_recorded() {
+        let rec = silent_after("agent-sess-LV-RECORDING", vec![]).await;
+        let backend = connect_recording_with(rec.clone(), liveness_config()).await;
+        let observer = BlockOnTransition::new(DiagnosticPhase::PromptStart, PhaseStatus::Completed);
+        let start = tokio::time::Instant::now();
+        let mut stream = backend
+            .prompt_with_observers(
+                &bkey("bridge-LV-RECORDING"),
+                vec![],
+                BackendObservers::diagnostic_only(observer.clone()),
+            )
+            .await
+            .unwrap();
+        tokio::time::timeout(minutes(1), observer.entered.notified())
+            .await
+            .expect("the driver must record the start of the stream");
+
+        tokio::time::timeout(minutes(31), rec.cancel_seen.notified())
+            .await
+            .expect("the silence cutoff must cancel the turn while its start is being recorded");
+        assert_ended_at(start.elapsed(), minutes(30));
+        assert_eq!(
+            rec.cancels.lock().await.as_slice(),
+            &["agent-sess-LV-RECORDING"]
+        );
+
+        observer.release.notify_one();
+        let terminal = stream_terminal(&mut stream).await;
+        assert_liveness_cutoff(&terminal, "acp.prompt.silence_cutoff");
+    }
+
+    /// I1 review round 1, finding 2, edge: a turn the agent has already finished completes when
+    /// its records are released just before the cutoff, and stays completed when the cutoff
+    /// falls due while they are still held.
+    #[tokio::test(start_paused = true)]
+    async fn a_finished_turn_whose_start_is_still_being_recorded_completes() {
+        for (minted_id, key, release_at) in [
+            (
+                "agent-sess-LV-RECORDED-EARLY",
+                "bridge-LV-RECORDED-EARLY",
+                minutes(30) - Duration::from_secs(1),
+            ),
+            (
+                "agent-sess-LV-RECORDED-LATE",
+                "bridge-LV-RECORDED-LATE",
+                minutes(31),
+            ),
+        ] {
+            let rec = ends_after(minted_id, vec![ScriptedUpdate::Delay(minutes(20))]).await;
+            let backend = connect_recording_with(rec.clone(), liveness_config()).await;
+            let observer =
+                BlockOnTransition::new(DiagnosticPhase::PromptStart, PhaseStatus::Completed);
+            let start = tokio::time::Instant::now();
+            let mut stream = backend
+                .prompt_with_observers(
+                    &bkey(key),
+                    vec![],
+                    BackendObservers::diagnostic_only(observer.clone()),
+                )
+                .await
+                .unwrap();
+
+            tokio::time::sleep_until(start + release_at).await;
+            observer.release.notify_one();
+            let terminal = stream_terminal(&mut stream).await;
+
+            assert_completed(&terminal);
+            assert_ended_at(start.elapsed(), release_at);
+            assert!(rec.cancels.lock().await.is_empty(), "{key}");
+        }
+    }
+
+    /// A container for `backend` whose reap is a no-op, so `backend.reaped` marks an
+    /// escalation on the in-process transport.
+    fn with_noop_container(backend: &mut AcpBackend) {
+        backend.container_reap = Some(ReapController::from_legacy(
+            "docker",
+            "a2a-ro-liveness",
+            Arc::new(|_runtime, _name| {}),
+        ));
+    }
+
+    /// I1 review round 1, finding 1: a turn whose agent ignores its silence or work cutoff's
+    /// cancel ends with its own failure, but the shared process is not terminated while another
+    /// session's turn runs a tool on it. The connection is fenced, so the timed-out session
+    /// accepts no new prompt; the sibling completes; then the process is terminated.
+    #[tokio::test(start_paused = true)]
+    async fn an_ignored_cutoff_cancel_defers_termination_while_a_sibling_turn_runs() {
+        use bridge_core::turn_liveness::{TurnLivenessRequestV1, TurnLivenessValueV1};
+        sibling_outlives_an_ignored_cutoff(
+            "agent-sess-LV-SIBLING-SILENT",
+            vec![ScriptedUpdate::Hang],
+            None,
+            "acp.prompt.silence_cutoff",
+        )
+        .await;
+        sibling_outlives_an_ignored_cutoff(
+            "agent-sess-LV-SIBLING-WORK",
+            vec![
+                ScriptedUpdate::OpenTool("hung".into(), ToolCallStatus::InProgress),
+                ScriptedUpdate::Hang,
+            ],
+            Some(liveness_meta(TurnLivenessRequestV1 {
+                work_cutoff: TurnLivenessValueV1::Ms(30 * 60_000),
+                ..TurnLivenessRequestV1::default()
+            })),
+            "acp.prompt.work_cutoff",
+        )
+        .await;
+    }
+
+    /// One session's turn runs `timed_out_script` under `timed_out_meta` and reaches `code` at
+    /// 30 minutes, ignoring the cancel; a sibling session on the same connection holds a tool
+    /// open until 40 minutes.
+    async fn sibling_outlives_an_ignored_cutoff(
+        minted_id: &'static str,
+        timed_out_script: Vec<ScriptedUpdate>,
+        timed_out_meta: Option<bridge_core::permission::TurnMeta>,
+        code: &str,
+    ) {
+        let rec = Recorder::new(minted_id);
+        rec.unique_minted_ids.store(true, Ordering::SeqCst);
+        let mut backend = connect_recording_with(
+            rec.clone(),
+            AcpConfig {
+                cancel_grace: minutes(1),
+                ..liveness_config()
+            },
+        )
+        .await;
+        with_noop_container(&mut backend);
+        let backend = Arc::new(backend);
+        let process = OwnedProcessTreeV1::spawn("/bin/cat", &[], None).expect("spawn cat");
+        let observed = process.clone();
+        *backend.supervised.lock().unwrap() = Some(process);
+        let process_open = || {
+            matches!(
+                observed.flight_state().unwrap(),
+                bridge_core::resource_flight::ResourceFlightStateV1::Open {}
+            ) && !backend.reaped.load(Ordering::SeqCst)
+        };
+        let (timed_out, sibling) = (format!("{minted_id}-A"), format!("{minted_id}-B"));
+        backend.ensure_session(&bkey(&timed_out)).await.unwrap();
+        backend.ensure_session(&bkey(&sibling)).await.unwrap();
+        rec.session_updates.lock().await.extend([
+            (format!("{minted_id}-1"), timed_out_script),
+            (
+                format!("{minted_id}-2"),
+                vec![
+                    ScriptedUpdate::OpenTool("cargo-test".into(), ToolCallStatus::InProgress),
+                    ScriptedUpdate::Delay(minutes(40)),
+                    ScriptedUpdate::ToolStatus("cargo-test".into(), ToolCallStatus::Completed),
+                ],
+            ),
+        ]);
+        let start = tokio::time::Instant::now();
+        let turn = |key: String, meta| {
+            let backend = Arc::clone(&backend);
+            tokio::spawn(async move { liveness_turn(&backend, &key, meta).await })
+        };
+        let timed_out_turn = turn(timed_out.clone(), timed_out_meta);
+        let sibling_turn = turn(sibling, None);
+
+        // Past the cutoff (30 min) and the cancel grace (1 min).
+        tokio::time::sleep_until(start + minutes(32)).await;
+        assert!(!sibling_turn.is_finished());
+        assert!(
+            process_open(),
+            "the shared process must not be terminated while the sibling's tool runs"
+        );
+        let (terminal, elapsed) = timed_out_turn.await.unwrap();
+        assert_liveness_cutoff(&terminal, code);
+        assert_ended_at(elapsed, minutes(31));
+        let refused = match backend.prompt(&bkey(&timed_out), vec![]).await {
+            Err(error) => error,
+            Ok(_) => panic!("the timed-out session must accept no new prompt"),
+        };
+        let diagnostic = assert_agent_failure(
+            &refused,
+            DiagnosticPhase::PromptStart,
+            DiagnosticFailureClass::AgentProcess,
+            false,
+        );
+        assert_eq!(
+            diagnostic.code().as_str(),
+            "acp.prompt_start.connection_terminated"
+        );
+        tokio::time::sleep_until(start + minutes(39)).await;
+        assert!(process_open());
+
+        let (terminal, elapsed) = sibling_turn.await.unwrap();
+        assert_completed(&terminal);
+        assert_ended_at(elapsed, minutes(40));
+        assert_eq!(
+            rec.cancels.lock().await.as_slice(),
+            &[format!("{minted_id}-1")],
+            "only the timed-out turn is cancelled"
+        );
+        assert_eq!(
+            rec.prompt_log.lock().await.as_slice(),
+            &["start", "start", "end"]
+        );
+        tokio::time::timeout(minutes(1), async {
+            while !(backend.reaped.load(Ordering::SeqCst)
+                && matches!(
+                    observed.flight_state().unwrap(),
+                    bridge_core::resource_flight::ResourceFlightStateV1::Settled { .. }
+                ))
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the process is terminated once no sibling turn is live");
+    }
+
+    /// I1 review round 1, finding 1, negative: with no other turn live, an ignored cutoff
+    /// cancel still terminates the shared process before the failure is reported. The
+    /// in-process transport has no agent process here; the container reap marks the
+    /// escalation.
+    #[tokio::test(start_paused = true)]
+    async fn an_ignored_cutoff_cancel_terminates_the_process_when_no_sibling_runs() {
+        let rec = Recorder::new("agent-sess-LV-ALONE");
+        rec.set_updates(vec![ScriptedUpdate::Hang]).await;
+        let mut backend = connect_recording_with(
+            rec.clone(),
+            AcpConfig {
+                cancel_grace: minutes(1),
+                ..liveness_config()
+            },
+        )
+        .await;
+        with_noop_container(&mut backend);
+
+        let (terminal, elapsed) = liveness_turn(&backend, "bridge-LV-ALONE", None).await;
+
+        assert_liveness_cutoff(&terminal, "acp.prompt.silence_cutoff");
+        assert_ended_at(elapsed, minutes(31));
+        assert!(backend.unavailable.load(Ordering::SeqCst));
+        assert!(
+            backend.reaped.load(Ordering::SeqCst),
+            "the process is terminated before the failure is reported"
+        );
+        assert_eq!(
+            rec.cancels.lock().await.as_slice(),
+            &["agent-sess-LV-ALONE"]
+        );
+    }
+
+    /// A turn alone on a real agent process whose agent ignores its cutoff's cancel: the bridge
+    /// terminates the process from inside the turn, which takes the child, and the turn still
+    /// ends with its own failure. The driver's child probe, and the coordinator's after the
+    /// turn, find no child and read `Unknown` instead of panicking. The legacy watchdog shares
+    /// the escalation and the probe.
+    #[tokio::test(start_paused = true)]
+    async fn a_turn_whose_agent_process_the_bridge_terminated_reports_its_failure() {
+        use bridge_core::turn_liveness::{TurnLivenessRequestV1, TurnLivenessValueV1};
+        terminated_turn_reports_its_failure(
+            "agent-sess-LV-TERMINATED-SILENT",
+            vec![ScriptedUpdate::Hang],
+            None,
+            None,
+            "acp.prompt.silence_cutoff",
+            minutes(31),
+        )
+        .await;
+        terminated_turn_reports_its_failure(
+            "agent-sess-LV-TERMINATED-WORK",
+            vec![
+                ScriptedUpdate::OpenTool("hung".into(), ToolCallStatus::InProgress),
+                ScriptedUpdate::Hang,
+            ],
+            Some(liveness_meta(TurnLivenessRequestV1 {
+                work_cutoff: TurnLivenessValueV1::Ms(30 * 60_000),
+                ..TurnLivenessRequestV1::default()
+            })),
+            None,
+            "acp.prompt.work_cutoff",
+            minutes(31),
+        )
+        .await;
+        terminated_turn_reports_its_failure(
+            "agent-sess-LV-TERMINATED-WATCHDOG",
+            vec![ScriptedUpdate::Hang],
+            None,
+            Some(bridge_core::domain::WatchdogConfig {
+                idle_timeout: minutes(5),
+                hard_wall_clock: minutes(10),
+            }),
+            "acp.prompt.watchdog_timeout",
+            minutes(11),
+        )
+        .await;
+    }
+
+    /// One turn runs `script` on a backend whose agent process is a real `/bin/cat`, ignores
+    /// the cancel of the bound that fires, and ends with `code` at `ended_at`.
+    async fn terminated_turn_reports_its_failure(
+        minted_id: &'static str,
+        script: Vec<ScriptedUpdate>,
+        meta: Option<bridge_core::permission::TurnMeta>,
+        watchdog: Option<bridge_core::domain::WatchdogConfig>,
+        code: &str,
+        ended_at: Duration,
+    ) {
+        let rec = Recorder::new(minted_id);
+        rec.set_updates(script).await;
+        let backend = connect_recording_with(
+            rec.clone(),
+            AcpConfig {
+                cancel_grace: minutes(1),
+                watchdog,
+                ..liveness_config()
+            },
+        )
+        .await;
+        let process = OwnedProcessTreeV1::spawn("/bin/cat", &[], None).expect("spawn cat");
+        let observed = process.clone();
+        *backend.supervised.lock().unwrap() = Some(process);
+        assert_eq!(
+            backend.bridge_owned_acp_child_liveness(),
+            bridge_core::terminal_evidence::AcpChildLiveness::Live
+        );
+
+        let (terminal, elapsed) =
+            liveness_turn(&backend, &format!("bridge-{minted_id}"), meta).await;
+
+        assert_liveness_cutoff(&terminal, code);
+        assert_ended_at(elapsed, ended_at);
+        assert_eq!(rec.cancels.lock().await.as_slice(), &[minted_id]);
+        assert!(
+            matches!(
+                observed.flight_state().unwrap(),
+                bridge_core::resource_flight::ResourceFlightStateV1::Settled { .. }
+            ),
+            "the bridge terminates the agent process before the failure is reported"
+        );
+        assert!(backend.unavailable.load(Ordering::SeqCst));
+        assert_eq!(
+            backend.bridge_owned_acp_child_liveness(),
+            bridge_core::terminal_evidence::AcpChildLiveness::Unknown
+        );
     }
 
     // ── Task 5: reverse session/request_permission handler ─────────────────────

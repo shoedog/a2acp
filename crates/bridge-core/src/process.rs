@@ -2462,6 +2462,19 @@ impl OwnedProcessTreeV1 {
         }
     }
 
+    /// The direct child, or `None` for a capture-only process or once a termination flight has
+    /// taken it. A probe that can run after the bridge terminated the process uses this;
+    /// [`Self::child_mut`] is for callers that own a live child.
+    pub fn try_child_mut(&mut self) -> Option<OwnedChildGuardV1<'_>> {
+        let guard = self
+            .live()
+            .ok()?
+            .child
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        guard.is_some().then_some(OwnedChildGuardV1 { guard })
+    }
+
     pub fn attach_owner(
         &self,
         owner: ResourceFlightOwnerV1,
@@ -3253,6 +3266,27 @@ mod tests {
             None => {} // reaped, good
             Some(s) => assert!(!s.starts_with('Z'), "left a zombie: {s}"),
         }
+    }
+
+    /// A probe through another handle of a process the bridge terminated finds no child instead
+    /// of panicking.
+    #[tokio::test]
+    async fn try_child_mut_finds_no_child_once_termination_took_it() {
+        let process = OwnedProcessTreeV1::spawn("/bin/cat", &[], None).unwrap();
+        let mut probe = process.clone();
+        let mut child = probe
+            .try_child_mut()
+            .expect("the live process has its child");
+        assert!(child.try_wait().unwrap().is_none());
+        drop(child);
+
+        let termination = process.terminate(Duration::from_millis(300)).await.unwrap();
+
+        assert_eq!(
+            termination.disposition,
+            ResourceActionDispositionV1::Complete
+        );
+        assert!(probe.try_child_mut().is_none());
     }
 
     #[test]

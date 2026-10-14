@@ -18,12 +18,14 @@ release (see [`docs/adr/`](docs/adr/) for the full architectural record).
   resolution of a permission request. A tool call that is `pending` or `in_progress`, or a pending
   permission request, pauses the silence clock, so a long `cargo test` never trips it; the clock
   restarts when the last one closes. Both endings are fatal `Timeout` failures that may follow an
-  accepted prompt and are never retried; the bridge sends `session/cancel` and, past `cancel_grace`,
-  terminates the agent process, the same path (and the same blast radius on a shared process-backed
-  agent) as the `[agents.watchdog]`. No client marks a turn as watched yet, so every such turn gets
-  the 2-hour work cutoff. Workflow node turns, preflight included, are unchanged: they carry neither
-  bound and keep the workflow's own deadlines. The legacy `[agents.watchdog]` keeps its semantics and
-  its `acp.prompt.watchdog_timeout` code and runs alongside; when bounds fall due at the same instant
+  accepted prompt and are never retried; the bridge sends `session/cancel`. When the agent ignores
+  it past `cancel_grace`, the turn still fails and its connection takes no new prompt, but the
+  shared agent process is terminated only once no other session's turn is running on it, so one
+  hung session does not cut the others short (the `[agents.watchdog]` still terminates at once).
+  No client marks a turn as watched yet, so every such turn gets the 2-hour work cutoff. Workflow
+  node turns, preflight included, are unchanged: they carry neither bound and keep the workflow's
+  own deadlines. The legacy `[agents.watchdog]` keeps its semantics and its
+  `acp.prompt.watchdog_timeout` code and runs alongside; when bounds fall due at the same instant
   the watchdog is reported first, then the work cutoff, then silence.
 
 - Reader and toolchain images pin codex-acp 2.2.2 with Codex 0.162.1 (was 1.13.1 / 0.157.1) and
@@ -107,6 +109,14 @@ release (see [`docs/adr/`](docs/adr/) for the full architectural record).
   only as a typed trace event, and release's result is unchanged. Measured against codex-acp 1.13.1
   and 2.1.1, a session's MCP server exits about 60 s after its own `session/close` while other
   sessions on the same adapter stay open.
+- A turn whose agent process the bridge terminates, because the agent ignored the `session/cancel`
+  of an `[agents.watchdog]` bound or a silence or work cutoff past `cancel_grace`, now ends with
+  that failure (`acp.prompt.watchdog_timeout`, `acp.prompt.silence_cutoff` or
+  `acp.prompt.work_cutoff`) and a terminal event. The turn's check of the agent process after the
+  termination panicked on the child the termination had already taken, so the client's stream
+  ended with neither, and the coordinator's check after the turn could panic the same way. Both now
+  record the process's liveness as `unknown`: they saw no exit status, and the termination may
+  still be reaping the child.
 
 ## [0.3.1] - 2026-07-30
 
