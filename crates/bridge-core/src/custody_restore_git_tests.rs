@@ -3187,10 +3187,10 @@ fn drift_after_home_and_xdg_refuses_before_the_bootstrap_is_created() {
 fn an_indexed_pack_that_is_not_the_staged_bytes_refuses() {
     let capsule = captured(CustodyGitObjectFormatV1::Sha1);
     let (_dest, verified) = phase_v(&capsule.capsule);
-    let route = RouteV1::new(&[(
-        "index-pack --strict --stdin",
-        "\"$REAL\" \"$@\"; rc=$?; for f in git-bootstrap/objects/pack/*.pack; do echo x >> \"$f\"; done; exit $rc",
-    )]);
+    let shell = format!(
+        "{APPEND_FIXTURE_BYTE_SH_V1}\n\"$REAL\" \"$@\"; rc=$?; for f in git-bootstrap/objects/pack/*.pack; do append_fixture_byte \"$f\"; done; exit $rc"
+    );
+    let route = RouteV1::new(&[("index-pack --strict --stdin", &shell)]);
     let (_area, runner) = route.runner();
     let failure = refusal(verified, &runner, GitObjectFormatV1::Sha1);
     assert!(
@@ -3658,19 +3658,53 @@ fn the_gate_checks_work_and_plain_without_any_staging_subdirectory() {
 // census measures every subtree a child can leave
 // ---------------------------------------------------------------------------------------------
 
-/// One byte of `path` changed in place: same inode, same length.
+/// Let a racer write even when Git or the restore sealed the file (0444). Restore the original
+/// mode through the retained inode so that a byte/length guard, rather than a mode change, refuses it.
+fn with_fixture_write_permission(path: &Path, change: impl FnOnce()) {
+    let file = std::fs::File::open(path).expect("the racer's original inode");
+    let permissions = file.metadata().expect("the original mode").permissions();
+    file.set_permissions(std::fs::Permissions::from_mode(permissions.mode() | 0o200))
+        .expect("the racer grants itself owner write");
+    change();
+    file.set_permissions(permissions)
+        .expect("the racer restores the original mode");
+}
+
+fn append_fixture_byte(path: &Path) {
+    use std::io::Write as _;
+    with_fixture_write_permission(path, || {
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(path)
+            .and_then(|mut file| file.write_all(b"x"))
+            .expect("an appended byte");
+    });
+}
+
+/// The shell racers use the same permission discipline. GNU and BSD stat spell the mode query
+/// differently; any failed query, chmod, or append must fail the fixture child loudly.
+const APPEND_FIXTURE_BYTE_SH_V1: &str = r#"append_fixture_byte() {
+    fixture_mode=$(stat -c %a "$1" 2>/dev/null) || fixture_mode=$(stat -f %Lp "$1") || exit 97
+    chmod u+w "$1" || exit 97
+    printf x >> "$1" || exit 97
+    chmod "$fixture_mode" "$1" || exit 97
+}"#;
+
+/// One byte of `path` changed in place: same inode, same length, same mode.
 fn change_in_place(path: &Path) {
     use std::os::unix::fs::FileExt as _;
-    let file = std::fs::OpenOptions::new()
-        .write(true)
-        .open(path)
-        .expect("an admitted file opens for the racer");
-    let mut byte = [0_u8; 1];
-    std::fs::File::open(path)
-        .and_then(|reader| reader.read_exact_at(&mut byte, 10))
-        .expect("the byte to change");
-    file.write_all_at(&[!byte[0]], 10)
-        .expect("one byte changed");
+    with_fixture_write_permission(path, || {
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .expect("an admitted file opens for the racer");
+        let mut byte = [0_u8; 1];
+        file.read_exact_at(&mut byte, 10)
+            .expect("the byte to change");
+        file.write_all_at(&[!byte[0]], 10)
+            .expect("one byte changed");
+    });
 }
 
 fn admitted_path(bootstrap: &Path, extension: &str) -> PathBuf {
@@ -6974,14 +7008,14 @@ fn pass_the_deadline(deadline: Instant) {
     );
 }
 
-/// Like [`run_with`], with the ABSOLUTE `deadline` chosen by the caller (so a hook can sleep to exactly
-/// it). `setup` runs after phase V and before the route is built; whatever it returns lives until the
-/// attempt ends.
+/// Like [`run_with`], with arbitrary seam guards and the actual deadline supplied to `setup` and
+/// returned to the caller. Build the capsule, phase V, and the warmed-up route/runner before starting
+/// the clock; only hook installation and the bootstrap spend the attempt's headroom.
 fn run_before(
     rules: &[(&str, &str)],
-    deadline: Instant,
-    setup: impl FnOnce(&DestV1) -> Vec<Box<dyn std::any::Any>>,
-) -> (RanV1, OutcomeV1) {
+    timeout: Duration,
+    setup: impl FnOnce(&DestV1, Instant) -> Vec<Box<dyn std::any::Any>>,
+) -> (RanV1, OutcomeV1, Instant) {
     let capsule = captured(CustodyGitObjectFormatV1::Sha1);
     let (dest, verified) = phase_v(&capsule.capsule);
     let (phase_v_used, base) = pin_charge(&verified);
@@ -6991,9 +7025,10 @@ fn run_before(
         .find(|one| one.role == CustodyCapsuleArtifactRoleV1::GitObjectPack)
         .map(|one| one.length)
         .expect("the staged pack");
-    let _guards = setup(&dest);
     let route = RouteV1::new(rules);
     let (_area, runner) = route.runner();
+    let deadline = Instant::now() + timeout;
+    let _guards = setup(&dest, deadline);
     let outcome = bootstrap_git_objects_v1(verified, &runner, GitObjectFormatV1::Sha1, deadline);
     (
         RanV1 {
@@ -7004,6 +7039,7 @@ fn run_before(
             pack_length,
         },
         outcome,
+        deadline,
     )
 }
 
@@ -7094,16 +7130,15 @@ fn run_late(
     points: &[LateV1],
     delay: DelayV1,
     mount_calls: usize,
-    deadline: Instant,
-) -> (RanV1, OutcomeV1, std::rc::Rc<LateStateV1>) {
+) -> (RanV1, OutcomeV1, std::rc::Rc<LateStateV1>, Instant) {
     let state = std::rc::Rc::new(LateStateV1::default());
     let shared = state.clone();
     let points = points.to_vec();
-    let slow = move || match delay {
-        DelayV1::PastTheDeadline => pass_the_deadline(deadline),
-        DelayV1::Brief => std::thread::sleep(Duration::from_millis(100)),
-    };
-    let (ran, outcome) = run_before(&[], deadline, move |_dest| {
+    let (ran, outcome, deadline) = run_before(&[], ROUND6_DEADLINE_V1, move |_dest, deadline| {
+        let slow = move || match delay {
+            DelayV1::PastTheDeadline => pass_the_deadline(deadline),
+            DelayV1::Brief => std::thread::sleep(Duration::from_millis(100)),
+        };
         let mut guards: Vec<Box<dyn std::any::Any>> = Vec::new();
         {
             let state = shared.clone();
@@ -7177,7 +7212,7 @@ fn run_late(
         }
         guards
     });
-    (ran, outcome, state)
+    (ran, outcome, state, deadline)
 }
 
 /// The six children a complete run starts, in order.
@@ -7189,8 +7224,7 @@ fn six_children() -> &'static [&'static str] {
 /// one of the SIX children started, the step `point` names as the last completed, and the ledger exactly
 /// as a clean run leaves it. Returns every problem found.
 fn late_row(point: LateV1, mount_calls: usize, clean: u64) -> Vec<String> {
-    let deadline = Instant::now() + ROUND6_DEADLINE_V1;
-    let (ran, outcome, state) = run_late(&[point], DelayV1::PastTheDeadline, mount_calls, deadline);
+    let (ran, outcome, state, deadline) = run_late(&[point], DelayV1::PastTheDeadline, mount_calls);
     let after = Instant::now().saturating_duration_since(deadline);
     println!(
         "DEADLINE-MARKER {point:?}: fired={:?} misplaced={:?} returned {}ms after the deadline",
@@ -7271,8 +7305,7 @@ fn round6_a_deadline_spent_after_the_final_digest_read_cannot_succeed() {
 #[test]
 fn round6_with_headroom_every_late_validation_step_succeeds_before_the_deadline() {
     let mount_calls = clean_mount_census_calls();
-    let deadline = Instant::now() + ROUND6_DEADLINE_V1;
-    let (ran, outcome, state) = run_late(&LateV1::ALL, DelayV1::Brief, mount_calls, deadline);
+    let (ran, outcome, state, deadline) = run_late(&LateV1::ALL, DelayV1::Brief, mount_calls);
     let observed = ran.route.children();
     println!(
         "CHILD-START-MARKER the headroom control: observed={observed:?} fired={:?} misplaced={:?} returned_before_the_deadline={}",
@@ -7337,12 +7370,11 @@ struct GuardLogV1 {
 /// One Captured SHA-1 bootstrap whose every late-validation guard is logged, with `at` done at one guard.
 fn run_guarded(
     rules: &[(&str, &str)],
-    deadline: Instant,
     at: AtGuardV1,
-) -> (RanV1, OutcomeV1, std::rc::Rc<GuardLogV1>) {
+) -> (RanV1, OutcomeV1, std::rc::Rc<GuardLogV1>, Instant) {
     let log = std::rc::Rc::new(GuardLogV1::default());
     let shared = log.clone();
-    let (ran, outcome) = run_before(rules, deadline, move |dest| {
+    let (ran, outcome, deadline) = run_before(rules, ROUND6_DEADLINE_V1, move |dest, deadline| {
         let mut guards: Vec<Box<dyn std::any::Any>> = Vec::new();
         {
             let log = shared.clone();
@@ -7387,7 +7419,7 @@ fn run_guarded(
         )));
         guards
     });
-    (ran, outcome, log)
+    (ran, outcome, log, deadline)
 }
 
 /// The guards one clean run makes, and the filesystem facts the expected sequence is derived from (never
@@ -7451,8 +7483,7 @@ impl GuardShapeV1 {
 }
 
 fn clean_guard_shape() -> GuardShapeV1 {
-    let deadline = Instant::now() + ROUND6_DEADLINE_V1;
-    let (ran, outcome, log) = run_guarded(&[], deadline, AtGuardV1::Observe);
+    let (ran, outcome, log, _) = run_guarded(&[], AtGuardV1::Observe);
     let verified = match outcome {
         Ok(verified) => verified,
         Err(failure) => panic!("the clean control must succeed: {failure:?}"),
@@ -7618,12 +7649,8 @@ fn round6_each_late_validation_guard_halts_the_run_alone() {
     let mut problems = Vec::new();
     for (index, label) in guard_rows(&shape) {
         let name = format!("guard #{index} `{label}`");
-        let deadline = Instant::now() + ROUND6_DEADLINE_V1;
-        let (ran, outcome, log) = run_guarded(
-            &[],
-            deadline,
-            AtGuardV1::PassTheDeadline { at: index, label },
-        );
+        let (ran, outcome, log, deadline) =
+            run_guarded(&[], AtGuardV1::PassTheDeadline { at: index, label });
         let events = log.events.borrow().clone();
         println!(
             "GUARD-MARKER {name}: found={:?} guards_run={} last={:?} returned {}ms after the deadline",
@@ -7676,10 +7703,8 @@ fn round6_the_root_identity_is_still_the_last_fallible_gate_after_its_guard() {
         (starts[1] + chains + 1, GitPlaneStepV1::Closure),
         (tree + 1 + 3 + chains, GitPlaneStepV1::Fsck),
     ] {
-        let deadline = Instant::now() + ROUND6_DEADLINE_V1;
-        let (ran, outcome, log) = run_guarded(
+        let (ran, outcome, log, _) = run_guarded(
             &[],
-            deadline,
             AtGuardV1::SwapTheRoot {
                 at: index,
                 label: "root",
@@ -7722,10 +7747,8 @@ fn round6_a_failed_final_child_is_never_held_to_the_success_gate_guards() {
     let clean = clean_charge();
     let shape = clean_guard_shape();
     let group = shape.chains() + 2;
-    let deadline = Instant::now() + ROUND6_DEADLINE_V1;
-    let (ran, outcome, log) = run_guarded(
+    let (ran, outcome, log, _) = run_guarded(
         &[("fsck --strict", "\"$REAL\" \"$@\"; exit 2")],
-        deadline,
         AtGuardV1::Observe,
     );
     let events = log.events.borrow().clone();
@@ -15318,14 +15341,7 @@ fn b2a_a_replaced_or_changed_bootstrap_object_file_refuses_before_any_write() {
                     std::fs::rename(&path, path.with_extension("moved")).expect("moved away");
                     std::fs::write(&path, &original).expect("the same bytes, a new inode");
                 }
-                _ => {
-                    use std::io::Write as _;
-                    std::fs::OpenOptions::new()
-                        .append(true)
-                        .open(&path)
-                        .and_then(|mut file| file.write_all(b"x"))
-                        .expect("an appended byte");
-                }
+                _ => append_fixture_byte(&path),
             }
             let outside_planted = snapshot(&outside);
             let cause = case.refused_before_any_write(&row);
@@ -15386,19 +15402,14 @@ fn b2a_a_bootstrap_file_that_changes_during_the_copy_is_refused_with_the_partial
             }
             match acting.2 {
                 "changed in place" => change_in_place(&acting.0),
-                "an appended byte" => {
-                    use std::io::Write as _;
+                "an appended byte" => append_fixture_byte(&acting.0),
+                _ => with_fixture_write_permission(&acting.0, || {
                     std::fs::OpenOptions::new()
-                        .append(true)
+                        .write(true)
                         .open(&acting.0)
-                        .and_then(|mut file| file.write_all(b"x"))
-                        .expect("an appended byte");
-                }
-                _ => std::fs::OpenOptions::new()
-                    .write(true)
-                    .open(&acting.0)
-                    .and_then(|file| file.set_len(20))
-                    .expect("a truncation"),
+                        .and_then(|file| file.set_len(20))
+                        .expect("a truncation");
+                }),
             }
         });
         let failure = case.refused(&row);
@@ -16754,6 +16765,11 @@ fn b2a_a_file_create_failure_other_than_a_collision_keeps_its_charge() {
 /// The deadline observed after the recheck, the read, and the file sync is never followed by an effect.
 const B2A_SPENT_DEADLINE_V1: Duration = Duration::from_millis(1200);
 
+/// These multi-row fixtures reach later files or many retry calls before injecting expiry. Leave
+/// headroom for those earlier calls under aggregate load; each row still spends its ONE deadline
+/// at the selected guard/call and forbids every effect or continuation after it.
+const B2A_LATE_ROW_DEADLINE_V1: Duration = Duration::from_secs(6);
+
 /// No effect follows a guard that finds the deadline spent. The guard right after every non-final recheck
 /// (whose last call is the root's identity, which can block), after each source read (before its chunk is
 /// charged and written), and after each file's sync (before the directory's) is made slow past the
@@ -16793,7 +16809,7 @@ fn b2a_no_effect_follows_a_guard_that_finds_the_deadline_spent() {
             let row = format!("{target} #{nth}");
             let mut case = StoreCaseV1::of(&capsule, CustodyGitObjectFormatV1::Sha1);
             let lengths = case.lengths();
-            let deadline = Instant::now() + B2A_SPENT_DEADLINE_V1;
+            let deadline = Instant::now() + B2A_LATE_ROW_DEADLINE_V1;
             let spent = std::rc::Rc::new(std::cell::Cell::new(false));
             let seen = std::rc::Rc::new(std::cell::Cell::new(0_usize));
             let effects = std::rc::Rc::new(std::cell::RefCell::new(Vec::<String>::new()));
@@ -17324,7 +17340,7 @@ fn b2a_no_read_write_or_probe_follows_a_call_that_returned_after_the_deadline() 
         // This run's own pack: every case has a destination of its own.
         let target = stored(&case.dest, &case.entry_names()[5]);
         let _script = retry_script();
-        let deadline = Instant::now() + B2A_SLOW_CALL_DEADLINE_V1;
+        let deadline = Instant::now() + B2A_LATE_ROW_DEADLINE_V1;
         // Counts every call on the pack, whatever its kind: the slow one is the `nth` of them.
         let counted = std::rc::Rc::new(std::cell::Cell::new(0_usize));
         let calls = std::rc::Rc::new(std::cell::RefCell::new(Vec::<String>::new()));
@@ -18818,8 +18834,9 @@ fn b2b_the_second_pass_refuses_what_pass_b1a_refuses_before_creating_it() {
         (
             "two spellings that differ only by ASCII case",
             REFS_V1,
-            base_refs().file(&long("A"), "x\n").file(&long("a"), "x\n"),
-            vec![long("a")],
+            base_refs().file(&long("A"), "A\n").file(&long("a"), "a\n"),
+            // A case-insensitive filesystem resolves `a` to `A`; inspect the actual entries below.
+            vec![],
         ),
         (
             "no HEAD at all",
@@ -18848,6 +18865,18 @@ fn b2b_the_second_pass_refuses_what_pass_b1a_refuses_before_creating_it() {
         );
         for path in &absent {
             assert!(!exists(&case.meta(path)), "{row}: `{path}` was created");
+        }
+        if row == "two spellings that differ only by ASCII case" {
+            let entries: Vec<_> = std::fs::read_dir(case.meta("refs/heads"))
+                .expect("the branch directory")
+                .map(|entry| entry.expect("a branch entry").file_name())
+                .collect();
+            assert_eq!(entries, [std::ffi::OsString::from("A")], "{row}");
+            assert_eq!(
+                std::fs::read(case.meta("refs/heads/A")).unwrap(),
+                b"A\n",
+                "{row}"
+            );
         }
         for forbidden in [
             "hooks",
@@ -20975,13 +21004,8 @@ fn swap_rows() -> Vec<MetaSwapV1> {
         MetaSwapV1 {
             row: "an admitted bootstrap object file grown",
             swap: |paths, _| {
-                use std::io::Write as _;
                 let pack = admitted_path_in(&paths.bootstrap.join("objects/pack"), "pack");
-                std::fs::OpenOptions::new()
-                    .append(true)
-                    .open(&pack)
-                    .and_then(|mut file| file.write_all(b"x"))
-                    .expect("an appended byte");
+                append_fixture_byte(&pack);
             },
             planted: 0,
             under: None,
@@ -24042,8 +24066,8 @@ fn b2c_the_one_deadline_reaches_every_helper_and_none_resets_it() {
     ];
     for (label, completed, began, planned, objects, metadata, children) in rows {
         let input = PlaneInV1::rich(&capsule, CustodyGitObjectFormatV1::Sha1);
-        let deadline = Instant::now() + B2C_DEADLINE_V1;
         let route = RouteV1::recorder();
+        let deadline = Instant::now() + B2C_DEADLINE_V1;
         let root = input.dest.path.clone();
         let at_the_guard: SnapshotSlotV1 = SnapshotSlotV1::default();
         let (stored_state, spent) = (at_the_guard.clone(), std::cell::Cell::new(false));
@@ -24481,9 +24505,9 @@ fn halting_row(
     } else {
         PlaneInV1::unborn(capsule, CustodyGitObjectFormatV1::Sha1)
     };
+    let route = RouteV1::recorder();
     let deadline = Instant::now() + B2C_DEADLINE_V1;
     let (events, found, _hook) = act_at_index(index, label, move || pass_the_deadline(deadline));
-    let route = RouteV1::recorder();
     let ran = run_plane(input, &route, deadline);
     println!(
         "GUARD-MARKER {name}: found={:?} guards_run={} returned {}ms after the deadline",
@@ -25052,11 +25076,7 @@ fn b2c_a_retained_chain_swapped_in_the_final_gates_or_the_root_swapped_last_is_r
                 // The same inode, so the entry by name still matches in identity; only the descriptor's own
                 // length, read next, shows it.
                 let pack = pack_file(&root.join(".restore-work/git-bootstrap"));
-                let mut file = std::fs::OpenOptions::new()
-                    .append(true)
-                    .open(pack)
-                    .expect("the admitted pack");
-                std::io::Write::write_all(&mut file, b"x").expect("a grown pack");
+                append_fixture_byte(&pack);
             },
             check: is_identity_changed,
             recorded: 3,
@@ -27207,13 +27227,13 @@ fn b2c_a_deadline_spent_before_a_childs_digest_refuses_before_the_child_starts()
     let capsule = captured(CustodyGitObjectFormatV1::Sha1);
     let clean = clean_final_shape(&capsule, CustodyGitObjectFormatV1::Sha1, true);
     let input = PlaneInV1::rich(&capsule, CustodyGitObjectFormatV1::Sha1);
+    let route = RouteV1::recorder();
     let deadline = Instant::now() + B2C_DEADLINE_V1;
     let _hook = install_git_hook_for_test(GitHookPointV1::BeforeFinalChildCensus, move |event| {
         if event.label == "rev-list --missing=print" {
             pass_the_deadline(deadline);
         }
     });
-    let route = RouteV1::recorder();
     let ran = run_plane(input, &route, deadline);
     let failure = ran.failure("a spent deadline");
     assert!(is_timeout(&failure.cause), "{:?}", failure.cause);
@@ -27427,6 +27447,7 @@ fn slow_return_row(
         (GitHookPointV1::FinalStagingChecked, "staging-checked"),
     ];
     let input = PlaneInV1::rich(capsule, CustodyGitObjectFormatV1::Sha1);
+    let route = RouteV1::recorder();
     let deadline = Instant::now() + B2C_DEADLINE_V1;
     let log: std::rc::Rc<std::cell::RefCell<Vec<String>>> = std::rc::Rc::default();
     let closing = std::rc::Rc::new(std::cell::Cell::new(false));
@@ -27460,7 +27481,6 @@ fn slow_return_row(
             },
         ));
     }
-    let route = RouteV1::recorder();
     let ran = run_plane(input, &route, deadline);
     drop(hooks);
     let Some(at) = slowed_at.get() else {
@@ -27631,6 +27651,10 @@ fn b2c_a_deadline_spent_in_a_runner_callback_is_reconciled_beside_what_the_child
         let input = PlaneInV1::rich(&capsule, CustodyGitObjectFormatV1::Sha1);
         let root = input.dest.path.clone();
         let stray = root.join("repository/.git/stray");
+        let route = match row.shell {
+            Some(shell) => RouteV1::new(&[("fsck --strict", &final_only(shell))]),
+            None => RouteV1::recorder(),
+        };
         let deadline = Instant::now() + B2C_DEADLINE_V1;
         let at_the_hook: SnapshotSlotV1 = SnapshotSlotV1::default();
         let (slot, planted, hooked_root) = (at_the_hook.clone(), row.plant, root.clone());
@@ -27646,10 +27670,6 @@ fn b2c_a_deadline_spent_in_a_runner_callback_is_reconciled_beside_what_the_child
         let _clocks = row
             .stalled
             .then(|| stall_census_clocks_for_test(BOTH_CLOCKS_V1));
-        let route = match row.shell {
-            Some(shell) => RouteV1::new(&[("fsck --strict", &final_only(shell))]),
-            None => RouteV1::recorder(),
-        };
         let ran = run_plane(input, &route, deadline);
         let Err(failure) = &ran.outcome else {
             problems.push(format!("{}: a success", row.name));
@@ -27832,6 +27852,7 @@ fn bracket_row(
     let name = format!("child {child} (`{label}`), {bracket:?}, {site:?}, {slow:?}");
     let input = PlaneInV1::rich(capsule, CustodyGitObjectFormatV1::Sha1);
     let root = input.dest.path.clone();
+    let route = RouteV1::recorder();
     let deadline = Instant::now() + B2C_DEADLINE_V1;
     let log: std::rc::Rc<std::cell::RefCell<Vec<SeenV1>>> = std::rc::Rc::default();
     let armed = std::rc::Rc::new(std::cell::Cell::new(false));
@@ -27952,7 +27973,6 @@ fn bracket_row(
             Ok(vec![b"/".to_vec()])
         }))
     };
-    let route = RouteV1::recorder();
     let ran = run_plane(input, &route, deadline);
     drop(hooks);
     drop(census);
@@ -28501,6 +28521,11 @@ fn known_row(capsule: &CustomCapsuleV1, clean: &FinalShapeV1, row: &KnownRowV1) 
             row.when,
             KnownWhenV1::SlowSettlement(_, HowSlowV1::PastTheDeadline)
         );
+    let body = row.shell.map(final_only);
+    let route = match &body {
+        Some(body) => RouteV1::new(&[("fsck --strict", body.as_str())]),
+        None => RouteV1::recorder(),
+    };
     let deadline = if spends_the_deadline {
         Instant::now() + B2C_DEADLINE_V1
     } else {
@@ -28609,11 +28634,6 @@ fn known_row(capsule: &CustomCapsuleV1, clean: &FinalShapeV1, row: &KnownRowV1) 
     let _clocks = row
         .stalled
         .then(|| stall_census_clocks_for_test(BOTH_CLOCKS_V1));
-    let body = row.shell.map(final_only);
-    let route = match &body {
-        Some(body) => RouteV1::new(&[("fsck --strict", body.as_str())]),
-        None => RouteV1::recorder(),
-    };
     let ran = run_plane(input, &route, deadline);
     drop(hooks);
     drop(census);
@@ -29189,6 +29209,11 @@ fn owed_row(capsule: &CustomCapsuleV1, clean: &FinalShapeV1, row: &OwedRowV1) ->
     let input = PlaneInV1::rich(capsule, CustodyGitObjectFormatV1::Sha1);
     let root = input.dest.path.clone();
     let (_area, outside) = external_dir_with(&["decoy"]);
+    let body = row.shell.map(|shell| final_only(&shell(&root, &outside)));
+    let route = match &body {
+        Some(body) => RouteV1::new(&[("fsck --strict", body.as_str())]),
+        None => RouteV1::recorder(),
+    };
     let deadline = if row.timed_out {
         Instant::now() + B2C_DEADLINE_V1
     } else {
@@ -29286,11 +29311,6 @@ fn owed_row(capsule: &CustomCapsuleV1, clean: &FinalShapeV1, row: &OwedRowV1) ->
     let _clocks = row
         .stalled
         .then(|| stall_census_clocks_for_test(BOTH_CLOCKS_V1));
-    let body = row.shell.map(|shell| final_only(&shell(&root, &outside)));
-    let route = match &body {
-        Some(body) => RouteV1::new(&[("fsck --strict", body.as_str())]),
-        None => RouteV1::recorder(),
-    };
     let ran = run_plane(input, &route, deadline);
     drop(hooks);
     drop(census);
@@ -30380,6 +30400,7 @@ fn b2c_a_returned_slow_census_call_is_counted_once_and_every_unattempted_unit_st
                 scope.spawn(move || {
                     let input = PlaneInV1::rich(capsule, CustodyGitObjectFormatV1::Sha1);
                     let git = input.dest.path.join("repository/.git");
+                    let route = RouteV1::recorder();
                     let deadline = Instant::now() + B2C_DEADLINE_V1;
                     let acted: RcCellV2<bool> = RcCellV2::default();
                     let done = acted.clone();
@@ -30417,7 +30438,6 @@ fn b2c_a_returned_slow_census_call_is_counted_once_and_every_unattempted_unit_st
                         }
                         pass_the_deadline(deadline);
                     };
-                    let route = RouteV1::recorder();
                     let watched = run_watched_v2(input, &route, deadline, false, act);
                     let mut judged = Vec::new();
                     if !matches!(make, Make::Nothing) && !acted.get() {
@@ -30584,6 +30604,7 @@ fn b2c_a_timeout_after_the_paced_digest_bytes_returned_does_not_reread_them() {
     ] {
         let input = PlaneInV1::rich(&capsule, CustodyGitObjectFormatV1::Sha1);
         let head = input.dest.path.join("repository/.git/HEAD");
+        let route = RouteV1::new(&[("fsck --strict", &final_only(&format!("\"$REAL\" \"$@\"; {REWRITE_HEAD_V1}")))]);
         let deadline = Instant::now() + B2C_DEADLINE_V1;
         let original: RcCellV2<Option<u8>> = RcCellV2::default();
         let slowed: RcCellV2<bool> = RcCellV2::default();
@@ -30614,7 +30635,6 @@ fn b2c_a_timeout_after_the_paced_digest_bytes_returned_does_not_reread_them() {
                 _ => {}
             }
         };
-        let route = RouteV1::new(&[("fsck --strict", &final_only(&format!("\"$REAL\" \"$@\"; {REWRITE_HEAD_V1}")))]);
         let watched = run_watched_v2(input, &route, deadline, true, act);
         if !slowed.get() {
             problems.push(format!("{name}: the slow call was never reached"));
@@ -30810,13 +30830,13 @@ fn b2c_work_and_plain_swapped_together_are_both_reported_once_each_with_unique_p
         let retained_staging = input.verified.destination.staging.borrow().len();
         let root = input.dest.path.clone();
         let (_area, outside) = external_dir_with(&["decoy"]);
+        let body = final_only(&(row.shell)(&root, &outside));
+        let route = RouteV1::new(&[("fsck --strict", body.as_str())]);
         let deadline = if row.timed_out {
             Instant::now() + B2C_DEADLINE_V1
         } else {
             far_deadline()
         };
-        let body = final_only(&(row.shell)(&root, &outside));
-        let route = RouteV1::new(&[("fsck --strict", body.as_str())]);
         let watched = run_watched_v2(input, &route, deadline, false, |_| {});
         let Err(failure) = &watched.ran.outcome else {
             problems.push(format!("{}: a success", row.name));
@@ -30859,6 +30879,7 @@ fn b2c_a_gate_stopped_between_an_admitted_files_two_calls_does_not_repeat_the_fi
     let capsule = captured(CustodyGitObjectFormatV1::Sha1);
     let clean = clean_final_shape(&capsule, CustodyGitObjectFormatV1::Sha1, true);
     let input = PlaneInV1::rich(&capsule, CustodyGitObjectFormatV1::Sha1);
+    let route = RouteV1::recorder();
     let deadline = Instant::now() + B2C_DEADLINE_V1;
     let slowed: RcCellV2<bool> = RcCellV2::default();
     let done = slowed.clone();
@@ -30874,7 +30895,6 @@ fn b2c_a_gate_stopped_between_an_admitted_files_two_calls_does_not_repeat_the_fi
             pass_the_deadline(deadline);
         }
     };
-    let route = RouteV1::recorder();
     let watched = run_watched_v2(input, &route, deadline, false, act);
     assert!(slowed.get(), "the slow call was never reached");
     let Err(failure) = &watched.ran.outcome else {
@@ -31117,10 +31137,11 @@ fn b2c_an_admitted_files_entry_and_its_retained_descriptor_are_independent_units
     let capsule = captured(CustodyGitObjectFormatV1::Sha1);
     let clean = clean_final_shape(&capsule, CustodyGitObjectFormatV1::Sha1, true);
     let mut problems = Vec::new();
+    let grown_shell = format!("{APPEND_FIXTURE_BYTE_SH_V1}\n\"$REAL\" \"$@\"; for f in ../.restore-work/git-bootstrap/objects/pack/*.pack; do ln \"$f\" \"$f.keep\" || exit 97; append_fixture_byte \"$f.keep\"; cp \"$f.keep\" \"$f.new\" || exit 97; mv \"$f.new\" \"$f\" || exit 97; done");
     for (name, shell, want) in [
         (
             "the original grown and another inode at the name",
-            "\"$REAL\" \"$@\"; for f in ../.restore-work/git-bootstrap/objects/pack/*.pack; do ln \"$f\" \"$f.keep\"; printf x >> \"$f.keep\"; cp \"$f.keep\" \"$f.new\"; mv \"$f.new\" \"$f\"; done",
+            grown_shell.as_str(),
             vec![
                 ExpectedFailureV1::Identity("no longer the admitted object file"),
                 ExpectedFailureV1::Identity("the retained descriptor is no longer the admitted object file"),
@@ -31265,6 +31286,7 @@ fn run_raw_row_v3(row: &RawRowV3, capsule: &CustomCapsuleV1, clean: &FinalShapeV
     let input = PlaneInV1::rich(capsule, CustodyGitObjectFormatV1::Sha1);
     let root = input.dest.path.clone();
     let (_area, outside) = external_dir_with(&["decoy"]);
+    let route = RouteV1::recorder();
     let deadline = match row.stop {
         RawStopV3::Never => far_deadline(),
         RawStopV3::AfterGitListing | RawStopV3::AtFirstStat => Instant::now() + B2C_DEADLINE_V1,
@@ -31362,7 +31384,6 @@ fn run_raw_row_v3(row: &RawRowV3, capsule: &CustomCapsuleV1, clean: &FinalShapeV
             }
         }
     };
-    let route = RouteV1::recorder();
     let watched = run_watched_v2(input, &route, deadline, false, act);
 
     let mut invalid = state.invalid.borrow().clone();
