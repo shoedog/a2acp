@@ -291,8 +291,9 @@ While its heartbeat is on, `submit` marks its unary turn as watched
 (`a2a-bridge.client_watching=true`): the turn dies with the client (closing the connection cancels the
 ACP prompt) and has no default 2-hour work cutoff. Scripts that want the backstop pass `--no-heartbeat`.
 
-Any served `message/send` or `message/stream` request can set its turn's bounds in `message.metadata`;
-each value is a string and an invalid one is refused as `InvalidRequest`:
+Any served `message/send` or `message/stream` request can set its turn's bounds in `message.metadata`.
+Each value must be a JSON string: a native number (`0` included), boolean, null, array or object is
+refused as `InvalidRequest`, as is a string that is not one of the values below:
 
 | Key | Values |
 |---|---|
@@ -300,6 +301,9 @@ each value is a string and an invalid one is refused as `InvalidRequest`:
 | `a2a-bridge.work_cutoff_secs` | same; beats `[agents.liveness]` |
 | `a2a-bridge.client_watching` | `"true"` or `"false"`; honoured on unary `message/send` only |
 
+A `fan-out` request applies them to its local leg, which `TaskLiveness` reports under the task id; the
+peer leg is unaffected. As for a single-agent turn, only unary `message/send` honours `client_watching`:
+dropping that request drops the local leg, which cancels its ACP prompt. A streaming fan-out ignores it.
 Served workflows ignore all three: their node turns follow the frozen workflow policy above and keep the
 workflow's 2-hour cutoff, whatever the client asked.
 

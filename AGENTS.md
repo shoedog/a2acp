@@ -73,8 +73,9 @@ a2a-bridge run-workflow <id> \
   the env. `submit` with the heartbeat on sends `a2a-bridge.client_watching=true`, so its unary turn
   dies with the client and has no default 2 h work cutoff; scripts wanting the backstop pass
   `--no-heartbeat`. Served requests may also set `a2a-bridge.silence_cutoff_secs` /
-  `a2a-bridge.work_cutoff_secs` (`"off"`, `"0"` or seconds) in `message.metadata`; workflows ignore all
-  three keys. Served turns are readable through the bridge-private `TaskLiveness {taskId}` RPC. Details:
+  `a2a-bridge.work_cutoff_secs` (JSON strings only: `"off"`, `"0"` or seconds) in `message.metadata`;
+  a fan-out applies all three keys to its local leg, workflows ignore them. Served turns are readable
+  through the bridge-private `TaskLiveness {taskId}` RPC. Details:
   [`docs/onboarding.md`](docs/onboarding.md#watching-a-run-the-heartbeat-and-per-request-bounds).
 
 **Built-in workflow `<id>`s** (defined in `examples/a2a-bridge.containerized.toml` and

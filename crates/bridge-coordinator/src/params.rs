@@ -297,6 +297,7 @@ pub struct RequestLivenessParams {
 
 impl RequestLivenessParams {
     /// Absent keys inherit; a present key that is not a valid value is `InvalidRequest`.
+    /// Every value is a JSON string: a number, boolean, null, array or object is refused.
     /// Durations are `"off"`, or whole seconds through the shared checked parser (`"0"` is
     /// off, at most 30 days); `client_watching` is `"true"` or `"false"`.
     pub fn from_a2a_metadata(
@@ -308,7 +309,6 @@ impl RequestLivenessParams {
             work_cutoff: parse_liveness_value(value(WORK_CUTOFF_SECS_KEY), WORK_CUTOFF_SECS_KEY)?,
             client_watching: match value(CLIENT_WATCHING_KEY) {
                 None => false,
-                Some(serde_json::Value::Bool(watching)) => *watching,
                 Some(serde_json::Value::String(raw)) if raw == "true" => true,
                 Some(serde_json::Value::String(raw)) if raw == "false" => false,
                 Some(_) => {
@@ -335,7 +335,6 @@ fn parse_liveness_value(
         {
             raw.parse::<u64>().ok()
         }
-        Some(serde_json::Value::Number(number)) => number.as_u64(),
         Some(_) => None,
     }
     .ok_or(BridgeError::InvalidRequest { field })?;
@@ -571,7 +570,7 @@ mod tests {
             TurnLivenessValueV1::Off
         );
         assert_eq!(
-            liveness(serde_json::json!({"a2a-bridge.work_cutoff_secs": 2_592_000}))
+            liveness(serde_json::json!({"a2a-bridge.work_cutoff_secs": "2592000"}))
                 .unwrap()
                 .work_cutoff,
             TurnLivenessValueV1::Ms(2_592_000_000)
@@ -609,6 +608,40 @@ mod tests {
                 ),
                 "{key} = {value} must be refused"
             );
+        }
+    }
+
+    /// I3 review round 2: every value is a JSON string. A native number (zero included, which
+    /// would otherwise turn a cutoff off), boolean, null, array or object is `InvalidRequest`
+    /// for each of the three keys, never coerced.
+    #[test]
+    fn request_liveness_metadata_refuses_every_non_string_value() {
+        for key in [
+            SILENCE_CUTOFF_SECS_KEY,
+            WORK_CUTOFF_SECS_KEY,
+            CLIENT_WATCHING_KEY,
+        ] {
+            for value in [
+                serde_json::json!(0),
+                serde_json::json!(600),
+                serde_json::json!(2_592_000),
+                serde_json::json!(1),
+                serde_json::json!(true),
+                serde_json::json!(false),
+                serde_json::Value::Null,
+                serde_json::json!(["600"]),
+                serde_json::json!({ "secs": "600" }),
+            ] {
+                let mut md = serde_json::Map::new();
+                md.insert(key.to_owned(), value.clone());
+                assert!(
+                    matches!(
+                        RequestLivenessParams::from_a2a_metadata(Some(&md)),
+                        Err(BridgeError::InvalidRequest { field }) if field == key
+                    ),
+                    "{key} = {value} must be refused"
+                );
+            }
         }
     }
 

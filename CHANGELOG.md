@@ -80,7 +80,11 @@ release (see [`docs/adr/`](docs/adr/) for the full architectural record).
   dies with its client: closing the connection drops the request, which cancels the ACP prompt
   (`session/cancel`). Only unary `message/send` honours `client_watching`; streaming requests and
   served workflows ignore it, and workflows ignore all three keys, keeping their own frozen policy
-  and 2-hour cutoff. An invalid value is refused as `InvalidRequest` before any work starts.
+  and 2-hour cutoff. A `fan-out` request applies the keys to its local leg, registered under the task
+  id for `TaskLiveness`: a unary fan-out's dropped request drops that leg, so it honours
+  `client_watching`, while a streaming one ignores it. Every value must be a JSON string; a native
+  number (`0` included), boolean, null, array or object, like any other invalid value, is refused as
+  `InvalidRequest` before any work starts.
   `submit` sends `client_watching=true` while its heartbeat is on, so `--no-heartbeat` (or
   `--heartbeat-secs 0`) keeps a script's turn on the 2-hour backstop.
 - `[[workflows]] silence_cutoff = "off" | <secs>` and `run-workflow --silence-cutoff <secs|off>` set

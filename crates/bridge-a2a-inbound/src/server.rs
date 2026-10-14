@@ -523,8 +523,8 @@ struct RoutedCall {
     /// Applied by Tasks 6 (single-agent) and 7 (workflow).
     session_cwd: Option<SessionCwd>,
     /// Per-request turn liveness from `a2a-bridge.*` metadata. Distinct from `AgentOverride`;
-    /// applied to local unary and streaming turns by [`served_turn_liveness`], never to a
-    /// workflow.
+    /// applied to local unary and streaming turns, and to a fan-out's local leg, by
+    /// [`served_turn_liveness`], never to a workflow.
     liveness: RequestLivenessParams,
 }
 
@@ -3090,6 +3090,8 @@ async fn poll_cancel_requested(store: &dyn SessionStore, local: &TaskId) {
 
 /// Build a `Source` for the local Kiro backend by running the Translator inside an
 /// `async_stream::stream!` that owns all the `Arc` clones it needs — no lifetime fight.
+/// `liveness` is staged for the leg's turn when the stream is first polled, immediately
+/// before translation, as the single-source paths stage theirs (`stage_served_turn`).
 #[allow(clippy::too_many_arguments)]
 fn local_kiro_source(
     label: String,
@@ -3103,6 +3105,7 @@ fn local_kiro_source(
     turn_id: Option<bridge_core::ids::TurnId>,
     activity: Arc<dyn bridge_core::attempt_activity::AttemptRecorder>,
     terminal_evidence: Arc<dyn bridge_core::terminal_evidence::TerminalEvidenceSink>,
+    liveness: TurnLivenessRequestV1,
 ) -> Source {
     let source_label = label.clone();
     // Build the stream by cloning Arc refs into a `'static + Send` stream.
@@ -3118,6 +3121,8 @@ fn local_kiro_source(
                 }
             },
         };
+        // A fan-out leg has no `TurnMeta` (`resolve_for_fanout` only configures the session).
+        stage_served_turn(backend.as_ref(), &session, None, liveness).await;
         let turn_context = bridge_core::ports::TurnContext {
             turn_id,
             session_id: ContextId::parse(session.as_str()).unwrap_or_else(|_| {
@@ -3176,6 +3181,8 @@ fn spawn_fanout_producer(
     let guard = srv.cancelled_peers.clone();
     let local_source_label = srv.local_source_label.clone();
     let agent_id = local_agent_id(&srv, &routed.target);
+    // Like every streaming turn, the local leg ignores `client_watching`.
+    let liveness = served_turn_liveness(&routed, false);
     let task = routed.task;
     let session = routed.session;
     let parts = routed.parts.clone();
@@ -3222,6 +3229,7 @@ fn spawn_fanout_producer(
                         None,
                         Arc::new(bridge_core::attempt_activity::NoopAttemptRecorder),
                         Arc::new(bridge_core::terminal_evidence::SharedTurnEvidence::unsupported()),
+                        liveness,
                     );
                     (src, Some(backend), Some(lease))
                 }
@@ -4517,6 +4525,10 @@ async fn unary_fanout_message(
                 leg_turn,
                 leg_recorder,
                 leg_evidence,
+                // Unary fan-out honours `client_watching` as unary `message/send` does: dropping
+                // this request future drops `rx`, so `fanout::run` returns on `tx.closed()` and
+                // drops this leg's stream, and the ACP driver cancels a dropped prompt.
+                served_turn_liveness(&routed, true),
             );
             (src, Some(lease))
         }
@@ -11472,6 +11484,7 @@ mod tests {
             None,
             Arc::new(bridge_core::attempt_activity::NoopAttemptRecorder),
             Arc::new(bridge_core::terminal_evidence::SharedTurnEvidence::unsupported()),
+            TurnLivenessRequestV1::default(),
         );
 
         let out: Vec<Result<Event, BridgeError>> = source.stream.collect().await;
@@ -14545,6 +14558,239 @@ mod tests {
         })
         .await
         .expect("the node turn leaves the board");
+    }
+
+    /// I3 review round 2: the wire contract is strings only. A native JSON number (zero
+    /// included) or boolean for any of the three keys is `InvalidRequest` on `message/send` and
+    /// `message/stream` alike, before any prompt.
+    #[tokio::test]
+    async fn non_string_liveness_metadata_is_refused_at_the_server_before_any_prompt() {
+        let board = Arc::new(TurnLivenessBoard::default());
+        let stub = HeartbeatStubBackend::new(board.clone());
+        let srv = liveness_server(stub.clone(), board, Arc::new(AlwaysGrant));
+        for (key, value) in [
+            ("a2a-bridge.work_cutoff_secs", json!(0)),
+            ("a2a-bridge.work_cutoff_secs", json!(600)),
+            ("a2a-bridge.silence_cutoff_secs", json!(0)),
+            ("a2a-bridge.silence_cutoff_secs", json!(600)),
+            ("a2a-bridge.client_watching", json!(true)),
+            ("a2a-bridge.client_watching", json!(false)),
+        ] {
+            for method in [methods::SEND_MESSAGE, methods::SEND_STREAMING_MESSAGE] {
+                // An accepted request reaches the stub, which parks: bounded, it fails instead.
+                let body = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                    let response = router(srv.clone())
+                        .oneshot(post_request(
+                            method,
+                            liveness_unary_msg(
+                                &bridge_core::ids::AttemptIdentity::initial().unwrap(),
+                                json!({ key: value }),
+                            ),
+                            "1.0",
+                        ))
+                        .await
+                        .unwrap();
+                    body_string(response).await
+                })
+                .await
+                .unwrap_or_else(|_| panic!("{method} {key}={value} was dispatched, not refused"));
+                let refused: Value = serde_json::from_str(&body)
+                    .unwrap_or_else(|e| panic!("{method} {key}={value}: {e}: {body}"));
+                assert_eq!(
+                    refused["error"]["code"], JSONRPC_INVALID_REQUEST,
+                    "{method} {key}={value}: {refused}"
+                );
+                assert!(
+                    refused["error"]["message"].as_str().unwrap().contains(key),
+                    "{method} {key}={value}: {refused}"
+                );
+            }
+        }
+        assert!(stub.requests().is_empty(), "refused before any prompt");
+    }
+
+    /// A fan-out server whose local leg is `backend`, sharing `board` with `TaskLiveness`.
+    fn liveness_fanout_server(
+        backend: Arc<dyn AgentBackend>,
+        board: Arc<TurnLivenessBoard>,
+    ) -> Arc<InboundServer> {
+        let coord = test_coordinator(
+            FakeRegistry::single("kiro", backend),
+            Arc::new(FakeStore::default()),
+            Arc::new(AutoApprove),
+        );
+        Arc::new(
+            InboundServer::from_coordinator(
+                coord,
+                Arc::new(FanoutSkillRoute),
+                Arc::new(AlwaysGrant),
+                "http://localhost:8080",
+                FakeDelegation::new(vec![Ok(Event::artifact("PA"))], Some("p1")),
+                "kiro",
+            )
+            .with_liveness_board(board),
+        )
+    }
+
+    fn liveness_fanout_msg(identity: &bridge_core::ids::AttemptIdentity, extra: Value) -> Value {
+        let mut params = liveness_unary_msg(identity, extra);
+        params["message"]["metadata"]["a2a-bridge.skill"] = json!("fan-out");
+        params
+    }
+
+    /// I3 review round 2: a unary fan-out's local leg runs under the request's cutoffs and is
+    /// registered under the served task id while it is held open, then leaves the board when it
+    /// completes. Before, the leg ran with the defaults and `TaskLiveness` found nothing.
+    #[tokio::test]
+    async fn a_unary_fanout_local_leg_carries_the_request_liveness_until_it_completes() {
+        use bridge_core::turn_liveness::TurnLivenessValueV1;
+        let board = Arc::new(TurnLivenessBoard::default());
+        let stub = HeartbeatStubBackend::new(board.clone());
+        let srv = liveness_fanout_server(stub.clone(), board.clone());
+        let identity = bridge_core::ids::AttemptIdentity::initial().unwrap();
+        let task = identity.execution_id.as_str().to_owned();
+
+        let request = tokio::spawn({
+            let srv = srv.clone();
+            let params = liveness_fanout_msg(
+                &identity,
+                json!({
+                    "a2a-bridge.silence_cutoff_secs": "off",
+                    "a2a-bridge.work_cutoff_secs": "60",
+                }),
+            );
+            async move { send_unary(&srv, params).await }
+        });
+        notified_within(&stub.started, "the fan-out local leg never started").await;
+
+        let (status, live) = task_liveness_response(srv.clone(), &task).await;
+        assert_eq!(status, StatusCode::OK, "{live}");
+        let turns: Vec<bridge_core::turn_liveness::TurnLivenessSnapshotV1> =
+            serde_json::from_value(live["result"]["turns"].clone()).unwrap();
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].work_cutoff_ms, Some(60_000));
+        assert_eq!(turns[0].silence_cutoff_ms, None);
+        assert_eq!(
+            stub.requests(),
+            vec![TurnLivenessRequestV1 {
+                silence: TurnLivenessValueV1::Off,
+                work_cutoff: TurnLivenessValueV1::Ms(60_000),
+                client_watching: false,
+                observer_key: Some(task.clone()),
+            }]
+        );
+
+        stub.release.notify_one();
+        let response = request.await.unwrap();
+        assert_eq!(
+            response["result"]["status"]["state"], "TASK_STATE_COMPLETED",
+            "{response}"
+        );
+        let (_, after) = task_liveness_response(srv, &task).await;
+        assert_eq!(after["error"]["message"], "task not found");
+    }
+
+    /// I3 review round 2: a unary fan-out sent with `client_watching=true` stages its local leg
+    /// watched (no default work cutoff), and dropping the request (the client disconnects)
+    /// drops that leg's stream, which is what cancels the ACP prompt (`session/cancel`); the leg
+    /// leaves the board.
+    #[tokio::test]
+    async fn a_watched_unary_fanout_local_leg_dies_with_its_client() {
+        let board = Arc::new(TurnLivenessBoard::default());
+        let stub = HeartbeatStubBackend::new(board.clone());
+        let srv = liveness_fanout_server(stub.clone(), board.clone());
+        let identity = bridge_core::ids::AttemptIdentity::initial().unwrap();
+        let task = identity.execution_id.as_str().to_owned();
+
+        let mut request = Box::pin(router(srv).oneshot(post_request(
+            methods::SEND_MESSAGE,
+            liveness_fanout_msg(&identity, json!({ "a2a-bridge.client_watching": "true" })),
+            "1.0",
+        )));
+        tokio::select! {
+            _ = &mut request => panic!("a parked fan-out leg must not answer"),
+            _ = stub.started.notified() => {}
+        }
+        let turns = board.snapshot(&task);
+        assert_eq!(turns.len(), 1, "the leg is registered under the task id");
+        assert_eq!(
+            turns[0].work_cutoff_ms, None,
+            "a watched leg has no default work cutoff"
+        );
+
+        drop(request);
+        notified_within(
+            &stub.cancelled,
+            "the disconnect did not end the fan-out leg",
+        )
+        .await;
+        assert!(board.snapshot(&task).is_empty());
+        assert_eq!(
+            stub.requests(),
+            vec![TurnLivenessRequestV1 {
+                client_watching: true,
+                observer_key: Some(task),
+                ..TurnLivenessRequestV1::default()
+            }]
+        );
+    }
+
+    /// I3 review round 2: a streaming fan-out's local leg takes the request's cutoffs and the
+    /// task id as its observer key but ignores `client_watching` (it keeps the default 2 h work
+    /// cutoff), and leaves the board when the caller disconnects.
+    #[tokio::test]
+    async fn a_streaming_fanout_local_leg_ignores_client_watching_and_leaves_on_disconnect() {
+        use bridge_core::turn_liveness::TurnLivenessValueV1;
+        let board = Arc::new(TurnLivenessBoard::default());
+        let stub = HeartbeatStubBackend::new(board.clone());
+        let srv = liveness_fanout_server(stub.clone(), board.clone());
+        let identity = bridge_core::ids::AttemptIdentity::initial().unwrap();
+        let task = identity.execution_id.as_str().to_owned();
+
+        let response = router(srv.clone())
+            .oneshot(post_request(
+                methods::SEND_STREAMING_MESSAGE,
+                liveness_fanout_msg(
+                    &identity,
+                    json!({
+                        "a2a-bridge.client_watching": "true",
+                        "a2a-bridge.silence_cutoff_secs": "600",
+                    }),
+                ),
+                "1.0",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        notified_within(&stub.started, "the fan-out local leg never started").await;
+
+        let (status, live) = task_liveness_response(srv, &task).await;
+        assert_eq!(status, StatusCode::OK, "{live}");
+        let turns: Vec<bridge_core::turn_liveness::TurnLivenessSnapshotV1> =
+            serde_json::from_value(live["result"]["turns"].clone()).unwrap();
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].silence_cutoff_ms, Some(600_000));
+        assert_eq!(
+            turns[0].work_cutoff_ms,
+            Some(bridge_core::execution_policy::DEFAULT_WORK_CUTOFF_MS),
+            "streaming ignores client_watching"
+        );
+        assert_eq!(
+            stub.requests(),
+            vec![TurnLivenessRequestV1 {
+                silence: TurnLivenessValueV1::Ms(600_000),
+                observer_key: Some(task.clone()),
+                ..TurnLivenessRequestV1::default()
+            }]
+        );
+
+        drop(response);
+        notified_within(
+            &stub.cancelled,
+            "the disconnect did not end the fan-out leg",
+        )
+        .await;
+        assert!(board.snapshot(&task).is_empty());
     }
 
     fn warm_msg(text: &str) -> serde_json::Value {
