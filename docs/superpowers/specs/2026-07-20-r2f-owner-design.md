@@ -101,7 +101,8 @@ The design is constrained by these verified production seams:
    artifact finalization have explicit finite ownership.
    **Amended 2026-10-14 (owner):** a *watched* run (an interactive CLI client printing the liveness heartbeat) has
    no absolute work cutoff unless it opts in; its node work is bounded by the activity silence cutoff and by the
-   client. Unwatched runs keep the absolute cutoff. See `2026-10-14-activity-liveness-design.md` §3.
+   client. Unwatched runs keep the absolute cutoff. See `2026-10-14-activity-liveness-design.md` §3 (for
+   workflows this takes effect only with its increment I2b, currently parked).
 2. Silence, elapsed time, process existence, CPU use, and file modification time are evidence, not proof of a
    wedge. A quiet live child may be healthy model reasoning or a silent test.
 3. Under `bounded_independent`, a failed fan-out leg does not shorten or reset a sibling's frozen clocks.

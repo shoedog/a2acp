@@ -57,6 +57,9 @@ are amended as follows, by the owner's 2026-10-14 decision:
 - Everything else in R2f (queue admission, cancellation and cleanup bounds, fixed grace, impossibility
   proofs) is unchanged.
 
+For workflows, the watched-run part of this amendment takes effect only when the parked I2b ships (§4.4);
+until then every automatic workflow keeps its absolute cutoff. The silence-cutoff part applies once I1/I2a ship.
+
 This PR edits the R2f document to point at this amendment.
 
 ## 4. Design
