@@ -12341,7 +12341,9 @@ inputs = []
         // and `:ro` agents) and the `:rw` container config. Off unless the entry asks for it.
         for rename_new_sessions in [false, true] {
             let mut reader = acp_entry("reader");
-            reader.cmd = Some("codex-acp".into());
+            // Absolute, so the test does not need `codex-acp` on PATH: a bare `codex-acp` goes
+            // through the packaged wrapper, which resolves the binary on PATH.
+            reader.cmd = Some("/opt/codex/bin/codex-acp".into());
             reader.rename_new_sessions = rename_new_sessions;
             let (_, _, acp) = acp_spawn_inputs(
                 &reader,
