@@ -9318,9 +9318,6 @@ mod tests {
         let bytes = Arc::new(StdMutex::new(Vec::new()));
         let dispatch = test_trace_dispatch(bytes.clone());
         let _trace = tracing::dispatcher::set_default(&dispatch);
-        // A callsite another test thread hit first, with no subscriber, can be cached as disabled
-        // process-wide; a thread-local default does not rebuild that cache, so rebuild it here.
-        tracing::callsite::rebuild_interest_cache();
         let failed: Result<ResourceActionResultV1, ()> =
             Ok(action_result(ResourceActionDispositionV1::Failed));
 
@@ -9337,9 +9334,6 @@ mod tests {
         let bytes = Arc::new(StdMutex::new(Vec::new()));
         let dispatch = test_trace_dispatch(bytes.clone());
         let _trace = tracing::dispatcher::set_default(&dispatch);
-        // A callsite another test thread hit first, with no subscriber, can be cached as disabled
-        // process-wide; a thread-local default does not rebuild that cache, so rebuild it here.
-        tracing::callsite::rebuild_interest_cache();
         let failed: Result<Option<ResourceActionResultV1>, ()> =
             Ok(Some(action_result(ResourceActionDispositionV1::Failed)));
 
@@ -9381,14 +9375,9 @@ mod tests {
     #[test]
     fn typed_trace_funnel_emits_metadata_without_opaque_secret_text() {
         let bytes = Arc::new(StdMutex::new(Vec::new()));
-        let subscriber = tracing_subscriber::fmt()
-            .without_time()
-            .with_ansi(false)
-            .with_max_level(tracing_subscriber::filter::LevelFilter::TRACE)
-            .with_writer(TraceCapture(bytes.clone()))
-            .finish();
+        let dispatch = test_trace_dispatch(bytes.clone());
         let known_secret = "sk-known-secret-must-not-appear";
-        tracing::subscriber::with_default(subscriber, || {
+        tracing::dispatcher::with_default(&dispatch, || {
             for event in [
                 AcpTraceEvent::ModelOptionsMissing,
                 AcpTraceEvent::EffortBelowMinimum {
@@ -13742,6 +13731,14 @@ mod tests {
     }
 
     fn test_trace_dispatch(bytes: Arc<StdMutex<Vec<u8>>>) -> tracing::Dispatch {
+        // tracing-core caches each callsite's interest process-wide. While exactly one dispatcher
+        // is registered, a callsite's interest comes from whichever thread hits it first, so a
+        // parallel test without a subscriber that emits the same event first (a turn whose start
+        // records also detach, say) caches `never` for it, and this dispatcher never sees it. A
+        // second dispatcher, registered before it and live for the whole process, makes every
+        // later registration consult all live dispatchers, this one included.
+        static SECOND: std::sync::OnceLock<tracing::Dispatch> = std::sync::OnceLock::new();
+        SECOND.get_or_init(|| tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default()));
         tracing::Dispatch::new(
             tracing_subscriber::fmt()
                 .without_time()
@@ -13761,9 +13758,6 @@ mod tests {
         let bytes = Arc::new(StdMutex::new(Vec::new()));
         let dispatch = test_trace_dispatch(bytes.clone());
         let _trace = tracing::dispatcher::set_default(&dispatch);
-        // A callsite another test thread hit first, with no subscriber, can be cached as disabled
-        // process-wide; a thread-local default does not rebuild that cache, so rebuild it here.
-        tracing::callsite::rebuild_interest_cache();
         let first = bkey("bridge-owner-attach-a");
         let second = bkey("bridge-owner-attach-b");
         let first_fingerprint = AcpTraceEvent::owner_key_fingerprint(first.as_str());
@@ -13794,9 +13788,6 @@ mod tests {
         let bytes = Arc::new(StdMutex::new(Vec::new()));
         let dispatch = test_trace_dispatch(bytes.clone());
         let _trace = tracing::dispatcher::set_default(&dispatch);
-        // A callsite another test thread hit first, with no subscriber, can be cached as disabled
-        // process-wide; a thread-local default does not rebuild that cache, so rebuild it here.
-        tracing::callsite::rebuild_interest_cache();
 
         let result = backend.release_session_result(&session).await;
 
@@ -17315,9 +17306,6 @@ mod tests {
         let bytes = Arc::new(StdMutex::new(Vec::new()));
         let dispatch = test_trace_dispatch(bytes.clone());
         let _trace = tracing::dispatcher::set_default(&dispatch);
-        // A callsite another test thread hit first, with no subscriber, can be cached as disabled
-        // process-wide; a thread-local default does not rebuild that cache, so rebuild it here.
-        tracing::callsite::rebuild_interest_cache();
         let ids = tool_ids("wide", bridge_core::turn_liveness::MAX_OPEN_TOOL_CALLS + 1);
         let mut updates: Vec<_> = ids
             .iter()
@@ -17963,9 +17951,6 @@ mod tests {
         let bytes = Arc::new(StdMutex::new(Vec::new()));
         let dispatch = test_trace_dispatch(bytes.clone());
         let _trace = tracing::dispatcher::set_default(&dispatch);
-        // A callsite another test thread hit first, with no subscriber, can be cached as disabled
-        // process-wide; a thread-local default does not rebuild that cache, so rebuild it here.
-        tracing::callsite::rebuild_interest_cache();
         let traced = |event: &str| {
             String::from_utf8(bytes.lock().unwrap().clone())
                 .unwrap()
@@ -18023,9 +18008,6 @@ mod tests {
         let bytes = Arc::new(StdMutex::new(Vec::new()));
         let dispatch = test_trace_dispatch(bytes.clone());
         let _trace = tracing::dispatcher::set_default(&dispatch);
-        // A callsite another test thread hit first, with no subscriber, can be cached as disabled
-        // process-wide; a thread-local default does not rebuild that cache, so rebuild it here.
-        tracing::callsite::rebuild_interest_cache();
         let rec = silent_after("agent-sess-LV-LAGGING", vec![]).await;
         let backend = connect_recording_with(rec.clone(), liveness_config()).await;
         let (mut stream, observer) =
