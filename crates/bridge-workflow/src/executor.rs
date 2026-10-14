@@ -1305,6 +1305,13 @@ impl PreflightSource<'_> {
         }
     }
 
+    fn frozen_controls(&self) -> Option<&ep::FrozenWorkflowControlsV1> {
+        match self {
+            Self::Legacy(_) => None,
+            Self::Bound { authority, .. } => Some(&authority.run_spec.controls),
+        }
+    }
+
     fn primary_model(&self) -> Option<String> {
         match self {
             Self::Legacy(entry) => entry.model.clone(),
@@ -1941,13 +1948,21 @@ pub enum WorkflowEvent {
 pub type WorkflowStream =
     std::pin::Pin<Box<dyn futures::Stream<Item = Result<WorkflowEvent, BridgeError>> + Send>>;
 
-/// The liveness request every workflow turn stages (preflight, warm and cold). Until the frozen
-/// workflow silence control is mapped here, a workflow turn carries neither a silence cutoff nor
-/// a turn work cutoff: the workflow's own deadlines stay its only bounds, as before the turn
-/// engine existed.
-fn workflow_turn_liveness_v1() -> TurnLivenessRequestV1 {
+/// The liveness request every workflow turn stages (preflight, warm and cold). The silence
+/// cutoff is the run's frozen one: `None` is off, `AgentDefault` inherits the node agent's
+/// `[agents.liveness]` (else 30 minutes), `Activity` is that duration. A turn with no frozen
+/// controls (the unbound route) keeps no silence cutoff, as before. The turn work cutoff is off:
+/// the workflow-wide cutoff is the backstop.
+fn workflow_turn_liveness_v1(
+    controls: Option<&ep::FrozenWorkflowControlsV1>,
+) -> TurnLivenessRequestV1 {
+    let silence = match controls.map(|controls| controls.profile.silence_cutoff) {
+        None | Some(ep::SilenceCutoffV1::None) => TurnLivenessValueV1::Off,
+        Some(ep::SilenceCutoffV1::AgentDefault) => TurnLivenessValueV1::Inherit,
+        Some(ep::SilenceCutoffV1::Activity { silence_ms }) => TurnLivenessValueV1::Ms(silence_ms),
+    };
     TurnLivenessRequestV1 {
-        silence: TurnLivenessValueV1::Off,
+        silence,
         work_cutoff: TurnLivenessValueV1::Off,
         ..TurnLivenessRequestV1::default()
     }
@@ -2509,7 +2524,7 @@ impl WorkflowExecutor {
                         requested_mode: HarvestSanitizationMode::Off,
                         prefix_attestation_request:
                             bridge_core::attestation::PrefixAttestationRequest::Disabled,
-                        liveness: workflow_turn_liveness_v1(),
+                        liveness: workflow_turn_liveness_v1(source.frozen_controls()),
                     },
                 )
                 .await;
@@ -3104,7 +3119,9 @@ impl WorkflowExecutor {
                             turn_id: obs_ctx.turn_id.clone(),
                             requested_mode: node_harvest_mode,
                             prefix_attestation_request: prefix_attestation_request.clone(),
-                            liveness: workflow_turn_liveness_v1(),
+                            liveness: workflow_turn_liveness_v1(
+                                frozen_authority.map(|authority| &authority.run_spec.controls),
+                            ),
                         },
                     )
                     .await;
@@ -4018,7 +4035,9 @@ impl WorkflowExecutor {
                                 turn_id: obs_ctx_ref.turn_id.clone(),
                                 requested_mode: node_harvest_mode,
                                 prefix_attestation_request: prefix_attestation_request.clone(),
-                                liveness: workflow_turn_liveness_v1(),
+                                liveness: workflow_turn_liveness_v1(
+                                    frozen_authority.map(|authority| &authority.run_spec.controls),
+                                ),
                             },
                         )
                         .await;
@@ -9354,13 +9373,14 @@ mod tests {
         }
     }
 
-    /// I1 test 19 (workflow half): until I2 maps the frozen workflow controls, every workflow
-    /// turn (preflight, warm and cold) requests silence and work cutoff off, so a manual
-    /// workflow node silent past 31 minutes, or past two hours, is not cut by the turn engine.
-    /// The backend half (`a_turn_requesting_silence_and_work_off_runs_unbounded`) runs such a
-    /// turn through `AcpBackend`.
+    /// I1 test 19 (workflow half): a workflow turn with no frozen controls (preflight, warm and
+    /// cold on the unbound route) requests silence and work cutoff off, so such a node silent
+    /// past 31 minutes, or past two hours, is not cut by the turn engine. The backend half
+    /// (`a_turn_requesting_silence_and_work_off_runs_unbounded`) runs such a turn through
+    /// `AcpBackend`; bound turns are covered by the I2a tests in
+    /// `tests/r2f1a_bound_executor.rs`.
     #[tokio::test]
-    async fn every_workflow_turn_site_requests_silence_and_work_cutoff_off() {
+    async fn unbound_workflow_turn_sites_request_silence_and_work_cutoff_off() {
         use bridge_core::turn_liveness::{
             resolve_turn_liveness_v1, TurnLivenessRequestV1, TurnLivenessTracker,
             TurnLivenessValueV1,
@@ -9426,6 +9446,52 @@ mod tests {
                 assert_eq!(tracker.due_cause(3 * 60 * 60_000, false), None);
             }
         }
+    }
+
+    /// I2a: the frozen silence cutoff maps onto the turn request (`None` → off, `AgentDefault` →
+    /// inherit, `Activity` → that duration); the turn work cutoff stays off whatever it is.
+    #[test]
+    fn workflow_turn_liveness_maps_the_frozen_silence_cutoff() {
+        use bridge_core::execution_policy::SilenceCutoffV1;
+
+        let mut controls = resolve_execution_policy_v1(
+            &WorkflowControlDefaultsV1::default(),
+            &ExecutionPolicyInvocationV1::default(),
+            false,
+            PolicyActivationV1::Production,
+        )
+        .unwrap();
+        assert_eq!(
+            controls.profile.silence_cutoff,
+            SilenceCutoffV1::AgentDefault
+        );
+        for (frozen, expected) in [
+            (SilenceCutoffV1::None, TurnLivenessValueV1::Off),
+            (SilenceCutoffV1::AgentDefault, TurnLivenessValueV1::Inherit),
+            (
+                SilenceCutoffV1::Activity {
+                    silence_ms: 600_000,
+                },
+                TurnLivenessValueV1::Ms(600_000),
+            ),
+        ] {
+            controls.profile.silence_cutoff = frozen;
+            assert_eq!(
+                workflow_turn_liveness_v1(Some(&controls)),
+                TurnLivenessRequestV1 {
+                    silence: expected,
+                    work_cutoff: TurnLivenessValueV1::Off,
+                    client_watching: false,
+                    observer_key: None,
+                },
+                "{frozen:?}"
+            );
+        }
+        assert_eq!(
+            workflow_turn_liveness_v1(None).silence,
+            TurnLivenessValueV1::Off,
+            "a turn with no frozen controls keeps no silence cutoff"
+        );
     }
 
     async fn exercise_preflight_fault(

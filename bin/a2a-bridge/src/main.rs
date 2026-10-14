@@ -1675,12 +1675,14 @@ fn permission_timeout_ms(server: &ServerConfig) -> u64 {
 /// from a raw args iterator (skipping the binary name at position 0 and the
 /// subcommand name at position 1).
 const RUN_WORKFLOW_USAGE: &str = "\
-usage: a2a-bridge run-workflow <workflow-id> --input <file|-> [--session-cwd <repo>] [--config <path>] [--out <file>] [--strict-brief]
+usage: a2a-bridge run-workflow <workflow-id> --input <file|-> [--session-cwd <repo>] [--config <path>] [--silence-cutoff <secs|off>] [--out <file>] [--strict-brief]
        a2a-bridge run-workflow --serve [--url <url>] --context <context-id> <workflow-id> --input <file|-> [--session-cwd <repo>] [--out <file>] [--strict-brief]
   <workflow-id>   design | code-review | spec-review | plan-review | … (whatever your --config defines)
   --input <file|-> the typed task-spec markdown the workflow acts on (required; '-' reads stdin)
   --session-cwd   the repo the agents read/work in (per-request cwd; without it they use the launch cwd)
   --config <path> registry config (default: ./a2a-bridge.toml)
+  --silence-cutoff <secs|off>  end a node turn after this many whole seconds without agent activity
+                  (at most 30 days; 'off' or 0 disables); beats the workflow's silence_cutoff
   --serve         call a running a2a-bridge serve via SendStreamingMessage instead of local execution
   --url <url>     serve URL for --serve (default: http://127.0.0.1:8080)
   --context       warm workflow parent context id for --serve (required with --serve)
@@ -1701,6 +1703,7 @@ fn parse_run_workflow_args(
         String,
         Option<String>,
         bool,
+        Option<bridge_core::turn_liveness::LivenessOverrideV1>,
     ),
     BoxError,
 > {
@@ -1708,6 +1711,7 @@ fn parse_run_workflow_args(
     let mut input: Option<PathBuf> = None;
     let mut out: Option<PathBuf> = None;
     let mut config: Option<PathBuf> = None;
+    let mut silence_cutoff = None;
     // The per-request ACP session cwd (the writable target for a container_rw agent, or the repo a
     // reader works in). Without it, run-workflow agents run in the LAUNCH cwd, not the target repo.
     let mut session_cwd: Option<String> = None;
@@ -1760,6 +1764,14 @@ fn parse_run_workflow_args(
                 );
                 idx += 1;
             }
+            "--silence-cutoff" => {
+                idx += 1;
+                silence_cutoff = Some(parse_silence_cutoff_flag(
+                    args.get(idx)
+                        .ok_or("run-workflow: --silence-cutoff requires a value")?,
+                )?);
+                idx += 1;
+            }
             "--url" => {
                 idx += 1;
                 url_explicit = true;
@@ -1809,6 +1821,9 @@ fn parse_run_workflow_args(
     if serve && config.is_some() {
         return Err("run-workflow: --config cannot be used with --serve".into());
     }
+    if serve && silence_cutoff.is_some() {
+        return Err("run-workflow: --silence-cutoff cannot be used with --serve".into());
+    }
     let input = input.ok_or_else(|| {
         format!("run-workflow: --input <file|-> is required\n{RUN_WORKFLOW_USAGE}")
     })?;
@@ -1823,7 +1838,24 @@ fn parse_run_workflow_args(
         url,
         context,
         strict_brief,
+        silence_cutoff,
     ))
+}
+
+/// `--silence-cutoff <secs|off>`: `off`, or whole seconds through the shared checked parser
+/// (`0` is off as well).
+fn parse_silence_cutoff_flag(
+    value: &str,
+) -> Result<bridge_core::turn_liveness::LivenessOverrideV1, BoxError> {
+    use bridge_core::turn_liveness::{parse_liveness_secs_v1, LivenessOverrideV1};
+    if value == "off" {
+        return Ok(LivenessOverrideV1::Off);
+    }
+    let secs = value.parse::<u64>().map_err(|_| {
+        format!("run-workflow: --silence-cutoff expects whole seconds or \"off\", got {value:?}")
+    })?;
+    Ok(parse_liveness_secs_v1(secs)
+        .map_err(|error| format!("run-workflow: --silence-cutoff {value}: {error}"))?)
 }
 
 // ---------------------------------------------------------------------------
@@ -4333,6 +4365,7 @@ async fn run_workflow_cmd(args: &[String]) -> Result<(), BoxError> {
         url,
         context,
         strict_brief,
+        silence_cutoff,
     ) = parse_run_workflow_args(args)?;
     let identity = bridge_core::ids::AttemptIdentity::initial()?;
     println!("execution_id={}", identity.execution_id.as_str());
@@ -4624,8 +4657,10 @@ async fn run_workflow_cmd(args: &[String]) -> Result<(), BoxError> {
             attempt_id: identity.attempt_id.clone(),
             graph: graph.clone(),
             requested_session_cwd: requested_session_cwd.clone(),
-            policy_invocation: bridge_core::execution_policy::ExecutionPolicyInvocationV1::default(
-            ),
+            policy_invocation: bridge_core::execution_policy::ExecutionPolicyInvocationV1 {
+                silence_cutoff,
+                ..bridge_core::execution_policy::ExecutionPolicyInvocationV1::default()
+            },
             ledger_admission: initial_ledger_admission,
             // R2f1b: production admission mints no V3 contract (slice-2 brief §5.2).
             r2f1b: None,
@@ -14921,7 +14956,7 @@ The command prints schemas, templates, and validates input.
             .iter()
             .map(|s| s.to_string())
             .collect();
-        let (id, input, _out, _cfg, scwd, serve, _url, context, strict_brief) =
+        let (id, input, _out, _cfg, scwd, serve, _url, context, strict_brief, silence) =
             super::parse_run_workflow_args(&args).unwrap();
         assert_eq!(id, "wf");
         assert_eq!(input, std::path::PathBuf::from("in.md"));
@@ -14929,6 +14964,7 @@ The command prints schemas, templates, and validates input.
         assert!(!serve);
         assert!(context.is_none());
         assert!(!strict_brief);
+        assert!(silence.is_none(), "an absent --silence-cutoff inherits");
     }
 
     #[test]
@@ -14937,7 +14973,7 @@ The command prints schemas, templates, and validates input.
             .iter()
             .map(|s| s.to_string())
             .collect();
-        let (_id, _input, _out, _cfg, scwd, _serve, _url, _context, _strict_brief) =
+        let (_id, _input, _out, _cfg, scwd, _serve, _url, _context, _strict_brief, _silence) =
             super::parse_run_workflow_args(&args).unwrap();
         assert!(scwd.is_none());
     }
@@ -14948,7 +14984,7 @@ The command prints schemas, templates, and validates input.
             .iter()
             .map(|s| s.to_string())
             .collect();
-        let (_id, _input, _out, _cfg, _scwd, _serve, _url, _context, strict_brief) =
+        let (_id, _input, _out, _cfg, _scwd, _serve, _url, _context, strict_brief, _silence) =
             super::parse_run_workflow_args(&args).unwrap();
         assert!(strict_brief);
     }
@@ -15013,7 +15049,7 @@ The command prints schemas, templates, and validates input.
             .iter()
             .map(|s| s.to_string())
             .collect();
-        let (id, input, _out, _cfg, scwd, serve, url, context, strict_brief) =
+        let (id, input, _out, _cfg, scwd, serve, url, context, strict_brief, silence) =
             super::parse_run_workflow_args(&args).unwrap();
         assert_eq!(id, "wf");
         assert_eq!(input, std::path::PathBuf::from("in.md"));
@@ -15022,6 +15058,7 @@ The command prints schemas, templates, and validates input.
         assert_eq!(url, "http://127.0.0.1:8080");
         assert_eq!(context.as_deref(), Some("C"));
         assert!(!strict_brief);
+        assert!(silence.is_none());
     }
 
     #[test]
@@ -15035,6 +15072,79 @@ The command prints schemas, templates, and validates input.
             .to_string();
         assert!(
             err.contains("--serve requires --context"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// Activity liveness I2a: `--silence-cutoff` goes through the shared checked parser. 30 days
+    /// is accepted; 30 days + 1 s and `u64::MAX` are refused; `off` (and `0`) is an explicit off,
+    /// never an absent flag.
+    #[test]
+    fn run_workflow_silence_cutoff_flag_goes_through_the_shared_checked_parser() {
+        use bridge_core::turn_liveness::LivenessOverrideV1;
+        let parse = |value: &str| {
+            let args: Vec<String> = ["wf", "--input", "in.md", "--silence-cutoff", value]
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
+            super::parse_run_workflow_args(&args)
+                .map(|parsed| parsed.9)
+                .map_err(|error| error.to_string())
+        };
+        assert_eq!(parse("900"), Ok(Some(LivenessOverrideV1::Ms(900_000))));
+        assert_eq!(
+            parse("2592000"),
+            Ok(Some(LivenessOverrideV1::Ms(2_592_000_000))),
+            "30 days is the longest accepted duration"
+        );
+        assert_eq!(parse("off"), Ok(Some(LivenessOverrideV1::Off)));
+        assert_eq!(parse("0"), Ok(Some(LivenessOverrideV1::Off)));
+        let max = u64::MAX.to_string();
+        for refused in [
+            "2592001",
+            max.as_str(),
+            "18446744073709551616",
+            "-1",
+            "30m",
+            "OFF",
+            "",
+        ] {
+            let Err(error) = parse(refused) else {
+                panic!("--silence-cutoff {refused:?} must be refused");
+            };
+            assert!(error.contains("--silence-cutoff"), "{refused:?}: {error}");
+        }
+        let missing: Vec<String> = ["wf", "--input", "in.md", "--silence-cutoff"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert!(super::parse_run_workflow_args(&missing)
+            .unwrap_err()
+            .to_string()
+            .contains("--silence-cutoff requires a value"));
+    }
+
+    /// A served workflow takes its controls from the server's config; the flag would be ignored.
+    #[test]
+    fn run_workflow_silence_cutoff_is_refused_with_serve() {
+        let args: Vec<String> = [
+            "--serve",
+            "--context",
+            "C",
+            "wf",
+            "--input",
+            "in.md",
+            "--silence-cutoff",
+            "900",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let err = super::parse_run_workflow_args(&args)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("--silence-cutoff cannot be used with --serve"),
             "unexpected error: {err}"
         );
     }

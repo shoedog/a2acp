@@ -745,10 +745,73 @@ pub struct WorkflowToml {
     pub max_work_cutoff_ms: Option<u64>,
     #[serde(default)]
     pub max_reason: Option<String>,
+    /// `silence_cutoff = "off" | <secs>`: the silence cutoff of this workflow's node turns.
+    /// Absent inherits each node agent's `[agents.liveness]`, else 30 minutes.
+    #[serde(default)]
+    pub silence_cutoff: Option<LivenessSettingToml>,
     #[serde(default)]
     pub panel: Option<PanelTomlSection>,
     #[serde(default)]
     pub nodes: Vec<WorkflowNodeToml>,
+}
+
+/// A liveness duration written as the string `"off"` or as whole seconds. Seconds go through the
+/// shared [`bridge_core::turn_liveness::parse_liveness_secs_v1`], so `0` is off as well.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LivenessSettingToml {
+    Off,
+    Secs(u64),
+}
+
+impl<'de> serde::Deserialize<'de> for LivenessSettingToml {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct Visitor;
+
+        impl serde::de::Visitor<'_> for Visitor {
+            type Value = LivenessSettingToml;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("\"off\" or whole seconds")
+            }
+
+            fn visit_u64<E: serde::de::Error>(self, secs: u64) -> Result<Self::Value, E> {
+                Ok(LivenessSettingToml::Secs(secs))
+            }
+
+            fn visit_i64<E: serde::de::Error>(self, secs: i64) -> Result<Self::Value, E> {
+                u64::try_from(secs)
+                    .map(LivenessSettingToml::Secs)
+                    .map_err(|_| E::invalid_value(serde::de::Unexpected::Signed(secs), &self))
+            }
+
+            fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<Self::Value, E> {
+                if value == "off" {
+                    Ok(LivenessSettingToml::Off)
+                } else {
+                    Err(E::invalid_value(serde::de::Unexpected::Str(value), &self))
+                }
+            }
+        }
+
+        deserializer.deserialize_any(Visitor)
+    }
+}
+
+impl LivenessSettingToml {
+    fn to_override(
+        self,
+    ) -> Result<
+        bridge_core::turn_liveness::LivenessOverrideV1,
+        bridge_core::turn_liveness::LivenessDurationError,
+    > {
+        match self {
+            Self::Off => Ok(bridge_core::turn_liveness::LivenessOverrideV1::Off),
+            Self::Secs(secs) => bridge_core::turn_liveness::parse_liveness_secs_v1(secs),
+        }
+    }
 }
 
 impl WorkflowToml {
@@ -766,7 +829,8 @@ impl WorkflowToml {
             && self.fixed_grace_ms.is_none()
             && self.synthesis_mode.is_none()
             && self.max_work_cutoff_ms.is_none()
-            && self.max_reason.is_none();
+            && self.max_reason.is_none()
+            && self.silence_cutoff.is_none();
         if omitted {
             return Ok(None);
         }
@@ -837,6 +901,16 @@ impl WorkflowToml {
                 self.id
             )));
         }
+        let silence_cutoff = self
+            .silence_cutoff
+            .map(LivenessSettingToml::to_override)
+            .transpose()
+            .map_err(|error| {
+                ConfigError::Registry(format!(
+                    "workflow {} has invalid silence_cutoff: {error}",
+                    self.id
+                ))
+            })?;
 
         Ok(Some(WorkflowControlDefaultsV1 {
             task_class,
@@ -845,6 +919,7 @@ impl WorkflowToml {
             synthesis,
             max_work_cutoff_ms: self.max_work_cutoff_ms,
             max_reason: self.max_reason.clone(),
+            silence_cutoff,
         }))
     }
 }
@@ -5460,6 +5535,62 @@ harvest_sanitization=\"attested_prefix_v1\"
             .remove(&bridge_core::ids::WorkflowId::parse("wf2").unwrap())
             .unwrap();
         assert!(graph.controls.is_none());
+    }
+
+    /// Activity liveness I2a: `[[workflows]] silence_cutoff = "off" | <secs>` reaches the declared
+    /// controls through the shared checked parser. `off` (and `0`) stays an explicit off, distinct
+    /// from absence; 30 days is accepted; 30 days + 1 s, `u64::MAX` and anything but whole
+    /// seconds or `"off"` are refused.
+    #[test]
+    fn workflow_silence_cutoff_parses_through_the_shared_checked_parser() {
+        use bridge_core::turn_liveness::LivenessOverrideV1;
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("p.md"), "review {{input}}").unwrap();
+        let load = |value: &str| {
+            let toml = format!(
+                "{AGENTS_HEADER}\n[[workflows]]\nid = \"wf1\"\nsilence_cutoff = {value}\n\
+                [[workflows.nodes]]\nid = \"only\"\nagent = \"codex\"\nprompt_file = \"p.md\"\ninputs = []\n{SERVER_FOOTER}"
+            );
+            RegistryConfig::parse(&toml)
+                .and_then(|cfg| cfg.load_workflows(dir.path()))
+                .map(|mut map| {
+                    map.remove(&bridge_core::ids::WorkflowId::parse("wf1").unwrap())
+                        .unwrap()
+                        .controls
+                        .clone()
+                        .expect("a declared silence_cutoff is a declared control")
+                        .silence_cutoff
+                })
+                .map_err(|error| error.to_string())
+        };
+
+        assert_eq!(load("\"off\""), Ok(Some(LivenessOverrideV1::Off)));
+        assert_eq!(load("0"), Ok(Some(LivenessOverrideV1::Off)));
+        assert_eq!(load("1200"), Ok(Some(LivenessOverrideV1::Ms(1_200_000))));
+        assert_eq!(
+            load("2592000"),
+            Ok(Some(LivenessOverrideV1::Ms(2_592_000_000))),
+            "30 days is the longest accepted duration"
+        );
+        let over = load("2592001").unwrap_err();
+        assert!(
+            over.contains("silence_cutoff") && over.contains("30 days"),
+            "{over}"
+        );
+        for refused in [
+            "18446744073709551615",
+            "-1",
+            "\"30m\"",
+            "\"OFF\"",
+            "\"1200\"",
+            "12.5",
+        ] {
+            assert!(
+                load(refused).is_err(),
+                "silence_cutoff = {refused} must be refused"
+            );
+        }
     }
 
     #[test]
