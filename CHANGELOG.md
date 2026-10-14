@@ -7,6 +7,13 @@ release (see [`docs/adr/`](docs/adr/) for the full architectural record).
 
 ## [Unreleased]
 
+### Changed
+
+- Reader and toolchain images pin codex-acp 2.2.2 with Codex 0.162.1 (was 1.13.1 / 0.157.1) and
+  claude-agent-acp 0.90.0 with Agent SDK 0.3.296 / Claude Code 2.1.296 (was 0.81.2 / 0.3.280 /
+  2.1.280). codex-acp 2.2.2 advertises `gpt-6.1-sol`. Host and reader fixed-`PONG` lanes passed for
+  both adapters; see `docs/compatibility.md`.
+
 ### Added
 
 - `[[agents]]` entries for `codex-acp` can set `rename_new_sessions = true` (default `false`) to stop
