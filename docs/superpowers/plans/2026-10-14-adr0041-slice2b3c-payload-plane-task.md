@@ -3,9 +3,10 @@ task-type: implement
 ---
 # ADR-0041 Slice 2B3c — payload plane (task specification)
 
-**Revision:** 3. Sol/xhigh round 1/2 REJECTED six blockers and three smells; round 2/2 REJECTED two blockers
-and four smells (converging, closed population). All are folded here, under one disclosed extension round
-(3/3). Findings and dispositions: `../reviews/2026-10-14-adr0041-slice2b3c-spec-review.md`.
+**Revision:** 4. Sol/xhigh round 1/2 REJECTED six blockers and three smells; round 2/2 REJECTED two blockers
+and four smells; disclosed extension round 3 REJECTED one blocker (the remainder of the gate/mode ordering)
+and three smells. Converging 6 → 2 → 1; the round-3 fixes are folded exactly as the reviewer specified, with no
+further spec round (controller decision, disclosed): the C3 source review re-examines this text against code. Findings and dispositions: `../reviews/2026-10-14-adr0041-slice2b3c-spec-review.md`.
 **Drafting base:** `5e3fec9367300bc12c37840f9d4ccaeebad2b04f` (main after PR #138). 2B3b merged in PR #137 at
 `4fcda06d`.
 **Implementor:** Opus 5.5 through `a2a-bridge implement` (the owner's standing implementor direction of
@@ -37,11 +38,11 @@ design.
 | # | Question | Decision |
 |---|---|---|
 | D1 | `evidence/<class-code>`: numeric code or name? | The class's snake-case wire name: `evidence/git_configuration_and_hooks/`, `evidence/in_progress_git_operations/`, `evidence/bridge_evidence/`. The root gitfile (D3) goes to `evidence/worktree_root_gitfile/gitfile`. |
-| D2 | Evidence modes | Evidence is inert. Regular files end `0400` and directories end `0500` (set in the closing gate, like every final mode), whatever the frame says. The frame's original mode is kept in the returned evidence inventory (2B3d records it). Evidence symlinks are written verbatim with the new symlink primitive and listed like worktree symlinks; nothing in the restore ever follows them. |
+| D2 | Evidence modes | Evidence is inert. Regular files end `0400` and directories end `0500` (set in the terminal gate, like every final mode), whatever the frame says. The frame's original mode is kept in the returned evidence inventory (2B3d records it). Evidence symlinks are written verbatim with the new symlink primitive and listed like worktree symlinks; nothing in the restore ever follows them. |
 | D3 | The worktree `.git` connector | Coverage emits the pinned git dir as a childless `Directory` entry, and a root gitfile as a `Regular` entry at path `.git`. Phase P skips exactly one childless `Directory` at path `.git` (because `repository/.git` already exists from phase G). A `Regular` at path `.git` is the root gitfile: its bytes go to `evidence/worktree_root_gitfile/gitfile` and nothing is created at `repository/.git`. Any entry *beneath* `.git/`, a `.git` symlink, or a `.git` directory that has children refuses as `PayloadFrameInvalid` before any phase-P write. A childless directory elsewhere (a separate git dir that lived inside the worktree) is restored as an ordinary empty directory; it is inert, and this is disclosed in the result. |
-| D4 | Worktree, index and `.git` modes | Worktree regular files and directories get the frame's exact mode (the decoder already limits modes to `0o777`). Directory modes are applied post-order inside the closing gate (see **Gates**), after the directory's descendants are verified, so a `0555`, `0400` or `0000` directory still receives and verifies its children as a non-root user. The index and `sharedindex.*` are byte-exact and created `0600`, the phase-G convention for `.git` metadata; their frame modes are kept in the result. |
+| D4 | Worktree, index and `.git` modes | Worktree regular files and directories get the frame's exact mode (the decoder already limits modes to `0o777`). Directory modes are applied post-order inside the terminal gate (see **Gates**), after the directory's descendants are verified, so a `0555`, `0400` or `0000` directory still receives and verifies its children as a non-root user. The index and `sharedindex.*` are byte-exact and created `0600`, the phase-G convention for `.git` metadata; their frame modes are kept in the result. |
 | D5 | Other Captured classes | The allowed Captured union is exactly eight classes: RefsAndHead, ObjectDatabase and StashAndReflogs (consumed by phase G, ignored by phase P) plus Worktree, Index, InProgressGitOperations, GitConfigurationAndHooks and BridgeEvidence (consumed by phase P). If any class outside that union is Captured, phase P refuses at admission with a typed `UnsupportedCapturedClass` and creates nothing. The 2B2 exporter never captures those classes; this is a fail-closed guard, tested with `stage_frame`. |
-| D6 | Path spelling on the destination | The worktree keeps real-world names, so phase G's printable-ASCII rule does NOT apply to worktree or evidence paths. Prevalidation still refuses, before any write: `.`/`..`/empty components, a parent that is not a `Directory` entry in the same frame, a path appearing twice, and an exact-byte duplicate. A destination file system that folds case or Unicode normalization may still collide two distinct frame names; create-new then returns "exists" and phase P refuses with a typed `DestinationCollision` after writes began (a `PayloadPlaneRestoreFailureV1` with partial progress). That outcome is acceptable and must be tested on macOS (APFS folds case). The prevalidation table is bounded like phase G's (`ACTIVE_PATH_TABLE_BYTES_V1`, 64 MiB, with a stated per-entry overhead formula and a small-bound test seam); exceeding it is a typed refusal before any write. |
+| D6 | Path spelling on the destination | The worktree keeps real-world names, so phase G's printable-ASCII rule does NOT apply to worktree or evidence paths. Prevalidation still refuses, before any write: `.`/`..`/empty components, a parent that is not a `Directory` entry in the same frame, a path appearing twice, and an exact-byte duplicate. A destination file system that folds case or Unicode normalization may still collide two distinct frame names; create-new then returns "exists" and phase P refuses with a typed `DestinationCollision` after writes began (a `PayloadPlaneRestoreFailureV1` with partial progress). That outcome is acceptable and must be tested on macOS (APFS folds case). The prevalidation table is bounded like phase G's (64 MiB, a small-bound test seam). Its checked charge per planned entry is: 2 × path length (key plus stored copy) + symlink target length (0 for other kinds) + 64 bytes of fixed overhead, summed with checked arithmetic; exceeding the bound is a typed refusal before any write. |
 | D7 | Escaping symlink targets | A symlink target is "external" when it is absolute, or when lexically resolving it against the link's parent directory leaves the restored root (`repository/` for the worktree, the class directory for evidence). Every external target is returned in `declared_external_references` with its path, target bytes and plane. Targets are written verbatim either way. |
 | D8 | Cross-phase failure type | Phase G already returns `GitPlaneRestoreFailureV1`; the design's `PartialRestoreV1` does not exist yet. 2B3c defines `PayloadPlaneRestoreFailureV1` for phase P only. 2B3d, which owns the whole restore wrapper, composes the phase failures. |
 
@@ -72,10 +73,11 @@ design.
   - A symlink target the destination file system cannot hold (for example `ENAMETOOLONG` on macOS for a
     long target the frame format admits, up to 4095 bytes) is a typed `DestinationUnsupported` refusal with no
     entry created; it is never truncated or skipped.
-  - `set_exact_mode(&File, mode)`: `fchmod` through a retained descriptor (`set_permissions`; no `unsafe`;
-    unaffected by umask), then confirm the mode with `fstat`. Works on a regular file or a pinned directory.
+  - `set_exact_file_mode(&File, mode)` and `PinnedDirectoryV1::set_exact_mode(mode)`, both inside
+    `fs_custody`: `fchmod` through the retained descriptor (`set_permissions`; no `unsafe`; unaffected by
+    umask), then confirm with `fstat`. Never a path-based chmod.
   - **All payload entries are materialized at `0600` (files) and `0700` (directories)** and keep those modes
-    until the closing gate, which alone applies the final modes (see **Closing gate**). So every file stays
+    until the terminal gate, which alone applies the final modes (see **Terminal gate**). So every file stays
     readable and every directory searchable for all writes and all per-step gates.
   - Update both existing unsafe-inventory controls (`custody_git_tests.rs`
     `a14_ast_inventory_keeps_new_unsafe_boundaries_exact` and `custody_walk_tests.rs`
@@ -87,23 +89,28 @@ design.
   write or deadline, keeping every byte that reached disk charged (phase G's rule, ~:6443). Never create a second ledger or replenish it. Test at exactly-fits and one-over.
 - **Deadline.** One caller-supplied absolute `Instant`. Check it before each frame, between chunks of long
   writes, and after each slow scan; no success after expiry.
-- **Gates.** Before the first write and at the end of each step: the mount census over the destination
+- **Gates.** Before the first write and at the end of each step before the terminal gate: the mount census over the destination
   (`refuse_mounts_within`), then rechecks of every retained staging, `.git` and newly created output chain,
   then the destination-root identity LAST, as in phase G's final gate. Nothing fallible follows the final
   gate's last check except building the result. A replaced or retyped created entry observed at any gate
   refuses (`IdentityChanged`/`DeviceCrossing`).
-- **Closing gate (post-order), the last step, after Worktree, Index and Evidence are all written.** It walks
-  every created tree (worktree, index, evidence) post-order. For each directory: for every child, re-stat it
-  no-follow by name under the retained parent pin and require the identity recorded at creation; for a
-  regular file (still `0600`), reopen it no-follow by name, require the same `dev`/`ino`, stream its full
-  content (deadline-paced) to require the recorded length and SHA-256, then set its final mode through that
-  verified descriptor and confirm it with `fstat` (do not keep every file descriptor open across the walk: a
-  large worktree would exhaust descriptors); for a symlink, require the recorded target bytes; then set the
-  directory's final mode through its retained descriptor and confirm it with `fstat`. Its own edge is
-  verified from its parent, which is still `0700`. A byte-integrity mismatch is a typed refusal. After a
-  directory is sealed to a restrictive mode, nothing is read by name inside it again; a change inside it after
-  its own check is outside the gate, the same residual boundary as 2B3a/2B3b. Then the census, staging/`.git`
-  chains and destination-root identity LAST, as above.
+- **Terminal gate (one integrated operation, the last step, after Worktree, Index and Evidence are all
+  written).** In this order:
+  1. The mount census over the destination.
+  2. A post-order walk of every created tree (worktree, index, evidence). For each directory: for every child,
+     re-stat it no-follow by name under the retained parent pin and require the identity recorded at
+     creation; for a regular file (still `0600`), reopen it no-follow by name, require the same `dev`/`ino`,
+     stream its full content (deadline-paced) to require the recorded length and SHA-256, then set its final
+     mode through that verified descriptor and confirm it with `fstat` (do not keep every file descriptor
+     open across the walk: a large worktree would exhaust descriptors); for a symlink, require the recorded
+     target bytes; then set the directory's final mode with `PinnedDirectoryV1::set_exact_mode` and confirm
+     it. Each output entry's post-order observation is its **sole terminal output-chain check**: after a
+     directory is sealed, nothing is looked up by name beneath it again (a sealed `0000` directory would
+     refuse a non-root lookup). Its own edge is checked from its parent, which is still `0700`. A
+     byte-integrity mismatch is a typed refusal. A change beneath a directory after its own check is outside
+     the gate, the same residual boundary as 2B3a/2B3b.
+  3. The retained staging and phase-G `.git` chains (never sealed by phase P).
+  4. The destination-root identity LAST. Nothing fallible follows except building the result.
 - **Phase-G guarantees stay true.** Phase P never writes beneath `repository/.git/` except `index` and
   `sharedindex.*`; never writes config, hooks, refs, or objects; never runs Git. It does not weaken any
   phase-G guard or test. Phase G's own final census (which requires `repository/` to hold only `.git`)
@@ -119,12 +126,14 @@ module, with no behavior change and all 2B3b tests unchanged.
 
 - `restore_payload_plane_v1(plane: RestoredGitPlaneV1, frame_budget: CustodyFrameBudgetV1,
   deadline: Instant) -> Result<RestoredPayloadPlaneV1, Box<PayloadPlaneRestoreFailureV1>>`.
-- `PayloadPlaneStepV1`: `Admission, Prevalidation, Worktree, Index, Evidence, ClosingGate, FinalGate`.
+- `PayloadPlaneStepV1`: `Admission, Prevalidation, Worktree, Index, Evidence, TerminalGate`.
   Progress advances only when a whole step succeeds.
 - `RestoredPayloadPlaneV1` retains the `RestoredGitPlaneV1` value unchanged, plus:
   - `worktree: WorktreeInventoryV1`: every created entry (path bytes, kind, mode, length, SHA-256 for files,
-    target bytes for symlinks, recorded `dev`/`ino`), and whether the connector was a directory or a root
-    gitfile;
+    target bytes for symlinks, recorded `dev`/`ino`); the root `.git` disposition (`ConnectorDirectorySkipped`,
+    `RootGitfileToEvidence`, or `Absent`); and the complete list of restored childless directories. It makes
+    no claim about which non-root childless directory was a separate Git directory (the frame carries no such
+    marker);
   - `index: IndexInventoryV1`: names, lengths, SHA-256, frame modes;
   - `evidence: EvidenceInventoryV1`: per class, every entry with its original frame mode and the mode written;
   - `declared_external_references: Vec<ExternalSymlinkV1>` (plane, path, target bytes);
@@ -156,7 +165,9 @@ existing file whose bytes and mode are unchanged afterwards); `set_exact_mode` w
 `0555`, `0755`, `0777` on files and directories regardless of umask, proved in an isolated child process that
 sets its own umask (`0o077` and `0o000`); never change the umask of the test process, which is global and
 races every concurrent test (see the existing note in `fs_custody.rs` ~:5927); the inventory controls fail if
-a second unsafe site is added (mutation check recorded).
+a second unsafe site is added (mutation check recorded); `PinnedDirectoryV1::set_exact_mode` on a pin whose
+directory was renamed away and replaced by a decoy at the old path changes the retained inode and leaves the
+decoy untouched.
 
 ### C2a — admission, prevalidation and plan (no writes)
 
@@ -164,11 +175,13 @@ Admission (D5, the class-state rule, re-verify descriptors, the first gate) and 
 the worktree, index and evidence frames into the bounded table: D3 connector rules, D6 path rules, D7
 external-target classification, index names, the consumed-byte binding for the prevalidation pass. Output is
 a pure plan; nothing is created. Tests: every refusal creates nothing (snapshot the destination); the
-rich-clone frames plan successfully; a table at exactly its bound succeeds and one byte over refuses; a frame
+rich-clone frames plan successfully; a table at exactly its bound succeeds and one byte over refuses, for both a path-dominated and a
+symlink-target-dominated fixture (mutating any charged term flips a result); a frame
 replaced in place by a valid same-length frame during the prevalidation pass refuses `StagedInputChanged`
 (its own hook, separate from C2b's); table-driven class-state tests for all five classes (Captured, Empty,
 `ExcludedReproducible`, Captured-without-payload); an unsupported Captured class refuses; D3 opposite branch
-(a childless connector away from `.git` plans as an ordinary empty directory and is disclosed); D7 opposite
+(the existing separate-git-dir coverage fixture plus one more ordinary empty directory: the result reports the
+root gitfile disposition and both childless directories, with no connector identity invented); D7 opposite
 branch (`dir/link -> ../inside` is internal; absolute and root-escaping targets are external, in both the
 worktree and an evidence class, with exact plane/class attribution); byte-distinct names that render
 identically stay distinct (lossless keys).
@@ -187,14 +200,15 @@ crossing refuses; `A`/`a` restore on a case-sensitive destination and collide `D
 folding one, and NFC/NFD names likewise (detect folding at runtime); every step's failure names the right
 `last_completed`; an Empty class creates nothing; a second invocation refuses.
 
-### C3 — closing gate, final modes and result
+### C3 — terminal gate, final modes and result
 
-The closing gate, the final gate, and the complete `RestoredPayloadPlaneV1`. Tests, all as a non-root user on
+The terminal gate and the complete `RestoredPayloadPlaneV1`. Tests, all as a non-root user on
 macOS and Linux: files with modes `0000`, `0200` and `0755`, a nested `0000` directory containing a file, and a
 `0555` directory with children, all restore, verify and end with their exact modes (and the inventory shows
-them); evidence ends `0400`/`0500` with the original modes in the inventory, and the rich clone's hook is never
+them), and no child-name lookup happens beneath a directory after it is sealed (instrumented seam); a
+replacement hook immediately before an entry's one terminal observation yields a typed refusal; evidence ends `0400`/`0500` with the original modes in the inventory, and the rich clone's hook is never
 executable; planted config/hook/filter/fsmonitor markers in evidence never run and never appear under
-`repository/`; a file rewritten in place (same inode and length) before the closing gate refuses with a typed
+`repository/`; a file rewritten in place (same inode and length) before the terminal gate refuses with a typed
 byte-integrity error; a file whose mode is changed between its `fchmod` and the confirming `fstat` (test seam)
 refuses; the one-ledger accounting equals phase V plus phase G plus phase P's on-disk charge (extend phase G's
 `assert_one_ledger` equivalent); end-to-end V→G→P on the rich clone.

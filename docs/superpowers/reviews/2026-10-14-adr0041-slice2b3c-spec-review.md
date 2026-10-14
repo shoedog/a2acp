@@ -33,3 +33,18 @@ the remainder of W3). Controller discloses **one extension round (3/3)** on the 
 | S2 | Consumed-byte binding not tested per pass | Folded: separate hooks and tests for each pass |
 | S3 | Raw-byte and evidence-symlink branches untested | Folded: byte-distinct names, NFC/NFD, non-UTF-8 targets, evidence symlinks |
 | S4 | C2 too broad for a two-round cap | Folded: split into C2a (admission/prevalidation/plan, no writes) and C2b (materialization); index and evidence move into C2b, closing gate and modes into C3 |
+
+## Extension round 3 — artifact `9330136d` (revision 3) — REJECT
+
+One WRONG·MATERIAL blocker (the remainder of the gate/mode ordering: a step-ending output-chain recheck after
+sealing a `0000` directory), three SMELL·MATERIAL·DEFER. All other earlier findings confirmed closed.
+Classification: converging (6 → 2 → 1, each narrower, same single ordering issue; closed population). The
+controller folds the reviewer's exact bounded fixes into revision 4 and runs **no further spec round**: the
+remaining text is reviewed again against code in the C3 source review. Disclosed to the owner.
+
+| # | Finding | Disposition (revision 4) |
+|---|---|---|
+| W1 | Terminal gate cannot recheck output chains after sealing restrictive directories | Folded: one integrated terminal gate (census → post-order verify+seal, each entry's sole terminal check → staging/`.git` chains → root identity last); per-step gate rule narrowed to steps before it |
+| S1 | `set_exact_mode(&File)` unusable on `PinnedDirectoryV1` (private file) | Folded: `PinnedDirectoryV1::set_exact_mode` + `set_exact_file_mode`, decoy test |
+| S2 | Table charge formula undefined | Folded: 2 × path + target + 64 B, checked; path- and target-dominated bound tests |
+| S3 | Connector disclosure cannot identify a non-root separate git dir | Folded: root `.git` disposition + full childless-directory list, no invented identity |
