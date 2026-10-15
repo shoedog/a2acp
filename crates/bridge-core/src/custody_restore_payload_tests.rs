@@ -1,5 +1,6 @@
-//! In-crate controls for ADR-0041 slice 2B3c increments C2a (phase P's admission, prevalidation, and plan)
-//! and C2b (materialization: the worktree, the index, and the evidence).
+//! In-crate controls for ADR-0041 slice 2B3c increments C2a (phase P's admission, prevalidation, and plan),
+//! C2b (materialization: the worktree, the index, and the evidence), and C3 (the terminal gate, the final
+//! modes, and the complete result).
 //!
 //! Every row runs phase P over a REAL phase-G value: a real 2B2 export carried through the real 2B3a reader
 //! (phase V) and the real 2B3b wrapper (phase G, with real Git). The export is the rich plan-backed clone
@@ -9,9 +10,11 @@
 //! phase G runs). Planning writes nothing, so every C2a row, a refusal or a success, also proves that the
 //! destination tree and the one ledger are exactly what they were; every C2b row proves that the one ledger
 //! moved by exactly what phase P reports it charged and that nothing phase V or phase G made changed.
-//! Mounted beneath the 2B3b controls, this reuses their fixtures without widening any of them. The mutation
-//! matrices in `.git/a2a-evidence/2b3c-c2a/` and `.git/a2a-evidence/2b3c-c2b/` map each guard to the rows
-//! that turn red without it.
+//! Every C3 row restores V to G to P and inspects sealed entries only through descriptors held open before
+//! the terminal gate, or through the recorded inventory, never by changing a mode back. Mounted beneath the
+//! 2B3b controls, this reuses their fixtures without widening any of them. The mutation matrices in
+//! `.git/a2a-evidence/2b3c-c2a/`, `.git/a2a-evidence/2b3c-c2b/`, and `.git/a2a-evidence/2b3c-c3/` map each
+//! guard to the rows that turn red without it.
 
 use super::super::payload::*;
 use super::*;
@@ -63,11 +66,12 @@ type TreeV1 = BTreeMap<String, Option<Vec<u8>>>;
 type DriftV1 = StdRc<StdRefCell<Option<TreeV1>>>;
 type PlannedOutcomeV1 = Result<PlannedPayloadPlaneV1, Box<PayloadPlaneRestoreFailureV1>>;
 
-/// One real phase-G value with its destination.
+/// One real phase-G value with its destination, and the one ledger's charge when phase V returned.
 struct PCaseV1 {
     dest: DestV1,
     plane: RestoredGitPlaneV1,
     drift: DriftV1,
+    phase_v: u64,
 }
 
 impl PCaseV1 {
@@ -80,7 +84,7 @@ impl PCaseV1 {
             dest,
             verified,
             format,
-            ..
+            phase_v,
         } = input;
         let outcome =
             restore_git_plane_v1(verified, &runner, format, frame_budget(), far_deadline());
@@ -94,6 +98,7 @@ impl PCaseV1 {
             dest,
             plane,
             drift: StdRc::new(StdRefCell::new(None)),
+            phase_v,
         }
     }
 
@@ -2029,6 +2034,12 @@ enum DiskV1 {
 type DiskTreeV1 = BTreeMap<Vec<u8>, DiskV1>;
 
 fn disk_tree(root: &Path) -> DiskTreeV1 {
+    disk_tree_where(root, |_| true)
+}
+
+/// [`disk_tree`] of only the entries whose relative name `keep` admits: any other entry is neither
+/// observed, read, nor descended into.
+fn disk_tree_where(root: &Path, keep: impl Fn(&[u8]) -> bool) -> DiskTreeV1 {
     use std::os::unix::ffi::OsStringExt as _;
     use std::os::unix::fs::PermissionsExt as _;
     let mut tree = BTreeMap::new();
@@ -2042,6 +2053,9 @@ fn disk_tree(root: &Path) -> DiskTreeV1 {
                 .as_os_str()
                 .as_bytes()
                 .to_vec();
+            if !keep(&relative) {
+                continue;
+            }
             let metadata = std::fs::symlink_metadata(&path).expect("its metadata");
             let mode = metadata.permissions().mode() & 0o7777;
             let found = if metadata.file_type().is_symlink() {
@@ -2168,6 +2182,23 @@ fn own_contents(plane: &RestoredGitPlaneV1, class: ClassV1) -> Vec<(Vec<u8>, Own
 /// an entry needs them. Every directory is `0700`, every file `0600` with the frame's bytes, and every link
 /// its target.
 fn expected_added(plane: &RestoredGitPlaneV1) -> DiskTreeV1 {
+    expected_tree(plane, false)
+}
+
+/// [`expected_added`] once the terminal gate sealed it: a worktree entry has its frame's exact mode (D4),
+/// an index file `0600` (D4), and every evidence file `0400` and directory `0500`, `evidence/` and its slots
+/// included (D2).
+fn expected_final(plane: &RestoredGitPlaneV1) -> DiskTreeV1 {
+    expected_tree(plane, true)
+}
+
+/// [`expected_added`] (`sealed` false) or [`expected_final`] (`sealed` true).
+fn expected_tree(plane: &RestoredGitPlaneV1, sealed: bool) -> DiskTreeV1 {
+    let directory_mode = |evidence: bool, frame: u32| match (sealed, evidence) {
+        (false, _) => 0o700,
+        (true, true) => 0o500,
+        (true, false) => frame,
+    };
     let mut tree = BTreeMap::new();
     let captured = P_CLASSES_V1.into_iter().filter(|class| {
         plane
@@ -2194,12 +2225,20 @@ fn expected_added(plane: &RestoredGitPlaneV1) -> DiskTreeV1 {
                 (None, _) => joined(b"repository/.git", &path),
             };
             if let Some(slot) = &slot {
-                tree.insert(b"evidence".to_vec(), DiskV1::Dir(0o700));
-                tree.insert(joined(b"evidence", slot), DiskV1::Dir(0o700));
+                let mode = directory_mode(true, 0);
+                tree.insert(b"evidence".to_vec(), DiskV1::Dir(mode));
+                tree.insert(joined(b"evidence", slot), DiskV1::Dir(mode));
             }
             let entry = match kind {
-                OwnKindV1::Dir(_) => DiskV1::Dir(0o700),
-                OwnKindV1::File(..) => DiskV1::File(0o600, content),
+                OwnKindV1::Dir(mode) => DiskV1::Dir(directory_mode(slot.is_some(), mode)),
+                OwnKindV1::File(mode, _) => {
+                    let mode = match (sealed, &slot, class) {
+                        (false, _, _) | (true, None, P_INDEX_V1) => 0o600,
+                        (true, Some(_), _) => 0o400,
+                        (true, None, _) => mode,
+                    };
+                    DiskV1::File(mode, content)
+                }
                 OwnKindV1::Link(target) => DiskV1::Link(target),
             };
             tree.insert(name, entry);
@@ -4525,7 +4564,9 @@ fn c2b_a_second_invocation_refuses_and_changes_nothing() {
             PayloadPlaneStepV1::Index,
         ),
     ] {
-        let written = PCaseV1::with_frames(&capsule, &frames).write(row);
+        let case = PCaseV1::with_frames(&capsule, &frames);
+        let phase_v = case.phase_v;
+        let written = case.write(row);
         let WrittenV1 { dest, outcome, .. } = written;
         let done = outcome.unwrap_or_else(|failure| panic!("{row}: {:?}", failure.cause));
         let first = if row == "every step" {
@@ -4537,6 +4578,7 @@ fn c2b_a_second_invocation_refuses_and_changes_nothing() {
             dest,
             plane: done.plane,
             drift: StdRc::new(StdRefCell::new(None)),
+            phase_v,
         };
         let before = disk_tree(&again.dest.path);
         let ledger = again.plane.ledger_used();
@@ -4563,14 +4605,16 @@ fn c2b_a_second_invocation_refuses_and_changes_nothing() {
 // ---------------------------------------------------------------------------------------------
 
 /// STRUCTURAL ONLY (evidence of shape, never of behavior; the behavioral evidence is every row above). The
-/// materialization section creates only through the create-new primitives beneath retained pins, charges the
-/// one ledger, reads only retained descriptors, and keeps the deadline; it renames, removes, truncates,
-/// chmods, links by path, syncs, and runs Git nowhere, names no Git metadata file of its own, and holds no
-/// `unsafe`.
+/// materialization section (up to the C3 terminal gate's section, which follows it) creates only through the
+/// create-new primitives beneath retained pins, charges the one ledger, reads only retained descriptors, and
+/// keeps the deadline; it renames, removes, truncates, chmods, links by path, syncs, and runs Git nowhere,
+/// names no Git metadata file of its own, and holds no `unsafe`.
 #[test]
 fn c2b_the_materialization_section_is_create_new_only() {
     let source = include_str!("custody_restore_payload.rs");
-    let (_planner, section) = source.split_once(P_WRITE_MARKER_V1).expect("the marker");
+    assert_eq!(source.matches(P_SEAL_MARKER_V1).count(), 1);
+    let (_planner, rest) = source.split_once(P_WRITE_MARKER_V1).expect("the marker");
+    let (section, _terminal) = rest.split_once(P_SEAL_MARKER_V1).expect("the C3 marker");
     let code: String = section
         .lines()
         .filter(|line| !line.trim_start().starts_with("//"))
@@ -4628,4 +4672,2264 @@ fn c2b_the_materialization_section_is_create_new_only() {
             "the materialization section lacks `{required}`"
         );
     }
+}
+
+// =============================================================================================
+// Increment C3: the terminal gate, the final modes, and the complete result
+//
+// Every row drives `restore_payload_plane_v1` over a REAL phase-G value. A sealed entry is never
+// re-chmodded to be inspected: every entry phase P added is held open (a directory or a file by a
+// descriptor) at the hook that runs immediately before the terminal gate, while every file is still `0600`
+// and every directory `0700`, and its final mode and bytes are read afterwards through that descriptor (a
+// link by its target, which no seal changes) or from the recorded inventory. The runner holds, on EVERY
+// outcome, that the one ledger moved by exactly what phase P charged and that nothing phase V or phase G
+// made changed (unless the row's own hook drifted it), and on success the one-ledger accounting: phase V's
+// charge, plus phase G's and phase P's on-disk charge by the test's own measure. A row's destination is made
+// removable again only when it is dropped, after every inspection.
+// =============================================================================================
+
+/// The terminal gate's section header in the production source.
+const P_SEAL_MARKER_V1: &str =
+    "// The terminal gate (increment C3): every created entry verified and sealed, and the result";
+
+type RestoredOutcomeV1 = Result<RestoredPayloadPlaneV1, Box<PayloadPlaneRestoreFailureV1>>;
+type StepActV1 = Box<dyn Fn(&PayloadHookEventV1<'_>)>;
+
+/// One entry of a hand-built frame, with the mode the frame records for it.
+#[derive(Clone, Copy)]
+enum ModedV1<'a> {
+    Dir(u32),
+    File(u32, &'a [u8]),
+    Link(&'a [u8]),
+}
+
+/// A frame's bytes from the real encoder, with each entry's own mode, in canonical order.
+fn moded_frame(class: ClassV1, entries: &[(&[u8], ModedV1<'_>)]) -> Vec<u8> {
+    let mut ordered: Vec<(CustodyFramePathV1, ModedV1<'_>)> = entries
+        .iter()
+        .map(|(path, entry)| {
+            (
+                CustodyFramePathV1::from_bytes(path).expect("a frame path"),
+                *entry,
+            )
+        })
+        .collect();
+    ordered.sort_by(|left, right| left.0.cmp(&right.0));
+    let header = CustodyFrameHeaderV1::new(class, GENERATION_V1).expect("a frame header");
+    let mut bytes = Vec::new();
+    let mut encoder =
+        CustodyFrameEncoderV1::new(&mut bytes, &header, frame_budget()).expect("an encoder");
+    for (path, entry) in ordered {
+        match entry {
+            ModedV1::Dir(mode) => encoder.directory(&path, mode).expect("a directory"),
+            ModedV1::File(mode, content) => {
+                let mut reader: &[u8] = content;
+                encoder
+                    .regular_file(&path, mode, content.len() as u64, &mut reader)
+                    .expect("a regular file");
+            }
+            ModedV1::Link(target) => encoder.symlink(&path, target).expect("a symlink"),
+        }
+    }
+    encoder.finish().expect("the trailer");
+    bytes
+}
+
+/// One entry phase P added, held at the hook immediately before the terminal gate: a directory or a file by a
+/// descriptor opened while it was still `0700` or `0600`, a link by its target and identity.
+enum HeldV1 {
+    Dir(std::fs::File),
+    File(std::fs::File),
+    Link(Vec<u8>, (u64, u64)),
+}
+
+/// Every entry phase P added, by its exact destination-relative name, held.
+struct HeldTreeV1(BTreeMap<Vec<u8>, HeldV1>);
+
+impl HeldTreeV1 {
+    /// Every entry in phase P's planes that `before` does not name, held open.
+    fn hold(root: &Path, before: &DiskTreeV1) -> Self {
+        use std::os::unix::ffi::OsStringExt as _;
+        use std::os::unix::fs::MetadataExt as _;
+        let mut held = BTreeMap::new();
+        let mut frontier = vec![root.to_path_buf()];
+        while let Some(directory) = frontier.pop() {
+            for entry in std::fs::read_dir(&directory).expect("a destination directory") {
+                let path = entry.expect("a destination entry").path();
+                let relative = path
+                    .strip_prefix(root)
+                    .expect("beneath the root")
+                    .as_os_str()
+                    .as_bytes()
+                    .to_vec();
+                let metadata = std::fs::symlink_metadata(&path).expect("its metadata");
+                if metadata.is_dir() {
+                    frontier.push(path.clone());
+                }
+                if !in_phase_p_planes(&relative) || before.contains_key(&relative) {
+                    continue;
+                }
+                let one = if metadata.file_type().is_symlink() {
+                    HeldV1::Link(
+                        std::fs::read_link(&path)
+                            .expect("a link target")
+                            .into_os_string()
+                            .into_vec(),
+                        (metadata.dev(), metadata.ino()),
+                    )
+                } else if metadata.is_dir() {
+                    HeldV1::Dir(std::fs::File::open(&path).expect("a directory held open"))
+                } else {
+                    HeldV1::File(std::fs::File::open(&path).expect("a file held open"))
+                };
+                held.insert(relative, one);
+            }
+        }
+        Self(held)
+    }
+
+    /// What every held entry is now: a directory's and a file's mode by its held descriptor's `fstat`, a
+    /// file's bytes read through that descriptor (opened before any seal, so no mode is ever changed to read
+    /// it), and a link's target.
+    fn now(&self) -> DiskTreeV1 {
+        use std::io::{Read as _, Seek as _};
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = |file: &std::fs::File| {
+            file.metadata()
+                .expect("a held descriptor's fstat")
+                .permissions()
+                .mode()
+                & 0o7777
+        };
+        self.0
+            .iter()
+            .map(|(name, one)| {
+                let now = match one {
+                    HeldV1::Dir(file) => DiskV1::Dir(mode(file)),
+                    HeldV1::File(file) => {
+                        let mut handle = file.try_clone().expect("a duplicate descriptor");
+                        handle.seek(SeekFrom::Start(0)).expect("rewind");
+                        let mut bytes = Vec::new();
+                        handle
+                            .read_to_end(&mut bytes)
+                            .expect("its bytes, through the descriptor held before the seal");
+                        DiskV1::File(mode(file), bytes)
+                    }
+                    HeldV1::Link(target, _) => DiskV1::Link(target.clone()),
+                };
+                (name.clone(), now)
+            })
+            .collect()
+    }
+
+    /// The held entry's `(dev, ino)`.
+    fn identity(&self, name: &[u8]) -> (u64, u64) {
+        use std::os::unix::fs::MetadataExt as _;
+        match self.0.get(name) {
+            Some(HeldV1::Dir(file) | HeldV1::File(file)) => {
+                let metadata = file.metadata().expect("a held descriptor's fstat");
+                (metadata.dev(), metadata.ino())
+            }
+            Some(HeldV1::Link(_, identity)) => *identity,
+            None => panic!("{} was not added", lossy(name)),
+        }
+    }
+}
+
+/// Makes every directory beneath a destination's area searchable and writable again when dropped: a non-root owner
+/// cannot otherwise remove the entries of a sealed `0500`, `0555`, or `0000` directory (as root it changes
+/// nothing that matters). Cleanup only, after every inspection: nothing is ever inspected through it.
+struct UnsealV1(PathBuf);
+
+impl Drop for UnsealV1 {
+    fn drop(&mut self) {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mut frontier = vec![self.0.clone()];
+        while let Some(directory) = frontier.pop() {
+            let _ = std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700));
+            let Ok(entries) = std::fs::read_dir(&directory) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if std::fs::symlink_metadata(&path).is_ok_and(|metadata| metadata.is_dir()) {
+                    frontier.push(path);
+                }
+            }
+        }
+    }
+}
+
+/// Whether this test process runs as root: a file it creates is owned by uid 0.
+fn running_as_root() -> bool {
+    use std::os::unix::fs::MetadataExt as _;
+    let probe = tempfile::NamedTempFile::new().expect("a probe file");
+    probe.as_file().metadata().expect("its metadata").uid() == 0
+}
+
+/// One restore's outcome: the destination (made removable again when dropped, before its area is removed),
+/// every entry phase P added held open immediately before the terminal gate (none when the run refused
+/// earlier), and the outcome.
+struct RestoredRunV1 {
+    /// Declared first, so dropped first.
+    _unseal: UnsealV1,
+    dest: DestV1,
+    held: Option<HeldTreeV1>,
+    outcome: RestoredOutcomeV1,
+}
+
+impl PCaseV1 {
+    /// Restores under `deadline`, with `act` run at every step-gate hook (after the entries are held, at the
+    /// terminal gate's), and requires what EVERY outcome keeps (this section's head).
+    fn restore_with(self, row: &str, deadline: Instant, act: Option<StepActV1>) -> RestoredRunV1 {
+        let PCaseV1 {
+            dest,
+            plane,
+            drift,
+            phase_v,
+        } = self;
+        let ledger = plane.ledger_used();
+        let before = disk_tree(&dest.path);
+        let phase_g = charge_on_disk(&dest, &PLANE_SUBTREES_V1);
+        assert_eq!(
+            ledger,
+            phase_v + phase_g,
+            "{row}: phase G's one-ledger accounting holds as phase P starts"
+        );
+        let slot = StdRc::new(StdRefCell::new(None));
+        let hook = {
+            let (slot, root, before) = (slot.clone(), dest.path.clone(), before.clone());
+            install_payload_hook_for_test(PayloadHookPointV1::BeforeStepGate, move |event| {
+                if event.step == Some(PayloadPlaneStepV1::TerminalGate) {
+                    *slot.borrow_mut() = Some(HeldTreeV1::hold(&root, &before));
+                }
+                if let Some(act) = &act {
+                    act(event);
+                }
+            })
+        };
+        let outcome = restore_payload_plane_v1(plane, frame_budget(), deadline);
+        drop(hook);
+        let held = slot.borrow_mut().take();
+        match &outcome {
+            Ok(done) => {
+                assert_eq!(done.step, PayloadPlaneStepV1::TerminalGate, "{row}");
+                assert!(
+                    done.plane
+                        .capsule()
+                        .staged
+                        .iter()
+                        .all(|one| position(one) == 0),
+                    "{row}: every staged descriptor is back at offset 0"
+                );
+                let held = held.as_ref().expect("held before the terminal gate");
+                assert_eq!(
+                    done.plane.ledger_used(),
+                    phase_v + phase_g + disk_charge(&held.now()),
+                    "{row}: the one ledger is phase V's charge plus phase G's and phase P's on disk"
+                );
+            }
+            Err(failure) => {
+                assert_eq!(
+                    failure.ledger_used,
+                    failure.partial.plane.ledger_used(),
+                    "{row}: the failure's figure is the one ledger's"
+                );
+                assert_eq!(
+                    failure.partial.plane.ledger_used(),
+                    ledger + charge_of(failure.partial.created.charged),
+                    "{row}: the one ledger moved by exactly what phase P charged"
+                );
+            }
+        }
+        if drift.borrow_mut().take().is_none() {
+            let outside: DiskTreeV1 = before
+                .iter()
+                .filter(|(name, _)| !in_phase_p_planes(name))
+                .map(|(name, entry)| (name.clone(), entry.clone()))
+                .collect();
+            assert_eq!(
+                disk_tree_where(&dest.path, |name| !in_phase_p_planes(name)),
+                outside,
+                "{row}: nothing phase V or phase G made changed, and nothing lies outside phase P's planes"
+            );
+        }
+        RestoredRunV1 {
+            // The whole area: a row may have moved a sealed tree out beside the destination.
+            _unseal: UnsealV1(
+                dest.path
+                    .parent()
+                    .expect("the destination's area")
+                    .to_path_buf(),
+            ),
+            dest,
+            held,
+            outcome,
+        }
+    }
+
+    fn restore(self, row: &str) -> RestoredRunV1 {
+        self.restore_with(row, far_deadline(), None)
+    }
+}
+
+impl RestoredRunV1 {
+    fn success(&self, row: &str) -> &RestoredPayloadPlaneV1 {
+        match &self.outcome {
+            Ok(done) => done,
+            Err(failure) => panic!(
+                "{row}: must restore: {:?} (completed {:?})",
+                failure.cause, failure.last_completed
+            ),
+        }
+    }
+
+    fn failure(&self, row: &str) -> &PayloadPlaneRestoreFailureV1 {
+        match &self.outcome {
+            Ok(_) => panic!("{row}: must refuse"),
+            Err(failure) => failure,
+        }
+    }
+
+    fn held(&self, row: &str) -> &HeldTreeV1 {
+        self.held
+            .as_ref()
+            .unwrap_or_else(|| panic!("{row}: the entries were held before the terminal gate"))
+    }
+
+    /// The success value's inventories are exactly what phase P added, as the held descriptors show it now:
+    /// each row's identity is the entry's, each mode written is its mode on disk, each file's length and
+    /// SHA-256 are its bytes', each link's target its target; nothing phase P added is missing from them; and
+    /// every retained directory pin is the directory its row names.
+    fn assert_inventory_is_the_disk(&self, row: &str) {
+        let done = self.success(row);
+        let held = self.held(row);
+        let now = held.now();
+        let mut recorded = DiskTreeV1::new();
+        let mut rows = |prefix: &[u8], entries: &[RestoredEntryV1]| {
+            for entry in entries {
+                let name = joined(prefix, &entry.path);
+                assert_eq!(
+                    held.identity(&name),
+                    (entry.dev, entry.ino),
+                    "{row}: {} is the recorded entry",
+                    lossy(&name)
+                );
+                let disk = match &entry.kind {
+                    CreatedKindV1::Directory => {
+                        DiskV1::Dir(entry.mode.expect("a directory's mode written"))
+                    }
+                    CreatedKindV1::Regular { length, sha256 } => {
+                        let Some(DiskV1::File(_, bytes)) = now.get(&name) else {
+                            panic!("{row}: {} is not a file", lossy(&name));
+                        };
+                        assert_eq!(bytes.len() as u64, *length, "{row}: {}", lossy(&name));
+                        assert_eq!(sha256_bytes(bytes), *sha256, "{row}: {}", lossy(&name));
+                        DiskV1::File(entry.mode.expect("a file's mode written"), bytes.clone())
+                    }
+                    CreatedKindV1::Symlink { target } => {
+                        assert_eq!(
+                            (entry.frame_mode, entry.mode),
+                            (None, None),
+                            "{row}: a link has no mode"
+                        );
+                        DiskV1::Link(target.clone())
+                    }
+                };
+                recorded.insert(name, disk);
+            }
+        };
+        rows(b"repository", &done.worktree.entries);
+        rows(b"repository/.git", &done.index.files);
+        let mut slots = Vec::new();
+        for slot in &done.evidence.slots {
+            let name = TreeAtV1::Evidence(slot.slot).prefix();
+            assert_eq!(held.identity(&name), (slot.dev, slot.ino), "{row}");
+            slots.push((name.clone(), DiskV1::Dir(slot.mode)));
+            rows(&name, &slot.entries);
+        }
+        if let Some((mode, dev, ino)) = done.evidence.root {
+            assert_eq!(held.identity(b"evidence"), (dev, ino), "{row}: evidence/");
+            recorded.insert(b"evidence".to_vec(), DiskV1::Dir(mode));
+        }
+        recorded.extend(slots);
+        assert_eq!(
+            now, recorded,
+            "{row}: the inventory is exactly what phase P added, with the modes on disk"
+        );
+
+        let pinned = |name: &[u8], pin: &PinnedDirectoryV1| {
+            assert_eq!(
+                (Some(held.identity(name).0), Some(held.identity(name).1)),
+                (pin.identity().dev, pin.identity().ino),
+                "{row}: {}'s pin",
+                lossy(name)
+            );
+        };
+        let directories = |entries: &[RestoredEntryV1]| {
+            entries
+                .iter()
+                .filter(|entry| entry.kind == CreatedKindV1::Directory)
+                .count()
+        };
+        assert_eq!(
+            done.pins.worktree.len(),
+            directories(&done.worktree.entries),
+            "{row}"
+        );
+        for (path, pin) in &done.pins.worktree {
+            pinned(&joined(b"repository", path), pin);
+        }
+        assert_eq!(done.pins.evidence.is_some(), done.evidence.root.is_some());
+        if let Some(pin) = &done.pins.evidence {
+            pinned(b"evidence", pin);
+        }
+        assert_eq!(
+            done.pins
+                .evidence_slots
+                .iter()
+                .map(|one| one.slot)
+                .collect::<Vec<_>>(),
+            done.evidence
+                .slots
+                .iter()
+                .map(|one| one.slot)
+                .collect::<Vec<_>>(),
+            "{row}"
+        );
+        for (pins, slot) in done.pins.evidence_slots.iter().zip(&done.evidence.slots) {
+            let name = TreeAtV1::Evidence(pins.slot).prefix();
+            pinned(&name, &pins.pin);
+            assert_eq!(pins.directories.len(), directories(&slot.entries), "{row}");
+            for (path, pin) in &pins.directories {
+                pinned(&joined(&name, path), pin);
+            }
+        }
+    }
+
+    /// A refused terminal gate kept everything: every entry the failure names as sealed has exactly that
+    /// mode, and every other entry phase P added still has its created mode (`0700`, `0600`), as the held
+    /// descriptors show; `changed` are the row's own mode changes, which are not compared.
+    fn assert_seals_are_the_disk(&self, row: &str, changed: &[&[u8]]) {
+        let failure = self.failure(row);
+        let sealed: BTreeMap<Vec<u8>, u32> = failure
+            .partial
+            .sealed
+            .iter()
+            .map(|one| (one.name.clone(), one.mode))
+            .collect();
+        assert_eq!(
+            sealed.len(),
+            failure.partial.sealed.len(),
+            "{row}: each entry is sealed at most once"
+        );
+        let now = self.held(row).now();
+        for name in sealed.keys() {
+            assert!(now.contains_key(name), "{row}: {} was added", lossy(name));
+        }
+        for (name, entry) in &now {
+            if changed.contains(&name.as_slice()) {
+                continue;
+            }
+            let (mode, created) = match entry {
+                DiskV1::Dir(mode) => (Some(*mode), Some(0o700)),
+                DiskV1::File(mode, _) => (Some(*mode), Some(0o600)),
+                DiskV1::Link(_) => (None, None),
+            };
+            assert_eq!(
+                mode,
+                sealed.get(name).copied().or(created),
+                "{row}: {}",
+                lossy(name)
+            );
+        }
+    }
+}
+
+/// The worktree and evidence frames of the mode controls: files `0000`, `0200`, and `0755`; a `0000`
+/// directory holding a `0000` directory that holds a file; a `0750` directory holding a `0000` directory
+/// that holds a file; a `0555` directory with a file, a link, and a `0700` directory with a file; a childless
+/// `0711` directory and a link escaping `repository/`; and an evidence class whose own modes (an executable
+/// hook, a `0000` directory) are kept only in the inventory.
+fn mode_frames() -> Vec<(ClassV1, Vec<u8>)> {
+    let worktree = [
+        (&b"f0000"[..], ModedV1::File(0o000, b"zero\n")),
+        (b"f0200", ModedV1::File(0o200, b"write-only\n")),
+        (b"f0755", ModedV1::File(0o755, b"#!/bin/sh\nexit 0\n")),
+        (b"zero", ModedV1::Dir(0o000)),
+        (b"zero/deeper", ModedV1::Dir(0o000)),
+        (
+            b"zero/deeper/file",
+            ModedV1::File(0o640, b"beneath two sealed directories\n"),
+        ),
+        (b"nest", ModedV1::Dir(0o750)),
+        (b"nest/locked", ModedV1::Dir(0o000)),
+        (
+            b"nest/locked/file",
+            ModedV1::File(0o604, b"inside a 0000 directory\n"),
+        ),
+        (b"ro", ModedV1::Dir(0o555)),
+        (b"ro/a", ModedV1::File(0o444, b"a\n")),
+        (b"ro/link", ModedV1::Link(b"a")),
+        (b"ro/sub", ModedV1::Dir(0o700)),
+        (b"ro/sub/b", ModedV1::File(0o600, b"b\n")),
+        (b"empty", ModedV1::Dir(0o711)),
+        (b"outside", ModedV1::Link(b"../outside")),
+    ];
+    let config = [
+        (&b"config"[..], ModedV1::File(0o644, b"[core]\n")),
+        (b"hooks", ModedV1::Dir(0o000)),
+        (
+            b"hooks/pre-commit",
+            ModedV1::File(0o777, b"#!/bin/sh\nexit 0\n"),
+        ),
+        (b"hooks/up", ModedV1::Link(b"../config")),
+    ];
+    vec![
+        (P_WORKTREE_V1, moded_frame(P_WORKTREE_V1, &worktree)),
+        (
+            P_INDEX_V1,
+            moded_frame(P_INDEX_V1, &[(b"index", ModedV1::File(0o644, b"DIRC0001"))]),
+        ),
+        (P_CONFIG_V1, moded_frame(P_CONFIG_V1, &config)),
+    ]
+}
+
+/// The inventory row at `path` of `entries`.
+fn row_at<'e>(entries: &'e [RestoredEntryV1], path: &[u8]) -> &'e RestoredEntryV1 {
+    entries
+        .iter()
+        .find(|entry| entry.path == path)
+        .unwrap_or_else(|| panic!("{} is inventoried", lossy(path)))
+}
+
+// ---------------------------------------------------------------------------------------------
+// Final modes
+// ---------------------------------------------------------------------------------------------
+
+/// Files `0000`, `0200`, and `0755`, a `0000` directory nested in a `0000` and in a `0750` directory and
+/// holding a file, and a `0555` directory with a file, a link, and a directory all restore, verify, and end
+/// with exactly their frame modes, as a non-root owner too: every directory is searched and every file read
+/// before its own seal, never after. The held descriptors show every final mode and every byte, the inventory
+/// shows the same modes beside the frame modes, and the index ends `0600` with its frame mode `0644` kept.
+/// As a non-root owner, the sealed `0000` directories really are closed to a lookup now.
+#[test]
+fn c3_every_frame_mode_restores_and_is_sealed_exactly() {
+    let capsule = frames_capsule();
+    let run = PCaseV1::with_frames(&capsule, &mode_frames()).restore("modes");
+    let done = run.success("modes");
+    assert_eq!(
+        run.held("modes").now(),
+        expected_final(&done.plane),
+        "every byte, with its final mode"
+    );
+    run.assert_inventory_is_the_disk("modes");
+    let now = run.held("modes").now();
+    for (name, want) in [
+        (
+            &b"repository/f0000"[..],
+            DiskV1::File(0o000, b"zero\n".to_vec()),
+        ),
+        (
+            b"repository/f0200",
+            DiskV1::File(0o200, b"write-only\n".to_vec()),
+        ),
+        (
+            b"repository/f0755",
+            DiskV1::File(0o755, b"#!/bin/sh\nexit 0\n".to_vec()),
+        ),
+        (b"repository/zero", DiskV1::Dir(0o000)),
+        (b"repository/zero/deeper", DiskV1::Dir(0o000)),
+        (b"repository/nest", DiskV1::Dir(0o750)),
+        (b"repository/nest/locked", DiskV1::Dir(0o000)),
+        (
+            b"repository/nest/locked/file",
+            DiskV1::File(0o604, b"inside a 0000 directory\n".to_vec()),
+        ),
+        (b"repository/ro", DiskV1::Dir(0o555)),
+        (b"repository/ro/a", DiskV1::File(0o444, b"a\n".to_vec())),
+        (b"repository/ro/link", DiskV1::Link(b"a".to_vec())),
+        (b"repository/ro/sub", DiskV1::Dir(0o700)),
+        (
+            b"repository/.git/index",
+            DiskV1::File(0o600, b"DIRC0001".to_vec()),
+        ),
+    ] {
+        assert_eq!(now.get(name), Some(&want), "{}", lossy(name));
+    }
+    for (path, frame, written) in [
+        (&b"f0000"[..], 0o000, 0o000),
+        (b"f0200", 0o200, 0o200),
+        (b"f0755", 0o755, 0o755),
+        (b"zero/deeper", 0o000, 0o000),
+        (b"nest/locked", 0o000, 0o000),
+        (b"ro", 0o555, 0o555),
+    ] {
+        let entry = row_at(&done.worktree.entries, path);
+        assert_eq!(
+            (entry.frame_mode, entry.mode),
+            (Some(frame), Some(written)),
+            "{}",
+            lossy(path)
+        );
+    }
+    let index = row_at(&done.index.files, b"index");
+    assert_eq!((index.frame_mode, index.mode), (Some(0o644), Some(0o600)));
+    assert_eq!(
+        done.worktree.state,
+        PayloadClassStateV1::Captured {
+            staged: staged_index(done.plane.capsule(), P_WORKTREE_V1)
+        }
+    );
+    assert_eq!(done.worktree.root_git, RootGitDispositionV1::Absent);
+    assert_eq!(done.worktree.childless_directories, [b"empty".to_vec()]);
+    assert_eq!(now.get(&b"repository/empty"[..]), Some(&DiskV1::Dir(0o711)));
+    assert_eq!(
+        done.declared_external_references,
+        [ExternalSymlinkV1 {
+            plane: PayloadPlaneV1::Worktree,
+            path: b"outside".to_vec(),
+            target: b"../outside".to_vec(),
+        }]
+    );
+    if !running_as_root() {
+        for sealed in ["repository/zero/deeper", "repository/nest/locked/file"] {
+            let error = std::fs::symlink_metadata(run.dest.path.join(sealed))
+                .expect_err("a lookup beneath a sealed 0000 directory");
+            assert_eq!(
+                error.kind(),
+                std::io::ErrorKind::PermissionDenied,
+                "{sealed}"
+            );
+        }
+    }
+    println!("PAYLOAD-SEAL-MODES as_root={}", running_as_root());
+}
+
+/// D3's opposite branch, restored whole on a REAL planned capsule (a worktree whose root `.git` is a gitfile
+/// naming the in-worktree separate Git directory `.gd`, plus an ordinary empty directory): the result reports
+/// the root gitfile's disposition and both childless directories, with no claim about which was a Git
+/// directory; the gitfile ends inert at `evidence/worktree_root_gitfile/gitfile` (`0400`, with its frame mode
+/// inventoried, beneath a `0500` slot and `evidence/`) holding the source's bytes; both childless directories
+/// end with their frame modes; and nothing is at `repository/.git` but phase G's directory.
+#[test]
+fn c3_the_root_gitfile_ends_inert_and_every_childless_directory_is_reported() {
+    let source = SeparateGitDirV1::export();
+    let repo = source
+        .capsule
+        .parent()
+        .and_then(Path::parent)
+        .expect("the fixture's area")
+        .join("repo");
+    let gitfile = std::fs::read(repo.join(".git")).expect("the source gitfile");
+    let run = PCaseV1::sealed(&source.capsule).restore("separate git dir");
+    let done = run.success("separate git dir");
+    let now = run.held("separate git dir").now();
+    assert_eq!(now, expected_final(&done.plane));
+    run.assert_inventory_is_the_disk("separate git dir");
+    assert_eq!(
+        done.worktree.root_git,
+        RootGitDispositionV1::RootGitfileToEvidence
+    );
+    assert_eq!(
+        done.worktree.childless_directories,
+        [b".gd".to_vec(), b"empty".to_vec()]
+    );
+    assert_eq!(
+        now.get(&b"evidence/worktree_root_gitfile/gitfile"[..]),
+        Some(&DiskV1::File(0o400, gitfile))
+    );
+    let slot = &done.evidence.slots[0];
+    assert_eq!(
+        (slot.slot, slot.mode),
+        (EvidenceSlotV1::WorktreeRootGitfile, 0o500)
+    );
+    let frame: BTreeMap<Vec<u8>, OwnKindV1> = own_contents(&done.plane, P_WORKTREE_V1)
+        .into_iter()
+        .map(|(path, kind, _)| (path, kind))
+        .collect();
+    let Some(OwnKindV1::File(gitfile_mode, _)) = frame.get(&b".git"[..]) else {
+        panic!("the frame's root gitfile");
+    };
+    let row = row_at(&slot.entries, b"gitfile");
+    assert_eq!(
+        (row.frame_mode, row.mode),
+        (Some(*gitfile_mode), Some(0o400))
+    );
+    for name in [&b".gd"[..], b"empty"] {
+        let Some(OwnKindV1::Dir(mode)) = frame.get(name) else {
+            panic!("{} is a frame directory", lossy(name));
+        };
+        assert_eq!(
+            now.get(&joined(b"repository", name)),
+            Some(&DiskV1::Dir(*mode)),
+            "{}",
+            lossy(name)
+        );
+    }
+    use std::os::unix::fs::MetadataExt as _;
+    let git =
+        std::fs::symlink_metadata(run.dest.path.join("repository/.git")).expect("repository/.git");
+    assert_eq!(
+        (git.is_dir(), Some(git.dev()), Some(git.ino())),
+        (
+            true,
+            done.plane.objects.pins.git.identity().dev,
+            done.plane.objects.pins.git.identity().ino
+        ),
+        "repository/.git is still phase G's directory"
+    );
+}
+
+/// What the instrumented seam saw of the terminal gate, in order.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum SeenV1 {
+    Entry(PathBuf),
+    Lookup(PathBuf),
+    Sealed(PathBuf),
+}
+
+/// The instrumented seam: every by-name lookup of the terminal gate, every entry's one terminal observation,
+/// and every seal, in order. No name is looked up at or beneath an entry once it is sealed (a sealed `0000`
+/// directory would refuse a non-root lookup); every entry phase P added is observed exactly once and every
+/// file and directory sealed once, a directory after everything beneath it; a directory's one observation
+/// (its own name, from its parent) follows every event beneath it and leads straight to its seal; and no
+/// retained phase-V or phase-G pin, which the chains after the walk look names up beneath, lies at or
+/// beneath a sealed entry.
+#[test]
+fn c3_no_name_is_looked_up_beneath_a_sealed_directory() {
+    let capsule = frames_capsule();
+    let mut frames = mode_frames();
+    frames.push((P_BRIDGE_V1, p_frame(P_BRIDGE_V1, &[file("e", b"evidence")])));
+    let case = PCaseV1::with_frames(&capsule, &frames);
+    let root = case.dest.path.clone();
+    let seen = StdRc::new(StdRefCell::new(Vec::new()));
+    let record = |kind: fn(PathBuf) -> SeenV1| {
+        let seen = seen.clone();
+        move |event: &PayloadHookEventV1<'_>| seen.borrow_mut().push(kind(event.path.to_path_buf()))
+    };
+    let _entry =
+        install_payload_hook_for_test(PayloadHookPointV1::TerminalEntry, record(SeenV1::Entry));
+    let _lookup =
+        install_payload_hook_for_test(PayloadHookPointV1::TerminalLookup, record(SeenV1::Lookup));
+    let _sealed =
+        install_payload_hook_for_test(PayloadHookPointV1::TerminalSealed, record(SeenV1::Sealed));
+    let run = case.restore("the seam");
+    let done = run.success("the seam");
+    let seen = seen.borrow().clone();
+    assert!(
+        seen.iter().any(|one| matches!(one, SeenV1::Lookup(_))),
+        "the seam observed the walk"
+    );
+
+    let mut sealed: Vec<&PathBuf> = Vec::new();
+    for (at, one) in seen.iter().enumerate() {
+        let path = match one {
+            SeenV1::Entry(path) | SeenV1::Lookup(path) | SeenV1::Sealed(path) => path,
+        };
+        if let Some(closed) = sealed.iter().find(|closed| path.starts_with(closed)) {
+            panic!(
+                "event {at} ({one:?}) is at or beneath {}, sealed before it",
+                closed.display()
+            );
+        }
+        if let SeenV1::Sealed(path) = one {
+            sealed.push(path);
+        }
+    }
+
+    let held = run.held("the seam").now();
+    let mut added: Vec<PathBuf> = held
+        .keys()
+        .map(|name| root.join(OsStr::from_bytes(name)))
+        .collect();
+    added.sort();
+    let mut entries: Vec<PathBuf> = seen
+        .iter()
+        .filter_map(|one| match one {
+            SeenV1::Entry(path) => Some(path.clone()),
+            _ => None,
+        })
+        .collect();
+    let observed = entries.len();
+    entries.sort();
+    entries.dedup();
+    assert_eq!(observed, entries.len(), "each entry is observed once");
+    assert_eq!(entries, added, "every entry phase P added is observed");
+    let mut sealed: Vec<PathBuf> = sealed.into_iter().cloned().collect();
+    let seals = sealed.len();
+    sealed.sort();
+    sealed.dedup();
+    assert_eq!(seals, sealed.len(), "each entry is sealed once");
+    let unsealed: Vec<PathBuf> = held
+        .iter()
+        .filter(|(_, entry)| matches!(entry, DiskV1::Link(_)))
+        .map(|(name, _)| root.join(OsStr::from_bytes(name)))
+        .collect();
+    assert_eq!(
+        sealed,
+        added
+            .iter()
+            .filter(|path| !unsealed.contains(path))
+            .cloned()
+            .collect::<Vec<_>>(),
+        "every file and directory is sealed, and no link"
+    );
+
+    // Post-order observation: a directory's own name is checked only once nothing beneath it is visited
+    // again, and nothing but that check comes between it and the directory's seal.
+    let path_of = |one: &SeenV1| match one {
+        SeenV1::Entry(path) | SeenV1::Lookup(path) | SeenV1::Sealed(path) => path.clone(),
+    };
+    let directories: Vec<PathBuf> = held
+        .iter()
+        .filter(|(_, entry)| matches!(entry, DiskV1::Dir(_)))
+        .map(|(name, _)| root.join(OsStr::from_bytes(name)))
+        .collect();
+    assert!(
+        directories.len() > 5,
+        "the frames hold worktree and evidence directories"
+    );
+    for directory in &directories {
+        let observed = seen
+            .iter()
+            .position(|one| *one == SeenV1::Entry(directory.clone()))
+            .unwrap_or_else(|| panic!("{} is observed", directory.display()));
+        let sealed_at = seen
+            .iter()
+            .position(|one| *one == SeenV1::Sealed(directory.clone()))
+            .unwrap_or_else(|| panic!("{} is sealed", directory.display()));
+        if let Some(last) = seen.iter().rposition(|one| {
+            let path = path_of(one);
+            path != *directory && path.starts_with(directory)
+        }) {
+            assert!(
+                last < observed,
+                "event {last} ({:?}) is beneath {}, observed before it at event {observed}",
+                seen[last],
+                directory.display()
+            );
+        }
+        assert!(
+            observed < sealed_at
+                && seen[observed..sealed_at]
+                    .iter()
+                    .all(|one| path_of(one) == *directory),
+            "{}: only its own observation precedes its seal",
+            directory.display()
+        );
+    }
+
+    // The chains after the walk look names up only beneath retained phase-V and phase-G pins.
+    let plane = &done.plane;
+    let dest = &plane.capsule().destination;
+    let pins = &plane.objects.pins;
+    let mut retained: Vec<&Path> = vec![
+        dest.root.canonical_path(),
+        dest.work.canonical_path(),
+        dest.plain.canonical_path(),
+        plane.bootstrap.home.canonical_path(),
+        plane.bootstrap.xdg.canonical_path(),
+    ];
+    for pin in [
+        &pins.repository,
+        &pins.git,
+        &pins.objects,
+        &pins.pack,
+        &pins.info,
+    ] {
+        retained.push(pin.canonical_path());
+    }
+    retained.extend(
+        plane
+            .metadata
+            .directories
+            .values()
+            .map(|pin| pin.canonical_path()),
+    );
+    retained.extend(
+        plane
+            .bootstrap
+            .directories
+            .values()
+            .map(|pin| pin.canonical_path()),
+    );
+    let staging: Vec<PathBuf> = dest
+        .staging
+        .borrow()
+        .values()
+        .map(|pin| pin.canonical_path().to_path_buf())
+        .collect();
+    retained.extend(staging.iter().map(PathBuf::as_path));
+    for pin in retained {
+        assert!(
+            !sealed.iter().any(|closed| pin.starts_with(closed)),
+            "{} lies beneath a sealed entry",
+            pin.display()
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Each entry's one terminal observation
+// ---------------------------------------------------------------------------------------------
+
+/// The names the three-step frames' terminal gate seals, in its order: the worktree's `a`, `d/x`, then `d`
+/// (`l` is a link), the index, and the evidence file, its slot, then `evidence/`.
+const SEAL_ORDER_V1: [&str; 7] = [
+    "repository/a",
+    "repository/d/x",
+    "repository/d",
+    "repository/.git/index",
+    "evidence/bridge_evidence/e",
+    "evidence/bridge_evidence",
+    "evidence",
+];
+
+/// Runs `act` once, at the `nth` event (from 0) whose path is `target`.
+fn nth_at(
+    target: PathBuf,
+    nth: usize,
+    act: impl Fn(&Path) + 'static,
+) -> impl Fn(&PayloadHookEventV1<'_>) + 'static {
+    let seen = StdCell::new(0_usize);
+    move |event| {
+        if event.path == target {
+            if seen.get() == nth {
+                act(event.path);
+            }
+            seen.set(seen.get() + 1);
+        }
+    }
+}
+
+/// `path` as a symlink to `target`, atomically: the link is made beside the destination and renamed over.
+fn replace_with_target(path: &Path, outside: &Path, target: &str) {
+    let staged = outside.join("replacement-target-link");
+    std::os::unix::fs::symlink(target, &staged).expect("a link");
+    std::fs::rename(&staged, path).expect("the link takes the name");
+}
+
+/// The typed refusal of a terminal-gate row: the cause `is`, `Evidence` the last step completed, writes
+/// began, and exactly `sealed` sealed, in order.
+fn refused_at_the_terminal_gate(
+    run: &RestoredRunV1,
+    row: &str,
+    is: impl Fn(&PayloadPlaneErrorV1) -> bool,
+    sealed: &[&str],
+) {
+    let failure = run.failure(row);
+    assert!(is(&failure.cause), "{row}: {:?}", failure.cause);
+    assert_eq!(
+        failure.last_completed,
+        Some(PayloadPlaneStepV1::Evidence),
+        "{row}"
+    );
+    assert!(failure.payload_materialization_began, "{row}");
+    assert_eq!(
+        failure
+            .partial
+            .sealed
+            .iter()
+            .map(|one| lossy(&one.name))
+            .collect::<Vec<_>>(),
+        sealed,
+        "{row}: exactly what was sealed before it"
+    );
+}
+
+fn identity_changed(cause: &PayloadPlaneErrorV1) -> bool {
+    matches!(
+        cause,
+        PayloadPlaneErrorV1::Restore(CustodyRestoreErrorV1::IdentityChanged(_))
+    )
+}
+
+/// A replacement immediately before an entry's one terminal observation refuses as an identity change at
+/// that entry, with `Evidence` the last step completed: a worktree file as another inode with the same bytes,
+/// a directory swapped for a new one (its observation follows its subtree, which is sealed), a file beneath
+/// it, a link as another link with the same target, the index file, `evidence/` itself, a slot directory,
+/// and an evidence file. Everything sealed before it keeps its final mode and nothing after it is sealed or
+/// removed. A directory's own name is checked after its subtree, never before: `repository/d`, a slot, or
+/// `evidence/` renamed away (still walked through its retained pin) and a new directory put at its name while
+/// a file beneath it is observed refuses at that directory's observation, with the file sealed and the
+/// directory not. Inside one observation: a file replaced between its by-name stat and its reopen (by
+/// another inode, or by a link the reopen will not follow), and a link retargeted before its `readlinkat` or
+/// replaced before its closing stat, refuse the same way. A file made `0000` in place (which a non-root
+/// reopen could not even open) and a link replaced by a regular file of its target's length (which
+/// `readlinkat` cannot read) are refused typed by the by-name stat itself.
+#[test]
+fn c3_a_replacement_before_an_entrys_terminal_observation_refuses_typed() {
+    type ActV1 = fn(&Path, &Path);
+    let capsule = frames_capsule();
+    let frames = three_step_frames();
+    let rows: [(&str, &str, usize, ActV1, usize); 17] = [
+        (
+            "a file as another inode",
+            "repository/a",
+            0,
+            |path, area| replace_with_same_bytes(path, area),
+            0,
+        ),
+        (
+            "a directory swapped",
+            "repository/d",
+            0,
+            |path, area| swap_directory(path, area),
+            2,
+        ),
+        (
+            "a directory's own name swapped while its file is observed",
+            "repository/d/x",
+            0,
+            |path, area| swap_directory(path.parent().expect("d"), area),
+            2,
+        ),
+        (
+            "a slot's own name swapped while its file is observed",
+            "evidence/bridge_evidence/e",
+            0,
+            |path, area| swap_directory(path.parent().expect("the slot"), area),
+            5,
+        ),
+        (
+            "evidence/'s own name swapped while a slot's file is observed",
+            "evidence/bridge_evidence/e",
+            0,
+            |path, area| {
+                let evidence = path.parent().and_then(Path::parent).expect("evidence/");
+                swap_directory(evidence, area);
+            },
+            6,
+        ),
+        (
+            "a file beneath a directory",
+            "repository/d/x",
+            0,
+            |path, area| replace_with_same_bytes(path, area),
+            1,
+        ),
+        (
+            "a link as another link",
+            "repository/l",
+            0,
+            |path, area| replace_with_target(path, area, "a"),
+            3,
+        ),
+        (
+            "the index file",
+            "repository/.git/index",
+            0,
+            |path, area| replace_with_same_bytes(path, area),
+            3,
+        ),
+        (
+            "evidence/ itself",
+            "evidence",
+            0,
+            |path, area| swap_directory(path, area),
+            6,
+        ),
+        (
+            "a slot directory",
+            "evidence/bridge_evidence",
+            0,
+            |path, area| swap_directory(path, area),
+            5,
+        ),
+        (
+            "an evidence file",
+            "evidence/bridge_evidence/e",
+            0,
+            |path, area| replace_with_same_bytes(path, area),
+            4,
+        ),
+        (
+            "a file replaced before its reopen",
+            "repository/a",
+            1,
+            |path, area| replace_with_same_bytes(path, area),
+            0,
+        ),
+        (
+            "a file replaced by a link before its reopen",
+            "repository/a",
+            1,
+            |path, area| replace_with_target(path, area, "d/x"),
+            0,
+        ),
+        (
+            "a link retargeted before its readlinkat",
+            "repository/l",
+            1,
+            |path, area| replace_with_target(path, area, "b"),
+            3,
+        ),
+        (
+            "a link replaced before its closing stat",
+            "repository/l",
+            2,
+            |path, area| replace_with_target(path, area, "a"),
+            3,
+        ),
+        (
+            "a file made 0000 before its observation",
+            "repository/a",
+            0,
+            |path, _| {
+                use std::os::unix::fs::PermissionsExt as _;
+                std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o000))
+                    .expect("a mode change");
+            },
+            0,
+        ),
+        (
+            "a link replaced by a file before its observation",
+            "repository/l",
+            0,
+            |path, area| {
+                let staged = area.join("replacement-file");
+                std::fs::write(&staged, b"a").expect("a file of the link's length");
+                std::fs::rename(&staged, path).expect("it takes the name");
+            },
+            3,
+        ),
+    ];
+    for (row, name, lookup, act, sealed) in rows {
+        let case = PCaseV1::with_frames(&capsule, &frames);
+        let target = case.dest.path.join(name);
+        let area = case.dest.path.parent().expect("the area").to_path_buf();
+        let hook = move |path: &Path| act(path, &area);
+        let _guard = if lookup == 0 {
+            install_payload_hook_for_test(
+                PayloadHookPointV1::TerminalEntry,
+                nth_at(target, 0, hook),
+            )
+        } else {
+            install_payload_hook_for_test(
+                PayloadHookPointV1::TerminalLookup,
+                nth_at(target, lookup, hook),
+            )
+        };
+        let run = case.restore(row);
+        refused_at_the_terminal_gate(&run, row, identity_changed, &SEAL_ORDER_V1[..sealed]);
+        let changed: &[&[u8]] = if row.contains("0000") {
+            &[name.as_bytes()]
+        } else {
+            &[]
+        };
+        run.assert_seals_are_the_disk(row, changed);
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Byte integrity
+// ---------------------------------------------------------------------------------------------
+
+/// `path`'s first byte flipped in place: the same inode and the same length, other bytes.
+fn rewrite_in_place(path: &Path) {
+    use std::os::unix::fs::FileExt as _;
+    let bytes = std::fs::read(path).expect("the file");
+    let handle = std::fs::OpenOptions::new()
+        .write(true)
+        .open(path)
+        .expect("the file, for writing");
+    handle
+        .write_all_at(&[!bytes[0]], 0)
+        .expect("one byte rewritten in place");
+}
+
+/// A file rewritten in place (the same inode and length, other bytes) before the terminal gate refuses with
+/// the typed byte-integrity error naming it, with `Evidence` the last step completed: a worktree file, the
+/// index, and an evidence file, rewritten just before the terminal gate, and a worktree file rewritten before
+/// the worktree's own step gate, which compares identity and mode and so passes it. The rewritten bytes stay
+/// (nothing is removed) and the file stays `0600`. A file rewritten with its own bytes after it was read and
+/// before its descriptor's closing `fstat` refuses as an identity change: it changed while it was read.
+#[test]
+fn c3_a_file_rewritten_in_place_refuses_as_content_changed() {
+    let capsule = frames_capsule();
+    let frames = three_step_frames();
+    let rows: [(&str, PayloadPlaneStepV1, &str, usize); 4] = [
+        (
+            "a worktree file before the terminal gate",
+            PayloadPlaneStepV1::TerminalGate,
+            "repository/a",
+            0,
+        ),
+        (
+            "the index before the terminal gate",
+            PayloadPlaneStepV1::TerminalGate,
+            "repository/.git/index",
+            3,
+        ),
+        (
+            "an evidence file before the terminal gate",
+            PayloadPlaneStepV1::TerminalGate,
+            "evidence/bridge_evidence/e",
+            4,
+        ),
+        (
+            "a worktree file before the worktree's step gate",
+            PayloadPlaneStepV1::Worktree,
+            "repository/d/x",
+            1,
+        ),
+    ];
+    for (row, step, name, sealed) in rows {
+        let case = PCaseV1::with_frames(&capsule, &frames);
+        let target = case.dest.path.join(name);
+        let act: StepActV1 = Box::new(move |event| {
+            if event.step == Some(step) {
+                rewrite_in_place(&target);
+            }
+        });
+        let run = case.restore_with(row, far_deadline(), Some(act));
+        refused_at_the_terminal_gate(
+            &run,
+            row,
+            |cause| matches!(cause, PayloadPlaneErrorV1::ContentChanged { name: found } if found == name),
+            &SEAL_ORDER_V1[..sealed],
+        );
+        run.assert_seals_are_the_disk(row, &[]);
+        let now = run.held(row).now();
+        let Some(DiskV1::File(mode, bytes)) = now.get(name.as_bytes()) else {
+            panic!("{row}: {name} is held");
+        };
+        let original = expected_added(&run.failure(row).partial.plane);
+        let Some(DiskV1::File(_, written)) = original.get(name.as_bytes()) else {
+            panic!("{row}: {name} is planned");
+        };
+        assert_eq!(*mode, 0o600, "{row}: not sealed");
+        assert_eq!(bytes.len(), written.len(), "{row}: the same length");
+        assert_eq!(bytes[0], !written[0], "{row}: the rewritten bytes stay");
+    }
+
+    let case = PCaseV1::with_frames(&capsule, &frames);
+    let target = case.dest.path.join("repository/a");
+    let _hook = install_payload_hook_for_test(
+        PayloadHookPointV1::TerminalDigested,
+        nth_at(target, 0, |path| {
+            // A write is seen by the closing `fstat` through its timestamps, which a coarse clock could
+            // leave unchanged inside one tick.
+            std::thread::sleep(Duration::from_millis(50));
+            let bytes = std::fs::read(path).expect("the file");
+            use std::os::unix::fs::FileExt as _;
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(path)
+                .expect("the file, for writing")
+                .write_all_at(&bytes, 0)
+                .expect("its own bytes, again");
+        }),
+    );
+    let row = "rewritten after it was read";
+    let run = case.restore(row);
+    refused_at_the_terminal_gate(&run, row, identity_changed, &[]);
+    run.assert_seals_are_the_disk(row, &[]);
+}
+
+// ---------------------------------------------------------------------------------------------
+// The seal's confirmation
+// ---------------------------------------------------------------------------------------------
+
+/// A mode changed between an entry's `fchmod` (the primitive's, confirmed by the primitive) and phase P's own
+/// confirming `fstat` of the same descriptor refuses as an identity change, with `Evidence` the last step
+/// completed and the entry not recorded as sealed: a worktree file, a worktree directory, the index, an
+/// evidence file, and `evidence/` itself. The primitive's own window (after its `fchmod`, before its `fstat`)
+/// is C1's seam, private to `fs_custody`; C1's `mode_03` covers it.
+#[test]
+fn c3_a_mode_changed_after_its_fchmod_refuses() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let capsule = frames_capsule();
+    let frames = three_step_frames();
+    let rows: [(&str, &str, u32, usize); 5] = [
+        ("a worktree file", "repository/a", 0o600, 0),
+        ("a worktree directory", "repository/d", 0o700, 2),
+        ("the index", "repository/.git/index", 0o640, 3),
+        ("an evidence file", "evidence/bridge_evidence/e", 0o600, 4),
+        ("evidence/ itself", "evidence", 0o700, 6),
+    ];
+    for (row, name, other, sealed) in rows {
+        let case = PCaseV1::with_frames(&capsule, &frames);
+        let target = case.dest.path.join(name);
+        let _hook = install_payload_hook_for_test(
+            PayloadHookPointV1::TerminalModeSet,
+            nth_at(target, 0, move |path| {
+                std::fs::set_permissions(path, std::fs::Permissions::from_mode(other))
+                    .expect("another mode");
+            }),
+        );
+        let run = case.restore(row);
+        refused_at_the_terminal_gate(&run, row, identity_changed, &SEAL_ORDER_V1[..sealed]);
+        run.assert_seals_are_the_disk(row, &[name.as_bytes()]);
+        let now = run.held(row).now();
+        let mode = match now.get(name.as_bytes()) {
+            Some(DiskV1::Dir(mode) | DiskV1::File(mode, _)) => *mode,
+            other => panic!("{row}: {other:?}"),
+        };
+        assert_eq!(mode, other, "{row}: the changed mode is what refused");
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// The gate's order, and a refused terminal gate
+// ---------------------------------------------------------------------------------------------
+
+/// A refused terminal gate names `Evidence` as the last step completed and keeps everything: a mount
+/// appearing at its census (the sixth of a clean restore: two planning gates, three step gates, and the
+/// terminal gate) refuses before anything is sealed; and every retained phase-V and phase-G chain changed
+/// just before the terminal gate (the metadata `refs` directory, the object `info` directory, `HEAD` and a
+/// copied object file as other inodes, an admitted bootstrap file and a bootstrap directory on a Captured
+/// database, the plain staging, HOME, and XDG directories) refuses as an identity change after every entry
+/// is sealed, so those chains are rechecked after the walk; the destination root swapped refuses at the
+/// root's identity, LAST, after every entry is sealed and every retained chain passed through its pins.
+#[test]
+fn c3_a_refused_terminal_gate_names_evidence_and_keeps_everything() {
+    let capsule = frames_capsule();
+    let frames = three_step_frames();
+
+    let census = crate::custody_mounts::seam::install_list(vec![b"/".to_vec()]);
+    let case = PCaseV1::with_frames(&capsule, &frames);
+    let phase_g = census.calls();
+    let _ = case.restore("clean").success("clean");
+    assert_eq!(
+        census.calls() - phase_g,
+        6,
+        "two planning gates, three step gates, and the terminal gate"
+    );
+    drop(census);
+
+    let case = PCaseV1::with_frames(&capsule, &frames);
+    let inside = mount_inside(&case.dest.path);
+    let _census = crate::custody_mounts::seam::install(Box::new(move |call| {
+        if call == 6 {
+            Ok(vec![b"/".to_vec(), inside.clone()])
+        } else {
+            Ok(vec![b"/".to_vec()])
+        }
+    }));
+    let row = "a mount at the terminal census";
+    let run = case.restore(row);
+    refused_at_the_terminal_gate(
+        &run,
+        row,
+        |cause| {
+            matches!(
+                cause,
+                PayloadPlaneErrorV1::Restore(CustodyRestoreErrorV1::MountBoundary(_))
+            )
+        },
+        &[],
+    );
+    run.assert_seals_are_the_disk(row, &[]);
+    drop(_census);
+
+    // Each retained chain, changed just before the terminal gate: on the three-step frames, every entry is
+    // sealed first; on a Captured database (which restores no phase-P class), nothing was created.
+    type ActV1 = fn(&Path);
+    let rows: [(&str, bool, ActV1); 10] = [
+        ("the metadata refs directory", false, |root| {
+            swap_out(root, &root.join("repository/.git/refs"));
+        }),
+        ("the object info directory", false, |root| {
+            swap_out(root, &root.join("repository/.git/objects/info"));
+        }),
+        ("HEAD as another inode", false, |root| {
+            let beside = root.parent().expect("the destination's area");
+            replace_with_same_bytes(&root.join("repository/.git/HEAD"), beside);
+        }),
+        ("a copied object file as another inode", true, |root| {
+            let beside = root.parent().expect("the destination's area");
+            replace_with_same_bytes(&pack_file(&root.join("repository/.git")), beside);
+        }),
+        (
+            "an admitted bootstrap file as another inode",
+            true,
+            |root| {
+                let beside = root.parent().expect("the destination's area");
+                replace_with_same_bytes(
+                    &admitted_path(&root.join(".restore-work/git-bootstrap"), "pack"),
+                    beside,
+                );
+            },
+        ),
+        ("a bootstrap directory", true, |root| {
+            swap_out(root, &root.join(".restore-work/git-bootstrap/objects"));
+        }),
+        ("the plain staging directory", false, |root| {
+            swap_out(root, &root.join(".restore-work/plain"));
+        }),
+        ("the HOME directory", false, |root| {
+            swap_out(root, &root.join(".restore-work/home"));
+        }),
+        ("the XDG directory", false, |root| {
+            swap_out(root, &root.join(".restore-work/xdg"));
+        }),
+        ("the destination root", false, |root| {
+            swap_out(root, root);
+        }),
+    ];
+    let captured_capsule = captured(CustodyGitObjectFormatV1::Sha1);
+    for (row, captured_database, act) in rows {
+        let case = if captured_database {
+            PCaseV1::of(PlaneInV1::rich(
+                &captured_capsule,
+                CustodyGitObjectFormatV1::Sha1,
+            ))
+        } else {
+            PCaseV1::with_frames(&capsule, &frames)
+        };
+        let act = drifting_when(&case, at_step(PayloadPlaneStepV1::TerminalGate), act);
+        let run = case.restore_with(row, far_deadline(), Some(Box::new(act)));
+        let failure = run.failure(row);
+        assert!(
+            identity_changed(&failure.cause),
+            "{row}: {:?}",
+            failure.cause
+        );
+        assert_eq!(
+            failure.last_completed,
+            Some(PayloadPlaneStepV1::Evidence),
+            "{row}"
+        );
+        assert_eq!(
+            failure.payload_materialization_began, !captured_database,
+            "{row}"
+        );
+        let sealed: &[&str] = if captured_database {
+            &[]
+        } else {
+            &SEAL_ORDER_V1
+        };
+        assert_eq!(
+            failure
+                .partial
+                .sealed
+                .iter()
+                .map(|one| lossy(&one.name))
+                .collect::<Vec<_>>(),
+            sealed,
+            "{row}: the walk ran before every retained chain"
+        );
+        run.assert_seals_are_the_disk(row, &[]);
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// The one deadline
+// ---------------------------------------------------------------------------------------------
+
+/// The terminal gate's own guards for the three-step frames, in order: its own, then each entry's before its
+/// observation and each file's and directory's before its seal (post-order: a directory's observation and
+/// seal after everything beneath it), then the retained chains' (one per object-store directory and copied
+/// file, metadata directory and file, admitted bootstrap file, staging chain, HOME and XDG, and bootstrap
+/// directory), and the root's own guard last.
+fn terminal_guards(plane: &RestoredGitPlaneV1) -> Vec<&'static str> {
+    let (entry, seal) = ("payload-terminal-entry", "payload-terminal-seal");
+    let mut guards = vec!["payload-terminal-gate"];
+    // The worktree: `a`, `d/x`, then `d`, each observed and sealed, and `l` observed; the index; `e`, then
+    // its slot, then `evidence/`, each observed and sealed.
+    guards.extend([entry, seal, entry, seal, entry, seal, entry]);
+    guards.extend([entry, seal]);
+    guards.extend([entry, seal, entry, seal, entry, seal]);
+    let chains = gate_guards(plane);
+    guards.extend(&chains[1..]);
+    guards
+}
+
+/// The deadline in the terminal gate. A clean restore's guards are the materialization's, then exactly the
+/// terminal gate's own. Each terminal guard halts the run alone with the typed timeout and `Evidence` the
+/// last step completed, having sealed exactly the entries before it: its first guard, the first and last
+/// entry's, the first and last seal's, the first and last retained chain's, and the root's. A slow step is
+/// never followed by a seal: a file whose digest returned after the deadline is not sealed, and a seal that
+/// returned after it (a file's, a directory's) is the last one.
+#[test]
+fn c3_the_one_deadline_is_kept_before_every_entry_and_every_seal() {
+    let capsule = frames_capsule();
+    let frames = three_step_frames();
+    let materialized = StdRc::new(StdRefCell::new(Vec::new()));
+    {
+        let case = PCaseV1::with_frames(&capsule, &frames);
+        let _labels = install_git_hook_for_test(
+            GitHookPointV1::DeadlineObserved,
+            guard_labels(&materialized),
+        );
+        let _ = case.write("materialized").success("materialized");
+    }
+    let labels = StdRc::new(StdRefCell::new(Vec::new()));
+    let case = PCaseV1::with_frames(&capsule, &frames);
+    let expected = terminal_guards(&case.plane);
+    {
+        let _labels =
+            install_git_hook_for_test(GitHookPointV1::DeadlineObserved, guard_labels(&labels));
+        let _ = case.restore("clean guards").success("clean guards");
+    }
+    let prefix = materialized.borrow().clone();
+    let labels = labels.borrow().clone();
+    assert_eq!(
+        labels[..prefix.len()],
+        prefix[..],
+        "the materialization's guards"
+    );
+    assert_eq!(
+        labels[prefix.len()..],
+        expected[..],
+        "the terminal gate's guards"
+    );
+
+    // The occurrence of `label` that is the terminal gate's `k`th (counting from its end when `from_end`).
+    let terminal = |label: &str, k: usize, from_end: bool| -> usize {
+        let before = prefix.iter().filter(|one| **one == label).count();
+        let within = expected.iter().filter(|one| **one == label).count();
+        before + if from_end { within - 1 - k } else { k }
+    };
+    let rows: Vec<(&'static str, usize, usize)> = vec![
+        (
+            "payload-terminal-gate",
+            terminal("payload-terminal-gate", 0, false),
+            0,
+        ),
+        (
+            "payload-terminal-entry",
+            terminal("payload-terminal-entry", 0, false),
+            0,
+        ),
+        (
+            "payload-terminal-entry",
+            terminal("payload-terminal-entry", 0, true),
+            6,
+        ),
+        (
+            "payload-terminal-seal",
+            terminal("payload-terminal-seal", 0, false),
+            0,
+        ),
+        (
+            "payload-terminal-seal",
+            terminal("payload-terminal-seal", 0, true),
+            6,
+        ),
+        ("objects-chain", terminal("objects-chain", 0, false), 7),
+        ("payload-chain", terminal("payload-chain", 0, true), 7),
+        ("payload-root", terminal("payload-root", 0, true), 7),
+    ];
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = rows
+            .into_iter()
+            .map(|(label, nth, sealed)| {
+                let (capsule, frames) = (&capsule, &frames);
+                scope.spawn(move || {
+                    let row = format!("{label} #{nth}");
+                    let case = PCaseV1::with_frames(capsule, frames);
+                    let deadline = Instant::now() + P_WRITE_DEADLINE_V1;
+                    let fired: FiredV1 = StdRc::new(StdCell::new(None));
+                    let act = spend(deadline, &fired);
+                    let count = StdCell::new(0_usize);
+                    let _guard =
+                        install_git_hook_for_test(GitHookPointV1::DeadlineObserved, move |event| {
+                            if event.label == label {
+                                if count.get() == nth {
+                                    act();
+                                }
+                                count.set(count.get() + 1);
+                            }
+                        });
+                    let run = case.restore_with(&row, deadline, None);
+                    assert_eq!(
+                        fired.get(),
+                        Some(true),
+                        "{row}: INVALID (not behavioral evidence): the guard was not reached before the deadline"
+                    );
+                    refused_at_the_terminal_gate(
+                        &run,
+                        &row,
+                        |cause| matches!(cause, PayloadPlaneErrorV1::Timeout),
+                        &SEAL_ORDER_V1[..sealed],
+                    );
+                    run.assert_seals_are_the_disk(&row, &[]);
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle.join().expect("a halting row's thread");
+        }
+    });
+
+    type SlowRowV1 = (&'static str, PayloadHookPointV1, &'static str, usize, usize);
+    let slow: [SlowRowV1; 4] = [
+        (
+            "a slow digest",
+            PayloadHookPointV1::TerminalDigested,
+            "repository/a",
+            0,
+            0,
+        ),
+        (
+            "a slow lookup",
+            PayloadHookPointV1::TerminalLookup,
+            "repository/d/x",
+            1,
+            1,
+        ),
+        (
+            "a slow file seal",
+            PayloadHookPointV1::TerminalModeSet,
+            "repository/a",
+            0,
+            1,
+        ),
+        (
+            "a slow directory seal",
+            PayloadHookPointV1::TerminalModeSet,
+            "repository/d",
+            0,
+            3,
+        ),
+    ];
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = slow
+            .into_iter()
+            .map(|(row, point, name, nth, sealed)| {
+                let (capsule, frames) = (&capsule, &frames);
+                scope.spawn(move || {
+                    let case = PCaseV1::with_frames(capsule, frames);
+                    let deadline = Instant::now() + P_WRITE_DEADLINE_V1;
+                    let fired: FiredV1 = StdRc::new(StdCell::new(None));
+                    let act = spend(deadline, &fired);
+                    let _hook = install_payload_hook_for_test(
+                        point,
+                        nth_at(case.dest.path.join(name), nth, move |_| act()),
+                    );
+                    let run = case.restore_with(row, deadline, None);
+                    assert_eq!(
+                        fired.get(),
+                        Some(true),
+                        "{row}: INVALID (not behavioral evidence): the hook was not reached before the deadline"
+                    );
+                    refused_at_the_terminal_gate(
+                        &run,
+                        row,
+                        |cause| matches!(cause, PayloadPlaneErrorV1::Timeout),
+                        &SEAL_ORDER_V1[..sealed],
+                    );
+                    run.assert_seals_are_the_disk(row, &[]);
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle.join().expect("a slow row's thread");
+        }
+    });
+}
+
+// ---------------------------------------------------------------------------------------------
+// The rich clone, V to G to P
+// ---------------------------------------------------------------------------------------------
+
+/// The rich plan-backed clone given a REAL split index and a worktree symlink (as C2b's byte-exact control
+/// gives it), with `plant` applied to its source before it is planned and exported, carried through phase V
+/// and phase G: ready for phase P. The fixture is returned so its area outlives the case.
+fn rich_case(plant: impl FnOnce(&Path)) -> (PlanFixtureV1, PathBuf, PCaseV1) {
+    let fixture = PlanFixtureV1::rich_clone();
+    let clone = fixture
+        .capsule_dir()
+        .parent()
+        .and_then(Path::parent)
+        .expect("the fixture's area")
+        .join("clone");
+    assert!(
+        clone.join(".git/MERGE_RR").is_file(),
+        "the rich clone's source, found by its layout"
+    );
+    source_git(&clone, &["update-index", "--split-index"]);
+    std::os::unix::fs::symlink("README", clone.join("readme-link")).expect("a worktree link");
+    plant(&clone);
+    let (manifest, capability, _receipts) = fixture.planned();
+    let _ = expect_sealed(
+        fixture
+            .export(&manifest, capability)
+            .expect("the rich export seals"),
+    );
+    let case = PCaseV1::sealed(&fixture.capsule_dir());
+    (fixture, clone, case)
+}
+
+/// How many descriptors this process has open (process-wide: exact only when nothing else runs).
+fn open_descriptors() -> usize {
+    std::fs::read_dir("/dev/fd").map_or(0, Iterator::count)
+}
+
+/// End to end, V to G to P, on the rich clone with a real split index and a worktree symlink: the restore
+/// succeeds with every entry byte-exact at its final mode (the worktree's frame modes, `0600` for `index` and
+/// the shared index, `0400`/`0500` for evidence), the inventories are exactly the disk (identities, modes,
+/// lengths, SHA-256, targets, pins), and they report the skipped connector, the childless directories, no
+/// external reference, every class Captured, and each frame mode as the frame says. The source's own bytes
+/// agree. The one ledger is phase V's charge plus phase G's and phase P's on-disk charge (the runner's own
+/// accounting, restated here with its figures). Prints the descriptors phase P's value retains, the
+/// process-wide measure (exact only when this control runs alone), and the soft `RLIMIT_NOFILE`
+/// (`PAYLOAD-DESCRIPTORS`).
+#[test]
+fn c3_the_rich_clone_restores_end_to_end_on_the_one_ledger() {
+    let baseline = open_descriptors();
+    let (_fixture, clone, case) = rich_case(|_| {});
+    let shared = sharedindex_names(&clone.join(".git"));
+    assert_eq!(shared.len(), 1, "real Git wrote one shared index");
+    let (phase_v, ledger_before) = (case.phase_v, case.plane.ledger_used());
+    let with_case = open_descriptors();
+    let run = case.restore("rich");
+    let done = run.success("rich");
+    let now = run.held("rich").now();
+    assert_eq!(
+        now,
+        expected_final(&done.plane),
+        "byte-exact, every entry at its final mode"
+    );
+    run.assert_inventory_is_the_disk("rich");
+
+    let captured = |class: ClassV1| PayloadClassStateV1::Captured {
+        staged: staged_index(done.plane.capsule(), class),
+    };
+    assert_eq!(done.worktree.state, captured(P_WORKTREE_V1));
+    assert_eq!(done.index.state, captured(P_INDEX_V1));
+    assert_eq!(
+        done.evidence.classes,
+        [
+            (P_OPERATIONS_V1, captured(P_OPERATIONS_V1)),
+            (P_CONFIG_V1, captured(P_CONFIG_V1)),
+            (P_BRIDGE_V1, captured(P_BRIDGE_V1)),
+        ]
+    );
+    assert_eq!(
+        done.worktree.root_git,
+        RootGitDispositionV1::ConnectorDirectorySkipped
+    );
+    assert!(done.declared_external_references.is_empty());
+    let worktree = own_contents(&done.plane, P_WORKTREE_V1);
+    let own_childless: Vec<Vec<u8>> = worktree
+        .iter()
+        .filter(|(path, kind, _)| {
+            matches!(kind, OwnKindV1::Dir(_))
+                && path != b".git"
+                && !worktree.iter().any(|(other, _, _)| {
+                    other.len() > path.len() && other.starts_with(path) && other[path.len()] == b'/'
+                })
+        })
+        .map(|(path, _, _)| path.clone())
+        .collect();
+    assert_eq!(done.worktree.childless_directories, own_childless);
+    let frame_modes = |class: ClassV1| -> BTreeMap<Vec<u8>, Option<u32>> {
+        own_contents(&done.plane, class)
+            .into_iter()
+            .map(|(path, kind, _)| match kind {
+                OwnKindV1::Dir(mode) | OwnKindV1::File(mode, _) => (path, Some(mode)),
+                OwnKindV1::Link(_) => (path, None),
+            })
+            .collect()
+    };
+    let check = |entries: &[RestoredEntryV1], class: ClassV1| {
+        let modes = frame_modes(class);
+        for entry in entries {
+            assert_eq!(
+                Some(&entry.frame_mode),
+                modes.get(&entry.path),
+                "{}",
+                lossy(&entry.path)
+            );
+        }
+    };
+    check(&done.worktree.entries, P_WORKTREE_V1);
+    check(&done.index.files, P_INDEX_V1);
+    assert_eq!(
+        done.index
+            .files
+            .iter()
+            .map(|entry| (entry.path.clone(), entry.mode))
+            .collect::<Vec<_>>(),
+        [
+            (b"index".to_vec(), Some(0o600)),
+            (shared[0].clone(), Some(0o600))
+        ]
+    );
+    for (slot, class) in done
+        .evidence
+        .slots
+        .iter()
+        .zip([P_OPERATIONS_V1, P_CONFIG_V1, P_BRIDGE_V1])
+    {
+        assert_eq!(slot.slot, EvidenceSlotV1::of_class(class).expect("a slot"));
+        assert_eq!(slot.mode, 0o500);
+        check(&slot.entries, class);
+    }
+    for (name, source) in [
+        (
+            joined(b"repository/.git", &shared[0]),
+            clone.join(".git").join(OsStr::from_bytes(&shared[0])),
+        ),
+        (b"repository/README".to_vec(), clone.join("README")),
+        (
+            b"evidence/bridge_evidence/a2a-bridge/evidence.json".to_vec(),
+            clone.join(".git/a2a-bridge/evidence.json"),
+        ),
+    ] {
+        let Some(DiskV1::File(_, bytes)) = now.get(&name) else {
+            panic!("{} is restored", lossy(&name));
+        };
+        assert_eq!(
+            *bytes,
+            std::fs::read(&source).expect("the source file"),
+            "{} is the source's bytes",
+            lossy(&name)
+        );
+    }
+    assert_eq!(
+        now.get(&b"repository/readme-link"[..]),
+        Some(&DiskV1::Link(b"README".to_vec()))
+    );
+
+    let phase_p = disk_charge(&now);
+    let phase_g = ledger_before - phase_v;
+    assert_eq!(
+        done.plane.ledger_used(),
+        phase_v + phase_g + phase_p,
+        "the one ledger: phase V, phase G, phase P"
+    );
+    println!(
+        "PAYLOAD-ONE-LEDGER phase_v={phase_v} phase_g_on_disk={phase_g} phase_p_on_disk={phase_p} \
+         ledger={}",
+        done.plane.ledger_used()
+    );
+
+    let pins = &done.pins;
+    let slot_directories: usize = pins
+        .evidence_slots
+        .iter()
+        .map(|slot| slot.directories.len())
+        .sum();
+    let phase_p_pins = pins.worktree.len()
+        + usize::from(pins.evidence.is_some())
+        + pins.evidence_slots.len()
+        + slot_directories;
+    let worktree_pins = pins.worktree.len();
+    let RestoredRunV1 {
+        _unseal,
+        dest,
+        held,
+        outcome,
+    } = run;
+    drop(held);
+    let with_value = open_descriptors();
+    drop(outcome);
+    let without = open_descriptors();
+    let soft = Command::new("/bin/sh")
+        .args(["-c", "ulimit -n"])
+        .output()
+        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+        .unwrap_or_default();
+    println!(
+        "PAYLOAD-DESCRIPTORS phase_p_pins={phase_p_pins} worktree_dirs={} evidence_dirs={} \
+         process_baseline={baseline} process_with_plane={with_case} \
+         process_with_restored_value={with_value} process_after_drop={without} soft_nofile={soft}",
+        worktree_pins,
+        phase_p_pins - worktree_pins
+    );
+    drop((_unseal, dest));
+}
+
+/// Evidence is inert: every file beneath `evidence/` ends `0400` and every directory `0500` (`evidence/` and
+/// each slot included), whatever the frame says, and the inventory keeps each original frame mode beside the
+/// mode written. The rich clone's executable hook (frame mode `0755`) is never executable: `0600` when it is
+/// created and at every gate, `0400` once sealed and after.
+#[test]
+fn c3_evidence_ends_inert_and_the_rich_clones_hook_is_never_executable() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let (_fixture, _clone, case) = rich_case(|_| {});
+    let hook = case
+        .dest
+        .path
+        .join("evidence/git_configuration_and_hooks/hooks/pre-commit");
+    let modes = StdRc::new(StdRefCell::new(Vec::<(String, u32)>::new()));
+    let sample = {
+        let (modes, hook) = (modes.clone(), hook.clone());
+        move |when: String| {
+            if let Ok(metadata) = std::fs::symlink_metadata(&hook) {
+                modes
+                    .borrow_mut()
+                    .push((when, metadata.permissions().mode() & 0o7777));
+            }
+        }
+    };
+    let at = |point: &'static str| {
+        let (sample, hook) = (sample.clone(), hook.clone());
+        move |event: &PayloadHookEventV1<'_>| {
+            if event.path == hook {
+                sample(point.to_owned());
+            }
+        }
+    };
+    let _created = install_payload_hook_for_test(PayloadHookPointV1::EntryCreated, at("created"));
+    let _sealed = install_payload_hook_for_test(PayloadHookPointV1::TerminalSealed, at("sealed"));
+    let gates = sample.clone();
+    let act: StepActV1 = Box::new(move |event| gates(format!("{:?} gate", event.step)));
+    let run = case.restore_with("evidence", far_deadline(), Some(act));
+    let done = run.success("evidence");
+    let now = run.held("evidence").now();
+    let evidence: Vec<(&Vec<u8>, &DiskV1)> = now
+        .iter()
+        .filter(|(name, _)| name.starts_with(b"evidence"))
+        .collect();
+    assert!(evidence.len() > 3, "the rich clone has evidence");
+    for (name, entry) in evidence {
+        match entry {
+            DiskV1::Dir(mode) => assert_eq!(*mode, 0o500, "{}", lossy(name)),
+            DiskV1::File(mode, _) => assert_eq!(*mode, 0o400, "{}", lossy(name)),
+            DiskV1::Link(_) => {}
+        }
+    }
+    let config = done
+        .evidence
+        .slots
+        .iter()
+        .find(|slot| slot.slot == EvidenceSlotV1::GitConfigurationAndHooks)
+        .expect("the configuration slot");
+    let frame: BTreeMap<Vec<u8>, OwnKindV1> = own_contents(&done.plane, P_CONFIG_V1)
+        .into_iter()
+        .map(|(path, kind, _)| (path, kind))
+        .collect();
+    for entry in &config.entries {
+        let (frame_mode, written) = match frame.get(&entry.path) {
+            Some(OwnKindV1::Dir(mode)) => (Some(*mode), Some(0o500)),
+            Some(OwnKindV1::File(mode, _)) => (Some(*mode), Some(0o400)),
+            Some(OwnKindV1::Link(_)) => (None, None),
+            None => panic!("{} is in the frame", lossy(&entry.path)),
+        };
+        assert_eq!(
+            (entry.frame_mode, entry.mode),
+            (frame_mode, written),
+            "{}",
+            lossy(&entry.path)
+        );
+    }
+    let row = row_at(&config.entries, b"hooks/pre-commit");
+    assert_eq!((row.frame_mode, row.mode), (Some(0o755), Some(0o400)));
+    let Some(DiskV1::File(after, _)) =
+        now.get(&b"evidence/git_configuration_and_hooks/hooks/pre-commit"[..])
+    else {
+        panic!("the hook is restored");
+    };
+    let mut seen = modes.borrow().clone();
+    seen.push(("after".to_owned(), *after));
+    assert_eq!(
+        seen,
+        [
+            ("created".to_owned(), 0o600),
+            ("Some(Evidence) gate".to_owned(), 0o600),
+            ("Some(TerminalGate) gate".to_owned(), 0o600),
+            ("sealed".to_owned(), 0o400),
+            ("after".to_owned(), 0o400),
+        ],
+        "the hook's mode at every observation"
+    );
+    assert!(
+        seen.iter().all(|(_, mode)| mode & 0o111 == 0),
+        "the hook is never executable"
+    );
+}
+
+/// The token every planted marker carries, so its bytes are recognized wherever they land.
+const PLANTED_TOKEN_V1: &[u8] = b"A2A-C3-PLANTED-MARKER";
+
+/// The rich clone's source with planted active configuration: `core.fsmonitor`, `core.pager`, an alias, a
+/// required `filter.marker` (clean, smudge, process) with `info/attributes` routing every path through it, an
+/// `[include]` of a file that sets `core.editor`, and executable `post-checkout`, `post-merge`, and
+/// `reference-transaction` hooks: each runs a marker script that records its own name, and the script is
+/// proven to record before the export. Whatever the 2B2 planning and export children did with the source is
+/// not phase P's, so the record starts empty after it. V to G to P then restores: no marker ran, the planted
+/// bytes are byte-exact inert evidence at `0400` beneath `evidence/git_configuration_and_hooks/`, and nothing
+/// beneath `repository/` holds a planted name or byte (its `.git/config` is phase G's own, with no hooks
+/// directory and no `info/`).
+#[test]
+fn c3_planted_config_hook_filter_and_fsmonitor_markers_never_run() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let markers = tempfile::TempDir::new().expect("a marker area");
+    let area = markers.path().canonicalize().expect("a canonical area");
+    let tokened = area.join(OsStr::from_bytes(PLANTED_TOKEN_V1));
+    std::fs::create_dir(&tokened).expect("the token directory");
+    let ran = area.join("ran");
+    std::fs::create_dir(&ran).expect("the record");
+    let script = tokened.join("mark.sh");
+    std::fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\necho \"$*\" >> '{}'/\"$1\"\nexit 0\n",
+            ran.display()
+        ),
+    )
+    .expect("the marker script");
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+        .expect("the marker script is executable");
+    let recorded = || -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(&ran)
+            .expect("the record")
+            .map(|entry| {
+                entry
+                    .expect("an entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        names.sort();
+        names
+    };
+    assert!(
+        retry_on_text_file_busy(|| Command::new(&script).arg("probe").status())
+            .expect("the marker runs")
+            .success()
+    );
+    assert_eq!(recorded(), ["probe"], "the marker records when it runs");
+    std::fs::remove_file(ran.join("probe")).expect("the probe's record");
+
+    let run = script.display().to_string();
+    let hooks = ["post-checkout", "post-merge", "reference-transaction"];
+    let (_fixture, clone, case) = rich_case(|clone| {
+        let git = clone.join(".git");
+        let mut config = std::fs::read(git.join("config")).expect("the source config");
+        config.extend(
+            format!(
+                "[core]\n\tfsmonitor = {run} fsmonitor\n\tpager = {run} pager\n\
+                 [filter \"marker\"]\n\tclean = {run} filter-clean\n\tsmudge = {run} filter-smudge\n\
+                 \tprocess = {run} filter-process\n\trequired = true\n\
+                 [alias]\n\tmarker = !{run} alias\n\
+                 [include]\n\tpath = {}\n",
+                tokened.join("included.config").display()
+            )
+            .into_bytes(),
+        );
+        std::fs::write(git.join("config"), config).expect("the planted config");
+        std::fs::write(
+            tokened.join("included.config"),
+            format!("[core]\n\teditor = {run} editor\n"),
+        )
+        .expect("the included config");
+        for hook in hooks {
+            let path = git.join("hooks").join(hook);
+            std::fs::write(&path, format!("#!/bin/sh\n{run} hook-{hook}\n")).expect("a hook");
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+                .expect("the hook is executable");
+        }
+        std::fs::create_dir_all(git.join("info")).expect("info/");
+        let mut attributes = PLANTED_TOKEN_V1.to_vec();
+        attributes.splice(0..0, b"# ".iter().copied());
+        attributes.extend_from_slice(b"\n* filter=marker\n");
+        std::fs::write(git.join("info/attributes"), attributes).expect("the attributes");
+    });
+    let during_export = recorded();
+    println!("PAYLOAD-MARKERS during_planning_and_export={during_export:?}");
+    for name in &during_export {
+        std::fs::remove_file(ran.join(name)).expect("a record from before the restore");
+    }
+
+    let run = case.restore("planted");
+    let _ = run.success("planted");
+    assert_eq!(recorded(), Vec::<String>::new(), "no planted marker ran");
+    let now = run.held("planted").now();
+    let holds_token = |bytes: &[u8]| {
+        bytes
+            .windows(PLANTED_TOKEN_V1.len())
+            .any(|window| window == PLANTED_TOKEN_V1)
+    };
+    let mut planted = vec!["config".to_owned(), "info/attributes".to_owned()];
+    planted.extend(hooks.iter().map(|hook| format!("hooks/{hook}")));
+    for leaf in &planted {
+        let name = joined(b"evidence/git_configuration_and_hooks", leaf.as_bytes());
+        let Some(DiskV1::File(mode, bytes)) = now.get(&name) else {
+            panic!("{} is restored as evidence", lossy(&name));
+        };
+        assert_eq!(*mode, 0o400, "{leaf}: inert");
+        assert!(holds_token(bytes), "{leaf}: the planted bytes");
+        assert_eq!(
+            *bytes,
+            std::fs::read(clone.join(".git").join(leaf)).expect("the planted source"),
+            "{leaf}: byte-exact"
+        );
+    }
+    let outside = disk_tree_where(&run.dest.path, |name| !in_phase_p_planes(name));
+    for (name, entry) in now.iter().chain(outside.iter()) {
+        if !name.starts_with(b"repository") {
+            continue;
+        }
+        let bytes: &[u8] = match entry {
+            DiskV1::File(_, bytes) | DiskV1::Link(bytes) => bytes,
+            DiskV1::Dir(_) => &[],
+        };
+        assert!(
+            !holds_token(bytes) && !holds_token(name),
+            "{} holds a planted marker",
+            lossy(name)
+        );
+        assert!(
+            !hooks.iter().any(|hook| name.ends_with(hook.as_bytes())),
+            "{} is a planted hook",
+            lossy(name)
+        );
+    }
+    for absent in ["repository/.git/hooks", "repository/.git/info"] {
+        assert!(
+            std::fs::symlink_metadata(run.dest.path.join(absent)).is_err(),
+            "{absent} does not exist"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Structural controls
+// ---------------------------------------------------------------------------------------------
+
+/// STRUCTURAL ONLY (evidence of shape and order, never of behavior; the behavioral evidence is every row
+/// above). The terminal gate's section creates, writes, renames, removes, charges, and runs Git nowhere, and
+/// changes a mode only through a descriptor (`set_exact_file_mode`, `set_exact_mode`), never by path. The gate
+/// is the census, the walk of the worktree, the index, and the evidence, then the retained chains, and the
+/// root's identity LAST, its guard immediately before it, with nothing after it; a file is observed by name,
+/// reopened, digested, guarded, and only then sealed, and nothing is looked up after its seal; a directory
+/// (a worktree or evidence directory, a slot, `evidence/`) is observed by name only after its subtree and
+/// immediately before its seal; and nothing fallible follows the gate but building the result.
+#[test]
+fn c3_the_terminal_gate_section_seals_through_descriptors_in_its_order() {
+    let source = include_str!("custody_restore_payload.rs");
+    let (_before, section) = source.split_once(P_SEAL_MARKER_V1).expect("the C3 marker");
+    let code: String = section
+        .lines()
+        .filter(|line| !line.trim_start().starts_with("//"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    for forbidden in [
+        "std::fs",
+        "File::open(",
+        "OpenOptions",
+        "read_dir(",
+        "create_new",
+        "create_staging_directory",
+        "symlink_child(",
+        "set_permissions",
+        "rename",
+        "remove_",
+        "unlink",
+        "set_len",
+        "truncate",
+        "write_all",
+        ".write(",
+        "reserve",
+        ".release(",
+        "sync_all",
+        "GitRunnerV1",
+        "GitRunRequestV1",
+        "Command",
+        "spawn",
+        "created_chains(",
+        " gate(",
+        "unsafe",
+    ] {
+        assert!(
+            !code.contains(forbidden),
+            "the terminal gate's section mentions `{forbidden}`"
+        );
+    }
+    let at = |body: &str, needle: &str| {
+        body.find(needle)
+            .unwrap_or_else(|| panic!("`{needle}` is in `{body}`"))
+    };
+    let gate = body_of(source, "fn terminal_gate(");
+    let order = [
+        "pace(\"payload-terminal-gate\")",
+        "refuse_mounts_within(",
+        "seal_tree(&pins.repository",
+        "seal_tree(&pins.git",
+        "seal_evidence(",
+        "output_chains(",
+        "metadata_chains(",
+        "source_files_unchanged(",
+        "retained_chains(",
+        "pace(\"payload-root\")",
+        "pinned_root_unchanged(",
+    ];
+    for pair in order.windows(2) {
+        assert!(
+            at(gate, pair[0]) < at(gate, pair[1]),
+            "`{}` precedes `{}`",
+            pair[0],
+            pair[1]
+        );
+    }
+    let tail = &gate[at(gate, "pinned_root_unchanged(")..];
+    assert!(
+        !tail.contains('?') && !tail.contains(';'),
+        "the root's identity is the gate's tail expression: {tail}"
+    );
+    let file = body_of(source, "fn seal_file(");
+    let order = [
+        "self.enter(",
+        "recheck_created(",
+        "open_regular_file(",
+        "stream_digest(",
+        "ContentChanged",
+        "pace(\"payload-terminal-seal\")",
+        "set_exact_file_mode(",
+        "confirm_sealed(",
+    ];
+    for pair in order.windows(2) {
+        assert!(
+            at(file, pair[0]) < at(file, pair[1]),
+            "`{}` precedes `{}` in a file's seal",
+            pair[0],
+            pair[1]
+        );
+    }
+    let sealed = &file[at(file, "set_exact_file_mode(")..];
+    for lookup in ["recheck_created(", "open_regular_file(", "lookup("] {
+        assert!(
+            !sealed.contains(lookup),
+            "nothing is looked up after a file's seal: `{lookup}`"
+        );
+    }
+    let directory = body_of(source, "fn seal_directory(");
+    assert!(
+        at(directory, "pace(\"payload-terminal-seal\")") < at(directory, ".set_exact_mode(")
+            && !directory.contains("recheck_")
+            && !directory.contains("lookup("),
+        "a directory is sealed through its pin after its guard, with no lookup"
+    );
+    let tree = body_of(source, "fn seal_tree(");
+    assert!(
+        tree.matches("observe_directory(").count() == 1
+            && at(tree, "open.pop()") < at(tree, "self.observe_directory(")
+            && at(tree, "self.observe_directory(") < at(tree, "self.seal_directory("),
+        "a directory's one observation is made when it is popped, after its children, before its seal"
+    );
+    let evidence = body_of(source, "fn seal_evidence(");
+    let order = [
+        "self.seal_tree(&slot.pin",
+        "self.observe_directory(directory,",
+        "self.seal_directory(&slot.pin,",
+        "self.observe_directory(root,",
+        "self.seal_directory(directory,",
+    ];
+    for pair in order.windows(2) {
+        assert!(
+            at(evidence, pair[0]) < at(evidence, pair[1]),
+            "`{}` precedes `{}` in the evidence walk",
+            pair[0],
+            pair[1]
+        );
+    }
+    let entry = body_of(source, "pub(crate) fn restore_payload_plane_bounded_v1(");
+    let arm = &entry[at(entry, "Ok(()) =>")..];
+    assert!(
+        arm.starts_with("Ok(()) => Ok(restored(plane, &plan, created)),"),
+        "nothing fallible follows the terminal gate but building the result"
+    );
+    let build = body_of(source, "fn restored(");
+    assert!(
+        !build.contains('?') && !build.contains("Result"),
+        "building the result is infallible"
+    );
 }

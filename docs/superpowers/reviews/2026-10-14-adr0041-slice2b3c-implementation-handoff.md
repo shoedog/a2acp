@@ -770,3 +770,349 @@ new `unsafe`. The commit message is in `.git/A2A_COMMIT_MSG`; the bridge commits
    walk of the worktree, index and evidence trees using `CreatedTreeV1`'s rows and pins, `set_exact_file_mode` /
    `PinnedDirectoryV1::set_exact_mode` with each row's `final_mode`; the retained chains; the root's identity last) and
    the complete `RestoredPayloadPlaneV1`.
+
+---
+
+# Increment C3 — the terminal gate, final modes, and the complete result
+
+**Written:** 2026-10-15 · **By:** Opus 5.5 (`claude-opus-5-5`) through `a2a-bridge implement` · **Base:**
+`0235b1d3` (C2b merged, PR #148) · **Scope:** C3 only; the `custody-restore.v1` record, the joint fixture and the
+cross-phase wrapper are 2B3d's.
+**Source snapshot:** `636fbb70fe70f227` after review fix 1 (§3.7, §4.3); `19dacdaffffa441f` before it (the first 16
+hex digits of the SHA-256 of the three changed `.rs` files concatenated in the C3 §7 order; per-file hashes are in the
+receipts).
+**Receipts:** `.git/a2a-evidence/2b3c-c3/` (listed in C3 §3.6); review fix 1's under `fix1/`.
+
+**Review fix 1 (REJECT, one blocker).** The first source review found directory edges checked pre-order: a directory
+was observed by name before its children, so renaming it away and putting a decoy at its name while a child was being
+processed went unnoticed (its children and its seal go through the retained pin, which follows the renamed original),
+and the restore succeeded with the destination path naming the decoy. Fixed: each directory's one by-name observation
+now happens when it is popped, after its whole subtree is sealed and immediately before its own seal, while its parent
+is still `0700`; a slot's tree is walked before the slot is observed and sealed, and `evidence/` is observed and sealed
+after every slot. The walk still makes exactly one terminal observation per entry. The sections below are updated in
+place.
+
+## C3 1. Context
+
+Increment C3 of the 2B3c payload plane (task spec revision 4, "Terminal gate", D2, D4, the API section and §C3; the
+C2b section's §5 and §8 above). It adds the terminal gate after C2b's materialization and the complete crate-private
+`RestoredPayloadPlaneV1`. The pin-retention model is unchanged; the descriptor count it implies is measured in §3.4 as a
+2B3d design input.
+
+Lane: the bridge's Linux container (OrbStack kernel `7.0.14`, aarch64), running as root, with every payload control
+(C2a's 18, C2b's 19 and C3's 12) also run as an unprivileged user (`setpriv --reuid=65534 --regid=65534
+--clear-groups`, `TMPDIR` in a world-writable scratch directory, empty afterwards). **The native non-root macOS run was
+not performed here**; the spec gives it to the controller (C3 §6).
+
+## C3 2. What changed
+
+### 2.1 `crates/bridge-core/src/custody_restore_payload.rs`
+
+The C2a and C2b halves are unchanged except: the module and `PayloadPlaneStepV1` docs, the new error variant, the
+partial value's `sealed` list (both existing constructions pass `Vec::new()`), and five new test hook points. All C3
+code is in one new section at the end of the file, headed
+`// The terminal gate (increment C3): every created entry verified and sealed, and the result`.
+
+| Item | Contract |
+|---|---|
+| `restore_payload_plane_v1(plane, frame_budget, deadline)` and `restore_payload_plane_bounded_v1(…, table_bound)` | C2b's `materialize_payload_plane_bounded_v1` (its failures returned unchanged), then the test hook `BeforeStepGate` with step `TerminalGate`, then `terminal_gate`. Success → `RestoredPayloadPlaneV1` (step `TerminalGate`), built by the infallible `restored`. Refusal → `PayloadPlaneRestoreFailureV1 { cause, last_completed: Some(Evidence), payload_materialization_began, ledger_used, partial }` with the phase-G value, the plan, every created row and pin, and `sealed`. The C2b entry point stays (§5.1). |
+| `terminal_gate` (order) | Guard `payload-terminal-gate`; `refuse_mounts_within`; the walk of the worktree (beneath phase G's `repository/`), the index (beneath `.git`) and the evidence (`evidence/`, each slot, each slot's tree); then phase G's `output_chains`, C2a's `metadata_chains`, phase G's `source_files_unchanged`, C2a's `retained_chains` (each with its own per-row guards); guard `payload-root`; `pinned_root_unchanged` as the tail expression. No `created_chains`: the walk is each created entry's sole terminal check. |
+| The walk (`SealRunV1::seal_tree`, `seal_evidence`) | Iterative post-order over `CreatedTreeV1` (children grouped by exact parent path, creation order): each entry is visited from its retained parent pin while that parent is still `0700`. **Directory**: descended into through its retained pin with no by-name call; once every child is sealed (on the pop), guard `payload-terminal-entry`, `recheck_directory` by name from its parent (kind, the pin's `dev`/`ino`, `0700`), guard `payload-terminal-seal`, `PinnedDirectoryV1::set_exact_mode(final)`, then phase P's own `fstat` of the pin must read the final mode. Its own name is therefore checked after its subtree, never before (review fix 1). **Evidence**: each slot's tree through the slot's pin, then the slot observed by name from `evidence/` and sealed `0500`; after every slot, `evidence/` observed by name from the root and sealed `0500`. **File** (`seal_file`): guard; `recheck_created` by name (`Regular`, `dev`, `ino`, length, `0600`); reopened by name no-follow (`open_regular_file`; a link, `ENOENT` or a non-regular → `IdentityChanged`); the descriptor's `fstat` must be (`Regular`, `dev`, `ino`, length, `0600`); phase G's `stream_digest` (deadline before every read, at most length + 1 bytes) must give the recorded length and SHA-256, else **`ContentChanged { name }`**; the descriptor's closing `fstat` must equal its opening one ("changed while it was read"); guard `payload-terminal-seal`; `set_exact_file_mode(&file, final)`; phase P's own `fstat` of that descriptor must read the final mode; the descriptor is dropped. **Symlink** (`verify_symlink`): guard; `recheck_created` by name (kind, `dev`, `ino`, target length); `read_child_symlink` must equal the recorded target (a longer target is another link); a closing `recheck_created`. Never followed, never given a mode. Every recorded entry must be reached (else `IdentityChanged`). |
+| Final modes | Each row's C2b `final_mode`: the frame's exact mode for the worktree (D4), `0600` for `index`/`sharedindex.*` (D4: set again, a no-op change, so every file takes one path), `0400`/`0500` for evidence entries (D2); `evidence/` and every slot `0500`. Sealing is through descriptors only, never a path. |
+| `SealedEntryV1 { name, mode }`, `PayloadPlanePartialV1::sealed` | Every entry the gate sealed, destination-relative, in seal order; pushed only after phase P's confirming `fstat`. Nothing is unsealed on failure. |
+| `RestoredPayloadPlaneV1` | `{ step, plane, worktree: WorktreeInventoryV1 { state, entries, root_git, childless_directories }, index: IndexInventoryV1 { state, files }, evidence: EvidenceInventoryV1 { classes: [(class, state); 3], root: Option<(mode, dev, ino)>, slots: [EvidenceSlotInventoryV1 { slot, mode, dev, ino, entries }] }, declared_external_references, pins: PayloadPinsV1 { worktree, evidence, evidence_slots: [EvidenceSlotPinsV1 { slot, pin, directories }] } }`. Every row is `RestoredEntryV1 { path, kind (length + SHA-256, or target), frame_mode, mode (written), dev, ino }`. |
+| Test seams (`#[cfg(test)]`) | Hook points `TerminalEntry` (before an entry's first by-name call; a directory's comes once its subtree is sealed), `TerminalLookup` (before every by-name call of the walk), `TerminalDigested` (after the read, before the closing `fstat`), `TerminalModeSet` (after the primitive's `fchmod` + confirmation, before phase P's own `fstat`), `TerminalSealed`; `BeforeStepGate` gains the `TerminalGate` step. |
+
+### 2.2 `crates/bridge-core/src/custody_restore_git.rs` (visibility only)
+
+`pub(super)` on `stream_digest`. No body changed; every 2B3b control is unchanged and green (its structural controls
+only search other bodies for `stream_digest(`).
+
+### 2.3 `crates/bridge-core/src/custody_restore.rs`
+
+Unchanged: C2a's `payload` mount already covers the new items, and nothing is re-exported.
+
+### 2.4 `crates/bridge-core/src/custody_restore_payload_tests.rs` (12 new controls; C2b fixture edits)
+
+C2b edits, behaviour-preserving: `PCaseV1` carries phase V's ledger figure (`phase_v`, from `PlaneInV1`); `disk_tree` is
+`disk_tree_where(root, |_| true)`; `expected_added` is `expected_tree(plane, false)` beside `expected_final`; the C2b
+structural control now cuts its section at the C3 header (which must occur once); the second-invocation row passes
+`phase_v` on. All 37 C2a/C2b controls are green as root and as `nobody`.
+
+C3 fixtures: `moded_frame` (the real encoder, each entry's own mode); `HeldTreeV1`, which opens every entry phase P added
+at the `BeforeStepGate(TerminalGate)` hook, while every file is `0600` and every directory `0700`, so a sealed entry's
+final mode and bytes are read afterwards through a descriptor opened before its seal, **never by changing a mode
+back**; `UnsealV1`, which re-opens the destination area's directories only when a run is dropped, for removal as a
+non-root owner (cleanup only; nothing is inspected through it); `PCaseV1::restore_with`, which holds on every outcome
+phase G's accounting as phase P starts (`ledger == phase_v + phase G's on-disk charge`), that a failure reports the one
+ledger and that it moved by exactly what phase P charged, that nothing outside phase P's planes changed (its own walk
+never reads or descends into a phase-P entry), and on success **the one-ledger accounting: phase V's charge + phase G's
+on-disk charge + phase P's on-disk charge (from the held descriptors)**; `assert_inventory_is_the_disk` (every row's
+identity, mode written, length, SHA-256 and target is the held entry's; nothing added is missing; every pin is the
+directory its row names); `assert_seals_are_the_disk` (on a refusal, exactly the `sealed` entries have their final mode,
+every other added entry its created mode); `rich_case` (C2b's rich clone with a real split index and a worktree symlink,
+with an optional plant before export).
+
+| Control | Proves |
+|---|---|
+| `c3_every_frame_mode_restores_and_is_sealed_exactly` | Files `0000`/`0200`/`0755`; `0000` directories nested in a `0000` and in a `0750` directory, each holding a file; a `0555` directory with a file, a link and a `0700` directory; a childless `0711` directory; an escaping link; an evidence class with a `0777` hook and a `0000` directory: all restore and end with exactly their frame modes (evidence `0400`/`0500`, index `0600`), byte-exact through the held descriptors; the inventory shows each frame mode and mode written; `childless_directories = [empty]`; the escaping link declared. As non-root, a lookup beneath the sealed `0000` directories now fails `PermissionDenied`. |
+| `c3_the_root_gitfile_ends_inert_and_every_childless_directory_is_reported` | D3's opposite branch on the REAL separate-Git-dir capsule: `RootGitfileToEvidence`, `childless_directories = [.gd, empty]`, the gitfile `0400` with the source's bytes and its frame mode inventoried, its slot `0500`, both childless directories at their frame modes, `repository/.git` still phase G's inode. |
+| `c3_no_name_is_looked_up_beneath_a_sealed_directory` | The instrumented seam (`TerminalEntry`, `TerminalLookup`, `TerminalSealed`, in order): no event at or beneath an already-sealed entry; every added entry observed exactly once; every file and directory sealed once and no link; every directory's observation (worktree, evidence, slot, `evidence/`) after every event beneath it, with only its own lookup between it and its seal (fix 1); no retained phase-V/G pin (root, work, plain, staging, HOME, XDG, bootstrap, object store, metadata) lies at or beneath a sealed entry, so the chains after the walk cannot look a name up beneath one. |
+| `c3_a_replacement_before_an_entrys_terminal_observation_refuses_typed` | 17 rows, each `IdentityChanged`, `last_completed = Evidence`, exactly the earlier entries sealed and nothing after: at `TerminalEntry`, a file as another inode, a swapped directory (its subtree already sealed), a file beneath it, a link as another same-target link, the index, `evidence/`, a slot, an evidence file, a file made `0000` in place, a link replaced by a regular file of its target's length; **the review's defect (fix 1)**: at a file's `TerminalEntry`, its directory renamed away (still walked through its pin) and a new directory put at its name, for `repository/d` (at `d/x`), the slot and `evidence/` (at the evidence file): the file is sealed, the restore refuses at that directory's own observation, and the directory stays `0700`; inside one observation (`TerminalLookup` by count), a file replaced before its reopen (another inode; a link), a link retargeted before its `readlinkat`, a link replaced before its closing stat. |
+| `c3_a_file_rewritten_in_place_refuses_as_content_changed` | The same inode and length with one byte flipped, before the terminal gate (a worktree file, the index, an evidence file) and before the worktree's own step gate (which compares identity and mode, so passes it): `ContentChanged { name }` naming the file, `Evidence`, the rewritten bytes kept and the file still `0600`. A file rewritten with its own bytes after its read (`TerminalDigested`) refuses as changed while it was read. |
+| `c3_a_mode_changed_after_its_fchmod_refuses` | At `TerminalModeSet` (after the primitive's `fchmod` and confirmation, before phase P's own `fstat`): a worktree file, a worktree directory, the index, an evidence file, `evidence/` → `IdentityChanged`, `Evidence`, the entry not in `sealed`, the changed mode what refused (§5.2). |
+| `c3_a_refused_terminal_gate_names_evidence_and_keeps_everything` | A clean restore takes six censuses (two planning, three step gates, the terminal gate); a mount at the sixth refuses with nothing sealed; ten retained chains changed just before the gate (metadata `refs`, `objects/info`, `HEAD` and a copied pack as other inodes, an admitted bootstrap file and a bootstrap directory on a Captured database, plain staging, HOME, XDG, the root) refuse `IdentityChanged`, `Evidence`, after every entry is sealed (the walk precedes the chains; the root is last); `payload_materialization_began` is false where nothing was created. |
+| `c3_the_one_deadline_is_kept_before_every_entry_and_every_seal` | A clean restore's guards = the materialization's (recorded from a `materialize` run) + exactly the terminal gate's (computed from the frames and the plane's chains). Eight halting rows (the gate's guard, the first and last entry, the first and last seal, the first object chain, the last staging chain, the root) → `Timeout`, `Evidence`, exactly the earlier entries sealed. A slow digest and a slow lookup are never followed by a seal; a slow file seal and a slow directory seal are the last ones. 10 s deadlines started after the plane exists; each row asserts its hook fired before the deadline (INVALID otherwise). |
+| `c3_the_rich_clone_restores_end_to_end_on_the_one_ledger` | V→G→P on the rich clone (real split index, worktree symlink): byte-exact at every final mode; inventories = disk; skipped connector, the computed childless list, no external reference, every class Captured, every frame mode the frame's; source bytes agree; one ledger = phase V + phase G + phase P on disk (`PAYLOAD-ONE-LEDGER`); `PAYLOAD-DESCRIPTORS` (§3.4). |
+| `c3_evidence_ends_inert_and_the_rich_clones_hook_is_never_executable` | Every evidence file `0400` and directory `0500`; the configuration class's frame modes inventoried beside the modes written; the hook (frame `0755`) observed `0600` at creation, at the Evidence and terminal step gates, `0400` once sealed and after: never an execute bit. |
+| `c3_planted_config_hook_filter_and_fsmonitor_markers_never_run` | The rich clone's source gains `core.fsmonitor`, `core.pager`, an alias, a required `filter.marker` with `info/attributes`, an `[include]` setting `core.editor`, and executable `post-checkout`/`post-merge`/`reference-transaction` hooks, each running a marker script proven to record; nothing ran during planning and export (`PAYLOAD-MARKERS … []`) or the restore; the planted files are byte-exact `0400` evidence; nothing beneath `repository/` holds a planted byte or hook name; no `repository/.git/hooks` or `info/`. |
+| `c3_the_terminal_gate_section_seals_through_descriptors_in_its_order` | Structural only: no path-based chmod, create, write, rename, remove, ledger, Git or `unsafe` vocabulary in the C3 section, and no `created_chains`; the gate's order (guard, census, three walks, the four chains, root guard, root identity as the tail); a file's order (observation, reopen, digest, `ContentChanged`, guard, seal, confirmation) with no lookup after its seal; a directory sealed through its pin after its guard; `seal_tree`'s one `observe_directory` on the pop, before the directory's seal, and `seal_evidence`'s order (slot tree, slot observation, slot seal, `evidence/` observation, `evidence/` seal) (fix 1); the success arm only builds the result, which is infallible. |
+
+## C3 3. Verification
+
+All runs were in the foreground with `CARGO_INCREMENTAL=0`, a target directory in `/tmp`, and the proxies unset.
+
+### 3.1 Targeted controls (final bytes)
+
+- The 49 payload controls as root: `49 passed; 0 failed; 0 ignored; 1503 filtered out` (33 s).
+- As `nobody`: `49 passed; 0 failed; 0 ignored; 1503 filtered out` (34 s); the scratch `TMPDIR` was empty afterwards, so
+  the sealed `0500`/`0555`/`0000` trees are removable after `UnsealV1`.
+- Probes: `PAYLOAD-SEAL-MODES as_root=true|false`, `PAYLOAD-MARKERS during_planning_and_export=[]`, and C2b's
+  `PAYLOAD-LONG-SYMLINK target_len=4095 holds=true`, `PAYLOAD-FOLDING case/normalization folds=false`.
+
+### 3.2 Required local gates
+
+| Gate | Result |
+|---|---|
+| `cargo fmt --all -- --check` | clean |
+| `cargo clippy --workspace --all-targets --all-features -- -D warnings` | clean (0 warnings) on final bytes, a forced re-check of `bridge-core` and its dependents |
+| `cargo test -p bridge-core` | **1697 passed, 0 failed, 0 ignored; nothing excluded**: lib 1552 (the base's 1540 + 12), 14 integration binaries 135 (trybuild `compile_fail` 1 included), doc-tests 10. Run as an exact partition (§3.3). The base figure 1540 is derived (1552 − 12); no failure occurred, so no base-control run was needed. |
+| `cargo run -p a2a-bridge -- validate --repo-hygiene` | `repository hygiene validated` (41 tracked artifacts, 9 example configs) |
+| `git diff --check` | clean |
+
+### 3.3 The full suite in partitions (final bytes)
+
+The lib binary was run directly in six filtered partitions at `--test-threads 6`, each under its own foreground timeout:
+`b2c` 66 (132 s), `b2a` 40 (175 s), `b2b` + `b1a` 80 (69 s), `b1b` + `round` + `corrective` 100 (163 s), the rest of
+`git_tests` with the 49 payload controls 138 (48 s), and the rest of the lib 1128 (39 s) = **1552, all passed**; then
+`cargo test -p bridge-core --test '*'` (14 binaries, 135) and `--doc` (10). The same partitions also passed once before
+the e2e control's baseline reading and two comment-only edits (`05-*`). The rest-of-lib log holds the known extra `1 passed` line of
+`path_identity_refuses_an_unreadable_ancestor`'s nested child (C1 §3.3), excluded from the totals. C2a §3.3's
+load-sensitive 2B3b deadline controls did not fail in this run.
+
+### 3.4 Descriptors (measured; a 2B3d design input, not a C3 change)
+
+`c3_the_rich_clone_restores_end_to_end_on_the_one_ledger` run alone (`--exact --test-threads 1`, so the process-wide
+`/dev/fd` count is exact), as root and as `nobody`, identically (`09-*`):
+
+| Point | Open descriptors |
+|---|---|
+| Baseline (stdio, harness, the listing's own) | 4 |
+| The phase-V/G value alive | 64 → **phase V and G retain 60** (staged plaintexts, phase V's and phase G's pins, the bootstrap's admitted files, phase G's retained metadata and object descriptors) |
+| The phase-P value alive (the test's held descriptors dropped) | 73 → **phase P retains 9**, exactly its 9 directory pins (`evidence/`, three slots, five evidence directories; the rich clone's worktree has no directory) |
+| Everything dropped | 4 |
+
+Transient use on top: the terminal gate holds at most one file descriptor (each reopened file is dropped before the next
+entry); C2b's materialization holds one output file at a time, and a directory create one extra duplicate while it checks
+emptiness.
+
+**The bound.** The production process inherits its shell's soft `RLIMIT_NOFILE`: 256 by default on macOS (1024 is common
+on Linux; this container's is 1048576). `cargo test` raises its own limit and its test binaries inherit that, so the
+suite does not exhibit the bound; the real binary would. For a restore whose phase-V/G value holds what the rich clone's
+holds, phase P can retain about 256 − 4 − 60 − 2 ≈ **190 directory pins in total** on macOS before a directory create
+fails with a typed I/O refusal (`EMFILE`) and its partial kept: about **180 worktree directories** beside the rich clone's
+9 evidence directories (about 950 at a 1024 soft limit). The phase-V/G share grows with the capsule (more staged
+artifacts, refs, reflogs and metadata directories), so the real headroom is smaller for a larger repository. 2B3d's
+options include raising the soft limit to the hard limit at startup, releasing pins once the terminal gate has sealed
+(nothing after it needs them except the record), or re-deriving identity per entry without retaining descriptors.
+
+### 3.5 Final-bytes run
+
+On snapshot `19dacdaffffa441f`, after the mutation matrix: fmt, workspace clippy, the partitioned suite (§3.3), and the 49
+payload controls as root and as `nobody` (`08-*`). Repo hygiene and `git diff --check` were run again after this
+handoff was written. `sha256sum -c source-sha256.txt` holds.
+
+### 3.6 Receipts (`.git/a2a-evidence/2b3c-c3/`)
+
+| File | Content |
+|---|---|
+| `base-commit.txt` | `0235b1d3…` |
+| `01-red-missing-symbol.log` | Structural RED (§4.1). |
+| `02-green-payload-root-linux.log`, `03-green-payload-nonroot-linux.log` | The first all-payload green runs (48 controls: before the root-gitfile control was added). |
+| `04-clippy-workspace.log` | §3.2 |
+| `05-binary.txt`, `05-part-{1..6}-*.log`, `05g-integration.log`, `05h-doc.log` | The first partitioned suite run. |
+| `06-repo-hygiene.log` | §3.2 |
+| `07-run_mutations.py`, `07-mutation-matrix-{a..j}.json`, `07-summary.md` | §4.2 |
+| `08-final-part-{1..6}-*.log`, `08-final-integration.log`, `08-final-doc.log`, `08-final-payload-{root,nonroot}-linux.log` | §3.3, §3.5 |
+| `09-descriptors-{root,nonroot}-linux.log` | §3.4 |
+| `source-sha256.txt` | Per-file SHA-256 of the three changed `.rs` files. |
+| `fix1/01-green-payload-root-linux.log`, `fix1/02-green-payload-nonroot-linux.log` | Review fix 1: the 49 payload controls on the fixed bytes (§3.7). |
+| `fix1/03-red-new-tests-committed-production.log`, `fix1/04-*`, `fix1/05-*`, `fix1/06-red-each-edge-swap-row-committed-production.log` | Review fix 1 RED and its isolated rows (§4.3). |
+| `fix1/07-run_mutations.py`, `fix1/07-mutation-matrix.json` | Review fix 1 mutations F1–F5 (§4.3). |
+| `fix1/08-clippy-workspace.log`, `fix1/09-part-{1..6}.log`, `fix1/10-integration.log`, `fix1/11-doc.log`, `fix1/12-repo-hygiene.log`, `fix1/source-sha256.txt` | Review fix 1 gates and the full suite on the final bytes (§3.7). |
+
+### 3.7 Review fix 1 (final bytes, snapshot `636fbb70fe70f227`)
+
+Same lane and conditions as above (foreground, `CARGO_INCREMENTAL=0`, target in `/tmp`, proxies unset).
+- The 49 payload controls: `49 passed; 0 failed` as root (39 s) and as `nobody` (39 s); the scratch `TMPDIR` was empty
+  afterwards.
+- `cargo fmt --all -- --check` clean; `cargo clippy --workspace --all-targets --all-features -- -D warnings` clean (0
+  warnings; `bridge-core` re-checked); `git diff --check` clean (worktree and index);
+  `cargo run -p a2a-bridge -- validate --repo-hygiene` → `repository hygiene validated`.
+- `cargo test -p bridge-core`: **1697 passed, 0 failed**: lib **1552** in six partitions proven disjoint and exact
+  against `--list` (`b2c_` 66; `b2a_` 41; `b2b_`/`b1a_` 80; `b1b_`/`round`/`corrective` 145; the rest of `git_tests` 138;
+  the rest of the lib 1082; each partition skips the earlier markers), integration 135 (14 binaries), doc-tests 10. The
+  rest-of-lib log again holds the known nested child's extra `1 passed` line, excluded. The partition boundaries differ
+  from §3.3's (whose `b2a_`, `round` and `corrective` filters overlapped other partitions); the total is the same.
+- Not re-run on these bytes: the full M01–M47 matrix (§4.3 says why) and the descriptor measurement (the fix changes
+  no pin or descriptor).
+
+## C3 4. RED evidence
+
+### 4.1 Structural RED
+
+The production section was drafted before the controls, so structural RED was taken by compiling the finished controls
+with the C3 section (everything from its header) removed: `cargo test -p bridge-core --lib --no-run` failed with 15
+errors, all unresolved C3 symbols (`RestoredEntryV1`, `RestoredPayloadPlaneV1`, `SealedEntryV1`,
+`restore_payload_plane_v1`) and their derived `E0282`s. The source was then restored and its hash checked.
+
+### 4.2 Behavioural RED: the single-guard mutation matrix
+
+`07-run_mutations.py` applies each row as exact, unique replacements to `custody_restore_payload.rs`, rebuilds, runs all
+C3 controls as root and as `nobody`, records the failing controls, restores the file and checks its SHA-256. **47 rows:
+45 turned controls red; 2 survived (below).** Every row turned the same controls red as root and as `nobody` except M16
+and M24, where `nobody` adds one (by design: those are the guards a root run hides). The full row → control table is
+`07-summary.md`; condensed:
+
+| Rows | Guard removed | Controls turned red |
+|---|---|---|
+| M01 | the terminal census | refused-gate (census count, mount row), structural |
+| M02–M04 | the worktree / index / evidence walk | seam, replacement, content, mode, refused-gate, deadline (+ modes, rich clone, gitfile; evidence and markers for M04) |
+| M05–M08 | the object-store, metadata, admitted-file, staging/HOME/XDG/bootstrap chains after the walk | refused-gate (+ deadline sequence, structural) |
+| M09, M10 | the root's identity last; its guard | refused-gate; deadline (+ structural) |
+| M11–M14 | the gate's, each entry's, a file seal's, a directory seal's guard | deadline (+ structural) |
+| M15, M17, M47 | a directory's by-name observation; the reopened descriptor's identity; a link at the reopen typed | replacement |
+| M16 | a file's by-name stat | structural as root; replacement as `nobody` (the `0000` row: the reopen alone gives an untyped `EACCES`) |
+| M18, M19 | the content comparison; the closing `fstat` | content |
+| M20, M21, M23, M35 | a file's or a directory's `fchmod`; a file sealed before its digest; the gate not run | nearly every control |
+| M22 | phase P's confirming `fstat` | mode |
+| M24 | post-order (a directory sealed before its children) | seam, replacement, content, mode, refused-gate, deadline; **+ the modes control as `nobody`** (a lookup beneath a sealed `0000` directory) |
+| M25, M27 | a link's by-name stat; its closing stat | replacement |
+| M29–M34 | a slot's / `evidence/`'s seal; `0700` for them; D2 file/directory and D4 index final modes taken from the frame | modes, evidence, markers, rich clone, gitfile, mode, refused-gate, deadline (row-dependent) |
+| M36–M39 | `last_completed`; `began`; `sealed` kept in the partial; each seal recorded | content, mode, refused-gate, replacement, deadline |
+| M40–M46 | the inventory's mode written, frame mode, childless list, root `.git`, external references, `evidence/` pin, index rows | modes, rich clone, gitfile, evidence (row-dependent) |
+
+Survivors, each predicted and kept deliberately:
+- **M26** (the symlink's target comparison removed): every replacement of a link is a new inode, which the closing stat
+  refuses; the comparison is defence in depth for the recorded target and cannot be isolated without inode reuse.
+- **M28** (every recorded entry reached): unreachable on a created tree whose every parent is a recorded directory (C2b
+  guarantees it); defence in depth.
+
+M25 survived its first run (chunk e) and M16 was then structural-only; the two rows added to the replacement control
+(a file made `0000`, a link replaced by a regular file) were written for them, and chunk j re-ran M16, M25, M26 and M28
+on those bytes. Rows M01–M47 in chunks a–i ran on test bytes without those two rows (later edits only add assertions and
+the e2e control's baseline reading); the pre-fix production bytes differ from the matrix's by one comment line in
+`restored`.
+
+### 4.3 Review fix 1: RED for the pre-order defect, and the fixed lines' mutations
+
+**Behavioural RED.** The fixed tests were run against the committed (pre-fix) production file, then the fixed file was
+restored and its SHA-256 checked (`fix1/03`): four controls fail, the seam (`evidence/bridge_evidence` sealed at event
+87, beneath `evidence/`, which was observed at event 61), the replacement control, the deadline control (the guard
+sequence) and the structural control (`seal_tree`'s observation is not on the pop). Because the replacement control's first failing row is an existing row whose expected seal count
+moved (`a directory swapped`), the three new rows were then run alone against the pre-fix file through a temporary,
+unstaged row filter (`fix1/04`, `fix1/06`): **each of the three succeeds on the pre-fix code** (`…: must refuse`):
+`repository/d`, the slot, and `evidence/` renamed away with a decoy at their name while a file beneath is observed. On the
+fixed file the same rows refuse `IdentityChanged` (`fix1/05`). This is the review's reproducer, executable.
+
+**Mutations** (`fix1/07`, root, all five red): F1 a worktree directory's post-order observation removed; F2 a slot's;
+F3 `evidence/`'s; F4 a slot observed before its tree; F5 `evidence/` observed before its slots. Each turns the seam,
+replacement, deadline and structural controls red. The pre-fix matrix's M15 (a directory's observation) and M24
+(post-order seal) concern the same lines and were not re-run; the M01–M47 rows outside `seal_tree` and `seal_evidence`
+apply to code that the fix does not change.
+
+## C3 5. Open items: interpretations for the reviewer and controller
+
+1. **Entry points.** `restore_payload_plane_v1` is C2b's `materialize_payload_plane_v1` followed by the terminal gate,
+   as the C2b ruling says; both stay.
+2. **"A mode changed between `fchmod` and the confirming `fstat` (test seam)."** C1's seam (`ModeSet`) is private to
+   `fs_custody`, and this increment may not change `fs_custody`. Phase P therefore confirms again through the same
+   descriptor (its own `fstat`, which is also what the inventory's mode written rests on), and its seam
+   (`TerminalModeSet`) sits between the primitive's return and that `fstat`. The primitive's own window is C1's
+   `mode_03`. If the controller wants C1's seam driven through phase P, that needs a test-only widening in `fs_custody`
+   (a contract point, not done).
+3. **Checks beyond the spec's text, all fail-closed.** A file's descriptor `fstat` must not change while it is read (a
+   write during the digest); a symlink is bracketed by a closing no-follow stat after `readlinkat` (as C1's primitive
+   is); every recorded entry must be reached by the walk. The first two have rows; the third is survivor M28.
+4. **The index is sealed too**: `set_exact_file_mode(0600)` changes nothing but keeps one path (and one digest) for every
+   file.
+5. **Step 3's scope** is C2a's gate scope (§C2a 5.3): the object store, metadata, admitted bootstrap files, and the
+   staging, HOME, XDG and bootstrap chains, all through phase V/G pins that phase P never seals (the seam control proves
+   no retained pin lies beneath a sealed entry).
+6. **Deadline placement.** Guards before the census, before every entry's observation, immediately before every seal,
+   before every retained chain (their existing labels), and before the root. No guard sits immediately after a seal:
+   the next effect is always preceded by one (a seal, the next entry, a chain, or the root), so no seal follows an
+   expired deadline; a slow digest or lookup is caught by the seal's guard or the digest's own per-read check.
+7. **`payload_materialization_began`** on a terminal-gate failure is derived from what materialization recorded (on its
+   success every create is recorded): false when every class was Empty.
+8. **A refused terminal gate leaves a partially sealed destination** (`sealed` lists exactly what carries its final mode,
+   possibly a `0000` directory). Nothing is unsealed or removed, per the spec. A second invocation refuses at its first
+   create, as in C2b; C3 adds no new row for it.
+9. **Inventory shape.** One row type (`RestoredEntryV1`) for the worktree, the index and evidence; evidence per slot
+   with the slot's own mode and identity; `evidence/` as `(mode, dev, ino)`; each inventory carries its class state(s).
+   The mode written is each row's final mode, which the gate confirmed by `fstat` before recording the seal.
+10. **Pins** move out of `PayloadCreatedV1` into `PayloadPinsV1`; the index tree never holds a directory, so it has no pins.
+11. **`fs_custody`'s `#[allow(dead_code)] // … lands in C3` notes** on `set_exact_file_mode` and `set_exact_mode` remain:
+    removing them is an `fs_custody` change, outside this increment.
+12. **Post-order directory observation (review fix 1).** A directory is descended into through its retained pin (the
+    created object, which the inventory and pins record) without a by-name call; its one by-name observation follows
+    its sealed subtree and immediately precedes its seal, while its parent is still `0700`. A directory renamed or
+    replaced at any time before that observation refuses there as `IdentityChanged`. One consequence on error typing,
+    with no row (read from the code, not run): a directory with children merely made `0000` in place before the gate
+    (not replaced) is now met first by a child's by-name stat beneath it, which a non-root owner gets as a typed `Io`
+    refusal (`EACCES`) rather than the
+    directory's own `IdentityChanged`; as root, the directory's observation refuses it as `IdentityChanged`. Both
+    refuse, keep everything, and name `Evidence`.
+
+## C3 6. Risks
+
+- **The macOS native non-root run has not happened.** Facts it decides: `File::open` of a directory to hold it, and
+  reading a sealed `0000`/`0200` file through a descriptor opened before its seal, on APFS; `PermissionDenied` for a
+  lookup beneath a sealed `0000` directory; `/dev/fd` listing; the swap and rename rows; the closing-`fstat` row (a write
+  is expected to move APFS's nanosecond timestamps; the row sleeps 50 ms first); the planted-marker fixture with the
+  macOS `/bin/sh`; `UnsealV1`'s cleanup (a failure would show as `TMPDIR` leftovers, not test failures). If any of these
+  fails, the right response is to report it, not to weaken the control.
+- **Descriptor bound** (§3.4): a real worktree with more than about 180 directories would hit macOS's default soft
+  limit in the production binary; 2B3d must decide.
+- **Residual boundaries** (unchanged from 2B3a/2B3b): a change to an entry or its name after its own terminal check is
+  outside the gate (since fix 1, a directory's check follows its whole subtree, so this is only the window after its
+  own observation); a same-owner process can change a mode back and rewrite after sealing.
+- **Pre-existing, outside scope:** C2a §3.3's load-sensitive 2B3b deadline controls (not reproduced here) and C2a §6's
+  `RouteV1` non-root leftovers (no payload control uses the recording route).
+- **Wall time.** The 12 C3 controls add about 30 s to the parallel payload run.
+
+## C3 7. Files
+
+Changed and staged, and nothing else:
+- `crates/bridge-core/src/custody_restore_git.rs` — visibility only (§2.2)
+- `crates/bridge-core/src/custody_restore_payload.rs` — the C3 section, the error variant, the partial's `sealed`, the
+  hook points and docs (§2.1)
+- `crates/bridge-core/src/custody_restore_payload_tests.rs` — 12 controls, the C3 fixtures, and the C2b fixture edits
+  (§2.4)
+- `docs/superpowers/reviews/2026-10-14-adr0041-slice2b3c-implementation-handoff.md` — this section
+
+There are no dependency, `Cargo.lock`, public-API, wire, runner, `fs_custody`, frame-codec or coverage changes, no new
+`unsafe`, and no operator wiring. The commit message is in `.git/A2A_COMMIT_MSG`; the bridge commits. There is no push or
+merge.
+
+## C3 8. Next
+
+1. The controller runs `cargo test -p bridge-core` natively on macOS as a non-root user on this candidate, before the C3
+   source review (§6 lists what it decides).
+2. C3 source review: Sol/xhigh, cap two rounds; the spec's terminal-gate text is re-examined against code here (the
+   spec ledger's round-3 disposition). §5 lists the interpretations to rule on, especially §5.2 (the confirming-`fstat`
+   seam), §5.6 (deadline placement) and §5.12 (post-order observation, fix 1). Round 1's blocker (pre-order directory
+   edges) is fixed with executable RED (§4.3); round 2 re-reviews these bytes.
+3. On approval, 2B3d: the `custody-restore.v1` record from `RestoredPayloadPlaneV1`'s inventories, the joint fixture,
+   the negative fixtures, the cross-phase wrapper and composed failure type, and a decision on the descriptor bound
+   (§3.4).
