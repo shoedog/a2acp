@@ -88,7 +88,8 @@
 //! for evidence files and `0500` for evidence directories (D2). Nothing is looked up by name beneath a
 //! directory once it is sealed, and no file descriptor outlives its entry. Then the retained staging and
 //! phase-G `.git` chains, which phase P never seals, and the destination root's identity LAST; the one
-//! deadline is read before every entry and immediately before every seal. A file whose bytes are not the
+//! deadline is read before every entry, immediately before every seal, and after every filesystem call the
+//! gate makes before it makes another or records a seal. A file whose bytes are not the
 //! bytes phase P wrote is [`PayloadPlaneErrorV1::ContentChanged`]. The result,
 //! [`RestoredPayloadPlaneV1`], is the phase-G value unchanged with the worktree, index, and evidence
 //! inventories (each entry's frame mode and the mode written), the root `.git` disposition, the childless
@@ -275,7 +276,9 @@ pub(crate) struct PayloadPlanePartialV1 {
     /// Every entry and pin materialization created so far, the file in flight, and the charge.
     pub(crate) created: PayloadCreatedV1,
     /// Every entry the terminal gate already sealed, in the order it sealed them: each now has its final
-    /// mode, and keeps it.
+    /// mode, and keeps it. An entry is recorded only once its seal is confirmed with the deadline still
+    /// unspent, so one whose mode was set but whose confirmation a refusal or the deadline stopped is not
+    /// listed, though it may carry its final mode.
     pub(crate) sealed: Vec<SealedEntryV1>,
 }
 
@@ -714,6 +717,11 @@ pub(crate) enum PayloadHookPointV1 {
     /// The terminal gate is about to look a name up beneath a retained pin, by that name (the name's path:
     /// the pin's path and the leaf). Every by-name call the walk makes runs this first.
     TerminalLookup,
+    /// The terminal gate is about to make a call through an entry's own descriptor: a reopened file's
+    /// opening or closing `fstat`, an entry's mode primitive, or phase P's confirming `fstat` (the entry's
+    /// path). With [`Self::TerminalLookup`], every call the walk makes is announced first, except a digest's
+    /// reads, each of which the digest itself guards.
+    TerminalDescriptor,
     /// A reopened file was read whole and its bytes compared, before its descriptor's closing `fstat` (its
     /// path).
     TerminalDigested,
@@ -2452,7 +2460,8 @@ pub(crate) fn materialize_payload_plane_bounded_v1(
 // The terminal gate (increment C3): every created entry verified and sealed, and the result
 // ---------------------------------------------------------------------------------------------
 
-use super::git::stream_digest;
+use super::git::{stream_digest, BootstrapObjectsV1};
+use super::{plain_relative, RESTORE_PLAIN_DIR_NAME_V1};
 use crate::fs_custody::set_exact_file_mode;
 
 /// One entry the terminal gate sealed: its destination-relative name and the mode it now has, which the gate
@@ -2642,6 +2651,14 @@ impl SealRunV1<'_> {
         let _ = (parent, leaf);
     }
 
+    /// Every call the walk makes through a file's own descriptor is announced to the test seam first.
+    fn descriptor(parent: &PinnedDirectoryV1, leaf: &[u8]) {
+        #[cfg(test)]
+        Self::hook(PayloadHookPointV1::TerminalDescriptor, parent, leaf);
+        #[cfg(not(test))]
+        let _ = (parent, leaf);
+    }
+
     /// The guard before an entry's one terminal observation, then the observation's seam.
     fn enter(&self, parent: &PinnedDirectoryV1, leaf: &[u8]) -> Result<(), PayloadPlaneErrorV1> {
         self.pace("payload-terminal-entry")?;
@@ -2669,7 +2686,7 @@ impl SealRunV1<'_> {
     }
 
     /// `mode`, which the primitive set and confirmed, must also be what the descriptor's own `fstat` shows
-    /// now; the entry is then recorded as sealed.
+    /// now; then the deadline is observed after that `fstat`, and only then is the entry recorded as sealed.
     fn confirm_sealed(
         &mut self,
         observed: Result<u32, FsCustodyError>,
@@ -2684,6 +2701,7 @@ impl SealRunV1<'_> {
             ))
             .into());
         }
+        self.pace("payload-terminal-confirmed")?;
         self.sealed.push(SealedEntryV1 {
             name: name.to_vec(),
             mode,
@@ -2692,8 +2710,8 @@ impl SealRunV1<'_> {
     }
 
     /// Seal the directory behind `pin` with `mode` (its children are all sealed already): the guard, then
-    /// the primitive's `fchmod` and confirmation through the retained descriptor, then that descriptor's
-    /// own `fstat`. Nothing beneath it is looked up again.
+    /// the primitive's `fchmod` and confirmation through the retained descriptor, the deadline again, then
+    /// that descriptor's own `fstat`. Nothing beneath it is looked up again.
     fn seal_directory(
         &mut self,
         pin: &PinnedDirectoryV1,
@@ -2702,11 +2720,24 @@ impl SealRunV1<'_> {
     ) -> Result<(), PayloadPlaneErrorV1> {
         const LABEL: &str = "custody restore payload final directory mode";
         self.pace("payload-terminal-seal")?;
+        #[cfg(test)]
+        run_payload_hook(
+            PayloadHookPointV1::TerminalDescriptor,
+            None,
+            pin.canonical_path(),
+        );
         pin.set_exact_mode(mode, LABEL)
             .map_err(|error| staging_refusal(error, name))?;
         #[cfg(test)]
         run_payload_hook(
             PayloadHookPointV1::TerminalModeSet,
+            None,
+            pin.canonical_path(),
+        );
+        self.pace("payload-terminal-mode-set")?;
+        #[cfg(test)]
+        run_payload_hook(
+            PayloadHookPointV1::TerminalDescriptor,
             None,
             pin.canonical_path(),
         );
@@ -2726,7 +2757,9 @@ impl SealRunV1<'_> {
     /// its whole content, read through that descriptor under the one deadline, has the recorded length and
     /// SHA-256 (else [`PayloadPlaneErrorV1::ContentChanged`]), and the descriptor's `fstat` did not change
     /// while it was read; then the guard, and its final mode set and confirmed through that descriptor,
-    /// which is then closed.
+    /// which is then closed. The deadline is observed after every call before the next one is made (the
+    /// opening `fstat`'s is the digest's own, before its first read), so a slow call is never followed by
+    /// another, or by the record of a seal.
     fn seal_file(
         &mut self,
         parent: &PinnedDirectoryV1,
@@ -2750,10 +2783,13 @@ impl SealRunV1<'_> {
         self.enter(parent, leaf)?;
         Self::lookup(parent, leaf);
         recheck_created(parent, leaf, entry.observed(), name)?;
+        self.pace("payload-terminal-statted")?;
         Self::lookup(parent, leaf);
         let mut file = parent
             .open_regular_file(OsStr::from_bytes(leaf), LABEL)
             .map_err(|error| reopen_refusal(error, name))?;
+        self.pace("payload-terminal-reopened")?;
+        Self::descriptor(parent, leaf);
         let opened = ChildStatV1::from_metadata(&file.metadata().map_err(io)?);
         if (
             opened.kind,
@@ -2778,13 +2814,18 @@ impl SealRunV1<'_> {
         if read != (*length, *sha256) {
             return Err(PayloadPlaneErrorV1::ContentChanged { name: shown });
         }
+        self.pace("payload-terminal-digested")?;
+        Self::descriptor(parent, leaf);
         if ChildStatV1::from_metadata(&file.metadata().map_err(io)?) != opened {
             return Err(changed("the file changed while it was read"));
         }
         self.pace("payload-terminal-seal")?;
+        Self::descriptor(parent, leaf);
         set_exact_file_mode(&file, mode, LABEL).map_err(|error| staging_refusal(error, name))?;
         #[cfg(test)]
         Self::hook(PayloadHookPointV1::TerminalModeSet, parent, leaf);
+        self.pace("payload-terminal-mode-set")?;
+        Self::descriptor(parent, leaf);
         let observed = file
             .metadata()
             .map(|metadata| ChildStatV1::from_metadata(&metadata).mode)
@@ -2798,7 +2839,8 @@ impl SealRunV1<'_> {
     /// The symlink `entry` at `leaf` beneath `parent`: its one terminal observation. By name, still the
     /// link created (its kind, device, inode, and target length); `readlinkat` returns exactly the recorded
     /// target; and a closing no-follow `fstatat` is still that link. It is never followed and never given a
-    /// mode.
+    /// mode. The deadline is observed after each of the first two calls; what follows the closing one is the
+    /// next entry's guard, a directory's, or the first chain's.
     fn verify_symlink(
         &self,
         parent: &PinnedDirectoryV1,
@@ -2819,6 +2861,7 @@ impl SealRunV1<'_> {
         self.enter(parent, leaf)?;
         Self::lookup(parent, leaf);
         recheck_created(parent, leaf, entry.observed(), name)?;
+        self.pace("payload-terminal-statted")?;
         Self::lookup(parent, leaf);
         let read = match parent.read_child_symlink(
             OsStr::from_bytes(leaf),
@@ -2833,6 +2876,7 @@ impl SealRunV1<'_> {
         if read != *target {
             return Err(changed());
         }
+        self.pace("payload-terminal-link-read")?;
         Self::lookup(parent, leaf);
         recheck_created(parent, leaf, entry.observed(), name)
     }
@@ -2944,12 +2988,148 @@ impl SealRunV1<'_> {
     }
 }
 
+/// Phase G's admitted bootstrap files, checked as [`source_files_unchanged`] checks them (the same two calls
+/// in the same order, with the same refusals), with the deadline observed before each call: the entry by name
+/// beneath the retained pack directory, then the file's retained descriptor. The step gates keep the shared
+/// sweep, which makes the two calls behind one guard.
+fn terminal_source_files_unchanged(
+    boot: &VerifiedGitBootstrapV1,
+    pace: PaceV1<'_>,
+) -> Result<(), GitBootstrapErrorV1> {
+    let BootstrapObjectsV1::Captured { files, .. } = &boot.objects else {
+        return Ok(());
+    };
+    for admitted in files {
+        let changed = |detail: &str| -> GitBootstrapErrorV1 {
+            CustodyRestoreErrorV1::IdentityChanged(format!("{}: {detail}", admitted.relative))
+                .into()
+        };
+        let measured = (
+            ChildKindV1::Regular,
+            admitted.dev,
+            admitted.ino,
+            admitted.length,
+        );
+        pace("objects-source")?;
+        let pack = boot.pack_directory().ok_or_else(|| {
+            GitBootstrapErrorV1::ObjectStoreInput(
+                "the bootstrap's pack directory is not retained".to_owned(),
+            )
+        })?;
+        let stat = pack
+            .child_metadata_no_follow(
+                OsStr::new(split_relative(&admitted.relative).1),
+                "custody restore admitted object file",
+            )
+            .map_err(|error| staging_refusal(error, admitted.relative.as_bytes()))?
+            .ok_or_else(|| changed("no longer the admitted object file"))?;
+        if stat.kind == ChildKindV1::Symlink {
+            return Err(CustodyRestoreErrorV1::SymlinkRefused {
+                name: admitted.relative.clone(),
+            }
+            .into());
+        }
+        if (stat.kind, stat.dev, stat.ino, stat.size) != measured {
+            return Err(changed("no longer the admitted object file"));
+        }
+        pace("payload-source-statted")?;
+        let held = admitted.file.metadata().map_err(|error| {
+            CustodyRestoreErrorV1::Io(format!("{}: {error}", admitted.relative))
+        })?;
+        let held = ChildStatV1::from_metadata(&held);
+        if (held.kind, held.dev, held.ino, held.size) != measured {
+            return Err(changed(
+                "the retained descriptor is no longer the admitted object file",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// [`retained_chains`]'s calls, in its order and with its refusals, with the deadline observed before each
+/// call: every staging chain from the root (the work directory's entry, the plain directory's, then each
+/// staging directory's beneath its retained parent), then HOME, XDG, and each bootstrap directory beneath its
+/// retained parent. A chain's first call has its `payload-chain` guard, as there, and each later call of the
+/// same chain a `payload-chain-step` guard. The step gates keep the shared sweep, which checks a whole chain
+/// behind one guard.
+fn terminal_retained_chains(
+    dest: &RestoreDestinationV1,
+    boot: &VerifiedGitBootstrapV1,
+    pace: PaceV1<'_>,
+) -> Result<(), GitBootstrapErrorV1> {
+    let work = RESTORE_WORK_DIR_NAME_V1.as_bytes();
+    let staging = dest.staging.borrow();
+    for key in std::iter::once(&b""[..]).chain(staging.keys().map(Vec::as_slice)) {
+        pace("payload-chain")?;
+        recheck_entry(&dest.root, work, &dest.work, work)?;
+        pace("payload-chain-step")?;
+        recheck_entry(
+            &dest.work,
+            RESTORE_PLAIN_DIR_NAME_V1.as_bytes(),
+            &dest.plain,
+            &plain_relative(b""),
+        )?;
+        if key.is_empty() {
+            continue;
+        }
+        let mut parent: &PinnedDirectoryV1 = &dest.plain;
+        let mut prefix = Vec::new();
+        for component in key.split(|byte| *byte == b'/') {
+            prefix = joined(&prefix, component);
+            let pin = staging.get(&prefix).ok_or_else(|| {
+                CustodyRestoreErrorV1::IdentityChanged(format!(
+                    "{}: a staging directory is not retained",
+                    lossy(&plain_relative(&prefix))
+                ))
+            })?;
+            pace("payload-chain-step")?;
+            recheck_entry(parent, component, pin, &plain_relative(&prefix))?;
+            parent = pin;
+        }
+    }
+    for (name, pin) in [(HOME_NAME_V1, &boot.home), (XDG_NAME_V1, &boot.xdg)] {
+        pace("payload-chain")?;
+        recheck_entry(
+            &dest.work,
+            name.as_bytes(),
+            pin,
+            &joined(work, name.as_bytes()),
+        )?;
+    }
+    let bootstrap = joined(work, BOOTSTRAP_NAME_V1.as_bytes());
+    for (relative, pin) in &boot.directories {
+        if relative.is_empty() {
+            pace("payload-chain")?;
+            recheck_entry(&dest.work, BOOTSTRAP_NAME_V1.as_bytes(), pin, &bootstrap)?;
+            continue;
+        }
+        let (parent_relative, component) =
+            relative.rsplit_once('/').unwrap_or(("", relative.as_str()));
+        let parent = boot.directories.get(parent_relative).ok_or_else(|| {
+            CustodyRestoreErrorV1::IdentityChanged(format!(
+                "{relative}: its bootstrap parent is not retained"
+            ))
+        })?;
+        pace("payload-chain")?;
+        recheck_entry(
+            parent,
+            component.as_bytes(),
+            pin,
+            &joined(&bootstrap, relative.as_bytes()),
+        )?;
+    }
+    Ok(())
+}
+
 /// The terminal gate, one integrated operation after every step is written: the mount census over the
 /// destination; then ONE post-order walk of the worktree, the index, and the evidence trees, which is each
 /// created entry's sole terminal check and applies its final mode (nothing is looked up by name beneath a
 /// directory once it is sealed); then the retained staging and phase-G `.git` chains, which phase P never
 /// seals; and the destination root's identity LAST, its guard immediately before it. Every entry it seals is
-/// pushed to `sealed` as it is sealed, so a refusal keeps them.
+/// pushed to `sealed` as it is sealed, so a refusal keeps them. The deadline is observed after every
+/// filesystem call before the next one: the census is followed by the first entry's guard (or the first
+/// chain's), each call of the walk by its own guard or the next entry's, and each call of the chains by the
+/// next call's guard, each chain making one call per guard.
 fn terminal_gate(
     plane: &RestoredGitPlaneV1,
     created: &PayloadCreatedV1,
@@ -2968,8 +3148,8 @@ fn terminal_gate(
     run.seal_evidence(&dest.root, &created.evidence)?;
     output_chains(dest, PinViewV1::of_final(pins), &plane.objects.files, pace)?;
     metadata_chains(plane, pace)?;
-    source_files_unchanged(&plane.bootstrap, pace)?;
-    retained_chains(dest, &plane.bootstrap, pace)?;
+    terminal_source_files_unchanged(&plane.bootstrap, pace)?;
+    terminal_retained_chains(dest, &plane.bootstrap, pace)?;
     pace("payload-root")?;
     pinned_root_unchanged(&dest.root)
         .map_err(|detail| CustodyRestoreErrorV1::IdentityChanged(detail).into())

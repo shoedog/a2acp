@@ -6120,33 +6120,293 @@ fn c3_a_refused_terminal_gate_names_evidence_and_keeps_everything() {
 // ---------------------------------------------------------------------------------------------
 
 /// The terminal gate's own guards for the three-step frames, in order: its own, then each entry's before its
-/// observation and each file's and directory's before its seal (post-order: a directory's observation and
-/// seal after everything beneath it), then the retained chains' (one per object-store directory and copied
-/// file, metadata directory and file, admitted bootstrap file, staging chain, HOME and XDG, and bootstrap
-/// directory), and the root's own guard last.
+/// observation, each file's and directory's before its seal, and one after every call the walk makes before
+/// it makes another or records a seal (post-order: a directory's observation and seal after everything
+/// beneath it); then the retained chains' (one per object-store directory and copied file, metadata directory
+/// and file, each of an admitted bootstrap file's two calls, each edge of every staging chain, HOME and XDG,
+/// and bootstrap directory), and the root's own guard last.
 fn terminal_guards(plane: &RestoredGitPlaneV1) -> Vec<&'static str> {
-    let (entry, seal) = ("payload-terminal-entry", "payload-terminal-seal");
+    let entry = "payload-terminal-entry";
+    // A file: its stat, its reopen, its digest (whose reads the digest guards itself), its closing `fstat`
+    // (the seal's guard), its mode primitive, and its confirming `fstat`. A directory: its stat (the seal's
+    // guard), its mode primitive, and its confirming `fstat`. A link: its stat and its `readlinkat`; its
+    // closing stat is followed by the next entry's guard.
+    let file = [
+        entry,
+        "payload-terminal-statted",
+        "payload-terminal-reopened",
+        "payload-terminal-digested",
+        "payload-terminal-seal",
+        "payload-terminal-mode-set",
+        "payload-terminal-confirmed",
+    ];
+    let directory = [
+        entry,
+        "payload-terminal-seal",
+        "payload-terminal-mode-set",
+        "payload-terminal-confirmed",
+    ];
+    let link = [
+        entry,
+        "payload-terminal-statted",
+        "payload-terminal-link-read",
+    ];
     let mut guards = vec!["payload-terminal-gate"];
     // The worktree: `a`, `d/x`, then `d`, each observed and sealed, and `l` observed; the index; `e`, then
     // its slot, then `evidence/`, each observed and sealed.
-    guards.extend([entry, seal, entry, seal, entry, seal, entry]);
-    guards.extend([entry, seal]);
-    guards.extend([entry, seal, entry, seal, entry, seal]);
-    let chains = gate_guards(plane);
-    guards.extend(&chains[1..]);
+    guards.extend(file.iter().chain(&file).chain(&directory).chain(&link));
+    guards.extend(file);
+    guards.extend(file.iter().chain(&directory).chain(&directory));
+    let admitted = match &plane.bootstrap.objects {
+        BootstrapObjectsV1::Captured { files, .. } => files.len(),
+        BootstrapObjectsV1::Empty => 0,
+    };
+    guards.extend(std::iter::repeat_n(
+        "objects-chain",
+        5 + plane.objects.files.len(),
+    ));
+    guards.extend(std::iter::repeat_n(
+        "payload-metadata-chain",
+        plane.metadata.directories.len() + plane.metadata.files.len(),
+    ));
+    for _ in 0..admitted {
+        guards.extend(["objects-source", "payload-source-statted"]);
+    }
+    // Each staging chain: the work directory's edge, the plain directory's, and one per component of its key.
+    let staging = plane.capsule().destination.staging.borrow();
+    for key in std::iter::once(&b""[..]).chain(staging.keys().map(Vec::as_slice)) {
+        guards.extend(["payload-chain", "payload-chain-step"]);
+        let components = if key.is_empty() {
+            0
+        } else {
+            key.split(|byte| *byte == b'/').count()
+        };
+        guards.extend(std::iter::repeat_n("payload-chain-step", components));
+    }
+    guards.extend(std::iter::repeat_n(
+        "payload-chain",
+        2 + plane.bootstrap.directories.len(),
+    ));
+    guards.push("payload-root");
     guards
 }
 
 /// The deadline in the terminal gate. A clean restore's guards are the materialization's, then exactly the
 /// terminal gate's own. Each terminal guard halts the run alone with the typed timeout and `Evidence` the
 /// last step completed, having sealed exactly the entries before it: its first guard, the first and last
-/// entry's, the first and last seal's, the first and last retained chain's, and the root's. A slow step is
-/// never followed by a seal: a file whose digest returned after the deadline is not sealed, and a seal that
-/// returned after it (a file's, a directory's) is the last one.
+/// entry's, the first and last seal's, the first and last retained chain's, the first later edge of a staging
+/// chain's, and the root's. A call of the walk that returns after the deadline is never followed by another
+/// call or by the record of a seal: for each call (a file's stat, reopen, opening `fstat`, digest, closing
+/// `fstat`, mode primitive, and confirming `fstat`; a link's stat, `readlinkat`, and closing stat; a
+/// directory's stat, mode primitive, and confirming `fstat`), the deadline is spent at the seam immediately
+/// before it (or, for the digest and a mode primitive, immediately after it returns), and the run halts with
+/// the typed timeout with no later event at all: the next call's own seam never runs, nothing more is sealed,
+/// and an entry whose mode primitive or confirmation returned late is not recorded as sealed, though it has its
+/// final mode. On a Captured object database, the guard between an admitted bootstrap file's two calls halts
+/// the run alone.
 #[test]
 fn c3_the_one_deadline_is_kept_before_every_entry_and_every_seal() {
     let capsule = frames_capsule();
     let frames = three_step_frames();
+    // First, each row makes one call of the walk return late: the deadline is spent at `spend` (the `nth` event
+    // of that seam for that name), and `next` (the `nth` event of that seam for that name) is the seam of the
+    // call that would follow, which must never run. `sealed` entries were sealed before it; `set` is an entry
+    // whose mode primitive ran but whose seal is not recorded.
+    use PayloadHookPointV1::{
+        TerminalDescriptor, TerminalDigested, TerminalEntry, TerminalLookup, TerminalModeSet,
+        TerminalSealed,
+    };
+    type AtV1 = (PayloadHookPointV1, &'static str, usize);
+    type SlowRowV1 = (&'static str, AtV1, AtV1, usize, Option<&'static str>);
+    let (a, d, x, l) = (
+        "repository/a",
+        "repository/d",
+        "repository/d/x",
+        "repository/l",
+    );
+    let slow: [SlowRowV1; 13] = [
+        (
+            "a slow file lookup",
+            (TerminalLookup, a, 0),
+            (TerminalLookup, a, 1),
+            0,
+            None,
+        ),
+        (
+            "a slow lookup",
+            (TerminalLookup, x, 1),
+            (TerminalDescriptor, x, 0),
+            1,
+            None,
+        ),
+        (
+            "a slow opening fstat",
+            (TerminalDescriptor, a, 0),
+            (TerminalDigested, a, 0),
+            0,
+            None,
+        ),
+        (
+            "a slow digest",
+            (TerminalDigested, a, 0),
+            (TerminalDescriptor, a, 1),
+            0,
+            None,
+        ),
+        (
+            "a slow closing fstat",
+            (TerminalDescriptor, a, 1),
+            (TerminalDescriptor, a, 2),
+            0,
+            None,
+        ),
+        (
+            "a slow file seal",
+            (TerminalModeSet, a, 0),
+            (TerminalDescriptor, a, 3),
+            0,
+            Some(a),
+        ),
+        (
+            "a slow file confirmation",
+            (TerminalDescriptor, a, 3),
+            (TerminalSealed, a, 0),
+            0,
+            Some(a),
+        ),
+        (
+            "a slow link lookup",
+            (TerminalLookup, l, 0),
+            (TerminalLookup, l, 1),
+            3,
+            None,
+        ),
+        (
+            "a slow readlinkat",
+            (TerminalLookup, l, 1),
+            (TerminalLookup, l, 2),
+            3,
+            None,
+        ),
+        (
+            "a slow closing link stat",
+            (TerminalLookup, l, 2),
+            (TerminalEntry, "repository/.git/index", 0),
+            3,
+            None,
+        ),
+        (
+            "a slow directory lookup",
+            (TerminalLookup, d, 0),
+            (TerminalDescriptor, d, 0),
+            2,
+            None,
+        ),
+        (
+            "a slow directory seal",
+            (TerminalModeSet, d, 0),
+            (TerminalDescriptor, d, 1),
+            2,
+            Some(d),
+        ),
+        (
+            "a slow directory confirmation",
+            (TerminalDescriptor, d, 1),
+            (TerminalSealed, d, 0),
+            2,
+            Some(d),
+        ),
+    ];
+    let seams = [
+        TerminalEntry,
+        TerminalLookup,
+        TerminalDescriptor,
+        TerminalDigested,
+        TerminalModeSet,
+        TerminalSealed,
+    ];
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = slow
+            .into_iter()
+            .map(|(row, spend_at, next, sealed, set)| {
+                let (capsule, frames) = (&capsule, &frames);
+                scope.spawn(move || {
+                    let case = PCaseV1::with_frames(capsule, frames);
+                    let root = case.dest.path.clone();
+                    let deadline = Instant::now() + P_WRITE_DEADLINE_V1;
+                    let fired: FiredV1 = StdRc::new(StdCell::new(None));
+                    let act = StdRc::new(spend(deadline, &fired));
+                    // Every terminal event in order, and how many had run when the deadline was spent.
+                    let events: StdRc<StdRefCell<Vec<(PayloadHookPointV1, PathBuf)>>> =
+                        StdRc::default();
+                    let spent: StdRc<StdCell<Option<usize>>> = StdRc::default();
+                    let _seams: Vec<_> = seams
+                        .iter()
+                        .map(|&point| {
+                            let (events, spent, act) = (events.clone(), spent.clone(), act.clone());
+                            let (target, seen) = (root.join(spend_at.1), StdCell::new(0_usize));
+                            install_payload_hook_for_test(point, move |event| {
+                                events.borrow_mut().push((point, event.path.to_path_buf()));
+                                if point == spend_at.0 && event.path == target {
+                                    if seen.get() == spend_at.2 {
+                                        spent.set(Some(events.borrow().len()));
+                                        (*act)();
+                                    }
+                                    seen.set(seen.get() + 1);
+                                }
+                            })
+                        })
+                        .collect();
+                    let run = case.restore_with(row, deadline, None);
+                    assert_eq!(
+                        fired.get(),
+                        Some(true),
+                        "{row}: INVALID (not behavioral evidence): the hook was not reached before the deadline"
+                    );
+                    let events = events.borrow();
+                    let (point, name, nth) = next;
+                    let next_path = root.join(name);
+                    assert_eq!(
+                        events
+                            .iter()
+                            .filter(|(one, path)| *one == point && *path == next_path)
+                            .count(),
+                        nth,
+                        "{row}: the next call's seam ({point:?} #{nth} of {name}) never runs"
+                    );
+                    let after = &events[spent.get().expect("the deadline was spent")..];
+                    assert!(
+                        after.is_empty(),
+                        "{row}: no event follows the late call: {after:?}"
+                    );
+                    refused_at_the_terminal_gate(
+                        &run,
+                        row,
+                        |cause| matches!(cause, PayloadPlaneErrorV1::Timeout),
+                        &SEAL_ORDER_V1[..sealed],
+                    );
+                    let Some(set) = set else {
+                        run.assert_seals_are_the_disk(row, &[]);
+                        return;
+                    };
+                    run.assert_seals_are_the_disk(row, &[set.as_bytes()]);
+                    let mode = |tree: &DiskTreeV1| match tree.get(set.as_bytes()) {
+                        Some(DiskV1::Dir(mode) | DiskV1::File(mode, _)) => *mode,
+                        other => panic!("{row}: {set} is {other:?}"),
+                    };
+                    assert_eq!(
+                        mode(&run.held(row).now()),
+                        mode(&expected_final(&run.failure(row).partial.plane)),
+                        "{row}: {set} has its final mode, which is not recorded as sealed"
+                    );
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle.join().expect("a slow row's thread");
+        }
+    });
+
     let materialized = StdRc::new(StdRefCell::new(Vec::new()));
     {
         let case = PCaseV1::with_frames(&capsule, &frames);
@@ -6210,6 +6470,11 @@ fn c3_the_one_deadline_is_kept_before_every_entry_and_every_seal() {
             6,
         ),
         ("objects-chain", terminal("objects-chain", 0, false), 7),
+        (
+            "payload-chain-step",
+            terminal("payload-chain-step", 0, false),
+            7,
+        ),
         ("payload-chain", terminal("payload-chain", 0, true), 7),
         ("payload-root", terminal("payload-root", 0, true), 7),
     ];
@@ -6255,71 +6520,43 @@ fn c3_the_one_deadline_is_kept_before_every_entry_and_every_seal() {
         }
     });
 
-    type SlowRowV1 = (&'static str, PayloadHookPointV1, &'static str, usize, usize);
-    let slow: [SlowRowV1; 4] = [
-        (
-            "a slow digest",
-            PayloadHookPointV1::TerminalDigested,
-            "repository/a",
-            0,
-            0,
-        ),
-        (
-            "a slow lookup",
-            PayloadHookPointV1::TerminalLookup,
-            "repository/d/x",
-            1,
-            1,
-        ),
-        (
-            "a slow file seal",
-            PayloadHookPointV1::TerminalModeSet,
-            "repository/a",
-            0,
-            1,
-        ),
-        (
-            "a slow directory seal",
-            PayloadHookPointV1::TerminalModeSet,
-            "repository/d",
-            0,
-            3,
-        ),
-    ];
-    std::thread::scope(|scope| {
-        let handles: Vec<_> = slow
-            .into_iter()
-            .map(|(row, point, name, nth, sealed)| {
-                let (capsule, frames) = (&capsule, &frames);
-                scope.spawn(move || {
-                    let case = PCaseV1::with_frames(capsule, frames);
-                    let deadline = Instant::now() + P_WRITE_DEADLINE_V1;
-                    let fired: FiredV1 = StdRc::new(StdCell::new(None));
-                    let act = spend(deadline, &fired);
-                    let _hook = install_payload_hook_for_test(
-                        point,
-                        nth_at(case.dest.path.join(name), nth, move |_| act()),
-                    );
-                    let run = case.restore_with(row, deadline, None);
-                    assert_eq!(
-                        fired.get(),
-                        Some(true),
-                        "{row}: INVALID (not behavioral evidence): the hook was not reached before the deadline"
-                    );
-                    refused_at_the_terminal_gate(
-                        &run,
-                        row,
-                        |cause| matches!(cause, PayloadPlaneErrorV1::Timeout),
-                        &SEAL_ORDER_V1[..sealed],
-                    );
-                    run.assert_seals_are_the_disk(row, &[]);
-                })
-            })
-            .collect();
-        for handle in handles {
-            handle.join().expect("a slow row's thread");
+    // A Captured object database (which restores no phase-P class): the guard between an admitted bootstrap
+    // file's by-name stat and its retained descriptor's `fstat` halts the run alone, with nothing created or
+    // sealed.
+    let row = "payload-source-statted #0";
+    let captured_capsule = captured(CustodyGitObjectFormatV1::Sha1);
+    let case = PCaseV1::of(PlaneInV1::rich(
+        &captured_capsule,
+        CustodyGitObjectFormatV1::Sha1,
+    ));
+    let deadline = Instant::now() + P_WRITE_DEADLINE_V1;
+    let fired: FiredV1 = StdRc::new(StdCell::new(None));
+    let act = spend(deadline, &fired);
+    let guard = install_git_hook_for_test(GitHookPointV1::DeadlineObserved, move |event| {
+        if event.label == "payload-source-statted" {
+            act();
         }
     });
+    let run = case.restore_with(row, deadline, None);
+    drop(guard);
+    assert_eq!(
+        fired.get(),
+        Some(true),
+        "{row}: INVALID (not behavioral evidence): the guard was not reached before the deadline"
+    );
+    let failure = run.failure(row);
+    assert!(
+        matches!(failure.cause, PayloadPlaneErrorV1::Timeout),
+        "{row}: {:?}",
+        failure.cause
+    );
+    assert_eq!(
+        failure.last_completed,
+        Some(PayloadPlaneStepV1::Evidence),
+        "{row}"
+    );
+    assert!(!failure.payload_materialization_began, "{row}");
+    assert!(failure.partial.sealed.is_empty(), "{row}");
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -6788,11 +7025,13 @@ fn c3_planted_config_hook_filter_and_fsmonitor_markers_never_run() {
 /// STRUCTURAL ONLY (evidence of shape and order, never of behavior; the behavioral evidence is every row
 /// above). The terminal gate's section creates, writes, renames, removes, charges, and runs Git nowhere, and
 /// changes a mode only through a descriptor (`set_exact_file_mode`, `set_exact_mode`), never by path. The gate
-/// is the census, the walk of the worktree, the index, and the evidence, then the retained chains, and the
-/// root's identity LAST, its guard immediately before it, with nothing after it; a file is observed by name,
-/// reopened, digested, guarded, and only then sealed, and nothing is looked up after its seal; a directory
-/// (a worktree or evidence directory, a slot, `evidence/`) is observed by name only after its subtree and
-/// immediately before its seal; and nothing fallible follows the gate but building the result.
+/// is the census, the walk of the worktree, the index, and the evidence, then the retained chains (each call
+/// behind its own guard), and the root's identity LAST, its guard immediately before it, with nothing after
+/// it; a file is observed by name, reopened, digested, guarded, and only then sealed, and nothing is looked up
+/// after its seal; a directory (a worktree or evidence directory, a slot, `evidence/`) is observed by name
+/// only after its subtree and immediately before its seal; the deadline is observed after each call of a
+/// file's, a link's, and a directory's before the next, and before a seal is recorded; and nothing fallible
+/// follows the gate but building the result.
 #[test]
 fn c3_the_terminal_gate_section_seals_through_descriptors_in_its_order() {
     let source = include_str!("custody_restore_payload.rs");
@@ -6847,11 +7086,50 @@ fn c3_the_terminal_gate_section_seals_through_descriptors_in_its_order() {
         "seal_evidence(",
         "output_chains(",
         "metadata_chains(",
-        "source_files_unchanged(",
-        "retained_chains(",
+        "terminal_source_files_unchanged(",
+        "terminal_retained_chains(",
         "pace(\"payload-root\")",
         "pinned_root_unchanged(",
     ];
+    // The chains make one call per guard: the shared sweeps that make several behind one are the step
+    // gates', not the terminal gate's.
+    for (paced, shared) in [
+        (
+            "terminal_source_files_unchanged(",
+            "source_files_unchanged(",
+        ),
+        ("terminal_retained_chains(", "retained_chains("),
+    ] {
+        assert_eq!(
+            gate.matches(shared).count(),
+            gate.matches(paced).count(),
+            "the terminal gate calls `{paced}`, never `{shared}` itself"
+        );
+    }
+    let staging = body_of(source, "fn terminal_retained_chains(");
+    let calls: Vec<&str> = staging.split("recheck_entry(").collect();
+    assert!(
+        calls.len() > 1
+            && calls[..calls.len() - 1]
+                .iter()
+                .all(|before| before.contains("pace(")),
+        "every call of the terminal gate's staging, HOME, XDG, and bootstrap chains has its own guard"
+    );
+    let source_files = body_of(source, "fn terminal_source_files_unchanged(");
+    let order_of_source = [
+        "pace(\"objects-source\")",
+        "child_metadata_no_follow(",
+        "pace(\"payload-source-statted\")",
+        "admitted.file.metadata()",
+    ];
+    for pair in order_of_source.windows(2) {
+        assert!(
+            at(source_files, pair[0]) < at(source_files, pair[1]),
+            "`{}` precedes `{}` for an admitted file",
+            pair[0],
+            pair[1]
+        );
+    }
     for pair in order.windows(2) {
         assert!(
             at(gate, pair[0]) < at(gate, pair[1]),
@@ -6869,11 +7147,15 @@ fn c3_the_terminal_gate_section_seals_through_descriptors_in_its_order() {
     let order = [
         "self.enter(",
         "recheck_created(",
+        "pace(\"payload-terminal-statted\")",
         "open_regular_file(",
+        "pace(\"payload-terminal-reopened\")",
         "stream_digest(",
         "ContentChanged",
+        "pace(\"payload-terminal-digested\")",
         "pace(\"payload-terminal-seal\")",
         "set_exact_file_mode(",
+        "pace(\"payload-terminal-mode-set\")",
         "confirm_sealed(",
     ];
     for pair in order.windows(2) {
@@ -6894,9 +7176,39 @@ fn c3_the_terminal_gate_section_seals_through_descriptors_in_its_order() {
     let directory = body_of(source, "fn seal_directory(");
     assert!(
         at(directory, "pace(\"payload-terminal-seal\")") < at(directory, ".set_exact_mode(")
+            && at(directory, ".set_exact_mode(") < at(directory, "pace(\"payload-terminal-mode-set\")")
+            && at(directory, "pace(\"payload-terminal-mode-set\")")
+                < at(directory, ".current_metadata(")
             && !directory.contains("recheck_")
             && !directory.contains("lookup("),
-        "a directory is sealed through its pin after its guard, with no lookup"
+        "a directory is sealed through its pin after its guard, with no lookup, and the deadline is observed \
+         between its mode primitive and its confirming `fstat`"
+    );
+    let confirm = body_of(source, "fn confirm_sealed(");
+    assert!(
+        at(confirm, "pace(\"payload-terminal-confirmed\")") < at(confirm, "self.sealed.push("),
+        "a seal is recorded only after the deadline is observed after its confirming `fstat`"
+    );
+    let link = body_of(source, "fn verify_symlink(");
+    let order_of_link = [
+        "self.enter(",
+        "recheck_created(",
+        "pace(\"payload-terminal-statted\")",
+        "read_child_symlink(",
+        "pace(\"payload-terminal-link-read\")",
+    ];
+    for pair in order_of_link.windows(2) {
+        assert!(
+            at(link, pair[0]) < at(link, pair[1]),
+            "`{}` precedes `{}` for a link",
+            pair[0],
+            pair[1]
+        );
+    }
+    assert!(
+        at(link, "pace(\"payload-terminal-link-read\")")
+            < link.rfind("recheck_created(").expect("the closing stat"),
+        "a link's closing stat follows the guard after its `readlinkat`"
     );
     let tree = body_of(source, "fn seal_tree(");
     assert!(
