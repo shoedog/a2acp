@@ -778,11 +778,12 @@ new `unsafe`. The commit message is in `.git/A2A_COMMIT_MSG`; the bridge commits
 **Written:** 2026-10-15 · **By:** Opus 5.5 (`claude-opus-5-5`) through `a2a-bridge implement` · **Base:**
 `0235b1d3` (C2b merged, PR #148) · **Scope:** C3 only; the `custody-restore.v1` record, the joint fixture and the
 cross-phase wrapper are 2B3d's.
-**Source snapshot:** `ca852ccd21844867` after review fix 2 (§3.8); `636fbb70fe70f227` after review fix 1 (§3.7,
-§4.3; commit `0dfbcc06`); `19dacdaffffa441f` before it (the first 16 hex digits of the SHA-256 of the three changed
-`.rs` files concatenated in the C3 §7 order; per-file hashes are in the receipts).
+**Source snapshot:** `a956903899a34780` after review fix 3 (§3.9); `ca852ccd21844867` after review fix 2 (§3.8;
+commit `b21927b6`); `636fbb70fe70f227` after review fix 1 (§3.7, §4.3; commit `0dfbcc06`); `19dacdaffffa441f` before
+it (the first 16 hex digits of the SHA-256 of the three changed `.rs` files concatenated in the C3 §7 order; per-file
+hashes are in the receipts).
 **Receipts:** `.git/a2a-evidence/2b3c-c3/` (listed in C3 §3.6): the first round's at the top level and under `round0/`,
-review fix 1's under `fix1/`, review fix 2's under `fix2/`.
+review fix 1's under `fix1/`, review fix 2's under `fix2/`, review fix 3's under `fix3/`.
 
 **Review fix 1 (REJECT, one blocker).** The first source review found directory edges checked pre-order: a directory
 was observed by name before its children, so renaming it away and putting a decoy at its name while a child was being
@@ -804,6 +805,17 @@ returned late is not recorded as sealed (§5.8). (2) Immaterial: §3.6 named fil
 paths; it now lists the real `round0/`, `fix1/` and `fix2/` paths, and a one-shot manifest check proves every listed
 path exists and the final hash file matches the sources (§3.8). Sections 2.1, 2.4, 5.6, 5.8, 6, 7 and 8 are updated in
 place where fix 2 changed what they say.
+
+**Review fix 3 (round 3: one WRONG, material; a second disclosed extension).** Round 3 confirmed both round-2 findings
+closed and accepted §5.13 (the C3-local chain copies) and §5.8 (`sealed` = confirmed before the deadline), and rejected
+§5.6's last-call interpretation: the root's identity lookup could return after the deadline with the unchanged
+identity, and the gate then returned `Ok`, so the caller built a success after expiry. The controller ruled that the
+spec's "no success after expiry" governs and the root's identity is not exempt. Fixed as the reviewer bounded it: a
+C3-local helper, `terminal_root_unchanged`, makes the lookup and then observes the deadline (`payload-root-statted`),
+and is the gate's tail expression; the lookup remains the last filesystem call. A new test seam,
+`TerminalRootStatted`, runs immediately after the lookup returns; the regression spends the deadline there (§3.9).
+§3.8 row 22 and §5.6 are rewritten (the decision was reversed by review); sections 2.1, 2.4, 3.6, 7 and 8 are updated
+in place where fix 3 changed what they say.
 
 ## C3 1. Context
 
@@ -829,12 +841,12 @@ code is in one new section at the end of the file, headed
 | Item | Contract |
 |---|---|
 | `restore_payload_plane_v1(plane, frame_budget, deadline)` and `restore_payload_plane_bounded_v1(…, table_bound)` | C2b's `materialize_payload_plane_bounded_v1` (its failures returned unchanged), then the test hook `BeforeStepGate` with step `TerminalGate`, then `terminal_gate`. Success → `RestoredPayloadPlaneV1` (step `TerminalGate`), built by the infallible `restored`. Refusal → `PayloadPlaneRestoreFailureV1 { cause, last_completed: Some(Evidence), payload_materialization_began, ledger_used, partial }` with the phase-G value, the plan, every created row and pin, and `sealed`. The C2b entry point stays (§5.1). |
-| `terminal_gate` (order) | Guard `payload-terminal-gate`; `refuse_mounts_within`; the walk of the worktree (beneath phase G's `repository/`), the index (beneath `.git`) and the evidence (`evidence/`, each slot, each slot's tree); then phase G's `output_chains`, C2a's `metadata_chains`, and (fix 2) `terminal_source_files_unchanged` and `terminal_retained_chains`, the C3-local copies of phase G's `source_files_unchanged` and C2a's `retained_chains` with one guard per call (§3.8); guard `payload-root`; `pinned_root_unchanged` as the tail expression. No `created_chains`: the walk is each created entry's sole terminal check. |
+| `terminal_gate` (order) | Guard `payload-terminal-gate`; `refuse_mounts_within`; the walk of the worktree (beneath phase G's `repository/`), the index (beneath `.git`) and the evidence (`evidence/`, each slot, each slot's tree); then phase G's `output_chains`, C2a's `metadata_chains`, and (fix 2) `terminal_source_files_unchanged` and `terminal_retained_chains`, the C3-local copies of phase G's `source_files_unchanged` and C2a's `retained_chains` with one guard per call (§3.8); guard `payload-root`; (fix 3) `terminal_root_unchanged` as the tail expression: `pinned_root_unchanged` (`IdentityChanged` on a mismatch), then guard `payload-root-statted`, so a lookup that returns after the deadline is `Timeout`, never success (§3.9). No `created_chains`: the walk is each created entry's sole terminal check. |
 | The walk (`SealRunV1::seal_tree`, `seal_evidence`) | Iterative post-order over `CreatedTreeV1` (children grouped by exact parent path, creation order): each entry is visited from its retained parent pin while that parent is still `0700`. **Directory**: descended into through its retained pin with no by-name call; once every child is sealed (on the pop), guard `payload-terminal-entry`, `recheck_directory` by name from its parent (kind, the pin's `dev`/`ino`, `0700`), guard `payload-terminal-seal`, `PinnedDirectoryV1::set_exact_mode(final)`, then phase P's own `fstat` of the pin must read the final mode. Its own name is therefore checked after its subtree, never before (review fix 1). **Evidence**: each slot's tree through the slot's pin, then the slot observed by name from `evidence/` and sealed `0500`; after every slot, `evidence/` observed by name from the root and sealed `0500`. **File** (`seal_file`): guard; `recheck_created` by name (`Regular`, `dev`, `ino`, length, `0600`); reopened by name no-follow (`open_regular_file`; a link, `ENOENT` or a non-regular → `IdentityChanged`); the descriptor's `fstat` must be (`Regular`, `dev`, `ino`, length, `0600`); phase G's `stream_digest` (deadline before every read, at most length + 1 bytes) must give the recorded length and SHA-256, else **`ContentChanged { name }`**; the descriptor's closing `fstat` must equal its opening one ("changed while it was read"); guard `payload-terminal-seal`; `set_exact_file_mode(&file, final)`; phase P's own `fstat` of that descriptor must read the final mode; the descriptor is dropped. **Symlink** (`verify_symlink`): guard; `recheck_created` by name (kind, `dev`, `ino`, target length); `read_child_symlink` must equal the recorded target (a longer target is another link); a closing `recheck_created`. Never followed, never given a mode. Every recorded entry must be reached (else `IdentityChanged`). **Fix 2:** a guard after every call before the next one or the record of a seal: a file's stat (`payload-terminal-statted`), reopen (`payload-terminal-reopened`), digest (`payload-terminal-digested`), mode primitive (`payload-terminal-mode-set`) and confirming `fstat` (`payload-terminal-confirmed`, inside `confirm_sealed`, before the push); a directory's mode primitive and confirming `fstat` the same; a link's stat and `readlinkat` (`payload-terminal-link-read`). The full enumeration is §3.8. |
 | Final modes | Each row's C2b `final_mode`: the frame's exact mode for the worktree (D4), `0600` for `index`/`sharedindex.*` (D4: set again, a no-op change, so every file takes one path), `0400`/`0500` for evidence entries (D2); `evidence/` and every slot `0500`. Sealing is through descriptors only, never a path. |
 | `SealedEntryV1 { name, mode }`, `PayloadPlanePartialV1::sealed` | Every entry the gate sealed, destination-relative, in seal order; pushed only after phase P's confirming `fstat` and (fix 2) the guard after it. Nothing is unsealed on failure. |
 | `RestoredPayloadPlaneV1` | `{ step, plane, worktree: WorktreeInventoryV1 { state, entries, root_git, childless_directories }, index: IndexInventoryV1 { state, files }, evidence: EvidenceInventoryV1 { classes: [(class, state); 3], root: Option<(mode, dev, ino)>, slots: [EvidenceSlotInventoryV1 { slot, mode, dev, ino, entries }] }, declared_external_references, pins: PayloadPinsV1 { worktree, evidence, evidence_slots: [EvidenceSlotPinsV1 { slot, pin, directories }] } }`. Every row is `RestoredEntryV1 { path, kind (length + SHA-256, or target), frame_mode, mode (written), dev, ino }`. |
-| Test seams (`#[cfg(test)]`) | Hook points `TerminalEntry` (before an entry's first by-name call; a directory's comes once its subtree is sealed), `TerminalLookup` (before every by-name call of the walk), `TerminalDescriptor` (fix 2: before every call through an entry's own descriptor: a file's opening and closing `fstat`, a mode primitive, the confirming `fstat`), `TerminalDigested` (after the read, before the closing `fstat`), `TerminalModeSet` (after the primitive's `fchmod` + confirmation, before phase P's own `fstat`), `TerminalSealed`; `BeforeStepGate` gains the `TerminalGate` step. |
+| Test seams (`#[cfg(test)]`) | Hook points `TerminalEntry` (before an entry's first by-name call; a directory's comes once its subtree is sealed), `TerminalLookup` (before every by-name call of the walk), `TerminalDescriptor` (fix 2: before every call through an entry's own descriptor: a file's opening and closing `fstat`, a mode primitive, the confirming `fstat`), `TerminalDigested` (after the read, before the closing `fstat`), `TerminalModeSet` (after the primitive's `fchmod` + confirmation, before phase P's own `fstat`), `TerminalSealed`, `TerminalRootStatted` (fix 3: immediately after the root's identity lookup returns, before its result is used); `BeforeStepGate` gains the `TerminalGate` step. |
 
 ### 2.2 `crates/bridge-core/src/custody_restore_git.rs` (visibility only)
 
@@ -875,11 +887,11 @@ with an optional plant before export).
 | `c3_a_file_rewritten_in_place_refuses_as_content_changed` | The same inode and length with one byte flipped, before the terminal gate (a worktree file, the index, an evidence file) and before the worktree's own step gate (which compares identity and mode, so passes it): `ContentChanged { name }` naming the file, `Evidence`, the rewritten bytes kept and the file still `0600`. A file rewritten with its own bytes after its read (`TerminalDigested`) refuses as changed while it was read. |
 | `c3_a_mode_changed_after_its_fchmod_refuses` | At `TerminalModeSet` (after the primitive's `fchmod` and confirmation, before phase P's own `fstat`): a worktree file, a worktree directory, the index, an evidence file, `evidence/` → `IdentityChanged`, `Evidence`, the entry not in `sealed`, the changed mode what refused (§5.2). |
 | `c3_a_refused_terminal_gate_names_evidence_and_keeps_everything` | A clean restore takes six censuses (two planning, three step gates, the terminal gate); a mount at the sixth refuses with nothing sealed; ten retained chains changed just before the gate (metadata `refs`, `objects/info`, `HEAD` and a copied pack as other inodes, an admitted bootstrap file and a bootstrap directory on a Captured database, plain staging, HOME, XDG, the root) refuse `IdentityChanged`, `Evidence`, after every entry is sealed (the walk precedes the chains; the root is last); `payload_materialization_began` is false where nothing was created. |
-| `c3_the_one_deadline_is_kept_before_every_entry_and_every_seal` | (Fix 2: the slow rows run first.) Thirteen slow rows, one per call of the walk (a file's stat, reopen, opening `fstat`, digest, closing `fstat`, mode primitive, confirming `fstat`; a link's stat, `readlinkat`, closing stat; a directory's stat, mode primitive, confirming `fstat`): the deadline is spent at the seam just before the call (or just after it, for the digest and a mode primitive), and the run halts `Timeout`, `Evidence`, with NO later terminal event (the named next call's seam never runs), exactly the earlier entries sealed, and an entry whose mode was set late not recorded though it has its final mode. A clean restore's guards = the materialization's (recorded from a `materialize` run) + exactly the terminal gate's (computed from the frames and the plane's chains, one guard per call). Nine halting rows (the gate's guard, the first and last entry, the first and last seal, the first object chain, the first `payload-chain-step`, the last staging chain, the root) → `Timeout`, `Evidence`, exactly the earlier entries sealed; on a Captured database, `payload-source-statted` halts with nothing created. 10 s deadlines started after the plane exists; each row asserts its hook fired before the deadline (INVALID otherwise). |
+| `c3_the_one_deadline_is_kept_before_every_entry_and_every_seal` | (Fix 2: the slow rows run first.) Thirteen slow rows, one per call of the walk (a file's stat, reopen, opening `fstat`, digest, closing `fstat`, mode primitive, confirming `fstat`; a link's stat, `readlinkat`, closing stat; a directory's stat, mode primitive, confirming `fstat`): the deadline is spent at the seam just before the call (or just after it, for the digest and a mode primitive), and the run halts `Timeout`, `Evidence`, with NO later terminal event (the named next call's seam never runs), exactly the earlier entries sealed, and an entry whose mode was set late not recorded though it has its final mode. A clean restore's guards = the materialization's (recorded from a `materialize` run) + exactly the terminal gate's (computed from the frames and the plane's chains, one guard per call). Nine halting rows (the gate's guard, the first and last entry, the first and last seal, the first object chain, the first `payload-chain-step`, the last staging chain, the root) → `Timeout`, `Evidence`, exactly the earlier entries sealed; on a Captured database, `payload-source-statted` halts with nothing created. Fix 3: four root rows after the slow rows (**a slow root lookup**: the deadline spent at `TerminalRootStatted` → `Timeout`, `Evidence`, all seven entries sealed and reported, the partial kept; an unchanged root on time restores; a replaced root refuses `IdentityChanged` on time and with its lookup late), the clean sequence's last guard `payload-root-statted`, and a tenth halting row at that guard (§3.9). 10 s deadlines started after the plane exists; each row asserts its hook fired before the deadline (INVALID otherwise). |
 | `c3_the_rich_clone_restores_end_to_end_on_the_one_ledger` | V→G→P on the rich clone (real split index, worktree symlink): byte-exact at every final mode; inventories = disk; skipped connector, the computed childless list, no external reference, every class Captured, every frame mode the frame's; source bytes agree; one ledger = phase V + phase G + phase P on disk (`PAYLOAD-ONE-LEDGER`); `PAYLOAD-DESCRIPTORS` (§3.4). |
 | `c3_evidence_ends_inert_and_the_rich_clones_hook_is_never_executable` | Every evidence file `0400` and directory `0500`; the configuration class's frame modes inventoried beside the modes written; the hook (frame `0755`) observed `0600` at creation, at the Evidence and terminal step gates, `0400` once sealed and after: never an execute bit. |
 | `c3_planted_config_hook_filter_and_fsmonitor_markers_never_run` | The rich clone's source gains `core.fsmonitor`, `core.pager`, an alias, a required `filter.marker` with `info/attributes`, an `[include]` setting `core.editor`, and executable `post-checkout`/`post-merge`/`reference-transaction` hooks, each running a marker script proven to record; nothing ran during planning and export (`PAYLOAD-MARKERS … []`) or the restore; the planted files are byte-exact `0400` evidence; nothing beneath `repository/` holds a planted byte or hook name; no `repository/.git/hooks` or `info/`. |
-| `c3_the_terminal_gate_section_seals_through_descriptors_in_its_order` | Structural only: no path-based chmod, create, write, rename, remove, ledger, Git or `unsafe` vocabulary in the C3 section, and no `created_chains`; the gate's order (guard, census, three walks, the four chains, root guard, root identity as the tail); a file's order (observation, reopen, digest, `ContentChanged`, guard, seal, confirmation) with no lookup after its seal; a directory sealed through its pin after its guard; `seal_tree`'s one `observe_directory` on the pop, before the directory's seal, and `seal_evidence`'s order (slot tree, slot observation, slot seal, `evidence/` observation, `evidence/` seal) (fix 1); the success arm only builds the result, which is infallible. Fix 2: each new guard in its place in a file's, a link's and a directory's order and before `confirm_sealed`'s push; the gate calls the paced chain copies, never the shared sweeps; every `recheck_entry` of `terminal_retained_chains` has its own guard; an admitted file's two calls are separated by `payload-source-statted`. |
+| `c3_the_terminal_gate_section_seals_through_descriptors_in_its_order` | Structural only: no path-based chmod, create, write, rename, remove, ledger, Git or `unsafe` vocabulary in the C3 section, and no `created_chains`; the gate's order (guard, census, three walks, the four chains, root guard, root identity as the tail); a file's order (observation, reopen, digest, `ContentChanged`, guard, seal, confirmation) with no lookup after its seal; a directory sealed through its pin after its guard; `seal_tree`'s one `observe_directory` on the pop, before the directory's seal, and `seal_evidence`'s order (slot tree, slot observation, slot seal, `evidence/` observation, `evidence/` seal) (fix 1); the success arm only builds the result, which is infallible. Fix 2: each new guard in its place in a file's, a link's and a directory's order and before `confirm_sealed`'s push; the gate calls the paced chain copies, never the shared sweeps; every `recheck_entry` of `terminal_retained_chains` has its own guard; an admitted file's two calls are separated by `payload-source-statted`. Fix 3 (replacing the assertion that locked the omission, that the bare root lookup was the gate's tail): the gate's tail is `terminal_root_unchanged(` and the gate never calls `pinned_root_unchanged` itself; in the helper, the one lookup, the `TerminalRootStatted` seam, the `IdentityChanged` refusal and `pace("payload-root-statted")` in that order, the guard being the helper's tail expression. |
 
 ## C3 3. Verification
 
@@ -949,7 +961,7 @@ handoff was written. `sha256sum -c round0/source-sha256.txt` held on those bytes
 
 Corrected in review fix 2: the earlier table placed the first round's partitioned run, its matrix summary, its final
 runs and its hash file at the top level, where they never were; they are under `round0/`. Every path below exists
-(`fix2/12-receipt-manifest.log`, §3.8).
+(`fix2/12-receipt-manifest.log`, §3.8; with the `fix3/` rows, `fix3/12-receipt-manifest.log`, §3.9).
 
 | File | Content |
 |---|---|
@@ -980,7 +992,17 @@ runs and its hash file at the top level, where they never were; they are under `
 | `fix2/07-binary.txt`, `fix2/07-part-{1..6}-*.log`, `fix2/08-integration.log`, `fix2/09-doc.log` | `cargo test -p bridge-core` on the final bytes (the binary and source hashes in `07-binary.txt`). |
 | `fix2/10-repo-hygiene.log`, `fix2/11-diff-check.log` | Review fix 2 gates. |
 | `fix2/12-check_receipt_manifest.py`, `fix2/12-receipt-manifest.log` | The receipt-manifest check over this table (§3.8). |
-| `fix2/source-sha256.txt` | Per-file SHA-256 of the three `.rs` files at review fix 2 (snapshot `ca852ccd21844867`). |
+| `fix2/source-sha256.txt` | Per-file SHA-256 of the three `.rs` files at review fix 2 (snapshot `ca852ccd21844867`), which round 3 reviewed: equal to commit `b21927b6`'s blobs (checked by `fix3/12`). |
+| `fix3/base-commit.txt` | `b21927b6…` |
+| `fix3/01-make_red_seam_only.py`, `fix3/01-red-seam-only-vs-b21927b6.diff` | Review fix 3: how the RED production file was made, and its whole difference from `b21927b6` (§3.9). |
+| `fix3/02-red-c3-on-b21927b6-plus-seam.log` | Review fix 3 RED (§3.9). |
+| `fix3/03-green-payload-root-linux.log`, `fix3/03-green-payload-nonroot-linux.log` | Review fix 3: the 49 payload controls on the final bytes, each followed by an `id -u` and `PAYLOAD-SEAL-MODES` probe of the user that ran them. |
+| `fix3/04-run_mutations.py`, `fix3/04-mutation-matrix.json` | Review fix 3 mutations R1–R3 (§3.9). |
+| `fix3/05-fmt-check.log`, `fix3/06-clippy-workspace.log` | Review fix 3 gates. |
+| `fix3/07-binary.txt`, `fix3/07-part-{1..6}-*.log`, `fix3/08-integration.log`, `fix3/09-doc.log` | `cargo test -p bridge-core` on the final bytes (each partition log begins with its exact command; the binary and source hashes in `07-binary.txt`). |
+| `fix3/10-repo-hygiene.log`, `fix3/11-diff-check.log` | Review fix 3 gates. |
+| `fix3/12-check_receipt_manifest.py`, `fix3/12-receipt-manifest.log` | The receipt-manifest check over this table, fix 3's copy (§3.9). |
+| `fix3/source-sha256.txt` | Per-file SHA-256 of the three `.rs` files at review fix 3 (snapshot `a956903899a34780`). |
 
 ### 3.7 Review fix 1 (final bytes, snapshot `636fbb70fe70f227`)
 
@@ -1031,7 +1053,7 @@ between them).
 | 19 | `terminal_retained_chains` (C3 copy of C2a's `retained_chains`) | a staging chain's first edge, the work directory beneath the root (`fstatat`) | `payload-chain-step` | **new** (C2); the shared sweep made a whole chain behind one guard | guard sequence; halting row |
 | 20 | `terminal_retained_chains` | the plain directory's edge, then each staging component's (`fstatat`) | the next component's `payload-chain-step` (**new**, C3), else the next chain's or HOME's `payload-chain` | **new** | guard sequence |
 | 21 | `terminal_retained_chains` | HOME, XDG, each bootstrap directory (`fstatat`) | the next `payload-chain`, else `payload-root` | existing: one call per guard | guard sequence; halting rows |
-| 22 | `terminal_gate` | `pinned_root_unchanged`: `lstat` of the root's canonical path | none: it is the last call, and the result is built infallibly (§5.6) | — | — |
+| 22 | `terminal_root_unchanged` (fix 3; the gate's tail expression) | `pinned_root_unchanged`: `lstat` of the root's canonical path, the gate's last call | `payload-root-statted`, after a mismatch's `IdentityChanged`; then only the infallible result. Round 2's "none" (the last call was exempt) was rejected in round 3 (§3.9, §5.6) | **new** (fix 3, R1) | a slow root lookup (§3.9); guard sequence; halting row |
 
 The copies in #17–#21 make the same calls in the same order with the same refusals as the shared sweeps (the staging
 chains still recheck the work and plain edges for each key, as C2a's does); the step gates keep the shared sweeps, so
@@ -1109,6 +1131,97 @@ script, reads §3.6's table from this file, expands each listed name's braces an
 directory, and requires every one to name at least one existing file; it then runs `sha256sum -c` on
 `fix2/source-sha256.txt` against the working tree and checks `fix1/source-sha256.txt` against commit `0dfbcc06`'s blobs.
 Its output is `fix2/12-receipt-manifest.log`.
+
+### 3.9 Review fix 3 (final bytes, snapshot `a956903899a34780`)
+
+**The finding (round 3, WRONG, material).** After fix 2, `terminal_gate` ended with `pace("payload-root")?;` and the
+bare `pinned_root_unchanged(&dest.root)` as its tail. If the retained-chain checks left little headroom, that guard
+passed, and the root's `lstat` then returned after the deadline with the unchanged identity, the gate returned `Ok`
+and the caller built a success after expiry, against the spec's "after each slow step" and "no success after expiry".
+Fix 2's structural control asserted that bare lookup was the gate's tail, so it locked the omission in. The
+controller ruled that "no success after expiry" governs and the root's identity is not exempt (§5.6 is reversed).
+
+**The fix** (`custody_restore_payload.rs`, the C3 section and the hook enum only). A C3-local helper makes the lookup,
+then observes the deadline as its tail; the gate's tail is the helper:
+
+```rust
+fn terminal_root_unchanged(root: &PinnedDirectoryV1, pace: PaceV1<'_>) -> Result<(), PayloadPlaneErrorV1> {
+    let unchanged = pinned_root_unchanged(root);
+    #[cfg(test)]
+    run_payload_hook(PayloadHookPointV1::TerminalRootStatted, None, root.canonical_path());
+    unchanged.map_err(CustodyRestoreErrorV1::IdentityChanged)?;
+    pace("payload-root-statted").map_err(Into::into)
+}
+// terminal_gate: … terminal_retained_chains(…)?; pace("payload-root")?; terminal_root_unchanged(&dest.root, pace)
+```
+
+The lookup remains the gate's last filesystem call; the observation after it is a clock read, and only the
+infallible `restored` follows. A mismatch refuses `IdentityChanged` before the observation, as every call of the gate
+refuses before the guard after it, so a replaced root whose lookup returned late is `IdentityChanged`, not `Timeout`
+(both refuse; the edge below pins the order). The module doc, `terminal_gate`'s doc and the new hook point's doc say
+so. The C2a/C2b step gates' shared `gate` keeps its bare root tail (unchanged; C2b is approved): every step gate is
+followed by the next step's guard, the last one by the terminal gate's `payload-terminal-gate`, so its late lookup
+cannot reach a success.
+
+**Regression and edges** (the deadline control, `c3_the_one_deadline_is_kept_before_every_entry_and_every_seal`; no
+new `#[test]`, so the payload suite is still 49 controls). Four root rows run in parallel after the slow rows, each on
+its own three-step case; every row requires the new `TerminalRootStatted` seam to have run exactly once, at the root:
+
+| Row | At the seam / before the gate | Required |
+|---|---|---|
+| **a slow root lookup** | the 10 s deadline spent at the seam | `Timeout`, `last_completed = Some(Evidence)`, `payload_materialization_began`; `sealed` = all seven entries in seal order; every added entry at its sealed mode through the held descriptors; the partial kept (`RestoredRunV1::assert_partial_is_the_disk`: the plan present, and every row and pin materialization recorded is exactly the held entry phase P added, by device and inode, with nothing unrecorded) |
+| an unchanged root, on time | nothing | success; the inventory is the disk |
+| a replaced root, on time | the root swapped for a new directory just before the gate (only the root's lookup can see it: everything else goes through retained pins) | `IdentityChanged`, `Evidence`, all seven sealed and reported, the partial kept |
+| a replaced root, its lookup late | the same swap, and the deadline spent at the seam | `IdentityChanged` (the lookup's own refusal precedes the observation after it) |
+
+The clean run's guard sequence now ends `payload-root`, `payload-root-statted`, and a tenth halting row spends the
+deadline inside that guard's own observation (`Timeout`, all seven sealed). The structural control's assertion that
+the bare lookup is the gate's tail is replaced (§2.4): the gate's tail is the helper and it never calls
+`pinned_root_unchanged` itself; inside the helper, the one lookup, the seam, the refusal and the guard are in that
+order, the guard being its tail expression.
+
+**RED** (`fix3/01`, `fix3/02`). The rows use the new `#[cfg(test)]` hook point, so they cannot compile against
+`b21927b6`'s bytes. The RED production file is `b21927b6`'s `custody_restore_payload.rs` plus only the seam: the hook
+point, and the gate's tail split so the seam runs between the lookup and the use of its result (11 lines added, 2
+removed; no helper, no guard); `fix3/01-red-seam-only-vs-b21927b6.diff` is its whole difference. Against it the final
+tests fail two of the 12 C3 controls: the deadline control at **`a slow root lookup: must refuse`** (the gate succeeded
+although the deadline was spent after the lookup returned: the finding's case, executable), and the structural control
+(no `terminal_root_unchanged`). The three edge rows pass there, as edges should. The fixed file was restored and its
+SHA-256 checked.
+
+**Mutations** (`fix3/04`, root): each row is also red in the structural control.
+
+| Row | Mutation | Red (behavioural) |
+|---|---|---|
+| R1 | the new observation deleted (the lookup's mapped result is the helper's tail again) | `a slow root lookup: must refuse` |
+| R2 | the observation moved before the lookup's own refusal | `a replaced root, its lookup late: Timeout` |
+| R3 | the gate's tail is the bare lookup again (the helper bypassed) | all four root rows (the seam never runs) |
+
+**Gates on the final bytes.** The lane and conditions of §3.8 (foreground, `CARGO_INCREMENTAL=0`, target in `/tmp`,
+proxies unset, `CARGO_HOME=/cargo`, `--offline --locked`). After the mutation run the source was hash-checked and the
+binary rebuilt from it before every final run (`fix3/07-binary.txt` records the binary's and the sources' SHA-256).
+- The 49 payload controls: `49 passed; 0 failed` as root (57 s) and as `nobody` (59 s); the scratch `TMPDIR` was empty
+  afterwards. Each log ends with the running user's `id -u` and `PAYLOAD-SEAL-MODES as_root=true|false` (`fix3/03`).
+- `cargo fmt --all -- --check` clean; `cargo clippy --workspace --all-targets --all-features -- -D warnings` clean (0
+  warnings; all 17 workspace crates checked, the first clippy run in that target directory); `git diff --check` and
+  `git diff --cached --check` clean; `cargo run -p a2a-bridge -- validate --repo-hygiene` → `repository hygiene
+  validated`.
+- `cargo test -p bridge-core`: **1697 passed, 0 failed**: lib **1552** in the six partitions of §3.7 (66, 41, 80, 145,
+  138, 1082; proven disjoint and exact against `--list`; each log begins with its exact command, `--test-threads 6`),
+  integration 135 (14 binaries), doc-tests 10. The rest-of-lib log again holds the nested child's extra `1 passed`
+  line, excluded.
+- Not re-run: the M01–M47, F1–F5 and fix 2 matrices (fix 3 adds one guard after the last call and removes nothing they
+  mutate) and the descriptor measurement (no pin or descriptor changes).
+
+**Receipt manifest** (`fix3/12`). Fix 2's one-shot checker, adapted: every name in §3.6's first column must match an
+existing file and every file in the evidence directory must be listed; `sha256sum -c fix3/source-sha256.txt` against
+the working tree; `fix2/source-sha256.txt` against commit `b21927b6`'s blobs and `fix1/source-sha256.txt` against
+`0dfbcc06`'s.
+
+**Outside this repair (disclosed, not changed).** Phase G's own final gates in `custody_restore_git.rs`
+(`sweep_chains`, `final_sweep_chains`; approved 2B3b, not in this repair's files) also end with the root's identity
+as their last fallible call; fix 2's §5.6 cited them as precedent. Whether any phase-G success path can complete after
+a late last lookup was not examined here.
 
 ## C3 4. RED evidence
 
@@ -1192,13 +1305,15 @@ apply to code that the fix does not change.
 5. **Step 3's scope** is C2a's gate scope (§C2a 5.3): the object store, metadata, admitted bootstrap files, and the
    staging, HOME, XDG and bootstrap chains, all through phase V/G pins that phase P never seals (the seam control proves
    no retained pin lies beneath a sealed entry).
-6. **Deadline placement** (rewritten by review fix 2; the round-2 review showed the earlier placement let a file's or
-   link's later calls and a seal's confirmation follow a late call). Guards before the census, before every entry's
-   observation, immediately before every seal, and after EVERY filesystem call before the next call or the record of a
-   seal (§3.8's table), with one guard per call in the chains. The one call nothing follows is the root's identity,
-   the gate's last: if it returns after the deadline, the gate still succeeds, because nothing is done after it but
-   building the result, as at phase G's final gates (whose `final_sweep_chains` also ends with it). Making a late last
-   call a `Timeout` would refuse a fully verified and sealed restore; that is the controller's call, not made here.
+6. **Deadline placement** (rewritten by review fix 2, whose round-2 review showed the earlier placement let a file's or
+   link's later calls and a seal's confirmation follow a late call; its last sentence reversed by review fix 3).
+   Guards before the census, before every entry's observation, immediately before every seal, and after EVERY
+   filesystem call before the next call, the record of a seal, or success (§3.8's table), with one guard per call in
+   the chains. That includes the root's identity, the gate's last call: `terminal_root_unchanged` observes the deadline
+   after its lookup returns, so a lookup that returns late is `Timeout` with everything sealed and kept, never a
+   success (§3.9). Fix 2 had exempted that call (nothing but building the result follows it) and left the choice to
+   the controller; round 3 rejected the exemption and the controller ruled that "no success after expiry" governs,
+   including for a fully verified and sealed restore whose last lookup returned late.
 7. **`payload_materialization_began`** on a terminal-gate failure is derived from what materialization recorded (on its
    success every create is recorded): false when every class was Empty.
 8. **A refused terminal gate leaves a partially sealed destination** (`sealed` lists every entry whose seal was confirmed
@@ -1254,6 +1369,7 @@ apply to code that the fix does not change.
   the halting rows, not a per-call seam.
 - **Wall time.** The 12 C3 controls add about 30 s to the parallel payload run; fix 2 adds about 13 s more (the 49
   controls took 39 s at fix 1 and 53 s at fix 2), mostly its Captured halting row, which spends a 10 s deadline alone.
+  Fix 3's root rows run in parallel, two of them spending a 10 s deadline; the 49 controls took 57 s.
 
 ## C3 7. Files
 
@@ -1274,6 +1390,12 @@ chain copies, the `TerminalDescriptor` hook point, and the docs of the module an
 `custody_restore_payload_tests.rs` (the deadline and structural controls) and this file. `custody_restore_git.rs` is
 unchanged from `0dfbcc06`.
 
+Review fix 3 (a follow-up commit on `b21927b6`) changes only `custody_restore_payload.rs` (the C3 helper
+`terminal_root_unchanged` and the gate's tail, the `TerminalRootStatted` hook point, and the docs of the module and of
+`terminal_gate`), `custody_restore_payload_tests.rs` (the deadline control's root rows, guard sequence and halting
+row, the `assert_partial_is_the_disk` fixture, and the structural control's root assertions) and this file.
+`custody_restore_git.rs` is unchanged from `0dfbcc06`.
+
 ## C3 8. Next
 
 1. The controller runs `cargo test -p bridge-core` natively on macOS as a non-root user on this candidate, before the C3
@@ -1281,9 +1403,10 @@ unchanged from `0dfbcc06`.
 2. C3 source review: Sol/xhigh, cap two rounds; the spec's terminal-gate text is re-examined against code here (the
    spec ledger's round-3 disposition). §5 lists the interpretations to rule on, especially §5.2 (the confirming-`fstat`
    seam), §5.6 (deadline placement) and §5.12 (post-order observation, fix 1). Round 1's blocker (pre-order directory
-   edges) is fixed with executable RED (§4.3). Round 2's two findings are fixed as one disclosed extension (§3.8): the
-   controller rules on §5.6's last-call interpretation (the root's identity), §5.8's `sealed` semantics and §5.13's
-   chain copies (versus phase G's final-gate helpers, a visibility change).
+   edges) is fixed with executable RED (§4.3). Round 2's two findings are fixed as one disclosed extension (§3.8).
+   Round 3 confirmed both closed, accepted §5.8's `sealed` semantics and §5.13's chain copies, and rejected §5.6's
+   last-call exemption; its one finding (the root's identity returning after the deadline) is fixed as a second
+   disclosed extension with executable RED (§3.9). The reviewer re-examines §3.9, §3.8 row 22 and §5.6.
 3. On approval, 2B3d: the `custody-restore.v1` record from `RestoredPayloadPlaneV1`'s inventories, the joint fixture,
    the negative fixtures, the cross-phase wrapper and composed failure type, and a decision on the descriptor bound
    (§3.4).

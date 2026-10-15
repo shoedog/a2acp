@@ -89,7 +89,7 @@
 //! directory once it is sealed, and no file descriptor outlives its entry. Then the retained staging and
 //! phase-G `.git` chains, which phase P never seals, and the destination root's identity LAST; the one
 //! deadline is read before every entry, immediately before every seal, and after every filesystem call the
-//! gate makes before it makes another or records a seal. A file whose bytes are not the
+//! gate makes before it makes another, records a seal, or succeeds. A file whose bytes are not the
 //! bytes phase P wrote is [`PayloadPlaneErrorV1::ContentChanged`]. The result,
 //! [`RestoredPayloadPlaneV1`], is the phase-G value unchanged with the worktree, index, and evidence
 //! inventories (each entry's frame mode and the mode written), the root `.git` disposition, the childless
@@ -730,6 +730,9 @@ pub(crate) enum PayloadHookPointV1 {
     TerminalModeSet,
     /// An entry's final mode is set and confirmed (its path).
     TerminalSealed,
+    /// The terminal gate's last filesystem call, the destination root's identity lookup, returned, before its
+    /// result is used (the destination root).
+    TerminalRootStatted,
 }
 
 #[cfg(test)]
@@ -3121,6 +3124,25 @@ fn terminal_retained_chains(
     Ok(())
 }
 
+/// The destination root's identity, the terminal gate's last filesystem call: the root's canonical path must
+/// still name the pinned directory (else `IdentityChanged`), and then the deadline is observed once more, so a
+/// lookup that returns after the deadline is the typed timeout, never success. Nothing follows the
+/// observation but building the result.
+fn terminal_root_unchanged(
+    root: &PinnedDirectoryV1,
+    pace: PaceV1<'_>,
+) -> Result<(), PayloadPlaneErrorV1> {
+    let unchanged = pinned_root_unchanged(root);
+    #[cfg(test)]
+    run_payload_hook(
+        PayloadHookPointV1::TerminalRootStatted,
+        None,
+        root.canonical_path(),
+    );
+    unchanged.map_err(CustodyRestoreErrorV1::IdentityChanged)?;
+    pace("payload-root-statted").map_err(Into::into)
+}
+
 /// The terminal gate, one integrated operation after every step is written: the mount census over the
 /// destination; then ONE post-order walk of the worktree, the index, and the evidence trees, which is each
 /// created entry's sole terminal check and applies its final mode (nothing is looked up by name beneath a
@@ -3128,8 +3150,9 @@ fn terminal_retained_chains(
 /// seals; and the destination root's identity LAST, its guard immediately before it. Every entry it seals is
 /// pushed to `sealed` as it is sealed, so a refusal keeps them. The deadline is observed after every
 /// filesystem call before the next one: the census is followed by the first entry's guard (or the first
-/// chain's), each call of the walk by its own guard or the next entry's, and each call of the chains by the
-/// next call's guard, each chain making one call per guard.
+/// chain's), each call of the walk by its own guard or the next entry's, each call of the chains by the
+/// next call's guard, each chain making one call per guard, and the root's identity, the last call, by its
+/// own guard before the gate returns.
 fn terminal_gate(
     plane: &RestoredGitPlaneV1,
     created: &PayloadCreatedV1,
@@ -3151,8 +3174,7 @@ fn terminal_gate(
     terminal_source_files_unchanged(&plane.bootstrap, pace)?;
     terminal_retained_chains(dest, &plane.bootstrap, pace)?;
     pace("payload-root")?;
-    pinned_root_unchanged(&dest.root)
-        .map_err(|detail| CustodyRestoreErrorV1::IdentityChanged(detail).into())
+    terminal_root_unchanged(&dest.root, pace)
 }
 
 /// The success value, built from what the terminal gate verified and sealed: every recorded entry now has

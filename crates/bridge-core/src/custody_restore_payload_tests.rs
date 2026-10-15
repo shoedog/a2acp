@@ -5144,6 +5144,50 @@ impl RestoredRunV1 {
             );
         }
     }
+
+    /// A refused terminal gate kept its partial whole: the plan, and a row or pin for every entry phase P added,
+    /// each still that entry (its device and inode, as the held descriptors show), and nothing else.
+    fn assert_partial_is_the_disk(&self, row: &str) {
+        let partial = &self.failure(row).partial;
+        assert!(partial.plan.is_some(), "{row}: the plan is kept");
+        let created = &partial.created;
+        let mut recorded = BTreeMap::new();
+        let rows =
+            |recorded: &mut BTreeMap<Vec<u8>, (u64, u64)>, at: TreeAtV1, tree: &CreatedTreeV1| {
+                for entry in &tree.entries {
+                    recorded.insert(at.name(&entry.path), (entry.dev, entry.ino));
+                }
+            };
+        let pinned = |pin: &PinnedDirectoryV1| {
+            (
+                pin.identity().dev.expect("a device"),
+                pin.identity().ino.expect("an inode"),
+            )
+        };
+        rows(&mut recorded, TreeAtV1::Worktree, &created.worktree);
+        rows(&mut recorded, TreeAtV1::Index, &created.index);
+        if let Some(pin) = &created.evidence.root {
+            recorded.insert(b"evidence".to_vec(), pinned(pin));
+        }
+        for slot in &created.evidence.slots {
+            let at = TreeAtV1::Evidence(slot.slot);
+            recorded.insert(at.prefix(), pinned(&slot.pin));
+            rows(&mut recorded, at, &slot.tree);
+        }
+        let held = self.held(row);
+        let added: BTreeMap<Vec<u8>, (u64, u64)> = held
+            .now()
+            .into_keys()
+            .map(|name| {
+                let identity = held.identity(&name);
+                (name, identity)
+            })
+            .collect();
+        assert_eq!(
+            recorded, added,
+            "{row}: the partial records exactly what phase P added"
+        );
+    }
 }
 
 /// The worktree and evidence frames of the mode controls: files `0000`, `0200`, and `0755`; a `0000`
@@ -6124,7 +6168,7 @@ fn c3_a_refused_terminal_gate_names_evidence_and_keeps_everything() {
 /// it makes another or records a seal (post-order: a directory's observation and seal after everything
 /// beneath it); then the retained chains' (one per object-store directory and copied file, metadata directory
 /// and file, each of an admitted bootstrap file's two calls, each edge of every staging chain, HOME and XDG,
-/// and bootstrap directory), and the root's own guard last.
+/// and bootstrap directory), and the root's own guards last, before and after its identity's lookup.
 fn terminal_guards(plane: &RestoredGitPlaneV1) -> Vec<&'static str> {
     let entry = "payload-terminal-entry";
     // A file: its stat, its reopen, its digest (whose reads the digest guards itself), its closing `fstat`
@@ -6187,7 +6231,7 @@ fn terminal_guards(plane: &RestoredGitPlaneV1) -> Vec<&'static str> {
         "payload-chain",
         2 + plane.bootstrap.directories.len(),
     ));
-    guards.push("payload-root");
+    guards.extend(["payload-root", "payload-root-statted"]);
     guards
 }
 
@@ -6195,15 +6239,20 @@ fn terminal_guards(plane: &RestoredGitPlaneV1) -> Vec<&'static str> {
 /// terminal gate's own. Each terminal guard halts the run alone with the typed timeout and `Evidence` the
 /// last step completed, having sealed exactly the entries before it: its first guard, the first and last
 /// entry's, the first and last seal's, the first and last retained chain's, the first later edge of a staging
-/// chain's, and the root's. A call of the walk that returns after the deadline is never followed by another
-/// call or by the record of a seal: for each call (a file's stat, reopen, opening `fstat`, digest, closing
-/// `fstat`, mode primitive, and confirming `fstat`; a link's stat, `readlinkat`, and closing stat; a
-/// directory's stat, mode primitive, and confirming `fstat`), the deadline is spent at the seam immediately
-/// before it (or, for the digest and a mode primitive, immediately after it returns), and the run halts with
-/// the typed timeout with no later event at all: the next call's own seam never runs, nothing more is sealed,
-/// and an entry whose mode primitive or confirmation returned late is not recorded as sealed, though it has its
-/// final mode. On a Captured object database, the guard between an admitted bootstrap file's two calls halts
-/// the run alone.
+/// chain's, and the root's two (before and after its lookup). A call of the walk that returns after the
+/// deadline is never followed by another call or by the record of a seal: for each call (a file's stat,
+/// reopen, opening `fstat`, digest, closing `fstat`, mode primitive, and confirming `fstat`; a link's stat,
+/// `readlinkat`, and closing stat; a directory's stat, mode primitive, and confirming `fstat`), the deadline
+/// is spent at the seam immediately before it (or, for the digest and a mode primitive, immediately after it
+/// returns), and the run halts with the typed timeout with no later event at all: the next call's own seam
+/// never runs, nothing more is sealed, and an entry whose mode primitive or confirmation returned late is not
+/// recorded as sealed, though it has its final mode. The root's identity, the gate's last call, is no
+/// exception (review fix 3): its lookup returning after the deadline (spent at the seam immediately after it
+/// returns) halts the run with the typed timeout, `Evidence`, every entry sealed and reported, and the partial
+/// kept, never success; an unchanged root looked up on time restores; and a replaced root refuses as an
+/// identity change, on time or with its lookup returning late (a call's own refusal precedes the observation
+/// after it, as for every call of the gate). On a Captured object database, the guard between an admitted
+/// bootstrap file's two calls halts the run alone.
 #[test]
 fn c3_the_one_deadline_is_kept_before_every_entry_and_every_seal() {
     let capsule = frames_capsule();
@@ -6407,6 +6456,83 @@ fn c3_the_one_deadline_is_kept_before_every_entry_and_every_seal() {
         }
     });
 
+    // The root's identity, the gate's last call: `late` spends the deadline at the seam immediately after its
+    // lookup returns; `replaced` swaps the destination root for a new directory just before the terminal gate,
+    // which only that lookup can see (everything else goes through retained pins).
+    let root_rows: [(&str, bool, bool); 4] = [
+        ("an unchanged root, on time", false, false),
+        ("a slow root lookup", false, true),
+        ("a replaced root, on time", true, false),
+        ("a replaced root, its lookup late", true, true),
+    ];
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = root_rows
+            .into_iter()
+            .map(|(row, replaced, late)| {
+                let (capsule, frames) = (&capsule, &frames);
+                scope.spawn(move || {
+                    let case = PCaseV1::with_frames(capsule, frames);
+                    let root = case.dest.path.clone();
+                    let deadline = if late {
+                        Instant::now() + P_WRITE_DEADLINE_V1
+                    } else {
+                        far_deadline()
+                    };
+                    let fired: FiredV1 = StdRc::new(StdCell::new(None));
+                    let act = spend(deadline, &fired);
+                    let looked: StdRc<StdRefCell<Vec<PathBuf>>> = StdRc::default();
+                    let _seam = {
+                        let looked = looked.clone();
+                        install_payload_hook_for_test(
+                            PayloadHookPointV1::TerminalRootStatted,
+                            move |event| {
+                                looked.borrow_mut().push(event.path.to_path_buf());
+                                if late {
+                                    act();
+                                }
+                            },
+                        )
+                    };
+                    let swap = replaced.then(|| {
+                        Box::new(drifting_when(
+                            &case,
+                            at_step(PayloadPlaneStepV1::TerminalGate),
+                            |root| swap_out(root, root),
+                        )) as StepActV1
+                    });
+                    let run = case.restore_with(row, deadline, swap);
+                    assert_eq!(
+                        *looked.borrow(),
+                        [root],
+                        "{row}: the root's identity is looked up once, last"
+                    );
+                    if late {
+                        assert_eq!(
+                            fired.get(),
+                            Some(true),
+                            "{row}: INVALID (not behavioral evidence): the seam was not reached before the deadline"
+                        );
+                    }
+                    if !replaced && !late {
+                        run.assert_inventory_is_the_disk(row);
+                        return;
+                    }
+                    let is: fn(&PayloadPlaneErrorV1) -> bool = if replaced {
+                        identity_changed
+                    } else {
+                        |cause| matches!(cause, PayloadPlaneErrorV1::Timeout)
+                    };
+                    refused_at_the_terminal_gate(&run, row, is, &SEAL_ORDER_V1);
+                    run.assert_seals_are_the_disk(row, &[]);
+                    run.assert_partial_is_the_disk(row);
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle.join().expect("a root row's thread");
+        }
+    });
+
     let materialized = StdRc::new(StdRefCell::new(Vec::new()));
     {
         let case = PCaseV1::with_frames(&capsule, &frames);
@@ -6477,6 +6603,11 @@ fn c3_the_one_deadline_is_kept_before_every_entry_and_every_seal() {
         ),
         ("payload-chain", terminal("payload-chain", 0, true), 7),
         ("payload-root", terminal("payload-root", 0, true), 7),
+        (
+            "payload-root-statted",
+            terminal("payload-root-statted", 0, true),
+            7,
+        ),
     ];
     std::thread::scope(|scope| {
         let handles: Vec<_> = rows
@@ -7026,12 +7157,13 @@ fn c3_planted_config_hook_filter_and_fsmonitor_markers_never_run() {
 /// above). The terminal gate's section creates, writes, renames, removes, charges, and runs Git nowhere, and
 /// changes a mode only through a descriptor (`set_exact_file_mode`, `set_exact_mode`), never by path. The gate
 /// is the census, the walk of the worktree, the index, and the evidence, then the retained chains (each call
-/// behind its own guard), and the root's identity LAST, its guard immediately before it, with nothing after
-/// it; a file is observed by name, reopened, digested, guarded, and only then sealed, and nothing is looked up
-/// after its seal; a directory (a worktree or evidence directory, a slot, `evidence/`) is observed by name
-/// only after its subtree and immediately before its seal; the deadline is observed after each call of a
-/// file's, a link's, and a directory's before the next, and before a seal is recorded; and nothing fallible
-/// follows the gate but building the result.
+/// behind its own guard), and the root's identity LAST, its guard immediately before it and the deadline
+/// observed immediately after it (review fix 3), with nothing else after it; a file is observed by name,
+/// reopened, digested, guarded, and only then sealed, and nothing is looked up after its seal; a directory (a
+/// worktree or evidence directory, a slot, `evidence/`) is observed by name only after its subtree and
+/// immediately before its seal; the deadline is observed after each call of a file's, a link's, and a
+/// directory's before the next, and before a seal is recorded; and nothing fallible follows the gate but
+/// building the result.
 #[test]
 fn c3_the_terminal_gate_section_seals_through_descriptors_in_its_order() {
     let source = include_str!("custody_restore_payload.rs");
@@ -7089,7 +7221,7 @@ fn c3_the_terminal_gate_section_seals_through_descriptors_in_its_order() {
         "terminal_source_files_unchanged(",
         "terminal_retained_chains(",
         "pace(\"payload-root\")",
-        "pinned_root_unchanged(",
+        "terminal_root_unchanged(",
     ];
     // The chains make one call per guard: the shared sweeps that make several behind one are the step
     // gates', not the terminal gate's.
@@ -7138,10 +7270,35 @@ fn c3_the_terminal_gate_section_seals_through_descriptors_in_its_order() {
             pair[1]
         );
     }
-    let tail = &gate[at(gate, "pinned_root_unchanged(")..];
+    let tail = &gate[at(gate, "terminal_root_unchanged(")..];
     assert!(
-        !tail.contains('?') && !tail.contains(';'),
-        "the root's identity is the gate's tail expression: {tail}"
+        !tail.contains('?') && !tail.contains(';') && !gate.contains("pinned_root_unchanged("),
+        "the root's identity, through the helper that observes the deadline after it, is the gate's tail \
+         expression: {tail}"
+    );
+    // Review fix 3: the root's lookup is the gate's last filesystem call, and the deadline observed after it
+    // returns is the helper's tail, so a lookup that returns late is a timeout, never success.
+    let root = body_of(source, "fn terminal_root_unchanged(");
+    let order_of_root = [
+        "pinned_root_unchanged(",
+        "PayloadHookPointV1::TerminalRootStatted",
+        "IdentityChanged",
+        "pace(\"payload-root-statted\")",
+    ];
+    for pair in order_of_root.windows(2) {
+        assert!(
+            at(root, pair[0]) < at(root, pair[1]),
+            "`{}` precedes `{}` for the root's identity",
+            pair[0],
+            pair[1]
+        );
+    }
+    let observed = &root[at(root, "pace(\"payload-root-statted\")")..];
+    assert!(
+        root.matches("pinned_root_unchanged(").count() == 1
+            && !observed.contains('?')
+            && !observed.contains(';'),
+        "the deadline observed after the root's one lookup is the helper's tail expression: {observed}"
     );
     let file = body_of(source, "fn seal_file(");
     let order = [
