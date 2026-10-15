@@ -75,6 +75,27 @@
 //! planned final mode) with every created directory's retained pin: what the terminal gate needs. A refusal
 //! keeps all of it in [`PayloadPlanePartialV1`], with the file that was in flight; nothing is removed, and a
 //! second invocation over the same destination refuses as a collision at its first create.
+//!
+//! **Increment C3: the terminal gate and the result.** [`restore_payload_plane_v1`] materializes exactly as
+//! above and then runs the terminal gate ([`PayloadPlaneStepV1::TerminalGate`]), one integrated operation:
+//! the mount census; then ONE post-order walk of the worktree, the index, and the evidence trees, in which
+//! every created entry receives its sole terminal observation by name beneath its retained parent (a
+//! directory's identity and `0700`; a file reopened no-follow, its device and inode, its length, and a fresh
+//! SHA-256 of its whole content equal to the recorded ones; a symlink's target bytes) and then its final
+//! mode, set through its own descriptor and confirmed, a directory both observed and sealed only after all
+//! its children are sealed (so its own name is checked after everything beneath it, never before):
+//! the frame's exact mode for the worktree (D4), `0600` for `index` and `sharedindex.*` (D4), and `0400`
+//! for evidence files and `0500` for evidence directories (D2). Nothing is looked up by name beneath a
+//! directory once it is sealed, and no file descriptor outlives its entry. Then the retained staging and
+//! phase-G `.git` chains, which phase P never seals, and the destination root's identity LAST; the one
+//! deadline is read before every entry, immediately before every seal, and after every filesystem call the
+//! gate makes before it makes another, records a seal, or succeeds. A file whose bytes are not the
+//! bytes phase P wrote is [`PayloadPlaneErrorV1::ContentChanged`]. The result,
+//! [`RestoredPayloadPlaneV1`], is the phase-G value unchanged with the worktree, index, and evidence
+//! inventories (each entry's frame mode and the mode written), the root `.git` disposition, the childless
+//! directories, the declared external references, and every directory pin phase P created. A refused
+//! terminal gate names [`PayloadPlaneStepV1::Evidence`] as the last step completed and keeps everything in
+//! its partial value, with every entry it already sealed; nothing is removed or unsealed.
 
 use super::git::{
     before_deadline, coverage_state, metadata_name, observe_deadline, output_chains, pin_beneath,
@@ -143,8 +164,8 @@ const SHARED_INDEX_PREFIX_V1: &[u8] = b"sharedindex.";
 // ---------------------------------------------------------------------------------------------
 
 /// The steps of phase P, in order. Progress advances only when a whole step succeeds. Planning (C2a)
-/// reaches [`Self::Prevalidation`] and materialization (C2b) [`Self::Evidence`]; the terminal gate is
-/// increment C3's and is enumerated here so one progress type spans the slice.
+/// reaches [`Self::Prevalidation`], materialization (C2b) [`Self::Evidence`], and the whole restore (C3)
+/// [`Self::TerminalGate`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum PayloadPlaneStepV1 {
     Admission,
@@ -214,6 +235,11 @@ pub(crate) enum PayloadPlaneErrorV1 {
         class: CustodyCoverageClassV1,
         detail: String,
     },
+    // The terminal gate.
+    /// A restored file's content, read whole through its reopened descriptor, is not the content phase P
+    /// wrote: its length or its SHA-256 differs from the recorded one, though its inode is the one created.
+    #[error("a restored file's bytes are not the bytes phase P wrote: {name}")]
+    ContentChanged { name: String },
     // The one deadline.
     #[error("the phase-P deadline passed")]
     Timeout,
@@ -249,6 +275,11 @@ pub(crate) struct PayloadPlanePartialV1 {
     pub(crate) plan: Option<PayloadPlanV1>,
     /// Every entry and pin materialization created so far, the file in flight, and the charge.
     pub(crate) created: PayloadCreatedV1,
+    /// Every entry the terminal gate already sealed, in the order it sealed them: each now has its final
+    /// mode, and keeps it. An entry is recorded only once its seal is confirmed with the deadline still
+    /// unspent, so one whose mode was set but whose confirmation a refusal or the deadline stopped is not
+    /// listed, though it may carry its final mode.
+    pub(crate) sealed: Vec<SealedEntryV1>,
 }
 
 /// A refused or failed phase P, with how far it got. `last_completed` is the last step that completed
@@ -676,8 +707,32 @@ pub(crate) enum PayloadHookPointV1 {
     /// class).
     EntryCreated,
     /// Every frame of a materialization step is written, before the step's gate (the destination root; the
-    /// event names the step).
+    /// event names the step). With [`PayloadPlaneStepV1::TerminalGate`] as the step: every materialization
+    /// step completed, before the terminal gate's first guard.
     BeforeStepGate,
+    /// An entry is about to receive its one terminal observation (a directory's, once everything beneath it
+    /// is sealed): its guard passed, and its first by-name call follows (the entry's path: its retained
+    /// parent's path and its leaf).
+    TerminalEntry,
+    /// The terminal gate is about to look a name up beneath a retained pin, by that name (the name's path:
+    /// the pin's path and the leaf). Every by-name call the walk makes runs this first.
+    TerminalLookup,
+    /// The terminal gate is about to make a call through an entry's own descriptor: a reopened file's
+    /// opening or closing `fstat`, an entry's mode primitive, or phase P's confirming `fstat` (the entry's
+    /// path). With [`Self::TerminalLookup`], every call the walk makes is announced first, except a digest's
+    /// reads, each of which the digest itself guards.
+    TerminalDescriptor,
+    /// A reopened file was read whole and its bytes compared, before its descriptor's closing `fstat` (its
+    /// path).
+    TerminalDigested,
+    /// An entry's final mode was set through its descriptor and the primitive confirmed it, before phase P's
+    /// own confirming `fstat` of that descriptor (its path).
+    TerminalModeSet,
+    /// An entry's final mode is set and confirmed (its path).
+    TerminalSealed,
+    /// The terminal gate's last filesystem call, the destination root's identity lookup, returned, before its
+    /// result is used (the destination root).
+    TerminalRootStatted,
 }
 
 #[cfg(test)]
@@ -1321,6 +1376,7 @@ pub(crate) fn plan_payload_plane_bounded_v1(
                 plane,
                 plan: None,
                 created: PayloadCreatedV1::default(),
+                sealed: Vec::new(),
             },
         })
     };
@@ -2397,6 +2453,863 @@ pub(crate) fn materialize_payload_plane_bounded_v1(
                 plane,
                 plan: Some(plan),
                 created,
+                sealed: Vec::new(),
+            },
+        })),
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// The terminal gate (increment C3): every created entry verified and sealed, and the result
+// ---------------------------------------------------------------------------------------------
+
+use super::git::{stream_digest, BootstrapObjectsV1};
+use super::{plain_relative, RESTORE_PLAIN_DIR_NAME_V1};
+use crate::fs_custody::set_exact_file_mode;
+
+/// One entry the terminal gate sealed: its destination-relative name and the mode it now has, which the gate
+/// set through the entry's own descriptor and then confirmed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SealedEntryV1 {
+    pub(crate) name: Vec<u8>,
+    pub(crate) mode: u32,
+}
+
+/// One restored entry, as the terminal gate verified and sealed it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RestoredEntryV1 {
+    /// Its exact path beneath its tree's root: the frame path (`gitfile` for the root gitfile).
+    pub(crate) path: Vec<u8>,
+    /// Its kind, with a file's length and SHA-256 (verified again by the terminal gate) or a link's target.
+    pub(crate) kind: CreatedKindV1,
+    /// The frame's mode; none for a symlink.
+    pub(crate) frame_mode: Option<u32>,
+    /// The mode written: the one the terminal gate set and confirmed; none for a symlink, which is never
+    /// given one.
+    pub(crate) mode: Option<u32>,
+    pub(crate) dev: u64,
+    pub(crate) ino: u64,
+}
+
+impl RestoredEntryV1 {
+    /// A created entry the terminal gate sealed to exactly its final mode.
+    fn of(entry: &CreatedEntryV1) -> Self {
+        Self {
+            path: entry.path.clone(),
+            kind: entry.kind.clone(),
+            frame_mode: entry.frame_mode,
+            mode: entry.final_mode,
+            dev: entry.dev,
+            ino: entry.ino,
+        }
+    }
+}
+
+/// The worktree as restored beneath `repository/`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct WorktreeInventoryV1 {
+    /// The class as admission found it: an Empty worktree restores nothing.
+    pub(crate) state: PayloadClassStateV1,
+    /// Every created entry, in creation order, each with the frame's exact mode written (D4).
+    pub(crate) entries: Vec<RestoredEntryV1>,
+    /// What the frame's root `.git` was (D3).
+    pub(crate) root_git: RootGitDispositionV1,
+    /// Every restored directory with no entry beneath it, in frame order. The frame carries no marker of a
+    /// separate Git directory, so no claim is made about which of these was one.
+    pub(crate) childless_directories: Vec<Vec<u8>>,
+}
+
+/// The index files as restored beneath `repository/.git`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct IndexInventoryV1 {
+    pub(crate) state: PayloadClassStateV1,
+    /// `index` and each `sharedindex.*`, byte-exact, with its length, SHA-256, and frame mode; each is
+    /// written `0600` (D4).
+    pub(crate) files: Vec<RestoredEntryV1>,
+}
+
+/// One slot directory beneath `evidence/`, as restored.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct EvidenceSlotInventoryV1 {
+    pub(crate) slot: EvidenceSlotV1,
+    /// The slot directory's own mode, as written (`0500`), and its identity.
+    pub(crate) mode: u32,
+    pub(crate) dev: u64,
+    pub(crate) ino: u64,
+    /// Every entry beneath it, in creation order, each with its original frame mode and the mode written:
+    /// `0400` for a file and `0500` for a directory (D2).
+    pub(crate) entries: Vec<RestoredEntryV1>,
+}
+
+/// The inert evidence plane, as restored.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct EvidenceInventoryV1 {
+    /// The three evidence-only classes, in step order, as admission found them: an Empty class restores
+    /// nothing, not even its slot.
+    pub(crate) classes: [(CustodyCoverageClassV1, PayloadClassStateV1); 3],
+    /// `evidence/` itself, as written (`0500`), with its identity, once an entry needed it.
+    pub(crate) root: Option<(u32, u64, u64)>,
+    /// Each slot directory, in creation order (the root gitfile's included, D3).
+    pub(crate) slots: Vec<EvidenceSlotInventoryV1>,
+}
+
+/// One evidence slot's retained pins: its own, and every directory restored beneath it, by its path there.
+#[derive(Debug)]
+pub(crate) struct EvidenceSlotPinsV1 {
+    pub(crate) slot: EvidenceSlotV1,
+    pub(crate) pin: PinnedDirectoryV1,
+    pub(crate) directories: BTreeMap<Vec<u8>, PinnedDirectoryV1>,
+}
+
+/// Every directory pin phase P created, retained.
+#[derive(Debug)]
+pub(crate) struct PayloadPinsV1 {
+    /// Every worktree directory, by its path beneath `repository/`.
+    pub(crate) worktree: BTreeMap<Vec<u8>, PinnedDirectoryV1>,
+    /// `evidence/`, once an entry needed it.
+    pub(crate) evidence: Option<PinnedDirectoryV1>,
+    /// Each slot directory and its directories, in creation order.
+    pub(crate) evidence_slots: Vec<EvidenceSlotPinsV1>,
+}
+
+/// Phase P's success value: the phase-G value unchanged (every staged descriptor back at offset 0), the
+/// inventories 2B3d's record needs, and every directory pin phase P created. Every entry has its final mode.
+#[derive(Debug)]
+pub(crate) struct RestoredPayloadPlaneV1 {
+    /// The phase-P step this completes: [`PayloadPlaneStepV1::TerminalGate`].
+    pub(crate) step: PayloadPlaneStepV1,
+    pub(crate) plane: RestoredGitPlaneV1,
+    pub(crate) worktree: WorktreeInventoryV1,
+    pub(crate) index: IndexInventoryV1,
+    pub(crate) evidence: EvidenceInventoryV1,
+    /// Every symlink whose target is absolute or leaves its plane's root (D7), in plan order.
+    pub(crate) declared_external_references: Vec<ExternalSymlinkV1>,
+    pub(crate) pins: PayloadPinsV1,
+}
+
+/// A by-name reopen of a created file that did not open it: a link, another kind, or nothing at the name is
+/// an identity change; anything else an I/O refusal.
+fn reopen_refusal(error: FsCustodyError, name: &[u8]) -> PayloadPlaneErrorV1 {
+    let replaced = match &error {
+        FsCustodyError::Io(_, source) => {
+            matches!(source.raw_os_error(), Some(libc::ELOOP | libc::ENOENT))
+        }
+        FsCustodyError::Unsupported(_) => true,
+        _ => false,
+    };
+    if replaced {
+        return CustodyRestoreErrorV1::IdentityChanged(format!(
+            "{}: the entry is no longer the file phase P created",
+            lossy(name)
+        ))
+        .into();
+    }
+    staging_refusal(error, name).into()
+}
+
+/// One directory still open in the post-order walk: the created entry it is and its parent's retained pin
+/// (none for the tree's root, which the walk never observes or seals), its own retained pin, its children in
+/// creation order, and the next child to visit.
+struct OpenDirectoryV1<'t> {
+    entry: Option<(&'t CreatedEntryV1, &'t PinnedDirectoryV1)>,
+    pin: &'t PinnedDirectoryV1,
+    children: &'t [&'t CreatedEntryV1],
+    next: usize,
+}
+
+/// The created entries directly beneath `parent` (`None` is the tree's root), in creation order.
+fn children_of<'m>(
+    children: &'m BTreeMap<Option<&'m [u8]>, Vec<&'m CreatedEntryV1>>,
+    parent: Option<&'m [u8]>,
+) -> &'m [&'m CreatedEntryV1] {
+    children.get(&parent).map_or(&[], Vec::as_slice)
+}
+
+/// The terminal gate's walk: the one deadline, and every entry it sealed so far.
+struct SealRunV1<'s> {
+    deadline: Instant,
+    sealed: &'s mut Vec<SealedEntryV1>,
+}
+
+impl SealRunV1<'_> {
+    fn pace(&self, step: &'static str) -> Result<(), PayloadPlaneErrorV1> {
+        observe_deadline(self.deadline, step).map_err(Into::into)
+    }
+
+    /// The test hook at `point`, for the name `leaf` beneath `parent`.
+    #[cfg(test)]
+    fn hook(point: PayloadHookPointV1, parent: &PinnedDirectoryV1, leaf: &[u8]) {
+        run_payload_hook(
+            point,
+            None,
+            &parent.canonical_path().join(OsStr::from_bytes(leaf)),
+        );
+    }
+
+    /// Every by-name call of the walk is announced to the test seam first.
+    fn lookup(parent: &PinnedDirectoryV1, leaf: &[u8]) {
+        #[cfg(test)]
+        Self::hook(PayloadHookPointV1::TerminalLookup, parent, leaf);
+        #[cfg(not(test))]
+        let _ = (parent, leaf);
+    }
+
+    /// Every call the walk makes through a file's own descriptor is announced to the test seam first.
+    fn descriptor(parent: &PinnedDirectoryV1, leaf: &[u8]) {
+        #[cfg(test)]
+        Self::hook(PayloadHookPointV1::TerminalDescriptor, parent, leaf);
+        #[cfg(not(test))]
+        let _ = (parent, leaf);
+    }
+
+    /// The guard before an entry's one terminal observation, then the observation's seam.
+    fn enter(&self, parent: &PinnedDirectoryV1, leaf: &[u8]) -> Result<(), PayloadPlaneErrorV1> {
+        self.pace("payload-terminal-entry")?;
+        #[cfg(test)]
+        Self::hook(PayloadHookPointV1::TerminalEntry, parent, leaf);
+        #[cfg(not(test))]
+        let _ = (parent, leaf);
+        Ok(())
+    }
+
+    /// The directory `leaf` beneath `parent`, observed by name: still the directory created as `pin`, at
+    /// `0700`. This is its one terminal observation, made once everything beneath it is sealed (so its edge
+    /// is checked after its subtree, never before), immediately before its own seal, while `parent` is still
+    /// `0700`.
+    fn observe_directory(
+        &self,
+        parent: &PinnedDirectoryV1,
+        leaf: &[u8],
+        pin: &PinnedDirectoryV1,
+        name: &[u8],
+    ) -> Result<(), PayloadPlaneErrorV1> {
+        self.enter(parent, leaf)?;
+        Self::lookup(parent, leaf);
+        recheck_directory(parent, leaf, pin, name)
+    }
+
+    /// `mode`, which the primitive set and confirmed, must also be what the descriptor's own `fstat` shows
+    /// now; then the deadline is observed after that `fstat`, and only then is the entry recorded as sealed.
+    fn confirm_sealed(
+        &mut self,
+        observed: Result<u32, FsCustodyError>,
+        mode: u32,
+        name: &[u8],
+    ) -> Result<(), PayloadPlaneErrorV1> {
+        let observed = observed.map_err(|error| staging_refusal(error, name))?;
+        if observed != mode {
+            return Err(CustodyRestoreErrorV1::IdentityChanged(format!(
+                "{}: the mode reads {observed:04o} after {mode:04o} was set",
+                lossy(name)
+            ))
+            .into());
+        }
+        self.pace("payload-terminal-confirmed")?;
+        self.sealed.push(SealedEntryV1 {
+            name: name.to_vec(),
+            mode,
+        });
+        Ok(())
+    }
+
+    /// Seal the directory behind `pin` with `mode` (its children are all sealed already): the guard, then
+    /// the primitive's `fchmod` and confirmation through the retained descriptor, the deadline again, then
+    /// that descriptor's own `fstat`. Nothing beneath it is looked up again.
+    fn seal_directory(
+        &mut self,
+        pin: &PinnedDirectoryV1,
+        mode: u32,
+        name: &[u8],
+    ) -> Result<(), PayloadPlaneErrorV1> {
+        const LABEL: &str = "custody restore payload final directory mode";
+        self.pace("payload-terminal-seal")?;
+        #[cfg(test)]
+        run_payload_hook(
+            PayloadHookPointV1::TerminalDescriptor,
+            None,
+            pin.canonical_path(),
+        );
+        pin.set_exact_mode(mode, LABEL)
+            .map_err(|error| staging_refusal(error, name))?;
+        #[cfg(test)]
+        run_payload_hook(
+            PayloadHookPointV1::TerminalModeSet,
+            None,
+            pin.canonical_path(),
+        );
+        self.pace("payload-terminal-mode-set")?;
+        #[cfg(test)]
+        run_payload_hook(
+            PayloadHookPointV1::TerminalDescriptor,
+            None,
+            pin.canonical_path(),
+        );
+        let observed = pin.current_metadata(LABEL).map(|stat| stat.mode);
+        self.confirm_sealed(observed, mode, name)?;
+        #[cfg(test)]
+        run_payload_hook(
+            PayloadHookPointV1::TerminalSealed,
+            None,
+            pin.canonical_path(),
+        );
+        Ok(())
+    }
+
+    /// The regular file `entry` at `leaf` beneath `parent`: its one terminal observation and its seal. By
+    /// name, still the file created, at `0600`; reopened no-follow by name, the descriptor is that file;
+    /// its whole content, read through that descriptor under the one deadline, has the recorded length and
+    /// SHA-256 (else [`PayloadPlaneErrorV1::ContentChanged`]), and the descriptor's `fstat` did not change
+    /// while it was read; then the guard, and its final mode set and confirmed through that descriptor,
+    /// which is then closed. The deadline is observed after every call before the next one is made (the
+    /// opening `fstat`'s is the digest's own, before its first read), so a slow call is never followed by
+    /// another, or by the record of a seal.
+    fn seal_file(
+        &mut self,
+        parent: &PinnedDirectoryV1,
+        leaf: &[u8],
+        entry: &CreatedEntryV1,
+        name: &[u8],
+    ) -> Result<(), PayloadPlaneErrorV1> {
+        const LABEL: &str = "custody restore payload terminal file";
+        let shown = lossy(name);
+        let changed = |detail: &str| -> PayloadPlaneErrorV1 {
+            CustodyRestoreErrorV1::IdentityChanged(format!("{shown}: {detail}")).into()
+        };
+        let io = |error: io::Error| -> PayloadPlaneErrorV1 {
+            CustodyRestoreErrorV1::Io(format!("{shown}: {error}")).into()
+        };
+        let (CreatedKindV1::Regular { length, sha256 }, Some(mode)) =
+            (&entry.kind, entry.final_mode)
+        else {
+            return Err(changed("the recorded file has no final mode"));
+        };
+        self.enter(parent, leaf)?;
+        Self::lookup(parent, leaf);
+        recheck_created(parent, leaf, entry.observed(), name)?;
+        self.pace("payload-terminal-statted")?;
+        Self::lookup(parent, leaf);
+        let mut file = parent
+            .open_regular_file(OsStr::from_bytes(leaf), LABEL)
+            .map_err(|error| reopen_refusal(error, name))?;
+        self.pace("payload-terminal-reopened")?;
+        Self::descriptor(parent, leaf);
+        let opened = ChildStatV1::from_metadata(&file.metadata().map_err(io)?);
+        if (
+            opened.kind,
+            opened.dev,
+            opened.ino,
+            opened.size,
+            opened.mode,
+        ) != (
+            ChildKindV1::Regular,
+            entry.dev,
+            entry.ino,
+            *length,
+            CREATED_FILE_MODE_V1,
+        ) {
+            return Err(changed(
+                "the reopened descriptor is not the file phase P created",
+            ));
+        }
+        let read = stream_digest(&mut file, *length, self.deadline, &shown)?;
+        #[cfg(test)]
+        Self::hook(PayloadHookPointV1::TerminalDigested, parent, leaf);
+        if read != (*length, *sha256) {
+            return Err(PayloadPlaneErrorV1::ContentChanged { name: shown });
+        }
+        self.pace("payload-terminal-digested")?;
+        Self::descriptor(parent, leaf);
+        if ChildStatV1::from_metadata(&file.metadata().map_err(io)?) != opened {
+            return Err(changed("the file changed while it was read"));
+        }
+        self.pace("payload-terminal-seal")?;
+        Self::descriptor(parent, leaf);
+        set_exact_file_mode(&file, mode, LABEL).map_err(|error| staging_refusal(error, name))?;
+        #[cfg(test)]
+        Self::hook(PayloadHookPointV1::TerminalModeSet, parent, leaf);
+        self.pace("payload-terminal-mode-set")?;
+        Self::descriptor(parent, leaf);
+        let observed = file
+            .metadata()
+            .map(|metadata| ChildStatV1::from_metadata(&metadata).mode)
+            .map_err(|error| FsCustodyError::Io(LABEL.to_owned(), error));
+        self.confirm_sealed(observed, mode, name)?;
+        #[cfg(test)]
+        Self::hook(PayloadHookPointV1::TerminalSealed, parent, leaf);
+        Ok(())
+    }
+
+    /// The symlink `entry` at `leaf` beneath `parent`: its one terminal observation. By name, still the
+    /// link created (its kind, device, inode, and target length); `readlinkat` returns exactly the recorded
+    /// target; and a closing no-follow `fstatat` is still that link. It is never followed and never given a
+    /// mode. The deadline is observed after each of the first two calls; what follows the closing one is the
+    /// next entry's guard, a directory's, or the first chain's.
+    fn verify_symlink(
+        &self,
+        parent: &PinnedDirectoryV1,
+        leaf: &[u8],
+        entry: &CreatedEntryV1,
+        name: &[u8],
+    ) -> Result<(), PayloadPlaneErrorV1> {
+        let changed = || -> PayloadPlaneErrorV1 {
+            CustodyRestoreErrorV1::IdentityChanged(format!(
+                "{}: the link is no longer the one phase P created",
+                lossy(name)
+            ))
+            .into()
+        };
+        let CreatedKindV1::Symlink { target } = &entry.kind else {
+            return Err(changed());
+        };
+        self.enter(parent, leaf)?;
+        Self::lookup(parent, leaf);
+        recheck_created(parent, leaf, entry.observed(), name)?;
+        self.pace("payload-terminal-statted")?;
+        Self::lookup(parent, leaf);
+        let read = match parent.read_child_symlink(
+            OsStr::from_bytes(leaf),
+            target.len(),
+            "custody restore payload terminal symlink",
+        ) {
+            Ok(read) => read,
+            // A longer target is another link, never a truncated match.
+            Err(FsCustodyError::Unsupported(_)) => return Err(changed()),
+            Err(error) => return Err(staging_refusal(error, name).into()),
+        };
+        if read != *target {
+            return Err(changed());
+        }
+        self.pace("payload-terminal-link-read")?;
+        Self::lookup(parent, leaf);
+        recheck_created(parent, leaf, entry.observed(), name)
+    }
+
+    /// The post-order walk of one created tree beneath its retained `root`, which is phase G's or a slot's
+    /// and is not observed or sealed here: each entry, in creation order beneath its parent, receives its one
+    /// terminal observation from that parent (still `0700`); a directory is descended into through its
+    /// retained pin and, once all its children are sealed, observed by name and sealed; a file is verified
+    /// and sealed; a symlink verified. Every recorded entry must be reached.
+    fn seal_tree(
+        &mut self,
+        root: &PinnedDirectoryV1,
+        tree: &CreatedTreeV1,
+        at: TreeAtV1,
+    ) -> Result<(), PayloadPlaneErrorV1> {
+        let mut children: BTreeMap<Option<&[u8]>, Vec<&CreatedEntryV1>> = BTreeMap::new();
+        for entry in &tree.entries {
+            children
+                .entry(split_path(&entry.path).0)
+                .or_default()
+                .push(entry);
+        }
+        let mut reached = 0_usize;
+        let mut open = vec![OpenDirectoryV1 {
+            entry: None,
+            pin: root,
+            children: children_of(&children, None),
+            next: 0,
+        }];
+        while let Some(top) = open.last_mut() {
+            let Some(&entry) = top.children.get(top.next) else {
+                // Every child is sealed, so the directory itself is observed by name from its parent (still
+                // `0700`) and sealed now; the tree's root never is.
+                if let Some(OpenDirectoryV1 {
+                    entry: Some((entry, parent)),
+                    pin,
+                    ..
+                }) = open.pop()
+                {
+                    let name = at.name(&entry.path);
+                    let mode = entry.final_mode.ok_or_else(|| {
+                        CustodyRestoreErrorV1::IdentityChanged(format!(
+                            "{}: the recorded directory has no final mode",
+                            lossy(&name)
+                        ))
+                    })?;
+                    self.observe_directory(parent, split_path(&entry.path).1, pin, &name)?;
+                    self.seal_directory(pin, mode, &name)?;
+                }
+                continue;
+            };
+            top.next += 1;
+            let parent = top.pin;
+            reached += 1;
+            let (_, leaf) = split_path(&entry.path);
+            let name = at.name(&entry.path);
+            match &entry.kind {
+                CreatedKindV1::Directory => {
+                    let pin = tree.directories.get(&entry.path).ok_or_else(|| {
+                        CustodyRestoreErrorV1::IdentityChanged(format!(
+                            "{}: the created directory is not retained",
+                            lossy(&name)
+                        ))
+                    })?;
+                    // Descended into through its pin; its own name is observed only after its subtree.
+                    open.push(OpenDirectoryV1 {
+                        entry: Some((entry, parent)),
+                        pin,
+                        children: children_of(&children, Some(entry.path.as_slice())),
+                        next: 0,
+                    });
+                }
+                CreatedKindV1::Regular { .. } => self.seal_file(parent, leaf, entry, &name)?,
+                CreatedKindV1::Symlink { .. } => self.verify_symlink(parent, leaf, entry, &name)?,
+            }
+        }
+        if reached != tree.entries.len() {
+            return Err(CustodyRestoreErrorV1::IdentityChanged(format!(
+                "{}: {} recorded entries, {reached} beneath a created directory",
+                lossy(&at.prefix()),
+                tree.entries.len()
+            ))
+            .into());
+        }
+        Ok(())
+    }
+
+    /// `evidence/` beneath the destination root, each slot beneath it, and each slot's tree: the same walk,
+    /// post-order. Each slot's tree is walked through the slot's pin, then the slot is observed by name from
+    /// `evidence/` and sealed `0500` (D2); once every slot is, `evidence/` is observed by name from the root
+    /// and sealed `0500`.
+    fn seal_evidence(
+        &mut self,
+        root: &PinnedDirectoryV1,
+        evidence: &CreatedEvidenceV1,
+    ) -> Result<(), PayloadPlaneErrorV1> {
+        let Some(directory) = &evidence.root else {
+            return Ok(());
+        };
+        for slot in &evidence.slots {
+            let at = TreeAtV1::Evidence(slot.slot);
+            let name = at.prefix();
+            self.seal_tree(&slot.pin, &slot.tree, at)?;
+            self.observe_directory(directory, slot.slot.directory_name(), &slot.pin, &name)?;
+            self.seal_directory(&slot.pin, EVIDENCE_DIRECTORY_MODE_V1, &name)?;
+        }
+        self.observe_directory(root, EVIDENCE_NAME_V1, directory, EVIDENCE_NAME_V1)?;
+        self.seal_directory(directory, EVIDENCE_DIRECTORY_MODE_V1, EVIDENCE_NAME_V1)
+    }
+}
+
+/// Phase G's admitted bootstrap files, checked as [`source_files_unchanged`] checks them (the same two calls
+/// in the same order, with the same refusals), with the deadline observed before each call: the entry by name
+/// beneath the retained pack directory, then the file's retained descriptor. The step gates keep the shared
+/// sweep, which makes the two calls behind one guard.
+fn terminal_source_files_unchanged(
+    boot: &VerifiedGitBootstrapV1,
+    pace: PaceV1<'_>,
+) -> Result<(), GitBootstrapErrorV1> {
+    let BootstrapObjectsV1::Captured { files, .. } = &boot.objects else {
+        return Ok(());
+    };
+    for admitted in files {
+        let changed = |detail: &str| -> GitBootstrapErrorV1 {
+            CustodyRestoreErrorV1::IdentityChanged(format!("{}: {detail}", admitted.relative))
+                .into()
+        };
+        let measured = (
+            ChildKindV1::Regular,
+            admitted.dev,
+            admitted.ino,
+            admitted.length,
+        );
+        pace("objects-source")?;
+        let pack = boot.pack_directory().ok_or_else(|| {
+            GitBootstrapErrorV1::ObjectStoreInput(
+                "the bootstrap's pack directory is not retained".to_owned(),
+            )
+        })?;
+        let stat = pack
+            .child_metadata_no_follow(
+                OsStr::new(split_relative(&admitted.relative).1),
+                "custody restore admitted object file",
+            )
+            .map_err(|error| staging_refusal(error, admitted.relative.as_bytes()))?
+            .ok_or_else(|| changed("no longer the admitted object file"))?;
+        if stat.kind == ChildKindV1::Symlink {
+            return Err(CustodyRestoreErrorV1::SymlinkRefused {
+                name: admitted.relative.clone(),
+            }
+            .into());
+        }
+        if (stat.kind, stat.dev, stat.ino, stat.size) != measured {
+            return Err(changed("no longer the admitted object file"));
+        }
+        pace("payload-source-statted")?;
+        let held = admitted.file.metadata().map_err(|error| {
+            CustodyRestoreErrorV1::Io(format!("{}: {error}", admitted.relative))
+        })?;
+        let held = ChildStatV1::from_metadata(&held);
+        if (held.kind, held.dev, held.ino, held.size) != measured {
+            return Err(changed(
+                "the retained descriptor is no longer the admitted object file",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// [`retained_chains`]'s calls, in its order and with its refusals, with the deadline observed before each
+/// call: every staging chain from the root (the work directory's entry, the plain directory's, then each
+/// staging directory's beneath its retained parent), then HOME, XDG, and each bootstrap directory beneath its
+/// retained parent. A chain's first call has its `payload-chain` guard, as there, and each later call of the
+/// same chain a `payload-chain-step` guard. The step gates keep the shared sweep, which checks a whole chain
+/// behind one guard.
+fn terminal_retained_chains(
+    dest: &RestoreDestinationV1,
+    boot: &VerifiedGitBootstrapV1,
+    pace: PaceV1<'_>,
+) -> Result<(), GitBootstrapErrorV1> {
+    let work = RESTORE_WORK_DIR_NAME_V1.as_bytes();
+    let staging = dest.staging.borrow();
+    for key in std::iter::once(&b""[..]).chain(staging.keys().map(Vec::as_slice)) {
+        pace("payload-chain")?;
+        recheck_entry(&dest.root, work, &dest.work, work)?;
+        pace("payload-chain-step")?;
+        recheck_entry(
+            &dest.work,
+            RESTORE_PLAIN_DIR_NAME_V1.as_bytes(),
+            &dest.plain,
+            &plain_relative(b""),
+        )?;
+        if key.is_empty() {
+            continue;
+        }
+        let mut parent: &PinnedDirectoryV1 = &dest.plain;
+        let mut prefix = Vec::new();
+        for component in key.split(|byte| *byte == b'/') {
+            prefix = joined(&prefix, component);
+            let pin = staging.get(&prefix).ok_or_else(|| {
+                CustodyRestoreErrorV1::IdentityChanged(format!(
+                    "{}: a staging directory is not retained",
+                    lossy(&plain_relative(&prefix))
+                ))
+            })?;
+            pace("payload-chain-step")?;
+            recheck_entry(parent, component, pin, &plain_relative(&prefix))?;
+            parent = pin;
+        }
+    }
+    for (name, pin) in [(HOME_NAME_V1, &boot.home), (XDG_NAME_V1, &boot.xdg)] {
+        pace("payload-chain")?;
+        recheck_entry(
+            &dest.work,
+            name.as_bytes(),
+            pin,
+            &joined(work, name.as_bytes()),
+        )?;
+    }
+    let bootstrap = joined(work, BOOTSTRAP_NAME_V1.as_bytes());
+    for (relative, pin) in &boot.directories {
+        if relative.is_empty() {
+            pace("payload-chain")?;
+            recheck_entry(&dest.work, BOOTSTRAP_NAME_V1.as_bytes(), pin, &bootstrap)?;
+            continue;
+        }
+        let (parent_relative, component) =
+            relative.rsplit_once('/').unwrap_or(("", relative.as_str()));
+        let parent = boot.directories.get(parent_relative).ok_or_else(|| {
+            CustodyRestoreErrorV1::IdentityChanged(format!(
+                "{relative}: its bootstrap parent is not retained"
+            ))
+        })?;
+        pace("payload-chain")?;
+        recheck_entry(
+            parent,
+            component.as_bytes(),
+            pin,
+            &joined(&bootstrap, relative.as_bytes()),
+        )?;
+    }
+    Ok(())
+}
+
+/// The destination root's identity, the terminal gate's last filesystem call: the root's canonical path must
+/// still name the pinned directory (else `IdentityChanged`), and then the deadline is observed once more, so a
+/// lookup that returns after the deadline is the typed timeout, never success. Nothing follows the
+/// observation but building the result.
+fn terminal_root_unchanged(
+    root: &PinnedDirectoryV1,
+    pace: PaceV1<'_>,
+) -> Result<(), PayloadPlaneErrorV1> {
+    let unchanged = pinned_root_unchanged(root);
+    #[cfg(test)]
+    run_payload_hook(
+        PayloadHookPointV1::TerminalRootStatted,
+        None,
+        root.canonical_path(),
+    );
+    unchanged.map_err(CustodyRestoreErrorV1::IdentityChanged)?;
+    pace("payload-root-statted").map_err(Into::into)
+}
+
+/// The terminal gate, one integrated operation after every step is written: the mount census over the
+/// destination; then ONE post-order walk of the worktree, the index, and the evidence trees, which is each
+/// created entry's sole terminal check and applies its final mode (nothing is looked up by name beneath a
+/// directory once it is sealed); then the retained staging and phase-G `.git` chains, which phase P never
+/// seals; and the destination root's identity LAST, its guard immediately before it. Every entry it seals is
+/// pushed to `sealed` as it is sealed, so a refusal keeps them. The deadline is observed after every
+/// filesystem call before the next one: the census is followed by the first entry's guard (or the first
+/// chain's), each call of the walk by its own guard or the next entry's, each call of the chains by the
+/// next call's guard, each chain making one call per guard, and the root's identity, the last call, by its
+/// own guard before the gate returns.
+fn terminal_gate(
+    plane: &RestoredGitPlaneV1,
+    created: &PayloadCreatedV1,
+    deadline: Instant,
+    sealed: &mut Vec<SealedEntryV1>,
+) -> Result<(), PayloadPlaneErrorV1> {
+    let observe = |step: &'static str| observe_deadline(deadline, step);
+    let pace: PaceV1<'_> = &observe;
+    let dest = &plane.capsule().destination;
+    let pins = &plane.objects.pins;
+    pace("payload-terminal-gate")?;
+    refuse_mounts_within(&dest.root)?;
+    let mut run = SealRunV1 { deadline, sealed };
+    run.seal_tree(&pins.repository, &created.worktree, TreeAtV1::Worktree)?;
+    run.seal_tree(&pins.git, &created.index, TreeAtV1::Index)?;
+    run.seal_evidence(&dest.root, &created.evidence)?;
+    output_chains(dest, PinViewV1::of_final(pins), &plane.objects.files, pace)?;
+    metadata_chains(plane, pace)?;
+    terminal_source_files_unchanged(&plane.bootstrap, pace)?;
+    terminal_retained_chains(dest, &plane.bootstrap, pace)?;
+    pace("payload-root")?;
+    terminal_root_unchanged(&dest.root, pace)
+}
+
+/// The success value, built from what the terminal gate verified and sealed: every recorded entry now has
+/// exactly its final mode. Infallible: nothing fallible follows the gate's last check.
+fn restored(
+    plane: RestoredGitPlaneV1,
+    plan: &PayloadPlanV1,
+    created: PayloadCreatedV1,
+) -> RestoredPayloadPlaneV1 {
+    let rows = |tree: &CreatedTreeV1| tree.entries.iter().map(RestoredEntryV1::of).collect();
+    let [(_, worktree_state), (_, index_state), operations, config, bridge] = plan.classes;
+    let PayloadCreatedV1 {
+        worktree,
+        index,
+        evidence,
+        ..
+    } = created;
+    // Every evidence pin passed `recheck_directory`, which requires its device and inode to be present.
+    let identity = |pin: &PinnedDirectoryV1| {
+        (
+            pin.identity().dev.unwrap_or_default(),
+            pin.identity().ino.unwrap_or_default(),
+        )
+    };
+    let evidence_inventory = EvidenceInventoryV1 {
+        classes: [operations, config, bridge],
+        root: evidence.root.as_ref().map(|pin| {
+            let (dev, ino) = identity(pin);
+            (EVIDENCE_DIRECTORY_MODE_V1, dev, ino)
+        }),
+        slots: evidence
+            .slots
+            .iter()
+            .map(|one| {
+                let (dev, ino) = identity(&one.pin);
+                EvidenceSlotInventoryV1 {
+                    slot: one.slot,
+                    mode: EVIDENCE_DIRECTORY_MODE_V1,
+                    dev,
+                    ino,
+                    entries: rows(&one.tree),
+                }
+            })
+            .collect(),
+    };
+    let worktree_inventory = WorktreeInventoryV1 {
+        state: worktree_state,
+        entries: rows(&worktree),
+        root_git: plan.root_git,
+        childless_directories: plan
+            .childless_directories()
+            .into_iter()
+            .map(<[u8]>::to_vec)
+            .collect(),
+    };
+    let index_inventory = IndexInventoryV1 {
+        state: index_state,
+        files: rows(&index),
+    };
+    let CreatedEvidenceV1 { root, slots } = evidence;
+    RestoredPayloadPlaneV1 {
+        step: PayloadPlaneStepV1::TerminalGate,
+        plane,
+        worktree: worktree_inventory,
+        index: index_inventory,
+        evidence: evidence_inventory,
+        declared_external_references: plan.declared_external_references(),
+        pins: PayloadPinsV1 {
+            worktree: worktree.directories,
+            evidence: root,
+            evidence_slots: slots
+                .into_iter()
+                .map(|one| EvidenceSlotPinsV1 {
+                    slot: one.slot,
+                    pin: one.pin,
+                    directories: one.tree.directories,
+                })
+                .collect(),
+        },
+    }
+}
+
+/// Restore phase P over `plane`, the phase-G success value: [`materialize_payload_plane_v1`] (admission,
+/// prevalidation, and the worktree, index, and evidence steps, each with its gate), then the terminal gate,
+/// all on the ONE caller-supplied absolute `deadline` and the one ledger.
+///
+/// On success every entry has its final mode, every staged descriptor is at offset 0, and the value carries
+/// the phase-G value unchanged, the inventories, and every directory pin phase P created. A refused terminal
+/// gate is a failure with [`PayloadPlaneStepV1::Evidence`] as the last step completed, keeping the phase-G
+/// value, the plan, every created entry and pin, and every entry already sealed; nothing is removed or
+/// unsealed, and the terminal gate charges nothing.
+pub(crate) fn restore_payload_plane_v1(
+    plane: RestoredGitPlaneV1,
+    frame_budget: CustodyFrameBudgetV1,
+    deadline: Instant,
+) -> Result<RestoredPayloadPlaneV1, Box<PayloadPlaneRestoreFailureV1>> {
+    restore_payload_plane_bounded_v1(plane, frame_budget, deadline, PAYLOAD_PLAN_TABLE_BYTES_V1)
+}
+
+/// [`restore_payload_plane_v1`] with the plan table's byte bound as a parameter.
+pub(crate) fn restore_payload_plane_bounded_v1(
+    plane: RestoredGitPlaneV1,
+    frame_budget: CustodyFrameBudgetV1,
+    deadline: Instant,
+    table_bound: u64,
+) -> Result<RestoredPayloadPlaneV1, Box<PayloadPlaneRestoreFailureV1>> {
+    let MaterializedPayloadPlaneV1 {
+        plane,
+        plan,
+        created,
+        ..
+    } = materialize_payload_plane_bounded_v1(plane, frame_budget, deadline, table_bound)?;
+    #[cfg(test)]
+    run_payload_step_hook(
+        PayloadHookPointV1::BeforeStepGate,
+        None,
+        Some(PayloadPlaneStepV1::TerminalGate),
+        plane.capsule().destination.root.canonical_path(),
+    );
+    let mut sealed = Vec::new();
+    match terminal_gate(&plane, &created, deadline, &mut sealed) {
+        Ok(()) => Ok(restored(plane, &plan, created)),
+        Err(cause) => Err(Box::new(PayloadPlaneRestoreFailureV1 {
+            cause,
+            last_completed: Some(PayloadPlaneStepV1::Evidence),
+            // Materialization succeeded, so everything it may have created is recorded.
+            payload_materialization_began: created.evidence.root.is_some()
+                || !created.worktree.entries.is_empty()
+                || !created.index.entries.is_empty(),
+            ledger_used: plane.ledger_used(),
+            partial: PayloadPlanePartialV1 {
+                plane,
+                plan: Some(plan),
+                created,
+                sealed,
             },
         })),
     }

@@ -1570,7 +1570,7 @@ impl FileFactV1 {
 /// reads at most `expected + 1` (a file that grew is never read whole), so the count says whether the
 /// file held exactly `expected` bytes. The ONE absolute `deadline` is checked before every read: there
 /// is no digest without it.
-fn stream_digest(
+pub(super) fn stream_digest(
     file: &mut File,
     expected: u64,
     deadline: Instant,
