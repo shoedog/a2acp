@@ -34,7 +34,7 @@
 - **Active slice:** **ADR-0041 Slice 2B3 (inert new-root restore and hidden-state proof).** Its design is
   `docs/superpowers/specs/2026-09-27-adr0041-slice2b3-restore-design.md` (PR #123). It has four serial children:
   2B3a reader → 2B3b Git plane → 2B3c payload plane → 2B3d record and joint fixture.
-  - **2B3c (payload plane) is in progress.** Spec rev 4 merged in PR #140 at `d56b1eed`:
+  - **2B3c (payload plane) is complete** (2026-10-15). Spec rev 4 merged in PR #140 at `d56b1eed`:
     `docs/superpowers/plans/2026-10-14-adr0041-slice2b3c-payload-plane-task.md`, with ledger
     `docs/superpowers/reviews/2026-10-14-adr0041-slice2b3c-spec-review.md`. Spec review went 6 → 2 → 1 blockers, and
     the last one was folded as specified. The spec splits the slice into four increments, each with a two-round
@@ -42,11 +42,13 @@
     - C1 primitives: merged, PR #142 at `c09e54d5`.
     - C2a admission and plan: merged, PR #143 at `c86d392a`.
     - C2b materialization: merged, PR #148 at `0235b1d3`. Review round 1 found 2 WRONG; round 2 approved.
-    - C3 (terminal gate, final modes, the complete result): in implementation.
+    - C3 (terminal gate, final modes, the complete result): merged, PR #151 at `b460f356`. Review went 1 → 2 → 1 → 0
+      WRONG over four rounds (two disclosed converging extensions past the cap).
 
     Running record: `docs/superpowers/reviews/2026-10-14-adr0041-slice2b3c-implementation-handoff.md`. Carried
-    into 2B3d's design: each created directory keeps a descriptor (the macOS soft `RLIMIT_NOFILE` is 256).
-    **Next after C3: the 2B3d spec (record and joint fixture).**
+    into 2B3d's design: each created directory keeps a descriptor (the macOS soft `RLIMIT_NOFILE` is 256); phase G's
+    final gates (2B3b) end with a root identity lookup that has no deadline observation after it, unlike C3's.
+    **Next: the 2B3d spec (record and joint fixture).**
   - **2B3b is merged** in PR #137 at `4fcda06d` (2026-10-14): the phase-G Git plane, crate-private and
     production-unwired. It landed after the owner accepted the B2c literal correction without a third source review,
     the first native macOS run surfaced 13 test-only portability failures (no production defect), the test-only
