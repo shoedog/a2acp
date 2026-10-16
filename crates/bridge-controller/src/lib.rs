@@ -27,3 +27,5 @@ pub mod verify;
 
 pub use merge::{MergeConfig, OperatorIdent};
 pub use verify::VerifyConfig;
+
+pub mod evidence;

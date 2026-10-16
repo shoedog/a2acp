@@ -2746,6 +2746,9 @@ async fn run_review_step(
         ..bridge_workflow::executor::WorkflowRunContext::default()
     };
     let token = tokio_util::sync::CancellationToken::new();
+    let invocation = bridge_controller::evidence::begin_review(clone_path)
+        .inspect_err(|e| eprintln!("[evidence] warning: review reservation: {e}"))
+        .ok();
     let stream = executor.run_with_context(
         graph,
         input,
@@ -2765,6 +2768,13 @@ async fn run_review_step(
     };
     if !completed {
         return (review::ReviewOutcome::Incomplete, String::new());
+    }
+    if let Some(invocation) = invocation {
+        if let Err(e) =
+            bridge_controller::evidence::complete_review(clone_path, attempt, invocation, &synth)
+        {
+            eprintln!("[evidence] warning: review persistence: {e}");
+        }
     }
     let (verdict, summary) = review::parse_verdict(&synth);
     if !matches!(verdict, review::Verdict::Approve) {
@@ -3401,6 +3411,7 @@ async fn run_warm_loop(
     telemetry: Arc<ImplementAttemptTelemetry>,
     run: &bridge_core::run_identity::RunHandle,
     verify_owner: &str,
+    evidence_cfg: &bridge_controller::evidence::EvidenceConfig,
 ) -> implement_resume::ImplementPhase {
     let final_ = {
         let mut effects = ProdEffects {
@@ -3482,9 +3493,14 @@ async fn run_warm_loop(
     // A failed or incomplete fix can leave the writer running. Snapshot Git needs the same
     // runtime-confirmed custody as the loop's reset/commit operations.
     if runner.acquire_host_custody().await.is_ok() {
-        finalize_implement_terminal(clone, custody_cfg, &ck, Some(terminal));
+        finalize_implement_terminal(clone, custody_cfg, &ck, Some(terminal), evidence_cfg);
     } else {
-        bridge_controller::custody_push::finalize_terminal_without_git(clone, custody_cfg, &ck);
+        bridge_controller::custody_push::finalize_terminal_without_git(
+            clone,
+            custody_cfg,
+            &ck,
+            evidence_cfg,
+        );
     }
     let _ = runner.retire().await;
     terminal
@@ -3737,6 +3753,7 @@ async fn implement_cmd(args: &[String]) -> Result<(), BoxError> {
     // B2b-3a: parsed pre-commit (beside verify).
     let review_cfg = cfg.review.as_ref().map(|t| t.to_config());
     // ADR-0027: parsed pre-move (--merge sugar).
+    let evidence_cfg = cfg.evidence.clone();
     let custody_cfg = cfg.custody.clone();
     custody_cfg.validate()?;
     let merge_cfg = cfg.merge.as_ref().map(|m| m.to_config());
@@ -3932,6 +3949,8 @@ async fn implement_cmd(args: &[String]) -> Result<(), BoxError> {
         edit_workflow: workflow.clone(),
         fix_workflow: loop_cfg.fix_workflow.as_str().to_string(),
         loop_max_attempts: loop_cfg.max_attempts,
+        review_invocation: 0,
+        final_review: None,
         attempt_next: 1,
         forced_depth: depth.to_forced_str(),
         resolved_lang: Some(
@@ -3962,6 +3981,7 @@ async fn implement_cmd(args: &[String]) -> Result<(), BoxError> {
                 &custody_cfg,
                 &no_commit_checkpoint,
                 Some(implement_resume::ImplementPhase::Abort),
+                &evidence_cfg,
             );
             return Err(format!("implement: stage check: {e}").into());
         }
@@ -3987,6 +4007,7 @@ async fn implement_cmd(args: &[String]) -> Result<(), BoxError> {
                     &custody_cfg,
                     &no_commit_checkpoint,
                     Some(implement_resume::ImplementPhase::Abort),
+                    &evidence_cfg,
                 );
                 eprintln!(
                     "[implement] {reason} — NO commit; clone left at {}",
@@ -4002,6 +4023,7 @@ async fn implement_cmd(args: &[String]) -> Result<(), BoxError> {
                     &custody_cfg,
                     &no_commit_checkpoint,
                     Some(implement_resume::ImplementPhase::NoCommitClean),
+                    &evidence_cfg,
                 );
                 println!(
                     "implement: made no changes; clone left at {}",
@@ -4017,6 +4039,7 @@ async fn implement_cmd(args: &[String]) -> Result<(), BoxError> {
                     &custody_cfg,
                     &no_commit_checkpoint,
                     Some(implement_resume::ImplementPhase::NoCommitDirty),
+                    &evidence_cfg,
                 );
                 eprintln!(
                     "[implement] agent edited but staged NOTHING — NOT committing (agent owns staging). \
@@ -4038,6 +4061,7 @@ async fn implement_cmd(args: &[String]) -> Result<(), BoxError> {
                             &custody_cfg,
                             &no_commit_checkpoint,
                             Some(implement_resume::ImplementPhase::CommitFailed),
+                            &evidence_cfg,
                         );
                         // Abort/NoCommitClean/NoCommitDirty all print the clone path; this path did
                         // not, so a failed commit stranded the agent's complete work with no pointer.
@@ -4095,6 +4119,7 @@ async fn implement_cmd(args: &[String]) -> Result<(), BoxError> {
                     telemetry,
                     &run,
                     &verify_owner,
+                    &evidence_cfg,
                 )
                 .await;
                 merge_after_loop(
@@ -4119,14 +4144,15 @@ fn finalize_implement_terminal(
     cfg: &bridge_controller::custody_push::CustodyConfig,
     ck: &implement_resume::ImplementCheckpoint,
     phase: Option<implement_resume::ImplementPhase>,
+    evidence_cfg: &bridge_controller::evidence::EvidenceConfig,
 ) {
     let mut ck = ck.clone();
     if let Some(phase) = phase {
         ck.phase = phase;
         ck.updated_at_ms = implement_resume::now_ms();
-        bridge_controller::custody_push::finalize_terminal(clone, cfg, &ck);
+        bridge_controller::custody_push::finalize_terminal(clone, cfg, &ck, evidence_cfg);
     } else {
-        bridge_controller::custody_push::finalize_refused_resume(clone, cfg, &ck);
+        bridge_controller::custody_push::finalize_refused_resume(clone, cfg, &ck, evidence_cfg);
     }
 }
 
@@ -4136,17 +4162,19 @@ struct RefusedResumeFinalizer {
     cfg: bridge_controller::custody_push::CustodyConfig,
     armed: bool,
     clone_ready: bool,
+    evidence: bridge_controller::evidence::EvidenceConfig,
 }
 impl Drop for RefusedResumeFinalizer {
     fn drop(&mut self) {
         if self.armed {
             if self.clone_ready {
-                finalize_implement_terminal(&self.clone, &self.cfg, &self.ck, None);
+                finalize_implement_terminal(&self.clone, &self.cfg, &self.ck, None, &self.evidence);
             } else {
                 bridge_controller::custody_push::finalize_terminal_without_git(
                     &self.clone,
                     &self.cfg,
                     &self.ck,
+                    &self.evidence,
                 );
             }
         }
@@ -4188,7 +4216,12 @@ async fn implement_resume_cmd(
         loop_cfg.clone_config.clone(),
     )
     .inspect_err(|_| {
-        bridge_controller::custody_push::finalize_terminal_without_git(&clone, &cfg.custody, &ck);
+        bridge_controller::custody_push::finalize_terminal_without_git(
+            &clone,
+            &cfg.custody,
+            &ck,
+            &cfg.evidence,
+        );
     })?;
     let mut refusal_finalizer = RefusedResumeFinalizer {
         clone: clone.clone(),
@@ -4196,6 +4229,7 @@ async fn implement_resume_cmd(
         cfg: cfg.custody.clone(),
         armed: true,
         clone_ready: false,
+        evidence: cfg.evidence.clone(),
     };
     // Recovery and a fail-closed runtime inventory precede ALL repository-aware clone Git.
     let entry_runtimes =
@@ -4237,6 +4271,7 @@ async fn implement_resume_cmd(
     let profile = select_profile(&cfg, &resume_lang, &ck.source_repo)
         .map_err(|e| format!("implement: language profile (resume): {e}"))?;
     let review_cfg = cfg.review.as_ref().map(|t| t.to_config());
+    let evidence_cfg = cfg.evidence.clone();
     let custody_cfg = cfg.custody.clone();
     custody_cfg.validate()?;
     let merge_cfg = cfg.merge.as_ref().map(|m| m.to_config()); // ADR-0027: parsed pre-move (--merge sugar)
@@ -4432,6 +4467,7 @@ async fn implement_resume_cmd(
         telemetry,
         &run,
         &verify_owner,
+        &evidence_cfg,
     )
     .await;
     settle_worktree_run_end(
@@ -12946,6 +12982,7 @@ esac
                     ImplementAttemptTelemetry::new("entry-test"),
                     &run,
                     "owner",
+                    &bridge_controller::evidence::EvidenceConfig::default(),
                 )
                 .await;
                 assert_eq!(terminal, implement_resume::ImplementPhase::Approved);
@@ -12981,17 +13018,30 @@ esac
             NoCommitDirty,
             CommitFailed,
         ] {
-            let (_root, source, clone, remote) = custody_fixture();
+            let (root, source, clone, remote) = custody_fixture();
             let mut ck = implement_resume::load_checkpoint(&clone).unwrap();
             ck.current_commit = None;
             std::fs::remove_file(implement_resume::checkpoint_path(&clone)).unwrap();
             std::fs::write(clone.join("leftover"), "agent work").unwrap();
+            std::fs::write(clone.join(".git/A2A_TASK.md"), "task").unwrap();
+            let evidence = bridge_controller::evidence::EvidenceConfig {
+                path: Some(root.path().join("evidence")),
+                ..Default::default()
+            };
             finalize_implement_terminal(
                 &clone,
                 &bridge_controller::custody_push::CustodyConfig::default(),
                 &ck,
                 Some(phase),
+                &evidence,
             );
+            let archive = evidence
+                .path
+                .as_ref()
+                .unwrap()
+                .join(bridge_controller::evidence::repo_key(&source).unwrap())
+                .join(format!("{}.tar.gz", ck.task_id));
+            assert!(archive.is_file(), "{phase:?} did not publish evidence");
             let saved = implement_resume::load_checkpoint(&clone).unwrap();
             assert_eq!(saved.phase, phase);
             assert!(saved.current_commit.is_none());
@@ -13108,6 +13158,46 @@ esac
         ])
         .await
         .unwrap();
+    }
+
+    #[test]
+    fn evidence_validate_closed_vocabulary_defaults_and_constraints() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("config.toml");
+        let base = "default = 'codex'\n[[agents]]\nid = 'codex'\ncmd = 'codex-acp'\n[server]\n";
+        let validate = |evidence: &str| {
+            validate_config_contents(
+                &path,
+                &format!("{base}\n[evidence]\n{evidence}"),
+                ExamplesPolicy::Off,
+                &[],
+                ValidationScope::Full,
+            )
+        };
+        validate("").unwrap();
+        for kind in bridge_controller::evidence::KINDS {
+            validate(&format!("include = ['{kind}']")).unwrap();
+        }
+        validate(
+            "include = []\nretain_days = 1\nmax_bytes_per_repo = 65536\npath = '/tmp/evidence'",
+        )
+        .unwrap();
+        for bad in [
+            "include = ['plans']",
+            "include = ['verify_logs']",
+            "store = 'remote'",
+            "path = 'relative'",
+            "retain_days = 0",
+            "retain_days = -1",
+            "max_bytes_per_repo = 65535",
+            "unknown = true",
+        ] {
+            assert!(validate(bad).is_err(), "{bad}");
+        }
+        let config = config::RegistryConfig::parse(base).unwrap();
+        assert_eq!(config.evidence.include, ["spec", "final_review_summary"]);
+        assert_eq!(config.evidence.retain_days, 30);
+        assert_eq!(config.evidence.max_bytes_per_repo, 10485760);
     }
 
     #[test]

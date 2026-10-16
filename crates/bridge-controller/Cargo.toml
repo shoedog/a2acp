@@ -20,6 +20,12 @@ tokio = { workspace = true }
 async-trait = { workspace = true }
 futures = { workspace = true }
 
+tar = "0.4"
+flate2 = "1"
+fs2 = "0.4"
+ring = { workspace = true }
+chrono = { version = "0.4", default-features = false, features = ["std"] }
+
 [dev-dependencies]
 tempfile = "3"
 tokio-stream = { workspace = true }

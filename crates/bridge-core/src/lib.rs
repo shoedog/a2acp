@@ -92,3 +92,5 @@ pub mod workflow_history;
 
 pub use profile::{rust_profile, CacheBinding, CacheCtx, LanguageProfile};
 pub use session_cwd::SessionCwd;
+
+pub mod platform_state;

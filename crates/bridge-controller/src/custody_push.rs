@@ -610,8 +610,9 @@ pub fn finalize_terminal(
     clone: &Path,
     cfg: &CustodyConfig,
     ck: &crate::implement_resume::ImplementCheckpoint,
+    evidence: &crate::evidence::EvidenceConfig,
 ) {
-    finalize_terminal_inner(clone, cfg, ck, true, false);
+    finalize_terminal_inner(clone, cfg, ck, true, false, evidence);
 }
 
 /// Refusal adds custody records without rewriting phase, progress, or unknown checkpoint fields.
@@ -619,8 +620,9 @@ pub fn finalize_refused_resume(
     clone: &Path,
     cfg: &CustodyConfig,
     ck: &crate::implement_resume::ImplementCheckpoint,
+    evidence: &crate::evidence::EvidenceConfig,
 ) {
-    finalize_terminal_inner(clone, cfg, ck, true, true);
+    finalize_terminal_inner(clone, cfg, ck, true, true, evidence);
 }
 
 /// Entry refused before runtime-confirmed custody: preserve metadata without invoking clone Git.
@@ -628,8 +630,9 @@ pub fn finalize_terminal_without_git(
     clone: &Path,
     cfg: &CustodyConfig,
     ck: &crate::implement_resume::ImplementCheckpoint,
+    evidence: &crate::evidence::EvidenceConfig,
 ) {
-    finalize_terminal_inner(clone, cfg, ck, false, true);
+    finalize_terminal_inner(clone, cfg, ck, false, true, evidence);
 }
 
 fn finalize_terminal_inner(
@@ -638,6 +641,7 @@ fn finalize_terminal_inner(
     ck: &crate::implement_resume::ImplementCheckpoint,
     clone_ready: bool,
     preserve_progress: bool,
+    evidence: &crate::evidence::EvidenceConfig,
 ) {
     let mut custody = crate::implement_resume::load_custody(clone).ok().flatten();
     let result = (|| {
@@ -675,11 +679,19 @@ fn finalize_terminal_inner(
     if saved.is_err() {
         eprintln!("[custody] warning: terminal checkpoint save failed");
     }
-    terminal_archive_hook(clone, ck);
+    terminal_archive_hook(clone, ck, evidence);
 }
 
-// I2 plugs its archive writer into this terminal hook.
-fn terminal_archive_hook(_clone: &Path, _ck: &crate::implement_resume::ImplementCheckpoint) {}
+fn terminal_archive_hook(
+    clone: &Path,
+    ck: &crate::implement_resume::ImplementCheckpoint,
+    evidence: &crate::evidence::EvidenceConfig,
+) {
+    let phase = format!("{:?}", ck.phase).to_ascii_lowercase();
+    if let Err(error) = crate::evidence::write_run_archive(clone, ck, &phase, evidence) {
+        eprintln!("[evidence] warning: archive not published: {error}");
+    }
+}
 
 /// Query an exact ref using the same isolated, bounded transport as push (I3 seam).
 pub fn ls_remote_ref(
@@ -874,7 +886,12 @@ mod tests {
         std::fs::write(f.clone.join("ignored"), "excluded").unwrap();
         let index = std::fs::read(f.clone.join(".git/index")).unwrap();
         let refs = run(&f.clone, &["show-ref"]);
-        finalize_terminal(&f.clone, &f.cfg, &f.ck);
+        finalize_terminal(
+            &f.clone,
+            &f.cfg,
+            &f.ck,
+            &crate::evidence::EvidenceConfig::default(),
+        );
         let state = crate::implement_resume::load_custody(&f.clone)
             .unwrap()
             .unwrap();
@@ -916,7 +933,12 @@ mod tests {
         assert_no_snapshot_index(&f.clone);
         // A second snapshot updates its own lease, without borrowing the normal lease.
         std::fs::write(f.clone.join("untracked"), "newer").unwrap();
-        finalize_terminal(&f.clone, &f.cfg, &f.ck);
+        finalize_terminal(
+            &f.clone,
+            &f.cfg,
+            &f.ck,
+            &crate::evidence::EvidenceConfig::default(),
+        );
         let state = crate::implement_resume::load_custody(&f.clone)
             .unwrap()
             .unwrap();
@@ -989,7 +1011,12 @@ mod tests {
                 _ => sentinel.to_string_lossy().into_owned(),
             };
             run(&f.clone, &["config", key, &value]);
-            finalize_terminal(&f.clone, &f.cfg, &f.ck);
+            finalize_terminal(
+                &f.clone,
+                &f.cfg,
+                &f.ck,
+                &crate::evidence::EvidenceConfig::default(),
+            );
             let state = crate::implement_resume::load_custody(&f.clone)
                 .unwrap()
                 .unwrap();
@@ -1009,7 +1036,12 @@ mod tests {
             },
         )
         .unwrap();
-        finalize_terminal(&f.clone, &f.cfg, &f.ck);
+        finalize_terminal(
+            &f.clone,
+            &f.cfg,
+            &f.ck,
+            &crate::evidence::EvidenceConfig::default(),
+        );
         assert!(crate::implement_resume::load_custody(&f.clone)
             .unwrap()
             .unwrap()
@@ -1027,7 +1059,12 @@ mod tests {
             std::fs::remove_file(&index).unwrap();
         }
         std::fs::write(f.clone.join("new"), "new").unwrap();
-        finalize_terminal(&f.clone, &f.cfg, &f.ck);
+        finalize_terminal(
+            &f.clone,
+            &f.cfg,
+            &f.ck,
+            &crate::evidence::EvidenceConfig::default(),
+        );
         let state = crate::implement_resume::load_custody(&f.clone)
             .unwrap()
             .unwrap();
@@ -1053,7 +1090,12 @@ mod tests {
                 "HEAD:refs/heads/wip/impl-test-dirty",
             ],
         );
-        finalize_terminal(&f.clone, &f.cfg, &f.ck);
+        finalize_terminal(
+            &f.clone,
+            &f.cfg,
+            &f.ck,
+            &crate::evidence::EvidenceConfig::default(),
+        );
         let state = crate::implement_resume::load_custody(&f.clone)
             .unwrap()
             .unwrap();

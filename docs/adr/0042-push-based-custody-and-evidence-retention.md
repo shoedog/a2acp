@@ -63,13 +63,14 @@ Configuration (`[evidence]`):
 
 | Key | Default | Meaning |
 |---|---|---|
-| `store` | `local` | `local`, or a named destination added later (for example, a private Git repository) |
-| `path` | platform data dir, `a2a-bridge/evidence/<repo>/` | Where `local` archives are written |
+| `store` | `local` | `local` is the only accepted value |
+| `path` | platform state dir, `evidence/<repo-key>/` | Where `local` archives are written |
 | `include` | `["spec", "final_review_summary"]` | Which evidence kinds go into the archive |
 | `retain_days` | `30` | Archives older than this are deleted |
 | `max_bytes_per_repo` | `10 MiB` | When a repository's archives exceed this, the oldest are deleted first |
 
-Evidence kinds a user can add to `include`: `plans`, `reviews`, `transcripts`, `verify_logs`, `checkpoints`. A
+Evidence kinds accepted in `include`: `spec`, `final_review_summary`, `reviews`, `transcripts`,
+`checkpoint`, `review_slices`. The implement path does not write plans or verify logs to disk. A
 single run whose selected evidence exceeds `max_bytes_per_repo` keeps the spec and the final review summary,
 drops the rest, and records what it dropped.
 
