@@ -3,21 +3,23 @@ task-type: implement
 ---
 # ADR-0042 implementation: push-based custody, evidence retention, safe clone deletion
 
+Revision 2 (2026-10-15) folds spec-review round 1. The round-1 ledger is at the end.
+
 ## Description
 
 Implement [ADR-0042](../../adr/0042-push-based-custody-and-evidence-retention.md) (accepted 2026-10-15) for the
 `a2a-bridge implement` / `--resume` / `merge` path. Today `merge` deletes the implement clone unconditionally after
-a successful landing (`crates/bridge-controller/src/merge.rs:863`). That destroys the clone's original commit,
-which `merge` re-authors, and its run evidence, and it can destroy a stash, index-flag edits or a linked worktree
-(ADR-0041 §2 WRONG-1/2/3). After this work:
+a successful landing (`crates/bridge-controller/src/merge.rs:863`). That destroys the clone's original commit
+(which `merge` re-authors) and its run evidence, and it can destroy a stash, index-flag edits, side refs, submodule
+history or a linked worktree (ADR-0041 §2 WRONG-1/2/3). After this work:
 
-- the run's commit is pushed from the host to a configured remote at each stable point;
+- the run's commit is pushed from the host to a configured remote before each review and before merge;
 - a small, configurable evidence archive is written per run and pruned by age and size;
 - `merge` deletes a clone only when nothing in it would be lost.
 
-The work is three serial increments. **Each increment is its own `implement` run and PR, with a review cap of two
-rounds, declared now.** At the cap, apply the convergence rule (fold if converging, park and escalate if
-open-class). I2 builds on I1's merged code and I3 on I2's.
+The work is four serial increments: **I1a, I1b, I2, I3**. Each is its own `implement` run and PR, with a review
+cap of **two rounds, declared now**. At the cap, apply the convergence rule (fold if converging, park and escalate
+if open-class). Each increment builds on the previous one's merged code.
 
 ### Facts this spec relies on (verified at `main` `44950581`)
 
@@ -27,235 +29,324 @@ open-class). I2 builds on I1's merged code and I3 on I2's.
 - **Identifiers.** The run id is `task_id = impl-<pid>-<nonce8>` (`ctl/implement.rs:249`), the same value as
   `resume_id`. The branch is `implement/<task_id>`.
 - **Commits.** There is one commit per run:
-  - first `host_commit` (`bin/a2a-bridge/src/main.rs:3765`);
+  - first `host_commit` (`bin/a2a-bridge/src/main.rs:3765`), which commits only the **agent-staged** index;
   - then `host_amend_commit` after each fix (`ctl/tweak.rs:270`);
-  - `restore_branch` (`ctl/tweak.rs:284`) moves the branch back to an earlier known SHA;
-  - `NoCommitDirty` (`main.rs:3734–3761`) leaves uncommitted work and makes no commit.
-- **Checkpoint.** `CLONE/.git/a2a-bridge/implement-checkpoint.json`, written atomically (`ctl/implement_resume.rs:91–107`).
+  - `restore_branch` (`ctl/tweak.rs:284`) moves the branch back to a trusted SHA;
+  - `reset_worktree_to_head` (`ctl/implement.rs:547`) discards unstaged and untracked leftovers before every
+    verify, **by design**, so verify tests exactly the committed tree.
+- **Terminal arms.** The `Abort`, `NoCommitClean` and `NoCommitDirty` arms and an initial commit failure
+  (`main.rs:3734–3780`) write no checkpoint and bypass `write_terminal` (`main.rs:3285`).
+- **Checkpoint.** `CLONE/.git/a2a-bridge/implement-checkpoint.json`, written atomically
+  (`ctl/implement_resume.rs:91–107`). It sits inside the clone, so **the implement agent can read it**.
 - **Evidence today:**
   - the task spec is `CLONE/.git/A2A_TASK.md`;
-  - the impl agent's transcripts are under `CLONE/.git/a2a-bridge/codex-sessions/`;
+  - transcripts are under `CLONE/.git/a2a-bridge/codex-sessions/`;
   - review slices are under `.git/a2a-bridge/review-slices/`;
-  - **review verdict text is not persisted**: `run_review_step` returns `(outcome, synth)` (`main.rs:2513`, stderr at
-    2641–2646);
-  - verify logs and plans are not written to disk on the implement path.
-- **Merge locking.** `merge_clone` holds the run's operation lock through push and reap (`ctl/merge.rs:634, 673`).
-  A fresh `implement` loop does not hold it.
-- **Existing gates to reuse.** `storage reap --clones` (`bin/a2a-bridge/src/storage_reap_clones.rs`) already gates
-  deletion on:
-  - `ls-files -v` index flags (`:1149`, pure parser `:1669`);
-  - a ref sweep including `refs/stash` (`:1476–1501`);
-  - linked worktrees and clone shape.
+  - **review verdict text is not persisted**: `run_review_step` returns `(outcome, synth)`, `main.rs:2513`.
+- **Merge.** `merge_clone` holds the run's operation lock through landing and reap (`ctl/merge.rs:634, 673`). The
+  shared success arm covers both normal and already-integrated landings. Dirty clones are refused at preflight
+  with exit 1 (`ctl/merge.rs:747–749`).
+- **Existing gates to reuse.** These live in `bin/a2a-bridge/src/storage_reap_clones.rs`:
+  - the `ls-files -v` index-flag parser (`:1149`, `:1669`);
+  - the ref sweep over `refs/heads/*`, `refs/tags/*` and `refs/stash` (`refs_disposition`, `:1476–1501`);
+  - the submodule checks (`:1726–1779`).
 - **Tools available.**
-  - Platform state dir: `select_platform_history` (`crates/bridge-store/src/sqlite.rs:15499`). Order is
-    `A2A_BRIDGE_STATE_DIR`, then macOS `~/Library/Application Support/a2a-bridge`, then the XDG state dir.
+  - Platform state dir: `select_platform_history` (`crates/bridge-store/src/sqlite.rs:15499`).
   - `tar` and `flate2` are already dependencies of `bin/a2a-bridge`.
-- **CI triggers** only on pushes to `main` and `feat/**` (`.github/workflows/ci.yml`), so `wip/**` pushes start no CI.
+- **CI.** The push workflow runs only for `main` and `feat/**`, so pushing `wip/**` starts no CI. Updates to an open
+  PR targeting `main` still trigger CI.
 
-### Increment I1: config and push at stable points
+### Common rules for every Git transport call (push and ls-remote)
 
-1. **`[custody]` config section** in `bin/a2a-bridge/src/config.rs` (`deny_unknown_fields`, every key optional):
+These apply in I1a and I3.
+
+- **Host side only.** The host's git credentials are used. Agents and containers never receive any.
+- **The destination is resolved from the source repo, not the clone.**
+  1. Resolve it with `git -C <source_repo> remote get-url --push <remote>`.
+  2. A relative filesystem URL is resolved against the source repo's working directory, giving an absolute path.
+  3. The result is the **transport URL**. It is held in memory only and re-resolved whenever needed. It is never
+     written to the checkpoint, the archive or stderr.
+  4. What gets persisted and printed is the **destination identity**: the URL with any userinfo (user, password,
+     token) removed. Git diagnostics are redacted the same way before they are printed or stored.
+- **No redirection.**
+  - If the clone's effective config (`git -C <clone> config --get-regexp '^url\..*\.(insteadof|pushinsteadof)$'`,
+    case-insensitive) has any entry, the transport call is **refused**, because the agent can write the clone's
+    config.
+  - Every call passes these options:
+    - `-c push.recurseSubmodules=no`
+    - `--no-follow-tags`
+    - `-c core.hooksPath=/dev/null`
+    - `--no-verify`
+- **Bounded.**
+  - `GIT_TERMINAL_PROMPT=0`.
+  - `GIT_SSH_COMMAND` gets `-o BatchMode=yes` unless the user already set it.
+  - A deadline of `push_timeout_secs` applies to push and ls-remote alike. On expiry the child process group is
+    killed and reaped, and the call reports a timeout.
+
+### Increment I1a: config, push before review and merge, resume
+
+1. **`[custody]` config section** (`deny_unknown_fields`, every key optional):
    - `push` (bool, default `true`);
    - `remote` (string, default `"origin"`);
    - `ref_prefix` (string, default `"wip/"`);
    - `delete_remote_on_merge` (bool, default `false`; consumed in I3);
    - `push_timeout_secs` (u64, default `120`, must be ≥ 1).
 
-   `a2a-bridge validate` must reject invalid values: an empty `remote`, or a `ref_prefix` that fails
-   `git check-ref-format` once combined with a sample run id. Today `validate` never calls `to_config()` for
-   `[implement]`/`[merge]`; `[custody]` must be value-validated in `validate_config_contents`.
+   `a2a-bridge validate` checks values in `validate_config_contents`: it rejects an empty `remote`, and a
+   `ref_prefix` that fails `git check-ref-format` once combined with a sample run id.
 
-2. **Remote resolution.**
-   - `remote` names a remote **of the source repo**, not of the clone. Resolve it once per run with
-     `git -C <source_repo> remote get-url --push <remote>`.
-   - If the source has no such remote, push is **disabled for this run**. Print one warning and record the reason
-     in the checkpoint; the run itself does not fail.
-   - The resolved URL is recorded in the checkpoint.
-   - `--resume` re-resolves the URL and prints a warning if it changed.
+2. **Push points.** Push the clone's HEAD to `refs/heads/<ref_prefix><task_id>`:
+   - **before every review**, including the first review after `--resume`;
+   - **before merge lands**.
 
-3. **Push points.** Push the clone's current `HEAD` to `refs/heads/<ref_prefix><task_id>`:
-   - after the first `host_commit`;
-   - after every `host_amend_commit`;
-   - after `restore_branch`;
-   - before `merge` lands, only when the recorded last-pushed SHA differs from HEAD.
+   In both cases the push is skipped when the checkpoint already records a successful push of the same
+   `(destination identity, ref, HEAD)`. Every new commit or amend is reviewed next, so "before every review"
+   covers each one and also covers a crash between commit and push.
 
-4. **Push mechanics.**
-   - All push mechanics are host-side and use the host's git credentials. Agents and containers never receive any.
-   - Command: `git -C <clone> -c core.hooksPath=/dev/null push --no-verify --porcelain <url> <sha>:refs/heads/<ref>`
-     with `--force-with-lease=refs/heads/<ref>:<expected>`.
-     - `<expected>` is the checkpoint's last-pushed SHA, or empty for the first push, meaning the ref must not exist.
-     - This lets the run update its own branch after an amend but never overwrite someone else's branch.
-   - Environment: `GIT_TERMINAL_PROMPT=0`, plus `GIT_SSH_COMMAND` with `-o BatchMode=yes` unless the user already
-     set it. The push is killed after `push_timeout_secs`.
+3. **Lease and ownership.**
+   - Use `--force-with-lease=refs/heads/<ref>:<expected>` and `--porcelain`.
+   - `<expected>` is the SHA last pushed **to the same destination identity and ref**. A lease SHA is never reused
+     across a changed destination or ref.
+   - With no recorded successful push, `<expected>` is empty, meaning the ref must not exist. In that case only
+     porcelain proof that a **new ref was created** (`*` flag) counts as success.
+   - An "up to date" or existing ref is a **collision**, including when the foreign ref already equals HEAD. A
+     collision or a stale-lease refusal disables push for this run and is recorded.
 
-5. **Push failure is not fatal.**
-   - It prints a warning and records `{ref, url, last_pushed_sha, last_error}` in a new optional checkpoint field
-     `custody`. The field uses `#[serde(default)]` so older checkpoints still load.
-   - A stale-lease refusal (the ref exists with an unexpected SHA) disables push for the rest of the run and says so.
+4. **Checkpoint.** Add an optional `custody` field with `#[serde(default)]`, so older checkpoints load through the
+   real `--resume` and `merge` paths. It records:
+   - `destination` (the identity, never the transport URL);
+   - `normal: {ref, last_pushed_sha?}` and `dirty: {ref, last_pushed_sha?}`, as separate records;
+   - `disabled: Option<reason>`;
+   - `last_error` (redacted).
 
-6. **Uncommitted work.** On the `NoCommitDirty` arm, and at any terminal exit where `git status --porcelain` is
-   non-empty, write a WIP snapshot without touching the worktree, the index or the branch:
-   - Write a temporary index with `GIT_INDEX_FILE` and run `git add -A` into it. Ignored files are excluded.
-   - `write-tree`, then `commit-tree` with parent `HEAD` (or none if HEAD is unborn) and message `wip snapshot <task_id>`.
-   - Push it to `refs/heads/<ref_prefix><task_id>-dirty` with the same lease rules.
-   - Record the SHA in the checkpoint.
-   - Do not move `implement/<task_id>`. The existing dirty-refusal in `reconcile_head` is unchanged.
+   On `--resume` and `merge`, the current `[custody]` config wins. If the destination identity or ref differs from
+   the record, the old lease SHAs are discarded and the next push is treated as a first push.
 
-**I1 tests** use a bare repository on the local filesystem as the "remote", registered as `origin` in a fixture
-source repo:
-- the first commit is pushed, and the ref equals HEAD;
-- an amend force-updates the run's own ref;
-- a pre-existing foreign ref at the target name is not overwritten: lease refusal, push disabled, run continues;
-- a missing source remote disables push with one warning, and the run continues;
-- an unreachable URL (nonexistent path) fails within the timeout and does not fail the run;
-- the `NoCommitDirty` snapshot captures an untracked non-ignored file and excludes an ignored file, while the
-  worktree, index and branch are byte-for-byte unchanged;
-- an old checkpoint without `custody` still loads;
-- `validate` rejects `remote = ""` and a bad `ref_prefix`;
-- no push happens when `push = false`.
+5. **Push failure is not fatal.** Print a warning, record it, and continue the run.
+
+**I1a tests.** The "remote" is a bare repository on the local filesystem, registered in a fixture source repo.
+- the first review is preceded by a push, and the ref equals HEAD;
+- after an amend, the run's own ref is force-updated;
+- a pre-existing foreign ref is not overwritten, including **the equal-SHA case**; push is disabled and the run
+  continues;
+- **resume after a crash between commit and push** pushes before the next review;
+- a **source-relative URL** (`../backup.git`) reaches the source-relative repository, not a clone-relative one;
+- an `https://user:token@…` URL never appears in the checkpoint or on stderr;
+- a clone-local `url.*.pushInsteadOf` makes the push refuse;
+- with `push.recurseSubmodules=on-demand` and a tag present, no other ref or repository changes;
+- a **stalled transport**, for example a `GIT_SSH_COMMAND` that sleeps, times out within the deadline;
+- a missing source remote disables push with one warning;
+- `push = false` pushes nothing;
+- an old checkpoint resumes;
+- `validate` rejects the bad values.
+
+### Increment I1b: terminal finalizer and the dirty snapshot
+
+1. **Shared terminal finalizer.** It covers every handled terminal arm:
+   - Approved and LoopStopped (`write_terminal`);
+   - `Abort`, `NoCommitClean` and `NoCommitDirty`;
+   - an initial commit failure;
+   - a refused `--resume`.
+
+   Where no checkpoint exists, it writes a minimal **no-commit checkpoint** (task id, source repo, branch, base
+   commit, terminal phase, no current commit). I2 hooks the archive writer into this finalizer.
+
+   An uncatchable process death (SIGKILL, power loss) is out of scope. The next `--resume` or `merge` pushes, and
+   the I3 gate keeps the clone.
+
+2. **Dirty snapshot.** In the finalizer, when the custody status check (below) finds non-ignored changes, write a
+   snapshot without touching the worktree, the real index or any branch:
+   1. Copy the real index to a private temporary file, so it stays a valid index and tracked-but-ignored files stay
+      tracked.
+   2. With `GIT_INDEX_FILE` pointing at that copy, run `git add -A`.
+   3. `write-tree`.
+   4. `commit-tree` with parent HEAD (none if unborn), the pinned bot identity and pins from `pin_prefix_argv`
+      (`commit.gpgsign=false`, hooks off), and message `wip snapshot <task_id>`.
+   5. Push it to `refs/heads/<ref_prefix><task_id>-dirty` under the lease rules, recorded in `custody.dirty`.
+
+   The temporary index is removed on success and on failure.
+
+3. **Custody status check.** Used here and in I3:
+   `git -c core.untrackedCache=false status --porcelain=v1 --untracked-files=all --ignore-submodules=none`, run with
+   `GIT_OPTIONAL_LOCKS=0`. A plain `status --porcelain` can hide untracked files under
+   `status.showUntrackedFiles=no`.
+
+**Not changed (round-1 #8, deferred):** `reset_worktree_to_head` still discards agent work that was left unstaged
+before verify. That is existing, intended behavior, so verify tests exactly the committed tree. ADR-0042 protects
+commits and evidence, not agent scratch.
+
+**I1b tests:**
+- each terminal arm runs the finalizer;
+- a no-commit checkpoint is written for `NoCommitDirty`;
+- the snapshot captures an untracked non-ignored file and keeps a tracked-but-ignored file;
+- it excludes an ignored untracked file;
+- the worktree, the real index bytes and every branch are unchanged;
+- `status.showUntrackedFiles=no` does not hide an untracked file from the custody status check;
+- a snapshot push collision is recorded and is not fatal.
 
 ### Increment I2: evidence archive and retention
 
-1. **Persist review text.** After each review, write the review synthesis to
-   `CLONE/.git/a2a-bridge/reviews/review-<attempt>.md`, capped at 256 KiB and truncated with a marker. Record the
-   final attempt number in the checkpoint.
+1. **Persist review text.** After each completed review, write the synthesis to
+   `CLONE/.git/a2a-bridge/reviews/review-<attempt>-<invocation>.md`. `<invocation>` is a counter stored in the
+   checkpoint, so a resume never overwrites earlier reviews. Each file is capped at 256 KiB and truncated with a
+   marker. `final_review_summary` is the newest *completed* review. An interrupted review writes nothing.
 
 2. **`[evidence]` config section:**
 
    | Key | Default | Constraint |
    |---|---|---|
-   | `store` | `"local"` | the only accepted value today |
+   | `store` | `"local"` | the only accepted value |
    | `path` | `<platform state dir>/evidence` | absolute, if set |
-   | `include` | `["spec", "final_review_summary"]` | each kind from the closed vocabulary below |
+   | `include` | `["spec", "final_review_summary"]` | closed vocabulary below |
    | `retain_days` | `30` | ≥ 1 |
    | `max_bytes_per_repo` | `10485760` | ≥ 65536 |
 
-   - Extract the platform-dir logic from `select_platform_history` into a small shared helper rather than
-     duplicating it.
-   - Closed vocabulary for `include`. `validate` rejects anything else.
+   - Extract the platform-dir logic from `select_platform_history` into a shared helper.
+   - Closed vocabulary for `include`:
 
      | Kind | Source |
      |---|---|
      | `spec` | `A2A_TASK.md` |
-     | `final_review_summary` | the last `reviews/review-<n>.md` |
+     | `final_review_summary` | the newest completed review |
      | `reviews` | all `reviews/*.md` |
      | `transcripts` | `codex-sessions/**` |
-     | `checkpoint` | `implement-checkpoint.json` |
+     | `checkpoint` | the checkpoint |
      | `review_slices` | `review-slices/*.md` |
 
-   - **Amend ADR-0042 §2 in the same PR.** The ADR lists `plans` and `verify_logs`, but the implement path writes
-     neither to disk, so replace its list with this one.
+   - **Amend ADR-0042 §2** to this list. The ADR's `plans` and `verify_logs` are never written to disk on the
+     implement path.
 
-3. **Archive.** Write one `tar.gz` per run to
-   `<path>/<repo-key>/<task_id>.tar.gz`:
-   - `<repo-key>` is `<sanitized source basename>-<first 12 hex of SHA-256 of the canonical source path>`.
-   - The archive contains the included files plus a `manifest.json`:
-     - `schema: "a2a-evidence.v1"`, `task_id`, `source_repo`, `branch`, `final_commit`, `terminal_phase`, `created_at`
-       (RFC 3339 UTC);
+3. **Archive.**
+   - One `tar.gz` per run at `<path>/<repo-key>/<task_id>.tar.gz`.
+     - `<repo-key>` is `<sanitized source basename>-<first 12 hex of SHA-256 of the canonical source path>`.
+   - **The canonical destination must not be inside the run's clone**, including through symlink aliases. If it is,
+     no archive is written and a warning is printed; I3 then keeps the clone.
+   - The archive holds a `manifest.json` with:
+     - `schema: "a2a-evidence.v1"`, `task_id`, `source_repo`, `branch`;
+     - `final_commit` (or null), `terminal_phase`, `created_at` (RFC 3339 UTC);
      - `included: [{kind, path, bytes, sha256}]`, `dropped: [{kind, reason}]`.
-   - Write it to `<task_id>.tar.gz.tmp` in the same directory, then rename it into place.
-   - Write it when the run reaches a terminal phase (`write_terminal`, `main.rs:3285`), and rewrite it after a
-     successful landing, so `terminal_phase` reads `merged`.
-   - A missing optional source is dropped with reason `absent`. Archive failure prints a warning and never fails the run.
+   - Publication: write `.<task_id>.tar.gz.a2a-tmp`, fsync it, then rename it into place.
+   - **When it is written:**
+     - from the I1b finalizer;
+     - again after a successful landing, with `terminal_phase = merged`, through the post-landing hook (I3 §1).
+   - Failure prints a warning and never fails the run.
 
-4. **Oversize.** If one run's selected content exceeds `max_bytes_per_repo`:
-   - keep `spec` and `final_review_summary`;
-   - drop the other kinds in reverse vocabulary order until the archive fits, recording each as `dropped: over_cap`;
-   - if those two alone exceed the cap, write them anyway and warn.
+4. **Accounting and oversize.**
+   - **All sizes are stored `.tar.gz` byte lengths**, including the manifest.
+   - When one run's archive exceeds `max_bytes_per_repo`, drop the selected kinds other than `spec` and
+     `final_review_summary`, in reverse vocabulary order, until it fits. Record each as `dropped: over_cap`.
+   - Oversize handling never adds a kind that `include` excluded.
+   - If the protected kinds alone exceed the cap, write them anyway and warn.
 
-5. **Retention sweep.** Run it after each archive write, for that `<repo-key>` directory only:
-   1. Delete archives whose manifest `created_at` is older than `retain_days`.
-   2. Then delete oldest first (by `created_at`, ties by file name) until the directory total is ≤ `max_bytes_per_repo`.
-   3. Never delete the archive just written.
-
-   Only regular files named `impl-*.tar.gz` are considered. Symlinks are never followed, and unreadable or
-   unparseable archives are left in place and reported. A `*.tmp` older than 1 hour is removed.
+5. **Retention sweep.** Run it after each archive write, for that `<repo-key>` directory only.
+   - It runs while holding a per-directory lock: an exclusive `flock` on `<repo-key>/.lock`. The archive
+     publication takes the same lock, so concurrent runs serialize.
+   - **Owned files** are regular, non-symlink files whose names match `impl-*.tar.gz` and whose manifest parses with
+     schema `a2a-evidence.v1`. Every other entry is left untouched.
+   - **Stale temps:** only regular files matching `.impl-*.tar.gz.a2a-tmp` and older than 1 hour are removed.
+   - Order:
+     1. Delete owned archives whose `created_at` is older than `retain_days`.
+     2. Delete owned archives oldest first (ties by name) until the owned total is ≤ `max_bytes_per_repo`.
+   - The archive just written is never deleted. Excess that can't be removed is reported.
 
 **I2 tests:**
-- default `include` produces exactly the spec and summary, with a correct manifest and digests;
-- each vocabulary kind is included when configured;
-- an unknown kind is rejected by `validate`;
-- oversize drops in the specified order, and spec and summary are kept even when over the cap;
-- the age sweep deletes an old archive and keeps a fresh one;
-- the size sweep deletes oldest first, never the current archive;
-- a symlink and a foreign file in the directory are untouched;
-- the rewrite at merge sets `terminal_phase = merged`;
-- an archive failure (read-only directory) does not fail the run;
-- review text is truncated at 256 KiB with the marker.
+- **content:** the default `include` produces exactly the spec and summary, with a correct manifest and digests;
+- **kinds:** every vocabulary kind can be included; `validate` rejects an unknown kind;
+- **review files:** reviews from a resumed run don't overwrite earlier ones, and an interrupted review is not chosen
+  as the summary;
+- **oversize:**
+  - the drop order holds, measured in compressed bytes;
+  - excluded kinds are never added back;
+  - the protected kinds are kept even when over the cap;
+- **sweep:**
+  - age, then size, and the current archive is never deleted;
+  - a foreign `notes.tmp`, a symlink, and an unparseable `impl-x.tar.gz` are left untouched;
+  - two concurrent writers serialize;
+- **destination and failure:**
+  - a `path` inside the clone writes no archive;
+  - the rewrite after merge sets `merged`;
+  - an archive failure doesn't fail the run.
 
-### Increment I3: safe deletion in `merge`
+### Increment I3: post-landing hook and safe deletion in `merge`
 
-Replace the unconditional `reap_clone` call at `ctl/merge.rs:863` with a gate evaluated **while the operation lock
-is still held**. Delete only if every check passes; otherwise keep the clone and print each failed check with the
-clone path. **The exit code is unchanged.** A kept clone is not a merge failure.
+1. **Post-landing interface.**
+   - `merge_clone` takes a host-supplied hook, invoked after a successful landing (normal or already-integrated)
+     and before the gate, **while the operation lock is still held**.
+   - The binary's hook pushes HEAD if it isn't recorded as pushed (I1a) and rewrites the archive with `merged` (I2).
+   - All merge entry paths pass it: standalone `merge`, fresh `implement --merge` and resumed `--merge`.
 
-1. **On remote.** `[custody].push` is true, and `git ls-remote <url> refs/heads/<ref_prefix><task_id>` returns
-   exactly the clone's HEAD SHA. Use the URL resolved for this run. Local tracking refs never satisfy this check.
-   When `push = false`, this check fails with reason "push disabled", so clones are kept.
-2. **Clean.** `git status --porcelain` is empty, which includes untracked non-ignored files. Ignored files are
-   allowed.
-3. **Evidence.** The run's archive exists and its manifest `task_id` matches.
-4. **Nothing unbacked.** All of these must hold:
-   - no `refs/stash`;
-   - no assume-unchanged, skip-worktree or sparse entries;
-   - no in-progress operation: no `MERGE_HEAD`, `CHERRY_PICK_HEAD`, `REVERT_HEAD`, `rebase-merge/`, `rebase-apply/`
-     or `sequencer/` under the clone's git dir;
-   - no registered linked worktree: `git worktree list --porcelain` has exactly one entry.
+2. **Deletion gate.** It replaces the unconditional `reap_clone`. Delete only if every check passes; otherwise keep
+   the clone and print each failed check with the clone path. **Exit codes are unchanged**: a clone kept after a
+   successful landing exits 0, and preflight refusals stay exit 1.
 
-   **Reuse the existing parsers** from `storage_reap_clones.rs` for the stash and index-flag checks. Move them into
-   a shared module if needed rather than copying them.
+   | # | Check | Passes when |
+   |---|---|---|
+   | 1 | On remote | `[custody].push` is true and `ls-remote` (common transport rules) shows `refs/heads/<ref_prefix><task_id>` at exactly HEAD. With `push = false` the reason is "push disabled". |
+   | 2 | Clean | The custody status check (I1b §3) is empty. Ignored files are allowed. |
+   | 3 | Evidence | The archive exists outside the clone, is fully readable, and its manifest has the expected schema, `task_id`, `source_repo`, `final_commit` = HEAD and `terminal_phase = merged`. Every listed file matches its recorded size and SHA-256. |
+   | 4 | Refs covered | Every `refs/heads/*` and `refs/tags/*` tip is HEAD, an ancestor of HEAD, or contained in the source repo, using the existing `refs_disposition`. There is no `refs/stash`. |
+   | 5 | Nothing unbacked | No assume-unchanged, skip-worktree or sparse entries (existing `ls-files -v` parser). No in-progress `MERGE_HEAD`, `CHERRY_PICK_HEAD`, `REVERT_HEAD`, `rebase-merge/`, `rebase-apply/` or `sequencer/`. No initialized submodule or `.git/modules` (existing submodule checks). No linked worktree: `git worktree list --porcelain` has one entry. |
 
-After a successful delete, if `delete_remote_on_merge = true`, delete the remote run branch with a leased push
-(`--force-with-lease=refs/heads/<ref>:<HEAD>`). A failure there is a warning only.
+   Reuse the `storage_reap_clones.rs` helpers by moving them into a shared module, not by copying them.
 
-**I3 tests** cover:
-- each check failing alone keeps the clone (8 cases):
-  - remote ref absent;
-  - remote ref at a different SHA;
-  - push disabled;
-  - dirty;
-  - archive missing;
-  - stash;
-  - skip-worktree;
-  - linked worktree;
-- an in-progress `MERGE_HEAD` keeps the clone;
+3. **Remote cleanup.** After a successful delete, if `delete_remote_on_merge = true`, delete the run's remote refs
+   with a leased push. A failure there is a warning only.
+
+**I3 tests.** Each case keeps the clone and exits 0:
+- remote ref absent;
+- remote ref at a different SHA;
+- push disabled;
+- an `ls-remote` timeout with a stalled transport (the operation lock is released afterwards);
+- dirtiness introduced **after preflight**, by a test seam;
+- archive missing;
+- archive digest mismatch;
+- archive inside the clone;
+- an unpushed side branch;
+- a unique tag;
+- a stash;
+- a skip-worktree entry;
+- `MERGE_HEAD`;
+- an initialized submodule;
+- a linked worktree.
+
+Beyond the keep cases:
 - all checks passing deletes the clone;
-- `delete_remote_on_merge` removes the remote ref only after a delete;
-- the already-integrated success path uses the same gate;
-- exit codes are unchanged in every case.
+- the already-integrated path uses the same hook and gate;
+- `delete_remote_on_merge` removes remote refs only after a delete;
+- an initially dirty clone still exits 1 at preflight.
 
-**Before the change, the same tests show the old behavior:** the clone is deleted despite a stash, a skip-worktree
-entry, or a linked worktree. State this result in the PR.
+**Before the change, the same tests show the old behavior:** the clone is deleted with a stash, a skip-worktree
+entry, a side branch or a linked worktree. State this result in the PR.
 
 ### Out of scope
 
-- `storage reap --clones` stays on its existing gates; adopting the ADR-0042 check 1 there is a follow-up.
+- `storage reap --clones` stays on its existing gates; adopting check 1 there is a follow-up.
 - Remote evidence stores.
-- Reflog-only and unreachable objects, stashes, in-progress state, and per-clone config and hooks (ADR-0042
-  Context).
+- Reflog-only and unreachable objects, stash contents, in-progress state contents, and per-clone config and hooks
+  (ADR-0042 Context). I3 keeps clones that have them; it does not preserve them.
+- Agent work left unstaged before verify (round-1 #8).
 - `run-workflow` artifacts.
 - Removing the parked ADR-0041 code.
 
 ## Acceptance Criteria
 
-- I1, I2 and I3 each merged as separate PRs, each with its tests above passing.
+- I1a, I1b, I2 and I3 each merged as separate PRs, each with its tests above passing.
 - **Local verify per owner rule:** `cargo fmt --check`, `cargo clippy` with `-D warnings`, and tests for the touched
-  crates only, with `CARGO_INCREMENTAL=0`. The full workspace suite runs in CI. Each PR states the local scope and
-  the CI result.
-- No agent or container receives git credentials. No push goes anywhere except `[custody].remote`'s resolved URL
-  and the existing local-path landing push.
+  crates only, with `CARGO_INCREMENTAL=0`. The full suite runs in CI. Each PR states the local scope and the CI
+  result.
+- No agent or container receives git credentials. No transport URL with credentials is persisted or printed.
+- No push goes anywhere except the resolved `[custody].remote` destination and the existing local-path landing push.
 - ADR-0042 §2's evidence-kind list matches the implemented vocabulary (I2).
 - `AGENTS.md` §3 and `docs/onboarding.md` describe `[custody]`, `[evidence]` and the kept-clone messages (I3).
 
 ## Files
 
-- I1: `bin/a2a-bridge/src/config.rs`, `bin/a2a-bridge/src/main.rs` (implement/resume/merge wiring),
-  `crates/bridge-controller/src/implement.rs`, `ctl/implement_resume.rs` (checkpoint field), new
-  `crates/bridge-controller/src/custody_push.rs`.
-- I2: `bin/a2a-bridge/src/main.rs` (review persistence, terminal hook), new `bin/a2a-bridge/src/evidence.rs`,
-  `config.rs`, the shared platform-dir helper, `docs/adr/0042-…md`.
-- I3: `crates/bridge-controller/src/merge.rs`, the shared stash and index-flag parsers out of
-  `bin/a2a-bridge/src/storage_reap_clones.rs`, `AGENTS.md`, `docs/onboarding.md`.
+| Increment | Files |
+|---|---|
+| I1a | `bin/a2a-bridge/src/config.rs`, `bin/a2a-bridge/src/main.rs` (review and resume wiring), `ctl/implement_resume.rs` (checkpoint field), new `crates/bridge-controller/src/custody_push.rs` (transport rules, push, ls-remote, redaction) |
+| I1b | `bin/a2a-bridge/src/main.rs` (terminal arms), `ctl/tweak.rs` / `ctl/implement.rs` (finalizer seam), `custody_push.rs` (snapshot) |
+| I2 | `bin/a2a-bridge/src/main.rs` (review persistence), new `bin/a2a-bridge/src/evidence.rs`, `config.rs`, shared platform-dir helper, `docs/adr/0042-…md` |
+| I3 | `crates/bridge-controller/src/merge.rs` (hook and gate), the shared module for the `storage_reap_clones.rs` helpers, `bin/a2a-bridge/src/main.rs` (hook wiring), `AGENTS.md`, `docs/onboarding.md` |
 
 ## Spec Refs
 
@@ -267,4 +358,33 @@ entry, or a linked worktree. State this result in the PR.
 
 ## Commit Message
 
-Per increment, for example: `feat(custody): push run branch at stable points (ADR-0042 I1)`.
+Per increment, for example: `feat(custody): push run branch before review and merge (ADR-0042 I1a)`.
+
+## Spec-review ledger
+
+**Round 1 (gpt-6.1-sol, high): REJECT.** Numbering follows the first findings list in the review output. All findings folded except #8.
+
+| # | Finding | Disposition |
+|---|---|---|
+| 1 | Side branch or tag lost | Folded: I3 check 4 |
+| 2 | Submodule history lost | Folded: I3 check 5 |
+| 3 | `showUntrackedFiles=no` hides untracked files | Folded: I1b §3 |
+| 4 | Archive inside the clone | Folded: I2 §3 and I3 check 3 |
+| 5 | `*.tmp` sweep catches foreign files | Folded: I2 §5 |
+| 6 | Token in the checkpoint | Folded: common transport rules |
+| 7 | Submodule push and URL rewrite | Folded: common transport rules |
+| 8 | Agent work left unstaged and discarded | **Deferred**: existing design, outside ADR-0042 |
+| 9 | Equal-SHA first push | Folded: I1a §3 |
+| 10 | Relative URL | Folded: common transport rules |
+| 11 | Resume skips a push | Folded: I1a §2 |
+| 12 | Terminal arms skip the archive | Folded: I1b §1 |
+| 13 | CI claim | Fixed in Facts |
+| 14 | Checkpoint contract | Folded: I1a §4 |
+| 15 | Temporary index | Folded: I1b §2 |
+| 16 | Timeouts | Folded: common transport rules |
+| 17 | Hook and ordering | Folded: I3 §1 |
+| 18 | Archive acceptance | Folded: I3 check 3 |
+| 19 | Accounting | Folded: I2 §4 |
+| 20 | Concurrent sweep | Folded: I2 §5 |
+| 21 | Review identity | Folded: I2 §1 |
+| 22 | Test precision | Folded: I3 tests |
