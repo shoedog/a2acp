@@ -130,6 +130,27 @@ that exact target commit; conflict or non-ancestor history refuses with the clon
 one clone-local operation lock. **Caveat:** a source repo with
 `receive.denyCurrentBranch=updateInstead`/`ignore` is out of scope (the default `refuse` is the no-touch backstop).
 
+**Custody, evidence, and clone retention (ADR-0042).** `[custody]` defaults to `push = true`,
+`remote = "origin"`, `ref_prefix = "wip/"`, `push_timeout_secs = 120`, and
+`delete_remote_on_merge = false`. Host-only transport resolves the source repository's push remote;
+credentials never enter the implementation container. The run branch is pushed before review/merge and
+checked again after landing. `[evidence]` defaults to local archives in the platform state directory,
+including `spec` and `final_review_summary`, retained for 30 days with a 10 MiB per-repository cap.
+Use an absolute `path` outside the clone to override the evidence destination.
+
+After landing, merge rewrites the archive with phase `merged` under the operation lock. It deletes the
+clone only when config admission, exact remote HEAD, clean custody status, archive integrity, refs, and
+repository shape all pass. A failed check prints `merge: landed; check N: <reason>; clone kept at <path>`;
+`push = false` reports `push disabled`. Landing still exits 0 when the clone is kept. Inspect the given
+path and resolve the reported state before another cleanup attempt. Initially dirty clones remain a
+preflight refusal (exit 1). Remote refs are deleted with leases only after clone deletion and only when
+`delete_remote_on_merge = true`; cleanup failure is a warning.
+
+`[implement] clone_config_guard = true` is the default; `clone_config_extra_keys` admits exact additional
+keys. Disabling the guard allows clone configuration to execute commands on the host and prints a warning.
+See [onboarding](docs/onboarding.md#clone-config-guard). `storage reap --clones` retains its own gates;
+adopting the remote-custody check there is a follow-up.
+
 **Parallel implementor flight (ADR-0040).** Freeze one base SHA, write independently testable task specs, and
 assign every changed path/seam to one implementor; reserve shared manifests, roadmaps, generated files, and
 cross-cutting cleanup for an integration task. Start all siblings with the same `--base-ref <sha>` and one shared

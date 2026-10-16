@@ -29,3 +29,5 @@ pub use merge::{MergeConfig, OperatorIdent};
 pub use verify::VerifyConfig;
 
 pub mod evidence;
+
+pub mod clone_deletion;

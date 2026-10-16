@@ -388,6 +388,53 @@ and prints one warning per invocation: an agent can use the clone's Git config t
 host. Resume and merge use the setting in the config passed to that command. Explicit repository paths
 and `core.fsmonitor=false` remain enabled with the opt-out.
 
+### Custody, evidence, and kept clones
+
+The host backs up implement commits before review and merge. Transport uses the source repository's
+push remote in an isolated scratch repository, with a bounded deadline and leases; clone-local remote
+configuration and credentials are never used for that transport.
+
+```toml
+[custody]
+push = true
+remote = "origin"
+ref_prefix = "wip/"
+push_timeout_secs = 120
+delete_remote_on_merge = false
+
+[evidence]
+store = "local"
+# path = "/absolute/operator-owned/evidence" # default: platform state directory / evidence
+include = ["spec", "final_review_summary"]
+retain_days = 30
+max_bytes_per_repo = 10485760
+```
+
+Other evidence kinds are `reviews`, `transcripts`, `checkpoint`, and `review_slices`. Archives contain a
+manifest with file sizes and SHA-256 digests; permitted drops are `not_produced`, `absent`, and `over_cap`.
+Archive publication is best effort. Choose a destination outside the clone, including through symlinks.
+
+After normal or already-integrated landing, the host checks the push record and rewrites the archive
+with phase `merged`, while retaining the run operation lock. Merge deletes a clone only when all six
+checks pass: config admission, remote run ref at exactly HEAD, clean custody status, readable external
+evidence with matching identity and digests, the refs allowlist, and the repository shape allowlist.
+Other branches and tags must have their exact objects retained by source refs (commit ancestry counts).
+Stashes, notes, unknown ref namespaces, index flags, gitlinks, nested repositories (even ignored ones),
+in-progress Git operations, and linked-worktree metadata keep the clone. Ordinary ignored cache files
+are allowed.
+
+A kept clone after landing prints each failed check and its path, for example:
+
+```text
+merge: landed; check 1: push disabled; clone kept at /path/to/impl-123-abcd
+```
+
+Landing still exits 0; inspect that clone before attempting cleanup. A clone dirty at initial preflight
+continues to exit 1. With `delete_remote_on_merge = true`, leased deletion of the normal and dirty run
+refs happens only after the clone was removed; failure is a warning and does not undo landing.
+`storage reap --clones` keeps its independent gates; adding the remote-custody check there is a follow-up.
+The `[implement] clone_config_guard` policy described above applies to merge and its gate too.
+
 ### Parallel implementation flights
 
 To keep several implementors in flight against one repo, freeze one base SHA and partition the work before
