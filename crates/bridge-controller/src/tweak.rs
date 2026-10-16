@@ -58,6 +58,9 @@ pub fn fix_step(action: &crate::implement::Action) -> FixDisposition {
 }
 
 pub fn classify(attempt: u32, max_attempts: u32, v: &VerifyOutcome, r: &ReviewOutcome) -> LoopStep {
+    if let ReviewOutcome::Refused(reason) = r {
+        return LoopStep::Stop(StopReason::StepError(reason.clone()));
+    }
     let verify_ok = match v {
         VerifyOutcome::Ran(verdict) => verdict.passed,
         VerifyOutcome::NotConfigured => true,
@@ -67,7 +70,10 @@ pub fn classify(attempt: u32, max_attempts: u32, v: &VerifyOutcome, r: &ReviewOu
     let review_ok = match r {
         ReviewOutcome::Ran { verdict, .. } => matches!(verdict, Verdict::Approve),
         ReviewOutcome::NotConfigured => true,
-        ReviewOutcome::ConfigError | ReviewOutcome::NotLoaded | ReviewOutcome::Incomplete => false,
+        ReviewOutcome::ConfigError
+        | ReviewOutcome::NotLoaded
+        | ReviewOutcome::Incomplete
+        | ReviewOutcome::Refused(_) => false,
     };
     if verify_ok && review_ok {
         return LoopStep::Stop(StopReason::Success);
@@ -147,7 +153,12 @@ pub fn loop_outcome_suffix(rep: &LoopReport) -> String {
 /// The injected workflow effects (verify/review/fix). Production wires `ProdEffects` (executor-backed); tests
 /// wire a scripted fake — so the loop's no-work-loss wiring is unit-tested without a real executor.
 #[async_trait::async_trait]
-pub trait TweakEffects {
+pub trait TweakEffects: Send {
+    /// Production must freeze all clone writers before the loop executes host Git.
+    async fn acquire_host_custody(&mut self) -> Result<(), String> {
+        Err("implement: writer custody unsupported; stopping before host git".into())
+    }
+
     async fn verify(&mut self, attempt: u32) -> VerifyOutcome;
     async fn review(
         &mut self,
@@ -171,6 +182,17 @@ pub struct NoopCheckpointSink;
 
 impl CheckpointSink for NoopCheckpointSink {
     fn record(&mut self, _attempt: u32, _sha: &str) {}
+}
+
+async fn acquire_clone_host_custody(
+    clone: &std::path::Path,
+    eff: &mut dyn TweakEffects,
+) -> Result<(), String> {
+    if crate::clone_config::policy_for(clone).enabled {
+        eff.acquire_host_custody().await
+    } else {
+        Ok(())
+    }
 }
 
 /// The bounded review→tweak loop. Git ops run on a REAL clone; the workflow effects are injected via `eff`
@@ -197,6 +219,12 @@ pub async fn run_tweak_loop(
     let mut last_verify = VerifyOutcome::Incomplete;
     let mut last_review = ReviewOutcome::Incomplete;
     let report = loop {
+        if let Err(e) = acquire_clone_host_custody(clone, eff).await {
+            break LoopReport {
+                attempts: attempt,
+                stop_reason: StopReason::StepError(e),
+            };
+        }
         // Verify the COMMITTED tree (discard the agent's unstaged scratch first).
         if let Err(e) = implement::reset_worktree_to_head(clone) {
             break LoopReport {
@@ -205,6 +233,12 @@ pub async fn run_tweak_loop(
             };
         }
         last_verify = eff.verify(attempt).await;
+        if let Err(e) = implement::guard_clone(clone) {
+            break LoopReport {
+                attempts: attempt,
+                stop_reason: StopReason::StepError(e),
+            };
+        }
         let (rev, synth) = eff.review(attempt, &sha, &last_verify).await;
         last_review = rev;
         match classify(attempt, max_attempts, &last_verify, &last_review) {
@@ -247,6 +281,12 @@ pub async fn run_tweak_loop(
                     break LoopReport {
                         attempts: attempt,
                         stop_reason: StopReason::FixIncomplete,
+                    };
+                }
+                if let Err(e) = acquire_clone_host_custody(clone, eff).await {
+                    break LoopReport {
+                        attempts: attempt,
+                        stop_reason: StopReason::StepError(e),
                     };
                 }
                 let guard = implement::head_guard(clone, branch, &pre_i);
@@ -541,6 +581,7 @@ mod tests {
         SelfCommit(&'static str),
         SwitchCommit(&'static str),
         Incomplete,
+        PoisonConfig,
     }
 
     struct Fake {
@@ -555,6 +596,9 @@ mod tests {
 
     #[async_trait::async_trait]
     impl TweakEffects for Fake {
+        async fn acquire_host_custody(&mut self) -> Result<(), String> {
+            Ok(())
+        }
         async fn verify(&mut self, attempt: u32) -> VerifyOutcome {
             at(&self.verify, attempt)
         }
@@ -587,6 +631,10 @@ mod tests {
                     git(&self.clone, &["commit", "-q", "-m", "rogue"]);
                     true
                 }
+                FixAct::PoisonConfig => {
+                    git(&self.clone, &["config", "core.fsmonitor", "secret-command"]);
+                    true
+                }
                 FixAct::Incomplete => false,
             }
         }
@@ -596,6 +644,173 @@ mod tests {
         let o = implement::run_git(Some(p), &["rev-list", "--count", &format!("{base}..HEAD")])
             .unwrap();
         String::from_utf8_lossy(&o.stdout).trim().parse().unwrap()
+    }
+
+    struct RefusingCustody;
+    #[async_trait::async_trait]
+    impl TweakEffects for RefusingCustody {
+        async fn acquire_host_custody(&mut self) -> Result<(), String> {
+            Err("freeze failed".into())
+        }
+        async fn verify(&mut self, _: u32) -> VerifyOutcome {
+            panic!("verify after refused custody")
+        }
+        async fn review(&mut self, _: u32, _: &str, _: &VerifyOutcome) -> (ReviewOutcome, String) {
+            panic!("review after refused custody")
+        }
+        async fn fix(&mut self, _: u32, _: &str) -> bool {
+            panic!("fix after refused custody")
+        }
+    }
+
+    #[tokio::test]
+    async fn refused_writer_custody_stops_before_host_git_and_keeps_clone() {
+        let (_g, p, _, sha) = loop_repo();
+        std::fs::write(p.join("A.md"), "keep unstaged change").unwrap();
+        let result = run_tweak_loop(
+            &p,
+            "implement/x",
+            "task",
+            sha,
+            "feat",
+            1,
+            3,
+            true,
+            &mut RefusingCustody,
+            &mut NoopCheckpointSink,
+        )
+        .await;
+        assert_eq!(
+            result.report.stop_reason,
+            StopReason::StepError("freeze failed".into())
+        );
+        assert_eq!(
+            std::fs::read_to_string(p.join("A.md")).unwrap(),
+            "keep unstaged change"
+        );
+    }
+
+    struct OptOutEffects;
+    #[async_trait::async_trait]
+    impl TweakEffects for OptOutEffects {
+        async fn acquire_host_custody(&mut self) -> Result<(), String> {
+            panic!("opt-out must skip loop custody");
+        }
+        async fn verify(&mut self, _: u32) -> VerifyOutcome {
+            ran_pass()
+        }
+        async fn review(&mut self, _: u32, _: &str, _: &VerifyOutcome) -> (ReviewOutcome, String) {
+            (rev(Verdict::Approve, 0), String::new())
+        }
+        async fn fix(&mut self, _: u32, _: &str) -> bool {
+            panic!("unexpected fix")
+        }
+    }
+
+    #[tokio::test]
+    async fn clone_config_opt_out_skips_loop_custody_and_admits_extra_config() {
+        let (_guard, clone, _, sha) = loop_repo();
+        git(&clone, &["config", "core.autocrlf", "false"]);
+        let _policy = crate::clone_config::ClonePolicyScope::install(
+            &clone,
+            crate::clone_config::CloneConfigPolicy {
+                enabled: false,
+                extra_keys: vec![],
+            },
+        )
+        .unwrap();
+        let result = run_tweak_loop(
+            &clone,
+            "implement/x",
+            "task",
+            sha,
+            "feat",
+            1,
+            3,
+            false,
+            &mut OptOutEffects,
+            &mut NoopCheckpointSink,
+        )
+        .await;
+        assert_eq!(result.report.stop_reason, StopReason::Success);
+    }
+
+    struct PoisonDuringVerify(PathBuf);
+    #[async_trait::async_trait]
+    impl TweakEffects for PoisonDuringVerify {
+        async fn acquire_host_custody(&mut self) -> Result<(), String> {
+            Ok(())
+        }
+        async fn verify(&mut self, _: u32) -> VerifyOutcome {
+            git(&self.0, &["config", "include.path", "secret-value"]);
+            ran_pass()
+        }
+        async fn review(&mut self, _: u32, _: &str, _: &VerifyOutcome) -> (ReviewOutcome, String) {
+            panic!("inadmissible config must stop before review")
+        }
+        async fn fix(&mut self, _: u32, _: &str) -> bool {
+            panic!("inadmissible config must stop before fix")
+        }
+    }
+
+    #[tokio::test]
+    async fn verify_poisoning_stops_before_review_and_cannot_approve() {
+        let (_g, p, _, sha) = loop_repo();
+        let result = run_tweak_loop(
+            &p,
+            "implement/x",
+            "task",
+            sha,
+            "feat",
+            1,
+            3,
+            true,
+            &mut PoisonDuringVerify(p.clone()),
+            &mut NoopCheckpointSink,
+        )
+        .await;
+        assert!(
+            matches!(result.report.stop_reason, StopReason::StepError(ref e) if e.contains("include.path"))
+        );
+        assert_ne!(result.report.stop_reason, StopReason::Success);
+        assert!(p.join(".git/config").exists());
+        assert_eq!(
+            classify(
+                1,
+                3,
+                &ran_fail(),
+                &ReviewOutcome::Refused("admission".into())
+            ),
+            LoopStep::Stop(StopReason::StepError("admission".into()))
+        );
+    }
+
+    #[tokio::test]
+    async fn loop_stops_and_keeps_clone_after_fix_poisoned_config() {
+        let (_g, p, _base, sha0) = loop_repo();
+        let mut fake = Fake {
+            clone: p.clone(),
+            verify: vec![ran_pass()],
+            review: vec![rev(Verdict::Reject, 0)],
+            fixes: vec![FixAct::PoisonConfig],
+        };
+        let f = run_tweak_loop(
+            &p,
+            "implement/x",
+            "task",
+            sha0,
+            "feat",
+            1,
+            3,
+            true,
+            &mut fake,
+            &mut NoopCheckpointSink,
+        )
+        .await;
+        assert!(matches!(f.report.stop_reason, StopReason::StepError(ref e)
+            if e.contains("clone config not allowed") && !e.contains("secret-command")));
+        assert_eq!(f.report.attempts, 1);
+        assert!(p.join(".git/config").is_file());
     }
 
     #[tokio::test]

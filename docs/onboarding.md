@@ -373,6 +373,21 @@ Auto-selected from `git diff --numstat` each attempt; override with
 `a2a-bridge implement … --depth auto|light|standard|thorough`. A forced depth is
 stored in the resume checkpoint (and `--depth` on `--resume` overrides it).
 
+### Clone config guard
+
+Host Git in an implementation clone uses an explicit `.git` directory and worktree, with
+`core.fsmonitor=false`. By default, `[implement] clone_config_guard = true` also requires an allowlisted
+clone config and pauses the warm writer during host Git. Resume recovers orphans and confirms container
+absence before inspecting HEAD; merge confirms absence without reaping. Keep the run's container runtimes
+configured and available for these entry checks.
+
+Use `clone_config_extra_keys = ["core.autocrlf"]` under `[implement]` to admit additional exact keys
+(case-insensitive; empty keys and subsection wildcard forms are rejected). Setting
+`clone_config_guard = false` skips config admission, writer pause custody, and container entry checks,
+and prints one warning per invocation: an agent can use the clone's Git config to run commands on the
+host. Resume and merge use the setting in the config passed to that command. Explicit repository paths
+and `core.fsmonitor=false` remain enabled with the opt-out.
+
 ### Parallel implementation flights
 
 To keep several implementors in flight against one repo, freeze one base SHA and partition the work before

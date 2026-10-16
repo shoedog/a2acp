@@ -38,6 +38,10 @@ pub async fn drain_turn(mut stream: bridge_core::ports::BackendStream) -> TurnOu
 
 #[async_trait::async_trait]
 pub trait TurnRunner: Send + Sync {
+    async fn acquire_host_custody(&self) -> Result<(), String> {
+        Err("implement: writer custody unsupported; stopping before host git".into())
+    }
+
     async fn run_turn(
         &self,
         session: &bridge_core::ids::SessionId,
