@@ -3,7 +3,7 @@ task-type: implement
 ---
 # ADR-0042 implementation: push-based custody, evidence retention, safe clone deletion
 
-Revision 2 (2026-10-15) folds spec-review round 1. The round-1 ledger is at the end.
+Revision 3 (2026-10-15) folds spec-review rounds 1 and 2. Rev 3 replaces the I3 hazard list with an allowlist (owner-approved) and runs transport from a scratch repository. The ledger is at the end.
 
 ## Description
 
@@ -68,15 +68,24 @@ These apply in I1a and I3.
      written to the checkpoint, the archive or stderr.
   4. What gets persisted and printed is the **destination identity**: the URL with any userinfo (user, password,
      token) removed. Git diagnostics are redacted the same way before they are printed or stored.
-- **No redirection.**
-  - If the clone's effective config (`git -C <clone> config --get-regexp '^url\..*\.(insteadof|pushinsteadof)$'`,
-    case-insensitive) has any entry, the transport call is **refused**, because the agent can write the clone's
-    config.
-  - Every call passes these options:
-    - `-c push.recurseSubmodules=no`
-    - `--no-follow-tags`
-    - `-c core.hooksPath=/dev/null`
-    - `--no-verify`
+  5. Leases are bound to a separate **destination fingerprint**: the SHA-256 of the complete resolved transport
+     URL, userinfo included, stored as hex. Two URLs that differ only in username are different destinations.
+  6. **A filesystem destination must not be inside the clone.** If the canonical destination path, after
+     resolving symlinks, is the clone or anything under it, the transport call is refused. If the path can't be
+     resolved, the call is also refused. A refusal disables push and keeps the clone.
+- **The clone's config is never read during transport.**
+  - The agent can write the clone's `.git/config`, including `credential.helper`, `url.*.insteadOf` and
+    `include.path`. So push and ls-remote never run inside the clone.
+  - Instead, each call runs in a **scratch bare repository**: a fresh `git init --bare` in a private temporary
+    directory. It has an empty repository config, and its `objects/info/alternates` points at the clone's object
+    directory. Push sends `<sha>:refs/heads/<ref>` from there, so the needed objects are reachable.
+  - Only the host's global and system git config apply, which is where the user's credential helper normally
+    lives. The scratch repository is removed after the call, whether it succeeded or failed.
+- **Options.**
+  - Both push and ls-remote get `-c core.hooksPath=/dev/null`, `-c push.recurseSubmodules=no` and
+    `-c core.fsmonitor=false`.
+  - Push additionally gets `--no-verify`, `--no-follow-tags` and `--porcelain`. `ls-remote` takes none of these
+    flags.
 - **Bounded.**
   - `GIT_TERMINAL_PROMPT=0`.
   - `GIT_SSH_COMMAND` gets `-o BatchMode=yes` unless the user already set it.
@@ -100,13 +109,13 @@ These apply in I1a and I3.
    - **before merge lands**.
 
    In both cases the push is skipped when the checkpoint already records a successful push of the same
-   `(destination identity, ref, HEAD)`. Every new commit or amend is reviewed next, so "before every review"
+   `(destination fingerprint, ref, HEAD)`. Every new commit or amend is reviewed next, so "before every review"
    covers each one and also covers a crash between commit and push.
 
 3. **Lease and ownership.**
    - Use `--force-with-lease=refs/heads/<ref>:<expected>` and `--porcelain`.
-   - `<expected>` is the SHA last pushed **to the same destination identity and ref**. A lease SHA is never reused
-     across a changed destination or ref.
+   - `<expected>` is the SHA last pushed **to the same destination fingerprint and ref**. A lease SHA is never
+     reused across a changed fingerprint or ref.
    - With no recorded successful push, `<expected>` is empty, meaning the ref must not exist. In that case only
      porcelain proof that a **new ref was created** (`*` flag) counts as success.
    - An "up to date" or existing ref is a **collision**, including when the foreign ref already equals HEAD. A
@@ -114,13 +123,13 @@ These apply in I1a and I3.
 
 4. **Checkpoint.** Add an optional `custody` field with `#[serde(default)]`, so older checkpoints load through the
    real `--resume` and `merge` paths. It records:
-   - `destination` (the identity, never the transport URL);
+   - `destination` (the redacted identity, never the transport URL) and `destination_fingerprint`;
    - `normal: {ref, last_pushed_sha?}` and `dirty: {ref, last_pushed_sha?}`, as separate records;
    - `disabled: Option<reason>`;
    - `last_error` (redacted).
 
-   On `--resume` and `merge`, the current `[custody]` config wins. If the destination identity or ref differs from
-   the record, the old lease SHAs are discarded and the next push is treated as a first push.
+   On `--resume` and `merge`, the current `[custody]` config wins. If the destination fingerprint or ref differs
+   from the record, the old lease SHAs are discarded and the next push is treated as a first push.
 
 5. **Push failure is not fatal.** Print a warning, record it, and continue the run.
 
@@ -132,8 +141,14 @@ These apply in I1a and I3.
 - **resume after a crash between commit and push** pushes before the next review;
 - a **source-relative URL** (`../backup.git`) reaches the source-relative repository, not a clone-relative one;
 - an `https://user:token@…` URL never appears in the checkpoint or on stderr;
-- a clone-local `url.*.pushInsteadOf` makes the push refuse;
-- with `push.recurseSubmodules=on-demand` and a tag present, no other ref or repository changes;
+- **clone config is ignored**: a clone-local `url.*.pushInsteadOf` doesn't redirect the push, and a clone-local
+  `credential.helper` (a script that records its input) is never invoked;
+- changing `alice@host:backup.git` to `bob@host:backup.git` clears the leases, so Bob's existing ref is a collision;
+- a destination bare repository **inside the clone** (`<clone>/.git/backup.git`, also via a symlink alias) is
+  refused;
+- with `push.recurseSubmodules=on-demand` in the host config and a tag present, no other ref or repository changes;
+- the scratch transport repository is removed after success, failure and timeout;
+- the actual `ls-remote` invocation succeeds against the fixture remote;
 - a **stalled transport**, for example a `GIT_SSH_COMMAND` that sleeps, times out within the deadline;
 - a missing source remote disables push with one warning;
 - `push = false` pushes nothing;
@@ -146,7 +161,10 @@ These apply in I1a and I3.
    - Approved and LoopStopped (`write_terminal`);
    - `Abort`, `NoCommitClean` and `NoCommitDirty`;
    - an initial commit failure;
-   - a refused `--resume`.
+   - a `--resume` refused **after** it has acquired the operation lock and loaded valid run metadata.
+
+   A `--resume` refused earlier, for example because the lock is busy, makes no finalizer writes. A refused resume
+   never changes the existing checkpoint's phase or progress; it only adds custody and evidence records.
 
    Where no checkpoint exists, it writes a minimal **no-commit checkpoint** (task id, source repo, branch, base
    commit, terminal phase, no current commit). I2 hooks the archive writer into this finalizer.
@@ -158,7 +176,7 @@ These apply in I1a and I3.
    snapshot without touching the worktree, the real index or any branch:
    1. Copy the real index to a private temporary file, so it stays a valid index and tracked-but-ignored files stay
       tracked.
-   2. With `GIT_INDEX_FILE` pointing at that copy, run `git add -A`.
+   2. With `GIT_INDEX_FILE` pointing at that copy, run `git -c core.fsmonitor=false add -A`.
    3. `write-tree`.
    4. `commit-tree` with parent HEAD (none if unborn), the pinned bot identity and pins from `pin_prefix_argv`
       (`commit.gpgsign=false`, hooks off), and message `wip snapshot <task_id>`.
@@ -167,9 +185,12 @@ These apply in I1a and I3.
    The temporary index is removed on success and on failure.
 
 3. **Custody status check.** Used here and in I3:
-   `git -c core.untrackedCache=false status --porcelain=v1 --untracked-files=all --ignore-submodules=none`, run with
-   `GIT_OPTIONAL_LOCKS=0`. A plain `status --porcelain` can hide untracked files under
-   `status.showUntrackedFiles=no`.
+   `git -c core.untrackedCache=false -c core.fsmonitor=false status --porcelain=v1 --untracked-files=all
+   --ignore-submodules=none`, run with `GIT_OPTIONAL_LOCKS=0`. A plain `status --porcelain` can hide untracked files
+   under `status.showUntrackedFiles=no`. A stale fsmonitor response can hide modified tracked files.
+
+   Every new git call this work runs **inside the clone** also passes `-c core.fsmonitor=false` and
+   `-c core.hooksPath=/dev/null`, so no clone-configured executable runs on the host.
 
 **Not changed (round-1 #8, deferred):** `reset_worktree_to_head` still discards agent work that was left unstaged
 before verify. That is existing, intended behavior, so verify tests exactly the committed tree. ADR-0042 protects
@@ -182,6 +203,8 @@ commits and evidence, not agent scratch.
 - it excludes an ignored untracked file;
 - the worktree, the real index bytes and every branch are unchanged;
 - `status.showUntrackedFiles=no` does not hide an untracked file from the custody status check;
+- an fsmonitor hook that reports no changes does not hide a modified tracked file, and the hook is never run;
+- a lock-busy `--resume` refusal writes nothing;
 - a snapshot push collision is recorded and is not fatal.
 
 ### Increment I2: evidence archive and retention
@@ -225,6 +248,12 @@ commits and evidence, not agent scratch.
      - `schema: "a2a-evidence.v1"`, `task_id`, `source_repo`, `branch`;
      - `final_commit` (or null), `terminal_phase`, `created_at` (RFC 3339 UTC);
      - `included: [{kind, path, bytes, sha256}]`, `dropped: [{kind, reason}]`.
+   - **Missing or unreadable sources.**
+     - If no review has completed, `final_review_summary` is recorded as `dropped: not_produced`.
+     - An optional kind with no files (no transcripts, no slices) is recorded as `dropped: absent`.
+     - Any other failure to read a selected source **prevents publication**: no archive is written, and a warning
+       is printed. A half-complete archive never looks complete.
+     - The only permitted drop reasons are `not_produced`, `absent` and `over_cap`.
    - Publication: write `.<task_id>.tar.gz.a2a-tmp`, fsync it, then rename it into place.
    - **When it is written:**
      - from the I1b finalizer;
@@ -264,6 +293,8 @@ commits and evidence, not agent scratch.
   - two concurrent writers serialize;
 - **destination and failure:**
   - a `path` inside the clone writes no archive;
+  - a run with no completed review records `final_review_summary` as `not_produced`;
+  - an unreadable selected source (permission denied) publishes no archive;
   - the rewrite after merge sets `merged`;
   - an archive failure doesn't fail the run.
 
@@ -275,19 +306,54 @@ commits and evidence, not agent scratch.
    - The binary's hook pushes HEAD if it isn't recorded as pushed (I1a) and rewrites the archive with `merged` (I2).
    - All merge entry paths pass it: standalone `merge`, fresh `implement --merge` and resumed `--merge`.
 
-2. **Deletion gate.** It replaces the unconditional `reap_clone`. Delete only if every check passes; otherwise keep
-   the clone and print each failed check with the clone path. **Exit codes are unchanged**: a clone kept after a
-   successful landing exits 0, and preflight refusals stay exit 1.
+2. **Deletion gate: an allowlist, not a hazard list.** It replaces the unconditional `reap_clone`.
+   - **Principle:** the clone is deleted only if it looks exactly like an ordinary finished run. Anything the gate
+     does not positively recognize keeps the clone. Unrecognized state is never evaluated for whether it is safe to
+     lose.
+   - Delete only if every check passes; otherwise keep the clone and print each failed check with the clone path.
+   - **Exit codes are unchanged:** a clone kept after a successful landing exits 0, and preflight refusals stay
+     exit 1.
 
    | # | Check | Passes when |
    |---|---|---|
    | 1 | On remote | `[custody].push` is true and `ls-remote` (common transport rules) shows `refs/heads/<ref_prefix><task_id>` at exactly HEAD. With `push = false` the reason is "push disabled". |
-   | 2 | Clean | The custody status check (I1b §3) is empty. Ignored files are allowed. |
-   | 3 | Evidence | The archive exists outside the clone, is fully readable, and its manifest has the expected schema, `task_id`, `source_repo`, `final_commit` = HEAD and `terminal_phase = merged`. Every listed file matches its recorded size and SHA-256. |
-   | 4 | Refs covered | Every `refs/heads/*` and `refs/tags/*` tip is HEAD, an ancestor of HEAD, or contained in the source repo, using the existing `refs_disposition`. There is no `refs/stash`. |
-   | 5 | Nothing unbacked | No assume-unchanged, skip-worktree or sparse entries (existing `ls-files -v` parser). No in-progress `MERGE_HEAD`, `CHERRY_PICK_HEAD`, `REVERT_HEAD`, `rebase-merge/`, `rebase-apply/` or `sequencer/`. No initialized submodule or `.git/modules` (existing submodule checks). No linked worktree: `git worktree list --porcelain` has one entry. |
+   | 2 | Clean | The custody status check (I1b §3) is empty. Ignored files are allowed, with the exception in check 5. |
+   | 3 | Evidence | The archive exists outside the clone and is fully readable. Its manifest has the expected schema, `task_id`, `source_repo`, `final_commit` = HEAD and `terminal_phase = merged`. Every listed file matches its recorded size and SHA-256. Every kind in `include` is either included or dropped with a permitted reason (I2 §3). |
+   | 4 | Refs allowlist | See below. |
+   | 5 | Shape allowlist | See below. |
 
-   Reuse the `storage_reap_clones.rs` helpers by moving them into a shared module, not by copying them.
+   **Check 4, refs allowlist.** Enumerate every ref with
+   `git -C <clone> for-each-ref --format='%(refname) %(objectname) %(objecttype) %(symref)'`, using the unpeeled
+   object.
+   - **Run branch:** HEAD is a symbolic ref to `refs/heads/implement/<task_id>`, and that ref equals the pushed SHA.
+   - **Symbolic refs** (for example `refs/remotes/origin/HEAD`) are skipped. The ref they point to is checked on its
+     own.
+   - **Other refs under `refs/heads/`, `refs/remotes/` or `refs/tags/`** pass only if their exact object is retained
+     by the source repo:
+     - a commit passes if `git -C <source_repo> for-each-ref --contains <sha>` is non-empty;
+     - a tag object passes only if its exact object id is the value of some ref in the source repo, so a tag at the
+       same commit with a different object does not pass;
+     - a ref to any other object type does not pass;
+     - an object the source repo lacks, or a source query that fails, does not pass.
+   - **Any ref in any other namespace keeps the clone.** That includes `refs/stash`, `refs/notes/*` and
+     `refs/replace/*`.
+
+   Tree equality never counts as coverage. The existing `refs_disposition` must **not** be reused, because it
+   accepts tree-equal commits and peels tags.
+
+   **Check 5, shape allowlist.**
+   - **Index:** the `ls-files -v` parser shows only ordinary `H` entries, so no assume-unchanged, skip-worktree or
+     sparse entries. `ls-files -s` shows **no mode-160000 gitlink**, whether or not `.gitmodules` exists.
+   - **Git dir:**
+     - no `modules/` directory, and `worktrees/` is absent or empty;
+     - no `rebase-merge/`, `rebase-apply/` or `sequencer/`;
+     - no file matching `*_HEAD` other than `ORIG_HEAD` and `FETCH_HEAD`. That covers `MERGE_HEAD`,
+       `CHERRY_PICK_HEAD`, `REVERT_HEAD`, `BISECT_HEAD` and any future one.
+   - **Worktree:** no nested `.git` entry (directory or file) anywhere below the clone root other than the
+     top-level `.git`, **including inside ignored directories**. Find it with a walk that does not follow symlinks.
+     An embedded repository keeps the clone even when it is ignored.
+
+   Reuse the `ls-files -v` parser from `storage_reap_clones.rs` by moving it into a shared module.
 
 3. **Remote cleanup.** After a successful delete, if `delete_remote_on_merge = true`, delete the run's remote refs
    with a leased push. A failure there is a warning only.
@@ -301,13 +367,22 @@ commits and evidence, not agent scratch.
 - archive missing;
 - archive digest mismatch;
 - archive inside the clone;
+- a selected kind missing from the archive without a permitted drop reason;
 - an unpushed side branch;
-- a unique tag;
+- **a side commit whose tree equals source `main` but whose commit is not in the source**;
+- a lightweight tag at a clone-only commit;
+- **an annotated tag at HEAD whose tag object is not in the source**;
+- `refs/notes/commits`;
 - a stash;
 - a skip-worktree entry;
-- `MERGE_HEAD`;
+- `MERGE_HEAD`, and a `BISECT_HEAD`;
 - an initialized submodule;
-- a linked worktree.
+- **a staged gitlink with an embedded repository and no `.gitmodules`**;
+- **an ignored directory containing its own `.git`**;
+- a linked worktree, and a non-empty `worktrees/` left by a deleted one.
+
+Allowed shape: a fresh clone with only its cloned branches, `refs/remotes/origin/*` and the source's tags, plus the
+pushed run branch, is deleted. This must hold even after the source's `main` has moved on since the clone was made.
 
 Beyond the keep cases:
 - all checks passing deletes the clone;
@@ -346,7 +421,7 @@ entry, a side branch or a linked worktree. State this result in the PR.
 | I1a | `bin/a2a-bridge/src/config.rs`, `bin/a2a-bridge/src/main.rs` (review and resume wiring), `ctl/implement_resume.rs` (checkpoint field), new `crates/bridge-controller/src/custody_push.rs` (transport rules, push, ls-remote, redaction) |
 | I1b | `bin/a2a-bridge/src/main.rs` (terminal arms), `ctl/tweak.rs` / `ctl/implement.rs` (finalizer seam), `custody_push.rs` (snapshot) |
 | I2 | `bin/a2a-bridge/src/main.rs` (review persistence), new `bin/a2a-bridge/src/evidence.rs`, `config.rs`, shared platform-dir helper, `docs/adr/0042-…md` |
-| I3 | `crates/bridge-controller/src/merge.rs` (hook and gate), the shared module for the `storage_reap_clones.rs` helpers, `bin/a2a-bridge/src/main.rs` (hook wiring), `AGENTS.md`, `docs/onboarding.md` |
+| I3 | `crates/bridge-controller/src/merge.rs` (hook and gate), the shared module for the `ls-files -v` parser, `bin/a2a-bridge/src/main.rs` (hook wiring), `AGENTS.md`, `docs/onboarding.md` |
 
 ## Spec Refs
 
@@ -388,3 +463,25 @@ Per increment, for example: `feat(custody): push run branch before review and me
 | 20 | Concurrent sweep | Folded: I2 §5 |
 | 21 | Review identity | Folded: I2 §1 |
 | 22 | Test precision | Folded: I3 tests |
+
+**Round 2 (gpt-6.1-sol, high): REJECT, at the two-round cap.** Opus classified the findings into two groups.
+
+- **Open-class:** hidden Git state that the hazard-list gate misses. Every round found new instances: a tree-equal
+  side commit, an annotated tag, `refs/notes`, an embedded repo without `.gitmodules`. The owner approved
+  redesigning I3 as an allowlist plus **one extra round (round 3)**. If round 3 is open-class again, it parks and
+  goes back to the owner.
+- **Closed:** each of these has a bounded fix, folded as listed.
+
+| # (review's second list) | Finding | Disposition |
+|---|---|---|
+| 1 | Tree-equal side commit passes `refs_disposition` | Closed by the I3 check 4 allowlist (exact commit containment) |
+| 2 | Annotated tag peeled | Closed by check 4 (exact tag object) |
+| 3 | Embedded repo without `.gitmodules` | Closed by check 5 (any gitlink; any nested `.git`) |
+| 4 | `refs/notes` not enumerated | Closed by check 4 (any other namespace keeps the clone) |
+| 5 | Backup destination inside the clone | Folded: common transport rules, item 6 |
+| 6 | fsmonitor hides changes | Folded: I1b §3 and every new in-clone call |
+| 7 | Clone-local credential helper | Folded: scratch transport repository |
+| 8 | `ls-remote` rejects push-only flags | Folded: options split |
+| 9 | Username-only destination change | Folded: destination fingerprint |
+| 10 | Refused-resume ambiguity | Folded: I1b §1 |
+| 11 | Archive completeness | Folded: I2 §3 and I3 check 3 |
