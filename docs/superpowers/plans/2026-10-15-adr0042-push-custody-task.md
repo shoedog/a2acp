@@ -3,7 +3,7 @@ task-type: implement
 ---
 # ADR-0042 implementation: push-based custody, evidence retention, safe clone deletion
 
-Revision 3 (2026-10-15) folds spec-review rounds 1 and 2. Rev 3 replaces the I3 hazard list with an allowlist (owner-approved) and runs transport from a scratch repository. The ledger is at the end.
+Revision 4 (2026-10-15) folds spec-review rounds 1–3. I3 is an allowlist gate, transport runs from a scratch repository, and in-clone git commands are guarded by a clone config allowlist (all owner-approved). The ledger is at the end.
 
 ## Description
 
@@ -91,6 +91,45 @@ These apply in I1a and I3.
   - `GIT_SSH_COMMAND` gets `-o BatchMode=yes` unless the user already set it.
   - A deadline of `push_timeout_secs` applies to push and ls-remote alike. On expiry the child process group is
     killed and reaped, and the call reports a timeout.
+
+### Clone config allowlist (used by I1b and I3)
+
+**Threat.** The agent can write the clone's `.git/config`. Any host-side git command that runs **inside the clone**
+reads it, and some keys make git execute commands or look at a different directory:
+- `filter.*` clean and smudge drivers;
+- `core.worktree`;
+- `core.fsmonitor`;
+- `credential.*`;
+- `include.*`;
+- `core.sshCommand`;
+- `diff.*.textconv`;
+- and others.
+
+Listing the dangerous keys would never be complete, so this is an allowlist.
+
+**Rule.** Before the custody status check, the dirty snapshot, or the I3 gate runs any git command inside the clone,
+read the clone's local config **file directly**. Do not ask git, because git would follow includes. Parse it with
+`git config --file <clone>/.git/config --list --null` and allow only these keys:
+
+- `core.repositoryformatversion`, `core.filemode`, `core.bare`, `core.logallrefupdates`, `core.ignorecase`,
+  `core.precomposeunicode`, `core.symlinks`;
+- `remote.origin.url`, `remote.origin.fetch`;
+- `branch.<name>.remote`, `branch.<name>.merge`.
+
+Key names are compared case-insensitively, the way git compares them. Any other key, an unreadable file, or a parse
+failure means **the clone is not admissible**:
+- no status, snapshot or gate commands run in it;
+- push already uses the scratch repository and is unaffected;
+- the finalizer records `custody.disabled = clone_config` and keeps going;
+- the I3 gate keeps the clone, with reason "clone config not allowlisted".
+
+The host's global and system config stay trusted, so a user-level git-lfs filter still works. Checks that read the
+git dir directly and run no git command (the `*_HEAD` files, `modules/`, `worktrees/`, the nested-`.git` walk) are
+unaffected.
+
+**Pre-existing exposure, recorded and out of scope.** The existing host-side `reset_worktree_to_head` and
+`restore_branch` (`ctl/implement.rs:547`, `:558`) already run inside the clone and can execute an agent-defined
+smudge filter. That predates ADR-0042 and is tracked as a separate follow-up issue.
 
 ### Increment I1a: config, push before review and merge, resume
 
@@ -204,6 +243,13 @@ commits and evidence, not agent scratch.
 - the worktree, the real index bytes and every branch are unchanged;
 - `status.showUntrackedFiles=no` does not hide an untracked file from the custody status check;
 - an fsmonitor hook that reports no changes does not hide a modified tracked file, and the hook is never run;
+- **clone config allowlist:** with a clone-local `filter.x.clean` (selected by `.gitattributes`) that tries to read
+  a host-only sentinel file, with `core.worktree` redirected, and with an `include.path`, the clone is
+  inadmissible:
+  - no snapshot is written;
+  - the filter never runs;
+  - `custody.disabled = clone_config` is recorded;
+- a fresh `git clone`'s config is admissible;
 - a lock-busy `--resume` refusal writes nothing;
 - a snapshot push collision is recorded and is not fatal.
 
@@ -316,6 +362,7 @@ commits and evidence, not agent scratch.
 
    | # | Check | Passes when |
    |---|---|---|
+   | 0 | Config admissible | The clone config allowlist passes. It runs first; if it fails, checks 2 and 5 do not run git in the clone, and the clone is kept. |
    | 1 | On remote | `[custody].push` is true and `ls-remote` (common transport rules) shows `refs/heads/<ref_prefix><task_id>` at exactly HEAD. With `push = false` the reason is "push disabled". |
    | 2 | Clean | The custody status check (I1b §3) is empty. Ignored files are allowed, with the exception in check 5. |
    | 3 | Evidence | The archive exists outside the clone and is fully readable. Its manifest has the expected schema, `task_id`, `source_repo`, `final_commit` = HEAD and `terminal_phase = merged`. Every listed file matches its recorded size and SHA-256. Every kind in `include` is either included or dropped with a permitted reason (I2 §3). |
@@ -379,7 +426,9 @@ commits and evidence, not agent scratch.
 - an initialized submodule;
 - **a staged gitlink with an embedded repository and no `.gitmodules`**;
 - **an ignored directory containing its own `.git`**;
-- a linked worktree, and a non-empty `worktrees/` left by a deleted one.
+- a linked worktree, and a non-empty `worktrees/` left by a deleted one;
+- `core.worktree` redirected to a clean copy while a unique file sits in the clone root;
+- a clone-local `filter.*` definition.
 
 Allowed shape: a fresh clone with only its cloned branches, `refs/remotes/origin/*` and the source's tags, plus the
 pushed run branch, is deleted. This must hold even after the source's `main` has moved on since the clone was made.
@@ -485,3 +534,14 @@ Per increment, for example: `feat(custody): push run branch before review and me
 | 9 | Username-only destination change | Folded: destination fingerprint |
 | 10 | Refused-resume ambiguity | Folded: I1b §1 |
 | 11 | Archive completeness | Folded: I2 §3 and I3 check 3 |
+
+**Round 3 (owner-approved extension, gpt-6.1-sol, high): REJECT with 2 findings, down from 11 and 22.** Both
+findings are clone-controlled config reaching host-side in-clone git commands, the same class as round 2's
+#6 and #7:
+1. a clone-local clean filter run by the snapshot's `git add -A`;
+2. `core.worktree` redirecting status.
+
+The owner approved closing the class with the **clone config allowlist** and proceeding to I1a **without a fourth
+spec round**. Each increment's two-round code review checks the implementation against these rules. The
+pre-existing smudge-filter exposure in `reset_worktree_to_head` and `restore_branch` is recorded as a separate
+follow-up.
