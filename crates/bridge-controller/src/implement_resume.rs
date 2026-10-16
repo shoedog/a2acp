@@ -60,6 +60,25 @@ pub struct ImplementCheckpoint {
     pub updated_at_ms: i64,
 }
 
+/// Optional host custody metadata wraps the stable run checkpoint. Keeping the
+/// envelope separate lets existing checkpoint consumers retain their core model;
+/// every disk write preserves the custody lease, including attempt/terminal writes.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct CheckpointFile<T> {
+    #[serde(flatten)]
+    checkpoint: T,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    custody: Option<crate::custody_push::CustodyState>,
+}
+
+pub fn load_custody(clone: &Path) -> Result<Option<crate::custody_push::CustodyState>, String> {
+    let bytes =
+        std::fs::read(checkpoint_path(clone)).map_err(|_| "custody checkpoint read failed")?;
+    let file: CheckpointFile<ImplementCheckpoint> =
+        serde_json::from_slice(&bytes).map_err(|_| "custody checkpoint decode failed")?;
+    Ok(file.custody)
+}
+
 pub const SCHEMA_VERSION: u32 = 1;
 
 /// The lock namespace under an `.a2a-implement` root: run operation locks (`<run id>.lock`) and, sharing
@@ -97,10 +116,31 @@ pub fn checkpoint_path(clone: &Path) -> PathBuf {
 
 /// Atomic write: serialize to a temp file in the same dir, then rename over the target.
 pub fn save_checkpoint(clone: &Path, ck: &ImplementCheckpoint) -> Result<(), String> {
+    let custody = match std::fs::read(checkpoint_path(clone)) {
+        Ok(bytes) => {
+            let file: CheckpointFile<ImplementCheckpoint> = serde_json::from_slice(&bytes)
+                .map_err(|_| "checkpoint decode before update failed")?;
+            file.custody
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(_) => return Err("checkpoint read before update failed".into()),
+    };
+    save_checkpoint_with_custody(clone, ck, custody)
+}
+
+pub(crate) fn save_checkpoint_with_custody(
+    clone: &Path,
+    ck: &ImplementCheckpoint,
+    custody: Option<crate::custody_push::CustodyState>,
+) -> Result<(), String> {
     let dir = clone.join(".git").join("a2a-bridge");
     std::fs::create_dir_all(&dir).map_err(|e| format!("checkpoint mkdir {dir:?}: {e}"))?;
     let tmp = dir.join("implement-checkpoint.json.tmp");
-    let bytes = serde_json::to_vec_pretty(ck).map_err(|e| format!("checkpoint encode: {e}"))?;
+    let bytes = serde_json::to_vec_pretty(&CheckpointFile {
+        checkpoint: ck,
+        custody,
+    })
+    .map_err(|e| format!("checkpoint encode: {e}"))?;
     std::fs::write(&tmp, &bytes).map_err(|e| format!("checkpoint write {tmp:?}: {e}"))?;
     std::fs::rename(&tmp, checkpoint_path(clone)).map_err(|e| format!("checkpoint rename: {e}"))?;
     Ok(())
@@ -110,7 +150,9 @@ pub fn save_checkpoint(clone: &Path, ck: &ImplementCheckpoint) -> Result<(), Str
 pub fn load_checkpoint(clone: &Path) -> Result<ImplementCheckpoint, String> {
     let p = checkpoint_path(clone);
     let s = std::fs::read_to_string(&p).map_err(|e| format!("checkpoint read {p:?}: {e}"))?;
-    serde_json::from_str(&s).map_err(|e| format!("checkpoint decode {p:?}: {e}"))
+    let file: CheckpointFile<ImplementCheckpoint> =
+        serde_json::from_str(&s).map_err(|e| format!("checkpoint decode {p:?}: {e}"))?;
+    Ok(file.checkpoint)
 }
 
 /// Production CheckpointSink: owns the live checkpoint + the clone path. Each `record` updates
@@ -376,6 +418,46 @@ mod tests {
             serde_json::from_slice(&std::fs::read(checkpoint_path(td.path())).unwrap()).unwrap();
         assert_eq!(raw["terminal_evidence_counts"]["reached"], 1);
         assert!(serde_json::to_vec(&persisted).unwrap().len() < 4096);
+    }
+
+    #[test]
+    fn custody_envelope_survives_terminal_and_telemetry_writes() {
+        use bridge_core::attempt_activity::AttemptRecorder;
+        let td = tempfile::tempdir().unwrap();
+        let ck = sample(td.path());
+        let state = crate::custody_push::CustodyState {
+            destination: "host:backup.git".into(),
+            destination_fingerprint: "fingerprint".into(),
+            normal: crate::custody_push::PushRecord {
+                r#ref: "refs/heads/wip/impl-test".into(),
+                last_pushed_sha: Some("sha".into()),
+            },
+            ..Default::default()
+        };
+        save_checkpoint_with_custody(td.path(), &ck, Some(state)).unwrap();
+        let terminal = write_terminal(td.path(), ck, ImplementPhase::Approved).unwrap();
+        let recorder = bridge_core::attempt_activity::SharedAttemptRecorder::new(
+            bridge_core::attempt_activity::SystemMonotonicClock::start(),
+        );
+        write_attempt_telemetry(
+            td.path(),
+            terminal,
+            recorder.tally().unwrap(),
+            Default::default(),
+        );
+        assert_eq!(
+            load_checkpoint(td.path()).unwrap().phase,
+            ImplementPhase::Approved
+        );
+        assert_eq!(
+            load_custody(td.path())
+                .unwrap()
+                .unwrap()
+                .normal
+                .last_pushed_sha
+                .as_deref(),
+            Some("sha")
+        );
     }
 
     #[test]

@@ -2833,6 +2833,49 @@ impl bridge_core::ports::RichEventSinkFactory for ImplementAttemptTelemetry {
     }
 }
 
+fn push_custody_checkpoint(
+    clone: &Path,
+    cfg: &bridge_controller::custody_push::CustodyConfig,
+    sha: Option<&str>,
+) {
+    if !cfg.push {
+        return;
+    }
+    let Ok(mut ck) = implement_resume::load_checkpoint(clone) else {
+        eprintln!("[custody] warning: checkpoint unavailable");
+        return;
+    };
+    let head;
+    let sha = match sha {
+        Some(sha) => sha,
+        None => {
+            let out = implement::run_git(
+                Some(clone),
+                &[
+                    "-c",
+                    "core.fsmonitor=false",
+                    "-c",
+                    "core.hooksPath=/dev/null",
+                    "rev-parse",
+                    "--verify",
+                    "HEAD",
+                ],
+            );
+            match out {
+                Ok(out) if out.status.success() => {
+                    head = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                    &head
+                }
+                _ => {
+                    eprintln!("[custody] warning: HEAD unavailable");
+                    return;
+                }
+            }
+        }
+    };
+    bridge_controller::custody_push::push_before_review_or_merge(clone, cfg, &mut ck, sha);
+}
+
 struct ProdEffects<'a> {
     verify_cfg: &'a Option<Result<verify::VerifyConfig, config::ConfigError>>,
     profile: Option<&'a bridge_core::profile::LanguageProfile>,
@@ -2863,6 +2906,7 @@ struct ProdEffects<'a> {
     /// `RunEndGuard` only covers THIS process's own clean-exit/panic path.
     run: &'a bridge_core::run_identity::RunHandle,
     verify_owner: &'a str,
+    custody_cfg: &'a bridge_controller::custody_push::CustodyConfig,
 }
 
 #[async_trait::async_trait]
@@ -2894,6 +2938,11 @@ impl tweak::TweakEffects for ProdEffects<'_> {
                 self.repository_ordinal,
             );
         }
+        push_custody_checkpoint(
+            Path::new(self.clone_cwd.as_str()),
+            self.custody_cfg,
+            Some(head_sha),
+        );
         run_review_step(
             self.review_cfg,
             self.wf_map,
@@ -3214,6 +3263,7 @@ async fn run_warm_loop(
     executor: &bridge_workflow::executor::WorkflowExecutor,
     fix_template: Option<String>,
     prod_ckpt: &mut implement_resume::ProdCheckpoint,
+    custody_cfg: &bridge_controller::custody_push::CustodyConfig,
     depth: review::Depth,
     telemetry: Arc<ImplementAttemptTelemetry>,
     run: &bridge_core::run_identity::RunHandle,
@@ -3240,6 +3290,7 @@ async fn run_warm_loop(
             depth,
             run,
             verify_owner,
+            custody_cfg,
         };
         tweak::run_tweak_loop(
             clone,
@@ -3322,10 +3373,12 @@ fn settle_worktree_run_end<T>(
 /// `implement --merge` sugar (ADR-0027): when the run ended `Approved`, land it via `merge_clone`
 /// (Approved-only, `--force` n/a — `implement` has no `--force`) and exit with its code; a non-Approved
 /// run prints `not merged:` and exits 2. Without `--merge`, returns `Ok(())` (plain implement unchanged).
+#[allow(clippy::too_many_arguments)]
 fn merge_after_loop(
     merge_requested: bool,
     outcome_phase: implement_resume::ImplementPhase,
     merge_cfg: Option<Result<merge::MergeConfig, config::ConfigError>>,
+    custody_cfg: &bridge_controller::custody_push::CustodyConfig,
     clone: &Path,
     root: &Path,
     onto: Option<&str>,
@@ -3339,16 +3392,24 @@ fn merge_after_loop(
             let mcfg = merge_cfg
                 .transpose()
                 .map_err(|e| format!("implement --merge: {e}"))?;
+            let operation = match operation {
+                Some(lock) => Some(lock),
+                None if custody_cfg.push => Some(implement_resume::acquire_operation_lock(clone)?),
+                None => None,
+            };
             let outcome = match operation {
-                Some(lock) => merge::merge_clone_with_operation_lock(
-                    lock,
-                    mcfg.as_ref(),
-                    clone,
-                    root,
-                    onto,
-                    false,
-                    merge::MergeMode::ExactBase,
-                ),
+                Some(lock) => {
+                    push_custody_checkpoint(clone, custody_cfg, None);
+                    merge::merge_clone_with_operation_lock(
+                        lock,
+                        mcfg.as_ref(),
+                        clone,
+                        root,
+                        onto,
+                        false,
+                        merge::MergeMode::ExactBase,
+                    )
+                }
                 None => merge::merge_clone(
                     mcfg.as_ref(),
                     clone,
@@ -3540,6 +3601,8 @@ async fn implement_cmd(args: &[String]) -> Result<(), BoxError> {
     // B2b-3a: parsed pre-commit (beside verify).
     let review_cfg = cfg.review.as_ref().map(|t| t.to_config());
     // ADR-0027: parsed pre-move (--merge sugar).
+    let custody_cfg = cfg.custody.clone();
+    custody_cfg.validate()?;
     let merge_cfg = cfg.merge.as_ref().map(|m| m.to_config());
     // Owner default: an absent --depth falls through to [review].default_depth (else Auto).
     let default_depth = match &review_cfg {
@@ -3840,6 +3903,7 @@ async fn implement_cmd(args: &[String]) -> Result<(), BoxError> {
                     &executor,
                     fix_template,
                     &mut prod_ckpt,
+                    &custody_cfg,
                     depth,
                     telemetry,
                     &run,
@@ -3850,6 +3914,7 @@ async fn implement_cmd(args: &[String]) -> Result<(), BoxError> {
                     merge_requested,
                     outcome_phase,
                     merge_cfg,
+                    &custody_cfg,
                     &clone,
                     &root,
                     onto.as_deref(),
@@ -3927,6 +3992,8 @@ async fn implement_resume_cmd(
     let profile = select_profile(&cfg, &resume_lang, &ck.source_repo)
         .map_err(|e| format!("implement: language profile (resume): {e}"))?;
     let review_cfg = cfg.review.as_ref().map(|t| t.to_config());
+    let custody_cfg = cfg.custody.clone();
+    custody_cfg.validate()?;
     let merge_cfg = cfg.merge.as_ref().map(|m| m.to_config()); // ADR-0027: parsed pre-move (--merge sugar)
     let mut snapshot = cfg
         .into_snapshot()
@@ -4106,6 +4173,7 @@ async fn implement_resume_cmd(
         &executor,
         fix_template,
         &mut prod_ckpt,
+        &custody_cfg,
         depth,
         telemetry,
         &run,
@@ -4118,6 +4186,7 @@ async fn implement_resume_cmd(
             merge_requested,
             outcome_phase,
             merge_cfg,
+            &custody_cfg,
             &clone,
             &root,
             onto,
@@ -4212,14 +4281,28 @@ pub async fn merge_cmd(args: &[String]) -> Result<(), BoxError> {
     let clone =
         implement_resume::resolve_clone(&root, &parsed.id).map_err(|e| format!("merge: {e}"))?;
 
-    let outcome = merge::merge_clone(
-        mcfg.as_ref(),
-        &clone,
-        &root,
-        parsed.onto.as_deref(),
-        parsed.force,
-        parsed.mode,
-    );
+    let outcome = if cfg.custody.push {
+        let operation = implement_resume::acquire_operation_lock(&clone)?;
+        push_custody_checkpoint(&clone, &cfg.custody, None);
+        merge::merge_clone_with_operation_lock(
+            operation,
+            mcfg.as_ref(),
+            &clone,
+            &root,
+            parsed.onto.as_deref(),
+            parsed.force,
+            parsed.mode,
+        )
+    } else {
+        merge::merge_clone(
+            mcfg.as_ref(),
+            &clone,
+            &root,
+            parsed.onto.as_deref(),
+            parsed.force,
+            parsed.mode,
+        )
+    };
     use std::io::Write;
     std::io::stdout().flush().ok();
     std::process::exit(outcome.code());
@@ -9003,6 +9086,7 @@ pub(crate) fn validate_config_contents(
     BoxError,
 > {
     let cfg = RegistryConfig::parse(raw).map_err(|e| format!("config parse: {e}"))?;
+    cfg.custody.validate()?;
     let base = config_path
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
@@ -11921,10 +12005,298 @@ inputs = []
         }
     }
 
+    fn custody_git(repo: &Path, args: &[&str]) -> String {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(args)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8(out.stdout).unwrap().trim().into()
+    }
+
+    fn custody_fixture() -> (tempfile::TempDir, PathBuf, PathBuf, PathBuf) {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        let clone = root.path().join(".a2a-implement/impl-test");
+        let remote = root.path().join("backup.git");
+        std::fs::create_dir(&source).unwrap();
+        std::fs::create_dir_all(clone.parent().unwrap()).unwrap();
+        custody_git(&source, &["init", "-q", "-b", "main"]);
+        custody_git(&source, &["config", "user.name", "Operator"]);
+        custody_git(
+            &source,
+            &["config", "user.email", "operator@example.invalid"],
+        );
+        custody_git(&source, &["commit", "--allow-empty", "-qm", "base"]);
+        let base = custody_git(&source, &["rev-parse", "HEAD"]);
+        custody_git(&source, &["branch", "release"]);
+        custody_git(&source, &["init", "--bare", remote.to_str().unwrap()]);
+        custody_git(&source, &["remote", "add", "origin", "../backup.git"]);
+        custody_git(
+            &source,
+            &[
+                "clone",
+                "-q",
+                source.to_str().unwrap(),
+                clone.to_str().unwrap(),
+            ],
+        );
+        custody_git(&clone, &["switch", "-qc", "implement/impl-test"]);
+        std::fs::write(clone.join("work"), "work\n").unwrap();
+        custody_git(&clone, &["add", "work"]);
+        custody_git(
+            &clone,
+            &[
+                "-c",
+                "user.name=bot",
+                "-c",
+                "user.email=bot@example.invalid",
+                "commit",
+                "-qm",
+                "work",
+            ],
+        );
+        let sha = custody_git(&clone, &["rev-parse", "HEAD"]);
+        // Deliberately write the old checkpoint shape (no custody field).
+        let value = serde_json::json!({
+            "schema_version":1,"resume_id":"impl-test","task_id":"impl-test","task_brief":"test",
+            "source_repo":source,"clone_path":clone,"config_path":"/cfg","branch":"implement/impl-test",
+            "base_ref":"release","base_commit":base,"current_commit":sha,"original_message":"work",
+            "edit_workflow":"e","fix_workflow":"f","loop_max_attempts":3,"attempt_next":1,
+            "phase":"FirstCommitCreated","created_at_ms":0,"updated_at_ms":0
+        });
+        let path = implement_resume::checkpoint_path(&clone);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, serde_json::to_vec(&value).unwrap()).unwrap();
+        (root, source, clone, remote)
+    }
+
+    #[tokio::test]
+    async fn custody_precedes_first_review_and_resumed_review_after_unrecorded_amend() {
+        use tweak::TweakEffects;
+        let (_root, source, clone, remote) = custody_fixture();
+        let state = Arc::new(ReviewTelemetryState::default());
+        let executor =
+            bridge_workflow::executor::WorkflowExecutor::new(Arc::new(ReviewTelemetryRegistry {
+                backend: Arc::new(ReviewTelemetryBackend {
+                    state: state.clone(),
+                }),
+            }));
+        let workflow = bridge_core::ids::WorkflowId::parse("implement-review").unwrap();
+        let graph = Arc::new(bridge_workflow::graph::WorkflowGraph {
+            id: workflow.clone(),
+            nodes: vec![bridge_workflow::graph::WorkflowNode {
+                id: bridge_core::ids::NodeId::parse("review").unwrap(),
+                agent: bridge_core::ids::AgentId::parse("codex").unwrap(),
+                prompt_template: "{{input}}".into(),
+                inputs: vec![],
+                retry: None,
+                harvest_sanitization: None,
+            }],
+            panel: None,
+            controls: None,
+        });
+        let workflows = std::collections::HashMap::from([(workflow.clone(), graph)]);
+        let review_cfg = Some(Ok(config::ReviewConfig {
+            workflow,
+            max_output_bytes: 16384,
+            timeout: Duration::from_secs(2),
+            slice_cmd: "/unused/prism".into(),
+            slice_timeout: Duration::from_millis(1),
+            slice_max_bytes: 1024,
+            light_max_lines: 1,
+            light_max_files: 1,
+            thorough_min_lines: 100,
+            thorough_min_files: 100,
+            default_depth: review::Depth::Forced(review::Tier::Standard),
+        }));
+        let clone_cwd = bridge_core::SessionCwd::parse(clone.to_str().unwrap()).unwrap();
+        let session = bridge_core::ids::SessionId::parse("custody-review").unwrap();
+        let runner = ScopeProbeRunner {
+            turns: vec![],
+            calls: Default::default(),
+            kinds: Default::default(),
+        };
+        let run = bridge_core::run_identity::RunHandle {
+            instance_id: "run0".into(),
+            host: "h".into(),
+            lease: "/l/run0.lock".into(),
+            start: "0".into(),
+        };
+        let cfg = bridge_controller::custody_push::CustodyConfig::default();
+        for resumed in [false, true] {
+            if resumed {
+                custody_git(
+                    &clone,
+                    &[
+                        "-c",
+                        "user.name=bot",
+                        "-c",
+                        "user.email=bot@example.invalid",
+                        "commit",
+                        "--amend",
+                        "-qm",
+                        "amended",
+                    ],
+                );
+            }
+            let ck = implement_resume::load_checkpoint(&clone).unwrap();
+            implement_resume::validate_resumable(&ck).unwrap();
+            let sha = implement_resume::reconcile_head(&clone, &ck).unwrap();
+            *state.custody_expected.lock().unwrap() = Some((remote.clone(), sha.clone()));
+            // Rebuild the production effects exactly as a resumed process does.
+            let mut effects = ProdEffects {
+                verify_cfg: &None,
+                profile: None,
+                review_cfg: &review_cfg,
+                custody_cfg: &cfg,
+                wf_map: &workflows,
+                executor: &executor,
+                runner: &runner,
+                impl_session: &session,
+                fix_template: None,
+                clone_cwd: &clone_cwd,
+                repo: &source,
+                task: "task",
+                base_sha: &ck.base_commit,
+                task_id: "impl-test",
+                telemetry: ImplementAttemptTelemetry::new("custody"),
+                repository_ordinal: 0,
+                last_head_sha: None,
+                depth: review::Depth::Forced(review::Tier::Standard),
+                run: &run,
+                verify_owner: "owner",
+            };
+            let (outcome, _) = effects
+                .review(1, &sha, &verify::VerifyOutcome::NotConfigured)
+                .await;
+            assert!(matches!(
+                outcome,
+                review::ReviewOutcome::Ran {
+                    verdict: review::Verdict::Approve,
+                    ..
+                }
+            ));
+            assert_eq!(
+                implement_resume::load_custody(&clone)
+                    .unwrap()
+                    .unwrap()
+                    .normal
+                    .last_pushed_sha,
+                Some(sha)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn custody_old_checkpoint_passes_real_resume_preflight() {
+        let (root, _source, clone, _remote) = custody_fixture();
+        let config = root.path().join("config.toml");
+        std::fs::write(&config, format!("default = 'codex'\nallowed_cwd_root = '{}'\n[[agents]]\nid = 'codex'\ncmd = 'codex-acp'\n[server]\n", root.path().display())).unwrap();
+        // The real resume entry passes checkpoint decoding and HEAD reconciliation,
+        // then stops at missing workflow admission, before any agent can spawn.
+        let error = implement_resume_cmd("impl-test", &config, false, None, None)
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("unknown workflow \"e\""),
+            "{error}"
+        );
+        assert!(implement_resume::load_custody(&clone).unwrap().is_none());
+        assert!(implement_resume::acquire_operation_lock(&clone).is_ok());
+    }
+
+    #[test]
+    fn custody_old_checkpoint_merge_path_pushes_before_landing() {
+        let (root, source, clone, remote) = custody_fixture();
+        let sha = custody_git(&clone, &["rev-parse", "HEAD"]);
+        let path = implement_resume::checkpoint_path(&clone);
+        let mut old: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        old["phase"] = "Approved".into();
+        assert!(old.get("custody").is_none());
+        std::fs::write(path, serde_json::to_vec(&old).unwrap()).unwrap();
+        let config = root.path().join("config.toml");
+        std::fs::write(&config, format!("default = 'codex'\nallowed_cwd_root = '{}'\n[[agents]]\nid = 'codex'\ncmd = 'codex-acp'\n[server]\n", root.path().display())).unwrap();
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "cli_tests::custody_merge_child", "--nocapture"])
+            .env("CUSTODY_TEST_MERGE_CONFIG", &config)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{} {}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(
+            custody_git(&remote, &["rev-parse", "refs/heads/wip/impl-test"]),
+            sha
+        );
+        assert!(
+            !clone.exists(),
+            "I1a preserves merge's existing reap behavior"
+        );
+        assert_eq!(custody_git(&source, &["show", "release:work"]), "work");
+    }
+
+    #[tokio::test]
+    async fn custody_merge_child() {
+        let Some(config) = std::env::var_os("CUSTODY_TEST_MERGE_CONFIG") else {
+            return;
+        };
+        merge_cmd(&[
+            "impl-test".into(),
+            "--config".into(),
+            config.to_str().unwrap().into(),
+        ])
+        .await
+        .unwrap();
+    }
+
+    #[test]
+    fn custody_validate_rejects_bad_values_and_unknown_keys() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("config.toml");
+        let base = "default = 'codex'\n[[agents]]\nid = 'codex'\ncmd = 'codex-acp'\n[server]\n";
+        let validate = |custody: &str| {
+            validate_config_contents(
+                &path,
+                &format!("{base}\n[custody]\n{custody}"),
+                ExamplesPolicy::Off,
+                &[],
+                ValidationScope::Full,
+            )
+        };
+        validate("").unwrap();
+        validate("push = false\nremote = 'backup'\nref_prefix = 'runs/'\ndelete_remote_on_merge = true\npush_timeout_secs = 1").unwrap();
+        for bad in [
+            "remote = ''",
+            "ref_prefix = 'bad..ref/'",
+            "ref_prefix = 'bad lock/'",
+            "push_timeout_secs = 0",
+            "push_timeout_secs = -1",
+            "unknown = true",
+        ] {
+            assert!(validate(bad).is_err(), "{bad}");
+        }
+    }
+
     #[derive(Default)]
     struct ReviewTelemetryState {
         activity_owned: std::sync::atomic::AtomicBool,
         evidence_bound: std::sync::atomic::AtomicBool,
+        custody_expected: std::sync::Mutex<Option<(PathBuf, String)>>,
     }
 
     struct ReviewTelemetryBackend {
@@ -11947,6 +12319,13 @@ inputs = []
             _parts: Vec<bridge_core::domain::Part>,
             observers: bridge_core::ports::BackendObservers,
         ) -> Result<bridge_core::ports::BackendStream, BridgeError> {
+            if let Some((remote, sha)) = self.state.custody_expected.lock().unwrap().as_ref() {
+                assert_eq!(
+                    custody_git(remote, &["rev-parse", "refs/heads/wip/impl-test"]),
+                    *sha,
+                    "the remote must contain HEAD before the reviewer receives its prompt"
+                );
+            }
             self.state.activity_owned.store(
                 observers
                     .activity
@@ -12211,6 +12590,10 @@ inputs = []
         let mut effects = ProdEffects {
             verify_cfg: &verify_cfg,
             profile: None,
+            custody_cfg: &bridge_controller::custody_push::CustodyConfig {
+                push: false,
+                ..Default::default()
+            },
             review_cfg: &review_cfg,
             wf_map: &wf_map,
             executor: &executor,
