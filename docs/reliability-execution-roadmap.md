@@ -37,7 +37,29 @@
   per repository), and a clone is deleted only when its exact HEAD is on the remote and no unbacked state remains.
   **ADR-0041 2B3d, the parent 2B gate and stages 3–5 are stopped**; the merged ADR-0041 code stays parked and
   unwired. The 2B3d design synthesis (`~/.a2a-dispatch/adr0041-2b3d-20261015/design-synth.md`) is kept as a
-  record. **Next: one ADR-0042 implementation slice.** The ADR-0041 history below is the lane record.
+  record. The ADR-0041 history below is the lane record.
+  - **ADR-0042 is implemented and complete (2026-10-16).**
+    - **Spec:** `docs/superpowers/plans/2026-10-15-adr0042-push-custody-task.md` rev 4, PR #154. Spec review on
+      gpt-6.1-sol went 22 → 11 → 2 findings, closed by owner-approved design changes: an allowlist deletion gate, a
+      scratch transport repository, and a clone config allowlist.
+    - **Merged, in order:**
+
+      | Increment | PR | Commit |
+      |---|---|---|
+      | I1a, push before review and merge | #155 | `0c164590` |
+      | Host-git hardening against clone-local config (security fix, opt-out `[implement] clone_config_guard`) | #157 | `9151b745` |
+      | I1b, terminal finalizer and dirty snapshot | #158 | `8e0f1be6` |
+      | I2, evidence archive and retention | #159 | `19a35bdf` |
+      | I3, post-landing hook and allowlist deletion gate in `merge` | #160 | `aca0267a` |
+
+      I3 closes ADR-0041 §2 WRONG-1/2/3.
+    - **Open follow-ups:**
+      - #156: a fresh run should hold the operation lock across container respawns;
+      - #161: flaky `runtime_freeze_blocks_config_replacement_after_admission_until_git_finishes`;
+      - `storage reap --clones` should adopt the "HEAD on remote" check;
+      - the deferred review smells listed in each PR.
+    - **The operator serve is not yet on a release containing this work.**
+  - **Next:** no active slice. Owner to choose.
 - **Stopped slice:** **ADR-0041 Slice 2B3 (inert new-root restore and hidden-state proof).** Its design is
   `docs/superpowers/specs/2026-09-27-adr0041-slice2b3-restore-design.md` (PR #123). It has four serial children:
   2B3a reader → 2B3b Git plane → 2B3c payload plane → 2B3d record and joint fixture.
