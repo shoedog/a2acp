@@ -641,6 +641,13 @@ impl MergeOutcome {
     }
 }
 
+/// Host composition invoked after either successful landing, under the operation lock.
+pub struct MergeHooks<'a> {
+    pub custody: &'a crate::custody_push::CustodyConfig,
+    pub evidence: &'a crate::evidence::EvidenceConfig,
+    pub post_landing: &'a mut dyn FnMut(&Path, &ImplementCheckpoint),
+}
+
 /// Shared core: lock, validate, gate, preflight, re-author, push, reap. Prints user-facing lines itself.
 /// Both `merge_cmd` (after `resolve_clone`) and `implement --merge` (with a known clone) call this.
 pub fn merge_clone(
@@ -650,6 +657,7 @@ pub fn merge_clone(
     onto: Option<&str>,
     force: bool,
     mode: MergeMode,
+    hooks: Option<&mut MergeHooks<'_>>,
 ) -> MergeOutcome {
     let operation = match acquire_operation_lock(clone) {
         Ok(lock) => lock,
@@ -658,12 +666,13 @@ pub fn merge_clone(
             return MergeOutcome::UsageOrPreflight;
         }
     };
-    merge_clone_with_operation_lock(operation, mcfg, clone, root, onto, force, mode)
+    merge_clone_with_operation_lock(operation, mcfg, clone, root, onto, force, mode, hooks)
 }
 
 /// Merge using a run-operation guard already acquired by the caller. `implement --resume --merge` transfers
 /// its resume guard here, making the resume-to-merge transition gap-free without recursively acquiring the
 /// non-blocking lock. The guard remains live through push and guarded reap, then drops on return.
+#[allow(clippy::too_many_arguments)]
 pub fn merge_clone_with_operation_lock(
     operation: bridge_core::liveness::PersistentLockGuard,
     mcfg: Option<&MergeConfig>,
@@ -672,6 +681,7 @@ pub fn merge_clone_with_operation_lock(
     onto: Option<&str>,
     force: bool,
     mode: MergeMode,
+    hooks: Option<&mut MergeHooks<'_>>,
 ) -> MergeOutcome {
     merge_clone_with_operation_lock_inner(
         operation,
@@ -680,6 +690,7 @@ pub fn merge_clone_with_operation_lock(
         root,
         onto,
         MergeOptions { force, mode },
+        hooks,
         || {},
     )
 }
@@ -690,6 +701,7 @@ struct MergeOptions {
     mode: MergeMode,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn merge_clone_with_operation_lock_inner<F>(
     _operation: bridge_core::liveness::PersistentLockGuard,
     mcfg: Option<&MergeConfig>,
@@ -697,6 +709,7 @@ fn merge_clone_with_operation_lock_inner<F>(
     root: &Path,
     onto: Option<&str>,
     options: MergeOptions,
+    hooks: Option<&mut MergeHooks<'_>>,
     before_landing: F,
 ) -> MergeOutcome
 where
@@ -887,8 +900,47 @@ where
             };
             match landing {
                 Ok(()) => {
-                    if let Err(e) = reap_clone(clone, &src, root) {
-                        eprintln!("merge: landed but {e}");
+                    if let Some(hooks) = hooks {
+                        (hooks.post_landing)(clone, &ck);
+                        let failures = crate::clone_deletion::failures(
+                            clone,
+                            &ck,
+                            hooks.custody,
+                            hooks.evidence,
+                        );
+                        if failures.is_empty() {
+                            let cleanup = if hooks.custody.delete_remote_on_merge {
+                                Some(crate::custody_push::RemoteCleanup::prepare(
+                                    clone,
+                                    hooks.custody,
+                                    &ck,
+                                ))
+                            } else {
+                                None
+                            };
+                            match reap_clone(clone, &src, root) {
+                                Ok(()) => {
+                                    if let Some(cleanup) = cleanup {
+                                        if let Err(e) = cleanup.and_then(|c| c.delete()) {
+                                            eprintln!("merge: warning: {e}");
+                                        }
+                                    }
+                                }
+                                Err(e) => eprintln!(
+                                    "merge: landed but {e}; clone kept at {}",
+                                    clone.display()
+                                ),
+                            }
+                        } else {
+                            for failure in failures {
+                                eprintln!(
+                                    "merge: landed; {failure}; clone kept at {}",
+                                    clone.display()
+                                );
+                            }
+                        }
+                    } else {
+                        eprintln!("merge: landed; post-landing custody hook unavailable; clone kept at {}", clone.display());
                     }
                     if already_integrated {
                         println!("already integrated into {target} at {:.12}", rt);
@@ -1400,6 +1452,77 @@ mod git_tests {
         (clone, current)
     }
 
+    fn with_test_hooks<T>(clone: &Path, f: impl FnOnce(&mut MergeHooks<'_>) -> T) -> T {
+        let ck = load_checkpoint(clone).unwrap();
+        // A local bare destination stands in for the operator's source remote.
+        let remote = clone
+            .parent()
+            .unwrap()
+            .join(format!("{}-remote", ck.task_id));
+        if !remote.exists() {
+            run_git(None, &["init", "--bare", remote.to_str().unwrap()]).unwrap();
+        }
+        run_git(Some(&ck.source_repo), &["remote", "remove", "origin"]).ok();
+        run_git(
+            Some(&ck.source_repo),
+            &["remote", "add", "origin", remote.to_str().unwrap()],
+        )
+        .unwrap();
+        std::fs::write(clone.join(".git/A2A_TASK.md"), "test spec").unwrap();
+        let custody = crate::custody_push::CustodyConfig::default();
+        let evidence = crate::evidence::EvidenceConfig {
+            path: Some(clone.parent().unwrap().join("evidence")),
+            ..Default::default()
+        };
+        let mut post = |clone: &Path, ck: &ImplementCheckpoint| {
+            assert!(acquire_operation_lock(clone).is_err());
+            let mut ck = ck.clone();
+            let sha = ck.current_commit.clone().unwrap();
+            crate::custody_push::push_before_review_or_merge(clone, &custody, &mut ck, &sha);
+            crate::evidence::write_run_archive(clone, &ck, "merged", &evidence).unwrap();
+        };
+        f(&mut MergeHooks {
+            custody: &custody,
+            evidence: &evidence,
+            post_landing: &mut post,
+        })
+    }
+    fn merge_clone(
+        mcfg: Option<&MergeConfig>,
+        clone: &Path,
+        root: &Path,
+        onto: Option<&str>,
+        force: bool,
+        mode: MergeMode,
+    ) -> MergeOutcome {
+        with_test_hooks(clone, |hooks| {
+            super::merge_clone(mcfg, clone, root, onto, force, mode, Some(hooks))
+        })
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn merge_clone_with_operation_lock(
+        operation: bridge_core::liveness::PersistentLockGuard,
+        mcfg: Option<&MergeConfig>,
+        clone: &Path,
+        root: &Path,
+        onto: Option<&str>,
+        force: bool,
+        mode: MergeMode,
+    ) -> MergeOutcome {
+        with_test_hooks(clone, |hooks| {
+            super::merge_clone_with_operation_lock(
+                operation,
+                mcfg,
+                clone,
+                root,
+                onto,
+                force,
+                mode,
+                Some(hooks),
+            )
+        })
+    }
+
     /// Backward-compatible fixture for the exact-base tests.
     fn clone_with_checkpoint(
         root: &Path,
@@ -1408,6 +1531,571 @@ mod git_tests {
         phase: ImplementPhase,
     ) -> (PathBuf, String) {
         clone_with_change(root, src, base, "impl-1-abcd", "w.txt", "w\n", phase)
+    }
+
+    fn rewrite_archive(path: &Path, change: impl FnOnce(&mut serde_json::Value)) {
+        use std::io::Read;
+        let mut archive = tar::Archive::new(flate2::read::GzDecoder::new(
+            std::fs::File::open(path).unwrap(),
+        ));
+        let mut files = Vec::new();
+        for entry in archive.entries().unwrap() {
+            let mut entry = entry.unwrap();
+            let name = entry.path().unwrap().into_owned();
+            let mut body = Vec::new();
+            entry.read_to_end(&mut body).unwrap();
+            files.push((name, body));
+        }
+        let manifest = files
+            .iter_mut()
+            .find(|(p, _)| p == Path::new("manifest.json"))
+            .unwrap();
+        let mut value = serde_json::from_slice(&manifest.1).unwrap();
+        change(&mut value);
+        manifest.1 = serde_json::to_vec(&value).unwrap();
+        let mut writer = tar::Builder::new(flate2::write::GzEncoder::new(
+            std::fs::File::create(path).unwrap(),
+            flate2::Compression::default(),
+        ));
+        for (name, body) in files {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(body.len() as u64);
+            header.set_mode(0o600);
+            header.set_cksum();
+            writer
+                .append_data(&mut header, name, body.as_slice())
+                .unwrap();
+        }
+        writer.into_inner().unwrap().finish().unwrap();
+    }
+
+    #[test]
+    fn post_landing_allowlist_keeps_every_unrecognized_shape() {
+        for (case, check) in [
+            ("remote-absent", 1),
+            ("remote-other", 1),
+            ("push-disabled", 1),
+            ("late-dirty", 2),
+            ("archive-missing", 3),
+            ("archive-digest", 3),
+            ("archive-inside", 3),
+            ("archive-kind", 3),
+            ("archive-drop-reason", 3),
+            ("archive-size", 3),
+            ("archive-identity", 3),
+            ("archive-phase", 3),
+            ("side-branch", 4),
+            ("tree-equal-side", 4),
+            ("light-tag", 4),
+            ("annotated-tag", 4),
+            ("notes", 4),
+            ("stash", 4),
+            ("skip-worktree", 5),
+            ("assume-unchanged", 5),
+            ("merge-head", 5),
+            ("bisect-head", 5),
+            ("submodule", 5),
+            ("gitlink", 5),
+            ("ignored-nested", 5),
+            ("linked-worktree", 5),
+            ("stale-worktrees", 5),
+            ("redirect", 0),
+            ("filter", 0),
+            ("rebase", 5),
+            ("sequencer", 5),
+            ("other-namespace", 4),
+        ] {
+            let (_gs, src, base) = repo_with_base();
+            run_git(Some(&src), &["branch", "release", &base]).unwrap();
+            let root = tempfile::tempdir().unwrap();
+            let (clone, current) =
+                clone_with_checkpoint(root.path(), &src, &base, ImplementPhase::Approved);
+            with_test_hooks(&clone, |original| {
+                let mut custody = original.custody.clone();
+                custody.delete_remote_on_merge = true; // a kept clone must also keep remote refs
+                if case == "push-disabled" {
+                    custody.push = false;
+                }
+                let mut evidence = original.evidence.clone();
+                if case == "archive-inside" {
+                    evidence.path = Some(clone.join(".git/evidence"));
+                }
+                let external = original
+                    .evidence
+                    .path
+                    .as_ref()
+                    .unwrap()
+                    .join(crate::evidence::repo_key(&src).unwrap())
+                    .join("impl-1-abcd.tar.gz");
+                let mut post = |clone: &Path, ck: &ImplementCheckpoint| {
+                    (original.post_landing)(clone, ck);
+                    // The operation lock remains held even inside the host callback.
+                    assert!(acquire_operation_lock(clone).is_err());
+                    let remote = run_git_str(&src, &["remote", "get-url", "origin"]);
+                    let remote_ref = "refs/heads/wip/impl-1-abcd";
+                    match case {
+                        "remote-absent" => {
+                            run_git(Some(Path::new(&remote)), &["update-ref", "-d", remote_ref])
+                                .unwrap();
+                        }
+                        "remote-other" => {
+                            run_git(Some(Path::new(&remote)), &["update-ref", remote_ref, &base])
+                                .unwrap();
+                        }
+                        "late-dirty" => {
+                            std::fs::write(clone.join("unique"), "late").unwrap();
+                        }
+                        "archive-missing" => {
+                            std::fs::remove_file(&external).unwrap();
+                        }
+                        "archive-digest" => rewrite_archive(&external, |v| {
+                            v["included"][0]["sha256"] = "wrong".into()
+                        }),
+                        "archive-size" => {
+                            rewrite_archive(&external, |v| v["included"][0]["bytes"] = 999.into())
+                        }
+                        "archive-identity" => {
+                            rewrite_archive(&external, |v| v["task_id"] = "impl-other".into())
+                        }
+                        "archive-phase" => {
+                            rewrite_archive(&external, |v| v["terminal_phase"] = "approved".into())
+                        }
+                        "archive-drop-reason" => rewrite_archive(&external, |v| {
+                            v["dropped"][0]["reason"] = "unreadable".into()
+                        }),
+                        "archive-kind" => rewrite_archive(&external, |v| {
+                            v["included"] = serde_json::json!([]);
+                            v["dropped"] = serde_json::json!([]);
+                        }),
+                        "archive-inside" => {
+                            let dir = evidence
+                                .path
+                                .as_ref()
+                                .unwrap()
+                                .join(crate::evidence::repo_key(&src).unwrap());
+                            std::fs::create_dir_all(&dir).unwrap();
+                            std::fs::copy(&external, dir.join("impl-1-abcd.tar.gz")).unwrap();
+                        }
+                        "side-branch" | "tree-equal-side" | "light-tag" => {
+                            let tree_ref = if case == "tree-equal-side" {
+                                format!("{base}^{{tree}}")
+                            } else {
+                                "HEAD^{tree}".into()
+                            };
+                            let tree = run_git_str(clone, &["rev-parse", &tree_ref]);
+                            let side =
+                                run_git_str(clone, &["commit-tree", &tree, "-m", "unique side"]);
+                            let reference = if case == "light-tag" {
+                                "refs/tags/side"
+                            } else {
+                                "refs/heads/side"
+                            };
+                            run_git(Some(clone), &["update-ref", reference, &side]).unwrap();
+                        }
+                        "annotated-tag" => {
+                            run_git(Some(clone), &["tag", "-a", "unique", "-m", "unique tag"])
+                                .unwrap();
+                        }
+                        "notes" => {
+                            run_git(Some(clone), &["notes", "add", "-m", "unique note"]).unwrap();
+                        }
+                        "stash" => {
+                            std::fs::write(clone.join("unique"), "stash").unwrap();
+                            run_git(Some(clone), &["stash", "push", "-u"]).unwrap();
+                        }
+                        "skip-worktree" | "assume-unchanged" => {
+                            run_git(
+                                Some(clone),
+                                &[
+                                    "update-index",
+                                    if case == "skip-worktree" {
+                                        "--skip-worktree"
+                                    } else {
+                                        "--assume-unchanged"
+                                    },
+                                    "w.txt",
+                                ],
+                            )
+                            .unwrap();
+                        }
+                        "merge-head" | "bisect-head" => {
+                            std::fs::write(
+                                clone.join(if case == "merge-head" {
+                                    ".git/MERGE_HEAD"
+                                } else {
+                                    ".git/BISECT_HEAD"
+                                }),
+                                &current,
+                            )
+                            .unwrap();
+                        }
+                        "submodule" => {
+                            let out = run_git(
+                                Some(clone),
+                                &[
+                                    "-c",
+                                    "protocol.file.allow=always",
+                                    "submodule",
+                                    "add",
+                                    src.to_str().unwrap(),
+                                    "sub",
+                                ],
+                            )
+                            .unwrap();
+                            assert!(
+                                out.status.success(),
+                                "{}",
+                                String::from_utf8_lossy(&out.stderr)
+                            );
+                            run_git(
+                                Some(clone),
+                                &["config", "--remove-section", "submodule.sub"],
+                            )
+                            .unwrap();
+                        }
+                        "gitlink" => {
+                            run_git(None, &["init", clone.join("embedded").to_str().unwrap()])
+                                .unwrap();
+                            run_git(
+                                Some(clone),
+                                &[
+                                    "update-index",
+                                    "--add",
+                                    "--cacheinfo",
+                                    &format!("160000,{current},embedded"),
+                                ],
+                            )
+                            .unwrap();
+                            assert!(!clone.join(".gitmodules").exists());
+                        }
+                        "ignored-nested" => {
+                            std::fs::write(clone.join(".git/info/exclude"), "ignored/\n").unwrap();
+                            std::fs::create_dir_all(clone.join("ignored/deep/.git")).unwrap();
+                        }
+                        "linked-worktree" => {
+                            run_git(
+                                Some(clone),
+                                &[
+                                    "worktree",
+                                    "add",
+                                    "--detach",
+                                    root.path().join("linked").to_str().unwrap(),
+                                ],
+                            )
+                            .unwrap();
+                        }
+                        "stale-worktrees" => {
+                            std::fs::create_dir_all(clone.join(".git/worktrees/deleted")).unwrap();
+                        }
+                        "redirect" => {
+                            let copy = root.path().join("clean");
+                            std::fs::create_dir(&copy).unwrap();
+                            std::fs::write(clone.join("unique"), "unique clone bytes").unwrap();
+                            run_git(
+                                Some(clone),
+                                &["config", "core.worktree", copy.to_str().unwrap()],
+                            )
+                            .unwrap();
+                        }
+                        "filter" => {
+                            run_git(Some(clone), &["config", "filter.evil.clean", "false"])
+                                .unwrap();
+                        }
+                        "rebase" => {
+                            std::fs::create_dir(clone.join(".git/rebase-apply")).unwrap();
+                        }
+                        "sequencer" => {
+                            std::fs::create_dir(clone.join(".git/sequencer")).unwrap();
+                        }
+                        "other-namespace" => {
+                            run_git(
+                                Some(clone),
+                                &["update-ref", "refs/private/unique", &current],
+                            )
+                            .unwrap();
+                        }
+                        _ => {}
+                    }
+                };
+                let mut hooks = MergeHooks {
+                    custody: &custody,
+                    evidence: &evidence,
+                    post_landing: &mut post,
+                };
+                let result = super::merge_clone(
+                    None,
+                    &clone,
+                    root.path(),
+                    Some("release"),
+                    false,
+                    MergeMode::ExactBase,
+                    Some(&mut hooks),
+                );
+                assert_eq!(result.code(), 0, "{case}");
+                assert!(clone.exists(), "{case}");
+                let ck = load_checkpoint(&clone).unwrap();
+                let failures = crate::clone_deletion::failures(&clone, &ck, &custody, &evidence);
+                assert!(
+                    failures
+                        .iter()
+                        .any(|e| e.starts_with(&format!("check {check}:"))),
+                    "{case}: {failures:?}"
+                );
+                assert!(
+                    acquire_operation_lock(&clone).is_ok(),
+                    "{case}: lock leaked"
+                );
+                if case != "remote-absent" {
+                    assert!(
+                        crate::custody_push::ls_remote_ref(
+                            &src,
+                            &clone,
+                            &custody,
+                            "refs/heads/wip/impl-1-abcd"
+                        )
+                        .unwrap()
+                        .is_some(),
+                        "{case}: remote deleted for kept clone"
+                    );
+                }
+            });
+        }
+    }
+
+    #[test]
+    fn allowed_shape_deletes_after_source_moves_and_cleans_remote_only_when_enabled() {
+        for cleanup in ["disabled", "delete", "stale-lease"] {
+            let (_gs, src, base) = repo_with_base();
+            run_git(Some(&src), &["tag", "-a", "source-tag", "-m", "source tag"]).unwrap();
+            run_git(Some(&src), &["branch", "release", &base]).unwrap();
+            let root = tempfile::tempdir().unwrap();
+            let (clone, current) =
+                clone_with_checkpoint(root.path(), &src, &base, ImplementPhase::Approved);
+            // Source main moves beyond the cloned main and remote-tracking refs.
+            std::fs::write(src.join("later"), "source main advanced").unwrap();
+            run_git(Some(&src), &["add", "later"]).unwrap();
+            run_git(Some(&src), &["commit", "-m", "later"]).unwrap();
+            with_test_hooks(&clone, |original| {
+                let mut custody = original.custody.clone();
+                custody.delete_remote_on_merge = cleanup != "disabled";
+                let remote = run_git_str(&src, &["remote", "get-url", "origin"]);
+                let mut post = |clone: &Path, ck: &ImplementCheckpoint| {
+                    (original.post_landing)(clone, ck);
+                    // The dirty ref uses the same recorded custody lease mechanism.
+                    let mut state = crate::implement_resume::load_custody(clone)
+                        .unwrap()
+                        .unwrap();
+                    let dirty_ref = "refs/heads/wip/impl-1-abcd-dirty";
+                    run_git(
+                        Some(Path::new(&remote)),
+                        &["update-ref", dirty_ref, &current],
+                    )
+                    .unwrap();
+                    state.dirty.last_pushed_sha = Some(if cleanup == "stale-lease" {
+                        base.clone()
+                    } else {
+                        current.clone()
+                    });
+                    crate::implement_resume::save_checkpoint_with_custody(clone, ck, Some(state))
+                        .unwrap();
+                    std::fs::write(clone.join(".git/info/exclude"), "ignored/\n").unwrap();
+                    std::fs::create_dir(clone.join("ignored")).unwrap();
+                    std::fs::write(clone.join("ignored/cache"), "disposable").unwrap();
+                    #[cfg(unix)]
+                    {
+                        let external = root.path().join("external");
+                        std::fs::create_dir_all(external.join(".git")).unwrap();
+                        std::os::unix::fs::symlink(&external, clone.join("ignored/link")).unwrap();
+                    }
+                    std::fs::create_dir(clone.join(".git/worktrees")).unwrap();
+                    std::fs::write(clone.join(".git/ORIG_HEAD"), &base).unwrap();
+                    std::fs::write(clone.join(".git/FETCH_HEAD"), &base).unwrap();
+                };
+                let mut hooks = MergeHooks {
+                    custody: &custody,
+                    evidence: original.evidence,
+                    post_landing: &mut post,
+                };
+                assert_eq!(
+                    super::merge_clone(
+                        None,
+                        &clone,
+                        root.path(),
+                        Some("release"),
+                        false,
+                        MergeMode::ExactBase,
+                        Some(&mut hooks)
+                    )
+                    .code(),
+                    0
+                );
+                assert!(!clone.exists());
+                for reference in [
+                    "refs/heads/wip/impl-1-abcd",
+                    "refs/heads/wip/impl-1-abcd-dirty",
+                ] {
+                    let out = run_git(
+                        Some(Path::new(&remote)),
+                        &["show-ref", "--verify", reference],
+                    )
+                    .unwrap();
+                    let retained = cleanup == "disabled"
+                        || (cleanup == "stale-lease" && reference.ends_with("-dirty"));
+                    assert_eq!(out.status.success(), retained, "{cleanup}: {reference}");
+                }
+            });
+        }
+    }
+
+    #[test]
+    fn stalled_gate_transport_keeps_clone_and_releases_operation_lock() {
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "merge::git_tests::stalled_gate_child",
+                "--nocapture",
+            ])
+            .env("I3_STALLED_CHILD", "1")
+            .env("GIT_SSH_COMMAND", "sleep 30 #")
+            .env("GIT_SSH_VARIANT", "ssh")
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(String::from_utf8_lossy(&out.stderr).contains("check 1: custody git timeout"));
+    }
+
+    #[test]
+    fn stalled_gate_child() {
+        if std::env::var_os("I3_STALLED_CHILD").is_none() {
+            return;
+        }
+        let (_gs, src, base) = repo_with_base();
+        run_git(Some(&src), &["branch", "release", &base]).unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let (clone, _) = clone_with_checkpoint(root.path(), &src, &base, ImplementPhase::Approved);
+        with_test_hooks(&clone, |original| {
+            let mut custody = original.custody.clone();
+            custody.push_timeout_secs = 1;
+            let mut post = |clone: &Path, ck: &ImplementCheckpoint| {
+                (original.post_landing)(clone, ck);
+                run_git(
+                    Some(&src),
+                    &["remote", "set-url", "origin", "ssh://host/backup.git"],
+                )
+                .unwrap();
+            };
+            let mut hooks = MergeHooks {
+                custody: &custody,
+                evidence: original.evidence,
+                post_landing: &mut post,
+            };
+            let start = std::time::Instant::now();
+            assert_eq!(
+                super::merge_clone(
+                    None,
+                    &clone,
+                    root.path(),
+                    Some("release"),
+                    false,
+                    MergeMode::ExactBase,
+                    Some(&mut hooks)
+                )
+                .code(),
+                0
+            );
+            assert!(start.elapsed() < std::time::Duration::from_secs(5));
+            assert!(clone.exists());
+            assert!(acquire_operation_lock(&clone).is_ok());
+        });
+    }
+
+    #[test]
+    fn initially_dirty_clone_is_preflight_exit_one_without_hook() {
+        let (_gs, src, base) = repo_with_base();
+        run_git(Some(&src), &["branch", "release", &base]).unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let (clone, _) = clone_with_checkpoint(root.path(), &src, &base, ImplementPhase::Approved);
+        std::fs::write(clone.join("untracked"), "unique").unwrap();
+        with_test_hooks(&clone, |original| {
+            let mut post = |_: &Path, _: &ImplementCheckpoint| panic!("hook on refused landing");
+            let mut hooks = MergeHooks {
+                custody: original.custody,
+                evidence: original.evidence,
+                post_landing: &mut post,
+            };
+            assert_eq!(
+                super::merge_clone(
+                    None,
+                    &clone,
+                    root.path(),
+                    Some("release"),
+                    false,
+                    MergeMode::ExactBase,
+                    Some(&mut hooks)
+                )
+                .code(),
+                1
+            );
+            assert!(clone.exists());
+        });
+    }
+
+    #[test]
+    fn custody_regression_hidden_state_survives_landing() {
+        let mut deleted = Vec::new();
+        for case in ["stash", "skip-worktree", "side-branch", "linked-worktree"] {
+            let (_gs, src, base) = repo_with_base();
+            run_git(Some(&src), &["branch", "release", &base]).unwrap();
+            let root = tempfile::tempdir().unwrap();
+            let (clone, _) =
+                clone_with_checkpoint(root.path(), &src, &base, ImplementPhase::Approved);
+            match case {
+                "stash" => {
+                    std::fs::write(clone.join("scratch"), "unique").unwrap();
+                    run_git(Some(&clone), &["stash", "push", "-u"]).unwrap();
+                }
+                "skip-worktree" => {
+                    run_git(Some(&clone), &["update-index", "--skip-worktree", "w.txt"]).unwrap();
+                }
+                "side-branch" => {
+                    let tree = run_git_str(&clone, &["rev-parse", "HEAD^{tree}"]);
+                    let side = run_git_str(&clone, &["commit-tree", &tree, "-m", "side"]);
+                    run_git(Some(&clone), &["update-ref", "refs/heads/side", &side]).unwrap();
+                }
+                _ => {
+                    run_git(
+                        Some(&clone),
+                        &[
+                            "worktree",
+                            "add",
+                            "--detach",
+                            root.path().join("linked").to_str().unwrap(),
+                        ],
+                    )
+                    .unwrap();
+                }
+            }
+            let outcome = merge_clone(
+                None,
+                &clone,
+                root.path(),
+                Some("release"),
+                false,
+                MergeMode::ExactBase,
+            );
+            assert_eq!(outcome.code(), 0, "{case}");
+            if !clone.exists() {
+                deleted.push(case);
+            }
+        }
+        assert!(
+            deleted.is_empty(),
+            "landed clones incorrectly deleted: {deleted:?}"
+        );
     }
 
     #[test]
@@ -1792,6 +2480,7 @@ mod git_tests {
                 force: false,
                 mode: MergeMode::IntegrateCurrent,
             },
+            None,
             || {
                 run_git(Some(&src), &["branch", "-f", "release", &moved]).unwrap();
             },

@@ -106,6 +106,93 @@ pub fn repo_key(source: &Path) -> io::Result<String> {
         &digest(source.as_os_str().as_encoded_bytes())[..12]
     ))
 }
+/// Validate the complete external archive before the only copy of a run can be removed.
+pub fn verify_merged_archive(
+    clone: &Path,
+    ck: &ImplementCheckpoint,
+    head: &str,
+    cfg: &EvidenceConfig,
+) -> io::Result<()> {
+    use std::io::Read;
+    cfg.validate().map_err(|e| invalid(&e))?;
+    let root = match &cfg.path {
+        Some(path) => path.clone(),
+        None => bridge_core::platform_state::platform_state_dir()
+            .map_err(|_| invalid("platform state unavailable"))?
+            .join("evidence"),
+    };
+    let path = root
+        .join(repo_key(&ck.source_repo)?)
+        .join(format!("{}.tar.gz", ck.task_id))
+        .canonicalize()?;
+    if path.starts_with(clone.canonicalize()?) {
+        return Err(invalid("archive inside clone"));
+    }
+    let mut bytes = Vec::new();
+    // Read through gzip EOF as well as tar EOF, checking the compressed stream's checksum.
+    flate2::read::MultiGzDecoder::new(fs::File::open(path)?).read_to_end(&mut bytes)?;
+    let manifest = archive_manifest(&mut tar::Archive::new(bytes.as_slice()))?;
+    let mut archive = tar::Archive::new(bytes.as_slice());
+    let mut files = std::collections::HashMap::new();
+    for entry in archive.entries()? {
+        let mut entry = entry?;
+        if !entry.header().entry_type().is_file() {
+            return Err(invalid("non-file archive entry"));
+        }
+        let path = entry.path()?.to_string_lossy().into_owned();
+        let mut body = Vec::new();
+        entry.read_to_end(&mut body)?;
+        if files.insert(path, body).is_some() {
+            return Err(invalid("duplicate archive entry"));
+        }
+    }
+    if manifest.schema != "a2a-evidence.v1"
+        || manifest.task_id != ck.task_id
+        || manifest.source_repo != ck.source_repo.canonicalize()?
+        || manifest.branch != ck.branch
+        || manifest.final_commit.as_deref() != Some(head)
+        || manifest.terminal_phase != "merged"
+    {
+        return Err(invalid(
+            "archive manifest identity or merged phase mismatch",
+        ));
+    }
+    if manifest
+        .included
+        .iter()
+        .any(|item| !KINDS.contains(&item.kind.as_str()))
+        || manifest.dropped.iter().any(|item| {
+            !KINDS.contains(&item.kind.as_str())
+                || !matches!(item.reason.as_str(), "not_produced" | "absent" | "over_cap")
+        })
+    {
+        return Err(invalid(
+            "archive has an unknown evidence kind or drop reason",
+        ));
+    }
+    for item in &manifest.included {
+        let body = files
+            .get(&item.path)
+            .ok_or_else(|| invalid("listed evidence missing"))?;
+        if body.len() as u64 != item.bytes || digest(body) != item.sha256 {
+            return Err(invalid("archive size or digest mismatch"));
+        }
+    }
+    for kind in &cfg.include {
+        if !manifest.included.iter().any(|item| &item.kind == kind)
+            && !manifest.dropped.iter().any(|item| {
+                &item.kind == kind
+                    && matches!(item.reason.as_str(), "not_produced" | "absent" | "over_cap")
+            })
+        {
+            return Err(invalid(
+                "selected evidence kind missing without permitted drop",
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Reserve before invoking a review, so an interrupted invocation cannot reuse an identity.
 pub fn begin_review(clone: &Path) -> Result<u64, String> {
     let mut ck = load_checkpoint(clone)?;
@@ -373,8 +460,12 @@ pub fn write_run_archive(
     Ok(destination)
 }
 fn read_manifest(path: &Path) -> io::Result<Manifest> {
-    let mut tar = tar::Archive::new(GzDecoder::new(fs::File::open(path)?));
-    for entry in tar.entries()? {
+    archive_manifest(&mut tar::Archive::new(GzDecoder::new(fs::File::open(
+        path,
+    )?)))
+}
+fn archive_manifest<R: io::Read>(archive: &mut tar::Archive<R>) -> io::Result<Manifest> {
+    for entry in archive.entries()? {
         let mut entry = entry?;
         if entry.path()?.as_ref() == Path::new("manifest.json") {
             let m: Manifest = serde_json::from_reader(&mut entry)?;

@@ -1670,36 +1670,7 @@ fn ref_inventory_summary(facts: &[RefFact], note: Option<&str>) -> String {
 /// state. A LOWERCASE letter means `--assume-unchanged` and `S` means `--skip-worktree` — both tell git
 /// to stop consulting the worktree for that path, so modified bytes there produce NO porcelain line.
 /// Anything that is not `H` therefore parks, including letters this parser does not recognize.
-pub fn index_flags_disposition(listing: &str) -> Result<String, String> {
-    let mut flagged: Vec<String> = Vec::new();
-    let mut total = 0usize;
-    let mut entries = 0usize;
-    for line in listing.lines() {
-        if line.trim().is_empty() {
-            continue;
-        }
-        entries += 1;
-        let first = line.chars().next().unwrap_or('?');
-        if first == 'H' {
-            continue;
-        }
-        total += 1;
-        if flagged.len() < MAX_QUOTED_STATUS_ENTRIES {
-            flagged.push(line.trim().to_string());
-        }
-    }
-    if total > 0 {
-        return Err(format!(
-            "{total} index entry/entries carry a non-`H` flag (assume-unchanged, skip-worktree, \
-             unmerged or sparse), so `git status` is blind to their worktree bytes — first {}: {}",
-            flagged.len(),
-            flagged.join(" | ")
-        ));
-    }
-    Ok(format!(
-        "{entries} index entr(y/ies), all plain `H` (cached)"
-    ))
-}
+pub use bridge_controller::clone_deletion::index_flags_disposition;
 
 /// Is this clone sparse? A sparse checkout is a whole-tree version of the same blindness: paths outside
 /// the cone are simply not in the worktree, and `git status` reports nothing about them.

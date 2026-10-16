@@ -3527,6 +3527,20 @@ fn settle_worktree_run_end<T>(
     outcome
 }
 
+fn post_landing_custody(
+    clone: &Path,
+    ck: &implement_resume::ImplementCheckpoint,
+    custody: &bridge_controller::custody_push::CustodyConfig,
+    evidence: &bridge_controller::evidence::EvidenceConfig,
+) {
+    push_custody_checkpoint(clone, custody, None);
+    if let Err(error) =
+        bridge_controller::evidence::write_run_archive(clone, ck, "merged", evidence)
+    {
+        eprintln!("[evidence] warning: archive not published: {error}");
+    }
+}
+
 /// `implement --merge` sugar (ADR-0027): when the run ended `Approved`, land it via `merge_clone`
 /// (Approved-only, `--force` n/a — `implement` has no `--force`) and exit with its code; a non-Approved
 /// run prints `not merged:` and exits 2. Without `--merge`, returns `Ok(())` (plain implement unchanged).
@@ -3536,6 +3550,7 @@ async fn merge_after_loop(
     outcome_phase: implement_resume::ImplementPhase,
     merge_cfg: Option<Result<merge::MergeConfig, config::ConfigError>>,
     custody_cfg: &bridge_controller::custody_push::CustodyConfig,
+    evidence_cfg: &bridge_controller::evidence::EvidenceConfig,
     clone: &Path,
     root: &Path,
     onto: Option<&str>,
@@ -3558,6 +3573,14 @@ async fn merge_after_loop(
                 .transpose()
                 .map_err(|e| format!("implement --merge: {e}"))?;
             push_custody_checkpoint(clone, custody_cfg, None);
+            let mut post = |clone: &Path, ck: &implement_resume::ImplementCheckpoint| {
+                post_landing_custody(clone, ck, custody_cfg, evidence_cfg)
+            };
+            let mut hooks = merge::MergeHooks {
+                custody: custody_cfg,
+                evidence: evidence_cfg,
+                post_landing: &mut post,
+            };
             let outcome = merge::merge_clone_with_operation_lock(
                 operation,
                 mcfg.as_ref(),
@@ -3566,6 +3589,7 @@ async fn merge_after_loop(
                 onto,
                 false,
                 merge::MergeMode::ExactBase,
+                Some(&mut hooks),
             );
             use std::io::Write;
             std::io::stdout().flush().ok();
@@ -4127,6 +4151,7 @@ async fn implement_cmd(args: &[String]) -> Result<(), BoxError> {
                     outcome_phase,
                     merge_cfg,
                     &custody_cfg,
+                    &evidence_cfg,
                     &clone,
                     &root,
                     onto.as_deref(),
@@ -4477,6 +4502,7 @@ async fn implement_resume_cmd(
             outcome_phase,
             merge_cfg,
             &custody_cfg,
+            &evidence_cfg,
             &clone,
             &root,
             onto,
@@ -4586,6 +4612,14 @@ pub async fn merge_cmd(args: &[String]) -> Result<(), BoxError> {
     prepare_clone_entry(&raw, &config_path, &clone, &checkpoint.source_repo, false).await?;
 
     push_custody_checkpoint(&clone, &cfg.custody, None);
+    let mut post = |clone: &Path, ck: &implement_resume::ImplementCheckpoint| {
+        post_landing_custody(clone, ck, &cfg.custody, &cfg.evidence)
+    };
+    let mut hooks = merge::MergeHooks {
+        custody: &cfg.custody,
+        evidence: &cfg.evidence,
+        post_landing: &mut post,
+    };
     let outcome = merge::merge_clone_with_operation_lock(
         operation,
         mcfg.as_ref(),
@@ -4594,6 +4628,7 @@ pub async fn merge_cmd(args: &[String]) -> Result<(), BoxError> {
         parsed.onto.as_deref(),
         parsed.force,
         parsed.mode,
+        Some(&mut hooks),
     );
     use std::io::Write;
     std::io::stdout().flush().ok();
@@ -12665,10 +12700,11 @@ esac
             format!("label=a2a.cwd={}", clone.canonicalize().unwrap().display()),
         )
         .unwrap();
+        std::fs::write(clone.join(".git/A2A_TASK.md"), "fixture task").unwrap();
         let config = root.path().join("config.toml");
         std::fs::write(&config, format!(
-            "default='writer'\nallowed_cwd_root='{}'\n[[agents]]\nid='writer'\nkind='container_rw'\ncmd='codex-acp'\n[agents.sandbox]\nruntime='{}'\nimage='fake'\nmount='{}'\naccess='rw'\negress='open'\n[server]\n[implement]\nclone_config_guard={}\n",
-            root.path().display(), runtime.display(), root.path().display(), !opt_out,
+            "default='writer'\nallowed_cwd_root='{}'\n[[agents]]\nid='writer'\nkind='container_rw'\ncmd='codex-acp'\n[agents.sandbox]\nruntime='{}'\nimage='fake'\nmount='{}'\naccess='rw'\negress='open'\n[server]\n[implement]\nclone_config_guard={}\n[evidence]\npath='{}'\n",
+            root.path().display(), runtime.display(), root.path().display(), !opt_out, root.path().join("evidence").display(),
         )).unwrap();
         (root, source, clone, config)
     }
@@ -12940,12 +12976,10 @@ esac
                     clone: clone.clone(),
                     ck: ck.clone(),
                 };
-                let custody = bridge_controller::custody_push::CustodyConfig {
-                    push: false,
-                    ..Default::default()
-                };
+                let custody = bridge_controller::custody_push::CustodyConfig::default();
                 let raw = std::fs::read_to_string(&config).unwrap();
                 let cfg = config::RegistryConfig::parse(&raw).unwrap();
+                let evidence = cfg.evidence.clone();
                 let snapshot = cfg.into_snapshot().unwrap();
                 let runtimes = run_guard_runtimes(&snapshot, &config, None);
                 let run = bridge_core::run_identity::RunHandle {
@@ -12982,7 +13016,7 @@ esac
                     ImplementAttemptTelemetry::new("entry-test"),
                     &run,
                     "owner",
-                    &bridge_controller::evidence::EvidenceConfig::default(),
+                    &evidence,
                 )
                 .await;
                 assert_eq!(terminal, implement_resume::ImplementPhase::Approved);
@@ -12991,6 +13025,7 @@ esac
                     terminal,
                     None,
                     &custody,
+                    &evidence,
                     &clone,
                     root,
                     Some("release"),
@@ -13141,7 +13176,7 @@ esac
         );
         assert!(
             !clone.exists(),
-            "I1a preserves merge's existing reap behavior"
+            "I3 deletes after custody and merged evidence pass"
         );
         assert_eq!(custody_git(&source, &["show", "release:work"]), "work");
     }

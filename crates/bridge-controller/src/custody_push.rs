@@ -722,6 +722,67 @@ pub fn ls_remote_ref(
         }))
 }
 
+/// Prepared while the clone exists; execution is permitted only after guarded removal.
+pub struct RemoteCleanup {
+    scratch: Scratch,
+    destination: Destination,
+    records: Vec<PushRecord>,
+    timeout: Duration,
+}
+impl RemoteCleanup {
+    pub fn prepare(
+        clone: &Path,
+        cfg: &CustodyConfig,
+        ck: &crate::implement_resume::ImplementCheckpoint,
+    ) -> Result<Self, String> {
+        cfg.validate()?;
+        let destination = destination(&ck.source_repo, clone, cfg)?;
+        let state =
+            crate::implement_resume::load_custody(clone)?.ok_or("custody record missing")?;
+        if state.destination_fingerprint != destination.fingerprint {
+            return Err("custody destination changed; remote refs kept".into());
+        }
+        let reference = format!("refs/heads/{}{}", cfg.ref_prefix, ck.task_id);
+        let records: Vec<_> = [state.normal, state.dirty]
+            .into_iter()
+            .filter(|r| r.last_pushed_sha.is_some())
+            .collect();
+        if records
+            .iter()
+            .any(|r| r.r#ref != reference && r.r#ref != format!("{reference}-dirty"))
+        {
+            return Err("custody ref identity changed".into());
+        }
+        let timeout = Duration::from_secs(cfg.push_timeout_secs);
+        Ok(Self {
+            scratch: Scratch::new(clone, timeout)?,
+            destination,
+            records,
+            timeout,
+        })
+    }
+    pub fn delete(self) -> Result<(), String> {
+        for record in self.records {
+            let mut cmd = git();
+            cmd.arg("-C")
+                .arg(&self.scratch.0)
+                .args(["push", "--no-verify", "--no-follow-tags", "--porcelain"])
+                .arg(format!(
+                    "--force-with-lease={}:{}",
+                    record.r#ref,
+                    record.last_pushed_sha.unwrap()
+                ))
+                .arg("--")
+                .arg(&self.destination.url)
+                .arg(format!(":{}", record.r#ref));
+            if !bounded(cmd, self.timeout)?.status.success() {
+                return Err("custody remote cleanup failed; remote ref kept".into());
+            }
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
