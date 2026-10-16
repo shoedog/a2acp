@@ -1385,6 +1385,8 @@ mod git_tests {
             edit_workflow: "e".into(),
             fix_workflow: "f".into(),
             loop_max_attempts: 1,
+            review_invocation: 0,
+            final_review: None,
             attempt_next: 1,
             forced_depth: None,
             resolved_lang: None,

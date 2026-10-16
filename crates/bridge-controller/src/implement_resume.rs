@@ -37,7 +37,11 @@ pub struct ImplementCheckpoint {
     pub edit_workflow: String,
     pub fix_workflow: String,
     pub loop_max_attempts: u32, // FROZEN from the original [implement] config
-    pub attempt_next: u32,      // the attempt to (re)start at
+    #[serde(default)]
+    pub review_invocation: u64,
+    #[serde(default)]
+    pub final_review: Option<String>,
+    pub attempt_next: u32, // the attempt to (re)start at
 
     /// Operator-forced review depth ("light"|"standard"), if any. `#[serde(default)]` so pre-existing
     /// (schema-version-1) checkpoints read as None = auto-size each attempt.
@@ -232,11 +236,18 @@ pub(crate) fn save_checkpoint_with_custody(
     ck: &ImplementCheckpoint,
     custody: Option<crate::custody_push::CustodyState>,
 ) -> Result<(), String> {
+    let mut ck = ck.clone();
+    if let Ok(previous) = load_checkpoint(clone) {
+        if previous.review_invocation > ck.review_invocation {
+            ck.review_invocation = previous.review_invocation;
+            ck.final_review = previous.final_review;
+        }
+    }
     let dir = clone.join(".git").join("a2a-bridge");
     std::fs::create_dir_all(&dir).map_err(|e| format!("checkpoint mkdir {dir:?}: {e}"))?;
     let tmp = dir.join("implement-checkpoint.json.tmp");
     let bytes = serde_json::to_vec_pretty(&CheckpointFile {
-        checkpoint: ck,
+        checkpoint: &ck,
         custody,
     })
     .map_err(|e| format!("checkpoint encode: {e}"))?;
@@ -426,6 +437,8 @@ mod tests {
             edit_workflow: "implement-edit".into(),
             fix_workflow: "implement-fix".into(),
             loop_max_attempts: 3,
+            review_invocation: 0,
+            final_review: None,
             attempt_next: 2,
             forced_depth: None,
             resolved_lang: None,

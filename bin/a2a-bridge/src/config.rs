@@ -594,6 +594,8 @@ pub struct RegistryConfig {
     pub merge: Option<MergeToml>,
     #[serde(default)]
     pub custody: bridge_controller::custody_push::CustodyConfig,
+    #[serde(default)]
+    pub evidence: bridge_controller::evidence::EvidenceConfig,
     /// `[batch]` (E3): parallel batch admission limits. Absent → batch RPCs are not wired.
     #[serde(default)]
     pub batch: Option<BatchToml>,
@@ -1866,6 +1868,7 @@ impl RegistryConfig {
     /// matching the inbound-server expectation that the auth header is already concrete).
     pub fn parse(s: &str) -> Result<Self, ConfigError> {
         let mut cfg: RegistryConfig = toml::from_str(s)?;
+        cfg.evidence.validate().map_err(ConfigError::Registry)?;
         if let Some(d) = cfg.delegation.as_mut() {
             d.peer_url = expand_env(&d.peer_url)?;
             d.auth = expand_env(&d.auth)?;
