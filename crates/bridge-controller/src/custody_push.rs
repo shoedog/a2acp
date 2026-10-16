@@ -234,6 +234,9 @@ fn object_format_from_head(clone: &Path) -> Result<&'static str, String> {
 struct Scratch(PathBuf);
 impl Scratch {
     fn new(clone: &Path, timeout: Duration) -> Result<Self, String> {
+        Self::with_format(clone, timeout, None)
+    }
+    fn with_format(clone: &Path, timeout: Duration, format: Option<&str>) -> Result<Self, String> {
         static NEXT: AtomicU64 = AtomicU64::new(0);
         let path = std::env::temp_dir().join(format!(
             "a2a-custody-{}-{}",
@@ -250,7 +253,10 @@ impl Scratch {
             .create(&path)
             .map_err(|_| "custody scratch creation failed")?;
         let scratch = Self(path);
-        let object_format = object_format_from_head(clone)?;
+        let object_format = match format {
+            Some(format) => format,
+            None => object_format_from_head(clone)?,
+        };
         let mut cmd = git();
         cmd.args(["init", "--bare", "--quiet", "--template="])
             .arg(format!("--object-format={object_format}"))
@@ -417,6 +423,19 @@ fn push_resolved(
     sha: &str,
     dest: Destination,
 ) -> Result<(), String> {
+    push_resolved_kind(clone, task_id, cfg, state, sha, dest, false)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn push_resolved_kind(
+    clone: &Path,
+    task_id: &str,
+    cfg: &CustodyConfig,
+    state: &mut CustodyState,
+    sha: &str,
+    dest: Destination,
+    dirty: bool,
+) -> Result<(), String> {
     let reference = format!("refs/heads/{}{task_id}", cfg.ref_prefix);
     if state.destination_fingerprint != dest.fingerprint || state.normal.r#ref != reference {
         state.normal = PushRecord {
@@ -430,12 +449,23 @@ fn push_resolved(
     }
     state.destination = dest.identity;
     state.destination_fingerprint = dest.fingerprint;
-    if state.normal.last_pushed_sha.as_deref() == Some(sha) {
+    let record = if dirty {
+        &mut state.dirty
+    } else {
+        &mut state.normal
+    };
+    let reference = record.r#ref.clone();
+    if record.last_pushed_sha.as_deref() == Some(sha) {
         return Ok(());
     }
-    let expected = state.normal.last_pushed_sha.as_deref().unwrap_or("");
+    let expected = record.last_pushed_sha.as_deref().unwrap_or("");
     let timeout = Duration::from_secs(cfg.push_timeout_secs);
-    let scratch = Scratch::new(clone, timeout)?;
+    let format = match sha.len() {
+        40 => "sha1",
+        64 => "sha256",
+        _ => return Err("custody object format unavailable".into()),
+    };
+    let scratch = Scratch::with_format(clone, timeout, Some(format))?;
     let mut cmd = git();
     cmd.arg("-C")
         .arg(&scratch.0)
@@ -476,10 +506,180 @@ fn push_resolved(
         }
         return Err("custody push failed (collision, stale lease, or transport refusal)".into());
     }
-    state.normal.last_pushed_sha = Some(sha.into());
+    record.last_pushed_sha = Some(sha.into());
     state.last_error = None;
     Ok(())
 }
+
+/// Status for custody must include untracked files and bypass optional index writes.
+pub fn custody_status(clone: &Path) -> Result<bool, String> {
+    let mut cmd = crate::implement::clone_git_command(clone).map_err(|_| "clone_config")?;
+    let out = cmd
+        .args([
+            "-c",
+            "core.hooksPath=/dev/null",
+            "-c",
+            "core.untrackedCache=false",
+            "status",
+            "--porcelain=v1",
+            "--untracked-files=all",
+            "--ignore-submodules=none",
+        ])
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .output()
+        .map_err(|_| "custody status failed")?;
+    if !out.status.success() {
+        return Err("custody status failed".into());
+    }
+    Ok(!out.stdout.is_empty())
+}
+
+struct SnapshotIndex(PathBuf);
+impl Drop for SnapshotIndex {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+        let mut lock = self.0.as_os_str().to_os_string();
+        lock.push(".lock");
+        let _ = std::fs::remove_file(PathBuf::from(lock));
+    }
+}
+
+fn snapshot(clone: &Path, task_id: &str) -> Result<String, String> {
+    use std::io::Write;
+    let path = clone
+        .join(".git")
+        .join(format!("a2a-snapshot-{}", crate::implement::nonce(16)));
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(&path)
+        .map_err(|_| "snapshot index creation failed")?;
+    let index = SnapshotIndex(path);
+    match std::fs::read(clone.join(".git/index")) {
+        Ok(bytes) => file
+            .write_all(&bytes)
+            .map_err(|_| "snapshot index copy failed")?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            // Git interprets an absent index as empty; a zero-byte index is invalid.
+            std::fs::remove_file(&index.0).map_err(|_| "snapshot index removal failed")?;
+        }
+        Err(_) => return Err("snapshot index copy failed".into()),
+    }
+    drop(file);
+    let run = |args: &[&str]| -> Result<std::process::Output, String> {
+        let mut cmd = crate::implement::clone_git_command(clone).map_err(|_| "clone_config")?;
+        cmd.args(crate::implement::pin_prefix_argv(&clone.to_string_lossy()))
+            .args(args)
+            .env("GIT_INDEX_FILE", &index.0)
+            .env("GIT_OPTIONAL_LOCKS", "0")
+            .env("GIT_AUTHOR_NAME", crate::implement::BOT_NAME)
+            .env("GIT_AUTHOR_EMAIL", crate::implement::BOT_EMAIL)
+            .env("GIT_COMMITTER_NAME", crate::implement::BOT_NAME)
+            .env("GIT_COMMITTER_EMAIL", crate::implement::BOT_EMAIL);
+        cmd.output().map_err(|_| "snapshot git failed".into())
+    };
+    if !run(&["add", "-A"])?.status.success() {
+        return Err("snapshot add failed".into());
+    }
+    let tree = run(&["write-tree"])?;
+    if !tree.status.success() {
+        return Err("snapshot write-tree failed".into());
+    }
+    let tree = String::from_utf8_lossy(&tree.stdout).trim().to_string();
+    let head = run(&["rev-parse", "--verify", "HEAD"])?;
+    let parent = String::from_utf8_lossy(&head.stdout).trim().to_string();
+    let message = format!("wip snapshot {task_id}");
+    let mut args = vec!["commit-tree", &tree, "-m", &message];
+    if head.status.success() {
+        args.extend(["-p", &parent]);
+    }
+    let commit = run(&args)?;
+    if !commit.status.success() {
+        return Err("snapshot commit-tree failed".into());
+    }
+    Ok(String::from_utf8_lossy(&commit.stdout).trim().to_string())
+}
+
+/// Shared terminal custody step. Failures are retained and never fail the run.
+pub fn finalize_terminal(
+    clone: &Path,
+    cfg: &CustodyConfig,
+    ck: &crate::implement_resume::ImplementCheckpoint,
+) {
+    finalize_terminal_inner(clone, cfg, ck, true, false);
+}
+
+/// Refusal adds custody records without rewriting phase, progress, or unknown checkpoint fields.
+pub fn finalize_refused_resume(
+    clone: &Path,
+    cfg: &CustodyConfig,
+    ck: &crate::implement_resume::ImplementCheckpoint,
+) {
+    finalize_terminal_inner(clone, cfg, ck, true, true);
+}
+
+/// Entry refused before runtime-confirmed custody: preserve metadata without invoking clone Git.
+pub fn finalize_terminal_without_git(
+    clone: &Path,
+    cfg: &CustodyConfig,
+    ck: &crate::implement_resume::ImplementCheckpoint,
+) {
+    finalize_terminal_inner(clone, cfg, ck, false, true);
+}
+
+fn finalize_terminal_inner(
+    clone: &Path,
+    cfg: &CustodyConfig,
+    ck: &crate::implement_resume::ImplementCheckpoint,
+    clone_ready: bool,
+    preserve_progress: bool,
+) {
+    let mut custody = crate::implement_resume::load_custody(clone).ok().flatten();
+    let result = (|| {
+        if !clone_ready {
+            return Err("host custody unavailable".into());
+        }
+        let dirty = custody_status(clone)?;
+        if !cfg.push || !dirty {
+            return Ok(());
+        }
+        let state = custody.get_or_insert_with(CustodyState::default);
+        if state.disabled.is_some() {
+            return Ok(());
+        }
+        cfg.validate()?;
+        let sha = snapshot(clone, &ck.task_id)?;
+        let dest = destination(&ck.source_repo, clone, cfg).inspect_err(|_| {
+            state.disabled = Some("destination".into());
+        })?;
+        push_resolved_kind(clone, &ck.task_id, cfg, state, &sha, dest, true)
+    })();
+    if let Err(error) = result {
+        let state = custody.get_or_insert_with(CustodyState::default);
+        if error == "clone_config" {
+            state.disabled = Some("clone_config".into());
+        }
+        eprintln!("[custody] warning: {error}");
+        state.last_error = Some(error);
+    }
+    let saved = if preserve_progress {
+        crate::implement_resume::save_custody_only(clone, custody)
+    } else {
+        crate::implement_resume::save_checkpoint_with_custody(clone, ck, custody)
+    };
+    if saved.is_err() {
+        eprintln!("[custody] warning: terminal checkpoint save failed");
+    }
+    terminal_archive_hook(clone, ck);
+}
+
+// I2 plugs its archive writer into this terminal hook.
+fn terminal_archive_hook(_clone: &Path, _ck: &crate::implement_resume::ImplementCheckpoint) {}
 
 /// Query an exact ref using the same isolated, bounded transport as push (I3 seam).
 pub fn ls_remote_ref(
@@ -661,6 +861,213 @@ mod tests {
             )
             .unwrap()
         }
+    }
+
+    #[test]
+    fn dirty_snapshot_contents_and_no_worktree_index_or_ref_mutation() {
+        let f = Fixture::new();
+        std::fs::write(f.clone.join("tracked"), "original").unwrap();
+        run(&f.clone, &["add", "tracked"]);
+        std::fs::write(f.clone.join(".gitignore"), "tracked\nignored\n").unwrap();
+        std::fs::write(f.clone.join("tracked"), "modified").unwrap();
+        std::fs::write(f.clone.join("untracked"), "new").unwrap();
+        std::fs::write(f.clone.join("ignored"), "excluded").unwrap();
+        let index = std::fs::read(f.clone.join(".git/index")).unwrap();
+        let refs = run(&f.clone, &["show-ref"]);
+        finalize_terminal(&f.clone, &f.cfg, &f.ck);
+        let state = crate::implement_resume::load_custody(&f.clone)
+            .unwrap()
+            .unwrap();
+        let sha = state.dirty.last_pushed_sha.unwrap();
+        assert_eq!(
+            run(&f.remote, &["rev-parse", "refs/heads/wip/impl-test-dirty"]),
+            sha
+        );
+        assert_eq!(
+            run(&f.clone, &["show", &format!("{sha}:tracked")]),
+            "modified"
+        );
+        assert_eq!(run(&f.clone, &["show", &format!("{sha}:untracked")]), "new");
+        assert_eq!(
+            run(&f.clone, &["ls-tree", "--name-only", &sha]),
+            ".gitignore\ntracked\nuntracked"
+        );
+        assert_eq!(
+            run(&f.clone, &["log", "-1", "--format=%s", &sha]),
+            "wip snapshot impl-test"
+        );
+        assert_eq!(
+            run(&f.clone, &["log", "-1", "--format=%an <%ae>", &sha]),
+            "a2a-implement <implement@a2a-bridge.local>"
+        );
+        assert_eq!(run(&f.clone, &["rev-parse", &format!("{sha}^")]), f.head());
+        assert_eq!(std::fs::read(f.clone.join(".git/index")).unwrap(), index);
+        assert_eq!(run(&f.clone, &["show-ref"]), refs);
+        for (name, contents) in [
+            ("tracked", "modified"),
+            ("untracked", "new"),
+            ("ignored", "excluded"),
+        ] {
+            assert_eq!(
+                std::fs::read_to_string(f.clone.join(name)).unwrap(),
+                contents
+            );
+        }
+        assert_no_snapshot_index(&f.clone);
+        // A second snapshot updates its own lease, without borrowing the normal lease.
+        std::fs::write(f.clone.join("untracked"), "newer").unwrap();
+        finalize_terminal(&f.clone, &f.cfg, &f.ck);
+        let state = crate::implement_resume::load_custody(&f.clone)
+            .unwrap()
+            .unwrap();
+        assert_ne!(state.dirty.last_pushed_sha, Some(sha));
+        assert!(state.normal.last_pushed_sha.is_none());
+    }
+
+    fn assert_no_snapshot_index(clone: &Path) {
+        assert!(
+            !std::fs::read_dir(clone.join(".git")).unwrap().any(|entry| {
+                entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("a2a-snapshot-")
+            })
+        );
+    }
+
+    #[test]
+    fn custody_status_overrides_hidden_untracked_and_fsmonitor() {
+        let f = Fixture::new();
+        let marker = f._root.path().join("fsmonitor-ran");
+        let hook = format!("!touch '{}'; printf 'v2\\0no-changes\\0'", marker.display());
+        run(&f.clone, &["config", "status.showUntrackedFiles", "no"]);
+        run(&f.clone, &["config", "core.fsmonitor", &hook]);
+        let _policy = crate::clone_config::ClonePolicyScope::install(
+            &f.clone,
+            crate::clone_config::CloneConfigPolicy {
+                enabled: true,
+                extra_keys: vec!["status.showUntrackedFiles".into(), "core.fsmonitor".into()],
+            },
+        )
+        .unwrap();
+        std::fs::write(f.clone.join("new"), "new").unwrap();
+        assert!(custody_status(&f.clone).unwrap());
+        run(&f.clone, &["-c", "core.fsmonitor=false", "add", "new"]);
+        run(
+            &f.clone,
+            &[
+                "-c",
+                "core.fsmonitor=false",
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "-qm",
+                "track",
+            ],
+        );
+        std::fs::write(f.clone.join("new"), "changed").unwrap();
+        assert!(custody_status(&f.clone).unwrap());
+        assert!(!marker.exists());
+    }
+
+    #[test]
+    fn inadmissible_snapshot_config_never_executes_and_opt_out_runs() {
+        for key in ["filter.x.clean", "core.worktree", "include.path"] {
+            let f = Fixture::new();
+            let marker = f._root.path().join("filter-ran");
+            let sentinel = f._root.path().join("host-only");
+            std::fs::write(&sentinel, "secret").unwrap();
+            std::fs::write(f.clone.join(".gitattributes"), "payload filter=x\n").unwrap();
+            std::fs::write(f.clone.join("payload"), "new").unwrap();
+            let filter = format!("cat '{}' > '{}'; cat", sentinel.display(), marker.display());
+            let value = match key {
+                "filter.x.clean" => filter,
+                "core.worktree" => f.source.to_string_lossy().into_owned(),
+                _ => sentinel.to_string_lossy().into_owned(),
+            };
+            run(&f.clone, &["config", key, &value]);
+            finalize_terminal(&f.clone, &f.cfg, &f.ck);
+            let state = crate::implement_resume::load_custody(&f.clone)
+                .unwrap()
+                .unwrap();
+            assert_eq!(state.disabled.as_deref(), Some("clone_config"));
+            assert!(state.dirty.last_pushed_sha.is_none());
+            assert!(!marker.exists());
+            assert_no_snapshot_index(&f.clone);
+        }
+        let f = Fixture::new();
+        run(&f.clone, &["config", "status.showUntrackedFiles", "no"]);
+        std::fs::write(f.clone.join("new"), "new").unwrap();
+        let _policy = crate::clone_config::ClonePolicyScope::install(
+            &f.clone,
+            crate::clone_config::CloneConfigPolicy {
+                enabled: false,
+                extra_keys: vec![],
+            },
+        )
+        .unwrap();
+        finalize_terminal(&f.clone, &f.cfg, &f.ck);
+        assert!(crate::implement_resume::load_custody(&f.clone)
+            .unwrap()
+            .unwrap()
+            .dirty
+            .last_pushed_sha
+            .is_some());
+    }
+
+    #[test]
+    fn unborn_snapshot_has_no_parent_and_keeps_absent_real_index() {
+        let f = Fixture::new();
+        run(&f.clone, &["symbolic-ref", "HEAD", "refs/heads/unborn"]);
+        let index = f.clone.join(".git/index");
+        if index.exists() {
+            std::fs::remove_file(&index).unwrap();
+        }
+        std::fs::write(f.clone.join("new"), "new").unwrap();
+        finalize_terminal(&f.clone, &f.cfg, &f.ck);
+        let state = crate::implement_resume::load_custody(&f.clone)
+            .unwrap()
+            .unwrap();
+        let sha = state.dirty.last_pushed_sha.unwrap();
+        assert_eq!(run(&f.clone, &["rev-list", "--parents", "-n1", &sha]), sha);
+        assert_eq!(
+            run(&f.clone, &["symbolic-ref", "HEAD"]),
+            "refs/heads/unborn"
+        );
+        assert!(!index.exists());
+        assert_no_snapshot_index(&f.clone);
+    }
+
+    #[test]
+    fn snapshot_collision_and_build_failure_are_nonfatal_and_remove_index() {
+        let f = Fixture::new();
+        std::fs::write(f.clone.join("new"), "new").unwrap();
+        run(
+            &f.remote,
+            &[
+                "fetch",
+                f.clone.to_str().unwrap(),
+                "HEAD:refs/heads/wip/impl-test-dirty",
+            ],
+        );
+        finalize_terminal(&f.clone, &f.cfg, &f.ck);
+        let state = crate::implement_resume::load_custody(&f.clone)
+            .unwrap()
+            .unwrap();
+        assert_eq!(state.disabled.as_deref(), Some("collision_or_stale_lease"));
+        assert!(state.last_error.is_some());
+        assert_no_snapshot_index(&f.clone);
+        let f = Fixture::new();
+        std::fs::write(f.clone.join(".git/index"), "invalid index").unwrap();
+        assert!(snapshot(&f.clone, "impl-test").is_err());
+        assert_no_snapshot_index(&f.clone);
+        assert_eq!(
+            std::fs::read_to_string(f.clone.join(".git/index")).unwrap(),
+            "invalid index"
+        );
     }
 
     #[test]

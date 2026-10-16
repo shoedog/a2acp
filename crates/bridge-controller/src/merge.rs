@@ -81,6 +81,9 @@ pub fn decide_merge(
                 Err(e) => MergePlan::Refuse(format!("cannot resolve target: {e}")),
             }
         }
+        Abort | NoCommitClean | NoCommitDirty | CommitFailed => {
+            MergePlan::RefuseHard("run finished without a commit — nothing to merge".into())
+        }
         Cloned | EditStarted | FirstCommitCreated | InLoop => MergePlan::RefuseHard(
             "run is not finished — `resume` it first (--force cannot override)".into(),
         ),
