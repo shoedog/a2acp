@@ -345,6 +345,7 @@ pub fn slice_ref_path(clone: &Path, runid: &str) -> PathBuf {
 /// The review step's terminal state. Every post-commit failure maps here (no `?` past the commit).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReviewOutcome {
+    Refused(String), // admission failure is terminal, never ordinary review degradation
     Ran {
         verdict: Verdict,
         summary: String,
@@ -505,6 +506,7 @@ pub fn outcome_suffix(o: &ReviewOutcome) -> String {
                 format!("review: {label}  ({summary}){degraded}")
             }
         }
+        ReviewOutcome::Refused(reason) => format!("review: refused ({reason})"),
         ReviewOutcome::NotConfigured => "review: not configured".to_string(),
         ReviewOutcome::ConfigError => "review: skipped (config error)".to_string(),
         ReviewOutcome::NotLoaded => "review: skipped (unknown workflow)".to_string(),

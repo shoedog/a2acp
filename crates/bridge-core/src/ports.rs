@@ -583,6 +583,12 @@ pub trait AgentBackend: Send + Sync {
     fn capabilities(&self) -> crate::orch::AgentSessionCaps {
         crate::orch::AgentSessionCaps::default()
     }
+    /// Freeze every write-capable process before host repository access; resume only before a turn.
+    /// Unsupported backends refuse: stream completion alone does not stop background writers.
+    async fn set_host_custody(&self, _held: bool) -> Result<(), BridgeError> {
+        Err(BridgeError::IdentityUnavailable)
+    }
+
     /// Graceful async teardown (the registry drains leases before calling this). Default: no-op. [§5.4]
     async fn retire(&self) -> Result<(), BridgeError> {
         Ok(())

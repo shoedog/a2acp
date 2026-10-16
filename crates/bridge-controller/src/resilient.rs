@@ -49,6 +49,7 @@ pub struct ResilientWarm {
     spec: SessionSpec,
     /// Run-wide respawn budget shared by the edit turn and all fix turns; 0 disables auto-respawn.
     respawns_left: Mutex<u32>,
+    clone_config_guard: bool,
 }
 
 impl ResilientWarm {
@@ -65,7 +66,31 @@ impl ResilientWarm {
             reset_worktree,
             spec,
             respawns_left: Mutex::new(max_respawns),
+            clone_config_guard: true,
         }
+    }
+
+    pub fn with_clone_config_guard(mut self, enabled: bool) -> Self {
+        self.clone_config_guard = enabled;
+        self
+    }
+
+    pub async fn acquire_host_custody(&self) -> Result<(), String> {
+        if !self.clone_config_guard {
+            return Ok(());
+        }
+        self.backend
+            .lock()
+            .await
+            .clone()
+            .set_host_custody(true)
+            .await
+            .map_err(|_| {
+                let reason =
+                    "implement: cannot freeze clone writers; stopping before host git (clone kept)";
+                eprintln!("{reason}");
+                reason.into()
+            })
     }
 
     pub async fn retire(&self) -> Result<(), BridgeError> {
@@ -77,6 +102,10 @@ impl ResilientWarm {
 
 #[async_trait::async_trait]
 impl turn::TurnRunner for ResilientWarm {
+    async fn acquire_host_custody(&self) -> Result<(), String> {
+        ResilientWarm::acquire_host_custody(self).await
+    }
+
     async fn run_turn(&self, session: &SessionId, parts: Vec<Part>) -> bool {
         self.run_turn_observed(
             session,
@@ -139,6 +168,10 @@ impl turn::TurnRunner for ResilientWarm {
         let _close_evidence = CloseEvidence(telemetry.terminal_evidence.clone());
         loop {
             let backend = self.backend.lock().await.clone();
+            if self.clone_config_guard && backend.set_host_custody(false).await.is_err() {
+                eprintln!("implement: cannot resume clone writers; stopping (clone kept)");
+                return false;
+            }
             if let Some(meta) = telemetry.turn_meta.clone() {
                 backend.configure_turn(session, meta).await;
             }
@@ -189,7 +222,10 @@ impl turn::TurnRunner for ResilientWarm {
             }
 
             let _ = backend.cancel(session).await;
-            let _ = backend.retire().await;
+            if backend.retire().await.is_err() {
+                eprintln!("implement: writer retirement unconfirmed; stopping before host git");
+                return false;
+            }
             if let Err(e) = (self.reset_worktree)() {
                 eprintln!("[implement] warm respawn reset failed: {e}");
                 return false;
@@ -463,6 +499,10 @@ mod tests {
 
     #[async_trait::async_trait]
     impl AgentBackend for FakeBackend {
+        async fn set_host_custody(&self, _held: bool) -> Result<(), BridgeError> {
+            Ok(())
+        }
+
         async fn prompt(
             &self,
             _session: &SessionId,
@@ -560,6 +600,45 @@ mod tests {
             self.count.fetch_add(1, Ordering::SeqCst);
             Ok(self.next.clone() as Arc<dyn AgentBackend>)
         }
+    }
+
+    struct NoCustodyBackend;
+    #[async_trait::async_trait]
+    impl AgentBackend for NoCustodyBackend {
+        async fn set_host_custody(&self, _: bool) -> Result<(), BridgeError> {
+            panic!("opt-out must skip both pause and unpause");
+        }
+        async fn prompt(&self, _: &SessionId, _: Vec<Part>) -> Result<BackendStream, BridgeError> {
+            Ok(done_stream())
+        }
+        async fn cancel(&self, _: &SessionId) -> Result<(), BridgeError> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn clone_config_opt_out_skips_all_pause_custody() {
+        let runner = ResilientWarm::new(
+            Arc::new(NoCustodyBackend),
+            Arc::new(CountingRebuild {
+                count: Arc::new(AtomicUsize::new(0)),
+                next: Arc::new(FakeBackend::new(
+                    BridgeError::agent_crashed("unused"),
+                    false,
+                    true,
+                )),
+            }),
+            session_spec(),
+            0,
+            Arc::new(|| Ok(())),
+        )
+        .with_clone_config_guard(false);
+        runner.acquire_host_custody().await.unwrap();
+        assert!(
+            runner
+                .run_turn(&SessionId::parse("opt-out").unwrap(), vec![])
+                .await
+        );
     }
 
     #[tokio::test]

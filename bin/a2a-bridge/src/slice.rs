@@ -1,13 +1,13 @@
 //! Host-side prism diff-slice prep for implement-review (standard tier). The bridge runs the prism slicing
 //! CLI on the committed diff and writes a defect-focused review slice to a reference file UNDER `.git/`.
-//! Degrades to None on any failure — the slice is an accelerant, never a hard dependency.
+//! Tool failures degrade to None. Clone admission failures refuse the review before Git runs.
 use std::path::Path;
 use std::time::Duration;
 
 /// Injectable command runner (real = tokio process; tests = fake), so the seam is unit-tested without prism.
 #[async_trait::async_trait]
 pub trait SliceRunner: Send + Sync {
-    /// Run `git diff base..head` then the prism CLI; return the slice text, or None on any failure/timeout.
+    /// Run `git diff base..head` then prism. Tool failures/timeouts return Ok(None); admission refuses with Err.
     async fn produce(
         &self,
         clone: &Path,
@@ -15,7 +15,7 @@ pub trait SliceRunner: Send + Sync {
         head: &str,
         prism: &Path,
         timeout: Duration,
-    ) -> Option<String>;
+    ) -> Result<Option<String>, String>;
 }
 
 /// Write `text` (truncated head+tail to `max_bytes`) to `ref_path`, creating parent dirs. Best-effort.
@@ -44,7 +44,7 @@ pub fn write_slice(ref_path: &Path, text: &str, max_bytes: usize) -> std::io::Re
 }
 
 /// Production runner: `git diff base..head > tmp` in the clone, then `prism --repo <clone> --diff tmp
-/// --format review`, bounded by `timeout`. Any nonzero/spawn/timeout → None (degrade).
+/// --format review`, bounded by `timeout`. Admission refuses; tool errors return Ok(None).
 pub struct ProdSliceRunner;
 
 #[async_trait::async_trait]
@@ -56,12 +56,17 @@ impl SliceRunner for ProdSliceRunner {
         head: &str,
         prism: &Path,
         timeout: Duration,
-    ) -> Option<String> {
-        tokio::time::timeout(timeout, async {
+    ) -> Result<Option<String>, String> {
+        bridge_controller::implement::guard_clone(clone)?;
+        let command =
+            bridge_controller::implement::clone_git_command(clone).map_err(|e| e.to_string())?;
+        Ok(tokio::time::timeout(timeout, async {
             // --no-ext-diff/--no-textconv: never invoke an external diff/textconv driver (could hang/be hostile).
-            let diff = tokio::process::Command::new("git")
-                .current_dir(clone)
+            let diff = tokio::process::Command::from(command)
+                .kill_on_drop(true)
                 .args([
+                    "-c",
+                    "core.fsmonitor=false",
                     "diff",
                     "--no-ext-diff",
                     "--no-textconv",
@@ -79,6 +84,7 @@ impl SliceRunner for ProdSliceRunner {
             }
             std::fs::write(&tmp, &diff.stdout).ok()?;
             let out = tokio::process::Command::new(prism)
+                .kill_on_drop(true)
                 .current_dir(clone)
                 .args(["--repo"])
                 .arg(clone)
@@ -94,7 +100,7 @@ impl SliceRunner for ProdSliceRunner {
         })
         .await
         .ok()
-        .flatten()
+        .flatten())
     }
 }
 
@@ -112,8 +118,8 @@ mod tests {
             _h: &str,
             _p: &Path,
             _t: Duration,
-        ) -> Option<String> {
-            Some("SLICE BODY".to_string())
+        ) -> Result<Option<String>, String> {
+            Ok(Some("SLICE BODY".to_string()))
         }
     }
     struct FakeNone;
@@ -126,9 +132,36 @@ mod tests {
             _h: &str,
             _p: &Path,
             _t: Duration,
-        ) -> Option<String> {
-            None
+        ) -> Result<Option<String>, String> {
+            Ok(None)
         }
+    }
+
+    #[tokio::test]
+    async fn production_slice_refuses_config_before_git_or_prism() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join(".git")).unwrap();
+        std::fs::write(
+            dir.path().join(".git/config"),
+            "[include]\npath = secret-value\n",
+        )
+        .unwrap();
+        let result = ProdSliceRunner
+            .produce(
+                dir.path(),
+                "a",
+                "b",
+                Path::new("/never-run-prism"),
+                Duration::from_secs(1),
+            )
+            .await;
+        let err = result.unwrap_err();
+        assert!(err.contains("include.path"));
+        assert!(!err.contains("secret-value"));
+        assert!(!dir
+            .path()
+            .join(".git/a2a-bridge/review-slices/diff.patch")
+            .exists());
     }
 
     #[tokio::test]
@@ -144,7 +177,8 @@ mod tests {
                 Path::new("/x/prism"),
                 Duration::from_secs(5),
             )
-            .await;
+            .await
+            .unwrap();
         assert_eq!(body.as_deref(), Some("SLICE BODY"));
         write_slice(&refp, &body.unwrap(), 200_000).unwrap();
         assert_eq!(std::fs::read_to_string(&refp).unwrap(), "SLICE BODY");
@@ -179,6 +213,7 @@ mod tests {
                 Duration::from_secs(1)
             )
             .await
+            .unwrap()
             .is_none());
     }
 

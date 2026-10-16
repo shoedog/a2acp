@@ -1672,9 +1672,13 @@ impl ReviewToml {
 }
 
 /// `[implement]` (Slice B2b-3b): bounds + names the fix workflow for the review→tweak loop.
-#[derive(Debug, serde::Deserialize)]
+#[derive(Debug, Default, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ImplementToml {
+    #[serde(default)]
+    pub clone_config_guard: Option<bool>,
+    #[serde(default)]
+    pub clone_config_extra_keys: Vec<String>,
     #[serde(default)]
     pub max_attempts: Option<u32>,
     #[serde(default)]
@@ -1687,6 +1691,7 @@ pub struct ImplementToml {
 /// `FixUnavailable`, never an abort). A malformed block is fail-loud PRE-clone (resolved before the clone).
 #[derive(Debug, Clone)]
 pub struct LoopConfig {
+    pub clone_config: bridge_controller::clone_config::CloneConfigPolicy,
     pub max_attempts: u32,
     pub fix_workflow: bridge_core::ids::WorkflowId,
     pub max_session_respawns: u32,
@@ -1702,6 +1707,7 @@ pub const RESPAWN_HARD_MAX: u32 = 20;
 impl Default for LoopConfig {
     fn default() -> Self {
         Self {
+            clone_config: Default::default(),
             max_attempts: 3,
             fix_workflow: default_fix_workflow_id(),
             max_session_respawns: 3,
@@ -1710,6 +1716,17 @@ impl Default for LoopConfig {
 }
 
 impl ImplementToml {
+    fn clone_config_policy(
+        &self,
+    ) -> Result<bridge_controller::clone_config::CloneConfigPolicy, ConfigError> {
+        let policy = bridge_controller::clone_config::CloneConfigPolicy {
+            enabled: self.clone_config_guard.unwrap_or(true),
+            extra_keys: self.clone_config_extra_keys.clone(),
+        };
+        policy.validate().map_err(ConfigError::Registry)?;
+        Ok(policy)
+    }
+
     pub fn to_config(&self) -> Result<LoopConfig, ConfigError> {
         let max_attempts = match self.max_attempts {
             None => 3,
@@ -1743,7 +1760,9 @@ impl ImplementToml {
             }
             Some(n) => n,
         };
+        let clone_config = self.clone_config_policy()?;
         Ok(LoopConfig {
+            clone_config,
             max_attempts,
             fix_workflow,
             max_session_respawns,
@@ -2120,6 +2139,9 @@ impl RegistryConfig {
 
     /// Convert this parsed config into a `RegistrySnapshot` with typed domain values.
     pub fn into_snapshot(self) -> Result<RegistrySnapshot, ConfigError> {
+        if let Some(implement) = &self.implement {
+            implement.clone_config_policy()?;
+        }
         // The watchdog is PER-AGENT only; a top-level `[watchdog]` table would be a silent no-op
         // (every `AcpConfig.watchdog` stays `None`). Reject it so an operator isn't misled.
         if self.watchdog.is_some() {
@@ -4451,6 +4473,7 @@ addr="127.0.0.1:8080"
             max_attempts: None,
             fix_workflow: None,
             max_session_respawns: None,
+            ..Default::default()
         }
         .to_config()
         .unwrap();
@@ -4468,6 +4491,7 @@ addr="127.0.0.1:8080"
             max_attempts: Some(0),
             fix_workflow: None,
             max_session_respawns: None,
+            ..Default::default()
         }
         .to_config()
         .is_err());
@@ -4479,6 +4503,7 @@ addr="127.0.0.1:8080"
             max_attempts: Some(99),
             fix_workflow: None,
             max_session_respawns: None,
+            ..Default::default()
         }
         .to_config()
         .unwrap();
@@ -4491,6 +4516,7 @@ addr="127.0.0.1:8080"
             max_attempts: Some(2),
             fix_workflow: Some("my-fix".into()),
             max_session_respawns: None,
+            ..Default::default()
         }
         .to_config()
         .unwrap();
@@ -4500,6 +4526,7 @@ addr="127.0.0.1:8080"
             max_attempts: None,
             fix_workflow: Some("".into()),
             max_session_respawns: None,
+            ..Default::default()
         }
         .to_config()
         .is_err());
@@ -4511,6 +4538,7 @@ addr="127.0.0.1:8080"
             max_attempts: None,
             fix_workflow: None,
             max_session_respawns: Some(99),
+            ..Default::default()
         }
         .to_config()
         .unwrap();
@@ -4520,10 +4548,37 @@ addr="127.0.0.1:8080"
             max_attempts: None,
             fix_workflow: None,
             max_session_respawns: Some(0),
+            ..Default::default()
         }
         .to_config()
         .unwrap();
         assert_eq!(lc.max_session_respawns, 0);
+    }
+
+    #[test]
+    fn clone_config_settings_default_and_validate_exact_extra_keys() {
+        let base = "default='x'\n[[agents]]\nid='x'\ncmd='echo'\n[server]\n";
+        let defaults = ImplementToml::default().to_config().unwrap();
+        assert!(defaults.clone_config.enabled);
+        assert!(defaults.clone_config.extra_keys.is_empty());
+        let parsed = RegistryConfig::parse(&format!("{base}\n[implement]\nclone_config_guard=false\nclone_config_extra_keys=['CORE.AutoCrLf']\n")).unwrap();
+        let policy = parsed
+            .implement
+            .as_ref()
+            .unwrap()
+            .to_config()
+            .unwrap()
+            .clone_config;
+        assert!(!policy.enabled);
+        assert_eq!(policy.extra_keys, ["CORE.AutoCrLf"]);
+        parsed.into_snapshot().unwrap();
+        for key in ["", "branch.*.merge", "remote.?.url", "core."] {
+            let cfg = RegistryConfig::parse(&format!(
+                "{base}\n[implement]\nclone_config_extra_keys=['{key}']\n"
+            ))
+            .unwrap();
+            assert!(cfg.into_snapshot().is_err(), "{key:?}");
+        }
     }
 
     #[test]

@@ -14,6 +14,7 @@
 //!
 //! Scaffold slice: intentionally empty; module moves follow.
 
+pub mod clone_config;
 pub mod custody_push;
 pub mod implement;
 pub mod implement_resume;

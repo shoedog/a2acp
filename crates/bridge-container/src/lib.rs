@@ -71,6 +71,16 @@ pub trait ContainerSpawn: Send + Sync {
         Ok(())
     }
 
+    /// Control the exact immutable container, never a reusable name. Unsupported controls refuse.
+    async fn set_host_custody(
+        &self,
+        _runtime: &str,
+        _id: &str,
+        _held: bool,
+    ) -> Result<(), BridgeError> {
+        Err(BridgeError::IdentityUnavailable)
+    }
+
     async fn spawn(
         &self,
         program: &str,
@@ -89,6 +99,57 @@ pub trait ContainerSpawn: Send + Sync {
     ) -> Result<ContainerSpawnResultV1, BridgeError> {
         self.spawn(program, argv, cfg, request).await
     }
+}
+
+/// Runtime-confirmed cgroup/process freeze for one immutable container. No output from the runtime
+/// enters errors (it can contain operator data). Every subprocess is bounded and killed on timeout.
+pub async fn set_container_host_custody(
+    runtime: &str,
+    id: &str,
+    held: bool,
+) -> Result<(), BridgeError> {
+    async fn command(runtime: &str, args: &[&str]) -> Result<std::process::Output, BridgeError> {
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            tokio::process::Command::new(runtime)
+                .args(args)
+                .kill_on_drop(true)
+                .output(),
+        )
+        .await
+        .map_err(|_| BridgeError::IdentityUnavailable)?
+        .map_err(|_| BridgeError::IdentityUnavailable)
+    }
+    async fn paused(runtime: &str, id: &str) -> Result<bool, BridgeError> {
+        let out = command(
+            runtime,
+            &[
+                "inspect",
+                "--format",
+                "{{.Id}} {{.State.Running}} {{.State.Paused}}",
+                id,
+            ],
+        )
+        .await?;
+        if !out.status.success() {
+            return Err(BridgeError::IdentityUnavailable);
+        }
+        let text =
+            std::str::from_utf8(&out.stdout).map_err(|_| BridgeError::IdentityUnavailable)?;
+        let fields: Vec<_> = text.split_whitespace().collect();
+        match fields.as_slice() {
+            [observed, "true", "true"] if *observed == id => Ok(true),
+            [observed, "true", "false"] if *observed == id => Ok(false),
+            _ => Err(BridgeError::IdentityUnavailable),
+        }
+    }
+    if paused(runtime, id).await? != held {
+        let out = command(runtime, &[if held { "pause" } else { "unpause" }, id]).await?;
+        if !out.status.success() || paused(runtime, id).await? != held {
+            return Err(BridgeError::IdentityUnavailable);
+        }
+    }
+    Ok(())
 }
 
 async fn record_container_transition(
@@ -476,6 +537,7 @@ struct InflightTurn {
 /// session was configured with (re-applied on a warm reuse turn).
 #[derive(Clone)]
 struct WarmInner {
+    immutable_container_id: String,
     inner: Arc<dyn AgentBackend>,
     owner: ReapOwner,
     rw_canon: SessionCwd,
@@ -558,6 +620,7 @@ pub struct ContainerRwBackend {
     /// admission checks it under the same lock, closing the drain-then-spawn
     /// window.
     retired: AtomicBool,
+    host_custody_held: AtomicBool,
     lifecycle: Lifecycle,
     /// Warm mode only: the authoritative cached container/session per `SessionId` (drained at `retire`).
     warm: Mutex<HashMap<SessionId, WarmInner>>,
@@ -654,6 +717,7 @@ impl ContainerRwBackend {
             inflight: Arc::new(Mutex::new(HashMap::new())),
             turn_seq: AtomicU64::new(0),
             retired: AtomicBool::new(false),
+            host_custody_held: AtomicBool::new(false),
             lifecycle: Lifecycle::PerTurn,
             warm: Mutex::new(HashMap::new()),
             session_reaps: StdMutex::new(HashMap::new()),
@@ -1094,6 +1158,7 @@ impl ContainerRwBackend {
             return Err(e);
         }
         Ok(WarmInner {
+            immutable_container_id: spawned.immutable_container_id,
             inner,
             owner,
             rw_canon,
@@ -1131,6 +1196,9 @@ impl ContainerRwBackend {
         let epoch = self.turn_epoch.fetch_add(1, Ordering::Relaxed);
         {
             let mut ta = self.turn_active.lock().await;
+            if self.host_custody_held.load(Ordering::SeqCst) {
+                return Err(BridgeError::InvalidStateTransition);
+            }
             if ta.contains_key(session) {
                 return Err(BridgeError::ConfigInvalid {
                     reason: format!("session {} already has an in-flight turn", session.as_str()),
@@ -1936,6 +2004,54 @@ impl AgentBackend for ContainerRwBackend {
         result
     }
 
+    async fn set_host_custody(&self, held: bool) -> Result<(), BridgeError> {
+        if !self.is_warm() {
+            return Err(BridgeError::InvalidStateTransition);
+        }
+        // The same lock reserves warm prompts. Hold it through runtime confirmation so a new
+        // prompt cannot start while writers are being frozen or resumed.
+        let active = self.turn_active.lock().await;
+        if !active.is_empty() {
+            return Err(BridgeError::InvalidStateTransition);
+        }
+        if held {
+            // Latch before awaiting; cancellation or partial failure must leave prompt admission shut.
+            self.host_custody_held.store(true, Ordering::SeqCst);
+        }
+        let warm = self.warm.lock().await;
+        let owners: Vec<_> = self
+            .session_reaps
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .values()
+            .cloned()
+            .collect();
+        for owner in owners {
+            if owner
+                .authority
+                .bound_controller()
+                .is_some_and(|c| c.result() == Some(Ok(())))
+            {
+                continue; // Observed complete removal, not merely a requested reap.
+            }
+            let Some(inner) = warm
+                .values()
+                .find(|w| w.owner.generation == owner.generation)
+            else {
+                return Err(BridgeError::IdentityUnavailable);
+            };
+            self.spawn
+                .set_host_custody(
+                    self.cfg.sandbox.runtime(),
+                    &inner.immutable_container_id,
+                    held,
+                )
+                .await?;
+        }
+        self.host_custody_held.store(held, Ordering::SeqCst);
+        Ok(())
+    }
+
     async fn retire(&self) -> Result<(), BridgeError> {
         // Seal admission and snapshot every retained generation under the same
         // lock used by reservation. Start every process-owned reap before the
@@ -2347,6 +2463,8 @@ mod tests {
     }
 
     struct CountingSpawn {
+        custody_calls: Mutex<Vec<(String, bool)>>,
+        custody_fails: AtomicBool,
         count: AtomicUsize,
         fail: bool,
         fail_prompt: bool,
@@ -2463,6 +2581,8 @@ mod tests {
         ) -> Arc<Self> {
             Arc::new(Self {
                 count: AtomicUsize::new(0),
+                custody_calls: Mutex::new(Vec::new()),
+                custody_fails: AtomicBool::new(false),
                 fail,
                 fail_prompt: false,
                 terminal_evidence_v1: AtomicBool::new(false),
@@ -2486,6 +2606,19 @@ mod tests {
     }
     #[async_trait]
     impl ContainerSpawn for CountingSpawn {
+        async fn set_host_custody(
+            &self,
+            _runtime: &str,
+            id: &str,
+            held: bool,
+        ) -> Result<(), BridgeError> {
+            self.custody_calls.lock().await.push((id.into(), held));
+            if self.custody_fails.load(Ordering::SeqCst) {
+                Err(BridgeError::IdentityUnavailable)
+            } else {
+                Ok(())
+            }
+        }
         async fn spawn(
             &self,
             _program: &str,
@@ -4332,6 +4465,72 @@ mod tests {
     }
 
     // ---- warm-mode tests (B2b-3c) -----------------------------------------
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn host_custody_requires_exact_identity_and_confirmed_frozen_state() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let runtime = tmp.path().join("runtime");
+        // A runtime accepting pause without actually freezing is not custody.
+        std::fs::write(&runtime, "#!/bin/sh\ncase \"$1\" in\ninspect) printf 'immutable-id true false\\n';;\npause) exit 0;;\n*) exit 1;;\nesac\n").unwrap();
+        std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(
+            set_container_host_custody(runtime.to_str().unwrap(), "immutable-id", true)
+                .await
+                .is_err()
+        );
+        // A reused selector or a mismatched returned identity is never sufficient either.
+        std::fs::write(&runtime, "#!/bin/sh\nprintf 'different-id true true\\n'\n").unwrap();
+        assert!(
+            set_container_host_custody(runtime.to_str().unwrap(), "immutable-id", true)
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn host_custody_freezes_exact_generation_and_preserves_warm_session() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_str().unwrap();
+        let spawn = CountingSpawn::new(false);
+        let (reap, reaps) = counting_reap();
+        let be = warm_backend(root, spawn.clone(), reap).await;
+        let session = SessionId::parse("implement-x").unwrap();
+        be.configure_session(&session, &spec_cwd(root))
+            .await
+            .unwrap();
+        let mut stream = be.prompt(&session, vec![]).await.unwrap();
+        assert!(
+            be.set_host_custody(true).await.is_err(),
+            "active turn cannot be frozen"
+        );
+        while stream.next().await.is_some() {}
+        be.set_host_custody(true).await.unwrap();
+        assert!(
+            be.prompt(&session, vec![]).await.is_err(),
+            "host custody closes prompt admission"
+        );
+        let calls = spawn.custody_calls.lock().await.clone();
+        assert_eq!(calls.len(), 1);
+        assert!(
+            calls[0].0.starts_with("sha256:test-"),
+            "immutable id, never container name"
+        );
+        assert!(calls[0].1);
+        be.set_host_custody(false).await.unwrap();
+        let mut stream = be.prompt(&session, vec![]).await.unwrap();
+        while stream.next().await.is_some() {}
+        assert_eq!(spawn.count.load(Ordering::SeqCst), 1);
+        assert_eq!(reaps.load(Ordering::SeqCst), 0);
+        spawn.custody_fails.store(true, Ordering::SeqCst);
+        assert!(be.set_host_custody(true).await.is_err());
+        assert!(
+            be.prompt(&session, vec![]).await.is_err(),
+            "failed freeze stays closed"
+        );
+        assert!(tmp.path().exists());
+    }
 
     #[tokio::test]
     async fn warm_reuses_one_inner_across_turns() {

@@ -114,6 +114,76 @@ pub fn checkpoint_path(clone: &Path) -> PathBuf {
         .join("implement-checkpoint.json")
 }
 
+/// Process-run IDs are distinct from task IDs and change on resume. Record them before any
+/// container can spawn, so later entry points can query every generation's exact `a2a.run` label.
+/// The cwd-label inventory remains mandatory for older runs and agent-modified/missing records.
+pub fn container_run_ids(clone: &Path) -> Result<Vec<String>, String> {
+    let path = clone.join(".git/a2a-bridge/container-runs.json");
+    let metadata = match std::fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(_) => return Err("container run record unreadable".into()),
+    };
+    if !metadata.file_type().is_file() || metadata.len() > 65536 {
+        return Err("container run record must be a bounded regular file".into());
+    }
+    use std::io::Read;
+    let mut bytes = Vec::new();
+    std::fs::File::open(path)
+        .map_err(|_| "container run record unreadable")?
+        .take(65537)
+        .read_to_end(&mut bytes)
+        .map_err(|_| "container run record unreadable")?;
+    if bytes.len() > 65536 {
+        return Err("container run record too large".into());
+    }
+    let ids: Vec<String> =
+        serde_json::from_slice(&bytes).map_err(|_| "invalid container run record")?;
+    if ids.iter().any(|id| {
+        id.is_empty()
+            || id.len() > 128
+            || !id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+    }) {
+        return Err("invalid container run id".into());
+    }
+    Ok(ids)
+}
+
+pub fn record_container_run(clone: &Path, instance_id: &str) -> Result<(), String> {
+    let mut ids = container_run_ids(clone)?;
+    if !ids.iter().any(|id| id == instance_id) {
+        ids.push(instance_id.to_string());
+    }
+    let dir = clone.join(".git/a2a-bridge");
+    match std::fs::create_dir(&dir) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(_) => return Err("container run record mkdir failed".into()),
+    }
+    if !std::fs::symlink_metadata(&dir).is_ok_and(|metadata| metadata.file_type().is_dir()) {
+        return Err("container run record directory must be a real directory".into());
+    }
+    let bytes = serde_json::to_vec(&ids).map_err(|_| "container run record encode failed")?;
+    let tmp = dir.join(format!(
+        "container-runs.{}.tmp",
+        crate::implement::nonce(16)
+    ));
+    use std::io::Write;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp)
+        .map_err(|_| "container run record create failed")?;
+    if file.write_all(&bytes).is_err() {
+        let _ = std::fs::remove_file(&tmp);
+        return Err("container run record write failed".into());
+    }
+    drop(file);
+    std::fs::rename(tmp, dir.join("container-runs.json"))
+        .map_err(|_| "container run record rename failed")?;
+    Ok(())
+}
+
 /// Atomic write: serialize to a temp file in the same dir, then rename over the target.
 pub fn save_checkpoint(clone: &Path, ck: &ImplementCheckpoint) -> Result<(), String> {
     let custody = match std::fs::read(checkpoint_path(clone)) {
@@ -259,6 +329,7 @@ pub fn validate_resumable(ck: &ImplementCheckpoint) -> Result<(), String> {
 /// - Else exactly one commit over base: accept the tip; an amend may have landed before checkpoint record.
 /// - Else fail loud for manual recovery.
 pub fn reconcile_head(clone: &Path, ck: &ImplementCheckpoint) -> Result<String, String> {
+    crate::implement::guard_clone(clone)?;
     let branch = crate::implement::current_branch(clone)?;
     if branch != ck.branch {
         return Err(format!(
@@ -277,7 +348,7 @@ pub fn reconcile_head(clone: &Path, ck: &ImplementCheckpoint) -> Result<String, 
         return Ok(head);
     }
     let range = format!("{}..HEAD", ck.base_commit);
-    let out = crate::implement::run_git(Some(clone), &["rev-list", "--count", &range])
+    let out = crate::implement::run_clone_git(clone, &["rev-list", "--count", &range])
         .map_err(|e| format!("git rev-list: {e}"))?;
     if !out.status.success() {
         return Err(format!(
@@ -329,6 +400,25 @@ mod tests {
             phase: ImplementPhase::InLoop,
             created_at_ms: 1,
             updated_at_ms: 2,
+        }
+    }
+
+    #[test]
+    fn container_run_records_preserve_each_resume_generation_and_refuse_invalid_records() {
+        let td = tempfile::tempdir().unwrap();
+        std::fs::create_dir(td.path().join(".git")).unwrap();
+        assert!(container_run_ids(td.path()).unwrap().is_empty());
+        record_container_run(td.path(), "original-run").unwrap();
+        record_container_run(td.path(), "resumed-run").unwrap();
+        record_container_run(td.path(), "original-run").unwrap();
+        assert_eq!(
+            container_run_ids(td.path()).unwrap(),
+            ["original-run", "resumed-run"]
+        );
+        let path = td.path().join(".git/a2a-bridge/container-runs.json");
+        for bytes in [b"invalid".as_slice(), b"[\"\"]", b"[\"bad/run\"]"] {
+            std::fs::write(&path, bytes).unwrap();
+            assert!(container_run_ids(td.path()).is_err());
         }
     }
 
@@ -565,6 +655,17 @@ mod tests {
         let old = r#"{"schema_version":1,"resume_id":"x","task_id":"x","task_brief":"b","source_repo":"/s","clone_path":"/c","config_path":"/cfg","branch":"br","base_ref":null,"base_commit":"abc","current_commit":null,"original_message":null,"edit_workflow":"e","fix_workflow":"f","loop_max_attempts":3,"attempt_next":1,"phase":"InLoop","created_at_ms":0,"updated_at_ms":0}"#;
         let cp: ImplementCheckpoint = serde_json::from_str(old).unwrap();
         assert_eq!(cp.resolved_lang, None);
+    }
+
+    #[test]
+    fn reconcile_refuses_clone_config_before_head_checks() {
+        let td = tempfile::tempdir().unwrap();
+        git(td.path(), &["init", "-q"]);
+        git(td.path(), &["config", "core.fsmonitor", "secret-command"]);
+        let err = reconcile_head(td.path(), &sample(td.path())).unwrap_err();
+        assert!(err.contains("clone config not allowed"));
+        assert!(!err.contains("secret-command"));
+        assert!(td.path().join(".git/config").exists());
     }
 
     #[test]

@@ -157,6 +157,18 @@ fn git_str(cwd: &Path, args: &[&str]) -> Result<String, String> {
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
+fn clone_git_str(clone: &Path, args: &[&str]) -> Result<String, String> {
+    crate::implement::guard_clone(clone)?;
+    let out = crate::implement::run_clone_git(clone, args).map_err(|e| e.to_string())?;
+    if !out.status.success() {
+        return Err(format!(
+            "git failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
 /// `commit-tree` `current_commit`'s tree over `base_commit` as `op` (author==committer, same fresh date).
 /// Reuses the identity-free pin prefix; identity via `GIT_*` env; message on stdin (`-F -`) so a multi-line
 /// body survives. Does NOT move the clone's branch (retry-safe).
@@ -167,6 +179,7 @@ fn author_tree_commit(
     msg: &str,
     op: &OperatorIdent,
 ) -> Result<String, String> {
+    crate::implement::guard_clone(clone)?;
     let t = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|e| e.to_string())?
@@ -182,10 +195,8 @@ fn author_tree_commit(
         "-".into(),
     ]);
 
-    let mut cmd = std::process::Command::new("git");
-    cmd.arg("-C")
-        .arg(clone)
-        .args(&argv)
+    let mut cmd = crate::implement::clone_git_command(clone).map_err(|e| e.to_string())?;
+    cmd.args(&argv)
         .env("GIT_AUTHOR_NAME", &op.name)
         .env("GIT_AUTHOR_EMAIL", &op.email)
         .env("GIT_AUTHOR_DATE", &date)
@@ -244,6 +255,7 @@ fn synthetic_side_commit(
     tree_commit: &str,
     base_commit: &str,
 ) -> Result<String, String> {
+    crate::implement::guard_clone(clone)?;
     let mut argv = pin_prefix_argv(&clone.to_string_lossy());
     argv.extend([
         "commit-tree".into(),
@@ -254,9 +266,8 @@ fn synthetic_side_commit(
         "-".into(),
     ]);
 
-    let mut child = std::process::Command::new("git")
-        .arg("-C")
-        .arg(clone)
+    let mut child = crate::implement::clone_git_command(clone)
+        .map_err(|e| e.to_string())?
         .args(&argv)
         .env("GIT_AUTHOR_NAME", "a2a-bridge synthetic merge-tree")
         .env("GIT_AUTHOR_EMAIL", "synthetic@a2a-bridge.invalid")
@@ -308,10 +319,11 @@ pub enum IntegrationError {
 /// Fetch the destination ref into the quarantine clone and return the exact commit fetched. This updates
 /// only clone-local FETCH_HEAD; the caller's per-run operation lock excludes another resume/merge on it.
 fn fetch_target_commit(clone: &Path, source_repo: &Path, target: &str) -> Result<String, String> {
+    crate::implement::guard_clone(clone)?;
     let source = source_repo.to_string_lossy().to_string();
     let target_ref = format!("refs/heads/{target}");
-    let out = run_git(
-        Some(clone),
+    let out = crate::implement::run_clone_git(
+        clone,
         &["fetch", "--no-tags", "--force", &source, &target_ref],
     )
     .map_err(|e| format!("git fetch current target: {e}"))?;
@@ -321,12 +333,13 @@ fn fetch_target_commit(clone: &Path, source_repo: &Path, target: &str) -> Result
             String::from_utf8_lossy(&out.stderr).trim()
         ));
     }
-    git_str(clone, &["rev-parse", "--verify", "FETCH_HEAD^{commit}"])
+    clone_git_str(clone, &["rev-parse", "--verify", "FETCH_HEAD^{commit}"])
 }
 
 fn require_ancestor(clone: &Path, ancestor: &str, descendant: &str) -> Result<(), String> {
-    let out = run_git(
-        Some(clone),
+    crate::implement::guard_clone(clone)?;
+    let out = crate::implement::run_clone_git(
+        clone,
         &["merge-base", "--is-ancestor", ancestor, descendant],
     )
     .map_err(|e| format!("git merge-base: {e}"))?;
@@ -363,13 +376,14 @@ pub fn integrate_run_tree(
     target_commit: &str,
     current_commit: &str,
 ) -> Result<String, IntegrationError> {
+    crate::implement::guard_clone(clone).map_err(IntegrationError::Other)?;
     require_ancestor(clone, base_commit, target_commit).map_err(IntegrationError::Other)?;
     let synthetic_target = synthetic_side_commit(clone, target_commit, base_commit)
         .map_err(|e| IntegrationError::Other(format!("synthetic target commit: {e}")))?;
     let synthetic_current = synthetic_side_commit(clone, current_commit, base_commit)
         .map_err(|e| IntegrationError::Other(format!("synthetic current commit: {e}")))?;
-    let out = run_git(
-        Some(clone),
+    let out = crate::implement::run_clone_git(
+        clone,
         &[
             "merge-tree",
             "--write-tree",
@@ -399,7 +413,8 @@ pub fn integrate_run_tree(
         .unwrap_or_default()
         .trim()
         .to_string();
-    if tree.is_empty() || git_str(clone, &["cat-file", "-t", &tree]).as_deref() != Ok("tree") {
+    if tree.is_empty() || clone_git_str(clone, &["cat-file", "-t", &tree]).as_deref() != Ok("tree")
+    {
         return Err(IntegrationError::Other(
             "git merge-tree returned no valid tree object".into(),
         ));
@@ -414,12 +429,13 @@ pub fn check_clone_shape(
     base_commit: &str,
     current_commit: &str,
 ) -> Result<(), String> {
+    crate::implement::guard_clone(clone)?;
     for obj in [base_commit, current_commit] {
-        git_str(clone, &["cat-file", "-e", &format!("{obj}^{{commit}}")])
+        clone_git_str(clone, &["cat-file", "-e", &format!("{obj}^{{commit}}")])
             .map_err(|_| format!("clone object {obj} missing — inspect {}", clone.display()))?;
     }
-    let out = run_git(
-        Some(clone),
+    let out = crate::implement::run_clone_git(
+        clone,
         &["merge-base", "--is-ancestor", base_commit, current_commit],
     )
     .map_err(|e| format!("git merge-base: {e}"))?;
@@ -452,10 +468,11 @@ pub fn push_landing(
     target: &str,
     base_commit: &str,
 ) -> Result<(), PushError> {
+    crate::implement::guard_clone(clone).map_err(PushError::Other)?;
     let refspec = format!("{reauthored}:refs/heads/{target}");
     let lease = format!("--force-with-lease=refs/heads/{target}:{base_commit}");
     let src = source_repo.to_string_lossy().to_string();
-    let out = run_git(Some(clone), &["push", &src, &refspec, &lease])
+    let out = crate::implement::run_clone_git(clone, &["push", &src, &refspec, &lease])
         .map_err(|e| PushError::Other(format!("git push spawn: {e}")))?;
     if out.status.success() {
         return Ok(());
@@ -683,6 +700,13 @@ where
     F: FnOnce(),
 {
     let MergeOptions { force, mode } = options;
+    if let Err(e) = crate::clone_config::check_clone_with_policy(clone) {
+        eprintln!(
+            "merge: clone config not allowed ({e}); clone kept at {}",
+            clone.display()
+        );
+        return MergeOutcome::UsageOrPreflight;
+    }
     let ck: ImplementCheckpoint = match load_checkpoint(clone) {
         Ok(c) => c,
         Err(e) => {
@@ -826,7 +850,7 @@ where
                             return MergeOutcome::Unlanded;
                         }
                     };
-                    let target_tree = match git_str(
+                    let target_tree = match clone_git_str(
                         clone,
                         &["rev-parse", &format!("{target_commit}^{{tree}}")],
                     ) {
@@ -1379,6 +1403,29 @@ mod git_tests {
         phase: ImplementPhase,
     ) -> (PathBuf, String) {
         clone_with_change(root, src, base, "impl-1-abcd", "w.txt", "w\n", phase)
+    }
+
+    #[test]
+    fn merge_refuses_clone_config_at_preflight_and_keeps_clone() {
+        let (_gs, src, base) = repo_with_base();
+        let root = tempfile::tempdir().unwrap();
+        let (clone, _) = clone_with_checkpoint(root.path(), &src, &base, ImplementPhase::Approved);
+        run_git(
+            Some(&clone),
+            &["config", "core.fsmonitor", "secret-command"],
+        )
+        .unwrap();
+        let out = merge_clone(
+            None,
+            &clone,
+            root.path(),
+            Some("release"),
+            false,
+            MergeMode::ExactBase,
+        );
+        assert!(matches!(out, MergeOutcome::UsageOrPreflight));
+        assert_eq!(out.code(), 1);
+        assert!(clone.join(".git/config").exists());
     }
 
     #[test]

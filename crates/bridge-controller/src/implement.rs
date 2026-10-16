@@ -359,10 +359,53 @@ pub fn run_git(cwd: Option<&Path>, argv: &[&str]) -> std::io::Result<std::proces
     c.args(argv).output()
 }
 
+/// Refuse agent-controlled clone configuration before any repository-aware host Git command.
+pub fn guard_clone(clone: &Path) -> Result<(), String> {
+    crate::clone_config::check_clone_with_policy(clone).map_err(|reason| {
+        let message = format!(
+            "implement: clone config not allowed ({reason}); stopping before running host git in {}",
+            clone.display()
+        );
+        eprintln!("{message}");
+        message
+    })
+}
+
+/// The clone-only command boundary. Source repositories deliberately use `run_git` instead.
+/// Callers that have started writers must retain runtime-confirmed host custody through completion;
+/// config admission alone cannot prevent a concurrent replacement. The implement loop owns that custody.
+pub fn run_clone_git(clone: &Path, argv: &[&str]) -> std::io::Result<std::process::Output> {
+    clone_git_command(clone)?.args(argv).output()
+}
+
+/// Construct a pinned command, also shared by asynchronous callers and stdin-based merge ops.
+/// Explicit metadata paths must fail if invalid; Git must never discover another repository.
+pub fn clone_git_command(clone: &Path) -> std::io::Result<Command> {
+    guard_clone(clone).map_err(std::io::Error::other)?;
+    let clone = std::path::absolute(clone)?;
+    let mut git_dir = std::ffi::OsString::from("--git-dir=");
+    git_dir.push(clone.join(".git"));
+    let mut work_tree = std::ffi::OsString::from("--work-tree=");
+    work_tree.push(&clone);
+    let mut command = Command::new("git");
+    command
+        .current_dir(&clone)
+        .arg(git_dir)
+        .arg(work_tree)
+        .env("GIT_CEILING_DIRECTORIES", clone.parent().unwrap_or(&clone))
+        // These inherited overrides can otherwise redirect the explicit Git directory's contents.
+        .env_remove("GIT_COMMON_DIR")
+        .env_remove("GIT_OBJECT_DIRECTORY")
+        .env_remove("GIT_ALTERNATE_OBJECT_DIRECTORIES")
+        .env_remove("GIT_INDEX_FILE")
+        .args(["-c", "core.fsmonitor=false"]);
+    Ok(command)
+}
+
 /// Run git, REQUIRE success, return trimmed stdout (else Err with stderr) — so a failed `git status` can't
 /// be misread as "clean".
-fn git_ok(cwd: Option<&Path>, argv: &[&str]) -> Result<String, String> {
-    let out = run_git(cwd, argv).map_err(|e| format!("git {}: {e}", argv.join(" ")))?;
+fn clone_git_ok(clone: &Path, argv: &[&str]) -> Result<String, String> {
+    let out = run_clone_git(clone, argv).map_err(|e| format!("git {}: {e}", argv.join(" ")))?;
     if !out.status.success() {
         return Err(format!(
             "git {} failed: {}",
@@ -376,14 +419,15 @@ fn git_ok(cwd: Option<&Path>, argv: &[&str]) -> Result<String, String> {
 /// Classify the working tree via `git status --porcelain` (detects UNTRACKED files, unlike
 /// `git diff --quiet`). Staged = any line whose index column (X) is not ' ' and not '?'.
 pub fn stage_state(clone: &Path) -> Result<StageState, String> {
-    // Read the porcelain output RAW. `git_ok` trims, and porcelain's first column is the index
+    guard_clone(clone)?;
+    // Read the porcelain output RAW. `clone_git_ok` trims, and porcelain's first column is the index
     // status — for a tracked-but-unstaged edit that column is a SPACE (` M path`). Trimming
     // deletes it, shifting the worktree column into byte 0, so ` M` was read as `M` and the tree
     // was misclassified `Staged`. `decide` then chose `Commit` against an empty index and the
     // commit failed with its explanation on stdout. That is the whole of the twice-seen
     // "index emptied between the check and the commit" behaviour: nothing emptied it, and the
     // check simply misread. Untracked-only trees were unaffected because `?` is not whitespace.
-    let out = run_git(Some(clone), &["status", "--porcelain"])
+    let out = run_clone_git(clone, &["status", "--porcelain"])
         .map_err(|e| format!("git status --porcelain: {e}"))?;
     if !out.status.success() {
         return Err(format!(
@@ -414,16 +458,19 @@ pub fn stage_state(clone: &Path) -> Result<StageState, String> {
 }
 
 pub fn head_sha(clone: &Path) -> Result<String, String> {
-    git_ok(Some(clone), &["rev-parse", "HEAD"])
+    guard_clone(clone)?;
+    clone_git_ok(clone, &["rev-parse", "HEAD"])
 }
 pub fn current_branch(clone: &Path) -> Result<String, String> {
-    git_ok(Some(clone), &["symbolic-ref", "--short", "HEAD"])
+    guard_clone(clone)?;
+    clone_git_ok(clone, &["symbolic-ref", "--short", "HEAD"])
 }
 
 /// True iff the worktree has staged or unstaged changes (untracked-aware via --porcelain).
 pub fn is_worktree_dirty(clone: &Path) -> Result<bool, String> {
+    guard_clone(clone)?;
     let out =
-        run_git(Some(clone), &["status", "--porcelain"]).map_err(|e| format!("git status: {e}"))?;
+        run_clone_git(clone, &["status", "--porcelain"]).map_err(|e| format!("git status: {e}"))?;
     if !out.status.success() {
         return Err(format!(
             "git status: {}",
@@ -435,8 +482,9 @@ pub fn is_worktree_dirty(clone: &Path) -> Result<bool, String> {
 
 /// The subject (first line) of HEAD's commit message, recomputed for hand-off after resume.
 pub fn commit_subject(clone: &Path) -> Result<String, String> {
+    guard_clone(clone)?;
     let out =
-        run_git(Some(clone), &["log", "-1", "--format=%s"]).map_err(|e| format!("git log: {e}"))?;
+        run_clone_git(clone, &["log", "-1", "--format=%s"]).map_err(|e| format!("git log: {e}"))?;
     if !out.status.success() {
         return Err(format!(
             "git log: {}",
@@ -449,6 +497,7 @@ pub fn commit_subject(clone: &Path) -> Result<String, String> {
 /// The agent has :rw + git and could switch branches or commit despite the contract. Assert HEAD is still
 /// `expect_branch` and hasn't advanced past `pre_sha`. Returns a human error for the subcommand.
 pub fn head_guard(clone: &Path, expect_branch: &str, pre_sha: &str) -> Result<(), String> {
+    guard_clone(clone)?;
     let br = current_branch(clone)?;
     if br != expect_branch {
         return Err(format!(
@@ -485,9 +534,10 @@ fn commit_failure_detail(out: &std::process::Output) -> String {
 }
 
 fn host_commit_argv_run(clone: &Path, argv: &[String]) -> Result<String, String> {
+    guard_clone(clone)?;
     let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
     for _ in 0..5 {
-        let out = run_git(Some(clone), &refs).map_err(|e| format!("git commit: {e}"))?;
+        let out = run_clone_git(clone, &refs).map_err(|e| format!("git commit: {e}"))?;
         if out.status.success() {
             return head_sha(clone);
         }
@@ -501,7 +551,7 @@ fn host_commit_argv_run(clone: &Path, argv: &[String]) -> Result<String, String>
         std::thread::sleep(Duration::from_millis(200));
     }
     let _ = std::fs::remove_file(clone.join(".git").join("index.lock")); // stale-lock clear, last resort
-    let out = run_git(Some(clone), &refs).map_err(|e| format!("git commit: {e}"))?;
+    let out = run_clone_git(clone, &refs).map_err(|e| format!("git commit: {e}"))?;
     if out.status.success() {
         head_sha(clone)
     } else {
@@ -516,6 +566,7 @@ fn host_commit_argv_run(clone: &Path, argv: &[String]) -> Result<String, String>
 /// pins. Bounded retry on an index-lock error (the per-turn container that held it is being reaped);
 /// clears a stale `.git/index.lock` only AFTER retries exhaust. Returns the new commit sha. Stages nothing.
 pub fn host_commit(clone: &Path, msg: &str) -> Result<String, String> {
+    guard_clone(clone)?;
     host_commit_argv_run(clone, &commit_argv(&clone.to_string_lossy(), msg))
 }
 
@@ -539,15 +590,17 @@ pub fn commit_amend_argv(clone: &str) -> Vec<String> {
 
 /// Amend the agent-staged fix into the single commit (keeps the original message + parent + bot identity).
 pub fn host_amend_commit(clone: &Path) -> Result<String, String> {
+    guard_clone(clone)?;
     host_commit_argv_run(clone, &commit_amend_argv(&clone.to_string_lossy()))
 }
 
 /// Reset the working tree to the committed HEAD (discard unstaged tracked changes + untracked files) so
 /// VERIFY tests EXACTLY the committed tree, not the agent's leftover scratch.
 pub fn reset_worktree_to_head(clone: &Path) -> Result<(), String> {
+    guard_clone(clone)?;
     let sd = format!("safe.directory={}", clone.to_string_lossy());
-    git_ok(Some(clone), &["-c", &sd, "reset", "--hard", "HEAD"])?;
-    git_ok(Some(clone), &["-c", &sd, "clean", "-fdq"]).map(|_| ())
+    clone_git_ok(clone, &["-c", &sd, "reset", "--hard", "HEAD"])?;
+    clone_git_ok(clone, &["-c", &sd, "clean", "-fdq"]).map(|_| ())
 }
 
 /// Restore OUR task branch to a trusted commit after a fix turn mutated HEAD (advanced OR switched branches).
@@ -556,9 +609,10 @@ pub fn reset_worktree_to_head(clone: &Path) -> Result<(), String> {
 /// the no-work-loss fix: a bare `reset --hard` on the agent's (possibly switched) HEAD would leave OUR branch
 /// at the rogue tip.
 pub fn restore_branch(clone: &Path, branch: &str, sha: &str) -> Result<(), String> {
+    guard_clone(clone)?;
     let sd = format!("safe.directory={}", clone.to_string_lossy());
-    git_ok(Some(clone), &["-c", &sd, "checkout", "-q", "-f", branch])?;
-    git_ok(Some(clone), &["-c", &sd, "reset", "--hard", sha]).map(|_| ())
+    clone_git_ok(clone, &["-c", &sd, "checkout", "-q", "-f", branch])?;
+    clone_git_ok(clone, &["-c", &sd, "reset", "--hard", sha]).map(|_| ())
 }
 
 /// Refuse a clone dest inside a git worktree (cloning into a repo dirties it). Walks to the nearest
@@ -598,9 +652,10 @@ pub fn do_clone(repo: &str, dest: &str) -> Result<(), String> {
     Ok(())
 }
 pub fn do_checkout_branch(clone: &Path, branch: &str) -> Result<(), String> {
+    guard_clone(clone)?;
     let argv = checkout_new_branch_argv(branch);
     let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
-    let out = run_git(Some(clone), &refs).map_err(|e| e.to_string())?;
+    let out = run_clone_git(clone, &refs).map_err(|e| e.to_string())?;
     if !out.status.success() {
         return Err(format!(
             "git checkout -b failed: {}",
@@ -1232,7 +1287,7 @@ mod tests {
             .status()
             .unwrap()
             .success());
-        // plant pre-commit (default path), a core.hooksPath-redirected hook dir, and prepare-commit-msg —
+        // Plant default-path pre-commit, prepare-commit-msg, and post-commit hooks —
         // all `exit 1`; the commit must STILL succeed (proves --no-verify + core.hooksPath=/dev/null).
         let hooks = p.join(".git").join("hooks");
         std::fs::create_dir_all(&hooks).unwrap();
@@ -1245,24 +1300,6 @@ mod tests {
                 std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o755)).unwrap();
             }
         }
-        // also a core.hooksPath the agent could have set, with its own failing pre-commit
-        let alt = p.join(".git").join("althooks");
-        std::fs::create_dir_all(&alt).unwrap();
-        let af = alt.join("pre-commit");
-        std::fs::write(&af, "#!/bin/sh\nexit 1\n").unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&af, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
-        assert!(Command::new("git")
-            .arg("-C")
-            .arg(&p)
-            .args(["config", "core.hooksPath", alt.to_str().unwrap()])
-            .status()
-            .unwrap()
-            .success());
-
         std::fs::write(p.join("FOO.md"), "bar\n").unwrap();
         assert!(Command::new("git")
             .arg("-C")
