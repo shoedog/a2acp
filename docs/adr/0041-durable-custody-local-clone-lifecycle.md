@@ -1,7 +1,7 @@
 # ADR-0041 — Durable custody and local clone lifecycle
 
 Date: 2026-09-08
-Status: **Proposed**
+Status: **Superseded by [ADR-0042](0042-push-based-custody-and-evidence-retention.md)** (2026-10-15) for custody, restore and retention; §2 findings carried forward. Earlier: Proposed.
 This document grants **no implementation, upload, remote-ref creation, project publication, merge, deletion, operator restart, or other operational authority**. Proposed commands and defaults below describe a future interface. They are not instructions to execute it.
 
 Builds on ADR-0025, ADR-0026, ADR-0027 and ADR-0040. On acceptance and implementation, it supersedes ADR-0027/ADR-0040’s immediate clone reap after **both successful landing and already-integrated/no-op success**. Their merge admission, integration and destination compare-and-swap rules remain intact.

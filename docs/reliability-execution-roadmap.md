@@ -31,7 +31,14 @@
   2 h cap. Rollback limit (accepted by the owner): binaries older than `fbee12ae` cannot decode the new automatic
   run-policy rows; this is documented in the operator's SERVICE.md. Known tooling issue: #146, where concurrent
   implement verifies share a stale target; serialize them until it is fixed.
-- **Active slice:** **ADR-0041 Slice 2B3 (inert new-root restore and hidden-state proof).** Its design is
+- **Active slice:** **ADR-0042 push-based custody and evidence retention** (owner ruling 2026-10-15). ADR-0042
+  supersedes ADR-0041's capsule/restore custody: commits are protected by pushing the run branch at stable points,
+  evidence is kept under a configurable local policy (defaults: spec plus final review summary, 30 days, 10 MiB
+  per repository), and a clone is deleted only when its exact HEAD is on the remote and no unbacked state remains.
+  **ADR-0041 2B3d, the parent 2B gate and stages 3–5 are stopped**; the merged ADR-0041 code stays parked and
+  unwired. The 2B3d design synthesis (`~/.a2a-dispatch/adr0041-2b3d-20261015/design-synth.md`) is kept as a
+  record. **Next: one ADR-0042 implementation slice.** The ADR-0041 history below is the lane record.
+- **Stopped slice:** **ADR-0041 Slice 2B3 (inert new-root restore and hidden-state proof).** Its design is
   `docs/superpowers/specs/2026-09-27-adr0041-slice2b3-restore-design.md` (PR #123). It has four serial children:
   2B3a reader → 2B3b Git plane → 2B3c payload plane → 2B3d record and joint fixture.
   - **2B3c (payload plane) is complete** (2026-10-15). Spec rev 4 merged in PR #140 at `d56b1eed`:
@@ -48,7 +55,7 @@
     Running record: `docs/superpowers/reviews/2026-10-14-adr0041-slice2b3c-implementation-handoff.md`. Carried
     into 2B3d's design: each created directory keeps a descriptor (the macOS soft `RLIMIT_NOFILE` is 256); phase G's
     final gates (2B3b) end with a root identity lookup that has no deadline observation after it, unlike C3's.
-    **Next: the 2B3d spec (record and joint fixture).**
+    2B3d was designed but not specified; it stopped when ADR-0042 superseded ADR-0041.
   - **2B3b is merged** in PR #137 at `4fcda06d` (2026-10-14): the phase-G Git plane, crate-private and
     production-unwired. It landed after the owner accepted the B2c literal correction without a third source review,
     the first native macOS run surfaced 13 test-only portability failures (no production defect), the test-only
