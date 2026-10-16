@@ -592,6 +592,8 @@ pub struct RegistryConfig {
     /// `[merge]` (ADR-0027): merge hand-off target + operator identity override. Absent → defaults.
     #[serde(default)]
     pub merge: Option<MergeToml>,
+    #[serde(default)]
+    pub custody: bridge_controller::custody_push::CustodyConfig,
     /// `[batch]` (E3): parallel batch admission limits. Absent → batch RPCs are not wired.
     #[serde(default)]
     pub batch: Option<BatchToml>,
