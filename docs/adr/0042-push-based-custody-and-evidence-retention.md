@@ -1,7 +1,7 @@
 # ADR-0042 — Push-based custody and configurable evidence retention
 
 **Date:** 2026-10-15
-**Status:** Proposed
+**Status:** Accepted (owner, 2026-10-15)
 
 **Supersedes:** the custody, capsule, restore, promotion and verification design of ADR-0041 (§§3–15, §17).
 ADR-0041 §2's findings remain the requirements this ADR must meet.
