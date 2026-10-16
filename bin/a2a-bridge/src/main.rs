@@ -2350,7 +2350,7 @@ fn run_verify_step(
         None => {
             return verify::VerifyOutcome::Skipped {
                 reason: "--lang none".into(),
-            }
+            };
         }
         Some(p) => p,
     };
@@ -2659,7 +2659,7 @@ async fn run_review_step(
             return (
                 review::ReviewOutcome::Refused(error.to_string()),
                 String::new(),
-            )
+            );
         }
     };
     let sizing: Option<(usize, usize)> = match tokio::time::timeout(
@@ -2675,7 +2675,9 @@ async fn run_review_step(
             &String::from_utf8_lossy(&o.stdout),
         )),
         _ => {
-            eprintln!("[implement] review: diff sizing failed or timed out; sizing unknown → standard tier");
+            eprintln!(
+                "[implement] review: diff sizing failed or timed out; sizing unknown → standard tier"
+            );
             None
         }
     };
@@ -3476,6 +3478,14 @@ async fn run_warm_loop(
             );
         }
     }
+    let ck = implement_resume::load_checkpoint(clone).unwrap_or_else(|_| prod_ckpt.ck.clone());
+    // A failed or incomplete fix can leave the writer running. Snapshot Git needs the same
+    // runtime-confirmed custody as the loop's reset/commit operations.
+    if runner.acquire_host_custody().await.is_ok() {
+        finalize_implement_terminal(clone, custody_cfg, &ck, Some(terminal));
+    } else {
+        bridge_controller::custody_push::finalize_terminal_without_git(clone, custody_cfg, &ck);
+    }
     let _ = runner.retire().await;
     terminal
 }
@@ -3906,6 +3916,36 @@ async fn implement_cmd(args: &[String]) -> Result<(), BoxError> {
     )
     .await;
 
+    let no_commit_checkpoint = implement_resume::ImplementCheckpoint {
+        schema_version: implement_resume::SCHEMA_VERSION,
+        resume_id: task_id.clone(),
+        task_id: task_id.clone(),
+        task_brief: task.clone(),
+        source_repo: repo.clone(),
+        clone_path: clone.clone(),
+        config_path: config_path.clone(),
+        branch: branch.clone(),
+        base_ref: base_ref.clone(),
+        base_commit: base_sha.clone(),
+        current_commit: None,
+        original_message: None,
+        edit_workflow: workflow.clone(),
+        fix_workflow: loop_cfg.fix_workflow.as_str().to_string(),
+        loop_max_attempts: loop_cfg.max_attempts,
+        attempt_next: 1,
+        forced_depth: depth.to_forced_str(),
+        resolved_lang: Some(
+            profile
+                .as_ref()
+                .map(|p| p.id.clone())
+                .unwrap_or_else(|| "none".to_string()),
+        ),
+        activity_tally: None,
+        terminal_evidence_counts: None,
+        phase: implement_resume::ImplementPhase::NoCommitClean,
+        created_at_ms: implement_resume::now_ms(),
+        updated_at_ms: implement_resume::now_ms(),
+    };
     // 5. the pure soft-gate decision, then execute its Action. A container exists now, so any post-edit
     // early-return must `retire()` (the RunEndGuard is only the backstop).
     if let Err(e) = warm_runner.acquire_host_custody().await {
@@ -3917,6 +3957,12 @@ async fn implement_cmd(args: &[String]) -> Result<(), BoxError> {
         Ok(s) => s,
         Err(e) => {
             let _ = warm_runner.retire().await;
+            finalize_implement_terminal(
+                &clone,
+                &custody_cfg,
+                &no_commit_checkpoint,
+                Some(implement_resume::ImplementPhase::Abort),
+            );
             return Err(format!("implement: stage check: {e}").into());
         }
     };
@@ -3936,6 +3982,12 @@ async fn implement_cmd(args: &[String]) -> Result<(), BoxError> {
         _wt_run_guard.as_ref(),
         match implement::decide(completed, guard, stage, msg) {
             implement::Action::Abort(reason) => {
+                finalize_implement_terminal(
+                    &clone,
+                    &custody_cfg,
+                    &no_commit_checkpoint,
+                    Some(implement_resume::ImplementPhase::Abort),
+                );
                 eprintln!(
                     "[implement] {reason} — NO commit; clone left at {}",
                     clone.display()
@@ -3945,6 +3997,12 @@ async fn implement_cmd(args: &[String]) -> Result<(), BoxError> {
                 Err(format!("implement: {reason}").into())
             }
             implement::Action::NoCommitClean => {
+                finalize_implement_terminal(
+                    &clone,
+                    &custody_cfg,
+                    &no_commit_checkpoint,
+                    Some(implement_resume::ImplementPhase::NoCommitClean),
+                );
                 println!(
                     "implement: made no changes; clone left at {}",
                     clone.display()
@@ -3954,11 +4012,17 @@ async fn implement_cmd(args: &[String]) -> Result<(), BoxError> {
                 Ok(())
             }
             implement::Action::NoCommitDirty => {
+                finalize_implement_terminal(
+                    &clone,
+                    &custody_cfg,
+                    &no_commit_checkpoint,
+                    Some(implement_resume::ImplementPhase::NoCommitDirty),
+                );
                 eprintln!(
-                "[implement] agent edited but staged NOTHING — NOT committing (agent owns staging). \
+                    "[implement] agent edited but staged NOTHING — NOT committing (agent owns staging). \
                  Clone left at {} for inspection.",
-                clone.display()
-            );
+                    clone.display()
+                );
                 report_agent_reply(&clone);
                 let _ = warm_runner.retire().await;
                 Ok(())
@@ -3969,6 +4033,12 @@ async fn implement_cmd(args: &[String]) -> Result<(), BoxError> {
                 let sha = match implement::host_commit(&clone, &message) {
                     Ok(s) => s,
                     Err(e) => {
+                        finalize_implement_terminal(
+                            &clone,
+                            &custody_cfg,
+                            &no_commit_checkpoint,
+                            Some(implement_resume::ImplementPhase::CommitFailed),
+                        );
                         // Abort/NoCommitClean/NoCommitDirty all print the clone path; this path did
                         // not, so a failed commit stranded the agent's complete work with no pointer.
                         eprintln!(
@@ -3984,34 +4054,10 @@ async fn implement_cmd(args: &[String]) -> Result<(), BoxError> {
                 let mut prod_ckpt = implement_resume::ProdCheckpoint {
                     clone: clone.clone(),
                     ck: implement_resume::ImplementCheckpoint {
-                        schema_version: implement_resume::SCHEMA_VERSION,
-                        resume_id: task_id.clone(),
-                        task_id: task_id.clone(),
-                        task_brief: task.clone(),
-                        source_repo: repo.clone(),
-                        clone_path: clone.clone(),
-                        config_path: config_path.clone(),
-                        branch: branch.clone(),
-                        base_ref: base_ref.clone(),
-                        base_commit: base_sha.clone(),
                         current_commit: Some(sha.clone()),
                         original_message: Some(message.clone()),
-                        edit_workflow: workflow.clone(),
-                        fix_workflow: loop_cfg.fix_workflow.as_str().to_string(),
-                        loop_max_attempts: loop_cfg.max_attempts,
-                        attempt_next: 1,
-                        forced_depth: depth.to_forced_str(),
-                        resolved_lang: Some(
-                            profile
-                                .as_ref()
-                                .map(|p| p.id.clone())
-                                .unwrap_or_else(|| "none".to_string()),
-                        ),
-                        activity_tally: None,
-                        terminal_evidence_counts: None,
                         phase: implement_resume::ImplementPhase::FirstCommitCreated,
-                        created_at_ms: implement_resume::now_ms(),
-                        updated_at_ms: implement_resume::now_ms(),
+                        ..no_commit_checkpoint
                     },
                 };
                 let _ = implement_resume::save_checkpoint(&clone, &prod_ckpt.ck);
@@ -4068,6 +4114,45 @@ async fn implement_cmd(args: &[String]) -> Result<(), BoxError> {
     )
 }
 
+fn finalize_implement_terminal(
+    clone: &Path,
+    cfg: &bridge_controller::custody_push::CustodyConfig,
+    ck: &implement_resume::ImplementCheckpoint,
+    phase: Option<implement_resume::ImplementPhase>,
+) {
+    let mut ck = ck.clone();
+    if let Some(phase) = phase {
+        ck.phase = phase;
+        ck.updated_at_ms = implement_resume::now_ms();
+        bridge_controller::custody_push::finalize_terminal(clone, cfg, &ck);
+    } else {
+        bridge_controller::custody_push::finalize_refused_resume(clone, cfg, &ck);
+    }
+}
+
+struct RefusedResumeFinalizer {
+    clone: PathBuf,
+    ck: implement_resume::ImplementCheckpoint,
+    cfg: bridge_controller::custody_push::CustodyConfig,
+    armed: bool,
+    clone_ready: bool,
+}
+impl Drop for RefusedResumeFinalizer {
+    fn drop(&mut self) {
+        if self.armed {
+            if self.clone_ready {
+                finalize_implement_terminal(&self.clone, &self.cfg, &self.ck, None);
+            } else {
+                bridge_controller::custody_push::finalize_terminal_without_git(
+                    &self.clone,
+                    &self.cfg,
+                    &self.ck,
+                );
+            }
+        }
+    }
+}
+
 async fn implement_resume_cmd(
     resume_id: &str,
     config_path: &Path,
@@ -4098,15 +4183,25 @@ async fn implement_resume_cmd(
     let _operation = implement_resume::acquire_operation_lock(&clone)
         .map_err(|e| format!("implement --resume: run {resume_id} is busy: {e}"))?;
     let ck = implement_resume::load_checkpoint(&clone)?;
-    implement_resume::validate_resumable(&ck)?;
-
     let _clone_policy = bridge_controller::clone_config::ClonePolicyScope::install(
         &clone,
         loop_cfg.clone_config.clone(),
-    )?;
+    )
+    .inspect_err(|_| {
+        bridge_controller::custody_push::finalize_terminal_without_git(&clone, &cfg.custody, &ck);
+    })?;
+    let mut refusal_finalizer = RefusedResumeFinalizer {
+        clone: clone.clone(),
+        ck: ck.clone(),
+        cfg: cfg.custody.clone(),
+        armed: true,
+        clone_ready: false,
+    };
     // Recovery and a fail-closed runtime inventory precede ALL repository-aware clone Git.
     let entry_runtimes =
         prepare_clone_entry(&raw, config_path, &clone, &ck.source_repo, true).await?;
+    refusal_finalizer.clone_ready = true;
+    implement_resume::validate_resumable(&ck)?;
     let resume_sha = implement_resume::reconcile_head(&clone, &ck)?;
     let clone_cwd = bridge_core::SessionCwd::parse(&clone.to_string_lossy())?;
 
@@ -4228,6 +4323,8 @@ async fn implement_resume_cmd(
     if loop_cfg.clone_config.enabled {
         implement_resume::record_container_run(&clone, &run.instance_id)?;
     }
+    // Setup may spawn a writer; until the loop takes custody, a refused entry only saves metadata.
+    refusal_finalizer.clone_ready = false;
     let warm_impl = build_warm_impl(
         &graph,
         fix_graph.as_deref(),
@@ -4306,6 +4403,7 @@ async fn implement_resume_cmd(
         let _ = implement_resume::save_checkpoint(&clone, &prod_ckpt.ck);
     }
     let telemetry = ImplementAttemptTelemetry::new(&ck.task_id);
+    refusal_finalizer.armed = false;
     let outcome_phase = run_warm_loop(
         &clone,
         &ck.source_repo,
@@ -8562,7 +8660,7 @@ async fn mcp_cmd(args: &[String]) -> Result<(), BoxError> {
                 "a2a-bridge mcp: invalid non-Unicode {} value",
                 bridge_core::mcp::MANAGED_MCP_CALL_DEPTH_ENV
             )
-            .into())
+            .into());
         }
     };
     if call_depth > 0 {
@@ -9378,7 +9476,7 @@ fn parse_validate_args(args: &[String]) -> Result<ValidateMode, BoxError> {
                 );
             }
             other => {
-                return Err(format!("validate: unknown flag {other:?}\n{VALIDATE_USAGE}").into())
+                return Err(format!("validate: unknown flag {other:?}\n{VALIDATE_USAGE}").into());
             }
         }
     }
@@ -9795,9 +9893,7 @@ fn validate_repo_hygiene_at(
 fn format_repo_hygiene_report(report: &RepoHygieneReport) -> String {
     format!(
         "repository hygiene validated\nallowlist: {}\ntracked_artifacts: {}\nvalidated_example_configs: {}\n",
-        report.allowlist_rel,
-        report.tracked_artifact_count,
-        report.validated_example_config_count
+        report.allowlist_rel, report.tracked_artifact_count, report.validated_example_config_count
     )
 }
 
@@ -9931,7 +10027,7 @@ fn prompt_cmd(args: &[String]) -> Result<(), BoxError> {
                 config = it.next().ok_or("prompt: --config requires a value")?.into();
             }
             s if s.starts_with("--") => {
-                return Err(format!("prompt: unknown flag {a:?}\n{PROMPT_USAGE}").into())
+                return Err(format!("prompt: unknown flag {a:?}\n{PROMPT_USAGE}").into());
             }
             _ => positional.push(a),
         }
@@ -10188,7 +10284,7 @@ async fn main() -> Result<(), BoxError> {
         TopSubcommand::Batch => return batch_cmd(&raw_args[2..]).await,
         TopSubcommand::Models => return models_cmd(&raw_args[2..]).await,
         TopSubcommand::Compatibility => {
-            return compatibility::compatibility_cmd(&raw_args[2..], process_entry).await
+            return compatibility::compatibility_cmd(&raw_args[2..], process_entry).await;
         }
         TopSubcommand::Implement => return implement_cmd(&raw_args[2..]).await,
         TopSubcommand::Merge => return merge_cmd(&raw_args[2..]).await,
@@ -10203,7 +10299,7 @@ async fn main() -> Result<(), BoxError> {
         TopSubcommand::TaskSpec => return task_spec_cmd(&raw_args[2..]),
         TopSubcommand::ProviderEffectKey => return provider_effect_key_cmd(&raw_args[2..]),
         TopSubcommand::ProviderRefresh => {
-            return provider_refresh::provider_refresh_cmd(&raw_args[2..])
+            return provider_refresh::provider_refresh_cmd(&raw_args[2..]);
         }
         TopSubcommand::Prompt => return prompt_cmd(&raw_args[2..]),
         TopSubcommand::Doctor => return doctor::doctor_cmd(&raw_args[2..]),
@@ -12872,6 +12968,77 @@ esac
             eprintln!("{error}");
             std::process::exit(1);
         }
+    }
+
+    #[test]
+    fn terminal_finalizer_covers_all_terminal_phases_and_creates_no_commit_checkpoint() {
+        use implement_resume::ImplementPhase::*;
+        for phase in [
+            Approved,
+            LoopStopped,
+            Abort,
+            NoCommitClean,
+            NoCommitDirty,
+            CommitFailed,
+        ] {
+            let (_root, source, clone, remote) = custody_fixture();
+            let mut ck = implement_resume::load_checkpoint(&clone).unwrap();
+            ck.current_commit = None;
+            std::fs::remove_file(implement_resume::checkpoint_path(&clone)).unwrap();
+            std::fs::write(clone.join("leftover"), "agent work").unwrap();
+            finalize_implement_terminal(
+                &clone,
+                &bridge_controller::custody_push::CustodyConfig::default(),
+                &ck,
+                Some(phase),
+            );
+            let saved = implement_resume::load_checkpoint(&clone).unwrap();
+            assert_eq!(saved.phase, phase);
+            assert!(saved.current_commit.is_none());
+            assert_eq!(saved.task_id, ck.task_id);
+            assert_eq!(saved.source_repo, source);
+            assert_eq!(saved.branch, ck.branch);
+            assert_eq!(saved.base_commit, ck.base_commit);
+            let state = implement_resume::load_custody(&clone).unwrap().unwrap();
+            let sha = state.dirty.last_pushed_sha.unwrap();
+            assert_eq!(
+                custody_git(&remote, &["rev-parse", "refs/heads/wip/impl-test-dirty"]),
+                sha
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn resume_busy_writes_nothing_and_dirty_refusal_preserves_progress() {
+        let (_root, _source, clone, config) = clone_entry_fixture("resume", "absent", false);
+        std::fs::write(clone.join("leftover"), "agent work").unwrap();
+        let path = implement_resume::checkpoint_path(&clone);
+        let before = std::fs::read(&path).unwrap();
+        let lock = implement_resume::acquire_operation_lock(&clone).unwrap();
+        let error = implement_resume_cmd("impl-test", &config, false, None, None)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("busy"), "{error}");
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert!(implement_resume::load_custody(&clone).unwrap().is_none());
+        drop(lock);
+        let error = implement_resume_cmd("impl-test", &config, false, None, None)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("dirty worktree"), "{error}");
+        let before: serde_json::Value = serde_json::from_slice(&before).unwrap();
+        let mut after: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        assert!(after.as_object_mut().unwrap().remove("custody").is_some());
+        assert_eq!(after, before);
+        assert!(implement_resume::load_custody(&clone)
+            .unwrap()
+            .unwrap()
+            .dirty
+            .last_pushed_sha
+            .is_some());
+        assert!(implement_resume::acquire_operation_lock(&clone).is_ok());
     }
 
     #[cfg(unix)]

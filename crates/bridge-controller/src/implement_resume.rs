@@ -11,6 +11,10 @@ pub enum ImplementPhase {
     InLoop,
     Approved,
     LoopStopped,
+    Abort,
+    NoCommitClean,
+    NoCommitDirty,
+    CommitFailed,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -198,6 +202,31 @@ pub fn save_checkpoint(clone: &Path, ck: &ImplementCheckpoint) -> Result<(), Str
     save_checkpoint_with_custody(clone, ck, custody)
 }
 
+/// A refused resume may add custody records, but must preserve every existing progress field,
+/// including fields from older or newer checkpoint writers.
+pub(crate) fn save_custody_only(
+    clone: &Path,
+    custody: Option<crate::custody_push::CustodyState>,
+) -> Result<(), String> {
+    let path = checkpoint_path(clone);
+    let bytes = std::fs::read(&path).map_err(|_| "custody checkpoint read failed")?;
+    let mut value: serde_json::Value =
+        serde_json::from_slice(&bytes).map_err(|_| "custody checkpoint decode failed")?;
+    if let Some(custody) = custody {
+        value
+            .as_object_mut()
+            .ok_or("custody checkpoint is not an object")?
+            .insert(
+                "custody".into(),
+                serde_json::to_value(custody).map_err(|_| "custody encode failed")?,
+            );
+    }
+    let bytes = serde_json::to_vec_pretty(&value).map_err(|_| "custody encode failed")?;
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, bytes).map_err(|_| "custody checkpoint write failed")?;
+    std::fs::rename(tmp, path).map_err(|_| "custody checkpoint rename failed".into())
+}
+
 pub(crate) fn save_checkpoint_with_custody(
     clone: &Path,
     ck: &ImplementCheckpoint,
@@ -307,7 +336,12 @@ pub fn resolve_clone(allowed_cwd_root: &Path, resume_id: &str) -> Result<PathBuf
 /// A checkpoint is resumable iff it is not terminal and still has loop budget.
 pub fn validate_resumable(ck: &ImplementCheckpoint) -> Result<(), String> {
     match ck.phase {
-        ImplementPhase::Approved | ImplementPhase::LoopStopped => {
+        ImplementPhase::Approved
+        | ImplementPhase::LoopStopped
+        | ImplementPhase::Abort
+        | ImplementPhase::NoCommitClean
+        | ImplementPhase::NoCommitDirty
+        | ImplementPhase::CommitFailed => {
             return Err("run already handed off (terminal phase) — nothing to resume".into());
         }
         _ => {}
