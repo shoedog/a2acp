@@ -173,6 +173,17 @@ pub fn failures(
     custody: &CustodyConfig,
     evidence: &EvidenceConfig,
 ) -> Vec<String> {
+    failures_for_phase(clone, ck, custody, evidence, "merged")
+}
+
+/// Reap may encounter a parked terminal archive created before landing was recorded.
+pub fn failures_for_phase(
+    clone: &Path,
+    ck: &ImplementCheckpoint,
+    custody: &CustodyConfig,
+    evidence: &EvidenceConfig,
+    phase: &str,
+) -> Vec<String> {
     let mut failures = Vec::new();
     let admitted = crate::clone_config::check_clone_with_policy(clone);
     if let Err(e) = &admitted {
@@ -220,7 +231,8 @@ pub fn failures(
     check(
         3,
         head.as_ref().map_err(Clone::clone).and_then(|h| {
-            crate::evidence::verify_merged_archive(clone, ck, h, evidence)
+            crate::evidence::verify_archive(clone, ck, h, evidence, phase)
+                .or_else(|_| crate::evidence::verify_merged_archive(clone, ck, h, evidence))
                 .map_err(|e| e.to_string())
         }),
     );

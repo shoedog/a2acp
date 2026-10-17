@@ -12,6 +12,249 @@ use crate::implement_resume::{
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+/// Canonicalize bridge provenance, even when the supplied message contains forged/duplicate trailers.
+fn provenance_message(message: &str, run: &str, original: &str) -> String {
+    let body = message
+        .lines()
+        .filter(|line| {
+            let key = line.trim_start().split_once(':').map(|(key, _)| key.trim());
+            !key.is_some_and(|key| {
+                key.eq_ignore_ascii_case("A2A-Run") || key.eq_ignore_ascii_case("A2A-Original")
+            })
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let body = if body.trim().is_empty() {
+        format!("Implement run {run}")
+    } else {
+        body.trim_end().to_owned()
+    };
+    format!("{body}\n\nA2A-Run: {run}\nA2A-Original: {original}\n")
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LandingEvidence {
+    /// Only `confirmed-provenance` authorizes automatic merged reap.
+    pub confidence: &'static str,
+    pub matched_commit: Option<String>,
+    /// Source main snapshot checked by the probes, for the final deletion boundary recheck.
+    pub main_oid: Option<String>,
+    pub reason: String,
+}
+impl LandingEvidence {
+    pub fn confirmed(&self) -> bool {
+        self.confidence == "confirmed-provenance"
+    }
+}
+
+fn patch_id(repo: &Path, args: &[&str], in_clone: bool) -> Result<Option<String>, String> {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    let diff = if in_clone {
+        crate::implement::run_clone_git(repo, args)
+    } else {
+        run_git(Some(repo), args)
+    }
+    .map_err(|_| "patch probe failed")?;
+    if !diff.status.success() {
+        return Err("patch probe failed".into());
+    }
+    let mut child = Command::new("git")
+        .args(["patch-id", "--stable"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|_| "patch-id spawn failed")?;
+    // Read stdout concurrently: patch-id produces one small line for a single diff.
+    child
+        .stdin
+        .take()
+        .ok_or("patch-id stdin missing")?
+        .write_all(&diff.stdout)
+        .map_err(|_| "patch-id input failed")?;
+    let out = child.wait_with_output().map_err(|_| "patch-id failed")?;
+    if !out.status.success() {
+        return Err("patch-id failed".into());
+    }
+    Ok(String::from_utf8(out.stdout)
+        .map_err(|_| "invalid patch-id")?
+        .split_whitespace()
+        .next()
+        .map(str::to_owned))
+}
+
+/// Inspect only source `main`. Equivalence is useful adjudication evidence, never run provenance.
+/// Every probe is pinned to one main OID and the live ref is rechecked before returning.
+pub fn classify_landing(
+    clone: &Path,
+    ck: &ImplementCheckpoint,
+    head: &str,
+    lookback: u32,
+) -> LandingEvidence {
+    let probe = || -> Result<LandingEvidence, String> {
+        let source = &ck.source_repo;
+        let query = |args: &[&str]| -> Result<String, String> {
+            let out = run_git(Some(source), args).map_err(|_| "source git probe failed")?;
+            if !out.status.success() {
+                return Err("source git probe failed".into());
+            }
+            String::from_utf8(out.stdout).map_err(|_| "invalid source git output".into())
+        };
+        let main = query(&["rev-parse", "--verify", "refs/heads/main^{commit}"])?
+            .trim()
+            .to_owned();
+        let history = query(&["log", "--format=%H", &main])?;
+        let mut result = LandingEvidence {
+            confidence: "absent",
+            matched_commit: None,
+            main_oid: None,
+            reason: "no landing evidence on source main".into(),
+        };
+        // Search the entire reachable history for exact trailers. Bodies are not trailers.
+        let trailer_log = query(&["log", "--format=%H%x00%(trailers:only,unfold)%x00", &main])?;
+        let mut records = trailer_log.split('\0');
+        while let Some(commit) = records.next() {
+            let commit = commit.trim();
+            if commit.is_empty() {
+                continue;
+            }
+            let trailers = records.next().ok_or("malformed trailer history")?;
+            let runs: Vec<_> = trailers
+                .lines()
+                .filter_map(|l| l.split_once(':'))
+                .filter(|(k, _)| k.eq_ignore_ascii_case("A2A-Run"))
+                .map(|(_, v)| v.trim())
+                .collect();
+            let originals: Vec<_> = trailers
+                .lines()
+                .filter_map(|l| l.split_once(':'))
+                .filter(|(k, _)| k.eq_ignore_ascii_case("A2A-Original"))
+                .map(|(_, v)| v.trim())
+                .collect();
+            if runs == [ck.task_id.as_str()] && originals == [head] {
+                result = LandingEvidence {
+                    confidence: "confirmed-provenance",
+                    matched_commit: Some(commit.into()),
+                    main_oid: None,
+                    reason: "exact A2A-Run/A2A-Original trailer pair reachable from main".into(),
+                };
+                break;
+            }
+        }
+        if !result.confirmed() {
+            let run_patch = patch_id(
+                clone,
+                &[
+                    "diff",
+                    "--no-ext-diff",
+                    "--no-textconv",
+                    "--binary",
+                    "--no-renames",
+                    "--no-color",
+                    &ck.base_commit,
+                    head,
+                    "--",
+                ],
+                true,
+            )?;
+            if let Some(run_patch) = run_patch {
+                for commit in history.lines().take(lookback as usize) {
+                    if patch_id(
+                        source,
+                        &[
+                            "show",
+                            "--format=",
+                            "--root",
+                            "--no-ext-diff",
+                            "--no-textconv",
+                            "--binary",
+                            "--no-renames",
+                            "--no-color",
+                            commit,
+                            "--",
+                        ],
+                        false,
+                    )?
+                    .as_ref()
+                        == Some(&run_patch)
+                    {
+                        result = LandingEvidence {
+                            confidence: "high-patch-equivalence",
+                            matched_commit: Some(commit.into()),
+                            main_oid: None,
+                            reason: "equal stable patch IDs; run provenance unproved".into(),
+                        };
+                        break;
+                    }
+                }
+            }
+        }
+        if result.confidence == "absent" {
+            let changed = clone_git_str(
+                clone,
+                &[
+                    "diff",
+                    "--no-renames",
+                    "--name-only",
+                    "-z",
+                    &ck.base_commit,
+                    head,
+                    "--",
+                ],
+            )?;
+            let paths: Vec<_> = changed.split('\0').filter(|p| !p.is_empty()).collect();
+            let timestamp: i64 = clone_git_str(clone, &["show", "-s", "--format=%ct", head])?
+                .parse()
+                .map_err(|_| "invalid clone timestamp")?;
+            if !paths.is_empty() {
+                for commit in history.lines().take(lookback as usize) {
+                    let time: i64 = query(&["show", "-s", "--format=%ct", commit])?
+                        .trim()
+                        .parse()
+                        .map_err(|_| "invalid source timestamp")?;
+                    if !(timestamp..=timestamp.saturating_add(14 * 86400)).contains(&time) {
+                        continue;
+                    }
+                    let mut matches = true;
+                    for path in &paths {
+                        // Empty output represents a deletion; compare modes and object IDs as well.
+                        let expected = clone_git_str(
+                            clone,
+                            &["--literal-pathspecs", "ls-tree", "-z", head, "--", path],
+                        )?;
+                        let actual =
+                            query(&["--literal-pathspecs", "ls-tree", "-z", commit, "--", path])?;
+                        if actual.trim() != expected.trim() {
+                            matches = false;
+                            break;
+                        }
+                    }
+                    if matches {
+                        result = LandingEvidence { confidence: "low-content-equivalence", matched_commit: Some(commit.into()), main_oid: None, reason: "all changed paths match together within 14 days; run provenance unproved".into() };
+                        break;
+                    }
+                }
+            }
+        }
+        if query(&["rev-parse", "refs/heads/main"])?.trim() != main {
+            return Err("source main moved during classification".into());
+        }
+        if result.confidence == "absent" && history.lines().count() > lookback as usize {
+            result.confidence = "unknown";
+            result.reason = format!("no exact trailers; alternative equivalence search exhausted the {lookback}-commit window");
+        }
+        result.main_oid = Some(main);
+        Ok(result)
+    };
+    probe().unwrap_or_else(|reason| LandingEvidence {
+        confidence: "unknown",
+        matched_commit: None,
+        main_oid: None,
+        reason,
+    })
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OperatorIdent {
     pub name: String,
@@ -821,6 +1064,7 @@ where
                 &ck.task_brief,
                 &ck.task_brief,
             );
+            let msg = provenance_message(&msg, &ck.task_id, cur);
             let (rt, expected_target, already_integrated) = match mode {
                 MergeMode::ExactBase => {
                     let rt = match reauthor_commit(clone, cur, &ck.base_commit, &msg, &op) {
@@ -892,6 +1136,7 @@ where
                     }
                 }
             };
+            let noop_evidence = already_integrated.then(|| classify_landing(clone, &ck, cur, 2000));
             before_landing();
             let landing = if already_integrated {
                 verify_target_unchanged(&src, &target, &expected_target)
@@ -922,7 +1167,7 @@ where
                                 Ok(()) => {
                                     if let Some(cleanup) = cleanup {
                                         if let Err(e) = cleanup.and_then(|c| c.delete()) {
-                                            eprintln!("merge: warning: {e}");
+                                            eprintln!("merge: warning: incomplete remote cleanup: {e}; remaining/unverified refs: refs/heads/{}{}, refs/heads/{}{}-dirty", hooks.custody.ref_prefix, ck.task_id, hooks.custody.ref_prefix, ck.task_id);
                                         }
                                     }
                                 }
@@ -943,7 +1188,11 @@ where
                         eprintln!("merge: landed; post-landing custody hook unavailable; clone kept at {}", clone.display());
                     }
                     if already_integrated {
-                        println!("already integrated into {target} at {:.12}", rt);
+                        let evidence = noop_evidence.as_ref().expect("no-op evidence");
+                        println!(
+                            "already integrated into {target} at {:.12}; {}: {} (matched {:?})",
+                            rt, evidence.confidence, evidence.reason, evidence.matched_commit
+                        );
                     } else {
                         println!("merged {:.12} into {target}", rt);
                     }
@@ -2512,5 +2761,80 @@ mod git_tests {
         assert!(matches!(out, MergeOutcome::UsageOrPreflight));
         assert!(clone.exists()); // kept
         assert_eq!(run_git_str(&src, &["rev-parse", "release"]), base); // not landed
+    }
+    #[test]
+    fn both_landing_modes_write_exact_canonical_provenance_trailers() {
+        for mode in [MergeMode::ExactBase, MergeMode::IntegrateCurrent] {
+            let (_gs, src, base) = repo_with_base();
+            run_git(Some(&src), &["checkout", "-q", "-b", "operator"]).unwrap();
+            let root = tempfile::tempdir().unwrap();
+            let (clone, current) =
+                clone_with_checkpoint(root.path(), &src, &base, ImplementPhase::Approved);
+            let mut ck = load_checkpoint(&clone).unwrap();
+            ck.original_message = Some(
+                "real subject\n\nA2A-Run: forged\na2a-original: bad\nA2A-Run: duplicate\n".into(),
+            );
+            crate::implement_resume::save_checkpoint(&clone, &ck).unwrap();
+            assert_eq!(
+                merge_clone(None, &clone, root.path(), Some("main"), false, mode).code(),
+                0
+            );
+            let body = run_git_str(&src, &["show", "-s", "--format=%B", "main"]);
+            assert_eq!(
+                body.lines()
+                    .filter(|l| l.starts_with("A2A-Run:"))
+                    .collect::<Vec<_>>(),
+                [format!("A2A-Run: {}", ck.task_id)]
+            );
+            assert_eq!(
+                body.lines()
+                    .filter(|l| l.starts_with("A2A-Original:"))
+                    .collect::<Vec<_>>(),
+                [format!("A2A-Original: {current}")]
+            );
+            assert!(
+                !body.contains("forged") && !body.contains("bad") && !body.contains("duplicate")
+            );
+        }
+    }
+
+    #[test]
+    fn failed_local_cleanup_after_landing_keeps_every_remote_ref() {
+        let (_gs, src, base) = repo_with_base();
+        run_git(Some(&src), &["branch", "release", &base]).unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let wrong_root = tempfile::tempdir().unwrap();
+        let (clone, _) = clone_with_checkpoint(root.path(), &src, &base, ImplementPhase::Approved);
+        with_test_hooks(&clone, |original| {
+            let mut custody = original.custody.clone();
+            custody.delete_remote_on_merge = true;
+            let mut hooks = MergeHooks {
+                custody: &custody,
+                evidence: original.evidence,
+                post_landing: original.post_landing,
+            };
+            assert_eq!(
+                super::merge_clone(
+                    None,
+                    &clone,
+                    wrong_root.path(),
+                    Some("release"),
+                    false,
+                    MergeMode::ExactBase,
+                    Some(&mut hooks)
+                )
+                .code(),
+                0
+            );
+            assert!(clone.exists());
+            assert!(crate::custody_push::ls_remote_ref(
+                &src,
+                &clone,
+                &custody,
+                "refs/heads/wip/impl-1-abcd"
+            )
+            .unwrap()
+            .is_some());
+        });
     }
 }

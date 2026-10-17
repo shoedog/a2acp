@@ -132,7 +132,7 @@ one clone-local operation lock. **Caveat:** a source repo with
 
 **Custody, evidence, and clone retention (ADR-0042).** `[custody]` defaults to `push = true`,
 `remote = "origin"`, `ref_prefix = "wip/"`, `push_timeout_secs = 120`, and
-`delete_remote_on_merge = false`. Host-only transport resolves the source repository's push remote;
+`delete_remote_on_merge = true`. Host-only transport resolves the source repository's push remote;
 credentials never enter the implementation container. The run branch is pushed before review/merge and
 checked again after landing. `[evidence]` defaults to local archives in the platform state directory,
 including `spec` and `final_review_summary`, retained for 30 days with a 10 MiB per-repository cap.
@@ -148,8 +148,26 @@ preflight refusal (exit 1). Remote refs are deleted with leases only after clone
 
 `[implement] clone_config_guard = true` is the default; `clone_config_extra_keys` admits exact additional
 keys. Disabling the guard allows clone configuration to execute commands on the host and prints a warning.
-See [onboarding](docs/onboarding.md#clone-config-guard). `storage reap --clones` retains its own gates;
-adopting the remote-custody check there is a follow-up.
+See [onboarding](docs/onboarding.md#clone-config-guard). `storage reap --clones` uses each run's recorded
+configuration and the same Git custody/archive/ref/shape gate. Automatic merged reap requires exactly one
+correct `A2A-Run`/`A2A-Original` trailer pair reachable from source `main`. Stable patch equivalence is
+high-confidence evidence and changed-path content equivalence within 14 days is low-confidence evidence;
+neither proves run provenance or permits automatic deletion. Reports name the run, path, source, matched
+commit/reason, confidence and blockers. Missing metadata/configuration and unknown probes retain the clone.
+
+For parked clones, `--disposition-list` accepts JSON `authorized_by`, `reason`, `run_ids` (explicit remove)
+and optional `keep_run_ids` (explicit keep). Contradictory decisions refuse. Keep or no decision preserves
+parked clones and refs. Explicit remove authorizes discarding the clone and its owned normal/dirty `wip/`
+refs, waiving merged classification and Git custody checks (on-remote, cleanliness, archive, refs and shape
+allowlists). Live-use, operation locks, protected roots, path identity and container safeguards remain.
+The recorded configuration's runtimes must affirm that no container for the clone/run exists; an unavailable
+runtime keeps the clone. A missing source does not block authorized local discard, but the receipt reports
+remote cleanup as unavailable. Chained origins use the terminal root for landing provenance and retain the
+immediate source for custody checks.
+The archive retains its actual terminal phase, and fold receipts remain durable. Remote deletions use the
+recorded leases only after successful local removal; changed foreign refs remain and incomplete cleanup is
+reported. New landings get canonical trailers even if the supplied message conflicts; an already-integrated
+no-op adds no empty commit and reports the available alternative evidence.
 
 **Parallel implementor flight (ADR-0040).** Freeze one base SHA, write independently testable task specs, and
 assign every changed path/seam to one implementor; reserve shared manifests, roadmaps, generated files, and
